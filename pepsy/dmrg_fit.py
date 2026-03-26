@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import autoray as ar
 import quimb.tensor as qtn
 
-from .core import build_optimizer, fidel_mps
+from .core import build_optimizer, tn_fidelity
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ __all__ = [
     "FIT",
     "build_optimizer",
     "opt_",
-    "fidel_mps",
+    "tn_fidelity",
     "energy_global",
     "gate_1d",
     "internal_inds",
@@ -343,7 +343,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
             # Compute fidelity if verbose mode is enabled
             if verbose:
-                fidelity = fidel_mps(self.tn, psi)
+                fidelity = tn_fidelity(self.tn, psi)
                 self.loss.append(ar.do("real", fidelity))
 
     def _build_env_right(self, psi, env_right):
@@ -550,7 +550,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
             # Compute fidelity if verbose mode is enabled
             if verbose:
-                fidelity = fidel_mps(self.tn, psi)
+                fidelity = tn_fidelity(self.tn, psi)
                 self.loss.append(ar.do("real", fidelity))
 
 
@@ -680,5 +680,5 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
             # Compute fidelity if verbose mode is enabled
             if verbose:
-                fidelity = fidel_mps(self.tn, psi)
+                fidelity = tn_fidelity(self.tn, psi)
                 self.loss.append(ar.do("real", fidelity))

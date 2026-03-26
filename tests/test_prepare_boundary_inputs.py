@@ -3,6 +3,22 @@
 import pepsy
 import pytest
 import quimb.tensor as qtn
+from pepsy import core
+
+
+def test_validate_tensor_network_tags_requires_i_tags():
+    """Validator should require at least one site tag with I<int>[,<int>...]."""
+    dummy = type("DummyTN", (), {"tags": {"X0", "Y0"}})()
+
+    with pytest.raises(ValueError, match=r"X\*, Y\*, and I\*"):
+        pepsy.boundary_norm._validate_tensor_network_tags(dummy)
+
+
+def test_validate_tensor_network_tags_accepts_multi_index_i_tag():
+    """Validator should accept I tags like I2, I3,4, or I2,3,4."""
+    dummy = type("DummyTN", (), {"tags": {"X2", "Y3", "I2,3,4"}})()
+
+    pepsy.boundary_norm._validate_tensor_network_tags(dummy)
 
 
 def test_prepare_boundary_inputs_uses_readable_bra_reindex_suffix():
@@ -213,7 +229,7 @@ def test_compbdy_fidelity_history_resets_each_run(monkeypatch):
     )
     comp = pepsy.CompBdy(norm_tagged, bdy.mps_b)
 
-    monkeypatch.setattr(pepsy.boundary_sweeps, "fidel_mps", lambda _tn, _p: 0.5)
+    monkeypatch.setattr(pepsy.boundary_sweeps, "tn_fidelity", lambda _tn, _p: 0.5)
     monkeypatch.setattr(
         pepsy.boundary_sweeps.CompBdy,
         "_run_fit_solver",
@@ -246,7 +262,7 @@ def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
         run_eff_verbose_args.append(verbose)
 
     monkeypatch.setattr(pepsy.boundary_sweeps.FIT, "run_eff", fake_run_eff)
-    monkeypatch.setattr(pepsy.boundary_sweeps, "fidel_mps", lambda _tn, _p: 0.5)
+    monkeypatch.setattr(pepsy.boundary_sweeps, "tn_fidelity", lambda _tn, _p: 0.5)
 
     comp.run(direction="y", fidel_=True, pbar=False, n_iter=1, max_separation=0)
 
@@ -533,7 +549,7 @@ def test_normalize_returns_dict_with_boundary_and_contract_result(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_states, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary_norm, "BdyMPS", fake_bdymps)
     monkeypatch.setattr(pepsy.boundary_norm, "ContractBoundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=131, dtype="complex128")
@@ -575,7 +591,7 @@ def test_normalize_uses_provided_bdy_without_constructing_new_one(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_states, "BdyMPS", fail_bdymps)
+    monkeypatch.setattr(pepsy.boundary_norm, "BdyMPS", fail_bdymps)
     monkeypatch.setattr(pepsy.boundary_norm, "ContractBoundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=137, dtype="complex128")
@@ -596,3 +612,24 @@ def test_normalize_requires_chi_when_bdy_not_provided():
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=139, dtype="complex128")
     with pytest.raises(ValueError, match="Provide chi when bdy is not supplied."):
         pepsy.normalize(ket)
+
+
+def test_normalize_returns_unit_cost_for_pre_normalized_peps():
+    """normalize should keep cost ~1 for a pre-normalized random PEPS."""
+    optimizer = core.build_optimizer(progbar=False, directory=None, parallel=False)
+
+    p = qtn.PEPS.rand(Lx=4, Ly=5, bond_dim=2, seed=6, dtype="complex128")
+    state_scale = (p.H & p).contract(all, optimize=optimizer)
+    p.multiply_(1 / state_scale**0.5)
+    normalize_result = pepsy.normalize(
+        p,
+        chi=32,
+        opt=optimizer,
+        max_separation=0,
+        n_iter=5,
+        direction="y",
+        pbar=False,
+        fidel_=False,
+    )
+    cost = complex(normalize_result["cost"])
+    assert abs(1 - cost) < 1e-12

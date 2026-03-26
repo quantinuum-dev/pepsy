@@ -2,9 +2,9 @@
 
 <img src="assets/pepsy-icon.svg" alt="pepsy icon" width="220" />
 
-`pepsy` is a Python package for boundary-MPS based PEPS norm contraction and related DMRG fitting workflows.
+`pepsy` is a Python package for Circuit Simulaiton and related DMRG fitting workflows.
 
-Current package version: `0.0.1` (from `pepsy/VERSION`).
+Current package version: `0.1.0` (from `pepsy/VERSION`).
 
 ## Package Layout
 - `pepsy/`: installable library code
@@ -20,11 +20,11 @@ Current package version: `0.0.1` (from `pepsy/VERSION`).
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
 pip install -e .
 # Optional backends:
 # pip install -e .[torch]
 # pip install -e .[jax]
+# pip install -e .[solvers]
 ```
 
 ## Quick Usage

@@ -6,11 +6,15 @@ from typing import Any
 
 import numpy as np
 import cotengra as ctg
+import torch
+import quimb.tensor as qtn
 
 __all__ = [
     "backend_torch",
     "backend_numpy",
     "backend_jax",
+    "register_torch_linalg",
+    "register_jax_linalg",
     "set_default_array_backend",
     "get_default_array_backend",
     "set_default_grad_backend",
@@ -18,9 +22,7 @@ __all__ = [
     "reset_default_backends",
     "build_optimizer",
     "build_compressed_optimizer",
-    "opt_",
-    "copt_",
-    "fidel_mps",
+    "tn_fidelity",
 ]
 
 _DEFAULT_ARRAY_BACKEND = None
@@ -32,17 +34,17 @@ def _validate_backend_callable(name, fn):
         raise TypeError(f"{name} must be callable or None")
 
 
-def set_default_array_backend(to_backend):
+def set_default_array_backend(array_backend):
     """Set package-wide default array backend caster.
 
     Parameters
     ----------
-    to_backend : callable | None
+    array_backend : callable | None
         Function mapping arrays to a target backend. ``None`` clears default.
     """
-    _validate_backend_callable("to_backend", to_backend)
+    _validate_backend_callable("array_backend", array_backend)
     global _DEFAULT_ARRAY_BACKEND  # pylint: disable=global-statement
-    _DEFAULT_ARRAY_BACKEND = to_backend
+    _DEFAULT_ARRAY_BACKEND = array_backend
 
 
 def get_default_array_backend():
@@ -50,17 +52,17 @@ def get_default_array_backend():
     return _DEFAULT_ARRAY_BACKEND
 
 
-def set_default_grad_backend(to_backend_grad):
+def set_default_grad_backend(grad_backend):
     """Set package-wide default gradient backend caster.
 
     Parameters
     ----------
-    to_backend_grad : callable | None
+    grad_backend : callable | None
         Function mapping arrays to trainable backend tensors.
     """
-    _validate_backend_callable("to_backend_grad", to_backend_grad)
+    _validate_backend_callable("grad_backend", grad_backend)
     global _DEFAULT_GRAD_BACKEND  # pylint: disable=global-statement
-    _DEFAULT_GRAD_BACKEND = to_backend_grad
+    _DEFAULT_GRAD_BACKEND = grad_backend
 
 
 def get_default_grad_backend():
@@ -75,37 +77,44 @@ def reset_default_backends():
     _DEFAULT_ARRAY_BACKEND = None
     _DEFAULT_GRAD_BACKEND = None
 
-
 def backend_torch(device="cpu", dtype=None, requires_grad=False):
-    """Return a converter that materializes arrays as torch tensors."""
-    try:
-        import torch  # pylint: disable=import-outside-toplevel
-    except ImportError as exc:  # pragma: no cover - depends on optional dependency
-        raise ImportError(
-            "backend_torch requires the optional dependency 'torch'. "
-            "Install it with: pip install pepsy[torch]"
-        ) from exc
 
-    if dtype is None:
-        dtype = torch.float64
+    def cast_array(x, device=device, dtype=dtype, requires_grad=requires_grad):
 
-    def to_backend(x, device=device, dtype=dtype, requires_grad=requires_grad):
         if isinstance(x, torch.Tensor):
-            out = x.detach().clone().to(device=device, dtype=dtype)
-            out.requires_grad_(requires_grad)
-            return out
-        return torch.tensor(x, dtype=dtype, device=device, requires_grad=requires_grad)
+            out = x.detach() if requires_grad else x
 
-    return to_backend
+            if dtype is None:
+                out = out.to(device=device)
+            else:
+                out = out.to(device=device, dtype=dtype)
 
+        else:
+            if dtype is None:
+                out = torch.as_tensor(x, device=device)
+            else:
+                out = torch.as_tensor(x, dtype=dtype, device=device)
+
+        # Trainable tensors must be floating or complex
+        if requires_grad and not (out.is_floating_point() or out.is_complex()):
+            out = out.to(dtype=torch.float64)
+
+        if requires_grad:
+            out.requires_grad_(True)
+        else:
+            out.requires_grad_(False)
+
+        return out
+
+    return cast_array
 
 def backend_numpy(dtype=np.float64):
     """Return a converter that materializes arrays as NumPy arrays."""
 
-    def to_backend(x, dtype=dtype):
+    def cast_array(x, dtype=dtype):
         return np.array(x, dtype=dtype)
 
-    return to_backend
+    return cast_array
 
 
 def backend_jax(dtype=None, device=None):
@@ -124,10 +133,38 @@ def backend_jax(dtype=None, device=None):
     if device is None:
         device = jax.devices("cpu")[0]
 
-    def to_backend(x, dtype=dtype, device=device):
+    def cast_array(x, dtype=dtype, device=device):
         return jax.device_put(jnp.array(x, dtype=dtype), device)
 
-    return to_backend
+    return cast_array
+
+
+def register_torch_linalg(mode="complex"):
+    """Register custom torch linalg gradients in autoray.
+
+    Parameters
+    ----------
+    mode : {"complex", "real"}, default="complex"
+        Which SVD/QR registrations to install.
+    """
+    from . import linalg_registrations as lr  # pylint: disable=import-outside-toplevel
+
+    if mode == "complex":
+        lr.reg_complex_svd()
+        lr.reg_complex_qr()
+        return
+    if mode == "real":
+        lr.reg_real_svd()
+        lr.reg_real_qr()
+        return
+    raise ValueError("mode must be 'complex' or 'real'")
+
+
+def register_jax_linalg():
+    """Register custom jax SVD gradient in autoray."""
+    from . import linalg_registrations as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_complex_svd_jax()
 
 
 def build_optimizer(
@@ -188,13 +225,7 @@ def build_compressed_optimizer(
     )
     return copt
 
-
-# Backward-compatible aliases.
-opt_ = build_optimizer
-copt_ = build_compressed_optimizer
-
-
-def fidel_mps(psi, psi_fix, seed=None):
+def tn_fidelity(psi, psi_fix, seed=None):
     """Compute normalized MPS overlap fidelity."""
     opt: Any = build_optimizer(progbar=False, seed=seed)
     val_0 = abs((psi.H & psi).contract(all, optimize=opt))
@@ -204,3 +235,18 @@ def fidel_mps(psi, psi_fix, seed=None):
     val_1 = val_1**2
     fidelity = complex(val_1 / (val_0 * val_ref)).real
     return fidelity
+
+def add_cycle(peps, bond_dim, cylinder=False):
+    Ly = peps.Ly
+    Lx = peps.Lx
+    for j in range(Ly):
+        T1 = peps[f"I{Lx-1},{j}"]
+        T2 = peps[f"I{0},{j}"]
+        qtn.new_bond(T1, T2, size=bond_dim, name=None, axis1=0, axis2=0)
+
+    if not cylinder:
+        for i in range(Lx):
+            T1 = peps[f"I{i},{Ly-1}"]
+            T2 = peps[f"I{i},{0}"]
+            qtn.new_bond(T1, T2, size=bond_dim, name=None, axis1=0, axis2=0)
+    return peps
