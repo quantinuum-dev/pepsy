@@ -162,9 +162,12 @@ class SVD_real(torch.autograd.Function):
     def forward(self, A):
         try:
             U, S, V = torch.svd(A)
-        except:
-            if True:
-                print('trouble in torch gesdd routine, falling back to gesvd')
+        except (RuntimeError, torch.linalg.LinAlgError):
+            warnings.warn(
+                'torch gesdd SVD failed, falling back to scipy gesvd',
+                RuntimeWarning,
+                stacklevel=2,
+            )
             U, S, V = scipy.linalg.svd(A.detach().numpy(), full_matrices=False, lapack_driver='gesvd')
             U = torch.from_numpy(U)
             S = torch.from_numpy(S)

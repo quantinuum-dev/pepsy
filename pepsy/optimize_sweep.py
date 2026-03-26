@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
 import quimb.tensor as qtn
-import torch
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from .boundary_norm import prepare_boundary_inputs
 from .boundary_sweeps import CompBdy
-from .core import get_default_array_backend, get_default_grad_backend
+from .gradient_solver import optimize_packed_params as run_gradient_solver
 
 _PHYS_IND_PATTERN = re.compile(r"^k\d+(?:,\d+)*$")
 _TAG_X = re.compile(r"^X(\d+)$")
@@ -47,12 +47,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         Boundary container used for overlap contractions.
     opt : object
         Contraction optimizer.
-    array_backend : callable | None, default=None
-        Array caster applied to intermediate networks. If ``None``, uses
-        :func:`pepsy.core.get_default_array_backend` when set.
-    grad_backend : callable | None, default=None
-        Array caster producing trainable tensors. If ``None``, uses
-        :func:`pepsy.core.get_default_grad_backend` when set.
     dmrg_run : {"eff", "global"}, default="eff"
         Backend mode passed to :class:`pepsy.boundary_sweeps.CompBdy`.
     """
@@ -65,8 +59,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         bdy,
         bdy_overlap,
         opt,
-        array_backend=None,
-        grad_backend=None,
         dmrg_run="eff",
     ):
         self.state = state
@@ -74,12 +66,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.bdy = bdy
         self.bdy_overlap = bdy_overlap
         self.opt = opt
-        self.array_backend = (
-            get_default_array_backend() if array_backend is None else array_backend
-        )
-        self.grad_backend = (
-            get_default_grad_backend() if grad_backend is None else grad_backend
-        )
         self.dmrg_run = dmrg_run
 
         self.Lx, self.Ly = self._infer_shape(self.state)
@@ -186,20 +172,9 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
     def _boundary_direction(axis, side):
         return f"{axis}_{side}"
 
-    def _to_trainable_array(self, x):
-        if self.grad_backend is not None:
-            return self.grad_backend(x)
-        if isinstance(x, torch.Tensor):
-            return x.detach().clone().requires_grad_(True)
-        return torch.tensor(x, dtype=torch.complex128, requires_grad=True)
-
     def _prepare_current_double_layers(self):
         self.state, norm_tn = prepare_boundary_inputs(ket=self.state, bra=None)
         _, overlap_tn = prepare_boundary_inputs(ket=self.target, bra=self.state)
-
-        if self.array_backend is not None:
-            norm_tn.apply_to_arrays(self.array_backend)
-            overlap_tn.apply_to_arrays(self.array_backend)
 
         return norm_tn, overlap_tn
 
@@ -221,54 +196,88 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             out = out | boundaries[left_key]
         return out
 
+    @staticmethod
+    def _merge_solver_options(*, solver, solver_options=None, adam_options=None):
+        """Merge new generic solver options with legacy Adam-only options."""
+        merged = {}
+        if solver_options is not None:
+            if not isinstance(solver_options, dict):
+                raise TypeError("solver_options must be a dict or None")
+            merged.update({k: v for k, v in solver_options.items() if v is not None})
+
+        if adam_options is None:
+            return merged
+        if solver != "adam":
+            raise ValueError("adam_options is only valid when solver='adam'")
+        if not isinstance(adam_options, dict):
+            raise TypeError("adam_options must be a dict or None")
+
+        overlap = set(merged) & set(adam_options)
+        if overlap:
+            keys = ", ".join(sorted(overlap))
+            raise ValueError(
+                f"Duplicate option keys in solver_options and adam_options: {keys}"
+            )
+        merged.update({k: v for k, v in adam_options.items() if v is not None})
+        return merged
+
+    @staticmethod
+    def _resolve_user_solver(solver):
+        """Normalize user-facing solver shortcuts and emit practical warnings."""
+        if solver == "lbfgs":
+            warnings.warn(
+                "solver='lbfgs' defaults to SciPy L-BFGS-B in sweep optimization. "
+                "Use solver='torch-lbfgs' to force torch.optim.LBFGS.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return "scipy-lbfgs"
+        if solver == "nlopt-lbfgs":
+            warnings.warn(
+                "solver='nlopt-lbfgs' uses NLopt on CPU float64 parameter vectors. "
+                "Tune NLopt controls (algorithm/maxeval/ftol_rel/xtol_rel) for your problem.",
+                UserWarning,
+                stacklevel=3,
+            )
+        return solver
+
     def _optimize_packed_params(
         self,
         params_init,
         loss_fn,
         *,
+        solver="adam",
+        solver_options=None,
         lr=1e-2,
+        adam_options=None,
         n_steps=100,
         log_every=20,
         show_opt_progress=False,
         opt_desc=None,
-        text_logs=False,
         progress_callback=None,
     ):
-        params_run = {k: self._to_trainable_array(v.detach().clone()) for k, v in params_init.items()}
-        optimizer = torch.optim.Adam(list(params_run.values()), lr=lr)
-        history = []
-        step_iter = range(n_steps)
-        if show_opt_progress:
-            step_iter = tqdm(
-                step_iter,
-                total=n_steps,
-                desc=opt_desc or "opt",
-                leave=False,
-                colour="CYAN",
-            )
+        effective_options = self._merge_solver_options(
+            solver=solver,
+            solver_options=solver_options,
+            adam_options=adam_options,
+        )
+        return run_gradient_solver(
+            params_init,
+            loss_fn,
+            solver=solver,
+            solver_options=effective_options,
+            lr=lr,
+            n_steps=n_steps,
+            log_every=log_every,
+            show_opt_progress=show_opt_progress,
+            opt_desc=opt_desc,
+            progress_callback=progress_callback,
+        )
 
-        for step in step_iter:
-            optimizer.zero_grad()
-            loss = loss_fn(params_run)
-            loss.backward()
-            optimizer.step()
-            loss_value = float(loss.detach())
-            history.append(loss_value)
-            if show_opt_progress:
-                step_iter.set_postfix({"loss": loss_value})
-            step_num = step + 1
-            if progress_callback is not None and ((step_num % log_every == 0) or (step_num == n_steps)):
-                progress_callback(step_num, loss_value)
-            if text_logs and (step_num % log_every == 0):
-                print(f"step={step + 1:4d} loss={history[-1]:.8f}")
-        return params_run, history
-
-    def _apply_slice_update(self, index, params_opt, skeleton, axis, *, text_logs=False):
+    def _apply_slice_update(self, index, params_opt, skeleton, axis):
         tn_opt = qtn.unpack(params_opt, skeleton)
         for tag in self._site_tensor_tags(axis, index):
             self.state[tag].modify(data=tn_opt[tag].data)
-        if text_logs:
-            print(f"updated {axis.upper()}{index} in p")
         return tn_opt
 
     def _make_comp_pair(self, norm_tn, overlap_tn):
@@ -377,43 +386,22 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         overlap_tn,
         *,
         axis,
+        solver="adam",
+        solver_options=None,
         lr=1e-2,
+        adam_options=None,
         n_steps=100,
         log_every=20,
-        keep_payload=False,
         store_history=False,
         show_opt_progress=False,
-        text_logs=False,
         progress_callback=None,
     ):
         axis_tag = self._axis_tag(axis)
         right_key, left_key = self._boundary_keys_for_index(index, axis)
-        if text_logs:
-            print(f"\n=== optimize {axis_tag}{index} (right={right_key}, left={left_key}) ===")
 
-        probe_norm = self._attach_boundaries(
-            norm_tn.select([f"{axis_tag}{index}"], "any"),
-            self.bdy.mps_b,
-            right_key=right_key,
-            left_key=left_key,
-        )
-        probe_overlap = self._attach_boundaries(
-            overlap_tn.select([f"{axis_tag}{index}"], "any"),
-            self.bdy_overlap.mps_b,
-            right_key=right_key,
-            left_key=left_key,
-        )
-        norm_probe_value = complex(probe_norm.contract(all, optimize=self.opt))
-        overlap_probe_value = complex(probe_overlap.contract(all, optimize=self.opt))
-        if text_logs:
-            print("norm probe:", norm_probe_value)
-            print("overlap probe:", overlap_probe_value)
 
         slice_state = self.state.select([f"{axis_tag}{index}"], "any")
         slice_target = self.target.select([f"{axis_tag}{index}"], "any")
-        if self.array_backend is not None:
-            slice_state.apply_to_arrays(self.array_backend)
-            slice_target.apply_to_arrays(self.array_backend)
         params_init, skeleton = qtn.pack(slice_state)
 
         def loss_fn(params_in):
@@ -445,29 +433,28 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             return 1 - (overlap_val / norm_val)
 
         initial_loss = float(loss_fn(params_init))
-        if text_logs:
-            print("initial loss:", initial_loss)
         params_opt, history = self._optimize_packed_params(
             params_init,
             loss_fn,
+            solver=solver,
+            solver_options=solver_options,
             lr=lr,
+            adam_options=adam_options,
             n_steps=n_steps,
             log_every=log_every,
             show_opt_progress=show_opt_progress,
             opt_desc=f"{axis_tag}{index}",
-            text_logs=text_logs,
             progress_callback=progress_callback,
         )
-        final_loss = float(history[-1])
-        if text_logs:
-            print("final loss:", final_loss)
+        final_loss = float(loss_fn(params_opt).detach().cpu())
+
 
         params_opt = {k: v.detach().clone() for k, v in params_opt.items()}
-        tn_opt = self._apply_slice_update(index, params_opt, skeleton, axis, text_logs=text_logs)
+        self._apply_slice_update(index, params_opt, skeleton, axis)
 
         _, global_loss = self.metrics()
-        if text_logs:
-            print("post-update global loss:", global_loss)
+        global_loss = float(global_loss)
+        global_fidelity = 1.0 - global_loss
 
         run_info = {
             "axis": axis,
@@ -477,16 +464,10 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "loss_initial": initial_loss,
             "loss_final": final_loss,
             "loss_delta": final_loss - initial_loss,
-            "global_loss_after": float(global_loss),
-            "probe_norm_abs": float(abs(norm_probe_value)),
-            "probe_overlap_abs": float(abs(overlap_probe_value)),
+            "global_loss_after": global_loss,
+            "global_fidelity_after": global_fidelity,
         }
         run_info["history"] = history if store_history else [initial_loss, final_loss]
-
-        if keep_payload:
-            run_info["params_opt"] = params_opt
-            run_info["skeleton"] = skeleton
-            run_info["tn_opt"] = tn_opt
 
         return run_info
 
@@ -497,16 +478,17 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         update_side,
         sweep_name,
+        solver="adam",
+        solver_options=None,
         lr=1e-2,
+        adam_options=None,
         n_steps=100,
         log_every=20,
         env_n_iter=4,
         show_env_progress=True,
-        keep_payload=False,
         store_history=False,
         show_sweep_progress=False,
         show_opt_progress=False,
-        text_logs=False,
         run_callback=None,
         fidel_=False,
     ):
@@ -573,13 +555,14 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 norm_tn,
                 overlap_tn,
                 axis=axis,
+                solver=solver,
+                solver_options=solver_options,
                 lr=lr,
+                adam_options=adam_options,
                 n_steps=n_steps,
                 log_every=log_every,
-                keep_payload=keep_payload,
                 store_history=store_history,
                 show_opt_progress=show_opt_progress,
-                text_logs=text_logs,
                 progress_callback=_on_step,
             )
             run_info["sweep"] = sweep_name
@@ -605,25 +588,37 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         *,
         n_round_trips=1,
+        solver="adam",
+        solver_options=None,
         lr=1e-2,
+        adam_options=None,
         n_steps=100,
         log_every=20,
         env_n_iter=4,
         show_env_progress=True,
-        keep_payload=False,
         store_history=False,
         show_sweep_progress=False,
         show_opt_progress=False,
-        text_logs=False,
         run_callback=None,
         fidel_=False,
     ):
-        """Run one axis with forward + round-trip sweeps."""
+        """Run one axis with forward + round-trip sweeps.
+
+        Parameters
+        ----------
+        solver : str, default="adam"
+            Gradient solver name. Supported values include ``adam``, ``lbfgs``,
+            ``scipy-lbfgs``, and ``nlopt-lbfgs``.
+        solver_options : dict | None, default=None
+            Extra backend-specific options for the selected ``solver``.
+        adam_options : dict | None, default=None
+            Legacy alias for Adam-specific options. Only valid with
+            ``solver='adam'``.
+        """
         n = self._axis_n(axis)
+        resolved_solver = self._resolve_user_solver(solver)
         all_runs = []
 
-        if text_logs:
-            print(f"\n===== axis {axis}: initial forward (0 -> {n - 1}) =====")
         self._refresh_right_boundaries_once(axis, env_n_iter=env_n_iter, show_env_progress=show_env_progress)
         all_runs.extend(
             self._run_axis_half_sweep(
@@ -631,70 +626,63 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 axis=axis,
                 update_side="left",
                 sweep_name="forward",
+                solver=resolved_solver,
+                solver_options=solver_options,
                 lr=lr,
+                adam_options=adam_options,
                 n_steps=n_steps,
                 log_every=log_every,
                 env_n_iter=env_n_iter,
                 show_env_progress=show_env_progress,
-                keep_payload=keep_payload,
                 store_history=store_history,
                 show_sweep_progress=show_sweep_progress,
                 show_opt_progress=show_opt_progress,
-                text_logs=text_logs,
                 run_callback=run_callback,
                 fidel_=fidel_,
             )
         )
 
         for trip in range(n_round_trips):
-            if text_logs:
-                print(
-                    f"\n===== axis {axis}: round-trip {trip + 1}/{n_round_trips} "
-                    f"backward ({n - 2} -> 0) ====="
-                )
             all_runs.extend(
                 self._run_axis_half_sweep(
                     range(n - 2, -1, -1),
                     axis=axis,
                     update_side="right",
                     sweep_name="backward",
+                    solver=resolved_solver,
+                    solver_options=solver_options,
                     lr=lr,
+                    adam_options=adam_options,
                     n_steps=n_steps,
                     log_every=log_every,
                     env_n_iter=env_n_iter,
                     show_env_progress=show_env_progress,
-                    keep_payload=keep_payload,
                     store_history=store_history,
                     show_sweep_progress=show_sweep_progress,
                     show_opt_progress=show_opt_progress,
-                    text_logs=text_logs,
                     run_callback=run_callback,
                     fidel_=fidel_,
                 )
             )
 
             forward_start = 1 if n > 1 else n
-            if text_logs:
-                print(
-                    f"\n===== axis {axis}: round-trip {trip + 1}/{n_round_trips} "
-                    f"forward ({forward_start} -> {n - 1}) ====="
-                )
             all_runs.extend(
                 self._run_axis_half_sweep(
                     range(forward_start, n),
                     axis=axis,
                     update_side="left",
                     sweep_name="forward",
+                    solver=resolved_solver,
+                    solver_options=solver_options,
                     lr=lr,
+                    adam_options=adam_options,
                     n_steps=n_steps,
                     log_every=log_every,
                     env_n_iter=env_n_iter,
                     show_env_progress=show_env_progress,
-                    keep_payload=keep_payload,
                     store_history=store_history,
                     show_sweep_progress=show_sweep_progress,
                     show_opt_progress=show_opt_progress,
-                    text_logs=text_logs,
                     run_callback=run_callback,
                     fidel_=fidel_,
                 )
@@ -708,18 +696,32 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axes=("y", "x"),
         n_cycles=1,
         n_round_trips=1,
+        solver="adam",
+        solver_options=None,
         lr=1e-2,
+        adam_options=None,
         n_steps=100,
         log_every=20,
         env_n_iter=4,
         pbar=True,
         fidel_=False,
-        keep_payload=False,
         store_history=False,
-        text_logs=False,
     ):
-        """Run alternating axis sweeps and return a :class:`SweepResult`."""
+        """Run alternating axis sweeps and return a :class:`SweepResult`.
+
+        Parameters
+        ----------
+        solver : str, default="adam"
+            Gradient solver name. Supported values include ``adam``, ``lbfgs``,
+            ``scipy-lbfgs``, and ``nlopt-lbfgs``.
+        solver_options : dict | None, default=None
+            Extra backend-specific options for the selected ``solver``.
+        adam_options : dict | None, default=None
+            Legacy alias for Adam-specific options. Only valid with
+            ``solver='adam'``.
+        """
         fid_before, loss_before = self.metrics()
+        resolved_solver = self._resolve_user_solver(solver)
         all_runs = []
         axis_seq = list(axes)
 
@@ -748,21 +750,25 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             )
 
         for cyc in range(n_cycles):
-            if text_logs:
-                print(f"\n######## global cycle {cyc + 1}/{n_cycles} ########")
             for axis in axis_seq:
                 def _on_run(run_info, *, cyc_num=cyc + 1, axis_name=axis):
                     _ = cyc_num, axis_name
                     if global_progress is None:
                         return
                     global_progress.update(1)
-                    _fidelity_now, loss_now = self.metrics()
-                    postfix = {"loss": float(loss_now)}
+                    fidelity_now = run_info.get("global_fidelity_after")
+                    if fidelity_now is None:
+                        fidelity_now, _loss_now = self.metrics()
+                    postfix = {"F": float(fidelity_now)}
                     chi_now = _current_chi()
                     if chi_now is not None:
                         postfix["chi"] = chi_now
-                    if run_info.get("sweep") is not None:
-                        postfix["dir"] = run_info.get("sweep")
+                    sweep_name = run_info.get("sweep")
+                    axis_name = run_info.get("axis")
+                    if sweep_name is not None:
+                        postfix["dir"] = (
+                            f"{axis_name}_{sweep_name}" if axis_name is not None else sweep_name
+                        )
                     if fidel_:
                         f_norm = run_info.get("boundary_fidelity_norm")
                         f_overlap = run_info.get("boundary_fidelity_overlap")
@@ -778,16 +784,17 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     self.optimize_axis(
                         axis,
                         n_round_trips=n_round_trips,
+                        solver=resolved_solver,
+                        solver_options=solver_options,
                         lr=lr,
+                        adam_options=adam_options,
                         n_steps=n_steps,
                         log_every=log_every,
                         env_n_iter=env_n_iter,
                         show_env_progress=False,
-                        keep_payload=keep_payload,
                         store_history=store_history,
                         show_sweep_progress=False,
                         show_opt_progress=False,
-                        text_logs=text_logs,
                         run_callback=_on_run,
                         fidel_=fidel_,
                     )

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
         boundary_sweeps,
         core,
         dmrg_fit,
+        gradient_solver,
         optimize_sweep,
     )
     from .boundary_norm import (
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
     from .core import (
         get_default_array_backend,
         get_default_grad_backend,
+        register_jax_linalg,
+        register_torch_linalg,
         reset_default_backends,
         set_default_array_backend,
         set_default_grad_backend,
@@ -44,10 +47,13 @@ __all__ = [
     "get_default_array_backend",
     "set_default_grad_backend",
     "get_default_grad_backend",
+    "register_torch_linalg",
+    "register_jax_linalg",
     "reset_default_backends",
     "PEPSSweepOptimizer",
     "SweepResult",
     "optimize_sweep",
+    "gradient_solver",
     "boundary_norm",
     "boundary_states",
     "boundary_sweeps",
@@ -61,6 +67,7 @@ def __getattr__(name):
         "boundary_norm",
         "boundary_states",
         "boundary_sweeps",
+        "gradient_solver",
         "optimize_sweep",
         "core",
         "dmrg_fit",
@@ -98,11 +105,15 @@ def __getattr__(name):
         "get_default_array_backend",
         "set_default_grad_backend",
         "get_default_grad_backend",
+        "register_torch_linalg",
+        "register_jax_linalg",
         "reset_default_backends",
     ):
         from .core import (  # pylint: disable=import-outside-toplevel
             get_default_array_backend,
             get_default_grad_backend,
+            register_jax_linalg,
+            register_torch_linalg,
             reset_default_backends,
             set_default_array_backend,
             set_default_grad_backend,
@@ -113,6 +124,8 @@ def __getattr__(name):
             "get_default_array_backend": get_default_array_backend,
             "set_default_grad_backend": set_default_grad_backend,
             "get_default_grad_backend": get_default_grad_backend,
+            "register_torch_linalg": register_torch_linalg,
+            "register_jax_linalg": register_jax_linalg,
             "reset_default_backends": reset_default_backends,
         }[name]
 

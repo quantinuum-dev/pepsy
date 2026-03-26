@@ -20,17 +20,9 @@ dependencies = [
 [project.optional-dependencies]
 torch = ["torch"]
 jax = ["jax", "jaxlib"]
-docs = [
-  "sphinx>=7",
-  "myst-parser>=2",
-  "pydata-sphinx-theme>=0.15",
-  "nbsphinx>=0.9",
-]
-dev = [
-  "pytest",
-  "nbclient",
-  "nbconvert",
-]
+solvers = ["scipy", "nlopt"]
+docs = ["sphinx>=7", "myst-parser>=2", "pydata-sphinx-theme>=0.15", "nbsphinx>=0.9"]
+dev = ["pytest", "nbclient", "nbconvert"]
 
 [tool.setuptools]
 include-package-data = true
@@ -43,7 +35,8 @@ include = ["pepsy*"]
 version = { attr = "pepsy.version.__version__" }
 
 [tool.setuptools.package-data]
-pepsy = ["VERSION", "py.typed"]
+pepsy = ["VERSION"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+cache_dir = "/tmp/pytest_cache_pepsy"

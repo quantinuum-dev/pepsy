@@ -6,5 +6,6 @@ Task-oriented references for common operational questions.
 :maxdepth: 2
 
 choose_parameters
+solver_tuning
 troubleshooting
 ```

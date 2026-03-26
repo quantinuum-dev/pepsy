@@ -52,8 +52,8 @@ def test_build_compressed_optimizer_forwards_seed(monkeypatch):
     assert captured["seed"] == 77
 
 
-def test_fidel_mps_forwards_seed(monkeypatch):
-    """fidel_mps should call build_optimizer with provided seed."""
+def test_tn_fidelity_forwards_seed(monkeypatch):
+    """tn_fidelity should call build_optimizer with provided seed."""
     captured = {}
 
     def fake_build_optimizer(**kwargs):
@@ -65,7 +65,7 @@ def test_fidel_mps_forwards_seed(monkeypatch):
     psi = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=5)
     psi_fix = psi.copy()
 
-    fidelity = core.fidel_mps(psi, psi_fix, seed=9)
+    fidelity = core.tn_fidelity(psi, psi_fix, seed=9)
 
     assert abs(fidelity - 1.0) < 1e-12
     assert captured["seed"] == 9

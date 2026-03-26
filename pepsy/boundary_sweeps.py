@@ -7,10 +7,10 @@ import numpy as np
 from tqdm import tqdm
 
 from .boundary_states import BdyMPS
-from .core import build_optimizer, fidel_mps
+from .core import build_optimizer, tn_fidelity
 from .dmrg_fit import FIT
 
-__all__ = ["BdyMPS", "CompBdy", "fidel_mps", "build_optimizer", "opt_"]
+__all__ = ["BdyMPS", "CompBdy", "tn_fidelity", "build_optimizer", "opt_"]
 
 # Backward-compatible alias.
 opt_ = build_optimizer
@@ -326,7 +326,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             if self.eq_norms:
                 fit.p.equalize_norms_(value=self.eq_norms)
             if self.fidel_:
-                fidelity = fidel_mps(tn, fit.p)
+                fidelity = tn_fidelity(tn, fit.p)
                 self.fidel.append(fidelity)
 
             if progress_bar is not None:
@@ -390,7 +390,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if self.eq_norms:
             fit.p.equalize_norms_(value=self.eq_norms)
         if self.fidel_:
-            fidelity = fidel_mps(tn, fit.p)
+            fidelity = tn_fidelity(tn, fit.p)
             self.fidel.append(fidelity)
 
         previous = fit.p

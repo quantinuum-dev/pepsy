@@ -8,11 +8,11 @@ from dataclasses import dataclass
 
 from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
-from .core import get_default_array_backend
 
 
 _TAG_X = re.compile(r"^X\d+$")
 _TAG_Y = re.compile(r"^Y\d+$")
+_TAG_I = re.compile(r"^I\d+(?:,\d+)*$")
 _PHYS_OUTER = re.compile(r"^k\d+(?:,\d+)*$")
 
 __all__ = [
@@ -35,11 +35,17 @@ class BoundaryContractResult:
 
 
 def _validate_tensor_network_tags(p):
-    """Ensure PEPS lattice tags are present for shape inference."""
+    """Ensure PEPS lattice/site tags are present for shape inference."""
     tags = set(getattr(p, "tags", ()))
+    has_x = any(isinstance(tag, str) and _TAG_X.fullmatch(tag) for tag in tags)
+    has_y = any(isinstance(tag, str) and _TAG_Y.fullmatch(tag) for tag in tags)
+    has_i = any(isinstance(tag, str) and _TAG_I.fullmatch(tag) for tag in tags)
 
-    if not any(_TAG_X.match(tag) for tag in tags) or not any(_TAG_Y.match(tag) for tag in tags):
-        raise ValueError("Input network must contain X* and Y* lattice tags.")
+    if not (has_x and has_y and has_i):
+        raise ValueError(
+            "Input network must contain X*, Y*, and I* tags "
+            "(I<int>[,<int>...])."
+        )
 
 
 def _normalize_retag_for_direction(direction, re_tag):
@@ -62,6 +68,21 @@ def _warn_nonstandard_physical_outer_inds(tn, role):
             f"Found non-matching indices: {sample}",
             stacklevel=3,
         )
+
+
+def _to_python_scalar(value):
+    """Convert backend scalar-like objects (torch/jax/numpy) to python scalar."""
+    obj = value
+    if hasattr(obj, "detach"):
+        obj = obj.detach()
+    if hasattr(obj, "cpu"):
+        obj = obj.cpu()
+    if hasattr(obj, "item") and not isinstance(obj, (int, float, complex, bool)):
+        try:
+            obj = obj.item()
+        except (ValueError, RuntimeError):  # backend-specific .item() failures
+            pass
+    return obj
 
 
 
@@ -102,7 +123,7 @@ def prepare_boundary_inputs(
 
     ket_tagged = ket
     auto_bra = bra is None
-    bra_tagged = ket.copy().conj() if auto_bra else bra.copy().conj()
+    bra_tagged = ket.conj() if auto_bra else bra.conj()
 
     if auto_bra:
         shared_inner = set(ket_tagged.inner_inds()) & set(bra_tagged.inner_inds())
@@ -244,7 +265,6 @@ def normalize(
     fidel_=False,
     dmrg_run="eff",
     single_layer=False,
-    to_backend=None,
 ):
     """Normalize a PEPS state with boundary contraction.
 
@@ -277,9 +297,6 @@ def normalize(
         Boundary fitting backend mode.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary_states.BdyMPS`.
-    to_backend : callable | None, default=None
-        Optional array caster applied to the double-layer norm network. If
-        ``None``, uses :func:`pepsy.core.get_default_array_backend` when set.
 
     Returns
     -------
@@ -296,9 +313,6 @@ def normalize(
         raise ValueError("p must not be None.")
 
     ket_tagged, norm_tagged = prepare_boundary_inputs(ket=p, bra=None)
-    backend = to_backend if to_backend is not None else get_default_array_backend()
-    if backend is not None:
-        norm_tagged.apply_to_arrays(backend)
 
     if bdy is None:
         if chi is None:
@@ -308,7 +322,6 @@ def normalize(
             tn_double=norm_tagged,
             chi=chi,
             single_layer=single_layer,
-            to_backend=backend,
         )
     elif not hasattr(bdy, "mps_b"):
         raise TypeError("bdy must expose attribute 'mps_b'.")
@@ -325,15 +338,13 @@ def normalize(
         fidel_=fidel_,
     )
     cost = result.cost
-    try:
-        cost_scalar = complex(cost)
-    except TypeError:
-        cost_scalar = cost
 
-    if abs(cost_scalar) == 0:
+
+    if abs(cost) == 0:
         raise ZeroDivisionError("Boundary norm cost is zero; cannot normalize state.")
+    cost_scalar = complex(_to_python_scalar(cost))
     return {
-        "state": ket_tagged / (cost_scalar**0.5),
+        "state": ket_tagged / (cost**0.5),
         "cost": cost,
         "cost_scalar": cost_scalar,
         "bdy": bdy,

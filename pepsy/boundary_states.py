@@ -8,18 +8,15 @@ import warnings
 import numpy as np
 import quimb.tensor as qtn
 
-from .core import get_default_array_backend
+from .core import backend_numpy, get_default_array_backend
+import autoray as ar
 
 logger = logging.getLogger(__name__)
 
 
 def make_numpy_array_caster(dtype=np.float64):
     """Return a callable that casts arrays to a target NumPy dtype."""
-
-    def to_backend(x, dtype=dtype):
-        return np.array(x, dtype=dtype)
-
-    return to_backend
+    return backend_numpy(dtype=dtype)
 
 
 class BdyMPS:
@@ -48,9 +45,6 @@ class BdyMPS:
     flat : bool
         If ``True``, initialize the first boundary slice directly from a
         flattened tensor network.
-    to_backend : callable | None
-        Function applied to tensor arrays before storage. If ``None``, uses
-        :func:`pepsy.core.get_default_array_backend` when set, otherwise identity.
     seed : int
         Random seed used during boundary randomization.
     single_layer : bool
@@ -61,6 +55,25 @@ class BdyMPS:
     mps_b : dict[str, qtn.MatrixProductState]
         Boundary map keyed by cut tags such as ``Y0_l`` and ``X2_r``.
     """
+    _NUMPY_DTYPE_MAP = {
+        "complex128": np.complex128,
+        "complex64": np.complex64,
+        "float64": np.float64,
+        "float32": np.float32,
+        "float16": np.float16,
+        "int64": np.int64,
+        "int32": np.int32,
+    }
+    _JAX_DTYPE_MAP = {
+        "complex128": None,
+        "complex64": None,
+        "float64": None,
+        "float32": None,
+        "float16": None,
+        "int64": None,
+        "int32": None,
+    }
+
     # (side, site_tag_id, cut_tag_id) sweep definitions used to prebuild boundaries.
     _SWEEP_SPECS = (
         ("left", "X{}", "Y{}"),
@@ -75,33 +88,44 @@ class BdyMPS:
         tn_double=None,
         chi=8,
         flat=False,
-        to_backend=None,
         seed=1,
         single_layer=False,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
         if chi < 1:
             raise ValueError("chi must be >= 1")
-        if to_backend is not None and not callable(to_backend):
-            raise TypeError("to_backend must be callable or None")
 
-        self.seed = seed
-        self._chi_target = int(chi)
-        self.flat = flat
-        backend = to_backend if to_backend is not None else get_default_array_backend()
-        self.to_backend = (lambda x: x) if backend is None else backend
-        self.numpy_backend = make_numpy_array_caster(dtype="complex128")
-
-        tn_ref = None
         if flat:
             if tn_flat is None:
                 raise ValueError("tn_flat is required when flat=True")
             self._tn_norm = tn_flat.copy()
             tn_ref = tn_flat
+            backend_source = tn_flat
         else:
             if tn_double is None:
                 raise ValueError("tn_double is required when flat=False")
             self._tn_norm = tn_double.copy()
             tn_ref = tn_flat if tn_flat is not None else tn_double
+            backend_source = tn_double
+
+        self.seed = seed
+        self._chi_target = int(chi)
+        self.flat = flat
+
+        backend_data = self._resolve_backend_source(backend_source)
+        backend, dtype_name = self._infer_backend_and_dtype(backend_data)
+
+        self.array_backend = self._dispatch_backend_converter(
+            backend=backend,
+            dtype_name=dtype_name,
+            sample_data=backend_data,
+        )
+        default_array_backend = get_default_array_backend()
+        if default_array_backend is not None:
+            self.array_backend = default_array_backend
+        # Backward-compatible alias used by older tests/callers.
+        self.to_backend = self.array_backend
+
+        self.numpy_backend = make_numpy_array_caster(dtype=dtype_name)
 
         # Validate that lattice dimensions can be resolved early.
         self._infer_lattice_shape(tn_ref, self._tn_norm)
@@ -119,19 +143,127 @@ class BdyMPS:
 
     def _initialize_all_boundaries(self, single_layer):
         """Build all configured boundary environments for this instance."""
-        initializer = (
-            self._initialize_single_layer_boundaries
-            if single_layer
-            else self._initialize_multi_layer_boundaries
-        )
         boundaries = {}
         for side, site_tag_id, cut_tag_id in self._SWEEP_SPECS:
-            boundaries |= initializer(
-                side=side,
-                site_tag_id=site_tag_id,
-                cut_tag_id=cut_tag_id,
-            )
+            if single_layer:
+                update = self._initialize_single_layer_boundaries(
+                    side=side,
+                    site_tag_id=site_tag_id,
+                    cut_tag_id=cut_tag_id,
+                )
+            else:
+                update = self._initialize_multi_layer_boundaries(
+                    side=side,
+                    site_tag_id=site_tag_id,
+                    cut_tag_id=cut_tag_id,
+                )
+            boundaries |= update
         return boundaries
+
+    @staticmethod
+    def _resolve_backend_source(network):
+        """Pick a tensor array from which backend metadata can be inferred."""
+        return next((t.data for t in network), None)
+
+    @staticmethod
+    def _infer_backend_and_dtype(sample_data):
+        """Infer backend and dtype from a representative tensor array."""
+        dtype_name = ar.get_dtype_name(sample_data)
+        backend = ar.infer_backend(sample_data)
+        return backend, dtype_name
+
+    @staticmethod
+    def _build_to_numpy(sample_data, dtype_name):
+        if dtype_name not in BdyMPS._NUMPY_DTYPE_MAP:
+            raise ValueError(f"Unsupported dtype '{dtype_name}' for numpy backend.")
+        dtype = BdyMPS._NUMPY_DTYPE_MAP[dtype_name]
+
+        def _to_numpy(x, dtype=dtype):
+            arr = np.asarray(x)
+            if np.issubdtype(dtype, np.floating) and np.iscomplexobj(arr):
+                arr = arr.real
+            return np.asarray(arr, dtype=dtype)
+
+        return _to_numpy
+
+    @staticmethod
+    def _build_to_jax(sample_data, dtype_name):
+        import jax.numpy as jnp
+
+        dtype_map = BdyMPS._JAX_DTYPE_MAP.copy()
+        dtype_map.update(
+            {
+                "complex128": jnp.complex128,
+                "complex64": jnp.complex64,
+                "float64": jnp.float64,
+                "float32": jnp.float32,
+                "float16": jnp.float16,
+                "int64": jnp.int64,
+                "int32": jnp.int32,
+            }
+        )
+        if dtype_name not in dtype_map:
+            raise ValueError(f"Unsupported dtype '{dtype_name}' for jax backend.")
+        return (
+            lambda x, dtype=dtype_map[dtype_name]: jnp.asarray(
+                jnp.asarray(x).real
+                if (jnp.issubdtype(dtype, jnp.floating) and jnp.iscomplexobj(x))
+                else jnp.asarray(x),
+                dtype=dtype,
+            )
+        )
+
+    @staticmethod
+    def _build_to_torch(sample_data, dtype_name):
+        import torch
+
+        dtype_map = {
+            "complex128": torch.complex128,
+            "complex64": torch.complex64,
+            "float64": torch.float64,
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "int64": torch.int64,
+            "int32": torch.int32,
+        }
+        if dtype_name not in dtype_map:
+            raise ValueError(f"Unsupported dtype '{dtype_name}' for torch backend.")
+        dtype = dtype_map[dtype_name]
+        device = getattr(sample_data, "device", None)
+        if device is not None:
+            return (
+                lambda x, dtype=dtype, device=device: torch.as_tensor(
+                    torch.as_tensor(x, device=device).real
+                    if (dtype.is_floating_point and torch.is_complex(torch.as_tensor(x, device=device)))
+                    else torch.as_tensor(x, device=device),
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+        return (
+            lambda x, dtype=dtype: torch.as_tensor(
+                torch.as_tensor(x).real
+                if (dtype.is_floating_point and torch.is_complex(torch.as_tensor(x)))
+                else torch.as_tensor(x),
+                dtype=dtype,
+            )
+        )
+
+    def _dispatch_backend_converter(self, backend, dtype_name, sample_data):
+        """Return a conversion callable for the detected backend."""
+        if sample_data is None:
+            raise ValueError(
+                "Cannot infer backend: tensor network has no tensors."
+            )
+
+        if backend == "numpy":
+            return self._build_to_numpy(sample_data, dtype_name)
+        if backend == "jax":
+            return self._build_to_jax(sample_data, dtype_name)
+        if backend == "torch":
+            return self._build_to_torch(sample_data, dtype_name)
+
+        raise ValueError(f"Unsupported backend: {backend}")
 
     @property
     def ly(self):
@@ -787,7 +919,7 @@ class BdyMPS:
     def _prepare_boundary_mps(self, mps):
         mps.apply_to_arrays(self.numpy_backend)
         mps.randomize(seed=self.seed, inplace=True)
-        mps.apply_to_arrays(self.to_backend)
+        mps.apply_to_arrays(self.array_backend)
         mps.compress("left", max_bond=self._chi_target)
         mps.normalize()
         return mps
@@ -806,7 +938,7 @@ class BdyMPS:
     def _flat_first_step_boundary(self, network, site_tag_id):
         """Build first-step boundary directly from a flat slice."""
         self._view_as_mps_from_outer_inds(network, site_tag_id)
-        network.apply_to_arrays(self.to_backend)
+        network.apply_to_arrays(self.array_backend)
         return network
 
     @staticmethod
