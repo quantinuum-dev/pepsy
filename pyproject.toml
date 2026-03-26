@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pepsy"
-dynamic = ["version"]
+version = "0.1.0"
 description = "Boundary-MPS tools for PEPS norm contraction and DMRG fitting"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,12 +30,6 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pepsy*"]
-
-[tool.setuptools.dynamic]
-version = { attr = "pepsy.version.__version__" }
-
-[tool.setuptools.package-data]
-pepsy = ["VERSION"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

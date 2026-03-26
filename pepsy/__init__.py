@@ -1,9 +1,10 @@
 """Pepsy boundary-contraction library package."""
 
 from importlib import import_module
+from importlib.metadata import version as _pkg_version
 from typing import TYPE_CHECKING
 
-from .version import __version__
+__version__ = _pkg_version("pepsy")
 
 if TYPE_CHECKING:
     from . import (

@@ -343,8 +343,11 @@ def normalize(
     if abs(cost) == 0:
         raise ZeroDivisionError("Boundary norm cost is zero; cannot normalize state.")
     cost_scalar = complex(_to_python_scalar(cost))
+
+    ket_tagged = ket_tagged / (cost**0.5)
+    ket_tagged.balance_bonds_()
     return {
-        "state": ket_tagged / (cost**0.5),
+        "state": ket_tagged,
         "cost": cost,
         "cost_scalar": cost_scalar,
         "bdy": bdy,

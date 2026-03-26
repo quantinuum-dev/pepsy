@@ -14,10 +14,10 @@ os.environ.setdefault("PYTHONPYCACHEPREFIX", "/tmp")
 project = "pepsy"
 author = "pepsy contributors"
 
-from pepsy.version import __version__  # noqa: E402
+from importlib.metadata import version as _pkg_version  # noqa: E402
 
-release = __version__
-version = __version__
+release = _pkg_version("pepsy")
+version = release
 
 extensions = [
     "sphinx.ext.autodoc",

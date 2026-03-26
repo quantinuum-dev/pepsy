@@ -35,7 +35,7 @@ def test_torch_adam_solver_reduces_quadratic():
         params_init,
         _loss_quadratic,
         solver="adam",
-        lr=0.2,
+        solver_options={"lr": 0.2},
         n_steps=30,
         log_every=10,
     )
@@ -51,9 +51,8 @@ def test_torch_lbfgs_solver_reduces_quadratic():
         params_init,
         _loss_quadratic,
         solver="lbfgs",
-        lr=1.0,
         n_steps=20,
-        solver_options={"max_iter": 1, "history_size": 10},
+        solver_options={"lr": 1.0, "max_iter": 1, "history_size": 10},
         log_every=10,
     )
     assert len(history) == 20
@@ -69,7 +68,7 @@ def test_torch_solvers_handle_complex128_params():
         params_init,
         _loss_complex_target,
         solver="adam",
-        lr=0.2,
+        solver_options={"lr": 0.2},
         n_steps=40,
         log_every=10,
     )
@@ -80,9 +79,8 @@ def test_torch_solvers_handle_complex128_params():
         params_init,
         _loss_complex_target,
         solver="lbfgs",
-        lr=1.0,
         n_steps=30,
-        solver_options={"max_iter": 1, "history_size": 10},
+        solver_options={"lr": 1.0, "max_iter": 1, "history_size": 10},
         log_every=10,
     )
     assert history_lbfgs[-1] < history_lbfgs[0]
@@ -96,10 +94,10 @@ def test_torch_solver_accepts_common_controls():
         params_init,
         _loss_quadratic,
         solver="adam",
-        lr=0.1,
         n_steps=10,
         log_every=5,
         solver_options={
+            "lr": 0.1,
             "its_max": 15,
             "patience": 5,
             "min_steps": 2,
@@ -116,14 +114,13 @@ def test_torch_solver_accepts_common_controls():
     assert abs(float(params_opt["x"].detach().item())) < 2.0
 
 
-def test_solver_options_lr_overrides_top_level_lr_for_torch_solver():
-    """solver_options['lr'] should take precedence over top-level lr."""
+def test_solver_options_lr_overrides_default():
+    """solver_options['lr'] should override the default lr."""
     params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
     params_opt, history = optimize_packed_params(
         params_init,
         _loss_quadratic,
         solver="adam",
-        lr=1.0,
         n_steps=5,
         log_every=2,
         solver_options={"lr": 1e-6},
@@ -157,7 +154,7 @@ def test_torch_solver_preserves_trainable_input_dtype(input_value, expected_dtyp
         {key: input_value},
         loss_fn,
         solver="adam",
-        lr=0.1,
+        solver_options={"lr": 0.1},
         n_steps=5,
         log_every=2,
     )
@@ -171,7 +168,7 @@ def test_integer_input_is_promoted_to_float64():
         {"x": np.array([2], dtype=np.int64)},
         _loss_quadratic,
         solver="adam",
-        lr=0.1,
+        solver_options={"lr": 0.1},
         n_steps=5,
         log_every=2,
     )
@@ -193,23 +190,13 @@ def test_returns_best_params_not_last_for_non_monotonic_trajectory():
         params_init,
         _loss_quadratic,
         solver="sgd",
-        lr=1.8,
+        solver_options={"lr": 1.8},
         n_steps=4,
         log_every=2,
     )
     returned_loss = float(_loss_quadratic(params_opt).detach().item())
     assert abs(returned_loss - min(history)) < 1e-10
     assert returned_loss <= history[-1]
-
-
-def test_merge_solver_options_enforces_adam_compatibility():
-    """Legacy Adam options should only be accepted with solver='adam'."""
-    with pytest.raises(ValueError, match="solver='adam'"):
-        PEPSSweepOptimizer._merge_solver_options(  # pylint: disable=protected-access
-            solver="lbfgs",
-            solver_options=None,
-            adam_options={"betas": (0.9, 0.999)},
-        )
 
 
 def test_resolve_user_solver_maps_lbfgs_to_scipy_with_warning():

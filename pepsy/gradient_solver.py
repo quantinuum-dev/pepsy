@@ -1064,14 +1064,22 @@ def optimize_packed_params(
     *,
     solver: str = "adam",
     solver_options: Mapping[str, Any] | None = None,
-    lr: float = 1e-2,
     n_steps: int = 100,
     log_every: int = 20,
-    show_opt_progress: bool = False,
+    pbar: bool = False,
     opt_desc: str | None = None,
     progress_callback: Callable[[int, float], None] | None = None,
 ):
-    """Optimize packed tensor params with a selected gradient solver."""
+    """Optimize packed tensor params with a selected gradient solver.
+
+    Parameters
+    ----------
+    solver_options : dict | None
+        Backend-specific options. Common keys:
+
+        - ``lr`` (float, default 1e-2): learning rate for torch solvers.
+        - ``patience``, ``min_steps``, ``restore_best``, …
+    """
     if n_steps <= 0:
         raise ValueError("n_steps must be >= 1")
     if log_every <= 0:
@@ -1082,9 +1090,8 @@ def optimize_packed_params(
         options = dict(solver_options)
     else:
         raise TypeError("solver_options must be a mapping or None")
-    if "lr" in options:
-        lr = float(options.pop("lr"))
-    if not np.isfinite(float(lr)) or float(lr) <= 0.0:
+    lr = float(options.pop("lr", 1e-2))
+    if not np.isfinite(lr) or lr <= 0.0:
         raise ValueError("lr must be finite and > 0")
 
     solver_name = _normalize_solver_name(solver)
@@ -1098,7 +1105,7 @@ def optimize_packed_params(
             solver_options=options,
             n_steps=n_steps,
             log_every=log_every,
-            show_opt_progress=show_opt_progress,
+            show_opt_progress=pbar,
             opt_desc=opt_desc,
             progress_callback=progress_callback,
         )
@@ -1112,7 +1119,7 @@ def optimize_packed_params(
             solver_options=options,
             n_steps=n_steps,
             log_every=log_every,
-            show_opt_progress=show_opt_progress,
+            show_opt_progress=pbar,
             opt_desc=opt_desc,
             progress_callback=progress_callback,
         )
@@ -1124,7 +1131,7 @@ def optimize_packed_params(
             solver_options=options,
             n_steps=n_steps,
             log_every=log_every,
-            show_opt_progress=show_opt_progress,
+            show_opt_progress=pbar,
             opt_desc=opt_desc,
             progress_callback=progress_callback,
         )
@@ -1136,7 +1143,7 @@ def optimize_packed_params(
             solver_options=options,
             n_steps=n_steps,
             log_every=log_every,
-            show_opt_progress=show_opt_progress,
+            show_opt_progress=pbar,
             opt_desc=opt_desc,
             progress_callback=progress_callback,
         )
