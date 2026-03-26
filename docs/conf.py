@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 
 # Avoid numba cache-path issues when importing quimb-dependent modules in docs builds.
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp")

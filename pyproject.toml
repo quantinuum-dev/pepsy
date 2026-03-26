@@ -27,8 +27,11 @@ dev = ["pytest", "nbclient", "nbconvert"]
 [tool.setuptools]
 include-package-data = true
 
+[tool.setuptools.package-dir]
+"" = "src"
+
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["pepsy*"]
 
 [tool.pytest.ini_options]
