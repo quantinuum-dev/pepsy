@@ -52,7 +52,7 @@ jobs:
       - name: Capture package version
         id: meta
         run: |
-          VERSION=$(python -c "import pepsy; print(pepsy.__version__)")
+          VERSION=$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifacts
