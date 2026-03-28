@@ -2,15 +2,16 @@
 
 <img src="assets/pepsy-icon.svg" alt="pepsy icon" width="220" />
 
-`pepsy` is a Python package for Circuit Simulaiton and related DMRG fitting workflows.
+`pepsy` is a Python package for circuit simulation and related DMRG fitting workflows.
 
-Current package version: `0.1.0` (from `pepsy/VERSION`).
+Current package version: `0.1.1` (from `pyproject.toml` / `pepsy.__version__`).
 
 ## Package Layout
-- `pepsy/`: installable library code
+- `src/pepsy/`: installable library code
   - `boundary_states.py`: boundary state initialization (`BdyMPS`)
   - `boundary_sweeps.py`: sweep/contraction runner (`CompBdy`)
   - `boundary_norm.py`: input preparation + contraction (`prepare_boundary_inputs`, `ContractBoundary`)
+  - `optimize_sweep.py`, `optimize_global.py`, `gate.py`, `gradient_solver.py`, `debug.py`
   - `dmrg_fit.py`, `core.py`, `linalg_registrations.py`
 - `example/`: example notebooks
 - `docs/`: Sphinx documentation source
@@ -23,8 +24,9 @@ source .venv/bin/activate
 pip install -e .
 # Optional backends:
 # pip install -e .[torch]
-# pip install -e .[jax]
 # pip install -e .[solvers]
+# Optional plotting helpers:
+# pip install -e .[viz]
 ```
 
 ## Quick Usage

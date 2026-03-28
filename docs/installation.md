@@ -10,7 +10,8 @@ Optional extras:
 
 ```bash
 pip install -e .[torch]
-pip install -e .[jax]
+pip install -e .[solvers]
+pip install -e .[viz]
 pip install -e .[docs]
 ```
 

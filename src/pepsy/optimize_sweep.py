@@ -72,6 +72,38 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.equalize_norms = equalize_norms
 
         self.Lx, self.Ly = self._infer_shape(self.state)
+        self._last_axis_runs = None
+        self._last_sweep_result = None
+
+    _PLOT_METRIC_ALIASES = {
+        "loss": "loss",
+        "global_loss": "loss",
+        "fidelity": "fidelity",
+        "global_fidelity": "fidelity",
+        "norm_peps": "state_norm",
+        "state_norm": "state_norm",
+        "norm_state": "state_norm",
+        "bdy_norm": "bdy_norm",
+        "boundary_norm": "bdy_norm",
+        "bdy_overlap_norm": "bdy_overlap_norm",
+        "boundary_overlap_norm": "bdy_overlap_norm",
+        "bdy_overlap": "bdy_overlap_norm",
+        "time_boundary": "time_boundary",
+        "boundary_time": "time_boundary",
+        "time_optimize": "time_optimize",
+        "optimize_time": "time_optimize",
+        "time_total": "time_total",
+        "timing": "time_total",
+    }
+    _PLOT_LOG_METRICS = frozenset({
+        "loss",
+        "state_norm",
+        "bdy_norm",
+        "bdy_overlap_norm",
+        "time_boundary",
+        "time_optimize",
+        "time_total",
+    })
 
     @staticmethod
     def _infer_shape(state):
@@ -97,6 +129,183 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         fidelity = (abs(overlap) ** 2) / (norm_state * norm_target)
         loss = 1.0 - fidelity
         return float(fidelity.real), float(loss.real)
+
+    @classmethod
+    def available_plot_metrics(cls):
+        """Return supported metric names for :meth:`plot_runs`."""
+        return tuple(
+            key for key in cls._PLOT_METRIC_ALIASES
+            if key == cls._PLOT_METRIC_ALIASES[key]
+        )
+
+    @classmethod
+    def _normalize_plot_metric(cls, name):
+        key = str(name).strip().lower()
+        if key not in cls._PLOT_METRIC_ALIASES:
+            supported = ", ".join(cls.available_plot_metrics())
+            raise ValueError(f"Unsupported metric {name!r}. Choose from: {supported}")
+        return cls._PLOT_METRIC_ALIASES[key]
+
+    @staticmethod
+    def _metric_value(run_info, metric):
+        if metric == "loss":
+            val = run_info.get("global_loss_after")
+            return run_info.get("loss_final") if val is None else val
+        if metric == "fidelity":
+            val = run_info.get("global_fidelity_after")
+            if val is not None:
+                return val
+            loss_final = run_info.get("loss_final")
+            return None if loss_final is None else (1.0 - float(loss_final))
+        if metric == "state_norm":
+            return run_info.get("state_norm")
+        if metric == "bdy_norm":
+            return run_info.get("bdy_norm_norm")
+        if metric == "bdy_overlap_norm":
+            return run_info.get("bdy_norm_overlap")
+        if metric == "time_boundary":
+            return run_info.get("time_boundary")
+        if metric == "time_optimize":
+            return run_info.get("time_optimize")
+        if metric == "time_total":
+            t_bdy = float(run_info.get("time_boundary", 0.0))
+            t_opt = float(run_info.get("time_optimize", 0.0))
+            return t_bdy + t_opt
+        raise RuntimeError(f"Unhandled metric {metric!r}")
+
+    @classmethod
+    def plot_runs(
+        cls,
+        runs,
+        *,
+        metrics=("loss",),
+        log_scale="auto",
+        cumulative=False,
+        show=True,
+        title="PEPS Sweep Metrics",
+        figsize=None,
+    ):
+        """Plot selected run metrics versus sweep iteration.
+
+        Parameters
+        ----------
+        runs : list[dict[str, Any]]
+            Sweep run records returned by :meth:`optimize_axis` or
+            stored in :class:`SweepResult.runs`.
+        metrics : str | sequence[str], default=("loss",)
+            Metric name(s) to plot. Supported values:
+            ``loss``, ``fidelity``, ``state_norm``, ``bdy_norm``,
+            ``bdy_overlap_norm``, ``time_boundary``, ``time_optimize``,
+            ``time_total``. Common aliases like ``norm_peps`` and
+            ``timing`` are also accepted.
+        log_scale : {"auto", bool}, default="auto"
+            Y-axis scaling policy. ``"auto"`` uses log scale for most
+            non-fidelity metrics (loss/norms/timing). ``True`` forces
+            log scale for all metrics, ``False`` keeps all linear.
+        cumulative : bool, default=False
+            If ``True``, plot cumulative sums (useful for timing metrics).
+        show : bool, default=True
+            Call ``matplotlib.pyplot.show()``.
+        title : str, default="PEPS Sweep Metrics"
+            Figure title.
+        figsize : tuple[float, float] | None, default=None
+            Optional figure size passed to ``plt.subplots``.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axes)`` from matplotlib.
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        if not runs:
+            raise ValueError("No runs to plot.")
+
+        if isinstance(metrics, str):
+            metrics = [metrics]
+        metrics = [cls._normalize_plot_metric(name) for name in metrics]
+
+        n_metrics = len(metrics)
+        if n_metrics == 0:
+            raise ValueError("Provide at least one metric name.")
+
+        if figsize is None:
+            figsize = (8.0, max(3.0, 2.8 * n_metrics))
+        fig, axes = plt.subplots(n_metrics, 1, figsize=figsize, dpi=120, squeeze=False)
+        axes = axes.ravel()
+
+        steps = np.arange(1, len(runs) + 1, dtype=int)
+        for ax, metric in zip(axes, metrics):
+            values = []
+            for r in runs:
+                value = cls._metric_value(r, metric)
+                values.append(np.nan if value is None else float(value))
+            y = np.array(values, dtype=float)
+            if cumulative:
+                y = np.nancumsum(y)
+
+            if log_scale == "auto":
+                use_log = metric in cls._PLOT_LOG_METRICS
+            elif isinstance(log_scale, bool):
+                use_log = log_scale
+            else:
+                raise ValueError("log_scale must be 'auto', True, or False.")
+
+            y_plot = y
+            if use_log:
+                y_plot = np.where(y > 0.0, y, np.nan)
+                ax.semilogy(steps, y_plot, marker="o", markersize=3.5, linewidth=1.4, alpha=0.9)
+            else:
+                ax.plot(steps, y_plot, marker="o", markersize=3.5, linewidth=1.4, alpha=0.9)
+
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel(metric)
+            ax.grid(alpha=0.2, linewidth=0.6)
+            if np.all(np.isnan(y_plot)):
+                warnings.warn(
+                    f"No data for metric '{metric}'. Try running with debug=True.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        fig.suptitle(title, fontsize=13, fontweight="bold")
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
+        if show:
+            plt.show()
+        return fig, axes
+
+    def plot(
+        self,
+        sweep_result=None,
+        *,
+        runs=None,
+        metrics=("loss",),
+        log_scale="auto",
+        cumulative=False,
+        show=True,
+        title="PEPS Sweep Metrics",
+        figsize=None,
+    ):
+        """Plot metrics from provided runs, a sweep result, or latest run."""
+        chosen_runs = runs
+        if chosen_runs is None and sweep_result is not None:
+            chosen_runs = sweep_result.runs
+        if chosen_runs is None and self._last_sweep_result is not None:
+            chosen_runs = self._last_sweep_result.runs
+        if chosen_runs is None:
+            chosen_runs = self._last_axis_runs
+        if chosen_runs is None:
+            raise ValueError("No runs available. Pass `runs`/`sweep_result` or run optimizer first.")
+        return self.plot_runs(
+            chosen_runs,
+            metrics=metrics,
+            log_scale=log_scale,
+            cumulative=cumulative,
+            show=show,
+            title=title,
+            figsize=figsize,
+        )
 
     @staticmethod
     def format_runs_table(runs):
@@ -241,7 +450,10 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
     def _apply_slice_update(self, index, params_opt, skeleton, axis):
         tn_opt = qtn.unpack(params_opt, skeleton)
         tn_opt.balance_bonds_()
-        tn_opt.equalize_norms_(self.equalize_norms)
+
+        if self.equalize_norms:
+            tn_opt.equalize_norms_(self.equalize_norms)
+
         for tag in self._site_tensor_tags(axis, index):
             self.state[tag].modify(data=tn_opt[tag].data)
         return tn_opt
@@ -327,7 +539,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         solver="adam",
         solver_options=None,
-        store_history=False,
         debug=False,
     ):
         axis_tag = self._axis_tag(axis)
@@ -363,7 +574,7 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             )
             overlap_val = abs(overlap_net.contract(all, optimize=self.opt)) ** 2
             norm_val = abs(norm_net.contract(all, optimize=self.opt))
-            return 1 - (overlap_val / norm_val)
+            return 1 - (overlap_val / (norm_val + 1e-12)).clamp(max=1.0)
 
         initial_loss = float(loss_fn(params_init))
         params_opt, history = self._optimize_packed_params(
@@ -373,7 +584,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             solver_options=solver_options,
         )
         final_loss = float(loss_fn(params_opt).detach().cpu())
-
         params_opt = {k: v.detach().clone() for k, v in params_opt.items()}
         self._apply_slice_update(index, params_opt, skeleton, axis)
 
@@ -400,11 +610,11 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 run_info["bdy_norm_overlap"] = float(complex(self.bdy_overlap.norm).real)
             except (ValueError, AttributeError):
                 pass
-        run_info["history"] = history if store_history else [initial_loss, final_loss]
+        run_info["history"] = history if debug else [initial_loss, final_loss]
 
         return run_info
 
-    def _run_axis_half_sweep(
+    def _run_axis_half_sweep(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         indices,
         *,
@@ -414,11 +624,11 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver="adam",
         solver_options=None,
         env_n_iter=4,
-        store_history=False,
         run_callback=None,
         fidel_=False,
         debug=False,
     ):
+        """Run a single forward or backward half-sweep over *indices*."""
         runs = []
         comp_norm = None
         comp_overlap = None
@@ -450,7 +660,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 axis=axis,
                 solver=solver,
                 solver_options=solver_options,
-                store_history=store_history,
                 debug=debug,
             )
             t_opt = time.perf_counter() - t0
@@ -474,7 +683,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver="adam",
         solver_options=None,
         env_n_iter=4,
-        store_history=False,
         run_callback=None,
         fidel_=False,
         debug=False,
@@ -494,6 +702,8 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         resolved_solver = self._resolve_user_solver(solver)
         all_runs = []
 
+        self.bdy.normalize()
+        self.bdy_overlap.normalize()
         if renormalize:
             self._normalize_state(env_n_iter)
 
@@ -504,7 +714,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             solver=resolved_solver,
             solver_options=solver_options,
             env_n_iter=env_n_iter,
-            store_history=store_history,
             run_callback=run_callback,
             fidel_=fidel_,
             debug=debug,
@@ -519,10 +728,7 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         )
 
-        for trip in range(n_round_trips):
-            if renormalize:
-                self._normalize_state(env_n_iter)
-
+        for _trip in range(n_round_trips):
             all_runs.extend(
                 self._run_axis_half_sweep(
                     range(n - 2, -1, -1),
@@ -541,6 +747,7 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             )
 
+        self._last_axis_runs = list(all_runs)
         return all_runs
 
     def optimize_global(
@@ -553,7 +760,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver_options=None,
         env_n_iter=4,
         pbar=True,
-        store_history=False,
         debug=False,
         renormalize=False,
     ):
@@ -576,14 +782,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         all_runs = []
         axis_seq = list(axes)
 
-        def _current_chi():
-            values = []
-            for obj in (self.bdy, self.bdy_overlap):
-                chi_val = getattr(obj, "chi", None)
-                if chi_val is not None:
-                    values.append(int(chi_val))
-            return max(values) if values else None
-
         def _steps_for_axis(axis_name):
             n = self._axis_n(axis_name)
             return n + (2 * n_round_trips * max(n - 1, 0))
@@ -596,7 +794,8 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 desc="bdy_dmrg:",
                 leave=True,
                 position=0,
-                colour="CYAN",
+                bar_format="{l_bar}{bar:30}{r_bar}",
+                colour="magenta",
                 disable=not pbar,
             )
 
@@ -611,15 +810,12 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     loss_final = run_info.get("loss_final")
                     if loss_final is not None:
                         postfix["loss"] = f"{float(loss_final):.6f}"
-                    chi_now = _current_chi()
-                    if chi_now is not None:
-                        postfix["chi"] = chi_now
-                    sweep_name = run_info.get("sweep")
                     axis_name = run_info.get("axis")
-                    if sweep_name is not None:
-                        postfix["dir"] = (
-                            f"{axis_name}_{sweep_name}" if axis_name is not None else sweep_name
-                        )
+                    sweep_name = run_info.get("sweep")
+                    index = run_info.get("index")
+                    if axis_name is not None and sweep_name is not None and index is not None:
+                        short = "fwd" if sweep_name == "forward" else "bwd"
+                        postfix["slice"] = f"{axis_name}_{short}_{index}"
                     global_progress.set_postfix(postfix)
 
                 all_runs.extend(
@@ -629,7 +825,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                         solver=solver,
                         solver_options=solver_options,
                         env_n_iter=env_n_iter,
-                        store_history=store_history,
                         run_callback=_on_run,
                         fidel_=debug,
                         debug=debug,
@@ -640,14 +835,20 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if global_progress is not None:
             global_progress.close()
 
+        if renormalize:
+            self._normalize_state(env_n_iter=env_n_iter)
+
         if debug:
             fid_after, loss_after = self.metrics()
         else:
             fid_after, loss_after = None, None
-        return SweepResult(
+        result = SweepResult(
             runs=all_runs,
             fidelity_before=fid_before,
             fidelity_after=fid_after,
             loss_before=loss_before,
             loss_after=loss_after,
         )
+        self._last_axis_runs = list(all_runs)
+        self._last_sweep_result = result
+        return result

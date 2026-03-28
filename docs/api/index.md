@@ -10,4 +10,9 @@ boundary_states
 boundary_sweeps
 core
 dmrg_fit
+gate
+optimize_sweep
+optimize_global
+gradient_solver
+debug
 ```

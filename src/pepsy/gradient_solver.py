@@ -217,17 +217,39 @@ def _as_numpy_vector(values: Any, size: int, *, key: str) -> np.ndarray:
     return arr
 
 
-def _normalize_lbfgs_name(name: Any, *, key: str) -> str:
+_SCIPY_METHOD_MAP: dict[str, str] = {
+    # L-BFGS-B aliases
+    "L_BFGS_B": "L-BFGS-B",
+    "L_BFGS": "L-BFGS-B",
+    "LBFGS": "L-BFGS-B",
+    "LD_LBFGS": "L-BFGS-B",
+    # Other gradient-based methods
+    "CG": "CG",
+    "BFGS": "BFGS",
+    "TNC": "TNC",
+    "SLSQP": "SLSQP",
+    "TRUST_CONSTR": "trust-constr",
+    "TRUST_KRYLOV": "trust-krylov",
+    "NEWTON_CG": "Newton-CG",
+}
+
+_SCIPY_BOUNDS_METHODS: frozenset[str] = frozenset(
+    {"L-BFGS-B", "TNC", "SLSQP", "trust-constr"}
+)
+
+
+def _normalize_scipy_method(name: Any, *, key: str) -> str:
     if not isinstance(name, str):
         raise TypeError(f"{key} must be a string")
     normalized = name.strip().upper().replace("-", "_")
-    aliases = {
-        "L_BFGS": "L_BFGS_B",
-        "LBFGS": "L_BFGS_B",
-        "LD_LBFGS": "L_BFGS_B",
-        "L_BFGS_B": "L_BFGS_B",
-    }
-    return aliases.get(normalized, normalized)
+    method = _SCIPY_METHOD_MAP.get(normalized)
+    if method is None:
+        valid = sorted(_SCIPY_METHOD_MAP.values())
+        raise ValueError(
+            f"Unknown scipy algorithm {name!r}. "
+            f"Supported: {', '.join(dict.fromkeys(valid))}"
+        )
+    return method
 
 
 def _as_nonnegative_float(value: Any, *, key: str) -> float:
@@ -697,21 +719,8 @@ def _run_scipy_lbfgs(
     upper = options.pop("upper_bounds", None)
     method_name = options.pop("method", None)
     algorithm_name = options.pop("algorithm", options.pop("optimizer", None))
-    if method_name is None:
-        method_norm = "L_BFGS_B"
-    else:
-        method_norm = _normalize_lbfgs_name(method_name, key="method")
-    if algorithm_name is not None:
-        algorithm_norm = _normalize_lbfgs_name(algorithm_name, key="algorithm")
-        if algorithm_norm != "L_BFGS_B":
-            raise ValueError(
-                "solver='scipy-lbfgs' supports only L-BFGS-B style algorithm names."
-            )
-    if method_norm != "L_BFGS_B":
-        raise ValueError(
-            "solver='scipy-lbfgs' currently supports method='L-BFGS-B' only."
-        )
-    method = "L-BFGS-B"
+    raw_name = algorithm_name or method_name or "L-BFGS-B"
+    method = _normalize_scipy_method(raw_name, key="algorithm")
 
     if "ftol" in options:
         ftol = _as_nonnegative_float(options.pop("ftol"), key="ftol")
@@ -732,6 +741,13 @@ def _run_scipy_lbfgs(
         lower_arr = _as_numpy_vector(-np.inf if lower is None else lower, n_vars, key="lower_bounds")
         upper_arr = _as_numpy_vector(np.inf if upper is None else upper, n_vars, key="upper_bounds")
         bounds = list(zip(lower_arr, upper_arr))
+
+    if bounds is not None and method not in _SCIPY_BOUNDS_METHODS:
+        warnings.warn(
+            f"scipy method {method!r} does not support bounds; ignoring.",
+            stacklevel=2,
+        )
+        bounds = None
 
     history: list[float] = []
     step_counter = {"value": 0}
@@ -854,8 +870,9 @@ def _run_nlopt_lbfgs(
         algorithm_name = options.pop("optimizer", "LD_LBFGS")
     method_name = options.pop("method", None)
     if method_name is not None:
-        method_norm = _normalize_lbfgs_name(method_name, key="method")
-        if method_norm != "L_BFGS_B":
+        normalized = method_name.strip().upper().replace("-", "_")
+        lbfgs_aliases = {"L_BFGS", "LBFGS", "LD_LBFGS", "L_BFGS_B"}
+        if normalized not in lbfgs_aliases:
             raise ValueError(
                 "solver='nlopt-lbfgs' only accepts L-BFGS-B style method aliases."
             )
@@ -877,7 +894,7 @@ def _run_nlopt_lbfgs(
     assume_nonnegative = bool(options.pop("assume_nonnegative", True))
     best_neg_tol = float(options.pop("best_neg_tol", 1e-12))
 
-    if ema_alpha is not None and not (0.0 < float(ema_alpha) <= 1.0):
+    if ema_alpha is not None and not 0.0 < float(ema_alpha) <= 1.0:
         raise ValueError("ema_alpha must be in (0, 1] when set")
     if max_step is not None and float(max_step) <= 0.0:
         raise ValueError("max_step must be > 0 when set")
@@ -1028,7 +1045,8 @@ def _run_nlopt_lbfgs(
     x_opt = None
     try:
         x_opt = opt.optimize(x0)
-    except (RuntimeError, ValueError, FloatingPointError) as exc:
+    except (RuntimeError, ValueError, FloatingPointError, nlopt.RoundoffLimited,
+            nlopt.ForcedStop, nlopt.runtime_error, nlopt.forced_stop) as exc:
         if not history:
             warnings.warn(
                 f"NLopt terminated before a valid step ({type(exc).__name__}). "

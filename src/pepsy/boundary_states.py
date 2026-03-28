@@ -64,15 +64,6 @@ class BdyMPS:
         "int64": np.int64,
         "int32": np.int32,
     }
-    _JAX_DTYPE_MAP = {
-        "complex128": None,
-        "complex64": None,
-        "float64": None,
-        "float32": None,
-        "float16": None,
-        "int64": None,
-        "int32": None,
-    }
 
     # (side, site_tag_id, cut_tag_id) sweep definitions used to prebuild boundaries.
     _SWEEP_SPECS = (
@@ -187,33 +178,6 @@ class BdyMPS:
         return _to_numpy
 
     @staticmethod
-    def _build_to_jax(sample_data, dtype_name):
-        import jax.numpy as jnp
-
-        dtype_map = BdyMPS._JAX_DTYPE_MAP.copy()
-        dtype_map.update(
-            {
-                "complex128": jnp.complex128,
-                "complex64": jnp.complex64,
-                "float64": jnp.float64,
-                "float32": jnp.float32,
-                "float16": jnp.float16,
-                "int64": jnp.int64,
-                "int32": jnp.int32,
-            }
-        )
-        if dtype_name not in dtype_map:
-            raise ValueError(f"Unsupported dtype '{dtype_name}' for jax backend.")
-        return (
-            lambda x, dtype=dtype_map[dtype_name]: jnp.asarray(
-                jnp.asarray(x).real
-                if (jnp.issubdtype(dtype, jnp.floating) and jnp.iscomplexobj(x))
-                else jnp.asarray(x),
-                dtype=dtype,
-            )
-        )
-
-    @staticmethod
     def _build_to_torch(sample_data, dtype_name):
         import torch
 
@@ -258,8 +222,6 @@ class BdyMPS:
 
         if backend == "numpy":
             return self._build_to_numpy(sample_data, dtype_name)
-        if backend == "jax":
-            return self._build_to_jax(sample_data, dtype_name)
         if backend == "torch":
             return self._build_to_torch(sample_data, dtype_name)
 

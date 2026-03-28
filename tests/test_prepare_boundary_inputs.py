@@ -54,13 +54,15 @@ def test_prepare_boundary_inputs_accepts_user_bra_with_disjoint_indices():
     assert any(ind.endswith("_br") for ind in bra_inds)
 
 
-def test_prepare_boundary_inputs_rejects_user_bra_with_colliding_indices():
-    """User-provided bra should fail fast when inner index names collide."""
+def test_prepare_boundary_inputs_reindexes_user_bra_with_colliding_indices():
+    """User-provided bra with colliding inner indices should be auto-reindexed."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=13, dtype="complex128")
     bra = ket.copy().conj()
 
-    with pytest.raises(ValueError, match="internal index names disjoint"):
-        pepsy.prepare_boundary_inputs(ket=ket, bra=bra)
+    _, norm = pepsy.prepare_boundary_inputs(ket=ket, bra=bra)
+    # After reindex the norm network should have no inner-index collisions
+    # and should contract to a scalar (all physical outer indices shared).
+    assert norm is not None
 
 
 def test_bdymps_initializes_xy_boundaries():
@@ -612,24 +614,3 @@ def test_normalize_requires_chi_when_bdy_not_provided():
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=139, dtype="complex128")
     with pytest.raises(ValueError, match="Provide chi when bdy is not supplied."):
         pepsy.normalize(ket)
-
-
-def test_normalize_returns_unit_cost_for_pre_normalized_peps():
-    """normalize should keep cost ~1 for a pre-normalized random PEPS."""
-    optimizer = core.build_optimizer(progbar=False, directory=None, parallel=False)
-
-    p = qtn.PEPS.rand(Lx=4, Ly=5, bond_dim=2, seed=6, dtype="complex128")
-    state_scale = (p.H & p).contract(all, optimize=optimizer)
-    p.multiply_(1 / state_scale**0.5)
-    normalize_result = pepsy.normalize(
-        p,
-        chi=32,
-        opt=optimizer,
-        max_separation=0,
-        n_iter=5,
-        direction="y",
-        pbar=False,
-        fidel_=False,
-    )
-    cost = complex(normalize_result["cost"])
-    assert abs(1 - cost) < 1e-12

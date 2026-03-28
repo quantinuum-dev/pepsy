@@ -20,104 +20,12 @@ __all__ = [
     "build_optimizer",
     "opt_",
     "tn_fidelity",
-    "energy_global",
-    "gate_1d",
     "internal_inds",
-    "canonize_mps",
+
 ]
 
-# Backward-compatible alias.
-opt_ = build_optimizer
 
 
-def energy_global(MPO_origin, mps_a, opt="auto-hq"):  # pylint: disable=invalid-name
-    """Compute global energy ``<mps_a|MPO_origin|mps_a>`` with normalization."""
-
-    mps_a_ = mps_a.copy()
-    mps_a_.normalize()
-    p_h = mps_a_.H
-    p_h.reindex_({f"k{i}": f"b{i}" for i in range(mps_a.L)})
-    mpo_t = MPO_origin * 1.0
-
-    energy_dmrg = (p_h | mpo_t | mps_a_).contract(all, optimize=opt)
-    return energy_dmrg
-
-
-def gate_1d(
-    tn,
-    where,
-    G,  # pylint: disable=invalid-name
-    ind_id="k{}",
-    site_tags="I{}",
-    cutoff=1.0e-12,
-    contract="split-gate",
-    inplace=False,
-):  # pylint: disable=too-many-arguments,too-many-positional-arguments
-
-    """
-    Apply a 1D gate to a tensor network at one or two sites.
-
-    Args:
-        tn:      Tensor network (quimb/qtn TensorNetwork).
-        where:   Iterable of site indices; length 1 (single-qubit) or 2 (two-qubit).
-        G:       Gate tensor (or matrix).
-        ind_id: Format string for site indices (e.g., "k{}" -> "k3").
-        site_tags: Format string for site tags   (e.g., "I{}" -> "I3").
-        cutoff:  SVD cutoff (used for split contraction paths).
-        contract: Contraction mode (e.g., "split-gate") or bool for single-qubit.
-        inplace: Modify tn in place if True; otherwise return a new TN.
-
-    Returns:
-        TensorNetwork with the gate applied and site tags added.
-    """
-
-    if len(where) == 2:
-        x, y = where
-        tn = qtn.tensor_network_gate_inds(
-            tn,
-            G,
-            [ind_id.format(x), ind_id.format(y)],
-            contract=contract,
-            inplace=inplace,
-            **{"cutoff": cutoff},
-        )
-        # Add site tags on updated tensors.
-        t = [tn.tensor_map[i] for i in tn.ind_map[ind_id.format(x)]][0]
-        t.add_tag(site_tags.format(x))
-        t = [tn.tensor_map[i] for i in tn.ind_map[ind_id.format(y)]][0]
-        t.add_tag(site_tags.format(y))
-    elif len(where) == 1:
-        x, = where
-        tn = qtn.tensor_network_gate_inds(
-            tn,
-            G,
-            [ind_id.format(x)],
-            contract=True,
-            inplace=inplace,
-        )
-    else:
-        raise ValueError("where must contain one or two site indices")
-
-    return tn
-
-
-def internal_inds(psi):
-    """Return all internal (non-open) indices of ``psi``."""
-    open_inds = psi.outer_inds()
-    inner_inds = []
-    for t in psi:
-        for ind in t.inds:
-            if ind not in open_inds:
-                inner_inds.append(ind)
-    return inner_inds
-
-
-def canonize_mps(p, where, cur_orthog):
-    """Canonize MPS on interval ``where`` and update ``cur_orthog`` in-place."""
-    xmin, xmax = sorted(where)
-    p.canonize([xmin, xmax], cur_orthog=cur_orthog)
-    # update cur_orthog in place (preserving reference)
-    cur_orthog[:] = [xmin, xmax]
 
 
 class FIT:  # pylint: disable=too-many-instance-attributes

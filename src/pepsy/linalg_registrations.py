@@ -1,24 +1,45 @@
-import torch
-import autoray as ar
-import warnings
+"""Autodiff-safe linear algebra registrations for torch and jax backends.
 
-import jax
+This module provides custom SVD/QR gradients and then registers them with
+``autoray`` so higher-level tensor code can use the stabilized routines.
+"""
+
+import autoray as ar
 import jax.numpy as jnp
-from jax import custom_jvp, custom_vjp
-jax.config.update("jax_enable_x64", True)
+import scipy.linalg
+import torch
+from jax import custom_vjp
+
+# pylint: disable=abstract-method,arguments-differ,bad-staticmethod-argument,bare-except,invalid-name,line-too-long,multiple-statements,not-callable,superfluous-parens,too-many-branches,too-many-locals,too-many-statements,unnecessary-semicolon,unused-variable,using-constant-test
+# jax.config.update("jax_enable_x64", True)
 
 
 
 def safe_inverse(x, eps_abs=1.0e-12):
+    """Return a smooth reciprocal-like map ``x / (x**2 + eps_abs)``.
+
+    This is used as a regularized inverse in singular-value expressions where
+    exact reciprocal factors may become numerically unstable.
+    """
     eps_abs=1.0e-12
     return x / (x ** 2 + eps_abs)
 
 
 def safe_inverse_2(x, eps):
+    """Return a clamped reciprocal used for real nonnegative values.
+
+    Values below ``eps`` are clipped before inversion.
+    """
     return x.clamp_min(eps).reciprocal()
 
 
 class SVD(torch.autograd.Function):
+    """Custom torch SVD with stabilized backward for near-degenerate spectra.
+
+    The forward computes ``torch.linalg.svd`` and the backward adds standard
+    regularization terms used in tensor-network optimization workflows.
+    """
+
     @staticmethod
     def forward(ctx, A):
         if A.is_cuda:
@@ -155,19 +176,192 @@ class SVD(torch.autograd.Function):
         return dA, None, None, None
 
 
-import scipy.linalg
+
+
+
+# def safe_inverse(x, eps_abs: float = 1.0e-12):
+#     """
+#     Smooth, sign/phase-preserving 'inverse-like' regularizer.
+
+#     For real x:   x / (x^2 + eps)
+#     For complex x: x / (|x|^2 + eps)  where |x|^2 = x * conj(x)
+
+#     This matches your intent for F and G (built from real singular values),
+#     and is also well-defined if ever called on complex tensors.
+#     """
+#     if torch.is_complex(x):
+#         denom = x * x.conj() + eps_abs
+#     else:
+#         denom = x * x + eps_abs
+#     return x / denom
+
+
+# def safe_inverse_2(x, eps: float):
+#     """
+#     Hard reciprocal with clamp. Only appropriate for nonnegative real tensors.
+#     (Not appropriate for F = 1/(s_i - s_j) which can be negative.)
+#     """
+#     return x.clamp_min(eps).reciprocal()
+
+
+# class SVD(torch.autograd.Function):
+#     @staticmethod
+#     def forward(A):
+#         # Do NOT force driver='gesvd' on CUDA: it can be much slower.
+#         # Let PyTorch choose the best driver.
+#         U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+#         return U, S, Vh
+
+#     @staticmethod
+#     def setup_context(ctx, inputs, output):
+#         # Required by functorch transforms (vmap, grad, jvp, jacrev, ...)
+#         (A,) = inputs
+#         U, S, Vh = output
+#         ctx.save_for_backward(U, S, Vh)
+#         ctx.set_materialize_grads(False)
+
+#     @staticmethod
+#     def backward(ctx, gu, gsigma, gvh):
+#         """
+#         Backward for A -> (U, S, Vh).
+
+#         Shapes (batched-safe):
+#           A:      (..., m, n)
+#           U:      (..., m, k)
+#           S:      (..., k)
+#           Vh:     (..., k, n)
+#           k = min(m, n)
+
+#         Returns:
+#           dA:     (..., m, n)
+#         """
+#         u, sigma, vh = ctx.saved_tensors
+#         eps = 1.0e-12
+
+#         # Batch-safe sizes
+#         m = u.size(-2)
+#         k = u.size(-1)
+#         n = vh.size(-1)
+#         batch_shape = u.shape[:-2]
+
+#         # sigma_term = U * diag(gsigma) @ Vh
+#         if gsigma is not None:
+#             sigma_term = (u * gsigma.unsqueeze(-2)) @ vh
+#         else:
+#             sigma_term = torch.zeros((*batch_shape, m, n), dtype=u.dtype, device=u.device)
+
+#         # If only singular values have grad, stop early
+#         if gu is None and gvh is None:
+#             return (sigma_term,)
+
+#         # Your chosen regularizer for sigma^{-1}
+#         sigma_inv = safe_inverse(sigma.clone(), eps_abs=eps)  # (..., k)
+
+#         # Build F and G from singular values (real), and apply safe_inverse to both
+#         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)         # (..., k, k)
+#         F = safe_inverse(F, eps_abs=eps)
+
+#         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)         # (..., k, k)
+#         G = safe_inverse(G, eps_abs=eps)
+
+#         # Zero diagonals WITHOUT in-place diagonal writes (transform-friendly)
+#         eye = torch.eye(k, dtype=F.dtype, device=F.device).view(*(1,) * len(batch_shape), k, k)
+#         F = F * (1.0 - eye)
+#         G = G * (1.0 - eye)
+
+#         uh = u.conj().transpose(-2, -1)                       # (..., k, m)
+
+#         # ---- U term
+#         if gu is not None:
+#             guh = gu.conj().transpose(-2, -1)                 # (..., k, m)
+
+#             # (uh @ gu - guh @ u): (..., k, k)
+#             skew_u = (uh @ gu) - (guh @ u)
+#             u_term = u @ ((F + G) * skew_u) * 0.5             # (..., m, k)
+
+#             if m > k:
+#                 # (I - U U^H) @ (gu * sigma_inv)
+#                 X = gu * sigma_inv.unsqueeze(-2)              # (..., m, k)
+#                 X = X - u @ (uh @ X)                          # (..., m, k)
+#                 u_term = u_term + X
+
+#             u_term = u_term @ vh                              # (..., m, n)
+#         else:
+#             u_term = torch.zeros((*batch_shape, m, n), dtype=u.dtype, device=u.device)
+
+#         # ---- V term
+#         v = vh.conj().transpose(-2, -1)                       # (..., n, k)
+
+#         if gvh is not None:
+#             gv = gvh.conj().transpose(-2, -1)                 # (..., n, k)
+
+#             # (vh @ gv - gvh @ v): (..., k, k)
+#             skew_v = (vh @ gv) - (gvh @ v)
+#             v_term = (((F - G) * skew_v) @ vh) * 0.5          # (..., k, n)
+
+#             if n > k:
+#                 # gvh @ (I - V V^H)  (right-projection) without forming I:
+#                 # Z = gvh - (gvh @ V) @ Vh
+#                 Z = gvh - (gvh @ v) @ vh                      # (..., k, n)
+#                 v_term = v_term + sigma_inv.unsqueeze(-1) * Z
+
+#             v_term = u @ v_term                               # (..., m, n)
+#         else:
+#             v_term = torch.zeros((*batch_shape, m, n), dtype=u.dtype, device=u.device)
+
+#         dA = u_term + sigma_term + v_term
+
+#         # Complex correction term (only meaningful if input is complex and gu is present)
+#         if (u.is_complex() or vh.is_complex()) and (gu is not None):
+#             L = (uh @ gu).diagonal(0, -2, -1)                 # (..., k)
+#             # Keep imaginary part only and scale by sigma_inv
+#             L = torch.complex(torch.zeros_like(L.real), L.imag * sigma_inv)
+#             dA = dA + (u * L.unsqueeze(-2)) @ vh
+
+#         # Only one tensor input (A), so only one gradient returned
+#         return (dA,)
+
+#     @staticmethod
+#     def vmap(info, in_dims, A):
+#         """
+#         vmap rule. torch.linalg.svd is already batched, so we just apply
+#         the same Function to the batched tensor.
+#         """
+#         (A_bdim,) = in_dims
+
+#         if A_bdim is None:
+#             U, S, Vh = SVD.apply(A)
+#             return (U, S, Vh), (None, None, None)
+
+#         if A_bdim != 0:
+#             A = A.movedim(A_bdim, 0)
+
+#         U, S, Vh = SVD.apply(A)
+#         return (U, S, Vh), (0, 0, 0)
+
+
+# def svd_custom(A):
+#     return SVD.apply(A)
+
+
+
+
+
 
 class SVD_real(torch.autograd.Function):
+    """Real-valued SVD autograd function with scipy fallback on failure.
+
+    This variant is intended for real tensors and keeps signs consistent across
+    repeated decompositions to reduce optimization noise.
+    """
+
     @staticmethod
     def forward(self, A):
         try:
             U, S, V = torch.svd(A)
-        except (RuntimeError, torch.linalg.LinAlgError):
-            warnings.warn(
-                'torch gesdd SVD failed, falling back to scipy gesvd',
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        except:
+            if True:
+                print('trouble in torch gesdd routine, falling back to gesvd')
             U, S, V = scipy.linalg.svd(A.detach().numpy(), full_matrices=False, lapack_driver='gesvd')
             U = torch.from_numpy(U)
             S = torch.from_numpy(S)
@@ -221,6 +415,11 @@ class SVD_real(torch.autograd.Function):
 
 
 class QR_real(torch.autograd.Function):
+    """Real-valued QR autograd function using a custom backward pass.
+
+    Handles both square and rectangular ``R`` branches used by this project.
+    """
+
     @staticmethod
     def forward(self, A):
         Q, R = torch.linalg.qr(A, )
@@ -242,6 +441,10 @@ class QR_real(torch.autograd.Function):
         return torch.cat([da, db], 1)
 
 def _simple_qr_backward(q, r, dq, dr):
+    """Compute the QR gradient for the square-``R`` case.
+
+    Parameters are ``Q, R`` and their upstream gradients ``dQ, dR``.
+    """
     if r.shape[-2] != r.shape[-1]:
         raise NotImplementedError("QrGrad not implemented when ncols > nrows "
                           "or full_matrices is true and ncols != nrows.")
@@ -266,6 +469,12 @@ def _simple_qr_backward(q, r, dq, dr):
 
 
 class QR_complex(torch.autograd.Function):
+    """Complex-valued QR autograd function using Hermitian symmetrization.
+
+    The backward enforces the appropriate Hermitian structure of the complex
+    QR differential.
+    """
+
     @staticmethod
     def forward(ctx, A):
         Q, R = torch.linalg.qr(A)
@@ -298,23 +507,41 @@ class QR_complex(torch.autograd.Function):
 
 @custom_vjp
 def svd_jax(A):
+    """JAX SVD primitive wrapped with a custom VJP definition.
+
+    Returns ``(U, S, V)`` with ``full_matrices=False``.
+    """
     return jnp.linalg.svd(A, full_matrices=False)
 
 
 def _safe_reciprocal(x, epsilon=1e-12):
+    """Regularized reciprocal used by the JAX SVD backward expressions.
+
+    Uses ``x / (x*x + epsilon)`` to avoid hard singularities.
+    """
     return x / (x * x + epsilon)
 
 
 def h(x):
+    """Return the conjugate transpose of ``x`` (Hermitian transpose)."""
     return jnp.conj(jnp.transpose(x))
 
 
 def jaxsvd_fwd(A):
+    """Forward rule for :func:`svd_jax` custom VJP.
+
+    Stores ``(U, S, V)`` as residuals for the backward rule.
+    """
     u, s, v = svd_jax(A)
     return (u, s, v), (u, s, v)
 
 
 def jaxsvd_bwd(r, tangents):
+    """Backward rule for :func:`svd_jax` custom VJP.
+
+    Combines singular-value, singular-vector, and gauge-fixing terms to produce
+    a stable gradient with respect to the input matrix.
+    """
     U, S, V = r
     du, ds, dv = tangents
 
@@ -348,21 +575,27 @@ svd_jax.defvjp(jaxsvd_fwd, jaxsvd_bwd)
 
 
 def reg_complex_svd_jax():
+    """Register the custom JAX SVD implementation in autoray.
+
+    After registration, ``autoray`` calls this VJP-aware primitive for JAX SVD.
+    """
     ar.register_function('jax', 'linalg.svd', svd_jax)
 
 
 
 
-def reg_complex_svd():
+def reg_complex_svd_torch():
+    """Register the complex torch SVD autograd implementation in autoray."""
     ar.register_function('torch', 'linalg.svd', SVD.apply)
 
-def reg_real_svd():
+def reg_real_svd_torch():
+    """Register the real torch SVD autograd implementation in autoray."""
     ar.register_function('torch', 'linalg.svd', SVD_real.apply)
 
-def reg_real_qr():
+def reg_real_qr_torch():
+    """Register the real torch QR autograd implementation in autoray."""
     ar.register_function('torch', 'linalg.qr', QR_real.apply)
 
-def reg_complex_qr():
+def reg_complex_qr_torch():
+    """Register the complex torch QR autograd implementation in autoray."""
     ar.register_function('torch', 'linalg.qr', QR_complex.apply)
-
-    

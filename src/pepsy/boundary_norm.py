@@ -2,24 +2,19 @@
 
 from __future__ import annotations
 
-import re
 import warnings
 from dataclasses import dataclass
 
+from ._tn_validation import _PHYS_OUTER, validate_tensor_network_tags
 from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
-
-
-_TAG_X = re.compile(r"^X\d+$")
-_TAG_Y = re.compile(r"^Y\d+$")
-_TAG_I = re.compile(r"^I\d+(?:,\d+)*$")
-_PHYS_OUTER = re.compile(r"^k\d+(?:,\d+)*$")
 
 __all__ = [
     "prepare_boundary_inputs",
     "BoundaryContractResult",
     "ContractBoundary",
     "normalize",
+    "infidelity",
 ]
 
 
@@ -36,16 +31,7 @@ class BoundaryContractResult:
 
 def _validate_tensor_network_tags(p):
     """Ensure PEPS lattice/site tags are present for shape inference."""
-    tags = set(getattr(p, "tags", ()))
-    has_x = any(isinstance(tag, str) and _TAG_X.fullmatch(tag) for tag in tags)
-    has_y = any(isinstance(tag, str) and _TAG_Y.fullmatch(tag) for tag in tags)
-    has_i = any(isinstance(tag, str) and _TAG_I.fullmatch(tag) for tag in tags)
-
-    if not (has_x and has_y and has_i):
-        raise ValueError(
-            "Input network must contain X*, Y*, and I* tags "
-            "(I<int>[,<int>...])."
-        )
+    validate_tensor_network_tags(p)
 
 
 def _normalize_retag_for_direction(direction, re_tag):
@@ -55,7 +41,7 @@ def _normalize_retag_for_direction(direction, re_tag):
 
 
 def _warn_nonstandard_physical_outer_inds(tn, role):
-    """Warn when outer physical indices don't match ``k<int>[,<int>...]``."""
+    """Warn when outer physical indices don't match ``k<int>[,<int>...]`` or ``b<int>[,<int>...]``."""
     bad = [
         idx
         for idx in tn.outer_inds()
@@ -64,14 +50,14 @@ def _warn_nonstandard_physical_outer_inds(tn, role):
     if bad:
         sample = ", ".join(sorted(bad)[:8])
         warnings.warn(
-            f"{role} outer indices expected format k<int>[,<int>...]. "
+            f"{role} outer indices expected format k/b<int>[,<int>...]. "
             f"Found non-matching indices: {sample}",
             stacklevel=3,
         )
 
 
 def _to_python_scalar(value):
-    """Convert backend scalar-like objects (torch/jax/numpy) to python scalar."""
+    """Convert backend scalar-like objects (torch/numpy) to python scalar."""
     obj = value
     if hasattr(obj, "detach"):
         obj = obj.detach()
@@ -95,10 +81,10 @@ def prepare_boundary_inputs(
 
     Parameters
     ----------
-    ket : qtn.TensorNetwork | None
+    ket : qtn.TensorNetwork | PEPS
         Input ket network.
-    bra : qtn.TensorNetwork | None
-        Optional bra network. If ``None``, ``ket.copy().conj()`` is used.
+    bra : qtn.TensorNetwork | PEPS
+        Optional bra network. If ``None``, ``ket.copy().conj()`` is used. Note: always conjugated.
 
     Returns
     -------
@@ -110,11 +96,9 @@ def prepare_boundary_inputs(
     ``ket`` is tagged in-place (no copy). The returned ``ket_tagged`` is the same
     object as ``ket``.
 
-    When ``bra`` is ``None``: shared internal ket/bra indices are renamed on the
-    auto-generated bra side as ``<original>_*``.
-
-    When ``bra`` is provided: no reindexing is performed; only bra/ket internal
-    index names are required to be disjoint (outer-index overlap is allowed).
+    In both cases (auto-generated or provided ``bra``), any shared internal
+    indices between ket and bra are automatically renamed on the bra side as
+    ``<original>_*`` to ensure disjointness.
     """
     if ket is None:
         raise ValueError("Provide ket.")
@@ -125,8 +109,9 @@ def prepare_boundary_inputs(
     auto_bra = bra is None
     bra_tagged = ket.conj() if auto_bra else bra.conj()
 
-    if auto_bra:
-        shared_inner = set(ket_tagged.inner_inds()) & set(bra_tagged.inner_inds())
+    # Ensure bra internal indices are disjoint from ket's.
+    shared_inner = set(ket_tagged.inner_inds()) & set(bra_tagged.inner_inds())
+    if shared_inner:
         reindex_map = {idx: f"{idx}_*" for idx in shared_inner}
         final_collisions = set(reindex_map.values()) & (
             set(ket_tagged.ind_map) | (set(bra_tagged.ind_map) - shared_inner)
@@ -134,18 +119,10 @@ def prepare_boundary_inputs(
         if final_collisions:
             sample = ", ".join(sorted(final_collisions)[:8])
             raise ValueError(
-                "Automatic bra reindex idx -> idx_* collides with existing indices. "
+                "Bra reindex idx -> idx_* collides with existing indices. "
                 f"Collisions found: {sample}"
             )
         bra_tagged.reindex_(reindex_map)
-    else:
-        collisions = set(ket_tagged.inner_inds()) & set(bra_tagged.inner_inds())
-        if collisions:
-            sample = ", ".join(sorted(collisions)[:8])
-            raise ValueError(
-                "Provided bra must have internal index names disjoint from ket. "
-                f"Internal collisions found: {sample}"
-            )
 
     _warn_nonstandard_physical_outer_inds(ket_tagged, "ket")
     if not auto_bra:
@@ -352,4 +329,190 @@ def normalize(
         "cost_scalar": cost_scalar,
         "bdy": bdy,
         "contract_result": result,
+    }
+
+
+def infidelity(
+    p,
+    p_target,
+    *,
+    chi=None,
+    norm=None,
+    norm_target=None,
+    bdy=None,
+    bdy_target=None,
+    bdy_overlap=None,
+    opt="auto-hq",
+    n_iter=5,
+    direction="y",
+    max_separation=0,
+    pbar=False,
+    fidel_=False,
+    dmrg_run="eff",
+    single_layer=False,
+):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    r"""Compute the infidelity between two PEPS states via boundary contraction.
+
+    The infidelity is defined as
+
+    .. math::
+
+        \mathcal{I} = 1
+          - \frac{|\langle p_{\mathrm{target}} | p \rangle|^{2}}
+                 {\langle p | p \rangle \;
+                  \langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle}
+
+    Up to three boundary contractions are performed to evaluate
+    :math:`\langle p | p \rangle`,
+    :math:`\langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle`, and
+    :math:`\langle p_{\mathrm{target}} | p \rangle`.
+    If ``norm`` or ``norm_target`` is supplied, the corresponding
+    contraction is skipped.
+
+    Parameters
+    ----------
+    p : qtn.TensorNetwork
+        Trial PEPS state.
+    p_target : qtn.TensorNetwork
+        Target PEPS state.
+    chi : int | None, default=None
+        Boundary MPS bond dimension. Required when the corresponding
+        ``bdy*`` argument is not supplied.
+    norm : complex | float | None, default=None
+        Known value of :math:`\langle p | p \rangle`.  When provided the
+        :math:`\langle p | p \rangle` boundary contraction is skipped
+        (e.g. pass ``1`` for an already-normalized state).
+    norm_target : complex | float | None, default=None
+        Known value of
+        :math:`\langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle`.
+        When provided the corresponding contraction is skipped.
+    bdy : pepsy.boundary_states.BdyMPS | None, default=None
+        Pre-built boundary for the :math:`\langle p | p \rangle` network.
+        Ignored when ``norm`` is given.
+    bdy_target : pepsy.boundary_states.BdyMPS | None, default=None
+        Pre-built boundary for the
+        :math:`\langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle`
+        network.  Ignored when ``norm_target`` is given.
+    bdy_overlap : pepsy.boundary_states.BdyMPS | None, default=None
+        Pre-built boundary for the
+        :math:`\langle p_{\mathrm{target}} | p \rangle` overlap network.
+    opt : str | object, default="auto-hq"
+        Contraction optimizer passed to :func:`ContractBoundary`.
+    n_iter : int, default=5
+        Number of local fit iterations per boundary step.
+    direction : str, default="y"
+        Sweep direction passed to :func:`ContractBoundary`.
+    max_separation : int, default=0
+        Sweep separation mode.
+    pbar : bool, default=False
+        Show progress bar.
+    fidel_ : bool, default=False
+        Track per-step fidelity during boundary contraction.
+    dmrg_run : {"eff", "global"}, default="eff"
+        Boundary fitting backend mode.
+    single_layer : bool, default=False
+        Boundary initializer mode for :class:`pepsy.boundary_states.BdyMPS`.
+
+    Returns
+    -------
+    dict[str, object]
+        Dictionary with:
+
+        - ``infidelity``: :math:`1 - F` where :math:`F` is the fidelity
+        - ``norm``: :math:`\langle p | p \rangle` (complex scalar)
+        - ``norm_target``: :math:`\langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle`
+        - ``overlap``: :math:`\langle p_{\mathrm{target}} | p \rangle` (complex scalar)
+        - ``bdy``: boundary MPS for *p* (``None`` when ``norm`` was given)
+        - ``bdy_target``: boundary MPS for *p_target* (``None`` when
+          ``norm_target`` was given)
+        - ``bdy_overlap``: boundary MPS for the overlap network
+    """
+    if p is None:
+        raise ValueError("p must not be None.")
+    if p_target is None:
+        raise ValueError("p_target must not be None.")
+
+    # Shared contraction kwargs
+    _kw = dict(
+        opt=opt,
+        dmrg_run=dmrg_run,
+        n_iter=n_iter,
+        pbar=pbar,
+        direction=direction,
+        max_separation=max_separation,
+        fidel_=fidel_,
+    )
+
+    # -- <p|p> --
+    if norm is None:
+        _, norm_tn = prepare_boundary_inputs(ket=p, bra=None)
+
+        if bdy is None:
+            if chi is None:
+                raise ValueError("Provide chi when bdy is not supplied.")
+            bdy = BdyMPS(tn_double=norm_tn, chi=chi, single_layer=single_layer)
+        elif not hasattr(bdy, "mps_b"):
+            raise TypeError("bdy must expose attribute 'mps_b'.")
+
+        norm = complex(_to_python_scalar(
+            ContractBoundary(norm=norm_tn, mps_boundaries=bdy.mps_b, **_kw).cost
+        ))
+    else:
+        norm = complex(norm)
+
+    # -- <p_target|p_target> --
+    if norm_target is None:
+        _, norm_target_tn = prepare_boundary_inputs(ket=p_target, bra=None)
+
+        if bdy_target is None:
+            if chi is None:
+                raise ValueError("Provide chi when bdy_target is not supplied.")
+            bdy_target = BdyMPS(
+                tn_double=norm_target_tn, chi=chi, single_layer=single_layer,
+            )
+        elif not hasattr(bdy_target, "mps_b"):
+            raise TypeError("bdy_target must expose attribute 'mps_b'.")
+
+        norm_target = complex(_to_python_scalar(
+            ContractBoundary(
+                norm=norm_target_tn, mps_boundaries=bdy_target.mps_b, **_kw,
+            ).cost
+        ))
+    else:
+        norm_target = complex(norm_target)
+
+    # -- <p_target|p> (overlap) --
+    _, overlap_tn = prepare_boundary_inputs(ket=p, bra=p_target)
+
+    if bdy_overlap is None:
+        if chi is None:
+            raise ValueError("Provide chi when bdy_overlap is not supplied.")
+        bdy_overlap = BdyMPS(
+            tn_double=overlap_tn, chi=chi, single_layer=single_layer,
+        )
+    elif not hasattr(bdy_overlap, "mps_b"):
+        raise TypeError("bdy_overlap must expose attribute 'mps_b'.")
+
+    overlap = complex(_to_python_scalar(
+        ContractBoundary(
+            norm=overlap_tn, mps_boundaries=bdy_overlap.mps_b, **_kw,
+        ).cost
+    ))
+
+    denom = abs(norm) * abs(norm_target)
+    if denom == 0:
+        raise ZeroDivisionError(
+            "Norm product is zero; cannot compute infidelity."
+        )
+
+    fidelity = abs(overlap) ** 2 / denom
+
+    return {
+        "infidelity": 1 - fidelity,
+        "norm": norm,
+        "norm_target": norm_target,
+        "overlap": overlap,
+        "bdy": bdy,
+        "bdy_target": bdy_target,
+        "bdy_overlap": bdy_overlap,
     }

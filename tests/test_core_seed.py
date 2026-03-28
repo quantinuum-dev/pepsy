@@ -1,11 +1,11 @@
-"""Tests for seed forwarding in optimizer/fidelity helpers."""
+"""Tests for optimizer/fidelity helper wiring and defaults."""
 
 import pepsy.core as core
 import quimb.tensor as qtn
 
 
-def test_build_optimizer_forwards_seed(monkeypatch):
-    """build_optimizer should pass seed through to cotengra optimizer."""
+def test_build_optimizer_constructs_without_seed(monkeypatch):
+    """build_optimizer should configure cotengra optimizer without seed kwarg."""
     captured = {}
 
     class DummyOpt:
@@ -21,15 +21,14 @@ def test_build_optimizer_forwards_seed(monkeypatch):
         directory=None,
         max_repeats=1,
         max_time="rate:1e2",
-        seed=123,
     )
 
     assert isinstance(out, DummyOpt)
-    assert captured["seed"] == 123
+    assert "seed" not in captured
 
 
-def test_build_compressed_optimizer_forwards_seed(monkeypatch):
-    """build_compressed_optimizer should pass seed to cotengra."""
+def test_build_compressed_optimizer_constructs_without_seed(monkeypatch):
+    """build_compressed_optimizer should not pass seed to cotengra."""
     captured = {}
 
     class DummyCOpt:
@@ -45,15 +44,14 @@ def test_build_compressed_optimizer_forwards_seed(monkeypatch):
         directory=None,
         max_repeats=1,
         max_time="rate:1e2",
-        seed=77,
     )
 
     assert isinstance(out, DummyCOpt)
-    assert captured["seed"] == 77
+    assert "seed" not in captured
 
 
-def test_tn_fidelity_forwards_seed(monkeypatch):
-    """tn_fidelity should call build_optimizer with provided seed."""
+def test_tn_fidelity_uses_default_optimizer_settings(monkeypatch):
+    """tn_fidelity should call build_optimizer with progbar disabled."""
     captured = {}
 
     def fake_build_optimizer(**kwargs):
@@ -65,11 +63,11 @@ def test_tn_fidelity_forwards_seed(monkeypatch):
     psi = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=5)
     psi_fix = psi.copy()
 
-    fidelity = core.tn_fidelity(psi, psi_fix, seed=9)
+    fidelity = core.tn_fidelity(psi, psi_fix)
 
     assert abs(fidelity - 1.0) < 1e-12
-    assert captured["seed"] == 9
     assert captured["progbar"] is False
+    assert "seed" not in captured
 
 
 def test_default_backend_setters_roundtrip():
