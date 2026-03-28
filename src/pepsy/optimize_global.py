@@ -112,7 +112,7 @@ class GlobalOptimizer:
         mode="exact",
         mode_="mps",
         max_separation=1,
-        sequence=["xmin", "xmax", "ymin", "ymax"],
+        sequence=None,
         progbar=False,
         cutoff=1e-12,
     ):

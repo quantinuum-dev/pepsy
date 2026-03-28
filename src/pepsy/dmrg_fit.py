@@ -21,11 +21,21 @@ __all__ = [
     "opt_",
     "tn_fidelity",
     "internal_inds",
-
 ]
 
+# Backward-compatible alias.
+opt_ = build_optimizer
 
 
+def internal_inds(psi):
+    """Return all internal (non-open) indices of ``psi``."""
+    open_inds = psi.outer_inds()
+    inner = []
+    for tensor in psi:
+        for ind in tensor.inds:
+            if ind not in open_inds:
+                inner.append(ind)
+    return inner
 
 
 class FIT:  # pylint: disable=too-many-instance-attributes
