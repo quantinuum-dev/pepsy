@@ -10,7 +10,6 @@ def _sample_runs():
         {
             "loss_final": 0.9,
             "global_loss_after": 0.8,
-            "global_fidelity_after": 0.2,
             "state_norm": 1.2,
             "bdy_norm_norm": 1.1,
             "bdy_norm_overlap": 1.3,
@@ -20,7 +19,6 @@ def _sample_runs():
         {
             "loss_final": 0.7,
             "global_loss_after": 0.6,
-            "global_fidelity_after": 0.4,
             "state_norm": 1.05,
             "bdy_norm_norm": 1.02,
             "bdy_norm_overlap": 1.01,
@@ -30,7 +28,6 @@ def _sample_runs():
         {
             "loss_final": 0.5,
             "global_loss_after": 0.3,
-            "global_fidelity_after": 0.7,
             "state_norm": 1.0,
             "bdy_norm_norm": 1.0,
             "bdy_norm_overlap": 1.0,
@@ -107,7 +104,7 @@ def test_instance_plot_uses_last_sweep_result_runs():
 
 
 def test_plot_runs_uses_auto_log_for_most_metrics():
-    """Auto scaling should log-scale loss/timing and keep fidelity linear."""
+    """Auto scaling should log-scale loss-like and timing metrics."""
     pytest.importorskip("matplotlib")
     import matplotlib
 
@@ -116,12 +113,18 @@ def test_plot_runs_uses_auto_log_for_most_metrics():
     runs = _sample_runs()
     _fig, axes = PEPSSweepOptimizer.plot_runs(
         runs,
-        metrics=["loss", "fidelity", "time_total"],
+        metrics=["loss", "infidelity", "time_total"],
         show=False,
     )
     assert axes[0].get_yscale() == "log"
-    assert axes[1].get_yscale() == "linear"
+    assert axes[1].get_yscale() == "log"
     assert axes[2].get_yscale() == "log"
+
+
+def test_plot_runs_rejects_fidelity_metric_name():
+    """Fidelity metric should be rejected; loss/infidelity is the API target."""
+    with pytest.raises(ValueError, match="Unsupported metric"):
+        PEPSSweepOptimizer.plot_runs(_sample_runs(), metrics=["fidelity"], show=False)
 
 
 def test_plot_runs_can_disable_log_scale():

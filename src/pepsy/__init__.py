@@ -44,12 +44,20 @@ if TYPE_CHECKING:
     from .gate import (
         apply_2dtn_,
         apply_gates,
-        canonize_mps,
         gate_1d,
         gen_long_range_swap_path,
+        rx,
+        ry,
+        rz,
+        rxx,
+        ryy,
+        rzz,
+        u3,
+        su4,
     )
     from .optimize_global import GlobalOptimizer
     from .optimize_sweep import PEPSSweepOptimizer, SweepResult
+    from .optimize_mps import MpsOptimizer
 
 __all__ = [
     "__version__",
@@ -81,7 +89,14 @@ __all__ = [
     "apply_2dtn_",
     "apply_gates",
     "gate_1d",
-    "canonize_mps",
+    "rx",
+    "ry",
+    "rz",
+    "rxx",
+    "ryy",
+    "rzz",
+    "u3",
+    "su4",
     "product_state_peps",
     "optimize_global",
     "optimize_sweep",
@@ -93,6 +108,7 @@ __all__ = [
     "core",
     "dmrg_fit",
     "debug",
+    "MpsOptimizer",
 ]
 
 
@@ -105,6 +121,7 @@ def __getattr__(name):
         "debug",
         "gate",
         "gradient_solver",
+        "optimize_mps",
         "optimize_global",
         "optimize_sweep",
         "core",
@@ -150,14 +167,28 @@ def __getattr__(name):
         "apply_2dtn_",
         "apply_gates",
         "gate_1d",
-        "canonize_mps",
+        "rx",
+        "ry",
+        "rz",
+        "rxx",
+        "ryy",
+        "rzz",
+        "u3",
+        "su4",
     ):
         from .gate import (  # pylint: disable=import-outside-toplevel
             apply_2dtn_,
             apply_gates,
-            canonize_mps,
             gate_1d,
             gen_long_range_swap_path,
+            rx,
+            ry,
+            rz,
+            rxx,
+            ryy,
+            rzz,
+            u3,
+            su4,
         )
 
         return {
@@ -165,7 +196,14 @@ def __getattr__(name):
             "apply_2dtn_": apply_2dtn_,
             "apply_gates": apply_gates,
             "gate_1d": gate_1d,
-            "canonize_mps": canonize_mps,
+            "rx": rx,
+            "ry": ry,
+            "rz": rz,
+            "rxx": rxx,
+            "ryy": ryy,
+            "rzz": rzz,
+            "u3": u3,
+            "su4": su4,
         }[name]
 
     if name in ("tn_applied", "product_state_peps"):
@@ -255,5 +293,10 @@ def __getattr__(name):
             "PEPSSweepOptimizer": PEPSSweepOptimizer,
             "SweepResult": SweepResult,
         }[name]
+
+    if name == "MpsOptimizer":
+        from .optimize_mps import MpsOptimizer  # pylint: disable=import-outside-toplevel
+
+        return MpsOptimizer
 
     raise AttributeError(f"module 'pepsy' has no attribute {name!r}")

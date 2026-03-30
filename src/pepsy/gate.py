@@ -15,7 +15,14 @@ import quimb.tensor as qtn
 __all__ = [
     "apply_gates",
     "gate_1d",
-    "canonize_mps",
+    "rx",
+    "ry",
+    "rz",
+    "rxx",
+    "ryy",
+    "rzz",
+    "u3",
+    "su4",
 ]
 
 
@@ -61,6 +68,98 @@ def _infer_backend_converter(sample_data):
         return _to_torch
 
     return None
+
+
+def rx(theta):
+    """Return a one-qubit RX gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.rx_gate_param_gen([theta])
+
+
+def ry(theta):
+    """Return a one-qubit RY gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.ry_gate_param_gen([theta])
+
+
+def rz(theta):
+    """Return a one-qubit RZ gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.rz_gate_param_gen([theta])
+
+
+def rzz(theta):
+    """Return a two-qubit RZZ gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.rzz_param_gen([theta])
+
+
+def rxx(theta):
+    """Return a two-qubit RXX gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.rxx_param_gen([theta])
+
+
+def ryy(theta):
+    """Return a two-qubit RYY gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.ryy_param_gen([theta])
+
+
+def su4(params):
+    """Return a two-qubit SU(4) gate from 15 parameters.
+
+    Parameters
+    ----------
+    params : sequence
+        Sequence of exactly 15 parameters.
+    """
+    if len(params) != 15:
+        raise ValueError("su4 expects exactly 15 parameters.")
+    return qtn.circuit.su4_gate_param_gen(params)
+
+
+def u3(params):
+    """Return a one-qubit U3 gate from 3 parameters.
+
+    Parameters
+    ----------
+    params : sequence
+        Sequence of exactly 3 parameters.
+    """
+    if len(params) != 3:
+        raise ValueError("u3 expects exactly 3 parameters.")
+    return qtn.circuit.u3_gate_param_gen(params)
 
 
 def gen_long_range_swap_path(  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
@@ -425,15 +524,6 @@ def apply_gates(  # pylint: disable=too-many-arguments,too-many-positional-argum
         peps.compress_all_(max_bond=chi_value, cutoff=chi_cutoff)
 
     return peps
-
-
-def canonize_mps(p, where, cur_orthog):
-    xmin, xmax = sorted(where)
-    p.canonize([xmin, xmax], cur_orthog=cur_orthog, 
-               #info=info_c
-              )
-    # update cur_orthog in place (preserving reference)
-    cur_orthog[:] = [xmin, xmax]
 
 
 def gate_1d(tn, where, G, ind_id="k{}", site_tags="I{}",

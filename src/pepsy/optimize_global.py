@@ -61,6 +61,17 @@ class GlobalOptimizer:
             merged.update(dict(extra))
         return merged
 
+    @staticmethod
+    def _normalize_optimizer_name(optimizer):
+        """Normalize common optimizer aliases for ``qtn.TNOptimizer``."""
+        if not isinstance(optimizer, str):
+            return optimizer
+
+        key = optimizer.strip().lower().replace("_", "-")
+        if key in {"lbfgs", "l-bfgs", "lbfgsb", "l-bfgs-b"}:
+            return "L-BFGS-B"
+        return optimizer
+
     @classmethod
     def _pick_known_keys(cls, options, allowed_keys, *, warn_unknown=True):
         incoming = dict(options or {})
@@ -123,7 +134,7 @@ class GlobalOptimizer:
             sequence = ["xmin", "xmax", "ymin", "ymax"]
         if (mode == "hyper") and (copt is None):
             warnings.warn(
-                "mode='hyper' requested but copt is None; provide copt_() for stable behavior.",
+                "mode='hyper' requested but copt is None; provide a compressed optimizer via `copt`.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -203,7 +214,7 @@ class GlobalOptimizer:
         """Compute overlap-based loss between trainable and target PEPS."""
         if (mode == "hyper") and (copt is None):
             warnings.warn(
-                "mode='hyper' requested but copt is None; provide copt_() for stable behavior.",
+                "mode='hyper' requested but copt is None; provide a compressed optimizer via `copt`.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -395,6 +406,7 @@ class GlobalOptimizer:
     ):
         """Construct a configured :class:`quimb.tensor.TNOptimizer`."""
         merged_loss_kwargs = self._merge_opts(self.loss_kwargs, loss_kwargs)
+        optimizer = self._normalize_optimizer_name(optimizer)
 
         constants = {}
         if self.peps_target is not None:

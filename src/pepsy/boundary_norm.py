@@ -29,17 +29,6 @@ class BoundaryContractResult:
     max_separation: int
 
 
-def _validate_tensor_network_tags(p):
-    """Ensure PEPS lattice/site tags are present for shape inference."""
-    validate_tensor_network_tags(p)
-
-
-def _normalize_retag_for_direction(direction, re_tag):
-    """Normalize ``re_tag`` flag for direction-specific calls."""
-    _ = direction
-    return bool(re_tag)
-
-
 def _warn_nonstandard_physical_outer_inds(tn, role):
     """Warn when outer physical indices don't match ``k<int>[,<int>...]`` or ``b<int>[,<int>...]``."""
     bad = [
@@ -103,7 +92,7 @@ def prepare_boundary_inputs(
     if ket is None:
         raise ValueError("Provide ket.")
 
-    _validate_tensor_network_tags(ket)
+    validate_tensor_network_tags(ket)
 
     ket_tagged = ket
     auto_bra = bra is None
@@ -196,7 +185,7 @@ def ContractBoundary(
     if not isinstance(mps_boundaries, dict):
         raise TypeError("mps_boundaries must be a dictionary of boundary states.")
 
-    re_tag = _normalize_retag_for_direction(direction, re_tag)
+    re_tag = bool(re_tag)
     norm_tagged = norm.copy()
 
     comp_bdy = CompBdy(

@@ -86,7 +86,7 @@ def test_default_backend_setters_roundtrip():
 
 
 def test_bdymps_uses_default_array_backend_when_not_provided():
-    """BdyMPS should pick global default array backend if to_backend is omitted."""
+    """BdyMPS should pick global default array backend for ``array_backend``."""
     import pepsy
 
     array_backend = lambda x: x  # noqa: E731
@@ -100,6 +100,6 @@ def test_bdymps_uses_default_array_backend_when_not_provided():
             chi=4,
             single_layer=False,
         )
-        assert bdy.to_backend is array_backend
+        assert bdy.array_backend is array_backend
     finally:
         core.reset_default_backends()

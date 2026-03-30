@@ -113,8 +113,6 @@ class BdyMPS:
         default_array_backend = get_default_array_backend()
         if default_array_backend is not None:
             self.array_backend = default_array_backend
-        # Backward-compatible alias used by older tests/callers.
-        self.to_backend = self.array_backend
 
         self.numpy_backend = make_numpy_array_caster(dtype=dtype_name)
 

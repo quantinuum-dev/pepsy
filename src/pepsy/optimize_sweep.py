@@ -77,9 +77,9 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     _PLOT_METRIC_ALIASES = {
         "loss": "loss",
+        "infidelity": "loss",
+        "global_infidelity": "loss",
         "global_loss": "loss",
-        "fidelity": "fidelity",
-        "global_fidelity": "fidelity",
         "norm_peps": "state_norm",
         "state_norm": "state_norm",
         "norm_state": "state_norm",
@@ -151,12 +151,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if metric == "loss":
             val = run_info.get("global_loss_after")
             return run_info.get("loss_final") if val is None else val
-        if metric == "fidelity":
-            val = run_info.get("global_fidelity_after")
-            if val is not None:
-                return val
-            loss_final = run_info.get("loss_final")
-            return None if loss_final is None else (1.0 - float(loss_final))
         if metric == "state_norm":
             return run_info.get("state_norm")
         if metric == "bdy_norm":
@@ -194,13 +188,13 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             stored in :class:`SweepResult.runs`.
         metrics : str | sequence[str], default=("loss",)
             Metric name(s) to plot. Supported values:
-            ``loss``, ``fidelity``, ``state_norm``, ``bdy_norm``,
+            ``loss``, ``state_norm``, ``bdy_norm``,
             ``bdy_overlap_norm``, ``time_boundary``, ``time_optimize``,
-            ``time_total``. Common aliases like ``norm_peps`` and
-            ``timing`` are also accepted.
+            ``time_total``. Common aliases like ``infidelity``,
+            ``norm_peps`` and ``timing`` are also accepted.
         log_scale : {"auto", bool}, default="auto"
             Y-axis scaling policy. ``"auto"`` uses log scale for most
-            non-fidelity metrics (loss/norms/timing). ``True`` forces
+            metrics (loss/norms/timing). ``True`` forces
             log scale for all metrics, ``False`` keeps all linear.
         cumulative : bool, default=False
             If ``True``, plot cumulative sums (useful for timing metrics).
@@ -600,7 +594,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             _, global_loss = self.metrics()
             global_loss = float(global_loss)
             run_info["global_loss_after"] = global_loss
-            run_info["global_fidelity_after"] = 1.0 - global_loss
             norm_state = abs(complex(
                 (self.state.H & self.state).contract(all, optimize=self.opt)
             ))
@@ -610,7 +603,7 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 run_info["bdy_norm_overlap"] = float(complex(self.bdy_overlap.norm).real)
             except (ValueError, AttributeError):
                 pass
-        run_info["history"] = history if debug else [initial_loss, final_loss]
+        run_info["history"] = list(history)
 
         return run_info
 
@@ -704,6 +697,7 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.bdy.normalize()
         self.bdy_overlap.normalize()
+        
         if renormalize:
             self._normalize_state(env_n_iter)
 
@@ -773,12 +767,13 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver_options : dict | None, default=None
             Extra backend-specific options for the selected ``solver``.
         debug : bool, default=False
-            When True, compute exact metrics and boundary fidelities per step.
+            When True, compute extra global-loss diagnostics and boundary
+            fidelities per step.
         """
         if debug:
-            fid_before, loss_before = self.metrics()
+            _, loss_before = self.metrics()
         else:
-            fid_before, loss_before = None, None
+            loss_before = None
         all_runs = []
         axis_seq = list(axes)
 
@@ -839,13 +834,13 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             self._normalize_state(env_n_iter=env_n_iter)
 
         if debug:
-            fid_after, loss_after = self.metrics()
+            _, loss_after = self.metrics()
         else:
-            fid_after, loss_after = None, None
+            loss_after = None
         result = SweepResult(
             runs=all_runs,
-            fidelity_before=fid_before,
-            fidelity_after=fid_after,
+            fidelity_before=None,
+            fidelity_after=None,
             loss_before=loss_before,
             loss_after=loss_after,
         )

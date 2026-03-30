@@ -10,10 +10,7 @@ from .boundary_states import BdyMPS
 from .core import build_optimizer, tn_fidelity
 from .dmrg_fit import FIT
 
-__all__ = ["BdyMPS", "CompBdy", "tn_fidelity", "build_optimizer", "opt_"]
-
-# Backward-compatible alias.
-opt_ = build_optimizer
+__all__ = ["BdyMPS", "CompBdy", "tn_fidelity", "build_optimizer"]
 
 
 @dataclass(frozen=True)
@@ -96,11 +93,6 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.Ly = 1 + max_y  # pylint: disable=invalid-name
         self.Lx = 1 + max_x  # pylint: disable=invalid-name
         self._update_separation()
-
-    @property
-    def fidelity(self):
-        """Alias for ``self.fidel``."""
-        return self.fidel
 
     def _reset_fidelity_history(self):
         """Reset stored fidelity values for a fresh public call."""

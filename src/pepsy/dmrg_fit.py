@@ -18,13 +18,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "FIT",
     "build_optimizer",
-    "opt_",
     "tn_fidelity",
     "internal_inds",
 ]
-
-# Backward-compatible alias.
-opt_ = build_optimizer
 
 
 def internal_inds(psi):

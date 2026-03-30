@@ -173,3 +173,20 @@ def test_global_optimizer_optional_target_blocks_loss_methods():
     with pytest.raises(ValueError, match="peps_target is required for make_tn_optimizer"):
         _ = opt.make_tn_optimizer()
 
+
+@pytest.mark.parametrize("name", ["LBFGS", "lbfgs"])
+def test_make_tn_optimizer_normalizes_lbfgs_aliases(monkeypatch, name):
+    """LBFGS aliases should be normalized to ``L-BFGS-B`` for TNOptimizer."""
+    peps = _rand_peps(seed=27)
+    peps_target = _rand_peps(seed=28)
+    opt = GlobalOptimizer(peps, peps_target, loss_kwargs={"mode": "exact", "opt": "auto-hq"})
+    called = {}
+
+    class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
+        def __init__(self, *args, **kwargs):
+            _ = args
+            called["optimizer"] = kwargs.get("optimizer")
+
+    monkeypatch.setattr("pepsy.optimize_global.qtn.TNOptimizer", _FakeTNOptimizer)
+    _ = opt.make_tn_optimizer(optimizer=name, progbar=False, loss_kwargs={"cost_f": "fid", "val_": 1.0})
+    assert called["optimizer"] == "L-BFGS-B"

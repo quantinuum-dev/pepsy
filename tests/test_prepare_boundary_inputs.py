@@ -11,14 +11,14 @@ def test_validate_tensor_network_tags_requires_i_tags():
     dummy = type("DummyTN", (), {"tags": {"X0", "Y0"}})()
 
     with pytest.raises(ValueError, match=r"X\*, Y\*, and I\*"):
-        pepsy.boundary_norm._validate_tensor_network_tags(dummy)
+        pepsy.boundary_norm.validate_tensor_network_tags(dummy)
 
 
 def test_validate_tensor_network_tags_accepts_multi_index_i_tag():
     """Validator should accept I tags like I2, I3,4, or I2,3,4."""
     dummy = type("DummyTN", (), {"tags": {"X2", "Y3", "I2,3,4"}})()
 
-    pepsy.boundary_norm._validate_tensor_network_tags(dummy)
+    pepsy.boundary_norm.validate_tensor_network_tags(dummy)
 
 
 def test_prepare_boundary_inputs_uses_readable_bra_reindex_suffix():
@@ -390,7 +390,6 @@ def test_compbdy_move_step_resets_and_updates_fidelity(monkeypatch):
 
     comp.move_step_bdy(pos=0, direction="y_left", fidel_=True)
     assert comp.fidel == [0.77]
-    assert comp.fidelity == [0.77]
 
 
 class _DummyNormWithTags:
