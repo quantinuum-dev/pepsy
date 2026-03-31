@@ -15,6 +15,31 @@ import quimb.tensor as qtn
 __all__ = [
     "apply_gates",
     "gate_1d",
+    "x",
+    "y",
+    "z",
+    "s",
+    "sdg",
+    "t",
+    "tdg",
+    "h",
+    "hadamard",
+    "cnot",
+    "cx",
+    "cy",
+    "cz",
+    "swap",
+    "iswap",
+    "phase",
+    "u1",
+    "u2",
+    "cphase",
+    "crx",
+    "cry",
+    "crz",
+    "cu1",
+    "cu2",
+    "cu3",
     "rx",
     "ry",
     "rz",
@@ -101,6 +126,197 @@ def rz(theta):
         Rotation angle.
     """
     return qtn.circuit.rz_gate_param_gen([theta])
+
+
+def x():
+    """Return the one-qubit Pauli-X gate."""
+    return qu.pauli("X")
+
+
+def y():
+    """Return the one-qubit Pauli-Y gate."""
+    return qu.pauli("Y")
+
+
+def z():
+    """Return the one-qubit Pauli-Z gate."""
+    return qu.pauli("Z")
+
+
+def s():
+    """Return the one-qubit S gate."""
+    return qu.S_gate()
+
+
+def sdg():
+    """Return the one-qubit S-dagger gate."""
+    return s().H
+
+
+def t():
+    """Return the one-qubit T gate."""
+    return qu.T_gate()
+
+
+def tdg():
+    """Return the one-qubit T-dagger gate."""
+    return t().H
+
+
+def hadamard():
+    """Return the one-qubit Hadamard gate."""
+    return qu.hadamard()
+
+
+def h():
+    """Alias for :func:`hadamard`."""
+    return hadamard()
+
+
+def cnot():
+    """Return the two-qubit controlled-X (CNOT) gate."""
+    return qu.CNOT()
+
+
+def cx():
+    """Alias for :func:`cnot`."""
+    return cnot()
+
+
+def cy():
+    """Return the two-qubit controlled-Y gate."""
+    return qu.cY()
+
+
+def cz():
+    """Return the two-qubit controlled-Z gate."""
+    return qu.cZ()
+
+
+def swap():
+    """Return the two-qubit SWAP gate."""
+    return qu.swap()
+
+
+def iswap():
+    """Return the two-qubit iSWAP gate."""
+    return qu.iswap()
+
+
+def phase(theta):
+    """Return a one-qubit phase gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.u1_gate_param_gen([theta])
+
+
+def u1(theta):
+    """Return a one-qubit U1 gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.u1_gate_param_gen([theta])
+
+
+def u2(params):
+    """Return a one-qubit U2 gate from 2 parameters.
+
+    Parameters
+    ----------
+    params : sequence
+        Sequence of exactly 2 parameters.
+    """
+    if len(params) != 2:
+        raise ValueError("u2 expects exactly 2 parameters.")
+    return qtn.circuit.u2_gate_param_gen(params)
+
+
+def cphase(theta):
+    """Return a two-qubit controlled-phase gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.cu1_param_gen([theta])
+
+
+def crx(theta):
+    """Return a two-qubit controlled-RX gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.crx_param_gen([theta])
+
+
+def cry(theta):
+    """Return a two-qubit controlled-RY gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.cry_param_gen([theta])
+
+
+def crz(theta):
+    """Return a two-qubit controlled-RZ gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.crz_param_gen([theta])
+
+
+def cu1(theta):
+    """Return a two-qubit controlled-U1 gate for angle ``theta``.
+
+    Parameters
+    ----------
+    theta : float
+        Rotation angle.
+    """
+    return qtn.circuit.cu1_param_gen([theta])
+
+
+def cu2(params):
+    """Return a two-qubit controlled-U2 gate from 2 parameters.
+
+    Parameters
+    ----------
+    params : sequence
+        Sequence of exactly 2 parameters.
+    """
+    if len(params) != 2:
+        raise ValueError("cu2 expects exactly 2 parameters.")
+    return qtn.circuit.cu2_param_gen(params)
+
+
+def cu3(params):
+    """Return a two-qubit controlled-U3 gate from 3 parameters.
+
+    Parameters
+    ----------
+    params : sequence
+        Sequence of exactly 3 parameters.
+    """
+    if len(params) != 3:
+        raise ValueError("cu3 expects exactly 3 parameters.")
+    return qtn.circuit.cu3_param_gen(params)
 
 
 def rzz(theta):

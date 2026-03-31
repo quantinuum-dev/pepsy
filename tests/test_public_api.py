@@ -31,6 +31,31 @@ def test_core_symbols_exported():
     assert "apply_gates" in pepsy.__all__
     assert "gate_1d" in pepsy.__all__
     assert "canonize_mps" not in pepsy.__all__
+    assert "x" in pepsy.__all__
+    assert "y" in pepsy.__all__
+    assert "z" in pepsy.__all__
+    assert "s" in pepsy.__all__
+    assert "sdg" in pepsy.__all__
+    assert "t" in pepsy.__all__
+    assert "tdg" in pepsy.__all__
+    assert "h" in pepsy.__all__
+    assert "hadamard" in pepsy.__all__
+    assert "cnot" in pepsy.__all__
+    assert "cx" in pepsy.__all__
+    assert "cy" in pepsy.__all__
+    assert "cz" in pepsy.__all__
+    assert "swap" in pepsy.__all__
+    assert "iswap" in pepsy.__all__
+    assert "phase" in pepsy.__all__
+    assert "u1" in pepsy.__all__
+    assert "u2" in pepsy.__all__
+    assert "cphase" in pepsy.__all__
+    assert "crx" in pepsy.__all__
+    assert "cry" in pepsy.__all__
+    assert "crz" in pepsy.__all__
+    assert "cu1" in pepsy.__all__
+    assert "cu2" in pepsy.__all__
+    assert "cu3" in pepsy.__all__
     assert "rx" in pepsy.__all__
     assert "ry" in pepsy.__all__
     assert "rz" in pepsy.__all__
@@ -79,6 +104,31 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.gate_1d)
     with pytest.raises(AttributeError):
         _ = pepsy.canonize_mps
+    assert callable(pepsy.x)
+    assert callable(pepsy.y)
+    assert callable(pepsy.z)
+    assert callable(pepsy.s)
+    assert callable(pepsy.sdg)
+    assert callable(pepsy.t)
+    assert callable(pepsy.tdg)
+    assert callable(pepsy.h)
+    assert callable(pepsy.hadamard)
+    assert callable(pepsy.cnot)
+    assert callable(pepsy.cx)
+    assert callable(pepsy.cy)
+    assert callable(pepsy.cz)
+    assert callable(pepsy.swap)
+    assert callable(pepsy.iswap)
+    assert callable(pepsy.phase)
+    assert callable(pepsy.u1)
+    assert callable(pepsy.u2)
+    assert callable(pepsy.cphase)
+    assert callable(pepsy.crx)
+    assert callable(pepsy.cry)
+    assert callable(pepsy.crz)
+    assert callable(pepsy.cu1)
+    assert callable(pepsy.cu2)
+    assert callable(pepsy.cu3)
     assert callable(pepsy.rx)
     assert callable(pepsy.ry)
     assert callable(pepsy.rz)
