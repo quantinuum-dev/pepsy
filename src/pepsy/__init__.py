@@ -36,7 +36,7 @@ if TYPE_CHECKING:
         reset_default_backends,
         set_default_array_backend,
         set_default_grad_backend,
-        tn_applied,
+        tns_align,
     )
     from .linalg_registrations import reg_complex_svd_jax, reg_complex_svd_torch
     from .debug import plot_sweep_diagnostics, plot_inner_loss, plot_global_loss_trajectory
@@ -84,7 +84,7 @@ __all__ = [
     "plot_sweep_diagnostics",
     "plot_inner_loss",
     "plot_global_loss_trajectory",
-    "tn_applied",
+    "tns_align",
     "gen_long_range_swap_path",
     "apply_2dtn_",
     "apply_gates",
@@ -206,14 +206,14 @@ def __getattr__(name):
             "su4": su4,
         }[name]
 
-    if name in ("tn_applied", "product_state_peps"):
+    if name in ("tns_align", "product_state_peps"):
         from .core import (  # pylint: disable=import-outside-toplevel
             product_state_peps,
-            tn_applied,
+            tns_align,
         )
 
         return {
-            "tn_applied": tn_applied,
+            "tns_align": tns_align,
             "product_state_peps": product_state_peps,
         }[name]
 

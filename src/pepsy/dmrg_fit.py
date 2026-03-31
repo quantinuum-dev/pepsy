@@ -55,7 +55,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self,
         tn: qtn.TensorNetwork,
         p: Optional[qtn.TensorNetwork] = None,
-        cutoffs: float = 1.e-12,
+        cutoffs: float = 1e-12,
         backend: Optional[str] = None,
         site_tag_id: str = "I{}",
         opt: str = "auto-hq",
@@ -63,7 +63,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         re_tag: bool = False,
         info: Optional[Dict[str, Any]] = None,
         warning: bool = False,
-        inplace=False,
+        inplace: bool = False,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
 
         if p is None:
@@ -79,19 +79,19 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         self.tn = tn.copy()
 
-
         if site_tag_id:
+            site_ind_id = getattr(self.p, "site_ind_id", None)
             self.p.view_as_(
                 qtn.MatrixProductState,
                 L=self.L,
                 site_tag_id=site_tag_id,
-                site_ind_id=None,
+                site_ind_id=site_ind_id,
                 cyclic=False,
             )
 
         self.site_tag_id = site_tag_id
 
-        # cotengra path finder
+        # Contraction path optimizer spec.
         self.opt = opt
 
         # cutoffs and underlying backend
@@ -101,9 +101,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # warnings being printed or not
         self.warning = warning
 
-        # store cost function results
-        self.loss: List[float] = []
-        self.loss_: List[float] = []
+        # Diagnostics collected during sweeps.
+        self.fidelity_trace: List[float] = []
+        self.local_norm_trace: List[float] = []
         self.info: Dict[str, Any] = info or {}
         self.range_int: List[int] = list(range_int) if range_int is not None else []
         if self.range_int:
@@ -114,7 +114,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 raise ValueError("range_int must satisfy start < stop.")
 
 
-        # Is there a better solution?
         # Reindex tensor network with random UUIDs for internal indices
         self.tn.reindex_({idx: qtn.rand_uuid() for idx in self.tn.inner_inds()})
 
@@ -124,7 +123,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # Re-tag TN for effective environments when requested.
         if re_tag:
             self._re_tag()
-
 
     def visual(
         self,
@@ -215,7 +213,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 )
             self._deep_tag()
 
-
     def run(self, n_iter=6, verbose=False):
         """Run basic left-to-right local fitting sweeps.
 
@@ -224,7 +221,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         n_iter : int
             Number of complete sweeps.
         verbose : bool
-            If ``True``, append per-sweep fidelity values to ``self.loss``.
+            If ``True``, append per-sweep fidelity values to ``self.fidelity_trace``.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
@@ -250,7 +247,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 f = f.transpose(*psi[site].inds)
 
                 norm_f = (f.H & f).contract(all) ** 0.5
-                self.loss_.append(complex(norm_f).real)
+                self.local_norm_trace.append(complex(norm_f).real)
 
                 # Update tensor data
                 psi[site].modify(data=f.data)
@@ -258,7 +255,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             # Compute fidelity if verbose mode is enabled
             if verbose:
                 fidelity = tn_fidelity(self.tn, psi)
-                self.loss.append(ar.do("real", fidelity))
+                self.fidelity_trace.append(ar.do("real", fidelity))
 
     def _build_env_right(self, psi, env_right):
         """
@@ -285,9 +282,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 # tie to previously computed right environment
                 t |= env_right[site_tag_id.format(i + 1)]
                 env_right[site_tag_id.format(i)] = t.contract(all, optimize=opt)
-
-
-
 
     def _right_range(self, psi, env_right, start, stop):
         """
@@ -355,8 +349,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 t |= env_left[site_tag_id.format(site - 1)]
                 env_left[site_tag_id.format(site)] = t.contract(all, optimize=opt)
 
-
-
     def _update_env_left(self, psi, site: int, env_left):
         """Update left environment incrementally for current site."""
 
@@ -376,8 +368,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             t |= env_left[site_tag_id.format(site - 1)]
             env_left[site_tag_id.format(site)] = t.contract(all, optimize=opt)
 
-
-    def run_eff(self, n_iter=6, verbose=False):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
+    def run_eff(
+        self,
+        n_iter=6,
+        verbose=False,
+    ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run environment-based fitting sweeps with cached left/right blocks.
 
         This method avoids rebuilding full contractions at each site by
@@ -456,7 +451,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     raise TypeError("Unexpected effective tensor type during run_eff.")
 
                 norm_f = (f.H & f).contract(all) ** 0.5
-                self.loss_.append(complex(norm_f).real)
+                self.local_norm_trace.append(complex(norm_f).real)
 
                 # Contract and normalize
                 # Update tensor data
@@ -465,9 +460,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             # Compute fidelity if verbose mode is enabled
             if verbose:
                 fidelity = tn_fidelity(self.tn, psi)
-                self.loss.append(ar.do("real", fidelity))
-
-
+                self.fidelity_trace.append(ar.do("real", fidelity))
 
     def run_gate(
         self, n_iter=6, verbose=False
@@ -525,7 +518,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                         tn = env_right[site_tag_id.format(site + 1)]
 
                 if 0 < site < L - 1:
-
                     # Boundary consistency: the left and right indices must match between tn and p
                     if count_ == 0:
                         indx = psi.bond(start - 1, start)
@@ -579,10 +571,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     raise TypeError("Unexpected effective tensor type during run_gate.")
 
                 norm_f = (f.H & f).contract(all) ** 0.5
-
-                # norm_f = ar.do("norm", f.data)
-
-                self.loss_.append(complex(norm_f).real)
+                self.local_norm_trace.append(complex(norm_f).real)
 
                 # Contract and normalize
                 # Update tensor data
@@ -591,8 +580,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 if site < stop:
                     psi.left_canonize_site(site, bra=None)
 
-
             # Compute fidelity if verbose mode is enabled
             if verbose:
                 fidelity = tn_fidelity(self.tn, psi)
-                self.loss.append(ar.do("real", fidelity))
+                self.fidelity_trace.append(ar.do("real", fidelity))

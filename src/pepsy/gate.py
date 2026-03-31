@@ -476,17 +476,17 @@ def apply_gates(  # pylint: disable=too-many-arguments,too-many-positional-argum
     qtn.TensorNetwork
         The same ``peps`` object, updated in place.
     """
-    base_opts = dict(
-        bond_dim=bond_dim,
-        bra=bra,
-        contract=contract,
-        tags=tags,
-        dtype=dtype,
-        cutoff=cutoff,
-        canonize_distance=canonize_distance,
-        to_backend=to_backend,
-        sequence=sequence,
-    )
+    base_opts = {
+        "bond_dim": bond_dim,
+        "bra": bra,
+        "contract": contract,
+        "tags": tags,
+        "dtype": dtype,
+        "cutoff": cutoff,
+        "canonize_distance": canonize_distance,
+        "to_backend": to_backend,
+        "sequence": sequence,
+    }
 
     for idx, item in enumerate(gates):
         if isinstance(item, dict):
@@ -526,9 +526,16 @@ def apply_gates(  # pylint: disable=too-many-arguments,too-many-positional-argum
     return peps
 
 
-def gate_1d(tn, where, G, ind_id="k{}", site_tags="I{}",
-            cutoff=1.e-12, contract='split-gate', 
-            inplace=False):
+def gate_1d(
+    tn,
+    where,
+    G,
+    ind_id="k{}",
+    site_tags="I{}",
+    cutoff=1.e-12,
+    contract="split-gate",
+    inplace=False,
+):
 
     """
     Apply a 1D gate to a tensor network at one or two sites.
@@ -546,31 +553,35 @@ def gate_1d(tn, where, G, ind_id="k{}", site_tags="I{}",
     Returns:
         TensorNetwork with the gate applied and site tags added.
     """
-    
-    if len(where)==2:
+    if len(where) == 2:
         x, y = where
-        tn = qtn.tensor_network_gate_inds(tn, G, [ind_id.format(x), ind_id.format(y)], contract=contract, inplace=inplace,
-                                **{"cutoff":cutoff}
-                                    )
+        tn = qtn.tensor_network_gate_inds(
+            tn,
+            G,
+            [ind_id.format(x), ind_id.format(y)],
+            contract=contract,
+            inplace=inplace,
+            cutoff=cutoff,
+        )
 
+        # Add site tags after the gate has been applied.
+        tensor_x = [tn.tensor_map[i] for i in tn.ind_map[ind_id.format(x)]][0]
+        tensor_x.add_tag(site_tags.format(x))
+        tensor_y = [tn.tensor_map[i] for i in tn.ind_map[ind_id.format(y)]][0]
+        tensor_y.add_tag(site_tags.format(y))
 
-        # for s in (x, y):
-        #     ind = ind_id.format(s)
-        #     tids = tn.ind_map.get(ind)
-        #     if tids:
-        #         tid = next(iter(tids))
-        #         tn.tensor_map[tid].add_tag(site_tags.format(s))
+    elif len(where) == 1:
+        (x,) = where
+        tn = qtn.tensor_network_gate_inds(
+            tn,
+            G,
+            [ind_id.format(x)],
+            contract=True,
+            inplace=inplace,
+        )
 
-        
-        # adding site tags
-        t = [ tn.tensor_map[i] for i in tn.ind_map[ind_id.format(x)] ][0]
-        t.add_tag(site_tags.format(x))
-        t = [ tn.tensor_map[i] for i in tn.ind_map[ind_id.format(y)] ][0]
-        t.add_tag(site_tags.format(y))
-
-    if len(where)==1:
-        x, = where
-        tn = qtn.tensor_network_gate_inds(tn, G, [ind_id.format(x)], contract=True, inplace=inplace)
+    else:
+        raise ValueError("where must contain one or two site indices.")
 
     return tn
 

@@ -25,12 +25,20 @@ def test_core_symbols_exported():
     assert "GlobalOptimizer" in pepsy.__all__
     assert "FIT" in pepsy.__all__
     assert "PEPSGlobalOptimizer" not in pepsy.__all__
-    assert "tn_applied" in pepsy.__all__
+    assert "tns_align" in pepsy.__all__
     assert "gen_long_range_swap_path" in pepsy.__all__
     assert "apply_2dtn_" in pepsy.__all__
     assert "apply_gates" in pepsy.__all__
     assert "gate_1d" in pepsy.__all__
-    assert "canonize_mps" in pepsy.__all__
+    assert "canonize_mps" not in pepsy.__all__
+    assert "rx" in pepsy.__all__
+    assert "ry" in pepsy.__all__
+    assert "rz" in pepsy.__all__
+    assert "rxx" in pepsy.__all__
+    assert "ryy" in pepsy.__all__
+    assert "rzz" in pepsy.__all__
+    assert "u3" in pepsy.__all__
+    assert "su4" in pepsy.__all__
     assert "apply_gates_" not in pepsy.__all__
     assert "product_state_peps" in pepsy.__all__
     assert "peps_I" not in pepsy.__all__
@@ -41,6 +49,7 @@ def test_core_symbols_exported():
     assert "SweepResult" in pepsy.__all__
     assert "plot_sweep_diagnostics" in pepsy.__all__
     assert "plot_inner_loss" in pepsy.__all__
+    assert "MpsOptimizer" in pepsy.__all__
     assert "optimize_global" in pepsy.__all__
     assert "optimize_sweep" in pepsy.__all__
     assert "gate" in pepsy.__all__
@@ -63,12 +72,21 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.FIT)
     with pytest.raises(AttributeError):
         _ = pepsy.PEPSGlobalOptimizer
-    assert callable(pepsy.tn_applied)
+    assert callable(pepsy.tns_align)
     assert callable(pepsy.gen_long_range_swap_path)
     assert callable(pepsy.apply_2dtn_)
     assert callable(pepsy.apply_gates)
     assert callable(pepsy.gate_1d)
-    assert callable(pepsy.canonize_mps)
+    with pytest.raises(AttributeError):
+        _ = pepsy.canonize_mps
+    assert callable(pepsy.rx)
+    assert callable(pepsy.ry)
+    assert callable(pepsy.rz)
+    assert callable(pepsy.rxx)
+    assert callable(pepsy.ryy)
+    assert callable(pepsy.rzz)
+    assert callable(pepsy.u3)
+    assert callable(pepsy.su4)
     with pytest.raises(AttributeError):
         _ = pepsy.apply_gates_
     assert callable(pepsy.product_state_peps)
@@ -78,6 +96,7 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.reg_complex_svd_jax)
     assert callable(pepsy.plot_sweep_diagnostics)
     assert callable(pepsy.plot_inner_loss)
+    assert callable(pepsy.MpsOptimizer)
     assert pepsy.optimize_global is not None
     assert pepsy.optimize_sweep is not None
     assert pepsy.gate is not None

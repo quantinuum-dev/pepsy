@@ -13,3 +13,6 @@ store/
 nohup.out
 
 *.egg-info/
+.eggs/
+build/
+dist/

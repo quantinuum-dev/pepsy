@@ -2,6 +2,8 @@
 
 import importlib.util
 import math
+import os
+import tempfile
 import warnings
 from typing import Any
 
@@ -25,10 +27,72 @@ __all__ = [
     "build_optimizer",
     "build_compressed_optimizer",
     "tn_fidelity",
+    "tns_align",
+    "product_state_peps",
 ]
 
 _DEFAULT_ARRAY_BACKEND = None
 _DEFAULT_GRAD_BACKEND = None
+
+
+def _default_cache_root():
+    """Return default cache root for pepsy artifacts."""
+    env_cache = os.environ.get("PEPSY_CACHE_DIR")
+    if env_cache:
+        return env_cache
+
+    try:
+        from platformdirs import user_cache_dir  # pylint: disable=import-outside-toplevel
+
+        return user_cache_dir("pepsy")
+    except Exception:  # pragma: no cover - optional dependency fallback
+        return os.path.join(os.path.expanduser("~"), ".cache", "pepsy")
+
+
+def _resolve_cache_directory(directory, subdir):
+    """Resolve cache directory, honoring global disable and env override."""
+    if directory is not None:
+        return _ensure_cache_directory(directory, warn=True)
+
+    disable_cache = os.environ.get("PEPSY_DISABLE_CACHE", "").strip().lower()
+    if disable_cache in {"1", "true", "yes", "on"}:
+        return None
+
+    default_cache = _ensure_cache_directory(os.path.join(_default_cache_root(), subdir), warn=False)
+    if default_cache is not None:
+        return default_cache
+
+    # Fallback for restricted environments where user-cache is not writable.
+    fallback_cache = _ensure_cache_directory(
+        os.path.join(tempfile.gettempdir(), "pepsy-cache", subdir),
+        warn=False,
+    )
+    if fallback_cache is not None:
+        return fallback_cache
+
+    warnings.warn(
+        "No writable cache directory available. Disabling optimizer cache.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return None
+
+
+def _ensure_cache_directory(path, warn=False):
+    """Create cache directory when possible, else return ``None``."""
+    if path is None:
+        return None
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except OSError:
+        if warn:
+            warnings.warn(
+                f"Cache directory '{path}' is not writable. Disabling optimizer cache.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return None
 
 
 def _validate_backend_callable(name, fn):
@@ -183,10 +247,18 @@ def build_optimizer(
     max_repeats=2**6,
     parallel=True,
     optlib="cmaes",
-    directory="cash/",
+    directory=None,
     hash_method="b",
 ):
-    """Build and return a reusable cotengra contraction optimizer."""
+    """Build and return a reusable cotengra contraction optimizer.
+
+    Parameters
+    ----------
+    directory : str | None, optional
+        Cache directory for optimizer artifacts. If ``None``, defaults to
+        ``$PEPSY_CACHE_DIR/cotengra`` (or OS user-cache dir fallback). Set
+        environment variable ``PEPSY_DISABLE_CACHE=1`` to force ``None``.
+    """
     selected_optlib = optlib
     if selected_optlib == "cmaes" and importlib.util.find_spec("cmaes") is None:
         warnings.warn(
@@ -194,6 +266,7 @@ def build_optimizer(
             RuntimeWarning,
         )
         selected_optlib = "random"
+    cache_dir = _resolve_cache_directory(directory, "cotengra")
     opt = ctg.ReusableHyperOptimizer(
         minimize=f"combo-{int(alpha)}",
         slicing_opts={"target_size": 2**40},
@@ -204,7 +277,7 @@ def build_optimizer(
         optlib=selected_optlib,
         max_time=max_time,
         hash_method=hash_method,
-        directory=directory,
+        directory=cache_dir,
         progbar=progbar,
         on_trial_error="ignore",
     )
@@ -218,14 +291,23 @@ def build_compressed_optimizer(
     max_repeats=2**8,
     max_time="rate:1e8",
 ):
-    """Build and return a reusable cotengra compressed optimizer."""
+    """Build and return a reusable cotengra compressed optimizer.
+
+    Parameters
+    ----------
+    directory : str | None, optional
+        Cache directory for optimizer artifacts. If ``None``, defaults to
+        ``$PEPSY_CACHE_DIR/cotengra-compressed`` (or OS user-cache dir
+        fallback). Set ``PEPSY_DISABLE_CACHE=1`` to force ``None``.
+    """
+    cache_dir = _resolve_cache_directory(directory, "cotengra-compressed")
     copt = ctg.ReusableHyperCompressedOptimizer(
         chi,
         max_repeats=max_repeats,
         minimize="combo-compressed",
         progbar=progbar,
         max_time=max_time,
-        directory=directory,
+        directory=cache_dir,
     )
     return copt
 
@@ -259,7 +341,7 @@ def add_cycle(peps, bond_dim, cylinder=False):
     return peps
 
 
-def tn_applied(p, pepo):
+def tns_align(p, pepo):
     r"""Apply a PEPO operator to a PEPS ket: :math:`\hat{O}|\psi\rangle`.
 
     The PEPO ``k``-indices contract with the PEPS ``k``-indices on join.
