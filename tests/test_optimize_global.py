@@ -155,7 +155,7 @@ def test_global_optimizer_warns_on_unknown_kwargs():
 
 
 def test_global_optimizer_optional_target_allows_norm_and_normalize():
-    """peps_target should be optional for norm/normalize workflows."""
+    """state_target should be optional for norm/normalize workflows."""
     peps = _rand_peps(seed=25)
     opt = GlobalOptimizer(peps)
     val = complex(opt.norm(mode="exact", opt="auto-hq"))
@@ -168,9 +168,9 @@ def test_global_optimizer_optional_target_blocks_loss_methods():
     """loss and TNOptimizer construction should require a target state."""
     peps = _rand_peps(seed=26)
     opt = GlobalOptimizer(peps)
-    with pytest.raises(ValueError, match="peps_target is required for loss"):
+    with pytest.raises(ValueError, match="state_target is required for loss"):
         _ = opt.loss()
-    with pytest.raises(ValueError, match="peps_target is required for make_tn_optimizer"):
+    with pytest.raises(ValueError, match="state_target is required for make_tn_optimizer"):
         _ = opt.make_tn_optimizer()
 
 

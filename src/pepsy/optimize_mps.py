@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from numbers import Integral
 
-from .dmrg_fit import FIT
+from .fit import FIT
 from .gate import gate_1d
 
 __all__ = ["MpsOptimizer"]
@@ -154,8 +154,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mode=None,
         fidelity_samples=10,
         k_2q_batch=1,
-        norm_samples=None,
-        target_norm_samples=None,
     ):
         """Run the currently queued gates.
 
@@ -177,16 +175,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             DMRG mode only: number of sequential two-qubit gates to batch
             into one local FIT update. The FIT window uses the batch-wide
             ``[xmin, xmax]`` from all two-qubit gate locations in the batch.
-        norm_samples : int | None, default=None
-            Deprecated alias for ``fidelity_samples`` retained for compatibility.
-        target_norm_samples : int | None, default=None
-            Deprecated alias for ``fidelity_samples`` retained for compatibility.
         """
-        if norm_samples is not None:
-            fidelity_samples = norm_samples
-        if target_norm_samples is not None:
-            fidelity_samples = target_norm_samples
-
         if mode is not None:
             self.set_mode(mode)
 

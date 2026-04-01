@@ -1,25 +1,28 @@
 """Pepsy boundary-contraction library package."""
 
 from importlib import import_module
-from importlib.metadata import version as _pkg_version
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import TYPE_CHECKING
 
-__version__ = _pkg_version("pepsy")
+try:
+    __version__ = _pkg_version("pepsy")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
 
 if TYPE_CHECKING:
     from . import (
-        boundary_norm,
+        boundary_metrics,
         boundary_states,
         boundary_sweeps,
         core,
-        debug,
-        dmrg_fit,
+        fit,
         gate,
+        ham,
         gradient_solver,
         optimize_global,
         optimize_sweep,
     )
-    from .boundary_norm import (
+    from .boundary_metrics import (
         BoundaryContractResult,
         ContractBoundary,
         infidelity,
@@ -39,13 +42,13 @@ if TYPE_CHECKING:
         tns_align,
     )
     from .linalg_registrations import reg_complex_svd_jax, reg_complex_svd_torch
-    from .debug import plot_sweep_diagnostics, plot_inner_loss, plot_global_loss_trajectory
-    from .dmrg_fit import FIT
+    from .fit import FIT
     from .gate import (
         apply_2dtn_,
         apply_gates,
         gate_1d,
         gen_long_range_swap_path,
+        pauli,
         x,
         y,
         z,
@@ -80,8 +83,11 @@ if TYPE_CHECKING:
         u3,
         su4,
     )
+    from .ham import (
+        ham_tn,
+    )
     from .optimize_global import GlobalOptimizer
-    from .optimize_sweep import PEPSSweepOptimizer, SweepResult
+    from .optimize_sweep import SweepOptimizer, SweepResult
     from .optimize_mps import MpsOptimizer
 
 __all__ = [
@@ -104,16 +110,14 @@ __all__ = [
     "reg_complex_svd_torch",
     "reg_complex_svd_jax",
     "reset_default_backends",
-    "PEPSSweepOptimizer",
+    "SweepOptimizer",
     "SweepResult",
-    "plot_sweep_diagnostics",
-    "plot_inner_loss",
-    "plot_global_loss_trajectory",
     "tns_align",
     "gen_long_range_swap_path",
     "apply_2dtn_",
     "apply_gates",
     "gate_1d",
+    "pauli",
     "x",
     "y",
     "z",
@@ -147,17 +151,18 @@ __all__ = [
     "rzz",
     "u3",
     "su4",
+    "ham_tn",
     "product_state_peps",
     "optimize_global",
     "optimize_sweep",
     "gradient_solver",
     "gate",
-    "boundary_norm",
+    "ham",
+    "boundary_metrics",
     "boundary_states",
     "boundary_sweeps",
     "core",
-    "dmrg_fit",
-    "debug",
+    "fit",
     "MpsOptimizer",
 ]
 
@@ -165,17 +170,17 @@ __all__ = [
 def __getattr__(name):
     """Lazily import public API symbols and common submodules."""
     if name in (
-        "boundary_norm",
+        "boundary_metrics",
         "boundary_states",
         "boundary_sweeps",
-        "debug",
         "gate",
+        "ham",
         "gradient_solver",
         "optimize_mps",
         "optimize_global",
         "optimize_sweep",
         "core",
-        "dmrg_fit",
+        "fit",
     ):
         return import_module(f".{name}", __name__)
 
@@ -186,7 +191,7 @@ def __getattr__(name):
         "normalize",
         "infidelity",
     ):
-        from .boundary_norm import (  # pylint: disable=import-outside-toplevel
+        from .boundary_metrics import (  # pylint: disable=import-outside-toplevel
             BoundaryContractResult,
             ContractBoundary,
             infidelity,
@@ -208,7 +213,7 @@ def __getattr__(name):
         return GlobalOptimizer
 
     if name == "FIT":
-        from .dmrg_fit import FIT  # pylint: disable=import-outside-toplevel
+        from .fit import FIT  # pylint: disable=import-outside-toplevel
 
         return FIT
 
@@ -217,6 +222,7 @@ def __getattr__(name):
         "apply_2dtn_",
         "apply_gates",
         "gate_1d",
+        "pauli",
         "x",
         "y",
         "z",
@@ -256,6 +262,7 @@ def __getattr__(name):
             apply_gates,
             gate_1d,
             gen_long_range_swap_path,
+            pauli,
             x,
             y,
             z,
@@ -296,6 +303,7 @@ def __getattr__(name):
             "apply_2dtn_": apply_2dtn_,
             "apply_gates": apply_gates,
             "gate_1d": gate_1d,
+            "pauli": pauli,
             "x": x,
             "y": y,
             "z": z,
@@ -330,6 +338,11 @@ def __getattr__(name):
             "u3": u3,
             "su4": su4,
         }[name]
+
+    if name == "ham_tn":
+        from .ham import ham_tn  # pylint: disable=import-outside-toplevel
+
+        return ham_tn
 
     if name in ("tns_align", "product_state_peps"):
         from .core import (  # pylint: disable=import-outside-toplevel
@@ -395,27 +408,14 @@ def __getattr__(name):
 
         return CompBdy
 
-    if name in ("plot_sweep_diagnostics", "plot_inner_loss", "plot_global_loss_trajectory"):
-        from .debug import (  # pylint: disable=import-outside-toplevel
-            plot_global_loss_trajectory,
-            plot_inner_loss,
-            plot_sweep_diagnostics,
-        )
-
-        return {
-            "plot_sweep_diagnostics": plot_sweep_diagnostics,
-            "plot_inner_loss": plot_inner_loss,
-            "plot_global_loss_trajectory": plot_global_loss_trajectory,
-        }[name]
-
-    if name in ("PEPSSweepOptimizer", "SweepResult"):
+    if name in ("SweepOptimizer", "SweepResult"):
         from .optimize_sweep import (  # pylint: disable=import-outside-toplevel
-            PEPSSweepOptimizer,
+            SweepOptimizer,
             SweepResult,
         )
 
         return {
-            "PEPSSweepOptimizer": PEPSSweepOptimizer,
+            "SweepOptimizer": SweepOptimizer,
             "SweepResult": SweepResult,
         }[name]
 

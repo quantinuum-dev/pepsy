@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from pepsy.gradient_solver import SUPPORTED_SOLVERS, optimize_packed_params
-from pepsy.optimize_sweep import PEPSSweepOptimizer
+from pepsy.optimize_sweep import SweepOptimizer
 
 
 def _loss_quadratic(params):
@@ -202,14 +202,14 @@ def test_returns_best_params_not_last_for_non_monotonic_trajectory():
 def test_resolve_user_solver_maps_lbfgs_to_scipy_with_warning():
     """Sweep-level 'lbfgs' shorthand should route to scipy-lbfgs."""
     with pytest.warns(UserWarning, match="defaults to SciPy"):
-        solver = PEPSSweepOptimizer._resolve_user_solver("lbfgs")  # pylint: disable=protected-access
+        solver = SweepOptimizer._resolve_user_solver("lbfgs")  # pylint: disable=protected-access
     assert solver == "scipy-lbfgs"
 
 
 def test_resolve_user_solver_warns_for_nlopt():
     """NLopt path should warn users with neutral option-tuning guidance."""
     with pytest.warns(UserWarning, match="uses NLopt"):
-        solver = PEPSSweepOptimizer._resolve_user_solver("nlopt-lbfgs")  # pylint: disable=protected-access
+        solver = SweepOptimizer._resolve_user_solver("nlopt-lbfgs")  # pylint: disable=protected-access
     assert solver == "nlopt-lbfgs"
 
 

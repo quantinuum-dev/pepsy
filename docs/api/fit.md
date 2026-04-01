@@ -1,7 +1,7 @@
-# `pepsy.boundary_norm`
+# `pepsy.fit`
 
 ```{eval-rst}
-.. automodule:: pepsy.boundary_norm
+.. automodule:: pepsy.fit
    :members:
    :undoc-members:
    :show-inheritance:

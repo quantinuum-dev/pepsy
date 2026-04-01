@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from .boundary_states import BdyMPS
 from .core import build_optimizer, tn_fidelity
-from .dmrg_fit import FIT
+from .fit import FIT
 
 __all__ = ["BdyMPS", "CompBdy", "tn_fidelity", "build_optimizer"]
 
@@ -72,7 +72,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.re_update = True
         self.re_tag = False
         self.visual_ = False
-        self.fidel_ = False
+        self.boundary_fidel = False
         self.fidel = []
         self.pbar = False
         self.max_separation = 0
@@ -154,7 +154,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         re_tag=False,
         visual_=False,
         flat=False,
-        fidel_=False,
+        boundary_fidel=False,
         pbar=False,
         n_iter=4,
         eq_norms=False,
@@ -169,7 +169,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.re_tag = re_tag
         self.visual_ = visual_
         self.flat = flat
-        self.fidel_ = fidel_
+        self.boundary_fidel = boundary_fidel
         self.pbar = pbar
         self.n_iter = n_iter
         self.eq_norms = eq_norms
@@ -317,13 +317,13 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
             if self.eq_norms:
                 fit.p.equalize_norms_(value=self.eq_norms)
-            if self.fidel_:
+            if self.boundary_fidel:
                 fidelity = tn_fidelity(tn, fit.p)
                 self.fidel.append(fidelity)
 
             if progress_bar is not None:
                 postfix = {"chi": int(fit.p.max_bond())}
-                if self.fidel_:
+                if self.boundary_fidel:
                     prod_fidelity = np.prod(self.fidel)
                     postfix["F"] = complex(prod_fidelity).real
                 progress_bar.set_postfix(postfix)
@@ -381,7 +381,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         if self.eq_norms:
             fit.p.equalize_norms_(value=self.eq_norms)
-        if self.fidel_:
+        if self.boundary_fidel:
             fidelity = tn_fidelity(tn, fit.p)
             self.fidel.append(fidelity)
 
@@ -418,7 +418,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         re_tag=False,
         visual_=False,
         flat=False,
-        fidel_=False,
+        boundary_fidel=False,
         pbar=False,
         n_iter=4,
         eq_norms=True,
@@ -440,7 +440,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             Enable intermediate tensor-network drawings.
         flat : bool, default=False
             Skip first-step fitting and use raw slice directly.
-        fidel_ : bool, default=False
+        boundary_fidel : bool, default=False
             If ``True``, compute and store per-step fidelity values in
             ``self.fidel``.
         pbar : bool, default=False
@@ -466,7 +466,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             re_tag=re_tag,
             visual_=visual_,
             flat=flat,
-            fidel_=fidel_,
+            boundary_fidel=boundary_fidel,
             pbar=pbar,
             n_iter=n_iter,
             eq_norms=eq_norms,
@@ -513,7 +513,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         re_tag=False,
         visual_=False,
         flat=False,
-        fidel_=False,
+        boundary_fidel=False,
         pbar=False,
         n_iter=4,
         eq_norms=False,
@@ -526,7 +526,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             re_tag=re_tag,
             visual_=visual_,
             flat=flat,
-            fidel_=fidel_,
+            boundary_fidel=boundary_fidel,
             pbar=pbar,
             n_iter=n_iter,
             eq_norms=eq_norms,
@@ -576,7 +576,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         re_tag=False,
         visual_=False,
         flat=False,
-        fidel_=False,
+        boundary_fidel=False,
         pbar=False,
         n_iter=4,
         eq_norms=False,
@@ -589,7 +589,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             re_tag=re_tag,
             visual_=visual_,
             flat=flat,
-            fidel_=fidel_,
+            boundary_fidel=boundary_fidel,
             pbar=pbar,
             n_iter=n_iter,
             eq_norms=eq_norms,
@@ -636,7 +636,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                     postfix = {"pos": int(pos)}
                     if hasattr(updated, "max_bond"):
                         postfix["chi"] = int(updated.max_bond())
-                    if self.fidel_ and self.fidel:
+                    if self.boundary_fidel and self.fidel:
                         postfix["F"] = complex(self.fidel[-1]).real
                     if postfix:
                         progress_bar.set_postfix(postfix)

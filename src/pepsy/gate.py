@@ -15,6 +15,7 @@ import quimb.tensor as qtn
 __all__ = [
     "apply_gates",
     "gate_1d",
+    "pauli",
     "x",
     "y",
     "z",
@@ -128,19 +129,27 @@ def rz(theta):
     return qtn.circuit.rz_gate_param_gen([theta])
 
 
+def pauli(which, dtype=None):
+    """Return a one-qubit Pauli matrix by label, e.g. ``'X'`` or ``'Z'``."""
+    label = str(which).upper()
+    if dtype is None:
+        return qu.pauli(label)
+    return qu.pauli(label, dtype=dtype)
+
+
 def x():
     """Return the one-qubit Pauli-X gate."""
-    return qu.pauli("X")
+    return pauli("X")
 
 
 def y():
     """Return the one-qubit Pauli-Y gate."""
-    return qu.pauli("Y")
+    return pauli("Y")
 
 
 def z():
     """Return the one-qubit Pauli-Z gate."""
-    return qu.pauli("Z")
+    return pauli("Z")
 
 
 def s():

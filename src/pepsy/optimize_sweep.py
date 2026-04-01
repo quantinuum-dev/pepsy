@@ -5,21 +5,25 @@ from __future__ import annotations
 import re
 import time
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import quimb.tensor as qtn
 from tqdm import tqdm
 
-from .boundary_norm import prepare_boundary_inputs, normalize
+from .boundary_metrics import infidelity as boundary_infidelity
+from .boundary_metrics import prepare_boundary_inputs, normalize
+from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
+from .core import tn_fidelity
 from .gradient_solver import optimize_packed_params as run_gradient_solver
 
 _PHYS_IND_PATTERN = re.compile(r"^k\d+(?:,\d+)*$")
 _TAG_X = re.compile(r"^X(\d+)$")
 _TAG_Y = re.compile(r"^Y(\d+)$")
 
-__all__ = ["PEPSSweepOptimizer", "SweepResult"]
+__all__ = ["SweepOptimizer", "SweepResult"]
 
 
 @dataclass(frozen=True)
@@ -27,13 +31,14 @@ class SweepResult:
     """Return object for global sweep runs."""
 
     runs: list[dict[str, Any]]
-    fidelity_before: float | None
-    fidelity_after: float | None
     loss_before: float | None
     loss_after: float | None
+    step_loss_trace: list[float] | None = None
+    inner_loss_traces: list[list[float]] | None = None
+    step_trace: list[dict[str, Any]] | None = None
 
 
-class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
+class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     """Optimize PEPS slices with alternating x/y boundary sweeps.
 
     Parameters
@@ -42,68 +47,300 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         Trainable PEPS-like tensor network.
     target : qtn.TensorNetwork
         Reference network for overlap objective.
-    bdy : pepsy.boundary_states.BdyMPS
-        Boundary container used for norm contractions.
-    bdy_overlap : pepsy.boundary_states.BdyMPS
-        Boundary container used for overlap contractions.
-    opt : object
+    chi : int | None, default=None
+        Boundary bond dimension used when ``bdy``/``bdy_overlap`` are not
+        supplied.
+    bdy : pepsy.boundary_states.BdyMPS | None, default=None
+        Optional pre-built boundary container for norm contractions.
+    bdy_overlap : pepsy.boundary_states.BdyMPS | None, default=None
+        Optional pre-built boundary container for overlap contractions.
+    opt : object | str, default="auto-hq"
         Contraction optimizer.
     dmrg_run : {"eff", "global"}, default="eff"
         Backend mode passed to :class:`pepsy.boundary_sweeps.CompBdy`.
     """
 
+    _NORMALIZE_KEYS = frozenset({
+        "opt",
+        "n_iter",
+        "direction",
+        "max_separation",
+        "pbar",
+        "boundary_fidel",
+    })
+    _INFIDELITY_KEYS = frozenset({
+        "chi",
+        "norm",
+        "norm_target",
+        "opt",
+        "n_iter",
+        "direction",
+        "max_separation",
+        "pbar",
+        "boundary_fidel",
+        "single_layer",
+    })
+    _OPTIMIZE_KEYS = frozenset({
+        "axes",
+        "n",
+        "n_round_trips",
+        "chi",
+        "optimizer",
+        "optimizer_options",
+        "env_n_iter",
+        "progbar",
+        "debug",
+        "debug_loss_mode",
+        "debug_loss_kwargs",
+        "boundary_fidel",
+        "renormalize",
+    })
+    _DEFAULT_SOLVER_OPTIONS = {
+        "algorithm": "LBFGS",
+        "lr": 1e-2,
+        "n_steps": 50,
+        "maxeval": 100,
+        "ftol_rel": 1e-9,
+        "xtol_rel": 1e-9,
+        "patience": 40,
+        "min_steps": 10,
+        "restore_best": True,
+        "bad_max": 20,
+        "penalty_on_bad": 1e20,
+    }
+
+    @staticmethod
+    def _merge_opts(base, extra):
+        merged = dict(base or {})
+        if extra:
+            merged.update(dict(extra))
+        return merged
+
+    @classmethod
+    def _pick_known_keys(cls, options, allowed_keys, *, warn_unknown=True):
+        incoming = dict(options or {})
+        filtered = {key: value for key, value in incoming.items() if key in allowed_keys}
+        unknown = sorted(set(incoming) - set(allowed_keys))
+        if warn_unknown and unknown:
+            warnings.warn(
+                f"Ignoring unknown options: {', '.join(unknown)}",
+                UserWarning,
+                stacklevel=3,
+            )
+        return filtered
+
+    @classmethod
+    def default_solver_options(cls):
+        """Return copy of package default local-solver options."""
+        return dict(cls._DEFAULT_SOLVER_OPTIONS)
+
+    @classmethod
+    def normalize_kwarg_names(cls):
+        """Return supported keyword names for :meth:`normalize` defaults."""
+        return tuple(sorted(cls._NORMALIZE_KEYS))
+
+    @classmethod
+    def optimize_kwarg_names(cls):
+        """Return supported keyword names for :meth:`set_optimize_kwargs`."""
+        return tuple(sorted(cls._OPTIMIZE_KEYS))
+
+    @classmethod
+    def infidelity_kwarg_names(cls):
+        """Return supported keyword names for :meth:`infidelity`."""
+        return tuple(sorted(cls._INFIDELITY_KEYS))
+
+    @classmethod
+    def kwarg_guide(cls):
+        """Return a compact guide of public kwargs and default solver options."""
+        return {
+            "normalize": cls.normalize_kwarg_names(),
+            "optimize": cls.optimize_kwarg_names(),
+            "infidelity": cls.infidelity_kwarg_names(),
+            "optimizer_defaults": cls.default_solver_options(),
+        }
+
+    @classmethod
+    def _merge_solver_options(cls, options):
+        merged = cls.default_solver_options()
+        if options:
+            merged.update(dict(options))
+        return merged
+
+    @classmethod
+    def _collect_init_renormalize_kwargs(
+        cls,
+        *,
+        renormalize_kwargs=None,
+        n_iter=None,
+        direction=None,
+        max_separation=None,
+        pbar=None,
+        boundary_fidel=None,
+    ):
+        """Collect init-time normalize kwargs from explicit and mapping styles."""
+        legacy = {
+            "n_iter": n_iter,
+            "direction": direction,
+            "max_separation": max_separation,
+            "pbar": pbar,
+            "boundary_fidel": boundary_fidel,
+        }
+        # Only forward values the caller explicitly set.
+        legacy = {k: v for k, v in legacy.items() if v is not None}
+        out = cls._pick_known_keys(legacy, cls._NORMALIZE_KEYS, warn_unknown=False)
+        if renormalize_kwargs:
+            out.update(cls._pick_known_keys(renormalize_kwargs, cls._NORMALIZE_KEYS))
+        return out
+
     def __init__(
         self,
         state,
-        target,
+        state_target,
         *,
-        bdy,
-        bdy_overlap,
-        opt,
+        chi=None,
+        bdy=None,
+        bdy_overlap=None,
+        opt="auto-hq",
         dmrg_run="eff",
-        equalize_norms=1,
+        single_layer=False,
+        normalize_kwargs: Mapping[str, Any] | None = None,
+        optimize_kwargs: Mapping[str, Any] | None = None,
+        renormalize_state=False,
+        renormalize_kwargs: Mapping[str, Any] | None = None,
+        n_iter: int | None = None,
+        direction: str | None = None,
+        max_separation: int | None = None,
+        pbar: bool | None = None,
+        boundary_fidel: bool | None = None,
     ):
+        if (bdy is None) ^ (bdy_overlap is None):
+            raise ValueError("Provide both bdy and bdy_overlap together, or neither.")
+
+        if bdy is None and bdy_overlap is None:
+            if chi is None:
+                raise ValueError(
+                    "Provide chi when bdy and bdy_overlap are not supplied."
+                )
+            if state_target is None:
+                raise ValueError("state_target is required when boundaries are not supplied.")
+            bdy, bdy_overlap = self._build_boundary_pair(
+                state,
+                state_target,
+                chi=chi,
+                single_layer=single_layer,
+            )
+        for name, obj in (("bdy", bdy), ("bdy_overlap", bdy_overlap)):
+            if not hasattr(obj, "mps_b"):
+                raise TypeError(f"{name} must expose attribute 'mps_b'.")
+
         self.state = state
-        self.target = target
+        self.state_target = state_target
         self.bdy = bdy
         self.bdy_overlap = bdy_overlap
         self.opt = opt
         self.dmrg_run = dmrg_run
-        self.equalize_norms = equalize_norms
+
+        if normalize_kwargs is None:
+            self.normalize_kwargs = {}
+        else:
+            self.normalize_kwargs = self._pick_known_keys(normalize_kwargs, self._NORMALIZE_KEYS)
+        self.optimize_kwargs = self._pick_known_keys(optimize_kwargs, self._OPTIMIZE_KEYS)
 
         self.Lx, self.Ly = self._infer_shape(self.state)
-        self._last_axis_runs = None
-        self._last_sweep_result = None
+        self._reset_run_traces()
 
-    _PLOT_METRIC_ALIASES = {
-        "loss": "loss",
-        "infidelity": "loss",
-        "global_infidelity": "loss",
-        "global_loss": "loss",
-        "norm_peps": "state_norm",
-        "state_norm": "state_norm",
-        "norm_state": "state_norm",
-        "bdy_norm": "bdy_norm",
-        "boundary_norm": "bdy_norm",
-        "bdy_overlap_norm": "bdy_overlap_norm",
-        "boundary_overlap_norm": "bdy_overlap_norm",
-        "bdy_overlap": "bdy_overlap_norm",
-        "time_boundary": "time_boundary",
-        "boundary_time": "time_boundary",
-        "time_optimize": "time_optimize",
-        "optimize_time": "time_optimize",
-        "time_total": "time_total",
-        "timing": "time_total",
+        init_renormalize_kwargs = self._collect_init_renormalize_kwargs(
+            renormalize_kwargs=renormalize_kwargs,
+            n_iter=n_iter,
+            direction=direction,
+            max_separation=max_separation,
+            pbar=pbar,
+            boundary_fidel=boundary_fidel,
+        )
+
+        if renormalize_state:
+            self.normalize(**init_renormalize_kwargs)
+
+    @staticmethod
+    def _build_boundary_pair(state, target, *, chi, single_layer=False):
+        """Construct norm and overlap boundary MPS containers."""
+        _, state_norm = prepare_boundary_inputs(ket=state, bra=None)
+        _, overlap_norm = prepare_boundary_inputs(ket=target, bra=state)
+        bdy = BdyMPS(
+            tn_double=state_norm,
+            chi=chi,
+            single_layer=single_layer,
+        )
+        bdy_overlap = BdyMPS(
+            tn_double=overlap_norm,
+            chi=chi,
+            single_layer=single_layer,
+        )
+        return bdy, bdy_overlap
+
+    def _reset_run_traces(self):
+        """Reset lightweight traces collected during :meth:`optimize_global`."""
+        self.step_loss_trace = []
+        self.inner_loss_traces = []
+        self.step_trace = []
+
+    @staticmethod
+    def _to_float_history(history):
+        """Convert solver history entries into plain Python floats."""
+        values = []
+        for entry in history or ():
+            value = entry
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "cpu"):
+                value = value.cpu()
+            values.append(float(value))
+        return values
+
+    def _collect_axis_run_traces(self, axis_runs, *, cycle, axis, debug=False):
+        """Collect per-step traces from axis run records."""
+        if not axis_runs:
+            return
+
+        for run_info in axis_runs:
+            local_loss = run_info.get("loss_final")
+            exact_loss = run_info.get("exact_loss_after")
+            if debug and exact_loss is not None:
+                step_loss = float(exact_loss)
+            elif local_loss is not None:
+                step_loss = float(local_loss)
+            else:
+                step_loss = None
+
+            if step_loss is not None:
+                self.step_loss_trace.append(step_loss)
+
+            boundary_time = float(run_info.get("time_boundary", 0.0))
+            optimize_time = float(run_info.get("time_optimize", 0.0))
+
+            trace_entry = {
+                "cycle": int(cycle),
+                "axis": axis,
+                "move": run_info.get("sweep"),
+                "index": run_info.get("index"),
+                "time_boundary": boundary_time,
+                "time_optimize": optimize_time,
+                "time_total": boundary_time + optimize_time,
+                "boundary_fidelity_norm": run_info.get("boundary_fidelity_norm"),
+                "boundary_fidelity_overlap": run_info.get("boundary_fidelity_overlap"),
+            }
+            self.step_trace.append(trace_entry)
+
+            history = run_info.get("history")
+            if history is not None:
+                self.inner_loss_traces.append(list(history))
+
+    _SOLVER_ALIASES = {
+        "scipy": "scipy-lbfgs",
+        "scipy_lbfgs": "scipy-lbfgs",
+        "nlopt": "nlopt-lbfgs",
+        "nlopt_lbfgs": "nlopt-lbfgs",
     }
-    _PLOT_LOG_METRICS = frozenset({
-        "loss",
-        "state_norm",
-        "bdy_norm",
-        "bdy_overlap_norm",
-        "time_boundary",
-        "time_optimize",
-        "time_total",
-    })
 
     @staticmethod
     def _infer_shape(state):
@@ -123,234 +360,171 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def metrics(self):
         """Return global normalized ``(fidelity, loss)``."""
-        norm_state = abs(complex((self.state.H & self.state).contract(all, optimize=self.opt)))
-        norm_target = abs(complex((self.target.H & self.target).contract(all, optimize=self.opt)))
-        overlap = complex((self.target.H & self.state).contract(all, optimize=self.opt))
-        fidelity = (abs(overlap) ** 2) / (norm_state * norm_target)
+        if self.state_target is None:
+            raise ValueError(
+                "state_target is required for metrics(). "
+                "Set it in constructor or via set_target()."
+            )
+        fidelity = tn_fidelity(self.state, self.state_target, opt=self.opt)
         loss = 1.0 - fidelity
-        return float(fidelity.real), float(loss.real)
+        return float(fidelity), float(loss)
 
-    @classmethod
-    def available_plot_metrics(cls):
-        """Return supported metric names for :meth:`plot_runs`."""
-        return tuple(
-            key for key in cls._PLOT_METRIC_ALIASES
-            if key == cls._PLOT_METRIC_ALIASES[key]
+    def _approx_infidelity_loss(self, *, env_n_iter=4, kwargs=None):
+        """Return boundary-infidelity loss for lightweight global diagnostics."""
+        infid_kwargs = self._pick_known_keys(
+            kwargs,
+            self._INFIDELITY_KEYS,
+            warn_unknown=False,
         )
+        infid_kwargs.setdefault("n_iter", env_n_iter)
+        infid_kwargs.setdefault("pbar", False)
+        infid_kwargs.setdefault("boundary_fidel", False)
+        try:
+            result = self.infidelity(**infid_kwargs)
+        except (AttributeError, ValueError, TypeError):
+            return None
+        return float(result)
 
-    @classmethod
-    def _normalize_plot_metric(cls, name):
-        key = str(name).strip().lower()
-        if key not in cls._PLOT_METRIC_ALIASES:
-            supported = ", ".join(cls.available_plot_metrics())
-            raise ValueError(f"Unsupported metric {name!r}. Choose from: {supported}")
-        return cls._PLOT_METRIC_ALIASES[key]
+    def _ensure_boundary_chi(self, chi):
+        """Retune both stored boundary objects to at least ``chi``."""
+        if chi is None:
+            return
+        if not isinstance(chi, int):
+            raise TypeError("chi must be an integer")
+        if chi < 1:
+            raise ValueError("chi must be >= 1")
 
-    @staticmethod
-    def _metric_value(run_info, metric):
-        if metric == "loss":
-            val = run_info.get("global_loss_after")
-            return run_info.get("loss_final") if val is None else val
-        if metric == "state_norm":
-            return run_info.get("state_norm")
-        if metric == "bdy_norm":
-            return run_info.get("bdy_norm_norm")
-        if metric == "bdy_overlap_norm":
-            return run_info.get("bdy_norm_overlap")
-        if metric == "time_boundary":
-            return run_info.get("time_boundary")
-        if metric == "time_optimize":
-            return run_info.get("time_optimize")
-        if metric == "time_total":
-            t_bdy = float(run_info.get("time_boundary", 0.0))
-            t_opt = float(run_info.get("time_optimize", 0.0))
-            return t_bdy + t_opt
-        raise RuntimeError(f"Unhandled metric {metric!r}")
+        bdy = getattr(self, "bdy", None)
+        if bdy is not None and getattr(bdy, "chi", 0) < chi:
+            bdy.expand_bnd(chi, inplace=True)
 
-    @classmethod
-    def plot_runs(
-        cls,
-        runs,
+        bdy_overlap = getattr(self, "bdy_overlap", None)
+        if bdy_overlap is not None and getattr(bdy_overlap, "chi", 0) < chi:
+            bdy_overlap.expand_bnd(chi, inplace=True)
+
+    def set_chi(
+        self,
+        chi,
         *,
-        metrics=("loss",),
-        log_scale="auto",
-        cumulative=False,
-        show=True,
-        title="PEPS Sweep Metrics",
-        figsize=None,
+        normalize_state=False,
+        n_iter=5,
+        direction="y",
+        max_separation=0,
+        pbar=False,
+        boundary_fidel=False,
     ):
-        """Plot selected run metrics versus sweep iteration.
+        """Expand stored boundaries to ``chi`` and optionally renormalize state.
 
         Parameters
         ----------
-        runs : list[dict[str, Any]]
-            Sweep run records returned by :meth:`optimize_axis` or
-            stored in :class:`SweepResult.runs`.
-        metrics : str | sequence[str], default=("loss",)
-            Metric name(s) to plot. Supported values:
-            ``loss``, ``state_norm``, ``bdy_norm``,
-            ``bdy_overlap_norm``, ``time_boundary``, ``time_optimize``,
-            ``time_total``. Common aliases like ``infidelity``,
-            ``norm_peps`` and ``timing`` are also accepted.
-        log_scale : {"auto", bool}, default="auto"
-            Y-axis scaling policy. ``"auto"`` uses log scale for most
-            metrics (loss/norms/timing). ``True`` forces
-            log scale for all metrics, ``False`` keeps all linear.
-        cumulative : bool, default=False
-            If ``True``, plot cumulative sums (useful for timing metrics).
-        show : bool, default=True
-            Call ``matplotlib.pyplot.show()``.
-        title : str, default="PEPS Sweep Metrics"
-            Figure title.
-        figsize : tuple[float, float] | None, default=None
-            Optional figure size passed to ``plt.subplots``.
+        chi : int
+            Target boundary bond dimension.
+        normalize_state : bool, default=False
+            If True, run :meth:`normalize` immediately after expanding
+            boundaries.
 
         Returns
         -------
-        tuple
-            ``(fig, axes)`` from matplotlib.
+        SweepOptimizer
+            ``self`` for chaining.
         """
-        import matplotlib.pyplot as plt
-        import numpy as np
+        self._ensure_boundary_chi(chi)
+        if normalize_state:
+            self.normalize(
+                n_iter=n_iter,
+                direction=direction,
+                max_separation=max_separation,
+                pbar=pbar,
+                boundary_fidel=boundary_fidel,
+            )
+        return self
 
-        if not runs:
-            raise ValueError("No runs to plot.")
-
-        if isinstance(metrics, str):
-            metrics = [metrics]
-        metrics = [cls._normalize_plot_metric(name) for name in metrics]
-
-        n_metrics = len(metrics)
-        if n_metrics == 0:
-            raise ValueError("Provide at least one metric name.")
-
-        if figsize is None:
-            figsize = (8.0, max(3.0, 2.8 * n_metrics))
-        fig, axes = plt.subplots(n_metrics, 1, figsize=figsize, dpi=120, squeeze=False)
-        axes = axes.ravel()
-
-        steps = np.arange(1, len(runs) + 1, dtype=int)
-        for ax, metric in zip(axes, metrics):
-            values = []
-            for r in runs:
-                value = cls._metric_value(r, metric)
-                values.append(np.nan if value is None else float(value))
-            y = np.array(values, dtype=float)
-            if cumulative:
-                y = np.nancumsum(y)
-
-            if log_scale == "auto":
-                use_log = metric in cls._PLOT_LOG_METRICS
-            elif isinstance(log_scale, bool):
-                use_log = log_scale
-            else:
-                raise ValueError("log_scale must be 'auto', True, or False.")
-
-            y_plot = y
-            if use_log:
-                y_plot = np.where(y > 0.0, y, np.nan)
-                ax.semilogy(steps, y_plot, marker="o", markersize=3.5, linewidth=1.4, alpha=0.9)
-            else:
-                ax.plot(steps, y_plot, marker="o", markersize=3.5, linewidth=1.4, alpha=0.9)
-
-            ax.set_xlabel("Iteration")
-            ax.set_ylabel(metric)
-            ax.grid(alpha=0.2, linewidth=0.6)
-            if np.all(np.isnan(y_plot)):
-                warnings.warn(
-                    f"No data for metric '{metric}'. Try running with debug=True.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-
-        fig.suptitle(title, fontsize=13, fontweight="bold")
-        fig.tight_layout(rect=[0, 0, 1, 0.97])
-        if show:
-            plt.show()
-        return fig, axes
-
-    def plot(
+    def infidelity(
         self,
-        sweep_result=None,
         *,
-        runs=None,
-        metrics=("loss",),
-        log_scale="auto",
-        cumulative=False,
-        show=True,
-        title="PEPS Sweep Metrics",
-        figsize=None,
+        chi=None,
+        norm=None,
+        norm_target=1.0,
+        opt=None,
+        n_iter=5,
+        direction="y",
+        max_separation=0,
+        pbar=False,
+        boundary_fidel=False,
+        single_layer=False,
     ):
-        """Plot metrics from provided runs, a sweep result, or latest run."""
-        chosen_runs = runs
-        if chosen_runs is None and sweep_result is not None:
-            chosen_runs = sweep_result.runs
-        if chosen_runs is None and self._last_sweep_result is not None:
-            chosen_runs = self._last_sweep_result.runs
-        if chosen_runs is None:
-            chosen_runs = self._last_axis_runs
-        if chosen_runs is None:
-            raise ValueError("No runs available. Pass `runs`/`sweep_result` or run optimizer first.")
-        return self.plot_runs(
-            chosen_runs,
-            metrics=metrics,
-            log_scale=log_scale,
-            cumulative=cumulative,
-            show=show,
-            title=title,
-            figsize=figsize,
-        )
+        """Compute boundary-based infidelity for current ``(state, state_target)``.
 
-    @staticmethod
-    def format_runs_table(runs):
-        """Format run records into a compact plain-text table."""
-        headers = [
-            "axis",
-            "sweep",
-            "index",
-            "loss_before",
-            "loss_after",
-            "delta",
-            "global_loss_after",
-        ]
-        rows = []
-        for r in runs:
-            l0 = float(r.get("loss_initial", r.get("history", [float("nan")])[0]))
-            l1 = float(r.get("loss_final", r.get("history", [float("nan"), float("nan")])[-1]))
-            d = float(r.get("loss_delta", l1 - l0))
-            g = float(r.get("global_loss_after", float("nan")))
-            rows.append(
-                [
-                    str(r.get("axis", "")),
-                    str(r.get("sweep", "")),
-                    str(r.get("index", "")),
-                    f"{l0:.8f}",
-                    f"{l1:.8f}",
-                    f"{d:+.8f}",
-                    f"{g:.8f}",
-                ]
+        This reuses ``self.bdy`` and ``self.bdy_overlap``. If ``chi`` is
+        provided and larger than current boundary bond dimension, both boundary
+        objects are expanded before evaluation.
+
+        Returns
+        -------
+        float
+            Boundary infidelity value.
+        """
+        if self.state_target is None:
+            raise ValueError(
+                "state_target is required for infidelity(). "
+                "Set it in constructor or via set_target()."
             )
 
-        if not rows:
-            return "(no runs)"
+        self._ensure_boundary_chi(chi)
 
-        widths = [len(h) for h in headers]
-        for row in rows:
-            for i, cell in enumerate(row):
-                widths[i] = max(widths[i], len(cell))
+        chi_for_call = chi
+        if chi_for_call is None and norm_target is None:
+            # infidelity() needs chi when it has to build bdy_target internally.
+            chi_for_call = max(int(getattr(self.bdy, "chi", 1)), int(getattr(self.bdy_overlap, "chi", 1)))
 
-        def _fmt(row):
-            return " | ".join(cell.ljust(widths[i]) for i, cell in enumerate(row))
+        result = boundary_infidelity(
+            self.state,
+            self.state_target,
+            chi=chi_for_call,
+            norm=norm,
+            norm_target=norm_target,
+            bdy=self.bdy,
+            bdy_overlap=self.bdy_overlap,
+            opt=self.opt if opt is None else opt,
+            n_iter=n_iter,
+            direction=direction,
+            max_separation=max_separation,
+            pbar=pbar,
+            boundary_fidel=boundary_fidel,
+            dmrg_run=self.dmrg_run,
+            single_layer=single_layer,
+        )
 
-        sep = "-+-".join("-" * w for w in widths)
-        lines = [_fmt(headers), sep]
-        lines.extend(_fmt(row) for row in rows)
-        return "\n".join(lines)
+        if result.get("bdy") is not None:
+            self.bdy = result["bdy"]
+        if result.get("bdy_overlap") is not None:
+            self.bdy_overlap = result["bdy_overlap"]
 
-    @staticmethod
-    def print_runs_table(runs):
-        """Print compact run summary."""
-        print(PEPSSweepOptimizer.format_runs_table(runs))
+        return float(result["infidelity"])
+
+    def _debug_loss(self, *, mode="exact", kwargs=None):
+        """Compute debug-only loss with selected evaluation mode."""
+        mode = "exact" if mode is None else str(mode).strip().lower()
+        if mode == "exact":
+            _, loss = self.metrics()
+            return float(loss)
+        if mode in {"infidelity", "boundary", "bdy"}:
+            return float(self.infidelity(**dict(kwargs or {})))
+        raise ValueError("debug_loss_mode must be 'exact' or 'infidelity'.")
+
+    def set_normalize_kwargs(self, **kwargs):
+        """Update stored defaults for :meth:`normalize`."""
+        if not hasattr(self, "normalize_kwargs"):
+            self.normalize_kwargs = {}
+        self.normalize_kwargs.update(self._pick_known_keys(kwargs, self._NORMALIZE_KEYS))
+        return self
+
+    def set_optimize_kwargs(self, **kwargs):
+        """Update stored defaults for :meth:`optimize`."""
+        if not hasattr(self, "optimize_kwargs"):
+            self.optimize_kwargs = {}
+        self.optimize_kwargs.update(self._pick_known_keys(kwargs, self._OPTIMIZE_KEYS))
+        return self
 
     def _axis_n(self, axis):
         if axis == "y":
@@ -380,7 +554,7 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _prepare_current_double_layers(self):
         self.state, norm_tn = prepare_boundary_inputs(ket=self.state, bra=None)
-        _, overlap_tn = prepare_boundary_inputs(ket=self.target, bra=self.state)
+        _, overlap_tn = prepare_boundary_inputs(ket=self.state_target, bra=self.state)
 
         return norm_tn, overlap_tn
 
@@ -405,6 +579,10 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
     @staticmethod
     def _resolve_user_solver(solver):
         """Normalize user-facing solver shortcuts and emit practical warnings."""
+        if not isinstance(solver, str):
+            raise TypeError("solver must be a string")
+        solver = solver.strip().lower()
+        solver = SweepOptimizer._SOLVER_ALIASES.get(solver, solver)
         if solver == "lbfgs":
             warnings.warn(
                 "solver='lbfgs' defaults to SciPy L-BFGS-B in sweep optimization. "
@@ -427,10 +605,10 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         params_init,
         loss_fn,
         *,
-        solver="adam",
+        solver="scipy",
         solver_options=None,
     ):
-        opts = dict(solver_options or {})
+        opts = self._merge_solver_options(solver_options)
         n_steps = int(opts.pop("n_steps", 100))
         return run_gradient_solver(
             params_init,
@@ -445,23 +623,153 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         tn_opt = qtn.unpack(params_opt, skeleton)
         tn_opt.balance_bonds_()
 
-        if self.equalize_norms:
-            tn_opt.equalize_norms_(self.equalize_norms)
-
         for tag in self._site_tensor_tags(axis, index):
             self.state[tag].modify(data=tn_opt[tag].data)
         return tn_opt
 
     def _normalize_state(self, env_n_iter=4):
-        normalize_result = normalize(
-            self.state,
-            chi=self.bdy.chi,
-            bdy=self.bdy,
-            opt=self.opt,
-            max_separation=1,
+        self.normalize(
             n_iter=env_n_iter,
+            direction="y",
+            max_separation=1,
+            pbar=False,
+            boundary_fidel=False,
         )
-        self.state = normalize_result["state"]
+
+    def normalize(self, state=None, **kwargs):
+        """Normalize PEPS in place and return the old norm estimate."""
+        state = self.state if state is None else state
+        opts = self._merge_opts(getattr(self, "normalize_kwargs", {}), kwargs)
+        opt = opts.get("opt", self.opt)
+        n_iter = opts.get("n_iter", 5)
+        direction = opts.get("direction", "y")
+        max_separation = opts.get("max_separation", 0)
+        pbar = opts.get("pbar", False)
+        boundary_fidel = opts.get("boundary_fidel", False)
+
+        if state is self.state:
+            return normalize(
+                self.state,
+                bdy=self.bdy,
+                opt=opt,
+                max_separation=max_separation,
+                n_iter=n_iter,
+                direction=direction,
+                pbar=pbar,
+                boundary_fidel=boundary_fidel,
+                dmrg_run=self.dmrg_run,
+            )
+
+        chi = getattr(self.bdy, "chi", None)
+        if chi is None:
+            raise ValueError("Provide chi via optimizer boundaries before normalizing external state.")
+        return normalize(
+            state,
+            chi=chi,
+            opt=opt,
+            max_separation=max_separation,
+            n_iter=n_iter,
+            direction=direction,
+            pbar=pbar,
+            boundary_fidel=boundary_fidel,
+            dmrg_run=self.dmrg_run,
+        )
+
+    def set_state(
+        self,
+        state,
+        *,
+        chi=None,
+        single_layer=False,
+        normalize_state=True,
+        n_iter=5,
+        direction="y",
+        max_separation=0,
+        pbar=False,
+        boundary_fidel=False,
+    ):
+        """Replace current state, rebuild boundaries, and optionally normalize.
+
+        Parameters
+        ----------
+        state : qtn.TensorNetwork
+            New trainable PEPS-like state.
+        chi : int | None, default=None
+            Boundary bond dimension for rebuilt boundaries. If omitted, uses
+            ``self.bdy.chi`` when available.
+        single_layer : bool, default=False
+            Forwarded to :class:`pepsy.boundary_states.BdyMPS`.
+        normalize_state : bool, default=True
+            If True, normalize new state immediately using rebuilt boundaries.
+
+        Returns
+        -------
+        complex | float | None
+            Old norm returned by :meth:`normalize` when ``normalize_state`` is
+            True, else None.
+        """
+        if self.state_target is None:
+            raise ValueError("state_target must be set before calling set_state().")
+
+        self.state = state
+        self.Lx, self.Ly = self._infer_shape(self.state)
+
+        if chi is None:
+            chi = getattr(self.bdy, "chi", None)
+        if chi is None:
+            raise ValueError("Provide chi when current boundary chi is unavailable.")
+
+        self.bdy, self.bdy_overlap = self._build_boundary_pair(
+            self.state,
+            self.state_target,
+            chi=chi,
+            single_layer=single_layer,
+        )
+
+        if normalize_state:
+            return self.normalize(
+                n_iter=n_iter,
+                direction=direction,
+                max_separation=max_separation,
+                pbar=pbar,
+                boundary_fidel=boundary_fidel,
+            )
+        return None
+
+    def set_target(
+        self,
+        target,
+        *,
+        chi=None,
+        single_layer=False,
+    ):
+        """Replace target state and rebuild overlap boundary immediately.
+
+        Parameters
+        ----------
+        target : qtn.TensorNetwork
+            New target PEPS-like state.
+        chi : int | None, default=None
+            Bond dimension for rebuilt overlap boundary. If omitted, uses
+            ``self.bdy_overlap.chi`` when available.
+        single_layer : bool, default=False
+            Forwarded to :class:`pepsy.boundary_states.BdyMPS`.
+        """
+        self.state_target = target
+
+        if chi is None:
+            chi = getattr(self.bdy_overlap, "chi", None)
+        if chi is None:
+            chi = getattr(self.bdy, "chi", None)
+        if chi is None:
+            raise ValueError("Provide chi when current boundary chi is unavailable.")
+
+        _, overlap_norm = prepare_boundary_inputs(ket=self.state_target, bra=self.state)
+        self.bdy_overlap = BdyMPS(
+            tn_double=overlap_norm,
+            chi=chi,
+            single_layer=single_layer,
+        )
 
     def _make_comp_pair(self, norm_tn, overlap_tn):
         comp_norm = CompBdy(norm_tn, self.bdy.mps_b, opt=self.opt, dmrg_run=self.dmrg_run)
@@ -480,13 +788,13 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             n_iter=env_n_iter,
             pbar=False,
             direction=self._boundary_direction(axis, "right"),
-            fidel_=False,
+            boundary_fidel=False,
         )
         comp_norm.move_bdy(
             n_iter=env_n_iter,
             pbar=False,
             direction=self._boundary_direction(axis, "right"),
-            fidel_=False,
+            boundary_fidel=False,
         )
 
     def _advance_boundary_one_step(
@@ -498,7 +806,7 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         comp_norm,
         comp_overlap,
         env_n_iter=4,
-        fidel_=False,
+        boundary_fidel=False,
     ):
         n = self._axis_n(axis)
         if side == "left" and index <= 0:
@@ -513,11 +821,11 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 n_iter=env_n_iter,
                 pbar=False,
                 direction=direction,
-                fidel_=fidel_,
+                boundary_fidel=boundary_fidel,
             )
         overlap_fidelity = None
         norm_fidelity = None
-        if fidel_:
+        if boundary_fidel:
             if comp_overlap.fidel:
                 overlap_fidelity = float(complex(comp_overlap.fidel[-1]).real)
             if comp_norm.fidel:
@@ -527,19 +835,20 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
     def _optimize_axis_slice_with_current_env(
         self,
         index,
-        norm_tn,
-        overlap_tn,
         *,
         axis,
         solver="adam",
         solver_options=None,
         debug=False,
+        debug_loss_mode="exact",
+        debug_loss_kwargs=None,
     ):
+        _ = debug_loss_mode, debug_loss_kwargs
         axis_tag = self._axis_tag(axis)
         right_key, left_key = self._boundary_keys_for_index(index, axis)
 
         slice_state = self.state.select([f"{axis_tag}{index}"], "any")
-        slice_target = self.target.select([f"{axis_tag}{index}"], "any")
+        slice_target = self.state_target.select([f"{axis_tag}{index}"], "any")
         params_init, skeleton = qtn.pack(slice_state)
 
         def loss_fn(params_in):
@@ -577,7 +886,13 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             solver=solver,
             solver_options=solver_options,
         )
-        final_loss = float(loss_fn(params_opt).detach().cpu())
+        history_values = self._to_float_history(history)
+        final_loss_raw = loss_fn(params_opt)
+        if hasattr(final_loss_raw, "detach"):
+            final_loss_raw = final_loss_raw.detach()
+        if hasattr(final_loss_raw, "cpu"):
+            final_loss_raw = final_loss_raw.cpu()
+        final_loss = float(final_loss_raw)
         params_opt = {k: v.detach().clone() for k, v in params_opt.items()}
         self._apply_slice_update(index, params_opt, skeleton, axis)
 
@@ -588,22 +903,11 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "left_key": left_key,
             "loss_initial": initial_loss,
             "loss_final": final_loss,
-            "loss_delta": final_loss - initial_loss,
         }
         if debug:
-            _, global_loss = self.metrics()
-            global_loss = float(global_loss)
-            run_info["global_loss_after"] = global_loss
-            norm_state = abs(complex(
-                (self.state.H & self.state).contract(all, optimize=self.opt)
-            ))
-            run_info["state_norm"] = float(norm_state)
-            try:
-                run_info["bdy_norm_norm"] = float(complex(self.bdy.norm).real)
-                run_info["bdy_norm_overlap"] = float(complex(self.bdy_overlap.norm).real)
-            except (ValueError, AttributeError):
-                pass
-        run_info["history"] = list(history)
+            exact_loss = 1.0 - tn_fidelity(self.state, self.state_target, opt=self.opt)
+            run_info["exact_loss_after"] = float(exact_loss)
+        run_info["history"] = history_values
 
         return run_info
 
@@ -614,12 +918,14 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         update_side,
         sweep_name,
-        solver="adam",
+        solver="scipy",
         solver_options=None,
         env_n_iter=4,
         run_callback=None,
-        fidel_=False,
+        boundary_fidel=False,
         debug=False,
+        debug_loss_mode="exact",
+        debug_loss_kwargs=None,
     ):
         """Run a single forward or backward half-sweep over *indices*."""
         runs = []
@@ -641,19 +947,19 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 comp_norm=comp_norm,
                 comp_overlap=comp_overlap,
                 env_n_iter=env_n_iter,
-                fidel_=fidel_,
+                boundary_fidel=boundary_fidel,
             )
             t_bdy = time.perf_counter() - t0
 
             t0 = time.perf_counter()
             run_info = self._optimize_axis_slice_with_current_env(
                 index,
-                norm_tn,
-                overlap_tn,
                 axis=axis,
                 solver=solver,
                 solver_options=solver_options,
                 debug=debug,
+                debug_loss_mode=debug_loss_mode,
+                debug_loss_kwargs=debug_loss_kwargs,
             )
             t_opt = time.perf_counter() - t0
 
@@ -673,31 +979,38 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         *,
         n_round_trips=1,
-        solver="adam",
+        solver="scipy",
         solver_options=None,
         env_n_iter=4,
         run_callback=None,
-        fidel_=False,
+        boundary_fidel=False,
         debug=False,
+        debug_loss_mode="exact",
+        debug_loss_kwargs=None,
         renormalize=False,
     ):
         """Run one axis with forward + round-trip sweeps.
 
         Parameters
         ----------
-        solver : str, default="adam"
+        solver : str, default="scipy"
             Gradient solver name. Supported values include ``adam``, ``lbfgs``,
             ``scipy-lbfgs``, and ``nlopt-lbfgs``.
         solver_options : dict | None, default=None
             Extra backend-specific options for the selected ``solver``.
         """
+        if self.state_target is None:
+            raise ValueError(
+                "state_target is required for optimize_axis(). "
+                "Set it in constructor or via set_target()."
+            )
         n = self._axis_n(axis)
         resolved_solver = self._resolve_user_solver(solver)
         all_runs = []
 
         self.bdy.normalize()
         self.bdy_overlap.normalize()
-        
+
         if renormalize:
             self._normalize_state(env_n_iter)
 
@@ -709,8 +1022,10 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             solver_options=solver_options,
             env_n_iter=env_n_iter,
             run_callback=run_callback,
-            fidel_=fidel_,
+            boundary_fidel=boundary_fidel,
             debug=debug,
+            debug_loss_mode=debug_loss_mode,
+            debug_loss_kwargs=debug_loss_kwargs,
         )
 
         all_runs.extend(
@@ -741,7 +1056,6 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             )
 
-        self._last_axis_runs = list(all_runs)
         return all_runs
 
     def optimize_global(
@@ -750,30 +1064,60 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axes=("y", "x"),
         n_cycles=1,
         n_round_trips=1,
-        solver="adam",
+        chi=None,
+        solver="scipy",
         solver_options=None,
         env_n_iter=4,
         pbar=True,
         debug=False,
+        debug_loss_mode="exact",
+        debug_loss_kwargs=None,
+        boundary_fidel=None,
         renormalize=False,
     ):
         """Run alternating axis sweeps and return a :class:`SweepResult`.
 
         Parameters
         ----------
-        solver : str, default="adam"
+        chi : int | None, default=None
+            If provided, expand stored boundaries to this bond dimension before
+            running sweeps.
+        solver : str, default="scipy"
             Gradient solver name. Supported values include ``adam``, ``lbfgs``,
             ``scipy-lbfgs``, and ``nlopt-lbfgs``.
         solver_options : dict | None, default=None
             Extra backend-specific options for the selected ``solver``.
         debug : bool, default=False
-            When True, compute extra global-loss diagnostics and boundary
-            fidelities per step.
+            When True, compute exact global-loss diagnostics.
+        debug_loss_mode : {"exact", "infidelity"}, default="exact"
+            Diagnostic loss backend used only when ``debug=True``.
+        debug_loss_kwargs : Mapping[str, Any] | None, default=None
+            Extra kwargs passed to debug loss backend. For
+            ``debug_loss_mode="infidelity"`` these are forwarded to
+            :meth:`infidelity`.
+        boundary_fidel : bool | None, default=None
+            Boundary-fidelity tracing flag for CompBdy updates. If ``None``,
+            follows ``debug``. Set explicitly to force behavior.
+
         """
+        if self.state_target is None:
+            raise ValueError(
+                "state_target is required for optimize_global(). "
+                "Set it in constructor or via set_target()."
+            )
+        self._ensure_boundary_chi(chi)
+        self._reset_run_traces()
         if debug:
-            _, loss_before = self.metrics()
+            loss_before = self._debug_loss(
+                mode=debug_loss_mode,
+                kwargs=debug_loss_kwargs,
+            )
         else:
-            loss_before = None
+            loss_before = self._approx_infidelity_loss(
+                env_n_iter=env_n_iter,
+                kwargs=debug_loss_kwargs,
+            )
+        boundary_fidel = bool(debug) if boundary_fidel is None else bool(boundary_fidel)
         all_runs = []
         axis_seq = list(axes)
 
@@ -802,9 +1146,11 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                         return
                     global_progress.update(1)
                     postfix = {}
-                    loss_final = run_info.get("loss_final")
-                    if loss_final is not None:
-                        postfix["loss"] = f"{float(loss_final):.6f}"
+                    loss_step = run_info.get("loss_final")
+                    if debug and run_info.get("exact_loss_after") is not None:
+                        loss_step = run_info.get("exact_loss_after")
+                    if loss_step is not None:
+                        postfix["loss"] = f"{float(loss_step):.6f}"
                     axis_name = run_info.get("axis")
                     sweep_name = run_info.get("sweep")
                     index = run_info.get("index")
@@ -813,18 +1159,25 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
                         postfix["slice"] = f"{axis_name}_{short}_{index}"
                     global_progress.set_postfix(postfix)
 
-                all_runs.extend(
-                    self.optimize_axis(
-                        axis,
-                        n_round_trips=n_round_trips,
-                        solver=solver,
-                        solver_options=solver_options,
-                        env_n_iter=env_n_iter,
-                        run_callback=_on_run,
-                        fidel_=debug,
-                        debug=debug,
-                        renormalize=renormalize,
-                    )
+                axis_runs = self.optimize_axis(
+                    axis,
+                    n_round_trips=n_round_trips,
+                    solver=solver,
+                    solver_options=solver_options,
+                    env_n_iter=env_n_iter,
+                    run_callback=_on_run,
+                    boundary_fidel=boundary_fidel,
+                    debug=debug,
+                    debug_loss_mode=debug_loss_mode,
+                    debug_loss_kwargs=debug_loss_kwargs,
+                    renormalize=renormalize,
+                )
+                all_runs.extend(axis_runs)
+                self._collect_axis_run_traces(
+                    axis_runs,
+                    cycle=cyc + 1,
+                    axis=axis,
+                    debug=debug,
                 )
 
         if global_progress is not None:
@@ -834,16 +1187,76 @@ class PEPSSweepOptimizer:  # pylint: disable=too-many-instance-attributes
             self._normalize_state(env_n_iter=env_n_iter)
 
         if debug:
-            _, loss_after = self.metrics()
+            loss_after = self._debug_loss(
+                mode=debug_loss_mode,
+                kwargs=debug_loss_kwargs,
+            )
         else:
-            loss_after = None
+            loss_after = self._approx_infidelity_loss(
+                env_n_iter=env_n_iter,
+                kwargs=debug_loss_kwargs,
+            )
         result = SweepResult(
             runs=all_runs,
-            fidelity_before=None,
-            fidelity_after=None,
             loss_before=loss_before,
             loss_after=loss_after,
+            step_loss_trace=list(self.step_loss_trace),
+            inner_loss_traces=[list(hist) for hist in self.inner_loss_traces],
+            step_trace=[dict(item) for item in self.step_trace],
         )
-        self._last_axis_runs = list(all_runs)
-        self._last_sweep_result = result
         return result
+
+    def run(
+        self,
+        *,
+        n=None,
+        chi=None,
+        progbar=None,
+        debug=None,
+        boundary_fidel=None,
+        renormalize=None,
+    ):
+        """High-level wrapper around :meth:`optimize_global`.
+
+        Parameters
+        ----------
+        n : int, default=1
+            Number of global y/x cycles.
+        chi : int | None, default=None
+            If provided, expand boundary bond dimension before sweeps.
+        progbar : bool, default=True
+            Show global sweep progress bar.
+        debug : bool | None, default=None
+            Enable exact global metrics collection when True.
+        boundary_fidel : bool | None, default=None
+            Boundary-fidelity tracing flag. If None, follows ``debug``.
+        """
+        opts = dict(getattr(self, "optimize_kwargs", {}))
+        if n is not None:
+            opts["n"] = n
+        if chi is not None:
+            opts["chi"] = chi
+        if progbar is not None:
+            opts["progbar"] = progbar
+        if debug is not None:
+            opts["debug"] = debug
+        if boundary_fidel is not None:
+            opts["boundary_fidel"] = boundary_fidel
+        if renormalize is not None:
+            opts["renormalize"] = renormalize
+
+        return self.optimize_global(
+            axes=opts.get("axes", ("y", "x")),
+            n_cycles=opts.get("n", 1),
+            n_round_trips=opts.get("n_round_trips", 1),
+            chi=opts.get("chi"),
+            solver=opts.get("optimizer", "scipy"),
+            solver_options=opts.get("optimizer_options"),
+            env_n_iter=opts.get("env_n_iter", 4),
+            pbar=opts.get("progbar", True),
+            debug=opts.get("debug", False),
+            debug_loss_mode=opts.get("debug_loss_mode", "exact"),
+            debug_loss_kwargs=opts.get("debug_loss_kwargs"),
+            boundary_fidel=opts.get("boundary_fidel"),
+            renormalize=opts.get("renormalize", False),
+        )

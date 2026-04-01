@@ -312,9 +312,22 @@ def build_compressed_optimizer(
     return copt
 
 
-def tn_fidelity(psi, psi_fix):
-    """Compute normalized MPS overlap fidelity."""
-    opt: Any = build_optimizer(progbar=False)
+def tn_fidelity(psi, psi_fix, *, opt: Any | None = None):
+    """Compute normalized overlap fidelity.
+
+    Parameters
+    ----------
+    psi : qtn.TensorNetwork
+        Trial state.
+    psi_fix : qtn.TensorNetwork
+        Reference state.
+    opt : object | None, optional
+        Contraction optimizer. If ``None``, builds a default optimizer with
+        ``progbar=False`` for backward compatibility.
+    """
+    if opt is None:
+        opt = build_optimizer(progbar=False)
+
     val_0 = abs((psi.H & psi).contract(all, optimize=opt))
     val_1 = abs((psi.H & psi_fix).contract(all, optimize=opt))
     val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=opt))

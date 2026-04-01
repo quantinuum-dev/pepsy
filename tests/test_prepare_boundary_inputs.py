@@ -11,14 +11,14 @@ def test_validate_tensor_network_tags_requires_i_tags():
     dummy = type("DummyTN", (), {"tags": {"X0", "Y0"}})()
 
     with pytest.raises(ValueError, match=r"X\*, Y\*, and I\*"):
-        pepsy.boundary_norm.validate_tensor_network_tags(dummy)
+        pepsy.boundary_metrics.validate_tensor_network_tags(dummy)
 
 
 def test_validate_tensor_network_tags_accepts_multi_index_i_tag():
     """Validator should accept I tags like I2, I3,4, or I2,3,4."""
     dummy = type("DummyTN", (), {"tags": {"X2", "Y3", "I2,3,4"}})()
 
-    pepsy.boundary_norm.validate_tensor_network_tags(dummy)
+    pepsy.boundary_metrics.validate_tensor_network_tags(dummy)
 
 
 def test_prepare_boundary_inputs_uses_readable_bra_reindex_suffix():
@@ -220,7 +220,7 @@ def test_bdymps_normalize_normalizes_all_boundaries_inplace():
 
 
 def test_compbdy_fidelity_history_resets_each_run(monkeypatch):
-    """CompBdy.run should rebuild self.fidel per run when fidel_=True."""
+    """CompBdy.run should rebuild self.fidel per run when boundary_fidel=True."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=23, dtype="complex128")
     ket_tagged, norm_tagged = pepsy.prepare_boundary_inputs(ket=ket)
     bdy = pepsy.BdyMPS(
@@ -238,16 +238,16 @@ def test_compbdy_fidelity_history_resets_each_run(monkeypatch):
         lambda self, fit, boundary_mps: None,
     )
 
-    comp.run(direction="y", fidel_=True, pbar=False, n_iter=1, max_separation=0)
+    comp.run(direction="y", boundary_fidel=True, pbar=False, n_iter=1, max_separation=0)
     assert comp.fidel == [0.5, 0.5]
 
     comp.fidel.append(9.0)
-    comp.run(direction="y", fidel_=True, pbar=False, n_iter=1, max_separation=0)
+    comp.run(direction="y", boundary_fidel=True, pbar=False, n_iter=1, max_separation=0)
     assert comp.fidel == [0.5, 0.5]
 
 
 def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
-    """CompBdy should keep FIT.run_eff verbose=False even when fidel_=True."""
+    """CompBdy should keep FIT.run_eff verbose=False even when boundary_fidel=True."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=29, dtype="complex128")
     ket_tagged, norm_tagged = pepsy.prepare_boundary_inputs(ket=ket)
     bdy = pepsy.BdyMPS(
@@ -266,7 +266,7 @@ def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
     monkeypatch.setattr(pepsy.boundary_sweeps.FIT, "run_eff", fake_run_eff)
     monkeypatch.setattr(pepsy.boundary_sweeps, "tn_fidelity", lambda _tn, _p: 0.5)
 
-    comp.run(direction="y", fidel_=True, pbar=False, n_iter=1, max_separation=0)
+    comp.run(direction="y", boundary_fidel=True, pbar=False, n_iter=1, max_separation=0)
 
     assert run_eff_verbose_args
     assert all(arg is False for arg in run_eff_verbose_args)
@@ -290,7 +290,7 @@ def test_contract_boundary_default_returns_structured_result(monkeypatch):
         def run(self, **_kwargs):
             return 12.5
 
-    monkeypatch.setattr(pepsy.boundary_norm, "CompBdy", _FakeCompBdy)
+    monkeypatch.setattr(pepsy.boundary_metrics, "CompBdy", _FakeCompBdy)
     out = pepsy.ContractBoundary(norm=_DummyNorm(), mps_boundaries={})
     assert isinstance(out, pepsy.BoundaryContractResult)
     assert out.cost == 12.5
@@ -307,7 +307,7 @@ def test_contract_boundary_includes_requested_metadata(monkeypatch):
         def run(self, **_kwargs):
             return 12.5
 
-    monkeypatch.setattr(pepsy.boundary_norm, "CompBdy", _FakeCompBdy)
+    monkeypatch.setattr(pepsy.boundary_metrics, "CompBdy", _FakeCompBdy)
     out = pepsy.ContractBoundary(
         norm=_DummyNorm(),
         mps_boundaries={},
@@ -324,50 +324,6 @@ def test_contract_boundary_includes_requested_metadata(monkeypatch):
     assert out.max_separation == 1
 
 
-def test_contract_boundary_fidelity_flag_keeps_structured_result(monkeypatch):
-    """fidel_=True should still return structured result with fidelity history."""
-
-    class _FakeCompBdy:
-        def __init__(self, *_args, **_kwargs):
-            self.fidel = [0.9, 0.8]
-
-        def run(self, **_kwargs):
-            return 7.5
-
-    monkeypatch.setattr(pepsy.boundary_norm, "CompBdy", _FakeCompBdy)
-    out = pepsy.ContractBoundary(
-        norm=_DummyNorm(),
-        mps_boundaries={},
-        fidel_=True,
-    )
-
-    assert isinstance(out, pepsy.BoundaryContractResult)
-    assert out.cost == 7.5
-    assert out.fidel == [0.9, 0.8]
-
-
-def test_contract_boundary_empty_fidelity_list_returns_structured_result(monkeypatch):
-    """Structured return should work even when fidelity history is empty."""
-
-    class _FakeCompBdy:
-        def __init__(self, *_args, **_kwargs):
-            self.fidel = []
-
-        def run(self, **_kwargs):
-            return 3.25
-
-    monkeypatch.setattr(pepsy.boundary_norm, "CompBdy", _FakeCompBdy)
-    out = pepsy.ContractBoundary(
-        norm=_DummyNorm(),
-        mps_boundaries={},
-        fidel_=True,
-    )
-
-    assert isinstance(out, pepsy.BoundaryContractResult)
-    assert out.cost == 3.25
-    assert out.fidel == []
-
-
 def test_compbdy_move_step_resets_and_updates_fidelity(monkeypatch):
     """move_step_bdy should rebuild fidelity history from scratch each call."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=31, dtype="complex128")
@@ -382,13 +338,13 @@ def test_compbdy_move_step_resets_and_updates_fidelity(monkeypatch):
 
     def fake_fit_one_step(self, side, step_, cut_tag_id, site_tag_id):
         _ = (step_, cut_tag_id, site_tag_id)
-        if self.fidel_:
+        if self.boundary_fidel:
             self.fidel.append(0.77 if side == "left" else 0.66)
         return None
 
     monkeypatch.setattr(pepsy.boundary_sweeps.CompBdy, "_fit_one_step", fake_fit_one_step)
 
-    comp.move_step_bdy(pos=0, direction="y_left", fidel_=True)
+    comp.move_step_bdy(pos=0, direction="y_left", boundary_fidel=True)
     assert comp.fidel == [0.77]
 
 
@@ -508,14 +464,14 @@ def test_compbdy_move_step_pbar_shows_current_fidelity(monkeypatch):
 
     def fake_fit_one_step(self, side, step_, cut_tag_id, site_tag_id):
         _ = (side, step_, cut_tag_id, site_tag_id)
-        if self.fidel_:
+        if self.boundary_fidel:
             self.fidel.append(0.77)
         return _DummyMPS()
 
     monkeypatch.setattr(pepsy.boundary_sweeps, "tqdm", _FakeTqdm)
     monkeypatch.setattr(pepsy.boundary_sweeps.CompBdy, "_fit_one_step", fake_fit_one_step)
 
-    comp.move_step_bdy(pos=1, direction="y_left", fidel_=True, pbar=True)
+    comp.move_step_bdy(pos=1, direction="y_left", boundary_fidel=True, pbar=True)
 
     assert _FakeTqdm.instances
     pbar = _FakeTqdm.instances[-1]
@@ -528,8 +484,8 @@ def test_compbdy_move_step_pbar_shows_current_fidelity(monkeypatch):
     assert abs(last["F"] - 0.77) < 1e-12
 
 
-def test_normalize_returns_dict_with_boundary_and_contract_result(monkeypatch):
-    """normalize should return state/cost and include built boundary object."""
+def test_normalize_returns_old_norm_and_updates_state_in_place(monkeypatch):
+    """normalize should return old norm and update the input state in place."""
     captured = {}
 
     class _FakeBdy:
@@ -550,22 +506,21 @@ def test_normalize_returns_dict_with_boundary_and_contract_result(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_norm, "BdyMPS", fake_bdymps)
-    monkeypatch.setattr(pepsy.boundary_norm, "ContractBoundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary_metrics, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary_metrics, "ContractBoundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=131, dtype="complex128")
-    out = pepsy.normalize(
+    ket_id_before = id(ket)
+    old_norm = pepsy.normalize(
         ket,
         chi=8,
         n_iter=1,
         pbar=False,
     )
 
-    assert set(out) == {"state", "cost", "cost_scalar", "bdy", "contract_result"}
-    assert out["cost"] == 4.0
-    assert out["cost_scalar"] == 4.0 + 0.0j
-    assert out["bdy"].mps_b is captured["contract_kwargs"]["mps_boundaries"]
-    assert isinstance(out["contract_result"], pepsy.BoundaryContractResult)
+    assert old_norm == 4.0
+    assert id(ket) == ket_id_before
+    assert captured["contract_kwargs"]["mps_boundaries"] is not None
     assert "tn_double" in captured["bdy_kwargs"]
 
 
@@ -592,20 +547,19 @@ def test_normalize_uses_provided_bdy_without_constructing_new_one(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_norm, "BdyMPS", fail_bdymps)
-    monkeypatch.setattr(pepsy.boundary_norm, "ContractBoundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary_metrics, "BdyMPS", fail_bdymps)
+    monkeypatch.setattr(pepsy.boundary_metrics, "ContractBoundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=137, dtype="complex128")
-    out = pepsy.normalize(
+    old_norm = pepsy.normalize(
         ket,
         bdy=provided,
         n_iter=1,
         pbar=False,
     )
 
-    assert out["bdy"] is provided
     assert captured["contract_kwargs"]["mps_boundaries"] is provided.mps_b
-    assert out["cost"] == 9.0
+    assert old_norm == 9.0
 
 
 def test_normalize_requires_chi_when_bdy_not_provided():

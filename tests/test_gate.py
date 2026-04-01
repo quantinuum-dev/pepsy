@@ -5,7 +5,7 @@ import pytest
 import quimb.tensor as qtn
 
 from pepsy import product_state_peps
-from pepsy.gate import apply_2dtn_, apply_gates, gen_long_range_swap_path
+from pepsy.gate import apply_2dtn_, apply_gates, gen_long_range_swap_path, pauli, x, y, z
 
 
 def test_gen_long_range_swap_path_adjacent():
@@ -136,3 +136,11 @@ def test_apply_2dtn_infers_swap_backend_from_gate(monkeypatch):
     assert isinstance(calls[2], torch.Tensor)
     assert calls[0].dtype == gate.dtype
     assert calls[2].dtype == gate.dtype
+
+
+def test_pauli_matches_axis_helpers():
+    """pauli('X'/'Y'/'Z') should match x()/y()/z() helpers."""
+    assert np.allclose(pauli("X"), x())
+    assert np.allclose(pauli("Y"), y())
+    assert np.allclose(pauli("Z"), z())
+    assert np.allclose(pauli("z"), z())

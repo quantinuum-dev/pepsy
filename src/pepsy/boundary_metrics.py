@@ -133,7 +133,7 @@ def ContractBoundary(
     n_iter=2,
     re_tag=True,
     pbar=True,
-    fidel_=False,
+    boundary_fidel=False,
     visual_=False,
     re_update=True,
     max_separation=0,
@@ -161,7 +161,7 @@ def ContractBoundary(
         Forwarded to fitting backend.
     pbar : bool, default=True
         Show progress bars.
-    fidel_ : bool, default=False
+    boundary_fidel : bool, default=False
         If ``True``, collect per-step fidelity values in ``result.fidel``.
     visual_ : bool, default=False
         Enable intermediate visualization in fitting backend.
@@ -199,7 +199,7 @@ def ContractBoundary(
         n_iter=n_iter,
         re_tag=re_tag,
         pbar=pbar,
-        fidel_=fidel_,
+        boundary_fidel=boundary_fidel,
         visual_=visual_,
         flat=flat,
         re_update=re_update,
@@ -207,7 +207,6 @@ def ContractBoundary(
         direction=direction,
         eq_norms=eq_norms,
     )
- 
 
     return BoundaryContractResult(
         cost=cost,
@@ -228,15 +227,15 @@ def normalize(
     direction="y",
     max_separation=0,
     pbar=False,
-    fidel_=False,
+    boundary_fidel=False,
     dmrg_run="eff",
     single_layer=False,
 ):
     """Normalize a PEPS state with boundary contraction.
 
     This performs:
-    ``prepare_boundary_inputs -> BdyMPS -> ContractBoundary`` and returns a
-    dictionary containing normalized state, cost, and boundary objects.
+    ``prepare_boundary_inputs -> BdyMPS -> ContractBoundary`` and normalizes
+    ``p`` in place.
 
     Parameters
     ----------
@@ -257,7 +256,7 @@ def normalize(
         Sweep separation mode.
     pbar : bool, default=False
         Show progress bar.
-    fidel_ : bool, default=False
+    boundary_fidel : bool, default=False
         Track fidelity history during boundary contraction.
     dmrg_run : {"eff", "global"}, default="eff"
         Boundary fitting backend mode.
@@ -266,14 +265,9 @@ def normalize(
 
     Returns
     -------
-    dict[str, object]
-        Dictionary with:
-
-        - ``state``: normalized PEPS state
-        - ``cost``: raw boundary contraction cost
-        - ``cost_scalar``: scalar used for normalization
-        - ``bdy``: constructed :class:`pepsy.boundary_states.BdyMPS`
-        - ``contract_result``: :class:`BoundaryContractResult`
+    complex | float
+        The old norm estimate (boundary contraction cost) before
+        normalization.
     """
     if p is None:
         raise ValueError("p must not be None.")
@@ -301,24 +295,16 @@ def normalize(
         pbar=pbar,
         direction=direction,
         max_separation=max_separation,
-        fidel_=fidel_,
+        boundary_fidel=boundary_fidel,
     )
     cost = result.cost
-
-
-    if abs(cost) == 0:
+    old_norm = _to_python_scalar(cost)
+    if abs(complex(old_norm)) == 0:
         raise ZeroDivisionError("Boundary norm cost is zero; cannot normalize state.")
-    cost_scalar = complex(_to_python_scalar(cost))
 
-    ket_tagged = ket_tagged / (cost**0.5)
+    ket_tagged /= cost**0.5
     ket_tagged.balance_bonds_()
-    return {
-        "state": ket_tagged,
-        "cost": cost,
-        "cost_scalar": cost_scalar,
-        "bdy": bdy,
-        "contract_result": result,
-    }
+    return old_norm
 
 
 def infidelity(
@@ -336,7 +322,7 @@ def infidelity(
     direction="y",
     max_separation=0,
     pbar=False,
-    fidel_=False,
+    boundary_fidel=False,
     dmrg_run="eff",
     single_layer=False,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
@@ -395,7 +381,7 @@ def infidelity(
         Sweep separation mode.
     pbar : bool, default=False
         Show progress bar.
-    fidel_ : bool, default=False
+    boundary_fidel : bool, default=False
         Track per-step fidelity during boundary contraction.
     dmrg_run : {"eff", "global"}, default="eff"
         Boundary fitting backend mode.
@@ -429,7 +415,7 @@ def infidelity(
         pbar=pbar,
         direction=direction,
         max_separation=max_separation,
-        fidel_=fidel_,
+        boundary_fidel=boundary_fidel,
     )
 
     # -- <p|p> --

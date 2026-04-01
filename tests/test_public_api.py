@@ -30,6 +30,7 @@ def test_core_symbols_exported():
     assert "apply_2dtn_" in pepsy.__all__
     assert "apply_gates" in pepsy.__all__
     assert "gate_1d" in pepsy.__all__
+    assert "pauli" in pepsy.__all__
     assert "canonize_mps" not in pepsy.__all__
     assert "x" in pepsy.__all__
     assert "y" in pepsy.__all__
@@ -70,16 +71,13 @@ def test_core_symbols_exported():
     assert "reg_complex_svd_torch" in pepsy.__all__
     assert "reg_complex_svd_jax" in pepsy.__all__
     assert "make_numpy_array_caster" in pepsy.__all__
-    assert "PEPSSweepOptimizer" in pepsy.__all__
+    assert "SweepOptimizer" in pepsy.__all__
     assert "SweepResult" in pepsy.__all__
-    assert "plot_sweep_diagnostics" in pepsy.__all__
-    assert "plot_inner_loss" in pepsy.__all__
     assert "MpsOptimizer" in pepsy.__all__
     assert "optimize_global" in pepsy.__all__
     assert "optimize_sweep" in pepsy.__all__
     assert "gate" in pepsy.__all__
     assert "gradient_solver" in pepsy.__all__
-    assert "debug" in pepsy.__all__
 
 
 def test_lazy_exports_resolve():
@@ -102,6 +100,7 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.apply_2dtn_)
     assert callable(pepsy.apply_gates)
     assert callable(pepsy.gate_1d)
+    assert callable(pepsy.pauli)
     with pytest.raises(AttributeError):
         _ = pepsy.canonize_mps
     assert callable(pepsy.x)
@@ -144,8 +143,7 @@ def test_lazy_exports_resolve():
         _ = pepsy.peps_I
     assert callable(pepsy.reg_complex_svd_torch)
     assert callable(pepsy.reg_complex_svd_jax)
-    assert callable(pepsy.plot_sweep_diagnostics)
-    assert callable(pepsy.plot_inner_loss)
+    assert callable(pepsy.SweepOptimizer)
     assert callable(pepsy.MpsOptimizer)
     assert pepsy.optimize_global is not None
     assert pepsy.optimize_sweep is not None

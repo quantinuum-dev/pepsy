@@ -10,9 +10,9 @@ Current package version: `0.1.1` (from `pyproject.toml` / `pepsy.__version__`).
 - `src/pepsy/`: installable library code
   - `boundary_states.py`: boundary state initialization (`BdyMPS`)
   - `boundary_sweeps.py`: sweep/contraction runner (`CompBdy`)
-  - `boundary_norm.py`: input preparation + contraction (`prepare_boundary_inputs`, `ContractBoundary`)
+  - `boundary_metrics.py`: input preparation + contraction (`prepare_boundary_inputs`, `ContractBoundary`)
   - `optimize_sweep.py`, `optimize_global.py`, `gate.py`, `gradient_solver.py`, `debug.py`
-  - `dmrg_fit.py`, `core.py`, `linalg_registrations.py`
+  - `fit.py`, `core.py`, `linalg_registrations.py`
 - `example/`: example notebooks
 - `docs/`: Sphinx documentation source
 - `tests/`: package tests

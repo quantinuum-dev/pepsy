@@ -323,21 +323,21 @@ class GlobalOptimizer:
         raise ValueError(f"Unknown cost function: {cost_f}")
 
     @staticmethod
-    def _tnopt_loss(peps, *, peps_target, **loss_kwargs):
+    def _tnopt_loss(state, *, state_target, **loss_kwargs):
         """Adapter for ``qtn.TNOptimizer`` using :meth:`_loss_peps`."""
-        return GlobalOptimizer._loss_peps(peps, peps_target, **loss_kwargs)
+        return GlobalOptimizer._loss_peps(state, state_target, **loss_kwargs)
 
     def __init__(
         self,
-        peps,
-        peps_target=None,
+        state,
+        state_target=None,
         *,
         norm_kwargs: Mapping[str, Any] | None = None,
         normalize_kwargs: Mapping[str, Any] | None = None,
         loss_kwargs: Mapping[str, Any] | None = None,
     ):
-        self.peps = peps
-        self.peps_target = peps_target
+        self.state = state
+        self.state_target = state_target
         self.loss_kwargs = self._pick_known_keys(loss_kwargs, self._LOSS_KEYS)
         self.norm_kwargs = self._pick_known_keys(norm_kwargs, self._NORM_KEYS)
 
@@ -368,26 +368,26 @@ class GlobalOptimizer:
         self.loss_kwargs.update(self._pick_known_keys(kwargs, self._LOSS_KEYS))
         return self
 
-    def norm(self, peps=None, **kwargs):
-        """Evaluate ``<peps|peps>`` with configured contraction options."""
-        state = self.peps if peps is None else peps
+    def norm(self, state=None, **kwargs):
+        """Evaluate ``<state|state>`` with configured contraction options."""
+        state = self.state if state is None else state
         opts = self._merge_opts(self.norm_kwargs, kwargs)
         return self._norm_peps(state, **opts)
 
-    def normalize(self, peps=None, **kwargs):
+    def normalize(self, state=None, **kwargs):
         """Normalize PEPS in place with configured contraction options."""
-        state = self.peps if peps is None else peps
+        state = self.state if state is None else state
         opts = self._merge_opts(self.normalize_kwargs, kwargs)
         return self._normalize_peps(state, **opts)
 
-    def loss(self, peps=None, *, peps_target=None, **kwargs):
+    def loss(self, state=None, *, state_target=None, **kwargs):
         """Evaluate configured global loss against target PEPS."""
-        state = self.peps if peps is None else peps
-        target = self.peps_target if peps_target is None else peps_target
+        state = self.state if state is None else state
+        target = self.state_target if state_target is None else state_target
         if target is None:
             raise ValueError(
-                "peps_target is required for loss(). "
-                "Provide peps_target in constructor or call loss(peps_target=...)."
+                "state_target is required for loss(). "
+                "Provide state_target in constructor or call loss(state_target=...)."
             )
         opts = self._merge_opts(self.loss_kwargs, kwargs)
         return self._loss_peps(state, target, **opts)
@@ -409,18 +409,18 @@ class GlobalOptimizer:
         optimizer = self._normalize_optimizer_name(optimizer)
 
         constants = {}
-        if self.peps_target is not None:
-            constants["peps_target"] = self.peps_target
+        if self.state_target is not None:
+            constants["state_target"] = self.state_target
         if loss_constants:
             constants.update(dict(loss_constants))
-        if constants.get("peps_target") is None:
+        if constants.get("state_target") is None:
             raise ValueError(
-                "peps_target is required for make_tn_optimizer(). "
-                "Provide it in constructor or via loss_constants={'peps_target': ...}."
+                "state_target is required for make_tn_optimizer(). "
+                "Provide it in constructor or via loss_constants={'state_target': ...}."
             )
 
         return qtn.TNOptimizer(
-            self.peps,
+            self.state,
             self._tnopt_loss,
             loss_constants=constants,
             loss_kwargs=merged_loss_kwargs,
@@ -456,5 +456,5 @@ class GlobalOptimizer:
             device=device,
         )
         out = tnopt.optimize(n=n, **optimize_kwargs)
-        self.peps = out
+        self.state = out
         return out

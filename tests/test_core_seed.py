@@ -70,6 +70,25 @@ def test_tn_fidelity_uses_default_optimizer_settings(monkeypatch):
     assert "seed" not in captured
 
 
+def test_tn_fidelity_uses_supplied_optimizer_without_build(monkeypatch):
+    """Passing ``opt`` should bypass default optimizer construction."""
+    called = {"build": 0}
+
+    def fake_build_optimizer(**kwargs):  # pylint: disable=unused-argument
+        called["build"] += 1
+        return "auto-hq"
+
+    monkeypatch.setattr(core, "build_optimizer", fake_build_optimizer)
+
+    psi = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=6)
+    psi_fix = psi.copy()
+
+    fidelity = core.tn_fidelity(psi, psi_fix, opt="auto-hq")
+
+    assert abs(fidelity - 1.0) < 1e-12
+    assert called["build"] == 0
+
+
 def test_default_backend_setters_roundtrip():
     """Default backend setters/getters should round-trip callables."""
     array_backend = lambda x: x  # noqa: E731
