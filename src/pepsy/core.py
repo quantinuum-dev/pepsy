@@ -28,7 +28,7 @@ __all__ = [
     "build_compressed_optimizer",
     "tn_fidelity",
     "tns_align",
-    "product_state_peps",
+    "ps_to_peps",
 ]
 
 _DEFAULT_ARRAY_BACKEND = None
@@ -421,7 +421,7 @@ def tns_align(p, pepo):
 
 
 
-def product_state_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0):
+def ps_to_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0):
     """Create a bond-dimension-1 product-state PEPS parameterized by ``theta``.
 
     Each site tensor is set so the physical vector is

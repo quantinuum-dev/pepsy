@@ -13,7 +13,8 @@ import quimb as qu
 import quimb.tensor as qtn
 
 __all__ = [
-    "apply_gates",
+    "gate_2d",
+    "gate_to_pepo",
     "gate_1d",
     "pauli",
     "x",
@@ -541,6 +542,7 @@ def apply_2dtn_(
     canonize_distance=2,
     to_backend=None,
     sequence=("av", "bh", "ah", "bv"),
+    ind_id="k{},{}",
 ):
     """Apply a local gate to a PEPS, routing long-range gates with SWAPs."""
 
@@ -567,7 +569,7 @@ def apply_2dtn_(
         qtn.tensor_network_gate_inds(
             peps,
             G,
-            [f"k{i},{j}"],
+            [ind_id.format(i, j)],
             contract=True,
             tags=tags,
             info=None,
@@ -592,7 +594,7 @@ def apply_2dtn_(
         qtn.tensor_network_gate_inds(
             peps,
             swap,
-            [f"k{i_},{j_}", f"k{m_},{n_}"],
+            [ind_id.format(i_, j_), ind_id.format(m_, n_)],
             contract=contract,
             tags=tags,
             info=None,
@@ -607,7 +609,7 @@ def apply_2dtn_(
     qtn.tensor_network_gate_inds(
         peps,
         G,
-        [f"k{i_},{j_}", f"k{m_},{n_}"],
+        [ind_id.format(i_, j_), ind_id.format(m_, n_)],
         contract=contract,
         tags=tags,
         info=None,
@@ -622,7 +624,7 @@ def apply_2dtn_(
         qtn.tensor_network_gate_inds(
             peps,
             swap,
-            [f"k{i_},{j_}", f"k{m_},{n_}"],
+            [ind_id.format(i_, j_), ind_id.format(m_, n_)],
             contract=contract,
             tags=tags,
             info=None,
@@ -642,7 +644,7 @@ def _is_lattice_coord(value):
 
 
 def _normalize_where_arg(where):
-    """Normalize one-site and two-site where specs for :func:`apply_2dtn_`."""
+    """Normalize one-site and two-site where specs for :func:`gate_2d`."""
     if _is_lattice_coord(where):
         i, j = where
         return ((int(i), int(j)),)
@@ -661,7 +663,7 @@ def _normalize_where_arg(where):
     )
 
 
-def apply_gates(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def gate_2d(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     peps,
     gates,
     *,
@@ -749,6 +751,100 @@ def apply_gates(  # pylint: disable=too-many-arguments,too-many-positional-argum
         peps.compress_all_(max_bond=chi_value, cutoff=chi_cutoff)
 
     return peps
+
+
+
+def pepo_identity(lx, ly, dtype="complex128"):
+    """Create bond-dimension-1 PEPO identity on an ``lx x ly`` lattice."""
+    pepo = qtn.PEPO.rand(Lx=lx, Ly=ly, bond_dim=1, seed=666, dtype=dtype)
+    eye = qu.pauli("I", dtype=dtype)
+
+    for tensor in pepo:
+        ndim = len(tensor.data.shape)
+        if ndim == 4:
+            data = np.zeros([1, 1, 2, 2], dtype=dtype)
+            data[0, 0, :, :] = eye
+            tensor.modify(data=data)
+        elif ndim == 5:
+            data = np.zeros([1, 1, 1, 2, 2], dtype=dtype)
+            data[0, 0, 0, :, :] = eye
+            tensor.modify(data=data)
+        elif ndim == 6:
+            data = np.zeros([1, 1, 1, 1, 2, 2], dtype=dtype)
+            data[0, 0, 0, 0, :, :] = eye
+            tensor.modify(data=data)
+
+    return pepo
+
+
+def peps_cycle(peps, bond_dim, cylinder=False):
+    """Add periodic bonds; wrapper around :func:`pepsy.core.add_cycle`."""
+    from .core import add_cycle  # pylint: disable=import-outside-toplevel
+
+    return add_cycle(peps, bond_dim=bond_dim, cylinder=cylinder)
+
+
+def gate_to_pepo(
+    gates,
+    cyclic=False,
+    cutoff=1.0e-12,
+    pepo_=None,
+    dtype="complex128",
+    bnd=32,
+    sequence=("av", "bh", "ah", "bv"),
+    contract="split",
+    compress_threshold=16,
+):
+    """Build a PEPO by applying ``(where, G)`` gate pairs onto a PEPO identity.
+
+    ``gates`` is a list of ``(where, G)`` where ``where`` is already in
+    normalized form: ``((i, j),)`` for single-site or
+    ``((i0, j0), (i1, j1))`` for two-site gates.
+    Lx / Ly are inferred from the gate coordinates.
+    """
+    gates = list(gates)
+    if not gates:
+        raise ValueError("gates must not be empty.")
+
+    where_list = [where for where, _ in gates]
+    gate_list  = [G    for _,     G in gates]
+
+    coords = [c for w in where_list for c in w]
+    Lx = max(i for i, _ in coords) + 1
+    Ly = max(j for _, j in coords) + 1
+
+    pepo = pepo_.copy() if pepo_ is not None else pepo_identity(Lx, Ly, dtype=dtype)
+    if pepo_ is None and cyclic:
+        pepo = peps_cycle(pepo, 1)
+
+    for tensor in pepo:
+        tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
+
+    for G, where_norm in zip(gate_list, where_list):
+        n = len(where_norm)
+        if n == 1:
+            gate_use = ar.do("transpose", G, (1, 0))
+        elif n == 2:
+            gate_use = ar.do("transpose", G, (2, 3, 0, 1))
+        else:
+            raise ValueError("where must contain one or two site coordinates.")
+
+        apply_2dtn_(
+            pepo, gate_use, where_norm,
+            bond_dim=bnd, bra=False, contract=contract,
+            tags=[], dtype=dtype, cutoff=cutoff,
+            sequence=sequence, ind_id="b{},{}",
+        )
+
+        if pepo.max_bond() > compress_threshold:
+            pepo.compress_all(
+                inplace=True,
+                max_bond=compress_threshold,
+                canonize_distance=4,
+                cutoff=1e-14,
+            )
+
+    return pepo
 
 
 def gate_1d(

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         gradient_solver,
         optimize_global,
         optimize_sweep,
+        optimize_energy,
     )
     from .boundary_metrics import (
         BoundaryContractResult,
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
     from .core import (
         get_default_array_backend,
         get_default_grad_backend,
-        product_state_peps,
+        ps_to_peps,
         register_torch_linalg,
         reset_default_backends,
         set_default_array_backend,
@@ -45,7 +46,8 @@ if TYPE_CHECKING:
     from .fit import FIT
     from .gate import (
         apply_2dtn_,
-        apply_gates,
+        gate_2d,
+        gate_to_pepo,
         gate_1d,
         gen_long_range_swap_path,
         pauli,
@@ -88,6 +90,7 @@ if TYPE_CHECKING:
     )
     from .optimize_global import GlobalOptimizer
     from .optimize_sweep import SweepOptimizer, SweepResult
+    from .optimize_energy import EnergyOptimizer, EnergyResult
     from .optimize_mps import MpsOptimizer
 
 __all__ = [
@@ -112,10 +115,13 @@ __all__ = [
     "reset_default_backends",
     "SweepOptimizer",
     "SweepResult",
+    "EnergyOptimizer",
+    "EnergyResult",
     "tns_align",
     "gen_long_range_swap_path",
     "apply_2dtn_",
-    "apply_gates",
+    "gate_2d",
+    "gate_to_pepo",
     "gate_1d",
     "pauli",
     "x",
@@ -152,9 +158,10 @@ __all__ = [
     "u3",
     "su4",
     "ham_tn",
-    "product_state_peps",
+    "ps_to_peps",
     "optimize_global",
     "optimize_sweep",
+    "optimize_energy",
     "gradient_solver",
     "gate",
     "ham",
@@ -179,6 +186,7 @@ def __getattr__(name):
         "optimize_mps",
         "optimize_global",
         "optimize_sweep",
+        "optimize_energy",
         "core",
         "fit",
     ):
@@ -220,7 +228,8 @@ def __getattr__(name):
     if name in (
         "gen_long_range_swap_path",
         "apply_2dtn_",
-        "apply_gates",
+        "gate_2d",
+        "gate_to_pepo",
         "gate_1d",
         "pauli",
         "x",
@@ -259,7 +268,8 @@ def __getattr__(name):
     ):
         from .gate import (  # pylint: disable=import-outside-toplevel
             apply_2dtn_,
-            apply_gates,
+            gate_2d,
+            gate_to_pepo,
             gate_1d,
             gen_long_range_swap_path,
             pauli,
@@ -301,7 +311,8 @@ def __getattr__(name):
         return {
             "gen_long_range_swap_path": gen_long_range_swap_path,
             "apply_2dtn_": apply_2dtn_,
-            "apply_gates": apply_gates,
+            "gate_2d": gate_2d,
+            "gate_to_pepo": gate_to_pepo,
             "gate_1d": gate_1d,
             "pauli": pauli,
             "x": x,
@@ -344,15 +355,15 @@ def __getattr__(name):
 
         return ham_tn
 
-    if name in ("tns_align", "product_state_peps"):
+    if name in ("tns_align", "ps_to_peps"):
         from .core import (  # pylint: disable=import-outside-toplevel
-            product_state_peps,
+            ps_to_peps,
             tns_align,
         )
 
         return {
             "tns_align": tns_align,
-            "product_state_peps": product_state_peps,
+            "ps_to_peps": ps_to_peps,
         }[name]
 
     if name in ("BdyMPS", "make_numpy_array_caster"):
@@ -417,6 +428,17 @@ def __getattr__(name):
         return {
             "SweepOptimizer": SweepOptimizer,
             "SweepResult": SweepResult,
+        }[name]
+
+    if name in ("EnergyOptimizer", "EnergyResult"):
+        from .optimize_energy import (  # pylint: disable=import-outside-toplevel
+            EnergyOptimizer,
+            EnergyResult,
+        )
+
+        return {
+            "EnergyOptimizer": EnergyOptimizer,
+            "EnergyResult": EnergyResult,
         }[name]
 
     if name == "MpsOptimizer":

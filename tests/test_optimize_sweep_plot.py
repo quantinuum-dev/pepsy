@@ -35,7 +35,6 @@ def test_run_wrapper_maps_global_style_arguments(monkeypatch):
         chi=24,
         progbar=False,
         debug=True,
-        boundary_fidel=True,
         renormalize=True,
     )
 
@@ -48,7 +47,7 @@ def test_run_wrapper_maps_global_style_arguments(monkeypatch):
     assert captured["debug"] is True
     assert captured["debug_loss_mode"] == "infidelity"
     assert captured["debug_loss_kwargs"] == {"chi": 32, "norm_target": 1.0}
-    assert captured["boundary_fidel"] is True
+    assert "boundary_fidel" not in captured
     assert captured["renormalize"] is True
 
 
@@ -63,6 +62,8 @@ def test_run_wrapper_rejects_alias_arguments():
         SweepOptimizer.run(opt, solver_options={"algorithm": "LD_VAR2"})
     with pytest.raises(TypeError):
         SweepOptimizer.run(opt, pbar=False)
+    with pytest.raises(TypeError):
+        SweepOptimizer.run(opt, boundary_fidel=True)
 
 
 def test_set_optimize_kwargs_uses_clear_canonical_keys():

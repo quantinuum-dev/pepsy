@@ -28,7 +28,7 @@ def test_core_symbols_exported():
     assert "tns_align" in pepsy.__all__
     assert "gen_long_range_swap_path" in pepsy.__all__
     assert "apply_2dtn_" in pepsy.__all__
-    assert "apply_gates" in pepsy.__all__
+    assert "gate_2d" in pepsy.__all__
     assert "gate_1d" in pepsy.__all__
     assert "pauli" in pepsy.__all__
     assert "canonize_mps" not in pepsy.__all__
@@ -66,7 +66,7 @@ def test_core_symbols_exported():
     assert "u3" in pepsy.__all__
     assert "su4" in pepsy.__all__
     assert "apply_gates_" not in pepsy.__all__
-    assert "product_state_peps" in pepsy.__all__
+    assert "ps_to_peps" in pepsy.__all__
     assert "peps_I" not in pepsy.__all__
     assert "reg_complex_svd_torch" in pepsy.__all__
     assert "reg_complex_svd_jax" in pepsy.__all__
@@ -98,7 +98,7 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.tns_align)
     assert callable(pepsy.gen_long_range_swap_path)
     assert callable(pepsy.apply_2dtn_)
-    assert callable(pepsy.apply_gates)
+    assert callable(pepsy.gate_2d)
     assert callable(pepsy.gate_1d)
     assert callable(pepsy.pauli)
     with pytest.raises(AttributeError):
@@ -138,7 +138,7 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.su4)
     with pytest.raises(AttributeError):
         _ = pepsy.apply_gates_
-    assert callable(pepsy.product_state_peps)
+    assert callable(pepsy.ps_to_peps)
     with pytest.raises(AttributeError):
         _ = pepsy.peps_I
     assert callable(pepsy.reg_complex_svd_torch)

@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import quimb.tensor as qtn
 
-from pepsy import product_state_peps
-from pepsy.gate import apply_2dtn_, apply_gates, gen_long_range_swap_path, pauli, x, y, z
+from pepsy import ps_to_peps
+from pepsy.gate import apply_2dtn_, gate_2d, gen_long_range_swap_path, pauli, x, y, z
 
 
 def test_gen_long_range_swap_path_adjacent():
@@ -20,9 +20,9 @@ def test_gen_long_range_swap_path_xy_order():
     assert path == [((0, 0), (1, 0)), ((1, 0), (1, 1))]
 
 
-def test_product_state_peps_builds_product_state():
-    """product_state_peps should build a valid bond-dimension-1 PEPS."""
-    peps = product_state_peps(2, 3, dtype="complex128", theta=0.123)
+def test_ps_to_peps_builds_product_state():
+    """ps_to_peps should build a valid bond-dimension-1 PEPS."""
+    peps = ps_to_peps(2, 3, dtype="complex128", theta=0.123)
     assert peps.Lx == 2
     assert peps.Ly == 3
     assert int(peps.max_bond()) == 1
@@ -30,7 +30,7 @@ def test_product_state_peps_builds_product_state():
 
 def test_apply_2dtn_one_site_inplace():
     """One-site gate application should modify in place and return same object."""
-    peps = product_state_peps(2, 2, dtype="complex128")
+    peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
     out = apply_2dtn_(peps, gate, ((0, 0),), cutoff=1e-12)
     assert out is peps
@@ -38,7 +38,7 @@ def test_apply_2dtn_one_site_inplace():
 
 def test_apply_2dtn_two_site_nearest_inplace():
     """Two-site nearest-neighbor gate should run and return same object."""
-    peps = product_state_peps(2, 2, dtype="complex128")
+    peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
     out = apply_2dtn_(peps, gate, ((0, 0), (0, 1)), cutoff=1e-12)
     assert out is peps
@@ -46,7 +46,7 @@ def test_apply_2dtn_two_site_nearest_inplace():
 
 def test_apply_2dtn_invalid_where_raises():
     """where must contain one or two coordinates."""
-    peps = product_state_peps(2, 2, dtype="complex128")
+    peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.complex128)
     with pytest.raises(ValueError, match="where must contain one or two"):
         apply_2dtn_(peps, gate, ((0, 0), (0, 1), (1, 1)))
@@ -54,15 +54,15 @@ def test_apply_2dtn_invalid_where_raises():
 
 def test_apply_2dtn_rejects_duplicate_two_site_coordinates():
     """Two-site gate call should require distinct coordinates."""
-    peps = product_state_peps(2, 2, dtype="complex128")
+    peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
     with pytest.raises(ValueError, match="distinct coordinates"):
         apply_2dtn_(peps, gate, ((0, 0), (0, 0)))
 
 
 def test_apply_gates_accepts_mixed_site_and_edge_specs():
-    """apply_gates should accept one-site (i,j) and two-site edge tuples."""
-    peps = product_state_peps(2, 2, dtype="complex128")
+    """gate_2d should accept one-site (i,j) and two-site edge tuples."""
+    peps = ps_to_peps(2, 2, dtype="complex128")
     rx = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
     rzz = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
 
@@ -74,7 +74,7 @@ def test_apply_gates_accepts_mixed_site_and_edge_specs():
     for site in sites:
         gates.append((site, rx))
 
-    out = apply_gates(
+    out = gate_2d(
         peps,
         gates,
         bra=False,
@@ -88,10 +88,10 @@ def test_apply_gates_accepts_mixed_site_and_edge_specs():
 
 def test_apply_gates_invalid_where_raises():
     """Invalid where entries should fail with clear ValueError."""
-    peps = product_state_peps(2, 2, dtype="complex128")
+    peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.complex128)
     with pytest.raises(ValueError, match="Invalid where specification"):
-        apply_gates(peps, [(((0, 0), (1, 1), (1, 0)), gate)])
+        gate_2d(peps, [(((0, 0), (1, 1), (1, 0)), gate)])
 
 
 def test_apply_gates_runs_final_compress_when_chi_given():
@@ -105,16 +105,16 @@ def test_apply_gates_runs_final_compress_when_chi_given():
             return self
 
     dummy = _DummyPeps()
-    out = apply_gates(dummy, [], chi=2, chi_cutoff=1.0e-12)
+    out = gate_2d(dummy, [], chi=2, chi_cutoff=1.0e-12)
     assert out is dummy
     assert dummy.called == (2, 1.0e-12)
 
 
 def test_apply_gates_invalid_chi_raises():
     """Non-positive chi should fail with ValueError."""
-    peps = product_state_peps(2, 2, dtype="complex128")
+    peps = ps_to_peps(2, 2, dtype="complex128")
     with pytest.raises(ValueError, match="positive integer"):
-        apply_gates(peps, [], chi=0)
+        gate_2d(peps, [], chi=0)
 
 
 def test_apply_2dtn_infers_swap_backend_from_gate(monkeypatch):
