@@ -10,7 +10,7 @@ import scipy.linalg
 import torch
 from jax import custom_vjp
 
-# pylint: disable=abstract-method,arguments-differ,bad-staticmethod-argument,bare-except,invalid-name,line-too-long,multiple-statements,not-callable,superfluous-parens,too-many-branches,too-many-locals,too-many-statements,unnecessary-semicolon,unused-variable,using-constant-test
+# pylint: disable=abstract-method,arguments-differ,bad-staticmethod-argument,bare-except,line-too-long,multiple-statements,not-callable,superfluous-parens,too-many-branches,too-many-locals,too-many-statements,unnecessary-semicolon,unused-variable,using-constant-test
 # jax.config.update("jax_enable_x64", True)
 
 

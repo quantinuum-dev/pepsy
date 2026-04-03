@@ -1,6 +1,6 @@
 # Tutorial: Fidelity Diagnostics
 
-`ContractBoundary` returns:
+`contract_boundary` returns:
 
 - `res.cost`: final contracted scalar
 - `res.fidel`: per-step fidelity values collected during sweeps
@@ -33,7 +33,7 @@ For `direction="x"`, use `split = ket.Lx // 2`.
 
 1. Increase `chi`.
 2. Increase `n_iter`.
-3. Try `dmrg_run="global"` for better local solves.
+3. Try `fit_mode="global"` for better local solves.
 4. Compare `direction="y"` vs `"x"` and choose the stabler one.
 
 ## Pitfall

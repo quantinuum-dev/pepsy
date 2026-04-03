@@ -39,16 +39,28 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
     Parameters
     ----------
-    tn : TensorNetwork
+    tn : qtn.TensorNetwork
         Target tensor network to fit.
-    p : TensorNetwork
-        Initial MPS/MPO state. Must support ``copy`` and canonization methods.
-    cutoffs : float, optional
-        Numerical cutoff for truncation (default: 1e-9).
-    backend : str or None, optional
+    p : qtn.MatrixProductState | qtn.MatrixProductOperator
+        Initial state to optimize.
+    cutoffs : float, default=1e-12
+        Numerical cutoff used by local decompositions/truncations.
+    backend : str | None, default=None
         Backend specification for tensor operations.
-    re_tag : bool, default=False
-        If True, (re)tag the target TN for environment construction.
+    site_tag_id : str, default="I{}"
+        Site-tag format used by ``p`` and local environment builders.
+    contraction_opt : str | object, default="auto-hq"
+        Contraction optimizer used for effective-environment contractions.
+    range_int : sequence[int] | None, default=None
+        Optional active interval ``(start, stop)`` used by :meth:`run_gate`.
+    retag : bool, default=False
+        If ``True``, regenerate tags on ``tn`` from ``p`` site connectivity.
+    info : dict[str, Any] | None, default=None
+        Optional scratch dictionary used by callers to store metadata.
+    warning : bool, default=False
+        Enable warning logs for fallback and retagging edge-cases.
+    inplace : bool, default=False
+        If ``True``, optimize ``p`` in place; otherwise operate on ``p.copy()``.
     """
 
     def __init__(
@@ -58,9 +70,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         cutoffs: float = 1e-12,
         backend: Optional[str] = None,
         site_tag_id: str = "I{}",
-        opt: str = "auto-hq",
+        contraction_opt: str = "auto-hq",
         range_int: Optional[Sequence[int]] = None,
-        re_tag: bool = False,
+        retag: bool = False,
         info: Optional[Dict[str, Any]] = None,
         warning: bool = False,
         inplace: bool = False,
@@ -73,7 +85,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if not isinstance(site_tag_id, str) or "{}" not in site_tag_id:
             raise ValueError("site_tag_id must be a format string containing '{}'.")
 
-        self.L = int(p.L)  # pylint: disable=invalid-name
+        self.L = int(p.L)
 
         self.p = p if inplace else p.copy()
 
@@ -92,7 +104,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.site_tag_id = site_tag_id
 
         # Contraction path optimizer spec.
-        self.opt = opt
+        self.contraction_opt = contraction_opt
+        self.opt = self.contraction_opt
 
         # cutoffs and underlying backend
         self.cutoffs = cutoffs
@@ -121,7 +134,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError("tn and p have different outer indices.")
 
         # Re-tag TN for effective environments when requested.
-        if re_tag:
+        if retag:
             self._re_tag()
 
     def visual(
@@ -227,7 +240,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             raise ValueError("Initial state `p` must be provided.")
 
         psi = self.p
-        L = self.L  # pylint: disable=invalid-name
+        L = self.L
         opt = self.opt
         site_tag_id = self.site_tag_id
 
@@ -258,11 +271,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self.fidelity_trace.append(ar.do("real", fidelity))
 
     def _build_env_right(self, psi, env_right):
+        """Build inclusive right environments for all sites.
+
+        Populates ``env_right[site_tag]`` for each site, where each entry is
+        the contraction of the current site block and everything to its right.
         """
-        Build right environments env_right["I{i}"] for i in 0..L-1.
-        env_right[i] corresponds to contraction of site i and everything to the right (inclusive).
-        """
-        L = self.L  # pylint: disable=invalid-name
+        L = self.L
         opt = self.opt
         site_tag_id = self.site_tag_id
 
@@ -284,11 +298,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 env_right[site_tag_id.format(i)] = t.contract(all, optimize=opt)
 
     def _right_range(self, psi, env_right, start, stop):
+        """Build right environments over a restricted ``[start, stop]`` window.
+
+        This variant is used by :meth:`run_gate` and supports partially
+        available right boundaries at interval edges.
         """
-        Build right environments env_right["I{i}"] for i in 0..L-1.
-        env_right[i] corresponds to contraction of site i and everything to the right (inclusive).
-        """
-        L = self.L  # pylint: disable=invalid-name
+        L = self.L
         opt = self.opt
         site_tag_id = self.site_tag_id
 
@@ -383,7 +398,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         site_tag_id = self.site_tag_id
         psi = self.p
-        L = self.L  # pylint: disable=invalid-name
+        L = self.L
         opt = self.opt
 
         if L == 1:
@@ -475,7 +490,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         site_tag_id = self.site_tag_id
         psi = self.p
-        L = self.L  # pylint: disable=invalid-name
+        L = self.L
         opt = self.opt
 
         if L == 1:

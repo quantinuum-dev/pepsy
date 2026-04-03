@@ -1,9 +1,7 @@
 """Shared DMRG backend, optimizer, and fidelity helpers."""
 
-import importlib.util
 import math
 import os
-import tempfile
 import warnings
 from typing import Any
 
@@ -34,65 +32,6 @@ __all__ = [
 _DEFAULT_ARRAY_BACKEND = None
 _DEFAULT_GRAD_BACKEND = None
 
-
-def _default_cache_root():
-    """Return default cache root for pepsy artifacts."""
-    env_cache = os.environ.get("PEPSY_CACHE_DIR")
-    if env_cache:
-        return env_cache
-
-    try:
-        from platformdirs import user_cache_dir  # pylint: disable=import-outside-toplevel
-
-        return user_cache_dir("pepsy")
-    except Exception:  # pragma: no cover - optional dependency fallback
-        return os.path.join(os.path.expanduser("~"), ".cache", "pepsy")
-
-
-def _resolve_cache_directory(directory, subdir):
-    """Resolve cache directory, honoring global disable and env override."""
-    if directory is not None:
-        return _ensure_cache_directory(directory, warn=True)
-
-    disable_cache = os.environ.get("PEPSY_DISABLE_CACHE", "").strip().lower()
-    if disable_cache in {"1", "true", "yes", "on"}:
-        return None
-
-    default_cache = _ensure_cache_directory(os.path.join(_default_cache_root(), subdir), warn=False)
-    if default_cache is not None:
-        return default_cache
-
-    # Fallback for restricted environments where user-cache is not writable.
-    fallback_cache = _ensure_cache_directory(
-        os.path.join(tempfile.gettempdir(), "pepsy-cache", subdir),
-        warn=False,
-    )
-    if fallback_cache is not None:
-        return fallback_cache
-
-    warnings.warn(
-        "No writable cache directory available. Disabling optimizer cache.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-    return None
-
-
-def _ensure_cache_directory(path, warn=False):
-    """Create cache directory when possible, else return ``None``."""
-    if path is None:
-        return None
-    try:
-        os.makedirs(path, exist_ok=True)
-        return path
-    except OSError:
-        if warn:
-            warnings.warn(
-                f"Cache directory '{path}' is not writable. Disabling optimizer cache.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        return None
 
 
 def _validate_backend_callable(name, fn):
@@ -240,11 +179,11 @@ def register_torch_linalg(mode="complex"):
 
 def build_optimizer(
     progbar=True,
-    alpha=32,
+    alpha=64,
     target_size=2**34,
     subtree_size=12,
-    max_time="rate:1e8",
-    max_repeats=2**6,
+    max_time="rate:1e7",
+    max_repeats=2**8,
     parallel=True,
     optlib="cmaes",
     directory=None,
@@ -254,19 +193,10 @@ def build_optimizer(
 
     Parameters
     ----------
-    directory : str | None, optional
-        Cache directory for optimizer artifacts. If ``None``, defaults to
-        ``$PEPSY_CACHE_DIR/cotengra`` (or OS user-cache dir fallback). Set
-        environment variable ``PEPSY_DISABLE_CACHE=1`` to force ``None``.
+    directory : None, True, or str, optional
+        Passed directly to cotengra. ``None`` disables caching; ``True``
+        auto-generates a directory in the current working directory.
     """
-    selected_optlib = optlib
-    if selected_optlib == "cmaes" and importlib.util.find_spec("cmaes") is None:
-        warnings.warn(
-            "Package 'cmaes' not found. Falling back to optlib='random'.",
-            RuntimeWarning,
-        )
-        selected_optlib = "random"
-    cache_dir = _resolve_cache_directory(directory, "cotengra")
     opt = ctg.ReusableHyperOptimizer(
         minimize=f"combo-{int(alpha)}",
         slicing_opts={"target_size": 2**40},
@@ -274,10 +204,10 @@ def build_optimizer(
         reconf_opts={"subtree_size": subtree_size},
         max_repeats=max_repeats,
         parallel=parallel,
-        optlib=selected_optlib,
+        optlib=optlib,
         max_time=max_time,
         hash_method=hash_method,
-        directory=cache_dir,
+        directory=directory,
         progbar=progbar,
         on_trial_error="ignore",
     )
@@ -289,25 +219,23 @@ def build_compressed_optimizer(
     chi=4,
     directory=None,
     max_repeats=2**8,
-    max_time="rate:1e8",
+    max_time="rate:1e7",
 ):
     """Build and return a reusable cotengra compressed optimizer.
 
     Parameters
     ----------
-    directory : str | None, optional
-        Cache directory for optimizer artifacts. If ``None``, defaults to
-        ``$PEPSY_CACHE_DIR/cotengra-compressed`` (or OS user-cache dir
-        fallback). Set ``PEPSY_DISABLE_CACHE=1`` to force ``None``.
+    directory : None, True, or str, optional
+        Passed directly to cotengra. ``None`` disables caching; ``True``
+        auto-generates a directory in the current working directory.
     """
-    cache_dir = _resolve_cache_directory(directory, "cotengra-compressed")
     copt = ctg.ReusableHyperCompressedOptimizer(
         chi,
         max_repeats=max_repeats,
         minimize="combo-compressed",
         progbar=progbar,
         max_time=max_time,
-        directory=cache_dir,
+        directory=directory,
     )
     return copt
 
@@ -380,32 +308,17 @@ def tns_align(p, pepo):
     validate_tensor_network_tags(p)
     validate_tensor_network_tags(pepo)
 
-    # Validate PEPS physical indices
-    bad_p = [i for i in p.outer_inds() if not _PHYS_OUTER.fullmatch(i)]
-    if bad_p:
-        sample = ", ".join(sorted(bad_p)[:8])
-        warnings.warn(
-            f"PEPS outer indices expected format k/b<int>[,<int>...]. "
-            f"Found non-matching: {sample}",
-            stacklevel=2,
-        )
-
-    # Validate PEPO physical indices
-    bad_pepo = [i for i in pepo.outer_inds() if not _PHYS_OUTER.fullmatch(i)]
-    if bad_pepo:
-        sample = ", ".join(sorted(bad_pepo)[:8])
-        warnings.warn(
-            f"PEPO outer indices expected format k/b<int>[,<int>...]. "
-            f"Found non-matching: {sample}",
-            stacklevel=2,
-        )
-
     tn = p & pepo
-    # The PEPS k-indices are now inner (contracted with PEPO k-indices).
-    # Randomize them so they won't collide when we rename b -> k.
+    # Only randomize the physical k-indices (shared between p and pepo).
+    # Virtual bond indices must NOT be renamed — they must stay stable so
+    # the Y-cut outer indices of the double-layer TN match the stored
+    # boundary MPS across repeated calls to _prepare_current_double_layers.
+    # Use non-mutating reindex to avoid modifying the original p/pepo tensors
+    # (quimb's & shares tensor objects, so reindex_ would mutate the originals).
     contracted_k = {
         idx: qtn.rand_uuid()
         for idx in tn.inner_inds()
+        if isinstance(idx, str) and idx.startswith("k")
     }
     if contracted_k:
         tn.reindex_(contracted_k)

@@ -32,24 +32,20 @@ _TORCH_SOLVERS = {
     "lbfgs": torch.optim.LBFGS,
 }
 
-_SOLVER_ALIASES = {
-    "torch-adam": "adam",
-    "torch_adam": "adam",
-    "torch-lbfgs": "lbfgs",
-    "torch_lbfgs": "lbfgs",
-    "scipy": "scipy-lbfgs",
-    "scipy_lbfgs": "scipy-lbfgs",
-    "scipy-l-bfgs-b": "scipy-lbfgs",
-    "nlopt": "nlopt-lbfgs",
-    "nlopt_lbfgs": "nlopt-lbfgs",
-}
-
-
 def _normalize_solver_name(solver: str) -> str:
     if not isinstance(solver, str):
         raise TypeError("solver must be a string")
     normalized = solver.strip().lower()
-    normalized = _SOLVER_ALIASES.get(normalized, normalized)
+    alias_hints = {
+        "scipy": "scipy-lbfgs",
+        "scipy_lbfgs": "scipy-lbfgs",
+        "nlopt": "nlopt-lbfgs",
+        "nlopt_lbfgs": "nlopt-lbfgs",
+    }
+    if normalized in alias_hints:
+        raise ValueError(
+            f"Unsupported solver alias {solver!r}; use canonical solver={alias_hints[normalized]!r}."
+        )
     if normalized not in SUPPORTED_SOLVERS:
         supported = ", ".join(SUPPORTED_SOLVERS)
         raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")

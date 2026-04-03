@@ -15,7 +15,7 @@ def test_run_wrapper_maps_global_style_arguments(monkeypatch):
     opt.optimize_kwargs = {
         "axes": ("y", "x"),
         "n_round_trips": 2,
-        "optimizer": "scipy",
+        "optimizer": "scipy-lbfgs",
         "optimizer_options": {"algorithm": "LBFGS"},
         "env_n_iter": 10,
         "debug_loss_mode": "infidelity",
@@ -31,9 +31,9 @@ def test_run_wrapper_maps_global_style_arguments(monkeypatch):
 
     out = SweepOptimizer.run(
         opt,
-        n=5,
+        n_cycles=5,
         chi=24,
-        progbar=False,
+        progress=False,
         debug=True,
         renormalize=True,
     )
@@ -41,13 +41,13 @@ def test_run_wrapper_maps_global_style_arguments(monkeypatch):
     assert out == "ok"
     assert captured["n_cycles"] == 5
     assert captured["chi"] == 24
-    assert captured["solver"] == "scipy"
+    assert captured["solver"] == "scipy-lbfgs"
     assert captured["solver_options"] == {"algorithm": "LBFGS"}
-    assert captured["pbar"] is False
+    assert captured["progress"] is False
     assert captured["debug"] is True
     assert captured["debug_loss_mode"] == "infidelity"
     assert captured["debug_loss_kwargs"] == {"chi": 32, "norm_target": 1.0}
-    assert "boundary_fidel" not in captured
+    assert "track_boundary_fidelity" not in captured
     assert captured["renormalize"] is True
 
 
@@ -55,7 +55,7 @@ def test_run_wrapper_rejects_alias_arguments():
     """run() should only accept canonical argument names."""
     opt = object.__new__(SweepOptimizer)
     with pytest.raises(TypeError):
-        SweepOptimizer.run(opt, n_cycles=3)
+        SweepOptimizer.run(opt, n=3)
     with pytest.raises(TypeError):
         SweepOptimizer.run(opt, solver="nlopt")
     with pytest.raises(TypeError):
@@ -63,7 +63,7 @@ def test_run_wrapper_rejects_alias_arguments():
     with pytest.raises(TypeError):
         SweepOptimizer.run(opt, pbar=False)
     with pytest.raises(TypeError):
-        SweepOptimizer.run(opt, boundary_fidel=True)
+        SweepOptimizer.run(opt, track_boundary_fidelity=True)
 
 
 def test_set_optimize_kwargs_uses_clear_canonical_keys():
@@ -72,19 +72,19 @@ def test_set_optimize_kwargs_uses_clear_canonical_keys():
     opt.optimize_kwargs = {}
     SweepOptimizer.set_optimize_kwargs(
         opt,
-        n=4,
+        n_cycles=4,
         chi=40,
-        optimizer="scipy",
+        optimizer="scipy-lbfgs",
         optimizer_options={"algorithm": "LBFGS"},
-        progbar=False,
-        boundary_fidel=True,
+        progress=False,
+        track_boundary_fidelity=True,
     )
-    assert opt.optimize_kwargs["n"] == 4
+    assert opt.optimize_kwargs["n_cycles"] == 4
     assert opt.optimize_kwargs["chi"] == 40
-    assert opt.optimize_kwargs["optimizer"] == "scipy"
+    assert opt.optimize_kwargs["optimizer"] == "scipy-lbfgs"
     assert opt.optimize_kwargs["optimizer_options"] == {"algorithm": "LBFGS"}
-    assert opt.optimize_kwargs["progbar"] is False
-    assert opt.optimize_kwargs["boundary_fidel"] is True
+    assert opt.optimize_kwargs["progress"] is False
+    assert opt.optimize_kwargs["track_boundary_fidelity"] is True
 
 
 @pytest.mark.parametrize(
@@ -97,7 +97,7 @@ def test_set_optimize_kwargs_uses_clear_canonical_keys():
     ],
 )
 def test_optimize_global_boundary_fidel_flag(debug, fidel_arg, expected_fidel, monkeypatch):
-    """Boundary boundary_fidel should default to debug unless explicitly overridden."""
+    """Boundary track_boundary_fidelity should default to debug unless explicitly overridden."""
     opt = object.__new__(SweepOptimizer)
     opt.state_target = object()
     opt.Lx = 2
@@ -114,13 +114,13 @@ def test_optimize_global_boundary_fidel_flag(debug, fidel_arg, expected_fidel, m
         solver_options,
         env_n_iter,
         run_callback,
-        boundary_fidel,
+        track_boundary_fidelity,
         debug,
         debug_loss_mode,
         debug_loss_kwargs,
         renormalize,
     ):  # pylint: disable=unused-argument
-        captured["boundary_fidel"] = boundary_fidel
+        captured["track_boundary_fidelity"] = track_boundary_fidelity
         captured["debug"] = debug
         captured["debug_loss_mode"] = debug_loss_mode
         captured["debug_loss_kwargs"] = debug_loss_kwargs
@@ -136,20 +136,20 @@ def test_optimize_global_boundary_fidel_flag(debug, fidel_arg, expected_fidel, m
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy",
+        solver="scipy-lbfgs",
         solver_options=None,
         env_n_iter=1,
-        pbar=False,
+        progress=False,
         debug=debug,
         renormalize=False,
     )
     if fidel_arg is not None:
-        kwargs["boundary_fidel"] = fidel_arg
+        kwargs["track_boundary_fidelity"] = fidel_arg
 
     _ = SweepOptimizer.optimize_global(opt, **kwargs)
 
     assert captured["debug"] is debug
-    assert captured["boundary_fidel"] is expected_fidel
+    assert captured["track_boundary_fidelity"] is expected_fidel
     assert captured["debug_loss_mode"] == "exact"
     assert captured["debug_loss_kwargs"] is None
 
@@ -170,7 +170,7 @@ def test_optimize_global_non_debug_skips_metrics(monkeypatch):
         solver_options,
         env_n_iter,
         run_callback,
-        boundary_fidel,
+        track_boundary_fidelity,
         debug,
         debug_loss_mode,
         debug_loss_kwargs,
@@ -189,11 +189,11 @@ def test_optimize_global_non_debug_skips_metrics(monkeypatch):
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy",
+        solver="scipy-lbfgs",
         env_n_iter=1,
-        pbar=False,
+        progress=False,
         debug=False,
-        boundary_fidel=True,
+        track_boundary_fidelity=True,
         renormalize=False,
     )
 
@@ -216,7 +216,7 @@ def test_optimize_global_non_debug_uses_infidelity_for_before_after(monkeypatch)
         solver_options,
         env_n_iter,
         run_callback,
-        boundary_fidel,
+        track_boundary_fidelity,
         debug,
         debug_loss_mode,
         debug_loss_kwargs,
@@ -241,20 +241,20 @@ def test_optimize_global_non_debug_uses_infidelity_for_before_after(monkeypatch)
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy",
+        solver="scipy-lbfgs",
         env_n_iter=7,
-        pbar=False,
+        progress=False,
         debug=False,
         debug_loss_kwargs={"chi": 32},
-        boundary_fidel=False,
+        track_boundary_fidelity=False,
         renormalize=False,
     )
 
     assert len(calls["infidelity"]) == 2
     assert calls["infidelity"][0]["chi"] == 32
     assert calls["infidelity"][0]["n_iter"] == 7
-    assert calls["infidelity"][0]["pbar"] is False
-    assert calls["infidelity"][0]["boundary_fidel"] is False
+    assert calls["infidelity"][0]["progress"] is False
+    assert calls["infidelity"][0]["track_boundary_fidelity"] is False
     assert out.loss_before == pytest.approx(0.25)
     assert out.loss_after == pytest.approx(0.10)
 
@@ -280,7 +280,7 @@ def test_optimize_global_applies_chi_before_sweeps(monkeypatch):
         solver_options,
         env_n_iter,
         run_callback,
-        boundary_fidel,
+        track_boundary_fidelity,
         debug,
         debug_loss_mode,
         debug_loss_kwargs,
@@ -298,11 +298,11 @@ def test_optimize_global_applies_chi_before_sweeps(monkeypatch):
         n_cycles=1,
         n_round_trips=1,
         chi=64,
-        solver="scipy",
+        solver="scipy-lbfgs",
         env_n_iter=1,
-        pbar=False,
+        progress=False,
         debug=False,
-        boundary_fidel=False,
+        track_boundary_fidelity=False,
         renormalize=False,
     )
 
@@ -331,8 +331,8 @@ def test_set_chi_expands_boundaries_and_optionally_normalizes(monkeypatch):
         n_iter=7,
         direction="x",
         max_separation=2,
-        pbar=True,
-        boundary_fidel=True,
+        progress=True,
+        track_boundary_fidelity=True,
     )
 
     assert out is opt
@@ -341,8 +341,8 @@ def test_set_chi_expands_boundaries_and_optionally_normalizes(monkeypatch):
         "n_iter": 7,
         "direction": "x",
         "max_separation": 2,
-        "pbar": True,
-        "boundary_fidel": True,
+        "progress": True,
+        "track_boundary_fidelity": True,
     }
 
 
@@ -362,7 +362,7 @@ def test_optimize_global_collects_step_loss_and_step_timing_when_not_debug(monke
         solver_options,
         env_n_iter,
         run_callback,
-        boundary_fidel,
+        track_boundary_fidelity,
         debug,
         debug_loss_mode,
         debug_loss_kwargs,
@@ -409,11 +409,11 @@ def test_optimize_global_collects_step_loss_and_step_timing_when_not_debug(monke
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy",
+        solver="scipy-lbfgs",
         env_n_iter=1,
-        pbar=False,
+        progress=False,
         debug=False,
-        boundary_fidel=False,
+        track_boundary_fidelity=False,
         renormalize=False,
     )
 
@@ -452,7 +452,7 @@ def test_optimize_global_resets_traces_each_call(monkeypatch):
         solver_options,
         env_n_iter,
         run_callback,
-        boundary_fidel,
+        track_boundary_fidelity,
         debug,
         debug_loss_mode,
         debug_loss_kwargs,
@@ -486,11 +486,11 @@ def test_optimize_global_resets_traces_each_call(monkeypatch):
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy",
+        solver="scipy-lbfgs",
         env_n_iter=1,
-        pbar=False,
+        progress=False,
         debug=False,
-        boundary_fidel=False,
+        track_boundary_fidelity=False,
         renormalize=False,
     )
     assert opt.step_loss_trace == pytest.approx([0.5])
@@ -500,11 +500,11 @@ def test_optimize_global_resets_traces_each_call(monkeypatch):
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy",
+        solver="scipy-lbfgs",
         env_n_iter=1,
-        pbar=False,
+        progress=False,
         debug=False,
-        boundary_fidel=False,
+        track_boundary_fidelity=False,
         renormalize=False,
     )
     assert opt.step_loss_trace == pytest.approx([0.2])
@@ -531,7 +531,7 @@ def test_optimize_global_debug_uses_exact_loss_per_step_trace(monkeypatch):
         solver_options,
         env_n_iter,
         run_callback,
-        boundary_fidel,
+        track_boundary_fidelity,
         debug,
         debug_loss_mode,
         debug_loss_kwargs,
@@ -576,11 +576,11 @@ def test_optimize_global_debug_uses_exact_loss_per_step_trace(monkeypatch):
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy",
+        solver="scipy-lbfgs",
         env_n_iter=1,
-        pbar=False,
+        progress=False,
         debug=True,
-        boundary_fidel=True,
+        track_boundary_fidelity=True,
         renormalize=False,
     )
 
@@ -612,13 +612,13 @@ def test_optimize_global_debug_infidelity_mode_skips_metrics(monkeypatch):
         solver_options,
         env_n_iter,
         run_callback,
-        boundary_fidel,
+        track_boundary_fidelity,
         debug,
         debug_loss_mode,
         debug_loss_kwargs,
         renormalize,
     ):  # pylint: disable=unused-argument
-        calls["axis_fidel"] = boundary_fidel
+        calls["axis_fidel"] = track_boundary_fidelity
         calls["axis_debug"] = debug
         calls["axis_debug_loss_mode"] = debug_loss_mode
         calls["axis_debug_loss_kwargs"] = debug_loss_kwargs
@@ -640,13 +640,13 @@ def test_optimize_global_debug_infidelity_mode_skips_metrics(monkeypatch):
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy",
+        solver="scipy-lbfgs",
         env_n_iter=1,
-        pbar=False,
+        progress=False,
         debug=True,
         debug_loss_mode="infidelity",
         debug_loss_kwargs={"chi": 18, "norm_target": 1.0},
-        boundary_fidel=None,
+        track_boundary_fidelity=None,
         renormalize=False,
     )
 
@@ -665,8 +665,8 @@ def test_infidelity_expands_boundaries_for_requested_chi(monkeypatch):
     opt = object.__new__(SweepOptimizer)
     opt.state = object()
     opt.state_target = object()
-    opt.opt = "auto-hq"
-    opt.dmrg_run = "eff"
+    opt.contraction_opt = "auto-hq"
+    opt.fit_mode = "eff"
 
     class _DummyBdy:
         def __init__(self, chi):
@@ -693,13 +693,13 @@ def test_infidelity_expands_boundaries_for_requested_chi(monkeypatch):
         norm_target,
         bdy,
         bdy_overlap,
-        opt,
+        contraction_opt,
         n_iter,
         direction,
         max_separation,
-        pbar,
-        boundary_fidel,
-        dmrg_run,
+        progress,
+        track_boundary_fidelity,
+        fit_mode,
         single_layer,
     ):
         captured["chi"] = chi
@@ -800,21 +800,25 @@ def test_optimize_packed_params_uses_default_solver_options(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("solver_in", "solver_out", "warns"),
+    "solver_in",
     [
-        ("scipy", "scipy-lbfgs", False),
-        ("nlopt", "nlopt-lbfgs", True),
-        ("scipy_lbfgs", "scipy-lbfgs", False),
-        ("nlopt_lbfgs", "nlopt-lbfgs", True),
+        "scipy",
+        "nlopt",
+        "scipy_lbfgs",
+        "nlopt_lbfgs",
     ],
 )
-def test_resolve_user_solver_aliases(solver_in, solver_out, warns):
-    """User-facing short solver names should normalize to canonical names."""
-    if warns:
-        with pytest.warns(UserWarning, match="nlopt-lbfgs"):
-            assert SweepOptimizer._resolve_user_solver(solver_in) == solver_out
-    else:
-        assert SweepOptimizer._resolve_user_solver(solver_in) == solver_out
+def test_resolve_user_solver_rejects_aliases(solver_in):
+    """Short solver aliases should be rejected in favor of canonical names."""
+    with pytest.raises(ValueError, match="Unsupported solver alias"):
+        SweepOptimizer._resolve_user_solver(solver_in)
+
+
+def test_resolve_user_solver_keeps_canonical_with_nlopt_warning():
+    """Canonical names should pass through, with NLopt guidance warning."""
+    assert SweepOptimizer._resolve_user_solver("scipy-lbfgs") == "scipy-lbfgs"
+    with pytest.warns(UserWarning, match="nlopt-lbfgs"):
+        assert SweepOptimizer._resolve_user_solver("nlopt-lbfgs") == "nlopt-lbfgs"
 
 
 def test_set_state_rebuilds_boundaries_and_normalizes(monkeypatch):
@@ -823,8 +827,8 @@ def test_set_state_rebuilds_boundaries_and_normalizes(monkeypatch):
     opt.state_target = object()
     opt.bdy = SimpleNamespace(chi=13, mps_b={})
     opt.bdy_overlap = SimpleNamespace(chi=13, mps_b={})
-    opt.opt = "auto-hq"
-    opt.dmrg_run = "eff"
+    opt.contraction_opt = "auto-hq"
+    opt.fit_mode = "eff"
     opt.state = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=1, dtype="complex128")
     opt.Lx, opt.Ly = 2, 2
 
@@ -854,8 +858,8 @@ def test_set_state_rebuilds_boundaries_and_normalizes(monkeypatch):
         opt,
         new_state,
         n_iter=3,
-        pbar=True,
-        boundary_fidel=True,
+        progress=True,
+        track_boundary_fidelity=True,
     )
 
     assert out == 7.5
@@ -864,8 +868,8 @@ def test_set_state_rebuilds_boundaries_and_normalizes(monkeypatch):
     assert rebuilt["target"] is opt.state_target
     assert rebuilt["chi"] == 13
     assert called_norm["n_iter"] == 3
-    assert called_norm["pbar"] is True
-    assert called_norm["boundary_fidel"] is True
+    assert called_norm["progress"] is True
+    assert called_norm["track_boundary_fidelity"] is True
 
 
 def test_set_state_can_skip_normalization(monkeypatch):
@@ -874,8 +878,8 @@ def test_set_state_can_skip_normalization(monkeypatch):
     opt.state_target = object()
     opt.bdy = SimpleNamespace(chi=9, mps_b={})
     opt.bdy_overlap = SimpleNamespace(chi=9, mps_b={})
-    opt.opt = "auto-hq"
-    opt.dmrg_run = "eff"
+    opt.contraction_opt = "auto-hq"
+    opt.fit_mode = "eff"
     opt.state = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=3, dtype="complex128")
     opt.Lx, opt.Ly = 2, 2
 
@@ -910,7 +914,7 @@ def test_set_target_rebuilds_overlap_boundary(monkeypatch):
 
     captured = {}
 
-    def _fake_prepare_boundary_inputs(*, ket=None, bra=None):
+    def _fake_build_bra_ket(*, ket=None, bra=None):
         captured["ket"] = ket
         captured["bra"] = bra
         return object(), object()
@@ -921,7 +925,7 @@ def test_set_target_rebuilds_overlap_boundary(monkeypatch):
         captured["single_layer"] = single_layer
         return SimpleNamespace(chi=chi, mps_b={"new": object()})
 
-    monkeypatch.setattr("pepsy.optimize_sweep.prepare_boundary_inputs", _fake_prepare_boundary_inputs)
+    monkeypatch.setattr("pepsy.optimize_sweep.build_bra_ket", _fake_build_bra_ket)
     monkeypatch.setattr("pepsy.optimize_sweep.BdyMPS", _fake_bdymps)
 
     target_new = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=7, dtype="complex128")
@@ -936,6 +940,36 @@ def test_set_target_rebuilds_overlap_boundary(monkeypatch):
     assert "new" in opt.bdy_overlap.mps_b
 
 
+def test_normalize_state_uses_stored_normalize_defaults(monkeypatch):
+    """_normalize_state should start from normalize_kwargs then apply sweep-time overrides."""
+    opt = object.__new__(SweepOptimizer)
+    opt.normalize_kwargs = {
+        "contraction_opt": "auto-dummy",
+        "n_iter": 99,
+        "direction": "x",
+        "max_separation": 3,
+        "progress": True,
+        "track_boundary_fidelity": True,
+    }
+    captured = {}
+
+    def _fake_normalize(self, **kwargs):  # pylint: disable=unused-argument
+        captured.update(kwargs)
+        return 1.25
+
+    monkeypatch.setattr(SweepOptimizer, "normalize", _fake_normalize)
+
+    out = SweepOptimizer._normalize_state(opt, env_n_iter=7)
+
+    assert out == 1.25
+    assert captured["contraction_opt"] == "auto-dummy"
+    assert captured["direction"] == "x"
+    assert captured["max_separation"] == 3
+    assert captured["n_iter"] == 7
+    assert captured["progress"] is False
+    assert captured["track_boundary_fidelity"] is False
+
+
 def test_constructor_accepts_state_target_names():
     """Constructor should accept state/target names."""
     peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=11, dtype="complex128")
@@ -944,18 +978,34 @@ def test_constructor_accepts_state_target_names():
         peps,
         peps_target,
         chi=8,
-        opt="auto-hq",
+        contraction_opt="auto-hq",
         renormalize_state=False,
     )
     assert opt.state is peps
     assert opt.state_target is peps_target
 
 
+def test_constructor_rejects_common_internal_indices():
+    """Constructor should warn+raise when state/target share inner bond labels."""
+    peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=19, dtype="complex128")
+    peps_target = peps.copy()
+
+    with pytest.warns(UserWarning, match="common internal indices"):
+        with pytest.raises(ValueError, match="common internal indices"):
+            SweepOptimizer(
+                peps,
+                peps_target,
+                chi=8,
+                contraction_opt="auto-hq",
+                renormalize_state=False,
+            )
+
+
 def test_metrics_api():
     """metrics() should expose global fidelity and loss."""
     peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=13, dtype="complex128")
     peps_target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=14, dtype="complex128")
-    opt = SweepOptimizer(peps, peps_target, chi=8, opt="auto-hq", renormalize_state=False)
+    opt = SweepOptimizer(peps, peps_target, chi=8, contraction_opt="auto-hq", renormalize_state=False)
     fidelity, loss = opt.metrics()
     assert fidelity >= 0.0
     assert loss >= 0.0
@@ -967,7 +1017,7 @@ def test_metrics_uses_tn_fidelity_with_optimizer(monkeypatch):
     opt = object.__new__(SweepOptimizer)
     opt.state = object()
     opt.state_target = object()
-    opt.opt = "auto-hq"
+    opt.contraction_opt = "auto-hq"
 
     captured = {}
 
@@ -1007,15 +1057,15 @@ def test_constructor_renormalize_uses_requested_options(monkeypatch):
         n_iter=7,
         direction="x",
         max_separation=2,
-        pbar=True,
-        boundary_fidel=False,
+        progress=True,
+        track_boundary_fidelity=False,
         renormalize_state=True,
     )
     assert called["n_iter"] == 7
     assert called["direction"] == "x"
     assert called["max_separation"] == 2
-    assert called["pbar"] is True
-    assert called["boundary_fidel"] is False
+    assert called["progress"] is True
+    assert called["track_boundary_fidelity"] is False
 
 
 def test_constructor_renormalize_kwargs_mapping_style(monkeypatch):
@@ -1039,13 +1089,13 @@ def test_constructor_renormalize_kwargs_mapping_style(monkeypatch):
             "n_iter": 9,
             "direction": "x",
             "max_separation": 1,
-            "pbar": True,
-            "boundary_fidel": False,
+            "progress": True,
+            "track_boundary_fidelity": False,
         },
     )
 
     assert called["n_iter"] == 9
     assert called["direction"] == "x"
     assert called["max_separation"] == 1
-    assert called["pbar"] is True
-    assert called["boundary_fidel"] is False
+    assert called["progress"] is True
+    assert called["track_boundary_fidelity"] is False

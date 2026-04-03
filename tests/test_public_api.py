@@ -15,8 +15,8 @@ def test_core_symbols_exported():
     assert "BdyMPS" in pepsy.__all__
     assert "CompBdy" in pepsy.__all__
     assert "BoundaryContractResult" in pepsy.__all__
-    assert "ContractBoundary" in pepsy.__all__
-    assert "prepare_boundary_inputs" in pepsy.__all__
+    assert "contract_boundary" in pepsy.__all__
+    assert "build_bra_ket" in pepsy.__all__
     assert "normalize" in pepsy.__all__
     assert "infidelity" in pepsy.__all__
     assert "norm_peps" not in pepsy.__all__
@@ -82,7 +82,8 @@ def test_core_symbols_exported():
 
 def test_lazy_exports_resolve():
     """Selected lazy exports should resolve to callables/modules."""
-    assert callable(pepsy.ContractBoundary)
+    assert callable(pepsy.contract_boundary)
+    assert callable(pepsy.build_bra_ket)
     assert callable(pepsy.normalize)
     assert callable(pepsy.infidelity)
     with pytest.raises(AttributeError):

@@ -25,10 +25,10 @@ if TYPE_CHECKING:
     )
     from .boundary_metrics import (
         BoundaryContractResult,
-        ContractBoundary,
+        contract_boundary,
+        build_bra_ket,
         infidelity,
         normalize,
-        prepare_boundary_inputs,
     )
     from .boundary_states import BdyMPS, make_numpy_array_caster
     from .boundary_sweeps import CompBdy
@@ -89,8 +89,8 @@ if TYPE_CHECKING:
         ham_tn,
     )
     from .optimize_global import GlobalOptimizer
-    from .optimize_sweep import SweepOptimizer, SweepResult
-    from .optimize_energy import EnergyOptimizer, EnergyResult
+    from .optimize_sweep import SweepOptimizer
+    from .optimize_energy import EnergyOptimizer
     from .optimize_mps import MpsOptimizer
 
 __all__ = [
@@ -98,8 +98,8 @@ __all__ = [
     "BdyMPS",
     "CompBdy",
     "BoundaryContractResult",
-    "ContractBoundary",
-    "prepare_boundary_inputs",
+    "contract_boundary",
+    "build_bra_ket",
     "normalize",
     "infidelity",
     "GlobalOptimizer",
@@ -114,9 +114,7 @@ __all__ = [
     "reg_complex_svd_jax",
     "reset_default_backends",
     "SweepOptimizer",
-    "SweepResult",
     "EnergyOptimizer",
-    "EnergyResult",
     "tns_align",
     "gen_long_range_swap_path",
     "apply_2dtn_",
@@ -193,25 +191,25 @@ def __getattr__(name):
         return import_module(f".{name}", __name__)
 
     if name in (
-        "ContractBoundary",
-        "prepare_boundary_inputs",
+        "contract_boundary",
+        "build_bra_ket",
         "BoundaryContractResult",
         "normalize",
         "infidelity",
     ):
         from .boundary_metrics import (  # pylint: disable=import-outside-toplevel
             BoundaryContractResult,
-            ContractBoundary,
+            contract_boundary,
+            build_bra_ket,
             infidelity,
             normalize,
-            prepare_boundary_inputs,
         )
 
         return {
             "BoundaryContractResult": BoundaryContractResult,
-            "ContractBoundary": ContractBoundary,
+            "contract_boundary": contract_boundary,
+            "build_bra_ket": build_bra_ket,
             "infidelity": infidelity,
-            "prepare_boundary_inputs": prepare_boundary_inputs,
             "normalize": normalize,
         }[name]
 
@@ -419,27 +417,15 @@ def __getattr__(name):
 
         return CompBdy
 
-    if name in ("SweepOptimizer", "SweepResult"):
-        from .optimize_sweep import (  # pylint: disable=import-outside-toplevel
-            SweepOptimizer,
-            SweepResult,
-        )
+    if name == "SweepOptimizer":
+        from .optimize_sweep import SweepOptimizer  # pylint: disable=import-outside-toplevel
 
-        return {
-            "SweepOptimizer": SweepOptimizer,
-            "SweepResult": SweepResult,
-        }[name]
+        return SweepOptimizer
 
-    if name in ("EnergyOptimizer", "EnergyResult"):
-        from .optimize_energy import (  # pylint: disable=import-outside-toplevel
-            EnergyOptimizer,
-            EnergyResult,
-        )
+    if name == "EnergyOptimizer":
+        from .optimize_energy import EnergyOptimizer  # pylint: disable=import-outside-toplevel
 
-        return {
-            "EnergyOptimizer": EnergyOptimizer,
-            "EnergyResult": EnergyResult,
-        }[name]
+        return EnergyOptimizer
 
     if name == "MpsOptimizer":
         from .optimize_mps import MpsOptimizer  # pylint: disable=import-outside-toplevel

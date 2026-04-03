@@ -1,4 +1,4 @@
-"""Boundary-based tensor-network norm evaluation."""
+"""Boundary-contraction helpers for norms, overlaps, and infidelity."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
 
 __all__ = [
-    "prepare_boundary_inputs",
+    "build_bra_ket",
     "BoundaryContractResult",
-    "ContractBoundary",
+    "contract_boundary",
     "normalize",
     "infidelity",
 ]
@@ -20,7 +20,21 @@ __all__ = [
 
 @dataclass(frozen=True)
 class BoundaryContractResult:
-    """Structured output for :func:`ContractBoundary`."""
+    """Structured result from :func:`contract_boundary`.
+
+    Attributes
+    ----------
+    cost : complex | float
+        Final scalar returned by the boundary contraction.
+    fidel : list[float]
+        Optional per-step fidelity values collected during the sweep.
+    direction : str
+        Direction selector used for the contraction call.
+    n_iter : int
+        Local fit iterations used per boundary update.
+    max_separation : int
+        Separation mode used during the sweep.
+    """
 
     cost: complex | float
     fidel: list[float]
@@ -61,12 +75,12 @@ def _to_python_scalar(value):
 
 
 
-def prepare_boundary_inputs(
+def build_bra_ket(
     ket=None,
     *,
     bra=None,
 ):
-    """Prepare tagged ``ket``/``bra`` networks and build ``norm``.
+    """Prepare tagged ``ket``/``bra`` networks and build a double-layer TN.
 
     Parameters
     ----------
@@ -78,12 +92,15 @@ def prepare_boundary_inputs(
     Returns
     -------
     tuple[qtn.TensorNetwork, qtn.TensorNetwork]
-        ``(ket_tagged, norm_tagged)``
+        ``(ket_tagged, norm_tagged)`` where:
+
+        - ``ket_tagged`` is ``ket`` with tag ``"KET"``
+        - ``norm_tagged`` is ``bra_tagged | ket_tagged``
 
     Notes
     -----
-    ``ket`` is tagged in-place (no copy). The returned ``ket_tagged`` is the same
-    object as ``ket``.
+    ``ket`` is tagged in-place (no copy). The returned ``ket_tagged`` is
+    the same object as ``ket``.
 
     In both cases (auto-generated or provided ``bra``), any shared internal
     indices between ket and bra are automatically renamed on the bra side as
@@ -123,61 +140,61 @@ def prepare_boundary_inputs(
     return ket_tagged, norm_tagged
 
 
-def ContractBoundary(
+def contract_boundary(
     *,
     norm,
     mps_boundaries,
-    opt="auto-hq",
+    contraction_opt="auto-hq",
     flat=False,
-    dmrg_run="eff",
-    n_iter=2,
-    re_tag=True,
-    pbar=True,
-    boundary_fidel=False,
-    visual_=False,
-    re_update=True,
-    max_separation=0,
+    fit_mode="eff",
+    n_iter=10,
+    retag=True,
+    progress=True,
+    track_boundary_fidelity=False,
+    visualize=False,
+    write_back=True,
+    max_separation=1,
     direction="y",
-    eq_norms=False,
-):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals,invalid-name
-    """Compute tensor-network norm via boundary sweeps.
+    equalize_norms=False,
+):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+    """Approximate a scalar contraction using boundary-MPS sweeps.
 
     Parameters
     ----------
     norm : qtn.TensorNetwork
         Prebuilt double-layer network, usually from
-        :func:`prepare_boundary_inputs`.
+        :func:`build_bra_ket`.
     mps_boundaries : dict[str, qtn.MatrixProductState]
         Boundary dictionary, usually from :class:`pepsy.boundary_states.BdyMPS`.
-    opt : str | object, default="auto-hq"
+    contraction_opt : str | object, default="auto-hq"
         Contraction optimizer passed through to :class:`pepsy.boundary_sweeps.CompBdy`.
     flat : bool, default=False
         Forwarded to sweep backend.
-    dmrg_run : {"eff", "global"}, default="eff"
+    fit_mode : {"eff", "global"}, default="eff"
         Fit backend mode.
-    n_iter : int, default=2
+    n_iter : int, default=10
         Number of local fit iterations per step.
-    re_tag : bool, default=True
+    retag : bool, default=True
         Forwarded to fitting backend.
-    pbar : bool, default=True
+    progress : bool, default=True
         Show progress bars.
-    boundary_fidel : bool, default=False
+    track_boundary_fidelity : bool, default=False
         If ``True``, collect per-step fidelity values in ``result.fidel``.
-    visual_ : bool, default=False
+    visualize : bool, default=False
         Enable intermediate visualization in fitting backend.
-    re_update : bool, default=True
+    write_back : bool, default=True
         Whether to write fitted boundaries back into ``mps_boundaries``.
-    max_separation : int, default=0
+    max_separation : int, default=1
         Sweep separation mode.
     direction : str, default="y"
         Sweep selector.
-    eq_norms : bool, default=False
+    equalize_norms : bool, default=False
         Forwarded normalization option for local fit outputs.
 
     Returns
     -------
     BoundaryContractResult
-        Structured boundary contraction result including ``cost`` and
+        Structured contraction result with scalar ``cost`` and optional
         fidelity history ``fidel``.
     """
     if norm is None:
@@ -185,27 +202,27 @@ def ContractBoundary(
     if not isinstance(mps_boundaries, dict):
         raise TypeError("mps_boundaries must be a dictionary of boundary states.")
 
-    re_tag = bool(re_tag)
+    retag = bool(retag)
     norm_tagged = norm.copy()
 
     comp_bdy = CompBdy(
         norm_tagged,
         mps_boundaries,
-        opt=opt,
-        dmrg_run=dmrg_run,
+        contraction_opt=contraction_opt,
+        fit_mode=fit_mode,
     )
 
     cost = comp_bdy.run(
         n_iter=n_iter,
-        re_tag=re_tag,
-        pbar=pbar,
-        boundary_fidel=boundary_fidel,
-        visual_=visual_,
+        retag=retag,
+        progress=progress,
+        track_boundary_fidelity=track_boundary_fidelity,
+        visualize=visualize,
         flat=flat,
-        re_update=re_update,
+        write_back=write_back,
         max_separation=max_separation,
         direction=direction,
-        eq_norms=eq_norms,
+        equalize_norms=equalize_norms,
     )
 
     return BoundaryContractResult(
@@ -222,19 +239,19 @@ def normalize(
     *,
     chi=None,
     bdy=None,
-    opt="auto-hq",
-    n_iter=5,
+    contraction_opt="auto-hq",
+    n_iter=10,
     direction="y",
-    max_separation=0,
-    pbar=False,
-    boundary_fidel=False,
-    dmrg_run="eff",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
     single_layer=False,
 ):
-    """Normalize a PEPS state with boundary contraction.
+    """Normalize a PEPS state in place using boundary contraction.
 
     This performs:
-    ``prepare_boundary_inputs -> BdyMPS -> ContractBoundary`` and normalizes
+    ``build_bra_ket -> BdyMPS -> contract_boundary`` and normalizes
     ``p`` in place.
 
     Parameters
@@ -246,19 +263,19 @@ def normalize(
     bdy : pepsy.boundary_states.BdyMPS | None, default=None
         Pre-built boundary object. If provided, ``normalize`` reuses it and
         skips creating a new :class:`pepsy.boundary_states.BdyMPS`.
-    opt : str | object, default="auto-hq"
+    contraction_opt : str | object, default="auto-hq"
         Contraction optimizer.
-    n_iter : int, default=5
+    n_iter : int, default=10
         Number of local fit iterations per boundary step.
     direction : str, default="y"
-        Sweep direction passed to :func:`ContractBoundary`.
-    max_separation : int, default=0
+        Sweep direction passed to :func:`contract_boundary`.
+    max_separation : int, default=1
         Sweep separation mode.
-    pbar : bool, default=False
+    progress : bool, default=False
         Show progress bar.
-    boundary_fidel : bool, default=False
+    track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    dmrg_run : {"eff", "global"}, default="eff"
+    fit_mode : {"eff", "global"}, default="eff"
         Boundary fitting backend mode.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary_states.BdyMPS`.
@@ -266,13 +283,13 @@ def normalize(
     Returns
     -------
     complex | float
-        The old norm estimate (boundary contraction cost) before
-        normalization.
+        Old norm estimate returned by the boundary contraction
+        before rescaling.
     """
     if p is None:
         raise ValueError("p must not be None.")
 
-    ket_tagged, norm_tagged = prepare_boundary_inputs(ket=p, bra=None)
+    ket_tagged, norm_tagged = build_bra_ket(ket=p, bra=None)
 
     if bdy is None:
         if chi is None:
@@ -286,16 +303,16 @@ def normalize(
     elif not hasattr(bdy, "mps_b"):
         raise TypeError("bdy must expose attribute 'mps_b'.")
 
-    result = ContractBoundary(
+    result = contract_boundary(
         norm=norm_tagged,
         mps_boundaries=bdy.mps_b,
-        opt=opt,
-        dmrg_run=dmrg_run,
+        contraction_opt=contraction_opt,
+        fit_mode=fit_mode,
         n_iter=n_iter,
-        pbar=pbar,
+        progress=progress,
         direction=direction,
         max_separation=max_separation,
-        boundary_fidel=boundary_fidel,
+        track_boundary_fidelity=track_boundary_fidelity,
     )
     cost = result.cost
     old_norm = _to_python_scalar(cost)
@@ -317,13 +334,13 @@ def infidelity(
     bdy=None,
     bdy_target=None,
     bdy_overlap=None,
-    opt="auto-hq",
-    n_iter=5,
+    contraction_opt="auto-hq",
+    n_iter=10,
     direction="y",
-    max_separation=0,
-    pbar=False,
-    boundary_fidel=False,
-    dmrg_run="eff",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
     single_layer=False,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     r"""Compute the infidelity between two PEPS states via boundary contraction.
@@ -371,19 +388,19 @@ def infidelity(
     bdy_overlap : pepsy.boundary_states.BdyMPS | None, default=None
         Pre-built boundary for the
         :math:`\langle p_{\mathrm{target}} | p \rangle` overlap network.
-    opt : str | object, default="auto-hq"
-        Contraction optimizer passed to :func:`ContractBoundary`.
-    n_iter : int, default=5
+    contraction_opt : str | object, default="auto-hq"
+        Contraction optimizer passed to :func:`contract_boundary`.
+    n_iter : int, default=10
         Number of local fit iterations per boundary step.
     direction : str, default="y"
-        Sweep direction passed to :func:`ContractBoundary`.
-    max_separation : int, default=0
+        Sweep direction passed to :func:`contract_boundary`.
+    max_separation : int, default=1
         Sweep separation mode.
-    pbar : bool, default=False
+    progress : bool, default=False
         Show progress bar.
-    boundary_fidel : bool, default=False
+    track_boundary_fidelity : bool, default=False
         Track per-step fidelity during boundary contraction.
-    dmrg_run : {"eff", "global"}, default="eff"
+    fit_mode : {"eff", "global"}, default="eff"
         Boundary fitting backend mode.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary_states.BdyMPS`.
@@ -409,18 +426,18 @@ def infidelity(
 
     # Shared contraction kwargs
     _kw = dict(
-        opt=opt,
-        dmrg_run=dmrg_run,
+        contraction_opt=contraction_opt,
+        fit_mode=fit_mode,
         n_iter=n_iter,
-        pbar=pbar,
+        progress=progress,
         direction=direction,
         max_separation=max_separation,
-        boundary_fidel=boundary_fidel,
+        track_boundary_fidelity=track_boundary_fidelity,
     )
 
     # -- <p|p> --
     if norm is None:
-        _, norm_tn = prepare_boundary_inputs(ket=p, bra=None)
+        _, norm_tn = build_bra_ket(ket=p, bra=None)
 
         if bdy is None:
             if chi is None:
@@ -430,14 +447,14 @@ def infidelity(
             raise TypeError("bdy must expose attribute 'mps_b'.")
 
         norm = complex(_to_python_scalar(
-            ContractBoundary(norm=norm_tn, mps_boundaries=bdy.mps_b, **_kw).cost
+            contract_boundary(norm=norm_tn, mps_boundaries=bdy.mps_b, **_kw).cost
         ))
     else:
         norm = complex(norm)
 
     # -- <p_target|p_target> --
     if norm_target is None:
-        _, norm_target_tn = prepare_boundary_inputs(ket=p_target, bra=None)
+        _, norm_target_tn = build_bra_ket(ket=p_target, bra=None)
 
         if bdy_target is None:
             if chi is None:
@@ -449,7 +466,7 @@ def infidelity(
             raise TypeError("bdy_target must expose attribute 'mps_b'.")
 
         norm_target = complex(_to_python_scalar(
-            ContractBoundary(
+            contract_boundary(
                 norm=norm_target_tn, mps_boundaries=bdy_target.mps_b, **_kw,
             ).cost
         ))
@@ -457,7 +474,7 @@ def infidelity(
         norm_target = complex(norm_target)
 
     # -- <p_target|p> (overlap) --
-    _, overlap_tn = prepare_boundary_inputs(ket=p, bra=p_target)
+    _, overlap_tn = build_bra_ket(ket=p, bra=p_target)
 
     if bdy_overlap is None:
         if chi is None:
@@ -469,7 +486,7 @@ def infidelity(
         raise TypeError("bdy_overlap must expose attribute 'mps_b'.")
 
     overlap = complex(_to_python_scalar(
-        ContractBoundary(
+        contract_boundary(
             norm=overlap_tn, mps_boundaries=bdy_overlap.mps_b, **_kw,
         ).cost
     ))

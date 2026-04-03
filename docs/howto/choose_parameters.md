@@ -5,13 +5,13 @@ This page gives pragmatic defaults for stable runs.
 ## Good starting point
 
 ```python
-res = pepsy.ContractBoundary(
+res = pepsy.contract_boundary(
     norm=norm,
     mps_boundaries=bdy.mps_b,
     direction="y",
     n_iter=2,
     max_separation=0,
-    fidel_=True,
+    track_boundary_fidelity=True,
 )
 ```
 

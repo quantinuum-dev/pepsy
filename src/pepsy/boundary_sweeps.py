@@ -1,4 +1,4 @@
-"""Boundary-MPS construction and fitting utilities for DMRG-like PEPS contractions."""
+"""Boundary-MPS sweep utilities for approximate 2D tensor-network contraction."""
 
 import re
 from dataclasses import dataclass
@@ -40,13 +40,35 @@ def max_tag_number(tags, tag_format):
 
 
 class CompBdy:  # pylint: disable=too-many-instance-attributes
-    """Boundary MPS fitting driver for x/y contraction sweeps.
+    """Approximate double-layer contraction via boundary-MPS sweeps.
+
+    The class fits boundary MPS tensors slice-by-slice on a tagged 2D
+    double-layer tensor network (``norm``), then contracts the resulting
+    boundary pair to a scalar. It also supports boundary-only updates
+    (full side or single-step) without final contraction.
+
+    Parameters
+    ----------
+    norm : qtn.TensorNetwork
+        Tagged double-layer network. Must include ``X*`` and ``Y*`` tags so
+        lattice shape can be inferred.
+    mps_boundaries : dict[str, qtn.MatrixProductState]
+        Boundary dictionary, typically from ``BdyMPS(...).mps_b``.
+    contraction_opt : str | object, default="auto-hq"
+        Contraction optimizer used for final contraction and fidelity calls.
+    fit_mode : {"eff", "global"}, default="eff"
+        Local fit backend used by :class:`pepsy.fit.FIT`:
+        ``"eff"`` uses ``FIT.run_eff`` for multi-site boundaries;
+        ``"global"`` uses ``FIT.run``.
 
     Notes
     -----
-    - This class mutates ``self.mps_boundaries`` when ``re_update=True``.
-    - Per-step fidelity values are exposed via ``self.fidel`` and reset at
-      the start of each :meth:`run` call.
+    - ``run(...)`` performs a full two-sided sweep and returns a scalar.
+    - ``move_bdy(...)`` updates one side (or both sides) and returns nothing.
+    - ``move_step_bdy(...)`` updates exactly one boundary position.
+    - ``self.fidel`` is reset at the start of each public call and populated
+      only when ``track_boundary_fidelity=True``.
+    - ``self.mps_boundaries`` is updated in place when ``write_back=True``.
     """
 
     def __init__(
@@ -54,27 +76,27 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         norm,
         mps_boundaries,
         *,
-        opt="auto-hq",
-        dmrg_run="eff",
+        contraction_opt="auto-hq",
+        fit_mode="eff",
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
         if not isinstance(mps_boundaries, dict):
             raise TypeError("mps_boundaries must be a dictionary of boundary states.")
 
         self.norm = norm
         self.mps_boundaries = mps_boundaries
-        self.opt = opt
-        self.dmrg_run = dmrg_run
+        self.contraction_opt = contraction_opt
+        self.fit_mode = fit_mode
 
         # Runtime sweep options are configured per call in run/move methods.
-        self.eq_norms = False
-        self.n_iter = 4
+        self.equalize_norms = False
+        self.n_iter = 10
         self.flat = False
-        self.re_update = True
-        self.re_tag = False
-        self.visual_ = False
-        self.boundary_fidel = False
+        self.write_back = True
+        self.retag = True
+        self.visualize = False
+        self.track_boundary_fidelity = False
         self.fidel = []
-        self.pbar = False
+        self.progress = False
         self.max_separation = 0
         self.direction = "y"
 
@@ -90,8 +112,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             raise ValueError(
                 "norm must include X*/Y* tags so lattice shape can be inferred."
             )
-        self.Ly = 1 + max_y  # pylint: disable=invalid-name
-        self.Lx = 1 + max_x  # pylint: disable=invalid-name
+        self.Ly = 1 + max_y
+        self.Lx = 1 + max_x
         self._update_separation()
 
     def _reset_fidelity_history(self):
@@ -151,14 +173,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self,
         *,
         mps_boundaries=None,
-        re_tag=False,
-        visual_=False,
+        retag=True,
+        visualize=False,
         flat=False,
-        boundary_fidel=False,
-        pbar=False,
-        n_iter=4,
-        eq_norms=False,
-        re_update=True,
+        track_boundary_fidelity=False,
+        progress=False,
+        n_iter=10,
+        equalize_norms=False,
+        write_back=True,
     ):  # pylint: disable=too-many-arguments
         """Apply run-time options explicitly for a single public call."""
         if mps_boundaries is not None:
@@ -166,14 +188,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 raise TypeError("mps_boundaries must be a dictionary of boundary states.")
             self.mps_boundaries = mps_boundaries
 
-        self.re_tag = re_tag
-        self.visual_ = visual_
+        self.retag = retag
+        self.visualize = visualize
         self.flat = flat
-        self.boundary_fidel = boundary_fidel
-        self.pbar = pbar
+        self.track_boundary_fidelity = track_boundary_fidelity
+        self.progress = progress
         self.n_iter = n_iter
-        self.eq_norms = eq_norms
-        self.re_update = re_update
+        self.equalize_norms = equalize_norms
+        self.write_back = write_back
 
     def _update_separation(self):
         """Update left/right sweep extents from ``max_separation``."""
@@ -232,13 +254,13 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if boundary_mps.L == 1:
             fit.run(n_iter=self.n_iter, verbose=verbose)
             return
-        if self.dmrg_run == "eff":
+        if self.fit_mode == "eff":
             fit.run_eff(n_iter=self.n_iter, verbose=verbose)
             return
-        if self.dmrg_run == "global":
+        if self.fit_mode == "global":
             fit.run(n_iter=self.n_iter, verbose=verbose)
             return
-        raise ValueError(f"Unsupported dmrg_run mode: {self.dmrg_run}")
+        raise ValueError(f"Unsupported fit_mode mode: {self.fit_mode}")
 
     def _maybe_visualize_fit(
         self,
@@ -248,8 +270,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         site_tag_id,
         axis_len,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
-        """Draw intermediate networks when ``visual_`` is enabled."""
-        if not self.visual_:
+        """Draw intermediate networks when ``visualize`` is enabled."""
+        if not self.visualize:
             return
 
         draw_tags = [site_tag_id.format(i) for i in range(axis_len)]
@@ -309,21 +331,21 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 p=boundary_mps,
                 inplace=False,
                 site_tag_id=site_tag_id,
-                opt=self.opt,
-                re_tag=self.re_tag,
+                contraction_opt=self.contraction_opt,
+                retag=self.retag,
             )
             self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
             self._run_fit_solver(fit, boundary_mps)
 
-            if self.eq_norms:
-                fit.p.equalize_norms_(value=self.eq_norms)
-            if self.boundary_fidel:
-                fidelity = tn_fidelity(tn, fit.p)
+            if self.equalize_norms:
+                fit.p.equalize_norms_(value=self.equalize_norms)
+            if self.track_boundary_fidelity:
+                fidelity = tn_fidelity(tn, fit.p, opt=self.contraction_opt)
                 self.fidel.append(fidelity)
 
             if progress_bar is not None:
                 postfix = {"chi": int(fit.p.max_bond())}
-                if self.boundary_fidel:
+                if self.track_boundary_fidelity:
                     prod_fidelity = np.prod(self.fidel)
                     postfix["F"] = complex(prod_fidelity).real
                 progress_bar.set_postfix(postfix)
@@ -331,7 +353,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 progress_bar.update(1)
 
             previous = fit.p
-            if self.re_update:
+            if self.write_back:
                 self.mps_boundaries[boundary_key] = fit.p.copy()
 
         return previous
@@ -373,20 +395,20 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             p=boundary_mps,
             inplace=False,
             site_tag_id=site_tag_id,
-            opt=self.opt,
-            re_tag=self.re_tag,
+            contraction_opt=self.contraction_opt,
+            retag=self.retag,
         )
         self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
         self._run_fit_solver(fit, boundary_mps)
 
-        if self.eq_norms:
-            fit.p.equalize_norms_(value=self.eq_norms)
-        if self.boundary_fidel:
-            fidelity = tn_fidelity(tn, fit.p)
+        if self.equalize_norms:
+            fit.p.equalize_norms_(value=self.equalize_norms)
+        if self.track_boundary_fidelity:
+            fidelity = tn_fidelity(tn, fit.p, opt=self.contraction_opt)
             self.fidel.append(fidelity)
 
         previous = fit.p
-        if self.re_update:
+        if self.write_back:
             self.mps_boundaries[boundary_key] = fit.p.copy()
 
         return previous
@@ -412,42 +434,42 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     def run(
         self,
         *,
-        re_update=True,
+        write_back=True,
         max_separation=0,
         mps_boundaries=None,
-        re_tag=False,
-        visual_=False,
+        retag=True,
+        visualize=False,
         flat=False,
-        boundary_fidel=False,
-        pbar=False,
-        n_iter=4,
-        eq_norms=True,
+        track_boundary_fidelity=False,
+        progress=False,
+        n_iter=10,
+        equalize_norms=True,
         direction="y",
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Run two-sided boundary sweeps and contract the final network.
 
         Parameters
         ----------
-        re_update : bool, default=True
+        write_back : bool, default=True
             Write fitted boundary MPS values back to ``self.mps_boundaries``.
         max_separation : int, default=0
             Separation mode (currently ``0`` or ``1``).
         mps_boundaries : dict | None, default=None
             Optional replacement boundary dictionary for this call.
-        re_tag : bool, default=False
+        retag : bool, default=True
             Forwarded to fit backend.
-        visual_ : bool, default=False
+        visualize : bool, default=False
             Enable intermediate tensor-network drawings.
         flat : bool, default=False
             Skip first-step fitting and use raw slice directly.
-        boundary_fidel : bool, default=False
+        track_boundary_fidelity : bool, default=False
             If ``True``, compute and store per-step fidelity values in
             ``self.fidel``.
-        pbar : bool, default=False
+        progress : bool, default=False
             Show progress bar.
-        n_iter : int, default=4
+        n_iter : int, default=10
             Number of local fit iterations for each step.
-        eq_norms : bool, default=True
+        equalize_norms : bool, default=True
             Forwarded normalization option for fitted MPS tensors.
         direction : str, default="y"
             Sweep selector.
@@ -463,14 +485,14 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self._update_separation()
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
-            re_tag=re_tag,
-            visual_=visual_,
+            retag=retag,
+            visualize=visualize,
             flat=flat,
-            boundary_fidel=boundary_fidel,
-            pbar=pbar,
+            track_boundary_fidelity=track_boundary_fidelity,
+            progress=progress,
             n_iter=n_iter,
-            eq_norms=eq_norms,
-            re_update=re_update,
+            equalize_norms=equalize_norms,
+            write_back=write_back,
         )
 
         self.direction = direction
@@ -485,7 +507,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             leave=True,
             position=0,
             colour="CYAN",
-            disable=not self.pbar,
+            disable=not self.progress,
         ) as progress_bar:
             p_previous_l = self._fit_one_side(
                 "left",
@@ -503,34 +525,38 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             )
 
         tn_f = self._build_final_boundary_network(spec, p_previous_l, p_previous_r)
-        main, exp = tn_f.contract(all, optimize=self.opt, strip_exponent=True)
+        main, exp = tn_f.contract(all, optimize=self.contraction_opt, strip_exponent=True)
         return main * 10**exp
 
     def move_bdy(
         self,
         *,
         mps_boundaries=None,
-        re_tag=False,
-        visual_=False,
+        retag=True,
+        visualize=False,
         flat=False,
-        boundary_fidel=False,
-        pbar=False,
-        n_iter=4,
-        eq_norms=False,
+        track_boundary_fidelity=False,
+        progress=False,
+        n_iter=10,
+        equalize_norms=False,
         direction="y_left",
     ):  # pylint: disable=too-many-arguments,too-many-locals
-        """Sweep and update stored boundary MPSs for a selected side/direction."""
+        """Sweep one or both sides and write updated boundary MPS tensors.
+
+        Parameters mirror :meth:`run`, except no final scalar contraction is
+        performed. This method is useful for environment preconditioning.
+        """
         self._reset_fidelity_history()
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
-            re_tag=re_tag,
-            visual_=visual_,
+            retag=retag,
+            visualize=visualize,
             flat=flat,
-            boundary_fidel=boundary_fidel,
-            pbar=pbar,
+            track_boundary_fidelity=track_boundary_fidelity,
+            progress=progress,
             n_iter=n_iter,
-            eq_norms=eq_norms,
-            re_update=True,
+            equalize_norms=equalize_norms,
+            write_back=True,
         )
 
         self.direction = direction
@@ -549,7 +575,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             leave=True,
             position=0,
             colour="CYAN",
-            disable=not self.pbar,
+            disable=not self.progress,
         ) as progress_bar:
             if move_left:
                 self._fit_one_side(
@@ -573,27 +599,31 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         *,
         pos=0,
         mps_boundaries=None,
-        re_tag=False,
-        visual_=False,
+        retag=True,
+        visualize=False,
         flat=False,
-        boundary_fidel=False,
-        pbar=False,
-        n_iter=4,
-        eq_norms=False,
+        track_boundary_fidelity=False,
+        progress=False,
+        n_iter=10,
+        equalize_norms=False,
         direction="y_left",
     ):  # pylint: disable=too-many-arguments,too-many-locals
-        """Fit and update one boundary step at position ``pos``."""
+        """Fit and update a single boundary step at ``pos``.
+
+        The update is applied to the side(s) encoded in ``direction``:
+        ``*_left``, ``*_right``, or both.
+        """
         self._reset_fidelity_history()
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
-            re_tag=re_tag,
-            visual_=visual_,
+            retag=retag,
+            visualize=visualize,
             flat=flat,
-            boundary_fidel=boundary_fidel,
-            pbar=pbar,
+            track_boundary_fidelity=track_boundary_fidelity,
+            progress=progress,
             n_iter=n_iter,
-            eq_norms=eq_norms,
-            re_update=True,
+            equalize_norms=equalize_norms,
+            write_back=True,
         )
 
         self.direction = direction
@@ -622,7 +652,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             leave=True,
             position=0,
             colour="CYAN",
-            disable=not self.pbar,
+            disable=not self.progress,
         ) as progress_bar:
             for side in sides:
                 updated = self._fit_one_step(
@@ -636,7 +666,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                     postfix = {"pos": int(pos)}
                     if hasattr(updated, "max_bond"):
                         postfix["chi"] = int(updated.max_bond())
-                    if self.boundary_fidel and self.fidel:
+                    if self.track_boundary_fidelity and self.fidel:
                         postfix["F"] = complex(self.fidel[-1]).real
                     if postfix:
                         progress_bar.set_postfix(postfix)

@@ -113,7 +113,7 @@ def test_bdymps_uses_default_array_backend_when_not_provided():
     try:
         core.set_default_array_backend(array_backend)
         ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=101, dtype="complex128")
-        _, norm = pepsy.prepare_boundary_inputs(ket=ket)
+        _, norm = pepsy.build_bra_ket(ket=ket)
         bdy = pepsy.BdyMPS(
             tn_double=norm,
             chi=4,

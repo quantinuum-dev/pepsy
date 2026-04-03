@@ -4,7 +4,7 @@
 
 Cause:
 
-- `prepare_boundary_inputs` expects lattice tags for shape inference.
+- `build_bra_ket` expects lattice tags for shape inference.
 
 Fix:
 
@@ -18,7 +18,7 @@ Cause:
 
 Fix:
 
-- Reindex bra internal indices before calling `prepare_boundary_inputs`.
+- Reindex bra internal indices before calling `build_bra_ket`.
 
 ## Slow runtime
 
@@ -31,15 +31,15 @@ Common causes:
 Practical actions:
 
 1. Reduce `chi` and `n_iter` first to baseline runtime.
-2. Use `fidel_=True` to see where quality drops.
+2. Use `track_boundary_fidelity=True` to see where quality drops.
 3. Increase only the parameter that improves that bottleneck.
 
 ## Fidelity list is empty
 
 Cause:
 
-- `fidel_=False` during `ContractBoundary` call.
+- `track_boundary_fidelity=False` during `contract_boundary` call.
 
 Fix:
 
-- Set `fidel_=True`.
+- Set `track_boundary_fidelity=True`.

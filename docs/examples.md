@@ -8,9 +8,9 @@ This is the recommended first notebook for interactive usage.
 
 It demonstrates:
 
-- preparing `ket` and `norm` with `prepare_boundary_inputs`
+- preparing `ket` and `norm` with `build_bra_ket`
 - initializing boundaries with `BdyMPS`
-- running `ContractBoundary(...)`
+- running `contract_boundary(...)`
 - inspecting `BoundaryContractResult.cost` and `.fidel`
 
 ## Additional notebooks

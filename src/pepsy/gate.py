@@ -907,7 +907,7 @@ def gate_1d(
     return tn
 
 
-def energy_global(MPO_origin, mps_a, opt="auto-hq"):  # pylint: disable=invalid-name
+def energy_global(MPO_origin, mps_a, opt="auto-hq"):
     """Compute global energy ``<mps_a|MPO_origin|mps_a>`` with normalization."""
 
     mps_a_ = mps_a.copy()

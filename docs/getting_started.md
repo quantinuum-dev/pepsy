@@ -25,7 +25,7 @@ import quimb.tensor as qtn
 import pepsy
 
 ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=1, dtype="complex128")
-ket_tagged, norm = pepsy.prepare_boundary_inputs(ket=ket)
+ket_tagged, norm = pepsy.build_bra_ket(ket=ket)
 ```
 
 ## 3. Initialize boundary states
@@ -42,12 +42,12 @@ bdy = pepsy.BdyMPS(
 ## 4. Contract and inspect diagnostics
 
 ```python
-res = pepsy.ContractBoundary(
+res = pepsy.contract_boundary(
     norm=norm,
     mps_boundaries=bdy.mps_b,
     direction="y",
     n_iter=2,
-    fidel_=True,
+    track_boundary_fidelity=True,
 )
 
 print(res.cost)
@@ -55,7 +55,7 @@ print(res.fidel)
 ```
 
 ```{note}
-`ContractBoundary` always returns a `BoundaryContractResult` object.
+`contract_boundary` always returns a `BoundaryContractResult` object.
 Use `res.cost` and `res.fidel` directly.
 ```
 

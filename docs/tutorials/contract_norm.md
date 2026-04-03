@@ -6,11 +6,11 @@ This tutorial covers a full `prepare -> boundary init -> sweep contract` pipelin
 
 ```text
 PEPS ket
-  -> prepare_boundary_inputs(ket, bra?)
+  -> build_bra_ket(ket, bra?)
       -> tagged ket + double-layer norm TN
   -> BdyMPS(...)
       -> boundary dictionary mps_b
-  -> ContractBoundary(norm, mps_b, ...)
+  -> contract_boundary(norm, mps_b, ...)
       -> BoundaryContractResult(cost, fidel, ...)
 ```
 
@@ -21,7 +21,7 @@ import pepsy
 import quimb.tensor as qtn
 
 ket = qtn.PEPS.rand(Lx=4, Ly=4, bond_dim=2, seed=7, dtype="complex128")
-ket_tagged, norm = pepsy.prepare_boundary_inputs(ket=ket)
+ket_tagged, norm = pepsy.build_bra_ket(ket=ket)
 ```
 
 ## Step 2: initialize boundaries
@@ -38,13 +38,13 @@ bdy = pepsy.BdyMPS(
 ## Step 3: contract
 
 ```python
-res = pepsy.ContractBoundary(
+res = pepsy.contract_boundary(
     norm=norm,
     mps_boundaries=bdy.mps_b,
     direction="y",
     n_iter=2,
     max_separation=0,
-    fidel_=True,
+    track_boundary_fidelity=True,
 )
 
 print("cost:", res.cost)

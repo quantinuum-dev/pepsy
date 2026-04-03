@@ -20,7 +20,7 @@ def make_numpy_array_caster(dtype=np.float64):
 
 
 class BdyMPS:
-    """Build and store boundary MPS environments for PEPS contractions.
+    """Build and store boundary MPS environments for PEPS-like contractions.
 
     The class precomputes left/right boundaries for both sweep axes:
 

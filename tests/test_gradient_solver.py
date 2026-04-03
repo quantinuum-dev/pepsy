@@ -199,11 +199,10 @@ def test_returns_best_params_not_last_for_non_monotonic_trajectory():
     assert returned_loss <= history[-1]
 
 
-def test_resolve_user_solver_maps_lbfgs_to_scipy_with_warning():
-    """Sweep-level 'lbfgs' shorthand should route to scipy-lbfgs."""
-    with pytest.warns(UserWarning, match="defaults to SciPy"):
-        solver = SweepOptimizer._resolve_user_solver("lbfgs")  # pylint: disable=protected-access
-    assert solver == "scipy-lbfgs"
+def test_resolve_user_solver_accepts_canonical_lbfgs():
+    """Canonical 'lbfgs' should remain torch LBFGS without remapping."""
+    solver = SweepOptimizer._resolve_user_solver("lbfgs")  # pylint: disable=protected-access
+    assert solver == "lbfgs"
 
 
 def test_resolve_user_solver_warns_for_nlopt():
@@ -211,6 +210,13 @@ def test_resolve_user_solver_warns_for_nlopt():
     with pytest.warns(UserWarning, match="uses NLopt"):
         solver = SweepOptimizer._resolve_user_solver("nlopt-lbfgs")  # pylint: disable=protected-access
     assert solver == "nlopt-lbfgs"
+
+
+@pytest.mark.parametrize("alias_name", ("scipy", "nlopt", "scipy_lbfgs", "nlopt_lbfgs"))
+def test_resolve_user_solver_rejects_alias_names(alias_name):
+    """Short alias names should fail with a canonical-name hint."""
+    with pytest.raises(ValueError, match="Unsupported solver alias"):
+        SweepOptimizer._resolve_user_solver(alias_name)  # pylint: disable=protected-access
 
 
 def test_scipy_lbfgs_solver_reduces_quadratic_if_available():
@@ -229,20 +235,16 @@ def test_scipy_lbfgs_solver_reduces_quadratic_if_available():
     assert abs(float(params_opt["x"].detach().item())) < 1e-6
 
 
-def test_scipy_short_alias_solver_reduces_quadratic_if_available():
-    """Short solver alias 'scipy' should map to scipy-lbfgs."""
-    pytest.importorskip("scipy")
+def test_gradient_solver_rejects_short_solver_aliases():
+    """gradient_solver should require canonical solver names."""
     params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="scipy",
-        n_steps=30,
-        log_every=10,
-    )
-    assert history
-    assert history[-1] < history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 1e-6
+    with pytest.raises(ValueError, match="Unsupported solver alias"):
+        optimize_packed_params(
+            params_init,
+            _loss_quadratic,
+            solver="scipy",
+            n_steps=4,
+        )
 
 
 def test_scipy_lbfgs_handles_complex128_if_available():

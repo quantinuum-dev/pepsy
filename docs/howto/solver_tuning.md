@@ -1,33 +1,32 @@
 # How-To: Tune Sweep Solvers
 
-Use `PEPSSweepOptimizer.optimize_axis(...)` or `optimize_global(...)` with `solver` and `solver_options`.
+Use `SweepOptimizer.optimize_axis(...)` or `optimize_global(...)` with `solver` and `solver_options`.
 
 ## Quick comparison
 
 - `solver="adam"`: best default for noisy or sensitive objectives.
-- `solver="lbfgs"`: defaults to SciPy `L-BFGS-B` in sweep APIs.
-- `solver="torch-lbfgs"`: torch-native quasi-Newton, often faster near convergence.
+- `solver="lbfgs"`: torch-native quasi-Newton, often faster near convergence.
 - `solver="scipy-lbfgs"`: robust CPU `L-BFGS-B`, supports bounds.
 - `solver="nlopt-lbfgs"`: flexible stopping controls and algorithm variants.
 
-## Recipe: Torch LBFGS
+## Recipe: LBFGS (Torch)
 
 ```python
 result = sweeper.optimize_global(
     axes=("y", "x"),
     n_cycles=1,
     n_round_trips=1,
-    solver="torch-lbfgs",
+    solver="lbfgs",
     solver_options={
+        "algorithm": "LBFGS",
+        "n_steps": 60,
         "max_iter": 1,      # one inner LBFGS step per outer sweep step
         "history_size": 20,
         "line_search_fn": "strong_wolfe",
+        "lr": 1.0,
     },
-    lr=1.0,
-    n_steps=60,
-    log_every=20,
     env_n_iter=4,
-    pbar=True,
+    progress=True,
 )
 ```
 
@@ -46,13 +45,12 @@ result = sweeper.optimize_global(
     solver="scipy-lbfgs",
     solver_options={
         "method": "L-BFGS-B",
+        "n_steps": 80,
         "maxiter": 80,
         "ftol": 1e-12,
     },
-    n_steps=80,
-    log_every=20,
     env_n_iter=4,
-    pbar=True,
+    progress=True,
 )
 ```
 
@@ -71,14 +69,13 @@ result = sweeper.optimize_global(
     solver="nlopt-lbfgs",
     solver_options={
         "algorithm": "LD_LBFGS",
+        "n_steps": 100,
         "maxeval": 100,
         "ftol_rel": 1e-10,
         "xtol_rel": 1e-10,
     },
-    n_steps=100,
-    log_every=20,
     env_n_iter=4,
-    pbar=True,
+    progress=True,
 )
 ```
 

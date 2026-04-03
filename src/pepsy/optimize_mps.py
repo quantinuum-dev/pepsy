@@ -26,7 +26,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Optimization backend.
     opt : object | None, optional
         Contraction path optimizer passed to local DMRG fitting. If ``None``,
-        defaults to ``"auto-hq"`` and emits a warning.
+        defaults to ``"auto-hq"``.
     """
 
     _ALLOWED_MODES = frozenset({"dmrg", "svd", "exact"})
@@ -160,9 +160,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Parameters
         ----------
         n_iter : int, default=6
-            Inner iterations for DMRG local fits.
+            Inner iterations for DMRG local fits. Ignored by ``svd``/``exact``.
         progbar : bool, default=False
-            Accepted for API compatibility.
+            Show per-mode progress bars.
         cutoff : float, default=1e-12
             Truncation cutoff used in gate application and local fitting.
         mode : {"dmrg", "svd", "exact"} | None, default=None
@@ -307,8 +307,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         p_g,
                         p=p,
                         cutoffs=cutoff,
-                        opt=self.opt,
-                        re_tag=False,
+                        contraction_opt=self.opt,
+                        retag=False,
                         range_int=[xmin, xmax],
                     )
                     fit.run_gate(n_iter=n_iter, verbose=False)
@@ -333,8 +333,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         p_g,
                         p=p,
                         cutoffs=cutoff,
-                        opt=self.opt,
-                        re_tag=False,
+                        contraction_opt=self.opt,
+                        retag=False,
                         range_int=[xmin, xmax],
                     )
                     fit.run_gate(n_iter=n_iter, verbose=False)
