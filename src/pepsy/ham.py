@@ -103,8 +103,8 @@ class ham_tn:
         plot_geometry=False,
         plot_kwargs=None,
         return_plot=False,
-        return_edges=False,
-        return_builder=False,
+        return_edges=True,
+        return_builder=True,
     ):
         """Construct a builder and ITF Hamiltonian in one call.
 
@@ -121,13 +121,16 @@ class ham_tn:
         max_bond, cutoff, data_type, build_snake_maps
             Used to construct the internal builder instance.
         return_builder : bool, default=False
-            If True, append the constructed builder to the return tuple.
+            Deprecated compatibility argument. Output is always a dict and
+            always includes the constructed builder.
 
         Returns
         -------
-        tuple
-            Same as :meth:`build_itf`, optionally with the builder appended when
-            ``return_builder=True``.
+        dict
+            Dictionary with named outputs and mappings:
+            ``mpo``, ``pepo``, optional ``edges``/``ax``, optional
+            ``edges_1d`` (when ``edges`` available), ``builder``,
+            ``one_d_to_two_d``, and ``two_d_to_one_d``.
         """
         builder = cls(
             L_x=L_x,
@@ -152,9 +155,32 @@ class ham_tn:
             return_plot=return_plot,
             return_edges=return_edges,
         )
-        if return_builder:
-            return (*out, builder)
-        return out
+        _ = return_builder  # accepted for backward compatibility
+        payload = {
+            "mpo": out[0],
+            "pepo": out[1],
+            "edges": None,
+            "edges_1d": None,
+            "ax": None,
+            "builder": builder,
+            "one_d_to_two_d": dict(builder.map),
+            "two_d_to_one_d": dict(builder.map_inv),
+        }
+        if return_edges and return_plot:
+            payload["edges"] = out[2]
+            payload["ax"] = out[3]
+        elif return_edges:
+            payload["edges"] = out[2]
+        elif return_plot:
+            payload["ax"] = out[2]
+
+        if payload["edges"] is not None:
+            map_inv = payload["two_d_to_one_d"]
+            payload["edges_1d"] = tuple(
+                (map_inv[tuple(site0)], map_inv[tuple(site1)])
+                for site0, site1 in payload["edges"]
+            )
+        return payload
 
     @staticmethod
     def _coerce_coord(site):

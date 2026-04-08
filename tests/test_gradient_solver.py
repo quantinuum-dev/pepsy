@@ -1,10 +1,10 @@
-"""Tests for gradient solver backends used by optimize_sweep."""
+"""Tests for the simplified gradient solver API."""
 
 import numpy as np
 import pytest
 import torch
 
-from pepsy.gradient_solver import SUPPORTED_SOLVERS, optimize_packed_params
+from pepsy.gradient_solver import GradientOptimizer, SUPPORTED_SOLVERS
 from pepsy.optimize_sweep import SweepOptimizer
 
 
@@ -13,120 +13,44 @@ def _loss_quadratic(params):
     return (x.conj() * x).real.sum()
 
 
-def _loss_complex_target(params):
-    z = params["z"]
-    target = torch.tensor([0.25 - 0.75j], dtype=torch.complex128)
-    diff = z - target
+def _loss_with_target(params, *, target):
+    x = params["x"]
+    diff = x - target
     return (diff.conj() * diff).real.sum()
 
 
 def test_supported_solvers_exports_expected_backends():
-    """Supported solver list should include torch + optional backend names."""
-    assert "adam" in SUPPORTED_SOLVERS
-    assert "lbfgs" in SUPPORTED_SOLVERS
-    assert "scipy-lbfgs" in SUPPORTED_SOLVERS
-    assert "nlopt-lbfgs" in SUPPORTED_SOLVERS
+    """Supported solver list should expose only canonical names."""
+    assert set(SUPPORTED_SOLVERS) == {"torch-adam", "scipy", "nlopt"}
 
 
 def test_torch_adam_solver_reduces_quadratic():
-    """Torch Adam backend should reduce a simple quadratic objective."""
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="adam",
-        solver_options={"lr": 0.2},
+    """Torch backend should reduce a simple quadratic objective."""
+    runner = GradientOptimizer(
+        solver="torch-adam",
         n_steps=30,
         log_every=10,
+        options={"lr": 0.2},
     )
-    assert len(history) == 30
-    assert history[-1] < history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 2.0
-
-
-def test_torch_lbfgs_solver_reduces_quadratic():
-    """Torch LBFGS backend should reduce a simple quadratic objective."""
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="lbfgs",
-        n_steps=20,
-        solver_options={"lr": 1.0, "max_iter": 1, "history_size": 10},
-        log_every=10,
+    result = runner.run(
+        params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+        loss_fn=_loss_quadratic,
     )
-    assert len(history) == 20
-    assert history[-1] < history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 1e-2
+    assert len(result.history) == 30
+    assert result.history[-1] < result.history[0]
+    assert abs(float(result.params["x"].detach().item())) < 2.0
 
 
-def test_torch_solvers_handle_complex128_params():
-    """Torch backends should optimize complex128 tensors directly."""
-    params_init = {"z": torch.tensor([2.0 + 1.5j], dtype=torch.complex128)}
-
-    params_adam, history_adam = optimize_packed_params(
-        params_init,
-        _loss_complex_target,
-        solver="adam",
-        solver_options={"lr": 0.2},
-        n_steps=40,
-        log_every=10,
+def test_run_accepts_loss_kwargs():
+    """run(...) should bind loss kwargs cleanly."""
+    runner = GradientOptimizer(solver="torch-adam", n_steps=30, options={"lr": 0.1})
+    result = runner.run(
+        params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+        loss_fn=_loss_with_target,
+        loss_kwargs={"target": torch.tensor([0.25], dtype=torch.float64)},
     )
-    assert history_adam[-1] < history_adam[0]
-    assert params_adam["z"].dtype == torch.complex128
-
-    params_lbfgs, history_lbfgs = optimize_packed_params(
-        params_init,
-        _loss_complex_target,
-        solver="lbfgs",
-        n_steps=30,
-        solver_options={"lr": 1.0, "max_iter": 1, "history_size": 10},
-        log_every=10,
-    )
-    assert history_lbfgs[-1] < history_lbfgs[0]
-    assert params_lbfgs["z"].dtype == torch.complex128
-
-
-def test_torch_solver_accepts_common_controls():
-    """Torch backend should accept shared run-control and scheduler keys."""
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="adam",
-        n_steps=10,
-        log_every=5,
-        solver_options={
-            "lr": 0.1,
-            "its_max": 15,
-            "patience": 5,
-            "min_steps": 2,
-            "min_improve": 0.0,
-            "restore_best": True,
-            "clip_grad_norm": 1.0,
-            "scheduler": "cosine",
-            "eta_min": 1e-8,
-        },
-    )
-    assert history
-    assert len(history) <= 15
-    assert history[-1] <= history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 2.0
-
-
-def test_solver_options_lr_overrides_default():
-    """solver_options['lr'] should override the default lr."""
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="adam",
-        n_steps=5,
-        log_every=2,
-        solver_options={"lr": 1e-6},
-    )
-    assert history
-    assert abs(float(params_opt["x"].detach().item()) - 2.0) < 1e-3
+    assert result.history[-1] < result.history[0]
+    assert abs(float(result.params["x"].detach().item()) - 0.25) < 1.0
 
 
 @pytest.mark.parametrize(
@@ -142,7 +66,7 @@ def test_solver_options_lr_overrides_default():
         (np.array([2.0 + 1.0j], dtype=np.complex128), torch.complex128),
     ],
 )
-def test_torch_solver_preserves_trainable_input_dtype(input_value, expected_dtype):
+def test_solver_preserves_trainable_input_dtype(input_value, expected_dtype):
     """Trainable float/complex input dtypes should be preserved after optimization."""
     key = "z" if torch.as_tensor(input_value).is_complex() else "x"
 
@@ -150,216 +74,82 @@ def test_torch_solver_preserves_trainable_input_dtype(input_value, expected_dtyp
         value = params[key]
         return (value.conj() * value).real.sum()
 
-    params_opt, history = optimize_packed_params(
-        {key: input_value},
-        loss_fn,
-        solver="adam",
-        solver_options={"lr": 0.1},
-        n_steps=5,
-        log_every=2,
+    runner = GradientOptimizer(solver="torch-adam", n_steps=5, options={"lr": 0.1})
+    result = runner.run(
+        params_init={key: input_value},
+        loss_fn=loss_fn,
     )
-    assert history[-1] <= history[0]
-    assert params_opt[key].dtype == expected_dtype
+    assert result.history[-1] <= result.history[0]
+    assert result.params[key].dtype == expected_dtype
 
 
 def test_integer_input_is_promoted_to_float64():
-    """Non-trainable integer inputs should be promoted to a trainable float dtype."""
-    params_opt, history = optimize_packed_params(
-        {"x": np.array([2], dtype=np.int64)},
-        _loss_quadratic,
-        solver="adam",
-        solver_options={"lr": 0.1},
-        n_steps=5,
-        log_every=2,
+    """Integer inputs should be promoted to trainable float64."""
+    runner = GradientOptimizer(solver="torch-adam", n_steps=5, options={"lr": 0.1})
+    result = runner.run(
+        params_init={"x": np.array([2], dtype=np.int64)},
+        loss_fn=_loss_quadratic,
     )
-    assert history[-1] <= history[0]
-    assert params_opt["x"].dtype == torch.float64
+    assert result.history[-1] <= result.history[0]
+    assert result.params["x"].dtype == torch.float64
 
 
 def test_solver_name_validation_errors():
-    """Unknown solver names should fail with a clear ValueError."""
-    params_init = {"x": torch.tensor([1.0], dtype=torch.float64)}
+    """Unknown/legacy solver names should fail with a clear ValueError."""
+    runner = GradientOptimizer(solver="does-not-exist")
     with pytest.raises(ValueError, match="Unsupported solver"):
-        optimize_packed_params(params_init, _loss_quadratic, solver="does-not-exist")
+        runner.run(
+            params_init={"x": torch.tensor([1.0], dtype=torch.float64)},
+            loss_fn=_loss_quadratic,
+        )
 
-
-def test_returns_best_params_not_last_for_non_monotonic_trajectory():
-    """Returned params should correspond to min(history), not the last step."""
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="sgd",
-        solver_options={"lr": 1.8},
-        n_steps=4,
-        log_every=2,
-    )
-    returned_loss = float(_loss_quadratic(params_opt).detach().item())
-    assert abs(returned_loss - min(history)) < 1e-10
-    assert returned_loss <= history[-1]
-
-
-def test_resolve_user_solver_accepts_canonical_lbfgs():
-    """Canonical 'lbfgs' should remain torch LBFGS without remapping."""
-    solver = SweepOptimizer._resolve_user_solver("lbfgs")  # pylint: disable=protected-access
-    assert solver == "lbfgs"
-
-
-def test_resolve_user_solver_warns_for_nlopt():
-    """NLopt path should warn users with neutral option-tuning guidance."""
-    with pytest.warns(UserWarning, match="uses NLopt"):
-        solver = SweepOptimizer._resolve_user_solver("nlopt-lbfgs")  # pylint: disable=protected-access
-    assert solver == "nlopt-lbfgs"
-
-
-@pytest.mark.parametrize("alias_name", ("scipy", "nlopt", "scipy_lbfgs", "nlopt_lbfgs"))
-def test_resolve_user_solver_rejects_alias_names(alias_name):
-    """Short alias names should fail with a canonical-name hint."""
-    with pytest.raises(ValueError, match="Unsupported solver alias"):
-        SweepOptimizer._resolve_user_solver(alias_name)  # pylint: disable=protected-access
-
-
-def test_scipy_lbfgs_solver_reduces_quadratic_if_available():
-    """SciPy backend should optimize when optional dependency is installed."""
-    pytest.importorskip("scipy")
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="scipy-lbfgs",
-        n_steps=30,
-        log_every=10,
-    )
-    assert history
-    assert history[-1] < history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 1e-6
-
-
-def test_gradient_solver_rejects_short_solver_aliases():
-    """gradient_solver should require canonical solver names."""
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    with pytest.raises(ValueError, match="Unsupported solver alias"):
-        optimize_packed_params(
-            params_init,
-            _loss_quadratic,
-            solver="scipy",
-            n_steps=4,
+    runner_alias = GradientOptimizer(solver="adam")
+    with pytest.raises(ValueError, match="Unsupported solver"):
+        runner_alias.run(
+            params_init={"x": torch.tensor([1.0], dtype=torch.float64)},
+            loss_fn=_loss_quadratic,
         )
 
 
-def test_scipy_lbfgs_handles_complex128_if_available():
-    """SciPy backend should round-trip complex128 through real-vector flattening."""
+def test_resolve_user_solver_accepts_canonical_names():
+    """Sweep optimizer should accept canonical solver names."""
+    assert SweepOptimizer._resolve_user_solver("scipy") == "scipy"  # pylint: disable=protected-access
+    assert SweepOptimizer._resolve_user_solver("torch-adam") == "torch-adam"  # pylint: disable=protected-access
+
+
+def test_resolve_user_solver_warns_for_nlopt():
+    """NLopt path should warn users with tuning guidance."""
+    with pytest.warns(UserWarning, match="uses NLopt"):
+        solver = SweepOptimizer._resolve_user_solver("nlopt")  # pylint: disable=protected-access
+    assert solver == "nlopt"
+
+
+def test_scipy_solver_reduces_quadratic_if_available():
+    """SciPy backend should optimize when optional dependency is installed."""
     pytest.importorskip("scipy")
-    params_init = {"z": torch.tensor([2.0 + 1.5j], dtype=torch.complex128)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_complex_target,
-        solver="scipy-lbfgs",
-        n_steps=40,
-        log_every=10,
+    runner = GradientOptimizer(solver="scipy", n_steps=30, log_every=10)
+    result = runner.run(
+        params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+        loss_fn=_loss_quadratic,
     )
-    assert history[-1] < history[0]
-    assert params_opt["z"].dtype == torch.complex128
+    assert result.history
+    assert result.history[-1] < result.history[0]
+    assert abs(float(result.params["x"].detach().item())) < 1e-6
 
 
-def test_scipy_lbfgs_accepts_nlopt_style_aliases_if_available():
-    """SciPy backend should accept NLopt-style option aliases for consistency."""
-    pytest.importorskip("scipy")
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="scipy-lbfgs",
-        n_steps=40,
-        log_every=20,
-        solver_options={
-            "algorithm": "LBFGS",
-            "maxeval": 40,
-            "ftol_rel": 1e-9,
-            "xtol_rel": 1e-9,
-        },
-    )
-    assert history
-    assert history[-1] < history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 1e-5
-
-
-def test_nlopt_lbfgs_solver_reduces_quadratic_if_available():
+def test_nlopt_solver_reduces_quadratic_if_available():
     """NLopt backend should optimize when optional dependency is installed."""
     pytest.importorskip("nlopt")
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="nlopt-lbfgs",
+    runner = GradientOptimizer(
+        solver="nlopt",
         n_steps=60,
         log_every=20,
-        solver_options={"algorithm": "LD_LBFGS"},
+        options={"algorithm": "LD_LBFGS"},
     )
-    assert history
-    assert history[-1] < history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 1e-4
-
-
-def test_nlopt_lbfgs_handles_complex128_if_available():
-    """NLopt backend should round-trip complex128 through real-vector flattening."""
-    pytest.importorskip("nlopt")
-    params_init = {"z": torch.tensor([2.0 + 1.5j], dtype=torch.complex128)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_complex_target,
-        solver="nlopt-lbfgs",
-        n_steps=60,
-        log_every=20,
-        solver_options={"algorithm": "LD_LBFGS"},
+    result = runner.run(
+        params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+        loss_fn=_loss_quadratic,
     )
-    assert history[-1] < history[0]
-    assert params_opt["z"].dtype == torch.complex128
-
-
-def test_nlopt_lbfgs_accepts_robust_option_aliases_if_available():
-    """NLopt backend should accept alias options and robustness knobs."""
-    pytest.importorskip("nlopt")
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="nlopt-lbfgs",
-        n_steps=40,
-        log_every=20,
-        solver_options={
-            "optimizer": "LBFGS",
-            "its_max": 40,
-            "patience": 20,
-            "min_evals": 5,
-            "bad_max": 10,
-            "min_improve": 1e-12,
-            "grad_clip_norm": 1e3,
-            "penalty_value": 1e20,
-        },
-    )
-    assert history
-    assert history[-1] <= history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 1e-3
-
-
-def test_nlopt_lbfgs_accepts_scipy_style_aliases_if_available():
-    """NLopt backend should accept SciPy-style option aliases for consistency."""
-    pytest.importorskip("nlopt")
-    params_init = {"x": torch.tensor([2.0], dtype=torch.float64)}
-    params_opt, history = optimize_packed_params(
-        params_init,
-        _loss_quadratic,
-        solver="nlopt-lbfgs",
-        n_steps=40,
-        log_every=20,
-        solver_options={
-            "method": "L-BFGS-B",
-            "maxiter": 40,
-            "ftol": 1e-9,
-            "gtol": 1e-9,
-        },
-    )
-    assert history
-    assert history[-1] < history[0]
-    assert abs(float(params_opt["x"].detach().item())) < 1e-3
+    assert result.history
+    assert result.history[-1] < result.history[0]
+    assert abs(float(result.params["x"].detach().item())) < 1e-4

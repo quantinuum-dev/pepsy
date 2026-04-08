@@ -15,7 +15,7 @@ from .boundary_metrics import contract_boundary, build_bra_ket, normalize
 from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
 from .core import tns_align
-from .gradient_solver import SUPPORTED_SOLVERS, optimize_packed_params as run_gradient_solver
+from .gradient_solver import GradientOptimizer, SUPPORTED_SOLVERS
 
 _PHYS_IND_PATTERN = re.compile(r"^k\d+(?:,\d+)*$")
 _TAG_X = re.compile(r"^X(\d+)$")
@@ -519,30 +519,18 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def _resolve_user_solver(solver):
-        """Validate canonical solver names and emit practical warnings."""
+        """Validate solver names and emit practical warnings."""
         if not isinstance(solver, str):
             raise TypeError("solver must be a string")
         solver = solver.strip().lower()
-
-        alias_hints = {
-            "scipy": "scipy-lbfgs",
-            "scipy_lbfgs": "scipy-lbfgs",
-            "nlopt": "nlopt-lbfgs",
-            "nlopt_lbfgs": "nlopt-lbfgs",
-        }
-        if solver in alias_hints:
-            raise ValueError(
-                f"Unsupported solver alias {solver!r}; "
-                f"use canonical solver={alias_hints[solver]!r}."
-            )
 
         if solver not in SUPPORTED_SOLVERS:
             supported = ", ".join(SUPPORTED_SOLVERS)
             raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
 
-        if solver == "nlopt-lbfgs":
+        if solver == "nlopt":
             warnings.warn(
-                "solver='nlopt-lbfgs' uses NLopt on CPU float64 parameter vectors. "
+                "solver='nlopt' uses NLopt on CPU float64 parameter vectors. "
                 "Tune NLopt controls (algorithm/maxeval/ftol_rel/xtol_rel) for your problem.",
                 UserWarning,
                 stacklevel=3,
@@ -554,19 +542,20 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
         params_init,
         loss_fn,
         *,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
     ):
         opts = self._merge_solver_options(solver_options)
         n_steps = int(opts.pop("n_steps", 100))
-        return run_gradient_solver(
-            params_init,
-            loss_fn,
+        runner = GradientOptimizer(
             solver=solver,
-            solver_options=opts,
             n_steps=n_steps,
-            pbar=False,
+            options=opts,
+            progress=False,
+            verbose=False,
         )
+        result = runner.run(params_init=params_init, loss_fn=loss_fn)
+        return result.params, result.history
 
     def _apply_slice_update(self, index, params_opt, skeleton, axis):
         tn_opt = qtn.unpack(params_opt, skeleton)
@@ -646,7 +635,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
         index,
         *,
         axis,
-        solver="adam",
+        solver="torch-adam",
         solver_options=None,
     ):
         axis_tag = self._axis_tag(axis)
@@ -717,7 +706,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         update_side,
         sweep_name,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
         env_n_iter=10,
         run_callback=None,
@@ -960,7 +949,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
 
         norm_result = contract_boundary(
             norm=norm_tn,
-            mps_boundaries=self.bdy.mps_b,
+            bdy=self.bdy,
             contraction_opt=opt_use,
             fit_mode=self.fit_mode,
             n_iter=n_iter,
@@ -971,7 +960,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         energy_result = contract_boundary(
             norm=energy_tn,
-            mps_boundaries=self.bdy_energy.mps_b,
+            bdy=self.bdy_energy,
             contraction_opt=opt_use,
             fit_mode=self.fit_mode,
             n_iter=n_iter,
@@ -1007,7 +996,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         *,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
         env_n_iter=10,
         run_callback=None,
@@ -1022,7 +1011,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
             Axis to sweep.
         n_round_trips : int, default=1
             Number of backward+forward round-trips after the initial forward pass.
-        solver : str, default="scipy-lbfgs"
+        solver : str, default="scipy"
             Local solver name passed to gradient backend.
         solver_options : dict | None, default=None
             Extra solver controls.
@@ -1092,7 +1081,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
         n_cycles=1,
         n_round_trips=1,
         chi=None,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
         env_n_iter=10,
         progress=True,
@@ -1111,7 +1100,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
             Number of backward+forward round-trips per axis.
         chi : int | None, default=None
             Optional boundary bond dimension expansion before running.
-        solver : str, default="scipy-lbfgs"
+        solver : str, default="scipy"
             Local solver name passed to gradient backend.
         solver_options : dict | None, default=None
             Extra solver controls.
@@ -1268,7 +1257,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
             n_cycles=opts.get("n_cycles", 1),
             n_round_trips=opts.get("n_round_trips", 1),
             chi=opts.get("chi"),
-            solver=opts.get("optimizer", "scipy-lbfgs"),
+            solver=opts.get("optimizer", "scipy"),
             solver_options=opts.get("optimizer_options"),
             env_n_iter=opts.get("env_n_iter", 10),
             progress=opts.get("progress", True),

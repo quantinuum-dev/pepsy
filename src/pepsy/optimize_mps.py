@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from numbers import Integral
+import warnings
+import quimb.tensor as qtn
 
 from .fit import FIT
 from .gate import gate_1d
@@ -24,9 +26,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Maximum bond dimension used by SVD mode.
     mode : {"dmrg", "svd", "exact"}, default="dmrg"
         Optimization backend.
+    contraction_opt : object | None, optional
+        Canonical contraction path optimizer keyword.
+    ind_id : str, default="k{}"
+        Format string for site index labels used by exact gate application.
+        Use "k{},{}" when gate sites are 2D coordinates like ``(i, j)``.
     opt : object | None, optional
-        Contraction path optimizer passed to local DMRG fitting. If ``None``,
-        defaults to ``"auto-hq"``.
+        Legacy contraction optimizer keyword kept for compatibility. If both
+        are supplied, ``contraction_opt`` takes precedence.
     """
 
     _ALLOWED_MODES = frozenset({"dmrg", "svd", "exact"})
@@ -45,7 +52,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         gates=None,
         chi=None,
         mode="dmrg",
-        opt="auto-hq",
+        contraction_opt=None,
+        ind_id="k{}",
     ):
         if chi is None:
             # Allow shorthand: MpsOptimizer(p, chi, mode=...)
@@ -65,7 +73,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.gates = list(gates)
         self.chi = chi
         self.mode = self._normalize_mode(mode)
-        self.opt = "auto-hq" if opt is None else opt
+        self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
+        self.ind_id = str(ind_id)
 
         self.info_c = {}
         self.fidelity_trace = [1.0]
@@ -86,8 +95,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.info_c["cur_orthog"] = cur
         return cur
 
+    def _format_ind(self, site):
+        """Format a site id using ``self.ind_id``."""
+        if isinstance(site, (tuple, list)):
+            return self.ind_id.format(*site)
+        return self.ind_id.format(site)
+
     def _init_canonicalization(self):
         """Initialize canonical form and orthogonality center."""
+        if self.mode == "exact":
+            # Exact evolution does not require a canonicalized input state.
+            self.info_c = {}
+            return
         center = self.p.L // 2
         self.info_c = {}
         self.p.canonicalize_([center], cur_orthog="calc", info=self.info_c)
@@ -125,7 +144,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def set_mode(self, mode):
         """Switch optimization mode while keeping ``p`` and ``info_c``."""
+        old_mode = self.mode
         self.mode = self._normalize_mode(mode)
+        if old_mode == "exact" and self.mode != "exact":
+            # Recreate canonical metadata when leaving exact mode.
+            self._init_canonicalization()
         return self
 
     def set_gates(self, gates):
@@ -169,7 +192,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
         fidelity_samples : int, default=10
-            SVD/Exact modes: target number of fidelity proxy samples collected across
+            SVD mode: target number of fidelity proxy samples collected across
             2-qubit updates. The final 2-qubit update is always sampled.
         k_2q_batch : int, default=1
             DMRG mode only: number of sequential two-qubit gates to batch
@@ -307,7 +330,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         p_g,
                         p=p,
                         cutoffs=cutoff,
-                        contraction_opt=self.opt,
+                        contraction_opt=self.contraction_opt,
                         retag=False,
                         range_int=[xmin, xmax],
                     )
@@ -333,7 +356,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         p_g,
                         p=p,
                         cutoffs=cutoff,
-                        contraction_opt=self.opt,
+                        contraction_opt=self.contraction_opt,
                         retag=False,
                         range_int=[xmin, xmax],
                     )
@@ -372,10 +395,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         p = self.p
         two_qubit_count = 0
-        if fidelity_samples < 1:
-            raise ValueError("fidelity_samples must be >= 1.")
+        # Keep parameter for API compatibility; exact mode does not sample fidelity.
+        _ = fidelity_samples
         total_two_qubit = sum(1 for where, _ in gates if len(where) == 2)
-        norm_stride = max(1, (total_two_qubit + fidelity_samples - 1) // fidelity_samples)
 
         pbar = None
         if progbar:
@@ -408,13 +430,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     method="direct",
                     cutoff=cutoff,
                 )
-                should_sample_fidelity = (
-                    two_qubit_count == total_two_qubit
-                    or (two_qubit_count % norm_stride == 0)
-                )
-                if should_sample_fidelity:
-                    fidelity = p.norm()
-                    self.fidelity_trace.append(complex(fidelity).real)
                 idx += 1
                 advanced = 1
 
@@ -445,10 +460,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         p = self.p
         two_qubit_count = 0
-        if fidelity_samples < 1:
-            raise ValueError("fidelity_samples must be >= 1.")
+        # Keep parameter for API compatibility; exact mode does not sample fidelity.
+        _ = fidelity_samples
         total_two_qubit = sum(1 for where, _ in gates if len(where) == 2)
-        norm_stride = max(1, (total_two_qubit + fidelity_samples - 1) // fidelity_samples)
 
         pbar = None
         if progbar:
@@ -463,32 +477,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
 
         for where, gate in gates:
-            if len(where) == 1:
-                gate_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
-                continue
-
-            if len(where) != 2:
+            if len(where) not in (1, 2):
                 raise ValueError("Each gate location must have one or two sites.")
 
-            two_qubit_count += 1
-            gate_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
-
-            should_sample_fidelity = (
-                two_qubit_count == total_two_qubit
-                or (two_qubit_count % norm_stride == 0)
+            inds = [self._format_ind(site) for site in where]
+            qtn.tensor_network_gate_inds(
+                p,
+                gate,
+                inds,
+                contract=True,
+                info=None,
+                inplace=True,
+                cutoff=cutoff,
             )
-            if should_sample_fidelity:
-                fidelity = p.norm()
-                self.fidelity_trace.append(complex(fidelity).real)
 
+            if len(where) == 1:
+                continue
+
+            two_qubit_count += 1
             if pbar is not None:
-                pbar.set_postfix(
-                    {
-                        "2q": two_qubit_count,
-                        "~F": self.fidelity_trace[-1],
-                        "bnd": p.max_bond(),
-                    }
-                )
+                pbar.set_postfix({"2q": two_qubit_count})
                 pbar.update(1)
 
         if pbar is not None:

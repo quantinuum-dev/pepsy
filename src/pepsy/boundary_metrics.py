@@ -143,7 +143,7 @@ def build_bra_ket(
 def contract_boundary(
     *,
     norm,
-    mps_boundaries,
+    bdy=None,
     contraction_opt="auto-hq",
     flat=False,
     fit_mode="eff",
@@ -164,8 +164,11 @@ def contract_boundary(
     norm : qtn.TensorNetwork
         Prebuilt double-layer network, usually from
         :func:`build_bra_ket`.
-    mps_boundaries : dict[str, qtn.MatrixProductState]
-        Boundary dictionary, usually from :class:`pepsy.boundary_states.BdyMPS`.
+    bdy : pepsy.boundary_states.BdyMPS | dict | None, default=None
+        Boundary handle:
+
+        - ``BdyMPS`` object: uses ``bdy.mps_b``
+        - dict holder with ``{"bdy": <BdyMPS>}``: uses ``bdy["bdy"].mps_b``
     contraction_opt : str | object, default="auto-hq"
         Contraction optimizer passed through to :class:`pepsy.boundary_sweeps.CompBdy`.
     flat : bool, default=False
@@ -183,7 +186,7 @@ def contract_boundary(
     visualize : bool, default=False
         Enable intermediate visualization in fitting backend.
     write_back : bool, default=True
-        Whether to write fitted boundaries back into ``mps_boundaries``.
+        Whether to write fitted boundaries back into the boundary map.
     max_separation : int, default=1
         Sweep separation mode.
     direction : str, default="y"
@@ -199,6 +202,18 @@ def contract_boundary(
     """
     if norm is None:
         raise ValueError("norm must not be None.")
+    if bdy is None:
+        raise ValueError("Provide bdy.")
+    if hasattr(bdy, "mps_b"):
+        mps_boundaries = bdy.mps_b
+    elif isinstance(bdy, dict):
+        bdy_obj = bdy.get("bdy", None)
+        if not hasattr(bdy_obj, "mps_b"):
+            raise TypeError("bdy dict must contain key 'bdy' with an object exposing attribute 'mps_b'.")
+        mps_boundaries = bdy_obj.mps_b
+    else:
+        raise TypeError("bdy must be a BdyMPS-like object or a dict containing key 'bdy'.")
+
     if not isinstance(mps_boundaries, dict):
         raise TypeError("mps_boundaries must be a dictionary of boundary states.")
 
@@ -247,6 +262,7 @@ def normalize(
     track_boundary_fidelity=False,
     fit_mode="eff",
     single_layer=False,
+    visualize=False,
 ):
     """Normalize a PEPS state in place using boundary contraction.
 
@@ -260,9 +276,13 @@ def normalize(
         Input PEPS state.
     chi : int | None, default=None
         Boundary MPS bond dimension used when ``bdy`` is not provided.
-    bdy : pepsy.boundary_states.BdyMPS | None, default=None
-        Pre-built boundary object. If provided, ``normalize`` reuses it and
-        skips creating a new :class:`pepsy.boundary_states.BdyMPS`.
+    bdy : pepsy.boundary_states.BdyMPS | dict | None, default=None
+        Boundary handle:
+
+        - ``BdyMPS``: reused and updated in place.
+        - ``dict``: if ``dict["bdy"]`` exists it is reused; otherwise a new
+          boundary is created (requires ``chi``) and written to ``dict["bdy"]``.
+        - ``None``: a new boundary is created internally (requires ``chi``).
     contraction_opt : str | object, default="auto-hq"
         Contraction optimizer.
     n_iter : int, default=10
@@ -283,29 +303,60 @@ def normalize(
     Returns
     -------
     complex | float
-        Old norm estimate returned by the boundary contraction
-        before rescaling.
+        Old norm estimate returned by the boundary contraction before
+        rescaling.
     """
     if p is None:
         raise ValueError("p must not be None.")
+    if chi is not None:
+        if not isinstance(chi, int):
+            raise TypeError("chi must be an integer when provided.")
+        if chi < 1:
+            raise ValueError("chi must be >= 1 when provided.")
 
     ket_tagged, norm_tagged = build_bra_ket(ket=p, bra=None)
 
-    if bdy is None:
+    bdy_holder = bdy if isinstance(bdy, dict) else None
+    bdy_obj = None
+    if bdy_holder is not None:
+        bdy_obj = bdy_holder.get("bdy", None)
+        if bdy_obj is not None and not hasattr(bdy_obj, "mps_b"):
+            raise TypeError("bdy['bdy'] must expose attribute 'mps_b'.")
+    elif bdy is not None:
+        bdy_obj = bdy
+        if not hasattr(bdy_obj, "mps_b"):
+            raise TypeError("bdy must expose attribute 'mps_b'.")
+
+    def _retune_bdy_to_chi(obj):
+        """Retune existing normalize boundary to requested chi."""
+        if obj is None or chi is None:
+            return
+        cur = getattr(obj, "chi", None)
+        if cur is None or int(cur) == chi:
+            return
+        if not hasattr(obj, "expand_bnd"):
+            raise TypeError(
+                f"bdy has chi={cur} but cannot be retuned to chi={chi}; "
+                "object must expose method 'expand_bnd'."
+            )
+        obj.expand_bnd(chi, inplace=True)
+
+    _retune_bdy_to_chi(bdy_obj)
+
+    if bdy_obj is None:
         if chi is None:
             raise ValueError("Provide chi when bdy is not supplied.")
-
-        bdy = BdyMPS(
+        bdy_obj = BdyMPS(
             tn_double=norm_tagged,
             chi=chi,
             single_layer=single_layer,
         )
-    elif not hasattr(bdy, "mps_b"):
-        raise TypeError("bdy must expose attribute 'mps_b'.")
+        if bdy_holder is not None:
+            bdy_holder["bdy"] = bdy_obj
 
     result = contract_boundary(
         norm=norm_tagged,
-        mps_boundaries=bdy.mps_b,
+        bdy=bdy_obj,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
         n_iter=n_iter,
@@ -313,6 +364,7 @@ def normalize(
         direction=direction,
         max_separation=max_separation,
         track_boundary_fidelity=track_boundary_fidelity,
+        visualize=visualize,
     )
     cost = result.cost
     old_norm = _to_python_scalar(cost)
@@ -342,6 +394,7 @@ def infidelity(
     track_boundary_fidelity=False,
     fit_mode="eff",
     single_layer=False,
+    visualize=False,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     r"""Compute the infidelity between two PEPS states via boundary contraction.
 
@@ -378,16 +431,19 @@ def infidelity(
         Known value of
         :math:`\langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle`.
         When provided the corresponding contraction is skipped.
-    bdy : pepsy.boundary_states.BdyMPS | None, default=None
+    bdy : pepsy.boundary_states.BdyMPS | dict | None, default=None
         Pre-built boundary for the :math:`\langle p | p \rangle` network.
+        Also supports dict holder style ``{"bdy": <BdyMPS>}``.
         Ignored when ``norm`` is given.
-    bdy_target : pepsy.boundary_states.BdyMPS | None, default=None
+    bdy_target : pepsy.boundary_states.BdyMPS | dict | None, default=None
         Pre-built boundary for the
         :math:`\langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle`
-        network.  Ignored when ``norm_target`` is given.
-    bdy_overlap : pepsy.boundary_states.BdyMPS | None, default=None
+        network. Also supports dict holder style ``{"bdy": <BdyMPS>}``.
+        Ignored when ``norm_target`` is given.
+    bdy_overlap : pepsy.boundary_states.BdyMPS | dict | None, default=None
         Pre-built boundary for the
         :math:`\langle p_{\mathrm{target}} | p \rangle` overlap network.
+        Also supports dict holder style ``{"bdy": <BdyMPS>}``.
     contraction_opt : str | object, default="auto-hq"
         Contraction optimizer passed to :func:`contract_boundary`.
     n_iter : int, default=10
@@ -404,7 +460,7 @@ def infidelity(
         Boundary fitting backend mode.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary_states.BdyMPS`.
-
+    visualize : bool, default=False
     Returns
     -------
     dict[str, object]
@@ -423,6 +479,50 @@ def infidelity(
         raise ValueError("p must not be None.")
     if p_target is None:
         raise ValueError("p_target must not be None.")
+    if chi is not None:
+        if not isinstance(chi, int):
+            raise TypeError("chi must be an integer when provided.")
+        if chi < 1:
+            raise ValueError("chi must be >= 1 when provided.")
+
+    def _unpack_bdy_handle(handle, name):
+        holder = handle if isinstance(handle, dict) else None
+        obj = None
+        if holder is not None:
+            obj = holder.get("bdy", None)
+            if obj is not None and not hasattr(obj, "mps_b"):
+                raise TypeError(f"{name}['bdy'] must expose attribute 'mps_b'.")
+        elif handle is not None:
+            obj = handle
+            if not hasattr(obj, "mps_b"):
+                raise TypeError(f"{name} must expose attribute 'mps_b'.")
+        return obj, holder
+
+    bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, "bdy")
+    bdy_target_obj, bdy_target_holder = _unpack_bdy_handle(bdy_target, "bdy_target")
+    bdy_overlap_obj, bdy_overlap_holder = _unpack_bdy_handle(bdy_overlap, "bdy_overlap")
+
+    def _retune_bdy_to_chi(obj, name):
+        """Retune an existing boundary object to the requested chi."""
+        if obj is None or chi is None:
+            return
+        cur = getattr(obj, "chi", None)
+        if cur is None:
+            return
+        if int(cur) == chi:
+            return
+        if not hasattr(obj, "expand_bnd"):
+            raise TypeError(
+                f"{name} has chi={cur} but cannot be retuned to chi={chi}; "
+                "object must expose method 'expand_bnd'."
+            )
+        obj.expand_bnd(chi, inplace=True)
+
+    # If caller supplies any boundary handles and chi, retune all supplied
+    # boundaries (norm, target, overlap) to the same requested chi.
+    _retune_bdy_to_chi(bdy_obj, "bdy")
+    _retune_bdy_to_chi(bdy_target_obj, "bdy_target")
+    _retune_bdy_to_chi(bdy_overlap_obj, "bdy_overlap")
 
     # Shared contraction kwargs
     _kw = dict(
@@ -433,21 +533,22 @@ def infidelity(
         direction=direction,
         max_separation=max_separation,
         track_boundary_fidelity=track_boundary_fidelity,
+        visualize=visualize,
     )
 
     # -- <p|p> --
     if norm is None:
         _, norm_tn = build_bra_ket(ket=p, bra=None)
 
-        if bdy is None:
+        if bdy_obj is None:
             if chi is None:
                 raise ValueError("Provide chi when bdy is not supplied.")
-            bdy = BdyMPS(tn_double=norm_tn, chi=chi, single_layer=single_layer)
-        elif not hasattr(bdy, "mps_b"):
-            raise TypeError("bdy must expose attribute 'mps_b'.")
+            bdy_obj = BdyMPS(tn_double=norm_tn, chi=chi, single_layer=single_layer)
+            if bdy_holder is not None:
+                bdy_holder["bdy"] = bdy_obj
 
         norm = complex(_to_python_scalar(
-            contract_boundary(norm=norm_tn, mps_boundaries=bdy.mps_b, **_kw).cost
+            contract_boundary(norm=norm_tn, bdy=bdy_obj, **_kw).cost
         ))
     else:
         norm = complex(norm)
@@ -456,18 +557,18 @@ def infidelity(
     if norm_target is None:
         _, norm_target_tn = build_bra_ket(ket=p_target, bra=None)
 
-        if bdy_target is None:
+        if bdy_target_obj is None:
             if chi is None:
                 raise ValueError("Provide chi when bdy_target is not supplied.")
-            bdy_target = BdyMPS(
+            bdy_target_obj = BdyMPS(
                 tn_double=norm_target_tn, chi=chi, single_layer=single_layer,
             )
-        elif not hasattr(bdy_target, "mps_b"):
-            raise TypeError("bdy_target must expose attribute 'mps_b'.")
+            if bdy_target_holder is not None:
+                bdy_target_holder["bdy"] = bdy_target_obj
 
         norm_target = complex(_to_python_scalar(
             contract_boundary(
-                norm=norm_target_tn, mps_boundaries=bdy_target.mps_b, **_kw,
+                norm=norm_target_tn, bdy=bdy_target_obj, **_kw,
             ).cost
         ))
     else:
@@ -476,18 +577,18 @@ def infidelity(
     # -- <p_target|p> (overlap) --
     _, overlap_tn = build_bra_ket(ket=p, bra=p_target)
 
-    if bdy_overlap is None:
+    if bdy_overlap_obj is None:
         if chi is None:
             raise ValueError("Provide chi when bdy_overlap is not supplied.")
-        bdy_overlap = BdyMPS(
+        bdy_overlap_obj = BdyMPS(
             tn_double=overlap_tn, chi=chi, single_layer=single_layer,
         )
-    elif not hasattr(bdy_overlap, "mps_b"):
-        raise TypeError("bdy_overlap must expose attribute 'mps_b'.")
+        if bdy_overlap_holder is not None:
+            bdy_overlap_holder["bdy"] = bdy_overlap_obj
 
     overlap = complex(_to_python_scalar(
         contract_boundary(
-            norm=overlap_tn, mps_boundaries=bdy_overlap.mps_b, **_kw,
+            norm=overlap_tn, bdy=bdy_overlap_obj, **_kw,
         ).cost
     ))
 
@@ -504,7 +605,7 @@ def infidelity(
         "norm": norm,
         "norm_target": norm_target,
         "overlap": overlap,
-        "bdy": bdy,
-        "bdy_target": bdy_target,
-        "bdy_overlap": bdy_overlap,
+        "bdy": bdy_obj,
+        "bdy_target": bdy_target_obj,
+        "bdy_overlap": bdy_overlap_obj,
     }

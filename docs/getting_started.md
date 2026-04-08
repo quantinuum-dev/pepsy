@@ -44,7 +44,7 @@ bdy = pepsy.BdyMPS(
 ```python
 res = pepsy.contract_boundary(
     norm=norm,
-    mps_boundaries=bdy.mps_b,
+    bdy=bdy,
     direction="y",
     n_iter=2,
     track_boundary_fidelity=True,

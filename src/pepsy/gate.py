@@ -13,8 +13,8 @@ import quimb as qu
 import quimb.tensor as qtn
 
 __all__ = [
-    "gate_2d",
-    "gate_to_pepo",
+    "apply_2d_gates",
+    "gates_to_pepo",
     "gate_1d",
     "pauli",
     "x",
@@ -214,14 +214,8 @@ def iswap():
 
 
 def phase(theta):
-    """Return a one-qubit phase gate for angle ``theta``.
-
-    Parameters
-    ----------
-    theta : float
-        Rotation angle.
-    """
-    return qtn.circuit.u1_gate_param_gen([theta])
+    """Alias for :func:`u1`."""
+    return u1(theta)
 
 
 def u1(theta):
@@ -259,6 +253,11 @@ def cphase(theta):
     return qtn.circuit.cu1_param_gen([theta])
 
 
+def cu1(theta):
+    """Alias for :func:`cphase`."""
+    return cphase(theta)
+
+
 def crx(theta):
     """Return a two-qubit controlled-RX gate for angle ``theta``.
 
@@ -290,17 +289,6 @@ def crz(theta):
         Rotation angle.
     """
     return qtn.circuit.crz_param_gen([theta])
-
-
-def cu1(theta):
-    """Return a two-qubit controlled-U1 gate for angle ``theta``.
-
-    Parameters
-    ----------
-    theta : float
-        Rotation angle.
-    """
-    return qtn.circuit.cu1_param_gen([theta])
 
 
 def cu2(params):
@@ -389,13 +377,33 @@ def u3(params):
 
 
 def gen_long_range_swap_path(  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
-    ij_a, ij_b, sequence=None
+    ij_a, ij_b, sequence=None, *, cyclic=False, Lx=None, Ly=None
 ):
     """Generate a SWAP path that brings two lattice sites together."""
     ia, ja = ij_a
     ib, jb = ij_b
-    di = ib - ia
-    dj = jb - ja
+
+    if cyclic:
+        if Lx is None or Ly is None:
+            raise ValueError("When cyclic=True, Lx and Ly must be provided.")
+        Lx = int(Lx)
+        Ly = int(Ly)
+        if Lx <= 0 or Ly <= 0:
+            raise ValueError("Lx and Ly must be positive integers when cyclic=True.")
+
+    def _wrapped_delta(delta, size):
+        if not cyclic:
+            return delta
+        wrapped = delta % size
+        half = size / 2
+        if wrapped > half:
+            wrapped -= size
+        elif (size % 2 == 0) and (wrapped == half) and (delta < 0):
+            wrapped -= size
+        return int(wrapped)
+
+    di = _wrapped_delta(ib - ia, Lx)
+    dj = _wrapped_delta(jb - ja, Ly)
 
     if (di == 0) and (dj == 0):
         return
@@ -435,41 +443,47 @@ def gen_long_range_swap_path(  # pylint: disable=too-many-branches,too-many-loca
         if not sequence:
             sequence = None
 
+    def _wrap_x(i):
+        return i % Lx if cyclic else i
+
+    def _wrap_y(j):
+        return j % Ly if cyclic else j
+
     def apply_move(move):
         nonlocal ij_a, ij_b, ia, ja, ib, jb, di, dj
         if (move == "av") and (di != 0):
             istep = min(max(di, -1), +1)
-            new_ij_a = (ia + istep, ja)
+            new_ij_a = (_wrap_x(ia + istep), ja)
             pair = (ij_a, new_ij_a)
             ij_a = new_ij_a
-            ia += istep
+            ia = new_ij_a[0]
             di -= istep
             return pair
 
         if (move == "bv") and (di != 0):
             istep = min(max(di, -1), +1)
-            new_ij_b = (ib - istep, jb)
+            new_ij_b = (_wrap_x(ib - istep), jb)
             pair = (ij_a, ij_b) if (new_ij_b == ij_a) else (ij_b, new_ij_b)
             ij_b = new_ij_b
-            ib -= istep
+            ib = new_ij_b[0]
             di -= istep
             return pair
 
         if (move == "ah") and (dj != 0):
             jstep = min(max(dj, -1), +1)
-            new_ij_a = (ia, ja + jstep)
+            new_ij_a = (ia, _wrap_y(ja + jstep))
             pair = (ij_a, new_ij_a)
             ij_a = new_ij_a
-            ja += jstep
+            ja = new_ij_a[1]
             dj -= jstep
             return pair
 
         if (move == "bh") and (dj != 0):
             jstep = min(max(dj, -1), +1)
-            new_ij_b = (ib, jb - jstep)
+            new_ij_b = (ib, _wrap_y(jb - jstep))
             pair = (ij_a, ij_b) if (new_ij_b == ij_a) else (ij_b, new_ij_b)
             ij_b = new_ij_b
-            jb -= jstep
+            jb = new_ij_b[1]
             dj -= jstep
             return pair
 
@@ -482,18 +496,18 @@ def gen_long_range_swap_path(  # pylint: disable=too-many-branches,too-many-loca
             if axis == "x":
                 while di != 0:
                     istep = min(max(di, -1), +1)
-                    new_ij_a = (ia + istep, ja)
+                    new_ij_a = (_wrap_x(ia + istep), ja)
                     yield (ij_a, new_ij_a)
                     ij_a = new_ij_a
-                    ia += istep
+                    ia = new_ij_a[0]
                     di -= istep
             else:
                 while dj != 0:
                     jstep = min(max(dj, -1), +1)
-                    new_ij_a = (ia, ja + jstep)
+                    new_ij_a = (ia, _wrap_y(ja + jstep))
                     yield (ij_a, new_ij_a)
                     ij_a = new_ij_a
-                    ja += jstep
+                    ja = new_ij_a[1]
                     dj -= jstep
         return
 
@@ -528,7 +542,7 @@ def gen_long_range_swap_path(  # pylint: disable=too-many-branches,too-many-loca
                 )
 
 
-def apply_2dtn_(
+def apply_2d_gate(
     peps,
     G,
     where,
@@ -542,13 +556,16 @@ def apply_2dtn_(
     canonize_distance=2,
     to_backend=None,
     sequence=("av", "bh", "ah", "bv"),
+    cyclic=False,
+    Lx=None,
+    Ly=None,
     ind_id="k{},{}",
 ):
     """Apply a local gate to a PEPS, routing long-range gates with SWAPs."""
 
     if bra or (canonize_distance != 2):
         warnings.warn(
-            "Unused options in apply_2dtn_: 'bra' and/or 'canonize_distance'.",
+            "Unused options in apply_2d_gate: 'bra' and/or 'canonize_distance'.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -585,7 +602,20 @@ def apply_2dtn_(
     if x == y:
         raise ValueError("Two-site gate requires distinct coordinates.")
 
-    *swaps, final = gen_long_range_swap_path(x, y, sequence=sequence)
+    lx_use = Lx
+    ly_use = Ly
+    if cyclic and (lx_use is None or ly_use is None):
+        lx_use = getattr(peps, "Lx", lx_use)
+        ly_use = getattr(peps, "Ly", ly_use)
+
+    *swaps, final = gen_long_range_swap_path(
+        x,
+        y,
+        sequence=sequence,
+        cyclic=cyclic,
+        Lx=lx_use,
+        Ly=ly_use,
+    )
 
     for pair in swaps:
         x_, y_ = pair
@@ -644,7 +674,7 @@ def _is_lattice_coord(value):
 
 
 def _normalize_where_arg(where):
-    """Normalize one-site and two-site where specs for :func:`gate_2d`."""
+    """Normalize one-site and two-site where specs for :func:`apply_2d_gates`."""
     if _is_lattice_coord(where):
         i, j = where
         return ((int(i), int(j)),)
@@ -663,7 +693,7 @@ def _normalize_where_arg(where):
     )
 
 
-def gate_2d(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def apply_2d_gates(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     peps,
     gates,
     *,
@@ -676,6 +706,9 @@ def gate_2d(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     canonize_distance=2,
     to_backend=None,
     sequence=("av", "bh", "ah", "bv"),
+    cyclic=False,
+    Lx=None,
+    Ly=None,
     chi=None,
     chi_cutoff=1.0e-12,
 ):
@@ -713,6 +746,9 @@ def gate_2d(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         "canonize_distance": canonize_distance,
         "to_backend": to_backend,
         "sequence": sequence,
+        "cyclic": cyclic,
+        "Lx": Lx,
+        "Ly": Ly,
     }
 
     for idx, item in enumerate(gates):
@@ -742,7 +778,7 @@ def gate_2d(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         where_norm = _normalize_where_arg(where)
         opts = dict(base_opts)
         opts.update(gate_opts)
-        peps = apply_2dtn_(peps, gate, where_norm, **opts)
+        peps = apply_2d_gate(peps, gate, where_norm, **opts)
 
     if chi is not None:
         chi_value = int(chi)
@@ -784,7 +820,7 @@ def peps_cycle(peps, bond_dim, cylinder=False):
     return add_cycle(peps, bond_dim=bond_dim, cylinder=cylinder)
 
 
-def gate_to_pepo(
+def gates_to_pepo(
     gates,
     cyclic=False,
     cutoff=1.0e-12,
@@ -829,11 +865,11 @@ def gate_to_pepo(
         else:
             raise ValueError("where must contain one or two site coordinates.")
 
-        apply_2dtn_(
+        apply_2d_gate(
             pepo, gate_use, where_norm,
             bond_dim=bnd, bra=False, contract=contract,
             tags=[], dtype=dtype, cutoff=cutoff,
-            sequence=sequence, ind_id="b{},{}",
+            sequence=sequence, cyclic=cyclic, Lx=Lx, Ly=Ly, ind_id="b{},{}",
         )
 
         if pepo.max_bond() > compress_threshold:
@@ -907,8 +943,11 @@ def gate_1d(
     return tn
 
 
-def energy_global(MPO_origin, mps_a, opt="auto-hq"):
+def energy_global(MPO_origin, mps_a, *, contraction_opt=None):
     """Compute global energy ``<mps_a|MPO_origin|mps_a>`` with normalization."""
+
+    if contraction_opt is None:
+        contraction_opt = "auto-hq"
 
     mps_a_ = mps_a.copy()
     mps_a_.normalize()
@@ -916,5 +955,5 @@ def energy_global(MPO_origin, mps_a, opt="auto-hq"):
     p_h.reindex_({f"k{i}": f"b{i}" for i in range(mps_a.L)})
     mpo_t = MPO_origin * 1.0
 
-    energy_dmrg = (p_h | mpo_t | mps_a_).contract(all, optimize=opt)
+    energy_dmrg = (p_h | mpo_t | mps_a_).contract(all, optimize=contraction_opt)
     return energy_dmrg

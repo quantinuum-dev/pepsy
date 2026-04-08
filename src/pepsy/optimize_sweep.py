@@ -8,14 +8,15 @@ import warnings
 from collections.abc import Mapping
 from typing import Any
 
+import autoray as ar
 import quimb.tensor as qtn
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from .boundary_metrics import infidelity as boundary_infidelity
 from .boundary_metrics import build_bra_ket, normalize
 from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
-from .gradient_solver import SUPPORTED_SOLVERS, optimize_packed_params as run_gradient_solver
+from .gradient_solver import GradientOptimizer, SUPPORTED_SOLVERS
 
 _PHYS_IND_PATTERN = re.compile(r"^k\d+(?:,\d+)*$")
 _TAG_X = re.compile(r"^X(\d+)$")
@@ -33,13 +34,17 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         Trainable PEPS-like tensor network.
     state_target : qtn.TensorNetwork
         Reference network for overlap objective.
-    chi : int | None, default=None
+    chi : int | tuple[int, int] | None, default=None
         Boundary bond dimension used when ``bdy``/``bdy_overlap`` are not
-        supplied.
-    bdy : pepsy.boundary_states.BdyMPS | None, default=None
-        Optional pre-built boundary container for norm contractions.
-    bdy_overlap : pepsy.boundary_states.BdyMPS | None, default=None
-        Optional pre-built boundary container for overlap contractions.
+        supplied.  Pass a single ``int`` to use the same dimension for both
+        boundaries, or ``(chi_bdy, chi_overlap)`` to set them independently.
+    bdy : pepsy.boundary_states.BdyMPS | dict | None, default=None
+        Optional boundary container for norm contractions. A dict holder style
+        ``{"bdy": <BdyMPS>}`` is also accepted and will be updated in place.
+    bdy_overlap : pepsy.boundary_states.BdyMPS | dict | None, default=None
+        Optional boundary container for overlap contractions. A dict holder
+        style ``{"bdy": <BdyMPS>}`` is also accepted and will be updated in
+        place.
     contraction_opt : object | str, default="auto-hq"
         Contraction optimizer.
     fit_mode : {"eff", "global"}, default="eff"
@@ -47,6 +52,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     """
 
     _NORMALIZE_KEYS = frozenset({
+        "chi",
         "contraction_opt",
         "n_iter",
         "direction",
@@ -81,16 +87,33 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     _DEFAULT_SOLVER_OPTIONS = {
         "algorithm": "LBFGS",
         "lr": 1e-2,
-        "n_steps": 50,
-        "maxeval": 100,
+        "n_steps": 20,
+        "maxeval": 50,
         "ftol_rel": 1e-9,
         "xtol_rel": 1e-9,
-        "patience": 40,
+        "patience": 25,
         "min_steps": 10,
         "restore_best": True,
         "bad_max": 20,
         "penalty_on_bad": 1e20,
     }
+
+
+    @staticmethod
+    def _unpack_chi(chi):
+        """Return ``(chi_bdy, chi_overlap)`` from *chi*.
+
+        Accepts ``int``, ``(int, int)`` tuple/list, or ``None``.
+        """
+        if chi is None:
+            return None, None
+        if isinstance(chi, (tuple, list)):
+            if len(chi) != 2:
+                raise ValueError(
+                    "chi tuple must have exactly 2 elements: (chi_bdy, chi_overlap)"
+                )
+            return int(chi[0]), int(chi[1])
+        return int(chi), int(chi)
 
     @staticmethod
     def _merge_opts(base, extra):
@@ -111,6 +134,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 stacklevel=3,
             )
         return filtered
+
+    @classmethod
+    def _merge_solver_options(cls, options):
+        merged = cls.default_solver_options()
+        if options:
+            merged.update(dict(options))
+        return merged
 
     @classmethod
     def default_solver_options(cls):
@@ -143,16 +173,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         }
 
     @classmethod
-    def _merge_solver_options(cls, options):
-        merged = cls.default_solver_options()
-        if options:
-            merged.update(dict(options))
-        return merged
-
-    @classmethod
     def _collect_init_renormalize_kwargs(
         cls,
         *,
+        chi=None,
         renormalize_kwargs=None,
         n_iter=None,
         direction=None,
@@ -162,6 +186,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Collect init-time normalize kwargs from explicit and mapping styles."""
         legacy = {
+            "chi": chi,
             "n_iter": n_iter,
             "direction": direction,
             "max_separation": max_separation,
@@ -186,6 +211,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         contraction_opt="auto-hq",
         fit_mode="eff",
         single_layer=False,
+        simplify=True,
         normalize_kwargs: Mapping[str, Any] | None = None,
         optimize_kwargs: Mapping[str, Any] | None = None,
         renormalize_state=False,
@@ -196,34 +222,46 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         progress: bool | None = None,
         track_boundary_fidelity: bool | None = None,
     ):
-        if (bdy is None) ^ (bdy_overlap is None):
-            raise ValueError("Provide both bdy and bdy_overlap together, or neither.")
-
         self._ensure_no_common_internal_indices(state, state_target)
 
-        if bdy is None and bdy_overlap is None:
+        bdy_obj, bdy_holder = self._resolve_boundary_arg(bdy, "bdy")
+        bdy_overlap_obj, bdy_overlap_holder = self._resolve_boundary_arg(
+            bdy_overlap,
+            "bdy_overlap",
+        )
+        self._bdy_holder = bdy_holder
+        self._bdy_overlap_holder = bdy_overlap_holder
+
+        if (bdy_obj is None) ^ (bdy_overlap_obj is None):
+            raise ValueError(
+                "Provide both boundaries (or holder dicts with key 'bdy') together, or neither."
+            )
+
+        if bdy_obj is None and bdy_overlap_obj is None:
             if chi is None:
                 raise ValueError(
                     "Provide chi when bdy and bdy_overlap are not supplied."
                 )
             if state_target is None:
                 raise ValueError("state_target is required when boundaries are not supplied.")
-            bdy, bdy_overlap = self._build_boundary_pair(
+            bdy_obj, bdy_overlap_obj = self._build_boundary_pair(
                 state,
                 state_target,
                 chi=chi,
                 single_layer=single_layer,
             )
-        for name, obj in (("bdy", bdy), ("bdy_overlap", bdy_overlap)):
-            if not hasattr(obj, "mps_b"):
-                raise TypeError(f"{name} must expose attribute 'mps_b'.")
 
         self.state = state
         self.state_target = state_target
-        self.bdy = bdy
-        self.bdy_overlap = bdy_overlap
+        self._set_boundary_pair(bdy_obj, bdy_overlap_obj)
         self.contraction_opt = contraction_opt
         self.fit_mode = fit_mode
+        # Store chi as-is (may be int or (int, int) tuple).
+        self.chi = chi if chi is not None else getattr(bdy_obj, "chi", None)
+        self.single_layer = single_layer
+        self.simplify = simplify
+        self.direction = direction if direction is not None else "y"
+        self.max_separation = max_separation if max_separation is not None else 1
 
         if normalize_kwargs is None:
             self.normalize_kwargs = {}
@@ -235,6 +273,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self._reset_run_traces()
 
         init_renormalize_kwargs = self._collect_init_renormalize_kwargs(
+            chi=self.chi,
             renormalize_kwargs=renormalize_kwargs,
             n_iter=n_iter,
             direction=direction,
@@ -248,42 +287,105 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def _ensure_no_common_internal_indices(state, state_target):
-        """Warn and stop when state/target share common internal bond indices."""
+        """Reindex ``state`` internals when state/target share internal indices."""
         if state is None or state_target is None:
             return
         if not hasattr(state, "inner_inds") or not hasattr(state_target, "inner_inds"):
             return
-        shared = set(state.inner_inds()) & set(state_target.inner_inds())
+        state_inner = set(state.inner_inds())
+        target_inner = set(state_target.inner_inds())
+        shared = state_inner & target_inner
         if not shared:
             return
+
+        # Reindex all internal bonds of ``state`` to random labels so the two
+        # networks are guaranteed disjoint for boundary contractions.
+        forbidden = state_inner | target_inner
+        reindex_map = {}
+        for idx in state_inner:
+            new_idx = qtn.rand_uuid()
+            while new_idx in forbidden:
+                new_idx = qtn.rand_uuid()
+            reindex_map[idx] = new_idx
+            forbidden.add(new_idx)
+        state.reindex_(reindex_map)
+
         sample = ", ".join(sorted(map(str, shared))[:8])
         msg = (
             "state and state_target share common internal indices. "
-            "Reindex one network so internal bond labels are disjoint. "
-            f"Shared sample: {sample}"
+            "Auto-reindexed all internal indices of state using random labels. "
+            f"Shared sample before reindex: {sample}"
         )
         warnings.warn(msg, UserWarning, stacklevel=3)
-        raise ValueError(msg)
+
+    @staticmethod
+    def _resolve_boundary_arg(boundary, name):
+        """Unpack boundary argument as ``(boundary_obj, holder_dict_or_none)``."""
+        if boundary is None:
+            return None, None
+        if isinstance(boundary, dict):
+            obj = boundary.get("bdy", None)
+            if obj is not None and not hasattr(obj, "mps_b"):
+                raise TypeError(f"{name}['bdy'] must expose attribute 'mps_b'.")
+            return obj, boundary
+        if not hasattr(boundary, "mps_b"):
+            raise TypeError(f"{name} must expose attribute 'mps_b'.")
+        return boundary, None
 
     @staticmethod
     def _build_boundary_pair(state, target, *, chi, single_layer=False):
         """Construct norm and overlap boundary MPS containers."""
+        chi_bdy, chi_overlap = SweepOptimizer._unpack_chi(chi)
         _, state_norm = build_bra_ket(ket=state, bra=None)
         _, overlap_norm = build_bra_ket(ket=target, bra=state)
         bdy = BdyMPS(
             tn_double=state_norm,
-            chi=chi,
+            chi=chi_bdy,
             single_layer=single_layer,
         )
         bdy_overlap = BdyMPS(
             tn_double=overlap_norm,
-            chi=chi,
+            chi=chi_overlap,
             single_layer=single_layer,
         )
         return bdy, bdy_overlap
 
+    def _set_boundary_pair(self, bdy, bdy_overlap):
+        """Assign boundary objects and keep optional holder dicts in sync."""
+        for name, obj in (("bdy", bdy), ("bdy_overlap", bdy_overlap)):
+            if not hasattr(obj, "mps_b"):
+                raise TypeError(f"{name} must expose attribute 'mps_b'.")
+        self.bdy = bdy
+        self.bdy_overlap = bdy_overlap
+        if getattr(self, "_bdy_holder", None) is not None:
+            self._bdy_holder["bdy"] = self.bdy
+        if getattr(self, "_bdy_overlap_holder", None) is not None:
+            self._bdy_overlap_holder["bdy"] = self.bdy_overlap
+
+    def _update_boundaries_from_result(self, result):
+        """Apply optional ``bdy``/``bdy_overlap`` entries from a result dict."""
+        bdy_new = result.get("bdy", self.bdy)
+        bdy_overlap_new = result.get("bdy_overlap", self.bdy_overlap)
+        self._set_boundary_pair(bdy_new, bdy_overlap_new)
+
+    @staticmethod
+    def _infer_shape(state):
+        """Infer ``(Lx, Ly)`` from ``X*`` and ``Y*`` tags."""
+        max_x = None
+        max_y = None
+        for tag in getattr(state, "tags", ()):
+            mx = _TAG_X.match(tag)
+            my = _TAG_Y.match(tag)
+            if mx:
+                max_x = max(int(mx.group(1)), -1 if max_x is None else max_x)
+            if my:
+                max_y = max(int(my.group(1)), -1 if max_y is None else max_y)
+        if max_x is None or max_y is None:
+            raise ValueError("state must include X*/Y* tags to infer lattice shape.")
+        return max_x + 1, max_y + 1
+
     def _reset_run_traces(self):
-        """Reset lightweight traces collected during :meth:`optimize_global`."""
+        """Reset lightweight traces collected during global sweep runs."""
         self.step_loss_trace = []
         # Keep legacy and new names synchronized.
         self.loss = self.step_loss_trace
@@ -291,6 +393,316 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.inner_loss_traces = []
         self.norm_trace = []
         self.fidels = []
+
+    def _ensure_boundary_chi(self, chi):
+        """Retune both stored boundary objects to at least ``chi``.
+
+        *chi* may be ``int`` (same for both) or ``(int, int)`` for
+        ``(bdy, bdy_overlap)``.
+        """
+        if chi is None:
+            return
+        chi_bdy, chi_overlap = self._unpack_chi(chi)
+        if chi_bdy < 1 or chi_overlap < 1:
+            raise ValueError("chi must be >= 1")
+
+        bdy = getattr(self, "bdy", None)
+        if bdy is not None and getattr(bdy, "chi", 0) < chi_bdy:
+            bdy.expand_bnd(chi_bdy, inplace=True)
+
+        bdy_overlap = getattr(self, "bdy_overlap", None)
+        if bdy_overlap is not None and getattr(bdy_overlap, "chi", 0) < chi_overlap:
+            bdy_overlap.expand_bnd(chi_overlap, inplace=True)
+
+    def set_chi(
+        self,
+        chi,
+        *,
+        normalize_state=False,
+        n_iter=5,
+        direction="y",
+        max_separation=0,
+        progress=False,
+        track_boundary_fidelity=False,
+    ):
+        """Expand stored boundaries to ``chi`` and optionally renormalize state.
+
+        Parameters
+        ----------
+        chi : int
+            Target boundary bond dimension.
+        normalize_state : bool, default=False
+            If True, run :meth:`normalize` immediately after expanding
+            boundaries.
+
+        Returns
+        -------
+        SweepOptimizer
+            ``self`` for chaining.
+        """
+        self._ensure_boundary_chi(chi)
+        if normalize_state:
+            self.normalize(
+                n_iter=n_iter,
+                direction=direction,
+                max_separation=max_separation,
+                progress=progress,
+                track_boundary_fidelity=track_boundary_fidelity,
+            )
+        return self
+
+    def set_state(
+        self,
+        state,
+        *,
+        chi=None,
+        single_layer=False,
+        normalize_state=True,
+        n_iter=10,
+        direction="y",
+        max_separation=1,
+        progress=False,
+        track_boundary_fidelity=False,
+    ):
+        """Replace current state, rebuild boundaries, and optionally normalize.
+
+        Parameters
+        ----------
+        state : qtn.TensorNetwork
+            New trainable PEPS-like state.
+        chi : int | None, default=None
+            Boundary bond dimension for rebuilt boundaries. If omitted, uses
+            ``self.bdy.chi`` when available.
+        single_layer : bool, default=False
+            Forwarded to :class:`pepsy.boundary_states.BdyMPS`.
+        normalize_state : bool, default=True
+            If True, normalize new state immediately using rebuilt boundaries.
+
+        Returns
+        -------
+        complex | float | None
+            Old norm returned by :meth:`normalize` when ``normalize_state`` is
+            True, else None.
+        """
+        if self.state_target is None:
+            raise ValueError("state_target must be set before calling set_state().")
+
+        self._ensure_no_common_internal_indices(state, self.state_target)
+
+        self.state = state
+        self.Lx, self.Ly = self._infer_shape(self.state)
+
+        if chi is None:
+            chi = getattr(self.bdy, "chi", None)
+        if chi is None:
+            raise ValueError("Provide chi when current boundary chi is unavailable.")
+
+        # chi may be int or (int, int) for separate bdy/bdy_overlap dims.
+        bdy_new, bdy_overlap_new = self._build_boundary_pair(
+            self.state,
+            self.state_target,
+            chi=chi,
+            single_layer=single_layer,
+        )
+        self._set_boundary_pair(bdy_new, bdy_overlap_new)
+
+        if normalize_state:
+            return self.normalize(
+                n_iter=n_iter,
+                direction=direction,
+                max_separation=max_separation,
+                progress=progress,
+                track_boundary_fidelity=track_boundary_fidelity,
+            )
+        return None
+
+    def set_target(
+        self,
+        target,
+        *,
+        chi=None,
+        single_layer=False,
+    ):
+        """Replace target state and rebuild overlap boundary immediately.
+
+        Parameters
+        ----------
+        target : qtn.TensorNetwork
+            New target PEPS-like state.
+        chi : int | None, default=None
+            Bond dimension for rebuilt overlap boundary. If omitted, uses
+            ``self.bdy_overlap.chi`` when available.
+        single_layer : bool, default=False
+            Forwarded to :class:`pepsy.boundary_states.BdyMPS`.
+        """
+        self._ensure_no_common_internal_indices(self.state, target)
+        self.state_target = target
+
+        # Extract overlap chi from tuple or scalar.
+        _, chi_overlap = self._unpack_chi(chi)
+        if chi_overlap is None:
+            chi_overlap = getattr(self.bdy_overlap, "chi", None)
+        if chi_overlap is None:
+            _, chi_overlap = self._unpack_chi(getattr(self, "chi", None))
+        if chi_overlap is None:
+            raise ValueError("Provide chi when current boundary chi is unavailable.")
+
+        _, overlap_norm = build_bra_ket(ket=self.state_target, bra=self.state)
+        bdy_overlap_new = BdyMPS(
+            tn_double=overlap_norm,
+            chi=chi_overlap,
+            single_layer=single_layer,
+        )
+        self._set_boundary_pair(self.bdy, bdy_overlap_new)
+
+    def set_normalize_kwargs(self, **kwargs):
+        """Update stored defaults for :meth:`normalize`."""
+        if not hasattr(self, "normalize_kwargs"):
+            self.normalize_kwargs = {}
+        self.normalize_kwargs.update(self._pick_known_keys(kwargs, self._NORMALIZE_KEYS))
+        return self
+
+    def set_optimize_kwargs(self, **kwargs):
+        """Update stored defaults for :meth:`run`."""
+        if not hasattr(self, "optimize_kwargs"):
+            self.optimize_kwargs = {}
+        self.optimize_kwargs.update(self._pick_known_keys(kwargs, self._OPTIMIZE_KEYS))
+        return self
+
+    def normalize(self, state=None, **kwargs):
+        """Normalize PEPS in place and return the old norm estimate."""
+        state = self.state if state is None else state
+        opts = self._merge_opts(getattr(self, "normalize_kwargs", {}), kwargs)
+        contraction_opt = opts.get("contraction_opt", self.contraction_opt)
+        n_iter = opts.get("n_iter", 10)
+        direction = opts.get("direction", "y")
+        max_separation = opts.get("max_separation", 1)
+        progress = opts.get("progress", False)
+        track_boundary_fidelity = opts.get("track_boundary_fidelity", False)
+
+        if state is self.state:
+            return normalize(
+                self.state,
+                bdy=self.bdy,
+                contraction_opt=contraction_opt,
+                max_separation=max_separation,
+                n_iter=n_iter,
+                direction=direction,
+                progress=progress,
+                track_boundary_fidelity=track_boundary_fidelity,
+                fit_mode=self.fit_mode,
+            )
+
+        chi = getattr(self.bdy, "chi", None)
+        if chi is None:
+            raise ValueError("Provide chi via optimizer boundaries before normalizing external state.")
+        return normalize(
+            state,
+            chi=chi,
+            contraction_opt=contraction_opt,
+            max_separation=max_separation,
+            n_iter=n_iter,
+            direction=direction,
+            progress=progress,
+            track_boundary_fidelity=track_boundary_fidelity,
+            fit_mode=self.fit_mode,
+        )
+
+    def _normalize_state(self, env_n_iter=4):
+        # Start from user/default normalize kwargs, but keep sweep-time
+        # normalization deterministic for stability.
+        opts = self._pick_known_keys(
+            getattr(self, "normalize_kwargs", {}),
+            self._NORMALIZE_KEYS,
+            warn_unknown=False,
+        )
+        opts.setdefault("direction", "y")
+        opts.setdefault("max_separation", 1)
+        opts["n_iter"] = env_n_iter
+        opts["progress"] = False
+        opts["track_boundary_fidelity"] = False
+        return self.normalize(**opts)
+
+    def infidelity(
+        self,
+        *,
+        chi=None,
+        norm=None,
+        norm_target=1.0,
+        contraction_opt=None,
+        n_iter=5,
+        direction="y",
+        max_separation=1,
+        progress=False,
+        track_boundary_fidelity=False,
+        single_layer=False,
+    ):
+        """Compute boundary-based infidelity for current ``(state, state_target)``.
+
+        This reuses ``self.bdy`` and ``self.bdy_overlap``. If ``chi`` is
+        provided and larger than current boundary bond dimension, both boundary
+        objects are expanded before evaluation.
+
+        Returns
+        -------
+        float
+            Boundary infidelity value.
+        """
+        if self.state_target is None:
+            raise ValueError(
+                "state_target is required for infidelity(). "
+                "Set it in constructor or via set_target()."
+            )
+
+        self._ensure_boundary_chi(chi)
+
+        # boundary_infidelity() expects a scalar int chi; derive one from
+        # the (possibly tuple) value after boundaries are already expanded.
+        chi_bdy, chi_overlap = self._unpack_chi(chi)
+        if chi_bdy is not None:
+            chi_for_call = max(chi_bdy, chi_overlap)
+        elif norm_target is None:
+            chi_for_call = max(int(getattr(self.bdy, "chi", 1)), int(getattr(self.bdy_overlap, "chi", 1)))
+        else:
+            chi_for_call = None
+
+        result = boundary_infidelity(
+            self.state,
+            self.state_target,
+            chi=chi_for_call,
+            norm=norm,
+            norm_target=norm_target,
+            bdy=self.bdy,
+            bdy_overlap=self.bdy_overlap,
+            contraction_opt=self.contraction_opt if contraction_opt is None else contraction_opt,
+            n_iter=n_iter,
+            direction=direction,
+            max_separation=max_separation,
+            progress=progress,
+            track_boundary_fidelity=track_boundary_fidelity,
+            fit_mode=self.fit_mode,
+            single_layer=single_layer,
+        )
+
+        self._update_boundaries_from_result(result)
+
+        return float(result["infidelity"])
+
+    def _approx_infidelity_loss(self, *, env_n_iter=4):
+        """Return boundary-infidelity loss for lightweight global diagnostics."""
+        try:
+            result = self.infidelity(
+                chi=self.chi,
+                n_iter=env_n_iter,
+                direction=self.direction,
+                max_separation=self.max_separation,
+                single_layer=self.single_layer,
+                progress=False,
+                track_boundary_fidelity=False,
+            )
+        except (AttributeError, ValueError, TypeError):
+            return None
+        return float(result)
 
     @staticmethod
     def _to_float_history(history):
@@ -379,165 +791,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     "overlap": boundary_infidelity_overlap,
                 }
             )
-
-    @staticmethod
-    def _infer_shape(state):
-        """Infer ``(Lx, Ly)`` from ``X*`` and ``Y*`` tags."""
-        max_x = None
-        max_y = None
-        for tag in getattr(state, "tags", ()):
-            mx = _TAG_X.match(tag)
-            my = _TAG_Y.match(tag)
-            if mx:
-                max_x = max(int(mx.group(1)), -1 if max_x is None else max_x)
-            if my:
-                max_y = max(int(my.group(1)), -1 if max_y is None else max_y)
-        if max_x is None or max_y is None:
-            raise ValueError("state must include X*/Y* tags to infer lattice shape.")
-        return max_x + 1, max_y + 1
-
-    def _approx_infidelity_loss(self, *, env_n_iter=4):
-        """Return boundary-infidelity loss for lightweight global diagnostics."""
-        try:
-            result = self.infidelity(
-                n_iter=env_n_iter,
-                progress=False,
-                track_boundary_fidelity=False,
+            self.norm_trace.append(
+                {
+                    "bdy_norm": run_info.get("bdy_norm"),
+                    "bdy_overlap_norm": run_info.get("bdy_overlap_norm"),
+                }
             )
-        except (AttributeError, ValueError, TypeError):
-            return None
-        return float(result)
-
-    def _ensure_boundary_chi(self, chi):
-        """Retune both stored boundary objects to at least ``chi``."""
-        if chi is None:
-            return
-        if not isinstance(chi, int):
-            raise TypeError("chi must be an integer")
-        if chi < 1:
-            raise ValueError("chi must be >= 1")
-
-        bdy = getattr(self, "bdy", None)
-        if bdy is not None and getattr(bdy, "chi", 0) < chi:
-            bdy.expand_bnd(chi, inplace=True)
-
-        bdy_overlap = getattr(self, "bdy_overlap", None)
-        if bdy_overlap is not None and getattr(bdy_overlap, "chi", 0) < chi:
-            bdy_overlap.expand_bnd(chi, inplace=True)
-
-    def set_chi(
-        self,
-        chi,
-        *,
-        normalize_state=False,
-        n_iter=5,
-        direction="y",
-        max_separation=0,
-        progress=False,
-        track_boundary_fidelity=False,
-    ):
-        """Expand stored boundaries to ``chi`` and optionally renormalize state.
-
-        Parameters
-        ----------
-        chi : int
-            Target boundary bond dimension.
-        normalize_state : bool, default=False
-            If True, run :meth:`normalize` immediately after expanding
-            boundaries.
-
-        Returns
-        -------
-        SweepOptimizer
-            ``self`` for chaining.
-        """
-        self._ensure_boundary_chi(chi)
-        if normalize_state:
-            self.normalize(
-                n_iter=n_iter,
-                direction=direction,
-                max_separation=max_separation,
-                progress=progress,
-                track_boundary_fidelity=track_boundary_fidelity,
-            )
-        return self
-
-    def infidelity(
-        self,
-        *,
-        chi=None,
-        norm=None,
-        norm_target=1.0,
-        contraction_opt=None,
-        n_iter=5,
-        direction="y",
-        max_separation=0,
-        progress=False,
-        track_boundary_fidelity=False,
-        single_layer=False,
-    ):
-        """Compute boundary-based infidelity for current ``(state, state_target)``.
-
-        This reuses ``self.bdy`` and ``self.bdy_overlap``. If ``chi`` is
-        provided and larger than current boundary bond dimension, both boundary
-        objects are expanded before evaluation.
-
-        Returns
-        -------
-        float
-            Boundary infidelity value.
-        """
-        if self.state_target is None:
-            raise ValueError(
-                "state_target is required for infidelity(). "
-                "Set it in constructor or via set_target()."
-            )
-
-        self._ensure_boundary_chi(chi)
-
-        chi_for_call = chi
-        if chi_for_call is None and norm_target is None:
-            # infidelity() needs chi when it has to build bdy_target internally.
-            chi_for_call = max(int(getattr(self.bdy, "chi", 1)), int(getattr(self.bdy_overlap, "chi", 1)))
-
-        result = boundary_infidelity(
-            self.state,
-            self.state_target,
-            chi=chi_for_call,
-            norm=norm,
-            norm_target=norm_target,
-            bdy=self.bdy,
-            bdy_overlap=self.bdy_overlap,
-            contraction_opt=self.contraction_opt if contraction_opt is None else contraction_opt,
-            n_iter=n_iter,
-            direction=direction,
-            max_separation=max_separation,
-            progress=progress,
-            track_boundary_fidelity=track_boundary_fidelity,
-            fit_mode=self.fit_mode,
-            single_layer=single_layer,
-        )
-
-        if result.get("bdy") is not None:
-            self.bdy = result["bdy"]
-        if result.get("bdy_overlap") is not None:
-            self.bdy_overlap = result["bdy_overlap"]
-
-        return float(result["infidelity"])
-
-    def set_normalize_kwargs(self, **kwargs):
-        """Update stored defaults for :meth:`normalize`."""
-        if not hasattr(self, "normalize_kwargs"):
-            self.normalize_kwargs = {}
-        self.normalize_kwargs.update(self._pick_known_keys(kwargs, self._NORMALIZE_KEYS))
-        return self
-
-    def set_optimize_kwargs(self, **kwargs):
-        """Update stored defaults for :meth:`optimize_global`."""
-        if not hasattr(self, "optimize_kwargs"):
-            self.optimize_kwargs = {}
-        self.optimize_kwargs.update(self._pick_known_keys(kwargs, self._OPTIMIZE_KEYS))
-        return self
 
     def _axis_n(self, axis):
         if axis == "y":
@@ -565,12 +824,6 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     def _boundary_direction(axis, side):
         return f"{axis}_{side}"
 
-    def _prepare_current_double_layers(self):
-        self.state, norm_tn = build_bra_ket(ket=self.state, bra=None)
-        _, overlap_tn = build_bra_ket(ket=self.state_target, bra=self.state)
-
-        return norm_tn, overlap_tn
-
     def _boundary_keys_for_index(self, index, axis):
         n = self._axis_n(axis)
         axis_tag = self._axis_tag(axis)
@@ -579,6 +832,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         right_key = None if index == n - 1 else f"{axis_tag}{n - 2 - index}_r"
         left_key = f"{axis_tag}{index - 1}_l" if index > 0 else None
         return right_key, left_key
+
+    def _prepare_current_double_layers(self):
+        self.state, norm_tn = build_bra_ket(ket=self.state, bra=None)
+        _, overlap_tn = build_bra_ket(ket=self.state_target, bra=self.state)
+
+        return norm_tn, overlap_tn
 
     @staticmethod
     def _attach_boundaries(tn, boundaries, *, right_key=None, left_key=None):
@@ -601,6 +860,19 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             }
         )
         return bra
+
+    @staticmethod
+    def _resolve_user_solver(solver):
+        """Validate solver names and emit practical warnings."""
+        if not isinstance(solver, str):
+            raise TypeError("solver must be a string")
+        solver = solver.strip().lower()
+
+        if solver not in SUPPORTED_SOLVERS:
+            supported = ", ".join(SUPPORTED_SOLVERS)
+            raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
+
+        return solver
 
     def _estimate_slice_contraction_metrics(
         self,
@@ -627,6 +899,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             right_key=right_key,
             left_key=left_key,
         )
+        
+        if self.simplify:
+            norm_net0 = norm_net0.full_simplify(seq="R", split_method="svd", inplace=False)
+            overlap_net0 = overlap_net0.full_simplify(seq="R", split_method="svd", inplace=False)
+
         tree_norm = norm_net0.contraction_tree(self.contraction_opt)
         tree_overlap = overlap_net0.contraction_tree(self.contraction_opt)
         flops_norm = float(tree_norm.contraction_cost(log=10))
@@ -634,62 +911,34 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         flops_overlap = float(tree_overlap.contraction_cost(log=10))
         peak_overlap = float(tree_overlap.peak_size(log=2))
         return {
-            "flops_norm": flops_norm,
-            "flops_overlap": flops_overlap,
+            "flops": max(flops_norm, flops_overlap),
             "peak_norm": peak_norm,
             "peak_overlap": peak_overlap,
         }
-
-    @staticmethod
-    def _resolve_user_solver(solver):
-        """Validate canonical solver names and emit practical warnings."""
-        if not isinstance(solver, str):
-            raise TypeError("solver must be a string")
-        solver = solver.strip().lower()
-
-        alias_hints = {
-            "scipy": "scipy-lbfgs",
-            "scipy_lbfgs": "scipy-lbfgs",
-            "nlopt": "nlopt-lbfgs",
-            "nlopt_lbfgs": "nlopt-lbfgs",
-        }
-        if solver in alias_hints:
-            raise ValueError(
-                f"Unsupported solver alias {solver!r}; "
-                f"use canonical solver={alias_hints[solver]!r}."
-            )
-
-        if solver not in SUPPORTED_SOLVERS:
-            supported = ", ".join(SUPPORTED_SOLVERS)
-            raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
-
-        if solver == "nlopt-lbfgs":
-            warnings.warn(
-                "solver='nlopt-lbfgs' uses NLopt on CPU float64 parameter vectors. "
-                "Tune NLopt controls (algorithm/maxeval/ftol_rel/xtol_rel) for your problem.",
-                UserWarning,
-                stacklevel=3,
-            )
-        return solver
 
     def _optimize_packed_params(
         self,
         params_init,
         loss_fn,
         *,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
     ):
         opts = self._merge_solver_options(solver_options)
         n_steps = int(opts.pop("n_steps", 100))
-        return run_gradient_solver(
-            params_init,
-            loss_fn,
+        # Allow callers to request a per-step gradient progress bar by setting
+        # progress=True inside optimizer_options.  We pop it here so it never
+        # reaches the backend solver (which doesn't know about it).
+        grad_progress = bool(opts.pop("progress", False))
+        runner = GradientOptimizer(
             solver=solver,
-            solver_options=opts,
             n_steps=n_steps,
-            pbar=False,
+            options=opts,
+            progress=grad_progress,
+            verbose=False,
         )
+        result = runner.run(params_init=params_init, loss_fn=loss_fn)
+        return result.params, result.history
 
     def _apply_slice_update(self, index, params_opt, skeleton, axis):
         tn_opt = qtn.unpack(params_opt, skeleton)
@@ -699,158 +948,81 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             self.state[tag].modify(data=tn_opt[tag].data)
         return tn_opt
 
-    def _normalize_state(self, env_n_iter=4):
-        # Start from user/default normalize kwargs, but keep sweep-time
-        # normalization deterministic for stability.
-        opts = self._pick_known_keys(
-            getattr(self, "normalize_kwargs", {}),
-            self._NORMALIZE_KEYS,
-            warn_unknown=False,
+    def _optimize_axis_slice_with_current_env(
+        self,
+        index,
+        *,
+        axis,
+        solver="torch-adam",
+        solver_options=None,
+    ):
+        axis_tag = self._axis_tag(axis)
+        right_key, left_key = self._boundary_keys_for_index(index, axis)
+
+        slice_state = self.state.select([f"{axis_tag}{index}"], "any")
+        slice_target = self.state_target.select([f"{axis_tag}{index}"], "any")
+        params_init, skeleton = qtn.pack(slice_state)
+        metrics = self._estimate_slice_contraction_metrics(
+            params_init=params_init,
+            skeleton=skeleton,
+            slice_target=slice_target,
+            right_key=right_key,
+            left_key=left_key,
         )
-        opts.setdefault("direction", "y")
-        opts.setdefault("max_separation", 1)
-        opts["n_iter"] = env_n_iter
-        opts["progress"] = False
-        opts["track_boundary_fidelity"] = False
-        return self.normalize(**opts)
 
-    def normalize(self, state=None, **kwargs):
-        """Normalize PEPS in place and return the old norm estimate."""
-        state = self.state if state is None else state
-        opts = self._merge_opts(getattr(self, "normalize_kwargs", {}), kwargs)
-        contraction_opt = opts.get("contraction_opt", self.contraction_opt)
-        n_iter = opts.get("n_iter", 10)
-        direction = opts.get("direction", "y")
-        max_separation = opts.get("max_separation", 1)
-        progress = opts.get("progress", False)
-        track_boundary_fidelity = opts.get("track_boundary_fidelity", False)
+        def loss_fn(params_in):
+            local = qtn.unpack(params_in, skeleton)
+            bra_norm = self._bra_with_reindexed_inner(local)
+            bra_overlap = local.conj()
 
-        if state is self.state:
-            return normalize(
-                self.state,
-                bdy=self.bdy,
-                contraction_opt=contraction_opt,
-                max_separation=max_separation,
-                n_iter=n_iter,
-                direction=direction,
-                progress=progress,
-                track_boundary_fidelity=track_boundary_fidelity,
-                fit_mode=self.fit_mode,
+            norm_net = self._attach_boundaries(
+                local | bra_norm,
+                self.bdy.mps_b,
+                right_key=right_key,
+                left_key=left_key,
+            )
+            overlap_net = self._attach_boundaries(
+                slice_target | bra_overlap,
+                self.bdy_overlap.mps_b,
+                right_key=right_key,
+                left_key=left_key,
             )
 
-        chi = getattr(self.bdy, "chi", None)
-        if chi is None:
-            raise ValueError("Provide chi via optimizer boundaries before normalizing external state.")
-        return normalize(
-            state,
-            chi=chi,
-            contraction_opt=contraction_opt,
-            max_separation=max_separation,
-            n_iter=n_iter,
-            direction=direction,
-            progress=progress,
-            track_boundary_fidelity=track_boundary_fidelity,
-            fit_mode=self.fit_mode,
+            if self.simplify:
+                norm_net = norm_net.full_simplify(seq="R", split_method="svd", inplace=False)
+                overlap_net = overlap_net.full_simplify(seq="R", split_method="svd", inplace=False)
+
+
+            overlap_val = abs(overlap_net.contract(all, optimize=self.contraction_opt)) ** 2
+            norm_val = abs(norm_net.contract(all, optimize=self.contraction_opt))
+            fid = overlap_val / norm_val
+            #infid = ar.do("clip", 1.0 - fid, 0.0, None)
+            infid = 1. - fid
+            return infid
+
+        initial_loss = float(loss_fn(params_init))
+
+        params_opt, history = self._optimize_packed_params(
+            params_init,
+            loss_fn,
+            solver=solver,
+            solver_options=solver_options,
         )
-
-    def set_state(
-        self,
-        state,
-        *,
-        chi=None,
-        single_layer=False,
-        normalize_state=True,
-        n_iter=10,
-        direction="y",
-        max_separation=1,
-        progress=False,
-        track_boundary_fidelity=False,
-    ):
-        """Replace current state, rebuild boundaries, and optionally normalize.
-
-        Parameters
-        ----------
-        state : qtn.TensorNetwork
-            New trainable PEPS-like state.
-        chi : int | None, default=None
-            Boundary bond dimension for rebuilt boundaries. If omitted, uses
-            ``self.bdy.chi`` when available.
-        single_layer : bool, default=False
-            Forwarded to :class:`pepsy.boundary_states.BdyMPS`.
-        normalize_state : bool, default=True
-            If True, normalize new state immediately using rebuilt boundaries.
-
-        Returns
-        -------
-        complex | float | None
-            Old norm returned by :meth:`normalize` when ``normalize_state`` is
-            True, else None.
-        """
-        if self.state_target is None:
-            raise ValueError("state_target must be set before calling set_state().")
-
-        self._ensure_no_common_internal_indices(state, self.state_target)
-
-        self.state = state
-        self.Lx, self.Ly = self._infer_shape(self.state)
-
-        if chi is None:
-            chi = getattr(self.bdy, "chi", None)
-        if chi is None:
-            raise ValueError("Provide chi when current boundary chi is unavailable.")
-
-        self.bdy, self.bdy_overlap = self._build_boundary_pair(
-            self.state,
-            self.state_target,
-            chi=chi,
-            single_layer=single_layer,
-        )
-
-        if normalize_state:
-            return self.normalize(
-                n_iter=n_iter,
-                direction=direction,
-                max_separation=max_separation,
-                progress=progress,
-                track_boundary_fidelity=track_boundary_fidelity,
-            )
-        return None
-
-    def set_target(
-        self,
-        target,
-        *,
-        chi=None,
-        single_layer=False,
-    ):
-        """Replace target state and rebuild overlap boundary immediately.
-
-        Parameters
-        ----------
-        target : qtn.TensorNetwork
-            New target PEPS-like state.
-        chi : int | None, default=None
-            Bond dimension for rebuilt overlap boundary. If omitted, uses
-            ``self.bdy_overlap.chi`` when available.
-        single_layer : bool, default=False
-            Forwarded to :class:`pepsy.boundary_states.BdyMPS`.
-        """
-        self._ensure_no_common_internal_indices(self.state, target)
-        self.state_target = target
-
-        if chi is None:
-            chi = getattr(self.bdy_overlap, "chi", None)
-        if chi is None:
-            chi = getattr(self.bdy, "chi", None)
-        if chi is None:
-            raise ValueError("Provide chi when current boundary chi is unavailable.")
-
-        _, overlap_norm = build_bra_ket(ket=self.state_target, bra=self.state)
-        self.bdy_overlap = BdyMPS(
-            tn_double=overlap_norm,
-            chi=chi,
-            single_layer=single_layer,
-        )
+        history_values = self._to_float_history(history)
+        final_loss = history_values[-1] if history_values else initial_loss
+        params_opt = {
+            k: v.detach().clone() if hasattr(v, "detach") else v
+            for k, v in params_opt.items()
+        }
+        self._apply_slice_update(index, params_opt, skeleton, axis)
+        return {
+            "axis": axis,
+            "index": index,
+            "loss_initial": initial_loss,
+            "loss_final": final_loss,
+            "history": history_values,
+            **metrics,
+        }
 
     def _make_comp_pair(self, norm_tn, overlap_tn):
         comp_norm = CompBdy(norm_tn, self.bdy.mps_b, contraction_opt=self.contraction_opt, fit_mode=self.fit_mode)
@@ -913,80 +1085,6 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 norm_fidelity = float(complex(comp_norm.fidel[-1]).real)
         return {"norm": norm_fidelity, "overlap": overlap_fidelity}
 
-    def _optimize_axis_slice_with_current_env(
-        self,
-        index,
-        *,
-        axis,
-        solver="adam",
-        solver_options=None,
-    ):
-        axis_tag = self._axis_tag(axis)
-        right_key, left_key = self._boundary_keys_for_index(index, axis)
-
-        slice_state = self.state.select([f"{axis_tag}{index}"], "any")
-        slice_target = self.state_target.select([f"{axis_tag}{index}"], "any")
-        params_init, skeleton = qtn.pack(slice_state)
-        metrics = self._estimate_slice_contraction_metrics(
-            params_init=params_init,
-            skeleton=skeleton,
-            slice_target=slice_target,
-            right_key=right_key,
-            left_key=left_key,
-        )
-
-        def loss_fn(params_in):
-            local = qtn.unpack(params_in, skeleton)
-            bra_norm = self._bra_with_reindexed_inner(local)
-            bra_overlap = local.conj()
-
-            norm_net = self._attach_boundaries(
-                local | bra_norm,
-                self.bdy.mps_b,
-                right_key=right_key,
-                left_key=left_key,
-            )
-            overlap_net = self._attach_boundaries(
-                slice_target | bra_overlap,
-                self.bdy_overlap.mps_b,
-                right_key=right_key,
-                left_key=left_key,
-            )
-
-            overlap_val = abs(overlap_net.contract(all, optimize=self.contraction_opt)) ** 2
-            norm_val = abs(norm_net.contract(all, optimize=self.contraction_opt))
-            return 1 - overlap_val / norm_val
-
-        initial_loss = float(loss_fn(params_init))
-
-        params_opt, history = self._optimize_packed_params(
-            params_init,
-            loss_fn,
-            solver=solver,
-            solver_options=solver_options,
-        )
-        history_values = self._to_float_history(history)
-        final_loss_raw = loss_fn(params_opt)
-
-        if hasattr(final_loss_raw, "detach"):
-            final_loss_raw = final_loss_raw.detach()
-        if hasattr(final_loss_raw, "cpu"):
-            final_loss_raw = final_loss_raw.cpu()
-        final_loss = float(final_loss_raw)
-        params_opt = {
-            k: v.detach().clone() if hasattr(v, "detach") else v
-            for k, v in params_opt.items()
-        }
-        self._apply_slice_update(index, params_opt, skeleton, axis)
-        return {
-            "axis": axis,
-            "index": index,
-            "loss_initial": initial_loss,
-            "loss_final": final_loss,
-            "history": history_values,
-            **metrics,
-        }
-
     def _run_axis_half_sweep(  # pylint: disable=too-many-arguments,too-many-locals
         self,
         indices,
@@ -994,7 +1092,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         update_side,
         sweep_name,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
         env_n_iter=4,
         run_callback=None,
@@ -1044,6 +1142,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             run_info["time_optimize"] = t_opt
             run_info["boundary_infidelity_norm"] = boundary_infidelity_norm
             run_info["boundary_infidelity_overlap"] = boundary_infidelity_overlap
+            try:
+                run_info["bdy_norm"] = float(abs(self.bdy.norm))
+            except Exception:
+                run_info["bdy_norm"] = None
+            try:
+                run_info["bdy_overlap_norm"] = float(abs(self.bdy_overlap.norm))
+            except Exception:
+                run_info["bdy_overlap_norm"] = None
             runs.append(run_info)
             if run_callback is not None:
                 run_callback(run_info)
@@ -1055,9 +1161,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         axis,
         *,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
-        env_n_iter=4,
+        env_n_iter=5,
         run_callback=None,
         track_boundary_fidelity=False,
         renormalize=True,
@@ -1070,9 +1176,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Axis to sweep.
         n_round_trips : int, default=1
             Number of backward+forward round-trips after the initial forward pass.
-        solver : str, default="scipy-lbfgs"
-            Gradient solver name. Supported values include ``adam``, ``lbfgs``,
-            ``scipy-lbfgs``, and ``nlopt-lbfgs``.
+        solver : str, default="scipy"
+            Gradient solver name. Supported values: ``torch-adam``, ``scipy``,
+            and ``nlopt``.
         solver_options : dict | None, default=None
             Extra backend-specific options for the selected ``solver``.
         env_n_iter : int, default=4
@@ -1098,7 +1204,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if renormalize:
             old_norm = self._normalize_state(env_n_iter)
-            self.norm_trace.append(float(abs(complex(old_norm))))
+            self.norm_trace.append({"state_norm": float(abs(complex(old_norm)))})
 
         self._refresh_right_boundaries_once(axis, env_n_iter=env_n_iter)
 
@@ -1141,14 +1247,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return all_runs
 
-    def optimize_global(
+    def _run_global_sweeps(
         self,
         *,
         axes=("y", "x"),
         n_cycles=1,
         n_round_trips=1,
         chi=None,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
         env_n_iter=4,
         progress=True,
@@ -1162,9 +1268,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         chi : int | None, default=None
             If provided, expand stored boundaries to this bond dimension before
             running sweeps.
-        solver : str, default="scipy-lbfgs"
-            Gradient solver name. Supported values include ``adam``, ``lbfgs``,
-            ``scipy-lbfgs``, and ``nlopt-lbfgs``.
+        solver : str, default="scipy"
+            Gradient solver name. Supported values: ``torch-adam``, ``scipy``,
+            and ``nlopt``.
         solver_options : dict | None, default=None
             Extra backend-specific options for the selected ``solver``.
         env_n_iter : int, default=4
@@ -1180,7 +1286,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         if self.state_target is None:
             raise ValueError(
-                "state_target is required for optimize_global(). "
+                "state_target is required for run(). "
                 "Set it in constructor or via set_target()."
             )
         self._ensure_boundary_chi(chi)
@@ -1199,12 +1305,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if progress:
             global_progress = tqdm(
                 total=total_steps,
-                desc="bdy_dmrg:",
+                desc="optimize",
                 leave=True,
-                position=0,
-                bar_format="{l_bar}{bar:30}{r_bar}",
-                colour="#6c5ce7",
-                disable=not progress,
+                colour="gray",
+                dynamic_ncols=True,
             )
 
         for cyc in range(n_cycles):
@@ -1213,29 +1317,37 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     if global_progress is None:
                         return
                     global_progress.update(1)
-                    postfix = {}
                     local_loss = run_info.get("loss_final")
+                    head = "loss=nan"
                     if local_loss is not None:
-                        postfix["loss"] = f"{float(local_loss):.6f}"
-                    t_bdy = run_info.get("time_boundary")
+                        cur = float(local_loss)
+                        # Scientific notation keeps very small losses readable.
+                        head = f"loss={cur:.6e}"
                     t_opt = run_info.get("time_optimize")
-                    if t_bdy is not None:
-                        postfix["t_bdy"] = f"{float(t_bdy):.2f}s"
-                    if t_opt is not None:
-                        postfix["t_opt"] = f"{float(t_opt):.2f}s"
-                    flops_norm = run_info.get("flops_norm")
-                    flops_overlap = run_info.get("flops_overlap")
-                    if flops_norm is not None:
-                        postfix["flops_norm"] = f"{float(flops_norm):.2f}"
-                    if flops_overlap is not None:
-                        postfix["flops_overlap"] = f"{float(flops_overlap):.2f}"
+                    t_bdy = run_info.get("time_boundary")
+                    parts = []
+                    if t_opt is not None or t_bdy is not None:
+                        t_opt_s = "na" if t_opt is None else f"{float(t_opt):.2f}"
+                        t_bdy_s = "na" if t_bdy is None else f"{float(t_bdy):.2f}"
+                        parts.append(f"t={t_opt_s}/{t_bdy_s}s")
+                    flops = run_info.get("flops")
+                    peak_norm = run_info.get("peak_norm")
+                    peak_overlap = run_info.get("peak_overlap")
+                    peak_vals = [v for v in (peak_norm, peak_overlap) if v is not None]
+                    peak2 = None if not peak_vals else float(max(peak_vals))
+                    if flops is not None or peak2 is not None:
+                        flops_s = "na" if flops is None else f"{float(flops):.2f}"
+                        peak2_s = "na" if peak2 is None else f"{peak2:.2f}"
+                        # cost=(log10 flops, log2 peak)
+                        parts.append(f"cost=({flops_s},{peak2_s})")
                     axis_name = run_info.get("axis")
                     sweep_name = run_info.get("sweep")
                     index = run_info.get("index")
                     if axis_name is not None and sweep_name is not None and index is not None:
                         short = "fwd" if sweep_name == "forward" else "bwd"
-                        postfix["slice"] = f"{axis_name}_{short}_{index}"
-                    global_progress.set_postfix(postfix)
+                        parts.append(f"slice={axis_name}_{short}_{index}")
+                    global_progress.set_description_str(head)
+                    global_progress.set_postfix_str(" | ".join(parts))
 
                 axis_runs = self.optimize_axis(
                     axis,
@@ -1259,9 +1371,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if renormalize:
             old_norm = self._normalize_state(env_n_iter=env_n_iter)
-            self.norm_trace.append(float(abs(complex(old_norm))))
+            self.norm_trace.append({"state_norm": float(abs(complex(old_norm)))})
 
         loss_after = self._approx_infidelity_loss(env_n_iter=env_n_iter)
+
+        bdy_norm = float(abs(self.bdy.norm))
+        bdy_overlap_norm = float(abs(self.bdy_overlap.norm))
+
         return {
             "runs": all_runs,
             "loss_before": loss_before,
@@ -1272,6 +1388,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "inner_loss_traces": [list(v) for v in self.inner_loss_traces],
             "norm_trace": list(self.norm_trace),
             "fidels": list(self.fidels),
+            "bdy_norm": bdy_norm,
+            "bdy_overlap_norm": bdy_overlap_norm,
         }
 
     def run(
@@ -1283,7 +1401,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         renormalize=None,
         track_boundary_fidelity=None,
     ):
-        """High-level wrapper around :meth:`optimize_global`.
+        """High-level global sweep entrypoint.
 
         Parameters
         ----------
@@ -1308,12 +1426,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if track_boundary_fidelity is not None:
             opts["track_boundary_fidelity"] = track_boundary_fidelity
 
-        return self.optimize_global(
+        return self._run_global_sweeps(
             axes=opts.get("axes", ("y", "x")),
             n_cycles=opts.get("n_cycles", 1),
             n_round_trips=opts.get("n_round_trips", 1),
             chi=opts.get("chi"),
-            solver=opts.get("optimizer", "scipy-lbfgs"),
+            solver=opts.get("optimizer", "scipy"),
             solver_options=opts.get("optimizer_options"),
             env_n_iter=opts.get("env_n_iter", 4),
             progress=opts.get("progress", True),
