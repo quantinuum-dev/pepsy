@@ -1,6 +1,7 @@
 """Tests for optimizer/fidelity helper wiring and defaults."""
 
 import pepsy.core as core
+import pytest
 import quimb.tensor as qtn
 
 
@@ -89,6 +90,25 @@ def test_tn_fidelity_uses_supplied_optimizer_without_build(monkeypatch):
     assert called["build"] == 0
 
 
+def test_tn_fidelity_accepts_contraction_opt_without_build(monkeypatch):
+    """Passing ``contraction_opt`` should bypass default optimizer construction."""
+    called = {"build": 0}
+
+    def fake_build_optimizer(**kwargs):  # pylint: disable=unused-argument
+        called["build"] += 1
+        return "auto-hq"
+
+    monkeypatch.setattr(core, "build_optimizer", fake_build_optimizer)
+
+    psi = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=16)
+    psi_fix = psi.copy()
+
+    fidelity = core.tn_fidelity(psi, psi_fix, contraction_opt="auto-hq")
+
+    assert abs(fidelity - 1.0) < 1e-12
+    assert called["build"] == 0
+
+
 def test_default_backend_setters_roundtrip():
     """Default backend setters/getters should round-trip callables."""
     array_backend = lambda x: x  # noqa: E731
@@ -122,3 +142,83 @@ def test_bdymps_uses_default_array_backend_when_not_provided():
         assert bdy.array_backend is array_backend
     finally:
         core.reset_default_backends()
+
+
+def test_contract_hypercompressed_tn_builds_copt_when_missing(monkeypatch):
+    """Missing copt should be built from chi via build_compressed_optimizer."""
+    captured = {}
+
+    def fake_build_compressed_optimizer(**kwargs):
+        captured.update(kwargs)
+        return "dummy-copt"
+
+    monkeypatch.setattr(core, "build_compressed_optimizer", fake_build_compressed_optimizer)
+
+    class DummyTN:  # pylint: disable=too-few-public-methods
+        def copy(self):
+            return DummyTN()
+
+        def full_simplify_(self, **kwargs):
+            self.simplify_kwargs = kwargs
+
+        def contraction_tree(self, copt):
+            self.copt = copt
+            return "dummy-tree"
+
+        def contract_compressed_(self, **kwargs):
+            self.contract_kwargs = kwargs
+
+    tn = DummyTN()
+    out = core.contract_hypercompressed_tn(
+        tn,
+        copt=None,
+        max_bond=9,
+        chi=7,
+        progbar=True,
+    )
+
+    assert out is not tn
+    assert captured["chi"] == 7
+    assert captured["progbar"] is True
+    assert out.copt == "dummy-copt"
+    assert out.contract_kwargs["max_bond"] == 9
+
+
+def test_contract_hypercompressed_tn_requires_chi_if_copt_missing():
+    """If copt is absent, chi must be provided so core can build one."""
+    tn = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=7)
+    with pytest.raises(ValueError, match="provide `chi`"):
+        _ = core.contract_hypercompressed_tn(tn, copt=None, max_bond=None, chi=None)
+
+
+def test_contract_hypercompressed_tn_inplace_mutates_input(monkeypatch):
+    """inplace=True should operate on the original TensorNetwork object."""
+    monkeypatch.setattr(core, "build_compressed_optimizer", lambda **kwargs: "dummy-copt")
+
+    class DummyTN:  # pylint: disable=too-few-public-methods
+        def copy(self):
+            self.copy_called = True
+            return DummyTN()
+
+        def full_simplify_(self, **kwargs):
+            self.simplify_kwargs = kwargs
+
+        def contraction_tree(self, copt):
+            _ = copt
+            return "dummy-tree"
+
+        def contract_compressed_(self, **kwargs):
+            self.contract_kwargs = kwargs
+
+    tn = DummyTN()
+    out = core.contract_hypercompressed_tn(
+        tn,
+        copt=None,
+        max_bond=5,
+        chi=5,
+        inplace=True,
+    )
+
+    assert out is tn
+    assert not hasattr(tn, "copy_called")
+    assert tn.contract_kwargs["max_bond"] == 5

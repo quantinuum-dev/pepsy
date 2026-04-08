@@ -24,7 +24,9 @@ __all__ = [
     "reset_default_backends",
     "build_optimizer",
     "build_compressed_optimizer",
+    "contract_hypercompressed_tn",
     "tn_fidelity",
+    "tn_norm",
     "tns_align",
     "ps_to_peps",
 ]
@@ -178,41 +180,72 @@ def register_torch_linalg(mode="complex"):
 
 
 def build_optimizer(
-    progbar=True,
-    alpha=64,
-    target_size=2**34,
-    subtree_size=12,
-    max_time="rate:1e7",
-    max_repeats=2**8,
-    parallel=True,
-    optlib="cmaes",
-    directory=None,
-    hash_method="b",
+    progbar: bool = False,
+    alpha: int = 64,
+    max_time="rate:7e8", 
+    max_repeats: int = 128,
+    parallel="auto",
+    optlib: str = "cmaes",
+    directory=False,
+    hash_method: str = "b",
+    overwrite=False,
+    on_trial_error: str = "warn",
+    reconf_opts: dict | None = None,
+    slicing_reconf_opts: dict | None = None,
 ):
-    """Build and return a reusable cotengra contraction optimizer.
+    """Build a reusable cotengra contraction optimizer.
 
     Parameters
     ----------
-    directory : None, True, or str, optional
-        Passed directly to cotengra. ``None`` disables caching; ``True``
-        auto-generates a directory in the current working directory.
+    progbar : bool, optional
+        Whether to show optimizer progress.
+    alpha : int, optional
+        Weight for the combo objective.
+    max_time : str | float | None, optional
+        Search budget for the hyper-optimizer.
+    max_repeats : int, optional
+        Maximum number of optimization trials.
+    parallel : bool | str, optional
+        Parallel search setting passed to cotengra.
+    optlib : str, optional
+        Backend optimizer library.
+    directory : None | bool | str, optional
+        Cache directory for reusable contraction trees.
+    hash_method : str, optional
+        Hashing method for reusable contraction lookup.
+    overwrite : bool | str, optional
+        Cache overwrite behavior.
+    on_trial_error : str, optional
+        How to handle individual trial failures.
+    reconf_opts : dict | None, optional
+        Options for subtree reconfiguration.
+    slicing_reconf_opts : dict | None, optional
+        Options for interleaved slicing and reconfiguration.
     """
-    opt = ctg.ReusableHyperOptimizer(
+    # cotengra expects directory to be str, True, or None — not False.
+    if directory is False:
+        directory = None
+
+    kwargs = dict(
         minimize=f"combo-{int(alpha)}",
-        slicing_opts={"target_size": 2**40},
-        slicing_reconf_opts={"target_size": target_size},
-        reconf_opts={"subtree_size": subtree_size},
+        max_time=max_time,
         max_repeats=max_repeats,
         parallel=parallel,
         optlib=optlib,
-        max_time=max_time,
-        hash_method=hash_method,
         directory=directory,
+        hash_method=hash_method,
+        overwrite=overwrite,
         progbar=progbar,
-        on_trial_error="ignore",
+        on_trial_error=on_trial_error,
     )
-    return opt
 
+    if reconf_opts is not None:
+        kwargs["reconf_opts"] = reconf_opts
+
+    if slicing_reconf_opts is not None:
+        kwargs["slicing_reconf_opts"] = slicing_reconf_opts
+
+    return ctg.ReusableHyperOptimizer(**kwargs)
 
 def build_compressed_optimizer(
     progbar=True,
@@ -240,7 +273,111 @@ def build_compressed_optimizer(
     return copt
 
 
-def tn_fidelity(psi, psi_fix, *, opt: Any | None = None):
+def contract_hypercompressed_tn(
+    tn,
+    copt=None,
+    max_bond=None,
+    *,
+    chi=None,
+    output_inds=None,
+    tree_gauge_distance=4,
+    progbar=False,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+    inplace=False,
+):
+    """Contract a generic tensor network with compressed hyper-optimization.
+
+    Parameters
+    ----------
+    tn : qtn.TensorNetwork
+        Tensor network to compress-contract.
+    copt : object, optional
+        Reusable compressed cotengra optimizer. If ``None``, one is built
+        with :func:`build_compressed_optimizer` using ``chi``.
+    max_bond : int | None, optional
+        Maximum retained bond dimension during compressed contraction.
+        If ``None``, defaults to ``chi``.
+    chi : int | None, optional
+        Bond dimension used to build ``copt`` when ``copt`` is ``None``.
+        Required if both ``copt`` and ``max_bond`` are missing.
+    output_inds : sequence[str] | None, optional
+        Output indices to preserve during contraction.
+    tree_gauge_distance : int, optional
+        Gauge distance passed to ``contract_compressed_``.
+    progbar : bool, optional
+        Whether to show progress during compressed contraction.
+    cutoff : float, optional
+        Truncation cutoff passed to ``contract_compressed_``.
+    equalize_norms : bool | float, optional
+        Norm equalization option passed to ``contract_compressed_``.
+    inplace : bool, optional
+        If ``True``, mutate ``tn`` directly. Otherwise, contract a copy.
+
+    Returns
+    -------
+    qtn.TensorNetwork
+        The compressed-contracted tensor network.
+    """
+    if max_bond is None:
+        max_bond = chi
+
+    if copt is None:
+        if chi is None:
+            raise ValueError(
+                "When `copt` is not provided, please provide `chi` "
+                "to build a compressed optimizer."
+            )
+        copt = build_compressed_optimizer(progbar=progbar, chi=chi)
+
+    if max_bond is None:
+        raise ValueError("Please provide `max_bond` (or `chi`) for compressed contraction.")
+
+    tn_out = tn if inplace else tn.copy()
+    tn_out.full_simplify_(seq="R", split_method="svd", inplace=True)
+    tree = tn_out.contraction_tree(copt)
+    tn_out.contract_compressed_(
+        optimize=tree,
+        output_inds=output_inds,
+        max_bond=max_bond,
+        tree_gauge_distance=tree_gauge_distance,
+        equalize_norms=equalize_norms,
+        cutoff=cutoff,
+        progbar=progbar,
+    )
+    return tn_out
+
+
+def tn_norm(
+    psi,
+    *,
+    contraction_opt: Any | None = None,
+):
+    """Compute the norm of a tensor network state.
+
+    Parameters
+    ----------
+    psi : qtn.TensorNetwork
+        State whose norm is computed.
+    contraction_opt : object | None, optional
+        Contraction optimizer. If ``None``, a default optimizer is built.
+
+    Returns
+    -------
+    float
+        ``|<psi|psi>|``.
+    """
+    if contraction_opt is None:
+        contraction_opt = build_optimizer(progbar=False)
+    return abs((psi.H & psi).contract(all, optimize=contraction_opt))
+
+
+def tn_fidelity(
+    psi,
+    psi_fix,
+    *,
+    contraction_opt: Any | None = None,
+):
     """Compute normalized overlap fidelity.
 
     Parameters
@@ -249,16 +386,15 @@ def tn_fidelity(psi, psi_fix, *, opt: Any | None = None):
         Trial state.
     psi_fix : qtn.TensorNetwork
         Reference state.
-    opt : object | None, optional
-        Contraction optimizer. If ``None``, builds a default optimizer with
-        ``progbar=False`` for backward compatibility.
+    contraction_opt : object | None, optional
+        Contraction optimizer. If ``None``, a default optimizer is built.
     """
-    if opt is None:
-        opt = build_optimizer(progbar=False)
+    if contraction_opt is None:
+        contraction_opt = build_optimizer(progbar=False)
 
-    val_0 = abs((psi.H & psi).contract(all, optimize=opt))
-    val_1 = abs((psi.H & psi_fix).contract(all, optimize=opt))
-    val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=opt))
+    val_0 = abs((psi.H & psi).contract(all, optimize=contraction_opt))
+    val_1 = abs((psi.H & psi_fix).contract(all, optimize=contraction_opt))
+    val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=contraction_opt))
 
     val_1 = val_1**2
     fidelity = complex(val_1 / (val_0 * val_ref)).real
@@ -334,7 +470,7 @@ def tns_align(p, pepo):
 
 
 
-def ps_to_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0):
+def ps_to_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False):
     """Create a bond-dimension-1 product-state PEPS parameterized by ``theta``.
 
     Each site tensor is set so the physical vector is
@@ -350,6 +486,8 @@ def ps_to_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0):
         Tensor dtype passed to numpy/quimb.
     theta : float, optional
         Product-state angle controlling local amplitudes.
+    cyclic : bool, optional
+        If True, add periodic bonds (bond dimension 1) via :func:`add_cycle`.
 
     Returns
     -------
@@ -372,4 +510,6 @@ def ps_to_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0):
             data[0, 0, 0, 0, :] = local_vec
             tensor.modify(data=data)
     peps.astype_(dtype)
+    if cyclic:
+        peps = add_cycle(peps, bond_dim=1)
     return peps

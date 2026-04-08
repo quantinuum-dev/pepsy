@@ -4,52 +4,91 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
-__all__ = ["SUPPORTED_SOLVERS", "optimize_packed_params"]
+__all__ = [
+    "SUPPORTED_SOLVERS",
+    "GradSolverResult",
+    "GradientOptimizer",
+    "optimize_packed_params",
+]
 
 SUPPORTED_SOLVERS = (
+    # canonical names used by SweepOptimizer
+    "scipy-lbfgs",
+    "nlopt-lbfgs",
+    # torch-based solvers
     "adam",
     "adamw",
     "adagrad",
     "rmsprop",
     "sgd",
     "lbfgs",
-    "scipy-lbfgs",
-    "nlopt-lbfgs",
+    # legacy / internal names kept for backward compat
+    "torch-adam",
+    "scipy",
+    "nlopt",
 )
 
 _TORCH_SOLVERS = {
-    "adam": torch.optim.Adam,
-    "adamw": torch.optim.AdamW,
-    "adagrad": torch.optim.Adagrad,
-    "rmsprop": torch.optim.RMSprop,
-    "sgd": torch.optim.SGD,
-    "lbfgs": torch.optim.LBFGS,
+    "torch-adam": torch.optim.Adam,
+    "adam":       torch.optim.Adam,
+    "adamw":      torch.optim.AdamW,
+    "adagrad":    torch.optim.Adagrad,
+    "rmsprop":    torch.optim.RMSprop,
+    "sgd":        torch.optim.SGD,
+    "lbfgs":      torch.optim.LBFGS,
 }
+
+# Map canonical public names -> internal routing key
+_SOLVER_ALIAS: dict[str, str] = {
+    "scipy-lbfgs": "scipy",
+    "nlopt-lbfgs": "nlopt",
+}
+
+
+@dataclass(frozen=True)
+class GradSolverResult:
+    """Structured optimization result returned by :class:`GradientOptimizer`.
+
+    Attributes
+    ----------
+    params : dict[str, torch.Tensor]
+        Optimized parameter tensors.
+    history : list[float]
+        Per-step loss history reported by the selected backend.
+    solver : str
+        Canonical solver name actually used.
+    n_steps : int
+        Number of reported history entries.
+    best_loss : float
+        Best value encountered in ``history``.
+    final_loss : float
+        Last reported value in ``history``.
+    """
+
+    params: dict[str, torch.Tensor]
+    history: list[float]
+    solver: str
+    n_steps: int
+    best_loss: float
+    final_loss: float
 
 def _normalize_solver_name(solver: str) -> str:
     if not isinstance(solver, str):
         raise TypeError("solver must be a string")
     normalized = solver.strip().lower()
-    alias_hints = {
-        "scipy": "scipy-lbfgs",
-        "scipy_lbfgs": "scipy-lbfgs",
-        "nlopt": "nlopt-lbfgs",
-        "nlopt_lbfgs": "nlopt-lbfgs",
-    }
-    if normalized in alias_hints:
-        raise ValueError(
-            f"Unsupported solver alias {solver!r}; use canonical solver={alias_hints[normalized]!r}."
-        )
-    if normalized not in SUPPORTED_SOLVERS:
+    # Resolve public aliases to internal routing keys
+    internal = _SOLVER_ALIAS.get(normalized, normalized)
+    if internal not in SUPPORTED_SOLVERS and normalized not in SUPPORTED_SOLVERS:
         supported = ", ".join(SUPPORTED_SOLVERS)
         raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
-    return normalized
+    return internal
 
 
 def _as_trainable_tensor(value: Any) -> torch.Tensor:
@@ -59,7 +98,9 @@ def _as_trainable_tensor(value: Any) -> torch.Tensor:
         tensor = torch.as_tensor(value)
     if not (tensor.is_floating_point() or tensor.is_complex()):
         tensor = tensor.to(dtype=torch.float64)
-    return tensor.requires_grad_(True)
+    # Ensure contiguous memory layout — torch.optim.LBFGS calls .view(-1) on
+    # gradients which fails on non-contiguous (e.g. strided complex) tensors.
+    return tensor.contiguous().requires_grad_(True)
 
 
 def _scalar_real_loss(loss: Any, imag_tol: float = 1e-10) -> torch.Tensor:
@@ -359,11 +400,11 @@ def _step_torch_scheduler(scheduler, kind: str, loss_value: float) -> None:
 def _iter_steps(
     n_steps: int,
     *,
-    show_opt_progress: bool,
+    progress: bool,
     opt_desc: str | None,
 ):
     iterator = range(n_steps)
-    if not show_opt_progress:
+    if not progress:
         return iterator
     return tqdm(iterator, total=n_steps, desc=opt_desc or "opt", leave=False, colour="CYAN")
 
@@ -377,12 +418,15 @@ def _run_torch_solver(
     solver_options: dict[str, Any],
     n_steps: int,
     log_every: int,
-    show_opt_progress: bool,
+    progress: bool,
     opt_desc: str | None,
     progress_callback: Callable[[int, float], None] | None,
 ):
     params_run = dict(items)
+    specs = _build_param_specs(items)
     options = dict(solver_options)
+    # maxeval is an nlopt concept; discard it so it doesn't override n_steps for torch solvers.
+    options.pop("maxeval", None)
     controls = _pop_common_controls(
         options,
         default_steps=n_steps,
@@ -432,6 +476,26 @@ def _run_torch_solver(
 
     optimizer_cls = _TORCH_SOLVERS[solver_name]
     optimizer = optimizer_cls(list(params_run.values()), lr=lr, **options)
+
+    if isinstance(optimizer, torch.optim.LBFGS):
+        # torch.optim.LBFGS._gather_flat_grad uses .view(-1) which fails for
+        # complex tensors (stride incompatibility). Patch it to use .reshape(-1).
+        def _patched_gather_flat_grad(self_lbfgs):
+            views = []
+            for group in self_lbfgs.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        view = p.new(p.numel()).zero_()
+                    elif p.grad.is_sparse:
+                        view = p.grad.to_dense().reshape(-1)
+                    else:
+                        view = p.grad.reshape(-1)
+                    if torch.is_complex(view):
+                        view = torch.view_as_real(view).reshape(-1)
+                    views.append(view)
+            return torch.cat(views, 0)
+        import types
+        optimizer._gather_flat_grad = types.MethodType(_patched_gather_flat_grad, optimizer)
     scheduler, scheduler_kind = _build_torch_scheduler(
         optimizer,
         scheduler_options,
@@ -440,10 +504,10 @@ def _run_torch_solver(
 
     history: list[float] = []
     best_loss = float("inf")
-    best_state = _clone_param_state(params_run)
+    best_vector = _flatten_params_real_numpy(specs)
     step_iter = _iter_steps(
         controls["max_steps"],
-        show_opt_progress=show_opt_progress,
+        progress=progress,
         opt_desc=opt_desc,
     )
     bad_consecutive = 0
@@ -457,8 +521,8 @@ def _run_torch_solver(
             loss_value = controls["penalty_on_bad"]
             history.append(loss_value)
             _step_torch_scheduler(scheduler, scheduler_kind, float("inf"))
-            if show_opt_progress:
-                step_iter.set_postfix({"loss": loss_value})
+            if progress:
+                step_iter.set_postfix({"||g||": "nan", "loss": "nan", "best": f"{best_loss:.4g}"})
             step_num = step + 1
             if progress_callback is not None and (step_num % log_every == 0):
                 progress_callback(step_num, loss_value)
@@ -471,7 +535,7 @@ def _run_torch_solver(
         history.append(loss_value)
         if loss_value + controls["min_improve"] < best_loss:
             best_loss = loss_value
-            best_state = _clone_param_state(params_run)
+            best_vector = _flatten_params_real_numpy(specs)
             last_improve_step = step + 1
 
         if max_step_norm is not None:
@@ -482,7 +546,24 @@ def _run_torch_solver(
             torch.nn.utils.clip_grad_value_(list(params_run.values()), float(grad_clip_value))
         if grad_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(list(params_run.values()), float(grad_clip_norm))
-        optimizer.step()
+        if isinstance(optimizer, torch.optim.LBFGS):
+            # LBFGS calls _gather_flat_grad() using the current grads BEFORE calling
+            # the closure, so fix contiguity here as well as inside the closure.
+            for _p in params_run.values():
+                if isinstance(_p, torch.Tensor) and _p.grad is not None and not _p.grad.is_contiguous():
+                    _p.grad.data = _p.grad.data.contiguous()
+            def _closure():
+                optimizer.zero_grad(set_to_none=True)
+                _l = _scalar_real_loss(loss_fn(params_run))
+                _l.backward()
+                # Also fix inside closure for subsequent line-search evaluations.
+                for _p in params_run.values():
+                    if isinstance(_p, torch.Tensor) and _p.grad is not None and not _p.grad.is_contiguous():
+                        _p.grad.data = _p.grad.data.contiguous()
+                return _l
+            optimizer.step(_closure)
+        else:
+            optimizer.step()
 
         if max_step_norm is not None:
             with torch.no_grad():
@@ -496,8 +577,17 @@ def _run_torch_solver(
 
         _step_torch_scheduler(scheduler, scheduler_kind, loss_value)
 
-        if show_opt_progress:
-            step_iter.set_postfix({"loss": loss_value})
+        if progress:
+            _gnorm = float(
+                sum(
+                    # Use .norm() on the raw (possibly complex) grad — handles real/complex
+                    # uniformly without discarding imaginary parts via float cast.
+                    float(spec["tensor"].grad.detach().norm().real) ** 2
+                    for spec in specs
+                    if spec["tensor"].grad is not None
+                ) ** 0.5
+            )
+            step_iter.set_postfix({"||g||": f"{_gnorm:.2e}", "loss": f"{loss_value:.4g}", "best": f"{best_loss:.4g}"})
         step_num = step + 1
         if progress_callback is not None and (step_num % log_every == 0):
             progress_callback(step_num, loss_value)
@@ -508,7 +598,7 @@ def _run_torch_solver(
     with torch.no_grad():
         final_loss = float(_scalar_real_loss(loss_fn(params_run)).detach().cpu())
     if final_loss + controls["min_improve"] < best_loss:
-        best_state = _clone_param_state(params_run)
+        best_vector = _flatten_params_real_numpy(specs)
         best_loss = final_loss
     if history:
         history[-1] = final_loss
@@ -516,166 +606,7 @@ def _run_torch_solver(
         progress_callback(max(1, len(history)), final_loss)
 
     if controls["restore_best"]:
-        _restore_param_state(params_run, best_state)
-    return params_run, history
-
-
-def _run_torch_lbfgs(
-    items: list[tuple[str, torch.Tensor]],
-    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
-    *,
-    lr: float,
-    solver_options: dict[str, Any],
-    n_steps: int,
-    log_every: int,
-    show_opt_progress: bool,
-    opt_desc: str | None,
-    progress_callback: Callable[[int, float], None] | None,
-):
-    params_run = dict(items)
-    options = dict(solver_options)
-    controls = _pop_common_controls(
-        options,
-        default_steps=n_steps,
-        default_bad_max=5,
-        default_penalty=1e20,
-    )
-    for key in (
-        "method",
-        "algorithm",
-        "optimizer",
-        "ftol",
-        "ftol_rel",
-        "gtol",
-        "xtol_rel",
-        "ftol_abs",
-        "xtol_abs",
-        "stopval",
-        "bounds",
-        "lower_bounds",
-        "upper_bounds",
-        "ema_alpha",
-        "assume_nonnegative",
-        "best_neg_tol",
-    ):
-        options.pop(key, None)
-    grad_clip_norm = options.pop("clip_grad_norm", options.pop("grad_clip_norm", None))
-    grad_clip_value = options.pop("grad_clip_value", None)
-    max_step_norm = options.pop("max_step_norm", options.pop("max_step", None))
-    if grad_clip_norm is not None and float(grad_clip_norm) <= 0.0:
-        raise ValueError("clip_grad_norm must be > 0 when set")
-    if max_step_norm is not None and float(max_step_norm) <= 0.0:
-        raise ValueError("max_step_norm must be > 0 when set")
-
-    scheduler_options = {}
-    for key in (
-        "scheduler",
-        "eta_min",
-        "step_size",
-        "gamma",
-        "plateau_patience",
-        "plateau_factor",
-        "plateau_threshold",
-        "plateau_cooldown",
-    ):
-        if key in options:
-            scheduler_options[key] = options.pop(key)
-
-    # Treat external step count as user-facing iteration count.
-    options.setdefault("max_iter", 1)
-    optimizer = torch.optim.LBFGS(list(params_run.values()), lr=lr, **options)
-    scheduler, scheduler_kind = _build_torch_scheduler(
-        optimizer,
-        scheduler_options,
-        max_steps=controls["max_steps"],
-    )
-
-    history: list[float] = []
-    best_loss = float("inf")
-    best_state = _clone_param_state(params_run)
-    step_iter = _iter_steps(
-        controls["max_steps"],
-        show_opt_progress=show_opt_progress,
-        opt_desc=opt_desc,
-    )
-    bad_consecutive = 0
-    last_improve_step = 0
-
-    def closure():
-        optimizer.zero_grad(set_to_none=True)
-        loss_val = _scalar_real_loss(loss_fn(params_run))
-        if not torch.isfinite(loss_val):
-            return loss_val
-        loss_val.backward()
-        if grad_clip_value is not None:
-            torch.nn.utils.clip_grad_value_(list(params_run.values()), float(grad_clip_value))
-        if grad_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(list(params_run.values()), float(grad_clip_norm))
-        return loss_val
-
-    for step in step_iter:
-        with torch.no_grad():
-            loss_before = _scalar_real_loss(loss_fn(params_run))
-        if not torch.isfinite(loss_before):
-            bad_consecutive += 1
-            loss_value = controls["penalty_on_bad"]
-            history.append(loss_value)
-            _step_torch_scheduler(scheduler, scheduler_kind, float("inf"))
-            if show_opt_progress:
-                step_iter.set_postfix({"loss": loss_value})
-            step_num = step + 1
-            if progress_callback is not None and (step_num % log_every == 0):
-                progress_callback(step_num, loss_value)
-            if (bad_consecutive >= controls["bad_max"]) and (step_num >= controls["min_steps"]):
-                break
-            continue
-
-        bad_consecutive = 0
-        loss_value = float(loss_before.detach().cpu())
-        history.append(loss_value)
-        if loss_value + controls["min_improve"] < best_loss:
-            best_loss = loss_value
-            best_state = _clone_param_state(params_run)
-            last_improve_step = step + 1
-
-        if max_step_norm is not None:
-            prev_flat = torch.nn.utils.parameters_to_vector(list(params_run.values())).detach().clone()
-
-        optimizer.step(closure)
-
-        if max_step_norm is not None:
-            with torch.no_grad():
-                cur_flat = torch.nn.utils.parameters_to_vector(list(params_run.values()))
-                delta = cur_flat - prev_flat
-                delta_norm = float(torch.linalg.vector_norm(delta).detach().cpu().item())
-                step_max = float(max_step_norm)
-                if delta_norm > step_max:
-                    clipped = prev_flat + delta * (step_max / (delta_norm + 1e-12))
-                    torch.nn.utils.vector_to_parameters(clipped, list(params_run.values()))
-
-        _step_torch_scheduler(scheduler, scheduler_kind, loss_value)
-
-        if show_opt_progress:
-            step_iter.set_postfix({"loss": loss_value})
-        step_num = step + 1
-        if progress_callback is not None and (step_num % log_every == 0):
-            progress_callback(step_num, loss_value)
-        if controls["patience"] is not None and step_num >= controls["min_steps"]:
-            if (step_num - last_improve_step) >= controls["patience"]:
-                break
-
-    with torch.no_grad():
-        final_loss = float(_scalar_real_loss(loss_fn(params_run)).detach().cpu())
-    if final_loss + controls["min_improve"] < best_loss:
-        best_state = _clone_param_state(params_run)
-        best_loss = final_loss
-    if history:
-        history[-1] = final_loss
-    if progress_callback is not None:
-        progress_callback(max(1, len(history)), final_loss)
-
-    if controls["restore_best"]:
-        _restore_param_state(params_run, best_state)
+        _assign_flat_params(best_vector, specs)
     return params_run, history
 
 
@@ -686,7 +617,7 @@ def _run_scipy_lbfgs(
     solver_options: dict[str, Any],
     n_steps: int,
     log_every: int,
-    show_opt_progress: bool,
+    progress: bool,
     opt_desc: str | None,
     progress_callback: Callable[[int, float], None] | None,
 ):
@@ -694,7 +625,7 @@ def _run_scipy_lbfgs(
         from scipy import optimize as sp_opt  # pylint: disable=import-outside-toplevel
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
-            "solver='scipy-lbfgs' requires SciPy. Install with: pip install scipy"
+            "solver='scipy' requires SciPy. Install with: pip install scipy"
         ) from exc
 
     params_run = dict(items)
@@ -704,6 +635,8 @@ def _run_scipy_lbfgs(
         return params_run, []
 
     options = dict(solver_options)
+    # maxeval is an nlopt concept; discard it so it doesn't override n_steps for scipy.
+    options.pop("maxeval", None)
     controls = _pop_common_controls(
         options,
         default_steps=n_steps,
@@ -728,9 +661,18 @@ def _run_scipy_lbfgs(
     else:
         gtol = _as_nonnegative_float(options.pop("xtol_rel", 1e-9), key="xtol_rel")
 
-    options.setdefault("maxiter", controls["max_steps"])
+    # SciPy line-search control alias (mostly useful for L-BFGS-B/TNC).
+    if "line_search_max_steps" in options:
+        options["maxls"] = int(options.pop("line_search_max_steps"))
+    if "maxls" in options and int(options["maxls"]) <= 0:
+        raise ValueError("maxls must be >= 1")
+
+    # n_steps is the canonical iteration limit for scipy (= maxiter).
+    options["maxiter"] = n_steps
     options.setdefault("ftol", ftol)
     options.setdefault("gtol", gtol)
+    if method in {"L-BFGS-B", "TNC"}:
+        options.setdefault("maxls", 40)
 
     if bounds is None and (lower is not None or upper is not None):
         n_vars = int(x0.size)
@@ -749,15 +691,16 @@ def _run_scipy_lbfgs(
     step_counter = {"value": 0}
     state = {
         "last_loss": None,
+        "last_gnorm": float("nan"),
         "best_loss": float("inf"),
         "best_x": None,
         "last_improve_step": 0,
         "bad_consecutive": 0,
     }
     pbar = None
-    if show_opt_progress:
+    if progress:
         pbar = tqdm(
-            total=controls["max_steps"],
+            total=n_steps,
             desc=opt_desc or "opt",
             leave=False,
             colour="CYAN",
@@ -774,6 +717,8 @@ def _run_scipy_lbfgs(
             grad_value = np.zeros_like(np.asarray(x, dtype=np.float64))
         else:
             state["bad_consecutive"] = 0
+            if pbar is not None:
+                state["last_gnorm"] = float(np.linalg.norm(grad_value))
             if loss_value + controls["min_improve"] < state["best_loss"]:
                 state["best_loss"] = loss_value
                 state["best_x"] = np.array(x, dtype=np.float64, copy=True)
@@ -790,7 +735,11 @@ def _run_scipy_lbfgs(
         history.append(float(loss_value))
         if pbar is not None:
             pbar.update(1)
-            pbar.set_postfix({"loss": float(loss_value)})
+            pbar.set_postfix({
+                "||g||": f"{state['last_gnorm']:.2e}",
+                "loss": f"{loss_value:.4g}",
+                "best": f"{state['best_loss']:.4g}",
+            })
         if progress_callback is not None and (
             (step_num % log_every == 0) or (step_num == controls["max_steps"])
         ):
@@ -842,7 +791,7 @@ def _run_nlopt_lbfgs(
     solver_options: dict[str, Any],
     n_steps: int,
     log_every: int,
-    show_opt_progress: bool,
+    progress: bool,
     opt_desc: str | None,
     progress_callback: Callable[[int, float], None] | None,
 ):
@@ -850,7 +799,7 @@ def _run_nlopt_lbfgs(
         import nlopt  # pylint: disable=import-outside-toplevel
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise ImportError(
-            "solver='nlopt-lbfgs' requires NLopt. Install with: pip install nlopt"
+            "solver='nlopt' requires NLopt. Install with: pip install nlopt"
         ) from exc
 
     params_run = dict(items)
@@ -870,7 +819,7 @@ def _run_nlopt_lbfgs(
         lbfgs_aliases = {"L_BFGS", "LBFGS", "LD_LBFGS", "L_BFGS_B"}
         if normalized not in lbfgs_aliases:
             raise ValueError(
-                "solver='nlopt-lbfgs' only accepts L-BFGS-B style method aliases."
+                "solver='nlopt' only accepts L-BFGS-B style method aliases."
             )
 
     controls = _pop_common_controls(
@@ -944,6 +893,7 @@ def _run_nlopt_lbfgs(
         "best_sel": float("inf"),
         "best_x_sel": None,
         "ema": None,
+        "last_gnorm": float("nan"),
         "last_improve_eval": 0,
         "evals": 0,
         "bad_consecutive": 0,
@@ -951,8 +901,19 @@ def _run_nlopt_lbfgs(
         "stopped_reason": "maxeval",
     }
     pbar = None
-    if show_opt_progress:
-        pbar = tqdm(total=maxeval, desc=opt_desc or "opt", leave=False, colour="CYAN")
+    # pbar shows n_steps displayed units; each unit covers maxeval/n_steps evaluations
+    pbar_step_size = max(1, maxeval // max(1, n_steps))
+    if progress:
+        pbar = tqdm(total=n_steps, desc=opt_desc or "opt", leave=False, colour="CYAN")
+
+    def _pbar_advance(evals):
+        """Advance pbar proportionally: n_steps units over maxeval total evaluations."""
+        if pbar is None:
+            return
+        new_pos = min(n_steps, evals // pbar_step_size)
+        advance = new_pos - pbar.n
+        if advance > 0:
+            pbar.update(advance)
 
     def objective(x, grad):
         eval_state["evals"] += 1
@@ -965,9 +926,8 @@ def _run_nlopt_lbfgs(
             eval_state["stopped_reason"] = "nan_x"
             opt.force_stop()
             if pbar is not None:
-                if pbar.n < pbar.total:
-                    pbar.update(1)
-                pbar.set_postfix({"loss": controls["penalty_on_bad"]})
+                _pbar_advance(eval_state["evals"])
+                pbar.set_postfix({"||g||": "nan", "loss": "nan", "best": f"{eval_state['best_true']:.4g}"})
             return controls["penalty_on_bad"]
 
         if max_step is not None and eval_state["prev_x"] is not None:
@@ -1000,6 +960,8 @@ def _run_nlopt_lbfgs(
                 clip = float(grad_clip_norm)
                 if grad_norm > clip:
                     grad_value = grad_value * (clip / (grad_norm + 1e-12))
+            if pbar is not None:
+                eval_state["last_gnorm"] = float(np.linalg.norm(grad_value))
             if grad.size > 0:
                 grad[:] = grad_value
 
@@ -1030,9 +992,12 @@ def _run_nlopt_lbfgs(
         history.append(float(loss_value))
         step_num = len(history)
         if pbar is not None:
-            if pbar.n < pbar.total:
-                pbar.update(1)
-            pbar.set_postfix({"loss": float(loss_value)})
+            _pbar_advance(eval_state["evals"])
+            pbar.set_postfix({
+                "||g||": f"{eval_state.get('last_gnorm', float('nan')):.2e}",
+                "loss": f"{loss_value:.4g}",
+                "best": f"{eval_state['best_true']:.4g}",
+            })
         if progress_callback is not None and ((step_num % log_every == 0) or (step_num == maxeval)):
             progress_callback(step_num, float(loss_value))
         return float(loss_value)
@@ -1072,28 +1037,19 @@ def _run_nlopt_lbfgs(
     return params_run, history
 
 
-def optimize_packed_params(
+def _optimize_dispatch(
     params_init: Mapping[str, Any],
     loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
     *,
-    solver: str = "adam",
-    solver_options: Mapping[str, Any] | None = None,
-    n_steps: int = 100,
-    log_every: int = 20,
-    pbar: bool = False,
-    opt_desc: str | None = None,
-    progress_callback: Callable[[int, float], None] | None = None,
+    solver: str,
+    solver_options: Mapping[str, Any] | None,
+    n_steps: int,
+    log_every: int,
+    progress: bool,
+    opt_desc: str | None,
+    progress_callback: Callable[[int, float], None] | None,
 ):
-    """Optimize packed tensor params with a selected gradient solver.
-
-    Parameters
-    ----------
-    solver_options : dict | None
-        Backend-specific options. Common keys:
-
-        - ``lr`` (float, default 1e-2): learning rate for torch solvers.
-        - ``patience``, ``min_steps``, ``restore_best``, …
-    """
+    """Core backend dispatch used by :class:`GradientOptimizer`."""
     if n_steps <= 0:
         raise ValueError("n_steps must be >= 1")
     if log_every <= 0:
@@ -1110,20 +1066,6 @@ def optimize_packed_params(
 
     solver_name = _normalize_solver_name(solver)
     items = _param_ordered_items(params_init)
-
-    if solver_name == "lbfgs":
-        return _run_torch_lbfgs(
-            items,
-            loss_fn,
-            lr=lr,
-            solver_options=options,
-            n_steps=n_steps,
-            log_every=log_every,
-            show_opt_progress=pbar,
-            opt_desc=opt_desc,
-            progress_callback=progress_callback,
-        )
-
     if solver_name in _TORCH_SOLVERS:
         return _run_torch_solver(
             items,
@@ -1133,33 +1075,213 @@ def optimize_packed_params(
             solver_options=options,
             n_steps=n_steps,
             log_every=log_every,
-            show_opt_progress=pbar,
+            progress=progress,
             opt_desc=opt_desc,
             progress_callback=progress_callback,
         )
 
-    if solver_name == "scipy-lbfgs":
+    if solver_name == "scipy":
         return _run_scipy_lbfgs(
             items,
             loss_fn,
             solver_options=options,
             n_steps=n_steps,
             log_every=log_every,
-            show_opt_progress=pbar,
+            progress=progress,
             opt_desc=opt_desc,
             progress_callback=progress_callback,
         )
 
-    if solver_name == "nlopt-lbfgs":
+    if solver_name == "nlopt":
         return _run_nlopt_lbfgs(
             items,
             loss_fn,
             solver_options=options,
             n_steps=n_steps,
             log_every=log_every,
-            show_opt_progress=pbar,
+            progress=progress,
             opt_desc=opt_desc,
             progress_callback=progress_callback,
         )
 
     raise RuntimeError(f"Unhandled solver path for {solver_name!r}")
+
+
+def optimize_packed_params(
+    params_init: Mapping[str, Any],
+    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+    *,
+    solver: str = "scipy-lbfgs",
+    solver_options: Mapping[str, Any] | None = None,
+    n_steps: int = 100,
+    progress: bool = False,
+    log_every: int = 1,
+    opt_desc: str | None = None,
+    progress_callback: Callable[[int, float], None] | None = None,
+) -> tuple[dict[str, torch.Tensor], list[float]]:
+    """Optimize a dict of packed parameters against a differentiable loss.
+
+    This is the primary entry point used by :class:`pepsy.SweepOptimizer`.
+    Parameters may live on any device (CPU or CUDA). scipy-lbfgs and
+    nlopt-lbfgs solvers flatten params to CPU float64 per evaluation and
+    reconstruct them on their original device after each step; torch-based
+    solvers keep params on-device throughout.
+
+    Parameters
+    ----------
+    params_init : dict[str, Any]
+        Initial parameter values. Torch tensors are kept on their current
+        device; other array types are converted with ``torch.as_tensor``.
+    loss_fn : callable
+        ``loss_fn(params) -> scalar tensor``.  Must be differentiable when
+        using gradient-based solvers.
+    solver : str, default="scipy-lbfgs"
+        Solver name. Supported values: ``"scipy-lbfgs"``, ``"nlopt-lbfgs"``,
+        ``"adam"``, ``"adamw"``, ``"adagrad"``, ``"rmsprop"``, ``"sgd"``,
+        ``"lbfgs"``.
+    solver_options : dict | None, default=None
+        Backend-specific options forwarded to the selected solver.
+    n_steps : int, default=100
+        Maximum number of optimisation steps / function evaluations.
+    progress : bool, default=False
+        Show a per-step progress bar with ``||g||``, ``loss``, and ``best``.
+    log_every : int, default=1
+        Frequency (in steps) for ``progress_callback`` calls.
+    opt_desc : str | None, default=None
+        Description string for progress bars.
+    progress_callback : callable | None, default=None
+        ``callback(step, loss_value)`` called every ``log_every`` steps.
+
+    Returns
+    -------
+    tuple[dict[str, torch.Tensor], list[float]]
+        ``(params_opt, history)`` where ``params_opt`` maps parameter names
+        to optimised tensors on their original devices (detached, no grad),
+        and ``history`` is the per-step loss trace.
+    """
+    params_opt, history = _optimize_dispatch(
+        params_init,
+        loss_fn,
+        solver=solver,
+        solver_options=solver_options,
+        n_steps=n_steps,
+        log_every=log_every,
+        progress=progress,
+        opt_desc=opt_desc,
+        progress_callback=progress_callback,
+    )
+    # Detach returned tensors — optimisation is done, grad tracking not needed.
+    params_out = {
+        name: t.detach() if isinstance(t, torch.Tensor) else t
+        for name, t in params_opt.items()
+    }
+    return params_out, history
+
+
+class GradientOptimizer:
+    """Simple class wrapper for gradient optimization over packed params.
+
+    The main entry point is :meth:`run`, which accepts ``params_init``,
+    ``loss_fn`` and optional ``loss_kwargs``.
+    """
+
+    def __init__(
+        self,
+        *,
+        solver: str = "torch-adam",
+        options: Mapping[str, Any] | None = None,
+        n_steps: int = 100,
+        log_every: int = 20,
+        progress: bool = False,
+        desc: str | None = None,
+        verbose: bool = False,
+    ):
+        self.solver = solver
+        self.options = {} if options is None else dict(options)
+        self.n_steps = int(n_steps)
+        self.log_every = int(log_every)
+        self.progress = bool(progress)
+        self.desc = desc
+        self.verbose = bool(verbose)
+
+    @staticmethod
+    def _bind_loss(
+        loss_fn: Callable[..., torch.Tensor],
+        loss_kwargs: Mapping[str, Any] | None,
+    ) -> Callable[[dict[str, torch.Tensor]], torch.Tensor]:
+        if loss_kwargs is None:
+            return loss_fn
+        if not isinstance(loss_kwargs, Mapping):
+            raise TypeError("loss_kwargs must be a mapping or None")
+        kwargs = dict(loss_kwargs)
+
+        def _wrapped(params):
+            return loss_fn(params, **kwargs)
+
+        return _wrapped
+
+    def run(
+        self,
+        *,
+        params_init: Mapping[str, Any],
+        loss_fn: Callable[..., torch.Tensor],
+        loss_kwargs: Mapping[str, Any] | None = None,
+        solver: str | None = None,
+        options: Mapping[str, Any] | None = None,
+        n_steps: int | None = None,
+        log_every: int | None = None,
+        progress: bool | None = None,
+        desc: str | None = None,
+        progress_callback: Callable[[int, float], None] | None = None,
+    ) -> GradSolverResult:
+        """Run optimization and return a structured result."""
+        solver_use = self.solver if solver is None else solver
+        options_use = dict(self.options)
+        if options is not None:
+            options_use.update(dict(options))
+        n_steps_use = self.n_steps if n_steps is None else int(n_steps)
+        log_every_use = self.log_every if log_every is None else int(log_every)
+        progress_use = self.progress if progress is None else bool(progress)
+        desc_use = self.desc if desc is None else desc
+
+        bound_loss = self._bind_loss(loss_fn, loss_kwargs)
+        solver_name = _normalize_solver_name(solver_use)
+
+        if self.verbose:
+            print(
+                f"[GradientOptimizer] solver={solver_name} "
+                f"n_steps={n_steps_use} progress={progress_use}"
+            )
+
+        params_opt, history = _optimize_dispatch(
+            params_init,
+            bound_loss,
+            solver=solver_use,
+            solver_options=options_use,
+            n_steps=n_steps_use,
+            log_every=log_every_use,
+            progress=progress_use,
+            opt_desc=desc_use,
+            progress_callback=progress_callback,
+        )
+        if history:
+            final_loss = float(history[-1])
+            best_loss = float(min(history))
+        else:
+            final_loss = float("nan")
+            best_loss = float("nan")
+
+        if self.verbose:
+            print(
+                f"[GradientOptimizer] done solver={solver_name} "
+                f"steps={len(history)} final={final_loss:.6g} best={best_loss:.6g}"
+            )
+
+        return GradSolverResult(
+            params=params_opt,
+            history=list(history),
+            solver=solver_name,
+            n_steps=len(history),
+            best_loss=best_loss,
+            final_loss=final_loss,
+        )

@@ -5,7 +5,15 @@ import pytest
 import quimb.tensor as qtn
 
 from pepsy import ps_to_peps
-from pepsy.gate import apply_2dtn_, gate_2d, gen_long_range_swap_path, pauli, x, y, z
+from pepsy.gate import (
+    apply_2d_gate,
+    apply_2d_gates,
+    gen_long_range_swap_path,
+    pauli,
+    x,
+    y,
+    z,
+)
 
 
 def test_gen_long_range_swap_path_adjacent():
@@ -20,6 +28,27 @@ def test_gen_long_range_swap_path_xy_order():
     assert path == [((0, 0), (1, 0)), ((1, 0), (1, 1))]
 
 
+def test_gen_long_range_swap_path_cyclic_adjacent_wrap():
+    """Cyclic routing should treat edge-wrapped neighbors as adjacent."""
+    path = list(gen_long_range_swap_path((0, 0), (3, 0), cyclic=True, Lx=4, Ly=4))
+    assert path == [((0, 0), (3, 0))]
+
+
+def test_gen_long_range_swap_path_cyclic_uses_shorter_wrap_route():
+    """Cyclic routing should choose shortest wrapped displacement."""
+    path = list(
+        gen_long_range_swap_path(
+            (0, 0),
+            (4, 0),
+            sequence="x_then_y",
+            cyclic=True,
+            Lx=6,
+            Ly=6,
+        )
+    )
+    assert path == [((0, 0), (5, 0)), ((5, 0), (4, 0))]
+
+
 def test_ps_to_peps_builds_product_state():
     """ps_to_peps should build a valid bond-dimension-1 PEPS."""
     peps = ps_to_peps(2, 3, dtype="complex128", theta=0.123)
@@ -32,7 +61,7 @@ def test_apply_2dtn_one_site_inplace():
     """One-site gate application should modify in place and return same object."""
     peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
-    out = apply_2dtn_(peps, gate, ((0, 0),), cutoff=1e-12)
+    out = apply_2d_gate(peps, gate, ((0, 0),), cutoff=1e-12)
     assert out is peps
 
 
@@ -40,7 +69,7 @@ def test_apply_2dtn_two_site_nearest_inplace():
     """Two-site nearest-neighbor gate should run and return same object."""
     peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
-    out = apply_2dtn_(peps, gate, ((0, 0), (0, 1)), cutoff=1e-12)
+    out = apply_2d_gate(peps, gate, ((0, 0), (0, 1)), cutoff=1e-12)
     assert out is peps
 
 
@@ -49,7 +78,7 @@ def test_apply_2dtn_invalid_where_raises():
     peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.complex128)
     with pytest.raises(ValueError, match="where must contain one or two"):
-        apply_2dtn_(peps, gate, ((0, 0), (0, 1), (1, 1)))
+        apply_2d_gate(peps, gate, ((0, 0), (0, 1), (1, 1)))
 
 
 def test_apply_2dtn_rejects_duplicate_two_site_coordinates():
@@ -57,11 +86,11 @@ def test_apply_2dtn_rejects_duplicate_two_site_coordinates():
     peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
     with pytest.raises(ValueError, match="distinct coordinates"):
-        apply_2dtn_(peps, gate, ((0, 0), (0, 0)))
+        apply_2d_gate(peps, gate, ((0, 0), (0, 0)))
 
 
 def test_apply_gates_accepts_mixed_site_and_edge_specs():
-    """gate_2d should accept one-site (i,j) and two-site edge tuples."""
+    """apply_2d_gates should accept one-site (i,j) and two-site edge tuples."""
     peps = ps_to_peps(2, 2, dtype="complex128")
     rx = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
     rzz = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
@@ -74,7 +103,7 @@ def test_apply_gates_accepts_mixed_site_and_edge_specs():
     for site in sites:
         gates.append((site, rx))
 
-    out = gate_2d(
+    out = apply_2d_gates(
         peps,
         gates,
         bra=False,
@@ -91,7 +120,7 @@ def test_apply_gates_invalid_where_raises():
     peps = ps_to_peps(2, 2, dtype="complex128")
     gate = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.complex128)
     with pytest.raises(ValueError, match="Invalid where specification"):
-        gate_2d(peps, [(((0, 0), (1, 1), (1, 0)), gate)])
+        apply_2d_gates(peps, [(((0, 0), (1, 1), (1, 0)), gate)])
 
 
 def test_apply_gates_runs_final_compress_when_chi_given():
@@ -105,7 +134,7 @@ def test_apply_gates_runs_final_compress_when_chi_given():
             return self
 
     dummy = _DummyPeps()
-    out = gate_2d(dummy, [], chi=2, chi_cutoff=1.0e-12)
+    out = apply_2d_gates(dummy, [], chi=2, chi_cutoff=1.0e-12)
     assert out is dummy
     assert dummy.called == (2, 1.0e-12)
 
@@ -114,7 +143,7 @@ def test_apply_gates_invalid_chi_raises():
     """Non-positive chi should fail with ValueError."""
     peps = ps_to_peps(2, 2, dtype="complex128")
     with pytest.raises(ValueError, match="positive integer"):
-        gate_2d(peps, [], chi=0)
+        apply_2d_gates(peps, [], chi=0)
 
 
 def test_apply_2dtn_infers_swap_backend_from_gate(monkeypatch):
@@ -129,13 +158,30 @@ def test_apply_2dtn_infers_swap_backend_from_gate(monkeypatch):
 
     peps = object()
     gate = torch.eye(4, dtype=torch.complex128).reshape(2, 2, 2, 2)
-    apply_2dtn_(peps, gate, ((0, 0), (0, 2)), sequence="x_then_y")
+    apply_2d_gate(peps, gate, ((0, 0), (0, 2)), sequence="x_then_y")
 
     assert len(calls) == 3
     assert isinstance(calls[0], torch.Tensor)
     assert isinstance(calls[2], torch.Tensor)
     assert calls[0].dtype == gate.dtype
     assert calls[2].dtype == gate.dtype
+
+
+def test_apply_2d_gate_cyclic_wrap_avoids_swap_chain(monkeypatch):
+    """Cyclic nearest-wrap neighbors should be applied directly with no SWAP chain."""
+    calls = []
+
+    def _fake_gate_inds(peps, gate, inds, **kwargs):
+        calls.append(tuple(inds))
+
+    monkeypatch.setattr(qtn, "tensor_network_gate_inds", _fake_gate_inds)
+
+    peps = object()
+    gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
+    apply_2d_gate(peps, gate, ((0, 0), (3, 0)), cyclic=True, Lx=4, Ly=4)
+
+    assert len(calls) == 1
+    assert calls[0] == ("k0,0", "k3,0")
 
 
 def test_pauli_matches_axis_helpers():

@@ -105,7 +105,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         # Contraction path optimizer spec.
         self.contraction_opt = contraction_opt
-        self.opt = self.contraction_opt
 
         # cutoffs and underlying backend
         self.cutoffs = cutoffs
@@ -241,7 +240,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         psi = self.p
         L = self.L
-        opt = self.opt
+        contraction_opt = self.contraction_opt
         site_tag_id = self.site_tag_id
 
         for _ in range(n_iter):
@@ -256,11 +255,12 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 tn_ = psi_h | self.tn
 
                 # Contract and normalize
-                f = tn_.contract(all, optimize=opt)
+                f = tn_.contract(all, optimize=contraction_opt)
                 f = f.transpose(*psi[site].inds)
 
-                norm_f = (f.H & f).contract(all) ** 0.5
-                self.local_norm_trace.append(complex(norm_f).real)
+                # norm_f is never applied (f.data used as-is); keep only for diagnostics if needed
+                # norm_f = (f.H & f).contract(all) ** 0.5
+                # self.local_norm_trace.append(complex(norm_f).real)
 
                 # Update tensor data
                 psi[site].modify(data=f.data)
@@ -277,7 +277,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         the contraction of the current site block and everything to its right.
         """
         L = self.L
-        opt = self.opt
+        contraction_opt = self.contraction_opt
         site_tag_id = self.site_tag_id
 
         # iterate from rightmost to leftmost
@@ -291,11 +291,11 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 t = psi_block
 
             if i == L - 1:
-                env_right[site_tag_id.format(i)] = t.contract(all, optimize=opt)
+                env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
             else:
                 # tie to previously computed right environment
                 t |= env_right[site_tag_id.format(i + 1)]
-                env_right[site_tag_id.format(i)] = t.contract(all, optimize=opt)
+                env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
 
     def _right_range(self, psi, env_right, start, stop):
         """Build right environments over a restricted ``[start, stop]`` window.
@@ -304,7 +304,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         available right boundaries at interval edges.
         """
         L = self.L
-        opt = self.opt
+        contraction_opt = self.contraction_opt
         site_tag_id = self.site_tag_id
 
         indx = None
@@ -321,7 +321,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 t = psi_block
 
             if i == L - 1:
-                env_right[site_tag_id.format(i)] = t.contract(all, optimize=opt)
+                env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
             else:
                 if count == 0:
                     indx = psi.bond(stop + 1, stop)
@@ -330,19 +330,19 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 # tie to previously computed right environment
                 if env_right[site_tag_id.format(i + 1)] is not None:
                     t |= env_right[site_tag_id.format(i + 1)]
-                    env_right[site_tag_id.format(i)] = t.contract(all, optimize=opt)
+                    env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
                 else:
                     if indx is None or indx_ is None:
                         raise ValueError("Right-range boundary indices are not initialized.")
                     t = t.reindex({indx: indx_})
-                    env_right[site_tag_id.format(i)] = t.contract(all, optimize=opt)
+                    env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
 
     def _left_range(self, psi, site, count, env_left):
         """Update left environment incrementally for current site."""
 
         # get tensor at site from p
         psi_block = psi.H.select([self.site_tag_id.format(site)], "all")
-        opt = self.opt
+        contraction_opt = self.contraction_opt
         site_tag_id = self.site_tag_id
 
         if site_tag_id.format(site) in self.tn.tags:
@@ -352,23 +352,23 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             t = psi_block
 
         if site == 0:
-            env_left[site_tag_id.format(site)] = t.contract(all, optimize=opt)
+            env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
         else:
             if count == 1:
                 indx = psi.bond(site - 1, site)
                 indx_ = self.tn.bond(site - 1, site)
                 t = t.copy()
                 t = t.reindex({indx: indx_})
-                env_left[site_tag_id.format(site)] = t.contract(all, optimize=opt)
+                env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
             else:
                 t |= env_left[site_tag_id.format(site - 1)]
-                env_left[site_tag_id.format(site)] = t.contract(all, optimize=opt)
+                env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
 
     def _update_env_left(self, psi, site: int, env_left):
         """Update left environment incrementally for current site."""
 
         psi_block = psi.H.select([self.site_tag_id.format(site)], "all")
-        opt = self.opt
+        contraction_opt = self.contraction_opt
         site_tag_id = self.site_tag_id
 
         if site_tag_id.format(site) in self.tn.tags:
@@ -378,10 +378,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             t = psi_block
 
         if site == 0:
-            env_left[site_tag_id.format(site)] = t.contract(all, optimize=opt)
+            env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
         else:
             t |= env_left[site_tag_id.format(site - 1)]
-            env_left[site_tag_id.format(site)] = t.contract(all, optimize=opt)
+            env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
 
     def run_eff(
         self,
@@ -399,7 +399,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         site_tag_id = self.site_tag_id
         psi = self.p
         L = self.L
-        opt = self.opt
+        contraction_opt = self.contraction_opt
 
         if L == 1:
             if self.warning:
@@ -457,7 +457,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Failed to build effective tensor for current site.")
 
                 if isinstance(tn, qtn.TensorNetwork):
-                    f = tn.contract(all, optimize=opt).transpose(
+                    f = tn.contract(all, optimize=contraction_opt).transpose(
                         *psi[site_tag_id.format(site)].inds
                     )
                 elif isinstance(tn, qtn.Tensor):
@@ -465,10 +465,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 else:
                     raise TypeError("Unexpected effective tensor type during run_eff.")
 
-                norm_f = (f.H & f).contract(all) ** 0.5
-                self.local_norm_trace.append(complex(norm_f).real)
+                # norm_f is never applied (f.data used as-is); keep only for diagnostics if needed
+                # norm_f = (f.H & f).contract(all) ** 0.5
+                # self.local_norm_trace.append(complex(norm_f).real)
 
-                # Contract and normalize
                 # Update tensor data
                 psi[site].modify(data=f.data)
 
@@ -491,7 +491,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         site_tag_id = self.site_tag_id
         psi = self.p
         L = self.L
-        opt = self.opt
+        contraction_opt = self.contraction_opt
 
         if L == 1:
             if self.warning:
@@ -577,7 +577,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Failed to build effective tensor for gate sweep.")
 
                 if isinstance(tn, qtn.TensorNetwork):
-                    f = tn.contract(all, optimize=opt).transpose(
+                    f = tn.contract(all, optimize=contraction_opt).transpose(
                         *psi[site_tag_id.format(site)].inds
                     )
                 elif isinstance(tn, qtn.Tensor):
@@ -588,7 +588,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 norm_f = (f.H & f).contract(all) ** 0.5
                 self.local_norm_trace.append(complex(norm_f).real)
 
-                # Contract and normalize
                 # Update tensor data
                 psi[site].modify(data=f.data)
 

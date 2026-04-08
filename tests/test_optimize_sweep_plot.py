@@ -10,44 +10,38 @@ from pepsy.optimize_sweep import SweepOptimizer
 
 
 def test_run_wrapper_maps_global_style_arguments(monkeypatch):
-    """run() should forward gopt-style args into optimize_global()."""
+    """run() should forward canonical args into the global sweep runner."""
     opt = object.__new__(SweepOptimizer)
     opt.optimize_kwargs = {
         "axes": ("y", "x"),
         "n_round_trips": 2,
-        "optimizer": "scipy-lbfgs",
+        "optimizer": "scipy",
         "optimizer_options": {"algorithm": "LBFGS"},
         "env_n_iter": 10,
-        "debug_loss_mode": "infidelity",
-        "debug_loss_kwargs": {"chi": 32, "norm_target": 1.0},
     }
     captured = {}
 
-    def _fake_optimize_global(self, **kwargs):  # pylint: disable=unused-argument
+    def _fake_run_global(self, **kwargs):  # pylint: disable=unused-argument
         captured.update(kwargs)
         return "ok"
 
-    monkeypatch.setattr(SweepOptimizer, "optimize_global", _fake_optimize_global)
+    monkeypatch.setattr(SweepOptimizer, "_run_global_sweeps", _fake_run_global)
 
     out = SweepOptimizer.run(
         opt,
         n_cycles=5,
         chi=24,
         progress=False,
-        debug=True,
         renormalize=True,
     )
 
     assert out == "ok"
     assert captured["n_cycles"] == 5
     assert captured["chi"] == 24
-    assert captured["solver"] == "scipy-lbfgs"
+    assert captured["solver"] == "scipy"
     assert captured["solver_options"] == {"algorithm": "LBFGS"}
     assert captured["progress"] is False
-    assert captured["debug"] is True
-    assert captured["debug_loss_mode"] == "infidelity"
-    assert captured["debug_loss_kwargs"] == {"chi": 32, "norm_target": 1.0}
-    assert "track_boundary_fidelity" not in captured
+    assert captured["track_boundary_fidelity"] is False
     assert captured["renormalize"] is True
 
 
@@ -62,8 +56,93 @@ def test_run_wrapper_rejects_alias_arguments():
         SweepOptimizer.run(opt, solver_options={"algorithm": "LD_VAR2"})
     with pytest.raises(TypeError):
         SweepOptimizer.run(opt, pbar=False)
-    with pytest.raises(TypeError):
-        SweepOptimizer.run(opt, track_boundary_fidelity=True)
+
+
+def test_run_progress_postfix_reports_compact_cost_and_timing(monkeypatch):
+    """Global progress postfix should include compact timing and cost diagnostics."""
+    opt = object.__new__(SweepOptimizer)
+    opt.state_target = object()
+    opt.Lx = 2
+    opt.Ly = 2
+    opt.optimize_kwargs = {}
+    opt.bdy = SimpleNamespace(norm=1.0)
+    opt.bdy_overlap = SimpleNamespace(norm=1.0)
+
+    class _FakeTQDM:  # pylint: disable=too-few-public-methods
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            _ = args, kwargs
+            self.postfix = {}
+            self.postfix_str = ""
+            self.description_str = ""
+            self.updated = 0
+            _FakeTQDM.instances.append(self)
+
+        def update(self, n=1):
+            self.updated += int(n)
+
+        def set_postfix(self, data):
+            self.postfix = dict(data)
+
+        def set_postfix_str(self, text):
+            self.postfix_str = str(text)
+
+        def set_description_str(self, text):
+            self.description_str = str(text)
+
+        def close(self):
+            return None
+
+    def _fake_optimize_axis(
+        self,
+        axis,
+        *,
+        n_round_trips,
+        solver,
+        solver_options,
+        env_n_iter,
+        run_callback,
+        track_boundary_fidelity,
+        renormalize,
+    ):  # pylint: disable=unused-argument
+        run_info = {
+            "axis": axis,
+            "sweep": "forward",
+            "index": 0,
+            "loss_final": 1.23e-4,
+            "time_boundary": 0.42,
+            "time_optimize": 0.84,
+            "flops": 7.0,
+            "peak_norm": 12.0,
+            "peak_overlap": 13.5,
+        }
+        run_callback(run_info)
+        return [run_info]
+
+    monkeypatch.setattr(sweep_mod, "tqdm", _FakeTQDM)
+    monkeypatch.setattr(SweepOptimizer, "optimize_axis", _fake_optimize_axis)
+    monkeypatch.setattr(SweepOptimizer, "_ensure_boundary_chi", lambda self, chi: None)
+    monkeypatch.setattr(SweepOptimizer, "_approx_infidelity_loss", lambda self, env_n_iter=4: 0.0)
+    monkeypatch.setattr(SweepOptimizer, "_collect_axis_run_traces", lambda self, axis_runs, cycle, axis: None)
+
+    _ = SweepOptimizer.run(
+        opt,
+        n_cycles=1,
+        progress=True,
+        renormalize=False,
+        track_boundary_fidelity=False,
+    )
+
+    assert _FakeTQDM.instances
+    bar = _FakeTQDM.instances[-1]
+    desc = bar.description_str
+    postfix = bar.postfix_str
+    assert "loss=" in desc
+    assert "[best:" not in desc
+    assert "e" in desc  # scientific notation
+    assert "t=" in postfix
+    assert "cost=(" in postfix
 
 
 def test_set_optimize_kwargs_uses_clear_canonical_keys():
@@ -74,14 +153,14 @@ def test_set_optimize_kwargs_uses_clear_canonical_keys():
         opt,
         n_cycles=4,
         chi=40,
-        optimizer="scipy-lbfgs",
+        optimizer="scipy",
         optimizer_options={"algorithm": "LBFGS"},
         progress=False,
         track_boundary_fidelity=True,
     )
     assert opt.optimize_kwargs["n_cycles"] == 4
     assert opt.optimize_kwargs["chi"] == 40
-    assert opt.optimize_kwargs["optimizer"] == "scipy-lbfgs"
+    assert opt.optimize_kwargs["optimizer"] == "scipy"
     assert opt.optimize_kwargs["optimizer_options"] == {"algorithm": "LBFGS"}
     assert opt.optimize_kwargs["progress"] is False
     assert opt.optimize_kwargs["track_boundary_fidelity"] is True
@@ -136,7 +215,7 @@ def test_optimize_global_boundary_fidel_flag(debug, fidel_arg, expected_fidel, m
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
         env_n_iter=1,
         progress=False,
@@ -146,7 +225,7 @@ def test_optimize_global_boundary_fidel_flag(debug, fidel_arg, expected_fidel, m
     if fidel_arg is not None:
         kwargs["track_boundary_fidelity"] = fidel_arg
 
-    _ = SweepOptimizer.optimize_global(opt, **kwargs)
+    _ = SweepOptimizer._run_global_sweeps(opt, **kwargs)
 
     assert captured["debug"] is debug
     assert captured["track_boundary_fidelity"] is expected_fidel
@@ -184,12 +263,12 @@ def test_optimize_global_non_debug_skips_metrics(monkeypatch):
     monkeypatch.setattr(SweepOptimizer, "optimize_axis", _fake_optimize_axis)
     monkeypatch.setattr(SweepOptimizer, "metrics", _boom_metrics)
 
-    _ = SweepOptimizer.optimize_global(
+    _ = SweepOptimizer._run_global_sweeps(
         opt,
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         env_n_iter=1,
         progress=False,
         debug=False,
@@ -236,12 +315,12 @@ def test_optimize_global_non_debug_uses_infidelity_for_before_after(monkeypatch)
     monkeypatch.setattr(SweepOptimizer, "infidelity", _fake_infidelity)
     monkeypatch.setattr(SweepOptimizer, "metrics", _boom_metrics)
 
-    out = SweepOptimizer.optimize_global(
+    out = SweepOptimizer._run_global_sweeps(
         opt,
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         env_n_iter=7,
         progress=False,
         debug=False,
@@ -260,7 +339,7 @@ def test_optimize_global_non_debug_uses_infidelity_for_before_after(monkeypatch)
 
 
 def test_optimize_global_applies_chi_before_sweeps(monkeypatch):
-    """optimize_global(chi=...) should expand boundaries before running sweeps."""
+    """run(chi=...) should expand boundaries before running sweeps."""
     opt = object.__new__(SweepOptimizer)
     opt.state_target = object()
     opt.Lx = 2
@@ -292,13 +371,13 @@ def test_optimize_global_applies_chi_before_sweeps(monkeypatch):
     monkeypatch.setattr(SweepOptimizer, "optimize_axis", _fake_optimize_axis)
     monkeypatch.setattr(SweepOptimizer, "_approx_infidelity_loss", lambda self, **kwargs: 0.5)
 
-    _ = SweepOptimizer.optimize_global(
+    _ = SweepOptimizer._run_global_sweeps(
         opt,
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
         chi=64,
-        solver="scipy-lbfgs",
+        solver="scipy",
         env_n_iter=1,
         progress=False,
         debug=False,
@@ -404,12 +483,12 @@ def test_optimize_global_collects_step_loss_and_step_timing_when_not_debug(monke
 
     monkeypatch.setattr(SweepOptimizer, "optimize_axis", _fake_optimize_axis)
 
-    out = SweepOptimizer.optimize_global(
+    out = SweepOptimizer._run_global_sweeps(
         opt,
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         env_n_iter=1,
         progress=False,
         debug=False,
@@ -481,12 +560,12 @@ def test_optimize_global_resets_traces_each_call(monkeypatch):
 
     monkeypatch.setattr(SweepOptimizer, "optimize_axis", _fake_optimize_axis)
 
-    _ = SweepOptimizer.optimize_global(
+    _ = SweepOptimizer._run_global_sweeps(
         opt,
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         env_n_iter=1,
         progress=False,
         debug=False,
@@ -495,12 +574,12 @@ def test_optimize_global_resets_traces_each_call(monkeypatch):
     )
     assert opt.step_loss_trace == pytest.approx([0.5])
 
-    _ = SweepOptimizer.optimize_global(
+    _ = SweepOptimizer._run_global_sweeps(
         opt,
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         env_n_iter=1,
         progress=False,
         debug=False,
@@ -571,12 +650,12 @@ def test_optimize_global_debug_uses_exact_loss_per_step_trace(monkeypatch):
     monkeypatch.setattr(SweepOptimizer, "_debug_loss", _fake_debug_loss)
     monkeypatch.setattr(SweepOptimizer, "optimize_axis", _fake_optimize_axis)
 
-    out = SweepOptimizer.optimize_global(
+    out = SweepOptimizer._run_global_sweeps(
         opt,
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         env_n_iter=1,
         progress=False,
         debug=True,
@@ -635,12 +714,12 @@ def test_optimize_global_debug_infidelity_mode_skips_metrics(monkeypatch):
     monkeypatch.setattr(SweepOptimizer, "infidelity", _fake_infidelity)
     monkeypatch.setattr(SweepOptimizer, "metrics", _boom_metrics)
 
-    out = SweepOptimizer.optimize_global(
+    out = SweepOptimizer._run_global_sweeps(
         opt,
         axes=("x",),
         n_cycles=1,
         n_round_trips=1,
-        solver="scipy-lbfgs",
+        solver="scipy",
         env_n_iter=1,
         progress=False,
         debug=True,
@@ -766,34 +845,26 @@ def test_optimize_packed_params_uses_default_solver_options(monkeypatch):
     opt = object.__new__(SweepOptimizer)
     captured = {}
 
-    def _fake_run_gradient_solver(
-        params_init,
-        loss_fn,  # pylint: disable=unused-argument
-        *,
-        solver,
-        solver_options,
-        n_steps,
-        pbar,  # pylint: disable=unused-argument
-    ):
+    def _fake_run(self, *, params_init, loss_fn, **kwargs):  # pylint: disable=unused-argument
         captured["params_init"] = params_init
-        captured["solver"] = solver
-        captured["solver_options"] = dict(solver_options)
-        captured["n_steps"] = n_steps
-        return params_init, [0.0]
+        captured["solver"] = self.solver
+        captured["solver_options"] = dict(self.options)
+        captured["n_steps"] = self.n_steps
+        return SimpleNamespace(params=params_init, history=[0.0])
 
-    monkeypatch.setattr(sweep_mod, "run_gradient_solver", _fake_run_gradient_solver)
+    monkeypatch.setattr(sweep_mod.GradientOptimizer, "run", _fake_run)
 
     params_init = {"x": 1.0}
     out_params, history = SweepOptimizer._optimize_packed_params(
         opt,
         params_init,
         lambda _params: 0.0,
-        solver="scipy-lbfgs",
+        solver="scipy",
         solver_options=None,
     )
     assert out_params == params_init
     assert history == [0.0]
-    assert captured["solver"] == "scipy-lbfgs"
+    assert captured["solver"] == "scipy"
     assert captured["n_steps"] == 50
     assert captured["solver_options"]["algorithm"] == "LBFGS"
     assert captured["solver_options"]["maxeval"] == 100
@@ -802,23 +873,21 @@ def test_optimize_packed_params_uses_default_solver_options(monkeypatch):
 @pytest.mark.parametrize(
     "solver_in",
     [
-        "scipy",
-        "nlopt",
         "scipy_lbfgs",
         "nlopt_lbfgs",
     ],
 )
 def test_resolve_user_solver_rejects_aliases(solver_in):
     """Short solver aliases should be rejected in favor of canonical names."""
-    with pytest.raises(ValueError, match="Unsupported solver alias"):
+    with pytest.raises(ValueError, match="Unsupported solver"):
         SweepOptimizer._resolve_user_solver(solver_in)
 
 
 def test_resolve_user_solver_keeps_canonical_with_nlopt_warning():
     """Canonical names should pass through, with NLopt guidance warning."""
-    assert SweepOptimizer._resolve_user_solver("scipy-lbfgs") == "scipy-lbfgs"
-    with pytest.warns(UserWarning, match="nlopt-lbfgs"):
-        assert SweepOptimizer._resolve_user_solver("nlopt-lbfgs") == "nlopt-lbfgs"
+    assert SweepOptimizer._resolve_user_solver("scipy") == "scipy"
+    with pytest.warns(UserWarning, match="nlopt"):
+        assert SweepOptimizer._resolve_user_solver("nlopt") == "nlopt"
 
 
 def test_set_state_rebuilds_boundaries_and_normalizes(monkeypatch):

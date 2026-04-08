@@ -340,7 +340,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             if self.equalize_norms:
                 fit.p.equalize_norms_(value=self.equalize_norms)
             if self.track_boundary_fidelity:
-                fidelity = tn_fidelity(tn, fit.p, opt=self.contraction_opt)
+                fidelity = tn_fidelity(tn, fit.p, contraction_opt=self.contraction_opt)
                 self.fidel.append(fidelity)
 
             if progress_bar is not None:
@@ -404,7 +404,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if self.equalize_norms:
             fit.p.equalize_norms_(value=self.equalize_norms)
         if self.track_boundary_fidelity:
-            fidelity = tn_fidelity(tn, fit.p, opt=self.contraction_opt)
+            fidelity = tn_fidelity(tn, fit.p, contraction_opt=self.contraction_opt)
             self.fidel.append(fidelity)
 
         previous = fit.p

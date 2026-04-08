@@ -45,9 +45,9 @@ if TYPE_CHECKING:
     from .linalg_registrations import reg_complex_svd_jax, reg_complex_svd_torch
     from .fit import FIT
     from .gate import (
-        apply_2dtn_,
-        gate_2d,
-        gate_to_pepo,
+        apply_2d_gate,
+        apply_2d_gates,
+        gates_to_pepo,
         gate_1d,
         gen_long_range_swap_path,
         pauli,
@@ -117,9 +117,9 @@ __all__ = [
     "EnergyOptimizer",
     "tns_align",
     "gen_long_range_swap_path",
-    "apply_2dtn_",
-    "gate_2d",
-    "gate_to_pepo",
+    "apply_2d_gate",
+    "apply_2d_gates",
+    "gates_to_pepo",
     "gate_1d",
     "pauli",
     "x",
@@ -225,9 +225,9 @@ def __getattr__(name):
 
     if name in (
         "gen_long_range_swap_path",
-        "apply_2dtn_",
-        "gate_2d",
-        "gate_to_pepo",
+        "apply_2d_gate",
+        "apply_2d_gates",
+        "gates_to_pepo",
         "gate_1d",
         "pauli",
         "x",
@@ -265,9 +265,9 @@ def __getattr__(name):
         "su4",
     ):
         from .gate import (  # pylint: disable=import-outside-toplevel
-            apply_2dtn_,
-            gate_2d,
-            gate_to_pepo,
+            apply_2d_gate,
+            apply_2d_gates,
+            gates_to_pepo,
             gate_1d,
             gen_long_range_swap_path,
             pauli,
@@ -308,9 +308,9 @@ def __getattr__(name):
 
         return {
             "gen_long_range_swap_path": gen_long_range_swap_path,
-            "apply_2dtn_": apply_2dtn_,
-            "gate_2d": gate_2d,
-            "gate_to_pepo": gate_to_pepo,
+            "apply_2d_gate": apply_2d_gate,
+            "apply_2d_gates": apply_2d_gates,
+            "gates_to_pepo": gates_to_pepo,
             "gate_1d": gate_1d,
             "pauli": pauli,
             "x": x,

@@ -10,7 +10,7 @@ PEPS ket
       -> tagged ket + double-layer norm TN
   -> BdyMPS(...)
       -> boundary dictionary mps_b
-  -> contract_boundary(norm, mps_b, ...)
+  -> contract_boundary(norm, bdy, ...)
       -> BoundaryContractResult(cost, fidel, ...)
 ```
 
@@ -40,7 +40,7 @@ bdy = pepsy.BdyMPS(
 ```python
 res = pepsy.contract_boundary(
     norm=norm,
-    mps_boundaries=bdy.mps_b,
+    bdy=bdy,
     direction="y",
     n_iter=2,
     max_separation=0,

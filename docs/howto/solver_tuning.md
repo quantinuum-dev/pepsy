@@ -4,26 +4,23 @@ Use `SweepOptimizer.optimize_axis(...)` or `optimize_global(...)` with `solver` 
 
 ## Quick comparison
 
-- `solver="adam"`: best default for noisy or sensitive objectives.
-- `solver="lbfgs"`: torch-native quasi-Newton, often faster near convergence.
-- `solver="scipy-lbfgs"`: robust CPU `L-BFGS-B`, supports bounds.
-- `solver="nlopt-lbfgs"`: flexible stopping controls and algorithm variants.
+- `solver="torch-adam"`: robust default for noisy or sensitive objectives.
+- `solver="scipy"`: robust CPU `L-BFGS-B`, supports bounds.
+- `solver="nlopt"`: flexible stopping controls and algorithm variants.
 
-## Recipe: LBFGS (Torch)
+## Recipe: Torch Adam
 
 ```python
 result = sweeper.optimize_global(
     axes=("y", "x"),
     n_cycles=1,
     n_round_trips=1,
-    solver="lbfgs",
+    solver="torch-adam",
     solver_options={
-        "algorithm": "LBFGS",
         "n_steps": 60,
-        "max_iter": 1,      # one inner LBFGS step per outer sweep step
-        "history_size": 20,
-        "line_search_fn": "strong_wolfe",
-        "lr": 1.0,
+        "lr": 1e-2,
+        "scheduler": "cosine",
+        "clip_grad_norm": 1.0,
     },
     env_n_iter=4,
     progress=True,
@@ -32,8 +29,8 @@ result = sweeper.optimize_global(
 
 Practical notes:
 
-- Keep `max_iter=1` so `n_steps` remains the main outer control knob.
-- Start with `lr=1.0`; reduce if updates oscillate.
+- This path runs in torch with native autograd tensors.
+- For unstable runs, lower `lr` or add gradient clipping.
 
 ## Recipe: SciPy L-BFGS-B
 
@@ -42,7 +39,7 @@ result = sweeper.optimize_global(
     axes=("y", "x"),
     n_cycles=1,
     n_round_trips=1,
-    solver="scipy-lbfgs",
+    solver="scipy",
     solver_options={
         "method": "L-BFGS-B",
         "n_steps": 80,
@@ -66,7 +63,7 @@ result = sweeper.optimize_global(
     axes=("y", "x"),
     n_cycles=1,
     n_round_trips=1,
-    solver="nlopt-lbfgs",
+    solver="nlopt",
     solver_options={
         "algorithm": "LD_LBFGS",
         "n_steps": 100,
@@ -83,7 +80,7 @@ Practical notes:
 
 - `maxeval` is the main NLopt iteration cap.
 - If needed, switch `algorithm` to another NLopt gradient method.
-- This path is more sensitive to stopping settings; for a robust default start from `scipy-lbfgs`.
+- This path is more sensitive to stopping settings; for a robust default start from `scipy`.
 
 ## Best-parameter behavior
 
@@ -91,7 +88,7 @@ All sweep solvers now return and apply the **best-loss parameters** seen during 
 
 ## Numerical stability and backend transitions
 
-- External solvers (`scipy-lbfgs`, `nlopt-lbfgs`) flatten params to CPU NumPy `float64`.
+- External solvers (`scipy`, `nlopt`) flatten params to CPU NumPy `float64`.
 - Complex parameters are split into real/imag blocks during optimization and reconstructed afterward.
 - Returned parameters are cast back to original tensor dtype/device before being applied to the PEPS state.
 
