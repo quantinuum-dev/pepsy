@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         optimize_global,
         optimize_sweep,
         optimize_energy,
+        optimize_mpo,
     )
     from .boundary_metrics import (
         BoundaryContractResult,
@@ -36,6 +37,10 @@ if TYPE_CHECKING:
         get_default_array_backend,
         get_default_grad_backend,
         ps_to_peps,
+        ps_to_mps,
+        random_haar_qubit,
+        hrps_to_peps,
+        hrps_to_mps,
         register_torch_linalg,
         reset_default_backends,
         set_default_array_backend,
@@ -45,10 +50,10 @@ if TYPE_CHECKING:
     from .linalg_registrations import reg_complex_svd_jax, reg_complex_svd_torch
     from .fit import FIT
     from .gate import (
-        apply_2d_gate,
-        apply_2d_gates,
+        apply_gate_2d,
+        apply_gates_2d,
         gates_to_pepo,
-        gate_1d,
+        apply_gate_1d,
         gen_long_range_swap_path,
         pauli,
         x,
@@ -92,6 +97,7 @@ if TYPE_CHECKING:
     from .optimize_sweep import SweepOptimizer
     from .optimize_energy import EnergyOptimizer
     from .optimize_mps import MpsOptimizer
+    from .optimize_mpo import MpoOptimizer
 
 __all__ = [
     "__version__",
@@ -117,10 +123,10 @@ __all__ = [
     "EnergyOptimizer",
     "tns_align",
     "gen_long_range_swap_path",
-    "apply_2d_gate",
-    "apply_2d_gates",
+    "apply_gate_2d",
+    "apply_gates_2d",
     "gates_to_pepo",
-    "gate_1d",
+    "apply_gate_1d",
     "pauli",
     "x",
     "y",
@@ -157,9 +163,14 @@ __all__ = [
     "su4",
     "ham_tn",
     "ps_to_peps",
+    "ps_to_mps",
+    "random_haar_qubit",
+    "hrps_to_peps",
+    "hrps_to_mps",
     "optimize_global",
     "optimize_sweep",
     "optimize_energy",
+    "optimize_mpo",
     "gradient_solver",
     "gate",
     "ham",
@@ -169,6 +180,7 @@ __all__ = [
     "core",
     "fit",
     "MpsOptimizer",
+    "MpoOptimizer",
 ]
 
 
@@ -185,6 +197,7 @@ def __getattr__(name):
         "optimize_global",
         "optimize_sweep",
         "optimize_energy",
+        "optimize_mpo",
         "core",
         "fit",
     ):
@@ -225,10 +238,10 @@ def __getattr__(name):
 
     if name in (
         "gen_long_range_swap_path",
-        "apply_2d_gate",
-        "apply_2d_gates",
+        "apply_gate_2d",
+        "apply_gates_2d",
         "gates_to_pepo",
-        "gate_1d",
+        "apply_gate_1d",
         "pauli",
         "x",
         "y",
@@ -265,10 +278,10 @@ def __getattr__(name):
         "su4",
     ):
         from .gate import (  # pylint: disable=import-outside-toplevel
-            apply_2d_gate,
-            apply_2d_gates,
+            apply_gate_2d,
+            apply_gates_2d,
             gates_to_pepo,
-            gate_1d,
+            apply_gate_1d,
             gen_long_range_swap_path,
             pauli,
             x,
@@ -308,10 +321,10 @@ def __getattr__(name):
 
         return {
             "gen_long_range_swap_path": gen_long_range_swap_path,
-            "apply_2d_gate": apply_2d_gate,
-            "apply_2d_gates": apply_2d_gates,
+            "apply_gate_2d": apply_gate_2d,
+            "apply_gates_2d": apply_gates_2d,
             "gates_to_pepo": gates_to_pepo,
-            "gate_1d": gate_1d,
+            "apply_gate_1d": apply_gate_1d,
             "pauli": pauli,
             "x": x,
             "y": y,
@@ -353,15 +366,23 @@ def __getattr__(name):
 
         return ham_tn
 
-    if name in ("tns_align", "ps_to_peps"):
+    if name in ("tns_align", "ps_to_peps", "ps_to_mps", "random_haar_qubit", "hrps_to_peps", "hrps_to_mps"):
         from .core import (  # pylint: disable=import-outside-toplevel
             ps_to_peps,
+            ps_to_mps,
+            random_haar_qubit,
+            hrps_to_peps,
+            hrps_to_mps,
             tns_align,
         )
 
         return {
             "tns_align": tns_align,
             "ps_to_peps": ps_to_peps,
+            "ps_to_mps": ps_to_mps,
+            "random_haar_qubit": random_haar_qubit,
+            "hrps_to_peps": hrps_to_peps,
+            "hrps_to_mps": hrps_to_mps,
         }[name]
 
     if name in ("BdyMPS", "make_numpy_array_caster"):
@@ -431,5 +452,10 @@ def __getattr__(name):
         from .optimize_mps import MpsOptimizer  # pylint: disable=import-outside-toplevel
 
         return MpsOptimizer
+
+    if name == "MpoOptimizer":
+        from .optimize_mpo import MpoOptimizer  # pylint: disable=import-outside-toplevel
+
+        return MpoOptimizer
 
     raise AttributeError(f"module 'pepsy' has no attribute {name!r}")
