@@ -9,7 +9,11 @@ import numpy as np
 import quimb.tensor as qtn
 
 from .core import backend_numpy, get_default_array_backend
-import autoray as ar
+from ._backend_utils import (
+    dispatch_backend_converter,
+    infer_backend_and_dtype,
+    resolve_backend_sample_data_from_tn,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,16 +59,6 @@ class BdyMPS:
     mps_b : dict[str, qtn.MatrixProductState]
         Boundary map keyed by cut tags such as ``Y0_l`` and ``X2_r``.
     """
-    _NUMPY_DTYPE_MAP = {
-        "complex128": np.complex128,
-        "complex64": np.complex64,
-        "float64": np.float64,
-        "float32": np.float32,
-        "float16": np.float16,
-        "int64": np.int64,
-        "int32": np.int32,
-    }
-
     # (side, site_tag_id, cut_tag_id) sweep definitions used to prebuild boundaries.
     _SWEEP_SPECS = (
         ("left", "X{}", "Y{}"),
@@ -102,8 +96,8 @@ class BdyMPS:
         self._chi_target = int(chi)
         self.flat = flat
 
-        backend_data = self._resolve_backend_source(backend_source)
-        backend, dtype_name = self._infer_backend_and_dtype(backend_data)
+        backend_data = resolve_backend_sample_data_from_tn(backend_source)
+        backend, dtype_name = infer_backend_and_dtype(backend_data)
 
         self.array_backend = self._dispatch_backend_converter(
             backend=backend,
@@ -130,6 +124,49 @@ class BdyMPS:
 
         self.mps_b = self._initialize_all_boundaries(single_layer=single_layer)
 
+    @staticmethod
+    def _build_to_numpy(sample_data, dtype_name):
+        return dispatch_backend_converter(
+            backend="numpy",
+            dtype_name=dtype_name,
+            sample_data=sample_data,
+            cast_complex_to_real=True,
+        )
+
+    @staticmethod
+    def _build_to_torch(sample_data, dtype_name):
+        return dispatch_backend_converter(
+            backend="torch",
+            dtype_name=dtype_name,
+            sample_data=sample_data,
+            cast_complex_to_real=True,
+        )
+
+    @staticmethod
+    def _build_to_cupy(sample_data, dtype_name):
+        return dispatch_backend_converter(
+            backend="cupy",
+            dtype_name=dtype_name,
+            sample_data=sample_data,
+            cast_complex_to_real=True,
+        )
+
+    def _dispatch_backend_converter(self, backend, dtype_name, sample_data):
+        """Return a conversion callable for the detected backend."""
+        if sample_data is None:
+            raise ValueError(
+                "Cannot infer backend: tensor network has no tensors."
+            )
+
+        if backend == "numpy":
+            return self._build_to_numpy(sample_data, dtype_name)
+        if backend == "torch":
+            return self._build_to_torch(sample_data, dtype_name)
+        if backend == "cupy":
+            return self._build_to_cupy(sample_data, dtype_name)
+
+        raise ValueError(f"Unsupported backend: {backend}")
+
     def _initialize_all_boundaries(self, single_layer):
         """Build all configured boundary environments for this instance."""
         boundaries = {}
@@ -148,82 +185,6 @@ class BdyMPS:
                 )
             boundaries |= update
         return boundaries
-
-    @staticmethod
-    def _resolve_backend_source(network):
-        """Pick a tensor array from which backend metadata can be inferred."""
-        return next((t.data for t in network), None)
-
-    @staticmethod
-    def _infer_backend_and_dtype(sample_data):
-        """Infer backend and dtype from a representative tensor array."""
-        dtype_name = ar.get_dtype_name(sample_data)
-        backend = ar.infer_backend(sample_data)
-        return backend, dtype_name
-
-    @staticmethod
-    def _build_to_numpy(sample_data, dtype_name):
-        if dtype_name not in BdyMPS._NUMPY_DTYPE_MAP:
-            raise ValueError(f"Unsupported dtype '{dtype_name}' for numpy backend.")
-        dtype = BdyMPS._NUMPY_DTYPE_MAP[dtype_name]
-
-        def _to_numpy(x, dtype=dtype):
-            arr = np.asarray(x)
-            if np.issubdtype(dtype, np.floating) and np.iscomplexobj(arr):
-                arr = arr.real
-            return np.asarray(arr, dtype=dtype)
-
-        return _to_numpy
-
-    @staticmethod
-    def _build_to_torch(sample_data, dtype_name):
-        import torch
-
-        dtype_map = {
-            "complex128": torch.complex128,
-            "complex64": torch.complex64,
-            "float64": torch.float64,
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "int64": torch.int64,
-            "int32": torch.int32,
-        }
-        if dtype_name not in dtype_map:
-            raise ValueError(f"Unsupported dtype '{dtype_name}' for torch backend.")
-        dtype = dtype_map[dtype_name]
-        device = getattr(sample_data, "device", None)
-        if device is not None:
-            return (
-                lambda x, dtype=dtype, device=device: torch.as_tensor(
-                    torch.as_tensor(x, device=device).real
-                    if (dtype.is_floating_point and torch.is_complex(torch.as_tensor(x, device=device)))
-                    else torch.as_tensor(x, device=device),
-                    dtype=dtype,
-                    device=device,
-                )
-            )
-        return (
-            lambda x, dtype=dtype: torch.as_tensor(
-                torch.as_tensor(x).real
-                if (dtype.is_floating_point and torch.is_complex(torch.as_tensor(x)))
-                else torch.as_tensor(x),
-                dtype=dtype,
-            )
-        )
-
-    def _dispatch_backend_converter(self, backend, dtype_name, sample_data):
-        """Return a conversion callable for the detected backend."""
-        if sample_data is None:
-            raise ValueError(
-                "Cannot infer backend: tensor network has no tensors."
-            )
-
-        if backend == "numpy":
-            return self._build_to_numpy(sample_data, dtype_name)
-        if backend == "torch":
-            return self._build_to_torch(sample_data, dtype_name)
-
-        raise ValueError(f"Unsupported backend: {backend}")
 
     @property
     def ly(self):

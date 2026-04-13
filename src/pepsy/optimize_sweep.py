@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 import warnings
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -393,6 +394,33 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.inner_loss_traces = []
         self.norm_trace = []
         self.fidels = []
+        self.best_state = None
+        self.best_loss = float("inf")
+
+    def _best_nonnegative_from_history(self, history):
+        """Return minimum finite non-negative loss from history or ``None``."""
+        values = [
+            float(v)
+            for v in (history or ())
+            if (v is not None) and math.isfinite(float(v)) and (float(v) >= 0.0)
+        ]
+        if not values:
+            return None
+        return min(values)
+
+    def _maybe_store_best_state(self, loss_value):
+        """Store current state snapshot when ``loss_value`` is a new valid best."""
+        if loss_value is None:
+            return
+        loss_value = float(loss_value)
+        if not math.isfinite(loss_value):
+            return
+        # Infidelity/loss should be non-negative; ignore negative artifacts.
+        if loss_value < 0.0:
+            return
+        if loss_value < float(self.best_loss):
+            self.best_loss = loss_value
+            self.best_state = self.state.copy()
 
     def _ensure_boundary_chi(self, chi):
         """Retune both stored boundary objects to at least ``chi``.
@@ -1015,6 +1043,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             for k, v in params_opt.items()
         }
         self._apply_slice_update(index, params_opt, skeleton, axis)
+        # Track the best state using the minimum non-negative loss observed
+        # during this local gradient optimization.
+        self._maybe_store_best_state(self._best_nonnegative_from_history(history_values))
         return {
             "axis": axis,
             "index": index,
@@ -1318,11 +1349,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                         return
                     global_progress.update(1)
                     local_loss = run_info.get("loss_final")
-                    head = "loss=nan"
+                    best_now = getattr(self, "best_loss", float("inf"))
+                    best_str = "na" if not math.isfinite(float(best_now)) else f"{float(best_now):.6e}"
+                    head = f"loss=nan [best:{best_str}]"
                     if local_loss is not None:
                         cur = float(local_loss)
                         # Scientific notation keeps very small losses readable.
-                        head = f"loss={cur:.6e}"
+                        head = f"loss={cur:.6e} [best:{best_str}]"
                     t_opt = run_info.get("time_optimize")
                     t_bdy = run_info.get("time_boundary")
                     parts = []
@@ -1382,6 +1415,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "runs": all_runs,
             "loss_before": loss_before,
             "loss_after": loss_after,
+            "best_loss": None if not math.isfinite(float(self.best_loss)) else float(self.best_loss),
+            "best_state": None if self.best_state is None else self.best_state.copy(),
             "loss": list(self.loss),
             "step_loss_trace": list(self.step_loss_trace),
             "step_trace": list(self.step_trace),

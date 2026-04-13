@@ -12,10 +12,17 @@ import numpy as np
 import quimb as qu
 import quimb.tensor as qtn
 
+from ._backend_utils import (
+    infer_backend_converter_from_sample,
+    resolve_backend_sample_data,
+    resolve_backend_sample_data_from_tn,
+)
+
 __all__ = [
-    "apply_2d_gates",
+    "apply_gate_2d",
+    "apply_gates_2d",
     "gates_to_pepo",
-    "gate_1d",
+    "apply_gate_1d",
     "pauli",
     "x",
     "y",
@@ -51,50 +58,6 @@ __all__ = [
     "u3",
     "su4",
 ]
-
-
-def _resolve_backend_sample_data(gate):
-    """Return representative array data from a gate-like object."""
-    if hasattr(gate, "shape") and hasattr(gate, "dtype"):
-        return gate
-    data = getattr(gate, "data", None)
-    if hasattr(data, "shape") and hasattr(data, "dtype"):
-        return data
-    return None
-
-
-def _infer_backend_converter(sample_data):
-    """Infer array converter callable from sample tensor data."""
-    if sample_data is None:
-        return None
-
-    backend = ar.infer_backend(sample_data)
-
-    if backend == "numpy":
-        dtype_name = ar.get_dtype_name(sample_data)
-        try:
-            dtype_np = np.dtype(dtype_name)
-        except TypeError:
-            return np.asarray
-        return lambda x, dtype=dtype_np: np.asarray(x, dtype=dtype)
-
-    if backend == "torch":
-        import torch  # pylint: disable=import-outside-toplevel
-
-        target_dtype = getattr(sample_data, "dtype", None)
-        target_device = getattr(sample_data, "device", None)
-
-        def _to_torch(x, dtype=target_dtype, device=target_device):
-            kwargs = {}
-            if dtype is not None:
-                kwargs["dtype"] = dtype
-            if device is not None:
-                kwargs["device"] = device
-            return torch.as_tensor(np.array(x, copy=True), **kwargs)
-
-        return _to_torch
-
-    return None
 
 
 def rx(theta):
@@ -542,7 +505,29 @@ def gen_long_range_swap_path(  # pylint: disable=too-many-branches,too-many-loca
                 )
 
 
-def apply_2d_gate(
+def gen_long_range_swap_path_1d(x, y):
+    """Generate adjacent 1D pairs to route a long-range two-site gate."""
+    x = int(x)
+    y = int(y)
+
+    if x == y:
+        raise ValueError("Two-site gate requires distinct site indices.")
+
+    if abs(y - x) == 1:
+        yield (x, y)
+        return
+
+    step = 1 if (y > x) else -1
+    current = x
+    while abs(y - current) > 1:
+        nxt = current + step
+        yield (current, nxt)
+        current = nxt
+
+    yield (current, y)
+
+
+def apply_gate_2d(
     peps,
     G,
     where,
@@ -554,7 +539,6 @@ def apply_2d_gate(
     dtype="complex128",
     cutoff=1.0e-12,
     canonize_distance=2,
-    to_backend=None,
     sequence=("av", "bh", "ah", "bv"),
     cyclic=False,
     Lx=None,
@@ -565,7 +549,7 @@ def apply_2d_gate(
 
     if bra or (canonize_distance != 2):
         warnings.warn(
-            "Unused options in apply_2d_gate: 'bra' and/or 'canonize_distance'.",
+            "Unused options in apply_gate_2d: 'bra' and/or 'canonize_distance'.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -573,19 +557,27 @@ def apply_2d_gate(
     if tags is None:
         tags = ["G"]
 
+    backend_sample = resolve_backend_sample_data_from_tn(peps)
+    if backend_sample is None:
+        backend_sample = resolve_backend_sample_data(G)
+    inferred_converter = infer_backend_converter_from_sample(backend_sample)
+
+    G_apply = G
+    if inferred_converter is not None:
+        try:
+            G_apply = inferred_converter(G)
+        except (TypeError, ValueError):
+            G_apply = G
+
     swap = qu.swap(dim=2, dtype=dtype).reshape(2, 2, 2, 2)
-    if to_backend:
-        swap = to_backend(swap)
-    else:
-        inferred_converter = _infer_backend_converter(_resolve_backend_sample_data(G))
-        if inferred_converter is not None:
-            swap = inferred_converter(swap)
+    if inferred_converter is not None:
+        swap = inferred_converter(swap)
 
     if len(where) == 1:
         ((i, j),) = where
         qtn.tensor_network_gate_inds(
             peps,
-            G,
+            G_apply,
             [ind_id.format(i, j)],
             contract=True,
             tags=tags,
@@ -638,7 +630,7 @@ def apply_2d_gate(
     m_, n_ = y_
     qtn.tensor_network_gate_inds(
         peps,
-        G,
+        G_apply,
         [ind_id.format(i_, j_), ind_id.format(m_, n_)],
         contract=contract,
         tags=tags,
@@ -674,7 +666,7 @@ def _is_lattice_coord(value):
 
 
 def _normalize_where_arg(where):
-    """Normalize one-site and two-site where specs for :func:`apply_2d_gates`."""
+    """Normalize one-site and two-site where specs for :func:`apply_gates_2d`."""
     if _is_lattice_coord(where):
         i, j = where
         return ((int(i), int(j)),)
@@ -693,7 +685,7 @@ def _normalize_where_arg(where):
     )
 
 
-def apply_2d_gates(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def apply_gates_2d(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     peps,
     gates,
     *,
@@ -704,7 +696,6 @@ def apply_2d_gates(  # pylint: disable=too-many-arguments,too-many-positional-ar
     dtype="complex128",
     cutoff=1.0e-12,
     canonize_distance=2,
-    to_backend=None,
     sequence=("av", "bh", "ah", "bv"),
     cyclic=False,
     Lx=None,
@@ -744,7 +735,6 @@ def apply_2d_gates(  # pylint: disable=too-many-arguments,too-many-positional-ar
         "dtype": dtype,
         "cutoff": cutoff,
         "canonize_distance": canonize_distance,
-        "to_backend": to_backend,
         "sequence": sequence,
         "cyclic": cyclic,
         "Lx": Lx,
@@ -778,7 +768,7 @@ def apply_2d_gates(  # pylint: disable=too-many-arguments,too-many-positional-ar
         where_norm = _normalize_where_arg(where)
         opts = dict(base_opts)
         opts.update(gate_opts)
-        peps = apply_2d_gate(peps, gate, where_norm, **opts)
+        peps = apply_gate_2d(peps, gate, where_norm, **opts)
 
     if chi is not None:
         chi_value = int(chi)
@@ -865,7 +855,7 @@ def gates_to_pepo(
         else:
             raise ValueError("where must contain one or two site coordinates.")
 
-        apply_2d_gate(
+        apply_gate_2d(
             pepo, gate_use, where_norm,
             bond_dim=bnd, bra=False, contract=contract,
             tags=[], dtype=dtype, cutoff=cutoff,
@@ -883,7 +873,7 @@ def gates_to_pepo(
     return pepo
 
 
-def gate_1d(
+def apply_gate_1d(
     tn,
     where,
     G,
@@ -892,6 +882,8 @@ def gate_1d(
     cutoff=1.e-12,
     contract="split-gate",
     inplace=False,
+    *,
+    dtype="complex128",
 ):
 
     """
@@ -906,20 +898,78 @@ def gate_1d(
         cutoff:  SVD cutoff (used for split contraction paths).
         contract: Contraction mode (e.g., "split-gate") or bool for single-qubit.
         inplace: Modify tn in place if True; otherwise return a new TN.
+        dtype: Dtype used to build SWAP gates for split-routing modes.
 
     Returns:
         TensorNetwork with the gate applied and site tags added.
     """
+    backend_sample = resolve_backend_sample_data_from_tn(tn)
+    if backend_sample is None:
+        backend_sample = resolve_backend_sample_data(G)
+    inferred_converter = infer_backend_converter_from_sample(backend_sample)
+
+    G_apply = G
+    if inferred_converter is not None:
+        try:
+            G_apply = inferred_converter(G)
+        except (TypeError, ValueError):
+            G_apply = G
+
     if len(where) == 2:
         x, y = where
-        tn = qtn.tensor_network_gate_inds(
-            tn,
-            G,
-            [ind_id.format(x), ind_id.format(y)],
-            contract=contract,
-            inplace=inplace,
-            cutoff=cutoff,
-        )
+        x = int(x)
+        y = int(y)
+
+        if x == y:
+            raise ValueError("where must contain distinct site indices for two-site gates.")
+
+        route_with_swaps = isinstance(contract, str) and (contract in {"split", "reduce-split"})
+
+        if route_with_swaps:
+            swap = qu.swap(dim=2, dtype=dtype).reshape(2, 2, 2, 2)
+            if inferred_converter is not None:
+                swap = inferred_converter(swap)
+
+            *swaps, final = gen_long_range_swap_path_1d(x, y)
+
+            for i_, j_ in swaps:
+                tn = qtn.tensor_network_gate_inds(
+                    tn,
+                    swap,
+                    [ind_id.format(i_), ind_id.format(j_)],
+                    contract=contract,
+                    inplace=inplace,
+                    cutoff=cutoff,
+                )
+
+            i_, j_ = final
+            tn = qtn.tensor_network_gate_inds(
+                tn,
+                G_apply,
+                [ind_id.format(i_), ind_id.format(j_)],
+                contract=contract,
+                inplace=inplace,
+                cutoff=cutoff,
+            )
+
+            for i_, j_ in reversed(swaps):
+                tn = qtn.tensor_network_gate_inds(
+                    tn,
+                    swap,
+                    [ind_id.format(i_), ind_id.format(j_)],
+                    contract=contract,
+                    inplace=inplace,
+                    cutoff=cutoff,
+                )
+        else:
+            tn = qtn.tensor_network_gate_inds(
+                tn,
+                G_apply,
+                [ind_id.format(x), ind_id.format(y)],
+                contract=contract,
+                inplace=inplace,
+                cutoff=cutoff,
+            )
 
         # Add site tags after the gate has been applied.
         tensor_x = [tn.tensor_map[i] for i in tn.ind_map[ind_id.format(x)]][0]
@@ -931,7 +981,7 @@ def gate_1d(
         (x,) = where
         tn = qtn.tensor_network_gate_inds(
             tn,
-            G,
+            G_apply,
             [ind_id.format(x)],
             contract=True,
             inplace=inplace,
@@ -941,7 +991,6 @@ def gate_1d(
         raise ValueError("where must contain one or two site indices.")
 
     return tn
-
 
 def energy_global(MPO_origin, mps_a, *, contraction_opt=None):
     """Compute global energy ``<mps_a|MPO_origin|mps_a>`` with normalization."""

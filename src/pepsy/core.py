@@ -29,11 +29,62 @@ __all__ = [
     "tn_norm",
     "tns_align",
     "ps_to_peps",
+    "ps_to_mps",
+    "random_haar_qubit",
+    "hrps_to_peps",
+    "hrps_to_mps",
 ]
 
 _DEFAULT_ARRAY_BACKEND = None
 _DEFAULT_GRAD_BACKEND = None
 
+
+
+def _patch_unhashable_device_namespace_key():
+    """Patch autoray namespace cache keys for unhashable backend device objects."""
+    try:
+        import autoray  # pylint: disable=import-outside-toplevel
+        import autoray.autoray as ar_core  # pylint: disable=import-outside-toplevel
+    except ImportError:  # pragma: no cover
+        return
+
+    if getattr(ar_core, "_pepsy_unhashable_device_patch", False):
+        return
+
+    original_get_namespace = ar_core.get_namespace
+
+    def _safe_get_namespace(like=None, device=None, dtype=None, submodule=None):
+        if (device is None) and (like is not None) and (not isinstance(like, str)):
+            try:
+                device = like.device
+            except AttributeError:
+                device = None
+
+        if device is not None:
+            try:
+                hash(device)
+            except TypeError:
+                dev_id = getattr(device, "id", None)
+                device = f"device:{dev_id}" if dev_id is not None else str(device)
+
+        return original_get_namespace(
+            like=like,
+            device=device,
+            dtype=dtype,
+            submodule=submodule,
+        )
+
+    ar_core.get_namespace = _safe_get_namespace
+    autoray.get_namespace = _safe_get_namespace
+
+    try:
+        import quimb.tensor.decomp as qtn_decomp  # pylint: disable=import-outside-toplevel
+
+        qtn_decomp.get_namespace = _safe_get_namespace
+    except Exception:  # pragma: no cover
+        pass
+
+    ar_core._pepsy_unhashable_device_patch = True
 
 
 def _validate_backend_callable(name, fn):
@@ -144,6 +195,8 @@ def backend_cupy(device=None, dtype=None):
             "backend_cupy requires optional dependency 'cupy'. "
             "Install it with: pip install cupy-cuda12x (or your CUDA variant)."
         ) from exc
+
+    _patch_unhashable_device_namespace_key()
 
     target_device = device
     if isinstance(target_device, int):
@@ -470,7 +523,7 @@ def tns_align(p, pepo):
 
 
 
-def ps_to_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False):
+def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False):
     """Create a bond-dimension-1 product-state PEPS parameterized by ``theta``.
 
     Each site tensor is set so the physical vector is
@@ -478,9 +531,9 @@ def ps_to_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0, 
 
     Parameters
     ----------
-    lx : int
+    Lx : int
         Lattice size in x direction.
-    ly : int
+    Ly : int
         Lattice size in y direction.
     dtype : str, optional
         Tensor dtype passed to numpy/quimb.
@@ -494,22 +547,179 @@ def ps_to_peps(lx: int, ly: int, dtype: str = "complex128", theta: float = 0.0, 
     quimb.tensor.PEPS
         Initialized PEPS with bond dimension 1.
     """
-    peps = qtn.PEPS.rand(Lx=lx, Ly=ly, bond_dim=1, seed=666, dtype=dtype)
+    peps = qtn.PEPS.rand(Lx=Lx, Ly=Ly, bond_dim=1, seed=666, dtype=dtype)
     local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
-    for tensor in peps:
-        if len(tensor.data.shape) == 3:
-            data = np.zeros([1, 1, 2], dtype=dtype)
-            data[0, 0, :] = local_vec
-            tensor.modify(data=data)
-        if len(tensor.data.shape) == 4:
-            data = np.zeros([1, 1, 1, 2], dtype=dtype)
-            data[0, 0, 0, :] = local_vec
-            tensor.modify(data=data)
-        if len(tensor.data.shape) == 5:
-            data = np.zeros([1, 1, 1, 1, 2], dtype=dtype)
-            data[0, 0, 0, 0, :] = local_vec
+    for x in range(Lx):
+        for y in range(Ly):
+            tensor = peps[x, y]
+            phys_ind = peps.site_ind(x, y)
+            phys_axis = tensor.inds.index(phys_ind)
+            data = np.zeros_like(tensor.data, dtype=dtype)
+
+            slicer = [0] * data.ndim
+            slicer[phys_axis] = slice(None)
+            data[tuple(slicer)] = local_vec
             tensor.modify(data=data)
     peps.astype_(dtype)
     if cyclic:
         peps = add_cycle(peps, bond_dim=1)
     return peps
+
+
+def ps_to_mps(L: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False):
+    """Create a bond-dimension-1 product-state MPS parameterized by ``theta``.
+
+    Each site tensor is set so the physical vector is
+    ``[cos(theta), sin(theta)]`` with trivial virtual bonds.
+
+    Parameters
+    ----------
+    L : int
+        Number of sites.
+    dtype : str, optional
+        Tensor dtype passed to numpy/quimb.
+    theta : float, optional
+        Product-state angle controlling local amplitudes.
+    cyclic : bool, optional
+        If True, create a periodic MPS with bond dimension 1.
+
+    Returns
+    -------
+    quimb.tensor.MatrixProductState
+        Initialized MPS with bond dimension 1.
+    """
+    mps = qtn.MPS_rand_state(L=L, bond_dim=1, phys_dim=2, cyclic=cyclic, seed=666, dtype=dtype)
+    local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
+
+    for i in range(L):
+        tensor = mps[i]
+        phys_ind = mps.site_ind(i)
+        phys_axis = tensor.inds.index(phys_ind)
+        data = np.zeros_like(tensor.data, dtype=dtype)
+
+        slicer = [0] * data.ndim
+        slicer[phys_axis] = slice(None)
+        data[tuple(slicer)] = local_vec
+        tensor.modify(data=data)
+
+    mps.astype_(dtype)
+    return mps
+
+
+def random_haar_qubit(seed=None, perturb=0.0):
+    """Generate one random single-qubit Haar sample as ``(theta, phi)``.
+
+    Parameters
+    ----------
+    seed : int | None, optional
+        If set, produce a deterministic sample.
+    perturb : float, optional
+        Additive offset applied to both sampled parameters.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(theta, phi)`` Bloch angles.
+    """
+    rng = np.random.default_rng(seed)
+    phi = 2 * np.pi * rng.random() + perturb
+    z = 2 * rng.random() - 1 + perturb
+    z = np.clip(z, -1.0, 1.0)
+    theta = np.arccos(z)
+    return float(theta), float(phi)
+
+
+def hrps_to_peps(
+    Lx: int,
+    Ly: int,
+    dtype: str = "complex128",
+    cyclic: bool = False,
+    seed=None,
+    perturb: float = 0.0,
+    haar_params=None,
+):
+    """Create a bond-dimension-1 PEPS with per-site single-qubit Haar states.
+
+    If ``haar_params`` is omitted, each site uses :func:`random_haar_qubit`.
+    With ``seed`` set, site ``k`` uses ``seed + k`` for reproducible but
+    distinct samples.
+    """
+    peps = ps_to_peps(Lx=Lx, Ly=Ly, dtype=dtype, theta=0.0, cyclic=cyclic)
+
+    n_sites = Lx * Ly
+    if haar_params is not None:
+        if len(haar_params) != n_sites:
+            raise ValueError(f"haar_params must have length {n_sites}.")
+        params = list(haar_params)
+    else:
+        params = [
+            random_haar_qubit(None if seed is None else int(seed) + k, perturb=perturb)
+            for k in range(n_sites)
+        ]
+
+    for x in range(Lx):
+        for y in range(Ly):
+            idx = x * Ly + y
+            theta, phi = params[idx]
+            local_vec = np.array(
+                [np.cos(theta / 2.0), np.exp(1j * phi) * np.sin(theta / 2.0)],
+                dtype=dtype,
+            )
+            tensor = peps[x, y]
+            phys_ind = peps.site_ind(x, y)
+            phys_axis = tensor.inds.index(phys_ind)
+            data = np.zeros_like(tensor.data, dtype=dtype)
+
+            slicer = [0] * data.ndim
+            slicer[phys_axis] = slice(None)
+            data[tuple(slicer)] = local_vec
+            tensor.modify(data=data)
+
+    peps.astype_(dtype)
+    return peps
+
+
+def hrps_to_mps(
+    L: int,
+    dtype: str = "complex128",
+    cyclic: bool = False,
+    seed=None,
+    perturb: float = 0.0,
+    haar_params=None,
+):
+    """Create a bond-dimension-1 MPS with per-site single-qubit Haar states.
+
+    If ``haar_params`` is omitted, each site uses :func:`random_haar_qubit`.
+    With ``seed`` set, site ``k`` uses ``seed + k`` for reproducible but
+    distinct samples.
+    """
+    mps = ps_to_mps(L=L, dtype=dtype, theta=0.0, cyclic=cyclic)
+
+    if haar_params is not None:
+        if len(haar_params) != L:
+            raise ValueError(f"haar_params must have length {L}.")
+        params = list(haar_params)
+    else:
+        params = [
+            random_haar_qubit(None if seed is None else int(seed) + k, perturb=perturb)
+            for k in range(L)
+        ]
+
+    for i in range(L):
+        theta, phi = params[i]
+        local_vec = np.array(
+            [np.cos(theta / 2.0), np.exp(1j * phi) * np.sin(theta / 2.0)],
+            dtype=dtype,
+        )
+        tensor = mps[i]
+        phys_ind = mps.site_ind(i)
+        phys_axis = tensor.inds.index(phys_ind)
+        data = np.zeros_like(tensor.data, dtype=dtype)
+
+        slicer = [0] * data.ndim
+        slicer[phys_axis] = slice(None)
+        data[tuple(slicer)] = local_vec
+        tensor.modify(data=data)
+
+    mps.astype_(dtype)
+    return mps

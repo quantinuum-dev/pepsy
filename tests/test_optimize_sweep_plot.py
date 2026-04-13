@@ -139,7 +139,7 @@ def test_run_progress_postfix_reports_compact_cost_and_timing(monkeypatch):
     desc = bar.description_str
     postfix = bar.postfix_str
     assert "loss=" in desc
-    assert "[best:" not in desc
+    assert "[best:" in desc
     assert "e" in desc  # scientific notation
     assert "t=" in postfix
     assert "cost=(" in postfix

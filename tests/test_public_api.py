@@ -26,14 +26,19 @@ def test_core_symbols_exported():
     assert "FIT" in pepsy.__all__
     assert "PEPSGlobalOptimizer" not in pepsy.__all__
     assert "tns_align" in pepsy.__all__
+    assert "tn_norm" not in pepsy.__all__
+    assert "tn_fidelity" not in pepsy.__all__
     assert "gen_long_range_swap_path" in pepsy.__all__
-    assert "apply_2d_gate" in pepsy.__all__
-    assert "apply_2d_gates" in pepsy.__all__
+    assert "apply_gate_2d" in pepsy.__all__
+    assert "apply_gates_2d" in pepsy.__all__
+    assert "apply_2d_gate" not in pepsy.__all__
+    assert "apply_2d_gates" not in pepsy.__all__
     assert "apply_2dtn_" not in pepsy.__all__
     assert "gate_2d" not in pepsy.__all__
     assert "gates_to_pepo" in pepsy.__all__
     assert "gate_to_pepo" not in pepsy.__all__
-    assert "gate_1d" in pepsy.__all__
+    assert "apply_gate_1d" in pepsy.__all__
+    assert "gate_1d" not in pepsy.__all__
     assert "pauli" in pepsy.__all__
     assert "canonize_mps" not in pepsy.__all__
     assert "x" in pepsy.__all__
@@ -76,7 +81,6 @@ def test_core_symbols_exported():
     assert "reg_complex_svd_jax" in pepsy.__all__
     assert "make_numpy_array_caster" in pepsy.__all__
     assert "SweepOptimizer" in pepsy.__all__
-    assert "SweepResult" in pepsy.__all__
     assert "MpsOptimizer" in pepsy.__all__
     assert "optimize_global" in pepsy.__all__
     assert "optimize_sweep" in pepsy.__all__
@@ -101,9 +105,17 @@ def test_lazy_exports_resolve():
     with pytest.raises(AttributeError):
         _ = pepsy.PEPSGlobalOptimizer
     assert callable(pepsy.tns_align)
+    with pytest.raises(AttributeError):
+        _ = pepsy.tn_norm
+    with pytest.raises(AttributeError):
+        _ = pepsy.tn_fidelity
     assert callable(pepsy.gen_long_range_swap_path)
-    assert callable(pepsy.apply_2d_gate)
-    assert callable(pepsy.apply_2d_gates)
+    assert callable(pepsy.apply_gate_2d)
+    assert callable(pepsy.apply_gates_2d)
+    with pytest.raises(AttributeError):
+        _ = pepsy.apply_2d_gate
+    with pytest.raises(AttributeError):
+        _ = pepsy.apply_2d_gates
     with pytest.raises(AttributeError):
         _ = pepsy.apply_2dtn_
     with pytest.raises(AttributeError):
@@ -111,7 +123,9 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.gates_to_pepo)
     with pytest.raises(AttributeError):
         _ = pepsy.gate_to_pepo
-    assert callable(pepsy.gate_1d)
+    assert callable(pepsy.apply_gate_1d)
+    with pytest.raises(AttributeError):
+        _ = pepsy.gate_1d
     assert callable(pepsy.pauli)
     with pytest.raises(AttributeError):
         _ = pepsy.canonize_mps

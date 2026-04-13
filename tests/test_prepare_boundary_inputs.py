@@ -219,6 +219,27 @@ def test_bdymps_normalize_normalizes_all_boundaries_inplace():
     assert all(abs(complex(mps.norm()) - 1.0) < 1e-9 for mps in bdy.mps_b.values())
 
 
+def test_bdymps_dispatch_backend_converter_routes_cupy(monkeypatch):
+    """Backend dispatch should route cupy tensors through cupy caster builder."""
+    sentinel = object()
+
+    def _fake_build_to_cupy(sample_data, dtype_name):
+        assert dtype_name == "complex128"
+        return sentinel
+
+    monkeypatch.setattr(pepsy.BdyMPS, "_build_to_cupy", staticmethod(_fake_build_to_cupy))
+    bdy = object.__new__(pepsy.BdyMPS)
+
+    out = pepsy.BdyMPS._dispatch_backend_converter(
+        bdy,
+        backend="cupy",
+        dtype_name="complex128",
+        sample_data=object(),
+    )
+
+    assert out is sentinel
+
+
 def test_compbdy_fidelity_history_resets_each_run(monkeypatch):
     """CompBdy.run should rebuild self.fidel per run when track_boundary_fidelity=True."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=23, dtype="complex128")
