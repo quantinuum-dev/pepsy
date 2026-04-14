@@ -14,6 +14,13 @@ def test_mpo_optimizer_exported():
     assert py.optimize_mpo is not None
 
 
+def test_mpo_optimizer_accepts_svd_mode():
+    """SVD mode should be accepted by ``MpoOptimizer`` mode validation."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    opt = py.MpoOptimizer(mpo0.copy(), gates=[], chi=8, mode="svd")
+    assert opt.mode == "svd"
+
+
 def test_mpo_prepare_gate_pair_uses_matrix_transpose_for_2q_quimb_gate():
     """For rank-2 two-site gates, use direct matrix transpose (no reshape path)."""
     gate = qu.CNOT()
@@ -88,13 +95,44 @@ def test_mpo_optimizer_tracks_fidelity_proxy_for_two_site_fit():
 
 
 def test_mpo_optimizer_rejects_unknown_mode():
-    """Only dmrg mode is currently supported."""
+    """Unknown modes should fail with a clear supported-modes message."""
     mpo0 = qtn.MPO_identity(3, dtype="complex128")
     opt = py.MpoOptimizer(mpo0.copy(), gates=[], chi=4, mode="dmrg")
 
     try:
         opt.set_mode("mpo")
     except ValueError as exc:
-        assert "Supported modes: dmrg" in str(exc)
+        assert "Supported modes:" in str(exc)
+        assert "dmrg" in str(exc)
+        assert "svd" in str(exc)
     else:
         raise AssertionError("Expected ValueError for unsupported mode")
+
+
+def test_mpo_optimizer_svd_smoke():
+    """SVD mode should apply mixed 1q/2q gates without errors."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    gates = [
+        ((1,), qu.hadamard()),
+        ((0, 3), qu.CNOT()),
+    ]
+
+    opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="svd")
+    out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=2)
+
+    assert out.L == 4
+    assert out.max_bond() <= 8
+
+
+def test_mpo_optimizer_svd_rejects_negative_fidelity_samples():
+    """Negative fidelity_samples should fail clearly in SVD mode."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    gates = [((0, 3), qu.CNOT())]
+    opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="svd")
+
+    try:
+        opt.run(progbar=False, cutoff=1e-12, fidelity_samples=-1)
+    except ValueError as exc:
+        assert "fidelity_samples must be >= 0" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for negative fidelity_samples")

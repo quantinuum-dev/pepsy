@@ -19,17 +19,6 @@ __all__ = [
 ]
 
 SUPPORTED_SOLVERS = (
-    # canonical names used by SweepOptimizer
-    "scipy-lbfgs",
-    "nlopt-lbfgs",
-    # torch-based solvers
-    "adam",
-    "adamw",
-    "adagrad",
-    "rmsprop",
-    "sgd",
-    "lbfgs",
-    # legacy / internal names kept for backward compat
     "torch-adam",
     "scipy",
     "nlopt",
@@ -37,18 +26,6 @@ SUPPORTED_SOLVERS = (
 
 _TORCH_SOLVERS = {
     "torch-adam": torch.optim.Adam,
-    "adam":       torch.optim.Adam,
-    "adamw":      torch.optim.AdamW,
-    "adagrad":    torch.optim.Adagrad,
-    "rmsprop":    torch.optim.RMSprop,
-    "sgd":        torch.optim.SGD,
-    "lbfgs":      torch.optim.LBFGS,
-}
-
-# Map canonical public names -> internal routing key
-_SOLVER_ALIAS: dict[str, str] = {
-    "scipy-lbfgs": "scipy",
-    "nlopt-lbfgs": "nlopt",
 }
 
 
@@ -56,20 +33,7 @@ _SOLVER_ALIAS: dict[str, str] = {
 class GradSolverResult:
     """Structured optimization result returned by :class:`GradientOptimizer`.
 
-    Attributes
-    ----------
-    params : dict[str, torch.Tensor]
-        Optimized parameter tensors.
-    history : list[float]
-        Per-step loss history reported by the selected backend.
-    solver : str
-        Canonical solver name actually used.
-    n_steps : int
-        Number of reported history entries.
-    best_loss : float
-        Best value encountered in ``history``.
-    final_loss : float
-        Last reported value in ``history``.
+    Fields capture optimized parameters, solver identity, and loss summary.
     """
 
     params: dict[str, torch.Tensor]
@@ -83,12 +47,10 @@ def _normalize_solver_name(solver: str) -> str:
     if not isinstance(solver, str):
         raise TypeError("solver must be a string")
     normalized = solver.strip().lower()
-    # Resolve public aliases to internal routing keys
-    internal = _SOLVER_ALIAS.get(normalized, normalized)
-    if internal not in SUPPORTED_SOLVERS and normalized not in SUPPORTED_SOLVERS:
+    if normalized not in SUPPORTED_SOLVERS:
         supported = ", ".join(SUPPORTED_SOLVERS)
         raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
-    return internal
+    return normalized
 
 
 def _as_trainable_tensor(value: Any) -> torch.Tensor:
@@ -1111,7 +1073,7 @@ def optimize_packed_params(
     params_init: Mapping[str, Any],
     loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
     *,
-    solver: str = "scipy-lbfgs",
+    solver: str = "scipy",
     solver_options: Mapping[str, Any] | None = None,
     n_steps: int = 100,
     progress: bool = False,
@@ -1122,10 +1084,10 @@ def optimize_packed_params(
     """Optimize a dict of packed parameters against a differentiable loss.
 
     This is the primary entry point used by :class:`pepsy.SweepOptimizer`.
-    Parameters may live on any device (CPU or CUDA). scipy-lbfgs and
-    nlopt-lbfgs solvers flatten params to CPU float64 per evaluation and
-    reconstruct them on their original device after each step; torch-based
-    solvers keep params on-device throughout.
+    Parameters may live on any device (CPU or CUDA). ``scipy`` and
+    ``nlopt`` flatten params to CPU float64 per evaluation and reconstruct
+    them on their original device after each step; ``torch-adam`` keeps
+    params on-device throughout.
 
     Parameters
     ----------
@@ -1135,10 +1097,9 @@ def optimize_packed_params(
     loss_fn : callable
         ``loss_fn(params) -> scalar tensor``.  Must be differentiable when
         using gradient-based solvers.
-    solver : str, default="scipy-lbfgs"
-        Solver name. Supported values: ``"scipy-lbfgs"``, ``"nlopt-lbfgs"``,
-        ``"adam"``, ``"adamw"``, ``"adagrad"``, ``"rmsprop"``, ``"sgd"``,
-        ``"lbfgs"``.
+    solver : str, default="scipy"
+        Solver name. Supported values: ``"torch-adam"``, ``"scipy"``,
+        and ``"nlopt"``.
     solver_options : dict | None, default=None
         Backend-specific options forwarded to the selected solver.
     n_steps : int, default=100

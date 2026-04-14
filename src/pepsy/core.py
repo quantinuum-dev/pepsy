@@ -429,6 +429,7 @@ def tn_fidelity(
     psi,
     psi_fix,
     *,
+    opt: Any | None = None,
     contraction_opt: Any | None = None,
 ):
     """Compute normalized overlap fidelity.
@@ -442,6 +443,9 @@ def tn_fidelity(
     contraction_opt : object | None, optional
         Contraction optimizer. If ``None``, a default optimizer is built.
     """
+    if contraction_opt is None:
+        contraction_opt = opt
+
     if contraction_opt is None:
         contraction_opt = build_optimizer(progbar=False)
 
