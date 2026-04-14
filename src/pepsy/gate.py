@@ -17,12 +17,14 @@ from ._backend_utils import (
     resolve_backend_sample_data,
     resolve_backend_sample_data_from_tn,
 )
+from .core import add_cycle, pepo_identity
 
 __all__ = [
-    "apply_gate_2d",
-    "apply_gates_2d",
-    "gates_to_pepo",
-    "apply_gate_1d",
+    "gate_tn_2d",
+    "gates_tn_2d",
+    "build_pepo_from_gates",
+    "gate_tn_1d",
+    "build_mpo_from_gates",
     "pauli",
     "x",
     "y",
@@ -527,7 +529,7 @@ def gen_long_range_swap_path_1d(x, y):
     yield (current, y)
 
 
-def apply_gate_2d(
+def gate_tn_2d(
     peps,
     G,
     where,
@@ -549,7 +551,7 @@ def apply_gate_2d(
 
     if bra or (canonize_distance != 2):
         warnings.warn(
-            "Unused options in apply_gate_2d: 'bra' and/or 'canonize_distance'.",
+            "Unused options in gate_tn_2d: 'bra' and/or 'canonize_distance'.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -593,6 +595,24 @@ def apply_gate_2d(
     x, y = where
     if x == y:
         raise ValueError("Two-site gate requires distinct coordinates.")
+
+    # Match 1D behavior:
+    # - split / reduce-split: route long-range gates via SWAP chains
+    # - split-gate (or others): apply directly to the requested endpoints
+    if contract not in ("split", "reduce-split"):
+        i, j = x
+        m, n = y
+        qtn.tensor_network_gate_inds(
+            peps,
+            G_apply,
+            [ind_id.format(i, j), ind_id.format(m, n)],
+            contract=contract,
+            tags=tags,
+            info=None,
+            inplace=True,
+            cutoff=cutoff,
+        )
+        return peps
 
     lx_use = Lx
     ly_use = Ly
@@ -666,7 +686,7 @@ def _is_lattice_coord(value):
 
 
 def _normalize_where_arg(where):
-    """Normalize one-site and two-site where specs for :func:`apply_gates_2d`."""
+    """Normalize one-site and two-site where specs for :func:`gates_tn_2d`."""
     if _is_lattice_coord(where):
         i, j = where
         return ((int(i), int(j)),)
@@ -685,7 +705,7 @@ def _normalize_where_arg(where):
     )
 
 
-def apply_gates_2d(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def gates_tn_2d(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     peps,
     gates,
     *,
@@ -768,7 +788,7 @@ def apply_gates_2d(  # pylint: disable=too-many-arguments,too-many-positional-ar
         where_norm = _normalize_where_arg(where)
         opts = dict(base_opts)
         opts.update(gate_opts)
-        peps = apply_gate_2d(peps, gate, where_norm, **opts)
+        peps = gate_tn_2d(peps, gate, where_norm, **opts)
 
     if chi is not None:
         chi_value = int(chi)
@@ -778,39 +798,7 @@ def apply_gates_2d(  # pylint: disable=too-many-arguments,too-many-positional-ar
 
     return peps
 
-
-
-def pepo_identity(lx, ly, dtype="complex128"):
-    """Create bond-dimension-1 PEPO identity on an ``lx x ly`` lattice."""
-    pepo = qtn.PEPO.rand(Lx=lx, Ly=ly, bond_dim=1, seed=666, dtype=dtype)
-    eye = qu.pauli("I", dtype=dtype)
-
-    for tensor in pepo:
-        ndim = len(tensor.data.shape)
-        if ndim == 4:
-            data = np.zeros([1, 1, 2, 2], dtype=dtype)
-            data[0, 0, :, :] = eye
-            tensor.modify(data=data)
-        elif ndim == 5:
-            data = np.zeros([1, 1, 1, 2, 2], dtype=dtype)
-            data[0, 0, 0, :, :] = eye
-            tensor.modify(data=data)
-        elif ndim == 6:
-            data = np.zeros([1, 1, 1, 1, 2, 2], dtype=dtype)
-            data[0, 0, 0, 0, :, :] = eye
-            tensor.modify(data=data)
-
-    return pepo
-
-
-def peps_cycle(peps, bond_dim, cylinder=False):
-    """Add periodic bonds; wrapper around :func:`pepsy.core.add_cycle`."""
-    from .core import add_cycle  # pylint: disable=import-outside-toplevel
-
-    return add_cycle(peps, bond_dim=bond_dim, cylinder=cylinder)
-
-
-def gates_to_pepo(
+def build_pepo_from_gates(
     gates,
     cyclic=False,
     cutoff=1.0e-12,
@@ -820,6 +808,7 @@ def gates_to_pepo(
     sequence=("av", "bh", "ah", "bv"),
     contract="split",
     compress_threshold=16,
+    ind_id="k{},{}",
 ):
     """Build a PEPO by applying ``(where, G)`` gate pairs onto a PEPO identity.
 
@@ -841,25 +830,19 @@ def gates_to_pepo(
 
     pepo = pepo_.copy() if pepo_ is not None else pepo_identity(Lx, Ly, dtype=dtype)
     if pepo_ is None and cyclic:
-        pepo = peps_cycle(pepo, 1)
+        pepo = add_cycle(pepo, 1)
 
     for tensor in pepo:
         tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for G, where_norm in zip(gate_list, where_list):
-        n = len(where_norm)
-        if n == 1:
-            gate_use = ar.do("transpose", G, (1, 0))
-        elif n == 2:
-            gate_use = ar.do("transpose", G, (2, 3, 0, 1))
-        else:
-            raise ValueError("where must contain one or two site coordinates.")
+        gate_use = _to_ket_gate_layout(G, len(where_norm))
 
-        apply_gate_2d(
+        gate_tn_2d(
             pepo, gate_use, where_norm,
             bond_dim=bnd, bra=False, contract=contract,
             tags=[], dtype=dtype, cutoff=cutoff,
-            sequence=sequence, cyclic=cyclic, Lx=Lx, Ly=Ly, ind_id="b{},{}",
+            sequence=sequence, cyclic=cyclic, Lx=Lx, Ly=Ly, ind_id=ind_id,
         )
 
         if pepo.max_bond() > compress_threshold:
@@ -873,7 +856,92 @@ def gates_to_pepo(
     return pepo
 
 
-def apply_gate_1d(
+def _to_ket_gate_layout(gate, n_sites):
+    """Map input gate to ket-side index ordering used by PEPO/MPO builders."""
+    if n_sites == 1:
+        return ar.do("transpose", gate, (1, 0))
+
+    if n_sites == 2:
+        shape = getattr(gate, "shape", ())
+        if len(shape) == 2:
+            din, dout = shape
+            if int(din) != int(dout):
+                raise ValueError(
+                    "Two-site gate matrix must be square with shape (d**2, d**2)."
+                )
+            return ar.do("transpose", gate, (1, 0))
+
+        if len(shape) == 4:
+            return ar.do("transpose", gate, (2, 3, 0, 1))
+
+        raise ValueError(
+            "Two-site gate must have shape (d**2, d**2) or (d, d, d, d)."
+        )
+
+    raise ValueError("Each gate location must have one or two sites.")
+
+
+def build_mpo_from_gates(
+    gates,
+    cyclic=False,
+    cutoff=1.0e-12,
+    mpo_=None,
+    dtype="complex128",
+    bnd=32,
+    contract="split",
+    compress_threshold=16,
+    ind_id="k{}",
+):
+    """Build an MPO by applying ``(where, G)`` gates onto an MPO identity.
+
+    ``gates`` is a list of ``(where, G)`` where ``where`` is
+    ``(i,)`` for one-qubit or ``(i, j)`` for two-qubit gates.
+    """
+    gates = list(gates)
+    if not gates:
+        raise ValueError("gates must not be empty.")
+
+    where_list = [tuple(where) for where, _ in gates]
+    gate_list = [G for _, G in gates]
+
+    coords = [int(i) for w in where_list for i in w]
+    L = max(coords) + 1
+
+    mpo = mpo_.copy() if mpo_ is not None else qtn.MPO_identity(
+        L, phys_dim=2, dtype=dtype, cyclic=cyclic
+    )
+
+    for tensor in mpo:
+        tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
+
+    for G, where_norm in zip(gate_list, where_list):
+        gate_use = _to_ket_gate_layout(G, len(where_norm))
+
+        gate_tn_1d(
+            mpo,
+            where_norm,
+            gate_use,
+            ind_id=ind_id,
+            cutoff=cutoff,
+            contract=contract,
+            inplace=True,
+            dtype=dtype,
+        )
+
+        if mpo.max_bond() > compress_threshold:
+            mpo.compress(
+                form="left",
+                max_bond=compress_threshold,
+                cutoff=1e-14,
+            )
+
+    if bnd is not None:
+        mpo.compress(form="left", max_bond=int(bnd), cutoff=cutoff)
+
+    return mpo
+
+
+def gate_tn_1d(
     tn,
     where,
     G,
@@ -886,22 +954,34 @@ def apply_gate_1d(
     dtype="complex128",
 ):
 
-    """
-    Apply a 1D gate to a tensor network at one or two sites.
+    """Apply a 1D gate to a tensor network at one or two sites.
 
-    Args:
-        tn:      Tensor network (quimb/qtn TensorNetwork).
-        where:   Iterable of site indices; length 1 (single-qubit) or 2 (two-qubit).
-        G:       Gate tensor (or matrix).
-        ind_id: Format string for site indices (e.g., "k{}" -> "k3").
-        site_tags: Format string for site tags   (e.g., "I{}" -> "I3").
-        cutoff:  SVD cutoff (used for split contraction paths).
-        contract: Contraction mode (e.g., "split-gate") or bool for single-qubit.
-        inplace: Modify tn in place if True; otherwise return a new TN.
-        dtype: Dtype used to build SWAP gates for split-routing modes.
+    Parameters
+    ----------
+    tn : qtn.TensorNetwork
+        Tensor network to apply the gate to.
+    where : sequence[int]
+        Site indices; length 1 (single-qubit) or 2 (two-qubit).
+    G : array_like
+        Gate tensor (or matrix).
+    ind_id : str, default="k{}"
+        Format string for site indices (e.g., ``"k{}"`` produces ``"k3"``).
+    site_tags : str, default="I{}"
+        Format string for site tags (e.g., ``"I{}"`` produces ``"I3"``).
+    cutoff : float, default=1e-12
+        SVD cutoff used by split contraction paths.
+    contract : str | bool, default="split-gate"
+        Contraction mode. String modes include ``"split-gate"`` and
+        ``"reduce-split"``; ``True`` contracts single-qubit gates directly.
+    inplace : bool, default=False
+        If ``True``, modify ``tn`` in place; otherwise return a new TN.
+    dtype : str, default="complex128"
+        Dtype used to build SWAP gates for split-routing modes.
 
-    Returns:
-        TensorNetwork with the gate applied and site tags added.
+    Returns
+    -------
+    qtn.TensorNetwork
+        Tensor network with the gate applied and site tags added.
     """
     backend_sample = resolve_backend_sample_data_from_tn(tn)
     if backend_sample is None:
@@ -991,18 +1071,3 @@ def apply_gate_1d(
         raise ValueError("where must contain one or two site indices.")
 
     return tn
-
-def energy_global(MPO_origin, mps_a, *, contraction_opt=None):
-    """Compute global energy ``<mps_a|MPO_origin|mps_a>`` with normalization."""
-
-    if contraction_opt is None:
-        contraction_opt = "auto-hq"
-
-    mps_a_ = mps_a.copy()
-    mps_a_.normalize()
-    p_h = mps_a_.H
-    p_h.reindex_({f"k{i}": f"b{i}" for i in range(mps_a.L)})
-    mpo_t = MPO_origin * 1.0
-
-    energy_dmrg = (p_h | mpo_t | mps_a_).contract(all, optimize=contraction_opt)
-    return energy_dmrg

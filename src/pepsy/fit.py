@@ -17,8 +17,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FIT",
-    "build_optimizer",
-    "tn_fidelity",
     "internal_inds",
 ]
 

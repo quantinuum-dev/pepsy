@@ -28,11 +28,14 @@ __all__ = [
     "tn_fidelity",
     "tn_norm",
     "tns_align",
+    "expec_tn_1d",
     "ps_to_peps",
     "ps_to_mps",
     "random_haar_qubit",
     "hrps_to_peps",
     "hrps_to_mps",
+    "pepo_identity",
+    "add_cycle",
 ]
 
 _DEFAULT_ARRAY_BACKEND = None
@@ -475,6 +478,29 @@ def add_cycle(peps, bond_dim, cylinder=False):
     return peps
 
 
+def pepo_identity(lx, ly, dtype="complex128"):
+    """Create bond-dimension-1 PEPO identity on an ``lx x ly`` lattice."""
+    pepo = qtn.PEPO.rand(Lx=lx, Ly=ly, bond_dim=1, seed=666, dtype=dtype)
+    eye = np.eye(2, dtype=dtype)
+
+    for tensor in pepo:
+        ndim = len(tensor.data.shape)
+        if ndim == 4:
+            data = np.zeros([1, 1, 2, 2], dtype=dtype)
+            data[0, 0, :, :] = eye
+            tensor.modify(data=data)
+        elif ndim == 5:
+            data = np.zeros([1, 1, 1, 2, 2], dtype=dtype)
+            data[0, 0, 0, :, :] = eye
+            tensor.modify(data=data)
+        elif ndim == 6:
+            data = np.zeros([1, 1, 1, 1, 2, 2], dtype=dtype)
+            data[0, 0, 0, 0, :, :] = eye
+            tensor.modify(data=data)
+
+    return pepo
+
+
 def tns_align(p, pepo):
     r"""Apply a PEPO operator to a PEPS ket: :math:`\hat{O}|\psi\rangle`.
 
@@ -525,6 +551,19 @@ def tns_align(p, pepo):
         tn.reindex_(b_to_k)
     return tn
 
+
+
+def expec_tn_1d(mpo, mps, *, contraction_opt=None):
+    """Compute normalized 1D expectation value ``<mps|mpo|mps> / <mps|mps>``."""
+    if contraction_opt is None:
+        contraction_opt = "auto-hq"
+
+    mps_n = mps.copy()
+    mps_n.normalize()
+    mps_h = mps_n.H
+    mps_h.reindex_({f"k{i}": f"b{i}" for i in range(mps_n.L)})
+    mpo_t = mpo * 1.0
+    return (mps_h | mpo_t | mps_n).contract(all, optimize=contraction_opt)
 
 
 def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False):

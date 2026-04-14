@@ -10,7 +10,7 @@ from .boundary_states import BdyMPS
 from .core import build_optimizer, tn_fidelity
 from .fit import FIT
 
-__all__ = ["BdyMPS", "CompBdy", "tn_fidelity", "build_optimizer"]
+__all__ = ["CompBdy"]
 
 
 @dataclass(frozen=True)

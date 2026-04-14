@@ -8,7 +8,7 @@ import autoray as ar
 import numpy as np
 
 from .fit import FIT
-from .gate import apply_gate_1d
+from .gate import gate_tn_1d
 
 __all__ = ["MpoOptimizer"]
 
@@ -20,8 +20,10 @@ class MpoOptimizer:
     ----------
     mpo : qtn.MatrixProductOperator
         Initial MPO.
-    gates : sequence[tuple[sequence[int], object]] | None, optional
-        Gate stream as ``(where, G)`` tuples.
+    gates : sequence[tuple] | None, optional
+        Gate stream in either form:
+        - ``(where, G)``: default bra operator is ``G†``.
+        - ``(where, G, B)``: explicit bra operator ``B`` (e.g. ``V†``).
     chi : int
         Working bond dimension.
     mode : {"dmrg", "svd"}, default="dmrg"
@@ -171,10 +173,10 @@ class MpoOptimizer:
         return norm_val
 
     @staticmethod
-    def _prepare_gate_pair(gate, n_sites):
-        """Return gate tensors for ket/bra index families."""
+    def _prepare_gate_tensor(gate, n_sites):
+        """Return a gate tensor in ket-index ordering."""
         if n_sites == 1:
-            g_k = ar.do("transpose", gate, (1, 0))
+            return ar.do("transpose", gate, (1, 0))
         elif n_sites == 2:
             shape = getattr(gate, "shape", ())
             if len(shape) == 2:
@@ -183,9 +185,9 @@ class MpoOptimizer:
                     raise ValueError(
                         "Two-site gate matrix must be square with shape (d**2, d**2)."
                     )
-                g_k = ar.do("transpose", gate, (1, 0))
+                return ar.do("transpose", gate, (1, 0))
             elif len(shape) == 4:
-                g_k = ar.do("transpose", gate, (2, 3, 0, 1))
+                return ar.do("transpose", gate, (2, 3, 0, 1))
             else:
                 raise ValueError(
                     "Two-site gate must have shape (d**2, d**2) or (d, d, d, d)."
@@ -193,14 +195,47 @@ class MpoOptimizer:
         else:
             raise ValueError("Each gate location must have one or two sites.")
 
-        g_b = ar.do("conj", g_k)
+    @staticmethod
+    def _prepare_gate_pair(gate, n_sites, bra_gate=None):
+        """Return gate tensors for ket/bra index families.
+
+        If ``bra_gate`` is supplied, it is used on bra indices after being
+        normalized to ket-index ordering. Otherwise the bra operator defaults
+        to ``conj(g_k)``.
+        """
+        g_k = MpoOptimizer._prepare_gate_tensor(gate, n_sites)
+        if bra_gate is None:
+            g_b = ar.do("conj", g_k)
+        else:
+            g_b = MpoOptimizer._prepare_gate_tensor(bra_gate, n_sites)
         return g_k, g_b
+
+    @staticmethod
+    def _parse_gate_spec(spec):
+        """Normalize one gate spec into ``(where, ket_gate, bra_gate_or_none)``."""
+        if not isinstance(spec, (tuple, list)):
+            raise TypeError(
+                "Each gate spec must be tuple/list in form (where, G) or (where, G, B)."
+            )
+        if len(spec) == 2:
+            where, gate = spec
+            bra_gate = None
+        elif len(spec) == 3:
+            where, gate, bra_gate = spec
+        else:
+            raise ValueError("Each gate spec must have length 2 or 3.")
+
+        where_norm = tuple(where)
+        if len(where_norm) not in (1, 2):
+            raise ValueError("Each gate location must have one or two sites.")
+        return where_norm, gate, bra_gate
 
     def _apply_gate_pair(
         self,
         p,
         where,
         gate,
+        bra_gate=None,
         *,
         cutoff,
         contract,
@@ -208,9 +243,9 @@ class MpoOptimizer:
     ):
         """Apply one gate to both ket and bra legs of ``p``."""
         n_sites = len(where)
-        g_k, g_b = self._prepare_gate_pair(gate, n_sites)
+        g_k, g_b = self._prepare_gate_pair(gate, n_sites, bra_gate=bra_gate)
 
-        apply_gate_1d(
+        gate_tn_1d(
             p,
             where,
             g_k,
@@ -219,7 +254,7 @@ class MpoOptimizer:
             cutoff=cutoff,
             inplace=inplace,
         )
-        apply_gate_1d(
+        gate_tn_1d(
             p,
             where,
             g_b,
@@ -229,13 +264,14 @@ class MpoOptimizer:
             inplace=inplace,
         )
 
-    def _build_dmrg_target(self, p, where, gate, cutoff):
+    def _build_dmrg_target(self, p, where, gate, bra_gate, cutoff):
         """Build target MPO after applying a two-site gate pair."""
         p_g = p.copy()
         self._apply_gate_pair(
             p_g,
             where,
             gate,
+            bra_gate=bra_gate,
             cutoff=cutoff,
             contract="split-gate",
             inplace=True,
@@ -259,13 +295,15 @@ class MpoOptimizer:
                 colour="CYAN",
             )
 
-        for where, gate in gates:
+        for spec in gates:
+            where, gate, bra_gate = self._parse_gate_spec(spec)
             n_sites = len(where)
             if n_sites == 1:
                 self._apply_gate_pair(
                     p,
                     where,
                     gate,
+                    bra_gate=bra_gate,
                     cutoff=cutoff,
                     contract=True,
                     inplace=True,
@@ -274,7 +312,7 @@ class MpoOptimizer:
                 two_qubit_count += 1
                 xmin, xmax = sorted(where)
                 self.canonize_mpo(p, (xmin, xmax))
-                p_g = self._build_dmrg_target(p, where, gate, cutoff)
+                p_g = self._build_dmrg_target(p, where, gate, bra_gate, cutoff)
 
                 fit = FIT(
                     p_g,
@@ -332,13 +370,14 @@ class MpoOptimizer:
 
         idx = 0
         while idx < len(gates):
-            where, gate = gates[idx]
+            where, gate, bra_gate = self._parse_gate_spec(gates[idx])
             n_sites = len(where)
             if n_sites == 1:
                 self._apply_gate_pair(
                     p,
                     where,
                     gate,
+                    bra_gate=bra_gate,
                     cutoff=cutoff,
                     contract=True,
                     inplace=True,
@@ -351,6 +390,7 @@ class MpoOptimizer:
                     p,
                     where,
                     gate,
+                    bra_gate=bra_gate,
                     cutoff=cutoff,
                     contract="reduce-split",
                     inplace=True,

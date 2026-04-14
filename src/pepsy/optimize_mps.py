@@ -8,7 +8,7 @@ import numpy as np
 import quimb.tensor as qtn
 
 from .fit import FIT
-from .gate import apply_gate_1d
+from .gate import gate_tn_1d
 
 __all__ = ["MpsOptimizer"]
 
@@ -325,9 +325,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         p_g = p.copy()
         for where, gate in batch_ops:
             if len(where) == 1:
-                apply_gate_1d(p_g, where, gate, contract=True, cutoff=cutoff, inplace=True)
+                gate_tn_1d(p_g, where, gate, contract=True, cutoff=cutoff, inplace=True)
             else:
-                p_g = apply_gate_1d(
+                p_g = gate_tn_1d(
                     p_g,
                     where,
                     gate,
@@ -369,7 +369,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         while idx < len(gates):
             where, gate = gates[idx]
             if len(where) == 1:
-                apply_gate_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
+                gate_tn_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
                 idx += 1
                 advanced = 1
             else:
@@ -380,7 +380,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     two_qubit_count += 1
                     xmin, xmax = sorted(where)
                     self.canonize_mps(p, (xmin, xmax))
-                    p_g = apply_gate_1d(
+                    p_g = gate_tn_1d(
                         p,
                         where,
                         gate,
@@ -475,7 +475,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         while idx < len(gates):
             where, gate = gates[idx]
             if len(where) == 1:
-                apply_gate_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
+                gate_tn_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
                 idx += 1
                 advanced = 1
             else:
@@ -542,7 +542,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         while idx < len(gates):
             where, gate = gates[idx]
             if len(where) == 1:
-                apply_gate_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
+                gate_tn_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
                 idx += 1
                 advanced = 1
             else:
@@ -613,7 +613,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         while idx < len(gates):
             where, gate = gates[idx]
             if len(where) == 1:
-                apply_gate_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
+                gate_tn_1d(p, where, gate, contract=True, cutoff=cutoff, inplace=True)
                 idx += 1
                 advanced = 1
             else:
@@ -622,7 +622,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 two_qubit_count += 1
 
                 compress_opts = {"cutoff": cutoff}
-                apply_gate_1d(
+                gate_tn_1d(
                     p,
                     where,
                     gate,

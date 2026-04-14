@@ -136,3 +136,25 @@ def test_mpo_optimizer_svd_rejects_negative_fidelity_samples():
         assert "fidelity_samples must be >= 0" in str(exc)
     else:
         raise AssertionError("Expected ValueError for negative fidelity_samples")
+
+
+def test_mpo_prepare_gate_pair_uses_explicit_bra_when_provided():
+    """When B is provided, use B on bra indices instead of conj(G_k)."""
+    g = qu.CNOT()
+    b = qu.swap()
+    g_k, g_b = py.MpoOptimizer._prepare_gate_pair(g, n_sites=2, bra_gate=b)
+
+    assert (g_k == g.T).all()
+    assert (g_b == b.T).all()
+
+
+def test_mpo_optimizer_accepts_three_tuple_gate_spec():
+    """Gate specs may be (where, G, B) with explicit bra-side operator."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    gates = [
+        ((1,), qu.hadamard(), qu.hadamard()),
+        ((0, 3), qu.CNOT(), qu.swap()),
+    ]
+    opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="svd")
+    out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=1)
+    assert out.L == 4

@@ -9,6 +9,7 @@ from numbers import Integral
 import numpy as np
 import quimb
 import quimb.tensor as qtn
+from .__utils import ansi_wrap, resolve_color_mode
 
 __all__ = [
     "ham_tn",
@@ -128,7 +129,8 @@ class ham_tn:
         -------
         dict
             Dictionary with named outputs and mappings:
-            ``mpo``, ``pepo``, optional ``edges``/``ax``, optional
+            ``mpo``, ``pepo``, optional ``edges``/``plot_text`` (and legacy
+            alias ``ax``), optional
             ``edges_1d`` (when ``edges`` available), ``builder``,
             ``one_d_to_two_d``, and ``two_d_to_one_d``.
         """
@@ -161,6 +163,7 @@ class ham_tn:
             "pepo": out[1],
             "edges": None,
             "edges_1d": None,
+            "plot_text": None,
             "ax": None,
             "builder": builder,
             "one_d_to_two_d": dict(builder.map),
@@ -168,10 +171,12 @@ class ham_tn:
         }
         if return_edges and return_plot:
             payload["edges"] = out[2]
+            payload["plot_text"] = out[3]
             payload["ax"] = out[3]
         elif return_edges:
             payload["edges"] = out[2]
         elif return_plot:
+            payload["plot_text"] = out[2]
             payload["ax"] = out[2]
 
         if payload["edges"] is not None:
@@ -380,8 +385,7 @@ class ham_tn:
         if len(set(chain_sites)) != len(chain_sites):
             raise ValueError("Duplicate sites in one term are not supported.")
 
-        mpo_term = qtn.MPO_identity(
-            self.L,
+        mpo_term = self._identity_mpo_with_swapped_phys_inds(
             phys_dim=phys_dim,
             dtype=dtype,
         )
@@ -394,9 +398,25 @@ class ham_tn:
 
         return mpo_term
 
-    def _zero_mpo(self, *, phys_dim, dtype):
+    def _swap_mpo_phys_inds_(self, mpo):
+        """Swap MPO physical index families from ``(k, b)`` to ``(b, k)``."""
+        mpo.reindex_({f"k{i}": f"l{i}" for i in range(self.L)})
+        mpo.reindex_({f"b{i}": f"k{i}" for i in range(self.L)})
+        mpo.reindex_({f"l{i}": f"b{i}" for i in range(self.L)})
+        return mpo
+
+    def _identity_mpo_with_swapped_phys_inds(self, *, phys_dim, dtype):
+        """Build identity MPO and immediately swap physical index families."""
         mpo = qtn.MPO_identity(
             self.L,
+            phys_dim=phys_dim,
+            dtype=dtype,
+        )
+        self._swap_mpo_phys_inds_(mpo)
+        return mpo
+
+    def _zero_mpo(self, *, phys_dim, dtype):
+        mpo = self._identity_mpo_with_swapped_phys_inds(
             phys_dim=phys_dim,
             dtype=dtype,
         )
@@ -724,58 +744,70 @@ class ham_tn:
         show_legend=True,
         site_positions=None,
         invert_y=None,
+        print_output=True,
+        color="auto",
     ):
-        """Plot lattice geometry and snake traversal with richer styling.
+        """Render lattice geometry and snake traversal as ASCII text.
 
         Parameters
         ----------
         edges : iterable of ((int, int), (int, int))
             Lattice edge list.
-        ax : matplotlib.axes.Axes | None, default=None
-            Optional axis. When None, creates a new figure + axis.
+        ax : object | None, default=None
+            Kept for API compatibility. Ignored by ASCII renderer.
         title : str | None, default=None
-            Plot title.
+            Header title shown above the ASCII preview.
         show_chain_index : bool, default=True
-            If True, annotate each lattice site with its snake-chain index.
+            If True, append the snake chain-index listing.
         snake_arrows : bool, default=True
-            Draw directional arrows along the snake traversal.
-        snake_cmap : str | None, default="plasma"
-            Colormap for progression along the snake path. If None, use
-            ``snake_color`` uniformly.
+            If True, mark snake-path direction on traversed links.
         show_legend : bool, default=True
-            If True, add a compact legend.
+            If True, append a one-line symbol legend.
         site_positions : Mapping[(int, int), (float, float)] | None, default=None
-            Optional plotting coordinates for sites. Useful for lattices whose
-            build coordinates are remapped internally (e.g. hexagonal/kagome).
+            Kept for API compatibility. Ignored by ASCII renderer.
         invert_y : bool | None, default=None
-            Whether to invert the y-axis. Defaults to True for plain integer
-            grids and False when ``site_positions`` is supplied.
-        """
-        try:
-            import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
-            from matplotlib import colors as mcolors  # pylint: disable=import-outside-toplevel
-            from matplotlib.collections import LineCollection  # pylint: disable=import-outside-toplevel
-            from matplotlib.lines import Line2D  # pylint: disable=import-outside-toplevel
-            from matplotlib.patches import FancyArrowPatch  # pylint: disable=import-outside-toplevel
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise ImportError(
-                "plot_lattice_snake requires matplotlib. "
-                "Install with: pip install matplotlib"
-            ) from exc
+            Kept for API compatibility. Ignored by ASCII renderer.
+        print_output : bool, default=True
+            If True, print the rendered text.
+        color : bool | {"auto"}, default="auto"
+            Enable ANSI color styling. ``"auto"`` enables colors when stdout
+            is a TTY.
 
-        def _coerce_plot_point(point):
-            if not isinstance(point, (tuple, list)) or len(point) != 2:
-                raise TypeError(f"plot position must be (x, y), got {point!r}")
-            x_val, y_val = point
-            if not (np.isscalar(x_val) and np.isscalar(y_val)):
-                raise TypeError(f"plot position values must be numeric, got {point!r}")
-            return float(x_val), float(y_val)
+        Returns
+        -------
+        str
+            Multiline ASCII rendering of lattice edges and snake traversal.
+        """
+        _ = (
+            edge_color,
+            snake_color,
+            node_color,
+            edge_alpha,
+            snake_alpha,
+            node_size,
+            edge_linewidth,
+            snake_linewidth,
+            node_edge_color,
+            node_edge_width,
+            snake_cmap,
+            site_positions,
+            invert_y,
+        )
+
+        color_enabled = resolve_color_mode(color)
+
+        if ax is not None:
+            warnings.warn(
+                "plot_lattice_snake now returns ASCII text; argument 'ax' is ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         edges = [tuple(edge) for edge in edges]
         if not edges:
             raise ValueError("edges must not be empty for plotting.")
 
-        edges_norm = []
+        edge_keys = set()
         for idx, edge in enumerate(edges):
             if not isinstance(edge, (tuple, list)) or len(edge) != 2:
                 raise TypeError(
@@ -783,221 +815,236 @@ class ham_tn:
                 )
             site0 = self._coerce_coord(edge[0])
             site1 = self._coerce_coord(edge[1])
-            edges_norm.append((site0, site1))
-        edges = edges_norm
-
-        positions = {}
-        if site_positions is not None:
-            if not hasattr(site_positions, "items"):
-                raise TypeError("site_positions must be a mapping from site to (x, y).")
-            for site, point in site_positions.items():
-                positions[self._coerce_coord(site)] = _coerce_plot_point(point)
-
-        def _pos(site):
-            if site in positions:
-                return positions[site]
-            return float(site[0]), float(site[1])
-
-        sites = sorted({self._coerce_coord(site) for edge in edges for site in edge})
-        node_plot_points = [_pos(site) for site in sites]
-
-        if ax is None:
-            _, ax = plt.subplots(figsize=(7.6, 5.8))
-
-        edge_segments = [
-            (_pos(site0), _pos(site1))
-            for site0, site1 in edges
-        ]
-        edge_collection = LineCollection(
-            edge_segments,
-            colors=edge_color,
-            linewidths=edge_linewidth,
-            alpha=edge_alpha,
-            capstyle="round",
-            zorder=1,
-        )
-        ax.add_collection(edge_collection)
+            edge_keys.add(frozenset((site0, site1)))
 
         snake_sites = [self.map[idx] for idx in range(self.L)]
-        snake_plot_sites = [_pos(site) for site in snake_sites]
-        snake_segments = [
-            (site0, site1)
-            for site0, site1 in zip(snake_plot_sites[:-1], snake_plot_sites[1:])
-        ]
-
-        cmap = None
-        snake_colors = snake_color
-        if snake_segments and snake_cmap is not None:
-            cmap = plt.get_cmap(snake_cmap)
-            snake_colors = cmap(np.linspace(0.08, 0.92, len(snake_segments)))
-            snake_colors[:, 3] = snake_alpha
-
-        snake_collection = LineCollection(
-            snake_segments,
-            colors=snake_colors,
-            linewidths=snake_linewidth,
-            alpha=snake_alpha if snake_cmap is None else 1.0,
-            capstyle="round",
-            zorder=3,
-        )
-        ax.add_collection(snake_collection)
-
-        if snake_arrows and snake_segments:
-            for seg_idx, (site0, site1) in enumerate(zip(snake_plot_sites[:-1], snake_plot_sites[1:])):
-                x0, y0 = site0
-                x1, y1 = site1
-                dx = x1 - x0
-                dy = y1 - y0
-                arrow_start = (x0 + 0.20 * dx, y0 + 0.20 * dy)
-                arrow_end = (x0 + 0.80 * dx, y0 + 0.80 * dy)
-                if snake_cmap is not None and cmap is not None:
-                    ratio = seg_idx / max(len(snake_segments) - 1, 1)
-                    arrow_color = cmap(0.08 + 0.84 * ratio)
-                else:
-                    arrow_color = snake_color
-                arrow = FancyArrowPatch(
-                    arrow_start,
-                    arrow_end,
-                    arrowstyle="-|>",
-                    mutation_scale=12,
-                    linewidth=0.0,
-                    color=arrow_color,
-                    alpha=snake_alpha,
-                    zorder=4,
-                )
-                ax.add_patch(arrow)
-
-        if snake_cmap is not None and cmap is not None:
-            norm = mcolors.Normalize(vmin=0, vmax=max(self.L - 1, 1))
-            node_colors = [
-                cmap(norm(self.map_inv[(x, y)]))
-                for x, y in sites
-            ]
-        else:
-            node_colors = node_color
-
-        x_nodes = [pt[0] for pt in node_plot_points]
-        y_nodes = [pt[1] for pt in node_plot_points]
-        ax.scatter(
-            x_nodes,
-            y_nodes,
-            s=node_size,
-            c=node_colors,
-            edgecolors=node_edge_color,
-            linewidths=node_edge_width,
-            zorder=5,
-        )
-
-        start_x, start_y = snake_plot_sites[0]
-        end_x, end_y = snake_plot_sites[-1]
-        ax.scatter(
-            [start_x],
-            [start_y],
-            s=node_size * 1.35,
-            c="#2ca02c",
-            marker="s",
-            edgecolors="white",
-            linewidths=1.3,
-            zorder=6,
-        )
-        ax.scatter(
-            [end_x],
-            [end_y],
-            s=node_size * 1.45,
-            c="#d62728",
-            marker="X",
-            edgecolors="white",
-            linewidths=1.3,
-            zorder=6,
-        )
-
-        if show_chain_index:
-            for chain_idx, (x_val, y_val) in enumerate(snake_plot_sites):
-                ax.text(
-                    x_val,
-                    y_val,
-                    str(chain_idx),
-                    fontsize=7.5,
-                    color="white",
-                    ha="center",
-                    va="center",
-                    weight="bold",
-                    zorder=7,
-                )
-
-        if show_legend:
-            snake_legend_color = snake_color
-            if snake_cmap is not None and cmap is not None:
-                snake_legend_color = cmap(0.5)
-            legend_handles = [
-                Line2D([0], [0], color=edge_color, lw=edge_linewidth, label="Lattice edges"),
-                Line2D([0], [0], color=snake_legend_color, lw=snake_linewidth, label="Snake path"),
-                Line2D(
-                    [0],
-                    [0],
-                    marker="s",
-                    linestyle="",
-                    markerfacecolor="#2ca02c",
-                    markeredgecolor="white",
-                    markersize=8,
-                    label="Snake start",
-                ),
-                Line2D(
-                    [0],
-                    [0],
-                    marker="X",
-                    linestyle="",
-                    markerfacecolor="#d62728",
-                    markeredgecolor="white",
-                    markersize=8,
-                    label="Snake end",
-                ),
-            ]
-            ax.legend(
-                handles=legend_handles,
-                loc="upper right",
-                frameon=True,
-                framealpha=0.92,
-                fontsize=8,
-            )
+        snake_dir = {}
+        for site0, site1 in zip(snake_sites[:-1], snake_sites[1:]):
+            dx = site1[0] - site0[0]
+            dy = site1[1] - site0[1]
+            if dx == 1 and dy == 0:
+                token = "r"
+            elif dx == -1 and dy == 0:
+                token = "l"
+            elif dx == 0 and dy == 1:
+                token = "u"
+            elif dx == 0 and dy == -1:
+                token = "d"
+            elif dx == 1 and dy == -1:
+                token = "dr"
+            elif dx == -1 and dy == 1:
+                token = "ul"
+            elif dx == 1 and dy == 1:
+                token = "ur"
+            elif dx == -1 and dy == -1:
+                token = "dl"
+            else:
+                token = "."
+            snake_dir[frozenset((site0, site1))] = token
 
         if title is None:
             title = f"Lattice Geometry + Snake MPS Path ({self.L_x}x{self.L_y})"
 
-        ax.set_title(title)
-        ax.set_xlabel("x")
-        ax.set_ylabel("y")
-        ax.set_aspect("equal", adjustable="box")
+        row_count = max(1, 2 * self.L_y - 1)
+        row_width = 4 * self.L_x - 3
+        canvas = [[" "] * row_width for _ in range(row_count)]
+        layer = [["empty"] * row_width for _ in range(row_count)]
 
-        if positions:
-            x_min = min(x_nodes)
-            x_max = max(x_nodes)
-            y_min = min(y_nodes)
-            y_max = max(y_nodes)
-            span = max(x_max - x_min, y_max - y_min, 1.0)
-            pad = 0.10 * span
-            ax.set_xlim(x_min - pad, x_max + pad)
-            ax.set_ylim(y_min - pad, y_max + pad)
-            ax.set_xticks([])
-            ax.set_yticks([])
-        else:
-            ax.set_xticks(range(self.L_x))
-            ax.set_yticks(range(self.L_y))
-            ax.set_xlim(-0.6, self.L_x - 0.4)
-            ax.set_ylim(-0.6, self.L_y - 0.4)
+        node_to_rc = {
+            (x, y): (2 * (self.L_y - 1 - y), 4 * x)
+            for x in range(self.L_x)
+            for y in range(self.L_y)
+        }
+        for (x, y), (row, col) in node_to_rc.items():
+            if 0 <= row < row_count and 0 <= col < row_width:
+                _ = (x, y)
+                canvas[row][col] = "●"
+                layer[row][col] = "node"
 
-        if invert_y is None:
-            invert_y = not positions
-        if invert_y:
-            ax.invert_yaxis()
+        def _put(row, col, char, layer_name):
+            if not (0 <= row < row_count and 0 <= col < row_width):
+                return
+            current = canvas[row][col]
+            if current == "●":
+                return
+            char_priority = {
+                " ": 0,
+                "-": 1,
+                "_": 1,
+                "|": 1,
+                "/": 1,
+                "\\": 1,
+                "*": 1,
+                ">": 2,
+                "<": 2,
+                "^": 2,
+                "v": 2,
+            }
+            layer_priority = {
+                "empty": 0,
+                "lattice": 1,
+                "snake": 2,
+                "node": 3,
+            }
+            current_layer = layer[row][col]
+            new_lp = layer_priority.get(layer_name, 1)
+            old_lp = layer_priority.get(current_layer, 0)
+            new_cp = char_priority.get(char, 1)
+            old_cp = char_priority.get(current, 0)
+            if (new_lp > old_lp) or (new_lp == old_lp and new_cp >= old_cp):
+                canvas[row][col] = char
+                layer[row][col] = layer_name
 
-        ax.set_facecolor("#f7f8fb")
-        ax.grid(alpha=0.22, linewidth=0.8)
+        periodic_edges_summary = set()
+        for edge_key in edge_keys:
+            site0, site1 = tuple(edge_key)
+            if site0 not in node_to_rc or site1 not in node_to_rc:
+                continue
+            row0, col0 = node_to_rc[site0]
+            row1, col1 = node_to_rc[site1]
+            token = snake_dir.get(edge_key)
+            x0, y0 = site0
+            x1, y1 = site1
 
-        for spine in ax.spines.values():
-            spine.set_visible(False)
+            wrap_x = self.L_x > 2 and {x0, x1} == {0, self.L_x - 1}
+            wrap_y = self.L_y > 2 and {y0, y1} == {0, self.L_y - 1}
+            far_jump = abs(x1 - x0) > 1 or abs(y1 - y0) > 1
+            is_cyclic_edge = bool(wrap_x or wrap_y or far_jump)
+            if is_cyclic_edge:
+                periodic_edges_summary.add(tuple(sorted((site0, site1))))
 
-        return ax
+            if row0 == row1 and abs(col0 - col1) == 4:
+                col_left = min(col0, col1)
+                if token in {"r", "l"}:
+                    if snake_arrows:
+                        connector = "__>" if token == "r" else "<__"
+                    else:
+                        connector = "___"
+                    conn_layer = "snake"
+                else:
+                    connector = "___"
+                    conn_layer = "cyclic" if is_cyclic_edge else "lattice"
+                for i, ch in enumerate(connector):
+                    _put(row0, col_left + 1 + i, ch, conn_layer)
+                continue
+
+            if col0 == col1 and abs(row0 - row1) == 2:
+                row_mid = (row0 + row1) // 2
+                if token in {"u", "d"}:
+                    if snake_arrows:
+                        symbol = "^" if token == "u" else "v"
+                    else:
+                        symbol = "|"
+                    conn_layer = "snake"
+                else:
+                    symbol = "|"
+                    conn_layer = "cyclic" if is_cyclic_edge else "lattice"
+                _put(row_mid, col0, symbol, conn_layer)
+                continue
+
+            if abs(row0 - row1) == 2 and abs(col0 - col1) == 4:
+                row_mid = (row0 + row1) // 2
+                col_mid = (col0 + col1) // 2
+                slope = (row1 - row0) * (col1 - col0)
+                base = "\\" if slope > 0 else "/"
+                if token in {"dr", "ur", "dl", "ul"}:
+                    if snake_arrows and token in {"dr", "ur"}:
+                        symbol = ">"
+                    elif snake_arrows and token in {"dl", "ul"}:
+                        symbol = "<"
+                    else:
+                        symbol = base
+                    conn_layer = "snake"
+                else:
+                    symbol = base
+                    conn_layer = "cyclic" if is_cyclic_edge else "lattice"
+                _put(row_mid, col_mid, symbol, conn_layer)
+                continue
+
+            # Non-local periodic connections are summarized separately below.
+            if is_cyclic_edge:
+                continue
+
+            row_mid = (row0 + row1) // 2
+            col_mid = (col0 + col1) // 2
+            _put(row_mid, col_mid, "_", "snake" if token is not None else "lattice")
+
+        def _style_row(chars, layers):
+            if not color_enabled:
+                return "".join(chars)
+            codes = {
+                "node": "1;37",
+                "lattice": "36",
+                "cyclic": "1;35",
+                "snake": "90",
+            }
+            out = []
+            for ch, layer_name in zip(chars, layers):
+                if ch == " ":
+                    out.append(ch)
+                    continue
+                if layer_name == "snake" and ch in {">", "<", "^", "v"}:
+                    code = "1;31"
+                else:
+                    code = codes.get(layer_name)
+                out.append(ansi_wrap(ch, code, True) if code else ch)
+            return "".join(out)
+
+        lines = [title]
+        for row in range(row_count):
+            if row % 2 == 0:
+                y = self.L_y - 1 - (row // 2)
+                prefix = f"Y{y:<2} "
+            else:
+                prefix = "    "
+            if color_enabled and row % 2 == 0:
+                prefix = ansi_wrap(prefix, "1;33", True)
+            lines.append(prefix + _style_row(canvas[row], layer[row]))
+
+        x_line = "    " + "   ".join(f"X{x}" for x in range(self.L_x))
+        if color_enabled:
+            x_line = ansi_wrap(x_line, "1;33", True)
+        lines.append(x_line)
+
+        if show_legend:
+            legend = "legend: ● node  _|/\\ edge  > < ^ v snake direction"
+            if color_enabled:
+                legend = (
+                    "legend: "
+                    + ansi_wrap("●", "1;37", True)
+                    + " node  "
+                    + ansi_wrap("___|/\\", "36", True)
+                    + " lattice  "
+                    + ansi_wrap("___|", "90", True)
+                    + " snake  "
+                    + ansi_wrap("> < ^ v", "1;31", True)
+                    + " direction  "
+                    + ansi_wrap("~~~", "1;35", True)
+                    + " cyclic"
+                )
+            lines.append(legend)
+
+        if periodic_edges_summary:
+            header = "cyclic edges (wrap connections):"
+            if color_enabled:
+                header = ansi_wrap(header, "1;35", True)
+            lines.append(header)
+            for site0, site1 in sorted(periodic_edges_summary):
+                edge_line = f"  {site0} <-> {site1}"
+                if color_enabled:
+                    edge_line = ansi_wrap(edge_line, "1;35", True)
+                lines.append(edge_line)
+
+        if show_chain_index:
+            lines.append(
+                "snake: "
+                + ", ".join(f"{idx}:{coord}" for idx, coord in enumerate(snake_sites))
+            )
+
+        text = "\n".join(lines)
+        if print_output:
+            print(text)
+        return text
 
     def build_itf(
         self,
@@ -1051,11 +1098,11 @@ class ham_tn:
         edge_kwargs : dict | None, default=None
             Extra kwargs forwarded to the edge generator.
         plot_geometry : bool, default=False
-            If True, plot lattice geometry and snake traversal path.
+            If True, render a text preview of lattice geometry + snake path.
         plot_kwargs : dict | None, default=None
             Extra kwargs forwarded to :meth:`plot_lattice_snake`.
         return_plot : bool, default=False
-            If True, include plot axis in the return tuple.
+            If True, include rendered ASCII text in the return tuple.
         return_edges : bool, default=False
             If True, return ``(H_mpo, H_pepo, edges)``.
 
@@ -1064,7 +1111,7 @@ class ham_tn:
         tuple
             ``(H_mpo, H_pepo)`` by default, or
             ``(H_mpo, H_pepo, edges)`` when ``return_edges=True``, or
-            includes ``ax`` when ``return_plot=True``.
+            includes rendered text when ``return_plot=True``.
         """
 
         def _is_xy_site(site):
@@ -1246,7 +1293,7 @@ class ham_tn:
             cycle_bond_dim=cycle_bond_dim,
         )
 
-        ax = None
+        plot_text = None
         if plot_geometry or return_plot:
             plot_opts = dict(plot_kwargs)
             if "title" not in plot_opts:
@@ -1257,12 +1304,14 @@ class ham_tn:
                 plot_opts["site_positions"] = plot_site_positions
             if plot_site_positions is not None and "invert_y" not in plot_opts:
                 plot_opts["invert_y"] = False
-            ax = builder_use.plot_lattice_snake(edges_norm, **plot_opts)
+            if "print_output" not in plot_opts:
+                plot_opts["print_output"] = bool(plot_geometry)
+            plot_text = builder_use.plot_lattice_snake(edges_norm, **plot_opts)
 
         if return_edges and return_plot:
-            return h_mpo, h_pepo, tuple(edges_norm), ax
+            return h_mpo, h_pepo, tuple(edges_norm), plot_text
         if return_edges:
             return h_mpo, h_pepo, tuple(edges_norm)
         if return_plot:
-            return h_mpo, h_pepo, ax
+            return h_mpo, h_pepo, plot_text
         return h_mpo, h_pepo
