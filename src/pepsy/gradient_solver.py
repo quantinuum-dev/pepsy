@@ -8,8 +8,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import torch
 from tqdm.auto import tqdm
+try:
+    import torch
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None
 
 __all__ = [
     "SUPPORTED_SOLVERS",
@@ -24,9 +27,19 @@ SUPPORTED_SOLVERS = (
     "nlopt",
 )
 
-_TORCH_SOLVERS = {
-    "torch-adam": torch.optim.Adam,
-}
+_TORCH_SOLVERS = {}
+if torch is not None:
+    _TORCH_SOLVERS = {
+        "torch-adam": torch.optim.Adam,
+    }
+
+
+def _require_torch() -> None:
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "pepsy.gradient_solver requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
 
 
 @dataclass(frozen=True)
@@ -1012,6 +1025,7 @@ def _optimize_dispatch(
     progress_callback: Callable[[int, float], None] | None,
 ):
     """Core backend dispatch used by :class:`GradientOptimizer`."""
+    _require_torch()
     if n_steps <= 0:
         raise ValueError("n_steps must be >= 1")
     if log_every <= 0:

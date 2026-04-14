@@ -1,5 +1,7 @@
 """Basic public API smoke tests for the pepsy package."""
 
+import importlib.util
+
 import pepsy
 import pytest
 
@@ -171,8 +173,12 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.expec_tn_1d)
     with pytest.raises(AttributeError):
         _ = pepsy.peps_I
-    assert callable(pepsy.reg_complex_svd_torch)
-    assert callable(pepsy.reg_complex_svd_jax)
+    has_torch = importlib.util.find_spec("torch") is not None
+    has_jax = importlib.util.find_spec("jax") is not None
+    if has_torch:
+        assert callable(pepsy.reg_complex_svd_torch)
+    if has_jax:
+        assert callable(pepsy.reg_complex_svd_jax)
     assert callable(pepsy.SweepOptimizer)
     assert callable(pepsy.MpsOptimizer)
     assert pepsy.optimize_global is not None

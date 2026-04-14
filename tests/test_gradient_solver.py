@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from pepsy.gradient_solver import GradientOptimizer, SUPPORTED_SOLVERS
 from pepsy.optimize_sweep import SweepOptimizer

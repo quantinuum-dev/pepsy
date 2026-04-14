@@ -7,8 +7,11 @@ from typing import Any
 
 import numpy as np
 import cotengra as ctg
-import torch
 import quimb.tensor as qtn
+try:
+    import torch
+except ImportError:  # pragma: no cover - optional dependency
+    torch = None
 
 from ._tn_validation import _PHYS_OUTER, validate_tensor_network_tags
 
@@ -141,6 +144,11 @@ def reset_default_backends():
 
 def backend_torch(device="cpu", dtype=None, requires_grad=False):
     """Return a converter that materializes arrays as torch tensors."""
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "backend_torch requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
 
     def cast_array(x, device=device, dtype=dtype, requires_grad=requires_grad):
 
@@ -222,6 +230,11 @@ def register_torch_linalg(mode="complex"):
     mode : {"complex", "real"}, default="complex"
         Which SVD/QR registrations to install.
     """
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "register_torch_linalg requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
     from . import linalg_registrations as lr  # pylint: disable=import-outside-toplevel
 
     if mode == "complex":

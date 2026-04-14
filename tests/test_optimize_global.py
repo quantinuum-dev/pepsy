@@ -77,6 +77,7 @@ def test_global_optimizer_builds_tnoptimizer():
 
 def test_global_optimizer_optimize_smoke():
     """Optimize should run a short TNOptimizer step and return a PEPS-like TN."""
+    pytest.importorskip("torch")
     peps = _rand_peps(seed=19)
     peps_target = peps.copy()
     ref = abs(complex(GlobalOptimizer._norm_state(peps_target.copy(), mode="exact", opt="auto-hq")))
