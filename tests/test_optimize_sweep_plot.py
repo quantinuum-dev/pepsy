@@ -1090,10 +1090,10 @@ def test_metrics_uses_tn_fidelity_with_optimizer(monkeypatch):
 
     captured = {}
 
-    def _fake_tn_fidelity(state, state_target, *, opt=None):
+    def _fake_tn_fidelity(state, state_target, *, contraction_opt=None):
         captured["state"] = state
         captured["state_target"] = state_target
-        captured["opt"] = opt
+        captured["contraction_opt"] = contraction_opt
         return 0.75
 
     monkeypatch.setattr(sweep_mod, "tn_fidelity", _fake_tn_fidelity)
@@ -1104,7 +1104,7 @@ def test_metrics_uses_tn_fidelity_with_optimizer(monkeypatch):
     assert loss == pytest.approx(0.25)
     assert captured["state"] is opt.state
     assert captured["state_target"] is opt.state_target
-    assert captured["opt"] == "auto-hq"
+    assert captured["contraction_opt"] == "auto-hq"
 
 
 def test_constructor_renormalize_uses_requested_options(monkeypatch):

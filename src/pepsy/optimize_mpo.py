@@ -7,10 +7,20 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
+from .core import tn_norm
 from .fit import FIT
-from .gate import gate_tn_1d
+from .gate import _normalize_gate_entries, gate as apply_gate
 
 __all__ = ["MpoOptimizer"]
+
+
+def _normalize_gate_queue(gates):
+    """Return ``(gate_list, where_list)`` from canonical bundled stream input."""
+    entries = _normalize_gate_entries(gates, where=None, allow_empty=True)
+    if not entries:
+        return [], []
+    gate_list, where_list = zip(*entries)
+    return list(gate_list), [tuple(w) if isinstance(w, list) else w for w in where_list]
 
 
 class MpoOptimizer:
@@ -20,16 +30,27 @@ class MpoOptimizer:
     ----------
     mpo : qtn.MatrixProductOperator
         Initial MPO.
-    gates : sequence[tuple] | None, optional
-        Gate stream in either form:
-        - ``(where, G)``: default bra operator is ``G†``.
-        - ``(where, G, B)``: explicit bra operator ``B`` (e.g. ``V†``).
+    gates : sequence[object] | None, optional
+        Canonical bundled gate stream ``((gate, where), ...)``. For each entry:
+        - ``gate`` applies ``G O G†`` (same gate on ket and bra families),
+        - ``(G,)`` applies ket-only (shorthand for ``(G, None)``),
+        - ``(G, B)`` applies ``G O B†``,
+        - ``(G, None)`` applies ket-only,
+        - ``(None, B)`` applies bra-only.
+        Either side may be ``None`` to skip it.
     chi : int
         Working bond dimension.
     mode : {"dmrg", "svd"}, default="dmrg"
         Execution backend.
+    ind_id_k : str, default="k{}"
+        Site-index format string for ket-family physical legs.
+    ind_id_b : str, default="b{}"
+        Site-index format string for bra-family physical legs.
     contraction_opt : object | None, optional
         Contraction path optimizer keyword used inside :class:`FIT`.
+    inplace : bool, default=False
+        Whether to optimize the provided input MPO object directly. If
+        ``False``, a copy is made and the original input remains unchanged.
     """
 
     _ALLOWED_MODES = frozenset({"dmrg", "svd"})
@@ -52,6 +73,7 @@ class MpoOptimizer:
         ind_id_k="k{}",
         ind_id_b="b{}",
         contraction_opt=None,
+        inplace=False,
     ):
         if chi is None:
             if isinstance(gates, Integral):
@@ -63,18 +85,16 @@ class MpoOptimizer:
                     "or MpoOptimizer(mpo, chi) for an empty gate queue."
                 )
 
-        if gates is None:
-            gates = []
-
-        self.p = mpo
-        self.mpo = self.p
-        self.gates = list(gates)
+        self.inplace = bool(inplace)
+        self.p = mpo if self.inplace else mpo.copy()
+        self.G, self.where = _normalize_gate_queue(gates)
         self.chi = int(chi)
         self.mode = self._normalize_mode(mode)
         self.ind_id_k = str(ind_id_k)
         self.ind_id_b = str(ind_id_b)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
 
+        self.norm_mpo = self._measure_norm(self.p)
         self.info_c = {}
         self.fidelity_trace = [1.0]
         self._init_canonicalization()
@@ -109,8 +129,8 @@ class MpoOptimizer:
 
     def set_mpo(self, mpo):
         """Assign a new MPO and reset canonicalization metadata."""
-        self.p = mpo
-        self.mpo = self.p
+        self.p = mpo if self.inplace else mpo.copy()
+        self.norm_mpo = self._measure_norm(self.p)
         self._init_canonicalization()
         return self
 
@@ -120,13 +140,15 @@ class MpoOptimizer:
         return self
 
     def set_gates(self, gates):
-        """Replace the current gate list with ``gates``."""
-        self.gates = list(gates)
+        """Replace the current gate queue with canonical bundled entries."""
+        self.G, self.where = _normalize_gate_queue(gates)
         return self
 
     def add_gates(self, gates):
-        """Append ``gates`` to the current gate list."""
-        self.gates.extend(list(gates))
+        """Append canonical bundled entries to the existing gate queue."""
+        G_new, where_new = _normalize_gate_queue(gates)
+        self.G.extend(G_new)
+        self.where.extend(where_new)
         return self
 
     @staticmethod
@@ -167,10 +189,21 @@ class MpoOptimizer:
         return float(real_value)
 
     def _append_norm_proxy_sample(self, p):
-        """Append current state norm proxy as a real float and return it."""
-        norm_val = self._real_float(p.norm())
+        """Append current normalized MPO norm and return it."""
+        norm_val = self._normalize_norm(self._measure_norm(p))
         self.fidelity_trace.append(norm_val)
         return norm_val
+
+    def _measure_norm(self, p):
+        """Measure the MPO norm using the shared TN contraction helper."""
+        return self._real_float(tn_norm(p, contraction_opt=self.contraction_opt))
+
+    def _normalize_norm(self, norm_val):
+        """Normalize a norm measurement against the initial MPO norm."""
+        ref = float(self.norm_mpo)
+        if ref == 0.0:
+            return 0.0 if norm_val == 0.0 else float("inf")
+        return float(norm_val) / ref
 
     @staticmethod
     def _prepare_gate_tensor(gate, n_sites):
@@ -199,42 +232,52 @@ class MpoOptimizer:
     def _prepare_gate_pair(gate, n_sites, bra_gate=None):
         """Return gate tensors for ket/bra index families.
 
-        If ``bra_gate`` is supplied, it is used on bra indices after being
-        normalized to ket-index ordering. Otherwise the bra operator defaults
-        to ``conj(g_k)``.
+        ``gate`` is applied on ket indices (transpose/index-order normalization).
+        ``bra_gate`` is applied on bra indices as ``bra_gate†`` after the same
+        normalization. Either side may be omitted with ``None``.
         """
-        g_k = MpoOptimizer._prepare_gate_tensor(gate, n_sites)
+        if gate is None and bra_gate is None:
+            raise ValueError("At least one of ket gate or bra gate must be provided.")
+
+        g_k = None if gate is None else MpoOptimizer._prepare_gate_tensor(gate, n_sites)
         if bra_gate is None:
-            g_b = ar.do("conj", g_k)
+            g_b = None
         else:
-            g_b = MpoOptimizer._prepare_gate_tensor(bra_gate, n_sites)
+            g_b = ar.do("conj", MpoOptimizer._prepare_gate_tensor(bra_gate, n_sites))
         return g_k, g_b
 
     @staticmethod
-    def _parse_gate_spec(spec):
-        """Normalize one gate spec into ``(where, ket_gate, bra_gate_or_none)``."""
-        if not isinstance(spec, (tuple, list)):
-            raise TypeError(
-                "Each gate spec must be tuple/list in form (where, G) or (where, G, B)."
-            )
-        if len(spec) == 2:
-            where, gate = spec
-            bra_gate = None
-        elif len(spec) == 3:
-            where, gate, bra_gate = spec
-        else:
-            raise ValueError("Each gate spec must have length 2 or 3.")
+    def _parse_gate_entry(G_i, where_i):
+        """Normalize one gate-stream entry to ``(ket_gate, bra_gate, where)``.
 
-        where_norm = tuple(where)
+        Bare gates default to two-sided MPO evolution by mapping ``G`` to
+        ``(G, G)``, which is interpreted as ``G`` on ket and ``G†`` on bra.
+        """
+        where_norm = tuple(where_i)
         if len(where_norm) not in (1, 2):
             raise ValueError("Each gate location must have one or two sites.")
-        return where_norm, gate, bra_gate
+
+        if isinstance(G_i, (tuple, list)):
+            if len(G_i) == 1:
+                # Explicit ket-only shorthand: (G,) -> (G, None)
+                gate, bra_gate = G_i[0], None
+            elif len(G_i) == 2:
+                gate, bra_gate = G_i
+            else:
+                raise ValueError("Each MPO gate entry must be G, (G,), or (G, B).")
+        else:
+            # Default MPO evolution applies U on ket and U† on bra.
+            gate, bra_gate = G_i, G_i
+
+        if gate is None and bra_gate is None:
+            raise ValueError("Each gate entry must provide at least one of G or B.")
+        return gate, bra_gate, where_norm
 
     def _apply_gate_pair(
         self,
         p,
-        where,
         gate,
+        where,
         bra_gate=None,
         *,
         cutoff,
@@ -245,32 +288,34 @@ class MpoOptimizer:
         n_sites = len(where)
         g_k, g_b = self._prepare_gate_pair(gate, n_sites, bra_gate=bra_gate)
 
-        gate_tn_1d(
-            p,
-            where,
-            g_k,
-            ind_id=self.ind_id_k,
-            contract=contract,
-            cutoff=cutoff,
-            inplace=inplace,
-        )
-        gate_tn_1d(
-            p,
-            where,
-            g_b,
-            ind_id=self.ind_id_b,
-            contract=contract,
-            cutoff=cutoff,
-            inplace=inplace,
-        )
+        if g_k is not None:
+            apply_gate(
+                p,
+                g_k,
+                where,
+                ind_id=self.ind_id_k,
+                contract=contract,
+                cutoff=cutoff,
+                inplace=inplace,
+            )
+        if g_b is not None:
+            apply_gate(
+                p,
+                g_b,
+                where,
+                ind_id=self.ind_id_b,
+                contract=contract,
+                cutoff=cutoff,
+                inplace=inplace,
+            )
 
-    def _build_dmrg_target(self, p, where, gate, bra_gate, cutoff):
+    def _build_dmrg_target(self, p, gate, where, bra_gate, cutoff):
         """Build target MPO after applying a two-site gate pair."""
         p_g = p.copy()
         self._apply_gate_pair(
             p_g,
-            where,
             gate,
+            where,
             bra_gate=bra_gate,
             cutoff=cutoff,
             contract="split-gate",
@@ -278,8 +323,52 @@ class MpoOptimizer:
         )
         return p_g
 
-    def _run_dmrg(self, gates, n_iter, progbar=False, cutoff=1e-12):
+    @staticmethod
+    def _collect_dmrg_batch(G_seq, where_seq, start_idx, k_2q_batch):
+        """Collect a DMRG batch starting at a two-site gate index."""
+        batch_G = []
+        batch_where = []
+        two_qubit_in_batch = 0
+        idx = start_idx
+
+        while idx < len(G_seq) and two_qubit_in_batch < k_2q_batch:
+            where = tuple(where_seq[idx])
+            gate = G_seq[idx]
+            if len(where) == 1:
+                batch_where.append(where)
+                batch_G.append(gate)
+            elif len(where) == 2:
+                batch_where.append(where)
+                batch_G.append(gate)
+                two_qubit_in_batch += 1
+            else:
+                raise ValueError("Each gate location must have one or two sites.")
+            idx += 1
+
+        return batch_G, batch_where, two_qubit_in_batch, idx
+
+    def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff):
+        """Apply a collected DMRG batch onto a copy of ``p``."""
+        p_g = p.copy()
+        for G_i, where_i in zip(batch_G, batch_where):
+            gate, bra_gate, where = self._parse_gate_entry(G_i, where_i)
+            contract = True if len(where) == 1 else "split-gate"
+            self._apply_gate_pair(
+                p_g,
+                gate,
+                where,
+                bra_gate=bra_gate,
+                cutoff=cutoff,
+                contract=contract,
+                inplace=True,
+            )
+        return p_g
+
+    def _run_dmrg(self, G_seq, where_seq, n_iter, progbar=False, cutoff=1e-12, k_2q_batch=1):
         """Apply gates with local DMRG-style fitting updates."""
+        if k_2q_batch < 1:
+            raise ValueError("k_2q_batch must be >= 1.")
+
         p = self.p
         two_qubit_count = 0
 
@@ -288,49 +377,81 @@ class MpoOptimizer:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
             pbar = tqdm(
-                total=len(gates),
+                total=len(G_seq),
                 desc="dmrg_mpo",
                 leave=True,
                 position=0,
                 colour="CYAN",
             )
 
-        for spec in gates:
-            where, gate, bra_gate = self._parse_gate_spec(spec)
+        idx = 0
+        while idx < len(G_seq):
+            gate, bra_gate, where = self._parse_gate_entry(G_seq[idx], where_seq[idx])
             n_sites = len(where)
             if n_sites == 1:
                 self._apply_gate_pair(
                     p,
-                    where,
                     gate,
+                    where,
                     bra_gate=bra_gate,
                     cutoff=cutoff,
                     contract=True,
                     inplace=True,
                 )
+                idx += 1
+                advanced = 1
             elif n_sites == 2:
-                two_qubit_count += 1
-                xmin, xmax = sorted(where)
-                self.canonize_mpo(p, (xmin, xmax))
-                p_g = self._build_dmrg_target(p, where, gate, bra_gate, cutoff)
+                if k_2q_batch == 1:
+                    two_qubit_count += 1
+                    xmin, xmax = sorted(where)
+                    self.canonize_mpo(p, (xmin, xmax))
+                    p_g = self._build_dmrg_target(p, gate, where, bra_gate, cutoff)
 
-                fit = FIT(
-                    p_g,
-                    p=p,
-                    cutoffs=cutoff,
-                    contraction_opt=self.contraction_opt,
-                    retag=False,
-                    range_int=[xmin, xmax],
-                )
-                fit.run_gate(n_iter=n_iter, verbose=False)
-                p = fit.p
+                    fit = FIT(
+                        p_g,
+                        p=p,
+                        cutoffs=cutoff,
+                        contraction_opt=self.contraction_opt,
+                        retag=False,
+                        range_int=[xmin, xmax],
+                    )
+                    fit.run_gate(n_iter=n_iter, verbose=False)
+                    p = fit.p
 
-                if fit.local_norm_trace:
-                    self.fidelity_trace.append(complex(fit.local_norm_trace[-1]).real)
+                    self._append_norm_proxy_sample(p)
+
+                    self.info_c["cur_orthog"] = (xmin, xmax)
+                    idx += 1
+                    advanced = 1
                 else:
-                    self.fidelity_trace.append(self.fidelity_trace[-1])
+                    batch_G, batch_where, two_qubit_in_batch, next_idx = self._collect_dmrg_batch(
+                        G_seq, where_seq, idx, k_2q_batch
+                    )
+                    if two_qubit_in_batch < 1:
+                        raise RuntimeError("DMRG batch unexpectedly contains no two-qubit gates.")
 
-                self.info_c["cur_orthog"] = (xmin, xmax)
+                    two_qubit_count += two_qubit_in_batch
+                    batch_span_sites = [site for where_i in batch_where for site in where_i]
+                    xmin, xmax = min(batch_span_sites), max(batch_span_sites)
+                    self.canonize_mpo(p, (xmin, xmax))
+                    p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff)
+
+                    fit = FIT(
+                        p_g,
+                        p=p,
+                        cutoffs=cutoff,
+                        contraction_opt=self.contraction_opt,
+                        retag=False,
+                        range_int=[xmin, xmax],
+                    )
+                    fit.run_gate(n_iter=n_iter, verbose=False)
+                    p = fit.p
+
+                    self._append_norm_proxy_sample(p)
+
+                    self.info_c["cur_orthog"] = (xmin, xmax)
+                    advanced = next_idx - idx
+                    idx = next_idx
             else:
                 raise ValueError("Each gate location must have one or two sites.")
 
@@ -341,19 +462,18 @@ class MpoOptimizer:
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
-                pbar.update(1)
+                pbar.update(advanced)
 
         if pbar is not None:
             pbar.close()
 
         self.p = p
-        self.mpo = self.p
 
-    def _run_svd(self, gates, progbar=False, cutoff=1e-12, fidelity_samples=10):
+    def _run_svd(self, G_seq, where_seq, progbar=False, cutoff=1e-12, fidelity_samples=10):
         """Apply gates with local SVD compression for two-site updates."""
         p = self.p
         two_qubit_count = 0
-        sample_steps = self._sampling_steps(len(gates), fidelity_samples)
+        sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
         norm_proxy = self.fidelity_trace[-1]
 
         pbar = None
@@ -361,7 +481,7 @@ class MpoOptimizer:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
             pbar = tqdm(
-                total=len(gates),
+                total=len(G_seq),
                 desc="svd_mpo",
                 leave=True,
                 position=0,
@@ -369,14 +489,14 @@ class MpoOptimizer:
             )
 
         idx = 0
-        while idx < len(gates):
-            where, gate, bra_gate = self._parse_gate_spec(gates[idx])
+        while idx < len(G_seq):
+            gate, bra_gate, where = self._parse_gate_entry(G_seq[idx], where_seq[idx])
             n_sites = len(where)
             if n_sites == 1:
                 self._apply_gate_pair(
                     p,
-                    where,
                     gate,
+                    where,
                     bra_gate=bra_gate,
                     cutoff=cutoff,
                     contract=True,
@@ -388,8 +508,8 @@ class MpoOptimizer:
 
                 self._apply_gate_pair(
                     p,
-                    where,
                     gate,
+                    where,
                     bra_gate=bra_gate,
                     cutoff=cutoff,
                     contract="reduce-split",
@@ -425,7 +545,6 @@ class MpoOptimizer:
             pbar.close()
 
         self.p = p
-        self.mpo = self.p
 
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -435,6 +554,7 @@ class MpoOptimizer:
         progbar=False,
         cutoff=1e-12,
         fidelity_samples=10,
+        k_2q_batch=1,
     ):
         """Run queued gates on both MPO index families.
 
@@ -452,27 +572,45 @@ class MpoOptimizer:
         fidelity_samples : int, default=10
             ``svd`` mode only: number of intermediate norm-proxy samples.
             A final sample is always recorded at the end of the run.
+        k_2q_batch : int, default=1
+            ``dmrg`` mode only: number of sequential two-qubit gates to batch
+            into one local FIT update. The FIT window uses the batch-wide
+            ``[xmin, xmax]`` from all gate locations in the batch.
+
+        Returns
+        -------
+        qtn.MatrixProductOperator
+            Updated MPO after replaying the queued gate stream.
         """
         if mode is not None:
             self.set_mode(mode)
 
-        gates = list(self.gates)
-        if not gates:
-            return self.mpo
+        G_seq = list(self.G)
+        where_seq = list(self.where)
+        if not G_seq:
+            return self.p
 
         if self.mode == "dmrg":
             self._prepare_dmrg_state()
-            self._run_dmrg(gates, n_iter=n_iter, progbar=progbar, cutoff=cutoff)
-            return self.mpo
+            self._run_dmrg(
+                G_seq,
+                where_seq,
+                n_iter=n_iter,
+                progbar=progbar,
+                cutoff=cutoff,
+                k_2q_batch=k_2q_batch,
+            )
+            return self.p
 
         if self.mode == "svd":
             self._run_svd(
-                gates,
+                G_seq,
+                where_seq,
                 progbar=progbar,
                 cutoff=cutoff,
                 fidelity_samples=fidelity_samples,
             )
-            return self.mpo
+            return self.p
 
         supported = ", ".join(sorted(self._ALLOWED_MODES))
         raise ValueError(f"Unknown mode: {self.mode}. Supported modes: {supported}")

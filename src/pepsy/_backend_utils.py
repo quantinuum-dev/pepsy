@@ -75,7 +75,11 @@ def _build_to_numpy(sample_data, dtype_name, *, cast_complex_to_real=False):
         arr = np.asarray(x)
         if cast_complex_to_real and np.issubdtype(dtype, np.floating) and np.iscomplexobj(arr):
             arr = arr.real
-        return np.asarray(arr, dtype=dtype)
+        target_dtype = dtype
+        if (not cast_complex_to_real) and np.issubdtype(target_dtype, np.floating) and np.iscomplexobj(arr):
+            # Preserve complex gate content when TN sample dtype is real.
+            target_dtype = np.result_type(target_dtype, np.complex64)
+        return np.asarray(arr, dtype=target_dtype)
 
     return _to_numpy
 
@@ -117,7 +121,11 @@ def _build_to_torch(sample_data, dtype_name, *, cast_complex_to_real=False):
         if cast_complex_to_real and dtype.is_floating_point and torch.is_complex(arr):
             arr = arr.real
 
-        kwargs = {"dtype": dtype}
+        target_dtype = dtype
+        if (not cast_complex_to_real) and target_dtype.is_floating_point and torch.is_complex(arr):
+            target_dtype = torch.complex128 if target_dtype == torch.float64 else torch.complex64
+
+        kwargs = {"dtype": target_dtype}
         if device is not None:
             kwargs["device"] = device
         return torch.as_tensor(arr, **kwargs)
@@ -158,7 +166,11 @@ def _build_to_cupy(sample_data, dtype_name, *, cast_complex_to_real=False):
         if cast_complex_to_real and cp.issubdtype(dtype, cp.floating) and cp.iscomplexobj(arr):
             arr = arr.real
 
-        return arr.astype(dtype, copy=False)
+        target_dtype = dtype
+        if (not cast_complex_to_real) and cp.issubdtype(target_dtype, cp.floating) and cp.iscomplexobj(arr):
+            target_dtype = cp.result_type(target_dtype, cp.complex64)
+
+        return arr.astype(target_dtype, copy=False)
 
     return _to_cupy
 

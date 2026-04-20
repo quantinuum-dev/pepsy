@@ -28,11 +28,19 @@ def test_core_symbols_exported():
     assert "FIT" in pepsy.__all__
     assert "PEPSGlobalOptimizer" not in pepsy.__all__
     assert "tns_align" in pepsy.__all__
+    assert "measure_obs" in pepsy.__all__
     assert "tn_norm" not in pepsy.__all__
     assert "tn_fidelity" not in pepsy.__all__
-    assert "gen_long_range_swap_path" in pepsy.__all__
-    assert "gate_tn_2d" in pepsy.__all__
-    assert "gates_tn_2d" in pepsy.__all__
+    assert "gen_long_range_swap_path" not in pepsy.__all__
+    assert "gen_long_range_swap_path_1d" not in pepsy.__all__
+    assert "gen_long_range_swap_path_2d" not in pepsy.__all__
+    assert "gen_long_range_swap_path_3d" not in pepsy.__all__
+    assert "gate_tn_1d" not in pepsy.__all__
+    assert "gate_tn_2d" not in pepsy.__all__
+    assert "gate_tn_3d" not in pepsy.__all__
+    assert "gates_tn_1d" not in pepsy.__all__
+    assert "gates_tn_2d" not in pepsy.__all__
+    assert "gates_tn_3d" not in pepsy.__all__
     assert "apply_2d_gate" not in pepsy.__all__
     assert "apply_2d_gates" not in pepsy.__all__
     assert "apply_2dtn_" not in pepsy.__all__
@@ -40,7 +48,6 @@ def test_core_symbols_exported():
     assert "build_pepo_from_gates" in pepsy.__all__
     assert "build_mpo_from_gates" in pepsy.__all__
     assert "gate_to_pepo" not in pepsy.__all__
-    assert "gate_tn_1d" in pepsy.__all__
     assert "gate_1d" not in pepsy.__all__
     assert "pauli" in pepsy.__all__
     assert "canonize_mps" not in pepsy.__all__
@@ -79,13 +86,19 @@ def test_core_symbols_exported():
     assert "su4" in pepsy.__all__
     assert "apply_gates_" not in pepsy.__all__
     assert "ps_to_peps" in pepsy.__all__
-    assert "expec_tn_1d" in pepsy.__all__
+    assert "expec_mpo" in pepsy.__all__
+    assert "expec_TN_1D" not in pepsy.__all__
+    assert "mpo_identity_1d" in pepsy.__all__
+    assert "pepo_identity_2d" in pepsy.__all__
     assert "peps_I" not in pepsy.__all__
     assert "reg_complex_svd_torch" in pepsy.__all__
     assert "reg_complex_svd_jax" in pepsy.__all__
     assert "make_numpy_array_caster" in pepsy.__all__
     assert "SweepOptimizer" in pepsy.__all__
     assert "MpsOptimizer" in pepsy.__all__
+    assert "MpoOptimizer" in pepsy.__all__
+    assert "MPSOptimizer" not in pepsy.__all__
+    assert "MPOOptimizer" not in pepsy.__all__
     assert "optimize_global" in pepsy.__all__
     assert "optimize_sweep" in pepsy.__all__
     assert "gate" in pepsy.__all__
@@ -108,14 +121,32 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.FIT)
     with pytest.raises(AttributeError):
         _ = pepsy.PEPSGlobalOptimizer
+    with pytest.raises(AttributeError):
+        _ = pepsy.gen_long_range_swap_path
     assert callable(pepsy.tns_align)
+    assert callable(pepsy.measure_obs)
     with pytest.raises(AttributeError):
         _ = pepsy.tn_norm
     with pytest.raises(AttributeError):
         _ = pepsy.tn_fidelity
-    assert callable(pepsy.gen_long_range_swap_path)
-    assert callable(pepsy.gate_tn_2d)
-    assert callable(pepsy.gates_tn_2d)
+    with pytest.raises(AttributeError):
+        _ = pepsy.gen_long_range_swap_path_1d
+    with pytest.raises(AttributeError):
+        _ = pepsy.gen_long_range_swap_path_2d
+    with pytest.raises(AttributeError):
+        _ = pepsy.gen_long_range_swap_path_3d
+    with pytest.raises(AttributeError):
+        _ = pepsy.gate_tn_1d
+    with pytest.raises(AttributeError):
+        _ = pepsy.gate_tn_2d
+    with pytest.raises(AttributeError):
+        _ = pepsy.gate_tn_3d
+    with pytest.raises(AttributeError):
+        _ = pepsy.gates_tn_1d
+    with pytest.raises(AttributeError):
+        _ = pepsy.gates_tn_2d
+    with pytest.raises(AttributeError):
+        _ = pepsy.gates_tn_3d
     with pytest.raises(AttributeError):
         _ = pepsy.apply_2d_gate
     with pytest.raises(AttributeError):
@@ -128,7 +159,6 @@ def test_lazy_exports_resolve():
     assert callable(pepsy.build_mpo_from_gates)
     with pytest.raises(AttributeError):
         _ = pepsy.gate_to_pepo
-    assert callable(pepsy.gate_tn_1d)
     with pytest.raises(AttributeError):
         _ = pepsy.gate_1d
     assert callable(pepsy.pauli)
@@ -170,7 +200,11 @@ def test_lazy_exports_resolve():
     with pytest.raises(AttributeError):
         _ = pepsy.apply_gates_
     assert callable(pepsy.ps_to_peps)
-    assert callable(pepsy.expec_tn_1d)
+    assert callable(pepsy.expec_mpo)
+    with pytest.raises(AttributeError):
+        _ = pepsy.expec_TN_1D
+    assert callable(pepsy.mpo_identity_1d)
+    assert callable(pepsy.pepo_identity_2d)
     with pytest.raises(AttributeError):
         _ = pepsy.peps_I
     has_torch = importlib.util.find_spec("torch") is not None
@@ -181,6 +215,11 @@ def test_lazy_exports_resolve():
         assert callable(pepsy.reg_complex_svd_jax)
     assert callable(pepsy.SweepOptimizer)
     assert callable(pepsy.MpsOptimizer)
+    assert callable(pepsy.MpoOptimizer)
+    with pytest.raises(AttributeError):
+        _ = pepsy.MPSOptimizer
+    with pytest.raises(AttributeError):
+        _ = pepsy.MPOOptimizer
     assert pepsy.optimize_global is not None
     assert pepsy.optimize_sweep is not None
     assert pepsy.gate is not None

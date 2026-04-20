@@ -118,7 +118,7 @@ class GlobalOptimizer:
         return self
 
     def set_loss_kwargs(self, **kwargs):
-        """Backward-compatible alias for :meth:`set_loss_opt`."""
+        """Update stored loss defaults via :meth:`set_loss_opt`."""
         return self.set_loss_opt(**kwargs)
 
     @classmethod

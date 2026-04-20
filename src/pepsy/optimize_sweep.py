@@ -740,7 +740,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 tn_fidelity(
                     self.state,
                     self.state_target,
-                    opt=self.contraction_opt,
+                    contraction_opt=self.contraction_opt,
                 )
             ).real
         )

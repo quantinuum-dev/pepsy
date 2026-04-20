@@ -34,9 +34,12 @@ if TYPE_CHECKING:
     from .boundary_states import BdyMPS, make_numpy_array_caster
     from .boundary_sweeps import CompBdy
     from .core import (
-        expec_tn_1d,
+        expec_mpo,
         get_default_array_backend,
         get_default_grad_backend,
+        measure_obs,
+        mpo_identity_1d,
+        pepo_identity_2d,
         ps_to_peps,
         ps_to_mps,
         random_haar_qubit,
@@ -51,12 +54,9 @@ if TYPE_CHECKING:
     from .linalg_registrations import reg_complex_svd_jax, reg_complex_svd_torch
     from .fit import FIT
     from .gate import (
-        gate_tn_2d,
-        gates_tn_2d,
+        gate,
         build_pepo_from_gates,
         build_mpo_from_gates,
-        gate_tn_1d,
-        gen_long_range_swap_path,
         pauli,
         x,
         y,
@@ -124,12 +124,10 @@ __all__ = [
     "SweepOptimizer",
     "EnergyOptimizer",
     "tns_align",
-    "gen_long_range_swap_path",
-    "gate_tn_2d",
-    "gates_tn_2d",
+    "measure_obs",
+    "gate",
     "build_pepo_from_gates",
     "build_mpo_from_gates",
-    "gate_tn_1d",
     "pauli",
     "x",
     "y",
@@ -165,7 +163,9 @@ __all__ = [
     "u3",
     "su4",
     "ham_tn",
-    "expec_tn_1d",
+    "expec_mpo",
+    "mpo_identity_1d",
+    "pepo_identity_2d",
     "ps_to_peps",
     "ps_to_mps",
     "random_haar_qubit",
@@ -176,7 +176,6 @@ __all__ = [
     "optimize_energy",
     "optimize_mpo",
     "gradient_solver",
-    "gate",
     "ham",
     "boundary_metrics",
     "boundary_states",
@@ -241,12 +240,8 @@ def __getattr__(name):
         return FIT
 
     if name in (
-        "gen_long_range_swap_path",
-        "gate_tn_2d",
-        "gates_tn_2d",
         "build_pepo_from_gates",
         "build_mpo_from_gates",
-        "gate_tn_1d",
         "pauli",
         "x",
         "y",
@@ -283,12 +278,8 @@ def __getattr__(name):
         "su4",
     ):
         from .gate import (  # pylint: disable=import-outside-toplevel
-            gate_tn_2d,
-            gates_tn_2d,
             build_pepo_from_gates,
             build_mpo_from_gates,
-            gate_tn_1d,
-            gen_long_range_swap_path,
             pauli,
             x,
             y,
@@ -326,12 +317,8 @@ def __getattr__(name):
         )
 
         return {
-            "gen_long_range_swap_path": gen_long_range_swap_path,
-            "gate_tn_2d": gate_tn_2d,
-            "gates_tn_2d": gates_tn_2d,
             "build_pepo_from_gates": build_pepo_from_gates,
             "build_mpo_from_gates": build_mpo_from_gates,
-            "gate_tn_1d": gate_tn_1d,
             "pauli": pauli,
             "x": x,
             "y": y,
@@ -375,7 +362,10 @@ def __getattr__(name):
 
     if name in (
         "tns_align",
-        "expec_tn_1d",
+        "measure_obs",
+        "expec_mpo",
+        "mpo_identity_1d",
+        "pepo_identity_2d",
         "ps_to_peps",
         "ps_to_mps",
         "random_haar_qubit",
@@ -383,7 +373,10 @@ def __getattr__(name):
         "hrps_to_mps",
     ):
         from .core import (  # pylint: disable=import-outside-toplevel
-            expec_tn_1d,
+            expec_mpo,
+            measure_obs,
+            mpo_identity_1d,
+            pepo_identity_2d,
             ps_to_peps,
             ps_to_mps,
             random_haar_qubit,
@@ -394,7 +387,10 @@ def __getattr__(name):
 
         return {
             "tns_align": tns_align,
-            "expec_tn_1d": expec_tn_1d,
+            "measure_obs": measure_obs,
+            "expec_mpo": expec_mpo,
+            "mpo_identity_1d": mpo_identity_1d,
+            "pepo_identity_2d": pepo_identity_2d,
             "ps_to_peps": ps_to_peps,
             "ps_to_mps": ps_to_mps,
             "random_haar_qubit": random_haar_qubit,

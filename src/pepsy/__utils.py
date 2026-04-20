@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from numbers import Integral
 import re
 import sys
 
@@ -92,3 +93,35 @@ def style_show_lines(lines, *, color=True, fancy=True):
     color_enabled = resolve_color_mode(color)
     return [style_show_line(line, color_enabled=color_enabled, fancy=fancy) for line in lines]
 
+
+def is_integral_tuple(value, *, length):
+    """Return True when ``value`` is a tuple of integral entries with given length."""
+    return (
+        isinstance(value, tuple)
+        and len(value) == int(length)
+        and all(isinstance(v, Integral) for v in value)
+    )
+
+
+def coerce_integral_tuple(value, *, length, name="value"):
+    """Normalize tuple/list of integral entries to an integer tuple."""
+    if isinstance(value, list):
+        value = tuple(value)
+    if is_integral_tuple(value, length=length):
+        return tuple(int(v) for v in value)
+    raise TypeError(f"{name} must be a tuple/list of {int(length)} integers.")
+
+
+def is_xy_site(site):
+    """Return True for standard 2D coordinate sites ``(x, y)``."""
+    return is_integral_tuple(site, length=2)
+
+
+def is_xy_sublattice_site(site):
+    """Return True for sublattice-labelled sites ``(x, y, sublattice)``."""
+    return (
+        isinstance(site, tuple)
+        and len(site) == 3
+        and isinstance(site[0], Integral)
+        and isinstance(site[1], Integral)
+    )
