@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from pepsy.gradient_solver import GradientOptimizer, SUPPORTED_SOLVERS
 from pepsy.optimize_sweep import SweepOptimizer
@@ -21,7 +21,10 @@ def _loss_with_target(params, *, target):
 
 def test_supported_solvers_exports_expected_backends():
     """Supported solver list should expose only canonical names."""
-    assert set(SUPPORTED_SOLVERS) == {"torch-adam", "scipy", "nlopt"}
+    assert set(SUPPORTED_SOLVERS) == {
+        "torch-adam", "torch-lbfgs", "torch-adamw", "torch-radam", "torch-nadam",
+        "scipy", "nlopt",
+    }
 
 
 def test_torch_adam_solver_reduces_quadratic():

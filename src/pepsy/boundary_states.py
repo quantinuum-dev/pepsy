@@ -2,13 +2,13 @@
 
 import logging
 import re
-import sys
 import warnings
 
 import numpy as np
 import quimb.tensor as qtn
 
 from .core import backend_numpy, get_default_array_backend
+from .__utils import ansi_wrap, colorize_symbols, resolve_color_mode, style_show_line, style_show_lines
 from ._backend_utils import (
     dispatch_backend_converter,
     infer_backend_and_dtype,
@@ -575,90 +575,27 @@ class BdyMPS:
     @staticmethod
     def _resolve_show_color(color):
         """Resolve color mode for ``show`` output."""
-        if color == "auto":
-            return bool(getattr(sys.stdout, "isatty", lambda: False)())
-        if isinstance(color, bool):
-            return color
-        raise TypeError("color must be bool or 'auto'")
+        return resolve_color_mode(color)
 
     @staticmethod
     def _ansi_wrap(text, code, enabled):
         """Wrap text with ANSI style code when enabled."""
-        if not enabled:
-            return text
-        return f"\033[{code}m{text}\033[0m"
+        return ansi_wrap(text, code, enabled)
 
     @classmethod
     def _colorize_symbols(cls, line, enabled, *, grid_arrows=False):
         """Apply ANSI colors to key structural symbols."""
-        if not enabled:
-            return line
-
-        replacements = [
-            ("◆", "31"),  # highlighted cut node
-            ("●", "31"),  # highlighted cut node (plain style)
-            ("▶", "31"),
-            ("◀", "31"),
-            ("▼", "1;35"),
-            ("▲", "1;35"),
-            ("○", "36"),
-            ("o", "36"),
-        ]
-        if grid_arrows:
-            replacements.extend(((">", "31"), ("<", "31")))
-        else:
-            replacements.extend(((">", "1;32"), ("<", "1;34")))
-
-        out = line
-        for symbol, code in replacements:
-            out = out.replace(symbol, cls._ansi_wrap(symbol, code, enabled))
-        return out
+        return colorize_symbols(line, enabled, grid_arrows=grid_arrows)
 
     @classmethod
     def _style_show_line(cls, line, *, color_enabled, fancy):
         """Render one show line with optional fancy symbols and ANSI colors."""
-        is_grid_title = line.startswith("grid cut=")
-        is_grid_row = re.match(r"^Y\d+\s+", line) is not None
-        is_x_axis = re.match(r"^\s+X\d+", line) is not None
-        stripped = line.strip()
-        is_conn_row = line.startswith("    ") and bool(stripped) and set(stripped) <= {
-            "|",
-            "v",
-            "^",
-            " ",
-        }
-
-        out = line
-        if fancy and (is_grid_row or is_conn_row):
-            out = out.replace("--", "──").replace(">>", "> ").replace("<<", " <")
-            out = out.replace("|", "│").replace("v", "▼").replace("^", "▲")
-            out = out.replace("o", "○")
-
-        if color_enabled:
-            if is_grid_title:
-                return cls._ansi_wrap(out, "1;36", True)
-            if is_grid_row:
-                match = re.match(r"^(Y\d+\s+)(.*)$", out)
-                if match:
-                    prefix, body = match.groups()
-                    return cls._ansi_wrap(prefix, "1;33", True) + cls._colorize_symbols(
-                        body,
-                        True,
-                        grid_arrows=True,
-                    )
-            if is_x_axis:
-                return cls._ansi_wrap(out, "1;33", True)
-            return cls._colorize_symbols(out, True)
-
-        return out
+        return style_show_line(line, color_enabled=color_enabled, fancy=fancy)
 
     @classmethod
     def _style_show_lines(cls, lines, *, color=True, fancy=True):
         """Apply styling to ``show`` output lines."""
-        color_enabled = cls._resolve_show_color(color)
-        return [
-            cls._style_show_line(line, color_enabled=color_enabled, fancy=fancy) for line in lines
-        ]
+        return style_show_lines(lines, color=color, fancy=fancy)
 
     def _resolve_selected_key(self, key, direction, side, step):
         """Resolve and validate selected boundary key from key or direction."""

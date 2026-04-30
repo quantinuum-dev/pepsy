@@ -118,8 +118,29 @@ class GlobalOptimizer:
         return self
 
     def set_loss_kwargs(self, **kwargs):
-        """Backward-compatible alias for :meth:`set_loss_opt`."""
+        """Update stored loss defaults via :meth:`set_loss_opt`."""
         return self.set_loss_opt(**kwargs)
+
+    def set_target(self, state_target, *, inplace=True):
+        """Replace stored target state used by :meth:`loss` and optimizers.
+
+        Parameters
+        ----------
+        state_target : qtn.TensorNetwork | None
+            New target state. Pass ``None`` to clear the stored target.
+        inplace : bool, default=True
+            If ``True``, store ``state_target`` directly. If ``False`` and
+            ``state_target`` has ``copy()``, store a shallow copy instead.
+
+        Returns
+        -------
+        GlobalOptimizer
+            ``self`` for fluent chaining.
+        """
+        if (not inplace) and state_target is not None and hasattr(state_target, "copy"):
+            state_target = state_target.copy()
+        self.state_target = state_target
+        return self
 
     @classmethod
     def norm_kwarg_names(cls):

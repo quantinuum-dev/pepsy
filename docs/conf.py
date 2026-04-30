@@ -30,6 +30,7 @@ extensions = [
 autoclass_content = "both"
 napoleon_google_docstring = False
 napoleon_numpy_docstring = True
+napoleon_attr_annotations = False
 
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "**.ipynb_checkpoints", ".DS_Store"]

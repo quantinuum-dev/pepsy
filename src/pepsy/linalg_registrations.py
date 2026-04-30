@@ -16,19 +16,44 @@ from jax import custom_vjp
 
 
 def safe_inverse(x, eps_abs=1.0e-12):
-    """Return a smooth reciprocal-like map ``x / (x**2 + eps_abs)``.
+    """Regularized reciprocal: ``x / (x**2 + eps_abs)``.
 
-    This is used as a regularized inverse in singular-value expressions where
-    exact reciprocal factors may become numerically unstable.
+    Avoids division-by-zero singularities in SVD backward expressions
+    where exact reciprocals of singular-value differences can diverge.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input values (typically singular-value differences or sums).
+    eps_abs : float, default=1e-12
+        Additive regularization constant.
+
+    Returns
+    -------
+    torch.Tensor
+        Smooth approximation to ``1/x``.
     """
     eps_abs=1.0e-12
     return x / (x ** 2 + eps_abs)
 
 
 def safe_inverse_2(x, eps):
-    """Return a clamped reciprocal used for real nonnegative values.
+    """Clamped reciprocal for real nonnegative values.
 
-    Values below ``eps`` are clipped before inversion.
+    Clips values below ``eps`` before inverting. Only appropriate for
+    nonnegative inputs (not for ``F = 1/(s_i - s_j)`` which can be negative).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Nonnegative input values.
+    eps : float
+        Minimum clamp threshold.
+
+    Returns
+    -------
+    torch.Tensor
+        Clamped reciprocal.
     """
     return x.clamp_min(eps).reciprocal()
 
@@ -174,178 +199,6 @@ class SVD(torch.autograd.Function):
             print(f"{diagnostics} {dA.abs().max()} {sigma.max()}")
 
         return dA, None, None, None
-
-
-
-
-
-# def safe_inverse(x, eps_abs: float = 1.0e-12):
-#     """
-#     Smooth, sign/phase-preserving 'inverse-like' regularizer.
-
-#     For real x:   x / (x^2 + eps)
-#     For complex x: x / (|x|^2 + eps)  where |x|^2 = x * conj(x)
-
-#     This matches your intent for F and G (built from real singular values),
-#     and is also well-defined if ever called on complex tensors.
-#     """
-#     if torch.is_complex(x):
-#         denom = x * x.conj() + eps_abs
-#     else:
-#         denom = x * x + eps_abs
-#     return x / denom
-
-
-# def safe_inverse_2(x, eps: float):
-#     """
-#     Hard reciprocal with clamp. Only appropriate for nonnegative real tensors.
-#     (Not appropriate for F = 1/(s_i - s_j) which can be negative.)
-#     """
-#     return x.clamp_min(eps).reciprocal()
-
-
-# class SVD(torch.autograd.Function):
-#     @staticmethod
-#     def forward(A):
-#         # Do NOT force driver='gesvd' on CUDA: it can be much slower.
-#         # Let PyTorch choose the best driver.
-#         U, S, Vh = torch.linalg.svd(A, full_matrices=False)
-#         return U, S, Vh
-
-#     @staticmethod
-#     def setup_context(ctx, inputs, output):
-#         # Required by functorch transforms (vmap, grad, jvp, jacrev, ...)
-#         (A,) = inputs
-#         U, S, Vh = output
-#         ctx.save_for_backward(U, S, Vh)
-#         ctx.set_materialize_grads(False)
-
-#     @staticmethod
-#     def backward(ctx, gu, gsigma, gvh):
-#         """
-#         Backward for A -> (U, S, Vh).
-
-#         Shapes (batched-safe):
-#           A:      (..., m, n)
-#           U:      (..., m, k)
-#           S:      (..., k)
-#           Vh:     (..., k, n)
-#           k = min(m, n)
-
-#         Returns:
-#           dA:     (..., m, n)
-#         """
-#         u, sigma, vh = ctx.saved_tensors
-#         eps = 1.0e-12
-
-#         # Batch-safe sizes
-#         m = u.size(-2)
-#         k = u.size(-1)
-#         n = vh.size(-1)
-#         batch_shape = u.shape[:-2]
-
-#         # sigma_term = U * diag(gsigma) @ Vh
-#         if gsigma is not None:
-#             sigma_term = (u * gsigma.unsqueeze(-2)) @ vh
-#         else:
-#             sigma_term = torch.zeros((*batch_shape, m, n), dtype=u.dtype, device=u.device)
-
-#         # If only singular values have grad, stop early
-#         if gu is None and gvh is None:
-#             return (sigma_term,)
-
-#         # Your chosen regularizer for sigma^{-1}
-#         sigma_inv = safe_inverse(sigma.clone(), eps_abs=eps)  # (..., k)
-
-#         # Build F and G from singular values (real), and apply safe_inverse to both
-#         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)         # (..., k, k)
-#         F = safe_inverse(F, eps_abs=eps)
-
-#         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)         # (..., k, k)
-#         G = safe_inverse(G, eps_abs=eps)
-
-#         # Zero diagonals WITHOUT in-place diagonal writes (transform-friendly)
-#         eye = torch.eye(k, dtype=F.dtype, device=F.device).view(*(1,) * len(batch_shape), k, k)
-#         F = F * (1.0 - eye)
-#         G = G * (1.0 - eye)
-
-#         uh = u.conj().transpose(-2, -1)                       # (..., k, m)
-
-#         # ---- U term
-#         if gu is not None:
-#             guh = gu.conj().transpose(-2, -1)                 # (..., k, m)
-
-#             # (uh @ gu - guh @ u): (..., k, k)
-#             skew_u = (uh @ gu) - (guh @ u)
-#             u_term = u @ ((F + G) * skew_u) * 0.5             # (..., m, k)
-
-#             if m > k:
-#                 # (I - U U^H) @ (gu * sigma_inv)
-#                 X = gu * sigma_inv.unsqueeze(-2)              # (..., m, k)
-#                 X = X - u @ (uh @ X)                          # (..., m, k)
-#                 u_term = u_term + X
-
-#             u_term = u_term @ vh                              # (..., m, n)
-#         else:
-#             u_term = torch.zeros((*batch_shape, m, n), dtype=u.dtype, device=u.device)
-
-#         # ---- V term
-#         v = vh.conj().transpose(-2, -1)                       # (..., n, k)
-
-#         if gvh is not None:
-#             gv = gvh.conj().transpose(-2, -1)                 # (..., n, k)
-
-#             # (vh @ gv - gvh @ v): (..., k, k)
-#             skew_v = (vh @ gv) - (gvh @ v)
-#             v_term = (((F - G) * skew_v) @ vh) * 0.5          # (..., k, n)
-
-#             if n > k:
-#                 # gvh @ (I - V V^H)  (right-projection) without forming I:
-#                 # Z = gvh - (gvh @ V) @ Vh
-#                 Z = gvh - (gvh @ v) @ vh                      # (..., k, n)
-#                 v_term = v_term + sigma_inv.unsqueeze(-1) * Z
-
-#             v_term = u @ v_term                               # (..., m, n)
-#         else:
-#             v_term = torch.zeros((*batch_shape, m, n), dtype=u.dtype, device=u.device)
-
-#         dA = u_term + sigma_term + v_term
-
-#         # Complex correction term (only meaningful if input is complex and gu is present)
-#         if (u.is_complex() or vh.is_complex()) and (gu is not None):
-#             L = (uh @ gu).diagonal(0, -2, -1)                 # (..., k)
-#             # Keep imaginary part only and scale by sigma_inv
-#             L = torch.complex(torch.zeros_like(L.real), L.imag * sigma_inv)
-#             dA = dA + (u * L.unsqueeze(-2)) @ vh
-
-#         # Only one tensor input (A), so only one gradient returned
-#         return (dA,)
-
-#     @staticmethod
-#     def vmap(info, in_dims, A):
-#         """
-#         vmap rule. torch.linalg.svd is already batched, so we just apply
-#         the same Function to the batched tensor.
-#         """
-#         (A_bdim,) = in_dims
-
-#         if A_bdim is None:
-#             U, S, Vh = SVD.apply(A)
-#             return (U, S, Vh), (None, None, None)
-
-#         if A_bdim != 0:
-#             A = A.movedim(A_bdim, 0)
-
-#         U, S, Vh = SVD.apply(A)
-#         return (U, S, Vh), (0, 0, 0)
-
-
-# def svd_custom(A):
-#     return SVD.apply(A)
-
-
-
-
 
 
 class SVD_real(torch.autograd.Function):

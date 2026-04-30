@@ -22,18 +22,7 @@ __all__ = [
 class BoundaryContractResult:
     """Structured result from :func:`contract_boundary`.
 
-    Attributes
-    ----------
-    cost : complex | float
-        Final scalar returned by the boundary contraction.
-    fidel : list[float]
-        Optional per-step fidelity values collected during the sweep.
-    direction : str
-        Direction selector used for the contraction call.
-    n_iter : int
-        Local fit iterations used per boundary update.
-    max_separation : int
-        Separation mode used during the sweep.
+    Fields store the contraction scalar plus sweep metadata.
     """
 
     cost: complex | float

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import re
 import time
 import warnings
 import math
+import inspect
 from collections.abc import Mapping
 from typing import Any
 
-import autoray as ar
 import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
@@ -17,13 +16,21 @@ from .boundary_metrics import infidelity as boundary_infidelity
 from .boundary_metrics import build_bra_ket, normalize
 from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
+from .core import tn_fidelity
 from .gradient_solver import GradientOptimizer, SUPPORTED_SOLVERS
-
-_PHYS_IND_PATTERN = re.compile(r"^k\d+(?:,\d+)*$")
-_TAG_X = re.compile(r"^X(\d+)$")
-_TAG_Y = re.compile(r"^Y(\d+)$")
+from ._tn_validation import _PHYS_IND_PATTERN, _TAG_X, _TAG_Y
 
 __all__ = ["SweepOptimizer"]
+
+
+class _AttrDict(dict):
+    """dict with attribute-style access for compatibility."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
 
 
 class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
@@ -83,16 +90,19 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "env_n_iter",
         "progress",
         "track_boundary_fidelity",
+        "debug",
+        "debug_loss_mode",
+        "debug_loss_kwargs",
         "renormalize",
     })
     _DEFAULT_SOLVER_OPTIONS = {
         "algorithm": "LBFGS",
         "lr": 1e-2,
-        "n_steps": 20,
-        "maxeval": 50,
+        "n_steps": 50,
+        "maxeval": 100,
         "ftol_rel": 1e-9,
         "xtol_rel": 1e-9,
-        "patience": 25,
+        "patience": 40,
         "min_steps": 10,
         "restore_best": True,
         "bad_max": 20,
@@ -288,7 +298,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def _ensure_no_common_internal_indices(state, state_target):
-        """Reindex ``state`` internals when state/target share internal indices."""
+        """Require disjoint internal indices between ``state`` and ``state_target``."""
         if state is None or state_target is None:
             return
         if not hasattr(state, "inner_inds") or not hasattr(state_target, "inner_inds"):
@@ -299,25 +309,22 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if not shared:
             return
 
-        # Reindex all internal bonds of ``state`` to random labels so the two
-        # networks are guaranteed disjoint for boundary contractions.
-        forbidden = state_inner | target_inner
-        reindex_map = {}
-        for idx in state_inner:
-            new_idx = qtn.rand_uuid()
-            while new_idx in forbidden:
-                new_idx = qtn.rand_uuid()
-            reindex_map[idx] = new_idx
-            forbidden.add(new_idx)
-        state.reindex_(reindex_map)
-
         sample = ", ".join(sorted(map(str, shared))[:8])
         msg = (
             "state and state_target share common internal indices. "
-            "Auto-reindexed all internal indices of state using random labels. "
-            f"Shared sample before reindex: {sample}"
+            f"Shared sample: {sample}"
         )
         warnings.warn(msg, UserWarning, stacklevel=3)
+        raise ValueError(msg)
+
+    @staticmethod
+    def _call_with_accepted_kwargs(fn, *args, **kwargs):
+        """Call ``fn`` while dropping unsupported keyword arguments."""
+        sig = inspect.signature(fn)
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return fn(*args, **kwargs)
+        accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return fn(*args, **accepted)
 
     @staticmethod
     def _resolve_boundary_arg(boundary, name):
@@ -716,6 +723,53 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return float(result["infidelity"])
 
+    def metrics(self):
+        """Return exact ``(fidelity, infidelity)`` for current state pair."""
+        if self.state_target is None:
+            raise ValueError(
+                "state_target is required for metrics(). "
+                "Set it in constructor or via set_target()."
+            )
+        fidelity = float(
+            complex(
+                tn_fidelity(
+                    self.state,
+                    self.state_target,
+                    contraction_opt=self.contraction_opt,
+                )
+            ).real
+        )
+        if fidelity < 0.0 and abs(fidelity) < 1e-12:
+            fidelity = 0.0
+        infid = 1.0 - fidelity
+        if infid < 0.0 and abs(infid) < 1e-12:
+            infid = 0.0
+        return fidelity, infid
+
+    def _debug_loss(self, *, mode="exact", kwargs=None, env_n_iter=4):
+        """Compute global diagnostic loss for debug/progress summaries."""
+        mode = str(mode).strip().lower()
+        kwargs = {} if kwargs is None else dict(kwargs)
+
+        if mode == "exact":
+            _fidel, loss = self.metrics()
+            return float(loss)
+
+        if mode == "infidelity":
+            defaults = {
+                "chi": getattr(self, "chi", None),
+                "n_iter": int(env_n_iter),
+                "direction": getattr(self, "direction", "y"),
+                "max_separation": getattr(self, "max_separation", 1),
+                "single_layer": bool(getattr(self, "single_layer", False)),
+                "progress": False,
+                "track_boundary_fidelity": False,
+            }
+            defaults.update(kwargs)
+            return float(self.infidelity(**defaults))
+
+        raise ValueError("debug_loss_mode must be 'exact' or 'infidelity'")
+
     def _approx_infidelity_loss(self, *, env_n_iter=4):
         """Return boundary-infidelity loss for lightweight global diagnostics."""
         try:
@@ -761,7 +815,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             return
 
         for run_info in axis_runs:
-            local_loss = run_info.get("loss_final")
+            local_loss = run_info.get("exact_loss_after", run_info.get("loss_final"))
             if local_loss is None:
                 step_loss = float("nan")
             else:
@@ -899,6 +953,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if solver not in SUPPORTED_SOLVERS:
             supported = ", ".join(SUPPORTED_SOLVERS)
             raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
+
+        if solver == "nlopt":
+            warnings.warn(
+                "solver='nlopt' uses NLopt and can be sensitive to tolerances; "
+                "consider tuning algorithm/maxeval/ftol_rel/xtol_rel.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         return solver
 
@@ -1128,6 +1190,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         env_n_iter=4,
         run_callback=None,
         track_boundary_fidelity=False,
+        debug=False,
+        debug_loss_mode="exact",
+        debug_loss_kwargs=None,
     ):
         """Run a single forward or backward half-sweep over *indices*."""
         runs = []
@@ -1173,6 +1238,15 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             run_info["time_optimize"] = t_opt
             run_info["boundary_infidelity_norm"] = boundary_infidelity_norm
             run_info["boundary_infidelity_overlap"] = boundary_infidelity_overlap
+            if debug:
+                try:
+                    run_info["exact_loss_after"] = self._debug_loss(
+                        mode=debug_loss_mode,
+                        kwargs=debug_loss_kwargs,
+                        env_n_iter=env_n_iter,
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    run_info["exact_loss_after"] = None
             try:
                 run_info["bdy_norm"] = float(abs(self.bdy.norm))
             except Exception:
@@ -1197,6 +1271,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         env_n_iter=5,
         run_callback=None,
         track_boundary_fidelity=False,
+        debug=False,
+        debug_loss_mode="exact",
+        debug_loss_kwargs=None,
         renormalize=True,
     ):
         """Run one axis with forward + round-trip sweeps.
@@ -1246,6 +1323,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             env_n_iter=env_n_iter,
             run_callback=run_callback,
             track_boundary_fidelity=track_boundary_fidelity,
+            debug=debug,
+            debug_loss_mode=debug_loss_mode,
+            debug_loss_kwargs=debug_loss_kwargs,
         )
 
         all_runs.extend(
@@ -1289,6 +1369,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver_options=None,
         env_n_iter=4,
         progress=True,
+        debug=False,
+        debug_loss_mode="exact",
+        debug_loss_kwargs=None,
         track_boundary_fidelity=None,
         renormalize=True,
     ):
@@ -1322,8 +1405,22 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         self._ensure_boundary_chi(chi)
         self._reset_run_traces()
-        loss_before = self._approx_infidelity_loss(env_n_iter=env_n_iter)
-        track_boundary_fidelity = False if track_boundary_fidelity is None else bool(track_boundary_fidelity)
+        if track_boundary_fidelity is None:
+            track_boundary_fidelity = bool(debug)
+        else:
+            track_boundary_fidelity = bool(track_boundary_fidelity)
+        loss_mode = debug_loss_mode if debug else "infidelity"
+        if (not debug) and (debug_loss_kwargs is None):
+            loss_before = self._approx_infidelity_loss(env_n_iter=env_n_iter)
+        else:
+            try:
+                loss_before = self._debug_loss(
+                    mode=loss_mode,
+                    kwargs=debug_loss_kwargs,
+                    env_n_iter=env_n_iter,
+                )
+            except (AttributeError, TypeError, ValueError):
+                loss_before = None
         all_runs = []
         axis_seq = list(axes)
 
@@ -1348,7 +1445,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     if global_progress is None:
                         return
                     global_progress.update(1)
-                    local_loss = run_info.get("loss_final")
+                    local_loss = run_info.get("exact_loss_after", run_info.get("loss_final"))
                     best_now = getattr(self, "best_loss", float("inf"))
                     best_str = "na" if not math.isfinite(float(best_now)) else f"{float(best_now):.6e}"
                     head = f"loss=nan [best:{best_str}]"
@@ -1382,7 +1479,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     global_progress.set_description_str(head)
                     global_progress.set_postfix_str(" | ".join(parts))
 
-                axis_runs = self.optimize_axis(
+                axis_runs = self._call_with_accepted_kwargs(
+                    self.optimize_axis,
                     axis,
                     n_round_trips=n_round_trips,
                     solver=solver,
@@ -1390,6 +1488,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     env_n_iter=env_n_iter,
                     run_callback=_on_run,
                     track_boundary_fidelity=track_boundary_fidelity,
+                    debug=debug,
+                    debug_loss_mode=debug_loss_mode,
+                    debug_loss_kwargs=debug_loss_kwargs,
                     renormalize=renormalize,
                 )
                 all_runs.extend(axis_runs)
@@ -1406,12 +1507,30 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             old_norm = self._normalize_state(env_n_iter=env_n_iter)
             self.norm_trace.append({"state_norm": float(abs(complex(old_norm)))})
 
-        loss_after = self._approx_infidelity_loss(env_n_iter=env_n_iter)
+        if (not debug) and (debug_loss_kwargs is None):
+            loss_after = self._approx_infidelity_loss(env_n_iter=env_n_iter)
+        else:
+            try:
+                loss_after = self._debug_loss(
+                    mode=loss_mode,
+                    kwargs=debug_loss_kwargs,
+                    env_n_iter=env_n_iter,
+                )
+            except (AttributeError, TypeError, ValueError):
+                loss_after = None
 
-        bdy_norm = float(abs(self.bdy.norm))
-        bdy_overlap_norm = float(abs(self.bdy_overlap.norm))
+        bdy_norm = None
+        bdy_overlap_norm = None
+        try:
+            bdy_norm = float(abs(self.bdy.norm))
+        except (AttributeError, TypeError, ValueError):
+            bdy_norm = None
+        try:
+            bdy_overlap_norm = float(abs(self.bdy_overlap.norm))
+        except (AttributeError, TypeError, ValueError):
+            bdy_overlap_norm = None
 
-        return {
+        return _AttrDict({
             "runs": all_runs,
             "loss_before": loss_before,
             "loss_after": loss_after,
@@ -1425,7 +1544,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "fidels": list(self.fidels),
             "bdy_norm": bdy_norm,
             "bdy_overlap_norm": bdy_overlap_norm,
-        }
+        })
 
     def run(
         self,
@@ -1433,6 +1552,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         n_cycles=None,
         chi=None,
         progress=None,
+        debug=None,
+        debug_loss_mode=None,
+        debug_loss_kwargs=None,
         renormalize=None,
         track_boundary_fidelity=None,
     ):
@@ -1456,6 +1578,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             opts["chi"] = chi
         if progress is not None:
             opts["progress"] = progress
+        if debug is not None:
+            opts["debug"] = debug
+        if debug_loss_mode is not None:
+            opts["debug_loss_mode"] = debug_loss_mode
+        if debug_loss_kwargs is not None:
+            opts["debug_loss_kwargs"] = debug_loss_kwargs
         if renormalize is not None:
             opts["renormalize"] = renormalize
         if track_boundary_fidelity is not None:
@@ -1470,6 +1598,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             solver_options=opts.get("optimizer_options"),
             env_n_iter=opts.get("env_n_iter", 4),
             progress=opts.get("progress", True),
+            debug=opts.get("debug", False),
+            debug_loss_mode=opts.get("debug_loss_mode", "exact"),
+            debug_loss_kwargs=opts.get("debug_loss_kwargs"),
             renormalize=opts.get("renormalize", True),
             track_boundary_fidelity=opts.get("track_boundary_fidelity", False),
         )

@@ -77,6 +77,7 @@ def test_global_optimizer_builds_tnoptimizer():
 
 def test_global_optimizer_optimize_smoke():
     """Optimize should run a short TNOptimizer step and return a PEPS-like TN."""
+    pytest.importorskip("torch")
     peps = _rand_peps(seed=19)
     peps_target = peps.copy()
     ref = abs(complex(GlobalOptimizer._norm_state(peps_target.copy(), mode="exact", opt="auto-hq")))
@@ -215,6 +216,34 @@ def test_global_optimizer_optional_target_blocks_loss_methods():
         _ = opt.loss()
     with pytest.raises(ValueError, match="state_target is required for make_tn_optimizer"):
         _ = opt.make_tn_optimizer()
+
+
+def test_global_optimizer_set_target_replaces_and_clears_target():
+    """set_target should replace, clear, and support fluent chaining."""
+    peps = _rand_peps(seed=41)
+    target_a = _rand_peps(seed=42)
+    target_b = _rand_peps(seed=43)
+    opt = GlobalOptimizer(peps, target_a)
+
+    out = opt.set_target(target_b)
+    assert out is opt
+    assert opt.state_target is target_b
+
+    out = opt.set_target(None)
+    assert out is opt
+    assert opt.state_target is None
+    with pytest.raises(ValueError, match="state_target is required for loss"):
+        _ = opt.loss()
+
+
+def test_global_optimizer_set_target_inplace_false_copies():
+    """set_target(inplace=False) should copy when requested."""
+    peps = _rand_peps(seed=44)
+    target = _rand_peps(seed=45)
+    opt = GlobalOptimizer(peps)
+
+    _ = opt.set_target(target, inplace=False)
+    assert opt.state_target is not target
 
 
 @pytest.mark.parametrize("name", ["LBFGS", "lbfgs"])
