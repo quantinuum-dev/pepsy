@@ -9,7 +9,7 @@ import numpy as np
 
 from .core import tn_norm
 from .fit import FIT
-from .gate import _normalize_gate_entries, gate as apply_gate
+from .gate import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 
 __all__ = ["MpoOptimizer"]
 
@@ -40,7 +40,7 @@ class MpoOptimizer:
         Either side may be ``None`` to skip it.
     chi : int
         Working bond dimension.
-    mode : {"dmrg", "svd"}, default="dmrg"
+    mode : {"dmrg", "svd", "mpo"}, default="dmrg"
         Execution backend.
     ind_id_k : str, default="k{}"
         Site-index format string for ket-family physical legs.
@@ -53,7 +53,7 @@ class MpoOptimizer:
         ``False``, a copy is made and the original input remains unchanged.
     """
 
-    _ALLOWED_MODES = frozenset({"dmrg", "svd"})
+    _ALLOWED_MODES = frozenset({"dmrg", "svd", "mpo"})
 
     @classmethod
     def _normalize_mode(cls, mode):
@@ -96,7 +96,7 @@ class MpoOptimizer:
 
         self.norm_mpo = self._measure_norm(self.p)
         self.info_c = {}
-        self.fidelity_trace = [1.0]
+        self.losses = [1.0]
         self._init_canonicalization()
 
     def _current_orthog(self, p=None):
@@ -106,10 +106,14 @@ class MpoOptimizer:
         if cur == "calc" or cur is None:
             lo, hi = state.calc_current_orthog_center()
             cur = (int(lo), int(hi))
-        elif isinstance(cur, int):
+        elif isinstance(cur, Integral):
             cur = (int(cur), int(cur))
-        else:
+        elif len(cur) == 1:
+            cur = (int(cur[0]), int(cur[0]))
+        elif len(cur) == 2:
             cur = (int(min(cur)), int(max(cur)))
+        else:
+            raise ValueError("cur_orthog must be an int, (int,), or (int, int).")
 
         self.info_c["cur_orthog"] = cur
         return cur
@@ -191,19 +195,28 @@ class MpoOptimizer:
     def _append_norm_proxy_sample(self, p):
         """Append current normalized MPO norm and return it."""
         norm_val = self._normalize_norm(self._measure_norm(p))
-        self.fidelity_trace.append(norm_val)
+        self.losses.append(norm_val)
         return norm_val
 
     def _measure_norm(self, p):
-        """Measure the MPO norm using the shared TN contraction helper."""
-        return self._real_float(tn_norm(p, contraction_opt=self.contraction_opt))
+        """Measure the MPO squared norm as (mantissa, exponent) for stability.
+
+        Returns ``(m, e)`` where ``<O|O> = m * 10^e``.
+        """
+        mantissa, exponent = tn_norm(p, contraction_opt=self.contraction_opt, strip_exponent=True)
+        return self._real_float(mantissa), float(exponent)
 
     def _normalize_norm(self, norm_val):
-        """Normalize a norm measurement against the initial MPO norm."""
-        ref = float(self.norm_mpo)
-        if ref == 0.0:
-            return 0.0 if norm_val == 0.0 else float("inf")
-        return float(norm_val) / ref
+        """Normalize a (mantissa, exponent) norm against the initial MPO norm.
+
+        Returns sqrt(<O|O>) / sqrt(<O0|O0>), i.e. the ratio of actual norms,
+        consistent with p.norm() / initial.norm().
+        """
+        m, e = norm_val
+        m0, e0 = self.norm_mpo
+        if m0 == 0.0:
+            return 0.0 if m == 0.0 else float("inf")
+        return float(np.sqrt(abs(m / m0))) * 10 ** ((e - e0) / 2)
 
     @staticmethod
     def _prepare_gate_tensor(gate, n_sites):
@@ -281,6 +294,7 @@ class MpoOptimizer:
         bra_gate=None,
         *,
         cutoff,
+        cutoff_mode="rel",
         contract,
         inplace=True,
     ):
@@ -296,6 +310,7 @@ class MpoOptimizer:
                 ind_id=self.ind_id_k,
                 contract=contract,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 inplace=inplace,
             )
         if g_b is not None:
@@ -306,10 +321,11 @@ class MpoOptimizer:
                 ind_id=self.ind_id_b,
                 contract=contract,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 inplace=inplace,
             )
 
-    def _build_dmrg_target(self, p, gate, where, bra_gate, cutoff):
+    def _build_dmrg_target(self, p, gate, where, bra_gate, cutoff, cutoff_mode="rel"):
         """Build target MPO after applying a two-site gate pair."""
         p_g = p.copy()
         self._apply_gate_pair(
@@ -318,6 +334,7 @@ class MpoOptimizer:
             where,
             bra_gate=bra_gate,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             contract="split-gate",
             inplace=True,
         )
@@ -347,7 +364,7 @@ class MpoOptimizer:
 
         return batch_G, batch_where, two_qubit_in_batch, idx
 
-    def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff):
+    def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff, cutoff_mode="rel"):
         """Apply a collected DMRG batch onto a copy of ``p``."""
         p_g = p.copy()
         for G_i, where_i in zip(batch_G, batch_where):
@@ -359,18 +376,21 @@ class MpoOptimizer:
                 where,
                 bra_gate=bra_gate,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 contract=contract,
                 inplace=True,
             )
         return p_g
 
-    def _run_dmrg(self, G_seq, where_seq, n_iter, progbar=False, cutoff=1e-12, k_2q_batch=1):
+    def _run_dmrg(self, G_seq, where_seq, n_iter, progbar=False, cutoff=1e-12, cutoff_mode="rel", k_2q_batch=1, fidelity_samples=10):
         """Apply gates with local DMRG-style fitting updates."""
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
 
         p = self.p
         two_qubit_count = 0
+        sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
+        norm_proxy = self.losses[-1]
 
         pbar = None
         if progbar:
@@ -395,6 +415,7 @@ class MpoOptimizer:
                     where,
                     bra_gate=bra_gate,
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                     contract=True,
                     inplace=True,
                 )
@@ -405,7 +426,7 @@ class MpoOptimizer:
                     two_qubit_count += 1
                     xmin, xmax = sorted(where)
                     self.canonize_mpo(p, (xmin, xmax))
-                    p_g = self._build_dmrg_target(p, gate, where, bra_gate, cutoff)
+                    p_g = self._build_dmrg_target(p, gate, where, bra_gate, cutoff, cutoff_mode)
 
                     fit = FIT(
                         p_g,
@@ -417,8 +438,6 @@ class MpoOptimizer:
                     )
                     fit.run_gate(n_iter=n_iter, verbose=False)
                     p = fit.p
-
-                    self._append_norm_proxy_sample(p)
 
                     self.info_c["cur_orthog"] = (xmin, xmax)
                     idx += 1
@@ -434,7 +453,7 @@ class MpoOptimizer:
                     batch_span_sites = [site for where_i in batch_where for site in where_i]
                     xmin, xmax = min(batch_span_sites), max(batch_span_sites)
                     self.canonize_mpo(p, (xmin, xmax))
-                    p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff)
+                    p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff, cutoff_mode)
 
                     fit = FIT(
                         p_g,
@@ -447,18 +466,19 @@ class MpoOptimizer:
                     fit.run_gate(n_iter=n_iter, verbose=False)
                     p = fit.p
 
-                    self._append_norm_proxy_sample(p)
-
                     self.info_c["cur_orthog"] = (xmin, xmax)
                     advanced = next_idx - idx
                     idx = next_idx
             else:
                 raise ValueError("Each gate location must have one or two sites.")
 
+            if idx in sample_steps:
+                norm_proxy = self._append_norm_proxy_sample(p)
+
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": self.fidelity_trace[-1],
+                    "~F": norm_proxy,
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -469,12 +489,12 @@ class MpoOptimizer:
 
         self.p = p
 
-    def _run_svd(self, G_seq, where_seq, progbar=False, cutoff=1e-12, fidelity_samples=10):
+    def _run_svd(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rel", fidelity_samples=10):
         """Apply gates with local SVD compression for two-site updates."""
         p = self.p
         two_qubit_count = 0
         sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
-        norm_proxy = self.fidelity_trace[-1]
+        norm_proxy = self.losses[-1]
 
         pbar = None
         if progbar:
@@ -482,7 +502,7 @@ class MpoOptimizer:
 
             pbar = tqdm(
                 total=len(G_seq),
-                desc="svd_mpo",
+                desc="svd",
                 leave=True,
                 position=0,
                 colour="CYAN",
@@ -499,6 +519,7 @@ class MpoOptimizer:
                     where,
                     bra_gate=bra_gate,
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                     contract=True,
                     inplace=True,
                 )
@@ -512,6 +533,7 @@ class MpoOptimizer:
                     where,
                     bra_gate=bra_gate,
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                     contract="reduce-split",
                     inplace=True,
                 )
@@ -546,6 +568,90 @@ class MpoOptimizer:
 
         self.p = p
 
+
+    def _run_mpo(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rel", fidelity_samples=10):
+        """Apply gates using MPO-style nonlocal compression via gate_nonlocal_opt.
+
+        For two-site gates, the raw gate/bra_gate tensors are applied independently
+        to the upper (ket) and lower (bra) layers of the MPO using gate_nonlocal_opt.
+        One-site gates are applied directly via _apply_gate_pair.
+        """
+        p = self.p
+        two_qubit_count = 0
+        sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
+        norm_proxy = self.losses[-1]
+
+        pbar = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(
+                total=len(G_seq),
+                desc="mpo",
+                leave=True,
+                position=0,
+                colour="GREEN",
+            )
+
+        idx = 0
+        while idx < len(G_seq):
+            gate, bra_gate, where = self._parse_gate_entry(G_seq[idx], where_seq[idx])
+            n_sites = len(where)
+            if n_sites == 1:
+                self._apply_gate_pair(
+                    p,
+                    gate,
+                    where,
+                    bra_gate=bra_gate,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    contract=True,
+                    inplace=True,
+                )
+            elif n_sites == 2:
+                two_qubit_count += 1
+                g_k, g_b = self._prepare_gate_pair(gate, n_sites, bra_gate=bra_gate)
+                if g_k is not None:
+                    p = gate_nonlocal_opt(
+                        p, g_k, where,
+                        which="upper", method="direct",
+                        info=self.info_c, inplace=True,
+                        ind_id_k=self.ind_id_k, ind_id_b=self.ind_id_b,
+                        max_bond=self.chi, cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                    )
+                if g_b is not None:
+                    p = gate_nonlocal_opt(
+                        p, g_b, where,
+                        which="lower", method="direct",
+                        info=self.info_c, inplace=True,
+                        ind_id_k=self.ind_id_k, ind_id_b=self.ind_id_b,
+                        max_bond=self.chi, cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                    )
+                self.p = p
+            else:
+                raise ValueError("Each gate location must have one or two sites.")
+
+            idx += 1
+            if idx in sample_steps:
+                norm_proxy = self._append_norm_proxy_sample(self.p)
+
+            if pbar is not None:
+                postfix = {
+                    "2q": two_qubit_count,
+                    "~F": norm_proxy,
+                    "bnd": self.p.max_bond(),
+                }
+                pbar.set_postfix(postfix)
+                pbar.update(1)
+
+        if pbar is not None:
+            pbar.close()
+
+        self.p = p
+
+
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         n_iter=6,
@@ -553,6 +659,7 @@ class MpoOptimizer:
         mode=None,
         progbar=False,
         cutoff=1e-12,
+        cutoff_mode="rel",
         fidelity_samples=10,
         k_2q_batch=1,
     ):
@@ -563,12 +670,15 @@ class MpoOptimizer:
         n_iter : int, default=6
             Inner iterations for DMRG ``FIT`` updates on two-site gates.
             Ignored by ``svd`` mode.
-        mode : {"dmrg", "svd"} | None, default=None
+        mode : {"dmrg", "svd", "mpo"} | None, default=None
             Optional mode override for this run.
         progbar : bool, default=False
             Show tqdm progress bar.
         cutoff : float, default=1e-12
             Truncation cutoff used in gate application and compression.
+        cutoff_mode : str, default="rel"
+            Truncation mode forwarded to ``tensor_network_gate_inds`` and
+            ``tensor_network_1d_compress``.
         fidelity_samples : int, default=10
             ``svd`` mode only: number of intermediate norm-proxy samples.
             A final sample is always recorded at the end of the run.
@@ -598,7 +708,9 @@ class MpoOptimizer:
                 n_iter=n_iter,
                 progbar=progbar,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 k_2q_batch=k_2q_batch,
+                fidelity_samples=fidelity_samples,
             )
             return self.p
 
@@ -608,6 +720,18 @@ class MpoOptimizer:
                 where_seq,
                 progbar=progbar,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+            )
+            return self.p
+
+        if self.mode == "mpo":
+            self._run_mpo(
+                G_seq,
+                where_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 fidelity_samples=fidelity_samples,
             )
             return self.p
@@ -616,11 +740,30 @@ class MpoOptimizer:
         raise ValueError(f"Unknown mode: {self.mode}. Supported modes: {supported}")
 
     def canonize_mpo(self, p, where):
-        """Update canonical form around a two-site gate span."""
-        xmin, xmax = sorted(where)
-        p.canonize([xmin, xmax], cur_orthog=self._current_orthog(p))
-        self.info_c["cur_orthog"] = (xmin, xmax)
+        """Update canonical form around a one- or two-site gate span.
+
+        ``where`` may be an int, a 1-tuple ``(site,)``, or a 2-tuple
+        ``(xmin, xmax)``.  Integers and singletons collapse to a single-site
+        orthogonality center.
+        """
+        if isinstance(where, Integral):
+            site = int(where)
+            where_canon = [site]
+            target_orthog = (site, site)
+        elif len(where) == 1:
+            site = int(where[0])
+            where_canon = [site]
+            target_orthog = (site, site)
+        elif len(where) == 2:
+            xmin, xmax = min(int(where[0]), int(where[1])), max(int(where[0]), int(where[1]))
+            where_canon = [xmin, xmax]
+            target_orthog = (xmin, xmax)
+        else:
+            raise ValueError("where must be an int, (int,), or (int, int).")
+
+        p.canonize(where_canon, cur_orthog=self._current_orthog(p))
+        self.info_c["cur_orthog"] = target_orthog
 
     def get_fidelities(self):
-        """Return the running fidelity history."""
-        return self.fidelity_trace
+        """Return the running loss history."""
+        return self.losses

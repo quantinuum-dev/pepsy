@@ -95,7 +95,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.ind_id = str(ind_id)
 
         self.info_c = {}
-        self.fidelity_trace = [1.0]
+        self.losses = [1.0]
         self._init_canonicalization()
 
     def _current_orthog(self, p=None):
@@ -194,6 +194,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         n_iter=5,
         progbar=False,
         cutoff=1e-12,
+        cutoff_mode="rel",
         mode=None,
         fidelity_samples=10,
         k_2q_batch=1,
@@ -209,6 +210,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Show per-mode progress bars.
         cutoff : float, default=1e-12
             Truncation cutoff used in gate application and local fitting.
+        cutoff_mode : str, default="rel"
+            Truncation mode forwarded to ``tensor_network_gate_inds`` and
+            ``tensor_network_1d_compress``.
         mode : {"dmrg", "mpo", "swap", "svd", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
@@ -242,6 +246,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 n_iter=n_iter,
                 progbar=progbar,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 k_2q_batch=k_2q_batch,
             )
             return self.p
@@ -252,6 +257,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 where_seq,
                 progbar=progbar,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 fidelity_samples=fidelity_samples,
             )
             return self.p
@@ -262,6 +268,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 where_seq,
                 progbar=progbar,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 fidelity_samples=fidelity_samples,
             )
             return self.p
@@ -272,6 +279,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 where_seq,
                 progbar=progbar,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 fidelity_samples=fidelity_samples,
             )
             return self.p
@@ -282,6 +290,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 where_seq,
                 progbar=progbar,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 fidelity_samples=fidelity_samples,
             )
             return self.p
@@ -329,7 +338,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _append_norm_proxy_sample(self, p):
         """Append current state norm proxy as a real float and return it."""
         norm_val = self._real_float(p.norm())
-        self.fidelity_trace.append(norm_val)
+        self.losses.append(norm_val)
         return norm_val
 
     @staticmethod
@@ -357,12 +366,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return batch_G, batch_where, two_qubit_in_batch, idx
 
     @staticmethod
-    def _build_dmrg_batch_target(p, batch_G, batch_where, cutoff):
+    def _build_dmrg_batch_target(p, batch_G, batch_where, cutoff, cutoff_mode="rel"):
         """Apply a collected DMRG batch onto a copy of ``p``."""
         p_g = p.copy()
         for gate, where in zip(batch_G, batch_where):
             if len(where) == 1:
-                apply_gate(p_g, gate, where, contract=True, cutoff=cutoff, inplace=True)
+                apply_gate(p_g, gate, where, contract=True, cutoff=cutoff, cutoff_mode=cutoff_mode, inplace=True)
             else:
                 p_g = apply_gate(
                     p_g,
@@ -370,6 +379,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     where,
                     contract="split-gate",
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                     inplace=False,
                 )
         return p_g
@@ -381,6 +391,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         n_iter,
         progbar=False,
         cutoff=1e-12,
+        cutoff_mode="rel",
         k_2q_batch=1,
     ):
         """Apply gates with local DMRG-style fitting."""
@@ -409,7 +420,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             where = where_seq[idx]
             gate = G_seq[idx]
             if len(where) == 1:
-                apply_gate(p, gate, where, contract=True, cutoff=cutoff, inplace=True)
+                apply_gate(p, gate, where, contract=True, cutoff=cutoff, cutoff_mode=cutoff_mode, inplace=True)
                 idx += 1
                 advanced = 1
             else:
@@ -426,6 +437,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         where,
                         contract="split-gate",
                         cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
                         inplace=False,
                     )
                     fit = FIT(
@@ -439,7 +451,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     fit.run_gate(n_iter=n_iter, verbose=False)
 
                     p = fit.p
-                    self.fidelity_trace.append(complex(fit.local_norm_trace[-1]).real)
+                    self.losses.append(complex(fit.local_norm_trace[-1]).real)
                     idx += 1
                     advanced = 1
                 else:
@@ -453,7 +465,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     batch_span_sites = [site for where_i in batch_where for site in where_i]
                     xmin, xmax = min(batch_span_sites), max(batch_span_sites)
                     self.canonize_mps(p, (xmin, xmax))
-                    p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff)
+                    p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff, cutoff_mode)
                     fit = FIT(
                         p_g,
                         p=p,
@@ -465,14 +477,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     fit.run_gate(n_iter=n_iter, verbose=False)
 
                     p = fit.p
-                    self.fidelity_trace.append(complex(fit.local_norm_trace[-1]).real)
+                    self.losses.append(complex(fit.local_norm_trace[-1]).real)
                     advanced = next_idx - idx
                     idx = next_idx
 
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": self.fidelity_trace[-1],
+                    "~F": self.losses[-1],
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -489,6 +501,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         progbar=False,
         cutoff=1e-12,
+        cutoff_mode="rel",
         fidelity_samples=10,
     ):
         """Apply gates with MPO-style nonlocal compression.
@@ -498,7 +511,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         p = self.p
         two_qubit_count = 0
         sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
-        norm_proxy = self.fidelity_trace[-1]
+        norm_proxy = self.losses[-1]
 
         pbar = None
         if progbar:
@@ -518,7 +531,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             where = where_seq[idx]
             gate = G_seq[idx]
             if len(where) == 1:
-                apply_gate(p, gate, where, contract=True, cutoff=cutoff, inplace=True)
+                apply_gate(p, gate, where, contract=True, cutoff=cutoff, cutoff_mode=cutoff_mode, inplace=True)
                 idx += 1
                 advanced = 1
             else:
@@ -532,6 +545,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     info=self.info_c,
                     method="direct",
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                 )
                 idx += 1
                 advanced = 1
@@ -559,6 +573,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         progbar=False,
         cutoff=1e-12,
+        cutoff_mode="rel",
         fidelity_samples=10,
     ):
         """Apply gates with swap-network compression for nonlocal 2-site gates.
@@ -568,7 +583,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         p = self.p
         two_qubit_count = 0
         sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
-        norm_proxy = self.fidelity_trace[-1]
+        norm_proxy = self.losses[-1]
 
         pbar = None
         if progbar:
@@ -588,7 +603,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             where = where_seq[idx]
             gate = G_seq[idx]
             if len(where) == 1:
-                apply_gate(p, gate, where, contract=True, cutoff=cutoff, inplace=True)
+                apply_gate(p, gate, where, contract=True, cutoff=cutoff, cutoff_mode=cutoff_mode, inplace=True)
                 idx += 1
                 advanced = 1
             else:
@@ -596,7 +611,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Each gate location must have one or two sites.")
                 two_qubit_count += 1
 
-                compress_opts = {"cutoff": cutoff}
+                compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
                 p.gate_with_auto_swap_(
                     gate,
                     where,
@@ -632,6 +647,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         progbar=False,
         cutoff=1e-12,
+        cutoff_mode="rel",
         fidelity_samples=10,
     ):
         """Apply gates with local SVD compression for nonlocal 2-site gates.
@@ -642,7 +658,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         p = self.p
         two_qubit_count = 0
         sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
-        norm_proxy = self.fidelity_trace[-1]
+        norm_proxy = self.losses[-1]
 
         pbar = None
         if progbar:
@@ -662,7 +678,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             where = where_seq[idx]
             gate = G_seq[idx]
             if len(where) == 1:
-                apply_gate(p, gate, where, contract=True, cutoff=cutoff, inplace=True)
+                apply_gate(p, gate, where, contract=True, cutoff=cutoff, cutoff_mode=cutoff_mode, inplace=True)
                 idx += 1
                 advanced = 1
             else:
@@ -677,10 +693,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     where,
                     contract="reduce-split",
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                     inplace=True,
                 )
                 xmin, xmax = sorted(where)
                 self.canonize_mps(p, (xmin, xmax))
+
                 for i in range(xmax, xmin, -1):
                     p.right_canonize_site(i, bra=None)
                 p.left_compress(
@@ -716,6 +734,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         progbar=False,
         cutoff=1e-12,
+        cutoff_mode="rel",
         fidelity_samples=10,
     ):
         """Apply gates exactly using in-place ``contract=True`` application.
@@ -755,6 +774,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 info=None,
                 inplace=True,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
             )
 
             if len(where) == 1:
@@ -781,5 +801,5 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.info_c["cur_orthog"] = (xmin, xmax)
 
     def get_fidelities(self):
-        """Return the running fidelity history."""
-        return self.fidelity_trace
+        """Return the running loss history."""
+        return self.losses

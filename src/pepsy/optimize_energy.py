@@ -2,24 +2,20 @@
 
 from __future__ import annotations
 
-import re
 import time
 import warnings
 from collections.abc import Mapping
 from typing import Any
 
 import quimb.tensor as qtn
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from .boundary_metrics import contract_boundary, build_bra_ket, normalize
 from .boundary_states import BdyMPS
 from .boundary_sweeps import CompBdy
 from .core import tns_align
 from .gradient_solver import GradientOptimizer, SUPPORTED_SOLVERS
-
-_PHYS_IND_PATTERN = re.compile(r"^k\d+(?:,\d+)*$")
-_TAG_X = re.compile(r"^X(\d+)$")
-_TAG_Y = re.compile(r"^Y(\d+)$")
+from ._tn_validation import _PHYS_IND_PATTERN, _TAG_X, _TAG_Y
 
 __all__ = ["EnergyOptimizer"]
 

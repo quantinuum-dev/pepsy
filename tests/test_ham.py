@@ -436,12 +436,8 @@ def test_ham_tn_3d_rejects_pepo_conversion():
     z_op = quimb.pauli("Z", dtype="complex128")
     mpo = builder.build_mpo([((z_op,), ((0, 0, 0),))], compress_each=False)
 
-    try:
+    with pytest.raises(NotImplementedError, match="only available for 2D builders"):
         builder.mpo_to_pepo(mpo)
-    except NotImplementedError as exc:
-        assert "only available for 2D builders" in str(exc)
-    else:
-        raise AssertionError("Expected NotImplementedError for 3D mpo_to_pepo.")
 
 
 def test_mpo_itf_works_for_2d_builder():
@@ -462,12 +458,8 @@ def test_mpo_itf_works_for_3d_builder_and_blocks_pepo():
     assert coord_to_chain == builder.map_inv
     assert all(len(coord) == 3 for coord in coord_to_chain)
 
-    try:
+    with pytest.raises(NotImplementedError, match="only available for 2D builders"):
         builder.mpo_itf(as_pepo=True)
-    except NotImplementedError as exc:
-        assert "only available for 2D builders" in str(exc)
-    else:
-        raise AssertionError("Expected NotImplementedError for 3D mpo_itf(as_pepo=True).")
 
 
 def test_map_builder_supports_col_major_mode():

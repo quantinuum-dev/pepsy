@@ -10,7 +10,6 @@ import warnings
 from itertools import count
 
 import autoray as ar
-import numpy as np
 import quimb as qu
 import quimb.tensor as qtn
 
@@ -18,7 +17,7 @@ from ._backend_utils import (
     infer_backend_converter_from_sample,
     resolve_backend_sample_data_from_tn,
 )
-from .core import add_cycle, mpo_identity_1d, pepo_identity_2d
+from .core import add_cycle, id_to_mpo, id_to_pepo
 
 __all__ = [
     "gate",
@@ -58,6 +57,8 @@ __all__ = [
     "rzz",
     "u3",
     "su4",
+    "fsim",
+    "fsimg",
 ]
 
 
@@ -338,6 +339,42 @@ def u3(params):
     if len(params) != 3:
         raise ValueError("u3 expects exactly 3 parameters.")
     return qtn.circuit.u3_gate_param_gen(params)
+
+
+def fsim(params):
+    """Return a two-qubit fSim gate from 2 parameters.
+
+    The fSim gate is defined as::
+
+        [[1,           0,           0, 0          ],
+         [0,  cos(theta), -i*sin(theta), 0          ],
+         [0, -i*sin(theta),  cos(theta), 0          ],
+         [0,           0,           0, exp(-i*phi)]]
+
+    Parameters
+    ----------
+    params : sequence
+        Sequence of exactly 2 parameters ``(theta, phi)``.
+    """
+    if len(params) != 2:
+        raise ValueError("fsim expects exactly 2 parameters (theta, phi).")
+    return qtn.circuit.fsim_param_gen(params)
+
+
+def fsimg(params):
+    """Return a two-qubit generalized fSim gate from 5 parameters.
+
+    The most general number-conserving two-qubit gate parametrized by
+    ``(theta, zeta, chi, gamma, phi)``.
+
+    Parameters
+    ----------
+    params : sequence
+        Sequence of exactly 5 parameters ``(theta, zeta, chi, gamma, phi)``.
+    """
+    if len(params) != 5:
+        raise ValueError("fsimg expects exactly 5 parameters (theta, zeta, chi, gamma, phi).")
+    return qtn.circuit.fsimg_param_gen(params)
 
 
 def gen_long_range_swap_path_2d(  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
@@ -1105,6 +1142,7 @@ def gate(tn, gates, where=None, **kwargs):
     """
     entries = _normalize_gate_entries(gates, where=where, allow_empty=True)
     opts = dict(kwargs)
+    opts.setdefault("cutoff_mode", "rel")
     inplace = opts.pop("inplace", True)
     chi = opts.pop("chi", None)
     chi_cutoff = float(opts.pop("chi_cutoff", 1.0e-12))
@@ -1221,6 +1259,7 @@ def _apply_gate_2d(
     Lx=None,
     Ly=None,
     ind_id="k{},{}",
+    cutoff_mode="rel",
 ):
     """Apply a single normalized 2D gate, routing long-range pairs with SWAPs."""
 
@@ -1247,6 +1286,7 @@ def _apply_gate_2d(
             info=None,
             inplace=True,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
         )
         return peps
 
@@ -1272,6 +1312,7 @@ def _apply_gate_2d(
             info=None,
             inplace=True,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
         )
         return peps
 
@@ -1312,6 +1353,7 @@ def _apply_gate_2d(
             info=None,
             inplace=True,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             max_bond=bond_dim,
         )
 
@@ -1327,6 +1369,7 @@ def _apply_gate_2d(
         info=None,
         inplace=True,
         cutoff=cutoff,
+        cutoff_mode=cutoff_mode,
     )
 
     for pair in reversed(swaps):
@@ -1342,6 +1385,7 @@ def _apply_gate_2d(
             info=None,
             inplace=True,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
         )
 
     return peps
@@ -1429,6 +1473,7 @@ def _apply_gate_3d(
     Ly=None,
     Lz=None,
     ind_id="k{},{},{}",
+    cutoff_mode="rel",
 ):
     """Apply a single normalized 3D gate, routing long-range pairs with SWAPs."""
 
@@ -1455,6 +1500,7 @@ def _apply_gate_3d(
             info=None,
             inplace=True,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
         )
         return tn
 
@@ -1477,6 +1523,7 @@ def _apply_gate_3d(
             info=None,
             inplace=True,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
         )
         return tn
 
@@ -1520,6 +1567,7 @@ def _apply_gate_3d(
             info=None,
             inplace=True,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             max_bond=bond_dim,
         )
 
@@ -1535,6 +1583,7 @@ def _apply_gate_3d(
         info=None,
         inplace=True,
         cutoff=cutoff,
+        cutoff_mode=cutoff_mode,
     )
 
     for pair in reversed(swaps):
@@ -1550,6 +1599,7 @@ def _apply_gate_3d(
             info=None,
             inplace=True,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
         )
 
     return tn
@@ -1614,7 +1664,7 @@ def build_pepo_from_gates(
     Lx = max(i for i, _ in coords) + 1
     Ly = max(j for _, j in coords) + 1
 
-    pepo = pepo_.copy() if pepo_ is not None else pepo_identity_2d(Lx, Ly, dtype=dtype)
+    pepo = pepo_.copy() if pepo_ is not None else id_to_pepo(Lx, Ly, dtype=dtype)
     if pepo_ is None and cyclic:
         pepo = add_cycle(pepo, 1)
 
@@ -1723,7 +1773,7 @@ def build_mpo_from_gates(
     coords = [int(i) for w in where_list for i in w]
     L = max(coords) + 1
 
-    mpo = mpo_.copy() if mpo_ is not None else mpo_identity_1d(
+    mpo = mpo_.copy() if mpo_ is not None else id_to_mpo(
         L, phys_dim=2, dtype=dtype, cyclic=cyclic
     )
 
@@ -1802,6 +1852,7 @@ def _apply_gate_1d(
     inplace=True,
     *,
     dtype="complex128",
+    cutoff_mode="rel",
 ):
     """Apply a single normalized 1D gate on one or two sites."""
 
@@ -1837,6 +1888,7 @@ def _apply_gate_1d(
                     contract=contract,
                     inplace=inplace,
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                 )
 
             i_, j_ = final
@@ -1847,6 +1899,7 @@ def _apply_gate_1d(
                 contract=contract,
                 inplace=inplace,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
             )
 
             for i_, j_ in reversed(swaps):
@@ -1857,6 +1910,7 @@ def _apply_gate_1d(
                     contract=contract,
                     inplace=inplace,
                     cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
                 )
         else:
             tn = qtn.tensor_network_gate_inds(
@@ -1866,13 +1920,14 @@ def _apply_gate_1d(
                 contract=contract,
                 inplace=inplace,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
             )
 
-        # Add site tags after the gate has been applied.
-        tensor_x = [tn.tensor_map[i] for i in tn.ind_map[_format_ind_id(ind_id, x)]][0]
-        tensor_x.add_tag(site_tags.format(x))
-        tensor_y = [tn.tensor_map[i] for i in tn.ind_map[_format_ind_id(ind_id, y)]][0]
-        tensor_y.add_tag(site_tags.format(y))
+            # Add site tags after the gate has been applied.
+            tensor_x = [tn.tensor_map[i] for i in tn.ind_map[_format_ind_id(ind_id, x)]][0]
+            tensor_x.add_tag(site_tags.format(x))
+            tensor_y = [tn.tensor_map[i] for i in tn.ind_map[_format_ind_id(ind_id, y)]][0]
+            tensor_y.add_tag(site_tags.format(y))
 
     elif len(where) == 1:
         (x,) = where
@@ -1888,3 +1943,207 @@ def _apply_gate_1d(
         raise ValueError("where must contain one or two site indices.")
 
     return tn
+
+
+
+def gate_with_submpo(
+    p,
+    submpo,
+    where=None,
+    which="upper",
+    method="direct",
+    transpose=False,
+    tags=None,
+    info=None,
+    inplace=False,
+    inplace_mpo=True,
+    ind_id_k="k{}",
+    ind_id_b="b{}",
+    **compress_opts,
+):
+    """Apply a sub-MPO to the upper (ket) or lower (bra) layer of an MPS/MPO.
+
+    The gate region is canonicalized, the sub-MPO is lazily absorbed, the
+    affected region is compressed via ``tensor_network_1d_compress``, and the
+    physical indices are re-mapped back to their canonical names.
+
+    Parameters
+    ----------
+    p : qtn.MatrixProductState or qtn.MatrixProductOperator
+        The target MPS/MPO to apply the sub-MPO to.
+    submpo : qtn.MatrixProductOperator
+        The sub-MPO to apply.
+    where : tuple[int], optional
+        The site indices where the sub-MPO acts.
+    which : {"upper", "lower"}, default="upper"
+        Whether to absorb into the upper (ket) or lower (bra) layer.
+    method : str, default="direct"
+        Compression method passed to ``tensor_network_1d_compress``.
+    transpose : bool, default=False
+        Whether to transpose the sub-MPO before application.
+    tags : sequence[str] | None, optional
+        Tags to add to the gate tensors (currently unused, reserved for
+        future alignment with quimb's ``gate_upper``/``gate_lower`` API).
+    info : dict | None, optional
+        If provided, ``cur_orthog`` is written back after compression.
+    inplace : bool, default=False
+        Whether to modify ``p`` in place.
+    inplace_mpo : bool, default=True
+        Whether to modify ``submpo`` in place during absorption.
+    ind_id_k : str, default="k{}"
+        Format string for ket-family physical index names.
+    ind_id_b : str, default="b{}"
+        Format string for bra-family physical index names.
+    **compress_opts :
+        Additional options forwarded to ``tensor_network_1d_compress``.
+
+    Returns
+    -------
+    p : qtn.MatrixProductState or qtn.MatrixProductOperator
+        The updated MPS/MPO after sub-MPO application and compression.
+    """
+    which_norm = str(which).strip().lower()
+    if which_norm not in ("upper", "lower"):
+        raise ValueError("which must be 'upper' or 'lower' (case-insensitive).")
+
+    p = p if inplace else p.copy()
+    si, sf = min(where), max(where)
+
+    # make the region canonical
+    p.canonicalize_((si, sf), info=info)
+
+    # lazily absorb the sub-MPO into the selected layer
+    if which_norm == "upper":
+        p.gate_upper_with_op_lazy_(submpo, transpose=transpose, inplace=inplace_mpo)
+        ind_id = ind_id_k
+        other_prefix = ind_id_b.replace("{}", "").rstrip("{}")
+    else:
+        p.gate_lower_with_op_lazy_(submpo, transpose=transpose, inplace=inplace_mpo)
+        ind_id = ind_id_b
+        other_prefix = ind_id_k.replace("{}", "").rstrip("{}")
+
+    # split off and compress the affected region
+    sub_site_tags = [p.site_tag(s) for s in range(si, sf + 1)]
+    _, subpsi = p.partition(sub_site_tags, which="any", inplace=True)
+    qtn.tensor_network_1d_compress(
+        subpsi,
+        site_tags=sub_site_tags,
+        method=method,
+        # the sub TN can't be automatically permuted when missing sites
+        permute_arrays=False,
+        inplace=True,
+        **compress_opts,
+    )
+
+    if info is not None:
+        if compress_opts.get("sweep_reverse", False):
+            info["cur_orthog"] = (sf, sf)
+        else:
+            info["cur_orthog"] = (si, si)
+
+    # recombine and remap physical indices back to canonical names
+    p |= subpsi
+    outer_inds = set(p.outer_inds())
+    mapping = {
+        ind: _format_ind_id(ind_id, i)
+        for i in range(p.L)
+        for ind in p[f"I{i}"].inds
+        if ind in outer_inds and not ind.startswith(other_prefix)
+    }
+    p.reindex_(mapping)
+    return p
+
+
+# Thin backward-compatible wrappers kept for external callers.
+def gate_with_submpo_upper(p, submpo, where=None, method="direct", transpose=False,
+                           info=None, inplace=False, inplace_mpo=True, **compress_opts):
+    """Apply a sub-MPO to the upper (ket) layer. Delegates to :func:`gate_with_submpo`."""
+    return gate_with_submpo(
+        p, submpo, where=where, which="upper", method=method, transpose=transpose,
+        info=info, inplace=inplace, inplace_mpo=inplace_mpo, **compress_opts,
+    )
+
+
+def gate_with_submpo_lower(p, submpo, where=None, method="direct", transpose=False,
+                           info=None, inplace=False, inplace_mpo=True, **compress_opts):
+    """Apply a sub-MPO to the lower (bra) layer. Delegates to :func:`gate_with_submpo`."""
+    return gate_with_submpo(
+        p, submpo, where=where, which="lower", method=method, transpose=transpose,
+        info=info, inplace=inplace, inplace_mpo=inplace_mpo, **compress_opts,
+    )
+
+
+def gate_nonlocal_opt(
+    p,
+    G,
+    where,
+    dims=None,
+    which="upper",
+    method="direct",
+    tags=None,
+    info=None,
+    inplace=False,
+    ind_id_k="k{}",
+    ind_id_b="b{}",
+    **compress_opts,
+):
+    """Apply a nonlocal gate (dense operator) to an MPO layer via sub-MPO compression.
+
+    The gate ``G`` is converted to a :class:`~quimb.tensor.MatrixProductOperator`,
+    absorbed lazily into the requested layer of ``p``, and the affected region is
+    compressed using ``tensor_network_1d_compress``.  This keeps bond dimension
+    controlled without the unbounded growth that quimb's native ``gate_upper`` /
+    ``gate_lower`` can produce.
+
+    Parameters
+    ----------
+    p : qtn.MatrixProductOperator
+        The target MPO to apply the gate to.
+    G : array_like
+        Dense gate operator with shape ``(d**n, d**n)`` or ``(d,)*2n``.
+    where : tuple[int]
+        Site indices the gate acts on.
+    dims : tuple[int] | None, optional
+        Physical dimensions for each site in ``where``.  Inferred from ``p``
+        when ``None``.
+    which : {"upper", "lower"}, default="upper"
+        Which layer to apply the gate to — consistent with quimb's
+        ``gate_upper`` / ``gate_lower`` naming.
+    method : str, default="direct"
+        Compression method passed to ``tensor_network_1d_compress``.
+    tags : sequence[str] | None, optional
+        Tags forwarded to the sub-MPO tensors (reserved for future use).
+    info : dict | None, optional
+        If provided, ``cur_orthog`` is written back after compression.
+    inplace : bool, default=False
+        Whether to modify ``p`` in place.
+    ind_id_k : str, default="k{}"
+        Format string for ket-family physical index names.
+    ind_id_b : str, default="b{}"
+        Format string for bra-family physical index names.
+    **compress_opts :
+        Additional options forwarded to ``tensor_network_1d_compress``
+        (e.g. ``max_bond``, ``cutoff``, ``cutoff_mode``).
+
+    Returns
+    -------
+    p : qtn.MatrixProductOperator
+        The updated MPO after gate application and compression.
+    """
+    if dims is None:
+        dims = tuple(p.phys_dim(i) for i in where)
+    submpo = qtn.MatrixProductOperator.from_dense(G, dims=dims, sites=where, L=p.L)
+    return gate_with_submpo(
+        p,
+        submpo,
+        where=where,
+        which=which,
+        method=method,
+        tags=tags,
+        info=info,
+        inplace=inplace,
+        inplace_mpo=True,
+        ind_id_k=ind_id_k,
+        ind_id_b=ind_id_b,
+        **compress_opts,
+    )

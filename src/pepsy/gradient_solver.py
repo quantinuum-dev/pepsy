@@ -23,6 +23,10 @@ __all__ = [
 
 SUPPORTED_SOLVERS = (
     "torch-adam",
+    "torch-lbfgs",
+    "torch-adamw",
+    "torch-radam",
+    "torch-nadam",
     "scipy",
     "nlopt",
 )
@@ -31,6 +35,10 @@ _TORCH_SOLVERS = {}
 if torch is not None:
     _TORCH_SOLVERS = {
         "torch-adam": torch.optim.Adam,
+        "torch-lbfgs": torch.optim.LBFGS,
+        "torch-adamw": torch.optim.AdamW,
+        "torch-radam": torch.optim.RAdam,
+        "torch-nadam": torch.optim.NAdam,
     }
 
 
@@ -55,6 +63,8 @@ class GradSolverResult:
     n_steps: int
     best_loss: float
     final_loss: float
+    convergence_reason: str = "maxiter"
+    n_evals: int = -1
 
 def _normalize_solver_name(solver: str) -> str:
     if not isinstance(solver, str):
@@ -120,24 +130,29 @@ def _build_param_specs(items: list[tuple[str, torch.Tensor]]):
 
 
 def _flatten_params_real_torch(specs: list[dict[str, Any]]) -> torch.Tensor:
-    """Flatten potentially complex tensors to a single CPU float64 tensor."""
+    """Flatten potentially complex tensors to a single CPU float64 tensor.
+
+    Concatenation is done on the source device first so that only a single
+    device→CPU transfer is needed (instead of one per tensor).
+    """
     parts: list[torch.Tensor] = []
     for spec in specs:
         data = spec["tensor"].detach()
         if spec["is_complex"]:
-            parts.append(data.real.reshape(-1).to(device="cpu", dtype=torch.float64))
-            parts.append(data.imag.reshape(-1).to(device="cpu", dtype=torch.float64))
+            parts.append(data.real.reshape(-1).to(dtype=torch.float64))
+            parts.append(data.imag.reshape(-1).to(dtype=torch.float64))
         else:
-            parts.append(data.reshape(-1).to(device="cpu", dtype=torch.float64))
+            parts.append(data.reshape(-1).to(dtype=torch.float64))
     if not parts:
         return torch.empty(0, dtype=torch.float64, device="cpu")
-    return torch.cat(parts).detach()
+    # Single cat on source device, then one bulk transfer to CPU.
+    return torch.cat(parts).detach().to(device="cpu")
 
 
 def _flatten_params_real_numpy(specs: list[dict[str, Any]]) -> np.ndarray:
     """Flatten params to NumPy float64 vector (for SciPy/NLopt only)."""
     flat = _flatten_params_real_torch(specs)
-    return np.array(flat.numpy(), dtype=np.float64, copy=True)
+    return flat.numpy().copy()
 
 
 def _assign_flat_params(vector: np.ndarray | torch.Tensor, specs: list[dict[str, Any]]):
@@ -184,25 +199,31 @@ def _restore_param_state(params_run: dict[str, torch.Tensor], state: Mapping[str
 
 def _flatten_grads_real(specs: list[dict[str, Any]]) -> np.ndarray:
     parts: list[torch.Tensor] = []
+    device = None
     for spec in specs:
         numel = spec["numel"]
         grad = spec["tensor"].grad
         if grad is None:
+            # Use source device for zero-fill so cat stays on one device.
+            dev = spec["device"]
             if spec["is_complex"]:
-                parts.append(torch.zeros(numel, dtype=torch.float64, device="cpu"))
-                parts.append(torch.zeros(numel, dtype=torch.float64, device="cpu"))
+                parts.append(torch.zeros(numel, dtype=torch.float64, device=dev))
+                parts.append(torch.zeros(numel, dtype=torch.float64, device=dev))
             else:
-                parts.append(torch.zeros(numel, dtype=torch.float64, device="cpu"))
+                parts.append(torch.zeros(numel, dtype=torch.float64, device=dev))
             continue
-        grad_cpu = grad.detach().to(device="cpu")
+        if device is None:
+            device = grad.device
+        grad_d = grad.detach()
         if spec["is_complex"]:
-            parts.append(grad_cpu.real.reshape(-1).to(dtype=torch.float64))
-            parts.append(grad_cpu.imag.reshape(-1).to(dtype=torch.float64))
+            parts.append(grad_d.real.reshape(-1).to(dtype=torch.float64))
+            parts.append(grad_d.imag.reshape(-1).to(dtype=torch.float64))
         else:
-            parts.append(grad_cpu.reshape(-1).to(dtype=torch.float64))
+            parts.append(grad_d.reshape(-1).to(dtype=torch.float64))
     if not parts:
         return np.empty(0, dtype=np.float64)
-    return np.array(torch.cat(parts).detach().numpy(), dtype=np.float64, copy=True)
+    # Single cat on source device, then one bulk transfer to CPU.
+    return torch.cat(parts).detach().to(device="cpu").numpy().copy()
 
 
 def _evaluate_loss_and_grad(
@@ -218,6 +239,76 @@ def _evaluate_loss_and_grad(
     loss.backward()
     grad_vec = _flatten_grads_real(specs)
     return float(loss.detach().cpu()), grad_vec
+
+
+def _build_loss_from_flat(
+    specs: list[dict[str, Any]],
+    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return a differentiable scalar function of the flat real parameter vector.
+
+    Unlike :func:`_evaluate_loss_and_grad`, this preserves the autograd graph
+    through the flat vector, enabling second-order differentiation.
+    Used by :func:`_evaluate_hessian` and :func:`_evaluate_hessp`.
+    """
+    def _loss(x_vec: torch.Tensor) -> torch.Tensor:
+        params_tmp: dict[str, torch.Tensor] = {}
+        offset = 0
+        for spec in specs:
+            name = spec["name"]
+            numel = spec["numel"]
+            shape = spec["shape"]
+            dtype = spec["dtype"]
+            device = spec["device"]
+            if spec["is_complex"]:
+                real_part = x_vec[offset : offset + numel].reshape(shape)
+                offset += numel
+                imag_part = x_vec[offset : offset + numel].reshape(shape)
+                offset += numel
+                val = torch.complex(
+                    real_part.to(device=device, dtype=torch.float64),
+                    imag_part.to(device=device, dtype=torch.float64),
+                ).to(dtype=dtype)
+            else:
+                val = x_vec[offset : offset + numel].reshape(shape).to(device=device, dtype=dtype)
+                offset += numel
+            params_tmp[name] = val
+        return _scalar_real_loss(loss_fn(params_tmp))
+    return _loss
+
+
+def _evaluate_hessian(
+    vector: np.ndarray,
+    specs: list[dict[str, Any]],
+    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+) -> np.ndarray:
+    """Compute the full n\u00d7n Hessian matrix via ``torch.autograd.functional.hessian``.
+
+    Cost: O(n) backward passes where n = number of real parameters.
+    Only practical for small parameter counts (< ~50).  Used by trust-exact.
+    """
+    x0 = torch.tensor(vector, dtype=torch.float64)
+    loss_from_flat = _build_loss_from_flat(specs, loss_fn)
+    H = torch.autograd.functional.hessian(loss_from_flat, x0)
+    return np.array(H.detach().cpu().numpy(), dtype=np.float64)
+
+
+def _evaluate_hessp(
+    vector: np.ndarray,
+    p: np.ndarray,
+    specs: list[dict[str, Any]],
+    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+) -> np.ndarray:
+    """Compute the Hessian-vector product H(x)@p via ``torch.autograd.functional.vhp``.
+
+    Cost: O(1) backward passes (one forward + one reverse-mode AD pass).
+    Suitable for trust-krylov and Newton-CG — much cheaper than the full Hessian.
+    """
+    x0 = torch.tensor(vector, dtype=torch.float64)
+    p_tensor = torch.tensor(p, dtype=torch.float64)
+    loss_from_flat = _build_loss_from_flat(specs, loss_fn)
+    _, hvp = torch.autograd.functional.vhp(loss_from_flat, x0, p_tensor)
+    return np.array(hvp.detach().cpu().numpy(), dtype=np.float64)
 
 
 def _as_numpy_vector(values: Any, size: int, *, key: str) -> np.ndarray:
@@ -243,11 +334,20 @@ _SCIPY_METHOD_MAP: dict[str, str] = {
     "TRUST_CONSTR": "trust-constr",
     "TRUST_KRYLOV": "trust-krylov",
     "NEWTON_CG": "Newton-CG",
+    # Hessian-based trust-region
+    "TRUST_EXACT": "trust-exact",
+    "TRUST_NCG": "trust-ncg",
 }
 
 _SCIPY_BOUNDS_METHODS: frozenset[str] = frozenset(
     {"L-BFGS-B", "TNC", "SLSQP", "trust-constr"}
 )
+# Methods that use a Hessian-vector product callable (hessp): O(1) backward pass per call.
+# Much cheaper than a full Hessian; suitable for mid-size problems.
+_SCIPY_HESSP_METHODS: frozenset[str] = frozenset({"trust-krylov", "trust-ncg", "Newton-CG"})
+# Methods that require the full n×n Hessian matrix: O(n) backward passes per call.
+# Only practical when the number of optimised parameters is small (< ~50).
+_SCIPY_HESS_METHODS: frozenset[str] = frozenset({"trust-exact"})
 
 
 def _normalize_scipy_method(name: Any, *, key: str) -> str:
@@ -299,6 +399,7 @@ def _pop_common_controls(
     restore_best = bool(options.pop("restore_best", True))
     bad_max = int(options.pop("bad_max", default_bad_max))
     penalty_on_bad = float(options.pop("penalty_on_bad", options.pop("penalty_value", default_penalty)))
+    angle_wrap = bool(options.pop("angle_wrap", False))
 
     if patience is not None and int(patience) < 0:
         raise ValueError("patience must be >= 0 or None")
@@ -317,6 +418,7 @@ def _pop_common_controls(
         "restore_best": restore_best,
         "bad_max": bad_max,
         "penalty_on_bad": penalty_on_bad,
+        "angle_wrap": angle_wrap,
     }
 
 
@@ -450,7 +552,8 @@ def _run_torch_solver(
             scheduler_options[key] = options.pop(key)
 
     optimizer_cls = _TORCH_SOLVERS[solver_name]
-    optimizer = optimizer_cls(list(params_run.values()), lr=lr, **options)
+    param_list = list(params_run.values())
+    optimizer = optimizer_cls(param_list, lr=lr, **options)
 
     if isinstance(optimizer, torch.optim.LBFGS):
         # torch.optim.LBFGS._gather_flat_grad uses .view(-1) which fails for
@@ -480,6 +583,7 @@ def _run_torch_solver(
     history: list[float] = []
     best_loss = float("inf")
     best_vector = _flatten_params_real_numpy(specs)
+    convergence_reason = "maxiter"
     step_iter = _iter_steps(
         controls["max_steps"],
         progress=progress,
@@ -497,11 +601,12 @@ def _run_torch_solver(
             history.append(loss_value)
             _step_torch_scheduler(scheduler, scheduler_kind, float("inf"))
             if progress:
-                step_iter.set_postfix({"||g||": "nan", "loss": "nan", "best": f"{best_loss:.4g}"})
+                step_iter.set_postfix({"||g||": "nan", "loss": "nan", "best": f"{best_loss:.3e}"})
             step_num = step + 1
             if progress_callback is not None and (step_num % log_every == 0):
                 progress_callback(step_num, loss_value)
             if (bad_consecutive >= controls["bad_max"]) and (step_num >= controls["min_steps"]):
+                convergence_reason = "bad_max"
                 break
             continue
 
@@ -514,17 +619,17 @@ def _run_torch_solver(
             last_improve_step = step + 1
 
         if max_step_norm is not None:
-            prev_flat = torch.nn.utils.parameters_to_vector(list(params_run.values())).detach().clone()
+            prev_flat = torch.nn.utils.parameters_to_vector(param_list).detach()
 
         loss.backward()
         if grad_clip_value is not None:
-            torch.nn.utils.clip_grad_value_(list(params_run.values()), float(grad_clip_value))
+            torch.nn.utils.clip_grad_value_(param_list, float(grad_clip_value))
         if grad_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(list(params_run.values()), float(grad_clip_norm))
+            torch.nn.utils.clip_grad_norm_(param_list, float(grad_clip_norm))
         if isinstance(optimizer, torch.optim.LBFGS):
             # LBFGS calls _gather_flat_grad() using the current grads BEFORE calling
             # the closure, so fix contiguity here as well as inside the closure.
-            for _p in params_run.values():
+            for _p in param_list:
                 if isinstance(_p, torch.Tensor) and _p.grad is not None and not _p.grad.is_contiguous():
                     _p.grad.data = _p.grad.data.contiguous()
             def _closure():
@@ -532,7 +637,7 @@ def _run_torch_solver(
                 _l = _scalar_real_loss(loss_fn(params_run))
                 _l.backward()
                 # Also fix inside closure for subsequent line-search evaluations.
-                for _p in params_run.values():
+                for _p in param_list:
                     if isinstance(_p, torch.Tensor) and _p.grad is not None and not _p.grad.is_contiguous():
                         _p.grad.data = _p.grad.data.contiguous()
                 return _l
@@ -542,15 +647,23 @@ def _run_torch_solver(
 
         if max_step_norm is not None:
             with torch.no_grad():
-                cur_flat = torch.nn.utils.parameters_to_vector(list(params_run.values()))
+                cur_flat = torch.nn.utils.parameters_to_vector(param_list)
                 delta = cur_flat - prev_flat
                 delta_norm = float(torch.linalg.vector_norm(delta).detach().cpu().item())
                 step_max = float(max_step_norm)
                 if delta_norm > step_max:
                     clipped = prev_flat + delta * (step_max / (delta_norm + 1e-12))
-                    torch.nn.utils.vector_to_parameters(clipped, list(params_run.values()))
+                    torch.nn.utils.vector_to_parameters(clipped, param_list)
 
         _step_torch_scheduler(scheduler, scheduler_kind, loss_value)
+
+        if controls["angle_wrap"]:
+            with torch.no_grad():
+                _TWO_PI = 2.0 * np.pi
+                for spec in specs:
+                    if not spec["is_complex"]:
+                        t = spec["tensor"]
+                        t.data = (t.data + np.pi) % _TWO_PI - np.pi
 
         if progress:
             _gnorm = float(
@@ -562,27 +675,24 @@ def _run_torch_solver(
                     if spec["tensor"].grad is not None
                 ) ** 0.5
             )
-            step_iter.set_postfix({"||g||": f"{_gnorm:.2e}", "loss": f"{loss_value:.4g}", "best": f"{best_loss:.4g}"})
+            step_iter.set_postfix({"||g||": f"{_gnorm:.2e}", "loss": f"{loss_value:.3e}", "best": f"{best_loss:.3e}"})
         step_num = step + 1
         if progress_callback is not None and (step_num % log_every == 0):
             progress_callback(step_num, loss_value)
         if controls["patience"] is not None and step_num >= controls["min_steps"]:
             if (step_num - last_improve_step) >= controls["patience"]:
+                convergence_reason = "patience"
                 break
-
-    with torch.no_grad():
-        final_loss = float(_scalar_real_loss(loss_fn(params_run)).detach().cpu())
-    if final_loss + controls["min_improve"] < best_loss:
-        best_vector = _flatten_params_real_numpy(specs)
-        best_loss = final_loss
-    if history:
-        history[-1] = final_loss
-    if progress_callback is not None:
-        progress_callback(max(1, len(history)), final_loss)
 
     if controls["restore_best"]:
         _assign_flat_params(best_vector, specs)
-    return params_run, history
+        final_loss = best_loss
+    else:
+        final_loss = history[-1] if history else float("nan")
+    if progress_callback is not None:
+        progress_callback(max(1, len(history)), final_loss)
+
+    return params_run, history, best_loss, final_loss, convergence_reason, len(history)
 
 
 def _run_scipy_lbfgs(
@@ -607,7 +717,7 @@ def _run_scipy_lbfgs(
     specs = _build_param_specs(items)
     x0 = _flatten_params_real_numpy(specs)
     if x0.size == 0:
-        return params_run, []
+        return params_run, [], float("nan"), float("nan"), "empty_params"
 
     options = dict(solver_options)
     # maxeval is an nlopt concept; discard it so it doesn't override n_steps for scipy.
@@ -625,6 +735,19 @@ def _run_scipy_lbfgs(
     algorithm_name = options.pop("algorithm", options.pop("optimizer", None))
     raw_name = algorithm_name or method_name or "L-BFGS-B"
     method = _normalize_scipy_method(raw_name, key="algorithm")
+    # Determine whether second-order information is needed for this method.
+    _needs_hess = method in _SCIPY_HESS_METHODS    # full n×n Hessian (trust-exact)
+    _needs_hessp = method in _SCIPY_HESSP_METHODS  # Hessian-vector product (trust-krylov, Newton-CG)
+    if _needs_hess and x0.size > 100:
+        warnings.warn(
+            f"scipy method {method!r} requires a full {x0.size}×{x0.size} Hessian matrix "
+            f"({x0.size} backward passes per step). Consider 'trust-krylov' or "
+            "'Newton-CG' with a Hessian-vector product instead.",
+            stacklevel=3,
+        )
+    grad_clip_norm = options.pop("grad_clip_norm", options.pop("clip_grad_norm", None))
+    if grad_clip_norm is not None and float(grad_clip_norm) <= 0.0:
+        raise ValueError("grad_clip_norm must be > 0 when set")
 
     if "ftol" in options:
         ftol = _as_nonnegative_float(options.pop("ftol"), key="ftol")
@@ -644,8 +767,14 @@ def _run_scipy_lbfgs(
 
     # n_steps is the canonical iteration limit for scipy (= maxiter).
     options["maxiter"] = n_steps
-    options.setdefault("ftol", ftol)
-    options.setdefault("gtol", gtol)
+    # ftol is only valid for L-BFGS-B / TNC / SLSQP — Hessian-based methods reject it.
+    if not (_needs_hess or _needs_hessp):
+        options.setdefault("ftol", ftol)
+    # Newton-CG converges on relative step size (xtol); all others use gradient norm (gtol).
+    if method == "Newton-CG":
+        options.setdefault("xtol", gtol)
+    else:
+        options.setdefault("gtol", gtol)
     if method in {"L-BFGS-B", "TNC"}:
         options.setdefault("maxls", 40)
 
@@ -662,7 +791,13 @@ def _run_scipy_lbfgs(
         )
         bounds = None
 
+    # angle_wrap: set bounds to [-π, π] if method supports bounds and none were given.
+    if controls["angle_wrap"] and bounds is None and method in _SCIPY_BOUNDS_METHODS:
+        n_vars = int(x0.size)
+        bounds = [(-np.pi, np.pi)] * n_vars
+
     history: list[float] = []
+    convergence_reason = "maxiter"
     step_counter = {"value": 0}
     state = {
         "last_loss": None,
@@ -674,14 +809,18 @@ def _run_scipy_lbfgs(
     }
     pbar = None
     if progress:
+        _pbar_desc = f"{opt_desc}[{method}]" if opt_desc else method
         pbar = tqdm(
             total=n_steps,
-            desc=opt_desc or "opt",
+            desc=_pbar_desc,
             leave=False,
             colour="CYAN",
         )
 
+    eval_counter = {"value": 0}
+
     def objective(x):
+        eval_counter["value"] += 1
         try:
             loss_value, grad_value = _evaluate_loss_and_grad(x, params_run, specs, loss_fn)
             if not np.isfinite(loss_value) or not np.isfinite(grad_value).all():
@@ -694,11 +833,24 @@ def _run_scipy_lbfgs(
             state["bad_consecutive"] = 0
             if pbar is not None:
                 state["last_gnorm"] = float(np.linalg.norm(grad_value))
+            if grad_clip_norm is not None:
+                grad_norm = float(np.linalg.norm(grad_value))
+                clip = float(grad_clip_norm)
+                if grad_norm > clip:
+                    grad_value = grad_value * (clip / (grad_norm + 1e-12))
             if loss_value + controls["min_improve"] < state["best_loss"]:
                 state["best_loss"] = loss_value
                 state["best_x"] = np.array(x, dtype=np.float64, copy=True)
                 state["last_improve_step"] = step_counter["value"] + 1
         state["last_loss"] = float(loss_value)
+        # Update progress bar on every function evaluation (not just callback)
+        if pbar is not None:
+            pbar.set_postfix({
+                "evals": eval_counter["value"],
+                "||g||": f"{state['last_gnorm']:.2e}",
+                "loss": f"{loss_value:.3e}",
+                "best": f"{state['best_loss']:.3e}",
+            })
         return loss_value, grad_value
 
     def callback(_xk):
@@ -712,18 +864,29 @@ def _run_scipy_lbfgs(
             pbar.update(1)
             pbar.set_postfix({
                 "||g||": f"{state['last_gnorm']:.2e}",
-                "loss": f"{loss_value:.4g}",
-                "best": f"{state['best_loss']:.4g}",
+                "loss": f"{loss_value:.3e}",
+                "best": f"{state['best_loss']:.3e}",
             })
         if progress_callback is not None and (
             (step_num % log_every == 0) or (step_num == controls["max_steps"])
         ):
             progress_callback(step_num, float(loss_value))
         if (state["bad_consecutive"] >= controls["bad_max"]) and (step_num >= controls["min_steps"]):
+            convergence_reason = "bad_max"
             raise StopIteration
         if controls["patience"] is not None and step_num >= controls["min_steps"]:
             if (step_num - state["last_improve_step"]) >= controls["patience"]:
+                convergence_reason = "patience"
                 raise StopIteration
+
+    hess_fn = None
+    hessp_fn = None
+    if _needs_hess:
+        def hess_fn(x, _specs=specs, _loss_fn=loss_fn):
+            return _evaluate_hessian(x, _specs, _loss_fn)
+    elif _needs_hessp:
+        def hessp_fn(x, p, _specs=specs, _loss_fn=loss_fn):
+            return _evaluate_hessp(x, p, _specs, _loss_fn)
 
     result = None
     try:
@@ -733,6 +896,8 @@ def _run_scipy_lbfgs(
             jac=True,
             method=method,
             bounds=bounds,
+            hess=hess_fn,
+            hessp=hessp_fn,
             options=options,
             callback=callback,
         )
@@ -756,7 +921,13 @@ def _run_scipy_lbfgs(
         except (RuntimeError, ValueError, FloatingPointError):
             fallback = controls["penalty_on_bad"]
         history.append(fallback)
-    return params_run, history
+
+    best_loss = state["best_loss"]
+    if controls["restore_best"] and state["best_x"] is not None:
+        final_loss = best_loss
+    else:
+        final_loss = history[-1] if history else float("nan")
+    return params_run, history, best_loss, final_loss, convergence_reason, eval_counter["value"]
 
 
 def _run_nlopt_lbfgs(
@@ -781,7 +952,7 @@ def _run_nlopt_lbfgs(
     specs = _build_param_specs(items)
     x0 = _flatten_params_real_numpy(specs)
     if x0.size == 0:
-        return params_run, []
+        return params_run, [], float("nan"), float("nan"), "empty_params"
 
     options = dict(solver_options)
     if "algorithm" in options:
@@ -789,13 +960,9 @@ def _run_nlopt_lbfgs(
     else:
         algorithm_name = options.pop("optimizer", "LD_LBFGS")
     method_name = options.pop("method", None)
-    if method_name is not None:
-        normalized = method_name.strip().upper().replace("-", "_")
-        lbfgs_aliases = {"L_BFGS", "LBFGS", "LD_LBFGS", "L_BFGS_B"}
-        if normalized not in lbfgs_aliases:
-            raise ValueError(
-                "solver='nlopt' only accepts L-BFGS-B style method aliases."
-            )
+    # method is an alias for algorithm in the nlopt backend; merge into algorithm_name.
+    if method_name is not None and algorithm_name == "LD_LBFGS":
+        algorithm_name = method_name
 
     controls = _pop_common_controls(
         options,
@@ -822,13 +989,29 @@ def _run_nlopt_lbfgs(
         raise ValueError("grad_clip_norm must be > 0 when set")
 
     opt_map = {
+        # L-BFGS aliases (scipy-style and native)
+        "L_BFGS_B": "LD_LBFGS",
+        "L_BFGS": "LD_LBFGS",
         "LBFGS": "LD_LBFGS",
+        "LD_LBFGS": "LD_LBFGS",
+        # Truncated Newton variants
+        "TNEWTON": "LD_TNEWTON",
+        "LD_TNEWTON": "LD_TNEWTON",
+        "TNEWTON_RESTART": "LD_TNEWTON_RESTART",
+        "LD_TNEWTON_RESTART": "LD_TNEWTON_RESTART",
+        "TNEWTON_PRECOND": "LD_TNEWTON_PRECOND",
+        "LD_TNEWTON_PRECOND": "LD_TNEWTON_PRECOND",
+        "TNEWTON_PRECOND_RESTART": "LD_TNEWTON_PRECOND_RESTART",
+        "LD_TNEWTON_PRECOND_RESTART": "LD_TNEWTON_PRECOND_RESTART",
+        # Other gradient-based methods
         "LD_VAR2": "LD_VAR2",
         "VAR2": "LD_VAR2",
         "MMA": "LD_MMA",
+        "LD_MMA": "LD_MMA",
         "CCSAQ": "LD_CCSAQ",
+        "LD_CCSAQ": "LD_CCSAQ",
         "SLSQP": "LD_SLSQP",
-        "TNEWTON": "LD_TNEWTON",
+        "LD_SLSQP": "LD_SLSQP",
     }
     if isinstance(algorithm_name, str):
         normalized = algorithm_name.strip().upper().replace("-", "_")
@@ -848,6 +1031,11 @@ def _run_nlopt_lbfgs(
         opt.set_lower_bounds(_as_numpy_vector(lower, int(x0.size), key="lower_bounds"))
     if upper is not None:
         opt.set_upper_bounds(_as_numpy_vector(upper, int(x0.size), key="upper_bounds"))
+
+    # angle_wrap: set bounds to [-π, π] if no explicit bounds were given.
+    if controls["angle_wrap"] and lower is None and upper is None:
+        opt.set_lower_bounds(np.full(int(x0.size), -np.pi))
+        opt.set_upper_bounds(np.full(int(x0.size), np.pi))
 
     setters = {
         "stopval": opt.set_stopval,
@@ -879,7 +1067,9 @@ def _run_nlopt_lbfgs(
     # pbar shows n_steps displayed units; each unit covers maxeval/n_steps evaluations
     pbar_step_size = max(1, maxeval // max(1, n_steps))
     if progress:
-        pbar = tqdm(total=n_steps, desc=opt_desc or "opt", leave=False, colour="CYAN")
+        _nlopt_alg_name = algorithm_name if isinstance(algorithm_name, str) else f"nlopt({int(algorithm)})"
+        _pbar_desc = f"{opt_desc}[{_nlopt_alg_name}]" if opt_desc else _nlopt_alg_name
+        pbar = tqdm(total=n_steps, desc=_pbar_desc, leave=False, colour="CYAN")
 
     def _pbar_advance(evals):
         """Advance pbar proportionally: n_steps units over maxeval total evaluations."""
@@ -902,16 +1092,17 @@ def _run_nlopt_lbfgs(
             opt.force_stop()
             if pbar is not None:
                 _pbar_advance(eval_state["evals"])
-                pbar.set_postfix({"||g||": "nan", "loss": "nan", "best": f"{eval_state['best_true']:.4g}"})
+                pbar.set_postfix({"||g||": "nan", "loss": "nan", "best": f"{eval_state['best_true']:.3e}"})
             return controls["penalty_on_bad"]
 
-        if max_step is not None and eval_state["prev_x"] is not None:
-            delta = x_vec - eval_state["prev_x"]
-            delta_norm = float(np.linalg.norm(delta))
-            step_limit = float(max_step)
-            if delta_norm > step_limit:
-                x_vec = eval_state["prev_x"] + delta * (step_limit / (delta_norm + 1e-12))
-        eval_state["prev_x"] = np.array(x_vec, dtype=np.float64, copy=True)
+        if max_step is not None:
+            if eval_state["prev_x"] is not None:
+                delta = x_vec - eval_state["prev_x"]
+                delta_norm = float(np.linalg.norm(delta))
+                step_limit = float(max_step)
+                if delta_norm > step_limit:
+                    x_vec = eval_state["prev_x"] + delta * (step_limit / (delta_norm + 1e-12))
+            eval_state["prev_x"] = np.array(x_vec, dtype=np.float64, copy=True)
 
         try:
             loss_value, grad_value = _evaluate_loss_and_grad(x_vec, params_run, specs, loss_fn)
@@ -930,13 +1121,13 @@ def _run_nlopt_lbfgs(
                 opt.force_stop()
         else:
             eval_state["bad_consecutive"] = 0
+            grad_norm = float(np.linalg.norm(grad_value))
+            if pbar is not None:
+                eval_state["last_gnorm"] = grad_norm
             if grad_clip_norm is not None:
-                grad_norm = float(np.linalg.norm(grad_value))
                 clip = float(grad_clip_norm)
                 if grad_norm > clip:
                     grad_value = grad_value * (clip / (grad_norm + 1e-12))
-            if pbar is not None:
-                eval_state["last_gnorm"] = float(np.linalg.norm(grad_value))
             if grad.size > 0:
                 grad[:] = grad_value
 
@@ -945,24 +1136,25 @@ def _run_nlopt_lbfgs(
                     eval_state["best_true"] = loss_value
                     eval_state["best_x_true"] = np.array(x_vec, dtype=np.float64, copy=True)
 
-            selection_value = loss_value
-            if ema_alpha is not None:
-                alpha = float(ema_alpha)
-                if eval_state["ema"] is None:
-                    eval_state["ema"] = selection_value
-                else:
-                    eval_state["ema"] = (1.0 - alpha) * float(eval_state["ema"]) + alpha * selection_value
-                selection_value = float(eval_state["ema"])
+            if ema_alpha is not None or controls["patience"] is not None:
+                selection_value = loss_value
+                if ema_alpha is not None:
+                    alpha = float(ema_alpha)
+                    if eval_state["ema"] is None:
+                        eval_state["ema"] = selection_value
+                    else:
+                        eval_state["ema"] = (1.0 - alpha) * float(eval_state["ema"]) + alpha * selection_value
+                    selection_value = float(eval_state["ema"])
 
-            if selection_value + controls["min_improve"] < eval_state["best_sel"]:
-                eval_state["best_sel"] = selection_value
-                eval_state["best_x_sel"] = np.array(x_vec, dtype=np.float64, copy=True)
-                eval_state["last_improve_eval"] = eval_state["evals"]
+                if selection_value + controls["min_improve"] < eval_state["best_sel"]:
+                    eval_state["best_sel"] = selection_value
+                    eval_state["best_x_sel"] = np.array(x_vec, dtype=np.float64, copy=True)
+                    eval_state["last_improve_eval"] = eval_state["evals"]
 
-            if controls["patience"] is not None and eval_state["evals"] >= controls["min_steps"]:
-                if (eval_state["evals"] - eval_state["last_improve_eval"]) > controls["patience"]:
-                    eval_state["stopped_reason"] = "patience"
-                    opt.force_stop()
+                if controls["patience"] is not None and eval_state["evals"] >= controls["min_steps"]:
+                    if (eval_state["evals"] - eval_state["last_improve_eval"]) > controls["patience"]:
+                        eval_state["stopped_reason"] = "patience"
+                        opt.force_stop()
 
         history.append(float(loss_value))
         step_num = len(history)
@@ -970,8 +1162,8 @@ def _run_nlopt_lbfgs(
             _pbar_advance(eval_state["evals"])
             pbar.set_postfix({
                 "||g||": f"{eval_state.get('last_gnorm', float('nan')):.2e}",
-                "loss": f"{loss_value:.4g}",
-                "best": f"{eval_state['best_true']:.4g}",
+                "loss": f"{loss_value:.3e}",
+                "best": f"{eval_state['best_true']:.3e}",
             })
         if progress_callback is not None and ((step_num % log_every == 0) or (step_num == maxeval)):
             progress_callback(step_num, float(loss_value))
@@ -1009,7 +1201,14 @@ def _run_nlopt_lbfgs(
         except (RuntimeError, ValueError, FloatingPointError):
             loss_fallback = controls["penalty_on_bad"]
         history.append(loss_fallback)
-    return params_run, history
+
+    best_loss = eval_state["best_true"]
+    convergence_reason = eval_state["stopped_reason"]
+    if controls["restore_best"] and eval_state["best_x_true"] is not None:
+        final_loss = best_loss
+    else:
+        final_loss = history[-1] if history else float("nan")
+    return params_run, history, best_loss, final_loss, convergence_reason, eval_state["evals"]
 
 
 def _optimize_dispatch(
@@ -1041,6 +1240,15 @@ def _optimize_dispatch(
         raise ValueError("lr must be finite and > 0")
 
     solver_name = _normalize_solver_name(solver)
+
+    # lr is only used by torch backends; warn if the user explicitly set it for scipy/nlopt.
+    if solver_name not in _TORCH_SOLVERS and "lr" in (solver_options or {}):
+        warnings.warn(
+            f"'lr' option is ignored by solver={solver_name!r} (torch-only). "
+            "Use algorithm-specific options like 'ftol', 'gtol' instead.",
+            stacklevel=3,
+        )
+
     items = _param_ordered_items(params_init)
     if solver_name in _TORCH_SOLVERS:
         return _run_torch_solver(
@@ -1134,7 +1342,7 @@ def optimize_packed_params(
         to optimised tensors on their original devices (detached, no grad),
         and ``history`` is the per-step loss trace.
     """
-    params_opt, history = _optimize_dispatch(
+    params_opt, history, _best, _final, _reason, _n_evals = _optimize_dispatch(
         params_init,
         loss_fn,
         solver=solver,
@@ -1228,7 +1436,7 @@ class GradientOptimizer:
                 f"n_steps={n_steps_use} progress={progress_use}"
             )
 
-        params_opt, history = _optimize_dispatch(
+        params_opt, history, best_loss, final_loss, convergence_reason, n_evals = _optimize_dispatch(
             params_init,
             bound_loss,
             solver=solver_use,
@@ -1239,10 +1447,7 @@ class GradientOptimizer:
             opt_desc=desc_use,
             progress_callback=progress_callback,
         )
-        if history:
-            final_loss = float(history[-1])
-            best_loss = float(min(history))
-        else:
+        if not history:
             final_loss = float("nan")
             best_loss = float("nan")
 
@@ -1257,6 +1462,8 @@ class GradientOptimizer:
             history=list(history),
             solver=solver_name,
             n_steps=len(history),
-            best_loss=best_loss,
-            final_loss=final_loss,
+            best_loss=float(best_loss),
+            final_loss=float(final_loss),
+            convergence_reason=convergence_reason,
+            n_evals=n_evals,
         )

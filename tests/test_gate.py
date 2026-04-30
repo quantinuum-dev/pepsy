@@ -199,18 +199,6 @@ def test_gates_tn_1d_applies_mixed_site_specs():
     assert out is mps
 
 
-def test_gates_tn_1d_accepts_bundled_pair_stream():
-    """gate should also accept ``[(gate, where), ...]``."""
-    mps = qtn.MPS_computational_state("0000", dtype=np.complex128)
-    x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
-    zz_gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
-
-    gates = [(x_gate, (1,)), (zz_gate, (1, 2))]
-
-    out = apply_gate(mps, gates, contract="split-gate", inplace=True)
-    assert out is mps
-
-
 def test_gate_dispatches_to_1d_for_mps_two_site_where(monkeypatch):
     """Dispatcher should route ``where=(i,j)`` on MPS to 1D helper."""
     calls = []
@@ -559,7 +547,7 @@ def test_gate_accepts_string_index_selectors(monkeypatch):
     )
 
     assert out is tn
-    assert calls == [(("k1", "k2"), {"contract": False, "inplace": True})]
+    assert calls == [(("k1", "k2"), {"contract": False, "inplace": True, "cutoff_mode": "rel"})]
 
 
 def test_gate_1d_general_tn_without_l_uses_gate_inds(monkeypatch):
@@ -594,7 +582,7 @@ def test_gate_1d_general_tn_without_l_uses_gate_inds(monkeypatch):
     )
 
     assert out is tn
-    assert calls == [(("b1",), {"contract": False, "inplace": True})]
+    assert calls == [(("b1",), {"contract": False, "inplace": True, "cutoff_mode": "rel"})]
 
 
 def test_apply_gates_accepts_mixed_site_and_edge_specs():

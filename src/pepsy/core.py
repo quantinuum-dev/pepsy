@@ -1,12 +1,10 @@
 """Shared DMRG backend, optimizer, and fidelity helpers."""
 
 import math
-import os
-import warnings
 from numbers import Integral
 from string import Formatter
 from typing import Any
-
+import autoray as ar
 import numpy as np
 import cotengra as ctg
 import quimb.tensor as qtn
@@ -36,13 +34,15 @@ __all__ = [
     "measure_obs",
     "tns_align",
     "expec_mpo",
-    "mpo_identity_1d",
+    "id_to_mpo",
     "ps_to_peps",
     "ps_to_mps",
+    "ps_to_pepo",
+    "ps_to_mpo",
     "random_haar_qubit",
     "hrps_to_peps",
     "hrps_to_mps",
-    "pepo_identity_2d",
+    "id_to_pepo",
     "add_cycle",
 ]
 
@@ -80,6 +80,7 @@ class OneDMap:
         "col-major",
         "hilbert",
         "hilbert-row-major",
+        "diag",
     )
     _MODE_ALIASES = {
         "snake": "snake",
@@ -100,6 +101,9 @@ class OneDMap:
         "hilbert-column-major": "hilbert",
         "hilbert-row": "hilbert-row-major",
         "hilbert-row-major": "hilbert-row-major",
+        "diag": "diag",
+        "diagonal": "diag",
+        "diag-snake": "diag",
     }
 
     @classmethod
@@ -216,6 +220,23 @@ class OneDMap:
         if int(Lz) < 1:
             raise ValueError("Lz must be >= 1 when provided.")
         return int(Lx), int(Ly), int(Lz)
+
+    @staticmethod
+    def _coords_diag_2d(L_x, L_y):
+        """Diagonal (anti-diagonal) traversal: sweep lines of constant
+        ``x + y`` from 0 to ``L_x + L_y - 2``, snaking direction each
+        stripe.  Natural 1-D ordering for triangular / square-plus-diagonal
+        lattices."""
+        coords = []
+        for s in range(L_x + L_y - 1):
+            diag = []
+            for x in range(max(0, s - L_y + 1), min(s + 1, L_x)):
+                y = s - x
+                diag.append((x, y))
+            if s % 2 == 1:
+                diag.reverse()
+            coords.extend(diag)
+        return coords
 
     @staticmethod
     def _coords_row_major_2d(L_x, L_y):
@@ -378,6 +399,10 @@ class OneDMap:
             if Lz is not None:
                 raise NotImplementedError("hilbert mode is currently implemented only for 2D lattices.")
             coords = cls._coords_hilbert_2d(Lx, Ly, major="row")
+        elif mode_norm == "diag":
+            if Lz is not None:
+                raise NotImplementedError("diag mode is currently implemented only for 2D lattices.")
+            coords = cls._coords_diag_2d(Lx, Ly)
         else:
             supported = ", ".join(cls._KNOWN_MODES)
             raise ValueError(f"Unknown lattice mapping mode: {mode}. Supported modes: {supported}")
@@ -504,6 +529,8 @@ class OneDMap:
                     drawing.line((x, y), (x + 1, y), preset="lattice")
                 if y + 1 < L_y:
                     drawing.line((x, y), (x, y + 1), preset="lattice")
+                if mode_norm == "diag" and x + 1 < L_x and y + 1 < L_y:
+                    drawing.line((x, y), (x + 1, y + 1), preset="lattice")
 
         coords = [one_d_to_lattice[idx] for idx in range(len(one_d_to_lattice))]
         cmap = colormaps.get_cmap(path_cmap)
@@ -968,6 +995,7 @@ def tn_norm(
     psi,
     *,
     contraction_opt: Any | None = None,
+    strip_exponent: bool = False,
 ):
     """Compute the norm of a tensor network state.
 
@@ -977,15 +1005,23 @@ def tn_norm(
         State whose norm is computed.
     contraction_opt : object | None, optional
         Contraction optimizer. If ``None``, a default optimizer is built.
+    strip_exponent : bool, default=False
+        If ``True``, pass ``strip_exponent=True`` to the contraction, which
+        returns ``(mantissa, exponent)`` instead of the scalar result.
 
     Returns
     -------
-    float
-        ``|<psi|psi>|``.
+    float | tuple[float, float]
+        ``|<psi|psi>|`` when ``strip_exponent=False``, or
+        ``(mantissa, exponent)`` when ``strip_exponent=True``.
     """
     if contraction_opt is None:
         contraction_opt = build_optimizer(progbar=False)
-    return abs((psi.H & psi).contract(all, optimize=contraction_opt))
+    if not strip_exponent:
+        return ar.do("abs", (psi.H & psi).contract(all, optimize=contraction_opt))
+    
+    else:
+        return (psi.H & psi).contract(all, optimize=contraction_opt, strip_exponent=strip_exponent)
 
 
 def _count_format_fields(fmt):
@@ -1231,8 +1267,8 @@ def tn_fidelity(
     val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=contraction_opt))
 
     val_1 = val_1**2
-    fidelity = complex(val_1 / (val_0 * val_ref)).real
-    return fidelity
+    fidelity = ar.do("abs", val_1) / (val_0 * val_ref)
+    return ar.do("abs",fidelity)
 
 
 def add_cycle(peps, bond_dim, cylinder=False):
@@ -1252,32 +1288,84 @@ def add_cycle(peps, bond_dim, cylinder=False):
     return peps
 
 
-def pepo_identity_2d(lx, ly, dtype="complex128"):
-    """Create bond-dimension-1 PEPO identity on an ``lx x ly`` lattice."""
+def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0):
+    """Create a PEPO identity on an ``lx x ly`` lattice.
+
+    Parameters
+    ----------
+    lx : int
+        Lattice size in x direction.
+    ly : int
+        Lattice size in y direction.
+    phys_dim : int, optional
+        Physical dimension per site.
+    dtype : str, optional
+        Tensor dtype.
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
+
+    Returns
+    -------
+    quimb.tensor.PEPO
+        Identity PEPO with bond dimension ``chi``.
+    """
     pepo = qtn.PEPO.rand(Lx=lx, Ly=ly, bond_dim=1, seed=666, dtype=dtype)
-    eye = np.eye(2, dtype=dtype)
+    eye = np.eye(phys_dim, dtype=dtype)
 
     for tensor in pepo:
         ndim = len(tensor.data.shape)
-        if ndim == 4:
-            data = np.zeros([1, 1, 2, 2], dtype=dtype)
-            data[0, 0, :, :] = eye
-            tensor.modify(data=data)
-        elif ndim == 5:
-            data = np.zeros([1, 1, 1, 2, 2], dtype=dtype)
-            data[0, 0, 0, :, :] = eye
-            tensor.modify(data=data)
-        elif ndim == 6:
-            data = np.zeros([1, 1, 1, 1, 2, 2], dtype=dtype)
-            data[0, 0, 0, 0, :, :] = eye
-            tensor.modify(data=data)
+        n_virt = ndim - 2
+        virt_shape = [1] * n_virt
+        data = np.zeros(virt_shape + [phys_dim, phys_dim], dtype=dtype)
+        data[tuple([0] * n_virt)] = eye
+        tensor.modify(data=data)
 
+    if chi > 1:
+        pepo.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return pepo
 
 
-def mpo_identity_1d(L, phys_dim=2, dtype="complex128", cyclic=False, **mpo_opts):
-    """Create 1D MPO identity wrapper for naming parity with quimb factories."""
-    return qtn.MPO_identity(L, phys_dim=phys_dim, dtype=dtype, cyclic=cyclic, **mpo_opts)
+def id_to_mpo(L, phys_dim=2, dtype="complex128", cyclic=False, chi=1, rand_strength=0.0):
+    """Create a 1D MPO identity.
+
+    Parameters
+    ----------
+    L : int
+        Number of sites.
+    phys_dim : int, optional
+        Physical dimension per site.
+    dtype : str, optional
+        Tensor dtype.
+    cyclic : bool, optional
+        Whether to create a periodic MPO.
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
+
+    Returns
+    -------
+    quimb.tensor.MatrixProductOperator
+        Identity MPO with bond dimension ``chi``.
+    """
+    mpo = qtn.MPO_rand(L, bond_dim=1, phys_dim=phys_dim, cyclic=cyclic, seed=666, dtype=dtype)
+    eye = np.eye(phys_dim, dtype=dtype)
+
+    for tensor in mpo:
+        ndim = len(tensor.data.shape)
+        n_virt = ndim - 2
+        virt_shape = [1] * n_virt
+        data = np.zeros(virt_shape + [phys_dim, phys_dim], dtype=dtype)
+        data[tuple([0] * n_virt)] = eye
+        tensor.modify(data=data)
+
+    if chi > 1:
+        mpo.expand_bond_dimension_(chi, rand_strength=rand_strength)
+    return mpo
 
 
 def tns_align(p, pepo):
@@ -1364,8 +1452,8 @@ def expec_mpo(mpo, mps, *, contraction_opt=None):
     return (mps_h | mpo | mps_n).contract(all, optimize=contraction_opt) / norm_
 
 
-def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False):
-    """Create a bond-dimension-1 product-state PEPS parameterized by ``theta``.
+def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False, chi: int = 1, rand_strength: float = 0.0):
+    """Create a product-state PEPS parameterized by ``theta``.
 
     Each site tensor is set so the physical vector is
     ``[cos(theta), sin(theta)]`` with trivial virtual bonds.
@@ -1382,11 +1470,16 @@ def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, 
         Product-state angle controlling local amplitudes.
     cyclic : bool, optional
         If True, add periodic bonds (bond dimension 1) via :func:`add_cycle`.
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
 
     Returns
     -------
     quimb.tensor.PEPS
-        Initialized PEPS with bond dimension 1.
+        Initialized PEPS with bond dimension ``chi``.
     """
     peps = qtn.PEPS.rand(Lx=Lx, Ly=Ly, bond_dim=1, seed=666, dtype=dtype)
     local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
@@ -1404,11 +1497,13 @@ def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, 
     peps.astype_(dtype)
     if cyclic:
         peps = add_cycle(peps, bond_dim=1)
+    if chi > 1:
+        peps.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return peps
 
 
-def ps_to_mps(L: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False):
-    """Create a bond-dimension-1 product-state MPS parameterized by ``theta``.
+def ps_to_mps(L: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False, chi: int = 1, rand_strength: float = 0.0):
+    """Create a product-state MPS parameterized by ``theta``.
 
     Each site tensor is set so the physical vector is
     ``[cos(theta), sin(theta)]`` with trivial virtual bonds.
@@ -1423,11 +1518,16 @@ def ps_to_mps(L: int, dtype: str = "complex128", theta: float = 0.0, cyclic: boo
         Product-state angle controlling local amplitudes.
     cyclic : bool, optional
         If True, create a periodic MPS with bond dimension 1.
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
 
     Returns
     -------
     quimb.tensor.MatrixProductState
-        Initialized MPS with bond dimension 1.
+        Initialized MPS with bond dimension ``chi``.
     """
     mps = qtn.MPS_rand_state(L=L, bond_dim=1, phys_dim=2, cyclic=cyclic, seed=666, dtype=dtype)
     local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
@@ -1444,7 +1544,118 @@ def ps_to_mps(L: int, dtype: str = "complex128", theta: float = 0.0, cyclic: boo
         tensor.modify(data=data)
 
     mps.astype_(dtype)
+    if chi > 1:
+        mps.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return mps
+
+
+def ps_to_pepo(
+    Lx: int,
+    Ly: int,
+    dtype: str = "complex128",
+    theta: float = 0.0,
+    cyclic: bool = False,
+    chi: int = 1,
+    rand_strength: float = 0.0,
+):
+    """Create a PEPO of local projectors ``|v><v|`` parameterized by ``theta``.
+
+    Each site tensor is the rank-1 operator
+    ``|v><v|`` where ``v = [cos(theta), sin(theta)]``.
+
+    Parameters
+    ----------
+    Lx : int
+        Lattice size in x direction.
+    Ly : int
+        Lattice size in y direction.
+    dtype : str, optional
+        Tensor dtype.
+    theta : float, optional
+        Product-state angle controlling the local vector.
+    cyclic : bool, optional
+        If True, add periodic bonds (bond dimension 1) via :func:`add_cycle`.
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
+
+    Returns
+    -------
+    quimb.tensor.PEPO
+        PEPO with local projectors and bond dimension ``chi``.
+    """
+    pepo = qtn.PEPO.rand(Lx=Lx, Ly=Ly, bond_dim=1, seed=666, dtype=dtype)
+    local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
+    proj = np.outer(local_vec, np.conj(local_vec))
+
+    for tensor in pepo:
+        ndim = len(tensor.data.shape)
+        n_virt = ndim - 2
+        virt_shape = [1] * n_virt
+        data = np.zeros(virt_shape + [2, 2], dtype=dtype)
+        data[tuple([0] * n_virt)] = proj
+        tensor.modify(data=data)
+
+    pepo.astype_(dtype)
+    if cyclic:
+        pepo = add_cycle(pepo, bond_dim=1)
+    if chi > 1:
+        pepo.expand_bond_dimension_(chi, rand_strength=rand_strength)
+    return pepo
+
+
+def ps_to_mpo(
+    L: int,
+    dtype: str = "complex128",
+    theta: float = 0.0,
+    cyclic: bool = False,
+    chi: int = 1,
+    rand_strength: float = 0.0,
+):
+    """Create an MPO of local projectors ``|v><v|`` parameterized by ``theta``.
+
+    Each site tensor is the rank-1 operator
+    ``|v><v|`` where ``v = [cos(theta), sin(theta)]``.
+
+    Parameters
+    ----------
+    L : int
+        Number of sites.
+    dtype : str, optional
+        Tensor dtype.
+    theta : float, optional
+        Product-state angle controlling the local vector.
+    cyclic : bool, optional
+        Whether to create a periodic MPO.
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
+
+    Returns
+    -------
+    quimb.tensor.MatrixProductOperator
+        MPO with local projectors and bond dimension ``chi``.
+    """
+    mpo = qtn.MPO_rand(L, bond_dim=1, phys_dim=2, cyclic=cyclic, seed=666, dtype=dtype)
+    local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
+    proj = np.outer(local_vec, np.conj(local_vec))
+
+    for tensor in mpo:
+        ndim = len(tensor.data.shape)
+        n_virt = ndim - 2
+        virt_shape = [1] * n_virt
+        data = np.zeros(virt_shape + [2, 2], dtype=dtype)
+        data[tuple([0] * n_virt)] = proj
+        tensor.modify(data=data)
+
+    mpo.astype_(dtype)
+    if chi > 1:
+        mpo.expand_bond_dimension_(chi, rand_strength=rand_strength)
+    return mpo
 
 
 def random_haar_qubit(seed=None, perturb=0.0):
@@ -1478,12 +1689,22 @@ def hrps_to_peps(
     seed=None,
     perturb: float = 0.0,
     haar_params=None,
+    chi: int = 1,
+    rand_strength: float = 0.0,
 ):
-    """Create a bond-dimension-1 PEPS with per-site single-qubit Haar states.
+    """Create a PEPS with per-site single-qubit Haar states.
 
     If ``haar_params`` is omitted, each site uses :func:`random_haar_qubit`.
     With ``seed`` set, site ``k`` uses ``seed + k`` for reproducible but
     distinct samples.
+
+    Parameters
+    ----------
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
     """
     peps = ps_to_peps(Lx=Lx, Ly=Ly, dtype=dtype, theta=0.0, cyclic=cyclic)
 
@@ -1517,6 +1738,8 @@ def hrps_to_peps(
             tensor.modify(data=data)
 
     peps.astype_(dtype)
+    if chi > 1:
+        peps.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return peps
 
 
@@ -1527,12 +1750,22 @@ def hrps_to_mps(
     seed=None,
     perturb: float = 0.0,
     haar_params=None,
+    chi: int = 1,
+    rand_strength: float = 0.0,
 ):
-    """Create a bond-dimension-1 MPS with per-site single-qubit Haar states.
+    """Create a MPS with per-site single-qubit Haar states.
 
     If ``haar_params`` is omitted, each site uses :func:`random_haar_qubit`.
     With ``seed`` set, site ``k`` uses ``seed + k`` for reproducible but
     distinct samples.
+
+    Parameters
+    ----------
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
     """
     mps = ps_to_mps(L=L, dtype=dtype, theta=0.0, cyclic=cyclic)
 
@@ -1563,4 +1796,6 @@ def hrps_to_mps(
         tensor.modify(data=data)
 
     mps.astype_(dtype)
+    if chi > 1:
+        mps.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return mps

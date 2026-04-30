@@ -38,10 +38,12 @@ if TYPE_CHECKING:
         get_default_array_backend,
         get_default_grad_backend,
         measure_obs,
-        mpo_identity_1d,
-        pepo_identity_2d,
+        id_to_mpo,
+        id_to_pepo,
         ps_to_peps,
         ps_to_mps,
+        ps_to_pepo,
+        ps_to_mpo,
         random_haar_qubit,
         hrps_to_peps,
         hrps_to_mps,
@@ -91,6 +93,8 @@ if TYPE_CHECKING:
         rzz,
         u3,
         su4,
+        fsim,
+        fsimg,
     )
     from .ham import (
         ham_tn,
@@ -162,18 +166,23 @@ __all__ = [
     "rzz",
     "u3",
     "su4",
+    "fsim",
+    "fsimg",
     "ham_tn",
     "expec_mpo",
-    "mpo_identity_1d",
-    "pepo_identity_2d",
+    "id_to_mpo",
+    "id_to_pepo",
     "ps_to_peps",
     "ps_to_mps",
+    "ps_to_pepo",
+    "ps_to_mpo",
     "random_haar_qubit",
     "hrps_to_peps",
     "hrps_to_mps",
     "optimize_global",
     "optimize_sweep",
     "optimize_energy",
+    "optimize_mps",
     "optimize_mpo",
     "gradient_solver",
     "ham",
@@ -193,7 +202,6 @@ def __getattr__(name):
         "boundary_metrics",
         "boundary_states",
         "boundary_sweeps",
-        "gate",
         "ham",
         "gradient_solver",
         "optimize_mps",
@@ -239,6 +247,15 @@ def __getattr__(name):
 
         return FIT
 
+    if name == "gate":
+        # Handle "gate" separately: importing from .gate causes Python to bind
+        # the submodule to pepsy.__dict__['gate'], overwriting our function.
+        # We must explicitly re-set the attribute to the function afterward.
+        import sys  # pylint: disable=import-outside-toplevel
+        from .gate import gate as _gate_fn  # pylint: disable=import-outside-toplevel
+        sys.modules[__name__].__dict__["gate"] = _gate_fn
+        return _gate_fn
+
     if name in (
         "build_pepo_from_gates",
         "build_mpo_from_gates",
@@ -276,8 +293,12 @@ def __getattr__(name):
         "rzz",
         "u3",
         "su4",
+        "fsim",
+        "fsimg",
     ):
+        import sys as _sys  # pylint: disable=import-outside-toplevel
         from .gate import (  # pylint: disable=import-outside-toplevel
+            gate as _gate_fn,
             build_pepo_from_gates,
             build_mpo_from_gates,
             pauli,
@@ -314,7 +335,12 @@ def __getattr__(name):
             rzz,
             u3,
             su4,
+            fsim,
+            fsimg,
         )
+        # Re-bind "gate" to the function; `from .gate import ...` causes
+        # Python to set __dict__["gate"] to the submodule.
+        _sys.modules[__name__].__dict__["gate"] = _gate_fn
 
         return {
             "build_pepo_from_gates": build_pepo_from_gates,
@@ -353,6 +379,8 @@ def __getattr__(name):
             "rzz": rzz,
             "u3": u3,
             "su4": su4,
+            "fsim": fsim,
+            "fsimg": fsimg,
         }[name]
 
     if name == "ham_tn":
@@ -364,10 +392,12 @@ def __getattr__(name):
         "tns_align",
         "measure_obs",
         "expec_mpo",
-        "mpo_identity_1d",
-        "pepo_identity_2d",
+        "id_to_mpo",
+        "id_to_pepo",
         "ps_to_peps",
         "ps_to_mps",
+        "ps_to_pepo",
+        "ps_to_mpo",
         "random_haar_qubit",
         "hrps_to_peps",
         "hrps_to_mps",
@@ -375,10 +405,12 @@ def __getattr__(name):
         from .core import (  # pylint: disable=import-outside-toplevel
             expec_mpo,
             measure_obs,
-            mpo_identity_1d,
-            pepo_identity_2d,
+            id_to_mpo,
+            id_to_pepo,
             ps_to_peps,
             ps_to_mps,
+            ps_to_pepo,
+            ps_to_mpo,
             random_haar_qubit,
             hrps_to_peps,
             hrps_to_mps,
@@ -389,10 +421,12 @@ def __getattr__(name):
             "tns_align": tns_align,
             "measure_obs": measure_obs,
             "expec_mpo": expec_mpo,
-            "mpo_identity_1d": mpo_identity_1d,
-            "pepo_identity_2d": pepo_identity_2d,
+            "id_to_mpo": id_to_mpo,
+            "id_to_pepo": id_to_pepo,
             "ps_to_peps": ps_to_peps,
             "ps_to_mps": ps_to_mps,
+            "ps_to_pepo": ps_to_pepo,
+            "ps_to_mpo": ps_to_mpo,
             "random_haar_qubit": random_haar_qubit,
             "hrps_to_peps": hrps_to_peps,
             "hrps_to_mps": hrps_to_mps,

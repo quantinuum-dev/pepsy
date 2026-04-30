@@ -4,10 +4,9 @@ import re
 from dataclasses import dataclass
 
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
-from .boundary_states import BdyMPS
-from .core import build_optimizer, tn_fidelity
+from .core import tn_fidelity
 from .fit import FIT
 
 __all__ = ["CompBdy"]

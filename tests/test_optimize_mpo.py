@@ -161,7 +161,49 @@ def test_mpo_optimizer_canonicalization_state_initialized():
     cur = opt.info_c["cur_orthog"]
     assert isinstance(cur, tuple)
     assert len(cur) == 2
-    assert np.isclose(opt.norm_mpo, py.core.tn_norm(mpo0, contraction_opt=opt.contraction_opt))
+    expected_m, expected_e = py.core.tn_norm(
+        mpo0, contraction_opt=opt.contraction_opt, strip_exponent=True
+    )
+    got_m, got_e = opt.norm_mpo
+    assert np.isclose(got_m, expected_m)
+    assert np.isclose(got_e, expected_e)
+
+
+def test_mpo_optimizer_current_orthog_normalizes_supported_shapes():
+    """Cached orthogonality metadata should accept 1-site and 2-site forms."""
+    mpo0 = qtn.MPO_identity(5, dtype="complex128")
+    opt = py.MpoOptimizer(mpo0.copy(), gates=[], chi=6, mode="dmrg")
+
+    opt.info_c["cur_orthog"] = 2
+    assert opt._current_orthog() == (2, 2)
+
+    opt.info_c["cur_orthog"] = (3,)
+    assert opt._current_orthog() == (3, 3)
+
+    opt.info_c["cur_orthog"] = (4, 1)
+    assert opt._current_orthog() == (1, 4)
+
+    opt.info_c["cur_orthog"] = (1, 2, 3)
+    with pytest.raises(ValueError, match="cur_orthog must be"):
+        opt._current_orthog()
+
+
+def test_mpo_optimizer_canonize_mpo_accepts_supported_where_shapes():
+    """canonize_mpo should accept int, singleton, and pair site selectors."""
+    mpo0 = qtn.MPO_identity(5, dtype="complex128")
+    opt = py.MpoOptimizer(mpo0.copy(), gates=[], chi=6, mode="dmrg")
+
+    opt.canonize_mpo(opt.p, 2)
+    assert opt.info_c["cur_orthog"] == (2, 2)
+
+    opt.canonize_mpo(opt.p, (3,))
+    assert opt.info_c["cur_orthog"] == (3, 3)
+
+    opt.canonize_mpo(opt.p, (4, 1))
+    assert opt.info_c["cur_orthog"] == (1, 4)
+
+    with pytest.raises(ValueError, match="where must be"):
+        opt.canonize_mpo(opt.p, (1, 2, 3))
 
 
 def test_mpo_optimizer_prepare_dmrg_state_expands_to_chi():
@@ -222,14 +264,8 @@ def test_mpo_optimizer_rejects_unknown_mode():
     mpo0 = qtn.MPO_identity(3, dtype="complex128")
     opt = py.MpoOptimizer(mpo0.copy(), gates=[], chi=4, mode="dmrg")
 
-    try:
-        opt.set_mode("mpo")
-    except ValueError as exc:
-        assert "Supported modes:" in str(exc)
-        assert "dmrg" in str(exc)
-        assert "svd" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for unsupported mode")
+    with pytest.raises(ValueError, match="Supported modes:"):
+        opt.set_mode("invalid_mode")
 
 
 def test_mpo_optimizer_svd_smoke():
@@ -270,12 +306,8 @@ def test_mpo_optimizer_svd_rejects_negative_fidelity_samples():
     gates = list(zip(G, where))
     opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="svd")
 
-    try:
+    with pytest.raises(ValueError, match="fidelity_samples must be >= 0"):
         opt.run(progbar=False, cutoff=1e-12, fidelity_samples=-1)
-    except ValueError as exc:
-        assert "fidelity_samples must be >= 0" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for negative fidelity_samples")
 
 
 def test_mpo_prepare_gate_pair_uses_explicit_bra_when_provided():
@@ -329,9 +361,60 @@ def test_mpo_optimizer_rejects_empty_gate_pair():
     gates = list(zip(G, where))
     opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="svd")
 
-    try:
+    with pytest.raises(ValueError, match="at least one of G or B"):
         opt.run(progbar=False, cutoff=1e-12, fidelity_samples=1)
-    except ValueError as exc:
-        assert "at least one of G or B" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for empty gate spec")
+
+
+def test_mpo_optimizer_mpo_mode_smoke():
+    """MPO mode should apply mixed 1q/2q gates via gate_nonlocal_opt without errors."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    gates = [
+        (qu.hadamard(), (1,)),
+        (qu.CNOT(), (0, 2)),
+    ]
+
+    opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="mpo")
+    out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=2)
+
+    assert out.L == 4
+    assert out.max_bond() <= 8
+
+
+def test_mpo_optimizer_mpo_mode_unitary_evolution_preserves_norm():
+    """Two-sided unitary evolution in MPO mode should preserve the normalized norm."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (1, 2)),
+        (qu.phase_gate(0.37), (3,)),
+    ]
+
+    opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="mpo")
+    out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=len(gates))
+
+    assert np.allclose(out.to_dense(), mpo0.to_dense(), atol=1e-10)
+    assert all(np.isclose(val, 1.0, atol=1e-8) for val in opt.get_fidelities())
+
+
+def test_mpo_optimizer_mpo_mode_ket_only_gate():
+    """MPO mode with ket-only gate should not crash and should change the MPO."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    gates = [((qu.CNOT(), None), (0, 2))]
+
+    opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="mpo")
+    out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    assert out.L == 4
+    assert not np.allclose(out.to_dense(), mpo0.to_dense())
+
+
+def test_mpo_optimizer_mpo_mode_bra_only_gate():
+    """MPO mode with bra-only gate should not crash and should change the MPO."""
+    mpo0 = qtn.MPO_identity(4, dtype="complex128")
+    gates = [((None, qu.CNOT()), (0, 2))]
+
+    opt = py.MpoOptimizer(mpo0.copy(), gates=gates, chi=8, mode="mpo")
+    out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    assert out.L == 4
+    assert not np.allclose(out.to_dense(), mpo0.to_dense())
