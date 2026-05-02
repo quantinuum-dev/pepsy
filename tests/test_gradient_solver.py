@@ -24,6 +24,7 @@ def test_supported_solvers_exports_expected_backends():
     assert set(SUPPORTED_SOLVERS) == {
         "torch-adam", "torch-lbfgs", "torch-adamw", "torch-radam", "torch-nadam",
         "scipy", "nlopt",
+        "jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop",
     }
 
 

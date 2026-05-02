@@ -29,6 +29,11 @@ SUPPORTED_SOLVERS = (
     "torch-nadam",
     "scipy",
     "nlopt",
+    # JAX / optax optimisers (optional deps: jax, optax)
+    "jax-adam",
+    "jax-adamw",
+    "jax-sgd",
+    "jax-rmsprop",
 )
 
 _TORCH_SOLVERS = {}
@@ -41,6 +46,10 @@ if torch is not None:
         "torch-nadam": torch.optim.NAdam,
     }
 
+_JAX_SOLVER_NAMES = frozenset(
+    {"jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop"}
+)
+
 
 def _require_torch() -> None:
     if torch is None:  # pragma: no cover - exercised in no-torch CI
@@ -50,14 +59,67 @@ def _require_torch() -> None:
         )
 
 
-@dataclass(frozen=True)
+def _require_jax():
+    try:
+        import jax  # pylint: disable=import-outside-toplevel
+        import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "jax-* solvers require optional dependency 'jax'. "
+            "Install with: pip install jax jaxlib"
+        ) from exc
+    return jax, jnp
+
+
+def _require_optax():
+    try:
+        import optax  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "jax-* solvers require optional dependency 'optax'. "
+            "Install with: pip install optax"
+        ) from exc
+    return optax
+
+
+# eq=False so the auto-generated __hash__ does not try to hash the mutable
+# dict/list fields (which would raise TypeError). Instances fall back to
+# identity equality and identity-based hashing, which is what we want for a
+# result object that is produced once and consumed by reference.
+@dataclass(frozen=True, eq=False)
 class GradSolverResult:
     """Structured optimization result returned by :class:`GradientOptimizer`.
 
-    Fields capture optimized parameters, solver identity, and loss summary.
+    Attributes
+    ----------
+    params : dict[str, Any]
+        Optimised parameters on their original devices, detached from
+        autograd. Concrete element type is backend-dependent: a
+        ``torch.Tensor`` for the torch/scipy/nlopt solvers shipped here,
+        a ``jax.Array`` / ``jnp.ndarray`` for a JAX-based solver, or any
+        other array-like a future backend produces.
+    history : list[float]
+        Per-step loss trace. Length matches ``n_steps``.
+    solver : str
+        Normalised solver name actually used (e.g. ``"scipy"``).
+    n_steps : int
+        Number of entries recorded in ``history`` (iterations for scipy,
+        function evaluations for nlopt/torch).
+    best_loss : float
+        Lowest loss value observed during the run.
+    final_loss : float
+        Loss after the final restored state (== ``best_loss`` when
+        ``restore_best=True``).
+    convergence_reason : str
+        ``"maxiter"``, ``"patience"``, ``"bad_max"``, ``"empty_params"``,
+        ``"nan_x"``, or ``"nlopt_error:<ExcType>"``.
+    n_evals : int
+        Number of objective evaluations (``-1`` if the backend does not
+        report it separately).
     """
 
-    params: dict[str, torch.Tensor]
+    # Backend-agnostic: holds torch.Tensor, jax.Array, np.ndarray, etc.
+    params: dict[str, Any]
     history: list[float]
     solver: str
     n_steps: int
@@ -371,6 +433,62 @@ def _as_nonnegative_float(value: Any, *, key: str) -> float:
     return out
 
 
+def _format_pbar_postfix(
+    *,
+    step: int,
+    evals: int,
+    ev_per_step: float | int,
+    gnorm: float | str | None,
+    loss: float | str | None,
+    best: float | str | None,
+) -> dict[str, Any]:
+    """Return a uniform tqdm postfix dict shared by all solver backends.
+
+    Keys (in display order):
+        step  : current iteration index (1-based)
+        ev    : cumulative cost-function evaluations
+        ev/it : evaluations consumed by the latest iteration
+        ||g|| : gradient norm at the latest evaluation
+        loss  : latest loss value
+        best  : best loss seen so far
+    """
+    def _fmt(v):
+        if isinstance(v, str):
+            return v
+        if v is None:
+            return "nan"
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        if not np.isfinite(fv):
+            return "nan"
+        return f"{fv:.3e}"
+
+    # ev/it can be fractional (e.g. nlopt sub-iteration accounting); show
+    # as int when whole, else with one decimal.
+    if isinstance(ev_per_step, str):
+        ev_it_str = ev_per_step
+    else:
+        try:
+            evf = float(ev_per_step)
+        except (TypeError, ValueError):
+            ev_it_str = str(ev_per_step)
+        else:
+            ev_it_str = f"{int(evf)}" if evf == int(evf) else f"{evf:.1f}"
+
+    return {
+        # ``step`` is omitted: tqdm already shows the iteration count
+        # (e.g. "58/2000") in its bar prefix, so re-displaying it here
+        # would just take up width in the postfix.
+        "ev": int(evals),
+        "ev/it": ev_it_str,
+        "||g||": _fmt(gnorm),
+        "loss": _fmt(loss),
+        "best": _fmt(best),
+    }
+
+
 def _pop_step_count(options: dict[str, Any], *, default: int) -> int:
     if "maxiter" in options:
         steps = int(options.pop("maxiter"))
@@ -483,7 +601,7 @@ def _iter_steps(
     iterator = range(n_steps)
     if not progress:
         return iterator
-    return tqdm(iterator, total=n_steps, desc=opt_desc or "opt", leave=False, colour="CYAN")
+    return tqdm(iterator, total=n_steps, desc=opt_desc or "opt", leave=False, colour="CYAN", dynamic_ncols=True)
 
 
 def _run_torch_solver(
@@ -591,18 +709,26 @@ def _run_torch_solver(
     )
     bad_consecutive = 0
     last_improve_step = 0
+    eval_counter = {"value": 0}
+    last_step_evals = 0
 
     for step in step_iter:
         optimizer.zero_grad(set_to_none=True)
+        eval_counter["value"] += 1
         loss = _scalar_real_loss(loss_fn(params_run))
         if not torch.isfinite(loss):
             bad_consecutive += 1
             loss_value = controls["penalty_on_bad"]
             history.append(loss_value)
             _step_torch_scheduler(scheduler, scheduler_kind, float("inf"))
-            if progress:
-                step_iter.set_postfix({"||g||": "nan", "loss": "nan", "best": f"{best_loss:.3e}"})
             step_num = step + 1
+            ev_this = eval_counter["value"] - last_step_evals
+            last_step_evals = eval_counter["value"]
+            if progress:
+                step_iter.set_postfix(_format_pbar_postfix(
+                    step=step_num, evals=eval_counter["value"], ev_per_step=ev_this,
+                    gnorm="nan", loss="nan", best=best_loss,
+                ))
             if progress_callback is not None and (step_num % log_every == 0):
                 progress_callback(step_num, loss_value)
             if (bad_consecutive >= controls["bad_max"]) and (step_num >= controls["min_steps"]):
@@ -634,6 +760,7 @@ def _run_torch_solver(
                     _p.grad.data = _p.grad.data.contiguous()
             def _closure():
                 optimizer.zero_grad(set_to_none=True)
+                eval_counter["value"] += 1
                 _l = _scalar_real_loss(loss_fn(params_run))
                 _l.backward()
                 # Also fix inside closure for subsequent line-search evaluations.
@@ -665,6 +792,9 @@ def _run_torch_solver(
                         t = spec["tensor"]
                         t.data = (t.data + np.pi) % _TWO_PI - np.pi
 
+        step_num = step + 1
+        ev_this = eval_counter["value"] - last_step_evals
+        last_step_evals = eval_counter["value"]
         if progress:
             _gnorm = float(
                 sum(
@@ -675,8 +805,10 @@ def _run_torch_solver(
                     if spec["tensor"].grad is not None
                 ) ** 0.5
             )
-            step_iter.set_postfix({"||g||": f"{_gnorm:.2e}", "loss": f"{loss_value:.3e}", "best": f"{best_loss:.3e}"})
-        step_num = step + 1
+            step_iter.set_postfix(_format_pbar_postfix(
+                step=step_num, evals=eval_counter["value"], ev_per_step=ev_this,
+                gnorm=_gnorm, loss=loss_value, best=best_loss,
+            ))
         if progress_callback is not None and (step_num % log_every == 0):
             progress_callback(step_num, loss_value)
         if controls["patience"] is not None and step_num >= controls["min_steps"]:
@@ -692,7 +824,7 @@ def _run_torch_solver(
     if progress_callback is not None:
         progress_callback(max(1, len(history)), final_loss)
 
-    return params_run, history, best_loss, final_loss, convergence_reason, len(history)
+    return params_run, history, best_loss, final_loss, convergence_reason, eval_counter["value"]
 
 
 def _run_scipy_lbfgs(
@@ -717,7 +849,7 @@ def _run_scipy_lbfgs(
     specs = _build_param_specs(items)
     x0 = _flatten_params_real_numpy(specs)
     if x0.size == 0:
-        return params_run, [], float("nan"), float("nan"), "empty_params"
+        return params_run, [], float("nan"), float("nan"), "empty_params", 0
 
     options = dict(solver_options)
     # maxeval is an nlopt concept; discard it so it doesn't override n_steps for scipy.
@@ -767,8 +899,9 @@ def _run_scipy_lbfgs(
 
     # n_steps is the canonical iteration limit for scipy (= maxiter).
     options["maxiter"] = n_steps
-    # ftol is only valid for L-BFGS-B / TNC / SLSQP — Hessian-based methods reject it.
-    if not (_needs_hess or _needs_hessp):
+    # ftol is accepted only by L-BFGS-B / TNC / SLSQP — other methods
+    # (BFGS, CG, Newton-CG, trust-*) emit OptimizeWarning if it is passed.
+    if method in {"L-BFGS-B", "TNC", "SLSQP"}:
         options.setdefault("ftol", ftol)
     # Newton-CG converges on relative step size (xtol); all others use gradient norm (gtol).
     if method == "Newton-CG":
@@ -797,7 +930,6 @@ def _run_scipy_lbfgs(
         bounds = [(-np.pi, np.pi)] * n_vars
 
     history: list[float] = []
-    convergence_reason = "maxiter"
     step_counter = {"value": 0}
     state = {
         "last_loss": None,
@@ -806,15 +938,23 @@ def _run_scipy_lbfgs(
         "best_x": None,
         "last_improve_step": 0,
         "bad_consecutive": 0,
+        "convergence_reason": "maxiter",
+        "last_step_evals": 0,
     }
     pbar = None
     if progress:
-        _pbar_desc = f"{opt_desc}[{method}]" if opt_desc else method
+        # Avoid duplicating the algorithm name when the caller already
+        # included it in opt_desc (e.g. desc="depth_v=5 LD_VAR2").
+        if opt_desc and method.lower() in opt_desc.lower():
+            _pbar_desc = opt_desc
+        else:
+            _pbar_desc = f"{opt_desc}[{method}]" if opt_desc else method
         pbar = tqdm(
             total=n_steps,
             desc=_pbar_desc,
             leave=False,
             colour="CYAN",
+            dynamic_ncols=True,
         )
 
     eval_counter = {"value": 0}
@@ -831,8 +971,7 @@ def _run_scipy_lbfgs(
             grad_value = np.zeros_like(np.asarray(x, dtype=np.float64))
         else:
             state["bad_consecutive"] = 0
-            if pbar is not None:
-                state["last_gnorm"] = float(np.linalg.norm(grad_value))
+            state["last_gnorm"] = float(np.linalg.norm(grad_value))
             if grad_clip_norm is not None:
                 grad_norm = float(np.linalg.norm(grad_value))
                 clip = float(grad_clip_norm)
@@ -845,12 +984,15 @@ def _run_scipy_lbfgs(
         state["last_loss"] = float(loss_value)
         # Update progress bar on every function evaluation (not just callback)
         if pbar is not None:
-            pbar.set_postfix({
-                "evals": eval_counter["value"],
-                "||g||": f"{state['last_gnorm']:.2e}",
-                "loss": f"{loss_value:.3e}",
-                "best": f"{state['best_loss']:.3e}",
-            })
+            ev_this = eval_counter["value"] - state["last_step_evals"]
+            pbar.set_postfix(_format_pbar_postfix(
+                step=step_counter["value"] + 1,
+                evals=eval_counter["value"],
+                ev_per_step=ev_this,
+                gnorm=state["last_gnorm"],
+                loss=loss_value,
+                best=state["best_loss"],
+            ))
         return loss_value, grad_value
 
     def callback(_xk):
@@ -862,21 +1004,26 @@ def _run_scipy_lbfgs(
         history.append(float(loss_value))
         if pbar is not None:
             pbar.update(1)
-            pbar.set_postfix({
-                "||g||": f"{state['last_gnorm']:.2e}",
-                "loss": f"{loss_value:.3e}",
-                "best": f"{state['best_loss']:.3e}",
-            })
+            ev_this = eval_counter["value"] - state["last_step_evals"]
+            state["last_step_evals"] = eval_counter["value"]
+            pbar.set_postfix(_format_pbar_postfix(
+                step=step_num,
+                evals=eval_counter["value"],
+                ev_per_step=ev_this,
+                gnorm=state["last_gnorm"],
+                loss=loss_value,
+                best=state["best_loss"],
+            ))
         if progress_callback is not None and (
             (step_num % log_every == 0) or (step_num == controls["max_steps"])
         ):
             progress_callback(step_num, float(loss_value))
         if (state["bad_consecutive"] >= controls["bad_max"]) and (step_num >= controls["min_steps"]):
-            convergence_reason = "bad_max"
+            state["convergence_reason"] = "bad_max"
             raise StopIteration
         if controls["patience"] is not None and step_num >= controls["min_steps"]:
             if (step_num - state["last_improve_step"]) >= controls["patience"]:
-                convergence_reason = "patience"
+                state["convergence_reason"] = "patience"
                 raise StopIteration
 
     hess_fn = None
@@ -927,7 +1074,7 @@ def _run_scipy_lbfgs(
         final_loss = best_loss
     else:
         final_loss = history[-1] if history else float("nan")
-    return params_run, history, best_loss, final_loss, convergence_reason, eval_counter["value"]
+    return params_run, history, best_loss, final_loss, state["convergence_reason"], eval_counter["value"]
 
 
 def _run_nlopt_lbfgs(
@@ -952,7 +1099,7 @@ def _run_nlopt_lbfgs(
     specs = _build_param_specs(items)
     x0 = _flatten_params_real_numpy(specs)
     if x0.size == 0:
-        return params_run, [], float("nan"), float("nan"), "empty_params"
+        return params_run, [], float("nan"), float("nan"), "empty_params", 0
 
     options = dict(solver_options)
     if "algorithm" in options:
@@ -1004,6 +1151,8 @@ def _run_nlopt_lbfgs(
         "TNEWTON_PRECOND_RESTART": "LD_TNEWTON_PRECOND_RESTART",
         "LD_TNEWTON_PRECOND_RESTART": "LD_TNEWTON_PRECOND_RESTART",
         # Other gradient-based methods
+        "LD_VAR1": "LD_VAR1",
+        "VAR1": "LD_VAR1",
         "LD_VAR2": "LD_VAR2",
         "VAR2": "LD_VAR2",
         "MMA": "LD_MMA",
@@ -1012,6 +1161,10 @@ def _run_nlopt_lbfgs(
         "LD_CCSAQ": "LD_CCSAQ",
         "SLSQP": "LD_SLSQP",
         "LD_SLSQP": "LD_SLSQP",
+        # Derivative-free (LN_*) — gradients are still computed by the
+        # torch loss but ignored by nlopt; kept for convenience.
+        "COBYLA": "LN_COBYLA",
+        "LN_COBYLA": "LN_COBYLA",
     }
     if isinstance(algorithm_name, str):
         normalized = algorithm_name.strip().upper().replace("-", "_")
@@ -1062,23 +1215,31 @@ def _run_nlopt_lbfgs(
         "bad_consecutive": 0,
         "prev_x": None,
         "stopped_reason": "maxeval",
+        "last_step_evals": 0,
+        "step": 0,
     }
     pbar = None
     # pbar shows n_steps displayed units; each unit covers maxeval/n_steps evaluations
     pbar_step_size = max(1, maxeval // max(1, n_steps))
     if progress:
         _nlopt_alg_name = algorithm_name if isinstance(algorithm_name, str) else f"nlopt({int(algorithm)})"
-        _pbar_desc = f"{opt_desc}[{_nlopt_alg_name}]" if opt_desc else _nlopt_alg_name
-        pbar = tqdm(total=n_steps, desc=_pbar_desc, leave=False, colour="CYAN")
+        if opt_desc and (
+            (isinstance(_nlopt_alg_name, str) and _nlopt_alg_name.lower() in opt_desc.lower())
+        ):
+            _pbar_desc = opt_desc
+        else:
+            _pbar_desc = f"{opt_desc}[{_nlopt_alg_name}]" if opt_desc else _nlopt_alg_name
+        pbar = tqdm(total=n_steps, desc=_pbar_desc, leave=False, colour="CYAN", dynamic_ncols=True)
 
     def _pbar_advance(evals):
         """Advance pbar proportionally: n_steps units over maxeval total evaluations."""
         if pbar is None:
-            return
+            return 0
         new_pos = min(n_steps, evals // pbar_step_size)
         advance = new_pos - pbar.n
         if advance > 0:
             pbar.update(advance)
+        return advance
 
     def objective(x, grad):
         eval_state["evals"] += 1
@@ -1091,8 +1252,15 @@ def _run_nlopt_lbfgs(
             eval_state["stopped_reason"] = "nan_x"
             opt.force_stop()
             if pbar is not None:
-                _pbar_advance(eval_state["evals"])
-                pbar.set_postfix({"||g||": "nan", "loss": "nan", "best": f"{eval_state['best_true']:.3e}"})
+                advanced = _pbar_advance(eval_state["evals"])
+                if advanced > 0:
+                    eval_state["step"] += advanced
+                ev_this = eval_state["evals"] - eval_state["last_step_evals"]
+                eval_state["last_step_evals"] = eval_state["evals"]
+                pbar.set_postfix(_format_pbar_postfix(
+                    step=eval_state["step"], evals=eval_state["evals"], ev_per_step=ev_this,
+                    gnorm="nan", loss="nan", best=eval_state["best_true"],
+                ))
             return controls["penalty_on_bad"]
 
         if max_step is not None:
@@ -1122,8 +1290,7 @@ def _run_nlopt_lbfgs(
         else:
             eval_state["bad_consecutive"] = 0
             grad_norm = float(np.linalg.norm(grad_value))
-            if pbar is not None:
-                eval_state["last_gnorm"] = grad_norm
+            eval_state["last_gnorm"] = grad_norm
             if grad_clip_norm is not None:
                 clip = float(grad_clip_norm)
                 if grad_norm > clip:
@@ -1152,19 +1319,27 @@ def _run_nlopt_lbfgs(
                     eval_state["last_improve_eval"] = eval_state["evals"]
 
                 if controls["patience"] is not None and eval_state["evals"] >= controls["min_steps"]:
-                    if (eval_state["evals"] - eval_state["last_improve_eval"]) > controls["patience"]:
+                    if (eval_state["evals"] - eval_state["last_improve_eval"]) >= controls["patience"]:
                         eval_state["stopped_reason"] = "patience"
                         opt.force_stop()
 
         history.append(float(loss_value))
         step_num = len(history)
         if pbar is not None:
-            _pbar_advance(eval_state["evals"])
-            pbar.set_postfix({
-                "||g||": f"{eval_state.get('last_gnorm', float('nan')):.2e}",
-                "loss": f"{loss_value:.3e}",
-                "best": f"{eval_state['best_true']:.3e}",
-            })
+            advanced = _pbar_advance(eval_state["evals"])
+            if advanced > 0:
+                eval_state["step"] += advanced
+            ev_this = eval_state["evals"] - eval_state["last_step_evals"]
+            if advanced > 0:
+                eval_state["last_step_evals"] = eval_state["evals"]
+            pbar.set_postfix(_format_pbar_postfix(
+                step=eval_state["step"] if eval_state["step"] > 0 else 1,
+                evals=eval_state["evals"],
+                ev_per_step=ev_this,
+                gnorm=eval_state.get("last_gnorm", float("nan")),
+                loss=loss_value,
+                best=eval_state["best_true"],
+            ))
         if progress_callback is not None and ((step_num % log_every == 0) or (step_num == maxeval)):
             progress_callback(step_num, float(loss_value))
         return float(loss_value)
@@ -1173,15 +1348,23 @@ def _run_nlopt_lbfgs(
     x_opt = None
     try:
         x_opt = opt.optimize(x0)
-    except (RuntimeError, ValueError, FloatingPointError, nlopt.RoundoffLimited,
-            nlopt.ForcedStop, nlopt.runtime_error, nlopt.forced_stop) as exc:
-        if not history:
-            warnings.warn(
-                f"NLopt terminated before a valid step ({type(exc).__name__}). "
-                "Restoring initial parameters.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+    except BaseException as exc:  # pylint: disable=broad-except
+        # NLopt raises a SWIG-generated `nlopt.nlopt.runtime_error` (not a
+        # Python RuntimeError subclass) when its internal line-search fails.
+        # Catch broadly so we always return the best params found so far
+        # rather than propagating the failure to the caller.
+        # Re-raise KeyboardInterrupt / SystemExit so users can still abort.
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            if pbar is not None:
+                pbar.close()
+            raise
+        eval_state["stopped_reason"] = f"nlopt_error:{type(exc).__name__}"
+        warnings.warn(
+            f"NLopt terminated with {type(exc).__name__}: {exc}. "
+            f"Returning best params found after {eval_state['evals']} evaluations.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     finally:
         if pbar is not None:
             pbar.close()
@@ -1211,6 +1394,171 @@ def _run_nlopt_lbfgs(
     return params_run, history, best_loss, final_loss, convergence_reason, eval_state["evals"]
 
 
+def _run_jax_solver(
+    params_init: Mapping[str, Any],
+    loss_fn: Callable[[dict[str, Any]], Any],
+    *,
+    solver_name: str,
+    lr: float,
+    solver_options: dict[str, Any],
+    n_steps: int,
+    log_every: int,
+    progress: bool,
+    opt_desc: str | None,
+    progress_callback: Callable[[int, float], None] | None,
+):
+    """Run an optax-based optimizer over JAX arrays.
+
+    ``loss_fn`` must accept a ``dict[str, jax.Array]`` and return a real
+    scalar (or near-real complex) ``jax.Array``. The optimisation runs
+    purely on the JAX device — no torch interop.
+    """
+    jax, jnp = _require_jax()
+    optax = _require_optax()
+
+    options = dict(solver_options)
+    # Strip keys that belong to other backends.
+    for key in (
+        "maxeval",
+        "method",
+        "algorithm",
+        "optimizer",
+        "ftol",
+        "ftol_rel",
+        "ftol_abs",
+        "gtol",
+        "xtol_rel",
+        "xtol_abs",
+        "stopval",
+        "bounds",
+        "lower_bounds",
+        "upper_bounds",
+        "ema_alpha",
+        "assume_nonnegative",
+        "best_neg_tol",
+        "max_step",
+        "max_step_norm",
+    ):
+        options.pop(key, None)
+
+    controls = _pop_common_controls(
+        options,
+        default_steps=n_steps,
+        default_bad_max=5,
+        default_penalty=1e20,
+    )
+    grad_clip_norm = options.pop("clip_grad_norm", options.pop("grad_clip_norm", None))
+    if grad_clip_norm is not None and float(grad_clip_norm) <= 0.0:
+        raise ValueError("clip_grad_norm must be > 0 when set")
+
+    optax_factories = {
+        "jax-adam": optax.adam,
+        "jax-adamw": optax.adamw,
+        "jax-sgd": optax.sgd,
+        "jax-rmsprop": optax.rmsprop,
+    }
+    factory = optax_factories[solver_name]
+    base_optimizer = factory(lr, **options)
+    if grad_clip_norm is not None:
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(float(grad_clip_norm)),
+            base_optimizer,
+        )
+    else:
+        optimizer = base_optimizer
+
+    # Convert initial params to JAX arrays. Keep the user's dtype where
+    # possible; default everything to float64 if jax is configured for it.
+    def _to_jax(value):
+        return jnp.asarray(value)
+
+    params = {name: _to_jax(value) for name, value in params_init.items()}
+    if not params:
+        return params, [], float("nan"), float("nan"), "empty_params", 0
+
+    opt_state = optimizer.init(params)
+
+    def _scalar_real(loss):
+        # Take real part if the loss is complex; jax handles this fine under jit.
+        if jnp.iscomplexobj(loss):
+            loss = loss.real
+        return loss
+
+    def _loss_real(p):
+        return _scalar_real(loss_fn(p))
+
+    @jax.jit
+    def _step(params, opt_state):
+        loss, grads = jax.value_and_grad(_loss_real)(params)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        gnorm_sq = sum(jnp.vdot(g, g).real for g in jax.tree_util.tree_leaves(grads))
+        return params, opt_state, loss, jnp.sqrt(gnorm_sq)
+
+    history: list[float] = []
+    best_loss = float("inf")
+    best_params = params
+    convergence_reason = "maxiter"
+    bad_consecutive = 0
+    last_improve_step = 0
+
+    step_iter = _iter_steps(controls["max_steps"], progress=progress, opt_desc=opt_desc)
+
+    for step in step_iter:
+        params, opt_state, loss, gnorm = _step(params, opt_state)
+        loss_value = float(loss)
+        gnorm_value = float(gnorm)
+        step_num = step + 1
+
+        if not np.isfinite(loss_value):
+            bad_consecutive += 1
+            history.append(controls["penalty_on_bad"])
+            if progress:
+                step_iter.set_postfix(_format_pbar_postfix(
+                    step=step_num, evals=step_num, ev_per_step=1,
+                    gnorm="nan", loss="nan", best=best_loss,
+                ))
+            if progress_callback is not None and (step_num % log_every == 0):
+                progress_callback(step_num, controls["penalty_on_bad"])
+            if (bad_consecutive >= controls["bad_max"]) and (step_num >= controls["min_steps"]):
+                convergence_reason = "bad_max"
+                break
+            continue
+
+        bad_consecutive = 0
+        history.append(loss_value)
+        if loss_value + controls["min_improve"] < best_loss:
+            best_loss = loss_value
+            best_params = params
+            last_improve_step = step_num
+
+        if progress:
+            step_iter.set_postfix(_format_pbar_postfix(
+                step=step_num, evals=step_num, ev_per_step=1,
+                gnorm=gnorm_value, loss=loss_value, best=best_loss,
+            ))
+        if progress_callback is not None and (step_num % log_every == 0):
+            progress_callback(step_num, loss_value)
+        if controls["patience"] is not None and step_num >= controls["min_steps"]:
+            if (step_num - last_improve_step) >= controls["patience"]:
+                convergence_reason = "patience"
+                break
+
+    if controls["restore_best"] and np.isfinite(best_loss):
+        params = best_params
+        final_loss = best_loss
+    else:
+        final_loss = history[-1] if history else float("nan")
+
+    if progress_callback is not None:
+        progress_callback(max(1, len(history)), final_loss)
+
+    if not history:
+        history.append(final_loss if np.isfinite(final_loss) else controls["penalty_on_bad"])
+
+    return dict(params), history, best_loss, final_loss, convergence_reason, len(history)
+
+
 def _optimize_dispatch(
     params_init: Mapping[str, Any],
     loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
@@ -1224,7 +1572,6 @@ def _optimize_dispatch(
     progress_callback: Callable[[int, float], None] | None,
 ):
     """Core backend dispatch used by :class:`GradientOptimizer`."""
-    _require_torch()
     if n_steps <= 0:
         raise ValueError("n_steps must be >= 1")
     if log_every <= 0:
@@ -1241,14 +1588,35 @@ def _optimize_dispatch(
 
     solver_name = _normalize_solver_name(solver)
 
-    # lr is only used by torch backends; warn if the user explicitly set it for scipy/nlopt.
-    if solver_name not in _TORCH_SOLVERS and "lr" in (solver_options or {}):
+    # lr is only used by iterative gradient backends (torch / jax-*); warn
+    # if the user explicitly set it for scipy/nlopt where it is ignored.
+    if (
+        solver_name not in _TORCH_SOLVERS
+        and solver_name not in _JAX_SOLVER_NAMES
+        and "lr" in (solver_options or {})
+    ):
         warnings.warn(
-            f"'lr' option is ignored by solver={solver_name!r} (torch-only). "
+            f"'lr' option is ignored by solver={solver_name!r}. "
             "Use algorithm-specific options like 'ftol', 'gtol' instead.",
             stacklevel=3,
         )
 
+    # JAX path: no torch needed, no torch-flavoured param specs.
+    if solver_name in _JAX_SOLVER_NAMES:
+        return _run_jax_solver(
+            params_init,
+            loss_fn,
+            solver_name=solver_name,
+            lr=lr,
+            solver_options=options,
+            n_steps=n_steps,
+            log_every=log_every,
+            progress=progress,
+            opt_desc=opt_desc,
+            progress_callback=progress_callback,
+        )
+
+    _require_torch()
     items = _param_ordered_items(params_init)
     if solver_name in _TORCH_SOLVERS:
         return _run_torch_solver(
@@ -1457,13 +1825,21 @@ class GradientOptimizer:
                 f"steps={len(history)} final={final_loss:.6g} best={best_loss:.6g}"
             )
 
+        # Detach returned tensors — the solver leaves requires_grad=True on
+        # the working tensors after restoring the best vector. Consumers of
+        # GradSolverResult should not need to clean up autograd state.
+        params_out = {
+            name: t.detach() if isinstance(t, torch.Tensor) else t
+            for name, t in params_opt.items()
+        }
+
         return GradSolverResult(
-            params=params_opt,
+            params=params_out,
             history=list(history),
             solver=solver_name,
             n_steps=len(history),
             best_loss=float(best_loss),
             final_loss=float(final_loss),
-            convergence_reason=convergence_reason,
-            n_evals=n_evals,
+            convergence_reason=convergence_reason if convergence_reason is not None else "maxiter",
+            n_evals=int(n_evals),
         )
