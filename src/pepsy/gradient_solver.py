@@ -1190,6 +1190,17 @@ def _run_nlopt_lbfgs(
         opt.set_lower_bounds(np.full(int(x0.size), -np.pi))
         opt.set_upper_bounds(np.full(int(x0.size), np.pi))
 
+    # NLopt raises `invalid_argument` if x0 is outside [lower, upper] by even
+    # one ulp. This easily happens after a torch-side cast (e.g. float32) of a
+    # value that the caller already clipped against float64 bounds: round-trip
+    # through float32 + back to float64 in `_flatten_params_real_numpy` can
+    # nudge the value just past the bound. Snap x0 into the actually-set
+    # bounds before handing it to nlopt.
+    _lo = np.asarray(opt.get_lower_bounds(), dtype=np.float64)
+    _hi = np.asarray(opt.get_upper_bounds(), dtype=np.float64)
+    if _lo.size == x0.size and _hi.size == x0.size:
+        x0 = np.clip(x0, _lo, _hi)
+
     setters = {
         "stopval": opt.set_stopval,
         "ftol_abs": opt.set_ftol_abs,
