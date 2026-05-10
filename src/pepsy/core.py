@@ -796,6 +796,70 @@ def backend_cupy(device=None, dtype=None):
     return cast_array
 
 
+def backend_jax(device="cpu", dtype=None):
+    """Return a converter that materializes arrays as JAX arrays.
+
+    Parameters
+    ----------
+    device : str | jax.Device | None, optional
+        Target device. Strings ``"cpu"``, ``"cuda"``/``"gpu"`` (optionally with
+        an index, e.g. ``"cuda:1"``) are resolved against ``jax.devices``. A
+        ``jax.Device`` instance is used as-is. ``None`` leaves placement to
+        JAX's default.
+    dtype : str | jax.numpy.dtype | None, optional
+        Target dtype, e.g. ``"float64"`` or ``jnp.complex128``. ``None`` infers
+        from the input.
+
+    Notes
+    -----
+    JAX arrays are immutable and have no ``requires_grad`` flag; gradients in
+    JAX flow via tracing (``jax.grad`` / ``jax.value_and_grad``). This
+    converter therefore does not expose a ``requires_grad`` argument.
+    """
+    try:
+        import jax  # pylint: disable=import-outside-toplevel
+        import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "backend_jax requires optional dependency 'jax'. "
+            "Install it with: pip install jax (or jax[cuda12])."
+        ) from exc
+
+    def _resolve_device(dev):
+        if dev is None or not isinstance(dev, str):
+            return dev
+        s = dev.lower()
+        if ":" in s:
+            kind, idx_s = s.split(":", 1)
+            idx = int(idx_s)
+        else:
+            kind, idx = s, 0
+        if kind == "cuda":
+            kind = "gpu"
+        try:
+            return jax.devices(kind)[idx]
+        except (RuntimeError, IndexError) as err:
+            raise ValueError(
+                f"backend_jax: device {dev!r} not available; "
+                f"jax.devices() = {jax.devices()}"
+            ) from err
+
+    target_device = _resolve_device(device)
+    target_dtype = jnp.dtype(dtype) if isinstance(dtype, str) else dtype
+
+    def cast_array(x, device=target_device, dtype=target_dtype):
+        # Coerce non-JAX inputs (incl. torch tensors) to a numpy-compatible
+        # form first so jnp.asarray accepts them on any backend.
+        if torch is not None and isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        arr = jnp.asarray(x, dtype=dtype)
+        if device is not None:
+            arr = jax.device_put(arr, device)
+        return arr
+
+    return cast_array
+
+
 def register_torch_linalg(mode="complex"):
     """Register custom torch linalg gradients in autoray.
 

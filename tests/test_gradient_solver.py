@@ -45,6 +45,26 @@ def test_torch_adam_solver_reduces_quadratic():
     assert abs(float(result.params["x"].detach().item())) < 2.0
 
 
+def test_torch_adam_solver_honors_lower_upper_bounds():
+    """Torch backends should hard-clip params to explicit flat-vector bounds."""
+    runner = GradientOptimizer(
+        solver="torch-adam",
+        n_steps=30,
+        options={
+            "lr": 0.2,
+            "lower_bounds": np.array([-0.25]),
+            "upper_bounds": np.array([0.25]),
+        },
+    )
+    result = runner.run(
+        params_init={"x": torch.tensor([0.0], dtype=torch.float64)},
+        loss_fn=_loss_with_target,
+        loss_kwargs={"target": torch.tensor([2.0], dtype=torch.float64)},
+    )
+    assert float(result.params["x"].detach().item()) <= 0.25 + 1e-12
+    assert float(result.params["x"].detach().item()) >= -0.25 - 1e-12
+
+
 def test_run_accepts_loss_kwargs():
     """run(...) should bind loss kwargs cleanly."""
     runner = GradientOptimizer(solver="torch-adam", n_steps=30, options={"lr": 0.1})
@@ -107,12 +127,13 @@ def test_solver_name_validation_errors():
             loss_fn=_loss_quadratic,
         )
 
-    runner_alias = GradientOptimizer(solver="adam")
-    with pytest.raises(ValueError, match="Unsupported solver"):
-        runner_alias.run(
-            params_init={"x": torch.tensor([1.0], dtype=torch.float64)},
-            loss_fn=_loss_quadratic,
-        )
+    # Bare torch short names are now auto-resolved ("adam" -> "torch-adam").
+    runner_alias = GradientOptimizer(solver="adam", n_steps=5)
+    result_alias = runner_alias.run(
+        params_init={"x": torch.tensor([1.0], dtype=torch.float64)},
+        loss_fn=_loss_quadratic,
+    )
+    assert result_alias.solver == "torch-adam"
 
 
 def test_resolve_user_solver_accepts_canonical_names():
@@ -141,6 +162,26 @@ def test_scipy_solver_reduces_quadratic_if_available():
     assert abs(float(result.params["x"].detach().item())) < 1e-6
 
 
+def test_scipy_solver_honors_lower_upper_bounds_if_available():
+    """SciPy bounded methods should keep optimized params inside explicit bounds."""
+    pytest.importorskip("scipy")
+    runner = GradientOptimizer(
+        solver="scipy",
+        n_steps=30,
+        options={
+            "algorithm": "L-BFGS-B",
+            "lower_bounds": np.array([-0.25]),
+            "upper_bounds": np.array([0.25]),
+        },
+    )
+    result = runner.run(
+        params_init={"x": torch.tensor([0.0], dtype=torch.float64)},
+        loss_fn=_loss_with_target,
+        loss_kwargs={"target": torch.tensor([2.0], dtype=torch.float64)},
+    )
+    assert float(result.params["x"].detach().item()) == pytest.approx(0.25)
+
+
 def test_nlopt_solver_reduces_quadratic_if_available():
     """NLopt backend should optimize when optional dependency is installed."""
     pytest.importorskip("nlopt")
@@ -157,3 +198,24 @@ def test_nlopt_solver_reduces_quadratic_if_available():
     assert result.history
     assert result.history[-1] < result.history[0]
     assert abs(float(result.params["x"].detach().item())) < 1e-4
+
+
+def test_nlopt_solver_honors_lower_upper_bounds_if_available():
+    """NLopt should receive native hard bounds from solver options."""
+    pytest.importorskip("nlopt")
+    runner = GradientOptimizer(
+        solver="nlopt",
+        n_steps=30,
+        options={
+            "algorithm": "LD_LBFGS",
+            "lower_bounds": np.array([-0.25]),
+            "upper_bounds": np.array([0.25]),
+        },
+    )
+    result = runner.run(
+        params_init={"x": torch.tensor([0.0], dtype=torch.float64)},
+        loss_fn=_loss_with_target,
+        loss_kwargs={"target": torch.tensor([2.0], dtype=torch.float64)},
+    )
+    assert float(result.params["x"].detach().item()) <= 0.25 + 1e-12
+    assert float(result.params["x"].detach().item()) >= -0.25 - 1e-12
