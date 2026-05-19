@@ -128,14 +128,99 @@ class GradSolverResult:
     convergence_reason: str = "maxiter"
     n_evals: int = -1
 
-def _normalize_solver_name(solver: str) -> str:
+# ---------------------------------------------------------------------------
+# Solver name resolution
+# ---------------------------------------------------------------------------
+
+# Map bare scipy shorthand names to the full scipy method string.
+_SCIPY_METHOD_MAP: dict[str, str] = {
+    "lbfgs":        "L-BFGS-B",
+    "l-bfgs-b":     "L-BFGS-B",
+    "bfgs":         "BFGS",
+    "cg":           "CG",
+    "tnc":          "TNC",
+    "slsqp":        "SLSQP",
+    "trust-constr": "trust-constr",
+    "trust_constr": "trust-constr",
+    "cobyla":       "COBYLA",
+    "nelder-mead":  "Nelder-Mead",
+    "nelder_mead":  "Nelder-Mead",
+}
+
+# Bare torch short names that map to full "torch-*" solver names.
+_TORCH_SHORT_NAMES: frozenset[str] = frozenset(
+    {"adam", "adamw", "radam", "nadam", "lbfgs"}
+)
+
+
+def _resolve_solver(solver: str) -> tuple[str, str | None]:
+    """Parse an extended solver string into ``(backend_name, algorithm_override)``.
+
+    Accepts any of the following forms (case-insensitive prefix matching):
+
+    - Exact ``SUPPORTED_SOLVERS`` names (``"nlopt"``, ``"scipy"``,
+      ``"torch-adam"``, …)  →  ``(solver, None)``
+    - ``"nlopt-ALGO"``   →  ``("nlopt", "ALGO")``
+    - ``"scipy-METHOD"`` →  ``("scipy", METHOD_normalized)``
+    - Bare ``LD_*`` / ``LN_*`` / ``GD_*`` / ``GN_*`` nlopt names
+      →  ``("nlopt", algo_upper)``
+    - Bare scipy shorthands (``"lbfgs"``, ``"bfgs"``, ``"cg"``, …)
+      →  ``("scipy", full_method_name)``
+    - Bare torch short names (``"adam"``, ``"adamw"``, ``"radam"``, …)
+      →  ``("torch-<name>", None)``
+
+    The returned ``algorithm_override`` (when not ``None``) is injected into
+    ``solver_options["algorithm"]`` by ``_optimize_dispatch`` if that key is
+    not already present, so callers do not have to set it separately.
+    """
     if not isinstance(solver, str):
         raise TypeError("solver must be a string")
-    normalized = solver.strip().lower()
-    if normalized not in SUPPORTED_SOLVERS:
-        supported = ", ".join(SUPPORTED_SOLVERS)
-        raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
-    return normalized
+    key = solver.strip().lower()
+
+    # 1. Fast path: already an exact SUPPORTED_SOLVERS backend name.
+    if key in SUPPORTED_SOLVERS:
+        return key, None
+
+    # 2. Explicit "nlopt-ALGO" prefix.
+    if key.startswith("nlopt-"):
+        algo = solver[6:].strip()  # preserve original case (NLopt is case-sensitive)
+        return "nlopt", algo
+
+    # 3. Explicit "scipy-METHOD" prefix.
+    if key.startswith("scipy-"):
+        suffix = key[6:]
+        method = _SCIPY_METHOD_MAP.get(suffix, solver[6:].strip())
+        return "scipy", method
+
+    # 4. Bare nlopt algorithm names: LD_* / LN_* / GD_* / GN_*
+    key_up = key.upper()
+    if key_up[:3] in ("LD_", "LN_", "GD_", "GN_"):
+        return "nlopt", key_up
+
+    # 5. Bare scipy method shorthand.
+    if key in _SCIPY_METHOD_MAP:
+        return "scipy", _SCIPY_METHOD_MAP[key]
+
+    # 6. Bare torch optimizer short name.
+    if key in _TORCH_SHORT_NAMES:
+        return f"torch-{key}", None
+
+    supported = ", ".join(SUPPORTED_SOLVERS)
+    raise ValueError(
+        f"Unsupported solver={solver!r}. "
+        f"Supported backend names: {supported}; "
+        "or use an 'nlopt-ALGO' / 'scipy-METHOD' / 'torch-NAME' prefix, "
+        "a bare LD_*/LN_* nlopt name, or a bare scipy shorthand."
+    )
+
+
+def _normalize_solver_name(solver: str) -> str:
+    """Return the backend name for *solver*, resolving any extended syntax.
+
+    Delegates to :func:`_resolve_solver`; kept for backward compatibility.
+    """
+    backend, _ = _resolve_solver(solver)
+    return backend
 
 
 def _as_trainable_tensor(value: Any) -> torch.Tensor:
@@ -382,6 +467,32 @@ def _as_numpy_vector(values: Any, size: int, *, key: str) -> np.ndarray:
     return arr
 
 
+def _resolve_bounds_arrays(
+    *,
+    bounds: Any,
+    lower: Any,
+    upper: Any,
+    size: int,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Normalize optional flat-vector bounds to ``(lower, upper)`` arrays."""
+    if bounds is not None:
+        if lower is not None or upper is not None:
+            raise ValueError("Use either bounds or lower_bounds/upper_bounds, not both.")
+        bounds_arr = np.asarray(bounds, dtype=np.float64)
+        if bounds_arr.shape != (size, 2):
+            raise ValueError(f"bounds must have shape ({size}, 2).")
+        lower_arr = bounds_arr[:, 0].copy()
+        upper_arr = bounds_arr[:, 1].copy()
+    elif lower is not None or upper is not None:
+        lower_arr = _as_numpy_vector(-np.inf if lower is None else lower, size, key="lower_bounds")
+        upper_arr = _as_numpy_vector(np.inf if upper is None else upper, size, key="upper_bounds")
+    else:
+        return None, None
+    if np.any(lower_arr > upper_arr):
+        raise ValueError("lower_bounds must be <= upper_bounds for every parameter.")
+    return lower_arr, upper_arr
+
+
 _SCIPY_METHOD_MAP: dict[str, str] = {
     # L-BFGS-B aliases
     "L_BFGS_B": "L-BFGS-B",
@@ -437,7 +548,7 @@ def _format_pbar_postfix(
     *,
     step: int,
     evals: int,
-    ev_per_step: float | int,
+    ev_per_step: float | int | None,
     gnorm: float | str | None,
     loss: float | str | None,
     best: float | str | None,
@@ -445,12 +556,18 @@ def _format_pbar_postfix(
     """Return a uniform tqdm postfix dict shared by all solver backends.
 
     Keys (in display order):
-        step  : current iteration index (1-based)
-        ev    : cumulative cost-function evaluations
-        ev/it : evaluations consumed by the latest iteration
+        ev/it : evaluations consumed by the latest iteration (omitted when
+                ``ev_per_step=None``).  Pass ``None`` for backends where
+                this metric is trivially 1 and adds no information — e.g.
+                NLopt LD_*/LN_* algorithms call the Python objective exactly
+                once per gradient step (line searches run in compiled C++).
         ||g|| : gradient norm at the latest evaluation
         loss  : latest loss value
         best  : best loss seen so far
+
+    The cumulative evaluation count is intentionally omitted: tqdm already
+    shows the iteration counter in its bar prefix, and ``n_evals`` is
+    available on the returned :class:`GradSolverResult`.
     """
     def _fmt(v):
         if isinstance(v, str):
@@ -465,28 +582,28 @@ def _format_pbar_postfix(
             return "nan"
         return f"{fv:.3e}"
 
-    # ev/it can be fractional (e.g. nlopt sub-iteration accounting); show
-    # as int when whole, else with one decimal.
-    if isinstance(ev_per_step, str):
-        ev_it_str = ev_per_step
-    else:
-        try:
-            evf = float(ev_per_step)
-        except (TypeError, ValueError):
-            ev_it_str = str(ev_per_step)
-        else:
-            ev_it_str = f"{int(evf)}" if evf == int(evf) else f"{evf:.1f}"
+    # ``step`` and cumulative ``ev`` are omitted: tqdm already shows the
+    # iteration count in its bar prefix (e.g. "58/2000"), and total
+    # evaluations are reported on the final :class:`GradSolverResult`.
+    postfix: dict[str, Any] = {}
 
-    return {
-        # ``step`` is omitted: tqdm already shows the iteration count
-        # (e.g. "58/2000") in its bar prefix, so re-displaying it here
-        # would just take up width in the postfix.
-        "ev": int(evals),
-        "ev/it": ev_it_str,
-        "||g||": _fmt(gnorm),
-        "loss": _fmt(loss),
-        "best": _fmt(best),
-    }
+    # ev/it: only shown when the backend reports a meaningful per-iteration
+    # evaluation cost (i.e. ev_per_step is not None).
+    if ev_per_step is not None:
+        if isinstance(ev_per_step, str):
+            postfix["ev/it"] = ev_per_step
+        else:
+            try:
+                evf = float(ev_per_step)
+            except (TypeError, ValueError):
+                postfix["ev/it"] = str(ev_per_step)
+            else:
+                postfix["ev/it"] = f"{int(evf)}" if evf == int(evf) else f"{evf:.1f}"
+
+    postfix["||g||"] = _fmt(gnorm)
+    postfix["loss"] = _fmt(loss)
+    postfix["best"] = _fmt(best)
+    return postfix
 
 
 def _pop_step_count(options: dict[str, Any], *, default: int) -> int:
@@ -518,6 +635,13 @@ def _pop_common_controls(
     bad_max = int(options.pop("bad_max", default_bad_max))
     penalty_on_bad = float(options.pop("penalty_on_bad", options.pop("penalty_value", default_penalty)))
     angle_wrap = bool(options.pop("angle_wrap", False))
+    # ``assume_nonnegative``: if True, only loss values >= -best_neg_tol are
+    # eligible to update the best-so-far tracker. Use this when the loss is
+    # mathematically nonnegative (e.g. infidelity, squared error) and stray
+    # negative values are numerical artefacts that should not be "won" by
+    # the optimiser. Honored by torch, scipy, nlopt and jax backends.
+    assume_nonnegative = bool(options.pop("assume_nonnegative", False))
+    best_neg_tol = float(options.pop("best_neg_tol", 1e-12))
 
     if patience is not None and int(patience) < 0:
         raise ValueError("patience must be >= 0 or None")
@@ -527,6 +651,8 @@ def _pop_common_controls(
         raise ValueError("bad_max must be >= 1")
     if not np.isfinite(penalty_on_bad):
         raise ValueError("penalty_on_bad must be finite")
+    if best_neg_tol < 0.0:
+        raise ValueError("best_neg_tol must be >= 0")
 
     return {
         "max_steps": max_steps,
@@ -537,7 +663,21 @@ def _pop_common_controls(
         "bad_max": bad_max,
         "penalty_on_bad": penalty_on_bad,
         "angle_wrap": angle_wrap,
+        "assume_nonnegative": assume_nonnegative,
+        "best_neg_tol": best_neg_tol,
     }
+
+
+def _accept_as_best(loss_value: float, controls: Mapping[str, Any]) -> bool:
+    """Whether ``loss_value`` is eligible to update the best-so-far tracker.
+
+    When ``controls['assume_nonnegative']`` is True, values below
+    ``-controls['best_neg_tol']`` are rejected (treated as numerical
+    artefacts of an otherwise nonnegative loss).
+    """
+    if controls["assume_nonnegative"] and loss_value < -controls["best_neg_tol"]:
+        return False
+    return True
 
 
 def _build_torch_scheduler(optimizer, options: dict[str, Any], *, max_steps: int):
@@ -639,14 +779,14 @@ def _run_torch_solver(
         "ftol_abs",
         "xtol_abs",
         "stopval",
-        "bounds",
-        "lower_bounds",
-        "upper_bounds",
         "ema_alpha",
         "assume_nonnegative",
         "best_neg_tol",
     ):
         options.pop(key, None)
+    bounds = options.pop("bounds", None)
+    lower = options.pop("lower_bounds", None)
+    upper = options.pop("upper_bounds", None)
     grad_clip_norm = options.pop("clip_grad_norm", options.pop("grad_clip_norm", None))
     grad_clip_value = options.pop("grad_clip_value", None)
     max_step_norm = options.pop("max_step_norm", options.pop("max_step", None))
@@ -671,6 +811,21 @@ def _run_torch_solver(
 
     optimizer_cls = _TORCH_SOLVERS[solver_name]
     param_list = list(params_run.values())
+    flat_size = int(_flatten_params_real_numpy(specs).size)
+    lower_arr, upper_arr = _resolve_bounds_arrays(
+        bounds=bounds, lower=lower, upper=upper, size=flat_size,
+    )
+
+    def _clip_params_to_bounds() -> None:
+        if lower_arr is None or upper_arr is None:
+            return
+        flat = _flatten_params_real_numpy(specs)
+        clipped = np.clip(flat, lower_arr, upper_arr)
+        if not np.array_equal(flat, clipped):
+            _assign_flat_params(clipped, specs)
+
+    if lower_arr is not None and upper_arr is not None:
+        _clip_params_to_bounds()
     optimizer = optimizer_cls(param_list, lr=lr, **options)
 
     if isinstance(optimizer, torch.optim.LBFGS):
@@ -739,7 +894,10 @@ def _run_torch_solver(
         bad_consecutive = 0
         loss_value = float(loss.detach().cpu())
         history.append(loss_value)
-        if loss_value + controls["min_improve"] < best_loss:
+        if (
+            _accept_as_best(loss_value, controls)
+            and (loss_value + controls["min_improve"] < best_loss)
+        ):
             best_loss = loss_value
             best_vector = _flatten_params_real_numpy(specs)
             last_improve_step = step + 1
@@ -781,6 +939,8 @@ def _run_torch_solver(
                 if delta_norm > step_max:
                     clipped = prev_flat + delta * (step_max / (delta_norm + 1e-12))
                     torch.nn.utils.vector_to_parameters(clipped, param_list)
+
+        _clip_params_to_bounds()
 
         _step_torch_scheduler(scheduler, scheduler_kind, loss_value)
 
@@ -977,7 +1137,10 @@ def _run_scipy_lbfgs(
                 clip = float(grad_clip_norm)
                 if grad_norm > clip:
                     grad_value = grad_value * (clip / (grad_norm + 1e-12))
-            if loss_value + controls["min_improve"] < state["best_loss"]:
+            if (
+                _accept_as_best(loss_value, controls)
+                and (loss_value + controls["min_improve"] < state["best_loss"])
+            ):
                 state["best_loss"] = loss_value
                 state["best_x"] = np.array(x, dtype=np.float64, copy=True)
                 state["last_improve_step"] = step_counter["value"] + 1
@@ -1111,6 +1274,11 @@ def _run_nlopt_lbfgs(
     if method_name is not None and algorithm_name == "LD_LBFGS":
         algorithm_name = method_name
 
+    # nlopt's historical default is to assume the objective is nonnegative
+    # (e.g. infidelity / squared error); keep that default here so existing
+    # callers see no behaviour change. Lifted into common controls so the
+    # same flag works for torch / scipy / jax backends too.
+    options.setdefault("assume_nonnegative", True)
     controls = _pop_common_controls(
         options,
         default_steps=n_steps,
@@ -1118,15 +1286,20 @@ def _run_nlopt_lbfgs(
         default_penalty=1e20,
     )
     maxeval = controls["max_steps"]
+    assume_nonnegative = controls["assume_nonnegative"]
+    best_neg_tol = controls["best_neg_tol"]
     ftol_rel = _as_nonnegative_float(options.pop("ftol_rel", options.pop("ftol", 1e-9)), key="ftol_rel")
     xtol_rel = _as_nonnegative_float(options.pop("xtol_rel", options.pop("gtol", 1e-9)), key="xtol_rel")
+    # ftol_abs default of 1e-9 prevents the common `runtime_error` (nlopt
+    # line-search failure) that occurs when the loss is already tiny and the
+    # gradient is near zero.  ftol_rel only fires after a completed iteration;
+    # ftol_abs fires before the line search starts, allowing a clean stop.
+    ftol_abs = _as_nonnegative_float(options.pop("ftol_abs", 1e-9), key="ftol_abs")
     lower = options.pop("lower_bounds", None)
     upper = options.pop("upper_bounds", None)
     max_step = options.pop("max_step", None)
     grad_clip_norm = options.pop("grad_clip_norm", None)
     ema_alpha = options.pop("ema_alpha", None)
-    assume_nonnegative = bool(options.pop("assume_nonnegative", True))
-    best_neg_tol = float(options.pop("best_neg_tol", 1e-12))
 
     if ema_alpha is not None and not 0.0 < float(ema_alpha) <= 1.0:
         raise ValueError("ema_alpha must be in (0, 1] when set")
@@ -1178,6 +1351,7 @@ def _run_nlopt_lbfgs(
     opt = nlopt.opt(algorithm, int(x0.size))
     opt.set_maxeval(maxeval)
     opt.set_ftol_rel(ftol_rel)
+    opt.set_ftol_abs(ftol_abs)
     opt.set_xtol_rel(xtol_rel)
 
     if lower is not None:
@@ -1226,7 +1400,6 @@ def _run_nlopt_lbfgs(
         "bad_consecutive": 0,
         "prev_x": None,
         "stopped_reason": "maxeval",
-        "last_step_evals": 0,
         "step": 0,
     }
     pbar = None
@@ -1266,10 +1439,8 @@ def _run_nlopt_lbfgs(
                 advanced = _pbar_advance(eval_state["evals"])
                 if advanced > 0:
                     eval_state["step"] += advanced
-                ev_this = eval_state["evals"] - eval_state["last_step_evals"]
-                eval_state["last_step_evals"] = eval_state["evals"]
                 pbar.set_postfix(_format_pbar_postfix(
-                    step=eval_state["step"], evals=eval_state["evals"], ev_per_step=ev_this,
+                    step=eval_state["step"], evals=eval_state["evals"], ev_per_step=None,
                     gnorm="nan", loss="nan", best=eval_state["best_true"],
                 ))
             return controls["penalty_on_bad"]
@@ -1340,13 +1511,14 @@ def _run_nlopt_lbfgs(
             advanced = _pbar_advance(eval_state["evals"])
             if advanced > 0:
                 eval_state["step"] += advanced
-            ev_this = eval_state["evals"] - eval_state["last_step_evals"]
-            if advanced > 0:
-                eval_state["last_step_evals"] = eval_state["evals"]
+            # NLopt LD_*/LN_* algorithms call the Python objective exactly once
+            # per gradient step — line searches happen in compiled C++ and never
+            # call back into Python.  So ev/it is trivially 1 for all nlopt
+            # gradient methods and we omit it (pass None) to avoid confusion.
             pbar.set_postfix(_format_pbar_postfix(
                 step=eval_state["step"] if eval_state["step"] > 0 else 1,
                 evals=eval_state["evals"],
-                ev_per_step=ev_this,
+                ev_per_step=None,
                 gnorm=eval_state.get("last_gnorm", float("nan")),
                 loss=loss_value,
                 best=eval_state["best_true"],
@@ -1429,6 +1601,9 @@ def _run_jax_solver(
 
     options = dict(solver_options)
     # Strip keys that belong to other backends.
+    # NOTE: ``assume_nonnegative`` and ``best_neg_tol`` are common controls
+    # (see ``_pop_common_controls``); they are popped below by that helper,
+    # so do NOT strip them here.
     for key in (
         "maxeval",
         "method",
@@ -1445,8 +1620,6 @@ def _run_jax_solver(
         "lower_bounds",
         "upper_bounds",
         "ema_alpha",
-        "assume_nonnegative",
-        "best_neg_tol",
         "max_step",
         "max_step_norm",
     ):
@@ -1538,7 +1711,10 @@ def _run_jax_solver(
 
         bad_consecutive = 0
         history.append(loss_value)
-        if loss_value + controls["min_improve"] < best_loss:
+        if (
+            _accept_as_best(loss_value, controls)
+            and (loss_value + controls["min_improve"] < best_loss)
+        ):
             best_loss = loss_value
             best_params = params
             last_improve_step = step_num
@@ -1597,7 +1773,12 @@ def _optimize_dispatch(
     if not np.isfinite(lr) or lr <= 0.0:
         raise ValueError("lr must be finite and > 0")
 
-    solver_name = _normalize_solver_name(solver)
+    solver_name, _algo_override = _resolve_solver(solver)
+    # Inject algorithm override when the caller did not supply one explicitly.
+    # This allows compact forms like solver="nlopt-LD_VAR2" or solver="lbfgs"
+    # without separately setting solver_options["algorithm"].
+    if _algo_override is not None and "algorithm" not in options and "method" not in options:
+        options["algorithm"] = _algo_override
 
     # lr is only used by iterative gradient backends (torch / jax-*); warn
     # if the user explicitly set it for scipy/nlopt where it is ignored.

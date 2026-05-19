@@ -1,6 +1,10 @@
 """Tests for optimizer/fidelity helper wiring and defaults."""
 
+import builtins
+import sys
+import warnings
 import numpy as np
+import autoray as ar
 import quimb as qu
 import pepsy.core as core
 import pytest
@@ -28,6 +32,33 @@ def test_build_optimizer_constructs_without_seed(monkeypatch):
 
     assert isinstance(out, DummyOpt)
     assert "seed" not in captured
+
+
+def test_build_optimizer_forwards_slicing_related_options(monkeypatch):
+    """build_optimizer should forward slicing/reconfig option dictionaries."""
+    captured = {}
+
+    class DummyOpt:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(core.ctg, "ReusableHyperOptimizer", DummyOpt)
+
+    slicing_opts = {"target_size": 2048}
+    reconf_opts = {"subtree_size": 8}
+    slicing_reconf_opts = {"target_slices": 16}
+
+    out = core.build_optimizer(
+        progbar=False,
+        slicing_opts=slicing_opts,
+        reconf_opts=reconf_opts,
+        slicing_reconf_opts=slicing_reconf_opts,
+    )
+
+    assert isinstance(out, DummyOpt)
+    assert captured["slicing_opts"] is slicing_opts
+    assert captured["reconf_opts"] is reconf_opts
+    assert captured["slicing_reconf_opts"] is slicing_reconf_opts
 
 
 def test_build_compressed_optimizer_constructs_without_seed(monkeypatch):
@@ -105,6 +136,63 @@ def test_default_backend_setters_roundtrip():
         assert core.get_default_grad_backend() is grad_backend
     finally:
         core.reset_default_backends()
+
+
+def test_core_all_exports_backend_jax():
+    """core.__all__ should include the JAX backend caster for parity."""
+    assert "backend_jax" in core.__all__
+    assert "reg_complex_svd_torch" in core.__all__
+    assert "reg_complex_svd_jax" in core.__all__
+
+
+def test_backend_jax_casts_arrays_on_cpu_with_dtype():
+    """backend_jax should cast inputs to JAX arrays and honor dtype."""
+    jnp = pytest.importorskip("jax.numpy")
+
+    caster = core.backend_jax(device="cpu", dtype="float32")
+    out = caster(np.array([1.0, 2.0], dtype=np.float32))
+
+    assert ar.infer_backend(out) == "jax"
+    assert out.dtype == jnp.float32
+    assert np.allclose(np.asarray(out), np.array([1.0, 2.0], dtype=np.float32))
+
+
+def test_backend_jax_accepts_torch_tensor_input_if_available():
+    """backend_jax should accept torch tensors via explicit host conversion."""
+    torch = pytest.importorskip("torch")
+    jnp = pytest.importorskip("jax.numpy")
+
+    caster = core.backend_jax(device="cpu", dtype=jnp.float32)
+    out = caster(torch.tensor([3.0, -1.0], dtype=torch.float64))
+
+    assert ar.infer_backend(out) == "jax"
+    assert out.dtype == jnp.float32
+    assert np.allclose(np.asarray(out), np.array([3.0, -1.0], dtype=np.float32))
+
+
+def test_backend_jax_invalid_device_raises():
+    """Invalid device spec should produce a clear ValueError."""
+    pytest.importorskip("jax")
+    with pytest.raises(ValueError, match="not available"):
+        core.backend_jax(device="cpu:9999")
+
+
+def test_backend_jax_canonicalizes_x64_dtype_without_truncation_warning():
+    """float64 requests should respect JAX x64 policy without warning spam."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    caster = core.backend_jax(device="cpu", dtype="float64")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = caster(np.array([1.0, 2.0], dtype=np.float32))
+
+    truncation_warnings = [
+        w for w in caught if "requested dtype float64" in str(w.message)
+    ]
+    assert not truncation_warnings
+    expected_dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
+    assert out.dtype == expected_dtype
 
 
 def test_bdymps_uses_default_array_backend_when_not_provided():
@@ -470,3 +558,57 @@ def test_expec_tn_1d_alias_removed():
     """Legacy ``expec_TN_1D`` name should no longer exist in core."""
     with pytest.raises(AttributeError):
         _ = core.expec_TN_1D
+
+
+def test_register_torch_linalg_does_not_require_jax(monkeypatch):
+    """Torch linalg registration should not import or require JAX."""
+    torch = pytest.importorskip("torch")
+    monkeypatch.delitem(sys.modules, "pepsy._backend_linalg_torch", raising=False)
+
+    original_import = builtins.__import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "jax" or name.startswith("jax."):
+            raise ImportError("simulated missing jax")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    core.register_torch_linalg(mode="complex")
+    A = torch.randn(4, 3, dtype=torch.complex128, requires_grad=True)
+    _U, S, _Vh = ar.do("linalg.svd", A)
+    loss = S.real.sum()
+    loss.backward()
+    assert A.grad is not None
+
+
+def test_reg_complex_svd_jax_does_not_require_torch_or_scipy(monkeypatch):
+    """JAX SVD registration should not import or require torch/scipy."""
+    pytest.importorskip("jax")
+    monkeypatch.delitem(sys.modules, "pepsy._backend_linalg_jax", raising=False)
+
+    original_import = builtins.__import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if (
+            name == "torch"
+            or name.startswith("torch.")
+            or name == "scipy"
+            or name.startswith("scipy.")
+        ):
+            raise ImportError(f"simulated missing dependency: {name}")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    core.reg_complex_svd_jax()
+
+
+def test_safe_inverse_honors_eps_abs():
+    """safe_inverse should honor caller-provided eps_abs regularization."""
+    pytest.importorskip("torch")
+    from pepsy import _backend_linalg_torch as lrt  # pylint: disable=import-outside-toplevel
+
+    x = lrt.torch.tensor([1.0e-8], dtype=lrt.torch.float64)
+    small = lrt.safe_inverse(x, eps_abs=1.0e-12)
+    large = lrt.safe_inverse(x, eps_abs=1.0e-2)
+    assert not lrt.torch.allclose(small, large)
