@@ -175,6 +175,56 @@ def _build_to_cupy(sample_data, dtype_name, *, cast_complex_to_real=False):
     return _to_cupy
 
 
+def _build_to_jax(sample_data, dtype_name, *, cast_complex_to_real=False):
+    import jax  # pylint: disable=import-outside-toplevel
+    import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+
+    dtype_map = {
+        "complex128": jnp.complex128,
+        "complex64": jnp.complex64,
+        "float64": jnp.float64,
+        "float32": jnp.float32,
+        "float16": jnp.float16,
+        "int64": jnp.int64,
+        "int32": jnp.int32,
+    }
+    if dtype_name not in dtype_map:
+        raise ValueError(f"Unsupported dtype '{dtype_name}' for jax backend.")
+
+    dtype = getattr(sample_data, "dtype", None) or dtype_map[dtype_name]
+    device = getattr(sample_data, "device", None)
+
+    def _to_jax(
+        x,
+        dtype=dtype,
+        device=device,
+        cast_complex_to_real=cast_complex_to_real,
+    ):
+        # Torch tensors need explicit host conversion before jnp.asarray.
+        try:
+            import torch  # pylint: disable=import-outside-toplevel
+        except ImportError:  # pragma: no cover - optional dependency
+            torch = None
+        if torch is not None and isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+
+        arr = jnp.asarray(x)
+
+        if cast_complex_to_real and jnp.issubdtype(dtype, jnp.floating) and jnp.iscomplexobj(arr):
+            arr = arr.real
+
+        target_dtype = dtype
+        if (not cast_complex_to_real) and jnp.issubdtype(target_dtype, jnp.floating) and jnp.iscomplexobj(arr):
+            target_dtype = jnp.result_type(target_dtype, jnp.complex64)
+
+        out = jnp.asarray(arr, dtype=target_dtype)
+        if device is not None:
+            out = jax.device_put(out, device)
+        return out
+
+    return _to_jax
+
+
 def dispatch_backend_converter(
     *,
     backend,
@@ -200,6 +250,12 @@ def dispatch_backend_converter(
         )
     if backend == "cupy":
         return _build_to_cupy(
+            sample_data,
+            dtype_name,
+            cast_complex_to_real=cast_complex_to_real,
+        )
+    if backend == "jax":
+        return _build_to_jax(
             sample_data,
             dtype_name,
             cast_complex_to_real=cast_complex_to_real,

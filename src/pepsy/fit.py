@@ -584,7 +584,7 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                     raise TypeError("Unexpected effective tensor type during run_gate.")
 
                 norm_f = (f.H & f).contract(all) ** 0.5
-                self.local_norm_trace.append(complex(norm_f).real)
+                self.local_norm_trace.append(ar.do("real", norm_f))
 
                 # Update tensor data
                 psi[site].modify(data=f.data)

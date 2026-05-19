@@ -1105,13 +1105,10 @@ def gate(tn, gates, where=None, **kwargs):
     tn : qtn.TensorNetwork
         Input tensor network.
     gates : array_like | tuple | sequence
-        Gate payload in one of these forms:
-        1) single gate with explicit ``where`` argument:
-           ``gate(tn, G, where=...)``
-        2) canonical bundled stream:
-           ``gate(tn, ((G1, where1), (G2, where2), ...))``
-        The single bundled alias ``(gate, where)`` is intentionally rejected
-        to avoid ambiguity with a plain rank-2 gate tensor.
+        Gate payload. Use ``gate(tn, G, where=...)`` for a single gate, or
+        ``gate(tn, ((G1, where1), (G2, where2), ...))`` for bundled gates.
+        The single bundled alias ``(gate, where)`` is rejected to avoid
+        ambiguity with a plain rank-2 gate tensor.
     where : object, optional
         Target location for single-gate form.
         - 1D: ``1``, ``(1,)``, ``(1, 2)``
@@ -1623,13 +1620,12 @@ def build_pepo_from_gates(
     Parameters
     ----------
     gates : array_like | sequence | tuple
-        Gate payload in one of these forms:
-        1) single gate with explicit ``where`` argument:
-           ``build_pepo_from_gates(G, where=...)``
-        2) canonical bundled stream:
-           ``build_pepo_from_gates(((G1, where1), (G2, where2), ...))``
-        3) legacy parallel form with ``wheres``:
-           ``build_pepo_from_gates([G1, G2], [where1, where2])``
+        Gate payload. Accepted forms are:
+        ``build_pepo_from_gates(G, where=...)`` for a single gate,
+        ``build_pepo_from_gates(((G1, where1), (G2, where2), ...))`` for the
+        canonical bundled stream, and
+        ``build_pepo_from_gates([G1, G2], [where1, where2])`` for the legacy
+        parallel ``wheres`` form.
     wheres : sequence[tuple] | None, optional
         Legacy parallel where stream aligned with ``gates``.
     where : object, optional
@@ -1735,13 +1731,12 @@ def build_mpo_from_gates(
     Parameters
     ----------
     gates : array_like | sequence | tuple
-        Gate payload in one of these forms:
-        1) single gate with explicit ``where`` argument:
-           ``build_mpo_from_gates(G, where=...)``
-        2) canonical bundled stream:
-           ``build_mpo_from_gates(((G1, where1), (G2, where2), ...))``
-        3) legacy parallel form with ``wheres``:
-           ``build_mpo_from_gates([G1, G2], [where1, where2])``
+        Gate payload. Accepted forms are:
+        ``build_mpo_from_gates(G, where=...)`` for a single gate,
+        ``build_mpo_from_gates(((G1, where1), (G2, where2), ...))`` for the
+        canonical bundled stream, and
+        ``build_mpo_from_gates([G1, G2], [where1, where2])`` for the legacy
+        parallel ``wheres`` form.
     wheres : sequence[tuple[int, ...]] | None, optional
         Legacy parallel where stream aligned with ``gates``.
     where : object, optional

@@ -90,32 +90,9 @@ def _require_optax():
 class GradSolverResult:
     """Structured optimization result returned by :class:`GradientOptimizer`.
 
-    Attributes
-    ----------
-    params : dict[str, Any]
-        Optimised parameters on their original devices, detached from
-        autograd. Concrete element type is backend-dependent: a
-        ``torch.Tensor`` for the torch/scipy/nlopt solvers shipped here,
-        a ``jax.Array`` / ``jnp.ndarray`` for a JAX-based solver, or any
-        other array-like a future backend produces.
-    history : list[float]
-        Per-step loss trace. Length matches ``n_steps``.
-    solver : str
-        Normalised solver name actually used (e.g. ``"scipy"``).
-    n_steps : int
-        Number of entries recorded in ``history`` (iterations for scipy,
-        function evaluations for nlopt/torch).
-    best_loss : float
-        Lowest loss value observed during the run.
-    final_loss : float
-        Loss after the final restored state (== ``best_loss`` when
-        ``restore_best=True``).
-    convergence_reason : str
-        ``"maxiter"``, ``"patience"``, ``"bad_max"``, ``"empty_params"``,
-        ``"nan_x"``, or ``"nlopt_error:<ExcType>"``.
-    n_evals : int
-        Number of objective evaluations (``-1`` if the backend does not
-        report it separately).
+    This dataclass stores backend-agnostic outputs (parameters, loss history,
+    convergence metadata, and evaluation counts). Field docs are derived from
+    the dataclass members listed below.
     """
 
     # Backend-agnostic: holds torch.Tensor, jax.Array, np.ndarray, etc.

@@ -342,6 +342,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return norm_val
 
     @staticmethod
+    def _format_progress_fidelity(value):
+        """Format displayed progress fidelity proxy with stable precision."""
+        return f"{MpsOptimizer._real_float(value):.6f}"
+
+    @staticmethod
     def _collect_dmrg_batch(G_seq, where_seq, start_idx, k_2q_batch):
         """Collect a DMRG batch starting at a two-qubit gate index."""
         batch_G = []
@@ -431,6 +436,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     two_qubit_count += 1
                     xmin, xmax = sorted(where)
                     self.canonize_mps(p, (xmin, xmax))
+
                     p_g = apply_gate(
                         p,
                         gate,
@@ -447,11 +453,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         contraction_opt=self.contraction_opt,
                         retag=False,
                         range_int=[xmin, xmax],
+                        inplace=False,
                     )
                     fit.run_gate(n_iter=n_iter, verbose=False)
 
                     p = fit.p
-                    self.losses.append(complex(fit.local_norm_trace[-1]).real)
+                    self.losses.append(self._real_float(fit.local_norm_trace[-1]))
                     idx += 1
                     advanced = 1
                 else:
@@ -477,14 +484,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     fit.run_gate(n_iter=n_iter, verbose=False)
 
                     p = fit.p
-                    self.losses.append(complex(fit.local_norm_trace[-1]).real)
+                    self.losses.append(self._real_float(fit.local_norm_trace[-1]))
                     advanced = next_idx - idx
                     idx = next_idx
 
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": self.losses[-1],
+                    "~F": self._format_progress_fidelity(self.losses[-1]),
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -556,7 +563,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": norm_proxy,
+                    "~F": self._format_progress_fidelity(norm_proxy),
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -630,7 +637,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": norm_proxy,
+                    "~F": self._format_progress_fidelity(norm_proxy),
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -717,7 +724,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
-                    "~F": norm_proxy,
+                    "~F": self._format_progress_fidelity(norm_proxy),
                     "bnd": p.max_bond(),
                 }
                 pbar.set_postfix(postfix)
@@ -779,13 +786,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
             if len(where) == 1:
                 if pbar is not None:
-                    pbar.set_postfix({"2q": two_qubit_count, "~F": 1.0, "bnd": "inf"})
+                    pbar.set_postfix(
+                        {"2q": two_qubit_count, "~F": self._format_progress_fidelity(1.0), "bnd": "inf"}
+                    )
                     pbar.update(1)
                 continue
 
             two_qubit_count += 1
             if pbar is not None:
-                pbar.set_postfix({"2q": two_qubit_count, "~F": 1.0, "bnd": "inf"})
+                pbar.set_postfix({"2q": two_qubit_count, "~F": self._format_progress_fidelity(1.0), "bnd": "inf"})
                 pbar.update(1)
 
         if pbar is not None:

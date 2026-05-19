@@ -20,8 +20,7 @@ _EXPECTED_IN_ALL = [
     "cnot", "cx", "cy", "cz", "swap", "iswap", "phase", "u1", "u2",
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "ps_to_peps", "expec_mpo",
-    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "reg_complex_svd_torch",
-    "reg_complex_svd_jax", "make_numpy_array_caster", "SweepOptimizer",
+    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "make_numpy_array_caster", "SweepOptimizer",
     "MpsOptimizer", "MpoOptimizer", "optimize_global", "optimize_sweep",
     "optimize_mps", "gate", "gradient_solver",
 ]
@@ -34,6 +33,7 @@ _EXPECTED_NOT_IN_ALL = [
     "gates_tn_1d", "gates_tn_2d", "gates_tn_3d", "apply_2d_gate",
     "apply_2d_gates", "apply_2dtn_", "gate_2d", "gate_to_pepo", "gate_1d",
     "canonize_mps", "apply_gates_", "expec_TN_1D", "peps_I",
+    "reg_complex_svd_torch", "reg_complex_svd_jax",
     "MPSOptimizer", "MPOOptimizer",
 ]
 
@@ -70,6 +70,7 @@ _BLOCKED_NAMES = [
     "gates_tn_1d", "gates_tn_2d", "gates_tn_3d", "apply_2d_gate",
     "apply_2d_gates", "apply_2dtn_", "gate_2d", "gate_to_pepo", "gate_1d",
     "canonize_mps", "apply_gates_", "expec_TN_1D", "peps_I",
+    "reg_complex_svd_torch", "reg_complex_svd_jax",
     "MPSOptimizer", "MPOOptimizer",
 ]
 
@@ -96,10 +97,10 @@ def test_module_export_resolves(name):
 
 
 def test_optional_linalg_registrations_resolve():
-    """Optional torch/jax registrations resolve when available."""
+    """Linalg registrations are exposed under pepsy.core only."""
     has_torch = importlib.util.find_spec("torch") is not None
     has_jax = importlib.util.find_spec("jax") is not None
     if has_torch:
-        assert callable(pepsy.reg_complex_svd_torch)
+        assert callable(pepsy.core.reg_complex_svd_torch)
     if has_jax:
-        assert callable(pepsy.reg_complex_svd_jax)
+        assert callable(pepsy.core.reg_complex_svd_jax)
