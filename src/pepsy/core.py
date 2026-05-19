@@ -20,7 +20,10 @@ __all__ = [
     "backend_torch",
     "backend_numpy",
     "backend_cupy",
+    "backend_jax",
     "register_torch_linalg",
+    "reg_complex_svd_torch",
+    "reg_complex_svd_jax",
     "set_default_array_backend",
     "get_default_array_backend",
     "set_default_grad_backend",
@@ -845,7 +848,12 @@ def backend_jax(device="cpu", dtype=None):
             ) from err
 
     target_device = _resolve_device(device)
-    target_dtype = jnp.dtype(dtype) if isinstance(dtype, str) else dtype
+    if dtype is None:
+        target_dtype = None
+    else:
+        # Canonicalize dtypes under current JAX x64 policy so requests like
+        # float64/complex128 do not emit truncation warnings when x64 is off.
+        target_dtype = jax.dtypes.canonicalize_dtype(jnp.dtype(dtype))
 
     def cast_array(x, device=target_device, dtype=target_dtype):
         # Coerce non-JAX inputs (incl. torch tensors) to a numpy-compatible
@@ -873,7 +881,7 @@ def register_torch_linalg(mode="complex"):
             "register_torch_linalg requires optional dependency 'torch'. "
             "Install it with: pip install pepsy[torch] (or pip install torch)."
         )
-    from . import linalg_registrations as lr  # pylint: disable=import-outside-toplevel
+    from . import _backend_linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
     if mode == "complex":
         lr.reg_complex_svd_torch()
@@ -884,6 +892,33 @@ def register_torch_linalg(mode="complex"):
         lr.reg_real_qr_torch()
         return
     raise ValueError("mode must be 'complex' or 'real'")
+
+
+def reg_complex_svd_torch():
+    """Register complex torch SVD autograd rule in autoray."""
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "reg_complex_svd_torch requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
+    from . import _backend_linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_complex_svd_torch()
+
+
+def reg_complex_svd_jax():
+    """Register complex JAX SVD custom-VJP rule in autoray."""
+    try:
+        import jax  # pylint: disable=unused-import,import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - exercised in no-jax CI
+        raise ImportError(
+            "reg_complex_svd_jax requires optional dependency 'jax'. "
+            "Install it with: pip install jax jaxlib."
+        ) from exc
+
+    from . import _backend_linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_complex_svd_jax()
 
 
 def build_optimizer(
@@ -897,6 +932,7 @@ def build_optimizer(
     hash_method: str = "b",
     overwrite=False,
     on_trial_error: str = "warn",
+    slicing_opts: dict | None = None,
     reconf_opts: dict | None = None,
     slicing_reconf_opts: dict | None = None,
 ):
@@ -924,6 +960,8 @@ def build_optimizer(
         Cache overwrite behavior.
     on_trial_error : str, optional
         How to handle individual trial failures.
+    slicing_opts : dict | None, optional
+        Options passed to cotengra slicing heuristics.
     reconf_opts : dict | None, optional
         Options for subtree reconfiguration.
     slicing_reconf_opts : dict | None, optional
@@ -948,6 +986,9 @@ def build_optimizer(
 
     if reconf_opts is not None:
         kwargs["reconf_opts"] = reconf_opts
+
+    if slicing_opts is not None:
+        kwargs["slicing_opts"] = slicing_opts
 
     if slicing_reconf_opts is not None:
         kwargs["slicing_reconf_opts"] = slicing_reconf_opts
