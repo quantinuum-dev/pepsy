@@ -1,5 +1,7 @@
 """Behavior tests for ``build_bra_ket``."""
 
+import autoray as ar
+import numpy as np
 import pepsy
 import pytest
 import quimb.tensor as qtn
@@ -238,6 +240,54 @@ def test_bdymps_dispatch_backend_converter_routes_cupy(monkeypatch):
     )
 
     assert out is sentinel
+
+
+def test_bdymps_dispatch_backend_converter_routes_jax(monkeypatch):
+    """Backend dispatch should route jax tensors through jax caster builder."""
+    sentinel = object()
+
+    def _fake_build_to_jax(sample_data, dtype_name):
+        assert dtype_name == "complex128"
+        return sentinel
+
+    monkeypatch.setattr(pepsy.BdyMPS, "_build_to_jax", staticmethod(_fake_build_to_jax))
+    bdy = object.__new__(pepsy.BdyMPS)
+
+    out = pepsy.BdyMPS._dispatch_backend_converter(
+        bdy,
+        backend="jax",
+        dtype_name="complex128",
+        sample_data=object(),
+    )
+
+    assert out is sentinel
+
+
+def test_bdymps_build_to_jax_casts_complex_numpy_input_to_real():
+    """JAX boundary caster should drop imaginary part when target dtype is real."""
+    jnp = pytest.importorskip("jax.numpy")
+
+    sample = jnp.asarray([0.0], dtype=jnp.float32)
+    caster = pepsy.BdyMPS._build_to_jax(sample, "float32")
+    out = caster(np.asarray([1.0 + 2.0j], dtype=np.complex64))
+
+    assert ar.infer_backend(out) == "jax"
+    assert out.dtype == jnp.float32
+    assert np.allclose(np.asarray(out), np.asarray([1.0], dtype=np.float32))
+
+
+def test_bdymps_build_to_jax_accepts_torch_complex_input():
+    """JAX boundary caster should accept torch tensors and keep real component."""
+    torch = pytest.importorskip("torch")
+    jnp = pytest.importorskip("jax.numpy")
+
+    sample = jnp.asarray([0.0], dtype=jnp.float32)
+    caster = pepsy.BdyMPS._build_to_jax(sample, "float32")
+    out = caster(torch.tensor([2.5 - 3.0j], dtype=torch.complex64))
+
+    assert ar.infer_backend(out) == "jax"
+    assert out.dtype == jnp.float32
+    assert np.allclose(np.asarray(out), np.asarray([2.5], dtype=np.float32))
 
 
 def test_compbdy_fidelity_history_resets_each_run(monkeypatch):

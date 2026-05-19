@@ -10,10 +10,9 @@ Current package version: `0.1.1` (from `pyproject.toml` / `pepsy.__version__`).
 - `src/pepsy/`: installable library code
   - `boundary_states.py`: boundary state initialization (`BdyMPS`)
   - `boundary_sweeps.py`: sweep/contraction runner (`CompBdy`)
-  - `boundary_metrics.py`: input preparation + contraction (`prepare_boundary_inputs`, `ContractBoundary`)
-  - `optimize_sweep.py`, `optimize_global.py`, `gate.py`, `gradient_solver.py`, `debug.py`
-  - `fit.py`, `core.py`, `linalg_registrations.py`
-- `example/`: example notebooks
+  - `boundary_metrics.py`: input preparation + contraction (`build_bra_ket`, `contract_boundary`, `BoundaryContractResult`)
+  - `optimize_sweep.py`, `optimize_global.py`, `optimize_energy.py`, `gate.py`, `gradient_solver.py`
+  - `fit.py`, `core.py`, `_backend_utils.py`, `_backend_linalg.py`
 - `docs/`: Sphinx documentation source
 - `tests/`: package tests
 
@@ -25,6 +24,8 @@ pip install -e .
 # Optional backends:
 # pip install -e .[torch]
 # pip install -e .[solvers]
+# jax backend (manual, platform-specific wheels):
+# pip install jax jaxlib
 # Optional plotting helpers:
 # pip install -e .[viz]
 ```
@@ -32,9 +33,15 @@ pip install -e .
 ## Quick Usage
 ```python
 import pepsy
-from pepsy import BdyMPS, CompBdy, ContractBoundary, prepare_boundary_inputs
+import quimb.tensor as qtn
 
-print(pepsy.__version__)
+ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=1, dtype="complex128")
+ket_tagged, norm = pepsy.build_bra_ket(ket=ket)
+
+bdy = pepsy.BdyMPS(tn_flat=ket_tagged, tn_double=norm, chi=32, single_layer=False)
+res = pepsy.contract_boundary(norm=norm, bdy=bdy, direction="y", n_iter=2)
+
+print(pepsy.__version__, res.cost)
 ```
 
 ## Documentation
@@ -42,6 +49,7 @@ Build docs locally:
 
 ```bash
 pip install -e .[docs]
+NUMBA_CACHE_DIR=/tmp PYTHONPYCACHEPREFIX=/tmp \
 sphinx-build -W -b html docs docs/_build/html
 ```
 
@@ -51,10 +59,6 @@ Main docs sections:
 - `tutorials/`
 - `howto/`
 - `api/`
-
-Guided notebook example:
-
-- `example/norm.ipynb`
 
 ## Notes
 - `.gitattributes` marks notebooks as binary to avoid noisy diffs.

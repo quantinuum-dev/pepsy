@@ -43,3 +43,14 @@ Cause:
 Fix:
 
 - Set `track_boundary_fidelity=True`.
+
+## `RuntimeError: cannot cache function ... quimb/core.py`
+
+Cause:
+
+- Some environments do not allow Numba cache writes in default locations.
+
+Fix:
+
+- Run commands with explicit cache env vars, for example:
+  `NUMBA_CACHE_DIR=/tmp PYTHONPYCACHEPREFIX=/tmp pytest -q`

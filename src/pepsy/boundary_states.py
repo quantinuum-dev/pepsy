@@ -151,6 +151,15 @@ class BdyMPS:
             cast_complex_to_real=True,
         )
 
+    @staticmethod
+    def _build_to_jax(sample_data, dtype_name):
+        return dispatch_backend_converter(
+            backend="jax",
+            dtype_name=dtype_name,
+            sample_data=sample_data,
+            cast_complex_to_real=True,
+        )
+
     def _dispatch_backend_converter(self, backend, dtype_name, sample_data):
         """Return a conversion callable for the detected backend."""
         if sample_data is None:
@@ -164,6 +173,8 @@ class BdyMPS:
             return self._build_to_torch(sample_data, dtype_name)
         if backend == "cupy":
             return self._build_to_cupy(sample_data, dtype_name)
+        if backend == "jax":
+            return self._build_to_jax(sample_data, dtype_name)
 
         raise ValueError(f"Unsupported backend: {backend}")
 

@@ -1,10 +1,10 @@
 # Examples
 
-## Primary notebook
+## Primary walkthrough
 
-- `example/norm.ipynb`
+- [Tutorial: Contract a PEPS Norm](tutorials/contract_norm.md)
 
-This is the recommended first notebook for interactive usage.
+This is the recommended first end-to-end walkthrough for interactive usage.
 
 It demonstrates:
 
@@ -13,9 +13,10 @@ It demonstrates:
 - running `contract_boundary(...)`
 - inspecting `BoundaryContractResult.cost` and `.fidel`
 
-## Additional notebooks
+## Additional walkthroughs
 
-- `example/peps_norm_.ipynb`: historical exploratory notebook
-- `example/peps_boundary_states.ipynb`: boundary-state focused experiments
+- [Tutorial: Fidelity Diagnostics](tutorials/fidelity_diagnostics.md)
+- [How-To: Choose Parameters](howto/choose_parameters.md)
+- [How-To: Tune Sweep Solvers](howto/solver_tuning.md)
 
 For a cleaner, docs-first narrative, start from [tutorials](tutorials/index.md).

@@ -53,7 +53,6 @@ if TYPE_CHECKING:
         set_default_grad_backend,
         tns_align,
     )
-    from .linalg_registrations import reg_complex_svd_jax, reg_complex_svd_torch
     from .fit import FIT
     from .gate import (
         gate,
@@ -122,8 +121,6 @@ __all__ = [
     "set_default_grad_backend",
     "get_default_grad_backend",
     "register_torch_linalg",
-    "reg_complex_svd_torch",
-    "reg_complex_svd_jax",
     "reset_default_backends",
     "SweepOptimizer",
     "EnergyOptimizer",
@@ -467,17 +464,6 @@ def __getattr__(name):
             "get_default_grad_backend": get_default_grad_backend,
             "register_torch_linalg": register_torch_linalg,
             "reset_default_backends": reset_default_backends,
-        }[name]
-
-    if name in ("reg_complex_svd_torch", "reg_complex_svd_jax"):
-        from .linalg_registrations import (  # pylint: disable=import-outside-toplevel
-            reg_complex_svd_jax,
-            reg_complex_svd_torch,
-        )
-
-        return {
-            "reg_complex_svd_torch": reg_complex_svd_torch,
-            "reg_complex_svd_jax": reg_complex_svd_jax,
         }[name]
 
     if name == "CompBdy":
