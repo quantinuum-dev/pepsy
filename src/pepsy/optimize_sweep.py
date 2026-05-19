@@ -954,9 +954,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             supported = ", ".join(SUPPORTED_SOLVERS)
             raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
 
-        if solver == "nlopt":
+        if solver in {"nlopt", "fd-nlopt"}:
             warnings.warn(
-                "solver='nlopt' uses NLopt and can be sensitive to tolerances; "
+                f"solver={solver!r} uses NLopt and can be sensitive to tolerances; "
                 "consider tuning algorithm/maxeval/ftol_rel/xtol_rel.",
                 UserWarning,
                 stacklevel=2,
