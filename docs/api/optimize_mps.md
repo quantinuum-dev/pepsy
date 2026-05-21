@@ -1,7 +1,7 @@
-# `pepsy.gate`
+# `pepsy.optimize_mps`
 
 ```{eval-rst}
-.. automodule:: pepsy.gate
+.. automodule:: pepsy.optimize_mps
    :members:
    :undoc-members:
    :show-inheritance:

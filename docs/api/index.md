@@ -10,8 +10,14 @@ boundary_states
 boundary_sweeps
 core
 fit
-gate
+gates
+ham
 optimize_sweep
 optimize_global
+optimize_energy
+optimize_mps
+optimize_mpo
 gradient_solver
+ft_solver
+sampler
 ```
