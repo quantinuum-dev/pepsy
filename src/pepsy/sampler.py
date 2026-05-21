@@ -55,7 +55,7 @@ class MpsSampleResult:
     configs_2d : list[np.ndarray]
         Each entry is a (Ly, Lx) int array with spin indices on the 2D lattice.
     probs : list[float]
-        Born probability |⟨config|ψ⟩|² for each sample.
+        Born probability ``|⟨config|ψ⟩|²`` for each sample.
     Lx : int
         Lattice width.
     Ly : int
@@ -139,7 +139,7 @@ class MpsSampler:
 class VecSampler:
     """Sample from a dense state vector (e.g. from MpsOptimizer mode='exact').
 
-    Computes Born probabilities p_i = |ψ_i|² and samples configurations
+    Computes Born probabilities ``p_i = |ψ_i|²`` and samples configurations
     from the resulting categorical distribution.
 
     Parameters
