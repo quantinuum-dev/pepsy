@@ -31,6 +31,7 @@ autoclass_content = "both"
 napoleon_google_docstring = False
 napoleon_numpy_docstring = True
 napoleon_attr_annotations = False
+napoleon_use_ivar = True
 
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "**.ipynb_checkpoints", ".DS_Store"]
@@ -58,7 +59,7 @@ html_theme_options = {
     "icon_links": [
         {
             "name": "GitHub",
-            "url": "https://github.com/rezaquant/pepsy",
+            "url": "https://github.com/quantinuum-dev/pepsy",
             "icon": "fa-brands fa-github",
         }
     ],
