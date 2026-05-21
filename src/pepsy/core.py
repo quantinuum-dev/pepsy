@@ -773,8 +773,9 @@ def backend_cupy(device=None, dtype=None):
     ----------
     device : int | cupy.cuda.Device | None, optional
         Target CUDA device. If ``None``, use CuPy's current device.
-    dtype : dtype-like | None, optional
-        Target CuPy dtype. If ``None``, infer from input.
+    dtype : dtype-like | torch.dtype | None, optional
+        Target CuPy dtype. If ``None``, infer from input. Torch dtypes are
+        accepted and internally mapped to CuPy-compatible dtypes.
     """
     try:
         import cupy as cp  # pylint: disable=import-outside-toplevel
@@ -789,6 +790,26 @@ def backend_cupy(device=None, dtype=None):
     target_device = device
     if isinstance(target_device, int):
         target_device = cp.cuda.Device(target_device)
+
+    if torch is not None and isinstance(dtype, torch.dtype):
+        torch_to_cupy = {
+            torch.complex128: cp.complex128,
+            torch.complex64: cp.complex64,
+            torch.float64: cp.float64,
+            torch.float32: cp.float32,
+            torch.float16: cp.float16,
+            torch.int64: cp.int64,
+            torch.int32: cp.int32,
+            torch.int16: cp.int16,
+            torch.int8: cp.int8,
+            torch.uint8: cp.uint8,
+            torch.bool: cp.bool_,
+        }
+        if dtype not in torch_to_cupy:
+            raise ValueError(
+                f"backend_cupy does not support torch dtype {dtype!r}."
+            )
+        dtype = torch_to_cupy[dtype]
 
     def cast_array(x, device=target_device, dtype=dtype):
         if device is None:
@@ -1264,7 +1285,7 @@ def measure_obs(
     where : site selector | sequence[site selector]
         Site selector(s) matching ``obs``. For batched use, provide one entry
         per observable. Site formatting follows ``ind_id`` and mirrors
-        :func:`pepsy.gate.gate` single-gate ``where`` usage.
+        :func:`pepsy.gates.gate` single-gate ``where`` usage.
     ind_id : str | None, optional
         Site-index format. If ``None`` (default), assume ``k``-prefixed
         indices based on ``where`` and TN dimensionality
@@ -1288,13 +1309,13 @@ def measure_obs(
 
     Notes
     -----
-    This function applies observables using :func:`pepsy.gate.gate` with
+    This function applies observables using :func:`pepsy.gates.gate` with
     ``contract=False`` on a copy of ``tn`` before contraction.
     """
     if contraction_opt is None:
         contraction_opt = build_optimizer(progbar=False)
     # Local import avoids circular import at module load time.
-    from .gate import gate  # pylint: disable=import-outside-toplevel
+    from .gates import gate  # pylint: disable=import-outside-toplevel
 
     if isinstance(obs, (list, tuple)):
         if not isinstance(where, (list, tuple)):
@@ -1488,7 +1509,7 @@ def tns_align(p, pepo):
     pepo : qtn.TensorNetwork
         PEPO operator :math:`\hat{O}`.  Outer indices must follow the
         ``k<int>[,<int>...]`` and ``b<int>[,<int>...]`` convention.
-        This matches :func:`pepsy.gate.build_pepo_from_gates` output.
+        This matches :func:`pepsy.gates.build_pepo_from_gates` output.
 
     Returns
     -------

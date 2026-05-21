@@ -16,13 +16,15 @@ if TYPE_CHECKING:
         boundary_sweeps,
         core,
         fit,
-        gate,
+        ft_solver,
+        gates,
         ham,
         gradient_solver,
         optimize_global,
         optimize_sweep,
         optimize_energy,
         optimize_mpo,
+        sampler,
     )
     from .boundary_metrics import (
         BoundaryContractResult,
@@ -54,8 +56,10 @@ if TYPE_CHECKING:
         tns_align,
     )
     from .fit import FIT
-    from .gate import (
+    from .gates import (
         gate,
+        gate_simple,
+        renorm_gauge,
         build_pepo_from_gates,
         build_mpo_from_gates,
         pauli,
@@ -103,6 +107,8 @@ if TYPE_CHECKING:
     from .optimize_energy import EnergyOptimizer
     from .optimize_mps import MpsOptimizer
     from .optimize_mpo import MpoOptimizer
+    from .sampler import PEPSSampleResult, PepsBpSampler
+    from .gradient_solver import FDSolver
 
 __all__ = [
     "__version__",
@@ -123,10 +129,13 @@ __all__ = [
     "register_torch_linalg",
     "reset_default_backends",
     "SweepOptimizer",
+    "FDSolver",
     "EnergyOptimizer",
     "tns_align",
     "measure_obs",
     "gate",
+    "gate_simple",
+    "renorm_gauge",
     "build_pepo_from_gates",
     "build_mpo_from_gates",
     "pauli",
@@ -182,6 +191,7 @@ __all__ = [
     "optimize_mps",
     "optimize_mpo",
     "gradient_solver",
+    "ft_solver",
     "ham",
     "boundary_metrics",
     "boundary_states",
@@ -190,6 +200,12 @@ __all__ = [
     "fit",
     "MpsOptimizer",
     "MpoOptimizer",
+    "MpsSampler",
+    "MpsSampleResult",
+    "VecSampler",
+    "PEPSSampleResult",
+    "PepsBpSampler",
+    "sampler",
 ]
 
 
@@ -201,11 +217,13 @@ def __getattr__(name):
         "boundary_sweeps",
         "ham",
         "gradient_solver",
+        "ft_solver",
         "optimize_mps",
         "optimize_global",
         "optimize_sweep",
         "optimize_energy",
         "optimize_mpo",
+        "sampler",
         "core",
         "fit",
     ):
@@ -245,13 +263,14 @@ def __getattr__(name):
         return FIT
 
     if name == "gate":
-        # Handle "gate" separately: importing from .gate causes Python to bind
-        # the submodule to pepsy.__dict__['gate'], overwriting our function.
-        # We must explicitly re-set the attribute to the function afterward.
-        import sys  # pylint: disable=import-outside-toplevel
-        from .gate import gate as _gate_fn  # pylint: disable=import-outside-toplevel
-        sys.modules[__name__].__dict__["gate"] = _gate_fn
+        from .gates import gate as _gate_fn  # pylint: disable=import-outside-toplevel
+
         return _gate_fn
+
+    if name == "gate_simple":
+        from .gates import gate_simple as _gate_simple_fn  # pylint: disable=import-outside-toplevel
+
+        return _gate_simple_fn
 
     if name in (
         "build_pepo_from_gates",
@@ -292,10 +311,9 @@ def __getattr__(name):
         "su4",
         "fsim",
         "fsimg",
+        "renorm_gauge",
     ):
-        import sys as _sys  # pylint: disable=import-outside-toplevel
-        from .gate import (  # pylint: disable=import-outside-toplevel
-            gate as _gate_fn,
+        from .gates import (  # pylint: disable=import-outside-toplevel
             build_pepo_from_gates,
             build_mpo_from_gates,
             pauli,
@@ -334,10 +352,8 @@ def __getattr__(name):
             su4,
             fsim,
             fsimg,
+            renorm_gauge,
         )
-        # Re-bind "gate" to the function; `from .gate import ...` causes
-        # Python to set __dict__["gate"] to the submodule.
-        _sys.modules[__name__].__dict__["gate"] = _gate_fn
 
         return {
             "build_pepo_from_gates": build_pepo_from_gates,
@@ -378,6 +394,7 @@ def __getattr__(name):
             "su4": su4,
             "fsim": fsim,
             "fsimg": fsimg,
+            "renorm_gauge": renorm_gauge,
         }[name]
 
     if name == "ham_tn":
@@ -476,6 +493,11 @@ def __getattr__(name):
 
         return SweepOptimizer
 
+    if name == "FDSolver":
+        from .gradient_solver import FDSolver  # pylint: disable=import-outside-toplevel
+
+        return FDSolver
+
     if name == "EnergyOptimizer":
         from .optimize_energy import EnergyOptimizer  # pylint: disable=import-outside-toplevel
 
@@ -491,4 +513,22 @@ def __getattr__(name):
 
         return MpoOptimizer
 
+    if name in ("PEPSSampleResult", "PepsBpSampler", "MpsSampler", "MpsSampleResult", "VecSampler"):
+        from .sampler import (  # pylint: disable=import-outside-toplevel
+            PEPSSampleResult,
+            PepsBpSampler,
+            MpsSampler,
+            MpsSampleResult,
+            VecSampler,
+        )
+
+        return {
+            "PEPSSampleResult": PEPSSampleResult,
+            "PepsBpSampler": PepsBpSampler,
+            "MpsSampler": MpsSampler,
+            "MpsSampleResult": MpsSampleResult,
+            "VecSampler": VecSampler,
+        }[name]
+
     raise AttributeError(f"module 'pepsy' has no attribute {name!r}")
+

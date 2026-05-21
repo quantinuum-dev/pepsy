@@ -524,9 +524,9 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
             supported = ", ".join(SUPPORTED_SOLVERS)
             raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
 
-        if solver == "nlopt":
+        if solver in {"nlopt", "fd-nlopt"}:
             warnings.warn(
-                "solver='nlopt' uses NLopt on CPU float64 parameter vectors. "
+                f"solver={solver!r} uses NLopt on CPU float64 parameter vectors. "
                 "Tune NLopt controls (algorithm/maxeval/ftol_rel/xtol_rel) for your problem.",
                 UserWarning,
                 stacklevel=3,

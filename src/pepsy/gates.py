@@ -21,6 +21,8 @@ from .core import add_cycle, id_to_mpo, id_to_pepo
 
 __all__ = [
     "gate",
+    "gate_simple",
+    "renorm_gauge",
     "build_pepo_from_gates",
     "build_mpo_from_gates",
     "pauli",
@@ -1143,6 +1145,11 @@ def gate(tn, gates, where=None, **kwargs):
     inplace = opts.pop("inplace", True)
     chi = opts.pop("chi", None)
     chi_cutoff = float(opts.pop("chi_cutoff", 1.0e-12))
+    if "gauges" in opts or "renorm" in opts or "smudge" in opts:
+        raise TypeError(
+            "gate() no longer accepts 'gauges'/'renorm'/'smudge'. "
+            "Use pepsy.gate_simple(tn, G, where, gauges, ...) instead."
+        )
 
     tn_work = tn if inplace else (tn.copy() if hasattr(tn, "copy") else tn)
     if not entries:
@@ -1237,6 +1244,197 @@ def gate(tn, gates, where=None, **kwargs):
 
     _apply_chi_compression(tn_work, chi=chi, chi_cutoff=chi_cutoff)
     return tn_work
+
+
+def gate_simple(
+    tn,
+    G,
+    where,
+    gauges,
+    *,
+    renorm=True,
+    smudge=1e-12,
+    max_bond=None,
+    cutoff=1e-12,
+    cutoff_mode="rsum2",
+    inplace=True,
+):
+    """Apply a gate using simple-update gauges (with long-range SWAP routing).
+
+    Thin pepsy wrapper around quimb's ``tn.gate_simple_()`` that adds:
+
+    * Automatic long-range SWAP routing when the two sites are not adjacent
+      (works for 1D / 2D / 3D ``where`` coordinates).
+    * Backend alignment of internal SWAP tensors with the TN sample data.
+    * Optional out-of-place semantics via ``inplace=False``.
+
+    The ``gauges`` dictionary is mutated in place by ``gate_simple_`` and is
+    the single source of truth for the simple-update bond environment.
+
+    Parameters
+    ----------
+    tn : qtn.TensorNetwork
+        Tensor network supporting ``gate_simple_()`` (1D MPS, 2D PEPS, 3D PEPS).
+    G : array_like
+        Gate tensor.
+    where : tuple
+        Site coordinates. For a one-site gate: ``(site,)`` or ``site``.
+        For a two-site gate: ``(site_a, site_b)``, where each ``site`` is an
+        ``int`` (1D) or a tuple ``(i, j)`` / ``(i, j, k)`` (2D / 3D).
+    gauges : dict
+        Simple-update gauge dictionary keyed by bond index (mutated in place).
+    renorm : bool, optional
+        Whether to renormalize the singular values after the gate. Default True.
+        Ignored for one-site gates.
+    smudge : float, optional
+        Small numerical-safety value. Default 1e-12.
+    max_bond : int or None, optional
+        Maximum bond dimension for the gate application. Default None.
+    cutoff : float, optional
+        Truncation cutoff. Default 1e-12.
+    cutoff_mode : str, optional
+        Cutoff mode passed to ``gate_simple_`` (e.g. ``'rsum2'``, ``'rel'``).
+        Default ``'rsum2'``.
+    inplace : bool, optional
+        If False, work on a copy of ``tn``. Default True.
+
+    Returns
+    -------
+    qtn.TensorNetwork
+        The updated tensor network (same object as ``tn`` when ``inplace=True``).
+    """
+    tn_work = tn if inplace else (tn.copy() if hasattr(tn, "copy") else tn)
+
+    gate_opts = {
+        "cutoff": cutoff,
+        "cutoff_mode": cutoff_mode,
+    }
+    if max_bond is not None:
+        gate_opts["max_bond"] = int(max_bond)
+
+    # One-site gate — no gauge update needed.
+    if len(where) == 1:
+        tn_work.gate_simple_(
+            G, where=where, gauges=gauges,
+            renorm=False, smudge=smudge, inplace=True,
+        )
+        return tn_work
+
+    # Two-site gate — check if the sites share a bond.
+    site_a, site_b = where
+    tag_a = tn_work.site_tag(site_a)
+    tag_b = tn_work.site_tag(site_b)
+    adjacent = bool(qtn.bonds(tn_work[tag_a], tn_work[tag_b]))
+
+    if adjacent:
+        tn_work.gate_simple_(
+            G, where=where, gauges=gauges,
+            renorm=renorm, smudge=smudge, inplace=True,
+            **gate_opts,
+        )
+        return tn_work
+
+    # Non-adjacent: route through a SWAP chain. Align the SWAP tensor to the
+    # TN sample backend so the gate_simple_ call sees consistent dtypes.
+    swap_gate = qu.swap(dim=2, dtype="complex128").reshape(2, 2, 2, 2)
+    backend_sample = resolve_backend_sample_data_from_tn(tn_work)
+    inferred_converter = infer_backend_converter_from_sample(backend_sample)
+    if inferred_converter is not None:
+        try:
+            swap_gate = inferred_converter(swap_gate)
+        except (TypeError, ValueError):
+            pass
+
+    ndim = len(site_a) if isinstance(site_a, (tuple, list)) else 1
+    if ndim == 1:
+        path_pairs = list(gen_long_range_swap_path_1d(site_a, site_b))
+    elif ndim == 2:
+        cyclic = bool(getattr(tn_work, "_cyclic", False))
+        path_pairs = list(gen_long_range_swap_path_2d(
+            site_a, site_b, cyclic=cyclic,
+            Lx=getattr(tn_work, "Lx", None),
+            Ly=getattr(tn_work, "Ly", None),
+        ))
+    elif ndim == 3:
+        cyclic = bool(getattr(tn_work, "_cyclic", False))
+        path_pairs = list(gen_long_range_swap_path_3d(
+            site_a, site_b, cyclic=cyclic,
+            Lx=getattr(tn_work, "Lx", None),
+            Ly=getattr(tn_work, "Ly", None),
+            Lz=getattr(tn_work, "Lz", None),
+        ))
+    else:
+        raise ValueError(f"gate_simple: unsupported dimensionality: {ndim}")
+
+    *swaps, final = path_pairs
+
+    # Forward SWAPs.
+    for pair in swaps:
+        tn_work.gate_simple_(
+            swap_gate, where=pair, gauges=gauges,
+            renorm=renorm, smudge=smudge, inplace=True,
+            **gate_opts,
+        )
+
+    # Apply the actual gate on the final (now adjacent) pair.
+    tn_work.gate_simple_(
+        G, where=final, gauges=gauges,
+        renorm=renorm, smudge=smudge, inplace=True,
+        **gate_opts,
+    )
+
+    # Reverse SWAPs.
+    for pair in reversed(swaps):
+        tn_work.gate_simple_(
+            swap_gate, where=pair, gauges=gauges,
+            renorm=renorm, smudge=smudge, inplace=True,
+            **gate_opts,
+        )
+
+    return tn_work
+
+
+def renorm_gauge(tn, gauges, where, smudge=1e-12):
+    """Renormalize the simple-update gauge on the bond between sites in *where*.
+
+    Divides the gauge vector by its RMS norm (with *smudge* for safety)
+    and accumulates the extracted scale into ``tn.exponent`` (if present).
+
+    Works for 1D/2D/3D — finds the bond index between the two site tensors.
+
+    Parameters
+    ----------
+    tn : TensorNetwork
+        Must have ``site_tag()`` method and optionally an ``exponent`` attribute.
+    gauges : dict[str, array_like]
+        Gauge dictionary (mutated in-place).
+    where : tuple
+        Pair of site coordinates, e.g. ``(3, 4)`` for 1D,
+        ``((0,1), (1,1))`` for 2D, ``((0,0,0), (0,0,1))`` for 3D.
+    smudge : float
+        Small value for numerical safety.
+    """
+    from ._backend_linalg import stop_grad  # pylint: disable=import-outside-toplevel
+
+    site_a, site_b = where
+    tag_a = tn.site_tag(site_a)
+    tag_b = tn.site_tag(site_b)
+    tensor_a = tn[tag_a]
+    tensor_b = tn[tag_b]
+    bond_ix_set = qtn.bonds(tensor_a, tensor_b)
+    if not bond_ix_set:
+        raise ValueError(
+            f"renorm_gauge: sites {site_a} and {site_b} are not adjacent "
+            "(no shared bond)."
+        )
+    ix = next(iter(bond_ix_set))
+    s = gauges[ix]
+    norm_s = ar.do("sqrt", ar.do("mean", ar.do("abs", s) ** 2))
+    # Stop gradient on the scalar norm — only tensor data carries AD info.
+    norm_s = stop_grad(norm_s)
+    if hasattr(tn, "exponent"):
+        tn.exponent = tn.exponent + ar.do("log10", norm_s)
+    gauges[ix] = s / (norm_s + smudge)
 
 
 def _apply_gate_2d(

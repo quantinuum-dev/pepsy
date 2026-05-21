@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 torch = pytest.importorskip("torch")
 
-from pepsy.gradient_solver import GradientOptimizer, SUPPORTED_SOLVERS
+from pepsy.gradient_solver import FDSolver, GradientOptimizer, SUPPORTED_SOLVERS
 from pepsy.optimize_sweep import SweepOptimizer
 
 
@@ -24,8 +24,45 @@ def test_supported_solvers_exports_expected_backends():
     assert set(SUPPORTED_SOLVERS) == {
         "torch-adam", "torch-lbfgs", "torch-adamw", "torch-radam", "torch-nadam",
         "scipy", "nlopt",
+        "fd-adam", "fd-scipy", "fd-nlopt",
         "jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop",
     }
+
+
+def test_fdsolver_default_reduces_quadratic():
+    """FDSolver should default to fd-adam and reduce a simple quadratic."""
+    runner = FDSolver(
+        n_steps=30,
+        options={"lr": 0.2, "fd_eps": 1e-6},
+    )
+    result = runner.run(
+        params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+        loss_fn=_loss_quadratic,
+    )
+    assert result.solver == "fd-adam"
+    assert result.history
+    assert result.history[-1] < result.history[0]
+    assert abs(float(result.params["x"].detach().item())) < 2.0
+
+
+def test_fdsolver_rejects_non_fd_solver():
+    """FDSolver should reject non-FD solver names in init and run."""
+    with pytest.raises(ValueError, match="must resolve to an FD solver"):
+        FDSolver(solver="torch-adam")
+
+    runner = FDSolver(solver="fd-adam", n_steps=5, options={"lr": 0.1, "fd_eps": 1e-6})
+    with pytest.raises(ValueError, match="must resolve to an FD solver"):
+        runner.run(
+            params_init={"x": torch.tensor([1.0], dtype=torch.float64)},
+            loss_fn=_loss_quadratic,
+            solver="scipy",
+        )
+
+
+def test_fdsolver_accepts_nlopt_short_solver_name():
+    """FDSolver should normalize bare NLopt algorithm names to fd-nlopt-*."""
+    runner = FDSolver(solver="LD_VAR2")
+    assert runner.solver == "fd-nlopt-LD_VAR2"
 
 
 def test_torch_adam_solver_reduces_quadratic():
@@ -140,6 +177,7 @@ def test_resolve_user_solver_accepts_canonical_names():
     """Sweep optimizer should accept canonical solver names."""
     assert SweepOptimizer._resolve_user_solver("scipy") == "scipy"  # pylint: disable=protected-access
     assert SweepOptimizer._resolve_user_solver("torch-adam") == "torch-adam"  # pylint: disable=protected-access
+    assert SweepOptimizer._resolve_user_solver("fd-scipy") == "fd-scipy"  # pylint: disable=protected-access
 
 
 def test_resolve_user_solver_warns_for_nlopt():
@@ -182,6 +220,61 @@ def test_scipy_solver_honors_lower_upper_bounds_if_available():
     assert float(result.params["x"].detach().item()) == pytest.approx(0.25)
 
 
+def test_fd_adam_solver_reduces_quadratic():
+    """Finite-difference Adam should reduce a simple quadratic objective."""
+    runner = GradientOptimizer(
+        solver="fd-adam",
+        n_steps=30,
+        options={"lr": 0.2, "fd_eps": 1e-6},
+    )
+    result = runner.run(
+        params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+        loss_fn=_loss_quadratic,
+    )
+    assert result.history
+    assert result.history[-1] < result.history[0]
+    assert abs(float(result.params["x"].detach().item())) < 2.0
+
+
+def test_fd_scipy_solver_reduces_quadratic_if_available():
+    """FD-SciPy backend should optimize when optional dependency is installed."""
+    pytest.importorskip("scipy")
+    runner = GradientOptimizer(
+        solver="fd-scipy",
+        n_steps=30,
+        log_every=10,
+        options={"algorithm": "L-BFGS-B", "fd_eps": 1e-6},
+    )
+    result = runner.run(
+        params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+        loss_fn=_loss_quadratic,
+    )
+    assert result.history
+    assert result.history[-1] < result.history[0]
+    assert abs(float(result.params["x"].detach().item())) < 1e-5
+
+
+def test_fd_scipy_solver_honors_lower_upper_bounds_if_available():
+    """FD-SciPy should keep optimized params inside explicit bounds."""
+    pytest.importorskip("scipy")
+    runner = GradientOptimizer(
+        solver="fd-scipy",
+        n_steps=30,
+        options={
+            "algorithm": "L-BFGS-B",
+            "fd_eps": 1e-6,
+            "lower_bounds": np.array([-0.25]),
+            "upper_bounds": np.array([0.25]),
+        },
+    )
+    result = runner.run(
+        params_init={"x": torch.tensor([0.0], dtype=torch.float64)},
+        loss_fn=_loss_with_target,
+        loss_kwargs={"target": torch.tensor([2.0], dtype=torch.float64)},
+    )
+    assert float(result.params["x"].detach().item()) == pytest.approx(0.25, abs=1e-6)
+
+
 def test_nlopt_solver_reduces_quadratic_if_available():
     """NLopt backend should optimize when optional dependency is installed."""
     pytest.importorskip("nlopt")
@@ -198,6 +291,24 @@ def test_nlopt_solver_reduces_quadratic_if_available():
     assert result.history
     assert result.history[-1] < result.history[0]
     assert abs(float(result.params["x"].detach().item())) < 1e-4
+
+
+def test_fd_nlopt_solver_reduces_quadratic_if_available():
+    """FD-NLopt backend should optimize when optional dependency is installed."""
+    pytest.importorskip("nlopt")
+    runner = GradientOptimizer(
+        solver="fd-nlopt",
+        n_steps=60,
+        log_every=20,
+        options={"algorithm": "LD_LBFGS", "fd_eps": 1e-6},
+    )
+    result = runner.run(
+        params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+        loss_fn=_loss_quadratic,
+    )
+    assert result.history
+    assert result.history[-1] < result.history[0]
+    assert abs(float(result.params["x"].detach().item())) < 1e-3
 
 
 def test_nlopt_solver_honors_lower_upper_bounds_if_available():

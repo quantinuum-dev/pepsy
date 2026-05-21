@@ -1,4 +1,4 @@
-"""Tests for gate-routing helpers in :mod:`pepsy.gate`."""
+"""Tests for gate-routing helpers in :mod:`pepsy.gates`."""
 
 import warnings
 
@@ -7,7 +7,7 @@ import pytest
 import quimb.tensor as qtn
 
 from pepsy import ps_to_peps
-from pepsy.gate import (
+from pepsy.gates import (
     build_mpo_from_gates,
     build_pepo_from_gates,
     gate as apply_gate,
@@ -211,8 +211,8 @@ def test_gate_dispatches_to_1d_for_mps_two_site_where(monkeypatch):
         calls.append(("2d", where, kwargs.get("contract")))
         return tn
 
-    monkeypatch.setattr("pepsy.gate._apply_gate_1d", _fake_gate_tn_1d)
-    monkeypatch.setattr("pepsy.gate._apply_gate_2d", _fake_gate_tn_2d)
+    monkeypatch.setattr("pepsy.gates._apply_gate_1d", _fake_gate_tn_1d)
+    monkeypatch.setattr("pepsy.gates._apply_gate_2d", _fake_gate_tn_2d)
 
     mps = qtn.MPS_computational_state("0000", dtype=np.complex128)
     G = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
@@ -265,7 +265,7 @@ def test_gate_sequence_dispatches_to_bulk_helpers(monkeypatch, dim):
         calls.append((tn_i, G_arg, where, kwargs.get("contract"), "inplace" in kwargs))
         return tn_i
 
-    monkeypatch.setattr(f"pepsy.gate.{helper_name}", _fake_bulk_helper)
+    monkeypatch.setattr(f"pepsy.gates.{helper_name}", _fake_bulk_helper)
 
     gate_pairs = list(zip(gates, where))
     out = apply_gate(tn, gate_pairs, contract=contract)
@@ -318,7 +318,7 @@ def test_gate_sequence_dispatch_inplace_false_copies(monkeypatch, dim):
         calls.append((tn_i, G_arg, where, "inplace" in kwargs))
         return tn_i
 
-    monkeypatch.setattr(f"pepsy.gate.{helper_name}", _fake_bulk_helper)
+    monkeypatch.setattr(f"pepsy.gates.{helper_name}", _fake_bulk_helper)
 
     gate_pairs = list(zip(gates, where))
     out = apply_gate(tn, gate_pairs, inplace=False)
@@ -446,8 +446,8 @@ def test_gate_dispatches_to_2d_for_peps_ambiguous_two_int_where(monkeypatch):
         calls.append(("2d", where, kwargs.get("contract")))
         return tn
 
-    monkeypatch.setattr("pepsy.gate._apply_gate_1d", _fake_gate_tn_1d)
-    monkeypatch.setattr("pepsy.gate._apply_gate_2d", _fake_gate_tn_2d)
+    monkeypatch.setattr("pepsy.gates._apply_gate_1d", _fake_gate_tn_1d)
+    monkeypatch.setattr("pepsy.gates._apply_gate_2d", _fake_gate_tn_2d)
 
     peps = ps_to_peps(2, 2, dtype="complex128")
     G = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
@@ -504,7 +504,7 @@ def test_gate_3d_dispatch_supports_inplace_false(monkeypatch):
         calls.append(("3d", where, kwargs.get("contract"), "inplace" in kwargs))
         return tn
 
-    monkeypatch.setattr("pepsy.gate._apply_gate_3d", _fake_gate_tn_3d)
+    monkeypatch.setattr("pepsy.gates._apply_gate_3d", _fake_gate_tn_3d)
 
     tn = _Dummy3DTN()
     G = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
@@ -562,7 +562,7 @@ def test_gate_1d_general_tn_without_l_uses_gate_inds(monkeypatch):
         raise AssertionError("gate should not be used for TNs without L.")
 
     monkeypatch.setattr(qtn, "tensor_network_gate_inds", _fake_gate_inds)
-    monkeypatch.setattr("pepsy.gate._apply_gate_1d", _fail_gate_tn_1d)
+    monkeypatch.setattr("pepsy.gates._apply_gate_1d", _fail_gate_tn_1d)
 
     class _DummyTN:  # pylint: disable=too-few-public-methods
         def outer_inds(self):
@@ -1005,7 +1005,7 @@ def test_gates_tn_3d_accepts_bundled_pair_stream(monkeypatch):
         calls.append((gate, where, kwargs.get("contract")))
         return tn
 
-    monkeypatch.setattr("pepsy.gate._apply_gate_3d", _fake_gate_tn_3d)
+    monkeypatch.setattr("pepsy.gates._apply_gate_3d", _fake_gate_tn_3d)
 
     class _Dummy3DTN:  # pylint: disable=too-few-public-methods
         Lx = 1

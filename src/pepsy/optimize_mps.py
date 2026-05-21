@@ -8,7 +8,7 @@ import numpy as np
 import quimb.tensor as qtn
 
 from .fit import FIT
-from .gate import _normalize_gate_entries, gate as apply_gate
+from .gates import _normalize_gate_entries, gate as apply_gate
 
 __all__ = ["MpsOptimizer"]
 
@@ -33,7 +33,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Canonical bundled gate stream ``((gate, where), ...)`` (outer list/tuple
         accepted). If omitted, start with an empty queue and use
         :meth:`set_gates` or :meth:`add_gates` before ``run``. Each ``gate`` is
-        applied on the ket family only (state evolution), using :func:`pepsy.gate.gate`.
+        applied on the ket family only (state evolution), using :func:`pepsy.gates.gate`.
         ``where`` supports one- or two-site locations in 1D/2D/3D forms.
     chi : int
         Maximum bond dimension used by MPO/swap/SVD compression modes.

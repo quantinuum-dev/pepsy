@@ -5,6 +5,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,7 @@ __all__ = [
     "SUPPORTED_SOLVERS",
     "GradSolverResult",
     "GradientOptimizer",
+    "FDSolver",
     "optimize_packed_params",
 ]
 
@@ -29,6 +31,10 @@ SUPPORTED_SOLVERS = (
     "torch-nadam",
     "scipy",
     "nlopt",
+    # Finite-difference (no autograd) backends
+    "fd-adam",
+    "fd-scipy",
+    "fd-nlopt",
     # JAX / optax optimisers (optional deps: jax, optax)
     "jax-adam",
     "jax-adamw",
@@ -50,6 +56,15 @@ _JAX_SOLVER_NAMES = frozenset(
     {"jax-adam", "jax-adamw", "jax-sgd", "jax-rmsprop"}
 )
 
+_FD_SOLVER_MODULE = None
+
+
+def _get_fd_solver_module():
+    """Lazily import and cache the finite-difference backend module."""
+    global _FD_SOLVER_MODULE  # cached module handle
+    if _FD_SOLVER_MODULE is None:
+        _FD_SOLVER_MODULE = import_module("pepsy.ft_solver")
+    return _FD_SOLVER_MODULE
 
 def _require_torch() -> None:
     if torch is None:  # pragma: no cover - exercised in no-torch CI
@@ -139,6 +154,8 @@ def _resolve_solver(solver: str) -> tuple[str, str | None]:
       ``"torch-adam"``, …)  →  ``(solver, None)``
     - ``"nlopt-ALGO"``   →  ``("nlopt", "ALGO")``
     - ``"scipy-METHOD"`` →  ``("scipy", METHOD_normalized)``
+    - ``"fd-nlopt-ALGO"``   →  ``("fd-nlopt", "ALGO")``
+    - ``"fd-scipy-METHOD"`` →  ``("fd-scipy", METHOD_normalized)``
     - Bare ``LD_*`` / ``LN_*`` / ``GD_*`` / ``GN_*`` nlopt names
       →  ``("nlopt", algo_upper)``
     - Bare scipy shorthands (``"lbfgs"``, ``"bfgs"``, ``"cg"``, …)
@@ -169,16 +186,27 @@ def _resolve_solver(solver: str) -> tuple[str, str | None]:
         method = _SCIPY_METHOD_MAP.get(suffix, solver[6:].strip())
         return "scipy", method
 
-    # 4. Bare nlopt algorithm names: LD_* / LN_* / GD_* / GN_*
+    # 4. Explicit finite-difference "fd-nlopt-ALGO" prefix.
+    if key.startswith("fd-nlopt-"):
+        algo = solver[9:].strip()  # preserve original case (NLopt is case-sensitive)
+        return "fd-nlopt", algo
+
+    # 5. Explicit finite-difference "fd-scipy-METHOD" prefix.
+    if key.startswith("fd-scipy-"):
+        suffix = key[9:]
+        method = _SCIPY_METHOD_MAP.get(suffix, solver[9:].strip())
+        return "fd-scipy", method
+
+    # 6. Bare nlopt algorithm names: LD_* / LN_* / GD_* / GN_*
     key_up = key.upper()
     if key_up[:3] in ("LD_", "LN_", "GD_", "GN_"):
         return "nlopt", key_up
 
-    # 5. Bare scipy method shorthand.
+    # 7. Bare scipy method shorthand.
     if key in _SCIPY_METHOD_MAP:
         return "scipy", _SCIPY_METHOD_MAP[key]
 
-    # 6. Bare torch optimizer short name.
+    # 8. Bare torch optimizer short name.
     if key in _TORCH_SHORT_NAMES:
         return f"torch-{key}", None
 
@@ -198,6 +226,32 @@ def _normalize_solver_name(solver: str) -> str:
     """
     backend, _ = _resolve_solver(solver)
     return backend
+
+
+def _ensure_fd_solver(solver: str, *, where: str = "solver") -> str:
+    """Validate and normalize *solver* to an FD backend solver string.
+
+    Accepted forms:
+    - explicit FD names: ``fd-adam``, ``fd-scipy-*``, ``fd-nlopt-*``
+    - NLopt forms, auto-mapped to FD-NLopt:
+      ``LD_*``/``LN_*``/``GD_*``/``GN_*`` or ``nlopt-ALGO``
+    """
+    backend, algo = _resolve_solver(solver)
+    if backend in {"fd-adam", "fd-scipy", "fd-nlopt"}:
+        return solver
+    if backend == "nlopt":
+        if not algo:
+            raise ValueError(
+                f"{where}={solver!r} is missing an NLopt algorithm. "
+                "Use e.g. 'LD_VAR2' or 'nlopt-LD_VAR2'."
+            )
+        return f"fd-nlopt-{algo}"
+    if backend not in {"fd-adam", "fd-scipy", "fd-nlopt"}:
+        raise ValueError(
+            f"{where} must resolve to an FD solver "
+            f"('fd-adam', 'fd-scipy', or 'fd-nlopt-*'), got {solver!r}."
+        )
+    return solver
 
 
 def _as_trainable_tensor(value: Any) -> torch.Tensor:
@@ -1554,6 +1608,83 @@ def _run_nlopt_lbfgs(
     return params_run, history, best_loss, final_loss, convergence_reason, eval_state["evals"]
 
 
+def _run_fd_adam(
+    items: list[tuple[str, torch.Tensor]],
+    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+    *,
+    lr: float,
+    solver_options: dict[str, Any],
+    n_steps: int,
+    log_every: int,
+    progress: bool,
+    opt_desc: str | None,
+    progress_callback: Callable[[int, float], None] | None,
+):
+    """Delegate finite-difference Adam backend to :mod:`pepsy.ft_solver`."""
+    fd_solver_module = _get_fd_solver_module()
+    return fd_solver_module._run_fd_adam(
+        items,
+        loss_fn,
+        lr=lr,
+        solver_options=solver_options,
+        n_steps=n_steps,
+        log_every=log_every,
+        progress=progress,
+        opt_desc=opt_desc,
+        progress_callback=progress_callback,
+    )
+
+
+def _run_fd_scipy(
+    items: list[tuple[str, torch.Tensor]],
+    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+    *,
+    solver_options: dict[str, Any],
+    n_steps: int,
+    log_every: int,
+    progress: bool,
+    opt_desc: str | None,
+    progress_callback: Callable[[int, float], None] | None,
+):
+    """Delegate finite-difference SciPy backend to :mod:`pepsy.ft_solver`."""
+    fd_solver_module = _get_fd_solver_module()
+    return fd_solver_module._run_fd_scipy(
+        items,
+        loss_fn,
+        solver_options=solver_options,
+        n_steps=n_steps,
+        log_every=log_every,
+        progress=progress,
+        opt_desc=opt_desc,
+        progress_callback=progress_callback,
+    )
+
+
+def _run_fd_nlopt(
+    items: list[tuple[str, torch.Tensor]],
+    loss_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
+    *,
+    solver_options: dict[str, Any],
+    n_steps: int,
+    log_every: int,
+    progress: bool,
+    opt_desc: str | None,
+    progress_callback: Callable[[int, float], None] | None,
+):
+    """Delegate finite-difference NLopt backend to :mod:`pepsy.ft_solver`."""
+    fd_solver_module = _get_fd_solver_module()
+    return fd_solver_module._run_fd_nlopt(
+        items,
+        loss_fn,
+        solver_options=solver_options,
+        n_steps=n_steps,
+        log_every=log_every,
+        progress=progress,
+        opt_desc=opt_desc,
+        progress_callback=progress_callback,
+    )
+
+
 def _run_jax_solver(
     params_init: Mapping[str, Any],
     loss_fn: Callable[[dict[str, Any]], Any],
@@ -1758,10 +1889,11 @@ def _optimize_dispatch(
         options["algorithm"] = _algo_override
 
     # lr is only used by iterative gradient backends (torch / jax-*); warn
-    # if the user explicitly set it for scipy/nlopt where it is ignored.
+    # if the user explicitly set it for backends where it is ignored.
     if (
         solver_name not in _TORCH_SOLVERS
         and solver_name not in _JAX_SOLVER_NAMES
+        and solver_name != "fd-adam"
         and "lr" in (solver_options or {})
     ):
         warnings.warn(
@@ -1801,6 +1933,19 @@ def _optimize_dispatch(
             progress_callback=progress_callback,
         )
 
+    if solver_name == "fd-adam":
+        return _run_fd_adam(
+            items,
+            loss_fn,
+            lr=lr,
+            solver_options=options,
+            n_steps=n_steps,
+            log_every=log_every,
+            progress=progress,
+            opt_desc=opt_desc,
+            progress_callback=progress_callback,
+        )
+
     if solver_name == "scipy":
         return _run_scipy_lbfgs(
             items,
@@ -1813,8 +1958,32 @@ def _optimize_dispatch(
             progress_callback=progress_callback,
         )
 
+    if solver_name == "fd-scipy":
+        return _run_fd_scipy(
+            items,
+            loss_fn,
+            solver_options=options,
+            n_steps=n_steps,
+            log_every=log_every,
+            progress=progress,
+            opt_desc=opt_desc,
+            progress_callback=progress_callback,
+        )
+
     if solver_name == "nlopt":
         return _run_nlopt_lbfgs(
+            items,
+            loss_fn,
+            solver_options=options,
+            n_steps=n_steps,
+            log_every=log_every,
+            progress=progress,
+            opt_desc=opt_desc,
+            progress_callback=progress_callback,
+        )
+
+    if solver_name == "fd-nlopt":
+        return _run_fd_nlopt(
             items,
             loss_fn,
             solver_options=options,
@@ -1855,10 +2024,11 @@ def optimize_packed_params(
         device; other array types are converted with ``torch.as_tensor``.
     loss_fn : callable
         ``loss_fn(params) -> scalar tensor``.  Must be differentiable when
-        using gradient-based solvers.
+        using autograd-based solvers.
     solver : str, default="scipy"
-        Solver name. Supported values: ``"torch-adam"``, ``"scipy"``,
-        and ``"nlopt"``.
+        Solver name. See :data:`SUPPORTED_SOLVERS` for canonical values,
+        including finite-difference backends (``"fd-adam"``,
+        ``"fd-scipy"``, ``"fd-nlopt"``).
     solver_options : dict | None, default=None
         Backend-specific options forwarded to the selected solver.
     n_steps : int, default=100
@@ -2011,4 +2181,65 @@ class GradientOptimizer:
             final_loss=float(final_loss),
             convergence_reason=convergence_reason if convergence_reason is not None else "maxiter",
             n_evals=int(n_evals),
+        )
+
+
+class FDSolver(GradientOptimizer):
+    """Dedicated public optimizer wrapper restricted to FD backends.
+
+    This class mirrors :class:`GradientOptimizer` but validates that any solver
+    passed at construction or run-time is one of:
+    ``fd-adam``, ``fd-scipy-*``, or ``fd-nlopt-*``.
+    """
+
+    def __init__(
+        self,
+        *,
+        solver: str = "fd-adam",
+        options: Mapping[str, Any] | None = None,
+        n_steps: int = 100,
+        log_every: int = 20,
+        progress: bool = False,
+        desc: str | None = None,
+        verbose: bool = False,
+    ):
+        solver_use = _ensure_fd_solver(solver, where="FDSolver(..., solver=...)")
+        super().__init__(
+            solver=solver_use,
+            options=options,
+            n_steps=n_steps,
+            log_every=log_every,
+            progress=progress,
+            desc=desc,
+            verbose=verbose,
+        )
+
+    def run(
+        self,
+        *,
+        params_init: Mapping[str, Any],
+        loss_fn: Callable[..., torch.Tensor],
+        loss_kwargs: Mapping[str, Any] | None = None,
+        solver: str | None = None,
+        options: Mapping[str, Any] | None = None,
+        n_steps: int | None = None,
+        log_every: int | None = None,
+        progress: bool | None = None,
+        desc: str | None = None,
+        progress_callback: Callable[[int, float], None] | None = None,
+    ) -> GradSolverResult:
+        solver_use = solver
+        if solver is not None:
+            solver_use = _ensure_fd_solver(solver, where="FDSolver.run(..., solver=...)")
+        return super().run(
+            params_init=params_init,
+            loss_fn=loss_fn,
+            loss_kwargs=loss_kwargs,
+            solver=solver_use,
+            options=options,
+            n_steps=n_steps,
+            log_every=log_every,
+            progress=progress,
+            desc=desc,
+            progress_callback=progress_callback,
         )
