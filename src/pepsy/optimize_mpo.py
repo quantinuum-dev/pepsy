@@ -9,7 +9,7 @@ import numpy as np
 
 from .core import tn_norm
 from .fit import FIT
-from .gate import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
+from .gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 
 __all__ = ["MpoOptimizer"]
 

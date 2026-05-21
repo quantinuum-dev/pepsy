@@ -21,8 +21,9 @@ _EXPECTED_IN_ALL = [
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "ps_to_peps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "make_numpy_array_caster", "SweepOptimizer",
-    "FDSolver", "MpsOptimizer", "MpoOptimizer", "optimize_global", "optimize_sweep",
-    "optimize_mps", "gate", "gradient_solver", "ft_solver",
+    "FDSolver", "MpsOptimizer", "MpoOptimizer", "PEPSSampleResult",
+    "PepsBpSampler", "optimize_global", "optimize_sweep",
+    "optimize_mps", "gate", "gradient_solver", "ft_solver", "sampler",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
@@ -59,7 +60,7 @@ _CALLABLE_EXPORTS = [
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "ps_to_peps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "SweepOptimizer",
-    "FDSolver", "MpsOptimizer", "MpoOptimizer",
+    "FDSolver", "MpsOptimizer", "MpoOptimizer", "PEPSSampleResult", "PepsBpSampler",
 ]
 
 _BLOCKED_NAMES = [
@@ -74,7 +75,7 @@ _BLOCKED_NAMES = [
     "MPSOptimizer", "MPOOptimizer",
 ]
 
-_MODULE_EXPORTS = ["optimize_global", "optimize_sweep", "optimize_mps", "gate", "gradient_solver", "ft_solver"]
+_MODULE_EXPORTS = ["optimize_global", "optimize_sweep", "optimize_mps", "gate", "gradient_solver", "ft_solver", "sampler"]
 
 
 @pytest.mark.parametrize("name", _CALLABLE_EXPORTS)
