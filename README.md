@@ -25,7 +25,7 @@ Current package version: `0.1.1` (from `pyproject.toml` / `pepsy.__version__`).
 
 ## Install
 ```bash
-pip install -e .
+pip install -U --no-deps -e .
 # Optional backends:
 # pip install -e .[torch]
 # pip install -e .[solvers]
