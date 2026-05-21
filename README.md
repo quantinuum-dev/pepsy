@@ -25,8 +25,6 @@ Current package version: `0.1.1` (from `pyproject.toml` / `pepsy.__version__`).
 
 ## Install
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 pip install -e .
 # Optional backends:
 # pip install -e .[torch]
