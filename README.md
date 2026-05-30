@@ -4,7 +4,7 @@
 
 `pepsy` is a Python package for circuit simulation and related DMRG fitting workflows.
 
-Current package version: `0.1.1` (from `pyproject.toml` / `pepsy.__version__`).
+Current package version: `0.2.0` (from `pyproject.toml` / `pepsy.__version__`).
 
 ## Package Layout
 - `src/pepsy/`: installable library code
