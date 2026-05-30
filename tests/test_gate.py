@@ -1,5 +1,7 @@
-"""Tests for gate-routing helpers in :mod:`pepsy.gates`."""
+"""Tests for gate-routing helpers in :mod:`pepsy.operators.gates`."""
 
+import builtins
+import sys
 import warnings
 
 import numpy as np
@@ -7,13 +9,14 @@ import pytest
 import quimb.tensor as qtn
 
 from pepsy import ps_to_peps
-from pepsy.gates import (
+from pepsy.operators.gates import (
     build_mpo_from_gates,
     build_pepo_from_gates,
     gate as apply_gate,
     gen_long_range_swap_path_2d,
     gen_long_range_swap_path_3d,
     pauli,
+    renorm_gauge,
     x,
     y,
     z,
@@ -211,8 +214,8 @@ def test_gate_dispatches_to_1d_for_mps_two_site_where(monkeypatch):
         calls.append(("2d", where, kwargs.get("contract")))
         return tn
 
-    monkeypatch.setattr("pepsy.gates._apply_gate_1d", _fake_gate_tn_1d)
-    monkeypatch.setattr("pepsy.gates._apply_gate_2d", _fake_gate_tn_2d)
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_1d", _fake_gate_tn_1d)
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_2d", _fake_gate_tn_2d)
 
     mps = qtn.MPS_computational_state("0000", dtype=np.complex128)
     G = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
@@ -265,7 +268,7 @@ def test_gate_sequence_dispatches_to_bulk_helpers(monkeypatch, dim):
         calls.append((tn_i, G_arg, where, kwargs.get("contract"), "inplace" in kwargs))
         return tn_i
 
-    monkeypatch.setattr(f"pepsy.gates.{helper_name}", _fake_bulk_helper)
+    monkeypatch.setattr(f"pepsy.operators.gates.{helper_name}", _fake_bulk_helper)
 
     gate_pairs = list(zip(gates, where))
     out = apply_gate(tn, gate_pairs, contract=contract)
@@ -318,7 +321,7 @@ def test_gate_sequence_dispatch_inplace_false_copies(monkeypatch, dim):
         calls.append((tn_i, G_arg, where, "inplace" in kwargs))
         return tn_i
 
-    monkeypatch.setattr(f"pepsy.gates.{helper_name}", _fake_bulk_helper)
+    monkeypatch.setattr(f"pepsy.operators.gates.{helper_name}", _fake_bulk_helper)
 
     gate_pairs = list(zip(gates, where))
     out = apply_gate(tn, gate_pairs, inplace=False)
@@ -446,8 +449,8 @@ def test_gate_dispatches_to_2d_for_peps_ambiguous_two_int_where(monkeypatch):
         calls.append(("2d", where, kwargs.get("contract")))
         return tn
 
-    monkeypatch.setattr("pepsy.gates._apply_gate_1d", _fake_gate_tn_1d)
-    monkeypatch.setattr("pepsy.gates._apply_gate_2d", _fake_gate_tn_2d)
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_1d", _fake_gate_tn_1d)
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_2d", _fake_gate_tn_2d)
 
     peps = ps_to_peps(2, 2, dtype="complex128")
     G = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
@@ -504,7 +507,7 @@ def test_gate_3d_dispatch_supports_inplace_false(monkeypatch):
         calls.append(("3d", where, kwargs.get("contract"), "inplace" in kwargs))
         return tn
 
-    monkeypatch.setattr("pepsy.gates._apply_gate_3d", _fake_gate_tn_3d)
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_3d", _fake_gate_tn_3d)
 
     tn = _Dummy3DTN()
     G = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
@@ -562,7 +565,7 @@ def test_gate_1d_general_tn_without_l_uses_gate_inds(monkeypatch):
         raise AssertionError("gate should not be used for TNs without L.")
 
     monkeypatch.setattr(qtn, "tensor_network_gate_inds", _fake_gate_inds)
-    monkeypatch.setattr("pepsy.gates._apply_gate_1d", _fail_gate_tn_1d)
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_1d", _fail_gate_tn_1d)
 
     class _DummyTN:  # pylint: disable=too-few-public-methods
         def outer_inds(self):
@@ -1005,7 +1008,7 @@ def test_gates_tn_3d_accepts_bundled_pair_stream(monkeypatch):
         calls.append((gate, where, kwargs.get("contract")))
         return tn
 
-    monkeypatch.setattr("pepsy.gates._apply_gate_3d", _fake_gate_tn_3d)
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_3d", _fake_gate_tn_3d)
 
     class _Dummy3DTN:  # pylint: disable=too-few-public-methods
         Lx = 1
@@ -1039,3 +1042,34 @@ def test_pauli_matches_axis_helpers():
     assert np.allclose(pauli("Y"), y())
     assert np.allclose(pauli("Z"), z())
     assert np.allclose(pauli("z"), z())
+
+
+def test_renorm_gauge_does_not_import_optional_linalg_dependencies(monkeypatch):
+    """renorm_gauge should not require torch/JAX/SciPy linalg helpers."""
+    monkeypatch.delitem(sys.modules, "pepsy.backends.linalg", raising=False)
+    original_import = builtins.__import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if (
+            name == "torch"
+            or name.startswith("torch.")
+            or name == "jax"
+            or name.startswith("jax.")
+            or name == "scipy"
+            or name.startswith("scipy.")
+        ):
+            raise ImportError(f"simulated missing dependency: {name}")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+    mps = qtn.MPS_rand_state(2, bond_dim=2, seed=11)
+    ix = next(iter(qtn.bonds(mps[mps.site_tag(0)], mps[mps.site_tag(1)])))
+    gauges = {ix: np.array([3.0, 4.0])}
+    mps.exponent = 0.0
+
+    renorm_gauge(mps, gauges, (0, 1))
+
+    assert ix in gauges
+    assert np.allclose(np.sqrt(np.mean(np.abs(gauges[ix]) ** 2)), 1.0)
+    assert mps.exponent != 0.0

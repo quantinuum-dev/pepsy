@@ -1,11 +1,11 @@
-"""Regression tests for :mod:`pepsy.ham` builders."""
+"""Regression tests for :mod:`pepsy.operators.hamiltonians` builders."""
 
 import numpy as np
 import pytest
 import quimb
 
 import pepsy as py
-from pepsy.core import OneDMap
+from pepsy.tensors.core import OneDMap
 
 
 def test_build_mpo_single_site_term_works_for_ly1():

@@ -1,9 +1,11 @@
 """Tests for PEPS BP importance sampling helpers."""
 
+import numpy as np
 import pytest
+import quimb.tensor as qtn
 
 import pepsy
-from pepsy import sampler as sampler_mod
+from pepsy.sampling import samplers as sampler_mod
 
 
 class DummyTN:
@@ -106,3 +108,41 @@ def test_sampler_public_exports_resolve():
     """Sampler helpers should be available from the package namespace."""
     assert pepsy.PepsBpSampler is sampler_mod.PepsBpSampler
     assert pepsy.PEPSSampleResult is sampler_mod.PEPSSampleResult
+
+
+def test_mps_sampler_rejects_incomplete_site_map():
+    """MPS sampler should fail at construction for incomplete site maps."""
+    psi = qtn.MPS_computational_state("00")
+    with pytest.raises(ValueError, match="consecutive site indices"):
+        sampler_mod.MpsSampler(psi, {0: (0, 0)})
+
+
+def test_mps_sampler_rejects_bad_coordinates():
+    """MPS sampler should require 2D integer coordinates."""
+    psi = qtn.MPS_computational_state("0")
+    with pytest.raises(TypeError, match="integer tuples"):
+        sampler_mod.MpsSampler(psi, {0: (0.0, 0)})
+
+
+def test_vec_sampler_rejects_invalid_vector_size():
+    """Dense vector length must match the site-map Hilbert-space dimension."""
+    with pytest.raises(ValueError, match=r"2\*\*L=4"):
+        sampler_mod.VecSampler([1.0, 0.0, 0.0], {0: (0, 0), 1: (1, 0)})
+
+
+def test_vec_sampler_rejects_zero_norm_state():
+    """Zero vectors are not valid probability distributions."""
+    with pytest.raises(ValueError, match="non-zero norm"):
+        sampler_mod.VecSampler(np.zeros(4), {0: (0, 0), 1: (1, 0)})
+
+
+def test_vec_sampler_samples_valid_dense_state():
+    """Dense sampler should still produce 1D configs and 2D grids."""
+    result = sampler_mod.VecSampler(
+        np.array([0.0, 0.0, 1.0, 0.0]),
+        {0: (0, 0), 1: (1, 0)},
+    ).sample(2, seed=1)
+
+    assert result.configs_1d == [[1, 0], [1, 0]]
+    assert all(np.array_equal(grid, np.array([[1, 0]])) for grid in result.configs_2d)
+    assert result.probs == [1.0, 1.0]

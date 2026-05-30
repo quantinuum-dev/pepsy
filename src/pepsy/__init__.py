@@ -9,154 +9,143 @@ try:
 except PackageNotFoundError:
     __version__ = "0+unknown"
 
-if TYPE_CHECKING:
-    from . import (
-        boundary_metrics,
-        boundary_states,
-        boundary_sweeps,
-        core,
-        fit,
-        ft_solver,
-        gates,
-        ham,
-        gradient_solver,
-        optimize_global,
-        optimize_sweep,
-        optimize_energy,
-        optimize_mpo,
-        sampler,
-    )
-    from .boundary_metrics import (
-        BoundaryContractResult,
-        contract_boundary,
-        build_bra_ket,
-        infidelity,
-        normalize,
-    )
-    from .boundary_states import BdyMPS, make_numpy_array_caster
-    from .boundary_sweeps import CompBdy
-    from .core import (
-        expec_mpo,
-        get_default_array_backend,
-        get_default_grad_backend,
-        measure_obs,
-        id_to_mpo,
-        id_to_pepo,
-        ps_to_peps,
-        ps_to_mps,
-        ps_to_pepo,
-        ps_to_mpo,
-        random_haar_qubit,
-        hrps_to_peps,
-        hrps_to_mps,
-        register_torch_linalg,
-        reset_default_backends,
-        set_default_array_backend,
-        set_default_grad_backend,
-        tns_align,
-    )
-    from .fit import FIT
-    from .gates import (
-        gate,
-        gate_simple,
-        renorm_gauge,
-        build_pepo_from_gates,
-        build_mpo_from_gates,
-        pauli,
-        x,
-        y,
-        z,
-        s,
-        sdg,
-        t,
-        tdg,
-        h,
-        hadamard,
-        cnot,
-        cx,
-        cy,
-        cz,
-        swap,
-        iswap,
-        phase,
-        u1,
-        u2,
-        cphase,
-        crx,
-        cry,
-        crz,
-        cu1,
-        cu2,
-        cu3,
-        rx,
-        ry,
-        rz,
-        rxx,
-        ryy,
-        rzz,
-        u3,
-        su4,
-        fsim,
-        fsimg,
-    )
-    from .ham import (
-        ham_tn,
-    )
-    from .optimize_global import GlobalOptimizer
-    from .optimize_sweep import SweepOptimizer
-    from .optimize_energy import EnergyOptimizer
-    from .optimize_mps import MpsOptimizer
-    from .optimize_mpo import MpoOptimizer
-    from .sampler import PEPSSampleResult, PepsBpSampler
-    from .gradient_solver import FDSolver
+_MODULE_EXPORTS = {
+    "backends",
+    "boundary",
+    "fitting",
+    "operators",
+    "optimizers",
+    "sampling",
+    "solvers",
+    "tensors",
+}
+
+_SYMBOL_MODULES = {
+    "BdyMPS": ".boundary",
+    "BoundaryContractResult": ".boundary",
+    "CompBdy": ".boundary",
+    "build_bra_ket": ".boundary",
+    "contract_boundary": ".boundary",
+    "infidelity": ".boundary",
+    "make_numpy_array_caster": ".boundary",
+    "normalize": ".boundary",
+    "backend_cupy": ".backends",
+    "backend_jax": ".backends",
+    "backend_numpy": ".backends",
+    "backend_torch": ".backends",
+    "get_default_array_backend": ".backends",
+    "get_default_grad_backend": ".backends",
+    "register_torch_linalg": ".backends",
+    "reset_default_backends": ".backends",
+    "set_default_array_backend": ".backends",
+    "set_default_grad_backend": ".backends",
+    "FIT": ".fitting",
+    "internal_inds": ".fitting",
+    "build_mpo_from_gates": ".operators",
+    "build_pepo_from_gates": ".operators",
+    "cnot": ".operators",
+    "cphase": ".operators",
+    "crx": ".operators",
+    "cry": ".operators",
+    "crz": ".operators",
+    "cu1": ".operators",
+    "cu2": ".operators",
+    "cu3": ".operators",
+    "cx": ".operators",
+    "cy": ".operators",
+    "cz": ".operators",
+    "fsim": ".operators",
+    "fsimg": ".operators",
+    "gate": ".operators",
+    "gate_simple": ".operators",
+    "h": ".operators",
+    "hadamard": ".operators",
+    "ham_tn": ".operators",
+    "iswap": ".operators",
+    "pauli": ".operators",
+    "phase": ".operators",
+    "renorm_gauge": ".operators",
+    "rx": ".operators",
+    "rxx": ".operators",
+    "ry": ".operators",
+    "ryy": ".operators",
+    "rz": ".operators",
+    "rzz": ".operators",
+    "s": ".operators",
+    "sdg": ".operators",
+    "su4": ".operators",
+    "swap": ".operators",
+    "t": ".operators",
+    "tdg": ".operators",
+    "u1": ".operators",
+    "u2": ".operators",
+    "u3": ".operators",
+    "x": ".operators",
+    "y": ".operators",
+    "z": ".operators",
+    "EnergyOptimizer": ".optimizers",
+    "GlobalOptimizer": ".optimizers",
+    "MpoOptimizer": ".optimizers",
+    "MpsOptimizer": ".optimizers",
+    "SweepOptimizer": ".optimizers",
+    "MpsSampleResult": ".sampling",
+    "MpsSampler": ".sampling",
+    "PEPSSampleResult": ".sampling",
+    "PepsBpSampler": ".sampling",
+    "VecSampler": ".sampling",
+    "FDSolver": ".solvers",
+    "GradSolverResult": ".solvers",
+    "GradientOptimizer": ".solvers",
+    "SUPPORTED_SOLVERS": ".solvers",
+    "optimize_packed_params": ".solvers",
+    "OneDMap": ".tensors",
+    "add_cycle": ".tensors",
+    "build_compressed_optimizer": ".tensors",
+    "build_optimizer": ".tensors",
+    "contract_hypercompressed_tn": ".tensors",
+    "expec_mpo": ".tensors",
+    "hrps_to_mps": ".tensors",
+    "hrps_to_peps": ".tensors",
+    "id_to_mpo": ".tensors",
+    "id_to_pepo": ".tensors",
+    "measure_obs": ".tensors",
+    "ps_to_mpo": ".tensors",
+    "ps_to_mps": ".tensors",
+    "ps_to_pepo": ".tensors",
+    "ps_to_peps": ".tensors",
+    "random_haar_qubit": ".tensors",
+    "tns_align": ".tensors",
+    "validate_tensor_network_tags": ".tensors",
+}
 
 __all__ = [
     "__version__",
+    "backends",
+    "boundary",
+    "fitting",
+    "operators",
+    "optimizers",
+    "sampling",
+    "solvers",
+    "tensors",
     "BdyMPS",
-    "CompBdy",
     "BoundaryContractResult",
-    "contract_boundary",
+    "CompBdy",
     "build_bra_ket",
-    "normalize",
+    "contract_boundary",
     "infidelity",
-    "GlobalOptimizer",
-    "FIT",
     "make_numpy_array_caster",
-    "set_default_array_backend",
+    "normalize",
     "get_default_array_backend",
-    "set_default_grad_backend",
     "get_default_grad_backend",
     "register_torch_linalg",
     "reset_default_backends",
-    "SweepOptimizer",
-    "FDSolver",
-    "EnergyOptimizer",
-    "tns_align",
-    "measure_obs",
-    "gate",
-    "gate_simple",
-    "renorm_gauge",
-    "build_pepo_from_gates",
+    "set_default_array_backend",
+    "set_default_grad_backend",
+    "FIT",
     "build_mpo_from_gates",
-    "pauli",
-    "x",
-    "y",
-    "z",
-    "s",
-    "sdg",
-    "t",
-    "tdg",
-    "h",
-    "hadamard",
+    "build_pepo_from_gates",
     "cnot",
-    "cx",
-    "cy",
-    "cz",
-    "swap",
-    "iswap",
-    "phase",
-    "u1",
-    "u2",
     "cphase",
     "crx",
     "cry",
@@ -164,371 +153,155 @@ __all__ = [
     "cu1",
     "cu2",
     "cu3",
-    "rx",
-    "ry",
-    "rz",
-    "rxx",
-    "ryy",
-    "rzz",
-    "u3",
-    "su4",
+    "cx",
+    "cy",
+    "cz",
     "fsim",
     "fsimg",
+    "gate",
+    "gate_simple",
+    "h",
+    "hadamard",
     "ham_tn",
-    "expec_mpo",
-    "id_to_mpo",
-    "id_to_pepo",
-    "ps_to_peps",
-    "ps_to_mps",
-    "ps_to_pepo",
-    "ps_to_mpo",
-    "random_haar_qubit",
-    "hrps_to_peps",
-    "hrps_to_mps",
-    "optimize_global",
-    "optimize_sweep",
-    "optimize_energy",
-    "optimize_mps",
-    "optimize_mpo",
-    "gradient_solver",
-    "ft_solver",
-    "ham",
-    "boundary_metrics",
-    "boundary_states",
-    "boundary_sweeps",
-    "core",
-    "fit",
-    "MpsOptimizer",
+    "iswap",
+    "pauli",
+    "phase",
+    "renorm_gauge",
+    "rx",
+    "rxx",
+    "ry",
+    "ryy",
+    "rz",
+    "rzz",
+    "s",
+    "sdg",
+    "su4",
+    "swap",
+    "t",
+    "tdg",
+    "u1",
+    "u2",
+    "u3",
+    "x",
+    "y",
+    "z",
+    "EnergyOptimizer",
+    "GlobalOptimizer",
     "MpoOptimizer",
-    "MpsSampler",
+    "MpsOptimizer",
+    "SweepOptimizer",
     "MpsSampleResult",
-    "VecSampler",
+    "MpsSampler",
     "PEPSSampleResult",
     "PepsBpSampler",
-    "sampler",
+    "VecSampler",
+    "FDSolver",
+    "OneDMap",
+    "expec_mpo",
+    "hrps_to_mps",
+    "hrps_to_peps",
+    "id_to_mpo",
+    "id_to_pepo",
+    "measure_obs",
+    "ps_to_mpo",
+    "ps_to_mps",
+    "ps_to_pepo",
+    "ps_to_peps",
+    "random_haar_qubit",
+    "tns_align",
 ]
 
 
 def __getattr__(name):
-    """Lazily import public API symbols and common submodules."""
-    if name in (
-        "boundary_metrics",
-        "boundary_states",
-        "boundary_sweeps",
-        "ham",
-        "gradient_solver",
-        "ft_solver",
-        "optimize_mps",
-        "optimize_global",
-        "optimize_sweep",
-        "optimize_energy",
-        "optimize_mpo",
-        "sampler",
-        "core",
-        "fit",
-    ):
+    """Lazily import public API symbols and new package namespaces."""
+    if name in _MODULE_EXPORTS:
         return import_module(f".{name}", __name__)
-
-    if name in (
-        "contract_boundary",
-        "build_bra_ket",
-        "BoundaryContractResult",
-        "normalize",
-        "infidelity",
-    ):
-        from .boundary_metrics import (  # pylint: disable=import-outside-toplevel
-            BoundaryContractResult,
-            contract_boundary,
-            build_bra_ket,
-            infidelity,
-            normalize,
-        )
-
-        return {
-            "BoundaryContractResult": BoundaryContractResult,
-            "contract_boundary": contract_boundary,
-            "build_bra_ket": build_bra_ket,
-            "infidelity": infidelity,
-            "normalize": normalize,
-        }[name]
-
-    if name == "GlobalOptimizer":
-        from .optimize_global import GlobalOptimizer  # pylint: disable=import-outside-toplevel
-
-        return GlobalOptimizer
-
-    if name == "FIT":
-        from .fit import FIT  # pylint: disable=import-outside-toplevel
-
-        return FIT
-
-    if name == "gate":
-        from .gates import gate as _gate_fn  # pylint: disable=import-outside-toplevel
-
-        return _gate_fn
-
-    if name == "gate_simple":
-        from .gates import gate_simple as _gate_simple_fn  # pylint: disable=import-outside-toplevel
-
-        return _gate_simple_fn
-
-    if name in (
-        "build_pepo_from_gates",
-        "build_mpo_from_gates",
-        "pauli",
-        "x",
-        "y",
-        "z",
-        "s",
-        "sdg",
-        "t",
-        "tdg",
-        "h",
-        "hadamard",
-        "cnot",
-        "cx",
-        "cy",
-        "cz",
-        "swap",
-        "iswap",
-        "phase",
-        "u1",
-        "u2",
-        "cphase",
-        "crx",
-        "cry",
-        "crz",
-        "cu1",
-        "cu2",
-        "cu3",
-        "rx",
-        "ry",
-        "rz",
-        "rxx",
-        "ryy",
-        "rzz",
-        "u3",
-        "su4",
-        "fsim",
-        "fsimg",
-        "renorm_gauge",
-    ):
-        from .gates import (  # pylint: disable=import-outside-toplevel
-            build_pepo_from_gates,
-            build_mpo_from_gates,
-            pauli,
-            x,
-            y,
-            z,
-            s,
-            sdg,
-            t,
-            tdg,
-            h,
-            hadamard,
-            cnot,
-            cx,
-            cy,
-            cz,
-            swap,
-            iswap,
-            phase,
-            u1,
-            u2,
-            cphase,
-            crx,
-            cry,
-            crz,
-            cu1,
-            cu2,
-            cu3,
-            rx,
-            ry,
-            rz,
-            rxx,
-            ryy,
-            rzz,
-            u3,
-            su4,
-            fsim,
-            fsimg,
-            renorm_gauge,
-        )
-
-        return {
-            "build_pepo_from_gates": build_pepo_from_gates,
-            "build_mpo_from_gates": build_mpo_from_gates,
-            "pauli": pauli,
-            "x": x,
-            "y": y,
-            "z": z,
-            "s": s,
-            "sdg": sdg,
-            "t": t,
-            "tdg": tdg,
-            "h": h,
-            "hadamard": hadamard,
-            "cnot": cnot,
-            "cx": cx,
-            "cy": cy,
-            "cz": cz,
-            "swap": swap,
-            "iswap": iswap,
-            "phase": phase,
-            "u1": u1,
-            "u2": u2,
-            "cphase": cphase,
-            "crx": crx,
-            "cry": cry,
-            "crz": crz,
-            "cu1": cu1,
-            "cu2": cu2,
-            "cu3": cu3,
-            "rx": rx,
-            "ry": ry,
-            "rz": rz,
-            "rxx": rxx,
-            "ryy": ryy,
-            "rzz": rzz,
-            "u3": u3,
-            "su4": su4,
-            "fsim": fsim,
-            "fsimg": fsimg,
-            "renorm_gauge": renorm_gauge,
-        }[name]
-
-    if name == "ham_tn":
-        from .ham import ham_tn  # pylint: disable=import-outside-toplevel
-
-        return ham_tn
-
-    if name in (
-        "tns_align",
-        "measure_obs",
-        "expec_mpo",
-        "id_to_mpo",
-        "id_to_pepo",
-        "ps_to_peps",
-        "ps_to_mps",
-        "ps_to_pepo",
-        "ps_to_mpo",
-        "random_haar_qubit",
-        "hrps_to_peps",
-        "hrps_to_mps",
-    ):
-        from .core import (  # pylint: disable=import-outside-toplevel
-            expec_mpo,
-            measure_obs,
-            id_to_mpo,
-            id_to_pepo,
-            ps_to_peps,
-            ps_to_mps,
-            ps_to_pepo,
-            ps_to_mpo,
-            random_haar_qubit,
-            hrps_to_peps,
-            hrps_to_mps,
-            tns_align,
-        )
-
-        return {
-            "tns_align": tns_align,
-            "measure_obs": measure_obs,
-            "expec_mpo": expec_mpo,
-            "id_to_mpo": id_to_mpo,
-            "id_to_pepo": id_to_pepo,
-            "ps_to_peps": ps_to_peps,
-            "ps_to_mps": ps_to_mps,
-            "ps_to_pepo": ps_to_pepo,
-            "ps_to_mpo": ps_to_mpo,
-            "random_haar_qubit": random_haar_qubit,
-            "hrps_to_peps": hrps_to_peps,
-            "hrps_to_mps": hrps_to_mps,
-        }[name]
-
-    if name in ("BdyMPS", "make_numpy_array_caster"):
-        from .boundary_states import (  # pylint: disable=import-outside-toplevel
-            BdyMPS,
-            make_numpy_array_caster,
-        )
-
-        return {
-            "BdyMPS": BdyMPS,
-            "make_numpy_array_caster": make_numpy_array_caster,
-        }[name]
-
-    if name in (
-        "set_default_array_backend",
-        "get_default_array_backend",
-        "set_default_grad_backend",
-        "get_default_grad_backend",
-        "register_torch_linalg",
-        "reset_default_backends",
-    ):
-        from .core import (  # pylint: disable=import-outside-toplevel
-            get_default_array_backend,
-            get_default_grad_backend,
-            register_torch_linalg,
-            reset_default_backends,
-            set_default_array_backend,
-            set_default_grad_backend,
-        )
-
-        return {
-            "set_default_array_backend": set_default_array_backend,
-            "get_default_array_backend": get_default_array_backend,
-            "set_default_grad_backend": set_default_grad_backend,
-            "get_default_grad_backend": get_default_grad_backend,
-            "register_torch_linalg": register_torch_linalg,
-            "reset_default_backends": reset_default_backends,
-        }[name]
-
-    if name == "CompBdy":
-        from .boundary_sweeps import CompBdy  # pylint: disable=import-outside-toplevel
-
-        return CompBdy
-
-    if name == "SweepOptimizer":
-        from .optimize_sweep import SweepOptimizer  # pylint: disable=import-outside-toplevel
-
-        return SweepOptimizer
-
-    if name == "FDSolver":
-        from .gradient_solver import FDSolver  # pylint: disable=import-outside-toplevel
-
-        return FDSolver
-
-    if name == "EnergyOptimizer":
-        from .optimize_energy import EnergyOptimizer  # pylint: disable=import-outside-toplevel
-
-        return EnergyOptimizer
-
-    if name == "MpsOptimizer":
-        from .optimize_mps import MpsOptimizer  # pylint: disable=import-outside-toplevel
-
-        return MpsOptimizer
-
-    if name == "MpoOptimizer":
-        from .optimize_mpo import MpoOptimizer  # pylint: disable=import-outside-toplevel
-
-        return MpoOptimizer
-
-    if name in ("PEPSSampleResult", "PepsBpSampler", "MpsSampler", "MpsSampleResult", "VecSampler"):
-        from .sampler import (  # pylint: disable=import-outside-toplevel
-            PEPSSampleResult,
-            PepsBpSampler,
-            MpsSampler,
-            MpsSampleResult,
-            VecSampler,
-        )
-
-        return {
-            "PEPSSampleResult": PEPSSampleResult,
-            "PepsBpSampler": PepsBpSampler,
-            "MpsSampler": MpsSampler,
-            "MpsSampleResult": MpsSampleResult,
-            "VecSampler": VecSampler,
-        }[name]
-
+    if name in _SYMBOL_MODULES:
+        module = import_module(_SYMBOL_MODULES[name], __name__)
+        return getattr(module, name)
     raise AttributeError(f"module 'pepsy' has no attribute {name!r}")
 
+
+if TYPE_CHECKING:
+    from . import backends, boundary, fitting, operators, optimizers, sampling, solvers, tensors
+    from .backends import (
+        get_default_array_backend,
+        get_default_grad_backend,
+        register_torch_linalg,
+        reset_default_backends,
+        set_default_array_backend,
+        set_default_grad_backend,
+    )
+    from .boundary import (
+        BdyMPS,
+        BoundaryContractResult,
+        CompBdy,
+        build_bra_ket,
+        contract_boundary,
+        infidelity,
+        make_numpy_array_caster,
+        normalize,
+    )
+    from .fitting import FIT
+    from .operators import (
+        build_mpo_from_gates,
+        build_pepo_from_gates,
+        cnot,
+        cphase,
+        crx,
+        cry,
+        crz,
+        cu1,
+        cu2,
+        cu3,
+        cx,
+        cy,
+        cz,
+        fsim,
+        fsimg,
+        gate,
+        gate_simple,
+        h,
+        hadamard,
+        ham_tn,
+        iswap,
+        pauli,
+        phase,
+        renorm_gauge,
+        rx,
+        rxx,
+        ry,
+        ryy,
+        rz,
+        rzz,
+        s,
+        sdg,
+        su4,
+        swap,
+        t,
+        tdg,
+        u1,
+        u2,
+        u3,
+        x,
+        y,
+        z,
+    )
+    from .optimizers import EnergyOptimizer, GlobalOptimizer, MpoOptimizer, MpsOptimizer, SweepOptimizer
+    from .sampling import MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, VecSampler
+    from .solvers import FDSolver
+    from .tensors import (
+        OneDMap,
+        expec_mpo,
+        hrps_to_mps,
+        hrps_to_peps,
+        id_to_mpo,
+        id_to_pepo,
+        measure_obs,
+        ps_to_mpo,
+        ps_to_mps,
+        ps_to_pepo,
+        ps_to_peps,
+        random_haar_qubit,
+        tns_align,
+    )

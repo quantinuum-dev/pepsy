@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,13 +11,21 @@ sys.path.insert(0, str(ROOT / "src"))
 # Avoid numba cache-path issues when importing quimb-dependent modules in docs builds.
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp")
 os.environ.setdefault("PYTHONPYCACHEPREFIX", "/tmp")
+os.environ.setdefault("MPLCONFIGDIR", "/tmp")
 
 project = "pepsy"
 author = "pepsy contributors"
 
-from importlib.metadata import version as _pkg_version  # noqa: E402
+from importlib.metadata import PackageNotFoundError, version as _pkg_version  # noqa: E402
 
-release = _pkg_version("pepsy")
+try:
+    release = _pkg_version("pepsy")
+except PackageNotFoundError:
+    pyproject = (ROOT / "pyproject.toml").read_text()
+    match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.MULTILINE)
+    if match is None:
+        raise
+    release = match.group(1)
 version = release
 
 extensions = [

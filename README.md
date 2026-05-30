@@ -8,17 +8,15 @@ Current package version: `0.1.1` (from `pyproject.toml` / `pepsy.__version__`).
 
 ## Package Layout
 - `src/pepsy/`: installable library code
-  - `boundary_states.py`: boundary state initialization (`BdyMPS`)
-  - `boundary_sweeps.py`: sweep/contraction runner (`CompBdy`)
-  - `boundary_metrics.py`: input preparation + contraction (`build_bra_ket`, `contract_boundary`, `BoundaryContractResult`)
-  - `gates.py`: gate application (`gate`, `gate_simple`, `renorm_gauge`) with long-range SWAP routing
-  - `core.py`: lattice maps (`OneDMap`), state/MPO/PEPO builders, backend defaults
-  - `ham.py`: Hamiltonian helpers
-  - `optimize_sweep.py`, `optimize_global.py`, `optimize_energy.py`: optimizers
-  - `optimize_mps.py`, `optimize_mpo.py`: `MpsOptimizer`, `MpoOptimizer`
-  - `gradient_solver.py`, `ft_solver.py`: gradient-based and FT/FD solvers
-  - `sampler.py`: `MpsSampler` and related sampling utilities
-  - `fit.py`, `_backend_utils.py`, `_backend_linalg.py`, `_backend_linalg_torch.py`, `_backend_linalg_jax.py`
+  - `backends/`: backend selection, conversion, and linear algebra registration
+  - `tensors/`: lattice maps (`OneDMap`), state/MPO/PEPO builders, contraction helpers
+  - `operators/`: gates, gate application, MPO/PEPO builders, and Hamiltonian helpers
+  - `boundary/`: boundary state initialization (`BdyMPS`), sweeps (`CompBdy`), and metrics
+  - `solvers/`: gradient-based and finite-difference solvers
+  - `fitting/`: local tensor fitting routines (`FIT`)
+  - `optimizers/`: sweep, global, energy, MPS, and MPO optimizers
+  - `sampling/`: `MpsSampler` and related sampling utilities
+  - `_internal/`: private formatting and utility helpers
 - `examples/`: runnable examples (e.g. `MpsMagnetization/` 2D ITF Trotter MPS evolution)
 - `docs/`: Sphinx documentation source
 - `tests/`: package tests

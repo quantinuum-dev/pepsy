@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 torch = pytest.importorskip("torch")
 
-from pepsy.gradient_solver import FDSolver, GradientOptimizer, SUPPORTED_SOLVERS
-from pepsy.optimize_sweep import SweepOptimizer
+from pepsy.solvers.gradient import FDSolver, GradientOptimizer, SUPPORTED_SOLVERS
+from pepsy.optimizers.sweep import SweepOptimizer
 
 
 def _loss_quadratic(params):

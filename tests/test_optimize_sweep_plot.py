@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import quimb.tensor as qtn
 import pytest
 
-import pepsy.optimize_sweep as sweep_mod
-from pepsy.optimize_sweep import SweepOptimizer
+import pepsy.optimizers.sweep as sweep_mod
+from pepsy.optimizers.sweep import SweepOptimizer
 
 
 def test_run_wrapper_maps_global_style_arguments(monkeypatch):
@@ -994,8 +994,8 @@ def test_set_target_rebuilds_overlap_boundary(monkeypatch):
         captured["single_layer"] = single_layer
         return SimpleNamespace(chi=chi, mps_b={"new": object()})
 
-    monkeypatch.setattr("pepsy.optimize_sweep.build_bra_ket", _fake_build_bra_ket)
-    monkeypatch.setattr("pepsy.optimize_sweep.BdyMPS", _fake_bdymps)
+    monkeypatch.setattr("pepsy.optimizers.sweep.build_bra_ket", _fake_build_bra_ket)
+    monkeypatch.setattr("pepsy.optimizers.sweep.BdyMPS", _fake_bdymps)
 
     target_new = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=7, dtype="complex128")
     SweepOptimizer.set_target(opt, target_new)

@@ -1,4 +1,4 @@
-"""Tests for :mod:`pepsy.optimize_mpo`."""
+"""Tests for :mod:`pepsy.optimizers.mpo`."""
 
 import numpy as np
 import pytest
@@ -9,11 +9,11 @@ import pepsy as py
 
 
 def test_mpo_optimizer_exported():
-    """Public API should expose MpoOptimizer and optimize_mpo module."""
+    """Public API should expose MpoOptimizer and the optimizers namespace."""
     assert "MpoOptimizer" in py.__all__
-    assert "optimize_mpo" in py.__all__
+    assert "optimizers" in py.__all__
     assert py.MpoOptimizer is not None
-    assert py.optimize_mpo is not None
+    assert py.optimizers.mpo is not None
 
 
 def test_mpo_optimizer_accepts_svd_mode():
@@ -161,7 +161,7 @@ def test_mpo_optimizer_canonicalization_state_initialized():
     cur = opt.info_c["cur_orthog"]
     assert isinstance(cur, tuple)
     assert len(cur) == 2
-    expected_m, expected_e = py.core.tn_norm(
+    expected_m, expected_e = py.tensors.tn_norm(
         mpo0, contraction_opt=opt.contraction_opt, strip_exponent=True
     )
     got_m, got_e = opt.norm_mpo
