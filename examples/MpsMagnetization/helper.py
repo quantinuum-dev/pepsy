@@ -5,6 +5,7 @@ import numpy as np
 import quimb
 import quimb.tensor as qtn
 import pepsy as py
+from pepsy.tensors import OneDMap, expec_mpo
 
 
 def build_lattice(Lx, Ly, coupling_j, field_h, cyclic=True, lattice="square", mode="hilbert"):
@@ -14,7 +15,7 @@ def build_lattice(Lx, Ly, coupling_j, field_h, cyclic=True, lattice="square", mo
     -------
     dict with keys: mpo_H, edges_1d, sites, mapper, res (full build_itf_lattice output).
     """
-    mapper = py.core.OneDMap(Lx, Ly, mode="hilbert")
+    mapper = OneDMap(Lx, Ly, mode="hilbert")
     res = py.ham_tn.build_itf_lattice(
         L_x=Lx, L_y=Ly, lattice=lattice, cyclic=cyclic,
         J=coupling_j, field=field_h,
@@ -125,17 +126,17 @@ def build_mpo_z_sq(Lx, Ly, mapper):
 
 def measure_energy(psi, mpo_H, L, optimizer):
     """<H>/L via MPO."""
-    e = py.core.expec_mpo(mpo_H, psi, contraction_opt=optimizer)
+    e = expec_mpo(mpo_H, psi, contraction_opt=optimizer)
     return float(np.real(e)) / L
 
 
 def measure_z(psi, mpo_z, optimizer):
     """<ΣZ/L> = <M> via MPO."""
-    m = py.core.expec_mpo(mpo_z, psi, contraction_opt=optimizer)
+    m = expec_mpo(mpo_z, psi, contraction_opt=optimizer)
     return float(np.real(m))
 
 
 def measure_z_sq(psi, mpo_z_sq_offdiag, diagonal_shift, optimizer):
     """<(ΣZ/L)²> = <M²> via MPO + diagonal shift."""
-    off_diag = py.core.expec_mpo(mpo_z_sq_offdiag, psi, contraction_opt=optimizer)
+    off_diag = expec_mpo(mpo_z_sq_offdiag, psi, contraction_opt=optimizer)
     return float(np.real(off_diag)) + diagonal_shift

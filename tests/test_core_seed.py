@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import autoray as ar
 import quimb as qu
-import pepsy.core as core
+import pepsy.tensors.core as core
 import pytest
 import quimb.tensor as qtn
 
@@ -253,6 +253,7 @@ def test_contract_hypercompressed_tn_builds_copt_when_missing(monkeypatch):
     assert captured["progbar"] is True
     assert out.copt == "dummy-copt"
     assert out.contract_kwargs["max_bond"] == 9
+    assert out.simplify_kwargs == {"seq": "R", "split_method": "svd", "inplace": True}
 
 
 def test_contract_hypercompressed_tn_requires_chi_if_copt_missing():
@@ -293,6 +294,70 @@ def test_contract_hypercompressed_tn_inplace_mutates_input(monkeypatch):
     assert out is tn
     assert not hasattr(tn, "copy_called")
     assert tn.contract_kwargs["max_bond"] == 5
+
+
+def test_contract_hypercompressed_tn_can_skip_full_simplify(monkeypatch):
+    """do_full_simplify=False should bypass pre-contraction simplification."""
+    monkeypatch.setattr(core, "build_compressed_optimizer", lambda **kwargs: "dummy-copt")
+
+    class DummyTN:  # pylint: disable=too-few-public-methods
+        def copy(self):
+            return DummyTN()
+
+        def full_simplify_(self, **kwargs):
+            self.simplify_kwargs = kwargs
+
+        def contraction_tree(self, copt):
+            _ = copt
+            return "dummy-tree"
+
+        def contract_compressed_(self, **kwargs):
+            self.contract_kwargs = kwargs
+
+    tn = DummyTN()
+    out = core.contract_hypercompressed_tn(
+        tn,
+        copt=None,
+        max_bond=5,
+        chi=5,
+        do_full_simplify=False,
+    )
+
+    assert out is not tn
+    assert not hasattr(out, "simplify_kwargs")
+    assert out.contract_kwargs["max_bond"] == 5
+
+
+def test_contract_hypercompressed_tn_passes_custom_seq(monkeypatch):
+    """A custom seq should be forwarded to full_simplify_."""
+    monkeypatch.setattr(core, "build_compressed_optimizer", lambda **kwargs: "dummy-copt")
+
+    class DummyTN:  # pylint: disable=too-few-public-methods
+        def copy(self):
+            return DummyTN()
+
+        def full_simplify_(self, **kwargs):
+            self.simplify_kwargs = kwargs
+
+        def contraction_tree(self, copt):
+            _ = copt
+            return "dummy-tree"
+
+        def contract_compressed_(self, **kwargs):
+            self.contract_kwargs = kwargs
+
+    tn = DummyTN()
+    out = core.contract_hypercompressed_tn(
+        tn,
+        copt=None,
+        max_bond=5,
+        chi=5,
+        seq="ADCRS",
+    )
+
+    assert out.simplify_kwargs["seq"] == "ADCRS"
+    assert out.simplify_kwargs["split_method"] == "svd"
+    assert out.simplify_kwargs["inplace"] is True
 
 
 def test_measure_obs_normalizes_when_bra_not_provided():
@@ -563,7 +628,7 @@ def test_expec_tn_1d_alias_removed():
 def test_register_torch_linalg_does_not_require_jax(monkeypatch):
     """Torch linalg registration should not import or require JAX."""
     torch = pytest.importorskip("torch")
-    monkeypatch.delitem(sys.modules, "pepsy._backend_linalg_torch", raising=False)
+    monkeypatch.delitem(sys.modules, "pepsy.backends.linalg_torch", raising=False)
 
     original_import = builtins.__import__
 
@@ -585,7 +650,7 @@ def test_register_torch_linalg_does_not_require_jax(monkeypatch):
 def test_reg_complex_svd_jax_does_not_require_torch_or_scipy(monkeypatch):
     """JAX SVD registration should not import or require torch/scipy."""
     pytest.importorskip("jax")
-    monkeypatch.delitem(sys.modules, "pepsy._backend_linalg_jax", raising=False)
+    monkeypatch.delitem(sys.modules, "pepsy.backends.linalg_jax", raising=False)
 
     original_import = builtins.__import__
 
@@ -606,7 +671,7 @@ def test_reg_complex_svd_jax_does_not_require_torch_or_scipy(monkeypatch):
 def test_safe_inverse_honors_eps_abs():
     """safe_inverse should honor caller-provided eps_abs regularization."""
     pytest.importorskip("torch")
-    from pepsy import _backend_linalg_torch as lrt  # pylint: disable=import-outside-toplevel
+    from pepsy.backends import linalg_torch as lrt  # pylint: disable=import-outside-toplevel
 
     x = lrt.torch.tensor([1.0e-8], dtype=lrt.torch.float64)
     small = lrt.safe_inverse(x, eps_abs=1.0e-12)

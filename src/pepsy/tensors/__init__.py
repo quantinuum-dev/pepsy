@@ -1,0 +1,88 @@
+"""Tensor-network maps, constructors, contractions, and validation."""
+
+from importlib import import_module
+
+from .validation import validate_tensor_network_tags
+from .core import (
+    OneDMap,
+    add_cycle,
+    backend_cupy,
+    backend_jax,
+    backend_numpy,
+    backend_torch,
+    build_compressed_optimizer,
+    build_optimizer,
+    contract_hypercompressed_tn,
+    expec_mpo,
+    get_default_array_backend,
+    get_default_grad_backend,
+    hrps_to_mps,
+    hrps_to_peps,
+    id_to_mpo,
+    id_to_pepo,
+    measure_obs,
+    ps_to_mpo,
+    ps_to_mps,
+    ps_to_pepo,
+    ps_to_peps,
+    random_haar_qubit,
+    reg_complex_svd_jax,
+    reg_complex_svd_torch,
+    reg_stop_gradient_torch,
+    register_torch_linalg,
+    reset_default_backends,
+    set_default_array_backend,
+    set_default_grad_backend,
+    stop_grad,
+    tn_fidelity,
+    tn_norm,
+    tns_align,
+)
+
+__all__ = [
+    "OneDMap",
+    "add_cycle",
+    "backend_cupy",
+    "backend_jax",
+    "backend_numpy",
+    "backend_torch",
+    "build_compressed_optimizer",
+    "build_optimizer",
+    "contract_hypercompressed_tn",
+    "expec_mpo",
+    "get_default_array_backend",
+    "get_default_grad_backend",
+    "hrps_to_mps",
+    "hrps_to_peps",
+    "id_to_mpo",
+    "id_to_pepo",
+    "measure_obs",
+    "ps_to_mpo",
+    "ps_to_mps",
+    "ps_to_pepo",
+    "ps_to_peps",
+    "random_haar_qubit",
+    "reg_complex_svd_jax",
+    "reg_complex_svd_torch",
+    "reg_stop_gradient_torch",
+    "register_torch_linalg",
+    "reset_default_backends",
+    "set_default_array_backend",
+    "set_default_grad_backend",
+    "stop_grad",
+    "tn_fidelity",
+    "tn_norm",
+    "tns_align",
+    "validate_tensor_network_tags",
+    "constructors",
+    "contractions",
+    "maps",
+    "observables",
+    "validation",
+]
+
+
+def __getattr__(name):
+    if name in {"constructors", "contractions", "maps", "observables", "validation"}:
+        return import_module(f".{name}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

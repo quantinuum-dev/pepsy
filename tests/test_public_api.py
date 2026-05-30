@@ -13,6 +13,8 @@ def test_package_version_available():
 
 
 _EXPECTED_IN_ALL = [
+    "backends", "boundary", "fitting", "operators", "optimizers",
+    "sampling", "solvers", "tensors",
     "BdyMPS", "CompBdy", "BoundaryContractResult", "contract_boundary",
     "build_bra_ket", "normalize", "infidelity", "GlobalOptimizer", "FIT",
     "tns_align", "measure_obs", "build_pepo_from_gates", "build_mpo_from_gates",
@@ -22,8 +24,7 @@ _EXPECTED_IN_ALL = [
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "ps_to_peps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "make_numpy_array_caster", "SweepOptimizer",
     "FDSolver", "MpsOptimizer", "MpoOptimizer", "PEPSSampleResult",
-    "PepsBpSampler", "optimize_global", "optimize_sweep",
-    "optimize_mps", "gate", "gradient_solver", "ft_solver", "sampler",
+    "PepsBpSampler", "MpsSampler", "MpsSampleResult", "VecSampler", "gate",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
@@ -35,7 +36,12 @@ _EXPECTED_NOT_IN_ALL = [
     "apply_2d_gates", "apply_2dtn_", "gate_2d", "gate_to_pepo", "gate_1d",
     "canonize_mps", "apply_gates_", "expec_TN_1D", "peps_I",
     "reg_complex_svd_torch", "reg_complex_svd_jax",
+    "reg_stop_gradient_torch", "stop_grad",
     "MPSOptimizer", "MPOOptimizer",
+    "boundary_metrics", "boundary_states", "boundary_sweeps", "core", "fit",
+    "ft_solver", "gates", "gradient_solver", "ham", "optimize_energy",
+    "optimize_global", "optimize_mpo", "optimize_mps", "optimize_sweep",
+    "sampler",
 ]
 
 
@@ -63,19 +69,23 @@ _CALLABLE_EXPORTS = [
     "FDSolver", "MpsOptimizer", "MpoOptimizer", "PEPSSampleResult", "PepsBpSampler",
 ]
 
-_BLOCKED_NAMES = [
-    "norm_peps", "normalize_peps", "loss_peps", "PEPSGlobalOptimizer",
-    "gen_long_range_swap_path", "tn_norm", "tn_fidelity",
-    "gen_long_range_swap_path_1d", "gen_long_range_swap_path_2d",
-    "gen_long_range_swap_path_3d", "gate_tn_1d", "gate_tn_2d", "gate_tn_3d",
-    "gates_tn_1d", "gates_tn_2d", "gates_tn_3d", "apply_2d_gate",
-    "apply_2d_gates", "apply_2dtn_", "gate_2d", "gate_to_pepo", "gate_1d",
-    "canonize_mps", "apply_gates_", "expec_TN_1D", "peps_I",
-    "reg_complex_svd_torch", "reg_complex_svd_jax",
-    "MPSOptimizer", "MPOOptimizer",
+_BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
+
+_MODULE_EXPORTS = [
+    "backends", "boundary", "fitting", "operators", "optimizers",
+    "sampling", "solvers", "tensors",
 ]
 
-_MODULE_EXPORTS = ["optimize_global", "optimize_sweep", "optimize_mps", "gate", "gradient_solver", "ft_solver", "sampler"]
+
+def test_all_exports_are_unique():
+    """Public export list should not contain duplicate names."""
+    assert len(pepsy.__all__) == len(set(pepsy.__all__))
+
+
+@pytest.mark.parametrize("name", pepsy.__all__)
+def test_all_exports_resolve(name):
+    """Every advertised public export should resolve."""
+    assert getattr(pepsy, name) is not None
 
 
 @pytest.mark.parametrize("name", _CALLABLE_EXPORTS)
@@ -98,10 +108,23 @@ def test_module_export_resolves(name):
 
 
 def test_optional_linalg_registrations_resolve():
-    """Linalg registrations are exposed under pepsy.core only."""
+    """Linalg registrations are exposed under tensor namespaces, not top-level pepsy."""
     has_torch = importlib.util.find_spec("torch") is not None
     has_jax = importlib.util.find_spec("jax") is not None
+    assert callable(pepsy.tensors.core.reg_stop_gradient_torch)
+    assert callable(pepsy.tensors.core.stop_grad)
+    assert callable(pepsy.tensors.reg_stop_gradient_torch)
+    assert callable(pepsy.tensors.stop_grad)
     if has_torch:
-        assert callable(pepsy.core.reg_complex_svd_torch)
+        import torch
+
+        assert callable(pepsy.tensors.core.reg_complex_svd_torch)
+        assert callable(pepsy.tensors.reg_complex_svd_torch)
+        x = torch.tensor([1.0], dtype=torch.float64, requires_grad=True)
+        y = pepsy.tensors.stop_grad(x)
+        assert not y.requires_grad
+        assert y is not x
+        assert y.data_ptr() != x.data_ptr()
     if has_jax:
-        assert callable(pepsy.core.reg_complex_svd_jax)
+        assert callable(pepsy.tensors.core.reg_complex_svd_jax)
+        assert callable(pepsy.tensors.reg_complex_svd_jax)

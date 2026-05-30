@@ -5,7 +5,6 @@ import numpy as np
 import pepsy
 import pytest
 import quimb.tensor as qtn
-from pepsy import core
 
 
 def test_validate_tensor_network_tags_requires_i_tags():
@@ -13,14 +12,14 @@ def test_validate_tensor_network_tags_requires_i_tags():
     dummy = type("DummyTN", (), {"tags": {"X0", "Y0"}})()
 
     with pytest.raises(ValueError, match=r"X\*, Y\*, and I\*"):
-        pepsy.boundary_metrics.validate_tensor_network_tags(dummy)
+        pepsy.boundary.metrics.validate_tensor_network_tags(dummy)
 
 
 def test_validate_tensor_network_tags_accepts_multi_index_i_tag():
     """Validator should accept I tags like I2, I3,4, or I2,3,4."""
     dummy = type("DummyTN", (), {"tags": {"X2", "Y3", "I2,3,4"}})()
 
-    pepsy.boundary_metrics.validate_tensor_network_tags(dummy)
+    pepsy.boundary.metrics.validate_tensor_network_tags(dummy)
 
 
 def test_build_bra_ket_uses_readable_bra_reindex_suffix():
@@ -65,6 +64,20 @@ def test_build_bra_ket_reindexes_user_bra_with_colliding_indices():
     # After reindex the norm network should have no inner-index collisions
     # and should contract to a scalar (all physical outer indices shared).
     assert norm is not None
+
+
+def test_build_bra_ket_removes_stale_layer_tags_from_overlap():
+    """Repeated norm/overlap builds should keep KET and BRA layers distinct."""
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=14, dtype="complex128")
+    target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=15, dtype="complex128")
+
+    pepsy.build_bra_ket(ket=ket)
+    pepsy.build_bra_ket(ket=target)
+    _, overlap = pepsy.build_bra_ket(ket=ket, bra=target)
+
+    assert len(overlap.select("KET").tensor_map) == len(ket.tensor_map)
+    assert len(overlap.select("BRA").tensor_map) == len(target.tensor_map)
+    assert len(overlap.select(["KET", "BRA"], which="all").tensor_map) == 0
 
 
 def test_bdymps_initializes_xy_boundaries():
@@ -302,9 +315,9 @@ def test_compbdy_fidelity_history_resets_each_run(monkeypatch):
     )
     comp = pepsy.CompBdy(norm_tagged, bdy.mps_b)
 
-    monkeypatch.setattr(pepsy.boundary_sweeps, "tn_fidelity", lambda _tn, _p, **kwargs: 0.5)
+    monkeypatch.setattr(pepsy.boundary.sweeps, "tn_fidelity", lambda _tn, _p, **kwargs: 0.5)
     monkeypatch.setattr(
-        pepsy.boundary_sweeps.CompBdy,
+        pepsy.boundary.sweeps.CompBdy,
         "_run_fit_solver",
         lambda self, fit, boundary_mps: None,
     )
@@ -334,8 +347,8 @@ def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
     def fake_run_eff(self, n_iter=6, verbose=False):
         run_eff_verbose_args.append(verbose)
 
-    monkeypatch.setattr(pepsy.boundary_sweeps.FIT, "run_eff", fake_run_eff)
-    monkeypatch.setattr(pepsy.boundary_sweeps, "tn_fidelity", lambda _tn, _p, **kwargs: 0.5)
+    monkeypatch.setattr(pepsy.boundary.sweeps.FIT, "run_eff", fake_run_eff)
+    monkeypatch.setattr(pepsy.boundary.sweeps, "tn_fidelity", lambda _tn, _p, **kwargs: 0.5)
 
     comp.run(direction="y", track_boundary_fidelity=True, progress=False, n_iter=1, max_separation=0)
 
@@ -361,7 +374,7 @@ def test_contract_boundary_default_returns_structured_result(monkeypatch):
         def run(self, **_kwargs):
             return 12.5
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "CompBdy", _FakeCompBdy)
+    monkeypatch.setattr(pepsy.boundary.metrics, "CompBdy", _FakeCompBdy)
     out = pepsy.contract_boundary(norm=_DummyNorm(), bdy={"bdy": type("B", (), {"mps_b": {}})()})
     assert isinstance(out, pepsy.BoundaryContractResult)
     assert out.cost == 12.5
@@ -378,7 +391,7 @@ def test_contract_boundary_includes_requested_metadata(monkeypatch):
         def run(self, **_kwargs):
             return 12.5
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "CompBdy", _FakeCompBdy)
+    monkeypatch.setattr(pepsy.boundary.metrics, "CompBdy", _FakeCompBdy)
     out = pepsy.contract_boundary(
         norm=_DummyNorm(),
         bdy={"bdy": type("B", (), {"mps_b": {}})()},
@@ -411,7 +424,7 @@ def test_contract_boundary_accepts_bdy_object(monkeypatch):
         def __init__(self):
             self.mps_b = {"Y0_l": object()}
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "CompBdy", _FakeCompBdy)
+    monkeypatch.setattr(pepsy.boundary.metrics, "CompBdy", _FakeCompBdy)
     bdy = _BdyObj()
     out = pepsy.contract_boundary(norm=_DummyNorm(), bdy=bdy)
     assert out.cost == 3.0
@@ -434,7 +447,7 @@ def test_contract_boundary_accepts_bdy_holder_dict(monkeypatch):
         def __init__(self):
             self.mps_b = {"Y0_l": object()}
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "CompBdy", _FakeCompBdy)
+    monkeypatch.setattr(pepsy.boundary.metrics, "CompBdy", _FakeCompBdy)
     holder = {"bdy": _BdyObj()}
     out = pepsy.contract_boundary(norm=_DummyNorm(), bdy=holder)
     assert out.cost == 5.0
@@ -465,7 +478,7 @@ def test_compbdy_move_step_resets_and_updates_fidelity(monkeypatch):
             self.fidel.append(0.77 if side == "left" else 0.66)
         return None
 
-    monkeypatch.setattr(pepsy.boundary_sweeps.CompBdy, "_fit_one_step", fake_fit_one_step)
+    monkeypatch.setattr(pepsy.boundary.sweeps.CompBdy, "_fit_one_step", fake_fit_one_step)
 
     comp.move_step_bdy(pos=0, direction="y_left", track_boundary_fidelity=True)
     assert comp.fidel == [0.77]
@@ -533,14 +546,14 @@ def test_compbdy_run_progress_total_accounts_for_flat_skip(monkeypatch):
     comp = pepsy.CompBdy(_DummyNormWithTags(), {})
     _FakeTqdm.instances = []
 
-    monkeypatch.setattr(pepsy.boundary_sweeps, "tqdm", _FakeTqdm)
+    monkeypatch.setattr(pepsy.boundary.sweeps, "tqdm", _FakeTqdm)
     monkeypatch.setattr(
-        pepsy.boundary_sweeps.CompBdy,
+        pepsy.boundary.sweeps.CompBdy,
         "_fit_one_side",
         _fake_fit_one_side_with_flat_skip,
     )
     monkeypatch.setattr(
-        pepsy.boundary_sweeps.CompBdy,
+        pepsy.boundary.sweeps.CompBdy,
         "_build_final_boundary_network",
         lambda self, spec, p_previous_l, p_previous_r: _DummyFinalTN(),
     )
@@ -559,9 +572,9 @@ def test_compbdy_move_bdy_progress_total_accounts_for_flat_skip(monkeypatch):
     comp = pepsy.CompBdy(_DummyNormWithTags(), {})
     _FakeTqdm.instances = []
 
-    monkeypatch.setattr(pepsy.boundary_sweeps, "tqdm", _FakeTqdm)
+    monkeypatch.setattr(pepsy.boundary.sweeps, "tqdm", _FakeTqdm)
     monkeypatch.setattr(
-        pepsy.boundary_sweeps.CompBdy,
+        pepsy.boundary.sweeps.CompBdy,
         "_fit_one_side",
         _fake_fit_one_side_with_flat_skip,
     )
@@ -591,8 +604,8 @@ def test_compbdy_move_step_pbar_shows_current_fidelity(monkeypatch):
             self.fidel.append(0.77)
         return _DummyMPS()
 
-    monkeypatch.setattr(pepsy.boundary_sweeps, "tqdm", _FakeTqdm)
-    monkeypatch.setattr(pepsy.boundary_sweeps.CompBdy, "_fit_one_step", fake_fit_one_step)
+    monkeypatch.setattr(pepsy.boundary.sweeps, "tqdm", _FakeTqdm)
+    monkeypatch.setattr(pepsy.boundary.sweeps.CompBdy, "_fit_one_step", fake_fit_one_step)
 
     comp.move_step_bdy(pos=1, direction="y_left", track_boundary_fidelity=True, progress=True)
 
@@ -629,8 +642,8 @@ def test_normalize_returns_old_norm_and_updates_state_in_place(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "BdyMPS", fake_bdymps)
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=131, dtype="complex128")
     ket_id_before = id(ket)
@@ -670,8 +683,8 @@ def test_normalize_uses_provided_bdy_without_constructing_new_one(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "BdyMPS", fail_bdymps)
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fail_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=137, dtype="complex128")
     old_norm = pepsy.normalize(
@@ -707,8 +720,8 @@ def test_normalize_accepts_bdy_dict_and_creates_entry(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "BdyMPS", fake_bdymps)
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=147, dtype="complex128")
     bdy = {}
@@ -750,8 +763,8 @@ def test_normalize_accepts_bdy_dict_with_existing_boundary(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "BdyMPS", fail_bdymps)
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fail_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=151, dtype="complex128")
     old_norm = pepsy.normalize(
@@ -790,7 +803,7 @@ def test_normalize_expands_existing_boundary_when_chi_increases(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=157, dtype="complex128")
     bdy = {"bdy": _ExpandableBdy(4)}
@@ -832,7 +845,7 @@ def test_normalize_retunes_existing_boundary_when_chi_decreases(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=158, dtype="complex128")
     bdy = {"bdy": _RetunableBdy(12)}
@@ -885,8 +898,8 @@ def test_infidelity_accepts_bdy_holder_dicts_and_fills_missing(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "BdyMPS", fake_bdymps)
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     p = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=161, dtype="complex128")
     p_target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=163, dtype="complex128")
@@ -940,8 +953,8 @@ def test_infidelity_reuses_existing_bdy_holder_entries(monkeypatch):
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "BdyMPS", fail_bdymps)
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fail_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     p = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=167, dtype="complex128")
     p_target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=169, dtype="complex128")
@@ -991,7 +1004,7 @@ def test_infidelity_retunes_all_existing_boundaries_to_requested_chi(monkeypatch
             max_separation=kwargs["max_separation"],
         )
 
-    monkeypatch.setattr(pepsy.boundary_metrics, "contract_boundary", fake_contract_boundary)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     p = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=173, dtype="complex128")
     p_target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=179, dtype="complex128")

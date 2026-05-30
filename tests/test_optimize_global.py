@@ -1,9 +1,9 @@
-"""Smoke/behavior tests for :mod:`pepsy.optimize_global`."""
+"""Smoke/behavior tests for :mod:`pepsy.optimizers.global_opt`."""
 
 import pytest
 import quimb.tensor as qtn
 
-from pepsy.optimize_global import GlobalOptimizer
+from pepsy.optimizers.global_opt import GlobalOptimizer
 
 
 def _rand_peps(seed: int):
@@ -259,7 +259,7 @@ def test_make_tn_optimizer_normalizes_lbfgs_aliases(monkeypatch, name):
             _ = args
             called["optimizer"] = kwargs.get("optimizer")
 
-    monkeypatch.setattr("pepsy.optimize_global.qtn.TNOptimizer", _FakeTNOptimizer)
+    monkeypatch.setattr("pepsy.optimizers.global_opt.qtn.TNOptimizer", _FakeTNOptimizer)
     _ = opt.make_tn_optimizer(optimizer=name, progbar=False, loss_kwargs={"cost_f": "fid", "val_": 1.0})
     assert called["optimizer"] == "L-BFGS-B"
 
@@ -281,7 +281,7 @@ def test_global_optimizer_optimize_nlopt_forwards_args_and_updates_state(monkeyp
             called["nlopt_kwargs"] = dict(kwargs)
             return sentinel_out
 
-    monkeypatch.setattr("pepsy.optimize_global.qtn.TNOptimizer", _FakeTNOptimizer)
+    monkeypatch.setattr("pepsy.optimizers.global_opt.qtn.TNOptimizer", _FakeTNOptimizer)
     out = opt.optimize_nlopt(
         n=7,
         tol=1e-4,
@@ -327,7 +327,7 @@ def test_global_optimizer_optimize_nlopt_has_sensible_default_tolerances(monkeyp
             called["nlopt_kwargs"] = dict(kwargs)
             return sentinel_out
 
-    monkeypatch.setattr("pepsy.optimize_global.qtn.TNOptimizer", _FakeTNOptimizer)
+    monkeypatch.setattr("pepsy.optimizers.global_opt.qtn.TNOptimizer", _FakeTNOptimizer)
     out = opt.optimize_nlopt(
         n=3,
         optimizer="nlopt",
@@ -367,7 +367,7 @@ def test_global_optimizer_optimize_can_return_losses(monkeypatch):
             _ = kwargs
             return sentinel_out
 
-    monkeypatch.setattr("pepsy.optimize_global.qtn.TNOptimizer", _FakeTNOptimizer)
+    monkeypatch.setattr("pepsy.optimizers.global_opt.qtn.TNOptimizer", _FakeTNOptimizer)
     out, losses = opt.optimize(
         n=3,
         optimizer="adam",
@@ -396,7 +396,7 @@ def test_global_optimizer_optimize_nlopt_can_return_losses(monkeypatch):
             _ = kwargs
             return sentinel_out
 
-    monkeypatch.setattr("pepsy.optimize_global.qtn.TNOptimizer", _FakeTNOptimizer)
+    monkeypatch.setattr("pepsy.optimizers.global_opt.qtn.TNOptimizer", _FakeTNOptimizer)
     out, losses = opt.optimize_nlopt(
         n=2,
         optimizer="nlopt",

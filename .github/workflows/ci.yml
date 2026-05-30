@@ -8,6 +8,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
+      PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
+      MPLCONFIGDIR: /tmp/mplconfig_pepsy
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,14 +22,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .[dev]
       - name: Validate source syntax
-        run: python -m compileall -q -f src/pepsy
+        run: python -m compileall -q -f src tests
+      - name: Check Python lint
+        run: python -m pyflakes src/pepsy tests
       - name: Run tests
-        run: |
-          NUMBA_CACHE_DIR=/tmp PYTHONPYCACHEPREFIX=/tmp \
-          pytest -q
+        run: pytest -q
 
   docs:
     runs-on: ubuntu-latest
+    env:
+      NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
+      PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
+      MPLCONFIGDIR: /tmp/mplconfig_pepsy
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +44,4 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .[docs]
       - name: Build docs
-        run: |
-          NUMBA_CACHE_DIR=/tmp PYTHONPYCACHEPREFIX=/tmp \
-          sphinx-build -W -b html docs docs/_build/html
+        run: sphinx-build -W -b html docs docs/_build/html
