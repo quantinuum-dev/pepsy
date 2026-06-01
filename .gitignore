@@ -9,6 +9,8 @@ __pycache__/
 .mypy_cache/
 docs/_build/
 cash/
+cash_ctg/
+ctg_cash/
 store/
 nohup.out
 
