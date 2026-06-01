@@ -1,4 +1,31 @@
-"""MPO optimization helpers centered on :class:`MpoOptimizer`."""
+"""MPO optimization helpers centered on :class:`MpoOptimizer`.
+
+:class:`MpoOptimizer` replays a queue of gates ``[(gate, where), ...]`` against
+an MPO ``O`` of length ``L`` with two physical index families (``ind_id_k``,
+``ind_id_b``).  Each bundled entry specifies what acts on the ket and bra
+legs:
+
+* ``gate``                       → apply ``gate`` on ket and ``gate†`` on bra
+  (default "unitary conjugation" semantics ``G O G†``);
+* ``(gate,)`` or ``(gate, None)`` → apply ``gate`` on ket only;
+* ``(None, B)``                  → apply ``B†`` on bra only;
+* ``(G, B)``                     → apply ``G`` on ket and ``B†`` on bra.
+
+Three execution backends are supported, all returning the same kind of MPO
+but differing in *how* two-site updates are compressed back to bond ``chi``:
+
+* ``mode="dmrg"`` — fit a target MPO with :class:`pepsy.fitting.local.FIT`
+  inside a local window ``[xmin, xmax]``; supports batching consecutive
+  two-site gates via ``k_2q_batch``;
+* ``mode="svd"``  — apply the gate with ``reduce-split`` then canonicalize +
+  left-compress to ``chi``;
+* ``mode="mpo"``  — use :func:`pepsy.operators.gates.gate_nonlocal_opt` to
+  apply each layer independently on the ket and bra families.
+
+The class also tracks a running "normalized-norm" proxy
+``sqrt(<O|O> / <O0|O0>)`` that equals ``1`` for purely unitary two-sided
+evolution (useful as a quick sanity signal).
+"""
 
 from __future__ import annotations
 
@@ -29,35 +56,55 @@ class MpoOptimizer:
     Parameters
     ----------
     mpo : qtn.MatrixProductOperator
-        Initial MPO.
-    gates : sequence[object] | None, optional
-        Canonical bundled gate stream ``((gate, where), ...)``. For each entry:
-        - ``gate`` applies ``G O G†`` (same gate on ket and bra families),
-        - ``(G,)`` applies ket-only (shorthand for ``(G, None)``),
-        - ``(G, B)`` applies ``G O B†``,
-        - ``(G, None)`` applies ket-only,
-        - ``(None, B)`` applies bra-only.
-        Either side may be ``None`` to skip it.
+        Initial MPO ``O``.  Used as the starting point for the queued
+        evolution.  By default a copy is taken (see ``inplace``).
+    gates : sequence | int | None, optional
+        Canonical bundled gate stream ``[(gate, where), ...]``.  ``gate``
+        encodes the (ket, bra) action per entry, with each side optionally
+        ``None``:
+
+        * ``G``            → apply ``G`` on ket and ``G†`` on bra (``G O G†``);
+        * ``(G,)``         → ket-only shorthand for ``(G, None)``;
+        * ``(G, None)``    → apply ``G`` on ket only;
+        * ``(None, B)``    → apply ``B†`` on bra only;
+        * ``(G, B)``       → apply ``G`` on ket and ``B†`` on bra.
+
+        For backward compatibility, passing a bare ``int`` is treated as
+        ``chi`` with an empty gate queue.
     chi : int
-        Working bond dimension.
+        Working bond dimension used by all compression backends.
     mode : {"dmrg", "svd", "mpo"}, default="dmrg"
-        Execution backend.
+        Execution backend for two-site updates (see module docstring).
     ind_id_k : str, default="k{}"
-        Site-index format string for ket-family physical legs.
+        Site-index format string for the ket physical leg family.
     ind_id_b : str, default="b{}"
-        Site-index format string for bra-family physical legs.
+        Site-index format string for the bra physical leg family.
     contraction_opt : object | None, optional
-        Contraction path optimizer keyword used inside :class:`FIT`.
+        Contraction path optimizer keyword used by :func:`tn_norm` and
+        :class:`pepsy.fitting.local.FIT`.  Defaults to ``"auto-hq"``.
     inplace : bool, default=False
-        Whether to optimize the provided input MPO object directly. If
-        ``False``, a copy is made and the original input remains unchanged.
+        When ``True`` mutate ``mpo`` directly; otherwise operate on a copy
+        and leave the input untouched.
+
+    Attributes
+    ----------
+    p : qtn.MatrixProductOperator
+        Current MPO state (after construction and after each :meth:`run`).
+    G, where : list
+        Parsed gate-tensor list and corresponding site-coordinate list.
+    losses : list[float]
+        Running history of the normalized-norm proxy
+        ``sqrt(<O|O> / <O0|O0>)`` appended at sampled steps during a run.
+    info_c : dict
+        Cached canonicalization metadata (``cur_orthog`` tracks the current
+        orthogonality center / span).
     """
 
     _ALLOWED_MODES = frozenset({"dmrg", "svd", "mpo"})
 
     @classmethod
     def _normalize_mode(cls, mode):
-        """Validate and normalize execution mode."""
+        """Lower-case and validate ``mode`` against :attr:`_ALLOWED_MODES`."""
         mode_norm = str(mode).strip().lower()
         if mode_norm not in cls._ALLOWED_MODES:
             supported = ", ".join(sorted(cls._ALLOWED_MODES))
@@ -75,6 +122,8 @@ class MpoOptimizer:
         contraction_opt=None,
         inplace=False,
     ):
+        # Allow the shorthand ``MpoOptimizer(mpo, chi)``: bare int second arg
+        # is interpreted as chi with an empty gate queue.
         if chi is None:
             if isinstance(gates, Integral):
                 chi = int(gates)
@@ -86,6 +135,7 @@ class MpoOptimizer:
                 )
 
         self.inplace = bool(inplace)
+        # Work on a copy by default so the user's input MPO stays unchanged.
         self.p = mpo if self.inplace else mpo.copy()
         self.G, self.where = _normalize_gate_queue(gates)
         self.chi = int(chi)
@@ -94,13 +144,20 @@ class MpoOptimizer:
         self.ind_id_b = str(ind_id_b)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
 
+        # Reference norm used to normalize the loss proxy in `_normalize_norm`.
         self.norm_mpo = self._measure_norm(self.p)
         self.info_c = {}
         self.losses = [1.0]
         self._init_canonicalization()
 
     def _current_orthog(self, p=None):
-        """Return cached ``(min_site, max_site)`` orthogonality span."""
+        """Return cached ``(min_site, max_site)`` orthogonality span.
+
+        Accepts cached entries shaped as ``"calc"`` / ``None`` (recompute),
+        ``int`` (single site), or 1- and 2-tuples.  The canonical form
+        returned and stored back into ``self.info_c['cur_orthog']`` is always
+        a 2-tuple with ``min <= max``.
+        """
         cur = self.info_c.get("cur_orthog", "calc")
         state = self.p if p is None else p
         if cur == "calc" or cur is None:
@@ -119,14 +176,18 @@ class MpoOptimizer:
         return cur
 
     def _init_canonicalization(self):
-        """Initialize canonical form and orthogonality center."""
+        """Put ``self.p`` into mixed-canonical form with center at ``L // 2``."""
         center = self.p.L // 2
         self.info_c = {}
         self.p.canonicalize_([center], cur_orthog="calc", info=self.info_c)
         self._current_orthog(self.p)
 
     def _prepare_dmrg_state(self):
-        """Ensure DMRG starts from at least ``chi`` bond dimension."""
+        """Pad to at least ``chi`` bond dimension before DMRG fits.
+
+        Local FIT updates cannot grow the bond dimension on their own, so we
+        expand the working MPO once up front and re-canonicalize.
+        """
         if self.p.max_bond() < self.chi:
             self.p.expand_bond_dimension(self.chi, inplace=True)
             self._init_canonicalization()
@@ -165,7 +226,13 @@ class MpoOptimizer:
 
     @staticmethod
     def _sampling_steps(total_steps, fidelity_samples):
-        """Return gate-step indices at which to sample norm proxy."""
+        """Return the set of gate-step indices at which to sample the norm proxy.
+
+        Indices are 1-based gate counts (``1 ≤ step ≤ total_steps``).  The
+        final step is always included so the run history ends with a fresh
+        measurement; up to ``fidelity_samples`` extra interior points are
+        spread linearly across the remaining range.
+        """
         if total_steps <= 0:
             return set()
 
@@ -199,18 +266,20 @@ class MpoOptimizer:
         return norm_val
 
     def _measure_norm(self, p):
-        """Measure the MPO squared norm as (mantissa, exponent) for stability.
+        """Return ``(mantissa, exponent)`` such that ``<O|O> = mantissa * 10**exponent``.
 
-        Returns ``(m, e)`` where ``<O|O> = m * 10^e``.
+        Working in log-mantissa form keeps the proxy stable for very long
+        gate streams where ``<O|O>`` can over- or under-flow.
         """
         mantissa, exponent = tn_norm(p, contraction_opt=self.contraction_opt, strip_exponent=True)
         return self._real_float(mantissa), float(exponent)
 
     def _normalize_norm(self, norm_val):
-        """Normalize a (mantissa, exponent) norm against the initial MPO norm.
+        """Convert a ``(mantissa, exponent)`` squared-norm into the relative MPO norm.
 
-        Returns sqrt(<O|O>) / sqrt(<O0|O0>), i.e. the ratio of actual norms,
-        consistent with p.norm() / initial.norm().
+        Returns ``sqrt(<O|O>) / sqrt(<O0|O0>)`` — i.e. the ratio of actual
+        MPO norms relative to the construction-time reference ``norm_mpo``.
+        For purely unitary two-sided evolution this stays equal to ``1``.
         """
         m, e = norm_val
         m0, e0 = self.norm_mpo
@@ -220,12 +289,18 @@ class MpoOptimizer:
 
     @staticmethod
     def _prepare_gate_tensor(gate, n_sites):
-        """Return a gate tensor in ket-index ordering."""
+        """Reorder a gate tensor into ``(input, output)`` ket-index order.
+
+        Quimb gates are stored as ``(output, input)`` matrices (or rank-4
+        ``(o1, o2, i1, i2)`` tensors for two-site gates).  ``apply_gate``
+        below expects the opposite ordering, so we transpose accordingly.
+        """
         if n_sites == 1:
             return ar.do("transpose", gate, (1, 0))
         elif n_sites == 2:
             shape = getattr(gate, "shape", ())
             if len(shape) == 2:
+                # 4x4 matrix form: just a matrix transpose.
                 din, dout = shape
                 if int(din) != int(dout):
                     raise ValueError(
@@ -233,6 +308,7 @@ class MpoOptimizer:
                     )
                 return ar.do("transpose", gate, (1, 0))
             elif len(shape) == 4:
+                # Rank-4 form: swap output and input pairs.
                 return ar.do("transpose", gate, (2, 3, 0, 1))
             else:
                 raise ValueError(
@@ -243,11 +319,13 @@ class MpoOptimizer:
 
     @staticmethod
     def _prepare_gate_pair(gate, n_sites, bra_gate=None):
-        """Return gate tensors for ket/bra index families.
+        """Return ``(g_k, g_b)`` ready to be fed to :func:`apply_gate`.
 
-        ``gate`` is applied on ket indices (transpose/index-order normalization).
-        ``bra_gate`` is applied on bra indices as ``bra_gate†`` after the same
-        normalization. Either side may be omitted with ``None``.
+        ``gate`` becomes ``g_k`` (acts on the ket index family with the
+        ket-ordering convention) and ``bra_gate`` becomes
+        ``g_b = conj(prepare(bra_gate))``, which when applied to the bra
+        family realises ``B† O`` on that side.  Passing ``None`` skips that
+        side; at least one of the two must be provided.
         """
         if gate is None and bra_gate is None:
             raise ValueError("At least one of ket gate or bra gate must be provided.")
@@ -261,10 +339,15 @@ class MpoOptimizer:
 
     @staticmethod
     def _parse_gate_entry(G_i, where_i):
-        """Normalize one gate-stream entry to ``(ket_gate, bra_gate, where)``.
+        """Decompose one stream entry into ``(ket_gate, bra_gate, where)``.
 
-        Bare gates default to two-sided MPO evolution by mapping ``G`` to
-        ``(G, G)``, which is interpreted as ``G`` on ket and ``G†`` on bra.
+        Acceptable shapes for ``G_i`` mirror the constructor convention:
+
+        * bare ``G``        → ``(G, G)``  ("unitary conjugation" default);
+        * ``(G,)``          → ``(G, None)`` (ket-only);
+        * ``(G, B)``        → explicit pair, either side may be ``None``.
+
+        At least one of the two sides must be non-``None``.
         """
         where_norm = tuple(where_i)
         if len(where_norm) not in (1, 2):
@@ -298,7 +381,11 @@ class MpoOptimizer:
         contract,
         inplace=True,
     ):
-        """Apply one gate to both ket and bra legs of ``p``."""
+        """Apply the (ket, bra) gate pair onto ``p`` using :func:`apply_gate`.
+
+        Each side is applied independently with its own ``ind_id_*`` so the
+        two index families stay decoupled.
+        """
         n_sites = len(where)
         g_k, g_b = self._prepare_gate_pair(gate, n_sites, bra_gate=bra_gate)
 
@@ -326,7 +413,11 @@ class MpoOptimizer:
             )
 
     def _build_dmrg_target(self, p, gate, where, bra_gate, cutoff, cutoff_mode="rel"):
-        """Build target MPO after applying a two-site gate pair."""
+        """Return ``p`` with one two-site gate pair applied via ``split-gate``.
+
+        The result is the *target* MPO that the local FIT update will fit
+        back to bond dimension ``chi`` inside the gate window.
+        """
         p_g = p.copy()
         self._apply_gate_pair(
             p_g,
@@ -342,7 +433,12 @@ class MpoOptimizer:
 
     @staticmethod
     def _collect_dmrg_batch(G_seq, where_seq, start_idx, k_2q_batch):
-        """Collect a DMRG batch starting at a two-site gate index."""
+        """Greedily collect up to ``k_2q_batch`` consecutive two-site gates.
+
+        Any one-site gates encountered along the way are folded into the
+        same batch so they are applied together inside a single FIT window.
+        Returns ``(batch_G, batch_where, n_two_qubit_in_batch, next_idx)``.
+        """
         batch_G = []
         batch_where = []
         two_qubit_in_batch = 0
@@ -365,7 +461,12 @@ class MpoOptimizer:
         return batch_G, batch_where, two_qubit_in_batch, idx
 
     def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff, cutoff_mode="rel"):
-        """Apply a collected DMRG batch onto a copy of ``p``."""
+        """Apply a collected DMRG batch onto a copy of ``p``.
+
+        Used to materialise the local target MPO for a batched FIT update.
+        Two-site gates are split (``split-gate``) and one-site gates are
+        contracted directly.
+        """
         p_g = p.copy()
         for G_i, where_i in zip(batch_G, batch_where):
             gate, bra_gate, where = self._parse_gate_entry(G_i, where_i)
@@ -383,7 +484,12 @@ class MpoOptimizer:
         return p_g
 
     def _run_dmrg(self, G_seq, where_seq, n_iter, progbar=False, cutoff=1e-12, cutoff_mode="rel", k_2q_batch=1, fidelity_samples=10):
-        """Apply gates with local DMRG-style fitting updates."""
+        """Sweep the gate stream with local DMRG-style FIT compression.
+
+        One-site gates are applied exactly; each two-site gate (or batch of
+        ``k_2q_batch`` consecutive ones) is fitted by :class:`FIT` back to
+        bond ``chi`` inside the gate window ``[xmin, xmax]``.
+        """
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
 
@@ -490,7 +596,12 @@ class MpoOptimizer:
         self.p = p
 
     def _run_svd(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rel", fidelity_samples=10):
-        """Apply gates with local SVD compression for two-site updates."""
+        """Sweep the gate stream with local ``reduce-split`` + left-compress.
+
+        Two-site updates use ``apply_gate(..., contract='reduce-split')``
+        followed by a canonicalise + left-compress sweep across the gate
+        window down to bond ``chi``.
+        """
         p = self.p
         two_qubit_count = 0
         sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
@@ -570,11 +681,12 @@ class MpoOptimizer:
 
 
     def _run_mpo(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rel", fidelity_samples=10):
-        """Apply gates using MPO-style nonlocal compression via gate_nonlocal_opt.
+        """Sweep the gate stream with :func:`gate_nonlocal_opt` compression.
 
-        For two-site gates, the raw gate/bra_gate tensors are applied independently
-        to the upper (ket) and lower (bra) layers of the MPO using gate_nonlocal_opt.
-        One-site gates are applied directly via _apply_gate_pair.
+        Two-site gates are routed through ``gate_nonlocal_opt`` independently
+        on the upper (ket) and lower (bra) MPO families using
+        ``method="direct"``.  One-site gates are applied directly via
+        :meth:`_apply_gate_pair`.
         """
         p = self.p
         two_qubit_count = 0
