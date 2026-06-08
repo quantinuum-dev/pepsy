@@ -114,6 +114,8 @@ _SYMBOL_MODULES = {
     "ps_to_pepo": ".tensors",
     "ps_to_peps": ".tensors",
     "random_haar_qubit": ".tensors",
+    "tn_fidelity": ".tensors",
+    "tn_norm": ".tensors",
     "tns_align": ".tensors",
     "validate_tensor_network_tags": ".tensors",
 }
@@ -208,6 +210,8 @@ __all__ = [
     "ps_to_pepo",
     "ps_to_peps",
     "random_haar_qubit",
+    "tn_fidelity",
+    "tn_norm",
     "tns_align",
 ]
 
@@ -303,5 +307,7 @@ if TYPE_CHECKING:
         ps_to_pepo,
         ps_to_peps,
         random_haar_qubit,
+        tn_fidelity,
+        tn_norm,
         tns_align,
     )

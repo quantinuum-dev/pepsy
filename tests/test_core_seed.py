@@ -647,6 +647,143 @@ def test_register_torch_linalg_does_not_require_jax(monkeypatch):
     assert A.grad is not None
 
 
+def test_complex_svd_torch_backward_matches_native():
+    """Custom complex SVD backward should match native torch off degeneracies."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import linalg_torch as lrt  # pylint: disable=import-outside-toplevel
+
+    torch.manual_seed(1234)
+    dtype = torch.complex128
+
+    def matrix_with_separated_singular_values(m, n):
+        A = torch.randn(m, n, dtype=dtype)
+        U, _S, Vh = torch.linalg.svd(A, full_matrices=False)
+        values = torch.linspace(3.0, 1.0, min(m, n), dtype=torch.float64)
+        return (U * values.unsqueeze(0)) @ Vh
+
+    def grad_for(A, loss_fn, *, custom):
+        A = A.clone().detach().requires_grad_(True)
+        if custom:
+            U, S, Vh = lrt.SVD.apply(A)
+        else:
+            U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+        loss = loss_fn(U, S, Vh)
+        loss.backward()
+        return A.grad
+
+    c_left = torch.randn(4, 4, dtype=dtype)
+    c_left = 0.5 * (c_left + c_left.conj().T)
+    c_right = torch.randn(4, 4, dtype=dtype)
+    c_right = 0.5 * (c_right + c_right.conj().T)
+
+    cases = [
+        (
+            matrix_with_separated_singular_values(4, 3),
+            lambda _U, S, _Vh: S.sum(),
+        ),
+        (
+            matrix_with_separated_singular_values(4, 3),
+            lambda U, S, Vh: ((U * S.unsqueeze(0)) @ Vh).real.sum(),
+        ),
+        (
+            matrix_with_separated_singular_values(4, 3),
+            lambda U, _S, _Vh: ((U @ U.conj().T) * c_left).real.sum(),
+        ),
+        (
+            matrix_with_separated_singular_values(3, 4),
+            lambda _U, _S, Vh: ((Vh.conj().T @ Vh) * c_right).real.sum(),
+        ),
+        (
+            matrix_with_separated_singular_values(4, 4),
+            lambda U, _S, Vh: (U[0, 0] * Vh.conj().T[0, 0].conj()).real,
+        ),
+    ]
+
+    for A, loss_fn in cases:
+        native_grad = grad_for(A, loss_fn, custom=False)
+        custom_grad = grad_for(A, loss_fn, custom=True)
+        torch.testing.assert_close(custom_grad, native_grad, rtol=1e-9, atol=1e-9)
+
+
+def test_complex_svd_torch_backward_supports_batched_autoray():
+    """Registered complex torch SVD should backpropagate through batches."""
+    torch = pytest.importorskip("torch")
+
+    torch.manual_seed(5678)
+    core.reg_complex_svd_torch()
+
+    A = torch.randn(2, 4, 3, dtype=torch.complex128, requires_grad=True)
+    U, S, Vh = ar.do("linalg.svd", A)
+    loss = ((U * S.unsqueeze(-2)) @ Vh).real.sum()
+    loss.backward()
+
+    assert A.grad is not None
+    assert A.grad.shape == A.shape
+    assert torch.isfinite(A.grad).all()
+
+
+def test_complex_svd_torch_backward_regularizes_degenerate_spectra():
+    """Custom complex SVD backward should stay finite at degenerate spectra."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import linalg_torch as lrt  # pylint: disable=import-outside-toplevel
+
+    torch.manual_seed(91011)
+    dtype = torch.complex128
+
+    def matrix_with_singular_values(values):
+        A = torch.randn(len(values), len(values), dtype=dtype)
+        U, _S, Vh = torch.linalg.svd(A, full_matrices=False)
+        values = torch.tensor(values, dtype=torch.float64)
+        return (U * values.unsqueeze(0)) @ Vh
+
+    def assert_finite_grad(A, loss_fn):
+        A = A.clone().detach().requires_grad_(True)
+        U, S, Vh = lrt.SVD.apply(A)
+        loss = loss_fn(U, S, Vh)
+        loss.backward()
+        assert A.grad is not None
+        assert torch.isfinite(A.grad).all()
+
+    cases = [
+        matrix_with_singular_values([3.0, 1.0, 1.0]),
+        matrix_with_singular_values([1.0, 1.0, 1.0]),
+        torch.zeros(3, 3, dtype=dtype),
+    ]
+    losses = [
+        lambda U, S, Vh: ((U * S.unsqueeze(-2)) @ Vh).real.sum(),
+        lambda U, _S, Vh: (U[0, 0] * Vh.conj().T[0, 0].conj()).real,
+    ]
+
+    for A in cases:
+        for loss_fn in losses:
+            assert_finite_grad(A, loss_fn)
+
+
+def test_complex_svd_torch_regularization_is_scale_aware():
+    """SVD regularization should preserve inverse-gradient scaling."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import linalg_torch as lrt  # pylint: disable=import-outside-toplevel
+
+    torch.manual_seed(121314)
+    dtype = torch.complex128
+    A = torch.randn(4, 4, dtype=dtype)
+    U, _S, Vh = torch.linalg.svd(A, full_matrices=False)
+    values = torch.linspace(4.0, 1.0, 4, dtype=torch.float64)
+    A = (U * values.unsqueeze(0)) @ Vh
+
+    def grad_for(X):
+        X = X.clone().detach().requires_grad_(True)
+        U, _S, Vh = lrt.SVD.apply(X)
+        loss = (U[0, 0] * Vh.conj().T[0, 0].conj()).real
+        loss.backward()
+        return X.grad
+
+    grad = grad_for(A)
+    for scale in (1.0e-6, 1.0e6):
+        scaled_grad = grad_for(scale * A)
+        torch.testing.assert_close(scale * scaled_grad, grad, rtol=1e-5, atol=1e-8)
+
+
 def test_reg_complex_svd_jax_does_not_require_torch_or_scipy(monkeypatch):
     """JAX SVD registration should not import or require torch/scipy."""
     pytest.importorskip("jax")

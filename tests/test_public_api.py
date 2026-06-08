@@ -24,12 +24,12 @@ _EXPECTED_IN_ALL = [
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "ps_to_peps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "make_numpy_array_caster", "SweepOptimizer",
     "FDSolver", "MpsOptimizer", "MpoOptimizer", "PEPSSampleResult",
-    "PepsBpSampler", "MpsSampler", "MpsSampleResult", "VecSampler", "gate",
+    "PepsBpSampler", "MpsSampler", "MpsSampleResult", "VecSampler", "gate", "tn_fidelity", "tn_norm",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
     "norm_peps", "normalize_peps", "loss_peps", "PEPSGlobalOptimizer",
-    "tn_norm", "tn_fidelity", "gen_long_range_swap_path",
+    "gen_long_range_swap_path",
     "gen_long_range_swap_path_1d", "gen_long_range_swap_path_2d",
     "gen_long_range_swap_path_3d", "gate_tn_1d", "gate_tn_2d", "gate_tn_3d",
     "gates_tn_1d", "gates_tn_2d", "gates_tn_3d", "apply_2d_gate",
@@ -67,6 +67,7 @@ _CALLABLE_EXPORTS = [
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "ps_to_peps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "SweepOptimizer",
     "FDSolver", "MpsOptimizer", "MpoOptimizer", "PEPSSampleResult", "PepsBpSampler",
+    "tn_fidelity", "tn_norm",
 ]
 
 _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
