@@ -42,6 +42,7 @@ __all__ = [
     "expec_mpo",
     "id_to_mpo",
     "ps_to_peps",
+    "ps_to_3dpeps",
     "ps_to_mps",
     "ps_to_pepo",
     "ps_to_mpo",
@@ -1665,6 +1666,75 @@ def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, 
     peps.astype_(dtype)
     if cyclic:
         peps = add_cycle(peps, bond_dim=1)
+    if chi > 1:
+        peps.expand_bond_dimension_(chi, rand_strength=rand_strength)
+    return peps
+
+
+def ps_to_3dpeps(
+    Lx: int,
+    Ly: int,
+    Lz: int,
+    dtype: str = "complex128",
+    theta: float = 0.0,
+    cyclic: bool = False,
+    chi: int = 1,
+    rand_strength: float = 0.0,
+):
+    """Create a product-state 3D PEPS parameterized by ``theta``.
+
+    Each site tensor is set so the physical vector is
+    ``[cos(theta), sin(theta)]`` with trivial virtual bonds.
+
+    Parameters
+    ----------
+    Lx : int
+        Lattice size in x direction.
+    Ly : int
+        Lattice size in y direction.
+    Lz : int
+        Lattice size in z direction.
+    dtype : str, optional
+        Tensor dtype passed to numpy/quimb.
+    theta : float, optional
+        Product-state angle controlling local amplitudes.
+    cyclic : bool or tuple[bool, bool, bool], optional
+        If True, create periodic bonds with bond dimension 1. A three-tuple
+        can set periodicity independently for x, y, and z.
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
+
+    Returns
+    -------
+    quimb.tensor.PEPS3D
+        Initialized 3D PEPS with bond dimension ``chi``.
+    """
+    peps = qtn.PEPS3D.rand(
+        Lx=Lx,
+        Ly=Ly,
+        Lz=Lz,
+        bond_dim=1,
+        seed=666,
+        dtype=dtype,
+        cyclic=cyclic,
+    )
+    local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
+    for x in range(Lx):
+        for y in range(Ly):
+            for z in range(Lz):
+                tensor = peps[x, y, z]
+                phys_ind = peps.site_ind(x, y, z)
+                phys_axis = tensor.inds.index(phys_ind)
+                data = np.zeros_like(tensor.data, dtype=dtype)
+
+                slicer = [0] * data.ndim
+                slicer[phys_axis] = slice(None)
+                data[tuple(slicer)] = local_vec
+                tensor.modify(data=data)
+    peps.astype_(dtype)
     if chi > 1:
         peps.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return peps

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import quimb.tensor as qtn
 
-from pepsy import ps_to_peps
+from pepsy import ps_to_3dpeps, ps_to_peps
 from pepsy.operators.gates import (
     build_mpo_from_gates,
     build_pepo_from_gates,
@@ -77,6 +77,16 @@ def test_ps_to_peps_builds_product_state():
     peps = ps_to_peps(2, 3, dtype="complex128", theta=0.123)
     assert peps.Lx == 2
     assert peps.Ly == 3
+    assert int(peps.max_bond()) == 1
+
+
+def test_ps_to_3dpeps_builds_product_state():
+    """ps_to_3dpeps should build a valid bond-dimension-1 PEPS3D."""
+    peps = ps_to_3dpeps(2, 3, 2, dtype="complex128", theta=0.123)
+    assert peps.Lx == 2
+    assert peps.Ly == 3
+    assert peps.Lz == 2
+    assert peps.site_ind(1, 2, 1) in peps.outer_inds()
     assert int(peps.max_bond()) == 1
 
 

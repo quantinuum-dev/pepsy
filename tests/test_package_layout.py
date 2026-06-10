@@ -13,6 +13,7 @@ from pepsy.tensors import (
     OneDMap,
     backend_torch,
     haar_random_state,
+    ps_to_3dpeps,
     ps_to_peps,
     reg_complex_svd_torch,
 )
@@ -33,6 +34,7 @@ def test_new_namespace_imports_resolve():
     assert callable(backend_torch)
     assert callable(haar_random_state)
     assert callable(ps_to_peps)
+    assert callable(ps_to_3dpeps)
     assert callable(reg_complex_svd_torch)
 
 

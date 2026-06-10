@@ -28,7 +28,7 @@ Use the clearer namespaces for submodule imports:
 from pepsy.boundary import BdyMPS, contract_boundary
 from pepsy.optimizers import SweepOptimizer, MpsOptimizer
 from pepsy.operators import rx, rzz, gate
-from pepsy.tensors import haar_random_state, ps_to_peps, ps_to_mps
+from pepsy.tensors import haar_random_state, ps_to_peps, ps_to_3dpeps, ps_to_mps
 ```
 
 When a leaf module is needed, import the new implementation path directly:
