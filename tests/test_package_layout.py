@@ -9,7 +9,13 @@ from pepsy.operators import gate, rx
 from pepsy.optimizers import MpsOptimizer, SweepOptimizer
 from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
-from pepsy.tensors import OneDMap, backend_torch, ps_to_peps, reg_complex_svd_torch
+from pepsy.tensors import (
+    OneDMap,
+    backend_torch,
+    haar_random_state,
+    ps_to_peps,
+    reg_complex_svd_torch,
+)
 
 
 def test_new_namespace_imports_resolve():
@@ -25,6 +31,7 @@ def test_new_namespace_imports_resolve():
     assert FDSolver is not None
     assert OneDMap is not None
     assert callable(backend_torch)
+    assert callable(haar_random_state)
     assert callable(ps_to_peps)
     assert callable(reg_complex_svd_torch)
 

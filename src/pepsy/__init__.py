@@ -104,6 +104,7 @@ _SYMBOL_MODULES = {
     "build_optimizer": ".tensors",
     "contract_hypercompressed_tn": ".tensors",
     "expec_mpo": ".tensors",
+    "haar_random_state": ".tensors",
     "hrps_to_mps": ".tensors",
     "hrps_to_peps": ".tensors",
     "id_to_mpo": ".tensors",
@@ -200,6 +201,7 @@ __all__ = [
     "FDSolver",
     "OneDMap",
     "expec_mpo",
+    "haar_random_state",
     "hrps_to_mps",
     "hrps_to_peps",
     "id_to_mpo",
@@ -297,6 +299,7 @@ if TYPE_CHECKING:
     from .tensors import (
         OneDMap,
         expec_mpo,
+        haar_random_state,
         hrps_to_mps,
         hrps_to_peps,
         id_to_mpo,

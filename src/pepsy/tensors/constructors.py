@@ -2,6 +2,7 @@
 
 from .core import (
     add_cycle,
+    haar_random_state,
     hrps_to_mps,
     hrps_to_peps,
     id_to_mpo,
@@ -15,6 +16,7 @@ from .core import (
 
 __all__ = [
     "add_cycle",
+    "haar_random_state",
     "hrps_to_mps",
     "hrps_to_peps",
     "id_to_mpo",
