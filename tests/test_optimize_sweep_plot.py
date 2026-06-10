@@ -7,6 +7,7 @@ import pytest
 
 import pepsy.optimizers.sweep as sweep_mod
 from pepsy.optimizers.sweep import SweepOptimizer
+from pepsy.tensors.core import tn_norm
 
 
 def test_run_wrapper_maps_global_style_arguments(monkeypatch):
@@ -56,6 +57,27 @@ def test_run_wrapper_rejects_alias_arguments():
         SweepOptimizer.run(opt, solver_options={"algorithm": "LD_VAR2"})
     with pytest.raises(TypeError):
         SweepOptimizer.run(opt, pbar=False)
+
+
+def test_scaled_overlap_fidelity_uses_mantissa_exponent_pairs():
+    """Local fidelity ratios should not materialize huge stripped exponents."""
+    fidelity = SweepOptimizer._scaled_overlap_fidelity(
+        overlap=(1.0, 250.0),
+        norm=(1.0, 500.0),
+        target_norm=(1.0, 0.0),
+    )
+
+    assert fidelity == pytest.approx(1.0)
+
+
+def test_set_target_norm_accepts_scaled_pair():
+    """target_norm can be stored as a stripped ``(mantissa, exponent)`` pair."""
+    opt = object.__new__(SweepOptimizer)
+
+    out = SweepOptimizer.set_target_norm(opt, (2.5, 17))
+
+    assert out is opt
+    assert opt.target_norm == (2.5, 17.0)
 
 
 def test_run_progress_postfix_reports_compact_cost_and_timing(monkeypatch):
@@ -123,7 +145,7 @@ def test_run_progress_postfix_reports_compact_cost_and_timing(monkeypatch):
     monkeypatch.setattr(sweep_mod, "tqdm", _FakeTQDM)
     monkeypatch.setattr(SweepOptimizer, "optimize_axis", _fake_optimize_axis)
     monkeypatch.setattr(SweepOptimizer, "_ensure_boundary_chi", lambda self, chi: None)
-    monkeypatch.setattr(SweepOptimizer, "_approx_infidelity_loss", lambda self, env_n_iter=4: 0.0)
+    monkeypatch.setattr(SweepOptimizer, "_approx_infidelity_loss", lambda self, env_n_iter=4: 0.5)
     monkeypatch.setattr(SweepOptimizer, "_collect_axis_run_traces", lambda self, axis_runs, cycle, axis: None)
 
     _ = SweepOptimizer.run(
@@ -808,6 +830,44 @@ def test_infidelity_expands_boundaries_for_requested_chi(monkeypatch):
     assert captured["bdy_overlap"] is opt.bdy_overlap
 
 
+def test_infidelity_default_does_not_assume_unit_target(monkeypatch):
+    """infidelity() should let the boundary helper estimate target norm by default."""
+    opt = object.__new__(SweepOptimizer)
+    opt.state = object()
+    opt.state_target = object()
+    opt.bdy = SimpleNamespace(chi=8, mps_b={})
+    opt.bdy_overlap = SimpleNamespace(chi=8, mps_b={})
+    opt.contraction_opt = "auto-hq"
+    opt.fit_mode = "eff"
+
+    captured = {}
+
+    def _fake_boundary_infidelity(
+        state,
+        state_target,
+        *,
+        chi,
+        norm,
+        norm_target,
+        bdy,
+        bdy_overlap,
+        **kwargs,
+    ):  # pylint: disable=unused-argument
+        captured["norm_target"] = norm_target
+        return {
+            "infidelity": 0.25,
+            "bdy": bdy,
+            "bdy_overlap": bdy_overlap,
+        }
+
+    monkeypatch.setattr(sweep_mod, "boundary_infidelity", _fake_boundary_infidelity)
+
+    out = SweepOptimizer.infidelity(opt)
+
+    assert out == pytest.approx(0.25)
+    assert captured["norm_target"] is None
+
+
 def test_default_solver_options_match_expected_baseline():
     """Default solver options should expose the package baseline settings."""
     opts = SweepOptimizer.default_solver_options()
@@ -1052,6 +1112,38 @@ def test_constructor_accepts_state_target_names():
     )
     assert opt.state is peps
     assert opt.state_target is peps_target
+
+
+def test_local_sweep_loss_divides_by_scaled_target_norm(monkeypatch):
+    """A scaled target equal to the state should still give zero local infidelity."""
+    peps = qtn.PEPS.rand(Lx=1, Ly=1, bond_dim=1, seed=21, dtype="complex128")
+    peps_target = peps.copy()
+    peps_target["I0,0"].modify(data=3.0 * peps_target["I0,0"].data)
+    target_norm = tn_norm(peps_target, contraction_opt="auto-hq", strip_exponent=True)
+
+    opt = SweepOptimizer(
+        peps,
+        peps_target,
+        target_norm=target_norm,
+        chi=1,
+        contraction_opt="auto-hq",
+        renormalize_state=False,
+    )
+
+    def _fake_optimize(self, params_init, loss_fn, *, solver, solver_options):
+        _ = self, solver, solver_options
+        return params_init, [float(loss_fn(params_init))]
+
+    monkeypatch.setattr(SweepOptimizer, "_optimize_packed_params", _fake_optimize)
+
+    run_info = opt._optimize_axis_slice_with_current_env(
+        0,
+        axis="y",
+        solver="scipy",
+    )
+
+    assert run_info["loss_initial"] == pytest.approx(0.0, abs=1e-12)
+    assert run_info["loss_final"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_constructor_rejects_common_internal_indices():

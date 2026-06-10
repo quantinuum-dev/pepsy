@@ -9,6 +9,7 @@ import inspect
 from collections.abc import Mapping
 from typing import Any
 
+import autoray as ar
 import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
@@ -42,6 +43,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         Trainable PEPS-like tensor network.
     state_target : qtn.TensorNetwork
         Reference network for overlap objective.
+    target_norm : complex | float | tuple[complex | float, float], default=1.0
+        Known value of ``<state_target|state_target>`` for local sweep
+        fidelity objectives. Pass either a scalar or a ``(mantissa, exponent)``
+        pair such that ``norm = mantissa * 10**exponent``. The default keeps
+        the historical normalized-target assumption.
     chi : int | tuple[int, int] | None, default=None
         Boundary bond dimension used when ``bdy``/``bdy_overlap`` are not
         supplied.  Pass a single ``int`` to use the same dimension for both
@@ -133,6 +139,54 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             merged.update(dict(extra))
         return merged
 
+    @staticmethod
+    def _as_scaled_scalar(value, *, name="value"):
+        """Return ``(mantissa, exponent)`` for scalar or stripped scalar input."""
+        if isinstance(value, (tuple, list)):
+            if len(value) != 2:
+                raise ValueError(f"{name} must be a scalar or (mantissa, exponent).")
+            return value[0], float(value[1])
+        return value, 0.0
+
+    @staticmethod
+    def _safe_pow10(exponent):
+        """Return ``10**exponent`` without over/under-flowing Python floats."""
+        # strip_exponent exponents are ordinary numbers in current quimb, but
+        # keep backend-scalar support for compatibility with differentiable runs.
+        if hasattr(exponent, "shape") or hasattr(exponent, "detach"):
+            return 10.0 ** ar.do("clip", exponent, -300.0, 300.0)
+        exponent = float(exponent)
+        if exponent <= -300.0:
+            return 0.0
+        if exponent >= 300.0:
+            return 1.0e300
+        return 10.0**exponent
+
+    @classmethod
+    def _scaled_overlap_fidelity(cls, overlap, norm, target_norm):
+        """Return ``|overlap|**2 / (|norm| * |target_norm|)`` stably.
+
+        Each input may be either a scalar or a ``(mantissa, exponent)`` pair
+        as returned by ``TensorNetwork.contract(..., strip_exponent=True)``.
+        """
+        overlap_m, overlap_e = cls._as_scaled_scalar(overlap, name="overlap")
+        norm_m, norm_e = cls._as_scaled_scalar(norm, name="norm")
+        target_m, target_e = cls._as_scaled_scalar(target_norm, name="target_norm")
+
+        fid_m = (ar.do("abs", overlap_m) ** 2) / (
+            ar.do("abs", norm_m) * ar.do("abs", target_m)
+        )
+        fid_e = 2.0 * overlap_e - norm_e - target_e
+        return ar.do("abs", fid_m) * cls._safe_pow10(fid_e)
+
+    def set_target_norm(self, target_norm=1.0):
+        """Set the stored target norm used by local sweep objectives."""
+        self.target_norm = self._as_scaled_scalar(
+            1.0 if target_norm is None else target_norm,
+            name="target_norm",
+        )
+        return self
+
     @classmethod
     def _pick_known_keys(cls, options, allowed_keys, *, warn_unknown=True):
         incoming = dict(options or {})
@@ -216,6 +270,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         state,
         state_target,
         *,
+        target_norm=1.0,
         chi=None,
         bdy=None,
         bdy_overlap=None,
@@ -264,6 +319,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.state = state
         self.state_target = state_target
+        self.set_target_norm(target_norm)
         self._set_boundary_pair(bdy_obj, bdy_overlap_obj)
         self.contraction_opt = contraction_opt
         self.fit_mode = fit_mode
@@ -555,6 +611,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self,
         target,
         *,
+        target_norm=1.0,
         chi=None,
         single_layer=False,
     ):
@@ -564,6 +621,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         ----------
         target : qtn.TensorNetwork
             New target PEPS-like state.
+        target_norm : complex | float | tuple[complex | float, float], default=1.0
+            Known ``<target|target>`` value for local sweep objectives. Pass a
+            ``(mantissa, exponent)`` pair to avoid reconstructing very large or
+            very small scalar norms.
         chi : int | None, default=None
             Bond dimension for rebuilt overlap boundary. If omitted, uses
             ``self.bdy_overlap.chi`` when available.
@@ -572,6 +633,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         self._ensure_no_common_internal_indices(self.state, target)
         self.state_target = target
+        self.set_target_norm(target_norm)
 
         # Extract overlap chi from tuple or scalar.
         _, chi_overlap = self._unpack_chi(chi)
@@ -663,7 +725,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         chi=None,
         norm=None,
-        norm_target=1.0,
+        norm_target=None,
         contraction_opt=None,
         n_iter=5,
         direction="y",
@@ -1083,9 +1145,21 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 overlap_net = overlap_net.full_simplify(seq="R", split_method="svd", inplace=False)
 
 
-            overlap_val = abs(overlap_net.contract(all, optimize=self.contraction_opt)) ** 2
-            norm_val = abs(norm_net.contract(all, optimize=self.contraction_opt))
-            fid = overlap_val / norm_val
+            overlap_val = overlap_net.contract(
+                all,
+                optimize=self.contraction_opt,
+                strip_exponent=True,
+            )
+            norm_val = norm_net.contract(
+                all,
+                optimize=self.contraction_opt,
+                strip_exponent=True,
+            )
+            fid = self._scaled_overlap_fidelity(
+                overlap_val,
+                norm_val,
+                self.target_norm,
+            )
             #infid = ar.do("clip", 1.0 - fid, 0.0, None)
             infid = 1. - fid
             return infid
