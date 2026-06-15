@@ -1,5 +1,7 @@
 """Regression tests for :mod:`pepsy.operators.hamiltonians` builders."""
 
+import builtins
+
 import numpy as np
 import pytest
 import quimb
@@ -534,6 +536,40 @@ def test_map_builder_instance_show_returns_schematic_drawing():
     assert hasattr(drawing, "fig")
     assert hasattr(drawing, "ax")
     assert drawing.ax.get_title() == "Instance Mapper"
+
+
+def test_map_builder_show_reports_missing_matplotlib(monkeypatch):
+    """show() should report the missing plotting package directly."""
+    real_import = builtins.__import__
+
+    def import_without_matplotlib(name, *args, **kwargs):
+        if name == "matplotlib" or name.startswith("matplotlib."):
+            raise ImportError("No module named 'matplotlib'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_matplotlib)
+
+    with pytest.raises(ImportError, match="matplotlib"):
+        OneDMap.show(2, 2, mode="snake")
+
+
+def test_mpo_schematic_reports_missing_matplotlib(monkeypatch):
+    """MPO schematic rendering should report the missing plotting package directly."""
+    real_import = builtins.__import__
+
+    def import_without_matplotlib(name, *args, **kwargs):
+        if name == "matplotlib" or name.startswith("matplotlib."):
+            raise ImportError("No module named 'matplotlib'")
+        return real_import(name, *args, **kwargs)
+
+    class DummyMPO:
+        L = 4
+
+    monkeypatch.setattr(builtins, "__import__", import_without_matplotlib)
+
+    builder = py.ham_tn(Lx=2, Ly=2)
+    with pytest.raises(ImportError, match="matplotlib"):
+        builder._show_mpo_schematic_2d(DummyMPO(), [((0, 0), (1, 0))])
 
 
 def test_map_builder_show_rejects_3d():

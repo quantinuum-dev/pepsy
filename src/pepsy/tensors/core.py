@@ -486,17 +486,17 @@ class OneDMap:
         figsize=None,
     ):
         try:
-            from quimb import schematic
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise ImportError(
-                "Schematic plotting requires quimb.schematic to be available."
-            ) from exc
-
-        try:
             from matplotlib import colormaps
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError(
                 "Schematic plotting requires matplotlib to be available."
+            ) from exc
+
+        try:
+            from quimb import schematic
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "Schematic plotting requires quimb.schematic to be available."
             ) from exc
 
         if title is None:
