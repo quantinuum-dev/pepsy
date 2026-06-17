@@ -10,7 +10,7 @@ from typing import Any
 import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
-from ..boundary.metrics import contract_boundary, build_bra_ket, normalize
+from ..boundary.metrics import contract_boundary, build_bra_ket, peps_normalize
 from ..boundary.states import BdyMPS
 from ..boundary.sweeps import CompBdy
 from ..tensors.core import tns_align
@@ -52,6 +52,13 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
+        "method",
+        "mode_",
+        "sequence",
+        "cutoff",
+        "equalize_norms",
+        "layer_tags",
+        "strip_exponent",
     })
     _OPTIMIZE_KEYS = frozenset({
         "axes",
@@ -788,7 +795,7 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
         track_boundary_fidelity = opts.get("track_boundary_fidelity", False)
 
         if state is self.state:
-            return normalize(
+            return peps_normalize(
                 self.state,
                 bdy=self.bdy,
                 contraction_opt=contraction_opt,
@@ -798,12 +805,19 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
                 progress=progress,
                 track_boundary_fidelity=track_boundary_fidelity,
                 fit_mode=self.fit_mode,
+                method=opts.get("method", "dmrg"),
+                mode_=opts.get("mode_", "mps"),
+                sequence=opts.get("sequence", None),
+                cutoff=opts.get("cutoff", 1.0e-12),
+                equalize_norms=opts.get("equalize_norms", False),
+                layer_tags=opts.get("layer_tags", None),
+                strip_exponent=opts.get("strip_exponent", False),
             )
 
         chi = getattr(self.bdy, "chi", None)
         if chi is None:
             raise ValueError("Provide chi via optimizer boundaries before normalizing external state.")
-        return normalize(
+        return peps_normalize(
             state,
             chi=chi,
             contraction_opt=contraction_opt,
@@ -813,6 +827,13 @@ class EnergyOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=progress,
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
+            method=opts.get("method", "dmrg"),
+            mode_=opts.get("mode_", "mps"),
+            sequence=opts.get("sequence", None),
+            cutoff=opts.get("cutoff", 1.0e-12),
+            equalize_norms=opts.get("equalize_norms", False),
+            layer_tags=opts.get("layer_tags", None),
+            strip_exponent=opts.get("strip_exponent", False),
         )
 
     def set_state(

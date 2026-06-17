@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import warnings
 from dataclasses import dataclass
 
@@ -13,9 +14,26 @@ __all__ = [
     "build_bra_ket",
     "BoundaryContractResult",
     "contract_boundary",
+    "contract_flat",
+    "peps_normalize",
     "normalize",
+    "boundary_norm",
+    "peps_norm",
+    "peps_infidelity",
+    "peps_fidelity",
     "infidelity",
 ]
+
+_DEFAULT_LAYER_TAGS = ("KET", "BRA")
+_DEFAULT_BOUNDARY_SEQUENCE = ("xmax", "xmin", "ymin", "ymax")
+_DEFAULT_BOUNDARY_SEQUENCE_3D = (
+    "xmax",
+    "xmin",
+    "ymin",
+    "ymax",
+    "zmin",
+    "zmax",
+)
 
 
 @dataclass(frozen=True)
@@ -25,7 +43,7 @@ class BoundaryContractResult:
     Fields store the contraction scalar plus sweep metadata.
     """
 
-    cost: complex | float
+    cost: complex | float | tuple[complex | float, float]
     fidel: list[float]
     direction: str
     n_iter: int
@@ -63,12 +81,485 @@ def _to_python_scalar(value):
     return obj
 
 
+def _is_scaled_scalar(value):
+    return isinstance(value, (tuple, list)) and len(value) == 2
+
+
+def _as_scaled_scalar(value, *, name="value"):
+    """Return ``(mantissa, exponent)`` for scalar or stripped scalar input."""
+    if _is_scaled_scalar(value):
+        mantissa, exponent = value
+        return _to_python_scalar(mantissa), float(_to_python_scalar(exponent))
+    return _to_python_scalar(value), 0.0
+
+
+def _safe_pow10(exponent):
+    """Return ``10**exponent`` with a finite floating range."""
+    exponent = float(exponent)
+    if exponent <= -300.0:
+        return 0.0
+    if exponent >= 300.0:
+        return 1.0e300
+    return 10.0**exponent
+
+
+def _scaled_to_complex(value):
+    mantissa, exponent = _as_scaled_scalar(value)
+    return complex(mantissa) * _safe_pow10(exponent)
+
+
+def _format_scaled_output(value, *, strip_exponent):
+    mantissa, exponent = _as_scaled_scalar(value)
+    if strip_exponent:
+        return mantissa, exponent
+    return _scaled_to_complex((mantissa, exponent))
+
+
+def _accumulate_tn_exponent(tn, exponent_delta):
+    """Apply a base-10 exponent shift to a tensor network when available."""
+    if exponent_delta == 0.0:
+        return
+    try:
+        tn.exponent = float(getattr(tn, "exponent", 0.0)) + float(exponent_delta)
+    except (AttributeError, TypeError, ValueError):  # pragma: no cover - fallback
+        # TensorNetwork normally exposes ``exponent``. If a compatible test
+        # double does not, leave data-only scaling in place.
+        return
+
+
+def _normalize_by_scaled_norm(tn, norm_value):
+    """Normalize ``tn`` using a scalar or ``(mantissa, exponent)`` norm."""
+    mantissa, exponent = _as_scaled_scalar(norm_value)
+    if abs(complex(mantissa)) == 0:
+        raise ZeroDivisionError("Boundary norm cost is zero; cannot normalize state.")
+    tn /= mantissa**0.5
+    _accumulate_tn_exponent(tn, -0.5 * exponent)
+
+
+def _scaled_overlap_fidelity(overlap, norm, norm_target):
+    """Compute ``|overlap|**2 / (|norm| * |norm_target|)`` stably."""
+    overlap_m, overlap_e = _as_scaled_scalar(overlap, name="overlap")
+    norm_m, norm_e = _as_scaled_scalar(norm, name="norm")
+    target_m, target_e = _as_scaled_scalar(norm_target, name="norm_target")
+
+    denom_m = abs(complex(norm_m)) * abs(complex(target_m))
+    if denom_m == 0:
+        raise ZeroDivisionError(
+            "Norm product is zero; cannot compute infidelity."
+        )
+    fidelity_m = (abs(complex(overlap_m)) ** 2) / denom_m
+    fidelity_e = 2.0 * overlap_e - norm_e - target_e
+    return fidelity_m * _safe_pow10(fidelity_e)
+
+
 def _drop_existing_layer_tags(tn):
     """Remove internal KET/BRA layer tags if present."""
     stale = [tag for tag in ("KET", "BRA") if tag in getattr(tn, "tags", ())]
     if stale:
         tn.drop_tags(stale)
 
+
+def _validate_chi(chi):
+    """Validate and normalize an optional PEPS boundary bond dimension."""
+    if chi is None:
+        return None
+    if not isinstance(chi, int):
+        raise TypeError("chi must be an integer when provided.")
+    if chi < 1:
+        raise ValueError("chi must be >= 1 when provided.")
+    return int(chi)
+
+
+def _normalize_contraction_method(method):
+    """Normalize PEPS metric contraction method names."""
+    key = str(method).strip().lower().replace("-", "_")
+    aliases = {
+        "fit": "dmrg",
+        "boundary_fit": "dmrg",
+        "boundary_dmrg": "dmrg",
+        "dmrg": "dmrg",
+        "boundary": "mps",
+        "boundary_mps": "mps",
+        "mps": "mps",
+        "ctm": "ctmrg",
+        "ctmrg": "ctmrg",
+        "hotrg": "hotrg",
+        "exact": "exact",
+        "full": "exact",
+    }
+    if key == "rg":
+        warnings.warn(
+            "method='rg' has been renamed to method='ctmrg'.",
+            UserWarning,
+            stacklevel=3,
+        )
+        return "ctmrg"
+    if key not in aliases:
+        raise ValueError(
+            "Unknown PEPS contraction method: "
+            f"{method!r}. Expected 'dmrg', 'mps', 'ctmrg', 'hotrg', or 'exact'."
+        )
+    return aliases[key]
+
+
+def _has_numbered_axis_tag(tn, axis):
+    prefix = str(axis)
+    for tag in getattr(tn, "tags", ()):
+        if (
+            isinstance(tag, str)
+            and tag.startswith(prefix)
+            and tag[len(prefix) :].isdigit()
+        ):
+            return True
+    return False
+
+
+def _infer_lattice_ndim(tn):
+    """Infer whether ``tn`` is a 2D or 3D lattice TN when possible."""
+    if getattr(tn, "Lz", None) is not None or _has_numbered_axis_tag(tn, "Z"):
+        return 3
+    if (
+        getattr(tn, "Lx", None) is not None
+        and getattr(tn, "Ly", None) is not None
+    ):
+        return 2
+    if _has_numbered_axis_tag(tn, "X") and _has_numbered_axis_tag(tn, "Y"):
+        return 2
+    return None
+
+
+def _default_quimb_sequence(tn, method):
+    """Choose a quimb boundary sequence that matches the lattice dimension."""
+    ndim = _infer_lattice_ndim(tn)
+    if method == "hotrg":
+        return ("x", "y", "z") if ndim == 3 else ("x", "y")
+    if method in {"mps", "ctmrg"}:
+        return _DEFAULT_BOUNDARY_SEQUENCE_3D if ndim == 3 else _DEFAULT_BOUNDARY_SEQUENCE
+    return None
+
+
+def _normalize_flat_contraction_method(method, tn):
+    """Normalize method names for direct contraction of flat TNs."""
+    key = str(method).strip().lower().replace("-", "_")
+    if key == "auto":
+        return "dmrg" if _infer_lattice_ndim(tn) == 2 else "mps"
+    return _normalize_contraction_method(method)
+
+
+def _call_with_accepted_kwargs(fn, **kwargs):
+    """Call ``fn`` with only the keyword arguments it accepts."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(**kwargs)
+
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()):
+        return fn(**kwargs)
+
+    accepted = {key: val for key, val in kwargs.items() if key in sig.parameters}
+    return fn(**accepted)
+
+
+def _unpack_bdy_handle(handle, name):
+    """Unpack a BdyMPS or ``{"bdy": BdyMPS}`` boundary handle."""
+    holder = handle if isinstance(handle, dict) else None
+    obj = None
+    if holder is not None:
+        obj = holder.get("bdy", None)
+        if obj is not None and not hasattr(obj, "mps_b"):
+            raise TypeError(f"{name}['bdy'] must expose attribute 'mps_b'.")
+    elif handle is not None:
+        obj = handle
+        if not hasattr(obj, "mps_b"):
+            raise TypeError(f"{name} must expose attribute 'mps_b'.")
+    return obj, holder
+
+
+def _retune_bdy_to_chi(obj, chi, name):
+    """Retune an existing boundary object to the requested chi."""
+    if obj is None or chi is None:
+        return
+    cur = getattr(obj, "chi", None)
+    if cur is None or int(cur) == chi:
+        return
+    if not hasattr(obj, "expand_bnd"):
+        raise TypeError(
+            f"{name} has chi={cur} but cannot be retuned to chi={chi}; "
+            "object must expose method 'expand_bnd'."
+        )
+    obj.expand_bnd(chi, inplace=True)
+
+
+def _contract_quimb_double_layer(  # pylint: disable=too-many-arguments
+    norm,
+    *,
+    method,
+    chi,
+    contraction_opt,
+    max_separation,
+    progress,
+    strip_exponent,
+    mode_,
+    sequence,
+    cutoff,
+    equalize_norms,
+    layer_tags,
+):
+    """Contract an already-built double-layer TN with a quimb-style method."""
+    if method == "exact":
+        return norm.contract(
+            all,
+            optimize=contraction_opt,
+            strip_exponent=strip_exponent,
+        )
+
+    if chi is None:
+        raise ValueError(f"Provide chi when method={method!r}.")
+
+    final_contract_opts = {
+        "optimize": contraction_opt,
+        "strip_exponent": strip_exponent,
+    }
+
+    if method == "mps":
+        contract_fn = getattr(norm, "contract_boundary", None)
+        if not callable(contract_fn):
+            raise TypeError("method='mps' requires a network with contract_boundary().")
+        sequence = _default_quimb_sequence(norm, method) if sequence is None else sequence
+        kwargs = dict(
+            max_bond=chi,
+            sequence=sequence,
+            final_contract_opts=final_contract_opts,
+            cutoff=cutoff,
+            progbar=progress,
+            max_separation=max_separation,
+            equalize_norms=equalize_norms,
+            inplace=False,
+        )
+        if mode_ is not None:
+            kwargs["mode"] = mode_
+        if layer_tags is not None:
+            kwargs["layer_tags"] = list(layer_tags)
+        return _call_with_accepted_kwargs(contract_fn, **kwargs)
+
+    if method == "ctmrg":
+        contract_fn = getattr(norm, "contract_ctmrg", None)
+        if not callable(contract_fn):
+            raise TypeError("method='ctmrg' requires a network with contract_ctmrg().")
+        sequence = _default_quimb_sequence(norm, method) if sequence is None else sequence
+        kwargs = dict(
+            max_bond=chi,
+            cutoff=cutoff,
+            canonize=True,
+            mode="projector",
+            sequence=sequence,
+            max_separation=max_separation,
+            equalize_norms=equalize_norms,
+            optimize=contraction_opt,
+            final_contract=True,
+            final_contract_opts=final_contract_opts,
+            progbar=progress,
+            inplace=False,
+        )
+        if layer_tags is not None:
+            kwargs["layer_tags"] = list(layer_tags)
+        return _call_with_accepted_kwargs(contract_fn, **kwargs)
+
+    if method == "hotrg":
+        contract_fn = getattr(norm, "contract_hotrg", None)
+        if not callable(contract_fn):
+            raise TypeError("method='hotrg' requires a network with contract_hotrg().")
+        sequence = _default_quimb_sequence(norm, method) if sequence is None else sequence
+        return _call_with_accepted_kwargs(
+            contract_fn,
+            max_bond=chi,
+            cutoff=cutoff,
+            sequence=sequence,
+            max_separation=max_separation,
+            equalize_norms=equalize_norms,
+            optimize=contraction_opt,
+            final_contract=True,
+            final_contract_opts=final_contract_opts,
+            progbar=progress,
+            inplace=False,
+        )
+
+    raise ValueError(f"Unknown PEPS contraction method: {method!r}")
+
+
+def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
+    norm,
+    *,
+    method,
+    chi,
+    bdy=None,
+    contraction_opt="auto-hq",
+    n_iter=10,
+    direction="y",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
+    single_layer=False,
+    visualize=False,
+    strip_exponent=False,
+    mode_="mps",
+    sequence=None,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+    layer_tags=None,
+    bdy_name="bdy",
+    flat=False,
+):
+    """Contract a double-layer PEPS norm/overlap network by the selected method."""
+    method = _normalize_contraction_method(method)
+    chi = _validate_chi(chi)
+    if layer_tags is None and not flat:
+        layer_tags = _DEFAULT_LAYER_TAGS
+    elif layer_tags is not None:
+        layer_tags = tuple(layer_tags)
+
+    if method == "dmrg":
+        bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, bdy_name)
+        _retune_bdy_to_chi(bdy_obj, chi, bdy_name)
+        if bdy_obj is None:
+            if chi is None:
+                raise ValueError(f"Provide chi when {bdy_name} is not supplied.")
+            if flat:
+                bdy_obj = BdyMPS(
+                    tn_flat=norm,
+                    chi=chi,
+                    flat=True,
+                    single_layer=single_layer,
+                )
+            else:
+                bdy_obj = BdyMPS(
+                    tn_double=norm,
+                    chi=chi,
+                    single_layer=single_layer,
+                )
+            if bdy_holder is not None:
+                bdy_holder["bdy"] = bdy_obj
+
+        result = contract_boundary(
+            norm=norm,
+            bdy=bdy_obj,
+            contraction_opt=contraction_opt,
+            fit_mode=fit_mode,
+            n_iter=n_iter,
+            progress=progress,
+            direction=direction,
+            max_separation=max_separation,
+            track_boundary_fidelity=track_boundary_fidelity,
+            visualize=visualize,
+            strip_exponent=strip_exponent,
+            equalize_norms=equalize_norms,
+            flat=flat,
+        )
+        return result.cost, bdy_obj
+
+    cost = _contract_quimb_double_layer(
+        norm,
+        method=method,
+        chi=chi,
+        contraction_opt=contraction_opt,
+        max_separation=max_separation,
+        progress=progress,
+        strip_exponent=strip_exponent,
+        mode_=mode_,
+        sequence=sequence,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
+    )
+    return cost, None
+
+
+def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    tn,
+    *,
+    chi=None,
+    bdy=None,
+    method="auto",
+    contraction_opt="auto-hq",
+    n_iter=10,
+    direction="y",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
+    visualize=False,
+    strip_exponent=False,
+    mode_=None,
+    sequence=None,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+    layer_tags=None,
+):
+    """Contract an already-flat PEPS-like tensor network.
+
+    This helper is for networks that have already been flattened into a scalar
+    tensor network, so it does not call :func:`build_bra_ket`. With
+    ``method="auto"`` it uses the PEPSY DMRG/FIT boundary path for 2D networks
+    and quimb's ``contract_boundary`` path for 3D networks. Explicit methods
+    are ``"dmrg"``, ``"mps"``, ``"ctmrg"``, ``"hotrg"``, and ``"exact"``.
+
+    Parameters
+    ----------
+    tn : qtn.TensorNetwork
+        Already-flat tensor network to contract.
+    chi : int | None, default=None
+        Boundary bond dimension required by all approximate methods unless an
+        existing ``bdy`` is supplied for ``method="dmrg"``.
+    bdy : pepsy.boundary.states.BdyMPS | dict | None, default=None
+        Optional reusable boundary handle for ``method="dmrg"``. Dict holders
+        are filled with ``dict["bdy"]`` when a new boundary is created.
+    method : {"auto", "dmrg", "mps", "ctmrg", "hotrg", "exact"}, default="auto"
+        Contraction backend. ``"dmrg"`` is only supported for 2D flat
+        PEPS-like networks; quimb methods are used for 2D and 3D when the
+        input network exposes the corresponding method.
+    strip_exponent : bool, default=False
+        If ``True``, return ``(mantissa, exponent)``.
+
+    Returns
+    -------
+    complex | float | tuple[complex | float, float]
+        Contraction scalar, optionally with stripped exponent.
+    """
+    if tn is None:
+        raise ValueError("tn must not be None.")
+
+    method = _normalize_flat_contraction_method(method, tn)
+    if method == "dmrg" and _infer_lattice_ndim(tn) == 3:
+        raise ValueError(
+            "method='dmrg' is only supported for 2D flat tensor networks; "
+            "use method='mps', 'ctmrg', 'hotrg', or 'exact' for 3D networks."
+        )
+
+    cost, _ = _contract_peps_double_layer(
+        tn,
+        method=method,
+        chi=chi,
+        bdy=bdy,
+        contraction_opt=contraction_opt,
+        n_iter=n_iter,
+        direction=direction,
+        max_separation=max_separation,
+        progress=progress,
+        track_boundary_fidelity=track_boundary_fidelity,
+        fit_mode=fit_mode,
+        single_layer=False,
+        visualize=visualize,
+        strip_exponent=strip_exponent,
+        mode_=mode_,
+        sequence=sequence,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
+        bdy_name="bdy",
+        flat=True,
+    )
+    return _format_scaled_output(cost, strip_exponent=strip_exponent)
 
 
 def build_bra_ket(
@@ -156,6 +647,7 @@ def contract_boundary(
     max_separation=1,
     direction="y",
     equalize_norms=False,
+    strip_exponent=False,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     """Approximate a scalar contraction using boundary-MPS sweeps.
 
@@ -193,6 +685,8 @@ def contract_boundary(
         Sweep selector.
     equalize_norms : bool, default=False
         Forwarded normalization option for local fit outputs.
+    strip_exponent : bool, default=False
+        If ``True``, keep the final contraction as ``(mantissa, exponent)``.
 
     Returns
     -------
@@ -238,6 +732,7 @@ def contract_boundary(
         max_separation=max_separation,
         direction=direction,
         equalize_norms=equalize_norms,
+        strip_exponent=strip_exponent,
     )
 
     return BoundaryContractResult(
@@ -249,11 +744,79 @@ def contract_boundary(
     )
 
 
-def normalize(
+def _contract_state_norm(
+    p,
+    *,
+    chi,
+    bdy,
+    method,
+    contraction_opt,
+    n_iter,
+    direction,
+    max_separation,
+    progress,
+    track_boundary_fidelity,
+    fit_mode,
+    single_layer,
+    visualize,
+    strip_exponent,
+    mode_,
+    sequence,
+    cutoff,
+    equalize_norms,
+    layer_tags,
+):
+    """Build ``<p|p>``, set up the boundary, and contract it.
+
+    Shared backend for :func:`peps_normalize` and :func:`boundary_norm`. Tags
+    ``p`` in place via :func:`build_bra_ket` but does **not** rescale it.
+
+    Returns
+    -------
+    tuple[BoundaryContractResult, qtn.TensorNetwork, object]
+        ``(result, ket_tagged, bdy_obj)`` where ``result.cost`` is the
+        ``<p|p>`` contraction scalar.
+    """
+    ket_tagged, norm_tagged = build_bra_ket(ket=p, bra=None)
+
+    cost, bdy_obj = _contract_peps_double_layer(
+        norm_tagged,
+        method=method,
+        chi=chi,
+        bdy=bdy,
+        contraction_opt=contraction_opt,
+        n_iter=n_iter,
+        direction=direction,
+        max_separation=max_separation,
+        progress=progress,
+        track_boundary_fidelity=track_boundary_fidelity,
+        fit_mode=fit_mode,
+        single_layer=single_layer,
+        visualize=visualize,
+        strip_exponent=strip_exponent,
+        mode_=mode_,
+        sequence=sequence,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
+        bdy_name="bdy",
+    )
+    result = BoundaryContractResult(
+        cost=cost,
+        fidel=[],
+        direction=direction,
+        n_iter=n_iter,
+        max_separation=max_separation,
+    )
+    return result, ket_tagged, bdy_obj
+
+
+def peps_normalize(
     p,
     *,
     chi=None,
     bdy=None,
+    method="dmrg",
     contraction_opt="auto-hq",
     n_iter=10,
     direction="y",
@@ -263,12 +826,20 @@ def normalize(
     fit_mode="eff",
     single_layer=False,
     visualize=False,
+    strip_exponent=False,
+    mode_="mps",
+    sequence=None,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+    layer_tags=None,
 ):
     """Normalize a PEPS state in place using boundary contraction.
 
-    This performs:
-    ``build_bra_ket -> BdyMPS -> contract_boundary`` and normalizes
-    ``p`` in place.
+    With ``method="dmrg"`` this performs the existing
+    ``build_bra_ket -> BdyMPS -> contract_boundary`` flow. Other methods use
+    quimb-style double-layer contractions when available. The state is rescaled
+    in place by ``1 / sqrt(<p|p>)``. To compute ``<p|p>`` without modifying
+    ``p``, use :func:`boundary_norm`.
 
     Parameters
     ----------
@@ -283,6 +854,12 @@ def normalize(
         - ``dict``: if ``dict["bdy"]`` exists it is reused; otherwise a new
           boundary is created (requires ``chi``) and written to ``dict["bdy"]``.
         - ``None``: a new boundary is created internally (requires ``chi``).
+        Only used with ``method="dmrg"``.
+    method : {"dmrg", "mps", "ctmrg", "hotrg", "exact"}, default="dmrg"
+        Contraction backend. ``"dmrg"`` is the package BdyMPS/FIT path.
+        ``"mps"``, ``"ctmrg"``, and ``"hotrg"`` call matching quimb methods
+        on the double-layer network. ``"rg"`` is accepted as a deprecated alias
+        for ``"ctmrg"``.
     contraction_opt : str | object, default="auto-hq"
                 Contraction optimizer.
     n_iter : int, default=10
@@ -299,93 +876,54 @@ def normalize(
         Boundary fitting backend mode.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
+    strip_exponent : bool, default=False
+        If ``True``, use stripped boundary contractions and return
+        ``(mantissa, exponent)`` for the old norm estimate.
 
     Returns
     -------
     complex | float
-        Old norm estimate returned by the boundary contraction before
+        The old norm estimate returned by the boundary contraction before
         rescaling.
     """
     if p is None:
         raise ValueError("p must not be None.")
-    if chi is not None:
-        if not isinstance(chi, int):
-            raise TypeError("chi must be an integer when provided.")
-        if chi < 1:
-            raise ValueError("chi must be >= 1 when provided.")
+    chi = _validate_chi(chi)
 
-    ket_tagged, norm_tagged = build_bra_ket(ket=p, bra=None)
-
-    bdy_holder = bdy if isinstance(bdy, dict) else None
-    bdy_obj = None
-    if bdy_holder is not None:
-        bdy_obj = bdy_holder.get("bdy", None)
-        if bdy_obj is not None and not hasattr(bdy_obj, "mps_b"):
-            raise TypeError("bdy['bdy'] must expose attribute 'mps_b'.")
-    elif bdy is not None:
-        bdy_obj = bdy
-        if not hasattr(bdy_obj, "mps_b"):
-            raise TypeError("bdy must expose attribute 'mps_b'.")
-
-    def _retune_bdy_to_chi(obj):
-        """Retune existing normalize boundary to requested chi."""
-        if obj is None or chi is None:
-            return
-        cur = getattr(obj, "chi", None)
-        if cur is None or int(cur) == chi:
-            return
-        if not hasattr(obj, "expand_bnd"):
-            raise TypeError(
-                f"bdy has chi={cur} but cannot be retuned to chi={chi}; "
-                "object must expose method 'expand_bnd'."
-            )
-        obj.expand_bnd(chi, inplace=True)
-
-    _retune_bdy_to_chi(bdy_obj)
-
-    if bdy_obj is None:
-        if chi is None:
-            raise ValueError("Provide chi when bdy is not supplied.")
-        bdy_obj = BdyMPS(
-            tn_double=norm_tagged,
-            chi=chi,
-            single_layer=single_layer,
-        )
-        if bdy_holder is not None:
-            bdy_holder["bdy"] = bdy_obj
-
-    result = contract_boundary(
-        norm=norm_tagged,
-        bdy=bdy_obj,
+    result, ket_tagged, _ = _contract_state_norm(
+        p,
+        chi=chi,
+        bdy=bdy,
+        method=method,
         contraction_opt=contraction_opt,
-        fit_mode=fit_mode,
         n_iter=n_iter,
-        progress=progress,
         direction=direction,
         max_separation=max_separation,
+        progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
+        fit_mode=fit_mode,
+        single_layer=single_layer,
         visualize=visualize,
+        strip_exponent=strip_exponent,
+        mode_=mode_,
+        sequence=sequence,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
     )
     cost = result.cost
-    old_norm = _to_python_scalar(cost)
-    if abs(complex(old_norm)) == 0:
-        raise ZeroDivisionError("Boundary norm cost is zero; cannot normalize state.")
-
-    ket_tagged /= cost**0.5
+    old_norm = _format_scaled_output(cost, strip_exponent=strip_exponent)
+    _normalize_by_scaled_norm(ket_tagged, cost)
     ket_tagged.balance_bonds_()
     return old_norm
 
 
-def infidelity(
+def boundary_norm(
     p,
-    p_target,
     *,
     chi=None,
-    norm=None,
-    norm_target=None,
     bdy=None,
-    bdy_target=None,
-    bdy_overlap=None,
+    method="dmrg",
     contraction_opt="auto-hq",
     n_iter=10,
     direction="y",
@@ -395,6 +933,165 @@ def infidelity(
     fit_mode="eff",
     single_layer=False,
     visualize=False,
+    strip_exponent=False,
+    mode_="mps",
+    sequence=None,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+    layer_tags=None,
+):
+    """Compute ``<p|p>`` via boundary contraction without rescaling ``p``.
+
+    This is the read-only counterpart of :func:`peps_normalize`: it performs the
+    same ``build_bra_ket -> BdyMPS -> contract_boundary`` pipeline and returns
+    the contraction scalar, but never divides the state by its norm. ``p`` is
+    not modified (a copy is contracted internally).
+
+    Parameters
+    ----------
+    p : qtn.TensorNetwork
+        Input PEPS state.
+    chi : int | None, default=None
+        Boundary MPS bond dimension used when ``bdy`` is not provided.
+    bdy : pepsy.boundary.states.BdyMPS | dict | None, default=None
+        Boundary handle, identical in meaning to :func:`peps_normalize`.
+    method : {"dmrg", "mps", "ctmrg", "hotrg", "exact"}, default="dmrg"
+        Contraction backend.
+    contraction_opt : str | object, default="auto-hq"
+        Contraction optimizer.
+    n_iter : int, default=10
+        Number of local fit iterations per boundary step.
+    direction : str, default="y"
+        Sweep direction passed to :func:`contract_boundary`.
+    max_separation : int, default=1
+        Sweep separation mode.
+    progress : bool, default=False
+        Show progress bar.
+    track_boundary_fidelity : bool, default=False
+        Track fidelity history during boundary contraction.
+    fit_mode : {"eff", "global"}, default="eff"
+        Boundary fitting backend mode.
+    single_layer : bool, default=False
+        Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
+    strip_exponent : bool, default=False
+        If ``True``, return ``(mantissa, exponent)`` for the norm estimate.
+
+    Returns
+    -------
+    complex | float
+        The ``<p|p>`` norm estimate from the boundary contraction.
+    """
+    if p is None:
+        raise ValueError("p must not be None.")
+    chi = _validate_chi(chi)
+
+    result, _, _ = _contract_state_norm(
+        p.copy(),
+        chi=chi,
+        bdy=bdy,
+        method=method,
+        contraction_opt=contraction_opt,
+        n_iter=n_iter,
+        direction=direction,
+        max_separation=max_separation,
+        progress=progress,
+        track_boundary_fidelity=track_boundary_fidelity,
+        fit_mode=fit_mode,
+        single_layer=single_layer,
+        visualize=visualize,
+        strip_exponent=strip_exponent,
+        mode_=mode_,
+        sequence=sequence,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
+    )
+    return _format_scaled_output(result.cost, strip_exponent=strip_exponent)
+
+
+def peps_norm(
+    p,
+    *,
+    chi=None,
+    bdy=None,
+    method="dmrg",
+    contraction_opt="auto-hq",
+    n_iter=10,
+    direction="y",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
+    single_layer=False,
+    visualize=False,
+    strip_exponent=False,
+    mode_="mps",
+    sequence=None,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+    layer_tags=None,
+):
+    """Compute the PEPS norm ``<p|p>`` without modifying ``p``.
+
+    This is the PEPS-named alias for :func:`boundary_norm`. It accepts the same
+    contraction methods and boundary controls, including ``method="dmrg"``,
+    ``"mps"``, ``"ctmrg"``, ``"hotrg"``, and ``"exact"``.
+
+    Returns
+    -------
+    complex | float | tuple[complex | float, float]
+        Norm estimate. With ``strip_exponent=True`` this is
+        ``(mantissa, exponent)``.
+    """
+    return boundary_norm(
+        p,
+        chi=chi,
+        bdy=bdy,
+        method=method,
+        contraction_opt=contraction_opt,
+        n_iter=n_iter,
+        direction=direction,
+        max_separation=max_separation,
+        progress=progress,
+        track_boundary_fidelity=track_boundary_fidelity,
+        fit_mode=fit_mode,
+        single_layer=single_layer,
+        visualize=visualize,
+        strip_exponent=strip_exponent,
+        mode_=mode_,
+        sequence=sequence,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
+    )
+
+
+def peps_infidelity(
+    p,
+    p_target,
+    *,
+    chi=None,
+    norm=None,
+    norm_target=None,
+    bdy=None,
+    bdy_target=None,
+    bdy_overlap=None,
+    method="dmrg",
+    contraction_opt="auto-hq",
+    n_iter=10,
+    direction="y",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
+    single_layer=False,
+    visualize=False,
+    strip_exponent=False,
+    mode_="mps",
+    sequence=None,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+    layer_tags=None,
 ):  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     r"""Compute the infidelity between two PEPS states via boundary contraction.
 
@@ -407,7 +1104,7 @@ def infidelity(
                  {\langle p | p \rangle \;
                   \langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle}
 
-    Up to three boundary contractions are performed to evaluate
+    Up to three contractions are performed to evaluate
     :math:`\langle p | p \rangle`,
     :math:`\langle p_{\mathrm{target}} | p_{\mathrm{target}} \rangle`, and
     :math:`\langle p_{\mathrm{target}} | p \rangle`.
@@ -444,6 +1141,11 @@ def infidelity(
         Pre-built boundary for the
         :math:`\langle p_{\mathrm{target}} | p \rangle` overlap network.
         Also supports dict holder style ``{"bdy": <BdyMPS>}``.
+    method : {"dmrg", "mps", "ctmrg", "hotrg", "exact"}, default="dmrg"
+        Contraction backend. ``"dmrg"`` is the package BdyMPS/FIT path.
+        ``"mps"``, ``"ctmrg"``, and ``"hotrg"`` call matching quimb methods
+        on each double-layer network. ``"rg"`` is accepted as a deprecated
+        alias for ``"ctmrg"``.
     contraction_opt : str | object, default="auto-hq"
         Contraction optimizer passed to :func:`contract_boundary`.
     n_iter : int, default=10
@@ -461,6 +1163,10 @@ def infidelity(
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     visualize : bool, default=False
+    strip_exponent : bool, default=False
+        If ``True``, keep norm and overlap contractions as
+        ``(mantissa, exponent)`` pairs and compute the fidelity ratio without
+        reconstructing large or tiny scalars.
     Returns
     -------
     dict[str, object]
@@ -479,53 +1185,13 @@ def infidelity(
         raise ValueError("p must not be None.")
     if p_target is None:
         raise ValueError("p_target must not be None.")
-    if chi is not None:
-        if not isinstance(chi, int):
-            raise TypeError("chi must be an integer when provided.")
-        if chi < 1:
-            raise ValueError("chi must be >= 1 when provided.")
-
-    def _unpack_bdy_handle(handle, name):
-        holder = handle if isinstance(handle, dict) else None
-        obj = None
-        if holder is not None:
-            obj = holder.get("bdy", None)
-            if obj is not None and not hasattr(obj, "mps_b"):
-                raise TypeError(f"{name}['bdy'] must expose attribute 'mps_b'.")
-        elif handle is not None:
-            obj = handle
-            if not hasattr(obj, "mps_b"):
-                raise TypeError(f"{name} must expose attribute 'mps_b'.")
-        return obj, holder
-
-    bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, "bdy")
-    bdy_target_obj, bdy_target_holder = _unpack_bdy_handle(bdy_target, "bdy_target")
-    bdy_overlap_obj, bdy_overlap_holder = _unpack_bdy_handle(bdy_overlap, "bdy_overlap")
-
-    def _retune_bdy_to_chi(obj, name):
-        """Retune an existing boundary object to the requested chi."""
-        if obj is None or chi is None:
-            return
-        cur = getattr(obj, "chi", None)
-        if cur is None:
-            return
-        if int(cur) == chi:
-            return
-        if not hasattr(obj, "expand_bnd"):
-            raise TypeError(
-                f"{name} has chi={cur} but cannot be retuned to chi={chi}; "
-                "object must expose method 'expand_bnd'."
-            )
-        obj.expand_bnd(chi, inplace=True)
-
-    # If caller supplies any boundary handles and chi, retune all supplied
-    # boundaries (norm, target, overlap) to the same requested chi.
-    _retune_bdy_to_chi(bdy_obj, "bdy")
-    _retune_bdy_to_chi(bdy_target_obj, "bdy_target")
-    _retune_bdy_to_chi(bdy_overlap_obj, "bdy_overlap")
+    chi = _validate_chi(chi)
+    method = _normalize_contraction_method(method)
 
     # Shared contraction kwargs
     _kw = dict(
+        method=method,
+        chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
         n_iter=n_iter,
@@ -534,71 +1200,65 @@ def infidelity(
         max_separation=max_separation,
         track_boundary_fidelity=track_boundary_fidelity,
         visualize=visualize,
+        strip_exponent=strip_exponent,
+        mode_=mode_,
+        sequence=sequence,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
     )
 
     # -- <p|p> --
+    bdy_obj = None
     if norm is None:
         _, norm_tn = build_bra_ket(ket=p, bra=None)
-
-        if bdy_obj is None:
-            if chi is None:
-                raise ValueError("Provide chi when bdy is not supplied.")
-            bdy_obj = BdyMPS(tn_double=norm_tn, chi=chi, single_layer=single_layer)
-            if bdy_holder is not None:
-                bdy_holder["bdy"] = bdy_obj
-
-        norm = complex(_to_python_scalar(
-            contract_boundary(norm=norm_tn, bdy=bdy_obj, **_kw).cost
-        ))
+        cost, bdy_obj = _contract_peps_double_layer(
+            norm_tn,
+            bdy=bdy,
+            single_layer=single_layer,
+            bdy_name="bdy",
+            **_kw,
+        )
+        norm = _format_scaled_output(
+            cost,
+            strip_exponent=strip_exponent,
+        )
     else:
-        norm = complex(norm)
+        norm = _format_scaled_output(norm, strip_exponent=strip_exponent)
 
     # -- <p_target|p_target> --
+    bdy_target_obj = None
     if norm_target is None:
         _, norm_target_tn = build_bra_ket(ket=p_target, bra=None)
-
-        if bdy_target_obj is None:
-            if chi is None:
-                raise ValueError("Provide chi when bdy_target is not supplied.")
-            bdy_target_obj = BdyMPS(
-                tn_double=norm_target_tn, chi=chi, single_layer=single_layer,
-            )
-            if bdy_target_holder is not None:
-                bdy_target_holder["bdy"] = bdy_target_obj
-
-        norm_target = complex(_to_python_scalar(
-            contract_boundary(
-                norm=norm_target_tn, bdy=bdy_target_obj, **_kw,
-            ).cost
-        ))
+        cost, bdy_target_obj = _contract_peps_double_layer(
+            norm_target_tn,
+            bdy=bdy_target,
+            single_layer=single_layer,
+            bdy_name="bdy_target",
+            **_kw,
+        )
+        norm_target = _format_scaled_output(
+            cost,
+            strip_exponent=strip_exponent,
+        )
     else:
-        norm_target = complex(norm_target)
+        norm_target = _format_scaled_output(norm_target, strip_exponent=strip_exponent)
 
     # -- <p_target|p> (overlap) --
     _, overlap_tn = build_bra_ket(ket=p, bra=p_target)
+    cost, bdy_overlap_obj = _contract_peps_double_layer(
+        overlap_tn,
+        bdy=bdy_overlap,
+        single_layer=single_layer,
+        bdy_name="bdy_overlap",
+        **_kw,
+    )
+    overlap = _format_scaled_output(
+        cost,
+        strip_exponent=strip_exponent,
+    )
 
-    if bdy_overlap_obj is None:
-        if chi is None:
-            raise ValueError("Provide chi when bdy_overlap is not supplied.")
-        bdy_overlap_obj = BdyMPS(
-            tn_double=overlap_tn, chi=chi, single_layer=single_layer,
-        )
-        if bdy_overlap_holder is not None:
-            bdy_overlap_holder["bdy"] = bdy_overlap_obj
-
-    overlap = complex(_to_python_scalar(
-        contract_boundary(
-            norm=overlap_tn, bdy=bdy_overlap_obj, **_kw,
-        ).cost
-    ))
-
-    denom = abs(norm) * abs(norm_target)
-    if denom == 0:
-        raise ZeroDivisionError(
-            "Norm product is zero; cannot compute infidelity."
-        )
-
-    fidelity = abs(overlap) ** 2 / denom
+    fidelity = _scaled_overlap_fidelity(overlap, norm, norm_target)
 
     return {
         "infidelity": 1 - fidelity,
@@ -609,3 +1269,81 @@ def infidelity(
         "bdy_target": bdy_target_obj,
         "bdy_overlap": bdy_overlap_obj,
     }
+
+
+def peps_fidelity(
+    p,
+    p_target,
+    *,
+    chi=None,
+    norm=None,
+    norm_target=None,
+    bdy=None,
+    bdy_target=None,
+    bdy_overlap=None,
+    method="dmrg",
+    contraction_opt="auto-hq",
+    n_iter=10,
+    direction="y",
+    max_separation=1,
+    progress=False,
+    track_boundary_fidelity=False,
+    fit_mode="eff",
+    single_layer=False,
+    visualize=False,
+    strip_exponent=False,
+    mode_="mps",
+    sequence=None,
+    cutoff=1.0e-12,
+    equalize_norms=False,
+    layer_tags=None,
+):
+    """Compute boundary-estimated PEPS fidelity.
+
+    This is a convenience wrapper around :func:`peps_infidelity` that returns
+    ``1 - infidelity``. Pass ``norm`` and/or ``norm_target`` when one of the
+    states is already known to be normalized; the corresponding self-overlap
+    contraction is then skipped.
+
+    Returns
+    -------
+    float
+        Boundary-estimated fidelity.
+    """
+    result = peps_infidelity(
+        p,
+        p_target,
+        chi=chi,
+        norm=norm,
+        norm_target=norm_target,
+        bdy=bdy,
+        bdy_target=bdy_target,
+        bdy_overlap=bdy_overlap,
+        method=method,
+        contraction_opt=contraction_opt,
+        n_iter=n_iter,
+        direction=direction,
+        max_separation=max_separation,
+        progress=progress,
+        track_boundary_fidelity=track_boundary_fidelity,
+        fit_mode=fit_mode,
+        single_layer=single_layer,
+        visualize=visualize,
+        strip_exponent=strip_exponent,
+        mode_=mode_,
+        sequence=sequence,
+        cutoff=cutoff,
+        equalize_norms=equalize_norms,
+        layer_tags=layer_tags,
+    )
+    return 1 - result["infidelity"]
+
+
+def normalize(*args, **kwargs):
+    """Compatibility alias for :func:`peps_normalize`."""
+    return peps_normalize(*args, **kwargs)
+
+
+def infidelity(*args, **kwargs):
+    """Compatibility alias for :func:`peps_infidelity`."""
+    return peps_infidelity(*args, **kwargs)

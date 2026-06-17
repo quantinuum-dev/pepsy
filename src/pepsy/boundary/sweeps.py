@@ -444,6 +444,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         n_iter=10,
         equalize_norms=True,
         direction="y",
+        strip_exponent=False,
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Run two-sided boundary sweeps and contract the final network.
 
@@ -472,11 +473,15 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             Forwarded normalization option for fitted MPS tensors.
         direction : str, default="y"
             Sweep selector.
+        strip_exponent : bool, default=False
+            If ``True``, return ``(mantissa, exponent)`` from the final
+            contraction instead of reconstructing the scalar.
 
         Returns
         -------
-        complex | float
-            Final contracted scalar.
+        complex | float | tuple[complex | float, float]
+            Final contracted scalar, or ``(mantissa, exponent)`` when
+            ``strip_exponent=True``.
         """
         # Fidelity history is run-local and resets for each run() call.
         self._reset_fidelity_history()
@@ -525,6 +530,8 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         tn_f = self._build_final_boundary_network(spec, p_previous_l, p_previous_r)
         main, exp = tn_f.contract(all, optimize=self.contraction_opt, strip_exponent=True)
+        if strip_exponent:
+            return main, exp
         return main * 10**exp
 
     def move_bdy(

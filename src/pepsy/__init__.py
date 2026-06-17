@@ -24,11 +24,17 @@ _SYMBOL_MODULES = {
     "BdyMPS": ".boundary",
     "BoundaryContractResult": ".boundary",
     "CompBdy": ".boundary",
+    "boundary_norm": ".boundary",
     "build_bra_ket": ".boundary",
     "contract_boundary": ".boundary",
+    "contract_flat": ".boundary",
     "infidelity": ".boundary",
     "make_numpy_array_caster": ".boundary",
     "normalize": ".boundary",
+    "peps_fidelity": ".boundary",
+    "peps_infidelity": ".boundary",
+    "peps_norm": ".boundary",
+    "peps_normalize": ".boundary",
     "backend_cupy": ".backends",
     "backend_jax": ".backends",
     "backend_numpy": ".backends",
@@ -87,6 +93,7 @@ _SYMBOL_MODULES = {
     "GlobalOptimizer": ".optimizers",
     "MpoOptimizer": ".optimizers",
     "MpsOptimizer": ".optimizers",
+    "PepsOptimizer": ".optimizers",
     "SweepOptimizer": ".optimizers",
     "MpsSampleResult": ".sampling",
     "MpsSampler": ".sampling",
@@ -135,11 +142,17 @@ __all__ = [
     "BdyMPS",
     "BoundaryContractResult",
     "CompBdy",
+    "boundary_norm",
     "build_bra_ket",
     "contract_boundary",
+    "contract_flat",
     "infidelity",
     "make_numpy_array_caster",
     "normalize",
+    "peps_fidelity",
+    "peps_infidelity",
+    "peps_norm",
+    "peps_normalize",
     "get_default_array_backend",
     "get_default_grad_backend",
     "register_torch_linalg",
@@ -193,6 +206,7 @@ __all__ = [
     "GlobalOptimizer",
     "MpoOptimizer",
     "MpsOptimizer",
+    "PepsOptimizer",
     "SweepOptimizer",
     "MpsSampleResult",
     "MpsSampler",
@@ -244,11 +258,17 @@ if TYPE_CHECKING:
         BdyMPS,
         BoundaryContractResult,
         CompBdy,
+        boundary_norm,
         build_bra_ket,
         contract_boundary,
+        contract_flat,
         infidelity,
         make_numpy_array_caster,
         normalize,
+        peps_fidelity,
+        peps_infidelity,
+        peps_norm,
+        peps_normalize,
     )
     from .fitting import FIT
     from .operators import (
@@ -295,7 +315,7 @@ if TYPE_CHECKING:
         y,
         z,
     )
-    from .optimizers import EnergyOptimizer, GlobalOptimizer, MpoOptimizer, MpsOptimizer, SweepOptimizer
+    from .optimizers import EnergyOptimizer, GlobalOptimizer, MpoOptimizer, MpsOptimizer, PepsOptimizer, SweepOptimizer
     from .sampling import MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, VecSampler
     from .solvers import FDSolver
     from .tensors import (

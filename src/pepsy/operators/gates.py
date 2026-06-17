@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from heapq import heappop, heappush
 from numbers import Integral
 import random
 import re
@@ -424,6 +425,9 @@ def gen_long_range_swap_path_2d(  # pylint: disable=too-many-branches,too-many-l
         return
 
     allowed_moves = {"av", "bv", "ah", "bh"}
+    if isinstance(sequence, str) and sequence in {"auto", "smart", "min_bond"}:
+        sequence = None
+
     if isinstance(sequence, str) and sequence not in {
         "random",
         "x_then_y",
@@ -629,6 +633,9 @@ def gen_long_range_swap_path_3d(  # pylint: disable=too-many-branches,too-many-l
         "zyx": ("z", "y", "x"),
     }
 
+    if isinstance(sequence, str) and sequence in {"auto", "smart", "min_bond"}:
+        sequence = None
+
     if isinstance(sequence, str) and (sequence not in {"random"} | set(named_axis_orders)):
         warnings.warn(
             f"Unknown string sequence='{sequence}'. Falling back to default cycle.",
@@ -780,6 +787,302 @@ def gen_long_range_swap_path_3d(  # pylint: disable=too-many-branches,too-many-l
                 )
 
 
+def _is_auto_sequence(sequence):
+    return isinstance(sequence, str) and (sequence.lower() in {"auto", "smart", "min_bond"})
+
+
+def _wrapped_axis_delta(delta, size):
+    """Return the shortest signed wrapped displacement along one axis."""
+    if size is None:
+        return int(delta)
+    size = int(size)
+    wrapped = int(delta) % size
+    half = size / 2
+    if wrapped > half:
+        wrapped -= size
+    elif (size % 2 == 0) and (wrapped == half) and (delta < 0):
+        wrapped -= size
+    return int(wrapped)
+
+
+def _site_tensor_for_coord(tn, coord):
+    """Return the tensor carrying a lattice site tag, if available."""
+    site_tag = getattr(tn, "site_tag", None)
+    if not callable(site_tag):
+        return None
+    try:
+        return tn[site_tag(coord)]
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
+def _tensor_index_size(tensor, ix):
+    ind_size = getattr(tensor, "ind_size", None)
+    if callable(ind_size):
+        return int(ind_size(ix))
+
+    inds = getattr(tensor, "inds", ())
+    shape = getattr(tensor, "shape", None)
+    if shape is not None and ix in inds:
+        return int(shape[inds.index(ix)])
+
+    data_shape = getattr(getattr(tensor, "data", None), "shape", None)
+    if data_shape is not None and ix in inds:
+        return int(data_shape[inds.index(ix)])
+
+    return 1
+
+
+def _bond_dimension_between_sites(tn, coord_a, coord_b):
+    """Estimate the virtual bond dimension between two adjacent lattice sites."""
+    tensor_a = _site_tensor_for_coord(tn, coord_a)
+    tensor_b = _site_tensor_for_coord(tn, coord_b)
+    if tensor_a is None or tensor_b is None:
+        return 1
+
+    bonds = qtn.bonds(tensor_a, tensor_b)
+    if not bonds:
+        return 10**12
+    return max(_tensor_index_size(tensor_a, ix) for ix in bonds)
+
+
+def _smart_long_range_swap_path(tn, start, target, *, cyclic=False, sizes=None):
+    """Choose a shortest SWAP path with the smallest current bond bottleneck."""
+    start = tuple(int(x) for x in start)
+    target = tuple(int(x) for x in target)
+    ndim = len(start)
+    sizes = tuple(sizes or (None,) * ndim)
+
+    if start == target:
+        return []
+
+    axis_delta_cache = {}
+    distance_cache = {}
+    bond_dim_cache = {}
+
+    def _axis_delta(coord, axis):
+        key = (coord, axis)
+        if key not in axis_delta_cache:
+            axis_delta_cache[key] = _wrapped_axis_delta(
+                target[axis] - coord[axis],
+                sizes[axis] if cyclic else None,
+            )
+        return axis_delta_cache[key]
+
+    def _coord_distance(coord):
+        if coord not in distance_cache:
+            distance_cache[coord] = sum(
+                abs(_axis_delta(coord, axis)) for axis in range(ndim)
+            )
+        return distance_cache[coord]
+
+    def _edge_bond_dim(coord_a, coord_b):
+        key = frozenset((coord_a, coord_b))
+        if key not in bond_dim_cache:
+            bond_dim_cache[key] = _bond_dimension_between_sites(
+                tn, coord_a, coord_b
+            )
+        return bond_dim_cache[key]
+
+    def _step_coord(coord, axis, step):
+        coord = list(coord)
+        coord[axis] += step
+        if cyclic:
+            coord[axis] %= int(sizes[axis])
+        return tuple(coord)
+
+    def _reconstruct_path(coord, parents):
+        path = []
+        while coord != start:
+            prev, pair = parents[coord]
+            path.append(pair)
+            coord = prev
+        path.reverse()
+        return path
+
+    queue = []
+    counter = count()
+    start_score = (0, 0, 0)
+    heappush(queue, (*start_score, next(counter), start))
+    best = {start: start_score}
+    parents = {start: None}
+
+    while queue:
+        steps, bottleneck, total, _, coord = heappop(queue)
+        if best.get(coord) != (steps, bottleneck, total):
+            continue
+        if coord == target:
+            return _reconstruct_path(coord, parents)
+
+        coord_distance = _coord_distance(coord)
+        for axis in range(ndim):
+            delta = _axis_delta(coord, axis)
+            if delta == 0:
+                continue
+            step = 1 if delta > 0 else -1
+            nxt = _step_coord(coord, axis, step)
+
+            if _coord_distance(nxt) >= coord_distance:
+                continue
+
+            bond_dim = _edge_bond_dim(coord, nxt)
+            new_score = (steps + 1, max(bottleneck, bond_dim), total + bond_dim)
+            if new_score < best.get(nxt, (10**18, 10**18, 10**18)):
+                best[nxt] = new_score
+                parents[nxt] = (coord, (coord, nxt))
+                heappush(queue, (*new_score, next(counter), nxt))
+
+    return []
+
+
+def _select_long_range_swap_path_2d(tn, start, target, *, sequence=None, cyclic=False, Lx=None, Ly=None):
+    if _is_auto_sequence(sequence) and (not cyclic or (Lx is not None and Ly is not None)):
+        path = _smart_long_range_swap_path(
+            tn, start, target, cyclic=cyclic, sizes=(Lx, Ly)
+        )
+        if path:
+            return path
+    return list(
+        gen_long_range_swap_path_2d(
+            start,
+            target,
+            sequence=sequence,
+            cyclic=cyclic,
+            Lx=Lx,
+            Ly=Ly,
+        )
+    )
+
+
+def _select_long_range_swap_path_3d(
+    tn, start, target, *, sequence=None, cyclic=False, Lx=None, Ly=None, Lz=None
+):
+    if _is_auto_sequence(sequence) and (
+        not cyclic or (Lx is not None and Ly is not None and Lz is not None)
+    ):
+        path = _smart_long_range_swap_path(
+            tn, start, target, cyclic=cyclic, sizes=(Lx, Ly, Lz)
+        )
+        if path:
+            return path
+    return list(
+        gen_long_range_swap_path_3d(
+            start,
+            target,
+            sequence=sequence,
+            cyclic=cyclic,
+            Lx=Lx,
+            Ly=Ly,
+            Lz=Lz,
+        )
+    )
+
+
+def _path_site_tags(tn, path_pairs):
+    """Return unique lattice site tags touched by a path."""
+    site_tag = getattr(tn, "site_tag", None)
+    if not callable(site_tag):
+        return []
+
+    tags = []
+    seen = set()
+    for pair in path_pairs:
+        for site in pair:
+            try:
+                tag = site_tag(site)
+            except (TypeError, ValueError):
+                continue
+            if tag not in seen:
+                tags.append(tag)
+                seen.add(tag)
+    return tags
+
+
+def _unique_path_pairs(path_pairs):
+    """Return unique undirected path pairs, preserving first-seen order."""
+    pairs = []
+    seen = set()
+    for a, b in path_pairs:
+        key = frozenset((a, b))
+        if key in seen:
+            continue
+        pairs.append((a, b))
+        seen.add(key)
+    return pairs
+
+
+def _maybe_canonize_path(
+    tn,
+    path_pairs,
+    *,
+    path_canonize=False,
+    path_canonize_distance=1,
+    path_canonize_opts=None,
+):
+    """Canonize once around the full path touched by a routed gate."""
+    if not path_canonize:
+        return
+
+    canonize_around = getattr(tn, "canonize_around_", None)
+    if not callable(canonize_around):
+        return
+
+    tags = _path_site_tags(tn, path_pairs)
+    if not tags:
+        return
+
+    max_distance = path_canonize_distance
+    if isinstance(path_canonize, Integral) and not isinstance(path_canonize, bool):
+        max_distance = int(path_canonize)
+
+    opts = dict(path_canonize_opts or {})
+    opts.setdefault("which", "any")
+    opts.setdefault("max_distance", max_distance)
+    canonize_around(tags, **opts)
+
+
+def _maybe_compress_path(
+    tn,
+    path_pairs,
+    *,
+    path_compress=False,
+    max_bond=None,
+    cutoff=1.0e-12,
+    path_compress_canonize_distance=0,
+    path_compress_opts=None,
+):
+    """Optionally clean up only the bonds traversed by a routed gate path."""
+    if not path_compress:
+        return
+
+    compress_between = getattr(tn, "compress_between", None)
+    site_tag = getattr(tn, "site_tag", None)
+    if not callable(compress_between) or not callable(site_tag):
+        return
+
+    opts = dict(path_compress_opts or {})
+    opts.setdefault("canonize_distance", path_compress_canonize_distance)
+
+    for site_a, site_b in _unique_path_pairs(path_pairs):
+        try:
+            compress_between(
+                site_tag(site_a),
+                site_tag(site_b),
+                max_bond=max_bond,
+                cutoff=cutoff,
+                **opts,
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+
+def _local_split_opts(max_bond):
+    """Return split/compression kwargs for quimb gate calls."""
+    if max_bond is None:
+        return {}
+    return {"max_bond": int(max_bond)}
+
+
 def _normalize_where_arg_1d(where):
     """Normalize one-site and two-site where specs for 1D gate application."""
     if isinstance(where, Integral):
@@ -838,6 +1141,33 @@ def _format_ind_id(ind_id, site):
             "Use one placeholder for 1D (e.g. 'b{}'), two for 2D (e.g. 'b{},{}'), "
             "and three for 3D (e.g. 'b{},{},{}')."
         ) from exc
+
+
+def _normalize_gate_which(which):
+    """Normalize an upper/lower layer selector."""
+    if which is None:
+        return None
+
+    which_norm = str(which).strip().lower()
+    if which_norm not in ("upper", "lower"):
+        raise ValueError("which must be 'upper' or 'lower' (case-insensitive).")
+    return which_norm
+
+
+def _ind_id_from_which(which, arity):
+    """Return the physical-index format corresponding to *which* and arity."""
+    which_norm = _normalize_gate_which(which)
+    if which_norm is None:
+        return None
+
+    prefix = "k" if which_norm == "upper" else "b"
+    if arity == 1:
+        return f"{prefix}{{}}"
+    if arity == 2:
+        return f"{prefix}{{}},{{}}"
+    if arity == 3:
+        return f"{prefix}{{}},{{}},{{}}"
+    raise ValueError("which can only be mapped for 1D, 2D, or 3D coordinates.")
 
 
 def _validate_gate_target_inds_exist(tn, where_norm, ind_id):
@@ -995,8 +1325,21 @@ def _looks_like_where_payload(where):
     return False
 
 
-def _looks_like_gate_where_pair_entry(item):
-    """Return True when ``item`` has the canonical ``(gate, where)`` shape."""
+def _looks_like_gate_where_pair_entry(item, *, allow_which=False):
+    """Return True when ``item`` has canonical ``(gate, where[, which])`` shape."""
+    if (
+        allow_which
+        and isinstance(item, tuple)
+        and len(item) == 3
+        and not isinstance(item[0], (Integral, float, complex, str, bytes, bool))
+        and _looks_like_where_payload(item[1])
+    ):
+        try:
+            _normalize_gate_which(item[2])
+        except ValueError:
+            return False
+        return True
+
     return (
         isinstance(item, tuple)
         and len(item) == 2
@@ -1027,46 +1370,66 @@ def _looks_like_parallel_gate_where_alias(gates, where):
     )
 
 
-def _normalize_gate_entries(gates, where=None, *, allow_empty=True):
-    """Normalize gate input into canonical ``[(gate, where), ...]`` entries."""
+def _normalize_gate_entries(
+    gates, where=None, *, allow_empty=True, allow_which=False
+):
+    """Normalize gate input into canonical entries.
+
+    With ``allow_which=False`` entries have shape ``(gate, where)``. With
+    ``allow_which=True`` entries have shape ``(gate, where, which_or_None)``
+    and bundled stream entries may use ``(gate, where, "upper"|"lower")``.
+    """
     if gates is None:
         if allow_empty and where is None:
             return []
         raise ValueError("gates must not be None.")
 
     if where is not None:
-        if _looks_like_gate_where_pair_entry(gates):
+        if _looks_like_gate_where_pair_entry(gates, allow_which=allow_which):
             raise ValueError(
-                "Do not pass a separate where when gates is already a (gate, where) pair."
+                "Do not pass a separate where when gates is already a bundled entry."
             )
         if isinstance(gates, (tuple, list)) and len(gates) > 0:
-            if all(_looks_like_gate_where_pair_entry(item) for item in gates):
+            if all(
+                _looks_like_gate_where_pair_entry(item, allow_which=allow_which)
+                for item in gates
+            ):
                 raise ValueError(
                     "Do not pass a separate where when gates is already a bundled stream. "
-                    "Use ((gate, where), ...)."
+                    "Use ((gate, where), ...) or ((gate, where, which), ...)."
                 )
             if (
                 len(gates) > 1
                 and isinstance(where, (tuple, list))
-                and not _looks_like_gate_where_pair_entry(gates)
+                and not _looks_like_gate_where_pair_entry(
+                    gates, allow_which=allow_which
+                )
             ):
                 raise ValueError(
-                    "For multiple gates, use bundled stream ((gate, where), ...) "
+                    "For multiple gates, use a bundled stream "
                     "instead of parallel gates/where lists."
                 )
             if _looks_like_parallel_gate_where_alias(gates, where):
                 raise ValueError(
-                    "For multiple gates, use bundled stream ((gate, where), ...) "
+                    "For multiple gates, use a bundled stream "
                     "instead of parallel gates/where lists."
                 )
+        if allow_which:
+            return [(gates, where, None)]
         return [(gates, where)]
 
-    if _looks_like_gate_where_pair_entry(gates):
-        gate_i, where_i = gates
+    if _looks_like_gate_where_pair_entry(gates, allow_which=allow_which):
+        gate_i, where_i = gates[0], gates[1]
         if _looks_like_parallel_gate_where_alias(gate_i, where_i):
             raise ValueError(
-                "Bundled gate streams must use exact shape ((gate, where), ...); "
+                "Bundled gate streams must use exact entry shape; "
                 "the alias (gates, wheres) is not allowed."
+            )
+        if allow_which and len(gates) == 3:
+            raise ValueError(
+                "Single bundled triple alias (gate, where, which) is not allowed. "
+                "Pass a single gate as gate(..., gate, where=where, which=which), "
+                "or use bundled stream ((gate, where, which), ...)."
             )
         raise ValueError(
             "Single bundled pair alias (gate, where) is not allowed. "
@@ -1080,11 +1443,23 @@ def _normalize_gate_entries(gates, where=None, *, allow_empty=True):
                 return []
             raise ValueError("gates must not be empty.")
 
-        if all(_looks_like_gate_where_pair_entry(item) for item in gates):
+        if all(
+            _looks_like_gate_where_pair_entry(item, allow_which=allow_which)
+            for item in gates
+        ):
+            if allow_which:
+                return [
+                    (item[0], item[1], _normalize_gate_which(item[2]) if len(item) == 3 else None)
+                    for item in gates
+                ]
             return [(item[0], item[1]) for item in gates]
-        if any(_looks_like_gate_where_pair_entry(item) for item in gates):
+        if any(
+            _looks_like_gate_where_pair_entry(item, allow_which=allow_which)
+            for item in gates
+        ):
             raise ValueError(
-                "Bundled gate stream entries must all have exact shape (gate, where)."
+                "Bundled gate stream entries must all have exact shape "
+                "(gate, where) or (gate, where, which)."
             )
         if (
             isinstance(gates, list)
@@ -1095,6 +1470,17 @@ def _normalize_gate_entries(gates, where=None, *, allow_empty=True):
                 "Single bundled pair alias (gate, where) is not allowed. "
                 "Pass a single gate as gate(..., gate, where=where), or use "
                 "bundled stream ((gate, where), ...)."
+            )
+        if (
+            allow_which
+            and isinstance(gates, list)
+            and len(gates) == 3
+            and _looks_like_where_payload(gates[1])
+        ):
+            raise ValueError(
+                "Single bundled triple alias (gate, where, which) is not allowed. "
+                "Pass a single gate as gate(..., gate, where=where, which=which), "
+                "or use bundled stream ((gate, where, which), ...)."
             )
         if len(gates) > 1:
             raise ValueError(
@@ -1107,7 +1493,7 @@ def _normalize_gate_entries(gates, where=None, *, allow_empty=True):
     )
 
 
-def gate(tn, gates, where=None, **kwargs):
+def gate(tn, gates, where=None, which=None, **kwargs):
     """Apply one or many gates with automatic 1D/2D/3D dispatch.
 
     Parameters
@@ -1125,10 +1511,19 @@ def gate(tn, gates, where=None, **kwargs):
         - 2D: ``(i, j)``, ``((i, j),)``, ``((i0, j0), (i1, j1))``
         - 3D: ``(i, j, k)``, ``((i, j, k),)``, ``((...), (...))``
         - explicit physical index names: ``"k3"`` or ``("b0", "b1")``
+    which : {"upper", "lower"} | None, optional
+        Convenience selector for operator-like TNs. ``"upper"`` maps numeric
+        coordinates to ``k...`` physical indices and ``"lower"`` maps them to
+        ``b...`` indices. Bundled stream entries may override this with
+        ``(gate, where, which)``. Explicit ``ind_id`` still wins for entries
+        without their own ``which`` value.
     **kwargs
         Forwarded to the selected implementation. Common options include
-        ``ind_id``, ``contract``, ``cutoff``, ``inplace``, and optional final
-        compression controls ``chi`` / ``chi_cutoff``.
+        ``ind_id``, ``contract``, ``cutoff``, ``max_bond``, ``inplace``,
+        optional final compression controls ``chi`` / ``chi_cutoff``, and
+        route-local controls ``path_canonize`` / ``path_compress``. Use
+        ``max_bond`` for the per-SWAP/per-gate local split truncation;
+        ``chi`` is a final whole-network compression pass after the stream.
 
     Returns
     -------
@@ -1146,13 +1541,35 @@ def gate(tn, gates, where=None, **kwargs):
     For nonlocal two-site gates, long-range SWAP routing is used in 1D/2D/3D
     when ``contract`` is ``"split"`` or ``"reduce-split"``. For other contract
     modes, the gate is applied directly to the requested endpoints.
+    By default, 2D/3D routing uses ``sequence="auto"`` to choose a shortest
+    route with the smallest current virtual-bond bottleneck. Pass an explicit
+    deterministic sequence to force a particular route.
+    The efficient routed pattern is::
+
+        gate(
+            peps,
+            G,
+            where,
+            max_bond=chi,
+            cutoff=cutoff,
+            path_canonize=True,
+            path_compress=False,
+        )
+
+    Here ``path_canonize=True`` performs one local canonization around the full
+    route before the SWAP/gate/SWAP-back sequence. Each local split already
+    receives ``max_bond``; ``path_compress=True`` is only an extra cleanup pass
+    over the route bonds after the sequence.
     """
-    entries = _normalize_gate_entries(gates, where=where, allow_empty=True)
+    entries = _normalize_gate_entries(
+        gates, where=where, allow_empty=True, allow_which=True
+    )
     opts = dict(kwargs)
     opts.setdefault("cutoff_mode", "rel")
     inplace = opts.pop("inplace", True)
     chi = opts.pop("chi", None)
     chi_cutoff = float(opts.pop("chi_cutoff", 1.0e-12))
+    which_default = _normalize_gate_which(which)
     if "gauges" in opts or "renorm" in opts or "smudge" in opts:
         raise TypeError(
             "gate() no longer accepts 'gauges'/'renorm'/'smudge'. "
@@ -1164,7 +1581,7 @@ def gate(tn, gates, where=None, **kwargs):
         _apply_chi_compression(tn_work, chi=chi, chi_cutoff=chi_cutoff)
         return tn_work
 
-    for gate_payload, where_payload in entries:
+    for gate_payload, where_payload, which_payload in entries:
         if _is_explicit_index_where(where_payload):
             inds = [where_payload] if isinstance(where_payload, str) else list(where_payload)
             opts_local = dict(opts)
@@ -1187,6 +1604,10 @@ def gate(tn, gates, where=None, **kwargs):
         if arity == 1:
             opts_local = dict(opts)
             opts_local.setdefault("contract", "split-gate")
+            if which_payload is not None:
+                opts_local["ind_id"] = _ind_id_from_which(which_payload, 1)
+            elif (which_default is not None) and ("ind_id" not in opts_local):
+                opts_local["ind_id"] = _ind_id_from_which(which_default, 1)
             where_norm = _normalize_where_arg_1d(where_payload)
             if len(where_norm) == 1 and not isinstance(opts_local.get("contract"), bool):
                 opts_local["contract"] = True
@@ -1219,6 +1640,10 @@ def gate(tn, gates, where=None, **kwargs):
         if arity == 2:
             opts_local = dict(opts)
             opts_local.setdefault("contract", "split")
+            if which_payload is not None:
+                opts_local["ind_id"] = _ind_id_from_which(which_payload, 2)
+            elif (which_default is not None) and ("ind_id" not in opts_local):
+                opts_local["ind_id"] = _ind_id_from_which(which_default, 2)
             where_norm = _normalize_where_arg_2d(where_payload)
             if len(where_norm) == 1 and not isinstance(opts_local.get("contract"), bool):
                 opts_local["contract"] = True
@@ -1233,6 +1658,10 @@ def gate(tn, gates, where=None, **kwargs):
         if arity == 3:
             opts_local = dict(opts)
             opts_local.setdefault("contract", "split")
+            if which_payload is not None:
+                opts_local["ind_id"] = _ind_id_from_which(which_payload, 3)
+            elif (which_default is not None) and ("ind_id" not in opts_local):
+                opts_local["ind_id"] = _ind_id_from_which(which_default, 3)
             where_norm = _normalize_where_arg_3d(where_payload)
             if len(where_norm) == 1 and not isinstance(opts_local.get("contract"), bool):
                 opts_local["contract"] = True
@@ -1257,22 +1686,37 @@ def gate(tn, gates, where=None, **kwargs):
 def gate_simple(
     tn,
     G,
-    where,
-    gauges,
+    where=None,
+    gauges=None,
     *,
+    which=None,
+    ind_id=None,
     renorm=True,
     smudge=1e-12,
     max_bond=None,
     cutoff=1e-12,
     cutoff_mode="rsum2",
+    sequence="auto",
+    path_canonize=False,
+    path_canonize_distance=1,
+    path_canonize_opts=None,
+    path_compress=False,
+    path_compress_max_bond=None,
+    path_compress_cutoff=None,
+    path_compress_canonize_distance=0,
+    path_compress_opts=None,
     inplace=True,
 ):
-    """Apply a gate using simple-update gauges (with long-range SWAP routing).
+    """Apply one or many gates using simple-update gauges.
 
     Thin pepsy wrapper around quimb's ``tn.gate_simple_()`` that adds:
 
+    * Canonical bundled gate streams ``((G1, where1), (G2, where2), ...)``.
+      Entries may use ``(G, where, "upper"|"lower")`` to override ``which``.
     * Automatic long-range SWAP routing when the two sites are not adjacent
       (works for 1D / 2D / 3D ``where`` coordinates).
+    * ``which``/``ind_id`` selection for vector-like networks whose physical
+      site-index family is not the default ``k...`` family.
     * Backend alignment of internal SWAP tensors with the TN sample data.
     * Optional out-of-place semantics via ``inplace=False``.
 
@@ -1284,25 +1728,40 @@ def gate_simple(
     tn : qtn.TensorNetwork
         Tensor network supporting ``gate_simple_()`` (1D MPS, 2D PEPS, 3D PEPS).
     G : array_like
-        Gate tensor.
-    where : tuple
-        Site coordinates. For a one-site gate: ``(site,)`` or ``site``.
+        Gate tensor, or bundled gate stream.
+    where : tuple, optional
+        Site coordinates for single-gate form. For a one-site gate: ``(site,)``
+        or ``site``.
         For a two-site gate: ``(site_a, site_b)``, where each ``site`` is an
         ``int`` (1D) or a tuple ``(i, j)`` / ``(i, j, k)`` (2D / 3D).
     gauges : dict
         Simple-update gauge dictionary keyed by bond index (mutated in place).
+    which : {"upper", "lower"} | None, optional
+        Convenience selector for the physical index family. ``"upper"`` maps
+        to ``k...`` indices and ``"lower"`` maps to ``b...`` indices.
+    ind_id : str | None, optional
+        Explicit physical index format, e.g. ``"k{}"``, ``"b{},{}"``.
     renorm : bool, optional
         Whether to renormalize the singular values after the gate. Default True.
         Ignored for one-site gates.
     smudge : float, optional
         Small numerical-safety value. Default 1e-12.
     max_bond : int or None, optional
-        Maximum bond dimension for the gate application. Default None.
+        Maximum bond dimension for each local SWAP/gate simple-update split.
+        Default None.
     cutoff : float, optional
         Truncation cutoff. Default 1e-12.
     cutoff_mode : str, optional
         Cutoff mode passed to ``gate_simple_`` (e.g. ``'rsum2'``, ``'rel'``).
         Default ``'rsum2'``.
+    sequence : object, optional
+        Long-range routing preference. Defaults to ``"auto"``, which chooses a
+        shortest 2D/3D path with the smallest current bond-dimension bottleneck.
+    path_canonize, path_compress : bool, optional
+        If enabled, ``path_canonize`` uses one local ``canonize_around_`` call
+        before the full route, while ``path_compress`` runs an extra
+        ``compress_between`` cleanup on route bonds after the gate/SWAP
+        sequence. The local gate calls already receive ``max_bond``.
     inplace : bool, optional
         If False, work on a copy of ``tn``. Default True.
 
@@ -1311,7 +1770,17 @@ def gate_simple(
     qtn.TensorNetwork
         The updated tensor network (same object as ``tn`` when ``inplace=True``).
     """
+    if gauges is None and isinstance(where, dict):
+        gauges = where
+        where = None
+    if gauges is None:
+        raise TypeError("gate_simple() requires a gauges dictionary.")
+
     tn_work = tn if inplace else (tn.copy() if hasattr(tn, "copy") else tn)
+    entries = _normalize_gate_entries(
+        G, where=where, allow_empty=True, allow_which=True
+    )
+    which_default = _normalize_gate_which(which)
 
     gate_opts = {
         "cutoff": cutoff,
@@ -1320,6 +1789,141 @@ def gate_simple(
     if max_bond is not None:
         gate_opts["max_bond"] = int(max_bond)
 
+    for gate_payload, where_payload, which_payload in entries:
+        if _is_explicit_index_where(where_payload):
+            raise ValueError(
+                "gate_simple() requires lattice site coordinates, not explicit "
+                "index-name selectors."
+            )
+
+        arity = _infer_where_arity_for_gate(tn_work, where_payload)
+        if arity == 1:
+            where_norm = _normalize_where_arg_1d(where_payload)
+        elif arity == 2:
+            where_norm = _normalize_where_arg_2d(where_payload)
+        elif arity == 3:
+            where_norm = _normalize_where_arg_3d(where_payload)
+        elif arity is not None and arity > 3:
+            raise NotImplementedError(
+                "gate_simple currently supports only 1D, 2D, and 3D coordinates."
+            )
+        else:
+            raise ValueError("Could not infer gate dimensionality from where.")
+
+        ind_id_local = ind_id
+        if which_payload is not None:
+            ind_id_local = _ind_id_from_which(which_payload, arity)
+        elif which_default is not None:
+            ind_id_local = _ind_id_from_which(which_default, arity)
+
+        if ind_id_local is not None:
+            _validate_gate_target_inds_exist(tn_work, where_norm, ind_id_local)
+
+        _gate_simple_one(
+            tn_work,
+            gate_payload,
+            where_norm,
+            gauges,
+            renorm=renorm,
+            smudge=smudge,
+            gate_opts=gate_opts,
+            ind_id=ind_id_local,
+            sequence=sequence,
+            path_canonize=path_canonize,
+            path_canonize_distance=path_canonize_distance,
+            path_canonize_opts=path_canonize_opts,
+            path_compress=path_compress,
+            path_compress_max_bond=path_compress_max_bond,
+            path_compress_cutoff=path_compress_cutoff,
+            path_compress_canonize_distance=path_compress_canonize_distance,
+            path_compress_opts=path_compress_opts,
+        )
+
+    return tn_work
+
+
+def _gate_simple_one(
+    tn_work,
+    G,
+    where,
+    gauges,
+    *,
+    renorm,
+    smudge,
+    gate_opts,
+    ind_id=None,
+    sequence=None,
+    path_canonize=False,
+    path_canonize_distance=1,
+    path_canonize_opts=None,
+    path_compress=False,
+    path_compress_max_bond=None,
+    path_compress_cutoff=None,
+    path_compress_canonize_distance=0,
+    path_compress_opts=None,
+):
+    """Apply a single normalized gate through quimb simple update."""
+    if not hasattr(tn_work, "gate_simple_"):
+        raise TypeError(
+            "gate_simple() requires a vector-like tensor network supporting "
+            "gate_simple_(); use gate(..., which=...) or gate_nonlocal_opt(...) "
+            "for MPO/PEPO operator layers."
+        )
+
+    has_site_ind_id = hasattr(tn_work, "site_ind_id")
+    old_site_ind_id = getattr(tn_work, "site_ind_id", None)
+    if ind_id is not None:
+        if not has_site_ind_id:
+            raise ValueError(
+                "gate_simple() can only use ind_id/which on tensor networks "
+                "with a site_ind_id attribute."
+            )
+        tn_work.site_ind_id = ind_id
+
+    try:
+        return _gate_simple_one_with_current_site_ind_id(
+            tn_work,
+            G,
+            where,
+            gauges,
+            renorm=renorm,
+            smudge=smudge,
+            gate_opts=gate_opts,
+            sequence=sequence,
+            path_canonize=path_canonize,
+            path_canonize_distance=path_canonize_distance,
+            path_canonize_opts=path_canonize_opts,
+            path_compress=path_compress,
+            path_compress_max_bond=path_compress_max_bond,
+            path_compress_cutoff=path_compress_cutoff,
+            path_compress_canonize_distance=path_compress_canonize_distance,
+            path_compress_opts=path_compress_opts,
+        )
+    finally:
+        if ind_id is not None and has_site_ind_id:
+            tn_work.site_ind_id = old_site_ind_id
+
+
+def _gate_simple_one_with_current_site_ind_id(
+    tn_work,
+    G,
+    where,
+    gauges,
+    *,
+    renorm,
+    smudge,
+    gate_opts,
+    sequence=None,
+    path_canonize=False,
+    path_canonize_distance=1,
+    path_canonize_opts=None,
+    path_compress=False,
+    path_compress_max_bond=None,
+    path_compress_cutoff=None,
+    path_compress_canonize_distance=0,
+    path_compress_opts=None,
+):
+    """Apply a single gate assuming ``site_ind_id`` has already been selected."""
     # One-site gate — no gauge update needed.
     if len(where) == 1:
         tn_work.gate_simple_(
@@ -1330,15 +1934,35 @@ def gate_simple(
 
     # Two-site gate — check if the sites share a bond.
     site_a, site_b = where
+    if site_a == site_b:
+        raise ValueError("Two-site gate requires distinct coordinates.")
+
     tag_a = tn_work.site_tag(site_a)
     tag_b = tn_work.site_tag(site_b)
     adjacent = bool(qtn.bonds(tn_work[tag_a], tn_work[tag_b]))
 
     if adjacent:
+        path_pairs = [(site_a, site_b)]
+        _maybe_canonize_path(
+            tn_work,
+            path_pairs,
+            path_canonize=path_canonize,
+            path_canonize_distance=path_canonize_distance,
+            path_canonize_opts=path_canonize_opts,
+        )
         tn_work.gate_simple_(
             G, where=where, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
             **gate_opts,
+        )
+        _maybe_compress_path(
+            tn_work,
+            path_pairs,
+            path_compress=path_compress,
+            max_bond=path_compress_max_bond if path_compress_max_bond is not None else gate_opts.get("max_bond"),
+            cutoff=path_compress_cutoff if path_compress_cutoff is not None else gate_opts.get("cutoff", 1.0e-12),
+            path_compress_canonize_distance=path_compress_canonize_distance,
+            path_compress_opts=path_compress_opts,
         )
         return tn_work
 
@@ -1346,7 +1970,10 @@ def gate_simple(
     # TN sample backend so the gate_simple_ call sees consistent dtypes.
     swap_gate = qu.swap(dim=2, dtype="complex128").reshape(2, 2, 2, 2)
     backend_sample = resolve_backend_sample_data_from_tn(tn_work)
-    inferred_converter = infer_backend_converter_from_sample(backend_sample)
+    inferred_converter = infer_backend_converter_from_sample(
+        backend_sample,
+        cast_complex_to_real=True,
+    )
     if inferred_converter is not None:
         try:
             swap_gate = inferred_converter(swap_gate)
@@ -1358,23 +1985,34 @@ def gate_simple(
         path_pairs = list(gen_long_range_swap_path_1d(site_a, site_b))
     elif ndim == 2:
         cyclic = bool(getattr(tn_work, "_cyclic", False))
-        path_pairs = list(gen_long_range_swap_path_2d(
+        path_pairs = _select_long_range_swap_path_2d(
+            tn_work,
             site_a, site_b, cyclic=cyclic,
             Lx=getattr(tn_work, "Lx", None),
             Ly=getattr(tn_work, "Ly", None),
-        ))
+            sequence=sequence,
+        )
     elif ndim == 3:
         cyclic = bool(getattr(tn_work, "_cyclic", False))
-        path_pairs = list(gen_long_range_swap_path_3d(
+        path_pairs = _select_long_range_swap_path_3d(
+            tn_work,
             site_a, site_b, cyclic=cyclic,
             Lx=getattr(tn_work, "Lx", None),
             Ly=getattr(tn_work, "Ly", None),
             Lz=getattr(tn_work, "Lz", None),
-        ))
+            sequence=sequence,
+        )
     else:
         raise ValueError(f"gate_simple: unsupported dimensionality: {ndim}")
 
     *swaps, final = path_pairs
+    _maybe_canonize_path(
+        tn_work,
+        path_pairs,
+        path_canonize=path_canonize,
+        path_canonize_distance=path_canonize_distance,
+        path_canonize_opts=path_canonize_opts,
+    )
 
     # Forward SWAPs.
     for pair in swaps:
@@ -1398,6 +2036,16 @@ def gate_simple(
             renorm=renorm, smudge=smudge, inplace=True,
             **gate_opts,
         )
+
+    _maybe_compress_path(
+        tn_work,
+        path_pairs,
+        path_compress=path_compress,
+        max_bond=path_compress_max_bond if path_compress_max_bond is not None else gate_opts.get("max_bond"),
+        cutoff=path_compress_cutoff if path_compress_cutoff is not None else gate_opts.get("cutoff", 1.0e-12),
+        path_compress_canonize_distance=path_compress_canonize_distance,
+        path_compress_opts=path_compress_opts,
+    )
 
     return tn_work
 
@@ -1449,24 +2097,33 @@ def _apply_gate_2d(
     where,
     *,
     bond_dim=None,
+    max_bond=None,
     bra=False,
     contract="split",
     tags=None,
     dtype="complex128",
     cutoff=1.0e-12,
     canonize_distance=2,
-    sequence=("av", "bh", "ah", "bv"),
+    sequence="auto",
     cyclic=False,
     Lx=None,
     Ly=None,
     ind_id="k{},{}",
     cutoff_mode="rel",
+    path_canonize=False,
+    path_canonize_distance=1,
+    path_canonize_opts=None,
+    path_compress=False,
+    path_compress_max_bond=None,
+    path_compress_cutoff=None,
+    path_compress_canonize_distance=0,
+    path_compress_opts=None,
 ):
     """Apply a single normalized 2D gate, routing long-range pairs with SWAPs."""
 
-    if bra or (canonize_distance != 2):
+    if bra:
         warnings.warn(
-            "Unused options in gate(...): 'bra' and/or 'canonize_distance' for 2D gates.",
+            "Unused option in gate(...): 'bra' for 2D gates.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1475,6 +2132,8 @@ def _apply_gate_2d(
         tags = ["G"]
 
     G_apply = gate
+    split_max_bond = max_bond if max_bond is not None else bond_dim
+    split_opts = _local_split_opts(split_max_bond)
 
     if len(where) == 1:
         ((i, j),) = where
@@ -1504,6 +2163,14 @@ def _apply_gate_2d(
     if contract not in ("split", "reduce-split"):
         i, j = x
         m, n = y
+        path_pairs = [(x, y)]
+        _maybe_canonize_path(
+            peps,
+            path_pairs,
+            path_canonize=path_canonize,
+            path_canonize_distance=path_canonize_distance,
+            path_canonize_opts=path_canonize_opts,
+        )
         qtn.tensor_network_gate_inds(
             peps,
             G_apply,
@@ -1514,11 +2181,24 @@ def _apply_gate_2d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            **split_opts,
+        )
+        _maybe_compress_path(
+            peps,
+            path_pairs,
+            path_compress=path_compress,
+            max_bond=path_compress_max_bond if path_compress_max_bond is not None else split_max_bond,
+            cutoff=path_compress_cutoff if path_compress_cutoff is not None else cutoff,
+            path_compress_canonize_distance=path_compress_canonize_distance,
+            path_compress_opts=path_compress_opts,
         )
         return peps
 
     backend_sample = resolve_backend_sample_data_from_tn(peps)
-    inferred_converter = infer_backend_converter_from_sample(backend_sample)
+    inferred_converter = infer_backend_converter_from_sample(
+        backend_sample,
+        cast_complex_to_real=True,
+    )
     swap = qu.swap(dim=2, dtype=dtype).reshape(2, 2, 2, 2)
     if inferred_converter is not None:
         try:
@@ -1532,13 +2212,22 @@ def _apply_gate_2d(
         lx_use = getattr(peps, "Lx", lx_use)
         ly_use = getattr(peps, "Ly", ly_use)
 
-    *swaps, final = gen_long_range_swap_path_2d(
+    path_pairs = _select_long_range_swap_path_2d(
+        peps,
         x,
         y,
         sequence=sequence,
         cyclic=cyclic,
         Lx=lx_use,
         Ly=ly_use,
+    )
+    *swaps, final = path_pairs
+    _maybe_canonize_path(
+        peps,
+        path_pairs,
+        path_canonize=path_canonize,
+        path_canonize_distance=path_canonize_distance,
+        path_canonize_opts=path_canonize_opts,
     )
 
     for pair in swaps:
@@ -1555,7 +2244,7 @@ def _apply_gate_2d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            max_bond=bond_dim,
+            **split_opts,
         )
 
     x_, y_ = final
@@ -1571,6 +2260,7 @@ def _apply_gate_2d(
         inplace=True,
         cutoff=cutoff,
         cutoff_mode=cutoff_mode,
+        **split_opts,
     )
 
     for pair in reversed(swaps):
@@ -1587,7 +2277,18 @@ def _apply_gate_2d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            **split_opts,
         )
+
+    _maybe_compress_path(
+        peps,
+        path_pairs,
+        path_compress=path_compress,
+        max_bond=path_compress_max_bond if path_compress_max_bond is not None else split_max_bond,
+        cutoff=path_compress_cutoff if path_compress_cutoff is not None else cutoff,
+        path_compress_canonize_distance=path_compress_canonize_distance,
+        path_compress_opts=path_compress_opts,
+    )
 
     return peps
 
@@ -1662,25 +2363,34 @@ def _apply_gate_3d(
     where,
     *,
     bond_dim=None,
+    max_bond=None,
     bra=False,
     contract="split",
     tags=None,
     dtype="complex128",
     cutoff=1.0e-12,
     canonize_distance=2,
-    sequence=("ax", "bx", "ay", "by", "az", "bz"),
+    sequence="auto",
     cyclic=False,
     Lx=None,
     Ly=None,
     Lz=None,
     ind_id="k{},{},{}",
     cutoff_mode="rel",
+    path_canonize=False,
+    path_canonize_distance=1,
+    path_canonize_opts=None,
+    path_compress=False,
+    path_compress_max_bond=None,
+    path_compress_cutoff=None,
+    path_compress_canonize_distance=0,
+    path_compress_opts=None,
 ):
     """Apply a single normalized 3D gate, routing long-range pairs with SWAPs."""
 
-    if bra or (canonize_distance != 2):
+    if bra:
         warnings.warn(
-            "Unused options in gate(...): 'bra' and/or 'canonize_distance' for 3D gates.",
+            "Unused option in gate(...): 'bra' for 3D gates.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1689,6 +2399,8 @@ def _apply_gate_3d(
         tags = ["G"]
 
     G_apply = gate
+    split_max_bond = max_bond if max_bond is not None else bond_dim
+    split_opts = _local_split_opts(split_max_bond)
 
     if len(where) == 1:
         ((i, j, k),) = where
@@ -1715,6 +2427,14 @@ def _apply_gate_3d(
     if contract not in ("split", "reduce-split"):
         i, j, k = x
         m, n, p = y
+        path_pairs = [(x, y)]
+        _maybe_canonize_path(
+            tn,
+            path_pairs,
+            path_canonize=path_canonize,
+            path_canonize_distance=path_canonize_distance,
+            path_canonize_opts=path_canonize_opts,
+        )
         qtn.tensor_network_gate_inds(
             tn,
             G_apply,
@@ -1725,11 +2445,24 @@ def _apply_gate_3d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            **split_opts,
+        )
+        _maybe_compress_path(
+            tn,
+            path_pairs,
+            path_compress=path_compress,
+            max_bond=path_compress_max_bond if path_compress_max_bond is not None else split_max_bond,
+            cutoff=path_compress_cutoff if path_compress_cutoff is not None else cutoff,
+            path_compress_canonize_distance=path_compress_canonize_distance,
+            path_compress_opts=path_compress_opts,
         )
         return tn
 
     backend_sample = resolve_backend_sample_data_from_tn(tn)
-    inferred_converter = infer_backend_converter_from_sample(backend_sample)
+    inferred_converter = infer_backend_converter_from_sample(
+        backend_sample,
+        cast_complex_to_real=True,
+    )
     swap = qu.swap(dim=2, dtype=dtype).reshape(2, 2, 2, 2)
     if inferred_converter is not None:
         try:
@@ -1745,7 +2478,8 @@ def _apply_gate_3d(
         ly_use = getattr(tn, "Ly", ly_use)
         lz_use = getattr(tn, "Lz", lz_use)
 
-    *swaps, final = gen_long_range_swap_path_3d(
+    path_pairs = _select_long_range_swap_path_3d(
+        tn,
         x,
         y,
         sequence=sequence,
@@ -1753,6 +2487,14 @@ def _apply_gate_3d(
         Lx=lx_use,
         Ly=ly_use,
         Lz=lz_use,
+    )
+    *swaps, final = path_pairs
+    _maybe_canonize_path(
+        tn,
+        path_pairs,
+        path_canonize=path_canonize,
+        path_canonize_distance=path_canonize_distance,
+        path_canonize_opts=path_canonize_opts,
     )
 
     for pair in swaps:
@@ -1769,7 +2511,7 @@ def _apply_gate_3d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            max_bond=bond_dim,
+            **split_opts,
         )
 
     x_, y_ = final
@@ -1785,6 +2527,7 @@ def _apply_gate_3d(
         inplace=True,
         cutoff=cutoff,
         cutoff_mode=cutoff_mode,
+        **split_opts,
     )
 
     for pair in reversed(swaps):
@@ -1801,7 +2544,18 @@ def _apply_gate_3d(
             inplace=True,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
+            **split_opts,
         )
+
+    _maybe_compress_path(
+        tn,
+        path_pairs,
+        path_compress=path_compress,
+        max_bond=path_compress_max_bond if path_compress_max_bond is not None else split_max_bond,
+        cutoff=path_compress_cutoff if path_compress_cutoff is not None else cutoff,
+        path_compress_canonize_distance=path_compress_canonize_distance,
+        path_compress_opts=path_compress_opts,
+    )
 
     return tn
 
@@ -1815,7 +2569,7 @@ def build_pepo_from_gates(
     pepo_=None,
     dtype="complex128",
     max_bond=16,
-    sequence=("av", "bh", "ah", "bv"),
+    sequence="auto",
     contract="split",
     ind_id="k{},{}",
 ):
@@ -1843,9 +2597,12 @@ def build_pepo_from_gates(
     dtype : str, default="complex128"
         Dtype used when creating an identity PEPO.
     max_bond : int, default=16
-        Compression cap applied during construction.
-    sequence : tuple[str, ...], optional
-        2D SWAP-path preference sequence for long-range two-site gates.
+        Per-gate local split truncation cap and fallback construction
+        compression cap.
+    sequence : object, optional
+        2D SWAP-path preference for long-range two-site gates. Defaults to
+        ``"auto"`` for the same lower-bond smart routing used by
+        :func:`gate`.
     contract : str, default="split"
         Gate contraction mode.
     ind_id : str, default="k{},{}"
@@ -1876,7 +2633,7 @@ def build_pepo_from_gates(
 
         gate(
             pepo, gate_use, where_norm,
-            bond_dim=max_bond, bra=False, contract=contract,
+            max_bond=max_bond, bra=False, contract=contract,
             tags=[], dtype=dtype, cutoff=cutoff,
             sequence=sequence, cyclic=cyclic, Lx=Lx, Ly=Ly, ind_id=ind_id,
             inplace=True,
@@ -1954,7 +2711,8 @@ def build_mpo_from_gates(
     dtype : str, default="complex128"
         Dtype used when creating an identity MPO.
     max_bond : int, default=16
-        Compression cap applied during construction.
+        Per-gate local split truncation cap and fallback construction
+        compression cap.
     contract : str, default="split"
         Gate contraction mode.
     ind_id : str, default="k{}"
@@ -1989,6 +2747,7 @@ def build_mpo_from_gates(
             ind_id=ind_id,
             cutoff=cutoff,
             contract=contract,
+            max_bond=max_bond,
             inplace=True,
             dtype=dtype,
         )
@@ -2052,10 +2811,20 @@ def _apply_gate_1d(
     *,
     dtype="complex128",
     cutoff_mode="rel",
+    max_bond=None,
+    path_canonize=False,
+    path_canonize_distance=1,
+    path_canonize_opts=None,
+    path_compress=False,
+    path_compress_max_bond=None,
+    path_compress_cutoff=None,
+    path_compress_canonize_distance=0,
+    path_compress_opts=None,
 ):
     """Apply a single normalized 1D gate on one or two sites."""
 
     G_apply = gate
+    split_opts = _local_split_opts(max_bond)
 
     if len(where) == 2:
         x, y = where
@@ -2069,7 +2838,10 @@ def _apply_gate_1d(
 
         if route_with_swaps:
             backend_sample = resolve_backend_sample_data_from_tn(tn)
-            inferred_converter = infer_backend_converter_from_sample(backend_sample)
+            inferred_converter = infer_backend_converter_from_sample(
+                backend_sample,
+                cast_complex_to_real=True,
+            )
             swap = qu.swap(dim=2, dtype=dtype).reshape(2, 2, 2, 2)
             if inferred_converter is not None:
                 try:
@@ -2077,7 +2849,15 @@ def _apply_gate_1d(
                 except (TypeError, ValueError):
                     pass
 
-            *swaps, final = gen_long_range_swap_path_1d(x, y)
+            path_pairs = list(gen_long_range_swap_path_1d(x, y))
+            *swaps, final = path_pairs
+            _maybe_canonize_path(
+                tn,
+                path_pairs,
+                path_canonize=path_canonize,
+                path_canonize_distance=path_canonize_distance,
+                path_canonize_opts=path_canonize_opts,
+            )
 
             for i_, j_ in swaps:
                 tn = qtn.tensor_network_gate_inds(
@@ -2088,6 +2868,7 @@ def _apply_gate_1d(
                     inplace=inplace,
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
+                    **split_opts,
                 )
 
             i_, j_ = final
@@ -2099,6 +2880,7 @@ def _apply_gate_1d(
                 inplace=inplace,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
+                **split_opts,
             )
 
             for i_, j_ in reversed(swaps):
@@ -2110,8 +2892,26 @@ def _apply_gate_1d(
                     inplace=inplace,
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
+                    **split_opts,
                 )
+            _maybe_compress_path(
+                tn,
+                path_pairs,
+                path_compress=path_compress,
+                max_bond=path_compress_max_bond if path_compress_max_bond is not None else max_bond,
+                cutoff=path_compress_cutoff if path_compress_cutoff is not None else cutoff,
+                path_compress_canonize_distance=path_compress_canonize_distance,
+                path_compress_opts=path_compress_opts,
+            )
         else:
+            path_pairs = [(x, y)]
+            _maybe_canonize_path(
+                tn,
+                path_pairs,
+                path_canonize=path_canonize,
+                path_canonize_distance=path_canonize_distance,
+                path_canonize_opts=path_canonize_opts,
+            )
             tn = qtn.tensor_network_gate_inds(
                 tn,
                 G_apply,
@@ -2120,6 +2920,16 @@ def _apply_gate_1d(
                 inplace=inplace,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
+                **split_opts,
+            )
+            _maybe_compress_path(
+                tn,
+                path_pairs,
+                path_compress=path_compress,
+                max_bond=path_compress_max_bond if path_compress_max_bond is not None else max_bond,
+                cutoff=path_compress_cutoff if path_compress_cutoff is not None else cutoff,
+                path_compress_canonize_distance=path_compress_canonize_distance,
+                path_compress_opts=path_compress_opts,
             )
 
             # Add site tags after the gate has been applied.
@@ -2136,6 +2946,7 @@ def _apply_gate_1d(
             [_format_ind_id(ind_id, x)],
             contract=contract,
             inplace=inplace,
+            **split_opts,
         )
 
     else:

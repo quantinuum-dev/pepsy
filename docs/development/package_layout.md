@@ -26,7 +26,7 @@ Use the clearer namespaces for submodule imports:
 
 ```python
 from pepsy.boundary import BdyMPS, contract_boundary
-from pepsy.optimizers import SweepOptimizer, MpsOptimizer
+from pepsy.optimizers import SweepOptimizer, MpsOptimizer, PepsOptimizer
 from pepsy.operators import rx, rzz, gate
 from pepsy.tensors import haar_random_state, ps_to_peps, ps_to_3dpeps, ps_to_mps
 ```

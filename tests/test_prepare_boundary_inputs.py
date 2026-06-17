@@ -408,6 +408,29 @@ def test_contract_boundary_includes_requested_metadata(monkeypatch):
     assert out.max_separation == 1
 
 
+def test_contract_boundary_can_return_stripped_exponent(monkeypatch):
+    """contract_boundary(strip_exponent=True) should preserve scaled output."""
+    captured = {}
+
+    class _FakeCompBdy:
+        def __init__(self, *_args, **_kwargs):
+            self.fidel = []
+
+        def run(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return 1.25, 42.0
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "CompBdy", _FakeCompBdy)
+    out = pepsy.contract_boundary(
+        norm=_DummyNorm(),
+        bdy={"bdy": type("B", (), {"mps_b": {}})()},
+        strip_exponent=True,
+    )
+
+    assert captured["run_kwargs"]["strip_exponent"] is True
+    assert out.cost == (1.25, 42.0)
+
+
 def test_contract_boundary_accepts_bdy_object(monkeypatch):
     """contract_boundary should accept bdy object instead of mps_boundaries."""
     captured = {}
@@ -647,7 +670,7 @@ def test_normalize_returns_old_norm_and_updates_state_in_place(monkeypatch):
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=131, dtype="complex128")
     ket_id_before = id(ket)
-    old_norm = pepsy.normalize(
+    old_norm = pepsy.peps_normalize(
         ket,
         chi=8,
         n_iter=1,
@@ -658,6 +681,46 @@ def test_normalize_returns_old_norm_and_updates_state_in_place(monkeypatch):
     assert id(ket) == ket_id_before
     assert captured["contract_kwargs"]["bdy"] is not None
     assert "tn_double" in captured["bdy_kwargs"]
+
+
+def test_normalize_strip_exponent_updates_tensor_network_exponent(monkeypatch):
+    """normalize(strip_exponent=True) should not reconstruct the full scale."""
+    captured = {}
+
+    class _FakeBdy:
+        def __init__(self):
+            self.mps_b = {"Y0_l": object()}
+
+    def fake_bdymps(**kwargs):
+        captured["bdy_kwargs"] = kwargs
+        return _FakeBdy()
+
+    def fake_contract_boundary(**kwargs):
+        captured["contract_kwargs"] = kwargs
+        return pepsy.BoundaryContractResult(
+            cost=(4.0, 6.0),
+            fidel=[],
+            direction=kwargs["direction"],
+            n_iter=kwargs["n_iter"],
+            max_separation=kwargs["max_separation"],
+        )
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
+
+    ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=134, dtype="complex128")
+    old_exponent = float(getattr(ket, "exponent", 0.0))
+    old_norm = pepsy.peps_normalize(
+        ket,
+        chi=8,
+        n_iter=1,
+        progress=False,
+        strip_exponent=True,
+    )
+
+    assert old_norm == (4.0, 6.0)
+    assert captured["contract_kwargs"]["strip_exponent"] is True
+    assert float(ket.exponent) == pytest.approx(old_exponent - 3.0)
 
 
 def test_normalize_uses_provided_bdy_without_constructing_new_one(monkeypatch):
@@ -687,7 +750,7 @@ def test_normalize_uses_provided_bdy_without_constructing_new_one(monkeypatch):
     monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=137, dtype="complex128")
-    old_norm = pepsy.normalize(
+    old_norm = pepsy.peps_normalize(
         ket,
         bdy=provided,
         n_iter=1,
@@ -725,7 +788,7 @@ def test_normalize_accepts_bdy_dict_and_creates_entry(monkeypatch):
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=147, dtype="complex128")
     bdy = {}
-    old_norm = pepsy.normalize(
+    old_norm = pepsy.peps_normalize(
         ket,
         chi=8,
         bdy=bdy,
@@ -767,7 +830,7 @@ def test_normalize_accepts_bdy_dict_with_existing_boundary(monkeypatch):
     monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=151, dtype="complex128")
-    old_norm = pepsy.normalize(
+    old_norm = pepsy.peps_normalize(
         ket,
         bdy=bdy,
         n_iter=1,
@@ -807,7 +870,7 @@ def test_normalize_expands_existing_boundary_when_chi_increases(monkeypatch):
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=157, dtype="complex128")
     bdy = {"bdy": _ExpandableBdy(4)}
-    old_norm = pepsy.normalize(
+    old_norm = pepsy.peps_normalize(
         ket,
         chi=10,
         bdy=bdy,
@@ -849,7 +912,7 @@ def test_normalize_retunes_existing_boundary_when_chi_decreases(monkeypatch):
 
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=158, dtype="complex128")
     bdy = {"bdy": _RetunableBdy(12)}
-    old_norm = pepsy.normalize(
+    old_norm = pepsy.peps_normalize(
         ket,
         chi=6,
         bdy=bdy,
@@ -867,7 +930,206 @@ def test_normalize_requires_chi_when_bdy_not_provided():
     """normalize should require chi if caller does not pass bdy."""
     ket = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=139, dtype="complex128")
     with pytest.raises(ValueError, match="Provide chi when bdy is not supplied."):
-        pepsy.normalize(ket)
+        pepsy.peps_normalize(ket)
+
+
+def test_peps_normalize_mps_method_uses_quimb_contract_boundary(monkeypatch):
+    """method='mps' should use the double-layer contract_boundary method."""
+    captured = {}
+
+    class _Ket:
+        def __init__(self):
+            self.divisor = None
+            self.balanced = False
+
+        def __itruediv__(self, value):
+            self.divisor = value
+            return self
+
+        def balance_bonds_(self):
+            self.balanced = True
+
+    class _Norm:
+        def contract_boundary(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return 4.0
+
+    def fake_build_bra_ket(ket=None, *, bra=None):
+        assert bra is None
+        return ket, _Norm()
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "build_bra_ket", fake_build_bra_ket)
+
+    ket = _Ket()
+    old_norm = pepsy.peps_normalize(
+        ket,
+        chi=7,
+        method="mps",
+        contraction_opt="OPT",
+        sequence=("xmin", "xmax"),
+        cutoff=1.0e-8,
+        equalize_norms=True,
+        progress=True,
+    )
+
+    assert old_norm == 4.0
+    assert ket.divisor == 2.0
+    assert ket.balanced is True
+    assert captured["kwargs"]["max_bond"] == 7
+    assert captured["kwargs"]["mode"] == "mps"
+    assert captured["kwargs"]["sequence"] == ("xmin", "xmax")
+    assert captured["kwargs"]["cutoff"] == 1.0e-8
+    assert captured["kwargs"]["equalize_norms"] is True
+    assert captured["kwargs"]["progbar"] is True
+    assert captured["kwargs"]["layer_tags"] == ["KET", "BRA"]
+    assert captured["kwargs"]["final_contract_opts"]["optimize"] == "OPT"
+
+
+def test_contract_flat_mps_does_not_add_default_layer_tags():
+    """Flat contractions should not assume PEPSY KET/BRA layer tags."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_boundary(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return (3.0, 2.0)
+
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        chi=5,
+        method="mps",
+        contraction_opt="OPT",
+        strip_exponent=True,
+        progress=True,
+    )
+
+    assert out == (3.0, 2.0)
+    assert "layer_tags" not in captured["kwargs"]
+    assert "mode" not in captured["kwargs"]
+    assert "strip_exponent" not in captured["kwargs"]
+    assert captured["kwargs"]["max_bond"] == 5
+    assert captured["kwargs"]["sequence"] == ("xmax", "xmin", "ymin", "ymax")
+    assert captured["kwargs"]["progbar"] is True
+    assert captured["kwargs"]["final_contract_opts"]["strip_exponent"] is True
+    assert captured["kwargs"]["final_contract_opts"]["optimize"] == "OPT"
+
+
+def test_contract_flat_dmrg_uses_flat_boundary_path(monkeypatch):
+    """method='dmrg' should build a flat BdyMPS and contract with flat=True."""
+    captured = {}
+    tn = type("Flat2D", (), {"Lx": 2, "Ly": 2, "tags": {"X0", "Y0"}})()
+
+    class _FakeBdy:
+        def __init__(self):
+            self.mps_b = {"Y0_l": object()}
+
+    def fake_bdymps(**kwargs):
+        captured["bdymps_kwargs"] = kwargs
+        return _FakeBdy()
+
+    def fake_contract_boundary(**kwargs):
+        captured["contract_kwargs"] = kwargs
+        return pepsy.BoundaryContractResult(
+            cost=7.0,
+            fidel=[],
+            direction=kwargs["direction"],
+            n_iter=kwargs["n_iter"],
+            max_separation=kwargs["max_separation"],
+        )
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
+
+    out = pepsy.contract_flat(tn, chi=4, method="dmrg", progress=False)
+
+    assert out == 7.0
+    assert captured["bdymps_kwargs"]["tn_flat"] is tn
+    assert captured["bdymps_kwargs"]["flat"] is True
+    assert captured["bdymps_kwargs"]["chi"] == 4
+    assert captured["contract_kwargs"]["norm"] is tn
+    assert captured["contract_kwargs"]["flat"] is True
+
+
+def test_contract_flat_default_auto_uses_quimb_for_3d():
+    """method='auto' should avoid PEPSY's 2D-only DMRG path for 3D TNs."""
+    captured = {}
+
+    class _Flat3D:
+        Lx = 2
+        Ly = 2
+        Lz = 2
+
+        def contract_boundary(self, **kwargs):
+            captured["kwargs"] = kwargs
+            return 5.0
+
+    out = pepsy.contract_flat(_Flat3D(), chi=3)
+
+    assert out == 5.0
+    assert captured["kwargs"]["max_bond"] == 3
+    assert captured["kwargs"]["sequence"] == (
+        "xmax",
+        "xmin",
+        "ymin",
+        "ymax",
+        "zmin",
+        "zmax",
+    )
+
+
+def test_contract_flat_rejects_dmrg_for_3d():
+    """PEPSY DMRG/FIT boundaries are 2D, so 3D flat TNs use quimb methods."""
+    tn = type("Flat3D", (), {"Lx": 2, "Ly": 2, "Lz": 2})()
+
+    with pytest.raises(ValueError, match="2D flat tensor networks"):
+        pepsy.contract_flat(tn, chi=3, method="dmrg")
+
+
+@pytest.mark.parametrize("method", ["exact", "ctmrg", "hotrg"])
+def test_contract_flat_quimb_routes_forward_strip_exponent(method):
+    """All quimb flat routes should preserve stripped contraction output."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract(self, *args, **kwargs):
+            captured["exact"] = (args, kwargs)
+            return (2.0, 3.0)
+
+        def contract_ctmrg(self, **kwargs):
+            captured["ctmrg"] = kwargs
+            return (2.0, 3.0)
+
+        def contract_hotrg(self, **kwargs):
+            captured["hotrg"] = kwargs
+            return (2.0, 3.0)
+
+    kwargs = {} if method == "exact" else {"chi": 4}
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method=method,
+        strip_exponent=True,
+        contraction_opt="OPT",
+        **kwargs,
+    )
+
+    assert out == (2.0, 3.0)
+    if method == "exact":
+        _, call_kwargs = captured["exact"]
+        assert call_kwargs["strip_exponent"] is True
+        assert call_kwargs["optimize"] == "OPT"
+    else:
+        call_kwargs = captured[method]
+        # strip_exponent must travel via final_contract_opts only; quimb's
+        # boundary routines reject a top-level strip_exponent kwarg.
+        assert "strip_exponent" not in call_kwargs
+        assert call_kwargs["final_contract_opts"]["strip_exponent"] is True
+        assert call_kwargs["final_contract_opts"]["optimize"] == "OPT"
 
 
 def test_infidelity_accepts_bdy_holder_dicts_and_fills_missing(monkeypatch):
@@ -908,7 +1170,7 @@ def test_infidelity_accepts_bdy_holder_dicts_and_fills_missing(monkeypatch):
     bdy_target = {}
     bdy_overlap = {}
 
-    out = pepsy.infidelity(
+    out = pepsy.peps_infidelity(
         p,
         p_target,
         chi=8,
@@ -923,6 +1185,183 @@ def test_infidelity_accepts_bdy_holder_dicts_and_fills_missing(monkeypatch):
     assert out["bdy_target"] is bdy_target["bdy"]
     assert out["bdy_overlap"] is bdy_overlap["bdy"]
     assert len(captured["contract_calls"]) == 3
+
+
+def test_infidelity_strip_exponent_uses_scaled_ratio(monkeypatch):
+    """infidelity(strip_exponent=True) should compare mantissa/exponent pairs."""
+    captured = {"contract_calls": []}
+
+    class _FakeBdy:
+        def __init__(self):
+            self.mps_b = {"Y0_l": object()}
+
+    def fake_bdymps(**kwargs):
+        _ = kwargs
+        return _FakeBdy()
+
+    def fake_contract_boundary(**kwargs):
+        captured["contract_calls"].append(kwargs)
+        idx = len(captured["contract_calls"])
+        cost = {1: (2.0, 10.0), 2: (8.0, 20.0), 3: (4.0, 15.0)}[idx]
+        return pepsy.BoundaryContractResult(
+            cost=cost,
+            fidel=[],
+            direction=kwargs["direction"],
+            n_iter=kwargs["n_iter"],
+            max_separation=kwargs["max_separation"],
+        )
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "BdyMPS", fake_bdymps)
+    monkeypatch.setattr(pepsy.boundary.metrics, "contract_boundary", fake_contract_boundary)
+
+    p = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=162, dtype="complex128")
+    p_target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=164, dtype="complex128")
+
+    out = pepsy.peps_infidelity(
+        p,
+        p_target,
+        chi=8,
+        progress=False,
+        strip_exponent=True,
+    )
+
+    assert all(call["strip_exponent"] is True for call in captured["contract_calls"])
+    assert out["norm"] == (2.0, 10.0)
+    assert out["norm_target"] == (8.0, 20.0)
+    assert out["overlap"] == (4.0, 15.0)
+    assert out["infidelity"] == pytest.approx(0.0)
+
+
+def test_peps_infidelity_ctmrg_skips_known_target_norm(monkeypatch):
+    """Known norm_target should skip the target self-overlap contraction."""
+    build_calls = []
+    contract_calls = []
+    p = object()
+    p_target = object()
+
+    class _Norm:
+        def __init__(self, label):
+            self.label = label
+
+        def contract_ctmrg(self, **kwargs):
+            contract_calls.append((self.label, kwargs))
+            return {"norm": 2.0, "overlap": 2.0}[self.label]
+
+    def fake_build_bra_ket(ket=None, *, bra=None):
+        if ket is p and bra is None:
+            label = "norm"
+        elif ket is p and bra is p_target:
+            label = "overlap"
+        elif ket is p_target and bra is None:
+            label = "target"
+        else:  # pragma: no cover - defensive branch for clearer failure
+            raise AssertionError("unexpected build_bra_ket inputs")
+        build_calls.append(label)
+        return ket, _Norm(label)
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "build_bra_ket", fake_build_bra_ket)
+
+    out = pepsy.peps_infidelity(
+        p,
+        p_target,
+        chi=9,
+        method="ctmrg",
+        norm_target=2.0,
+        contraction_opt="OPT",
+        cutoff=1.0e-7,
+        max_separation=2,
+        equalize_norms=True,
+        progress=True,
+    )
+
+    assert build_calls == ["norm", "overlap"]
+    assert [label for label, _ in contract_calls] == ["norm", "overlap"]
+    assert out["infidelity"] == pytest.approx(0.0)
+    assert out["bdy"] is None
+    assert out["bdy_target"] is None
+    assert out["bdy_overlap"] is None
+    for _, kwargs in contract_calls:
+        assert kwargs["max_bond"] == 9
+        assert kwargs["cutoff"] == 1.0e-7
+        assert kwargs["max_separation"] == 2
+        assert kwargs["equalize_norms"] is True
+        assert kwargs["progbar"] is True
+        assert kwargs["inplace"] is False
+        assert kwargs["layer_tags"] == ["KET", "BRA"]
+        assert kwargs["final_contract_opts"]["optimize"] == "OPT"
+
+
+def test_peps_infidelity_mps_uses_layer_tags_for_all_contractions(monkeypatch):
+    """MPS boundary infidelity should use KET/BRA layers for each TN."""
+    build_calls = []
+    contract_calls = []
+    p = object()
+    p_target = object()
+
+    class _Norm:
+        def __init__(self, label):
+            self.label = label
+
+        def contract_boundary(self, **kwargs):
+            contract_calls.append((self.label, kwargs))
+            return {"norm": 2.0, "target": 2.0, "overlap": 2.0}[self.label]
+
+    def fake_build_bra_ket(ket=None, *, bra=None):
+        if ket is p and bra is None:
+            label = "norm"
+        elif ket is p_target and bra is None:
+            label = "target"
+        elif ket is p and bra is p_target:
+            label = "overlap"
+        else:  # pragma: no cover - defensive branch for clearer failure
+            raise AssertionError("unexpected build_bra_ket inputs")
+        build_calls.append(label)
+        return ket, _Norm(label)
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "build_bra_ket", fake_build_bra_ket)
+
+    out = pepsy.peps_infidelity(
+        p,
+        p_target,
+        chi=5,
+        method="mps",
+        progress=False,
+    )
+
+    assert build_calls == ["norm", "target", "overlap"]
+    assert [label for label, _ in contract_calls] == ["norm", "target", "overlap"]
+    assert out["infidelity"] == pytest.approx(0.0)
+    for _, kwargs in contract_calls:
+        assert kwargs["layer_tags"] == ["KET", "BRA"]
+        assert kwargs["max_bond"] == 5
+        assert kwargs["mode"] == "mps"
+
+
+def test_peps_metric_aliases(monkeypatch):
+    """PEPS-named metric helpers should delegate to boundary implementations."""
+    calls = []
+
+    def fake_boundary_norm(*args, **kwargs):
+        calls.append(("norm", args, kwargs))
+        return 2.0
+
+    def fake_infidelity(*args, **kwargs):
+        calls.append(("infidelity", args, kwargs))
+        return {"infidelity": 0.25}
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "boundary_norm", fake_boundary_norm)
+    monkeypatch.setattr(pepsy.boundary.metrics, "peps_infidelity", fake_infidelity)
+
+    assert pepsy.peps_norm("p", chi=4) == 2.0
+    assert pepsy.peps_fidelity("p", "q", chi=5) == pytest.approx(0.75)
+    assert calls[0][0] == "norm"
+    assert calls[0][1] == ("p",)
+    assert calls[0][2]["chi"] == 4
+    assert calls[0][2]["method"] == "dmrg"
+    assert calls[1][0] == "infidelity"
+    assert calls[1][1] == ("p", "q")
+    assert calls[1][2]["chi"] == 5
+    assert calls[1][2]["method"] == "dmrg"
 
 
 def test_infidelity_reuses_existing_bdy_holder_entries(monkeypatch):
@@ -959,7 +1398,7 @@ def test_infidelity_reuses_existing_bdy_holder_entries(monkeypatch):
     p = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=167, dtype="complex128")
     p_target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=169, dtype="complex128")
 
-    out = pepsy.infidelity(
+    out = pepsy.peps_infidelity(
         p,
         p_target,
         bdy=bdy,
@@ -1009,7 +1448,7 @@ def test_infidelity_retunes_all_existing_boundaries_to_requested_chi(monkeypatch
     p = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=173, dtype="complex128")
     p_target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=179, dtype="complex128")
 
-    _ = pepsy.infidelity(
+    _ = pepsy.peps_infidelity(
         p,
         p_target,
         chi=10,

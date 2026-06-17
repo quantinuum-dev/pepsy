@@ -980,7 +980,7 @@ def build_optimizer(
     progbar: bool = False,
     alpha: int = 64,
     max_time="rate:7e8", 
-    max_repeats: int = 128,
+    max_repeats: int = 2**8,
     parallel="auto",
     optlib: str = "cmaes",
     directory=False,
@@ -1431,9 +1431,9 @@ def tn_fidelity(
     if contraction_opt is None:
         contraction_opt = build_optimizer(progbar=False)
 
-    val_0 = abs((psi.H & psi).contract(all, optimize=contraction_opt))
-    val_1 = abs((psi.H & psi_fix).contract(all, optimize=contraction_opt))
-    val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=contraction_opt))
+    val_0 = abs((psi.H & psi).contract(all, optimize=contraction_opt, output_inds=()))
+    val_1 = abs((psi.H & psi_fix).contract(all, optimize=contraction_opt, output_inds=()))
+    val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=contraction_opt, output_inds=()))
 
     val_1 = val_1**2
     fidelity = ar.do("abs", val_1) / (val_0 * val_ref)

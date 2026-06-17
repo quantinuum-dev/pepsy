@@ -13,8 +13,8 @@ import autoray as ar
 import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
-from ..boundary.metrics import infidelity as boundary_infidelity
-from ..boundary.metrics import build_bra_ket, normalize
+from ..boundary.metrics import peps_infidelity as boundary_infidelity
+from ..boundary.metrics import build_bra_ket, peps_normalize
 from ..boundary.states import BdyMPS
 from ..boundary.sweeps import CompBdy
 from ..tensors.core import tn_fidelity
@@ -73,6 +73,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
+        "strip_exponent",
+        "method",
+        "mode_",
+        "sequence",
+        "cutoff",
+        "equalize_norms",
+        "layer_tags",
     })
     _INFIDELITY_KEYS = frozenset({
         "chi",
@@ -85,6 +92,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "progress",
         "track_boundary_fidelity",
         "single_layer",
+        "strip_exponent",
+        "method",
+        "mode_",
+        "sequence",
+        "cutoff",
+        "equalize_norms",
+        "layer_tags",
     })
     _OPTIMIZE_KEYS = frozenset({
         "axes",
@@ -95,6 +109,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "optimizer_options",
         "env_n_iter",
         "progress",
+        "progress_position",
         "track_boundary_fidelity",
         "debug",
         "debug_loss_mode",
@@ -676,9 +691,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         max_separation = opts.get("max_separation", 1)
         progress = opts.get("progress", False)
         track_boundary_fidelity = opts.get("track_boundary_fidelity", False)
+        strip_exponent = opts.get("strip_exponent", False)
 
         if state is self.state:
-            return normalize(
+            return peps_normalize(
                 self.state,
                 bdy=self.bdy,
                 contraction_opt=contraction_opt,
@@ -688,12 +704,19 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 progress=progress,
                 track_boundary_fidelity=track_boundary_fidelity,
                 fit_mode=self.fit_mode,
+                strip_exponent=strip_exponent,
+                method=opts.get("method", "dmrg"),
+                mode_=opts.get("mode_", "mps"),
+                sequence=opts.get("sequence", None),
+                cutoff=opts.get("cutoff", 1.0e-12),
+                equalize_norms=opts.get("equalize_norms", False),
+                layer_tags=opts.get("layer_tags", None),
             )
 
         chi = getattr(self.bdy, "chi", None)
         if chi is None:
             raise ValueError("Provide chi via optimizer boundaries before normalizing external state.")
-        return normalize(
+        return peps_normalize(
             state,
             chi=chi,
             contraction_opt=contraction_opt,
@@ -703,6 +726,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=progress,
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
+            strip_exponent=strip_exponent,
+            method=opts.get("method", "dmrg"),
+            mode_=opts.get("mode_", "mps"),
+            sequence=opts.get("sequence", None),
+            cutoff=opts.get("cutoff", 1.0e-12),
+            equalize_norms=opts.get("equalize_norms", False),
+            layer_tags=opts.get("layer_tags", None),
         )
 
     def _normalize_state(self, env_n_iter=4):
@@ -733,6 +763,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         progress=False,
         track_boundary_fidelity=False,
         single_layer=False,
+        strip_exponent=False,
+        method="dmrg",
+        mode_="mps",
+        sequence=None,
+        cutoff=1.0e-12,
+        equalize_norms=False,
+        layer_tags=None,
     ):
         """Compute boundary-based infidelity for current ``(state, state_target)``.
 
@@ -763,7 +800,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         else:
             chi_for_call = None
 
-        result = boundary_infidelity(
+        result = self._call_with_accepted_kwargs(
+            boundary_infidelity,
             self.state,
             self.state_target,
             chi=chi_for_call,
@@ -779,6 +817,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
             single_layer=single_layer,
+            strip_exponent=strip_exponent,
+            method=method,
+            mode_=mode_,
+            sequence=sequence,
+            cutoff=cutoff,
+            equalize_norms=equalize_norms,
+            layer_tags=layer_tags,
         )
 
         self._update_boundaries_from_result(result)
@@ -1443,6 +1488,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver_options=None,
         env_n_iter=4,
         progress=True,
+        progress_position=0,
         debug=False,
         debug_loss_mode="exact",
         debug_loss_kwargs=None,
@@ -1465,6 +1511,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Local boundary-fit iterations per boundary move.
         progress : bool, default=True
             Show global progress bar over all local updates.
+        progress_position : int, default=0
+            TQDM display row for nested progress bars.
         track_boundary_fidelity : bool | None, default=None
             Boundary-fidelity tracing flag for CompBdy updates. Defaults to
             ``False`` when not set explicitly.
@@ -1540,6 +1588,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 total=total_steps,
                 desc="optimize",
                 leave=True,
+                position=progress_position,
                 colour="gray",
                 dynamic_ncols=True,
             )
@@ -1722,6 +1771,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             solver_options=opts.get("optimizer_options"),
             env_n_iter=opts.get("env_n_iter", 4),
             progress=opts.get("progress", True),
+            progress_position=opts.get("progress_position", 0),
             debug=opts.get("debug", False),
             debug_loss_mode=opts.get("debug_loss_mode", "exact"),
             debug_loss_kwargs=opts.get("debug_loss_kwargs"),

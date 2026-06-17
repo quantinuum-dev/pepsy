@@ -18,6 +18,7 @@ optimizers/global_opt
 optimizers/energy
 optimizers/mps
 optimizers/mpo
+optimizers/peps
 solvers/gradient
 solvers/finite_difference
 sampling/samplers

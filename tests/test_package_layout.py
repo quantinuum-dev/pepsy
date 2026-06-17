@@ -4,9 +4,17 @@ import importlib
 
 import pytest
 
-from pepsy.boundary import BdyMPS, contract_boundary
+from pepsy.boundary import (
+    BdyMPS,
+    contract_boundary,
+    contract_flat,
+    peps_fidelity,
+    peps_infidelity,
+    peps_norm,
+    peps_normalize,
+)
 from pepsy.operators import gate, rx
-from pepsy.optimizers import MpsOptimizer, SweepOptimizer
+from pepsy.optimizers import MpsOptimizer, PepsOptimizer, SweepOptimizer
 from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
 from pepsy.tensors import (
@@ -23,9 +31,15 @@ def test_new_namespace_imports_resolve():
     """Common new namespace imports should resolve to usable objects."""
     assert BdyMPS is not None
     assert callable(contract_boundary)
+    assert callable(contract_flat)
+    assert callable(peps_norm)
+    assert callable(peps_normalize)
+    assert callable(peps_infidelity)
+    assert callable(peps_fidelity)
     assert callable(gate)
     assert callable(rx)
     assert MpsOptimizer is not None
+    assert PepsOptimizer is not None
     assert SweepOptimizer is not None
     assert MpsSampler is not None
     assert PepsBpSampler is not None

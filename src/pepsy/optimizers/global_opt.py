@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+import math
 from collections.abc import Mapping
 from numbers import Integral
 from typing import Any
@@ -51,6 +52,7 @@ class GlobalOptimizer:
         "sequence",
         "progbar",
         "cutoff",
+        "strip_exponent",
     })
     _LOSS_KEYS = frozenset({
         "opt",
@@ -59,6 +61,7 @@ class GlobalOptimizer:
         "contraction_opt_hyper",
         "hyper_contraction_opt",
         "cost_f",
+        "target_norm",
         "val_",
         "progbar",
         "chi",
@@ -68,6 +71,7 @@ class GlobalOptimizer:
         "max_separation",
         "equalize_norms",
         "sequence",
+        "strip_exponent",
     })
 
     def __init__(
@@ -260,6 +264,84 @@ class GlobalOptimizer:
         return int(chi_norm), int(chi_overlap)
 
     @staticmethod
+    def _is_scaled_scalar(value):
+        return isinstance(value, (tuple, list)) and len(value) == 2
+
+    @staticmethod
+    def _as_scaled_scalar(value, *, name="value"):
+        """Return ``(mantissa, exponent)`` for scalar or stripped scalar input."""
+        if GlobalOptimizer._is_scaled_scalar(value):
+            mantissa, exponent = value
+            return mantissa, float(exponent)
+        return value, 0.0
+
+    @staticmethod
+    def _safe_pow10(exponent):
+        """Return ``10**exponent`` without over/underflowing Python floats."""
+        if hasattr(exponent, "shape") or hasattr(exponent, "detach"):
+            return 10.0 ** ar.do("clip", exponent, -300.0, 300.0)
+        exponent = float(exponent)
+        if exponent <= -300.0:
+            return 0.0
+        if exponent >= 300.0:
+            return 1.0e300
+        return 10.0**exponent
+
+    @classmethod
+    def _scaled_to_value(cls, value):
+        mantissa, exponent = cls._as_scaled_scalar(value)
+        return mantissa * cls._safe_pow10(exponent)
+
+    @classmethod
+    def _scaled_overlap_fidelity(cls, overlap, norm, target_norm):
+        """Return ``|overlap|**2 / (|norm| * |target_norm|)`` stably."""
+        overlap_m, overlap_e = cls._as_scaled_scalar(overlap, name="overlap")
+        norm_m, norm_e = cls._as_scaled_scalar(norm, name="norm")
+        target_m, target_e = cls._as_scaled_scalar(target_norm, name="target_norm")
+
+        fid_m = (ar.do("abs", overlap_m) ** 2) / (
+            ar.do("abs", norm_m) * ar.do("abs", target_m)
+        )
+        fid_e = 2.0 * overlap_e - norm_e - target_e
+        return ar.do("abs", fid_m) * cls._safe_pow10(fid_e)
+
+    @classmethod
+    def _scaled_abs_log(cls, value):
+        mantissa, exponent = cls._as_scaled_scalar(value)
+        return ar.do("log", ar.do("abs", mantissa)) + float(exponent) * math.log(10.0)
+
+    @staticmethod
+    def _accumulate_tn_exponent(tn, exponent_delta):
+        if exponent_delta == 0.0:
+            return
+        try:
+            tn.exponent = float(getattr(tn, "exponent", 0.0)) + float(exponent_delta)
+        except (AttributeError, TypeError, ValueError):  # pragma: no cover
+            return
+
+    @classmethod
+    def _normalize_state_by_norm(cls, state, norm_value):
+        mantissa, exponent = cls._as_scaled_scalar(norm_value)
+        state /= mantissa**0.5
+        cls._accumulate_tn_exponent(state, -0.5 * exponent)
+        return state
+
+    @staticmethod
+    def _normalize_contraction_mode(mode):
+        """Normalize global PEPS contraction mode names."""
+        if not isinstance(mode, str):
+            return mode
+        key = mode.strip().lower().replace("-", "_")
+        if key == "rg":
+            warnings.warn(
+                "mode='rg' has been renamed to mode='ctmrg'.",
+                UserWarning,
+                stacklevel=3,
+            )
+            return "ctmrg"
+        return key
+
+    @staticmethod
     def _apply_hyperoptimized_compressed(
         tn,
         copt,
@@ -300,8 +382,10 @@ class GlobalOptimizer:
         sequence=None,
         progbar=False,
         cutoff=1e-12,
+        strip_exponent=False,
     ):
-        """Compute ``<state|state>`` using exact, boundary, rg, or hyper modes."""
+        """Compute ``<state|state>`` using exact, mps, ctmrg, or hyper modes."""
+        mode = GlobalOptimizer._normalize_contraction_mode(mode)
         chi_norm, _ = GlobalOptimizer._split_chi(chi)
         kw = GlobalOptimizer._normalize_contraction_option_keys(
             {
@@ -340,7 +424,10 @@ class GlobalOptimizer:
                 max_bond=chi_norm,
                 mode=mode_,
                 sequence=sequence,
-                final_contract_opts={"optimize": contraction_opt},
+                final_contract_opts={
+                    "optimize": contraction_opt,
+                    "strip_exponent": strip_exponent,
+                },
                 cutoff=cutoff,
                 progbar=progbar,
                 layer_tags=layer_tags,
@@ -348,7 +435,7 @@ class GlobalOptimizer:
                 equalize_norms=equalize_norms,
             )
 
-        if mode == "rg":
+        if mode == "ctmrg":
             return norm.contract_ctmrg(
                 max_bond=chi_norm,
                 cutoff=cutoff,
@@ -358,14 +445,21 @@ class GlobalOptimizer:
                 equalize_norms=equalize_norms,
                 layer_tags=list(_DEFAULT_LAYER_TAGS),
                 final_contract=True,
-                final_contract_opts={"optimize": contraction_opt},
+                final_contract_opts={
+                    "optimize": contraction_opt,
+                    "strip_exponent": strip_exponent,
+                },
                 progbar=progbar,
                 inplace=False,
             )
 
         if mode == "exact":
             norm = norm.full_simplify(seq="R", output_inds={}, split_method="svd", inplace=False)
-            return norm.contract(all, optimize=contraction_opt)
+            return norm.contract(
+                all,
+                optimize=contraction_opt,
+                strip_exponent=strip_exponent,
+            )
 
         if mode == "hyper":
             overlap = GlobalOptimizer._apply_hyperoptimized_compressed(
@@ -376,6 +470,8 @@ class GlobalOptimizer:
                 equalize_norms=equalize_norms,
                 progbar=progbar,
             )
+            if strip_exponent:
+                return overlap.contract(all, optimize=contraction_opt, strip_exponent=True)
             return overlap ^ all
 
         raise ValueError(f"Unknown mode: {mode}")
@@ -383,7 +479,8 @@ class GlobalOptimizer:
     @staticmethod
     def _normalize_state(state, **norm_opts):
         """Normalize a state in place via :meth:`_norm_state`."""
-        state /= GlobalOptimizer._norm_state(state, **norm_opts) ** 0.5
+        norm_value = GlobalOptimizer._norm_state(state, **norm_opts)
+        GlobalOptimizer._normalize_state_by_norm(state, norm_value)
         return state
 
     @staticmethod
@@ -396,6 +493,7 @@ class GlobalOptimizer:
         contraction_opt_hyper=None,
         hyper_contraction_opt=None,
         cost_f="fid",
+        target_norm=None,
         val_=1.0,
         progbar=False,
         chi=64,
@@ -405,8 +503,13 @@ class GlobalOptimizer:
         max_separation=1,
         equalize_norms=False,
         sequence=_DEFAULT_SEQUENCE,
+        strip_exponent=False,
     ):
         """Compute overlap-based loss between trainable and target states."""
+        mode = GlobalOptimizer._normalize_contraction_mode(mode)
+        if target_norm is not None:
+            val_ = target_norm
+
         chi_norm, chi_overlap = GlobalOptimizer._split_chi(chi)
         kw = GlobalOptimizer._normalize_contraction_option_keys(
             {
@@ -443,7 +546,10 @@ class GlobalOptimizer:
             val_0 = norm.contract_boundary(
                 max_bond=chi_norm,
                 mode=mode_,
-                final_contract_opts={"optimize": contraction_opt},
+                final_contract_opts={
+                    "optimize": contraction_opt,
+                    "strip_exponent": strip_exponent,
+                },
                 progbar=progbar,
                 layer_tags=list(_DEFAULT_LAYER_TAGS),
                 max_separation=max_separation,
@@ -454,7 +560,10 @@ class GlobalOptimizer:
             val_1 = norm_.contract_boundary(
                 max_bond=chi_overlap,
                 mode=mode_,
-                final_contract_opts={"optimize": contraction_opt},
+                final_contract_opts={
+                    "optimize": contraction_opt,
+                    "strip_exponent": strip_exponent,
+                },
                 progbar=progbar,
                 layer_tags=list(_DEFAULT_LAYER_TAGS),
                 max_separation=max_separation,
@@ -462,7 +571,7 @@ class GlobalOptimizer:
                 sequence=sequence,
                 equalize_norms=equalize_norms,
             )
-        elif mode == "rg":
+        elif mode == "ctmrg":
             val_0 = norm.contract_ctmrg(
                 max_bond=chi_norm,
                 cutoff=cutoff,
@@ -472,7 +581,10 @@ class GlobalOptimizer:
                 equalize_norms=equalize_norms,
                 layer_tags=list(_DEFAULT_LAYER_TAGS),
                 final_contract=True,
-                final_contract_opts={"optimize": contraction_opt},
+                final_contract_opts={
+                    "optimize": contraction_opt,
+                    "strip_exponent": strip_exponent,
+                },
                 progbar=progbar,
                 inplace=False,
             )
@@ -485,7 +597,10 @@ class GlobalOptimizer:
                 equalize_norms=equalize_norms,
                 layer_tags=list(_DEFAULT_LAYER_TAGS),
                 final_contract=True,
-                final_contract_opts={"optimize": contraction_opt},
+                final_contract_opts={
+                    "optimize": contraction_opt,
+                    "strip_exponent": strip_exponent,
+                },
                 progbar=progbar,
                 inplace=False,
             )
@@ -498,7 +613,11 @@ class GlobalOptimizer:
                 equalize_norms=equalize_norms,
                 progbar=progbar,
             )
-            val_0 = overlap ^ all
+            val_0 = (
+                overlap.contract(all, optimize=contraction_opt, strip_exponent=True)
+                if strip_exponent
+                else overlap ^ all
+            )
             overlap = GlobalOptimizer._apply_hyperoptimized_compressed(
                 norm_,
                 copt,
@@ -507,28 +626,40 @@ class GlobalOptimizer:
                 equalize_norms=equalize_norms,
                 progbar=progbar,
             )
-            val_1 = overlap ^ all
+            val_1 = (
+                overlap.contract(all, optimize=contraction_opt, strip_exponent=True)
+                if strip_exponent
+                else overlap ^ all
+            )
         elif mode == "exact":
-            val_0 = norm.contract(all, optimize=contraction_opt)
-            val_1 = norm_.contract(all, optimize=contraction_opt)
+            val_0 = norm.contract(
+                all,
+                optimize=contraction_opt,
+                strip_exponent=strip_exponent,
+            )
+            val_1 = norm_.contract(
+                all,
+                optimize=contraction_opt,
+                strip_exponent=strip_exponent,
+            )
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
         if cost_f == "fid":
-            pr_norm = ar.do("abs", val_ * val_0)
-            val_1 = ar.do("abs", val_1) ** 2
-            in_f = 1 - val_1 / pr_norm
+            fid = GlobalOptimizer._scaled_overlap_fidelity(val_1, val_0, val_)
+            in_f = 1 - fid
             return ar.do("abs", in_f)
 
         if cost_f == "logfidelity":
-            val_0 = ar.do("abs", val_0)
-            val_0 = ar.do("log", val_0)
-            val_4 = ar.do("log", val_)
-            val_1 = ar.do("abs", val_1)
-            val_1 = ar.do("log", val_1)
-            return -val_1 + (val_0 + val_4) * 0.5
+            log_norm = GlobalOptimizer._scaled_abs_log(val_0)
+            log_target = GlobalOptimizer._scaled_abs_log(val_)
+            log_overlap = GlobalOptimizer._scaled_abs_log(val_1)
+            return -log_overlap + (log_norm + log_target) * 0.5
 
         if cost_f == "dis":
+            val_0 = GlobalOptimizer._scaled_to_value(val_0)
+            val_1 = GlobalOptimizer._scaled_to_value(val_1)
+            val_ = GlobalOptimizer._scaled_to_value(val_)
             val_0 = ar.do("abs", val_0)
             val_2 = ar.do("conj", val_1)
             return abs(val_ + val_0 - val_1 - val_2)

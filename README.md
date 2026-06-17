@@ -14,7 +14,7 @@ Current package version: `0.2.0` (from `pyproject.toml` / `pepsy.__version__`).
   - `boundary/`: boundary state initialization (`BdyMPS`), sweeps (`CompBdy`), and metrics
   - `solvers/`: gradient-based and finite-difference solvers
   - `fitting/`: local tensor fitting routines (`FIT`)
-  - `optimizers/`: sweep, global, energy, MPS, and MPO optimizers
+  - `optimizers/`: sweep, global, energy, MPS, MPO, and PEPS optimizers
   - `sampling/`: `MpsSampler` and related sampling utilities
   - `_internal/`: private formatting and utility helpers
 - `examples/`: runnable examples (e.g. `MpsMagnetization/` 2D ITF Trotter MPS evolution)
