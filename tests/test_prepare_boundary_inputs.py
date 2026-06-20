@@ -357,6 +357,200 @@ def test_compbdy_run_eff_does_not_use_fit_verbose_fidelity(monkeypatch):
     assert comp.fidel == [0.5, 0.5]
 
 
+def test_compbdy_run_reuses_equalized_boundaries_without_stale_exponent():
+    """Switching equalize modes should not reuse stale boundary exponents."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=31, dtype="complex128")
+    for tensor in ket:
+        tensor.modify(data=5.0 * tensor.data)
+
+    ket_tagged, norm_tagged = pepsy.build_bra_ket(ket=ket)
+    exact = norm_tagged.contract(all, optimize="auto-hq")
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=16,
+        single_layer=False,
+    )
+    comp = pepsy.CompBdy(norm_tagged, bdy.mps_b)
+
+    comp.run(
+        direction="y",
+        equalize_norms=True,
+        progress=False,
+        n_iter=12,
+        max_separation=0,
+    )
+    out = comp.run(
+        direction="y",
+        equalize_norms=False,
+        progress=False,
+        n_iter=12,
+        max_separation=0,
+    )
+
+    assert abs(out - exact) / abs(exact) < 1.0e-10
+
+
+def test_compbdy_run_write_back_false_does_not_mutate_boundary_exponents(monkeypatch):
+    """write_back=False should not alter caller-owned boundary exponent state."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=33, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.build_bra_ket(ket=ket)
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=8,
+        single_layer=False,
+    )
+    bdy.mps_b["Y0_r"].exponent = 3.0
+    bdy.mps_b["Y1_r"].exponent = 7.0
+    before = {key: bdy.mps_b[key].exponent for key in ("Y0_r", "Y1_r")}
+    comp = pepsy.CompBdy(norm_tagged, bdy.mps_b)
+
+    monkeypatch.setattr(
+        pepsy.boundary.sweeps.CompBdy,
+        "_run_fit_solver",
+        lambda self, fit, boundary_mps: None,
+    )
+
+    comp.run(
+        direction="y",
+        equalize_norms=False,
+        progress=False,
+        n_iter=1,
+        max_separation=0,
+        write_back=False,
+    )
+
+    for key, exponent in before.items():
+        assert bdy.mps_b[key].exponent == exponent
+
+
+def test_compbdy_move_step_clears_stale_exponent_for_data_carried_fit(monkeypatch):
+    """move_step_bdy(equalize_norms=False) should write a data-carried boundary."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=35, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.build_bra_ket(ket=ket)
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=8,
+        single_layer=False,
+    )
+    bdy.mps_b["Y0_l"].exponent = 4.0
+    bdy.mps_b["Y1_l"].exponent = 9.0
+    comp = pepsy.CompBdy(norm_tagged, bdy.mps_b)
+
+    monkeypatch.setattr(
+        pepsy.boundary.sweeps.CompBdy,
+        "_run_fit_solver",
+        lambda self, fit, boundary_mps: None,
+    )
+
+    comp.move_step_bdy(
+        pos=1,
+        direction="y_left",
+        equalize_norms=False,
+        progress=False,
+        n_iter=1,
+    )
+
+    assert bdy.mps_b["Y1_l"].exponent == 0.0
+
+
+@pytest.mark.parametrize("equalize_norms", [False, True])
+@pytest.mark.parametrize("max_separation", [0, 1])
+def test_compbdy_run_includes_input_network_exponent(equalize_norms, max_separation):
+    """CompBdy.run should report the represented value of exponent-scaled norm."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=37, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.build_bra_ket(ket=ket)
+    norm_tagged.exponent = 5.0
+    exact = norm_tagged.contract(all, optimize="auto-hq")
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=16,
+        single_layer=False,
+    )
+    comp = pepsy.CompBdy(norm_tagged, bdy.mps_b)
+
+    out = comp.run(
+        direction="y",
+        equalize_norms=equalize_norms,
+        progress=False,
+        n_iter=12,
+        max_separation=max_separation,
+    )
+
+    assert abs(out - exact) / abs(exact) < 1.0e-10
+
+
+def test_compbdy_run_strip_exponent_includes_negative_input_network_exponent():
+    """strip_exponent=True should add the input TN exponent without changing mantissa."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=39, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.build_bra_ket(ket=ket)
+    norm_base = norm_tagged.copy()
+    norm_scaled = norm_tagged.copy()
+    norm_scaled.exponent = -4.0
+
+    bdy_base = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_base,
+        chi=16,
+        single_layer=False,
+    )
+    bdy_scaled = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_scaled,
+        chi=16,
+        single_layer=False,
+    )
+
+    main_base, exp_base = pepsy.CompBdy(norm_base, bdy_base.mps_b).run(
+        direction="y",
+        equalize_norms=True,
+        progress=False,
+        n_iter=12,
+        max_separation=0,
+        strip_exponent=True,
+    )
+    main_scaled, exp_scaled = pepsy.CompBdy(norm_scaled, bdy_scaled.mps_b).run(
+        direction="y",
+        equalize_norms=True,
+        progress=False,
+        n_iter=12,
+        max_separation=0,
+        strip_exponent=True,
+    )
+
+    assert main_scaled == pytest.approx(main_base)
+    assert exp_scaled == pytest.approx(exp_base - 4.0)
+
+
+def test_contract_boundary_includes_input_network_exponent():
+    """Public contract_boundary should preserve a copied norm's exponent scale."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=41, dtype="complex128")
+    ket_tagged, norm_tagged = pepsy.build_bra_ket(ket=ket)
+    norm_tagged.exponent = 3.0
+    exact = norm_tagged.contract(all, optimize="auto-hq")
+    bdy = pepsy.BdyMPS(
+        tn_flat=ket_tagged,
+        tn_double=norm_tagged,
+        chi=16,
+        single_layer=False,
+    )
+
+    out = pepsy.contract_boundary(
+        norm=norm_tagged,
+        bdy=bdy,
+        direction="y",
+        equalize_norms=True,
+        progress=False,
+        n_iter=12,
+        max_separation=0,
+    )
+
+    assert abs(out.cost - exact) / abs(exact) < 1.0e-10
+
+
 class _DummyNorm:
     """Minimal norm-like object with copy() for contract_boundary tests."""
 
@@ -983,6 +1177,45 @@ def test_peps_normalize_mps_method_uses_quimb_contract_boundary(monkeypatch):
     assert captured["kwargs"]["progbar"] is True
     assert captured["kwargs"]["layer_tags"] == ["KET", "BRA"]
     assert captured["kwargs"]["final_contract_opts"]["optimize"] == "OPT"
+
+
+def test_peps_normalize_can_skip_bond_balancing(monkeypatch):
+    """normalize should allow backends to skip post-rescale bond balancing."""
+
+    class _Ket:
+        def __init__(self):
+            self.divisor = None
+            self.balanced = False
+
+        def __itruediv__(self, value):
+            self.divisor = value
+            return self
+
+        def balance_bonds_(self):
+            self.balanced = True
+
+    class _Norm:
+        def contract_boundary(self, **kwargs):
+            _ = kwargs
+            return 9.0
+
+    def fake_build_bra_ket(ket=None, *, bra=None):
+        assert bra is None
+        return ket, _Norm()
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "build_bra_ket", fake_build_bra_ket)
+
+    ket = _Ket()
+    old_norm = pepsy.peps_normalize(
+        ket,
+        chi=7,
+        method="mps",
+        balance_bonds=False,
+    )
+
+    assert old_norm == 9.0
+    assert ket.divisor == 3.0
+    assert ket.balanced is False
 
 
 def test_contract_flat_mps_does_not_add_default_layer_tags():

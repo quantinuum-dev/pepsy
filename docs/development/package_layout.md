@@ -15,7 +15,7 @@ pepsy.operators     gates, gate application, MPO/PEPO builders, Hamiltonians
 pepsy.boundary      boundary-MPS states, sweeps, metrics
 pepsy.solvers       gradient and finite-difference parameter solvers
 pepsy.fitting       local tensor fitting routines
-pepsy.optimizers    high-level MPS, MPO, PEPS, and energy optimizers
+pepsy.optimizers    high-level MPS, MPO, and PEPS optimizers
 pepsy.sampling      MPS, vector, and PEPS samplers
 pepsy._internal     private formatting and utility helpers
 ```

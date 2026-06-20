@@ -832,6 +832,7 @@ def peps_normalize(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    balance_bonds=True,
 ):
     """Normalize a PEPS state in place using boundary contraction.
 
@@ -879,6 +880,8 @@ def peps_normalize(
     strip_exponent : bool, default=False
         If ``True``, use stripped boundary contractions and return
         ``(mantissa, exponent)`` for the old norm estimate.
+    balance_bonds : bool, default=True
+        If ``True``, call ``balance_bonds_()`` after rescaling the state.
 
     Returns
     -------
@@ -914,7 +917,8 @@ def peps_normalize(
     cost = result.cost
     old_norm = _format_scaled_output(cost, strip_exponent=strip_exponent)
     _normalize_by_scaled_norm(ket_tagged, cost)
-    ket_tagged.balance_bonds_()
+    if balance_bonds:
+        ket_tagged.balance_bonds_()
     return old_norm
 
 

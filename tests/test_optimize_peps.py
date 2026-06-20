@@ -50,6 +50,27 @@ class DummyState:
         return self
 
 
+class _FakeSymmrayArray:
+    shape = (2, 2)
+    dtype = "complex128"
+
+
+_FakeSymmrayArray.__module__ = "symmray.fake"
+
+
+class _FakeTensor:
+    def __init__(self):
+        self.data = _FakeSymmrayArray()
+
+
+class SymmrayDummyState(DummyState):
+    """Dummy state carrying Symmray-looking tensor data."""
+
+    def __init__(self, bond=1, name="state"):
+        super().__init__(bond=bond, name=name)
+        self.tensor_map = {"site": _FakeTensor()}
+
+
 def _install_fake_gate(monkeypatch):
     calls = []
 
@@ -149,7 +170,7 @@ def test_peps_optimizer_truncated_warmstart_below_tol_skips_sweep(monkeypatch):
     assert out.bond == 3
     assert out.normalized == 1
     assert len(norm_calls) == 1
-    assert norm_calls[0][1]["chi"] == 3
+    assert norm_calls[0][1]["chi"] == 6
     assert norm_calls[0][1]["n_iter"] == 10
     assert norm_calls[0][1]["direction"] == "y"
     assert norm_calls[0][1]["max_separation"] == 1
@@ -164,6 +185,35 @@ def test_peps_optimizer_truncated_warmstart_below_tol_skips_sweep(monkeypatch):
     assert "state" not in normalization_events[0]
     assert normalization_events[0]["old_norm"] == pytest.approx(1.0)
     assert normalization_events[0]["state_max_bond"] == 3
+
+
+def test_peps_optimizer_symmray_defaults_to_quimb_mps_boundaries(monkeypatch):
+    """Symmray PEPS runs should avoid the PEPSY DMRG/FIT boundary path."""
+    _install_fake_gate(monkeypatch)
+    norm_calls = _install_fake_normalize(monkeypatch)
+    infidelity_calls = []
+
+    def _fake_infidelity(*args, **kwargs):
+        infidelity_calls.append(dict(kwargs))
+        return {"infidelity": 1.0e-12}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
+
+    opt = PepsOptimizer(
+        SymmrayDummyState(bond=1),
+        [({"bond": 8}, ((0, 0), (0, 1)))],
+        chi=3,
+        normalize_initial=False,
+    )
+
+    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+
+    assert out.bond == 3
+    assert norm_calls[0][1]["method"] == "mps"
+    assert norm_calls[0][1]["mode_"] == "mps"
+    assert norm_calls[0][1]["balance_bonds"] is False
+    assert infidelity_calls[0]["method"] == "mps"
+    assert infidelity_calls[0]["mode_"] == "mps"
 
 
 def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
@@ -544,7 +594,7 @@ def test_peps_optimizer_global_nlopt_runtime_error_falls_back(monkeypatch):
     record = opt.step_records[0]
     assert out.name == "fallback-best"
     assert captured["nlopt_kwargs"]["optimizer"] == "nlopt"
-    assert captured["nlopt_kwargs"]["n"] == 100
+    assert captured["nlopt_kwargs"]["n"] == 1200
     assert captured["fallback_kwargs"]["optimizer"] == "lbfgs"
     assert captured["fallback_kwargs"]["n"] == 1
     assert captured["fallback_kwargs"]["progbar"] is False
@@ -558,7 +608,7 @@ def test_peps_optimizer_global_nlopt_runtime_error_falls_back(monkeypatch):
 
 
 def test_peps_optimizer_global_default_budget_is_user_overridable(monkeypatch):
-    """Global mode should default to n=100 but let explicit n win."""
+    """Global mode should default to n=1200 but let explicit n win."""
     _install_fake_gate(monkeypatch)
     _install_fake_normalize(monkeypatch)
     monkeypatch.setattr(
@@ -596,7 +646,9 @@ def test_peps_optimizer_global_default_budget_is_user_overridable(monkeypatch):
 
 
 def test_peps_optimizer_progress_reports_geometric_infidelity(monkeypatch):
-    """Progress bar should expose compact local/cumulative/geometric infidelity."""
+    """Progress bar should expose a compact MpsOptimizer-style postfix."""
+    import tqdm as tqdm_pkg
+
     _install_fake_gate(monkeypatch)
     _install_fake_normalize(monkeypatch)
     monkeypatch.setattr(
@@ -624,7 +676,7 @@ def test_peps_optimizer_progress_reports_geometric_infidelity(monkeypatch):
         def close(self):
             self.closed = True
 
-    monkeypatch.setattr(peps_mod, "tqdm", _FakeTqdm)
+    monkeypatch.setattr(tqdm_pkg, "tqdm", _FakeTqdm)
 
     opt = PepsOptimizer(
         DummyState(bond=1),
@@ -641,24 +693,28 @@ def test_peps_optimizer_progress_reports_geometric_infidelity(monkeypatch):
     assert progress.closed is True
     assert progress.kwargs["position"] == 0
     assert progress.kwargs["ascii"] is True
+    # No widget-only knobs that diverge from MpsOptimizer's bar.
+    assert "unit" not in progress.kwargs
+    assert "dynamic_ncols" not in progress.kwargs
+    # Compact postfix mirrors MpsOptimizer: 2q, bnd, Icum (no why/I/Igeo/tgt).
+    assert set(last.keys()) == {"2q", "bnd", "Icum"}
     assert last["2q"] == 1
     assert last["bnd"] == 3
-    assert last["why"] == "below_tol"
-    assert last["I"] == PepsOptimizer._format_progress_infidelity(1.0e-6)
-    assert last["Icum"] == PepsOptimizer._format_progress_infidelity(opt.get_infidelities()[-1])
-    assert last["Igeo"] == PepsOptimizer._format_progress_infidelity(
-        1.0 - opt.get_fidelities()[-1]
+    assert last["Icum"] == PepsOptimizer._format_progress_infidelity(
+        opt.get_infidelities()[-1]
     )
+    # Only one postfix update per gate step, matching MpsOptimizer.
+    assert len(progress.postfix_calls) == 1
 
 
-def test_peps_optimizer_inner_sweep_progress_uses_nested_position():
-    """PEPS outer progress should leave row 1 for the inner sweep bar."""
+def test_peps_optimizer_inner_sweep_progress_is_silenced():
+    """Inner sweep bar should be off so only the outer PEPS bar shows."""
     opt = PepsOptimizer(DummyState(bond=1), [], chi=2, normalize_initial=False)
 
     _init_kwargs, opt_kwargs, strip_exponent = opt._sweep_boundary_kwargs(progress=True)
 
-    assert opt_kwargs["progress"] is True
-    assert opt_kwargs["progress_position"] == 1
+    assert opt_kwargs["progress"] is False
+    assert opt_kwargs["progress_position"] == 0
     assert strip_exponent is True
 
 
@@ -688,6 +744,116 @@ def test_peps_optimizer_nonunitary_normalizes_target_before_infidelity(monkeypat
 
     assert out.bond == 3
     assert opt.step_records[0]["reason"] == "below_tol"
+
+
+def test_peps_optimizer_batches_two_site_targets_before_truncation(monkeypatch):
+    """Batched PEPS updates should absorb gates before the chi warm start."""
+    gate_calls = _install_fake_gate(monkeypatch)
+    _install_fake_normalize(monkeypatch)
+    infidelity_calls = []
+
+    def _fake_infidelity(state, target, **kwargs):
+        infidelity_calls.append(
+            {
+                "state_applied": list(state.applied),
+                "target_applied": list(target.applied),
+                "kwargs": dict(kwargs),
+            }
+        )
+        return {"infidelity": 1.0e-12}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
+
+    gates = [
+        ({"bond": 8, "label": "a"}, ((0, 0), (0, 1))),
+        ({"bond": 9, "label": "b"}, ((1, 1),)),
+        ({"bond": 10, "label": "c"}, ((1, 0), (1, 1))),
+    ]
+    opt = PepsOptimizer(DummyState(bond=1), gates, chi=3, normalize_initial=False)
+
+    out = opt.run(progress=False, k_2q_batch=2, infidelity_tol=1.0e-9)
+
+    assert out.bond == 3
+    assert [call["gate"]["label"] for call in gate_calls] == ["a", "b", "c"]
+    assert len(infidelity_calls) == 1
+    assert [
+        gate_payload["label"]
+        for gate_payload, _where, _which, _opts in infidelity_calls[0]["target_applied"]
+    ] == ["a", "b", "c"]
+    assert [
+        gate_payload["label"]
+        for gate_payload, _where, _which, _opts in infidelity_calls[0]["state_applied"]
+    ] == ["a", "b", "c"]
+    record = opt.step_records[0]
+    assert record["step"] == 3
+    assert record["start_step"] == 1
+    assert record["where"] == tuple(where for _gate, where in gates)
+    assert record["batch_size"] == 3
+    assert record["two_site_batch"] == 2
+    assert record["reason"] == "below_tol"
+    assert opt.last_result["step"] == 3
+    assert opt.get_local_infidelities() == [pytest.approx(1.0e-12)]
+
+
+def test_peps_optimizer_batches_before_sweep_optimizer(monkeypatch):
+    """A batch that needs cleanup should run one sweep against the batch target."""
+    _install_fake_gate(monkeypatch)
+    _install_fake_normalize(monkeypatch)
+    infidelities = iter([0.2, 0.03])
+    monkeypatch.setattr(
+        peps_mod,
+        "boundary_infidelity",
+        lambda *args, **kwargs: {"infidelity": next(infidelities)},
+    )
+    captured = {}
+
+    class _FakeSweep:
+        def __init__(self, *, state, state_target, **kwargs):
+            captured["state"] = state
+            captured["state_target"] = state_target
+            captured["kwargs"] = dict(kwargs)
+            self.state = DummyState(bond=state.bond, name="swept")
+
+        def set_optimize_kwargs(self, **kwargs):
+            captured["optimize_kwargs"] = dict(kwargs)
+            return self
+
+        def run(self):
+            return {
+                "best_loss": 0.04,
+                "best_state": DummyState(bond=3, name="best"),
+            }
+
+    monkeypatch.setattr(peps_mod, "SweepOptimizer", _FakeSweep)
+
+    gates = [
+        ({"bond": 8, "label": "a"}, ((0, 0), (0, 1))),
+        ({"bond": 10, "label": "b"}, ((1, 0), (1, 1))),
+    ]
+    opt = PepsOptimizer(DummyState(bond=1), gates, chi=3, normalize_initial=False)
+
+    out = opt.run(progress=False, k_2q_batch=2, infidelity_tol=1.0e-9)
+
+    assert out.name == "best"
+    assert captured["state"].bond == 3
+    assert [
+        gate_payload["label"]
+        for gate_payload, _where, _which, _opts in captured["state_target"].applied
+    ] == ["a", "b"]
+    record = opt.step_records[0]
+    assert record["step"] == 2
+    assert record["batch_size"] == 2
+    assert record["two_site_batch"] == 2
+    assert record["optimizer_attempted"] is True
+    assert record["reason"] == "optimized"
+
+
+def test_peps_optimizer_rejects_invalid_two_site_batch_size():
+    """The PEPS batch size should be a positive integer."""
+    opt = PepsOptimizer(DummyState(bond=1), [], chi=2, normalize_initial=False)
+
+    with pytest.raises(ValueError, match="k_2q_batch"):
+        opt.run(k_2q_batch=0)
 
 
 def test_peps_optimizer_forwards_entry_which_over_default(monkeypatch):

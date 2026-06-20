@@ -110,6 +110,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "env_n_iter",
         "progress",
         "progress_position",
+        "progress_leave",
         "track_boundary_fidelity",
         "debug",
         "debug_loss_mode",
@@ -119,7 +120,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     _DEFAULT_SOLVER_OPTIONS = {
         "algorithm": "LBFGS",
         "lr": 1e-2,
-        "n_steps": 50,
+        "n_steps": 30,
         "maxeval": 100,
         "ftol_rel": 1e-9,
         "xtol_rel": 1e-9,
@@ -164,6 +165,17 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         return value, 0.0
 
     @staticmethod
+    def _network_exponent(tn):
+        """Return the real base-10 exponent carried by a tensor network."""
+        return complex(getattr(tn, "exponent", 0.0)).real
+
+    @classmethod
+    def _shift_scaled_exponent(cls, value, exponent_delta):
+        """Add ``exponent_delta`` to a scalar or stripped scalar result."""
+        mantissa, exponent = cls._as_scaled_scalar(value)
+        return mantissa, exponent + float(exponent_delta)
+
+    @staticmethod
     def _safe_pow10(exponent):
         """Return ``10**exponent`` without over/under-flowing Python floats."""
         # strip_exponent exponents are ordinary numbers in current quimb, but
@@ -193,6 +205,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         fid_e = 2.0 * overlap_e - norm_e - target_e
         return ar.do("abs", fid_m) * cls._safe_pow10(fid_e)
+
+    def _local_norm_exponent(self):
+        """Exponent for the represented local norm environment."""
+        return 2.0 * self._network_exponent(self.state)
+
+    def _local_overlap_exponent(self):
+        """Exponent for the represented local target/state overlap environment."""
+        return self._network_exponent(self.state) + self._network_exponent(self.state_target)
 
     def set_target_norm(self, target_norm=1.0):
         """Set the stored target norm used by local sweep objectives."""
@@ -1122,7 +1142,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver_options=None,
     ):
         opts = self._merge_solver_options(solver_options)
-        n_steps = int(opts.pop("n_steps", 100))
+        n_steps = int(opts.pop("n_steps", 30))
         # Allow callers to request a per-step gradient progress bar by setting
         # progress=True inside optimizer_options.  We pop it here so it never
         # reaches the backend solver (which doesn't know about it).
@@ -1199,6 +1219,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 all,
                 optimize=self.contraction_opt,
                 strip_exponent=True,
+            )
+            overlap_val = self._shift_scaled_exponent(
+                overlap_val,
+                self._local_overlap_exponent(),
+            )
+            norm_val = self._shift_scaled_exponent(
+                norm_val,
+                self._local_norm_exponent(),
             )
             fid = self._scaled_overlap_fidelity(
                 overlap_val,
@@ -1489,6 +1517,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         env_n_iter=4,
         progress=True,
         progress_position=0,
+        progress_leave=True,
         debug=False,
         debug_loss_mode="exact",
         debug_loss_kwargs=None,
@@ -1513,6 +1542,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Show global progress bar over all local updates.
         progress_position : int, default=0
             TQDM display row for nested progress bars.
+        progress_leave : bool, default=True
+            Whether the progress bar persists after completion. Set ``False``
+            for nested sub-bars that should disappear when the run finishes.
         track_boundary_fidelity : bool | None, default=None
             Boundary-fidelity tracing flag for CompBdy updates. Defaults to
             ``False`` when not set explicitly.
@@ -1587,7 +1619,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             global_progress = tqdm(
                 total=total_steps,
                 desc="optimize",
-                leave=True,
+                leave=progress_leave,
                 position=progress_position,
                 colour="gray",
                 dynamic_ncols=True,
@@ -1772,6 +1804,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             env_n_iter=opts.get("env_n_iter", 4),
             progress=opts.get("progress", True),
             progress_position=opts.get("progress_position", 0),
+            progress_leave=opts.get("progress_leave", True),
             debug=opts.get("debug", False),
             debug_loss_mode=opts.get("debug_loss_mode", "exact"),
             debug_loss_kwargs=opts.get("debug_loss_kwargs"),

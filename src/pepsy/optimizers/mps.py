@@ -175,6 +175,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.ind_id.format(*site)
         return self.ind_id.format(site)
 
+    @staticmethod
+    def _infer_gate_dims(gate, where):
+        """Infer physical dimensions from an explicit rank-2n gate tensor."""
+        shape = getattr(gate, "shape", None)
+        if shape is None:
+            return None
+        try:
+            shape = tuple(int(d) for d in shape)
+        except (TypeError, ValueError):
+            return None
+        nsites = len(where)
+        if len(shape) != 2 * nsites:
+            return None
+        dims_in = shape[:nsites]
+        dims_out = shape[nsites:]
+        if dims_in != dims_out:
+            return None
+        return dims_in
+
     def _apply_gate(self, p, gate, where, **kwargs):
         """Apply a gate using this optimizer's physical-index convention."""
         kwargs.setdefault("ind_id", self.ind_id)
@@ -1211,6 +1230,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 p.gate_nonlocal_(
                     gate,
                     where,
+                    dims=self._infer_gate_dims(gate, where),
                     max_bond=self.chi,
                     info=self.info_c,
                     method="direct",

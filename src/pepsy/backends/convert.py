@@ -274,9 +274,12 @@ def infer_backend_converter_from_sample(
         return None
 
     backend, dtype_name = infer_backend_and_dtype(sample_data)
-    return dispatch_backend_converter(
-        backend=backend,
-        dtype_name=dtype_name,
-        sample_data=sample_data,
-        cast_complex_to_real=cast_complex_to_real,
-    )
+    try:
+        return dispatch_backend_converter(
+            backend=backend,
+            dtype_name=dtype_name,
+            sample_data=sample_data,
+            cast_complex_to_real=cast_complex_to_real,
+        )
+    except ValueError:
+        return None

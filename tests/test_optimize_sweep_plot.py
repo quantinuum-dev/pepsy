@@ -873,7 +873,7 @@ def test_default_solver_options_match_expected_baseline():
     opts = SweepOptimizer.default_solver_options()
     assert opts["algorithm"] == "LBFGS"
     assert opts["lr"] == pytest.approx(1e-2)
-    assert opts["n_steps"] == 50
+    assert opts["n_steps"] == 30
     assert opts["maxeval"] == 100
     assert opts["ftol_rel"] == pytest.approx(1e-9)
     assert opts["xtol_rel"] == pytest.approx(1e-9)
@@ -925,7 +925,7 @@ def test_optimize_packed_params_uses_default_solver_options(monkeypatch):
     assert out_params == params_init
     assert history == [0.0]
     assert captured["solver"] == "scipy"
-    assert captured["n_steps"] == 50
+    assert captured["n_steps"] == 30
     assert captured["solver_options"]["algorithm"] == "LBFGS"
     assert captured["solver_options"]["maxeval"] == 100
 
@@ -1129,6 +1129,74 @@ def test_local_sweep_loss_divides_by_scaled_target_norm(monkeypatch):
         contraction_opt="auto-hq",
         renormalize_state=False,
     )
+
+    def _fake_optimize(self, params_init, loss_fn, *, solver, solver_options):
+        _ = self, solver, solver_options
+        return params_init, [float(loss_fn(params_init))]
+
+    monkeypatch.setattr(SweepOptimizer, "_optimize_packed_params", _fake_optimize)
+
+    run_info = opt._optimize_axis_slice_with_current_env(
+        0,
+        axis="y",
+        solver="scipy",
+    )
+
+    assert run_info["loss_initial"] == pytest.approx(0.0, abs=1e-12)
+    assert run_info["loss_final"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_local_sweep_loss_includes_target_network_exponent(monkeypatch):
+    """A target represented by data plus exponent should compare at full scale."""
+    peps = qtn.PEPS.rand(Lx=1, Ly=1, bond_dim=1, seed=22, dtype="complex128")
+    peps_target = peps.copy()
+    peps_target.exponent = 3.0
+    peps_target["I0,0"].modify(data=1.0e-3 * peps_target["I0,0"].data)
+    target_norm = tn_norm(peps_target, contraction_opt="auto-hq", strip_exponent=True)
+
+    opt = SweepOptimizer(
+        peps,
+        peps_target,
+        target_norm=target_norm,
+        chi=1,
+        contraction_opt="auto-hq",
+        renormalize_state=False,
+    )
+
+    def _fake_optimize(self, params_init, loss_fn, *, solver, solver_options):
+        _ = self, solver, solver_options
+        return params_init, [float(loss_fn(params_init))]
+
+    monkeypatch.setattr(SweepOptimizer, "_optimize_packed_params", _fake_optimize)
+
+    run_info = opt._optimize_axis_slice_with_current_env(
+        0,
+        axis="y",
+        solver="scipy",
+    )
+
+    assert run_info["loss_initial"] == pytest.approx(0.0, abs=1e-12)
+    assert run_info["loss_final"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_local_sweep_boundary_loss_includes_target_network_exponent(monkeypatch):
+    """Boundary environments from move_bdy should combine with global exponents once."""
+    peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=1, seed=23, dtype="complex128")
+    peps_target = peps.copy()
+    peps_target.reindex_({idx: f"{idx}_target" for idx in peps_target.inner_inds()})
+    peps_target.exponent = 3.0
+    peps_target["I0,0"].modify(data=1.0e-3 * peps_target["I0,0"].data)
+    target_norm = tn_norm(peps_target, contraction_opt="auto-hq", strip_exponent=True)
+
+    opt = SweepOptimizer(
+        peps,
+        peps_target,
+        target_norm=target_norm,
+        chi=1,
+        contraction_opt="auto-hq",
+        renormalize_state=False,
+    )
+    opt._refresh_right_boundaries_once("y", env_n_iter=4)
 
     def _fake_optimize(self, params_init, loss_fn, *, solver, solver_options):
         _ = self, solver, solver_options

@@ -19,11 +19,16 @@ from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
 from pepsy.tensors import (
     OneDMap,
+    SymGateStream,
+    SymMPS,
+    SymPEPS,
     backend_torch,
+    default_physical_sectors,
     haar_random_state,
     ps_to_3dpeps,
     ps_to_peps,
     reg_complex_svd_torch,
+    site_charge_from_occupations,
 )
 
 
@@ -45,11 +50,16 @@ def test_new_namespace_imports_resolve():
     assert PepsBpSampler is not None
     assert FDSolver is not None
     assert OneDMap is not None
+    assert SymGateStream is not None
+    assert SymMPS is not None
+    assert SymPEPS is not None
+    assert callable(default_physical_sectors)
     assert callable(backend_torch)
     assert callable(haar_random_state)
     assert callable(ps_to_peps)
     assert callable(ps_to_3dpeps)
     assert callable(reg_complex_svd_torch)
+    assert callable(site_charge_from_occupations)
 
 
 @pytest.mark.parametrize(

@@ -8,8 +8,7 @@ from collections.abc import Mapping
 from numbers import Integral
 from typing import Any
 
-from tqdm.auto import tqdm
-
+from ..backends.convert import resolve_backend_sample_data_from_tn
 from ..boundary.metrics import peps_infidelity as boundary_infidelity
 from ..boundary.metrics import peps_normalize as boundary_normalize
 from ..operators.gates import _normalize_gate_entries, gate as apply_gate
@@ -31,9 +30,11 @@ _DEFAULT_SWEEP_OPTIMIZE_KWARGS = {
     "n_round_trips": 4,
     "renormalize": False,
 }
+_DEFAULT_SWEEP_SOLVER = "nlopt"
+_DEFAULT_SWEEP_NLOPT_ALGORITHM = "LD_LBFGS"
 _DEFAULT_GLOBAL_OPTIMIZE_KWARGS = {
-    "n": 100,
-    "optimizer": "lbfgs",
+    "n": 1200,
+    "optimizer": "LD_VAR2",
 }
 _DEFAULT_GLOBAL_FALLBACK_KWARGS = {
     "n": 1,
@@ -73,6 +74,48 @@ def _merge_opts(*options):
     return merged
 
 
+def _is_symmray_array_data(data):
+    """Return whether ``data`` looks like a Symmray array."""
+    return type(data).__module__.split(".", 1)[0] == "symmray"
+
+
+def _uses_symmray_arrays(tn):
+    """Return whether a tensor-network-like object stores Symmray arrays."""
+    sample_data = resolve_backend_sample_data_from_tn(tn)
+    if sample_data is not None and _is_symmray_array_data(sample_data):
+        return True
+
+    tensor_map = getattr(tn, "tensor_map", None)
+    tensors = None
+    if tensor_map:
+        tensors = tensor_map.values()
+    else:
+        try:
+            tensors = iter(tn)
+        except TypeError:
+            tensors = ()
+
+    for tensor in tensors:
+        data = getattr(tensor, "data", None)
+        if data is not None and _is_symmray_array_data(data):
+            return True
+    return False
+
+
+def _prefer_symmray_quimb_mps(opts, *states, normalize=False):
+    """Route Symmray PEPS boundary work away from PEPSY BdyMPS/FIT."""
+    if not any(_uses_symmray_arrays(state) for state in states):
+        return opts
+
+    method = str(opts.get("method", "dmrg")).strip().lower().replace("-", "_")
+    if method in {"", "auto", "dmrg", "fit"}:
+        opts["method"] = "mps"
+    opts.setdefault("mode_", "mps")
+    if normalize:
+        opts.setdefault("balance_bonds", False)
+    return opts
+
+
 def _optimizer_key(optimizer):
     if not isinstance(optimizer, str):
         return ""
@@ -96,6 +139,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     as-is. Otherwise a warm start is formed by compressing ``target.copy()`` to
     ``chi``; this warm start is either accepted by a boundary-fidelity check or
     refined against the exact target with ``mode="sweep"`` or ``mode="global"``.
+    Use ``run(k_2q_batch=...)`` to absorb multiple sequential two-site gates
+    into one target before the truncation and optional variational cleanup.
 
     Boundary contractions use ``strip_exponent=True`` by default, so norm and
     overlap estimates are handled as ``(mantissa, exponent)`` pairs where the
@@ -128,18 +173,18 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Boundary contraction bond dimension used by the sweep/global
         optimization backends. Defaults to ``chi``. Tuple values are forwarded
         to :class:`SweepOptimizer`; when no explicit ``normalize_chi`` or
-        ``evaluation_chi`` is supplied, normalization uses the first entry and
-        standalone infidelity estimates use the larger entry.
+        ``evaluation_chi`` is supplied, normalization and standalone infidelity
+        estimates use ``2 * max(boundary_chi)``.
     normalize_chi : int | None, optional
         Boundary bond dimension used for PEPS normalization calls. Use this to
         normalize with a larger boundary than the trainable PEPS bond ``chi``
         or the optimizer environment ``boundary_chi``. If ``None``, the
-        normalization chi follows ``boundary_chi``.
+        normalization chi defaults to ``2 * max(boundary_chi)``.
     evaluation_chi : int | None, optional
         Boundary bond dimension used for pre/post local infidelity estimates
         that decide whether the warm start or optimized candidate is accepted.
         This is the knob for stricter initial/final diagnostics. If ``None``,
-        the evaluation chi follows ``boundary_chi``.
+        the evaluation chi defaults to ``2 * max(boundary_chi)``.
     mode : {"sweep", "global"}, default="sweep"
         Variational optimizer backend used when the warm start is not good
         enough.
@@ -168,8 +213,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         already-built target.
     optimizer : str | None, optional
         Compact optimizer selection for the chosen variational backend. In
-        sweep mode this maps to :class:`SweepOptimizer`'s local solver name.
-        In global mode, ``"nlopt"`` together with
+        sweep mode this maps to :class:`SweepOptimizer`'s local solver name;
+        when left as ``None`` the sweep local solver defaults to NLopt
+        ``LD_LBFGS``. In global mode, ``"nlopt"`` together with
         ``optimizer_options={"algorithm": "LD_VAR2"}`` routes to
         :meth:`GlobalOptimizer.optimize_nlopt`.
     optimizer_options : mapping, optional
@@ -319,23 +365,24 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         return cls._validate_scalar_chi(chi, name="boundary_chi")
 
+    def _boundary_chi_max(self):
+        if isinstance(self.boundary_chi, tuple):
+            return max(int(self.boundary_chi[0]), int(self.boundary_chi[1]))
+        return int(self.boundary_chi)
+
     def _boundary_chi_for_norm(self, override=None):
         if override is not None:
             return self._validate_scalar_chi(override, name="normalize_chi")
         if self.normalize_chi is not None:
             return int(self.normalize_chi)
-        if isinstance(self.boundary_chi, tuple):
-            return int(self.boundary_chi[0])
-        return int(self.boundary_chi)
+        return 2 * self._boundary_chi_max()
 
     def _boundary_chi_for_infidelity(self, override=None):
         if override is not None:
             return self._validate_scalar_chi(override, name="evaluation_chi")
         if self.evaluation_chi is not None:
             return int(self.evaluation_chi)
-        if isinstance(self.boundary_chi, tuple):
-            return max(int(self.boundary_chi[0]), int(self.boundary_chi[1]))
-        return int(self.boundary_chi)
+        return 2 * self._boundary_chi_max()
 
     def set_boundary_chi(
         self,
@@ -434,6 +481,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts.setdefault("chi", self._boundary_chi_for_norm(normalize_chi))
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
+        _prefer_symmray_quimb_mps(opts, state, normalize=True)
         old_norm = boundary_normalize(state, **opts)
         self.normalizations.append(self._normalization_record(state, old_norm))
         return old_norm
@@ -536,6 +584,25 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             inplace=True,
         )
 
+    def _build_batch_target(self, state, batch_entries, *, cutoff, cutoff_mode, gate_kwargs):
+        """Apply a collected gate batch onto a copy of ``state``."""
+        opts = self._target_gate_options(
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            gate_kwargs=gate_kwargs,
+        )
+        state_work = state.copy() if hasattr(state, "copy") else state
+        for gate_payload, where, which in batch_entries:
+            state_work = self._apply_gate_entry(
+                state_work,
+                gate_payload,
+                where,
+                which,
+                opts=opts,
+                inplace=True,
+            )
+        return state_work
+
     def _build_routed_warmstart(
         self,
         state,
@@ -563,6 +630,32 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return self._compress_to_chi(out, cutoff=cutoff)
 
+    def _build_routed_batch_warmstart(
+        self,
+        state,
+        batch_entries,
+        *,
+        cutoff,
+        cutoff_mode,
+        gate_kwargs,
+    ):
+        opts = self._warmstart_gate_options(
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            gate_kwargs=gate_kwargs,
+        )
+        state_work = state.copy() if hasattr(state, "copy") else state
+        for gate_payload, where, which in batch_entries:
+            state_work = self._apply_gate_entry(
+                state_work,
+                gate_payload,
+                where,
+                which,
+                opts=opts,
+                inplace=True,
+            )
+        return self._compress_to_chi(state_work, cutoff=cutoff)
+
     def _build_warmstart(
         self,
         target,
@@ -589,6 +682,60 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
             gate_kwargs=gate_kwargs,
+        )
+
+    def _build_batch_warmstart(
+        self,
+        target,
+        state,
+        batch_entries,
+        *,
+        cutoff,
+        cutoff_mode,
+        gate_kwargs,
+    ):
+        if hasattr(target, "copy"):
+            warmstart = self._compress_to_chi(target.copy(), cutoff=cutoff)
+            max_bond = self._max_bond(warmstart)
+            if max_bond is None or max_bond <= self.chi:
+                return warmstart
+
+        return self._build_routed_batch_warmstart(
+            state,
+            batch_entries,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            gate_kwargs=gate_kwargs,
+        )
+
+    def _collect_gate_batch(self, start_idx, k_2q_batch):
+        """Collect a run of gates with up to ``k_2q_batch`` two-site entries."""
+        batch_entries = []
+        two_site_in_batch = 0
+        idx = int(start_idx)
+
+        while idx < len(self.gates) and two_site_in_batch < k_2q_batch:
+            gate_payload, where, which = self.gates[idx]
+            site_count = self._site_count(where, self.state)
+            if site_count == 1:
+                batch_entries.append((gate_payload, where, which))
+            elif site_count == 2:
+                batch_entries.append((gate_payload, where, which))
+                two_site_in_batch += 1
+            else:
+                raise ValueError("PepsOptimizer supports one- and two-site gates only.")
+            idx += 1
+
+        return batch_entries, two_site_in_batch, idx
+
+    @staticmethod
+    def _batch_record_payload(batch_entries):
+        if len(batch_entries) == 1:
+            _, where, which = batch_entries[0]
+            return where, which
+        return (
+            tuple(where for _, where, _ in batch_entries),
+            tuple(which for _, _, which in batch_entries),
         )
 
     def _compress_to_chi(self, state, *, cutoff):
@@ -697,6 +844,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts.setdefault("progress", False)
         opts.setdefault("norm", 1.0)
         opts.setdefault("norm_target", 1.0)
+        _prefer_symmray_quimb_mps(opts, state, target)
         return self._clean_infidelity(boundary_infidelity(state, target, **opts))
 
     def _sweep_boundary_kwargs(self, *, progress):
@@ -706,11 +854,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
         # SweepOptimizer.run uses env_n_iter for boundary moves during sweeps.
+        # The inner sweep keeps its own progress bar silent so only the outer
+        # PEPS bar is shown, matching the MpsOptimizer visualization.
         opt_kwargs = {
             "env_n_iter": opts.get("n_iter", _DEFAULT_BOUNDARY_KWARGS["n_iter"]),
             "track_boundary_fidelity": opts.get("track_boundary_fidelity", False),
-            "progress": bool(progress),
-            "progress_position": 1 if progress else 0,
+            "progress": False,
+            "progress_position": 0,
+            "progress_leave": False,
         }
         return opts, opt_kwargs, strip_exponent
 
@@ -720,9 +871,19 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             opt_kwargs.setdefault("optimizer", self.optimizer)
         if self.optimizer_options:
             opt_kwargs.setdefault("optimizer_options", dict(self.optimizer_options))
+        opt_kwargs.setdefault("optimizer", _DEFAULT_SWEEP_SOLVER)
+        if _optimizer_key(opt_kwargs.get("optimizer")) == "nlopt":
+            opt_kwargs["optimizer_options"] = _merge_opts(
+                {"algorithm": _DEFAULT_SWEEP_NLOPT_ALGORITHM},
+                opt_kwargs.get("optimizer_options"),
+            )
         return opt_kwargs
 
     def _global_contraction_defaults(self, *, cutoff, progress):
+        # ``progress`` is accepted for signature symmetry but intentionally not
+        # propagated to inner boundary contractions so only the outer PEPS bar
+        # is shown (matching the MpsOptimizer visualization).
+        del progress
         bopts = _merge_opts(self.boundary_kwargs)
         return {
             "contraction_opt": self.contraction_opt,
@@ -731,7 +892,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             "mode_": "mps",
             "max_separation": bopts.get("max_separation", 1),
             "cutoff": cutoff,
-            "progbar": bool(progress),
+            "progbar": False,
             "strip_exponent": bool(bopts.get("strip_exponent", True)),
         }
 
@@ -956,7 +1117,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         opt_kwargs = _merge_opts(self.global_optimize_kwargs, global_optimize_kwargs)
         opt_kwargs = self._apply_global_optimizer_options(opt_kwargs)
-        opt_kwargs.setdefault("progbar", bool(progress))
+        opt_kwargs.setdefault("progbar", False)
         optimizer_name = opt_kwargs.get("optimizer", "adam")
         use_nlopt = _is_nlopt_optimizer(optimizer_name)
         self._maybe_register_torch_svd(opt_kwargs)
@@ -975,7 +1136,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     stacklevel=2,
                 )
                 fallback_kwargs = _merge_opts(self.global_fallback_kwargs)
-                fallback_kwargs.setdefault("progbar", bool(progress))
+                fallback_kwargs.setdefault("progbar", False)
                 self._maybe_register_torch_svd(fallback_kwargs)
                 out = optimizer.optimize(**fallback_kwargs)
                 fallback_used = True
@@ -1116,23 +1277,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _progress_postfix(
         self,
         *,
-        reason,
-        final_infidelity,
         two_site_count=None,
-        target_max_bond=None,
     ):
+        """Return a compact tqdm postfix that mirrors :class:`MpsOptimizer`."""
         postfix = {
             "2q": self._fidelity_count if two_site_count is None else int(two_site_count),
             "bnd": self._max_bond(self.state),
-            "why": reason,
         }
-        if target_max_bond is not None:
-            postfix["tgt"] = int(target_max_bond)
         if self._fidelity_count:
-            postfix["Igeo"] = self._format_progress_infidelity(1.0 - self.losses[-1])
             postfix["Icum"] = self._format_progress_infidelity(self.infidelities[-1])
-        if final_infidelity is not None:
-            postfix["I"] = self._format_progress_infidelity(final_infidelity)
         return postfix
 
     def run(  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
@@ -1143,6 +1296,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         progress=None,
         cutoff=1.0e-12,
         cutoff_mode="rel",
+        k_2q_batch=1,
         non_unitary=False,
         normalize_target=None,
         normalize_initial=None,
@@ -1165,11 +1319,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Run the queued gate stream and return the compressed state.
 
-        One-site gates are applied directly. Two-site gates are applied exactly
-        to form a target, then compressed to ``chi`` to form a warm start. The
-        warm start is accepted immediately when it is already inside
-        ``infidelity_tol``; otherwise it can be refined by the selected sweep or
-        global optimizer.
+        One-site gates are applied directly unless they are folded into a
+        two-site batch. Two-site gates are applied exactly to form a target,
+        then compressed to ``chi`` to form a warm start. The warm start is
+        accepted immediately when it is already inside ``infidelity_tol``;
+        otherwise it can be refined by the selected sweep or global optimizer.
 
         Parameters
         ----------
@@ -1181,6 +1335,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff, cutoff_mode
             Truncation settings passed to gate application and target-derived
             warm-start compression.
+        k_2q_batch : int, default=1
+            Number of sequential two-site gates to absorb into one target
+            before the warm-start truncation and optional sweep/global
+            optimization. One-site gates encountered while collecting the batch
+            are folded into the same target.
         non_unitary : bool, default=False
             If ``True``, target states produced by gates are explicitly
             normalized before fidelity estimates and optimization.
@@ -1235,6 +1394,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             if accept_if_improved is None
             else bool(accept_if_improved)
         )
+        k_2q_batch = self._validate_scalar_chi(k_2q_batch, name="k_2q_batch")
 
         self._ensure_initial_normalized(
             normalize_initial=normalize_initial,
@@ -1244,19 +1404,22 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         pbar = None
         if show_progress:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
             pbar = tqdm(
                 total=len(self.gates),
                 desc=f"peps-{run_mode}",
-                unit="gate",
                 leave=True,
                 position=0,
                 ascii=True,
-                dynamic_ncols=True,
                 colour=self._PROGBAR_COLORS[run_mode],
             )
 
         two_site_count = 0
-        for step, (gate_payload, where, which) in enumerate(self.gates, start=1):
+        idx = 0
+        while idx < len(self.gates):
+            step = idx + 1
+            gate_payload, where, which = self.gates[idx]
             site_count = self._site_count(where, self.state)
             reason = "1q"
             pre_infidelity = None
@@ -1267,6 +1430,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             optimizer_attempted = False
             post_infidelity = None
             opt_infidelity = None
+            final_state = self.state
+            record_step = step
+            record_where = where
+            advanced = 1
 
             if site_count == 1:
                 opts = self._base_gate_options(
@@ -1289,14 +1456,30 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         normalize_chi=normalize_chi,
                     )
                 final_state = self.state
+                idx += 1
             elif site_count == 2:
-                two_site_count += 1
+                batch_entries, two_site_in_batch, next_idx = self._collect_gate_batch(
+                    idx,
+                    k_2q_batch,
+                )
+                if two_site_in_batch < 1:
+                    raise RuntimeError("Gate batch unexpectedly contains no two-site gates.")
+
+                two_site_count += two_site_in_batch
+                record_where, record_which = self._batch_record_payload(batch_entries)
+                if isinstance(record_which, tuple):
+                    record_which = tuple(
+                        self.which if which_i is None else which_i
+                        for which_i in record_which
+                    )
+                else:
+                    record_which = self.which if record_which is None else record_which
+                record_step = next_idx
+                advanced = next_idx - idx
                 state_before = self.state
-                target = self._build_target(
+                target = self._build_batch_target(
                     state_before,
-                    gate_payload,
-                    where,
-                    which,
+                    batch_entries,
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     gate_kwargs=gate_kwargs,
@@ -1315,12 +1498,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     final_infidelity = 0.0
                     reason = "within_chi"
                 else:
-                    warmstart = self._build_warmstart(
+                    warmstart = self._build_batch_warmstart(
                         target,
                         state_before,
-                        gate_payload,
-                        where,
-                        which,
+                        batch_entries,
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
                         gate_kwargs=gate_kwargs,
@@ -1358,13 +1539,6 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 if hasattr(warmstart, "copy")
                                 else warmstart
                             )
-                        if pbar is not None:
-                            pbar.set_postfix(self._progress_postfix(
-                                reason=f"opt:{run_mode}",
-                                final_infidelity=pre_infidelity,
-                                two_site_count=two_site_count,
-                                target_max_bond=target_max_bond,
-                            ))
                         final_state, opt_infidelity, optimizer_result = self._optimize_state(
                             warmstart,
                             target,
@@ -1429,9 +1603,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
                 fidelity, geometric_fidelity = self._record_fidelity_progress(final_infidelity)
                 record = {
-                    "step": int(step),
-                    "where": where,
-                    "which": self.which if which is None else which,
+                    "step": int(record_step),
+                    "start_step": int(step),
+                    "where": record_where,
+                    "which": record_which,
+                    "batch_size": len(batch_entries),
+                    "two_site_batch": int(two_site_in_batch),
                     "target_max_bond": target_max_bond,
                     "state_max_bond": self._max_bond(self.state),
                     "normalize_chi": self._boundary_chi_for_norm(normalize_chi),
@@ -1448,24 +1625,22 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "optimizer_result": optimizer_result,
                 }
                 self.step_records.append(record)
+                idx = next_idx
             else:
                 raise ValueError("PepsOptimizer supports one- and two-site gates only.")
 
             self.last_result = {
-                "step": int(step),
-                "where": where,
+                "step": int(record_step),
+                "where": record_where,
                 "state": final_state,
                 "reason": reason,
                 "infidelity": final_infidelity,
             }
             if pbar is not None:
                 pbar.set_postfix(self._progress_postfix(
-                    reason=reason,
-                    final_infidelity=final_infidelity,
                     two_site_count=two_site_count,
-                    target_max_bond=target_max_bond,
                 ))
-                pbar.update(1)
+                pbar.update(advanced)
 
         if pbar is not None:
             pbar.close()

@@ -11,6 +11,10 @@
 Use `evaluation_chi` larger than `boundary_chi` when you want a stricter final
 quality check without making every optimization environment more expensive.
 
+Use `PepsOptimizer.run(k_2q_batch=N)` to absorb up to `N` sequential two-site
+gates, plus intervening one-site gates, into one PEPS target before truncating
+to `chi` and optionally running the sweep/global cleanup.
+
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.peps
    :members:

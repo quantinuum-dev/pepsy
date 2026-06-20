@@ -32,7 +32,7 @@ At the start of a new task:
 - `pepsy.operators`: gate matrices, `gate`/`gate_simple` dispatch, MPO/PEPO builders, and `ham_tn` Hamiltonian helpers.
 - `pepsy.boundary`: PEPS norm/overlap setup (`build_bra_ket`), boundary environments (`BdyMPS`), sweeps (`CompBdy`), `contract_boundary`, `normalize`, and `infidelity`.
 - `pepsy.solvers`: `GradientOptimizer`, `FDSolver`, `optimize_packed_params`, finite-difference adapters, and canonical solver-name handling.
-- `pepsy.optimizers`: higher-level `GlobalOptimizer`, `SweepOptimizer`, `EnergyOptimizer`, `MpsOptimizer`, and `MpoOptimizer` workflows.
+- `pepsy.optimizers`: higher-level `GlobalOptimizer`, `SweepOptimizer`, `MpsOptimizer`, `MpoOptimizer`, and `PepsOptimizer` workflows.
 - `pepsy.sampling`: `MpsSampler`, `VecSampler`, `PepsBpSampler`, and result dataclasses.
 - `pepsy._internal`: private formatting and small utility helpers only.
 

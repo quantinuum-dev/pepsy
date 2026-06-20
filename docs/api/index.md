@@ -10,12 +10,12 @@ boundary/metrics
 boundary/states
 boundary/sweeps
 tensors/core
+tensors/symmetric
 fitting/local
 operators/gates
 operators/hamiltonians
 optimizers/sweep
 optimizers/global_opt
-optimizers/energy
 optimizers/mps
 optimizers/mpo
 optimizers/peps
