@@ -1,4 +1,4 @@
-"""Tests for :mod:`pepsy.optimizers.mps`."""
+"""Tests for :mod:`pepsy.optimizers.mps.optimizer`."""
 
 from numbers import Real
 import sys

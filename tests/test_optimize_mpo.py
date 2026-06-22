@@ -1,4 +1,4 @@
-"""Tests for :mod:`pepsy.optimizers.mpo`."""
+"""Tests for :mod:`pepsy.optimizers.mpo.optimizer`."""
 
 import numpy as np
 import pytest
@@ -58,7 +58,7 @@ def test_mpo_optimizer_apply_gate_pair_separates_ket_and_bra_indices(monkeypatch
         calls.append((where, kwargs.copy()))
         return tn
 
-    monkeypatch.setattr("pepsy.optimizers.mpo.apply_gate", _fake_apply_gate)
+    monkeypatch.setattr("pepsy.optimizers.mpo.optimizer.apply_gate", _fake_apply_gate)
 
     mpo0 = qtn.MPO_identity(2, dtype="complex128")
     gate = qu.phase_gate(0.37)

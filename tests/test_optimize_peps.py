@@ -1,8 +1,8 @@
-"""Tests for :mod:`pepsy.optimizers.peps`."""
+"""Tests for :mod:`pepsy.optimizers.peps.optimizer`."""
 
 import pytest
 
-import pepsy.optimizers.peps as peps_mod
+import pepsy.optimizers.peps.optimizer as peps_mod
 from pepsy.optimizers.peps import PepsOptimizer
 
 
@@ -846,6 +846,157 @@ def test_peps_optimizer_batches_before_sweep_optimizer(monkeypatch):
     assert record["two_site_batch"] == 2
     assert record["optimizer_attempted"] is True
     assert record["reason"] == "optimized"
+
+
+def test_peps_optimizer_symmray_sweep_uses_quimb_mps_boundaries(monkeypatch):
+    """Symmray sweep cleanup should request Quimb MPS sweep environments."""
+    _install_fake_gate(monkeypatch)
+    _install_fake_normalize(monkeypatch)
+    infidelities = iter([0.2, 0.03])
+    monkeypatch.setattr(
+        peps_mod,
+        "boundary_infidelity",
+        lambda *args, **kwargs: {"infidelity": next(infidelities)},
+    )
+    captured = {}
+
+    class _FakeSweep:
+        def __init__(self, *, state, state_target, **kwargs):
+            captured["state"] = state
+            captured["state_target"] = state_target
+            captured["kwargs"] = dict(kwargs)
+            self.state = state
+
+        def set_optimize_kwargs(self, **kwargs):
+            captured["optimize_kwargs"] = dict(kwargs)
+            return self
+
+        def run(self):
+            return {
+                "best_loss": 0.04,
+                "best_state": SymmrayDummyState(bond=3, name="best"),
+            }
+
+    monkeypatch.setattr(peps_mod, "SweepOptimizer", _FakeSweep)
+
+    opt = PepsOptimizer(
+        SymmrayDummyState(bond=1),
+        [({"bond": 8}, ((0, 0), (0, 1)))],
+        chi=3,
+        normalize_initial=False,
+    )
+
+    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+
+    assert out.name == "best"
+    assert captured["kwargs"]["boundary_engine"] == "quimb-mps"
+    assert captured["kwargs"]["normalize_kwargs"]["method"] == "mps"
+    assert captured["kwargs"]["normalize_kwargs"]["mode_"] == "mps"
+    assert captured["kwargs"]["normalize_kwargs"]["balance_bonds"] is False
+    assert captured["optimize_kwargs"]["env_n_iter"] == 10
+
+
+def test_peps_optimizer_explicit_quimb_boundary_engine_forwards_options(monkeypatch):
+    """Dense PEPS cleanup can opt into Quimb MPS sweep boundaries explicitly."""
+    _install_fake_gate(monkeypatch)
+    _install_fake_normalize(monkeypatch)
+    infidelities = iter([0.2, 0.03])
+    monkeypatch.setattr(
+        peps_mod,
+        "boundary_infidelity",
+        lambda *args, **kwargs: {"infidelity": next(infidelities)},
+    )
+    captured = {}
+
+    class _FakeSweep:
+        def __init__(self, *, state, state_target, **kwargs):
+            captured["state"] = state
+            captured["state_target"] = state_target
+            captured["kwargs"] = dict(kwargs)
+            self.state = state
+
+        def set_optimize_kwargs(self, **kwargs):
+            captured["optimize_kwargs"] = dict(kwargs)
+            return self
+
+        def run(self):
+            return {
+                "best_loss": 0.04,
+                "best_state": DummyState(bond=3, name="best"),
+            }
+
+    monkeypatch.setattr(peps_mod, "SweepOptimizer", _FakeSweep)
+
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [({"bond": 8}, ((0, 0), (0, 1)))],
+        chi=3,
+        boundary_engine="quimb-mps",
+        boundary_options={"cutoff": 1.0e-10, "canonize": False},
+        normalize_initial=False,
+    )
+
+    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+
+    assert out.name == "best"
+    assert captured["kwargs"]["boundary_engine"] == "quimb-mps"
+    assert captured["kwargs"]["boundary_options"] == {
+        "cutoff": 1.0e-10,
+        "canonize": False,
+    }
+    assert captured["kwargs"]["normalize_kwargs"]["method"] == "mps"
+    assert captured["kwargs"]["normalize_kwargs"]["mode_"] == "mps"
+    assert captured["kwargs"]["normalize_kwargs"]["balance_bonds"] is False
+
+
+def test_peps_optimizer_explicit_dmrg_boundary_engine_overrides_symmray_auto(monkeypatch):
+    """An explicit DMRG selector should not be rewritten to Quimb MPS."""
+    _install_fake_gate(monkeypatch)
+    norm_calls = _install_fake_normalize(monkeypatch)
+    infidelity_calls = []
+    infidelities = iter([0.2, 0.03])
+
+    def _fake_infidelity(*args, **kwargs):
+        infidelity_calls.append(dict(kwargs))
+        return {"infidelity": next(infidelities)}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
+    captured = {}
+
+    class _FakeSweep:
+        def __init__(self, *, state, state_target, **kwargs):
+            captured["state"] = state
+            captured["state_target"] = state_target
+            captured["kwargs"] = dict(kwargs)
+            self.state = state
+
+        def set_optimize_kwargs(self, **kwargs):
+            captured["optimize_kwargs"] = dict(kwargs)
+            return self
+
+        def run(self):
+            return {
+                "best_loss": 0.04,
+                "best_state": SymmrayDummyState(bond=3, name="best"),
+            }
+
+    monkeypatch.setattr(peps_mod, "SweepOptimizer", _FakeSweep)
+
+    opt = PepsOptimizer(
+        SymmrayDummyState(bond=1),
+        [({"bond": 8}, ((0, 0), (0, 1)))],
+        chi=3,
+        boundary_engine="dmrg",
+        normalize_initial=False,
+    )
+
+    out = opt.run(progress=False, infidelity_tol=1.0e-9)
+
+    assert out.name == "best"
+    assert captured["kwargs"]["boundary_engine"] == "dmrg"
+    assert "method" not in captured["kwargs"]["normalize_kwargs"]
+    assert "method" not in infidelity_calls[0]
+    assert "method" not in norm_calls[0][1]
 
 
 def test_peps_optimizer_rejects_invalid_two_site_batch_size():

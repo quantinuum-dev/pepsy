@@ -5,8 +5,9 @@ from types import SimpleNamespace
 import quimb.tensor as qtn
 import pytest
 
-import pepsy.optimizers.sweep as sweep_mod
-from pepsy.optimizers.sweep import SweepOptimizer
+import pepsy.optimizers.sweep.optimizer as sweep_mod
+from pepsy.optimizers.sweep.environments import QuimbMpsBoundaryStore
+from pepsy.optimizers.sweep.optimizer import SweepOptimizer
 from pepsy.tensors.core import tn_norm
 
 
@@ -1054,8 +1055,8 @@ def test_set_target_rebuilds_overlap_boundary(monkeypatch):
         captured["single_layer"] = single_layer
         return SimpleNamespace(chi=chi, mps_b={"new": object()})
 
-    monkeypatch.setattr("pepsy.optimizers.sweep.build_bra_ket", _fake_build_bra_ket)
-    monkeypatch.setattr("pepsy.optimizers.sweep.BdyMPS", _fake_bdymps)
+    monkeypatch.setattr("pepsy.optimizers.sweep.optimizer.build_bra_ket", _fake_build_bra_ket)
+    monkeypatch.setattr("pepsy.optimizers.sweep.optimizer.BdyMPS", _fake_bdymps)
 
     target_new = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=7, dtype="complex128")
     SweepOptimizer.set_target(opt, target_new)
@@ -1328,3 +1329,202 @@ def test_constructor_renormalize_kwargs_mapping_style(monkeypatch):
     assert called["max_separation"] == 1
     assert called["progress"] is True
     assert called["track_boundary_fidelity"] is False
+
+
+def test_quimb_mps_boundary_store_maps_environment_keys():
+    """Quimb environment dictionaries should populate legacy sweep keys."""
+
+    class _Env:  # pylint: disable=too-few-public-methods
+        def __init__(self, name):
+            self.name = name
+
+        def norm(self):
+            return 1.0
+
+    class _FakeTN:  # pylint: disable=too-few-public-methods
+        Lx = 3
+        Ly = 4
+
+        def __init__(self):
+            self.calls = []
+
+        def compute_y_environments(self, **kwargs):
+            self.calls.append(("y", dict(kwargs)))
+            return {
+                ("ymin", j): _Env(f"ymin{j}")
+                for j in range(self.Ly)
+            } | {
+                ("ymax", j): _Env(f"ymax{j}")
+                for j in range(self.Ly)
+            }
+
+        def compute_x_environments(self, **kwargs):
+            self.calls.append(("x", dict(kwargs)))
+            return {
+                ("xmin", i): _Env(f"xmin{i}")
+                for i in range(self.Lx)
+            } | {
+                ("xmax", i): _Env(f"xmax{i}")
+                for i in range(self.Lx)
+            }
+
+    tn = _FakeTN()
+    store = QuimbMpsBoundaryStore(chi=5, cutoff=1.0e-9)
+
+    store.update_axis(tn, "y")
+    store.update_axis(tn, "x")
+
+    assert store.mps_b["Y0_l"].name == "ymin1"
+    assert store.mps_b["Y2_l"].name == "ymin3"
+    assert store.mps_b["Y2_r"].name == "ymax0"
+    assert store.mps_b["Y0_r"].name == "ymax2"
+    assert store.mps_b["X0_l"].name == "xmin1"
+    assert store.mps_b["X1_l"].name == "xmin2"
+    assert store.mps_b["X1_r"].name == "xmax0"
+    assert store.mps_b["X0_r"].name == "xmax1"
+    assert tn.calls[0][1]["max_bond"] == 5
+    assert tn.calls[0][1]["cutoff"] == 1.0e-9
+    assert tn.calls[0][1]["mode"] == "mps"
+    assert tn.calls[0][1]["layer_tags"] == ["KET", "BRA"]
+
+
+def test_sweep_quimb_mps_normalize_and_infidelity_use_quimb_methods(monkeypatch):
+    """Quimb sweep stores should route scalar metrics through method='mps'."""
+    opt = object.__new__(SweepOptimizer)
+    opt.state = object()
+    opt.state_target = object()
+    opt.bdy = QuimbMpsBoundaryStore(chi=7)
+    opt.bdy_overlap = QuimbMpsBoundaryStore(chi=9)
+    opt.boundary_engine = "quimb-mps"
+    opt.normalize_kwargs = {}
+    opt.contraction_opt = "OPT"
+    opt.fit_mode = "eff"
+
+    normalize_calls = []
+
+    def _fake_normalize(state, **kwargs):
+        normalize_calls.append((state, dict(kwargs)))
+        return 3.0
+
+    monkeypatch.setattr(sweep_mod, "peps_normalize", _fake_normalize)
+
+    old_norm = SweepOptimizer.normalize(opt)
+
+    assert old_norm == 3.0
+    assert normalize_calls[0][0] is opt.state
+    assert normalize_calls[0][1]["method"] == "mps"
+    assert normalize_calls[0][1]["chi"] == 7
+    assert normalize_calls[0][1]["bdy"] is None
+    assert normalize_calls[0][1]["balance_bonds"] is False
+
+    infidelity_calls = []
+
+    def _fake_infidelity(*args, **kwargs):
+        infidelity_calls.append((args, dict(kwargs)))
+        return {"infidelity": 0.125, "bdy": None, "bdy_overlap": None}
+
+    monkeypatch.setattr(sweep_mod, "boundary_infidelity", _fake_infidelity)
+
+    loss = SweepOptimizer.infidelity(opt, norm=1.0, norm_target=1.0)
+
+    assert loss == pytest.approx(0.125)
+    assert infidelity_calls[0][1]["method"] == "mps"
+    assert infidelity_calls[0][1]["chi"] == 9
+    assert infidelity_calls[0][1]["bdy"] is None
+    assert infidelity_calls[0][1]["bdy_overlap"] is None
+    assert opt.bdy.chi == 7
+    assert opt.bdy_overlap.chi == 9
+
+
+def test_sweep_normalize_uses_norm_chi_from_tuple(monkeypatch):
+    """Tuple boundary chi should not be forwarded to scalar normalization."""
+    opt = object.__new__(SweepOptimizer)
+    opt.state = object()
+    opt.bdy = type("_Bdy", (), {"chi": (5, 7)})()
+    opt.boundary_engine = "dmrg"
+    opt.normalize_kwargs = {}
+    opt.contraction_opt = "OPT"
+    opt.fit_mode = "eff"
+
+    normalize_calls = []
+
+    def _fake_normalize(state, **kwargs):
+        normalize_calls.append((state, dict(kwargs)))
+        return 2.0
+
+    monkeypatch.setattr(sweep_mod, "peps_normalize", _fake_normalize)
+
+    old_norm = SweepOptimizer.normalize(opt, chi=(5, 7))
+
+    assert old_norm == 2.0
+    assert normalize_calls[0][1]["chi"] == 5
+
+
+def test_sweep_quimb_mps_refreshes_real_quimb_environments():
+    """A tiny PEPS should populate local sweep keys with Quimb environments."""
+    peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=21, dtype="complex128")
+    target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=22, dtype="complex128")
+    opt = SweepOptimizer(
+        peps,
+        target,
+        chi=4,
+        boundary_engine="quimb-mps",
+        renormalize_state=False,
+    )
+
+    norm_tn, overlap_tn = opt._prepare_current_double_layers()
+    opt._refresh_quimb_axis_boundaries(norm_tn, overlap_tn, "y")
+
+    assert "Y0_l" in opt.bdy.mps_b
+    assert "Y0_r" in opt.bdy.mps_b
+    assert "Y0_l" in opt.bdy_overlap.mps_b
+    assert "Y0_r" in opt.bdy_overlap.mps_b
+    assert opt.bdy.update_count == 1
+    assert opt.bdy_overlap.update_count == 1
+
+
+def test_sweep_quimb_mps_half_sweep_refreshes_per_slice(monkeypatch):
+    """Quimb sweep branch should rebuild environments before each slice."""
+    opt = object.__new__(SweepOptimizer)
+    opt.boundary_engine = "quimb-mps"
+    opt.bdy = SimpleNamespace(norm=1.0)
+    opt.bdy_overlap = SimpleNamespace(norm=1.0)
+
+    refreshes = []
+
+    def _fake_prepare():
+        return object(), object()
+
+    def _fake_refresh(norm_tn, overlap_tn, axis, *, progress=False):
+        refreshes.append((norm_tn, overlap_tn, axis, progress))
+        return {"norm": None, "overlap": None}
+
+    def _fake_optimize(index, *, axis, solver, solver_options):
+        return {
+            "axis": axis,
+            "index": index,
+            "loss_final": 0.1 + index,
+            "history": [0.2, 0.1 + index],
+        }
+
+    def _boom_make_comp(*args, **kwargs):  # pylint: disable=unused-argument
+        raise AssertionError("CompBdy path should not run for quimb-mps")
+
+    monkeypatch.setattr(opt, "_prepare_current_double_layers", _fake_prepare)
+    monkeypatch.setattr(opt, "_refresh_quimb_axis_boundaries", _fake_refresh)
+    monkeypatch.setattr(opt, "_optimize_axis_slice_with_current_env", _fake_optimize)
+    monkeypatch.setattr(opt, "_make_comp_pair", _boom_make_comp)
+
+    runs = SweepOptimizer._run_axis_half_sweep(
+        opt,
+        range(2),
+        axis="y",
+        update_side="left",
+        sweep_name="forward",
+        solver="scipy",
+        solver_options=None,
+    )
+
+    assert [run["index"] for run in runs] == [0, 1]
+    assert len(refreshes) == 2
+    assert all(item[2] == "y" for item in refreshes)
