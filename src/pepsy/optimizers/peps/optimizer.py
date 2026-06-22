@@ -43,6 +43,7 @@ _DEFAULT_GLOBAL_FALLBACK_KWARGS = {
     "n": 1,
     "optimizer": "lbfgs",
 }
+_TRACE_FIDELITY_FLOOR = 1.0e-15
 
 
 def _normalize_gate_queue(gates):
@@ -133,6 +134,29 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     - ``evaluation_chi`` controls calls to :func:`pepsy.peps_infidelity` used
       to accept/reject warm starts and optimized candidates.
 
+    Important cautions
+    ------------------
+    - A second :meth:`run` call applies the queued gates again to the current
+      state. The default ``reset_traces=True`` resets diagnostics only; use
+      :meth:`set_state` when you want to replay from a fresh input state.
+    - If ``normalize_chi`` or ``evaluation_chi`` is left as ``None``, standalone
+      normalization and infidelity diagnostics use ``2 * max(boundary_chi)``.
+      This is often more accurate, but it can dominate runtime.
+    - ``accept_if_improved=True`` is most meaningful with
+      ``measure_final_infidelity=True``. If final measurement is disabled, the
+      optimizer loss used as a fallback can come from the coarser
+      ``boundary_chi`` environment while the pre-check used ``evaluation_chi``.
+    - Sweep mode defaults to the optional NLopt ``LD_LBFGS`` solver. Install
+      NLopt or pass an explicit ``optimizer`` / ``sweep_optimize_kwargs`` value
+      for environments where NLopt is unavailable.
+    - ``non_unitary=True`` normalizes generated targets and candidates; it does
+      not implement the interval scheduling or norm-proxy machinery available
+      in :class:`pepsy.optimizers.mps.MpsOptimizer`.
+    - Step records and fidelity traces are per measured two-site update.
+      One-site gates applied outside a two-site batch are not recorded as
+      separate steps. For PEPS lattice gates, prefer coordinate-tuple sites
+      like ``((x0, y0), (x1, y1))`` over flat integer pairs.
+
     Parameters
     ----------
     state : qtn.TensorNetwork
@@ -216,7 +240,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Constructor options forwarded to :class:`GlobalOptimizer`.
     global_optimize_kwargs : mapping, optional
         Per-run global optimizer controls. The default global cleanup budget is
-        ``n=100``; pass ``{"n": ...}`` to tune this sensitive value.
+        ``n=1200``; pass ``{"n": ...}`` to tune this sensitive value.
     global_fallback_kwargs : mapping, optional
         Global fallback controls used if an optional NLopt run raises an NLopt
         runtime error. Defaults to one LBFGS step.
@@ -966,17 +990,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.local_infidelities.append(infidelity)
         self._fidelity_count += 1
 
-        if fidelity <= 0.0 or self._fidelity_log_sum == -math.inf:
-            self._fidelity_log_sum = -math.inf
-        else:
-            self._fidelity_log_sum += math.log(fidelity)
+        trace_fidelity = max(float(fidelity), _TRACE_FIDELITY_FLOOR)
+        self._fidelity_log_sum += math.log(trace_fidelity)
 
-        if self._fidelity_log_sum == -math.inf:
-            cumulative_fidelity = 0.0
-            geometric_fidelity = 0.0
-        else:
-            cumulative_fidelity = math.exp(self._fidelity_log_sum)
-            geometric_fidelity = math.exp(self._fidelity_log_sum / self._fidelity_count)
+        cumulative_fidelity = math.exp(self._fidelity_log_sum)
+        geometric_fidelity = math.exp(self._fidelity_log_sum / self._fidelity_count)
 
         self.losses.append(float(geometric_fidelity))
         self.infidelities.append(float(1.0 - cumulative_fidelity))
@@ -1318,6 +1336,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         sweep_optimize_kwargs: Mapping[str, Any] | None = None,
         global_kwargs: Mapping[str, Any] | None = None,
         global_optimize_kwargs: Mapping[str, Any] | None = None,
+        reset_traces=True,
     ):
         """Run the queued gate stream and return the compressed state.
 
@@ -1371,7 +1390,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             estimate.
         measure_final_infidelity : bool, default=True
             Re-estimate infidelity after variational cleanup before deciding
-            whether to accept the optimized state.
+            whether to accept the optimized state. Keep this enabled when
+            ``accept_if_improved`` should compare pre/post candidates at the
+            same ``evaluation_chi``.
         accept_if_improved : bool | None, default=None
             If true, keep the chi-truncated warm start whenever the measured
             optimized state is not better than the warm start. The default uses
@@ -1385,6 +1406,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             Per-run sweep backend and optimizer overrides.
         global_kwargs, global_optimize_kwargs : mapping, optional
             Per-run global backend and optimizer overrides.
+        reset_traces : bool, default=True
+            Reset diagnostic traces at the start of this call. Calling
+            ``run()`` again still applies the queued gates to the current
+            state; this flag controls only the recorded losses, infidelities,
+            step records, and normalization events.
         """
         if mode is not None:
             self.set_mode(mode)
@@ -1397,6 +1423,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             else bool(accept_if_improved)
         )
         k_2q_batch = self._validate_scalar_chi(k_2q_batch, name="k_2q_batch")
+        if reset_traces:
+            self._reset_traces()
 
         self._ensure_initial_normalized(
             normalize_initial=normalize_initial,
@@ -1655,6 +1683,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         This is a per-two-site-gate monitor, not an exact global fidelity. For
         small systems, use a direct overlap with a high-chi or dense reference
         when you need the true state-vs-ideal fidelity.
+
+        Zero local-fidelity estimates are floored only in this diagnostic trace
+        so one saturated boundary estimate does not pin later progress to
+        exactly zero.
         """
         return list(self.losses)
 
@@ -1665,6 +1697,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         state-vs-ideal infidelity. It can overestimate the true global
         infidelity by orders of magnitude because later gates can coherently
         rotate or partially recover earlier local truncation errors.
+
+        The product uses the same tiny local-fidelity floor as
+        :meth:`get_fidelities` to keep the trace finite.
         """
         return list(self.infidelities)
 

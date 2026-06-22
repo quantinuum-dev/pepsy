@@ -645,6 +645,66 @@ def test_peps_optimizer_global_default_budget_is_user_overridable(monkeypatch):
     assert captured["optimize_kwargs"]["optimizer"] == "lbfgs"
 
 
+def test_peps_optimizer_fidelity_trace_stays_finite_after_zero(monkeypatch):
+    """A zero local-fidelity estimate should not poison later trace diagnostics."""
+    _install_fake_gate(monkeypatch)
+    _install_fake_normalize(monkeypatch)
+    infidelities = iter([1.0, 0.01])
+    monkeypatch.setattr(
+        peps_mod,
+        "boundary_infidelity",
+        lambda *args, **kwargs: {"infidelity": next(infidelities)},
+    )
+
+    gates = [
+        ({"bond": 8, "label": "zero"}, ((0, 0), (0, 1))),
+        ({"bond": 8, "label": "good"}, ((1, 0), (1, 1))),
+    ]
+    opt = PepsOptimizer(DummyState(bond=1), gates, chi=3, normalize_initial=False)
+
+    opt.run(progress=False, optimize=False)
+
+    assert opt.local_infidelities == [pytest.approx(1.0), pytest.approx(0.01)]
+    assert opt.step_records[0]["fidelity"] == pytest.approx(0.0)
+    assert opt.step_records[0]["geometric_fidelity"] == pytest.approx(
+        peps_mod._TRACE_FIDELITY_FLOOR
+    )
+    assert opt.get_fidelities()[-1] == pytest.approx(
+        (peps_mod._TRACE_FIDELITY_FLOOR * 0.99) ** 0.5
+    )
+    assert opt.get_infidelities()[-1] < 1.0
+
+
+def test_peps_optimizer_run_resets_traces_by_default(monkeypatch):
+    """Repeated run calls should start fresh diagnostics unless opted out."""
+    _install_fake_gate(monkeypatch)
+    _install_fake_normalize(monkeypatch)
+    infidelities = iter([0.1, 0.2, 0.3])
+    monkeypatch.setattr(
+        peps_mod,
+        "boundary_infidelity",
+        lambda *args, **kwargs: {"infidelity": next(infidelities)},
+    )
+
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [({"bond": 8}, ((0, 0), (0, 1)))],
+        chi=3,
+        normalize_initial=False,
+    )
+
+    opt.run(progress=False, optimize=False)
+    assert opt.local_infidelities == [pytest.approx(0.1)]
+
+    opt.run(progress=False, optimize=False, reset_traces=False)
+    assert opt.local_infidelities == [pytest.approx(0.1), pytest.approx(0.2)]
+    assert len(opt.step_records) == 2
+
+    opt.run(progress=False, optimize=False)
+    assert opt.local_infidelities == [pytest.approx(0.3)]
+    assert len(opt.step_records) == 1
+
+
 def test_peps_optimizer_progress_reports_geometric_infidelity(monkeypatch):
     """Progress bar should expose a compact MpsOptimizer-style postfix."""
     import tqdm as tqdm_pkg

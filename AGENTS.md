@@ -13,6 +13,9 @@ This file defines default behavior for coding agents working in this repository.
 - Tests: `tests/`
 - Docs: `docs/`
 - Examples: `examples/`
+- The sibling `/home/reza.haghshenas@quantinuum.com/tensy` repository uses
+  Pepsy as its tensor-network package; keep that consumer in mind for API and
+  behavior changes.
 - Local/generated artifacts may appear in `build/`, `docs/_build/`, `__pycache__/`, `cash*/`, `ctg_cash/`, and `store/`; do not use these as source-of-truth code.
 
 ## Startup Checklist

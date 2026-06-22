@@ -123,6 +123,91 @@ def test_tn_fidelity_uses_supplied_optimizer_without_build(monkeypatch):
     assert called["build"] == 0
 
 
+def test_tn_fidelity_simplifies_closed_overlap_networks(monkeypatch):
+    """tn_fidelity can simplify closed norm/overlap TNs before contraction."""
+
+    psi = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=7)
+    psi_fix = psi.copy()
+    simplify_output_inds = []
+    original = qtn.TensorNetwork.full_simplify_
+
+    def spy_full_simplify(self, *args, **kwargs):
+        simplify_output_inds.append(kwargs.get("output_inds"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.TensorNetwork, "full_simplify_", spy_full_simplify)
+
+    fidelity = core.tn_fidelity(
+        psi,
+        psi_fix,
+        contraction_opt="greedy",
+        simplify=True,
+    )
+
+    assert abs(fidelity - 1.0) < 1e-12
+    assert simplify_output_inds == [(), (), ()]
+
+
+def test_tn_fidelity_defaults_to_no_closed_overlap_simplification(monkeypatch):
+    """The default tn_fidelity path should avoid full_simplify_ calls."""
+
+    psi = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=8)
+    psi_fix = psi.copy()
+    called = {"simplify": 0}
+
+    def fail_full_simplify(self, *args, **kwargs):  # pylint: disable=unused-argument
+        called["simplify"] += 1
+        raise AssertionError("full_simplify_ should not be called")
+
+    monkeypatch.setattr(qtn.TensorNetwork, "full_simplify_", fail_full_simplify)
+
+    fidelity = core.tn_fidelity(
+        psi,
+        psi_fix,
+        contraction_opt="greedy",
+    )
+
+    assert abs(fidelity - 1.0) < 1e-12
+    assert called["simplify"] == 0
+
+
+def test_tn_norm_simplifies_closed_network_when_requested(monkeypatch):
+    """tn_norm can simplify the closed norm TN before contraction."""
+
+    psi = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=9)
+    simplify_output_inds = []
+    original = qtn.TensorNetwork.full_simplify_
+
+    def spy_full_simplify(self, *args, **kwargs):
+        simplify_output_inds.append(kwargs.get("output_inds"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.TensorNetwork, "full_simplify_", spy_full_simplify)
+
+    norm = core.tn_norm(psi, contraction_opt="greedy", simplify=True)
+
+    assert norm > 0
+    assert simplify_output_inds == [()]
+
+
+def test_tn_norm_defaults_to_no_closed_network_simplification(monkeypatch):
+    """The default tn_norm path should avoid full_simplify_ calls."""
+
+    psi = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=10)
+    called = {"simplify": 0}
+
+    def fail_full_simplify(self, *args, **kwargs):  # pylint: disable=unused-argument
+        called["simplify"] += 1
+        raise AssertionError("full_simplify_ should not be called")
+
+    monkeypatch.setattr(qtn.TensorNetwork, "full_simplify_", fail_full_simplify)
+
+    norm = core.tn_norm(psi, contraction_opt="greedy")
+
+    assert norm > 0
+    assert called["simplify"] == 0
+
+
 def test_default_backend_setters_roundtrip():
     """Default backend setters/getters should round-trip callables."""
     array_backend = lambda x: x  # noqa: E731

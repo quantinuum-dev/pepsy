@@ -1165,6 +1165,8 @@ def tn_norm(
     *,
     contraction_opt: Any | None = None,
     strip_exponent: bool = False,
+    simplify: bool = False,
+    simplify_seq: str = "R",
 ):
     """Compute the norm of a tensor network state.
 
@@ -1177,6 +1179,11 @@ def tn_norm(
     strip_exponent : bool, default=False
         If ``True``, pass ``strip_exponent=True`` to the contraction, which
         returns ``(mantissa, exponent)`` instead of the scalar result.
+    simplify : bool, default=False
+        Whether to simplify the closed norm network before contraction.
+    simplify_seq : str, optional
+        Simplification sequence passed to ``full_simplify_`` when
+        ``simplify=True``.
 
     Returns
     -------
@@ -1186,11 +1193,21 @@ def tn_norm(
     """
     if contraction_opt is None:
         contraction_opt = build_optimizer(progbar=False)
+    norm_tn = psi.H & psi
+    if simplify:
+        norm_tn.full_simplify_(seq=simplify_seq, output_inds=())
     if not strip_exponent:
-        return ar.do("abs", (psi.H & psi).contract(all, optimize=contraction_opt))
-    
-    else:
-        return (psi.H & psi).contract(all, optimize=contraction_opt, strip_exponent=strip_exponent)
+        return ar.do(
+            "abs",
+            norm_tn.contract(all, optimize=contraction_opt, output_inds=()),
+        )
+
+    return norm_tn.contract(
+        all,
+        optimize=contraction_opt,
+        output_inds=(),
+        strip_exponent=strip_exponent,
+    )
 
 
 def _count_format_fields(fmt):
@@ -1416,6 +1433,8 @@ def tn_fidelity(
     psi_fix,
     *,
     contraction_opt: Any | None = None,
+    simplify: bool = False,
+    simplify_seq: str = "R",
 ):
     """Compute normalized overlap fidelity.
 
@@ -1427,17 +1446,29 @@ def tn_fidelity(
         Reference state.
     contraction_opt : object | None, optional
         Contraction optimizer. If ``None``, a default optimizer is built.
+    simplify : bool, default=False
+        Whether to simplify each closed norm/overlap network before
+        contraction.
+    simplify_seq : str, optional
+        Simplification sequence passed to ``full_simplify_`` when
+        ``simplify=True``.
     """
     if contraction_opt is None:
         contraction_opt = build_optimizer(progbar=False)
 
-    val_0 = abs((psi.H & psi).contract(all, optimize=contraction_opt, output_inds=()))
-    val_1 = abs((psi.H & psi_fix).contract(all, optimize=contraction_opt, output_inds=()))
-    val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=contraction_opt, output_inds=()))
+    def closed_overlap(left, right):
+        tn = left.H & right
+        if simplify:
+            tn.full_simplify_(seq=simplify_seq, output_inds=())
+        return abs(tn.contract(all, optimize=contraction_opt, output_inds=()))
+
+    val_0 = closed_overlap(psi, psi)
+    val_1 = closed_overlap(psi, psi_fix)
+    val_ref = closed_overlap(psi_fix, psi_fix)
 
     val_1 = val_1**2
     fidelity = ar.do("abs", val_1) / (val_0 * val_ref)
-    return ar.do("abs",fidelity)
+    return ar.do("abs", fidelity)
 
 
 def add_cycle(peps, bond_dim, cylinder=False):

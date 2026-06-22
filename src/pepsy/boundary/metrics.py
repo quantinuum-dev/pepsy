@@ -855,6 +855,7 @@ def peps_normalize(
         - ``dict``: if ``dict["bdy"]`` exists it is reused; otherwise a new
           boundary is created (requires ``chi``) and written to ``dict["bdy"]``.
         - ``None``: a new boundary is created internally (requires ``chi``).
+
         Only used with ``method="dmrg"``.
     method : {"dmrg", "mps", "ctmrg", "hotrg", "exact"}, default="dmrg"
         Contraction backend. ``"dmrg"`` is the package BdyMPS/FIT path.
@@ -862,7 +863,7 @@ def peps_normalize(
         on the double-layer network. ``"rg"`` is accepted as a deprecated alias
         for ``"ctmrg"``.
     contraction_opt : str | object, default="auto-hq"
-                Contraction optimizer.
+        Contraction optimizer.
     n_iter : int, default=10
         Number of local fit iterations per boundary step.
     direction : str, default="y"
