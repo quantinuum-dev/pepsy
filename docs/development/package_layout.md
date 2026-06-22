@@ -34,10 +34,15 @@ from pepsy.tensors import haar_random_state, ps_to_peps, ps_to_3dpeps, ps_to_mps
 When a leaf module is needed, import the new implementation path directly:
 
 ```python
-from pepsy.optimizers.sweep import SweepOptimizer
+from pepsy.optimizers.sweep.optimizer import SweepOptimizer
 from pepsy.boundary.states import BdyMPS
 from pepsy.operators.gates import rx, gate
 ```
+
+Optimizer implementations are split into subpackages. Prefer public class
+imports from `pepsy.optimizers`; use leaf paths such as
+`pepsy.optimizers.mps.optimizer` only for implementation-level tests or
+internal development.
 
 ## Migration Order
 
