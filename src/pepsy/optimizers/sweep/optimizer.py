@@ -13,13 +13,18 @@ import autoray as ar
 import quimb.tensor as qtn
 from tqdm.auto import tqdm
 
-from ..boundary.metrics import peps_infidelity as boundary_infidelity
-from ..boundary.metrics import build_bra_ket, peps_normalize
-from ..boundary.states import BdyMPS
-from ..boundary.sweeps import CompBdy
-from ..tensors.core import tn_fidelity
-from ..solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS
-from ..tensors.validation import _PHYS_IND_PATTERN, _TAG_X, _TAG_Y
+from ...boundary.metrics import peps_infidelity as boundary_infidelity
+from ...boundary.metrics import build_bra_ket, peps_normalize
+from ...boundary.states import BdyMPS
+from ...boundary.sweeps import CompBdy
+from ...tensors.core import tn_fidelity
+from ...solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS
+from ...tensors.validation import _PHYS_IND_PATTERN, _TAG_X, _TAG_Y
+from .environments import (
+    QuimbMpsBoundaryStore,
+    normalize_boundary_engine,
+    uses_symmray_arrays,
+)
 
 __all__ = ["SweepOptimizer"]
 
@@ -63,6 +68,16 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         Contraction optimizer.
     fit_mode : {"eff", "global"}, default="eff"
         Backend mode passed to :class:`pepsy.boundary.sweeps.CompBdy`.
+    boundary_engine : {"auto", "dmrg", "quimb-mps"}, default="auto"
+        Environment engine used during local sweeps. ``"dmrg"`` preserves the
+        Pepsy ``BdyMPS``/``CompBdy`` path. ``"quimb-mps"`` builds reusable
+        Quimb MPS environments with ``compute_x/y_environments(...)``.
+        ``"auto"`` keeps dense backends on ``"dmrg"`` and routes Symmray
+        networks to ``"quimb-mps"``.
+    boundary_options : mapping | None, optional
+        Extra options for the Quimb MPS environment engine, such as
+        ``cutoff``, ``canonize``, ``mode``, ``layer_tags``,
+        ``compress_opts``, and ``equalize_norms``.
     """
 
     _NORMALIZE_KEYS = frozenset({
@@ -80,6 +95,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "cutoff",
         "equalize_norms",
         "layer_tags",
+        "balance_bonds",
     })
     _INFIDELITY_KEYS = frozenset({
         "chi",
@@ -116,6 +132,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "debug_loss_mode",
         "debug_loss_kwargs",
         "renormalize",
+        "boundary_engine",
+        "boundary_options",
     })
     _DEFAULT_SOLVER_OPTIONS = {
         "algorithm": "LBFGS",
@@ -147,6 +165,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             return int(chi[0]), int(chi[1])
         return int(chi), int(chi)
+
+    @classmethod
+    def _normalize_chi(cls, chi):
+        """Return the scalar chi used for state-norm contractions."""
+        chi_bdy, _ = cls._unpack_chi(chi)
+        return chi_bdy
 
     @staticmethod
     def _merge_opts(base, extra):
@@ -317,6 +341,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         optimize_kwargs: Mapping[str, Any] | None = None,
         renormalize_state=False,
         renormalize_kwargs: Mapping[str, Any] | None = None,
+        boundary_engine: str | None = "auto",
+        boundary_options: Mapping[str, Any] | None = None,
         n_iter: int | None = None,
         direction: str | None = None,
         max_separation: int | None = None,
@@ -332,6 +358,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         self._bdy_holder = bdy_holder
         self._bdy_overlap_holder = bdy_overlap_holder
+        self.boundary_options = dict(boundary_options or {})
+        self.boundary_engine = normalize_boundary_engine(
+            boundary_engine,
+            state,
+            state_target,
+            boundaries_supplied=bdy_obj is not None,
+        )
 
         if (bdy_obj is None) ^ (bdy_overlap_obj is None):
             raise ValueError(
@@ -345,11 +378,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             if state_target is None:
                 raise ValueError("state_target is required when boundaries are not supplied.")
-            bdy_obj, bdy_overlap_obj = self._build_boundary_pair(
+            bdy_obj, bdy_overlap_obj = self._call_with_accepted_kwargs(
+                self._build_boundary_pair,
                 state,
                 state_target,
                 chi=chi,
                 single_layer=single_layer,
+                boundary_engine=self.boundary_engine,
+                boundary_options=self.boundary_options,
             )
 
         self.state = state
@@ -432,9 +468,25 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         return boundary, None
 
     @staticmethod
-    def _build_boundary_pair(state, target, *, chi, single_layer=False):
+    def _build_boundary_pair(
+        state,
+        target,
+        *,
+        chi,
+        single_layer=False,
+        boundary_engine="dmrg",
+        boundary_options=None,
+    ):
         """Construct norm and overlap boundary MPS containers."""
         chi_bdy, chi_overlap = SweepOptimizer._unpack_chi(chi)
+        boundary_engine = normalize_boundary_engine(boundary_engine, state, target)
+        if boundary_engine == "quimb-mps":
+            opts = dict(boundary_options or {})
+            return (
+                QuimbMpsBoundaryStore(chi=chi_bdy, **opts),
+                QuimbMpsBoundaryStore(chi=chi_overlap, **opts),
+            )
+
         _, state_norm = build_bra_ket(ket=state, bra=None)
         _, overlap_norm = build_bra_ket(ket=target, bra=state)
         bdy = BdyMPS(
@@ -463,8 +515,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _update_boundaries_from_result(self, result):
         """Apply optional ``bdy``/``bdy_overlap`` entries from a result dict."""
-        bdy_new = result.get("bdy", self.bdy)
-        bdy_overlap_new = result.get("bdy_overlap", self.bdy_overlap)
+        bdy_new = result.get("bdy") or self.bdy
+        bdy_overlap_new = result.get("bdy_overlap") or self.bdy_overlap
         self._set_boundary_pair(bdy_new, bdy_overlap_new)
 
     @staticmethod
@@ -624,11 +676,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError("Provide chi when current boundary chi is unavailable.")
 
         # chi may be int or (int, int) for separate bdy/bdy_overlap dims.
-        bdy_new, bdy_overlap_new = self._build_boundary_pair(
+        bdy_new, bdy_overlap_new = self._call_with_accepted_kwargs(
+            self._build_boundary_pair,
             self.state,
             self.state_target,
             chi=chi,
             single_layer=single_layer,
+            boundary_engine=getattr(self, "boundary_engine", "dmrg"),
+            boundary_options=getattr(self, "boundary_options", None),
         )
         self._set_boundary_pair(bdy_new, bdy_overlap_new)
 
@@ -679,12 +734,18 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if chi_overlap is None:
             raise ValueError("Provide chi when current boundary chi is unavailable.")
 
-        _, overlap_norm = build_bra_ket(ket=self.state_target, bra=self.state)
-        bdy_overlap_new = BdyMPS(
-            tn_double=overlap_norm,
-            chi=chi_overlap,
-            single_layer=single_layer,
-        )
+        if getattr(self, "boundary_engine", "dmrg") == "quimb-mps":
+            bdy_overlap_new = QuimbMpsBoundaryStore(
+                chi=chi_overlap,
+                **getattr(self, "boundary_options", {}),
+            )
+        else:
+            _, overlap_norm = build_bra_ket(ket=self.state_target, bra=self.state)
+            bdy_overlap_new = BdyMPS(
+                tn_double=overlap_norm,
+                chi=chi_overlap,
+                single_layer=single_layer,
+            )
         self._set_boundary_pair(self.bdy, bdy_overlap_new)
 
     def set_normalize_kwargs(self, **kwargs):
@@ -705,6 +766,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         """Normalize PEPS in place and return the old norm estimate."""
         state = self.state if state is None else state
         opts = self._merge_opts(getattr(self, "normalize_kwargs", {}), kwargs)
+        uses_quimb = getattr(self, "boundary_engine", "dmrg") == "quimb-mps"
         contraction_opt = opts.get("contraction_opt", self.contraction_opt)
         n_iter = opts.get("n_iter", 10)
         direction = opts.get("direction", "y")
@@ -712,11 +774,16 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         progress = opts.get("progress", False)
         track_boundary_fidelity = opts.get("track_boundary_fidelity", False)
         strip_exponent = opts.get("strip_exponent", False)
+        method = opts.get("method", "mps" if uses_quimb else "dmrg")
+        chi = self._normalize_chi(opts.get("chi", getattr(self.bdy, "chi", None)))
+        bdy = None if uses_quimb else self.bdy
+        balance_bonds = opts.get("balance_bonds", not uses_quimb)
 
         if state is self.state:
             return peps_normalize(
                 self.state,
-                bdy=self.bdy,
+                chi=chi,
+                bdy=bdy,
                 contraction_opt=contraction_opt,
                 max_separation=max_separation,
                 n_iter=n_iter,
@@ -725,15 +792,15 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 track_boundary_fidelity=track_boundary_fidelity,
                 fit_mode=self.fit_mode,
                 strip_exponent=strip_exponent,
-                method=opts.get("method", "dmrg"),
+                method=method,
                 mode_=opts.get("mode_", "mps"),
                 sequence=opts.get("sequence", None),
                 cutoff=opts.get("cutoff", 1.0e-12),
                 equalize_norms=opts.get("equalize_norms", False),
                 layer_tags=opts.get("layer_tags", None),
+                balance_bonds=balance_bonds,
             )
 
-        chi = getattr(self.bdy, "chi", None)
         if chi is None:
             raise ValueError("Provide chi via optimizer boundaries before normalizing external state.")
         return peps_normalize(
@@ -747,12 +814,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
             strip_exponent=strip_exponent,
-            method=opts.get("method", "dmrg"),
+            method=method,
             mode_=opts.get("mode_", "mps"),
             sequence=opts.get("sequence", None),
             cutoff=opts.get("cutoff", 1.0e-12),
             equalize_norms=opts.get("equalize_norms", False),
             layer_tags=opts.get("layer_tags", None),
+            balance_bonds=balance_bonds,
         )
 
     def _normalize_state(self, env_n_iter=4):
@@ -808,6 +876,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "Set it in constructor or via set_target()."
             )
 
+        uses_quimb = getattr(self, "boundary_engine", "dmrg") == "quimb-mps"
+        if uses_quimb and method == "dmrg":
+            method = "mps"
         self._ensure_boundary_chi(chi)
 
         # boundary_infidelity() expects a scalar int chi; derive one from
@@ -815,6 +886,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         chi_bdy, chi_overlap = self._unpack_chi(chi)
         if chi_bdy is not None:
             chi_for_call = max(chi_bdy, chi_overlap)
+        elif uses_quimb:
+            chi_for_call = max(
+                int(getattr(self.bdy, "chi", 1)),
+                int(getattr(self.bdy_overlap, "chi", 1)),
+            )
         elif norm_target is None:
             chi_for_call = max(int(getattr(self.bdy, "chi", 1)), int(getattr(self.bdy_overlap, "chi", 1)))
         else:
@@ -827,8 +903,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             chi=chi_for_call,
             norm=norm,
             norm_target=norm_target,
-            bdy=self.bdy,
-            bdy_overlap=self.bdy_overlap,
+            bdy=None if uses_quimb else self.bdy,
+            bdy_overlap=None if uses_quimb else self.bdy_overlap,
             contraction_opt=self.contraction_opt if contraction_opt is None else contraction_opt,
             n_iter=n_iter,
             direction=direction,
@@ -1159,7 +1235,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _apply_slice_update(self, index, params_opt, skeleton, axis):
         tn_opt = qtn.unpack(params_opt, skeleton)
-        tn_opt.balance_bonds_()
+        if not uses_symmray_arrays(tn_opt):
+            tn_opt.balance_bonds_()
 
         for tag in self._site_tensor_tags(axis, index):
             self.state[tag].modify(data=tn_opt[tag].data)
@@ -1276,6 +1353,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _refresh_right_boundaries_once(self, axis, *, env_n_iter=4):
         norm_tn, overlap_tn = self._prepare_current_double_layers()
+        if getattr(self, "boundary_engine", "dmrg") == "quimb-mps":
+            del env_n_iter
+            self._refresh_quimb_axis_boundaries(norm_tn, overlap_tn, axis)
+            return
         comp_norm, comp_overlap = self._make_comp_pair(norm_tn, overlap_tn)
         comp_overlap.move_bdy(
             n_iter=env_n_iter,
@@ -1289,6 +1370,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             direction=self._boundary_direction(axis, "right"),
             track_boundary_fidelity=False,
         )
+
+    def _refresh_quimb_axis_boundaries(self, norm_tn, overlap_tn, axis, *, progress=False):
+        """Rebuild Quimb MPS environments for the current double layers."""
+        self.bdy.update_axis(norm_tn, axis, progress=progress)
+        self.bdy_overlap.update_axis(overlap_tn, axis, progress=progress)
+        return {"norm": None, "overlap": None}
 
     def _advance_boundary_one_step(
         self,
@@ -1345,24 +1432,36 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         runs = []
         comp_norm = None
         comp_overlap = None
+        uses_quimb = getattr(self, "boundary_engine", "dmrg") == "quimb-mps"
 
         for index in indices:
             norm_tn, overlap_tn = self._prepare_current_double_layers()
-            if comp_norm is None:
+            if uses_quimb:
+                comp_norm = None
+                comp_overlap = None
+            elif comp_norm is None:
                 comp_norm, comp_overlap = self._make_comp_pair(norm_tn, overlap_tn)
             else:
                 self._set_comp_norms(comp_norm, comp_overlap, norm_tn=norm_tn, overlap_tn=overlap_tn)
 
             t0 = time.perf_counter()
-            boundary_fidelity = self._advance_boundary_one_step(
-                index,
-                side=update_side,
-                axis=axis,
-                comp_norm=comp_norm,
-                comp_overlap=comp_overlap,
-                env_n_iter=env_n_iter,
-                track_boundary_fidelity=track_boundary_fidelity,
-            )
+            if uses_quimb:
+                boundary_fidelity = self._refresh_quimb_axis_boundaries(
+                    norm_tn,
+                    overlap_tn,
+                    axis,
+                    progress=False,
+                )
+            else:
+                boundary_fidelity = self._advance_boundary_one_step(
+                    index,
+                    side=update_side,
+                    axis=axis,
+                    comp_norm=comp_norm,
+                    comp_overlap=comp_overlap,
+                    env_n_iter=env_n_iter,
+                    track_boundary_fidelity=track_boundary_fidelity,
+                )
             boundary_infidelity_norm = self._fidelity_to_infidelity(
                 boundary_fidelity.get("norm")
             )
@@ -1697,11 +1796,14 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if early_exit and self.best_state is not None:
             self.state = self.best_state.copy()
             self._set_boundary_pair(
-                *self._build_boundary_pair(
+                *self._call_with_accepted_kwargs(
+                    self._build_boundary_pair,
                     self.state,
                     self.state_target,
                     chi=getattr(self, "chi", None),
                     single_layer=getattr(self, "single_layer", False),
+                    boundary_engine=getattr(self, "boundary_engine", "dmrg"),
+                    boundary_options=getattr(self, "boundary_options", None),
                 )
             )
 

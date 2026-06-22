@@ -8,13 +8,16 @@ from collections.abc import Mapping
 from numbers import Integral
 from typing import Any
 
-from ..backends.convert import resolve_backend_sample_data_from_tn
-from ..boundary.metrics import peps_infidelity as boundary_infidelity
-from ..boundary.metrics import peps_normalize as boundary_normalize
-from ..operators.gates import _normalize_gate_entries, gate as apply_gate
-from ..tensors.core import reg_complex_svd_torch as _reg_complex_svd_torch
-from .global_opt import GlobalOptimizer
-from .sweep import SweepOptimizer
+from ...boundary.metrics import peps_infidelity as boundary_infidelity
+from ...boundary.metrics import peps_normalize as boundary_normalize
+from ...operators.gates import _normalize_gate_entries, gate as apply_gate
+from ...tensors.core import reg_complex_svd_torch as _reg_complex_svd_torch
+from ..global_opt import GlobalOptimizer
+from ..sweep import SweepOptimizer
+from ..sweep.environments import (
+    canonical_boundary_engine_selector,
+    normalize_boundary_engine,
+)
 
 __all__ = ["PepsOptimizer"]
 
@@ -74,37 +77,9 @@ def _merge_opts(*options):
     return merged
 
 
-def _is_symmray_array_data(data):
-    """Return whether ``data`` looks like a Symmray array."""
-    return type(data).__module__.split(".", 1)[0] == "symmray"
-
-
-def _uses_symmray_arrays(tn):
-    """Return whether a tensor-network-like object stores Symmray arrays."""
-    sample_data = resolve_backend_sample_data_from_tn(tn)
-    if sample_data is not None and _is_symmray_array_data(sample_data):
-        return True
-
-    tensor_map = getattr(tn, "tensor_map", None)
-    tensors = None
-    if tensor_map:
-        tensors = tensor_map.values()
-    else:
-        try:
-            tensors = iter(tn)
-        except TypeError:
-            tensors = ()
-
-    for tensor in tensors:
-        data = getattr(tensor, "data", None)
-        if data is not None and _is_symmray_array_data(data):
-            return True
-    return False
-
-
-def _prefer_symmray_quimb_mps(opts, *states, normalize=False):
-    """Route Symmray PEPS boundary work away from PEPSY BdyMPS/FIT."""
-    if not any(_uses_symmray_arrays(state) for state in states):
+def _prefer_boundary_engine_mps(opts, boundary_engine, *states, normalize=False):
+    """Route metric contractions to Quimb MPS when the PEPS engine chooses it."""
+    if normalize_boundary_engine(boundary_engine, *states) != "quimb-mps":
         return opts
 
     method = str(opts.get("method", "dmrg")).strip().lower().replace("-", "_")
@@ -203,6 +178,15 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         estimates, and sweep environment updates. Defaults are
         ``n_iter=10``, ``direction="y"``, ``max_separation=1``,
         ``track_boundary_fidelity=False``, and ``strip_exponent=True``.
+    boundary_engine : {"auto", "dmrg", "quimb-mps"}, default="auto"
+        Boundary engine used by sweep cleanup. ``"auto"`` keeps dense inputs
+        on Pepsy ``BdyMPS``/``CompBdy`` boundaries and routes Symmray-looking
+        inputs to Quimb MPS boundaries. The same selector supplies default
+        ``method="mps"`` metric contractions when Quimb MPS is selected.
+    boundary_options : mapping | None, optional
+        Extra options forwarded to :class:`SweepOptimizer`'s Quimb MPS
+        boundary store, such as ``cutoff``, ``canonize``, ``compress_opts``,
+        ``equalize_norms``, ``layer_tags``, and ``mode``.
     normalize_kwargs, infidelity_kwargs : mapping, optional
         Extra keyword arguments for boundary normalization and local infidelity
         estimates. These are merged after ``boundary_kwargs``.
@@ -265,6 +249,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         inplace=False,
         normalize_initial=True,
         boundary_kwargs: Mapping[str, Any] | None = None,
+        boundary_engine="auto",
+        boundary_options: Mapping[str, Any] | None = None,
         normalize_kwargs: Mapping[str, Any] | None = None,
         infidelity_kwargs: Mapping[str, Any] | None = None,
         gate_kwargs: Mapping[str, Any] | None = None,
@@ -316,6 +302,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             _DEFAULT_BOUNDARY_KWARGS,
             boundary_kwargs,
         )
+        self.boundary_engine = canonical_boundary_engine_selector(boundary_engine)
+        self.boundary_options = dict(boundary_options or {})
         self.normalize_kwargs = dict(normalize_kwargs or {})
         self.infidelity_kwargs = dict(infidelity_kwargs or {})
         self.gate_kwargs = dict(gate_kwargs or {})
@@ -481,7 +469,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts.setdefault("chi", self._boundary_chi_for_norm(normalize_chi))
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
-        _prefer_symmray_quimb_mps(opts, state, normalize=True)
+        _prefer_boundary_engine_mps(opts, self.boundary_engine, state, normalize=True)
         old_norm = boundary_normalize(state, **opts)
         self.normalizations.append(self._normalization_record(state, old_norm))
         return old_norm
@@ -844,7 +832,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opts.setdefault("progress", False)
         opts.setdefault("norm", 1.0)
         opts.setdefault("norm_target", 1.0)
-        _prefer_symmray_quimb_mps(opts, state, target)
+        _prefer_boundary_engine_mps(opts, self.boundary_engine, state, target)
         return self._clean_infidelity(boundary_infidelity(state, target, **opts))
 
     def _sweep_boundary_kwargs(self, *, progress):
@@ -1013,11 +1001,25 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             "target_norm": 1.0,
             "contraction_opt": self.contraction_opt,
             "renormalize_state": True,
+            "boundary_engine": self.boundary_engine,
             **boundary_init_kwargs,
         }
+        if self.boundary_options:
+            init_kwargs["boundary_options"] = dict(self.boundary_options)
         init_kwargs.update(self.sweep_kwargs)
         init_kwargs.update(dict(sweep_kwargs or {}))
+        boundary_engine = normalize_boundary_engine(
+            init_kwargs.get("boundary_engine", "auto"),
+            state,
+            target_opt,
+        )
+        init_kwargs["boundary_engine"] = boundary_engine
         normalize_payload = init_kwargs.get("normalize_kwargs")
+        if boundary_engine == "quimb-mps":
+            normalize_payload = _merge_opts(
+                {"method": "mps", "mode_": "mps", "balance_bonds": False},
+                normalize_payload,
+            )
         if normalize_chi is not None or self.normalize_chi is not None:
             normalize_payload = _merge_opts(
                 normalize_payload,

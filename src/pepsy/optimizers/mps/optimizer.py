@@ -23,9 +23,9 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from ..fitting.local import FIT
-from ..operators.gates import _normalize_gate_entries, gate as apply_gate
-from ..tensors.core import tn_fidelity
+from ...fitting.local import FIT
+from ...operators.gates import _normalize_gate_entries, gate as apply_gate
+from ...tensors.core import tn_fidelity
 
 __all__ = ["MpsOptimizer"]
 

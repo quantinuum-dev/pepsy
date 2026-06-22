@@ -34,9 +34,9 @@ from numbers import Integral
 import autoray as ar
 import numpy as np
 
-from ..tensors.core import tn_norm
-from ..fitting.local import FIT
-from ..operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
+from ...tensors.core import tn_norm
+from ...fitting.local import FIT
+from ...operators.gates import _normalize_gate_entries, gate as apply_gate, gate_nonlocal_opt
 
 __all__ = ["MpoOptimizer"]
 
