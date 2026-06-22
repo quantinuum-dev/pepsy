@@ -1,7 +1,7 @@
-# `pepsy.optimizers.mpo`
+# `pepsy.optimizers.mpo.optimizer`
 
 ```{eval-rst}
-.. automodule:: pepsy.optimizers.mpo
+.. automodule:: pepsy.optimizers.mpo.optimizer
    :members:
    :undoc-members:
    :show-inheritance:

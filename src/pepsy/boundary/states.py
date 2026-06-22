@@ -95,6 +95,9 @@ class BdyMPS:
         self.seed = seed
         self._chi_target = int(chi)
         self.flat = flat
+        # Lattice shape is immutable after construction; cache on first access.
+        self._lx = None
+        self._ly = None
 
         backend_data = resolve_backend_sample_data_from_tn(backend_source)
         backend, dtype_name = infer_backend_and_dtype(backend_data)
@@ -175,6 +178,8 @@ class BdyMPS:
             return self._build_to_cupy(sample_data, dtype_name)
         if backend == "jax":
             return self._build_to_jax(sample_data, dtype_name)
+        if backend == "symmray":
+            return self._build_to_numpy(sample_data, dtype_name)
 
         raise ValueError(f"Unsupported backend: {backend}")
 
@@ -200,14 +205,16 @@ class BdyMPS:
     @property
     def ly(self):
         """Lattice size along the vertical axis."""
-        _, ly = self._infer_lattice_shape(None, self._tn_norm)
-        return ly
+        if self._ly is None:
+            self._lx, self._ly = self._infer_lattice_shape(None, self._tn_norm)
+        return self._ly
 
     @property
     def lx(self):
         """Lattice size along the horizontal axis."""
-        lx, _ = self._infer_lattice_shape(None, self._tn_norm)
-        return lx
+        if self._lx is None:
+            self._lx, self._ly = self._infer_lattice_shape(None, self._tn_norm)
+        return self._lx
 
     @property
     def tn_norm(self):
@@ -826,9 +833,10 @@ class BdyMPS:
 
         site_tags = self._sort_site_tags_by_index(network.tags, site_tag_id)
         ordered_inds = []
+        outer_set = set(outer_inds)
         for tag in site_tags:
             selected = network.select(tag)
-            local_outer = [idx for idx in selected.outer_inds() if idx in outer_inds]
+            local_outer = [idx for idx in selected.outer_inds() if idx in outer_set]
             ordered_inds.extend(local_outer)
 
         # Keep grouped ordering when available, then include any remaining open indices.
@@ -869,6 +877,7 @@ class BdyMPS:
         return self._prepare_boundary_mps(mps)
 
     def _build_multi_layer_boundary_mps(self, network, site_tag_id, mps_length):
+        network_outer = set(network.outer_inds())
         grouped_inds = {pos: [] for pos in range(mps_length)}
         for pos in range(mps_length):
             tag = site_tag_id.format(pos)
@@ -877,7 +886,7 @@ class BdyMPS:
                 [
                     (idx, network.ind_size(idx))
                     for idx in selected.outer_inds()
-                    if idx in network.outer_inds()
+                    if idx in network_outer
                 ]
             )
 

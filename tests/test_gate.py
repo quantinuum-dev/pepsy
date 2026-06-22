@@ -8,11 +8,12 @@ import numpy as np
 import pytest
 import quimb.tensor as qtn
 
-from pepsy import ps_to_peps
+from pepsy import ps_to_3dpeps, ps_to_peps
 from pepsy.operators.gates import (
     build_mpo_from_gates,
     build_pepo_from_gates,
     gate as apply_gate,
+    gate_simple,
     gen_long_range_swap_path_2d,
     gen_long_range_swap_path_3d,
     pauli,
@@ -21,6 +22,71 @@ from pepsy.operators.gates import (
     y,
     z,
 )
+
+
+class _SmartSwapFakeTensor:  # pylint: disable=too-few-public-methods
+    def __init__(self, inds, sizes):
+        self.inds = tuple(inds)
+        self.shape = tuple(sizes[ix] for ix in self.inds)
+        self._sizes = sizes
+
+    def ind_size(self, ix):
+        return self._sizes[ix]
+
+    def __iter__(self):
+        return iter((self,))
+
+
+class _DummySmartSwap2DTN:  # pylint: disable=too-few-public-methods
+    Lx = 2
+    Ly = 3
+
+    def __init__(self):
+        self.simple_gate_calls = []
+        sizes = {}
+        inds_by_site = {
+            (i, j): [f"k{i},{j}"]
+            for i in range(self.Lx)
+            for j in range(self.Ly)
+        }
+
+        def add_edge(a, b, size):
+            ix = f"bond{a}-{b}"
+            sizes[ix] = size
+            inds_by_site[a].append(ix)
+            inds_by_site[b].append(ix)
+
+        add_edge((0, 0), (1, 0), 9)
+        add_edge((0, 0), (0, 1), 1)
+        add_edge((0, 1), (0, 2), 1)
+        add_edge((0, 2), (1, 2), 1)
+        add_edge((0, 1), (1, 1), 5)
+        add_edge((1, 0), (1, 1), 9)
+        add_edge((1, 1), (1, 2), 9)
+        for coord in inds_by_site:
+            sizes[f"k{coord[0]},{coord[1]}"] = 2
+
+        self._tensors = {
+            self.site_tag(coord): _SmartSwapFakeTensor(inds, sizes)
+            for coord, inds in inds_by_site.items()
+        }
+
+    def site_tag(self, coord):
+        i, j = coord
+        return f"I{i},{j}"
+
+    def __getitem__(self, tag):
+        return self._tensors[tag]
+
+    def __iter__(self):
+        return iter(self._tensors.values())
+
+    def outer_inds(self):
+        return tuple(f"k{i},{j}" for i in range(self.Lx) for j in range(self.Ly))
+
+    def gate_simple_(self, gate, where, gauges, **kwargs):
+        self.simple_gate_calls.append(tuple(where))
+        return self
 
 
 def test_gen_long_range_swap_path_2d_adjacent():
@@ -72,11 +138,184 @@ def test_gen_long_range_swap_path_3d_xyz_order():
     ]
 
 
+@pytest.mark.parametrize(
+    "sequence_kwargs",
+    [{}, {"sequence": "auto"}, {"sequence": "smart"}],
+)
+def test_apply_2d_gate_smart_sequence_prefers_lower_bond_path(
+    monkeypatch, sequence_kwargs
+):
+    """Default/auto routing should pick a shortest path with lower current bonds."""
+    calls = []
+
+    def _fake_gate_inds(tn, gate, inds, **kwargs):
+        calls.append(tuple(inds))
+        return tn
+
+    monkeypatch.setattr(qtn, "tensor_network_gate_inds", _fake_gate_inds)
+
+    tn = _DummySmartSwap2DTN()
+    gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
+
+    out = apply_gate(tn, gate, ((0, 0), (1, 2)), **sequence_kwargs)
+
+    assert out is tn
+    assert calls == [
+        ("k0,0", "k0,1"),
+        ("k0,1", "k0,2"),
+        ("k0,2", "k1,2"),
+        ("k0,1", "k0,2"),
+        ("k0,0", "k0,1"),
+    ]
+
+
+def test_gate_simple_2d_default_sequence_prefers_lower_bond_path():
+    """gate_simple should use the same lower-bond smart route by default."""
+    tn = _DummySmartSwap2DTN()
+    gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
+
+    out = gate_simple(tn, gate, where=((0, 0), (1, 2)), gauges={})
+
+    assert out is tn
+    assert tn.simple_gate_calls == [
+        ((0, 0), (0, 1)),
+        ((0, 1), (0, 2)),
+        ((0, 2), (1, 2)),
+        ((0, 1), (0, 2)),
+        ((0, 0), (0, 1)),
+    ]
+
+
+def test_apply_2d_gate_can_canonize_and_compress_route(monkeypatch):
+    """Route-local quimb canonize/compress hooks should stay on path bonds."""
+    gate_calls = []
+    canonize_calls = []
+    compress_calls = []
+
+    class _Dummy2DTN:  # pylint: disable=too-few-public-methods
+        Lx = 1
+        Ly = 3
+
+        def site_tag(self, coord):
+            i, j = coord
+            return f"I{i},{j}"
+
+        def outer_inds(self):
+            return ("k0,0", "k0,1", "k0,2")
+
+        def canonize_around_(self, tags, **kwargs):
+            canonize_calls.append((tuple(tags), kwargs.copy()))
+
+        def compress_between(self, tags1, tags2, **kwargs):
+            compress_calls.append((tags1, tags2, kwargs.copy()))
+
+    def _fake_gate_inds(tn, gate, inds, **kwargs):
+        gate_calls.append((tuple(inds), kwargs.copy()))
+        return tn
+
+    monkeypatch.setattr(qtn, "tensor_network_gate_inds", _fake_gate_inds)
+
+    tn = _Dummy2DTN()
+    gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
+    out = apply_gate(
+        tn,
+        gate,
+        ((0, 0), (0, 2)),
+        sequence="x_then_y",
+        path_canonize=True,
+        path_canonize_distance=2,
+        path_compress=True,
+        max_bond=3,
+        cutoff=1.0e-9,
+    )
+
+    assert out is tn
+    assert [inds for inds, _ in gate_calls] == [
+        ("k0,0", "k0,1"),
+        ("k0,1", "k0,2"),
+        ("k0,0", "k0,1"),
+    ]
+    assert all(kwargs["max_bond"] == 3 for _, kwargs in gate_calls)
+    assert canonize_calls == [
+        (("I0,0", "I0,1", "I0,2"), {"which": "any", "max_distance": 2})
+    ]
+    assert [(a, b) for a, b, _ in compress_calls] == [
+        ("I0,0", "I0,1"),
+        ("I0,1", "I0,2"),
+    ]
+    assert all(kwargs["max_bond"] == 3 for _, _, kwargs in compress_calls)
+    assert all(kwargs["cutoff"] == 1.0e-9 for _, _, kwargs in compress_calls)
+
+
+def test_apply_2d_gate_efficient_route_canonizes_once_without_extra_compress(monkeypatch):
+    """Efficient routed gates should split-truncate each step without cleanup pass."""
+    gate_calls = []
+    canonize_calls = []
+    compress_calls = []
+
+    class _Dummy2DTN:  # pylint: disable=too-few-public-methods
+        Lx = 1
+        Ly = 3
+
+        def site_tag(self, coord):
+            i, j = coord
+            return f"I{i},{j}"
+
+        def outer_inds(self):
+            return ("k0,0", "k0,1", "k0,2")
+
+        def canonize_around_(self, tags, **kwargs):
+            canonize_calls.append((tuple(tags), kwargs.copy()))
+
+        def compress_between(self, tags1, tags2, **kwargs):
+            compress_calls.append((tags1, tags2, kwargs.copy()))
+
+    def _fake_gate_inds(tn, gate, inds, **kwargs):
+        gate_calls.append((tuple(inds), kwargs.copy()))
+        return tn
+
+    monkeypatch.setattr(qtn, "tensor_network_gate_inds", _fake_gate_inds)
+
+    tn = _Dummy2DTN()
+    gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
+    out = apply_gate(
+        tn,
+        gate,
+        ((0, 0), (0, 2)),
+        sequence="x_then_y",
+        path_canonize=True,
+        max_bond=4,
+        cutoff=1.0e-9,
+    )
+
+    assert out is tn
+    assert [inds for inds, _ in gate_calls] == [
+        ("k0,0", "k0,1"),
+        ("k0,1", "k0,2"),
+        ("k0,0", "k0,1"),
+    ]
+    assert all(kwargs["max_bond"] == 4 for _, kwargs in gate_calls)
+    assert canonize_calls == [
+        (("I0,0", "I0,1", "I0,2"), {"which": "any", "max_distance": 1})
+    ]
+    assert compress_calls == []
+
+
 def test_ps_to_peps_builds_product_state():
     """ps_to_peps should build a valid bond-dimension-1 PEPS."""
     peps = ps_to_peps(2, 3, dtype="complex128", theta=0.123)
     assert peps.Lx == 2
     assert peps.Ly == 3
+    assert int(peps.max_bond()) == 1
+
+
+def test_ps_to_3dpeps_builds_product_state():
+    """ps_to_3dpeps should build a valid bond-dimension-1 PEPS3D."""
+    peps = ps_to_3dpeps(2, 3, 2, dtype="complex128", theta=0.123)
+    assert peps.Lx == 2
+    assert peps.Ly == 3
+    assert peps.Lz == 2
+    assert peps.site_ind(1, 2, 1) in peps.outer_inds()
     assert int(peps.max_bond()) == 1
 
 
@@ -437,6 +676,36 @@ def test_gate_sequence_non_k_prefix_uses_custom_ind_id_for_all_entries():
     assert out is mps
 
 
+def test_gate_sequence_accepts_per_entry_which_for_2d(monkeypatch):
+    """Bundled streams may choose upper/lower physical legs per entry."""
+    calls = []
+
+    class _Dummy2DOperator:  # pylint: disable=too-few-public-methods
+        Lx = 1
+        Ly = 2
+
+        def outer_inds(self):
+            return ("k0,0", "b0,1")
+
+    def _fake_gate_inds(tn, gate, inds, **kwargs):
+        calls.append((tuple(inds), kwargs["contract"]))
+        return tn
+
+    monkeypatch.setattr(qtn, "tensor_network_gate_inds", _fake_gate_inds)
+
+    tn = _Dummy2DOperator()
+    x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    z_gate = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
+
+    out = apply_gate(
+        tn,
+        ((x_gate, ((0, 0),), "upper"), (z_gate, ((0, 1),), "lower")),
+    )
+
+    assert out is tn
+    assert calls == [(("k0,0",), True), (("b0,1",), True)]
+
+
 def test_gate_dispatches_to_2d_for_peps_ambiguous_two_int_where(monkeypatch):
     """Dispatcher should treat ``where=(i,j)`` as 2D coordinate on PEPS."""
     calls = []
@@ -695,6 +964,27 @@ def test_build_mpo_from_gates_accepts_single_gate_where():
     assert mpo.max_bond() >= 1
 
 
+def test_build_mpo_from_gates_forwards_max_bond_to_gate(monkeypatch):
+    """MPO builder should use the public max_bond gate API."""
+    calls = []
+
+    def _fake_gate(tn, gate, where, **kwargs):
+        calls.append((where, kwargs.copy()))
+        return tn
+
+    monkeypatch.setattr("pepsy.operators.gates.gate", _fake_gate)
+
+    zz_gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
+    build_mpo_from_gates(zz_gate, where=(0, 2), max_bond=5, cutoff=1.0e-9)
+
+    assert len(calls) == 1
+    where, kwargs = calls[0]
+    assert where == (0, 2)
+    assert kwargs["max_bond"] == 5
+    assert "bond_dim" not in kwargs
+    assert kwargs["ind_id"] == "k{}"
+
+
 def test_build_pepo_from_gates_accepts_bundled_stream():
     """PEPO builder should accept canonical bundled gate streams."""
     x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
@@ -719,6 +1009,43 @@ def test_build_pepo_from_gates_accepts_single_gate_where():
     )
     assert (pepo.Lx, pepo.Ly) == (2, 2)
     assert pepo.max_bond() >= 1
+
+
+def test_build_pepo_from_gates_forwards_smart_max_bond_api(monkeypatch):
+    """PEPO builder should use gate's smart routing and max_bond spelling."""
+    calls = []
+
+    def _fake_gate(tn, gate, where, **kwargs):
+        calls.append((where, kwargs.copy()))
+        return tn
+
+    monkeypatch.setattr("pepsy.operators.gates.gate", _fake_gate)
+
+    zz_gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
+    build_pepo_from_gates(
+        zz_gate,
+        where=((0, 0), (1, 2)),
+        max_bond=6,
+        cutoff=1.0e-9,
+    )
+
+    assert len(calls) == 1
+    where, kwargs = calls[0]
+    assert where == ((0, 0), (1, 2))
+    assert kwargs["max_bond"] == 6
+    assert "bond_dim" not in kwargs
+    assert kwargs["sequence"] == "auto"
+    assert kwargs["ind_id"] == "k{},{}"
+
+
+def test_build_pepo_from_gates_preserves_k_input_and_b_output_families():
+    """PEPO builders should leave upper/input k and lower/output b legs visible."""
+    x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    pepo = build_pepo_from_gates(x_gate, where=((1, 1),), max_bond=8)
+
+    outer = set(pepo.outer_inds())
+    assert {"k0,0", "k0,1", "k1,0", "k1,1"} <= outer
+    assert {"b0,0", "b0,1", "b1,0", "b1,1"} <= outer
 
 
 def test_build_operator_from_gates_rejects_explicit_index_where():
@@ -773,6 +1100,62 @@ def test_apply_2dtn_prefers_network_backend_over_gate_backend(monkeypatch):
     assert len(calls) == 3
     assert isinstance(calls[0], torch.Tensor)
     assert isinstance(calls[2], torch.Tensor)
+
+
+def test_gate_simple_2d_routes_swaps_with_real_torch_dtype():
+    """Internal SWAP tensors should match real torch PEPS dtype."""
+    torch = pytest.importorskip("torch")
+
+    peps = ps_to_peps(2, 3, dtype="complex128", chi=2)
+    peps.apply_to_arrays(lambda x: torch.as_tensor(x, dtype=torch.float64))
+    gate = torch.eye(4, dtype=torch.float64).reshape(2, 2, 2, 2)
+    gauges = {}
+
+    gate_simple(
+        peps,
+        gate,
+        where=((0, 0), (0, 2)),
+        gauges=gauges,
+        max_bond=2,
+        cutoff=0.0,
+    )
+
+    assert {tensor.data.dtype for tensor in peps} == {torch.float64}
+    assert {gauge.dtype for gauge in gauges.values()} <= {torch.float64}
+
+
+def test_gate_simple_accepts_bundled_gate_stream():
+    """gate_simple should replay canonical bundled streams."""
+    mps = qtn.MPS_computational_state("000", dtype=np.complex128)
+    x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    z_gate = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=np.complex128)
+    gauges = {}
+
+    out = gate_simple(mps, ((x_gate, (1,)), (z_gate, (2,))), gauges=gauges)
+
+    assert out is mps
+
+
+def test_gate_simple_stream_entry_which_selects_lower_index_family(monkeypatch):
+    """Per-entry which should temporarily route simple-update through b-indices."""
+    mps = qtn.MPS_computational_state("000", dtype=np.complex128)
+    mps.reindex_({f"k{i}": f"b{i}" for i in range(3)})
+    old_site_ind_id = mps.site_ind_id
+    x_gate = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    seen_site_ind_ids = []
+    original_gate_simple = mps.gate_simple_
+
+    def _recording_gate_simple(*args, **kwargs):
+        seen_site_ind_ids.append(mps.site_ind_id)
+        return original_gate_simple(*args, **kwargs)
+
+    monkeypatch.setattr(mps, "gate_simple_", _recording_gate_simple)
+
+    out = gate_simple(mps, ((x_gate, (1,), "lower"),), gauges={})
+
+    assert out is mps
+    assert mps.site_ind_id == old_site_ind_id
+    assert seen_site_ind_ids == ["b{}"]
 
 
 def test_apply_2d_gate_cyclic_wrap_avoids_swap_chain(monkeypatch):

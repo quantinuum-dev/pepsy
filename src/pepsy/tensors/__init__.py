@@ -3,6 +3,19 @@
 from importlib import import_module
 
 from .validation import validate_tensor_network_tags
+from .symmetric import (
+    SymGateStream,
+    SymHamiltonian,
+    SymMPS,
+    SymPEPS,
+    default_physical_sectors,
+    sector_index_map,
+    site_charge_alternating,
+    site_charge_from_map,
+    site_charge_from_occupations,
+    site_charge_uniform,
+    symm_operator_from_dense,
+)
 from .core import (
     OneDMap,
     add_cycle,
@@ -16,11 +29,13 @@ from .core import (
     expec_mpo,
     get_default_array_backend,
     get_default_grad_backend,
+    haar_random_state,
     hrps_to_mps,
     hrps_to_peps,
     id_to_mpo,
     id_to_pepo,
     measure_obs,
+    ps_to_3dpeps,
     ps_to_mpo,
     ps_to_mps,
     ps_to_pepo,
@@ -41,6 +56,10 @@ from .core import (
 
 __all__ = [
     "OneDMap",
+    "SymGateStream",
+    "SymHamiltonian",
+    "SymMPS",
+    "SymPEPS",
     "add_cycle",
     "backend_cupy",
     "backend_jax",
@@ -50,13 +69,16 @@ __all__ = [
     "build_optimizer",
     "contract_hypercompressed_tn",
     "expec_mpo",
+    "default_physical_sectors",
     "get_default_array_backend",
     "get_default_grad_backend",
+    "haar_random_state",
     "hrps_to_mps",
     "hrps_to_peps",
     "id_to_mpo",
     "id_to_pepo",
     "measure_obs",
+    "ps_to_3dpeps",
     "ps_to_mpo",
     "ps_to_mps",
     "ps_to_pepo",
@@ -69,7 +91,13 @@ __all__ = [
     "reset_default_backends",
     "set_default_array_backend",
     "set_default_grad_backend",
+    "sector_index_map",
+    "site_charge_alternating",
+    "site_charge_from_map",
+    "site_charge_from_occupations",
+    "site_charge_uniform",
     "stop_grad",
+    "symm_operator_from_dense",
     "tn_fidelity",
     "tn_norm",
     "tns_align",
@@ -78,11 +106,12 @@ __all__ = [
     "contractions",
     "maps",
     "observables",
+    "symmetric",
     "validation",
 ]
 
 
 def __getattr__(name):
-    if name in {"constructors", "contractions", "maps", "observables", "validation"}:
+    if name in {"constructors", "contractions", "maps", "observables", "symmetric", "validation"}:
         return import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

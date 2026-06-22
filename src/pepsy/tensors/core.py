@@ -1,6 +1,7 @@
 """Shared DMRG backend, optimizer, and fidelity helpers."""
 
 import math
+import warnings
 from numbers import Integral
 from string import Formatter
 from typing import Any
@@ -41,9 +42,11 @@ __all__ = [
     "expec_mpo",
     "id_to_mpo",
     "ps_to_peps",
+    "ps_to_3dpeps",
     "ps_to_mps",
     "ps_to_pepo",
     "ps_to_mpo",
+    "haar_random_state",
     "random_haar_qubit",
     "hrps_to_peps",
     "hrps_to_mps",
@@ -977,7 +980,7 @@ def build_optimizer(
     progbar: bool = False,
     alpha: int = 64,
     max_time="rate:7e8", 
-    max_repeats: int = 128,
+    max_repeats: int = 2**8,
     parallel="auto",
     optlib: str = "cmaes",
     directory=False,
@@ -1162,6 +1165,8 @@ def tn_norm(
     *,
     contraction_opt: Any | None = None,
     strip_exponent: bool = False,
+    simplify: bool = False,
+    simplify_seq: str = "R",
 ):
     """Compute the norm of a tensor network state.
 
@@ -1174,6 +1179,11 @@ def tn_norm(
     strip_exponent : bool, default=False
         If ``True``, pass ``strip_exponent=True`` to the contraction, which
         returns ``(mantissa, exponent)`` instead of the scalar result.
+    simplify : bool, default=False
+        Whether to simplify the closed norm network before contraction.
+    simplify_seq : str, optional
+        Simplification sequence passed to ``full_simplify_`` when
+        ``simplify=True``.
 
     Returns
     -------
@@ -1183,11 +1193,21 @@ def tn_norm(
     """
     if contraction_opt is None:
         contraction_opt = build_optimizer(progbar=False)
+    norm_tn = psi.H & psi
+    if simplify:
+        norm_tn.full_simplify_(seq=simplify_seq, output_inds=())
     if not strip_exponent:
-        return ar.do("abs", (psi.H & psi).contract(all, optimize=contraction_opt))
-    
-    else:
-        return (psi.H & psi).contract(all, optimize=contraction_opt, strip_exponent=strip_exponent)
+        return ar.do(
+            "abs",
+            norm_tn.contract(all, optimize=contraction_opt, output_inds=()),
+        )
+
+    return norm_tn.contract(
+        all,
+        optimize=contraction_opt,
+        output_inds=(),
+        strip_exponent=strip_exponent,
+    )
 
 
 def _count_format_fields(fmt):
@@ -1413,6 +1433,8 @@ def tn_fidelity(
     psi_fix,
     *,
     contraction_opt: Any | None = None,
+    simplify: bool = False,
+    simplify_seq: str = "R",
 ):
     """Compute normalized overlap fidelity.
 
@@ -1424,17 +1446,29 @@ def tn_fidelity(
         Reference state.
     contraction_opt : object | None, optional
         Contraction optimizer. If ``None``, a default optimizer is built.
+    simplify : bool, default=False
+        Whether to simplify each closed norm/overlap network before
+        contraction.
+    simplify_seq : str, optional
+        Simplification sequence passed to ``full_simplify_`` when
+        ``simplify=True``.
     """
     if contraction_opt is None:
         contraction_opt = build_optimizer(progbar=False)
 
-    val_0 = abs((psi.H & psi).contract(all, optimize=contraction_opt))
-    val_1 = abs((psi.H & psi_fix).contract(all, optimize=contraction_opt))
-    val_ref = abs((psi_fix.H & psi_fix).contract(all, optimize=contraction_opt))
+    def closed_overlap(left, right):
+        tn = left.H & right
+        if simplify:
+            tn.full_simplify_(seq=simplify_seq, output_inds=())
+        return abs(tn.contract(all, optimize=contraction_opt, output_inds=()))
+
+    val_0 = closed_overlap(psi, psi)
+    val_1 = closed_overlap(psi, psi_fix)
+    val_ref = closed_overlap(psi_fix, psi_fix)
 
     val_1 = val_1**2
     fidelity = ar.do("abs", val_1) / (val_0 * val_ref)
-    return ar.do("abs",fidelity)
+    return ar.do("abs", fidelity)
 
 
 def add_cycle(peps, bond_dim, cylinder=False):
@@ -1668,6 +1702,75 @@ def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, 
     return peps
 
 
+def ps_to_3dpeps(
+    Lx: int,
+    Ly: int,
+    Lz: int,
+    dtype: str = "complex128",
+    theta: float = 0.0,
+    cyclic: bool = False,
+    chi: int = 1,
+    rand_strength: float = 0.0,
+):
+    """Create a product-state 3D PEPS parameterized by ``theta``.
+
+    Each site tensor is set so the physical vector is
+    ``[cos(theta), sin(theta)]`` with trivial virtual bonds.
+
+    Parameters
+    ----------
+    Lx : int
+        Lattice size in x direction.
+    Ly : int
+        Lattice size in y direction.
+    Lz : int
+        Lattice size in z direction.
+    dtype : str, optional
+        Tensor dtype passed to numpy/quimb.
+    theta : float, optional
+        Product-state angle controlling local amplitudes.
+    cyclic : bool or tuple[bool, bool, bool], optional
+        If True, create periodic bonds with bond dimension 1. A three-tuple
+        can set periodicity independently for x, y, and z.
+    chi : int, optional
+        Target bond dimension. If greater than 1, the bond dimension is
+        expanded via ``expand_bond_dimension`` after initialization.
+    rand_strength : float, optional
+        Random noise strength passed to ``expand_bond_dimension``.
+
+    Returns
+    -------
+    quimb.tensor.PEPS3D
+        Initialized 3D PEPS with bond dimension ``chi``.
+    """
+    peps = qtn.PEPS3D.rand(
+        Lx=Lx,
+        Ly=Ly,
+        Lz=Lz,
+        bond_dim=1,
+        seed=666,
+        dtype=dtype,
+        cyclic=cyclic,
+    )
+    local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
+    for x in range(Lx):
+        for y in range(Ly):
+            for z in range(Lz):
+                tensor = peps[x, y, z]
+                phys_ind = peps.site_ind(x, y, z)
+                phys_axis = tensor.inds.index(phys_ind)
+                data = np.zeros_like(tensor.data, dtype=dtype)
+
+                slicer = [0] * data.ndim
+                slicer[phys_axis] = slice(None)
+                data[tuple(slicer)] = local_vec
+                tensor.modify(data=data)
+    peps.astype_(dtype)
+    if chi > 1:
+        peps.expand_bond_dimension_(chi, rand_strength=rand_strength)
+    return peps
+
+
 def ps_to_mps(L: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False, chi: int = 1, rand_strength: float = 0.0):
     """Create a product-state MPS parameterized by ``theta``.
 
@@ -1845,6 +1948,74 @@ def random_haar_qubit(seed=None, perturb=0.0):
     z = np.clip(z, -1.0, 1.0)
     theta = np.arccos(z)
     return float(theta), float(phi)
+
+
+def haar_random_state(
+    L: int,
+    dtype: str = "complex128",
+    seed=None,
+    L_max: int = 20,
+    as_tensor: bool = False,
+):
+    """Create a dense Haar-random ``L``-qubit state.
+
+    This samples a full Hilbert-space state, so the result is generally
+    entangled. Unlike :func:`hrps_to_mps`, this is not a product-state tensor
+    network: it returns dense amplitudes with ``2**L`` entries.
+
+    Parameters
+    ----------
+    L : int
+        Number of qubits.
+    dtype : str, optional
+        Complex numpy dtype for the returned amplitudes.
+    seed : int | None, optional
+        Seed for deterministic samples.
+    L_max : int, optional
+        Maximum allowed number of qubits. Values above 20 are capped to 20
+        with a warning because this helper constructs a dense state.
+    as_tensor : bool, optional
+        If True, return the amplitudes reshaped as a dense tensor with shape
+        ``(2,) * L``. Otherwise return a dense vector with shape ``(2**L,)``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Normalized dense Haar-random state amplitudes.
+    """
+    if not isinstance(L, Integral) or L < 0:
+        raise ValueError("L must be a non-negative integer.")
+    if not isinstance(L_max, Integral) or L_max < 0:
+        raise ValueError("L_max must be a non-negative integer.")
+    if L_max > 20:
+        warnings.warn(
+            "haar_random_state constructs dense entangled states and is "
+            "intended for L <= 20; capping L_max to 20.",
+            UserWarning,
+            stacklevel=2,
+        )
+        L_max = 20
+    if L > L_max:
+        raise ValueError(
+            "haar_random_state constructs a dense entangled state and only "
+            f"supports L <= L_max (got L={L}, L_max={L_max})."
+        )
+
+    dtype = np.dtype(dtype)
+    if dtype.kind != "c":
+        raise TypeError("dtype must be a complex numpy dtype.")
+
+    real_dtype = np.float32 if dtype == np.dtype("complex64") else np.float64
+    rng = np.random.default_rng(seed)
+    dim = 2 ** int(L)
+    state = rng.normal(size=dim).astype(real_dtype)
+    state = state + 1j * rng.normal(size=dim).astype(real_dtype)
+    state = state.astype(dtype, copy=False)
+    state /= np.linalg.norm(state)
+
+    if as_tensor:
+        return state.reshape((2,) * int(L))
+    return state
 
 
 def hrps_to_peps(

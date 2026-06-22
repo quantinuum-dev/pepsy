@@ -4,29 +4,62 @@ import importlib
 
 import pytest
 
-from pepsy.boundary import BdyMPS, contract_boundary
+from pepsy.boundary import (
+    BdyMPS,
+    contract_boundary,
+    contract_flat,
+    peps_fidelity,
+    peps_infidelity,
+    peps_norm,
+    peps_normalize,
+)
 from pepsy.operators import gate, rx
-from pepsy.optimizers import MpsOptimizer, SweepOptimizer
+from pepsy.optimizers import MpsOptimizer, PepsOptimizer, SweepOptimizer
 from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
-from pepsy.tensors import OneDMap, backend_torch, ps_to_peps, reg_complex_svd_torch
+from pepsy.tensors import (
+    OneDMap,
+    SymGateStream,
+    SymMPS,
+    SymPEPS,
+    backend_torch,
+    default_physical_sectors,
+    haar_random_state,
+    ps_to_3dpeps,
+    ps_to_peps,
+    reg_complex_svd_torch,
+    site_charge_from_occupations,
+)
 
 
 def test_new_namespace_imports_resolve():
     """Common new namespace imports should resolve to usable objects."""
     assert BdyMPS is not None
     assert callable(contract_boundary)
+    assert callable(contract_flat)
+    assert callable(peps_norm)
+    assert callable(peps_normalize)
+    assert callable(peps_infidelity)
+    assert callable(peps_fidelity)
     assert callable(gate)
     assert callable(rx)
     assert MpsOptimizer is not None
+    assert PepsOptimizer is not None
     assert SweepOptimizer is not None
     assert MpsSampler is not None
     assert PepsBpSampler is not None
     assert FDSolver is not None
     assert OneDMap is not None
+    assert SymGateStream is not None
+    assert SymMPS is not None
+    assert SymPEPS is not None
+    assert callable(default_physical_sectors)
     assert callable(backend_torch)
+    assert callable(haar_random_state)
     assert callable(ps_to_peps)
+    assert callable(ps_to_3dpeps)
     assert callable(reg_complex_svd_torch)
+    assert callable(site_charge_from_occupations)
 
 
 @pytest.mark.parametrize(

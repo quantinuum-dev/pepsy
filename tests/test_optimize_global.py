@@ -17,6 +17,20 @@ def test_norm_state_exact_returns_positive_value():
     assert abs(value) > 0.0
 
 
+def test_norm_state_exact_can_return_stripped_exponent():
+    """Exact-mode norm should support mantissa/exponent output."""
+    peps = _rand_peps(seed=111)
+    scalar = complex(GlobalOptimizer._norm_state(peps.copy(), mode="exact", opt="auto-hq"))
+    mantissa, exponent = GlobalOptimizer._norm_state(
+        peps.copy(),
+        mode="exact",
+        opt="auto-hq",
+        strip_exponent=True,
+    )
+
+    assert complex(mantissa) * 10**float(exponent) == pytest.approx(scalar)
+
+
 def test_normalize_state_is_inplace_and_unit_norm():
     """_normalize_state should mutate and return the same state object."""
     peps = _rand_peps(seed=12)
@@ -39,6 +53,30 @@ def test_loss_state_identical_is_near_zero():
             opt="auto-hq",
             cost_f="fid",
             val_=val_ref,
+        )
+    )
+    assert loss < 1e-6
+
+
+def test_loss_state_identical_with_stripped_exponents_is_near_zero():
+    """Fidelity-style global loss should consume stripped norm/overlap pairs."""
+    peps = _rand_peps(seed=113)
+    peps_fix = peps.copy()
+    target_norm = GlobalOptimizer._norm_state(
+        peps_fix.copy(),
+        mode="exact",
+        opt="auto-hq",
+        strip_exponent=True,
+    )
+    loss = float(
+        GlobalOptimizer._loss_state(
+            peps,
+            peps_fix,
+            mode="exact",
+            opt="auto-hq",
+            cost_f="fid",
+            val_=target_norm,
+            strip_exponent=True,
         )
     )
     assert loss < 1e-6
@@ -172,6 +210,49 @@ def test_global_optimizer_kwarg_metadata_helpers():
     assert tuple(guide["norm"]) == norm_keys
     assert tuple(guide["normalize"]) == normalize_keys
     assert tuple(guide["loss"]) == loss_keys
+
+
+def test_global_optimizer_accepts_target_norm_alias():
+    """target_norm should be a clear alias for val_ in fidelity losses."""
+    peps = _rand_peps(seed=37)
+    peps_target = peps.copy()
+    target_norm = abs(complex(GlobalOptimizer._norm_state(peps_target.copy(), mode="exact", opt="auto-hq")))
+
+    loss_with_alias = float(
+        GlobalOptimizer._loss_state(
+            peps,
+            peps_target,
+            mode="exact",
+            opt="auto-hq",
+            cost_f="fid",
+            target_norm=target_norm,
+        )
+    )
+    loss_with_val = float(
+        GlobalOptimizer._loss_state(
+            peps,
+            peps_target,
+            mode="exact",
+            opt="auto-hq",
+            cost_f="fid",
+            val_=target_norm,
+        )
+    )
+
+    opt = GlobalOptimizer(
+        peps,
+        peps_target,
+        loss_kwargs={
+            "mode": "exact",
+            "opt": "auto-hq",
+            "cost_f": "fid",
+            "target_norm": target_norm,
+        },
+    )
+
+    assert "target_norm" in GlobalOptimizer.loss_kwarg_names()
+    assert loss_with_alias == pytest.approx(loss_with_val)
+    assert float(opt.loss()) == pytest.approx(loss_with_alias)
 
 
 def test_global_optimizer_accepts_canonical_contraction_kwargs():

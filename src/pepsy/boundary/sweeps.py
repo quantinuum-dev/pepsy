@@ -55,6 +55,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         Boundary dictionary, typically from ``BdyMPS(...).mps_b``.
     contraction_opt : str | object, default="auto-hq"
         Contraction optimizer used for final contraction and fidelity calls.
+    fit_contraction_opt : str | object, default="auto-hq"
+        Contraction optimizer used by the local :class:`~pepsy.fitting.local.FIT`
+        boundary fits. Kept separate from ``contraction_opt`` so the local
+        fitting path can be tuned independently of the final contraction.
     fit_mode : {"eff", "global"}, default="eff"
         Local fit backend used by :class:`pepsy.fitting.local.FIT`:
         ``"eff"`` uses ``FIT.run_eff`` for multi-site boundaries;
@@ -76,6 +80,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         mps_boundaries,
         *,
         contraction_opt="auto-hq",
+        fit_contraction_opt="auto-hq",
         fit_mode="eff",
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
         if not isinstance(mps_boundaries, dict):
@@ -84,6 +89,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.norm = norm
         self.mps_boundaries = mps_boundaries
         self.contraction_opt = contraction_opt
+        self.fit_contraction_opt = fit_contraction_opt
         self.fit_mode = fit_mode
 
         # Runtime sweep options are configured per call in run/move methods.
@@ -291,6 +297,50 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         (tn & boundary_mps).draw(draw_tags, **draw_kwargs)
         fit.visual(figsize=(8, 8), show_inds="bond-size", tags_=[])
 
+    def _initial_boundary_mps(self, boundary_key, previous):
+        """Return an owned boundary guess with exponent representation aligned."""
+        boundary_mps = self.mps_boundaries[boundary_key].copy()
+
+        if self.equalize_norms and previous is not None:
+            boundary_mps.exponent = complex(getattr(previous, "exponent", 0.0)).real
+        else:
+            boundary_mps.exponent = 0.0
+
+        return boundary_mps
+
+    def _fit_boundary(
+        self,
+        tn,
+        boundary_key,
+        previous,
+        site_tag_id,
+        axis_len,
+    ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        """Fit one boundary MPS against ``tn`` and return the owned result."""
+        boundary_mps = self._initial_boundary_mps(boundary_key, previous)
+
+        fit = FIT(
+            tn,
+            p=boundary_mps,
+            inplace=True,
+            site_tag_id=site_tag_id,
+            contraction_opt=self.fit_contraction_opt,
+            retag=self.retag,
+        )
+        self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
+        self._run_fit_solver(fit, boundary_mps)
+
+        if self.equalize_norms:
+            fit.p.equalize_norms_(value=self.equalize_norms)
+        if self.track_boundary_fidelity:
+            fidelity = tn_fidelity(tn, fit.p, contraction_opt=self.contraction_opt)
+            self.fidel.append(fidelity)
+
+        if self.write_back:
+            self.mps_boundaries[boundary_key] = fit.p
+
+        return fit.p
+
     def _fit_one_side(
         self,
         side,
@@ -321,39 +371,22 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Missing previous boundary MPS during fitting.")
                 tn = tn_slice | previous
 
-            boundary_mps = self.mps_boundaries[boundary_key]
-            if previous is not None and step_idx > 0:
-                boundary_mps.exponent = complex(previous.exponent).real
-
-            fit = FIT(
+            previous = self._fit_boundary(
                 tn,
-                p=boundary_mps,
-                inplace=False,
+                boundary_key,
+                previous if step_idx > 0 else None,
                 site_tag_id=site_tag_id,
-                contraction_opt=self.contraction_opt,
-                retag=self.retag,
+                axis_len=axis_len,
             )
-            self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
-            self._run_fit_solver(fit, boundary_mps)
-
-            if self.equalize_norms:
-                fit.p.equalize_norms_(value=self.equalize_norms)
-            if self.track_boundary_fidelity:
-                fidelity = tn_fidelity(tn, fit.p, contraction_opt=self.contraction_opt)
-                self.fidel.append(fidelity)
 
             if progress_bar is not None:
-                postfix = {"chi": int(fit.p.max_bond())}
+                postfix = {"chi": int(previous.max_bond())}
                 if self.track_boundary_fidelity:
                     prod_fidelity = np.prod(self.fidel)
                     postfix["F"] = complex(prod_fidelity).real
                 progress_bar.set_postfix(postfix)
                 progress_bar.refresh()
                 progress_bar.update(1)
-
-            previous = fit.p
-            if self.write_back:
-                self.mps_boundaries[boundary_key] = fit.p.copy()
 
         return previous
 
@@ -385,30 +418,13 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
                 raise ValueError("Missing previous boundary MPS during fitting.")
             tn = tn_slice | previous
 
-        boundary_mps = self.mps_boundaries[boundary_key]
-        if previous is not None and step_ > 0:
-            boundary_mps.exponent = complex(previous.exponent).real
-
-        fit = FIT(
+        previous = self._fit_boundary(
             tn,
-            p=boundary_mps,
-            inplace=False,
+            boundary_key,
+            previous if step_ > 0 else None,
             site_tag_id=site_tag_id,
-            contraction_opt=self.contraction_opt,
-            retag=self.retag,
+            axis_len=axis_len,
         )
-        self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
-        self._run_fit_solver(fit, boundary_mps)
-
-        if self.equalize_norms:
-            fit.p.equalize_norms_(value=self.equalize_norms)
-        if self.track_boundary_fidelity:
-            fidelity = tn_fidelity(tn, fit.p, contraction_opt=self.contraction_opt)
-            self.fidel.append(fidelity)
-
-        previous = fit.p
-        if self.write_back:
-            self.mps_boundaries[boundary_key] = fit.p.copy()
 
         return previous
 
@@ -430,6 +446,11 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             return p_previous_r | center
         return p_previous_r | center | p_previous_l
 
+    @staticmethod
+    def _network_exponent(tn):
+        """Return the real base-10 exponent carried by ``tn``."""
+        return complex(getattr(tn, "exponent", 0.0)).real
+
     def run(
         self,
         *,
@@ -444,6 +465,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         n_iter=10,
         equalize_norms=True,
         direction="y",
+        strip_exponent=False,
     ):  # pylint: disable=too-many-arguments,too-many-locals
         """Run two-sided boundary sweeps and contract the final network.
 
@@ -472,11 +494,15 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             Forwarded normalization option for fitted MPS tensors.
         direction : str, default="y"
             Sweep selector.
+        strip_exponent : bool, default=False
+            If ``True``, return ``(mantissa, exponent)`` from the final
+            contraction instead of reconstructing the scalar.
 
         Returns
         -------
-        complex | float
-            Final contracted scalar.
+        complex | float | tuple[complex | float, float]
+            Final contracted scalar, or ``(mantissa, exponent)`` when
+            ``strip_exponent=True``.
         """
         # Fidelity history is run-local and resets for each run() call.
         self._reset_fidelity_history()
@@ -525,6 +551,9 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
 
         tn_f = self._build_final_boundary_network(spec, p_previous_l, p_previous_r)
         main, exp = tn_f.contract(all, optimize=self.contraction_opt, strip_exponent=True)
+        exp = exp + self._network_exponent(self.norm)
+        if strip_exponent:
+            return main, exp
         return main * 10**exp
 
     def move_bdy(

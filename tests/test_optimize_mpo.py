@@ -1,4 +1,4 @@
-"""Tests for :mod:`pepsy.optimizers.mpo`."""
+"""Tests for :mod:`pepsy.optimizers.mpo.optimizer`."""
 
 import numpy as np
 import pytest
@@ -48,6 +48,41 @@ def test_mpo_optimizer_single_gate_defaults_to_unitary_conjugation():
     out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
 
     assert np.allclose(out.to_dense(), mpo0.to_dense())
+
+
+def test_mpo_optimizer_apply_gate_pair_separates_ket_and_bra_indices(monkeypatch):
+    """Ket updates should use k indices and bra updates should use b indices."""
+    calls = []
+
+    def _fake_apply_gate(tn, gate, where, **kwargs):
+        calls.append((where, kwargs.copy()))
+        return tn
+
+    monkeypatch.setattr("pepsy.optimizers.mpo.optimizer.apply_gate", _fake_apply_gate)
+
+    mpo0 = qtn.MPO_identity(2, dtype="complex128")
+    gate = qu.phase_gate(0.37)
+    opt = py.MpoOptimizer(
+        mpo0.copy(),
+        gates=[],
+        chi=4,
+        mode="svd",
+        ind_id_k="k{}",
+        ind_id_b="b{}",
+    )
+
+    opt._apply_gate_pair(
+        opt.p,
+        gate,
+        (1,),
+        bra_gate=gate,
+        cutoff=1.0e-12,
+        contract=True,
+    )
+
+    assert len(calls) == 2
+    assert [kwargs["ind_id"] for _, kwargs in calls] == ["k{}", "b{}"]
+    assert all(where == (1,) for where, _ in calls)
 
 
 def test_mpo_optimizer_explicit_ket_only_pair_changes_identity():

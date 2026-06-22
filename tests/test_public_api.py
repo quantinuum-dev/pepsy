@@ -16,20 +16,26 @@ _EXPECTED_IN_ALL = [
     "backends", "boundary", "fitting", "operators", "optimizers",
     "sampling", "solvers", "tensors",
     "BdyMPS", "CompBdy", "BoundaryContractResult", "contract_boundary",
-    "build_bra_ket", "normalize", "infidelity", "GlobalOptimizer", "FIT",
+    "contract_flat", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
+    "peps_norm", "peps_infidelity", "peps_fidelity", "GlobalOptimizer", "FIT",
     "tns_align", "measure_obs", "build_pepo_from_gates", "build_mpo_from_gates",
     "pauli", "x", "y", "z", "s", "sdg", "t", "tdg", "h", "hadamard",
     "cnot", "cx", "cy", "cz", "swap", "iswap", "phase", "u1", "u2",
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
-    "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "ps_to_peps", "expec_mpo",
+    "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "make_numpy_array_caster", "SweepOptimizer",
-    "FDSolver", "MpsOptimizer", "MpoOptimizer", "PEPSSampleResult",
-    "PepsBpSampler", "MpsSampler", "MpsSampleResult", "VecSampler", "gate",
+    "FDSolver", "MpsOptimizer", "MpoOptimizer", "PepsOptimizer", "PEPSSampleResult",
+    "PepsBpSampler", "MpsSampler", "MpsSampleResult", "VecSampler", "gate", "tn_fidelity", "tn_norm",
+    "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
+    "default_physical_sectors", "sector_index_map",
+    "site_charge_alternating", "site_charge_from_map",
+    "site_charge_from_occupations", "site_charge_uniform",
+    "symm_operator_from_dense",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
     "norm_peps", "normalize_peps", "loss_peps", "PEPSGlobalOptimizer",
-    "tn_norm", "tn_fidelity", "gen_long_range_swap_path",
+    "gen_long_range_swap_path",
     "gen_long_range_swap_path_1d", "gen_long_range_swap_path_2d",
     "gen_long_range_swap_path_3d", "gate_tn_1d", "gate_tn_2d", "gate_tn_3d",
     "gates_tn_1d", "gates_tn_2d", "gates_tn_3d", "apply_2d_gate",
@@ -58,15 +64,21 @@ def test_internal_symbol_not_exported(name):
 
 
 _CALLABLE_EXPORTS = [
-    "contract_boundary", "build_bra_ket", "normalize", "infidelity",
+    "contract_boundary", "contract_flat", "build_bra_ket", "normalize", "peps_normalize",
+    "boundary_norm", "peps_norm", "infidelity", "peps_infidelity", "peps_fidelity",
     "GlobalOptimizer", "FIT", "tns_align", "measure_obs",
     "build_pepo_from_gates", "build_mpo_from_gates", "pauli",
     "x", "y", "z", "s", "sdg", "t", "tdg", "h", "hadamard",
     "cnot", "cx", "cy", "cz", "swap", "iswap", "phase", "u1", "u2",
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
-    "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "ps_to_peps", "expec_mpo",
+    "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "SweepOptimizer",
-    "FDSolver", "MpsOptimizer", "MpoOptimizer", "PEPSSampleResult", "PepsBpSampler",
+    "FDSolver", "MpsOptimizer", "MpoOptimizer", "PepsOptimizer", "PEPSSampleResult", "PepsBpSampler",
+    "tn_fidelity", "tn_norm", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
+    "default_physical_sectors", "sector_index_map",
+    "site_charge_alternating", "site_charge_from_map",
+    "site_charge_from_occupations", "site_charge_uniform",
+    "symm_operator_from_dense",
 ]
 
 _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL

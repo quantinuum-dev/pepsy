@@ -15,7 +15,7 @@ pepsy.operators     gates, gate application, MPO/PEPO builders, Hamiltonians
 pepsy.boundary      boundary-MPS states, sweeps, metrics
 pepsy.solvers       gradient and finite-difference parameter solvers
 pepsy.fitting       local tensor fitting routines
-pepsy.optimizers    high-level MPS, MPO, PEPS, and energy optimizers
+pepsy.optimizers    high-level MPS, MPO, and PEPS optimizers
 pepsy.sampling      MPS, vector, and PEPS samplers
 pepsy._internal     private formatting and utility helpers
 ```
@@ -26,18 +26,23 @@ Use the clearer namespaces for submodule imports:
 
 ```python
 from pepsy.boundary import BdyMPS, contract_boundary
-from pepsy.optimizers import SweepOptimizer, MpsOptimizer
+from pepsy.optimizers import SweepOptimizer, MpsOptimizer, PepsOptimizer
 from pepsy.operators import rx, rzz, gate
-from pepsy.tensors import ps_to_peps, ps_to_mps
+from pepsy.tensors import haar_random_state, ps_to_peps, ps_to_3dpeps, ps_to_mps
 ```
 
 When a leaf module is needed, import the new implementation path directly:
 
 ```python
-from pepsy.optimizers.sweep import SweepOptimizer
+from pepsy.optimizers.sweep.optimizer import SweepOptimizer
 from pepsy.boundary.states import BdyMPS
 from pepsy.operators.gates import rx, gate
 ```
+
+Optimizer implementations are split into subpackages. Prefer public class
+imports from `pepsy.optimizers`; use leaf paths such as
+`pepsy.optimizers.mps.optimizer` only for implementation-level tests or
+internal development.
 
 ## Migration Order
 

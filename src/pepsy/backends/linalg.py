@@ -13,9 +13,10 @@ from jax import custom_vjp
 # pylint: disable=abstract-method,arguments-differ,bad-staticmethod-argument,bare-except,line-too-long,multiple-statements,not-callable,superfluous-parens,too-many-branches,too-many-locals,too-many-statements,unnecessary-semicolon,unused-variable,using-constant-test
 # jax.config.update("jax_enable_x64", True)
 
+_SVD_EPS_REL = 1.0e-6
 
 
-def safe_inverse(x, eps_abs=1.0e-12):
+def safe_inverse(x, eps_abs=1.0e-12, *, eps_rel=0.0, eps_scale=None):
     """Regularized reciprocal: ``x / (x**2 + eps_abs)``.
 
     Avoids division-by-zero singularities in SVD backward expressions
@@ -33,7 +34,11 @@ def safe_inverse(x, eps_abs=1.0e-12):
     torch.Tensor
         Smooth approximation to ``1/x``.
     """
-    return x / (x ** 2 + eps_abs)
+    eps = x.new_tensor(eps_abs)
+    if eps_scale is not None and eps_rel:
+        eps_scale = torch.as_tensor(eps_scale, dtype=x.dtype, device=x.device)
+        eps = torch.maximum(eps, (eps_rel * eps_scale) ** 2)
+    return x / (x ** 2 + eps)
 
 
 def safe_inverse_2(x, eps):
@@ -115,13 +120,15 @@ class SVD(torch.autograd.Function):
         diagnostics = None
 
         u, sigma, vh= ctx.saved_tensors
-        m= u.size(0) # first dim of original tensor A = u sigma v^\dag
-        n= vh.size(1) # second dim of A
-        k= sigma.size(0)
-        scaled_eps= 1.e-12
+        m= u.size(-2) # row dimension of original tensor A = u sigma v^\dag
+        n= vh.size(-1) # column dimension of A
+        k= sigma.size(-1)
+        eps_abs= torch.finfo(sigma.dtype).tiny
+        sigma_scale= sigma.detach().amax(dim=-1, keepdim=True)
+        pair_scale= sigma_scale.unsqueeze(-1)
 
         #
-        if (u.size(-2)!=u.size(-1)) or (vh.size(-2)!=vh.size(-1)):
+        if (u.size(-1)!=k) or (vh.size(-2)!=k):
             # We ignore the free subspace here because possible base vectors cancel
             # each other, e.g., both -v and +v are valid base for a dimension.
             # Don't assume behavior of any particular implementation of svd.
@@ -135,25 +142,40 @@ class SVD(torch.autograd.Function):
             # computes u @ diag(gsigma) @ vh
             sigma_term = u * gsigma.unsqueeze(-2) @ vh
         else:
-            sigma_term = torch.zeros(m,n,dtype=u.dtype,device=u.device)
+            sigma_term = torch.zeros((*sigma.shape[:-1],m,n),dtype=u.dtype,device=u.device)
         # in case that there are no gu and gvh, we can avoid the series of kernel
         # calls below
         if (gu is None) and (gvh is None):
             if not (diagnostics is None):
                 print(f"{diagnostics} {sigma_term.abs().max()} {sigma.max()}")
-            return sigma_term, None, None, None
+            return sigma_term
 
 
         # sigma_inv= safe_inverse_2(sigma.clone(), sigma_scale*eps)
         # sigma_inv= safe_inverse(sigma.clone(), eps_abs=sigma_scale*eps)
-        sigma_inv= safe_inverse(sigma.clone(), eps_abs= scaled_eps)
+        sigma_inv= safe_inverse(
+            sigma.clone(),
+            eps_abs=eps_abs,
+            eps_rel=_SVD_EPS_REL,
+            eps_scale=sigma_scale,
+        )
 
         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
-        F = safe_inverse(F, eps_abs= scaled_eps)
+        F = safe_inverse(
+            F,
+            eps_abs=eps_abs,
+            eps_rel=_SVD_EPS_REL,
+            eps_scale=pair_scale,
+        )
         F.diagonal(0,-2,-1).fill_(0)
 
         G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)
-        G = safe_inverse(G, eps_abs= scaled_eps)
+        G = safe_inverse(
+            G,
+            eps_abs=eps_abs,
+            eps_rel=_SVD_EPS_REL,
+            eps_scale=pair_scale,
+        )
         G.diagonal(0,-2,-1).fill_(0)
 
         uh= u.conj().transpose(-2,-1)
@@ -167,7 +189,7 @@ class SVD(torch.autograd.Function):
                 u_term = u_term + proj_on_ortho_u @ (gu * sigma_inv.unsqueeze(-2))
             u_term = u_term @ vh
         else:
-            u_term = torch.zeros(m,n,dtype=u.dtype,device=u.device)
+            u_term = torch.zeros((*sigma.shape[:-1],m,n),dtype=u.dtype,device=u.device)
 
         v= vh.conj().transpose(-2,-1)
         if not (gvh is None):
@@ -180,24 +202,23 @@ class SVD(torch.autograd.Function):
                 v_term = v_term + sigma_inv.unsqueeze(-1) * (gvh @ proj_on_v_ortho)
             v_term = u @ v_term
         else:
-            v_term = torch.zeros(m,n,dtype=u.dtype,device=u.device)
+            v_term = torch.zeros((*sigma.shape[:-1],m,n),dtype=u.dtype,device=u.device)
 
 
         # // for complex-valued input there is an additional term
         # // https://giggleliu.github.io/2019/04/02/einsumbp.html
         # // https://arxiv.org/abs/1909.02659
         dA= u_term + sigma_term + v_term
-        if u.is_complex() or v.is_complex():
-            L= (uh @ gu).diagonal(0,-2,-1)
-            L.real.zero_()
-            L.imag.mul_(sigma_inv)
+        if (u.is_complex() or v.is_complex()) and gu is not None:
+            phase_diag= (uh @ gu).diagonal(0,-2,-1)
+            L= 1j * phase_diag.imag * sigma_inv
             imag_term= (u * L.unsqueeze(-2)) @ vh
             dA= dA + imag_term
 
         if diagnostics is not None:
             print(f"{diagnostics} {dA.abs().max()} {sigma.max()}")
 
-        return dA, None, None, None
+        return dA
 
 
 class SVD_real(torch.autograd.Function):
