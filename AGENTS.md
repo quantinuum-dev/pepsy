@@ -28,6 +28,15 @@ At the start of a new task:
 - Read the closest tests before editing. For public API or import-path work, read `tests/test_public_api.py`, `tests/test_package_layout.py`, and `docs/development/package_layout.md`.
 - Prefer new package namespaces for imports. Do not add old flat modules such as `pepsy.core`, `pepsy.gates`, `pepsy.sampler`, or `pepsy.optimize_sweep`.
 
+## Branching & Workflow
+
+- After a small coherent batch of package changes, run the relevant focused
+  validation, commit only the files you changed, and push to the configured
+  upstream. Do this incrementally instead of waiting for many unrelated edits
+  to accumulate.
+- Never include unrelated or user-owned work in these automatic commits, and
+  do not push changes that fail validation unless the user explicitly asks.
+
 ## Architecture Map
 
 - `pepsy.backends`: backend inference/conversion helpers, package-wide backend defaults, torch/JAX/CuPy linalg registration.
