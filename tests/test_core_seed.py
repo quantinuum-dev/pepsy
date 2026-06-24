@@ -11,6 +11,35 @@ import pytest
 import quimb.tensor as qtn
 
 
+def test_build_optimizer_loads_cotengrust_before_cotengra(monkeypatch):
+    """build_optimizer should make cotengrust available to cotengra."""
+    events = []
+
+    def fake_ensure_cotengrust():
+        events.append("cotengrust")
+        return object()
+
+    class DummyOpt:
+        def __init__(self, **kwargs):
+            _ = kwargs
+            events.append("cotengra")
+
+    monkeypatch.setattr(core, "_ensure_cotengrust", fake_ensure_cotengrust)
+    monkeypatch.setattr(core.ctg, "ReusableHyperOptimizer", DummyOpt)
+
+    out = core.build_optimizer(
+        progbar=False,
+        parallel=False,
+        optlib="random",
+        directory=None,
+        max_repeats=1,
+        max_time="rate:1e2",
+    )
+
+    assert isinstance(out, DummyOpt)
+    assert events == ["cotengrust", "cotengra"]
+
+
 def test_build_optimizer_constructs_without_seed(monkeypatch):
     """build_optimizer should configure cotengra optimizer without seed kwarg."""
     captured = {}
@@ -82,6 +111,34 @@ def test_build_compressed_optimizer_constructs_without_seed(monkeypatch):
 
     assert isinstance(out, DummyCOpt)
     assert "seed" not in captured
+
+
+def test_build_compressed_optimizer_loads_cotengrust_before_cotengra(monkeypatch):
+    """build_compressed_optimizer should make cotengrust available to cotengra."""
+    events = []
+
+    def fake_ensure_cotengrust():
+        events.append("cotengrust")
+        return object()
+
+    class DummyCOpt:
+        def __init__(self, *args, **kwargs):
+            _ = args, kwargs
+            events.append("cotengra")
+
+    monkeypatch.setattr(core, "_ensure_cotengrust", fake_ensure_cotengrust)
+    monkeypatch.setattr(core.ctg, "ReusableHyperCompressedOptimizer", DummyCOpt)
+
+    out = core.build_compressed_optimizer(
+        progbar=False,
+        chi=4,
+        directory=None,
+        max_repeats=1,
+        max_time="rate:1e2",
+    )
+
+    assert isinstance(out, DummyCOpt)
+    assert events == ["cotengrust", "cotengra"]
 
 
 def test_tn_fidelity_uses_default_optimizer_settings(monkeypatch):

@@ -48,6 +48,41 @@ At the start of a new task:
 - `pepsy.sampling`: `MpsSampler`, `VecSampler`, `PepsBpSampler`, and result dataclasses.
 - `pepsy._internal`: private formatting and small utility helpers only.
 
+## Upstream Tensor-Network Substrate
+
+- Treat `autoray`, `cotengra`, `cotengrust`, and `quimb` as first-class
+  dependencies and prefer their APIs over local reimplementations wherever they
+  cover the needed tensor-network, contraction-planning, and backend-dispatch
+  behavior.
+- Use `quimb` tensor-network objects and methods for Tensor/TensorNetwork,
+  MPS/MPO/PEPS/PEPO construction, contraction, boundary, gate, geometry,
+  sampling, and optimization workflows when practical. Keep Pepsy wrappers
+  thin and focused on Pepsy conventions, compatibility, and stable public APIs.
+- Use `cotengra` for contraction path/tree optimization, hyper-optimization,
+  slicing, subtree reconfiguration, compressed contraction planning, and
+  reusable optimizer objects. Forward cotengra-compatible options rather than
+  inventing parallel path-search configuration inside Pepsy.
+- Use `cotengrust` through cotengra's public acceleration paths for Rust-backed
+  greedy, random-greedy, optimal, and subtree-reconfiguration path-finding.
+  Keep cotengra as the main optimizer interface unless a task specifically
+  needs a lower-level cotengrust primitive.
+- Use `autoray` for backend inference and backend-agnostic array operations,
+  including creation, conversion, `einsum`/`tensordot`, reshaping, conjugation,
+  linalg, and registered backend-specific gradient/linalg fixes. Preserve
+  compatibility with NumPy, Torch, JAX, CuPy, and other autoray-compatible
+  arrays when optional dependencies are installed.
+- Preserve compatibility with the supported dependency ranges in
+  `pyproject.toml`; handle version-specific upstream behavior with feature
+  detection and focused regression tests.
+- Do not vendor or copy upstream internals. If Pepsy needs a workaround for an
+  upstream behavior, isolate it behind a small adapter, document why it exists,
+  and test it against the closest public upstream API.
+- `symmray` is the planned symmetric/block-sparse integration path. Design new
+  tensor, gate, boundary, and optimizer code so Symmray-style arrays can flow
+  through quimb/autoray paths where possible, keep `symmray` optional unless it
+  becomes a declared dependency, and use `pytest.importorskip("symmray")` for
+  Symmray-specific tests.
+
 ## Core Workflows
 
 - Boundary contraction flow: `build_bra_ket(ket, bra?) -> BdyMPS(...) -> contract_boundary(...)`.

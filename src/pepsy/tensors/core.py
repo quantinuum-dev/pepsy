@@ -976,10 +976,22 @@ def stop_grad(x):
             return x
 
 
+def _ensure_cotengrust():
+    """Import cotengrust so cotengra can use accelerated pathfinders."""
+    try:
+        import cotengrust as ctgr  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - exercised by packaging/env failures
+        raise ImportError(
+            "Pepsy requires 'cotengrust' for accelerated cotengra path search. "
+            "Install it with: pip install cotengrust"
+        ) from exc
+    return ctgr
+
+
 def build_optimizer(
     progbar: bool = False,
     alpha: int = 64,
-    max_time="rate:7e8", 
+    max_time="rate:7e8",
     max_repeats: int = 2**8,
     parallel="auto",
     optlib: str = "cmaes",
@@ -992,6 +1004,10 @@ def build_optimizer(
     slicing_reconf_opts: dict | None = None,
 ):
     """Build a reusable cotengra contraction optimizer.
+
+    ``cotengrust`` is imported up front so cotengra's ``accel="auto"``
+    pathfinders can use the Rust implementations when constructing greedy,
+    random-greedy, optimal, and reconfiguration paths.
 
     Parameters
     ----------
@@ -1022,6 +1038,8 @@ def build_optimizer(
     slicing_reconf_opts : dict | None, optional
         Options for interleaved slicing and reconfiguration.
     """
+    _ensure_cotengrust()
+
     # cotengra expects directory to be str, True, or None — not False.
     if directory is False:
         directory = None
@@ -1050,6 +1068,7 @@ def build_optimizer(
 
     return ctg.ReusableHyperOptimizer(**kwargs)
 
+
 def build_compressed_optimizer(
     progbar=True,
     chi=4,
@@ -1059,12 +1078,17 @@ def build_compressed_optimizer(
 ):
     """Build and return a reusable cotengra compressed optimizer.
 
+    ``cotengrust`` is imported up front so cotengra can use accelerated
+    contraction-ordering primitives in any supported compressed path searches.
+
     Parameters
     ----------
     directory : None, True, or str, optional
         Passed directly to cotengra. ``None`` disables caching; ``True``
         auto-generates a directory in the current working directory.
     """
+    _ensure_cotengrust()
+
     copt = ctg.ReusableHyperCompressedOptimizer(
         chi,
         max_repeats=max_repeats,

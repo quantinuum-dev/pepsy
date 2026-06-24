@@ -13,6 +13,7 @@ dependencies = [
   "numpy",
   "quimb",
   "cotengra",
+  "cotengrust",
   "autoray",
   "tqdm",
 ]
