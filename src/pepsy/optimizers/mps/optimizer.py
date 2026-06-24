@@ -1532,7 +1532,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Each gate location must have one or two sites.")
                 two_qubit_count += 1
 
-                compress_opts = {"cutoff": cutoff}
+                compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
                 xmin, xmax = sorted(where)
                 if track_norm_infidelity:
                     self.canonize_mps(p, (xmin, xmax))

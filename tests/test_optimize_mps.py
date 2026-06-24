@@ -183,6 +183,28 @@ def test_mps_optimizer_unitary_default_still_samples_norm_proxy():
     assert len(opt.get_fidelities()) > 1
 
 
+def test_mps_optimizer_svd_forwards_cutoff_mode_to_final_compression(monkeypatch):
+    """SVD mode should honor explicit cutoff_mode in its chi compression pass."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [(qu.CNOT(), (0, 3))]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="svd")
+    calls = []
+    original_left_compress = opt.p.left_compress
+
+    def _recording_left_compress(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_left_compress(*args, **kwargs)
+
+    monkeypatch.setattr(opt.p, "left_compress", _recording_left_compress)
+
+    opt.run(progbar=False, cutoff=1.0e-9, cutoff_mode="rsum2")
+
+    assert calls
+    assert calls[-1]["cutoff"] == pytest.approx(1.0e-9)
+    assert calls[-1]["cutoff_mode"] == "rsum2"
+
+
 def test_mps_optimizer_rejects_negative_fidelity_samples():
     """Negative fidelity_samples should fail clearly."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
