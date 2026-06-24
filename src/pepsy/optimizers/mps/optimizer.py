@@ -25,7 +25,7 @@ import quimb.tensor as qtn
 
 from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate
-from ...tensors.core import tn_fidelity
+from ...tensors.core import tn_fidelity, tn_norm
 
 __all__ = ["MpsOptimizer"]
 
@@ -69,7 +69,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ----------
     normalizations : list[dict]
         Automatic normalization events recorded during :meth:`run`. Each entry
-        stores the 1-based gate step, previous local squared norm,
+        stores the 1-based gate step, previous raw squared norm,
         canonicalization span, tensor site where the normalization factor was
         inserted, and resulting base-10 ``p.exponent``.
         The raw tensor data are rescaled; the represented norm remains
@@ -637,28 +637,29 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         raise ValueError("where must be an int, (int,), or (int, int).")
 
     def _canonical_span_norm(self, p, where, *, fallback=True):
-        """Return ``||p||`` from a canonical center/span block.
+        """Return the raw working-data norm without densifying wide spans.
 
-        This assumes tensors outside ``where`` are already isometric. The span
-        itself can contain multiple tensors per site, e.g. after ``split-gate``.
+        Normalization needs the norm of the current tensor data, excluding the
+        accumulated ``p.exponent`` scale. Contracting a canonical span into a
+        dense block can explode for long-range gates because the span retains
+        all physical legs, so use ``tn_norm``'s double-layer contraction instead.
         """
-        xmin, xmax = self._normalize_span(where)
+        _ = where, fallback
+        exponent = getattr(p, "exponent", None)
         try:
-            tags = [p.site_tag(i) for i in range(xmin, xmax + 1)]
-            block = p.select(tags, which="any")
-            if isinstance(block, qtn.TensorNetwork):
-                if block.num_tensors == 0:
-                    raise ValueError("canonical span selected no tensors.")
-                block = block.contract(
-                    all,
-                    output_inds=block.outer_inds(),
-                    optimize=self.contraction_opt,
-                )
-            return ar.do("linalg.norm", block.data)
-        except Exception:
-            if not fallback:
-                raise
-            return p.norm(optimize=self.contraction_opt)
+            if exponent is not None:
+                p.exponent = 0.0
+            mantissa, exponent_sq = tn_norm(
+                p,
+                contraction_opt=self.contraction_opt,
+                strip_exponent=True,
+            )
+            return ar.do("sqrt", ar.do("abs", mantissa)) * 10 ** (
+                float(exponent_sq) / 2.0
+            )
+        finally:
+            if exponent is not None:
+                p.exponent = exponent
 
     @staticmethod
     def _norm_ratio_fidelity(approx_norm, target_norm):

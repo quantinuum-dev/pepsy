@@ -10,6 +10,7 @@ import quimb as qu
 import quimb.tensor as qtn
 
 import pepsy as py
+import pepsy.optimizers.mps.optimizer as mps_optimizer_module
 
 
 def _non_unitary_entangling_gate():
@@ -386,6 +387,54 @@ def test_mps_optimizer_canonical_span_norm_matches_full_target_norm(where):
     assert local_norm == pytest.approx(target.norm())
 
 
+def test_mps_optimizer_canonical_span_norm_ignores_stored_exponent():
+    """Internal normalization should measure raw data, not represented scale."""
+    p0 = qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128")
+    opt = py.MpsOptimizer(p0.copy(), gates=[], chi=8, mode="svd")
+    opt.p.exponent = 3.0
+
+    raw = opt.p.copy()
+    raw.exponent = 0.0
+    measured = opt._canonical_span_norm(opt.p, (0, 3))  # pylint: disable=protected-access
+
+    assert measured == pytest.approx(raw.norm())
+    assert opt.p.exponent == pytest.approx(3.0)
+
+
+def test_mps_optimizer_norm_infidelity_uses_tn_norm_strip_exponent(monkeypatch):
+    """Norm-infidelity diagnostics should measure raw norms through ``tn_norm``."""
+    calls = []
+    original_tn_norm = mps_optimizer_module.tn_norm
+
+    def _spy_tn_norm(*args, **kwargs):
+        calls.append(kwargs.copy())
+        return original_tn_norm(*args, **kwargs)
+
+    monkeypatch.setattr(mps_optimizer_module, "tn_norm", _spy_tn_norm)
+
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.hadamard(), (1,)),
+        (_non_unitary_entangling_gate(), (0, 1)),
+    ]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode="mpo")
+    opt.run(
+        progbar=False,
+        cutoff=1e-12,
+        non_unitary=True,
+        normalize_final=True,
+        track_norm_infidelity=True,
+    )
+
+    samples = opt.get_norm_infidelity_samples()
+    assert len(samples) == 1
+    assert len(calls) >= 2
+    assert all(call["strip_exponent"] is True for call in calls)
+    assert all(call["contraction_opt"] == opt.contraction_opt for call in calls)
+
+
 def test_mps_optimizer_non_unitary_norm_infidelity_matches_svd_target():
     """SVD non-unitary proxy should match quimb's target infidelity."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -664,9 +713,9 @@ def test_mps_optimizer_dmrg_non_unitary_matches_mpo_accuracy():
     )
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "mpo"])
+@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "svd"])
 def test_mps_optimizer_non_unitary_norm_infidelity_smoke_other_modes(mode):
-    """Other compressed modes should expose a bounded non-unitary proxy."""
+    """All compressed modes should expose a bounded non-unitary proxy."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -675,6 +724,8 @@ def test_mps_optimizer_non_unitary_norm_infidelity_smoke_other_modes(mode):
     ]
 
     opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode=mode)
+    if mode == "swap" and not hasattr(opt.p, "gate_with_auto_swap_"):
+        pytest.skip("swap mode requires gate_with_auto_swap_ in this quimb version.")
     opt.run(
         progbar=False,
         cutoff=1e-12,

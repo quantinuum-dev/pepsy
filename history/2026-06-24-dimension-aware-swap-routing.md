@@ -1,7 +1,7 @@
 # 2026-06-24 — Dimension-aware SWAP routing
 
 - Milestone: B0 — gate-routing audit / quimb integration prerequisite
-- Branch / commit: `main` working tree, uncommitted
+- Branch / commit: `main` / `2caae41`
 
 ## What changed
 - Added dimension-aware routed SWAP construction in `src/pepsy/operators/gates.py`.
