@@ -39,6 +39,18 @@ def _square_lattice_edges(Lx, Ly):
     return tuple(edges)
 
 
+def _square_lattice_coordinate_edges(Lx, Ly):
+    """Return nearest-neighbor square-lattice edges as PEPS coordinates."""
+    edges = []
+    for x in range(Lx):
+        for y in range(Ly):
+            if y + 1 < Ly:
+                edges.append(((x, y), (x, y + 1)))
+            if x + 1 < Lx:
+                edges.append(((x, y), (x + 1, y)))
+    return tuple(edges)
+
+
 def _xy_u1_hamiltonian(edges):
     """Build the U(1)-symmetric XY Hamiltonian from an explicit dense term."""
     sx = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
@@ -145,6 +157,75 @@ def _build_3x3_symmray_mps_case(name):
         return state, hamiltonian, gates, True, sum(occupations)
 
     raise ValueError(f"Unknown symmetric MPS case {name!r}.")
+
+
+def _build_3x3_symmray_peps_case(name, *, edges=None):
+    """Build an explicit 3x3 PEPS state, Hamiltonian, and gate stream."""
+    edges = _square_lattice_coordinate_edges(3, 3) if edges is None else tuple(edges)
+
+    if name == "itf_z2":
+        charges = {(i, j): 0 for i in range(3) for j in range(3)}
+        state = SymPEPS.random(
+            3,
+            3,
+            symmetry="Z2",
+            phys_dim={0: 1, 1: 1},
+            site_charge=site_charge_from_occupations(charges),
+            bond_dim=2,
+            seed=51,
+            dtype="complex128",
+        )
+        hamiltonian = SymHamiltonian.from_edges(
+            "itf",
+            "Z2",
+            edges,
+            jx=-1.0,
+            hz=-0.5,
+        )
+        gates = hamiltonian.gate_stream(0.001, imaginary=False)
+        return state, hamiltonian, gates, 0
+
+    if name == "xy_u1":
+        charges = {(i, j): (i + j) % 2 for i in range(3) for j in range(3)}
+        state = SymPEPS.random(
+            3,
+            3,
+            symmetry="U1",
+            phys_dim={0: 1, 1: 1},
+            site_charge=site_charge_from_occupations(charges),
+            bond_dim=2,
+            seed=52,
+            dtype="complex128",
+        )
+        hamiltonian = _xy_u1_hamiltonian(edges)
+        gates = hamiltonian.gate_stream(0.001, imaginary=False)
+        return state, hamiltonian, gates, sum(charges.values())
+
+    if name == "fermi_hubbard_u1":
+        charges = {(i, j): 1 for i in range(3) for j in range(3)}
+        state = SymPEPS.random(
+            3,
+            3,
+            symmetry="U1",
+            phys_dim={0: 1, 1: 2, 2: 1},
+            fermionic=True,
+            site_charge=site_charge_from_occupations(charges),
+            bond_dim=2,
+            seed=53,
+            dtype="complex128",
+        )
+        hamiltonian = SymHamiltonian.from_edges(
+            "fermi_hubbard",
+            "U1",
+            edges,
+            t=1.0,
+            U=2.0,
+            mu=0.1,
+        )
+        gates = hamiltonian.gate_stream(0.0005, imaginary=True)
+        return state, hamiltonian, gates, sum(charges.values())
+
+    raise ValueError(f"Unknown symmetric PEPS case {name!r}.")
 
 
 def test_sector_and_charge_helpers_make_total_charge_explicit():
@@ -650,6 +731,80 @@ def test_sympeps_gate_stream_runs_pepsy_gate_and_gate_simple():
     assert len(gauges) > 0
     assert np.isfinite(np.real(out_gate.norm()))
     assert np.isfinite(np.real(out_simple.norm()))
+
+
+@pytest.mark.parametrize("case_name", ["itf_z2", "xy_u1", "fermi_hubbard_u1"])
+@pytest.mark.parametrize("method", ["gate", "simple"])
+def test_sympeps_gate_wrappers_3x3_streams_cover_symmetries(case_name, method):
+    """PEPSY gate wrappers should handle 3x3 Symmray PEPS gate streams."""
+    state, hamiltonian, gates, expected_charge = _build_3x3_symmray_peps_case(
+        case_name
+    )
+
+    assert len(hamiltonian.edges) == 12
+    assert len(gates) == 12
+    assert state.Lx == 3
+    assert state.Ly == 3
+    assert state.overall_charge() == expected_charge
+
+    if method == "gate":
+        out = gate(
+            state.tn.copy(),
+            gates,
+            max_bond=4,
+            cutoff=1.0e-10,
+            inplace=False,
+        )
+    else:
+        gauges = {}
+        out = gate_simple(
+            state.tn.copy(),
+            gates,
+            gauges=gauges,
+            max_bond=4,
+            cutoff=1.0e-10,
+            inplace=False,
+        )
+        assert len(gauges) == len(gates)
+
+    assert out.Lx == 3
+    assert out.Ly == 3
+    assert out.max_bond() <= 4
+    assert _all_tensor_data_symmray(out)
+
+
+@pytest.mark.parametrize("case_name", ["itf_z2", "xy_u1", "fermi_hubbard_u1"])
+@pytest.mark.parametrize("method", ["gate", "simple"])
+def test_sympeps_gate_wrappers_route_nonlocal_symmray_swaps(case_name, method):
+    """Internal routed SWAPs should be Symmray arrays for nonlocal PEPS gates."""
+    nonlocal_edge = (((0, 0), (2, 2)),)
+    state, _, gates, _ = _build_3x3_symmray_peps_case(
+        case_name,
+        edges=nonlocal_edge,
+    )
+
+    if method == "gate":
+        out = gate(
+            state.tn.copy(),
+            gates,
+            max_bond=4,
+            cutoff=1.0e-10,
+            inplace=False,
+        )
+    else:
+        gauges = {}
+        out = gate_simple(
+            state.tn.copy(),
+            gates,
+            gauges=gauges,
+            max_bond=4,
+            cutoff=1.0e-10,
+            inplace=False,
+        )
+        assert len(gauges) > 0
+
+    assert out.max_bond() <= 4
+    assert _all_tensor_data_symmray(out)
 
 
 def test_sympeps_gate_method_preserves_pepsy_gate_contract_default(monkeypatch):

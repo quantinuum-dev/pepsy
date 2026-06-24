@@ -1207,6 +1207,117 @@ def _rectangular_swap_gate(dim_a, dim_b, *, dtype="complex128"):
     return swap_gate
 
 
+def _is_symmray_array(value):
+    """Return whether ``value`` looks like a Symmray block-sparse array."""
+    return hasattr(value, "blocks") and hasattr(value, "indices")
+
+
+def _symmray_sample_data_from_tn(tn):
+    """Return representative Symmray array data from a tensor network."""
+    tensor_map = getattr(tn, "tensor_map", None)
+    if tensor_map:
+        tensors = tensor_map.values()
+    else:
+        try:
+            tensors = tuple(tn)
+        except TypeError:
+            tensors = ()
+
+    for tensor in tensors:
+        data = getattr(tensor, "data", None)
+        if _is_symmray_array(data):
+            return data
+    return None
+
+
+def _symmray_index_map_for_tn_ind(tn, ind):
+    """Return the Symmray charge map for a live tensor-network index."""
+    tensor_ids = getattr(tn, "ind_map", {}).get(ind, ())
+    tensors = []
+    tensor_map = getattr(tn, "tensor_map", {})
+    for tid in tensor_ids:
+        try:
+            tensors.append(tensor_map[tid])
+        except KeyError:
+            continue
+    if not tensors:
+        try:
+            tensors = tuple(tn)
+        except TypeError:
+            tensors = ()
+
+    for tensor in tensors:
+        data = getattr(tensor, "data", None)
+        if not _is_symmray_array(data) or ind not in getattr(tensor, "inds", ()):
+            continue
+        axis = tensor.inds.index(ind)
+        return dict(data.indices[axis].chargemap)
+
+    raise ValueError(f"Could not infer Symmray charge map for index {ind!r}.")
+
+
+def _symmray_dense_index_map_from_chargemap(chargemap):
+    """Expand ``{charge: size}`` into Symmray's ``{dense_index: charge}``."""
+    index_map = {}
+    dense_index = 0
+    for charge, size in dict(chargemap).items():
+        for _ in range(int(size)):
+            index_map[dense_index] = charge
+            dense_index += 1
+    return index_map
+
+
+def _symmray_dense_gate_from_site_maps(tn, gate, output_sites, input_sites, ind_id):
+    """Convert a dense site gate to a Symmray array using live site sectors."""
+    sample = _symmray_sample_data_from_tn(tn)
+    if sample is None:
+        return None
+
+    index_maps = []
+    for site in tuple(output_sites) + tuple(input_sites):
+        ind = _physical_index_for_site(tn, site, ind_id)
+        index_maps.append(
+            _symmray_dense_index_map_from_chargemap(
+                _symmray_index_map_for_tn_ind(tn, ind)
+            )
+        )
+
+    nout = len(tuple(output_sites))
+    nin = len(tuple(input_sites))
+    array_cls = type(sample)
+    kwargs = {}
+    if array_cls.__name__ in {"AbelianArray", "FermionicArray"}:
+        symmetry = getattr(sample, "symmetry", None)
+        if symmetry is not None:
+            kwargs["symmetry"] = symmetry
+
+    return array_cls.from_dense(
+        np.asarray(gate),
+        index_maps=tuple(index_maps),
+        duals=(False,) * nout + (True,) * nin,
+        charge=0,
+        **kwargs,
+    )
+
+
+def _symmray_swap_gate_for_site_pair(tn, site_a, site_b, *, ind_id=None, dtype="complex128"):
+    """Return a Symmray block-sparse SWAP for two live physical site legs."""
+    sample = _symmray_sample_data_from_tn(tn)
+    if sample is None:
+        return None
+
+    dim_a = _physical_index_size_for_site(tn, site_a, ind_id)
+    dim_b = _physical_index_size_for_site(tn, site_b, ind_id)
+    dense_swap = _rectangular_swap_gate(dim_a, dim_b, dtype=dtype)
+    return _symmray_dense_gate_from_site_maps(
+        tn,
+        dense_swap,
+        output_sites=(site_b, site_a),
+        input_sites=(site_a, site_b),
+        ind_id=ind_id,
+    )
+
+
 def _convert_internal_gate_to_backend(gate, inferred_converter):
     """Best-effort conversion for internally generated exact gates."""
     if inferred_converter is None:
@@ -1227,6 +1338,16 @@ def _swap_gate_for_site_pair(
     inferred_converter=None,
 ):
     """Return a SWAP tensor matching the sites' current physical dimensions."""
+    symmray_swap = _symmray_swap_gate_for_site_pair(
+        tn,
+        site_a,
+        site_b,
+        ind_id=ind_id,
+        dtype=dtype,
+    )
+    if symmray_swap is not None:
+        return symmray_swap
+
     dim_a = _physical_index_size_for_site(tn, site_a, ind_id)
     dim_b = _physical_index_size_for_site(tn, site_b, ind_id)
     swap_gate = _rectangular_swap_gate(dim_a, dim_b, dtype=dtype)
