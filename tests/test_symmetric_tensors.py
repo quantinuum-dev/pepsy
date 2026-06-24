@@ -23,6 +23,130 @@ from pepsy.tensors import (
 sr = pytest.importorskip("symmray")
 
 
+def _square_lattice_edges(Lx, Ly):
+    """Return nearest-neighbor square-lattice edges in row-major MPS order."""
+    edges = []
+
+    def site(x, y):
+        return x * Ly + y
+
+    for x in range(Lx):
+        for y in range(Ly):
+            if x + 1 < Lx:
+                edges.append((site(x, y), site(x + 1, y)))
+            if y + 1 < Ly:
+                edges.append((site(x, y), site(x, y + 1)))
+    return tuple(edges)
+
+
+def _xy_u1_hamiltonian(edges):
+    """Build the U(1)-symmetric XY Hamiltonian from an explicit dense term."""
+    sx = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    sy = np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=np.complex128)
+    xy_term_dense = 0.5 * (np.kron(sx, sx) + np.kron(sy, sy))
+    xy_term = symm_operator_from_dense(
+        xy_term_dense,
+        {0: 1, 1: 1},
+        symmetry="U1",
+        charge=0,
+        sites=2,
+    )
+    return SymHamiltonian(
+        model="xy",
+        symmetry="U1",
+        edges=tuple(edges),
+        terms={edge: xy_term for edge in edges},
+        parameters={"J": 1.0},
+    )
+
+
+def _all_tensor_data_symmray(tn):
+    """Return whether every tensor stores Symmray block-sparse data."""
+    return all(
+        hasattr(tensor.data, "blocks") and hasattr(tensor.data, "indices")
+        for tensor in tn.tensors
+    )
+
+
+def _finite_double_layer_norm(tn):
+    """Return whether the direct double-layer norm contraction is finite."""
+    norm = (tn.H & tn).contract(all, optimize="auto-hq")
+    return np.isfinite(np.real(norm))
+
+
+def _raw_mps_norm(mps):
+    """Return an MPS norm with PEPSY's stored exponent removed."""
+    raw = mps.copy()
+    if hasattr(raw, "exponent"):
+        raw.exponent = 0.0
+    return raw.norm()
+
+
+def _build_3x3_symmray_mps_case(name):
+    """Build an explicit 3x3 state, Hamiltonian, and gate stream."""
+    edges = _square_lattice_edges(3, 3)
+
+    if name == "itf_z2":
+        state = SymMPS.random(
+            9,
+            symmetry="Z2",
+            phys_dim={0: 1, 1: 1},
+            site_charge=site_charge_from_occupations([0] * 9),
+            bond_dim=4,
+            seed=41,
+            dtype="complex128",
+        )
+        hamiltonian = SymHamiltonian.from_edges(
+            "itf",
+            "Z2",
+            edges,
+            jx=-1.0,
+            hz=-0.5,
+        )
+        gates = hamiltonian.gate_stream(0.001, imaginary=False)
+        return state, hamiltonian, gates, False, 0
+
+    if name == "xy_u1":
+        occupations = [1, 0, 1, 0, 1, 0, 1, 0, 1]
+        state = SymMPS.random(
+            9,
+            symmetry="U1",
+            phys_dim={0: 1, 1: 1},
+            site_charge=site_charge_from_occupations(occupations),
+            bond_dim=4,
+            seed=42,
+            dtype="complex128",
+        )
+        hamiltonian = _xy_u1_hamiltonian(edges)
+        gates = hamiltonian.gate_stream(0.001, imaginary=False)
+        return state, hamiltonian, gates, False, sum(occupations)
+
+    if name == "fermi_hubbard_u1":
+        occupations = [1] * 9
+        state = SymMPS.random(
+            9,
+            symmetry="U1",
+            phys_dim={0: 1, 1: 2, 2: 1},
+            fermionic=True,
+            site_charge=site_charge_from_occupations(occupations),
+            bond_dim=4,
+            seed=43,
+            dtype="complex128",
+        )
+        hamiltonian = SymHamiltonian.from_edges(
+            "fermi_hubbard",
+            "U1",
+            edges,
+            t=1.0,
+            U=2.0,
+            mu=0.1,
+        )
+        gates = hamiltonian.gate_stream(0.0005, imaginary=True)
+        return state, hamiltonian, gates, True, sum(occupations)
+
+    raise ValueError(f"Unknown symmetric MPS case {name!r}.")
+
+
 def test_sector_and_charge_helpers_make_total_charge_explicit():
     """Physical sectors and local charges should be easy to inspect."""
     assert default_physical_sectors("U1", 4) == {0: 1, 1: 2, 2: 1}
@@ -216,6 +340,109 @@ def test_symmps_mps_optimizer_coerces_dense_hamiltonian_terms():
     assert evolved.tn.L == 4
     assert evolved.tn.max_bond() <= 4
     assert np.isfinite(np.real(evolved.norm()))
+
+
+@pytest.mark.parametrize("case_name", ["itf_z2", "xy_u1", "fermi_hubbard_u1"])
+@pytest.mark.parametrize("mode", ["dmrg", "swap", "exact"])
+def test_symmps_mps_optimizer_3x3_streams_cover_supported_modes(case_name, mode):
+    """Explicit 3x3 Symmray streams should run through supported MPS modes."""
+    state, hamiltonian, gates, non_unitary, expected_charge = _build_3x3_symmray_mps_case(
+        case_name
+    )
+
+    assert len(hamiltonian.edges) == 12
+    assert len(gates) == 12
+    assert state.L == 9
+    assert state.overall_charge() == expected_charge
+    valid_gate_shapes = {(2, 2, 2, 2), (4, 4, 4, 4)}
+    assert all(term.shape in valid_gate_shapes for term in hamiltonian.terms.values())
+    assert all(gate.shape in valid_gate_shapes for gate, _ in gates)
+
+    opt = pepsy.MpsOptimizer(state.tn.copy(), gates, chi=4, mode=mode)
+    run_kwargs = {
+        "progbar": False,
+        "cutoff": 1.0e-10,
+        "fidelity_samples": 0,
+        "n_iter": 4,
+    }
+    if non_unitary and mode != "exact":
+        run_kwargs.update(
+            {
+                "non_unitary": True,
+                "normalize_every": 1,
+                "normalize_final": True,
+            }
+        )
+
+    out = opt.run(**run_kwargs)
+
+    assert _all_tensor_data_symmray(out)
+    assert _finite_double_layer_norm(out)
+
+    if mode == "exact":
+        assert len(out.tensors) == 1
+    else:
+        assert out.L == 9
+        assert out.max_bond() <= 4
+
+    if non_unitary and mode != "exact":
+        assert len(opt.get_normalizations()) == len(gates)
+        assert _raw_mps_norm(out) == pytest.approx(1.0)
+    else:
+        assert opt.get_normalizations() == []
+
+
+def test_symmps_mps_optimizer_symmray_mode_caveats_are_explicit():
+    """Unsupported Symmray compression routes should fail before quimb internals."""
+    state = SymMPS.random(
+        4,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations([0] * 4),
+        bond_dim=2,
+        seed=46,
+        dtype="complex128",
+    )
+    nearest_ham = SymHamiltonian.from_edges(
+        "itf",
+        "Z2",
+        [(0, 1)],
+        jx=-1.0,
+        hz=-0.5,
+    )
+    nonlocal_ham = SymHamiltonian.from_edges(
+        "itf",
+        "Z2",
+        [(0, 2)],
+        jx=-1.0,
+        hz=-0.5,
+    )
+
+    nearest_gates = nearest_ham.gate_stream(0.001)
+    nonlocal_gates = nonlocal_ham.gate_stream(0.001)
+
+    mpo_out = pepsy.MpsOptimizer(
+        state.tn.copy(),
+        nearest_gates,
+        chi=2,
+        mode="mpo",
+    ).run(progbar=False, cutoff=1.0e-10, fidelity_samples=0)
+    assert mpo_out.L == 4
+
+    with pytest.raises(ValueError, match="bond_dim >= chi"):
+        pepsy.MpsOptimizer(state.tn.copy(), nearest_gates, chi=4, mode="dmrg").run(
+            progbar=False
+        )
+
+    with pytest.raises(ValueError, match="mode='svd'"):
+        pepsy.MpsOptimizer(state.tn.copy(), nearest_gates, chi=2, mode="svd").run(
+            progbar=False
+        )
+
+    with pytest.raises(ValueError, match="nearest-neighbor"):
+        pepsy.MpsOptimizer(state.tn.copy(), nonlocal_gates, chi=2, mode="mpo").run(
+            progbar=False
+        )
 
 
 def test_sympeps_tfim_builds_z2_terms_and_step():

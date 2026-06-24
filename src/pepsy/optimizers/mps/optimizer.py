@@ -194,6 +194,63 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return None
         return dims_in
 
+    @staticmethod
+    def _is_symmray_array(value):
+        """Return whether ``value`` looks like a Symmray block-sparse array."""
+        return hasattr(value, "blocks") and hasattr(value, "indices")
+
+    @classmethod
+    def _has_symmray_data(cls, tn):
+        """Return whether any tensor data in ``tn`` is Symmray-backed."""
+        return any(
+            cls._is_symmray_array(tensor.data)
+            for tensor in getattr(tn, "tensors", ())
+        )
+
+    @staticmethod
+    def _is_nearest_neighbor_1d(where):
+        """Return whether an integer two-site location is adjacent in MPS order."""
+        if len(where) != 2:
+            return True
+        site0, site1 = where
+        if not isinstance(site0, Integral) or not isinstance(site1, Integral):
+            return True
+        return abs(int(site0) - int(site1)) == 1
+
+    def _validate_symmray_mode_support(self, where_seq):
+        """Fail early for Symmray/MPS mode combinations with known bad paths."""
+        if not self._has_symmray_data(self.p):
+            return
+
+        two_site = [where for where in where_seq if len(where) == 2]
+
+        if self.mode == "dmrg" and self.p.max_bond() < self.chi:
+            raise ValueError(
+                "Symmray MPS data cannot be automatically expanded for "
+                "mode='dmrg' because quimb's bond-dimension expansion calls "
+                "dense-style pad on the Symmray backend. Construct the SymMPS "
+                "with bond_dim >= chi, or run with chi <= p.max_bond()."
+            )
+
+        if self.mode == "svd" and two_site:
+            raise ValueError(
+                "mode='svd' is not currently compatible with Symmray two-site "
+                "gates because quimb's reduce-split path loses block-sparse "
+                "fusion metadata. Use mode='swap' for compressed Symmray gate "
+                "streams, mode='dmrg' with bond_dim >= chi, or mode='exact'."
+            )
+
+        if self.mode == "mpo" and any(
+            not self._is_nearest_neighbor_1d(where) for where in two_site
+        ):
+            raise ValueError(
+                "mode='mpo' is currently compatible with Symmray only for "
+                "nearest-neighbor two-site gates. Nonlocal sub-MPO compression "
+                "in this quimb/Symmray stack inserts dense NumPy tensors. Use "
+                "mode='swap' for nonlocal Symmray gate streams, mode='dmrg' "
+                "with bond_dim >= chi, or mode='exact'."
+            )
+
     def _apply_gate(self, p, gate, where, **kwargs):
         """Apply a gate using this optimizer's physical-index convention."""
         kwargs.setdefault("ind_id", self.ind_id)
@@ -366,6 +423,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq = list(self.where)
         if not G_seq:
             return self.p
+        self._validate_symmray_mode_support(where_seq)
 
         non_unitary = bool(non_unitary)
         if not non_unitary:

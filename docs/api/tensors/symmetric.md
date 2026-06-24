@@ -56,6 +56,14 @@ gates = ham.gate_stream(0.01)
 psi.time_evolve_mps_optimizer(0.01, hamiltonian=ham, chi=16, mode="mpo")
 ```
 
+For Symmray-backed MPS gate streams, ``mode="swap"`` is the safest compressed
+route for nonlocal 1D gate streams such as a row-major square lattice, and
+``mode="exact"`` is useful as a small-system reference. ``mode="dmrg"`` works
+when the initial symmetric MPS was built with enough block-sparse bond capacity,
+for example ``bond_dim >= chi``. In the current quimb/Symmray stack,
+``mode="mpo"`` is limited to nearest-neighbor Symmray gates and ``mode="svd"``
+is not compatible with Symmray two-site gates.
+
 ```python
 peps = py.SymPEPS.for_model("itf", 4, 4, bond_dim=2)
 ham = peps.build_hamiltonian(jx=-1.0, hz=-0.5)
