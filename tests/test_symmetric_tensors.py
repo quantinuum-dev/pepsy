@@ -343,7 +343,7 @@ def test_symmps_mps_optimizer_coerces_dense_hamiltonian_terms():
 
 
 @pytest.mark.parametrize("case_name", ["itf_z2", "xy_u1", "fermi_hubbard_u1"])
-@pytest.mark.parametrize("mode", ["dmrg", "swap", "exact"])
+@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "svd", "exact"])
 def test_symmps_mps_optimizer_3x3_streams_cover_supported_modes(case_name, mode):
     """Explicit 3x3 Symmray streams should run through supported MPS modes."""
     state, hamiltonian, gates, non_unitary, expected_charge = _build_3x3_symmray_mps_case(
@@ -392,8 +392,8 @@ def test_symmps_mps_optimizer_3x3_streams_cover_supported_modes(case_name, mode)
         assert opt.get_normalizations() == []
 
 
-def test_symmps_mps_optimizer_symmray_mode_caveats_are_explicit():
-    """Unsupported Symmray compression routes should fail before quimb internals."""
+def test_symmps_mps_optimizer_symmray_dmrg_expansion_caveat_is_explicit():
+    """DMRG should fail clearly when Symmray bond expansion would be required."""
     state = SymMPS.random(
         4,
         symmetry="Z2",
@@ -421,28 +421,65 @@ def test_symmps_mps_optimizer_symmray_mode_caveats_are_explicit():
     nearest_gates = nearest_ham.gate_stream(0.001)
     nonlocal_gates = nonlocal_ham.gate_stream(0.001)
 
-    mpo_out = pepsy.MpsOptimizer(
-        state.tn.copy(),
-        nearest_gates,
-        chi=2,
-        mode="mpo",
-    ).run(progbar=False, cutoff=1.0e-10, fidelity_samples=0)
-    assert mpo_out.L == 4
+    for mode, gates in [
+        ("mpo", nearest_gates),
+        ("mpo", nonlocal_gates),
+        ("svd", nonlocal_gates),
+    ]:
+        out = pepsy.MpsOptimizer(
+            state.tn.copy(),
+            gates,
+            chi=2,
+            mode=mode,
+        ).run(progbar=False, cutoff=1.0e-10, fidelity_samples=0)
+        assert out.L == 4
+        assert out.max_bond() <= 2
 
     with pytest.raises(ValueError, match="bond_dim >= chi"):
         pepsy.MpsOptimizer(state.tn.copy(), nearest_gates, chi=4, mode="dmrg").run(
             progbar=False
         )
 
-    with pytest.raises(ValueError, match="mode='svd'"):
-        pepsy.MpsOptimizer(state.tn.copy(), nearest_gates, chi=2, mode="svd").run(
-            progbar=False
-        )
 
-    with pytest.raises(ValueError, match="nearest-neighbor"):
-        pepsy.MpsOptimizer(state.tn.copy(), nonlocal_gates, chi=2, mode="mpo").run(
-            progbar=False
-        )
+@pytest.mark.parametrize("mode", ["mpo", "svd"])
+def test_symmps_mps_optimizer_symmray_auto_swap_tracks_infidelity(mode):
+    """Symmray auto-swap fallbacks should still support true infidelity samples."""
+    state = SymMPS.random(
+        4,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations([0] * 4),
+        bond_dim=2,
+        seed=47,
+        dtype="complex128",
+    )
+    hamiltonian = SymHamiltonian.from_edges(
+        "itf",
+        "Z2",
+        [(0, 2)],
+        jx=-1.0,
+        hz=-0.5,
+    )
+
+    opt = pepsy.MpsOptimizer(
+        state.tn.copy(),
+        hamiltonian.gate_stream(0.001),
+        chi=2,
+        mode=mode,
+    )
+    out = opt.run(
+        progbar=False,
+        cutoff=1.0e-10,
+        fidelity_samples=0,
+        track_infidelity=True,
+    )
+
+    samples = opt.get_infidelity_samples()
+    assert out.L == 4
+    assert out.max_bond() <= 2
+    assert len(samples) == 1
+    assert 0.0 <= samples[0]["fidelity"] <= 1.0
+    assert 0.0 <= opt.get_infidelities()[-1] <= 1.0
 
 
 def test_sympeps_tfim_builds_z2_terms_and_step():

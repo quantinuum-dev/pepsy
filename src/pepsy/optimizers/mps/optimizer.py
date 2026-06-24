@@ -217,12 +217,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return True
         return abs(int(site0) - int(site1)) == 1
 
-    def _validate_symmray_mode_support(self, where_seq):
+    def _validate_symmray_mode_support(self):
         """Fail early for Symmray/MPS mode combinations with known bad paths."""
         if not self._has_symmray_data(self.p):
             return
-
-        two_site = [where for where in where_seq if len(where) == 2]
 
         if self.mode == "dmrg" and self.p.max_bond() < self.chi:
             raise ValueError(
@@ -232,24 +230,45 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "with bond_dim >= chi, or run with chi <= p.max_bond()."
             )
 
-        if self.mode == "svd" and two_site:
-            raise ValueError(
-                "mode='svd' is not currently compatible with Symmray two-site "
-                "gates because quimb's reduce-split path loses block-sparse "
-                "fusion metadata. Use mode='swap' for compressed Symmray gate "
-                "streams, mode='dmrg' with bond_dim >= chi, or mode='exact'."
-            )
+    def _apply_symmray_auto_swap_gate(
+        self,
+        p,
+        gate,
+        where,
+        *,
+        cutoff,
+        cutoff_mode,
+        max_bond=None,
+        info=None,
+    ):
+        """Apply a Symmray two-site gate through quimb's block-aware swaps."""
+        compress_opts = {
+            "cutoff": cutoff,
+            "cutoff_mode": cutoff_mode,
+        }
+        if max_bond is not None:
+            compress_opts["max_bond"] = max_bond
+        p.gate_with_auto_swap_(
+            gate,
+            where,
+            info=self.info_c if info is None else info,
+            swap_back=True,
+            **compress_opts,
+        )
+        return p
 
-        if self.mode == "mpo" and any(
-            not self._is_nearest_neighbor_1d(where) for where in two_site
-        ):
-            raise ValueError(
-                "mode='mpo' is currently compatible with Symmray only for "
-                "nearest-neighbor two-site gates. Nonlocal sub-MPO compression "
-                "in this quimb/Symmray stack inserts dense NumPy tensors. Use "
-                "mode='swap' for nonlocal Symmray gate streams, mode='dmrg' "
-                "with bond_dim >= chi, or mode='exact'."
-            )
+    def _build_symmray_auto_swap_target(self, p, gate, where, cutoff, cutoff_mode):
+        """Build an un-chi-capped target using Symmray-aware swap routing."""
+        p_target = p.copy()
+        self._apply_symmray_auto_swap_gate(
+            p_target,
+            gate,
+            where,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            info={},
+        )
+        return p_target
 
     def _apply_gate(self, p, gate, where, **kwargs):
         """Apply a gate using this optimizer's physical-index convention."""
@@ -423,7 +442,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq = list(self.where)
         if not G_seq:
             return self.p
-        self._validate_symmray_mode_support(where_seq)
+        self._validate_symmray_mode_support()
 
         non_unitary = bool(non_unitary)
         if not non_unitary:
@@ -1270,32 +1289,55 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Each gate location must have one or two sites.")
                 two_qubit_count += 1
                 xmin, xmax = sorted(where)
+                use_symmray_auto_swap = (
+                    self._has_symmray_data(p)
+                    and not self._is_nearest_neighbor_1d(where)
+                )
                 if track_norm_infidelity:
                     self.canonize_mps(p, (xmin, xmax))
                 if track_norm_infidelity or track_infidelity:
-                    p_target = self._build_norm_target(
-                        p,
-                        gate,
-                        where,
-                        cutoff,
-                        cutoff_mode,
-                    )
+                    if use_symmray_auto_swap:
+                        p_target = self._build_symmray_auto_swap_target(
+                            p,
+                            gate,
+                            where,
+                            cutoff,
+                            cutoff_mode,
+                        )
+                    else:
+                        p_target = self._build_norm_target(
+                            p,
+                            gate,
+                            where,
+                            cutoff,
+                            cutoff_mode,
+                        )
                 else:
                     p_target = None
                 if track_norm_infidelity:
                     target_norm = self._canonical_span_norm(p_target, (xmin, xmax))
                 else:
                     target_norm = None
-                p.gate_nonlocal_(
-                    gate,
-                    where,
-                    dims=self._infer_gate_dims(gate, where),
-                    max_bond=self.chi,
-                    info=self.info_c,
-                    method="direct",
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                )
+                if use_symmray_auto_swap:
+                    self._apply_symmray_auto_swap_gate(
+                        p,
+                        gate,
+                        where,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        max_bond=self.chi,
+                    )
+                else:
+                    p.gate_nonlocal_(
+                        gate,
+                        where,
+                        dims=self._infer_gate_dims(gate, where),
+                        max_bond=self.chi,
+                        info=self.info_c,
+                        method="direct",
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                    )
                 idx += 1
                 advanced = 1
                 last_where = (xmin, xmax)
@@ -1536,7 +1578,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Apply gates with local SVD compression for nonlocal 2-site gates.
 
         Two-site gates are applied with ``contract="reduce-split"`` then
-        compressed on the local span to ``max_bond=self.chi``.
+        compressed on the local span to ``max_bond=self.chi``. Symmray-backed
+        MPS data use quimb's block-aware auto-swap split path instead, since
+        ``reduce-split`` loses Symmray fusion metadata in current quimb/Symmray.
         """
         p = self.p
         two_qubit_count = 0
@@ -1592,33 +1636,59 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
                 compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
                 xmin, xmax = sorted(where)
+                use_symmray_auto_swap = self._has_symmray_data(p)
                 if track_norm_infidelity:
                     self.canonize_mps(p, (xmin, xmax))
-                self._apply_gate(
-                    p,
-                    gate,
-                    where,
-                    contract="reduce-split",
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    inplace=True,
-                )
-                target_norm = (
-                    self._canonical_span_norm(p, (xmin, xmax))
-                    if track_norm_infidelity
-                    else None
-                )
-                p_target = p.copy() if track_infidelity else None
-                self.canonize_mps(p, (xmin, xmax))
+                if use_symmray_auto_swap:
+                    if track_norm_infidelity or track_infidelity:
+                        p_target = self._build_symmray_auto_swap_target(
+                            p,
+                            gate,
+                            where,
+                            cutoff,
+                            cutoff_mode,
+                        )
+                    else:
+                        p_target = None
+                    target_norm = (
+                        self._canonical_span_norm(p_target, (xmin, xmax))
+                        if track_norm_infidelity
+                        else None
+                    )
+                    self._apply_symmray_auto_swap_gate(
+                        p,
+                        gate,
+                        where,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        max_bond=self.chi,
+                    )
+                else:
+                    self._apply_gate(
+                        p,
+                        gate,
+                        where,
+                        contract="reduce-split",
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        inplace=True,
+                    )
+                    target_norm = (
+                        self._canonical_span_norm(p, (xmin, xmax))
+                        if track_norm_infidelity
+                        else None
+                    )
+                    p_target = p.copy() if track_infidelity else None
+                    self.canonize_mps(p, (xmin, xmax))
 
-                for i in range(xmax, xmin, -1):
-                    p.right_canonize_site(i, bra=None)
-                p.left_compress(
-                    start=xmin,
-                    stop=xmax,
-                    max_bond=self.chi,
-                    **compress_opts,
-                )
+                    for i in range(xmax, xmin, -1):
+                        p.right_canonize_site(i, bra=None)
+                    p.left_compress(
+                        start=xmin,
+                        stop=xmax,
+                        max_bond=self.chi,
+                        **compress_opts,
+                    )
 
                 idx += 1
                 advanced = 1
