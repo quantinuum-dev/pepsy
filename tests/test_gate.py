@@ -611,6 +611,38 @@ def test_gate_sequence_dispatches_to_bulk_helpers(monkeypatch, dim):
         assert has_inplace_kw is (dim == "1d")
 
 
+def test_gate_2d_3d_default_contract_is_reduce_split(monkeypatch):
+    """PEPS-like direct gate routing should default to quimb's reduce-split."""
+    calls = []
+
+    def _fake_gate_2d(tn, G_arg, where=None, **kwargs):
+        calls.append(("2d", where, kwargs.get("contract")))
+        return tn
+
+    def _fake_gate_3d(tn, G_arg, where=None, **kwargs):
+        calls.append(("3d", where, kwargs.get("contract")))
+        return tn
+
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_2d", _fake_gate_2d)
+    monkeypatch.setattr("pepsy.operators.gates._apply_gate_3d", _fake_gate_3d)
+
+    class _Dummy3DTN:  # pylint: disable=too-few-public-methods
+        Lx = 1
+        Ly = 1
+        Lz = 2
+
+    gate_op = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
+    peps = ps_to_peps(1, 2, dtype="complex128")
+    tn3d = _Dummy3DTN()
+
+    assert apply_gate(peps, gate_op, ((0, 0), (0, 1))) is peps
+    assert apply_gate(tn3d, gate_op, ((0, 0, 0), (0, 0, 1))) is tn3d
+    assert calls == [
+        ("2d", ((0, 0), (0, 1)), "reduce-split"),
+        ("3d", ((0, 0, 0), (0, 0, 1)), "reduce-split"),
+    ]
+
+
 @pytest.mark.parametrize("dim", ("1d", "2d", "3d"))
 def test_gate_sequence_dispatch_inplace_false_copies(monkeypatch, dim):
     """Bundled streams should copy TN first when ``inplace=False``."""
@@ -1071,6 +1103,7 @@ def test_build_mpo_from_gates_forwards_max_bond_to_gate(monkeypatch):
     where, kwargs = calls[0]
     assert where == (0, 2)
     assert kwargs["max_bond"] == 5
+    assert kwargs["contract"] == "reduce-split"
     assert "bond_dim" not in kwargs
     assert kwargs["ind_id"] == "k{}"
 
@@ -1123,6 +1156,7 @@ def test_build_pepo_from_gates_forwards_smart_max_bond_api(monkeypatch):
     where, kwargs = calls[0]
     assert where == ((0, 0), (1, 2))
     assert kwargs["max_bond"] == 6
+    assert kwargs["contract"] == "reduce-split"
     assert "bond_dim" not in kwargs
     assert kwargs["sequence"] == "auto"
     assert kwargs["ind_id"] == "k{},{}"

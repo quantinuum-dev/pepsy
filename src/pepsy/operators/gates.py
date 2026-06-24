@@ -1633,8 +1633,10 @@ def gate(tn, gates, where=None, which=None, **kwargs):
     when ``contract`` is ``"split"`` or ``"reduce-split"``. For other contract
     modes, the gate is applied directly to the requested endpoints.
     By default, 2D/3D routing uses ``sequence="auto"`` to choose a shortest
-    route with the smallest current virtual-bond bottleneck. Pass an explicit
-    deterministic sequence to force a particular route.
+    route with the smallest current virtual-bond bottleneck, and
+    ``contract="reduce-split"`` for quimb's reduced two-site split path. Pass
+    an explicit deterministic sequence or contract mode to force a particular
+    route or split strategy.
     The efficient routed pattern is::
 
         gate(
@@ -1730,7 +1732,7 @@ def gate(tn, gates, where=None, which=None, **kwargs):
 
         if arity == 2:
             opts_local = dict(opts)
-            opts_local.setdefault("contract", "split")
+            opts_local.setdefault("contract", "reduce-split")
             if which_payload is not None:
                 opts_local["ind_id"] = _ind_id_from_which(which_payload, 2)
             elif (which_default is not None) and ("ind_id" not in opts_local):
@@ -1748,7 +1750,7 @@ def gate(tn, gates, where=None, which=None, **kwargs):
 
         if arity == 3:
             opts_local = dict(opts)
-            opts_local.setdefault("contract", "split")
+            opts_local.setdefault("contract", "reduce-split")
             if which_payload is not None:
                 opts_local["ind_id"] = _ind_id_from_which(which_payload, 3)
             elif (which_default is not None) and ("ind_id" not in opts_local):
@@ -2203,7 +2205,7 @@ def _apply_gate_2d(
     bond_dim=None,
     max_bond=None,
     bra=False,
-    contract="split",
+    contract="reduce-split",
     tags=None,
     dtype="complex128",
     cutoff=1.0e-12,
@@ -2478,7 +2480,7 @@ def _apply_gate_3d(
     bond_dim=None,
     max_bond=None,
     bra=False,
-    contract="split",
+    contract="reduce-split",
     tags=None,
     dtype="complex128",
     cutoff=1.0e-12,
@@ -2692,7 +2694,7 @@ def build_pepo_from_gates(
     dtype="complex128",
     max_bond=16,
     sequence="auto",
-    contract="split",
+    contract="reduce-split",
     ind_id="k{},{}",
 ):
     """Build a PEPO from gate-style input on top of a PEPO identity.
@@ -2725,8 +2727,9 @@ def build_pepo_from_gates(
         2D SWAP-path preference for long-range two-site gates. Defaults to
         ``"auto"`` for the same lower-bond smart routing used by
         :func:`gate`.
-    contract : str, default="split"
-        Gate contraction mode.
+    contract : str, default="reduce-split"
+        Gate contraction mode. The default uses quimb's reduced two-site split
+        path, which is usually cheaper than ``"split"`` for PEPO/PEPS tensors.
     ind_id : str, default="k{},{}"
         Physical index format used for PEPO ket-family indices.
 
@@ -2806,7 +2809,7 @@ def build_mpo_from_gates(
     mpo_=None,
     dtype="complex128",
     max_bond=16,
-    contract="split",
+    contract="reduce-split",
     ind_id="k{}",
 ):
     """Build an MPO from gate-style input on top of an MPO identity.
@@ -2835,8 +2838,9 @@ def build_mpo_from_gates(
     max_bond : int, default=16
         Per-gate local split truncation cap and fallback construction
         compression cap.
-    contract : str, default="split"
-        Gate contraction mode.
+    contract : str, default="reduce-split"
+        Gate contraction mode. The default uses quimb's reduced two-site split
+        path, which is usually cheaper than ``"split"`` for MPO tensors.
     ind_id : str, default="k{}"
         Physical index format used for MPO ket-family indices.
 

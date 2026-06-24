@@ -689,7 +689,7 @@ class _SymState:
         self,
         gates,
         *,
-        contract="split",
+        contract="auto",
         max_bond=None,
         cutoff=1e-10,
         normalize=False,
@@ -702,6 +702,7 @@ class _SymState:
         """Apply a bundled local gate stream to this state."""
         target = self if inplace else self.copy()
         method = str(method).strip().lower()
+        contract_auto = contract is None or str(contract).strip().lower() == "auto"
         if max_bond is not None:
             compress_opts.setdefault("max_bond", max_bond)
         if cutoff is not None:
@@ -711,7 +712,8 @@ class _SymState:
             from ..operators import gate as pepsy_gate
 
             opts = dict(compress_opts)
-            opts.setdefault("contract", contract)
+            if not contract_auto:
+                opts.setdefault("contract", contract)
             opts.update({} if gate_kwargs is None else dict(gate_kwargs))
             target.network = pepsy_gate(
                 target.network,
@@ -752,7 +754,7 @@ class _SymState:
                 target.network,
                 gate,
                 inds,
-                contract=contract,
+                contract="split" if contract_auto else contract,
                 tags=[],
                 info=None,
                 inplace=True,
@@ -775,7 +777,7 @@ class _SymState:
         max_bond=None,
         cutoff=1e-10,
         normalize=None,
-        contract="split",
+        contract="auto",
         inplace=True,
         method="direct",
         gauges=None,

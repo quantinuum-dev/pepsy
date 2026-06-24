@@ -388,6 +388,33 @@ def test_sympeps_gate_stream_runs_pepsy_gate_and_gate_simple():
     assert np.isfinite(np.real(out_simple.norm()))
 
 
+def test_sympeps_gate_method_preserves_pepsy_gate_contract_default(monkeypatch):
+    """SymPEPS method='gate' should not override pepsy.gate's default."""
+    state = SymPEPS.for_model(
+        "heisenberg",
+        2,
+        2,
+        bond_dim=2,
+        seed=12,
+        dtype="complex128",
+    )
+    calls = []
+
+    def _fake_gate(tn, gates, **kwargs):
+        calls.append((gates, kwargs.copy()))
+        return tn
+
+    monkeypatch.setattr("pepsy.operators.gate", _fake_gate)
+
+    out = state.copy().apply_gates(
+        ((np.eye(2, dtype=np.complex128), ((0, 0),)),),
+        method="gate",
+    )
+
+    assert out.tn is not None
+    assert "contract" not in calls[0][1]
+
+
 def test_sympeps_raw_pepsy_gate_functions_accept_symmray_streams():
     """The plain gate functions should accept a SymGateStream directly."""
     state = SymPEPS.for_model("itf", 2, 2, bond_dim=2, seed=10, dtype="complex128")
