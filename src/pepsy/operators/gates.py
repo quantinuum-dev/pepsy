@@ -11,6 +11,7 @@ import warnings
 from itertools import count
 
 import autoray as ar
+import numpy as np
 import quimb as qu
 import quimb.tensor as qtn
 
@@ -1143,6 +1144,95 @@ def _format_ind_id(ind_id, site):
         ) from exc
 
 
+def _physical_index_for_site(tn, site, ind_id=None):
+    """Return the current physical index name for a lattice site."""
+    if ind_id is not None:
+        return _format_ind_id(ind_id, site)
+
+    site_ind = getattr(tn, "site_ind", None)
+    if callable(site_ind):
+        try:
+            if isinstance(site, (tuple, list)):
+                return site_ind(*site)
+            return site_ind(site)
+        except TypeError:
+            return site_ind(site)
+
+    if isinstance(site, (tuple, list)):
+        if len(site) == 2:
+            return _format_ind_id("k{},{}", site)
+        if len(site) == 3:
+            return _format_ind_id("k{},{},{}", site)
+    elif isinstance(site, Integral):
+        return _format_ind_id("k{}", site)
+
+    raise ValueError(
+        "Cannot infer physical index for routed SWAP. Pass ind_id explicitly "
+        "or use a tensor network with a site_ind method."
+    )
+
+
+def _physical_index_size_for_site(tn, site, ind_id=None):
+    """Return the live physical-index dimension for one lattice site."""
+    ix = _physical_index_for_site(tn, site, ind_id)
+
+    ind_size = getattr(tn, "ind_size", None)
+    if callable(ind_size):
+        try:
+            return int(ind_size(ix))
+        except (KeyError, TypeError, ValueError):
+            pass
+
+    tensor = _site_tensor_for_coord(tn, site)
+    if tensor is not None and ix in getattr(tensor, "inds", ()):
+        return _tensor_index_size(tensor, ix)
+
+    # Keep compatibility with generic or mocked TNs that cannot report physical
+    # index sizes. This matches the old routed-SWAP assumption while real PEPS
+    # and MPS objects take the dimension-aware path above.
+    return 2
+
+
+def _rectangular_swap_gate(dim_a, dim_b, *, dtype="complex128"):
+    """Build the exact SWAP from d_a x d_b to d_b x d_a."""
+    dim_a = int(dim_a)
+    dim_b = int(dim_b)
+    if dim_a <= 0 or dim_b <= 0:
+        raise ValueError("SWAP dimensions must be positive integers.")
+
+    swap_gate = np.zeros((dim_b, dim_a, dim_a, dim_b), dtype=dtype)
+    for ia in range(dim_a):
+        for ib in range(dim_b):
+            swap_gate[ib, ia, ia, ib] = 1
+    return swap_gate
+
+
+def _convert_internal_gate_to_backend(gate, inferred_converter):
+    """Best-effort conversion for internally generated exact gates."""
+    if inferred_converter is None:
+        return gate
+    try:
+        return inferred_converter(gate)
+    except (TypeError, ValueError):
+        return gate
+
+
+def _swap_gate_for_site_pair(
+    tn,
+    site_a,
+    site_b,
+    *,
+    ind_id=None,
+    dtype="complex128",
+    inferred_converter=None,
+):
+    """Return a SWAP tensor matching the sites' current physical dimensions."""
+    dim_a = _physical_index_size_for_site(tn, site_a, ind_id)
+    dim_b = _physical_index_size_for_site(tn, site_b, ind_id)
+    swap_gate = _rectangular_swap_gate(dim_a, dim_b, dtype=dtype)
+    return _convert_internal_gate_to_backend(swap_gate, inferred_converter)
+
+
 def _normalize_gate_which(which):
     """Normalize an upper/lower layer selector."""
     if which is None:
@@ -1536,8 +1626,9 @@ def gate(tn, gates, where=None, which=None, **kwargs):
     gate tensors. Provide TN and gate tensors on compatible backends explicitly.
     For one-site gates, ``contract`` is normalized to a boolean mode:
     non-boolean values are treated as ``True``.
-    Internal SWAP tensors used for long-range routing are backend-aligned from
-    the TN sample data when available.
+    Internal SWAP tensors used for long-range routing infer the current
+    physical dimensions of each adjacent pair and are backend-aligned from the
+    TN sample data when available.
     For nonlocal two-site gates, long-range SWAP routing is used in 1D/2D/3D
     when ``contract`` is ``"split"`` or ``"reduce-split"``. For other contract
     modes, the gate is applied directly to the requested endpoints.
@@ -1717,7 +1808,8 @@ def gate_simple(
       (works for 1D / 2D / 3D ``where`` coordinates).
     * ``which``/``ind_id`` selection for vector-like networks whose physical
       site-index family is not the default ``k...`` family.
-    * Backend alignment of internal SWAP tensors with the TN sample data.
+    * Dimension-aware, backend-aligned internal SWAP tensors for long-range
+      routing through mixed physical dimensions.
     * Optional out-of-place semantics via ``inplace=False``.
 
     The ``gauges`` dictionary is mutated in place by ``gate_simple_`` and is
@@ -1966,19 +2058,15 @@ def _gate_simple_one_with_current_site_ind_id(
         )
         return tn_work
 
-    # Non-adjacent: route through a SWAP chain. Align the SWAP tensor to the
-    # TN sample backend so the gate_simple_ call sees consistent dtypes.
-    swap_gate = qu.swap(dim=2, dtype="complex128").reshape(2, 2, 2, 2)
+    # Non-adjacent: route through a SWAP chain. Each SWAP is built from the
+    # live physical dimensions because routed mixed-dimensional sites exchange
+    # their physical index sizes as they move along the path.
     backend_sample = resolve_backend_sample_data_from_tn(tn_work)
     inferred_converter = infer_backend_converter_from_sample(
         backend_sample,
         cast_complex_to_real=True,
     )
-    if inferred_converter is not None:
-        try:
-            swap_gate = inferred_converter(swap_gate)
-        except (TypeError, ValueError):
-            pass
+    swap_ind_id = getattr(tn_work, "site_ind_id", None)
 
     ndim = len(site_a) if isinstance(site_a, (tuple, list)) else 1
     if ndim == 1:
@@ -2016,6 +2104,14 @@ def _gate_simple_one_with_current_site_ind_id(
 
     # Forward SWAPs.
     for pair in swaps:
+        swap_gate = _swap_gate_for_site_pair(
+            tn_work,
+            pair[0],
+            pair[1],
+            ind_id=swap_ind_id,
+            dtype="complex128",
+            inferred_converter=inferred_converter,
+        )
         tn_work.gate_simple_(
             swap_gate, where=pair, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
@@ -2031,6 +2127,14 @@ def _gate_simple_one_with_current_site_ind_id(
 
     # Reverse SWAPs.
     for pair in reversed(swaps):
+        swap_gate = _swap_gate_for_site_pair(
+            tn_work,
+            pair[0],
+            pair[1],
+            ind_id=swap_ind_id,
+            dtype="complex128",
+            inferred_converter=inferred_converter,
+        )
         tn_work.gate_simple_(
             swap_gate, where=pair, gauges=gauges,
             renorm=renorm, smudge=smudge, inplace=True,
@@ -2199,13 +2303,6 @@ def _apply_gate_2d(
         backend_sample,
         cast_complex_to_real=True,
     )
-    swap = qu.swap(dim=2, dtype=dtype).reshape(2, 2, 2, 2)
-    if inferred_converter is not None:
-        try:
-            swap = inferred_converter(swap)
-        except (TypeError, ValueError):
-            pass
-
     lx_use = Lx
     ly_use = Ly
     if cyclic and (lx_use is None or ly_use is None):
@@ -2234,6 +2331,14 @@ def _apply_gate_2d(
         x_, y_ = pair
         i_, j_ = x_
         m_, n_ = y_
+        swap = _swap_gate_for_site_pair(
+            peps,
+            x_,
+            y_,
+            ind_id=ind_id,
+            dtype=dtype,
+            inferred_converter=inferred_converter,
+        )
         qtn.tensor_network_gate_inds(
             peps,
             swap,
@@ -2267,6 +2372,14 @@ def _apply_gate_2d(
         x_, y_ = pair
         i_, j_ = x_
         m_, n_ = y_
+        swap = _swap_gate_for_site_pair(
+            peps,
+            x_,
+            y_,
+            ind_id=ind_id,
+            dtype=dtype,
+            inferred_converter=inferred_converter,
+        )
         qtn.tensor_network_gate_inds(
             peps,
             swap,
@@ -2463,13 +2576,6 @@ def _apply_gate_3d(
         backend_sample,
         cast_complex_to_real=True,
     )
-    swap = qu.swap(dim=2, dtype=dtype).reshape(2, 2, 2, 2)
-    if inferred_converter is not None:
-        try:
-            swap = inferred_converter(swap)
-        except (TypeError, ValueError):
-            pass
-
     lx_use = Lx
     ly_use = Ly
     lz_use = Lz
@@ -2501,6 +2607,14 @@ def _apply_gate_3d(
         x_, y_ = pair
         i_, j_, k_ = x_
         m_, n_, p_ = y_
+        swap = _swap_gate_for_site_pair(
+            tn,
+            x_,
+            y_,
+            ind_id=ind_id,
+            dtype=dtype,
+            inferred_converter=inferred_converter,
+        )
         qtn.tensor_network_gate_inds(
             tn,
             swap,
@@ -2534,6 +2648,14 @@ def _apply_gate_3d(
         x_, y_ = pair
         i_, j_, k_ = x_
         m_, n_, p_ = y_
+        swap = _swap_gate_for_site_pair(
+            tn,
+            x_,
+            y_,
+            ind_id=ind_id,
+            dtype=dtype,
+            inferred_converter=inferred_converter,
+        )
         qtn.tensor_network_gate_inds(
             tn,
             swap,
@@ -2842,13 +2964,6 @@ def _apply_gate_1d(
                 backend_sample,
                 cast_complex_to_real=True,
             )
-            swap = qu.swap(dim=2, dtype=dtype).reshape(2, 2, 2, 2)
-            if inferred_converter is not None:
-                try:
-                    swap = inferred_converter(swap)
-                except (TypeError, ValueError):
-                    pass
-
             path_pairs = list(gen_long_range_swap_path_1d(x, y))
             *swaps, final = path_pairs
             _maybe_canonize_path(
@@ -2860,6 +2975,14 @@ def _apply_gate_1d(
             )
 
             for i_, j_ in swaps:
+                swap = _swap_gate_for_site_pair(
+                    tn,
+                    i_,
+                    j_,
+                    ind_id=ind_id,
+                    dtype=dtype,
+                    inferred_converter=inferred_converter,
+                )
                 tn = qtn.tensor_network_gate_inds(
                     tn,
                     swap,
@@ -2884,6 +3007,14 @@ def _apply_gate_1d(
             )
 
             for i_, j_ in reversed(swaps):
+                swap = _swap_gate_for_site_pair(
+                    tn,
+                    i_,
+                    j_,
+                    ind_id=ind_id,
+                    dtype=dtype,
+                    inferred_converter=inferred_converter,
+                )
                 tn = qtn.tensor_network_gate_inds(
                     tn,
                     swap,

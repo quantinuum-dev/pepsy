@@ -1,7 +1,7 @@
 # PLAN.md — Belief Propagation, quimb integration, and Symmetric Tensor Networks
 
 Status: draft / living document
-Last updated: 2026-06-22
+Last updated: 2026-06-24
 Owners: pepsy maintainers + coding agents
 
 This document plans three related workstreams to extend `pepsy`:
@@ -158,6 +158,26 @@ Goal: avoid reinventing BP / gauging / contraction; wrap and adapt quimb.
 - Ensure pepsy's `cotengra`-based contraction optimizers (`build_optimizer`,
   `contraction_opt="auto-hq"`) are reused for the loop-excitation sub-networks.
 - Do **not** add seed kwargs to optimizer builders (tests assert their absence).
+
+### B0. Gate-routing audit: dimension-aware SWAPs
+
+Status: implemented as a small prerequisite for Tensy PF PEPS replay.
+
+- Finding: quimb's adjacent `tensor_network_gate_inds(..., contract="split")`,
+  `tensor_network_gate_inds(..., contract="reduce-split")`, and
+  `gate_simple_` accept rectangular two-site tensors whose output physical
+  dimensions differ from their input dimensions. That is enough to represent a
+  mixed-dimension SWAP with shape `(d_b, d_a, d_a, d_b)`.
+- Requirement: pepsy's long-range `gate` / `gate_simple` SWAP routing must infer
+  the **current** physical index dimensions before each forward and reverse
+  SWAP. A single cached `qu.swap(dim=2)` is only valid for binary sites.
+- Scope: keep the public API stable; make dimension-aware SWAPs the internal
+  default for 1D/2D/3D routed `split` / `reduce-split` paths and simple-update
+  routing. For binary sites this is behavior-preserving.
+- Validation target: mixed physical dimensions such as Tensy PF fused sites
+  (`dim=4` frame, `dim=2` measurement, and possible larger selector sites)
+  should route through spectator sites and swap back to the original layout for
+  both direct split/reduce-split and simple-update replay.
 
 Deliverable: a short `learning/quimb.md` mapping "pepsy concept → quimb API",
 plus adapters under the new contraction subpackage.

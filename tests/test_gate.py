@@ -24,6 +24,47 @@ from pepsy.operators.gates import (
 )
 
 
+def _dense_numpy(tn, out_inds):
+    """Contract a tiny test TN without invoking the cotengra planner."""
+    alphabet = iter("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    symbol_map = {}
+    specs = []
+    arrays = []
+    for tensor in tn.tensors:
+        spec = []
+        for ind in tensor.inds:
+            if ind not in symbol_map:
+                symbol_map[ind] = next(alphabet)
+            spec.append(symbol_map[ind])
+        specs.append("".join(spec))
+        arrays.append(np.asarray(tensor.data))
+    output = "".join(symbol_map[ind] for ind in out_inds)
+    return np.einsum(",".join(specs) + "->" + output, *arrays)
+
+
+def _mixed_dim_1x3_peps(seed=7):
+    rng = np.random.default_rng(seed)
+    arrays = [
+        [
+            rng.normal(size=(1, 2)),
+            rng.normal(size=(1, 1, 3)),
+            rng.normal(size=(1, 4)),
+        ]
+    ]
+    return qtn.PEPS(arrays, shape="urdlp")
+
+
+def _random_endpoint_gate(seed=8):
+    rng = np.random.default_rng(seed)
+    return rng.normal(size=(2, 4, 2, 4))
+
+
+def _direct_endpoint_action(peps, gate):
+    inds = ("k0,0", "k0,1", "k0,2")
+    state = _dense_numpy(peps, inds).reshape(2, 3, 4)
+    return np.einsum("xzab,ayb->xyz", gate, state)
+
+
 class _SmartSwapFakeTensor:  # pylint: disable=too-few-public-methods
     def __init__(self, inds, sizes):
         self.inds = tuple(inds)
@@ -373,6 +414,55 @@ def test_apply_2dtn_two_site_nearest_inplace():
     gate = np.eye(4, dtype=np.complex128).reshape(2, 2, 2, 2)
     out = apply_gate(peps, gate, ((0, 0), (0, 1)), cutoff=1e-12)
     assert out is peps
+
+
+@pytest.mark.parametrize("contract", ["split", "reduce-split"])
+def test_apply_2dtn_routes_mixed_physical_dimensions_exactly(contract):
+    """Routed direct gates should use live mixed physical dimensions for SWAPs."""
+    peps = _mixed_dim_1x3_peps()
+    gate = _random_endpoint_gate()
+    expected = _direct_endpoint_action(peps, gate)
+
+    out = apply_gate(
+        peps,
+        gate,
+        ((0, 0), (0, 2)),
+        contract=contract,
+        cutoff=0.0,
+        sequence="x_then_y",
+    )
+
+    actual = _dense_numpy(out, ("k0,0", "k0,1", "k0,2")).reshape(2, 3, 4)
+    assert out is peps
+    assert [out.phys_dim(0, j) for j in range(3)] == [2, 3, 4]
+    assert np.allclose(actual, expected, atol=1.0e-10, rtol=1.0e-10)
+
+
+def test_gate_simple_routes_mixed_physical_dimensions_exactly():
+    """Simple-update routing should swap mixed dimensions and swap back."""
+    peps = _mixed_dim_1x3_peps(seed=11)
+    gate = _random_endpoint_gate(seed=12)
+    expected = _direct_endpoint_action(peps, gate)
+    gauges = {}
+
+    out = gate_simple(
+        peps,
+        gate,
+        where=((0, 0), (0, 2)),
+        gauges=gauges,
+        cutoff=0.0,
+        renorm=False,
+        sequence="x_then_y",
+    )
+
+    out_with_gauges = out.copy()
+    out_with_gauges.gauge_simple_insert(gauges)
+    actual = _dense_numpy(out_with_gauges, ("k0,0", "k0,1", "k0,2")).reshape(
+        2, 3, 4
+    )
+    assert out is peps
+    assert [out.phys_dim(0, j) for j in range(3)] == [2, 3, 4]
+    assert np.allclose(actual, expected, atol=1.0e-10, rtol=1.0e-10)
 
 
 def test_apply_2dtn_invalid_where_raises():
