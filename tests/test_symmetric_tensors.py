@@ -11,16 +11,140 @@ from pepsy.tensors import (
     SymMPS,
     SymPEPS,
     default_physical_sectors,
+    draw_symmray_blocks,
+    draw_symmray_mps,
+    draw_symmray_peps,
     sector_index_map,
     site_charge_alternating,
     site_charge_from_map,
     site_charge_from_occupations,
     site_charge_uniform,
+    symmray_block_summary,
+    symmray_mps_summary,
+    symmray_peps_summary,
     symm_operator_from_dense,
 )
 
 
 sr = pytest.importorskip("symmray")
+
+
+def test_symmray_block_summary_and_schematic_for_z2_gate():
+    """Symmray gate helpers should expose and draw block-sector structure."""
+    state = SymMPS.random(
+        4,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations([0] * 4),
+        bond_dim=2,
+        seed=1,
+        dtype="complex128",
+    )
+    rz_gate = state.operator_from_dense(pepsy.rz(0.1), charge=0, sites=1)
+
+    summary = symmray_block_summary(rz_gate)
+
+    assert summary["shape"] == (2, 2)
+    assert summary["num_blocks"] == 2
+    assert summary["stored_size"] == 2
+    assert summary["dense_size"] == 4
+    assert [block["sector"] for block in summary["blocks"]] == [(0, 0), (1, 1)]
+    assert [block["shape"] for block in summary["blocks"]] == [(1, 1), (1, 1)]
+    assert summary["indices"][0]["direction"] == "out"
+    assert summary["indices"][1]["direction"] == "in"
+
+    pytest.importorskip("matplotlib")
+    drawing, drawn_summary = draw_symmray_blocks(
+        rz_gate,
+        title="Z2 RZ gate",
+        return_summary=True,
+    )
+    assert drawing is not None
+    assert drawn_summary["blocks"] == summary["blocks"]
+
+
+def test_symmray_mps_summary_and_schematic_for_z2_chain():
+    """Symmray MPS drawings should expose site blocks and bond-sector metadata."""
+    state = SymMPS.random(
+        4,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations([0] * 4),
+        bond_dim=2,
+        seed=2,
+        dtype="complex128",
+    )
+
+    summary = symmray_mps_summary(state.tn)
+
+    assert summary["num_sites"] == 4
+    assert summary["max_bond_dim"] == 2
+    assert summary["max_bond_sectors"] == 2
+    assert summary["total_stored_size"] == 12
+    assert summary["total_dense_size"] == 24
+    assert summary["charge_total"] == summary["total_charge"]
+    assert summary["Q_total"] == summary["total_parity"]
+    assert summary["tensors"][0]["site"] == 0
+    assert summary["tensors"][0]["physical"]["chargemap"] == {0: 1, 1: 1}
+    assert summary["tensors"][0]["physical"]["direction"] in {"in", "out"}
+    assert summary["tensors"][1]["left_bond"]["between"] == (0, 1)
+    assert summary["bonds"][0]["chargemap"] == {0: 1, 1: 1}
+    assert summary["bonds"][0]["left_direction"] in {"in", "out"}
+    assert summary["bonds"][0]["right_direction"] in {"in", "out"}
+
+    pytest.importorskip("matplotlib")
+    drawing, drawn_summary = draw_symmray_mps(
+        state.tn,
+        title="Z2 MPS",
+        return_summary=True,
+    )
+    assert hasattr(drawing, "fig")
+    assert hasattr(drawing, "ax")
+    assert drawn_summary["bonds"] == summary["bonds"]
+
+
+def test_symmray_peps_summary_and_schematic_for_z2_grid():
+    """Symmray PEPS drawings should expose grid bonds and block-sector metadata."""
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations({(i, j): 0 for i in range(2) for j in range(2)}),
+        bond_dim=2,
+        seed=3,
+        dtype="complex128",
+    )
+
+    summary = symmray_peps_summary(state)
+
+    assert summary["Lx"] == 2
+    assert summary["Ly"] == 2
+    assert summary["num_sites"] == 4
+    assert len(summary["bonds"]) == 4
+    assert summary["max_bond_dim"] == 2
+    assert summary["max_bond_sectors"] == 2
+    assert summary["total_stored_size"] == 16
+    assert summary["total_dense_size"] == 32
+    assert summary["charge_total"] == summary["total_charge"]
+    assert summary["Q_total"] == summary["total_parity"]
+    assert summary["tensors"][0]["site"] == (0, 0)
+    assert summary["tensors"][0]["physical"]["chargemap"] == {0: 1, 1: 1}
+    assert summary["tensors"][0]["physical"]["direction"] in {"in", "out"}
+    assert summary["tensors"][0]["bonds"]["right"]["between"] == ((0, 0), (0, 1))
+    assert summary["tensors"][0]["bonds"]["down"]["between"] == ((0, 0), (1, 0))
+    assert summary["bonds"][0]["site_a_direction"] in {"in", "out"}
+    assert summary["bonds"][0]["site_b_direction"] in {"in", "out"}
+
+    pytest.importorskip("matplotlib")
+    drawing, drawn_summary = draw_symmray_peps(
+        state,
+        title="Z2 PEPS",
+        return_summary=True,
+    )
+    assert hasattr(drawing, "fig")
+    assert hasattr(drawing, "ax")
+    assert drawn_summary["bonds"] == summary["bonds"]
 
 
 def _square_lattice_edges(Lx, Ly):

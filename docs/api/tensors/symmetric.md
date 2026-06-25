@@ -112,6 +112,93 @@ peps.measure(
 )
 ```
 
+## Inspecting Symmray blocks
+
+Use ``symmray_block_summary`` to inspect the charge sectors and stored block
+dimensions of any Symmray-backed local operator or tensor. Use
+``draw_symmray_blocks`` for a lightweight ``quimb.schematic`` drawing of the
+same information, including the stored-vs-dense entry count.
+
+For whole MPS states, use ``symmray_mps_summary`` and ``draw_symmray_mps``. For
+PEPS, use ``symmray_peps_summary`` and ``draw_symmray_peps``. These expose the
+scientific structure that is usually hidden in a dense drawing: each site
+tensor's block count, physical charge sectors, virtual-bond sector maps, and
+aggregate block-sparse storage density. The default schematics follow the
+compact quimb style with tensor nodes, physical legs, and bond arrows; labels
+and diagnostics are opt-in.
+
+In the detailed drawing mode, ``T_i`` is the site tensor, ``q`` is that tensor's
+Symmray charge, ``B`` is the number of stored block sectors, ``e_i`` is a
+virtual bond, and ``q_e``/``q_p`` are the virtual/physical charge-sector maps.
+Bond labels include the two local index orientations, for example
+``out->in``, so the charge-flow convention is visible on the same line as the
+bond dimension. Diagnostics include both ``charge_total`` and ``Q_total``; for
+``Z2`` states ``Q_total`` is reduced modulo two. Colored block tiles are
+available with ``show_blocks=True`` for a focused block-sector view, but the
+overview diagrams leave them off by default and show ``B`` instead.
+The MPS/PEPS summary dictionaries also expose ``charge_total`` and ``Q_total``
+alongside the legacy ``total_charge`` key.
+
+```python
+psi = py.SymMPS.for_model(
+    "itf",
+    4,
+    bond_dim=2,
+    site_charge=py.site_charge_from_occupations([0] * 4),
+)
+rz_gate = psi.operator_from_dense(py.rz(0.1), charge=0, sites=1)
+
+summary = py.symmray_block_summary(rz_gate)
+summary["blocks"]
+
+gate_drawing = py.draw_symmray_blocks(rz_gate, title="Z2 RZ gate")
+display(gate_drawing.fig)
+
+mps_summary = py.symmray_mps_summary(psi.tn)
+mps_summary["bonds"]
+
+mps_drawing = py.draw_symmray_mps(psi.tn, title="Symmray ITF MPS")
+display(mps_drawing.fig)
+
+detailed_mps_drawing = py.draw_symmray_mps(
+    psi.tn,
+    title="Symmray ITF MPS with dimensions",
+    show_bond_labels=True,
+    show_phys_labels=True,
+    show_diagnostics=True,
+)
+display(detailed_mps_drawing.fig)
+
+peps = py.SymPEPS.for_model("itf", 3, 3, bond_dim=2)
+peps_summary = py.symmray_peps_summary(peps)
+peps_summary["bonds"]
+
+peps_drawing = py.draw_symmray_peps(
+    peps,
+    title="Symmray ITF PEPS",
+    show_bond_labels=True,
+    show_phys_labels=True,
+    show_diagnostics=True,
+)
+display(peps_drawing.fig)
+```
+
+At the end of a Symmray ``MpsOptimizer`` notebook, pass the optimized chain
+directly:
+
+```python
+opt = py.MpsOptimizer(psi.tn.copy(), gates, chi=8, mode="mpo")
+opt.run(progbar=False)
+
+py.draw_symmray_mps(
+    opt.p,
+    title="Final Symmray ITF MPS",
+    center="middle",
+    show_bond_labels=True,
+    show_diagnostics=True,
+)
+```
+
 ```{eval-rst}
 .. automodule:: pepsy.tensors.symmetric
    :members:

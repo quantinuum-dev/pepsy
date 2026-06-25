@@ -27,10 +27,11 @@ _EXPECTED_IN_ALL = [
     "FDSolver", "MpsOptimizer", "MpoOptimizer", "PepsOptimizer", "PEPSSampleResult",
     "PepsBpSampler", "MpsSampler", "MpsSampleResult", "VecSampler", "gate", "tn_fidelity", "tn_norm",
     "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
-    "default_physical_sectors", "sector_index_map",
+    "default_physical_sectors", "draw_symmray_blocks", "draw_symmray_mps", "draw_symmray_peps",
+    "sector_index_map",
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
-    "symm_operator_from_dense",
+    "symmray_block_summary", "symmray_mps_summary", "symmray_peps_summary", "symm_operator_from_dense",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
@@ -75,10 +76,11 @@ _CALLABLE_EXPORTS = [
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "SweepOptimizer",
     "FDSolver", "MpsOptimizer", "MpoOptimizer", "PepsOptimizer", "PEPSSampleResult", "PepsBpSampler",
     "tn_fidelity", "tn_norm", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
-    "default_physical_sectors", "sector_index_map",
+    "default_physical_sectors", "draw_symmray_blocks", "draw_symmray_mps", "draw_symmray_peps",
+    "sector_index_map",
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
-    "symm_operator_from_dense",
+    "symmray_block_summary", "symmray_mps_summary", "symmray_peps_summary", "symm_operator_from_dense",
 ]
 
 _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
