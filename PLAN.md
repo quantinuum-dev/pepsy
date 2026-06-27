@@ -1,10 +1,10 @@
-# PLAN.md — Belief Propagation, quimb integration, and Symmetric Tensor Networks
+# PLAN.md — BP, quimb, Symmetric TN, and Differentiable Truncations
 
 Status: draft / living document
 Last updated: 2026-06-24
 Owners: pepsy maintainers + coding agents
 
-This document plans three related workstreams to extend `pepsy`:
+This document plans four related workstreams to extend `pepsy`:
 
 1. **BP** — Belief Propagation (BP) contraction and gauging, plus the *loop
    series / loop cluster expansion* corrections that turn BP from an
@@ -15,10 +15,15 @@ This document plans three related workstreams to extend `pepsy`:
 3. **Symmetric TN** — block-sparse abelian-symmetric and fermionic tensors via
    [`symmray`](https://github.com/jcmgray/symmray), so PEPS/MPS workflows can
    exploit U(1)/Z2 symmetries and fermionic statistics.
+4. **Differentiable truncations** — implement stable, efficient AD rules for
+   truncated SVD/eigendecomposition/QR-style decompositions, with the
+   Francuz-Schuch-Vanhecke missing truncated-spectrum term and a clear split
+   between "full SVD then truncate" and true low-rank `svds` paths.
 
-These three are deliberately grouped: `quimb` is the substrate, BP is the new
-algorithmic layer, and `symmray` provides the symmetric array backend that both
-can run on top of (all three share the same author/ecosystem, so they compose).
+These are deliberately grouped: `quimb` is the substrate, BP is the new
+algorithmic layer, `symmray` provides the symmetric array backend that both can
+run on top of, and differentiable truncations make gradient-based PEPS/MPS/MPO
+optimization reliable across all of those paths.
 
 Companion folders:
 - `history/` — session-to-session hand-off notes for agents (read on start,
@@ -67,6 +72,31 @@ Companion folders:
   `ham_tfim_from_edges`, `ham_heisenberg_from_edges`, `ham_fermi_hubbard_*`.
   Reference: Gao et al., *Phys. Rev. Research* 7, 023193 (2025).
 
+### Stable AD for truncated decompositions
+- **Stable and efficient differentiation of tensor network algorithms** —
+  Francuz, Schuch, Vanhecke, *Phys. Rev. Research* 7, 013237 (2025).
+  DOI: https://doi.org/10.1103/PhysRevResearch.7.013237 ·
+  arXiv: https://arxiv.org/abs/2311.11894
+  - Core message for `pepsy`: differentiating a true truncated SVD is not the
+    same as differentiating a full SVD and then slicing. The true truncated
+    pullback contains an extra term from the discarded spectrum; older AD
+    treatments effectively assumed that discarded spectrum was zero.
+  - If the forward pass already computes a full SVD and only then truncates,
+    ordinary full-SVD AD plus separate slicing is a valid baseline. The paper's
+    efficient rule matters when the forward pass only computes the kept
+    subspace (`svds`/iterative/randomized low-rank SVD), or when memory and
+    large matrix dimensions make full SVD undesirable.
+  - Gauge-dependent singular-vector losses are ill-conditioned near
+    degeneracy. Tests must use gauge/phase-invariant objectives, or explicitly
+    remove the gauge component of the cotangents.
+- **TensorKit / MatrixAlgebraKit reference implementation**
+  - Current TensorKit moved factorization pullbacks into
+    `src/factorizations/pullbacks.jl` and delegates dense block pullbacks to
+    MatrixAlgebraKit, rather than keeping the old
+    `ext/TensorKitChainRulesCoreExt/factorizations.jl` entry point.
+  - Useful design cue for `pepsy`: keep tensor wrappers thin and put the AD
+    rules at the array/decomposition layer.
+
 ---
 
 ## 1. Where this lands in pepsy
@@ -77,7 +107,7 @@ Current relevant architecture (do not break these public entry points):
 - `pepsy.tensors`: `OneDMap`, product/identity constructors, contraction
   optimizers, observables, `tn_norm`, `tn_fidelity`.
 - `pepsy.backends`: backend inference/conversion + torch/JAX/CuPy linalg
-  registration.
+  registration, including custom linalg AD rules.
 - `pepsy.operators`, `pepsy.solvers`, `pepsy.optimizers`, `pepsy.sampling`.
 
 BP is conceptually a *peer* of boundary-MPS contraction: another way to
@@ -95,6 +125,22 @@ Symmetric tensors are a *backend/array* concern, not an algorithm:
 - `src/pepsy/symmetry/` (thin) — helpers to build symmray-backed PEPS/MPS,
   validate symmetry tags, and bridge pepsy lattice tags (`X{i}`, `Y{j}`, `I…`,
   `k…`/`b…` legs) to symmray index `dual`/charge conventions.
+
+Differentiable truncations are also a *backend/decomposition* concern:
+- The existing `pepsy.backends.linalg_torch.SVD` registers a stabilized full
+  SVD via `autoray` as `torch.linalg.svd`. This helps full-SVD AD, but by
+  itself does not implement the truncated-SVD pullback from the paper.
+- Installed `quimb` routes tensor splits through `quimb.tensor.decomp.array_split`.
+  The default `svd_truncated` currently computes `xp.linalg.svd(x)` and then
+  slices/trims the factors in `_trim_and_renorm_svd_result`. Thus:
+  - For dense full-SVD paths, `pepsy` can continue to register full-SVD AD and
+    treat truncation as an independent slice.
+  - For efficient low-rank paths, `pepsy` needs a new split driver or adapter
+    that exposes a custom VJP/JVP for `svds`-style truncated factors.
+- Primary call sites that should benefit without scattered rewrites:
+  `Tensor.split`/`tensor_network_gate_inds`, `compress_between`,
+  `compress_all_`, MPS/MPO `left_compress`, PEPS warmstarts, and boundary
+  fitting canonicalization/compression.
 
 Keep the public API lazy and centralized in `src/pepsy/__init__.py`
 (`_SYMBOL_MODULES`, `_MODULE_EXPORTS`, `__all__`) per AGENTS.md.
@@ -220,7 +266,109 @@ Goal: let PEPS/MPS workflows carry abelian symmetry and fermionic statistics.
 
 ---
 
-## 5. Milestones (suggested order)
+## 5. Workstream D — Differentiable truncated SVD / QR / eig
+
+Goal: make the decomposition layer usable for gradient optimization when
+truncation is real, not just a post-hoc slice of a full decomposition.
+
+### D0. Audit and terminology
+- Name the modes explicitly:
+  - `full_svd_slice`: compute full/compact SVD, then slice. Existing full SVD
+    AD is acceptable here and should remain the default baseline.
+  - `truncated_svd_ad`: compute only the kept subspace and use the paper's
+    truncated pullback. This is the efficient path Bram described in email.
+  - `stable_qr`: QR/LQ backward with phase/gauge stabilization, useful for
+    canonicalization but not a substitute for the missing SVD truncation term.
+- Document which `quimb` methods map to each mode:
+  - `method="svd"` in current `quimb`: full SVD then trim.
+  - `method="svds"`, `"isvd"`, `"rsvd"`: low-rank candidates, but their AD
+    behavior is not automatically correct just because the forward is fast.
+  - `method="qr"`/`"lq"`: no singular-value truncation; useful for stable
+    canonicalization and gauge fixing.
+
+### D1. Centralize decomposition policy
+- Add a small `pepsy.backends.decompositions` or `pepsy.backends.truncation`
+  module that owns:
+  - registration of full torch/JAX SVD/QR rules;
+  - optional registration of a `quimb` split driver such as
+    `method="svd:pepsy-trunc-ad"`;
+  - a context manager/config flag for choosing `full_svd_slice` vs
+    `truncated_svd_ad`.
+- Prefer registering a new `quimb.tensor.decomp.register_split_driver(...)`
+  driver over changing every optimizer call site. Existing pepsy calls already
+  pass `max_bond`, `cutoff`, and `cutoff_mode` through Quimb.
+- Keep the public optimizer APIs stable. Add keyword plumbing only where users
+  already pass decomposition/compression options; otherwise default to current
+  behavior.
+
+### D2. Implement the torch prototype first
+- Start with torch because `PepsOptimizer` already has
+  `register_torch_svd=True` and `pepsy.backends.linalg_torch` already contains
+  custom SVD/QR autograd functions.
+- Implement a custom `torch.autograd.Function` for true truncated SVD:
+  - forward accepts matrix `A`, target rank/cutoff policy, and method selector;
+  - returns `U_k`, `S_k`, `Vh_k` and enough metadata for backward;
+  - backward computes the paper's truncated-SVD VJP, including the discarded
+    spectrum contribution;
+  - for the first version, allow an internal full SVD in backward to verify the
+    formula, then replace the expensive part with Sylvester/linear-solve forms
+    when the tests pass.
+- Handle adaptive cutoff carefully:
+  - the selected rank is piecewise constant and non-differentiable at threshold
+    crossings;
+  - stop gradients through the rank decision and test away from exact cutoff
+    crossings;
+  - record selected rank and discarded norm in `info` for diagnostics.
+
+### D3. JAX and backend follow-up
+- After torch validation, implement the same primitive as a JAX `custom_vjp`.
+- Do not promise NumPy gradients. NumPy remains the numerical/reference path.
+- Symmray/block-sparse support should reuse the same array-level primitive per
+  dense block, following the TensorKit/MatrixAlgebraKit design rather than
+  writing tensor-object-specific AD rules.
+
+### D4. Integrate with Quimb without fighting Quimb
+- Register a new split driver that mirrors `quimb.tensor.decomp.svd_truncated`
+  but calls the pepsy AD primitive instead of plain `xp.linalg.svd`.
+- Respect Quimb's absorb modes (`both`, `left`, `right`, `None`) by applying
+  absorption after the custom primitive, just like Quimb's `_do_absorb`.
+- Keep `info["error"]` semantics compatible with Quimb's current SVD driver.
+- For call sites that cannot select `method=...`, add narrowly scoped adapter
+  kwargs in pepsy optimizers, e.g. `decomp_method="auto"` or
+  `compression_method="svd:pepsy-trunc-ad"`, defaulting to existing Quimb
+  behavior.
+
+### D5. Numerical tests
+- Unit-level gradient checks:
+  - small complex matrices with fixed rank `k`; compare VJP to high-order
+    finite differences of gauge/phase-invariant scalar losses;
+  - repeated or near-repeated singular values; verify no blow-up beyond the
+    intended regularization;
+  - adaptive cutoff away from threshold crossings; verify selected-rank
+    diagnostics and gradients.
+- Integration checks:
+  - MPS/MPO `mode="svd"` gate update with torch tensors and `max_bond < full`;
+  - PEPS warmstart split path;
+  - boundary-MPS fitting on a tiny PEPS;
+  - compare optimization steps against the current full-SVD baseline on small
+    examples where full SVD is feasible.
+- Tests should avoid objectives depending on arbitrary singular-vector phases.
+  Use reconstructed factors, projectors/subspaces, norms, or physical
+  observables.
+
+### D6. Acceptance criteria
+- Existing tests pass with default behavior unchanged.
+- New focused tests pass under torch when optional torch is installed.
+- Users can opt into the new path without touching Quimb internals directly.
+- Docs explain when to use:
+  - current full-SVD AD: small matrices or when Quimb already computes all
+    singular vectors;
+  - true truncated AD: large matrices with small retained rank;
+  - finite differences: debugging/reference only.
+
+---
+
+## 6. Milestones (suggested order)
 
 1. **M0 — scaffolding (this PR):** `PLAN.md`, `history/`, `learning/`.
 2. **M1 — quimb BP wrapper:** BP fixed point + norm via quimb, pepsy adapter +
@@ -233,14 +381,20 @@ Goal: let PEPS/MPS workflows carry abelian symmetry and fermionic statistics.
    PEPS norm test. (C1–C3, C5)
 6. **M5 — fermionic support:** fermionic constructors, phase handling, Hubbard
    energy test. (C4)
-7. **M6 — docs:** `docs/howto/` + `docs/tutorials/` pages; update `docs/api/`
+7. **M6 — AD decomposition prototype:** torch true-truncated-SVD primitive,
+   Quimb split driver registration, fixed-rank gradient tests, and one MPS/MPO
+   integration smoke. (D1–D5)
+8. **M7 — AD decomposition integration:** adaptive-rank diagnostics, JAX
+   custom-VJP if needed, PEPS/boundary integration tests, docs explaining the
+   full-SVD vs true-truncated distinction. (D3–D6)
+9. **M8 — docs:** `docs/howto/` + `docs/tutorials/` pages; update `docs/api/`
    and `tests/test_public_api.py` for any new public symbols.
 
 Each milestone is independently shippable and testable.
 
 ---
 
-## 6. Cross-cutting requirements (from AGENTS.md)
+## 7. Cross-cutting requirements (from AGENTS.md)
 
 - Use new package namespaces; never add old flat modules
   (`pepsy.core`, `pepsy.gates`, …).
@@ -254,13 +408,14 @@ Each milestone is independently shippable and testable.
   - API/layout: `pytest -q tests/test_public_api.py tests/test_package_layout.py`
   - Boundary/contraction: `pytest -q tests/test_prepare_boundary_inputs.py`
   - Core/observables: `pytest -q tests/test_core_seed.py`
+  - Decomposition AD: `pytest -q tests/test_linalg_ad.py`
   - New BP: `pytest -q tests/test_bp.py`
   - New symmetry: `pytest -q tests/test_symmetry.py`
   - Docs: `sphinx-build -W -b html docs docs/_build/html`
 
 ---
 
-## 7. Open questions / risks
+## 8. Open questions / risks
 
 - BP fixed point may not exist / be unique for ground states of local
   Hamiltonians; loop expansion diverges for (near-)degenerate fixed points
@@ -270,10 +425,13 @@ Each milestone is independently shippable and testable.
 - Exact division of labor between pepsy and quimb for BP (wrap vs. own) — decide
   in M1 after the quimb API audit; record the decision in `history/`.
 - symmray API is young (v0.2.x); pin a version and isolate behind the bridge.
+- The efficient truncated-SVD VJP is subtle for complex tensors, adaptive
+  cutoffs, and degenerate singular values. Start with fixed-rank torch tests
+  and only wire into optimization once finite-difference checks are boring.
 
 ---
 
-## 8. How agents should use this file
+## 9. How agents should use this file
 
 1. On session start: read this `PLAN.md` and the latest entry in `history/`.
 2. Pick the current milestone; do the smallest shippable slice.

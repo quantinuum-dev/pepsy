@@ -13,22 +13,29 @@ def build_lattice(Lx, Ly, coupling_j, field_h, cyclic=True, lattice="square", mo
 
     Returns
     -------
-    dict with keys: mpo_H, edges_1d, sites, mapper, res (full build_itf_lattice output).
+    dict with keys: mpo_H, edges_2d, edges_1d, sites, mapper, res
+    (full build_itf_lattice output), and the 1D <-> 2D maps.
     """
-    mapper = OneDMap(Lx, Ly, mode="hilbert")
+    mapper = OneDMap(Lx, Ly, mode=mode)
     res = py.ham_tn.build_itf_lattice(
         L_x=Lx, L_y=Ly, lattice=lattice, cyclic=cyclic,
         J=coupling_j, field=field_h,
         mapper=mapper,
     )
     mpo_H = res["mpo"]
+    edges_2d = res["edges"]
     edges_1d = res["edges_1d"]
-    sites = sorted({(site,) for edge in edges_1d for site in edge})
+    one_d_to_two_d = res["one_d_to_lattice"]
+    two_d_to_one_d = res["lattice_to_one_d"]
+    sites = tuple((site,) for site in sorted(one_d_to_two_d))
     return {
         "mpo_H": mpo_H,
+        "edges_2d": edges_2d,
         "edges_1d": edges_1d,
         "sites": sites,
         "mapper": mapper,
+        "one_d_to_two_d": one_d_to_two_d,
+        "two_d_to_one_d": two_d_to_one_d,
         "res": res,
     }
 

@@ -150,6 +150,14 @@ NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX
 ## Examples and Notebooks
 
 - Keep examples lightweight and deterministic where practical.
+- Write examples compositionally: expose small setup/build/evolve/measure steps
+  that compose public APIs instead of copying internal implementation details.
+- For Pepsy examples, prefer Pepsy public functionality wherever possible; drop
+  to `quimb`, `autoray`, or `cotengra` only when the example specifically needs
+  lower-level tensor-network, backend, or contraction-planning control.
+- For Gaugy examples, prefer Gaugy public functionality first, then Pepsy public
+  functionality, then `quimb`; use `autoray`/`cotengra` only for explicit
+  backend or contraction-optimizer concerns.
 - Do not modify generated notebook outputs unless explicitly requested.
 - When changing public examples, verify that imports use current namespaces and public API names.
 - If a notebook or helper still shows an old flat import path, migrate it deliberately instead of copying that pattern into new code.
