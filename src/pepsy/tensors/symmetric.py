@@ -79,6 +79,10 @@ _MODEL_ALIASES = {
     "fermi-hubbard": "fermi_hubbard",
     "hubbard": "fermi_hubbard",
     "fh": "fermi_hubbard",
+    "fermi_hubbard_u1u1": "fermi_hubbard_u1u1",
+    "fermi-hubbard-u1u1": "fermi_hubbard_u1u1",
+    "hubbard_u1u1": "fermi_hubbard_u1u1",
+    "fh_u1u1": "fermi_hubbard_u1u1",
     "spinless_fermi_hubbard": "fermi_hubbard_spinless",
     "spinless-fermi-hubbard": "fermi_hubbard_spinless",
     "fermi_hubbard_spinless": "fermi_hubbard_spinless",
@@ -91,6 +95,7 @@ _MODEL_DEFAULTS = {
     "tfim": {"symmetry": "Z2", "fermionic": False, "phys_dim": 2},
     "heisenberg": {"symmetry": "U1", "fermionic": False, "phys_dim": 2},
     "fermi_hubbard": {"symmetry": "U1", "fermionic": True, "phys_dim": 4},
+    "fermi_hubbard_u1u1": {"symmetry": "U1U1", "fermionic": True, "phys_dim": 4},
     "fermi_hubbard_spinless": {"symmetry": "U1", "fermionic": True, "phys_dim": 2},
 }
 
@@ -1866,7 +1871,7 @@ def _hamiltonian_from_edges(model, symmetry, edges, *, flat=False, **params):
         return sr.ham_tfim_from_edges(symmetry, edges, flat=flat, **params)
     if model == "heisenberg":
         return sr.ham_heisenberg_from_edges(symmetry, edges, flat=flat, **params)
-    if model == "fermi_hubbard":
+    if model in {"fermi_hubbard", "fermi_hubbard_u1u1"}:
         return sr.ham_fermi_hubbard_from_edges(symmetry, edges, flat=flat, **params)
     if model == "fermi_hubbard_spinless":
         return sr.ham_fermi_hubbard_spinless_from_edges(symmetry, edges, flat=flat, **params)

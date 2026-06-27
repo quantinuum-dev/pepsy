@@ -67,6 +67,12 @@ these conventions for shape inference and layer construction.
 helpers. Symmray remains optional. Code and tests that depend on it should
 import lazily or use `pytest.importorskip("symmray")`.
 
+For spinful Fermi-Hubbard states, the named model presets are:
+
+- `fermi_hubbard`: total particle-number `U1` sectors.
+- `fermi_hubbard_u1u1`: spin-resolved `U1U1` sectors with charges
+  `(N_up, N_down)`.
+
 When changing symmetric behavior, check both dense compatibility and Symmray
 routing through PEPS optimizers and boundary contraction paths.
 

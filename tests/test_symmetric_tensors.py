@@ -356,6 +356,12 @@ def test_sector_and_charge_helpers_make_total_charge_explicit():
     """Physical sectors and local charges should be easy to inspect."""
     assert default_physical_sectors("U1", 4) == {0: 1, 1: 2, 2: 1}
     assert default_physical_sectors(model="fermi_hubbard") == {0: 1, 1: 2, 2: 1}
+    assert default_physical_sectors(model="fermi_hubbard_u1u1") == {
+        (0, 0): 1,
+        (0, 1): 1,
+        (1, 0): 1,
+        (1, 1): 1,
+    }
     assert sector_index_map({0: 1, 1: 2, 2: 1}) == {0: 0, 1: 1, 2: 1, 3: 2}
 
     occupations = [1, 0, 1, 0]
@@ -465,6 +471,71 @@ def test_symmps_fermi_hubbard_defaults_to_fermionic_u1():
     assert evolved is not state
     assert evolved.tn.max_bond() <= 4
     assert evolved.norm() == pytest.approx(1.0)
+
+
+def test_fermi_hubbard_u1u1_preset_uses_spin_resolved_fermionic_tensors():
+    """U1U1 preset should expose spin-resolved spinful Hubbard sectors."""
+    sectors = default_physical_sectors(model="fermi_hubbard_u1u1")
+    mps = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=2,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0), (0, 1)]),
+        seed=3,
+        dtype="complex128",
+    )
+    ham_mps = mps.build_hamiltonian(t=1.0, U=4.0, mu=0.0)
+    evolved_mps = mps.time_evolve(
+        0.001,
+        steps=1,
+        hamiltonian=ham_mps,
+        imaginary=True,
+        max_bond=4,
+        inplace=False,
+    )
+
+    assert mps.symmetry == "U1U1"
+    assert mps.fermionic
+    assert mps.phys_sectors == sectors
+    assert mps.overall_charge() == (2, 2)
+    assert all(type(term).__name__ == "U1U1FermionicArray" for term in ham_mps.terms.values())
+    assert evolved_mps.overall_charge() == (2, 2)
+    assert evolved_mps.tn.max_bond() <= 4
+    assert evolved_mps.norm() == pytest.approx(1.0)
+
+    peps_charges = {
+        (0, 0): (1, 0),
+        (0, 1): (0, 1),
+        (1, 0): (1, 0),
+        (1, 1): (0, 1),
+    }
+    peps = SymPEPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        2,
+        bond_dim=2,
+        site_charge=site_charge_from_occupations(peps_charges),
+        seed=4,
+        dtype="complex128",
+    )
+    ham_peps = peps.build_hamiltonian(t=1.0, U=4.0, mu=0.0)
+    evolved_peps = peps.time_evolve(
+        0.001,
+        steps=1,
+        hamiltonian=ham_peps,
+        imaginary=True,
+        max_bond=4,
+        method="gate",
+        inplace=False,
+    )
+
+    assert peps.symmetry == "U1U1"
+    assert peps.fermionic
+    assert peps.phys_sectors == sectors
+    assert peps.overall_charge() == (2, 2)
+    assert all(type(term).__name__ == "U1U1FermionicArray" for term in ham_peps.terms.values())
+    assert evolved_peps.overall_charge() == (2, 2)
+    assert evolved_peps.tn.max_bond() <= 4
 
 
 def test_symmps_gate_stream_runs_mps_optimizer_mpo_heisenberg():

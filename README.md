@@ -17,7 +17,8 @@ Current package version: `0.2.0` (from `pyproject.toml` / `pepsy.__version__`).
   - `optimizers/`: sweep, global, energy, MPS, MPO, and PEPS optimizers
   - `sampling/`: `MpsSampler` and related sampling utilities
   - `_internal/`: private formatting and utility helpers
-- `examples/`: runnable examples (e.g. `MpsMagnetization/` 2D ITF Trotter MPS evolution)
+- `examples/`: runnable examples, including `MpsMagnetization/` and direct
+  fermionic Symmray Fermi-Hubbard starters under `pepsy_examples/Fermi_Hubbard/`
 - `docs/`: Sphinx documentation source
 - `tests/`: package tests
 
@@ -45,6 +46,26 @@ bdy = pepsy.BdyMPS(tn_flat=ket_tagged, tn_double=norm, chi=32, single_layer=Fals
 res = pepsy.contract_boundary(norm=norm, bdy=bdy, direction="y", n_iter=2)
 
 print(pepsy.__version__, res.cost)
+```
+
+## Symmetric Fermionic States
+
+Pepsy includes optional Symmray-backed symmetric tensor-network wrappers. For
+spinful Fermi-Hubbard work, `model="fermi_hubbard"` uses total particle-number
+`U1`, while `model="fermi_hubbard_u1u1"` uses spin-resolved `U1U1` charges
+`(N_up, N_down)`.
+
+```python
+import pepsy as py
+
+psi = py.SymMPS.for_model(
+    "fermi_hubbard_u1u1",
+    16,
+    bond_dim=4,
+    site_charge=py.site_charge_from_occupations([(1, 0), (0, 1)] * 8),
+)
+
+assert psi.overall_charge() == (8, 8)
 ```
 
 ## Documentation

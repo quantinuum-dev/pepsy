@@ -4,14 +4,16 @@
 
 Physical sectors are charge maps: ``{charge: sector_size}``. For example,
 ``{0: 1, 1: 1}`` is a two-state U(1) or Z2 local space, while
-``{0: 1, 1: 2, 2: 1}`` is the spinful Fermi-Hubbard local space
-``|0>, |up>, |down>, |up down>``.
+``{0: 1, 1: 2, 2: 1}`` is the spinful Fermi-Hubbard local space with total
+particle-number U(1). For spin-resolved particle-number sectors use
+``model="fermi_hubbard_u1u1"``, whose local charges are ``(n_up, n_down)``.
 
 ```python
 import pepsy as py
 
 spinless = py.default_physical_sectors("U1", 2)
 spinful = py.default_physical_sectors(model="fermi_hubbard")
+spinful_spin_resolved = py.default_physical_sectors(model="fermi_hubbard_u1u1")
 
 psi = py.SymMPS.random(
     6,
@@ -23,8 +25,9 @@ psi = py.SymMPS.random(
 ```
 
 The local ``site_charge`` pattern fixes the global sector represented by the
-state. For U(1), ``psi.overall_charge()`` is the sum of local charges. For Z2,
-``psi.overall_parity()`` is the same sum modulo two.
+state. For U(1), ``psi.overall_charge()`` is the sum of local charges. For
+``U1U1``, it is a pair such as ``(N_up, N_down)``. For Z2,
+``psi.overall_parity()`` is the charge sum modulo two.
 
 ```python
 even = py.site_charge_uniform(0)
@@ -41,6 +44,21 @@ peps = py.SymPEPS.random(
 
 peps.site_charges()
 peps.overall_parity()
+```
+
+```python
+half_filled_4x4 = py.site_charge_from_occupations(
+    [(1, 0), (0, 1)] * 8,
+)
+
+fh = py.SymMPS.for_model(
+    "fermi_hubbard_u1u1",
+    16,
+    bond_dim=4,
+    site_charge=half_filled_4x4,
+)
+
+fh.overall_charge()  # (8, 8)
 ```
 
 ## Time evolution
