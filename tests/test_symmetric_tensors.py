@@ -499,6 +499,16 @@ def test_fermi_hubbard_u1u1_preset_uses_spin_resolved_fermionic_tensors():
     assert mps.phys_sectors == sectors
     assert mps.overall_charge() == (2, 2)
     assert all(type(term).__name__ == "U1U1FermionicArray" for term in ham_mps.terms.values())
+    mps_ordering = mps.fermionic_ordering()
+    assert mps_ordering["enabled"] is True
+    assert mps_ordering["network_kind"] == "mps"
+    assert mps_ordering["methods_reference"]["doi"] == "10.1103/PhysRevResearch.7.023193"
+    assert mps_ordering["site_order"] == (0, 1, 2, 3)
+    assert mps_ordering["edge_order"] == mps.edges
+    assert mps_ordering["edges"][0]["edge"] == (0, 1)
+    assert mps_ordering["edges"][0]["edge_order"] == 0
+    assert mps_ordering["edges"][0]["index_directions"][0]["site"] == 0
+    assert mps_ordering["edges"][0]["index_directions"][0]["direction"] in {"in", "out"}
     assert evolved_mps.overall_charge() == (2, 2)
     assert evolved_mps.tn.max_bond() <= 4
     assert evolved_mps.norm() == pytest.approx(1.0)
@@ -534,6 +544,20 @@ def test_fermi_hubbard_u1u1_preset_uses_spin_resolved_fermionic_tensors():
     assert peps.phys_sectors == sectors
     assert peps.overall_charge() == (2, 2)
     assert all(type(term).__name__ == "U1U1FermionicArray" for term in ham_peps.terms.values())
+    peps_ordering = peps.fermionic_ordering()
+    assert peps_ordering["enabled"] is True
+    assert peps_ordering["network_kind"] == "peps"
+    assert peps_ordering["methods_reference"]["doi"] == "10.1103/PhysRevResearch.7.023193"
+    assert peps_ordering["site_order"] == ((0, 0), (0, 1), (1, 0), (1, 1))
+    assert peps_ordering["edge_order"] == peps.edges
+    peps_first_edge = peps.edges[0]
+    peps_first_record = next(
+        record for record in peps_ordering["edges"]
+        if record["edge"] == peps_first_edge
+    )
+    assert peps_first_record["edge_order"] == 0
+    assert tuple(item["site"] for item in peps_first_record["index_directions"]) == peps_first_edge
+    assert peps_first_record["index_directions"][0]["direction"] in {"in", "out"}
     assert evolved_peps.overall_charge() == (2, 2)
     assert evolved_peps.tn.max_bond() <= 4
 

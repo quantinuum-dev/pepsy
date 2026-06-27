@@ -73,6 +73,10 @@ psi = py.SymMPS.for_model(
 )
 
 assert psi.overall_charge() == (8, 8)
+
+ordering = psi.fermionic_ordering()
+assert ordering["enabled"]
+assert ordering["methods_reference"]["doi"] == "10.1103/PhysRevResearch.7.023193"
 ```
 
 ## Documentation

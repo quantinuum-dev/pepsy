@@ -81,6 +81,11 @@ to preserve Symmray fermionic parity, symmetry, and leg-order metadata through
 gate application, measurement, boundary contraction, and any future arbitrary
 graph lattice wrappers.
 
+`SymMPS.fermionic_ordering()` and `SymPEPS.fermionic_ordering()` expose the
+package-level record of site order, edge order, local index directions, and the
+methods reference. The same record is included in `symmray_mps_summary(...)`
+and `symmray_peps_summary(...)` under the `fermionic_ordering` key.
+
 When changing symmetric behavior, check both dense compatibility and Symmray
 routing through PEPS optimizers and boundary contraction paths.
 

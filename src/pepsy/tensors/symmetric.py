@@ -28,6 +28,12 @@ __all__ += [
 
 _SYMMRAY_AUTORAY_REGISTERED = False
 
+_FERMIONIC_TN_METHODS_REFERENCE = {
+    "title": "Fermionic tensor network contraction for arbitrary geometries",
+    "doi": "10.1103/PhysRevResearch.7.023193",
+    "url": "https://doi.org/10.1103/PhysRevResearch.7.023193",
+}
+
 
 def _require_symmray():
     """Import symmray with a clear optional-dependency message."""
@@ -383,6 +389,87 @@ def _shared_virtual_inds(tensor_a, tensor_b, physical_inds):
     )
 
 
+def _is_fermionic_array_data(data):
+    if data is None:
+        return False
+    if bool(getattr(data, "fermionic", False)):
+        return True
+    return "fermionic" in type(data).__name__.lower()
+
+
+def _infer_fermionic(source, tensors):
+    fermionic = getattr(source, "fermionic", None)
+    if fermionic is not None:
+        return bool(fermionic)
+    return any(_is_fermionic_array_data(getattr(tensor, "data", None)) for tensor in tensors)
+
+
+def _source_edges(source, bonds):
+    edges = getattr(source, "edges", None)
+    if edges is not None:
+        return _as_edges(edges)
+    return tuple(tuple(bond["between"]) for bond in bonds)
+
+
+def _edge_lookup(edges):
+    order_by_pair = {}
+    edge_by_pair = {}
+    for position, edge in enumerate(edges):
+        edge = tuple(edge)
+        reverse_edge = tuple(reversed(edge))
+        order_by_pair.setdefault(edge, int(position))
+        order_by_pair.setdefault(reverse_edge, int(position))
+        edge_by_pair.setdefault(edge, edge)
+        edge_by_pair.setdefault(reverse_edge, edge)
+    return order_by_pair, edge_by_pair
+
+
+def _bond_endpoint_directions(bond):
+    if "left_site" in bond:
+        return {
+            bond["left_site"]: bond.get("left_direction"),
+            bond["right_site"]: bond.get("right_direction"),
+        }
+    return {
+        bond["site_a"]: bond.get("site_a_direction"),
+        bond["site_b"]: bond.get("site_b_direction"),
+    }
+
+
+def _fermionic_edge_record(bond, order_by_pair, edge_by_pair):
+    between = tuple(bond["between"])
+    edge = edge_by_pair.get(between, between)
+    directions = _bond_endpoint_directions(bond)
+    return {
+        "position": int(bond["position"]),
+        "edge_order": order_by_pair.get(between),
+        "edge": edge,
+        "between": between,
+        "ind": bond["ind"],
+        "lattice_direction": bond.get("direction"),
+        "index_directions": tuple(
+            {"site": site, "direction": directions.get(site)}
+            for site in edge
+        ),
+    }
+
+
+def _fermionic_ordering_summary(source, *, network_kind, sites, bonds, fermionic):
+    edges = _source_edges(source, bonds)
+    order_by_pair, edge_by_pair = _edge_lookup(edges)
+    return {
+        "enabled": bool(fermionic),
+        "network_kind": network_kind,
+        "methods_reference": dict(_FERMIONIC_TN_METHODS_REFERENCE),
+        "site_order": tuple(sites),
+        "edge_order": edges,
+        "edges": tuple(
+            _fermionic_edge_record(bond, order_by_pair, edge_by_pair)
+            for bond in bonds
+        ),
+    }
+
+
 def _resolve_mps_position(tensors, value, *, name="position"):
     if value is None:
         return None
@@ -495,6 +582,7 @@ def symmray_mps_summary(mps):
     total_stored_size = int(sum(tensor["stored_size"] for tensor in tensors))
     total_charge = _resolve_total_charge(source, tensors)
     symmetry = getattr(source, "symmetry", None)
+    fermionic = _infer_fermionic(source, site_tensors)
     q_total = _resolve_q_total(symmetry, total_charge)
     return {
         "num_sites": len(sites),
@@ -502,7 +590,14 @@ def symmray_mps_summary(mps):
         "tensors": tensors,
         "bonds": bonds,
         "symmetry": symmetry,
-        "fermionic": getattr(source, "fermionic", None),
+        "fermionic": fermionic,
+        "fermionic_ordering": _fermionic_ordering_summary(
+            source,
+            network_kind="mps",
+            sites=sites,
+            bonds=bonds,
+            fermionic=fermionic,
+        ),
         "total_charge": total_charge,
         "charge_total": total_charge,
         "Q_total": q_total,
@@ -1261,6 +1356,7 @@ def symmray_peps_summary(peps):
     Ly = int(getattr(tn, "Ly", max(site[1] for site in site_set) + 1))
     total_charge = _resolve_total_charge(source, tensors)
     symmetry = getattr(source, "symmetry", None)
+    fermionic = _infer_fermionic(source, site_tensors.values())
     q_total = _resolve_q_total(symmetry, total_charge)
     return {
         "Lx": Lx,
@@ -1270,7 +1366,14 @@ def symmray_peps_summary(peps):
         "tensors": tensors,
         "bonds": bonds,
         "symmetry": symmetry,
-        "fermionic": getattr(source, "fermionic", None),
+        "fermionic": fermionic,
+        "fermionic_ordering": _fermionic_ordering_summary(
+            source,
+            network_kind="peps",
+            sites=sites,
+            bonds=bonds,
+            fermionic=fermionic,
+        ),
         "total_charge": total_charge,
         "charge_total": total_charge,
         "Q_total": q_total,
@@ -2034,6 +2137,21 @@ class _SymState:
     def overall_parity(self):
         """Return the configured total Z2 parity, i.e. charge sum modulo 2."""
         return self.overall_charge(mod=2)
+
+    def fermionic_ordering(self):
+        """Return site and edge ordering metadata for this Symmray state.
+
+        The metadata records the site order, stored edge order, local bond index
+        directions, and the direct-fermion tensor-network reference used by the
+        Symmray summaries. For fermionic states, this is the package-level
+        record of the graph/order data that Symmray uses for parity-aware
+        contractions.
+        """
+        if self.site_ind_id == "k{}":
+            return symmray_mps_summary(self)["fermionic_ordering"]
+        if self.site_ind_id == "k{},{}":
+            return symmray_peps_summary(self)["fermionic_ordering"]
+        raise ValueError("Unsupported symmetric state site index convention.")
 
     def operator_from_dense(self, array, *, charge=0, sectors=None, sites=None):
         """Convert a dense local observable/operator to this state's symmetry."""

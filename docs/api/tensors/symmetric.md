@@ -69,6 +69,21 @@ symmetries such as ``U1`` or ``U1U1``, and leg-order metadata in Symmray-backed
 arrays, while relying on quimb/cotengra graph optimizers for contraction
 ordering.
 
+Use ``state.fermionic_ordering()`` when a workflow needs the package-level
+record of the graph and local order data carried by a symmetric state:
+
+```python
+ordering = fh.fermionic_ordering()
+
+ordering["enabled"]       # True for direct fermionic states
+ordering["site_order"]    # the site labels in tensor-network order
+ordering["edge_order"]    # the stored graph edge order
+ordering["edges"][0]["index_directions"]
+```
+
+The same record is available as ``summary["fermionic_ordering"]`` from
+``symmray_mps_summary`` and ``symmray_peps_summary``.
+
 ## Time evolution
 
 Hamiltonians produce a canonical bundled gate stream, so the same stream can be
