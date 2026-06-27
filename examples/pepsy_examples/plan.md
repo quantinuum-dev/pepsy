@@ -2,19 +2,50 @@
 
 ## Goal
 
-Build Pepsy examples that use fermionic Symmray tensor networks to test the
-main Fermi-Hubbard results in arXiv:2511.02125, "Superconducting pairing
-correlations on a trapped-ion quantum computer".
+Build Pepsy examples that use fermionic Symmray tensor networks for direct
+Fermi-Hubbard simulations. The main methods reference for the Pepsy/Symmray
+path is Gao et al., "Fermionic tensor network contraction for arbitrary
+geometries", Phys. Rev. Research 7, 023193 (2025).
+
+Use arXiv:2511.02125, "Superconducting pairing correlations on a trapped-ion
+quantum computer", as the physics benchmark source for square-lattice,
+checkerboard, and bilayer settings.
 
 The examples should prioritize reproducible classical checks over reproducing
 the trapped-ion circuit encoding. Use Pepsy's native fermionic tensor-network
 path whenever possible so that the examples test the physics directly, without
 the Octagon fermion-to-qubit overhead used in the hardware experiment.
 
-Paper source:
+Paper sources:
 
+- Main direct-fermion TN reference:
+  https://doi.org/10.1103/PhysRevResearch.7.023193
+- Open arXiv text for the methods reference:
+  https://arxiv.org/abs/2410.02215
+- Physics benchmark paper:
 - https://arxiv.org/pdf/2511.02125
 - Version checked while writing this plan: arXiv v3, dated 2026-02-18.
+
+## Implementation Notes From PRR 7, 023193
+
+- Keep the fermions native: parity, Abelian charge sectors, and leg-order
+  metadata should stay with Symmray fermionic arrays rather than being encoded
+  through Jordan-Wigner, compact, or Octagon qubit mappings.
+- Prefer graph-level geometry metadata. The PRR paper supports both globally
+  ordered and locally ordered conventions, with local ordering most natural for
+  arbitrary graphs; Pepsy examples should record site maps, edge orientations,
+  and any MPS snake embedding explicitly.
+- Contraction planning can remain graph based. quimb/cotengra should choose
+  exact or approximate contraction trees from the tensor-network graph, while
+  Symmray handles fermionic swap/parity signs during transposition,
+  contraction, and decomposition.
+- The PRR benchmarks use fermionic PEPS for half-filled Hubbard models on 3D
+  diamond lattices and random 3-regular graphs. Those are not the immediate
+  square-lattice targets below, but they are useful future regression tests for
+  Pepsy arbitrary-graph support.
+- The paper's cluster-energy idea suggests an eventual Pepsy smoke benchmark:
+  compare full approximate contraction against small-radius graph clusters
+  with simple-update gauges on a fixed fermionic PEPS.
 
 ## Existing Pepsy Pieces To Reuse
 
@@ -190,6 +221,9 @@ Example target:
 
 ## Pepsy Gaps To Resolve Before Full Reproduction
 
+- Fermionic graph metadata: keep site ordering, edge orientation, graph
+  distance, and any local/global ordering convention explicit in outputs and
+  helpers, especially for non-square, bilayer, and snake-MPS embeddings.
 - Weighted Hubbard edges: the checkerboard model needs per-edge `t` values,
   and the light pulse needs time-dependent Peierls phases.
 - Bilayer exchange: the current uniform Fermi-Hubbard builder is not enough for

@@ -73,6 +73,14 @@ For spinful Fermi-Hubbard states, the named model presets are:
 - `fermi_hubbard_u1u1`: spin-resolved `U1U1` sectors with charges
   `(N_up, N_down)`.
 
+Use Gao et al., "Fermionic tensor network contraction for arbitrary
+geometries", Phys. Rev. Research 7, 023193 (2025),
+https://doi.org/10.1103/PhysRevResearch.7.023193 as the main methods
+reference for Pepsy/Symmray Fermi-Hubbard examples. The relevant design cue is
+to preserve Symmray fermionic parity, symmetry, and leg-order metadata through
+gate application, measurement, boundary contraction, and any future arbitrary
+graph lattice wrappers.
+
 When changing symmetric behavior, check both dense compatibility and Symmray
 routing through PEPS optimizers and boundary contraction paths.
 

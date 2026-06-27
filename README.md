@@ -55,6 +55,13 @@ spinful Fermi-Hubbard work, `model="fermi_hubbard"` uses total particle-number
 `U1`, while `model="fermi_hubbard_u1u1"` uses spin-resolved `U1U1` charges
 `(N_up, N_down)`.
 
+For direct fermionic Fermi-Hubbard work, the main Pepsy/Symmray methods
+reference is Gao et al., "Fermionic tensor network contraction for arbitrary
+geometries", Phys. Rev. Research 7, 023193 (2025),
+https://doi.org/10.1103/PhysRevResearch.7.023193. It motivates keeping
+fermionic parity and leg-order metadata in Symmray arrays while letting quimb
+choose graph-level contraction orders.
+
 ```python
 import pepsy as py
 

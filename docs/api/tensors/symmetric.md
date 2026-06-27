@@ -61,6 +61,14 @@ fh = py.SymMPS.for_model(
 fh.overall_charge()  # (8, 8)
 ```
 
+For direct fermionic Fermi-Hubbard examples, use Gao et al., "Fermionic tensor
+network contraction for arbitrary geometries", Phys. Rev. Research 7, 023193
+(2025), https://doi.org/10.1103/PhysRevResearch.7.023193 as the primary
+methods reference. Pepsy should keep fermionic parity, additional Abelian
+symmetries such as ``U1`` or ``U1U1``, and leg-order metadata in Symmray-backed
+arrays, while relying on quimb/cotengra graph optimizers for contraction
+ordering.
+
 ## Time evolution
 
 Hamiltonians produce a canonical bundled gate stream, so the same stream can be
