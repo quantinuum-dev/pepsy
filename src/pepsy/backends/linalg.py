@@ -457,9 +457,13 @@ def reg_complex_svd_jax():
 
 
 
+def reg_rel_svd_torch():
+    """Register the relative-regularized torch SVD rule in autoray."""
+    ar.register_function('torch', 'linalg.svd', SVD.apply)
+
 def reg_complex_svd_torch():
     """Register the complex torch SVD autograd implementation in autoray."""
-    ar.register_function('torch', 'linalg.svd', SVD.apply)
+    reg_rel_svd_torch()
 
 def reg_real_svd_torch():
     """Register the real torch SVD autograd implementation in autoray."""

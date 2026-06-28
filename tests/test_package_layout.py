@@ -28,6 +28,7 @@ from pepsy.tensors import (
     ps_to_3dpeps,
     ps_to_peps,
     reg_complex_svd_torch,
+    reg_rel_svd_torch,
     site_charge_from_occupations,
 )
 
@@ -58,6 +59,7 @@ def test_new_namespace_imports_resolve():
     assert callable(haar_random_state)
     assert callable(ps_to_peps)
     assert callable(ps_to_3dpeps)
+    assert callable(reg_rel_svd_torch)
     assert callable(reg_complex_svd_torch)
     assert callable(site_charge_from_occupations)
 

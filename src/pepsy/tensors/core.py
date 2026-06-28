@@ -23,6 +23,7 @@ __all__ = [
     "backend_cupy",
     "backend_jax",
     "register_torch_linalg",
+    "reg_rel_svd_torch",
     "reg_complex_svd_torch",
     "reg_complex_svd_jax",
     "reg_stop_gradient_torch",
@@ -910,7 +911,7 @@ def register_torch_linalg(mode="complex"):
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
     if mode == "complex":
-        lr.reg_complex_svd_torch()
+        lr.reg_rel_svd_torch()
         lr.reg_complex_qr_torch()
         return
     if mode == "real":
@@ -920,8 +921,29 @@ def register_torch_linalg(mode="complex"):
     raise ValueError("mode must be 'complex' or 'real'")
 
 
+def reg_rel_svd_torch():
+    """Register torch SVD with a stable relative-regularized backward rule.
+
+    The registered autoray ``torch`` SVD uses Townsend's rectangular SVD
+    reverse-mode update, Lorentzian broadening of singular-value denominators
+    from differentiable tensor-network practice, and the complex phase/gauge
+    correction for complex-valued SVDs.
+    """
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "reg_rel_svd_torch requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
+    from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_rel_svd_torch()
+
+
 def reg_complex_svd_torch():
-    """Register complex torch SVD autograd rule in autoray."""
+    """Register complex torch SVD autograd rule in autoray.
+
+    Compatibility wrapper for :func:`reg_rel_svd_torch`.
+    """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_complex_svd_torch requires optional dependency 'torch'. "
@@ -929,7 +951,7 @@ def reg_complex_svd_torch():
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
-    lr.reg_complex_svd_torch()
+    lr.reg_rel_svd_torch()
 
 
 def reg_complex_svd_jax():

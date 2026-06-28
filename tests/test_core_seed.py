@@ -283,6 +283,7 @@ def test_default_backend_setters_roundtrip():
 def test_core_all_exports_backend_jax():
     """core.__all__ should include the JAX backend caster for parity."""
     assert "backend_jax" in core.__all__
+    assert "reg_rel_svd_torch" in core.__all__
     assert "reg_complex_svd_torch" in core.__all__
     assert "reg_complex_svd_jax" in core.__all__
 
@@ -861,6 +862,21 @@ def test_complex_svd_torch_backward_supports_batched_autoray():
 
     assert A.grad is not None
     assert A.grad.shape == A.shape
+    assert torch.isfinite(A.grad).all()
+
+
+def test_reg_rel_svd_torch_registers_stable_autoray_rule():
+    """Relative SVD registration should stabilize degenerate spectra."""
+    torch = pytest.importorskip("torch")
+
+    core.reg_rel_svd_torch()
+
+    A = torch.eye(3, dtype=torch.complex128, requires_grad=True)
+    U, S, Vh = ar.do("linalg.svd", A)
+    loss = S.sum() + (U[0, 0] * Vh.conj().T[0, 0].conj()).real
+    loss.backward()
+
+    assert A.grad is not None
     assert torch.isfinite(A.grad).all()
 
 

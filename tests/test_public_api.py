@@ -42,7 +42,7 @@ _EXPECTED_NOT_IN_ALL = [
     "gates_tn_1d", "gates_tn_2d", "gates_tn_3d", "apply_2d_gate",
     "apply_2d_gates", "apply_2dtn_", "gate_2d", "gate_to_pepo", "gate_1d",
     "canonize_mps", "apply_gates_", "expec_TN_1D", "peps_I",
-    "reg_complex_svd_torch", "reg_complex_svd_jax",
+    "reg_rel_svd_torch", "reg_complex_svd_torch", "reg_complex_svd_jax",
     "reg_stop_gradient_torch", "stop_grad",
     "MPSOptimizer", "MPOOptimizer",
     "boundary_metrics", "boundary_states", "boundary_sweeps", "core", "fit",
@@ -132,6 +132,8 @@ def test_optional_linalg_registrations_resolve():
     if has_torch:
         import torch
 
+        assert callable(pepsy.tensors.core.reg_rel_svd_torch)
+        assert callable(pepsy.tensors.reg_rel_svd_torch)
         assert callable(pepsy.tensors.core.reg_complex_svd_torch)
         assert callable(pepsy.tensors.reg_complex_svd_torch)
         x = torch.tensor([1.0], dtype=torch.float64, requires_grad=True)

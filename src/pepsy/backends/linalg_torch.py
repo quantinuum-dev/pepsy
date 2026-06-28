@@ -33,7 +33,15 @@ def safe_inverse_2(x, eps):
 
 
 class SVD(torch.autograd.Function):
-    """Custom torch SVD with stabilized backward for near-degenerate spectra."""
+    """Torch SVD with a relative-regularized reverse-mode rule.
+
+    The rectangular real-SVD terms follow Townsend's reverse update, with the
+    singular-gap and inverse-singular-value reciprocals regularized as
+    ``x / (x**2 + eps)``. The scale-aware ``eps`` keeps the stabilizer relative
+    to the current singular spectrum, which is the Lorentzian broadening used in
+    differentiable tensor-network SVDs. Complex inputs additionally include the
+    phase/gauge term from the complex-valued SVD backward formula.
+    """
 
     @staticmethod
     def forward(ctx, A):
@@ -85,6 +93,8 @@ class SVD(torch.autograd.Function):
             eps_scale=sigma_scale,
         )
 
+        # Townsend's F+/F- terms, written as 1/(s_j - s_i) and
+        # 1/(s_i + s_j), with relative Lorentzian broadening.
         F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
         F = safe_inverse(
             F,
@@ -137,6 +147,7 @@ class SVD(torch.autograd.Function):
 
         dA = u_term + sigma_term + v_term
         if (u.is_complex() or v.is_complex()) and gu is not None:
+            # Complex-SVD gauge correction from arXiv:1909.02659.
             phase_diag = (uh @ gu).diagonal(0, -2, -1)
             L = 1j * phase_diag.imag * sigma_inv
             imag_term = (u * L.unsqueeze(-2)) @ vh
@@ -287,9 +298,18 @@ class QR_complex(torch.autograd.Function):
         return dA
 
 
-def reg_complex_svd_torch():
-    """Register the complex torch SVD autograd implementation in autoray."""
+def reg_rel_svd_torch():
+    """Register the relative-regularized torch SVD rule in autoray."""
     ar.register_function("torch", "linalg.svd", SVD.apply)
+
+
+def reg_complex_svd_torch():
+    """Register the complex torch SVD autograd implementation in autoray.
+
+    This compatibility name installs the same relative-regularized SVD rule as
+    :func:`reg_rel_svd_torch`.
+    """
+    reg_rel_svd_torch()
 
 
 def reg_real_svd_torch():
