@@ -1,7 +1,7 @@
 # PLAN.md — BP, quimb, Symmetric TN, and Differentiable Truncations
 
 Status: draft / living document
-Last updated: 2026-06-24
+Last updated: 2026-06-28
 Owners: pepsy maintainers + coding agents
 
 This document plans four related workstreams to extend `pepsy`:
@@ -128,7 +128,13 @@ Symmetric tensors are a *backend/array* concern, not an algorithm:
 
 Differentiable truncations are also a *backend/decomposition* concern:
 - The existing `pepsy.backends.linalg_torch.SVD` registers a stabilized full
-  SVD via `autoray` as `torch.linalg.svd`. This helps full-SVD AD, but by
+  SVD via `autoray` as `torch.linalg.svd`. The preferred public hook is
+  `pepsy.tensors.reg_rel_svd_torch()`; `reg_complex_svd_torch()` and
+  `register_torch_linalg(mode="complex")` are compatibility paths to the same
+  relative-regularized rule. It uses Townsend's rectangular full-SVD backward
+  structure, Lorentzian relative broadening for singular-value denominators,
+  the complex SVD gauge correction, and a CPU SciPy `gesvd` forward fallback
+  when `torch.linalg.svd` fails. This helps full-SVD AD and robustness, but by
   itself does not implement the truncated-SVD pullback from the paper.
 - Installed `quimb` routes tensor splits through `quimb.tensor.decomp.array_split`.
   The default `svd_truncated` currently computes `xp.linalg.svd(x)` and then

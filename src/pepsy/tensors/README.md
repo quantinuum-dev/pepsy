@@ -47,7 +47,10 @@ Backend helpers manage package-wide defaults and optional linalg shims:
 - `set_default_array_backend(...)` / `get_default_array_backend()`
 - `set_default_grad_backend(...)` / `get_default_grad_backend()`
 - `reset_default_backends()`
-- torch and JAX complex-SVD/stop-gradient registrations
+- torch and JAX linalg/stop-gradient registrations. For torch SVD,
+  `reg_rel_svd_torch()` is the preferred full-SVD autodiff shim; it installs
+  the relative-regularized backward rule also used by `reg_complex_svd_torch()`
+  and falls back to SciPy `gesvd` on CPU forward-driver failures.
 
 ## Tag and index conventions
 
