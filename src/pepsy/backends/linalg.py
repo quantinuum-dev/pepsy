@@ -6,6 +6,7 @@ This module provides custom SVD/QR gradients and then registers them with
 
 import autoray as ar
 import jax.numpy as jnp
+import numpy as np
 import scipy.linalg
 import torch
 from jax import custom_vjp
@@ -62,6 +63,50 @@ def safe_inverse_2(x, eps):
     return x.clamp_min(eps).reciprocal()
 
 
+def _scipy_gesvd(A):
+    """Compute a thin SVD through SciPy's more robust ``gesvd`` driver."""
+    A_np = A.detach().cpu().numpy()
+    batch_shape = A_np.shape[:-2]
+    m, n = A_np.shape[-2:]
+    k = min(m, n)
+
+    if batch_shape:
+        flat = A_np.reshape((-1,) + A_np.shape[-2:])
+        if flat.shape[0] == 0:
+            U_np = np.empty(batch_shape + (m, k), dtype=A_np.dtype)
+            S_np = np.empty(batch_shape + (k,), dtype=A_np.real.dtype)
+            Vh_np = np.empty(batch_shape + (k, n), dtype=A_np.dtype)
+        else:
+            parts = [
+                scipy.linalg.svd(
+                    mat,
+                    full_matrices=False,
+                    lapack_driver="gesvd",
+                )
+                for mat in flat
+            ]
+            U_np = np.stack([part[0] for part in parts]).reshape(
+                batch_shape + parts[0][0].shape
+            )
+            S_np = np.stack([part[1] for part in parts]).reshape(
+                batch_shape + parts[0][1].shape
+            )
+            Vh_np = np.stack([part[2] for part in parts]).reshape(
+                batch_shape + parts[0][2].shape
+            )
+    else:
+        U_np, S_np, Vh_np = scipy.linalg.svd(
+            A_np,
+            full_matrices=False,
+            lapack_driver="gesvd",
+        )
+
+    U = torch.from_numpy(np.asarray(U_np)).to(device=A.device, dtype=A.dtype)
+    S = torch.from_numpy(np.asarray(S_np)).to(device=A.device, dtype=A.real.dtype)
+    Vh = torch.from_numpy(np.asarray(Vh_np)).to(device=A.device, dtype=A.dtype)
+    return U, S, Vh
+
+
 class SVD(torch.autograd.Function):
     """Custom torch SVD with stabilized backward for near-degenerate spectra.
 
@@ -71,10 +116,13 @@ class SVD(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
-        if A.is_cuda:
-            U, S, Vh = torch.linalg.svd(A, full_matrices=False, driver='gesvd')
-        else:
-            U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+        try:
+            if A.is_cuda:
+                U, S, Vh = torch.linalg.svd(A, full_matrices=False, driver='gesvd')
+            else:
+                U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+        except Exception:
+            U, S, Vh = _scipy_gesvd(A)
         # A = U @ diag(S) @ Vh
         ctx.save_for_backward(U, S, Vh)
 

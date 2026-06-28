@@ -880,6 +880,33 @@ def test_reg_rel_svd_torch_registers_stable_autoray_rule():
     assert torch.isfinite(A.grad).all()
 
 
+@pytest.mark.parametrize("dtype", ["float64", "complex128"])
+def test_reg_rel_svd_torch_forward_falls_back_to_scipy_gesvd(monkeypatch, dtype):
+    """Relative SVD should recover when torch's CPU SVD driver fails."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("scipy.linalg")
+    from pepsy.backends import linalg_torch as lrt  # pylint: disable=import-outside-toplevel
+
+    torch_dtype = getattr(torch, dtype)
+
+    def fail_svd(*_args, **_kwargs):
+        raise RuntimeError("forced gesdd failure")
+
+    monkeypatch.setattr(lrt.torch.linalg, "svd", fail_svd)
+
+    torch.manual_seed(151617)
+    A = torch.randn(2, 4, 3, dtype=torch_dtype, requires_grad=True)
+    U, S, Vh = lrt.SVD.apply(A)
+    recon = (U * S.unsqueeze(-2)) @ Vh
+
+    torch.testing.assert_close(recon, A.detach(), rtol=1e-10, atol=1e-10)
+    loss = recon.real.square().sum() + S.sum()
+    loss.backward()
+
+    assert A.grad is not None
+    assert torch.isfinite(A.grad).all()
+
+
 def test_complex_svd_torch_backward_regularizes_degenerate_spectra():
     """Custom complex SVD backward should stay finite at degenerate spectra."""
     torch = pytest.importorskip("torch")
