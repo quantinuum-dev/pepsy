@@ -140,6 +140,7 @@ def test_build_itf_lattice_can_return_pepo_explicitly():
 
 def test_build_itf_lattice_show_returns_schematic_drawing():
     """build_itf_lattice(show=True) should include a schematic MPO drawing."""
+    pytest.importorskip("matplotlib")
     out = py.ham_tn.build_itf_lattice(
         Lx=2,
         Ly=2,
@@ -522,6 +523,7 @@ def test_map_builder_instance_style_supports_3d_build():
 
 def test_map_builder_show_returns_schematic_drawing():
     """show() should now return a schematic drawing object for 2D maps."""
+    pytest.importorskip("matplotlib")
     drawing = OneDMap.show(2, 2, mode="snake")
     assert hasattr(drawing, "fig")
     assert hasattr(drawing, "ax")
@@ -530,6 +532,7 @@ def test_map_builder_show_returns_schematic_drawing():
 
 def test_map_builder_instance_show_returns_schematic_drawing():
     """Instance-style show() should return a drawing and honor override kwargs."""
+    pytest.importorskip("matplotlib")
     mapper = OneDMap(2, 2, mode="row-major")
     drawing = mapper.show(mode="snake", title="Instance Mapper")
 

@@ -106,6 +106,7 @@ def test_loss_state_unknown_cost_raises():
 
 def test_global_optimizer_builds_tnoptimizer():
     """GlobalOptimizer should build a TNOptimizer with merged loss kwargs."""
+    pytest.importorskip("torch")
     peps = _rand_peps(seed=17)
     peps_target = _rand_peps(seed=18)
     opt = GlobalOptimizer(peps, peps_target, loss_kwargs={"mode": "exact", "opt": "auto-hq"})
