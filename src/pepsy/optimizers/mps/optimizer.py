@@ -354,7 +354,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         n_iter=5,
         progbar=False,
         cutoff=1e-12,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         mode=None,
         fidelity_samples=None,
         k_2q_batch=1,
@@ -376,7 +376,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Show per-mode progress bars.
         cutoff : float, default=1e-12
             Truncation cutoff used in gate application and local fitting.
-        cutoff_mode : str, default="rel"
+        cutoff_mode : str, default="rsum2"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
             ``tensor_network_1d_compress``.
         mode : {"dmrg", "mpo", "swap", "svd", "exact"} | None, default=None
@@ -810,7 +810,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self.infidelities.append(cumulative_infidelity)
         return cumulative_infidelity
 
-    def _build_norm_target(self, p, gate, where, cutoff, cutoff_mode="rel"):
+    def _build_norm_target(self, p, gate, where, cutoff, cutoff_mode="rsum2"):
         """Build the pre-chi-compression target used for norm diagnostics."""
         p_target = p.copy()
         if len(where) == 1:
@@ -989,7 +989,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return batch_G, batch_where, two_qubit_in_batch, idx
 
-    def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff, cutoff_mode="rel"):
+    def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff, cutoff_mode="rsum2"):
         """Apply a collected DMRG batch onto a copy of ``p``."""
         p_g = p.copy()
         for gate, where in zip(batch_G, batch_where):
@@ -1022,7 +1022,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         n_iter,
         progbar=False,
         cutoff=1e-12,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         k_2q_batch=1,
         normalize_every=None,
         normalize_final=True,
@@ -1225,7 +1225,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         progbar=False,
         cutoff=1e-12,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         fidelity_samples=10,
         normalize_every=None,
         normalize_final=True,
@@ -1407,7 +1407,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         progbar=False,
         cutoff=1e-12,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         fidelity_samples=10,
         normalize_every=None,
         normalize_final=True,
@@ -1567,7 +1567,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         progbar=False,
         cutoff=1e-12,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         fidelity_samples=10,
         normalize_every=None,
         normalize_final=True,
@@ -1759,7 +1759,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         progbar=False,
         cutoff=1e-12,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         fidelity_samples=10,
     ):
         """Apply gates exactly using in-place ``contract=True`` application.

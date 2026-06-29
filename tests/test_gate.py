@@ -941,7 +941,7 @@ def test_gate_accepts_string_index_selectors(monkeypatch):
     )
 
     assert out is tn
-    assert calls == [(("k1", "k2"), {"contract": False, "inplace": True, "cutoff_mode": "rel"})]
+    assert calls == [(("k1", "k2"), {"contract": False, "inplace": True, "cutoff_mode": "rsum2"})]
 
 
 def test_gate_1d_general_tn_without_l_uses_gate_inds(monkeypatch):
@@ -976,7 +976,7 @@ def test_gate_1d_general_tn_without_l_uses_gate_inds(monkeypatch):
     )
 
     assert out is tn
-    assert calls == [(("b1",), {"contract": False, "inplace": True, "cutoff_mode": "rel"})]
+    assert calls == [(("b1",), {"contract": False, "inplace": True, "cutoff_mode": "rsum2"})]
 
 
 def test_apply_gates_accepts_mixed_site_and_edge_specs():

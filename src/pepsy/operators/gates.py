@@ -1779,7 +1779,7 @@ def gate(tn, gates, where=None, which=None, **kwargs):
         gates, where=where, allow_empty=True, allow_which=True
     )
     opts = dict(kwargs)
-    opts.setdefault("cutoff_mode", "rel")
+    opts.setdefault("cutoff_mode", "rsum2")
     inplace = opts.pop("inplace", True)
     chi = opts.pop("chi", None)
     chi_cutoff = float(opts.pop("chi_cutoff", 1.0e-12))
@@ -2336,7 +2336,7 @@ def _apply_gate_2d(
     Lx=None,
     Ly=None,
     ind_id="k{},{}",
-    cutoff_mode="rel",
+    cutoff_mode="rsum2",
     path_canonize=False,
     path_canonize_distance=1,
     path_canonize_opts=None,
@@ -2612,7 +2612,7 @@ def _apply_gate_3d(
     Ly=None,
     Lz=None,
     ind_id="k{},{},{}",
-    cutoff_mode="rel",
+    cutoff_mode="rsum2",
     path_canonize=False,
     path_canonize_distance=1,
     path_canonize_opts=None,
@@ -3057,7 +3057,7 @@ def _apply_gate_1d(
     inplace=True,
     *,
     dtype="complex128",
-    cutoff_mode="rel",
+    cutoff_mode="rsum2",
     max_bond=None,
     path_canonize=False,
     path_canonize_distance=1,

@@ -3013,7 +3013,7 @@ class SymPEPS(_SymState):
         visualize=False,
         equalize_norms=False,
         cutoff=1.0e-12,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         mode="mps",
         canonize=True,
         autogroup=True,

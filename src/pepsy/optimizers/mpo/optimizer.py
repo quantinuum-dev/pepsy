@@ -377,7 +377,7 @@ class MpoOptimizer:
         bra_gate=None,
         *,
         cutoff,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         contract,
         inplace=True,
     ):
@@ -412,7 +412,7 @@ class MpoOptimizer:
                 inplace=inplace,
             )
 
-    def _build_dmrg_target(self, p, gate, where, bra_gate, cutoff, cutoff_mode="rel"):
+    def _build_dmrg_target(self, p, gate, where, bra_gate, cutoff, cutoff_mode="rsum2"):
         """Return ``p`` with one two-site gate pair applied via ``split-gate``.
 
         The result is the *target* MPO that the local FIT update will fit
@@ -460,7 +460,7 @@ class MpoOptimizer:
 
         return batch_G, batch_where, two_qubit_in_batch, idx
 
-    def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff, cutoff_mode="rel"):
+    def _build_dmrg_batch_target(self, p, batch_G, batch_where, cutoff, cutoff_mode="rsum2"):
         """Apply a collected DMRG batch onto a copy of ``p``.
 
         Used to materialise the local target MPO for a batched FIT update.
@@ -483,7 +483,7 @@ class MpoOptimizer:
             )
         return p_g
 
-    def _run_dmrg(self, G_seq, where_seq, n_iter, progbar=False, cutoff=1e-12, cutoff_mode="rel", k_2q_batch=1, fidelity_samples=10):
+    def _run_dmrg(self, G_seq, where_seq, n_iter, progbar=False, cutoff=1e-12, cutoff_mode="rsum2", k_2q_batch=1, fidelity_samples=10):
         """Sweep the gate stream with local DMRG-style FIT compression.
 
         One-site gates are applied exactly; each two-site gate (or batch of
@@ -595,7 +595,7 @@ class MpoOptimizer:
 
         self.p = p
 
-    def _run_svd(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rel", fidelity_samples=10):
+    def _run_svd(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rsum2", fidelity_samples=10):
         """Sweep the gate stream with local ``reduce-split`` + left-compress.
 
         Two-site updates use ``apply_gate(..., contract='reduce-split')``
@@ -680,7 +680,7 @@ class MpoOptimizer:
         self.p = p
 
 
-    def _run_mpo(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rel", fidelity_samples=10):
+    def _run_mpo(self, G_seq, where_seq, progbar=False, cutoff=1e-12, cutoff_mode="rsum2", fidelity_samples=10):
         """Sweep the gate stream with :func:`gate_nonlocal_opt` compression.
 
         Two-site gates are routed through ``gate_nonlocal_opt`` independently
@@ -771,7 +771,7 @@ class MpoOptimizer:
         mode=None,
         progbar=False,
         cutoff=1e-12,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         fidelity_samples=10,
         k_2q_batch=1,
     ):
@@ -788,7 +788,7 @@ class MpoOptimizer:
             Show tqdm progress bar.
         cutoff : float, default=1e-12
             Truncation cutoff used in gate application and compression.
-        cutoff_mode : str, default="rel"
+        cutoff_mode : str, default="rsum2"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
             ``tensor_network_1d_compress``.
         fidelity_samples : int, default=10
