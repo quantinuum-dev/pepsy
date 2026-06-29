@@ -569,8 +569,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if loss_value < 0.0:
             return
         if loss_value < float(self.best_loss):
+            state = getattr(self, "state", None)
+            if state is None:
+                return
             self.best_loss = loss_value
-            self.best_state = self.state.copy()
+            self.best_state = state.copy()
 
     def _ensure_boundary_chi(self, chi):
         """Retune both stored boundary objects to at least ``chi``.

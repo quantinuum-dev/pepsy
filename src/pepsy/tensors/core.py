@@ -487,17 +487,17 @@ class OneDMap:
         figsize=None,
     ):
         try:
-            from quimb import schematic
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise ImportError(
-                "Schematic plotting requires quimb.schematic to be available."
-            ) from exc
-
-        try:
             from matplotlib import colormaps
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError(
                 "Schematic plotting requires matplotlib to be available."
+            ) from exc
+
+        try:
+            from quimb import schematic
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "Schematic plotting requires quimb.schematic to be available."
             ) from exc
 
         if title is None:
@@ -1685,17 +1685,19 @@ def expec_mpo(mpo, mps, *, contraction_opt=None):
         mps_n = mps.copy()
         norm_ = mps_n.normalize()
         L = mps.L
+        divisor = 1.0
     else:
         mps_n = mps.copy()
         L = len(mps.outer_inds())
         norm_ = tn_norm(mps_n, contraction_opt=contraction_opt)
-    
+        divisor = norm_
+
     if norm_ == 0.0:
         raise ValueError("Cannot compute normalized expectation for a zero-norm state.")
 
     mps_h = mps_n.H
     mps_h.reindex_({f"k{i}": f"b{i}" for i in range(L)})
-    return (mps_h | mpo | mps_n).contract(all, optimize=contraction_opt) / norm_
+    return (mps_h | mpo | mps_n).contract(all, optimize=contraction_opt) / divisor
 
 
 def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False, chi: int = 1, rand_strength: float = 0.0):
