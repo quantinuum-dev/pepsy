@@ -40,6 +40,17 @@ def test_build_optimizer_loads_cotengrust_before_cotengra(monkeypatch):
     assert events == ["cotengrust", "cotengra"]
 
 
+def test_expec_mpo_mps_normalized_copy_does_not_divide_twice():
+    """MPS expectations should be invariant to the input state's scale."""
+    mps = qtn.MPS_rand_state(5, bond_dim=2, phys_dim=2, dtype="complex128", seed=26)
+    mps[0].modify(data=0.2 * mps[0].data)
+    mpo = core.id_to_mpo(5, dtype="complex128")
+
+    measured = core.expec_mpo(mpo, mps, contraction_opt="auto-hq")
+
+    assert abs(measured - 1.0) < 1e-12
+
+
 def test_build_optimizer_constructs_without_seed(monkeypatch):
     """build_optimizer should configure cotengra optimizer without seed kwarg."""
     captured = {}
