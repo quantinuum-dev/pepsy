@@ -11,7 +11,7 @@ import numpy as np
 import quimb.tensor as qtn
 
 from ...backends import backend_cupy, backend_jax, backend_numpy, backend_torch
-from ...tensors import build_optimizer
+from ...tensors import build_optimizer, reg_rel_svd_jax, reg_rel_svd_torch
 from ..global_opt import GlobalOptimizer
 
 __all__ = ["EnergyEstimate", "PepsEnergyOptimizer"]
@@ -235,6 +235,76 @@ class PepsEnergyOptimizer:
             edge: cls._convert_term_array(term, converter)
             for edge, term in dict(terms).items()
         }
+
+    @staticmethod
+    def _prepare_autodiff_backend(backend):
+        key = str(backend).strip().lower()
+        try:
+            if key == "torch":
+                # Boundary-MPS contractions use SVD compression. Torch's native
+                # complex SVD backward can fail on gauge/phase-sensitive losses,
+                # so install Pepsy's regularized SVD rule. Do not register QR
+                # here: rectangular QR appears in quimb boundary compression and
+                # has a narrower custom-backward domain.
+                reg_rel_svd_torch()
+            elif key == "jax":
+                reg_rel_svd_jax()
+        except ImportError:
+            # TNOptimizer will report the missing backend if it is actually
+            # needed. Keeping this hook soft preserves optional-dependency tests.
+            return
+
+    @staticmethod
+    def _is_finite_number(value):
+        try:
+            return bool(np.isfinite(float(value)))
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _validate_initial_gradient(cls, tnopt):
+        if not (
+            hasattr(tnopt, "vectorized_value_and_grad")
+            and hasattr(getattr(tnopt, "vectorizer", None), "vector")
+        ):
+            return
+        x0 = tnopt.vectorizer.vector.copy()
+        loss0, grad0 = tnopt.vectorized_value_and_grad(x0)
+        finite_loss = cls._is_finite_number(loss0)
+        finite_grad = bool(np.all(np.isfinite(grad0)))
+        tnopt.vectorizer.vector[:] = x0
+        cls._reset_tnopt_tracking(tnopt)
+        if finite_loss and finite_grad:
+            return
+        raise ValueError(
+            "PEPS energy autodiff produced a non-finite initial gradient. "
+            "The energy value can still be finite, but differentiating through "
+            "the approximate boundary/SVD contraction is unstable for this "
+            "state. This commonly happens for Symmray PEPS after simple update. "
+            "Use PepsEnergyOptimizer.energy(...) to report the energy, continue "
+            "with simple/gate update, or switch to a non-autodiff/local "
+            "optimization route rather than a global autodiff optimizer on this "
+            "boundary objective."
+        )
+
+    @staticmethod
+    def _reset_tnopt_tracking(tnopt):
+        for name in ("losses", "loss_diffs"):
+            values = getattr(tnopt, name, None)
+            if hasattr(values, "clear"):
+                values.clear()
+        if hasattr(tnopt, "lgrdm"):
+            try:
+                tnopt.lgrdm = type(tnopt.lgrdm)()
+            except TypeError:
+                pass
+        for name, value in (
+            ("loss", float("inf")),
+            ("loss_best", float("inf")),
+            ("_n", 0),
+        ):
+            if hasattr(tnopt, name):
+                setattr(tnopt, name, value)
 
     @classmethod
     def _pick_loss_kwargs(cls, options):
@@ -461,6 +531,7 @@ class PepsEnergyOptimizer:
             self._pick_loss_kwargs(loss_kwargs),
         )
         optimizer = GlobalOptimizer._normalize_optimizer_name(optimizer)
+        self._prepare_autodiff_backend(autodiff_backend)
         incoming_constants = dict(loss_constants or {})
         terms = incoming_constants.pop("terms", self.terms)
         constants = {
@@ -499,6 +570,7 @@ class PepsEnergyOptimizer:
         return_losses: bool = False,
         normalize: bool = False,
         normalize_kwargs: Mapping[str, Any] | None = None,
+        check_finite_gradient: bool = True,
         **optimize_kwargs,
     ):
         """Run ``TNOptimizer.optimize`` and store the optimized PEPS."""
@@ -511,6 +583,8 @@ class PepsEnergyOptimizer:
             jit_fn=jit_fn,
             device=device,
         )
+        if check_finite_gradient:
+            self._validate_initial_gradient(tnopt)
         out = tnopt.optimize(n=n, **optimize_kwargs)
         self.losses = list(getattr(tnopt, "losses", ()))
         if normalize:

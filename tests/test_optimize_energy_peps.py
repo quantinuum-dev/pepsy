@@ -190,6 +190,71 @@ def test_peps_energy_make_tn_optimizer_and_optimize(monkeypatch):
     assert calls[-1] == ("optimize", 3, {})
 
 
+def test_peps_energy_make_tn_optimizer_prepares_autodiff_backend(monkeypatch):
+    """Autodiff construction should register Pepsy's stable SVD hooks."""
+    calls = []
+
+    class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
+        def __init__(self, state, loss_fn, **kwargs):
+            _ = (state, loss_fn)
+            calls.append(("tnopt", kwargs["autodiff_backend"]))
+
+    monkeypatch.setattr("pepsy.optimizers.energy.peps.qtn.TNOptimizer", _FakeTNOptimizer)
+    monkeypatch.setattr(
+        "pepsy.optimizers.energy.peps.reg_rel_svd_torch",
+        lambda: calls.append("torch-svd"),
+    )
+    monkeypatch.setattr(
+        "pepsy.optimizers.energy.peps.reg_rel_svd_jax",
+        lambda: calls.append("jax-svd"),
+    )
+    opt = PepsEnergyOptimizer(_FakePeps(value=5.0), {"edge": object()})
+
+    opt.make_tn_optimizer(autodiff_backend="torch", progbar=False)
+    opt.make_tn_optimizer(autodiff_backend="jax", progbar=False)
+
+    assert calls == [
+        "torch-svd",
+        ("tnopt", "torch"),
+        "jax-svd",
+        ("tnopt", "jax"),
+    ]
+
+
+def test_peps_energy_optimize_rejects_nonfinite_initial_gradient(monkeypatch):
+    """A finite energy with NaN gradient should fail before optimizer updates."""
+    class _FakeVectorizer:
+        def __init__(self):
+            self.vector = np.array([1.0])
+
+    class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
+        def __init__(self, state, loss_fn, **kwargs):
+            _ = (state, loss_fn, kwargs)
+            self.vectorizer = _FakeVectorizer()
+            self.losses = []
+            self.loss = 123.0
+            self.loss_best = 123.0
+            self._n = 7
+
+        def vectorized_value_and_grad(self, vector):
+            assert np.array_equal(vector, np.array([1.0]))
+            self.losses.append(float("nan"))
+            return 1.0, np.array([np.nan])
+
+        def optimize(self, n=220, **kwargs):
+            _ = (n, kwargs)
+            raise AssertionError("optimize should not run after a NaN gradient.")
+
+    monkeypatch.setattr("pepsy.optimizers.energy.peps.qtn.TNOptimizer", _FakeTNOptimizer)
+    state = _FakePeps(value=5.0)
+    opt = PepsEnergyOptimizer(state, {"edge": object()})
+
+    with pytest.raises(ValueError, match="non-finite initial gradient"):
+        opt.optimize(n=3, progbar=False)
+
+    assert opt.state is state
+
+
 def test_peps_energy_make_tn_optimizer_converts_terms_to_autodiff_backend(monkeypatch):
     """Autodiff loss constants should use the same backend dtype as the PEPS."""
     torch = pytest.importorskip("torch")
