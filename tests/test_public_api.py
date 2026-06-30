@@ -32,6 +32,7 @@ _EXPECTED_IN_ALL = [
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
     "symmray_block_summary", "symmray_mps_summary", "symmray_peps_summary", "symm_operator_from_dense",
+    "reg_complex_svd_torch", "reg_complex_svd_jax",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
@@ -42,7 +43,7 @@ _EXPECTED_NOT_IN_ALL = [
     "gates_tn_1d", "gates_tn_2d", "gates_tn_3d", "apply_2d_gate",
     "apply_2d_gates", "apply_2dtn_", "gate_2d", "gate_to_pepo", "gate_1d",
     "canonize_mps", "apply_gates_", "expec_TN_1D", "peps_I",
-    "reg_rel_svd_torch", "reg_complex_svd_torch", "reg_complex_svd_jax",
+    "reg_rel_svd_torch",
     "reg_stop_gradient_torch", "stop_grad",
     "MPSOptimizer", "MPOOptimizer",
     "boundary_metrics", "boundary_states", "boundary_sweeps", "core", "fit",
@@ -81,6 +82,7 @@ _CALLABLE_EXPORTS = [
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
     "symmray_block_summary", "symmray_mps_summary", "symmray_peps_summary", "symm_operator_from_dense",
+    "reg_complex_svd_torch", "reg_complex_svd_jax",
 ]
 
 _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
@@ -122,13 +124,15 @@ def test_module_export_resolves(name):
 
 
 def test_optional_linalg_registrations_resolve():
-    """Linalg registrations are exposed under tensor namespaces, not top-level pepsy."""
+    """Linalg registrations resolve under tensor namespaces and public wrappers."""
     has_torch = importlib.util.find_spec("torch") is not None
     has_jax = importlib.util.find_spec("jax") is not None
     assert callable(pepsy.tensors.core.reg_stop_gradient_torch)
     assert callable(pepsy.tensors.core.stop_grad)
     assert callable(pepsy.tensors.reg_stop_gradient_torch)
     assert callable(pepsy.tensors.stop_grad)
+    assert pepsy.reg_complex_svd_torch is pepsy.tensors.reg_complex_svd_torch
+    assert pepsy.reg_complex_svd_jax is pepsy.tensors.reg_complex_svd_jax
     if has_torch:
         import torch
 
