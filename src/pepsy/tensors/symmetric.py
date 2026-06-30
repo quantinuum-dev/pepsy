@@ -323,6 +323,23 @@ def _shape_size(shape):
     return int(np.prod(tuple(shape), dtype=int)) if shape else 1
 
 
+def _block_size(block, shape):
+    if hasattr(block, "numel"):
+        return int(block.numel())
+    size = getattr(block, "size", None)
+    if callable(size):
+        try:
+            size = size()
+        except TypeError:
+            size = None
+    if size is not None and not isinstance(size, tuple):
+        try:
+            return int(size)
+        except TypeError:
+            pass
+    return _shape_size(shape)
+
+
 def _summarize_symmray_index(index, axis):
     chargemap = {
         charge: int(size)
@@ -368,7 +385,7 @@ def symmray_block_summary(array):
     blocks = []
     for sector, block in array.get_sector_block_pairs():
         shape = tuple(int(dim) for dim in getattr(block, "shape", ()))
-        size = int(getattr(block, "size", _shape_size(shape)))
+        size = _block_size(block, shape)
         blocks.append(
             {
                 "sector": _as_tuple(sector),

@@ -213,6 +213,8 @@ def test_symmetric_constructors_apply_to_backend_to_symmray_blocks():
     assert tensor.data.backend == "torch"
     assert isinstance(block, torch.Tensor)
     assert block.dtype == torch.complex128
+    summary = symmray_peps_summary(state)
+    assert summary["total_stored_size"] > 0
 
     ham = SymHamiltonian.from_edges(
         "fermi_hubbard_u1u1",
