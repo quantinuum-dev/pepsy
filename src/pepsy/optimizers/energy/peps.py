@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import autoray as ar
+import numpy as np
 import quimb.tensor as qtn
 
+from ...backends import backend_cupy, backend_jax, backend_numpy, backend_torch
 from ...tensors import build_optimizer
 from ..global_opt import GlobalOptimizer
 
@@ -107,6 +109,133 @@ class PepsEnergyOptimizer:
             opts.update(dict(extra))
         return opts
 
+    @staticmethod
+    def _sample_array(value):
+        if value is None:
+            return None
+        blocks = getattr(value, "blocks", None)
+        if blocks:
+            try:
+                return next(iter(blocks.values()))
+            except StopIteration:
+                return None
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            return value
+        data = getattr(value, "data", None)
+        if hasattr(data, "shape") and hasattr(data, "dtype"):
+            return data
+        return None
+
+    @classmethod
+    def _sample_array_from_tn(cls, state):
+        tensor_map = getattr(state, "tensor_map", None)
+        if tensor_map:
+            for tensor in tensor_map.values():
+                sample = cls._sample_array(getattr(tensor, "data", None))
+                if sample is not None:
+                    return sample
+        try:
+            tensors = iter(state)
+        except TypeError:
+            return None
+        for tensor in tensors:
+            sample = cls._sample_array(getattr(tensor, "data", None))
+            if sample is not None:
+                return sample
+        return None
+
+    @classmethod
+    def _sample_array_from_terms(cls, terms):
+        for term in dict(terms).values():
+            sample = cls._sample_array(term)
+            if sample is not None:
+                return sample
+        return None
+
+    @staticmethod
+    def _dtype_name(sample):
+        if sample is None:
+            return None
+        try:
+            return ar.get_dtype_name(sample)
+        except Exception:  # pragma: no cover - defensive for unusual arrays
+            dtype = getattr(sample, "dtype", None)
+            return None if dtype is None else np.dtype(dtype).name
+
+    @classmethod
+    def _autodiff_dtype_name(cls, state, terms):
+        dtype_names = [
+            name
+            for name in (
+                cls._dtype_name(cls._sample_array_from_tn(state)),
+                cls._dtype_name(cls._sample_array_from_terms(terms)),
+            )
+            if name is not None
+        ]
+        if not dtype_names:
+            return None
+        try:
+            return np.result_type(*dtype_names).name
+        except TypeError:
+            return dtype_names[0]
+
+    @staticmethod
+    def _autodiff_backend_converter(backend, dtype_name, *, device="cpu"):
+        key = str(backend).strip().lower()
+        if dtype_name is None:
+            return None
+        if key in {"auto", "autograd"}:
+            return None
+        if key == "numpy":
+            return backend_numpy(dtype=np.dtype(dtype_name))
+        if key == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            dtype = getattr(torch, dtype_name)
+            return backend_torch(device=device, dtype=dtype)
+        if key == "jax":
+            import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+
+            dtype = getattr(jnp, dtype_name)
+            return backend_jax(device=device, dtype=dtype)
+        if key == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            dtype = getattr(cp, dtype_name)
+            return backend_cupy(dtype=dtype)
+        return None
+
+    @staticmethod
+    def _copy_array_like(value):
+        copy = getattr(value, "copy", None)
+        if callable(copy):
+            return copy()
+        return value
+
+    @classmethod
+    def _convert_term_array(cls, term, converter):
+        term = cls._copy_array_like(term)
+        apply_to_arrays = getattr(term, "apply_to_arrays", None)
+        if callable(apply_to_arrays):
+            apply_to_arrays(converter)
+            return term
+        return converter(term)
+
+    @classmethod
+    def _terms_for_autodiff_backend(cls, terms, state, autodiff_backend, *, device="cpu"):
+        dtype_name = cls._autodiff_dtype_name(state, terms)
+        converter = cls._autodiff_backend_converter(
+            autodiff_backend,
+            dtype_name,
+            device=device,
+        )
+        if converter is None:
+            return terms
+        return {
+            edge: cls._convert_term_array(term, converter)
+            for edge, term in dict(terms).items()
+        }
+
     @classmethod
     def _pick_loss_kwargs(cls, options):
         incoming = dict(options or {})
@@ -186,8 +315,27 @@ class PepsEnergyOptimizer:
             return value.real
 
     @staticmethod
-    def _stabilize_state(state):
-        if hasattr(state, "balance_bonds_"):
+    def _state_uses_symmray(state):
+        tensor_map = getattr(state, "tensor_map", None)
+        tensors = tensor_map.values() if tensor_map else state
+        try:
+            iterator = iter(tensors)
+        except TypeError:
+            return False
+        for tensor in iterator:
+            data = getattr(tensor, "data", None)
+            if data is None:
+                continue
+            module = type(data).__module__.split(".", maxsplit=1)[0]
+            if module == "symmray":
+                return True
+            if hasattr(data, "blocks") and hasattr(data, "apply_to_arrays"):
+                return True
+        return False
+
+    @classmethod
+    def _stabilize_state(cls, state):
+        if hasattr(state, "balance_bonds_") and not cls._state_uses_symmray(state):
             state.balance_bonds_()
         if hasattr(state, "equalize_norms_"):
             state.equalize_norms_(1.0)
@@ -313,9 +461,17 @@ class PepsEnergyOptimizer:
             self._pick_loss_kwargs(loss_kwargs),
         )
         optimizer = GlobalOptimizer._normalize_optimizer_name(optimizer)
-        constants = {"terms": self.terms}
-        if loss_constants:
-            constants.update(dict(loss_constants))
+        incoming_constants = dict(loss_constants or {})
+        terms = incoming_constants.pop("terms", self.terms)
+        constants = {
+            "terms": self._terms_for_autodiff_backend(
+                terms,
+                self.state,
+                autodiff_backend,
+                device=device,
+            )
+        }
+        constants.update(incoming_constants)
         return qtn.TNOptimizer(
             self.state,
             self._tnopt_loss,

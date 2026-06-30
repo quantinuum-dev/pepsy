@@ -67,6 +67,38 @@ def test_peps_energy_loss_calls_local_expectation_with_expected_options():
     assert kwargs["contract_optimize"] == "auto-hq"
 
 
+def test_peps_energy_stabilize_skips_balance_for_symmray_blocks():
+    """Symmray PEPS stabilization should avoid fragile bond balancing."""
+
+    class _SymmrayLikeData:
+        blocks = {"q0": np.ones((1,))}
+
+        def apply_to_arrays(self, fn):
+            self.blocks = {
+                sector: fn(block)
+                for sector, block in self.blocks.items()
+            }
+
+    class _FakeTensor:
+        data = _SymmrayLikeData()
+
+    class _SymmrayPeps(_FakePeps):
+        tensor_map = {"I0,0": _FakeTensor()}
+
+        def balance_bonds_(self):
+            raise AssertionError("Symmray-backed stabilization should not balance bonds.")
+
+    state = _SymmrayPeps()
+    opt = PepsEnergyOptimizer(
+        state,
+        {"edge": object()},
+        stabilize_state=True,
+    )
+
+    assert opt.loss() == pytest.approx(2.0)
+    assert state.equalized_to == pytest.approx(1.0)
+
+
 def test_peps_energy_returns_full_and_per_site_estimate():
     """energy() should report both total energy and energy per site."""
     state = _FakePeps(value=9.0)
@@ -156,6 +188,57 @@ def test_peps_energy_make_tn_optimizer_and_optimize(monkeypatch):
     assert opt.state is out
     assert losses == (2.0, 1.0)
     assert calls[-1] == ("optimize", 3, {})
+
+
+def test_peps_energy_make_tn_optimizer_converts_terms_to_autodiff_backend(monkeypatch):
+    """Autodiff loss constants should use the same backend dtype as the PEPS."""
+    torch = pytest.importorskip("torch")
+    calls = []
+
+    class _FakeTensor:
+        def __init__(self):
+            self.data = np.ones((1,), dtype=np.complex128)
+
+    class _FakeBlockTerm:
+        def __init__(self, blocks):
+            self.blocks = blocks
+
+        def copy(self):
+            return type(self)({
+                sector: block.copy()
+                for sector, block in self.blocks.items()
+            })
+
+        def apply_to_arrays(self, fn):
+            self.blocks = {
+                sector: fn(block)
+                for sector, block in self.blocks.items()
+            }
+            return self
+
+    class _FakePepsWithBlocks(_FakePeps):
+        tensor_map = {"I0,0": _FakeTensor()}
+
+    class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
+        def __init__(self, state, loss_fn, **kwargs):
+            _ = (state, loss_fn)
+            calls.append(kwargs)
+
+    monkeypatch.setattr("pepsy.optimizers.energy.peps.qtn.TNOptimizer", _FakeTNOptimizer)
+
+    term = _FakeBlockTerm({"q0": np.ones((1,), dtype=np.float64)})
+    opt = PepsEnergyOptimizer(
+        _FakePepsWithBlocks(value=5.0),
+        {"edge": term},
+    )
+
+    opt.make_tn_optimizer(autodiff_backend="torch", progbar=False)
+
+    converted = calls[-1]["loss_constants"]["terms"]["edge"].blocks["q0"]
+    assert isinstance(converted, torch.Tensor)
+    assert converted.dtype == torch.complex128
+    assert isinstance(term.blocks["q0"], np.ndarray)
+    assert term.blocks["q0"].dtype == np.float64
 
 
 def test_peps_energy_normalize_translates_projector_mode(monkeypatch):
