@@ -193,6 +193,18 @@ def _format_shape(shape):
     return "x".join(str(int(dim)) for dim in shape) or "scalar"
 
 
+def _charge_particle_number(charge):
+    """Total particle number carried by a tensor charge (sum of components)."""
+    if charge is None:
+        return None
+    if isinstance(charge, tuple):
+        return sum(int(x) for x in charge)
+    try:
+        return int(charge)
+    except (TypeError, ValueError):
+        return None
+
+
 def _add_charges(a, b):
     if isinstance(a, tuple) or isinstance(b, tuple):
         a_t = a if isinstance(a, tuple) else (a,) * len(b)
@@ -1426,6 +1438,7 @@ def draw_symmray_peps(
     show_diagnostics=False,
     show_blocks=False,
     show_block_labels=False,
+    charge_in_node=False,
     max_blocks_per_site=4,
     node_shape="circle",
     node_radius=0.22,
@@ -1437,6 +1450,10 @@ def draw_symmray_peps(
     The schematic follows the compact :mod:`quimb.schematic` style with a PEPS
     lattice, virtual-bond arrows, physical legs, and optional Symmray block and
     dimension labels.
+
+    Set ``charge_in_node=True`` to print each tensor's charge ``q`` and total
+    particle number ``N`` (the sum of the charge components) centered inside its
+    node circle; the node is enlarged automatically so the text fits.
     """
     summary = symmray_peps_summary(peps)
     max_blocks_per_site = int(max_blocks_per_site)
@@ -1564,17 +1581,36 @@ def draw_symmray_peps(
             )
 
     show_block_labels = bool(show_block_labels)
+    charge_in_node = bool(charge_in_node)
+    node_text_radius = node_radius
+    if charge_in_node and node_shape == "circle":
+        node_text_radius = max(node_radius, 0.32)
     for tensor in shown_tensors:
         site = tensor["site"]
         x_pos, y_pos = xy_by_site[site]
         preset = "center" if site == center_site else ("site_a" if sum(site) % 2 == 0 else "site_b")
 
         if node_shape == "circle":
-            drawing.circle((x_pos, y_pos), radius=node_radius, preset=preset, zorder=3)
+            drawing.circle((x_pos, y_pos), radius=node_text_radius, preset=preset, zorder=3)
         elif node_shape == "cube":
             drawing.cube((x_pos, y_pos, 0.0), preset=preset, zorder=3)
         else:
             raise ValueError("node_shape must be 'circle' or 'cube'.")
+
+        if charge_in_node and tensor["charge"] is not None:
+            node_lines = [rf"$q={_format_charge(tensor['charge'])}$"]
+            particle = _charge_particle_number(tensor["charge"])
+            if particle is not None:
+                node_lines.append(rf"$N={particle}$")
+            drawing.text(
+                (x_pos, y_pos),
+                "\n".join(node_lines),
+                fontsize=6.4,
+                ha="center",
+                va="center",
+                color=(1.0, 1.0, 1.0, 1.0),
+                zorder=4,
+            )
 
         phys_xy = (x_pos - 0.30, y_pos - 0.42)
         drawing.line((x_pos, y_pos), phys_xy, preset="phys", zorder=1)
@@ -1589,7 +1625,7 @@ def draw_symmray_peps(
 
         if show_tensor_labels:
             label_lines = [rf"$T_{{({site[0]},{site[1]})}}$"]
-            if tensor["charge"] is not None:
+            if tensor["charge"] is not None and not charge_in_node:
                 label_lines.append(rf"$q={_format_charge(tensor['charge'])}$")
             if not show_blocks:
                 label_lines.append(rf"$B={tensor['num_blocks']}$")
@@ -1600,7 +1636,7 @@ def draw_symmray_peps(
                 else (0.06, 0.20, 0.30, 1.0)
             )
             drawing.text(
-                (x_pos, y_pos + 0.34),
+                (x_pos, y_pos + node_text_radius + 0.12),
                 label,
                 fontsize=7.5,
                 ha="center",
@@ -1632,7 +1668,7 @@ def draw_symmray_peps(
             gap = 0.032
             total_width = len(blocks) * block_width + (len(blocks) - 1) * gap
             start = x_pos - 0.5 * total_width
-            block_y = y_pos - 0.34
+            block_y = y_pos - node_text_radius - 0.12
             for block_pos, block in enumerate(blocks):
                 bx = start + block_pos * (block_width + gap)
                 color = schematic.hash_to_color(str(block["sector"]))

@@ -146,6 +146,9 @@ def test_symmray_peps_summary_and_schematic_for_z2_grid():
     assert hasattr(drawing, "ax")
     assert drawn_summary["bonds"] == summary["bonds"]
 
+    node_drawing = draw_symmray_peps(state, charge_in_node=True)
+    assert hasattr(node_drawing, "fig")
+
 
 def test_symmetric_state_uses_psi_with_network_compatibility_alias():
     """SymMPS should prefer psi/mps naming while keeping network compatibility."""
