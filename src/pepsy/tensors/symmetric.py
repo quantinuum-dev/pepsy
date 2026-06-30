@@ -205,6 +205,46 @@ def _charge_particle_number(charge):
         return None
 
 
+def _format_signed_half_integer(twice_value):
+    twice_value = int(twice_value)
+    if twice_value == 0:
+        return "0"
+    if twice_value % 2 == 0:
+        value = twice_value // 2
+        return f"+{value}" if value > 0 else str(value)
+    sign = "+" if twice_value > 0 else "-"
+    return f"{sign}{abs(twice_value)}/2"
+
+
+def _charge_spin_label_lines(charge):
+    """Return compact in-node charge/spin labels for spin-resolved charges."""
+    if not (isinstance(charge, tuple) and len(charge) == 2):
+        return None
+    try:
+        n_up, n_down = (int(charge[0]), int(charge[1]))
+    except (TypeError, ValueError):
+        return None
+    charge_total = n_up + n_down
+    spin_twice = n_up - n_down
+    return [
+        rf"$Q={charge_total}$",
+        rf"$S_z={_format_signed_half_integer(spin_twice)}$",
+    ]
+
+
+def _node_charge_label_lines(charge):
+    if charge is None:
+        return []
+    spin_lines = _charge_spin_label_lines(charge)
+    if spin_lines is not None:
+        return spin_lines
+    node_lines = [rf"$q={_format_charge(charge)}$"]
+    particle = _charge_particle_number(charge)
+    if particle is not None:
+        node_lines.append(rf"$N={particle}$")
+    return node_lines
+
+
 def _add_charges(a, b):
     if isinstance(a, tuple) or isinstance(b, tuple):
         a_t = a if isinstance(a, tuple) else (a,) * len(b)
@@ -1438,7 +1478,7 @@ def draw_symmray_peps(
     show_diagnostics=False,
     show_blocks=False,
     show_block_labels=False,
-    charge_in_node=False,
+    charge_in_node=True,
     max_blocks_per_site=4,
     node_shape="circle",
     node_radius=0.22,
@@ -1451,9 +1491,12 @@ def draw_symmray_peps(
     lattice, virtual-bond arrows, physical legs, and optional Symmray block and
     dimension labels.
 
-    Set ``charge_in_node=True`` to print each tensor's charge ``q`` and total
-    particle number ``N`` (the sum of the charge components) centered inside its
-    node circle; the node is enlarged automatically so the text fits.
+    By default each node circle contains a compact white charge label. For
+    spin-resolved two-component charges this is the total charge ``Q`` and
+    spin projection ``S_z``; for other charges it shows the tensor charge ``q``
+    and total particle number ``N`` where available. The node is enlarged
+    automatically so the text fits. Set ``charge_in_node=False`` to keep the
+    charge outside the node with the tensor label.
     """
     summary = symmray_peps_summary(peps)
     max_blocks_per_site = int(max_blocks_per_site)
@@ -1598,10 +1641,7 @@ def draw_symmray_peps(
             raise ValueError("node_shape must be 'circle' or 'cube'.")
 
         if charge_in_node and tensor["charge"] is not None:
-            node_lines = [rf"$q={_format_charge(tensor['charge'])}$"]
-            particle = _charge_particle_number(tensor["charge"])
-            if particle is not None:
-                node_lines.append(rf"$N={particle}$")
+            node_lines = _node_charge_label_lines(tensor["charge"])
             drawing.text(
                 (x_pos, y_pos),
                 "\n".join(node_lines),

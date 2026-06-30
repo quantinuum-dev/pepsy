@@ -165,13 +165,17 @@ PEPS, use ``symmray_peps_summary`` and ``draw_symmray_peps``. These expose the
 scientific structure that is usually hidden in a dense drawing: each site
 tensor's block count, physical charge sectors, virtual-bond sector maps, and
 aggregate block-sparse storage density. The default schematics follow the
-compact quimb style with tensor nodes, physical legs, and bond arrows; labels
-and diagnostics are opt-in.
+compact quimb style with tensor nodes, physical legs, and bond arrows; extended
+bond/physical labels and diagnostics are opt-in.
 
-In the detailed drawing mode, ``T_i`` is the site tensor, ``q`` is that tensor's
-Symmray charge, ``B`` is the number of stored block sectors, ``e_i`` is a
-virtual bond, and ``q_e``/``q_p`` are the virtual/physical charge-sector maps.
-Bond labels include the two local index orientations, for example
+In the detailed drawing mode, ``T_i`` is the site tensor, ``B`` is the number of
+stored block sectors, ``e_i`` is a virtual bond, and ``q_e``/``q_p`` are the
+virtual/physical charge-sector maps. PEPS node circles show compact white charge
+labels by default: spin-resolved two-component charges use total charge ``Q``
+and spin projection ``S_z=(N_up-N_down)/2``, while other charges use the raw
+Symmray charge ``q`` and total particle number ``N`` where available. Set
+``charge_in_node=False`` to move the raw charge back outside the node with the
+tensor label. Bond labels include the two local index orientations, for example
 ``out->in``, so the charge-flow convention is visible on the same line as the
 bond dimension. Diagnostics include both ``charge_total`` and ``Q_total``; for
 ``Z2`` states ``Q_total`` is reduced modulo two. Colored block tiles are

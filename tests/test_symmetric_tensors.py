@@ -150,6 +150,38 @@ def test_symmray_peps_summary_and_schematic_for_z2_grid():
     assert hasattr(node_drawing, "fig")
 
 
+def test_symmray_peps_schematic_shows_spinful_charge_labels_inside_nodes():
+    """Spin-resolved PEPS charges should render as white Q/Sz node labels."""
+    pytest.importorskip("matplotlib")
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1U1",
+        phys_dim=default_physical_sectors(model="fermi_hubbard_u1u1"),
+        fermionic=True,
+        site_charge=site_charge_from_occupations(
+            {
+                (0, 0): (1, 0),
+                (0, 1): (0, 1),
+                (1, 0): (1, 0),
+                (1, 1): (0, 1),
+            }
+        ),
+        bond_dim=2,
+        seed=30,
+        dtype="complex128",
+    )
+
+    drawing = draw_symmray_peps(state, show_tensor_labels=False)
+    labels = [text.get_text() for text in drawing.ax.texts]
+    node_texts = [text for text in drawing.ax.texts if "$Q=" in text.get_text()]
+
+    assert any("$Q=1$" in label and "$S_z=+1/2$" in label for label in labels)
+    assert any("$Q=1$" in label and "$S_z=-1/2$" in label for label in labels)
+    assert node_texts
+    assert all(text.get_color() == (1.0, 1.0, 1.0, 1.0) for text in node_texts)
+
+
 def test_symmetric_state_uses_psi_with_network_compatibility_alias():
     """SymMPS should prefer psi/mps naming while keeping network compatibility."""
     state = SymMPS.random(
