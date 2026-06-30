@@ -2044,11 +2044,11 @@ class SymHamiltonian:
     gate_stream = trotter_gates
 
 
-@dataclass
+@dataclass(init=False)
 class _SymState:
     """Shared implementation for symmetric tensor-network states."""
 
-    network: qtn.TensorNetwork
+    psi: qtn.TensorNetwork
     symmetry: str
     edges: tuple
     fermionic: bool = False
@@ -2060,20 +2060,78 @@ class _SymState:
     phys_sectors: dict | None = None
     site_charge: object = None
 
+    def __init__(
+        self,
+        psi=None,
+        symmetry=None,
+        edges=None,
+        *,
+        network=None,
+        mps=None,
+        peps=None,
+        fermionic=False,
+        model=None,
+        hamiltonian=None,
+        contraction_opt="auto-hq",
+        site_ind_id="k{}",
+        gauges=None,
+        phys_sectors=None,
+        site_charge=None,
+    ):
+        supplied_states = [
+            (name, value)
+            for name, value in (
+                ("psi", psi),
+                ("network", network),
+                ("mps", mps),
+                ("peps", peps),
+            )
+            if value is not None
+        ]
+        if len(supplied_states) != 1:
+            raise TypeError("Pass exactly one of `psi`, `network`, `mps`, or `peps`.")
+
+        state_name, state = supplied_states[0]
+        class_name = type(self).__name__
+        if state_name == "mps" and class_name != "SymMPS":
+            raise TypeError("`mps=` is only valid when constructing `SymMPS`.")
+        if state_name == "peps" and class_name != "SymPEPS":
+            raise TypeError("`peps=` is only valid when constructing `SymPEPS`.")
+        if symmetry is None:
+            raise TypeError("`symmetry` is required.")
+        if edges is None:
+            raise TypeError("`edges` is required.")
+
+        self.psi = state
+        self.symmetry = symmetry
+        self.edges = edges
+        self.fermionic = bool(fermionic)
+        self.model = model
+        self.hamiltonian = hamiltonian
+        self.contraction_opt = contraction_opt
+        self.site_ind_id = site_ind_id
+        self.gauges = gauges
+        self.phys_sectors = phys_sectors
+        self.site_charge = site_charge
+
     @property
     def tn(self):
         """The wrapped quimb tensor network."""
-        return self.network
+        return self.psi
 
     @property
-    def psi(self):
-        """Alias for the wrapped state."""
-        return self.network
+    def network(self):
+        """Compatibility alias for the wrapped quimb tensor network."""
+        return self.psi
+
+    @network.setter
+    def network(self, value):
+        self.psi = value
 
     def copy(self):
         """Return a shallow configuration copy with a copied tensor network."""
         return type(self)(
-            network=self.network.copy(),
+            psi=self.psi.copy(),
             symmetry=self.symmetry,
             edges=self.edges,
             fermionic=self.fermionic,
@@ -2089,8 +2147,8 @@ class _SymState:
     @property
     def sites(self):
         """Return the sites in the wrapped state."""
-        if hasattr(self.network, "gen_site_coos"):
-            return tuple(self.network.gen_site_coos())
+        if hasattr(self.psi, "gen_site_coos"):
+            return tuple(self.psi.gen_site_coos())
         return tuple(range(self.num_sites))
 
     def charge_at(self, site):
@@ -2233,7 +2291,7 @@ class _SymState:
             obs_use = self._coerce_observable(obs, where, charge=charge)
 
         return measure_obs(
-            self.network,
+            self.psi,
             obs_use,
             where=where,
             ind_id=self.site_ind_id,
@@ -2300,11 +2358,11 @@ class _SymState:
     def norm(self, *, contraction_opt=None):
         """Return ``<psi|psi>`` using the configured contraction optimizer."""
         opt = self.contraction_opt if contraction_opt is None else contraction_opt
-        return _as_scalar((self.network.H & self.network).contract(all, optimize=opt))
+        return _as_scalar((self.psi.H & self.psi).contract(all, optimize=opt))
 
     def normalize(self):
         """Normalize the wrapped tensor network in place."""
-        self.network.normalize()
+        self.psi.normalize()
         return self
 
     def trotter_gates(self, dt, *, model=None, hamiltonian=None, imaginary=False, order=1, **params):
@@ -2344,8 +2402,8 @@ class _SymState:
             if not contract_auto:
                 opts.setdefault("contract", contract)
             opts.update({} if gate_kwargs is None else dict(gate_kwargs))
-            target.network = pepsy_gate(
-                target.network,
+            target.psi = pepsy_gate(
+                target.psi,
                 tuple(gates),
                 inplace=True,
                 **opts,
@@ -2362,8 +2420,8 @@ class _SymState:
                 gauges_use = target.gauges if target.gauges is not None else {}
             opts = dict(compress_opts)
             opts.update({} if gate_kwargs is None else dict(gate_kwargs))
-            target.network = gate_simple(
-                target.network,
+            target.psi = gate_simple(
+                target.psi,
                 tuple(gates),
                 gauges=gauges_use,
                 inplace=True,
@@ -2380,7 +2438,7 @@ class _SymState:
         for gate, where in gates:
             inds = [_format_site_ind(site, target.site_ind_id) for site in where]
             qtn.tensor_network_gate_inds(
-                target.network,
+                target.psi,
                 gate,
                 inds,
                 contract="split" if contract_auto else contract,
@@ -2476,12 +2534,12 @@ class _SymState:
         """Estimate ``<psi|H|psi>`` from local two-site Symmray terms."""
         ham = self.require_hamiltonian(model=model, hamiltonian=hamiltonian, **params)
         opt = self.contraction_opt if contraction_opt is None else contraction_opt
-        bra = self.network.H
+        bra = self.psi.H
         total = 0
         for edge, term in ham.terms.items():
             inds = [_format_site_ind(site, self.site_ind_id) for site in edge]
             gated = qtn.tensor_network_gate_inds(
-                self.network,
+                self.psi,
                 term,
                 inds,
                 contract="split",
@@ -2531,7 +2589,7 @@ class SymMPS(_SymState):
         phys_sectors = _resolve_phys_sectors(symmetry, phys_dim)
         sr = _require_symmray()
         constructor = sr.TN_fermionic_from_edges_rand if fermionic else sr.TN_abelian_from_edges_rand
-        network = constructor(
+        mps = constructor(
             symmetry,
             edges,
             bond_dim=bond_dim,
@@ -2544,7 +2602,7 @@ class SymMPS(_SymState):
             subsizes=subsizes,
             **kwargs,
         )
-        network.view_as_(
+        mps.view_as_(
             qtn.MatrixProductState,
             L=int(L),
             site_tag_id="I{}",
@@ -2552,7 +2610,7 @@ class SymMPS(_SymState):
             cyclic=False,
         )
         return cls(
-            network=network,
+            mps=mps,
             symmetry=str(symmetry),
             edges=edges,
             fermionic=bool(fermionic),
@@ -2576,6 +2634,15 @@ class SymMPS(_SymState):
         )
         state.model = model_norm
         return state
+
+    @property
+    def mps(self):
+        """The wrapped quimb matrix-product state."""
+        return self.psi
+
+    @mps.setter
+    def mps(self, value):
+        self.psi = value
 
     def time_evolve_mps_optimizer(
         self,
@@ -2606,10 +2673,10 @@ class SymMPS(_SymState):
         target = self if inplace else self.copy()
         ham = target.require_hamiltonian(model=model, hamiltonian=hamiltonian, **params)
         stream = ham.gate_stream(dt, imaginary=imaginary, order=order).repeat(int(steps))
-        chi_use = target.network.max_bond() if chi is None else int(chi)
+        chi_use = target.psi.max_bond() if chi is None else int(chi)
         opt_kwargs = {} if optimizer_kwargs is None else dict(optimizer_kwargs)
         opt = MpsOptimizer(
-            target.network,
+            target.psi,
             stream,
             chi=chi_use,
             mode=mode,
@@ -2631,13 +2698,13 @@ class SymMPS(_SymState):
             )
         if run_kwargs is not None:
             run_opts.update(dict(run_kwargs))
-        target.network = opt.run(**run_opts)
+        target.psi = opt.run(**run_opts)
         return target
 
     @property
     def num_sites(self):
         """Number of MPS sites."""
-        return int(self.network.L)
+        return int(self.psi.L)
 
     @property
     def L(self):
@@ -2671,7 +2738,7 @@ class SymPEPS(_SymState):
         phys_sectors = _resolve_phys_sectors(symmetry, phys_dim)
         sr = _require_symmray()
         constructor = sr.PEPS_fermionic_rand if fermionic else sr.PEPS_abelian_rand
-        network = constructor(
+        peps = constructor(
             symmetry,
             Lx=int(Lx),
             Ly=int(Ly),
@@ -2690,7 +2757,7 @@ class SymPEPS(_SymState):
         )
         edges = _as_edges(qtn.edges_2d_square(int(Lx), int(Ly), cyclic=cyclic))
         return cls(
-            network=network,
+            peps=peps,
             symmetry=str(symmetry),
             edges=edges,
             fermionic=bool(fermionic),
@@ -2715,6 +2782,15 @@ class SymPEPS(_SymState):
         )
         state.model = model_norm
         return state
+
+    @property
+    def peps(self):
+        """The wrapped quimb projected-entangled pair state."""
+        return self.psi
+
+    @peps.setter
+    def peps(self, value):
+        self.psi = value
 
     @staticmethod
     def _is_site_coordinate(site):
@@ -2827,7 +2903,7 @@ class SymPEPS(_SymState):
                 second_dense=second_dense,
                 compress_opts=compress_opts,
             )
-            norm_tn = self.network.make_norm(layer_tags=layer_tags)
+            norm_tn = self.psi.make_norm(layer_tags=layer_tags)
             plaquette_envs = {}
             for x_bsz, y_bsz in calc_plaquette_sizes(terms.keys(), autogroup):
                 plaquette_envs.update(
@@ -2919,7 +2995,7 @@ class SymPEPS(_SymState):
         progress,
         equalize_norms,
     ):
-        ket_obs = self.network.copy()
+        ket_obs = self.psi.copy()
         for obs_i, where_i, charge_i in measurement_terms:
             sites = self._sites_from_where(where_i)
             obs_use = self._coerce_observable(obs_i, where_i, charge=charge_i)
@@ -2937,9 +3013,9 @@ class SymPEPS(_SymState):
             )
 
         if bra is None:
-            bra_network = self.network
+            bra_network = self.psi
         elif isinstance(bra, _SymState):
-            bra_network = bra.network
+            bra_network = bra.psi
         else:
             bra_network = bra
 
@@ -2960,7 +3036,7 @@ class SymPEPS(_SymState):
             return numerator
 
         if norm is None:
-            denom_tn = self.network.make_norm(layer_tags=layer_tags)
+            denom_tn = self.psi.make_norm(layer_tags=layer_tags)
             norm = self._contract_quimb_double_layer(
                 denom_tn,
                 chi=chi,
@@ -3095,7 +3171,7 @@ class SymPEPS(_SymState):
                 compress_opts=compress_opts,
             )
 
-        value = self.network.compute_local_expectation(
+        value = self.psi.compute_local_expectation(
             terms,
             max_bond=chi,
             cutoff=cutoff,
@@ -3120,14 +3196,14 @@ class SymPEPS(_SymState):
     @property
     def num_sites(self):
         """Number of PEPS sites."""
-        return int(self.network.Lx) * int(self.network.Ly)
+        return int(self.psi.Lx) * int(self.psi.Ly)
 
     @property
     def Lx(self):
         """PEPS x dimension."""
-        return int(self.network.Lx)
+        return int(self.psi.Lx)
 
     @property
     def Ly(self):
         """PEPS y dimension."""
-        return int(self.network.Ly)
+        return int(self.psi.Ly)

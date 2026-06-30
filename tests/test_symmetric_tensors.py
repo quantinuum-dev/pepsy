@@ -147,6 +147,111 @@ def test_symmray_peps_summary_and_schematic_for_z2_grid():
     assert drawn_summary["bonds"] == summary["bonds"]
 
 
+def test_symmetric_state_uses_psi_with_network_compatibility_alias():
+    """SymMPS should prefer psi/mps naming while keeping network compatibility."""
+    state = SymMPS.random(
+        4,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations([0] * 4),
+        bond_dim=2,
+        seed=4,
+        dtype="complex128",
+    )
+
+    assert state.psi is state.tn
+    assert state.network is state.psi
+    assert state.mps is state.psi
+
+    wrapped_from_psi = SymMPS(
+        psi=state.psi.copy(),
+        symmetry=state.symmetry,
+        edges=state.edges,
+        site_ind_id=state.site_ind_id,
+        phys_sectors=state.phys_sectors,
+        site_charge=state.site_charge,
+    )
+    wrapped_from_network = SymMPS(
+        network=state.psi.copy(),
+        symmetry=state.symmetry,
+        edges=state.edges,
+        site_ind_id=state.site_ind_id,
+        phys_sectors=state.phys_sectors,
+        site_charge=state.site_charge,
+    )
+    wrapped_from_mps = SymMPS(
+        mps=state.psi.copy(),
+        symmetry=state.symmetry,
+        edges=state.edges,
+        site_ind_id=state.site_ind_id,
+        phys_sectors=state.phys_sectors,
+        site_charge=state.site_charge,
+    )
+
+    assert wrapped_from_psi.tn is wrapped_from_psi.psi
+    assert wrapped_from_network.network is wrapped_from_network.psi
+    assert wrapped_from_mps.mps is wrapped_from_mps.psi
+
+    replacement = state.psi.copy()
+    wrapped_from_psi.network = replacement
+    assert wrapped_from_psi.psi is replacement
+
+    with pytest.raises(TypeError, match="exactly one"):
+        SymMPS(
+            psi=state.psi,
+            network=state.psi,
+            symmetry=state.symmetry,
+            edges=state.edges,
+        )
+
+    with pytest.raises(TypeError, match="only valid"):
+        SymMPS(
+            peps=state.psi,
+            symmetry=state.symmetry,
+            edges=state.edges,
+        )
+
+
+def test_sympeps_accepts_peps_constructor_alias():
+    """SymPEPS should expose peps as the shape-specific wrapped state name."""
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations({(i, j): 0 for i in range(2) for j in range(2)}),
+        bond_dim=2,
+        seed=5,
+        dtype="complex128",
+    )
+
+    assert state.peps is state.psi
+    assert state.network is state.psi
+
+    wrapped = SymPEPS(
+        peps=state.peps.copy(),
+        symmetry=state.symmetry,
+        edges=state.edges,
+        site_ind_id=state.site_ind_id,
+        phys_sectors=state.phys_sectors,
+        site_charge=state.site_charge,
+    )
+
+    assert wrapped.peps is wrapped.psi
+    assert wrapped.tn is wrapped.psi
+
+    replacement = state.peps.copy()
+    wrapped.peps = replacement
+    assert wrapped.psi is replacement
+
+    with pytest.raises(TypeError, match="only valid"):
+        SymPEPS(
+            mps=state.peps,
+            symmetry=state.symmetry,
+            edges=state.edges,
+        )
+
+
 def _square_lattice_edges(Lx, Ly):
     """Return nearest-neighbor square-lattice edges in row-major MPS order."""
     edges = []
