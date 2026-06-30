@@ -1218,6 +1218,89 @@ def test_peps_normalize_can_skip_bond_balancing(monkeypatch):
     assert ket.balanced is False
 
 
+def test_peps_normalize_retries_stripped_when_full_cost_is_nonfinite(monkeypatch):
+    """normalize should avoid dividing the state by a non-finite full norm."""
+
+    class _Ket:
+        def __init__(self):
+            self.divisor = None
+            self.exponent = 0.0
+
+        def __itruediv__(self, value):
+            self.divisor = value
+            return self
+
+        def balance_bonds_(self):
+            raise AssertionError("balance_bonds=False should skip balancing.")
+
+    class _Norm:
+        def __init__(self):
+            self.strip_calls = []
+
+        def contract_boundary(self, **kwargs):
+            strip = kwargs["final_contract_opts"]["strip_exponent"]
+            self.strip_calls.append(strip)
+            if not strip:
+                return complex(float("nan"), float("nan"))
+            return 4.0, 6.0
+
+    norm = _Norm()
+
+    def fake_build_bra_ket(ket=None, *, bra=None):
+        assert bra is None
+        return ket, norm
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "build_bra_ket", fake_build_bra_ket)
+
+    ket = _Ket()
+    with pytest.warns(RuntimeWarning, match="retrying with strip_exponent=True"):
+        old_norm = pepsy.peps_normalize(
+            ket,
+            chi=7,
+            method="mps",
+            balance_bonds=False,
+        )
+
+    assert old_norm == 4.0e6
+    assert ket.divisor == 2.0
+    assert ket.exponent == pytest.approx(-3.0)
+    assert norm.strip_calls == [False, True]
+
+
+def test_peps_normalize_rejects_nonfinite_stripped_cost_before_mutation(monkeypatch):
+    """A genuinely non-finite stripped norm should fail before rescaling data."""
+
+    class _Ket:
+        def __init__(self):
+            self.divisor = None
+
+        def __itruediv__(self, value):
+            self.divisor = value
+            return self
+
+    class _Norm:
+        def contract_boundary(self, **kwargs):
+            assert kwargs["final_contract_opts"]["strip_exponent"] is True
+            return float("nan"), 0.0
+
+    def fake_build_bra_ket(ket=None, *, bra=None):
+        assert bra is None
+        return ket, _Norm()
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "build_bra_ket", fake_build_bra_ket)
+
+    ket = _Ket()
+    with pytest.raises(ValueError, match="Boundary norm cost is not finite"):
+        pepsy.peps_normalize(
+            ket,
+            chi=7,
+            method="mps",
+            strip_exponent=True,
+        )
+
+    assert ket.divisor is None
+
+
 def test_contract_flat_mps_does_not_add_default_layer_tags():
     """Flat contractions should not assume PEPSY KET/BRA layer tags."""
     captured = {}

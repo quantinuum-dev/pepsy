@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import warnings
 from dataclasses import dataclass
 
@@ -115,6 +116,40 @@ def _format_scaled_output(value, *, strip_exponent):
     return _scaled_to_complex((mantissa, exponent))
 
 
+def _is_finite_scaled_scalar(value):
+    mantissa, exponent = _as_scaled_scalar(value)
+    try:
+        mantissa = complex(mantissa)
+        exponent = float(exponent)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(mantissa.real)
+        and math.isfinite(mantissa.imag)
+        and math.isfinite(exponent)
+    )
+
+
+def _ensure_finite_norm_value(norm_value):
+    if not _is_finite_scaled_scalar(norm_value):
+        raise ValueError(
+            "Boundary norm cost is not finite; cannot normalize state. "
+            "Use strip_exponent=True for very large or very small norms, "
+            "or inspect the state for NaN/Inf tensor entries."
+        )
+
+
+def _warn_retry_stripped_norm(reason):
+    warnings.warn(
+        "Boundary norm cost was "
+        f"{reason}; retrying with strip_exponent=True. Pass "
+        "strip_exponent=True to receive the stable (mantissa, exponent) "
+        "old norm directly.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
 def _accumulate_tn_exponent(tn, exponent_delta):
     """Apply a base-10 exponent shift to a tensor network when available."""
     if exponent_delta == 0.0:
@@ -129,6 +164,7 @@ def _accumulate_tn_exponent(tn, exponent_delta):
 
 def _normalize_by_scaled_norm(tn, norm_value):
     """Normalize ``tn`` using a scalar or ``(mantissa, exponent)`` norm."""
+    _ensure_finite_norm_value(norm_value)
     mantissa, exponent = _as_scaled_scalar(norm_value)
     if abs(complex(mantissa)) == 0:
         raise ZeroDivisionError("Boundary norm cost is zero; cannot normalize state.")
@@ -880,7 +916,10 @@ def peps_normalize(
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     strip_exponent : bool, default=False
         If ``True``, use stripped boundary contractions and return
-        ``(mantissa, exponent)`` for the old norm estimate.
+        ``(mantissa, exponent)`` for the old norm estimate. If ``False`` and
+        the full norm estimate is non-finite, normalization retries with the
+        stripped representation before mutating ``p`` and emits a
+        ``RuntimeWarning``.
     balance_bonds : bool, default=True
         If ``True``, call ``balance_bonds_()`` after rescaling the state.
 
@@ -894,8 +933,7 @@ def peps_normalize(
         raise ValueError("p must not be None.")
     chi = _validate_chi(chi)
 
-    result, ket_tagged, _ = _contract_state_norm(
-        p,
+    contract_kwargs = dict(
         chi=chi,
         bdy=bdy,
         method=method,
@@ -908,14 +946,37 @@ def peps_normalize(
         fit_mode=fit_mode,
         single_layer=single_layer,
         visualize=visualize,
-        strip_exponent=strip_exponent,
         mode_=mode_,
         sequence=sequence,
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
     )
+    try:
+        result, ket_tagged, _ = _contract_state_norm(
+            p,
+            strip_exponent=strip_exponent,
+            **contract_kwargs,
+        )
+    except OverflowError:
+        if strip_exponent:
+            raise
+        _warn_retry_stripped_norm("overflowing")
+        result, ket_tagged, _ = _contract_state_norm(
+            p,
+            strip_exponent=True,
+            **contract_kwargs,
+        )
     cost = result.cost
+    if not strip_exponent and not _is_finite_scaled_scalar(cost):
+        _warn_retry_stripped_norm("not finite")
+        result, ket_tagged, _ = _contract_state_norm(
+            p,
+            strip_exponent=True,
+            **contract_kwargs,
+        )
+        cost = result.cost
+    _ensure_finite_norm_value(cost)
     old_norm = _format_scaled_output(cost, strip_exponent=strip_exponent)
     _normalize_by_scaled_norm(ket_tagged, cost)
     if balance_bonds:
