@@ -2054,6 +2054,20 @@ def _format_site_ind(site, site_ind_id):
 
 
 def _as_scalar(value):
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        shape = tuple(shape)
+        if shape != ():
+            return value
+        detach = getattr(value, "detach", None)
+        if callable(detach):
+            value = detach()
+        cpu = getattr(value, "cpu", None)
+        if callable(cpu):
+            value = cpu()
+        item = getattr(value, "item", None)
+        if callable(item):
+            return item()
     arr = np.asarray(value)
     if arr.shape == ():
         return arr.item()

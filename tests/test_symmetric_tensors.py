@@ -5,6 +5,7 @@ import pytest
 
 import pepsy
 from pepsy.operators import gate, gate_simple
+from pepsy.tensors import symmetric as symmetric_mod
 from pepsy.tensors import (
     SymGateStream,
     SymHamiltonian,
@@ -230,6 +231,36 @@ def test_symmetric_constructors_apply_to_backend_to_symmray_blocks():
     assert term.backend == "torch"
     assert isinstance(term_block, torch.Tensor)
     assert term_block.dtype == torch.complex128
+
+
+def test_symmetric_as_scalar_handles_backend_scalars_before_numpy_conversion():
+    """Backend scalar conversion should not require NumPy array coercion."""
+
+    class BackendScalar:
+        shape = ()
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def item(self):
+            return 1.25
+
+        def __array__(self, *_args, **_kwargs):
+            raise AssertionError("NumPy conversion should not be used.")
+
+    class BackendVector:
+        shape = (2,)
+
+        def __array__(self, *_args, **_kwargs):
+            raise AssertionError("Non-scalar backend arrays should be returned.")
+
+    vector = BackendVector()
+
+    assert symmetric_mod._as_scalar(BackendScalar()) == pytest.approx(1.25)
+    assert symmetric_mod._as_scalar(vector) is vector
 
 
 def test_symmetric_to_backend_copy_preserves_original_blocks():
