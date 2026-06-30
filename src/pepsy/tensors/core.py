@@ -24,7 +24,12 @@ __all__ = [
     "backend_jax",
     "register_torch_linalg",
     "reg_rel_svd_torch",
+    "reg_real_svd_torch",
     "reg_complex_svd_torch",
+    "reg_real_qr_torch",
+    "reg_complex_qr_torch",
+    "reg_rel_svd_jax",
+    "reg_real_svd_jax",
     "reg_complex_svd_jax",
     "reg_stop_gradient_torch",
     "stop_grad",
@@ -954,6 +959,42 @@ def reg_complex_svd_torch():
     lr.reg_rel_svd_torch()
 
 
+def reg_real_svd_torch():
+    """Register real torch SVD autograd rule in autoray."""
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "reg_real_svd_torch requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
+    from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_real_svd_torch()
+
+
+def reg_complex_qr_torch():
+    """Register complex torch QR autograd rule in autoray."""
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "reg_complex_qr_torch requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
+    from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_complex_qr_torch()
+
+
+def reg_real_qr_torch():
+    """Register real torch QR autograd rule in autoray."""
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "reg_real_qr_torch requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
+    from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_real_qr_torch()
+
+
 def reg_complex_svd_jax():
     """Register complex JAX SVD custom-VJP rule in autoray."""
     try:
@@ -967,6 +1008,36 @@ def reg_complex_svd_jax():
     from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
 
     lr.reg_complex_svd_jax()
+
+
+def reg_rel_svd_jax():
+    """Register JAX SVD with Pepsy's custom VJP rule in autoray."""
+    try:
+        __import__("jax")
+    except ImportError as exc:  # pragma: no cover - exercised in no-jax CI
+        raise ImportError(
+            "reg_rel_svd_jax requires optional dependency 'jax'. "
+            "Install it with: pip install jax jaxlib."
+        ) from exc
+
+    from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_rel_svd_jax()
+
+
+def reg_real_svd_jax():
+    """Register JAX SVD custom-VJP rule for real-valued SVD workloads."""
+    try:
+        __import__("jax")
+    except ImportError as exc:  # pragma: no cover - exercised in no-jax CI
+        raise ImportError(
+            "reg_real_svd_jax requires optional dependency 'jax'. "
+            "Install it with: pip install jax jaxlib."
+        ) from exc
+
+    from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_real_svd_jax()
 
 
 def reg_stop_gradient_torch():

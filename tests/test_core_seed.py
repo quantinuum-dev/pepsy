@@ -295,7 +295,12 @@ def test_core_all_exports_backend_jax():
     """core.__all__ should include the JAX backend caster for parity."""
     assert "backend_jax" in core.__all__
     assert "reg_rel_svd_torch" in core.__all__
+    assert "reg_real_svd_torch" in core.__all__
     assert "reg_complex_svd_torch" in core.__all__
+    assert "reg_real_qr_torch" in core.__all__
+    assert "reg_complex_qr_torch" in core.__all__
+    assert "reg_rel_svd_jax" in core.__all__
+    assert "reg_real_svd_jax" in core.__all__
     assert "reg_complex_svd_jax" in core.__all__
 
 
@@ -891,6 +896,38 @@ def test_reg_rel_svd_torch_registers_stable_autoray_rule():
     assert torch.isfinite(A.grad).all()
 
 
+def test_reg_real_qr_torch_registers_autoray_rule():
+    """Registered real torch QR should backpropagate finite gradients."""
+    torch = pytest.importorskip("torch")
+
+    torch.manual_seed(181920)
+    core.reg_real_qr_torch()
+
+    A = torch.randn(4, 4, dtype=torch.float64, requires_grad=True)
+    Q, R = ar.do("linalg.qr", A)
+    loss = (Q @ R).sum() + 0.01 * (Q.square().sum() + R.square().sum())
+    loss.backward()
+
+    assert A.grad is not None
+    assert torch.isfinite(A.grad).all()
+
+
+def test_reg_complex_qr_torch_registers_autoray_rule():
+    """Registered complex torch QR should backpropagate finite gradients."""
+    torch = pytest.importorskip("torch")
+
+    torch.manual_seed(212223)
+    core.reg_complex_qr_torch()
+
+    A = torch.randn(4, 4, dtype=torch.complex128, requires_grad=True)
+    Q, R = ar.do("linalg.qr", A)
+    loss = (Q @ R).real.sum() + 0.01 * (Q.real.square().sum() + R.real.square().sum())
+    loss.backward()
+
+    assert A.grad is not None
+    assert torch.isfinite(A.grad).all()
+
+
 @pytest.mark.parametrize("dtype", ["float64", "complex128"])
 def test_reg_rel_svd_torch_forward_falls_back_to_scipy_gesvd(monkeypatch, dtype):
     """Relative SVD should recover when torch's CPU SVD driver fails."""
@@ -999,6 +1036,28 @@ def test_reg_complex_svd_jax_does_not_require_torch_or_scipy(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _fake_import)
     core.reg_complex_svd_jax()
+
+
+def test_reg_rel_and_real_svd_jax_alias_custom_vjp(monkeypatch):
+    """JAX SVD aliases should register without importing torch/scipy."""
+    pytest.importorskip("jax")
+    monkeypatch.delitem(sys.modules, "pepsy.backends.linalg_jax", raising=False)
+
+    original_import = builtins.__import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if (
+            name == "torch"
+            or name.startswith("torch.")
+            or name == "scipy"
+            or name.startswith("scipy.")
+        ):
+            raise ImportError(f"simulated missing dependency: {name}")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    core.reg_rel_svd_jax()
+    core.reg_real_svd_jax()
 
 
 def test_safe_inverse_honors_eps_abs():

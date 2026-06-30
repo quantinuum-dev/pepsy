@@ -64,3 +64,13 @@ svd_jax.defvjp(jaxsvd_fwd, jaxsvd_bwd)
 def reg_complex_svd_jax():
     """Register the custom JAX SVD implementation in autoray."""
     ar.register_function("jax", "linalg.svd", svd_jax)
+
+
+def reg_rel_svd_jax():
+    """Register the custom JAX SVD implementation in autoray."""
+    reg_complex_svd_jax()
+
+
+def reg_real_svd_jax():
+    """Register the custom JAX SVD implementation in autoray."""
+    reg_complex_svd_jax()

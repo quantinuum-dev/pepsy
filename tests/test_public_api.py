@@ -32,7 +32,9 @@ _EXPECTED_IN_ALL = [
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
     "symmray_block_summary", "symmray_mps_summary", "symmray_peps_summary", "symm_operator_from_dense",
-    "reg_rel_svd_torch", "reg_complex_svd_torch", "reg_complex_svd_jax",
+    "reg_rel_svd_torch", "reg_real_svd_torch", "reg_complex_svd_torch",
+    "reg_real_qr_torch", "reg_complex_qr_torch",
+    "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
@@ -81,7 +83,9 @@ _CALLABLE_EXPORTS = [
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
     "symmray_block_summary", "symmray_mps_summary", "symmray_peps_summary", "symm_operator_from_dense",
-    "reg_rel_svd_torch", "reg_complex_svd_torch", "reg_complex_svd_jax",
+    "reg_rel_svd_torch", "reg_real_svd_torch", "reg_complex_svd_torch",
+    "reg_real_qr_torch", "reg_complex_qr_torch",
+    "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
 ]
 
 _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
@@ -131,20 +135,35 @@ def test_optional_linalg_registrations_resolve():
     assert callable(pepsy.tensors.reg_stop_gradient_torch)
     assert callable(pepsy.tensors.stop_grad)
     assert pepsy.reg_rel_svd_torch is pepsy.tensors.reg_rel_svd_torch
+    assert pepsy.reg_real_svd_torch is pepsy.tensors.reg_real_svd_torch
     assert pepsy.reg_complex_svd_torch is pepsy.tensors.reg_complex_svd_torch
+    assert pepsy.reg_real_qr_torch is pepsy.tensors.reg_real_qr_torch
+    assert pepsy.reg_complex_qr_torch is pepsy.tensors.reg_complex_qr_torch
+    assert pepsy.reg_rel_svd_jax is pepsy.tensors.reg_rel_svd_jax
+    assert pepsy.reg_real_svd_jax is pepsy.tensors.reg_real_svd_jax
     assert pepsy.reg_complex_svd_jax is pepsy.tensors.reg_complex_svd_jax
     if has_torch:
         import torch
 
         assert callable(pepsy.tensors.core.reg_rel_svd_torch)
         assert callable(pepsy.tensors.reg_rel_svd_torch)
+        assert callable(pepsy.tensors.core.reg_real_svd_torch)
+        assert callable(pepsy.tensors.reg_real_svd_torch)
         assert callable(pepsy.tensors.core.reg_complex_svd_torch)
         assert callable(pepsy.tensors.reg_complex_svd_torch)
+        assert callable(pepsy.tensors.core.reg_real_qr_torch)
+        assert callable(pepsy.tensors.reg_real_qr_torch)
+        assert callable(pepsy.tensors.core.reg_complex_qr_torch)
+        assert callable(pepsy.tensors.reg_complex_qr_torch)
         x = torch.tensor([1.0], dtype=torch.float64, requires_grad=True)
         y = pepsy.tensors.stop_grad(x)
         assert not y.requires_grad
         assert y is not x
         assert y.data_ptr() != x.data_ptr()
     if has_jax:
+        assert callable(pepsy.tensors.core.reg_rel_svd_jax)
+        assert callable(pepsy.tensors.reg_rel_svd_jax)
+        assert callable(pepsy.tensors.core.reg_real_svd_jax)
+        assert callable(pepsy.tensors.reg_real_svd_jax)
         assert callable(pepsy.tensors.core.reg_complex_svd_jax)
         assert callable(pepsy.tensors.reg_complex_svd_jax)
