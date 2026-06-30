@@ -84,6 +84,50 @@ ordering["edges"][0]["index_directions"]
 The same record is available as ``summary["fermionic_ordering"]`` from
 ``symmray_mps_summary`` and ``symmray_peps_summary``.
 
+## Backend conversion
+
+Pass ``to_backend=`` to build Symmray blocks directly on a chosen array
+backend. The callable is applied to each stored dense block, preserving the
+Symmray charge maps and sparse block structure.
+
+```python
+import torch
+
+to_backend = py.backend_torch(dtype=torch.complex128)
+peps_site_charge = py.site_charge_from_occupations(
+    {
+        (i, j): (1, 0) if (i + j) % 2 == 0 else (0, 1)
+        for i in range(3)
+        for j in range(3)
+    }
+)
+
+peps = py.SymPEPS.random(
+    3,
+    3,
+    symmetry="U1U1",
+    fermionic=True,
+    phys_dim=py.default_physical_sectors(model="fermi_hubbard_u1u1"),
+    site_charge=peps_site_charge,
+    bond_dim=4,
+    to_backend=to_backend,
+)
+
+ham = py.SymHamiltonian.from_edges(
+    "fermi_hubbard_u1u1",
+    "U1U1",
+    peps.edges,
+    t=1.0,
+    U=8.0,
+    mu=0.0,
+    to_backend=to_backend,
+)
+
+# Existing wrappers can be converted too.
+peps_torch = peps.to_backend(to_backend, inplace=False)
+ham_torch = ham.to_backend(to_backend, inplace=False)
+```
+
 ## Time evolution
 
 Hamiltonians produce a canonical bundled gate stream, so the same stream can be

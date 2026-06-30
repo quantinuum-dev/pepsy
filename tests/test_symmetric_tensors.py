@@ -182,6 +182,81 @@ def test_symmray_peps_schematic_shows_spinful_charge_labels_inside_nodes():
     assert all(text.get_color() == (1.0, 1.0, 1.0, 1.0) for text in node_texts)
 
 
+def test_symmetric_constructors_apply_to_backend_to_symmray_blocks():
+    """Symmetric state/Hamiltonian constructors should backend-map stored blocks."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(dtype=torch.complex128)
+    site_charge = site_charge_from_occupations(
+        {
+            (0, 0): (1, 0),
+            (0, 1): (0, 1),
+            (1, 0): (1, 0),
+            (1, 1): (0, 1),
+        }
+    )
+
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1U1",
+        phys_dim=default_physical_sectors(model="fermi_hubbard_u1u1"),
+        fermionic=True,
+        site_charge=site_charge,
+        bond_dim=2,
+        seed=34,
+        dtype="complex128",
+        to_backend=to_backend,
+    )
+
+    tensor = next(iter(state.peps.tensor_map.values()))
+    block = next(iter(tensor.data.blocks.values()))
+    assert tensor.data.backend == "torch"
+    assert isinstance(block, torch.Tensor)
+    assert block.dtype == torch.complex128
+
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        state.edges,
+        t=1.0,
+        U=4.0,
+        mu=0.0,
+        to_backend=to_backend,
+    )
+    term = next(iter(ham.terms.values()))
+    term_block = next(iter(term.blocks.values()))
+    assert term.backend == "torch"
+    assert isinstance(term_block, torch.Tensor)
+    assert term_block.dtype == torch.complex128
+
+
+def test_symmetric_to_backend_copy_preserves_original_blocks():
+    """to_backend(..., inplace=False) should convert a copied wrapper only."""
+    torch = pytest.importorskip("torch")
+    state = SymMPS.random(
+        4,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations([0, 0, 0, 0]),
+        bond_dim=2,
+        seed=35,
+        dtype="complex128",
+    )
+
+    converted = state.to_backend(
+        pepsy.backend_torch(dtype=torch.complex128),
+        inplace=False,
+    )
+    original_tensor = next(iter(state.mps.tensor_map.values()))
+    converted_tensor = next(iter(converted.mps.tensor_map.values()))
+    original_block = next(iter(original_tensor.data.blocks.values()))
+    converted_block = next(iter(converted_tensor.data.blocks.values()))
+
+    assert converted is not state
+    assert not isinstance(original_block, torch.Tensor)
+    assert isinstance(converted_block, torch.Tensor)
+
+
 def test_symmetric_state_uses_psi_with_network_compatibility_alias():
     """SymMPS should prefer psi/mps naming while keeping network compatibility."""
     state = SymMPS.random(

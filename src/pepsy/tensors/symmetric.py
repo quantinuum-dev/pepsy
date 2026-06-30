@@ -2043,6 +2043,47 @@ def _as_scalar(value):
     return value
 
 
+def _validate_backend_mapper(to_backend):
+    if to_backend is not None and not callable(to_backend):
+        raise TypeError("to_backend must be callable or None.")
+
+
+def _copy_array_like(value):
+    copy = getattr(value, "copy", None)
+    if callable(copy):
+        return copy()
+    return value
+
+
+def _apply_to_array_blocks(value, to_backend):
+    """Apply a backend mapper while preserving Symmray block structure."""
+    if to_backend is None:
+        return value
+    _validate_backend_mapper(to_backend)
+    if _is_symmray_array(value):
+        value.apply_to_arrays(to_backend)
+        return value
+    return to_backend(value)
+
+
+def _apply_to_tensor_network_arrays(tn, to_backend):
+    if to_backend is None:
+        return tn
+    _validate_backend_mapper(to_backend)
+    tn.apply_to_arrays(lambda array: _apply_to_array_blocks(array, to_backend))
+    return tn
+
+
+def _apply_to_hamiltonian_terms(terms, to_backend):
+    if to_backend is None:
+        return dict(terms)
+    _validate_backend_mapper(to_backend)
+    return {
+        edge: _apply_to_array_blocks(term, to_backend)
+        for edge, term in dict(terms).items()
+    }
+
+
 def _hamiltonian_from_edges(model, symmetry, edges, *, flat=False, **params):
     sr = _require_symmray()
     model = _normalize_model(model)
@@ -2078,18 +2119,40 @@ class SymHamiltonian:
     parameters: dict = field(default_factory=dict)
 
     @classmethod
-    def from_edges(cls, model, symmetry, edges, *, flat=False, **params):
+    def from_edges(cls, model, symmetry, edges, *, flat=False, to_backend=None, **params):
         """Build a Symmray Hamiltonian dictionary from lattice edges."""
         model_norm = _normalize_model(model)
         edges = _as_edges(edges)
         terms = _hamiltonian_from_edges(model_norm, symmetry, edges, flat=flat, **params)
+        terms = _apply_to_hamiltonian_terms(terms, to_backend)
         return cls(
             model=model_norm,
             symmetry=str(symmetry),
             edges=edges,
-            terms=dict(terms),
+            terms=terms,
             parameters=dict(params),
         )
+
+    def apply_to_arrays(self, fn, *, inplace=True):
+        """Apply ``fn`` to each dense block of each Hamiltonian term."""
+        _validate_backend_mapper(fn)
+        target = self if inplace else type(self)(
+            model=self.model,
+            symmetry=self.symmetry,
+            edges=self.edges,
+            terms={
+                edge: _copy_array_like(term)
+                for edge, term in self.terms.items()
+            },
+            parameters=dict(self.parameters),
+        )
+        for edge, term in list(target.terms.items()):
+            target.terms[edge] = _apply_to_array_blocks(term, fn)
+        return target
+
+    def to_backend(self, to_backend, *, inplace=True):
+        """Convert Hamiltonian term blocks with a backend mapper callable."""
+        return self.apply_to_arrays(to_backend, inplace=inplace)
 
     def trotter_gates(self, dt, *, imaginary=False, order=1):
         """Return local gate entries ``[(gate, edge), ...]`` for one Trotter step."""
@@ -2189,6 +2252,16 @@ class _SymState:
         self.gauges = gauges
         self.phys_sectors = phys_sectors
         self.site_charge = site_charge
+
+    def apply_to_arrays(self, fn, *, inplace=True):
+        """Apply ``fn`` to each dense array/block in the wrapped state."""
+        target = self if inplace else self.copy()
+        _apply_to_tensor_network_arrays(target.psi, fn)
+        return target
+
+    def to_backend(self, to_backend, *, inplace=True):
+        """Convert wrapped state arrays with a backend mapper callable."""
+        return self.apply_to_arrays(to_backend, inplace=inplace)
 
     @property
     def tn(self):
@@ -2657,6 +2730,7 @@ class SymMPS(_SymState):
         site_charge=None,
         subsizes="maximal",
         contraction_opt="auto-hq",
+        to_backend=None,
         **kwargs,
     ):
         """Create a random symmetric open-chain MPS."""
@@ -2678,6 +2752,7 @@ class SymMPS(_SymState):
             subsizes=subsizes,
             **kwargs,
         )
+        _apply_to_tensor_network_arrays(mps, to_backend)
         mps.view_as_(
             qtn.MatrixProductState,
             L=int(L),
@@ -2807,6 +2882,7 @@ class SymPEPS(_SymState):
         site_charge=None,
         subsizes="maximal",
         contraction_opt="auto-hq",
+        to_backend=None,
         **kwargs,
     ):
         """Create a random symmetric 2D PEPS."""
@@ -2831,6 +2907,7 @@ class SymPEPS(_SymState):
             subsizes=subsizes,
             **kwargs,
         )
+        _apply_to_tensor_network_arrays(peps, to_backend)
         edges = _as_edges(qtn.edges_2d_square(int(Lx), int(Ly), cyclic=cyclic))
         return cls(
             peps=peps,
