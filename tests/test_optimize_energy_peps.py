@@ -1,0 +1,184 @@
+"""Tests for PEPS energy-objective optimization."""
+
+import numpy as np
+import pytest
+import quimb.tensor as qtn
+
+import pepsy
+from pepsy.optimizers import EnergyEstimate, PepsEnergyOptimizer
+from pepsy.optimizers.energy.peps import PepsEnergyOptimizer as ModulePepsEnergyOptimizer
+
+
+class _FakePeps:
+    Lx = 2
+    Ly = 3
+
+    def __init__(self, value=12.0):
+        self.value = value
+        self.calls = []
+        self.balanced = False
+        self.equalized_to = None
+
+    def compute_local_expectation(self, terms, **kwargs):
+        self.calls.append((terms, kwargs))
+        return self.value
+
+    def balance_bonds_(self):
+        self.balanced = True
+        return self
+
+    def equalize_norms_(self, value):
+        self.equalized_to = value
+        return self
+
+
+def _zz_terms():
+    z_op = np.diag([1.0, -1.0])
+    zz_op = np.kron(z_op, z_op).reshape(2, 2, 2, 2)
+    return {((0, 0), (0, 1)): zz_op}
+
+
+def test_peps_energy_loss_calls_local_expectation_with_expected_options():
+    """loss() should route Pepsy options to quimb local expectation kwargs."""
+    state = _FakePeps()
+    terms = {"edge": object()}
+    opt = PepsEnergyOptimizer(
+        state,
+        terms,
+        chi=7,
+        boundary_mode="ctmrg",
+        cutoff=1.0e-8,
+        normalized=True,
+        contraction_opt="auto-hq",
+        stabilize_state=True,
+    )
+
+    loss = opt.loss()
+
+    assert loss == pytest.approx(2.0)
+    assert state.balanced is True
+    assert state.equalized_to == pytest.approx(1.0)
+    called_terms, kwargs = state.calls[-1]
+    assert called_terms is terms
+    assert kwargs["max_bond"] == 7
+    assert kwargs["cutoff"] == pytest.approx(1.0e-8)
+    assert kwargs["normalized"] is True
+    assert kwargs["mode"] == "projector"
+    assert kwargs["contract_optimize"] == "auto-hq"
+
+
+def test_peps_energy_returns_full_and_per_site_estimate():
+    """energy() should report both total energy and energy per site."""
+    state = _FakePeps(value=9.0)
+    opt = PepsEnergyOptimizer(state, {"edge": object()}, energy_per_site=True)
+
+    estimate = opt.energy()
+
+    assert isinstance(estimate, EnergyEstimate)
+    assert estimate.energy == pytest.approx(9.0)
+    assert estimate.energy_per_site == pytest.approx(1.5)
+    assert estimate.num_sites == 6
+    assert estimate.boundary_mode == "mps"
+    assert estimate.as_dict()["energy"] == pytest.approx(9.0)
+
+
+def test_peps_energy_accepts_local_ham_payload_mapping():
+    """Hamiltonian payloads should resolve local_terms before measurement."""
+    state = _FakePeps(value=4.0)
+    terms = {"edge": object()}
+    opt = PepsEnergyOptimizer(state, {"local_terms": terms}, energy_per_site=False)
+
+    assert opt.loss() == pytest.approx(4.0)
+    assert state.calls[-1][0] is terms
+
+
+def test_peps_energy_loss_matches_direct_quimb_local_expectation():
+    """The static energy loss should be a thin wrapper around quimb."""
+    peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=23, dtype="complex128")
+    terms = _zz_terms()
+    direct = peps.compute_local_expectation(
+        terms,
+        max_bond=8,
+        cutoff=0.0,
+        normalized=True,
+        mode="mps",
+        contract_optimize="auto-hq",
+    )
+    opt = PepsEnergyOptimizer(
+        peps,
+        terms,
+        chi=8,
+        cutoff=0.0,
+        normalized=True,
+        energy_per_site=False,
+        contraction_opt="auto-hq",
+    )
+
+    assert complex(opt.loss()) == pytest.approx(complex(direct))
+
+
+def test_peps_energy_make_tn_optimizer_and_optimize(monkeypatch):
+    """TNOptimizer construction should receive terms as constants and update state."""
+    calls = []
+    out = _FakePeps(value=3.0)
+
+    class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
+        def __init__(self, state, loss_fn, **kwargs):
+            calls.append((state, loss_fn, kwargs))
+            self.losses = [2.0, 1.0]
+
+        def optimize(self, n=220, **kwargs):
+            calls.append(("optimize", n, kwargs))
+            return out
+
+    monkeypatch.setattr("pepsy.optimizers.energy.peps.qtn.TNOptimizer", _FakeTNOptimizer)
+    state = _FakePeps(value=5.0)
+    terms = {"edge": object()}
+    opt = PepsEnergyOptimizer(state, terms)
+
+    tnopt = opt.make_tn_optimizer(
+        optimizer="lbfgs",
+        autodiff_backend="jax",
+        progbar=False,
+        loss_kwargs={"chi": 5},
+    )
+    assert isinstance(tnopt, _FakeTNOptimizer)
+    _, loss_fn, kwargs = calls[0]
+    assert loss_fn is ModulePepsEnergyOptimizer._tnopt_loss
+    assert kwargs["loss_constants"]["terms"] is terms
+    assert kwargs["loss_kwargs"]["chi"] == 5
+    assert kwargs["optimizer"] == "L-BFGS-B"
+    assert kwargs["autodiff_backend"] == "jax"
+    assert kwargs["progbar"] is False
+
+    optimized, losses = opt.optimize(n=3, progbar=False, return_losses=True)
+    assert optimized is out
+    assert opt.state is out
+    assert losses == (2.0, 1.0)
+    assert calls[-1] == ("optimize", 3, {})
+
+
+def test_peps_energy_normalize_translates_projector_mode(monkeypatch):
+    """normalize() should translate local projector mode to global ctmrg mode."""
+    calls = []
+    state = _FakePeps(value=5.0)
+
+    def _fake_normalize(state_arg, **kwargs):
+        calls.append((state_arg, kwargs))
+        return state_arg
+
+    monkeypatch.setattr(
+        "pepsy.optimizers.energy.peps.GlobalOptimizer._normalize_state",
+        _fake_normalize,
+    )
+    opt = PepsEnergyOptimizer(state, {"edge": object()}, boundary_mode="projector")
+
+    assert opt.normalize() is state
+    assert calls[-1][0] is state
+    assert calls[-1][1]["mode"] == "ctmrg"
+
+
+def test_peps_energy_optimizer_public_exports():
+    """New optimizer should resolve from package public namespaces."""
+    assert pepsy.PepsEnergyOptimizer is PepsEnergyOptimizer
+    assert pepsy.optimizers.PepsEnergyOptimizer is PepsEnergyOptimizer

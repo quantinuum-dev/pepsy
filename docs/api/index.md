@@ -16,6 +16,7 @@ operators/gates
 operators/hamiltonians
 optimizers/sweep
 optimizers/global_opt
+optimizers/energy
 optimizers/mps
 optimizers/mpo
 optimizers/peps
