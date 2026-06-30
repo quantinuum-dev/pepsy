@@ -16,11 +16,16 @@ class _FakePeps:
     def __init__(self, value=12.0):
         self.value = value
         self.calls = []
+        self.exact_calls = []
         self.balanced = False
         self.equalized_to = None
 
     def compute_local_expectation(self, terms, **kwargs):
         self.calls.append((terms, kwargs))
+        return self.value
+
+    def compute_local_expectation_exact(self, terms, **kwargs):
+        self.exact_calls.append((terms, kwargs))
         return self.value
 
     def balance_bonds_(self):
@@ -114,6 +119,26 @@ def test_peps_energy_returns_full_and_per_site_estimate():
     assert estimate.as_dict()["energy"] == pytest.approx(9.0)
 
 
+def test_peps_energy_exact_boundary_uses_exact_local_expectation():
+    """Exact PEPS energy mode should avoid approximate boundary contraction."""
+    state = _FakePeps(value=6.0)
+    terms = {"edge": object()}
+    opt = PepsEnergyOptimizer(
+        state,
+        terms,
+        boundary_mode="exact",
+        energy_per_site=False,
+        contraction_opt="auto-hq",
+    )
+
+    assert opt.loss() == pytest.approx(6.0)
+    assert state.calls == []
+    called_terms, kwargs = state.exact_calls[-1]
+    assert called_terms is terms
+    assert kwargs["optimize"] == "auto-hq"
+    assert kwargs["normalized"] is True
+
+
 def test_peps_energy_accepts_local_ham_payload_mapping():
     """Hamiltonian payloads should resolve local_terms before measurement."""
     state = _FakePeps(value=4.0)
@@ -141,6 +166,27 @@ def test_peps_energy_loss_matches_direct_quimb_local_expectation():
         terms,
         chi=8,
         cutoff=0.0,
+        normalized=True,
+        energy_per_site=False,
+        contraction_opt="auto-hq",
+    )
+
+    assert complex(opt.loss()) == pytest.approx(complex(direct))
+
+
+def test_peps_energy_exact_loss_matches_direct_quimb_exact_expectation():
+    """Exact mode should route to quimb's exact local expectation contraction."""
+    peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=24, dtype="complex128")
+    terms = _zz_terms()
+    direct = peps.compute_local_expectation_exact(
+        terms,
+        optimize="auto-hq",
+        normalized=True,
+    )
+    opt = PepsEnergyOptimizer(
+        peps,
+        terms,
+        boundary_mode="exact",
         normalized=True,
         energy_per_site=False,
         contraction_opt="auto-hq",
@@ -221,8 +267,11 @@ def test_peps_energy_make_tn_optimizer_prepares_autodiff_backend(monkeypatch):
     ]
 
 
-def test_peps_energy_optimize_rejects_nonfinite_initial_gradient(monkeypatch):
-    """A finite energy with NaN gradient should fail before optimizer updates."""
+def test_peps_energy_optimize_falls_back_to_exact_gradient(monkeypatch):
+    """A NaN MPS gradient should rebuild the objective with exact contraction."""
+    out = _FakePeps(value=3.0)
+    modes = []
+
     class _FakeVectorizer:
         def __init__(self):
             self.vector = np.array([1.0])
@@ -230,6 +279,8 @@ def test_peps_energy_optimize_rejects_nonfinite_initial_gradient(monkeypatch):
     class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
         def __init__(self, state, loss_fn, **kwargs):
             _ = (state, loss_fn, kwargs)
+            self.mode = kwargs["loss_kwargs"]["boundary_mode"]
+            modes.append(self.mode)
             self.vectorizer = _FakeVectorizer()
             self.losses = []
             self.loss = 123.0
@@ -238,21 +289,65 @@ def test_peps_energy_optimize_rejects_nonfinite_initial_gradient(monkeypatch):
 
         def vectorized_value_and_grad(self, vector):
             assert np.array_equal(vector, np.array([1.0]))
-            self.losses.append(float("nan"))
-            return 1.0, np.array([np.nan])
+            if self.mode == "mps":
+                self.losses.append(float("nan"))
+                return 1.0, np.array([np.nan])
+            return 0.5, np.array([0.0])
 
         def optimize(self, n=220, **kwargs):
-            _ = (n, kwargs)
-            raise AssertionError("optimize should not run after a NaN gradient.")
+            assert self.mode == "exact"
+            assert n == 3
+            assert kwargs == {}
+            self.losses = [0.5, 0.25]
+            return out
 
     monkeypatch.setattr("pepsy.optimizers.energy.peps.qtn.TNOptimizer", _FakeTNOptimizer)
     state = _FakePeps(value=5.0)
     opt = PepsEnergyOptimizer(state, {"edge": object()})
 
-    with pytest.raises(ValueError, match="non-finite initial gradient"):
-        opt.optimize(n=3, progbar=False)
+    optimized, losses = opt.optimize(n=3, progbar=False, return_losses=True)
 
+    assert optimized is out
+    assert opt.state is out
+    assert losses == (0.5, 0.25)
+    assert modes == ["mps", "exact"]
+
+
+def test_peps_energy_optimize_returns_state_if_fallback_gradient_nonfinite(monkeypatch):
+    """If all autodiff gradients are bad, avoid raising or poisoning state."""
+    modes = []
+
+    class _FakeVectorizer:
+        def __init__(self):
+            self.vector = np.array([1.0])
+
+    class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
+        def __init__(self, state, loss_fn, **kwargs):
+            _ = (state, loss_fn)
+            self.mode = kwargs["loss_kwargs"]["boundary_mode"]
+            modes.append(self.mode)
+            self.vectorizer = _FakeVectorizer()
+            self.losses = []
+
+        def vectorized_value_and_grad(self, vector):
+            _ = vector
+            return 1.0, np.array([np.nan])
+
+        def optimize(self, n=220, **kwargs):
+            _ = (n, kwargs)
+            raise AssertionError("optimize should not run with a NaN gradient.")
+
+    monkeypatch.setattr("pepsy.optimizers.energy.peps.qtn.TNOptimizer", _FakeTNOptimizer)
+    state = _FakePeps(value=5.0)
+    opt = PepsEnergyOptimizer(state, {"edge": object()})
+
+    with pytest.warns(RuntimeWarning, match="non-finite initial gradient"):
+        optimized, losses = opt.optimize(n=3, progbar=False, return_losses=True)
+
+    assert optimized is state
     assert opt.state is state
+    assert losses == (1.0,)
+    assert modes == ["mps", "exact"]
 
 
 def test_peps_energy_make_tn_optimizer_converts_terms_to_autodiff_backend(monkeypatch):

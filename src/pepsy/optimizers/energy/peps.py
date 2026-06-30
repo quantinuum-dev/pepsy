@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+import warnings
 
 import autoray as ar
 import numpy as np
@@ -262,30 +263,24 @@ class PepsEnergyOptimizer:
             return False
 
     @classmethod
-    def _validate_initial_gradient(cls, tnopt):
+    def _initial_gradient_status(cls, tnopt):
         if not (
             hasattr(tnopt, "vectorized_value_and_grad")
             and hasattr(getattr(tnopt, "vectorizer", None), "vector")
         ):
-            return
+            return True, None
         x0 = tnopt.vectorizer.vector.copy()
-        loss0, grad0 = tnopt.vectorized_value_and_grad(x0)
-        finite_loss = cls._is_finite_number(loss0)
-        finite_grad = bool(np.all(np.isfinite(grad0)))
-        tnopt.vectorizer.vector[:] = x0
-        cls._reset_tnopt_tracking(tnopt)
-        if finite_loss and finite_grad:
-            return
-        raise ValueError(
-            "PEPS energy autodiff produced a non-finite initial gradient. "
-            "The energy value can still be finite, but differentiating through "
-            "the approximate boundary/SVD contraction is unstable for this "
-            "state. This commonly happens for Symmray PEPS after simple update. "
-            "Use PepsEnergyOptimizer.energy(...) to report the energy, continue "
-            "with simple/gate update, or switch to a non-autodiff/local "
-            "optimization route rather than a global autodiff optimizer on this "
-            "boundary objective."
-        )
+        loss0 = None
+        try:
+            loss0, grad0 = tnopt.vectorized_value_and_grad(x0)
+            finite_loss = cls._is_finite_number(loss0)
+            finite_grad = bool(np.all(np.isfinite(grad0)))
+            return finite_loss and finite_grad, loss0 if finite_loss else None
+        except (FloatingPointError, RuntimeError, ValueError):
+            return False, loss0 if cls._is_finite_number(loss0) else None
+        finally:
+            tnopt.vectorizer.vector[:] = x0
+            cls._reset_tnopt_tracking(tnopt)
 
     @staticmethod
     def _reset_tnopt_tracking(tnopt):
@@ -366,6 +361,8 @@ class PepsEnergyOptimizer:
             return "mps"
         if key in {"projector", "ctmrg", "ctm"}:
             return "projector"
+        if key in {"exact", "full", "full-contract", "full-contraction"}:
+            return "exact"
         return mode
 
     @staticmethod
@@ -435,15 +432,34 @@ class PepsEnergyOptimizer:
             contraction_opt = build_optimizer(progbar=False)
 
         kwargs = dict(compute_kwargs or {})
-        value = state.compute_local_expectation(
-            terms,
-            max_bond=chi,
-            cutoff=cutoff,
-            normalized=bool(normalized),
-            mode=cls._boundary_mode(boundary_mode),
-            contract_optimize=contraction_opt,
-            **kwargs,
-        )
+        mode = cls._boundary_mode(boundary_mode)
+        if mode == "exact":
+            exact_expectation = getattr(
+                state,
+                "compute_local_expectation_exact",
+                None,
+            )
+            if not callable(exact_expectation):
+                raise TypeError(
+                    "boundary_mode='exact' requires a PEPS-like state with "
+                    "compute_local_expectation_exact()."
+                )
+            value = exact_expectation(
+                terms,
+                optimize=contraction_opt,
+                normalized=bool(normalized),
+                **kwargs,
+            )
+        else:
+            value = state.compute_local_expectation(
+                terms,
+                max_bond=chi,
+                cutoff=cutoff,
+                normalized=bool(normalized),
+                mode=mode,
+                contract_optimize=contraction_opt,
+                **kwargs,
+            )
         if energy_per_site:
             value = value / cls._num_sites(state)
         if real:
@@ -571,11 +587,16 @@ class PepsEnergyOptimizer:
         normalize: bool = False,
         normalize_kwargs: Mapping[str, Any] | None = None,
         check_finite_gradient: bool = True,
+        fallback_boundary_mode: str | None = "exact",
         **optimize_kwargs,
     ):
         """Run ``TNOptimizer.optimize`` and store the optimized PEPS."""
+        merged_loss_kwargs = self._merge_opts(
+            self.loss_kwargs,
+            self._pick_loss_kwargs(loss_kwargs),
+        )
         tnopt = self.make_tn_optimizer(
-            loss_kwargs=loss_kwargs,
+            loss_kwargs=merged_loss_kwargs,
             loss_constants=loss_constants,
             autodiff_backend=autodiff_backend,
             optimizer=optimizer,
@@ -584,7 +605,42 @@ class PepsEnergyOptimizer:
             device=device,
         )
         if check_finite_gradient:
-            self._validate_initial_gradient(tnopt)
+            finite_gradient, finite_loss = self._initial_gradient_status(tnopt)
+            fallback_mode = (
+                None
+                if fallback_boundary_mode is None
+                else self._boundary_mode(fallback_boundary_mode)
+            )
+            current_mode = self._boundary_mode(merged_loss_kwargs["boundary_mode"])
+            if (
+                (not finite_gradient)
+                and fallback_mode is not None
+                and current_mode != fallback_mode
+            ):
+                fallback_loss_kwargs = dict(merged_loss_kwargs)
+                fallback_loss_kwargs["boundary_mode"] = fallback_mode
+                tnopt = self.make_tn_optimizer(
+                    loss_kwargs=fallback_loss_kwargs,
+                    loss_constants=loss_constants,
+                    autodiff_backend=autodiff_backend,
+                    optimizer=optimizer,
+                    progbar=progbar,
+                    jit_fn=jit_fn,
+                    device=device,
+                )
+                finite_gradient, fallback_loss = self._initial_gradient_status(tnopt)
+                finite_loss = fallback_loss if fallback_loss is not None else finite_loss
+            if not finite_gradient:
+                self.losses = [] if finite_loss is None else [float(finite_loss)]
+                warnings.warn(
+                    "PEPS energy autodiff produced a non-finite initial gradient; "
+                    "returning the unmodified state.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                if return_losses:
+                    return self.state, tuple(self.losses)
+                return self.state
         out = tnopt.optimize(n=n, **optimize_kwargs)
         self.losses = list(getattr(tnopt, "losses", ()))
         if normalize:
