@@ -4,6 +4,44 @@ Optional VMC integrations live under `pepsy.vmc`. The NetKet bridge can now
 wrap a packed PEPS as a Flax model for spin systems, while keeping the
 Fermi-Hubbard helper as a specialization.
 
+## Recommended public workflow
+
+Use the model-specific builders for NetKet-backed VMC:
+
+- `build_ising_vmc(...)`
+- `build_heisenberg_vmc(...)`
+- `build_fermi_hubbard_vmc(...)`
+
+Each builder returns a `NetKetPEPSVMC` setup bundle with the NetKet Hilbert
+space, Hamiltonian, sampler, variational state, packed PEPS ansatz, and optional
+SR preconditioner. The bundle exposes `n_sites`, `n_params`,
+`setup.expect_energy()`, and `setup.make_driver(...)` so notebooks can keep the
+main path compact:
+
+```python
+import pepsy.vmc as pvmc
+
+setup = pvmc.build_ising_vmc(
+    peps,
+    Lx=2,
+    Ly=2,
+    h=1.0,
+    J=1.0,
+    contraction="exact",
+    n_samples=1024,
+    n_chains=16,
+    use_sr=False,
+)
+
+print(setup.n_sites, setup.n_params)
+energy = setup.expect_energy()
+driver = setup.make_driver(learning_rate=0.02)
+```
+
+Lower-level functions such as `pack_peps_ansatz(...)`,
+`make_peps_batched_amplitude_function(...)`, and `make_netket_vmc_driver(...)`
+remain public for custom flows and profiling.
+
 ## Torch sampling and local-energy kernels
 
 `pepsy.vmc.torch` provides lightweight PyTorch kernels for custom VMC loops and
@@ -115,7 +153,7 @@ setup = pvmc.build_ising_vmc(
     sampler_seed=2,
     use_sr=False,
 )
-driver = pvmc.make_netket_vmc_driver(setup, learning_rate=0.02)
+driver = setup.make_driver(learning_rate=0.02)
 ```
 
 Heisenberg VMC uses the same generic PEPS amplitude model with NetKet's
@@ -178,8 +216,7 @@ setup = pvmc.build_fermi_hubbard_vmc(
     seed=1,
     sampler_seed=2,
 )
-driver = pvmc.make_netket_vmc_driver(
-    setup,
+driver = setup.make_driver(
     driver=settings.driver,
     learning_rate=0.02,
     sr_mode=settings.sr_mode,

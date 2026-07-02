@@ -81,6 +81,32 @@ class SpinOrbitalColumns:
     up: tuple[int, ...]
     down: tuple[int, ...]
 
+    def __post_init__(self):
+        up = tuple(int(i) for i in self.up)
+        down = tuple(int(i) for i in self.down)
+        if len(up) == 0:
+            raise ValueError("SpinOrbitalColumns requires at least one orbital.")
+        if len(up) != len(down):
+            raise ValueError("up and down columns must have the same length.")
+        if any(i < 0 for i in (*up, *down)):
+            raise ValueError("Spin-orbital columns must be non-negative.")
+        if len(set(up)) != len(up) or len(set(down)) != len(down):
+            raise ValueError("Spin-orbital columns must be unique per spin.")
+        if set(up) & set(down):
+            raise ValueError("up and down columns must be disjoint.")
+        object.__setattr__(self, "up", up)
+        object.__setattr__(self, "down", down)
+
+    @property
+    def n_orbitals(self):
+        """Number of spatial orbitals/sites represented by this layout."""
+        return len(self.up)
+
+    @property
+    def n_columns(self):
+        """Number of NetKet occupation columns in each configuration row."""
+        return 2 * self.n_orbitals
+
 
 @dataclass(frozen=True)
 class PackedPEPS:
@@ -162,6 +188,27 @@ class NetKetPEPSVMC:
     ansatz: PackedPEPS
     config_map: NetKetLocalConfigMap | None
     preconditioner: Any | None
+
+    @property
+    def n_sites(self):
+        """Number of PEPS/configuration sites in the variational ansatz."""
+        return self.ansatz.n_sites
+
+    @property
+    def n_params(self):
+        """Number of scalar variational parameters in the packed ansatz."""
+        return self.ansatz.n_params
+
+    def expect_energy(self):
+        """Return NetKet's expectation estimate for this setup Hamiltonian."""
+        return self.vstate.expect(self.hamiltonian)
+
+    def make_driver(self, **kwargs):
+        """Create a NetKet VMC driver for this setup.
+
+        This is a convenience wrapper around :func:`make_netket_vmc_driver`.
+        """
+        return make_netket_vmc_driver(self, **kwargs)
 
 
 @dataclass(frozen=True)

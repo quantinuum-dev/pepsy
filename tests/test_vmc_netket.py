@@ -83,6 +83,48 @@ def test_choose_netket_chunk_size_prefers_power_of_two_divisor():
         choose_netket_chunk_size(0)
 
 
+def test_spin_orbital_columns_validate_and_report_shape():
+    columns = SpinOrbitalColumns(up=[2, 3], down=[0, 1])
+    assert columns.up == (2, 3)
+    assert columns.down == (0, 1)
+    assert columns.n_orbitals == 2
+    assert columns.n_columns == 4
+
+    with pytest.raises(ValueError, match="same length"):
+        SpinOrbitalColumns(up=(1, 2), down=(0,))
+    with pytest.raises(ValueError, match="disjoint"):
+        SpinOrbitalColumns(up=(0, 1), down=(1, 2))
+    with pytest.raises(ValueError, match="unique"):
+        SpinOrbitalColumns(up=(1, 1), down=(0, 2))
+
+
+def test_netket_vmc_setup_reports_ansatz_shape_without_optional_dependencies():
+    ansatz = PackedPEPS(
+        params=None,
+        skeleton=None,
+        leaves=(),
+        treedef=None,
+        sites=("a", "b"),
+        orbital_sites=("a", "b"),
+        orb_to_site=(0, 1),
+        site_to_orb=(0, 1),
+        n_params=17,
+    )
+    setup = NetKetPEPSVMC(
+        hilbert=None,
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=None,
+        model=None,
+        ansatz=ansatz,
+        config_map=None,
+        preconditioner=None,
+    )
+    assert setup.n_sites == 2
+    assert setup.n_params == 17
+
+
 def test_recommend_netket_vmc_settings_large_parameter_count():
     settings = recommend_netket_vmc_settings(
         n_params=20_000,
@@ -358,8 +400,12 @@ def test_build_fermi_hubbard_vmc_tiny_setup():
     )
     assert setup.hilbert.n_states == 36
     assert setup.ansatz.n_sites == 4
+    assert setup.n_sites == setup.ansatz.n_sites
+    assert setup.n_params == setup.ansatz.n_params
+    assert setup.columns.n_orbitals == setup.n_sites
     assert setup.preconditioner is None
     assert make_netket_vmc_driver(setup) is not None
+    assert setup.make_driver() is not None
 
 
 def test_build_ising_vmc_tiny_setup_and_expectation():
@@ -392,9 +438,12 @@ def test_build_ising_vmc_tiny_setup_and_expectation():
     assert setup.hilbert.n_states == 16
     assert setup.config_map == NetKetLocalConfigMap.spin_half()
     assert setup.preconditioner is None
-    energy = setup.vstate.expect(setup.hamiltonian)
+    assert setup.n_sites == setup.ansatz.n_sites
+    assert setup.n_params == setup.ansatz.n_params
+    energy = setup.expect_energy()
     assert np.isfinite(np.asarray(energy.mean).real)
     assert make_netket_vmc_driver(setup) is not None
+    assert setup.make_driver() is not None
 
 
 def test_build_heisenberg_vmc_tiny_setup_and_expectation():
@@ -427,9 +476,12 @@ def test_build_heisenberg_vmc_tiny_setup_and_expectation():
     assert setup.hilbert.n_states == 6
     assert setup.config_map == NetKetLocalConfigMap.spin_half()
     assert setup.preconditioner is None
-    energy = setup.vstate.expect(setup.hamiltonian)
+    assert setup.n_sites == setup.ansatz.n_sites
+    assert setup.n_params == setup.ansatz.n_params
+    energy = setup.expect_energy()
     assert np.isfinite(np.asarray(energy.mean).real)
     assert make_netket_vmc_driver(setup) is not None
+    assert setup.make_driver() is not None
 
 
 def test_make_netket_sr_preconditioner_resolves_qgt():
