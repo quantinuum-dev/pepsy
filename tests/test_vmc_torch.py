@@ -1,15 +1,18 @@
 """Tests for Pepsy's optional torch VMC kernels."""
 
 import pytest
+import quimb.tensor as qtn
 
 torch = pytest.importorskip("torch")
 
 from pepsy.vmc.torch import (  # noqa: E402
     FermionSiteEncoding,
+    TorchPEPSAmplitude,
     TorchSquareLattice,
     count_spinful_particles,
     heisenberg_connections,
     local_energy_from_connections,
+    make_torch_peps_amplitude_model,
     metropolis_exchange_sweep,
     propose_spin_exchange,
     propose_spinful_exchange_or_hopping,
@@ -60,6 +63,65 @@ def test_torch_square_lattice_edges_match_row_major_open_boundary():
         (1, 4),
         (2, 5),
     )
+
+
+def test_torch_peps_amplitude_matches_direct_quimb_contraction():
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=10,
+        dtype="float64",
+    )
+    model = TorchPEPSAmplitude(peps, contraction="exact", dtype=torch.float64)
+    rows = torch.tensor([[0, 1, 0, 1], [1, 0, 1, 0]])
+    amps = model(rows)
+
+    direct = []
+    for row in rows:
+        tnx = peps.isel({
+            peps.site_ind(site): int(row[i])
+            for i, site in enumerate(peps.sites)
+        })
+        direct.append(tnx.contract(all))
+
+    assert torch.allclose(amps, torch.as_tensor(direct, dtype=torch.float64))
+    phase, log_abs = model.forward_log(rows)
+    assert torch.allclose(phase * torch.exp(log_abs), amps)
+    assert model.n_sites == 4
+    assert model.n_params == sum(p.numel() for p in model.parameters())
+
+
+def test_torch_peps_amplitude_supports_torch_optimizer_step():
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=11,
+        dtype="float64",
+    )
+    model = make_torch_peps_amplitude_model(
+        peps,
+        contraction="exact",
+        dtype=torch.float64,
+    )
+    rows = torch.tensor([[0, 0, 0, 0], [1, 1, 1, 1]])
+    target = torch.tensor([0.25, -0.1], dtype=torch.float64)
+    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+
+    opt.zero_grad()
+    before = model(rows).detach().clone()
+    loss = (model(rows) - target).square().sum()
+    loss.backward()
+    assert all(param.grad is not None for param in model.parameters())
+    opt.step()
+    after = model(rows).detach()
+
+    assert not torch.allclose(before, after)
+    peps_after = model.to_peps()
+    assert tuple(peps_after.sites) == tuple(peps.sites)
 
 
 def test_spinful_exchange_hopping_proposal_preserves_particle_counts():
@@ -148,6 +210,26 @@ def test_local_energy_from_connections_matches_constant_amplitude_sum():
 
     energy = local_energy_from_connections(configs, amps, conn, amplitude_fn)
     assert energy.tolist() == [0.5]
+
+
+def test_torch_peps_amplitude_feeds_local_energy_kernel():
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=12,
+        dtype="float64",
+    )
+    model = TorchPEPSAmplitude(peps, contraction="exact", dtype=torch.float64)
+    graph = TorchSquareLattice(2, 2)
+    configs = torch.tensor([[0, 1, 0, 1], [1, 0, 1, 0]])
+    amps = model(configs)
+    conn = heisenberg_connections(configs, graph, J=1.0)
+    energy = local_energy_from_connections(configs, amps, conn, model)
+
+    assert energy.shape == (2,)
+    assert torch.isfinite(energy).all()
 
 
 def test_metropolis_exchange_sweep_accepts_constant_amplitude_proposals():

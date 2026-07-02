@@ -25,14 +25,17 @@ configs = pvmc.random_spinful_configs(
     encoding=encoding,
 )
 
-def amplitude_fn(rows):
-    # rows has shape (batch, n_sites). Plug in a torch PEPS, NN-fPEPS,
-    # Slater, or hybrid amplitude model here.
-    return torch.ones(rows.shape[0], dtype=torch.float64, device=rows.device)
+# For pure PEPS VMC, pack a quimb PEPS as torch trainable parameters.
+model = pvmc.TorchPEPSAmplitude(
+    peps,
+    contraction="exact",  # or "boundary" / "ctmrg" / "hotrg" with chi=...
+    dtype=torch.float64,
+)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 sample = pvmc.metropolis_exchange_sweep(
     configs,
-    amplitude_fn,
+    model,
     graph,
     proposal="spinful",
     hopping_rate=0.25,
@@ -49,9 +52,13 @@ eloc = pvmc.local_energy_from_connections(
     sample.configs,
     sample.amplitudes,
     conn,
-    amplitude_fn,
+    model,
 )
 ```
+
+`TorchPEPSAmplitude.parameters()` returns the packed PEPS tensor leaves as
+torch parameters, so plain torch optimizers and future SR/minSR utilities can
+update the tensor network directly.
 
 The default spinful encoding matches Pepsy/Symmray physical indices
 `0=empty, 1=double, 2=up, 3=down`. Use

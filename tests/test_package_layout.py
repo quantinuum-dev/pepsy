@@ -39,12 +39,14 @@ from pepsy.tensors import (
 )
 from pepsy.vmc import (
     FermionSiteEncoding,
+    TorchPEPSAmplitude,
     TorchSquareLattice,
     build_heisenberg_vmc,
     build_ising_vmc,
     heisenberg_connections,
     make_fermionic_peps_batched_amplitude_function,
     make_peps_batched_amplitude_function,
+    make_torch_peps_amplitude_model,
     pack_peps_ansatz,
     spinful_fermi_hubbard_connections,
     square_lattice_edges,
@@ -89,12 +91,14 @@ def test_new_namespace_imports_resolve():
     assert callable(reg_complex_svd_jax)
     assert callable(site_charge_from_occupations)
     assert FermionSiteEncoding is not None
+    assert TorchPEPSAmplitude is not None
     assert TorchSquareLattice is not None
     assert callable(build_heisenberg_vmc)
     assert callable(build_ising_vmc)
     assert callable(heisenberg_connections)
     assert callable(make_fermionic_peps_batched_amplitude_function)
     assert callable(make_peps_batched_amplitude_function)
+    assert callable(make_torch_peps_amplitude_model)
     assert callable(pack_peps_ansatz)
     assert callable(spinful_fermi_hubbard_connections)
     assert callable(square_lattice_edges)

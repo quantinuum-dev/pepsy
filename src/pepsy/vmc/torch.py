@@ -13,6 +13,7 @@ from typing import Any
 
 __all__ = [
     "FermionSiteEncoding",
+    "TorchPEPSAmplitude",
     "TorchConnections",
     "TorchMetropolisResult",
     "TorchSquareLattice",
@@ -24,6 +25,7 @@ __all__ = [
     "propose_spinful_exchange_or_hopping",
     "random_spin_configs",
     "random_spinful_configs",
+    "make_torch_peps_amplitude_model",
     "spinful_fermi_hubbard_connections",
     "transverse_ising_connections",
 ]
@@ -71,6 +73,269 @@ def _site_value(value, site):
     if isinstance(value, dict):
         return value.get(site, 0.0)
     return value
+
+
+_CONTRACTION_ALIASES = {
+    "exact": "exact",
+    "hotrg": "hotrg",
+    "ctmrg": "ctmrg",
+    "boundary": "boundary",
+    "contract_boundary": "boundary",
+    "mps": "boundary",
+    "boundary_mps": "boundary",
+    "contract-boundary": "boundary",
+    "boundary-mps": "boundary",
+}
+
+
+def _validate_contraction(contraction, chi):
+    key = str(contraction).replace("_", "-").lower()
+    try:
+        contraction = _CONTRACTION_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(
+            "contraction must be 'exact', 'hotrg', 'ctmrg', or 'boundary'."
+        ) from exc
+    if contraction in {"hotrg", "ctmrg", "boundary"} and chi is None:
+        raise ValueError(f"contraction={contraction!r} requires chi.")
+    return contraction
+
+
+def _as_contraction_options(contraction_opts):
+    return {} if contraction_opts is None else dict(contraction_opts)
+
+
+def _torch_finfo_tiny(dtype):
+    torch = _require_torch()
+    if dtype.is_complex:
+        dtype = torch.empty((), dtype=dtype).real.dtype
+    return torch.finfo(dtype).tiny
+
+
+class TorchPEPSAmplitude:
+    """Torch-optimizable amplitude wrapper for a quimb PEPS-like network.
+
+    The input configuration rows are physical indices in the PEPS site order by
+    default. For spin PEPS this usually means binary rows ``0/1``. For spinful
+    Hubbard PEPS use a four-state row encoding that matches the PEPS physical
+    basis, for example :class:`FermionSiteEncoding.symmray`.
+
+    This class deliberately stays pure PEPS/TNS: it registers the packed PEPS
+    tensor leaves as torch parameters and evaluates amplitudes by selecting
+    physical indices then contracting the resulting quimb tensor network.
+    """
+
+    def __init__(
+        self,
+        peps,
+        *,
+        contraction="exact",
+        chi=None,
+        cutoff=0.0,
+        contraction_opts=None,
+        dtype=None,
+        device=None,
+        site_order=None,
+    ):
+        torch = _require_torch()
+        import quimb as qu
+        import quimb.tensor as qtn
+
+        self.contraction = _validate_contraction(contraction, chi)
+        self.chi = None if chi is None else int(chi)
+        self.cutoff = float(cutoff)
+        self.contraction_opts = _as_contraction_options(contraction_opts)
+        if self.contraction == "boundary":
+            self.contraction_opts.setdefault("mode", "mps")
+
+        tn = getattr(peps, "tn", peps)
+        if not hasattr(tn, "sites"):
+            raise TypeError("peps must be a quimb PEPS-like object with sites.")
+        self.sites = tuple(tn.sites if site_order is None else site_order)
+        missing = [site for site in self.sites if site not in tn.sites]
+        if missing:
+            raise ValueError(f"site_order contains site(s) not in PEPS: {missing!r}")
+        self.site_inds = tuple(tn.site_ind(site) for site in self.sites)
+
+        params, skeleton = qtn.pack(tn)
+        flat_params, params_pytree = qu.utils.tree_flatten(params, get_ref=True)
+        leaves = []
+        for leaf in flat_params:
+            tensor = torch.as_tensor(leaf, dtype=dtype, device=device)
+            leaves.append(torch.nn.Parameter(tensor.clone()))
+        self.params = torch.nn.ParameterList(leaves)
+        self.params_pytree = params_pytree
+        self.skeleton = skeleton
+
+    @property
+    def n_sites(self):
+        """Number of physical sites expected in each config row."""
+        return len(self.sites)
+
+    @property
+    def n_params(self):
+        """Number of scalar PEPS tensor parameters."""
+        return int(sum(p.numel() for p in self.params))
+
+    def parameters(self):
+        """Return trainable PEPS tensor parameters for ``torch.optim``."""
+        return self.params.parameters()
+
+    def named_parameters(self):
+        """Return named trainable PEPS tensor parameters."""
+        return self.params.named_parameters()
+
+    def zero_grad(self, *, set_to_none=True):
+        """Clear parameter gradients."""
+        for param in self.params:
+            if set_to_none:
+                param.grad = None
+            elif param.grad is not None:
+                param.grad.zero_()
+
+    def to(self, *args, **kwargs):
+        """Move/cast PEPS tensor parameters, mirroring ``torch.nn.Module.to``."""
+        self.params.to(*args, **kwargs)
+        return self
+
+    def _params_pytree(self, params=None):
+        import quimb as qu
+
+        if params is None:
+            params = list(self.params)
+        elif isinstance(params, _require_torch().nn.ParameterList):
+            params = list(params)
+        return qu.utils.tree_unflatten(params, self.params_pytree)
+
+    def to_peps(self, *, detach=True, device="cpu"):
+        """Return a quimb PEPS-like object with the current tensor parameters."""
+        import quimb.tensor as qtn
+
+        leaves = []
+        for param in self.params:
+            leaf = param.detach() if detach else param
+            if device is not None:
+                leaf = leaf.to(device)
+            leaves.append(leaf)
+        return qtn.unpack(self._params_pytree(leaves), self.skeleton)
+
+    def _unpack_tn(self, params=None):
+        import quimb.tensor as qtn
+
+        return qtn.unpack(self._params_pytree(params), self.skeleton)
+
+    def _select_config(self, tn, config):
+        if config.shape[0] != self.n_sites:
+            raise ValueError(
+                f"config row has length {config.shape[0]}, expected {self.n_sites}."
+            )
+        return tn.isel({ind: config[i] for i, ind in enumerate(self.site_inds)})
+
+    def _contract_value(self, tnx):
+        if self.contraction == "hotrg":
+            return tnx.contract_hotrg(
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                **self.contraction_opts,
+            )
+        if self.contraction == "ctmrg":
+            return tnx.contract_ctmrg(
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                **self.contraction_opts,
+            )
+        if self.contraction == "boundary":
+            return tnx.contract_boundary(
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                **self.contraction_opts,
+            )
+        return tnx.contract(all)
+
+    def _contract_log_parts(self, tnx):
+        torch = _require_torch()
+        if self.contraction == "hotrg":
+            mantissa, exponent_10 = tnx.contract_hotrg(
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                strip_exponent=True,
+                **self.contraction_opts,
+            )
+        elif self.contraction == "ctmrg":
+            mantissa, exponent_10 = tnx.contract_ctmrg(
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                strip_exponent=True,
+                **self.contraction_opts,
+            )
+        elif self.contraction == "boundary":
+            mantissa, exponent_10 = tnx.contract_boundary(
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                strip_exponent=True,
+                **self.contraction_opts,
+            )
+        else:
+            amp = tnx.contract(all)
+            abs_amp = amp.abs()
+            tiny = _torch_finfo_tiny(abs_amp.dtype)
+            phase = torch.where(
+                abs_amp > 0,
+                amp / abs_amp.to(dtype=amp.dtype),
+                torch.zeros_like(amp),
+            )
+            return phase, torch.log(abs_amp.clamp_min(tiny))
+
+        mantissa = torch.as_tensor(mantissa)
+        exponent_10 = torch.as_tensor(exponent_10, device=mantissa.device)
+        abs_mantissa = mantissa.abs()
+        tiny = _torch_finfo_tiny(abs_mantissa.dtype)
+        phase = torch.where(
+            abs_mantissa > 0,
+            mantissa / abs_mantissa.to(dtype=mantissa.dtype),
+            torch.zeros_like(mantissa),
+        )
+        log_abs = torch.log(abs_mantissa.clamp_min(tiny)) + exponent_10 * torch.log(
+            torch.as_tensor(10.0, dtype=exponent_10.dtype, device=mantissa.device)
+        )
+        return phase, log_abs
+
+    def amplitude(self, config, params=None):
+        """Evaluate a single configuration amplitude."""
+        config = _as_long_matrix(config).reshape(-1)
+        tn = self._unpack_tn(params)
+        return self._contract_value(self._select_config(tn, config))
+
+    def forward(self, configs, params=None):
+        """Evaluate a batch of configuration amplitudes."""
+        configs = _as_long_matrix(configs)
+        tn = self._unpack_tn(params)
+        return _require_torch().stack([
+            self._contract_value(self._select_config(tn, row))
+            for row in configs
+        ])
+
+    def forward_log(self, configs, params=None):
+        """Return ``(phase, log_abs)`` for a batch of configurations."""
+        configs = _as_long_matrix(configs)
+        tn = self._unpack_tn(params)
+        phases = []
+        log_abs = []
+        for row in configs:
+            phase, log_scale = self._contract_log_parts(self._select_config(tn, row))
+            phases.append(phase)
+            log_abs.append(log_scale)
+        torch = _require_torch()
+        return torch.stack(phases), torch.stack(log_abs)
+
+    def __call__(self, configs, params=None):
+        """Alias for :meth:`forward`."""
+        return self.forward(configs, params=params)
+
+
+def make_torch_peps_amplitude_model(peps, **kwargs):
+    """Build a :class:`TorchPEPSAmplitude` from a quimb PEPS-like object."""
+    return TorchPEPSAmplitude(peps, **kwargs)
 
 
 @dataclass(frozen=True)
