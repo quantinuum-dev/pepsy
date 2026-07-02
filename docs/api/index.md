@@ -23,4 +23,5 @@ optimizers/peps
 solvers/gradient
 solvers/finite_difference
 sampling/samplers
+vmc
 ```

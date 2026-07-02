@@ -37,6 +37,7 @@ from pepsy.tensors import (
     reg_rel_svd_torch,
     site_charge_from_occupations,
 )
+from pepsy.vmc import make_fermionic_peps_batched_amplitude_function, square_lattice_edges
 
 
 def test_new_namespace_imports_resolve():
@@ -75,6 +76,8 @@ def test_new_namespace_imports_resolve():
     assert callable(reg_real_svd_jax)
     assert callable(reg_complex_svd_jax)
     assert callable(site_charge_from_occupations)
+    assert callable(make_fermionic_peps_batched_amplitude_function)
+    assert callable(square_lattice_edges)
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ _MODULE_EXPORTS = {
     "sampling",
     "solvers",
     "tensors",
+    "vmc",
 }
 
 _SYMBOL_MODULES = {
@@ -164,6 +165,7 @@ __all__ = [
     "sampling",
     "solvers",
     "tensors",
+    "vmc",
     "BdyMPS",
     "BoundaryContractResult",
     "CompBdy",
@@ -295,7 +297,7 @@ def __getattr__(name):
 
 
 if TYPE_CHECKING:
-    from . import backends, boundary, fitting, operators, optimizers, sampling, solvers, tensors
+    from . import backends, boundary, fitting, operators, optimizers, sampling, solvers, tensors, vmc
     from .backends import (
         get_default_array_backend,
         get_default_grad_backend,

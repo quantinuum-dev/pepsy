@@ -14,7 +14,7 @@ def test_package_version_available():
 
 _EXPECTED_IN_ALL = [
     "backends", "boundary", "fitting", "operators", "optimizers",
-    "sampling", "solvers", "tensors",
+    "sampling", "solvers", "tensors", "vmc",
     "BdyMPS", "CompBdy", "BoundaryContractResult", "contract_boundary",
     "contract_flat", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
     "peps_norm", "peps_infidelity", "peps_fidelity", "GlobalOptimizer", "FIT",
@@ -92,7 +92,7 @@ _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
 
 _MODULE_EXPORTS = [
     "backends", "boundary", "fitting", "operators", "optimizers",
-    "sampling", "solvers", "tensors",
+    "sampling", "solvers", "tensors", "vmc",
 ]
 
 
