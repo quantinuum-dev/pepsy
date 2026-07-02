@@ -13,9 +13,14 @@ This file defines default behavior for coding agents working in this repository.
 - Tests: `tests/`
 - Docs: `docs/`
 - Examples: `examples/`
-- The sibling `/home/reza.haghshenas@quantinuum.com/tensy` repository uses
-  Pepsy as its tensor-network package; keep that consumer in mind for API and
-  behavior changes.
+- Gaugy and Tensy are separate packages/repositories. Do not recreate Gaugy,
+  Tensy, or other sibling-project folders inside this Pepsy repository.
+- Keep Pepsy source, tests, docs, and examples focused on Pepsy itself. Do not
+  add `gaugy` or `tensy` imports, package code, notebooks, examples, or docs
+  here unless the user explicitly asks for a cross-package integration artifact.
+- When work needs Gaugy or Tensy behavior, make the Pepsy side expose a clean
+  public API and leave package-specific code in the corresponding external
+  repository.
 - Local/generated artifacts may appear in `build/`, `docs/_build/`, `__pycache__/`, `cash*/`, `ctg_cash/`, and `store/`; do not use these as source-of-truth code.
 
 ## Startup Checklist
@@ -121,7 +126,8 @@ At the start of a new task:
 
 ## Python and Environment
 
-- Use Python 3.11 environment for commands and tests.
+- Use the Python 3.12 environment for commands and tests:
+  `source ~/envs/py312/bin/activate`.
 - Run commands from repository root when possible.
 - Install local development dependencies with `python -m pip install -e '.[dev,docs]'` when needed.
 
@@ -155,9 +161,8 @@ NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX
 - For Pepsy examples, prefer Pepsy public functionality wherever possible; drop
   to `quimb`, `autoray`, or `cotengra` only when the example specifically needs
   lower-level tensor-network, backend, or contraction-planning control.
-- For Gaugy examples, prefer Gaugy public functionality first, then Pepsy public
-  functionality, then `quimb`; use `autoray`/`cotengra` only for explicit
-  backend or contraction-optimizer concerns.
+- Do not add Gaugy or Tensy examples/notebooks under `examples/`; those belong
+  in their own repositories.
 - Do not modify generated notebook outputs unless explicitly requested.
 - When changing public examples, verify that imports use current namespaces and public API names.
 - If a notebook or helper still shows an old flat import path, migrate it deliberately instead of copying that pattern into new code.

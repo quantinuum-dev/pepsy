@@ -19,4 +19,11 @@ It demonstrates:
 - [How-To: Choose Parameters](howto/choose_parameters.md)
 - [How-To: Tune Sweep Solvers](howto/solver_tuning.md)
 
+## Runnable scripts
+
+- `examples/SimpleUpdateGen/long_range_peps.py` demonstrates a long-range PEPS
+  simple-update term: raw `quimb.SimpleUpdateGen` fails on the non-adjacent
+  endpoints, while `pepsy.SimpleUpdateGen` routes the gate through SWAPs and
+  reports the resulting max bond, gauge count, and cluster energy.
+
 For a cleaner, docs-first narrative, start from [tutorials](tutorials/index.md).

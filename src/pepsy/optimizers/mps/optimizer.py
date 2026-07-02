@@ -3,12 +3,12 @@
 :class:`MpsOptimizer` replays a canonical bundled gate stream
 ``[(gate, where), ...]`` against an MPS, using one of several compression
 backends.  The default path assumes a norm-preserving stream and does not
-renormalize.  Non-unitary streams should use ``non_unitary=True``; this
-normalizes the raw MPS tensor data every 20 applied gate steps by default
-(tunable via ``normalize_every``) while accumulating the removed scale into
-``p.exponent``.  Quimb includes that exponent in ``p.norm()``, so ``p.norm()``
-still reports the represented state norm; inspect a copy with ``exponent=0``
-to see the rescaled data norm.  Diagnostics are separate opt-ins:
+renormalize.  Non-unitary streams should use ``non_unitary=True``; when
+``normalize_every`` is enabled this normalizes the active MPS tensor data after
+compressed updates while accumulating the removed scale into ``p.exponent``.
+Quimb includes that exponent in ``p.norm()``, so ``p.norm()`` still reports the
+represented state norm; inspect a copy with ``exponent=0`` to see the rescaled
+data norm. Diagnostics are separate opt-ins:
 ``track_norm_infidelity=True`` records a cheap norm-ratio proxy, while
 ``track_infidelity=True`` records a true normalized-overlap metric, reports
 cumulative infidelity in progress bars, and keeps the running geometric mean
@@ -69,11 +69,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ----------
     normalizations : list[dict]
         Automatic normalization events recorded during :meth:`run`. Each entry
-        stores the 1-based gate step, previous raw squared norm,
-        canonicalization span, tensor site where the normalization factor was
-        inserted, and resulting base-10 ``p.exponent``.
-        The raw tensor data are rescaled; the represented norm remains
-        available through ``p.norm()`` because quimb applies ``p.exponent``.
+        stores the 1-based gate step, removed local squared scale,
+        orthogonality span, tensor sites that were rescaled, and resulting
+        base-10 ``p.exponent``. The raw tensor data are rescaled; the
+        represented norm remains available through ``p.norm()`` because quimb
+        applies ``p.exponent``.
     infidelities : list[float]
         Cumulative infidelity trace. When ``track_infidelity=True``, compressed
         two-site updates append the true normalized-overlap infidelity from
@@ -88,7 +88,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     """
 
     _ALLOWED_MODES = frozenset({"dmrg", "mpo", "swap", "svd", "exact"})
-    _NON_UNITARY_NORMALIZE_EVERY = 20
     _PROGBAR_COLORS = {
         "dmrg": "#1f77b4",
         "mpo": "#2ca02c",
@@ -359,7 +358,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fidelity_samples=None,
         k_2q_batch=1,
         non_unitary=False,
-        normalize_every=None,
+        normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
         track_norm_infidelity=False,
@@ -399,23 +398,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         non_unitary : bool, default=False
             Convenience flag for non-unitary gate streams. Normalization is
             only available when this is ``True``; default/unitary runs never
-            normalize. If ``True`` and ``normalize_every`` is omitted,
-            normalize after every 20 applied gate steps. Batched DMRG updates
-            normalize once at the batch end. No trailing normalization is
-            performed unless ``normalize_final=True``.
-        normalize_every : int | bool | None, default=None
-            Periodically normalize the MPS after this many queued gate steps.
-            This requires ``non_unitary=True``. Batches that cross an interval
-            normalize once at the batch end. The normalization factor is
-            inserted inside the latest canonicalization range. ``True`` means
-            every step, ``False`` disables normalization, and ``None`` maps to
-            20 when ``non_unitary=True``.
+            normalize. If enabled, local tensor scale control runs after every
+            compressed two-site update or DMRG batch. No trailing
+            normalization is performed unless ``normalize_final=True``.
+        normalize_every : int | bool | None, default=False
+            Compatibility switch for non-unitary local scale control. Any
+            positive integer or ``True`` enables normalization after compressed
+            updates; ``False`` or ``None`` disables it.
         normalize_final : bool, default=False
-            If periodic normalization is enabled, also normalize once at the
-            end of the run when the final gate did not land on an interval.
-            This also requires ``non_unitary=True``.
+            If local scale control is enabled, also normalize once at the end
+            of the run when the final gate was not already normalized. This
+            also requires ``non_unitary=True``.
         normalize_eps : float, default=1e-15
-            Precision passed to :meth:`qtn.MatrixProductState.normalize`.
+            Retained for compatibility with older full-normalization paths.
+            Local tensor scale control does not use this value.
         track_norm_infidelity : bool, default=False
             If ``True``, build pre-compression norm targets and append the
             cumulative norm-ratio infidelity proxy for compressed two-site
@@ -835,35 +831,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             inplace=False,
         )
 
-    @classmethod
-    def _normalize_every_interval(cls, normalize_every, non_unitary=False):
-        """Return periodic normalization interval, or ``None`` if disabled.
+    @staticmethod
+    def _normalize_every_interval(normalize_every, non_unitary=False):
+        """Return whether non-unitary local scale control is enabled.
 
         Normalization is only meaningful for non-unitary streams. Callers
         validate explicit normalization requests before this helper is reached.
         """
         if not non_unitary:
             return None
-        if normalize_every is None:
-            return cls._NON_UNITARY_NORMALIZE_EVERY
-        if normalize_every is False:
+        if normalize_every is None or normalize_every is False:
             return None
         if normalize_every is True:
-            return 1
+            return True
         if not isinstance(normalize_every, Integral):
             raise TypeError("normalize_every must be a positive integer, bool, or None.")
 
         interval = int(normalize_every)
         if interval < 1:
             raise ValueError("normalize_every must be >= 1 when enabled.")
-        return interval
-
-    @staticmethod
-    def _normalization_due(prev_step, step, normalize_every):
-        """Return whether a periodic normalization boundary was crossed."""
-        if normalize_every is None:
-            return False
-        return step // normalize_every > prev_step // normalize_every
+        return True
 
     @staticmethod
     def _normalization_insert_site(p, fallback_span):
@@ -878,47 +865,123 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             pass
         return int(span[-1])
 
-    def _normalize_in_canonical_range(self, p, where, *, step, eps=1e-15):
-        """Canonicalize ``where``, normalize data, store scale in exponent."""
-        span = self.canonize_mps(p, where)
-        insert = self._normalization_insert_site(p, span)
-        norm = self._canonical_span_norm(p, span)
-        old_norm = norm**2
-        try:
-            p[insert].modify(data=p[insert].data / norm)
-            self._accumulate_exponent(p, norm)
-        except Exception:
-            old_norm = p.normalize(eps=eps, insert=insert)
-            self._accumulate_exponent(p, old_norm**0.5)
-        self.info_c["cur_orthog"] = span
+    @staticmethod
+    def _tensor_local_scale(data):
+        """Return a cheap local Frobenius scale for one tensor's data."""
+        return ar.do("linalg.norm", data)
 
+    @staticmethod
+    def _accumulate_exponent_log10(p, log10_scale):
+        """Accumulate an extracted base-10 log scale into ``p.exponent``."""
+        if hasattr(p, "exponent"):
+            p.exponent = p.exponent + log10_scale
+
+    @staticmethod
+    def _event_old_norm_from_log10(log10_old_norm):
+        """Return a float old-norm value from its base-10 log when possible."""
+        if not np.isfinite(log10_old_norm):
+            return np.inf if log10_old_norm > 0.0 else 0.0
+        max_log10 = np.log10(np.finfo(float).max)
+        if log10_old_norm > max_log10:
+            return np.inf
+        if log10_old_norm < -max_log10:
+            return 0.0
+        return float(10.0**log10_old_norm)
+
+    def _normalize_orthog_tensors(
+        self,
+        p,
+        where,
+        *,
+        step,
+        reason,
+        canonicalize=False,
+    ):
+        """Rescale tensors in the active orthogonality span and track exponent."""
+        fallback_span = self._normalize_span(where)
+        if canonicalize:
+            span = self.canonize_mps(p, fallback_span)
+        else:
+            try:
+                span = self._current_orthog(p)
+            except Exception:  # pragma: no cover - defensive for quimb variants
+                span = fallback_span
+            if not (span[0] <= fallback_span[0] and fallback_span[1] <= span[1]):
+                span = fallback_span
+                self.info_c["cur_orthog"] = span
+
+        sites = tuple(range(int(span[0]), int(span[1]) + 1))
+        scaled_sites = []
+        scales = []
+        log10_scales = []
+        log10_total_scale = 0.0
+
+        for site in sites:
+            data = p[site].data
+            scale = self._tensor_local_scale(data)
+            scale_abs = ar.do("abs", scale)
+            scale_float = self._real_float(scale_abs)
+            if scale_float == 0.0 or not np.isfinite(scale_float):
+                continue
+
+            p[site].modify(data=data / scale)
+            log10_scale = ar.do("log10", scale_abs)
+            self._accumulate_exponent_log10(p, log10_scale)
+
+            log10_scale_float = self._real_float(log10_scale)
+            scaled_sites.append(int(site))
+            scales.append(scale_float)
+            log10_scales.append(log10_scale_float)
+            log10_total_scale += log10_scale_float
+
+        if not scaled_sites:
+            return None
+
+        self.info_c["cur_orthog"] = span
+        insert = self._normalization_insert_site(p, span)
         event = {
             "step": int(step),
-            "old_norm": self._real_float(old_norm),
+            "old_norm": self._event_old_norm_from_log10(2.0 * log10_total_scale),
             "span": tuple(span),
             "insert": int(insert),
+            "sites": tuple(scaled_sites),
+            "scales": tuple(scales),
+            "log10_scale": float(log10_total_scale),
+            "log10_scales": tuple(log10_scales),
+            "reason": str(reason),
+            "method": "local_tensors",
             "exponent": self._real_float(getattr(p, "exponent", 0.0)),
         }
         self.normalizations.append(event)
         return event
 
-    def _maybe_normalize_after_step(
+    def _normalize_in_canonical_range(self, p, where, *, step, eps=1e-15):
+        """Canonicalize ``where`` and apply local tensor scale control."""
+        _ = eps
+        return self._normalize_orthog_tensors(
+            p,
+            where,
+            step=step,
+            reason="final",
+            canonicalize=True,
+        )
+
+    def _maybe_normalize_after_compression(
         self,
         p,
         *,
-        prev_step,
         step,
         where,
         normalize_every,
-        normalize_eps,
     ):
-        """Apply automatic normalization if the configured interval is due."""
-        if self._normalization_due(prev_step, step, normalize_every):
-            return self._normalize_in_canonical_range(
+        """Apply local scale control after a compressed update when enabled."""
+        if normalize_every is not None:
+            return self._normalize_orthog_tensors(
                 p,
                 where,
                 step=step,
-                eps=normalize_eps,
+                reason="compression",
+                canonicalize=False,
             )
         return None
 
@@ -933,7 +996,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_final,
         normalize_eps,
     ):
-        """Optionally normalize at run end if periodic normalization was active."""
+        """Optionally normalize at run end if local scale control was active."""
         if (
             normalize_every is not None
             and normalize_final
@@ -1057,7 +1120,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         idx = 0
         while idx < len(G_seq):
-            prev_idx = idx
+            compressed = False
             where = where_seq[idx]
             gate = G_seq[idx]
             if len(where) == 1:
@@ -1129,6 +1192,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     idx += 1
                     advanced = 1
                     last_where = (xmin, xmax)
+                    compressed = True
                 else:
                     batch_G, batch_where, two_qubit_in_batch, next_idx = self._collect_dmrg_batch(
                         G_seq, where_seq, idx, k_2q_batch
@@ -1178,14 +1242,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     advanced = next_idx - idx
                     idx = next_idx
                     last_where = (xmin, xmax)
+                    compressed = True
 
-            event = self._maybe_normalize_after_step(
-                p,
-                prev_step=prev_idx,
-                step=idx,
-                where=last_where,
-                normalize_every=normalize_every,
-                normalize_eps=normalize_eps,
+            event = (
+                self._maybe_normalize_after_compression(
+                    p,
+                    step=idx,
+                    where=last_where,
+                    normalize_every=normalize_every,
+                )
+                if compressed
+                else None
             )
             if event is not None:
                 last_normalized_step = idx
@@ -1268,7 +1335,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         idx = 0
         while idx < len(G_seq):
-            prev_idx = idx
+            compressed = False
             where = where_seq[idx]
             gate = G_seq[idx]
             if len(where) == 1:
@@ -1341,6 +1408,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 idx += 1
                 advanced = 1
                 last_where = (xmin, xmax)
+                compressed = True
                 if track_norm_infidelity:
                     self._append_norm_infidelity_sample(
                         self._canonical_span_norm(p, (xmin, xmax)),
@@ -1358,13 +1426,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     true_cumulative_infidelity = sample["infidelity"]
 
-            event = self._maybe_normalize_after_step(
-                p,
-                prev_step=prev_idx,
-                step=idx,
-                where=last_where,
-                normalize_every=normalize_every,
-                normalize_eps=normalize_eps,
+            event = (
+                self._maybe_normalize_after_compression(
+                    p,
+                    step=idx,
+                    where=last_where,
+                    normalize_every=normalize_every,
+                )
+                if compressed
+                else None
             )
             if event is not None:
                 last_normalized_step = idx
@@ -1450,7 +1520,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         idx = 0
         while idx < len(G_seq):
-            prev_idx = idx
+            compressed = False
             where = where_seq[idx]
             gate = G_seq[idx]
             if len(where) == 1:
@@ -1501,6 +1571,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 idx += 1
                 advanced = 1
                 last_where = (xmin, xmax)
+                compressed = True
                 if track_norm_infidelity:
                     self._append_norm_infidelity_sample(
                         self._canonical_span_norm(p, (xmin, xmax)),
@@ -1518,13 +1589,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     true_cumulative_infidelity = sample["infidelity"]
 
-            event = self._maybe_normalize_after_step(
-                p,
-                prev_step=prev_idx,
-                step=idx,
-                where=last_where,
-                normalize_every=normalize_every,
-                normalize_eps=normalize_eps,
+            event = (
+                self._maybe_normalize_after_compression(
+                    p,
+                    step=idx,
+                    where=last_where,
+                    normalize_every=normalize_every,
+                )
+                if compressed
+                else None
             )
             if event is not None:
                 last_normalized_step = idx
@@ -1613,7 +1686,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         idx = 0
         while idx < len(G_seq):
-            prev_idx = idx
+            compressed = False
             where = where_seq[idx]
             gate = G_seq[idx]
             if len(where) == 1:
@@ -1693,6 +1766,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 idx += 1
                 advanced = 1
                 last_where = (xmin, xmax)
+                compressed = True
                 if track_norm_infidelity:
                     self._append_norm_infidelity_sample(
                         self._canonical_span_norm(p, (xmin, xmax)),
@@ -1710,13 +1784,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     true_cumulative_infidelity = sample["infidelity"]
 
-            event = self._maybe_normalize_after_step(
-                p,
-                prev_step=prev_idx,
-                step=idx,
-                where=last_where,
-                normalize_every=normalize_every,
-                normalize_eps=normalize_eps,
+            event = (
+                self._maybe_normalize_after_compression(
+                    p,
+                    step=idx,
+                    where=last_where,
+                    normalize_every=normalize_every,
+                )
+                if compressed
+                else None
             )
             if event is not None:
                 last_normalized_step = idx
@@ -1894,8 +1970,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def get_normalizations(self):
         """Return automatic normalization events recorded during ``run``.
 
-        Each event contains the 1-based ``step``, removed ``old_norm``,
-        canonical ``span``, and tensor ``insert`` site that received the
-        normalization factor, plus the resulting base-10 ``exponent``.
+        Each event contains the 1-based ``step``, removed local ``old_norm``,
+        active ``span``, rescaled ``sites``, per-tensor ``scales``, total
+        ``log10_scale``, event ``reason``, and resulting base-10 ``exponent``.
         """
         return self.normalizations

@@ -17,8 +17,9 @@ Current package version: `0.2.0` (from `pyproject.toml` / `pepsy.__version__`).
   - `optimizers/`: sweep, global, energy, MPS, MPO, and PEPS optimizers
   - `sampling/`: `MpsSampler` and related sampling utilities
   - `_internal/`: private formatting and utility helpers
-- `examples/`: runnable examples, including `MpsMagnetization/` and direct
-  fermionic Symmray Fermi-Hubbard starters under `pepsy_examples/Fermi_Hubbard/`
+- `examples/`: lightweight runnable examples kept with the package
+- `../pepsy_examples/`: external notebooks and smoke examples, including direct
+  fermionic Symmray Fermi-Hubbard starters under `fermi_hubbard/`
 - `docs/`: Sphinx documentation source
 - `tests/`: package tests
 

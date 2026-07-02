@@ -1,4 +1,4 @@
-# `pepsy.optimizers.peps.optimizer`
+# `pepsy.optimizers.peps`
 
 `PepsOptimizer` has separate chi controls for different jobs:
 
@@ -20,6 +20,12 @@ Quimb environment controls with `boundary_options`.
 Use `PepsOptimizer.run(k_2q_batch=N)` to absorb up to `N` sequential two-site
 gates, plus intervening one-site gates, into one PEPS target before truncating
 to `chi` and optionally running the sweep/global cleanup.
+
+`SimpleUpdateGen` preserves quimb's arbitrary-geometry simple-update sweep and
+energy bookkeeping, but routes every gate through `pepsy.gate_simple(...)`.
+This lets sequential simple update handle long-range PEPS terms via Pepsy's
+SWAP routing. Use `route_opts` for routing controls such as `sequence`,
+`path_canonize`, and `path_compress`.
 
 ## Important cautions
 
@@ -43,9 +49,17 @@ to `chi` and optionally running the sweep/global cleanup.
   gates applied outside a two-site batch are not recorded as separate steps.
   For PEPS lattice gates, prefer coordinate-tuple sites such as
   `((x0, y0), (x1, y1))` over flat integer pairs.
+- `SimpleUpdateGen(update="parallel")` currently supports only direct-neighbor
+  terms. Long-range routed terms need route-aware layer scheduling and should
+  use `update="sequential"` for now.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.peps.optimizer
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. automodule:: pepsy.optimizers.peps.simple_update
    :members:
    :undoc-members:
    :show-inheritance:

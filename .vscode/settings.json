@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "/home/reza.haghshenas@quantinuum.com/envs/py312/bin/python",
+  "python.terminal.activateEnvironment": true
+}

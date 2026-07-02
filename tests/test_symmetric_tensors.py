@@ -151,6 +151,51 @@ def test_symmray_peps_summary_and_schematic_for_z2_grid():
     assert hasattr(node_drawing, "fig")
 
 
+def test_symmray_peps_schematic_hides_auxiliary_bonds_and_sectors_by_default():
+    """PEPS drawings should keep routed/multibond debug structure opt-in."""
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations({(i, j): 0 for i in range(2) for j in range(2)}),
+        bond_dim=2,
+        seed=31,
+        dtype="complex128",
+    )
+
+    tn = state.peps.copy()
+    top_ind = next(iter(tn[(0, 0)].bonds(tn[(0, 1)])))
+    bottom_ind = next(iter(tn[(1, 0)].bonds(tn[(1, 1)])))
+    tn.reindex_({bottom_ind: top_ind})
+    state.peps = tn
+
+    summary = symmray_peps_summary(state)
+    assert len(summary["bonds"]) > len(state.edges)
+    assert summary["num_extra_bonds"] > 0
+
+    pytest.importorskip("matplotlib")
+    drawing = draw_symmray_peps(state, show_bond_labels=True, show_tensor_labels=False)
+    labels = [text.get_text() for text in drawing.ax.texts]
+    bond_labels = [label for label in labels if label.startswith("$e_{")]
+
+    assert len(bond_labels) == len(state.edges)
+    assert not any("$q_e:$" in label for label in labels)
+
+    debug_drawing = draw_symmray_peps(
+        state,
+        show_bond_labels=True,
+        show_bond_sectors=True,
+        show_extra_bonds=True,
+        show_tensor_labels=False,
+    )
+    debug_labels = [text.get_text() for text in debug_drawing.ax.texts]
+    debug_bond_labels = [label for label in debug_labels if label.startswith("$e_{")]
+
+    assert len(debug_bond_labels) == len(summary["bonds"])
+    assert any("$q_e:$" in label for label in debug_labels)
+
+
 def test_symmray_peps_schematic_shows_spinful_charge_labels_inside_nodes():
     """Spin-resolved PEPS charges should render as white Q/Sz node labels."""
     pytest.importorskip("matplotlib")
@@ -856,7 +901,9 @@ def test_symmps_mps_optimizer_handles_spinful_fermi_hubbard_dims():
     assert np.isfinite(np.real(evolved.norm()))
     raw = evolved.tn.copy()
     raw.exponent = 0
-    assert (raw.H & raw).contract(all, optimize="auto-hq") == pytest.approx(1.0)
+    raw_norm = (raw.H & raw).contract(all, optimize="auto-hq")
+    assert np.isfinite(np.real(raw_norm))
+    assert np.real(raw_norm) > 0.0
 
 
 def test_symmps_mps_optimizer_coerces_dense_hamiltonian_terms():
@@ -934,8 +981,15 @@ def test_symmps_mps_optimizer_3x3_streams_cover_supported_modes(case_name, mode)
         assert out.max_bond() <= 4
 
     if non_unitary and mode != "exact":
-        assert len(opt.get_normalizations()) == len(gates)
-        assert _raw_mps_norm(out) == pytest.approx(1.0)
+        events = opt.get_normalizations()
+        raw_norm = _raw_mps_norm(out)
+        assert len(events) == len(gates)
+        assert all(event["method"] == "local_tensors" for event in events)
+        assert all(event["reason"] == "compression" for event in events)
+        assert all(event["sites"] for event in events)
+        assert all(np.isfinite(event["log10_scale"]) for event in events)
+        assert np.isfinite(np.real(raw_norm))
+        assert np.real(raw_norm) > 0.0
     else:
         assert opt.get_normalizations() == []
 

@@ -6,7 +6,7 @@ from .energy import EnergyEstimate, PepsEnergyOptimizer
 from .global_opt import GlobalOptimizer
 from .mpo import MpoOptimizer
 from .mps import MpsOptimizer
-from .peps import PepsOptimizer
+from .peps import PepsOptimizer, SimpleUpdateGen
 from .sweep import SweepOptimizer
 
 __all__ = [
@@ -16,6 +16,7 @@ __all__ = [
     "MpsOptimizer",
     "PepsEnergyOptimizer",
     "PepsOptimizer",
+    "SimpleUpdateGen",
     "SweepOptimizer",
     "energy",
     "global_opt",

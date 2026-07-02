@@ -17,6 +17,7 @@ pepsy.solvers       gradient and finite-difference parameter solvers
 pepsy.fitting       local tensor fitting routines
 pepsy.optimizers    high-level MPS, MPO, and PEPS optimizers
 pepsy.sampling      MPS, vector, and PEPS samplers
+pepsy.vmc           optional NetKet/JAX variational Monte Carlo bridges
 pepsy._internal     private formatting and utility helpers
 ```
 
@@ -26,7 +27,7 @@ Use the clearer namespaces for submodule imports:
 
 ```python
 from pepsy.boundary import BdyMPS, contract_boundary
-from pepsy.optimizers import SweepOptimizer, MpsOptimizer, PepsOptimizer
+from pepsy.optimizers import SweepOptimizer, MpsOptimizer, PepsOptimizer, SimpleUpdateGen
 from pepsy.operators import rx, rzz, gate
 from pepsy.tensors import haar_random_state, ps_to_peps, ps_to_3dpeps, ps_to_mps
 ```

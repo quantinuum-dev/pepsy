@@ -480,6 +480,13 @@ def _source_edges(source, bonds):
     return tuple(tuple(bond["between"]) for bond in bonds)
 
 
+def _explicit_source_edges(source):
+    edges = getattr(source, "edges", None)
+    if edges is None:
+        return None
+    return _as_edges(edges)
+
+
 def _edge_lookup(edges):
     order_by_pair = {}
     edge_by_pair = {}
@@ -537,6 +544,10 @@ def _fermionic_ordering_summary(source, *, network_kind, sites, bonds, fermionic
             for bond in bonds
         ),
     }
+
+
+def _directions_are_complementary(direction_a, direction_b):
+    return {direction_a, direction_b} == {"in", "out"}
 
 
 def _resolve_mps_position(tensors, value, *, name="position"):
@@ -1345,6 +1356,12 @@ def symmray_peps_summary(peps):
     site_tensors = {}
     index_maps = {}
     physical_inds = {}
+    source_edges = _explicit_source_edges(source)
+    order_by_pair, edge_by_pair = (
+        _edge_lookup(source_edges)
+        if source_edges is not None
+        else ({}, {})
+    )
 
     for position, site in enumerate(sites):
         tensor = _peps_site_tensor(tn, site)
@@ -1401,15 +1418,24 @@ def symmray_peps_summary(peps):
                 index_b = index_maps[site_b].get(ind)
                 index_summary = index_a or index_b
                 direction = _peps_relative_direction(site_a, site_b)
+                between = (site_a, site_b)
+                edge_order = order_by_pair.get(between)
                 bond = {
                     "position": len(bonds),
                     "site_a": site_a,
                     "site_b": site_b,
-                    "between": (site_a, site_b),
+                    "between": between,
+                    "edge": edge_by_pair.get(between),
+                    "edge_order": edge_order,
+                    "is_source_edge": edge_order is not None,
                     "ind": ind,
                     "direction": direction,
                     "site_a_direction": index_a["direction"] if index_a is not None else None,
                     "site_b_direction": index_b["direction"] if index_b is not None else None,
+                    "has_complementary_directions": _directions_are_complementary(
+                        index_a["direction"] if index_a is not None else None,
+                        index_b["direction"] if index_b is not None else None,
+                    ),
                     "dim": index_summary["dim"],
                     "num_sectors": index_summary["num_sectors"],
                     "chargemap": index_summary["chargemap"],
@@ -1434,6 +1460,17 @@ def symmray_peps_summary(peps):
         "sites": sites,
         "tensors": tensors,
         "bonds": bonds,
+        "source_edges": (
+            source_edges
+            if source_edges is not None
+            else tuple(tuple(bond["between"]) for bond in bonds)
+        ),
+        "has_source_edges": source_edges is not None,
+        "num_extra_bonds": (
+            sum(1 for bond in bonds if bond["edge_order"] is None)
+            if source_edges is not None
+            else 0
+        ),
         "symmetry": symmetry,
         "fermionic": fermionic,
         "fermionic_ordering": _fermionic_ordering_summary(
@@ -1479,6 +1516,37 @@ def _peps_site_distance(site, center):
     return abs(int(site[0]) - int(center[0])) + abs(int(site[1]) - int(center[1]))
 
 
+def _peps_primary_bond_key(bond):
+    return (
+        0 if bond.get("has_complementary_directions") else 1,
+        0 if bond.get("direction") != "other" else 1,
+        -int(bond.get("dim", 0)),
+        int(bond["position"]),
+    )
+
+
+def _peps_display_bonds(summary, shown_sites, *, show_extra_bonds):
+    bonds = [
+        bond
+        for bond in summary["bonds"]
+        if bond["site_a"] in shown_sites and bond["site_b"] in shown_sites
+    ]
+    if show_extra_bonds or not summary.get("has_source_edges"):
+        return bonds
+
+    grouped = {}
+    for bond in bonds:
+        edge_order = bond.get("edge_order")
+        if edge_order is None:
+            continue
+        grouped.setdefault(edge_order, []).append(bond)
+
+    return [
+        min(group, key=_peps_primary_bond_key)
+        for _edge_order, group in sorted(grouped.items())
+    ]
+
+
 def draw_symmray_peps(
     peps,
     *,
@@ -1490,6 +1558,8 @@ def draw_symmray_peps(
     show_arrows=True,
     show_leg_chargemaps=True,
     show_bond_labels=False,
+    show_bond_sectors=False,
+    show_extra_bonds=False,
     show_phys_labels=False,
     show_tensor_labels=True,
     show_diagnostics=False,
@@ -1514,6 +1584,13 @@ def draw_symmray_peps(
     and total particle number ``N`` where available. The node is enlarged
     automatically so the text fits. Set ``charge_in_node=False`` to keep the
     charge outside the node with the tensor label.
+
+    ``show_bond_labels=True`` annotates only the edge id, charge-flow
+    directions, and bond dimension. Set ``show_bond_sectors=True`` to add the
+    compact bond charge-sector maps. When the input is a ``SymPEPS`` wrapper,
+    only one primary shared index per configured ``edges`` entry is drawn by
+    default; set ``show_extra_bonds=True`` to debug all shared virtual indices,
+    including non-lattice and multibond indices introduced by routing/gauges.
     """
     summary = symmray_peps_summary(peps)
     max_blocks_per_site = int(max_blocks_per_site)
@@ -1535,11 +1612,18 @@ def draw_symmray_peps(
         Ly=summary["Ly"],
         name="center",
     )
-    shown_bonds = [
-        bond
+    show_bond_sectors = bool(show_bond_sectors)
+    show_extra_bonds = bool(show_extra_bonds)
+    shown_bonds = _peps_display_bonds(
+        summary,
+        shown_sites,
+        show_extra_bonds=show_extra_bonds,
+    )
+    hidden_bond_count = sum(
+        1
         for bond in summary["bonds"]
         if bond["site_a"] in shown_sites and bond["site_b"] in shown_sites
-    ]
+    ) - len(shown_bonds)
 
     try:
         from quimb import schematic  # pylint: disable=import-outside-toplevel
@@ -1555,9 +1639,12 @@ def draw_symmray_peps(
     if figsize is None:
         width = max(4.8, 1.15 * max(1, summary["Ly"]) + 1.8)
         height = max(4.4, 1.20 * max(1, summary["Lx"]) + 1.9)
-        if show_bond_labels or show_phys_labels or show_blocks:
-            width += 0.85 if show_leg_chargemaps else 0.55
-            height += 0.55 if show_leg_chargemaps else 0.35
+        if show_bond_labels or show_bond_sectors or show_phys_labels or show_blocks:
+            detailed_leg_maps = bool(
+                show_bond_sectors or (show_phys_labels and show_leg_chargemaps)
+            )
+            width += 0.85 if detailed_leg_maps else 0.55
+            height += 0.55 if detailed_leg_maps else 0.35
         if show_diagnostics:
             width += 1.35
         figsize = (width, height)
@@ -1620,23 +1707,39 @@ def draw_symmray_peps(
                     start, stop = xy_b, xy_a
             drawing.arrowhead(start, stop, preset="bond", center=0.58, width=0.10)
 
-        if show_bond_labels:
+        if show_bond_labels or show_bond_sectors:
             mid = (0.5 * (xy_a[0] + xy_b[0]), 0.5 * (xy_a[1] + xy_b[1]))
             offset = (0.0, 0.16) if bond["direction"] in {"left", "right"} else (0.17, 0.0)
             flow = _flow_math(bond.get("site_a_direction"), bond.get("site_b_direction"))
-            if flow:
-                label = rf"$e_{{{bond['position']}}}: {flow}, \chi={bond['dim']}$"
-            else:
-                label = rf"$e_{{{bond['position']}}}: \chi={bond['dim']}$"
-            if show_leg_chargemaps:
-                label += "\n" + rf"$q_e:$ {_format_compact_mapping(bond['chargemap'], max_items=4)}"
+            label_lines = []
+            if show_bond_labels:
+                if flow:
+                    label_lines.append(
+                        rf"$e_{{{bond['position']}}}: {flow}, \chi={bond['dim']}$"
+                    )
+                else:
+                    label_lines.append(rf"$e_{{{bond['position']}}}: \chi={bond['dim']}$")
+            if show_bond_sectors:
+                label_lines.append(
+                    rf"$q_e:$ {_format_compact_mapping(bond['chargemap'], max_items=4)}"
+                )
             drawing.text(
                 (mid[0] + offset[0], mid[1] + offset[1]),
-                label,
+                "\n".join(label_lines),
                 fontsize=6.2,
                 ha="center" if offset[0] == 0.0 else "left",
                 va="bottom" if offset[1] > 0.0 else "center",
                 color=(0.18, 0.20, 0.23, 1.0),
+                bbox=(
+                    {
+                        "boxstyle": "round,pad=0.05",
+                        "facecolor": (1.0, 1.0, 1.0, 0.72),
+                        "edgecolor": (1.0, 1.0, 1.0, 0.0),
+                        "linewidth": 0.0,
+                    }
+                    if show_bond_sectors
+                    else None
+                ),
                 zorder=5,
             )
 
@@ -1788,6 +1891,8 @@ def draw_symmray_peps(
             diagnostic += "\ncolored tiles: stored blocks"
         if show_arrows:
             diagnostic += "\narrows/labels: charge in/out flow"
+        if hidden_bond_count:
+            diagnostic += f"\n{hidden_bond_count} extra bonds hidden"
         if len(shown_tensors) < summary["num_sites"]:
             diagnostic += f"\n+{summary['num_sites'] - len(shown_tensors)} sites hidden"
         drawing.ax.text(

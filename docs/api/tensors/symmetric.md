@@ -213,18 +213,23 @@ compact quimb style with tensor nodes, physical legs, and bond arrows; extended
 bond/physical labels and diagnostics are opt-in.
 
 In the detailed drawing mode, ``T_i`` is the site tensor, ``B`` is the number of
-stored block sectors, ``e_i`` is a virtual bond, and ``q_e``/``q_p`` are the
-virtual/physical charge-sector maps. PEPS node circles show compact white charge
-labels by default: spin-resolved two-component charges use total charge ``Q``
-and spin projection ``S_z=(N_up-N_down)/2``, while other charges use the raw
-Symmray charge ``q`` and total particle number ``N`` where available. Set
-``charge_in_node=False`` to move the raw charge back outside the node with the
-tensor label. Bond labels include the two local index orientations, for example
-``out->in``, so the charge-flow convention is visible on the same line as the
-bond dimension. Diagnostics include both ``charge_total`` and ``Q_total``; for
-``Z2`` states ``Q_total`` is reduced modulo two. Colored block tiles are
-available with ``show_blocks=True`` for a focused block-sector view, but the
-overview diagrams leave them off by default and show ``B`` instead.
+stored block sectors, and ``e_i`` is a virtual bond. PEPS node circles show
+compact white charge labels by default: spin-resolved two-component charges use
+total charge ``Q`` and spin projection ``S_z=(N_up-N_down)/2``, while other
+charges use the raw Symmray charge ``q`` and total particle number ``N`` where
+available. Set ``charge_in_node=False`` to move the raw charge back outside the
+node with the tensor label. Bond labels include the two local index
+orientations, for example ``out->in``, so the charge-flow convention is visible
+on the same line as the bond dimension. Use ``show_bond_sectors=True`` to add
+compact ``q_e`` virtual-bond sector maps, and ``show_phys_labels=True`` with
+``show_leg_chargemaps=True`` to show ``q_p`` physical-sector maps. For PEPS
+wrappers, the overview draws one primary shared index per configured
+``SymPEPS.edges`` entry; set ``show_extra_bonds=True`` to debug all non-lattice
+or multibond shared indices introduced by routing/gauges. Diagnostics include
+both ``charge_total`` and ``Q_total``; for ``Z2`` states ``Q_total`` is reduced
+modulo two. Colored block tiles are available with ``show_blocks=True`` for a
+focused block-sector view, but the overview diagrams leave them off by default
+and show ``B`` instead.
 The MPS/PEPS summary dictionaries also expose ``charge_total`` and ``Q_total``
 alongside the legacy ``total_charge`` key.
 
@@ -266,10 +271,19 @@ peps_drawing = py.draw_symmray_peps(
     peps,
     title="Symmray ITF PEPS",
     show_bond_labels=True,
-    show_phys_labels=True,
     show_diagnostics=True,
 )
 display(peps_drawing.fig)
+
+sector_debug = py.draw_symmray_peps(
+    peps,
+    title="Symmray ITF PEPS bond sectors",
+    show_bond_labels=True,
+    show_bond_sectors=True,
+    show_extra_bonds=True,
+    show_diagnostics=True,
+)
+display(sector_debug.fig)
 ```
 
 At the end of a Symmray ``MpsOptimizer`` notebook, pass the optimized chain
