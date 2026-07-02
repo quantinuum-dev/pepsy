@@ -172,6 +172,32 @@ def test_mps_optimizer_mpo_mode_accepts_submpo_mapping_event():
     assert np.allclose(vec, expected)
 
 
+def test_mps_optimizer_public_submpo_event_helpers():
+    """Public helpers should own the sub-MPO stream event contract."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=4, sites=(0, 2), targets=(0, 2))
+    tuple_event = py.MpsOptimizer.submpo_event(mpo, [0, 2])
+    mapping_event = {"kind": "submpo", "mpo": mpo, "where": [0, 2]}
+    gate_event = (np.eye(2), (0,))
+
+    assert py.MpsOptimizer.is_submpo_event(tuple_event)
+    assert py.MpsOptimizer.is_submpo_event(mapping_event)
+    assert not py.MpsOptimizer.is_submpo_event(gate_event)
+
+    assert py.MpsOptimizer.submpo_event_parts(tuple_event) == (mpo, (0, 2))
+    assert py.MpsOptimizer.submpo_event_parts(
+        mapping_event,
+        normalize_where=True,
+    ) == (mpo, (0, 2))
+    assert py.MpsOptimizer.submpo_event_parts(gate_event) is None
+    assert py.optimizers.mps.is_submpo_event(mapping_event)
+    assert py.optimizers.mps.normalize_submpo_where([0, 2]) == (0, 2)
+
+    bad_mapping = {"kind": "submpo", "mpo": mpo}
+    with pytest.raises(ValueError, match="mpo.*where"):
+        py.MpsOptimizer.submpo_event_parts(bad_mapping)
+
+
 def test_mps_optimizer_submpo_diagnostics_do_not_consume_event_mpo():
     """Diagnostic target construction should not mutate reusable event MPOs."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")

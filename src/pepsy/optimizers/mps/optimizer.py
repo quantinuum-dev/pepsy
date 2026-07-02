@@ -30,7 +30,12 @@ from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate
 from ...tensors.core import tn_fidelity, tn_norm
 
-__all__ = ["MpsOptimizer"]
+__all__ = [
+    "MpsOptimizer",
+    "is_submpo_event",
+    "normalize_submpo_where",
+    "submpo_event_parts",
+]
 
 
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
@@ -55,6 +60,12 @@ def _normalize_submpo_where(where):
     raise ValueError(
         "subMPO event where must be a non-empty sequence of 1D sites."
     )
+
+
+def normalize_submpo_where(where):
+    """Return canonical 1D support sites for a sub-MPO stream event."""
+
+    return _normalize_submpo_where(where)
 
 
 def _submpo_event_parts(entry):
@@ -86,9 +97,32 @@ def _submpo_event_parts(entry):
     return mpo, where
 
 
+def submpo_event_parts(entry, *, normalize_where=False):
+    """Return ``(mpo, where)`` for a public sub-MPO stream event.
+
+    Returns ``None`` when ``entry`` is not an explicit sub-MPO event. Mapping
+    events must contain both an MPO payload and support sites, matching the
+    accepted :class:`MpsOptimizer` stream contract.
+    """
+
+    parts = _submpo_event_parts(entry)
+    if parts is None:
+        return None
+    mpo, where = parts
+    if normalize_where:
+        where = _normalize_submpo_where(where)
+    return mpo, where
+
+
 def _is_submpo_event(entry):
     """Return whether ``entry`` is an explicit sub-MPO stream event."""
-    return _submpo_event_parts(entry) is not None
+    return submpo_event_parts(entry) is not None
+
+
+def is_submpo_event(entry):
+    """Return whether ``entry`` is an explicit sub-MPO stream event."""
+
+    return submpo_event_parts(entry) is not None
 
 
 def _normalize_gate_queue(gates):
@@ -212,6 +246,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
 
         return ("submpo", mpo, _normalize_submpo_where(where))
+
+    @staticmethod
+    def submpo_event_parts(entry, *, normalize_where=False):
+        """Return ``(mpo, where)`` when ``entry`` is a sub-MPO event."""
+
+        return submpo_event_parts(entry, normalize_where=normalize_where)
+
+    @staticmethod
+    def is_submpo_event(entry):
+        """Return whether ``entry`` is an explicit sub-MPO stream event."""
+
+        return is_submpo_event(entry)
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,

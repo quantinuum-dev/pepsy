@@ -2,10 +2,18 @@
 
 from importlib import import_module
 
-from .optimizer import MpsOptimizer
+from .optimizer import (
+    MpsOptimizer,
+    is_submpo_event,
+    normalize_submpo_where,
+    submpo_event_parts,
+)
 
 __all__ = [
     "MpsOptimizer",
+    "is_submpo_event",
+    "normalize_submpo_where",
+    "submpo_event_parts",
     "compression",
     "diagnostics",
     "normalization",
