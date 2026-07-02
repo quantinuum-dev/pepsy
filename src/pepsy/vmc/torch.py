@@ -130,6 +130,15 @@ def _find_symmray_tensors(tn):
     ]
 
 
+def _as_torch_scalar(value, reference):
+    torch = _require_torch()
+    if isinstance(value, torch.Tensor):
+        return value
+    if reference is None:
+        return torch.as_tensor(value)
+    return torch.as_tensor(value, dtype=reference.dtype, device=reference.device)
+
+
 class TorchPEPSAmplitude:
     """Torch-optimizable amplitude wrapper for a quimb PEPS-like network.
 
@@ -141,6 +150,10 @@ class TorchPEPSAmplitude:
     This class deliberately stays pure PEPS/TNS: it registers the packed PEPS
     tensor leaves as torch parameters and evaluates amplitudes by selecting
     physical indices then contracting the resulting quimb tensor network.
+    Dense quimb tensors and Symmray block-sparse tensors are both handled
+    through ``quimb.tensor.pack`` / ``unpack``. For Symmray, this preserves the
+    array's own pytree metadata, including fermionic phases and charge sectors,
+    while replacing numeric block leaves with torch trainable parameters.
     """
 
     def __init__(
@@ -169,14 +182,7 @@ class TorchPEPSAmplitude:
         tn = getattr(peps, "tn", peps)
         if not hasattr(tn, "sites"):
             raise TypeError("peps must be a quimb PEPS-like object with sites.")
-        symmray_tensor_ids = _find_symmray_tensors(tn)
-        if symmray_tensor_ids:
-            raise NotImplementedError(
-                "TorchPEPSAmplitude currently supports dense quimb PEPS tensor "
-                "leaves only. Symmray/block-sparse fermionic PEPS need a "
-                "dedicated torch to_pytree/from_pytree adapter before they can "
-                "be optimized safely."
-            )
+        self.symmray_tensor_ids = tuple(_find_symmray_tensors(tn))
         self.sites = tuple(tn.sites if site_order is None else site_order)
         missing = [site for site in self.sites if site not in tn.sites]
         if missing:
@@ -192,6 +198,11 @@ class TorchPEPSAmplitude:
         self.params = torch.nn.ParameterList(leaves)
         self.params_pytree = params_pytree
         self.skeleton = skeleton
+
+    @property
+    def is_symmray(self):
+        """Whether the wrapped PEPS contains Symmray tensor data."""
+        return bool(self.symmray_tensor_ids)
 
     @property
     def n_sites(self):
@@ -250,6 +261,17 @@ class TorchPEPSAmplitude:
 
         return qtn.unpack(self._params_pytree(params), self.skeleton)
 
+    def _reference_tensor(self, params=None):
+        torch = _require_torch()
+        if params is None:
+            params = self.params
+        if isinstance(params, torch.nn.ParameterList):
+            params = list(params)
+        try:
+            return next(iter(params))
+        except StopIteration:
+            return None
+
     def _select_config(self, tn, config):
         if config.shape[0] != self.n_sites:
             raise ValueError(
@@ -257,28 +279,30 @@ class TorchPEPSAmplitude:
             )
         return tn.isel({ind: config[i] for i, ind in enumerate(self.site_inds)})
 
-    def _contract_value(self, tnx):
+    def _contract_value(self, tnx, reference=None):
         if self.contraction == "hotrg":
-            return tnx.contract_hotrg(
+            value = tnx.contract_hotrg(
                 max_bond=self.chi,
                 cutoff=self.cutoff,
                 **self.contraction_opts,
             )
-        if self.contraction == "ctmrg":
-            return tnx.contract_ctmrg(
+        elif self.contraction == "ctmrg":
+            value = tnx.contract_ctmrg(
                 max_bond=self.chi,
                 cutoff=self.cutoff,
                 **self.contraction_opts,
             )
-        if self.contraction == "boundary":
-            return tnx.contract_boundary(
+        elif self.contraction == "boundary":
+            value = tnx.contract_boundary(
                 max_bond=self.chi,
                 cutoff=self.cutoff,
                 **self.contraction_opts,
             )
-        return tnx.contract(all)
+        else:
+            value = tnx.contract(all)
+        return _as_torch_scalar(value, reference)
 
-    def _contract_log_parts(self, tnx):
+    def _contract_log_parts(self, tnx, reference=None):
         torch = _require_torch()
         if self.contraction == "hotrg":
             mantissa, exponent_10 = tnx.contract_hotrg(
@@ -303,6 +327,7 @@ class TorchPEPSAmplitude:
             )
         else:
             amp = tnx.contract(all)
+            amp = _as_torch_scalar(amp, reference)
             abs_amp = amp.abs()
             tiny = _torch_finfo_tiny(abs_amp.dtype)
             phase = torch.where(
@@ -312,8 +337,18 @@ class TorchPEPSAmplitude:
             )
             return phase, torch.log(abs_amp.clamp_min(tiny))
 
-        mantissa = torch.as_tensor(mantissa)
-        exponent_10 = torch.as_tensor(exponent_10, device=mantissa.device)
+        mantissa = _as_torch_scalar(mantissa, reference)
+        if isinstance(exponent_10, torch.Tensor):
+            exponent_10 = exponent_10.to(device=mantissa.device)
+        else:
+            exponent_dtype = (
+                mantissa.real.dtype if mantissa.is_complex() else mantissa.dtype
+            )
+            exponent_10 = torch.as_tensor(
+                exponent_10,
+                dtype=exponent_dtype,
+                device=mantissa.device,
+            )
         abs_mantissa = mantissa.abs()
         tiny = _torch_finfo_tiny(abs_mantissa.dtype)
         phase = torch.where(
@@ -330,14 +365,16 @@ class TorchPEPSAmplitude:
         """Evaluate a single configuration amplitude."""
         config = _as_long_matrix(config).reshape(-1)
         tn = self._unpack_tn(params)
-        return self._contract_value(self._select_config(tn, config))
+        reference = self._reference_tensor(params)
+        return self._contract_value(self._select_config(tn, config), reference)
 
     def forward(self, configs, params=None):
         """Evaluate a batch of configuration amplitudes."""
         configs = _as_long_matrix(configs)
         tn = self._unpack_tn(params)
+        reference = self._reference_tensor(params)
         return _require_torch().stack([
-            self._contract_value(self._select_config(tn, row))
+            self._contract_value(self._select_config(tn, row), reference)
             for row in configs
         ])
 
@@ -345,10 +382,14 @@ class TorchPEPSAmplitude:
         """Return ``(phase, log_abs)`` for a batch of configurations."""
         configs = _as_long_matrix(configs)
         tn = self._unpack_tn(params)
+        reference = self._reference_tensor(params)
         phases = []
         log_abs = []
         for row in configs:
-            phase, log_scale = self._contract_log_parts(self._select_config(tn, row))
+            phase, log_scale = self._contract_log_parts(
+                self._select_config(tn, row),
+                reference,
+            )
             phases.append(phase)
             log_abs.append(log_scale)
         torch = _require_torch()

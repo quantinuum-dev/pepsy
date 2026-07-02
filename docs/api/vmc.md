@@ -109,11 +109,14 @@ sr = pvmc.solve_torch_sr(
 pvmc.apply_torch_sr_update(model, sr.direction, learning_rate=0.02)
 ```
 
-The torch PEPS wrapper is currently validated for dense quimb PEPS leaves.
-True Symmray/block-sparse fermionic PEPS tensors need a dedicated torch
-`to_pytree`/`from_pytree` packing adapter before they can be optimized safely;
-the wrapper raises `NotImplementedError` for those arrays rather than
-silently densifying or mis-packing them.
+The torch PEPS wrapper is validated for dense quimb PEPS and Symmray
+block-sparse fermionic PEPS. Symmray tensors are packed through their own
+`to_pytree` / `from_pytree` metadata via `quimb.tensor.pack`, then the numeric
+block leaves are registered as torch parameters. This preserves fermionic
+phases and charge sectors for sparse `Z2`, `U1`, `Z2Z2`, and `U1U1` PEPS. The
+flat Symmray backend is currently a Symmray-side feature for `Z2`; Pepsy also
+supports that path and it can be combined with `torch.vmap` in the style of
+Symmray's batch-GPU fermionic-amplitude example.
 
 The default spinful encoding matches Pepsy/Symmray physical indices
 `0=empty, 1=double, 2=up, 3=down`. Use

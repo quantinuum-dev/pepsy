@@ -226,21 +226,113 @@ def test_torch_peps_amplitude_supports_sr_kernel():
     assert torch.isfinite(result.direction).all()
 
 
-def test_torch_peps_amplitude_rejects_symmray_block_sparse_peps():
+def _symmray_site_charge(symmetry):
+    if symmetry == "U1":
+        return lambda site: 0 if (site[0] + site[1]) % 2 == 0 else 1
+    if symmetry == "U1U1":
+        return lambda site: (1, 0) if (site[0] + site[1]) % 2 == 0 else (0, 1)
+    if symmetry == "Z2Z2":
+        return lambda site: (0, 0)
+    return None
+
+
+def _symmray_fermionic_peps(symmetry, *, flat=False):
     sr = pytest.importorskip("symmray")
-    peps = sr.networks.PEPS_fermionic_rand(
-        "Z2",
+    return sr.networks.PEPS_fermionic_rand(
+        symmetry,
         2,
         2,
         2,
         phys_dim=4,
         subsizes="equal",
-        flat=True,
+        flat=flat,
         seed=1,
+        site_charge=_symmray_site_charge(symmetry),
     )
 
-    with pytest.raises(NotImplementedError, match="Symmray/block-sparse"):
-        TorchPEPSAmplitude(peps, contraction="exact", dtype=torch.float64)
+
+def _direct_peps_amplitudes(peps, rows):
+    values = []
+    for row in rows:
+        tnx = peps.isel({
+            peps.site_ind(site): int(row[i])
+            for i, site in enumerate(peps.sites)
+        })
+        value = tnx.contract(all)
+        if hasattr(value, "item"):
+            value = value.item()
+        values.append(value)
+    return torch.as_tensor(values, dtype=torch.float64)
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "valid_row"),
+    [
+        ("Z2", (0, 0, 0, 0)),
+        ("U1", (0, 0, 0, 3)),
+        ("Z2Z2", (0, 0, 0, 0)),
+        ("U1U1", (2, 0, 1, 3)),
+    ],
+)
+def test_torch_peps_amplitude_supports_symmray_fermionic_symmetries(
+    symmetry,
+    valid_row,
+):
+    peps = _symmray_fermionic_peps(symmetry)
+    model = TorchPEPSAmplitude(peps, contraction="exact", dtype=torch.float64)
+    rows = torch.tensor([valid_row, (3, 3, 3, 3)], dtype=torch.long)
+
+    amps = model(rows)
+    direct = _direct_peps_amplitudes(peps, rows)
+
+    assert model.is_symmray
+    assert model.symmray_tensor_ids
+    assert torch.allclose(amps, direct)
+
+    phase, log_abs = model.forward_log(rows)
+    assert phase.shape == (2,)
+    assert log_abs.shape == (2,)
+    assert torch.isfinite(log_abs).all()
+
+    model.zero_grad()
+    loss = model(torch.tensor([valid_row], dtype=torch.long)).square().sum()
+    loss.backward()
+    grads = [param.grad for param in model.parameters() if param.grad is not None]
+    assert grads
+    assert all(torch.isfinite(grad).all() for grad in grads)
+
+
+def test_torch_peps_amplitude_supports_symmray_flat_z2_vmap():
+    peps = _symmray_fermionic_peps("Z2", flat=True)
+    model = TorchPEPSAmplitude(peps, contraction="exact", dtype=torch.float64)
+    rows = torch.tensor([(0, 0, 0, 0), (1, 1, 1, 1)], dtype=torch.long)
+
+    loop = model(rows)
+    vmapped = torch.vmap(model.amplitude)(rows)
+
+    assert model.is_symmray
+    assert torch.allclose(vmapped, loop)
+
+
+def test_symmray_fermionic_peps_feeds_hubbard_local_energy_kernel():
+    peps = _symmray_fermionic_peps("U1U1")
+    model = TorchPEPSAmplitude(peps, contraction="exact", dtype=torch.float64)
+    graph = TorchSquareLattice(2, 2)
+    encoding = FermionSiteEncoding.symmray()
+    configs = torch.tensor([[2, 0, 1, 3]], dtype=torch.long)
+
+    amps = model(configs)
+    conn = spinful_fermi_hubbard_connections(
+        configs,
+        graph,
+        t=1.0,
+        U=8.0,
+        encoding=encoding,
+    )
+    energy = local_energy_from_connections(configs, amps, conn, model)
+
+    assert energy.shape == (1,)
+    assert torch.isfinite(energy).all()
 
 
 def test_spinful_exchange_hopping_proposal_preserves_particle_counts():
