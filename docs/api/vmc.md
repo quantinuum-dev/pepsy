@@ -4,6 +4,67 @@ Optional VMC integrations live under `pepsy.vmc`. The NetKet bridge can now
 wrap a packed PEPS as a Flax model for spin systems, while keeping the
 Fermi-Hubbard helper as a specialization.
 
+## Torch sampling and local-energy kernels
+
+`pepsy.vmc.torch` provides lightweight PyTorch kernels for custom VMC loops and
+neuralized-PEPS experiments. They are intentionally lower-level than the
+NetKet bridge: pass a batch amplitude function, choose a sampler proposal, and
+accumulate local energies from connected configurations.
+
+```python
+import torch
+import pepsy.vmc as pvmc
+
+graph = pvmc.TorchSquareLattice(2, 2)
+encoding = pvmc.FermionSiteEncoding.symmray()
+configs = pvmc.random_spinful_configs(
+    n_walkers=128,
+    n_sites=graph.n_sites,
+    n_up=2,
+    n_down=2,
+    encoding=encoding,
+)
+
+def amplitude_fn(rows):
+    # rows has shape (batch, n_sites). Plug in a torch PEPS, NN-fPEPS,
+    # Slater, or hybrid amplitude model here.
+    return torch.ones(rows.shape[0], dtype=torch.float64, device=rows.device)
+
+sample = pvmc.metropolis_exchange_sweep(
+    configs,
+    amplitude_fn,
+    graph,
+    proposal="spinful",
+    hopping_rate=0.25,
+    encoding=encoding,
+)
+conn = pvmc.spinful_fermi_hubbard_connections(
+    sample.configs,
+    graph,
+    t=1.0,
+    U=8.0,
+    encoding=encoding,
+)
+eloc = pvmc.local_energy_from_connections(
+    sample.configs,
+    sample.amplitudes,
+    conn,
+    amplitude_fn,
+)
+```
+
+The default spinful encoding matches Pepsy/Symmray physical indices
+`0=empty, 1=double, 2=up, 3=down`. Use
+`FermionSiteEncoding.vmc_torch()` when consuming configs from
+`sjdu10/vmc_torch`, where the convention is
+`0=empty, 1=down, 2=up, 3=double`.
+
+Available connected-config helpers include
+`spinful_fermi_hubbard_connections`, `heisenberg_connections`, and
+`transverse_ising_connections`. The Hubbard helper uses the site-major
+fermionic mode order `down, up` by default, matching the Symmray-oriented
+convention used by the reference implementation.
+
 For spin models, NetKet spin-1/2 configurations use local values `+1` and
 `-1`. The default `NetKetLocalConfigMap` sends `+1 -> physical index 0` and
 `-1 -> physical index 1`; pass a custom map when a symmetric PEPS uses another
@@ -146,6 +207,10 @@ driver.run(n_iter=100, out="vmc_run", callback=callback)
 
 ```{eval-rst}
 .. automodule:: pepsy.vmc.netket
+   :members:
+   :undoc-members:
+
+.. automodule:: pepsy.vmc.torch
    :members:
    :undoc-members:
 ```

@@ -7,6 +7,7 @@ from leaf modules, for example ``pepsy.vmc.netket``.
 from importlib import import_module
 
 _SYMBOL_MODULES = {
+    "FermionSiteEncoding": ".torch",
     "NetKetLocalConfigMap": ".netket",
     "NetKetChunkSettings": ".netket",
     "NetKetPEPSVMC": ".netket",
@@ -15,12 +16,18 @@ _SYMBOL_MODULES = {
     "PackedPEPS": ".netket",
     "PackedFermionicPEPS": ".netket",
     "SpinOrbitalColumns": ".netket",
+    "TorchConnections": ".torch",
+    "TorchMetropolisResult": ".torch",
+    "TorchSquareLattice": ".torch",
     "build_heisenberg_vmc": ".netket",
     "build_ising_vmc": ".netket",
     "build_fermi_hubbard_vmc": ".netket",
     "choose_netket_chunk_size": ".netket",
     "configure_jax_for_vmc": ".netket",
     "config_to_phys_indices": ".netket",
+    "count_spinful_particles": ".torch",
+    "heisenberg_connections": ".torch",
+    "local_energy_from_connections": ".torch",
     "make_peps_batched_amplitude_function": ".netket",
     "make_peps_log_amplitude_model": ".netket",
     "make_fermionic_peps_batched_amplitude_function": ".netket",
@@ -32,8 +39,15 @@ _SYMBOL_MODULES = {
     "occupation_to_phys_indices": ".netket",
     "pack_peps_ansatz": ".netket",
     "pack_fermionic_peps_ansatz": ".netket",
+    "propose_spin_exchange": ".torch",
+    "propose_spinful_exchange_or_hopping": ".torch",
+    "random_spin_configs": ".torch",
+    "random_spinful_configs": ".torch",
     "recommend_netket_vmc_settings": ".netket",
     "square_lattice_edges": ".netket",
+    "metropolis_exchange_sweep": ".torch",
+    "spinful_fermi_hubbard_connections": ".torch",
+    "transverse_ising_connections": ".torch",
     "verify_netket_spin_columns": ".netket",
 }
 
