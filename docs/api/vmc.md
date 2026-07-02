@@ -116,7 +116,10 @@ block leaves are registered as torch parameters. This preserves fermionic
 phases and charge sectors for sparse `Z2`, `U1`, `Z2Z2`, and `U1U1` PEPS. The
 flat Symmray backend is currently a Symmray-side feature for `Z2`; Pepsy also
 supports that path and it can be combined with `torch.vmap` in the style of
-Symmray's batch-GPU fermionic-amplitude example.
+Symmray's batch-GPU fermionic-amplitude example. Do not assume the same flat
+`vmap` batching behavior for `U1`, `Z2Z2`, or `U1U1`: those symmetries are
+supported through sparse block contractions, so their batching/performance
+profile should be benchmarked separately.
 
 The default spinful encoding matches Pepsy/Symmray physical indices
 `0=empty, 1=double, 2=up, 3=down`. Use
@@ -231,7 +234,11 @@ driver = setup.make_driver(
 
 The fermionic batch path mirrors Symmray's batch GPU amplitude example: pack
 the PEPS once, keep `flat=True` Symmray data for JIT-friendly leaves, and
-evaluate many spin-orbital occupation rows with one compiled function.
+evaluate many spin-orbital occupation rows with one compiled function. In the
+currently tested Symmray stack this flat path is the `Z2` route; sparse
+fermionic `U1`, `Z2Z2`, and `U1U1` PEPS remain supported by
+`TorchPEPSAmplitude`, but should use the sparse-block amplitude/local-energy
+helpers unless a matching flat backend is available and benchmarked.
 
 ```python
 batched_amp = pvmc.make_fermionic_peps_batched_amplitude_function(
