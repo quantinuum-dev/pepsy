@@ -11,21 +11,27 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from ...backends import backend_cupy, backend_jax, backend_numpy, backend_torch
+from ...backends import (
+    backend_cupy,
+    backend_jax,
+    backend_numpy,
+    backend_torch,
+    infer_backend_converter_from_sample,
+)
 from ...tensors import build_optimizer, reg_rel_svd_jax, reg_rel_svd_torch
 from ..global_opt import GlobalOptimizer
 
-__all__ = ["EnergyEstimate", "PepsEnergyOptimizer"]
+__all__ = ["EnergyEstimate", "MpsEnergyOptimizer", "PepsEnergyOptimizer"]
 
 
 @dataclass(frozen=True)
 class EnergyEstimate:
-    """Energy evaluation metadata for a finite PEPS."""
+    """Energy evaluation metadata for a finite tensor-network state."""
 
     energy: Any
     energy_per_site: Any
     num_sites: int
-    chi: int | tuple[int, int]
+    chi: int | tuple[int, int] | None
     boundary_mode: str
     normalized: bool
     metadata: dict[str, Any] | None = None
@@ -634,6 +640,310 @@ class PepsEnergyOptimizer:
                 self.losses = [] if finite_loss is None else [float(finite_loss)]
                 warnings.warn(
                     "PEPS energy autodiff produced a non-finite initial gradient; "
+                    "returning the unmodified state.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                if return_losses:
+                    return self.state, tuple(self.losses)
+                return self.state
+        out = tnopt.optimize(n=n, **optimize_kwargs)
+        self.losses = list(getattr(tnopt, "losses", ()))
+        if normalize:
+            out = self.normalize(out, **dict(normalize_kwargs or {}))
+        self.state = out
+        if return_losses:
+            return out, tuple(self.losses)
+        return out
+
+
+class MpsEnergyOptimizer(PepsEnergyOptimizer):
+    """Optimize finite MPS energy with exact 1D local expectations.
+
+    The objective is the normalized local expectation value
+    ``<psi|H|psi>/<psi|psi>`` computed by
+    ``MPS.compute_local_expectation_exact(...)``. Hamiltonians can be supplied
+    as a ``qtn.LocalHam1D``-like object with ``.terms``, a Pepsy symmetric
+    Hamiltonian, or a plain local-term mapping.
+    """
+
+    _LOSS_KEYS = frozenset({
+        "normalized",
+        "energy_per_site",
+        "real",
+        "contraction_opt",
+        "compute_kwargs",
+        "progbar",
+    })
+
+    def __init__(
+        self,
+        state,
+        hamiltonian,
+        *,
+        normalized: bool = True,
+        energy_per_site: bool = True,
+        real: bool = True,
+        contraction_opt: Any = "auto-hq",
+        progbar: bool = False,
+        compute_kwargs: Mapping[str, Any] | None = None,
+        loss_kwargs: Mapping[str, Any] | None = None,
+    ):
+        self.state = self._as_mps_state(state)
+        self.hamiltonian = hamiltonian
+        self.terms = self._terms_from_hamiltonian(hamiltonian)
+        self.losses: list[float] = []
+        self.loss_kwargs = {
+            "normalized": normalized,
+            "energy_per_site": energy_per_site,
+            "real": real,
+            "contraction_opt": contraction_opt,
+            "progbar": progbar,
+            "compute_kwargs": {} if compute_kwargs is None else dict(compute_kwargs),
+        }
+        if loss_kwargs is not None:
+            self.set_loss_kwargs(**loss_kwargs)
+
+    @classmethod
+    def _pick_loss_kwargs(cls, options):
+        incoming = dict(options or {})
+        unknown = sorted(set(incoming) - cls._LOSS_KEYS)
+        if unknown:
+            allowed = ", ".join(sorted(cls._LOSS_KEYS))
+            raise TypeError(
+                f"Unknown MPS energy option(s): {', '.join(unknown)}. "
+                f"Allowed options: {allowed}."
+            )
+        return incoming
+
+    @staticmethod
+    def _looks_like_mps(state):
+        if not hasattr(state, "compute_local_expectation_exact"):
+            return False
+        if hasattr(state, "Lx") and hasattr(state, "Ly"):
+            return False
+        return hasattr(state, "L") or hasattr(state, "phys_inds")
+
+    @classmethod
+    def _as_mps_state(cls, state):
+        if cls._looks_like_mps(state):
+            return state
+        mps = getattr(state, "mps", None)
+        if mps is not None and cls._looks_like_mps(mps):
+            return mps
+        tn = getattr(state, "tn", None)
+        if tn is not None and cls._looks_like_mps(tn):
+            return tn
+        raise TypeError(
+            "state must be an MPS-like object with "
+            "compute_local_expectation_exact()."
+        )
+
+    @staticmethod
+    def _num_sites(state):
+        num_sites = getattr(state, "num_sites", None)
+        if num_sites is not None:
+            return int(num_sites() if callable(num_sites) else num_sites)
+        length = getattr(state, "L", None)
+        if length is not None:
+            return int(length)
+        sites = getattr(state, "sites", None)
+        if sites is not None:
+            return len(tuple(sites))
+        phys_inds = getattr(state, "phys_inds", None)
+        if phys_inds is not None:
+            return len(tuple(phys_inds() if callable(phys_inds) else phys_inds))
+        raise ValueError("Could not infer the number of MPS sites.")
+
+    @staticmethod
+    def _max_bond(state):
+        max_bond = getattr(state, "max_bond", None)
+        if callable(max_bond):
+            return int(max_bond())
+        return None
+
+    @classmethod
+    def _terms_for_state_backend(cls, terms, state):
+        sample = cls._sample_array_from_tn(state)
+        try:
+            converter = infer_backend_converter_from_sample(sample)
+        except (ImportError, TypeError, ValueError):
+            converter = None
+        if converter is None:
+            return terms
+        return {
+            edge: cls._convert_term_array(term, converter)
+            for edge, term in dict(terms).items()
+        }
+
+    @classmethod
+    def _loss_state(
+        cls,
+        state,
+        *,
+        terms,
+        normalized=True,
+        energy_per_site=True,
+        real=True,
+        contraction_opt="auto-hq",
+        compute_kwargs=None,
+        progbar=False,
+    ):
+        state = cls._as_mps_state(state)
+        terms = cls._terms_from_hamiltonian(terms)
+        terms = cls._terms_for_state_backend(terms, state)
+        if contraction_opt is None:
+            contraction_opt = build_optimizer(progbar=False)
+
+        kwargs = dict(compute_kwargs or {})
+        kwargs.setdefault("progbar", bool(progbar))
+        value = state.compute_local_expectation_exact(
+            terms,
+            optimize=contraction_opt,
+            normalized=bool(normalized),
+            **kwargs,
+        )
+        if energy_per_site:
+            value = value / cls._num_sites(state)
+        if real:
+            value = cls._maybe_real(value)
+        return value
+
+    @staticmethod
+    def _tnopt_loss(state, *, terms, **loss_kwargs):
+        """Adapter for ``qtn.TNOptimizer``."""
+        return MpsEnergyOptimizer._loss_state(state, terms=terms, **loss_kwargs)
+
+    def loss(self, state=None, *, hamiltonian=None, terms=None, **kwargs):
+        """Evaluate the configured MPS energy loss."""
+        state = self.state if state is None else self._as_mps_state(state)
+        terms_use = self.terms
+        if hamiltonian is not None:
+            terms_use = self._terms_from_hamiltonian(hamiltonian)
+        if terms is not None:
+            terms_use = self._terms_from_hamiltonian(terms)
+        opts = self._merge_opts(self.loss_kwargs, self._pick_loss_kwargs(kwargs))
+        return self._loss_state(state, terms=terms_use, **opts)
+
+    def energy(self, state=None, *, hamiltonian=None, terms=None, **kwargs):
+        """Return full and per-site MPS energy estimates for ``state``."""
+        state = self.state if state is None else self._as_mps_state(state)
+        terms_use = self.terms
+        if hamiltonian is not None:
+            terms_use = self._terms_from_hamiltonian(hamiltonian)
+        if terms is not None:
+            terms_use = self._terms_from_hamiltonian(terms)
+
+        opts = self._merge_opts(self.loss_kwargs, self._pick_loss_kwargs(kwargs))
+        opts_full = dict(opts)
+        opts_full["energy_per_site"] = False
+        energy = self._loss_state(state, terms=terms_use, **opts_full)
+        num_sites = self._num_sites(state)
+        energy_per_site = energy / num_sites
+        return EnergyEstimate(
+            energy=energy,
+            energy_per_site=energy_per_site,
+            num_sites=num_sites,
+            chi=self._max_bond(state),
+            boundary_mode="exact",
+            normalized=bool(opts["normalized"]),
+            metadata={
+                "real": opts["real"],
+                "contraction_opt": opts["contraction_opt"],
+                "progbar": opts["progbar"],
+                "compute_kwargs": dict(opts["compute_kwargs"]),
+            },
+        )
+
+    def normalize(self, state=None, **kwargs):
+        """Normalize ``state`` in place using the MPS' native normalization."""
+        state = self.state if state is None else self._as_mps_state(state)
+        normalize = getattr(state, "normalize", None)
+        if not callable(normalize):
+            raise TypeError("state must provide normalize() for MPS normalization.")
+        normalize(**kwargs)
+        return state
+
+    def make_tn_optimizer(
+        self,
+        *,
+        loss_kwargs: Mapping[str, Any] | None = None,
+        loss_constants: Mapping[str, Any] | None = None,
+        autodiff_backend: str = "torch",
+        optimizer: str = "adam",
+        progbar: bool = True,
+        jit_fn: bool = False,
+        device: str = "cpu",
+        **tnopt_kwargs,
+    ):
+        """Construct a configured :class:`quimb.tensor.TNOptimizer`."""
+        merged_loss_kwargs = self._merge_opts(
+            self.loss_kwargs,
+            self._pick_loss_kwargs(loss_kwargs),
+        )
+        optimizer = GlobalOptimizer._normalize_optimizer_name(optimizer)
+        self._prepare_autodiff_backend(autodiff_backend)
+        incoming_constants = dict(loss_constants or {})
+        terms = incoming_constants.pop("terms", self.terms)
+        constants = {
+            "terms": self._terms_for_autodiff_backend(
+                terms,
+                self.state,
+                autodiff_backend,
+                device=device,
+            )
+        }
+        constants.update(incoming_constants)
+        return qtn.TNOptimizer(
+            self.state,
+            self._tnopt_loss,
+            loss_constants=constants,
+            loss_kwargs=merged_loss_kwargs,
+            autodiff_backend=autodiff_backend,
+            optimizer=optimizer,
+            progbar=progbar,
+            jit_fn=jit_fn,
+            device=device,
+            **tnopt_kwargs,
+        )
+
+    def optimize(
+        self,
+        *,
+        n=220,
+        loss_kwargs: Mapping[str, Any] | None = None,
+        loss_constants: Mapping[str, Any] | None = None,
+        autodiff_backend: str = "torch",
+        optimizer: str = "adam",
+        progbar: bool = True,
+        jit_fn: bool = False,
+        device: str = "cpu",
+        return_losses: bool = False,
+        normalize: bool = False,
+        normalize_kwargs: Mapping[str, Any] | None = None,
+        check_finite_gradient: bool = True,
+        **optimize_kwargs,
+    ):
+        """Run ``TNOptimizer.optimize`` and store the optimized MPS."""
+        merged_loss_kwargs = self._merge_opts(
+            self.loss_kwargs,
+            self._pick_loss_kwargs(loss_kwargs),
+        )
+        tnopt = self.make_tn_optimizer(
+            loss_kwargs=merged_loss_kwargs,
+            loss_constants=loss_constants,
+            autodiff_backend=autodiff_backend,
+            optimizer=optimizer,
+            progbar=progbar,
+            jit_fn=jit_fn,
+            device=device,
+        )
+        if check_finite_gradient:
+            finite_gradient, finite_loss = self._initial_gradient_status(tnopt)
+            if not finite_gradient:
+                self.losses = [] if finite_loss is None else [float(finite_loss)]
+                warnings.warn(
+                    "MPS energy autodiff produced a non-finite initial gradient; "
                     "returning the unmodified state.",
                     RuntimeWarning,
                     stacklevel=2,

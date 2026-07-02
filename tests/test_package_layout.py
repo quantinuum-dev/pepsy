@@ -14,7 +14,14 @@ from pepsy.boundary import (
     peps_normalize,
 )
 from pepsy.operators import gate, rx
-from pepsy.optimizers import MpsOptimizer, PepsEnergyOptimizer, PepsOptimizer, SimpleUpdateGen, SweepOptimizer
+from pepsy.optimizers import (
+    MpsEnergyOptimizer,
+    MpsOptimizer,
+    PepsEnergyOptimizer,
+    PepsOptimizer,
+    SimpleUpdateGen,
+    SweepOptimizer,
+)
 from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
 from pepsy.tensors import (
@@ -68,6 +75,7 @@ def test_new_namespace_imports_resolve():
     assert callable(gate)
     assert callable(rx)
     assert MpsOptimizer is not None
+    assert MpsEnergyOptimizer is not None
     assert PepsEnergyOptimizer is not None
     assert PepsOptimizer is not None
     assert SimpleUpdateGen is not None

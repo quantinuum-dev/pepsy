@@ -2,7 +2,7 @@
 
 from importlib import import_module
 
-from .energy import EnergyEstimate, PepsEnergyOptimizer
+from .energy import EnergyEstimate, MpsEnergyOptimizer, PepsEnergyOptimizer
 from .global_opt import GlobalOptimizer
 from .mpo import MpoOptimizer
 from .mps import MpsOptimizer
@@ -13,6 +13,7 @@ __all__ = [
     "EnergyEstimate",
     "GlobalOptimizer",
     "MpoOptimizer",
+    "MpsEnergyOptimizer",
     "MpsOptimizer",
     "PepsEnergyOptimizer",
     "PepsOptimizer",
