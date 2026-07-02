@@ -18,6 +18,33 @@ def _non_unitary_entangling_gate():
     return np.diag([1.0, 0.5, 0.5, 2.0]).astype(complex)
 
 
+def _two_branch_flip_submpo(*, L, sites, targets, w0=0.7, w1=0.3):
+    """Return ``w0 * I + w1 * prod(X_targets)`` as a sparse-site MPO."""
+    eye = np.eye(2, dtype=np.complex128)
+    flip = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    sites = tuple(sites)
+    targets = set(targets)
+    branch0 = [eye.copy() for _site in sites]
+    branch1 = [flip.copy() if site in targets else eye.copy() for site in sites]
+    branch0[0] *= w0
+    branch1[0] *= w1
+    mpo0 = qtn.MPO_product_operator(
+        branch0,
+        sites=sites,
+        L=L,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+    )
+    mpo1 = qtn.MPO_product_operator(
+        branch1,
+        sites=sites,
+        L=L,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+    )
+    return mpo0.add_MPO(mpo1)
+
+
 def _mps_data_norm(mps):
     """Return the MPS norm without its stored global exponent."""
     mps_data = mps.copy()
@@ -98,6 +125,126 @@ def test_mps_optimizer_set_and_add_gates_accept_bundled_gate_stream():
 
     assert len(opt.G) == 2
     assert opt.where == [(1,), (0, 3)]
+
+
+def test_mps_optimizer_mpo_mode_applies_submpo_stream_event():
+    """MPO mode should apply explicit sparse sub-MPO stream events."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=4, sites=(1, 3), targets=(1, 3))
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(mpo, (1, 3))],
+        chi=8,
+        mode="mpo",
+    )
+
+    out = opt.run(progbar=False, cutoff=0.0, fidelity_samples=0)
+    vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
+    expected = np.zeros(16, dtype=np.complex128)
+    expected[0] = 0.7
+    expected[5] = 0.3
+
+    assert opt.event_types == ["submpo"]
+    assert opt.where == [(1, 3)]
+    assert np.allclose(vec, expected)
+    assert out.max_bond() <= 8
+
+
+def test_mps_optimizer_mpo_mode_accepts_submpo_mapping_event():
+    """Mapping events should provide a readable public sub-MPO stream API."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=4, sites=(0, 2), targets=(0, 2))
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[{"kind": "submpo", "mpo": mpo, "where": [0, 2]}],
+        chi=8,
+        mode="mpo",
+    )
+
+    out = opt.run(progbar=False, cutoff=0.0, fidelity_samples=0)
+    vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
+    expected = np.zeros(16, dtype=np.complex128)
+    expected[0] = 0.7
+    expected[10] = 0.3
+
+    assert opt.event_types == ["submpo"]
+    assert opt.where == [(0, 2)]
+    assert np.allclose(vec, expected)
+
+
+def test_mps_optimizer_submpo_diagnostics_do_not_consume_event_mpo():
+    """Diagnostic target construction should not mutate reusable event MPOs."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=4, sites=(1, 3), targets=(1, 3))
+
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(mpo, (1, 3))],
+        chi=8,
+        mode="mpo",
+    )
+    out = opt.run(
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+        non_unitary=True,
+        track_norm_infidelity=True,
+    )
+    vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
+    expected = np.zeros(16, dtype=np.complex128)
+    expected[0] = 0.7
+    expected[5] = 0.3
+
+    assert len(opt.get_norm_infidelity_samples()) == 1
+    assert np.allclose(vec, expected)
+
+    reuse = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(mpo, (1, 3))],
+        chi=8,
+        mode="mpo",
+    ).run(progbar=False, cutoff=0.0, fidelity_samples=0)
+    reuse_vec = reuse.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
+    assert np.allclose(reuse_vec, expected)
+
+
+def test_mps_optimizer_submpo_stream_events_require_mpo_mode():
+    """Non-MPO modes should reject sub-MPO stream events clearly."""
+    p0 = qtn.MPS_computational_state("000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=3, sites=(0, 2), targets=(0, 2))
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[("submpo", mpo, (0, 2))],
+        chi=8,
+        mode="svd",
+    )
+
+    with pytest.raises(ValueError, match="subMPO stream events"):
+        opt.run(progbar=False)
+
+
+def test_mps_optimizer_submpo_stream_validates_support_sites():
+    """Sub-MPO support should be a unique in-range set of 1D sites."""
+    p0 = qtn.MPS_computational_state("000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=3, sites=(0, 2), targets=(0, 2))
+
+    repeated = py.MpsOptimizer(
+        p0.copy(),
+        gates=[("submpo", mpo, (0, 0))],
+        chi=8,
+        mode="mpo",
+    )
+    with pytest.raises(ValueError, match="repeated site"):
+        repeated.run(progbar=False)
+
+    out_of_range = py.MpsOptimizer(
+        p0.copy(),
+        gates=[("submpo", mpo, (0, 3))],
+        chi=8,
+        mode="mpo",
+    )
+    with pytest.raises(ValueError, match="outside the MPS range"):
+        out_of_range.run(progbar=False)
 
 
 def test_mps_optimizer_default_inplace_false_keeps_input_unchanged():

@@ -2,8 +2,10 @@
 
 :class:`MpsOptimizer` replays a canonical bundled gate stream
 ``[(gate, where), ...]`` against an MPS, using one of several compression
-backends.  The default path assumes a norm-preserving stream and does not
-renormalize.  Non-unitary streams should use ``non_unitary=True``; when
+backends.  ``mode="mpo"`` also accepts explicit sub-MPO events of the form
+``("submpo", mpo, where)`` or
+``{"kind": "submpo", "mpo": mpo, "where": where}``.  The default path assumes
+a norm-preserving stream and does not renormalize.  Non-unitary streams should use ``non_unitary=True``; when
 ``normalize_every`` is enabled this normalizes the active MPS tensor data after
 compressed updates while accumulating the removed scale into ``p.exponent``.
 Quimb includes that exponent in ``p.norm()``, so ``p.norm()`` still reports the
@@ -17,6 +19,7 @@ of measured local true fidelities in ``losses`` for compatibility.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from numbers import Integral
 import types
 import autoray as ar
@@ -30,13 +33,105 @@ from ...tensors.core import tn_fidelity, tn_norm
 __all__ = ["MpsOptimizer"]
 
 
+_SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
+_MISSING = object()
+
+
+def _normalize_event_name(name):
+    """Normalize a stream event name for matching."""
+    return str(name).replace("-", "_").strip().lower()
+
+
+def _normalize_submpo_where(where):
+    """Normalize sub-MPO support sites to a non-empty tuple of 1D ints."""
+    if isinstance(where, Integral):
+        return (int(where),)
+    if (
+        isinstance(where, (tuple, list))
+        and len(where) > 0
+        and all(isinstance(site, Integral) for site in where)
+    ):
+        return tuple(int(site) for site in where)
+    raise ValueError(
+        "subMPO event where must be a non-empty sequence of 1D sites."
+    )
+
+
+def _submpo_event_parts(entry):
+    """Return ``(mpo, where)`` if ``entry`` is a sub-MPO event, else ``None``."""
+    if (
+        isinstance(entry, tuple)
+        and len(entry) == 3
+        and isinstance(entry[0], str)
+        and _normalize_event_name(entry[0]) in _SUBMPO_EVENT_NAMES
+    ):
+        return entry[1], entry[2]
+
+    if not isinstance(entry, Mapping):
+        return None
+
+    kind = entry.get("kind", entry.get("type", entry.get("event", _MISSING)))
+    if kind is _MISSING or _normalize_event_name(kind) not in _SUBMPO_EVENT_NAMES:
+        return None
+
+    mpo = entry.get(
+        "mpo",
+        entry.get("submpo", entry.get("operator", entry.get("payload", _MISSING))),
+    )
+    where = entry.get("where", entry.get("sites", _MISSING))
+    if mpo is _MISSING or where is _MISSING:
+        raise ValueError(
+            "subMPO stream event mappings must contain 'mpo' and 'where'."
+        )
+    return mpo, where
+
+
+def _is_submpo_event(entry):
+    """Return whether ``entry`` is an explicit sub-MPO stream event."""
+    return _submpo_event_parts(entry) is not None
+
+
 def _normalize_gate_queue(gates):
-    """Return ``(gate_list, where_list)`` from canonical bundled stream input."""
+    """Return ``(payloads, wheres, event_types)`` from bundled stream input."""
+    submpo_parts = _submpo_event_parts(gates)
+    if submpo_parts is not None:
+        mpo, where = submpo_parts
+        return [mpo], [_normalize_submpo_where(where)], ["submpo"]
+
+    if isinstance(gates, (tuple, list)) and any(
+        _is_submpo_event(entry) for entry in gates
+    ):
+        payloads = []
+        wheres = []
+        event_types = []
+        for entry in gates:
+            submpo_parts = _submpo_event_parts(entry)
+            if submpo_parts is not None:
+                mpo, where = submpo_parts
+                payloads.append(mpo)
+                wheres.append(_normalize_submpo_where(where))
+                event_types.append("submpo")
+                continue
+            gate_entries = _normalize_gate_entries(
+                (entry,),
+                where=None,
+                allow_empty=False,
+            )
+            gate, where = gate_entries[0]
+            payloads.append(gate)
+            wheres.append(tuple(where) if isinstance(where, list) else where)
+            event_types.append("gate")
+        return payloads, wheres, event_types
+
     entries = _normalize_gate_entries(gates, where=None, allow_empty=True)
     if not entries:
-        return [], []
+        return [], [], []
     gate_list, where_list = zip(*entries)
-    return list(gate_list), [tuple(w) if isinstance(w, list) else w for w in where_list]
+    return (
+        list(gate_list),
+        [tuple(w) if isinstance(w, list) else w for w in where_list],
+        ["gate"] * len(gate_list),
+    )
 
 
 class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
@@ -52,6 +147,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         :meth:`set_gates` or :meth:`add_gates` before ``run``. Each ``gate`` is
         applied on the ket family only (state evolution), using :func:`pepsy.operators.gates.gate`.
         ``where`` supports one- or two-site locations in 1D/2D/3D forms.
+        For ``mode="mpo"``, entries may also have the explicit sub-MPO form
+        ``("submpo", mpo, where)`` or mapping form
+        ``{"kind": "submpo", "mpo": mpo, "where": where}``, with a 1D
+        support ``where``. :meth:`submpo_event` builds the tuple form.
     chi : int
         Maximum bond dimension used by MPO/swap/SVD compression modes.
     mode : {"dmrg", "mpo", "swap", "svd", "exact"}, default="dmrg"
@@ -104,6 +203,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"Unknown mode: {mode}")
         return mode_norm
 
+    @staticmethod
+    def submpo_event(mpo, where):
+        """Return a canonical explicit sub-MPO stream event.
+
+        The returned entry can be placed directly inside the ``gates`` stream
+        for ``mode="mpo"``. ``where`` is restricted to 1D integer MPS sites.
+        """
+
+        return ("submpo", mpo, _normalize_submpo_where(where))
+
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         p,
@@ -126,7 +235,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.inplace = bool(inplace)
         self.p = self._install_represented_norm(p if self.inplace else p.copy())
-        self.G, self.where = _normalize_gate_queue(gates)
+        self.G, self.where, self.event_types = _normalize_gate_queue(gates)
         self.chi = chi
         self.mode = self._normalize_mode(mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
@@ -334,7 +443,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         After calling this, ``run(...)`` applies only this new list
         (unless you call :meth:`add_gates` before running).
         """
-        self.G, self.where = _normalize_gate_queue(gates)
+        self.G, self.where, self.event_types = _normalize_gate_queue(gates)
         return self
 
     def add_gates(self, gates):
@@ -343,9 +452,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         This preserves previously queued gates and extends them with
         new ones.
         """
-        G_new, where_new = _normalize_gate_queue(gates)
+        G_new, where_new, event_types_new = _normalize_gate_queue(gates)
         self.G.extend(G_new)
         self.where.extend(where_new)
+        self.event_types.extend(event_types_new)
         return self
 
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -436,9 +546,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         G_seq = list(self.G)
         where_seq = list(self.where)
+        event_seq = list(self.event_types)
         if not G_seq:
             return self.p
         self._validate_symmray_mode_support()
+        self._validate_event_stream_for_run(G_seq, where_seq, event_seq)
 
         non_unitary = bool(non_unitary)
         if not non_unitary:
@@ -493,6 +605,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._run_mpo(
                 G_seq,
                 where_seq,
+                event_seq,
                 progbar=progbar,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
@@ -549,6 +662,43 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
 
         raise ValueError(f"Unknown mode: {self.mode}")
+
+    def _validate_event_stream_for_run(self, G_seq, where_seq, event_seq):
+        """Validate queued event metadata before replay."""
+        if not (len(G_seq) == len(where_seq) == len(event_seq)):
+            raise ValueError(
+                "MpsOptimizer event stream metadata is inconsistent: "
+                "payloads, wheres, and event types must have the same length."
+            )
+
+        unknown = sorted(set(event_seq) - {"gate", "submpo"})
+        if unknown:
+            raise ValueError(f"Unknown MPS stream event type(s): {unknown!r}.")
+
+        has_submpo = any(event_type == "submpo" for event_type in event_seq)
+        if has_submpo and self.mode != "mpo":
+            raise ValueError("subMPO stream events currently require mode='mpo'.")
+
+        if not has_submpo:
+            return
+
+        L = int(getattr(self.p, "L", 0))
+        for step, (where, event_type) in enumerate(
+            zip(where_seq, event_seq),
+            start=1,
+        ):
+            if event_type != "submpo":
+                continue
+            if len(set(where)) != len(where):
+                raise ValueError(
+                    f"subMPO event at step {step} has repeated site(s): {where!r}."
+                )
+            out_of_range = [site for site in where if site < 0 or site >= L]
+            if out_of_range:
+                raise ValueError(
+                    f"subMPO event at step {step} references site(s) outside "
+                    f"the MPS range [0, {L}): {out_of_range!r}."
+                )
 
     @staticmethod
     def _normalize_fidelity_samples(fidelity_samples):
@@ -1290,6 +1440,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self,
         G_seq,
         where_seq,
+        event_seq,
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
@@ -1306,6 +1457,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         p = self.p
         two_qubit_count = 0
+        submpo_count = 0
         sample_steps = (
             set()
             if track_infidelity
@@ -1338,7 +1490,63 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             compressed = False
             where = where_seq[idx]
             gate = G_seq[idx]
-            if len(where) == 1:
+            event_type = event_seq[idx]
+            if event_type == "submpo":
+                submpo_count += 1
+                xmin, xmax = min(where), max(where)
+                if track_norm_infidelity:
+                    self.canonize_mps(p, (xmin, xmax))
+                if track_norm_infidelity or track_infidelity:
+                    p_target = p.copy()
+                    p_target.gate_with_submpo_(
+                        gate,
+                        where=where,
+                        method="direct",
+                        max_bond=None,
+                        info={},
+                        inplace_mpo=False,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                    )
+                else:
+                    p_target = None
+                if track_norm_infidelity:
+                    target_norm = self._canonical_span_norm(p_target, (xmin, xmax))
+                else:
+                    target_norm = None
+
+                p.gate_with_submpo_(
+                    gate,
+                    where=where,
+                    method="direct",
+                    max_bond=self.chi,
+                    info=self.info_c,
+                    inplace_mpo=False,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                )
+
+                idx += 1
+                advanced = 1
+                last_where = (xmin, xmax)
+                compressed = True
+                if track_norm_infidelity:
+                    self._append_norm_infidelity_sample(
+                        self._canonical_span_norm(p, (xmin, xmax)),
+                        target_norm,
+                        step=idx,
+                        where=(xmin, xmax),
+                        record_trace=not track_infidelity,
+                    )
+                if track_infidelity:
+                    sample = self._append_true_infidelity_sample(
+                        p_target,
+                        p,
+                        step=idx,
+                        where=(xmin, xmax),
+                    )
+                    true_cumulative_infidelity = sample["infidelity"]
+            elif len(where) == 1:
                 self._apply_gate(
                     p,
                     gate,
@@ -1447,6 +1655,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "2q": two_qubit_count,
                     "bnd": p.max_bond(),
                 }
+                if submpo_count:
+                    postfix["mpo"] = submpo_count
                 if track_infidelity and true_cumulative_infidelity is not None:
                     postfix["Icum"] = self._format_progress_infidelity(true_cumulative_infidelity)
                 elif norm_proxy is not None:
