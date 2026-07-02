@@ -234,6 +234,102 @@ def test_mps_optimizer_submpo_diagnostics_do_not_consume_event_mpo():
     assert np.allclose(reuse_vec, expected)
 
 
+def test_mps_optimizer_submpo_method_and_optimize_are_forwarded(monkeypatch):
+    """Sub-MPO replay should expose compression method and optimizer choice."""
+    p0 = qtn.MPS_computational_state("000000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=6, sites=(0, 5), targets=(0, 5))
+    calls = []
+    optimize = object()
+
+    def fake_gate_with_submpo_(
+        self,
+        submpo,
+        *,
+        where=None,
+        method="direct",
+        info=None,
+        optimize=None,
+        **_kwargs,
+    ):
+        calls.append((submpo, tuple(where), method, optimize))
+        if info is not None:
+            info["cur_orthog"] = (min(where), min(where))
+        return self
+
+    monkeypatch.setattr(
+        qtn.MatrixProductState,
+        "gate_with_submpo_",
+        fake_gate_with_submpo_,
+    )
+
+    direct = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(mpo, (0, 5))],
+        chi=8,
+        mode="mpo",
+        contraction_opt=optimize,
+    )
+    direct.run(
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+        submpo_method="direct",
+    )
+
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(mpo, (0, 5))],
+        chi=8,
+        mode="mpo",
+        contraction_opt=optimize,
+    )
+    opt.run(
+        progbar=False,
+        cutoff=0.0,
+        fidelity_samples=0,
+        submpo_method="fit-zipup",
+    )
+
+    assert calls == [
+        (mpo, (0, 5), "direct", None),
+        (mpo, (0, 5), "fit-zipup", optimize),
+    ]
+
+
+def test_mps_optimizer_submpo_method_validation(monkeypatch):
+    """Unknown sub-MPO methods should be rejected clearly."""
+    p0 = qtn.MPS_computational_state("000000", dtype="complex128")
+    short_mpo = _two_branch_flip_submpo(L=6, sites=(0, 3), targets=(0, 3))
+
+    def fake_gate_with_submpo_(
+        self,
+        _submpo,
+        *,
+        where=None,
+        method="direct",
+        info=None,
+        **_kwargs,
+    ):
+        if info is not None:
+            info["cur_orthog"] = (min(where), min(where))
+        return self
+
+    monkeypatch.setattr(
+        qtn.MatrixProductState,
+        "gate_with_submpo_",
+        fake_gate_with_submpo_,
+    )
+
+    bad = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(short_mpo, (0, 3))],
+        chi=8,
+        mode="mpo",
+    )
+    with pytest.raises(ValueError, match="Unknown subMPO method"):
+        bad.run(progbar=False, submpo_method="bad")
+
+
 def test_mps_optimizer_submpo_stream_events_require_mpo_mode():
     """Non-MPO modes should reject sub-MPO stream events clearly."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")

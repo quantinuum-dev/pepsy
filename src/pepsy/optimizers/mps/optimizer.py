@@ -221,6 +221,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     """
 
     _ALLOWED_MODES = frozenset({"dmrg", "mpo", "swap", "svd", "exact"})
+    _ALLOWED_SUBMPO_METHODS = frozenset(
+        {
+            "direct",
+            "dm",
+            "zipup",
+            "zipup-first",
+            "zipup-oversample",
+            "src",
+            "src-first",
+            "src-oversample",
+            "srcmps",
+            "srcmps-first",
+            "srcmps-oversample",
+            "fit",
+            "fit-direct",
+            "fit-dm",
+            "fit-zipup",
+            "fit-zipup-first",
+            "fit-zipup-oversample",
+            "fit-src",
+            "fit-src-first",
+            "fit-src-oversample",
+            "fit-oversample",
+        }
+    )
     _PROGBAR_COLORS = {
         "dmrg": "#1f77b4",
         "mpo": "#2ca02c",
@@ -236,6 +261,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if mode_norm not in cls._ALLOWED_MODES:
             raise ValueError(f"Unknown mode: {mode}")
         return mode_norm
+
+    @classmethod
+    def _normalize_submpo_method(cls, method):
+        """Validate and normalize the sub-MPO compression method."""
+        method_norm = str(method).strip().lower()
+        if method_norm not in cls._ALLOWED_SUBMPO_METHODS:
+            raise ValueError(f"Unknown subMPO method: {method}")
+        return method_norm
+
+    def _submpo_compress_opts(self, method):
+        """Return compression options for a sub-MPO method."""
+        if method == "direct":
+            return {}
+        optimize = self.contraction_opt
+        if optimize is None:
+            return {}
+        if isinstance(optimize, str) and optimize.strip().lower() in {
+            "auto",
+            "auto-hq",
+        }:
+            return {}
+        return {"optimize": optimize}
 
     @staticmethod
     def submpo_event(mpo, where):
@@ -519,6 +566,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_eps=1e-15,
         track_norm_infidelity=False,
         track_infidelity=False,
+        submpo_method="direct",
     ):
         """Run the currently queued gates.
 
@@ -581,6 +629,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             :meth:`get_fidelities` still reports the running geometric mean of
             these local true fidelities. This is expensive and disabled by
             default.
+        submpo_method : str, default="direct"
+            MPO mode only: compression method used for explicit sub-MPO stream
+            events. This is forwarded to quimb's
+            ``MatrixProductState.gate_with_submpo_``.
 
         Returns
         -------
@@ -661,6 +713,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 normalize_eps=normalize_eps,
                 track_norm_infidelity=track_norm_infidelity,
                 track_infidelity=track_infidelity,
+                submpo_method=submpo_method,
             )
             return self.p
 
@@ -1496,6 +1549,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_eps=1e-15,
         track_norm_infidelity=False,
         track_infidelity=False,
+        submpo_method="direct",
     ):
         """Apply gates with MPO-style nonlocal compression.
 
@@ -1540,6 +1594,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if event_type == "submpo":
                 submpo_count += 1
                 xmin, xmax = min(where), max(where)
+                method = self._normalize_submpo_method(submpo_method)
+                submpo_compress_opts = self._submpo_compress_opts(method)
                 if track_norm_infidelity:
                     self.canonize_mps(p, (xmin, xmax))
                 if track_norm_infidelity or track_infidelity:
@@ -1547,12 +1603,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     p_target.gate_with_submpo_(
                         gate,
                         where=where,
-                        method="direct",
+                        method=method,
                         max_bond=None,
                         info={},
                         inplace_mpo=False,
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
+                        **submpo_compress_opts,
                     )
                 else:
                     p_target = None
@@ -1564,12 +1621,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 p.gate_with_submpo_(
                     gate,
                     where=where,
-                    method="direct",
+                    method=method,
                     max_bond=self.chi,
                     info=self.info_c,
                     inplace_mpo=False,
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
+                    **submpo_compress_opts,
                 )
 
                 idx += 1
