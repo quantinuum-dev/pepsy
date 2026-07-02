@@ -37,7 +37,14 @@ from pepsy.tensors import (
     reg_rel_svd_torch,
     site_charge_from_occupations,
 )
-from pepsy.vmc import make_fermionic_peps_batched_amplitude_function, square_lattice_edges
+from pepsy.vmc import (
+    build_heisenberg_vmc,
+    build_ising_vmc,
+    make_fermionic_peps_batched_amplitude_function,
+    make_peps_batched_amplitude_function,
+    pack_peps_ansatz,
+    square_lattice_edges,
+)
 
 
 def test_new_namespace_imports_resolve():
@@ -77,7 +84,11 @@ def test_new_namespace_imports_resolve():
     assert callable(reg_real_svd_jax)
     assert callable(reg_complex_svd_jax)
     assert callable(site_charge_from_occupations)
+    assert callable(build_heisenberg_vmc)
+    assert callable(build_ising_vmc)
     assert callable(make_fermionic_peps_batched_amplitude_function)
+    assert callable(make_peps_batched_amplitude_function)
+    assert callable(pack_peps_ansatz)
     assert callable(square_lattice_edges)
 
 

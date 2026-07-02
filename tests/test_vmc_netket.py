@@ -4,23 +4,34 @@ import os
 
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("NETKET_NO_TIPS", "1")
 
 from pepsy.vmc.netket import (  # noqa: E402
+    NetKetLocalConfigMap,
+    NetKetPEPSVMC,
+    PackedFermionicPEPS,
+    PackedPEPS,
     SpinOrbitalColumns,
     build_fermi_hubbard_vmc,
+    build_heisenberg_vmc,
+    build_ising_vmc,
     choose_netket_chunk_size,
+    config_to_phys_indices,
     make_fermionic_peps_batched_amplitude_function,
     make_fermionic_peps_log_amplitude_model,
     make_netket_autochunk_callback,
     make_netket_sr_preconditioner,
     make_netket_vmc_driver,
+    make_peps_batched_amplitude_function,
+    make_peps_log_amplitude_model,
     netket_spin_orbital_columns,
     occupation_to_phys_indices,
     pack_fermionic_peps_ansatz,
+    pack_peps_ansatz,
     recommend_netket_vmc_settings,
     square_lattice_edges,
     verify_netket_spin_columns,
@@ -45,6 +56,23 @@ def test_occupation_to_phys_indices_spinful_ordering():
     row = np.array([[0, 1, 0, 1, 0, 1, 1, 0]])
     phys = occupation_to_phys_indices(row, columns)
     assert phys.tolist() == [[0, 1, 2, 3]]
+
+
+def test_config_to_phys_indices_spin_half_ordering():
+    config_map = NetKetLocalConfigMap.spin_half(up=0, down=1)
+    row = np.array([[1, -1, -1, 1]])
+    phys = config_to_phys_indices(row, config_map)
+    assert phys.tolist() == [[0, 1, 1, 0]]
+
+    reordered = config_to_phys_indices(
+        row,
+        config_map,
+        site_to_config=(2, 0, 3, 1),
+    )
+    assert reordered.tolist() == [[1, 0, 0, 1]]
+
+    with pytest.raises(ValueError, match="not in config_map"):
+        config_to_phys_indices([[0, 1]], config_map)
 
 
 def test_choose_netket_chunk_size_prefers_power_of_two_divisor():
@@ -83,6 +111,99 @@ def test_netket_spin_columns_match_number_operators():
     columns = netket_spin_orbital_columns(hi)
     assert columns == SpinOrbitalColumns(up=(4, 5, 6, 7), down=(0, 1, 2, 3))
     assert verify_netket_spin_columns(hi, columns) == columns
+
+
+def test_generic_peps_log_model_matches_direct_contraction():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=5,
+        dtype="complex128",
+    )
+    ansatz = pack_peps_ansatz(peps, lattice_shape=(2, 2))
+    assert isinstance(ansatz, PackedPEPS)
+    assert not isinstance(ansatz, PackedFermionicPEPS)
+
+    config_map = NetKetLocalConfigMap.spin_half()
+    model = make_peps_log_amplitude_model(ansatz, config_map, contraction="exact")
+    row = jnp.asarray([[1, -1, 1, -1]], dtype=jnp.int32)
+    phys = config_to_phys_indices(
+        np.asarray(row),
+        config_map,
+        site_to_config=ansatz.site_to_config,
+    )[0]
+    tnx = peps.isel({
+        peps.site_ind(site): phys[k]
+        for k, site in enumerate(ansatz.sites)
+    })
+    direct = tnx.contract(all)
+
+    variables = model.init(jax.random.PRNGKey(0), row)
+    log_amp = model.apply(variables, row)[0]
+    amp = jax.block_until_ready(jnp.exp(log_amp))
+    assert np.allclose(np.asarray(amp), np.asarray(direct))
+
+
+def test_generic_peps_batched_amplitude_function_matches_direct_contraction():
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=6,
+        dtype="complex128",
+    )
+    ansatz = pack_peps_ansatz(peps, lattice_shape=(2, 2))
+    config_map = {1: 0, -1: 1}
+    rows = jnp.asarray(
+        [
+            [1, 1, -1, -1],
+            [1, -1, 1, -1],
+        ],
+        dtype=jnp.int32,
+    )
+
+    batched_amp = make_peps_batched_amplitude_function(
+        ansatz,
+        config_map,
+        contraction="exact",
+        output="amplitude",
+    )
+    amps = jax.block_until_ready(batched_amp(rows))
+
+    phys_rows = config_to_phys_indices(
+        np.asarray(rows),
+        config_map,
+        site_to_config=ansatz.site_to_config,
+    )
+    direct = []
+    for phys in phys_rows:
+        tnx = peps.isel({
+            peps.site_ind(site): phys[k]
+            for k, site in enumerate(ansatz.sites)
+        })
+        direct.append(tnx.contract(all))
+
+    assert np.allclose(np.asarray(amps), np.asarray(direct))
+
+    batched_me = make_peps_batched_amplitude_function(
+        ansatz,
+        config_map,
+        contraction="exact",
+        output="mantissa_exponent",
+        jit=False,
+    )
+    mantissa, exponent = batched_me(rows)
+    assert np.allclose(np.asarray(mantissa), np.asarray(direct))
+    assert np.allclose(np.asarray(exponent), np.zeros(2))
 
 
 def test_fermionic_peps_log_model_matches_direct_contraction():
@@ -238,6 +359,76 @@ def test_build_fermi_hubbard_vmc_tiny_setup():
     assert setup.hilbert.n_states == 36
     assert setup.ansatz.n_sites == 4
     assert setup.preconditioner is None
+    assert make_netket_vmc_driver(setup) is not None
+
+
+def test_build_ising_vmc_tiny_setup_and_expectation():
+    pytest.importorskip("netket")
+    pytest.importorskip("flax")
+
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=7,
+        dtype="complex128",
+    )
+    setup = build_ising_vmc(
+        peps,
+        Lx=2,
+        Ly=2,
+        h=1.0,
+        J=0.7,
+        n_samples=16,
+        n_chains=4,
+        n_discard_per_chain=0,
+        chunk_size=8,
+        seed=1,
+        sampler_seed=2,
+        use_sr=False,
+    )
+    assert isinstance(setup, NetKetPEPSVMC)
+    assert setup.hilbert.n_states == 16
+    assert setup.config_map == NetKetLocalConfigMap.spin_half()
+    assert setup.preconditioner is None
+    energy = setup.vstate.expect(setup.hamiltonian)
+    assert np.isfinite(np.asarray(energy.mean).real)
+    assert make_netket_vmc_driver(setup) is not None
+
+
+def test_build_heisenberg_vmc_tiny_setup_and_expectation():
+    pytest.importorskip("netket")
+    pytest.importorskip("flax")
+
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=8,
+        dtype="complex128",
+    )
+    setup = build_heisenberg_vmc(
+        peps,
+        Lx=2,
+        Ly=2,
+        J=1.0,
+        total_sz=0.0,
+        n_samples=16,
+        n_chains=4,
+        n_discard_per_chain=0,
+        chunk_size=8,
+        seed=1,
+        sampler_seed=2,
+        use_sr=False,
+    )
+    assert isinstance(setup, NetKetPEPSVMC)
+    assert setup.hilbert.n_states == 6
+    assert setup.config_map == NetKetLocalConfigMap.spin_half()
+    assert setup.preconditioner is None
+    energy = setup.vstate.expect(setup.hamiltonian)
+    assert np.isfinite(np.asarray(energy.mean).real)
     assert make_netket_vmc_driver(setup) is not None
 
 

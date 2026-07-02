@@ -1,4 +1,4 @@
-"""NetKet bridge for fermionic Symmray PEPS VMC.
+"""NetKet bridge for PEPS VMC.
 
 This module keeps NetKet/JAX/Flax/Symmray optional. Importing it requires those
 packages only when the concrete helpers are used.
@@ -16,14 +16,22 @@ import numpy as np
 import quimb.tensor as qtn
 
 __all__ = [
+    "NetKetLocalConfigMap",
     "NetKetChunkSettings",
+    "NetKetPEPSVMC",
     "NetKetFermiHubbardVMC",
     "NetKetVMCSettings",
+    "PackedPEPS",
     "PackedFermionicPEPS",
     "SpinOrbitalColumns",
+    "build_heisenberg_vmc",
+    "build_ising_vmc",
     "build_fermi_hubbard_vmc",
     "choose_netket_chunk_size",
     "configure_jax_for_vmc",
+    "config_to_phys_indices",
+    "make_peps_log_amplitude_model",
+    "make_peps_batched_amplitude_function",
     "make_fermionic_peps_log_amplitude_model",
     "make_fermionic_peps_batched_amplitude_function",
     "make_netket_autochunk_callback",
@@ -31,11 +39,39 @@ __all__ = [
     "make_netket_vmc_driver",
     "netket_spin_orbital_columns",
     "occupation_to_phys_indices",
+    "pack_peps_ansatz",
     "pack_fermionic_peps_ansatz",
     "recommend_netket_vmc_settings",
     "square_lattice_edges",
     "verify_netket_spin_columns",
 ]
+
+
+@dataclass(frozen=True)
+class NetKetLocalConfigMap:
+    """Map local NetKet configuration values to PEPS physical indices."""
+
+    values: tuple[Any, ...] = (1, -1)
+    phys_indices: tuple[int, ...] = (0, 1)
+
+    def __post_init__(self):
+        values = tuple(self.values)
+        phys_indices = tuple(int(i) for i in self.phys_indices)
+        if len(values) != len(phys_indices):
+            raise ValueError("values and phys_indices must have the same length.")
+        if len(values) == 0:
+            raise ValueError("At least one local configuration value is required.")
+        if len(set(values)) != len(values):
+            raise ValueError("Local configuration values must be unique.")
+        if any(i < 0 for i in phys_indices):
+            raise ValueError("PEPS physical indices must be non-negative.")
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "phys_indices", phys_indices)
+
+    @classmethod
+    def spin_half(cls, *, up=0, down=1):
+        """Return the standard NetKet spin-1/2 ``+1/-1`` map."""
+        return cls(values=(1, -1), phys_indices=(up, down))
 
 
 @dataclass(frozen=True)
@@ -47,7 +83,7 @@ class SpinOrbitalColumns:
 
 
 @dataclass(frozen=True)
-class PackedFermionicPEPS:
+class PackedPEPS:
     """Packed PEPS data needed by a NetKet/Flax log-amplitude model."""
 
     params: Any
@@ -66,6 +102,26 @@ class PackedFermionicPEPS:
     def n_sites(self):
         """Number of physical lattice sites/orbitals."""
         return len(self.orbital_sites)
+
+    @property
+    def config_sites(self):
+        """NetKet configuration-site order."""
+        return self.orbital_sites
+
+    @property
+    def config_to_site(self):
+        """Map configuration-site order to packed PEPS site order."""
+        return self.orb_to_site
+
+    @property
+    def site_to_config(self):
+        """Map packed PEPS site order to configuration-site order."""
+        return self.site_to_orb
+
+
+@dataclass(frozen=True)
+class PackedFermionicPEPS(PackedPEPS):
+    """Packed fermionic PEPS data for backward-compatible type checks."""
 
 
 @dataclass(frozen=True)
@@ -94,8 +150,8 @@ class NetKetVMCSettings:
 
 
 @dataclass(frozen=True)
-class NetKetFermiHubbardVMC:
-    """Bundle returned by :func:`build_fermi_hubbard_vmc`."""
+class NetKetPEPSVMC:
+    """Bundle returned by generic PEPS/NetKet VMC builders."""
 
     hilbert: Any
     graph: Any
@@ -103,9 +159,16 @@ class NetKetFermiHubbardVMC:
     sampler: Any
     vstate: Any
     model: Any
-    ansatz: PackedFermionicPEPS
-    columns: SpinOrbitalColumns
+    ansatz: PackedPEPS
+    config_map: NetKetLocalConfigMap | None
     preconditioner: Any | None
+
+
+@dataclass(frozen=True)
+class NetKetFermiHubbardVMC(NetKetPEPSVMC):
+    """Bundle returned by :func:`build_fermi_hubbard_vmc`."""
+
+    columns: SpinOrbitalColumns | None = None
 
 
 def configure_jax_for_vmc(
@@ -208,6 +271,20 @@ def _validate_contraction(name, contraction, chi):
 
 def _contraction_options(contraction_opts):
     return {} if contraction_opts is None else dict(contraction_opts)
+
+
+def _coerce_config_map(config_map):
+    if config_map is None:
+        return NetKetLocalConfigMap.spin_half()
+    if isinstance(config_map, NetKetLocalConfigMap):
+        return config_map
+    if isinstance(config_map, dict):
+        return NetKetLocalConfigMap(
+            values=tuple(config_map.keys()),
+            phys_indices=tuple(config_map.values()),
+        )
+    values, phys_indices = config_map
+    return NetKetLocalConfigMap(values=tuple(values), phys_indices=tuple(phys_indices))
 
 
 def _is_symmray_array(value):
@@ -492,47 +569,397 @@ def occupation_to_phys_indices(occ_rows, columns, *, site_to_orb=None):
     return phys_orb[:, np.asarray(site_to_orb)].astype(np.int32)
 
 
+def config_to_phys_indices(config_rows, config_map=None, *, site_to_config=None):
+    """Map NetKet local configurations to PEPS physical indices.
+
+    NetKet spin-1/2 Hilbert spaces use local values ``+1`` and ``-1``. The
+    default map sends ``+1 -> 0`` and ``-1 -> 1``. Supply ``config_map`` to use
+    another local basis or physical-index order.
+    """
+    config_map = _coerce_config_map(config_map)
+    rows = np.asarray(config_rows)
+    if rows.ndim == 1:
+        rows = rows.reshape(1, -1)
+
+    phys = np.zeros(rows.shape, dtype=np.int32)
+    matched = np.zeros(rows.shape, dtype=bool)
+    for value, phys_index in zip(config_map.values, config_map.phys_indices):
+        mask = rows == value
+        phys[mask] = phys_index
+        matched |= mask
+    if not np.all(matched):
+        bad = np.unique(rows[~matched])
+        raise ValueError(
+            "Configuration row contains value(s) not in config_map: "
+            f"{bad.tolist()!r}."
+        )
+
+    if site_to_config is None:
+        return phys
+    return phys[:, np.asarray(site_to_config)].astype(np.int32)
+
+
 def _row_major_sites(Lx, Ly):
     return tuple((i, j) for i in range(Lx) for j in range(Ly))
 
 
-def pack_fermionic_peps_ansatz(peps, *, lattice_shape=None, orbital_sites=None):
-    """Pack a Symmray/quimb PEPS for use as a Flax parameter pytree."""
+def _pack_peps_ansatz(
+    peps,
+    *,
+    lattice_shape=None,
+    config_sites=None,
+    packed_cls=PackedPEPS,
+):
     tn = getattr(peps, "tn", peps)
     if not hasattr(tn, "sites"):
         raise TypeError("peps must be a quimb PEPS-like object with a `sites` attribute.")
 
     sites = tuple(tn.sites)
-    if orbital_sites is None:
+    if config_sites is None:
         if lattice_shape is None:
-            orbital_sites = sites
+            config_sites = sites
         else:
-            orbital_sites = _row_major_sites(*lattice_shape)
-    orbital_sites = tuple(orbital_sites)
+            config_sites = _row_major_sites(*lattice_shape)
+    config_sites = tuple(config_sites)
 
-    missing = [site for site in orbital_sites if site not in sites]
+    missing = [site for site in config_sites if site not in sites]
     if missing:
-        raise ValueError(f"orbital_sites contains site(s) not in PEPS: {missing!r}")
+        raise ValueError(f"config_sites contains site(s) not in PEPS: {missing!r}")
 
     params, skeleton = qtn.pack(tn)
     leaves, treedef = _require_jax()[0].tree_util.tree_flatten(params)
     site_inds = tuple(tn.site_ind(site) for site in sites)
-    orb_to_site = tuple(sites.index(site) for site in orbital_sites)
+    orb_to_site = tuple(sites.index(site) for site in config_sites)
     site_to_orb = tuple(int(i) for i in np.argsort(np.asarray(orb_to_site)))
     n_params = int(sum(_param_leaf_size(leaf) for leaf in leaves))
-    return PackedFermionicPEPS(
+    return packed_cls(
         params=params,
         skeleton=skeleton,
         leaves=tuple(leaves),
         treedef=treedef,
         sites=sites,
-        orbital_sites=orbital_sites,
+        orbital_sites=config_sites,
         site_inds=site_inds,
         orb_to_site=orb_to_site,
         site_to_orb=site_to_orb,
         n_params=n_params,
         uses_flat_symmray=_uses_flat_symmray_arrays(tn),
     )
+
+
+def pack_peps_ansatz(peps, *, lattice_shape=None, config_sites=None):
+    """Pack a quimb/Symmray PEPS for use as a Flax parameter pytree."""
+    return _pack_peps_ansatz(
+        peps,
+        lattice_shape=lattice_shape,
+        config_sites=config_sites,
+        packed_cls=PackedPEPS,
+    )
+
+
+def pack_fermionic_peps_ansatz(peps, *, lattice_shape=None, orbital_sites=None):
+    """Pack a Symmray/quimb fermionic PEPS for use as a Flax pytree."""
+    return _pack_peps_ansatz(
+        peps,
+        lattice_shape=lattice_shape,
+        config_sites=orbital_sites,
+        packed_cls=PackedFermionicPEPS,
+    )
+
+
+def _make_peps_batched_amplitude_apply(
+    ansatz,
+    config_map=None,
+    *,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    output="log",
+):
+    contraction = _validate_contraction("contraction", contraction, chi)
+    if output not in {"log", "amplitude", "mantissa_exponent"}:
+        raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
+    if ansatz.uses_flat_symmray is False:
+        warnings.warn(
+            "JAX-jitted Symmray PEPS amplitudes are fastest with flat=True "
+            "PEPS data; repack a flat Symmray PEPS for large GPU runs.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    config_map = _coerce_config_map(config_map)
+    method_opts = _contraction_options(contraction_opts)
+    if contraction == "boundary":
+        method_opts.setdefault("mode", "mps")
+    jax, jnp = _require_jax()
+    values = jnp.asarray(config_map.values)
+    phys_indices = jnp.asarray(config_map.phys_indices, dtype=jnp.int32)
+    site_to_config = jnp.asarray(ansatz.site_to_config, dtype=jnp.int32)
+    real_dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
+    complex_dtype = jnp.complex128 if jax.config.x64_enabled else jnp.complex64
+    log10 = jnp.log(jnp.asarray(10.0, dtype=real_dtype))
+    n_sites = ansatz.n_sites
+    site_inds = tuple(ansatz.site_inds)
+
+    def config_rows_to_phys_jax(config_rows):
+        rows = jnp.asarray(config_rows).reshape((-1, n_sites))
+        phys = jnp.zeros(rows.shape, dtype=jnp.int32)
+        for value, phys_index in zip(values, phys_indices):
+            phys = jnp.where(rows == value, phys_index, phys)
+        return phys[:, site_to_config]
+
+    def select_phys(tn, phys):
+        if site_inds:
+            return tn.isel({ind: phys[k] for k, ind in enumerate(site_inds)})
+        return tn.isel({
+            tn.site_ind(site): phys[k]
+            for k, site in enumerate(ansatz.sites)
+        })
+
+    def contract_mantissa_exponent(tnx):
+        if contraction == "hotrg":
+            return tnx.contract_hotrg(
+                max_bond=chi,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **method_opts,
+            )
+        if contraction == "ctmrg":
+            return tnx.contract_ctmrg(
+                max_bond=chi,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **method_opts,
+            )
+        if contraction == "boundary":
+            return tnx.contract_boundary(
+                max_bond=chi,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **method_opts,
+            )
+        amp = tnx.contract(all)
+        return amp, jnp.zeros((), dtype=real_dtype)
+
+    def log_from_mantissa_exponent(mantissa, exponent):
+        return (
+            jnp.log(jnp.asarray(mantissa).astype(complex_dtype))
+            + jnp.asarray(exponent, dtype=real_dtype) * log10
+        )
+
+    def amplitude_from_mantissa_exponent(mantissa, exponent):
+        return (
+            jnp.asarray(mantissa).astype(complex_dtype)
+            * jnp.power(jnp.asarray(10.0, dtype=real_dtype), exponent)
+        )
+
+    def apply(config_rows, params):
+        tn = qtn.unpack(params, ansatz.skeleton)
+        phys_rows = config_rows_to_phys_jax(config_rows)
+
+        def evaluate_phys(phys):
+            mantissa, exponent = contract_mantissa_exponent(select_phys(tn, phys))
+            if output == "mantissa_exponent":
+                return mantissa, exponent
+            if output == "amplitude":
+                return amplitude_from_mantissa_exponent(mantissa, exponent)
+            return log_from_mantissa_exponent(mantissa, exponent)
+
+        return jax.vmap(evaluate_phys)(phys_rows)
+
+    return apply
+
+
+def _make_peps_batched_amplitude_nojit(
+    ansatz,
+    config_map=None,
+    *,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    output="log",
+):
+    contraction = _validate_contraction("contraction", contraction, chi)
+    if output not in {"log", "amplitude", "mantissa_exponent"}:
+        raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
+    if ansatz.uses_flat_symmray is False:
+        warnings.warn(
+            "JAX-jitted Symmray PEPS amplitudes are fastest with flat=True "
+            "PEPS data; repack a flat Symmray PEPS for large GPU runs.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    config_map = _coerce_config_map(config_map)
+    method_opts = _contraction_options(contraction_opts)
+    if contraction == "boundary":
+        method_opts.setdefault("mode", "mps")
+    jax, jnp = _require_jax()
+    real_dtype = jnp.float64 if jax.config.x64_enabled else jnp.float32
+    complex_dtype = jnp.complex128 if jax.config.x64_enabled else jnp.complex64
+    log10 = jnp.log(jnp.asarray(10.0, dtype=real_dtype))
+    site_inds = tuple(ansatz.site_inds)
+
+    def select_phys(tn, phys):
+        if site_inds:
+            return tn.isel({ind: int(phys[k]) for k, ind in enumerate(site_inds)})
+        return tn.isel({
+            tn.site_ind(site): int(phys[k])
+            for k, site in enumerate(ansatz.sites)
+        })
+
+    def evaluate_one(tn, phys):
+        tnx = select_phys(tn, phys)
+        if contraction == "hotrg":
+            mantissa, exponent = tnx.contract_hotrg(
+                max_bond=chi,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **method_opts,
+            )
+        elif contraction == "ctmrg":
+            mantissa, exponent = tnx.contract_ctmrg(
+                max_bond=chi,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **method_opts,
+            )
+        elif contraction == "boundary":
+            mantissa, exponent = tnx.contract_boundary(
+                max_bond=chi,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **method_opts,
+            )
+        else:
+            mantissa = tnx.contract(all)
+            exponent = jnp.zeros((), dtype=real_dtype)
+
+        if output == "mantissa_exponent":
+            return mantissa, exponent
+        if output == "amplitude":
+            return (
+                jnp.asarray(mantissa).astype(complex_dtype)
+                * jnp.power(jnp.asarray(10.0, dtype=real_dtype), exponent)
+            )
+        return (
+            jnp.log(jnp.asarray(mantissa).astype(complex_dtype))
+            + jnp.asarray(exponent, dtype=real_dtype) * log10
+        )
+
+    def apply(config_rows, params):
+        tn = qtn.unpack(params, ansatz.skeleton)
+        phys_rows = config_to_phys_indices(
+            config_rows,
+            config_map,
+            site_to_config=ansatz.site_to_config,
+        )
+        values = [evaluate_one(tn, phys) for phys in phys_rows]
+        if output == "mantissa_exponent":
+            mantissas, exponents = zip(*values)
+            return (
+                jnp.stack([jnp.asarray(x) for x in mantissas]),
+                jnp.asarray(exponents, dtype=real_dtype),
+            )
+        return jnp.stack([jnp.asarray(x) for x in values])
+
+    return apply
+
+
+def make_peps_batched_amplitude_function(
+    ansatz,
+    config_map=None,
+    *,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    output="mantissa_exponent",
+    jit=True,
+):
+    """Return a batched JAX amplitude function for NetKet local configs."""
+    jax, _ = _require_jax()
+    config_map = _coerce_config_map(config_map)
+    if jit:
+        apply = _make_peps_batched_amplitude_apply(
+            ansatz,
+            config_map,
+            contraction=contraction,
+            chi=chi,
+            cutoff=cutoff,
+            contraction_opts=contraction_opts,
+            output=output,
+        )
+        apply = jax.jit(apply)
+    else:
+        apply = _make_peps_batched_amplitude_nojit(
+            ansatz,
+            config_map,
+            contraction=contraction,
+            chi=chi,
+            cutoff=cutoff,
+            contraction_opts=contraction_opts,
+            output=output,
+        )
+
+    def evaluate(config_rows, params=None):
+        if params is None:
+            params = ansatz.params
+        return apply(config_rows, params)
+
+    return evaluate
+
+
+def make_peps_log_amplitude_model(
+    ansatz,
+    config_map=None,
+    *,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    param_dtype=None,
+):
+    """Build a Flax model returning batched ``log(psi(config_row))``."""
+    _validate_contraction("contraction", contraction, chi)
+
+    config_map = _coerce_config_map(config_map)
+    jax, jnp = _require_jax()
+    nn = _require_flax_linen()
+    init_values = tuple(np.asarray(leaf) for leaf in ansatz.leaves)
+    batched_log_amplitude = _make_peps_batched_amplitude_apply(
+        ansatz,
+        config_map,
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        contraction_opts=contraction_opts,
+        output="log",
+    )
+
+    class PEPSLogAmplitude(nn.Module):
+        """Flax module wrapping a packed PEPS log amplitude."""
+
+        @nn.compact
+        def __call__(self, x):
+            x = jnp.atleast_2d(x)
+            leaves = [
+                self.param(
+                    f"t{k}",
+                    lambda key, value=value: (
+                        jnp.asarray(value)
+                        if param_dtype is None
+                        else jnp.asarray(value, dtype=param_dtype)
+                    ),
+                )
+                for k, value in enumerate(init_values)
+            ]
+            params = jax.tree_util.tree_unflatten(ansatz.treedef, leaves)
+            return batched_log_amplitude(x, params)
+
+    return PEPSLogAmplitude()
 
 
 def _make_fermionic_peps_batched_amplitude_apply(
@@ -843,6 +1270,271 @@ def make_fermionic_peps_log_amplitude_model(
     return FermionicPEPSLogAmplitude()
 
 
+def _maybe_make_sr_preconditioner(
+    ansatz,
+    *,
+    use_sr,
+    max_sr_params,
+    sr_diag_shift,
+    sr_diag_scale,
+    sr_qgt,
+    sr_solver,
+    sr_solver_restart,
+):
+    if use_sr == "auto":
+        use_sr = ansatz.n_params <= max_sr_params
+    return (
+        make_netket_sr_preconditioner(
+            qgt=sr_qgt,
+            solver=sr_solver,
+            diag_shift=sr_diag_shift,
+            diag_scale=sr_diag_scale,
+            solver_restart=sr_solver_restart,
+        )
+        if use_sr
+        else None
+    )
+
+
+def _build_netket_peps_vmc(
+    peps,
+    *,
+    Lx,
+    Ly,
+    hilbert,
+    graph,
+    hamiltonian,
+    sampler,
+    config_map=None,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    n_samples=1024,
+    n_discard_per_chain=32,
+    chunk_size=256,
+    seed=None,
+    sampler_seed=None,
+    use_sr="auto",
+    max_sr_params=5_000,
+    sr_diag_shift=0.01,
+    sr_diag_scale=None,
+    sr_qgt="auto",
+    sr_solver=None,
+    sr_solver_restart=False,
+    param_dtype=None,
+):
+    config_map = _coerce_config_map(config_map)
+    ansatz = pack_peps_ansatz(peps, lattice_shape=(Lx, Ly))
+    model = make_peps_log_amplitude_model(
+        ansatz,
+        config_map,
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        contraction_opts=contraction_opts,
+        param_dtype=param_dtype,
+    )
+    vstate = _require_netket().vqs.MCState(
+        sampler,
+        model,
+        n_samples=n_samples,
+        n_discard_per_chain=n_discard_per_chain,
+        chunk_size=_check_positive_int("chunk_size", chunk_size),
+        seed=seed,
+        sampler_seed=sampler_seed,
+    )
+    preconditioner = _maybe_make_sr_preconditioner(
+        ansatz,
+        use_sr=use_sr,
+        max_sr_params=max_sr_params,
+        sr_diag_shift=sr_diag_shift,
+        sr_diag_scale=sr_diag_scale,
+        sr_qgt=sr_qgt,
+        sr_solver=sr_solver,
+        sr_solver_restart=sr_solver_restart,
+    )
+    return NetKetPEPSVMC(
+        hilbert=hilbert,
+        graph=graph,
+        hamiltonian=hamiltonian,
+        sampler=sampler,
+        vstate=vstate,
+        model=model,
+        ansatz=ansatz,
+        config_map=config_map,
+        preconditioner=preconditioner,
+    )
+
+
+def build_ising_vmc(
+    peps,
+    *,
+    Lx,
+    Ly,
+    h=1.0,
+    J=1.0,
+    pbc=False,
+    edges=None,
+    graph=None,
+    config_map=None,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    n_samples=1024,
+    n_chains=16,
+    n_discard_per_chain=32,
+    chunk_size=256,
+    sampler_chunk_size=None,
+    seed=None,
+    sampler_seed=None,
+    use_sr="auto",
+    max_sr_params=5_000,
+    sr_diag_shift=0.01,
+    sr_diag_scale=None,
+    sr_qgt="auto",
+    sr_solver=None,
+    sr_solver_restart=False,
+    param_dtype=None,
+):
+    """Create NetKet VMC objects for a spin-1/2 transverse-field Ising PEPS."""
+    nk = _require_netket()
+    n_sites = int(Lx) * int(Ly)
+    hilbert = nk.hilbert.Spin(s=1 / 2, N=n_sites)
+    if graph is None:
+        if edges is None:
+            edges = square_lattice_edges(Lx, Ly, pbc=pbc)
+        graph = nk.graph.Graph(edges=tuple(edges), n_nodes=n_sites)
+
+    hamiltonian = nk.operator.Ising(
+        hilbert,
+        graph=graph,
+        h=h,
+        J=J,
+        dtype=float,
+    )
+    sampler_kwargs = {"n_chains": n_chains}
+    if sampler_chunk_size is not None:
+        sampler_kwargs["chunk_size"] = _check_positive_int(
+            "sampler_chunk_size",
+            sampler_chunk_size,
+        )
+    sampler = nk.sampler.MetropolisLocal(hilbert, **sampler_kwargs)
+    return _build_netket_peps_vmc(
+        peps,
+        Lx=Lx,
+        Ly=Ly,
+        hilbert=hilbert,
+        graph=graph,
+        hamiltonian=hamiltonian,
+        sampler=sampler,
+        config_map=config_map,
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        contraction_opts=contraction_opts,
+        n_samples=n_samples,
+        n_discard_per_chain=n_discard_per_chain,
+        chunk_size=chunk_size,
+        seed=seed,
+        sampler_seed=sampler_seed,
+        use_sr=use_sr,
+        max_sr_params=max_sr_params,
+        sr_diag_shift=sr_diag_shift,
+        sr_diag_scale=sr_diag_scale,
+        sr_qgt=sr_qgt,
+        sr_solver=sr_solver,
+        sr_solver_restart=sr_solver_restart,
+        param_dtype=param_dtype,
+    )
+
+
+def build_heisenberg_vmc(
+    peps,
+    *,
+    Lx,
+    Ly,
+    J=1.0,
+    total_sz=0.0,
+    sign_rule=None,
+    pbc=False,
+    edges=None,
+    graph=None,
+    d_max=1,
+    config_map=None,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    n_samples=1024,
+    n_chains=16,
+    n_discard_per_chain=32,
+    chunk_size=256,
+    sampler_chunk_size=None,
+    seed=None,
+    sampler_seed=None,
+    use_sr="auto",
+    max_sr_params=5_000,
+    sr_diag_shift=0.01,
+    sr_diag_scale=None,
+    sr_qgt="auto",
+    sr_solver=None,
+    sr_solver_restart=False,
+    param_dtype=None,
+):
+    """Create NetKet VMC objects for a spin-1/2 Heisenberg PEPS."""
+    nk = _require_netket()
+    n_sites = int(Lx) * int(Ly)
+    hilbert = nk.hilbert.Spin(s=1 / 2, N=n_sites, total_sz=total_sz)
+    if graph is None:
+        if edges is None:
+            edges = square_lattice_edges(Lx, Ly, pbc=pbc)
+        graph = nk.graph.Graph(edges=tuple(edges), n_nodes=n_sites)
+
+    hamiltonian = nk.operator.Heisenberg(
+        hilbert,
+        graph=graph,
+        J=J,
+        sign_rule=sign_rule,
+        dtype=float,
+    )
+    sampler_kwargs = {"graph": graph, "d_max": d_max, "n_chains": n_chains}
+    if sampler_chunk_size is not None:
+        sampler_kwargs["chunk_size"] = _check_positive_int(
+            "sampler_chunk_size",
+            sampler_chunk_size,
+        )
+    sampler = nk.sampler.MetropolisExchange(hilbert, **sampler_kwargs)
+    return _build_netket_peps_vmc(
+        peps,
+        Lx=Lx,
+        Ly=Ly,
+        hilbert=hilbert,
+        graph=graph,
+        hamiltonian=hamiltonian,
+        sampler=sampler,
+        config_map=config_map,
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        contraction_opts=contraction_opts,
+        n_samples=n_samples,
+        n_discard_per_chain=n_discard_per_chain,
+        chunk_size=chunk_size,
+        seed=seed,
+        sampler_seed=sampler_seed,
+        use_sr=use_sr,
+        max_sr_params=max_sr_params,
+        sr_diag_shift=sr_diag_shift,
+        sr_diag_scale=sr_diag_scale,
+        sr_qgt=sr_qgt,
+        sr_solver=sr_solver,
+        sr_solver_restart=sr_solver_restart,
+        param_dtype=param_dtype,
+    )
+
+
 def build_fermi_hubbard_vmc(
     peps,
     *,
@@ -933,18 +1625,15 @@ def build_fermi_hubbard_vmc(
         sampler_seed=sampler_seed,
     )
 
-    if use_sr == "auto":
-        use_sr = ansatz.n_params <= max_sr_params
-    preconditioner = (
-        make_netket_sr_preconditioner(
-            qgt=sr_qgt,
-            solver=sr_solver,
-            diag_shift=sr_diag_shift,
-            diag_scale=sr_diag_scale,
-            solver_restart=sr_solver_restart,
-        )
-        if use_sr
-        else None
+    preconditioner = _maybe_make_sr_preconditioner(
+        ansatz,
+        use_sr=use_sr,
+        max_sr_params=max_sr_params,
+        sr_diag_shift=sr_diag_shift,
+        sr_diag_scale=sr_diag_scale,
+        sr_qgt=sr_qgt,
+        sr_solver=sr_solver,
+        sr_solver_restart=sr_solver_restart,
     )
     return NetKetFermiHubbardVMC(
         hilbert=hilbert,
@@ -954,8 +1643,9 @@ def build_fermi_hubbard_vmc(
         vstate=vstate,
         model=model,
         ansatz=ansatz,
-        columns=columns,
+        config_map=None,
         preconditioner=preconditioner,
+        columns=columns,
     )
 
 
@@ -980,7 +1670,7 @@ def make_netket_vmc_driver(
     momentum=None,
     linear_solver=None,
 ):
-    """Create a NetKet VMC driver from :func:`build_fermi_hubbard_vmc`.
+    """Create a NetKet VMC driver from a Pepsy/NetKet VMC setup.
 
     ``driver="vmc"`` returns standard NetKet ``VMC``. ``driver="vmc_sr"``
     returns NetKet's newer SR/minSR driver with explicit Jacobian mode,

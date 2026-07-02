@@ -1,7 +1,73 @@
 # `pepsy.vmc`
 
-Optional VMC integrations live under `pepsy.vmc`. The first implementation is a
-NetKet bridge for Symmray-backed fermionic PEPS amplitudes:
+Optional VMC integrations live under `pepsy.vmc`. The NetKet bridge can now
+wrap a packed PEPS as a Flax model for spin systems, while keeping the
+Fermi-Hubbard helper as a specialization.
+
+For spin models, NetKet spin-1/2 configurations use local values `+1` and
+`-1`. The default `NetKetLocalConfigMap` sends `+1 -> physical index 0` and
+`-1 -> physical index 1`; pass a custom map when a symmetric PEPS uses another
+physical-sector order.
+
+```python
+import quimb.tensor as qtn
+import pepsy.vmc as pvmc
+
+pvmc.configure_jax_for_vmc()
+
+peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, phys_dim=2, dtype="complex128")
+setup = pvmc.build_ising_vmc(
+    peps,
+    Lx=2,
+    Ly=2,
+    h=1.0,
+    J=1.0,
+    contraction="exact",
+    n_samples=1024,
+    n_chains=16,
+    chunk_size=256,
+    seed=1,
+    sampler_seed=2,
+    use_sr=False,
+)
+driver = pvmc.make_netket_vmc_driver(setup, learning_rate=0.02)
+```
+
+Heisenberg VMC uses the same generic PEPS amplitude model with NetKet's
+exchange sampler and, by default, the `total_sz=0` sector:
+
+```python
+setup = pvmc.build_heisenberg_vmc(
+    peps,
+    Lx=2,
+    Ly=2,
+    J=1.0,
+    total_sz=0.0,
+    contraction="exact",
+    n_samples=1024,
+    n_chains=16,
+    chunk_size=256,
+    use_sr=False,
+)
+```
+
+For notebook profiling or custom NetKet models, use the generic batched JAX
+path directly:
+
+```python
+ansatz = pvmc.pack_peps_ansatz(peps, lattice_shape=(2, 2))
+batched_amp = pvmc.make_peps_batched_amplitude_function(
+    ansatz,
+    pvmc.NetKetLocalConfigMap.spin_half(),
+    contraction="hotrg",
+    chi=4,
+    output="mantissa_exponent",
+)
+mantissa, exponent = batched_amp(spin_config_rows)
+```
+
+The Fermi-Hubbard helper builds the spin-orbital Hilbert space, fermionic
+Hamiltonian, fermion-hop sampler, and Symmray spinful local-index map:
 
 ```python
 import pepsy.vmc as pvmc
@@ -38,10 +104,9 @@ driver = pvmc.make_netket_vmc_driver(
 )
 ```
 
-For notebook profiling or custom NetKet models, use the same batched JAX path
-directly. This mirrors Symmray's batch GPU amplitude example: pack the PEPS once,
-keep `flat=True` Symmray data for JIT-friendly leaves, and evaluate many
-spin-orbital occupation rows with one compiled function.
+The fermionic batch path mirrors Symmray's batch GPU amplitude example: pack
+the PEPS once, keep `flat=True` Symmray data for JIT-friendly leaves, and
+evaluate many spin-orbital occupation rows with one compiled function.
 
 ```python
 batched_amp = pvmc.make_fermionic_peps_batched_amplitude_function(
