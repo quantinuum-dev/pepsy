@@ -16,7 +16,9 @@ __all__ = [
     "TorchPEPSAmplitude",
     "TorchConnections",
     "TorchMetropolisResult",
+    "TorchSRResult",
     "TorchSquareLattice",
+    "apply_torch_sr_update",
     "count_spinful_particles",
     "heisenberg_connections",
     "local_energy_from_connections",
@@ -26,7 +28,9 @@ __all__ = [
     "random_spin_configs",
     "random_spinful_configs",
     "make_torch_peps_amplitude_model",
+    "solve_torch_sr",
     "spinful_fermi_hubbard_connections",
+    "torch_log_derivative_matrix",
     "transverse_ising_connections",
 ]
 
@@ -112,6 +116,20 @@ def _torch_finfo_tiny(dtype):
     return torch.finfo(dtype).tiny
 
 
+def _is_symmray_data(data):
+    cls = type(data)
+    return cls.__module__.split(".", 1)[0] == "symmray"
+
+
+def _find_symmray_tensors(tn):
+    tensor_map = getattr(tn, "tensor_map", {})
+    return [
+        tensor_id
+        for tensor_id, tensor in tensor_map.items()
+        if _is_symmray_data(getattr(tensor, "data", None))
+    ]
+
+
 class TorchPEPSAmplitude:
     """Torch-optimizable amplitude wrapper for a quimb PEPS-like network.
 
@@ -151,6 +169,14 @@ class TorchPEPSAmplitude:
         tn = getattr(peps, "tn", peps)
         if not hasattr(tn, "sites"):
             raise TypeError("peps must be a quimb PEPS-like object with sites.")
+        symmray_tensor_ids = _find_symmray_tensors(tn)
+        if symmray_tensor_ids:
+            raise NotImplementedError(
+                "TorchPEPSAmplitude currently supports dense quimb PEPS tensor "
+                "leaves only. Symmray/block-sparse fermionic PEPS need a "
+                "dedicated torch to_pytree/from_pytree adapter before they can "
+                "be optimized safely."
+            )
         self.sites = tuple(tn.sites if site_order is None else site_order)
         missing = [site for site in self.sites if site not in tn.sites]
         if missing:
@@ -336,6 +362,254 @@ class TorchPEPSAmplitude:
 def make_torch_peps_amplitude_model(peps, **kwargs):
     """Build a :class:`TorchPEPSAmplitude` from a quimb PEPS-like object."""
     return TorchPEPSAmplitude(peps, **kwargs)
+
+
+@dataclass(frozen=True)
+class TorchSRResult:
+    """Result of a torch stochastic-reconfiguration linear solve."""
+
+    direction: Any
+    energy_mean: Any
+    energy_variance: Any
+    force: Any
+    centered_log_derivatives: Any
+    method: str
+    diag_shift: float
+    info: dict[str, Any]
+
+
+def _torch_model_parameters(model):
+    try:
+        params = list(model.parameters())
+    except AttributeError as exc:
+        raise TypeError("model must expose a parameters() method.") from exc
+    if not params:
+        raise ValueError("model must expose at least one trainable parameter.")
+    return params
+
+
+def _flatten_torch_tensors(tensors, refs):
+    torch = _require_torch()
+    pieces = []
+    for tensor, ref in zip(tensors, refs, strict=True):
+        if tensor is None:
+            tensor = torch.zeros_like(ref)
+        pieces.append(tensor.reshape(-1))
+    return torch.cat(pieces) if pieces else torch.empty(0)
+
+
+def torch_log_derivative_matrix(
+    model,
+    configs,
+    *,
+    amplitude_floor=None,
+    create_graph=False,
+):
+    """Return per-sample log-amplitude derivatives for a torch model.
+
+    The returned matrix has shape ``(n_samples, n_params)`` and entries
+    ``d psi(config) / d theta / psi(config)``. It is intended for real-valued
+    PEPS amplitudes; complex-amplitude SR needs an explicit real/imaginary
+    parameter convention and is not silently guessed here.
+    """
+    torch = _require_torch()
+    configs = _as_long_matrix(configs)
+    params = _torch_model_parameters(model)
+    rows = []
+
+    for config in configs:
+        amp = model(config.reshape(1, -1))
+        amp = torch.as_tensor(amp).reshape(-1)
+        if amp.numel() != 1:
+            raise ValueError("model(config) must return one amplitude per row.")
+        amp = amp[0]
+        if torch.is_complex(amp):
+            raise NotImplementedError(
+                "torch_log_derivative_matrix currently supports real scalar "
+                "amplitudes. Split complex parameters/amplitudes explicitly "
+                "before using torch SR."
+            )
+        if not amp.requires_grad:
+            raise RuntimeError("model amplitude does not require gradients.")
+
+        amp_abs = amp.detach().abs()
+        if amplitude_floor is None:
+            if amp_abs.item() == 0:
+                raise ZeroDivisionError(
+                    "Encountered a zero amplitude while forming log derivatives."
+                )
+            denom = amp
+        else:
+            floor = torch.as_tensor(
+                amplitude_floor,
+                dtype=amp.dtype,
+                device=amp.device,
+            )
+            sign = torch.where(
+                amp.detach() >= 0,
+                torch.ones_like(amp),
+                -torch.ones_like(amp),
+            )
+            denom = torch.where(amp_abs < floor, sign * floor, amp)
+
+        grads = torch.autograd.grad(
+            amp,
+            params,
+            retain_graph=create_graph,
+            create_graph=create_graph,
+            allow_unused=True,
+        )
+        row = _flatten_torch_tensors(grads, params) / denom
+        if not create_graph:
+            row = row.detach()
+        rows.append(row)
+
+    return torch.stack(rows, dim=0)
+
+
+def _promote_sr_tensors(log_derivatives, local_energies):
+    torch = _require_torch()
+    log_derivatives = torch.as_tensor(log_derivatives)
+    if log_derivatives.ndim != 2:
+        raise ValueError("log_derivatives must have shape (n_samples, n_params).")
+    if not torch.is_floating_point(log_derivatives) and not torch.is_complex(
+        log_derivatives
+    ):
+        log_derivatives = log_derivatives.to(torch.float64)
+
+    local_energies = torch.as_tensor(local_energies, device=log_derivatives.device)
+    if local_energies.ndim != 1:
+        local_energies = local_energies.reshape(-1)
+    if local_energies.shape[0] != log_derivatives.shape[0]:
+        raise ValueError("local_energies must have one entry per sample.")
+    if not torch.is_floating_point(local_energies) and not torch.is_complex(
+        local_energies
+    ):
+        local_energies = local_energies.to(log_derivatives.dtype)
+
+    dtype = torch.promote_types(log_derivatives.dtype, local_energies.dtype)
+    return log_derivatives.to(dtype), local_energies.to(dtype)
+
+
+def _torch_solve_linear(matrix, rhs):
+    torch = _require_torch()
+    try:
+        return torch.linalg.solve(matrix, rhs), "solve"
+    except RuntimeError:
+        return torch.linalg.lstsq(matrix, rhs).solution, "lstsq"
+
+
+def solve_torch_sr(
+    log_derivatives,
+    local_energies,
+    *,
+    diag_shift=1.0e-4,
+    method="auto",
+    center=True,
+):
+    """Solve direct SR or sample-space minSR for a torch VMC batch.
+
+    ``method="direct"`` forms the parameter-space covariance matrix.
+    ``method="minsr"`` solves the equivalent sample-space system, which is
+    preferable when the number of PEPS parameters is much larger than the
+    number of Monte Carlo samples. ``method="auto"`` picks minSR when
+    ``n_samples < n_params``.
+    """
+    torch = _require_torch()
+    if diag_shift < 0:
+        raise ValueError("diag_shift must be non-negative.")
+    log_derivatives, local_energies = _promote_sr_tensors(
+        log_derivatives,
+        local_energies,
+    )
+    n_samples, n_params = log_derivatives.shape
+    if n_samples == 0 or n_params == 0:
+        raise ValueError("SR requires at least one sample and one parameter.")
+
+    method_key = str(method).replace("_", "").replace("-", "").lower()
+    if method_key == "auto":
+        method_key = "minsr" if n_samples < n_params else "direct"
+    if method_key not in {"direct", "sr", "minsr"}:
+        raise ValueError("method must be 'auto', 'direct', or 'minsr'.")
+    if method_key == "sr":
+        method_key = "direct"
+
+    energy_mean = local_energies.mean()
+    energy_residual = local_energies - energy_mean if center else local_energies
+    centered = (
+        log_derivatives - log_derivatives.mean(dim=0, keepdim=True)
+        if center
+        else log_derivatives
+    )
+    force = centered.conj().transpose(0, 1) @ energy_residual / n_samples
+    shift = torch.as_tensor(
+        diag_shift,
+        dtype=log_derivatives.dtype,
+        device=log_derivatives.device,
+    )
+
+    if method_key == "direct":
+        eye = torch.eye(
+            n_params,
+            dtype=log_derivatives.dtype,
+            device=log_derivatives.device,
+        )
+        sr_matrix = centered.conj().transpose(0, 1) @ centered / n_samples
+        direction, solver = _torch_solve_linear(sr_matrix + shift * eye, force)
+        matrix_shape = tuple(sr_matrix.shape)
+    else:
+        eye = torch.eye(
+            n_samples,
+            dtype=log_derivatives.dtype,
+            device=log_derivatives.device,
+        )
+        gram = centered @ centered.conj().transpose(0, 1)
+        alpha, solver = _torch_solve_linear(
+            gram + n_samples * shift * eye,
+            energy_residual,
+        )
+        direction = centered.conj().transpose(0, 1) @ alpha
+        matrix_shape = tuple(gram.shape)
+
+    energy_variance = energy_residual.abs().square().mean()
+    return TorchSRResult(
+        direction=direction,
+        energy_mean=energy_mean,
+        energy_variance=energy_variance.real,
+        force=force,
+        centered_log_derivatives=centered,
+        method=method_key,
+        diag_shift=float(diag_shift),
+        info={"solver": solver, "matrix_shape": matrix_shape},
+    )
+
+
+def apply_torch_sr_update(model, direction, *, learning_rate=1.0):
+    """Apply ``theta <- theta - learning_rate * direction`` in place."""
+    torch = _require_torch()
+    params = _torch_model_parameters(model)
+    n_params = sum(param.numel() for param in params)
+    direction = torch.as_tensor(direction)
+    if direction.numel() != n_params:
+        raise ValueError(
+            f"direction has {direction.numel()} entries, expected {n_params}."
+        )
+
+    offset = 0
+    with torch.no_grad():
+        for param in params:
+            size = param.numel()
+            update = direction[offset:offset + size].reshape_as(param)
+            if torch.is_complex(update) and not torch.is_complex(param):
+                if update.imag.abs().max().item() > 1.0e-12:
+                    raise ValueError(
+                        "Cannot apply a complex SR direction to real parameters."
+                    )
+                update = update.real
+            update = update.to(dtype=param.dtype, device=param.device)
+            param.sub_(learning_rate * update)
+            offset += size
+    return model
 
 
 @dataclass(frozen=True)

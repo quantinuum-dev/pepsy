@@ -9,6 +9,7 @@ from pepsy.vmc.torch import (  # noqa: E402
     FermionSiteEncoding,
     TorchPEPSAmplitude,
     TorchSquareLattice,
+    apply_torch_sr_update,
     count_spinful_particles,
     heisenberg_connections,
     local_energy_from_connections,
@@ -18,9 +19,22 @@ from pepsy.vmc.torch import (  # noqa: E402
     propose_spinful_exchange_or_hopping,
     random_spin_configs,
     random_spinful_configs,
+    solve_torch_sr,
     spinful_fermi_hubbard_connections,
+    torch_log_derivative_matrix,
     transverse_ising_connections,
 )
+
+
+class ProductAmplitude(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weights = torch.nn.Parameter(
+            torch.tensor([2.0, 3.0], dtype=torch.float64)
+        )
+
+    def forward(self, configs):
+        return self.weights[configs].prod(dim=1)
 
 
 def test_fermion_site_encoding_supports_symmray_and_vmc_torch_orders():
@@ -122,6 +136,111 @@ def test_torch_peps_amplitude_supports_torch_optimizer_step():
     assert not torch.allclose(before, after)
     peps_after = model.to_peps()
     assert tuple(peps_after.sites) == tuple(peps.sites)
+
+
+def test_torch_log_derivative_matrix_matches_product_model_manual_values():
+    model = ProductAmplitude()
+    configs = torch.tensor([[0, 1], [1, 1]])
+
+    log_derivatives = torch_log_derivative_matrix(model, configs)
+
+    expected = torch.tensor(
+        [
+            [1.0 / 2.0, 1.0 / 3.0],
+            [0.0, 2.0 / 3.0],
+        ],
+        dtype=torch.float64,
+    )
+    assert torch.allclose(log_derivatives, expected)
+
+
+def test_solve_torch_sr_direct_matches_minsr():
+    generator = torch.Generator().manual_seed(13)
+    log_derivatives = torch.randn(
+        4,
+        9,
+        dtype=torch.float64,
+        generator=generator,
+    )
+    local_energies = torch.randn(4, dtype=torch.float64, generator=generator)
+
+    direct = solve_torch_sr(
+        log_derivatives,
+        local_energies,
+        method="direct",
+        diag_shift=1.0e-3,
+    )
+    minsr = solve_torch_sr(
+        log_derivatives,
+        local_energies,
+        method="minsr",
+        diag_shift=1.0e-3,
+    )
+    auto = solve_torch_sr(
+        log_derivatives,
+        local_energies,
+        method="auto",
+        diag_shift=1.0e-3,
+    )
+
+    assert direct.method == "direct"
+    assert minsr.method == "minsr"
+    assert auto.method == "minsr"
+    assert torch.allclose(direct.direction, minsr.direction, atol=1.0e-10)
+    assert torch.allclose(auto.direction, minsr.direction, atol=1.0e-10)
+
+
+def test_apply_torch_sr_update_changes_model_parameters():
+    model = ProductAmplitude()
+    before = model.weights.detach().clone()
+    direction = torch.tensor([0.5, -1.0], dtype=torch.float64)
+
+    apply_torch_sr_update(model, direction, learning_rate=0.1)
+
+    assert torch.allclose(model.weights, before - 0.1 * direction)
+
+
+def test_torch_peps_amplitude_supports_sr_kernel():
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=14,
+        dtype="float64",
+    )
+    model = TorchPEPSAmplitude(peps, contraction="exact", dtype=torch.float64)
+    rows = torch.tensor([[0, 1, 0, 1], [1, 0, 1, 0]])
+    log_derivatives = torch_log_derivative_matrix(model, rows)
+    local_energies = torch.tensor([0.2, -0.1], dtype=torch.float64)
+
+    result = solve_torch_sr(
+        log_derivatives,
+        local_energies,
+        method="auto",
+        diag_shift=1.0e-2,
+    )
+
+    assert log_derivatives.shape == (2, model.n_params)
+    assert result.direction.shape == (model.n_params,)
+    assert torch.isfinite(result.direction).all()
+
+
+def test_torch_peps_amplitude_rejects_symmray_block_sparse_peps():
+    sr = pytest.importorskip("symmray")
+    peps = sr.networks.PEPS_fermionic_rand(
+        "Z2",
+        2,
+        2,
+        2,
+        phys_dim=4,
+        subsizes="equal",
+        flat=True,
+        seed=1,
+    )
+
+    with pytest.raises(NotImplementedError, match="Symmray/block-sparse"):
+        TorchPEPSAmplitude(peps, contraction="exact", dtype=torch.float64)
 
 
 def test_spinful_exchange_hopping_proposal_preserves_particle_counts():

@@ -57,8 +57,25 @@ eloc = pvmc.local_energy_from_connections(
 ```
 
 `TorchPEPSAmplitude.parameters()` returns the packed PEPS tensor leaves as
-torch parameters, so plain torch optimizers and future SR/minSR utilities can
-update the tensor network directly.
+torch parameters, so plain torch optimizers and the lightweight SR/minSR
+helpers can update the tensor network directly.
+
+```python
+log_derivatives = pvmc.torch_log_derivative_matrix(model, sample.configs)
+sr = pvmc.solve_torch_sr(
+    log_derivatives,
+    eloc,
+    method="auto",  # direct SR or sample-space minSR
+    diag_shift=1e-3,
+)
+pvmc.apply_torch_sr_update(model, sr.direction, learning_rate=0.02)
+```
+
+The torch PEPS wrapper is currently validated for dense quimb PEPS leaves.
+True Symmray/block-sparse fermionic PEPS tensors need a dedicated torch
+`to_pytree`/`from_pytree` packing adapter before they can be optimized safely;
+the wrapper raises `NotImplementedError` for those arrays rather than
+silently densifying or mis-packing them.
 
 The default spinful encoding matches Pepsy/Symmray physical indices
 `0=empty, 1=double, 2=up, 3=down`. Use

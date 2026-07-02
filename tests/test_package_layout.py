@@ -41,6 +41,7 @@ from pepsy.vmc import (
     FermionSiteEncoding,
     TorchPEPSAmplitude,
     TorchSquareLattice,
+    apply_torch_sr_update,
     build_heisenberg_vmc,
     build_ising_vmc,
     heisenberg_connections,
@@ -48,8 +49,10 @@ from pepsy.vmc import (
     make_peps_batched_amplitude_function,
     make_torch_peps_amplitude_model,
     pack_peps_ansatz,
+    solve_torch_sr,
     spinful_fermi_hubbard_connections,
     square_lattice_edges,
+    torch_log_derivative_matrix,
 )
 
 
@@ -93,6 +96,7 @@ def test_new_namespace_imports_resolve():
     assert FermionSiteEncoding is not None
     assert TorchPEPSAmplitude is not None
     assert TorchSquareLattice is not None
+    assert callable(apply_torch_sr_update)
     assert callable(build_heisenberg_vmc)
     assert callable(build_ising_vmc)
     assert callable(heisenberg_connections)
@@ -100,8 +104,10 @@ def test_new_namespace_imports_resolve():
     assert callable(make_peps_batched_amplitude_function)
     assert callable(make_torch_peps_amplitude_model)
     assert callable(pack_peps_ansatz)
+    assert callable(solve_torch_sr)
     assert callable(spinful_fermi_hubbard_connections)
     assert callable(square_lattice_edges)
+    assert callable(torch_log_derivative_matrix)
 
 
 @pytest.mark.parametrize(

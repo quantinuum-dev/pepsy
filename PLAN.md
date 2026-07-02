@@ -255,6 +255,20 @@ boundary-reuse mechanics, but keep Pepsy's scope here to pure PEPS:
   backflow, NN-fTNS tensor corrections, neural Jastrow, Slater backflow, LoRA,
   or other neural-network wavefunction layers.
 
+Current status:
+
+- Dense quimb PEPS can be packed as torch parameters with exact, boundary-MPS,
+  CTMRG, or HOTRG contraction choices.
+- Torch samplers and connected-configuration local-energy kernels cover ITF,
+  Heisenberg, and spinful Fermi-Hubbard.
+- Direct SR and sample-space minSR utilities are available for real-valued
+  torch amplitudes; minSR is the intended path when `n_params >> n_samples`.
+- Large `L,D` runs are still not efficient until boundary-MPS environment reuse
+  is implemented around local PEPS updates and connected configurations.
+- True torch Symmray/block-sparse fermionic PEPS is not yet validated. The
+  current torch wrapper is tested on dense quimb PEPS and rejects Symmray arrays
+  until a dedicated torch `to_pytree`/`from_pytree` adapter is added.
+
 Implementation order:
 
 1. Keep the existing `pepsy.vmc.torch` sampler/local-energy kernels minimal and
@@ -262,11 +276,12 @@ Implementation order:
    Heisenberg, and 2x2 Fermi-Hubbard.
 2. Add a pure torch PEPS amplitude wrapper with `forward(config_rows)` and
    `forward_log(config_rows)` matching the sampler interface.
-3. Add local-energy drivers that combine `*_connections(...)`,
+3. Add SR/minSR optimizer helpers for packed PEPS tensor parameters.
+4. Add local-energy drivers that combine `*_connections(...)`,
    `local_energy_from_connections(...)`, and a PEPS amplitude model.
-4. Add boundary-reuse PEPS amplitude evaluation after the direct/batched path is
+5. Add boundary-reuse PEPS amplitude evaluation after the direct/batched path is
    correct.
-5. Add a small example/notebook comparing exact dense energy, plain PEPS VMC,
+6. Add a small example/notebook comparing exact dense energy, plain PEPS VMC,
    and contraction-reuse timing.
 
 ### Validation
