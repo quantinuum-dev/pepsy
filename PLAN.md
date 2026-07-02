@@ -1,7 +1,7 @@
 # PLAN.md — pepsy roadmap
 
 Status: living document
-Last updated: 2026-07-01
+Last updated: 2026-07-02
 Owners: pepsy maintainers + coding agents
 
 This document tracks the planned workstreams for `pepsy` (boundary-MPS tools for
@@ -17,8 +17,8 @@ Four headline workstreams drive the roadmap:
 2. **quimb integration** — lean on `quimb` / `cotengra` / `autoray` rather than
    reimplementing tensor-network primitives.
 3. **Symmetric & fermionic tensors** via `symmray`.
-4. **Variational Monte Carlo** for fermionic PEPS via the `pepsy.vmc` NetKet
-   bridge.
+4. **Variational Monte Carlo** for PEPS: current NetKet/JAX bridge plus a
+   later torch-only pure-PEPS path for ITF, Fermi-Hubbard, Heisenberg, etc.
 
 The conceptual background for each lives in `learning/bp.md`,
 `learning/quimb.md`, and `learning/symmray.md`.
@@ -228,10 +228,53 @@ Development rule of thumb (from the notebook): reusable NetKet/Symmray glue
 moves into `pepsy.vmc`; physics sanity checks and timing experiments stay in the
 example notebook.
 
+### Later torch-only pure-PEPS VMC
+
+Add a torch-only VMC path focused on **plain PEPS/TNS amplitudes and standard
+Hamiltonians**, not neural-network ansatz layers. Use `sjdu10/vmc_torch` and the
+NN-fTNS paper as implementation references for sampling, local-energy, SR, and
+boundary-reuse mechanics, but keep Pepsy's scope here to pure PEPS:
+
+- In scope: torch PEPS amplitude wrappers, batched amplitude evaluation,
+  boundary-MPS / CTMRG / HOTRG contraction choices, cached boundary reuse,
+  Metropolis samplers, local-energy kernels, and optimizer/preconditioner
+  utilities for tensor parameters.
+- Models in scope first: transverse-field Ising (ITF/TFI), Heisenberg, and
+  spinful Fermi-Hubbard on square/open lattices; add chain variants only where
+  they reuse the same graph/Hamiltonian machinery.
+- Sampling options: spin exchange for fixed-`S_z` Heisenberg, spin flips for
+  ITF, and spinful exchange/hopping proposals for Fermi-Hubbard preserving
+  `N_up`/`N_down`.
+- Amplitude choices: pure quimb/Symmray PEPS packed as torch parameters, with
+  optional approximate contraction (`boundary`, `ctmrg`, `hotrg`) and
+  `torch.vmap`/chunking where upstream operations support it.
+- Reuse strategy: cache row/column boundary environments and invalidate only
+  affected rows/columns after local moves; benchmark no-reuse vs reuse at
+  increasing `L`, `D`, `chi`.
+- Explicitly out of scope for Pepsy until requested: Transformer/CNN/MLP
+  backflow, NN-fTNS tensor corrections, neural Jastrow, Slater backflow, LoRA,
+  or other neural-network wavefunction layers.
+
+Implementation order:
+
+1. Keep the existing `pepsy.vmc.torch` sampler/local-energy kernels minimal and
+   backend-agnostic; harden tests against tiny ED references for ITF,
+   Heisenberg, and 2x2 Fermi-Hubbard.
+2. Add a pure torch PEPS amplitude wrapper with `forward(config_rows)` and
+   `forward_log(config_rows)` matching the sampler interface.
+3. Add local-energy drivers that combine `*_connections(...)`,
+   `local_energy_from_connections(...)`, and a PEPS amplitude model.
+4. Add boundary-reuse PEPS amplitude evaluation after the direct/batched path is
+   correct.
+5. Add a small example/notebook comparing exact dense energy, plain PEPS VMC,
+   and contraction-reuse timing.
+
 ### Validation
 
 - Package: `pytest -q tests/test_vmc_netket.py tests/test_public_api.py`
   (VMC deps guarded with `pytest.importorskip`).
+- Torch-only VMC: `pytest -q tests/test_vmc_torch.py` plus ED checks for tiny
+  ITF, Heisenberg, and Fermi-Hubbard systems as the pure PEPS wrapper lands.
 - Downstream: run
   `../pepsy_examples/fermi_hubbard/fermi_hubbard_vmc.ipynb` (the default 2×2 run
   is fast and cross-checks against ED).
@@ -241,6 +284,11 @@ example notebook.
 - Concept note: `learning/symmray.md` (fermionic amplitudes).
 - Gao et al., *Fermionic tensor network contraction for arbitrary geometries*,
   Phys. Rev. Research 7, 023193 (2025), DOI `10.1103/PhysRevResearch.7.023193`.
+- `sjdu10/vmc_torch`: <https://github.com/sjdu10/vmc_torch> (torch VMC
+  sampling/local-energy/SR and PEPS reuse reference).
+- Du, Chen, Chan, *Neuralized Fermionic Tensor Networks for Quantum Many-Body
+  Systems*: <https://arxiv.org/pdf/2506.08329> (use mechanics as reference, but
+  do not add NN-fTNS/neural ansatz scope to Pepsy unless explicitly requested).
 - Downstream plan: `../pepsy_examples/fermi_hubbard/PLAN.md`.
 
 ---
