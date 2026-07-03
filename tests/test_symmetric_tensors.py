@@ -157,6 +157,63 @@ def test_symmray_mpo_summary_and_schematic_for_z2_operator():
     assert compat_summary["bonds"] == summary["bonds"]
 
 
+def test_symmray_mps_mpo_schematics_accept_onedmap_layout():
+    """1D Symmray chain drawings should optionally render on a OneDMap grid."""
+    pytest.importorskip("matplotlib")
+    mapper = OneDMap(2, 2, mode="snake")
+    state = SymMPS.random(
+        4,
+        symmetry="Z2",
+        phys_dim={0: 1, 1: 1},
+        site_charge=site_charge_from_occupations([0] * 4),
+        bond_dim=2,
+        seed=20,
+        dtype="complex128",
+    )
+
+    mps_drawing, mps_summary = draw_symmray_mps(
+        state.tn,
+        mapper=mapper,
+        max_sites=3,
+        show_bond_labels=True,
+        show_phys_labels=True,
+        show_diagnostics=True,
+        return_summary=True,
+    )
+
+    assert hasattr(mps_drawing, "fig")
+    assert mps_summary["num_sites"] == 4
+    assert mps_drawing.ax.get_aspect() == 1.0
+    assert any("+1 sites hidden" in text.get_text() for text in mps_drawing.ax.texts)
+
+    ham = SymHamiltonian.from_edges(
+        "tfim",
+        "Z2",
+        [(0, 1), (1, 2), (2, 3)],
+        jx=-1.0,
+        hz=-0.5,
+    )
+    mpo = ham.to_mpo(L=4, compress=False)
+
+    mpo_drawing, mpo_summary = draw_symmray_mpo(
+        mpo,
+        mapper=mapper,
+        show_bond_labels=True,
+        show_phys_labels=True,
+        show_diagnostics=True,
+        return_summary=True,
+    )
+    compat_drawing = draw_symmray_peps(mpo, mapper=mapper)
+
+    assert hasattr(mpo_drawing, "fig")
+    assert hasattr(compat_drawing, "fig")
+    assert mpo_summary["num_sites"] == 4
+    assert mpo_drawing.ax.get_aspect() == 1.0
+
+    with pytest.raises(ValueError, match="does not match network length"):
+        draw_symmray_mps(state.tn, mapper=OneDMap(3, 1))
+
+
 def test_symmray_peps_summary_and_schematic_for_z2_grid():
     """Symmray PEPS drawings should expose grid bonds and block-sector metadata."""
     state = SymPEPS.random(

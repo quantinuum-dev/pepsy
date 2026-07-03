@@ -165,6 +165,9 @@ fermionic signs.
 - The returned object is a ``quimb.tensor.MatrixProductOperator`` whose tensor
   data are Symmray block-sparse arrays. Its physical index families default to
   ``k{}`` and ``b{}``, matching Pepsy's MPS/MPO conventions.
+- ``to_mpo`` assembles the symmetry-preserving MPO first. The default
+  ``compress=True`` then calls quimb MPO compression; pass ``compress=False``
+  when you want to inspect or compare the uncompressed assembled MPO exactly.
 
 ```python
 mapper = py.OneDMap(Lx=4, Ly=4, mode="snake")
@@ -293,6 +296,9 @@ count, physical charge sectors, virtual-bond sector maps, and aggregate
 block-sparse storage density. The default schematics follow the compact quimb
 style with tensor nodes, physical legs, and bond arrows; extended bond/physical
 labels and diagnostics are opt-in.
+MPS and MPO drawings also accept ``mapper=OneDMap(...)`` to place the 1D chain
+on its 2D lattice path. The mapped view keeps the charge-sector labels but uses
+site-colored nodes and quieter gray bonds instead of left/right region shading.
 For backwards-compatible notebook use, ``draw_symmray_peps`` also dispatches to
 the MPS/MPO drawers when the input is a 1D MPS or MPO object.
 
@@ -360,6 +366,27 @@ mpo_drawing = py.draw_symmray_mpo(
     show_diagnostics=True,
 )
 display(mpo_drawing.fig)
+
+mapper = py.OneDMap(Lx=2, Ly=2, mode="snake")
+mapped_mps_drawing = py.draw_symmray_mps(
+    psi.tn,
+    mapper=mapper,
+    title="Symmray ITF MPS on OneDMap",
+    show_bond_labels=True,
+    show_phys_labels=True,
+    show_diagnostics=True,
+)
+display(mapped_mps_drawing.fig)
+
+mapped_mpo_drawing = py.draw_symmray_mpo(
+    mpo,
+    mapper=mapper,
+    title="Symmray ITF MPO on OneDMap",
+    show_bond_labels=True,
+    show_phys_labels=True,
+    show_diagnostics=True,
+)
+display(mapped_mpo_drawing.fig)
 
 peps = py.SymPEPS.for_model("itf", 3, 3, bond_dim=2)
 peps_summary = py.symmray_peps_summary(peps)
