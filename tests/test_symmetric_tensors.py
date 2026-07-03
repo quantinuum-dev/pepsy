@@ -15,6 +15,7 @@ from pepsy.tensors import (
     default_physical_sectors,
     draw_symmray_blocks,
     draw_symmray_mps,
+    draw_symmray_mpo,
     draw_symmray_peps,
     sector_index_map,
     site_charge_alternating,
@@ -23,6 +24,7 @@ from pepsy.tensors import (
     site_charge_uniform,
     symmray_block_summary,
     symmray_mps_summary,
+    symmray_mpo_summary,
     symmray_peps_summary,
     symm_operator_from_dense,
 )
@@ -103,6 +105,56 @@ def test_symmray_mps_summary_and_schematic_for_z2_chain():
     assert hasattr(drawing, "fig")
     assert hasattr(drawing, "ax")
     assert drawn_summary["bonds"] == summary["bonds"]
+
+    compat_drawing, compat_summary = draw_symmray_peps(
+        state.tn,
+        return_summary=True,
+    )
+    assert hasattr(compat_drawing, "fig")
+    assert compat_summary["bonds"] == summary["bonds"]
+
+
+def test_symmray_mpo_summary_and_schematic_for_z2_operator():
+    """Symmray MPO drawings should expose upper/lower physical legs."""
+    ham = SymHamiltonian.from_edges(
+        "tfim",
+        "Z2",
+        [(0, 1)],
+        jx=-1.0,
+        hz=-0.5,
+    )
+    mpo = ham.to_mpo(L=2, compress=False)
+
+    summary = symmray_mpo_summary(mpo)
+
+    assert summary["num_sites"] == 2
+    assert summary["symmetry"] == "Z2"
+    assert summary["fermionic_ordering"]["network_kind"] == "mpo"
+    assert summary["max_bond_dim"] == 5
+    assert summary["max_bond_sectors"] == 2
+    assert summary["tensors"][0]["upper_ind"] == mpo.upper_ind(0)
+    assert summary["tensors"][0]["lower_ind"] == mpo.lower_ind(0)
+    assert summary["tensors"][0]["upper_physical"]["chargemap"] == {0: 1, 1: 1}
+    assert summary["tensors"][0]["lower_physical"]["chargemap"] == {0: 1, 1: 1}
+    assert summary["tensors"][0]["lower_physical"]["direction"] in {"in", "out"}
+    assert summary["bonds"][0]["between"] == (0, 1)
+    assert summary["bonds"][0]["left_direction"] in {"in", "out"}
+    assert summary["bonds"][0]["right_direction"] in {"in", "out"}
+
+    pytest.importorskip("matplotlib")
+    drawing, drawn_summary = draw_symmray_mpo(
+        mpo,
+        title="Z2 MPO",
+        show_phys_labels=True,
+        return_summary=True,
+    )
+    assert hasattr(drawing, "fig")
+    assert hasattr(drawing, "ax")
+    assert drawn_summary["bonds"] == summary["bonds"]
+
+    compat_drawing, compat_summary = draw_symmray_peps(mpo, return_summary=True)
+    assert hasattr(compat_drawing, "fig")
+    assert compat_summary["bonds"] == summary["bonds"]
 
 
 def test_symmray_peps_summary_and_schematic_for_z2_grid():

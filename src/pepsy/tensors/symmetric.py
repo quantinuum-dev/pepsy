@@ -15,6 +15,7 @@ __all__ += [
     "default_physical_sectors",
     "draw_symmray_blocks",
     "draw_symmray_mps",
+    "draw_symmray_mpo",
     "draw_symmray_peps",
     "sector_index_map",
     "site_charge_alternating",
@@ -23,6 +24,7 @@ __all__ += [
     "site_charge_uniform",
     "symmray_block_summary",
     "symmray_mps_summary",
+    "symmray_mpo_summary",
     "symmray_peps_summary",
     "symm_operator_from_dense",
 ]
@@ -459,6 +461,36 @@ def _as_mps_tensor_network(value):
     return value
 
 
+def _as_mpo_tensor_network(value):
+    if hasattr(value, "mpo"):
+        value = value.mpo
+    elif hasattr(value, "H_mpo"):
+        value = value.H_mpo
+    if not hasattr(value, "sites"):
+        raise TypeError("mpo must be a quimb MatrixProductOperator object.")
+    if not hasattr(value, "upper_ind") or not hasattr(value, "lower_ind"):
+        raise TypeError("mpo must expose upper_ind(site) and lower_ind(site).")
+    return value
+
+
+def _is_mpo_like(value):
+    try:
+        _as_mpo_tensor_network(value)
+    except TypeError:
+        return False
+    return True
+
+
+def _is_mps_like_not_peps(value):
+    try:
+        tn = _as_mps_tensor_network(value)
+    except TypeError:
+        return False
+    if hasattr(tn, "upper_ind") and hasattr(tn, "lower_ind"):
+        return False
+    return not (hasattr(tn, "Lx") and hasattr(tn, "Ly"))
+
+
 def _mps_sites(tn):
     sites = tuple(getattr(tn, "sites", ()))
     if not sites and hasattr(tn, "gen_sites_present"):
@@ -510,6 +542,17 @@ def _infer_fermionic(source, tensors):
     if fermionic is not None:
         return bool(fermionic)
     return any(_is_fermionic_array_data(getattr(tensor, "data", None)) for tensor in tensors)
+
+
+def _infer_symmetry(source, tensors):
+    symmetry = getattr(source, "symmetry", None)
+    if symmetry is not None:
+        return symmetry
+    for tensor in tensors:
+        symmetry = getattr(getattr(tensor, "data", None), "symmetry", None)
+        if symmetry is not None:
+            return symmetry
+    return None
 
 
 def _source_edges(source, bonds):
@@ -700,7 +743,7 @@ def symmray_mps_summary(mps):
     total_dense_size = int(sum(tensor["dense_size"] for tensor in tensors))
     total_stored_size = int(sum(tensor["stored_size"] for tensor in tensors))
     total_charge = _resolve_total_charge(source, tensors)
-    symmetry = getattr(source, "symmetry", None)
+    symmetry = _infer_symmetry(source, site_tensors)
     fermionic = _infer_fermionic(source, site_tensors)
     q_total = _resolve_q_total(symmetry, total_charge)
     return {
@@ -713,6 +756,147 @@ def symmray_mps_summary(mps):
         "fermionic_ordering": _fermionic_ordering_summary(
             source,
             network_kind="mps",
+            sites=sites,
+            bonds=bonds,
+            fermionic=fermionic,
+        ),
+        "total_charge": total_charge,
+        "charge_total": total_charge,
+        "Q_total": q_total,
+        "total_parity": _mod_charge(total_charge, 2),
+        "max_bond_dim": max((bond["dim"] for bond in bonds), default=1),
+        "max_bond_sectors": max((bond["num_sectors"] for bond in bonds), default=0),
+        "total_dense_size": total_dense_size,
+        "total_stored_size": total_stored_size,
+        "density": total_stored_size / total_dense_size if total_dense_size else 0.0,
+    }
+
+
+def symmray_mpo_summary(mpo):
+    """Return site, bond, and block metadata for a Symmray-backed MPO.
+
+    Parameters
+    ----------
+    mpo : quimb MatrixProductOperator
+        Operator whose site tensors store Symmray block-sparse arrays.
+
+    Returns
+    -------
+    dict
+        Summary with per-site tensor block counts, upper/lower physical-sector
+        maps, nearest-neighbor bond-sector maps, and aggregate storage
+        diagnostics.
+    """
+    source = mpo
+    tn = _as_mpo_tensor_network(mpo)
+    sites = _mps_sites(tn)
+
+    tensors = []
+    site_tensors = []
+    index_maps = []
+    physical_inds = []
+
+    for position, site in enumerate(sites):
+        tensor = _mps_site_tensor(tn, site)
+        array_summary = symmray_block_summary(tensor)
+        upper_ind = tn.upper_ind(site)
+        lower_ind = tn.lower_ind(site)
+
+        index_by_ind = {}
+        indices = []
+        for ind, index_summary in zip(tensor.inds, array_summary["indices"]):
+            entry = dict(index_summary)
+            entry["ind"] = ind
+            index_by_ind[ind] = entry
+            indices.append(entry)
+
+        upper_physical = index_by_ind.get(upper_ind)
+        lower_physical = index_by_ind.get(lower_ind)
+        if upper_physical is None or lower_physical is None:
+            raise ValueError(
+                f"MPO tensor for site {site!r} does not expose physical "
+                f"indices {upper_ind!r} and {lower_ind!r}."
+            )
+
+        tensors.append(
+            {
+                "position": int(position),
+                "site": site,
+                "site_tag": tn.site_tag(site) if hasattr(tn, "site_tag") else None,
+                "upper_ind": upper_ind,
+                "lower_ind": lower_ind,
+                "inds": tuple(tensor.inds),
+                "shape": array_summary["shape"],
+                "charge": array_summary["charge"],
+                "indices": indices,
+                "upper_physical": upper_physical,
+                "lower_physical": lower_physical,
+                "left_bond": None,
+                "right_bond": None,
+                "blocks": array_summary["blocks"],
+                "num_blocks": array_summary["num_blocks"],
+                "dense_size": array_summary["dense_size"],
+                "stored_size": array_summary["stored_size"],
+                "density": array_summary["density"],
+            }
+        )
+        site_tensors.append(tensor)
+        index_maps.append(index_by_ind)
+        physical_inds.append((upper_ind, lower_ind))
+
+    bonds = []
+    for position, (site_l, site_r) in enumerate(zip(sites[:-1], sites[1:])):
+        excluded = (
+            physical_inds[position][0],
+            physical_inds[position][1],
+            physical_inds[position + 1][0],
+            physical_inds[position + 1][1],
+        )
+        ind = _shared_virtual_ind(
+            site_tensors[position],
+            site_tensors[position + 1],
+            excluded,
+        )
+        if ind is None:
+            continue
+        left_index = index_maps[position].get(ind)
+        right_index = index_maps[position + 1].get(ind)
+        index_summary = left_index or right_index
+        bond = {
+            "position": int(position),
+            "left_position": int(position),
+            "right_position": int(position + 1),
+            "left_site": site_l,
+            "right_site": site_r,
+            "between": (site_l, site_r),
+            "ind": ind,
+            "left_direction": left_index["direction"] if left_index is not None else None,
+            "right_direction": right_index["direction"] if right_index is not None else None,
+            "dim": index_summary["dim"],
+            "num_sectors": index_summary["num_sectors"],
+            "chargemap": index_summary["chargemap"],
+            "sectors": index_summary["sectors"],
+        }
+        bonds.append(bond)
+        tensors[position]["right_bond"] = bond
+        tensors[position + 1]["left_bond"] = bond
+
+    total_dense_size = int(sum(tensor["dense_size"] for tensor in tensors))
+    total_stored_size = int(sum(tensor["stored_size"] for tensor in tensors))
+    total_charge = _resolve_total_charge(source, tensors)
+    symmetry = _infer_symmetry(source, site_tensors)
+    fermionic = _infer_fermionic(source, site_tensors)
+    q_total = _resolve_q_total(symmetry, total_charge)
+    return {
+        "num_sites": len(sites),
+        "sites": sites,
+        "tensors": tensors,
+        "bonds": bonds,
+        "symmetry": symmetry,
+        "fermionic": fermionic,
+        "fermionic_ordering": _fermionic_ordering_summary(
+            source,
+            network_kind="mpo",
             sites=sites,
             bonds=bonds,
             fermionic=fermionic,
@@ -1300,6 +1484,422 @@ def draw_symmray_mps(
     return drawing
 
 
+def draw_symmray_mpo(
+    mpo,
+    *,
+    ax=None,
+    title=None,
+    max_sites=None,
+    center="middle",
+    highlight_pair=False,
+    show_regions=False,
+    show_arrows=True,
+    show_leg_chargemaps=True,
+    show_bond_labels=False,
+    show_phys_labels=False,
+    show_tensor_labels=True,
+    show_diagnostics=False,
+    show_blocks=False,
+    show_block_labels=False,
+    max_blocks_per_site=4,
+    node_shape="circle",
+    node_radius=0.24,
+    figsize=None,
+    return_summary=False,
+):
+    """Draw a block-aware MPO schematic for a Symmray-backed MPO.
+
+    The diagram uses the same compact 1D style as ``draw_symmray_mps`` but
+    shows both operator physical legs at each site: upper/output and
+    lower/input.
+    """
+    summary = symmray_mpo_summary(mpo)
+    max_blocks_per_site = int(max_blocks_per_site)
+    if max_blocks_per_site < 1:
+        raise ValueError("max_blocks_per_site must be >= 1.")
+    if max_sites is None:
+        shown_tensors = list(summary["tensors"])
+    else:
+        max_sites = int(max_sites)
+        if max_sites < 1:
+            raise ValueError("max_sites must be >= 1.")
+        shown_tensors = list(summary["tensors"][:max_sites])
+
+    shown_positions = {tensor["position"] for tensor in shown_tensors}
+    center_position = _resolve_mps_position(shown_tensors, center, name="center")
+    pair_right_position = None
+    if highlight_pair and center_position is not None:
+        candidate = center_position + 1
+        if candidate in shown_positions:
+            pair_right_position = candidate
+    shown_bonds = [
+        bond
+        for bond in summary["bonds"]
+        if bond["left_position"] in shown_positions
+        and bond["right_position"] in shown_positions
+    ]
+
+    try:
+        from quimb import schematic  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - quimb is a declared dep
+        raise ImportError("draw_symmray_mpo requires quimb.schematic.") from exc
+
+    try:
+        from matplotlib.patches import Rectangle  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:  # pragma: no cover - plotting optionality
+        raise ImportError("draw_symmray_mpo requires matplotlib.") from exc
+
+    n_show = len(shown_tensors)
+    detailed_labels = bool(show_leg_chargemaps and (show_bond_labels or show_phys_labels))
+    spacing = 1.72 if detailed_labels and n_show <= 12 else (1.32 if detailed_labels else 1.08)
+    if figsize is None:
+        height = 4.25
+        if show_bond_labels or show_phys_labels or show_blocks:
+            height = 5.45 if detailed_labels else 4.65
+        if show_block_labels:
+            height += 0.35
+        if show_diagnostics:
+            height += 0.15
+        figsize = (max(7.0, spacing * max(1, n_show - 1) + 3.0), height)
+
+    presets = {
+        "bond": {
+            "color": (0.12, 0.14, 0.16, 1.0),
+            "linewidth": 3.0,
+        },
+        "phys": {
+            "color": (0.12, 0.14, 0.16, 1.0),
+            "linewidth": 1.55,
+        },
+        "center": {
+            "color": schematic.get_color("orange"),
+            "hatch": "/////",
+            "linewidth": 1.3,
+            "edgecolor": (0.55, 0.38, 0.00, 1.0),
+        },
+        "left": {
+            "color": schematic.get_color("bluedark"),
+            "linewidth": 1.3,
+            "edgecolor": (0.02, 0.22, 0.34, 1.0),
+        },
+        "right": {
+            "color": schematic.get_color("blue"),
+            "linewidth": 1.3,
+            "edgecolor": (0.05, 0.34, 0.50, 1.0),
+        },
+        "pair": {
+            "facecolor": (0.20, 0.80, 0.50, 0.34),
+            "edgecolor": (0.18, 0.50, 0.30, 0.72),
+            "linestyle": ":",
+            "linewidth": 1.5,
+        },
+        "region": {
+            "facecolor": (0.83, 0.83, 0.83, 0.42),
+            "edgecolor": (0.42, 0.42, 0.42, 0.72),
+            "linestyle": ":",
+            "linewidth": 1.4,
+        },
+    }
+    drawing = schematic.Drawing(presets=presets, ax=ax, figsize=figsize)
+
+    x_by_position = {
+        tensor["position"]: i * spacing
+        for i, tensor in enumerate(shown_tensors)
+    }
+    y0 = 0.0
+    upper_y = 0.72
+    lower_y = -0.72
+    block_y = -1.25 if show_phys_labels else -1.05
+    max_dim = max((bond["dim"] for bond in shown_bonds), default=1)
+
+    if center_position is not None:
+        right_region_start = (
+            pair_right_position + 1
+            if pair_right_position is not None
+            else center_position + 1
+        )
+        left_region = [
+            (x_by_position[tensor["position"]], y0)
+            for tensor in shown_tensors
+            if tensor["position"] < center_position
+        ]
+        right_region = [
+            (x_by_position[tensor["position"]], y0)
+            for tensor in shown_tensors
+            if tensor["position"] >= right_region_start
+        ]
+        if show_regions and left_region:
+            drawing.patch_around(left_region, radius=0.46, preset="region", zorder=0)
+            drawing.text(
+                (left_region[-1][0] - 0.25 * spacing, 1.42),
+                "LEFT",
+                fontsize=12,
+                color=(0.18, 0.19, 0.21, 1.0),
+                ha="center",
+            )
+        if show_regions and right_region:
+            drawing.patch_around(right_region, radius=0.46, preset="region", zorder=0)
+            drawing.text(
+                (right_region[0][0] + 0.35 * spacing, 1.42),
+                "RIGHT",
+                fontsize=12,
+                color=(0.18, 0.19, 0.21, 1.0),
+                ha="center",
+            )
+        if show_regions and pair_right_position is not None:
+            drawing.patch_around_circles(
+                (x_by_position[center_position], y0),
+                node_radius + 0.04,
+                (x_by_position[pair_right_position], y0),
+                node_radius + 0.04,
+                padding=0.22,
+                preset="pair",
+                zorder=0,
+            )
+
+    for bond in shown_bonds:
+        x0 = x_by_position[bond["left_position"]]
+        x1 = x_by_position[bond["right_position"]]
+        width = 2.4 + 1.2 * (bond["dim"] / max_dim)
+        drawing.line((x0, y0), (x1, y0), preset="bond", linewidth=width, zorder=1)
+
+        if show_arrows:
+            if center_position is None:
+                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.10)
+            elif bond["right_position"] <= center_position:
+                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.10)
+            elif (
+                pair_right_position is not None
+                and bond["left_position"] >= pair_right_position
+            ) or (
+                pair_right_position is None
+                and bond["left_position"] >= center_position
+            ):
+                drawing.arrowhead((x1, y0), (x0, y0), preset="bond", center=0.58, width=0.10)
+
+        if show_bond_labels:
+            mid = 0.5 * (x0 + x1)
+            flow = _flow_math(bond.get("left_direction"), bond.get("right_direction"))
+            if flow:
+                label = rf"$e_{{{bond['position']}}}: {flow}, \chi={bond['dim']}$"
+            else:
+                label = rf"$e_{{{bond['position']}}}: \chi={bond['dim']}$"
+            if show_leg_chargemaps:
+                label += "\n" + rf"$q_e:$ {_format_compact_mapping(bond['chargemap'], max_items=4)}"
+            drawing.text(
+                (mid, 0.30),
+                label,
+                fontsize=6.6,
+                ha="center",
+                va="bottom",
+                color=(0.18, 0.20, 0.23, 1.0),
+                zorder=5,
+            )
+
+    show_block_labels = bool(show_block_labels)
+    for tensor in shown_tensors:
+        x_pos = x_by_position[tensor["position"]]
+        position = tensor["position"]
+        if position == center_position:
+            preset = "center"
+        elif pair_right_position is not None and position == pair_right_position:
+            preset = "right"
+        elif center_position is not None and position < center_position:
+            preset = "left"
+        else:
+            preset = "right"
+
+        if node_shape == "circle":
+            drawing.circle((x_pos, y0), radius=node_radius, preset=preset, zorder=3)
+        elif node_shape == "cube":
+            drawing.cube((x_pos, y0, 0.0), preset=preset, zorder=3)
+        else:
+            raise ValueError("node_shape must be 'circle' or 'cube'.")
+
+        drawing.line((x_pos, y0), (x_pos, upper_y), preset="phys", zorder=1)
+        drawing.line((x_pos, y0), (x_pos, lower_y), preset="phys", zorder=1)
+        if show_arrows:
+            drawing.arrowhead((x_pos, y0), (x_pos, upper_y), preset="phys", center=0.56, width=0.09)
+            drawing.arrowhead((x_pos, lower_y), (x_pos, y0), preset="phys", center=0.56, width=0.09)
+        for y_pos in (upper_y, lower_y):
+            drawing.dot(
+                (x_pos, y_pos),
+                color=(0.12, 0.14, 0.16, 1.0),
+                radius=0.028,
+                zorder=2,
+            )
+
+        if show_tensor_labels:
+            label_lines = [rf"$W_{{{tensor['site']}}}$"]
+            if tensor["charge"] is not None:
+                label_lines.append(rf"$q={_format_charge(tensor['charge'])}$")
+            if not show_blocks:
+                label_lines.append(rf"$B={tensor['num_blocks']}$")
+            label = "\n".join(label_lines)
+            label_color = (
+                schematic.get_color("orange")
+                if position == center_position
+                else (0.06, 0.20, 0.30, 1.0)
+            )
+            drawing.text(
+                (x_pos, 1.02),
+                label,
+                fontsize=8.5,
+                ha="center",
+                va="bottom",
+                color=label_color,
+                zorder=5,
+            )
+
+        if show_phys_labels:
+            upper = tensor["upper_physical"]
+            lower = tensor["lower_physical"]
+            upper_label = (
+                rf"$u_{{{tensor['site']}}}: \mathrm{{{upper['direction']}}}, d={upper['dim']}$"
+            )
+            lower_label = (
+                rf"$l_{{{tensor['site']}}}: \mathrm{{{lower['direction']}}}, d={lower['dim']}$"
+            )
+            if show_leg_chargemaps:
+                upper_label += "\n" + rf"$q_u:$ {_format_compact_mapping(upper['chargemap'], max_items=4)}"
+                lower_label += "\n" + rf"$q_l:$ {_format_compact_mapping(lower['chargemap'], max_items=4)}"
+            drawing.text(
+                (x_pos, upper_y + 0.14),
+                upper_label,
+                fontsize=6.4,
+                ha="center",
+                va="bottom",
+                color=(0.18, 0.20, 0.23, 1.0),
+            )
+            drawing.text(
+                (x_pos, lower_y - 0.14),
+                lower_label,
+                fontsize=6.4,
+                ha="center",
+                va="top",
+                color=(0.18, 0.20, 0.23, 1.0),
+            )
+
+        if show_blocks and tensor["blocks"]:
+            blocks = tensor["blocks"][:max_blocks_per_site]
+            block_width = 0.18
+            block_height = 0.14
+            gap = 0.035
+            total_width = len(blocks) * block_width + (len(blocks) - 1) * gap
+            start = x_pos - 0.5 * total_width
+            for block_pos, block in enumerate(blocks):
+                bx = start + block_pos * (block_width + gap)
+                color = schematic.hash_to_color(str(block["sector"]))
+                drawing.ax.add_patch(
+                    Rectangle(
+                        (bx, block_y),
+                        block_width,
+                        block_height,
+                        facecolor=color,
+                        edgecolor=(0.16, 0.18, 0.21, 0.75),
+                        alpha=0.86,
+                        linewidth=0.65,
+                        zorder=4,
+                    )
+                )
+                if show_block_labels:
+                    drawing.ax.text(
+                        bx + 0.5 * block_width,
+                        block_y - 0.045,
+                        _format_sector(block["sector"]),
+                        fontsize=5.2,
+                        ha="center",
+                        va="top",
+                        rotation=45,
+                        color=(0.15, 0.17, 0.20, 1.0),
+                    )
+            drawing.ax.text(
+                x_pos,
+                block_y + block_height + 0.025,
+                rf"$B={tensor['num_blocks']}$",
+                fontsize=6.5,
+                ha="center",
+                va="bottom",
+                color=(0.15, 0.17, 0.20, 1.0),
+                bbox={
+                    "boxstyle": "round,pad=0.06",
+                    "facecolor": (1.0, 1.0, 1.0, 0.78),
+                    "edgecolor": (1.0, 1.0, 1.0, 0.0),
+                    "linewidth": 0.0,
+                },
+                zorder=5,
+            )
+
+    last_x = x_by_position[shown_tensors[-1]["position"]] if shown_tensors else 0.0
+    right_pad = 0.75
+    if show_diagnostics:
+        charge_line = _charge_summary_text(summary)
+        diagnostic_lines = [f"sites {summary['num_sites']}"]
+        if charge_line:
+            diagnostic_lines.append(charge_line)
+        diagnostic_lines += [
+            f"max bond {summary['max_bond_dim']}",
+            f"bond sectors {summary['max_bond_sectors']}",
+            f"stored {summary['total_stored_size']}/{summary['total_dense_size']}",
+            f"density {summary['density']:.3f}",
+        ]
+        diagnostic = "\n".join(diagnostic_lines)
+        if show_blocks:
+            diagnostic += "\ncolored tiles: stored blocks"
+        if show_arrows:
+            diagnostic += "\narrows/labels: charge in/out flow"
+        if len(shown_tensors) < summary["num_sites"]:
+            diagnostic += f"\n+{summary['num_sites'] - len(shown_tensors)} sites hidden"
+        drawing.ax.text(
+            last_x + 0.82,
+            0.62,
+            diagnostic,
+            fontsize=8,
+            ha="left",
+            va="top",
+            color=(0.15, 0.17, 0.20, 1.0),
+            bbox={
+                "boxstyle": "round,pad=0.22",
+                "facecolor": (1.0, 1.0, 1.0, 0.92),
+                "edgecolor": (0.68, 0.70, 0.74, 1.0),
+                "linewidth": 0.8,
+            },
+        )
+        right_pad = 1.80
+    elif len(shown_tensors) < summary["num_sites"]:
+        drawing.text(
+            (last_x + 0.55, y0),
+            f"+{summary['num_sites'] - len(shown_tensors)}",
+            fontsize=9,
+            ha="left",
+            va="center",
+            color=(0.18, 0.20, 0.23, 1.0),
+        )
+        right_pad = 1.10
+
+    if title is None:
+        title = "Symmray MPO block structure"
+    drawing.ax.set_title(title)
+    charge_text = _charge_summary_text(summary)
+    if charge_text and not show_diagnostics:
+        drawing.text(
+            (-0.55, 1.38),
+            charge_text,
+            fontsize=8,
+            ha="left",
+            va="center",
+            color=(0.18, 0.20, 0.23, 1.0),
+        )
+    drawing.ax.set_xlim(-0.65, last_x + right_pad)
+    y_min = -1.72 if (show_phys_labels or show_blocks or show_block_labels) else -1.02
+    y_max = 1.92 if (show_phys_labels or detailed_labels) else 1.42
+    drawing.ax.set_ylim(y_min, y_max)
+    drawing.ax.axis("off")
+    if return_summary:
+        return drawing, summary
+    return drawing
+
+
 def _as_peps_tensor_network(value):
     if hasattr(value, "tn"):
         value = value.tn
@@ -1631,6 +2231,50 @@ def draw_symmray_peps(
     default; set ``show_extra_bonds=True`` to debug all shared virtual indices,
     including non-lattice and multibond indices introduced by routing/gauges.
     """
+    if _is_mpo_like(peps):
+        return draw_symmray_mpo(
+            peps,
+            ax=ax,
+            title=title,
+            max_sites=max_sites,
+            center=center,
+            show_arrows=show_arrows,
+            show_leg_chargemaps=show_leg_chargemaps,
+            show_bond_labels=show_bond_labels,
+            show_phys_labels=show_phys_labels,
+            show_tensor_labels=show_tensor_labels,
+            show_diagnostics=show_diagnostics,
+            show_blocks=show_blocks,
+            show_block_labels=show_block_labels,
+            max_blocks_per_site=max_blocks_per_site,
+            node_shape=node_shape,
+            node_radius=node_radius,
+            figsize=figsize,
+            return_summary=return_summary,
+        )
+    if _is_mps_like_not_peps(peps):
+        return draw_symmray_mps(
+            peps,
+            ax=ax,
+            title=title,
+            max_sites=max_sites,
+            center=center,
+            show_regions=show_region,
+            show_arrows=show_arrows,
+            show_leg_chargemaps=show_leg_chargemaps,
+            show_bond_labels=show_bond_labels,
+            show_phys_labels=show_phys_labels,
+            show_tensor_labels=show_tensor_labels,
+            show_diagnostics=show_diagnostics,
+            show_blocks=show_blocks,
+            show_block_labels=show_block_labels,
+            max_blocks_per_site=max_blocks_per_site,
+            node_shape=node_shape,
+            node_radius=node_radius,
+            figsize=figsize,
+            return_summary=return_summary,
+        )
+
     summary = symmray_peps_summary(peps)
     max_blocks_per_site = int(max_blocks_per_site)
     if max_blocks_per_site < 1:

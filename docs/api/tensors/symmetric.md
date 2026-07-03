@@ -286,12 +286,15 @@ dimensions of any Symmray-backed local operator or tensor. Use
 same information, including the stored-vs-dense entry count.
 
 For whole MPS states, use ``symmray_mps_summary`` and ``draw_symmray_mps``. For
-PEPS, use ``symmray_peps_summary`` and ``draw_symmray_peps``. These expose the
-scientific structure that is usually hidden in a dense drawing: each site
-tensor's block count, physical charge sectors, virtual-bond sector maps, and
-aggregate block-sparse storage density. The default schematics follow the
-compact quimb style with tensor nodes, physical legs, and bond arrows; extended
-bond/physical labels and diagnostics are opt-in.
+MPOs, use ``symmray_mpo_summary`` and ``draw_symmray_mpo``. For PEPS, use
+``symmray_peps_summary`` and ``draw_symmray_peps``. These expose the scientific
+structure that is usually hidden in a dense drawing: each site tensor's block
+count, physical charge sectors, virtual-bond sector maps, and aggregate
+block-sparse storage density. The default schematics follow the compact quimb
+style with tensor nodes, physical legs, and bond arrows; extended bond/physical
+labels and diagnostics are opt-in.
+For backwards-compatible notebook use, ``draw_symmray_peps`` also dispatches to
+the MPS/MPO drawers when the input is a 1D MPS or MPO object.
 
 In the detailed drawing mode, ``T_i`` is the site tensor, ``B`` is the number of
 stored block sectors, and ``e_i`` is a virtual bond. PEPS node circles show
@@ -343,6 +346,20 @@ detailed_mps_drawing = py.draw_symmray_mps(
     show_diagnostics=True,
 )
 display(detailed_mps_drawing.fig)
+
+ham = py.SymHamiltonian.from_edges("tfim", "Z2", [(0, 1), (1, 2), (2, 3)])
+mpo = ham.to_mpo(L=4)
+mpo_summary = py.symmray_mpo_summary(mpo)
+mpo_summary["bonds"]
+
+mpo_drawing = py.draw_symmray_mpo(
+    mpo,
+    title="Symmray ITF MPO",
+    show_bond_labels=True,
+    show_phys_labels=True,
+    show_diagnostics=True,
+)
+display(mpo_drawing.fig)
 
 peps = py.SymPEPS.for_model("itf", 3, 3, bond_dim=2)
 peps_summary = py.symmray_peps_summary(peps)
