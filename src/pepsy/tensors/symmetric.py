@@ -711,15 +711,32 @@ def _resolve_chain_mapper(mapper, summary, *, name="mapper"):
 
 def _mapped_site_color(colormaps, cmap_name, position, num_sites):
     cmap_key = str(cmap_name).strip().lower()
-    if cmap_key in {"auto", "hash", "quimb"}:
+    if cmap_key in {"auto", "quimb", "quimb-green", "green"}:
         from quimb import schematic  # pylint: disable=import-outside-toplevel
 
-        return schematic.hash_to_color(f"I{int(position)}")
+        return _lighten_rgba(schematic.get_color("green"), amount=0.52)
+    if cmap_key == "hash":
+        from quimb import schematic  # pylint: disable=import-outside-toplevel
+
+        return _lighten_rgba(schematic.hash_to_color(f"I{int(position)}"), amount=0.46)
     cmap = colormaps.get_cmap(cmap_name)
     colors = getattr(cmap, "colors", None)
     if colors is not None and len(colors) > 0:
         return cmap(int(position) % len(colors))
     return cmap(int(position) / max(1, int(num_sites) - 1))
+
+
+def _lighten_rgba(color, *, amount=0.45):
+    from matplotlib.colors import to_rgba  # pylint: disable=import-outside-toplevel
+
+    red, green, blue, alpha = to_rgba(color)
+    amount = min(max(float(amount), 0.0), 1.0)
+    return (
+        red + (1.0 - red) * amount,
+        green + (1.0 - green) * amount,
+        blue + (1.0 - blue) * amount,
+        alpha,
+    )
 
 
 def _mapped_contrast_text_color(color):
@@ -763,9 +780,8 @@ def _mapped_charge_spin_lines(charge):
 
 
 def _mapped_tensor_label_lines(tensor, *, kind):
-    lines = [rf"${kind}_{{{tensor['site']}}}$"]
-    lines.extend(_mapped_charge_spin_lines(tensor.get("charge")))
-    return lines
+    _ = kind
+    return _mapped_charge_spin_lines(tensor.get("charge"))
 
 
 def _mapped_bond_label(bond, *, show_leg_chargemaps):
@@ -1316,7 +1332,7 @@ def _draw_symmray_mps_mapped(
 ):
     coords_by_position = _resolve_chain_mapper(mapper, summary)
     spacing = 1.28
-    node_radius = max(float(node_radius), 0.31) if show_tensor_labels else float(node_radius)
+    node_radius = float(node_radius)
     xy_by_position = {
         tensor["position"]: (
             coords_by_position[tensor["position"]][0] * spacing,
@@ -1402,8 +1418,8 @@ def _draw_symmray_mps_mapped(
                     stop,
                     preset="bond",
                     center=0.58,
-                    width=0.060,
-                    length=0.12,
+                    width=0.040,
+                    length=0.085,
                     zorder=2,
                 )
 
@@ -1469,7 +1485,7 @@ def _draw_symmray_mps_mapped(
         else:
             raise ValueError("node_shape must be 'circle' or 'cube'.")
 
-        phys_xy = (x_pos - 0.30, y_pos - 0.42)
+        phys_xy = (x_pos - 0.22, y_pos - 0.30)
         drawing.line(
             (x_pos, y_pos),
             phys_xy,
@@ -1483,30 +1499,25 @@ def _draw_symmray_mps_mapped(
                 (x_pos, y_pos),
                 preset="phys",
                 center=0.57,
-                width=0.065,
-                length=0.12,
+                width=0.034,
+                length=0.070,
                 zorder=2,
             )
-        drawing.dot(
-            phys_xy,
-            color=(0.31, 0.34, 0.38, 1.0),
-            radius=0.023,
-            zorder=2,
-        )
 
         if show_tensor_labels:
             label_lines = _mapped_tensor_label_lines(tensor, kind="T")
-            drawing.text(
-                (x_pos, y_pos),
-                "\n".join(label_lines),
-                fontsize=5.9 if len(label_lines) > 2 else 6.5,
-                ha="center",
-                va="center",
-                color=_mapped_contrast_text_color(facecolor),
-                fontweight="bold",
-                linespacing=0.84,
-                zorder=7,
-            )
+            if label_lines:
+                drawing.text(
+                    (x_pos, y_pos),
+                    "\n".join(label_lines),
+                    fontsize=5.2 if len(label_lines) > 1 else 5.8,
+                    ha="center",
+                    va="center",
+                    color=_mapped_contrast_text_color(facecolor),
+                    fontweight="bold",
+                    linespacing=0.84,
+                    zorder=7,
+                )
 
         physical = tensor["physical"]
         if show_phys_labels:
@@ -1835,9 +1846,9 @@ def draw_symmray_mps(
 
         if show_arrows:
             if center_position is None:
-                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.10)
+                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.055, length=0.11)
             elif bond["right_position"] <= center_position:
-                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.10)
+                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.055, length=0.11)
             elif (
                 pair_right_position is not None
                 and bond["left_position"] >= pair_right_position
@@ -1845,7 +1856,7 @@ def draw_symmray_mps(
                 pair_right_position is None
                 and bond["left_position"] >= center_position
             ):
-                drawing.arrowhead((x1, y0), (x0, y0), preset="bond", center=0.58, width=0.10)
+                drawing.arrowhead((x1, y0), (x0, y0), preset="bond", center=0.58, width=0.055, length=0.11)
 
         mid = 0.5 * (x0 + x1)
         if show_bond_labels:
@@ -1899,14 +1910,9 @@ def draw_symmray_mps(
                 (x_pos, y0),
                 preset="phys",
                 center=0.55,
-                width=0.09,
+                width=0.040,
+                length=0.080,
             )
-        drawing.dot(
-            (x_pos, phys_y),
-            color=(0.12, 0.14, 0.16, 1.0),
-            radius=0.028,
-            zorder=2,
-        )
 
         if show_tensor_labels:
             label_lines = [rf"$T_{{{tensor['site']}}}$"]
@@ -2095,7 +2101,7 @@ def _draw_symmray_mpo_mapped(
 ):
     coords_by_position = _resolve_chain_mapper(mapper, summary)
     spacing = 1.28
-    node_radius = max(float(node_radius), 0.31) if show_tensor_labels else float(node_radius)
+    node_radius = float(node_radius)
     xy_by_position = {
         tensor["position"]: (
             coords_by_position[tensor["position"]][0] * spacing,
@@ -2181,8 +2187,8 @@ def _draw_symmray_mpo_mapped(
                     stop,
                     preset="bond",
                     center=0.58,
-                    width=0.060,
-                    length=0.12,
+                    width=0.040,
+                    length=0.085,
                     zorder=2,
                 )
 
@@ -2248,8 +2254,8 @@ def _draw_symmray_mpo_mapped(
         else:
             raise ValueError("node_shape must be 'circle' or 'cube'.")
 
-        upper_xy = (x_pos - 0.30, y_pos + 0.42)
-        lower_xy = (x_pos + 0.30, y_pos - 0.42)
+        upper_xy = (x_pos - 0.22, y_pos + 0.30)
+        lower_xy = (x_pos + 0.22, y_pos - 0.30)
         drawing.line(
             (x_pos, y_pos),
             upper_xy,
@@ -2270,8 +2276,8 @@ def _draw_symmray_mpo_mapped(
                 upper_xy,
                 preset="phys",
                 center=0.57,
-                width=0.065,
-                length=0.12,
+                width=0.034,
+                length=0.070,
                 zorder=2,
             )
             drawing.arrowhead(
@@ -2279,31 +2285,25 @@ def _draw_symmray_mpo_mapped(
                 (x_pos, y_pos),
                 preset="phys",
                 center=0.57,
-                width=0.065,
-                length=0.12,
-                zorder=2,
-            )
-        for phys_xy in (upper_xy, lower_xy):
-            drawing.dot(
-                phys_xy,
-                color=(0.31, 0.34, 0.38, 1.0),
-                radius=0.023,
+                width=0.034,
+                length=0.070,
                 zorder=2,
             )
 
         if show_tensor_labels:
             label_lines = _mapped_tensor_label_lines(tensor, kind="W")
-            drawing.text(
-                (x_pos, y_pos),
-                "\n".join(label_lines),
-                fontsize=5.9 if len(label_lines) > 2 else 6.5,
-                ha="center",
-                va="center",
-                color=_mapped_contrast_text_color(facecolor),
-                fontweight="bold",
-                linespacing=0.84,
-                zorder=7,
-            )
+            if label_lines:
+                drawing.text(
+                    (x_pos, y_pos),
+                    "\n".join(label_lines),
+                    fontsize=5.2 if len(label_lines) > 1 else 5.8,
+                    ha="center",
+                    va="center",
+                    color=_mapped_contrast_text_color(facecolor),
+                    fontweight="bold",
+                    linespacing=0.84,
+                    zorder=7,
+                )
 
         if show_phys_labels:
             upper = tensor["upper_physical"]
@@ -2639,9 +2639,9 @@ def draw_symmray_mpo(
 
         if show_arrows:
             if center_position is None:
-                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.10)
+                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.055, length=0.11)
             elif bond["right_position"] <= center_position:
-                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.10)
+                drawing.arrowhead((x0, y0), (x1, y0), preset="bond", center=0.58, width=0.055, length=0.11)
             elif (
                 pair_right_position is not None
                 and bond["left_position"] >= pair_right_position
@@ -2649,7 +2649,7 @@ def draw_symmray_mpo(
                 pair_right_position is None
                 and bond["left_position"] >= center_position
             ):
-                drawing.arrowhead((x1, y0), (x0, y0), preset="bond", center=0.58, width=0.10)
+                drawing.arrowhead((x1, y0), (x0, y0), preset="bond", center=0.58, width=0.055, length=0.11)
 
         if show_bond_labels:
             mid = 0.5 * (x0 + x1)
@@ -2693,16 +2693,22 @@ def draw_symmray_mpo(
         drawing.line((x_pos, y0), (x_pos, upper_y), preset="phys", zorder=1)
         drawing.line((x_pos, y0), (x_pos, lower_y), preset="phys", zorder=1)
         if show_arrows:
-            drawing.arrowhead((x_pos, y0), (x_pos, upper_y), preset="phys", center=0.56, width=0.09)
-            drawing.arrowhead((x_pos, lower_y), (x_pos, y0), preset="phys", center=0.56, width=0.09)
-        for y_pos in (upper_y, lower_y):
-            drawing.dot(
-                (x_pos, y_pos),
-                color=(0.12, 0.14, 0.16, 1.0),
-                radius=0.028,
-                zorder=2,
+            drawing.arrowhead(
+                (x_pos, y0),
+                (x_pos, upper_y),
+                preset="phys",
+                center=0.56,
+                width=0.040,
+                length=0.080,
             )
-
+            drawing.arrowhead(
+                (x_pos, lower_y),
+                (x_pos, y0),
+                preset="phys",
+                center=0.56,
+                width=0.040,
+                length=0.080,
+            )
         if show_tensor_labels:
             label_lines = [rf"$W_{{{tensor['site']}}}$"]
             if tensor["charge"] is not None:
@@ -3374,7 +3380,7 @@ def draw_symmray_peps(
                 dist_b = _peps_site_distance(bond["site_b"], center_site)
                 if dist_a < dist_b:
                     start, stop = xy_b, xy_a
-            drawing.arrowhead(start, stop, preset="bond", center=0.58, width=0.10)
+            drawing.arrowhead(start, stop, preset="bond", center=0.58, width=0.055, length=0.11)
 
         if show_bond_labels or show_bond_sectors:
             mid = (0.5 * (xy_a[0] + xy_b[0]), 0.5 * (xy_a[1] + xy_b[1]))
@@ -3441,16 +3447,17 @@ def draw_symmray_peps(
                 zorder=4,
             )
 
-        phys_xy = (x_pos - 0.30, y_pos - 0.42)
+        phys_xy = (x_pos - 0.24, y_pos - 0.34)
         drawing.line((x_pos, y_pos), phys_xy, preset="phys", zorder=1)
         if show_arrows:
-            drawing.arrowhead(phys_xy, (x_pos, y_pos), preset="phys", center=0.56, width=0.08)
-        drawing.dot(
-            phys_xy,
-            color=(0.12, 0.14, 0.16, 1.0),
-            radius=0.025,
-            zorder=2,
-        )
+            drawing.arrowhead(
+                phys_xy,
+                (x_pos, y_pos),
+                preset="phys",
+                center=0.56,
+                width=0.038,
+                length=0.075,
+            )
 
         if show_tensor_labels:
             label_lines = [rf"$T_{{({site[0]},{site[1]})}}$"]

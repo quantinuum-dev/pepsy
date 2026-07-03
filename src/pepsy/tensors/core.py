@@ -488,7 +488,7 @@ class OneDMap:
         title=None,
         show_order=True,
         path_cmap="plasma",
-        node_radius=0.19,
+        node_radius=0.16,
         figsize=None,
     ):
         try:
@@ -513,18 +513,18 @@ class OneDMap:
 
         presets = {
             "lattice": {
-                "color": (0.72, 0.76, 0.80, 1.0),
-                "linewidth": 1.8,
+                "color": (0.78, 0.82, 0.84, 1.0),
+                "linewidth": 1.35,
             },
             "node": {
-                "facecolor": schematic.get_color("blue"),
+                "facecolor": (0.67, 0.86, 0.72, 1.0),
                 "edgecolor": "white",
                 "linewidth": 1.2,
                 "radius": node_radius,
             },
             "label": {
-                "color": "white",
-                "fontsize": 9,
+                "color": (0.08, 0.16, 0.12, 1.0),
+                "fontsize": 8,
                 "ha": "center",
                 "va": "center",
             },
@@ -550,8 +550,15 @@ class OneDMap:
         cmap = colormaps.get_cmap(path_cmap)
         for idx, (coord0, coord1) in enumerate(zip(coords[:-1], coords[1:])):
             color = cmap(idx / max(1, len(coords) - 2))
-            drawing.line(coord0, coord1, color=color, linewidth=3.2)
-            drawing.arrowhead(coord0, coord1, color=color, center=0.56, width=0.11)
+            drawing.line(coord0, coord1, color=color, linewidth=2.35)
+            drawing.arrowhead(
+                coord0,
+                coord1,
+                color=color,
+                center=0.56,
+                width=0.052,
+                length=0.105,
+            )
 
         for coord, idx in lattice_to_one_d.items():
             drawing.circle(coord, preset="node")
@@ -591,7 +598,7 @@ class OneDMap:
         title=None,
         show_order=True,
         path_cmap="plasma",
-        node_radius=0.19,
+        node_radius=0.16,
         figsize=None,
     ):
         """Render a schematic illustration of 1D<->lattice mapping.
