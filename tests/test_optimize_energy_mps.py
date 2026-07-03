@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 
 import pepsy
 from pepsy.optimizers import EnergyEstimate, MpsEnergyOptimizer
@@ -93,6 +94,29 @@ def test_mps_energy_returns_full_and_per_site_estimate():
     assert estimate.chi == 3
     assert estimate.boundary_mode == "exact"
     assert estimate.as_dict()["energy"] == pytest.approx(8.0)
+
+
+def test_mps_energy_accepts_mpo_hamiltonian():
+    """MPO Hamiltonians should contract as <psi|H|psi>."""
+    mps = qtn.MPS_computational_state("01")
+    z_op = np.diag([1.0, -1.0])
+    mpo = qtn.MPO_product_operator(
+        [z_op, z_op],
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+    )
+    opt = MpsEnergyOptimizer(
+        mps,
+        mpo,
+        energy_per_site=False,
+        real=True,
+    )
+
+    estimate = opt.energy()
+
+    assert estimate.energy == pytest.approx(-1.0)
+    assert estimate.energy_per_site == pytest.approx(-0.5)
+    assert estimate.boundary_mode == "exact"
 
 
 def test_mps_energy_accepts_wrapper_and_local_ham_payload_mapping():

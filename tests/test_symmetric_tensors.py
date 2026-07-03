@@ -855,6 +855,80 @@ def test_fermi_hubbard_u1u1_preset_uses_spin_resolved_fermionic_tensors():
     assert evolved_peps.tn.max_bond() <= 4
 
 
+def test_fermi_hubbard_u1u1_hamiltonian_builds_mpo_energy_path():
+    """The FH MPO should match adjacent two-site Symmray term energy."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)]),
+        seed=11,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1)],
+        t=1.0,
+        U=8.0,
+        mu=0.2,
+    )
+    mpo = ham.to_mpo(L=2, compress=False)
+
+    mpo_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    term_energy = state.energy(
+        hamiltonian=ham,
+        normalized=True,
+        contraction_opt="auto-hq",
+    )
+
+    assert complex(mpo_energy) == pytest.approx(complex(term_energy))
+
+
+def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
+    """Long-range mapped FH terms should include a parity string and compress."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        3,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 0), (0, 1)]),
+        seed=12,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 2)],
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+    )
+    mpo = ham.to_mpo(L=3, compress=False)
+    mpo_compressed = ham.to_mpo(L=3, compress=True, max_bond=16, cutoff=1e-12)
+
+    energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    energy_compressed = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo_compressed,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert mpo.max_bond() >= 3
+    assert mpo_compressed.max_bond() <= mpo.max_bond()
+    assert complex(energy_compressed) == pytest.approx(complex(energy))
+
+
 def test_symmps_gate_stream_runs_mps_optimizer_mpo_heisenberg():
     """Symmray U(1) gates should run through MpsOptimizer(mode='mpo')."""
     state = SymMPS.for_model(

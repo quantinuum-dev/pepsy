@@ -68,8 +68,46 @@ def _register_symmray_autoray_compat():
     def _allclose(a, b, rtol=1e-5, atol=1e-8, **kwargs):
         return np.allclose(_to_dense(a), _to_dense(b), rtol=rtol, atol=atol, **kwargs)
 
+    def _pad(a, pad_width, mode="constant", **kwargs):
+        if mode != "constant":
+            raise NotImplementedError("Symmray autoray pad only supports constant mode.")
+        constant_values = kwargs.get("constant_values", 0)
+        if np.any(np.asarray(constant_values) != 0):
+            raise NotImplementedError("Symmray autoray pad only supports zero padding.")
+        if not _is_symmray_array(a):
+            return np.pad(a, pad_width, mode=mode, **kwargs)
+
+        pad_width = tuple((int(lo), int(hi)) for lo, hi in pad_width)
+        if len(pad_width) != len(a.shape):
+            raise ValueError("pad_width rank does not match Symmray array rank.")
+
+        for axis, (lo, hi) in enumerate(pad_width):
+            if lo == 0 and hi == 0:
+                continue
+            chargemap = getattr(a.indices[axis], "chargemap", None)
+            if chargemap is None or len(chargemap) != 1:
+                raise NotImplementedError(
+                    "Symmray autoray pad currently supports only single-sector "
+                    "padded axes."
+                )
+
+        blocks = {
+            sector: ar.do("pad", block, pad_width, mode="constant")
+            for sector, block in a.blocks.items()
+        }
+        return type(a).from_blocks(
+            blocks,
+            duals=a.duals,
+            charge=getattr(a, "charge", None),
+            symmetry=getattr(a, "symmetry", None),
+            phases=getattr(a, "phases", None),
+            label=getattr(a, "label", None),
+            dummy_modes=getattr(a, "dummy_modes", None),
+        )
+
     ar.register_function("symmray", "eye", _eye)
     ar.register_function("symmray", "allclose", _allclose)
+    ar.register_function("symmray", "pad", _pad)
     _SYMMRAY_AUTORAY_REGISTERED = True
 
 
@@ -2244,6 +2282,90 @@ def _gate_from_term(term, dt, *, imaginary=False):
     return ar.do("linalg.expm", scale * term.reshape(matrix_shape)).reshape(shape)
 
 
+def _zero_like_charge(charge):
+    if isinstance(charge, tuple):
+        return tuple(0 for _ in charge)
+    return 0
+
+
+def _neg_charge(charge):
+    if isinstance(charge, tuple):
+        return tuple(-int(x) for x in charge)
+    return -int(charge)
+
+
+def _first_term_block_sample(terms):
+    for term in dict(terms).values():
+        blocks = getattr(term, "blocks", None)
+        if blocks:
+            return next(iter(blocks.values()))
+        if hasattr(term, "dtype"):
+            return term
+    return None
+
+
+def _dtype_from_hamiltonian_terms(terms, default="complex128"):
+    sample = _first_term_block_sample(terms)
+    dtype = getattr(sample, "dtype", None)
+    if dtype is None:
+        return np.dtype(default)
+    try:
+        return np.dtype(dtype)
+    except TypeError:
+        return np.dtype(default)
+
+
+def _as_spin_pair(value, *, name):
+    try:
+        left, right = value
+    except TypeError:
+        return value, value
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a scalar or a length-2 sequence.") from exc
+    return left, right
+
+
+def _fh_u1u1_dense_local_ops(dtype):
+    """Return dense one-site spinful FH operators in Symmray's basis order."""
+    sr = _require_symmray()
+    import symmray.fermionic_local_operators as flo  # pylint: disable=import-outside-toplevel
+
+    au = sr.FermionicOperator("a↑")
+    ad = sr.FermionicOperator("a↓")
+    basis = ((), (au.dag,), (ad.dag,), (ad.dag, au.dag))
+
+    def dense(term_ops, coeff=1.0):
+        arr = sr.build_local_fermionic_dense(
+            [(coeff, tuple(term_ops))],
+            [basis],
+        )
+        return np.asarray(arr, dtype=dtype)
+
+    return {
+        "index_map": flo.get_spinful_charge_indexmap("U1U1"),
+        "identity": np.eye(4, dtype=dtype),
+        "parity": np.diag([1.0, -1.0, -1.0, 1.0]).astype(dtype),
+        "annihilate_u": dense((au,)),
+        "create_u": dense((au.dag,)),
+        "number_u": dense((au.dag, au)),
+        "annihilate_d": dense((ad,)),
+        "create_d": dense((ad.dag,)),
+        "number_d": dense((ad.dag, ad)),
+        "double": dense((au.dag, au, ad.dag, ad)),
+    }
+
+
+def _add_local_transition(tensor, site, L, left_pos, right_pos, op):
+    if L == 1:
+        tensor[:, :] += op
+    elif site == 0:
+        tensor[right_pos, :, :] += op
+    elif site == L - 1:
+        tensor[left_pos, :, :] += op
+    else:
+        tensor[left_pos, right_pos, :, :] += op
+
+
 @dataclass(frozen=True)
 class SymHamiltonian:
     """Container for Symmray local two-site Hamiltonian terms."""
@@ -2289,6 +2411,184 @@ class SymHamiltonian:
     def to_backend(self, to_backend, *, inplace=True):
         """Convert Hamiltonian term blocks with a backend mapper callable."""
         return self.apply_to_arrays(to_backend, inplace=inplace)
+
+    def to_mpo(
+        self,
+        L=None,
+        *,
+        max_bond=None,
+        cutoff=1e-12,
+        compress=True,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+        site_tag_id="I{}",
+        to_backend=None,
+        dtype=None,
+    ):
+        """Build a symmetry-preserving MPS-chain MPO for this Hamiltonian.
+
+        Currently this supports spinful ``fermi_hubbard_u1u1`` Hamiltonians on
+        integer MPS-chain sites. Long-range hopping terms include the required
+        fermionic parity string along the mapped 1D path.
+        """
+        if self.model != "fermi_hubbard_u1u1" or self.symmetry != "U1U1":
+            raise NotImplementedError(
+                "SymHamiltonian.to_mpo currently supports only "
+                "fermi_hubbard_u1u1 with U1U1 symmetry."
+            )
+
+        edges = _as_edges(self.edges)
+        if not edges:
+            raise ValueError("Cannot build an MPO from a Hamiltonian with no edges.")
+        if any(
+            isinstance(site, tuple)
+            for edge in edges
+            for site in edge
+        ):
+            raise ValueError("SymHamiltonian.to_mpo requires 1D integer edges.")
+
+        if L is None:
+            L = max(max(int(i), int(j)) for i, j in edges) + 1
+        L = int(L)
+        if L < 1:
+            raise ValueError("L must be a positive integer.")
+
+        dtype = _dtype_from_hamiltonian_terms(self.terms) if dtype is None else np.dtype(dtype)
+        ops = _fh_u1u1_dense_local_ops(dtype)
+        phys_map = list(ops["index_map"])
+        zero = (0, 0)
+        start = ("start",)
+        done = ("done",)
+
+        t_u, t_d = _as_spin_pair(self.parameters.get("t", 1.0), name="t")
+        mu_u, mu_d = _as_spin_pair(self.parameters.get("mu", 0.0), name="mu")
+        U = self.parameters.get("U", 8.0)
+
+        channels = [[(start, zero), (done, zero)] for _ in range(max(L - 1, 0))]
+        transitions = [[] for _ in range(L)]
+
+        onsite = (
+            U * ops["double"]
+            - mu_u * ops["number_u"]
+            - mu_d * ops["number_d"]
+        )
+        if np.any(onsite != 0):
+            for site in range(L):
+                transitions[site].append((start, done, onsite))
+
+        hopping_terms = []
+        mode_terms = (
+            (t_u, ops["create_u"], ops["annihilate_u"], (0, 1), "u"),
+            (t_d, ops["create_d"], ops["annihilate_d"], (1, 0), "d"),
+        )
+        for edge_pos, edge in enumerate(edges):
+            i, j = (int(edge[0]), int(edge[1]))
+            if i == j:
+                raise ValueError("Hamiltonian edges must connect distinct sites.")
+            if not (0 <= i < L and 0 <= j < L):
+                raise ValueError(f"edge {edge!r} is outside MPO length L={L}.")
+            if i > j:
+                i, j = j, i
+            for t_sigma, create, annihilate, create_charge, spin in mode_terms:
+                if t_sigma == 0:
+                    continue
+                for direction, first, second, first_charge in (
+                    ("forward", create, annihilate, create_charge),
+                    ("backward", annihilate, create, _neg_charge(create_charge)),
+                ):
+                    channel_id = ("hop", edge_pos, spin, direction)
+                    channel_charge = _neg_charge(first_charge)
+                    for cut in range(i, j):
+                        channels[cut].append((channel_id, channel_charge))
+                    hopping_terms.append(
+                        (i, j, channel_id, -t_sigma * first, second)
+                    )
+
+        channel_pos = [
+            {channel_id: pos for pos, (channel_id, _) in enumerate(cut_channels)}
+            for cut_channels in channels
+        ]
+
+        for i, j, channel_id, first, second in hopping_terms:
+            transitions[i].append((start, channel_id, first))
+            for site in range(i + 1, j):
+                transitions[site].append((channel_id, channel_id, ops["parity"]))
+            transitions[j].append((channel_id, done, second))
+
+        arrays = []
+        _require_symmray()
+        from symmray import utils as sr_utils  # pylint: disable=import-outside-toplevel
+
+        for site in range(L):
+            if L == 1:
+                data = np.zeros((4, 4), dtype=dtype)
+                index_maps = [phys_map, phys_map]
+                duals = [False, True]
+            elif site == 0:
+                right_map = [charge for _, charge in channels[site]]
+                data = np.zeros((len(right_map), 4, 4), dtype=dtype)
+                index_maps = [right_map, phys_map, phys_map]
+                duals = [False, False, True]
+                _add_local_transition(data, site, L, None, channel_pos[site][start], ops["identity"])
+            elif site == L - 1:
+                left_map = [charge for _, charge in channels[site - 1]]
+                data = np.zeros((len(left_map), 4, 4), dtype=dtype)
+                index_maps = [left_map, phys_map, phys_map]
+                duals = [True, False, True]
+                _add_local_transition(data, site, L, channel_pos[site - 1][done], None, ops["identity"])
+            else:
+                left_map = [charge for _, charge in channels[site - 1]]
+                right_map = [charge for _, charge in channels[site]]
+                data = np.zeros((len(left_map), len(right_map), 4, 4), dtype=dtype)
+                index_maps = [left_map, right_map, phys_map, phys_map]
+                duals = [True, False, False, True]
+                _add_local_transition(
+                    data,
+                    site,
+                    L,
+                    channel_pos[site - 1][start],
+                    channel_pos[site][start],
+                    ops["identity"],
+                )
+                _add_local_transition(
+                    data,
+                    site,
+                    L,
+                    channel_pos[site - 1][done],
+                    channel_pos[site][done],
+                    ops["identity"],
+                )
+
+            for left_id, right_id, op in transitions[site]:
+                left_pos = None if site == 0 else channel_pos[site - 1][left_id]
+                right_pos = None if site == L - 1 else channel_pos[site][right_id]
+                _add_local_transition(data, site, L, left_pos, right_pos, op)
+
+            array = sr_utils.from_dense(
+                data,
+                symmetry=self.symmetry,
+                index_maps=index_maps,
+                duals=duals,
+                fermionic=False,
+                charge=zero,
+            )
+            arrays.append(array)
+
+        mpo = qtn.MatrixProductOperator(
+            arrays,
+            shape="lrud",
+            upper_ind_id=upper_ind_id,
+            lower_ind_id=lower_ind_id,
+            site_tag_id=site_tag_id,
+        )
+        if to_backend is not None:
+            _apply_to_tensor_network_arrays(mpo, to_backend)
+        if compress and L > 1:
+            compress_opts = {"cutoff": cutoff}
+            if max_bond is not None:
+                compress_opts["max_bond"] = int(max_bond)
+            mpo.compress(**compress_opts)
+        return mpo
 
     def trotter_gates(self, dt, *, imaginary=False, order=1):
         """Return local gate entries ``[(gate, edge), ...]`` for one Trotter step."""

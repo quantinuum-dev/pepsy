@@ -740,6 +740,70 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         )
 
     @staticmethod
+    def _is_mpo_hamiltonian(hamiltonian):
+        return isinstance(hamiltonian, qtn.MatrixProductOperator)
+
+    @staticmethod
+    def _is_symmray_array(value):
+        return hasattr(value, "blocks") and hasattr(value, "indices")
+
+    @staticmethod
+    def _is_fermionic_array(value):
+        return "fermionic" in type(value).__name__.lower()
+
+    @classmethod
+    def _mpo_uses_bosonic_symmray(cls, mpo):
+        for tensor in mpo:
+            data = getattr(tensor, "data", None)
+            if cls._is_symmray_array(data) and not cls._is_fermionic_array(data):
+                return True
+        return False
+
+    @staticmethod
+    def _symmray_symmetry_name(data):
+        symmetry = getattr(data, "symmetry", None)
+        if symmetry is not None:
+            return symmetry
+        name = type(data).__name__
+        for candidate in ("U1U1", "Z2Z2", "U1", "Z2"):
+            if name.startswith(candidate):
+                return candidate
+        return None
+
+    @classmethod
+    def _bosonize_fermionic_tn(cls, tn):
+        import symmray.utils as sr_utils  # pylint: disable=import-outside-toplevel
+
+        target = tn.copy()
+        for tensor in target:
+            data = getattr(tensor, "data", None)
+            if not (cls._is_symmray_array(data) and cls._is_fermionic_array(data)):
+                continue
+            symmetry = cls._symmray_symmetry_name(data)
+            if symmetry is None:
+                continue
+            array_cls = sr_utils.get_array_cls(symmetry, fermionic=False)
+            blocks = {
+                sector: cls._copy_array_like(block)
+                for sector, block in data.blocks.items()
+            }
+            tensor.modify(
+                data=array_cls(
+                    indices=data.indices,
+                    charge=getattr(data, "charge", None),
+                    blocks=blocks,
+                    symmetry=symmetry,
+                )
+            )
+        return target
+
+    @classmethod
+    def _terms_from_hamiltonian(cls, hamiltonian):
+        if cls._is_mpo_hamiltonian(hamiltonian):
+            return hamiltonian
+        return super()._terms_from_hamiltonian(hamiltonian)
+
+    @staticmethod
     def _num_sites(state):
         num_sites = getattr(state, "num_sites", None)
         if num_sites is not None:
@@ -764,6 +828,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
 
     @classmethod
     def _terms_for_state_backend(cls, terms, state):
+        if cls._is_mpo_hamiltonian(terms):
+            return terms
         sample = cls._sample_array_from_tn(state)
         try:
             converter = infer_backend_converter_from_sample(sample)
@@ -775,6 +841,35 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             edge: cls._convert_term_array(term, converter)
             for edge, term in dict(terms).items()
         }
+
+    @classmethod
+    def _mpo_expectation(
+        cls,
+        state,
+        mpo,
+        *,
+        normalized=True,
+        contraction_opt="auto-hq",
+    ):
+        if contraction_opt is None:
+            contraction_opt = build_optimizer(progbar=False)
+        state = cls._as_mps_state(state)
+        if cls._mpo_uses_bosonic_symmray(mpo):
+            ket = cls._bosonize_fermionic_tn(state)
+        else:
+            ket = state.copy()
+        bra = ket.H
+        bra.reindex_({f"k{i}": f"b{i}" for i in range(ket.L)})
+        network = bra | mpo | ket
+        for site in range(ket.L):
+            network ^= f"I{site}"
+        value = network.contract(all, optimize=contraction_opt)
+        if normalized:
+            norm = (ket.H & ket).contract(all, optimize=contraction_opt)
+            if norm == 0.0:
+                raise ValueError("Cannot compute normalized energy for a zero-norm state.")
+            value = value / norm
+        return value
 
     @classmethod
     def _loss_state(
@@ -791,6 +886,19 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     ):
         state = cls._as_mps_state(state)
         terms = cls._terms_from_hamiltonian(terms)
+        if cls._is_mpo_hamiltonian(terms):
+            value = cls._mpo_expectation(
+                state,
+                terms,
+                normalized=normalized,
+                contraction_opt=contraction_opt,
+            )
+            if energy_per_site:
+                value = value / cls._num_sites(state)
+            if real:
+                value = cls._maybe_real(value)
+            return value
+
         terms = cls._terms_for_state_backend(terms, state)
         if contraction_opt is None:
             contraction_opt = build_optimizer(progbar=False)
@@ -885,6 +993,21 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         self._prepare_autodiff_backend(autodiff_backend)
         incoming_constants = dict(loss_constants or {})
         terms = incoming_constants.pop("terms", self.terms)
+        if self._is_mpo_hamiltonian(terms):
+            constants = {"terms": terms}
+            constants.update(incoming_constants)
+            return qtn.TNOptimizer(
+                self.state,
+                self._tnopt_loss,
+                loss_constants=constants,
+                loss_kwargs=merged_loss_kwargs,
+                autodiff_backend=autodiff_backend,
+                optimizer=optimizer,
+                progbar=progbar,
+                jit_fn=jit_fn,
+                device=device,
+                **tnopt_kwargs,
+            )
         constants = {
             "terms": self._terms_for_autodiff_backend(
                 terms,
