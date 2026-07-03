@@ -89,6 +89,22 @@ package-level record of site order, edge order, local index directions, and the
 methods reference. The same record is included in `symmray_mps_summary(...)`
 and `symmray_peps_summary(...)` under the `fermionic_ordering` key.
 
+`SymHamiltonian.to_mpo(...)` currently implements the spin-resolved
+Fermi-Hubbard MPO path for `model="fermi_hubbard_u1u1"` with `symmetry="U1U1"`.
+It builds a quimb `MatrixProductOperator` from Symmray block-sparse tensors,
+using the four-state spinful local basis with charges `(n_up, n_down)`. The
+builder handles onsite `U`/`mu` terms, spin-dependent scalar-or-pair `t` and
+`mu` parameters, and hopping channels for both spin species. When a mapped edge
+is non-adjacent on the MPS chain, the MPO channel inserts fermionic parity on
+the intermediate sites so coordinate-lattice edges preserve the correct signs
+after flattening through `OneDMap`.
+
+Coordinate edges require `mapper=OneDMap(...)` or explicit `idx2coo`/`coo2idx`
+maps when calling `to_mpo(...)`; already-flat integer edges can pass `L=...`.
+The method supports optional MPO compression, physical index IDs, `dtype=`, and
+`to_backend=` block conversion. Focused coverage lives in
+`tests/test_symmetric_tensors.py::test_fermi_hubbard_u1u1_hamiltonian_*`.
+
 When changing symmetric behavior, check both dense compatibility and Symmray
 routing through PEPS optimizers and boundary contraction paths.
 
