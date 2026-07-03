@@ -103,15 +103,16 @@ def test_build_itf_lattice_ly1_has_chain_edges():
 
 def test_build_itf_lattice_ly1_cyclic_drops_degenerate_edges():
     """Ly=1 with cyclic=True should ignore degenerate singleton periodic edges."""
-    out = py.ham_tn.build_itf_lattice(
-        Lx=5,
-        Ly=1,
-        lattice="square",
-        cyclic=True,
-        J=1.0,
-        field=0.5,
-        return_edges=True,
-    )
+    with pytest.warns(UserWarning, match="Dropped 5 degenerate generated edge"):
+        out = py.ham_tn.build_itf_lattice(
+            Lx=5,
+            Ly=1,
+            lattice="square",
+            cyclic=True,
+            J=1.0,
+            field=0.5,
+            return_edges=True,
+        )
 
     assert out["mpo"].L == 5
     assert out["pepo"] is None

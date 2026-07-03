@@ -428,6 +428,7 @@ def test_apply_2dtn_routes_mixed_physical_dimensions_exactly(contract):
         gate,
         ((0, 0), (0, 2)),
         contract=contract,
+        max_bond=64,
         cutoff=0.0,
         sequence="x_then_y",
     )
@@ -1230,7 +1231,7 @@ def test_gate_simple_2d_routes_swaps_with_real_torch_dtype():
     """Internal SWAP tensors should match real torch PEPS dtype."""
     torch = pytest.importorskip("torch")
 
-    peps = ps_to_peps(2, 3, dtype="complex128", chi=2)
+    peps = ps_to_peps(2, 3, dtype="float64", chi=2)
     peps.apply_to_arrays(lambda x: torch.as_tensor(x, dtype=torch.float64))
     gate = torch.eye(4, dtype=torch.float64).reshape(2, 2, 2, 2)
     gauges = {}

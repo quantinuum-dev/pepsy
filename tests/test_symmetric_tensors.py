@@ -2190,10 +2190,18 @@ def test_fermi_hubbard_u1u1_mpo_matches_terms_on_2d_snake_lattice():
         mpo = ham.to_mpo(L=L, compress=False)
 
         mpo_energy = pepsy.MpsEnergyOptimizer(
-            state, mpo, energy_per_site=False, real=False
+            state,
+            mpo,
+            energy_per_site=False,
+            real=False,
+            contraction_opt="greedy",
         ).energy().energy
         term_energy = pepsy.MpsEnergyOptimizer(
-            state, ham.terms, energy_per_site=False, real=False
+            state,
+            ham.terms,
+            energy_per_site=False,
+            real=False,
+            contraction_opt="greedy",
         ).energy().energy
 
         assert complex(mpo_energy) == pytest.approx(complex(term_energy))

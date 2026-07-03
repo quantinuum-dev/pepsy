@@ -590,8 +590,18 @@ def verify_netket_spin_columns(hilbert, columns=None, *, max_states=50_000):
         return next(c for c in range(hilbert.size) if np.array_equal(states[:, c], diag))
 
     n_orbitals = int(hilbert.n_orbitals)
-    detected_up = tuple(match_col(number(hilbert, i, +1)) for i in range(n_orbitals))
-    detected_down = tuple(match_col(number(hilbert, i, -1)) for i in range(n_orbitals))
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"\s*WARNING: Initializing `netket\.operator\.FermionOperator2nd`",
+            category=UserWarning,
+        )
+        detected_up = tuple(
+            match_col(number(hilbert, i, +1)) for i in range(n_orbitals)
+        )
+        detected_down = tuple(
+            match_col(number(hilbert, i, -1)) for i in range(n_orbitals)
+        )
     if detected_up != columns.up or detected_down != columns.down:
         raise ValueError(
             "NetKet spin-column mismatch: "
