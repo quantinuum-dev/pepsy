@@ -131,6 +131,11 @@ the interruption.
   `MpsEnergyOptimizer`, applies a two-site effective-Hamiltonian matvec in the
   exact current `theta` block layout, and performs an exact dense local solve
   with Symmray SVD writeback for `L=2` correctness runs.
-- The real remaining DMRG work is enabling safe longer-chain sweeps: canonical
-  center or effective norm handling, then replacing the dense reference local
-  solve with a block-sparse Lanczos/torch path.
+- Longer-chain Symmray sweeps now use an explicit effective norm, not an
+  assumed canonical center. Pepsy builds `<psi|psi>` left/right environments,
+  applies `N_eff` in the same theta block layout as `H_eff`, solves the dense
+  generalized problem `H_eff theta = E N_eff theta`, and then writes back with
+  Symmray SVD.
+- The real remaining DMRG work is performance and scale: replace the dense
+  reference local matrices with a block-sparse Lanczos/LinearOperator path,
+  then make the block matvec torch-native where useful.

@@ -207,9 +207,10 @@ data too early.
    them as Pepsy dependencies.
 4. Only after the notebook-level MPO expectation is confirmed, revisit DMRG2
    adaptation:
-   block-sparse eigensolver sectors, SVD sector truncation, Lanczos environment
-   construction, and torch/autodiff support are separate problems from the
-   fermion algebra.
+   the first dense reference path now has explicit `H_eff` and `N_eff`
+   environments for small longer-chain sweeps, while block-sparse Lanczos,
+   sector truncation policy, and torch/autodiff support remain separate
+   performance problems from the fermion algebra.
 
 ## Acceptance Criteria For The True MPO Fix
 

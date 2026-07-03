@@ -177,9 +177,12 @@ constructions, plus the fermionic Fermi-Hubbard starters in
 - The first Pepsy-native Symmray DMRG internals are in place: dense left/right
   environments for `<psi|MPO|psi>`, environment-energy validation against
   `MpsEnergyOptimizer`, a sector-preserving two-site matvec on the current
-  `theta` block layout, and an exact dense local solve/writeback for the whole
-  `L=2` theta sector. Longer-chain local updates remain blocked until the
-  canonical-center / effective-norm part is implemented.
+  `theta` block layout, dense norm environments for `<psi|psi>`, and exact
+  dense generalized local solves/writeback. Small `L>2` FH U1U1 chains now run
+  correctness-reference two-direction sweeps in the current block layout.
+- The next DMRG step is replacing the dense local matrices with a block-sparse
+  Lanczos/LinearOperator path, then adding torch-native kernels where the block
+  matvec benefits from them.
 
 ### Validation
 

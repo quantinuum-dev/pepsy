@@ -4,9 +4,8 @@ This module provides the public :class:`SymDMRG2` API that Pepsy will grow into
 for Symmray-backed block-sparse Hamiltonians. Ordinary quimb MPOs are delegated
 directly to :class:`quimb.tensor.DMRG2`; Symmray MPOs use Pepsy's bosonic
 Jordan-Wigner/U1U1 path with dense reference environments, a sector-preserving
-two-site matvec, and an exact dense local solve for the whole ``L=2`` theta
-sector. Longer-chain sweeps still need canonical-center / effective-norm
-plumbing before the local updates are enabled generally.
+two-site matvec, dense norm environments, and an exact dense generalized local
+solve in the current theta block layout.
 """
 
 from __future__ import annotations
@@ -218,6 +217,9 @@ class SymDMRG2:
     max_dense_dim
         Maximum active two-site block-subspace dimension for the dense
         reference local eigensolver.
+    norm_rcond
+        Relative cutoff for dropping tiny effective-norm eigenvalues in the
+        dense generalized local solve.
     """
 
     def __init__(
@@ -233,6 +235,7 @@ class SymDMRG2:
         which="SA",
         tol=1e-4,
         max_dense_dim=4096,
+        norm_rcond=1e-10,
         dmrg_opts=None,
     ):
         if chi is None:
@@ -252,6 +255,7 @@ class SymDMRG2:
         self.which = which
         self.tol = float(tol)
         self.max_dense_dim = int(max_dense_dim)
+        self.norm_rcond = float(norm_rcond)
         self.dmrg_opts = {} if dmrg_opts is None else dict(dmrg_opts)
 
         requested_backend = _normalize_backend(backend)
@@ -275,6 +279,8 @@ class SymDMRG2:
         self.initial_energy = self._compute_initial_energy()
         self.left_envs = None
         self.right_envs = None
+        self.left_norm_envs = None
+        self.right_norm_envs = None
 
         if self.backend == "symmray" and self.mps is not None:
             self._state = self._prepare_symmray_state(self.mps)
@@ -554,6 +560,162 @@ class SymDMRG2:
         self.right_envs[site] = self._right_env_step(site, self.right_envs[site + 1], bra)
         return self.right_envs[site]
 
+    def _norm_left_env_step(self, site, env, bra):
+        labels = {}
+        next_label = 0
+
+        def label(name):
+            nonlocal next_label
+            if name not in labels:
+                labels[name] = next_label
+                next_label += 1
+            return labels[name]
+
+        arrays = []
+        subscripts = []
+        if site > 0:
+            arrays.append(env)
+            subscripts.append([label("bra_l"), label("ket_l")])
+
+        ket_t = self._state[site]
+        bra_t = bra[site]
+        ket_labels = []
+        bra_labels = []
+        for ind in ket_t.inds:
+            if ind == self._site_ind(site):
+                ket_labels.append(label("phys"))
+            elif site > 0 and ind == self._state.bond(site - 1, site):
+                ket_labels.append(label("ket_l"))
+            elif site < self._state.L - 1 and ind == self._state.bond(site, site + 1):
+                ket_labels.append(label("ket_r"))
+            else:  # pragma: no cover
+                raise ValueError(f"Unexpected ket index {ind!r} at site {site}.")
+        for ind in bra_t.inds:
+            if ind == self._bra_site_ind(site):
+                bra_labels.append(label("phys"))
+            elif site > 0 and ind == self._state.bond(site - 1, site):
+                bra_labels.append(label("bra_l"))
+            elif site < self._state.L - 1 and ind == self._state.bond(site, site + 1):
+                bra_labels.append(label("bra_r"))
+            else:  # pragma: no cover
+                raise ValueError(f"Unexpected bra index {ind!r} at site {site}.")
+
+        phys_index = self._index_for_tensor_ind(ket_t, self._site_ind(site))
+        target_indices = {
+            self._site_ind(site): phys_index,
+            self._bra_site_ind(site): phys_index,
+        }
+        arrays.extend((
+            self._dense_tensor_aligned(bra_t, target_indices),
+            self._dense_tensor_aligned(ket_t, target_indices),
+        ))
+        subscripts.extend((bra_labels, ket_labels))
+        output = [label("bra_r"), label("ket_r")] if site < self._state.L - 1 else []
+        return self._einsum(arrays, subscripts, output)
+
+    def _norm_right_env_step(self, site, env, bra):
+        labels = {}
+        next_label = 0
+
+        def label(name):
+            nonlocal next_label
+            if name not in labels:
+                labels[name] = next_label
+                next_label += 1
+            return labels[name]
+
+        arrays = []
+        subscripts = []
+        if site < self._state.L - 1:
+            arrays.append(env)
+            subscripts.append([label("bra_r"), label("ket_r")])
+
+        ket_t = self._state[site]
+        bra_t = bra[site]
+        ket_labels = []
+        bra_labels = []
+        for ind in ket_t.inds:
+            if ind == self._site_ind(site):
+                ket_labels.append(label("phys"))
+            elif site > 0 and ind == self._state.bond(site - 1, site):
+                ket_labels.append(label("ket_l"))
+            elif site < self._state.L - 1 and ind == self._state.bond(site, site + 1):
+                ket_labels.append(label("ket_r"))
+            else:  # pragma: no cover
+                raise ValueError(f"Unexpected ket index {ind!r} at site {site}.")
+        for ind in bra_t.inds:
+            if ind == self._bra_site_ind(site):
+                bra_labels.append(label("phys"))
+            elif site > 0 and ind == self._state.bond(site - 1, site):
+                bra_labels.append(label("bra_l"))
+            elif site < self._state.L - 1 and ind == self._state.bond(site, site + 1):
+                bra_labels.append(label("bra_r"))
+            else:  # pragma: no cover
+                raise ValueError(f"Unexpected bra index {ind!r} at site {site}.")
+
+        phys_index = self._index_for_tensor_ind(ket_t, self._site_ind(site))
+        target_indices = {
+            self._site_ind(site): phys_index,
+            self._bra_site_ind(site): phys_index,
+        }
+        arrays.extend((
+            self._dense_tensor_aligned(bra_t, target_indices),
+            self._dense_tensor_aligned(ket_t, target_indices),
+        ))
+        subscripts.extend((bra_labels, ket_labels))
+        output = [label("bra_l"), label("ket_l")] if site > 0 else []
+        return self._einsum(arrays, subscripts, output)
+
+    def build_norm_environments(self):
+        """Build left/right dense environments for ``<psi|psi>``."""
+        if self.backend != "symmray":
+            raise ValueError("build_norm_environments is only used by backend='symmray'.")
+        if self._state is None:
+            raise ValueError("SymDMRG2 requires init_mps before building norm environments.")
+
+        bra = self._make_bra()
+        left = [None] * (self._state.L + 1)
+        right = [None] * (self._state.L + 1)
+        left[0] = np.asarray(1.0 + 0.0j)
+        for site in range(self._state.L):
+            left[site + 1] = self._norm_left_env_step(site, left[site], bra)
+        right[self._state.L] = np.asarray(1.0 + 0.0j)
+        for site in reversed(range(self._state.L)):
+            right[site] = self._norm_right_env_step(site, right[site + 1], bra)
+        self.left_norm_envs = left
+        self.right_norm_envs = right
+        return left, right
+
+    def update_left_norm_environment(self, site):
+        """Incrementally refresh the left norm environment through ``site``."""
+        if self.left_norm_envs is None:
+            self.build_norm_environments()
+        bra = self._make_bra()
+        self.left_norm_envs[site + 1] = self._norm_left_env_step(
+            site,
+            self.left_norm_envs[site],
+            bra,
+        )
+        return self.left_norm_envs[site + 1]
+
+    def update_right_norm_environment(self, site):
+        """Incrementally refresh the right norm environment through ``site``."""
+        if self.right_norm_envs is None:
+            self.build_norm_environments()
+        bra = self._make_bra()
+        self.right_norm_envs[site] = self._norm_right_env_step(
+            site,
+            self.right_norm_envs[site + 1],
+            bra,
+        )
+        return self.right_norm_envs[site]
+
+    def norm_environment_value(self):
+        """Return ``<psi|psi>`` from the current full norm environments."""
+        if self.left_norm_envs is None or self.right_norm_envs is None:
+            self.build_norm_environments()
+        return complex(np.asarray(self.left_norm_envs[self._state.L]))
+
     def _current_norm(self):
         norm = (self._state.H & self._state).contract(all, optimize="auto-hq")
         return complex(norm)
@@ -675,6 +837,85 @@ class SymDMRG2:
         data = _array_with_blocks_like(theta.data, blocks)
         return _tensor_with_data(theta, data)
 
+    def _norm_matvec_dense(self, site, theta_dense):
+        if self.left_norm_envs is None or self.right_norm_envs is None:
+            self.build_norm_environments()
+
+        right_site = site + 1
+        labels = {}
+        next_label = 0
+
+        def label(name):
+            nonlocal next_label
+            if name not in labels:
+                labels[name] = next_label
+                next_label += 1
+            return labels[name]
+
+        arrays = []
+        subscripts = []
+        if site > 0:
+            arrays.append(self.left_norm_envs[site])
+            subscripts.append([label("bra_l"), label("ket_l")])
+        if right_site < self._state.L - 1:
+            arrays.append(self.right_norm_envs[right_site + 1])
+            subscripts.append([label("bra_r"), label("ket_r")])
+
+        theta = self.two_site_theta(site)
+        theta_labels = []
+        for ind in theta.inds:
+            if site > 0 and ind == self._state.bond(site - 1, site):
+                theta_labels.append(label("ket_l"))
+            elif right_site < self._state.L - 1 and ind == self._state.bond(right_site, right_site + 1):
+                theta_labels.append(label("ket_r"))
+            elif ind == self._site_ind(site):
+                theta_labels.append(label("phys_l"))
+            elif ind == self._site_ind(right_site):
+                theta_labels.append(label("phys_r"))
+            else:  # pragma: no cover
+                raise ValueError(f"Unexpected theta index {ind!r}.")
+
+        arrays.append(theta_dense)
+        subscripts.append(theta_labels)
+        output = []
+        for ind in theta.inds:
+            if site > 0 and ind == self._state.bond(site - 1, site):
+                output.append(label("bra_l"))
+            elif right_site < self._state.L - 1 and ind == self._state.bond(right_site, right_site + 1):
+                output.append(label("bra_r"))
+            elif ind == self._site_ind(site):
+                output.append(label("phys_l"))
+            elif ind == self._site_ind(right_site):
+                output.append(label("phys_r"))
+        return self._einsum(arrays, subscripts, output)
+
+    def two_site_norm_matvec(self, site, theta=None):
+        """Apply the two-site effective norm operator to ``theta``."""
+        theta = self.two_site_theta(site) if theta is None else theta
+        full_indices = tuple(theta.data.indices)
+        dense = _embed_dense_to_indices(
+            _dense_data(theta.data),
+            theta.data.indices,
+            full_indices,
+        )
+        out_dense = self._norm_matvec_dense(site, dense)
+        blocks = _blocks_from_projected_dense(out_dense, full_indices, theta.data)
+        data = _array_with_blocks_like(theta.data, blocks)
+        return _tensor_with_data(theta, data)
+
+    def _dense_operator_matrix(self, site, theta, metadata, matvec):
+        vector, _ = _flatten_blocks(theta.data)
+        dim = vector.size
+        matrix = np.empty((dim, dim), dtype=np.result_type(vector.dtype, complex))
+        for col in range(dim):
+            basis = np.zeros(dim, dtype=matrix.dtype)
+            basis[col] = 1.0
+            blocks = _unflatten_blocks(basis, metadata)
+            trial = _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
+            out = matvec(site, trial)
+            matrix[:, col] = _flatten_blocks(out.data)[0]
+        return matrix
+
     def dense_local_eigensolve(self, site, *, max_dense_dim=None):
         """Solve the dense effective two-site problem in theta's block layout."""
         theta = self.two_site_theta(site)
@@ -688,15 +929,12 @@ class SymDMRG2:
                 f"Dense local eigensolve dimension {dim} exceeds max_dense_dim={max_dense_dim}."
             )
 
-        matrix = np.empty((dim, dim), dtype=np.result_type(vector.dtype, complex))
-        for col in range(dim):
-            basis = np.zeros(dim, dtype=matrix.dtype)
-            basis[col] = 1.0
-            blocks = _unflatten_blocks(basis, metadata)
-            trial = _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
-            out = self.two_site_matvec(site, trial)
-            matrix[:, col] = _flatten_blocks(out.data)[0]
-
+        matrix = self._dense_operator_matrix(
+            site,
+            theta,
+            metadata,
+            self.two_site_matvec,
+        )
         matrix = (matrix + matrix.conj().T) / 2
         evals, evecs = np.linalg.eigh(matrix)
         pick = -1 if str(self.which).upper().startswith("L") else 0
@@ -704,6 +942,65 @@ class SymDMRG2:
         blocks = _unflatten_blocks(evecs[:, pick], metadata)
         theta_opt = _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
         return energy, theta_opt
+
+    def dense_generalized_local_eigensolve(
+        self,
+        site,
+        *,
+        max_dense_dim=None,
+        norm_rcond=None,
+    ):
+        """Solve ``H_eff theta = E N_eff theta`` in theta's block layout."""
+        theta = self.two_site_theta(site)
+        vector, metadata = _flatten_blocks(theta.data)
+        dim = vector.size
+        max_dense_dim = self.max_dense_dim if max_dense_dim is None else int(max_dense_dim)
+        norm_rcond = self.norm_rcond if norm_rcond is None else float(norm_rcond)
+        if dim == 0:
+            raise ValueError("The two-site theta tensor has no active blocks.")
+        if dim > max_dense_dim:
+            raise ValueError(
+                f"Dense local eigensolve dimension {dim} exceeds max_dense_dim={max_dense_dim}."
+            )
+
+        h_matrix = self._dense_operator_matrix(
+            site,
+            theta,
+            metadata,
+            self.two_site_matvec,
+        )
+        n_matrix = self._dense_operator_matrix(
+            site,
+            theta,
+            metadata,
+            self.two_site_norm_matvec,
+        )
+        h_matrix = (h_matrix + h_matrix.conj().T) / 2
+        n_matrix = (n_matrix + n_matrix.conj().T) / 2
+
+        norm_evals, norm_evecs = np.linalg.eigh(n_matrix)
+        scale = max(float(np.max(np.abs(norm_evals))), 1.0)
+        keep = norm_evals > norm_rcond * scale
+        if not np.any(keep):
+            raise ValueError(
+                "The effective norm matrix has no numerically positive "
+                f"eigenvalues at rcond={norm_rcond}."
+            )
+
+        metric_inv_sqrt = norm_evecs[:, keep] / np.sqrt(norm_evals[keep])
+        reduced_h = metric_inv_sqrt.conj().T @ h_matrix @ metric_inv_sqrt
+        reduced_h = (reduced_h + reduced_h.conj().T) / 2
+        evals, evecs = np.linalg.eigh(reduced_h)
+        pick = -1 if str(self.which).upper().startswith("L") else 0
+        vector_opt = metric_inv_sqrt @ evecs[:, pick]
+        norm = vector_opt.conj() @ n_matrix @ vector_opt
+        if abs(norm) > 0:
+            vector_opt = vector_opt / np.sqrt(norm)
+        denom = vector_opt.conj() @ n_matrix @ vector_opt
+        energy = (vector_opt.conj() @ h_matrix @ vector_opt) / denom
+        blocks = _unflatten_blocks(vector_opt, metadata)
+        theta_opt = _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
+        return float(energy.real), theta_opt
 
     def _replace_two_site_theta(self, site, theta, *, chi, cutoff, direction="right"):
         right_site = site + 1
@@ -728,6 +1025,34 @@ class SymDMRG2:
         self._state[right_site].modify(data=right_tensor.data, inds=right_tensor.inds)
         self._state.site_ind_id = getattr(self._state, "site_ind_id", "k{}")
         return self._state[site], self._state[right_site]
+
+    def _symmray_sweep_direction(self, direction, *, chi, cutoff):
+        if direction == "right":
+            sites = range(self._state.L - 1)
+            split_direction = "right"
+        elif direction == "left":
+            sites = reversed(range(self._state.L - 1))
+            split_direction = "left"
+        else:  # pragma: no cover - private consistency check
+            raise ValueError("direction must be 'right' or 'left'.")
+
+        last_energy = None
+        for site in sites:
+            last_energy, theta = self.dense_generalized_local_eigensolve(site)
+            self._replace_two_site_theta(
+                site,
+                theta,
+                chi=chi,
+                cutoff=cutoff,
+                direction=split_direction,
+            )
+            if direction == "right":
+                self.update_left_environment(site)
+                self.update_left_norm_environment(site)
+            else:
+                self.update_right_environment(site + 1)
+                self.update_right_norm_environment(site + 1)
+        return last_energy
 
     def _solve_quimb(
         self,
@@ -772,19 +1097,19 @@ class SymDMRG2:
     def _solve_symmray(self, *, chi, cutoff, sweeps):
         if self._state is None:
             raise ValueError("SymDMRG2 backend='symmray' requires an initial MPS.")
-        if self._state.L != 2:
-            raise NotImplementedError(
-                "The first dense Symmray DMRG2 eigensolver is enabled for L=2 "
-                "correctness runs. General sweeps need the effective norm "
-                "environment or canonical-center plumbing before local updates "
-                "are safe on longer chains."
-            )
+        if self._state.L < 2:
+            raise ValueError("SymDMRG2 requires an MPS with at least two sites.")
 
         self.build_environments()
+        self.build_norm_environments()
         for _ in range(sweeps):
-            energy, theta = self.dense_local_eigensolve(0)
-            self._replace_two_site_theta(0, theta, chi=chi, cutoff=cutoff)
+            self._symmray_sweep_direction("right", chi=chi, cutoff=cutoff)
+            if self._state.L > 2:
+                self.build_environments()
+                self.build_norm_environments()
+                self._symmray_sweep_direction("left", chi=chi, cutoff=cutoff)
             self.build_environments()
+            self.build_norm_environments()
             self.energies.append(self.environment_energy(normalized=True).real)
             if len(self.energies) >= 2 and abs(self.energies[-1] - self.energies[-2]) < self.tol:
                 self.converged = True
@@ -807,9 +1132,7 @@ class SymDMRG2:
         """Run DMRG2 and return ``self``.
 
         Dense/quimb MPOs are solved immediately by quimb's implementation.
-        Symmray MPOs currently raise :class:`NotImplementedError` at solve time,
-        after initialization has recorded charge-sector and initial-energy
-        diagnostics.
+        Symmray MPOs use Pepsy's sector-preserving dense reference path.
         """
         chi = self.chi if chi is None else int(chi)
         cutoff = self.cutoff if cutoff is None else float(cutoff)
@@ -842,6 +1165,7 @@ class SymDMRG2:
             "uses_symmray": self.uses_symmray,
             "chi": self.chi,
             "cutoff": self.cutoff,
+            "norm_rcond": self.norm_rcond,
             "sweeps": self.sweeps,
             "total_charge": self.total_charge,
             "initial_energy": self.initial_energy,
