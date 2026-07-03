@@ -55,6 +55,24 @@ def _to_dense(value):
     return value.to_dense() if hasattr(value, "to_dense") else value
 
 
+def _as_python_bool(value):
+    item = getattr(value, "item", None)
+    if callable(item):
+        value = item()
+    return bool(value)
+
+
+def _to_host_numpy(value):
+    value = _to_dense(value)
+    detach = getattr(value, "detach", None)
+    if callable(detach):
+        value = detach()
+    cpu = getattr(value, "cpu", None)
+    if callable(cpu):
+        value = cpu()
+    return np.asarray(value)
+
+
 def _is_symmray_array(value):
     return hasattr(value, "blocks") and hasattr(value, "indices")
 
@@ -69,7 +87,21 @@ def _register_symmray_autoray_compat():
         return np.eye(n, n if m is None else m, k=k, dtype=dtype)
 
     def _allclose(a, b, rtol=1e-5, atol=1e-8, **kwargs):
-        return np.allclose(_to_dense(a), _to_dense(b), rtol=rtol, atol=atol, **kwargs)
+        a_dense = _to_dense(a)
+        b_dense = _to_dense(b)
+        try:
+            b_dense = ar.do("array", b_dense, like=a_dense)
+            return _as_python_bool(
+                ar.do("allclose", a_dense, b_dense, rtol=rtol, atol=atol, **kwargs)
+            )
+        except Exception:
+            return np.allclose(
+                _to_host_numpy(a_dense),
+                _to_host_numpy(b_dense),
+                rtol=rtol,
+                atol=atol,
+                **kwargs,
+            )
 
     def _pad(a, pad_width, mode="constant", **kwargs):
         if mode != "constant":

@@ -1346,6 +1346,42 @@ def test_symmps_mps_optimizer_handles_spinful_fermi_hubbard_dims():
     assert np.real(raw_norm) > 0.0
 
 
+def test_symmps_mps_optimizer_handles_cuda_torch_blocks():
+    """Symmray canonicalization should not coerce CUDA torch blocks via NumPy."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA torch device is not available.")
+
+    to_backend = pepsy.backend_torch(device="cuda:0", dtype=torch.complex128)
+    state = SymMPS.for_model(
+        "fermi_hubbard",
+        3,
+        bond_dim=2,
+        seed=8,
+        dtype="complex128",
+        to_backend=to_backend,
+    )
+    ham = state.build_hamiltonian(
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+        to_backend=to_backend,
+    )
+
+    evolved = state.time_evolve_mps_optimizer(
+        0.005,
+        steps=1,
+        hamiltonian=ham,
+        imaginary=True,
+        chi=4,
+        inplace=False,
+    )
+
+    block = next(iter(next(iter(evolved.tn.tensor_map.values())).data.blocks.values()))
+    assert block.device.type == "cuda"
+    assert evolved.tn.L == 3
+
+
 def test_symmps_mps_optimizer_coerces_dense_hamiltonian_terms():
     """Dense custom Hamiltonian terms should not mix NumPy gates into Symmray MPS."""
     state = SymMPS.for_model(
