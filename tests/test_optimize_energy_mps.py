@@ -119,6 +119,43 @@ def test_mps_energy_accepts_mpo_hamiltonian():
     assert estimate.boundary_mode == "exact"
 
 
+def test_mps_energy_mpo_hamiltonian_uses_direct_contract(monkeypatch):
+    """MPO Hamiltonians should bypass term-wise local expectations."""
+    mps = qtn.MPS_computational_state("01")
+
+    def fail_local_terms(*_args, **_kwargs):
+        raise AssertionError("MPO energy must not use local-term expectation.")
+
+    monkeypatch.setattr(mps, "compute_local_expectation_exact", fail_local_terms)
+    z_op = np.diag([1.0, -1.0])
+    mpo = qtn.MPO_product_operator(
+        [z_op, z_op],
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+    )
+    optimize_seen = []
+    original_contract = qtn.TensorNetwork.contract
+
+    def contract_spy(self, *args, **kwargs):
+        optimize_seen.append(kwargs.get("optimize"))
+        return original_contract(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.TensorNetwork, "contract", contract_spy)
+    opt = MpsEnergyOptimizer(
+        mps,
+        mpo,
+        normalized=False,
+        energy_per_site=False,
+        real=True,
+        contraction_opt="greedy",
+    )
+
+    estimate = opt.energy()
+
+    assert estimate.energy == pytest.approx(-1.0)
+    assert optimize_seen[-1] == "greedy"
+
+
 def test_mps_energy_accepts_wrapper_and_local_ham_payload_mapping():
     """SymMPS-like wrappers and local_terms payloads should resolve."""
     state = _FakeMps(value=4.0)

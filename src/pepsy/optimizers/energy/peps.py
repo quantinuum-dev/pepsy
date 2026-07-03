@@ -661,10 +661,13 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     """Optimize finite MPS energy with exact 1D local expectations.
 
     The objective is the normalized local expectation value
-    ``<psi|H|psi>/<psi|psi>`` computed by
-    ``MPS.compute_local_expectation_exact(...)``. Hamiltonians can be supplied
-    as a ``qtn.LocalHam1D``-like object with ``.terms``, a Pepsy symmetric
-    Hamiltonian, or a plain local-term mapping.
+    ``<psi|H|psi>/<psi|psi>``. Local-term Hamiltonians are evaluated with
+    ``MPS.compute_local_expectation_exact(...)``. MPO Hamiltonians are evaluated
+    directly as ``(<psi| & H_mpo & |psi>).contract(all, optimize=...)``, using
+    ``contraction_opt`` for the full network contraction. Hamiltonians can be
+    supplied as a ``qtn.MatrixProductOperator``, a ``qtn.LocalHam1D``-like
+    object with ``.terms``, a Pepsy symmetric Hamiltonian, or a plain local-term
+    mapping.
     """
 
     _LOSS_KEYS = frozenset({
