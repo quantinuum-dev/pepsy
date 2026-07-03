@@ -8,6 +8,7 @@ from .convert import (
     infer_backend_converter_from_sample,
     resolve_backend_sample_data,
     resolve_backend_sample_data_from_tn,
+    to_float,
 )
 from ..tensors.core import (
     backend_cupy,
@@ -32,6 +33,7 @@ __all__ = [
     "infer_backend_converter_from_sample",
     "resolve_backend_sample_data",
     "resolve_backend_sample_data_from_tn",
+    "to_float",
     "get_default_array_backend",
     "get_default_grad_backend",
     "register_torch_linalg",

@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 import autoray as ar
 
+_SCALAR_TYPES = (int, float, complex, bool, np.number)
+
 _NUMPY_DTYPE_MAP = {
     "complex128": np.complex128,
     "complex64": np.complex64,
@@ -14,6 +16,64 @@ _NUMPY_DTYPE_MAP = {
     "int64": np.int64,
     "int32": np.int32,
 }
+
+
+def _backend_scalar(value):
+    """Return a Python scalar from scalar-like backend values."""
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        shape = tuple(shape)
+        if shape != ():
+            raise TypeError(f"Expected a scalar-like value, got shape {shape}.")
+
+    obj = value
+    for method_name in ("detach", "cpu"):
+        method = getattr(obj, method_name, None)
+        if callable(method):
+            obj = method()
+
+    get = getattr(obj, "get", None)
+    if callable(get) and shape is not None:
+        obj = get()
+
+    item = getattr(obj, "item", None)
+    if callable(item) and not isinstance(obj, _SCALAR_TYPES):
+        try:
+            obj = item()
+        except (TypeError, ValueError, RuntimeError):
+            pass
+
+    if isinstance(obj, _SCALAR_TYPES):
+        return obj
+
+    arr = np.asarray(obj)
+    if arr.shape != ():
+        raise TypeError(f"Expected a scalar-like value, got shape {arr.shape}.")
+    return arr.item()
+
+
+def to_float(value, *, real=True):
+    """Convert a scalar-like backend value to a Python ``float``.
+
+    The input can be a Python scalar, NumPy scalar or scalar array, or a
+    scalar-like backend tensor. Torch-style values are detached and moved to
+    CPU before extracting ``.item()``; CuPy-style values are host-transferred
+    with ``.get()`` when available. Non-scalar arrays raise ``TypeError``.
+
+    Parameters
+    ----------
+    value
+        Scalar-like object to convert.
+    real
+        If ``True`` (default), return the real component. This is convenient
+        for expectation values whose imaginary part should be numerical noise.
+        If ``False``, complex values follow Python's normal ``float(...)``
+        rules and therefore raise when they are not real.
+    """
+    scalar = _backend_scalar(value)
+    if real:
+        scalar = np.real(scalar)
+    return float(scalar)
 
 
 def resolve_backend_sample_data(obj):

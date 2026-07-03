@@ -11,4 +11,5 @@ Top-level convenience exports.
 .. autofunction:: pepsy.peps_infidelity
 .. autofunction:: pepsy.tn_fidelity
 .. autofunction:: pepsy.tn_norm
+.. autofunction:: pepsy.to_float
 ```

@@ -46,6 +46,7 @@ _SYMBOL_MODULES = {
     "reset_default_backends": ".backends",
     "set_default_array_backend": ".backends",
     "set_default_grad_backend": ".backends",
+    "to_float": ".backends",
     "FIT": ".fitting",
     "internal_inds": ".fitting",
     "build_mpo_from_gates": ".operators",
@@ -188,6 +189,7 @@ __all__ = [
     "reset_default_backends",
     "set_default_array_backend",
     "set_default_grad_backend",
+    "to_float",
     "FIT",
     "build_mpo_from_gates",
     "build_pepo_from_gates",
@@ -309,6 +311,7 @@ if TYPE_CHECKING:
         reset_default_backends,
         set_default_array_backend,
         set_default_grad_backend,
+        to_float,
     )
     from .boundary import (
         BdyMPS,
