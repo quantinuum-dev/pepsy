@@ -41,4 +41,5 @@ howto/index
 examples
 api/index
 development/package_layout
+development/fermi_hubbard_u1u1_mpo_notes
 ```

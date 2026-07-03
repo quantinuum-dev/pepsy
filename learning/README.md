@@ -16,6 +16,8 @@ user-facing, promote it into `docs/` (tutorials / how-to).
   `autoray`); the "pepsy concept → quimb API" map.
 - [`symmray.md`](symmray.md) — Block-sparse abelian-symmetric and fermionic
   tensors via `symmray`, and how they bridge into pepsy's tagging conventions.
+- [`fermionic_mpo.md`](fermionic_mpo.md) — Fermionic Fermi-Hubbard MPO
+  conventions, the Symmray/Jordan-Wigner bridge, and current validation status.
 
 ## Relationship to other docs
 

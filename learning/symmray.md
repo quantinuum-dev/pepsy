@@ -76,6 +76,11 @@ Phys. Rev. Research 7, 023193 (2025).
 - Fermionic norm and a small Fermi–Hubbard energy match ED on a 2×2 patch,
   exercising `label`/`dummy_modes` phase tracking and the conjugation phase-flip.
 
+For the repaired finite-chain Fermi-Hubbard MPO bridge, see
+`learning/fermionic_mpo.md`. The important convention is that a native
+fermionic Symmray MPS must be bosonized into the same Jordan-Wigner gauge as the
+bosonic MPO before direct MPO energy evaluation.
+
 ## Other libraries (for comparison)
 
 `abeliantensors`, `yastn`, `pyblock3`, Google `TensorNetwork`, `grassmanntn`,

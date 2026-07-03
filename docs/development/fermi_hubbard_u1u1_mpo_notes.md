@@ -1,6 +1,7 @@
 # Fermi-Hubbard U1U1 MPO Notes
 
 Living investigation record, started 2026-07-03.
+Last updated: 2026-07-03.
 
 This note records what we have learned while debugging the Symmray-backed
 spinful Fermi-Hubbard U1U1 MPS/MPO path. It is intentionally practical:
@@ -22,8 +23,8 @@ Hamiltonian terms. The MPO energy is computed from a bosonic Jordan-Wigner MPO
 after converting the fermionic Symmray MPS into the same bosonic JW
 representation.
 
-The direct MPO path is now repaired for the tested finite-chain cases. The fix
-has two parts:
+As of 2026-07-03, the direct MPO path is repaired for the tested finite-chain
+cases and committed. The fix has two parts:
 
 - The spinful U1U1 FH MPO uses explicit JW endpoint operators:
   `c_i^dag P_i ... c_j` and `P_i c_i ... c_j^dag`, with the overall `-t`
@@ -36,6 +37,12 @@ has two parts:
   has odd parity.
 
 The old source-term fallback is not used for the direct MPO expectation.
+
+Implementation checkpoints:
+
+- `1ebf5d4 Fix fermionic FH MPO energy path`
+- `affefad Quiet expected test warnings`
+- `7d1dec4 Refine tensor schematic visuals`
 
 On 2026-07-03 the notebook-shaped 4 by 3 periodic case was rerun from a
 scratch script using the same seed, half-filled U1U1 sector, `D=16`, compressed
@@ -60,6 +67,19 @@ after tau=0.03 steps=10:
 The scratch run was interrupted during the final `tau=0.01` block because it
 was spending a long time in Symmray QR/canonicalization, not because an energy
 mismatch appeared.
+
+Focused and package-level validation after the fix:
+
+```text
+pytest -q tests/test_symmetric_tensors.py
+  84 passed
+
+pytest -q
+  1100 passed
+```
+
+The full-suite warning summary was also cleaned up, so the expected optional
+dependency and backend warnings no longer obscure the result.
 
 ## Empirical Findings
 
@@ -98,6 +118,17 @@ That mixture is safe only if the exact bosonization gauge between the Symmray
 fermionic tensor basis and the chosen Jordan-Wigner chain basis is applied. The
 implemented route is: convert the MPS to a bosonic JW representation with the
 derived bond-sector phase, and contract it with a bosonic JW MPO.
+
+The current site-major JW convention for an edge `i < j` is:
+
+- forward hopping: `c_i^dag P_i ... P_{j-1} c_j`
+- backward hopping: `P_i c_i ... P_{j-1} c_j^dag`
+- coefficient: `-t_sigma`
+
+There is no parity prefix from site 0 and no alternating `(-1)^i` patch. The
+left endpoint parity is part of the convention; an earlier intermediate
+interpretation that used bare endpoints plus strictly interior parity was not
+the final passing implementation.
 
 ## External References And Lessons
 
@@ -166,18 +197,15 @@ data too early.
 
 ## Next Experiments
 
-1. Extend the dense Fock-space oracle into a permanent, compact test helper for
-   L <= 4 spinful Hubbard chains, including shifted edges and periodic wrap
-   edges.
-2. Re-run the full `fh_mps` notebook through the final `tau=0.01` schedule
+1. Re-run the full `fh_mps` notebook through the final `tau=0.01` schedule
    block when runtime is acceptable, and update the saved notebook output.
-3. Write down the Symmray U1U1 site basis explicitly, including charge order,
+2. Write down the Symmray U1U1 site basis explicitly, including charge order,
    local state order, double-occupancy phase, and how `dag`/non-`dag`
    operators act on that basis.
-4. Use MPS-FQE/block2 as an optional external oracle for small chemistry-style
+3. Use MPS-FQE/block2 as an optional external oracle for small chemistry-style
    Hamiltonians if those dependencies are available locally. Do not introduce
    them as Pepsy dependencies.
-5. Only after the notebook-level MPO expectation is confirmed, revisit DMRG2
+4. Only after the notebook-level MPO expectation is confirmed, revisit DMRG2
    adaptation:
    block-sparse eigensolver sectors, SVD sector truncation, Lanczos environment
    construction, and torch/autodiff support are separate problems from the
@@ -185,10 +213,15 @@ data too early.
 
 ## Acceptance Criteria For The True MPO Fix
 
-- Term and MPO energies match for random U1U1 fermionic MPS states at bond
+- [x] Term and MPO energies match for random U1U1 fermionic MPS states at bond
   dimensions 2, 3, 8, and 16.
-- Tests include adjacent, shifted, long-range, and periodic-wrap edges.
-- Hopping-only, onsite-only, and combined Hamiltonians are tested separately.
-- Dense Fock oracle comparisons pass on L <= 4.
-- The fix does not rely on the source-term fallback in `MpsEnergyOptimizer`.
-- Coordinate-mapped 2D edges match explicit flat-chain edges.
+- [x] Tests include adjacent, shifted, long-range, and periodic-wrap edges.
+- [x] Hopping-only, onsite-only, and combined Hamiltonians are tested
+  separately.
+- [x] Dense Fock oracle comparisons pass on L <= 4.
+- [x] The fix does not rely on the source-term fallback in
+  `MpsEnergyOptimizer`.
+- [x] Coordinate-mapped 2D edges match explicit flat-chain edges.
+- [x] Focused symmetric-tensor tests and the full package suite pass.
+- [ ] The full `fh_mps` notebook output is rerun and saved through the final
+  `tau=0.01` schedule block.

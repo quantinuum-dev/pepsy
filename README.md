@@ -63,6 +63,10 @@ https://doi.org/10.1103/PhysRevResearch.7.023193. It motivates keeping
 fermionic parity and leg-order metadata in Symmray arrays while letting quimb
 choose graph-level contraction orders.
 
+The current finite-chain Fermi-Hubbard MPO convention and validation record are
+tracked in `learning/fermionic_mpo.md` and
+`docs/development/fermi_hubbard_u1u1_mpo_notes.md`.
+
 ```python
 import pepsy as py
 

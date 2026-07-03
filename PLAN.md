@@ -1,7 +1,7 @@
 # PLAN.md — pepsy roadmap
 
 Status: living document
-Last updated: 2026-07-02
+Last updated: 2026-07-03
 Owners: pepsy maintainers + coding agents
 
 This document tracks the planned workstreams for `pepsy` (boundary-MPS tools for
@@ -21,7 +21,8 @@ Four headline workstreams drive the roadmap:
    later torch-only pure-PEPS path for ITF, Fermi-Hubbard, Heisenberg, etc.
 
 The conceptual background for each lives in `learning/bp.md`,
-`learning/quimb.md`, and `learning/symmray.md`.
+`learning/quimb.md`, `learning/symmray.md`, and
+`learning/fermionic_mpo.md`.
 
 ---
 
@@ -154,6 +155,21 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   dangling legs (norms, cluster/infinite settings), explicitly phase-flip the
   conjugated network's dangling dual legs — the main correctness pitfall.
 
+### Current progress (validated)
+
+- The spinful Fermi-Hubbard `U1U1` direct MPO energy path is repaired for the
+  tested finite-chain cases. Pepsy now evaluates the bosonic Jordan-Wigner MPO
+  against a bosonized Symmray fermionic MPS with the required bond-sector phase.
+- The MPO hopping convention is documented and regression tested: for `i < j`
+  the left endpoint carries the JW endpoint parity, interior sites carry parity,
+  and the direct MPO expectation does not fall back to source terms.
+- Focused symmetric-tensor tests and the full package suite passed after the
+  fix and warning cleanup (`tests/test_symmetric_tensors.py` and `pytest -q`).
+- The 4 by 3 periodic `fh_mps`-shaped scratch run matched local terms and MPO
+  energy through the first two imaginary-time schedule blocks. The last
+  `tau=0.01` block still needs a complete notebook rerun because runtime, not a
+  mismatch, interrupted the scratch check.
+
 ### Validation
 
 - Abelian (`Z2` / `U1`) PEPS norm `⟨ψ|ψ⟩` matches a dense contraction on a tiny
@@ -165,6 +181,8 @@ constructions, plus the fermionic Fermi-Hubbard starters in
 ### References
 
 - Concept note: `learning/symmray.md`.
+- Fermionic MPO convention note: `learning/fermionic_mpo.md`.
+- Development/debug note: `docs/development/fermi_hubbard_u1u1_mpo_notes.md`.
 - Gao et al., *Fermionic tensor network contraction for arbitrary geometries*,
   Phys. Rev. Research 7, 023193 (2025), DOI `10.1103/PhysRevResearch.7.023193`.
 
@@ -338,6 +356,9 @@ New public symbols must be threaded consistently:
 - Exact pepsy-vs-quimb division of labor for BP (wrap vs. own per component) —
   resolve during the BP prototype (§1, §3).
 - `symmray` version to pin (currently tracking v0.2.x).
+- Whether to keep the repaired finite-chain Fermi-Hubbard MPO bridge as the
+  long-term route, or later add a fully native fermionic MPO path that avoids
+  bosonizing the MPS.
 - Whether loop-series corrections expose free-energy, transfer-matrix, and
   2-site-density-matrix outputs behind one `BPResult` or separate result types.
 
