@@ -171,18 +171,16 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   mismatch, interrupted the scratch check.
 - `SymDMRG2` now provides the public two-site DMRG entry point. Dense/quimb MPOs
   delegate directly to `quimb.tensor.DMRG2`; Symmray MPOs select the Pepsy
-  block-sparse path, infer the fixed total charge from `SymMPS`, and record the
-  initial MPO energy before stopping at the not-yet-implemented local
-  sector-eigensolver.
-- The first Pepsy-native Symmray DMRG internals are in place: dense left/right
-  environments for `<psi|MPO|psi>`, environment-energy validation against
-  `MpsEnergyOptimizer`, a sector-preserving two-site matvec on the current
-  `theta` block layout, dense norm environments for `<psi|psi>`, and exact
-  dense generalized local solves/writeback. Small `L>2` FH U1U1 chains now run
-  correctness-reference two-direction sweeps in the current block layout.
-- The next DMRG step is replacing the dense local matrices with a block-sparse
-  Lanczos/LinearOperator path, then adding torch-native kernels where the block
-  matvec benefits from them.
+  block-sparse path, infer the fixed total charge from `SymMPS`, and optimize
+  in that fixed sector.
+- The Pepsy-native Symmray DMRG internals now include dense left/right
+  environments for `<psi|MPO|psi>`, dense norm environments for `<psi|psi>`,
+  sector-preserving `H_eff` and `N_eff` matvecs in the exact current `theta`
+  block layout, dense generalized fallback solves, and a quimb-style
+  Lanczos/LinearOperator local solver after MPS canonicalization.
+- The next DMRG step is performance and scale: reduce dense embedding inside
+  the local matvec, add torch-native block contractions where useful, and later
+  add PBC segment-compressed moving environments.
 
 ### Validation
 

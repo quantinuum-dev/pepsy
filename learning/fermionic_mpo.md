@@ -126,16 +126,15 @@ the interruption.
 - `SymDMRG2` now exists as the API and quimb-adapter scaffold: dense/quimb MPOs
   run through `quimb.tensor.DMRG2`, while Symmray FH MPOs initialize the Pepsy
   block-sparse path, infer the fixed charge, and record the initial MPO energy.
-- The first Symmray DMRG internals are also present: Pepsy builds dense
-  left/right environments for `<psi|MPO|psi>`, validates their energy against
-  `MpsEnergyOptimizer`, applies a two-site effective-Hamiltonian matvec in the
-  exact current `theta` block layout, and performs an exact dense local solve
-  with Symmray SVD writeback for `L=2` correctness runs.
-- Longer-chain Symmray sweeps now use an explicit effective norm, not an
-  assumed canonical center. Pepsy builds `<psi|psi>` left/right environments,
-  applies `N_eff` in the same theta block layout as `H_eff`, solves the dense
-  generalized problem `H_eff theta = E N_eff theta`, and then writes back with
-  Symmray SVD.
-- The real remaining DMRG work is performance and scale: replace the dense
-  reference local matrices with a block-sparse Lanczos/LinearOperator path,
-  then make the block matvec torch-native where useful.
+- The Symmray DMRG internals follow the ITensor/TeNPy/quimb pattern more
+  closely now: canonicalize the MPS center, view the projected two-site
+  Hamiltonian as a linear operator in the exact current `theta` block layout,
+  use the current theta vector as the Krylov/Lanczos initial vector, and split
+  the optimized theta with Symmray SVD.
+- The explicit effective norm remains in the code as both a validator and a
+  dense generalized fallback. If canonicalization does not make `N_eff`
+  identity-like, small local problems solve `H_eff theta = E N_eff theta`
+  directly rather than trusting an H-only Lanczos solve.
+- The real remaining DMRG work is performance and scale: reduce dense embedding
+  in the matvec, add torch-native block contractions where useful, and later
+  add PBC segment-compressed moving environments.

@@ -7,6 +7,26 @@ import pepsy
 from pepsy.tensors import SymHamiltonian, SymMPS, site_charge_from_occupations
 
 
+def _fh_u1u1_chain(L, occupations, *, bond_dim=3, seed=13, U=2.0, mu=0.1):
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        L,
+        bond_dim=bond_dim,
+        site_charge=site_charge_from_occupations(occupations),
+        seed=seed,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(site, site + 1) for site in range(L - 1)],
+        t=1.0,
+        U=U,
+        mu=mu,
+    )
+    return state, ham.to_mpo(L=L, compress=False)
+
+
 def test_symdmrg2_delegates_dense_mpo_to_quimb_dmrg2():
     """Dense/quimb MPOs should run through quimb's DMRG2 implementation."""
     mpo = qtn.MPO_ham_ising(2, j=1.0, bx=0.5)
@@ -89,23 +109,7 @@ def test_symdmrg2_solves_two_site_symmray_fh_u1u1_dense_reference():
 def test_symdmrg2_solves_longer_chain_with_effective_norm():
     """L>2 uses H and N environments for a safe dense reference sweep."""
     pytest.importorskip("symmray")
-    state = SymMPS.for_model(
-        "fermi_hubbard_u1u1",
-        3,
-        bond_dim=3,
-        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0)]),
-        seed=13,
-        dtype="complex128",
-    )
-    ham = SymHamiltonian.from_edges(
-        "fermi_hubbard_u1u1",
-        "U1U1",
-        [(0, 1), (1, 2)],
-        t=1.0,
-        U=2.0,
-        mu=0.1,
-    )
-    mpo = ham.to_mpo(L=3, compress=False)
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
 
     opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, sweeps=1)
     ref_energy = pepsy.MpsEnergyOptimizer(
@@ -144,9 +148,105 @@ def test_symdmrg2_solves_longer_chain_with_effective_norm():
     assert out is opt
     assert opt.state.max_bond() <= 4
     assert len(opt.energies) == 1
-    assert opt.energy <= local_energy
+    assert opt.energy <= local_energy + 1e-12
     assert complex(post_energy) == pytest.approx(complex(opt.energy))
     assert opt.environment_energy() == pytest.approx(complex(opt.energy))
+
+
+def test_symdmrg2_linear_operator_matches_dense_effective_hamiltonian():
+    """The Lanczos LinearOperator should be the same H_eff as dense columns."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, sweeps=1)
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    theta = opt.two_site_theta(0)
+    space = opt.two_site_theta_space(0, theta)
+    operator = opt.two_site_effective_hamiltonian(0, theta)
+    matrix = opt._dense_operator_matrix(
+        0,
+        theta,
+        space.metadata,
+        opt.two_site_matvec,
+    )
+
+    vector = space.vector
+    assert operator.shape == matrix.shape
+    assert operator @ vector == pytest.approx(matrix @ vector)
+
+    vectors = vector.reshape(-1, 1)
+    vectors = vectors.repeat(2, axis=1)
+    assert operator @ vectors == pytest.approx(matrix @ vectors)
+
+
+def test_symdmrg2_lanczos_matches_dense_after_canonicalization():
+    """Canonical-center Lanczos should reproduce the dense local reference."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-12,
+        local_eig_ncv=8,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_norm_environments()
+    theta = opt.two_site_theta(0)
+
+    assert opt.effective_norm_identity_error(0, theta, samples=3) < 1e-12
+    hermitian, herm_error = opt.check_two_site_hermiticity(0, theta, samples=3)
+    assert hermitian, herm_error
+
+    dense_energy, dense_theta = opt.dense_local_eigensolve(0)
+    lanczos_energy, lanczos_theta = opt.lanczos_local_eigensolve(0, theta=theta)
+
+    assert lanczos_energy == pytest.approx(dense_energy)
+    assert lanczos_theta.inds == dense_theta.inds
+    assert set(lanczos_theta.data.blocks) == set(dense_theta.data.blocks)
+
+
+def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
+    """Forced Lanczos sweeps should still match the independent MPO energy."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+        seed=17,
+        U=1.0,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=3,
+        cutoff=1e-10,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-10,
+        local_eig_ncv=8,
+    )
+    out = opt.solve()
+    post_energy = pepsy.MpsEnergyOptimizer(
+        opt.state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert out is opt
+    assert opt.state.max_bond() <= 3
+    assert len(opt.energies) == 1
+    assert complex(post_energy) == pytest.approx(complex(opt.energy))
 
 
 def test_symdmrg2_rejects_quimb_backend_for_symmray_arrays():

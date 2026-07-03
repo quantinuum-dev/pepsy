@@ -4,8 +4,8 @@ This module provides the public :class:`SymDMRG2` API that Pepsy will grow into
 for Symmray-backed block-sparse Hamiltonians. Ordinary quimb MPOs are delegated
 directly to :class:`quimb.tensor.DMRG2`; Symmray MPOs use Pepsy's bosonic
 Jordan-Wigner/U1U1 path with dense reference environments, a sector-preserving
-two-site matvec, dense norm environments, and an exact dense generalized local
-solve in the current theta block layout.
+two-site matvec, dense norm environments, and dense or Lanczos local solves in
+the current theta block layout.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 from itertools import product
 
 import numpy as np
+from scipy.sparse.linalg import LinearOperator
 
 from .energy import MpsEnergyOptimizer
 
@@ -131,6 +132,27 @@ def _embed_dense_to_indices(dense, source_indices, target_indices):
     return target
 
 
+class _DenseIndex:
+    """Minimal charge-map holder for dense alignment of Symmray legs."""
+
+    def __init__(self, chargemap):
+        self.chargemap = dict(chargemap)
+
+
+def _union_dense_index(*indices):
+    chargemap = {}
+    for index in indices:
+        for charge, size in index.chargemap.items():
+            size = int(size)
+            if charge in chargemap and chargemap[charge] != size:
+                raise ValueError(
+                    f"Incompatible degeneracies for charge {charge!r}: "
+                    f"{chargemap[charge]} and {size}."
+                )
+            chargemap[charge] = size
+    return _DenseIndex({charge: chargemap[charge] for charge in sorted(chargemap, key=repr)})
+
+
 def _blocks_from_projected_dense(dense, full_indices, template_data):
     full_slices = [_charge_slices(ix) for ix in full_indices]
     blocks = {}
@@ -185,6 +207,84 @@ def _unflatten_blocks(vector, metadata):
     return blocks
 
 
+def _normalize_local_solver(local_solver):
+    key = str(local_solver).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto",
+        "dense": "dense",
+        "exact": "dense",
+        "lanczos": "lanczos",
+        "linear_operator": "lanczos",
+        "linop": "lanczos",
+        "generalized": "generalized_dense",
+        "generalized_dense": "generalized_dense",
+        "dense_generalized": "generalized_dense",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown local_solver {local_solver!r}. Expected one of: {allowed}."
+        ) from exc
+
+
+class _ThetaSpace:
+    """Flat vector adapter for one fixed Symmray two-site theta layout."""
+
+    def __init__(self, theta):
+        self.theta = theta.copy()
+        self.inds = tuple(theta.inds)
+        self.data_template = theta.data
+        self.vector, self.metadata = _flatten_blocks(theta.data)
+        self.dim = int(self.vector.size)
+        self.dtype = np.dtype(np.result_type(self.vector.dtype, complex))
+        self.sectors = tuple(item[0] for item in self.metadata)
+        self.block_shapes = tuple(item[1] for item in self.metadata)
+
+    def _check_tensor(self, theta):
+        if tuple(theta.inds) != self.inds:
+            raise ValueError("Theta tensor indices changed during local solve.")
+        _, metadata = _flatten_blocks(theta.data)
+        sectors = tuple(item[0] for item in metadata)
+        shapes = tuple(item[1] for item in metadata)
+        if sectors != self.sectors or shapes != self.block_shapes:
+            raise ValueError("Theta tensor block layout changed during local solve.")
+
+    def flatten(self, theta):
+        self._check_tensor(theta)
+        vector, _ = _flatten_blocks(theta.data)
+        return np.asarray(vector, dtype=self.dtype)
+
+    def unflatten(self, vector):
+        blocks = _unflatten_blocks(np.asarray(vector).reshape(-1), self.metadata)
+        data = _array_with_blocks_like(self.data_template, blocks)
+        return _tensor_with_data(self.theta, data)
+
+
+class _SymmrayEffectiveHamiltonian(LinearOperator):
+    """Projected two-site Hamiltonian as a matrix-free linear operator."""
+
+    def __init__(self, optimizer, site, theta_space):
+        self.optimizer = optimizer
+        self.site = int(site)
+        self.theta_space = theta_space
+        super().__init__(
+            dtype=theta_space.dtype,
+            shape=(theta_space.dim, theta_space.dim),
+        )
+
+    def _matvec(self, vector):
+        theta = self.theta_space.unflatten(vector)
+        out = self.optimizer.two_site_matvec(self.site, theta)
+        return self.theta_space.flatten(out)
+
+    def _matmat(self, matrix):
+        matrix = np.asarray(matrix)
+        cols = [self._matvec(matrix[:, col]) for col in range(matrix.shape[1])]
+        return np.column_stack(cols)
+
+
 class SymDMRG2:
     """Two-site DMRG facade for dense quimb and Symmray MPOs.
 
@@ -220,6 +320,19 @@ class SymDMRG2:
     norm_rcond
         Relative cutoff for dropping tiny effective-norm eigenvalues in the
         dense generalized local solve.
+    local_solver
+        ``"auto"`` selects dense local solves below ``dense_threshold`` and
+        Lanczos linear-operator solves above it. ``"dense"``, ``"lanczos"``,
+        and ``"generalized_dense"`` force a specific Symmray local solver.
+    dense_threshold
+        Active theta-vector dimension at or below which ``local_solver="auto"``
+        uses the dense reference Hamiltonian solve.
+    local_eig_tol, local_eig_ncv, local_eig_maxiter, local_eig_backend
+        Krylov/Lanczos eigensolver options passed to quimb's eigensolver
+        wrapper for matrix-free local solves.
+    norm_check_tol
+        Tolerance for checking that the canonical-center effective norm acts
+        like identity before using an H-only dense or Lanczos solve.
     """
 
     def __init__(
@@ -236,6 +349,14 @@ class SymDMRG2:
         tol=1e-4,
         max_dense_dim=4096,
         norm_rcond=1e-10,
+        local_solver="auto",
+        dense_threshold=800,
+        local_eig_tol=1e-8,
+        local_eig_ncv=8,
+        local_eig_maxiter=None,
+        local_eig_backend=None,
+        norm_check_tol=1e-6,
+        norm_check_samples=2,
         dmrg_opts=None,
     ):
         if chi is None:
@@ -256,6 +377,18 @@ class SymDMRG2:
         self.tol = float(tol)
         self.max_dense_dim = int(max_dense_dim)
         self.norm_rcond = float(norm_rcond)
+        self.local_solver = _normalize_local_solver(local_solver)
+        self.dense_threshold = int(dense_threshold)
+        self.local_eig_tol = float(local_eig_tol)
+        self.local_eig_ncv = (
+            None if local_eig_ncv is None else int(local_eig_ncv)
+        )
+        self.local_eig_maxiter = (
+            None if local_eig_maxiter is None else int(local_eig_maxiter)
+        )
+        self.local_eig_backend = local_eig_backend
+        self.norm_check_tol = float(norm_check_tol)
+        self.norm_check_samples = int(norm_check_samples)
         self.dmrg_opts = {} if dmrg_opts is None else dict(dmrg_opts)
 
         requested_backend = _normalize_backend(backend)
@@ -335,6 +468,16 @@ class SymDMRG2:
     def _index_for_tensor_ind(tensor, ind):
         return tensor.data.indices[tensor.inds.index(ind)]
 
+    def _dense_index_for_state_ind(self, ind):
+        indices = [
+            self._index_for_tensor_ind(tensor, ind)
+            for tensor in self._state
+            if ind in tensor.inds
+        ]
+        if not indices:
+            raise ValueError(f"State index {ind!r} is not present in the MPS.")
+        return _union_dense_index(*indices)
+
     def _theta_order(self, site):
         right_site = site + 1
         order = []
@@ -354,12 +497,39 @@ class SymDMRG2:
             elif ind == self._site_ind(right_site):
                 full_indices.append(self._index_for_tensor_ind(self.mpo[right_site], ind))
             elif site > 0 and ind == self._state.bond(site - 1, site):
-                full_indices.append(self._index_for_tensor_ind(self._state[site], ind))
+                full_indices.append(self._dense_index_for_state_ind(ind))
             elif right_site < self._state.L - 1 and ind == self._state.bond(right_site, right_site + 1):
-                full_indices.append(self._index_for_tensor_ind(self._state[right_site], ind))
+                full_indices.append(self._dense_index_for_state_ind(ind))
             else:  # pragma: no cover - defensive consistency check
                 raise ValueError(f"Unexpected theta index {ind!r}.")
         return tuple(full_indices)
+
+    def _theta_norm_full_indices(self, site, theta):
+        right_site = site + 1
+        full_indices = []
+        for axis, ind in enumerate(theta.inds):
+            if ind == self._site_ind(site) or ind == self._site_ind(right_site):
+                full_indices.append(theta.data.indices[axis])
+            elif site > 0 and ind == self._state.bond(site - 1, site):
+                full_indices.append(self._dense_index_for_state_ind(ind))
+            elif right_site < self._state.L - 1 and ind == self._state.bond(right_site, right_site + 1):
+                full_indices.append(self._dense_index_for_state_ind(ind))
+            else:  # pragma: no cover - defensive consistency check
+                raise ValueError(f"Unexpected theta index {ind!r}.")
+        return tuple(full_indices)
+
+    def _state_target_indices_for_site(self, site, physical_index):
+        target_indices = {
+            self._site_ind(site): physical_index,
+            self._bra_site_ind(site): physical_index,
+        }
+        if site > 0:
+            bond = self._state.bond(site - 1, site)
+            target_indices[bond] = self._dense_index_for_state_ind(bond)
+        if site < self._state.L - 1:
+            bond = self._state.bond(site, site + 1)
+            target_indices[bond] = self._dense_index_for_state_ind(bond)
+        return target_indices
 
     @staticmethod
     def _dense_tensor(tensor):
@@ -437,10 +607,10 @@ class SymDMRG2:
             else:  # pragma: no cover
                 raise ValueError(f"Unexpected MPO index {ind!r} at site {site}.")
 
-        target_indices = {
-            self._site_ind(site): self._index_for_tensor_ind(mpo_t, self._site_ind(site)),
-            self._bra_site_ind(site): self._index_for_tensor_ind(mpo_t, self._bra_site_ind(site)),
-        }
+        target_indices = self._state_target_indices_for_site(
+            site,
+            self._index_for_tensor_ind(mpo_t, self._site_ind(site)),
+        )
         arrays.extend((
             self._dense_tensor_aligned(bra_t, target_indices),
             self._dense_tensor(mpo_t),
@@ -507,10 +677,10 @@ class SymDMRG2:
             else:  # pragma: no cover
                 raise ValueError(f"Unexpected MPO index {ind!r} at site {site}.")
 
-        target_indices = {
-            self._site_ind(site): self._index_for_tensor_ind(mpo_t, self._site_ind(site)),
-            self._bra_site_ind(site): self._index_for_tensor_ind(mpo_t, self._bra_site_ind(site)),
-        }
+        target_indices = self._state_target_indices_for_site(
+            site,
+            self._index_for_tensor_ind(mpo_t, self._site_ind(site)),
+        )
         arrays.extend((
             self._dense_tensor_aligned(bra_t, target_indices),
             self._dense_tensor(mpo_t),
@@ -601,10 +771,7 @@ class SymDMRG2:
                 raise ValueError(f"Unexpected bra index {ind!r} at site {site}.")
 
         phys_index = self._index_for_tensor_ind(ket_t, self._site_ind(site))
-        target_indices = {
-            self._site_ind(site): phys_index,
-            self._bra_site_ind(site): phys_index,
-        }
+        target_indices = self._state_target_indices_for_site(site, phys_index)
         arrays.extend((
             self._dense_tensor_aligned(bra_t, target_indices),
             self._dense_tensor_aligned(ket_t, target_indices),
@@ -654,10 +821,7 @@ class SymDMRG2:
                 raise ValueError(f"Unexpected bra index {ind!r} at site {site}.")
 
         phys_index = self._index_for_tensor_ind(ket_t, self._site_ind(site))
-        target_indices = {
-            self._site_ind(site): phys_index,
-            self._bra_site_ind(site): phys_index,
-        }
+        target_indices = self._state_target_indices_for_site(site, phys_index)
         arrays.extend((
             self._dense_tensor_aligned(bra_t, target_indices),
             self._dense_tensor_aligned(ket_t, target_indices),
@@ -892,7 +1056,7 @@ class SymDMRG2:
     def two_site_norm_matvec(self, site, theta=None):
         """Apply the two-site effective norm operator to ``theta``."""
         theta = self.two_site_theta(site) if theta is None else theta
-        full_indices = tuple(theta.data.indices)
+        full_indices = self._theta_norm_full_indices(site, theta)
         dense = _embed_dense_to_indices(
             _dense_data(theta.data),
             theta.data.indices,
@@ -902,6 +1066,76 @@ class SymDMRG2:
         blocks = _blocks_from_projected_dense(out_dense, full_indices, theta.data)
         data = _array_with_blocks_like(theta.data, blocks)
         return _tensor_with_data(theta, data)
+
+    def two_site_theta_space(self, site, theta=None):
+        """Return the active flat vector space for the current two-site theta."""
+        theta = self.two_site_theta(site) if theta is None else theta
+        return _ThetaSpace(theta)
+
+    def two_site_effective_hamiltonian(self, site, theta=None):
+        """Return ``H_eff`` as a matrix-free operator in theta block space."""
+        space = self.two_site_theta_space(site, theta)
+        if space.dim == 0:
+            raise ValueError("The two-site theta tensor has no active blocks.")
+        return _SymmrayEffectiveHamiltonian(self, site, space)
+
+    def effective_norm_identity_error(
+        self,
+        site,
+        theta=None,
+        *,
+        samples=None,
+        seed=0,
+    ):
+        """Return max relative error of ``N_eff`` versus identity on samples."""
+        theta = self.two_site_theta(site) if theta is None else theta
+        space = self.two_site_theta_space(site, theta)
+        if space.dim == 0:
+            raise ValueError("The two-site theta tensor has no active blocks.")
+
+        samples = self.norm_check_samples if samples is None else int(samples)
+        vectors = [space.vector.astype(space.dtype, copy=False)]
+        rng = np.random.default_rng(seed + int(site))
+        for _ in range(max(samples - 1, 0)):
+            real = rng.standard_normal(space.dim)
+            imag = rng.standard_normal(space.dim)
+            vectors.append(np.asarray(real + 1.0j * imag, dtype=space.dtype))
+
+        max_error = 0.0
+        for vector in vectors:
+            trial = space.unflatten(vector)
+            out = self.two_site_norm_matvec(site, trial)
+            out_vector = space.flatten(out)
+            scale = max(float(np.linalg.norm(vector)), 1.0)
+            error = float(np.linalg.norm(out_vector - vector) / scale)
+            max_error = max(max_error, error)
+        return max_error
+
+    def check_two_site_hermiticity(
+        self,
+        site,
+        theta=None,
+        *,
+        samples=2,
+        atol=1e-8,
+        seed=0,
+    ):
+        """Return whether random theta-space probes see Hermitian ``H_eff``."""
+        theta = self.two_site_theta(site) if theta is None else theta
+        operator = self.two_site_effective_hamiltonian(site, theta)
+        dim = operator.shape[0]
+        rng = np.random.default_rng(seed + int(site))
+        max_error = 0.0
+        for _ in range(int(samples)):
+            x = rng.standard_normal(dim) + 1.0j * rng.standard_normal(dim)
+            y = rng.standard_normal(dim) + 1.0j * rng.standard_normal(dim)
+            hx = operator @ x
+            hy = operator @ y
+            lhs = np.vdot(x, hy)
+            rhs = np.vdot(hx, y)
+            scale = max(abs(lhs), abs(rhs), 1.0)
+            max_error = max(max_error, float(abs(lhs - rhs) / scale))
+        return max_error <= float(atol), max_error
 
     def _dense_operator_matrix(self, site, theta, metadata, matvec):
         vector, _ = _flatten_blocks(theta.data)
@@ -942,6 +1176,79 @@ class SymDMRG2:
         blocks = _unflatten_blocks(evecs[:, pick], metadata)
         theta_opt = _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
         return energy, theta_opt
+
+    def lanczos_local_eigensolve(self, site, *, theta=None):
+        """Solve the local theta problem with quimb's matrix-free eigensolver."""
+        from quimb.linalg.base_linalg import eigh  # pylint: disable=import-outside-toplevel
+
+        theta = self.two_site_theta(site) if theta is None else theta
+        space = self.two_site_theta_space(site, theta)
+        dim = space.dim
+        if dim == 0:
+            raise ValueError("The two-site theta tensor has no active blocks.")
+        if dim <= 2:
+            return self.dense_local_eigensolve(site)
+
+        operator = _SymmrayEffectiveHamiltonian(self, site, space)
+        ncv = self.local_eig_ncv
+        if ncv is not None:
+            ncv = min(max(2, int(ncv)), max(2, dim - 1))
+
+        evals, evecs = eigh(
+            operator,
+            k=1,
+            which=self.which,
+            v0=space.vector,
+            backend=self.local_eig_backend,
+            ncv=ncv,
+            tol=self.local_eig_tol,
+            maxiter=self.local_eig_maxiter,
+            fallback_to_scipy=True,
+        )
+        evals = np.asarray(evals).reshape(-1)
+        evecs = np.asarray(evecs)
+        vector = evecs[:, 0] if evecs.ndim == 2 else evecs.reshape(-1)
+        theta_opt = space.unflatten(vector)
+        return float(evals[0].real), theta_opt
+
+    def _norm_identity_or_fallback(self, site, theta, dim):
+        norm_error = self.effective_norm_identity_error(site, theta)
+        if norm_error <= self.norm_check_tol:
+            return True, norm_error
+        if dim <= self.max_dense_dim:
+            return False, norm_error
+        raise ValueError(
+            "Effective norm is not identity-like after canonicalization "
+            f"(relative error {norm_error:.3e} > norm_check_tol="
+            f"{self.norm_check_tol:.3e}) and theta dimension {dim} exceeds "
+            f"max_dense_dim={self.max_dense_dim}; cannot safely run an H-only "
+            "Lanczos local solve."
+        )
+
+    def local_eigensolve(self, site):
+        """Solve one two-site local problem using the configured Symmray path."""
+        theta = self.two_site_theta(site)
+        space = self.two_site_theta_space(site, theta)
+        dim = space.dim
+        if dim == 0:
+            raise ValueError("The two-site theta tensor has no active blocks.")
+
+        solver = self.local_solver
+        if solver == "auto":
+            solver = "dense" if dim <= self.dense_threshold else "lanczos"
+
+        if solver == "generalized_dense":
+            return self.dense_generalized_local_eigensolve(site)
+
+        norm_ok, _ = self._norm_identity_or_fallback(site, theta, dim)
+        if not norm_ok:
+            return self.dense_generalized_local_eigensolve(site)
+
+        if solver == "dense":
+            return self.dense_local_eigensolve(site)
+        if solver == "lanczos":
+            return self.lanczos_local_eigensolve(site, theta=theta)
+        raise ValueError(f"Unknown local solver mode {solver!r}.")
 
     def dense_generalized_local_eigensolve(
         self,
@@ -1026,7 +1333,30 @@ class SymDMRG2:
         self._state.site_ind_id = getattr(self._state, "site_ind_id", "k{}")
         return self._state[site], self._state[right_site]
 
-    def _symmray_sweep_direction(self, direction, *, chi, cutoff):
+    def _clear_environments(self):
+        self.left_envs = None
+        self.right_envs = None
+        self.left_norm_envs = None
+        self.right_norm_envs = None
+
+    def _canonize_for_sweep(self, direction):
+        method_name = {
+            "right": "right_canonize",
+            "left": "left_canonize",
+        }[direction]
+        method = getattr(self._state, method_name, None)
+        if not callable(method):
+            return
+        try:
+            result = method(bra=None)
+        except TypeError:
+            result = method()
+        if result is not None:
+            self._state = result
+            self.mps = self._state
+        self._clear_environments()
+
+    def _symmray_sweep_direction(self, direction, *, chi, cutoff, canonize=True):
         if direction == "right":
             sites = range(self._state.L - 1)
             split_direction = "right"
@@ -1036,9 +1366,14 @@ class SymDMRG2:
         else:  # pragma: no cover - private consistency check
             raise ValueError("direction must be 'right' or 'left'.")
 
+        if canonize:
+            self._canonize_for_sweep(direction)
+        self.build_environments()
+        self.build_norm_environments()
+
         last_energy = None
         for site in sites:
-            last_energy, theta = self.dense_generalized_local_eigensolve(site)
+            last_energy, theta = self.local_eigensolve(site)
             self._replace_two_site_theta(
                 site,
                 theta,
@@ -1094,24 +1429,20 @@ class SymDMRG2:
         self._state = self.driver.state
         return self
 
-    def _solve_symmray(self, *, chi, cutoff, sweeps):
+    def _solve_symmray(self, *, chi, cutoff, sweeps, tol):
         if self._state is None:
             raise ValueError("SymDMRG2 backend='symmray' requires an initial MPS.")
         if self._state.L < 2:
             raise ValueError("SymDMRG2 requires an MPS with at least two sites.")
 
-        self.build_environments()
-        self.build_norm_environments()
         for _ in range(sweeps):
             self._symmray_sweep_direction("right", chi=chi, cutoff=cutoff)
             if self._state.L > 2:
-                self.build_environments()
-                self.build_norm_environments()
                 self._symmray_sweep_direction("left", chi=chi, cutoff=cutoff)
             self.build_environments()
             self.build_norm_environments()
             self.energies.append(self.environment_energy(normalized=True).real)
-            if len(self.energies) >= 2 and abs(self.energies[-1] - self.energies[-2]) < self.tol:
+            if len(self.energies) >= 2 and abs(self.energies[-1] - self.energies[-2]) < tol:
                 self.converged = True
                 break
         else:
@@ -1132,7 +1463,7 @@ class SymDMRG2:
         """Run DMRG2 and return ``self``.
 
         Dense/quimb MPOs are solved immediately by quimb's implementation.
-        Symmray MPOs use Pepsy's sector-preserving dense reference path.
+        Symmray MPOs use Pepsy's sector-preserving dense/Lanczos reference path.
         """
         chi = self.chi if chi is None else int(chi)
         cutoff = self.cutoff if cutoff is None else float(cutoff)
@@ -1154,7 +1485,7 @@ class SymDMRG2:
                 sweep_sequence=sweep_sequence,
                 solve_opts=solve_opts,
             )
-        return self._solve_symmray(chi=chi, cutoff=cutoff, sweeps=sweeps)
+        return self._solve_symmray(chi=chi, cutoff=cutoff, sweeps=sweeps, tol=tol)
 
     run = solve
 
@@ -1166,6 +1497,13 @@ class SymDMRG2:
             "chi": self.chi,
             "cutoff": self.cutoff,
             "norm_rcond": self.norm_rcond,
+            "local_solver": self.local_solver,
+            "dense_threshold": self.dense_threshold,
+            "local_eig_tol": self.local_eig_tol,
+            "local_eig_ncv": self.local_eig_ncv,
+            "local_eig_maxiter": self.local_eig_maxiter,
+            "local_eig_backend": self.local_eig_backend,
+            "norm_check_tol": self.norm_check_tol,
             "sweeps": self.sweeps,
             "total_charge": self.total_charge,
             "initial_energy": self.initial_energy,

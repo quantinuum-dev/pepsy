@@ -207,10 +207,12 @@ data too early.
    them as Pepsy dependencies.
 4. Only after the notebook-level MPO expectation is confirmed, revisit DMRG2
    adaptation:
-   the first dense reference path now has explicit `H_eff` and `N_eff`
-   environments for small longer-chain sweeps, while block-sparse Lanczos,
-   sector truncation policy, and torch/autodiff support remain separate
-   performance problems from the fermion algebra.
+   the first stable local eigensolver path now canonicalizes the MPS center,
+   applies a quimb-compatible Lanczos `LinearOperator` in the exact current
+   `theta` block layout, and keeps the explicit dense `N_eff` generalized solve
+   as a validator/fallback. Sector truncation policy, torch/autodiff support,
+   and PBC segment-compressed environments remain separate performance
+   problems from the fermion algebra.
 
 ## Acceptance Criteria For The True MPO Fix
 
