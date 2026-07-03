@@ -213,6 +213,26 @@ def test_symdmrg2_lanczos_matches_dense_after_canonicalization():
     assert set(lanczos_theta.data.blocks) == set(dense_theta.data.blocks)
 
 
+def test_symdmrg2_rejects_cyclic_symmray_mps_chain():
+    """The Symmray DMRG path is deliberately restricted to OBC MPS chains."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+    state.mps.cyclic = True
+
+    with pytest.raises(ValueError, match="assumes an OBC MPS chain"):
+        pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, sweeps=1)
+
+
+def test_symdmrg2_rejects_cyclic_symmray_mpo_chain():
+    """Periodic lattice physics should be encoded as long-range OBC MPO terms."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+    mpo.cyclic = True
+
+    with pytest.raises(ValueError, match="assumes an OBC MPO chain"):
+        pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, sweeps=1)
+
+
 def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
     """Forced Lanczos sweeps should still match the independent MPO energy."""
     pytest.importorskip("symmray")

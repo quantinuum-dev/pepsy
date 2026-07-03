@@ -131,10 +131,11 @@ the interruption.
   Hamiltonian as a linear operator in the exact current `theta` block layout,
   use the current theta vector as the Krylov/Lanczos initial vector, and split
   the optimized theta with Symmray SVD.
-- The explicit effective norm remains in the code as both a validator and a
-  dense generalized fallback. If canonicalization does not make `N_eff`
-  identity-like, small local problems solve `H_eff theta = E N_eff theta`
-  directly rather than trusting an H-only Lanczos solve.
+- The Symmray DMRG path assumes an OBC MPS/MPO chain. Periodic lattice edges
+  should be represented as long-range terms in that OBC MPO.
+- The explicit effective norm remains in the code as a validator and
+  diagnostic. After OBC canonicalization, `N_eff` should be identity-like; if
+  it is not, the normal dense/Lanczos path raises a canonicalization/alignment
+  error rather than quietly solving a generalized problem.
 - The real remaining DMRG work is performance and scale: reduce dense embedding
-  in the matvec, add torch-native block contractions where useful, and later
-  add PBC segment-compressed moving environments.
+  in the matvec and add torch-native block contractions where useful.

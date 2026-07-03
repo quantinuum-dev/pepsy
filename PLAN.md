@@ -171,16 +171,16 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   mismatch, interrupted the scratch check.
 - `SymDMRG2` now provides the public two-site DMRG entry point. Dense/quimb MPOs
   delegate directly to `quimb.tensor.DMRG2`; Symmray MPOs select the Pepsy
-  block-sparse path, infer the fixed total charge from `SymMPS`, and optimize
-  in that fixed sector.
+  OBC block-sparse path, infer the fixed total charge from `SymMPS`, and
+  optimize in that fixed sector. Periodic lattice edges are represented as
+  long-range terms in an OBC MPO.
 - The Pepsy-native Symmray DMRG internals now include dense left/right
   environments for `<psi|MPO|psi>`, dense norm environments for `<psi|psi>`,
   sector-preserving `H_eff` and `N_eff` matvecs in the exact current `theta`
-  block layout, dense generalized fallback solves, and a quimb-style
-  Lanczos/LinearOperator local solver after MPS canonicalization.
+  block layout, an explicit dense generalized diagnostic solve, and a
+  quimb-style Lanczos/LinearOperator local solver after MPS canonicalization.
 - The next DMRG step is performance and scale: reduce dense embedding inside
-  the local matvec, add torch-native block contractions where useful, and later
-  add PBC segment-compressed moving environments.
+  the local matvec and add torch-native block contractions where useful.
 
 ### Validation
 

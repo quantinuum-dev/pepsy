@@ -219,6 +219,7 @@ def _normalize_local_solver(local_solver):
         "generalized": "generalized_dense",
         "generalized_dense": "generalized_dense",
         "dense_generalized": "generalized_dense",
+        "debug_generalized": "generalized_dense",
     }
     try:
         return aliases[key]
@@ -292,7 +293,8 @@ class SymDMRG2:
     ----------
     mpo
         Hamiltonian MPO. Dense/quimb MPOs are solved by delegating to
-        ``quimb.tensor.DMRG2``. Symmray MPOs select the Pepsy block-sparse path.
+        ``quimb.tensor.DMRG2``. Symmray MPOs select the Pepsy OBC
+        block-sparse path.
     init_mps
         Optional initial MPS. Pepsy ``SymMPS`` wrappers and raw quimb MPS objects
         are both accepted.
@@ -332,7 +334,10 @@ class SymDMRG2:
         wrapper for matrix-free local solves.
     norm_check_tol
         Tolerance for checking that the canonical-center effective norm acts
-        like identity before using an H-only dense or Lanczos solve.
+        like identity before using an H-only dense or Lanczos solve. In the
+        Symmray OBC path, a failed check is treated as a canonicalization or
+        alignment error unless ``local_solver="generalized_dense"`` is
+        explicitly requested for debugging.
     """
 
     def __init__(
@@ -418,6 +423,7 @@ class SymDMRG2:
         if self.backend == "symmray" and self.mps is not None:
             self._state = self._prepare_symmray_state(self.mps)
             self.mps = self._state
+            self._validate_obc_chain()
 
     @property
     def state(self):
@@ -458,6 +464,19 @@ class SymDMRG2:
         if any(_is_fermionic_symmray_array(data) for data in _iter_tensor_data(state)):
             return MpsEnergyOptimizer._bosonize_fermionic_tn(state)
         return state.copy()
+
+    def _validate_obc_chain(self):
+        if bool(getattr(self._state, "cyclic", False)):
+            raise ValueError(
+                "SymDMRG2 backend='symmray' assumes an OBC MPS chain. "
+                "Use long-range MPO terms to represent periodic lattice edges."
+            )
+        if bool(getattr(self.mpo, "cyclic", False)):
+            raise ValueError(
+                "SymDMRG2 backend='symmray' assumes an OBC MPO chain. "
+                "Use an OBC MPO with long-range terms for periodic lattice "
+                "Hamiltonians."
+            )
 
     def _make_bra(self):
         bra = self._state.H
@@ -1211,18 +1230,17 @@ class SymDMRG2:
         theta_opt = space.unflatten(vector)
         return float(evals[0].real), theta_opt
 
-    def _norm_identity_or_fallback(self, site, theta, dim):
+    def _check_effective_norm_identity(self, site, theta):
         norm_error = self.effective_norm_identity_error(site, theta)
         if norm_error <= self.norm_check_tol:
-            return True, norm_error
-        if dim <= self.max_dense_dim:
-            return False, norm_error
+            return norm_error
         raise ValueError(
-            "Effective norm is not identity-like after canonicalization "
+            "Effective norm is not identity-like after OBC canonicalization "
             f"(relative error {norm_error:.3e} > norm_check_tol="
-            f"{self.norm_check_tol:.3e}) and theta dimension {dim} exceeds "
-            f"max_dense_dim={self.max_dense_dim}; cannot safely run an H-only "
-            "Lanczos local solve."
+            f"{self.norm_check_tol:.3e}). SymDMRG2 backend='symmray' assumes "
+            "OBC MPS canonicalization, so this indicates a canonicalization or "
+            "dense charge-alignment bug. Use local_solver='generalized_dense' "
+            "only as an explicit diagnostic."
         )
 
     def local_eigensolve(self, site):
@@ -1240,9 +1258,7 @@ class SymDMRG2:
         if solver == "generalized_dense":
             return self.dense_generalized_local_eigensolve(site)
 
-        norm_ok, _ = self._norm_identity_or_fallback(site, theta, dim)
-        if not norm_ok:
-            return self.dense_generalized_local_eigensolve(site)
+        self._check_effective_norm_identity(site, theta)
 
         if solver == "dense":
             return self.dense_local_eigensolve(site)

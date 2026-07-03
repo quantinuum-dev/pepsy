@@ -17,8 +17,12 @@
 - Added canonical sweep setup: right sweeps call quimb/Symmray
   `right_canonize`, left sweeps call `left_canonize`, then local H-only dense
   or Lanczos solves are allowed only when `N_eff` is identity-like.
+- The Symmray path now assumes OBC MPS/MPO chains. Periodic lattice edges
+  should be represented as long-range terms in an OBC MPO, not by cyclic MPS
+  DMRG.
 - Kept the explicit dense generalized `H_eff theta = E N_eff theta` solve as a
-  fallback when the norm check fails for small local spaces.
+  diagnostic mode, but normal dense/Lanczos local solves raise if the OBC
+  canonicalization check does not make `N_eff` identity-like.
 - Generalized dense alignment of MPS virtual legs. Symmray canonicalization can
   shrink visible charge maps differently on the two sides of a virtual bond, so
   dense reference contractions embed those legs into a union charge map before
@@ -30,8 +34,8 @@
   the current two-site tensor in a projected Hamiltonian, reuse the current
   theta as the Krylov starting vector, then split/truncate and move the
   canonical center.
-- Keeping the norm check and generalized fallback prevents an H-only Lanczos
-  solve from silently running when canonical form is not reliable.
+- Keeping the norm check prevents an H-only Lanczos solve from silently running
+  when OBC canonical form or dense charge alignment is not reliable.
 
 ## Validation plan
 
@@ -40,6 +44,7 @@
   - `N_eff` acts like identity after canonicalization;
   - Hermiticity probes pass;
   - Lanczos local energy matches dense local energy;
+  - cyclic Symmray MPS/MPO chains are rejected;
   - forced Lanczos sweeps on a four-site FH U1U1 chain match
     `MpsEnergyOptimizer`.
 
@@ -74,6 +79,5 @@ pytest -q
 - The matrix-free operator still uses dense embedded contractions internally.
   It avoids forming the full dense local Hamiltonian matrix, but it is not yet a
   fully block-sparse/tensor-core matvec.
-- Next step: reduce dense embedding inside the matvec, add torch-native block
-  contractions where useful, and later mirror quimb's moving-environment
-  segment compression for larger periodic chains.
+- Next step: reduce dense embedding inside the matvec and add torch-native
+  block contractions where useful.
