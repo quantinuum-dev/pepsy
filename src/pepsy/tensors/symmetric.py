@@ -4578,18 +4578,22 @@ def _build_fermionic_model_mpo(
             t_sigma = t_values[t_key]
             if t_sigma == 0:
                 continue
-            hopping_phase = -1 if i % 2 else 1
             for direction, first, second, first_charge in (
                 ("forward", create, annihilate, create_charge),
                 ("backward", annihilate, create, _charge_neg(create_charge, hamiltonian.symmetry)),
             ):
+                endpoint = (
+                    first @ ops["parity"]
+                    if direction == "forward"
+                    else ops["parity"] @ first
+                )
                 add_channel(
                     edge_pos,
                     i,
                     j,
                     (spin, direction),
                     first_charge,
-                    hopping_phase * t_sigma * first,
+                    -t_sigma * endpoint,
                     second,
                 )
 
@@ -4843,7 +4847,8 @@ class SymHamiltonian:
             idx2coo=idx2coo,
             coo2idx=coo2idx,
         )
-        edges = _map_edges_to_mpo_indices(_as_edges(self.edges), coo2idx_use)
+        raw_edges = _as_edges(self.edges)
+        edges = _map_edges_to_mpo_indices(raw_edges, coo2idx_use)
 
         if L is None:
             L = (
@@ -4858,7 +4863,7 @@ class SymHamiltonian:
             raise ValueError(f"L={L} does not match MPO mapping length {mapped_L}.")
 
         dtype = _dtype_from_hamiltonian_terms(self.terms) if dtype is None else np.dtype(dtype)
-        ops = _fh_u1u1_jw_local_ops(dtype) if L == 2 else _fh_u1u1_dense_local_ops(dtype)
+        ops = _fh_u1u1_jw_local_ops(dtype)
         phys_map = list(ops["index_map"])
         zero = (0, 0)
         start = ("start",)
@@ -4880,6 +4885,7 @@ class SymHamiltonian:
             for site in range(L):
                 transitions[site].append((start, done, onsite))
 
+        parity = ops["parity"]
         mode_terms = (
             (t_u, ops["create_u"], ops["annihilate_u"], (0, 1), "u"),
             (t_d, ops["create_d"], ops["annihilate_d"], (1, 0), "d"),
@@ -4895,32 +4901,23 @@ class SymHamiltonian:
             for t_sigma, create, annihilate, create_charge, spin in mode_terms:
                 if t_sigma == 0:
                     continue
-                hopping_phase = 1 if L == 2 or i % 2 else -1
                 for direction, first, second, first_charge in (
                     ("forward", create, annihilate, create_charge),
                     ("backward", annihilate, create, _neg_charge(create_charge)),
                 ):
                     channel_id = ("hop", edge_pos, spin, direction)
                     channel_charge = _neg_charge(first_charge)
-                    first_op = hopping_phase * t_sigma * first
-                    cut_start = 0 if L > 2 and i > 0 else i
-                    for cut in range(cut_start, j):
-                        charge = zero if cut < i else channel_charge
-                        channels[cut].append((channel_id, charge))
-
-                    if L > 2 and i > 0:
-                        transitions[0].append((start, channel_id, ops["parity"]))
-                        for site in range(1, i):
-                            transitions[site].append(
-                                (channel_id, channel_id, ops["parity"])
-                            )
-                        transitions[i].append((channel_id, channel_id, first_op))
-                    else:
-                        transitions[i].append((start, channel_id, first_op))
-
+                    # Site-major JW convention: for i < j the string spans
+                    # i <= l < j. Thus c_i^dag c_j has c_i^dag P_i on the
+                    # left endpoint, while its Hermitian conjugate has P_i c_i.
+                    endpoint = first @ parity if direction == "forward" else parity @ first
+                    first_op = -t_sigma * endpoint
+                    for cut in range(i, j):
+                        channels[cut].append((channel_id, channel_charge))
+                    transitions[i].append((start, channel_id, first_op))
                     for site in range(i + 1, j):
                         transitions[site].append(
-                            (channel_id, channel_id, ops["parity"])
+                            (channel_id, channel_id, parity)
                         )
                     transitions[j].append((channel_id, done, second))
 

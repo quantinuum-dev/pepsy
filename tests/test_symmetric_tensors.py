@@ -991,12 +991,52 @@ def test_fermi_hubbard_u1u1_hamiltonian_builds_mpo_energy_path():
         energy_per_site=False,
         real=False,
     ).energy().energy
-    term_energy = state.energy(
-        hamiltonian=ham,
-        normalized=True,
-        contraction_opt="auto-hq",
-    )
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
 
+    assert complex(mpo_energy) == pytest.approx(complex(term_energy))
+
+
+def test_fermi_hubbard_u1u1_mpo_energy_matches_high_bond_fermionic_mps():
+    """High-bond fermionic FH MPS energy should use the direct MPO."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=16,
+        site_charge=site_charge_from_occupations(
+            [(1, 0), (0, 1), (1, 0), (0, 1)]
+        ),
+        seed=222,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1)],
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+    )
+    mpo = ham.to_mpo(L=4, compress=True, max_bond=48, cutoff=1e-12)
+
+    mpo_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert not hasattr(mpo, "_pepsy_source_terms")
     assert complex(mpo_energy) == pytest.approx(complex(term_energy))
 
 
@@ -1031,11 +1071,12 @@ def test_symmetric_hamiltonian_to_mpo_supports_spin_models(
         energy_per_site=False,
         real=False,
     ).energy().energy
-    term_energy = state.energy(
-        hamiltonian=ham,
-        normalized=True,
-        contraction_opt="auto-hq",
-    )
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
 
     assert mpo.L == 2
     assert type(mpo[0].data).__name__.startswith(symmetry)
@@ -1147,9 +1188,16 @@ def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_compresses_long_range():
         energy_per_site=False,
         real=False,
     ).energy().energy
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
 
     assert mpo.max_bond() >= 3
     assert mpo_compressed.max_bond() <= mpo.max_bond()
+    assert complex(energy) == pytest.approx(complex(term_energy))
     assert complex(energy_compressed) == pytest.approx(complex(energy))
 
 
@@ -1252,9 +1300,16 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
         energy_per_site=False,
         real=False,
     ).energy().energy
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
 
     assert mpo.max_bond() >= 3
     assert mpo_compressed.max_bond() <= mpo.max_bond()
+    assert complex(energy) == pytest.approx(complex(term_energy))
     assert complex(energy_compressed) == pytest.approx(complex(energy))
 
 
@@ -1266,6 +1321,8 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
         ((0.0, 1.0), [(1, 0), (0, 0)]),
         ((0.0, 1.0), [(1, 1), (0, 1)]),
         ((1.0, 1.0), [(1, 0), (0, 1)]),
+        ((1.0, 1.0), [(0, 0), (1, 1)]),
+        ((1.0, 1.0), [(1, 1), (0, 0)]),
     ],
 )
 def test_fermi_hubbard_u1u1_hamiltonian_mpo_matches_two_site_sectors(
@@ -1297,11 +1354,12 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_matches_two_site_sectors(
         energy_per_site=False,
         real=False,
     ).energy().energy
-    term_energy = state.energy(
-        hamiltonian=ham,
-        normalized=True,
-        contraction_opt="auto-hq",
-    )
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
 
     assert complex(mpo_energy) == pytest.approx(complex(term_energy))
 
@@ -1368,10 +1426,17 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_builds_pbc_wrap_edge():
         energy_per_site=False,
         real=False,
     ).energy().energy
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
 
     assert mpo.L == 4
     assert mpo.max_bond() >= 4
     assert np.isfinite(complex(energy))
+    assert complex(energy) == pytest.approx(complex(term_energy))
 
 
 def test_fermi_hubbard_u1u1_hamiltonian_mpo_maps_2d_edges_with_onedmap():
@@ -2012,3 +2077,123 @@ def test_symmetric_classes_are_top_level_lazy_exports():
     assert pepsy.SymPEPS is SymPEPS
     assert pepsy.default_physical_sectors is default_physical_sectors
     assert pepsy.symm_operator_from_dense is symm_operator_from_dense
+
+
+def _dense_jw_fermi_hubbard(L, edges, *, t=1.0, U=4.0, mu=0.3):
+    """Independent dense spinful Fermi-Hubbard Hamiltonian via Jordan-Wigner.
+
+    Built from scratch (2L spin-orbitals, explicit Z strings) with no reference
+    to Symmray, so it is an independent oracle for the U1U1 MPO spectrum.
+    """
+    n = 2 * L
+    eye = np.eye(2)
+    zed = np.array([[1.0, 0.0], [0.0, -1.0]])
+    lower = np.array([[0.0, 1.0], [0.0, 0.0]])
+
+    def annihilate(mode):
+        mats = [zed] * mode + [lower] + [eye] * (n - mode - 1)
+        out = mats[0]
+        for mat in mats[1:]:
+            out = np.kron(out, mat)
+        return out
+
+    def mode(site, spin):
+        return 2 * site + spin  # spin 0 = up, 1 = down
+
+    ham = np.zeros((2 ** n, 2 ** n))
+    for i, j in edges:
+        for spin in (0, 1):
+            hop = annihilate(mode(i, spin)).conj().T @ annihilate(mode(j, spin))
+            ham += -t * (hop + hop.conj().T)
+    for site in range(L):
+        num_up = annihilate(mode(site, 0)).conj().T @ annihilate(mode(site, 0))
+        num_dn = annihilate(mode(site, 1)).conj().T @ annihilate(mode(site, 1))
+        ham += U * (num_up @ num_dn) - mu * (num_up + num_dn)
+    return ham
+
+
+def _mpo_to_dense_matrix(mpo, L):
+    tensor = mpo.copy().contract(all)
+    fused = tensor.to_dense(
+        [f"k{i}" for i in range(L)], [f"b{i}" for i in range(L)]
+    )
+    if hasattr(fused, "to_dense"):
+        fused = fused.to_dense()
+    return np.asarray(fused)
+
+
+@pytest.mark.parametrize(
+    "L,edges",
+    [
+        (3, [(0, 1), (1, 2)]),          # nearest-neighbour chain
+        (3, [(0, 2)]),                  # single long-range (parity string)
+        (4, [(0, 1), (1, 2), (2, 3), (0, 3)]),  # periodic wrap -> crossing term
+    ],
+)
+def test_fermi_hubbard_u1u1_mpo_matches_dense_jw_spectrum(L, edges):
+    """The U1U1 FH MPO spectrum must match an independent dense JW Hamiltonian."""
+    t, U, mu = 1.0, 4.0, 0.3
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", edges, t=t, U=U, mu=mu
+    )
+    mpo = ham.to_mpo(L=L, compress=False)
+
+    matrix = _mpo_to_dense_matrix(mpo, L)
+    assert np.max(np.abs(matrix - matrix.conj().T)) < 1e-10  # Hermitian
+
+    reference = _dense_jw_fermi_hubbard(L, edges, t=t, U=U, mu=mu)
+    spec_mpo = np.sort(np.linalg.eigvalsh((matrix + matrix.conj().T) / 2).real)
+    spec_ref = np.sort(np.linalg.eigvalsh(reference).real)
+    np.testing.assert_allclose(spec_mpo, spec_ref, atol=1e-9)
+
+
+def test_fermi_hubbard_u1u1_mpo_matches_terms_on_2d_snake_lattice():
+    """MPO expectation must match the term energy on the notebook's 2D snake map.
+
+    The 4x3 periodic square lattice mapped through a snake OneDMap produces many
+    crossing long-range hopping channels -- exactly the case that earlier sign
+    conventions got wrong while single-edge tests still passed.
+    """
+    import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+    Lx, Ly = 4, 3
+    L = Lx * Ly
+    mapper = OneDMap(Lx, Ly, mode="snake")
+    _, coo2idx = mapper.build()
+    half = {
+        (x, y): (1, 0) if (x + y) % 2 == 0 else (0, 1)
+        for x in range(Lx)
+        for y in range(Ly)
+    }
+    site_charge = site_charge_from_occupations(
+        {coo2idx[c]: q for c, q in half.items()}
+    )
+
+    for cyclic in (False, True):
+        edges = [
+            (coo2idx[a], coo2idx[b])
+            for a, b in qtn.edges_2d_square(Lx, Ly, cyclic=cyclic)
+        ]
+        state = SymMPS.random(
+            L,
+            symmetry="U1U1",
+            fermionic=True,
+            phys_dim=default_physical_sectors(model="fermi_hubbard_u1u1"),
+            site_charge=site_charge,
+            bond_dim=8,
+            seed=13,
+            dtype="complex128",
+        )
+        ham = SymHamiltonian.from_edges(
+            "fermi_hubbard_u1u1", "U1U1", edges, t=1.0, U=8.0, mu=0.0
+        )
+        mpo = ham.to_mpo(L=L, compress=False)
+
+        mpo_energy = pepsy.MpsEnergyOptimizer(
+            state, mpo, energy_per_site=False, real=False
+        ).energy().energy
+        term_energy = pepsy.MpsEnergyOptimizer(
+            state, ham.terms, energy_per_site=False, real=False
+        ).energy().energy
+
+        assert complex(mpo_energy) == pytest.approx(complex(term_energy))

@@ -229,6 +229,33 @@ class PepsEnergyOptimizer:
         return converter(term)
 
     @classmethod
+    def _convert_state_arrays(cls, state, converter):
+        if converter is None:
+            return state
+        apply_to_arrays = getattr(state, "apply_to_arrays", None)
+        if not callable(apply_to_arrays):
+            return state
+        apply_to_arrays(lambda array: cls._convert_term_array(array, converter))
+        return state
+
+    @classmethod
+    def _state_for_autodiff_backend(
+        cls,
+        state,
+        reference_state,
+        autodiff_backend,
+        *,
+        device="cpu",
+    ):
+        dtype_name = cls._dtype_name(cls._sample_array_from_tn(reference_state))
+        converter = cls._autodiff_backend_converter(
+            autodiff_backend,
+            dtype_name,
+            device=device,
+        )
+        return cls._convert_state_arrays(state, converter)
+
+    @classmethod
     def _terms_for_autodiff_backend(cls, terms, state, autodiff_backend, *, device="cpu"):
         dtype_name = cls._autodiff_dtype_name(state, terms)
         converter = cls._autodiff_backend_converter(
@@ -649,6 +676,12 @@ class PepsEnergyOptimizer:
                 return self.state
         out = tnopt.optimize(n=n, **optimize_kwargs)
         self.losses = list(getattr(tnopt, "losses", ()))
+        out = self._state_for_autodiff_backend(
+            out,
+            self.state,
+            autodiff_backend,
+            device=device,
+        )
         if normalize:
             out = self.normalize(out, **dict(normalize_kwargs or {}))
         self.state = out
@@ -773,31 +806,133 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                 return candidate
         return None
 
+    @staticmethod
+    def _charge_zero_like(charge):
+        if isinstance(charge, tuple):
+            return tuple(0 for _ in charge)
+        return 0
+
+    @staticmethod
+    def _charge_add(a, b):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        if isinstance(a, tuple) or isinstance(b, tuple):
+            if not isinstance(a, tuple):
+                a = (a,) * len(b)
+            if not isinstance(b, tuple):
+                b = (b,) * len(a)
+            return tuple(x + y for x, y in zip(a, b))
+        return a + b
+
+    @staticmethod
+    def _charge_neg(charge):
+        if isinstance(charge, tuple):
+            return tuple(-x for x in charge)
+        return -charge
+
+    @classmethod
+    def _charge_sub(cls, a, b):
+        return cls._charge_add(a, cls._charge_neg(b))
+
+    @staticmethod
+    def _charge_parity(charge):
+        if charge is None:
+            return 0
+        if isinstance(charge, tuple):
+            return sum(int(x) for x in charge) % 2
+        return int(charge) % 2
+
     @classmethod
     def _bosonize_fermionic_tn(cls, tn):
         import symmray.utils as sr_utils  # pylint: disable=import-outside-toplevel
 
         target = tn.copy()
-        for tensor in target:
+        if not hasattr(target, "L"):
+            tensors = tuple(target)
+        else:
+            tensors = tuple(target[site] for site in range(int(target.L)))
+
+        tensor_charges = [
+            getattr(getattr(tensor, "data", None), "charge", None)
+            for tensor in tensors
+        ]
+        tensor_is_fermionic = [
+            cls._is_symmray_array(getattr(tensor, "data", None))
+            and cls._is_fermionic_array(getattr(tensor, "data", None))
+            for tensor in tensors
+        ]
+        prefix_charge = None
+        for site, tensor in enumerate(tensors):
             data = getattr(tensor, "data", None)
             if not (cls._is_symmray_array(data) and cls._is_fermionic_array(data)):
+                prefix_charge = cls._charge_add(
+                    prefix_charge,
+                    getattr(data, "charge", None),
+                )
                 continue
             symmetry = cls._symmray_symmetry_name(data)
             if symmetry is None:
                 continue
+            # Materialize any lazy fermionic swap phases into the block data
+            # before dropping to a bosonic array; otherwise the JW image of the
+            # state loses those phases and the MPO sandwich is wrong.
+            phase_sync = getattr(data, "phase_sync", None)
+            if callable(phase_sync):
+                data = phase_sync()
             array_cls = sr_utils.get_array_cls(symmetry, fermionic=False)
-            blocks = {
-                sector: cls._copy_array_like(block)
-                for sector, block in data.blocks.items()
-            }
+            tensor_charge = getattr(data, "charge", None)
+            if prefix_charge is None:
+                prefix_charge = cls._charge_zero_like(tensor_charge)
+            prefix_after = cls._charge_add(prefix_charge, tensor_charge)
+
+            phys_ind = f"k{site}"
+            try:
+                phys_axis = tensor.inds.index(phys_ind)
+            except ValueError:
+                phys_axis = len(tensor.inds) - 1
+
+            right_axis = None
+            if site + 1 < len(tensors):
+                right_inds = [
+                    ind
+                    for ind in tensor.inds
+                    if ind in set(tensors[site + 1].inds)
+                ]
+                if right_inds:
+                    right_axis = tensor.inds.index(right_inds[0])
+            next_dummy_parity = (
+                cls._charge_parity(tensor_charges[site + 1])
+                if site + 1 < len(tensors) and tensor_is_fermionic[site + 1]
+                else 0
+            )
+            dummy_crossing_parity = (
+                cls._charge_parity(prefix_after) & next_dummy_parity
+            )
+
+            blocks = {}
+            for sector, block in data.blocks.items():
+                exponent = 0
+                if right_axis is not None:
+                    # This is the left-to-right Symmray fermionic contraction
+                    # phase for the outgoing virtual mode, plus the dummy-mode
+                    # phase created by the next odd tensor.
+                    right_parity = cls._charge_parity(sector[right_axis])
+                    phys_parity = cls._charge_parity(sector[phys_axis])
+                    exponent ^= right_parity & (phys_parity ^ 1)
+                    exponent ^= dummy_crossing_parity
+                block = cls._copy_array_like(block)
+                blocks[sector] = -block if exponent else block
             tensor.modify(
                 data=array_cls(
                     indices=data.indices,
-                    charge=getattr(data, "charge", None),
+                    charge=tensor_charge,
                     blocks=blocks,
                     symmetry=symmetry,
                 )
             )
+            prefix_charge = prefix_after
         return target
 
     @classmethod
@@ -1079,6 +1214,12 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                 return self.state
         out = tnopt.optimize(n=n, **optimize_kwargs)
         self.losses = list(getattr(tnopt, "losses", ()))
+        out = self._state_for_autodiff_backend(
+            out,
+            self.state,
+            autodiff_backend,
+            device=device,
+        )
         if normalize:
             out = self.normalize(out, **dict(normalize_kwargs or {}))
         self.state = out
