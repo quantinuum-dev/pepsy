@@ -128,29 +128,43 @@ peps_torch = peps.to_backend(to_backend, inplace=False)
 ham_torch = ham.to_backend(to_backend, inplace=False)
 ```
 
-## Fermi-Hubbard MPO mapping
+## Symmetric MPO mapping
 
-Spin-resolved Fermi-Hubbard Hamiltonians can be built on 2D or 3D coordinate
-edges and then flattened into a symmetry-preserving MPS-chain MPO with an
-explicit ``OneDMap`` path. The mapping is required for coordinate edges because
-it defines where long-range fermionic parity strings sit on the chain.
+Symmetric Hamiltonians can be flattened into an MPS-chain MPO with
+``SymHamiltonian.to_mpo(...)``. Coordinate edges from a 2D or 3D lattice can be
+mapped with an explicit ``OneDMap`` path. The mapping is required for
+coordinate edges because it defines where nonlocal chain channels, including
+fermionic parity strings, sit.
 
-The current MPO builder is intentionally narrow and explicit:
+Current support is:
 
-- ``SymHamiltonian.to_mpo(...)`` supports ``model="fermi_hubbard_u1u1"`` with
+- generic charge-neutral rank-4 two-site terms, including ``tfim``/``Z2`` and
+  ``heisenberg``/``U1``;
+- spinless Fermi-Hubbard ``model="fermi_hubbard_spinless"`` with ``U1`` or
+  ``Z2`` symmetry, hopping, density interaction, and chemical-potential terms
+  (pairing ``delta != 0`` is not implemented yet);
+- spinful Fermi-Hubbard ``model="fermi_hubbard_u1u1"`` with
   ``symmetry="U1U1"``.
-- The local physical space has four spinful Hubbard states with charges
-  ``(n_up, n_down)``.
-- Onsite terms use ``U * n_up * n_down - mu_up * n_up - mu_down * n_down``.
-  ``mu`` may be a scalar or ``(mu_up, mu_down)``.
-- Hopping terms use ``-t_sigma c^dagger_i_sigma c_j_sigma`` plus the reverse
-  direction. ``t`` may be a scalar or ``(t_up, t_down)``.
-- Non-adjacent mapped edges insert the dense fermionic parity operator on every
-  intermediate chain site, so a 2D nearest-neighbor edge can become a nonlocal
-  MPS-chain term without dropping fermionic signs.
+
+Spinful total-particle-number ``model="fermi_hubbard"`` with ``symmetry="U1"``
+still raises ``NotImplementedError``; use ``model="fermi_hubbard_u1u1"`` when
+an MPO is required for spinful Fermi-Hubbard.
+
+For spinful ``U1U1`` Fermi-Hubbard, the local physical space has four spinful
+Hubbard states with charges ``(n_up, n_down)``. Onsite terms use
+``U * n_up * n_down - mu_up * n_up - mu_down * n_down``. ``mu`` may be a scalar
+or ``(mu_up, mu_down)``. Hopping terms use
+``-t_sigma c^dagger_i_sigma c_j_sigma`` plus the reverse direction, and ``t``
+may be a scalar or ``(t_up, t_down)``.
+
+For fermionic models, non-adjacent mapped hopping edges insert the dense
+fermionic parity operator on every intermediate chain site, so a 2D
+nearest-neighbor edge can become a nonlocal MPS-chain term without dropping
+fermionic signs.
+
 - The returned object is a ``quimb.tensor.MatrixProductOperator`` whose tensor
-  data are Symmray ``U1U1`` block-sparse arrays. Its physical index families
-  default to ``k{}`` and ``b{}``, matching Pepsy's MPS/MPO conventions.
+  data are Symmray block-sparse arrays. Its physical index families default to
+  ``k{}`` and ``b{}``, matching Pepsy's MPS/MPO conventions.
 
 ```python
 mapper = py.OneDMap(Lx=4, Ly=4, mode="snake")
@@ -190,9 +204,10 @@ mpo = ham.to_mpo(L=3, compress=True, max_bond=16, cutoff=1e-12)
 ``to_mpo`` also accepts ``to_backend=`` to map each stored Symmray block to an
 array backend, and ``dtype=`` to choose the dense local operator dtype used
 before conversion to block-sparse arrays. The implementation is validated by
-checking that MPO energies agree with the local two-site ``SymHamiltonian``
-energy path, that compressed long-range MPOs preserve the uncompressed energy,
-and that ``OneDMap`` coordinate edges match equivalent flat integer edges.
+checking that supported adjacent MPO energies agree with the local two-site
+``SymHamiltonian`` energy path, that compressed long-range MPOs preserve the
+uncompressed energy, and that ``OneDMap`` coordinate edges match equivalent
+flat integer edges.
 
 ## Time evolution
 

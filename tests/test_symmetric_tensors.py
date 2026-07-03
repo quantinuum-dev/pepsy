@@ -891,6 +891,189 @@ def test_fermi_hubbard_u1u1_hamiltonian_builds_mpo_energy_path():
     assert complex(mpo_energy) == pytest.approx(complex(term_energy))
 
 
+@pytest.mark.parametrize(
+    "model,symmetry,site_charges,params",
+    [
+        ("tfim", "Z2", [0, 0], {"jx": -1.0, "hz": -0.5}),
+        ("heisenberg", "U1", [1, 0], {}),
+    ],
+)
+def test_symmetric_hamiltonian_to_mpo_supports_spin_models(
+    model,
+    symmetry,
+    site_charges,
+    params,
+):
+    """Generic SymHamiltonian MPOs should support non-fermionic Z2/U1 terms."""
+    state = SymMPS.for_model(
+        model,
+        2,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations(site_charges),
+        seed=21,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(model, symmetry, [(0, 1)], **params)
+    mpo = ham.to_mpo(L=2, compress=False)
+
+    mpo_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    term_energy = state.energy(
+        hamiltonian=ham,
+        normalized=True,
+        contraction_opt="auto-hq",
+    )
+
+    assert mpo.L == 2
+    assert type(mpo[0].data).__name__.startswith(symmetry)
+    assert complex(mpo_energy) == pytest.approx(complex(term_energy))
+
+
+def test_spinless_fermi_hubbard_u1_hamiltonian_builds_mpo_energy_path():
+    """Spinless FH U1 MPOs should preserve the fermionic contraction signs."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_spinless",
+        2,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([1, 0]),
+        seed=23,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_spinless",
+        "U1",
+        [(0, 1)],
+        t=1.0,
+        V=0.5,
+        mu=0.1,
+    )
+    mpo = ham.to_mpo(L=2, compress=False)
+
+    mpo_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    term_energy = state.energy(
+        hamiltonian=ham,
+        normalized=True,
+        contraction_opt="auto-hq",
+    )
+
+    assert type(mpo[0].data).__name__ == "U1Array"
+    assert complex(mpo_energy) == pytest.approx(complex(term_energy))
+
+
+def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_compresses_long_range():
+    """Spinless FH long-range MPOs should insert parity strings and compress."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_spinless",
+        3,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([1, 0, 0]),
+        seed=25,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_spinless",
+        "U1",
+        [(0, 2)],
+        t=1.0,
+        V=0.0,
+        mu=0.0,
+    )
+    mpo = ham.to_mpo(L=3, compress=False)
+    mpo_compressed = ham.to_mpo(L=3, compress=True, max_bond=16, cutoff=1e-12)
+
+    energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    energy_compressed = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo_compressed,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert mpo.max_bond() >= 3
+    assert mpo_compressed.max_bond() <= mpo.max_bond()
+    assert complex(energy_compressed) == pytest.approx(complex(energy))
+
+
+def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_maps_2d_long_range_edge():
+    """Spinless FH coordinate edges should match their mapped flat edge."""
+    mapper = OneDMap(2, 2, mode="snake")
+    idx2coo, coo2idx = mapper.build()
+    edge_2d = ((0, 0), (1, 0))
+    occupations = {
+        (0, 0): 1,
+        (0, 1): 0,
+        (1, 0): 0,
+        (1, 1): 0,
+    }
+    state = SymMPS.for_model(
+        "fermi_hubbard_spinless",
+        4,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations(
+            [occupations[idx2coo[i]] for i in range(4)]
+        ),
+        seed=26,
+        dtype="complex128",
+    )
+    params = {"t": 1.0, "V": 0.0, "mu": 0.0}
+    ham_2d = SymHamiltonian.from_edges(
+        "fermi_hubbard_spinless",
+        "U1",
+        [edge_2d],
+        **params,
+    )
+    flat_edge = tuple(coo2idx[site] for site in edge_2d)
+    ham_flat = SymHamiltonian.from_edges(
+        "fermi_hubbard_spinless",
+        "U1",
+        [flat_edge],
+        **params,
+    )
+
+    mpo_from_mapper = ham_2d.to_mpo(mapper=mapper, compress=False)
+    mpo_from_flat = ham_flat.to_mpo(L=4, compress=False)
+
+    def energy(mpo):
+        return pepsy.MpsEnergyOptimizer(
+            state,
+            mpo,
+            energy_per_site=False,
+            real=False,
+        ).energy().energy
+
+    assert abs(coo2idx[edge_2d[0]] - coo2idx[edge_2d[1]]) > 1
+    assert complex(energy(mpo_from_mapper)) == pytest.approx(complex(energy(mpo_from_flat)))
+
+
+def test_spinful_fermi_hubbard_total_u1_mpo_fails_clearly():
+    """Spinful FH total-U1 MPOs are intentionally not routed through U1U1."""
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard",
+        "U1",
+        [(0, 1)],
+        t=1.0,
+        U=4.0,
+        mu=0.1,
+    )
+
+    with pytest.raises(NotImplementedError, match="total-U1"):
+        ham.to_mpo(L=2)
+
+
 def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
     """Long-range mapped FH terms should include a parity string and compress."""
     state = SymMPS.for_model(

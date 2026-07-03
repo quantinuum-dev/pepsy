@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Integral
 
@@ -2400,6 +2401,51 @@ def _neg_charge(charge):
     return -int(charge)
 
 
+def _normalize_group_charge(charge, symmetry):
+    symmetry = str(symmetry)
+    if isinstance(charge, tuple):
+        charge = tuple(int(x) for x in charge)
+        if symmetry == "Z2Z2":
+            return tuple(x % 2 for x in charge)
+        return charge
+    charge = int(charge)
+    if symmetry == "Z2":
+        return charge % 2
+    return charge
+
+
+def _charge_add(a, b, symmetry):
+    if isinstance(a, tuple) or isinstance(b, tuple):
+        a = _as_tuple(a)
+        b = _as_tuple(b)
+        if len(a) != len(b):
+            raise ValueError("Cannot add charges with different ranks.")
+        charge = tuple(int(x) + int(y) for x, y in zip(a, b))
+    else:
+        charge = int(a) + int(b)
+    return _normalize_group_charge(charge, symmetry)
+
+
+def _charge_sub(a, b, symmetry):
+    return _charge_add(a, _charge_neg(b, symmetry), symmetry)
+
+
+def _charge_neg(charge, symmetry):
+    if isinstance(charge, tuple):
+        charge = tuple(-int(x) for x in charge)
+    else:
+        charge = -int(charge)
+    return _normalize_group_charge(charge, symmetry)
+
+
+def _charge_sort_key(charge):
+    return repr(charge)
+
+
+def _is_fermionic_symmray_array(value):
+    return "FermionicArray" in type(value).__name__
+
+
 def _first_term_block_sample(terms):
     for term in dict(terms).values():
         blocks = getattr(term, "blocks", None)
@@ -2431,7 +2477,169 @@ def _as_spin_pair(value, *, name):
     return left, right
 
 
+def _edge_parameter(value, left, right):
+    if callable(value):
+        return value(left, right)
+    if isinstance(value, Mapping):
+        try:
+            return value[(left, right)]
+        except KeyError:
+            return value[(right, left)]
+    return value
+
+
+def _node_parameter(value, site):
+    if callable(value):
+        return value(site)
+    if isinstance(value, Mapping):
+        return value[site]
+    return value
+
+
+def _dense_numpy(value, *, dtype=None):
+    value = _to_dense(value)
+    detach = getattr(value, "detach", None)
+    if callable(detach):
+        value = detach()
+    cpu = getattr(value, "cpu", None)
+    if callable(cpu):
+        value = cpu()
+    return np.asarray(value, dtype=dtype)
+
+
+def _expanded_index_charges(index):
+    chargemap = getattr(index, "chargemap", None)
+    if chargemap is None:
+        raise TypeError("SymHamiltonian.to_mpo requires Symmray index charge maps.")
+    out = []
+    for charge, size in chargemap.items():
+        out.extend([charge] * int(size))
+    return out
+
+
+def _term_dense_and_phys_maps(term, *, dtype, reverse=False):
+    dense = _dense_numpy(term, dtype=dtype)
+    if dense.ndim != 4 or dense.shape[0] != dense.shape[2] or dense.shape[1] != dense.shape[3]:
+        raise ValueError(
+            "SymHamiltonian.to_mpo requires two-site terms with shape "
+            "(da, db, da, db)."
+        )
+
+    indices = getattr(term, "indices", None)
+    if indices is None or len(indices) != 4:
+        raise TypeError("SymHamiltonian.to_mpo requires Symmray rank-4 terms.")
+
+    left_out = _expanded_index_charges(indices[0])
+    right_out = _expanded_index_charges(indices[1])
+    left_in = _expanded_index_charges(indices[2])
+    right_in = _expanded_index_charges(indices[3])
+
+    if reverse:
+        dense = dense.transpose(1, 0, 3, 2)
+        left_out, right_out = right_out, left_out
+        left_in, right_in = right_in, left_in
+
+    if left_out != left_in or right_out != right_in:
+        raise ValueError("MPO terms must use matching upper/lower physical charge maps.")
+
+    return dense, left_out, right_out
+
+
+def _svd_rank_cutoff(singular_values, shape):
+    if singular_values.size == 0:
+        return 0.0
+    dtype = singular_values.dtype
+    if not np.issubdtype(dtype, np.floating):
+        dtype = np.float64
+    eps = np.finfo(dtype).eps
+    return eps * max(shape) * float(singular_values[0])
+
+
+def _decompose_neutral_two_site_term(term, *, symmetry, dtype, reverse=False):
+    """Split a neutral two-site operator into charged one-site channels."""
+    dense, left_phys, right_phys = _term_dense_and_phys_maps(
+        term,
+        dtype=dtype,
+        reverse=reverse,
+    )
+    dl, dr, _, _ = dense.shape
+    matrix = dense.transpose(0, 2, 1, 3).reshape(dl * dl, dr * dr)
+
+    left_entries = []
+    for out_i, out_charge in enumerate(left_phys):
+        for in_i, in_charge in enumerate(left_phys):
+            charge = _charge_sub(out_charge, in_charge, symmetry)
+            left_entries.append((out_i, in_i, charge))
+
+    right_entries = []
+    for out_i, out_charge in enumerate(right_phys):
+        for in_i, in_charge in enumerate(right_phys):
+            charge = _charge_sub(out_charge, in_charge, symmetry)
+            right_entries.append((out_i, in_i, charge))
+
+    left_by_charge = {}
+    for pos, (_, _, charge) in enumerate(left_entries):
+        left_by_charge.setdefault(charge, []).append(pos)
+    right_by_charge = {}
+    for pos, (_, _, charge) in enumerate(right_entries):
+        right_by_charge.setdefault(charge, []).append(pos)
+
+    channels = []
+    for left_charge in sorted(left_by_charge, key=_charge_sort_key):
+        right_charge = _charge_neg(left_charge, symmetry)
+        rows = left_by_charge[left_charge]
+        cols = right_by_charge.get(right_charge, ())
+        if not cols:
+            continue
+        block = matrix[np.ix_(rows, cols)]
+        if not np.any(block):
+            continue
+
+        u, s, vh = np.linalg.svd(block, full_matrices=False)
+        rank_cutoff = _svd_rank_cutoff(s, block.shape)
+        for rank, singular_value in enumerate(s):
+            if float(singular_value) <= rank_cutoff:
+                continue
+            root = np.sqrt(singular_value)
+            left_vec = u[:, rank] * root
+            right_vec = root * vh[rank, :]
+
+            left_op = np.zeros((dl, dl), dtype=dtype)
+            for entry_pos, value in zip(rows, left_vec):
+                out_i, in_i, _ = left_entries[entry_pos]
+                left_op[out_i, in_i] = value
+
+            right_op = np.zeros((dr, dr), dtype=dtype)
+            for entry_pos, value in zip(cols, right_vec):
+                out_i, in_i, _ = right_entries[entry_pos]
+                right_op[out_i, in_i] = value
+
+            channels.append((left_charge, left_op, right_op))
+
+    return channels, left_phys, right_phys
+
+
+def _fermion_parity_operator(phys_map, dtype):
+    diag = []
+    for charge in phys_map:
+        particle_number = _charge_particle_number(charge)
+        if particle_number is None:
+            raise ValueError("Cannot infer fermionic parity from physical charges.")
+        diag.append(-1.0 if particle_number % 2 else 1.0)
+    return np.diag(diag).astype(dtype)
+
+
+def _charged_op_needs_fermion_string(charge):
+    particle_number = _charge_particle_number(charge)
+    return particle_number is not None and particle_number % 2 != 0
+
+
 def _fh_u1u1_dense_local_ops(dtype):
+    """Return dense one-site spinful FH operators in Symmray's basis order."""
+    return _fh_spinful_dense_local_ops("U1U1", dtype)
+
+
+def _fh_spinful_dense_local_ops(symmetry, dtype):
     """Return dense one-site spinful FH operators in Symmray's basis order."""
     sr = _require_symmray()
     import symmray.fermionic_local_operators as flo  # pylint: disable=import-outside-toplevel
@@ -2448,7 +2656,7 @@ def _fh_u1u1_dense_local_ops(dtype):
         return np.asarray(arr, dtype=dtype)
 
     return {
-        "index_map": flo.get_spinful_charge_indexmap("U1U1"),
+        "index_map": flo.get_spinful_charge_indexmap(symmetry),
         "identity": np.eye(4, dtype=dtype),
         "parity": np.diag([1.0, -1.0, -1.0, 1.0]).astype(dtype),
         "annihilate_u": dense((au,)),
@@ -2461,6 +2669,31 @@ def _fh_u1u1_dense_local_ops(dtype):
     }
 
 
+def _fh_spinless_dense_local_ops(symmetry, dtype):
+    """Return dense one-site spinless FH operators in Symmray's basis order."""
+    sr = _require_symmray()
+    import symmray.fermionic_local_operators as flo  # pylint: disable=import-outside-toplevel
+
+    a = sr.FermionicOperator("a")
+    basis = ((), (a.dag,))
+
+    def dense(term_ops, coeff=1.0):
+        arr = sr.build_local_fermionic_dense(
+            [(coeff, tuple(term_ops))],
+            [basis],
+        )
+        return np.asarray(arr, dtype=dtype)
+
+    return {
+        "index_map": flo.get_spinless_charge_indexmap(symmetry),
+        "identity": np.eye(2, dtype=dtype),
+        "parity": np.diag([1.0, -1.0]).astype(dtype),
+        "annihilate": dense((a,)),
+        "create": dense((a.dag,)),
+        "number": dense((a.dag, a)),
+    }
+
+
 def _add_local_transition(tensor, site, L, left_pos, right_pos, op):
     if L == 1:
         tensor[:, :] += op
@@ -2470,6 +2703,366 @@ def _add_local_transition(tensor, site, L, left_pos, right_pos, op):
         tensor[left_pos, :, :] += op
     else:
         tensor[left_pos, right_pos, :, :] += op
+
+
+def _assemble_symmray_mpo(
+    *,
+    L,
+    channels,
+    transitions,
+    phys_map,
+    symmetry,
+    zero,
+    dtype,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=True,
+    upper_ind_id="k{}",
+    lower_ind_id="b{}",
+    site_tag_id="I{}",
+    to_backend=None,
+):
+    channel_pos = [
+        {channel_id: pos for pos, (channel_id, _) in enumerate(cut_channels)}
+        for cut_channels in channels
+    ]
+
+    arrays = []
+    _require_symmray()
+    from symmray import utils as sr_utils  # pylint: disable=import-outside-toplevel
+
+    identity = np.eye(len(phys_map), dtype=dtype)
+    for site in range(L):
+        if L == 1:
+            data = np.zeros((len(phys_map), len(phys_map)), dtype=dtype)
+            index_maps = [phys_map, phys_map]
+            duals = [False, True]
+        elif site == 0:
+            right_map = [charge for _, charge in channels[site]]
+            data = np.zeros((len(right_map), len(phys_map), len(phys_map)), dtype=dtype)
+            index_maps = [right_map, phys_map, phys_map]
+            duals = [False, False, True]
+            _add_local_transition(data, site, L, None, channel_pos[site][("start",)], identity)
+        elif site == L - 1:
+            left_map = [charge for _, charge in channels[site - 1]]
+            data = np.zeros((len(left_map), len(phys_map), len(phys_map)), dtype=dtype)
+            index_maps = [left_map, phys_map, phys_map]
+            duals = [True, False, True]
+            _add_local_transition(data, site, L, channel_pos[site - 1][("done",)], None, identity)
+        else:
+            left_map = [charge for _, charge in channels[site - 1]]
+            right_map = [charge for _, charge in channels[site]]
+            data = np.zeros(
+                (len(left_map), len(right_map), len(phys_map), len(phys_map)),
+                dtype=dtype,
+            )
+            index_maps = [left_map, right_map, phys_map, phys_map]
+            duals = [True, False, False, True]
+            _add_local_transition(
+                data,
+                site,
+                L,
+                channel_pos[site - 1][("start",)],
+                channel_pos[site][("start",)],
+                identity,
+            )
+            _add_local_transition(
+                data,
+                site,
+                L,
+                channel_pos[site - 1][("done",)],
+                channel_pos[site][("done",)],
+                identity,
+            )
+
+        for left_id, right_id, op in transitions[site]:
+            left_pos = None if site == 0 else channel_pos[site - 1][left_id]
+            right_pos = None if site == L - 1 else channel_pos[site][right_id]
+            _add_local_transition(data, site, L, left_pos, right_pos, op)
+
+        arrays.append(
+            sr_utils.from_dense(
+                data,
+                symmetry=symmetry,
+                index_maps=index_maps,
+                duals=duals,
+                fermionic=False,
+                charge=zero,
+            )
+        )
+
+    mpo = qtn.MatrixProductOperator(
+        arrays,
+        shape="lrud",
+        upper_ind_id=upper_ind_id,
+        lower_ind_id=lower_ind_id,
+        site_tag_id=site_tag_id,
+    )
+    if to_backend is not None:
+        _apply_to_tensor_network_arrays(mpo, to_backend)
+    if compress and L > 1:
+        compress_opts = {"cutoff": cutoff}
+        if max_bond is not None:
+            compress_opts["max_bond"] = int(max_bond)
+        mpo.compress(**compress_opts)
+    return mpo
+
+
+def _build_fermionic_model_mpo(
+    hamiltonian,
+    L,
+    *,
+    mapper=None,
+    idx2coo=None,
+    coo2idx=None,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=True,
+    upper_ind_id="k{}",
+    lower_ind_id="b{}",
+    site_tag_id="I{}",
+    to_backend=None,
+    dtype=None,
+):
+    _, coo2idx_use, mapped_L = _resolve_mpo_mapping(
+        mapper=mapper,
+        idx2coo=idx2coo,
+        coo2idx=coo2idx,
+    )
+    raw_edges = _as_edges(hamiltonian.edges)
+    edges = _map_edges_to_mpo_indices(raw_edges, coo2idx_use)
+
+    if L is None:
+        L = (
+            mapped_L
+            if mapped_L is not None
+            else max(max(int(i), int(j)) for i, j in edges) + 1
+        )
+    L = int(L)
+    if L < 1:
+        raise ValueError("L must be a positive integer.")
+    if mapped_L is not None and L != mapped_L:
+        raise ValueError(f"L={L} does not match MPO mapping length {mapped_L}.")
+
+    dtype = (
+        _dtype_from_hamiltonian_terms(hamiltonian.terms)
+        if dtype is None
+        else np.dtype(dtype)
+    )
+    zero = _normalize_group_charge(
+        getattr(next(iter(hamiltonian.terms.values())), "charge", 0),
+        hamiltonian.symmetry,
+    )
+    start = ("start",)
+    done = ("done",)
+    channels = [[(start, zero), (done, zero)] for _ in range(max(L - 1, 0))]
+    transitions = [[] for _ in range(L)]
+
+    coordinations = {}
+    for left, right in raw_edges:
+        coordinations[left] = coordinations.setdefault(left, 0) + 1
+        coordinations[right] = coordinations.setdefault(right, 0) + 1
+
+    if hamiltonian.model != "fermi_hubbard_spinless":  # pragma: no cover - guarded by caller
+        raise NotImplementedError(f"Unsupported fermionic model {hamiltonian.model!r}.")
+    delta = hamiltonian.parameters.get("delta", 0.0)
+    if delta != 0:
+        raise NotImplementedError(
+            "SymHamiltonian.to_mpo does not yet support spinless "
+            "Fermi-Hubbard pairing terms with delta != 0."
+        )
+    ops = _fh_spinless_dense_local_ops(hamiltonian.symmetry, dtype)
+    phys_map = list(ops["index_map"])
+    mode_terms = (("spinless", "t", ops["create"], ops["annihilate"], 1),)
+
+    def add_channel(edge_pos, i, j, label, left_charge, left_op, right_op):
+        channel_id = ("fermion", edge_pos, label, left_charge)
+        channel_charge = _charge_neg(left_charge, hamiltonian.symmetry)
+        for cut in range(i, j):
+            channels[cut].append((channel_id, channel_charge))
+        transitions[i].append((start, channel_id, left_op))
+        string_op = (
+            ops["parity"]
+            if _charged_op_needs_fermion_string(left_charge)
+            else ops["identity"]
+        )
+        for site in range(i + 1, j):
+            transitions[site].append((channel_id, channel_id, string_op))
+        transitions[j].append((channel_id, done, right_op))
+
+    for edge_pos, (raw_edge, edge) in enumerate(zip(raw_edges, edges)):
+        raw_left, raw_right = raw_edge
+        left_site, right_site = int(edge[0]), int(edge[1])
+        if left_site == right_site:
+            raise ValueError("Hamiltonian edges must connect distinct sites.")
+        if not (0 <= left_site < L and 0 <= right_site < L):
+            raise ValueError(f"edge {edge!r} is outside MPO length L={L}.")
+
+        t_values = {"t": _edge_parameter(hamiltonian.parameters.get("t", 1.0), raw_left, raw_right)}
+        V_edge = _edge_parameter(hamiltonian.parameters.get("V", 0.0), raw_left, raw_right)
+        if V_edge != 0:
+            i, j = sorted((left_site, right_site))
+            add_channel(edge_pos, i, j, "V", zero, V_edge * ops["number"], ops["number"])
+
+        for raw_site, site in ((raw_left, left_site), (raw_right, right_site)):
+            coordination = coordinations[raw_site]
+            mu_site = _node_parameter(hamiltonian.parameters.get("mu", 0.0), raw_site)
+            onsite = -(mu_site / coordination) * ops["number"]
+            if np.any(onsite != 0):
+                transitions[site].append((start, done, onsite))
+
+        i, j = sorted((left_site, right_site))
+        for spin, t_key, create, annihilate, create_charge in mode_terms:
+            t_sigma = t_values[t_key]
+            if t_sigma == 0:
+                continue
+            for direction, first, second, first_charge in (
+                ("forward", create, annihilate, create_charge),
+                ("backward", annihilate, create, _charge_neg(create_charge, hamiltonian.symmetry)),
+            ):
+                add_channel(
+                    edge_pos,
+                    i,
+                    j,
+                    (spin, direction),
+                    first_charge,
+                    t_sigma * first,
+                    second,
+                )
+
+    return _assemble_symmray_mpo(
+        L=L,
+        channels=channels,
+        transitions=transitions,
+        phys_map=phys_map,
+        symmetry=hamiltonian.symmetry,
+        zero=zero,
+        dtype=dtype,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        compress=compress,
+        upper_ind_id=upper_ind_id,
+        lower_ind_id=lower_ind_id,
+        site_tag_id=site_tag_id,
+        to_backend=to_backend,
+    )
+
+
+def _generic_symhamiltonian_to_mpo(
+    hamiltonian,
+    L,
+    *,
+    mapper=None,
+    idx2coo=None,
+    coo2idx=None,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=True,
+    upper_ind_id="k{}",
+    lower_ind_id="b{}",
+    site_tag_id="I{}",
+    to_backend=None,
+    dtype=None,
+):
+    """Build a Symmray MPO from generic charge-neutral two-site terms."""
+    _, coo2idx_use, mapped_L = _resolve_mpo_mapping(
+        mapper=mapper,
+        idx2coo=idx2coo,
+        coo2idx=coo2idx,
+    )
+    raw_edges = _as_edges(hamiltonian.edges)
+    edges = _map_edges_to_mpo_indices(raw_edges, coo2idx_use)
+
+    if L is None:
+        L = (
+            mapped_L
+            if mapped_L is not None
+            else max(max(int(i), int(j)) for i, j in edges) + 1
+        )
+    L = int(L)
+    if L < 1:
+        raise ValueError("L must be a positive integer.")
+    if mapped_L is not None and L != mapped_L:
+        raise ValueError(f"L={L} does not match MPO mapping length {mapped_L}.")
+
+    dtype = (
+        _dtype_from_hamiltonian_terms(hamiltonian.terms)
+        if dtype is None
+        else np.dtype(dtype)
+    )
+    zero = _normalize_group_charge(getattr(next(iter(hamiltonian.terms.values())), "charge", 0), hamiltonian.symmetry)
+    start = ("start",)
+    done = ("done",)
+    channels = [[(start, zero), (done, zero)] for _ in range(max(L - 1, 0))]
+    transitions = [[] for _ in range(L)]
+    phys_map = None
+    is_fermionic = any(_is_fermionic_symmray_array(term) for term in hamiltonian.terms.values())
+
+    for edge_pos, (raw_edge, edge) in enumerate(zip(raw_edges, edges)):
+        i, j = (int(edge[0]), int(edge[1]))
+        if i == j:
+            raise ValueError("Hamiltonian edges must connect distinct sites.")
+        if not (0 <= i < L and 0 <= j < L):
+            raise ValueError(f"edge {edge!r} is outside MPO length L={L}.")
+        reverse = i > j
+        if reverse:
+            i, j = j, i
+
+        term = hamiltonian.terms[raw_edge]
+        term_channels, left_phys, right_phys = _decompose_neutral_two_site_term(
+            term,
+            symmetry=hamiltonian.symmetry,
+            dtype=dtype,
+            reverse=reverse,
+        )
+        if left_phys != right_phys:
+            raise ValueError(
+                "SymHamiltonian.to_mpo currently requires a uniform physical "
+                "charge map on both sites of each term."
+            )
+        if phys_map is None:
+            phys_map = list(left_phys)
+        elif phys_map != list(left_phys):
+            raise ValueError(
+                "SymHamiltonian.to_mpo currently requires one physical charge "
+                "map shared by all sites."
+            )
+
+        for rank, (left_charge, left_op, right_op) in enumerate(term_channels):
+            channel_id = ("term", edge_pos, rank, left_charge)
+            channel_charge = _charge_neg(left_charge, hamiltonian.symmetry)
+            for cut in range(i, j):
+                channels[cut].append((channel_id, channel_charge))
+            transitions[i].append((start, channel_id, left_op))
+
+            if is_fermionic and _charged_op_needs_fermion_string(left_charge):
+                string_op = _fermion_parity_operator(phys_map, dtype)
+            else:
+                string_op = np.eye(len(phys_map), dtype=dtype)
+            for site in range(i + 1, j):
+                transitions[site].append((channel_id, channel_id, string_op))
+
+            transitions[j].append((channel_id, done, right_op))
+
+    if phys_map is None:
+        raise ValueError("At least one Hamiltonian term is required to build an MPO.")
+
+    return _assemble_symmray_mpo(
+        L=L,
+        channels=channels,
+        transitions=transitions,
+        phys_map=phys_map,
+        symmetry=hamiltonian.symmetry,
+        zero=zero,
+        dtype=dtype,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        compress=compress,
+        upper_ind_id=upper_ind_id,
+        lower_ind_id=lower_ind_id,
+        site_tag_id=site_tag_id,
+        to_backend=to_backend,
+    )
 
 
 @dataclass(frozen=True)
@@ -2536,16 +3129,50 @@ class SymHamiltonian:
     ):
         """Build a symmetry-preserving MPS-chain MPO for this Hamiltonian.
 
-        Currently this supports spinful ``fermi_hubbard_u1u1`` Hamiltonians on
-        integer MPS-chain sites. Coordinate-lattice edges can be mapped with
-        ``mapper=OneDMap(...)`` or the ``idx2coo, coo2idx`` dictionaries from
-        ``OneDMap(...).build()``. Long-range hopping terms include the required
-        fermionic parity string along the mapped 1D path.
+        Coordinate-lattice edges can be mapped with ``mapper=OneDMap(...)`` or
+        the ``idx2coo, coo2idx`` dictionaries from ``OneDMap(...).build()``.
+        Fermionic paths include parity strings along non-adjacent mapped
+        hopping channels.
         """
-        if self.model != "fermi_hubbard_u1u1" or self.symmetry != "U1U1":
+        if self.model == "fermi_hubbard_spinless":
+            return _build_fermionic_model_mpo(
+                self,
+                L,
+                mapper=mapper,
+                idx2coo=idx2coo,
+                coo2idx=coo2idx,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                compress=compress,
+                upper_ind_id=upper_ind_id,
+                lower_ind_id=lower_ind_id,
+                site_tag_id=site_tag_id,
+                to_backend=to_backend,
+                dtype=dtype,
+            )
+
+        if self.model == "fermi_hubbard":
             raise NotImplementedError(
-                "SymHamiltonian.to_mpo currently supports only "
-                "fermi_hubbard_u1u1 with U1U1 symmetry."
+                "SymHamiltonian.to_mpo supports spinful Fermi-Hubbard through "
+                "model='fermi_hubbard_u1u1' with U1U1 symmetry. The total-U1 "
+                "spinful Fermi-Hubbard MPO path is not implemented yet."
+            )
+
+        if self.model != "fermi_hubbard_u1u1" or self.symmetry != "U1U1":
+            return _generic_symhamiltonian_to_mpo(
+                self,
+                L,
+                mapper=mapper,
+                idx2coo=idx2coo,
+                coo2idx=coo2idx,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                compress=compress,
+                upper_ind_id=upper_ind_id,
+                lower_ind_id=lower_ind_id,
+                site_tag_id=site_tag_id,
+                to_backend=to_backend,
+                dtype=dtype,
             )
 
         _, coo2idx_use, mapped_L = _resolve_mpo_mapping(
