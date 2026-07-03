@@ -678,11 +678,78 @@ def _resolve_chain_mapper(mapper, summary, *, name="mapper"):
 
 
 def _mapped_site_color(colormaps, cmap_name, position, num_sites):
+    cmap_key = str(cmap_name).strip().lower()
+    if cmap_key in {"auto", "hash", "quimb"}:
+        from quimb import schematic  # pylint: disable=import-outside-toplevel
+
+        return schematic.hash_to_color(f"I{int(position)}")
     cmap = colormaps.get_cmap(cmap_name)
     colors = getattr(cmap, "colors", None)
     if colors is not None and len(colors) > 0:
         return cmap(int(position) % len(colors))
     return cmap(int(position) / max(1, int(num_sites) - 1))
+
+
+def _mapped_contrast_text_color(color):
+    from matplotlib.colors import to_rgba  # pylint: disable=import-outside-toplevel
+
+    red, green, blue, _ = to_rgba(color)
+    luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+    if luminance < 0.54:
+        return (1.0, 1.0, 1.0, 0.96)
+    return (0.08, 0.10, 0.13, 0.96)
+
+
+def _format_half_integer(twice_value):
+    try:
+        twice_value = int(twice_value)
+    except (TypeError, ValueError):
+        return str(twice_value)
+    if twice_value == 0:
+        return "0"
+    sign = "+" if twice_value > 0 else "-"
+    numerator = abs(twice_value)
+    if numerator % 2 == 0:
+        return f"{sign}{numerator // 2}"
+    return f"{sign}{numerator}/2"
+
+
+def _mapped_charge_spin_lines(charge):
+    if charge is None:
+        return []
+    charge_tuple = _as_tuple(charge)
+    if len(charge_tuple) == 2:
+        try:
+            n_up, n_down = (int(x) for x in charge_tuple)
+        except (TypeError, ValueError):
+            return [rf"$q={_format_charge(charge)}$"]
+        return [
+            rf"$N={n_up + n_down}$",
+            rf"$S_z={_format_half_integer(n_up - n_down)}$",
+        ]
+    return [rf"$q={_format_charge(charge)}$"]
+
+
+def _mapped_tensor_label_lines(tensor, *, kind):
+    lines = [rf"${kind}_{{{tensor['site']}}}$"]
+    lines.extend(_mapped_charge_spin_lines(tensor.get("charge")))
+    return lines
+
+
+def _mapped_bond_label(bond, *, show_leg_chargemaps):
+    pieces = [rf"$e_{{{bond['position']}}}$", rf"$\chi={bond['dim']}$"]
+    if show_leg_chargemaps:
+        pieces.append(rf"$Q={len(bond['chargemap'])}$")
+    return " | ".join(pieces)
+
+
+def _mapped_physical_label(prefix, tensor, physical, *, show_leg_chargemaps):
+    if show_leg_chargemaps:
+        return (
+            rf"${prefix}_{{{tensor['site']}}}$ | "
+            rf"$d/Q={physical['dim']}/{len(physical['chargemap'])}$"
+        )
+    return rf"${prefix}_{{{tensor['site']}}}$ | $d={physical['dim']}$"
 
 
 def _mapped_label_offset(x0, y0, x1, y1, amount=0.17):
@@ -713,12 +780,12 @@ def _draw_mapped_chain_grid(drawing, mapper, *, spacing):
                 )
 
 
-def _mapped_chain_limits(mapper, xy_by_position, *, spacing, right_pad, y_pad):
+def _mapped_chain_limits(mapper, xy_by_position, *, spacing, right_pad, y_pad, left_pad=0.82):
     xs = [xy[0] for xy in xy_by_position.values()] or [0.0]
     ys = [xy[1] for xy in xy_by_position.values()] or [0.0]
     grid_xs = [0.0, (int(mapper.Lx) - 1) * spacing]
     grid_ys = [0.0, (int(mapper.Ly) - 1) * spacing]
-    x_min = min(xs + grid_xs) - 0.82
+    x_min = min(xs + grid_xs) - left_pad
     x_max = max(xs + grid_xs) + right_pad
     y_min = min(ys + grid_ys) - y_pad
     y_max = max(ys + grid_ys) + y_pad
@@ -1216,7 +1283,8 @@ def _draw_symmray_mps_mapped(
     return_summary,
 ):
     coords_by_position = _resolve_chain_mapper(mapper, summary)
-    spacing = 1.18
+    spacing = 1.28
+    node_radius = max(float(node_radius), 0.31) if show_tensor_labels else float(node_radius)
     xy_by_position = {
         tensor["position"]: (
             coords_by_position[tensor["position"]][0] * spacing,
@@ -1238,8 +1306,8 @@ def _draw_symmray_mps_mapped(
 
     detailed_labels = bool(show_leg_chargemaps and (show_bond_labels or show_phys_labels))
     if figsize is None:
-        width = max(5.4, 1.18 * int(mapper.Lx) + 2.2)
-        height = max(4.3, 1.18 * int(mapper.Ly) + 2.0)
+        width = max(5.6, spacing * int(mapper.Lx) + 2.35)
+        height = max(4.4, spacing * int(mapper.Ly) + 2.10)
         if show_bond_labels or show_phys_labels or show_blocks:
             width += 0.55 if detailed_labels else 0.35
             height += 0.55 if detailed_labels else 0.35
@@ -1249,18 +1317,18 @@ def _draw_symmray_mps_mapped(
 
     presets = {
         "lattice": {
-            "color": (0.78, 0.80, 0.83, 1.0),
-            "linewidth": 1.05,
-            "alpha": 0.85,
+            "color": (0.84, 0.86, 0.89, 1.0),
+            "linewidth": 0.95,
+            "alpha": 0.78,
         },
         "bond": {
-            "color": (0.43, 0.46, 0.50, 1.0),
-            "linewidth": 2.4,
+            "color": (0.34, 0.37, 0.41, 0.96),
+            "linewidth": 2.0,
             "solid_capstyle": "round",
         },
         "phys": {
-            "color": (0.37, 0.40, 0.44, 1.0),
-            "linewidth": 1.25,
+            "color": (0.40, 0.43, 0.48, 0.88),
+            "linewidth": 1.05,
             "solid_capstyle": "round",
         },
     }
@@ -1271,7 +1339,7 @@ def _draw_symmray_mps_mapped(
     for bond in shown_bonds:
         xy_l = xy_by_position[bond["left_position"]]
         xy_r = xy_by_position[bond["right_position"]]
-        width = 1.65 + 1.0 * (bond["dim"] / max_dim)
+        width = 1.25 + 1.05 * np.sqrt(bond["dim"] / max_dim)
         drawing.line(
             xy_l,
             xy_r,
@@ -1301,9 +1369,9 @@ def _draw_symmray_mps_mapped(
                     start,
                     stop,
                     preset="bond",
-                    center=0.60,
-                    width=0.075,
-                    length=0.14,
+                    center=0.58,
+                    width=0.060,
+                    length=0.12,
                     zorder=2,
                 )
 
@@ -1311,18 +1379,15 @@ def _draw_symmray_mps_mapped(
             x0, y0 = xy_l
             x1, y1 = xy_r
             mid = (0.5 * (x0 + x1), 0.5 * (y0 + y1))
-            off = _mapped_label_offset(x0, y0, x1, y1, amount=0.18)
-            flow = _flow_math(bond.get("left_direction"), bond.get("right_direction"))
-            if flow:
-                label = rf"$e_{{{bond['position']}}}: {flow}, \chi={bond['dim']}$"
-            else:
-                label = rf"$e_{{{bond['position']}}}: \chi={bond['dim']}$"
-            if show_leg_chargemaps:
-                label += "\n" + rf"$q_e:$ {_format_compact_mapping(bond['chargemap'], max_items=4)}"
+            off = _mapped_label_offset(x0, y0, x1, y1, amount=0.15)
+            label = _mapped_bond_label(
+                bond,
+                show_leg_chargemaps=show_leg_chargemaps,
+            )
             drawing.text(
                 (mid[0] + off[0], mid[1] + off[1]),
                 label,
-                fontsize=6.0,
+                fontsize=5.7,
                 ha="center",
                 va="center",
                 color=(0.18, 0.20, 0.23, 1.0),
@@ -1348,9 +1413,9 @@ def _draw_symmray_mps_mapped(
         edgecolor = (
             schematic.get_color("orange")
             if position == center_position
-            else (1.0, 1.0, 1.0, 1.0)
+            else (0.18, 0.20, 0.23, 0.72)
         )
-        linewidth = 2.0 if position == center_position else 1.2
+        linewidth = 2.35 if position == center_position else 0.95
 
         if node_shape == "circle":
             drawing.circle(
@@ -1398,32 +1463,33 @@ def _draw_symmray_mps_mapped(
         )
 
         if show_tensor_labels:
-            label_lines = [rf"$T_{{{tensor['site']}}}$"]
-            if tensor["charge"] is not None:
-                label_lines.append(rf"$q={_format_charge(tensor['charge'])}$")
-            if not show_blocks:
-                label_lines.append(rf"$B={tensor['num_blocks']}$")
+            label_lines = _mapped_tensor_label_lines(tensor, kind="T")
             drawing.text(
-                (x_pos, y_pos + node_radius + 0.13),
+                (x_pos, y_pos),
                 "\n".join(label_lines),
-                fontsize=7.2,
+                fontsize=5.9 if len(label_lines) > 2 else 6.5,
                 ha="center",
-                va="bottom",
-                color=(0.08, 0.12, 0.16, 1.0),
+                va="center",
+                color=_mapped_contrast_text_color(facecolor),
+                fontweight="bold",
+                linespacing=0.84,
                 zorder=7,
             )
 
         physical = tensor["physical"]
         if show_phys_labels:
             phys_label = (
-                rf"$p_{{{tensor['site']}}}: \mathrm{{{physical['direction']}}}, d={physical['dim']}$"
+                _mapped_physical_label(
+                    "p",
+                    tensor,
+                    physical,
+                    show_leg_chargemaps=show_leg_chargemaps,
+                )
             )
-            if show_leg_chargemaps:
-                phys_label += "\n" + rf"$q_p:$ {_format_compact_mapping(physical['chargemap'], max_items=4)}"
             drawing.text(
                 (phys_xy[0] - 0.04, phys_xy[1] - 0.08),
                 phys_label,
-                fontsize=5.7,
+                fontsize=5.5,
                 ha="right",
                 va="top",
                 color=(0.18, 0.20, 0.23, 1.0),
@@ -1509,6 +1575,7 @@ def _draw_symmray_mps_mapped(
         spacing=spacing,
         right_pad=right_pad,
         y_pad=0.95 if show_phys_labels else 0.78,
+        left_pad=1.14 if show_phys_labels else 0.82,
     )
     drawing.ax.set_xlim(x_min, x_max)
     drawing.ax.set_ylim(y_min, y_max)
@@ -1540,7 +1607,7 @@ def draw_symmray_mps(
     max_blocks_per_site=4,
     node_shape="circle",
     node_radius=0.24,
-    site_cmap="tab20",
+    site_cmap="quimb",
     figsize=None,
     return_summary=False,
 ):
@@ -1995,7 +2062,8 @@ def _draw_symmray_mpo_mapped(
     return_summary,
 ):
     coords_by_position = _resolve_chain_mapper(mapper, summary)
-    spacing = 1.18
+    spacing = 1.28
+    node_radius = max(float(node_radius), 0.31) if show_tensor_labels else float(node_radius)
     xy_by_position = {
         tensor["position"]: (
             coords_by_position[tensor["position"]][0] * spacing,
@@ -2017,8 +2085,8 @@ def _draw_symmray_mpo_mapped(
 
     detailed_labels = bool(show_leg_chargemaps and (show_bond_labels or show_phys_labels))
     if figsize is None:
-        width = max(5.4, 1.18 * int(mapper.Lx) + 2.2)
-        height = max(4.6, 1.18 * int(mapper.Ly) + 2.2)
+        width = max(5.6, spacing * int(mapper.Lx) + 2.35)
+        height = max(4.6, spacing * int(mapper.Ly) + 2.35)
         if show_bond_labels or show_phys_labels or show_blocks:
             width += 0.65 if detailed_labels else 0.40
             height += 0.70 if detailed_labels else 0.45
@@ -2028,18 +2096,18 @@ def _draw_symmray_mpo_mapped(
 
     presets = {
         "lattice": {
-            "color": (0.78, 0.80, 0.83, 1.0),
-            "linewidth": 1.05,
-            "alpha": 0.85,
+            "color": (0.84, 0.86, 0.89, 1.0),
+            "linewidth": 0.95,
+            "alpha": 0.78,
         },
         "bond": {
-            "color": (0.43, 0.46, 0.50, 1.0),
-            "linewidth": 2.4,
+            "color": (0.34, 0.37, 0.41, 0.96),
+            "linewidth": 2.0,
             "solid_capstyle": "round",
         },
         "phys": {
-            "color": (0.37, 0.40, 0.44, 1.0),
-            "linewidth": 1.25,
+            "color": (0.40, 0.43, 0.48, 0.88),
+            "linewidth": 1.05,
             "solid_capstyle": "round",
         },
     }
@@ -2050,7 +2118,7 @@ def _draw_symmray_mpo_mapped(
     for bond in shown_bonds:
         xy_l = xy_by_position[bond["left_position"]]
         xy_r = xy_by_position[bond["right_position"]]
-        width = 1.65 + 1.0 * (bond["dim"] / max_dim)
+        width = 1.25 + 1.05 * np.sqrt(bond["dim"] / max_dim)
         drawing.line(
             xy_l,
             xy_r,
@@ -2080,9 +2148,9 @@ def _draw_symmray_mpo_mapped(
                     start,
                     stop,
                     preset="bond",
-                    center=0.60,
-                    width=0.075,
-                    length=0.14,
+                    center=0.58,
+                    width=0.060,
+                    length=0.12,
                     zorder=2,
                 )
 
@@ -2090,18 +2158,15 @@ def _draw_symmray_mpo_mapped(
             x0, y0 = xy_l
             x1, y1 = xy_r
             mid = (0.5 * (x0 + x1), 0.5 * (y0 + y1))
-            off = _mapped_label_offset(x0, y0, x1, y1, amount=0.18)
-            flow = _flow_math(bond.get("left_direction"), bond.get("right_direction"))
-            if flow:
-                label = rf"$e_{{{bond['position']}}}: {flow}, \chi={bond['dim']}$"
-            else:
-                label = rf"$e_{{{bond['position']}}}: \chi={bond['dim']}$"
-            if show_leg_chargemaps:
-                label += "\n" + rf"$q_e:$ {_format_compact_mapping(bond['chargemap'], max_items=4)}"
+            off = _mapped_label_offset(x0, y0, x1, y1, amount=0.15)
+            label = _mapped_bond_label(
+                bond,
+                show_leg_chargemaps=show_leg_chargemaps,
+            )
             drawing.text(
                 (mid[0] + off[0], mid[1] + off[1]),
                 label,
-                fontsize=6.0,
+                fontsize=5.7,
                 ha="center",
                 va="center",
                 color=(0.18, 0.20, 0.23, 1.0),
@@ -2127,9 +2192,9 @@ def _draw_symmray_mpo_mapped(
         edgecolor = (
             schematic.get_color("orange")
             if position == center_position
-            else (1.0, 1.0, 1.0, 1.0)
+            else (0.18, 0.20, 0.23, 0.72)
         )
-        linewidth = 2.0 if position == center_position else 1.2
+        linewidth = 2.35 if position == center_position else 0.95
 
         if node_shape == "circle":
             drawing.circle(
@@ -2195,37 +2260,38 @@ def _draw_symmray_mpo_mapped(
             )
 
         if show_tensor_labels:
-            label_lines = [rf"$W_{{{tensor['site']}}}$"]
-            if tensor["charge"] is not None:
-                label_lines.append(rf"$q={_format_charge(tensor['charge'])}$")
-            if not show_blocks:
-                label_lines.append(rf"$B={tensor['num_blocks']}$")
+            label_lines = _mapped_tensor_label_lines(tensor, kind="W")
             drawing.text(
-                (x_pos, y_pos + node_radius + 0.13),
+                (x_pos, y_pos),
                 "\n".join(label_lines),
-                fontsize=7.2,
+                fontsize=5.9 if len(label_lines) > 2 else 6.5,
                 ha="center",
-                va="bottom",
-                color=(0.08, 0.12, 0.16, 1.0),
+                va="center",
+                color=_mapped_contrast_text_color(facecolor),
+                fontweight="bold",
+                linespacing=0.84,
                 zorder=7,
             )
 
         if show_phys_labels:
             upper = tensor["upper_physical"]
             lower = tensor["lower_physical"]
-            upper_label = (
-                rf"$u_{{{tensor['site']}}}: \mathrm{{{upper['direction']}}}, d={upper['dim']}$"
+            upper_label = _mapped_physical_label(
+                "u",
+                tensor,
+                upper,
+                show_leg_chargemaps=show_leg_chargemaps,
             )
-            lower_label = (
-                rf"$l_{{{tensor['site']}}}: \mathrm{{{lower['direction']}}}, d={lower['dim']}$"
+            lower_label = _mapped_physical_label(
+                "l",
+                tensor,
+                lower,
+                show_leg_chargemaps=show_leg_chargemaps,
             )
-            if show_leg_chargemaps:
-                upper_label += "\n" + rf"$q_u:$ {_format_compact_mapping(upper['chargemap'], max_items=4)}"
-                lower_label += "\n" + rf"$q_l:$ {_format_compact_mapping(lower['chargemap'], max_items=4)}"
             drawing.text(
                 (upper_xy[0] - 0.04, upper_xy[1] + 0.08),
                 upper_label,
-                fontsize=5.7,
+                fontsize=5.5,
                 ha="right",
                 va="bottom",
                 color=(0.18, 0.20, 0.23, 1.0),
@@ -2234,7 +2300,7 @@ def _draw_symmray_mpo_mapped(
             drawing.text(
                 (lower_xy[0] + 0.04, lower_xy[1] - 0.08),
                 lower_label,
-                fontsize=5.7,
+                fontsize=5.5,
                 ha="left",
                 va="top",
                 color=(0.18, 0.20, 0.23, 1.0),
@@ -2320,6 +2386,7 @@ def _draw_symmray_mpo_mapped(
         spacing=spacing,
         right_pad=right_pad,
         y_pad=1.08 if show_phys_labels else 0.88,
+        left_pad=1.22 if show_phys_labels else 0.82,
     )
     drawing.ax.set_xlim(x_min, x_max)
     drawing.ax.set_ylim(y_min, y_max)
@@ -2351,7 +2418,7 @@ def draw_symmray_mpo(
     max_blocks_per_site=4,
     node_shape="circle",
     node_radius=0.24,
-    site_cmap="tab20",
+    site_cmap="quimb",
     figsize=None,
     return_summary=False,
 ):
