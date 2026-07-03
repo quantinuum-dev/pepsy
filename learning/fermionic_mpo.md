@@ -123,6 +123,8 @@ the interruption.
 - A fully native fermionic MPO is still future work. It would avoid bosonizing
   the MPS, but Symmray does not currently provide a ready-made MPO class for
   this route.
-- DMRG adaptation is intentionally deferred. The immediate milestone was
-  "MPS plus MPO energy is correct"; two-site DMRG sector solving is a separate
-  problem.
+- `SymDMRG2` now exists as the API and quimb-adapter scaffold: dense/quimb MPOs
+  run through `quimb.tensor.DMRG2`, while Symmray FH MPOs initialize the Pepsy
+  block-sparse path, infer the fixed charge, and record the initial MPO energy.
+  The real remaining DMRG work is the Symmray two-site effective Hamiltonian,
+  local Lanczos/eigensolve, and sector-preserving SVD update.

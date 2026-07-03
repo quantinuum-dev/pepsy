@@ -20,6 +20,7 @@ from pepsy.optimizers import (
     PepsEnergyOptimizer,
     PepsOptimizer,
     SimpleUpdateGen,
+    SymDMRG2,
     SweepOptimizer,
 )
 from pepsy.sampling import MpsSampler, PepsBpSampler
@@ -79,6 +80,7 @@ def test_new_namespace_imports_resolve():
     assert PepsEnergyOptimizer is not None
     assert PepsOptimizer is not None
     assert SimpleUpdateGen is not None
+    assert SymDMRG2 is not None
     assert SweepOptimizer is not None
     assert MpsSampler is not None
     assert PepsBpSampler is not None

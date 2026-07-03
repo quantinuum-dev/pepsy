@@ -20,6 +20,7 @@ optimizers/energy
 optimizers/mps
 optimizers/mpo
 optimizers/peps
+optimizers/sym_dmrg
 solvers/gradient
 solvers/finite_difference
 sampling/samplers

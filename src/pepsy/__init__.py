@@ -98,6 +98,7 @@ _SYMBOL_MODULES = {
     "PepsEnergyOptimizer": ".optimizers",
     "PepsOptimizer": ".optimizers",
     "SimpleUpdateGen": ".optimizers",
+    "SymDMRG2": ".optimizers",
     "SweepOptimizer": ".optimizers",
     "MpsSampleResult": ".sampling",
     "MpsSampler": ".sampling",
@@ -242,6 +243,7 @@ __all__ = [
     "PepsEnergyOptimizer",
     "PepsOptimizer",
     "SimpleUpdateGen",
+    "SymDMRG2",
     "SweepOptimizer",
     "MpsSampleResult",
     "MpsSampler",
@@ -378,7 +380,7 @@ if TYPE_CHECKING:
         y,
         z,
     )
-    from .optimizers import GlobalOptimizer, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, PepsEnergyOptimizer, PepsOptimizer, SimpleUpdateGen, SweepOptimizer
+    from .optimizers import GlobalOptimizer, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, PepsEnergyOptimizer, PepsOptimizer, SimpleUpdateGen, SymDMRG2, SweepOptimizer
     from .sampling import MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, VecSampler
     from .solvers import FDSolver
     from .tensors import (

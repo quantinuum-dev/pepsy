@@ -169,6 +169,11 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   energy through the first two imaginary-time schedule blocks. The last
   `tau=0.01` block still needs a complete notebook rerun because runtime, not a
   mismatch, interrupted the scratch check.
+- `SymDMRG2` now provides the public two-site DMRG entry point. Dense/quimb MPOs
+  delegate directly to `quimb.tensor.DMRG2`; Symmray MPOs select the Pepsy
+  block-sparse path, infer the fixed total charge from `SymMPS`, and record the
+  initial MPO energy before stopping at the not-yet-implemented local
+  sector-eigensolver.
 
 ### Validation
 
