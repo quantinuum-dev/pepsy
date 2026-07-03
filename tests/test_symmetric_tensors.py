@@ -1078,6 +1078,42 @@ def test_spinless_fermi_hubbard_u1_hamiltonian_builds_mpo_energy_path():
     assert complex(mpo_energy) == pytest.approx(complex(term_energy))
 
 
+def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_matches_shifted_edges():
+    """Spinless FH hopping signs should not depend on the bond position."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_spinless",
+        4,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([1, 0, 1, 0]),
+        seed=222,
+        dtype="complex128",
+    )
+
+    for edge in [(0, 1), (1, 2), (2, 3)]:
+        ham = SymHamiltonian.from_edges(
+            "fermi_hubbard_spinless",
+            "U1",
+            [edge],
+            t=1.0,
+            V=0.0,
+            mu=0.0,
+        )
+        mpo = ham.to_mpo(L=4, compress=False)
+        mpo_energy = pepsy.MpsEnergyOptimizer(
+            state,
+            mpo,
+            energy_per_site=False,
+            real=False,
+        ).energy().energy
+        term_energy = state.energy(
+            hamiltonian=ham,
+            normalized=True,
+            contraction_opt="auto-hq",
+        )
+
+        assert complex(mpo_energy) == pytest.approx(complex(term_energy))
+
+
 def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_compresses_long_range():
     """Spinless FH long-range MPOs should insert parity strings and compress."""
     state = SymMPS.for_model(
@@ -1220,6 +1256,122 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
     assert mpo.max_bond() >= 3
     assert mpo_compressed.max_bond() <= mpo.max_bond()
     assert complex(energy_compressed) == pytest.approx(complex(energy))
+
+
+@pytest.mark.parametrize(
+    "hopping,site_charges",
+    [
+        ((1.0, 0.0), [(0, 1), (0, 0)]),
+        ((1.0, 0.0), [(1, 1), (1, 0)]),
+        ((0.0, 1.0), [(1, 0), (0, 0)]),
+        ((0.0, 1.0), [(1, 1), (0, 1)]),
+        ((1.0, 1.0), [(1, 0), (0, 1)]),
+    ],
+)
+def test_fermi_hubbard_u1u1_hamiltonian_mpo_matches_two_site_sectors(
+    hopping,
+    site_charges,
+):
+    """The U1U1 FH MPO should use JW signs on the two-site boundary case."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations(site_charges),
+        seed=123,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1)],
+        t=hopping,
+        U=0.0,
+        mu=0.0,
+    )
+    mpo = ham.to_mpo(L=2, compress=False)
+
+    mpo_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    term_energy = state.energy(
+        hamiltonian=ham,
+        normalized=True,
+        contraction_opt="auto-hq",
+    )
+
+    assert complex(mpo_energy) == pytest.approx(complex(term_energy))
+
+
+def test_fermi_hubbard_u1u1_hamiltonian_mpo_matches_shifted_edges():
+    """U1U1 FH MPO hopping channels need prefix parity on shifted bonds."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0), (0, 1)]),
+        seed=222,
+        dtype="complex128",
+    )
+
+    for hopping in [(1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]:
+        for edge in [(0, 1), (1, 2), (2, 3)]:
+            ham = SymHamiltonian.from_edges(
+                "fermi_hubbard_u1u1",
+                "U1U1",
+                [edge],
+                t=hopping,
+                U=0.0,
+                mu=0.0,
+            )
+            mpo = ham.to_mpo(L=4, compress=False)
+            mpo_energy = pepsy.MpsEnergyOptimizer(
+                state,
+                mpo,
+                energy_per_site=False,
+                real=False,
+            ).energy().energy
+            term_energy = state.energy(
+                hamiltonian=ham,
+                normalized=True,
+                contraction_opt="auto-hq",
+            )
+
+            assert complex(mpo_energy) == pytest.approx(complex(term_energy))
+
+
+def test_fermi_hubbard_u1u1_hamiltonian_mpo_builds_pbc_wrap_edge():
+    """PBC wrap edges should build a finite long-string U1U1 FH MPO."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0), (0, 1)]),
+        seed=222,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1), (1, 2), (2, 3), (3, 0)],
+        t=1.0,
+        U=4.0,
+        mu=0.0,
+    )
+    mpo = ham.to_mpo(L=4, compress=False)
+    energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert mpo.L == 4
+    assert mpo.max_bond() >= 4
+    assert np.isfinite(complex(energy))
 
 
 def test_fermi_hubbard_u1u1_hamiltonian_mpo_maps_2d_edges_with_onedmap():
