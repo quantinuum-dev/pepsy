@@ -2190,6 +2190,112 @@ def _as_edges(edges):
     return out
 
 
+def _normalize_mpo_coord(site):
+    try:
+        coord = tuple(site)
+    except TypeError as exc:
+        raise TypeError(
+            "MPO lattice coordinates must be non-empty tuples/lists of integers."
+        ) from exc
+    if not coord:
+        raise ValueError("MPO lattice coordinates cannot be empty.")
+    if not all(isinstance(part, Integral) for part in coord):
+        raise TypeError("MPO lattice coordinate components must be integers.")
+    return tuple(int(part) for part in coord)
+
+
+def _validate_mpo_mapping_indices(indices, *, name):
+    indices = sorted(int(idx) for idx in indices)
+    if indices != list(range(len(indices))):
+        raise ValueError(f"{name} must use contiguous integer indices 0..L-1.")
+
+
+def _normalize_idx2coo(idx2coo):
+    out = {}
+    for idx, coord in dict(idx2coo).items():
+        if not isinstance(idx, Integral):
+            raise TypeError("idx2coo keys must be integer chain indices.")
+        idx = int(idx)
+        if idx in out:
+            raise ValueError("idx2coo contains duplicate chain indices.")
+        out[idx] = _normalize_mpo_coord(coord)
+    if not out:
+        raise ValueError("idx2coo cannot be empty.")
+    _validate_mpo_mapping_indices(out, name="idx2coo")
+    if len(set(out.values())) != len(out):
+        raise ValueError("idx2coo contains duplicate lattice coordinates.")
+    return out
+
+
+def _normalize_coo2idx(coo2idx):
+    out = {}
+    for coord, idx in dict(coo2idx).items():
+        if not isinstance(idx, Integral):
+            raise TypeError("coo2idx values must be integer chain indices.")
+        coord = _normalize_mpo_coord(coord)
+        if coord in out:
+            raise ValueError("coo2idx contains duplicate lattice coordinates.")
+        out[coord] = int(idx)
+    if not out:
+        raise ValueError("coo2idx cannot be empty.")
+    _validate_mpo_mapping_indices(out.values(), name="coo2idx")
+    if len(set(out.values())) != len(out):
+        raise ValueError("coo2idx contains duplicate chain indices.")
+    return out
+
+
+def _resolve_mpo_mapping(*, mapper=None, idx2coo=None, coo2idx=None):
+    if mapper is not None:
+        if idx2coo is not None or coo2idx is not None:
+            raise TypeError("Pass either mapper or idx2coo/coo2idx, not both.")
+        from .core import OneDMap  # pylint: disable=import-outside-toplevel
+
+        if not isinstance(mapper, OneDMap):
+            raise TypeError("mapper must be a pepsy.tensors.OneDMap instance.")
+        idx2coo, coo2idx = mapper.build()
+
+    if idx2coo is None and coo2idx is None:
+        return None, None, None
+
+    idx2coo_norm = None if idx2coo is None else _normalize_idx2coo(idx2coo)
+    coo2idx_norm = None if coo2idx is None else _normalize_coo2idx(coo2idx)
+
+    if idx2coo_norm is None:
+        idx2coo_norm = {idx: coord for coord, idx in coo2idx_norm.items()}
+    elif coo2idx_norm is None:
+        coo2idx_norm = {coord: idx for idx, coord in idx2coo_norm.items()}
+    else:
+        expected = {coord: idx for idx, coord in idx2coo_norm.items()}
+        if coo2idx_norm != expected:
+            raise ValueError("idx2coo and coo2idx describe different mappings.")
+
+    return idx2coo_norm, coo2idx_norm, len(idx2coo_norm)
+
+
+def _map_edges_to_mpo_indices(edges, coo2idx):
+    mapped_edges = []
+    for edge in edges:
+        mapped_edge = []
+        for site in edge:
+            if isinstance(site, Integral):
+                mapped_edge.append(int(site))
+                continue
+            if coo2idx is None:
+                raise ValueError(
+                    "SymHamiltonian.to_mpo requires mapper=OneDMap(...) or "
+                    "coo2idx=... when Hamiltonian edges use lattice coordinates."
+                )
+            coord = _normalize_mpo_coord(site)
+            try:
+                mapped_edge.append(coo2idx[coord])
+            except KeyError as exc:
+                raise ValueError(
+                    f"Hamiltonian site {coord!r} is not present in the MPO mapping."
+                ) from exc
+        mapped_edges.append(tuple(mapped_edge))
+    return tuple(mapped_edges)
+
+
 def _format_site_ind(site, site_ind_id):
     if isinstance(site, tuple):
         return site_ind_id.format(*site)
@@ -2416,6 +2522,9 @@ class SymHamiltonian:
         self,
         L=None,
         *,
+        mapper=None,
+        idx2coo=None,
+        coo2idx=None,
         max_bond=None,
         cutoff=1e-12,
         compress=True,
@@ -2428,7 +2537,9 @@ class SymHamiltonian:
         """Build a symmetry-preserving MPS-chain MPO for this Hamiltonian.
 
         Currently this supports spinful ``fermi_hubbard_u1u1`` Hamiltonians on
-        integer MPS-chain sites. Long-range hopping terms include the required
+        integer MPS-chain sites. Coordinate-lattice edges can be mapped with
+        ``mapper=OneDMap(...)`` or the ``idx2coo, coo2idx`` dictionaries from
+        ``OneDMap(...).build()``. Long-range hopping terms include the required
         fermionic parity string along the mapped 1D path.
         """
         if self.model != "fermi_hubbard_u1u1" or self.symmetry != "U1U1":
@@ -2437,21 +2548,24 @@ class SymHamiltonian:
                 "fermi_hubbard_u1u1 with U1U1 symmetry."
             )
 
-        edges = _as_edges(self.edges)
-        if not edges:
-            raise ValueError("Cannot build an MPO from a Hamiltonian with no edges.")
-        if any(
-            isinstance(site, tuple)
-            for edge in edges
-            for site in edge
-        ):
-            raise ValueError("SymHamiltonian.to_mpo requires 1D integer edges.")
+        _, coo2idx_use, mapped_L = _resolve_mpo_mapping(
+            mapper=mapper,
+            idx2coo=idx2coo,
+            coo2idx=coo2idx,
+        )
+        edges = _map_edges_to_mpo_indices(_as_edges(self.edges), coo2idx_use)
 
         if L is None:
-            L = max(max(int(i), int(j)) for i, j in edges) + 1
+            L = (
+                mapped_L
+                if mapped_L is not None
+                else max(max(int(i), int(j)) for i, j in edges) + 1
+            )
         L = int(L)
         if L < 1:
             raise ValueError("L must be a positive integer.")
+        if mapped_L is not None and L != mapped_L:
+            raise ValueError(f"L={L} does not match MPO mapping length {mapped_L}.")
 
         dtype = _dtype_from_hamiltonian_terms(self.terms) if dtype is None else np.dtype(dtype)
         ops = _fh_u1u1_dense_local_ops(dtype)

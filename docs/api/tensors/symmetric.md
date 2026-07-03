@@ -128,6 +128,32 @@ peps_torch = peps.to_backend(to_backend, inplace=False)
 ham_torch = ham.to_backend(to_backend, inplace=False)
 ```
 
+## Fermi-Hubbard MPO mapping
+
+Spin-resolved Fermi-Hubbard Hamiltonians can be built on 2D or 3D coordinate
+edges and then flattened into a symmetry-preserving MPS-chain MPO with an
+explicit ``OneDMap`` path. The mapping is required for coordinate edges because
+it defines where long-range fermionic parity strings sit on the chain.
+
+```python
+mapper = py.OneDMap(Lx=4, Ly=4, mode="snake")
+idx2coo, coo2idx = mapper.build()
+
+ham = py.SymHamiltonian.from_edges(
+    "fermi_hubbard_u1u1",
+    "U1U1",
+    square_lattice_edges,
+    t=1.0,
+    U=8.0,
+    mu=0.0,
+)
+
+mpo = ham.to_mpo(mapper=mapper)
+
+# Equivalent when a workflow already stores the maps explicitly:
+mpo = ham.to_mpo(idx2coo=idx2coo, coo2idx=coo2idx)
+```
+
 ## Time evolution
 
 Hamiltonians produce a canonical bundled gate stream, so the same stream can be

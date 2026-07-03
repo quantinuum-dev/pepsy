@@ -7,6 +7,7 @@ import pepsy
 from pepsy.operators import gate, gate_simple
 from pepsy.tensors import symmetric as symmetric_mod
 from pepsy.tensors import (
+    OneDMap,
     SymGateStream,
     SymHamiltonian,
     SymMPS,
@@ -927,6 +928,79 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
     assert mpo.max_bond() >= 3
     assert mpo_compressed.max_bond() <= mpo.max_bond()
     assert complex(energy_compressed) == pytest.approx(complex(energy))
+
+
+def test_fermi_hubbard_u1u1_hamiltonian_mpo_maps_2d_edges_with_onedmap():
+    """Coordinate FH edges should align with an explicit OneDMap chain path."""
+    mapper = OneDMap(2, 2, mode="snake")
+    idx2coo, coo2idx = mapper.build()
+    edges_2d = (
+        ((0, 0), (1, 0)),
+        ((0, 1), (1, 1)),
+    )
+    occupations = {
+        (0, 0): (1, 0),
+        (0, 1): (0, 1),
+        (1, 0): (0, 1),
+        (1, 1): (1, 0),
+    }
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations(
+            [occupations[idx2coo[i]] for i in range(4)]
+        ),
+        seed=13,
+        dtype="complex128",
+    )
+    params = {"t": 1.0, "U": 4.0, "mu": 0.25}
+    ham_2d = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        edges_2d,
+        **params,
+    )
+    flat_edges = tuple((coo2idx[left], coo2idx[right]) for left, right in edges_2d)
+    ham_flat = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        flat_edges,
+        **params,
+    )
+
+    mpo_from_mapper = ham_2d.to_mpo(mapper=mapper, compress=False)
+    mpo_from_maps = ham_2d.to_mpo(idx2coo=idx2coo, coo2idx=coo2idx, compress=False)
+    mpo_from_flat = ham_flat.to_mpo(L=4, compress=False)
+
+    def energy(mpo):
+        return pepsy.MpsEnergyOptimizer(
+            state,
+            mpo,
+            energy_per_site=False,
+            real=False,
+        ).energy().energy
+
+    energy_flat = energy(mpo_from_flat)
+    assert mpo_from_mapper.L == 4
+    assert mpo_from_maps.L == 4
+    assert complex(energy(mpo_from_mapper)) == pytest.approx(complex(energy_flat))
+    assert complex(energy(mpo_from_maps)) == pytest.approx(complex(energy_flat))
+
+
+def test_fermi_hubbard_u1u1_hamiltonian_mpo_requires_mapper_for_2d_edges():
+    """Coordinate FH edges need an explicit chain path for fermionic strings."""
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [((0, 0), (1, 0))],
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+    )
+
+    with pytest.raises(ValueError, match="requires mapper=OneDMap"):
+        ham.to_mpo()
 
 
 def test_symmps_gate_stream_runs_mps_optimizer_mpo_heisenberg():
