@@ -126,5 +126,11 @@ the interruption.
 - `SymDMRG2` now exists as the API and quimb-adapter scaffold: dense/quimb MPOs
   run through `quimb.tensor.DMRG2`, while Symmray FH MPOs initialize the Pepsy
   block-sparse path, infer the fixed charge, and record the initial MPO energy.
-  The real remaining DMRG work is the Symmray two-site effective Hamiltonian,
-  local Lanczos/eigensolve, and sector-preserving SVD update.
+- The first Symmray DMRG internals are also present: Pepsy builds dense
+  left/right environments for `<psi|MPO|psi>`, validates their energy against
+  `MpsEnergyOptimizer`, applies a two-site effective-Hamiltonian matvec in the
+  exact current `theta` block layout, and performs an exact dense local solve
+  with Symmray SVD writeback for `L=2` correctness runs.
+- The real remaining DMRG work is enabling safe longer-chain sweeps: canonical
+  center or effective norm handling, then replacing the dense reference local
+  solve with a block-sparse Lanczos/torch path.

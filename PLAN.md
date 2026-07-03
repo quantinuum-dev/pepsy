@@ -174,6 +174,12 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   block-sparse path, infer the fixed total charge from `SymMPS`, and record the
   initial MPO energy before stopping at the not-yet-implemented local
   sector-eigensolver.
+- The first Pepsy-native Symmray DMRG internals are in place: dense left/right
+  environments for `<psi|MPO|psi>`, environment-energy validation against
+  `MpsEnergyOptimizer`, a sector-preserving two-site matvec on the current
+  `theta` block layout, and an exact dense local solve/writeback for the whole
+  `L=2` theta sector. Longer-chain local updates remain blocked until the
+  canonical-center / effective-norm part is implemented.
 
 ### Validation
 

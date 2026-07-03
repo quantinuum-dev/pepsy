@@ -31,8 +31,8 @@ def test_symdmrg2_delegates_dense_mpo_to_quimb_dmrg2():
     assert opt.summary()["energy"] == opt.energy
 
 
-def test_symdmrg2_auto_detects_symmray_fh_u1u1_scaffold():
-    """Symmray FH MPOs should initialize the Pepsy block-sparse path."""
+def test_symdmrg2_solves_two_site_symmray_fh_u1u1_dense_reference():
+    """The first Symmray path should solve the whole L=2 theta sector."""
     pytest.importorskip("symmray")
     state = SymMPS.for_model(
         "fermi_hubbard_u1u1",
@@ -66,7 +66,65 @@ def test_symdmrg2_auto_detects_symmray_fh_u1u1_scaffold():
     assert complex(opt.initial_energy) == pytest.approx(complex(ref_energy))
     assert opt.summary()["total_charge"] == (1, 1)
 
-    with pytest.raises(NotImplementedError, match="Symmray DMRG2 local eigensolver"):
+    assert opt.environment_energy() == pytest.approx(complex(ref_energy))
+    local_energy, theta = opt.dense_local_eigensolve(0)
+    assert theta.inds == opt.two_site_theta(0).inds
+
+    out = opt.solve(sweeps=2)
+    post_energy = pepsy.MpsEnergyOptimizer(
+        opt.state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert out is opt
+    assert opt.converged
+    assert opt.state.max_bond() <= 4
+    assert opt.energy == pytest.approx(local_energy)
+    assert complex(post_energy) == pytest.approx(complex(opt.energy))
+    assert opt.energy <= ref_energy.real
+
+
+def test_symdmrg2_builds_symmray_environments_and_matvec_for_longer_chain():
+    """L>2 has environment/matvec support before full sweep plumbing."""
+    pytest.importorskip("symmray")
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        3,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0)]),
+        seed=13,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1), (1, 2)],
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+    )
+    mpo = ham.to_mpo(L=3, compress=False)
+
+    opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, sweeps=1)
+    ref_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    left, right = opt.build_environments()
+    assert len(left) == len(right) == 4
+    assert opt.environment_energy() == pytest.approx(complex(ref_energy))
+
+    theta = opt.two_site_theta(0)
+    htheta = opt.two_site_matvec(0, theta)
+    assert htheta.inds == theta.inds
+    assert set(htheta.data.blocks) == set(theta.data.blocks)
+
+    with pytest.raises(NotImplementedError, match="enabled for L=2"):
         opt.solve()
 
 
