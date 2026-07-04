@@ -10,8 +10,10 @@ the current theta block layout.
 
 from __future__ import annotations
 
+import itertools
 from itertools import product
 import string
+import warnings
 
 import numpy as np
 from scipy.sparse.linalg import LinearOperator
@@ -284,6 +286,32 @@ def _normalize_sector_enrichment(sector_enrichment):
         ) from exc
 
 
+def _sequence_tuple(values, *, name):
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{name} must be a scalar or a sequence, not a string.")
+    try:
+        out = tuple(values)
+    except TypeError:
+        out = (values,)
+    if not out:
+        raise ValueError(f"{name} must not be empty.")
+    return out
+
+
+def _normalize_sweep_direction(direction):
+    key = str(direction).strip().upper()
+    aliases = {
+        "R": ("R", "right"),
+        "RIGHT": ("R", "right"),
+        "L": ("L", "left"),
+        "LEFT": ("L", "left"),
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        raise ValueError("direction must be 'R'/'right' or 'L'/'left'.") from exc
+
+
 class _ThetaSpace:
     """Flat vector adapter for one fixed Symmray two-site theta layout."""
 
@@ -421,6 +449,9 @@ class SymDMRG2:
         chi=None,
         cutoff=1e-8,
         sweeps=4,
+        bond_dims=None,
+        cutoffs=None,
+        p0=None,
         total_charge=None,
         backend="auto",
         which="SA",
@@ -442,8 +473,14 @@ class SymDMRG2:
         sector_enrichment_seed=0,
         dmrg_opts=None,
     ):
-        if chi is None:
+        if init_mps is None and p0 is not None:
+            init_mps = p0
+        if bond_dims is not None:
+            chi = _sequence_tuple(bond_dims, name="bond_dims")[0]
+        elif chi is None:
             chi = 32
+        if cutoffs is not None:
+            cutoff = _sequence_tuple(cutoffs, name="cutoffs")[0]
         if int(chi) < 1:
             raise ValueError("chi must be a positive integer.")
         if int(sweeps) < 1:
@@ -504,6 +541,8 @@ class SymDMRG2:
         self.driver = None
         self.converged = None
         self.energies = []
+        self.local_energies = []
+        self.total_energies = []
         self._state = self.mps
         self.initial_energy = self._compute_initial_energy()
         self.left_envs = None
@@ -517,6 +556,13 @@ class SymDMRG2:
         self.local_solve_diagnostics = []
         self.sector_enrichment_diagnostics = []
         self._current_sweep_direction = None
+        self.opts = {
+            "default_sweep_sequence": "R",
+            "bond_compress_method": "svd",
+            "bond_compress_cutoff_mode": "rel",
+        }
+        self._set_bond_dim_seq(self.chi if bond_dims is None else bond_dims)
+        self._set_cutoff_seq(self.cutoff if cutoffs is None else cutoffs)
 
         if self.backend == "symmray" and self.mps is not None:
             self._state = self._prepare_symmray_state(self.mps)
@@ -562,6 +608,47 @@ class SymDMRG2:
         if not self.sector_enrichment_diagnostics:
             return None
         return self.sector_enrichment_diagnostics[-1]
+
+    def _set_bond_dim_seq(self, bond_dims):
+        bond_dims = tuple(
+            int(dim) for dim in _sequence_tuple(bond_dims, name="bond_dims")
+        )
+        if any(dim < 1 for dim in bond_dims):
+            raise ValueError("bond_dims entries must be positive integers.")
+        self.bond_dims = bond_dims
+        self._bond_dim0 = bond_dims[0]
+        self._bond_dims = itertools.chain(bond_dims, itertools.repeat(bond_dims[-1]))
+
+    def _set_cutoff_seq(self, cutoffs):
+        cutoffs = tuple(
+            float(cutoff)
+            for cutoff in _sequence_tuple(cutoffs, name="cutoffs")
+        )
+        self.cutoffs = cutoffs
+        self._cutoffs = itertools.chain(cutoffs, itertools.repeat(cutoffs[-1]))
+
+    def _print_pre_sweep(self, i, direction, max_bond, cutoff, verbosity=0):
+        if int(verbosity) > 0:
+            print(
+                f"{i + 1}, {direction}, "
+                f"max_bond=({self.state.max_bond()}/{max_bond}), "
+                f"cutoff:{cutoff}",
+                flush=True,
+            )
+
+    def _print_post_sweep(self, converged, verbosity=0):
+        if int(verbosity) > 1 and hasattr(self.state, "show"):
+            self.state.show()
+        if int(verbosity) > 0:
+            msg = "Energy: {} ... {}".format(
+                self.energy, "converged!" if converged else "not converged."
+            )
+            print(msg, flush=True)
+
+    def _check_convergence(self, tol):
+        if len(self.energies) < 2:
+            return False
+        return abs(self.energies[-1] - self.energies[-2]) < float(tol)
 
     def _compute_initial_energy(self):
         if self.init_mps is None:
@@ -2050,7 +2137,17 @@ class SymDMRG2:
         theta_opt = _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
         return float(energy.real), theta_opt
 
-    def _replace_two_site_theta(self, site, theta, *, chi, cutoff, direction="right"):
+    def _replace_two_site_theta(
+        self,
+        site,
+        theta,
+        *,
+        chi,
+        cutoff,
+        direction="right",
+        method="svd",
+        cutoff_mode="rel",
+    ):
         right_site = site + 1
         bond = self._state.bond(site, right_site)
         left_inds = []
@@ -2060,11 +2157,11 @@ class SymDMRG2:
         absorb = "right" if direction == "right" else "left"
         left_tensor, right_tensor = theta.split(
             left_inds=left_inds,
-            method="svd",
+            method=method,
             absorb=absorb,
             max_bond=chi,
             cutoff=cutoff,
-            cutoff_mode="rel",
+            cutoff_mode=cutoff_mode,
             bond_ind=bond,
             ltags=self._state[site].tags,
             rtags=self._state[right_site].tags,
@@ -2111,12 +2208,22 @@ class SymDMRG2:
             self.mps = self._state
         self._clear_environments()
 
-    def _symmray_sweep_direction(self, direction, *, chi, cutoff, canonize=True):
+    def _symmray_sweep_direction(
+        self,
+        direction,
+        *,
+        chi,
+        cutoff,
+        canonize=True,
+        verbosity=0,
+        method="svd",
+        cutoff_mode="rel",
+    ):
         if direction == "right":
             sites = range(self._state.L - 1)
             split_direction = "right"
         elif direction == "left":
-            sites = reversed(range(self._state.L - 1))
+            sites = range(self._state.L - 2, -1, -1)
             split_direction = "left"
         else:  # pragma: no cover - private consistency check
             raise ValueError("direction must be 'right' or 'left'.")
@@ -2129,17 +2236,26 @@ class SymDMRG2:
             self.build_sweep_block_environments(direction)
 
         last_energy = None
+        local_ens = []
         previous_direction = self._current_sweep_direction
         self._current_sweep_direction = direction
+        sweep = sites
+        if int(verbosity) > 0:
+            from quimb.utils import progbar  # pylint: disable=import-outside-toplevel
+
+            sweep = progbar(sites, ncols=80, total=len(sites))
         try:
-            for site in sites:
+            for site in sweep:
                 last_energy, theta = self.local_eigensolve(site)
+                local_ens.append(float(last_energy))
                 self._replace_two_site_theta(
                     site,
                     theta,
                     chi=chi,
                     cutoff=cutoff,
                     direction=split_direction,
+                    method=method,
+                    cutoff_mode=cutoff_mode,
                 )
                 if direction == "right":
                     self.update_left_environment(site)
@@ -2152,9 +2268,14 @@ class SymDMRG2:
                     if self.right_block_envs is not None:
                         self.update_right_block_environment(site + 1)
         finally:
+            if int(verbosity) > 0:
+                sweep.close()
             self._current_sweep_direction = previous_direction
         self._finish_sweep_direction_environments(direction)
-        return last_energy
+        energy = self.environment_energy(normalized=True).real
+        self.local_energies.append(tuple(local_ens))
+        self.total_energies.append(tuple(local_ens[:-1] + [energy]))
+        return energy
 
     def _finish_sweep_direction_environments(self, direction):
         if direction == "right":
@@ -2176,110 +2297,240 @@ class SymDMRG2:
         else:  # pragma: no cover - private consistency check
             raise ValueError("direction must be 'right' or 'left'.")
 
+    def _ensure_quimb_driver(self, *, bond_dims=None, cutoffs=None):
+        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+        if self.driver is None:
+            self.driver = qtn.DMRG2(
+                self.mpo,
+                which=self.which,
+                bond_dims=self.bond_dims if bond_dims is None else bond_dims,
+                cutoffs=self.cutoffs if cutoffs is None else cutoffs,
+                p0=self.mps,
+            )
+            if self.dmrg_opts:
+                self.driver.opts.update(self.dmrg_opts)
+            self._state = self.driver.state
+        return self.driver
+
     def _solve_quimb(
         self,
         *,
-        chi,
-        cutoff,
-        sweeps,
+        bond_dims,
+        cutoffs,
+        max_sweeps,
         tol,
         verbosity,
         sweep_sequence,
+        suppress_warnings,
         solve_opts,
     ):
-        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
-
-        self.driver = qtn.DMRG2(
-            self.mpo,
-            which=self.which,
-            bond_dims=chi,
-            cutoffs=cutoff,
-            p0=self.mps,
-        )
-        if self.dmrg_opts:
-            self.driver.opts.update(self.dmrg_opts)
-
+        driver = self._ensure_quimb_driver(bond_dims=bond_dims, cutoffs=cutoffs)
         kwargs = dict(solve_opts)
-        if sweep_sequence is not None:
-            kwargs["sweep_sequence"] = sweep_sequence
         self.converged = bool(
-            self.driver.solve(
+            driver.solve(
                 tol=tol,
-                bond_dims=chi,
-                cutoffs=cutoff,
-                max_sweeps=sweeps,
+                bond_dims=bond_dims,
+                cutoffs=cutoffs,
+                sweep_sequence=sweep_sequence,
+                max_sweeps=max_sweeps,
                 verbosity=verbosity,
+                suppress_warnings=suppress_warnings,
                 **kwargs,
             )
         )
-        self.energies = list(self.driver.energies)
-        self._state = self.driver.state
+        self.energies = list(driver.energies)
+        self.local_energies = list(driver.local_energies)
+        self.total_energies = list(driver.total_energies)
+        self._state = driver.state
         return self
 
-    def _solve_symmray(self, *, chi, cutoff, sweeps, tol):
+    def sweep(self, direction, canonize=True, verbosity=0, **update_opts):
+        """Perform one DMRG sweep, using quimb's ``DMRG2.sweep`` conventions.
+
+        Parameters
+        ----------
+        direction : {"R", "L", "right", "left"}
+            Sweep direction.
+        canonize : bool, default=True
+            Whether to canonicalize the state before sweeping.
+        verbosity : {0, 1, 2}, default=0
+            Non-zero values display a quimb-style per-site progress bar.
+        update_opts
+            Supports quimb-style ``max_bond``, ``cutoff``, ``method``, and
+            ``cutoff_mode`` options. Symmray uses these for the two-site SVD
+            writeback.
+        """
+        direction_char, direction_name = _normalize_sweep_direction(direction)
+        max_bond = int(update_opts.pop("max_bond", update_opts.pop("chi", self.chi)))
+        cutoff = float(update_opts.pop("cutoff", self.cutoff))
+        method = update_opts.pop("method", self.opts["bond_compress_method"])
+        cutoff_mode = update_opts.pop(
+            "cutoff_mode",
+            self.opts["bond_compress_cutoff_mode"],
+        )
+
+        if self.backend == "quimb":
+            driver = self._ensure_quimb_driver()
+            energy = driver.sweep(
+                direction_char,
+                canonize=canonize,
+                verbosity=verbosity,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                method=method,
+                cutoff_mode=cutoff_mode,
+                **update_opts,
+            )
+            self._state = driver.state
+            self.local_energies = list(driver.local_energies)
+            self.total_energies = list(driver.total_energies)
+            return energy
+
+        return self._symmray_sweep_direction(
+            direction_name,
+            chi=max_bond,
+            cutoff=cutoff,
+            canonize=canonize,
+            verbosity=verbosity,
+            method=method,
+            cutoff_mode=cutoff_mode,
+        )
+
+    def _solve_symmray(
+        self,
+        *,
+        max_sweeps,
+        tol,
+        verbosity,
+        sweep_sequence,
+        suppress_warnings,
+    ):
         if self._state is None:
             raise ValueError("SymDMRG2 backend='symmray' requires an initial MPS.")
         if self._state.L < 2:
             raise ValueError("SymDMRG2 requires an MPS with at least two sites.")
-        for sweep in range(sweeps):
-            if self._should_enrich_before_sweep(sweep):
+        if sweep_sequence is None:
+            sweep_sequence = self.opts["default_sweep_sequence"]
+        directions = itertools.cycle(str(sweep_sequence).upper())
+        previous_direction = "0"
+
+        self.converged = False
+        for _ in range(max_sweeps):
+            direction = next(directions)
+            direction, _ = _normalize_sweep_direction(direction)
+            max_bond = next(self._bond_dims)
+            cutoff = next(self._cutoffs)
+            sweep_num = len(self.energies)
+
+            if self._should_enrich_before_sweep(sweep_num):
                 bond_dim = self.sector_enrichment_bond_dim
                 if bond_dim is None:
-                    bond_dim = chi
+                    bond_dim = max_bond
                 self.enrich_sectors(
                     bond_dim=bond_dim,
                     noise=self.sector_noise,
                     mode=self.sector_enrichment,
-                    sweep=sweep,
+                    sweep=sweep_num,
                 )
-            self._symmray_sweep_direction("right", chi=chi, cutoff=cutoff)
-            if self._state.L > 2:
-                self._symmray_sweep_direction("left", chi=chi, cutoff=cutoff)
-            self.energies.append(self.environment_energy(normalized=True).real)
-            if len(self.energies) >= 2 and abs(self.energies[-1] - self.energies[-2]) < tol:
-                self.converged = True
+
+            self._print_pre_sweep(
+                sweep_num,
+                direction,
+                max_bond,
+                cutoff,
+                verbosity=verbosity,
+            )
+            canonize = (
+                False
+                if direction + previous_direction in {"LR", "RL"}
+                else True
+            )
+            if suppress_warnings:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    energy = self.sweep(
+                        direction,
+                        canonize=canonize,
+                        verbosity=verbosity,
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                    )
+            else:
+                energy = self.sweep(
+                    direction,
+                    canonize=canonize,
+                    verbosity=verbosity,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                )
+
+            self.energies.append(energy)
+            self.converged = self._check_convergence(tol)
+            self._print_post_sweep(self.converged, verbosity=verbosity)
+            if self.converged:
                 break
-        else:
-            self.converged = False
+            previous_direction = direction
         return self
 
     def solve(
         self,
-        *,
         tol=None,
+        bond_dims=None,
+        cutoffs=None,
+        sweep_sequence=None,
+        max_sweeps=None,
+        verbosity=0,
+        suppress_warnings=True,
+        *,
         sweeps=None,
         chi=None,
         cutoff=None,
-        verbosity=0,
-        sweep_sequence=None,
         **solve_opts,
     ):
         """Run DMRG2 and return ``self``.
 
-        Dense/quimb MPOs are solved immediately by quimb's implementation.
-        Symmray MPOs use Pepsy's sector-preserving dense/Lanczos reference path.
+        The main controls mirror ``quimb.tensor.DMRG2.solve``: ``bond_dims``,
+        ``cutoffs``, ``sweep_sequence``, ``max_sweeps``, ``verbosity``, and
+        ``suppress_warnings``. Pepsy's older ``chi``, ``cutoff``, and
+        ``sweeps`` names remain accepted aliases.
         """
-        chi = self.chi if chi is None else int(chi)
-        cutoff = self.cutoff if cutoff is None else float(cutoff)
-        sweeps = self.sweeps if sweeps is None else int(sweeps)
         tol = self.tol if tol is None else float(tol)
+        if bond_dims is None and chi is not None:
+            bond_dims = chi
+        if cutoffs is None and cutoff is not None:
+            cutoffs = cutoff
+        if bond_dims is not None:
+            self._set_bond_dim_seq(bond_dims)
+            self.chi = self.bond_dims[0]
+        if cutoffs is not None:
+            self._set_cutoff_seq(cutoffs)
+            self.cutoff = self.cutoffs[0]
 
-        if chi < 1:
-            raise ValueError("chi must be a positive integer.")
-        if sweeps < 1:
-            raise ValueError("sweeps must be a positive integer.")
+        if max_sweeps is None:
+            max_sweeps = self.sweeps if sweeps is None else sweeps
+        max_sweeps = int(max_sweeps)
+        if max_sweeps < 1:
+            raise ValueError("max_sweeps must be a positive integer.")
 
         if self.backend == "quimb":
             return self._solve_quimb(
-                chi=chi,
-                cutoff=cutoff,
-                sweeps=sweeps,
+                bond_dims=bond_dims,
+                cutoffs=cutoffs,
+                max_sweeps=max_sweeps,
                 tol=tol,
                 verbosity=verbosity,
                 sweep_sequence=sweep_sequence,
+                suppress_warnings=suppress_warnings,
                 solve_opts=solve_opts,
             )
-        return self._solve_symmray(chi=chi, cutoff=cutoff, sweeps=sweeps, tol=tol)
+        return self._solve_symmray(
+            max_sweeps=max_sweeps,
+            tol=tol,
+            verbosity=verbosity,
+            sweep_sequence=sweep_sequence,
+            suppress_warnings=suppress_warnings,
+        )
 
     run = solve
 
@@ -2290,6 +2541,9 @@ class SymDMRG2:
             "uses_symmray": self.uses_symmray,
             "chi": self.chi,
             "cutoff": self.cutoff,
+            "bond_dims": self.bond_dims,
+            "cutoffs": self.cutoffs,
+            "default_sweep_sequence": self.opts["default_sweep_sequence"],
             "norm_rcond": self.norm_rcond,
             "local_solver": self.local_solver,
             "dense_threshold": self.dense_threshold,
@@ -2309,6 +2563,8 @@ class SymDMRG2:
             "initial_energy": self.initial_energy,
             "energy": self.energy,
             "converged": self.converged,
+            "num_local_energy_sweeps": len(self.local_energies),
+            "num_total_energy_sweeps": len(self.total_energies),
             "num_svd_diagnostics": len(self.svd_diagnostics),
             "last_svd_diagnostic": self.last_svd_diagnostic,
             "num_norm_identity_diagnostics": len(self.norm_identity_diagnostics),

@@ -3,6 +3,16 @@
 `SymDMRG2` is the public entry point for the symmetric two-site DMRG path.
 Ordinary quimb MPOs are delegated directly to `quimb.tensor.DMRG2`.
 
+The main solve controls intentionally mirror quimb's `DMRG2`: `bond_dims`,
+`cutoffs`, `sweep_sequence`, `max_sweeps`, `verbosity`, and
+`suppress_warnings` are accepted by `solve`, and `sweep(direction, ...)`
+accepts `"R"`/`"L"` or `"right"`/`"left"`. Pepsy's older `chi`, `cutoff`, and
+`sweeps` names remain accepted as aliases. `solve` keeps the Pepsy optimizer
+convention of returning `self`; the quimb-style convergence boolean is stored
+on `converged`. With `verbosity > 0`, Symmray sweeps use quimb's `progbar`
+helper for the per-site progress display and print quimb-style pre/post sweep
+energy lines.
+
 For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain. Periodic
 lattice edges should be encoded as long-range terms in that OBC MPO, not as a
 cyclic MPS. Pepsy builds dense left/right environments for `<psi|MPO|psi>`,

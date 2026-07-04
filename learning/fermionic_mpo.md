@@ -169,3 +169,7 @@ the interruption.
   norm environment for normalized energy readout. `sector_enrichment="adaptive"`
   repeats template enrichment before each sweep and preserves restricted
   physical sector maps when building the template.
+- The public `SymDMRG2` control surface now follows quimb `DMRG2` naming:
+  `p0`, `bond_dims`, `cutoffs`, `max_sweeps`, `sweep_sequence`, `verbosity`,
+  and public `sweep("R"/"L", ...)` are accepted. Verbose Symmray sweeps use
+  quimb's per-site progress bar.

@@ -189,7 +189,7 @@ def test_symdmrg2_solves_longer_chain_with_effective_norm():
     local_energy, local_theta = opt.dense_generalized_local_eigensolve(0)
     assert local_theta.inds == theta.inds
 
-    out = opt.solve()
+    out = opt.solve(max_sweeps=2, sweep_sequence="RL")
     post_energy = pepsy.MpsEnergyOptimizer(
         opt.state,
         mpo,
@@ -199,7 +199,7 @@ def test_symdmrg2_solves_longer_chain_with_effective_norm():
 
     assert out is opt
     assert opt.state.max_bond() <= 4
-    assert len(opt.energies) == 1
+    assert len(opt.energies) == 2
     assert opt.energy <= local_energy + 1e-12
     assert complex(post_energy) == pytest.approx(complex(opt.energy))
     assert opt.environment_energy() == pytest.approx(complex(opt.energy))
@@ -239,6 +239,67 @@ def test_symdmrg2_directional_environment_builds_only_static_side(monkeypatch):
     assert all(env is not None for env in opt.left_envs)
     assert all(env is None for env in opt.right_envs[:-1])
     assert opt.right_envs[-1] is not None
+
+
+def test_symdmrg2_accepts_quimb_style_solve_controls():
+    """SymDMRG2 should accept DMRG2-style p0/bond_dims/cutoffs controls."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        p0=state,
+        bond_dims=[3, 4],
+        cutoffs=[1e-9, 1e-10],
+        local_solver="dense",
+    )
+    out = opt.solve(max_sweeps=2, sweep_sequence="RL", tol=0.0)
+
+    assert out is opt
+    assert opt.summary()["bond_dims"] == (3, 4)
+    assert opt.summary()["cutoffs"] == (1e-09, 1e-10)
+    assert len(opt.energies) == 2
+    assert len(opt.local_energies) == 2
+    assert len(opt.total_energies) == 2
+    assert {diag["chi"] for diag in opt.svd_diagnostics} == {3, 4}
+    assert opt.state.max_bond() <= 4
+
+
+def test_symdmrg2_sweep_uses_quimb_progress_bar(monkeypatch):
+    """verbosity>0 should wrap the site sweep with quimb's progbar helper."""
+    pytest.importorskip("symmray")
+    import quimb.utils as qutils
+
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+    opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, local_solver="dense")
+    calls = []
+
+    class DummyProgbar:
+        def __init__(self, iterable):
+            self.iterable = iterable
+            self.closed = False
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def close(self):
+            self.closed = True
+
+    def fake_progbar(iterable, **kwargs):
+        bar = DummyProgbar(iterable)
+        calls.append((kwargs, bar))
+        return bar
+
+    monkeypatch.setattr(qutils, "progbar", fake_progbar)
+
+    energy = opt.sweep("R", verbosity=1, max_bond=4, cutoff=1e-10)
+
+    assert isinstance(energy, float)
+    assert len(opt.energies) == 0
+    assert len(opt.local_energies) == 1
+    assert calls[0][0]["total"] == opt.state.L - 1
+    assert calls[0][0]["ncols"] == 80
+    assert calls[0][1].closed
 
 
 def test_symdmrg2_linear_operator_matches_dense_effective_hamiltonian():
@@ -407,7 +468,7 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
         local_eig_tol=1e-10,
         local_eig_ncv=8,
     )
-    out = opt.solve()
+    out = opt.solve(max_sweeps=2, sweep_sequence="RL")
     post_energy = pepsy.MpsEnergyOptimizer(
         opt.state,
         mpo,
@@ -417,7 +478,7 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
 
     assert out is opt
     assert opt.state.max_bond() <= 3
-    assert len(opt.energies) == 1
+    assert len(opt.energies) == 2
     assert complex(post_energy) == pytest.approx(complex(opt.energy))
     assert len(opt.svd_diagnostics) == 2 * (4 - 1)
     assert opt.summary()["num_svd_diagnostics"] == len(opt.svd_diagnostics)
@@ -495,7 +556,7 @@ def test_symdmrg2_lanczos_reaches_fixed_sector_ed_with_full_initial_support():
         local_eig_ncv=16,
         norm_check_samples=3,
     )
-    opt.solve(tol=0.0)
+    opt.solve(tol=0.0, max_sweeps=2, sweep_sequence="RL")
     post_energy = pepsy.MpsEnergyOptimizer(
         opt.state,
         mpo,
@@ -559,7 +620,7 @@ def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():
         sector_noise=1e-8,
         sector_enrichment_seed=123,
     )
-    opt.solve(tol=0.0)
+    opt.solve(tol=0.0, max_sweeps=2, sweep_sequence="RL")
     post_energy = pepsy.MpsEnergyOptimizer(
         opt.state,
         mpo,
@@ -640,7 +701,7 @@ def test_symdmrg2_lanczos_stress_obc_six_site_chain_tracks_svd_sectors():
         local_eig_tol=1e-10,
         local_eig_ncv=8,
     )
-    out = opt.solve()
+    out = opt.solve(max_sweeps=2, sweep_sequence="RL")
     post_energy = pepsy.MpsEnergyOptimizer(
         opt.state,
         mpo,
@@ -650,7 +711,7 @@ def test_symdmrg2_lanczos_stress_obc_six_site_chain_tracks_svd_sectors():
 
     assert out is opt
     assert opt.state.max_bond() <= 4
-    assert len(opt.energies) == 1
+    assert len(opt.energies) == 2
     assert complex(post_energy) == pytest.approx(complex(opt.energy))
     assert len(opt.svd_diagnostics) == 2 * (6 - 1)
     assert opt.summary()["last_svd_diagnostic"] == opt.svd_diagnostics[-1]

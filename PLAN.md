@@ -206,6 +206,11 @@ constructions, plus the fermionic Fermi-Hubbard starters in
 - `sector_enrichment="adaptive"` now repeats template enrichment before every
   sweep. Template construction preserves the current physical sector map rather
   than reducing restricted U1U1 states to a bare physical dimension.
+- `SymDMRG2` now accepts quimb-style `p0`, `bond_dims`, `cutoffs`,
+  `max_sweeps`, `sweep_sequence`, `verbosity`, and `suppress_warnings`
+  controls, exposes a public `sweep("R"/"L", ...)`, and uses quimb's progress
+  bar helper for verbose Symmray sweeps. `solve` still returns `self`; the
+  quimb-style convergence boolean is stored on `converged`.
 - The next DMRG step is larger-chain profiling: time the block-native matvec
   and adaptive enrichment on target workloads, then add torch-native block
   contractions where useful.
