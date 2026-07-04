@@ -23,13 +23,15 @@ default the benchmark skips the startup `initial_energy` estimate and samples
 local residual and matvec diagnostics, so runs spend their extra correctness
 and profiling budget on the two-site solves being timed.
 
-For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain. Periodic
-lattice edges should be encoded as long-range terms in that OBC MPO, not as a
-cyclic MPS. Pepsy builds dense left/right environments for `<psi|MPO|psi>`,
-block-sparse environments for the projected `H_eff`, and dense debug
-environments for `N_eff`. The active local basis is exactly the current
-`theta` block layout. By default, Symmray `H_eff` matvecs use a block-native
-projected contraction; `matvec_backend="dense_reference"` keeps the older
+For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain and a
+bosonic/Jordan-Wigner Symmray MPO whenever the input MPS uses fermionic
+Symmray arrays that need bosonization. Periodic lattice edges should be
+encoded as long-range terms in that OBC MPO, not as a cyclic MPS. Pepsy builds
+dense left/right environments for `<psi|MPO|psi>`, block-sparse environments
+for the projected `H_eff`, and dense debug environments for `N_eff`. The
+active local basis is exactly the current `theta` block layout. By default,
+Symmray `H_eff` matvecs use a block-native projected contraction;
+`matvec_backend="dense_reference"` keeps the older
 NumPy dense-aligned matvec available as a validator. During a local
 dense/Lanczos solve, the block-native path caches the static projected
 problem for the active two-site window, including reindexed MPO tensors and
@@ -41,7 +43,10 @@ Symmray sweeps
 canonicalize the MPS center before using H-only dense/Lanczos solves; a
 non-identity effective norm is treated as a canonicalization/alignment error
 unless the explicit diagnostic `local_solver="generalized_dense"` mode is
-requested. The default `norm_check="strict"` validates every two-site window.
+requested. If a requested state canonicalization method is unavailable,
+SymDMRG2 forces `N_eff ~= I` checks for that H-only sweep even when
+`norm_check="off"`, so the wrong metric cannot be used silently. The default
+`norm_check="strict"` validates every two-site window.
 For larger trusted runs, `norm_check="sampled"` checks boundary windows plus
 every `norm_check_interval`-th interior window, `norm_check="first_sweep"`
 checks only the first sweep, and `norm_check="off"` skips this expensive

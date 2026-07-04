@@ -918,6 +918,8 @@ class SymDMRG2:
         self._projected_problem_cache = None
         self._last_matvec_projected_problem = None
         self._last_matvec_cache_hit = None
+        self._force_norm_check_after_skipped_canonize = False
+        self._force_norm_check_reason = None
         self.projected_problem_cache_hits = 0
         self.projected_problem_cache_misses = 0
         self.svd_diagnostics = []
@@ -1197,6 +1199,13 @@ class SymDMRG2:
     def _prepare_symmray_state(self, state):
         state = _unwrap_state(state)
         if any(_is_fermionic_symmray_array(data) for data in _iter_tensor_data(state)):
+            if not MpsEnergyOptimizer._mpo_uses_bosonic_symmray(self.mpo):
+                raise ValueError(
+                    "SymDMRG2 can only bosonize a fermionic Symmray MPS when "
+                    "the MPO is already a bosonic/Jordan-Wigner Symmray MPO. "
+                    "A fermionic MPS with a fermionic or non-Symmray MPO would "
+                    "make the bra-MPO-ket sandwich inconsistent."
+                )
             return MpsEnergyOptimizer._bosonize_fermionic_tn(state)
         return state.copy()
 
@@ -2351,11 +2360,8 @@ class SymDMRG2:
         """
         backend = self._resolved_matvec_backend()
         profile_start = self._profile_start()
-        diagnostic_start = (
-            time.perf_counter()
-            if self.matvec_diagnostics != "off"
-            else None
-        )
+        record_matvec_diagnostic = self._should_record_matvec_diagnostic(site)
+        diagnostic_start = time.perf_counter() if record_matvec_diagnostic else None
         theta_input = self.two_site_theta(site) if theta is None else theta
         self._last_matvec_projected_problem = None
         self._last_matvec_cache_hit = None
@@ -2370,11 +2376,12 @@ class SymDMRG2:
                 "site": int(site),
                 "right_site": int(site + 1),
                 "matvec_backend": backend,
-                **self._tensor_block_stats(theta_input),
             }
+            if profile_start is not None or record_matvec_diagnostic:
+                metadata.update(self._tensor_block_stats(theta_input))
             diagnostic_metadata = dict(metadata)
             problem = self._last_matvec_projected_problem
-            if problem is not None and self._should_record_matvec_diagnostic(site):
+            if problem is not None and record_matvec_diagnostic:
                 diagnostic_metadata.update(problem.summary())
                 diagnostic_metadata["projected_problem_cache_hit"] = bool(
                     self._last_matvec_cache_hit
@@ -2393,11 +2400,12 @@ class SymDMRG2:
                     else None
                 )
             )
-            self._record_matvec_diagnostic(
-                site,
-                elapsed=elapsed,
-                metadata=diagnostic_metadata,
-            )
+            if record_matvec_diagnostic:
+                self._record_matvec_diagnostic(
+                    site,
+                    elapsed=elapsed,
+                    metadata=diagnostic_metadata,
+                )
 
     def _norm_matvec_dense(self, site, theta_dense):
         if self.left_norm_envs is None or self.right_norm_envs is None:
@@ -2668,7 +2676,15 @@ class SymDMRG2:
         )
         return diagnostic
 
-    def _check_effective_norm_identity(self, site, theta, *, dim=None):
+    def _check_effective_norm_identity(
+        self,
+        site,
+        theta,
+        *,
+        dim=None,
+        forced=False,
+        reason=None,
+    ):
         profile_start = self._profile_start()
         norm_error = self.effective_norm_identity_error(site, theta)
         diagnostic = {
@@ -2683,6 +2699,8 @@ class SymDMRG2:
             "skipped": False,
             "mode": self.norm_check,
             "interval": self.norm_check_interval,
+            "forced": bool(forced),
+            "reason": None if reason is None else str(reason),
         }
         self.norm_identity_diagnostics.append(diagnostic)
         self._record_profile_elapsed(
@@ -2695,6 +2713,8 @@ class SymDMRG2:
             samples=int(self.norm_check_samples),
             skipped=False,
             mode=self.norm_check,
+            forced=bool(forced),
+            reason=None if reason is None else str(reason),
         )
         if norm_error <= self.norm_check_tol:
             return norm_error
@@ -2914,8 +2934,15 @@ class SymDMRG2:
             )
             return energy, theta_opt
 
-        if self._should_run_norm_check(site):
-            norm_error = self._check_effective_norm_identity(site, theta, dim=dim)
+        force_norm_check = bool(self._force_norm_check_after_skipped_canonize)
+        if force_norm_check or self._should_run_norm_check(site):
+            norm_error = self._check_effective_norm_identity(
+                site,
+                theta,
+                dim=dim,
+                forced=force_norm_check,
+                reason=self._force_norm_check_reason if force_norm_check else None,
+            )
         else:
             norm_error = None
             self._record_skipped_norm_identity(site, dim=dim)
@@ -3114,7 +3141,7 @@ class SymDMRG2:
                 direction=direction,
                 skipped=True,
             )
-            return
+            return False
         try:
             result = method(bra=None)
         except TypeError:
@@ -3129,6 +3156,7 @@ class SymDMRG2:
             direction=direction,
             skipped=False,
         )
+        return True
 
     def _symmray_sweep_direction(
         self,
@@ -3151,8 +3179,13 @@ class SymDMRG2:
             raise ValueError("direction must be 'right' or 'left'.")
 
         sweep_profile_start = self._profile_start()
+        self._force_norm_check_after_skipped_canonize = False
+        self._force_norm_check_reason = None
         if canonize:
-            self._canonize_for_sweep(direction)
+            canonized = self._canonize_for_sweep(direction)
+            if not canonized:
+                self._force_norm_check_after_skipped_canonize = True
+                self._force_norm_check_reason = f"{direction}_canonize_unavailable"
         self.build_sweep_environments(direction)
         self.build_sweep_norm_environments(direction)
         if self._resolved_matvec_backend() == "symmray":
@@ -3210,6 +3243,8 @@ class SymDMRG2:
             if int(verbosity) > 0:
                 sweep.close()
             self._current_sweep_direction = previous_direction
+            self._force_norm_check_after_skipped_canonize = False
+            self._force_norm_check_reason = None
         finish_start = self._profile_start()
         self._finish_sweep_direction_environments(direction)
         self._record_profile_elapsed(

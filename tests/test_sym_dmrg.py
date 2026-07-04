@@ -469,6 +469,45 @@ def test_symdmrg2_norm_check_off_skips_effective_norm_probe(monkeypatch):
     assert opt.summary()["norm_check"] == "off"
 
 
+def test_symdmrg2_skipped_canonicalization_forces_norm_probe(monkeypatch):
+    """H-only solves must validate N_eff if requested canonicalization is unavailable."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        norm_check="off",
+    )
+
+    calls = []
+
+    def skipped_canonize(direction):
+        assert direction == "right"
+        return False
+
+    def identity_norm_probe(site, theta):
+        calls.append(int(site))
+        return 0.0
+
+    monkeypatch.setattr(opt, "_canonize_for_sweep", skipped_canonize)
+    monkeypatch.setattr(opt, "effective_norm_identity_error", identity_norm_probe)
+
+    opt.sweep("R", max_bond=4, cutoff=1e-10)
+
+    assert calls == [0, 1]
+    assert len(opt.norm_identity_diagnostics) == 2
+    assert all(not diag["skipped"] for diag in opt.norm_identity_diagnostics)
+    assert all(diag["forced"] for diag in opt.norm_identity_diagnostics)
+    assert {diag["reason"] for diag in opt.norm_identity_diagnostics} == {
+        "right_canonize_unavailable"
+    }
+    assert all(diag["norm_error"] == 0.0 for diag in opt.local_solve_diagnostics)
+
+
 def test_symdmrg2_sampled_norm_check_checks_boundaries_and_skips_interval():
     """Sampled checks should keep boundary probes and skip selected interiors."""
     pytest.importorskip("symmray")
@@ -732,6 +771,35 @@ def test_symdmrg2_matvec_diagnostics_record_cache_and_projector_stats():
     assert opt.profile_summary()["num_matvec_diagnostics"] == 2
 
 
+def test_symdmrg2_matvec_skips_block_stats_without_profile_or_diagnostics(monkeypatch):
+    """Lanczos hot-loop metadata should be free when profile/diagnostics are off."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        matvec_backend="dense_reference",
+        matvec_diagnostics="off",
+        profile=False,
+    )
+    theta = opt.two_site_theta(0)
+
+    def raise_if_called(*_args, **_kwargs):
+        raise AssertionError("_tensor_block_stats should not run")
+
+    monkeypatch.setattr(opt, "_tensor_block_stats", raise_if_called)
+
+    out = opt.two_site_matvec(0, theta)
+
+    assert out.inds == theta.inds
+    assert opt.profile_diagnostics == []
+    assert opt.matvec_diagnostic_records == []
+
+
 def test_symdmrg2_dense_reference_matvec_backend_remains_selectable():
     """The dense-aligned matvec stays available as a debug fallback."""
     pytest.importorskip("symmray")
@@ -754,6 +822,27 @@ def test_symdmrg2_dense_reference_matvec_backend_remains_selectable():
     assert set(via_dispatch.data.blocks) == set(direct.data.blocks)
     for sector in theta.data.blocks:
         assert via_dispatch.data.blocks[sector] == pytest.approx(direct.data.blocks[sector])
+
+
+def test_symdmrg2_rejects_fermionic_state_without_bosonic_symmray_mpo(monkeypatch):
+    """Bosonizing a fermionic state requires a matching bosonic/JW MPO."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(2, [(1, 0), (0, 1)])
+
+    monkeypatch.setattr(
+        pepsy.MpsEnergyOptimizer,
+        "_mpo_uses_bosonic_symmray",
+        classmethod(lambda cls, mpo: False),
+    )
+
+    with pytest.raises(ValueError, match="bosonic/Jordan-Wigner Symmray MPO"):
+        pepsy.SymDMRG2(
+            mpo,
+            state,
+            chi=4,
+            cutoff=1e-10,
+            sweeps=1,
+        )
 
 
 def test_symdmrg2_lanczos_matches_dense_after_canonicalization():
