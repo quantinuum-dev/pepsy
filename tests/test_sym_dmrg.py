@@ -613,6 +613,82 @@ def test_symdmrg2_sampled_residual_check_records_boundaries_and_interval():
     assert by_local_site[2]["residual_check_passed"] is True
 
 
+def test_symdmrg2_convergence_uses_residual_and_truncation_gates():
+    """Optional convergence gates should use per-sweep diagnostic maxima."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=3,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        convergence_residual_tol=1e-8,
+        convergence_truncation_tol=1.0,
+        energy_tol_per_site=True,
+    )
+    opt.solve(max_sweeps=2, sweep_sequence="RR", tol=1e9)
+
+    first, last = opt.convergence_diagnostics
+    summary = opt.summary()
+
+    assert opt.converged is True
+    assert opt.summary()["residual_check"] == "strict"
+    assert summary["energy_tol_per_site"] is True
+    assert summary["num_convergence_diagnostics"] == 2
+    assert summary["last_convergence_diagnostic"] == opt.last_convergence_diagnostic
+    assert first["energy_converged"] is False
+    assert last["energy_converged"] is True
+    assert last["residual_converged"] is True
+    assert last["truncation_converged"] is True
+    assert last["converged"] is True
+    assert last["num_local_solves"] == 3
+    assert last["num_svd_splits"] == 3
+    assert last["num_residual_checks"] == 3
+    assert last["num_skipped_residual_checks"] == 0
+    assert last["max_residual_norm"] < 1e-8
+    assert last["energy_scale"] == pytest.approx(4.0)
+
+
+def test_symdmrg2_convergence_truncation_gate_can_block_energy_convergence():
+    """A strict truncation gate should keep energy-only convergence honest."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=3,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=1,
+        cutoff=1e-10,
+        local_solver="dense",
+        convergence_truncation_tol=0.0,
+    )
+    opt.solve(max_sweeps=1, sweep_sequence="R", tol=1e9)
+
+    offsets = opt._sweep_convergence_offsets()
+    energy = opt.sweep("R")
+    opt.energies.append(energy)
+    for diagnostic in opt.svd_diagnostics[offsets["svd"]:]:
+        diagnostic["truncation_error"] = 1e-3
+    opt.converged = opt._check_convergence(1e9, offsets)
+    last = opt.last_convergence_diagnostic
+
+    assert opt.converged is False
+    assert len(opt.energies) == 2
+    assert last["energy_converged"] is True
+    assert last["truncation_converged"] is False
+    assert last["max_truncation_error"] == pytest.approx(1e-3)
+
+
 def test_symdmrg2_linear_operator_matches_dense_effective_hamiltonian():
     """The Lanczos LinearOperator should be the same H_eff as dense columns."""
     pytest.importorskip("symmray")

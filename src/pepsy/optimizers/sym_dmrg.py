@@ -747,6 +747,17 @@ class SymDMRG2:
     residual_check_tol
         Optional tolerance for marking residual diagnostics as passed/failed.
         Diagnostics are recorded but not raised as hard errors.
+    convergence_residual_tol, convergence_truncation_tol
+        Optional Symmray convergence gates. When supplied, sweep convergence
+        requires the energy criterion and the corresponding per-sweep maximum
+        local residual or SVD truncation error to be below this tolerance.
+        ``convergence_residual_tol`` enables strict residual checks when
+        ``residual_check`` is otherwise off, so the required diagnostic is
+        available.
+    energy_tol_per_site, energy_tol_relative
+        Optional scalings for the energy-difference convergence criterion.
+        Both default to ``False`` to preserve the historical absolute
+        ``abs(E_n - E_{n-1}) < tol`` behavior.
     matvec_backend
         Projected Hamiltonian matvec implementation for the Symmray path.
         ``"auto"`` uses the block-native Symmray contraction, while
@@ -807,6 +818,10 @@ class SymDMRG2:
         residual_check="off",
         residual_check_interval=1,
         residual_check_tol=None,
+        convergence_residual_tol=None,
+        convergence_truncation_tol=None,
+        energy_tol_per_site=False,
+        energy_tol_relative=False,
         matvec_backend="auto",
         matvec_diagnostics="off",
         matvec_diagnostics_interval=1,
@@ -861,6 +876,23 @@ class SymDMRG2:
         self.residual_check_tol = (
             None if residual_check_tol is None else float(residual_check_tol)
         )
+        self.convergence_residual_tol = (
+            None
+            if convergence_residual_tol is None
+            else float(convergence_residual_tol)
+        )
+        self.convergence_truncation_tol = (
+            None
+            if convergence_truncation_tol is None
+            else float(convergence_truncation_tol)
+        )
+        self.energy_tol_per_site = bool(energy_tol_per_site)
+        self.energy_tol_relative = bool(energy_tol_relative)
+        if (
+            self.convergence_residual_tol is not None
+            and self.residual_check == "off"
+        ):
+            self.residual_check = "strict"
         self.matvec_backend = _normalize_matvec_backend(matvec_backend)
         self.matvec_diagnostics = _normalize_check_schedule(
             matvec_diagnostics,
@@ -885,6 +917,16 @@ class SymDMRG2:
             raise ValueError("residual_check_interval must be a positive integer.")
         if self.residual_check_tol is not None and self.residual_check_tol < 0.0:
             raise ValueError("residual_check_tol must be non-negative.")
+        if (
+            self.convergence_residual_tol is not None
+            and self.convergence_residual_tol < 0.0
+        ):
+            raise ValueError("convergence_residual_tol must be non-negative.")
+        if (
+            self.convergence_truncation_tol is not None
+            and self.convergence_truncation_tol < 0.0
+        ):
+            raise ValueError("convergence_truncation_tol must be non-negative.")
         if self.matvec_diagnostics_interval < 1:
             raise ValueError("matvec_diagnostics_interval must be a positive integer.")
         if self.sector_enrichment_bond_dim is not None and self.sector_enrichment_bond_dim < 1:
@@ -935,6 +977,7 @@ class SymDMRG2:
         self.residual_diagnostics = []
         self.matvec_diagnostic_records = []
         self.local_solve_diagnostics = []
+        self.convergence_diagnostics = []
         self.sector_enrichment_diagnostics = []
         self.profile_diagnostics = []
         self._current_sweep_direction = None
@@ -1023,6 +1066,13 @@ class SymDMRG2:
         if not self.local_solve_diagnostics:
             return None
         return self.local_solve_diagnostics[-1]
+
+    @property
+    def last_convergence_diagnostic(self):
+        """Most recent per-sweep convergence diagnostic, if any."""
+        if not self.convergence_diagnostics:
+            return None
+        return self.convergence_diagnostics[-1]
 
     @property
     def last_sector_enrichment_diagnostic(self):
@@ -1169,10 +1219,119 @@ class SymDMRG2:
             )
             print(msg, flush=True)
 
-    def _check_convergence(self, tol):
+    def _sweep_convergence_offsets(self):
+        return {
+            "svd": len(self.svd_diagnostics),
+            "residual": len(self.residual_diagnostics),
+            "local_solve": len(self.local_solve_diagnostics),
+        }
+
+    @staticmethod
+    def _max_optional_float(values):
+        floats = [float(value) for value in values if value is not None]
+        if not floats:
+            return None
+        return float(max(floats))
+
+    def _energy_convergence_data(self, tol):
         if len(self.energies) < 2:
-            return False
-        return abs(self.energies[-1] - self.energies[-2]) < float(tol)
+            return {
+                "previous_energy": None,
+                "energy_delta": None,
+                "energy_metric": None,
+                "energy_scale": None,
+                "energy_converged": False,
+            }
+
+        previous_energy = float(self.energies[-2])
+        current_energy = float(self.energies[-1])
+        delta = float(abs(current_energy - previous_energy))
+        scale = 1.0
+        if self.energy_tol_per_site:
+            scale *= max(int(getattr(self._state, "L", 1)), 1)
+        if self.energy_tol_relative:
+            scale *= max(abs(previous_energy), abs(current_energy), 1.0)
+        metric = float(delta / scale)
+        return {
+            "previous_energy": previous_energy,
+            "energy_delta": delta,
+            "energy_metric": metric,
+            "energy_scale": float(scale),
+            "energy_converged": bool(metric < float(tol)),
+        }
+
+    def _record_convergence_diagnostic(self, tol, offsets):
+        residual_records = self.residual_diagnostics[offsets["residual"]:]
+        available_residuals = [
+            diagnostic.get("residual_norm")
+            for diagnostic in residual_records
+            if not diagnostic.get("skipped", False)
+        ]
+        skipped_residuals = sum(
+            1 for diagnostic in residual_records if diagnostic.get("skipped", False)
+        )
+        max_residual = self._max_optional_float(available_residuals)
+
+        svd_records = self.svd_diagnostics[offsets["svd"]:]
+        truncation_errors = [
+            diagnostic.get("truncation_error") for diagnostic in svd_records
+        ]
+        max_truncation = self._max_optional_float(truncation_errors)
+        missing_truncation = sum(error is None for error in truncation_errors)
+
+        residual_converged = None
+        if self.convergence_residual_tol is not None:
+            residual_converged = bool(
+                max_residual is not None
+                and skipped_residuals == 0
+                and max_residual <= self.convergence_residual_tol
+            )
+
+        truncation_converged = None
+        if self.convergence_truncation_tol is not None:
+            truncation_converged = bool(
+                max_truncation is not None
+                and missing_truncation == 0
+                and max_truncation <= self.convergence_truncation_tol
+            )
+
+        energy_data = self._energy_convergence_data(tol)
+        checks = [energy_data["energy_converged"]]
+        if residual_converged is not None:
+            checks.append(residual_converged)
+        if truncation_converged is not None:
+            checks.append(truncation_converged)
+        converged = bool(all(checks))
+
+        diagnostic = {
+            "sweep": len(self.energies) - 1,
+            "energy": None if not self.energies else float(self.energies[-1]),
+            "energy_tol": float(tol),
+            "energy_tol_per_site": self.energy_tol_per_site,
+            "energy_tol_relative": self.energy_tol_relative,
+            "num_local_solves": len(
+                self.local_solve_diagnostics[offsets["local_solve"]:]
+            ),
+            "num_svd_splits": len(svd_records),
+            "max_truncation_error": max_truncation,
+            "num_missing_truncation_errors": int(missing_truncation),
+            "truncation_tol": self.convergence_truncation_tol,
+            "truncation_converged": truncation_converged,
+            "num_residual_checks": len(available_residuals),
+            "num_skipped_residual_checks": int(skipped_residuals),
+            "max_residual_norm": max_residual,
+            "residual_tol": self.convergence_residual_tol,
+            "residual_converged": residual_converged,
+            "converged": converged,
+        }
+        diagnostic.update(energy_data)
+        self.convergence_diagnostics.append(diagnostic)
+        return diagnostic
+
+    def _check_convergence(self, tol, offsets=None):
+        if offsets is None:
+            offsets = self._sweep_convergence_offsets()
+        return self._record_convergence_diagnostic(tol, offsets)["converged"]
 
     def _compute_initial_energy(self):
         if self.init_mps is None:
@@ -3451,6 +3610,7 @@ class SymDMRG2:
                     if direction + previous_direction in {"LR", "RL"}
                     else True
                 )
+                convergence_offsets = self._sweep_convergence_offsets()
                 if suppress_warnings:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
@@ -3471,7 +3631,7 @@ class SymDMRG2:
                     )
 
                 self.energies.append(energy)
-                self.converged = self._check_convergence(tol)
+                self.converged = self._check_convergence(tol, convergence_offsets)
                 self._print_post_sweep(self.converged, verbosity=verbosity)
                 if self.converged:
                     break
@@ -3571,6 +3731,10 @@ class SymDMRG2:
             "residual_check": self.residual_check,
             "residual_check_interval": self.residual_check_interval,
             "residual_check_tol": self.residual_check_tol,
+            "convergence_residual_tol": self.convergence_residual_tol,
+            "convergence_truncation_tol": self.convergence_truncation_tol,
+            "energy_tol_per_site": self.energy_tol_per_site,
+            "energy_tol_relative": self.energy_tol_relative,
             "matvec_backend": self.matvec_backend,
             "resolved_matvec_backend": self._resolved_matvec_backend(),
             "matvec_diagnostics": self.matvec_diagnostics,
@@ -3602,6 +3766,8 @@ class SymDMRG2:
             "last_matvec_diagnostic": self.last_matvec_diagnostic,
             "num_local_solve_diagnostics": len(self.local_solve_diagnostics),
             "last_local_solve_diagnostic": self.last_local_solve_diagnostic,
+            "num_convergence_diagnostics": len(self.convergence_diagnostics),
+            "last_convergence_diagnostic": self.last_convergence_diagnostic,
             "num_sector_enrichment_diagnostics": len(self.sector_enrichment_diagnostics),
             "last_sector_enrichment_diagnostic": self.last_sector_enrichment_diagnostic,
             "num_profile_diagnostics": len(self.profile_diagnostics),
