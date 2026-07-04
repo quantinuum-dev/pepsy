@@ -218,9 +218,13 @@ data too early.
    canonical `N_eff ~= I` check and every local dense/Lanczos solve, including
    the active theta dimension and matvec backend. A small OBC FH U1U1 test
    reaches the fixed `(2,2)` sector ED energy once the initial MPS contains
-   enough bond-sector support. Torch/autodiff support, sector-expansion/noise,
-   and PBC segment-compressed environments remain separate performance and
-   convergence layers from the fermion algebra.
+   enough bond-sector support. The first sector-expansion/noise layer is now
+   available as `sector_enrichment="template"`: it merges virtual charge maps
+   from a same-charge random template MPS into the current OBC MPS and seeds
+   newly valid blocks with `sector_noise` before canonical Lanczos. The narrow
+   `bond_dim=2` L=4 FH U1U1 test reaches the same fixed-sector ED energy after
+   enrichment. Torch/autodiff support and PBC segment-compressed environments
+   remain separate performance layers from the fermion algebra.
 
 ## Acceptance Criteria For The True MPO Fix
 

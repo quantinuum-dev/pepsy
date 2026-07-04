@@ -154,6 +154,13 @@ the interruption.
 - A four-site OBC Fermi-Hubbard U1U1 regression now compares forced Lanczos
   DMRG against a dense Jordan-Wigner fixed-sector ED oracle. With enough initial
   bond-sector support, one sweep reaches the `(N_up,N_down)=(2,2)` ED energy to
-  numerical precision. With too little initial sector support, the current
-  implementation improves energy but cannot invent missing symmetry sectors;
-  a future noise/expansion mechanism should address that separately.
+  numerical precision. Without enrichment, too little initial sector support
+  improves energy but cannot invent missing symmetry sectors by itself.
+- The first sector-enrichment/noise layer is now implemented. With
+  `sector_enrichment="template"`, `SymDMRG2` builds a same-charge random
+  template MPS, merges its virtual charge maps into the current OBC MPS, copies
+  existing blocks into the expanded layout, and fills newly valid blocks with
+  zero or small `sector_noise`. This preserves the fixed total charge while
+  letting the local dense/Lanczos solve optimize sectors that were absent from
+  a narrow initial MPS. The L=4 FH U1U1 test now reaches the same fixed-sector
+  ED energy from `bond_dim=2` initial support after enrichment.

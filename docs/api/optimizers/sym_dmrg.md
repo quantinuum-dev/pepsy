@@ -21,7 +21,11 @@ and the left/right charge sectors kept by Symmray's SVD.
 records `norm_identity_diagnostics` for the per-window `N_eff ~= I` canonical
 check and `local_solve_diagnostics` for the resolved dense/Lanczos solver,
 theta-space dimension, local energy, and matvec backend used at each two-site
-solve.
+solve. For narrow initial MPS sector layouts, `sector_enrichment="template"`
+can expand virtual-bond charge maps from a same-charge random template MPS and
+seed newly valid blocks with `sector_noise` before the first sweep.
+`sector_enrichment_diagnostics` records the added blocks and template bond
+sectors.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.sym_dmrg

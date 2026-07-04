@@ -192,12 +192,17 @@ constructions, plus the fermionic Fermi-Hubbard starters in
 - A four-site OBC Fermi-Hubbard U1U1 regression now forces Lanczos and compares
   the final DMRG energy with a dense fixed-sector ED oracle. With enough
   initial bond-sector support, the run reaches the `(N_up,N_down)=(2,2)` ED
-  ground energy to numerical precision. Missing sector support in the initial
-  MPS is still not expanded automatically; noise/sector-enrichment is a later
-  convergence layer.
+  ground energy to numerical precision.
+- The first sector-enrichment/noise convergence layer is implemented for the
+  Symmray OBC path. `sector_enrichment="template"` builds a same-charge random
+  template MPS, merges its virtual-bond charge maps into the current MPS,
+  copies existing blocks into the expanded layout, and fills newly valid blocks
+  with zero or small `sector_noise`. The narrow `bond_dim=2` L=4 FH U1U1
+  regression now reaches the same fixed-sector ED energy after enrichment.
 - The next DMRG step is performance and scale: profile the block-native matvec,
-  reduce repeated environment work, add sector-enrichment/noise once the stable
-  path is measured, and later add torch-native block contractions where useful.
+  reduce repeated environment work, study enrichment schedules beyond the
+  one-shot template path, and later add torch-native block contractions where
+  useful.
 
 ### Validation
 

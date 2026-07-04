@@ -479,6 +479,74 @@ def test_symdmrg2_lanczos_reaches_fixed_sector_ed_with_full_initial_support():
     assert all(diag["theta_dim"] > 2 for diag in opt.local_solve_diagnostics)
 
 
+def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():
+    """Template sector enrichment lets a narrow initial MPS reach FH ED."""
+    pytest.importorskip("symmray")
+    edges = [(site, site + 1) for site in range(3)]
+    occupations = [(1, 0), (0, 1), (1, 0), (0, 1)]
+    state, mpo = _fh_u1u1_chain(
+        4,
+        occupations,
+        bond_dim=2,
+        seed=31,
+        U=1.0,
+        mu=0.1,
+    )
+    ed_energy = _fixed_u1u1_sector_ground_energy(
+        4,
+        edges,
+        (2, 2),
+        t=1.0,
+        U=1.0,
+        mu=0.1,
+    )
+    initial_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy.real
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=16,
+        cutoff=1e-12,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-11,
+        local_eig_ncv=16,
+        norm_check_samples=3,
+        sector_enrichment="template",
+        sector_enrichment_bond_dim=12,
+        sector_noise=1e-8,
+        sector_enrichment_seed=123,
+    )
+    opt.solve(tol=0.0)
+    post_energy = pepsy.MpsEnergyOptimizer(
+        opt.state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    enrichment = opt.sector_enrichment_diagnostics[0]
+
+    assert opt.energy == pytest.approx(ed_energy, abs=1e-10)
+    assert opt.energy <= initial_energy
+    assert complex(post_energy) == pytest.approx(complex(opt.energy))
+    assert opt.state.max_bond() <= 16
+    assert len(opt.sector_enrichment_diagnostics) == 1
+    assert enrichment["mode"] == "template"
+    assert enrichment["bond_dim"] == 12
+    assert enrichment["noise"] == pytest.approx(1e-8)
+    assert enrichment["added_blocks"] > 0
+    assert opt.summary()["last_sector_enrichment_diagnostic"] == enrichment
+    assert len(opt.norm_identity_diagnostics) == 2 * (4 - 1)
+    assert all(diag["passed"] for diag in opt.norm_identity_diagnostics)
+    assert all(diag["solver"] == "lanczos" for diag in opt.local_solve_diagnostics)
+
+
 def test_symdmrg2_lanczos_stress_obc_six_site_chain_tracks_svd_sectors():
     """A longer forced-Lanczos OBC sweep should keep auditable SVD sectors."""
     pytest.importorskip("symmray")

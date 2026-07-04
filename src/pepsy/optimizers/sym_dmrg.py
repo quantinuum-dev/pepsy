@@ -253,6 +253,33 @@ def _normalize_matvec_backend(matvec_backend):
         ) from exc
 
 
+def _normalize_sector_enrichment(sector_enrichment):
+    if sector_enrichment is None or sector_enrichment is False:
+        return "none"
+    if sector_enrichment is True:
+        return "template"
+    key = str(sector_enrichment).strip().lower().replace("-", "_")
+    aliases = {
+        "none": "none",
+        "off": "none",
+        "false": "none",
+        "no": "none",
+        "template": "template",
+        "auto": "template",
+        "bond": "template",
+        "bond_dim": "template",
+        "sector": "template",
+        "sectors": "template",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown sector_enrichment {sector_enrichment!r}. Expected one of: {allowed}."
+        ) from exc
+
+
 class _ThetaSpace:
     """Flat vector adapter for one fixed Symmray two-site theta layout."""
 
@@ -366,6 +393,18 @@ class SymDMRG2:
         ``"auto"`` uses the block-native Symmray contraction, while
         ``"dense_reference"`` keeps the older NumPy dense-aligned contraction
         as an explicit fallback and validator.
+    sector_enrichment
+        Optional Symmray convergence helper. ``"template"`` expands each MPS
+        virtual bond's charge map using a same-charge random template MPS before
+        the first sweep, then fills newly valid tensor blocks with
+        ``sector_noise``. This lets Lanczos see sectors missing from a narrow
+        initial MPS without changing the fixed total charge.
+    sector_enrichment_bond_dim
+        Bond-sector budget for the enrichment template. Defaults to ``chi``
+        when enrichment is enabled.
+    sector_noise
+        Absolute random noise scale used for newly valid blocks during sector
+        enrichment.
     """
 
     def __init__(
@@ -391,6 +430,10 @@ class SymDMRG2:
         norm_check_tol=1e-6,
         norm_check_samples=2,
         matvec_backend="auto",
+        sector_enrichment="none",
+        sector_enrichment_bond_dim=None,
+        sector_noise=0.0,
+        sector_enrichment_seed=0,
         dmrg_opts=None,
     ):
         if chi is None:
@@ -424,6 +467,18 @@ class SymDMRG2:
         self.norm_check_tol = float(norm_check_tol)
         self.norm_check_samples = int(norm_check_samples)
         self.matvec_backend = _normalize_matvec_backend(matvec_backend)
+        self.sector_enrichment = _normalize_sector_enrichment(sector_enrichment)
+        self.sector_enrichment_bond_dim = (
+            None
+            if sector_enrichment_bond_dim is None
+            else int(sector_enrichment_bond_dim)
+        )
+        self.sector_noise = float(sector_noise)
+        self.sector_enrichment_seed = int(sector_enrichment_seed)
+        if self.sector_enrichment_bond_dim is not None and self.sector_enrichment_bond_dim < 1:
+            raise ValueError("sector_enrichment_bond_dim must be a positive integer.")
+        if self.sector_noise < 0.0:
+            raise ValueError("sector_noise must be non-negative.")
         self.dmrg_opts = {} if dmrg_opts is None else dict(dmrg_opts)
 
         requested_backend = _normalize_backend(backend)
@@ -454,6 +509,7 @@ class SymDMRG2:
         self.svd_diagnostics = []
         self.norm_identity_diagnostics = []
         self.local_solve_diagnostics = []
+        self.sector_enrichment_diagnostics = []
         self._current_sweep_direction = None
 
         if self.backend == "symmray" and self.mps is not None:
@@ -493,6 +549,13 @@ class SymDMRG2:
         if not self.local_solve_diagnostics:
             return None
         return self.local_solve_diagnostics[-1]
+
+    @property
+    def last_sector_enrichment_diagnostic(self):
+        """Most recent sector-enrichment diagnostic, if any."""
+        if not self.sector_enrichment_diagnostics:
+            return None
+        return self.sector_enrichment_diagnostics[-1]
 
     def _compute_initial_energy(self):
         if self.init_mps is None:
@@ -598,6 +661,165 @@ class SymDMRG2:
             "num_sectors": len(sectors),
             "bond_dim": sum(sectors.values()),
         }
+
+    def _state_block_dtype(self):
+        for tensor in self._state:
+            blocks = getattr(tensor.data, "blocks", None)
+            if blocks:
+                return np.dtype(_to_numpy(next(iter(blocks.values()))).dtype)
+        return np.dtype("complex128")
+
+    def _state_phys_dim(self):
+        phys_index = self._index_for_tensor_ind(self._state[0], self._site_ind(0))
+        return sum(int(size) for size in phys_index.chargemap.values())
+
+    @staticmethod
+    def _merge_chargemaps(base, extra):
+        merged = {charge: int(size) for charge, size in dict(base).items()}
+        for charge, size in dict(extra).items():
+            size = int(size)
+            merged[charge] = max(size, merged.get(charge, 0))
+        return {charge: merged[charge] for charge in sorted(merged, key=repr)}
+
+    def _sector_template_state(self, bond_dim):
+        from ..tensors import SymMPS  # pylint: disable=import-outside-toplevel
+
+        first_data = self._state[0].data
+        site_charge = {
+            site: self._state[site].data.charge for site in range(self._state.L)
+        }
+
+        def charge_at(site):
+            return site_charge[site]
+
+        return SymMPS.random(
+            self._state.L,
+            symmetry=str(first_data.symmetry),
+            fermionic=False,
+            phys_dim=self._state_phys_dim(),
+            bond_dim=int(bond_dim),
+            site_charge=charge_at,
+            seed=self.sector_enrichment_seed,
+            dtype=self._state_block_dtype().name,
+        ).tn
+
+    def _template_bond_chargemaps(self, bond_dim):
+        template = self._sector_template_state(bond_dim)
+        bond_maps = {}
+        for site in range(self._state.L - 1):
+            bond = self._state.bond(site, site + 1)
+            template_bond = template.bond(site, site + 1)
+            template_index = self._index_for_tensor_ind(template[site], template_bond)
+            bond_maps[bond] = self._index_chargemap(template_index)
+        return bond_maps
+
+    def _enriched_tensor_data(self, tensor, bond_maps, rng, noise):
+        old_data = tensor.data
+        new_indices = []
+        changed_indices = 0
+        for ind, index in zip(tensor.inds, old_data.indices):
+            if ind in bond_maps:
+                chargemap = self._merge_chargemaps(index.chargemap, bond_maps[ind])
+                if chargemap != self._index_chargemap(index):
+                    changed_indices += 1
+                new_indices.append(index.copy_with(chargemap=chargemap))
+            else:
+                new_indices.append(index)
+
+        dtype = self._state_block_dtype()
+        complex_noise = np.issubdtype(dtype, np.complexfloating)
+
+        def fill_fn(shape):
+            if noise <= 0.0:
+                return np.zeros(shape, dtype=dtype)
+            real = rng.standard_normal(shape)
+            if complex_noise:
+                imag = rng.standard_normal(shape)
+                return np.asarray(noise * (real + 1.0j * imag), dtype=dtype)
+            return np.asarray(noise * real, dtype=dtype)
+
+        new_data = type(old_data).from_fill_fn(
+            fill_fn,
+            tuple(new_indices),
+            charge=old_data.charge,
+            symmetry=old_data.symmetry,
+        )
+        old_blocks = getattr(old_data, "blocks", {})
+        old_sectors = set(old_blocks)
+        new_sectors = set(new_data.blocks)
+        copied_blocks = 0
+        for sector, old_block in old_blocks.items():
+            if sector not in new_data.blocks:
+                continue
+            target = np.array(_to_numpy(new_data.blocks[sector]), copy=True)
+            old_dense = _to_numpy(old_block)
+            slices = tuple(slice(0, size) for size in old_dense.shape)
+            target[slices] = old_dense
+            new_data.set_block(sector, np.asarray(target, dtype=target.dtype))
+            copied_blocks += 1
+
+        return new_data, {
+            "changed_indices": int(changed_indices),
+            "old_num_blocks": len(old_sectors),
+            "new_num_blocks": len(new_sectors),
+            "added_blocks": len(new_sectors - old_sectors),
+            "copied_blocks": int(copied_blocks),
+        }
+
+    def enrich_sectors(self, *, bond_dim=None, noise=None):
+        """Expand Symmray MPS virtual charge maps using a random template MPS.
+
+        The current tensor values are copied into the expanded block layout.
+        Newly valid blocks are initialized with zero or small random noise.
+        This preserves the fixed total charge but gives the local two-site
+        eigensolver a larger sector layout to optimize.
+        """
+        if self.backend != "symmray":
+            return None
+        bond_dim = (
+            self.chi
+            if bond_dim is None and self.sector_enrichment_bond_dim is None
+            else self.sector_enrichment_bond_dim if bond_dim is None else int(bond_dim)
+        )
+        if int(bond_dim) < 1:
+            raise ValueError("bond_dim must be a positive integer.")
+        noise = self.sector_noise if noise is None else float(noise)
+        if noise < 0.0:
+            raise ValueError("noise must be non-negative.")
+
+        bond_maps = self._template_bond_chargemaps(bond_dim)
+        rng = np.random.default_rng(self.sector_enrichment_seed)
+        site_diagnostics = []
+        for site, tensor in enumerate(self._state):
+            new_data, diagnostic = self._enriched_tensor_data(
+                tensor,
+                bond_maps,
+                rng,
+                noise,
+            )
+            tensor.modify(data=new_data)
+            diagnostic["site"] = int(site)
+            site_diagnostics.append(diagnostic)
+
+        self._clear_environments()
+        diagnostic = {
+            "mode": "template",
+            "bond_dim": int(bond_dim),
+            "noise": float(noise),
+            "seed": int(self.sector_enrichment_seed),
+            "bonds": {
+                bond: {
+                    "num_sectors": len(chargemap),
+                    "bond_dim": sum(chargemap.values()),
+                    "sectors": dict(chargemap),
+                }
+                for bond, chargemap in bond_maps.items()
+            },
+            "sites": site_diagnostics,
+            "added_blocks": sum(item["added_blocks"] for item in site_diagnostics),
+        }
+        self.sector_enrichment_diagnostics.append(diagnostic)
+        return diagnostic
 
     def _dense_index_for_state_ind(self, ind):
         indices = [
@@ -1881,6 +2103,11 @@ class SymDMRG2:
             raise ValueError("SymDMRG2 backend='symmray' requires an initial MPS.")
         if self._state.L < 2:
             raise ValueError("SymDMRG2 requires an MPS with at least two sites.")
+        if self.sector_enrichment != "none" and not self.sector_enrichment_diagnostics:
+            bond_dim = self.sector_enrichment_bond_dim
+            if bond_dim is None:
+                bond_dim = chi
+            self.enrich_sectors(bond_dim=bond_dim, noise=self.sector_noise)
 
         for _ in range(sweeps):
             self._symmray_sweep_direction("right", chi=chi, cutoff=cutoff)
@@ -1953,6 +2180,10 @@ class SymDMRG2:
             "norm_check_tol": self.norm_check_tol,
             "matvec_backend": self.matvec_backend,
             "resolved_matvec_backend": self._resolved_matvec_backend(),
+            "sector_enrichment": self.sector_enrichment,
+            "sector_enrichment_bond_dim": self.sector_enrichment_bond_dim,
+            "sector_noise": self.sector_noise,
+            "sector_enrichment_seed": self.sector_enrichment_seed,
             "sweeps": self.sweeps,
             "total_charge": self.total_charge,
             "initial_energy": self.initial_energy,
@@ -1964,4 +2195,6 @@ class SymDMRG2:
             "last_norm_identity_diagnostic": self.last_norm_identity_diagnostic,
             "num_local_solve_diagnostics": len(self.local_solve_diagnostics),
             "last_local_solve_diagnostic": self.last_local_solve_diagnostic,
+            "num_sector_enrichment_diagnostics": len(self.sector_enrichment_diagnostics),
+            "last_sector_enrichment_diagnostic": self.last_sector_enrichment_diagnostic,
         }
