@@ -211,9 +211,16 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   controls, exposes a public `sweep("R"/"L", ...)`, and uses quimb's progress
   bar helper for verbose Symmray sweeps. `solve` still returns `self`; the
   quimb-style convergence boolean is stored on `converged`.
-- The next DMRG step is larger-chain profiling: time the block-native matvec
-  and adaptive enrichment on target workloads, then add torch-native block
-  contractions where useful.
+- `profile=True` now records JSON-friendly timing diagnostics for canonicalize,
+  dense/norm/block environment setup, environment updates, norm checks, local
+  eigensolves, projected matvecs, SVD splits, enrichment, sweeps, and solves.
+  `profile_summary()` aggregates phase counts and elapsed time.
+- Added `benchmarks/symdmrg2_fh_u1u1.py`, a deterministic FH U1U1 OBC
+  benchmark harness that emits case metadata, final energy, and profiling data
+  as JSON.
+- The next DMRG step is to use those profiles on larger target chains to reduce
+  block-native matvec overhead and tune adaptive enrichment schedules, then add
+  torch-native block contractions where useful.
 
 ### Validation
 

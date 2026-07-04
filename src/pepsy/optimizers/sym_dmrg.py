@@ -13,6 +13,7 @@ from __future__ import annotations
 import itertools
 from itertools import product
 import string
+import time
 import warnings
 
 import numpy as np
@@ -471,6 +472,7 @@ class SymDMRG2:
         sector_enrichment_bond_dim=None,
         sector_noise=0.0,
         sector_enrichment_seed=0,
+        profile=False,
         dmrg_opts=None,
     ):
         if init_mps is None and p0 is not None:
@@ -518,6 +520,7 @@ class SymDMRG2:
         )
         self.sector_noise = float(sector_noise)
         self.sector_enrichment_seed = int(sector_enrichment_seed)
+        self.profile = bool(profile)
         if self.sector_enrichment_bond_dim is not None and self.sector_enrichment_bond_dim < 1:
             raise ValueError("sector_enrichment_bond_dim must be a positive integer.")
         if self.sector_noise < 0.0:
@@ -555,6 +558,7 @@ class SymDMRG2:
         self.norm_identity_diagnostics = []
         self.local_solve_diagnostics = []
         self.sector_enrichment_diagnostics = []
+        self.profile_diagnostics = []
         self._current_sweep_direction = None
         self.opts = {
             "default_sweep_sequence": "R",
@@ -608,6 +612,68 @@ class SymDMRG2:
         if not self.sector_enrichment_diagnostics:
             return None
         return self.sector_enrichment_diagnostics[-1]
+
+    @property
+    def last_profile_diagnostic(self):
+        """Most recent profiling event diagnostic, if any."""
+        if not self.profile_diagnostics:
+            return None
+        return self.profile_diagnostics[-1]
+
+    def _profile_start(self):
+        if not self.profile:
+            return None
+        return time.perf_counter()
+
+    def _record_profile_elapsed(self, phase, start, **metadata):
+        if start is None:
+            return None
+        elapsed = time.perf_counter() - start
+        entry = {
+            "phase": str(phase),
+            "elapsed": float(elapsed),
+            "sweep": len(self.energies),
+            "direction": self._current_sweep_direction,
+        }
+        for key, value in metadata.items():
+            if value is not None:
+                entry[key] = value
+        self.profile_diagnostics.append(entry)
+        return entry
+
+    @staticmethod
+    def _tensor_block_stats(tensor):
+        blocks = getattr(getattr(tensor, "data", None), "blocks", {})
+        dim = 0
+        max_block_size = 0
+        for block in blocks.values():
+            shape = getattr(block, "shape", ())
+            size = int(np.prod(shape, dtype=np.int64)) if shape else 1
+            dim += size
+            max_block_size = max(max_block_size, size)
+        return {
+            "theta_dim": int(dim),
+            "theta_num_blocks": len(blocks),
+            "theta_max_block_size": int(max_block_size),
+        }
+
+    def profile_summary(self):
+        """Return aggregate timing/count information for profiling events."""
+        phase_totals = {}
+        phase_counts = {}
+        for entry in self.profile_diagnostics:
+            phase = entry["phase"]
+            phase_totals[phase] = phase_totals.get(phase, 0.0) + entry["elapsed"]
+            phase_counts[phase] = phase_counts.get(phase, 0) + 1
+        total_elapsed = sum(phase_totals.values())
+        return {
+            "enabled": self.profile,
+            "num_events": len(self.profile_diagnostics),
+            "total_elapsed": float(total_elapsed),
+            "phase_totals": phase_totals,
+            "phase_counts": phase_counts,
+            "num_matvecs": phase_counts.get("matvec", 0),
+        }
 
     def _set_bond_dim_seq(self, bond_dims):
         bond_dims = tuple(
@@ -880,6 +946,7 @@ class SymDMRG2:
         if noise < 0.0:
             raise ValueError("noise must be non-negative.")
 
+        profile_start = self._profile_start()
         bond_maps = self._template_bond_chargemaps(bond_dim)
         rng = np.random.default_rng(self.sector_enrichment_seed)
         site_diagnostics = []
@@ -913,6 +980,13 @@ class SymDMRG2:
             "added_blocks": sum(item["added_blocks"] for item in site_diagnostics),
         }
         self.sector_enrichment_diagnostics.append(diagnostic)
+        self._record_profile_elapsed(
+            "sector_enrichment",
+            profile_start,
+            mode=diagnostic["mode"],
+            added_blocks=int(diagnostic["added_blocks"]),
+            bond_dim=int(bond_dim),
+        )
         return diagnostic
 
     def _should_enrich_before_sweep(self, sweep):
@@ -1178,6 +1252,7 @@ class SymDMRG2:
             raise ValueError("SymDMRG2 requires init_mps before building environments.")
 
         direction = str(direction).strip().lower()
+        profile_start = self._profile_start()
         bra = self._make_bra()
         left = [None] * (self._state.L + 1)
         right = [None] * (self._state.L + 1)
@@ -1195,6 +1270,11 @@ class SymDMRG2:
             raise ValueError("direction must be 'right' or 'left'.")
         self.left_envs = left
         self.right_envs = right
+        self._record_profile_elapsed(
+            "build_dense_environments",
+            profile_start,
+            direction=direction,
+        )
         return left, right
 
     def update_left_environment(self, site):
@@ -1277,6 +1357,7 @@ class SymDMRG2:
             raise ValueError("SymDMRG2 requires init_mps before building environments.")
 
         direction = str(direction).strip().lower()
+        profile_start = self._profile_start()
         bra = self._make_block_bra()
         left = [None] * (self._state.L + 1)
         right = [None] * (self._state.L + 1)
@@ -1294,6 +1375,11 @@ class SymDMRG2:
             raise ValueError("direction must be 'right' or 'left'.")
         self.left_block_envs = left
         self.right_block_envs = right
+        self._record_profile_elapsed(
+            "build_block_environments",
+            profile_start,
+            direction=direction,
+        )
         return left, right
 
     def update_left_block_environment(self, site):
@@ -1448,6 +1534,7 @@ class SymDMRG2:
             raise ValueError("SymDMRG2 requires init_mps before building norm environments.")
 
         direction = str(direction).strip().lower()
+        profile_start = self._profile_start()
         bra = self._make_bra()
         left = [None] * (self._state.L + 1)
         right = [None] * (self._state.L + 1)
@@ -1465,6 +1552,11 @@ class SymDMRG2:
             raise ValueError("direction must be 'right' or 'left'.")
         self.left_norm_envs = left
         self.right_norm_envs = right
+        self._record_profile_elapsed(
+            "build_norm_environments",
+            profile_start,
+            direction=direction,
+        )
         return left, right
 
     def update_left_norm_environment(self, site):
@@ -1770,11 +1862,23 @@ class SymDMRG2:
         NumPy dense-aligned validator.
         """
         backend = self._resolved_matvec_backend()
-        if backend == "symmray":
-            return self.two_site_matvec_symmray(site, theta)
-        if backend == "dense_reference":
-            return self.two_site_matvec_dense_reference(site, theta)
-        raise ValueError(f"Unknown resolved matvec backend {backend!r}.")
+        profile_start = self._profile_start()
+        theta_input = self.two_site_theta(site) if theta is None else theta
+        try:
+            if backend == "symmray":
+                return self.two_site_matvec_symmray(site, theta_input)
+            if backend == "dense_reference":
+                return self.two_site_matvec_dense_reference(site, theta_input)
+            raise ValueError(f"Unknown resolved matvec backend {backend!r}.")
+        finally:
+            self._record_profile_elapsed(
+                "matvec",
+                profile_start,
+                site=int(site),
+                right_site=int(site + 1),
+                matvec_backend=backend,
+                **self._tensor_block_stats(theta_input),
+            )
 
     def _norm_matvec_dense(self, site, theta_dense):
         if self.left_norm_envs is None or self.right_norm_envs is None:
@@ -1987,6 +2091,7 @@ class SymDMRG2:
         return float(evals[0].real), theta_opt
 
     def _check_effective_norm_identity(self, site, theta, *, dim=None):
+        profile_start = self._profile_start()
         norm_error = self.effective_norm_identity_error(site, theta)
         diagnostic = {
             "site": int(site),
@@ -1999,6 +2104,15 @@ class SymDMRG2:
             "passed": bool(norm_error <= self.norm_check_tol),
         }
         self.norm_identity_diagnostics.append(diagnostic)
+        self._record_profile_elapsed(
+            "norm_check",
+            profile_start,
+            site=int(site),
+            right_site=int(site + 1),
+            theta_dim=None if dim is None else int(dim),
+            error=float(norm_error),
+            samples=int(self.norm_check_samples),
+        )
         if norm_error <= self.norm_check_tol:
             return norm_error
         raise ValueError(
@@ -2036,6 +2150,7 @@ class SymDMRG2:
 
     def local_eigensolve(self, site):
         """Solve one two-site local problem using the configured Symmray path."""
+        profile_start = self._profile_start()
         theta = self.two_site_theta(site)
         space = self.two_site_theta_space(site, theta)
         dim = space.dim
@@ -2048,7 +2163,17 @@ class SymDMRG2:
             solver = "dense" if dim <= self.dense_threshold else "lanczos"
 
         if solver == "generalized_dense":
+            solver_start = self._profile_start()
             energy, theta_opt = self.dense_generalized_local_eigensolve(site)
+            self._record_profile_elapsed(
+                "local_eigensolver",
+                solver_start,
+                site=int(site),
+                right_site=int(site + 1),
+                solver="generalized_dense",
+                theta_dim=int(dim),
+                energy=float(energy),
+            )
             self._record_local_solve_diagnostic(
                 site,
                 solver="generalized_dense",
@@ -2056,10 +2181,20 @@ class SymDMRG2:
                 dim=dim,
                 energy=energy,
             )
+            self._record_profile_elapsed(
+                "local_solve",
+                profile_start,
+                site=int(site),
+                right_site=int(site + 1),
+                solver="generalized_dense",
+                theta_dim=int(dim),
+                energy=float(energy),
+            )
             return energy, theta_opt
 
         norm_error = self._check_effective_norm_identity(site, theta, dim=dim)
 
+        solver_start = self._profile_start()
         if solver == "dense":
             energy, theta_opt = self.dense_local_eigensolve(site)
             solver_used = "dense"
@@ -2068,6 +2203,15 @@ class SymDMRG2:
             solver_used = "dense" if dim <= 2 else "lanczos"
         else:
             raise ValueError(f"Unknown local solver mode {solver!r}.")
+        self._record_profile_elapsed(
+            "local_eigensolver",
+            solver_start,
+            site=int(site),
+            right_site=int(site + 1),
+            solver=solver_used,
+            theta_dim=int(dim),
+            energy=float(energy),
+        )
         self._record_local_solve_diagnostic(
             site,
             solver=solver_used,
@@ -2075,6 +2219,16 @@ class SymDMRG2:
             dim=dim,
             energy=energy,
             norm_error=norm_error,
+        )
+        self._record_profile_elapsed(
+            "local_solve",
+            profile_start,
+            site=int(site),
+            right_site=int(site + 1),
+            solver=solver_used,
+            theta_dim=int(dim),
+            energy=float(energy),
+            norm_error=float(norm_error),
         )
         return energy, theta_opt
 
@@ -2148,6 +2302,7 @@ class SymDMRG2:
         method="svd",
         cutoff_mode="rel",
     ):
+        profile_start = self._profile_start()
         right_site = site + 1
         bond = self._state.bond(site, right_site)
         left_inds = []
@@ -2181,6 +2336,16 @@ class SymDMRG2:
         self._state[site].modify(data=left_tensor.data, inds=left_tensor.inds)
         self._state[right_site].modify(data=right_tensor.data, inds=right_tensor.inds)
         self._state.site_ind_id = getattr(self._state, "site_ind_id", "k{}")
+        self._record_profile_elapsed(
+            "svd_split",
+            profile_start,
+            site=int(site),
+            right_site=int(right_site),
+            chi=int(chi),
+            cutoff=float(cutoff),
+            left_bond_dim=int(self.svd_diagnostics[-1]["left"]["bond_dim"]),
+            right_bond_dim=int(self.svd_diagnostics[-1]["right"]["bond_dim"]),
+        )
         return self._state[site], self._state[right_site]
 
     def _clear_environments(self):
@@ -2192,12 +2357,19 @@ class SymDMRG2:
         self.right_block_envs = None
 
     def _canonize_for_sweep(self, direction):
+        profile_start = self._profile_start()
         method_name = {
             "right": "right_canonize",
             "left": "left_canonize",
         }[direction]
         method = getattr(self._state, method_name, None)
         if not callable(method):
+            self._record_profile_elapsed(
+                "canonize",
+                profile_start,
+                direction=direction,
+                skipped=True,
+            )
             return
         try:
             result = method(bra=None)
@@ -2207,6 +2379,12 @@ class SymDMRG2:
             self._state = result
             self.mps = self._state
         self._clear_environments()
+        self._record_profile_elapsed(
+            "canonize",
+            profile_start,
+            direction=direction,
+            skipped=False,
+        )
 
     def _symmray_sweep_direction(
         self,
@@ -2228,6 +2406,7 @@ class SymDMRG2:
         else:  # pragma: no cover - private consistency check
             raise ValueError("direction must be 'right' or 'left'.")
 
+        sweep_profile_start = self._profile_start()
         if canonize:
             self._canonize_for_sweep(direction)
         self.build_sweep_environments(direction)
@@ -2258,23 +2437,54 @@ class SymDMRG2:
                     cutoff_mode=cutoff_mode,
                 )
                 if direction == "right":
+                    env_update_start = self._profile_start()
                     self.update_left_environment(site)
                     self.update_left_norm_environment(site)
                     if self.left_block_envs is not None:
                         self.update_left_block_environment(site)
+                    self._record_profile_elapsed(
+                        "environment_update",
+                        env_update_start,
+                        site=int(site),
+                        right_site=int(site + 1),
+                        update_side="left",
+                    )
                 else:
+                    env_update_start = self._profile_start()
                     self.update_right_environment(site + 1)
                     self.update_right_norm_environment(site + 1)
                     if self.right_block_envs is not None:
                         self.update_right_block_environment(site + 1)
+                    self._record_profile_elapsed(
+                        "environment_update",
+                        env_update_start,
+                        site=int(site),
+                        right_site=int(site + 1),
+                        update_side="right",
+                    )
         finally:
             if int(verbosity) > 0:
                 sweep.close()
             self._current_sweep_direction = previous_direction
+        finish_start = self._profile_start()
         self._finish_sweep_direction_environments(direction)
+        self._record_profile_elapsed(
+            "finish_sweep_environments",
+            finish_start,
+            direction=direction,
+        )
         energy = self.environment_energy(normalized=True).real
         self.local_energies.append(tuple(local_ens))
         self.total_energies.append(tuple(local_ens[:-1] + [energy]))
+        self._record_profile_elapsed(
+            "sweep",
+            sweep_profile_start,
+            direction=direction,
+            chi=int(chi),
+            cutoff=float(cutoff),
+            energy=float(energy),
+            num_sites=int(len(local_ens)),
+        )
         return energy
 
     def _finish_sweep_direction_environments(self, direction):
@@ -2415,40 +2625,50 @@ class SymDMRG2:
         directions = itertools.cycle(str(sweep_sequence).upper())
         previous_direction = "0"
 
+        solve_profile_start = self._profile_start()
         self.converged = False
-        for _ in range(max_sweeps):
-            direction = next(directions)
-            direction, _ = _normalize_sweep_direction(direction)
-            max_bond = next(self._bond_dims)
-            cutoff = next(self._cutoffs)
-            sweep_num = len(self.energies)
+        try:
+            for _ in range(max_sweeps):
+                direction = next(directions)
+                direction, _ = _normalize_sweep_direction(direction)
+                max_bond = next(self._bond_dims)
+                cutoff = next(self._cutoffs)
+                sweep_num = len(self.energies)
 
-            if self._should_enrich_before_sweep(sweep_num):
-                bond_dim = self.sector_enrichment_bond_dim
-                if bond_dim is None:
-                    bond_dim = max_bond
-                self.enrich_sectors(
-                    bond_dim=bond_dim,
-                    noise=self.sector_noise,
-                    mode=self.sector_enrichment,
-                    sweep=sweep_num,
+                if self._should_enrich_before_sweep(sweep_num):
+                    bond_dim = self.sector_enrichment_bond_dim
+                    if bond_dim is None:
+                        bond_dim = max_bond
+                    self.enrich_sectors(
+                        bond_dim=bond_dim,
+                        noise=self.sector_noise,
+                        mode=self.sector_enrichment,
+                        sweep=sweep_num,
+                    )
+
+                self._print_pre_sweep(
+                    sweep_num,
+                    direction,
+                    max_bond,
+                    cutoff,
+                    verbosity=verbosity,
                 )
-
-            self._print_pre_sweep(
-                sweep_num,
-                direction,
-                max_bond,
-                cutoff,
-                verbosity=verbosity,
-            )
-            canonize = (
-                False
-                if direction + previous_direction in {"LR", "RL"}
-                else True
-            )
-            if suppress_warnings:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
+                canonize = (
+                    False
+                    if direction + previous_direction in {"LR", "RL"}
+                    else True
+                )
+                if suppress_warnings:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        energy = self.sweep(
+                            direction,
+                            canonize=canonize,
+                            verbosity=verbosity,
+                            max_bond=max_bond,
+                            cutoff=cutoff,
+                        )
+                else:
                     energy = self.sweep(
                         direction,
                         canonize=canonize,
@@ -2456,21 +2676,21 @@ class SymDMRG2:
                         max_bond=max_bond,
                         cutoff=cutoff,
                     )
-            else:
-                energy = self.sweep(
-                    direction,
-                    canonize=canonize,
-                    verbosity=verbosity,
-                    max_bond=max_bond,
-                    cutoff=cutoff,
-                )
 
-            self.energies.append(energy)
-            self.converged = self._check_convergence(tol)
-            self._print_post_sweep(self.converged, verbosity=verbosity)
-            if self.converged:
-                break
-            previous_direction = direction
+                self.energies.append(energy)
+                self.converged = self._check_convergence(tol)
+                self._print_post_sweep(self.converged, verbosity=verbosity)
+                if self.converged:
+                    break
+                previous_direction = direction
+        finally:
+            self._record_profile_elapsed(
+                "solve",
+                solve_profile_start,
+                max_sweeps=int(max_sweeps),
+                num_sweeps=len(self.energies),
+                converged=bool(self.converged),
+            )
         return self
 
     def solve(
@@ -2558,6 +2778,7 @@ class SymDMRG2:
             "sector_enrichment_bond_dim": self.sector_enrichment_bond_dim,
             "sector_noise": self.sector_noise,
             "sector_enrichment_seed": self.sector_enrichment_seed,
+            "profile": self.profile,
             "sweeps": self.sweeps,
             "total_charge": self.total_charge,
             "initial_energy": self.initial_energy,
@@ -2573,4 +2794,7 @@ class SymDMRG2:
             "last_local_solve_diagnostic": self.last_local_solve_diagnostic,
             "num_sector_enrichment_diagnostics": len(self.sector_enrichment_diagnostics),
             "last_sector_enrichment_diagnostic": self.last_sector_enrichment_diagnostic,
+            "num_profile_diagnostics": len(self.profile_diagnostics),
+            "last_profile_diagnostic": self.last_profile_diagnostic,
+            "profile_summary": self.profile_summary(),
         }

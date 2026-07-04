@@ -13,6 +13,13 @@ on `converged`. With `verbosity > 0`, Symmray sweeps use quimb's `progbar`
 helper for the per-site progress display and print quimb-style pre/post sweep
 energy lines.
 
+For scale studies, `profile=True` enables JSON-friendly profiling events in
+`profile_diagnostics`. `profile_summary()` aggregates counts and elapsed time
+by phase, including canonicalization, environment setup/update, norm checks,
+local eigensolves, `H_eff` matvecs, SVD splits, enrichment, sweeps, and solves.
+The development harness `benchmarks/symdmrg2_fh_u1u1.py` runs deterministic
+open-chain Fermi-Hubbard U1U1 cases and emits this profiling data as JSON.
+
 For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain. Periodic
 lattice edges should be encoded as long-range terms in that OBC MPO, not as a
 cyclic MPS. Pepsy builds dense left/right environments for `<psi|MPO|psi>`,

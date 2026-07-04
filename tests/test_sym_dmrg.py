@@ -1,6 +1,8 @@
 """Tests for the SymDMRG2 public driver scaffold."""
 
 import numpy as np
+import importlib.util
+from pathlib import Path
 import quimb.tensor as qtn
 import pytest
 
@@ -300,6 +302,71 @@ def test_symdmrg2_sweep_uses_quimb_progress_bar(monkeypatch):
     assert calls[0][0]["total"] == opt.state.L - 1
     assert calls[0][0]["ncols"] == 80
     assert calls[0][1].closed
+
+
+def test_symdmrg2_profile_records_phase_timings():
+    """Opt-in profiling should record useful timing phases."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        profile=True,
+    )
+    opt.solve(max_sweeps=1)
+    phases = {event["phase"] for event in opt.profile_diagnostics}
+    summary = opt.profile_summary()
+
+    assert {
+        "build_dense_environments",
+        "build_norm_environments",
+        "build_block_environments",
+        "local_solve",
+        "local_eigensolver",
+        "matvec",
+        "norm_check",
+        "svd_split",
+        "sweep",
+        "solve",
+    } <= phases
+    assert all(event["elapsed"] >= 0.0 for event in opt.profile_diagnostics)
+    assert summary["enabled"]
+    assert summary["num_events"] == len(opt.profile_diagnostics)
+    assert summary["num_matvecs"] >= 1
+    assert summary["phase_counts"]["matvec"] >= 1
+    assert opt.summary()["num_profile_diagnostics"] == len(opt.profile_diagnostics)
+    assert opt.summary()["last_profile_diagnostic"] == opt.last_profile_diagnostic
+
+
+def test_symdmrg2_benchmark_harness_returns_json_ready_result():
+    """The benchmark helper should produce structured profiling data."""
+    pytest.importorskip("symmray")
+    bench_path = Path(__file__).resolve().parents[1] / "benchmarks" / "symdmrg2_fh_u1u1.py"
+    spec = importlib.util.spec_from_file_location("symdmrg2_fh_u1u1_benchmark", bench_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    result = module.run_benchmark(
+        length=2,
+        chi=3,
+        initial_bond_dim=2,
+        sweeps=1,
+        local_solver="dense",
+        dense_threshold=100,
+        include_events=True,
+    )
+
+    assert result["case"]["length"] == 2
+    assert result["result"]["num_sweeps"] == 1
+    assert isinstance(result["result"]["energy"], float)
+    assert result["profile"]["enabled"]
+    assert result["profile"]["num_events"] == len(result["profile_events"])
+    assert result["profile"]["phase_counts"]["sweep"] == 1
+    assert result["profile"]["num_matvecs"] >= 1
 
 
 def test_symdmrg2_linear_operator_matches_dense_effective_hamiltonian():
