@@ -267,6 +267,58 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
     assert opt.state.max_bond() <= 3
     assert len(opt.energies) == 1
     assert complex(post_energy) == pytest.approx(complex(opt.energy))
+    assert len(opt.svd_diagnostics) == 2 * (4 - 1)
+    assert opt.summary()["num_svd_diagnostics"] == len(opt.svd_diagnostics)
+    assert opt.summary()["last_svd_diagnostic"] == opt.last_svd_diagnostic
+    for diagnostic in opt.svd_diagnostics:
+        assert diagnostic["left"]["bond_dim"] <= 3
+        assert diagnostic["right"]["bond_dim"] <= 3
+        assert diagnostic["left"]["num_sectors"] >= 1
+        assert diagnostic["right"]["num_sectors"] >= 1
+
+
+def test_symdmrg2_lanczos_stress_obc_six_site_chain_tracks_svd_sectors():
+    """A longer forced-Lanczos OBC sweep should keep auditable SVD sectors."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        6,
+        [(1, 0), (0, 1), (1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+        seed=23,
+        U=1.5,
+        mu=0.05,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-10,
+        local_eig_ncv=8,
+    )
+    out = opt.solve()
+    post_energy = pepsy.MpsEnergyOptimizer(
+        opt.state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert out is opt
+    assert opt.state.max_bond() <= 4
+    assert len(opt.energies) == 1
+    assert complex(post_energy) == pytest.approx(complex(opt.energy))
+    assert len(opt.svd_diagnostics) == 2 * (6 - 1)
+    assert opt.summary()["last_svd_diagnostic"] == opt.svd_diagnostics[-1]
+    for diagnostic in opt.svd_diagnostics:
+        assert diagnostic["left"]["bond_dim"] <= 4
+        assert diagnostic["right"]["bond_dim"] <= 4
+        assert diagnostic["left"]["num_sectors"] >= 1
+        assert diagnostic["right"]["num_sectors"] >= 1
 
 
 def test_symdmrg2_rejects_quimb_backend_for_symmray_arrays():

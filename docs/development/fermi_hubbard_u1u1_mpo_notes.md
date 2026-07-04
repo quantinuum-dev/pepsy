@@ -210,9 +210,12 @@ data too early.
    the first stable local eigensolver path now canonicalizes the MPS center,
    applies a quimb-compatible Lanczos `LinearOperator` in the exact current
    `theta` block layout, and keeps the explicit dense `N_eff` generalized solve
-   as a validator/fallback. Sector truncation policy, torch/autodiff support,
-   and PBC segment-compressed environments remain separate performance
-   problems from the fermion algebra.
+   as a validator/fallback. The SVD writeback records the charge sectors kept
+   on every split. A direct Symmray-native matvec still needs a safe
+   intermediate index-expansion adapter, because naive contractions can prune
+   shared charge maps before later tensors see the full virtual/MPO index.
+   Torch/autodiff support and PBC segment-compressed environments remain
+   separate performance problems from the fermion algebra.
 
 ## Acceptance Criteria For The True MPO Fix
 

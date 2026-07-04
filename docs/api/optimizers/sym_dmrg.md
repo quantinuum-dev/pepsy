@@ -12,7 +12,10 @@ local problem either with a dense reference matrix or a quimb-compatible
 Lanczos `LinearOperator`. Symmray sweeps canonicalize the MPS center before
 using H-only dense/Lanczos solves; a non-identity effective norm is treated as
 a canonicalization/alignment error unless the explicit diagnostic
-`local_solver="generalized_dense"` mode is requested.
+`local_solver="generalized_dense"` mode is requested. Every Symmray two-site
+writeback records an entry in `svd_diagnostics`, including the split direction,
+bond name, `chi`, cutoff, and the left/right charge sectors kept by Symmray's
+SVD. `last_svd_diagnostic` exposes the most recent entry.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.sym_dmrg

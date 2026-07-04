@@ -179,8 +179,13 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   sector-preserving `H_eff` and `N_eff` matvecs in the exact current `theta`
   block layout, an explicit dense generalized diagnostic solve, and a
   quimb-style Lanczos/LinearOperator local solver after MPS canonicalization.
+  The SVD writeback now records the actual Symmray bond sectors kept at each
+  two-site split.
 - The next DMRG step is performance and scale: reduce dense embedding inside
-  the local matvec and add torch-native block contractions where useful.
+  the local matvec and add torch-native block contractions where useful. A
+  first Symmray-native contraction probe showed that intermediate contractions
+  can prune shared charge maps, so the block-native matvec needs a safe sparse
+  index-expansion adapter before replacing the current dense-aligned matvec.
 
 ### Validation
 

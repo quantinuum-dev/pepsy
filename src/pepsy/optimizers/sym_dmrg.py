@@ -419,6 +419,7 @@ class SymDMRG2:
         self.right_envs = None
         self.left_norm_envs = None
         self.right_norm_envs = None
+        self.svd_diagnostics = []
 
         if self.backend == "symmray" and self.mps is not None:
             self._state = self._prepare_symmray_state(self.mps)
@@ -436,6 +437,13 @@ class SymDMRG2:
         if self.energies:
             return self.energies[-1]
         return self.initial_energy
+
+    @property
+    def last_svd_diagnostic(self):
+        """Most recent Symmray SVD split diagnostic, if any."""
+        if not self.svd_diagnostics:
+            return None
+        return self.svd_diagnostics[-1]
 
     def _compute_initial_energy(self):
         if self.init_mps is None:
@@ -486,6 +494,22 @@ class SymDMRG2:
     @staticmethod
     def _index_for_tensor_ind(tensor, ind):
         return tensor.data.indices[tensor.inds.index(ind)]
+
+    @staticmethod
+    def _index_chargemap(index):
+        return {
+            charge: int(size)
+            for charge, size in getattr(index, "chargemap", {}).items()
+        }
+
+    def _svd_bond_summary(self, tensor, bond):
+        index = self._index_for_tensor_ind(tensor, bond)
+        sectors = self._index_chargemap(index)
+        return {
+            "sectors": sectors,
+            "num_sectors": len(sectors),
+            "bond_dim": sum(sectors.values()),
+        }
 
     def _dense_index_for_state_ind(self, ind):
         indices = [
@@ -1211,7 +1235,7 @@ class SymDMRG2:
         operator = _SymmrayEffectiveHamiltonian(self, site, space)
         ncv = self.local_eig_ncv
         if ncv is not None:
-            ncv = min(max(2, int(ncv)), max(2, dim - 1))
+            ncv = min(max(3, int(ncv)), dim)
 
         evals, evecs = eigh(
             operator,
@@ -1343,6 +1367,18 @@ class SymDMRG2:
             bond_ind=bond,
             ltags=self._state[site].tags,
             rtags=self._state[right_site].tags,
+        )
+        self.svd_diagnostics.append(
+            {
+                "site": int(site),
+                "right_site": int(right_site),
+                "direction": direction,
+                "bond": bond,
+                "chi": int(chi),
+                "cutoff": float(cutoff),
+                "left": self._svd_bond_summary(left_tensor, bond),
+                "right": self._svd_bond_summary(right_tensor, bond),
+            }
         )
         self._state[site].modify(data=left_tensor.data, inds=left_tensor.inds)
         self._state[right_site].modify(data=right_tensor.data, inds=right_tensor.inds)
@@ -1525,4 +1561,6 @@ class SymDMRG2:
             "initial_energy": self.initial_energy,
             "energy": self.energy,
             "converged": self.converged,
+            "num_svd_diagnostics": len(self.svd_diagnostics),
+            "last_svd_diagnostic": self.last_svd_diagnostic,
         }

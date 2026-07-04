@@ -130,12 +130,18 @@ the interruption.
   closely now: canonicalize the MPS center, view the projected two-site
   Hamiltonian as a linear operator in the exact current `theta` block layout,
   use the current theta vector as the Krylov/Lanczos initial vector, and split
-  the optimized theta with Symmray SVD.
+  the optimized theta with Symmray SVD. Each split now records
+  `svd_diagnostics` showing the bond sectors and dimensions actually kept by
+  Symmray.
 - The Symmray DMRG path assumes an OBC MPS/MPO chain. Periodic lattice edges
   should be represented as long-range terms in that OBC MPO.
 - The explicit effective norm remains in the code as a validator and
   diagnostic. After OBC canonicalization, `N_eff` should be identity-like; if
   it is not, the normal dense/Lanczos path raises a canonicalization/alignment
   error rather than quietly solving a generalized problem.
-- The real remaining DMRG work is performance and scale: reduce dense embedding
-  in the matvec and add torch-native block contractions where useful.
+- The real remaining DMRG work is performance and scale. A Symmray-native
+  projected-matvec probe showed that intermediate contractions can prune charge
+  maps on shared virtual/MPO legs, producing shape mismatches unless those
+  indices are safely re-expanded after each step. Until that adapter is in
+  place, the stable path remains Lanczos over exact theta blocks with dense
+  embedding inside each matvec.
