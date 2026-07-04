@@ -967,7 +967,15 @@ def reg_complex_svd_torch():
 
 
 def reg_real_svd_torch():
-    """Register real torch SVD autograd rule in autoray."""
+    """Register the real-only torch SVD autograd rule in autoray.
+
+    This is the real counterpart of :func:`reg_rel_svd_torch`. It shares the
+    robust forward path (``gesvd`` driver on CUDA plus a batched SciPy ``gesvd``
+    fallback), the same Townsend rectangular reverse-mode update, and the
+    scale-aware Lorentzian broadening of the singular-value denominators, while
+    dropping the complex phase/gauge correction. It supports rectangular and
+    batched real inputs.
+    """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_real_svd_torch requires optional dependency 'torch'. "

@@ -213,70 +213,118 @@ class SVD(torch.autograd.Function):
 
 
 class SVD_real(torch.autograd.Function):
-    """Real-valued SVD autograd function with scipy fallback on failure."""
+    """Real-valued SVD with the relative-regularized reverse-mode rule.
+
+    This is the real-only counterpart of :class:`SVD`. It shares the robust
+    forward path (``gesvd`` driver on CUDA plus a batched SciPy ``gesvd``
+    fallback) and the scale-aware Lorentzian broadening of the singular-gap and
+    inverse-singular-value reciprocals, and it supports rectangular and batched
+    inputs. Only the complex phase/gauge term of :class:`SVD` is dropped, since
+    real orthogonal factors carry no gauge freedom.
+    """
 
     @staticmethod
-    def forward(self, A):
+    def forward(ctx, A):
         try:
-            U, S, V = torch.svd(A)
-        except Exception as exc:
-            if scipy_linalg is None:
-                raise RuntimeError(
-                    "torch.svd failed and scipy is unavailable for gesvd fallback."
-                ) from exc
-            print("trouble in torch gesdd routine, falling back to gesvd")
-            U, S, V = scipy_linalg.svd(
-                A.detach().numpy(),
-                full_matrices=False,
-                lapack_driver="gesvd",
-            )
-            U = torch.from_numpy(U)
-            S = torch.from_numpy(S)
-            V = torch.from_numpy(V.T)
-
-        for idx in range(U.size()[1]):
-            if max(torch.max(U[:, idx]), torch.min(U[:, idx]), key=abs) < 0.0:
-                U[:, idx] *= -1.0
-                V[:, idx] *= -1.0
-
-        self.save_for_backward(U, S, V)
-        return U, S, V.t()
+            if A.is_cuda:
+                U, S, Vh = torch.linalg.svd(A, full_matrices=False, driver="gesvd")
+            else:
+                U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+        except Exception as exc:  # pragma: no cover - backend failure dependent
+            U, S, Vh = _scipy_gesvd(A, exc)
+        ctx.save_for_backward(U, S, Vh)
+        return U, S, Vh
 
     @staticmethod
-    def backward(self, dU, dS, dV):
-        U, S, V = self.saved_tensors
-        dV = dV.t()
-        Vt = V.t()
-        Ut = U.t()
-        M = U.size(0)
-        N = V.size(0)
-        NS = len(S)
+    def backward(ctx, gu, gsigma, gvh):
+        u, sigma, vh = ctx.saved_tensors
+        m = u.size(-2)
+        n = vh.size(-1)
+        k = sigma.size(-1)
+        eps_abs = torch.finfo(sigma.dtype).tiny
+        sigma_scale = sigma.detach().amax(dim=-1, keepdim=True)
+        pair_scale = sigma_scale.unsqueeze(-1)
 
-        F = (S - S[:, None])
-        F = safe_inverse(F)
-        F.diagonal().fill_(0)
+        if (u.size(-1) != k) or (vh.size(-2) != k):
+            u = u.narrow(-1, 0, k)
+            vh = vh.narrow(-2, 0, k)
+            if not (gu is None):
+                gu = gu.narrow(-1, 0, k)
+            if not (gvh is None):
+                gvh = gvh.narrow(-2, 0, k)
 
-        G = (S + S[:, None])
-        G = safe_inverse(G)
-        G.diagonal().fill_(0)
-
-        UdU = Ut @ dU
-        VdV = Vt @ dV
-
-        Su = (F + G) * (UdU - UdU.t()) / 2
-        Sv = (F - G) * (VdV - VdV.t()) / 2
-
-        dA = U @ (Su + Sv + torch.diag(dS)) @ Vt
-        if M > NS:
-            dA = dA + (torch.eye(M, dtype=dU.dtype, device=dU.device) - U @ Ut) @ (
-                dU * safe_inverse(S)
-            ) @ Vt
-        if N > NS:
-            dA = dA + (U * safe_inverse(S)) @ dV.t() @ (
-                torch.eye(N, dtype=dU.dtype, device=dU.device) - V @ Vt
+        if not (gsigma is None):
+            sigma_term = u * gsigma.unsqueeze(-2) @ vh
+        else:
+            sigma_term = torch.zeros(
+                (*sigma.shape[:-1], m, n),
+                dtype=u.dtype,
+                device=u.device,
             )
 
-        return dA
+        if (gu is None) and (gvh is None):
+            return sigma_term
+
+        sigma_inv = safe_inverse(
+            sigma.clone(),
+            eps_abs=eps_abs,
+            eps_rel=_SVD_EPS_REL,
+            eps_scale=sigma_scale,
+        )
+
+        # Townsend's F+/F- terms, written as 1/(s_j - s_i) and
+        # 1/(s_i + s_j), with relative Lorentzian broadening.
+        F = sigma.unsqueeze(-2) - sigma.unsqueeze(-1)
+        F = safe_inverse(
+            F,
+            eps_abs=eps_abs,
+            eps_rel=_SVD_EPS_REL,
+            eps_scale=pair_scale,
+        )
+        F.diagonal(0, -2, -1).fill_(0)
+
+        G = sigma.unsqueeze(-2) + sigma.unsqueeze(-1)
+        G = safe_inverse(
+            G,
+            eps_abs=eps_abs,
+            eps_rel=_SVD_EPS_REL,
+            eps_scale=pair_scale,
+        )
+        G.diagonal(0, -2, -1).fill_(0)
+
+        ut = u.transpose(-2, -1)
+        if not (gu is None):
+            gut = gu.transpose(-2, -1)
+            u_term = u @ ((F + G).mul(ut @ gu - gut @ u)) * 0.5
+            if m > k:
+                proj_on_ortho_u = -u @ ut
+                proj_on_ortho_u.diagonal(0, -2, -1).add_(1)
+                u_term = u_term + proj_on_ortho_u @ (gu * sigma_inv.unsqueeze(-2))
+            u_term = u_term @ vh
+        else:
+            u_term = torch.zeros(
+                (*sigma.shape[:-1], m, n),
+                dtype=u.dtype,
+                device=u.device,
+            )
+
+        v = vh.transpose(-2, -1)
+        if not (gvh is None):
+            gv = gvh.transpose(-2, -1)
+            v_term = ((F - G).mul(vh @ gv - gvh @ v)) @ vh * 0.5
+            if n > k:
+                proj_on_v_ortho = -v @ vh
+                proj_on_v_ortho.diagonal(0, -2, -1).add_(1)
+                v_term = v_term + sigma_inv.unsqueeze(-1) * (gvh @ proj_on_v_ortho)
+            v_term = u @ v_term
+        else:
+            v_term = torch.zeros(
+                (*sigma.shape[:-1], m, n),
+                dtype=u.dtype,
+                device=u.device,
+            )
+
+        return u_term + sigma_term + v_term
 
 
 class QR_real(torch.autograd.Function):

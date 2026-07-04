@@ -240,6 +240,48 @@ def test_mps_energy_make_tn_optimizer_and_optimize(monkeypatch):
     assert calls[-1] == ("optimize", 3, {})
 
 
+def test_mps_energy_optimize_recasts_tnoptimizer_output_to_autodiff_backend(monkeypatch):
+    """quimb returns optimized variables as NumPy; Pepsy should restore backend."""
+    torch = pytest.importorskip("torch")
+    calls = []
+
+    state = qtn.MPS_computational_state("00")
+    state.apply_to_arrays(pepsy.backend_torch(dtype=torch.float64, device="cpu"))
+
+    out = qtn.MPS_computational_state("11")
+    out.apply_to_arrays(lambda x: np.asarray(x, dtype=np.float64))
+
+    class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
+        def __init__(self, state, loss_fn, **kwargs):
+            _ = (state, loss_fn)
+            calls.append(kwargs)
+            self.losses = [1.0]
+
+        def optimize(self, n=220, **kwargs):
+            _ = (n, kwargs)
+            return out
+
+    monkeypatch.setattr("pepsy.optimizers.energy.peps.qtn.TNOptimizer", _FakeTNOptimizer)
+    terms = {(0, 1): np.eye(4, dtype=np.float64).reshape(2, 2, 2, 2)}
+    opt = MpsEnergyOptimizer(state, terms)
+
+    optimized, losses = opt.optimize(
+        n=1,
+        autodiff_backend="torch",
+        device="cpu",
+        progbar=False,
+        normalize=True,
+        return_losses=True,
+    )
+
+    block = next(iter(optimized.tensor_map.values())).data
+    assert isinstance(block, torch.Tensor)
+    assert block.dtype == torch.float64
+    assert block.device.type == "cpu"
+    assert losses == (1.0,)
+    assert calls[-1]["autodiff_backend"] == "torch"
+
+
 def test_mps_energy_optimizer_public_exports():
     """MPS energy optimizer should resolve from package public namespaces."""
     assert pepsy.MpsEnergyOptimizer is MpsEnergyOptimizer

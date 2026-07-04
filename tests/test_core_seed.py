@@ -955,6 +955,47 @@ def test_reg_rel_svd_torch_forward_falls_back_to_scipy_gesvd(monkeypatch, dtype)
     assert torch.isfinite(A.grad).all()
 
 
+def test_reg_real_svd_torch_supports_batched_float64_autoray():
+    """Registered real torch SVD should backpropagate through batches."""
+    torch = pytest.importorskip("torch")
+
+    torch.manual_seed(242526)
+    core.reg_real_svd_torch()
+
+    A = torch.randn(2, 4, 3, dtype=torch.float64, requires_grad=True)
+    U, S, Vh = ar.do("linalg.svd", A)
+    loss = ((U * S.unsqueeze(-2)) @ Vh).square().sum() + S.sum()
+    loss.backward()
+
+    assert A.grad is not None
+    assert A.grad.shape == A.shape
+    assert torch.isfinite(A.grad).all()
+
+
+def test_real_svd_torch_forward_falls_back_to_scipy_gesvd(monkeypatch):
+    """Real SVD should use the shared batched gesvd fallback on torch failure."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("scipy.linalg")
+    from pepsy.backends import linalg_torch as lrt  # pylint: disable=import-outside-toplevel
+
+    def fail_svd(*_args, **_kwargs):
+        raise RuntimeError("forced gesdd failure")
+
+    monkeypatch.setattr(lrt.torch.linalg, "svd", fail_svd)
+
+    torch.manual_seed(272829)
+    A = torch.randn(2, 4, 3, dtype=torch.float64, requires_grad=True)
+    U, S, Vh = lrt.SVD_real.apply(A)
+    recon = (U * S.unsqueeze(-2)) @ Vh
+
+    torch.testing.assert_close(recon, A.detach(), rtol=1e-10, atol=1e-10)
+    loss = recon.square().sum() + S.sum()
+    loss.backward()
+
+    assert A.grad is not None
+    assert torch.isfinite(A.grad).all()
+
+
 def test_complex_svd_torch_backward_regularizes_degenerate_spectra():
     """Custom complex SVD backward should stay finite at degenerate spectra."""
     torch = pytest.importorskip("torch")
