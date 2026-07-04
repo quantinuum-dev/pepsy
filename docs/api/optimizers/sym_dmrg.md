@@ -57,8 +57,11 @@ auditable. `residual_check` accepts the same schedule modes and records
 normalized local eigensolver residuals in `residual_diagnostics` without
 raising by default; `residual_check_tol` marks diagnostics as passed/failed
 when supplied. `matvec_diagnostics` records sampled `H_eff` matvec elapsed
-time, cache-hit status, theta block size, projector block counts, and cached
-contraction routing counts in `matvec_diagnostic_records`.
+time, cache-hit status, theta block size, projector block counts, cached
+contraction routing counts, and block-native substep timings in
+`matvec_diagnostic_records`. The cached projected problem also records whether
+the block-native path used the original right-first contraction route or the
+left-first route selected for strongly imbalanced projector sizes.
 `compute_initial_energy=True` preserves the historical eager startup estimate,
 `False` skips it, and `"lazy"` defers it until the `initial_energy` or
 pre-sweep `energy` property is requested. Sweep setup

@@ -462,6 +462,11 @@ class _ThetaSpace:
         return _tensor_with_data(self.theta, data)
 
 
+def _add_elapsed(timings, key, start):
+    if timings is not None:
+        timings[key] = timings.get(key, 0.0) + (time.perf_counter() - start)
+
+
 class _BlockPairContraction:
     """Precomputed index routing for one static-left block contraction."""
 
@@ -517,42 +522,55 @@ class _BlockPairContraction:
                 output.pop(axis)
         return tuple(output)
 
-    def apply(self, right):
+    def apply(self, right, *, timings=None, prefix="contract"):
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
         if tuple(right.inds) != self.right_inds:
             raise ValueError("Right tensor indices changed for cached block contraction.")
         if not self.shared:
+            step_start = time.perf_counter() if timings is not None else None
             data = self.left.data.tensordot(
                 right.data,
                 axes=((), ()),
                 mode="blockwise",
                 preserve_array=True,
             )
-            return qtn.Tensor(
+            _add_elapsed(timings, f"{prefix}_tensordot_elapsed", step_start)
+            step_start = time.perf_counter() if timings is not None else None
+            out = qtn.Tensor(
                 data=data,
                 inds=self.contract_output_inds,
                 tags=self.left.tags | right.tags,
             )
+            _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
+            return out
 
+        step_start = time.perf_counter() if timings is not None else None
         right_work = (
             right.reindex(self.reindex_map, inplace=False)
             if self.reindex_map
             else right
         )
+        _add_elapsed(timings, f"{prefix}_reindex_elapsed", step_start)
+        step_start = time.perf_counter() if timings is not None else None
         data = self.left.data.tensordot(
             right_work.data,
             axes=((self.left_axis,), (self.right_axis,)),
             mode="blockwise",
             preserve_array=True,
         )
+        _add_elapsed(timings, f"{prefix}_tensordot_elapsed", step_start)
+        step_start = time.perf_counter() if timings is not None else None
         out = qtn.Tensor(
             data=data,
             inds=self.contract_output_inds,
             tags=self.left.tags | right.tags,
         )
+        _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
+        step_start = time.perf_counter() if timings is not None else None
         for ind, temp_ind in self.trace_pairs:
             out = self.optimizer._trace_block_tensor_inds(out, ind, temp_ind)
+        _add_elapsed(timings, f"{prefix}_trace_elapsed", step_start)
         return out
 
     def summary(self, prefix):
@@ -599,16 +617,34 @@ class _LocalProjectedProblem:
             else w_right
         )
         theta_input_inds = tuple(self.input_map.get(ind, ind) for ind in self.inds)
-        self.right_contraction = _BlockPairContraction(
-            optimizer,
-            self.right_projector,
-            theta_input_inds,
-        )
-        self.left_contraction = _BlockPairContraction(
-            optimizer,
-            self.left_projector,
-            self.right_contraction.output_inds,
-        )
+        left_stats = self._tensor_block_stats(self.left_projector, "left_projector")
+        right_stats = self._tensor_block_stats(self.right_projector, "right_projector")
+        # Keep the original right-first route unless the static projector
+        # imbalance is large enough to overcome the extra right-after-left work.
+        if left_stats["left_projector_dim"] > 2 * right_stats["right_projector_dim"]:
+            self.contraction_order = "left_first"
+            self.left_contraction = _BlockPairContraction(
+                optimizer,
+                self.left_projector,
+                theta_input_inds,
+            )
+            self.right_contraction = _BlockPairContraction(
+                optimizer,
+                self.right_projector,
+                self.left_contraction.output_inds,
+            )
+        else:
+            self.contraction_order = "right_first"
+            self.right_contraction = _BlockPairContraction(
+                optimizer,
+                self.right_projector,
+                theta_input_inds,
+            )
+            self.left_contraction = _BlockPairContraction(
+                optimizer,
+                self.left_projector,
+                self.right_contraction.output_inds,
+            )
         self.summary_data = self._make_summary()
 
     @staticmethod
@@ -634,12 +670,45 @@ class _LocalProjectedProblem:
             return block.copy()
         return np.array(block, copy=True)
 
-    def apply(self, theta):
+    def apply(self, theta, *, timings=None):
+        step_start = time.perf_counter() if timings is not None else None
         theta_in = theta.reindex(self.input_map, inplace=False)
-        out = self.right_contraction.apply(theta_in)
-        out = self.left_contraction.apply(out)
+        _add_elapsed(timings, "matvec_input_reindex_elapsed", step_start)
+        if self.contraction_order == "left_first":
+            step_start = time.perf_counter() if timings is not None else None
+            out = self.left_contraction.apply(
+                theta_in,
+                timings=timings,
+                prefix="matvec_left_contract",
+            )
+            _add_elapsed(timings, "matvec_left_contract_elapsed", step_start)
+            step_start = time.perf_counter() if timings is not None else None
+            out = self.right_contraction.apply(
+                out,
+                timings=timings,
+                prefix="matvec_right_contract",
+            )
+            _add_elapsed(timings, "matvec_right_contract_elapsed", step_start)
+        else:
+            step_start = time.perf_counter() if timings is not None else None
+            out = self.right_contraction.apply(
+                theta_in,
+                timings=timings,
+                prefix="matvec_right_contract",
+            )
+            _add_elapsed(timings, "matvec_right_contract_elapsed", step_start)
+            step_start = time.perf_counter() if timings is not None else None
+            out = self.left_contraction.apply(
+                out,
+                timings=timings,
+                prefix="matvec_left_contract",
+            )
+            _add_elapsed(timings, "matvec_left_contract_elapsed", step_start)
+        step_start = time.perf_counter() if timings is not None else None
         out = out.transpose(*self.inds)
+        _add_elapsed(timings, "matvec_transpose_elapsed", step_start)
 
+        step_start = time.perf_counter() if timings is not None else None
         blocks = {}
         for sector in theta.data.blocks:
             if sector in out.data.blocks:
@@ -647,6 +716,7 @@ class _LocalProjectedProblem:
             else:
                 blocks[sector] = self._copy_block(self.output_zeros[sector])
         data = _array_with_blocks_like(theta.data, blocks)
+        _add_elapsed(timings, "matvec_output_blocks_elapsed", step_start)
         return _tensor_with_data(theta, data)
 
     @staticmethod
@@ -673,6 +743,7 @@ class _LocalProjectedProblem:
             "has_right_env": self.has_right_env,
             "theta_num_blocks": len(self.block_layout),
             "matvec_num_contractions": 2,
+            "matvec_contraction_order": self.contraction_order,
         }
         summary.update(self._tensor_block_stats(self.left_projector, "left_projector"))
         summary.update(self._tensor_block_stats(self.right_projector, "right_projector"))
@@ -1203,10 +1274,17 @@ class SymDMRG2:
         """Return aggregate timing/count information for profiling events."""
         phase_totals = {}
         phase_counts = {}
+        matvec_timing_totals = {}
         for entry in self.profile_diagnostics:
             phase = entry["phase"]
             phase_totals[phase] = phase_totals.get(phase, 0.0) + entry["elapsed"]
             phase_counts[phase] = phase_counts.get(phase, 0) + 1
+            if phase == "matvec":
+                for key, value in entry.items():
+                    if key.startswith("matvec_") and key.endswith("_elapsed"):
+                        matvec_timing_totals[key] = (
+                            matvec_timing_totals.get(key, 0.0) + float(value)
+                        )
         total_elapsed = sum(phase_totals.values())
         return {
             "enabled": self.profile,
@@ -1214,6 +1292,7 @@ class SymDMRG2:
             "total_elapsed": float(total_elapsed),
             "phase_totals": phase_totals,
             "phase_counts": phase_counts,
+            "matvec_timing_totals": matvec_timing_totals,
             "num_matvecs": phase_counts.get("matvec", 0),
             "num_matvec_diagnostics": len(self.matvec_diagnostic_records),
             "num_residual_checks": phase_counts.get("residual_check", 0),
@@ -2588,13 +2667,13 @@ class SymDMRG2:
         )
         return problem, False
 
-    def two_site_matvec_symmray(self, site, theta=None):
+    def two_site_matvec_symmray(self, site, theta=None, *, timings=None):
         """Apply ``H_eff`` using Symmray block contractions."""
         theta = self.two_site_theta(site) if theta is None else theta
         problem, cache_hit = self._get_projected_problem(site, theta)
         self._last_matvec_projected_problem = problem
         self._last_matvec_cache_hit = cache_hit
-        return problem.apply(theta)
+        return problem.apply(theta, timings=timings)
 
     def _matvec_dense(self, site, theta_dense):
         if self.left_envs is None or self.right_envs is None:
@@ -2748,11 +2827,21 @@ class SymDMRG2:
         record_matvec_diagnostic = self._should_record_matvec_diagnostic(site)
         diagnostic_start = time.perf_counter() if record_matvec_diagnostic else None
         theta_input = self.two_site_theta(site) if theta is None else theta
+        detail_timings = (
+            {}
+            if backend == "symmray"
+            and (profile_start is not None or record_matvec_diagnostic)
+            else None
+        )
         self._last_matvec_projected_problem = None
         self._last_matvec_cache_hit = None
         try:
             if backend == "symmray":
-                return self.two_site_matvec_symmray(site, theta_input)
+                return self.two_site_matvec_symmray(
+                    site,
+                    theta_input,
+                    timings=detail_timings,
+                )
             if backend == "dense_reference":
                 return self.two_site_matvec_dense_reference(site, theta_input)
             raise ValueError(f"Unknown resolved matvec backend {backend!r}.")
@@ -2764,6 +2853,10 @@ class SymDMRG2:
             }
             if profile_start is not None or record_matvec_diagnostic:
                 metadata.update(self._tensor_block_stats(theta_input))
+            if detail_timings:
+                metadata.update(
+                    {key: float(value) for key, value in detail_timings.items()}
+                )
             diagnostic_metadata = dict(metadata)
             problem = self._last_matvec_projected_problem
             if problem is not None and record_matvec_diagnostic:

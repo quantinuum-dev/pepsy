@@ -749,8 +749,15 @@ def test_symdmrg2_block_native_matvec_matches_dense_reference_all_sites():
 
         dense = opt.two_site_matvec_dense_reference(site, trial)
         native = opt.two_site_matvec_symmray(site, trial)
+        summary = opt._last_matvec_projected_problem.summary()
+        expected_order = (
+            "left_first"
+            if summary["left_projector_dim"] > 2 * summary["right_projector_dim"]
+            else "right_first"
+        )
 
         assert native.inds == dense.inds == theta.inds
+        assert summary["matvec_contraction_order"] == expected_order
         assert set(native.data.blocks) == set(dense.data.blocks) == set(theta.data.blocks)
         for sector in theta.data.blocks:
             assert native.data.blocks[sector] == pytest.approx(dense.data.blocks[sector])
@@ -863,15 +870,23 @@ def test_symdmrg2_matvec_diagnostics_record_cache_and_projector_stats():
     assert first["theta_dim"] == space.dim
     assert first["theta_num_blocks"] == len(theta.data.blocks)
     assert first["matvec_num_contractions"] == 2
+    assert first["matvec_contraction_order"] in {"right_first", "left_first"}
     assert first["projected_block_terms"] > 0
     assert first["left_projector_num_blocks"] > 0
     assert first["right_projector_num_blocks"] > 0
     assert first["right_contract_shared_inds"] >= 1
     assert first["left_contract_shared_inds"] >= 1
+    assert first["matvec_input_reindex_elapsed"] >= 0.0
+    assert first["matvec_right_contract_elapsed"] >= 0.0
+    assert first["matvec_left_contract_elapsed"] >= 0.0
+    assert first["matvec_output_blocks_elapsed"] >= 0.0
     assert first["elapsed"] >= 0.0
     assert opt.summary()["num_matvec_diagnostics"] == 2
     assert opt.summary()["last_matvec_diagnostic"] == opt.last_matvec_diagnostic
     assert opt.profile_summary()["num_matvec_diagnostics"] == 2
+    assert opt.profile_summary()["matvec_timing_totals"][
+        "matvec_right_contract_elapsed"
+    ] >= 0.0
 
 
 def test_symdmrg2_matvec_skips_block_stats_without_profile_or_diagnostics(monkeypatch):
