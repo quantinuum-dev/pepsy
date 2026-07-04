@@ -29,9 +29,14 @@ Symmray arrays that need bosonization; fermionic Symmray tensors in that MPO
 are rejected before the state is bosonized. Periodic lattice edges should be
 encoded as long-range terms in that OBC MPO, not as a cyclic MPS. Pepsy builds
 dense left/right environments for `<psi|MPO|psi>`, block-sparse environments
-for the projected `H_eff`, and dense debug environments for `N_eff`. The
-active local basis is exactly the current `theta` block layout. By default,
-Symmray `H_eff` matvecs use a block-native projected contraction;
+for the projected `H_eff`, and dense debug environments for `N_eff`. Before
+Symmray sweeps that are not already using explicit sector enrichment or the
+mixer's sector expansion, SymDMRG2 widens the MPS virtual charge maps with
+zero-valued, same-total-charge template sectors. Local dense/Lanczos solves
+then use a two-site variational template whose active physical legs include
+every charge-compatible local sector, so the subsequent SVD can nucleate bond
+sectors that were absent from a narrow product or low-bond initial state. By
+default, Symmray `H_eff` matvecs use a block-native projected contraction;
 `matvec_backend="dense_reference"` keeps the older
 NumPy dense-aligned matvec available as a validator. During a local
 dense/Lanczos solve, the block-native path caches the static projected
@@ -78,11 +83,12 @@ matching the kind of compression health metrics used by mature MPS workflows.
 records `norm_identity_diagnostics` for the per-window `N_eff ~= I` canonical
 check, `residual_diagnostics` for scheduled `H theta - E theta` (or
 generalized `H theta - E N theta`) residuals, `matvec_diagnostic_records` for
-sampled projected matvec cost metadata, and `local_solve_diagnostics` for the
-resolved dense/Lanczos solver, theta-space dimension, local energy, residual
-status, and matvec backend used at each two-site solve. For narrow initial MPS
-sector layouts, `sector_enrichment="template"`
-can expand virtual-bond charge maps from a same-charge random template MPS and
+sampled projected matvec cost metadata, `variational_sector_diagnostics` for
+automatic zero-valued sector-basis widening, and `local_solve_diagnostics` for
+the resolved dense/Lanczos solver, theta-space dimension, local energy,
+residual status, and matvec backend used at each two-site solve. For especially
+fragile narrow initial MPS sector layouts, `sector_enrichment="template"` can
+also expand virtual-bond charge maps from a same-charge random template MPS and
 seed newly valid blocks with `sector_noise` before the first sweep.
 `sector_enrichment="adaptive"` repeats that template enrichment before every
 sweep, which can reintroduce valid sectors after SVD truncation prunes them.

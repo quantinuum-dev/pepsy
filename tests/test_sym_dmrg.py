@@ -1012,15 +1012,19 @@ def test_symdmrg2_lanczos_matches_dense_after_canonicalization():
     opt._canonize_for_sweep("right")
     opt.build_environments()
     opt.build_norm_environments()
-    theta = opt.two_site_theta(0)
+    current_theta = opt.two_site_theta(0)
+    theta = opt.two_site_variational_theta(0, current_theta)
 
     assert opt.effective_norm_identity_error(0, theta, samples=3) < 1e-12
     hermitian, herm_error = opt.check_two_site_hermiticity(0, theta, samples=3)
     assert hermitian, herm_error
 
-    dense_energy, dense_theta = opt.dense_local_eigensolve(0)
+    dense_energy, dense_theta = opt.dense_local_eigensolve(0, theta=theta)
     lanczos_energy, lanczos_theta = opt.lanczos_local_eigensolve(0, theta=theta)
 
+    assert sum(block.size for block in theta.data.blocks.values()) >= sum(
+        block.size for block in current_theta.data.blocks.values()
+    )
     assert lanczos_energy == pytest.approx(dense_energy)
     assert lanczos_theta.inds == dense_theta.inds
     assert set(lanczos_theta.data.blocks) == set(dense_theta.data.blocks)
@@ -1182,6 +1186,68 @@ def test_symdmrg2_lanczos_reaches_fixed_sector_ed_with_full_initial_support():
     assert max(diag["error"] for diag in opt.norm_identity_diagnostics) < 1e-12
     assert all(diag["solver"] == "lanczos" for diag in opt.local_solve_diagnostics)
     assert all(diag["theta_dim"] > 2 for diag in opt.local_solve_diagnostics)
+
+
+def test_symdmrg2_nucleates_sectors_from_product_state_without_enrichment():
+    """The local two-site space should include absent but charge-valid sectors."""
+    pytest.importorskip("symmray")
+    edges = [(site, site + 1) for site in range(3)]
+    occupations = [(1, 0), (0, 1), (1, 0), (0, 1)]
+    state, mpo = _fh_u1u1_chain(
+        4,
+        occupations,
+        bond_dim=1,
+        seed=31,
+        U=1.0,
+        mu=0.1,
+    )
+    ed_energy = _fixed_u1u1_sector_ground_energy(
+        4,
+        edges,
+        (2, 2),
+        t=1.0,
+        U=1.0,
+        mu=0.1,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=16,
+        cutoff=1e-12,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-11,
+        local_eig_ncv=16,
+        norm_check_samples=3,
+        sector_enrichment="none",
+        mixer="none",
+    )
+    current_theta = opt.two_site_theta(1)
+    variational_theta = opt.two_site_variational_theta(1, current_theta)
+
+    opt.solve(tol=0.0, max_sweeps=2, sweep_sequence="RL")
+
+    assert sum(block.size for block in current_theta.data.blocks.values()) == 1
+    assert sum(block.size for block in variational_theta.data.blocks.values()) > 1
+    assert opt.energy == pytest.approx(ed_energy, abs=1e-10)
+    assert opt.state.max_bond() > 1
+    assert len(opt.sector_enrichment_diagnostics) == 0
+    assert len(opt.variational_sector_diagnostics) >= 1
+    assert len(opt.mixer_diagnostics) == 0
+    basis = opt.variational_sector_diagnostics[0]
+    assert basis["mode"] == "variational_basis"
+    assert basis["noise"] == 0.0
+    assert basis["added_blocks"] > 0
+    assert basis["modified_tensors"] > 0
+    assert opt.summary()["last_variational_sector_diagnostic"] == (
+        opt.last_variational_sector_diagnostic
+    )
+    assert any(
+        diagnostic["left"]["num_sectors"] > 1
+        for diagnostic in opt.svd_diagnostics
+    )
 
 
 def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():

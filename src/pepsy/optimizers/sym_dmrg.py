@@ -1116,6 +1116,7 @@ class SymDMRG2:
         self.convergence_diagnostics = []
         self.mixer_diagnostics = []
         self.sector_enrichment_diagnostics = []
+        self.variational_sector_diagnostics = []
         self.profile_diagnostics = []
         self._current_sweep_direction = None
         self._last_local_input_theta = None
@@ -1225,6 +1226,13 @@ class SymDMRG2:
         if not self.sector_enrichment_diagnostics:
             return None
         return self.sector_enrichment_diagnostics[-1]
+
+    @property
+    def last_variational_sector_diagnostic(self):
+        """Most recent automatic variational-sector diagnostic, if any."""
+        if not self.variational_sector_diagnostics:
+            return None
+        return self.variational_sector_diagnostics[-1]
 
     @property
     def last_profile_diagnostic(self):
@@ -1730,6 +1738,7 @@ class SymDMRG2:
         bond_maps = self._template_bond_chargemaps(bond_dim)
         rng = np.random.default_rng(self.sector_enrichment_seed)
         site_diagnostics = []
+        modified_tensors = 0
         for site, tensor in enumerate(self._state):
             new_data, diagnostic = self._enriched_tensor_data(
                 tensor,
@@ -1737,11 +1746,19 @@ class SymDMRG2:
                 rng,
                 noise,
             )
-            tensor.modify(data=new_data)
+            modified = (
+                diagnostic["changed_indices"] > 0
+                or diagnostic["added_blocks"] > 0
+            )
+            if modified:
+                tensor.modify(data=new_data)
+                modified_tensors += 1
             diagnostic["site"] = int(site)
+            diagnostic["modified"] = bool(modified)
             site_diagnostics.append(diagnostic)
 
-        self._clear_environments()
+        if modified_tensors:
+            self._clear_environments()
         diagnostic = {
             "mode": "template" if mode is None else str(mode),
             "sweep": None if sweep is None else int(sweep),
@@ -1758,6 +1775,7 @@ class SymDMRG2:
             },
             "sites": site_diagnostics,
             "added_blocks": sum(item["added_blocks"] for item in site_diagnostics),
+            "modified_tensors": int(modified_tensors),
         }
         self._record_profile_elapsed(
             profile_phase,
@@ -1765,6 +1783,7 @@ class SymDMRG2:
             mode=diagnostic["mode"],
             added_blocks=int(diagnostic["added_blocks"]),
             bond_dim=int(bond_dim),
+            modified_tensors=int(modified_tensors),
         )
         return diagnostic
 
@@ -1801,6 +1820,25 @@ class SymDMRG2:
         if self.sector_enrichment == "adaptive_template":
             return True
         raise ValueError(f"Unknown sector_enrichment mode {self.sector_enrichment!r}.")
+
+    def _prepare_variational_sector_basis(self, *, sweep, max_bond):
+        """Expose legal virtual charge sectors for the next Symmray sweep.
+
+        This is the deterministic, zero-valued sector-basis widening needed for
+        a two-site solve to nucleate sectors from a narrow MPS. User-facing
+        ``sector_enrichment`` remains the optional noisy/adaptive helper.
+        """
+        diagnostic = self._expand_sector_chargemaps(
+            bond_dim=max_bond,
+            noise=0.0,
+            mode="variational_basis",
+            sweep=sweep,
+            profile_phase="variational_sector_basis",
+        )
+        if diagnostic is None or diagnostic["modified_tensors"] == 0:
+            return None
+        self.variational_sector_diagnostics.append(diagnostic)
+        return diagnostic
 
     def _active_mixer_amplitude(self, sweep=None):
         if self.backend != "symmray" or self.mixer == "none":
@@ -2537,6 +2575,58 @@ class SymDMRG2:
         order = tuple(ind for ind in self._theta_order(site) if ind in theta.inds)
         return theta.transpose(*order)
 
+    def _copy_blocks_into_template(self, old_data, new_data):
+        for sector, old_block in getattr(old_data, "blocks", {}).items():
+            if sector not in new_data.blocks:
+                continue
+            target = np.array(_to_numpy(new_data.blocks[sector]), copy=True)
+            old_dense = _to_numpy(old_block)
+            slices = tuple(slice(0, size) for size in old_dense.shape)
+            target[slices] = old_dense
+            new_data.set_block(sector, np.asarray(target, dtype=target.dtype))
+        return new_data
+
+    def two_site_variational_theta(self, site, theta=None):
+        """Return the two-site local solve template with full physical sectors.
+
+        The current MPS fixes the outer environment legs for a two-site update,
+        but the local eigensolve should span every charge-compatible pair of
+        physical sectors on the two active sites. The subsequent SVD can then
+        nucleate the new middle-bond sectors selected by the optimized theta.
+        """
+        theta = self.two_site_theta(site) if theta is None else theta
+        right_site = site + 1
+        physical_inds = {
+            self._site_ind(site): self._index_for_tensor_ind(
+                self.mpo[site],
+                self._site_ind(site),
+            ),
+            self._site_ind(right_site): self._index_for_tensor_ind(
+                self.mpo[right_site],
+                self._site_ind(right_site),
+            ),
+        }
+        new_indices = tuple(
+            physical_inds.get(ind, index)
+            for ind, index in zip(theta.inds, theta.data.indices)
+        )
+        if new_indices == tuple(theta.data.indices):
+            return theta
+
+        dtype = self._state_block_dtype()
+
+        def fill_fn(shape):
+            return np.zeros(shape, dtype=dtype)
+
+        new_data = type(theta.data).from_fill_fn(
+            fill_fn,
+            new_indices,
+            charge=theta.data.charge,
+            symmetry=theta.data.symmetry,
+        )
+        new_data = self._copy_blocks_into_template(theta.data, new_data)
+        return _tensor_with_data(theta, new_data)
+
     @staticmethod
     def _trace_block_tensor_axes(tensor, axis_a, axis_b):
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
@@ -3034,9 +3124,9 @@ class SymDMRG2:
             matrix[:, col] = _flatten_blocks(out.data)[0]
         return matrix
 
-    def dense_local_eigensolve(self, site, *, max_dense_dim=None):
+    def dense_local_eigensolve(self, site, *, theta=None, max_dense_dim=None):
         """Solve the dense effective two-site problem in theta's block layout."""
-        theta = self.two_site_theta(site)
+        theta = self.two_site_variational_theta(site) if theta is None else theta
         vector, metadata = _flatten_blocks(theta.data)
         dim = vector.size
         max_dense_dim = self.max_dense_dim if max_dense_dim is None else int(max_dense_dim)
@@ -3065,13 +3155,13 @@ class SymDMRG2:
         """Solve the local theta problem with quimb's matrix-free eigensolver."""
         from quimb.linalg.base_linalg import eigh  # pylint: disable=import-outside-toplevel
 
-        theta = self.two_site_theta(site) if theta is None else theta
+        theta = self.two_site_variational_theta(site) if theta is None else theta
         space = self.two_site_theta_space(site, theta)
         dim = space.dim
         if dim == 0:
             raise ValueError("The two-site theta tensor has no active blocks.")
         if dim <= 2:
-            return self.dense_local_eigensolve(site)
+            return self.dense_local_eigensolve(site, theta=theta)
 
         operator = _SymmrayEffectiveHamiltonian(self, site, space)
         ncv = self.local_eig_ncv
@@ -3360,7 +3450,8 @@ class SymDMRG2:
     def local_eigensolve(self, site):
         """Solve one two-site local problem using the configured Symmray path."""
         profile_start = self._profile_start()
-        theta = self.two_site_theta(site)
+        theta_current = self.two_site_theta(site)
+        theta = self.two_site_variational_theta(site, theta_current)
         self._last_local_input_theta = theta.copy()
         space = self.two_site_theta_space(site, theta)
         dim = space.dim
@@ -3374,7 +3465,10 @@ class SymDMRG2:
 
         if solver == "generalized_dense":
             solver_start = self._profile_start()
-            energy, theta_opt = self.dense_generalized_local_eigensolve(site)
+            energy, theta_opt = self.dense_generalized_local_eigensolve(
+                site,
+                theta=theta,
+            )
             self._record_profile_elapsed(
                 "local_eigensolver",
                 solver_start,
@@ -3428,7 +3522,7 @@ class SymDMRG2:
 
         solver_start = self._profile_start()
         if solver == "dense":
-            energy, theta_opt = self.dense_local_eigensolve(site)
+            energy, theta_opt = self.dense_local_eigensolve(site, theta=theta)
             solver_used = "dense"
         elif solver == "lanczos":
             energy, theta_opt = self.lanczos_local_eigensolve(site, theta=theta)
@@ -3479,11 +3573,12 @@ class SymDMRG2:
         self,
         site,
         *,
+        theta=None,
         max_dense_dim=None,
         norm_rcond=None,
     ):
         """Solve ``H_eff theta = E N_eff theta`` in theta's block layout."""
-        theta = self.two_site_theta(site)
+        theta = self.two_site_variational_theta(site) if theta is None else theta
         vector, metadata = _flatten_blocks(theta.data)
         dim = vector.size
         max_dense_dim = self.max_dense_dim if max_dense_dim is None else int(max_dense_dim)
@@ -3913,6 +4008,15 @@ class SymDMRG2:
                     )
                 else:
                     mixer_diagnostic = None
+                if enrichment_diagnostic is None and mixer_diagnostic is None:
+                    variational_sector_diagnostic = (
+                        self._prepare_variational_sector_basis(
+                            sweep=sweep_num,
+                            max_bond=max_bond,
+                        )
+                    )
+                else:
+                    variational_sector_diagnostic = None
 
                 self._print_pre_sweep(
                     sweep_num,
@@ -3924,6 +4028,7 @@ class SymDMRG2:
                 pre_sweep_mutated = (
                     enrichment_diagnostic is not None
                     or mixer_diagnostic is not None
+                    or variational_sector_diagnostic is not None
                 )
                 canonize = (
                     pre_sweep_mutated
@@ -4097,6 +4202,8 @@ class SymDMRG2:
             "last_mixer_diagnostic": self.last_mixer_diagnostic,
             "num_sector_enrichment_diagnostics": len(self.sector_enrichment_diagnostics),
             "last_sector_enrichment_diagnostic": self.last_sector_enrichment_diagnostic,
+            "num_variational_sector_diagnostics": len(self.variational_sector_diagnostics),
+            "last_variational_sector_diagnostic": self.last_variational_sector_diagnostic,
             "num_profile_diagnostics": len(self.profile_diagnostics),
             "last_profile_diagnostic": self.last_profile_diagnostic,
             "profile_summary": self.profile_summary(),
