@@ -25,7 +25,8 @@ and profiling budget on the two-site solves being timed.
 
 For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain and a
 bosonic/Jordan-Wigner Symmray MPO whenever the input MPS uses fermionic
-Symmray arrays that need bosonization. Periodic lattice edges should be
+Symmray arrays that need bosonization; fermionic Symmray tensors in that MPO
+are rejected before the state is bosonized. Periodic lattice edges should be
 encoded as long-range terms in that OBC MPO, not as a cyclic MPS. Pepsy builds
 dense left/right environments for `<psi|MPO|psi>`, block-sparse environments
 for the projected `H_eff`, and dense debug environments for `N_eff`. The

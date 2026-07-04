@@ -63,6 +63,14 @@ def _is_fermionic_symmray_array(value):
     return _is_symmray_array(value) and "fermionic" in type(value).__name__.lower()
 
 
+def _uses_fermionic_symmray_arrays(*objects):
+    return any(
+        _is_fermionic_symmray_array(data)
+        for obj in objects
+        for data in _iter_tensor_data(obj)
+    )
+
+
 def _infer_total_charge(state):
     if state is None:
         return None
@@ -1198,7 +1206,13 @@ class SymDMRG2:
 
     def _prepare_symmray_state(self, state):
         state = _unwrap_state(state)
-        if any(_is_fermionic_symmray_array(data) for data in _iter_tensor_data(state)):
+        if _uses_fermionic_symmray_arrays(state):
+            if _uses_fermionic_symmray_arrays(self.mpo):
+                raise ValueError(
+                    "SymDMRG2 can only bosonize a fermionic Symmray MPS with "
+                    "a bosonic/Jordan-Wigner Symmray MPO, not a fermionic "
+                    "Symmray MPO."
+                )
             if not MpsEnergyOptimizer._mpo_uses_bosonic_symmray(self.mpo):
                 raise ValueError(
                     "SymDMRG2 can only bosonize a fermionic Symmray MPS when "

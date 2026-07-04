@@ -508,6 +508,33 @@ def test_symdmrg2_skipped_canonicalization_forces_norm_probe(monkeypatch):
     assert all(diag["norm_error"] == 0.0 for diag in opt.local_solve_diagnostics)
 
 
+def test_symdmrg2_skipped_canonicalization_bad_norm_raises(monkeypatch):
+    """Forced N_eff checks should fail fast when canonicalization is unsafe."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        norm_check="off",
+        norm_check_tol=1e-6,
+    )
+
+    monkeypatch.setattr(opt, "_canonize_for_sweep", lambda direction: False)
+    monkeypatch.setattr(opt, "effective_norm_identity_error", lambda site, theta: 1e-3)
+
+    with pytest.raises(ValueError, match="Effective norm is not identity-like"):
+        opt.sweep("R", max_bond=4, cutoff=1e-10)
+
+    assert len(opt.norm_identity_diagnostics) == 1
+    assert opt.norm_identity_diagnostics[0]["forced"] is True
+    assert opt.norm_identity_diagnostics[0]["reason"] == "right_canonize_unavailable"
+    assert opt.norm_identity_diagnostics[0]["passed"] is False
+
+
 def test_symdmrg2_sampled_norm_check_checks_boundaries_and_skips_interval():
     """Sampled checks should keep boundary probes and skip selected interiors."""
     pytest.importorskip("symmray")
@@ -836,6 +863,36 @@ def test_symdmrg2_rejects_fermionic_state_without_bosonic_symmray_mpo(monkeypatc
     )
 
     with pytest.raises(ValueError, match="bosonic/Jordan-Wigner Symmray MPO"):
+        pepsy.SymDMRG2(
+            mpo,
+            state,
+            chi=4,
+            cutoff=1e-10,
+            sweeps=1,
+        )
+
+
+def test_symdmrg2_rejects_fermionic_state_with_fermionic_symmray_mpo(monkeypatch):
+    """A mixed/fermionic Symmray MPO should not pass the bosonization guard."""
+    pytest.importorskip("symmray")
+    import pepsy.optimizers.sym_dmrg as sym_dmrg_mod
+
+    state, mpo = _fh_u1u1_chain(2, [(1, 0), (0, 1)])
+    mpo_data_ids = {id(tensor.data) for tensor in mpo}
+    original = sym_dmrg_mod._is_fermionic_symmray_array
+
+    def mark_mpo_data_fermionic(data):
+        if id(data) in mpo_data_ids:
+            return True
+        return original(data)
+
+    monkeypatch.setattr(
+        sym_dmrg_mod,
+        "_is_fermionic_symmray_array",
+        mark_mpo_data_fermionic,
+    )
+
+    with pytest.raises(ValueError, match="fermionic Symmray MPO"):
         pepsy.SymDMRG2(
             mpo,
             state,
