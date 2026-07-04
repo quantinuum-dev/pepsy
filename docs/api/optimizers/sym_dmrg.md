@@ -14,7 +14,10 @@ NumPy dense-aligned matvec available as a validator. Symmray sweeps
 canonicalize the MPS center before using H-only dense/Lanczos solves; a
 non-identity effective norm is treated as a canonicalization/alignment error
 unless the explicit diagnostic `local_solver="generalized_dense"` mode is
-requested. Every Symmray two-site writeback records an entry in
+requested. Sweep setup builds only the static side environments needed for the
+current direction, updates the moving side incrementally after each two-site
+writeback, and reuses the completed norm environments for normalized energies.
+Every Symmray two-site writeback records an entry in
 `svd_diagnostics`, including the split direction, bond name, `chi`, cutoff,
 and the left/right charge sectors kept by Symmray's SVD.
 `last_svd_diagnostic` exposes the most recent entry. The Symmray path also
@@ -24,6 +27,8 @@ theta-space dimension, local energy, and matvec backend used at each two-site
 solve. For narrow initial MPS sector layouts, `sector_enrichment="template"`
 can expand virtual-bond charge maps from a same-charge random template MPS and
 seed newly valid blocks with `sector_noise` before the first sweep.
+`sector_enrichment="adaptive"` repeats that template enrichment before every
+sweep, which can reintroduce valid sectors after SVD truncation prunes them.
 `sector_enrichment_diagnostics` records the added blocks and template bond
 sectors.
 

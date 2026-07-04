@@ -205,6 +205,42 @@ def test_symdmrg2_solves_longer_chain_with_effective_norm():
     assert opt.environment_energy() == pytest.approx(complex(opt.energy))
 
 
+def test_symdmrg2_directional_environment_builds_only_static_side(monkeypatch):
+    """Sweep setup should not prebuild environments that are updated locally."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(4, [(1, 0), (0, 1), (1, 0), (0, 1)])
+    opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, sweeps=1)
+
+    calls = {"left": 0, "right": 0}
+    left_step = opt._left_env_step
+    right_step = opt._right_env_step
+
+    def counted_left_step(site, env, bra):
+        calls["left"] += 1
+        return left_step(site, env, bra)
+
+    def counted_right_step(site, env, bra):
+        calls["right"] += 1
+        return right_step(site, env, bra)
+
+    monkeypatch.setattr(opt, "_left_env_step", counted_left_step)
+    monkeypatch.setattr(opt, "_right_env_step", counted_right_step)
+
+    opt.build_sweep_environments("right")
+    assert calls == {"left": 0, "right": opt.state.L}
+    assert opt.left_envs[0] is not None
+    assert all(env is None for env in opt.left_envs[1:])
+    assert all(env is not None for env in opt.right_envs)
+
+    calls["left"] = 0
+    calls["right"] = 0
+    opt.build_sweep_environments("left")
+    assert calls == {"left": opt.state.L, "right": 0}
+    assert all(env is not None for env in opt.left_envs)
+    assert all(env is None for env in opt.right_envs[:-1])
+    assert opt.right_envs[-1] is not None
+
+
 def test_symdmrg2_linear_operator_matches_dense_effective_hamiltonian():
     """The Lanczos LinearOperator should be the same H_eff as dense columns."""
     pytest.importorskip("symmray")
@@ -545,6 +581,40 @@ def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():
     assert len(opt.norm_identity_diagnostics) == 2 * (4 - 1)
     assert all(diag["passed"] for diag in opt.norm_identity_diagnostics)
     assert all(diag["solver"] == "lanczos" for diag in opt.local_solve_diagnostics)
+
+
+def test_symdmrg2_adaptive_sector_enrichment_runs_each_sweep():
+    """Adaptive template enrichment should re-run before every sweep."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        3,
+        [(1, 0), (0, 1), (1, 0)],
+        bond_dim=2,
+        seed=37,
+        U=1.0,
+        mu=0.1,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=6,
+        cutoff=1e-10,
+        sweeps=2,
+        sector_enrichment="adaptive",
+        sector_enrichment_bond_dim=5,
+        sector_noise=0.0,
+        sector_enrichment_seed=456,
+    )
+    opt.solve(tol=0.0)
+
+    assert opt.summary()["sector_enrichment"] == "adaptive_template"
+    assert len(opt.energies) == 2
+    assert len(opt.sector_enrichment_diagnostics) == 2
+    assert [diag["sweep"] for diag in opt.sector_enrichment_diagnostics] == [0, 1]
+    assert {
+        diag["mode"] for diag in opt.sector_enrichment_diagnostics
+    } == {"adaptive_template"}
 
 
 def test_symdmrg2_lanczos_stress_obc_six_site_chain_tracks_svd_sectors():

@@ -199,10 +199,16 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   copies existing blocks into the expanded layout, and fills newly valid blocks
   with zero or small `sector_noise`. The narrow `bond_dim=2` L=4 FH U1U1
   regression now reaches the same fixed-sector ED energy after enrichment.
-- The next DMRG step is performance and scale: profile the block-native matvec,
-  reduce repeated environment work, study enrichment schedules beyond the
-  one-shot template path, and later add torch-native block contractions where
-  useful.
+- Symmray sweeps now build only the static-side dense, norm, and block
+  environments required for each direction, grow the moving side incrementally,
+  and reuse the completed norm environment for normalized energy readout. This
+  removes the full post-sweep environment rebuild from the solve loop.
+- `sector_enrichment="adaptive"` now repeats template enrichment before every
+  sweep. Template construction preserves the current physical sector map rather
+  than reducing restricted U1U1 states to a bare physical dimension.
+- The next DMRG step is larger-chain profiling: time the block-native matvec
+  and adaptive enrichment on target workloads, then add torch-native block
+  contractions where useful.
 
 ### Validation
 

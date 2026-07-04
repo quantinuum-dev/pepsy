@@ -270,6 +270,10 @@ def _normalize_sector_enrichment(sector_enrichment):
         "bond_dim": "template",
         "sector": "template",
         "sectors": "template",
+        "adaptive": "adaptive_template",
+        "adaptive_template": "adaptive_template",
+        "repeat": "adaptive_template",
+        "repeated": "adaptive_template",
     }
     try:
         return aliases[key]
@@ -399,6 +403,8 @@ class SymDMRG2:
         the first sweep, then fills newly valid tensor blocks with
         ``sector_noise``. This lets Lanczos see sectors missing from a narrow
         initial MPS without changing the fixed total charge.
+        ``"adaptive"`` repeats the same template enrichment before every sweep,
+        which can reintroduce valid sectors that an earlier truncated SVD pruned.
     sector_enrichment_bond_dim
         Bond-sector budget for the enrichment template. Defaults to ``chi``
         when enrichment is enabled.
@@ -669,9 +675,9 @@ class SymDMRG2:
                 return np.dtype(_to_numpy(next(iter(blocks.values()))).dtype)
         return np.dtype("complex128")
 
-    def _state_phys_dim(self):
+    def _state_phys_sectors(self):
         phys_index = self._index_for_tensor_ind(self._state[0], self._site_ind(0))
-        return sum(int(size) for size in phys_index.chargemap.values())
+        return self._index_chargemap(phys_index)
 
     @staticmethod
     def _merge_chargemaps(base, extra):
@@ -696,7 +702,7 @@ class SymDMRG2:
             self._state.L,
             symmetry=str(first_data.symmetry),
             fermionic=False,
-            phys_dim=self._state_phys_dim(),
+            phys_dim=self._state_phys_sectors(),
             bond_dim=int(bond_dim),
             site_charge=charge_at,
             seed=self.sector_enrichment_seed,
@@ -766,7 +772,7 @@ class SymDMRG2:
             "copied_blocks": int(copied_blocks),
         }
 
-    def enrich_sectors(self, *, bond_dim=None, noise=None):
+    def enrich_sectors(self, *, bond_dim=None, noise=None, mode=None, sweep=None):
         """Expand Symmray MPS virtual charge maps using a random template MPS.
 
         The current tensor values are copied into the expanded block layout.
@@ -803,7 +809,8 @@ class SymDMRG2:
 
         self._clear_environments()
         diagnostic = {
-            "mode": "template",
+            "mode": "template" if mode is None else str(mode),
+            "sweep": None if sweep is None else int(sweep),
             "bond_dim": int(bond_dim),
             "noise": float(noise),
             "seed": int(self.sector_enrichment_seed),
@@ -820,6 +827,15 @@ class SymDMRG2:
         }
         self.sector_enrichment_diagnostics.append(diagnostic)
         return diagnostic
+
+    def _should_enrich_before_sweep(self, sweep):
+        if self.sector_enrichment == "none":
+            return False
+        if self.sector_enrichment == "template":
+            return int(sweep) == 0 and not self.sector_enrichment_diagnostics
+        if self.sector_enrichment == "adaptive_template":
+            return True
+        raise ValueError(f"Unknown sector_enrichment mode {self.sector_enrichment!r}.")
 
     def _dense_index_for_state_ind(self, ind):
         indices = [
@@ -1067,6 +1083,33 @@ class SymDMRG2:
         self.right_envs = right
         return left, right
 
+    def build_sweep_environments(self, direction):
+        """Build only dense environments needed for one sweep direction."""
+        if self.backend != "symmray":
+            raise ValueError("build_sweep_environments is only used by backend='symmray'.")
+        if self._state is None:
+            raise ValueError("SymDMRG2 requires init_mps before building environments.")
+
+        direction = str(direction).strip().lower()
+        bra = self._make_bra()
+        left = [None] * (self._state.L + 1)
+        right = [None] * (self._state.L + 1)
+        if direction == "right":
+            left[0] = np.asarray(1.0 + 0.0j)
+            right[self._state.L] = np.asarray(1.0 + 0.0j)
+            for site in reversed(range(self._state.L)):
+                right[site] = self._right_env_step(site, right[site + 1], bra)
+        elif direction == "left":
+            left[0] = np.asarray(1.0 + 0.0j)
+            for site in range(self._state.L):
+                left[site + 1] = self._left_env_step(site, left[site], bra)
+            right[self._state.L] = np.asarray(1.0 + 0.0j)
+        else:
+            raise ValueError("direction must be 'right' or 'left'.")
+        self.left_envs = left
+        self.right_envs = right
+        return left, right
+
     def update_left_environment(self, site):
         """Incrementally refresh the left environment through ``site``."""
         if self.left_envs is None:
@@ -1135,6 +1178,33 @@ class SymDMRG2:
             current = self._block_right_env_step(site, current, bra)
             right[site] = current
 
+        self.left_block_envs = left
+        self.right_block_envs = right
+        return left, right
+
+    def build_sweep_block_environments(self, direction):
+        """Build only block environments needed for one sweep direction."""
+        if self.backend != "symmray":
+            raise ValueError("build_sweep_block_environments is only used by backend='symmray'.")
+        if self._state is None:
+            raise ValueError("SymDMRG2 requires init_mps before building environments.")
+
+        direction = str(direction).strip().lower()
+        bra = self._make_block_bra()
+        left = [None] * (self._state.L + 1)
+        right = [None] * (self._state.L + 1)
+        if direction == "right":
+            current = None
+            for site in reversed(range(self._state.L)):
+                current = self._block_right_env_step(site, current, bra)
+                right[site] = current
+        elif direction == "left":
+            current = None
+            for site in range(self._state.L):
+                current = self._block_left_env_step(site, current, bra)
+                left[site + 1] = current
+        else:
+            raise ValueError("direction must be 'right' or 'left'.")
         self.left_block_envs = left
         self.right_block_envs = right
         return left, right
@@ -1283,6 +1353,33 @@ class SymDMRG2:
         self.right_norm_envs = right
         return left, right
 
+    def build_sweep_norm_environments(self, direction):
+        """Build only norm environments needed for one sweep direction."""
+        if self.backend != "symmray":
+            raise ValueError("build_sweep_norm_environments is only used by backend='symmray'.")
+        if self._state is None:
+            raise ValueError("SymDMRG2 requires init_mps before building norm environments.")
+
+        direction = str(direction).strip().lower()
+        bra = self._make_bra()
+        left = [None] * (self._state.L + 1)
+        right = [None] * (self._state.L + 1)
+        if direction == "right":
+            left[0] = np.asarray(1.0 + 0.0j)
+            right[self._state.L] = np.asarray(1.0 + 0.0j)
+            for site in reversed(range(self._state.L)):
+                right[site] = self._norm_right_env_step(site, right[site + 1], bra)
+        elif direction == "left":
+            left[0] = np.asarray(1.0 + 0.0j)
+            for site in range(self._state.L):
+                left[site + 1] = self._norm_left_env_step(site, left[site], bra)
+            right[self._state.L] = np.asarray(1.0 + 0.0j)
+        else:
+            raise ValueError("direction must be 'right' or 'left'.")
+        self.left_norm_envs = left
+        self.right_norm_envs = right
+        return left, right
+
     def update_left_norm_environment(self, site):
         """Incrementally refresh the left norm environment through ``site``."""
         if self.left_norm_envs is None:
@@ -1323,7 +1420,7 @@ class SymDMRG2:
             self.build_environments()
         value = complex(np.asarray(self.left_envs[self._state.L]))
         if normalized:
-            value /= self._current_norm()
+            value /= self.norm_environment_value()
         return value
 
     def two_site_theta(self, site):
@@ -2026,10 +2123,10 @@ class SymDMRG2:
 
         if canonize:
             self._canonize_for_sweep(direction)
-        self.build_environments()
-        self.build_norm_environments()
+        self.build_sweep_environments(direction)
+        self.build_sweep_norm_environments(direction)
         if self._resolved_matvec_backend() == "symmray":
-            self.build_block_environments()
+            self.build_sweep_block_environments(direction)
 
         last_energy = None
         previous_direction = self._current_sweep_direction
@@ -2056,7 +2153,28 @@ class SymDMRG2:
                         self.update_right_block_environment(site + 1)
         finally:
             self._current_sweep_direction = previous_direction
+        self._finish_sweep_direction_environments(direction)
         return last_energy
+
+    def _finish_sweep_direction_environments(self, direction):
+        if direction == "right":
+            self.update_left_environment(self._state.L - 1)
+            self.update_left_norm_environment(self._state.L - 1)
+            self.right_envs[0] = self.left_envs[self._state.L]
+            self.right_norm_envs[0] = self.left_norm_envs[self._state.L]
+            if self.left_block_envs is not None:
+                self.update_left_block_environment(self._state.L - 1)
+                self.right_block_envs[0] = self.left_block_envs[self._state.L]
+        elif direction == "left":
+            self.update_right_environment(0)
+            self.update_right_norm_environment(0)
+            self.left_envs[self._state.L] = self.right_envs[0]
+            self.left_norm_envs[self._state.L] = self.right_norm_envs[0]
+            if self.right_block_envs is not None:
+                self.update_right_block_environment(0)
+                self.left_block_envs[self._state.L] = self.right_block_envs[0]
+        else:  # pragma: no cover - private consistency check
+            raise ValueError("direction must be 'right' or 'left'.")
 
     def _solve_quimb(
         self,
@@ -2103,18 +2221,20 @@ class SymDMRG2:
             raise ValueError("SymDMRG2 backend='symmray' requires an initial MPS.")
         if self._state.L < 2:
             raise ValueError("SymDMRG2 requires an MPS with at least two sites.")
-        if self.sector_enrichment != "none" and not self.sector_enrichment_diagnostics:
-            bond_dim = self.sector_enrichment_bond_dim
-            if bond_dim is None:
-                bond_dim = chi
-            self.enrich_sectors(bond_dim=bond_dim, noise=self.sector_noise)
-
-        for _ in range(sweeps):
+        for sweep in range(sweeps):
+            if self._should_enrich_before_sweep(sweep):
+                bond_dim = self.sector_enrichment_bond_dim
+                if bond_dim is None:
+                    bond_dim = chi
+                self.enrich_sectors(
+                    bond_dim=bond_dim,
+                    noise=self.sector_noise,
+                    mode=self.sector_enrichment,
+                    sweep=sweep,
+                )
             self._symmray_sweep_direction("right", chi=chi, cutoff=cutoff)
             if self._state.L > 2:
                 self._symmray_sweep_direction("left", chi=chi, cutoff=cutoff)
-            self.build_environments()
-            self.build_norm_environments()
             self.energies.append(self.environment_energy(normalized=True).real)
             if len(self.energies) >= 2 and abs(self.energies[-1] - self.energies[-2]) < tol:
                 self.converged = True

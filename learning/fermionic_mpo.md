@@ -164,3 +164,8 @@ the interruption.
   letting the local dense/Lanczos solve optimize sectors that were absent from
   a narrow initial MPS. The L=4 FH U1U1 test now reaches the same fixed-sector
   ED energy from `bond_dim=2` initial support after enrichment.
+- Directional Symmray sweeps now prebuild only the static-side environments,
+  update the moving side after each two-site writeback, and reuse the completed
+  norm environment for normalized energy readout. `sector_enrichment="adaptive"`
+  repeats template enrichment before each sweep and preserves restricted
+  physical sector maps when building the template.
