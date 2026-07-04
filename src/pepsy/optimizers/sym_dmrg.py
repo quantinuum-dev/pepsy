@@ -1631,6 +1631,115 @@ class SymDMRG2:
             merged[charge] = max(size, merged.get(charge, 0))
         return {charge: merged[charge] for charge in sorted(merged, key=repr)}
 
+    @staticmethod
+    def _charge_zero_like(charge):
+        if isinstance(charge, tuple):
+            return tuple(0 for _ in charge)
+        return type(charge)(0)
+
+    @staticmethod
+    def _charge_add(left, right):
+        if isinstance(left, tuple) or isinstance(right, tuple):
+            left = tuple(left)
+            right = tuple(right)
+            if len(left) != len(right):
+                raise ValueError("Charge tuples must have matching lengths.")
+            return tuple(a + b for a, b in zip(left, right))
+        return left + right
+
+    @staticmethod
+    def _charge_neg(charge):
+        if isinstance(charge, tuple):
+            return tuple(-item for item in charge)
+        return -charge
+
+    @classmethod
+    def _charge_sub(cls, left, right):
+        return cls._charge_add(left, cls._charge_neg(right))
+
+    @staticmethod
+    def _is_additive_u1_symmetry(symmetry):
+        symmetry_name = str(symmetry).upper()
+        return "U1" in symmetry_name and "Z" not in symmetry_name
+
+    def _physical_sector_charges(self, site):
+        state_index = self._index_for_tensor_ind(
+            self._state[site],
+            self._site_ind(site),
+        )
+        charges = set(self._index_chargemap(state_index))
+        mpo_tensor = self.mpo[site]
+        if self._site_ind(site) in mpo_tensor.inds:
+            mpo_index = self._index_for_tensor_ind(mpo_tensor, self._site_ind(site))
+            charges.update(self._index_chargemap(mpo_index))
+        return tuple(sorted(charges, key=repr))
+
+    def _minimal_variational_bond_chargemaps(self):
+        """Return charge maps reachable from both left and right prefixes.
+
+        For the U(1)-style SymMPS convention, each site satisfies
+        ``-q_left + q_right + q_phys = site_charge``. Thus the virtual charge
+        after a prefix is the target prefix charge minus the physical prefix
+        charge. Intersecting forward-reachable and suffix-completable charges
+        gives the minimal legal charge sectors for each bond.
+        """
+        if self.backend != "symmray":
+            return None
+        if self._state.L < 2:
+            return None
+        first_data = self._state[0].data
+        if not self._is_additive_u1_symmetry(first_data.symmetry):
+            return None
+
+        site_charges = [
+            self._state[site].data.charge for site in range(self._state.L)
+        ]
+        physical_charges = [
+            self._physical_sector_charges(site) for site in range(self._state.L)
+        ]
+        if any(not charges for charges in physical_charges):
+            return None
+
+        try:
+            zero = self._charge_zero_like(site_charges[0])
+            forward = [set() for _ in range(self._state.L + 1)]
+            backward = [set() for _ in range(self._state.L + 1)]
+            forward[0].add(zero)
+            backward[self._state.L].add(zero)
+
+            for site in range(self._state.L):
+                site_charge = site_charges[site]
+                for left_charge in forward[site]:
+                    for physical_charge in physical_charges[site]:
+                        right_charge = self._charge_sub(
+                            self._charge_add(left_charge, site_charge),
+                            physical_charge,
+                        )
+                        forward[site + 1].add(right_charge)
+
+            for site in range(self._state.L - 1, -1, -1):
+                site_charge = site_charges[site]
+                for right_charge in backward[site + 1]:
+                    for physical_charge in physical_charges[site]:
+                        left_charge = self._charge_add(
+                            self._charge_sub(right_charge, site_charge),
+                            physical_charge,
+                        )
+                        backward[site].add(left_charge)
+        except (TypeError, ValueError):
+            return None
+
+        bond_maps = {}
+        for site in range(self._state.L - 1):
+            allowed = forward[site + 1] & backward[site + 1]
+            if not allowed:
+                return None
+            bond = self._state.bond(site, site + 1)
+            bond_maps[bond] = {
+                charge: 1 for charge in sorted(allowed, key=repr)
+            }
+        return bond_maps
+
     def _sector_template_state(self, bond_dim):
         from ..tensors import SymMPS  # pylint: disable=import-outside-toplevel
 
@@ -1724,6 +1833,8 @@ class SymDMRG2:
         mode,
         sweep,
         profile_phase,
+        bond_maps=None,
+        map_source="template",
     ):
         if self.backend != "symmray":
             return None
@@ -1735,7 +1846,9 @@ class SymDMRG2:
             raise ValueError("noise must be non-negative.")
 
         profile_start = self._profile_start()
-        bond_maps = self._template_bond_chargemaps(bond_dim)
+        if bond_maps is None:
+            bond_maps = self._template_bond_chargemaps(bond_dim)
+            map_source = "template"
         rng = np.random.default_rng(self.sector_enrichment_seed)
         site_diagnostics = []
         modified_tensors = 0
@@ -1765,6 +1878,7 @@ class SymDMRG2:
             "bond_dim": int(bond_dim),
             "noise": float(noise),
             "seed": int(self.sector_enrichment_seed),
+            "map_source": str(map_source),
             "bonds": {
                 bond: {
                     "num_sectors": len(chargemap),
@@ -1784,6 +1898,7 @@ class SymDMRG2:
             added_blocks=int(diagnostic["added_blocks"]),
             bond_dim=int(bond_dim),
             modified_tensors=int(modified_tensors),
+            map_source=diagnostic["map_source"],
         )
         return diagnostic
 
@@ -1828,12 +1943,16 @@ class SymDMRG2:
         a two-site solve to nucleate sectors from a narrow MPS. User-facing
         ``sector_enrichment`` remains the optional noisy/adaptive helper.
         """
+        bond_maps = self._minimal_variational_bond_chargemaps()
+        map_source = "prefix_closure" if bond_maps is not None else "template"
         diagnostic = self._expand_sector_chargemaps(
             bond_dim=max_bond,
             noise=0.0,
             mode="variational_basis",
             sweep=sweep,
             profile_phase="variational_sector_basis",
+            bond_maps=bond_maps,
+            map_source=map_source,
         )
         if diagnostic is None or diagnostic["modified_tensors"] == 0:
             return None

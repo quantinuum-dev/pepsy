@@ -31,11 +31,12 @@ encoded as long-range terms in that OBC MPO, not as a cyclic MPS. Pepsy builds
 dense left/right environments for `<psi|MPO|psi>`, block-sparse environments
 for the projected `H_eff`, and dense debug environments for `N_eff`. Before
 Symmray sweeps that are not already using explicit sector enrichment or the
-mixer's sector expansion, SymDMRG2 widens the MPS virtual charge maps with
-zero-valued, same-total-charge template sectors. Local dense/Lanczos solves
-then use a two-site variational template whose active physical legs include
-every charge-compatible local sector, so the subsequent SVD can nucleate bond
-sectors that were absent from a narrow product or low-bond initial state. By
+mixer's sector expansion, SymDMRG2 widens additive U(1)-style MPS virtual
+charge maps with the minimal zero-valued sectors reachable from both the left
+prefix and the right suffix. Local dense/Lanczos solves then use a two-site
+variational template whose active physical legs include every charge-compatible
+local sector, so the subsequent SVD can nucleate bond sectors that were absent
+from a narrow product or low-bond initial state. By
 default, Symmray `H_eff` matvecs use a block-native projected contraction;
 `matvec_backend="dense_reference"` keeps the older
 NumPy dense-aligned matvec available as a validator. During a local
@@ -86,10 +87,13 @@ generalized `H theta - E N theta`) residuals, `matvec_diagnostic_records` for
 sampled projected matvec cost metadata, `variational_sector_diagnostics` for
 automatic zero-valued sector-basis widening, and `local_solve_diagnostics` for
 the resolved dense/Lanczos solver, theta-space dimension, local energy,
-residual status, and matvec backend used at each two-site solve. For especially
-fragile narrow initial MPS sector layouts, `sector_enrichment="template"` can
-also expand virtual-bond charge maps from a same-charge random template MPS and
-seed newly valid blocks with `sector_noise` before the first sweep.
+residual status, and matvec backend used at each two-site solve. The automatic
+diagnostic records `map_source="prefix_closure"` when this minimal path is
+available, and falls back to `map_source="template"` for unsupported symmetry
+types. For especially fragile narrow initial MPS sector layouts,
+`sector_enrichment="template"` can also expand virtual-bond charge maps from a
+same-charge random template MPS and seed newly valid blocks with `sector_noise`
+before the first sweep.
 `sector_enrichment="adaptive"` repeats that template enrichment before every
 sweep, which can reintroduce valid sectors after SVD truncation prunes them.
 `sector_enrichment_diagnostics` records the added blocks and template bond

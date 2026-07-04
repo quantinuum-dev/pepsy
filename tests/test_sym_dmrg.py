@@ -1238,9 +1238,14 @@ def test_symdmrg2_nucleates_sectors_from_product_state_without_enrichment():
     assert len(opt.mixer_diagnostics) == 0
     basis = opt.variational_sector_diagnostics[0]
     assert basis["mode"] == "variational_basis"
+    assert basis["map_source"] == "prefix_closure"
     assert basis["noise"] == 0.0
     assert basis["added_blocks"] > 0
     assert basis["modified_tensors"] > 0
+    assert [
+        basis["bonds"][opt.state.bond(site, site + 1)]["num_sectors"]
+        for site in range(3)
+    ] == [4, 9, 4]
     assert opt.summary()["last_variational_sector_diagnostic"] == (
         opt.last_variational_sector_diagnostic
     )
