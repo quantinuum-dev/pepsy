@@ -78,6 +78,10 @@ def run_benchmark(
     matvec_backend="auto",
     norm_check="strict",
     norm_check_interval=1,
+    residual_check="sampled",
+    residual_check_interval=1,
+    residual_check_tol=None,
+    compute_initial_energy=False,
     include_events=False,
 ):
     """Run one benchmark and return a JSON-serializable result dict."""
@@ -106,6 +110,10 @@ def run_benchmark(
         matvec_backend=matvec_backend,
         norm_check=norm_check,
         norm_check_interval=int(norm_check_interval),
+        residual_check=residual_check,
+        residual_check_interval=int(residual_check_interval),
+        residual_check_tol=residual_check_tol,
+        compute_initial_energy=compute_initial_energy,
         profile=True,
     )
 
@@ -130,6 +138,10 @@ def run_benchmark(
             "matvec_backend": str(matvec_backend),
             "norm_check": str(norm_check),
             "norm_check_interval": int(norm_check_interval),
+            "residual_check": str(residual_check),
+            "residual_check_interval": int(residual_check_interval),
+            "residual_check_tol": residual_check_tol,
+            "compute_initial_energy": compute_initial_energy,
             "sector_enrichment": str(sector_enrichment),
             "sector_enrichment_bond_dim": sector_enrichment_bond_dim,
             "sector_noise": float(sector_noise),
@@ -142,6 +154,7 @@ def run_benchmark(
             "num_sweeps": len(opt.energies),
             "num_svd_diagnostics": len(opt.svd_diagnostics),
             "num_norm_identity_diagnostics": len(opt.norm_identity_diagnostics),
+            "num_residual_diagnostics": len(opt.residual_diagnostics),
             "num_local_solve_diagnostics": len(opt.local_solve_diagnostics),
         },
         "profile": opt.profile_summary(),
@@ -173,6 +186,10 @@ def build_arg_parser():
     parser.add_argument("--matvec-backend", default="auto")
     parser.add_argument("--norm-check", default="strict")
     parser.add_argument("--norm-check-interval", type=int, default=1)
+    parser.add_argument("--residual-check", default="sampled")
+    parser.add_argument("--residual-check-interval", type=int, default=1)
+    parser.add_argument("--residual-check-tol", type=float, default=None)
+    parser.add_argument("--compute-initial-energy", action="store_true")
     parser.add_argument("--include-events", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     return parser
@@ -200,6 +217,10 @@ def main(argv=None):
         matvec_backend=args.matvec_backend,
         norm_check=args.norm_check,
         norm_check_interval=args.norm_check_interval,
+        residual_check=args.residual_check,
+        residual_check_interval=args.residual_check_interval,
+        residual_check_tol=args.residual_check_tol,
+        compute_initial_energy=args.compute_initial_energy,
         include_events=args.include_events,
     )
     text = json.dumps(result, indent=2, sort_keys=True)

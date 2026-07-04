@@ -293,12 +293,12 @@ def _normalize_sector_enrichment(sector_enrichment):
         ) from exc
 
 
-def _normalize_norm_check(norm_check):
-    if norm_check is None or norm_check is False:
+def _normalize_check_schedule(value, *, name):
+    if value is None or value is False:
         return "off"
-    if norm_check is True:
+    if value is True:
         return "strict"
-    key = str(norm_check).strip().lower().replace("-", "_")
+    key = str(value).strip().lower().replace("-", "_")
     aliases = {
         "strict": "strict",
         "every": "strict",
@@ -323,8 +323,46 @@ def _normalize_norm_check(norm_check):
         return aliases[key]
     except KeyError as exc:
         allowed = ", ".join(sorted(aliases))
+        raise ValueError(f"Unknown {name} {value!r}. Expected one of: {allowed}.") from exc
+
+
+def _normalize_norm_check(norm_check):
+    return _normalize_check_schedule(norm_check, name="norm_check")
+
+
+def _normalize_residual_check(residual_check):
+    return _normalize_check_schedule(residual_check, name="residual_check")
+
+
+def _normalize_initial_energy_mode(compute_initial_energy):
+    if compute_initial_energy is True:
+        return "eager"
+    if compute_initial_energy is False or compute_initial_energy is None:
+        return "off"
+    key = str(compute_initial_energy).strip().lower().replace("-", "_")
+    aliases = {
+        "eager": "eager",
+        "always": "eager",
+        "on": "eager",
+        "true": "eager",
+        "yes": "eager",
+        "lazy": "lazy",
+        "deferred": "lazy",
+        "defer": "lazy",
+        "optional": "lazy",
+        "off": "off",
+        "none": "off",
+        "false": "off",
+        "no": "off",
+        "skip": "off",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
         raise ValueError(
-            f"Unknown norm_check {norm_check!r}. Expected one of: {allowed}."
+            "compute_initial_energy must be a bool or one of: "
+            f"{allowed}. Got {compute_initial_energy!r}."
         ) from exc
 
 
@@ -552,6 +590,13 @@ class SymDMRG2:
         development behavior. ``"sampled"`` checks boundary windows and every
         ``norm_check_interval``-th interior window. ``"first_sweep"`` checks
         every window during the first sweep only. ``"off"`` skips the check.
+    residual_check
+        Schedule for local residual diagnostics after each two-site solve.
+        The schedule modes match ``norm_check``. ``"off"`` avoids the extra
+        effective-Hamiltonian matvec; ``"sampled"`` is useful for benchmarks.
+    residual_check_tol
+        Optional tolerance for marking residual diagnostics as passed/failed.
+        Diagnostics are recorded but not raised as hard errors.
     matvec_backend
         Projected Hamiltonian matvec implementation for the Symmray path.
         ``"auto"`` uses the block-native Symmray contraction, while
@@ -571,6 +616,11 @@ class SymDMRG2:
     sector_noise
         Absolute random noise scale used for newly valid blocks during sector
         enrichment.
+    compute_initial_energy
+        ``True`` preserves the historical eager initial-energy estimate.
+        ``False`` skips it. ``"lazy"`` defers the estimate until
+        :attr:`initial_energy` or :attr:`energy` is first requested before any
+        sweeps have produced energies.
     """
 
     def __init__(
@@ -600,12 +650,16 @@ class SymDMRG2:
         norm_check_samples=2,
         norm_check="strict",
         norm_check_interval=1,
+        residual_check="off",
+        residual_check_interval=1,
+        residual_check_tol=None,
         matvec_backend="auto",
         sector_enrichment="none",
         sector_enrichment_bond_dim=None,
         sector_noise=0.0,
         sector_enrichment_seed=0,
         profile=False,
+        compute_initial_energy=True,
         dmrg_opts=None,
     ):
         if init_mps is None and p0 is not None:
@@ -646,6 +700,11 @@ class SymDMRG2:
         self.norm_check_samples = int(norm_check_samples)
         self.norm_check = _normalize_norm_check(norm_check)
         self.norm_check_interval = int(norm_check_interval)
+        self.residual_check = _normalize_residual_check(residual_check)
+        self.residual_check_interval = int(residual_check_interval)
+        self.residual_check_tol = (
+            None if residual_check_tol is None else float(residual_check_tol)
+        )
         self.matvec_backend = _normalize_matvec_backend(matvec_backend)
         self.sector_enrichment = _normalize_sector_enrichment(sector_enrichment)
         self.sector_enrichment_bond_dim = (
@@ -656,8 +715,15 @@ class SymDMRG2:
         self.sector_noise = float(sector_noise)
         self.sector_enrichment_seed = int(sector_enrichment_seed)
         self.profile = bool(profile)
+        self.initial_energy_mode = _normalize_initial_energy_mode(
+            compute_initial_energy
+        )
         if self.norm_check_interval < 1:
             raise ValueError("norm_check_interval must be a positive integer.")
+        if self.residual_check_interval < 1:
+            raise ValueError("residual_check_interval must be a positive integer.")
+        if self.residual_check_tol is not None and self.residual_check_tol < 0.0:
+            raise ValueError("residual_check_tol must be non-negative.")
         if self.sector_enrichment_bond_dim is not None and self.sector_enrichment_bond_dim < 1:
             raise ValueError("sector_enrichment_bond_dim must be a positive integer.")
         if self.sector_noise < 0.0:
@@ -684,7 +750,10 @@ class SymDMRG2:
         self.local_energies = []
         self.total_energies = []
         self._state = self.mps
-        self.initial_energy = self._compute_initial_energy()
+        self._initial_energy = None
+        self._initial_energy_computed = False
+        if self.initial_energy_mode == "eager":
+            self.measure_initial_energy()
         self.left_envs = None
         self.right_envs = None
         self.left_norm_envs = None
@@ -696,6 +765,7 @@ class SymDMRG2:
         self.projected_problem_cache_misses = 0
         self.svd_diagnostics = []
         self.norm_identity_diagnostics = []
+        self.residual_diagnostics = []
         self.local_solve_diagnostics = []
         self.sector_enrichment_diagnostics = []
         self.profile_diagnostics = []
@@ -719,6 +789,32 @@ class SymDMRG2:
         return self._state
 
     @property
+    def initial_energy(self):
+        """Initial energy estimate, optionally computed lazily."""
+        if (
+            not self._initial_energy_computed
+            and self.initial_energy_mode == "lazy"
+        ):
+            return self.measure_initial_energy()
+        return self._initial_energy
+
+    def measure_initial_energy(self):
+        """Compute, cache, and return the initial-state energy estimate."""
+        self._initial_energy = self._compute_initial_energy()
+        self._initial_energy_computed = True
+        return self._initial_energy
+
+    def _reported_initial_energy(self):
+        if self._initial_energy_computed:
+            return self._initial_energy
+        return None
+
+    def _reported_energy(self):
+        if self.energies:
+            return self.energies[-1]
+        return self._reported_initial_energy()
+
+    @property
     def energy(self):
         """Most recent sweep energy, falling back to the initial energy."""
         if self.energies:
@@ -738,6 +834,13 @@ class SymDMRG2:
         if not self.norm_identity_diagnostics:
             return None
         return self.norm_identity_diagnostics[-1]
+
+    @property
+    def last_residual_diagnostic(self):
+        """Most recent local residual diagnostic, if any."""
+        if not self.residual_diagnostics:
+            return None
+        return self.residual_diagnostics[-1]
 
     @property
     def last_local_solve_diagnostic(self):
@@ -813,6 +916,7 @@ class SymDMRG2:
             "phase_totals": phase_totals,
             "phase_counts": phase_counts,
             "num_matvecs": phase_counts.get("matvec", 0),
+            "num_residual_checks": phase_counts.get("residual_check", 0),
             "projected_problem_cache_hits": int(self.projected_problem_cache_hits),
             "projected_problem_cache_misses": int(self.projected_problem_cache_misses),
         }
@@ -2283,6 +2387,21 @@ class SymDMRG2:
             return (int(site) % self.norm_check_interval) == 0
         raise ValueError(f"Unknown normalized norm_check mode {mode!r}.")
 
+    def _should_run_residual_check(self, site):
+        mode = self.residual_check
+        if mode == "strict":
+            return True
+        if mode == "off":
+            return False
+        if mode == "first_sweep":
+            return len(self.energies) == 0
+        if mode == "sampled":
+            last_window = None if self._state is None else self._state.L - 2
+            if site == 0 or site == last_window:
+                return True
+            return (int(site) % self.residual_check_interval) == 0
+        raise ValueError(f"Unknown normalized residual_check mode {mode!r}.")
+
     def _record_skipped_norm_identity(self, site, *, dim=None, reason="scheduled"):
         profile_start = self._profile_start()
         diagnostic = {
@@ -2351,6 +2470,129 @@ class SymDMRG2:
             "only as an explicit diagnostic."
         )
 
+    def local_residual_norm(
+        self,
+        site,
+        theta,
+        energy,
+        *,
+        generalized=False,
+        space=None,
+    ):
+        """Return normalized local eigensolver residual for one two-site solve."""
+        space = self.two_site_theta_space(site, theta) if space is None else space
+        h_theta = self.two_site_matvec(site, theta)
+        h_vector = space.flatten(h_theta)
+        if generalized:
+            rhs_theta = self.two_site_norm_matvec(site, theta)
+            rhs_vector = space.flatten(rhs_theta)
+        else:
+            rhs_vector = space.flatten(theta)
+        residual = h_vector - complex(energy) * rhs_vector
+        denom = max(float(np.linalg.norm(rhs_vector)), 1.0)
+        return float(np.linalg.norm(residual) / denom)
+
+    def _record_skipped_residual(
+        self,
+        site,
+        *,
+        dim=None,
+        solver=None,
+        generalized=False,
+        reason="scheduled",
+    ):
+        diagnostic = {
+            "site": int(site),
+            "right_site": int(site + 1),
+            "direction": self._current_sweep_direction,
+            "theta_dim": None if dim is None else int(dim),
+            "solver": solver,
+            "residual_norm": None,
+            "tol": self.residual_check_tol,
+            "passed": None,
+            "skipped": True,
+            "mode": self.residual_check,
+            "interval": self.residual_check_interval,
+            "generalized": bool(generalized),
+            "reason": str(reason),
+        }
+        if self.residual_check != "off":
+            profile_start = self._profile_start()
+            self.residual_diagnostics.append(diagnostic)
+            self._record_profile_elapsed(
+                "residual_check",
+                profile_start,
+                site=int(site),
+                right_site=int(site + 1),
+                theta_dim=None if dim is None else int(dim),
+                solver=solver,
+                skipped=True,
+                mode=self.residual_check,
+            )
+        return diagnostic
+
+    def _check_local_residual(
+        self,
+        site,
+        theta,
+        energy,
+        *,
+        dim=None,
+        solver=None,
+        generalized=False,
+        space=None,
+    ):
+        if not self._should_run_residual_check(site):
+            reason = "off" if self.residual_check == "off" else "scheduled"
+            return self._record_skipped_residual(
+                site,
+                dim=dim,
+                solver=solver,
+                generalized=generalized,
+                reason=reason,
+            )
+
+        profile_start = self._profile_start()
+        residual_norm = self.local_residual_norm(
+            site,
+            theta,
+            energy,
+            generalized=generalized,
+            space=space,
+        )
+        passed = (
+            None
+            if self.residual_check_tol is None
+            else bool(residual_norm <= self.residual_check_tol)
+        )
+        diagnostic = {
+            "site": int(site),
+            "right_site": int(site + 1),
+            "direction": self._current_sweep_direction,
+            "theta_dim": None if dim is None else int(dim),
+            "solver": solver,
+            "residual_norm": float(residual_norm),
+            "tol": self.residual_check_tol,
+            "passed": passed,
+            "skipped": False,
+            "mode": self.residual_check,
+            "interval": self.residual_check_interval,
+            "generalized": bool(generalized),
+        }
+        self.residual_diagnostics.append(diagnostic)
+        self._record_profile_elapsed(
+            "residual_check",
+            profile_start,
+            site=int(site),
+            right_site=int(site + 1),
+            theta_dim=None if dim is None else int(dim),
+            solver=solver,
+            residual_norm=float(residual_norm),
+            skipped=False,
+            mode=self.residual_check,
+        )
+        return diagnostic
+
     def _record_local_solve_diagnostic(
         self,
         site,
@@ -2360,7 +2602,9 @@ class SymDMRG2:
         dim,
         energy,
         norm_error=None,
+        residual_diagnostic=None,
     ):
+        residual_diagnostic = residual_diagnostic or {}
         self.local_solve_diagnostics.append(
             {
                 "site": int(site),
@@ -2371,6 +2615,9 @@ class SymDMRG2:
                 "theta_dim": int(dim),
                 "energy": float(energy),
                 "norm_error": None if norm_error is None else float(norm_error),
+                "residual_norm": residual_diagnostic.get("residual_norm"),
+                "residual_check_skipped": residual_diagnostic.get("skipped"),
+                "residual_check_passed": residual_diagnostic.get("passed"),
                 "matvec_backend": self._resolved_matvec_backend(),
             }
         )
@@ -2401,12 +2648,22 @@ class SymDMRG2:
                 theta_dim=int(dim),
                 energy=float(energy),
             )
+            residual_diagnostic = self._check_local_residual(
+                site,
+                theta_opt,
+                energy,
+                dim=dim,
+                solver="generalized_dense",
+                generalized=True,
+                space=space,
+            )
             self._record_local_solve_diagnostic(
                 site,
                 solver="generalized_dense",
                 requested_solver=requested_solver,
                 dim=dim,
                 energy=energy,
+                residual_diagnostic=residual_diagnostic,
             )
             self._record_profile_elapsed(
                 "local_solve",
@@ -2416,6 +2673,7 @@ class SymDMRG2:
                 solver="generalized_dense",
                 theta_dim=int(dim),
                 energy=float(energy),
+                residual_norm=residual_diagnostic.get("residual_norm"),
             )
             return energy, theta_opt
 
@@ -2443,6 +2701,15 @@ class SymDMRG2:
             theta_dim=int(dim),
             energy=float(energy),
         )
+        residual_diagnostic = self._check_local_residual(
+            site,
+            theta_opt,
+            energy,
+            dim=dim,
+            solver=solver_used,
+            generalized=False,
+            space=space,
+        )
         self._record_local_solve_diagnostic(
             site,
             solver=solver_used,
@@ -2450,6 +2717,7 @@ class SymDMRG2:
             dim=dim,
             energy=energy,
             norm_error=norm_error,
+            residual_diagnostic=residual_diagnostic,
         )
         self._record_profile_elapsed(
             "local_solve",
@@ -2460,6 +2728,7 @@ class SymDMRG2:
             theta_dim=int(dim),
             energy=float(energy),
             norm_error=None if norm_error is None else float(norm_error),
+            residual_norm=residual_diagnostic.get("residual_norm"),
         )
         return energy, theta_opt
 
@@ -3013,6 +3282,9 @@ class SymDMRG2:
             "norm_check_samples": self.norm_check_samples,
             "norm_check": self.norm_check,
             "norm_check_interval": self.norm_check_interval,
+            "residual_check": self.residual_check,
+            "residual_check_interval": self.residual_check_interval,
+            "residual_check_tol": self.residual_check_tol,
             "matvec_backend": self.matvec_backend,
             "resolved_matvec_backend": self._resolved_matvec_backend(),
             "sector_enrichment": self.sector_enrichment,
@@ -3024,8 +3296,10 @@ class SymDMRG2:
             "projected_problem_cache_misses": int(self.projected_problem_cache_misses),
             "sweeps": self.sweeps,
             "total_charge": self.total_charge,
-            "initial_energy": self.initial_energy,
-            "energy": self.energy,
+            "initial_energy_mode": self.initial_energy_mode,
+            "initial_energy_computed": self._initial_energy_computed,
+            "initial_energy": self._reported_initial_energy(),
+            "energy": self._reported_energy(),
             "converged": self.converged,
             "num_local_energy_sweeps": len(self.local_energies),
             "num_total_energy_sweeps": len(self.total_energies),
@@ -3034,6 +3308,8 @@ class SymDMRG2:
             "compression_summary": self.compression_summary(),
             "num_norm_identity_diagnostics": len(self.norm_identity_diagnostics),
             "last_norm_identity_diagnostic": self.last_norm_identity_diagnostic,
+            "num_residual_diagnostics": len(self.residual_diagnostics),
+            "last_residual_diagnostic": self.last_residual_diagnostic,
             "num_local_solve_diagnostics": len(self.local_solve_diagnostics),
             "last_local_solve_diagnostic": self.last_local_solve_diagnostic,
             "num_sector_enrichment_diagnostics": len(self.sector_enrichment_diagnostics),

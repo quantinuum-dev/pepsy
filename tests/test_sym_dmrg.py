@@ -160,6 +160,60 @@ def test_symdmrg2_solves_two_site_symmray_fh_u1u1_dense_reference():
     assert opt.energy <= ref_energy.real
 
 
+def test_symdmrg2_initial_energy_can_be_disabled_or_lazy(monkeypatch):
+    """Startup energy measurement should be optional or deferred."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(2, [(1, 0), (0, 1)])
+
+    def raise_if_called(*_args, **_kwargs):
+        raise AssertionError("initial energy should not be computed")
+
+    monkeypatch.setattr(pepsy.SymDMRG2, "_compute_initial_energy", raise_if_called)
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        compute_initial_energy=False,
+    )
+
+    assert opt.initial_energy is None
+    assert opt.energy is None
+    assert opt.summary()["initial_energy_mode"] == "off"
+    assert opt.summary()["initial_energy_computed"] is False
+    assert opt.summary()["initial_energy"] is None
+    assert opt.summary()["energy"] is None
+
+    calls = []
+
+    def fake_initial_energy(self):
+        calls.append(self)
+        return -1.25
+
+    state, mpo = _fh_u1u1_chain(2, [(1, 0), (0, 1)])
+    monkeypatch.setattr(pepsy.SymDMRG2, "_compute_initial_energy", fake_initial_energy)
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        compute_initial_energy="lazy",
+    )
+
+    assert calls == []
+    assert opt.summary()["initial_energy_mode"] == "lazy"
+    assert opt.summary()["initial_energy_computed"] is False
+    assert opt.summary()["initial_energy"] is None
+    assert opt.summary()["energy"] is None
+    assert calls == []
+    assert opt.initial_energy == pytest.approx(-1.25)
+    assert opt.energy == pytest.approx(-1.25)
+    assert len(calls) == 1
+    assert opt.summary()["initial_energy_computed"] is True
+
+
 def test_symdmrg2_solves_longer_chain_with_effective_norm():
     """L>2 uses H and N environments for a safe dense reference sweep."""
     pytest.importorskip("symmray")
@@ -363,11 +417,18 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     assert result["case"]["length"] == 2
     assert result["case"]["norm_check"] == "strict"
     assert result["case"]["norm_check_interval"] == 1
+    assert result["case"]["residual_check"] == "sampled"
+    assert result["case"]["residual_check_interval"] == 1
+    assert result["case"]["residual_check_tol"] is None
+    assert result["case"]["compute_initial_energy"] is False
     assert result["result"]["num_sweeps"] == 1
     assert isinstance(result["result"]["energy"], float)
+    assert result["result"]["num_residual_diagnostics"] == 1
     assert result["profile"]["enabled"]
     assert result["profile"]["num_events"] == len(result["profile_events"])
     assert result["profile"]["phase_counts"]["sweep"] == 1
+    assert result["profile"]["phase_counts"]["residual_check"] == 1
+    assert result["profile"]["num_residual_checks"] == 1
     assert result["profile"]["num_matvecs"] >= 1
     assert result["compression"]["num_splits"] == result["result"]["num_svd_diagnostics"]
     assert result["compression"]["max_bond_dim"] <= 3
@@ -433,6 +494,51 @@ def test_symdmrg2_sampled_norm_check_checks_boundaries_and_skips_interval():
     assert by_site[2]["error"] is not None
     assert {diag["mode"] for diag in by_site.values()} == {"sampled"}
     assert opt.summary()["norm_check_interval"] == 2
+
+
+def test_symdmrg2_sampled_residual_check_records_boundaries_and_interval():
+    """Sampled residuals should catch local eigensolver correctness cheaply."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        residual_check="sampled",
+        residual_check_interval=2,
+        residual_check_tol=1e-8,
+    )
+    opt.solve(max_sweeps=1, sweep_sequence="R")
+
+    by_site = {diag["site"]: diag for diag in opt.residual_diagnostics}
+    by_local_site = {diag["site"]: diag for diag in opt.local_solve_diagnostics}
+
+    assert set(by_site) == {0, 1, 2}
+    assert not by_site[0]["skipped"]
+    assert by_site[1]["skipped"]
+    assert not by_site[2]["skipped"]
+    assert by_site[0]["residual_norm"] < 1e-8
+    assert by_site[1]["residual_norm"] is None
+    assert by_site[2]["residual_norm"] < 1e-8
+    assert by_site[0]["passed"] is True
+    assert by_site[1]["passed"] is None
+    assert by_site[2]["passed"] is True
+    assert {diag["mode"] for diag in by_site.values()} == {"sampled"}
+    assert opt.summary()["residual_check_interval"] == 2
+    assert opt.summary()["num_residual_diagnostics"] == len(opt.residual_diagnostics)
+    assert opt.summary()["last_residual_diagnostic"] == opt.last_residual_diagnostic
+    assert by_local_site[0]["residual_norm"] == pytest.approx(
+        by_site[0]["residual_norm"]
+    )
+    assert by_local_site[1]["residual_check_skipped"] is True
+    assert by_local_site[2]["residual_check_passed"] is True
 
 
 def test_symdmrg2_linear_operator_matches_dense_effective_hamiltonian():

@@ -18,7 +18,10 @@ For scale studies, `profile=True` enables JSON-friendly profiling events in
 by phase, including canonicalization, environment setup/update, norm checks,
 local eigensolves, `H_eff` matvecs, SVD splits, enrichment, sweeps, and solves.
 The development harness `benchmarks/symdmrg2_fh_u1u1.py` runs deterministic
-open-chain Fermi-Hubbard U1U1 cases and emits this profiling data as JSON.
+open-chain Fermi-Hubbard U1U1 cases and emits this profiling data as JSON. By
+default the benchmark skips the startup `initial_energy` estimate and samples
+local residual diagnostics, so runs spend their extra correctness budget on the
+two-site solves being timed.
 
 For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain. Periodic
 lattice edges should be encoded as long-range terms in that OBC MPO, not as a
@@ -42,9 +45,15 @@ every `norm_check_interval`-th interior window, `norm_check="first_sweep"`
 checks only the first sweep, and `norm_check="off"` skips this expensive
 debug assertion. Skipped checks are still recorded in
 `norm_identity_diagnostics` with `skipped=True` so benchmark logs remain
-auditable. Sweep setup builds only the static side environments needed for the
-current direction, updates the moving side incrementally after each two-site
-writeback, and reuses the completed norm environments for normalized energies.
+auditable. `residual_check` accepts the same schedule modes and records
+normalized local eigensolver residuals in `residual_diagnostics` without
+raising by default; `residual_check_tol` marks diagnostics as passed/failed
+when supplied. `compute_initial_energy=True` preserves the historical eager
+startup estimate, `False` skips it, and `"lazy"` defers it until the
+`initial_energy` or pre-sweep `energy` property is requested. Sweep setup
+builds only the static side environments needed for the current direction,
+updates the moving side incrementally after each two-site writeback, and
+reuses the completed norm environments for normalized energies.
 Every Symmray two-site writeback records an entry in
 `svd_diagnostics`, including the split direction, bond name, `chi`, cutoff,
 truncation error when reported by the split backend, and the left/right charge
@@ -53,9 +62,11 @@ records into maximum kept bond dimensions and maximum/summed truncation error,
 matching the kind of compression health metrics used by mature MPS workflows.
 `last_svd_diagnostic` exposes the most recent entry. The Symmray path also
 records `norm_identity_diagnostics` for the per-window `N_eff ~= I` canonical
-check and `local_solve_diagnostics` for the resolved dense/Lanczos solver,
-theta-space dimension, local energy, and matvec backend used at each two-site
-solve. For narrow initial MPS sector layouts, `sector_enrichment="template"`
+check, `residual_diagnostics` for scheduled `H theta - E theta` (or
+generalized `H theta - E N theta`) residuals, and `local_solve_diagnostics`
+for the resolved dense/Lanczos solver, theta-space dimension, local energy,
+residual status, and matvec backend used at each two-site solve. For narrow
+initial MPS sector layouts, `sector_enrichment="template"`
 can expand virtual-bond charge maps from a same-charge random template MPS and
 seed newly valid blocks with `sector_noise` before the first sweep.
 `sector_enrichment="adaptive"` repeats that template enrichment before every
