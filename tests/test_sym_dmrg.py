@@ -1338,6 +1338,47 @@ def test_symdmrg2_adaptive_sector_enrichment_runs_each_sweep():
     } == {"adaptive_template"}
 
 
+def test_symdmrg2_adaptive_enrichment_forces_canonize_on_alternating_sweep(monkeypatch):
+    """A pre-sweep sector expansion invalidates the alternating-sweep center."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        3,
+        [(1, 0), (0, 1), (1, 0)],
+        bond_dim=2,
+        seed=38,
+        U=1.0,
+        mu=0.1,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=6,
+        cutoff=1e-10,
+        sweeps=2,
+        sector_enrichment="adaptive",
+        sector_enrichment_bond_dim=5,
+        sector_noise=0.0,
+    )
+    canonize_flags = []
+    enrichment_sweeps = []
+
+    def fake_enrich_sectors(*, bond_dim, noise, mode, sweep):
+        enrichment_sweeps.append(sweep)
+        return {"bond_dim": bond_dim, "noise": noise, "mode": mode, "sweep": sweep}
+
+    def fake_sweep(direction, canonize=True, **kwargs):
+        canonize_flags.append((direction, canonize))
+        return -1.0 - len(canonize_flags)
+
+    monkeypatch.setattr(opt, "enrich_sectors", fake_enrich_sectors)
+    monkeypatch.setattr(opt, "sweep", fake_sweep)
+    opt.solve(max_sweeps=2, sweep_sequence="RL", tol=0.0)
+
+    assert enrichment_sweeps == [0, 1]
+    assert canonize_flags == [("R", True), ("L", True)]
+
+
 def test_symdmrg2_lanczos_stress_obc_six_site_chain_tracks_svd_sectors():
     """A longer forced-Lanczos OBC sweep should keep auditable SVD sectors."""
     pytest.importorskip("symmray")

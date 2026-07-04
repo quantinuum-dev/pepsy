@@ -3805,17 +3805,21 @@ class SymDMRG2:
                     bond_dim = self.sector_enrichment_bond_dim
                     if bond_dim is None:
                         bond_dim = max_bond
-                    self.enrich_sectors(
+                    enrichment_diagnostic = self.enrich_sectors(
                         bond_dim=bond_dim,
                         noise=self.sector_noise,
                         mode=self.sector_enrichment,
                         sweep=sweep_num,
                     )
+                else:
+                    enrichment_diagnostic = None
                 if self._should_apply_mixer(sweep_num):
-                    self._prepare_mixer_sweep(
+                    mixer_diagnostic = self._prepare_mixer_sweep(
                         sweep=sweep_num,
                         max_bond=max_bond,
                     )
+                else:
+                    mixer_diagnostic = None
 
                 self._print_pre_sweep(
                     sweep_num,
@@ -3824,10 +3828,13 @@ class SymDMRG2:
                     cutoff,
                     verbosity=verbosity,
                 )
+                pre_sweep_mutated = (
+                    enrichment_diagnostic is not None
+                    or mixer_diagnostic is not None
+                )
                 canonize = (
-                    False
-                    if direction + previous_direction in {"LR", "RL"}
-                    else True
+                    pre_sweep_mutated
+                    or direction + previous_direction not in {"LR", "RL"}
                 )
                 convergence_offsets = self._sweep_convergence_offsets()
                 if suppress_warnings:
