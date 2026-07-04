@@ -420,12 +420,18 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     assert result["case"]["residual_check"] == "sampled"
     assert result["case"]["residual_check_interval"] == 1
     assert result["case"]["residual_check_tol"] is None
+    assert result["case"]["matvec_diagnostics"] == "sampled"
+    assert result["case"]["matvec_diagnostics_interval"] == 1
     assert result["case"]["compute_initial_energy"] is False
     assert result["result"]["num_sweeps"] == 1
     assert isinstance(result["result"]["energy"], float)
     assert result["result"]["num_residual_diagnostics"] == 1
+    assert result["result"]["num_matvec_diagnostics"] == result["profile"]["num_matvecs"]
     assert result["profile"]["enabled"]
     assert result["profile"]["num_events"] == len(result["profile_events"])
+    assert result["profile"]["num_matvec_diagnostics"] == len(
+        result["matvec_diagnostics"]
+    )
     assert result["profile"]["phase_counts"]["sweep"] == 1
     assert result["profile"]["phase_counts"]["residual_check"] == 1
     assert result["profile"]["num_residual_checks"] == 1
@@ -665,6 +671,65 @@ def test_symdmrg2_block_native_matvec_reuses_projected_problem_cache(monkeypatch
     for sector in theta.data.blocks:
         assert native_a.data.blocks[sector] == pytest.approx(dense_a.data.blocks[sector])
         assert native_b.data.blocks[sector] == pytest.approx(dense_b.data.blocks[sector])
+
+
+def test_symdmrg2_matvec_diagnostics_record_cache_and_projector_stats():
+    """Sampled matvec records should explain cached block-native matvec cost."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+        seed=31,
+        U=1.25,
+        mu=0.05,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        matvec_backend="symmray",
+        matvec_diagnostics="strict",
+        profile=True,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_block_environments()
+
+    site = 1
+    theta = opt.two_site_theta(site)
+    space = opt.two_site_theta_space(site, theta)
+    rng = np.random.default_rng(43)
+    trial_a = space.unflatten(
+        rng.standard_normal(space.dim) + 1.0j * rng.standard_normal(space.dim)
+    )
+    trial_b = space.unflatten(
+        rng.standard_normal(space.dim) + 1.0j * rng.standard_normal(space.dim)
+    )
+
+    opt.two_site_matvec(site, trial_a)
+    opt.two_site_matvec(site, trial_b)
+
+    first, second = opt.matvec_diagnostic_records
+
+    assert len(opt.matvec_diagnostic_records) == 2
+    assert first["projected_problem_cache_hit"] is False
+    assert second["projected_problem_cache_hit"] is True
+    assert first["theta_dim"] == space.dim
+    assert first["theta_num_blocks"] == len(theta.data.blocks)
+    assert first["matvec_num_contractions"] == 2
+    assert first["projected_block_terms"] > 0
+    assert first["left_projector_num_blocks"] > 0
+    assert first["right_projector_num_blocks"] > 0
+    assert first["right_contract_shared_inds"] >= 1
+    assert first["left_contract_shared_inds"] >= 1
+    assert first["elapsed"] >= 0.0
+    assert opt.summary()["num_matvec_diagnostics"] == 2
+    assert opt.summary()["last_matvec_diagnostic"] == opt.last_matvec_diagnostic
+    assert opt.profile_summary()["num_matvec_diagnostics"] == 2
 
 
 def test_symdmrg2_dense_reference_matvec_backend_remains_selectable():

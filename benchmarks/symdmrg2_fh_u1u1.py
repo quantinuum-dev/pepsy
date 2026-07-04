@@ -81,6 +81,8 @@ def run_benchmark(
     residual_check="sampled",
     residual_check_interval=1,
     residual_check_tol=None,
+    matvec_diagnostics="sampled",
+    matvec_diagnostics_interval=1,
     compute_initial_energy=False,
     include_events=False,
 ):
@@ -113,6 +115,8 @@ def run_benchmark(
         residual_check=residual_check,
         residual_check_interval=int(residual_check_interval),
         residual_check_tol=residual_check_tol,
+        matvec_diagnostics=matvec_diagnostics,
+        matvec_diagnostics_interval=int(matvec_diagnostics_interval),
         compute_initial_energy=compute_initial_energy,
         profile=True,
     )
@@ -141,6 +145,8 @@ def run_benchmark(
             "residual_check": str(residual_check),
             "residual_check_interval": int(residual_check_interval),
             "residual_check_tol": residual_check_tol,
+            "matvec_diagnostics": str(matvec_diagnostics),
+            "matvec_diagnostics_interval": int(matvec_diagnostics_interval),
             "compute_initial_energy": compute_initial_energy,
             "sector_enrichment": str(sector_enrichment),
             "sector_enrichment_bond_dim": sector_enrichment_bond_dim,
@@ -155,6 +161,7 @@ def run_benchmark(
             "num_svd_diagnostics": len(opt.svd_diagnostics),
             "num_norm_identity_diagnostics": len(opt.norm_identity_diagnostics),
             "num_residual_diagnostics": len(opt.residual_diagnostics),
+            "num_matvec_diagnostics": len(opt.matvec_diagnostic_records),
             "num_local_solve_diagnostics": len(opt.local_solve_diagnostics),
         },
         "profile": opt.profile_summary(),
@@ -162,6 +169,7 @@ def run_benchmark(
     }
     if include_events:
         result["profile_events"] = list(opt.profile_diagnostics)
+        result["matvec_diagnostics"] = list(opt.matvec_diagnostic_records)
     return result
 
 
@@ -189,6 +197,8 @@ def build_arg_parser():
     parser.add_argument("--residual-check", default="sampled")
     parser.add_argument("--residual-check-interval", type=int, default=1)
     parser.add_argument("--residual-check-tol", type=float, default=None)
+    parser.add_argument("--matvec-diagnostics", default="sampled")
+    parser.add_argument("--matvec-diagnostics-interval", type=int, default=1)
     parser.add_argument("--compute-initial-energy", action="store_true")
     parser.add_argument("--include-events", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
@@ -220,6 +230,8 @@ def main(argv=None):
         residual_check=args.residual_check,
         residual_check_interval=args.residual_check_interval,
         residual_check_tol=args.residual_check_tol,
+        matvec_diagnostics=args.matvec_diagnostics,
+        matvec_diagnostics_interval=args.matvec_diagnostics_interval,
         compute_initial_energy=args.compute_initial_energy,
         include_events=args.include_events,
     )

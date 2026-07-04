@@ -425,6 +425,107 @@ class _ThetaSpace:
         return _tensor_with_data(self.theta, data)
 
 
+class _BlockPairContraction:
+    """Precomputed index routing for one static-left block contraction."""
+
+    def __init__(self, optimizer, left, right_inds):
+        self.optimizer = optimizer
+        self.left = left
+        self.left_inds = tuple(left.inds)
+        self.right_inds = tuple(right_inds)
+        self.shared = tuple(ind for ind in self.left_inds if ind in self.right_inds)
+        self.reindex_map = {}
+        self.trace_pairs = []
+
+        if not self.shared:
+            self.left_axis = None
+            self.right_axis = None
+            self.contract_output_inds = self.left_inds + self.right_inds
+            self.output_inds = self.contract_output_inds
+            return
+
+        first, *remaining = self.shared
+        for num, ind in enumerate(remaining):
+            temp_ind = f"{ind}__symdmrg_rhs{num}"
+            self.reindex_map[ind] = temp_ind
+            self.trace_pairs.append((ind, temp_ind))
+
+        right_work_inds = tuple(
+            self.reindex_map.get(ind, ind) for ind in self.right_inds
+        )
+        self.left_axis = self.left_inds.index(first)
+        self.right_axis = right_work_inds.index(first)
+        self.contract_output_inds = (
+            tuple(
+                ind for axis, ind in enumerate(self.left_inds)
+                if axis != self.left_axis
+            )
+            + tuple(
+                ind for axis, ind in enumerate(right_work_inds)
+                if axis != self.right_axis
+            )
+        )
+        self.output_inds = self._output_after_traces(
+            self.contract_output_inds,
+            self.trace_pairs,
+        )
+
+    @staticmethod
+    def _output_after_traces(output_inds, trace_pairs):
+        output = list(output_inds)
+        for ind, temp_ind in trace_pairs:
+            axis_a = output.index(ind)
+            axis_b = output.index(temp_ind)
+            for axis in sorted((axis_a, axis_b), reverse=True):
+                output.pop(axis)
+        return tuple(output)
+
+    def apply(self, right):
+        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+        if tuple(right.inds) != self.right_inds:
+            raise ValueError("Right tensor indices changed for cached block contraction.")
+        if not self.shared:
+            data = self.left.data.tensordot(
+                right.data,
+                axes=((), ()),
+                mode="blockwise",
+                preserve_array=True,
+            )
+            return qtn.Tensor(
+                data=data,
+                inds=self.contract_output_inds,
+                tags=self.left.tags | right.tags,
+            )
+
+        right_work = (
+            right.reindex(self.reindex_map, inplace=False)
+            if self.reindex_map
+            else right
+        )
+        data = self.left.data.tensordot(
+            right_work.data,
+            axes=((self.left_axis,), (self.right_axis,)),
+            mode="blockwise",
+            preserve_array=True,
+        )
+        out = qtn.Tensor(
+            data=data,
+            inds=self.contract_output_inds,
+            tags=self.left.tags | right.tags,
+        )
+        for ind, temp_ind in self.trace_pairs:
+            out = self.optimizer._trace_block_tensor_inds(out, ind, temp_ind)
+        return out
+
+    def summary(self, prefix):
+        return {
+            f"{prefix}_shared_inds": len(self.shared),
+            f"{prefix}_trace_pairs": len(self.trace_pairs),
+            f"{prefix}_reindexed_inds": len(self.reindex_map),
+        }
+
+
 class _LocalProjectedProblem:
     """Cached static tensors for one two-site projected Hamiltonian."""
 
@@ -460,6 +561,18 @@ class _LocalProjectedProblem:
             if right_env is not None
             else w_right
         )
+        theta_input_inds = tuple(self.input_map.get(ind, ind) for ind in self.inds)
+        self.right_contraction = _BlockPairContraction(
+            optimizer,
+            self.right_projector,
+            theta_input_inds,
+        )
+        self.left_contraction = _BlockPairContraction(
+            optimizer,
+            self.left_projector,
+            self.right_contraction.output_inds,
+        )
+        self.summary_data = self._make_summary()
 
     @staticmethod
     def _block_layout(theta):
@@ -486,8 +599,8 @@ class _LocalProjectedProblem:
 
     def apply(self, theta):
         theta_in = theta.reindex(self.input_map, inplace=False)
-        out = self.optimizer._contract_block_pair(self.right_projector, theta_in)
-        out = self.optimizer._contract_block_pair(self.left_projector, out)
+        out = self.right_contraction.apply(theta_in)
+        out = self.left_contraction.apply(out)
         out = out.transpose(*self.inds)
 
         blocks = {}
@@ -499,14 +612,43 @@ class _LocalProjectedProblem:
         data = _array_with_blocks_like(theta.data, blocks)
         return _tensor_with_data(theta, data)
 
-    def summary(self):
+    @staticmethod
+    def _tensor_block_stats(tensor, prefix):
+        blocks = getattr(getattr(tensor, "data", None), "blocks", {})
+        dim = 0
+        max_block_size = 0
+        for block in blocks.values():
+            shape = getattr(block, "shape", ())
+            size = int(np.prod(shape, dtype=np.int64)) if shape else 1
+            dim += size
+            max_block_size = max(max_block_size, size)
         return {
+            f"{prefix}_num_blocks": len(blocks),
+            f"{prefix}_dim": int(dim),
+            f"{prefix}_max_block_size": int(max_block_size),
+        }
+
+    def _make_summary(self):
+        summary = {
             "site": self.site,
             "right_site": self.right_site,
             "has_left_env": self.has_left_env,
             "has_right_env": self.has_right_env,
             "theta_num_blocks": len(self.block_layout),
+            "matvec_num_contractions": 2,
         }
+        summary.update(self._tensor_block_stats(self.left_projector, "left_projector"))
+        summary.update(self._tensor_block_stats(self.right_projector, "right_projector"))
+        summary.update(self.right_contraction.summary("right_contract"))
+        summary.update(self.left_contraction.summary("left_contract"))
+        summary["projected_block_terms"] = (
+            summary["left_projector_num_blocks"]
+            + summary["right_projector_num_blocks"]
+        )
+        return summary
+
+    def summary(self):
+        return dict(self.summary_data)
 
 
 class _SymmrayEffectiveHamiltonian(LinearOperator):
@@ -602,6 +744,10 @@ class SymDMRG2:
         ``"auto"`` uses the block-native Symmray contraction, while
         ``"dense_reference"`` keeps the older NumPy dense-aligned contraction
         as an explicit fallback and validator.
+    matvec_diagnostics
+        Schedule for recording sampled ``H_eff`` matvec timing and projected
+        problem shape metadata. The schedule modes match ``norm_check``.
+        ``"off"`` keeps only lightweight profile events.
     sector_enrichment
         Optional Symmray convergence helper. ``"template"`` expands each MPS
         virtual bond's charge map using a same-charge random template MPS before
@@ -654,6 +800,8 @@ class SymDMRG2:
         residual_check_interval=1,
         residual_check_tol=None,
         matvec_backend="auto",
+        matvec_diagnostics="off",
+        matvec_diagnostics_interval=1,
         sector_enrichment="none",
         sector_enrichment_bond_dim=None,
         sector_noise=0.0,
@@ -706,6 +854,11 @@ class SymDMRG2:
             None if residual_check_tol is None else float(residual_check_tol)
         )
         self.matvec_backend = _normalize_matvec_backend(matvec_backend)
+        self.matvec_diagnostics = _normalize_check_schedule(
+            matvec_diagnostics,
+            name="matvec_diagnostics",
+        )
+        self.matvec_diagnostics_interval = int(matvec_diagnostics_interval)
         self.sector_enrichment = _normalize_sector_enrichment(sector_enrichment)
         self.sector_enrichment_bond_dim = (
             None
@@ -724,6 +877,8 @@ class SymDMRG2:
             raise ValueError("residual_check_interval must be a positive integer.")
         if self.residual_check_tol is not None and self.residual_check_tol < 0.0:
             raise ValueError("residual_check_tol must be non-negative.")
+        if self.matvec_diagnostics_interval < 1:
+            raise ValueError("matvec_diagnostics_interval must be a positive integer.")
         if self.sector_enrichment_bond_dim is not None and self.sector_enrichment_bond_dim < 1:
             raise ValueError("sector_enrichment_bond_dim must be a positive integer.")
         if self.sector_noise < 0.0:
@@ -761,11 +916,14 @@ class SymDMRG2:
         self.left_block_envs = None
         self.right_block_envs = None
         self._projected_problem_cache = None
+        self._last_matvec_projected_problem = None
+        self._last_matvec_cache_hit = None
         self.projected_problem_cache_hits = 0
         self.projected_problem_cache_misses = 0
         self.svd_diagnostics = []
         self.norm_identity_diagnostics = []
         self.residual_diagnostics = []
+        self.matvec_diagnostic_records = []
         self.local_solve_diagnostics = []
         self.sector_enrichment_diagnostics = []
         self.profile_diagnostics = []
@@ -843,6 +1001,13 @@ class SymDMRG2:
         return self.residual_diagnostics[-1]
 
     @property
+    def last_matvec_diagnostic(self):
+        """Most recent sampled matvec diagnostic, if any."""
+        if not self.matvec_diagnostic_records:
+            return None
+        return self.matvec_diagnostic_records[-1]
+
+    @property
     def last_local_solve_diagnostic(self):
         """Most recent two-site local solver diagnostic, if any."""
         if not self.local_solve_diagnostics:
@@ -916,6 +1081,7 @@ class SymDMRG2:
             "phase_totals": phase_totals,
             "phase_counts": phase_counts,
             "num_matvecs": phase_counts.get("matvec", 0),
+            "num_matvec_diagnostics": len(self.matvec_diagnostic_records),
             "num_residual_checks": phase_counts.get("residual_check", 0),
             "projected_problem_cache_hits": int(self.projected_problem_cache_hits),
             "projected_problem_cache_misses": int(self.projected_problem_cache_misses),
@@ -2015,7 +2181,7 @@ class SymDMRG2:
         problem = self._projected_problem_cache
         if problem is not None and problem.matches(site, theta):
             self.projected_problem_cache_hits += 1
-            return problem
+            return problem, True
 
         profile_start = self._profile_start()
         problem = _LocalProjectedProblem(self, site, theta)
@@ -2026,12 +2192,15 @@ class SymDMRG2:
             profile_start,
             **problem.summary(),
         )
-        return problem
+        return problem, False
 
     def two_site_matvec_symmray(self, site, theta=None):
         """Apply ``H_eff`` using Symmray block contractions."""
         theta = self.two_site_theta(site) if theta is None else theta
-        return self._get_projected_problem(site, theta).apply(theta)
+        problem, cache_hit = self._get_projected_problem(site, theta)
+        self._last_matvec_projected_problem = problem
+        self._last_matvec_cache_hit = cache_hit
+        return problem.apply(theta)
 
     def _matvec_dense(self, site, theta_dense):
         if self.left_envs is None or self.right_envs is None:
@@ -2135,6 +2304,43 @@ class SymDMRG2:
             return "symmray" if self.backend == "symmray" else "dense_reference"
         return self.matvec_backend
 
+    def _should_record_matvec_diagnostic(self, site):
+        mode = self.matvec_diagnostics
+        if mode == "strict":
+            return True
+        if mode == "off":
+            return False
+        if mode == "first_sweep":
+            return len(self.energies) == 0
+        if mode == "sampled":
+            last_window = None if self._state is None else self._state.L - 2
+            if site == 0 or site == last_window:
+                return True
+            return (int(site) % self.matvec_diagnostics_interval) == 0
+        raise ValueError(f"Unknown normalized matvec_diagnostics mode {mode!r}.")
+
+    def _record_matvec_diagnostic(
+        self,
+        site,
+        *,
+        elapsed,
+        metadata,
+    ):
+        if not self._should_record_matvec_diagnostic(site):
+            return None
+        diagnostic = {
+            "site": int(site),
+            "right_site": int(site + 1),
+            "direction": self._current_sweep_direction,
+            "sweep": len(self.energies),
+            "elapsed": None if elapsed is None else float(elapsed),
+            "mode": self.matvec_diagnostics,
+            "interval": self.matvec_diagnostics_interval,
+        }
+        diagnostic.update(metadata)
+        self.matvec_diagnostic_records.append(diagnostic)
+        return diagnostic
+
     def two_site_matvec(self, site, theta=None):
         """Apply the two-site effective Hamiltonian to ``theta``.
 
@@ -2145,7 +2351,14 @@ class SymDMRG2:
         """
         backend = self._resolved_matvec_backend()
         profile_start = self._profile_start()
+        diagnostic_start = (
+            time.perf_counter()
+            if self.matvec_diagnostics != "off"
+            else None
+        )
         theta_input = self.two_site_theta(site) if theta is None else theta
+        self._last_matvec_projected_problem = None
+        self._last_matvec_cache_hit = None
         try:
             if backend == "symmray":
                 return self.two_site_matvec_symmray(site, theta_input)
@@ -2153,13 +2366,37 @@ class SymDMRG2:
                 return self.two_site_matvec_dense_reference(site, theta_input)
             raise ValueError(f"Unknown resolved matvec backend {backend!r}.")
         finally:
-            self._record_profile_elapsed(
+            metadata = {
+                "site": int(site),
+                "right_site": int(site + 1),
+                "matvec_backend": backend,
+                **self._tensor_block_stats(theta_input),
+            }
+            diagnostic_metadata = dict(metadata)
+            problem = self._last_matvec_projected_problem
+            if problem is not None and self._should_record_matvec_diagnostic(site):
+                diagnostic_metadata.update(problem.summary())
+                diagnostic_metadata["projected_problem_cache_hit"] = bool(
+                    self._last_matvec_cache_hit
+                )
+            profile_entry = self._record_profile_elapsed(
                 "matvec",
                 profile_start,
-                site=int(site),
-                right_site=int(site + 1),
-                matvec_backend=backend,
-                **self._tensor_block_stats(theta_input),
+                **metadata,
+            )
+            elapsed = (
+                profile_entry["elapsed"]
+                if profile_entry is not None
+                else (
+                    time.perf_counter() - diagnostic_start
+                    if diagnostic_start is not None
+                    else None
+                )
+            )
+            self._record_matvec_diagnostic(
+                site,
+                elapsed=elapsed,
+                metadata=diagnostic_metadata,
             )
 
     def _norm_matvec_dense(self, site, theta_dense):
@@ -3287,6 +3524,8 @@ class SymDMRG2:
             "residual_check_tol": self.residual_check_tol,
             "matvec_backend": self.matvec_backend,
             "resolved_matvec_backend": self._resolved_matvec_backend(),
+            "matvec_diagnostics": self.matvec_diagnostics,
+            "matvec_diagnostics_interval": self.matvec_diagnostics_interval,
             "sector_enrichment": self.sector_enrichment,
             "sector_enrichment_bond_dim": self.sector_enrichment_bond_dim,
             "sector_noise": self.sector_noise,
@@ -3310,6 +3549,8 @@ class SymDMRG2:
             "last_norm_identity_diagnostic": self.last_norm_identity_diagnostic,
             "num_residual_diagnostics": len(self.residual_diagnostics),
             "last_residual_diagnostic": self.last_residual_diagnostic,
+            "num_matvec_diagnostics": len(self.matvec_diagnostic_records),
+            "last_matvec_diagnostic": self.last_matvec_diagnostic,
             "num_local_solve_diagnostics": len(self.local_solve_diagnostics),
             "last_local_solve_diagnostic": self.last_local_solve_diagnostic,
             "num_sector_enrichment_diagnostics": len(self.sector_enrichment_diagnostics),
