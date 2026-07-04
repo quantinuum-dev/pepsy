@@ -27,7 +27,12 @@ block-sparse environments for the projected `H_eff`, and dense debug
 environments for `N_eff`. The active local basis is exactly the current
 `theta` block layout. By default, Symmray `H_eff` matvecs use a block-native
 projected contraction; `matvec_backend="dense_reference"` keeps the older
-NumPy dense-aligned matvec available as a validator. Symmray sweeps
+NumPy dense-aligned matvec available as a validator. During a local
+dense/Lanczos solve, the block-native path caches the static projected
+problem for the active two-site window, including reindexed MPO tensors and
+left/right environment projectors. `profile_summary()` reports projected
+problem cache hits and misses so scale runs can confirm the hot matvec path is
+reusing this setup work. Symmray sweeps
 canonicalize the MPS center before using H-only dense/Lanczos solves; a
 non-identity effective norm is treated as a canonicalization/alignment error
 unless the explicit diagnostic `local_solver="generalized_dense"` mode is

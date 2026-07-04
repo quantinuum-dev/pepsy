@@ -387,6 +387,90 @@ class _ThetaSpace:
         return _tensor_with_data(self.theta, data)
 
 
+class _LocalProjectedProblem:
+    """Cached static tensors for one two-site projected Hamiltonian."""
+
+    def __init__(self, optimizer, site, theta):
+        self.optimizer = optimizer
+        self.site = int(site)
+        self.right_site = self.site + 1
+        self.inds = tuple(theta.inds)
+        self.block_layout = self._block_layout(theta)
+        self.input_map = {ind: optimizer._input_ind(ind) for ind in self.inds}
+        self.output_zeros = {
+            sector: np.zeros_like(_to_numpy(block))
+            for sector, block in theta.data.blocks.items()
+        }
+
+        w_left = optimizer._active_mpo_tensor_for_matvec(self.site, self.input_map)
+        w_right = optimizer._active_mpo_tensor_for_matvec(
+            self.right_site,
+            self.input_map,
+        )
+        left_env = optimizer._block_env_for_left_cut(self.site)
+        right_env = optimizer._block_env_for_right_cut(self.right_site)
+
+        self.has_left_env = left_env is not None
+        self.has_right_env = right_env is not None
+        self.left_projector = (
+            optimizer._contract_block_pair(left_env, w_left)
+            if left_env is not None
+            else w_left
+        )
+        self.right_projector = (
+            optimizer._contract_block_pair(w_right, right_env)
+            if right_env is not None
+            else w_right
+        )
+
+    @staticmethod
+    def _block_layout(theta):
+        layout = []
+        for sector, block in _sorted_block_items(theta.data):
+            dtype = getattr(block, "dtype", None)
+            if dtype is None:
+                dtype = _to_numpy(block).dtype
+            layout.append((sector, tuple(getattr(block, "shape", ())), np.dtype(dtype).str))
+        return tuple(layout)
+
+    def matches(self, site, theta):
+        return (
+            int(site) == self.site
+            and tuple(theta.inds) == self.inds
+            and self._block_layout(theta) == self.block_layout
+        )
+
+    @staticmethod
+    def _copy_block(block):
+        if hasattr(block, "copy"):
+            return block.copy()
+        return np.array(block, copy=True)
+
+    def apply(self, theta):
+        theta_in = theta.reindex(self.input_map, inplace=False)
+        out = self.optimizer._contract_block_pair(self.right_projector, theta_in)
+        out = self.optimizer._contract_block_pair(self.left_projector, out)
+        out = out.transpose(*self.inds)
+
+        blocks = {}
+        for sector in theta.data.blocks:
+            if sector in out.data.blocks:
+                blocks[sector] = out.data.blocks[sector]
+            else:
+                blocks[sector] = self._copy_block(self.output_zeros[sector])
+        data = _array_with_blocks_like(theta.data, blocks)
+        return _tensor_with_data(theta, data)
+
+    def summary(self):
+        return {
+            "site": self.site,
+            "right_site": self.right_site,
+            "has_left_env": self.has_left_env,
+            "has_right_env": self.has_right_env,
+            "theta_num_blocks": len(self.block_layout),
+        }
+
+
 class _SymmrayEffectiveHamiltonian(LinearOperator):
     """Projected two-site Hamiltonian as a matrix-free linear operator."""
 
@@ -607,6 +691,9 @@ class SymDMRG2:
         self.right_norm_envs = None
         self.left_block_envs = None
         self.right_block_envs = None
+        self._projected_problem_cache = None
+        self.projected_problem_cache_hits = 0
+        self.projected_problem_cache_misses = 0
         self.svd_diagnostics = []
         self.norm_identity_diagnostics = []
         self.local_solve_diagnostics = []
@@ -726,6 +813,8 @@ class SymDMRG2:
             "phase_totals": phase_totals,
             "phase_counts": phase_counts,
             "num_matvecs": phase_counts.get("matvec", 0),
+            "projected_problem_cache_hits": int(self.projected_problem_cache_hits),
+            "projected_problem_cache_misses": int(self.projected_problem_cache_misses),
         }
 
     def compression_summary(self):
@@ -1421,6 +1510,7 @@ class SymDMRG2:
         if self._state is None:
             raise ValueError("SymDMRG2 requires init_mps before building environments.")
 
+        self._invalidate_projected_problem_cache()
         bra = self._make_block_bra()
         left = [None] * (self._state.L + 1)
         current = None
@@ -1445,6 +1535,7 @@ class SymDMRG2:
         if self._state is None:
             raise ValueError("SymDMRG2 requires init_mps before building environments.")
 
+        self._invalidate_projected_problem_cache()
         direction = str(direction).strip().lower()
         profile_start = self._profile_start()
         bra = self._make_block_bra()
@@ -1475,6 +1566,7 @@ class SymDMRG2:
         """Incrementally refresh the block left environment through ``site``."""
         if self.left_block_envs is None:
             self.build_block_environments()
+        self._invalidate_projected_problem_cache()
         bra = self._make_block_bra()
         self.left_block_envs[site + 1] = self._block_left_env_step(
             site,
@@ -1487,6 +1579,7 @@ class SymDMRG2:
         """Incrementally refresh the block right environment through ``site``."""
         if self.right_block_envs is None:
             self.build_block_environments()
+        self._invalidate_projected_problem_cache()
         bra = self._make_block_bra()
         self.right_block_envs[site] = self._block_right_env_step(
             site,
@@ -1808,37 +1901,33 @@ class SymDMRG2:
         }
         return self.mpo[site].reindex(reindex, inplace=False)
 
-    def two_site_matvec_symmray(self, site, theta=None):
-        """Apply ``H_eff`` using Symmray block contractions."""
-        theta = self.two_site_theta(site) if theta is None else theta
-        right_site = site + 1
+    def _invalidate_projected_problem_cache(self):
+        self._projected_problem_cache = None
+
+    def _get_projected_problem(self, site, theta):
         if self.left_block_envs is None or self.right_block_envs is None:
             self.build_block_environments()
 
-        input_map = {ind: self._input_ind(ind) for ind in theta.inds}
-        theta_in = theta.reindex(input_map, inplace=False)
-        w_left = self._active_mpo_tensor_for_matvec(site, input_map)
-        w_right = self._active_mpo_tensor_for_matvec(right_site, input_map)
-        left_env = self._block_env_for_left_cut(site)
-        right_env = self._block_env_for_right_cut(right_site)
+        problem = self._projected_problem_cache
+        if problem is not None and problem.matches(site, theta):
+            self.projected_problem_cache_hits += 1
+            return problem
 
-        out = w_right
-        if right_env is not None:
-            out = self._contract_block_pair(out, right_env)
-        out = self._contract_block_pair(out, theta_in)
-        out = self._contract_block_pair(w_left, out)
-        if left_env is not None:
-            out = self._contract_block_pair(left_env, out)
-        out = out.transpose(*theta.inds)
+        profile_start = self._profile_start()
+        problem = _LocalProjectedProblem(self, site, theta)
+        self._projected_problem_cache = problem
+        self.projected_problem_cache_misses += 1
+        self._record_profile_elapsed(
+            "build_projected_problem",
+            profile_start,
+            **problem.summary(),
+        )
+        return problem
 
-        blocks = {}
-        for sector, template in theta.data.blocks.items():
-            blocks[sector] = out.data.blocks.get(
-                sector,
-                np.zeros_like(_to_numpy(template)),
-            )
-        data = _array_with_blocks_like(theta.data, blocks)
-        return _tensor_with_data(theta, data)
+    def two_site_matvec_symmray(self, site, theta=None):
+        """Apply ``H_eff`` using Symmray block contractions."""
+        theta = self.two_site_theta(site) if theta is None else theta
+        return self._get_projected_problem(site, theta).apply(theta)
 
     def _matvec_dense(self, site, theta_dense):
         if self.left_envs is None or self.right_envs is None:
@@ -2482,6 +2571,7 @@ class SymDMRG2:
         self._state[site].modify(data=left_tensor.data, inds=left_tensor.inds)
         self._state[right_site].modify(data=right_tensor.data, inds=right_tensor.inds)
         self._state.site_ind_id = getattr(self._state, "site_ind_id", "k{}")
+        self._invalidate_projected_problem_cache()
         self._record_profile_elapsed(
             "svd_split",
             profile_start,
@@ -2496,6 +2586,7 @@ class SymDMRG2:
         return self._state[site], self._state[right_site]
 
     def _clear_environments(self):
+        self._invalidate_projected_problem_cache()
         self.left_envs = None
         self.right_envs = None
         self.left_norm_envs = None
@@ -2929,6 +3020,8 @@ class SymDMRG2:
             "sector_noise": self.sector_noise,
             "sector_enrichment_seed": self.sector_enrichment_seed,
             "profile": self.profile,
+            "projected_problem_cache_hits": int(self.projected_problem_cache_hits),
+            "projected_problem_cache_misses": int(self.projected_problem_cache_misses),
             "sweeps": self.sweeps,
             "total_charge": self.total_charge,
             "initial_energy": self.initial_energy,

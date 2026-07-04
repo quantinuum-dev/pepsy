@@ -502,6 +502,65 @@ def test_symdmrg2_block_native_matvec_matches_dense_reference_all_sites():
             assert native.data.blocks[sector] == pytest.approx(dense.data.blocks[sector])
 
 
+def test_symdmrg2_block_native_matvec_reuses_projected_problem_cache(monkeypatch):
+    """Repeated matvecs for one window should reuse cached local projectors."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+        seed=29,
+        U=1.25,
+        mu=0.05,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        matvec_backend="symmray",
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_block_environments()
+
+    calls = []
+    original = opt._active_mpo_tensor_for_matvec
+
+    def wrapped(site, input_map):
+        calls.append(int(site))
+        return original(site, input_map)
+
+    monkeypatch.setattr(opt, "_active_mpo_tensor_for_matvec", wrapped)
+
+    site = 1
+    theta = opt.two_site_theta(site)
+    space = opt.two_site_theta_space(site, theta)
+    rng = np.random.default_rng(41)
+    trial_a = space.unflatten(
+        rng.standard_normal(space.dim) + 1.0j * rng.standard_normal(space.dim)
+    )
+    trial_b = space.unflatten(
+        rng.standard_normal(space.dim) + 1.0j * rng.standard_normal(space.dim)
+    )
+
+    dense_a = opt.two_site_matvec_dense_reference(site, trial_a)
+    native_a = opt.two_site_matvec_symmray(site, trial_a)
+    dense_b = opt.two_site_matvec_dense_reference(site, trial_b)
+    native_b = opt.two_site_matvec_symmray(site, trial_b)
+
+    assert calls == [site, site + 1]
+    assert opt.projected_problem_cache_misses == 1
+    assert opt.projected_problem_cache_hits == 1
+    assert opt.summary()["projected_problem_cache_hits"] == 1
+    assert opt.profile_summary()["projected_problem_cache_misses"] == 1
+    for sector in theta.data.blocks:
+        assert native_a.data.blocks[sector] == pytest.approx(dense_a.data.blocks[sector])
+        assert native_b.data.blocks[sector] == pytest.approx(dense_b.data.blocks[sector])
+
+
 def test_symdmrg2_dense_reference_matvec_backend_remains_selectable():
     """The dense-aligned matvec stays available as a debug fallback."""
     pytest.importorskip("symmray")
