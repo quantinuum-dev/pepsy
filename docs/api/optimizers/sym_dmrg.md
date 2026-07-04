@@ -42,7 +42,10 @@ current direction, updates the moving side incrementally after each two-site
 writeback, and reuses the completed norm environments for normalized energies.
 Every Symmray two-site writeback records an entry in
 `svd_diagnostics`, including the split direction, bond name, `chi`, cutoff,
-and the left/right charge sectors kept by Symmray's SVD.
+truncation error when reported by the split backend, and the left/right charge
+sectors kept by Symmray's SVD. `compression_summary()` aggregates these split
+records into maximum kept bond dimensions and maximum/summed truncation error,
+matching the kind of compression health metrics used by mature MPS workflows.
 `last_svd_diagnostic` exposes the most recent entry. The Symmray path also
 records `norm_identity_diagnostics` for the per-window `N_eff ~= I` canonical
 check and `local_solve_diagnostics` for the resolved dense/Lanczos solver,

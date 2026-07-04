@@ -145,6 +145,7 @@ def run_benchmark(
             "num_local_solve_diagnostics": len(opt.local_solve_diagnostics),
         },
         "profile": opt.profile_summary(),
+        "compression": opt.compression_summary(),
     }
     if include_events:
         result["profile_events"] = list(opt.profile_diagnostics)

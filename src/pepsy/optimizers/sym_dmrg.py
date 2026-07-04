@@ -106,6 +106,12 @@ def _dense_data(data):
     return _to_numpy(dense)
 
 
+def _optional_float(value):
+    if value is None:
+        return None
+    return float(np.asarray(value).real)
+
+
 def _charge_slices(index):
     start = 0
     out = {}
@@ -720,6 +726,42 @@ class SymDMRG2:
             "phase_totals": phase_totals,
             "phase_counts": phase_counts,
             "num_matvecs": phase_counts.get("matvec", 0),
+        }
+
+    def compression_summary(self):
+        """Return aggregate SVD split and truncation information."""
+        left_bonds = []
+        right_bonds = []
+        truncation_errors = []
+        missing_errors = 0
+        for diagnostic in self.svd_diagnostics:
+            left_bonds.append(int(diagnostic["left"]["bond_dim"]))
+            right_bonds.append(int(diagnostic["right"]["bond_dim"]))
+            error = diagnostic.get("truncation_error")
+            if error is None:
+                missing_errors += 1
+            else:
+                truncation_errors.append(float(error))
+
+        bond_dims = left_bonds + right_bonds
+        max_error = None
+        sum_error = None
+        num_truncated = 0
+        if truncation_errors:
+            max_error = float(max(truncation_errors))
+            sum_error = float(sum(truncation_errors))
+            num_truncated = sum(error > 0.0 for error in truncation_errors)
+
+        return {
+            "num_splits": len(self.svd_diagnostics),
+            "max_bond_dim": int(max(bond_dims, default=0)),
+            "max_left_bond_dim": int(max(left_bonds, default=0)),
+            "max_right_bond_dim": int(max(right_bonds, default=0)),
+            "max_truncation_error": max_error,
+            "sum_truncation_error": sum_error,
+            "num_truncated_splits": int(num_truncated),
+            "num_truncation_errors": len(truncation_errors),
+            "num_missing_truncation_errors": int(missing_errors),
         }
 
     def _set_bond_dim_seq(self, bond_dims):
@@ -2410,6 +2452,7 @@ class SymDMRG2:
             left_inds.append(self._state.bond(site - 1, site))
         left_inds.append(self._site_ind(site))
         absorb = "right" if direction == "right" else "left"
+        split_info = {}
         left_tensor, right_tensor = theta.split(
             left_inds=left_inds,
             method=method,
@@ -2420,7 +2463,9 @@ class SymDMRG2:
             bond_ind=bond,
             ltags=self._state[site].tags,
             rtags=self._state[right_site].tags,
+            info=split_info,
         )
+        truncation_error = _optional_float(split_info.get("error"))
         self.svd_diagnostics.append(
             {
                 "site": int(site),
@@ -2429,6 +2474,7 @@ class SymDMRG2:
                 "bond": bond,
                 "chi": int(chi),
                 "cutoff": float(cutoff),
+                "truncation_error": truncation_error,
                 "left": self._svd_bond_summary(left_tensor, bond),
                 "right": self._svd_bond_summary(right_tensor, bond),
             }
@@ -2445,6 +2491,7 @@ class SymDMRG2:
             cutoff=float(cutoff),
             left_bond_dim=int(self.svd_diagnostics[-1]["left"]["bond_dim"]),
             right_bond_dim=int(self.svd_diagnostics[-1]["right"]["bond_dim"]),
+            truncation_error=truncation_error,
         )
         return self._state[site], self._state[right_site]
 
@@ -2891,6 +2938,7 @@ class SymDMRG2:
             "num_total_energy_sweeps": len(self.total_energies),
             "num_svd_diagnostics": len(self.svd_diagnostics),
             "last_svd_diagnostic": self.last_svd_diagnostic,
+            "compression_summary": self.compression_summary(),
             "num_norm_identity_diagnostics": len(self.norm_identity_diagnostics),
             "last_norm_identity_diagnostic": self.last_norm_identity_diagnostic,
             "num_local_solve_diagnostics": len(self.local_solve_diagnostics),

@@ -369,6 +369,8 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     assert result["profile"]["num_events"] == len(result["profile_events"])
     assert result["profile"]["phase_counts"]["sweep"] == 1
     assert result["profile"]["num_matvecs"] >= 1
+    assert result["compression"]["num_splits"] == result["result"]["num_svd_diagnostics"]
+    assert result["compression"]["max_bond_dim"] <= 3
 
 
 def test_symdmrg2_norm_check_off_skips_effective_norm_probe(monkeypatch):
@@ -614,6 +616,7 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
     assert len(opt.svd_diagnostics) == 2 * (4 - 1)
     assert opt.summary()["num_svd_diagnostics"] == len(opt.svd_diagnostics)
     assert opt.summary()["last_svd_diagnostic"] == opt.last_svd_diagnostic
+    assert opt.summary()["compression_summary"] == opt.compression_summary()
     assert len(opt.norm_identity_diagnostics) == len(opt.svd_diagnostics)
     assert len(opt.local_solve_diagnostics) == len(opt.svd_diagnostics)
     assert opt.summary()["num_norm_identity_diagnostics"] == len(
@@ -640,7 +643,14 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
     assert all(
         diag["matvec_backend"] == "symmray" for diag in opt.local_solve_diagnostics
     )
+    compression = opt.compression_summary()
+    assert compression["num_splits"] == len(opt.svd_diagnostics)
+    assert compression["max_bond_dim"] <= 3
+    assert compression["num_truncation_errors"] == len(opt.svd_diagnostics)
+    assert compression["num_missing_truncation_errors"] == 0
+    assert compression["max_truncation_error"] is not None
     for diagnostic in opt.svd_diagnostics:
+        assert "truncation_error" in diagnostic
         assert diagnostic["left"]["bond_dim"] <= 3
         assert diagnostic["right"]["bond_dim"] <= 3
         assert diagnostic["left"]["num_sectors"] >= 1
