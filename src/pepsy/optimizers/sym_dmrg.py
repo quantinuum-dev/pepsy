@@ -287,6 +287,41 @@ def _normalize_sector_enrichment(sector_enrichment):
         ) from exc
 
 
+def _normalize_norm_check(norm_check):
+    if norm_check is None or norm_check is False:
+        return "off"
+    if norm_check is True:
+        return "strict"
+    key = str(norm_check).strip().lower().replace("-", "_")
+    aliases = {
+        "strict": "strict",
+        "every": "strict",
+        "always": "strict",
+        "on": "strict",
+        "true": "strict",
+        "sample": "sampled",
+        "sampled": "sampled",
+        "sparse": "sampled",
+        "interval": "sampled",
+        "first": "first_sweep",
+        "first_sweep": "first_sweep",
+        "initial": "first_sweep",
+        "warmup": "first_sweep",
+        "off": "off",
+        "none": "off",
+        "false": "off",
+        "no": "off",
+        "skip": "off",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown norm_check {norm_check!r}. Expected one of: {allowed}."
+        ) from exc
+
+
 def _sequence_tuple(values, *, name):
     if isinstance(values, (str, bytes)):
         raise TypeError(f"{name} must be a scalar or a sequence, not a string.")
@@ -421,6 +456,12 @@ class SymDMRG2:
         Symmray OBC path, a failed check is treated as a canonicalization or
         alignment error unless ``local_solver="generalized_dense"`` is
         explicitly requested for debugging.
+    norm_check
+        Schedule for the Symmray effective-norm identity check.
+        ``"strict"`` checks every two-site solve, preserving the safest
+        development behavior. ``"sampled"`` checks boundary windows and every
+        ``norm_check_interval``-th interior window. ``"first_sweep"`` checks
+        every window during the first sweep only. ``"off"`` skips the check.
     matvec_backend
         Projected Hamiltonian matvec implementation for the Symmray path.
         ``"auto"`` uses the block-native Symmray contraction, while
@@ -467,6 +508,8 @@ class SymDMRG2:
         local_eig_backend=None,
         norm_check_tol=1e-6,
         norm_check_samples=2,
+        norm_check="strict",
+        norm_check_interval=1,
         matvec_backend="auto",
         sector_enrichment="none",
         sector_enrichment_bond_dim=None,
@@ -511,6 +554,8 @@ class SymDMRG2:
         self.local_eig_backend = local_eig_backend
         self.norm_check_tol = float(norm_check_tol)
         self.norm_check_samples = int(norm_check_samples)
+        self.norm_check = _normalize_norm_check(norm_check)
+        self.norm_check_interval = int(norm_check_interval)
         self.matvec_backend = _normalize_matvec_backend(matvec_backend)
         self.sector_enrichment = _normalize_sector_enrichment(sector_enrichment)
         self.sector_enrichment_bond_dim = (
@@ -521,6 +566,8 @@ class SymDMRG2:
         self.sector_noise = float(sector_noise)
         self.sector_enrichment_seed = int(sector_enrichment_seed)
         self.profile = bool(profile)
+        if self.norm_check_interval < 1:
+            raise ValueError("norm_check_interval must be a positive integer.")
         if self.sector_enrichment_bond_dim is not None and self.sector_enrichment_bond_dim < 1:
             raise ValueError("sector_enrichment_bond_dim must be a positive integer.")
         if self.sector_noise < 0.0:
@@ -2090,6 +2137,50 @@ class SymDMRG2:
         theta_opt = space.unflatten(vector)
         return float(evals[0].real), theta_opt
 
+    def _should_run_norm_check(self, site):
+        mode = self.norm_check
+        if mode == "strict":
+            return True
+        if mode == "off":
+            return False
+        if mode == "first_sweep":
+            return len(self.energies) == 0
+        if mode == "sampled":
+            last_window = None if self._state is None else self._state.L - 2
+            if site == 0 or site == last_window:
+                return True
+            return (int(site) % self.norm_check_interval) == 0
+        raise ValueError(f"Unknown normalized norm_check mode {mode!r}.")
+
+    def _record_skipped_norm_identity(self, site, *, dim=None, reason="scheduled"):
+        profile_start = self._profile_start()
+        diagnostic = {
+            "site": int(site),
+            "right_site": int(site + 1),
+            "direction": self._current_sweep_direction,
+            "theta_dim": None if dim is None else int(dim),
+            "error": None,
+            "tol": self.norm_check_tol,
+            "samples": 0,
+            "passed": True,
+            "skipped": True,
+            "mode": self.norm_check,
+            "interval": self.norm_check_interval,
+            "reason": str(reason),
+        }
+        self.norm_identity_diagnostics.append(diagnostic)
+        self._record_profile_elapsed(
+            "norm_check",
+            profile_start,
+            site=int(site),
+            right_site=int(site + 1),
+            theta_dim=None if dim is None else int(dim),
+            samples=0,
+            skipped=True,
+            mode=self.norm_check,
+        )
+        return diagnostic
+
     def _check_effective_norm_identity(self, site, theta, *, dim=None):
         profile_start = self._profile_start()
         norm_error = self.effective_norm_identity_error(site, theta)
@@ -2102,6 +2193,9 @@ class SymDMRG2:
             "tol": self.norm_check_tol,
             "samples": self.norm_check_samples,
             "passed": bool(norm_error <= self.norm_check_tol),
+            "skipped": False,
+            "mode": self.norm_check,
+            "interval": self.norm_check_interval,
         }
         self.norm_identity_diagnostics.append(diagnostic)
         self._record_profile_elapsed(
@@ -2112,6 +2206,8 @@ class SymDMRG2:
             theta_dim=None if dim is None else int(dim),
             error=float(norm_error),
             samples=int(self.norm_check_samples),
+            skipped=False,
+            mode=self.norm_check,
         )
         if norm_error <= self.norm_check_tol:
             return norm_error
@@ -2192,7 +2288,11 @@ class SymDMRG2:
             )
             return energy, theta_opt
 
-        norm_error = self._check_effective_norm_identity(site, theta, dim=dim)
+        if self._should_run_norm_check(site):
+            norm_error = self._check_effective_norm_identity(site, theta, dim=dim)
+        else:
+            norm_error = None
+            self._record_skipped_norm_identity(site, dim=dim)
 
         solver_start = self._profile_start()
         if solver == "dense":
@@ -2228,7 +2328,7 @@ class SymDMRG2:
             solver=solver_used,
             theta_dim=int(dim),
             energy=float(energy),
-            norm_error=float(norm_error),
+            norm_error=None if norm_error is None else float(norm_error),
         )
         return energy, theta_opt
 
@@ -2772,6 +2872,9 @@ class SymDMRG2:
             "local_eig_maxiter": self.local_eig_maxiter,
             "local_eig_backend": self.local_eig_backend,
             "norm_check_tol": self.norm_check_tol,
+            "norm_check_samples": self.norm_check_samples,
+            "norm_check": self.norm_check,
+            "norm_check_interval": self.norm_check_interval,
             "matvec_backend": self.matvec_backend,
             "resolved_matvec_backend": self._resolved_matvec_backend(),
             "sector_enrichment": self.sector_enrichment,

@@ -361,12 +361,76 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     )
 
     assert result["case"]["length"] == 2
+    assert result["case"]["norm_check"] == "strict"
+    assert result["case"]["norm_check_interval"] == 1
     assert result["result"]["num_sweeps"] == 1
     assert isinstance(result["result"]["energy"], float)
     assert result["profile"]["enabled"]
     assert result["profile"]["num_events"] == len(result["profile_events"])
     assert result["profile"]["phase_counts"]["sweep"] == 1
     assert result["profile"]["num_matvecs"] >= 1
+
+
+def test_symdmrg2_norm_check_off_skips_effective_norm_probe(monkeypatch):
+    """Production runs can skip the expensive N_eff ~= I probe explicitly."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        norm_check="off",
+    )
+
+    def raise_if_called(*_args, **_kwargs):
+        raise AssertionError("effective_norm_identity_error should be skipped")
+
+    monkeypatch.setattr(opt, "effective_norm_identity_error", raise_if_called)
+    opt.solve(max_sweeps=1)
+
+    assert len(opt.norm_identity_diagnostics) == 2
+    assert all(diag["skipped"] for diag in opt.norm_identity_diagnostics)
+    assert {diag["mode"] for diag in opt.norm_identity_diagnostics} == {"off"}
+    assert all(diag["samples"] == 0 for diag in opt.norm_identity_diagnostics)
+    assert all(diag["error"] is None for diag in opt.norm_identity_diagnostics)
+    assert all(diag["norm_error"] is None for diag in opt.local_solve_diagnostics)
+    assert opt.summary()["norm_check"] == "off"
+
+
+def test_symdmrg2_sampled_norm_check_checks_boundaries_and_skips_interval():
+    """Sampled checks should keep boundary probes and skip selected interiors."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        norm_check="sampled",
+        norm_check_interval=2,
+    )
+    opt.solve(max_sweeps=1, sweep_sequence="R")
+
+    by_site = {diag["site"]: diag for diag in opt.norm_identity_diagnostics}
+
+    assert set(by_site) == {0, 1, 2}
+    assert not by_site[0]["skipped"]
+    assert by_site[1]["skipped"]
+    assert not by_site[2]["skipped"]
+    assert by_site[0]["error"] is not None
+    assert by_site[1]["error"] is None
+    assert by_site[2]["error"] is not None
+    assert {diag["mode"] for diag in by_site.values()} == {"sampled"}
+    assert opt.summary()["norm_check_interval"] == 2
 
 
 def test_symdmrg2_linear_operator_matches_dense_effective_hamiltonian():

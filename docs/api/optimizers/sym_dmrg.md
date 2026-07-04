@@ -31,7 +31,13 @@ NumPy dense-aligned matvec available as a validator. Symmray sweeps
 canonicalize the MPS center before using H-only dense/Lanczos solves; a
 non-identity effective norm is treated as a canonicalization/alignment error
 unless the explicit diagnostic `local_solver="generalized_dense"` mode is
-requested. Sweep setup builds only the static side environments needed for the
+requested. The default `norm_check="strict"` validates every two-site window.
+For larger trusted runs, `norm_check="sampled"` checks boundary windows plus
+every `norm_check_interval`-th interior window, `norm_check="first_sweep"`
+checks only the first sweep, and `norm_check="off"` skips this expensive
+debug assertion. Skipped checks are still recorded in
+`norm_identity_diagnostics` with `skipped=True` so benchmark logs remain
+auditable. Sweep setup builds only the static side environments needed for the
 current direction, updates the moving side incrementally after each two-site
 writeback, and reuses the completed norm environments for normalized energies.
 Every Symmray two-site writeback records an entry in
