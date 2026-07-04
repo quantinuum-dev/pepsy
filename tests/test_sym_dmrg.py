@@ -1237,6 +1237,73 @@ def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():
     assert all(diag["solver"] == "lanczos" for diag in opt.local_solve_diagnostics)
 
 
+def test_symdmrg2_subspace_mixer_reaches_ed_from_narrow_initial_support():
+    """The opt-in mixer should use H-aware directions without random noise."""
+    pytest.importorskip("symmray")
+    edges = [(site, site + 1) for site in range(3)]
+    occupations = [(1, 0), (0, 1), (1, 0), (0, 1)]
+    state, mpo = _fh_u1u1_chain(
+        4,
+        occupations,
+        bond_dim=2,
+        seed=31,
+        U=1.0,
+        mu=0.1,
+    )
+    ed_energy = _fixed_u1u1_sector_ground_energy(
+        4,
+        edges,
+        (2, 2),
+        t=1.0,
+        U=1.0,
+        mu=0.1,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=16,
+        cutoff=1e-12,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-11,
+        local_eig_ncv=16,
+        norm_check_samples=3,
+        mixer="density_matrix",
+        mixer_bond_dim=12,
+        mixer_amplitude=1e-8,
+        mixer_decay=0.5,
+        mixer_disable_after=1,
+    )
+    opt.solve(tol=0.0, max_sweeps=2, sweep_sequence="RL")
+
+    expansion = opt.mixer_diagnostics[0]
+    local_mixer = [
+        diagnostic
+        for diagnostic in opt.mixer_diagnostics
+        if diagnostic["kind"] == "local_subspace"
+    ]
+    summary = opt.summary()
+
+    assert opt.energy == pytest.approx(ed_energy, abs=1e-10)
+    assert len(opt.sector_enrichment_diagnostics) == 0
+    assert summary["mixer"] == "subspace_expansion"
+    assert summary["mixer_bond_dim"] == 12
+    assert summary["num_mixer_diagnostics"] == len(opt.mixer_diagnostics)
+    assert summary["last_mixer_diagnostic"] == opt.last_mixer_diagnostic
+    assert summary["active_mixer_amplitude"] == 0.0
+    assert expansion["kind"] == "sector_expansion"
+    assert expansion["mode"] == "subspace_expansion"
+    assert expansion["noise"] == 0.0
+    assert expansion["amplitude"] == pytest.approx(1e-8)
+    assert expansion["added_blocks"] > 0
+    assert len(local_mixer) == 3
+    assert all(diagnostic["applied"] for diagnostic in local_mixer)
+    assert all(diagnostic["injected_norm"] > 0.0 for diagnostic in local_mixer)
+    assert {diagnostic["sweep"] for diagnostic in local_mixer} == {0}
+
+
 def test_symdmrg2_adaptive_sector_enrichment_runs_each_sweep():
     """Adaptive template enrichment should re-run before every sweep."""
     pytest.importorskip("symmray")

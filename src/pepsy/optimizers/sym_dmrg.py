@@ -342,6 +342,35 @@ def _normalize_residual_check(residual_check):
     return _normalize_check_schedule(residual_check, name="residual_check")
 
 
+def _normalize_mixer(mixer):
+    if mixer is None or mixer is False:
+        return "none"
+    if mixer is True:
+        return "subspace_expansion"
+    key = str(mixer).strip().lower().replace("-", "_")
+    aliases = {
+        "none": "none",
+        "off": "none",
+        "false": "none",
+        "no": "none",
+        "subspace": "subspace_expansion",
+        "subspace_expansion": "subspace_expansion",
+        "density_matrix": "subspace_expansion",
+        "density_matrix_mixer": "subspace_expansion",
+        "dm": "subspace_expansion",
+        "mixer": "subspace_expansion",
+        "true": "subspace_expansion",
+        "yes": "subspace_expansion",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown mixer {mixer!r}. Expected one of: {allowed}."
+        ) from exc
+
+
 def _normalize_initial_energy_mode(compute_initial_energy):
     if compute_initial_energy is True:
         return "eager"
@@ -781,6 +810,20 @@ class SymDMRG2:
     sector_noise
         Absolute random noise scale used for newly valid blocks during sector
         enrichment.
+    mixer
+        Optional Symmray Hamiltonian-aware subspace-expansion mixer. ``"none"``
+        keeps the historical behavior. ``"subspace"`` expands virtual charge
+        maps with zero-valued legal sectors before active sweeps, then injects
+        an orthogonalized ``H_eff`` direction into each optimized two-site
+        theta before the SVD writeback. ``"density_matrix"`` is accepted as an
+        alias for this first subspace-expansion mixer.
+    mixer_amplitude, mixer_decay, mixer_disable_after
+        Initial mixer amplitude, per-sweep decay factor, and optional sweep
+        index at which to disable the mixer. The amplitude at sweep ``s`` is
+        ``mixer_amplitude * mixer_decay**s`` while active.
+    mixer_bond_dim
+        Bond-sector budget for mixer sector expansion. Defaults to the current
+        sweep's maximum bond dimension.
     compute_initial_energy
         ``True`` preserves the historical eager initial-energy estimate.
         ``False`` skips it. ``"lazy"`` defers the estimate until
@@ -829,6 +872,11 @@ class SymDMRG2:
         sector_enrichment_bond_dim=None,
         sector_noise=0.0,
         sector_enrichment_seed=0,
+        mixer="none",
+        mixer_amplitude=1e-4,
+        mixer_decay=0.5,
+        mixer_disable_after=None,
+        mixer_bond_dim=None,
         profile=False,
         compute_initial_energy=True,
         dmrg_opts=None,
@@ -907,6 +955,15 @@ class SymDMRG2:
         )
         self.sector_noise = float(sector_noise)
         self.sector_enrichment_seed = int(sector_enrichment_seed)
+        self.mixer = _normalize_mixer(mixer)
+        self.mixer_amplitude = float(mixer_amplitude)
+        self.mixer_decay = float(mixer_decay)
+        self.mixer_disable_after = (
+            None if mixer_disable_after is None else int(mixer_disable_after)
+        )
+        self.mixer_bond_dim = (
+            None if mixer_bond_dim is None else int(mixer_bond_dim)
+        )
         self.profile = bool(profile)
         self.initial_energy_mode = _normalize_initial_energy_mode(
             compute_initial_energy
@@ -933,6 +990,14 @@ class SymDMRG2:
             raise ValueError("sector_enrichment_bond_dim must be a positive integer.")
         if self.sector_noise < 0.0:
             raise ValueError("sector_noise must be non-negative.")
+        if self.mixer_amplitude < 0.0:
+            raise ValueError("mixer_amplitude must be non-negative.")
+        if self.mixer_decay < 0.0:
+            raise ValueError("mixer_decay must be non-negative.")
+        if self.mixer_disable_after is not None and self.mixer_disable_after < 0:
+            raise ValueError("mixer_disable_after must be non-negative.")
+        if self.mixer_bond_dim is not None and self.mixer_bond_dim < 1:
+            raise ValueError("mixer_bond_dim must be a positive integer.")
         self.dmrg_opts = {} if dmrg_opts is None else dict(dmrg_opts)
 
         requested_backend = _normalize_backend(backend)
@@ -978,9 +1043,11 @@ class SymDMRG2:
         self.matvec_diagnostic_records = []
         self.local_solve_diagnostics = []
         self.convergence_diagnostics = []
+        self.mixer_diagnostics = []
         self.sector_enrichment_diagnostics = []
         self.profile_diagnostics = []
         self._current_sweep_direction = None
+        self._last_local_input_theta = None
         self.opts = {
             "default_sweep_sequence": "R",
             "bond_compress_method": "svd",
@@ -1073,6 +1140,13 @@ class SymDMRG2:
         if not self.convergence_diagnostics:
             return None
         return self.convergence_diagnostics[-1]
+
+    @property
+    def last_mixer_diagnostic(self):
+        """Most recent Symmray mixer diagnostic, if any."""
+        if not self.mixer_diagnostics:
+            return None
+        return self.mixer_diagnostics[-1]
 
     @property
     def last_sector_enrichment_diagnostic(self):
@@ -1555,24 +1629,21 @@ class SymDMRG2:
             "copied_blocks": int(copied_blocks),
         }
 
-    def enrich_sectors(self, *, bond_dim=None, noise=None, mode=None, sweep=None):
-        """Expand Symmray MPS virtual charge maps using a random template MPS.
-
-        The current tensor values are copied into the expanded block layout.
-        Newly valid blocks are initialized with zero or small random noise.
-        This preserves the fixed total charge but gives the local two-site
-        eigensolver a larger sector layout to optimize.
-        """
+    def _expand_sector_chargemaps(
+        self,
+        *,
+        bond_dim,
+        noise,
+        mode,
+        sweep,
+        profile_phase,
+    ):
         if self.backend != "symmray":
             return None
-        bond_dim = (
-            self.chi
-            if bond_dim is None and self.sector_enrichment_bond_dim is None
-            else self.sector_enrichment_bond_dim if bond_dim is None else int(bond_dim)
-        )
+        bond_dim = int(bond_dim)
         if int(bond_dim) < 1:
             raise ValueError("bond_dim must be a positive integer.")
-        noise = self.sector_noise if noise is None else float(noise)
+        noise = float(noise)
         if noise < 0.0:
             raise ValueError("noise must be non-negative.")
 
@@ -1609,14 +1680,38 @@ class SymDMRG2:
             "sites": site_diagnostics,
             "added_blocks": sum(item["added_blocks"] for item in site_diagnostics),
         }
-        self.sector_enrichment_diagnostics.append(diagnostic)
         self._record_profile_elapsed(
-            "sector_enrichment",
+            profile_phase,
             profile_start,
             mode=diagnostic["mode"],
             added_blocks=int(diagnostic["added_blocks"]),
             bond_dim=int(bond_dim),
         )
+        return diagnostic
+
+    def enrich_sectors(self, *, bond_dim=None, noise=None, mode=None, sweep=None):
+        """Expand Symmray MPS virtual charge maps using a random template MPS.
+
+        The current tensor values are copied into the expanded block layout.
+        Newly valid blocks are initialized with zero or small random noise.
+        This preserves the fixed total charge but gives the local two-site
+        eigensolver a larger sector layout to optimize.
+        """
+        bond_dim = (
+            self.chi
+            if bond_dim is None and self.sector_enrichment_bond_dim is None
+            else self.sector_enrichment_bond_dim if bond_dim is None else int(bond_dim)
+        )
+        noise = self.sector_noise if noise is None else float(noise)
+        diagnostic = self._expand_sector_chargemaps(
+            bond_dim=bond_dim,
+            noise=noise,
+            mode="template" if mode is None else mode,
+            sweep=sweep,
+            profile_phase="sector_enrichment",
+        )
+        if diagnostic is not None:
+            self.sector_enrichment_diagnostics.append(diagnostic)
         return diagnostic
 
     def _should_enrich_before_sweep(self, sweep):
@@ -1627,6 +1722,123 @@ class SymDMRG2:
         if self.sector_enrichment == "adaptive_template":
             return True
         raise ValueError(f"Unknown sector_enrichment mode {self.sector_enrichment!r}.")
+
+    def _active_mixer_amplitude(self, sweep=None):
+        if self.backend != "symmray" or self.mixer == "none":
+            return 0.0
+        sweep = len(self.energies) if sweep is None else int(sweep)
+        if self.mixer_disable_after is not None and sweep >= self.mixer_disable_after:
+            return 0.0
+        return float(self.mixer_amplitude * (self.mixer_decay ** sweep))
+
+    def _should_apply_mixer(self, sweep=None):
+        return self._active_mixer_amplitude(sweep) > 0.0
+
+    def _prepare_mixer_sweep(self, *, sweep, max_bond):
+        amplitude = self._active_mixer_amplitude(sweep)
+        if amplitude <= 0.0:
+            return None
+        bond_dim = self.mixer_bond_dim if self.mixer_bond_dim is not None else max_bond
+        diagnostic = self._expand_sector_chargemaps(
+            bond_dim=bond_dim,
+            noise=0.0,
+            mode=self.mixer,
+            sweep=sweep,
+            profile_phase="mixer_sector_expansion",
+        )
+        if diagnostic is None:
+            return None
+        diagnostic["kind"] = "sector_expansion"
+        diagnostic["amplitude"] = float(amplitude)
+        self.mixer_diagnostics.append(diagnostic)
+        return diagnostic
+
+    def _record_mixer_local_diagnostic(self, diagnostic):
+        self.mixer_diagnostics.append(diagnostic)
+        self._record_profile_elapsed(
+            "mixer_local",
+            diagnostic.pop("_profile_start", None),
+            site=diagnostic["site"],
+            right_site=diagnostic["right_site"],
+            amplitude=diagnostic["amplitude"],
+            applied=diagnostic["applied"],
+            injected_norm=diagnostic.get("injected_norm"),
+            reason=diagnostic.get("reason"),
+        )
+        return diagnostic
+
+    def _apply_subspace_mixer(self, site, theta, energy):
+        amplitude = self._active_mixer_amplitude()
+        if amplitude <= 0.0:
+            return theta
+
+        profile_start = self._profile_start()
+        right_site = site + 1
+        diagnostic = {
+            "kind": "local_subspace",
+            "mode": self.mixer,
+            "sweep": len(self.energies),
+            "site": int(site),
+            "right_site": int(right_site),
+            "direction": self._current_sweep_direction,
+            "amplitude": float(amplitude),
+            "energy": float(energy),
+            "applied": False,
+            "_profile_start": profile_start,
+        }
+
+        source_theta = self._last_local_input_theta
+        if source_theta is None:
+            diagnostic["reason"] = "missing_source_theta"
+            self._record_mixer_local_diagnostic(diagnostic)
+            return theta
+
+        space = self.two_site_theta_space(site, theta)
+        try:
+            source_vector = space.flatten(source_theta)
+        except ValueError:
+            diagnostic["reason"] = "source_layout_mismatch"
+            self._record_mixer_local_diagnostic(diagnostic)
+            return theta
+
+        theta_vector = space.flatten(theta)
+        drive_theta = self.two_site_matvec(site, source_theta)
+        drive_vector = space.flatten(drive_theta)
+        theta_norm = float(np.linalg.norm(theta_vector))
+        source_norm = float(np.linalg.norm(source_vector))
+
+        denom = np.vdot(theta_vector, theta_vector)
+        if abs(denom) > 0.0:
+            drive_vector = drive_vector - theta_vector * (
+                np.vdot(theta_vector, drive_vector) / denom
+            )
+        drive_norm = float(np.linalg.norm(drive_vector))
+
+        diagnostic.update(
+            {
+                "theta_dim": int(space.dim),
+                "theta_num_blocks": len(space.metadata),
+                "theta_norm": theta_norm,
+                "source_norm": source_norm,
+                "drive_norm": drive_norm,
+            }
+        )
+        if drive_norm <= 0.0 or theta_norm <= 0.0:
+            diagnostic["reason"] = "zero_drive"
+            self._record_mixer_local_diagnostic(diagnostic)
+            return theta
+
+        injected_vector = drive_vector * (amplitude * theta_norm / drive_norm)
+        mixed_theta = space.unflatten(theta_vector + injected_vector)
+        diagnostic.update(
+            {
+                "applied": True,
+                "injected_norm": float(np.linalg.norm(injected_vector)),
+                "mixed_norm": float(np.linalg.norm(theta_vector + injected_vector)),
+            }
+        )
+        self._record_mixer_local_diagnostic(diagnostic)
+        return mixed_theta
 
     def _dense_index_for_state_ind(self, ind):
         indices = [
@@ -3056,6 +3268,7 @@ class SymDMRG2:
         """Solve one two-site local problem using the configured Symmray path."""
         profile_start = self._profile_start()
         theta = self.two_site_theta(site)
+        self._last_local_input_theta = theta.copy()
         space = self.two_site_theta_space(site, theta)
         dim = space.dim
         if dim == 0:
@@ -3377,6 +3590,7 @@ class SymDMRG2:
             for site in sweep:
                 last_energy, theta = self.local_eigensolve(site)
                 local_ens.append(float(last_energy))
+                theta = self._apply_subspace_mixer(site, theta, last_energy)
                 self._replace_two_site_theta(
                     site,
                     theta,
@@ -3597,6 +3811,11 @@ class SymDMRG2:
                         mode=self.sector_enrichment,
                         sweep=sweep_num,
                     )
+                if self._should_apply_mixer(sweep_num):
+                    self._prepare_mixer_sweep(
+                        sweep=sweep_num,
+                        max_bond=max_bond,
+                    )
 
                 self._print_pre_sweep(
                     sweep_num,
@@ -3743,6 +3962,12 @@ class SymDMRG2:
             "sector_enrichment_bond_dim": self.sector_enrichment_bond_dim,
             "sector_noise": self.sector_noise,
             "sector_enrichment_seed": self.sector_enrichment_seed,
+            "mixer": self.mixer,
+            "mixer_amplitude": self.mixer_amplitude,
+            "mixer_decay": self.mixer_decay,
+            "mixer_disable_after": self.mixer_disable_after,
+            "mixer_bond_dim": self.mixer_bond_dim,
+            "active_mixer_amplitude": self._active_mixer_amplitude(),
             "profile": self.profile,
             "projected_problem_cache_hits": int(self.projected_problem_cache_hits),
             "projected_problem_cache_misses": int(self.projected_problem_cache_misses),
@@ -3768,6 +3993,8 @@ class SymDMRG2:
             "last_local_solve_diagnostic": self.last_local_solve_diagnostic,
             "num_convergence_diagnostics": len(self.convergence_diagnostics),
             "last_convergence_diagnostic": self.last_convergence_diagnostic,
+            "num_mixer_diagnostics": len(self.mixer_diagnostics),
+            "last_mixer_diagnostic": self.last_mixer_diagnostic,
             "num_sector_enrichment_diagnostics": len(self.sector_enrichment_diagnostics),
             "last_sector_enrichment_diagnostic": self.last_sector_enrichment_diagnostic,
             "num_profile_diagnostics": len(self.profile_diagnostics),
