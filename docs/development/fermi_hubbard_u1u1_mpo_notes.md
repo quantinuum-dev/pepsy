@@ -214,9 +214,13 @@ data too early.
    on every split. The default projected `H_eff` matvec now uses Symmray block
    contractions with one-shared-leg contraction plus internal traces, avoiding
    the fused multi-leg shape-mismatch path. The dense-aligned matvec remains
-   available as a reference validator. Torch/autodiff support and PBC
-   segment-compressed environments remain separate performance problems from
-   the fermion algebra.
+   available as a reference validator. The sweep now also records every
+   canonical `N_eff ~= I` check and every local dense/Lanczos solve, including
+   the active theta dimension and matvec backend. A small OBC FH U1U1 test
+   reaches the fixed `(2,2)` sector ED energy once the initial MPS contains
+   enough bond-sector support. Torch/autodiff support, sector-expansion/noise,
+   and PBC segment-compressed environments remain separate performance and
+   convergence layers from the fermion algebra.
 
 ## Acceptance Criteria For The True MPO Fix
 

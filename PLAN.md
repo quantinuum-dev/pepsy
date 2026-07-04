@@ -180,15 +180,24 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   and `N_eff` matvecs in the exact current `theta` block layout, an explicit
   dense generalized diagnostic solve, and a quimb-style Lanczos/LinearOperator
   local solver after MPS canonicalization. The SVD writeback records the
-  actual Symmray bond sectors kept at each two-site split.
+  actual Symmray bond sectors kept at each two-site split. The sweep also
+  records per-window `N_eff ~= I` diagnostics and local-solver diagnostics so
+  failures can be traced to a site, direction, theta dimension, and matvec
+  backend.
 - The Symmray `H_eff` matvec is now block-native by default. It avoids
   Symmray's fused multi-leg shape-mismatch path by contracting one shared leg
   at a time and tracing the remaining shared legs, then projecting back to the
   current theta block sectors. The dense-aligned matvec remains available as
   `matvec_backend="dense_reference"` for validation.
+- A four-site OBC Fermi-Hubbard U1U1 regression now forces Lanczos and compares
+  the final DMRG energy with a dense fixed-sector ED oracle. With enough
+  initial bond-sector support, the run reaches the `(N_up,N_down)=(2,2)` ED
+  ground energy to numerical precision. Missing sector support in the initial
+  MPS is still not expanded automatically; noise/sector-enrichment is a later
+  convergence layer.
 - The next DMRG step is performance and scale: profile the block-native matvec,
-  reduce repeated environment work, and later add torch-native block
-  contractions where useful.
+  reduce repeated environment work, add sector-enrichment/noise once the stable
+  path is measured, and later add torch-native block contractions where useful.
 
 ### Validation
 

@@ -139,6 +139,11 @@ the interruption.
   diagnostic. After OBC canonicalization, `N_eff` should be identity-like; if
   it is not, the normal dense/Lanczos path raises a canonicalization/alignment
   error rather than quietly solving a generalized problem.
+- The canonical norm check is now recorded on every two-site window in
+  `norm_identity_diagnostics`, and `local_solve_diagnostics` records the
+  resolved dense/Lanczos solver, theta dimension, local energy, and matvec
+  backend. Small OBC FH U1U1 Lanczos tests verify that each canonical window has
+  `N_eff` identity error below numerical tolerance.
 - The projected `H_eff` matvec is now block-native by default. The key lesson
   from the failed probe was not to use Symmray's fused multi-leg contraction
   blindly: intermediate contractions can prune charge maps or expose composite
@@ -146,3 +151,9 @@ the interruption.
   at a time, traces any remaining shared legs inside the resulting Symmray
   tensor, then projects the result back to the current theta block sectors.
   The dense-aligned matvec remains selectable as a validation fallback.
+- A four-site OBC Fermi-Hubbard U1U1 regression now compares forced Lanczos
+  DMRG against a dense Jordan-Wigner fixed-sector ED oracle. With enough initial
+  bond-sector support, one sweep reaches the `(N_up,N_down)=(2,2)` ED energy to
+  numerical precision. With too little initial sector support, the current
+  implementation improves energy but cannot invent missing symmetry sectors;
+  a future noise/expansion mechanism should address that separately.

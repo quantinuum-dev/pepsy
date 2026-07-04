@@ -28,6 +28,57 @@ def _fh_u1u1_chain(L, occupations, *, bond_dim=3, seed=13, U=2.0, mu=0.1):
     return state, ham.to_mpo(L=L, compress=False)
 
 
+def _dense_jw_fermi_hubbard(L, edges, *, t=1.0, U=4.0, mu=0.3):
+    n_modes = 2 * L
+    eye = np.eye(2)
+    zed = np.array([[1.0, 0.0], [0.0, -1.0]])
+    lower = np.array([[0.0, 1.0], [0.0, 0.0]])
+
+    def annihilate(mode):
+        mats = [zed] * mode + [lower] + [eye] * (n_modes - mode - 1)
+        out = mats[0]
+        for mat in mats[1:]:
+            out = np.kron(out, mat)
+        return out
+
+    def mode(site, spin):
+        return 2 * site + spin
+
+    ham = np.zeros((2**n_modes, 2**n_modes))
+    for i, j in edges:
+        for spin in (0, 1):
+            hop = annihilate(mode(i, spin)).conj().T @ annihilate(mode(j, spin))
+            ham += -t * (hop + hop.conj().T)
+    for site in range(L):
+        num_up = annihilate(mode(site, 0)).conj().T @ annihilate(mode(site, 0))
+        num_dn = annihilate(mode(site, 1)).conj().T @ annihilate(mode(site, 1))
+        ham += U * (num_up @ num_dn) - mu * (num_up + num_dn)
+    return ham
+
+
+def _u1u1_sector_indices(L, total_charge):
+    n_modes = 2 * L
+    num_up, num_down = tuple(total_charge)
+    indices = []
+    for basis in range(2**n_modes):
+        up_count = 0
+        down_count = 0
+        for site in range(L):
+            up_count += (basis >> (n_modes - 1 - 2 * site)) & 1
+            down_count += (basis >> (n_modes - 2 - 2 * site)) & 1
+        if (up_count, down_count) == (num_up, num_down):
+            indices.append(basis)
+    return np.asarray(indices, dtype=int)
+
+
+def _fixed_u1u1_sector_ground_energy(L, edges, total_charge, *, t=1.0, U=4.0, mu=0.3):
+    ham = _dense_jw_fermi_hubbard(L, edges, t=t, U=U, mu=mu)
+    sector = _u1u1_sector_indices(L, total_charge)
+    sector_ham = ham[np.ix_(sector, sector)]
+    sector_ham = (sector_ham + sector_ham.conj().T) / 2
+    return float(np.linalg.eigvalsh(sector_ham)[0].real)
+
+
 def test_symdmrg2_delegates_dense_mpo_to_quimb_dmrg2():
     """Dense/quimb MPOs should run through quimb's DMRG2 implementation."""
     mpo = qtn.MPO_ham_ising(2, j=1.0, bx=0.5)
@@ -335,11 +386,97 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
     assert len(opt.svd_diagnostics) == 2 * (4 - 1)
     assert opt.summary()["num_svd_diagnostics"] == len(opt.svd_diagnostics)
     assert opt.summary()["last_svd_diagnostic"] == opt.last_svd_diagnostic
+    assert len(opt.norm_identity_diagnostics) == len(opt.svd_diagnostics)
+    assert len(opt.local_solve_diagnostics) == len(opt.svd_diagnostics)
+    assert opt.summary()["num_norm_identity_diagnostics"] == len(
+        opt.norm_identity_diagnostics
+    )
+    assert opt.summary()["last_norm_identity_diagnostic"] == (
+        opt.norm_identity_diagnostics[-1]
+    )
+    assert opt.summary()["num_local_solve_diagnostics"] == len(
+        opt.local_solve_diagnostics
+    )
+    assert opt.summary()["last_local_solve_diagnostic"] == (
+        opt.local_solve_diagnostics[-1]
+    )
+    assert {diag["direction"] for diag in opt.norm_identity_diagnostics} == {
+        "right",
+        "left",
+    }
+    assert all(diag["passed"] for diag in opt.norm_identity_diagnostics)
+    assert max(diag["error"] for diag in opt.norm_identity_diagnostics) < 1e-12
+    assert all(
+        diag["requested_solver"] == "lanczos" for diag in opt.local_solve_diagnostics
+    )
+    assert all(
+        diag["matvec_backend"] == "symmray" for diag in opt.local_solve_diagnostics
+    )
     for diagnostic in opt.svd_diagnostics:
         assert diagnostic["left"]["bond_dim"] <= 3
         assert diagnostic["right"]["bond_dim"] <= 3
         assert diagnostic["left"]["num_sectors"] >= 1
         assert diagnostic["right"]["num_sectors"] >= 1
+
+
+def test_symdmrg2_lanczos_reaches_fixed_sector_ed_with_full_initial_support():
+    """With enough initial bond sectors, Lanczos reaches the OBC FH ED energy."""
+    pytest.importorskip("symmray")
+    edges = [(site, site + 1) for site in range(3)]
+    occupations = [(1, 0), (0, 1), (1, 0), (0, 1)]
+    state, mpo = _fh_u1u1_chain(
+        4,
+        occupations,
+        bond_dim=12,
+        seed=31,
+        U=1.0,
+        mu=0.1,
+    )
+    ed_energy = _fixed_u1u1_sector_ground_energy(
+        4,
+        edges,
+        (2, 2),
+        t=1.0,
+        U=1.0,
+        mu=0.1,
+    )
+    initial_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy.real
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=16,
+        cutoff=1e-12,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-11,
+        local_eig_ncv=16,
+        norm_check_samples=3,
+    )
+    opt.solve(tol=0.0)
+    post_energy = pepsy.MpsEnergyOptimizer(
+        opt.state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert opt.energy == pytest.approx(ed_energy, abs=1e-10)
+    assert opt.energy <= initial_energy
+    assert complex(post_energy) == pytest.approx(complex(opt.energy))
+    assert opt.state.max_bond() <= 16
+    assert len(opt.norm_identity_diagnostics) == 2 * (4 - 1)
+    assert len(opt.local_solve_diagnostics) == 2 * (4 - 1)
+    assert all(diag["passed"] for diag in opt.norm_identity_diagnostics)
+    assert max(diag["error"] for diag in opt.norm_identity_diagnostics) < 1e-12
+    assert all(diag["solver"] == "lanczos" for diag in opt.local_solve_diagnostics)
+    assert all(diag["theta_dim"] > 2 for diag in opt.local_solve_diagnostics)
 
 
 def test_symdmrg2_lanczos_stress_obc_six_site_chain_tracks_svd_sectors():

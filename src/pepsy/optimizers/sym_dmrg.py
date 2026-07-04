@@ -452,6 +452,9 @@ class SymDMRG2:
         self.left_block_envs = None
         self.right_block_envs = None
         self.svd_diagnostics = []
+        self.norm_identity_diagnostics = []
+        self.local_solve_diagnostics = []
+        self._current_sweep_direction = None
 
         if self.backend == "symmray" and self.mps is not None:
             self._state = self._prepare_symmray_state(self.mps)
@@ -476,6 +479,20 @@ class SymDMRG2:
         if not self.svd_diagnostics:
             return None
         return self.svd_diagnostics[-1]
+
+    @property
+    def last_norm_identity_diagnostic(self):
+        """Most recent effective-norm identity diagnostic, if any."""
+        if not self.norm_identity_diagnostics:
+            return None
+        return self.norm_identity_diagnostics[-1]
+
+    @property
+    def last_local_solve_diagnostic(self):
+        """Most recent two-site local solver diagnostic, if any."""
+        if not self.local_solve_diagnostics:
+            return None
+        return self.local_solve_diagnostics[-1]
 
     def _compute_initial_energy(self):
         if self.init_mps is None:
@@ -1563,8 +1580,19 @@ class SymDMRG2:
         theta_opt = space.unflatten(vector)
         return float(evals[0].real), theta_opt
 
-    def _check_effective_norm_identity(self, site, theta):
+    def _check_effective_norm_identity(self, site, theta, *, dim=None):
         norm_error = self.effective_norm_identity_error(site, theta)
+        diagnostic = {
+            "site": int(site),
+            "right_site": int(site + 1),
+            "direction": self._current_sweep_direction,
+            "theta_dim": None if dim is None else int(dim),
+            "error": float(norm_error),
+            "tol": self.norm_check_tol,
+            "samples": self.norm_check_samples,
+            "passed": bool(norm_error <= self.norm_check_tol),
+        }
+        self.norm_identity_diagnostics.append(diagnostic)
         if norm_error <= self.norm_check_tol:
             return norm_error
         raise ValueError(
@@ -1576,6 +1604,30 @@ class SymDMRG2:
             "only as an explicit diagnostic."
         )
 
+    def _record_local_solve_diagnostic(
+        self,
+        site,
+        *,
+        solver,
+        requested_solver,
+        dim,
+        energy,
+        norm_error=None,
+    ):
+        self.local_solve_diagnostics.append(
+            {
+                "site": int(site),
+                "right_site": int(site + 1),
+                "direction": self._current_sweep_direction,
+                "solver": solver,
+                "requested_solver": requested_solver,
+                "theta_dim": int(dim),
+                "energy": float(energy),
+                "norm_error": None if norm_error is None else float(norm_error),
+                "matvec_backend": self._resolved_matvec_backend(),
+            }
+        )
+
     def local_eigensolve(self, site):
         """Solve one two-site local problem using the configured Symmray path."""
         theta = self.two_site_theta(site)
@@ -1584,20 +1636,41 @@ class SymDMRG2:
         if dim == 0:
             raise ValueError("The two-site theta tensor has no active blocks.")
 
-        solver = self.local_solver
+        requested_solver = self.local_solver
+        solver = requested_solver
         if solver == "auto":
             solver = "dense" if dim <= self.dense_threshold else "lanczos"
 
         if solver == "generalized_dense":
-            return self.dense_generalized_local_eigensolve(site)
+            energy, theta_opt = self.dense_generalized_local_eigensolve(site)
+            self._record_local_solve_diagnostic(
+                site,
+                solver="generalized_dense",
+                requested_solver=requested_solver,
+                dim=dim,
+                energy=energy,
+            )
+            return energy, theta_opt
 
-        self._check_effective_norm_identity(site, theta)
+        norm_error = self._check_effective_norm_identity(site, theta, dim=dim)
 
         if solver == "dense":
-            return self.dense_local_eigensolve(site)
-        if solver == "lanczos":
-            return self.lanczos_local_eigensolve(site, theta=theta)
-        raise ValueError(f"Unknown local solver mode {solver!r}.")
+            energy, theta_opt = self.dense_local_eigensolve(site)
+            solver_used = "dense"
+        elif solver == "lanczos":
+            energy, theta_opt = self.lanczos_local_eigensolve(site, theta=theta)
+            solver_used = "dense" if dim <= 2 else "lanczos"
+        else:
+            raise ValueError(f"Unknown local solver mode {solver!r}.")
+        self._record_local_solve_diagnostic(
+            site,
+            solver=solver_used,
+            requested_solver=requested_solver,
+            dim=dim,
+            energy=energy,
+            norm_error=norm_error,
+        )
+        return energy, theta_opt
 
     def dense_generalized_local_eigensolve(
         self,
@@ -1737,25 +1810,30 @@ class SymDMRG2:
             self.build_block_environments()
 
         last_energy = None
-        for site in sites:
-            last_energy, theta = self.local_eigensolve(site)
-            self._replace_two_site_theta(
-                site,
-                theta,
-                chi=chi,
-                cutoff=cutoff,
-                direction=split_direction,
-            )
-            if direction == "right":
-                self.update_left_environment(site)
-                self.update_left_norm_environment(site)
-                if self.left_block_envs is not None:
-                    self.update_left_block_environment(site)
-            else:
-                self.update_right_environment(site + 1)
-                self.update_right_norm_environment(site + 1)
-                if self.right_block_envs is not None:
-                    self.update_right_block_environment(site + 1)
+        previous_direction = self._current_sweep_direction
+        self._current_sweep_direction = direction
+        try:
+            for site in sites:
+                last_energy, theta = self.local_eigensolve(site)
+                self._replace_two_site_theta(
+                    site,
+                    theta,
+                    chi=chi,
+                    cutoff=cutoff,
+                    direction=split_direction,
+                )
+                if direction == "right":
+                    self.update_left_environment(site)
+                    self.update_left_norm_environment(site)
+                    if self.left_block_envs is not None:
+                        self.update_left_block_environment(site)
+                else:
+                    self.update_right_environment(site + 1)
+                    self.update_right_norm_environment(site + 1)
+                    if self.right_block_envs is not None:
+                        self.update_right_block_environment(site + 1)
+        finally:
+            self._current_sweep_direction = previous_direction
         return last_energy
 
     def _solve_quimb(
@@ -1882,4 +1960,8 @@ class SymDMRG2:
             "converged": self.converged,
             "num_svd_diagnostics": len(self.svd_diagnostics),
             "last_svd_diagnostic": self.last_svd_diagnostic,
+            "num_norm_identity_diagnostics": len(self.norm_identity_diagnostics),
+            "last_norm_identity_diagnostic": self.last_norm_identity_diagnostic,
+            "num_local_solve_diagnostics": len(self.local_solve_diagnostics),
+            "last_local_solve_diagnostic": self.last_local_solve_diagnostic,
         }

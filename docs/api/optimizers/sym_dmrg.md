@@ -17,7 +17,11 @@ unless the explicit diagnostic `local_solver="generalized_dense"` mode is
 requested. Every Symmray two-site writeback records an entry in
 `svd_diagnostics`, including the split direction, bond name, `chi`, cutoff,
 and the left/right charge sectors kept by Symmray's SVD.
-`last_svd_diagnostic` exposes the most recent entry.
+`last_svd_diagnostic` exposes the most recent entry. The Symmray path also
+records `norm_identity_diagnostics` for the per-window `N_eff ~= I` canonical
+check and `local_solve_diagnostics` for the resolved dense/Lanczos solver,
+theta-space dimension, local energy, and matvec backend used at each two-site
+solve.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.sym_dmrg
