@@ -211,11 +211,12 @@ data too early.
    applies a quimb-compatible Lanczos `LinearOperator` in the exact current
    `theta` block layout, and keeps the explicit dense `N_eff` generalized solve
    as a validator/fallback. The SVD writeback records the charge sectors kept
-   on every split. A direct Symmray-native matvec still needs a safe
-   intermediate index-expansion adapter, because naive contractions can prune
-   shared charge maps before later tensors see the full virtual/MPO index.
-   Torch/autodiff support and PBC segment-compressed environments remain
-   separate performance problems from the fermion algebra.
+   on every split. The default projected `H_eff` matvec now uses Symmray block
+   contractions with one-shared-leg contraction plus internal traces, avoiding
+   the fused multi-leg shape-mismatch path. The dense-aligned matvec remains
+   available as a reference validator. Torch/autodiff support and PBC
+   segment-compressed environments remain separate performance problems from
+   the fermion algebra.
 
 ## Acceptance Criteria For The True MPO Fix
 

@@ -1,5 +1,6 @@
 """Tests for the SymDMRG2 public driver scaffold."""
 
+import numpy as np
 import quimb.tensor as qtn
 import pytest
 
@@ -178,6 +179,70 @@ def test_symdmrg2_linear_operator_matches_dense_effective_hamiltonian():
     vectors = vector.reshape(-1, 1)
     vectors = vectors.repeat(2, axis=1)
     assert operator @ vectors == pytest.approx(matrix @ vectors)
+
+
+def test_symdmrg2_block_native_matvec_matches_dense_reference_all_sites():
+    """The Symmray matvec should equal the dense validator in theta space."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+        seed=19,
+        U=1.25,
+        mu=0.05,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        matvec_backend="symmray",
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_block_environments()
+
+    rng = np.random.default_rng(4)
+    for site in range(opt.state.L - 1):
+        theta = opt.two_site_theta(site)
+        space = opt.two_site_theta_space(site, theta)
+        vector = rng.standard_normal(space.dim) + 1.0j * rng.standard_normal(space.dim)
+        trial = space.unflatten(vector)
+
+        dense = opt.two_site_matvec_dense_reference(site, trial)
+        native = opt.two_site_matvec_symmray(site, trial)
+
+        assert native.inds == dense.inds == theta.inds
+        assert set(native.data.blocks) == set(dense.data.blocks) == set(theta.data.blocks)
+        for sector in theta.data.blocks:
+            assert native.data.blocks[sector] == pytest.approx(dense.data.blocks[sector])
+
+
+def test_symdmrg2_dense_reference_matvec_backend_remains_selectable():
+    """The dense-aligned matvec stays available as a debug fallback."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        matvec_backend="dense_reference",
+    )
+    theta = opt.two_site_theta(0)
+    via_dispatch = opt.two_site_matvec(0, theta)
+    direct = opt.two_site_matvec_dense_reference(0, theta)
+
+    assert opt.summary()["matvec_backend"] == "dense_reference"
+    assert opt.summary()["resolved_matvec_backend"] == "dense_reference"
+    assert set(via_dispatch.data.blocks) == set(direct.data.blocks)
+    for sector in theta.data.blocks:
+        assert via_dispatch.data.blocks[sector] == pytest.approx(direct.data.blocks[sector])
 
 
 def test_symdmrg2_lanczos_matches_dense_after_canonicalization():

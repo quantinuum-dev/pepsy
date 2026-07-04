@@ -11,6 +11,7 @@ the current theta block layout.
 from __future__ import annotations
 
 from itertools import product
+import string
 
 import numpy as np
 from scipy.sparse.linalg import LinearOperator
@@ -230,6 +231,28 @@ def _normalize_local_solver(local_solver):
         ) from exc
 
 
+def _normalize_matvec_backend(matvec_backend):
+    key = str(matvec_backend).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto",
+        "dense": "dense_reference",
+        "dense_reference": "dense_reference",
+        "reference": "dense_reference",
+        "numpy": "dense_reference",
+        "symmray": "symmray",
+        "block": "symmray",
+        "block_sparse": "symmray",
+        "block_native": "symmray",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown matvec_backend {matvec_backend!r}. Expected one of: {allowed}."
+        ) from exc
+
+
 class _ThetaSpace:
     """Flat vector adapter for one fixed Symmray two-site theta layout."""
 
@@ -338,6 +361,11 @@ class SymDMRG2:
         Symmray OBC path, a failed check is treated as a canonicalization or
         alignment error unless ``local_solver="generalized_dense"`` is
         explicitly requested for debugging.
+    matvec_backend
+        Projected Hamiltonian matvec implementation for the Symmray path.
+        ``"auto"`` uses the block-native Symmray contraction, while
+        ``"dense_reference"`` keeps the older NumPy dense-aligned contraction
+        as an explicit fallback and validator.
     """
 
     def __init__(
@@ -362,6 +390,7 @@ class SymDMRG2:
         local_eig_backend=None,
         norm_check_tol=1e-6,
         norm_check_samples=2,
+        matvec_backend="auto",
         dmrg_opts=None,
     ):
         if chi is None:
@@ -394,6 +423,7 @@ class SymDMRG2:
         self.local_eig_backend = local_eig_backend
         self.norm_check_tol = float(norm_check_tol)
         self.norm_check_samples = int(norm_check_samples)
+        self.matvec_backend = _normalize_matvec_backend(matvec_backend)
         self.dmrg_opts = {} if dmrg_opts is None else dict(dmrg_opts)
 
         requested_backend = _normalize_backend(backend)
@@ -419,6 +449,8 @@ class SymDMRG2:
         self.right_envs = None
         self.left_norm_envs = None
         self.right_norm_envs = None
+        self.left_block_envs = None
+        self.right_block_envs = None
         self.svd_diagnostics = []
 
         if self.backend == "symmray" and self.mps is not None:
@@ -467,6 +499,14 @@ class SymDMRG2:
     def _bra_site_ind(site):
         return f"b{site}"
 
+    @staticmethod
+    def _input_ind(ind):
+        return f"{ind}__symdmrg_in"
+
+    @staticmethod
+    def _bra_bond_ind(ind):
+        return f"{ind}__symdmrg_bra"
+
     def _prepare_symmray_state(self, state):
         state = _unwrap_state(state)
         if any(_is_fermionic_symmray_array(data) for data in _iter_tensor_data(state)):
@@ -490,6 +530,37 @@ class SymDMRG2:
         bra = self._state.H
         bra.reindex_({self._site_ind(site): self._bra_site_ind(site) for site in range(self._state.L)})
         return bra
+
+    def _state_bond_input_map(self):
+        return {
+            self._state.bond(site, site + 1): self._input_ind(
+                self._state.bond(site, site + 1)
+            )
+            for site in range(self._state.L - 1)
+        }
+
+    def _state_bond_bra_map(self):
+        return {
+            self._state.bond(site, site + 1): self._bra_bond_ind(
+                self._state.bond(site, site + 1)
+            )
+            for site in range(self._state.L - 1)
+        }
+
+    def _make_block_bra(self):
+        bra = self._state.H
+        reindex = {
+            self._site_ind(site): self._bra_site_ind(site)
+            for site in range(self._state.L)
+        }
+        reindex.update(self._state_bond_bra_map())
+        bra.reindex_(reindex)
+        return bra
+
+    def _ket_input_tensor(self, site):
+        ket_map = self._state_bond_input_map()
+        reindex = {ind: ket_map[ind] for ind in self._state[site].inds if ind in ket_map}
+        return self._state[site].reindex(reindex, inplace=False)
 
     @staticmethod
     def _index_for_tensor_ind(tensor, ind):
@@ -773,6 +844,86 @@ class SymDMRG2:
         self.right_envs[site] = self._right_env_step(site, self.right_envs[site + 1], bra)
         return self.right_envs[site]
 
+    def _block_left_env_step(self, site, env, bra):
+        output = ()
+        if site < self._state.L - 1:
+            bond = self._state.bond(site, site + 1)
+            output = (
+                self._bra_bond_ind(bond),
+                self.mpo.bond(site, site + 1),
+                self._input_ind(bond),
+            )
+
+        out = self._contract_block_pair(self.mpo[site], self._ket_input_tensor(site))
+        out = self._contract_block_pair(bra[site], out)
+        if env is not None:
+            out = self._contract_block_pair(env, out)
+        return out.transpose(*output)
+
+    def _block_right_env_step(self, site, env, bra):
+        output = ()
+        if site > 0:
+            bond = self._state.bond(site - 1, site)
+            output = (
+                self._bra_bond_ind(bond),
+                self.mpo.bond(site - 1, site),
+                self._input_ind(bond),
+            )
+
+        out = self._contract_block_pair(self.mpo[site], self._ket_input_tensor(site))
+        out = self._contract_block_pair(bra[site], out)
+        if env is not None:
+            out = self._contract_block_pair(env, out)
+        return out.transpose(*output)
+
+    def build_block_environments(self):
+        """Build Symmray block-sparse environments for ``<psi|MPO|psi>``."""
+        if self.backend != "symmray":
+            raise ValueError("build_block_environments is only used by backend='symmray'.")
+        if self._state is None:
+            raise ValueError("SymDMRG2 requires init_mps before building environments.")
+
+        bra = self._make_block_bra()
+        left = [None] * (self._state.L + 1)
+        current = None
+        for site in range(self._state.L):
+            current = self._block_left_env_step(site, current, bra)
+            left[site + 1] = current
+
+        right = [None] * (self._state.L + 1)
+        current = None
+        for site in reversed(range(self._state.L)):
+            current = self._block_right_env_step(site, current, bra)
+            right[site] = current
+
+        self.left_block_envs = left
+        self.right_block_envs = right
+        return left, right
+
+    def update_left_block_environment(self, site):
+        """Incrementally refresh the block left environment through ``site``."""
+        if self.left_block_envs is None:
+            self.build_block_environments()
+        bra = self._make_block_bra()
+        self.left_block_envs[site + 1] = self._block_left_env_step(
+            site,
+            self.left_block_envs[site],
+            bra,
+        )
+        return self.left_block_envs[site + 1]
+
+    def update_right_block_environment(self, site):
+        """Incrementally refresh the block right environment through ``site``."""
+        if self.right_block_envs is None:
+            self.build_block_environments()
+        bra = self._make_block_bra()
+        self.right_block_envs[site] = self._block_right_env_step(
+            site,
+            self.right_block_envs[site + 1],
+            bra,
+        )
+        return self.right_block_envs[site]
+
     def _norm_left_env_step(self, site, env, bra):
         labels = {}
         next_label = 0
@@ -946,6 +1097,145 @@ class SymDMRG2:
         order = tuple(ind for ind in self._theta_order(site) if ind in theta.inds)
         return theta.transpose(*order)
 
+    @staticmethod
+    def _trace_block_tensor_axes(tensor, axis_a, axis_b):
+        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+        labels = []
+        symbol_iter = iter(string.ascii_letters)
+        trace_label = next(symbol_iter)
+        for axis in range(len(tensor.inds)):
+            if axis == axis_a or axis == axis_b:
+                labels.append(trace_label)
+            else:
+                try:
+                    labels.append(next(symbol_iter))
+                except StopIteration as exc:  # pragma: no cover - defensive guard
+                    raise ValueError("Too many tensor axes for SymDMRG2 trace helper.") from exc
+        output_labels = [
+            label for axis, label in enumerate(labels) if axis not in (axis_a, axis_b)
+        ]
+        data = tensor.data.einsum(
+            "".join(labels) + "->" + "".join(output_labels),
+            preserve_array=True,
+        )
+        inds = list(tensor.inds)
+        for axis in sorted((axis_a, axis_b), reverse=True):
+            inds.pop(axis)
+        return qtn.Tensor(data=data, inds=tuple(inds), tags=tensor.tags)
+
+    def _trace_block_tensor_inds(self, tensor, ind_a, ind_b):
+        if ind_a == ind_b:
+            axes = [axis for axis, ind in enumerate(tensor.inds) if ind == ind_a]
+            if len(axes) < 2:
+                raise ValueError(f"Tensor does not contain two copies of index {ind_a!r}.")
+            axis_a, axis_b = axes[:2]
+        else:
+            axis_a = tensor.inds.index(ind_a)
+            axis_b = tensor.inds.index(ind_b)
+        return self._trace_block_tensor_axes(tensor, axis_a, axis_b)
+
+    def _contract_block_pair(self, left, right):
+        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+        shared = tuple(ind for ind in left.inds if ind in right.inds)
+        if not shared:
+            data = left.data.tensordot(
+                right.data,
+                axes=((), ()),
+                mode="blockwise",
+                preserve_array=True,
+            )
+            return qtn.Tensor(
+                data=data,
+                inds=tuple(left.inds) + tuple(right.inds),
+                tags=left.tags | right.tags,
+            )
+
+        first, *remaining = shared
+        right_work = right
+        trace_pairs = []
+        for num, ind in enumerate(remaining):
+            temp_ind = f"{ind}__symdmrg_rhs{num}"
+            right_work = right_work.reindex({ind: temp_ind}, inplace=False)
+            trace_pairs.append((ind, temp_ind))
+
+        left_axis = left.inds.index(first)
+        right_axis = right_work.inds.index(first)
+        data = left.data.tensordot(
+            right_work.data,
+            axes=((left_axis,), (right_axis,)),
+            mode="blockwise",
+            preserve_array=True,
+        )
+        inds = (
+            tuple(ind for axis, ind in enumerate(left.inds) if axis != left_axis)
+            + tuple(
+                ind for axis, ind in enumerate(right_work.inds) if axis != right_axis
+            )
+        )
+        out = qtn.Tensor(data=data, inds=inds, tags=left.tags | right.tags)
+        for ind, temp_ind in trace_pairs:
+            out = self._trace_block_tensor_inds(out, ind, temp_ind)
+        return out
+
+    def _block_env_for_left_cut(self, site):
+        if site == 0:
+            return None
+        if self.left_block_envs is None:
+            self.build_block_environments()
+        bond = self._state.bond(site - 1, site)
+        env = self.left_block_envs[site]
+        return env.reindex({self._bra_bond_ind(bond): bond}, inplace=False)
+
+    def _block_env_for_right_cut(self, right_site):
+        if right_site == self._state.L - 1:
+            return None
+        if self.right_block_envs is None:
+            self.build_block_environments()
+        bond = self._state.bond(right_site, right_site + 1)
+        env = self.right_block_envs[right_site + 1]
+        return env.reindex({self._bra_bond_ind(bond): bond}, inplace=False)
+
+    def _active_mpo_tensor_for_matvec(self, site, input_map):
+        reindex = {
+            self._site_ind(site): input_map[self._site_ind(site)],
+            self._bra_site_ind(site): self._site_ind(site),
+        }
+        return self.mpo[site].reindex(reindex, inplace=False)
+
+    def two_site_matvec_symmray(self, site, theta=None):
+        """Apply ``H_eff`` using Symmray block contractions."""
+        theta = self.two_site_theta(site) if theta is None else theta
+        right_site = site + 1
+        if self.left_block_envs is None or self.right_block_envs is None:
+            self.build_block_environments()
+
+        input_map = {ind: self._input_ind(ind) for ind in theta.inds}
+        theta_in = theta.reindex(input_map, inplace=False)
+        w_left = self._active_mpo_tensor_for_matvec(site, input_map)
+        w_right = self._active_mpo_tensor_for_matvec(right_site, input_map)
+        left_env = self._block_env_for_left_cut(site)
+        right_env = self._block_env_for_right_cut(right_site)
+
+        out = w_right
+        if right_env is not None:
+            out = self._contract_block_pair(out, right_env)
+        out = self._contract_block_pair(out, theta_in)
+        out = self._contract_block_pair(w_left, out)
+        if left_env is not None:
+            out = self._contract_block_pair(left_env, out)
+        out = out.transpose(*theta.inds)
+
+        blocks = {}
+        for sector, template in theta.data.blocks.items():
+            blocks[sector] = out.data.blocks.get(
+                sector,
+                np.zeros_like(_to_numpy(template)),
+            )
+        data = _array_with_blocks_like(theta.data, blocks)
+        return _tensor_with_data(theta, data)
+
     def _matvec_dense(self, site, theta_dense):
         if self.left_envs is None or self.right_envs is None:
             self.build_environments()
@@ -1025,12 +1315,11 @@ class SymDMRG2:
                 output.append(label("phys_b_r"))
         return self._einsum(arrays, subscripts, output)
 
-    def two_site_matvec(self, site, theta=None):
-        """Apply the two-site effective Hamiltonian to ``theta``.
+    def two_site_matvec_dense_reference(self, site, theta=None):
+        """Apply ``H_eff`` with the NumPy dense-aligned reference path.
 
         The returned tensor has the same block sectors as the input two-site
-        tensor. This is the dense reference matvec used by the first local
-        eigensolver and by tests for the future Lanczos implementation.
+        tensor.
         """
         theta = self.two_site_theta(site) if theta is None else theta
         full_indices = self._theta_full_indices(site, theta)
@@ -1043,6 +1332,26 @@ class SymDMRG2:
         blocks = _blocks_from_projected_dense(out_dense, full_indices, theta.data)
         data = _array_with_blocks_like(theta.data, blocks)
         return _tensor_with_data(theta, data)
+
+    def _resolved_matvec_backend(self):
+        if self.matvec_backend == "auto":
+            return "symmray" if self.backend == "symmray" else "dense_reference"
+        return self.matvec_backend
+
+    def two_site_matvec(self, site, theta=None):
+        """Apply the two-site effective Hamiltonian to ``theta``.
+
+        The returned tensor has the same block sectors as the input two-site
+        tensor. ``matvec_backend="symmray"`` contracts the projected local
+        network with Symmray blocks; ``"dense_reference"`` keeps the older
+        NumPy dense-aligned validator.
+        """
+        backend = self._resolved_matvec_backend()
+        if backend == "symmray":
+            return self.two_site_matvec_symmray(site, theta)
+        if backend == "dense_reference":
+            return self.two_site_matvec_dense_reference(site, theta)
+        raise ValueError(f"Unknown resolved matvec backend {backend!r}.")
 
     def _norm_matvec_dense(self, site, theta_dense):
         if self.left_norm_envs is None or self.right_norm_envs is None:
@@ -1390,6 +1699,8 @@ class SymDMRG2:
         self.right_envs = None
         self.left_norm_envs = None
         self.right_norm_envs = None
+        self.left_block_envs = None
+        self.right_block_envs = None
 
     def _canonize_for_sweep(self, direction):
         method_name = {
@@ -1422,6 +1733,8 @@ class SymDMRG2:
             self._canonize_for_sweep(direction)
         self.build_environments()
         self.build_norm_environments()
+        if self._resolved_matvec_backend() == "symmray":
+            self.build_block_environments()
 
         last_energy = None
         for site in sites:
@@ -1436,9 +1749,13 @@ class SymDMRG2:
             if direction == "right":
                 self.update_left_environment(site)
                 self.update_left_norm_environment(site)
+                if self.left_block_envs is not None:
+                    self.update_left_block_environment(site)
             else:
                 self.update_right_environment(site + 1)
                 self.update_right_norm_environment(site + 1)
+                if self.right_block_envs is not None:
+                    self.update_right_block_environment(site + 1)
         return last_energy
 
     def _solve_quimb(
@@ -1556,6 +1873,8 @@ class SymDMRG2:
             "local_eig_maxiter": self.local_eig_maxiter,
             "local_eig_backend": self.local_eig_backend,
             "norm_check_tol": self.norm_check_tol,
+            "matvec_backend": self.matvec_backend,
+            "resolved_matvec_backend": self._resolved_matvec_backend(),
             "sweeps": self.sweeps,
             "total_charge": self.total_charge,
             "initial_energy": self.initial_energy,

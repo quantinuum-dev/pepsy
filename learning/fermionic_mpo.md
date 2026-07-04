@@ -139,9 +139,10 @@ the interruption.
   diagnostic. After OBC canonicalization, `N_eff` should be identity-like; if
   it is not, the normal dense/Lanczos path raises a canonicalization/alignment
   error rather than quietly solving a generalized problem.
-- The real remaining DMRG work is performance and scale. A Symmray-native
-  projected-matvec probe showed that intermediate contractions can prune charge
-  maps on shared virtual/MPO legs, producing shape mismatches unless those
-  indices are safely re-expanded after each step. Until that adapter is in
-  place, the stable path remains Lanczos over exact theta blocks with dense
-  embedding inside each matvec.
+- The projected `H_eff` matvec is now block-native by default. The key lesson
+  from the failed probe was not to use Symmray's fused multi-leg contraction
+  blindly: intermediate contractions can prune charge maps or expose composite
+  axes with mismatched degeneracies. The working path contracts one shared leg
+  at a time, traces any remaining shared legs inside the resulting Symmray
+  tensor, then projects the result back to the current theta block sectors.
+  The dense-aligned matvec remains selectable as a validation fallback.

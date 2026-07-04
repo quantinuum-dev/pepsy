@@ -176,16 +176,19 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   long-range terms in an OBC MPO.
 - The Pepsy-native Symmray DMRG internals now include dense left/right
   environments for `<psi|MPO|psi>`, dense norm environments for `<psi|psi>`,
-  sector-preserving `H_eff` and `N_eff` matvecs in the exact current `theta`
-  block layout, an explicit dense generalized diagnostic solve, and a
-  quimb-style Lanczos/LinearOperator local solver after MPS canonicalization.
-  The SVD writeback now records the actual Symmray bond sectors kept at each
-  two-site split.
-- The next DMRG step is performance and scale: reduce dense embedding inside
-  the local matvec and add torch-native block contractions where useful. A
-  first Symmray-native contraction probe showed that intermediate contractions
-  can prune shared charge maps, so the block-native matvec needs a safe sparse
-  index-expansion adapter before replacing the current dense-aligned matvec.
+  block-sparse environments for projected `H_eff`, sector-preserving `H_eff`
+  and `N_eff` matvecs in the exact current `theta` block layout, an explicit
+  dense generalized diagnostic solve, and a quimb-style Lanczos/LinearOperator
+  local solver after MPS canonicalization. The SVD writeback records the
+  actual Symmray bond sectors kept at each two-site split.
+- The Symmray `H_eff` matvec is now block-native by default. It avoids
+  Symmray's fused multi-leg shape-mismatch path by contracting one shared leg
+  at a time and tracing the remaining shared legs, then projecting back to the
+  current theta block sectors. The dense-aligned matvec remains available as
+  `matvec_backend="dense_reference"` for validation.
+- The next DMRG step is performance and scale: profile the block-native matvec,
+  reduce repeated environment work, and later add torch-native block
+  contractions where useful.
 
 ### Validation
 
