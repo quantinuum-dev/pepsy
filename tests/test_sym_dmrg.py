@@ -1238,6 +1238,11 @@ def test_symdmrg2_auto_solver_defaults_to_matrix_free_lanczos():
     assert diagnostic["requested_solver"] == "auto"
     assert diagnostic["theta_dim"] > 2
     assert diagnostic["solver"] == "lanczos"
+    assert diagnostic["current_theta_blocks"] <= diagnostic["widened_theta_blocks"]
+    assert diagnostic["current_theta_dim"] <= diagnostic["widened_theta_dim"]
+    assert diagnostic["pruned_theta_blocks"] <= diagnostic["widened_theta_blocks"]
+    assert diagnostic["pruned_theta_dim"] == diagnostic["theta_dim"]
+    assert diagnostic["prune_method"] == "structural"
 
 
 def test_symdmrg2_rejects_cyclic_symmray_mps_chain():
@@ -1332,6 +1337,8 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
     assert compression["max_truncation_error"] is not None
     for diagnostic in opt.svd_diagnostics:
         assert "truncation_error" in diagnostic
+        assert diagnostic["optimized_theta_blocks"] >= diagnostic["left"]["num_sectors"]
+        assert diagnostic["optimized_theta_dim"] >= diagnostic["optimized_theta_blocks"]
         assert diagnostic["left"]["bond_dim"] <= 3
         assert diagnostic["right"]["bond_dim"] <= 3
         assert diagnostic["left"]["num_sectors"] >= 1
@@ -1508,6 +1515,8 @@ def test_symdmrg2_prunes_projected_dead_variational_blocks_on_mapped_2d_case():
     assert diagnostic["removed_blocks"] > 0
     assert diagnostic["kept_blocks"] < diagnostic["input_blocks"]
     assert diagnostic["kept_dim"] < diagnostic["input_dim"]
+    assert diagnostic["method"] == "structural"
+    assert diagnostic["live_blocks"] <= diagnostic["kept_blocks"]
     assert set(pruned.data.blocks) < set(theta.data.blocks)
 
 

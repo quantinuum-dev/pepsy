@@ -511,21 +511,37 @@ def _tensor_block_linear_combination(template, terms):
     blocks = {}
     coeff_dtypes = [np.asarray(coeff).dtype for coeff, _ in terms]
     for sector, block in template.data.blocks.items():
-        arrays = [_to_numpy(tensor.data.blocks[sector]) for _, tensor in terms]
+        template_block = _to_numpy(block)
+        arrays = tuple(_to_numpy(tensor.data.blocks[sector]) for _, tensor in terms)
         dtype = np.result_type(
-            _to_numpy(block).dtype,
+            template_block.dtype,
             *coeff_dtypes,
             *(arr.dtype for arr in arrays),
         )
-        out = np.zeros(getattr(block, "shape", ()), dtype=dtype)
-        for (coeff, _), arr in zip(terms, arrays):
-            out = out + coeff * arr
+        out = np.empty(getattr(block, "shape", ()), dtype=dtype)
+        work = None
+        for term_num, ((coeff, _), arr) in enumerate(zip(terms, arrays)):
+            target = out if term_num == 0 else work
+            if target is None:
+                work = np.empty_like(out)
+                target = work
+            np.multiply(arr, coeff, out=target, casting="unsafe")
+            if term_num != 0:
+                np.add(out, target, out=out, casting="unsafe")
         blocks[sector] = out
     return _tensor_with_data(template, _array_with_blocks_like(template.data, blocks))
 
 
 def _tensor_block_scale(tensor, coeff):
-    return _tensor_block_linear_combination(tensor, ((coeff, tensor),))
+    coeff_dtype = np.asarray(coeff).dtype
+    blocks = {}
+    for sector, block in tensor.data.blocks.items():
+        array = _to_numpy(block)
+        dtype = np.result_type(array.dtype, coeff_dtype)
+        out = np.empty(getattr(block, "shape", ()), dtype=dtype)
+        np.multiply(array, coeff, out=out, casting="unsafe")
+        blocks[sector] = out
+    return _tensor_with_data(tensor, _array_with_blocks_like(tensor.data, blocks))
 
 
 def _add_elapsed(timings, key, start):
@@ -553,6 +569,8 @@ class _BlockPairContraction:
         self.trace_pairs = []
         self.left_axes = ()
         self.right_axes = ()
+        self.left_output_axes = tuple(range(len(self.left_inds)))
+        self.right_output_axes = tuple(range(len(self.right_inds)))
 
         if not self.shared:
             self.left_axis = None
@@ -570,12 +588,36 @@ class _BlockPairContraction:
         self.right_axes = tuple(self.right_inds.index(ind) for ind in self.shared)
         self.left_axis = self.left_axes[0]
         self.right_axis = self.right_axes[0]
+        self.left_output_axes = tuple(
+            axis for axis, ind in enumerate(self.left_inds) if ind not in self.shared
+        )
+        self.right_output_axes = tuple(
+            axis for axis, ind in enumerate(self.right_inds) if ind not in self.shared
+        )
         self.contract_output_inds = (
-            tuple(ind for ind in self.left_inds if ind not in self.shared)
-            + tuple(ind for ind in self.right_inds if ind not in self.shared)
+            tuple(self.left_inds[axis] for axis in self.left_output_axes)
+            + tuple(self.right_inds[axis] for axis in self.right_output_axes)
         )
         self.output_inds = self.contract_output_inds
         self.trace_subscript = None
+
+    def structural_output_sectors(self, right_sectors):
+        """Return block sectors possible after this contraction, ignoring values."""
+        right_sectors = tuple(right_sectors)
+        right_by_shared = {}
+        for sector in right_sectors:
+            key = tuple(sector[axis] for axis in self.right_axes)
+            right_by_shared.setdefault(key, []).append(sector)
+
+        out = set()
+        for left_sector in self.left.data.blocks:
+            key = tuple(left_sector[axis] for axis in self.left_axes)
+            for right_sector in right_by_shared.get(key, ()):
+                out.add(
+                    tuple(left_sector[axis] for axis in self.left_output_axes)
+                    + tuple(right_sector[axis] for axis in self.right_output_axes)
+                )
+        return out
 
     def apply(self, right, *, timings=None, prefix="contract"):
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
@@ -664,6 +706,7 @@ class _LocalProjectedProblem:
             else w_right
         )
         theta_input_inds = tuple(self.input_map.get(ind, ind) for ind in self.inds)
+        self.theta_input_inds = theta_input_inds
         left_stats = self._tensor_block_stats(self.left_projector, "left_projector")
         right_stats = self._tensor_block_stats(self.right_projector, "right_projector")
         # Keep the original right-first route unless the static projector
@@ -710,6 +753,24 @@ class _LocalProjectedProblem:
             and tuple(theta.inds) == self.inds
             and self._block_layout(theta) == self.block_layout
         )
+
+    @staticmethod
+    def _transpose_sectors(sectors, source_inds, target_inds):
+        axes = tuple(source_inds.index(ind) for ind in target_inds)
+        return {tuple(sector[axis] for axis in axes) for sector in sectors}
+
+    def structural_output_sectors(self):
+        """Return theta-layout sectors that can receive nonzero ``H_eff`` output."""
+        sectors = set(self.output_zeros)
+        if self.contraction_order == "left_first":
+            sectors = self.left_contraction.structural_output_sectors(sectors)
+            sectors = self.right_contraction.structural_output_sectors(sectors)
+            output_inds = self.right_contraction.output_inds
+        else:
+            sectors = self.right_contraction.structural_output_sectors(sectors)
+            sectors = self.left_contraction.structural_output_sectors(sectors)
+            output_inds = self.left_contraction.output_inds
+        return self._transpose_sectors(sectors, output_inds, self.inds)
 
     @staticmethod
     def _copy_block(block):
@@ -2865,19 +2926,6 @@ class SymDMRG2:
     def _block_norm(block):
         return float(np.linalg.norm(_to_numpy(block).reshape(-1)))
 
-    def _projected_support_probe_theta(self, theta, site):
-        rng = np.random.default_rng(
-            104729 * (len(self.energies) + 1) + 7919 * (int(site) + 1)
-        )
-        blocks = {}
-        for sector, block in theta.data.blocks.items():
-            dense = _to_numpy(block)
-            values = rng.standard_normal(dense.shape)
-            if np.issubdtype(dense.dtype, np.complexfloating):
-                values = values + 1.0j * rng.standard_normal(dense.shape)
-            blocks[sector] = np.asarray(values, dtype=dense.dtype)
-        return _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
-
     def _prune_theta_to_projected_support(self, site, theta):
         if self._resolved_matvec_backend() != "symmray":
             return theta, None
@@ -2885,18 +2933,8 @@ class SymDMRG2:
             return theta, None
 
         profile_start = self._profile_start()
-        probe = self._projected_support_probe_theta(theta, site)
-        projected = self.two_site_matvec_symmray(site, probe)
-        output_norms = {
-            sector: self._block_norm(block)
-            for sector, block in projected.data.blocks.items()
-        }
-        scale = max(output_norms.values(), default=0.0)
-        threshold = max(scale, 1.0) * 1e-13
-        live_sectors = {
-            sector for sector, norm in output_norms.items()
-            if norm > threshold
-        }
+        problem, _ = self._get_projected_problem(site, theta)
+        live_sectors = problem.structural_output_sectors() & set(theta.data.blocks)
         nonzero_input_sectors = {
             sector for sector, block in theta.data.blocks.items()
             if self._block_norm(block) > 0.0
@@ -2913,7 +2951,7 @@ class SymDMRG2:
                 "kept_dim": self._theta_dim(theta),
                 "live_blocks": len(live_sectors),
                 "nonzero_input_blocks": len(nonzero_input_sectors),
-                "threshold": float(threshold),
+                "method": "structural",
             }
             self._record_profile_elapsed(
                 "variational_sector_prune",
@@ -2925,6 +2963,8 @@ class SymDMRG2:
                 removed_blocks=0,
                 input_dim=diagnostic["input_dim"],
                 kept_dim=diagnostic["kept_dim"],
+                live_blocks=diagnostic["live_blocks"],
+                method=diagnostic["method"],
             )
             return theta, diagnostic
 
@@ -2947,7 +2987,7 @@ class SymDMRG2:
             "kept_dim": self._theta_dim(pruned),
             "live_blocks": len(live_sectors),
             "nonzero_input_blocks": len(nonzero_input_sectors),
-            "threshold": float(threshold),
+            "method": "structural",
         }
         self._record_profile_elapsed(
             "variational_sector_prune",
@@ -2959,6 +2999,8 @@ class SymDMRG2:
             removed_blocks=diagnostic["removed_blocks"],
             input_dim=diagnostic["input_dim"],
             kept_dim=diagnostic["kept_dim"],
+            live_blocks=diagnostic["live_blocks"],
+            method=diagnostic["method"],
         )
         return pruned, diagnostic
 
@@ -3320,6 +3362,60 @@ class SymDMRG2:
     @staticmethod
     def _theta_dim(theta):
         return _block_data_dim(theta.data)
+
+    def _theta_nonzero_blocks(self, theta):
+        return sum(
+            1
+            for block in getattr(theta.data, "blocks", {}).values()
+            if self._block_norm(block) > 0.0
+        )
+
+    def _theta_support_summary(self, theta, prefix):
+        blocks = getattr(theta.data, "blocks", {})
+        return {
+            f"{prefix}_blocks": len(blocks),
+            f"{prefix}_dim": self._theta_dim(theta),
+            f"{prefix}_nonzero_blocks": self._theta_nonzero_blocks(theta),
+        }
+
+    def _variational_theta_diagnostic(
+        self,
+        site,
+        *,
+        current_theta,
+        widened_theta,
+        pruned_theta,
+        pruning_diagnostic=None,
+    ):
+        diagnostic = {
+            "site": int(site),
+            "right_site": int(site + 1),
+        }
+        diagnostic.update(self._theta_support_summary(current_theta, "current_theta"))
+        diagnostic.update(self._theta_support_summary(widened_theta, "widened_theta"))
+        diagnostic.update(self._theta_support_summary(pruned_theta, "pruned_theta"))
+        diagnostic["widened_added_blocks"] = (
+            diagnostic["widened_theta_blocks"] - diagnostic["current_theta_blocks"]
+        )
+        diagnostic["widened_added_dim"] = (
+            diagnostic["widened_theta_dim"] - diagnostic["current_theta_dim"]
+        )
+        if pruning_diagnostic is not None:
+            diagnostic.update(
+                {
+                    "prune_method": pruning_diagnostic.get("method"),
+                    "prune_live_blocks": pruning_diagnostic.get("live_blocks"),
+                    "prune_removed_blocks": pruning_diagnostic.get("removed_blocks"),
+                    "prune_removed_dim": (
+                        pruning_diagnostic.get("input_dim", 0)
+                        - pruning_diagnostic.get("kept_dim", 0)
+                    ),
+                    "prune_nonzero_input_blocks": pruning_diagnostic.get(
+                        "nonzero_input_blocks"
+                    ),
+                }
+            )
+        return diagnostic
 
     def two_site_effective_hamiltonian(self, site, theta=None):
         """Return ``H_eff`` as a matrix-free operator in theta block space."""
@@ -3817,6 +3913,7 @@ class SymDMRG2:
         norm_error=None,
         residual_diagnostic=None,
         solver_info=None,
+        variational_diagnostic=None,
     ):
         residual_diagnostic = residual_diagnostic or {}
         diagnostic = {
@@ -3833,6 +3930,8 @@ class SymDMRG2:
             "residual_check_passed": residual_diagnostic.get("passed"),
             "matvec_backend": self._resolved_matvec_backend(),
         }
+        if variational_diagnostic:
+            diagnostic.update(variational_diagnostic)
         if solver_info:
             diagnostic.update(solver_info)
         self.local_solve_diagnostics.append(diagnostic)
@@ -3841,13 +3940,20 @@ class SymDMRG2:
         """Solve one two-site local problem using the configured Symmray path."""
         profile_start = self._profile_start()
         theta_current = self.two_site_theta(site)
-        theta = self.two_site_variational_theta(site, theta_current)
+        theta_widened = self.two_site_variational_theta(site, theta_current)
         theta, pruning_diagnostic = self._prune_theta_to_projected_support(
             site,
-            theta,
+            theta_widened,
         )
         if pruning_diagnostic is not None:
             self.variational_pruning_diagnostics.append(pruning_diagnostic)
+        variational_diagnostic = self._variational_theta_diagnostic(
+            site,
+            current_theta=theta_current,
+            widened_theta=theta_widened,
+            pruned_theta=theta,
+            pruning_diagnostic=pruning_diagnostic,
+        )
         self._last_local_input_theta = theta.copy()
         space = None
         dim = self._theta_dim(theta)
@@ -3892,6 +3998,7 @@ class SymDMRG2:
                 energy=energy,
                 residual_diagnostic=residual_diagnostic,
                 solver_info={"local_eig_backend": "generalized_dense"},
+                variational_diagnostic=variational_diagnostic,
             )
             self._record_profile_elapsed(
                 "local_solve",
@@ -3900,6 +4007,9 @@ class SymDMRG2:
                 right_site=int(site + 1),
                 solver="generalized_dense",
                 theta_dim=int(dim),
+                current_theta_dim=variational_diagnostic["current_theta_dim"],
+                widened_theta_dim=variational_diagnostic["widened_theta_dim"],
+                pruned_theta_dim=variational_diagnostic["pruned_theta_dim"],
                 energy=float(energy),
                 residual_norm=residual_diagnostic.get("residual_norm"),
             )
@@ -3958,6 +4068,7 @@ class SymDMRG2:
             norm_error=norm_error,
             residual_diagnostic=residual_diagnostic,
             solver_info=solver_info,
+            variational_diagnostic=variational_diagnostic,
         )
         self._record_profile_elapsed(
             "local_solve",
@@ -3966,6 +4077,9 @@ class SymDMRG2:
             right_site=int(site + 1),
             solver=solver_used,
             theta_dim=int(dim),
+            current_theta_dim=variational_diagnostic["current_theta_dim"],
+            widened_theta_dim=variational_diagnostic["widened_theta_dim"],
+            pruned_theta_dim=variational_diagnostic["pruned_theta_dim"],
             energy=float(energy),
             norm_error=None if norm_error is None else float(norm_error),
             residual_norm=residual_diagnostic.get("residual_norm"),
@@ -4065,6 +4179,7 @@ class SymDMRG2:
             info=split_info,
         )
         truncation_error = _optional_float(split_info.get("error"))
+        optimized_theta_summary = self._theta_support_summary(theta, "optimized_theta")
         self.svd_diagnostics.append(
             {
                 "site": int(site),
@@ -4074,6 +4189,7 @@ class SymDMRG2:
                 "chi": int(chi),
                 "cutoff": float(cutoff),
                 "truncation_error": truncation_error,
+                **optimized_theta_summary,
                 "left": self._svd_bond_summary(left_tensor, bond),
                 "right": self._svd_bond_summary(right_tensor, bond),
             }
