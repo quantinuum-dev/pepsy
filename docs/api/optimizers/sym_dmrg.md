@@ -36,8 +36,12 @@ charge maps with the minimal zero-valued sectors reachable from both the left
 prefix and the right suffix. Local dense/Lanczos solves then use a two-site
 variational template whose active physical legs include every charge-compatible
 local sector, so the subsequent SVD can nucleate bond sectors that were absent
-from a narrow product or low-bond initial state. By
-default, Symmray `H_eff` matvecs use a block-native projected contraction;
+from a narrow product or low-bond initial state. The default
+`variational_sector_basis="adaptive"` reopens those legal zero sectors whenever
+later sweeps need them. `variational_sector_basis="bond_dim"` reopens them only
+when the requested sweep bond dimension increases, allowing equal-chi
+turnarounds to reuse maintained environments but narrowing the later search
+space. By default, Symmray `H_eff` matvecs use a block-native projected contraction;
 `matvec_backend="dense_reference"` keeps the older
 NumPy dense-aligned matvec available as a validator. During a local
 dense/Lanczos solve, the block-native path caches the static projected
@@ -49,12 +53,14 @@ so scale runs can confirm the hot matvec path is reusing this setup work.
 Default Symmray Lanczos solves keep Krylov vectors as block tensors and use
 dense NumPy only for block dot products and the small Rayleigh-Ritz projected
 matrix, avoiding a flat-vector Symmray-to-NumPy-to-Symmray round trip for every
-`H_eff` application. Real block data remains real unless the state or MPO data
-is complex. Before each local solve, SymDMRG2 also probes the projected
+`H_eff` application. `local_eig_ncv` may be a scalar cap or a sweep schedule
+whose last entry repeats, matching `bond_dims` and `cutoffs`. Real block data
+remains real unless the state or MPO data is complex. Before each local solve,
+SymDMRG2 also probes the projected
 block-native `H_eff` support and drops widened zero blocks that are neither
 structurally live nor already populated by the current MPS.
-Symmray sweeps
-canonicalize the MPS center before using H-only dense/Lanczos solves; a
+Symmray sweeps canonicalize the MPS center before using H-only dense/Lanczos
+solves; a
 non-identity effective norm is treated as a canonicalization/alignment error
 unless the explicit diagnostic `local_solver="generalized_dense"` mode is
 requested. `local_solver="auto"` now defaults to the matrix-free Lanczos path
@@ -82,8 +88,10 @@ left-first route selected for strongly imbalanced projector sizes.
 `False` skips it, and `"lazy"` defers it until the `initial_energy` or
 pre-sweep `energy` property is requested. Sweep setup
 builds only the static side environments needed for the current direction,
-updates the moving side incrementally after each two-site writeback, and
-reuses the completed norm environments for normalized energies.
+updates the moving side incrementally after each two-site writeback, and reuses
+that maintained side on direction turnarounds. It rebuilds only when a pre-sweep
+sector-layout mutation, a same-direction sweep, or an increased bond-dimension
+sector-basis pass invalidates the cached side.
 Every Symmray two-site writeback records an entry in
 `svd_diagnostics`, including the split direction, bond name, `chi`, cutoff,
 truncation error when reported by the split backend, and the left/right charge

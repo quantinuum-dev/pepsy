@@ -351,6 +351,34 @@ def _normalize_residual_check(residual_check):
     return _normalize_check_schedule(residual_check, name="residual_check")
 
 
+def _normalize_variational_sector_basis(variational_sector_basis):
+    key = str(variational_sector_basis).strip().lower().replace("-", "_")
+    aliases = {
+        "adaptive": "adaptive",
+        "always": "adaptive",
+        "on": "adaptive",
+        "true": "adaptive",
+        "yes": "adaptive",
+        "bond_dim": "bond_dim",
+        "bond_dims": "bond_dim",
+        "chi": "bond_dim",
+        "initial": "bond_dim",
+        "once": "bond_dim",
+        "off": "off",
+        "none": "off",
+        "false": "off",
+        "no": "off",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown variational_sector_basis {variational_sector_basis!r}. "
+            f"Expected one of: {allowed}."
+        ) from exc
+
+
 def _normalize_mixer(mixer):
     if mixer is None or mixer is False:
         return "none"
@@ -421,6 +449,13 @@ def _sequence_tuple(values, *, name):
         out = (values,)
     if not out:
         raise ValueError(f"{name} must not be empty.")
+    return out
+
+
+def _positive_int_sequence(values, *, name):
+    out = tuple(int(value) for value in _sequence_tuple(values, name=name))
+    if any(value < 1 for value in out):
+        raise ValueError(f"{name} entries must be positive integers.")
     return out
 
 
@@ -941,9 +976,10 @@ class SymDMRG2:
         keep the Lanczos basis as block tensors and use dense NumPy only for
         scalar Rayleigh-Ritz projections. The native-block path uses
         ``local_eig_ncv`` as its Krylov subspace cap unless
-        ``local_eig_maxiter`` is set explicitly. Set ``local_eig_backend`` to
-        an explicit quimb/scipy backend to use the older flat LinearOperator
-        adapter.
+        ``local_eig_maxiter`` is set explicitly. ``local_eig_ncv`` can also be
+        a sweep schedule, in which case the last entry is repeated. Set
+        ``local_eig_backend`` to an explicit quimb/scipy backend to use the
+        older flat LinearOperator adapter.
     norm_check_tol
         Tolerance for checking that the canonical-center effective norm acts
         like identity before using an H-only dense or Lanczos solve. In the
@@ -991,6 +1027,13 @@ class SymDMRG2:
         initial MPS without changing the fixed total charge.
         ``"adaptive"`` repeats the same template enrichment before every sweep,
         which can reintroduce valid sectors that an earlier truncated SVD pruned.
+    variational_sector_basis
+        Deterministic zero-valued sector-basis widening schedule. ``"adaptive"``
+        preserves the historical behavior of reopening legal sectors whenever a
+        sweep needs them. ``"bond_dim"`` runs only when the requested sweep bond
+        dimension increases, enabling turnaround environment reuse on equal-chi
+        sweeps at the cost of a smaller later variational search space.
+        ``"off"`` disables the automatic basis.
     sector_enrichment_bond_dim
         Bond-sector budget for the enrichment template. Defaults to ``chi``
         when enrichment is enabled.
@@ -1056,6 +1099,7 @@ class SymDMRG2:
         matvec_diagnostics="off",
         matvec_diagnostics_interval=1,
         sector_enrichment="none",
+        variational_sector_basis="adaptive",
         sector_enrichment_bond_dim=None,
         sector_noise=0.0,
         sector_enrichment_seed=0,
@@ -1095,9 +1139,10 @@ class SymDMRG2:
         self.local_solver = _normalize_local_solver(local_solver)
         self.dense_threshold = int(dense_threshold)
         self.local_eig_tol = float(local_eig_tol)
-        self.local_eig_ncv = (
-            None if local_eig_ncv is None else int(local_eig_ncv)
-        )
+        self._local_eig_ncv_input = local_eig_ncv
+        self.local_eig_ncv = None
+        self.local_eig_ncvs = None
+        self._active_local_eig_ncv = None
         self.local_eig_maxiter = (
             None if local_eig_maxiter is None else int(local_eig_maxiter)
         )
@@ -1135,6 +1180,9 @@ class SymDMRG2:
         )
         self.matvec_diagnostics_interval = int(matvec_diagnostics_interval)
         self.sector_enrichment = _normalize_sector_enrichment(sector_enrichment)
+        self.variational_sector_basis = _normalize_variational_sector_basis(
+            variational_sector_basis
+        )
         self.sector_enrichment_bond_dim = (
             None
             if sector_enrichment_bond_dim is None
@@ -1159,8 +1207,6 @@ class SymDMRG2:
             raise ValueError("norm_check_interval must be a positive integer.")
         if self.residual_check_interval < 1:
             raise ValueError("residual_check_interval must be a positive integer.")
-        if self.local_eig_ncv is not None and self.local_eig_ncv < 1:
-            raise ValueError("local_eig_ncv must be a positive integer.")
         if self.local_eig_maxiter is not None and self.local_eig_maxiter < 1:
             raise ValueError("local_eig_maxiter must be a positive integer.")
         if self.residual_check_tol is not None and self.residual_check_tol < 0.0:
@@ -1221,6 +1267,9 @@ class SymDMRG2:
         self.right_norm_envs = None
         self.left_block_envs = None
         self.right_block_envs = None
+        self._dense_env_valid_sides = set()
+        self._norm_env_valid_sides = set()
+        self._block_env_valid_sides = set()
         self._projected_problem_cache = None
         self._last_matvec_projected_problem = None
         self._last_matvec_cache_hit = None
@@ -1239,6 +1288,7 @@ class SymDMRG2:
         self.sector_enrichment_diagnostics = []
         self.variational_sector_diagnostics = []
         self.variational_pruning_diagnostics = []
+        self._variational_sector_basis_max_bond = 0
         self.profile_diagnostics = []
         self._current_sweep_direction = None
         self._last_local_input_theta = None
@@ -1249,6 +1299,7 @@ class SymDMRG2:
         }
         self._set_bond_dim_seq(self.chi if bond_dims is None else bond_dims)
         self._set_cutoff_seq(self.cutoff if cutoffs is None else cutoffs)
+        self._set_local_eig_ncv_seq(self._local_eig_ncv_input)
 
         if self.backend == "symmray" and self.mps is not None:
             self._state = self._prepare_symmray_state(self.mps)
@@ -1474,11 +1525,7 @@ class SymDMRG2:
         }
 
     def _set_bond_dim_seq(self, bond_dims):
-        bond_dims = tuple(
-            int(dim) for dim in _sequence_tuple(bond_dims, name="bond_dims")
-        )
-        if any(dim < 1 for dim in bond_dims):
-            raise ValueError("bond_dims entries must be positive integers.")
+        bond_dims = _positive_int_sequence(bond_dims, name="bond_dims")
         self.bond_dims = bond_dims
         self._bond_dim0 = bond_dims[0]
         self._bond_dims = itertools.chain(bond_dims, itertools.repeat(bond_dims[-1]))
@@ -1490,6 +1537,84 @@ class SymDMRG2:
         )
         self.cutoffs = cutoffs
         self._cutoffs = itertools.chain(cutoffs, itertools.repeat(cutoffs[-1]))
+
+    def _set_local_eig_ncv_seq(self, local_eig_ncv):
+        if local_eig_ncv is None:
+            self.local_eig_ncv = None
+            self.local_eig_ncvs = None
+            self._active_local_eig_ncv = None
+            self._local_eig_ncvs = itertools.repeat(None)
+            return
+        local_eig_ncvs = _positive_int_sequence(
+            local_eig_ncv,
+            name="local_eig_ncv",
+        )
+        self.local_eig_ncv = local_eig_ncvs[0]
+        self.local_eig_ncvs = local_eig_ncvs
+        self._active_local_eig_ncv = local_eig_ncvs[0]
+        self._local_eig_ncvs = itertools.chain(
+            local_eig_ncvs,
+            itertools.repeat(local_eig_ncvs[-1]),
+        )
+
+    def _resolved_local_eig_ncv(self):
+        return self._active_local_eig_ncv
+
+    def _environment_valid_sides(self, kind):
+        return {
+            "dense": self._dense_env_valid_sides,
+            "norm": self._norm_env_valid_sides,
+            "block": self._block_env_valid_sides,
+        }[kind]
+
+    def _set_environment_valid_sides(self, kind, sides):
+        valid_sides = self._environment_valid_sides(kind)
+        valid_sides.clear()
+        valid_sides.update(sides)
+
+    @staticmethod
+    def _static_environment_side(direction):
+        return "right" if direction == "right" else "left"
+
+    def _has_valid_sweep_environments(self, kind, direction):
+        side = self._static_environment_side(direction)
+        if side not in self._environment_valid_sides(kind):
+            return False
+        if kind == "dense":
+            return self.left_envs is not None and self.right_envs is not None
+        if kind == "norm":
+            return self.left_norm_envs is not None and self.right_norm_envs is not None
+        if kind == "block":
+            return self.left_block_envs is not None and self.right_block_envs is not None
+        raise ValueError(f"Unknown environment kind {kind!r}.")
+
+    def _record_reused_sweep_environments(self, kind, direction):
+        phase = {
+            "dense": "build_dense_environments",
+            "norm": "build_norm_environments",
+            "block": "build_block_environments",
+        }[kind]
+        profile_start = self._profile_start()
+        self._record_profile_elapsed(
+            phase,
+            profile_start,
+            direction=direction,
+            built_sites=0,
+            reused=True,
+        )
+
+    def _ensure_sweep_environments(self, kind, direction):
+        if self._has_valid_sweep_environments(kind, direction):
+            self._record_reused_sweep_environments(kind, direction)
+            return
+        if kind == "dense":
+            self.build_sweep_environments(direction)
+        elif kind == "norm":
+            self.build_sweep_norm_environments(direction)
+        elif kind == "block":
+            self.build_sweep_block_environments(direction)
+        else:
+            raise ValueError(f"Unknown environment kind {kind!r}.")
 
     def _print_pre_sweep(self, i, direction, max_bond, cutoff, verbosity=0):
         if int(verbosity) > 0:
@@ -2095,6 +2220,17 @@ class SymDMRG2:
         self.variational_sector_diagnostics.append(diagnostic)
         return diagnostic
 
+    def _should_prepare_variational_sector_basis(self, max_bond):
+        if self.variational_sector_basis == "off":
+            return False
+        if self.variational_sector_basis == "adaptive":
+            return True
+        if self.variational_sector_basis == "bond_dim":
+            return int(max_bond) > self._variational_sector_basis_max_bond
+        raise ValueError(
+            f"Unknown variational_sector_basis mode {self.variational_sector_basis!r}."
+        )
+
     def _active_mixer_amplitude(self, sweep=None):
         if self.backend != "symmray" or self.mixer == "none":
             return 0.0
@@ -2456,6 +2592,7 @@ class SymDMRG2:
             right[site] = self._right_env_step(site, right[site + 1], bra)
         self.left_envs = left
         self.right_envs = right
+        self._set_environment_valid_sides("dense", {"left", "right"})
         return left, right
 
     def build_sweep_environments(self, direction):
@@ -2484,11 +2621,13 @@ class SymDMRG2:
             raise ValueError("direction must be 'right' or 'left'.")
         self.left_envs = left
         self.right_envs = right
+        self._set_environment_valid_sides("dense", {self._static_environment_side(direction)})
         self._record_profile_elapsed(
             "build_dense_environments",
             profile_start,
             direction=direction,
             built_sites=max(int(self._state.L) - 2, 0),
+            reused=False,
         )
         return left, right
 
@@ -2569,6 +2708,7 @@ class SymDMRG2:
 
         self.left_block_envs = left
         self.right_block_envs = right
+        self._set_environment_valid_sides("block", {"left", "right"})
         return left, right
 
     def build_sweep_block_environments(self, direction):
@@ -2598,11 +2738,13 @@ class SymDMRG2:
             raise ValueError("direction must be 'right' or 'left'.")
         self.left_block_envs = left
         self.right_block_envs = right
+        self._set_environment_valid_sides("block", {self._static_environment_side(direction)})
         self._record_profile_elapsed(
             "build_block_environments",
             profile_start,
             direction=direction,
             built_sites=max(int(self._state.L) - 2, 0),
+            reused=False,
         )
         return left, right
 
@@ -2750,6 +2892,7 @@ class SymDMRG2:
             right[site] = self._norm_right_env_step(site, right[site + 1], bra)
         self.left_norm_envs = left
         self.right_norm_envs = right
+        self._set_environment_valid_sides("norm", {"left", "right"})
         return left, right
 
     def build_sweep_norm_environments(self, direction):
@@ -2778,11 +2921,13 @@ class SymDMRG2:
             raise ValueError("direction must be 'right' or 'left'.")
         self.left_norm_envs = left
         self.right_norm_envs = right
+        self._set_environment_valid_sides("norm", {self._static_environment_side(direction)})
         self._record_profile_elapsed(
             "build_norm_environments",
             profile_start,
             direction=direction,
             built_sites=max(int(self._state.L) - 2, 0),
+            reused=False,
         )
         return left, right
 
@@ -3547,7 +3692,7 @@ class SymDMRG2:
             return self.dense_local_eigensolve(site, theta=theta)
 
         operator = _SymmrayEffectiveHamiltonian(self, site, space)
-        ncv = self.local_eig_ncv
+        ncv = self._resolved_local_eig_ncv()
         if ncv is not None:
             ncv = min(max(3, int(ncv)), dim)
 
@@ -3577,8 +3722,8 @@ class SymDMRG2:
         if self.local_eig_maxiter is not None:
             steps = self.local_eig_maxiter
             source = "local_eig_maxiter"
-        elif self.local_eig_ncv is not None:
-            steps = self.local_eig_ncv
+        elif self._resolved_local_eig_ncv() is not None:
+            steps = self._resolved_local_eig_ncv()
             source = "local_eig_ncv"
         else:
             steps = dim
@@ -4195,6 +4340,9 @@ class SymDMRG2:
             info=split_info,
         )
         truncation_error = _optional_float(split_info.get("error"))
+        self._state[site].modify(data=left_tensor.data, inds=left_tensor.inds)
+        self._state[right_site].modify(data=right_tensor.data, inds=right_tensor.inds)
+        self._state.site_ind_id = getattr(self._state, "site_ind_id", "k{}")
         optimized_theta_summary = self._theta_support_summary(theta, "optimized_theta")
         self.svd_diagnostics.append(
             {
@@ -4206,13 +4354,10 @@ class SymDMRG2:
                 "cutoff": float(cutoff),
                 "truncation_error": truncation_error,
                 **optimized_theta_summary,
-                "left": self._svd_bond_summary(left_tensor, bond),
-                "right": self._svd_bond_summary(right_tensor, bond),
+                "left": self._svd_bond_summary(self._state[site], bond),
+                "right": self._svd_bond_summary(self._state[right_site], bond),
             }
         )
-        self._state[site].modify(data=left_tensor.data, inds=left_tensor.inds)
-        self._state[right_site].modify(data=right_tensor.data, inds=right_tensor.inds)
-        self._state.site_ind_id = getattr(self._state, "site_ind_id", "k{}")
         self._invalidate_projected_problem_cache()
         self._record_profile_elapsed(
             "svd_split",
@@ -4235,6 +4380,9 @@ class SymDMRG2:
         self.right_norm_envs = None
         self.left_block_envs = None
         self.right_block_envs = None
+        self._set_environment_valid_sides("dense", ())
+        self._set_environment_valid_sides("norm", ())
+        self._set_environment_valid_sides("block", ())
 
     def _canonize_for_sweep(self, direction):
         profile_start = self._profile_start()
@@ -4274,6 +4422,7 @@ class SymDMRG2:
         chi,
         cutoff,
         canonize=True,
+        prepare_variational_basis=True,
         verbosity=0,
         method="svd",
         cutoff_mode="rel",
@@ -4296,19 +4445,41 @@ class SymDMRG2:
             if not canonized:
                 self._force_norm_check_after_skipped_canonize = True
                 self._force_norm_check_reason = f"{direction}_canonize_unavailable"
+        if (
+            prepare_variational_basis
+            and self._should_prepare_variational_sector_basis(chi)
+        ):
+            variational_diagnostic = self._prepare_variational_sector_basis(
+                sweep=len(self.energies),
+                max_bond=chi,
+            )
+            self._variational_sector_basis_max_bond = max(
+                self._variational_sector_basis_max_bond,
+                int(chi),
+            )
+            if variational_diagnostic is not None and self._should_track_norm_environments():
+                canonized = self._canonize_for_sweep(direction)
+                if not canonized:
+                    self._force_norm_check_after_skipped_canonize = True
+                    self._force_norm_check_reason = f"{direction}_canonize_unavailable"
         if use_block_h_envs:
             self.left_envs = None
             self.right_envs = None
+            self._set_environment_valid_sides("dense", ())
         else:
-            self.build_sweep_environments(direction)
+            self.left_block_envs = None
+            self.right_block_envs = None
+            self._set_environment_valid_sides("block", ())
+            self._ensure_sweep_environments("dense", direction)
         track_norm_envs = self._should_track_norm_environments()
         if track_norm_envs:
-            self.build_sweep_norm_environments(direction)
+            self._ensure_sweep_environments("norm", direction)
         else:
             self.left_norm_envs = None
             self.right_norm_envs = None
+            self._set_environment_valid_sides("norm", ())
         if use_block_h_envs:
-            self.build_sweep_block_environments(direction)
+            self._ensure_sweep_environments("block", direction)
 
         last_energy = None
         local_ens = []
@@ -4418,6 +4589,12 @@ class SymDMRG2:
             if update_block and self.left_block_envs is not None:
                 self.update_left_block_environment(self._state.L - 1)
                 self.right_block_envs[0] = self.left_block_envs[self._state.L]
+            if update_dense:
+                self._set_environment_valid_sides("dense", {"left"})
+            if update_norm:
+                self._set_environment_valid_sides("norm", {"left"})
+            if update_block:
+                self._set_environment_valid_sides("block", {"left"})
         elif direction == "left":
             if update_dense:
                 self.update_right_environment(0)
@@ -4430,6 +4607,12 @@ class SymDMRG2:
             if update_block and self.right_block_envs is not None:
                 self.update_right_block_environment(0)
                 self.left_block_envs[self._state.L] = self.right_block_envs[0]
+            if update_dense:
+                self._set_environment_valid_sides("dense", {"right"})
+            if update_norm:
+                self._set_environment_valid_sides("norm", {"right"})
+            if update_block:
+                self._set_environment_valid_sides("block", {"right"})
         else:  # pragma: no cover - private consistency check
             raise ValueError("direction must be 'right' or 'left'.")
 
@@ -4505,6 +4688,9 @@ class SymDMRG2:
             "cutoff_mode",
             self.opts["bond_compress_cutoff_mode"],
         )
+        prepare_variational_basis = bool(
+            update_opts.pop("prepare_variational_basis", True)
+        )
 
         if self.backend == "quimb":
             driver = self._ensure_quimb_driver()
@@ -4528,6 +4714,7 @@ class SymDMRG2:
             chi=max_bond,
             cutoff=cutoff,
             canonize=canonize,
+            prepare_variational_basis=prepare_variational_basis,
             verbosity=verbosity,
             method=method,
             cutoff_mode=cutoff_mode,
@@ -4559,6 +4746,7 @@ class SymDMRG2:
                 direction, _ = _normalize_sweep_direction(direction)
                 max_bond = next(self._bond_dims)
                 cutoff = next(self._cutoffs)
+                self._active_local_eig_ncv = next(self._local_eig_ncvs)
                 sweep_num = len(self.energies)
 
                 if self._should_enrich_before_sweep(sweep_num):
@@ -4581,14 +4769,9 @@ class SymDMRG2:
                 else:
                     mixer_diagnostic = None
                 if enrichment_diagnostic is None and mixer_diagnostic is None:
-                    variational_sector_diagnostic = (
-                        self._prepare_variational_sector_basis(
-                            sweep=sweep_num,
-                            max_bond=max_bond,
-                        )
-                    )
+                    prepare_variational_basis = True
                 else:
-                    variational_sector_diagnostic = None
+                    prepare_variational_basis = False
 
                 self._print_pre_sweep(
                     sweep_num,
@@ -4600,7 +4783,6 @@ class SymDMRG2:
                 pre_sweep_mutated = (
                     enrichment_diagnostic is not None
                     or mixer_diagnostic is not None
-                    or variational_sector_diagnostic is not None
                 )
                 canonize = (
                     pre_sweep_mutated
@@ -4616,6 +4798,7 @@ class SymDMRG2:
                             verbosity=verbosity,
                             max_bond=max_bond,
                             cutoff=cutoff,
+                            prepare_variational_basis=prepare_variational_basis,
                         )
                 else:
                     energy = self.sweep(
@@ -4624,6 +4807,7 @@ class SymDMRG2:
                         verbosity=verbosity,
                         max_bond=max_bond,
                         cutoff=cutoff,
+                        prepare_variational_basis=prepare_variational_basis,
                     )
 
                 self.energies.append(energy)
@@ -4718,6 +4902,8 @@ class SymDMRG2:
             "dense_threshold": self.dense_threshold,
             "local_eig_tol": self.local_eig_tol,
             "local_eig_ncv": self.local_eig_ncv,
+            "local_eig_ncvs": self.local_eig_ncvs,
+            "active_local_eig_ncv": self._active_local_eig_ncv,
             "local_eig_maxiter": self.local_eig_maxiter,
             "local_eig_backend": self.local_eig_backend,
             "norm_check_tol": self.norm_check_tol,
@@ -4736,6 +4922,10 @@ class SymDMRG2:
             "matvec_diagnostics": self.matvec_diagnostics,
             "matvec_diagnostics_interval": self.matvec_diagnostics_interval,
             "sector_enrichment": self.sector_enrichment,
+            "variational_sector_basis": self.variational_sector_basis,
+            "variational_sector_basis_max_bond": (
+                self._variational_sector_basis_max_bond
+            ),
             "sector_enrichment_bond_dim": self.sector_enrichment_bond_dim,
             "sector_noise": self.sector_noise,
             "sector_enrichment_seed": self.sector_enrichment_seed,

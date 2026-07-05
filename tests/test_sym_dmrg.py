@@ -330,6 +330,50 @@ def test_symdmrg2_block_sweep_skips_dense_h_environment_updates(monkeypatch):
     assert opt.environment_energy() == pytest.approx(complex(energy))
 
 
+def test_symdmrg2_turnaround_reuses_maintained_block_environment(monkeypatch):
+    """An R->L turnaround should reuse the left block side maintained by R."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(4, [(1, 0), (0, 1), (1, 0), (0, 1)])
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=2,
+        norm_check="off",
+        variational_sector_basis="bond_dim",
+        compute_initial_energy=False,
+        profile=True,
+    )
+
+    build_directions = []
+    build_sweep_block_environments = opt.build_sweep_block_environments
+
+    def counted_build_sweep_block_environments(direction):
+        build_directions.append(direction)
+        return build_sweep_block_environments(direction)
+
+    monkeypatch.setattr(
+        opt,
+        "build_sweep_block_environments",
+        counted_build_sweep_block_environments,
+    )
+
+    opt.solve(max_sweeps=2, sweep_sequence="RL", tol=0.0)
+
+    assert build_directions == ["right"]
+    assert opt._block_env_valid_sides == {"right"}
+    reuse_events = [
+        event
+        for event in opt.profile_diagnostics
+        if event["phase"] == "build_block_environments"
+        and event.get("direction") == "left"
+        and event.get("reused")
+    ]
+    assert len(reuse_events) == 1
+    assert reuse_events[0]["built_sites"] == 0
+
+
 def test_symdmrg2_accepts_quimb_style_solve_controls():
     """SymDMRG2 should accept DMRG2-style p0/bond_dims/cutoffs controls."""
     pytest.importorskip("symmray")
@@ -1172,6 +1216,48 @@ def test_symdmrg2_native_lanczos_honors_krylov_step_cap():
     assert opt._last_lanczos_info["max_steps"] == 5
     assert opt._last_lanczos_info["max_steps_source"] == "local_eig_maxiter"
     assert opt._last_lanczos_info["num_steps"] <= 5
+
+
+def test_symdmrg2_local_eig_ncv_accepts_sweep_schedule():
+    """The native Lanczos Krylov cap should follow the sweep schedule."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+        seed=19,
+        U=1.0,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=3,
+        cutoff=1e-10,
+        sweeps=2,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-10,
+        local_eig_ncv=[3, 5],
+        norm_check="off",
+        compute_initial_energy=False,
+    )
+    opt.solve(max_sweeps=2, sweep_sequence="RR", tol=0.0)
+
+    assert opt.summary()["local_eig_ncv"] == 3
+    assert opt.summary()["local_eig_ncvs"] == (3, 5)
+    assert opt.summary()["active_local_eig_ncv"] == 5
+    assert len(opt.local_solve_diagnostics) == 2 * (4 - 1)
+    assert {
+        diag["max_steps"]
+        for diag in opt.local_solve_diagnostics[:3]
+        if diag["solver"] == "lanczos"
+    } == {3}
+    assert {
+        diag["max_steps"]
+        for diag in opt.local_solve_diagnostics[3:]
+        if diag["solver"] == "lanczos"
+    } == {5}
 
 
 def test_symdmrg2_preserves_real_theta_space_dtype():
