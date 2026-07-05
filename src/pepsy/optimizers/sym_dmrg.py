@@ -878,8 +878,10 @@ class SymDMRG2:
     local_eig_tol, local_eig_ncv, local_eig_maxiter, local_eig_backend
         Krylov/Lanczos eigensolver options. By default, Symmray local solves
         keep the Lanczos basis as block tensors and use dense NumPy only for
-        scalar Rayleigh-Ritz projections. Set ``local_eig_backend`` to an
-        explicit quimb/scipy backend to use the older flat LinearOperator
+        scalar Rayleigh-Ritz projections. The native-block path uses
+        ``local_eig_ncv`` as its Krylov subspace cap unless
+        ``local_eig_maxiter`` is set explicitly. Set ``local_eig_backend`` to
+        an explicit quimb/scipy backend to use the older flat LinearOperator
         adapter.
     norm_check_tol
         Tolerance for checking that the canonical-center effective norm acts
@@ -1096,6 +1098,10 @@ class SymDMRG2:
             raise ValueError("norm_check_interval must be a positive integer.")
         if self.residual_check_interval < 1:
             raise ValueError("residual_check_interval must be a positive integer.")
+        if self.local_eig_ncv is not None and self.local_eig_ncv < 1:
+            raise ValueError("local_eig_ncv must be a positive integer.")
+        if self.local_eig_maxiter is not None and self.local_eig_maxiter < 1:
+            raise ValueError("local_eig_maxiter must be a positive integer.")
         if self.residual_check_tol is not None and self.residual_check_tol < 0.0:
             raise ValueError("residual_check_tol must be non-negative.")
         if (
@@ -3462,6 +3468,18 @@ class SymDMRG2:
         key = str(which).upper()
         return -1 if key.startswith("L") else 0
 
+    def _native_lanczos_max_steps(self, dim):
+        if self.local_eig_maxiter is not None:
+            steps = self.local_eig_maxiter
+            source = "local_eig_maxiter"
+        elif self.local_eig_ncv is not None:
+            steps = self.local_eig_ncv
+            source = "local_eig_ncv"
+        else:
+            steps = dim
+            source = "dim"
+        return min(max(1, int(steps)), int(dim)), source
+
     def _native_block_lanczos_local_eigensolve(self, site, *, theta=None):
         """Solve the local theta problem with a Symmray-tensor Krylov basis."""
         theta = self.two_site_variational_theta(site) if theta is None else theta
@@ -3475,8 +3493,7 @@ class SymDMRG2:
         if norm <= 0.0:
             raise ValueError("The two-site theta tensor has zero norm.")
 
-        max_steps = dim if self.local_eig_maxiter is None else int(self.local_eig_maxiter)
-        max_steps = min(max(1, max_steps), dim)
+        max_steps, max_steps_source = self._native_lanczos_max_steps(dim)
         tol = max(float(self.local_eig_tol), np.finfo(float).eps)
         pick = self._native_lanczos_pick(self.which)
 
@@ -3523,6 +3540,7 @@ class SymDMRG2:
                 "num_steps": int(len(alphas)),
                 "converged": bool(residual_estimate <= tol or beta <= 1e-14),
                 "max_steps": int(max_steps),
+                "max_steps_source": max_steps_source,
                 "backend": "native_block",
             }
             if best["converged"]:

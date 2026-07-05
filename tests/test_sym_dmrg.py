@@ -1128,6 +1128,43 @@ def test_symdmrg2_lanczos_uses_native_block_krylov_by_default(monkeypatch):
     assert opt._last_lanczos_info["num_steps"] >= 1
 
 
+def test_symdmrg2_native_lanczos_honors_krylov_step_cap():
+    """Native block Lanczos should use ncv/maxiter to bound local work."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-12,
+        local_eig_ncv=3,
+        norm_check="off",
+        compute_initial_energy=False,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_block_environments()
+    theta = opt.two_site_variational_theta(0, opt.two_site_theta(0))
+
+    opt.lanczos_local_eigensolve(0, theta=theta)
+
+    assert opt._last_lanczos_info["backend"] == "native_block"
+    assert opt._last_lanczos_info["max_steps"] == 3
+    assert opt._last_lanczos_info["max_steps_source"] == "local_eig_ncv"
+    assert opt._last_lanczos_info["num_steps"] <= 3
+
+    opt.local_eig_maxiter = 5
+    opt.lanczos_local_eigensolve(0, theta=theta)
+
+    assert opt._last_lanczos_info["max_steps"] == 5
+    assert opt._last_lanczos_info["max_steps_source"] == "local_eig_maxiter"
+    assert opt._last_lanczos_info["num_steps"] <= 5
+
+
 def test_symdmrg2_preserves_real_theta_space_dtype():
     """Real Symmray states should not be promoted to complex local vectors."""
     pytest.importorskip("symmray")
