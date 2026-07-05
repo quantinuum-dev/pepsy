@@ -20,6 +20,7 @@ __all__ = [
     "NetKetChunkSettings",
     "NetKetPEPSVMC",
     "NetKetFermiHubbardVMC",
+    "NetKetSparseFermiHubbardVMC",
     "NetKetVMCSettings",
     "PackedPEPS",
     "PackedFermionicPEPS",
@@ -27,6 +28,7 @@ __all__ = [
     "build_heisenberg_vmc",
     "build_ising_vmc",
     "build_fermi_hubbard_vmc",
+    "build_sparse_fermi_hubbard_vmc",
     "fermionic_peps_rand",
     "choose_netket_chunk_size",
     "configure_jax_for_vmc",
@@ -218,6 +220,105 @@ class NetKetFermiHubbardVMC(NetKetPEPSVMC):
     """Bundle returned by :func:`build_fermi_hubbard_vmc`."""
 
     columns: SpinOrbitalColumns | None = None
+
+
+@dataclass(frozen=True)
+class NetKetSparseFermiHubbardVMC:
+    """Bundle for sparse-block fermionic PEPS VMC.
+
+    NetKet supplies the Hilbert space, graph, and Hamiltonian metadata. The
+    actual samples, amplitudes, and local energies use the non-jitted torch
+    PEPS path so block-sparse ``U1U1`` Symmray tensors can be evaluated today.
+    """
+
+    hilbert: Any
+    graph: Any
+    hamiltonian: Any
+    model: Any
+    ansatz: PackedFermionicPEPS
+    columns: SpinOrbitalColumns
+    torch_graph: Any
+    encoding: Any
+    configs: Any
+    amplitudes: Any
+    n_fermions_per_spin: tuple[int, int]
+    t: Any
+    U: Any
+    mode_order: str = "down-up"
+    generator: Any | None = None
+
+    @property
+    def n_sites(self):
+        """Number of spatial orbitals/sites in the PEPS and Hilbert sector."""
+        return self.ansatz.n_sites
+
+    @property
+    def n_params(self):
+        """Number of scalar variational parameters in the packed ansatz."""
+        return self.ansatz.n_params
+
+    def amplitudes_for(self, configs):
+        """Evaluate PEPS amplitudes for site-local fermion config rows."""
+        return self.model(configs)
+
+    def local_energy(self, configs=None, amplitudes=None):
+        """Return per-sample Fermi-Hubbard local energies."""
+        from .torch import (
+            local_energy_from_connections,
+            spinful_fermi_hubbard_connections,
+        )
+
+        configs = self.configs if configs is None else configs
+        amplitudes = self.amplitudes_for(configs) if amplitudes is None else amplitudes
+        connections = spinful_fermi_hubbard_connections(
+            configs,
+            self.torch_graph,
+            t=self.t,
+            U=self.U,
+            encoding=self.encoding,
+            mode_order=self.mode_order,
+        )
+        return local_energy_from_connections(
+            configs,
+            amplitudes,
+            connections,
+            self.model,
+        )
+
+    def energy_estimate(self, configs=None, amplitudes=None):
+        """Return the Monte-Carlo mean of :meth:`local_energy`."""
+        return self.local_energy(configs=configs, amplitudes=amplitudes).mean()
+
+    def sample_sweep(
+        self,
+        configs=None,
+        amplitudes=None,
+        *,
+        hopping_rate=0.25,
+        generator=None,
+    ):
+        """Run one nearest-neighbor Metropolis sweep with the torch sampler."""
+        from .torch import metropolis_exchange_sweep
+
+        configs = self.configs if configs is None else configs
+        if amplitudes is None:
+            amplitudes = (
+                self.amplitudes
+                if configs is self.configs
+                else self.amplitudes_for(configs)
+            )
+        if generator is None:
+            generator = self.generator
+        return metropolis_exchange_sweep(
+            configs,
+            self.model,
+            self.torch_graph,
+            current_amplitudes=amplitudes,
+            proposal="spinful",
+            hopping_rate=hopping_rate,
+            encoding=self.encoding,
+            generator=generator,
+        )
 
 
 def configure_jax_for_vmc(
@@ -425,6 +526,21 @@ def _spinful_phys_lookup(phys_charges):
     return lut
 
 
+def _fermion_site_encoding_from_phys_charges(phys_charges):
+    """Return the local torch encoding matching a PEPS physical charge order."""
+    from .torch import FermionSiteEncoding
+
+    lut = _spinful_phys_lookup(phys_charges)
+    if lut is None:
+        return FermionSiteEncoding.symmray()
+    return FermionSiteEncoding(
+        empty=int(lut[0, 0]),
+        down=int(lut[0, 1]),
+        up=int(lut[1, 0]),
+        double=int(lut[1, 1]),
+    )
+
+
 def _require_jittable_fermionic_ansatz(ansatz):
     """Raise a clear error when NetKet's jitted VMC path cannot use ``ansatz``."""
     if ansatz.uses_flat_symmray is not False:
@@ -441,6 +557,34 @@ def _require_jittable_fermionic_ansatz(ansatz):
         "contraction='exact', 'hotrg', 'ctmrg', or 'boundary' for validation, "
         "or use a flat Z2 fermionic PEPS for full NetKet VMC until Symmray "
         "provides a flat U1U1 fermionic backend."
+    )
+
+
+def _make_torch_generator(seed, device=None):
+    if seed is None:
+        return None
+    from .torch import _require_torch  # pylint: disable=import-outside-toplevel
+
+    torch = _require_torch()
+    try:
+        generator = (
+            torch.Generator(device=device)
+            if device is not None
+            else torch.Generator()
+        )
+    except (RuntimeError, TypeError, ValueError):
+        generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return generator
+
+
+def _nonzero_amplitude_mask(amplitudes, *, amplitude_floor=0.0):
+    from .torch import _require_torch  # pylint: disable=import-outside-toplevel
+
+    torch = _require_torch()
+    amplitudes = torch.as_tensor(amplitudes)
+    return torch.isfinite(amplitudes) & (
+        amplitudes.abs() > float(amplitude_floor)
     )
 
 
@@ -1900,6 +2044,202 @@ def build_fermi_hubbard_vmc(
         config_map=None,
         preconditioner=preconditioner,
         columns=columns,
+    )
+
+
+def build_sparse_fermi_hubbard_vmc(
+    peps,
+    *,
+    Lx,
+    Ly,
+    t=1.0,
+    U=8.0,
+    n_fermions_per_spin=None,
+    pbc=False,
+    edges=None,
+    graph=None,
+    contraction="exact",
+    chi=None,
+    cutoff=0.0,
+    contraction_opts=None,
+    n_samples=1024,
+    initial_configs=None,
+    init_max_attempts=16,
+    init_max_states=50_000,
+    amplitude_floor=0.0,
+    seed=None,
+    sampler_seed=None,
+    dtype=None,
+    device=None,
+    mode_order="down-up",
+    verify_columns=False,
+):
+    """Create a sparse-block PEPS VMC setup for the Fermi-Hubbard model.
+
+    This path is intended for Symmray block-sparse fermionic PEPS, including
+    ``U1U1`` tensors that cannot yet be used by NetKet's jitted ``MCState``.
+    NetKet still defines the Hilbert sector, graph, and Hamiltonian metadata,
+    while Pepsy's torch kernels do Metropolis sweeps and local-energy
+    evaluation with exact, HOTRG, CTMRG, or boundary contractions.
+    """
+    nk = _require_netket()
+    n_sites = int(Lx) * int(Ly)
+    if n_fermions_per_spin is None:
+        n_fermions_per_spin = (n_sites // 2, n_sites // 2)
+    n_up, n_down = (int(x) for x in n_fermions_per_spin)
+
+    hilbert = nk.hilbert.SpinOrbitalFermions(
+        n_sites,
+        s=1 / 2,
+        n_fermions_per_spin=(n_up, n_down),
+    )
+    if graph is None:
+        if edges is None:
+            edges = square_lattice_edges(Lx, Ly, pbc=pbc)
+        graph = nk.graph.Graph(edges=tuple(edges), n_nodes=n_sites)
+
+    hamiltonian = nk.operator.FermiHubbardJax(
+        hilbert,
+        graph=graph,
+        t=t,
+        U=U,
+        dtype=float,
+    )
+    columns = netket_spin_orbital_columns(hilbert)
+    if verify_columns:
+        verify_netket_spin_columns(hilbert, columns)
+
+    from .torch import (  # pylint: disable=import-outside-toplevel
+        TorchPEPSAmplitude,
+        _require_torch,
+        random_spinful_configs,
+    )
+
+    torch = _require_torch()
+    ansatz = pack_fermionic_peps_ansatz(peps, lattice_shape=(Lx, Ly))
+    encoding = _fermion_site_encoding_from_phys_charges(ansatz.phys_charges)
+    model = TorchPEPSAmplitude(
+        peps,
+        contraction=contraction,
+        chi=chi,
+        cutoff=cutoff,
+        contraction_opts=contraction_opts,
+        dtype=dtype,
+        device=device,
+        site_order=ansatz.config_sites,
+    )
+    init_generator = _make_torch_generator(seed, device=device)
+    sampler_generator = _make_torch_generator(sampler_seed, device=device)
+    n_samples = _check_positive_int("n_samples", n_samples)
+    init_max_attempts = _check_positive_int("init_max_attempts", init_max_attempts)
+    init_max_states = _check_positive_int("init_max_states", init_max_states)
+    if n_samples is None:
+        raise ValueError("n_samples must be a positive integer.")
+
+    if initial_configs is not None:
+        configs = torch.as_tensor(initial_configs, dtype=torch.long, device=device)
+        if configs.ndim == 1:
+            configs = configs.reshape(1, -1)
+        if tuple(configs.shape) != (n_samples, n_sites):
+            raise ValueError(
+                "initial_configs must have shape "
+                f"({n_samples}, {n_sites}), got {tuple(configs.shape)}."
+            )
+        amplitudes = model(configs)
+        keep = _nonzero_amplitude_mask(
+            amplitudes,
+            amplitude_floor=amplitude_floor,
+        )
+        if not bool(keep.all()):
+            raise ValueError(
+                "initial_configs include zero, non-finite, or below-floor "
+                "PEPS amplitudes; pass configurations inside the ansatz support."
+            )
+    else:
+        kept_configs = []
+        kept_amplitudes = []
+        n_kept = 0
+        for _ in range(init_max_attempts):
+            candidate = random_spinful_configs(
+                n_samples,
+                n_sites,
+                n_up,
+                n_down,
+                encoding=encoding,
+                device=device,
+                generator=init_generator,
+            )
+            candidate_amplitudes = model(candidate)
+            keep = _nonzero_amplitude_mask(
+                candidate_amplitudes,
+                amplitude_floor=amplitude_floor,
+            )
+            if not bool(keep.any()):
+                continue
+            kept_configs.append(candidate[keep])
+            kept_amplitudes.append(candidate_amplitudes[keep])
+            n_kept += int(keep.sum().item())
+            if n_kept >= n_samples:
+                break
+
+        if (
+            n_kept < n_samples
+            and init_max_states is not None
+            and hilbert.n_states <= init_max_states
+        ):
+            states = np.asarray(hilbert.all_states()).astype(np.int32)
+            phys = occupation_to_phys_indices(
+                states,
+                columns,
+                site_to_orb=ansatz.site_to_orb,
+                phys_charges=ansatz.phys_charges,
+            )
+            candidate = torch.as_tensor(phys, dtype=torch.long, device=device)
+            candidate_amplitudes = model(candidate)
+            keep = _nonzero_amplitude_mask(
+                candidate_amplitudes,
+                amplitude_floor=amplitude_floor,
+            )
+            if bool(keep.any()):
+                support_configs = candidate[keep]
+                support_amplitudes = candidate_amplitudes[keep]
+                choice = torch.randint(
+                    support_configs.shape[0],
+                    (n_samples,),
+                    device=support_configs.device,
+                    generator=init_generator,
+                )
+                kept_configs = [support_configs[choice]]
+                kept_amplitudes = [support_amplitudes[choice]]
+                n_kept = n_samples
+
+        if n_kept < n_samples:
+            raise RuntimeError(
+                "Could not initialize enough non-zero PEPS walkers in the "
+                "requested Fermi-Hubbard sector. Pass initial_configs from the "
+                "ansatz support, increase init_max_attempts, or raise "
+                "init_max_states for small exact sectors."
+            )
+
+        configs = torch.cat(kept_configs, dim=0)[:n_samples]
+        amplitudes = torch.cat(kept_amplitudes, dim=0)[:n_samples]
+
+    return NetKetSparseFermiHubbardVMC(
+        hilbert=hilbert,
+        graph=graph,
+        hamiltonian=hamiltonian,
+        model=model,
+        ansatz=ansatz,
+        columns=columns,
+        torch_graph=graph,
+        encoding=encoding,
+        configs=configs,
+        amplitudes=amplitudes,
+        n_fermions_per_spin=(n_up, n_down),
+        t=t,
+        U=U,
+        mode_order=mode_order,
+        generator=sampler_generator,
     )
 
 

@@ -245,6 +245,39 @@ validated with `contraction="exact"`, `"hotrg"`, `"ctmrg"`, and
 `"boundary"`/`"mps"`. Full NetKet `MCState` VMC still requires a jitted Flax
 model, so `build_fermi_hubbard_vmc(...)` raises clearly for block-sparse
 `U1U1` PEPS until Symmray provides a flat U1U1 fermionic backend.
+For an actual fixed-sector sparse-block VMC loop, use
+`build_sparse_fermi_hubbard_vmc(...)`: it builds the NetKet
+`SpinOrbitalFermions` Hilbert space and Fermi-Hubbard operator metadata, then
+uses `TorchPEPSAmplitude`, `metropolis_exchange_sweep`, and
+`spinful_fermi_hubbard_connections` for the non-jitted PEPS amplitudes and
+local energies. The builder starts walkers on non-zero PEPS support; for tiny
+sectors it can enumerate the NetKet Hilbert space, while larger runs can pass
+`initial_configs=...` directly.
+
+```python
+peps = pvmc.fermionic_peps_rand(
+    "U1U1",
+    Lx=2,
+    Ly=2,
+    bond_dim=3,
+    n_fermions_per_spin=(2, 2),
+)
+setup = pvmc.build_sparse_fermi_hubbard_vmc(
+    peps,
+    Lx=2,
+    Ly=2,
+    t=1.0,
+    U=8.0,
+    contraction="boundary",  # or "exact", "hotrg", "ctmrg"
+    chi=4,
+    n_samples=128,
+    seed=1,
+    sampler_seed=2,
+)
+eloc = setup.local_energy()
+sample = setup.sample_sweep()
+energy = setup.energy_estimate()
+```
 
 ```python
 batched_amp = pvmc.make_fermionic_peps_batched_amplitude_function(

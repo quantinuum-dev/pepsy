@@ -13,12 +13,14 @@ os.environ.setdefault("NETKET_NO_TIPS", "1")
 from pepsy.vmc.netket import (  # noqa: E402
     NetKetLocalConfigMap,
     NetKetPEPSVMC,
+    NetKetSparseFermiHubbardVMC,
     PackedFermionicPEPS,
     PackedPEPS,
     SpinOrbitalColumns,
     build_fermi_hubbard_vmc,
     build_heisenberg_vmc,
     build_ising_vmc,
+    build_sparse_fermi_hubbard_vmc,
     choose_netket_chunk_size,
     config_to_phys_indices,
     fermionic_peps_rand,
@@ -688,6 +690,70 @@ def test_u1u1_fermionic_peps_full_netket_vmc_fails_clearly():
             use_sr=False,
             contraction="exact",
         )
+
+
+@pytest.mark.parametrize(
+    ("contraction", "chi"),
+    [
+        ("exact", None),
+        ("hotrg", 4),
+        ("ctmrg", 4),
+        ("boundary", 4),
+    ],
+)
+def test_sparse_u1u1_fermi_hubbard_vmc_contractions_work(contraction, chi):
+    pytest.importorskip("netket")
+    pytest.importorskip("symmray")
+    torch = pytest.importorskip("torch")
+    from pepsy.vmc.torch import (  # noqa: E402
+        FermionSiteEncoding,
+        count_spinful_particles,
+    )
+
+    peps = fermionic_peps_rand(
+        "U1U1", 2, 2, 3, n_fermions_per_spin=(2, 2), seed=13
+    )
+    kwargs = {} if chi is None else {"chi": chi}
+    setup = build_sparse_fermi_hubbard_vmc(
+        peps,
+        Lx=2,
+        Ly=2,
+        n_samples=3,
+        seed=1,
+        sampler_seed=2,
+        dtype=torch.float64,
+        contraction=contraction,
+        **kwargs,
+    )
+
+    assert isinstance(setup, NetKetSparseFermiHubbardVMC)
+    assert setup.hilbert.n_states == 36
+    assert setup.n_sites == 4
+    assert setup.columns.n_orbitals == setup.n_sites
+    assert setup.ansatz.phys_charges == ((0, 0), (0, 1), (1, 0), (1, 1))
+    assert setup.encoding == FermionSiteEncoding.vmc_torch()
+    assert setup.configs.shape == (3, 4)
+    assert setup.amplitudes.shape == (3,)
+    assert torch.isfinite(setup.amplitudes).all()
+
+    n_up, n_down = count_spinful_particles(setup.configs, encoding=setup.encoding)
+    assert n_up.tolist() == [2, 2, 2]
+    assert n_down.tolist() == [2, 2, 2]
+
+    eloc = setup.local_energy()
+    assert eloc.shape == (3,)
+    assert torch.isfinite(eloc).all()
+    assert torch.isfinite(setup.energy_estimate())
+
+    sample = setup.sample_sweep()
+    n_up, n_down = count_spinful_particles(sample.configs, encoding=setup.encoding)
+    assert n_up.tolist() == [2, 2, 2]
+    assert n_down.tolist() == [2, 2, 2]
+    assert torch.isfinite(sample.amplitudes).all()
+
+    chained = setup.sample_sweep(sample.configs, sample.amplitudes)
+    assert chained.configs.shape == setup.configs.shape
+    assert torch.isfinite(chained.amplitudes).all()
 
 
 def test_fermionic_peps_rand_z2_uses_flat_backend():
