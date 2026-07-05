@@ -286,16 +286,18 @@ def test_symdmrg2_directional_environment_builds_only_static_side(monkeypatch):
     monkeypatch.setattr(opt, "_right_env_step", counted_right_step)
 
     opt.build_sweep_environments("right")
-    assert calls == {"left": 0, "right": opt.state.L}
+    assert calls == {"left": 0, "right": opt.state.L - 2}
     assert opt.left_envs[0] is not None
     assert all(env is None for env in opt.left_envs[1:])
-    assert all(env is not None for env in opt.right_envs)
+    assert all(env is None for env in opt.right_envs[:2])
+    assert all(env is not None for env in opt.right_envs[2:])
 
     calls["left"] = 0
     calls["right"] = 0
     opt.build_sweep_environments("left")
-    assert calls == {"left": opt.state.L, "right": 0}
-    assert all(env is not None for env in opt.left_envs)
+    assert calls == {"left": opt.state.L - 2, "right": 0}
+    assert all(env is not None for env in opt.left_envs[: opt.state.L - 1])
+    assert all(env is None for env in opt.left_envs[opt.state.L - 1 :])
     assert all(env is None for env in opt.right_envs[:-1])
     assert opt.right_envs[-1] is not None
 
@@ -1507,7 +1509,9 @@ def test_symdmrg2_prunes_projected_dead_variational_blocks_on_mapped_2d_case():
     opt._prepare_variational_sector_basis(sweep=0, max_bond=8)
     opt._canonize_for_sweep("right")
     opt.build_environments()
+    dense_energy = opt.environment_energy()
     opt.build_block_environments()
+    assert opt.block_environment_energy() == pytest.approx(dense_energy)
 
     theta = opt.two_site_variational_theta(1, opt.two_site_theta(1))
     pruned, diagnostic = opt._prune_theta_to_projected_support(1, theta)

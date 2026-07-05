@@ -2473,11 +2473,11 @@ class SymDMRG2:
         if direction == "right":
             left[0] = np.asarray(1.0 + 0.0j)
             right[self._state.L] = np.asarray(1.0 + 0.0j)
-            for site in reversed(range(self._state.L)):
+            for site in reversed(range(2, self._state.L)):
                 right[site] = self._right_env_step(site, right[site + 1], bra)
         elif direction == "left":
             left[0] = np.asarray(1.0 + 0.0j)
-            for site in range(self._state.L):
+            for site in range(max(self._state.L - 2, 0)):
                 left[site + 1] = self._left_env_step(site, left[site], bra)
             right[self._state.L] = np.asarray(1.0 + 0.0j)
         else:
@@ -2488,6 +2488,7 @@ class SymDMRG2:
             "build_dense_environments",
             profile_start,
             direction=direction,
+            built_sites=max(int(self._state.L) - 2, 0),
         )
         return left, right
 
@@ -2517,10 +2518,13 @@ class SymDMRG2:
                 self._input_ind(bond),
             )
 
-        out = self._contract_block_pair(self.mpo[site], self._ket_input_tensor(site))
-        out = self._contract_block_pair(bra[site], out)
-        if env is not None:
-            out = self._contract_block_pair(env, out)
+        if env is None:
+            out = self._contract_block_pair(self.mpo[site], self._ket_input_tensor(site))
+            out = self._contract_block_pair(bra[site], out)
+        else:
+            out = self._contract_block_pair(env, self.mpo[site])
+            out = self._contract_block_pair(out, self._ket_input_tensor(site))
+            out = self._contract_block_pair(bra[site], out)
         return out.transpose(*output)
 
     def _block_right_env_step(self, site, env, bra):
@@ -2533,10 +2537,13 @@ class SymDMRG2:
                 self._input_ind(bond),
             )
 
-        out = self._contract_block_pair(self.mpo[site], self._ket_input_tensor(site))
-        out = self._contract_block_pair(bra[site], out)
-        if env is not None:
-            out = self._contract_block_pair(env, out)
+        if env is None:
+            out = self._contract_block_pair(self.mpo[site], self._ket_input_tensor(site))
+            out = self._contract_block_pair(bra[site], out)
+        else:
+            out = self._contract_block_pair(env, self.mpo[site])
+            out = self._contract_block_pair(out, self._ket_input_tensor(site))
+            out = self._contract_block_pair(bra[site], out)
         return out.transpose(*output)
 
     def build_block_environments(self):
@@ -2579,12 +2586,12 @@ class SymDMRG2:
         right = [None] * (self._state.L + 1)
         if direction == "right":
             current = None
-            for site in reversed(range(self._state.L)):
+            for site in reversed(range(2, self._state.L)):
                 current = self._block_right_env_step(site, current, bra)
                 right[site] = current
         elif direction == "left":
             current = None
-            for site in range(self._state.L):
+            for site in range(max(self._state.L - 2, 0)):
                 current = self._block_left_env_step(site, current, bra)
                 left[site + 1] = current
         else:
@@ -2595,6 +2602,7 @@ class SymDMRG2:
             "build_block_environments",
             profile_start,
             direction=direction,
+            built_sites=max(int(self._state.L) - 2, 0),
         )
         return left, right
 
@@ -2759,11 +2767,11 @@ class SymDMRG2:
         if direction == "right":
             left[0] = np.asarray(1.0 + 0.0j)
             right[self._state.L] = np.asarray(1.0 + 0.0j)
-            for site in reversed(range(self._state.L)):
+            for site in reversed(range(2, self._state.L)):
                 right[site] = self._norm_right_env_step(site, right[site + 1], bra)
         elif direction == "left":
             left[0] = np.asarray(1.0 + 0.0j)
-            for site in range(self._state.L):
+            for site in range(max(self._state.L - 2, 0)):
                 left[site + 1] = self._norm_left_env_step(site, left[site], bra)
             right[self._state.L] = np.asarray(1.0 + 0.0j)
         else:
@@ -2774,6 +2782,7 @@ class SymDMRG2:
             "build_norm_environments",
             profile_start,
             direction=direction,
+            built_sites=max(int(self._state.L) - 2, 0),
         )
         return left, right
 
