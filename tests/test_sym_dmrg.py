@@ -553,6 +553,9 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
         matvec_diagnostics="sampled",
         matvec_diagnostics_interval=2,
         matvec_layout="fused",
+        expected_energy=0.0,
+        expected_energy_tol=1e-12,
+        exact_schmidt_bound=3,
         compute_initial_energy=False,
     )
 
@@ -561,11 +564,45 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     assert mapped["case"]["mapper_mode"] == "snake"
     assert mapped["case"]["mpo_compress"] is True
     assert mapped["case"]["matvec_layout"] == "fused"
+    assert mapped["case"]["periodic"] is False
+    assert mapped["case"]["expected_energy"] == 0.0
+    assert mapped["case"]["expected_energy_tol"] == 1e-12
+    assert mapped["case"]["exact_schmidt_bound"] == 3
+    assert mapped["result"]["energy_error"] == pytest.approx(
+        abs(mapped["result"]["energy"])
+    )
+    assert mapped["result"]["reached_expected_energy"] is False
     assert mapped["case"]["num_edges"] == 4
     assert mapped["result"]["num_sweeps"] == 1
     assert mapped["profile"]["enabled"]
     assert mapped["profile"]["phase_counts"]["sweep"] == 1
     assert mapped["compression"]["max_bond_dim"] <= 3
+
+    open_case = module.build_fh_u1u1_case(
+        length=1,
+        lattice_shape=(3, 2),
+        periodic=False,
+        bond_dim=1,
+        seed=3,
+        hopping=1.0,
+        interaction=1.0,
+        chemical_potential=0.0,
+    )
+    pbc_case = module.build_fh_u1u1_case(
+        length=1,
+        lattice_shape=(3, 2),
+        periodic=True,
+        bond_dim=1,
+        seed=3,
+        hopping=1.0,
+        interaction=1.0,
+        chemical_potential=0.0,
+    )
+
+    assert open_case["periodic"] is False
+    assert pbc_case["periodic"] is True
+    assert len(pbc_case["edges"]) > len(open_case["edges"])
+    assert pbc_case["mpo"].cyclic is False
 
 
 def test_symdmrg2_norm_check_off_skips_effective_norm_probe(monkeypatch):

@@ -1,9 +1,10 @@
-"""Benchmark SymDMRG2 on small open-boundary FH U1U1 chains.
+"""Benchmark SymDMRG2 on FH U1U1 chains and mapped square lattices.
 
 This script is intentionally lightweight: it constructs a deterministic
 Symmray-backed Fermi-Hubbard MPS/MPO, runs ``pepsy.SymDMRG2`` with profiling
 enabled, and emits JSON suitable for local comparison across implementation
-changes.
+changes. Periodic square-lattice edges are encoded as long-range terms in the
+open-boundary MPO/MPS chain, matching the SymDMRG2 implementation contract.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ def build_fh_u1u1_case(
     *,
     length,
     lattice_shape=None,
+    periodic=False,
     mapper_mode="snake",
     bond_dim,
     seed,
@@ -46,6 +48,8 @@ def build_fh_u1u1_case(
     if lattice_shape is None:
         length = int(length)
         edges = [(site, site + 1) for site in range(length - 1)]
+        if periodic and length > 2:
+            edges.append((0, length - 1))
         compress_mpo = False
         lattice_shape_out = None
     else:
@@ -53,7 +57,7 @@ def build_fh_u1u1_case(
         if lx < 1 or ly < 1:
             raise ValueError("lattice_shape dimensions must be positive.")
         length = lx * ly
-        edges = tuple(qtn.edges_2d_square(lx, ly))
+        edges = tuple(qtn.edges_2d_square(lx, ly, cyclic=bool(periodic)))
         mapper = OneDMap(lx, ly, mode=mapper_mode)
         compress_mpo = True
         lattice_shape_out = (lx, ly)
@@ -88,6 +92,7 @@ def build_fh_u1u1_case(
         "length": length,
         "edges": tuple(edges),
         "lattice_shape": lattice_shape_out,
+        "periodic": bool(periodic),
         "mapper_mode": None if mapper is None else str(mapper_mode),
         "mpo_compress": compress_mpo,
         "mpo_cutoff": float(mpo_cutoff),
@@ -98,6 +103,7 @@ def run_benchmark(
     *,
     length=4,
     lattice_shape=None,
+    periodic=False,
     mapper_mode="snake",
     chi=8,
     initial_bond_dim=4,
@@ -114,6 +120,11 @@ def run_benchmark(
     sector_enrichment="none",
     sector_enrichment_bond_dim=None,
     sector_noise=0.0,
+    mixer="none",
+    mixer_amplitude=1e-4,
+    mixer_decay=0.5,
+    mixer_disable_after=None,
+    mixer_bond_dim=None,
     matvec_backend="auto",
     matvec_layout="unfused",
     norm_check="strict",
@@ -125,6 +136,9 @@ def run_benchmark(
     matvec_diagnostics_interval=1,
     compute_initial_energy=False,
     mpo_cutoff=1e-12,
+    expected_energy=None,
+    expected_energy_tol=None,
+    exact_schmidt_bound=None,
     include_events=False,
 ):
     """Run one benchmark and return a JSON-serializable result dict."""
@@ -133,6 +147,7 @@ def run_benchmark(
     case = build_fh_u1u1_case(
         length=length,
         lattice_shape=lattice_shape,
+        periodic=periodic,
         mapper_mode=mapper_mode,
         bond_dim=initial_bond_dim,
         seed=seed,
@@ -155,6 +170,11 @@ def run_benchmark(
         sector_enrichment=sector_enrichment,
         sector_enrichment_bond_dim=sector_enrichment_bond_dim,
         sector_noise=float(sector_noise),
+        mixer=mixer,
+        mixer_amplitude=float(mixer_amplitude),
+        mixer_decay=float(mixer_decay),
+        mixer_disable_after=mixer_disable_after,
+        mixer_bond_dim=mixer_bond_dim,
         matvec_backend=matvec_backend,
         matvec_layout=matvec_layout,
         norm_check=norm_check,
@@ -171,6 +191,15 @@ def run_benchmark(
     start = time.perf_counter()
     opt.solve(max_sweeps=int(sweeps), sweep_sequence=sweep_sequence, tol=0.0)
     elapsed = time.perf_counter() - start
+    energy = None if opt.energy is None else float(opt.energy)
+    energy_error = (
+        None
+        if energy is None or expected_energy is None
+        else float(abs(energy - float(expected_energy)))
+    )
+    expected_energy_tol = (
+        None if expected_energy_tol is None else float(expected_energy_tol)
+    )
 
     result = {
         "case": {
@@ -182,9 +211,17 @@ def run_benchmark(
             ),
             "edges": [list(edge) for edge in case["edges"]],
             "num_edges": len(case["edges"]),
+            "periodic": bool(case["periodic"]),
             "mapper_mode": case["mapper_mode"],
             "mpo_compress": bool(case["mpo_compress"]),
             "mpo_cutoff": float(case["mpo_cutoff"]),
+            "expected_energy": (
+                None if expected_energy is None else float(expected_energy)
+            ),
+            "expected_energy_tol": expected_energy_tol,
+            "exact_schmidt_bound": (
+                None if exact_schmidt_bound is None else int(exact_schmidt_bound)
+            ),
             "chi": int(chi),
             "initial_bond_dim": int(initial_bond_dim),
             "sweeps": int(sweeps),
@@ -209,9 +246,20 @@ def run_benchmark(
             "sector_enrichment": str(sector_enrichment),
             "sector_enrichment_bond_dim": sector_enrichment_bond_dim,
             "sector_noise": float(sector_noise),
+            "mixer": str(mixer),
+            "mixer_amplitude": float(mixer_amplitude),
+            "mixer_decay": float(mixer_decay),
+            "mixer_disable_after": mixer_disable_after,
+            "mixer_bond_dim": mixer_bond_dim,
         },
         "result": {
-            "energy": None if opt.energy is None else float(opt.energy),
+            "energy": energy,
+            "energy_error": energy_error,
+            "reached_expected_energy": (
+                None
+                if energy_error is None or expected_energy_tol is None
+                else bool(energy_error <= expected_energy_tol)
+            ),
             "converged": bool(opt.converged),
             "elapsed": float(elapsed),
             "max_bond": int(opt.state.max_bond()),
@@ -242,6 +290,12 @@ def build_arg_parser():
         default=None,
         help="Build a mapped LX-by-LY square-lattice MPO instead of a 1D chain.",
     )
+    parser.add_argument(
+        "--periodic",
+        "--pbc",
+        action="store_true",
+        help="Encode periodic lattice edges as long-range terms in the OBC MPO.",
+    )
     parser.add_argument("--mapper-mode", default="snake")
     parser.add_argument("--chi", type=int, default=8)
     parser.add_argument("--initial-bond-dim", type=int, default=4)
@@ -258,6 +312,11 @@ def build_arg_parser():
     parser.add_argument("--sector-enrichment", default="none")
     parser.add_argument("--sector-enrichment-bond-dim", type=int, default=None)
     parser.add_argument("--sector-noise", type=float, default=0.0)
+    parser.add_argument("--mixer", default="none")
+    parser.add_argument("--mixer-amplitude", type=float, default=1e-4)
+    parser.add_argument("--mixer-decay", type=float, default=0.5)
+    parser.add_argument("--mixer-disable-after", type=int, default=None)
+    parser.add_argument("--mixer-bond-dim", type=int, default=None)
     parser.add_argument("--matvec-backend", default="auto")
     parser.add_argument("--matvec-layout", default="unfused")
     parser.add_argument("--norm-check", default="strict")
@@ -269,6 +328,9 @@ def build_arg_parser():
     parser.add_argument("--matvec-diagnostics-interval", type=int, default=1)
     parser.add_argument("--compute-initial-energy", action="store_true")
     parser.add_argument("--mpo-cutoff", type=float, default=1e-12)
+    parser.add_argument("--expected-energy", type=float, default=None)
+    parser.add_argument("--expected-energy-tol", type=float, default=None)
+    parser.add_argument("--exact-schmidt-bound", type=int, default=None)
     parser.add_argument("--include-events", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     return parser
@@ -279,6 +341,7 @@ def main(argv=None):
     result = run_benchmark(
         length=args.length,
         lattice_shape=args.lattice_shape,
+        periodic=args.periodic,
         mapper_mode=args.mapper_mode,
         chi=args.chi,
         initial_bond_dim=args.initial_bond_dim,
@@ -295,6 +358,11 @@ def main(argv=None):
         sector_enrichment=args.sector_enrichment,
         sector_enrichment_bond_dim=args.sector_enrichment_bond_dim,
         sector_noise=args.sector_noise,
+        mixer=args.mixer,
+        mixer_amplitude=args.mixer_amplitude,
+        mixer_decay=args.mixer_decay,
+        mixer_disable_after=args.mixer_disable_after,
+        mixer_bond_dim=args.mixer_bond_dim,
         matvec_backend=args.matvec_backend,
         matvec_layout=args.matvec_layout,
         norm_check=args.norm_check,
@@ -306,6 +374,9 @@ def main(argv=None):
         matvec_diagnostics_interval=args.matvec_diagnostics_interval,
         compute_initial_energy=args.compute_initial_energy,
         mpo_cutoff=args.mpo_cutoff,
+        expected_energy=args.expected_energy,
+        expected_energy_tol=args.expected_energy_tol,
+        exact_schmidt_bound=args.exact_schmidt_bound,
         include_events=args.include_events,
     )
     text = json.dumps(result, indent=2, sort_keys=True)

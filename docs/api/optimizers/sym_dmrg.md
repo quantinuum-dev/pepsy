@@ -18,10 +18,12 @@ For scale studies, `profile=True` enables JSON-friendly profiling events in
 by phase, including canonicalization, environment setup/update, norm checks,
 local eigensolves, `H_eff` matvecs, SVD splits, enrichment, sweeps, and solves.
 The development harness `benchmarks/symdmrg2_fh_u1u1.py` runs deterministic
-open-chain Fermi-Hubbard U1U1 cases and emits this profiling data as JSON. By
-default the benchmark skips the startup `initial_energy` estimate and samples
-local residual and matvec diagnostics, so runs spend their extra correctness
-and profiling budget on the two-site solves being timed.
+chain and mapped-square-lattice Fermi-Hubbard U1U1 cases and emits this
+profiling data as JSON. By default the benchmark skips the startup
+`initial_energy` estimate and samples local residual and matvec diagnostics,
+so runs spend their extra correctness and profiling budget on the two-site
+solves being timed. Use `--periodic`/`--pbc` with `--lattice-shape LX LY` to
+encode periodic square-lattice edges as long-range OBC-MPO terms.
 
 For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain and a
 bosonic/Jordan-Wigner Symmray MPO whenever the input MPS uses fermionic
@@ -126,6 +128,26 @@ before the first sweep.
 sweep, which can reintroduce valid sectors after SVD truncation prunes them.
 `sector_enrichment_diagnostics` records the added blocks and template bond
 sectors.
+
+For a hard periodic benchmark, the 3 by 3 PBC U1U1 Fermi-Hubbard sector-ED
+reference currently used during development is
+`E0 = -7.824105712954`. This case is intentionally not a normal unit test:
+with `chi=128` and no mixer it can stall around `8.7e-3` above ED, while the
+subspace mixer with `chi` up to the exact Schmidt bound of `256` reaches the
+sector ED value to about `6e-12`. A representative command is:
+
+```sh
+python benchmarks/symdmrg2_fh_u1u1.py \
+  --lattice-shape 3 3 --periodic \
+  --chi 256 --initial-bond-dim 2 --sweeps 4 --sweep-sequence RL \
+  --local-solver lanczos --dense-threshold 0 --local-eig-ncv 16 \
+  --mixer subspace --mixer-bond-dim 256 --mixer-amplitude 1e-4 \
+  --norm-check sampled --norm-check-interval 2 \
+  --residual-check sampled --residual-check-interval 2 \
+  --matvec-diagnostics sampled --matvec-diagnostics-interval 4 \
+  --expected-energy -7.824105712954 --expected-energy-tol 1e-10 \
+  --exact-schmidt-bound 256
+```
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.sym_dmrg
