@@ -65,9 +65,18 @@ leaving the default `matvec_layout="unfused"` unchanged.
 Default Symmray Lanczos solves keep Krylov vectors as block tensors and use
 dense NumPy only for block dot products and the small Rayleigh-Ritz projected
 matrix, avoiding a flat-vector Symmray-to-NumPy-to-Symmray round trip for every
-`H_eff` application. `local_eig_ncv` may be a scalar cap or a sweep schedule
-whose last entry repeats, matching `bond_dims` and `cutoffs`. Real block data
-remains real unless the state or MPO data is complex. Before each local solve,
+`H_eff` application. The native block path stops when either the residual
+estimate meets `local_eig_tol` or the Ritz energy changes by less than
+`local_eig_energy_tol` after at least `local_eig_min_steps` Krylov vectors.
+The default `local_eig_energy_tol=1e-2` targets warm-started DMRG sweeps where
+over-solving the local problem costs many extra `H_eff` matvecs without
+improving the variational sweep. `local_eig_ncv` remains the hard cap and may
+be a scalar cap or a sweep
+schedule whose last entry repeats, matching `bond_dims` and `cutoffs`. Set
+`local_eig_energy_tol=None` to force residual/cap-only behavior for dense
+reference comparisons. Local solve diagnostics record `stop_reason`,
+`ritz_energy_delta`, `num_steps`, and `num_matvecs`. Real block data remains
+real unless the state or MPO data is complex. Before each local solve,
 SymDMRG2 also probes the projected
 block-native `H_eff` support and drops widened zero blocks that are neither
 structurally live nor already populated by the current MPS.

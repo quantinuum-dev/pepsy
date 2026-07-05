@@ -1091,15 +1091,18 @@ class SymDMRG2:
         uses the dense reference Hamiltonian solve. The default ``0`` keeps
         the block-native path matrix-free unless a caller explicitly opts into
         dense local solves.
-    local_eig_tol, local_eig_ncv, local_eig_maxiter, local_eig_backend
+    local_eig_tol, local_eig_energy_tol, local_eig_min_steps,
+    local_eig_ncv, local_eig_maxiter, local_eig_backend
         Krylov/Lanczos eigensolver options. By default, Symmray local solves
         keep the Lanczos basis as block tensors and use dense NumPy only for
         scalar Rayleigh-Ritz projections. The native-block path uses
-        ``local_eig_ncv`` as its Krylov subspace cap unless
-        ``local_eig_maxiter`` is set explicitly. ``local_eig_ncv`` can also be
-        a sweep schedule, in which case the last entry is repeated. Set
-        ``local_eig_backend`` to an explicit quimb/scipy backend to use the
-        older flat LinearOperator adapter.
+        an energy-change stop once at least ``local_eig_min_steps`` Krylov
+        vectors have been built, and uses ``local_eig_ncv`` as its hard Krylov
+        subspace cap unless ``local_eig_maxiter`` is set explicitly.
+        ``local_eig_energy_tol=None`` disables the energy-change stop.
+        ``local_eig_ncv`` can also be a sweep schedule, in which case the last
+        entry is repeated. Set ``local_eig_backend`` to an explicit
+        quimb/scipy backend to use the older flat LinearOperator adapter.
     norm_check_tol
         Tolerance for checking that the canonical-center effective norm acts
         like identity before using an H-only dense or Lanczos solve. In the
@@ -1207,6 +1210,8 @@ class SymDMRG2:
         local_solver="auto",
         dense_threshold=0,
         local_eig_tol=1e-8,
+        local_eig_energy_tol=1e-2,
+        local_eig_min_steps=3,
         local_eig_ncv=8,
         local_eig_maxiter=None,
         local_eig_backend=None,
@@ -1266,6 +1271,12 @@ class SymDMRG2:
         self.local_solver = _normalize_local_solver(local_solver)
         self.dense_threshold = int(dense_threshold)
         self.local_eig_tol = float(local_eig_tol)
+        self.local_eig_energy_tol = (
+            None
+            if local_eig_energy_tol is None
+            else float(local_eig_energy_tol)
+        )
+        self.local_eig_min_steps = int(local_eig_min_steps)
         self._local_eig_ncv_input = local_eig_ncv
         self.local_eig_ncv = None
         self.local_eig_ncvs = None
@@ -1337,6 +1348,10 @@ class SymDMRG2:
             raise ValueError("residual_check_interval must be a positive integer.")
         if self.local_eig_maxiter is not None and self.local_eig_maxiter < 1:
             raise ValueError("local_eig_maxiter must be a positive integer.")
+        if self.local_eig_energy_tol is not None and self.local_eig_energy_tol < 0.0:
+            raise ValueError("local_eig_energy_tol must be non-negative.")
+        if self.local_eig_min_steps < 1:
+            raise ValueError("local_eig_min_steps must be a positive integer.")
         if self.residual_check_tol is not None and self.residual_check_tol < 0.0:
             raise ValueError("residual_check_tol must be non-negative.")
         if (
@@ -1602,6 +1617,19 @@ class SymDMRG2:
                             matvec_timing_totals.get(key, 0.0) + float(value)
                         )
         total_elapsed = sum(phase_totals.values())
+        lanczos_matvecs = [
+            int(entry["num_matvecs"])
+            for entry in self.local_solve_diagnostics
+            if entry.get("num_matvecs") is not None
+        ]
+        lanczos_stop_reasons = {}
+        for entry in self.local_solve_diagnostics:
+            reason = entry.get("stop_reason")
+            if reason is not None:
+                lanczos_stop_reasons[reason] = (
+                    lanczos_stop_reasons.get(reason, 0) + 1
+                )
+        total_lanczos_matvecs = int(sum(lanczos_matvecs))
         return {
             "enabled": self.profile,
             "num_events": len(self.profile_diagnostics),
@@ -1614,6 +1642,17 @@ class SymDMRG2:
             "num_residual_checks": phase_counts.get("residual_check", 0),
             "projected_problem_cache_hits": int(self.projected_problem_cache_hits),
             "projected_problem_cache_misses": int(self.projected_problem_cache_misses),
+            "num_lanczos_solves": len(lanczos_matvecs),
+            "num_lanczos_matvecs": total_lanczos_matvecs,
+            "avg_lanczos_matvecs": (
+                None
+                if not lanczos_matvecs
+                else float(total_lanczos_matvecs / len(lanczos_matvecs))
+            ),
+            "max_lanczos_matvecs": (
+                None if not lanczos_matvecs else int(max(lanczos_matvecs))
+            ),
+            "lanczos_stop_reasons": lanczos_stop_reasons,
         }
 
     def compression_summary(self):
@@ -3883,6 +3922,9 @@ class SymDMRG2:
         beta_prev = 0.0
         q = _tensor_block_scale(theta, 1.0 / norm)
         best = None
+        previous_ritz_energy = None
+        energy_tol = self.local_eig_energy_tol
+        min_steps = min(int(self.local_eig_min_steps), int(max_steps))
 
         for step in range(max_steps):
             basis.append(q)
@@ -3911,20 +3953,48 @@ class SymDMRG2:
                 tri = tri + np.diag(offdiag, 1) + np.diag(offdiag, -1)
             evals, evecs = np.linalg.eigh(tri)
             coeffs = evecs[:, pick]
+            ritz_energy = float(evals[pick])
+            ritz_energy_delta = (
+                None
+                if previous_ritz_energy is None
+                else float(abs(ritz_energy - previous_ritz_energy))
+            )
             residual_estimate = float(beta * abs(coeffs[-1]))
+            residual_converged = bool(residual_estimate <= tol or beta <= 1e-14)
+            energy_converged = bool(
+                energy_tol is not None
+                and ritz_energy_delta is not None
+                and len(alphas) >= min_steps
+                and ritz_energy_delta <= energy_tol
+            )
+            stop_reason = None
+            if residual_converged:
+                stop_reason = "residual"
+            elif energy_converged:
+                stop_reason = "energy"
+            elif len(alphas) >= max_steps:
+                stop_reason = "max_steps"
             best = {
-                "energy": float(evals[pick]),
+                "energy": ritz_energy,
                 "coeffs": coeffs.copy(),
                 "residual_estimate": residual_estimate,
+                "residual_converged": residual_converged,
+                "energy_converged": energy_converged,
+                "ritz_energy_delta": ritz_energy_delta,
+                "local_eig_energy_tol": energy_tol,
+                "local_eig_min_steps": int(min_steps),
                 "num_steps": int(len(alphas)),
-                "converged": bool(residual_estimate <= tol or beta <= 1e-14),
+                "num_matvecs": int(len(alphas)),
+                "converged": bool(residual_converged or energy_converged),
+                "stop_reason": stop_reason,
                 "max_steps": int(max_steps),
                 "max_steps_source": max_steps_source,
                 "backend": "native_block",
             }
-            if best["converged"]:
+            if residual_converged or energy_converged:
                 break
 
+            previous_ritz_energy = ritz_energy
             betas.append(beta)
             q_prev = q
             beta_prev = beta
@@ -5030,6 +5100,8 @@ class SymDMRG2:
             "local_solver": self.local_solver,
             "dense_threshold": self.dense_threshold,
             "local_eig_tol": self.local_eig_tol,
+            "local_eig_energy_tol": self.local_eig_energy_tol,
+            "local_eig_min_steps": self.local_eig_min_steps,
             "local_eig_ncv": self.local_eig_ncv,
             "local_eig_ncvs": self.local_eig_ncvs,
             "active_local_eig_ncv": self._active_local_eig_ncv,

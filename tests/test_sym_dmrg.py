@@ -1409,6 +1409,55 @@ def test_symdmrg2_native_lanczos_honors_krylov_step_cap():
     assert opt._last_lanczos_info["num_steps"] <= 5
 
 
+def test_symdmrg2_native_lanczos_energy_stop_cuts_before_ncv():
+    """Native block Lanczos should stop on Ritz-energy convergence."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-14,
+        local_eig_energy_tol=float("inf"),
+        local_eig_min_steps=3,
+        local_eig_ncv=8,
+        norm_check="off",
+        compute_initial_energy=False,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_block_environments()
+    theta = opt.two_site_variational_theta(0, opt.two_site_theta(0))
+
+    opt.lanczos_local_eigensolve(0, theta=theta)
+    info = opt._last_lanczos_info
+
+    assert info["backend"] == "native_block"
+    assert info["max_steps"] > info["local_eig_min_steps"]
+    assert info["stop_reason"] == "energy"
+    assert info["energy_converged"]
+    assert not info["residual_converged"]
+    assert info["num_steps"] == 3
+    assert info["num_matvecs"] == info["num_steps"]
+    opt._record_local_solve_diagnostic(
+        0,
+        solver="lanczos",
+        requested_solver="lanczos",
+        dim=opt._theta_dim(theta),
+        energy=0.0,
+        solver_info=info,
+    )
+    summary = opt.profile_summary()
+    assert summary["num_lanczos_solves"] == 1
+    assert summary["num_lanczos_matvecs"] == 3
+    assert summary["avg_lanczos_matvecs"] == pytest.approx(3.0)
+    assert summary["lanczos_stop_reasons"] == {"energy": 1}
+
+
 def test_symdmrg2_local_eig_ncv_accepts_sweep_schedule():
     """The native Lanczos Krylov cap should follow the sweep schedule."""
     pytest.importorskip("symmray")
@@ -1668,6 +1717,7 @@ def test_symdmrg2_lanczos_reaches_fixed_sector_ed_with_full_initial_support():
         local_solver="lanczos",
         dense_threshold=0,
         local_eig_tol=1e-11,
+        local_eig_energy_tol=None,
         local_eig_ncv=16,
         norm_check_samples=3,
     )
@@ -1722,6 +1772,7 @@ def test_symdmrg2_nucleates_sectors_from_product_state_without_enrichment():
         local_solver="lanczos",
         dense_threshold=0,
         local_eig_tol=1e-11,
+        local_eig_energy_tol=None,
         local_eig_ncv=16,
         norm_check_samples=3,
         sector_enrichment="none",
@@ -1845,6 +1896,7 @@ def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():
         local_solver="lanczos",
         dense_threshold=0,
         local_eig_tol=1e-11,
+        local_eig_energy_tol=None,
         local_eig_ncv=16,
         norm_check_samples=3,
         sector_enrichment="template",
@@ -1907,6 +1959,7 @@ def test_symdmrg2_subspace_mixer_reaches_ed_from_narrow_initial_support():
         local_solver="lanczos",
         dense_threshold=0,
         local_eig_tol=1e-11,
+        local_eig_energy_tol=None,
         local_eig_ncv=16,
         norm_check_samples=3,
         mixer="density_matrix",
