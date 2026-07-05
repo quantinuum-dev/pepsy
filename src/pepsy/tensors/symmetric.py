@@ -4002,6 +4002,101 @@ def _apply_to_hamiltonian_terms(terms, to_backend):
     }
 
 
+def _fh_spinful_density_edge_array(symmetry, *, V, like="numpy", flat=False):
+    """Return a spinful edge density-density term in Symmray form."""
+    import symmray.fermionic_local_operators as flo  # pylint: disable=import-outside-toplevel
+
+    au = flo.FermionicOperator("a↑")
+    ad = flo.FermionicOperator("a↓")
+    bu = flo.FermionicOperator("b↑")
+    bd = flo.FermionicOperator("b↓")
+
+    terms = (
+        (V, (au.dag, au, bu.dag, bu)),
+        (V, (au.dag, au, bd.dag, bd)),
+        (V, (ad.dag, ad, bu.dag, bu)),
+        (V, (ad.dag, ad, bd.dag, bd)),
+    )
+    basis_a = ((), (au.dag,), (ad.dag,), (ad.dag, au.dag))
+    basis_b = ((), (bu.dag,), (bd.dag,), (bd.dag, bu.dag))
+    indexmap = flo.get_spinful_charge_indexmap(symmetry)
+
+    return flo.build_local_fermionic_array(
+        terms,
+        (basis_a, basis_b),
+        symmetry,
+        index_maps=[indexmap, indexmap],
+        like=like,
+        flat=flat,
+    )
+
+
+def _fh_spinful_local_array_with_v(
+    symmetry,
+    *,
+    t=1.0,
+    U=8.0,
+    mu=0.0,
+    V=0.0,
+    coordinations=(1, 1),
+    like="numpy",
+    flat=False,
+):
+    """Return a Symmray spinful Fermi-Hubbard local array with optional V."""
+    import symmray.fermionic_local_operators as flo  # pylint: disable=import-outside-toplevel
+
+    base = flo.fermi_hubbard_local_array(
+        symmetry,
+        t=t,
+        U=U,
+        mu=mu,
+        coordinations=coordinations,
+        like=like,
+        flat=flat,
+    )
+    if V == 0:
+        return base
+    return base + _fh_spinful_density_edge_array(
+        symmetry,
+        V=V,
+        like=like,
+        flat=flat,
+    )
+
+
+def _ham_fermi_hubbard_spinful_from_edges_with_v(
+    symmetry,
+    edges,
+    *,
+    t=1.0,
+    U=8.0,
+    mu=0.0,
+    V=0.0,
+    like="numpy",
+    flat=False,
+):
+    """Return spinful Fermi-Hubbard terms, including edge density V."""
+    edges = _as_edges(edges)
+    coordinations = {}
+    for left, right in edges:
+        coordinations[left] = coordinations.setdefault(left, 0) + 1
+        coordinations[right] = coordinations.setdefault(right, 0) + 1
+
+    return {
+        (left, right): _fh_spinful_local_array_with_v(
+            symmetry,
+            t=_edge_parameter(t, left, right),
+            U=(_node_parameter(U, left), _node_parameter(U, right)),
+            mu=(_node_parameter(mu, left), _node_parameter(mu, right)),
+            V=_edge_parameter(V, left, right),
+            coordinations=(coordinations[left], coordinations[right]),
+            like=like,
+            flat=flat,
+        )
+        for left, right in edges
+    }
+
+
 def _hamiltonian_from_edges(model, symmetry, edges, *, flat=False, **params):
     sr = _require_symmray()
     model = _normalize_model(model)
@@ -4010,6 +4105,13 @@ def _hamiltonian_from_edges(model, symmetry, edges, *, flat=False, **params):
     if model == "heisenberg":
         return sr.ham_heisenberg_from_edges(symmetry, edges, flat=flat, **params)
     if model in {"fermi_hubbard", "fermi_hubbard_u1u1"}:
+        if "V" in params:
+            return _ham_fermi_hubbard_spinful_from_edges_with_v(
+                symmetry,
+                edges,
+                flat=flat,
+                **params,
+            )
         return sr.ham_fermi_hubbard_from_edges(symmetry, edges, flat=flat, **params)
     if model == "fermi_hubbard_spinless":
         return sr.ham_fermi_hubbard_spinless_from_edges(symmetry, edges, flat=flat, **params)
@@ -4879,6 +4981,7 @@ class SymHamiltonian:
         t_u, t_d = _as_spin_pair(self.parameters.get("t", 1.0), name="t")
         mu_u, mu_d = _as_spin_pair(self.parameters.get("mu", 0.0), name="mu")
         U = self.parameters.get("U", 8.0)
+        V = self.parameters.get("V", 0.0)
 
         channels = [[(start, zero), (done, zero)] for _ in range(max(L - 1, 0))]
         transitions = [[] for _ in range(L)]
@@ -4897,7 +5000,8 @@ class SymHamiltonian:
             (t_u, ops["create_u"], ops["annihilate_u"], (0, 1), "u"),
             (t_d, ops["create_d"], ops["annihilate_d"], (1, 0), "d"),
         )
-        for edge_pos, edge in enumerate(edges):
+        number = ops["number_u"] + ops["number_d"]
+        for edge_pos, (raw_edge, edge) in enumerate(zip(raw_edges, edges)):
             i, j = (int(edge[0]), int(edge[1]))
             if i == j:
                 raise ValueError("Hamiltonian edges must connect distinct sites.")
@@ -4905,6 +5009,17 @@ class SymHamiltonian:
                 raise ValueError(f"edge {edge!r} is outside MPO length L={L}.")
             if i > j:
                 i, j = j, i
+            V_edge = _edge_parameter(V, raw_edge[0], raw_edge[1])
+            if V_edge != 0:
+                channel_id = ("density", edge_pos)
+                for cut in range(i, j):
+                    channels[cut].append((channel_id, zero))
+                transitions[i].append((start, channel_id, V_edge * number))
+                for site in range(i + 1, j):
+                    transitions[site].append(
+                        (channel_id, channel_id, ops["identity"])
+                    )
+                transitions[j].append((channel_id, done, number))
             for t_sigma, create, annihilate, create_charge, spin in mode_terms:
                 if t_sigma == 0:
                     continue

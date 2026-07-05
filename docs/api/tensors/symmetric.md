@@ -144,7 +144,8 @@ Current support is:
   ``Z2`` symmetry, hopping, density interaction, and chemical-potential terms
   (pairing ``delta != 0`` is not implemented yet);
 - spinful Fermi-Hubbard ``model="fermi_hubbard_u1u1"`` with
-  ``symmetry="U1U1"``.
+  ``symmetry="U1U1"``, hopping, onsite interaction, nearest-neighbor density
+  interaction, and chemical-potential terms.
 
 Spinful total-particle-number ``model="fermi_hubbard"`` with ``symmetry="U1"``
 still raises ``NotImplementedError``; use ``model="fermi_hubbard_u1u1"`` when
@@ -155,7 +156,9 @@ Hubbard states with charges ``(n_up, n_down)``. Onsite terms use
 ``U * n_up * n_down - mu_up * n_up - mu_down * n_down``. ``mu`` may be a scalar
 or ``(mu_up, mu_down)``. Hopping terms use
 ``-t_sigma c^dagger_i_sigma c_j_sigma`` plus the reverse direction, and ``t``
-may be a scalar or ``(t_up, t_down)``.
+may be a scalar or ``(t_up, t_down)``. Nearest-neighbor density terms use
+``V * (n_up + n_down)_i * (n_up + n_down)_j`` on each supplied edge; ``V`` may
+be a scalar, edge mapping, or edge callable.
 
 For fermionic models, non-adjacent mapped hopping edges insert the dense
 fermionic parity operator on every intermediate chain site, so a 2D
@@ -179,6 +182,7 @@ ham = py.SymHamiltonian.from_edges(
     square_lattice_edges,
     t=1.0,
     U=8.0,
+    V=0.25,
     mu=0.0,
 )
 

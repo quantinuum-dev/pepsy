@@ -982,6 +982,7 @@ def test_fermi_hubbard_u1u1_hamiltonian_builds_mpo_energy_path():
         t=1.0,
         U=8.0,
         mu=0.2,
+        V=0.3,
     )
     mpo = ham.to_mpo(L=2, compress=False)
 
@@ -1313,6 +1314,54 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
     assert complex(energy_compressed) == pytest.approx(complex(energy))
 
 
+def test_fermi_hubbard_u1u1_hamiltonian_mpo_supports_long_range_density_v():
+    """Spinful U1U1 FH MPOs should support neutral NN density channels."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations(
+            [(1, 0), (0, 0), (1, 1), (0, 1)]
+        ),
+        seed=1234,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 2), (1, 3)],
+        t=0.0,
+        U=0.0,
+        mu=0.0,
+        V=0.7,
+    )
+    mpo = ham.to_mpo(L=4, compress=False)
+    mpo_compressed = ham.to_mpo(L=4, compress=True, max_bond=16, cutoff=1e-12)
+
+    energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    energy_compressed = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo_compressed,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert mpo.max_bond() >= 3
+    assert complex(energy) == pytest.approx(complex(term_energy))
+    assert complex(energy_compressed) == pytest.approx(complex(energy))
+
+
 @pytest.mark.parametrize(
     "hopping,site_charges",
     [
@@ -1418,6 +1467,7 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_builds_pbc_wrap_edge():
         t=1.0,
         U=4.0,
         mu=0.0,
+        V=0.25,
     )
     mpo = ham.to_mpo(L=4, compress=False)
     energy = pepsy.MpsEnergyOptimizer(
@@ -1463,7 +1513,7 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_maps_2d_edges_with_onedmap():
         seed=13,
         dtype="complex128",
     )
-    params = {"t": 1.0, "U": 4.0, "mu": 0.25}
+    params = {"t": 1.0, "U": 4.0, "mu": 0.25, "V": 0.4}
     ham_2d = SymHamiltonian.from_edges(
         "fermi_hubbard_u1u1",
         "U1U1",
