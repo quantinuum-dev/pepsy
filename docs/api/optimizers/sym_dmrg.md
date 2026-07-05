@@ -50,7 +50,10 @@ Symmray sweeps
 canonicalize the MPS center before using H-only dense/Lanczos solves; a
 non-identity effective norm is treated as a canonicalization/alignment error
 unless the explicit diagnostic `local_solver="generalized_dense"` mode is
-requested. If a requested state canonicalization method is unavailable,
+requested. `local_solver="auto"` now defaults to the matrix-free Lanczos path
+for Symmray local solves; set `dense_threshold` above zero or request
+`local_solver="dense"` only when deliberately building dense reference local
+Hamiltonians. If a requested state canonicalization method is unavailable,
 SymDMRG2 forces `N_eff ~= I` checks for that H-only sweep even when
 `norm_check="off"`, so the wrong metric cannot be used silently. The default
 `norm_check="strict"` validates every two-site window.

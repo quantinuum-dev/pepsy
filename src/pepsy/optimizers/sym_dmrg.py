@@ -866,12 +866,15 @@ class SymDMRG2:
         Relative cutoff for dropping tiny effective-norm eigenvalues in the
         dense generalized local solve.
     local_solver
-        ``"auto"`` selects dense local solves below ``dense_threshold`` and
-        Lanczos linear-operator solves above it. ``"dense"``, ``"lanczos"``,
-        and ``"generalized_dense"`` force a specific Symmray local solver.
+        ``"auto"`` selects Lanczos linear-operator solves by default and uses
+        dense local solves only when the active theta-vector dimension is at or
+        below ``dense_threshold``. ``"dense"``, ``"lanczos"``, and
+        ``"generalized_dense"`` force a specific Symmray local solver.
     dense_threshold
         Active theta-vector dimension at or below which ``local_solver="auto"``
-        uses the dense reference Hamiltonian solve.
+        uses the dense reference Hamiltonian solve. The default ``0`` keeps
+        the block-native path matrix-free unless a caller explicitly opts into
+        dense local solves.
     local_eig_tol, local_eig_ncv, local_eig_maxiter, local_eig_backend
         Krylov/Lanczos eigensolver options passed to quimb's eigensolver
         wrapper for matrix-free local solves.
@@ -967,7 +970,7 @@ class SymDMRG2:
         max_dense_dim=4096,
         norm_rcond=1e-10,
         local_solver="auto",
-        dense_threshold=800,
+        dense_threshold=0,
         local_eig_tol=1e-8,
         local_eig_ncv=8,
         local_eig_maxiter=None,

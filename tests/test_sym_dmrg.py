@@ -1038,6 +1038,37 @@ def test_symdmrg2_lanczos_matches_dense_after_canonicalization():
     assert set(lanczos_theta.data.blocks) == set(dense_theta.data.blocks)
 
 
+def test_symdmrg2_auto_solver_defaults_to_matrix_free_lanczos():
+    """Auto local solves should avoid dense full-matrix construction by default."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        compute_initial_energy=False,
+        local_eig_tol=1e-10,
+        local_eig_ncv=8,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_norm_environments()
+    opt.build_block_environments()
+
+    energy, theta = opt.local_eigensolve(0)
+    diagnostic = opt.local_solve_diagnostics[-1]
+
+    assert theta.inds == opt.two_site_theta(0).inds
+    assert isinstance(energy, float)
+    assert opt.summary()["dense_threshold"] == 0
+    assert diagnostic["requested_solver"] == "auto"
+    assert diagnostic["theta_dim"] > 2
+    assert diagnostic["solver"] == "lanczos"
+
+
 def test_symdmrg2_rejects_cyclic_symmray_mps_chain():
     """The Symmray DMRG path is deliberately restricted to OBC MPS chains."""
     pytest.importorskip("symmray")
