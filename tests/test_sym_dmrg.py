@@ -749,7 +749,8 @@ def test_symdmrg2_block_native_matvec_matches_dense_reference_all_sites():
 
         dense = opt.two_site_matvec_dense_reference(site, trial)
         native = opt.two_site_matvec_symmray(site, trial)
-        summary = opt._last_matvec_projected_problem.summary()
+        problem = opt._last_matvec_projected_problem
+        summary = problem.summary()
         expected_order = (
             "left_first"
             if summary["left_projector_dim"] > 2 * summary["right_projector_dim"]
@@ -758,6 +759,13 @@ def test_symdmrg2_block_native_matvec_matches_dense_reference_all_sites():
 
         assert native.inds == dense.inds == theta.inds
         assert summary["matvec_contraction_order"] == expected_order
+        for prefix, contraction in (
+            ("left_contract", problem.left_contraction),
+            ("right_contract", problem.right_contraction),
+        ):
+            if contraction.shared:
+                sizes = [contraction.left.ind_size(ind) for ind in contraction.shared]
+                assert summary[f"{prefix}_contracted_ind_size"] == max(sizes)
         assert set(native.data.blocks) == set(dense.data.blocks) == set(theta.data.blocks)
         for sector in theta.data.blocks:
             assert native.data.blocks[sector] == pytest.approx(dense.data.blocks[sector])

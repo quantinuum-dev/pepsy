@@ -467,6 +467,17 @@ def _add_elapsed(timings, key, start):
         timings[key] = timings.get(key, 0.0) + (time.perf_counter() - start)
 
 
+def _tensor_ind_size(tensor, ind):
+    try:
+        return int(tensor.ind_size(ind))
+    except Exception:  # pragma: no cover - best-effort optimization heuristic
+        return 1
+
+
+def _largest_shared_ind(left, shared):
+    return max(shared, key=lambda ind: _tensor_ind_size(left, ind))
+
+
 class _BlockPairContraction:
     """Precomputed index routing for one static-left block contraction."""
 
@@ -484,9 +495,13 @@ class _BlockPairContraction:
             self.right_axis = None
             self.contract_output_inds = self.left_inds + self.right_inds
             self.output_inds = self.contract_output_inds
+            self.trace_subscript = None
+            self.contract_ind_size = 0
             return
 
-        first, *remaining = self.shared
+        first = _largest_shared_ind(self.left, self.shared)
+        remaining = tuple(ind for ind in self.shared if ind != first)
+        self.contract_ind_size = _tensor_ind_size(self.left, first)
         for num, ind in enumerate(remaining):
             temp_ind = f"{ind}__symdmrg_rhs{num}"
             self.reindex_map[ind] = temp_ind
@@ -511,22 +526,54 @@ class _BlockPairContraction:
             self.contract_output_inds,
             self.trace_pairs,
         )
+        self.trace_subscript = self._trace_subscript(
+            self.contract_output_inds,
+            self.trace_pairs,
+        )
 
     @staticmethod
-    def _output_after_traces(output_inds, trace_pairs):
-        output = list(output_inds)
-        for ind, temp_ind in trace_pairs:
-            axis_a = output.index(ind)
-            axis_b = output.index(temp_ind)
-            for axis in sorted((axis_a, axis_b), reverse=True):
-                output.pop(axis)
-        return tuple(output)
+    def _output_after_traces(inds, trace_pairs):
+        traced = {ind for pair in trace_pairs for ind in pair}
+        return tuple(ind for ind in inds if ind not in traced)
+
+    @staticmethod
+    def _trace_subscript(inds, trace_pairs):
+        if not trace_pairs:
+            return None
+
+        labels_by_ind = {}
+        symbol_iter = iter(string.ascii_letters)
+        for ind_a, ind_b in trace_pairs:
+            try:
+                label = next(symbol_iter)
+            except StopIteration as exc:  # pragma: no cover - defensive guard
+                raise ValueError("Too many trace pairs for SymDMRG2 contraction.") from exc
+            labels_by_ind[ind_a] = label
+            labels_by_ind[ind_b] = label
+
+        labels = []
+        output_labels = []
+        for ind in inds:
+            if ind in labels_by_ind:
+                labels.append(labels_by_ind[ind])
+                continue
+            try:
+                label = next(symbol_iter)
+            except StopIteration as exc:  # pragma: no cover - defensive guard
+                raise ValueError(
+                    "Too many tensor axes for SymDMRG2 contraction."
+                ) from exc
+            labels.append(label)
+            output_labels.append(label)
+
+        return "".join(labels) + "->" + "".join(output_labels)
 
     def apply(self, right, *, timings=None, prefix="contract"):
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
         if tuple(right.inds) != self.right_inds:
             raise ValueError("Right tensor indices changed for cached block contraction.")
+
         if not self.shared:
             step_start = time.perf_counter() if timings is not None else None
             data = self.left.data.tensordot(
@@ -546,11 +593,7 @@ class _BlockPairContraction:
             return out
 
         step_start = time.perf_counter() if timings is not None else None
-        right_work = (
-            right.reindex(self.reindex_map, inplace=False)
-            if self.reindex_map
-            else right
-        )
+        right_work = right.reindex(self.reindex_map, inplace=False)
         _add_elapsed(timings, f"{prefix}_reindex_elapsed", step_start)
         step_start = time.perf_counter() if timings is not None else None
         data = self.left.data.tensordot(
@@ -560,17 +603,19 @@ class _BlockPairContraction:
             preserve_array=True,
         )
         _add_elapsed(timings, f"{prefix}_tensordot_elapsed", step_start)
+        inds = self.contract_output_inds
+        if self.trace_subscript is not None:
+            step_start = time.perf_counter() if timings is not None else None
+            data = data.einsum(self.trace_subscript, preserve_array=True)
+            inds = self.output_inds
+            _add_elapsed(timings, f"{prefix}_trace_elapsed", step_start)
         step_start = time.perf_counter() if timings is not None else None
         out = qtn.Tensor(
             data=data,
-            inds=self.contract_output_inds,
+            inds=inds,
             tags=self.left.tags | right.tags,
         )
         _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
-        step_start = time.perf_counter() if timings is not None else None
-        for ind, temp_ind in self.trace_pairs:
-            out = self.optimizer._trace_block_tensor_inds(out, ind, temp_ind)
-        _add_elapsed(timings, f"{prefix}_trace_elapsed", step_start)
         return out
 
     def summary(self, prefix):
@@ -578,6 +623,8 @@ class _BlockPairContraction:
             f"{prefix}_shared_inds": len(self.shared),
             f"{prefix}_trace_pairs": len(self.trace_pairs),
             f"{prefix}_reindexed_inds": len(self.reindex_map),
+            f"{prefix}_contracted_inds": int(bool(self.shared)),
+            f"{prefix}_contracted_ind_size": self.contract_ind_size,
         }
 
 
@@ -2801,7 +2848,8 @@ class SymDMRG2:
                 tags=left.tags | right.tags,
             )
 
-        first, *remaining = shared
+        first = _largest_shared_ind(left, shared)
+        remaining = tuple(ind for ind in shared if ind != first)
         right_work = right
         trace_pairs = []
         for num, ind in enumerate(remaining):
@@ -2820,7 +2868,8 @@ class SymDMRG2:
         inds = (
             tuple(ind for axis, ind in enumerate(left.inds) if axis != left_axis)
             + tuple(
-                ind for axis, ind in enumerate(right_work.inds) if axis != right_axis
+                ind for axis, ind in enumerate(right_work.inds)
+                if axis != right_axis
             )
         )
         out = qtn.Tensor(data=data, inds=inds, tags=left.tags | right.tags)
