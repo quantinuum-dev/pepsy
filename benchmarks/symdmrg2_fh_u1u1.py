@@ -192,6 +192,11 @@ def run_benchmark(
     opt.solve(max_sweeps=int(sweeps), sweep_sequence=sweep_sequence, tol=0.0)
     elapsed = time.perf_counter() - start
     energy = None if opt.energy is None else float(opt.energy)
+    energy_history = [float(item) for item in opt.energies]
+    energy_deltas = [
+        float(abs(current - previous))
+        for previous, current in zip(energy_history, energy_history[1:])
+    ]
     energy_error = (
         None
         if energy is None or expected_energy is None
@@ -264,11 +269,19 @@ def run_benchmark(
             "elapsed": float(elapsed),
             "max_bond": int(opt.state.max_bond()),
             "num_sweeps": len(opt.energies),
+            "energies": energy_history,
+            "energy_deltas": energy_deltas,
             "num_svd_diagnostics": len(opt.svd_diagnostics),
             "num_norm_identity_diagnostics": len(opt.norm_identity_diagnostics),
             "num_residual_diagnostics": len(opt.residual_diagnostics),
             "num_matvec_diagnostics": len(opt.matvec_diagnostic_records),
             "num_local_solve_diagnostics": len(opt.local_solve_diagnostics),
+            "num_convergence_diagnostics": len(opt.convergence_diagnostics),
+            "last_convergence_diagnostic": opt.last_convergence_diagnostic,
+            "num_mixer_diagnostics": len(opt.mixer_diagnostics),
+            "num_variational_sector_diagnostics": len(
+                opt.variational_sector_diagnostics
+            ),
         },
         "profile": opt.profile_summary(),
         "compression": opt.compression_summary(),

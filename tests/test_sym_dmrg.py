@@ -1,5 +1,6 @@
 """Tests for the SymDMRG2 public driver scaffold."""
 
+import json
 import numpy as np
 import importlib.util
 from pathlib import Path
@@ -525,8 +526,17 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     assert result["case"]["compute_initial_energy"] is False
     assert result["result"]["num_sweeps"] == 1
     assert isinstance(result["result"]["energy"], float)
+    assert result["result"]["energies"] == pytest.approx([result["result"]["energy"]])
+    assert result["result"]["energy_deltas"] == []
     assert result["result"]["num_residual_diagnostics"] == 1
     assert result["result"]["num_matvec_diagnostics"] == result["profile"]["num_matvecs"]
+    assert result["result"]["num_convergence_diagnostics"] == 1
+    assert result["result"]["last_convergence_diagnostic"]["energy"] == pytest.approx(
+        result["result"]["energy"]
+    )
+    assert result["result"]["num_mixer_diagnostics"] == 0
+    assert result["result"]["num_variational_sector_diagnostics"] >= 1
+    json.dumps(result)
     assert result["profile"]["enabled"]
     assert result["profile"]["num_events"] == len(result["profile_events"])
     assert result["profile"]["num_matvec_diagnostics"] == len(
@@ -574,6 +584,12 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     assert mapped["result"]["reached_expected_energy"] is False
     assert mapped["case"]["num_edges"] == 4
     assert mapped["result"]["num_sweeps"] == 1
+    assert mapped["result"]["energies"] == pytest.approx([mapped["result"]["energy"]])
+    assert mapped["result"]["energy_deltas"] == []
+    assert mapped["result"]["last_convergence_diagnostic"]["energy"] == pytest.approx(
+        mapped["result"]["energy"]
+    )
+    json.dumps(mapped)
     assert mapped["profile"]["enabled"]
     assert mapped["profile"]["phase_counts"]["sweep"] == 1
     assert mapped["compression"]["max_bond_dim"] <= 3
