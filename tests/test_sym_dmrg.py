@@ -513,7 +513,14 @@ def test_symdmrg2_norm_check_off_skips_effective_norm_probe(monkeypatch):
     def raise_if_called(*_args, **_kwargs):
         raise AssertionError("effective_norm_identity_error should be skipped")
 
+    def raise_if_norm_env_called(*_args, **_kwargs):
+        raise AssertionError("norm environments should not be tracked")
+
     monkeypatch.setattr(opt, "effective_norm_identity_error", raise_if_called)
+    monkeypatch.setattr(opt, "build_sweep_norm_environments", raise_if_norm_env_called)
+    monkeypatch.setattr(opt, "update_left_norm_environment", raise_if_norm_env_called)
+    monkeypatch.setattr(opt, "update_right_norm_environment", raise_if_norm_env_called)
+    monkeypatch.setattr(opt, "norm_environment_value", raise_if_norm_env_called)
     opt.solve(max_sweeps=1)
 
     assert len(opt.norm_identity_diagnostics) == 2

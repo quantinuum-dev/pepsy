@@ -3693,6 +3693,13 @@ class SymDMRG2:
             return (int(site) % self.norm_check_interval) == 0
         raise ValueError(f"Unknown normalized norm_check mode {mode!r}.")
 
+    def _should_track_norm_environments(self):
+        if self.local_solver == "generalized_dense":
+            return True
+        if self.norm_check != "off":
+            return True
+        return bool(self._force_norm_check_after_skipped_canonize)
+
     def _should_run_residual_check(self, site):
         mode = self.residual_check
         if mode == "strict":
@@ -4294,7 +4301,12 @@ class SymDMRG2:
             self.right_envs = None
         else:
             self.build_sweep_environments(direction)
-        self.build_sweep_norm_environments(direction)
+        track_norm_envs = self._should_track_norm_environments()
+        if track_norm_envs:
+            self.build_sweep_norm_environments(direction)
+        else:
+            self.left_norm_envs = None
+            self.right_norm_envs = None
         if use_block_h_envs:
             self.build_sweep_block_environments(direction)
 
@@ -4325,7 +4337,8 @@ class SymDMRG2:
                     env_update_start = self._profile_start()
                     if not use_block_h_envs:
                         self.update_left_environment(site)
-                    self.update_left_norm_environment(site)
+                    if track_norm_envs:
+                        self.update_left_norm_environment(site)
                     if use_block_h_envs:
                         self.update_left_block_environment(site)
                     self._record_profile_elapsed(
@@ -4339,7 +4352,8 @@ class SymDMRG2:
                     env_update_start = self._profile_start()
                     if not use_block_h_envs:
                         self.update_right_environment(site + 1)
-                    self.update_right_norm_environment(site + 1)
+                    if track_norm_envs:
+                        self.update_right_norm_environment(site + 1)
                     if use_block_h_envs:
                         self.update_right_block_environment(site + 1)
                     self._record_profile_elapsed(
@@ -4360,6 +4374,7 @@ class SymDMRG2:
             direction,
             update_dense=not use_block_h_envs,
             update_block=use_block_h_envs,
+            update_norm=track_norm_envs,
         )
         self._record_profile_elapsed(
             "finish_sweep_environments",
@@ -4367,9 +4382,9 @@ class SymDMRG2:
             direction=direction,
         )
         if use_block_h_envs:
-            energy = self.block_environment_energy(normalized=True).real
+            energy = self.block_environment_energy(normalized=track_norm_envs).real
         else:
-            energy = self.environment_energy(normalized=True).real
+            energy = self.environment_energy(normalized=track_norm_envs).real
         self.local_energies.append(tuple(local_ens))
         self.total_energies.append(tuple(local_ens[:-1] + [energy]))
         self._record_profile_elapsed(
@@ -4389,24 +4404,29 @@ class SymDMRG2:
         *,
         update_dense=True,
         update_block=True,
+        update_norm=True,
     ):
         if direction == "right":
             if update_dense:
                 self.update_left_environment(self._state.L - 1)
-            self.update_left_norm_environment(self._state.L - 1)
+            if update_norm:
+                self.update_left_norm_environment(self._state.L - 1)
             if update_dense:
                 self.right_envs[0] = self.left_envs[self._state.L]
-            self.right_norm_envs[0] = self.left_norm_envs[self._state.L]
+            if update_norm:
+                self.right_norm_envs[0] = self.left_norm_envs[self._state.L]
             if update_block and self.left_block_envs is not None:
                 self.update_left_block_environment(self._state.L - 1)
                 self.right_block_envs[0] = self.left_block_envs[self._state.L]
         elif direction == "left":
             if update_dense:
                 self.update_right_environment(0)
-            self.update_right_norm_environment(0)
+            if update_norm:
+                self.update_right_norm_environment(0)
             if update_dense:
                 self.left_envs[self._state.L] = self.right_envs[0]
-            self.left_norm_envs[self._state.L] = self.right_norm_envs[0]
+            if update_norm:
+                self.left_norm_envs[self._state.L] = self.right_norm_envs[0]
             if update_block and self.right_block_envs is not None:
                 self.update_right_block_environment(0)
                 self.left_block_envs[self._state.L] = self.right_block_envs[0]
