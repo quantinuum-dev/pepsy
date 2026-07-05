@@ -23,29 +23,50 @@ def alternating_occupations(length):
 def build_fh_u1u1_case(
     *,
     length,
+    lattice_shape=None,
+    mapper_mode="snake",
     bond_dim,
     seed,
     hopping,
     interaction,
     chemical_potential,
+    mpo_cutoff=1e-12,
 ):
-    """Build a Symmray FH U1U1 state and OBC MPO."""
+    """Build a Symmray FH U1U1 state and OBC or mapped-2D MPO."""
+    import quimb.tensor as qtn
+
     from pepsy.tensors import (
+        OneDMap,
         SymHamiltonian,
         SymMPS,
         site_charge_from_occupations,
     )
 
+    mapper = None
+    if lattice_shape is None:
+        length = int(length)
+        edges = [(site, site + 1) for site in range(length - 1)]
+        compress_mpo = False
+        lattice_shape_out = None
+    else:
+        lx, ly = (int(dim) for dim in lattice_shape)
+        if lx < 1 or ly < 1:
+            raise ValueError("lattice_shape dimensions must be positive.")
+        length = lx * ly
+        edges = tuple(qtn.edges_2d_square(lx, ly))
+        mapper = OneDMap(lx, ly, mode=mapper_mode)
+        compress_mpo = True
+        lattice_shape_out = (lx, ly)
+
     occupations = alternating_occupations(length)
     state = SymMPS.for_model(
         "fermi_hubbard_u1u1",
-        int(length),
+        length,
         bond_dim=int(bond_dim),
         site_charge=site_charge_from_occupations(occupations),
         seed=int(seed),
         dtype="complex128",
     )
-    edges = [(site, site + 1) for site in range(int(length) - 1)]
     ham = SymHamiltonian.from_edges(
         "fermi_hubbard_u1u1",
         "U1U1",
@@ -54,12 +75,30 @@ def build_fh_u1u1_case(
         U=float(interaction),
         mu=float(chemical_potential),
     )
-    return occupations, state, ham.to_mpo(L=int(length), compress=False)
+    mpo = ham.to_mpo(
+        L=length,
+        mapper=mapper,
+        compress=compress_mpo,
+        cutoff=float(mpo_cutoff),
+    )
+    return {
+        "occupations": occupations,
+        "state": state,
+        "mpo": mpo,
+        "length": length,
+        "edges": tuple(edges),
+        "lattice_shape": lattice_shape_out,
+        "mapper_mode": None if mapper is None else str(mapper_mode),
+        "mpo_compress": compress_mpo,
+        "mpo_cutoff": float(mpo_cutoff),
+    }
 
 
 def run_benchmark(
     *,
     length=4,
+    lattice_shape=None,
+    mapper_mode="snake",
     chi=8,
     initial_bond_dim=4,
     sweeps=2,
@@ -84,19 +123,25 @@ def run_benchmark(
     matvec_diagnostics="sampled",
     matvec_diagnostics_interval=1,
     compute_initial_energy=False,
+    mpo_cutoff=1e-12,
     include_events=False,
 ):
     """Run one benchmark and return a JSON-serializable result dict."""
     import pepsy
 
-    occupations, state, mpo = build_fh_u1u1_case(
+    case = build_fh_u1u1_case(
         length=length,
+        lattice_shape=lattice_shape,
+        mapper_mode=mapper_mode,
         bond_dim=initial_bond_dim,
         seed=seed,
         hopping=hopping,
         interaction=interaction,
         chemical_potential=chemical_potential,
+        mpo_cutoff=mpo_cutoff,
     )
+    state = case["state"]
+    mpo = case["mpo"]
     opt = pepsy.SymDMRG2(
         mpo,
         state,
@@ -127,13 +172,23 @@ def run_benchmark(
 
     result = {
         "case": {
-            "length": int(length),
+            "length": int(case["length"]),
+            "lattice_shape": (
+                None
+                if case["lattice_shape"] is None
+                else [int(dim) for dim in case["lattice_shape"]]
+            ),
+            "edges": [list(edge) for edge in case["edges"]],
+            "num_edges": len(case["edges"]),
+            "mapper_mode": case["mapper_mode"],
+            "mpo_compress": bool(case["mpo_compress"]),
+            "mpo_cutoff": float(case["mpo_cutoff"]),
             "chi": int(chi),
             "initial_bond_dim": int(initial_bond_dim),
             "sweeps": int(sweeps),
             "sweep_sequence": str(sweep_sequence),
             "seed": int(seed),
-            "occupations": [list(item) for item in occupations],
+            "occupations": [list(item) for item in case["occupations"]],
             "hopping": float(hopping),
             "interaction": float(interaction),
             "chemical_potential": float(chemical_potential),
@@ -176,6 +231,15 @@ def run_benchmark(
 def build_arg_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--length", type=int, default=4)
+    parser.add_argument(
+        "--lattice-shape",
+        type=int,
+        nargs=2,
+        metavar=("LX", "LY"),
+        default=None,
+        help="Build a mapped LX-by-LY square-lattice MPO instead of a 1D chain.",
+    )
+    parser.add_argument("--mapper-mode", default="snake")
     parser.add_argument("--chi", type=int, default=8)
     parser.add_argument("--initial-bond-dim", type=int, default=4)
     parser.add_argument("--sweeps", type=int, default=2)
@@ -200,6 +264,7 @@ def build_arg_parser():
     parser.add_argument("--matvec-diagnostics", default="sampled")
     parser.add_argument("--matvec-diagnostics-interval", type=int, default=1)
     parser.add_argument("--compute-initial-energy", action="store_true")
+    parser.add_argument("--mpo-cutoff", type=float, default=1e-12)
     parser.add_argument("--include-events", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     return parser
@@ -209,6 +274,8 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     result = run_benchmark(
         length=args.length,
+        lattice_shape=args.lattice_shape,
+        mapper_mode=args.mapper_mode,
         chi=args.chi,
         initial_bond_dim=args.initial_bond_dim,
         sweeps=args.sweeps,
@@ -233,6 +300,7 @@ def main(argv=None):
         matvec_diagnostics=args.matvec_diagnostics,
         matvec_diagnostics_interval=args.matvec_diagnostics_interval,
         compute_initial_energy=args.compute_initial_energy,
+        mpo_cutoff=args.mpo_cutoff,
         include_events=args.include_events,
     )
     text = json.dumps(result, indent=2, sort_keys=True)

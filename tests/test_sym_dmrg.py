@@ -539,6 +539,32 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     assert result["compression"]["num_splits"] == result["result"]["num_svd_diagnostics"]
     assert result["compression"]["max_bond_dim"] <= 3
 
+    mapped = module.run_benchmark(
+        lattice_shape=(2, 2),
+        chi=3,
+        initial_bond_dim=1,
+        sweeps=1,
+        local_solver="dense",
+        dense_threshold=100,
+        norm_check="sampled",
+        norm_check_interval=2,
+        residual_check="sampled",
+        residual_check_interval=2,
+        matvec_diagnostics="sampled",
+        matvec_diagnostics_interval=2,
+        compute_initial_energy=False,
+    )
+
+    assert mapped["case"]["length"] == 4
+    assert mapped["case"]["lattice_shape"] == [2, 2]
+    assert mapped["case"]["mapper_mode"] == "snake"
+    assert mapped["case"]["mpo_compress"] is True
+    assert mapped["case"]["num_edges"] == 4
+    assert mapped["result"]["num_sweeps"] == 1
+    assert mapped["profile"]["enabled"]
+    assert mapped["profile"]["phase_counts"]["sweep"] == 1
+    assert mapped["compression"]["max_bond_dim"] <= 3
+
 
 def test_symdmrg2_norm_check_off_skips_effective_norm_probe(monkeypatch):
     """Production runs can skip the expensive N_eff ~= I probe explicitly."""
