@@ -7,7 +7,7 @@ import quimb.tensor as qtn
 import pytest
 
 import pepsy
-from pepsy.tensors import SymHamiltonian, SymMPS, site_charge_from_occupations
+from pepsy.tensors import OneDMap, SymHamiltonian, SymMPS, site_charge_from_occupations
 
 
 def _fh_u1u1_chain(L, occupations, *, bond_dim=3, seed=13, U=2.0, mu=0.1):
@@ -1038,6 +1038,86 @@ def test_symdmrg2_lanczos_matches_dense_after_canonicalization():
     assert set(lanczos_theta.data.blocks) == set(dense_theta.data.blocks)
 
 
+def test_symdmrg2_lanczos_uses_native_block_krylov_by_default(monkeypatch):
+    """Default Lanczos should keep Krylov vectors as block tensors."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-12,
+        local_eig_ncv=8,
+        norm_check="off",
+        compute_initial_energy=False,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_block_environments()
+    theta = opt.two_site_variational_theta(0, opt.two_site_theta(0))
+
+    def fail_flat_space(*_args, **_kwargs):
+        raise AssertionError("flat theta space should not be used")
+
+    monkeypatch.setattr(opt, "two_site_theta_space", fail_flat_space)
+    dense_energy, _ = opt.dense_local_eigensolve(0, theta=theta)
+    lanczos_energy, lanczos_theta = opt.lanczos_local_eigensolve(0, theta=theta)
+
+    assert lanczos_energy == pytest.approx(dense_energy)
+    assert lanczos_theta.inds == theta.inds
+    assert opt._last_lanczos_info["backend"] == "native_block"
+    assert opt._last_lanczos_info["num_steps"] >= 1
+
+
+def test_symdmrg2_preserves_real_theta_space_dtype():
+    """Real Symmray states should not be promoted to complex local vectors."""
+    pytest.importorskip("symmray")
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        3,
+        bond_dim=2,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0)]),
+        seed=5,
+        dtype="float64",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1), (1, 2)],
+        t=1.0,
+        U=1.0,
+        mu=0.1,
+    )
+    opt = pepsy.SymDMRG2(
+        ham.to_mpo(L=3, compress=False),
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-10,
+        norm_check="off",
+        compute_initial_energy=False,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_block_environments()
+    theta = opt.two_site_variational_theta(0, opt.two_site_theta(0))
+    space = opt.two_site_theta_space(0, theta)
+    _, theta_opt = opt.lanczos_local_eigensolve(0, theta=theta)
+
+    assert np.issubdtype(space.dtype, np.floating)
+    assert {
+        np.asarray(block).dtype.kind for block in theta_opt.data.blocks.values()
+    } == {"f"}
+
+
 def test_symdmrg2_auto_solver_defaults_to_matrix_free_lanczos():
     """Auto local solves should avoid dense full-matrix construction by default."""
     pytest.importorskip("symmray")
@@ -1292,6 +1372,52 @@ def test_symdmrg2_nucleates_sectors_from_product_state_without_enrichment():
         diagnostic["left"]["num_sectors"] > 1
         for diagnostic in opt.svd_diagnostics
     )
+
+
+def test_symdmrg2_prunes_projected_dead_variational_blocks_on_mapped_2d_case():
+    """Long-range mapped MPO environments should trim dead widened theta blocks."""
+    pytest.importorskip("symmray")
+    mapper = OneDMap(3, 2, mode="snake")
+    occupations = [(1, 0), (0, 1)] * 3
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        6,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations(occupations),
+        seed=7,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        tuple(qtn.edges_2d_square(3, 2)),
+        t=1.0,
+        U=4.0,
+        mu=0.0,
+    )
+    opt = pepsy.SymDMRG2(
+        ham.to_mpo(mapper=mapper, compress=True, cutoff=1e-12),
+        state,
+        chi=8,
+        cutoff=1e-9,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        norm_check="off",
+        compute_initial_energy=False,
+    )
+    opt._prepare_variational_sector_basis(sweep=0, max_bond=8)
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_block_environments()
+
+    theta = opt.two_site_variational_theta(1, opt.two_site_theta(1))
+    pruned, diagnostic = opt._prune_theta_to_projected_support(1, theta)
+
+    assert diagnostic["removed_blocks"] > 0
+    assert diagnostic["kept_blocks"] < diagnostic["input_blocks"]
+    assert diagnostic["kept_dim"] < diagnostic["input_dim"]
+    assert set(pruned.data.blocks) < set(theta.data.blocks)
 
 
 def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():

@@ -215,6 +215,16 @@ def _flatten_blocks(data):
     return np.concatenate(pieces), metadata
 
 
+def _block_data_dim(data):
+    return int(
+        sum(
+            int(np.prod(getattr(block, "shape", ()), dtype=np.int64))
+            if getattr(block, "shape", ()) else 1
+            for block in getattr(data, "blocks", {}).values()
+        )
+    )
+
+
 def _unflatten_blocks(vector, metadata):
     blocks = {}
     start = 0
@@ -438,7 +448,7 @@ class _ThetaSpace:
         self.data_template = theta.data
         self.vector, self.metadata = _flatten_blocks(theta.data)
         self.dim = int(self.vector.size)
-        self.dtype = np.dtype(np.result_type(self.vector.dtype, complex))
+        self.dtype = np.dtype(self.vector.dtype)
         self.sectors = tuple(item[0] for item in self.metadata)
         self.block_shapes = tuple(item[1] for item in self.metadata)
 
@@ -460,6 +470,63 @@ class _ThetaSpace:
         blocks = _unflatten_blocks(np.asarray(vector).reshape(-1), self.metadata)
         data = _array_with_blocks_like(self.data_template, blocks)
         return _tensor_with_data(self.theta, data)
+
+
+def _check_same_block_layout(left, right):
+    if tuple(left.inds) != tuple(right.inds):
+        raise ValueError("Tensor index layout changed during block-vector operation.")
+    if tuple(left.data.blocks) != tuple(right.data.blocks):
+        if set(left.data.blocks) != set(right.data.blocks):
+            raise ValueError(
+                "Tensor block sectors changed during block-vector operation."
+            )
+
+
+def _tensor_block_inner(left, right):
+    _check_same_block_layout(left, right)
+    total = 0.0
+    for sector in left.data.blocks:
+        total += np.vdot(
+            _to_numpy(left.data.blocks[sector]),
+            _to_numpy(right.data.blocks[sector]),
+        )
+    return total
+
+
+def _tensor_block_norm(tensor):
+    return float(np.sqrt(max(float(np.real(_tensor_block_inner(tensor, tensor))), 0.0)))
+
+
+def _tensor_block_linear_combination(template, terms):
+    terms = tuple((coeff, tensor) for coeff, tensor in terms)
+    if not terms:
+        blocks = {
+            sector: np.zeros_like(_to_numpy(block))
+            for sector, block in template.data.blocks.items()
+        }
+        return _tensor_with_data(template, _array_with_blocks_like(template.data, blocks))
+
+    for _, tensor in terms:
+        _check_same_block_layout(template, tensor)
+
+    blocks = {}
+    coeff_dtypes = [np.asarray(coeff).dtype for coeff, _ in terms]
+    for sector, block in template.data.blocks.items():
+        arrays = [_to_numpy(tensor.data.blocks[sector]) for _, tensor in terms]
+        dtype = np.result_type(
+            _to_numpy(block).dtype,
+            *coeff_dtypes,
+            *(arr.dtype for arr in arrays),
+        )
+        out = np.zeros(getattr(block, "shape", ()), dtype=dtype)
+        for (coeff, _), arr in zip(terms, arrays):
+            out = out + coeff * arr
+        blocks[sector] = out
+    return _tensor_with_data(template, _array_with_blocks_like(template.data, blocks))
+
+
+def _tensor_block_scale(tensor, coeff):
+    return _tensor_block_linear_combination(tensor, ((coeff, tensor),))
 
 
 def _add_elapsed(timings, key, start):
@@ -876,8 +943,11 @@ class SymDMRG2:
         the block-native path matrix-free unless a caller explicitly opts into
         dense local solves.
     local_eig_tol, local_eig_ncv, local_eig_maxiter, local_eig_backend
-        Krylov/Lanczos eigensolver options passed to quimb's eigensolver
-        wrapper for matrix-free local solves.
+        Krylov/Lanczos eigensolver options. By default, Symmray local solves
+        keep the Lanczos basis as block tensors and use dense NumPy only for
+        scalar Rayleigh-Ritz projections. Set ``local_eig_backend`` to an
+        explicit quimb/scipy backend to use the older flat LinearOperator
+        adapter.
     norm_check_tol
         Tolerance for checking that the canonical-center effective norm acts
         like identity before using an H-only dense or Lanczos solve. In the
@@ -1154,6 +1224,7 @@ class SymDMRG2:
         self._projected_problem_cache = None
         self._last_matvec_projected_problem = None
         self._last_matvec_cache_hit = None
+        self._last_lanczos_info = None
         self._force_norm_check_after_skipped_canonize = False
         self._force_norm_check_reason = None
         self.projected_problem_cache_hits = 0
@@ -1167,6 +1238,7 @@ class SymDMRG2:
         self.mixer_diagnostics = []
         self.sector_enrichment_diagnostics = []
         self.variational_sector_diagnostics = []
+        self.variational_pruning_diagnostics = []
         self.profile_diagnostics = []
         self._current_sweep_direction = None
         self._last_local_input_theta = None
@@ -1283,6 +1355,13 @@ class SymDMRG2:
         if not self.variational_sector_diagnostics:
             return None
         return self.variational_sector_diagnostics[-1]
+
+    @property
+    def last_variational_pruning_diagnostic(self):
+        """Most recent projected-support pruning diagnostic, if any."""
+        if not self.variational_pruning_diagnostics:
+            return None
+        return self.variational_pruning_diagnostics[-1]
 
     @property
     def last_profile_diagnostic(self):
@@ -1668,6 +1747,13 @@ class SymDMRG2:
             if blocks:
                 return np.dtype(_to_numpy(next(iter(blocks.values()))).dtype)
         return np.dtype("complex128")
+
+    def _mpo_block_dtype(self):
+        for tensor in self.mpo:
+            blocks = getattr(tensor.data, "blocks", None)
+            if blocks:
+                return np.dtype(_to_numpy(next(iter(blocks.values()))).dtype)
+        return self._state_block_dtype()
 
     def _state_phys_sectors(self):
         phys_index = self._index_for_tensor_ind(self._state[0], self._site_ind(0))
@@ -2797,6 +2883,107 @@ class SymDMRG2:
         return _tensor_with_data(theta, new_data)
 
     @staticmethod
+    def _block_norm(block):
+        return float(np.linalg.norm(_to_numpy(block).reshape(-1)))
+
+    def _projected_support_probe_theta(self, theta, site):
+        rng = np.random.default_rng(
+            104729 * (len(self.energies) + 1) + 7919 * (int(site) + 1)
+        )
+        blocks = {}
+        for sector, block in theta.data.blocks.items():
+            dense = _to_numpy(block)
+            values = rng.standard_normal(dense.shape)
+            if np.issubdtype(dense.dtype, np.complexfloating):
+                values = values + 1.0j * rng.standard_normal(dense.shape)
+            blocks[sector] = np.asarray(values, dtype=dense.dtype)
+        return _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
+
+    def _prune_theta_to_projected_support(self, site, theta):
+        if self._resolved_matvec_backend() != "symmray":
+            return theta, None
+        if not getattr(theta.data, "blocks", None):
+            return theta, None
+
+        profile_start = self._profile_start()
+        probe = self._projected_support_probe_theta(theta, site)
+        projected = self.two_site_matvec_symmray(site, probe)
+        output_norms = {
+            sector: self._block_norm(block)
+            for sector, block in projected.data.blocks.items()
+        }
+        scale = max(output_norms.values(), default=0.0)
+        threshold = max(scale, 1.0) * 1e-13
+        live_sectors = {
+            sector for sector, norm in output_norms.items()
+            if norm > threshold
+        }
+        nonzero_input_sectors = {
+            sector for sector, block in theta.data.blocks.items()
+            if self._block_norm(block) > 0.0
+        }
+        kept_sectors = live_sectors | nonzero_input_sectors
+        if not kept_sectors or kept_sectors == set(theta.data.blocks):
+            diagnostic = {
+                "site": int(site),
+                "right_site": int(site + 1),
+                "input_blocks": len(theta.data.blocks),
+                "kept_blocks": len(theta.data.blocks),
+                "removed_blocks": 0,
+                "input_dim": self._theta_dim(theta),
+                "kept_dim": self._theta_dim(theta),
+                "live_blocks": len(live_sectors),
+                "nonzero_input_blocks": len(nonzero_input_sectors),
+                "threshold": float(threshold),
+            }
+            self._record_profile_elapsed(
+                "variational_sector_prune",
+                profile_start,
+                site=int(site),
+                right_site=int(site + 1),
+                input_blocks=diagnostic["input_blocks"],
+                kept_blocks=diagnostic["kept_blocks"],
+                removed_blocks=0,
+                input_dim=diagnostic["input_dim"],
+                kept_dim=diagnostic["kept_dim"],
+            )
+            return theta, diagnostic
+
+        blocks = {
+            sector: block
+            for sector, block in theta.data.blocks.items()
+            if sector in kept_sectors
+        }
+        pruned = _tensor_with_data(
+            theta,
+            _array_with_blocks_like(theta.data, blocks),
+        )
+        diagnostic = {
+            "site": int(site),
+            "right_site": int(site + 1),
+            "input_blocks": len(theta.data.blocks),
+            "kept_blocks": len(blocks),
+            "removed_blocks": len(theta.data.blocks) - len(blocks),
+            "input_dim": self._theta_dim(theta),
+            "kept_dim": self._theta_dim(pruned),
+            "live_blocks": len(live_sectors),
+            "nonzero_input_blocks": len(nonzero_input_sectors),
+            "threshold": float(threshold),
+        }
+        self._record_profile_elapsed(
+            "variational_sector_prune",
+            profile_start,
+            site=int(site),
+            right_site=int(site + 1),
+            input_blocks=diagnostic["input_blocks"],
+            kept_blocks=diagnostic["kept_blocks"],
+            removed_blocks=diagnostic["removed_blocks"],
+            input_dim=diagnostic["input_dim"],
+            kept_dim=diagnostic["kept_dim"],
+        )
+        return pruned, diagnostic
+
+    @staticmethod
     def _trace_block_tensor_axes(tensor, axis_a, axis_b):
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
@@ -3217,6 +3404,10 @@ class SymDMRG2:
         theta = self.two_site_theta(site) if theta is None else theta
         return _ThetaSpace(theta)
 
+    @staticmethod
+    def _theta_dim(theta):
+        return _block_data_dim(theta.data)
+
     def two_site_effective_hamiltonian(self, site, theta=None):
         """Return ``H_eff`` as a matrix-free operator in theta block space."""
         space = self.two_site_theta_space(site, theta)
@@ -3285,7 +3476,10 @@ class SymDMRG2:
     def _dense_operator_matrix(self, site, theta, metadata, matvec):
         vector, _ = _flatten_blocks(theta.data)
         dim = vector.size
-        matrix = np.empty((dim, dim), dtype=np.result_type(vector.dtype, complex))
+        matrix = np.empty(
+            (dim, dim),
+            dtype=np.result_type(vector.dtype, self._mpo_block_dtype()),
+        )
         for col in range(dim):
             basis = np.zeros(dim, dtype=matrix.dtype)
             basis[col] = 1.0
@@ -3322,8 +3516,8 @@ class SymDMRG2:
         theta_opt = _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
         return energy, theta_opt
 
-    def lanczos_local_eigensolve(self, site, *, theta=None):
-        """Solve the local theta problem with quimb's matrix-free eigensolver."""
+    def _linear_operator_lanczos_local_eigensolve(self, site, *, theta=None):
+        """Solve the local theta problem through a flat LinearOperator adapter."""
         from quimb.linalg.base_linalg import eigh  # pylint: disable=import-outside-toplevel
 
         theta = self.two_site_variational_theta(site) if theta is None else theta
@@ -3355,6 +3549,104 @@ class SymDMRG2:
         vector = evecs[:, 0] if evecs.ndim == 2 else evecs.reshape(-1)
         theta_opt = space.unflatten(vector)
         return float(evals[0].real), theta_opt
+
+    @staticmethod
+    def _native_lanczos_pick(which):
+        key = str(which).upper()
+        return -1 if key.startswith("L") else 0
+
+    def _native_block_lanczos_local_eigensolve(self, site, *, theta=None):
+        """Solve the local theta problem with a Symmray-tensor Krylov basis."""
+        theta = self.two_site_variational_theta(site) if theta is None else theta
+        dim = self._theta_dim(theta)
+        if dim == 0:
+            raise ValueError("The two-site theta tensor has no active blocks.")
+        if dim <= 2:
+            return self.dense_local_eigensolve(site, theta=theta)
+
+        norm = _tensor_block_norm(theta)
+        if norm <= 0.0:
+            raise ValueError("The two-site theta tensor has zero norm.")
+
+        max_steps = dim if self.local_eig_maxiter is None else int(self.local_eig_maxiter)
+        max_steps = min(max(1, max_steps), dim)
+        tol = max(float(self.local_eig_tol), np.finfo(float).eps)
+        pick = self._native_lanczos_pick(self.which)
+
+        basis = []
+        alphas = []
+        betas = []
+        q_prev = None
+        beta_prev = 0.0
+        q = _tensor_block_scale(theta, 1.0 / norm)
+        best = None
+
+        for step in range(max_steps):
+            basis.append(q)
+            z = self.two_site_matvec(site, q)
+            alpha = _tensor_block_inner(q, z)
+            terms = [(1.0, z), (-alpha, q)]
+            if q_prev is not None:
+                terms.append((-beta_prev, q_prev))
+            z = _tensor_block_linear_combination(theta, terms)
+
+            # Full reorthogonalization keeps the small projected problem stable
+            # while retaining the Krylov basis as block tensors.
+            for basis_tensor in basis:
+                overlap = _tensor_block_inner(basis_tensor, z)
+                if abs(overlap) > 1e-13:
+                    z = _tensor_block_linear_combination(
+                        theta,
+                        ((1.0, z), (-overlap, basis_tensor)),
+                    )
+
+            beta = _tensor_block_norm(z)
+            alphas.append(float(np.real(alpha)))
+            tri = np.diag(np.asarray(alphas, dtype=float))
+            if len(alphas) > 1:
+                offdiag = np.asarray(betas, dtype=float)
+                tri = tri + np.diag(offdiag, 1) + np.diag(offdiag, -1)
+            evals, evecs = np.linalg.eigh(tri)
+            coeffs = evecs[:, pick]
+            residual_estimate = float(beta * abs(coeffs[-1]))
+            best = {
+                "energy": float(evals[pick]),
+                "coeffs": coeffs.copy(),
+                "residual_estimate": residual_estimate,
+                "num_steps": int(len(alphas)),
+                "converged": bool(residual_estimate <= tol or beta <= 1e-14),
+                "max_steps": int(max_steps),
+                "backend": "native_block",
+            }
+            if best["converged"]:
+                break
+
+            betas.append(beta)
+            q_prev = q
+            beta_prev = beta
+            q = _tensor_block_scale(z, 1.0 / beta)
+
+        coeffs = best["coeffs"]
+        theta_opt = _tensor_block_linear_combination(
+            theta,
+            tuple((coeff, tensor) for coeff, tensor in zip(coeffs, basis)),
+        )
+        opt_norm = _tensor_block_norm(theta_opt)
+        if opt_norm > 0.0:
+            theta_opt = _tensor_block_scale(theta_opt, 1.0 / opt_norm)
+        self._last_lanczos_info = {
+            key: value
+            for key, value in best.items()
+            if key not in {"coeffs", "energy"}
+        }
+        return float(best["energy"]), theta_opt
+
+    def lanczos_local_eigensolve(self, site, *, theta=None):
+        """Solve the local theta problem with a matrix-free eigensolver."""
+        if self.local_eig_backend in (None, "native", "native_block"):
+            return self._native_block_lanczos_local_eigensolve(site, theta=theta)
+        self._last_lanczos_info = {"backend": str(self.local_eig_backend)}
+        return self._linear_operator_lanczos_local_eigensolve(site, theta=theta)
 
     def _should_run_norm_check(self, site):
         mode = self.norm_check
@@ -3599,33 +3891,41 @@ class SymDMRG2:
         energy,
         norm_error=None,
         residual_diagnostic=None,
+        solver_info=None,
     ):
         residual_diagnostic = residual_diagnostic or {}
-        self.local_solve_diagnostics.append(
-            {
-                "site": int(site),
-                "right_site": int(site + 1),
-                "direction": self._current_sweep_direction,
-                "solver": solver,
-                "requested_solver": requested_solver,
-                "theta_dim": int(dim),
-                "energy": float(energy),
-                "norm_error": None if norm_error is None else float(norm_error),
-                "residual_norm": residual_diagnostic.get("residual_norm"),
-                "residual_check_skipped": residual_diagnostic.get("skipped"),
-                "residual_check_passed": residual_diagnostic.get("passed"),
-                "matvec_backend": self._resolved_matvec_backend(),
-            }
-        )
+        diagnostic = {
+            "site": int(site),
+            "right_site": int(site + 1),
+            "direction": self._current_sweep_direction,
+            "solver": solver,
+            "requested_solver": requested_solver,
+            "theta_dim": int(dim),
+            "energy": float(energy),
+            "norm_error": None if norm_error is None else float(norm_error),
+            "residual_norm": residual_diagnostic.get("residual_norm"),
+            "residual_check_skipped": residual_diagnostic.get("skipped"),
+            "residual_check_passed": residual_diagnostic.get("passed"),
+            "matvec_backend": self._resolved_matvec_backend(),
+        }
+        if solver_info:
+            diagnostic.update(solver_info)
+        self.local_solve_diagnostics.append(diagnostic)
 
     def local_eigensolve(self, site):
         """Solve one two-site local problem using the configured Symmray path."""
         profile_start = self._profile_start()
         theta_current = self.two_site_theta(site)
         theta = self.two_site_variational_theta(site, theta_current)
+        theta, pruning_diagnostic = self._prune_theta_to_projected_support(
+            site,
+            theta,
+        )
+        if pruning_diagnostic is not None:
+            self.variational_pruning_diagnostics.append(pruning_diagnostic)
         self._last_local_input_theta = theta.copy()
-        space = self.two_site_theta_space(site, theta)
-        dim = space.dim
+        space = None
+        dim = self._theta_dim(theta)
         if dim == 0:
             raise ValueError("The two-site theta tensor has no active blocks.")
 
@@ -3635,6 +3935,7 @@ class SymDMRG2:
             solver = "dense" if dim <= self.dense_threshold else "lanczos"
 
         if solver == "generalized_dense":
+            space = self.two_site_theta_space(site, theta)
             solver_start = self._profile_start()
             energy, theta_opt = self.dense_generalized_local_eigensolve(
                 site,
@@ -3665,6 +3966,7 @@ class SymDMRG2:
                 dim=dim,
                 energy=energy,
                 residual_diagnostic=residual_diagnostic,
+                solver_info={"local_eig_backend": "generalized_dense"},
             )
             self._record_profile_elapsed(
                 "local_solve",
@@ -3692,12 +3994,15 @@ class SymDMRG2:
             self._record_skipped_norm_identity(site, dim=dim)
 
         solver_start = self._profile_start()
+        self._last_lanczos_info = None
         if solver == "dense":
             energy, theta_opt = self.dense_local_eigensolve(site, theta=theta)
             solver_used = "dense"
+            solver_info = {"local_eig_backend": "dense"}
         elif solver == "lanczos":
             energy, theta_opt = self.lanczos_local_eigensolve(site, theta=theta)
             solver_used = "dense" if dim <= 2 else "lanczos"
+            solver_info = self._last_lanczos_info
         else:
             raise ValueError(f"Unknown local solver mode {solver!r}.")
         self._record_profile_elapsed(
@@ -3708,6 +4013,7 @@ class SymDMRG2:
             solver=solver_used,
             theta_dim=int(dim),
             energy=float(energy),
+            **(solver_info or {}),
         )
         residual_diagnostic = self._check_local_residual(
             site,
@@ -3726,6 +4032,7 @@ class SymDMRG2:
             energy=energy,
             norm_error=norm_error,
             residual_diagnostic=residual_diagnostic,
+            solver_info=solver_info,
         )
         self._record_profile_elapsed(
             "local_solve",
@@ -4375,6 +4682,8 @@ class SymDMRG2:
             "last_sector_enrichment_diagnostic": self.last_sector_enrichment_diagnostic,
             "num_variational_sector_diagnostics": len(self.variational_sector_diagnostics),
             "last_variational_sector_diagnostic": self.last_variational_sector_diagnostic,
+            "num_variational_pruning_diagnostics": len(self.variational_pruning_diagnostics),
+            "last_variational_pruning_diagnostic": self.last_variational_pruning_diagnostic,
             "num_profile_diagnostics": len(self.profile_diagnostics),
             "last_profile_diagnostic": self.last_profile_diagnostic,
             "profile_summary": self.profile_summary(),

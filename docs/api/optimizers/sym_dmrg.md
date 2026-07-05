@@ -46,6 +46,13 @@ left/right environment projectors. The cached projected problem also
 precomputes the static block-contraction routing used by repeated Lanczos
 matvecs. `profile_summary()` reports projected problem cache hits and misses
 so scale runs can confirm the hot matvec path is reusing this setup work.
+Default Symmray Lanczos solves keep Krylov vectors as block tensors and use
+dense NumPy only for block dot products and the small Rayleigh-Ritz projected
+matrix, avoiding a flat-vector Symmray-to-NumPy-to-Symmray round trip for every
+`H_eff` application. Real block data remains real unless the state or MPO data
+is complex. Before each local solve, SymDMRG2 also probes the projected
+block-native `H_eff` support and drops widened zero blocks that are neither
+structurally live nor already populated by the current MPS.
 Symmray sweeps
 canonicalize the MPS center before using H-only dense/Lanczos solves; a
 non-identity effective norm is treated as a canonicalization/alignment error
