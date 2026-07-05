@@ -230,6 +230,9 @@ def test_symdmrg2_solves_longer_chain_with_effective_norm():
     left, right = opt.build_environments()
     assert len(left) == len(right) == 4
     assert opt.environment_energy() == pytest.approx(complex(ref_energy))
+    bleft, bright = opt.build_block_environments()
+    assert len(bleft) == len(bright) == 4
+    assert opt.block_environment_energy() == pytest.approx(complex(ref_energy))
     nleft, nright = opt.build_norm_environments()
     assert len(nleft) == len(nright) == 4
     assert opt.norm_environment_value() == pytest.approx(opt._current_norm())
@@ -295,6 +298,34 @@ def test_symdmrg2_directional_environment_builds_only_static_side(monkeypatch):
     assert all(env is not None for env in opt.left_envs)
     assert all(env is None for env in opt.right_envs[:-1])
     assert opt.right_envs[-1] is not None
+
+
+def test_symdmrg2_block_sweep_skips_dense_h_environment_updates(monkeypatch):
+    """Block projected matvec sweeps should not build dense H environments."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        compute_initial_energy=False,
+    )
+
+    def fail_dense_h_env(*_args, **_kwargs):
+        raise AssertionError("dense Hamiltonian environments should not be used")
+
+    monkeypatch.setattr(opt, "build_sweep_environments", fail_dense_h_env)
+    monkeypatch.setattr(opt, "update_left_environment", fail_dense_h_env)
+    monkeypatch.setattr(opt, "update_right_environment", fail_dense_h_env)
+
+    energy = opt.sweep("R", max_bond=4, cutoff=1e-10)
+
+    assert opt.left_envs is None
+    assert opt.right_envs is None
+    assert energy == pytest.approx(opt.block_environment_energy().real)
+    assert opt.environment_energy() == pytest.approx(complex(energy))
 
 
 def test_symdmrg2_accepts_quimb_style_solve_controls():
@@ -376,7 +407,6 @@ def test_symdmrg2_profile_records_phase_timings():
     summary = opt.profile_summary()
 
     assert {
-        "build_dense_environments",
         "build_norm_environments",
         "build_block_environments",
         "local_solve",
@@ -387,6 +417,7 @@ def test_symdmrg2_profile_records_phase_timings():
         "sweep",
         "solve",
     } <= phases
+    assert "build_dense_environments" not in phases
     assert all(event["elapsed"] >= 0.0 for event in opt.profile_diagnostics)
     assert summary["enabled"]
     assert summary["num_events"] == len(opt.profile_diagnostics)
@@ -394,6 +425,29 @@ def test_symdmrg2_profile_records_phase_timings():
     assert summary["phase_counts"]["matvec"] >= 1
     assert opt.summary()["num_profile_diagnostics"] == len(opt.profile_diagnostics)
     assert opt.summary()["last_profile_diagnostic"] == opt.last_profile_diagnostic
+
+
+def test_symdmrg2_dense_reference_profile_keeps_dense_h_environments():
+    """The explicit dense-reference matvec path should still build dense H envs."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        matvec_backend="dense_reference",
+        profile=True,
+        compute_initial_energy=False,
+    )
+    opt.solve(max_sweeps=1)
+    phases = {event["phase"] for event in opt.profile_diagnostics}
+
+    assert "build_dense_environments" in phases
+    assert opt.left_envs is not None
+    assert opt.right_envs is not None
 
 
 def test_symdmrg2_benchmark_harness_returns_json_ready_result():

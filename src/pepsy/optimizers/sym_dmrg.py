@@ -3,16 +3,15 @@
 This module provides the public :class:`SymDMRG2` API that Pepsy will grow into
 for Symmray-backed block-sparse Hamiltonians. Ordinary quimb MPOs are delegated
 directly to :class:`quimb.tensor.DMRG2`; Symmray MPOs use Pepsy's bosonic
-Jordan-Wigner/U1U1 path with dense reference environments, a sector-preserving
-two-site matvec, dense norm environments, and dense or Lanczos local solves in
-the current theta block layout.
+Jordan-Wigner/U1U1 path with block-sparse Hamiltonian environments, a
+sector-preserving two-site matvec, dense norm environments, and dense or
+Lanczos local solves in the current theta block layout.
 """
 
 from __future__ import annotations
 
 import itertools
 from itertools import product
-import string
 import time
 import warnings
 
@@ -541,10 +540,6 @@ def _tensor_ind_size(tensor, ind):
         return 1
 
 
-def _largest_shared_ind(left, shared):
-    return max(shared, key=lambda ind: _tensor_ind_size(left, ind))
-
-
 class _BlockPairContraction:
     """Precomputed index routing for one static-left block contraction."""
 
@@ -556,6 +551,8 @@ class _BlockPairContraction:
         self.shared = tuple(ind for ind in self.left_inds if ind in self.right_inds)
         self.reindex_map = {}
         self.trace_pairs = []
+        self.left_axes = ()
+        self.right_axes = ()
 
         if not self.shared:
             self.left_axis = None
@@ -566,74 +563,19 @@ class _BlockPairContraction:
             self.contract_ind_size = 0
             return
 
-        first = _largest_shared_ind(self.left, self.shared)
-        remaining = tuple(ind for ind in self.shared if ind != first)
-        self.contract_ind_size = _tensor_ind_size(self.left, first)
-        for num, ind in enumerate(remaining):
-            temp_ind = f"{ind}__symdmrg_rhs{num}"
-            self.reindex_map[ind] = temp_ind
-            self.trace_pairs.append((ind, temp_ind))
-
-        right_work_inds = tuple(
-            self.reindex_map.get(ind, ind) for ind in self.right_inds
+        self.contract_ind_size = max(
+            _tensor_ind_size(self.left, ind) for ind in self.shared
         )
-        self.left_axis = self.left_inds.index(first)
-        self.right_axis = right_work_inds.index(first)
+        self.left_axes = tuple(self.left_inds.index(ind) for ind in self.shared)
+        self.right_axes = tuple(self.right_inds.index(ind) for ind in self.shared)
+        self.left_axis = self.left_axes[0]
+        self.right_axis = self.right_axes[0]
         self.contract_output_inds = (
-            tuple(
-                ind for axis, ind in enumerate(self.left_inds)
-                if axis != self.left_axis
-            )
-            + tuple(
-                ind for axis, ind in enumerate(right_work_inds)
-                if axis != self.right_axis
-            )
+            tuple(ind for ind in self.left_inds if ind not in self.shared)
+            + tuple(ind for ind in self.right_inds if ind not in self.shared)
         )
-        self.output_inds = self._output_after_traces(
-            self.contract_output_inds,
-            self.trace_pairs,
-        )
-        self.trace_subscript = self._trace_subscript(
-            self.contract_output_inds,
-            self.trace_pairs,
-        )
-
-    @staticmethod
-    def _output_after_traces(inds, trace_pairs):
-        traced = {ind for pair in trace_pairs for ind in pair}
-        return tuple(ind for ind in inds if ind not in traced)
-
-    @staticmethod
-    def _trace_subscript(inds, trace_pairs):
-        if not trace_pairs:
-            return None
-
-        labels_by_ind = {}
-        symbol_iter = iter(string.ascii_letters)
-        for ind_a, ind_b in trace_pairs:
-            try:
-                label = next(symbol_iter)
-            except StopIteration as exc:  # pragma: no cover - defensive guard
-                raise ValueError("Too many trace pairs for SymDMRG2 contraction.") from exc
-            labels_by_ind[ind_a] = label
-            labels_by_ind[ind_b] = label
-
-        labels = []
-        output_labels = []
-        for ind in inds:
-            if ind in labels_by_ind:
-                labels.append(labels_by_ind[ind])
-                continue
-            try:
-                label = next(symbol_iter)
-            except StopIteration as exc:  # pragma: no cover - defensive guard
-                raise ValueError(
-                    "Too many tensor axes for SymDMRG2 contraction."
-                ) from exc
-            labels.append(label)
-            output_labels.append(label)
-
-        return "".join(labels) + "->" + "".join(output_labels)
+        self.output_inds = self.contract_output_inds
+        self.trace_subscript = None
 
     def apply(self, right, *, timings=None, prefix="contract"):
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
@@ -660,26 +602,17 @@ class _BlockPairContraction:
             return out
 
         step_start = time.perf_counter() if timings is not None else None
-        right_work = right.reindex(self.reindex_map, inplace=False)
-        _add_elapsed(timings, f"{prefix}_reindex_elapsed", step_start)
-        step_start = time.perf_counter() if timings is not None else None
         data = self.left.data.tensordot(
-            right_work.data,
-            axes=((self.left_axis,), (self.right_axis,)),
+            right.data,
+            axes=(self.left_axes, self.right_axes),
             mode="blockwise",
             preserve_array=True,
         )
         _add_elapsed(timings, f"{prefix}_tensordot_elapsed", step_start)
-        inds = self.contract_output_inds
-        if self.trace_subscript is not None:
-            step_start = time.perf_counter() if timings is not None else None
-            data = data.einsum(self.trace_subscript, preserve_array=True)
-            inds = self.output_inds
-            _add_elapsed(timings, f"{prefix}_trace_elapsed", step_start)
         step_start = time.perf_counter() if timings is not None else None
         out = qtn.Tensor(
             data=data,
-            inds=inds,
+            inds=self.output_inds,
             tags=self.left.tags | right.tags,
         )
         _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
@@ -2811,9 +2744,49 @@ class SymDMRG2:
         norm = (self._state.H & self._state).contract(all, optimize="auto-hq")
         return complex(norm)
 
+    def _full_block_environment_tensor(self):
+        if self.left_block_envs is not None:
+            tensor = self.left_block_envs[self._state.L]
+            if tensor is not None:
+                return tensor
+        if self.right_block_envs is not None:
+            tensor = self.right_block_envs[0]
+            if tensor is not None:
+                return tensor
+        return None
+
+    def block_environment_energy(self, *, normalized=True):
+        """Return the energy from the current full block Hamiltonian environment."""
+        if self.backend != "symmray":
+            raise ValueError("block_environment_energy is only used by backend='symmray'.")
+        tensor = self._full_block_environment_tensor()
+        if tensor is None:
+            self.build_block_environments()
+            tensor = self._full_block_environment_tensor()
+        value_array = np.asarray(_dense_data(tensor.data))
+        if value_array.size != 1:
+            raise ValueError("Full block Hamiltonian environment is not scalar.")
+        value = complex(value_array.reshape(()))
+        if normalized:
+            value /= self.norm_environment_value()
+        return value
+
     def environment_energy(self, *, normalized=True):
         """Return the energy from the current full left/right environments."""
+        if (
+            self.backend == "symmray"
+            and (self.left_envs is None or self.right_envs is None)
+            and self._full_block_environment_tensor() is not None
+        ):
+            return self.block_environment_energy(normalized=normalized)
         if self.left_envs is None or self.right_envs is None:
+            self.build_environments()
+        if self.left_envs[self._state.L] is None:
+            if (
+                self.backend == "symmray"
+                and self._full_block_environment_tensor() is not None
+            ):
+                return self.block_environment_energy(normalized=normalized)
             self.build_environments()
         value = complex(np.asarray(self.left_envs[self._state.L]))
         if normalized:
@@ -2983,89 +2956,23 @@ class SymDMRG2:
         )
         return pruned, diagnostic
 
-    @staticmethod
-    def _trace_block_tensor_axes(tensor, axis_a, axis_b):
-        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
-
-        labels = []
-        symbol_iter = iter(string.ascii_letters)
-        trace_label = next(symbol_iter)
-        for axis in range(len(tensor.inds)):
-            if axis == axis_a or axis == axis_b:
-                labels.append(trace_label)
-            else:
-                try:
-                    labels.append(next(symbol_iter))
-                except StopIteration as exc:  # pragma: no cover - defensive guard
-                    raise ValueError("Too many tensor axes for SymDMRG2 trace helper.") from exc
-        output_labels = [
-            label for axis, label in enumerate(labels) if axis not in (axis_a, axis_b)
-        ]
-        data = tensor.data.einsum(
-            "".join(labels) + "->" + "".join(output_labels),
-            preserve_array=True,
-        )
-        inds = list(tensor.inds)
-        for axis in sorted((axis_a, axis_b), reverse=True):
-            inds.pop(axis)
-        return qtn.Tensor(data=data, inds=tuple(inds), tags=tensor.tags)
-
-    def _trace_block_tensor_inds(self, tensor, ind_a, ind_b):
-        if ind_a == ind_b:
-            axes = [axis for axis, ind in enumerate(tensor.inds) if ind == ind_a]
-            if len(axes) < 2:
-                raise ValueError(f"Tensor does not contain two copies of index {ind_a!r}.")
-            axis_a, axis_b = axes[:2]
-        else:
-            axis_a = tensor.inds.index(ind_a)
-            axis_b = tensor.inds.index(ind_b)
-        return self._trace_block_tensor_axes(tensor, axis_a, axis_b)
-
     def _contract_block_pair(self, left, right):
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
         shared = tuple(ind for ind in left.inds if ind in right.inds)
-        if not shared:
-            data = left.data.tensordot(
-                right.data,
-                axes=((), ()),
-                mode="blockwise",
-                preserve_array=True,
-            )
-            return qtn.Tensor(
-                data=data,
-                inds=tuple(left.inds) + tuple(right.inds),
-                tags=left.tags | right.tags,
-            )
-
-        first = _largest_shared_ind(left, shared)
-        remaining = tuple(ind for ind in shared if ind != first)
-        right_work = right
-        trace_pairs = []
-        for num, ind in enumerate(remaining):
-            temp_ind = f"{ind}__symdmrg_rhs{num}"
-            right_work = right_work.reindex({ind: temp_ind}, inplace=False)
-            trace_pairs.append((ind, temp_ind))
-
-        left_axis = left.inds.index(first)
-        right_axis = right_work.inds.index(first)
+        left_axes = tuple(left.inds.index(ind) for ind in shared)
+        right_axes = tuple(right.inds.index(ind) for ind in shared)
         data = left.data.tensordot(
-            right_work.data,
-            axes=((left_axis,), (right_axis,)),
+            right.data,
+            axes=(left_axes, right_axes),
             mode="blockwise",
             preserve_array=True,
         )
         inds = (
-            tuple(ind for axis, ind in enumerate(left.inds) if axis != left_axis)
-            + tuple(
-                ind for axis, ind in enumerate(right_work.inds)
-                if axis != right_axis
-            )
+            tuple(ind for ind in left.inds if ind not in shared)
+            + tuple(ind for ind in right.inds if ind not in shared)
         )
-        out = qtn.Tensor(data=data, inds=inds, tags=left.tags | right.tags)
-        for ind, temp_ind in trace_pairs:
-            out = self._trace_block_tensor_inds(out, ind, temp_ind)
-        return out
+        return qtn.Tensor(data=data, inds=inds, tags=left.tags | right.tags)
 
     def _block_env_for_left_cut(self, site):
         if site == 0:
@@ -4233,14 +4140,19 @@ class SymDMRG2:
         sweep_profile_start = self._profile_start()
         self._force_norm_check_after_skipped_canonize = False
         self._force_norm_check_reason = None
+        use_block_h_envs = self._resolved_matvec_backend() == "symmray"
         if canonize:
             canonized = self._canonize_for_sweep(direction)
             if not canonized:
                 self._force_norm_check_after_skipped_canonize = True
                 self._force_norm_check_reason = f"{direction}_canonize_unavailable"
-        self.build_sweep_environments(direction)
+        if use_block_h_envs:
+            self.left_envs = None
+            self.right_envs = None
+        else:
+            self.build_sweep_environments(direction)
         self.build_sweep_norm_environments(direction)
-        if self._resolved_matvec_backend() == "symmray":
+        if use_block_h_envs:
             self.build_sweep_block_environments(direction)
 
         last_energy = None
@@ -4268,9 +4180,10 @@ class SymDMRG2:
                 )
                 if direction == "right":
                     env_update_start = self._profile_start()
-                    self.update_left_environment(site)
+                    if not use_block_h_envs:
+                        self.update_left_environment(site)
                     self.update_left_norm_environment(site)
-                    if self.left_block_envs is not None:
+                    if use_block_h_envs:
                         self.update_left_block_environment(site)
                     self._record_profile_elapsed(
                         "environment_update",
@@ -4281,9 +4194,10 @@ class SymDMRG2:
                     )
                 else:
                     env_update_start = self._profile_start()
-                    self.update_right_environment(site + 1)
+                    if not use_block_h_envs:
+                        self.update_right_environment(site + 1)
                     self.update_right_norm_environment(site + 1)
-                    if self.right_block_envs is not None:
+                    if use_block_h_envs:
                         self.update_right_block_environment(site + 1)
                     self._record_profile_elapsed(
                         "environment_update",
@@ -4299,13 +4213,20 @@ class SymDMRG2:
             self._force_norm_check_after_skipped_canonize = False
             self._force_norm_check_reason = None
         finish_start = self._profile_start()
-        self._finish_sweep_direction_environments(direction)
+        self._finish_sweep_direction_environments(
+            direction,
+            update_dense=not use_block_h_envs,
+            update_block=use_block_h_envs,
+        )
         self._record_profile_elapsed(
             "finish_sweep_environments",
             finish_start,
             direction=direction,
         )
-        energy = self.environment_energy(normalized=True).real
+        if use_block_h_envs:
+            energy = self.block_environment_energy(normalized=True).real
+        else:
+            energy = self.environment_energy(normalized=True).real
         self.local_energies.append(tuple(local_ens))
         self.total_energies.append(tuple(local_ens[:-1] + [energy]))
         self._record_profile_elapsed(
@@ -4319,21 +4240,31 @@ class SymDMRG2:
         )
         return energy
 
-    def _finish_sweep_direction_environments(self, direction):
+    def _finish_sweep_direction_environments(
+        self,
+        direction,
+        *,
+        update_dense=True,
+        update_block=True,
+    ):
         if direction == "right":
-            self.update_left_environment(self._state.L - 1)
+            if update_dense:
+                self.update_left_environment(self._state.L - 1)
             self.update_left_norm_environment(self._state.L - 1)
-            self.right_envs[0] = self.left_envs[self._state.L]
+            if update_dense:
+                self.right_envs[0] = self.left_envs[self._state.L]
             self.right_norm_envs[0] = self.left_norm_envs[self._state.L]
-            if self.left_block_envs is not None:
+            if update_block and self.left_block_envs is not None:
                 self.update_left_block_environment(self._state.L - 1)
                 self.right_block_envs[0] = self.left_block_envs[self._state.L]
         elif direction == "left":
-            self.update_right_environment(0)
+            if update_dense:
+                self.update_right_environment(0)
             self.update_right_norm_environment(0)
-            self.left_envs[self._state.L] = self.right_envs[0]
+            if update_dense:
+                self.left_envs[self._state.L] = self.right_envs[0]
             self.left_norm_envs[self._state.L] = self.right_norm_envs[0]
-            if self.right_block_envs is not None:
+            if update_block and self.right_block_envs is not None:
                 self.update_right_block_environment(0)
                 self.left_block_envs[self._state.L] = self.right_block_envs[0]
         else:  # pragma: no cover - private consistency check
