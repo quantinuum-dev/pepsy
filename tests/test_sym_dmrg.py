@@ -1108,6 +1108,53 @@ def test_symdmrg2_rejects_fermionic_state_with_fermionic_symmray_mpo(monkeypatch
         )
 
 
+def test_symdmrg2_bosonized_state_rejects_fermionic_local_term_energy():
+    """Term dictionaries should not silently measure a bosonic JW DMRG state."""
+    pytest.importorskip("symmray")
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)]),
+        seed=11,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1)],
+        t=1.0,
+        U=8.0,
+        mu=0.2,
+    )
+    mpo = ham.to_mpo(L=2, compress=False)
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        compute_initial_energy=False,
+    )
+
+    with pytest.raises(ValueError, match="bosonic/Jordan-Wigner MPO"):
+        pepsy.MpsEnergyOptimizer(
+            opt.state,
+            ham.terms,
+            energy_per_site=False,
+            real=False,
+        ).energy()
+
+    mpo_energy = pepsy.MpsEnergyOptimizer(
+        opt.state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert complex(mpo_energy) == pytest.approx(opt.environment_energy())
+
+
 def test_symdmrg2_lanczos_matches_dense_after_canonicalization():
     """Canonical-center Lanczos should reproduce the dense local reference."""
     pytest.importorskip("symmray")

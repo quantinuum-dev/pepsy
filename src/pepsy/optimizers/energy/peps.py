@@ -981,6 +981,49 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         }
 
     @classmethod
+    def _iter_tn_data(cls, state):
+        tensor_map = getattr(state, "tensor_map", None)
+        if tensor_map:
+            tensors = tensor_map.values()
+        else:
+            try:
+                tensors = iter(state)
+            except TypeError:
+                return
+        for tensor in tensors:
+            yield getattr(tensor, "data", None)
+
+    @classmethod
+    def _state_uses_bosonic_symmray(cls, state):
+        found_symmray = False
+        for data in cls._iter_tn_data(state):
+            if not cls._is_symmray_array(data):
+                continue
+            found_symmray = True
+            if cls._is_fermionic_array(data):
+                return False
+        return found_symmray
+
+    @classmethod
+    def _terms_use_fermionic_symmray(cls, terms):
+        return any(
+            cls._is_symmray_array(term) and cls._is_fermionic_array(term)
+            for term in dict(terms).values()
+        )
+
+    @classmethod
+    def _check_local_terms_state_compatible(cls, state, terms):
+        if (
+            cls._terms_use_fermionic_symmray(terms)
+            and cls._state_uses_bosonic_symmray(state)
+        ):
+            raise ValueError(
+                "Fermionic Symmray local-term dictionaries cannot be evaluated "
+                "on a bosonic/Jordan-Wigner MPS state. Use the corresponding "
+                "bosonic/Jordan-Wigner MPO for energy measurements."
+            )
+
+    @classmethod
     def _mpo_expectation(
         cls,
         state,
@@ -1037,6 +1080,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                 value = cls._maybe_real(value)
             return value
 
+        cls._check_local_terms_state_compatible(state, terms)
         terms = cls._terms_for_state_backend(terms, state)
         if contraction_opt is None:
             contraction_opt = build_optimizer(progbar=False)
