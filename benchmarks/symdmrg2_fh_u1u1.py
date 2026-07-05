@@ -115,6 +115,7 @@ def run_benchmark(
     sector_enrichment_bond_dim=None,
     sector_noise=0.0,
     matvec_backend="auto",
+    matvec_layout="unfused",
     norm_check="strict",
     norm_check_interval=1,
     residual_check="sampled",
@@ -155,6 +156,7 @@ def run_benchmark(
         sector_enrichment_bond_dim=sector_enrichment_bond_dim,
         sector_noise=float(sector_noise),
         matvec_backend=matvec_backend,
+        matvec_layout=matvec_layout,
         norm_check=norm_check,
         norm_check_interval=int(norm_check_interval),
         residual_check=residual_check,
@@ -195,6 +197,7 @@ def run_benchmark(
             "local_solver": str(local_solver),
             "dense_threshold": int(dense_threshold),
             "matvec_backend": str(matvec_backend),
+            "matvec_layout": str(matvec_layout),
             "norm_check": str(norm_check),
             "norm_check_interval": int(norm_check_interval),
             "residual_check": str(residual_check),
@@ -256,6 +259,7 @@ def build_arg_parser():
     parser.add_argument("--sector-enrichment-bond-dim", type=int, default=None)
     parser.add_argument("--sector-noise", type=float, default=0.0)
     parser.add_argument("--matvec-backend", default="auto")
+    parser.add_argument("--matvec-layout", default="unfused")
     parser.add_argument("--norm-check", default="strict")
     parser.add_argument("--norm-check-interval", type=int, default=1)
     parser.add_argument("--residual-check", default="sampled")
@@ -292,6 +296,7 @@ def main(argv=None):
         sector_enrichment_bond_dim=args.sector_enrichment_bond_dim,
         sector_noise=args.sector_noise,
         matvec_backend=args.matvec_backend,
+        matvec_layout=args.matvec_layout,
         norm_check=args.norm_check,
         norm_check_interval=args.norm_check_interval,
         residual_check=args.residual_check,

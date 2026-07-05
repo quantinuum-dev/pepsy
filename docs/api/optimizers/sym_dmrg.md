@@ -50,6 +50,16 @@ left/right environment projectors. The cached projected problem also
 precomputes the static block-contraction routing used by repeated Lanczos
 matvecs. `profile_summary()` reports projected problem cache hits and misses
 so scale runs can confirm the hot matvec path is reusing this setup work.
+`matvec_layout="fused"` is available as an opt-in prototype for the
+block-native path. It attempts to fuse multiple shared contraction legs inside
+each cached projected problem, using Symmray's fused-index support when the
+resulting charge maps are compatible. When the fused total-charge index would
+collapse distinct charge-combination slots, the contraction falls back to the
+exact unfused blockwise route and records candidate, attempt, and fallback
+counts in matvec diagnostics; incompatible fused layouts are cached per
+projected problem so repeated Lanczos matvecs do not keep retrying the same
+failed fused contraction. This keeps the switch safe for benchmarking while
+leaving the default `matvec_layout="unfused"` unchanged.
 Default Symmray Lanczos solves keep Krylov vectors as block tensors and use
 dense NumPy only for block dot products and the small Rayleigh-Ritz projected
 matrix, avoiding a flat-vector Symmray-to-NumPy-to-Symmray round trip for every

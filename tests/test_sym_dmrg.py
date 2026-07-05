@@ -552,6 +552,7 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
         residual_check_interval=2,
         matvec_diagnostics="sampled",
         matvec_diagnostics_interval=2,
+        matvec_layout="fused",
         compute_initial_energy=False,
     )
 
@@ -559,6 +560,7 @@ def test_symdmrg2_benchmark_harness_returns_json_ready_result():
     assert mapped["case"]["lattice_shape"] == [2, 2]
     assert mapped["case"]["mapper_mode"] == "snake"
     assert mapped["case"]["mpo_compress"] is True
+    assert mapped["case"]["matvec_layout"] == "fused"
     assert mapped["case"]["num_edges"] == 4
     assert mapped["result"]["num_sweeps"] == 1
     assert mapped["profile"]["enabled"]
@@ -1081,6 +1083,69 @@ def test_symdmrg2_dense_reference_matvec_backend_remains_selectable():
     assert set(via_dispatch.data.blocks) == set(direct.data.blocks)
     for sector in theta.data.blocks:
         assert via_dispatch.data.blocks[sector] == pytest.approx(direct.data.blocks[sector])
+
+
+def test_symdmrg2_fused_matvec_layout_matches_dense_reference():
+    """The opt-in fused layout should preserve the projected H action."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+        seed=41,
+        U=1.25,
+        mu=0.05,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        matvec_backend="symmray",
+        matvec_layout="fused",
+        matvec_diagnostics="strict",
+        compute_initial_energy=False,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_environments()
+    opt.build_block_environments()
+
+    rng = np.random.default_rng(9)
+    saw_fused_candidate = False
+    for site in range(opt.state.L - 1):
+        theta = opt.two_site_theta(site)
+        space = opt.two_site_theta_space(site, theta)
+        trial = space.unflatten(
+            rng.standard_normal(space.dim) + 1.0j * rng.standard_normal(space.dim)
+        )
+
+        dense = opt.two_site_matvec_dense_reference(site, trial)
+        fused = opt.two_site_matvec(site, trial)
+        summary = opt._last_matvec_projected_problem.summary()
+        saw_fused_candidate |= (
+            summary["left_contract_fused_shared_candidate"]
+            or summary["right_contract_fused_shared_candidate"]
+        )
+
+        assert summary["matvec_layout"] == "fused"
+        assert fused.inds == dense.inds == theta.inds
+        assert set(fused.data.blocks) == set(dense.data.blocks) == set(theta.data.blocks)
+        for sector in theta.data.blocks:
+            assert fused.data.blocks[sector] == pytest.approx(dense.data.blocks[sector])
+
+    assert saw_fused_candidate
+    assert opt.summary()["matvec_layout"] == "fused"
+    assert all(
+        diagnostic["matvec_layout"] == "fused"
+        for diagnostic in opt.matvec_diagnostic_records
+    )
+    assert any(
+        diagnostic["left_contract_fused_shared_attempts"]
+        or diagnostic["right_contract_fused_shared_attempts"]
+        for diagnostic in opt.matvec_diagnostic_records
+    )
 
 
 def test_symdmrg2_rejects_fermionic_state_without_bosonic_symmray_mpo(monkeypatch):

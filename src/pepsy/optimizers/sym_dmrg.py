@@ -279,6 +279,30 @@ def _normalize_matvec_backend(matvec_backend):
         ) from exc
 
 
+def _normalize_matvec_layout(matvec_layout):
+    key = str(matvec_layout).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "unfused",
+        "default": "unfused",
+        "native": "unfused",
+        "standard": "unfused",
+        "unfused": "unfused",
+        "plain": "unfused",
+        "fused": "fused",
+        "combine": "fused",
+        "combined": "fused",
+        "pipe": "fused",
+        "piped": "fused",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown matvec_layout {matvec_layout!r}. Expected one of: {allowed}."
+        ) from exc
+
+
 def _normalize_sector_enrichment(sector_enrichment):
     if sector_enrichment is None or sector_enrichment is False:
         return "none"
@@ -594,11 +618,12 @@ def _tensor_ind_size(tensor, ind):
 class _BlockPairContraction:
     """Precomputed index routing for one static-left block contraction."""
 
-    def __init__(self, optimizer, left, right_inds):
+    def __init__(self, optimizer, left, right_inds, *, layout="unfused"):
         self.optimizer = optimizer
         self.left = left
         self.left_inds = tuple(left.inds)
         self.right_inds = tuple(right_inds)
+        self.layout = str(layout)
         self.shared = tuple(ind for ind in self.left_inds if ind in self.right_inds)
         self.reindex_map = {}
         self.trace_pairs = []
@@ -614,6 +639,15 @@ class _BlockPairContraction:
             self.output_inds = self.contract_output_inds
             self.trace_subscript = None
             self.contract_ind_size = 0
+            self.use_fused_shared = False
+            self.fused_shared_ind = None
+            self.left_fused = None
+            self.left_fused_axis = None
+            self.fused_contract_ind_size = None
+            self.fused_shared_compatible = None
+            self.last_used_fused_shared = False
+            self.fused_shared_attempts = 0
+            self.fused_shared_fallbacks = 0
             return
 
         self.contract_ind_size = max(
@@ -635,6 +669,50 @@ class _BlockPairContraction:
         )
         self.output_inds = self.contract_output_inds
         self.trace_subscript = None
+        self.use_fused_shared = self.layout == "fused" and len(self.shared) > 1
+        self.fused_shared_ind = None
+        self.left_fused = None
+        self.left_fused_axis = None
+        self.fused_contract_ind_size = None
+        self.fused_shared_compatible = None
+        self.last_used_fused_shared = False
+        self.fused_shared_attempts = 0
+        self.fused_shared_fallbacks = 0
+        if self.use_fused_shared:
+            self.fused_shared_ind = f"_pepsy_fused_shared_{id(self)}"
+            self.left_fused = self.left.fuse(
+                {self.fused_shared_ind: self.shared},
+            )
+            self.left_fused_axis = self.left_fused.inds.index(self.fused_shared_ind)
+            self.fused_contract_ind_size = _tensor_ind_size(
+                self.left_fused,
+                self.fused_shared_ind,
+            )
+            fused_left_output = tuple(
+                ind for ind in self.left_fused.inds if ind != self.fused_shared_ind
+            )
+            fused_right_output = self._fused_output_inds(self.right_inds)
+            fused_output = fused_left_output + fused_right_output
+            if fused_output != self.contract_output_inds:
+                raise ValueError(
+                    "Fused block contraction would change output index order."
+                )
+
+    def _fused_contract_indices_match(self, right_fused):
+        left_index = self.left_fused.data.indices[self.left_fused_axis]
+        right_axis = right_fused.inds.index(self.fused_shared_ind)
+        right_index = right_fused.data.indices[right_axis]
+        return dict(left_index.chargemap) == dict(right_index.chargemap)
+
+    def _fused_output_inds(self, inds):
+        axes = tuple(inds.index(ind) for ind in self.shared)
+        gax0 = min(axes)
+        fused_inds = (
+            *inds[:gax0],
+            self.fused_shared_ind,
+            *(ind for ind in inds[gax0:] if ind not in self.shared),
+        )
+        return tuple(ind for ind in fused_inds if ind != self.fused_shared_ind)
 
     def structural_output_sectors(self, right_sectors):
         """Return block sectors possible after this contraction, ignoring values."""
@@ -678,6 +756,35 @@ class _BlockPairContraction:
             _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
             return out
 
+        if self.use_fused_shared and self.fused_shared_compatible is not False:
+            step_start = time.perf_counter() if timings is not None else None
+            right_fused = right.fuse({self.fused_shared_ind: self.shared})
+            _add_elapsed(timings, f"{prefix}_fuse_elapsed", step_start)
+            self.fused_shared_attempts += 1
+            if self._fused_contract_indices_match(right_fused):
+                self.fused_shared_compatible = True
+                self.last_used_fused_shared = True
+                right_axis = right_fused.inds.index(self.fused_shared_ind)
+                step_start = time.perf_counter() if timings is not None else None
+                data = self.left_fused.data.tensordot(
+                    right_fused.data,
+                    axes=((self.left_fused_axis,), (right_axis,)),
+                    mode="blockwise",
+                    preserve_array=True,
+                )
+                _add_elapsed(timings, f"{prefix}_tensordot_elapsed", step_start)
+                step_start = time.perf_counter() if timings is not None else None
+                out = qtn.Tensor(
+                    data=data,
+                    inds=self.output_inds,
+                    tags=self.left.tags | right.tags,
+                )
+                _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
+                return out
+            self.fused_shared_compatible = False
+            self.last_used_fused_shared = False
+            self.fused_shared_fallbacks += 1
+
         step_start = time.perf_counter() if timings is not None else None
         data = self.left.data.tensordot(
             right.data,
@@ -702,6 +809,13 @@ class _BlockPairContraction:
             f"{prefix}_reindexed_inds": len(self.reindex_map),
             f"{prefix}_contracted_inds": int(bool(self.shared)),
             f"{prefix}_contracted_ind_size": self.contract_ind_size,
+            f"{prefix}_layout": self.layout,
+            f"{prefix}_fused_shared_candidate": bool(self.use_fused_shared),
+            f"{prefix}_fused_shared_compatible": self.fused_shared_compatible,
+            f"{prefix}_uses_fused_shared": bool(self.last_used_fused_shared),
+            f"{prefix}_fused_shared_attempts": int(self.fused_shared_attempts),
+            f"{prefix}_fused_shared_fallbacks": int(self.fused_shared_fallbacks),
+            f"{prefix}_fused_contract_ind_size": self.fused_contract_ind_size,
         }
 
 
@@ -714,6 +828,7 @@ class _LocalProjectedProblem:
         self.right_site = self.site + 1
         self.inds = tuple(theta.inds)
         self.block_layout = self._block_layout(theta)
+        self.layout = optimizer.matvec_layout
         self.input_map = {ind: optimizer._input_ind(ind) for ind in self.inds}
         self.output_zeros = {
             sector: np.zeros_like(_to_numpy(block))
@@ -752,11 +867,13 @@ class _LocalProjectedProblem:
                 optimizer,
                 self.left_projector,
                 theta_input_inds,
+                layout=self.layout,
             )
             self.right_contraction = _BlockPairContraction(
                 optimizer,
                 self.right_projector,
                 self.left_contraction.output_inds,
+                layout=self.layout,
             )
         else:
             self.contraction_order = "right_first"
@@ -764,11 +881,13 @@ class _LocalProjectedProblem:
                 optimizer,
                 self.right_projector,
                 theta_input_inds,
+                layout=self.layout,
             )
             self.left_contraction = _BlockPairContraction(
                 optimizer,
                 self.left_projector,
                 self.right_contraction.output_inds,
+                layout=self.layout,
             )
         self.summary_data = self._make_summary()
 
@@ -887,6 +1006,7 @@ class _LocalProjectedProblem:
             "theta_num_blocks": len(self.block_layout),
             "matvec_num_contractions": 2,
             "matvec_contraction_order": self.contraction_order,
+            "matvec_layout": self.layout,
         }
         summary.update(self._tensor_block_stats(self.left_projector, "left_projector"))
         summary.update(self._tensor_block_stats(self.right_projector, "right_projector"))
@@ -899,7 +1019,7 @@ class _LocalProjectedProblem:
         return summary
 
     def summary(self):
-        return dict(self.summary_data)
+        return self._make_summary()
 
 
 class _SymmrayEffectiveHamiltonian(LinearOperator):
@@ -1015,6 +1135,12 @@ class SymDMRG2:
         ``"auto"`` uses the block-native Symmray contraction, while
         ``"dense_reference"`` keeps the older NumPy dense-aligned contraction
         as an explicit fallback and validator.
+    matvec_layout
+        Block-native Symmray contraction layout. ``"unfused"`` keeps the
+        historical per-leg contraction. ``"fused"`` combines multiple shared
+        contraction legs into one Symmray fused leg inside each cached local
+        projected problem, following the same broad idea as TenPy's combined
+        effective-Hamiltonian legs. This is opt-in while benchmarked.
     matvec_diagnostics
         Schedule for recording sampled ``H_eff`` matvec timing and projected
         problem shape metadata. The schedule modes match ``norm_check``.
@@ -1096,6 +1222,7 @@ class SymDMRG2:
         energy_tol_per_site=False,
         energy_tol_relative=False,
         matvec_backend="auto",
+        matvec_layout="unfused",
         matvec_diagnostics="off",
         matvec_diagnostics_interval=1,
         sector_enrichment="none",
@@ -1174,6 +1301,7 @@ class SymDMRG2:
         ):
             self.residual_check = "strict"
         self.matvec_backend = _normalize_matvec_backend(matvec_backend)
+        self.matvec_layout = _normalize_matvec_layout(matvec_layout)
         self.matvec_diagnostics = _normalize_check_schedule(
             matvec_diagnostics,
             name="matvec_diagnostics",
@@ -3407,6 +3535,7 @@ class SymDMRG2:
                 "site": int(site),
                 "right_site": int(site + 1),
                 "matvec_backend": backend,
+                "matvec_layout": self.matvec_layout,
             }
             if profile_start is not None or record_matvec_diagnostic:
                 metadata.update(self._tensor_block_stats(theta_input))
@@ -4919,6 +5048,7 @@ class SymDMRG2:
             "energy_tol_relative": self.energy_tol_relative,
             "matvec_backend": self.matvec_backend,
             "resolved_matvec_backend": self._resolved_matvec_backend(),
+            "matvec_layout": self.matvec_layout,
             "matvec_diagnostics": self.matvec_diagnostics,
             "matvec_diagnostics_interval": self.matvec_diagnostics_interval,
             "sector_enrichment": self.sector_enrichment,
