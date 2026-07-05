@@ -21,6 +21,7 @@ from pepsy.vmc.netket import (  # noqa: E402
     build_ising_vmc,
     choose_netket_chunk_size,
     config_to_phys_indices,
+    fermionic_peps_rand,
     make_fermionic_peps_batched_amplitude_function,
     make_fermionic_peps_log_amplitude_model,
     make_netket_autochunk_callback,
@@ -36,6 +37,7 @@ from pepsy.vmc.netket import (  # noqa: E402
     square_lattice_edges,
     verify_netket_spin_columns,
 )
+from pepsy.vmc.netket import _spinful_phys_lookup  # noqa: E402
 
 
 def test_square_lattice_edges_open_boundary_order():
@@ -544,3 +546,154 @@ def test_make_netket_vmc_sr_driver_tiny_setup():
     assert driver.mode == "real"
     assert driver.use_ntk is False
     assert driver.chunk_size_bwd == 8
+
+
+def test_spinful_phys_lookup_u1u1_and_z2_fallback():
+    # U1U1 charges resolve every (n_up, n_down) -> 2*n_up + n_down.
+    lut = _spinful_phys_lookup(((0, 0), (0, 1), (1, 0), (1, 1)))
+    assert lut is not None
+    assert lut[0, 0] == 0
+    assert lut[0, 1] == 1
+    assert lut[1, 0] == 2
+    assert lut[1, 1] == 3
+    # Z2 parity charges (int, 2 sectors) cannot resolve (n_up, n_down): legacy fold.
+    assert _spinful_phys_lookup((0, 1)) is None
+    assert _spinful_phys_lookup(()) is None
+
+
+def test_occupation_fold_switches_on_phys_charges():
+    columns = SpinOrbitalColumns(up=(2, 3), down=(0, 1))
+    # one row per (n_up, n_down) for a single orbital pair (2 orbitals here).
+    # occ layout length 2*n_orb = 4; down cols (0,1), up cols (2,3).
+    # orbital 0 -> (n_up=1, n_down=1) doublon; orbital 1 -> (n_up=0, n_down=0) empty.
+    occ = np.array([[1, 0, 1, 0]])  # dn0=1, dn1=0, up0=1, up1=0
+    z2 = occupation_to_phys_indices(occ, columns, phys_charges=None)
+    u1u1 = occupation_to_phys_indices(
+        occ, columns, phys_charges=((0, 0), (0, 1), (1, 0), (1, 1))
+    )
+    # doublon: Z2 fold -> 1, U1U1 fold -> 3; empty -> 0 for both.
+    assert z2[0].tolist() == [1, 0]
+    assert u1u1[0].tolist() == [3, 0]
+
+
+def test_fermionic_peps_rand_u1u1_fold_is_charge_consistent():
+    pytest.importorskip("netket")
+    pytest.importorskip("flax")
+    pytest.importorskip("symmray")
+    import netket as nk
+
+    Lx = Ly = 2
+    n_sites = Lx * Ly
+    peps = fermionic_peps_rand(
+        "U1U1", Lx, Ly, 4, n_fermions_per_spin=(2, 2), seed=5
+    )
+    ansatz = pack_fermionic_peps_ansatz(peps, lattice_shape=(Lx, Ly))
+    assert ansatz.phys_charges == ((0, 0), (0, 1), (1, 0), (1, 1))
+
+    hilbert = nk.hilbert.SpinOrbitalFermions(
+        n_sites, s=1 / 2, n_fermions_per_spin=(2, 2)
+    )
+    columns = netket_spin_orbital_columns(hilbert)
+    states = np.asarray(hilbert.all_states()).astype(int)
+    charges = np.asarray(ansatz.phys_charges)
+
+    def charge_sums(phys_charges):
+        phys = occupation_to_phys_indices(
+            states, columns, site_to_orb=ansatz.site_to_orb, phys_charges=phys_charges
+        )
+        return charges[phys].sum(axis=1)
+
+    # The U1U1-aware fold maps every sector config to a total charge of (2, 2).
+    u1u1_sums = charge_sums(ansatz.phys_charges)
+    assert np.all(u1u1_sums == np.array([2, 2]))
+    # The legacy Z2 fold is not charge-consistent for U1U1 physical indices.
+    legacy_sums = charge_sums(None)
+    assert not np.all(legacy_sums == np.array([2, 2]))
+
+
+def test_u1u1_fermionic_peps_nojit_contractions_work():
+    pytest.importorskip("netket")
+    pytest.importorskip("flax")
+    pytest.importorskip("symmray")
+    import netket as nk
+
+    Lx = Ly = 2
+    n_sites = Lx * Ly
+    peps = fermionic_peps_rand(
+        "U1U1", Lx, Ly, 3, n_fermions_per_spin=(2, 2), seed=11
+    )
+    ansatz = pack_fermionic_peps_ansatz(peps, lattice_shape=(Lx, Ly))
+    hilbert = nk.hilbert.SpinOrbitalFermions(
+        n_sites, s=1 / 2, n_fermions_per_spin=(2, 2)
+    )
+    columns = netket_spin_orbital_columns(hilbert)
+    rows = np.asarray(hilbert.all_states()[:3]).astype(np.int32)
+
+    assert ansatz.uses_flat_symmray is False
+    assert ansatz.phys_charges == ((0, 0), (0, 1), (1, 0), (1, 1))
+
+    for contraction, chi in (
+        ("exact", None),
+        ("hotrg", 4),
+        ("ctmrg", 4),
+        ("boundary", 4),
+        ("mps", 4),
+    ):
+        kwargs = {} if chi is None else {"chi": chi}
+        fn = make_fermionic_peps_batched_amplitude_function(
+            ansatz,
+            columns,
+            contraction=contraction,
+            output="mantissa_exponent",
+            jit=False,
+            **kwargs,
+        )
+        mantissa, exponent = fn(rows)
+
+        assert np.asarray(mantissa).shape == (3,)
+        assert np.asarray(exponent).shape == (3,)
+        assert np.all(np.isfinite(np.asarray(mantissa)))
+        assert np.all(np.isfinite(np.asarray(exponent)))
+
+    with pytest.raises(NotImplementedError, match="flat U1U1 fermionic backend"):
+        make_fermionic_peps_batched_amplitude_function(
+            ansatz,
+            columns,
+            contraction="exact",
+            output="amplitude",
+            jit=True,
+        )
+
+
+def test_u1u1_fermionic_peps_full_netket_vmc_fails_clearly():
+    pytest.importorskip("netket")
+    pytest.importorskip("flax")
+    pytest.importorskip("symmray")
+
+    peps = fermionic_peps_rand(
+        "U1U1", 2, 2, 3, n_fermions_per_spin=(2, 2), seed=12
+    )
+
+    with pytest.raises(NotImplementedError, match="flat U1U1 fermionic backend"):
+        build_fermi_hubbard_vmc(
+            peps,
+            Lx=2,
+            Ly=2,
+            n_samples=8,
+            n_chains=2,
+            n_discard_per_chain=0,
+            chunk_size=4,
+            seed=1,
+            sampler_seed=2,
+            use_sr=False,
+            contraction="exact",
+        )
+
+
+def test_fermionic_peps_rand_z2_uses_flat_backend():
+    pytest.importorskip("symmray")
+    peps = fermionic_peps_rand("Z2", 2, 2, 2, seed=1)
+    ansatz = pack_fermionic_peps_ansatz(peps, lattice_shape=(2, 2))
+    # Z2 physical index is parity-resolved (2 sectors) -> legacy fold, flat backend.
+    assert _spinful_phys_lookup(ansatz.phys_charges) is None
+    assert ansatz.uses_flat_symmray is True

@@ -236,9 +236,15 @@ The fermionic batch path mirrors Symmray's batch GPU amplitude example: pack
 the PEPS once, keep `flat=True` Symmray data for JIT-friendly leaves, and
 evaluate many spin-orbital occupation rows with one compiled function. In the
 currently tested Symmray stack this flat path is the `Z2` route; sparse
-fermionic `U1`, `Z2Z2`, and `U1U1` PEPS remain supported by
-`TorchPEPSAmplitude`, but should use the sparse-block amplitude/local-energy
-helpers unless a matching flat backend is available and benchmarked.
+fermionic `U1`, `Z2Z2`, and `U1U1` PEPS remain supported by the non-jitted
+batch amplitude function and by `TorchPEPSAmplitude`, but should use those
+sparse-block paths unless a matching flat backend is available and benchmarked.
+For `U1U1`, `fermionic_peps_rand("U1U1", ...)` builds the block-sparse ansatz
+and `make_fermionic_peps_batched_amplitude_function(..., jit=False)` is
+validated with `contraction="exact"`, `"hotrg"`, `"ctmrg"`, and
+`"boundary"`/`"mps"`. Full NetKet `MCState` VMC still requires a jitted Flax
+model, so `build_fermi_hubbard_vmc(...)` raises clearly for block-sparse
+`U1U1` PEPS until Symmray provides a flat U1U1 fermionic backend.
 
 ```python
 batched_amp = pvmc.make_fermionic_peps_batched_amplitude_function(

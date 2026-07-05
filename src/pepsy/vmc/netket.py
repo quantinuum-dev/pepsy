@@ -27,6 +27,7 @@ __all__ = [
     "build_heisenberg_vmc",
     "build_ising_vmc",
     "build_fermi_hubbard_vmc",
+    "fermionic_peps_rand",
     "choose_netket_chunk_size",
     "configure_jax_for_vmc",
     "config_to_phys_indices",
@@ -123,6 +124,7 @@ class PackedPEPS:
     n_params: int
     site_inds: tuple[Any, ...] = ()
     uses_flat_symmray: bool | None = None
+    phys_charges: tuple[Any, ...] = ()
 
     @property
     def n_sites(self):
@@ -276,6 +278,17 @@ def _require_netket():
     return nk
 
 
+def _require_symmray():
+    try:
+        import symmray as sr
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "fermionic PEPS VMC requires optional dependency 'symmray'. "
+            "Install it with `pip install symmray`."
+        ) from exc
+    return sr
+
+
 def _check_positive_int(name, value):
     if value is None:
         return None
@@ -358,6 +371,77 @@ def _param_leaf_size(leaf):
     if shape is not None:
         return int(np.prod(shape, dtype=np.int64))
     return int(np.asarray(leaf).size)
+
+
+def _peps_phys_charges(tn):
+    """Return the ordered physical-index charges of a Symmray PEPS, else ``()``.
+
+    For a spinful fermionic PEPS the physical index carries the local charge of
+    each basis state. For ``U1U1`` these are ``(n_up, n_down)`` tuples in a
+    definite order (e.g. ``(0, 0), (0, 1), (1, 0), (1, 1)``); for ``Z2`` they
+    are parity integers. The ordering is authoritative for the
+    occupation->physical-index fold used by the amplitude functions.
+    """
+    try:
+        site = next(iter(tn.sites))
+    except Exception:  # pragma: no cover - non-PEPS input
+        return ()
+    tensor = tn[site]
+    data = getattr(tensor, "data", None)
+    if not _is_symmray_array(data):
+        return ()
+    try:
+        phys_ind = tn.site_ind(site)
+        axis = tuple(tensor.inds).index(phys_ind)
+        index = data.indices[axis]
+        chargemap = getattr(index, "chargemap", None)
+        if chargemap is None:
+            return ()
+        return tuple(chargemap.keys())
+    except Exception:  # pragma: no cover - best-effort introspection
+        return ()
+
+
+def _spinful_phys_lookup(phys_charges):
+    """Return a ``(2, 2)`` int lookup ``lut[n_up, n_down] -> phys index``.
+
+    The lookup is derived from the PEPS physical-index charge order so the
+    occupation->physical fold matches the symmetry actually stored in the
+    ansatz. Returns ``None`` when the charges are not resolved per
+    ``(n_up, n_down)`` tuple (e.g. ``Z2`` parity sectors), in which case callers
+    use the legacy ``2 * (n_up != n_down) + n_down`` fold.
+    """
+    charges = tuple(phys_charges or ())
+    if len(charges) != 4:
+        return None
+    if not all(isinstance(c, tuple) and len(c) == 2 for c in charges):
+        return None
+    lut = np.full((2, 2), -1, dtype=np.int32)
+    for pos, (n_up, n_down) in enumerate(charges):
+        if n_up in (0, 1) and n_down in (0, 1):
+            lut[int(n_up), int(n_down)] = pos
+    if bool((lut < 0).any()):
+        return None
+    return lut
+
+
+def _require_jittable_fermionic_ansatz(ansatz):
+    """Raise a clear error when NetKet's jitted VMC path cannot use ``ansatz``."""
+    if ansatz.uses_flat_symmray is not False:
+        return
+    if _spinful_phys_lookup(getattr(ansatz, "phys_charges", ())) is not None:
+        symmetry = "U1U1"
+    else:
+        symmetry = "non-flat Symmray"
+    raise NotImplementedError(
+        "NetKet MCState JIT-compiles the PEPS log-amplitude model, but this "
+        f"{symmetry} fermionic PEPS uses block-sparse Symmray arrays rather "
+        "than a flat JAX-friendly backend. Use "
+        "make_fermionic_peps_batched_amplitude_function(..., jit=False) with "
+        "contraction='exact', 'hotrg', 'ctmrg', or 'boundary' for validation, "
+        "or use a flat Z2 fermionic PEPS for full NetKet VMC until Symmray "
+        "provides a flat U1U1 fermionic backend."
+    )
 
 
 def choose_netket_chunk_size(
@@ -611,16 +695,24 @@ def verify_netket_spin_columns(hilbert, columns=None, *, max_states=50_000):
     return columns
 
 
-def occupation_to_phys_indices(occ_rows, columns, *, site_to_orb=None):
+def occupation_to_phys_indices(occ_rows, columns, *, site_to_orb=None, phys_charges=None):
     """Map NetKet spin-orbital occupations to Symmray spinful physical indices.
 
-    Symmray's spinful PEPS physical ordering is assumed to be:
-    ``0=(0,0)``, ``1=(1,1)``, ``2=(1,0)``, ``3=(0,1)``.
+    The occupation->physical-index fold follows the PEPS physical-index charge
+    order supplied via ``phys_charges``. For ``U1U1`` the charges resolve each
+    ``(n_up, n_down)`` state directly (typically
+    ``0=(0,0)``, ``1=(0,1)``, ``2=(1,0)``, ``3=(1,1)`` -> ``2*n_up + n_down``).
+    When ``phys_charges`` is ``None`` or only parity-resolved (``Z2``), the
+    legacy fold ``0=(0,0)``, ``1=(1,1)``, ``2=(1,0)``, ``3=(0,1)`` is used.
     """
     occ_rows = np.asarray(occ_rows).astype(int).reshape(-1, 2 * len(columns.up))
     nu = occ_rows[:, np.asarray(columns.up)]
     nd = occ_rows[:, np.asarray(columns.down)]
-    phys_orb = 2 * (nu != nd).astype(np.int32) + nd
+    lut = _spinful_phys_lookup(phys_charges)
+    if lut is not None:
+        phys_orb = lut[nu, nd].astype(np.int32)
+    else:
+        phys_orb = 2 * (nu != nd).astype(np.int32) + nd
     if site_to_orb is None:
         return phys_orb.astype(np.int32)
     return phys_orb[:, np.asarray(site_to_orb)].astype(np.int32)
@@ -701,6 +793,7 @@ def _pack_peps_ansatz(
         site_to_orb=site_to_orb,
         n_params=n_params,
         uses_flat_symmray=_uses_flat_symmray_arrays(tn),
+        phys_charges=_peps_phys_charges(tn),
     )
 
 
@@ -841,13 +934,6 @@ def _make_peps_batched_amplitude_nojit(
     contraction = _validate_contraction("contraction", contraction, chi)
     if output not in {"log", "amplitude", "mantissa_exponent"}:
         raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
-    if ansatz.uses_flat_symmray is False:
-        warnings.warn(
-            "JAX-jitted Symmray PEPS amplitudes are fastest with flat=True "
-            "PEPS data; repack a flat Symmray PEPS for large GPU runs.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
 
     config_map = _coerce_config_map(config_map)
     method_opts = _contraction_options(contraction_opts)
@@ -1032,13 +1118,6 @@ def _make_fermionic_peps_batched_amplitude_apply(
     contraction = _validate_contraction("contraction", contraction, chi)
     if output not in {"log", "amplitude", "mantissa_exponent"}:
         raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
-    if ansatz.uses_flat_symmray is False:
-        warnings.warn(
-            "JAX-jitted Symmray fermionic PEPS amplitudes are fastest with "
-            "flat=True PEPS data; repack a flat Symmray PEPS for large GPU runs.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
 
     method_opts = _contraction_options(contraction_opts)
     if contraction == "boundary":
@@ -1052,12 +1131,17 @@ def _make_fermionic_peps_batched_amplitude_apply(
     log10 = jnp.log(jnp.asarray(10.0, dtype=real_dtype))
     n_sites = ansatz.n_sites
     site_inds = tuple(ansatz.site_inds)
+    _phys_lut = _spinful_phys_lookup(getattr(ansatz, "phys_charges", ()))
+    phys_lut = None if _phys_lut is None else jnp.asarray(_phys_lut, dtype=jnp.int32)
 
     def occ_rows_to_phys_jax(occ_rows):
         occ_rows = jnp.asarray(occ_rows, dtype=jnp.int32).reshape((-1, 2 * n_sites))
         nu = occ_rows[:, col_up]
         nd = occ_rows[:, col_down]
-        phys_orb = 2 * (nu != nd).astype(jnp.int32) + nd
+        if phys_lut is not None:
+            phys_orb = phys_lut[nu, nd]
+        else:
+            phys_orb = 2 * (nu != nd).astype(jnp.int32) + nd
         return phys_orb[:, site_to_orb]
 
     def select_phys(tn, phys):
@@ -1135,13 +1219,6 @@ def _make_fermionic_peps_batched_amplitude_nojit(
     contraction = _validate_contraction("contraction", contraction, chi)
     if output not in {"log", "amplitude", "mantissa_exponent"}:
         raise ValueError("output must be 'log', 'amplitude', or 'mantissa_exponent'.")
-    if ansatz.uses_flat_symmray is False:
-        warnings.warn(
-            "JAX-jitted Symmray fermionic PEPS amplitudes are fastest with "
-            "flat=True PEPS data; repack a flat Symmray PEPS for large GPU runs.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
 
     method_opts = _contraction_options(contraction_opts)
     if contraction == "boundary":
@@ -1205,6 +1282,7 @@ def _make_fermionic_peps_batched_amplitude_nojit(
             np.asarray(occ_rows),
             columns,
             site_to_orb=ansatz.site_to_orb,
+            phys_charges=getattr(ansatz, "phys_charges", ()),
         )
         values = [evaluate_one(tn, phys) for phys in phys_rows]
         if output == "mantissa_exponent":
@@ -1249,6 +1327,7 @@ def make_fermionic_peps_batched_amplitude_function(
     """
     jax, _ = _require_jax()
     if jit:
+        _require_jittable_fermionic_ansatz(ansatz)
         apply = _make_fermionic_peps_batched_amplitude_apply(
             ansatz,
             columns,
@@ -1290,6 +1369,7 @@ def make_fermionic_peps_log_amplitude_model(
 ):
     """Build a Flax model returning batched ``log(psi(occupation_row))``."""
     _validate_contraction("contraction", contraction, chi)
+    _require_jittable_fermionic_ansatz(ansatz)
 
     jax, jnp = _require_jax()
     nn = _require_flax_linen()
@@ -1589,6 +1669,123 @@ def build_heisenberg_vmc(
         sr_solver=sr_solver,
         sr_solver_restart=sr_solver_restart,
         param_dtype=param_dtype,
+    )
+
+
+def _default_u1u1_flux_occupations(Lx, Ly, n_up, n_down):
+    """Per-site ``(n_up, n_down)`` flux summing to ``(n_up, n_down)``.
+
+    Up charges are placed on the first ``n_up`` sites (row-major) and down
+    charges on the last ``n_down`` sites, spreading them apart. Only the *total*
+    charge sector matters for VMC; local occupation still fluctuates through the
+    virtual bonds of the random ansatz.
+    """
+    sites = [(i, j) for i in range(int(Lx)) for j in range(int(Ly))]
+    n = len(sites)
+    n_up = int(n_up)
+    n_down = int(n_down)
+    if not (0 <= n_up <= n and 0 <= n_down <= n):
+        raise ValueError(
+            f"n_fermions_per_spin=({n_up}, {n_down}) is out of range for "
+            f"{n} sites."
+        )
+    ups = [0] * n
+    downs = [0] * n
+    for k in range(n_up):
+        ups[k] = 1
+    for k in range(n_down):
+        downs[n - 1 - k] = 1
+    return {site: (ups[k], downs[k]) for k, site in enumerate(sites)}
+
+
+def fermionic_peps_rand(
+    symmetry,
+    Lx,
+    Ly,
+    bond_dim,
+    *,
+    n_fermions_per_spin=None,
+    site_charge=None,
+    seed=None,
+    dtype="float64",
+    flat="auto",
+    **kwargs,
+):
+    """Build a random fermionic PEPS for VMC, symmetry-aware.
+
+    ``"Z2"`` uses the flat (``jax.jit``/``vmap``-friendly) Symmray backend and a
+    ``phys_dim=4`` parity-resolved physical index. ``"U1U1"`` uses the
+    block-sparse backend (Symmray currently has no flat ``U1U1`` fermionic
+    array) with a per-spin ``(n_up, n_down)`` physical charge map and a default
+    site-charge summing to ``n_fermions_per_spin`` (half filling if omitted).
+
+    Note
+    ----
+    A ``U1U1`` ansatz cannot yet be driven through the NetKet Monte-Carlo state
+    (which JIT-compiles the model) because the flat backend is missing upstream.
+    The block-sparse ``U1U1`` PEPS still evaluates correctly through the
+    non-jitted amplitude functions (``jit=False``) for validation and exact/dense
+    sums.
+    """
+    sr = _require_symmray()
+    sym = str(symmetry).upper().replace("-", "").replace("_", "")
+    n_sites = int(Lx) * int(Ly)
+
+    if sym == "Z2":
+        use_flat = True if flat == "auto" else bool(flat)
+        return sr.networks.PEPS_fermionic_rand(
+            "Z2",
+            Lx,
+            Ly,
+            bond_dim,
+            phys_dim=4,
+            subsizes="equal",
+            flat=use_flat,
+            seed=seed,
+            dtype=dtype,
+            **kwargs,
+        )
+
+    if sym == "U1U1":
+        from pepsy.tensors import (
+            default_physical_sectors,
+            site_charge_from_occupations,
+        )
+
+        if site_charge is None:
+            if n_fermions_per_spin is None:
+                n_fermions_per_spin = (n_sites // 2, n_sites // 2)
+            n_up, n_down = (int(x) for x in n_fermions_per_spin)
+            site_charge = site_charge_from_occupations(
+                _default_u1u1_flux_occupations(Lx, Ly, n_up, n_down)
+            )
+        use_flat = False if flat == "auto" else bool(flat)
+        if use_flat:
+            warnings.warn(
+                "Symmray has no flat U1U1 fermionic backend; falling back to "
+                "block-sparse (flat=False). NetKet MC sampling JIT-compiles the "
+                "model and needs a flat backend, so use the non-jit amplitude "
+                "functions for U1U1 until flat U1U1 lands upstream.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            use_flat = False
+        return sr.networks.PEPS_fermionic_rand(
+            "U1U1",
+            Lx,
+            Ly,
+            bond_dim,
+            phys_dim=default_physical_sectors(model="fermi_hubbard_u1u1"),
+            site_charge=site_charge,
+            flat=use_flat,
+            seed=seed,
+            dtype=dtype,
+            **kwargs,
+        )
+
+    raise ValueError(
+        f"Unsupported symmetry {symmetry!r} for fermionic_peps_rand; "
+        "use 'Z2' or 'U1U1'."
     )
 
 

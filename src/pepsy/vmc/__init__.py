@@ -25,6 +25,7 @@ _SYMBOL_MODULES = {
     "build_heisenberg_vmc": ".netket",
     "build_ising_vmc": ".netket",
     "build_fermi_hubbard_vmc": ".netket",
+    "fermionic_peps_rand": ".netket",
     "choose_netket_chunk_size": ".netket",
     "configure_jax_for_vmc": ".netket",
     "config_to_phys_indices": ".netket",
