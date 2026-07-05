@@ -436,6 +436,61 @@ def test_symdmrg2_sweep_uses_quimb_progress_bar(monkeypatch):
     assert calls[0][1].closed
 
 
+def test_symdmrg2_solve_progbar_alias_uses_quimb_progress_bar(monkeypatch, capsys):
+    """progbar=True is a clear alias for quimb-style verbosity=1 output."""
+    pytest.importorskip("symmray")
+    import quimb.utils as qutils
+
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+    opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, local_solver="dense")
+    calls = []
+
+    class DummyProgbar:
+        def __init__(self, iterable):
+            self.iterable = iterable
+            self.closed = False
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def close(self):
+            self.closed = True
+
+    def fake_progbar(iterable, **kwargs):
+        bar = DummyProgbar(iterable)
+        calls.append((kwargs, bar))
+        return bar
+
+    monkeypatch.setattr(qutils, "progbar", fake_progbar)
+
+    out = opt.solve(max_sweeps=1, progbar=True, tol=0.0)
+
+    assert out is opt
+    assert len(opt.energies) == 1
+    assert calls[0][0]["total"] == opt.state.L - 1
+    assert calls[0][0]["ncols"] == 80
+    assert calls[0][1].closed
+    captured = capsys.readouterr().out
+    assert "1, R, max_bond=" in captured
+    assert "Energy:" in captured
+
+
+def test_symdmrg2_rejects_ambiguous_progress_and_unknown_options():
+    """Progress aliases should be unambiguous and unknown kwargs should fail."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+    opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, local_solver="dense")
+
+    with pytest.raises(ValueError, match="progbar=False conflicts"):
+        opt.solve(max_sweeps=1, verbosity=1, progbar=False)
+
+    with pytest.raises(TypeError, match="SymDMRG2.solve.*made_up"):
+        opt.solve(max_sweeps=1, made_up=True)
+
+    with pytest.raises(TypeError, match="SymDMRG2.sweep.*made_up"):
+        opt.sweep("R", made_up=True)
+
+
 def test_symdmrg2_profile_records_phase_timings():
     """Opt-in profiling should record useful timing phases."""
     pytest.importorskip("symmray")

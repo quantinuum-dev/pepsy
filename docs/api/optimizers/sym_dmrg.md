@@ -11,7 +11,9 @@ accepts `"R"`/`"L"` or `"right"`/`"left"`. Pepsy's older `chi`, `cutoff`, and
 convention of returning `self`; the quimb-style convergence boolean is stored
 on `converged`. With `verbosity > 0`, Symmray sweeps use quimb's `progbar`
 helper for the per-site progress display and print quimb-style pre/post sweep
-energy lines.
+energy lines. For Pepsy-style call sites, `progbar=True` is accepted by
+`solve` and `sweep` as a clear alias for at least `verbosity=1`; conflicting
+`progbar=False, verbosity>0` settings are rejected.
 
 For scale studies, `profile=True` enables JSON-friendly profiling events in
 `profile_diagnostics`. `profile_summary()` aggregates counts and elapsed time

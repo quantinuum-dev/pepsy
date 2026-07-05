@@ -483,6 +483,32 @@ def _positive_int_sequence(values, *, name):
     return out
 
 
+def _normalize_verbosity(verbosity, *, progbar=None):
+    if verbosity is None:
+        verbosity = 0
+    verbosity = int(verbosity)
+    if verbosity < 0:
+        raise ValueError("verbosity must be a non-negative integer.")
+    if progbar is None:
+        return verbosity
+    progbar = bool(progbar)
+    if progbar:
+        return max(verbosity, 1)
+    if verbosity > 0:
+        raise ValueError(
+            "progbar=False conflicts with verbosity>0. Use verbosity=0 or "
+            "omit progbar."
+        )
+    return 0
+
+
+def _raise_unexpected_kwargs(owner, kwargs):
+    if not kwargs:
+        return
+    names = ", ".join(sorted(kwargs))
+    raise TypeError(f"{owner} got unexpected keyword argument(s): {names}.")
+
+
 def _normalize_sweep_direction(direction):
     key = str(direction).strip().upper()
     aliases = {
@@ -4841,10 +4867,8 @@ class SymDMRG2:
         verbosity,
         sweep_sequence,
         suppress_warnings,
-        solve_opts,
     ):
         driver = self._ensure_quimb_driver(bond_dims=bond_dims, cutoffs=cutoffs)
-        kwargs = dict(solve_opts)
         self.converged = bool(
             driver.solve(
                 tol=tol,
@@ -4854,7 +4878,6 @@ class SymDMRG2:
                 max_sweeps=max_sweeps,
                 verbosity=verbosity,
                 suppress_warnings=suppress_warnings,
-                **kwargs,
             )
         )
         self.energies = list(driver.energies)
@@ -4863,7 +4886,15 @@ class SymDMRG2:
         self._state = driver.state
         return self
 
-    def sweep(self, direction, canonize=True, verbosity=0, **update_opts):
+    def sweep(
+        self,
+        direction,
+        canonize=True,
+        verbosity=0,
+        *,
+        progbar=None,
+        **update_opts,
+    ):
         """Perform one DMRG sweep, using quimb's ``DMRG2.sweep`` conventions.
 
         Parameters
@@ -4873,12 +4904,17 @@ class SymDMRG2:
         canonize : bool, default=True
             Whether to canonicalize the state before sweeping.
         verbosity : {0, 1, 2}, default=0
-            Non-zero values display a quimb-style per-site progress bar.
+            Non-zero values display quimb-style pre/post sweep lines and a
+            quimb per-site progress bar.
+        progbar : bool, optional
+            Convenience alias for the progress-bar part of ``verbosity``.
+            ``progbar=True`` is equivalent to at least ``verbosity=1``.
         update_opts
             Supports quimb-style ``max_bond``, ``cutoff``, ``method``, and
             ``cutoff_mode`` options. Symmray uses these for the two-site SVD
             writeback.
         """
+        verbosity = _normalize_verbosity(verbosity, progbar=progbar)
         direction_char, direction_name = _normalize_sweep_direction(direction)
         max_bond = int(update_opts.pop("max_bond", update_opts.pop("chi", self.chi)))
         cutoff = float(update_opts.pop("cutoff", self.cutoff))
@@ -4908,6 +4944,7 @@ class SymDMRG2:
             self.total_energies = list(driver.total_energies)
             return energy
 
+        _raise_unexpected_kwargs("SymDMRG2.sweep", update_opts)
         return self._symmray_sweep_direction(
             direction_name,
             chi=max_bond,
@@ -5038,6 +5075,7 @@ class SymDMRG2:
         sweeps=None,
         chi=None,
         cutoff=None,
+        progbar=None,
         **solve_opts,
     ):
         """Run DMRG2 and return ``self``.
@@ -5045,8 +5083,11 @@ class SymDMRG2:
         The main controls mirror ``quimb.tensor.DMRG2.solve``: ``bond_dims``,
         ``cutoffs``, ``sweep_sequence``, ``max_sweeps``, ``verbosity``, and
         ``suppress_warnings``. Pepsy's older ``chi``, ``cutoff``, and
-        ``sweeps`` names remain accepted aliases.
+        ``sweeps`` names remain accepted aliases. ``progbar=True`` is a Pepsy
+        convenience alias for at least ``verbosity=1``.
         """
+        verbosity = _normalize_verbosity(verbosity, progbar=progbar)
+        _raise_unexpected_kwargs("SymDMRG2.solve", solve_opts)
         tol = self.tol if tol is None else float(tol)
         if bond_dims is None and chi is not None:
             bond_dims = chi
@@ -5074,7 +5115,6 @@ class SymDMRG2:
                 verbosity=verbosity,
                 sweep_sequence=sweep_sequence,
                 suppress_warnings=suppress_warnings,
-                solve_opts=solve_opts,
             )
         return self._solve_symmray(
             max_sweeps=max_sweeps,
