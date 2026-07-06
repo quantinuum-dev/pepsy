@@ -335,6 +335,97 @@ def test_symdmrg2_auto_ramp_blocks_early_energy_convergence(monkeypatch):
     assert opt.convergence_diagnostics[-1]["bond_schedule_ready"] is True
 
 
+def test_symdmrg2_min_sweeps_blocks_early_energy_convergence(monkeypatch):
+    """Sweep convergence should require a clean comparison window."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=3,
+    )
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=8,
+        cutoff=1e-10,
+        compute_initial_energy=False,
+        min_sweeps=2,
+        norm_check="off",
+    )
+    seen_bonds = []
+
+    def flat_sweep(direction, canonize=True, **kwargs):
+        del direction, canonize
+        seen_bonds.append(kwargs["max_bond"])
+        return 0.0
+
+    monkeypatch.setattr(opt, "sweep", flat_sweep)
+    opt.solve(max_sweeps=5, sweep_sequence="R", tol=1e-10)
+
+    assert seen_bonds == [8, 8, 8]
+    assert opt.converged is True
+    assert opt.convergence_diagnostics[1]["convergence_blocked_reason"] == "min_sweeps"
+    assert opt.convergence_diagnostics[-1]["min_sweeps_satisfied"] is True
+    assert opt.summary()["min_sweeps"] == 2
+
+
+def test_symdmrg2_mixer_convergence_deactivates_before_final_sweep(monkeypatch):
+    """TeNPy-style mixer runs should not stop until a no-mixer sweep agrees."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=3,
+    )
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=8,
+        cutoff=1e-10,
+        compute_initial_energy=False,
+        mixer="density_matrix",
+        mixer_amplitude=1e-4,
+        mixer_decay=0.5,
+        mixer_disable_after=15,
+        norm_check="off",
+    )
+    seen_bonds = []
+
+    def flat_sweep(direction, canonize=True, **kwargs):
+        del direction, canonize
+        seen_bonds.append(kwargs["max_bond"])
+        return 0.0
+
+    monkeypatch.setattr(opt, "sweep", flat_sweep)
+    opt.solve(max_sweeps=5, sweep_sequence="R", tol=1e-10)
+
+    blocked = opt.convergence_diagnostics[1]
+    final = opt.convergence_diagnostics[-1]
+    lifecycle = [
+        diagnostic
+        for diagnostic in opt.mixer_diagnostics
+        if diagnostic["kind"] == "mixer_lifecycle"
+    ]
+
+    assert seen_bonds == [8, 8, 8]
+    assert opt.converged is True
+    assert blocked["convergence_blocked_reason"] == "mixer_active"
+    assert blocked["mixer_active_during_sweep"] is True
+    assert final["mixer_active_during_sweep"] is False
+    assert lifecycle == [
+        {
+            "kind": "mixer_lifecycle",
+            "action": "deactivate_for_convergence",
+            "mixer": "subspace_expansion",
+            "sweep": 1,
+        }
+    ]
+    summary = opt.summary()
+    assert summary["active_mixer_amplitude"] == 0.0
+    assert summary["mixer_disabled_for_convergence"] is True
+    assert summary["mixer_disabled_at_sweep"] == 1
+
+
 def test_symdmrg2_solves_longer_chain_with_effective_norm():
     """L>2 uses H and N environments for a safe dense reference sweep."""
     pytest.importorskip("symmray")

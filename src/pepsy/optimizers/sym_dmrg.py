@@ -1182,6 +1182,10 @@ class SymDMRG2:
         ``local_eig_ncv`` can also be a sweep schedule, in which case the last
         entry is repeated. Set ``local_eig_backend`` to an explicit
         quimb/scipy backend to use the older flat LinearOperator adapter.
+    min_sweeps
+        Minimum number of completed sweeps before accepting convergence. This
+        follows TeNPy's finite-DMRG habit of requiring at least one comparison
+        sweep and prevents early plateau detection during warmup.
     norm_check_tol
         Tolerance for checking that the canonical-center effective norm acts
         like identity before using an H-only dense or Lanczos solve. In the
@@ -1296,11 +1300,12 @@ class SymDMRG2:
         local_solver="auto",
         dense_threshold=0,
         local_eig_tol=1e-8,
-        local_eig_energy_tol=1e-2,
+        local_eig_energy_tol=None,
         local_eig_min_steps=3,
-        local_eig_ncv=8,
+        local_eig_ncv=20,
         local_eig_maxiter=None,
         local_eig_backend=None,
+        min_sweeps=1,
         norm_check_tol=1e-6,
         norm_check_samples=2,
         norm_check="strict",
@@ -1374,6 +1379,7 @@ class SymDMRG2:
             None if local_eig_maxiter is None else int(local_eig_maxiter)
         )
         self.local_eig_backend = local_eig_backend
+        self.min_sweeps = int(min_sweeps)
         self.norm_check_tol = float(norm_check_tol)
         self.norm_check_samples = int(norm_check_samples)
         self.norm_check = _normalize_norm_check(norm_check)
@@ -1446,6 +1452,8 @@ class SymDMRG2:
             raise ValueError("local_eig_energy_tol must be non-negative.")
         if self.local_eig_min_steps < 1:
             raise ValueError("local_eig_min_steps must be a positive integer.")
+        if self.min_sweeps < 0:
+            raise ValueError("min_sweeps must be non-negative.")
         if self.residual_check_tol is not None and self.residual_check_tol < 0.0:
             raise ValueError("residual_check_tol must be non-negative.")
         if (
@@ -1529,6 +1537,8 @@ class SymDMRG2:
         self.profile_diagnostics = []
         self._current_sweep_direction = None
         self._last_local_input_theta = None
+        self._mixer_disabled_for_convergence = False
+        self._mixer_disabled_at_sweep = None
         self.opts = {
             "default_sweep_sequence": "R",
             "bond_compress_method": "svd",
@@ -2070,6 +2080,83 @@ class SymDMRG2:
             return False
         return raw_converged
 
+    def _apply_min_sweeps_convergence_gate(self, diagnostic):
+        converged = bool(diagnostic["converged"])
+        completed_sweeps = int(diagnostic["sweep"]) + 1
+        min_sweeps_satisfied = completed_sweeps > int(self.min_sweeps)
+        diagnostic.update(
+            {
+                "completed_sweeps": int(completed_sweeps),
+                "min_sweeps": int(self.min_sweeps),
+                "min_sweeps_satisfied": bool(min_sweeps_satisfied),
+            }
+        )
+        if converged and not min_sweeps_satisfied:
+            diagnostic["converged"] = False
+            diagnostic["convergence_blocked_reason"] = "min_sweeps"
+            return False
+        return converged
+
+    def _record_mixer_lifecycle_diagnostic(self, diagnostic):
+        self.mixer_diagnostics.append(diagnostic)
+        self._record_profile_elapsed(
+            "mixer_lifecycle",
+            diagnostic.pop("_profile_start", None),
+            sweep=diagnostic["sweep"],
+            mixer=diagnostic["mixer"],
+            action=diagnostic["action"],
+        )
+        return diagnostic
+
+    def _deactivate_mixer_for_convergence(self, sweep):
+        if self._mixer_disabled_for_convergence:
+            return
+        self._mixer_disabled_for_convergence = True
+        self._mixer_disabled_at_sweep = int(sweep)
+        self._record_mixer_lifecycle_diagnostic(
+            {
+                "kind": "mixer_lifecycle",
+                "action": "deactivate_for_convergence",
+                "mixer": self.mixer,
+                "sweep": int(sweep),
+                "_profile_start": self._profile_start(),
+            }
+        )
+
+    def _apply_mixer_convergence_gate(self, diagnostic):
+        converged = bool(diagnostic["converged"])
+        sweep = int(diagnostic["sweep"])
+        active_amplitude = self._active_mixer_amplitude(sweep)
+        mixer_active = bool(active_amplitude > 0.0)
+        diagnostic.update(
+            {
+                "mixer_active_during_sweep": mixer_active,
+                "mixer_active_amplitude": float(active_amplitude),
+                "mixer_disabled_for_convergence": bool(
+                    self._mixer_disabled_for_convergence
+                ),
+                "mixer_disabled_at_sweep": self._mixer_disabled_at_sweep,
+            }
+        )
+        if converged and mixer_active:
+            self._deactivate_mixer_for_convergence(sweep)
+            diagnostic["converged"] = False
+            diagnostic["convergence_blocked_reason"] = "mixer_active"
+            diagnostic["mixer_disabled_for_convergence"] = True
+            diagnostic["mixer_disabled_at_sweep"] = self._mixer_disabled_at_sweep
+            return False
+        return converged
+
+    def _apply_convergence_gates(self, diagnostic, active_bond_dim):
+        if not self._apply_bond_schedule_convergence_gate(
+            diagnostic,
+            active_bond_dim,
+        ):
+            return False
+        if not self._apply_min_sweeps_convergence_gate(diagnostic):
+            return False
+        return self._apply_mixer_convergence_gate(diagnostic)
+
     def _compute_initial_energy(self):
         if self.init_mps is None:
             return None
@@ -2555,6 +2642,8 @@ class SymDMRG2:
 
     def _active_mixer_amplitude(self, sweep=None):
         if self.backend != "symmray" or self.mixer == "none":
+            return 0.0
+        if self._mixer_disabled_for_convergence:
             return 0.0
         sweep = len(self.energies) if sweep is None else int(sweep)
         if self.mixer_disable_after is not None and sweep >= self.mixer_disable_after:
@@ -5324,7 +5413,7 @@ class SymDMRG2:
                     tol,
                     convergence_offsets,
                 )
-                self.converged = self._apply_bond_schedule_convergence_gate(
+                self.converged = self._apply_convergence_gates(
                     convergence_diagnostic,
                     max_bond,
                 )
@@ -5349,6 +5438,7 @@ class SymDMRG2:
         cutoffs=None,
         sweep_sequence=None,
         max_sweeps=None,
+        min_sweeps=None,
         verbosity=0,
         suppress_warnings=True,
         *,
@@ -5362,9 +5452,10 @@ class SymDMRG2:
 
         The main controls mirror ``quimb.tensor.DMRG2.solve``: ``bond_dims``,
         ``cutoffs``, ``sweep_sequence``, ``max_sweeps``, ``verbosity``, and
-        ``suppress_warnings``. Pepsy's older ``chi``, ``cutoff``, and
-        ``sweeps`` names remain accepted aliases. ``progbar=True`` is a Pepsy
-        convenience alias for at least ``verbosity=1``.
+        ``suppress_warnings``. ``min_sweeps`` controls Pepsy's Symmray
+        convergence gate. Pepsy's older ``chi``, ``cutoff``, and ``sweeps``
+        names remain accepted aliases. ``progbar=True`` is a Pepsy convenience
+        alias for at least ``verbosity=1``.
         """
         verbosity = _normalize_verbosity(verbosity, progbar=progbar)
         _raise_unexpected_kwargs("SymDMRG2.solve", solve_opts)
@@ -5397,6 +5488,10 @@ class SymDMRG2:
         max_sweeps = int(max_sweeps)
         if max_sweeps < 1:
             raise ValueError("max_sweeps must be a positive integer.")
+        if min_sweeps is not None:
+            self.min_sweeps = int(min_sweeps)
+            if self.min_sweeps < 0:
+                raise ValueError("min_sweeps must be non-negative.")
         if bond_dims is None or _is_auto_bond_dim_schedule(bond_dims):
             self._fit_auto_bond_dim_schedule_to_sweeps(max_sweeps)
 
@@ -5443,6 +5538,7 @@ class SymDMRG2:
             "active_local_eig_ncv": self._active_local_eig_ncv,
             "local_eig_maxiter": self.local_eig_maxiter,
             "local_eig_backend": self.local_eig_backend,
+            "min_sweeps": self.min_sweeps,
             "norm_check_tol": self.norm_check_tol,
             "norm_check_samples": self.norm_check_samples,
             "norm_check": self.norm_check,
@@ -5473,6 +5569,8 @@ class SymDMRG2:
             "mixer_disable_after": self.mixer_disable_after,
             "mixer_bond_dim": self.mixer_bond_dim,
             "active_mixer_amplitude": self._active_mixer_amplitude(),
+            "mixer_disabled_for_convergence": self._mixer_disabled_for_convergence,
+            "mixer_disabled_at_sweep": self._mixer_disabled_at_sweep,
             "canonicalize_init": self.canonicalize_init,
             "init_canonicalized": self.init_canonicalized,
             "init_canonicalization_skipped_reason": (

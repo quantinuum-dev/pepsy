@@ -7,9 +7,11 @@ The main solve controls intentionally mirror quimb's `DMRG2`: `bond_dims`,
 `cutoffs`, `sweep_sequence`, `max_sweeps`, `verbosity`, and
 `suppress_warnings` are accepted by `solve`, and `sweep(direction, ...)`
 accepts `"R"`/`"L"` or `"right"`/`"left"`. Pepsy's older `chi`, `cutoff`, and
-`sweeps` names remain accepted as aliases. `solve` keeps the Pepsy optimizer
-convention of returning `self`; the quimb-style convergence boolean is stored
-on `converged`. With `verbosity > 0`, Symmray sweeps use quimb's `progbar`
+`sweeps` names remain accepted as aliases. `min_sweeps` controls the Symmray
+convergence gate and defaults to one comparison sweep before convergence can be
+accepted. `solve` keeps the Pepsy optimizer convention of returning `self`; the
+quimb-style convergence boolean is stored on `converged`. With `verbosity > 0`,
+Symmray sweeps use quimb's `progbar`
 helper for the per-site progress display and print quimb-style pre/post sweep
 energy lines. For Pepsy-style call sites, `progbar=True` is accepted by
 `solve` and `sweep` as a clear alias for at least `verbosity=1`; conflicting
@@ -67,16 +69,15 @@ leaving the default `matvec_layout="unfused"` unchanged.
 Default Symmray Lanczos solves keep Krylov vectors as block tensors and use
 dense NumPy only for block dot products and the small Rayleigh-Ritz projected
 matrix, avoiding a flat-vector Symmray-to-NumPy-to-Symmray round trip for every
-`H_eff` application. The native block path stops when either the residual
-estimate meets `local_eig_tol` or the Ritz energy changes by less than
-`local_eig_energy_tol` after at least `local_eig_min_steps` Krylov vectors.
-The default `local_eig_energy_tol=1e-2` targets warm-started DMRG sweeps where
-over-solving the local problem costs many extra `H_eff` matvecs without
-improving the variational sweep. `local_eig_ncv` remains the hard cap and may
-be a scalar cap or a sweep
-schedule whose last entry repeats, matching `bond_dims` and `cutoffs`. Set
-`local_eig_energy_tol=None` to force residual/cap-only behavior for dense
-reference comparisons. Local solve diagnostics record `stop_reason`,
+`H_eff` application. The native block path stops when the residual estimate
+meets `local_eig_tol`, when the Krylov basis reaches `local_eig_ncv`, or when a
+caller explicitly opts into an additional Ritz-energy stop with
+`local_eig_energy_tol`. The default `local_eig_energy_tol=None` follows TeNPy's
+more conservative local-solve posture and avoids declaring difficult random
+starts solved after only a few low-accuracy Krylov steps. The default
+`local_eig_ncv=20` mirrors TeNPy's default Krylov cap; it may also be a sweep
+schedule whose last entry repeats, matching `bond_dims` and `cutoffs`. Local
+solve diagnostics record `stop_reason`,
 `ritz_energy_delta`, `num_steps`, and `num_matvecs`. Real block data remains
 real unless the state or MPO data is complex. Before each local solve,
 SymDMRG2 also probes the projected
@@ -139,6 +140,14 @@ before the first sweep.
 sweep, which can reintroduce valid sectors after SVD truncation prunes them.
 `sector_enrichment_diagnostics` records the added blocks and template bond
 sectors.
+
+When the optional subspace mixer is active, SymDMRG2 uses it as a temporary
+exploration aid rather than a final convergence state. If the sweep convergence
+criteria are met while the mixer was still active, the Symmray path records a
+`mixer_lifecycle` diagnostic, disables the mixer, and requires a subsequent
+no-mixer sweep before setting `converged=True`. This matches the TeNPy practice
+of turning the mixer off and doing final clean sweeps once the state has found
+the right Schmidt subspace.
 
 For a hard periodic benchmark, the 3 by 3 PBC U1U1 Fermi-Hubbard sector-ED
 reference currently used during development is
