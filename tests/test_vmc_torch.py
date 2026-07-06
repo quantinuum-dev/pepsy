@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 from pepsy.vmc.torch import (  # noqa: E402
     FermionSiteEncoding,
     TorchPEPSAmplitude,
+    TorchPEPSBoundaryAmplitude,
     TorchVMCDriver,
     TorchVMCStepResult,
     TorchSquareLattice,
@@ -235,6 +236,46 @@ def test_torch_peps_amplitude_supports_sr_kernel():
     assert log_derivatives.shape == (2, model.n_params)
     assert result.direction.shape == (model.n_params,)
     assert torch.isfinite(result.direction).all()
+
+
+def test_torch_peps_boundary_amplitude_reuses_connected_environments():
+    peps = qtn.PEPS.rand(
+        Lx=3,
+        Ly=3,
+        bond_dim=2,
+        phys_dim=2,
+        seed=15,
+        dtype="float64",
+    )
+    model = TorchPEPSBoundaryAmplitude(
+        peps,
+        chi=4,
+        cutoff=0.0,
+        dtype=torch.float64,
+    )
+    configs = torch.tensor(
+        [
+            [0, 1, 0, 1, 0, 1, 0, 1, 0],
+            [1, 0, 1, 0, 1, 0, 1, 0, 1],
+        ],
+        dtype=torch.long,
+    )
+    graph = TorchSquareLattice(3, 3)
+    amplitudes = model(configs, chunk_size=1)
+    connections = heisenberg_connections(configs, graph, J=1.0)
+
+    reused = model.connected_amplitudes(
+        configs,
+        amplitudes,
+        connections,
+        chunk_size=2,
+    )
+    fresh = model(connections.configs, chunk_size=2)
+
+    assert torch.allclose(reused, fresh, rtol=1.0e-7, atol=1.0e-8)
+    assert model.last_connected_reuse_stats["num_diagonal"] > 0
+    assert model.last_connected_reuse_stats["num_reused"] > 0
+    assert model.last_connected_reuse_stats["num_fallback"] == 0
 
 
 def test_local_energy_reuses_diagonal_connections_and_chunks_offdiagonal():

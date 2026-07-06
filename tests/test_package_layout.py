@@ -48,6 +48,7 @@ from pepsy.tensors import (
 from pepsy.vmc import (
     FermionSiteEncoding,
     TorchPEPSAmplitude,
+    TorchPEPSBoundaryAmplitude,
     TorchVMCDriver,
     TorchVMCStepResult,
     TorchSquareLattice,
@@ -107,6 +108,7 @@ def test_new_namespace_imports_resolve():
     assert callable(site_charge_from_occupations)
     assert FermionSiteEncoding is not None
     assert TorchPEPSAmplitude is not None
+    assert TorchPEPSBoundaryAmplitude is not None
     assert TorchVMCDriver is not None
     assert TorchVMCStepResult is not None
     assert TorchSquareLattice is not None

@@ -109,12 +109,24 @@ sr = pvmc.solve_torch_sr(
 pvmc.apply_torch_sr_update(model, sr.direction, learning_rate=0.02)
 ```
 
+For boundary-MPS contractions, `TorchPEPSBoundaryAmplitude` also reuses each
+parent walker's row or column environments when evaluating local Hamiltonian
+connections:
+
+```python
+model = pvmc.TorchPEPSBoundaryAmplitude(
+    peps,
+    chi=64,
+    cutoff=1e-10,
+    dtype=torch.float64,
+)
+```
+
 For a compact no-JIT torch loop, `TorchVMCDriver` keeps walker configurations,
 current amplitudes, Hamiltonian connection metadata, sampling, local-energy
 evaluation, and optional SR updates together. Local-energy evaluation reuses
-diagonal connected amplitudes and supports chunked off-diagonal amplitude
-calls; PEPS-specific boundary-environment reuse can be plugged in by
-specializing the model's `connected_amplitudes(...)` method.
+diagonal connected amplitudes, supports chunked off-diagonal amplitude calls,
+and uses `connected_amplitudes(...)` automatically when the model provides it.
 
 ```python
 driver = pvmc.TorchVMCDriver(

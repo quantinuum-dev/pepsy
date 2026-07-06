@@ -14,6 +14,7 @@ from typing import Any
 __all__ = [
     "FermionSiteEncoding",
     "TorchPEPSAmplitude",
+    "TorchPEPSBoundaryAmplitude",
     "TorchConnections",
     "TorchMetropolisResult",
     "TorchVMCDriver",
@@ -145,6 +146,12 @@ def _normalize_chunk_size(chunk_size, *, name="chunk_size"):
     if chunk_size is None:
         return None
     return _check_positive_int(name, chunk_size)
+
+
+def _check_nonnegative_int(name, value):
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
+    return int(value)
 
 
 def _call_amplitude_fn(amplitude_fn, configs, *, chunk_size=None):
@@ -513,6 +520,276 @@ class TorchPEPSAmplitude:
     def __call__(self, configs, params=None, *, chunk_size=None):
         """Alias for :meth:`forward`."""
         return self.forward(configs, params=params, chunk_size=chunk_size)
+
+
+class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
+    """PEPS amplitude wrapper with boundary-environment connected reuse.
+
+    The base :class:`TorchPEPSAmplitude` evaluates every off-diagonal connected
+    configuration with a fresh contraction. This subclass keeps the same public
+    call interface but specializes ``connected_amplitudes(...)`` for finite
+    quimb PEPS using boundary-MPS environments around each parent walker. For a
+    local update, only the touched row or column window is recontracted.
+
+    Unsupported PEPS geometries or non-boundary contractions fall back to the
+    base implementation.
+    """
+
+    def __init__(
+        self,
+        peps,
+        *,
+        contraction="boundary",
+        chi=None,
+        cutoff=0.0,
+        contraction_opts=None,
+        dtype=None,
+        device=None,
+        site_order=None,
+        environment_radius=0,
+    ):
+        super().__init__(
+            peps,
+            contraction=contraction,
+            chi=chi,
+            cutoff=cutoff,
+            contraction_opts=contraction_opts,
+            dtype=dtype,
+            device=device,
+            site_order=site_order,
+        )
+        self.environment_radius = _check_nonnegative_int(
+            "environment_radius",
+            environment_radius,
+        )
+        self._boundary_geometry = self._infer_boundary_geometry(self._unpack_tn())
+        self.last_connected_reuse_stats = None
+
+    def _infer_boundary_geometry(self, tn):
+        try:
+            Lx = getattr(tn, "Lx", None)
+            Ly = getattr(tn, "Ly", None)
+            if Lx is None:
+                Lx = getattr(tn, "_Lx")
+            if Ly is None:
+                Ly = getattr(tn, "_Ly")
+            Lx = int(Lx)
+            Ly = int(Ly)
+            view_kwargs = {
+                "site_tag_id": getattr(tn, "_site_tag_id"),
+                "x_tag_id": getattr(tn, "_x_tag_id"),
+                "y_tag_id": getattr(tn, "_y_tag_id"),
+                "site_ind_id": getattr(tn, "_site_ind_id"),
+                "Lx": Lx,
+                "Ly": Ly,
+            }
+        except AttributeError:
+            return None
+
+        coords = []
+        for site in self.sites:
+            if not isinstance(site, tuple) or len(site) != 2:
+                return None
+            try:
+                x, y = int(site[0]), int(site[1])
+            except (TypeError, ValueError):
+                return None
+            if not (0 <= x < Lx and 0 <= y < Ly):
+                return None
+            coords.append((x, y))
+
+        return {
+            "Lx": Lx,
+            "Ly": Ly,
+            "coords": tuple(coords),
+            "view_kwargs": view_kwargs,
+        }
+
+    def _changed_axis_window(self, parent_config, target_config):
+        torch = _require_torch()
+        changed = torch.nonzero(parent_config != target_config, as_tuple=True)[0]
+        if changed.numel() == 0:
+            return None
+
+        geometry = self._boundary_geometry
+        coords = [geometry["coords"][int(i)] for i in changed.detach().cpu()]
+        xs = [coord[0] for coord in coords]
+        ys = [coord[1] for coord in coords]
+        radius = self.environment_radius
+        x0 = max(0, min(xs) - radius)
+        x1 = min(geometry["Lx"], max(xs) + radius + 1)
+        y0 = max(0, min(ys) - radius)
+        y1 = min(geometry["Ly"], max(ys) + radius + 1)
+
+        if (x1 - x0) <= (y1 - y0):
+            return "x", tuple(range(x0, x1))
+        return "y", tuple(range(y0, y1))
+
+    def _compute_boundary_environments(self, parent_tn, axis):
+        if axis == "x":
+            return parent_tn.compute_x_environments(
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                **self.contraction_opts,
+            )
+        return parent_tn.compute_y_environments(
+            max_bond=self.chi,
+            cutoff=self.cutoff,
+            **self.contraction_opts,
+        )
+
+    def _contract_axis_window(self, tn, target_config, axis, indices, envs, reference):
+        import quimb.tensor as qtn
+
+        target_tn = self._select_config(tn, target_config)
+        first = indices[0]
+        last = indices[-1]
+        if axis == "x":
+            tags = [tn.x_tag(i) for i in indices]
+            window_tn = target_tn.select(tags, which="any")
+            reuse_tn = envs[("xmin", first)] | window_tn | envs[("xmax", last)]
+            reuse_tn.view_as_(
+                qtn.PEPS,
+                **self._boundary_geometry["view_kwargs"],
+            )
+            reuse_tn.contract_boundary_from_xmin_(
+                xrange=[first, last + 1],
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                **self.contraction_opts,
+            )
+        else:
+            tags = [tn.y_tag(i) for i in indices]
+            window_tn = target_tn.select(tags, which="any")
+            reuse_tn = envs[("ymin", first)] | window_tn | envs[("ymax", last)]
+            reuse_tn.view_as_(
+                qtn.PEPS,
+                **self._boundary_geometry["view_kwargs"],
+            )
+            reuse_tn.contract_boundary_from_ymin_(
+                yrange=[first, last + 1],
+                max_bond=self.chi,
+                cutoff=self.cutoff,
+                **self.contraction_opts,
+            )
+        return _as_torch_scalar(reuse_tn.contract(all), reference)
+
+    def connected_amplitudes(
+        self,
+        configs,
+        amplitudes,
+        connections,
+        *,
+        chunk_size=None,
+        reuse_diagonal=True,
+    ):
+        """Evaluate connected amplitudes with parent boundary environments."""
+        torch = _require_torch()
+        configs = _as_long_matrix(configs)
+        amplitudes = torch.as_tensor(amplitudes, device=configs.device)
+        if connections.configs.numel() == 0:
+            self.last_connected_reuse_stats = {
+                "num_diagonal": 0,
+                "num_reused": 0,
+                "num_fallback": 0,
+            }
+            return torch.empty(0, dtype=amplitudes.dtype, device=configs.device)
+
+        if self.contraction != "boundary" or self._boundary_geometry is None:
+            num_diagonal = (
+                int(_diagonal_connection_mask(configs, connections).sum().item())
+                if reuse_diagonal
+                else 0
+            )
+            result = super().connected_amplitudes(
+                configs,
+                amplitudes,
+                connections,
+                chunk_size=chunk_size,
+                reuse_diagonal=reuse_diagonal,
+            )
+            self.last_connected_reuse_stats = {
+                "num_diagonal": num_diagonal,
+                "num_reused": 0,
+                "num_fallback": int(connections.configs.shape[0]) - num_diagonal,
+            }
+            return result
+
+        out = torch.empty(
+            connections.configs.shape[0],
+            dtype=amplitudes.dtype,
+            device=configs.device,
+        )
+        diag = (
+            _diagonal_connection_mask(configs, connections)
+            if reuse_diagonal
+            else torch.zeros(
+                connections.configs.shape[0],
+                dtype=torch.bool,
+                device=configs.device,
+            )
+        )
+        if bool(torch.any(diag)):
+            out[diag] = amplitudes[connections.batch_ids[diag]]
+
+        tn = self._unpack_tn()
+        reference = self._reference_tensor()
+        env_cache = {}
+        stats = {
+            "num_diagonal": int(diag.sum().item()),
+            "num_reused": 0,
+            "num_fallback": 0,
+        }
+
+        offdiag = (~diag).nonzero(as_tuple=True)[0]
+        for conn_idx_tensor in offdiag:
+            conn_idx = int(conn_idx_tensor)
+            parent_idx = int(connections.batch_ids[conn_idx].item())
+            parent_config = configs[parent_idx]
+            target_config = connections.configs[conn_idx]
+            window = self._changed_axis_window(parent_config, target_config)
+            if window is None:
+                out[conn_idx] = self._contract_value(
+                    self._select_config(tn, target_config),
+                    reference,
+                )
+                stats["num_fallback"] += 1
+                continue
+
+            axis, indices = window
+            cache_key = (parent_idx, axis)
+            try:
+                envs = env_cache[cache_key]
+            except KeyError:
+                parent_tn = self._select_config(tn, parent_config)
+                envs = self._compute_boundary_environments(parent_tn, axis)
+                env_cache[cache_key] = envs
+
+            try:
+                out[conn_idx] = self._contract_axis_window(
+                    tn,
+                    target_config,
+                    axis,
+                    indices,
+                    envs,
+                    reference,
+                )
+                stats["num_reused"] += 1
+            except (
+                AttributeError,
+                KeyError,
+                NotImplementedError,
+                TypeError,
+                ValueError,
+            ):
+                out[conn_idx] = self._contract_value(
+                    self._select_config(tn, target_config),
+                    reference,
+                )
+                stats["num_fallback"] += 1
+
+        self.last_connected_reuse_stats = stats
+        return out
 
 
 def make_torch_peps_amplitude_model(peps, **kwargs):
