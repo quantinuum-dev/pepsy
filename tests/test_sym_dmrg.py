@@ -215,6 +215,89 @@ def test_symdmrg2_initial_energy_can_be_disabled_or_lazy(monkeypatch):
     assert opt.summary()["initial_energy_computed"] is True
 
 
+def test_symdmrg2_product_init_gets_default_bond_ramp():
+    """Product-like initial states should grow gently when only chi is supplied."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=1,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=8,
+        cutoff=1e-10,
+        compute_initial_energy=False,
+    )
+
+    summary = opt.summary()
+    assert summary["initial_state_max_bond"] == 1
+    assert summary["bond_dims"] == (1, 2, 4, 8)
+    assert summary["bond_dim_schedule_mode"] == "auto_product_ramp"
+    assert summary["chi"] == 8
+
+
+def test_symdmrg2_rich_init_keeps_constant_bond_dim_by_default():
+    """A user-provided rich random state should be canonicalized, not replaced."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=3,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=8,
+        cutoff=1e-10,
+        compute_initial_energy=False,
+        profile=True,
+    )
+
+    summary = opt.summary()
+    assert summary["initial_state_max_bond"] == 3
+    assert summary["bond_dims"] == (8,)
+    assert summary["bond_dim_schedule_mode"] == "constant"
+    assert summary["init_canonicalized"] is True
+    assert any(
+        event["phase"] == "canonize" and event["direction"] == "right"
+        for event in opt.profile_diagnostics
+    )
+
+
+def test_symdmrg2_explicit_auto_and_manual_bond_schedules_win():
+    """Callers can still request either an auto ramp or an exact manual schedule."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=3,
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=8,
+        bond_dims="auto",
+        cutoff=1e-10,
+        compute_initial_energy=False,
+    )
+    assert opt.summary()["bond_dims"] == (1, 2, 4, 8)
+    assert opt.summary()["bond_dim_schedule_mode"] == "auto_ramp"
+
+    opt.solve(bond_dims="auto", chi=6, max_sweeps=4, sweep_sequence="R", tol=0.0)
+    assert opt.summary()["bond_dims"] == (1, 2, 4, 6)
+    assert opt.summary()["bond_dim_schedule_mode"] == "auto_ramp"
+
+    opt.solve(bond_dims=[3, 5], max_sweeps=1, sweep_sequence="R", tol=0.0)
+    assert opt.summary()["bond_dims"] == (3, 5)
+    assert opt.summary()["bond_dim_schedule_mode"] == "explicit"
+    assert opt.summary()["chi"] == 3
+
+
 def test_symdmrg2_solves_longer_chain_with_effective_norm():
     """L>2 uses H and N environments for a safe dense reference sweep."""
     pytest.importorskip("symmray")

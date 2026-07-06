@@ -483,6 +483,54 @@ def _positive_int_sequence(values, *, name):
     return out
 
 
+def _is_auto_bond_dim_schedule(value):
+    if not isinstance(value, (str, bytes)):
+        return False
+    key = str(value).strip().lower().replace("-", "_")
+    return key in {
+        "auto",
+        "ramp",
+        "auto_ramp",
+        "product_ramp",
+        "grow",
+        "growth",
+        "anneal",
+    }
+
+
+def _bond_dim_ramp(target):
+    target = int(target)
+    if target < 1:
+        raise ValueError("chi must be a positive integer.")
+    base = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
+    dims = [dim for dim in base if dim <= target]
+    if not dims or dims[-1] != target:
+        dims.append(target)
+    return tuple(dims)
+
+
+def _state_max_bond(state):
+    state = _unwrap_state(state)
+    if state is None:
+        return None
+    max_bond = getattr(state, "max_bond", None)
+    if callable(max_bond):
+        try:
+            return int(max_bond())
+        except Exception:  # pragma: no cover - best-effort metadata only
+            return None
+    chi = getattr(state, "chi", None)
+    if chi is not None:
+        try:
+            return int(max(chi, default=1))
+        except TypeError:
+            try:
+                return int(chi)
+            except Exception:  # pragma: no cover - best-effort metadata only
+                return None
+    return None
+
+
 def _normalize_verbosity(verbosity, *, progbar=None):
     if verbosity is None:
         verbosity = 0
@@ -1089,6 +1137,12 @@ class SymDMRG2:
         SVD truncation cutoff.
     sweeps
         Default number of DMRG sweeps for :meth:`solve`.
+    auto_bond_ramp
+        When ``True`` and no explicit ``bond_dims`` schedule is supplied,
+        product-like initial states (current maximum bond dimension ``<= 1``)
+        are grown through Pepsy's gentle automatic bond-dimension ramp up to
+        ``chi``. Explicit ``bond_dims`` still takes precedence, and
+        ``bond_dims="auto"`` requests the same ramp directly.
     total_charge
         Fixed global charge sector. If omitted, Pepsy tries to infer this from
         ``init_mps.overall_charge()``.
@@ -1210,6 +1264,10 @@ class SymDMRG2:
         ``mixer_amplitude * mixer_decay**s`` while active.
     mixer_bond_dim
         Reserved compatibility option for older mixer sector-expansion runs.
+    canonicalize_init
+        Canonicalize the copied Symmray initial MPS once during construction
+        before local environments are built. This gives raw random initial
+        states orthonormal Schmidt bases without replacing the user's state.
     compute_initial_energy
         ``True`` preserves the historical eager initial-energy estimate.
         ``False`` skips it. ``"lazy"`` defers the estimate until
@@ -1227,6 +1285,7 @@ class SymDMRG2:
         sweeps=4,
         bond_dims=None,
         cutoffs=None,
+        auto_bond_ramp=True,
         p0=None,
         total_charge=None,
         backend="auto",
@@ -1267,13 +1326,15 @@ class SymDMRG2:
         mixer_decay=0.5,
         mixer_disable_after=15,
         mixer_bond_dim=None,
+        canonicalize_init=True,
         profile=False,
         compute_initial_energy=True,
         dmrg_opts=None,
     ):
         if init_mps is None and p0 is not None:
             init_mps = p0
-        if bond_dims is not None:
+        bond_dims_input = bond_dims
+        if bond_dims is not None and not _is_auto_bond_dim_schedule(bond_dims):
             chi = _sequence_tuple(bond_dims, name="bond_dims")[0]
         elif chi is None:
             chi = 32
@@ -1290,6 +1351,7 @@ class SymDMRG2:
         self.chi = int(chi)
         self.cutoff = float(cutoff)
         self.sweeps = int(sweeps)
+        self.auto_bond_ramp = bool(auto_bond_ramp)
         self.total_charge = total_charge if total_charge is not None else _infer_total_charge(init_mps)
         self.which = which
         self.tol = float(tol)
@@ -1365,6 +1427,11 @@ class SymDMRG2:
         self.mixer_bond_dim = (
             None if mixer_bond_dim is None else int(mixer_bond_dim)
         )
+        self.canonicalize_init = bool(canonicalize_init)
+        self.init_canonicalized = False
+        self.init_canonicalization_skipped_reason = None
+        self.initial_state_max_bond = _state_max_bond(self.mps)
+        self.bond_dim_schedule_mode = None
         self.profile = bool(profile)
         self.initial_energy_mode = _normalize_initial_energy_mode(
             compute_initial_energy
@@ -1467,7 +1534,6 @@ class SymDMRG2:
             "bond_compress_method": "svd",
             "bond_compress_cutoff_mode": "rel",
         }
-        self._set_bond_dim_seq(self.chi if bond_dims is None else bond_dims)
         self._set_cutoff_seq(self.cutoff if cutoffs is None else cutoffs)
         self._set_local_eig_ncv_seq(self._local_eig_ncv_input)
 
@@ -1475,6 +1541,14 @@ class SymDMRG2:
             self._state = self._prepare_symmray_state(self.mps)
             self.mps = self._state
             self._validate_obc_chain()
+            if self.canonicalize_init:
+                self._canonicalize_initial_state()
+            self.initial_state_max_bond = _state_max_bond(self._state)
+        bond_dims_resolved, bond_dims_mode = self._resolve_bond_dim_schedule(
+            bond_dims_input,
+            target_chi=self.chi,
+        )
+        self._set_bond_dim_seq(bond_dims_resolved, mode=bond_dims_mode)
 
     @property
     def state(self):
@@ -1718,11 +1792,39 @@ class SymDMRG2:
             "num_missing_truncation_errors": int(missing_errors),
         }
 
-    def _set_bond_dim_seq(self, bond_dims):
+    def _resolve_bond_dim_schedule(self, bond_dims, *, target_chi):
+        if _is_auto_bond_dim_schedule(bond_dims):
+            return _bond_dim_ramp(target_chi), "auto_ramp"
+        if bond_dims is not None:
+            return _positive_int_sequence(bond_dims, name="bond_dims"), "explicit"
+        if (
+            self.auto_bond_ramp
+            and self.initial_state_max_bond is not None
+            and self.initial_state_max_bond <= 1
+            and int(target_chi) > 1
+        ):
+            return _bond_dim_ramp(target_chi), "auto_product_ramp"
+        return (int(target_chi),), "constant"
+
+    def _set_bond_dim_seq(self, bond_dims, *, mode=None):
         bond_dims = _positive_int_sequence(bond_dims, name="bond_dims")
         self.bond_dims = bond_dims
         self._bond_dim0 = bond_dims[0]
         self._bond_dims = itertools.chain(bond_dims, itertools.repeat(bond_dims[-1]))
+        if mode is not None:
+            self.bond_dim_schedule_mode = str(mode)
+
+    def _fit_auto_bond_dim_schedule_to_sweeps(self, max_sweeps):
+        if self.bond_dim_schedule_mode not in {"auto_ramp", "auto_product_ramp"}:
+            return
+        max_sweeps = int(max_sweeps)
+        if max_sweeps >= len(self.bond_dims):
+            return
+        if max_sweeps < 3:
+            dims = (self.chi,)
+        else:
+            dims = tuple(self.bond_dims[:max_sweeps - 1]) + (self.chi,)
+        self._set_bond_dim_seq(dims, mode=self.bond_dim_schedule_mode)
 
     def _set_cutoff_seq(self, cutoffs):
         cutoffs = tuple(
@@ -4785,6 +4887,17 @@ class SymDMRG2:
         )
         return True
 
+    def _canonicalize_initial_state(self):
+        canonized = self._canonize_for_sweep("right")
+        self.init_canonicalized = bool(canonized)
+        if canonized:
+            self.init_canonicalization_skipped_reason = None
+            return True
+        self.init_canonicalization_skipped_reason = "right_canonize_unavailable"
+        self._force_norm_check_after_skipped_canonize = True
+        self._force_norm_check_reason = self.init_canonicalization_skipped_reason
+        return False
+
     def _symmray_sweep_direction(
         self,
         direction,
@@ -5223,13 +5336,25 @@ class SymDMRG2:
         verbosity = _normalize_verbosity(verbosity, progbar=progbar)
         _raise_unexpected_kwargs("SymDMRG2.solve", solve_opts)
         tol = self.tol if tol is None else float(tol)
+        bond_dims_from_chi = False
         if bond_dims is None and chi is not None:
-            bond_dims = chi
+            bond_dims_from_chi = True
+            bond_dims = None
+            chi = int(chi)
+        else:
+            chi = self.chi if chi is None else int(chi)
         if cutoffs is None and cutoff is not None:
             cutoffs = cutoff
-        if bond_dims is not None:
-            self._set_bond_dim_seq(bond_dims)
-            self.chi = self.bond_dims[0]
+        if bond_dims is not None or bond_dims_from_chi:
+            target_chi = chi
+            if bond_dims is not None and not _is_auto_bond_dim_schedule(bond_dims):
+                target_chi = _sequence_tuple(bond_dims, name="bond_dims")[0]
+            bond_dims_resolved, bond_dims_mode = self._resolve_bond_dim_schedule(
+                bond_dims,
+                target_chi=target_chi,
+            )
+            self._set_bond_dim_seq(bond_dims_resolved, mode=bond_dims_mode)
+            self.chi = int(target_chi)
         if cutoffs is not None:
             self._set_cutoff_seq(cutoffs)
             self.cutoff = self.cutoffs[0]
@@ -5239,6 +5364,8 @@ class SymDMRG2:
         max_sweeps = int(max_sweeps)
         if max_sweeps < 1:
             raise ValueError("max_sweeps must be a positive integer.")
+        if bond_dims is None or _is_auto_bond_dim_schedule(bond_dims):
+            self._fit_auto_bond_dim_schedule_to_sweeps(max_sweeps)
 
         if self.backend == "quimb":
             return self._solve_quimb(
@@ -5268,6 +5395,8 @@ class SymDMRG2:
             "chi": self.chi,
             "cutoff": self.cutoff,
             "bond_dims": self.bond_dims,
+            "bond_dim_schedule_mode": self.bond_dim_schedule_mode,
+            "auto_bond_ramp": self.auto_bond_ramp,
             "cutoffs": self.cutoffs,
             "default_sweep_sequence": self.opts["default_sweep_sequence"],
             "norm_rcond": self.norm_rcond,
@@ -5311,6 +5440,12 @@ class SymDMRG2:
             "mixer_disable_after": self.mixer_disable_after,
             "mixer_bond_dim": self.mixer_bond_dim,
             "active_mixer_amplitude": self._active_mixer_amplitude(),
+            "canonicalize_init": self.canonicalize_init,
+            "init_canonicalized": self.init_canonicalized,
+            "init_canonicalization_skipped_reason": (
+                self.init_canonicalization_skipped_reason
+            ),
+            "initial_state_max_bond": self.initial_state_max_bond,
             "profile": self.profile,
             "projected_problem_cache_hits": int(self.projected_problem_cache_hits),
             "projected_problem_cache_misses": int(self.projected_problem_cache_misses),
