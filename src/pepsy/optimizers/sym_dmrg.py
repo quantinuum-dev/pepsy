@@ -1196,18 +1196,20 @@ class SymDMRG2:
         enrichment.
     mixer
         Optional Symmray Hamiltonian-aware subspace-expansion mixer. ``"none"``
-        keeps the historical behavior. ``"subspace"`` expands virtual charge
-        maps with zero-valued legal sectors before active sweeps, then injects
-        an orthogonalized ``H_eff`` direction into each optimized two-site
-        theta before the SVD writeback. ``"density_matrix"`` is accepted as an
-        alias for this first subspace-expansion mixer.
+        keeps the historical behavior. ``"subspace"`` uses an orthogonalized
+        ``H_eff`` direction to choose an expanded SVD basis while preserving
+        the optimized two-site theta up to truncation. If the target sweep
+        bond dimension exceeds the current MPS bond dimension, the existing
+        deterministic variational-sector basis still opens legal charge sectors
+        before the sweep.
+        ``"density_matrix"`` is accepted as an alias for this Hubig/TeNPy-style
+        SVD-basis mixer.
     mixer_amplitude, mixer_decay, mixer_disable_after
         Initial mixer amplitude, per-sweep decay factor, and optional sweep
         index at which to disable the mixer. The amplitude at sweep ``s`` is
         ``mixer_amplitude * mixer_decay**s`` while active.
     mixer_bond_dim
-        Bond-sector budget for mixer sector expansion. Defaults to the current
-        sweep's maximum bond dimension.
+        Reserved compatibility option for older mixer sector-expansion runs.
     compute_initial_energy
         ``True`` preserves the historical eager initial-energy estimate.
         ``False`` skips it. ``"lazy"`` defers the estimate until
@@ -1263,7 +1265,7 @@ class SymDMRG2:
         mixer="none",
         mixer_amplitude=1e-4,
         mixer_decay=0.5,
-        mixer_disable_after=None,
+        mixer_disable_after=15,
         mixer_bond_dim=None,
         profile=False,
         compute_initial_energy=True,
@@ -2434,24 +2436,10 @@ class SymDMRG2:
     def _should_apply_mixer(self, sweep=None):
         return self._active_mixer_amplitude(sweep) > 0.0
 
-    def _prepare_mixer_sweep(self, *, sweep, max_bond):
-        amplitude = self._active_mixer_amplitude(sweep)
-        if amplitude <= 0.0:
-            return None
-        bond_dim = self.mixer_bond_dim if self.mixer_bond_dim is not None else max_bond
-        diagnostic = self._expand_sector_chargemaps(
-            bond_dim=bond_dim,
-            noise=0.0,
-            mode=self.mixer,
-            sweep=sweep,
-            profile_phase="mixer_sector_expansion",
-        )
-        if diagnostic is None:
-            return None
-        diagnostic["kind"] = "sector_expansion"
-        diagnostic["amplitude"] = float(amplitude)
-        self.mixer_diagnostics.append(diagnostic)
-        return diagnostic
+    def _mixer_needs_variational_sector_basis(self, max_bond):
+        if self.backend != "symmray" or self.mixer == "none":
+            return True
+        return int(self._state.max_bond()) < int(max_bond)
 
     def _record_mixer_local_diagnostic(self, diagnostic):
         self.mixer_diagnostics.append(diagnostic)
@@ -2467,78 +2455,212 @@ class SymDMRG2:
         )
         return diagnostic
 
-    def _apply_subspace_mixer(self, site, theta, energy):
-        amplitude = self._active_mixer_amplitude()
-        if amplitude <= 0.0:
-            return theta
-
-        profile_start = self._profile_start()
-        right_site = site + 1
-        diagnostic = {
-            "kind": "local_subspace",
-            "mode": self.mixer,
-            "sweep": len(self.energies),
-            "site": int(site),
-            "right_site": int(right_site),
-            "direction": self._current_sweep_direction,
-            "amplitude": float(amplitude),
-            "energy": float(energy),
-            "applied": False,
-            "_profile_start": profile_start,
+    @staticmethod
+    def _scale_block_data(data, scale):
+        blocks = {
+            sector: np.asarray(_to_numpy(block) * scale)
+            for sector, block in getattr(data, "blocks", {}).items()
         }
+        return type(data)(
+            indices=data.indices,
+            charge=data.charge,
+            blocks=blocks,
+            symmetry=data.symmetry,
+        )
 
+    def _mixer_drive_theta(self, site, theta, amplitude):
         source_theta = self._last_local_input_theta
         if source_theta is None:
-            diagnostic["reason"] = "missing_source_theta"
-            self._record_mixer_local_diagnostic(diagnostic)
-            return theta
+            return None, {"reason": "missing_source_theta"}
 
         space = self.two_site_theta_space(site, theta)
         try:
-            source_vector = space.flatten(source_theta)
+            theta_vector = space.flatten(theta)
+            drive_theta = self.two_site_matvec(site, source_theta)
+            drive_vector = space.flatten(drive_theta)
         except ValueError:
-            diagnostic["reason"] = "source_layout_mismatch"
-            self._record_mixer_local_diagnostic(diagnostic)
-            return theta
+            return None, {"reason": "source_layout_mismatch"}
 
-        theta_vector = space.flatten(theta)
-        drive_theta = self.two_site_matvec(site, source_theta)
-        drive_vector = space.flatten(drive_theta)
         theta_norm = float(np.linalg.norm(theta_vector))
-        source_norm = float(np.linalg.norm(source_vector))
-
+        drive_norm_initial = float(np.linalg.norm(drive_vector))
         denom = np.vdot(theta_vector, theta_vector)
         if abs(denom) > 0.0:
             drive_vector = drive_vector - theta_vector * (
                 np.vdot(theta_vector, drive_vector) / denom
             )
         drive_norm = float(np.linalg.norm(drive_vector))
-
-        diagnostic.update(
-            {
-                "theta_dim": int(space.dim),
-                "theta_num_blocks": len(space.metadata),
+        if drive_norm <= 0.0 or theta_norm <= 0.0:
+            return None, {
+                "reason": "zero_drive",
                 "theta_norm": theta_norm,
-                "source_norm": source_norm,
+                "drive_norm_initial": drive_norm_initial,
                 "drive_norm": drive_norm,
             }
-        )
-        if drive_norm <= 0.0 or theta_norm <= 0.0:
-            diagnostic["reason"] = "zero_drive"
-            self._record_mixer_local_diagnostic(diagnostic)
-            return theta
 
-        injected_vector = drive_vector * (amplitude * theta_norm / drive_norm)
-        mixed_theta = space.unflatten(theta_vector + injected_vector)
+        scale = np.sqrt(float(amplitude)) * theta_norm / drive_norm
+        drive_theta = space.unflatten(drive_vector)
+        drive_theta = _tensor_with_data(
+            drive_theta,
+            self._scale_block_data(drive_theta.data, scale),
+        )
+        return drive_theta, {
+            "theta_dim": int(space.dim),
+            "theta_num_blocks": len(space.metadata),
+            "theta_norm": theta_norm,
+            "drive_norm_initial": drive_norm_initial,
+            "drive_norm": drive_norm,
+            "expansion_norm": float(np.linalg.norm(drive_vector * scale)),
+            "scale": float(scale),
+        }
+
+    @staticmethod
+    def _expanded_chargemap(chargemap):
+        return {
+            charge: int(size) * 2
+            for charge, size in dict(chargemap).items()
+        }
+
+    def _stack_theta_with_drive_on_axis(self, theta, drive_theta, axis):
+        indices = list(theta.data.indices)
+        original_index = indices[axis]
+        indices[axis] = original_index.copy_with(
+            chargemap=self._expanded_chargemap(original_index.chargemap),
+        )
+
+        blocks = {}
+        for sector, block in theta.data.blocks.items():
+            if sector not in drive_theta.data.blocks:
+                raise ValueError("Mixer drive theta is missing an optimized theta block.")
+            theta_block = _to_numpy(block)
+            drive_block = _to_numpy(drive_theta.data.blocks[sector])
+            if theta_block.shape != drive_block.shape:
+                raise ValueError("Mixer drive theta block layout changed.")
+            shape = list(theta_block.shape)
+            old_size = int(shape[axis])
+            shape[axis] = 2 * old_size
+            stacked = np.zeros(shape, dtype=np.result_type(theta_block, drive_block))
+            original_slice = [slice(None)] * stacked.ndim
+            original_slice[axis] = slice(0, old_size)
+            drive_slice = [slice(None)] * stacked.ndim
+            drive_slice[axis] = slice(old_size, 2 * old_size)
+            stacked[tuple(original_slice)] = theta_block
+            stacked[tuple(drive_slice)] = drive_block
+            blocks[sector] = stacked
+
+        data = type(theta.data)(
+            indices=tuple(indices),
+            charge=theta.data.charge,
+            blocks=blocks,
+            symmetry=theta.data.symmetry,
+        )
+        return _tensor_with_data(theta, data), original_index
+
+    def _project_tensor_axis_to_index(self, tensor, ind, target_index):
+        axis = tensor.inds.index(ind)
+        indices = list(tensor.data.indices)
+        source_index = indices[axis]
+        if self._index_chargemap(source_index) == self._index_chargemap(target_index):
+            return tensor
+        indices[axis] = target_index
+        blocks = {}
+        for sector, block in tensor.data.blocks.items():
+            charge = sector[axis]
+            target_size = int(target_index.chargemap.get(charge, 0))
+            if target_size == 0:
+                continue
+            block_array = _to_numpy(block)
+            if block_array.shape[axis] < target_size:
+                raise ValueError(
+                    "Cannot project mixer-expanded tensor axis to a larger target index."
+                )
+            selector = [slice(None)] * block_array.ndim
+            selector[axis] = slice(0, target_size)
+            blocks[sector] = np.asarray(block_array[tuple(selector)])
+
+        data = type(tensor.data)(
+            indices=tuple(indices),
+            charge=tensor.data.charge,
+            blocks=blocks,
+            symmetry=tensor.data.symmetry,
+        )
+        return _tensor_with_data(tensor, data)
+
+    def _mixer_expansion_axis(self, site, theta, left_inds, direction):
+        right_site = site + 1
+        left_inds = tuple(left_inds)
+        if direction == "right":
+            candidates = [ind for ind in theta.inds if ind not in left_inds]
+            preferred = (
+                self._state.bond(right_site, right_site + 1)
+                if right_site < self._state.L - 1
+                else None
+            )
+        else:
+            candidates = [ind for ind in theta.inds if ind in left_inds]
+            preferred = (
+                self._state.bond(site - 1, site)
+                if site > 0
+                else None
+            )
+        if preferred in candidates:
+            return preferred, theta.inds.index(preferred)
+        if not candidates:
+            return None, None
+        ind = candidates[0]
+        return ind, theta.inds.index(ind)
+
+    def _prepare_svd_subspace_expansion(self, site, theta, *, left_inds, direction):
+        amplitude = self._active_mixer_amplitude()
+        right_site = site + 1
+        diagnostic = {
+            "kind": "svd_subspace",
+            "mode": self.mixer,
+            "sweep": len(self.energies),
+            "site": int(site),
+            "right_site": int(right_site),
+            "direction": direction,
+            "amplitude": float(amplitude),
+            "applied": False,
+            "_profile_start": self._profile_start(),
+        }
+        if amplitude <= 0.0:
+            diagnostic["reason"] = "inactive"
+            self._record_mixer_local_diagnostic(diagnostic)
+            return theta, None
+
+        expand_ind, axis = self._mixer_expansion_axis(site, theta, left_inds, direction)
+        if expand_ind is None:
+            diagnostic["reason"] = "no_expandable_axis"
+            self._record_mixer_local_diagnostic(diagnostic)
+            return theta, None
+
+        drive_theta, drive_diagnostic = self._mixer_drive_theta(site, theta, amplitude)
+        diagnostic.update(drive_diagnostic)
+        if drive_theta is None:
+            self._record_mixer_local_diagnostic(diagnostic)
+            return theta, None
+
+        expanded_theta, original_index = self._stack_theta_with_drive_on_axis(
+            theta,
+            drive_theta,
+            axis,
+        )
         diagnostic.update(
             {
                 "applied": True,
-                "injected_norm": float(np.linalg.norm(injected_vector)),
-                "mixed_norm": float(np.linalg.norm(theta_vector + injected_vector)),
+                "expanded_ind": expand_ind,
+                "expanded_axis": int(axis),
+                "expanded_theta_dim": self._theta_dim(expanded_theta),
+                "expanded_theta_blocks": len(expanded_theta.data.blocks),
             }
         )
         self._record_mixer_local_diagnostic(diagnostic)
-        return mixed_theta
+        return expanded_theta, {
+            "ind": expand_ind,
+            "original_index": original_index,
+            "side": "right" if direction == "right" else "left",
+            "diagnostic": diagnostic,
+        }
 
     def _dense_index_for_state_ind(self, ind):
         indices = [
@@ -4550,8 +4672,17 @@ class SymDMRG2:
             left_inds.append(self._state.bond(site - 1, site))
         left_inds.append(self._site_ind(site))
         absorb = "right" if direction == "right" else "left"
+        split_theta = theta
+        mixer_projection = None
+        if self._should_apply_mixer():
+            split_theta, mixer_projection = self._prepare_svd_subspace_expansion(
+                site,
+                theta,
+                left_inds=left_inds,
+                direction=direction,
+            )
         split_info = {}
-        left_tensor, right_tensor = theta.split(
+        left_tensor, right_tensor = split_theta.split(
             left_inds=left_inds,
             method=method,
             absorb=absorb,
@@ -4563,6 +4694,19 @@ class SymDMRG2:
             rtags=self._state[right_site].tags,
             info=split_info,
         )
+        if mixer_projection is not None:
+            if mixer_projection["side"] == "right":
+                right_tensor = self._project_tensor_axis_to_index(
+                    right_tensor,
+                    mixer_projection["ind"],
+                    mixer_projection["original_index"],
+                )
+            else:
+                left_tensor = self._project_tensor_axis_to_index(
+                    left_tensor,
+                    mixer_projection["ind"],
+                    mixer_projection["original_index"],
+                )
         truncation_error = _optional_float(split_info.get("error"))
         self._state[site].modify(data=left_tensor.data, inds=left_tensor.inds)
         self._state[right_site].modify(data=right_tensor.data, inds=right_tensor.inds)
@@ -4577,6 +4721,7 @@ class SymDMRG2:
                 "chi": int(chi),
                 "cutoff": float(cutoff),
                 "truncation_error": truncation_error,
+                "mixer_svd_expansion": mixer_projection is not None,
                 **optimized_theta_summary,
                 "left": self._svd_bond_summary(self._state[site], bond),
                 "right": self._svd_bond_summary(self._state[right_site], bond),
@@ -4593,6 +4738,7 @@ class SymDMRG2:
             left_bond_dim=int(self.svd_diagnostics[-1]["left"]["bond_dim"]),
             right_bond_dim=int(self.svd_diagnostics[-1]["right"]["bond_dim"]),
             truncation_error=truncation_error,
+            mixer_svd_expansion=mixer_projection is not None,
         )
         return self._state[site], self._state[right_site]
 
@@ -4718,7 +4864,6 @@ class SymDMRG2:
             for site in sweep:
                 last_energy, theta = self.local_eigensolve(site)
                 local_ens.append(float(last_energy))
-                theta = self._apply_subspace_mixer(site, theta, last_energy)
                 self._replace_two_site_theta(
                     site,
                     theta,
@@ -4996,17 +5141,10 @@ class SymDMRG2:
                     )
                 else:
                     enrichment_diagnostic = None
-                if self._should_apply_mixer(sweep_num):
-                    mixer_diagnostic = self._prepare_mixer_sweep(
-                        sweep=sweep_num,
-                        max_bond=max_bond,
-                    )
-                else:
-                    mixer_diagnostic = None
-                if enrichment_diagnostic is None and mixer_diagnostic is None:
-                    prepare_variational_basis = True
-                else:
-                    prepare_variational_basis = False
+                prepare_variational_basis = (
+                    enrichment_diagnostic is None
+                    and self._mixer_needs_variational_sector_basis(max_bond)
+                )
 
                 self._print_pre_sweep(
                     sweep_num,
@@ -5015,10 +5153,7 @@ class SymDMRG2:
                     cutoff,
                     verbosity=verbosity,
                 )
-                pre_sweep_mutated = (
-                    enrichment_diagnostic is not None
-                    or mixer_diagnostic is not None
-                )
+                pre_sweep_mutated = enrichment_diagnostic is not None
                 canonize = (
                     pre_sweep_mutated
                     or direction + previous_direction not in {"LR", "RL"}

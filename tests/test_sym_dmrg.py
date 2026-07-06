@@ -2025,11 +2025,10 @@ def test_symdmrg2_subspace_mixer_reaches_ed_from_narrow_initial_support():
     )
     opt.solve(tol=0.0, max_sweeps=2, sweep_sequence="RL")
 
-    expansion = opt.mixer_diagnostics[0]
     local_mixer = [
         diagnostic
         for diagnostic in opt.mixer_diagnostics
-        if diagnostic["kind"] == "local_subspace"
+        if diagnostic["kind"] == "svd_subspace"
     ]
     summary = opt.summary()
 
@@ -2040,14 +2039,17 @@ def test_symdmrg2_subspace_mixer_reaches_ed_from_narrow_initial_support():
     assert summary["num_mixer_diagnostics"] == len(opt.mixer_diagnostics)
     assert summary["last_mixer_diagnostic"] == opt.last_mixer_diagnostic
     assert summary["active_mixer_amplitude"] == 0.0
-    assert expansion["kind"] == "sector_expansion"
-    assert expansion["mode"] == "subspace_expansion"
-    assert expansion["noise"] == 0.0
-    assert expansion["amplitude"] == pytest.approx(1e-8)
-    assert expansion["added_blocks"] > 0
+    assert len(opt.variational_sector_diagnostics) >= 1
+    assert all(
+        diagnostic["kind"] == "svd_subspace"
+        for diagnostic in opt.mixer_diagnostics
+    )
     assert len(local_mixer) == 3
     assert all(diagnostic["applied"] for diagnostic in local_mixer)
-    assert all(diagnostic["injected_norm"] > 0.0 for diagnostic in local_mixer)
+    assert all(diagnostic["mode"] == "subspace_expansion" for diagnostic in local_mixer)
+    assert all(diagnostic["amplitude"] == pytest.approx(1e-8) for diagnostic in local_mixer)
+    assert all(diagnostic["expansion_norm"] > 0.0 for diagnostic in local_mixer)
+    assert all(diagnostic["expanded_theta_dim"] > diagnostic["theta_dim"] for diagnostic in local_mixer)
     assert {diagnostic["sweep"] for diagnostic in local_mixer} == {0}
 
 
