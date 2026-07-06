@@ -20,6 +20,8 @@ _SYMBOL_MODULES = {
     "TorchConnections": ".torch",
     "TorchMetropolisResult": ".torch",
     "TorchPEPSAmplitude": ".torch",
+    "TorchVMCDriver": ".torch",
+    "TorchVMCStepResult": ".torch",
     "TorchSRResult": ".torch",
     "TorchSquareLattice": ".torch",
     "apply_torch_sr_update": ".torch",

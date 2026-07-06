@@ -8,6 +8,8 @@ torch = pytest.importorskip("torch")
 from pepsy.vmc.torch import (  # noqa: E402
     FermionSiteEncoding,
     TorchPEPSAmplitude,
+    TorchVMCDriver,
+    TorchVMCStepResult,
     TorchSquareLattice,
     apply_torch_sr_update,
     count_spinful_particles,
@@ -35,6 +37,15 @@ class ProductAmplitude(torch.nn.Module):
 
     def forward(self, configs):
         return self.weights[configs].prod(dim=1)
+
+
+class CountingAmplitude:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, configs):
+        self.calls.append(configs.detach().clone())
+        return torch.ones(configs.shape[0], dtype=torch.float64, device=configs.device)
 
 
 def test_fermion_site_encoding_supports_symmray_and_vmc_torch_orders():
@@ -224,6 +235,73 @@ def test_torch_peps_amplitude_supports_sr_kernel():
     assert log_derivatives.shape == (2, model.n_params)
     assert result.direction.shape == (model.n_params,)
     assert torch.isfinite(result.direction).all()
+
+
+def test_local_energy_reuses_diagonal_connections_and_chunks_offdiagonal():
+    configs = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+    amps = torch.ones(2, dtype=torch.float64)
+    conn = heisenberg_connections(configs, [(0, 1)], J=1.0)
+    amplitude = CountingAmplitude()
+
+    energy = local_energy_from_connections(
+        configs,
+        amps,
+        conn,
+        amplitude,
+        chunk_size=1,
+    )
+
+    assert torch.allclose(energy, torch.tensor([0.25, 0.25], dtype=torch.float64))
+    assert [tuple(call.shape) for call in amplitude.calls] == [(1, 2), (1, 2)]
+
+
+def test_torch_vmc_driver_runs_sampling_and_energy_estimate():
+    model = ProductAmplitude()
+    configs = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+    driver = TorchVMCDriver(
+        model,
+        [(0, 1)],
+        configs,
+        connection_fn="heisenberg",
+        proposal="spin",
+        chunk_size=1,
+        generator=torch.Generator().manual_seed(3),
+    )
+
+    result = driver.step()
+
+    assert isinstance(result, TorchVMCStepResult)
+    assert result.configs.shape == configs.shape
+    assert result.amplitudes.shape == (2,)
+    assert result.local_energies.shape == (2,)
+    assert result.n_proposed == 2
+    assert result.n_accepted == 2
+    assert result.acceptance_rate == 1.0
+    assert torch.isfinite(result.energy_mean)
+    assert torch.isfinite(result.energy_variance)
+
+
+def test_torch_vmc_driver_can_apply_sr_update():
+    model = ProductAmplitude()
+    configs = torch.tensor([[0, 0], [0, 1]], dtype=torch.long)
+    before = model.weights.detach().clone()
+    driver = TorchVMCDriver(
+        model,
+        [(0, 1)],
+        configs,
+        connection_fn="transverse_ising",
+        connection_kwargs={"J": 1.0, "h": 1.0},
+        proposal="spin",
+        chunk_size=1,
+        generator=torch.Generator().manual_seed(4),
+    )
+
+    result = driver.step(sr=True, learning_rate=0.05, sr_diag_shift=1.0e-2)
+
+    assert result.sr is not None
+    assert result.sr.direction.shape == (2,)
+    assert not torch.allclose(model.weights.detach(), before)
+    assert torch.allclose(driver.amplitudes, model(driver.configs))
 
 
 def _symmray_site_charge(symmetry):

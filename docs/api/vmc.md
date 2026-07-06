@@ -109,6 +109,33 @@ sr = pvmc.solve_torch_sr(
 pvmc.apply_torch_sr_update(model, sr.direction, learning_rate=0.02)
 ```
 
+For a compact no-JIT torch loop, `TorchVMCDriver` keeps walker configurations,
+current amplitudes, Hamiltonian connection metadata, sampling, local-energy
+evaluation, and optional SR updates together. Local-energy evaluation reuses
+diagonal connected amplitudes and supports chunked off-diagonal amplitude
+calls; PEPS-specific boundary-environment reuse can be plugged in by
+specializing the model's `connected_amplitudes(...)` method.
+
+```python
+driver = pvmc.TorchVMCDriver(
+    model,
+    graph,
+    configs,
+    connection_fn="fermi_hubbard",
+    connection_kwargs={"t": 1.0, "U": 8.0, "encoding": encoding},
+    proposal="spinful",
+    hopping_rate=0.25,
+    chunk_size=64,
+)
+
+result = driver.step(
+    sr=True,
+    learning_rate=0.02,
+    sr_diag_shift=1e-3,
+)
+print(result.energy_mean, result.acceptance_rate)
+```
+
 The torch PEPS wrapper is validated for dense quimb PEPS and Symmray
 block-sparse fermionic PEPS. Symmray tensors are packed through their own
 `to_pytree` / `from_pytree` metadata via `quimb.tensor.pack`, then the numeric

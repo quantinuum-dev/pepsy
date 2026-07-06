@@ -16,6 +16,8 @@ __all__ = [
     "TorchPEPSAmplitude",
     "TorchConnections",
     "TorchMetropolisResult",
+    "TorchVMCDriver",
+    "TorchVMCStepResult",
     "TorchSRResult",
     "TorchSquareLattice",
     "apply_torch_sr_update",
@@ -137,6 +139,85 @@ def _as_torch_scalar(value, reference):
     if reference is None:
         return torch.as_tensor(value)
     return torch.as_tensor(value, dtype=reference.dtype, device=reference.device)
+
+
+def _normalize_chunk_size(chunk_size, *, name="chunk_size"):
+    if chunk_size is None:
+        return None
+    return _check_positive_int(name, chunk_size)
+
+
+def _call_amplitude_fn(amplitude_fn, configs, *, chunk_size=None):
+    """Evaluate ``amplitude_fn`` on ``configs``, optionally in chunks."""
+    torch = _require_torch()
+    configs = _as_long_matrix(configs)
+    chunk_size = _normalize_chunk_size(chunk_size)
+    if chunk_size is None or configs.shape[0] <= chunk_size:
+        return torch.as_tensor(amplitude_fn(configs), device=configs.device)
+
+    pieces = []
+    for start in range(0, configs.shape[0], chunk_size):
+        stop = min(start + chunk_size, configs.shape[0])
+        pieces.append(torch.as_tensor(
+            amplitude_fn(configs[start:stop]),
+            device=configs.device,
+        ))
+    return torch.cat(pieces, dim=0)
+
+
+def _diagonal_connection_mask(configs, connections):
+    torch = _require_torch()
+    if connections.configs.numel() == 0:
+        return torch.zeros(0, dtype=torch.bool, device=configs.device)
+    parents = configs[connections.batch_ids]
+    return torch.all(connections.configs == parents, dim=1)
+
+
+def _default_connected_amplitudes(
+    configs,
+    amplitudes,
+    connections,
+    amplitude_fn,
+    *,
+    chunk_size=None,
+    reuse_diagonal=True,
+):
+    """Evaluate connected amplitudes, copying diagonal terms when possible."""
+    torch = _require_torch()
+    configs = _as_long_matrix(configs)
+    amplitudes = torch.as_tensor(amplitudes, device=configs.device)
+    if connections.configs.numel() == 0:
+        return torch.empty(0, dtype=amplitudes.dtype, device=configs.device)
+
+    if not reuse_diagonal:
+        return _call_amplitude_fn(
+            amplitude_fn,
+            connections.configs,
+            chunk_size=chunk_size,
+        )
+
+    diag = _diagonal_connection_mask(configs, connections)
+    if not bool(torch.any(diag)):
+        return _call_amplitude_fn(
+            amplitude_fn,
+            connections.configs,
+            chunk_size=chunk_size,
+        )
+
+    out = torch.empty(
+        connections.configs.shape[0],
+        dtype=amplitudes.dtype,
+        device=configs.device,
+    )
+    out[diag] = amplitudes[connections.batch_ids[diag]]
+    offdiag = ~diag
+    if bool(torch.any(offdiag)):
+        out[offdiag] = _call_amplitude_fn(
+            amplitude_fn,
+            connections.configs[offdiag],
+            chunk_size=chunk_size,
+        ).to(dtype=out.dtype, device=out.device)
+    return out
 
 
 class TorchPEPSAmplitude:
@@ -368,9 +449,19 @@ class TorchPEPSAmplitude:
         reference = self._reference_tensor(params)
         return self._contract_value(self._select_config(tn, config), reference)
 
-    def forward(self, configs, params=None):
+    def forward(self, configs, params=None, *, chunk_size=None):
         """Evaluate a batch of configuration amplitudes."""
         configs = _as_long_matrix(configs)
+        chunk_size = _normalize_chunk_size(chunk_size)
+        if chunk_size is not None and configs.shape[0] > chunk_size:
+            return _require_torch().cat([
+                self.forward(
+                    configs[start:start + chunk_size],
+                    params=params,
+                    chunk_size=None,
+                )
+                for start in range(0, configs.shape[0], chunk_size)
+            ])
         tn = self._unpack_tn(params)
         reference = self._reference_tensor(params)
         return _require_torch().stack([
@@ -395,9 +486,33 @@ class TorchPEPSAmplitude:
         torch = _require_torch()
         return torch.stack(phases), torch.stack(log_abs)
 
-    def __call__(self, configs, params=None):
+    def connected_amplitudes(
+        self,
+        configs,
+        amplitudes,
+        connections,
+        *,
+        chunk_size=None,
+        reuse_diagonal=True,
+    ):
+        """Evaluate amplitudes for Hamiltonian-connected configurations.
+
+        Diagonal connections reuse the already available parent amplitudes.
+        Future boundary-environment reuse can specialize this method without
+        changing :func:`local_energy_from_connections` or the VMC driver API.
+        """
+        return _default_connected_amplitudes(
+            configs,
+            amplitudes,
+            connections,
+            self,
+            chunk_size=chunk_size,
+            reuse_diagonal=reuse_diagonal,
+        )
+
+    def __call__(self, configs, params=None, *, chunk_size=None):
         """Alias for :meth:`forward`."""
-        return self.forward(configs, params=params)
+        return self.forward(configs, params=params, chunk_size=chunk_size)
 
 
 def make_torch_peps_amplitude_model(peps, **kwargs):
@@ -956,16 +1071,22 @@ def metropolis_exchange_sweep(
     hopping_rate=0.25,
     encoding=None,
     generator=None,
+    chunk_size=None,
 ):
     """Run one nearest-neighbor Metropolis sweep.
 
     ``amplitude_fn`` should accept a ``(batch, n_sites)`` torch integer tensor
     and return a batch of amplitudes. The sampler evaluates only changed
-    proposals when possible.
+    proposals when possible. ``chunk_size`` caps proposal-amplitude batch size
+    without changing the Markov chain.
     """
     torch = _require_torch()
     configs = _as_long_matrix(configs).clone()
-    current = amplitude_fn(configs) if current_amplitudes is None else current_amplitudes
+    current = (
+        _call_amplitude_fn(amplitude_fn, configs, chunk_size=chunk_size)
+        if current_amplitudes is None
+        else current_amplitudes
+    )
     current = torch.as_tensor(current, device=configs.device)
     n_proposed = 0
     n_accepted = 0
@@ -993,7 +1114,11 @@ def metropolis_exchange_sweep(
         n_changed = int(flags.sum().item())
         n_proposed += n_changed
         proposed_amps = current.clone()
-        proposed_amps[flags] = amplitude_fn(proposed[flags])
+        proposed_amps[flags] = _call_amplitude_fn(
+            amplitude_fn,
+            proposed[flags],
+            chunk_size=chunk_size,
+        )
         ratio = _safe_metropolis_ratio(proposed_amps, current)
         accept = flags & (
             torch.rand(configs.shape[0], device=configs.device, generator=generator)
@@ -1216,8 +1341,16 @@ def local_energy_from_connections(
     amplitudes,
     connections,
     amplitude_fn,
+    *,
+    chunk_size=None,
+    reuse_diagonal=True,
 ):
-    """Accumulate local energies from connected configs and amplitudes."""
+    """Accumulate local energies from connected configs and amplitudes.
+
+    If ``amplitude_fn`` exposes ``connected_amplitudes(...)`` that method is
+    used. Otherwise diagonal connections can reuse the supplied parent
+    amplitudes and off-diagonal amplitudes are evaluated in optional chunks.
+    """
     torch = _require_torch()
     configs = _as_long_matrix(configs)
     amplitudes = torch.as_tensor(amplitudes, device=configs.device)
@@ -1227,7 +1360,25 @@ def local_energy_from_connections(
             dtype=amplitudes.dtype,
             device=configs.device,
         )
-    conn_amps = amplitude_fn(connections.configs)
+
+    connected_amplitudes = getattr(amplitude_fn, "connected_amplitudes", None)
+    if callable(connected_amplitudes):
+        conn_amps = connected_amplitudes(
+            configs,
+            amplitudes,
+            connections,
+            chunk_size=chunk_size,
+            reuse_diagonal=reuse_diagonal,
+        )
+    else:
+        conn_amps = _default_connected_amplitudes(
+            configs,
+            amplitudes,
+            connections,
+            amplitude_fn,
+            chunk_size=chunk_size,
+            reuse_diagonal=reuse_diagonal,
+        )
     conn_amps = torch.as_tensor(conn_amps, device=configs.device)
     ratios = conn_amps / amplitudes[connections.batch_ids]
     contrib = connections.coeffs.to(dtype=ratios.dtype) * ratios
@@ -1238,6 +1389,228 @@ def local_energy_from_connections(
     )
     energy.index_add_(0, connections.batch_ids, contrib)
     return energy
+
+
+def _energy_mean_and_variance(local_energies):
+    energy_mean = local_energies.mean()
+    centered = local_energies - energy_mean
+    variance = centered.abs().square().mean()
+    return energy_mean, variance.real
+
+
+def _resolve_connection_fn(connection_fn):
+    if callable(connection_fn):
+        return None, connection_fn
+    key = str(connection_fn).replace("-", "_").lower()
+    aliases = {
+        "fermi_hubbard": ("spinful_fermi_hubbard", spinful_fermi_hubbard_connections),
+        "fh": ("spinful_fermi_hubbard", spinful_fermi_hubbard_connections),
+        "hubbard": ("spinful_fermi_hubbard", spinful_fermi_hubbard_connections),
+        "spinful": ("spinful_fermi_hubbard", spinful_fermi_hubbard_connections),
+        "spinful_fermi_hubbard": (
+            "spinful_fermi_hubbard",
+            spinful_fermi_hubbard_connections,
+        ),
+        "heisenberg": ("heisenberg", heisenberg_connections),
+        "heis": ("heisenberg", heisenberg_connections),
+        "transverse_ising": ("transverse_ising", transverse_ising_connections),
+        "tfim": ("transverse_ising", transverse_ising_connections),
+        "ising": ("transverse_ising", transverse_ising_connections),
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown torch VMC connection_fn {connection_fn!r}. "
+            f"Expected a callable or one of: {allowed}."
+        ) from exc
+
+
+@dataclass(frozen=True)
+class TorchVMCStepResult:
+    """Result of one :class:`TorchVMCDriver` step."""
+
+    configs: Any
+    amplitudes: Any
+    local_energies: Any
+    energy_mean: Any
+    energy_variance: Any
+    acceptance_rate: float
+    n_proposed: int
+    n_accepted: int
+    sr: Any = None
+
+
+class TorchVMCDriver:
+    """Small PyTorch-native VMC loop around Pepsy's torch kernels.
+
+    The driver keeps walker configurations and amplitudes in sync, runs
+    Metropolis exchange/hopping sweeps, evaluates local energies with optional
+    chunking/diagonal reuse, and can apply one SR/minSR update per step.
+    """
+
+    def __init__(
+        self,
+        model,
+        graph,
+        configs,
+        connection_fn="spinful_fermi_hubbard",
+        *,
+        connection_kwargs=None,
+        amplitudes=None,
+        proposal="spinful",
+        hopping_rate=0.25,
+        encoding=None,
+        chunk_size=None,
+        generator=None,
+    ):
+        self.model = model
+        self.graph = graph
+        self.configs = _as_long_matrix(configs)
+        self.connection_name, self.connection_fn = _resolve_connection_fn(
+            connection_fn
+        )
+        self.connection_kwargs = (
+            {} if connection_kwargs is None else dict(connection_kwargs)
+        )
+        self.proposal = proposal
+        self.hopping_rate = float(hopping_rate)
+        self.encoding = encoding
+        self.chunk_size = _normalize_chunk_size(chunk_size)
+        self.generator = generator
+
+        if (
+            self.connection_name == "spinful_fermi_hubbard"
+            and encoding is not None
+            and "encoding" not in self.connection_kwargs
+        ):
+            self.connection_kwargs["encoding"] = encoding
+
+        if amplitudes is None:
+            self.refresh_amplitudes()
+        else:
+            self.amplitudes = _require_torch().as_tensor(
+                amplitudes,
+                device=self.configs.device,
+            )
+
+    @property
+    def n_walkers(self):
+        """Number of active walkers."""
+        return int(self.configs.shape[0])
+
+    @property
+    def n_sites(self):
+        """Number of sites in each walker configuration."""
+        return int(self.configs.shape[1])
+
+    def refresh_amplitudes(self):
+        """Recompute current walker amplitudes from the current model."""
+        with _require_torch().no_grad():
+            self.amplitudes = _call_amplitude_fn(
+                self.model,
+                self.configs,
+                chunk_size=self.chunk_size,
+            )
+        return self.amplitudes
+
+    def make_connections(self, configs=None):
+        """Build Hamiltonian-connected configurations for ``configs``."""
+        configs = self.configs if configs is None else _as_long_matrix(configs)
+        return self.connection_fn(configs, self.graph, **self.connection_kwargs)
+
+    def sample_sweep(self, *, n_sweeps=1):
+        """Run one or more Metropolis sweeps and update driver state."""
+        n_sweeps = _check_positive_int("n_sweeps", n_sweeps)
+        result = None
+        with _require_torch().no_grad():
+            for _ in range(n_sweeps):
+                result = metropolis_exchange_sweep(
+                    self.configs,
+                    self.model,
+                    self.graph,
+                    current_amplitudes=self.amplitudes,
+                    proposal=self.proposal,
+                    hopping_rate=self.hopping_rate,
+                    encoding=self.encoding,
+                    generator=self.generator,
+                    chunk_size=self.chunk_size,
+                )
+                self.configs = result.configs
+                self.amplitudes = result.amplitudes
+        return result
+
+    def local_energies(self, *, connections=None):
+        """Evaluate local energies for the current walkers."""
+        connections = self.make_connections() if connections is None else connections
+        with _require_torch().no_grad():
+            return local_energy_from_connections(
+                self.configs,
+                self.amplitudes,
+                connections,
+                self.model,
+                chunk_size=self.chunk_size,
+                reuse_diagonal=True,
+            )
+
+    def energy_estimate(self):
+        """Return ``(mean, variance, local_energies)`` for current walkers."""
+        local_energies = self.local_energies()
+        energy_mean, energy_variance = _energy_mean_and_variance(local_energies)
+        return energy_mean, energy_variance, local_energies
+
+    def step(
+        self,
+        *,
+        sample_sweeps=1,
+        sr=False,
+        learning_rate=1.0,
+        sr_diag_shift=1.0e-4,
+        sr_method="auto",
+        amplitude_floor=None,
+    ):
+        """Run sampling, estimate energy, and optionally apply an SR update."""
+        sample = self.sample_sweep(n_sweeps=sample_sweeps)
+        local_energies = self.local_energies()
+        energy_mean, energy_variance = _energy_mean_and_variance(local_energies)
+
+        sr_result = None
+        if sr:
+            log_derivatives = torch_log_derivative_matrix(
+                self.model,
+                self.configs,
+                amplitude_floor=amplitude_floor,
+            )
+            sr_result = solve_torch_sr(
+                log_derivatives,
+                local_energies,
+                method=sr_method,
+                diag_shift=sr_diag_shift,
+            )
+            apply_torch_sr_update(
+                self.model,
+                sr_result.direction,
+                learning_rate=learning_rate,
+            )
+            self.refresh_amplitudes()
+
+        return TorchVMCStepResult(
+            configs=self.configs,
+            amplitudes=self.amplitudes,
+            local_energies=local_energies,
+            energy_mean=energy_mean,
+            energy_variance=energy_variance,
+            acceptance_rate=0.0 if sample is None else sample.acceptance_rate,
+            n_proposed=0 if sample is None else sample.n_proposed,
+            n_accepted=0 if sample is None else sample.n_accepted,
+            sr=sr_result,
+        )
+
+    def run(self, n_steps, **step_kwargs):
+        """Run ``n_steps`` VMC steps and return their result records."""
+        n_steps = _check_positive_int("n_steps", n_steps)
+        return [self.step(**step_kwargs) for _ in range(n_steps)]
 
 
 def random_spin_configs(n_walkers, n_sites, n_up, *, device=None, generator=None):

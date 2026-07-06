@@ -1117,8 +1117,7 @@ class SymDMRG2:
         uses the dense reference Hamiltonian solve. The default ``0`` keeps
         the block-native path matrix-free unless a caller explicitly opts into
         dense local solves.
-    local_eig_tol, local_eig_energy_tol, local_eig_min_steps,
-    local_eig_ncv, local_eig_maxiter, local_eig_backend
+    local_eig_tol, local_eig_energy_tol, local_eig_min_steps, local_eig_ncv, local_eig_maxiter, local_eig_backend
         Krylov/Lanczos eigensolver options. By default, Symmray local solves
         keep the Lanczos basis as block tensors and use dense NumPy only for
         scalar Rayleigh-Ritz projections. The native-block path uses
