@@ -298,6 +298,43 @@ def test_symdmrg2_explicit_auto_and_manual_bond_schedules_win():
     assert opt.summary()["chi"] == 3
 
 
+def test_symdmrg2_auto_ramp_blocks_early_energy_convergence(monkeypatch):
+    """Flat energies during warmup should not stop before the ramp reaches chi."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=1,
+    )
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=8,
+        cutoff=1e-10,
+        compute_initial_energy=False,
+        norm_check="off",
+    )
+    seen_bonds = []
+
+    def flat_sweep(direction, canonize=True, **kwargs):
+        del direction, canonize
+        seen_bonds.append(kwargs["max_bond"])
+        return 0.0
+
+    monkeypatch.setattr(opt, "sweep", flat_sweep)
+    opt.solve(max_sweeps=8, sweep_sequence="R", tol=1e-10)
+
+    assert seen_bonds == [1, 2, 4, 8, 8]
+    assert opt.converged is True
+    blocked = [
+        diag
+        for diag in opt.convergence_diagnostics
+        if diag.get("convergence_blocked_reason") == "bond_dim_schedule"
+    ]
+    assert [diag["active_bond_dim"] for diag in blocked] == [2, 4, 8]
+    assert opt.convergence_diagnostics[-1]["bond_schedule_ready"] is True
+
+
 def test_symdmrg2_solves_longer_chain_with_effective_norm():
     """L>2 uses H and N environments for a safe dense reference sweep."""
     pytest.importorskip("symmray")

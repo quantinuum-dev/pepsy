@@ -2044,6 +2044,32 @@ class SymDMRG2:
             offsets = self._sweep_convergence_offsets()
         return self._record_convergence_diagnostic(tol, offsets)["converged"]
 
+    def _apply_bond_schedule_convergence_gate(self, diagnostic, active_bond_dim):
+        raw_converged = bool(diagnostic["converged"])
+        sweep = int(diagnostic["sweep"])
+        final_bond_dim = int(self.bond_dims[-1])
+        active_bond_dim = int(active_bond_dim)
+        # Energy deltas during a ramp compare different variational spaces. Wait
+        # until at least one previous sweep has also used the final bond target.
+        schedule_ready = bool(
+            active_bond_dim >= final_bond_dim
+            and sweep >= len(self.bond_dims)
+        )
+        diagnostic.update(
+            {
+                "raw_converged": raw_converged,
+                "bond_schedule_ready": schedule_ready,
+                "active_bond_dim": active_bond_dim,
+                "final_bond_dim": final_bond_dim,
+                "bond_schedule_length": len(self.bond_dims),
+            }
+        )
+        if raw_converged and not schedule_ready:
+            diagnostic["converged"] = False
+            diagnostic["convergence_blocked_reason"] = "bond_dim_schedule"
+            return False
+        return raw_converged
+
     def _compute_initial_energy(self):
         if self.init_mps is None:
             return None
@@ -5294,7 +5320,14 @@ class SymDMRG2:
                     )
 
                 self.energies.append(energy)
-                self.converged = self._check_convergence(tol, convergence_offsets)
+                convergence_diagnostic = self._record_convergence_diagnostic(
+                    tol,
+                    convergence_offsets,
+                )
+                self.converged = self._apply_bond_schedule_convergence_gate(
+                    convergence_diagnostic,
+                    max_bond,
+                )
                 self._print_post_sweep(self.converged, verbosity=verbosity)
                 if self.converged:
                     break
