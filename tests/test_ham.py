@@ -259,6 +259,37 @@ def test_map_builder_supports_row_major_snake_mode():
     assert map_inv == {coord: idx for idx, coord in expected.items()}
 
 
+def test_map_builder_supports_folded_snake_mode():
+    """folded-snake should alternate opposite periodic columns."""
+    map_, map_inv = OneDMap.build(3, 2, mode="folded-snake")
+    expected = {
+        0: (0, 0),
+        1: (0, 1),
+        2: (2, 1),
+        3: (2, 0),
+        4: (1, 0),
+        5: (1, 1),
+    }
+    assert map_ == expected
+    assert map_inv == {coord: idx for idx, coord in expected.items()}
+
+
+def test_map_builder_folded_snake_reduces_6x6_torus_bandwidth():
+    """Folded periodic snake should avoid the length-35 torus wrap edge."""
+    import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+    edges = tuple(qtn.edges_2d_square(6, 6, cyclic=True))
+    _, snake = OneDMap(6, 6, mode="snake").build()
+    _, folded = OneDMap(6, 6, mode="folded-snake").build()
+
+    snake_lengths = [abs(snake[a] - snake[b]) for a, b in edges]
+    folded_lengths = [abs(folded[a] - folded[b]) for a, b in edges]
+
+    assert max(snake_lengths) == 35
+    assert max(folded_lengths) == 12
+    assert sum(folded_lengths) == sum(snake_lengths)
+
+
 def test_map_builder_supports_hilbert_mode():
     """hilbert mode should follow the standard 4x4 Hilbert traversal."""
     map_, map_inv = OneDMap.build(4, 4, mode="hilbert")

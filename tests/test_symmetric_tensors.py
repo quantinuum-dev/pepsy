@@ -17,6 +17,10 @@ from pepsy.tensors import (
     draw_symmray_mps,
     draw_symmray_mpo,
     draw_symmray_peps,
+    fermi_hubbard_u1u1_gate_stream,
+    fermi_hubbard_u1u1_hopping_gate_stream,
+    fermi_hubbard_u1u1_interaction_gate_stream,
+    fermi_hubbard_u1u1_light_pulse_gate_stream,
     sector_index_map,
     site_charge_alternating,
     site_charge_from_map,
@@ -963,6 +967,113 @@ def test_fermi_hubbard_u1u1_preset_uses_spin_resolved_fermionic_tensors():
     assert peps_first_record["index_directions"][0]["direction"] in {"in", "out"}
     assert evolved_peps.overall_charge() == (2, 2)
     assert evolved_peps.tn.max_bond() <= 4
+
+
+def test_fermi_hubbard_u1u1_light_pulse_stream_uses_paper_schedule():
+    """The native fermion pulse stream should expose the merged Strang layers."""
+    edges = ((0, 1), (1, 2))
+    stream = fermi_hubbard_u1u1_light_pulse_gate_stream(
+        edges,
+        sites=(0, 1, 2),
+        t=1.0,
+        U=8.0,
+        omega=4 * np.pi / 3,
+        pulse_steps=2,
+        relaxation_steps=2,
+    )
+
+    assert isinstance(stream, SymGateStream)
+    assert stream.dt == pytest.approx(0.375)
+    assert stream.order == 2
+    assert len(stream) == 5 * 3 + 4 * 2
+    assert [where for _, where in stream[:3]] == [0, 1, 2]
+    assert [where for _, where in stream[3:5]] == [(0, 1), (1, 2)]
+    assert all(type(gate_i).__name__ == "U1U1FermionicArray" for gate_i, _ in stream)
+
+
+def test_fermi_hubbard_u1u1_streams_run_mps_optimizer_and_direct_gate():
+    """Onsite and Peierls hopping layers should replay through SymMPS paths."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        3,
+        bond_dim=2,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0)]),
+        seed=51,
+        dtype="complex128",
+    )
+    interaction = fermi_hubbard_u1u1_interaction_gate_stream(
+        range(3),
+        0.001,
+        U=2.0,
+    )
+    hopping = fermi_hubbard_u1u1_hopping_gate_stream(
+        ((0, 1), (1, 2)),
+        0.001,
+        t=0.5,
+        peierls_angle=0.3,
+    )
+    stream = fermi_hubbard_u1u1_gate_stream(
+        ((0, 1), (1, 2)),
+        0.001,
+        sites=range(3),
+        t=0.5,
+        U=2.0,
+        peierls_angle=0.3,
+    )
+
+    direct = state.copy().apply_gates(interaction, method="direct", inplace=False)
+    opt = pepsy.MpsOptimizer(state.tn.copy(), stream, chi=4, mode="mpo")
+    out = opt.run(progbar=False, cutoff=1e-10, fidelity_samples=0)
+
+    assert len(interaction) == 3
+    assert len(hopping) == 2
+    assert len(stream) == 3 + 2 + 3
+    assert direct.tn.L == 3
+    assert out.L == 3
+    assert out.max_bond() <= 4
+    assert np.isfinite(np.real((out.H & out).contract(all, optimize="auto-hq")))
+
+
+def test_fermi_hubbard_u1u1_light_pulse_stream_runs_sympeps_simple_update():
+    """The same native fermion pulse stream should feed PEPS simple update."""
+    site_charge = site_charge_from_occupations(
+        {
+            (0, 0): (1, 0),
+            (0, 1): (0, 1),
+            (1, 0): (1, 0),
+            (1, 1): (0, 1),
+        }
+    )
+    state = SymPEPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        2,
+        bond_dim=2,
+        site_charge=site_charge,
+        seed=52,
+        dtype="complex128",
+    )
+    stream = fermi_hubbard_u1u1_light_pulse_gate_stream(
+        state.edges,
+        sites=state.sites,
+        t=0.2,
+        U=1.0,
+        omega=4 * np.pi / 3,
+        pulse_steps=2,
+    )
+    gauges = {}
+
+    out = state.copy().apply_gates(
+        stream,
+        method="simple",
+        gauges=gauges,
+        max_bond=4,
+        cutoff=1e-10,
+    )
+
+    assert out.tn.max_bond() <= 4
+    assert len(gauges) > 0
+    assert np.isfinite(np.real(out.norm()))
 
 
 def test_fermi_hubbard_u1u1_hamiltonian_builds_mpo_energy_path():

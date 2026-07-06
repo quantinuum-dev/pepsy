@@ -17,6 +17,10 @@ __all__ += [
     "draw_symmray_mps",
     "draw_symmray_mpo",
     "draw_symmray_peps",
+    "fermi_hubbard_u1u1_gate_stream",
+    "fermi_hubbard_u1u1_hopping_gate_stream",
+    "fermi_hubbard_u1u1_interaction_gate_stream",
+    "fermi_hubbard_u1u1_light_pulse_gate_stream",
     "sector_index_map",
     "site_charge_alternating",
     "site_charge_from_map",
@@ -3782,6 +3786,355 @@ class SymGateStream(tuple):
         )
 
 
+def _sites_from_edges(edges, sites):
+    if sites is not None:
+        out = tuple(sites)
+        if not out:
+            raise ValueError("sites must not be empty.")
+        return out
+
+    out = []
+    seen = set()
+    for left, right in edges:
+        for site in (left, right):
+            if site not in seen:
+                seen.add(site)
+                out.append(site)
+    return tuple(out)
+
+
+def _edge_angle_parameter(value, left, right):
+    """Return an oriented edge angle, negating reversed mapping lookups."""
+    if callable(value):
+        return value(left, right)
+    if isinstance(value, Mapping):
+        if (left, right) in value:
+            return value[(left, right)]
+        return -value[(right, left)]
+    return value
+
+
+def _fh_spinful_peierls_hopping_array(
+    symmetry,
+    *,
+    t=1.0,
+    peierls_angle=0.0,
+    dtype="complex128",
+):
+    """Return a spinful Fermi-Hubbard hopping term with Peierls phases."""
+    import symmray.fermionic_local_operators as flo  # pylint: disable=import-outside-toplevel
+
+    au = flo.FermionicOperator("a↑")
+    ad = flo.FermionicOperator("a↓")
+    bu = flo.FermionicOperator("b↑")
+    bd = flo.FermionicOperator("b↓")
+
+    tu, td = _as_spin_pair(t, name="t")
+    phase = np.exp(1j * peierls_angle)
+    phase_conj = np.conjugate(phase)
+    terms = (
+        (-tu * phase, (au.dag, bu)),
+        (-tu * phase_conj, (bu.dag, au)),
+        (-td * phase, (ad.dag, bd)),
+        (-td * phase_conj, (bd.dag, ad)),
+    )
+    basis_a = ((), (au.dag,), (ad.dag,), (ad.dag, au.dag))
+    basis_b = ((), (bu.dag,), (bd.dag,), (bd.dag, bu.dag))
+    bases = (basis_a, basis_b)
+    dense = np.zeros((4, 4, 4, 4), dtype=np.dtype(dtype))
+    # Symmray's dense helper currently initializes real zeros, so complex
+    # Peierls coefficients need an explicitly complex accumulation buffer.
+    for idx, val in flo.build_local_fermionic_elements(terms, bases).items():
+        dense[idx] += val
+
+    sectors = default_physical_sectors(symmetry, 4)
+    return symm_operator_from_dense(
+        dense,
+        sectors,
+        symmetry=symmetry,
+        charge=_zero_like_charge(next(iter(sectors))),
+        fermionic=True,
+        sites=2,
+    )
+
+
+def _fh_u1u1_onsite_interaction_gate(
+    site,
+    dt,
+    *,
+    U=8.0,
+    imaginary=False,
+    dtype="complex128",
+    to_backend=None,
+):
+    dtype = np.dtype(dtype)
+    scale = -dt if imaginary else -1j * dt
+    double = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=dtype)
+    U_site = _node_parameter(U, site)
+    gate_dense = np.diag(np.exp(scale * U_site * double)).astype(dtype, copy=False)
+    gate = symm_operator_from_dense(
+        gate_dense,
+        default_physical_sectors(model="fermi_hubbard_u1u1"),
+        symmetry="U1U1",
+        charge=(0, 0),
+        fermionic=True,
+        sites=1,
+    )
+    return _apply_to_array_blocks(gate, to_backend)
+
+
+def fermi_hubbard_u1u1_interaction_gate_stream(
+    sites,
+    dt,
+    *,
+    U=8.0,
+    imaginary=False,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Return onsite ``U n_up n_down`` gates for spinful ``U1U1`` Hubbard.
+
+    The returned stream contains one charge-preserving fermionic one-site gate
+    per supplied site. It can be mixed with two-site hopping streams and passed
+    to :class:`pepsy.MpsOptimizer`, :func:`pepsy.gate`, or
+    :func:`pepsy.gate_simple`.
+    """
+    sites = tuple(sites)
+    if not sites:
+        raise ValueError("sites must not be empty.")
+    entries = [
+        (
+            _fh_u1u1_onsite_interaction_gate(
+                site,
+                dt,
+                U=U,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            ),
+            site,
+        )
+        for site in sites
+    ]
+    return SymGateStream(entries, dt=dt, imaginary=imaginary, order=1)
+
+
+def fermi_hubbard_u1u1_hopping_gate_stream(
+    edges,
+    dt,
+    *,
+    t=1.0,
+    peierls_angle=0.0,
+    imaginary=False,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Return spin-preserving ``U1U1`` Fermi-Hubbard hopping gates.
+
+    ``peierls_angle`` is the oriented left-to-right bond angle ``A``: hopping
+    from the first edge site to the second receives ``exp(+i A)`` and the
+    reverse direction receives ``exp(-i A)``. It may be a scalar, edge mapping,
+    or ``callable(left, right)``.
+    """
+    edges = _as_edges(edges)
+    entries = []
+    for left, right in edges:
+        term = _fh_spinful_peierls_hopping_array(
+            "U1U1",
+            t=_edge_parameter(t, left, right),
+            peierls_angle=_edge_angle_parameter(peierls_angle, left, right),
+            dtype=dtype,
+        )
+        gate = _gate_from_term(term, dt, imaginary=imaginary)
+        gate = _apply_to_array_blocks(gate, to_backend)
+        entries.append((gate, (left, right)))
+    return SymGateStream(entries, dt=dt, imaginary=imaginary, order=1)
+
+
+def fermi_hubbard_u1u1_gate_stream(
+    edges,
+    dt,
+    *,
+    sites=None,
+    t=1.0,
+    U=8.0,
+    peierls_angle=0.0,
+    imaginary=False,
+    order=2,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Return a native fermionic ``U1U1`` Fermi-Hubbard Trotter stream.
+
+    ``order=1`` returns a Lie step ``U_int(dt) U_hop(dt)``. ``order=2``
+    returns the Strang step ``U_int(dt/2) U_hop(dt) U_int(dt/2)``. The onsite
+    and hopping gates are exact fermionic Symmray arrays, so no spin/qubit
+    mapping is introduced.
+    """
+    if order not in {1, 2}:
+        raise ValueError("order must be 1 or 2.")
+    edges = _as_edges(edges)
+    sites = _sites_from_edges(edges, sites)
+    if order == 1:
+        entries = (
+            tuple(
+                fermi_hubbard_u1u1_interaction_gate_stream(
+                    sites,
+                    dt,
+                    U=U,
+                    imaginary=imaginary,
+                    dtype=dtype,
+                    to_backend=to_backend,
+                )
+            )
+            + tuple(
+                fermi_hubbard_u1u1_hopping_gate_stream(
+                    edges,
+                    dt,
+                    t=t,
+                    peierls_angle=peierls_angle,
+                    imaginary=imaginary,
+                    dtype=dtype,
+                    to_backend=to_backend,
+                )
+            )
+        )
+        return SymGateStream(entries, dt=dt, imaginary=imaginary, order=order)
+
+    half = dt / 2
+    entries = (
+        tuple(
+            fermi_hubbard_u1u1_interaction_gate_stream(
+                sites,
+                half,
+                U=U,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+        + tuple(
+            fermi_hubbard_u1u1_hopping_gate_stream(
+                edges,
+                dt,
+                t=t,
+                peierls_angle=peierls_angle,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+        + tuple(
+            fermi_hubbard_u1u1_interaction_gate_stream(
+                sites,
+                half,
+                U=U,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+    )
+    return SymGateStream(entries, dt=dt, imaginary=imaginary, order=order)
+
+
+def _default_light_pulse_angle(time, omega):
+    return np.pi * (1.0 - np.cos(omega * time)) / 2.0
+
+
+def _pulse_angle_for_step(peierls_angles, step, time, omega):
+    if peierls_angles is None:
+        return _default_light_pulse_angle(time, omega)
+    if callable(peierls_angles):
+        return peierls_angles(step, time)
+    if isinstance(peierls_angles, Mapping):
+        return peierls_angles
+    try:
+        return peierls_angles[step]
+    except TypeError:
+        return peierls_angles
+
+
+def fermi_hubbard_u1u1_light_pulse_gate_stream(
+    edges,
+    *,
+    sites=None,
+    t=1.0,
+    U=8.0,
+    omega=4 * np.pi / 3,
+    tau=None,
+    pulse_steps=2,
+    relaxation_steps=0,
+    peierls_angles=None,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Return the paper-style real-time Hubbard light-pulse gate stream.
+
+    The default pulse uses midpoint Peierls angles from
+    ``A(s) = pi * (1 - cos(omega * s)) / 2`` with
+    ``tau = pi / (pulse_steps * omega)``. For the trapped-ion paper settings,
+    ``pulse_steps=2`` gives ``tau=0.375`` when ``omega=4*pi/3``. After the
+    pulsed hopping layers, optional field-off relaxation steps are appended.
+
+    Adjacent Strang half-interaction layers are merged, so the default two-step
+    pulse has the structure ``U_int(tau/2), U_hop(A_0), U_int(tau),
+    U_hop(A_1), U_int(tau/2)``.
+    """
+    if not isinstance(pulse_steps, Integral) or int(pulse_steps) < 1:
+        raise ValueError("pulse_steps must be a positive integer.")
+    if not isinstance(relaxation_steps, Integral) or int(relaxation_steps) < 0:
+        raise ValueError("relaxation_steps must be a non-negative integer.")
+
+    pulse_steps = int(pulse_steps)
+    relaxation_steps = int(relaxation_steps)
+    tau = np.pi / (pulse_steps * omega) if tau is None else tau
+    edges = _as_edges(edges)
+    sites = _sites_from_edges(edges, sites)
+
+    hop_angles = [
+        _pulse_angle_for_step(peierls_angles, step, (step + 0.5) * tau, omega)
+        for step in range(pulse_steps)
+    ]
+    hop_angles.extend(0.0 for _ in range(relaxation_steps))
+
+    entries = list(
+        fermi_hubbard_u1u1_interaction_gate_stream(
+            sites,
+            tau / 2,
+            U=U,
+            imaginary=False,
+            dtype=dtype,
+            to_backend=to_backend,
+        )
+    )
+    for step, angle in enumerate(hop_angles):
+        entries.extend(
+            fermi_hubbard_u1u1_hopping_gate_stream(
+                edges,
+                tau,
+                t=t,
+                peierls_angle=angle,
+                imaginary=False,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+        interaction_dt = tau / 2 if step == len(hop_angles) - 1 else tau
+        entries.extend(
+            fermi_hubbard_u1u1_interaction_gate_stream(
+                sites,
+                interaction_dt,
+                U=U,
+                imaginary=False,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+
+    return SymGateStream(entries, dt=tau, imaginary=False, order=2)
+
+
 def _normalize_model(model):
     key = str(model).strip().lower().replace(" ", "_")
     try:
@@ -3938,6 +4291,36 @@ def _format_site_ind(site, site_ind_id):
     if isinstance(site, tuple):
         return site_ind_id.format(*site)
     return site_ind_id.format(site)
+
+
+def _sites_from_gate_where(where, site_ind_id):
+    """Normalize one-/two-site gate locations for local index formatting."""
+    if site_ind_id == "k{}" and isinstance(where, Integral):
+        return (int(where),)
+    if (
+        site_ind_id == "k{},{}"
+        and isinstance(where, tuple)
+        and len(where) == 2
+        and all(isinstance(x, Integral) for x in where)
+    ):
+        return (tuple(int(x) for x in where),)
+    if isinstance(where, (tuple, list)):
+        if (
+            site_ind_id == "k{},{}"
+            and len(where) == 1
+            and isinstance(where[0], (tuple, list))
+            and len(where[0]) == 2
+            and all(isinstance(x, Integral) for x in where[0])
+        ):
+            return (tuple(int(x) for x in where[0]),)
+        if (
+            site_ind_id == "k{}"
+            and len(where) == 1
+            and isinstance(where[0], Integral)
+        ):
+            return (int(where[0]),)
+        return tuple(where)
+    return (where,)
 
 
 def _as_scalar(value):
@@ -5491,7 +5874,8 @@ class _SymState:
             raise ValueError("method must be 'direct', 'gate', or 'simple'.")
 
         for gate, where in gates:
-            inds = [_format_site_ind(site, target.site_ind_id) for site in where]
+            sites = _sites_from_gate_where(where, target.site_ind_id)
+            inds = [_format_site_ind(site, target.site_ind_id) for site in sites]
             qtn.tensor_network_gate_inds(
                 target.psi,
                 gate,

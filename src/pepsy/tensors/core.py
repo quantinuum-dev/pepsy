@@ -90,6 +90,8 @@ class OneDMap:
     _KNOWN_MODES = (
         "snake",
         "snake-row-major",
+        "folded-snake",
+        "folded-snake-row-major",
         "row-major",
         "col-major",
         "hilbert",
@@ -105,6 +107,19 @@ class OneDMap:
         "snake-row": "snake-row-major",
         "snake-row-major": "snake-row-major",
         "row-snake": "snake-row-major",
+        "folded-snake": "folded-snake",
+        "folded-snake-col": "folded-snake",
+        "folded-snake-column": "folded-snake",
+        "folded-snake-col-major": "folded-snake",
+        "folded-snake-column-major": "folded-snake",
+        "periodic-snake": "folded-snake",
+        "torus-snake": "folded-snake",
+        "folded-snake-row": "folded-snake-row-major",
+        "folded-snake-row-major": "folded-snake-row-major",
+        "periodic-snake-row": "folded-snake-row-major",
+        "periodic-snake-row-major": "folded-snake-row-major",
+        "torus-snake-row": "folded-snake-row-major",
+        "torus-snake-row-major": "folded-snake-row-major",
         "row-major": "row-major",
         "col-major": "col-major",
         "hilbert": "hilbert",
@@ -286,6 +301,37 @@ class OneDMap:
         raise ValueError(f"Unknown snake major axis: {major!r}.")
 
     @staticmethod
+    def _folded_axis_order(length):
+        """Return ``0, L-1, 1, L-2, ...`` for periodic boundary mappings."""
+        left = 0
+        right = int(length) - 1
+        order = []
+        while left <= right:
+            order.append(left)
+            if left != right:
+                order.append(right)
+            left += 1
+            right -= 1
+        return order
+
+    @classmethod
+    def _coords_folded_snake_2d(cls, L_x, L_y, *, major="col"):
+        coords = []
+        if major == "col":
+            for step, x in enumerate(cls._folded_axis_order(L_x)):
+                y_iter = range(L_y) if (step % 2 == 0) else range(L_y - 1, -1, -1)
+                for y in y_iter:
+                    coords.append((x, y))
+            return coords
+        if major == "row":
+            for step, y in enumerate(cls._folded_axis_order(L_y)):
+                x_iter = range(L_x) if (step % 2 == 0) else range(L_x - 1, -1, -1)
+                for x in x_iter:
+                    coords.append((x, y))
+            return coords
+        raise ValueError(f"Unknown folded snake major axis: {major!r}.")
+
+    @staticmethod
     def _is_power_of_two(value):
         return value > 0 and (value & (value - 1)) == 0
 
@@ -393,6 +439,14 @@ class OneDMap:
                 if Lz is None
                 else cls._coords_snake_3d(Lx, Ly, Lz, major="row")
             )
+        elif mode_norm == "folded-snake":
+            if Lz is not None:
+                raise NotImplementedError("folded-snake mode is currently implemented only for 2D lattices.")
+            coords = cls._coords_folded_snake_2d(Lx, Ly, major="col")
+        elif mode_norm == "folded-snake-row-major":
+            if Lz is not None:
+                raise NotImplementedError("folded-snake mode is currently implemented only for 2D lattices.")
+            coords = cls._coords_folded_snake_2d(Lx, Ly, major="row")
         elif mode_norm == "row-major":
             coords = (
                 cls._coords_row_major_2d(Lx, Ly)

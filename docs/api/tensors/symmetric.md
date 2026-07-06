@@ -192,6 +192,13 @@ mpo = ham.to_mpo(mapper=mapper)
 mpo = ham.to_mpo(idx2coo=idx2coo, coo2idx=coo2idx)
 ```
 
+For periodic square lattices encoded as long-range edges in an OBC MPS/MPO,
+``mode="folded-snake"`` alternates opposite columns before snaking. On a 6 by
+6 torus this lowers the longest nearest-neighbor chain separation from 35
+with the standard snake path to 12, while preserving the same total edge
+separation. This is often a better starting ordering for fixed-``chi`` MPS
+DMRG benchmarks with PBC lattice physics.
+
 For a Hamiltonian whose edges are already integer MPS-chain sites, pass
 ``L=...`` instead of a coordinate mapper:
 
@@ -227,6 +234,84 @@ ham = psi.build_hamiltonian()
 gates = ham.gate_stream(0.01)
 
 psi.time_evolve_mps_optimizer(0.01, hamiltonian=ham, chi=16, mode="mpo")
+```
+
+For direct spinful Fermi-Hubbard dynamics, Pepsy also exposes native fermionic
+``U1U1`` stream builders. These keep the four-state local fermion space and do
+not map the system to qubits or spins. The light-pulse helper follows the
+paper-style real-time schedule with onsite interaction half-layers, Peierls
+hopping layers, and optional field-off relaxation steps.
+
+```python
+peps_charge = py.site_charge_from_occupations(
+    {
+        (i, j): (1, 0) if (i + j) % 2 == 0 else (0, 1)
+        for i in range(6)
+        for j in range(6)
+    }
+)
+peps = py.SymPEPS.for_model(
+    "fermi_hubbard_u1u1",
+    6,
+    6,
+    bond_dim=4,
+    site_charge=peps_charge,
+    dtype="complex128",
+)
+
+edges = peps.edges
+sites = peps.sites
+
+pulse = py.fermi_hubbard_u1u1_light_pulse_gate_stream(
+    edges,
+    sites=sites,
+    t=1.0,
+    U=8.0,
+    omega=4 * np.pi / 3,
+    pulse_steps=2,
+    relaxation_steps=2,
+)
+```
+
+For a flattened MPS path, feed the same canonical bundled stream to
+``MpsOptimizer``:
+
+```python
+mapper = py.OneDMap(Lx=6, Ly=6, mode="folded-snake")
+idx2coo, coo2idx = mapper.build()
+flat_edges = tuple((coo2idx[a], coo2idx[b]) for a, b in square_lattice_edges)
+
+psi = py.SymMPS.for_model(
+    "fermi_hubbard_u1u1",
+    36,
+    bond_dim=8,
+    site_charge=py.site_charge_from_occupations([(1, 0), (0, 1)] * 18),
+    dtype="complex128",
+)
+
+pulse = py.fermi_hubbard_u1u1_light_pulse_gate_stream(
+    flat_edges,
+    sites=range(36),
+    t=1.0,
+    U=8.0,
+    relaxation_steps=2,
+)
+
+opt = py.MpsOptimizer(psi.tn, pulse, chi=64, mode="mpo", inplace=True)
+psi_t = opt.run(progbar=True, cutoff=1e-10, fidelity_samples=0)
+```
+
+For a PEPS path, apply the same stream through routed simple update:
+
+```python
+gauges = {}
+peps.apply_gates(
+    pulse,
+    method="simple",
+    gauges=gauges,
+    max_bond=8,
+    cutoff=1e-10,
+)
 ```
 
 For Symmray-backed MPS gate streams, ``mode="swap"`` and ``mode="svd"`` use

@@ -125,6 +125,15 @@ def is_submpo_event(entry):
     return submpo_event_parts(entry) is not None
 
 
+def _normalize_gate_where(where):
+    """Return canonical one-/two-site gate locations for MPS replay."""
+    if isinstance(where, Integral):
+        return (int(where),)
+    if isinstance(where, list):
+        return tuple(where)
+    return where
+
+
 def _normalize_gate_queue(gates):
     """Return ``(payloads, wheres, event_types)`` from bundled stream input."""
     submpo_parts = _submpo_event_parts(gates)
@@ -153,7 +162,7 @@ def _normalize_gate_queue(gates):
             )
             gate, where = gate_entries[0]
             payloads.append(gate)
-            wheres.append(tuple(where) if isinstance(where, list) else where)
+            wheres.append(_normalize_gate_where(where))
             event_types.append("gate")
         return payloads, wheres, event_types
 
@@ -163,7 +172,7 @@ def _normalize_gate_queue(gates):
     gate_list, where_list = zip(*entries)
     return (
         list(gate_list),
-        [tuple(w) if isinstance(w, list) else w for w in where_list],
+        [_normalize_gate_where(w) for w in where_list],
         ["gate"] * len(gate_list),
     )
 
