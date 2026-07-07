@@ -51,7 +51,11 @@ when the requested sweep bond dimension increases, allowing equal-chi
 turnarounds to reuse maintained environments but narrowing the later search
 space. Adaptive zero-sector widening retargets already maintained block
 environments into the expanded bond charge maps, so equal-chi turnarounds can
-reuse block environments without giving up the wider local search space.
+reuse block environments without giving up the wider local search space. Fresh
+zero-sector widening with no maintained block environment is recanonicalized
+before H-only local solves. Retargeted maintained block environments keep the
+reuse path intact in production `norm_check="off"` runs, while explicit
+norm-tracking audit modes recanonicalize after retargeting.
 Noisy sector enrichment still clears environments because it changes the
 represented state. By default, Symmray `H_eff` matvecs use a block-native projected contraction;
 `matvec_backend="dense_reference"` keeps the older
@@ -123,14 +127,16 @@ for Symmray local solves; set `dense_threshold` above zero or request
 Hamiltonians. If a requested state canonicalization method is unavailable,
 SymDMRG2 forces `N_eff ~= I` checks for that H-only sweep even when
 `norm_check="off"`, so the wrong metric cannot be used silently. The default
-`norm_check="strict"` validates every two-site window.
+`norm_check="off"` uses this fast canonical-assumption path after successful
+OBC canonicalization, matching production DMRG usage. Set
+`norm_check="strict"` to validate every two-site window when debugging
+canonicalization or charge-alignment changes.
 Strict and generalized-dense diagnostics build explicit dense norm
 environments; skipped checks in canonical H-only modes are recorded as
 canonical assumptions rather than as measured `N_eff` validations.
-For larger trusted runs, `norm_check="sampled"` checks boundary windows plus
-every `norm_check_interval`-th interior window, `norm_check="first_sweep"`
-checks only the first sweep, and `norm_check="off"` skips this expensive
-debug assertion. Skipped checks are still recorded in
+For audit runs, `norm_check="sampled"` checks boundary windows plus every
+`norm_check_interval`-th interior window, and `norm_check="first_sweep"` checks
+only the first sweep. Skipped checks are still recorded in
 `norm_identity_diagnostics` with `skipped=True` so benchmark logs remain
 auditable. `residual_check` accepts the same schedule modes and records
 normalized local eigensolver residuals in `residual_diagnostics` without
@@ -142,9 +148,10 @@ block-native substep timings in
 `matvec_diagnostic_records`. The cached projected problem also records whether
 the block-native path used the original right-first contraction route or the
 left-first route selected for strongly imbalanced projector sizes.
+`compute_initial_energy="lazy"` is the default, deferring the startup estimate
+until the `initial_energy` or pre-sweep `energy` property is requested.
 `compute_initial_energy=True` preserves the historical eager startup estimate,
-`False` skips it, and `"lazy"` defers it until the `initial_energy` or
-pre-sweep `energy` property is requested. Sweep setup
+and `False` skips it entirely. Sweep setup
 builds only the static side environments needed for the current direction,
 updates the moving side incrementally after each two-site writeback, and reuses
 that maintained side on direction turnarounds. It rebuilds only when a pre-sweep

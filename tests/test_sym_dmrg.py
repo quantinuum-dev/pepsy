@@ -215,6 +215,20 @@ def test_symdmrg2_initial_energy_can_be_disabled_or_lazy(monkeypatch):
     assert opt.summary()["initial_energy_computed"] is True
 
 
+def test_symdmrg2_defaults_are_production_fast_and_lazy():
+    """Plain SymDMRG2 construction should avoid startup and dense debug probes."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10)
+    summary = opt.summary()
+
+    assert summary["initial_energy_mode"] == "lazy"
+    assert summary["initial_energy_computed"] is False
+    assert summary["initial_energy"] is None
+    assert summary["norm_check"] == "off"
+
+
 def test_symdmrg2_product_init_gets_default_bond_ramp():
     """Product-like initial states should grow gently when only chi is supplied."""
     pytest.importorskip("symmray")
@@ -524,6 +538,7 @@ def test_symdmrg2_strict_norm_check_builds_dense_norm_environments(monkeypatch):
         chi=4,
         cutoff=1e-10,
         local_solver="dense",
+        norm_check="strict",
         profile=True,
     )
 
@@ -898,6 +913,7 @@ def test_symdmrg2_profile_records_phase_timings():
         chi=4,
         cutoff=1e-10,
         local_solver="dense",
+        norm_check="strict",
         profile=True,
     )
     opt.solve(max_sweeps=1)
@@ -2271,6 +2287,7 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
         dense_threshold=0,
         local_eig_tol=1e-10,
         local_eig_ncv=8,
+        norm_check="strict",
     )
     out = opt.solve(max_sweeps=2, sweep_sequence="RL")
     post_energy = pepsy.MpsEnergyOptimizer(
@@ -2369,6 +2386,7 @@ def test_symdmrg2_lanczos_reaches_fixed_sector_ed_with_full_initial_support():
         local_eig_tol=1e-11,
         local_eig_energy_tol=None,
         local_eig_ncv=16,
+        norm_check="strict",
         norm_check_samples=3,
     )
     opt.solve(tol=0.0, max_sweeps=2, sweep_sequence="RL")
@@ -2611,6 +2629,7 @@ def test_symdmrg2_subspace_mixer_reaches_ed_from_narrow_initial_support():
         local_eig_tol=1e-11,
         local_eig_energy_tol=None,
         local_eig_ncv=16,
+        norm_check="strict",
         norm_check_samples=3,
         mixer="density_matrix",
         mixer_bond_dim=12,

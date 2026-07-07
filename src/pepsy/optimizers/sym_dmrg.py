@@ -1415,10 +1415,12 @@ class SymDMRG2:
         explicitly requested for debugging.
     norm_check
         Schedule for the Symmray effective-norm identity check.
-        ``"strict"`` checks every two-site solve, preserving the safest
-        development behavior. ``"sampled"`` checks boundary windows and every
+        ``"off"`` is the production default: after successful OBC
+        canonicalization, SymDMRG2 records skipped canonical assumptions instead
+        of building dense ``N_eff`` debug probes. ``"strict"`` checks every
+        two-site solve. ``"sampled"`` checks boundary windows and every
         ``norm_check_interval``-th interior window. ``"first_sweep"`` checks
-        every window during the first sweep only. ``"off"`` skips the check.
+        every window during the first sweep only.
     residual_check
         Schedule for local residual diagnostics after each two-site solve.
         The schedule modes match ``norm_check``. ``"off"`` avoids the extra
@@ -1494,10 +1496,9 @@ class SymDMRG2:
         before local environments are built. This gives raw random initial
         states orthonormal Schmidt bases without replacing the user's state.
     compute_initial_energy
-        ``True`` preserves the historical eager initial-energy estimate.
-        ``False`` skips it. ``"lazy"`` defers the estimate until
-        :attr:`initial_energy` or :attr:`energy` is first requested before any
-        sweeps have produced energies.
+        ``"lazy"`` is the default: it defers the initial-energy estimate until
+        :attr:`initial_energy` or the pre-sweep :attr:`energy` property is first
+        requested. ``True`` computes it eagerly, and ``False`` skips it.
     """
 
     def __init__(
@@ -1534,7 +1535,7 @@ class SymDMRG2:
         min_sweeps=1,
         norm_check_tol=1e-6,
         norm_check_samples=2,
-        norm_check="strict",
+        norm_check="off",
         norm_check_interval=1,
         residual_check="off",
         residual_check_interval=1,
@@ -1559,7 +1560,7 @@ class SymDMRG2:
         mixer_bond_dim=None,
         canonicalize_init=True,
         profile=False,
-        compute_initial_energy=True,
+        compute_initial_energy="lazy",
         dmrg_opts=None,
     ):
         if init_mps is None and p0 is not None:
@@ -5576,7 +5577,16 @@ class SymDMRG2:
                 self._variational_sector_basis_max_bond,
                 int(chi),
             )
-            if variational_diagnostic is not None and self._should_track_norm_environments():
+            # Fresh zero-sector widening needs a new canonical center for H-only
+            # local solves. Strict/sample norm audits also recanonicalize after
+            # retargeting; production norm_check="off" keeps that reuse path.
+            if variational_diagnostic is not None and (
+                self._should_track_norm_environments()
+                or not variational_diagnostic.get(
+                    "preserved_block_environments",
+                    False,
+                )
+            ):
                 canonized = self._canonize_for_sweep(direction)
                 if not canonized:
                     self._force_norm_check_after_skipped_canonize = True
