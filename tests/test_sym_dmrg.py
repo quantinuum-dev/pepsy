@@ -514,6 +514,82 @@ def test_symdmrg2_directional_environment_builds_only_static_side(monkeypatch):
     assert opt.right_envs[-1] is not None
 
 
+def test_symdmrg2_canonical_norm_setup_uses_identity_static_side(monkeypatch):
+    """Canonical sweep norm setup should skip dense norm contractions."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(4, [(1, 0), (0, 1), (1, 0), (0, 1)])
+    opt = pepsy.SymDMRG2(mpo, state, chi=4, cutoff=1e-10, sweeps=1)
+
+    def fail_norm_step(*_args, **_kwargs):
+        raise AssertionError("dense norm step should not be used")
+
+    monkeypatch.setattr(opt, "_norm_left_env_step", fail_norm_step)
+    monkeypatch.setattr(opt, "_norm_right_env_step", fail_norm_step)
+
+    opt.build_sweep_norm_environments("right", assume_canonical=True)
+
+    assert opt.left_norm_envs[0] is not None
+    assert all(env is None for env in opt.left_norm_envs[1:])
+    assert all(env is None for env in opt.right_norm_envs[:2])
+    for env in opt.right_norm_envs[2:-1]:
+        assert env is not None
+        assert np.allclose(env, np.eye(env.shape[0]))
+    assert opt.right_norm_envs[-1] is not None
+
+    opt.build_sweep_norm_environments("left", assume_canonical=True)
+
+    assert opt.left_norm_envs[0] is not None
+    for env in opt.left_norm_envs[1:-2]:
+        assert env is not None
+        assert np.allclose(env, np.eye(env.shape[0]))
+    assert all(env is None for env in opt.left_norm_envs[-2:])
+    assert all(env is None for env in opt.right_norm_envs[:-1])
+    assert opt.right_norm_envs[-1] is not None
+
+
+def test_symdmrg2_canonical_sweep_requests_identity_norm_setup(monkeypatch):
+    """A freshly canonicalized H-only sweep should avoid full norm rebuilds."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="dense",
+        profile=True,
+    )
+    calls = []
+    build_sweep_norm_environments = opt.build_sweep_norm_environments
+
+    def counted_build_sweep_norm_environments(
+        direction,
+        *,
+        assume_canonical=False,
+    ):
+        calls.append((direction, assume_canonical))
+        return build_sweep_norm_environments(
+            direction,
+            assume_canonical=assume_canonical,
+        )
+
+    monkeypatch.setattr(
+        opt,
+        "build_sweep_norm_environments",
+        counted_build_sweep_norm_environments,
+    )
+
+    opt.solve(max_sweeps=1, sweep_sequence="R", tol=0.0)
+
+    assert calls == [("right", True)]
+    norm_builds = [
+        event
+        for event in opt.profile_diagnostics
+        if event["phase"] == "build_norm_environments"
+    ]
+    assert norm_builds[0]["canonical_identity"] is True
+
+
 def test_symdmrg2_block_sweep_skips_dense_h_environment_updates(monkeypatch):
     """Block projected matvec sweeps should not build dense H environments."""
     pytest.importorskip("symmray")
