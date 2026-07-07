@@ -1171,7 +1171,7 @@ class SymDMRG2:
         uses the dense reference Hamiltonian solve. The default ``0`` keeps
         the block-native path matrix-free unless a caller explicitly opts into
         dense local solves.
-    local_eig_tol, local_eig_energy_tol, local_eig_p_tol, local_eig_min_gap, local_eig_min_steps, local_eig_ncv, local_eig_maxiter, local_eig_backend
+    local_eig_tol, local_eig_energy_tol, local_eig_p_tol, local_eig_p_tol_to_trunc, local_eig_p_tol_min, local_eig_p_tol_max, local_eig_min_gap, local_eig_min_steps, local_eig_ncv, local_eig_maxiter, local_eig_backend
         Krylov/Lanczos eigensolver options. By default, Symmray local solves
         keep the Lanczos basis as block tensors and use dense NumPy only for
         scalar Rayleigh-Ritz projections. The native-block path uses a
@@ -1182,8 +1182,13 @@ class SymDMRG2:
         disable that side of the early-stop gate. ``local_eig_ncv`` is the hard
         Krylov subspace cap unless ``local_eig_maxiter`` is set explicitly.
         ``local_eig_ncv`` can also be a sweep schedule, in which case the last
-        entry is repeated. Set ``local_eig_backend`` to an explicit
-        quimb/scipy backend to use the older flat LinearOperator adapter.
+        entry is repeated. ``local_eig_p_tol_to_trunc`` couples the next
+        sweep's P-error tolerance to the previous sweep's maximum SVD
+        truncation error, clamped by ``local_eig_p_tol_min`` and
+        ``local_eig_p_tol_max``. The default ``"auto"`` enables this TeNPy-style
+        update only when ``local_eig_p_tol`` is also automatic and active. Set
+        ``local_eig_backend`` to an explicit quimb/scipy backend to use the
+        older flat LinearOperator adapter.
     min_sweeps
         Minimum number of completed sweeps before accepting convergence. This
         follows TeNPy's finite-DMRG habit of requiring at least one comparison
@@ -1304,6 +1309,9 @@ class SymDMRG2:
         local_eig_tol=1e-8,
         local_eig_energy_tol=float("inf"),
         local_eig_p_tol="auto",
+        local_eig_p_tol_to_trunc="auto",
+        local_eig_p_tol_min=None,
+        local_eig_p_tol_max=1e-4,
         local_eig_min_gap=1e-12,
         local_eig_min_steps=2,
         local_eig_ncv=20,
@@ -1374,15 +1382,42 @@ class SymDMRG2:
             if local_eig_energy_tol is None
             else float(local_eig_energy_tol)
         )
+        local_eig_p_tol_auto = False
         if isinstance(local_eig_p_tol, str):
             local_eig_p_tol_key = local_eig_p_tol.strip().lower().replace("-", "_")
             if local_eig_p_tol_key != "auto":
                 raise ValueError("local_eig_p_tol must be a float, None, or 'auto'.")
+            local_eig_p_tol_auto = True
             local_eig_p_tol = (
                 None if self.local_eig_energy_tol is None else 1e-8
             )
         self.local_eig_p_tol = (
             None if local_eig_p_tol is None else float(local_eig_p_tol)
+        )
+        self._local_eig_p_tol_auto = bool(local_eig_p_tol_auto)
+        if isinstance(local_eig_p_tol_to_trunc, str):
+            local_eig_p_tol_to_trunc_key = (
+                local_eig_p_tol_to_trunc.strip().lower().replace("-", "_")
+            )
+            if local_eig_p_tol_to_trunc_key != "auto":
+                raise ValueError(
+                    "local_eig_p_tol_to_trunc must be a float, None, or 'auto'."
+                )
+            local_eig_p_tol_to_trunc = (
+                0.05
+                if self._local_eig_p_tol_auto and self.local_eig_p_tol is not None
+                else None
+            )
+        self.local_eig_p_tol_to_trunc = (
+            None
+            if local_eig_p_tol_to_trunc is None
+            else float(local_eig_p_tol_to_trunc)
+        )
+        self.local_eig_p_tol_min = (
+            None if local_eig_p_tol_min is None else float(local_eig_p_tol_min)
+        )
+        self.local_eig_p_tol_max = (
+            None if local_eig_p_tol_max is None else float(local_eig_p_tol_max)
         )
         self.local_eig_min_gap = float(local_eig_min_gap)
         self.local_eig_min_steps = int(local_eig_min_steps)
@@ -1467,6 +1502,24 @@ class SymDMRG2:
             raise ValueError("local_eig_energy_tol must be non-negative.")
         if self.local_eig_p_tol is not None and self.local_eig_p_tol < 0.0:
             raise ValueError("local_eig_p_tol must be non-negative.")
+        if (
+            self.local_eig_p_tol_to_trunc is not None
+            and self.local_eig_p_tol_to_trunc < 0.0
+        ):
+            raise ValueError("local_eig_p_tol_to_trunc must be non-negative.")
+        if self.local_eig_p_tol_min is not None and self.local_eig_p_tol_min < 0.0:
+            raise ValueError("local_eig_p_tol_min must be non-negative.")
+        if self.local_eig_p_tol_max is not None and self.local_eig_p_tol_max < 0.0:
+            raise ValueError("local_eig_p_tol_max must be non-negative.")
+        if (
+            self.local_eig_p_tol_min is not None
+            and self.local_eig_p_tol_max is not None
+            and self.local_eig_p_tol_max < self.local_eig_p_tol_min
+        ):
+            raise ValueError(
+                "local_eig_p_tol_max must be greater than or equal to "
+                "local_eig_p_tol_min."
+            )
         if self.local_eig_min_gap <= 0.0:
             raise ValueError("local_eig_min_gap must be positive.")
         if self.local_eig_min_steps < 1:
@@ -1548,6 +1601,7 @@ class SymDMRG2:
         self.matvec_diagnostic_records = []
         self.local_solve_diagnostics = []
         self.convergence_diagnostics = []
+        self.local_eig_p_tol_diagnostics = []
         self.mixer_diagnostics = []
         self.sector_enrichment_diagnostics = []
         self.variational_sector_diagnostics = []
@@ -2067,6 +2121,51 @@ class SymDMRG2:
         diagnostic.update(energy_data)
         self.convergence_diagnostics.append(diagnostic)
         return diagnostic
+
+    def _local_eig_p_tol_floor(self, cutoff):
+        if self.local_eig_p_tol_min is not None:
+            return float(self.local_eig_p_tol_min)
+        factor = self.local_eig_p_tol_to_trunc
+        if factor is None:
+            return None
+        cutoff = 0.0 if cutoff is None else max(float(cutoff), 0.0)
+        return float(max(1.0e-30, cutoff * cutoff * float(factor)))
+
+    def _update_local_eig_p_tol_from_truncation(self, diagnostic, cutoff):
+        """Update the Lanczos P-error tolerance from sweep SVD truncation."""
+        factor = self.local_eig_p_tol_to_trunc
+        if factor is None or self.local_eig_p_tol is None:
+            return None
+        max_truncation = diagnostic.get("max_truncation_error")
+        if max_truncation is None:
+            return None
+        max_truncation = float(max_truncation)
+        p_tol_min = self._local_eig_p_tol_floor(cutoff)
+        if p_tol_min is None or max_truncation <= p_tol_min:
+            return None
+
+        proposed = float(max_truncation * float(factor))
+        new_p_tol = proposed
+        p_tol_max = self.local_eig_p_tol_max
+        if p_tol_max is not None:
+            new_p_tol = min(float(p_tol_max), new_p_tol)
+        new_p_tol = max(float(p_tol_min), new_p_tol)
+
+        old_p_tol = float(self.local_eig_p_tol)
+        self.local_eig_p_tol = float(new_p_tol)
+        update = {
+            "sweep": int(diagnostic["sweep"]),
+            "old_p_tol": old_p_tol,
+            "new_p_tol": self.local_eig_p_tol,
+            "max_truncation_error": max_truncation,
+            "factor": float(factor),
+            "p_tol_min": float(p_tol_min),
+            "p_tol_max": None if p_tol_max is None else float(p_tol_max),
+            "cutoff": None if cutoff is None else float(cutoff),
+        }
+        diagnostic["local_eig_p_tol_update"] = update
+        self.local_eig_p_tol_diagnostics.append(update)
+        return update
 
     def _check_convergence(self, tol, offsets=None):
         if offsets is None:
@@ -5479,6 +5578,10 @@ class SymDMRG2:
                     tol,
                     convergence_offsets,
                 )
+                self._update_local_eig_p_tol_from_truncation(
+                    convergence_diagnostic,
+                    cutoff,
+                )
                 self.converged = self._apply_convergence_gates(
                     convergence_diagnostic,
                     max_bond,
@@ -5599,6 +5702,9 @@ class SymDMRG2:
             "local_eig_tol": self.local_eig_tol,
             "local_eig_energy_tol": self.local_eig_energy_tol,
             "local_eig_p_tol": self.local_eig_p_tol,
+            "local_eig_p_tol_to_trunc": self.local_eig_p_tol_to_trunc,
+            "local_eig_p_tol_min": self.local_eig_p_tol_min,
+            "local_eig_p_tol_max": self.local_eig_p_tol_max,
             "local_eig_min_gap": self.local_eig_min_gap,
             "local_eig_min_steps": self.local_eig_min_steps,
             "local_eig_ncv": self.local_eig_ncv,
@@ -5670,6 +5776,12 @@ class SymDMRG2:
             "last_local_solve_diagnostic": self.last_local_solve_diagnostic,
             "num_convergence_diagnostics": len(self.convergence_diagnostics),
             "last_convergence_diagnostic": self.last_convergence_diagnostic,
+            "num_local_eig_p_tol_updates": len(self.local_eig_p_tol_diagnostics),
+            "last_local_eig_p_tol_update": (
+                None
+                if not self.local_eig_p_tol_diagnostics
+                else self.local_eig_p_tol_diagnostics[-1]
+            ),
             "num_mixer_diagnostics": len(self.mixer_diagnostics),
             "last_mixer_diagnostic": self.last_mixer_diagnostic,
             "num_sector_enrichment_diagnostics": len(self.sector_enrichment_diagnostics),

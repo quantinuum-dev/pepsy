@@ -1766,6 +1766,121 @@ def test_symdmrg2_native_lanczos_ritz_p_error_gate_cuts_before_ncv():
     assert opt.summary()["local_eig_min_gap"] == pytest.approx(1e-12)
 
 
+def test_symdmrg2_local_eig_p_tol_auto_enables_truncation_coupling():
+    """Automatic P-error stopping should also adapt from truncation error."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        compute_initial_energy=False,
+    )
+    summary = opt.summary()
+
+    assert summary["local_eig_p_tol"] == pytest.approx(1e-8)
+    assert summary["local_eig_p_tol_to_trunc"] == pytest.approx(0.05)
+    assert summary["local_eig_p_tol_min"] is None
+    assert summary["local_eig_p_tol_max"] == pytest.approx(1e-4)
+    assert summary["num_local_eig_p_tol_updates"] == 0
+    assert summary["last_local_eig_p_tol_update"] is None
+
+
+def test_symdmrg2_local_eig_p_tol_auto_disables_with_full_cap_mode():
+    """The explicit full-Krylov compatibility mode should remain untouched."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        local_eig_energy_tol=None,
+        compute_initial_energy=False,
+    )
+    summary = opt.summary()
+
+    assert summary["local_eig_p_tol"] is None
+    assert summary["local_eig_p_tol_to_trunc"] is None
+
+
+def test_symdmrg2_fixed_local_eig_p_tol_stays_fixed_by_default():
+    """Explicit P-error tolerances should not be adapted unless requested."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        local_eig_p_tol=1e-6,
+        compute_initial_energy=False,
+    )
+    summary = opt.summary()
+
+    assert summary["local_eig_p_tol"] == pytest.approx(1e-6)
+    assert summary["local_eig_p_tol_to_trunc"] is None
+
+
+def test_symdmrg2_updates_local_eig_p_tol_from_truncation_diagnostic():
+    """Sweep truncation diagnostics should set the next P-error tolerance."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        local_eig_p_tol=1e-8,
+        local_eig_p_tol_to_trunc=0.05,
+        local_eig_p_tol_min=1e-12,
+        local_eig_p_tol_max=1e-4,
+        compute_initial_energy=False,
+    )
+    diagnostic = {"sweep": 0, "max_truncation_error": 1e-3}
+
+    update = opt._update_local_eig_p_tol_from_truncation(
+        diagnostic,
+        cutoff=1e-10,
+    )
+    summary = opt.summary()
+
+    assert opt.local_eig_p_tol == pytest.approx(5e-5)
+    assert update == diagnostic["local_eig_p_tol_update"]
+    assert update["old_p_tol"] == pytest.approx(1e-8)
+    assert update["new_p_tol"] == pytest.approx(5e-5)
+    assert update["max_truncation_error"] == pytest.approx(1e-3)
+    assert update["p_tol_min"] == pytest.approx(1e-12)
+    assert summary["num_local_eig_p_tol_updates"] == 1
+    assert summary["last_local_eig_p_tol_update"] == update
+
+
+def test_symdmrg2_local_eig_p_tol_truncation_update_respects_bounds():
+    """The TeNPy-style P-error update should obey min and max clamps."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        local_eig_p_tol=1e-8,
+        local_eig_p_tol_to_trunc=0.05,
+        local_eig_p_tol_max=1e-4,
+        compute_initial_energy=False,
+    )
+
+    capped = opt._update_local_eig_p_tol_from_truncation(
+        {"sweep": 0, "max_truncation_error": 1.0},
+        cutoff=1e-10,
+    )
+    skipped = opt._update_local_eig_p_tol_from_truncation(
+        {"sweep": 1, "max_truncation_error": 1e-32},
+        cutoff=1e-10,
+    )
+
+    assert capped["new_p_tol"] == pytest.approx(1e-4)
+    assert capped["p_tol_min"] == pytest.approx(5e-22)
+    assert skipped is None
+    assert opt.local_eig_p_tol == pytest.approx(1e-4)
+
+
 def test_symdmrg2_local_eig_ncv_accepts_sweep_schedule():
     """The native Lanczos Krylov cap should follow the sweep schedule."""
     pytest.importorskip("symmray")

@@ -81,6 +81,16 @@ the gate. The defaults use `local_eig_energy_tol=inf`,
 is well resolved by the residual/gap criterion. For compatibility,
 `local_eig_p_tol="auto"` resolves to `None` when
 `local_eig_energy_tol=None`, preserving the explicit full-Krylov-cap mode.
+When `local_eig_p_tol` is automatic and active, the default
+`local_eig_p_tol_to_trunc="auto"` resolves to TeNPy's `0.05` coupling: after
+each sweep, SymDMRG2 sets the next sweep's P-error tolerance from
+`max_truncation_error * local_eig_p_tol_to_trunc`, clamped by
+`local_eig_p_tol_min` and `local_eig_p_tol_max` (default `1e-4`). If
+`local_eig_p_tol_min` is omitted, the floor is derived from the active SVD
+cutoff as `max(1e-30, cutoff**2 * factor)`. Explicit fixed
+`local_eig_p_tol` values stay fixed unless `local_eig_p_tol_to_trunc` is set
+explicitly. Update records are exposed in `summary()` and the per-sweep
+convergence diagnostic.
 `local_eig_ncv` may also be a sweep schedule whose last entry repeats, matching
 `bond_dims` and `cutoffs`. Local solve diagnostics record `stop_reason`,
 `ritz_energy_delta`, `ritz_gap`, `ritz_p_error`, `num_steps`, and
