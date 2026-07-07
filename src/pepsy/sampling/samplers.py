@@ -52,6 +52,48 @@ def _validate_one_d_to_two_d(
     return L
 
 
+def _normalize_mps_sampler_backend(backend):
+    if backend is None:
+        return "quimb"
+    key = str(backend).strip().lower().replace("-", "_")
+    aliases = {
+        "quimb": "quimb",
+        "cpu": "quimb",
+        "numpy_quimb": "quimb",
+        "auto": "auto",
+        "native": "native",
+        "device": "native",
+        "cuda": "native",
+        "gpu": "native",
+        "numpy": "numpy",
+        "np": "numpy",
+        "torch": "torch",
+        "pytorch": "torch",
+        "cupy": "cupy",
+        "cp": "cupy",
+    }
+    try:
+        return aliases[key]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(aliases))
+        raise ValueError(
+            f"Unknown MpsSampler backend {backend!r}. Expected one of: {allowed}."
+        ) from exc
+
+
+def _mps_array_backend(array):
+    module = type(array).__module__.split(".", 1)[0]
+    if module == "torch":
+        return "torch"
+    if module == "cupy":
+        return "cupy"
+    if isinstance(array, np.ndarray):
+        return "numpy"
+    if hasattr(array, "blocks"):
+        return "symmray"
+    return "unknown"
+
+
 @dataclass
 class PEPSSampleResult:
     """Container for PEPS BP importance samples.
@@ -111,10 +153,12 @@ class MpsSampleResult:
 
 
 class MpsSampler:
-    """Sample from an MPS using quimb's canonical-form sampler.
+    """Sample from an MPS using quimb or a backend-native batched sampler.
 
-    Handles GPU→CPU conversion and maps 1D MPS site indices to 2D lattice
-    coordinates via a ``one_d_to_two_d`` mapping.
+    The legacy ``backend="quimb"`` path handles GPU→CPU conversion and calls
+    quimb's canonical-form sampler. ``backend="native"`` keeps dense NumPy,
+    Torch, or CuPy MPS arrays on their current device, canonicalizes once, and
+    draws all requested samples with batched conditional contractions.
 
     Parameters
     ----------
@@ -122,30 +166,225 @@ class MpsSampler:
         The MPS to sample from (can be on any backend).
     one_d_to_two_d : dict[int, tuple[int, int]]
         Mapping from 1D site index to (x, y) lattice coordinate.
+    backend : {"quimb", "native", "auto", "numpy", "torch", "cupy"}
+        Sampling implementation. ``"quimb"`` preserves the historical CPU
+        behavior. ``"native"`` accepts dense NumPy/Torch/CuPy tensors.
+        ``"auto"`` tries native sampling and falls back to ``"quimb"`` when
+        the MPS layout is unsupported.
     """
 
-    def __init__(self, psi, one_d_to_two_d: dict[int, tuple[int, int]]):
+    def __init__(
+        self,
+        psi,
+        one_d_to_two_d: dict[int, tuple[int, int]],
+        *,
+        backend: str | None = "quimb",
+    ):
         _validate_one_d_to_two_d(one_d_to_two_d, expected_L=getattr(psi, "L", None))
         self.one_d_to_two_d = one_d_to_two_d
         self.Lx = max(x for x, y in one_d_to_two_d.values()) + 1
         self.Ly = max(y for x, y in one_d_to_two_d.values()) + 1
+        self.backend = _normalize_mps_sampler_backend(backend)
+        self.resolved_backend = None
+        self._native_arrays = None
+        self._psi = None
+
+        if self.backend != "quimb":
+            try:
+                native_backend, native_arrays = self._prepare_native_arrays(psi)
+                if (
+                    self.backend in {"numpy", "torch", "cupy"}
+                    and native_backend != self.backend
+                ):
+                    raise ValueError(
+                        f"MpsSampler backend={self.backend!r} requested, but "
+                        f"the MPS tensors use backend {native_backend!r}."
+                    )
+                self.resolved_backend = native_backend
+                self._native_arrays = native_arrays
+                return
+            except Exception:
+                if self.backend != "auto":
+                    raise
+
+        self.resolved_backend = "quimb"
         # Convert to numpy for quimb sampling compatibility
         self._psi = psi.copy()
         self._psi.apply_to_arrays(
             lambda x: x.get() if hasattr(x, "get") else np.asarray(x)
         )
 
+    @staticmethod
+    def _canonicalize_for_native(psi):
+        try:
+            return psi.copy().canonicalize(0)
+        except Exception as exc:  # pragma: no cover - backend-specific failure
+            raise ValueError(
+                "backend-native MPS sampling requires a dense MPS that quimb can "
+                "canonicalize on its current array backend."
+            ) from exc
+
+    @staticmethod
+    def _site_array_lr_phys_r(psi, site):
+        tensor = psi[site]
+        site_ind = psi.site_ind(site)
+        left_ind = psi.bond(site - 1, site) if site > 0 else None
+        right_ind = psi.bond(site, site + 1) if site < psi.L - 1 else None
+        if left_ind is None and right_ind is None:
+            data = tensor.transpose(site_ind).data
+            return data.reshape((1, data.shape[0], 1))
+        if left_ind is None:
+            data = tensor.transpose(site_ind, right_ind).data
+            return data.reshape((1, data.shape[0], data.shape[1]))
+        if right_ind is None:
+            data = tensor.transpose(left_ind, site_ind).data
+            return data.reshape((data.shape[0], data.shape[1], 1))
+        return tensor.transpose(left_ind, site_ind, right_ind).data
+
+    def _prepare_native_arrays(self, psi):
+        psi_native = self._canonicalize_for_native(psi)
+        arrays = tuple(
+            self._site_array_lr_phys_r(psi_native, site)
+            for site in range(psi_native.L)
+        )
+        if not arrays:
+            raise ValueError("Cannot sample an empty MPS.")
+        backends = {_mps_array_backend(array) for array in arrays}
+        if len(backends) != 1:
+            raise ValueError(f"MPS tensors use mixed backends {sorted(backends)!r}.")
+        backend = next(iter(backends))
+        if backend not in {"numpy", "torch", "cupy"}:
+            raise ValueError(
+                "backend-native MPS sampling currently supports dense NumPy, "
+                f"Torch, or CuPy arrays, not {backend!r}."
+            )
+        return backend, arrays
+
+    @staticmethod
+    def _torch_sample(arrays, n_samples, seed):
+        import torch  # pylint: disable=import-outside-toplevel
+
+        device = arrays[0].device
+        dtype = arrays[0].dtype
+        if not (torch.is_floating_point(arrays[0]) or torch.is_complex(arrays[0])):
+            dtype = torch.float64
+        arrays = tuple(array.to(device=device, dtype=dtype) for array in arrays)
+        vec = torch.ones((int(n_samples), 1), dtype=dtype, device=device)
+        probs_total = torch.ones((int(n_samples),), dtype=torch.float64, device=device)
+        configs = []
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+
+        for array in arrays:
+            amps = torch.einsum("bl,ldr->bdr", vec, array)
+            probs = amps.abs().square().sum(dim=2).real
+            probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(
+                torch.finfo(probs.dtype).tiny
+            )
+            choices = torch.multinomial(probs, 1, generator=generator).reshape(-1)
+            batch = torch.arange(int(n_samples), device=device)
+            selected_probs = probs[batch, choices]
+            vec = amps[batch, choices, :] / torch.sqrt(selected_probs).clamp_min(
+                torch.finfo(selected_probs.dtype).tiny
+            ).reshape(-1, 1).to(dtype=dtype)
+            probs_total = probs_total * selected_probs.to(dtype=torch.float64)
+            configs.append(choices)
+
+        configs = torch.stack(configs, dim=1).detach().cpu().numpy()
+        probs_total = probs_total.detach().cpu().numpy()
+        return configs, probs_total
+
+    @staticmethod
+    def _array_namespace_sample(arrays, n_samples, seed, *, backend):
+        xp = np
+        if backend == "cupy":
+            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
+
+        dtype = np.dtype(getattr(arrays[0], "dtype", np.float64))
+        if dtype.kind not in {"f", "c"}:
+            dtype = np.dtype(np.float64)
+        arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+        vec = xp.ones((int(n_samples), 1), dtype=dtype)
+        probs_total = xp.ones((int(n_samples),), dtype=np.float64)
+        configs = []
+        rng = xp.random.default_rng(seed)
+
+        for array in arrays:
+            amps = xp.einsum("bl,ldr->bdr", vec, array)
+            probs = xp.sum(xp.abs(amps) ** 2, axis=2).real
+            probs = probs / xp.maximum(
+                probs.sum(axis=1, keepdims=True),
+                np.finfo(float).tiny,
+            )
+            cdf = xp.cumsum(probs, axis=1)
+            draws = rng.random(int(n_samples))
+            choices = xp.sum(draws[:, None] > cdf, axis=1).astype(np.int64)
+            choices = xp.minimum(choices, probs.shape[1] - 1)
+            batch = xp.arange(int(n_samples))
+            selected_probs = probs[batch, choices]
+            vec = amps[batch, choices, :] / xp.sqrt(
+                xp.maximum(selected_probs, np.finfo(float).tiny)
+            )[:, None]
+            probs_total = probs_total * selected_probs
+            configs.append(choices)
+
+        configs = xp.stack(configs, axis=1)
+        if backend == "cupy":
+            configs = configs.get()
+            probs_total = probs_total.get()
+        return np.asarray(configs), np.asarray(probs_total)
+
+    def _native_sample_arrays(self, n_samples, seed):
+        if self.resolved_backend == "torch":
+            return self._torch_sample(self._native_arrays, n_samples, seed)
+        return self._array_namespace_sample(
+            self._native_arrays,
+            n_samples,
+            seed,
+            backend=self.resolved_backend,
+        )
+
+    def _result_from_arrays(self, configs_array, probs_array):
+        configs_1d = []
+        configs_2d = []
+        probs = []
+        for config, prob in zip(configs_array, probs_array):
+            config = [int(value) for value in config]
+            configs_1d.append(config)
+            grid = np.zeros((self.Ly, self.Lx), dtype=int)
+            for site_1d, spin in enumerate(config):
+                x, y = self.one_d_to_two_d[site_1d]
+                grid[y, x] = spin
+            configs_2d.append(grid)
+            probs.append(float(prob))
+        return MpsSampleResult(
+            configs_1d=configs_1d,
+            configs_2d=configs_2d,
+            probs=probs,
+            Lx=self.Lx,
+            Ly=self.Ly,
+        )
+
     def sample(self, n_samples: int = 1, seed: int | None = None) -> MpsSampleResult:
         """Draw ``n_samples`` configurations from the MPS.
 
-        Uses quimb's ``MatrixProductState.sample()`` which internally
-        right-canonicalizes the MPS and sweeps left-to-right.
+        The native backend uses batched conditional contractions on the MPS
+        tensor device. The quimb backend uses ``MatrixProductState.sample()``,
+        which internally right-canonicalizes the MPS and sweeps left-to-right.
 
         Returns
         -------
         MpsSampleResult
             Contains 1D configs, 2D grids, and Born probabilities.
         """
+        if int(n_samples) < 1:
+            raise ValueError("n_samples must be a positive integer.")
+        if self._native_arrays is not None:
+            configs, probs = self._native_sample_arrays(int(n_samples), seed)
+            return self._result_from_arrays(configs, probs)
+
         configs_1d = []
         configs_2d = []
         probs = []

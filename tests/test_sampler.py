@@ -124,6 +124,73 @@ def test_mps_sampler_rejects_bad_coordinates():
         sampler_mod.MpsSampler(psi, {0: (0.0, 0)})
 
 
+def test_mps_sampler_native_numpy_samples_product_state():
+    """Native sampler should batch samples without quimb's CPU sampler."""
+    psi = qtn.MPS_computational_state("101")
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0), 2: (2, 0)},
+        backend="native",
+    )
+
+    result = sampler.sample(4, seed=1)
+
+    assert sampler.resolved_backend == "numpy"
+    assert result.configs_1d == [[1, 0, 1]] * 4
+    assert all(
+        np.array_equal(grid, np.array([[1, 0, 1]]))
+        for grid in result.configs_2d
+    )
+    assert result.probs == [1.0] * 4
+
+
+def test_mps_sampler_native_numpy_reports_born_probabilities():
+    """Native sampler should return the probability of each sampled config."""
+    site_probs = [(0.8, 0.2), (0.3, 0.7)]
+    psi = qtn.MPS_product_state([
+        np.sqrt(np.array(probs))
+        for probs in site_probs
+    ])
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+
+    result = sampler.sample(20, seed=4)
+
+    for config, prob in zip(result.configs_1d, result.probs):
+        expected = site_probs[0][config[0]] * site_probs[1][config[1]]
+        assert prob == pytest.approx(expected)
+
+
+def test_mps_sampler_native_torch_keeps_tensors_on_torch():
+    """Torch MPS tensors should stay on Torch through native sampling."""
+    torch = pytest.importorskip("torch")
+    psi = qtn.MPS_computational_state("10")
+    psi.apply_to_arrays(lambda array: torch.as_tensor(array, dtype=torch.float64))
+
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+    result = sampler.sample(3, seed=2)
+
+    assert sampler.resolved_backend == "torch"
+    assert all(isinstance(array, torch.Tensor) for array in sampler._native_arrays)
+    assert result.configs_1d == [[1, 0]] * 3
+    assert result.probs == [1.0] * 3
+
+
+def test_mps_sampler_rejects_explicit_native_backend_mismatch():
+    """Explicit native backend requests should fail instead of copying devices."""
+    psi = qtn.MPS_computational_state("0")
+
+    with pytest.raises(ValueError, match="backend='torch' requested"):
+        sampler_mod.MpsSampler(psi, {0: (0, 0)}, backend="torch")
+
+
 def test_vec_sampler_rejects_invalid_vector_size():
     """Dense vector length must match the site-map Hilbert-space dimension."""
     with pytest.raises(ValueError, match=r"2\*\*L=4"):
