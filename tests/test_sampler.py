@@ -108,6 +108,7 @@ def test_sampler_public_exports_resolve():
     """Sampler helpers should be available from the package namespace."""
     assert pepsy.PepsBpSampler is sampler_mod.PepsBpSampler
     assert pepsy.PEPSSampleResult is sampler_mod.PEPSSampleResult
+    assert pepsy.MpsBatchSampleResult is sampler_mod.MpsBatchSampleResult
 
 
 def test_mps_sampler_rejects_incomplete_site_map():
@@ -161,6 +162,37 @@ def test_mps_sampler_native_numpy_sample_arrays_returns_arrays():
     assert probs.shape == (4,)
     np.testing.assert_array_equal(configs, np.array([[1, 0, 1]] * 4))
     np.testing.assert_allclose(probs, np.ones(4))
+
+
+def test_mps_sampler_native_numpy_sample_batch_result_helpers():
+    """Named batch samples should convert cleanly to legacy forms."""
+    psi = qtn.MPS_computational_state("101")
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0), 2: (2, 0)},
+        backend="native",
+    )
+
+    batch = sampler.sample_batch(4, seed=1)
+    numpy_batch = batch.to_numpy()
+    legacy = batch.to_sample_result()
+
+    assert isinstance(batch, sampler_mod.MpsBatchSampleResult)
+    assert len(batch) == 4
+    assert batch.n_samples == 4
+    assert batch.L == 3
+    assert batch.backend == "numpy"
+    assert numpy_batch.backend == "numpy"
+    np.testing.assert_array_equal(batch.configs, np.array([[1, 0, 1]] * 4))
+    np.testing.assert_allclose(batch.probs, np.ones(4))
+    assert batch.configs_1d() == [[1, 0, 1]] * 4
+    assert all(
+        np.array_equal(grid, np.array([[1, 0, 1]]))
+        for grid in batch.configs_2d()
+    )
+    np.testing.assert_allclose(batch.magnetizations(), [-1 / 3] * 4)
+    assert legacy.configs_1d == [[1, 0, 1]] * 4
+    assert legacy.probs == [1.0] * 4
 
 
 def test_mps_sampler_native_site_ops_are_reused(monkeypatch):
@@ -277,6 +309,38 @@ def test_mps_sampler_native_torch_sample_arrays_stays_on_torch():
     torch.testing.assert_close(probs, torch.ones(3, dtype=probs.dtype))
 
 
+def test_mps_sampler_native_torch_sample_batch_stays_on_torch():
+    """Named Torch batch samples should keep tensors and convert on demand."""
+    torch = pytest.importorskip("torch")
+    psi = qtn.MPS_computational_state("10")
+    psi.apply_to_arrays(lambda array: torch.as_tensor(array, dtype=torch.float64))
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+
+    batch = sampler.sample_batch(3, seed=2)
+    numpy_batch = batch.to_numpy()
+    legacy = batch.to_sample_result()
+
+    assert batch.backend == "torch"
+    assert isinstance(batch.configs, torch.Tensor)
+    assert isinstance(batch.probs, torch.Tensor)
+    torch.testing.assert_close(
+        batch.configs,
+        torch.tensor([[1, 0]] * 3, dtype=torch.long, device=batch.configs.device),
+    )
+    torch.testing.assert_close(batch.probs, torch.ones(3, dtype=batch.probs.dtype))
+    torch.testing.assert_close(
+        batch.magnetizations(),
+        torch.zeros(3, dtype=batch.probs.dtype, device=batch.probs.device),
+    )
+    assert isinstance(numpy_batch.configs, np.ndarray)
+    assert numpy_batch.backend == "numpy"
+    assert legacy.configs_1d == [[1, 0]] * 3
+
+
 def test_mps_sampler_native_torch_evaluates_batched_configs_on_torch():
     """Torch probability/amplitude evaluation should stay on Torch."""
     torch = pytest.importorskip("torch")
@@ -364,6 +428,16 @@ def test_mps_sampler_native_cupy_sample_arrays_stays_on_cupy():
     )
     cupy.testing.assert_allclose(probs, cupy.ones(3, dtype=probs.dtype))
 
+    batch = sampler.sample_batch(3, seed=2)
+    assert batch.backend == "cupy"
+    assert isinstance(batch.configs, cupy.ndarray)
+    assert isinstance(batch.probs, cupy.ndarray)
+    cupy.testing.assert_array_equal(
+        batch.configs,
+        cupy.asarray([[1, 0]] * 3, dtype=cupy.int64),
+    )
+    assert isinstance(batch.to_numpy().configs, np.ndarray)
+
 
 def test_mps_sampler_rejects_explicit_native_backend_mismatch():
     """Explicit native backend requests should fail instead of copying devices."""
@@ -396,6 +470,32 @@ def test_mps_sampler_sample_arrays_validates_sample_count():
 
     with pytest.raises(ValueError, match="positive integer"):
         sampler.sample_arrays(0)
+
+
+def test_mps_sampler_sample_batch_validates_sample_count():
+    """Named batched sampling should reject non-positive sample counts."""
+    psi = qtn.MPS_computational_state("0")
+    sampler = sampler_mod.MpsSampler(psi, {0: (0, 0)}, backend="native")
+
+    with pytest.raises(ValueError, match="positive integer"):
+        sampler.sample_batch(0)
+
+
+def test_mps_sampler_quimb_sample_batch_returns_numpy_result():
+    """Default quimb backend should still support the named batch API."""
+    psi = qtn.MPS_computational_state("10")
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+    )
+
+    batch = sampler.sample_batch(3, seed=2)
+
+    assert batch.backend == "numpy"
+    assert isinstance(batch.configs, np.ndarray)
+    assert isinstance(batch.probs, np.ndarray)
+    assert batch.configs_1d() == [[1, 0]] * 3
+    assert batch.to_sample_result().configs_1d == [[1, 0]] * 3
 
 
 def test_vec_sampler_rejects_invalid_vector_size():

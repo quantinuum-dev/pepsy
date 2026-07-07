@@ -13,6 +13,7 @@ sample_d2bp = None
 build_optimizer = None
 
 __all__ = [
+    "MpsBatchSampleResult",
     "MpsSampleResult",
     "MpsSampler",
     "PEPSSampleResult",
@@ -94,6 +95,37 @@ def _mps_array_backend(array):
     return "unknown"
 
 
+def _backend_array_to_numpy(array):
+    backend = _mps_array_backend(array)
+    if backend == "torch":
+        return array.detach().cpu().numpy()
+    if backend == "cupy":
+        return array.get()
+    return np.asarray(array)
+
+
+def _configs_to_sample_result(configs, probs, *, Lx, Ly, one_d_to_two_d):
+    configs_1d = []
+    configs_2d = []
+    probs_out = []
+    for config, prob in zip(configs, probs):
+        config = [int(value) for value in config]
+        configs_1d.append(config)
+        grid = np.zeros((Ly, Lx), dtype=int)
+        for site_1d, spin in enumerate(config):
+            x, y = one_d_to_two_d[site_1d]
+            grid[y, x] = spin
+        configs_2d.append(grid)
+        probs_out.append(float(prob))
+    return MpsSampleResult(
+        configs_1d=configs_1d,
+        configs_2d=configs_2d,
+        probs=probs_out,
+        Lx=Lx,
+        Ly=Ly,
+    )
+
+
 @dataclass
 class PEPSSampleResult:
     """Container for PEPS BP importance samples.
@@ -150,6 +182,93 @@ class MpsSampleResult:
         return np.array([
             np.sum(1 - 2 * np.array(c)) / L for c in self.configs_1d
         ])
+
+
+@dataclass
+class MpsBatchSampleResult:
+    """Backend-native batched MPS samples.
+
+    Attributes
+    ----------
+    configs
+        Array-like object with shape ``(n_samples, L)``. With the native
+        sampler this can be a NumPy array, Torch tensor, or CuPy array.
+    probs
+        Born probabilities for ``configs`` with shape ``(n_samples,)``.
+    Lx, Ly
+        2D lattice dimensions used by :meth:`configs_2d` and
+        :meth:`to_sample_result`.
+    one_d_to_two_d
+        Mapping from 1D site index to ``(x, y)`` coordinate.
+    backend
+        Backend of ``configs`` and ``probs``: ``"numpy"``, ``"torch"``, or
+        ``"cupy"``.
+    """
+
+    configs: Any
+    probs: Any
+    Lx: int
+    Ly: int
+    one_d_to_two_d: dict[int, tuple[int, int]]
+    backend: str = "numpy"
+
+    def __len__(self):
+        return int(self.configs.shape[0])
+
+    @property
+    def n_samples(self) -> int:
+        """Number of sampled configurations."""
+        return len(self)
+
+    @property
+    def L(self) -> int:
+        """Number of MPS sites."""
+        return int(self.configs.shape[1])
+
+    def to_numpy(self) -> "MpsBatchSampleResult":
+        """Return a CPU NumPy copy of this batched result."""
+        return MpsBatchSampleResult(
+            configs=_backend_array_to_numpy(self.configs),
+            probs=_backend_array_to_numpy(self.probs),
+            Lx=self.Lx,
+            Ly=self.Ly,
+            one_d_to_two_d=dict(self.one_d_to_two_d),
+            backend="numpy",
+        )
+
+    def configs_1d(self) -> list[list[int]]:
+        """Return configurations as Python ``list[list[int]]``."""
+        configs = _backend_array_to_numpy(self.configs)
+        return [[int(value) for value in config] for config in configs]
+
+    def configs_2d(self) -> list[np.ndarray]:
+        """Return configurations as ``(Ly, Lx)`` NumPy grids."""
+        return self.to_sample_result().configs_2d
+
+    def magnetizations(self, *, to_numpy: bool = False):
+        """Per-sample magnetization ``(1 / L) * sum_i (1 - 2 * spin_i)``."""
+        backend = _mps_array_backend(self.configs)
+        if backend == "torch":
+            configs = self.configs.to(dtype=self.probs.dtype)
+            out = (1 - 2 * configs).sum(dim=1) / float(self.L)
+            return out.detach().cpu().numpy() if to_numpy else out
+        if backend == "cupy":
+            configs = self.configs.astype(np.float64, copy=False)
+            out = (1 - 2 * configs).sum(axis=1) / float(self.L)
+            return out.get() if to_numpy else out
+        configs = np.asarray(self.configs, dtype=float)
+        return (1 - 2 * configs).sum(axis=1) / float(self.L)
+
+    def to_sample_result(self) -> MpsSampleResult:
+        """Convert to the legacy list/grid :class:`MpsSampleResult`."""
+        batch = self.to_numpy()
+        return _configs_to_sample_result(
+            batch.configs,
+            batch.probs,
+            Lx=batch.Lx,
+            Ly=batch.Ly,
+            one_d_to_two_d=batch.one_d_to_two_d,
+        )
 
 
 class MpsSampler:
@@ -566,11 +685,7 @@ class MpsSampler:
 
     @staticmethod
     def _to_numpy_backend_array(array, backend):
-        if backend == "torch":
-            return array.detach().cpu().numpy()
-        if backend == "cupy":
-            return array.get()
-        return np.asarray(array)
+        return _backend_array_to_numpy(array)
 
     def amplitudes(self, configs, *, to_numpy: bool = True):
         """Return batched MPS amplitudes for ``configs``.
@@ -641,25 +756,38 @@ class MpsSampler:
             probs.append(prob)
         return np.asarray(configs, dtype=np.int64), np.asarray(probs, dtype=float)
 
-    def _result_from_arrays(self, configs_array, probs_array):
-        configs_1d = []
-        configs_2d = []
-        probs = []
-        for config, prob in zip(configs_array, probs_array):
-            config = [int(value) for value in config]
-            configs_1d.append(config)
-            grid = np.zeros((self.Ly, self.Lx), dtype=int)
-            for site_1d, spin in enumerate(config):
-                x, y = self.one_d_to_two_d[site_1d]
-                grid[y, x] = spin
-            configs_2d.append(grid)
-            probs.append(float(prob))
-        return MpsSampleResult(
-            configs_1d=configs_1d,
-            configs_2d=configs_2d,
+    def sample_batch(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        to_numpy: bool = False,
+    ) -> MpsBatchSampleResult:
+        """Draw samples and return a named batched result.
+
+        This is the preferred API for fast downstream workflows. With
+        ``backend="native"`` and ``to_numpy=False``, Torch/CuPy arrays stay on
+        their current device. Use :meth:`sample_arrays` when tuple unpacking is
+        more convenient, or :meth:`sample` when the legacy Python-list/grid
+        result is needed.
+        """
+        configs, probs = self.sample_arrays(
+            n_samples,
+            seed=seed,
+            to_numpy=to_numpy,
+        )
+        backend = (
+            "numpy"
+            if to_numpy or self._native_arrays is None
+            else self.resolved_backend
+        )
+        return MpsBatchSampleResult(
+            configs=configs,
             probs=probs,
             Lx=self.Lx,
             Ly=self.Ly,
+            one_d_to_two_d=dict(self.one_d_to_two_d),
+            backend=backend,
         )
 
     def sample(self, n_samples: int = 1, seed: int | None = None) -> MpsSampleResult:
@@ -674,36 +802,11 @@ class MpsSampler:
         MpsSampleResult
             Contains 1D configs, 2D grids, and Born probabilities.
         """
-        if int(n_samples) < 1:
-            raise ValueError("n_samples must be a positive integer.")
-        if self._native_arrays is not None:
-            configs, probs = self._native_sample_arrays(
-                int(n_samples),
-                seed,
-                to_numpy=True,
-            )
-            return self._result_from_arrays(configs, probs)
-
-        configs_1d = []
-        configs_2d = []
-        probs = []
-
-        for config, prob in self._psi.sample(n_samples, seed=seed):
-            configs_1d.append(list(config))
-            grid = np.zeros((self.Ly, self.Lx), dtype=int)
-            for site_1d, spin in enumerate(config):
-                x, y = self.one_d_to_two_d[site_1d]
-                grid[y, x] = spin
-            configs_2d.append(grid)
-            probs.append(float(prob))
-
-        return MpsSampleResult(
-            configs_1d=configs_1d,
-            configs_2d=configs_2d,
-            probs=probs,
-            Lx=self.Lx,
-            Ly=self.Ly,
-        )
+        return self.sample_batch(
+            n_samples,
+            seed=seed,
+            to_numpy=True,
+        ).to_sample_result()
 
 
 class VecSampler:

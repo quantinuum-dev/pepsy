@@ -100,6 +100,7 @@ _SYMBOL_MODULES = {
     "SimpleUpdateGen": ".optimizers",
     "SymDMRG2": ".optimizers",
     "SweepOptimizer": ".optimizers",
+    "MpsBatchSampleResult": ".sampling",
     "MpsSampleResult": ".sampling",
     "MpsSampler": ".sampling",
     "PEPSSampleResult": ".sampling",
@@ -249,6 +250,7 @@ __all__ = [
     "SimpleUpdateGen",
     "SymDMRG2",
     "SweepOptimizer",
+    "MpsBatchSampleResult",
     "MpsSampleResult",
     "MpsSampler",
     "PEPSSampleResult",
@@ -389,7 +391,7 @@ if TYPE_CHECKING:
         z,
     )
     from .optimizers import GlobalOptimizer, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, PepsEnergyOptimizer, PepsOptimizer, SimpleUpdateGen, SymDMRG2, SweepOptimizer
-    from .sampling import MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, VecSampler
+    from .sampling import MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, VecSampler
     from .solvers import FDSolver
     from .tensors import (
         OneDMap,

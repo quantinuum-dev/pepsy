@@ -2,9 +2,17 @@
 
 from importlib import import_module
 
-from .samplers import MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, VecSampler
+from .samplers import (
+    MpsBatchSampleResult,
+    MpsSampleResult,
+    MpsSampler,
+    PEPSSampleResult,
+    PepsBpSampler,
+    VecSampler,
+)
 
 __all__ = [
+    "MpsBatchSampleResult",
     "MpsSampleResult",
     "MpsSampler",
     "PEPSSampleResult",
