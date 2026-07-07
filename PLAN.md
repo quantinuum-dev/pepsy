@@ -218,9 +218,23 @@ constructions, plus the fermionic Fermi-Hubbard starters in
 - Added `benchmarks/symdmrg2_fh_u1u1.py`, a deterministic FH U1U1 OBC
   benchmark harness that emits case metadata, final energy, and profiling data
   as JSON.
-- The next DMRG step is to use those profiles on larger target chains to reduce
-  block-native matvec overhead and tune adaptive enrichment schedules, then add
-  torch-native block contractions where useful.
+- SymDMRG2 now has TeNPy-style robust random and product-growth initialization
+  paths for hard mapped-2D DMRG cases. `SymMPS.random_unitary_evolution(...)`
+  and `SymMPS.random_unitary_for_model(...)` build well-conditioned random MPS
+  starts by growing a product state with charge-preserving two-site random
+  unitary layers. Product-like starts also take the automatic gentle
+  bond-dimension ramp by default.
+- Native block Lanczos now uses TeNPy-style Ritz stopping and adaptive
+  truncation-aware P-error tolerance. The local solve records residual/gap
+  P-error diagnostics and can update the next sweep's `local_eig_p_tol` from
+  the observed maximum SVD truncation error.
+- The next DMRG step is to run the 6 by 6 mapped-PBC control on the adaptive
+  P-tolerance commit and compare algorithmic counters, especially
+  `avg_lanczos_matvecs`, `lanczos_stop_reasons`, and
+  `num_local_eig_p_tol_updates`. If local matvec counts are already low but the
+  run is still slower than TeNPy, shift focus to per-matvec cost: fused
+  projected-problem contraction routing, cache reuse, and block-native
+  hot-loop profiling.
 
 ### Validation
 

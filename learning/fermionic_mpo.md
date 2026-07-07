@@ -177,3 +177,16 @@ the interruption.
   environment setup/update, norm checks, local eigensolves, matvecs, SVD splits,
   enrichment, sweeps, and solve totals. `benchmarks/symdmrg2_fh_u1u1.py` emits
   those diagnostics as JSON for deterministic OBC FH U1U1 chains.
+- Hard mapped-2D DMRG comparisons against TeNPy showed two separate issues:
+  robustness of the initial state and cost of the local Lanczos solve. For
+  robust starts, prefer `SymMPS.random_unitary_evolution(...)` or
+  `SymMPS.random_unitary_for_model(...)`, which grow a charge-correct product
+  state with charge-preserving two-site random unitaries and canonicalize the
+  result. Raw full-bond `SymMPS.random(...)` remains a useful stress test, but
+  it is not the stable default for difficult DMRG basins.
+- Native block Lanczos now follows the TeNPy stopping pattern more closely. It
+  records Ritz energy changes, residual/gap P-error estimates, stop reasons,
+  and local matvec counts; with `local_eig_p_tol="auto"` it can also adapt the
+  next sweep's P-error tolerance from the previous sweep's maximum SVD
+  truncation error. For speed comparisons on busy shared machines, prefer these
+  algorithmic counters over raw wall time.
