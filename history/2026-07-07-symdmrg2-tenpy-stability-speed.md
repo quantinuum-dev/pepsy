@@ -67,6 +67,49 @@
   engaging on repeated matvecs (`compiled_block_plan_uses > 0`) and reducing
   the compiled contraction substep on the local probe. This is only a
   micro-control; the 6 by 6 run remains the meaningful next benchmark.
+- Final corrected TeNPy comparisons use `eng.run()` for all TeNPy numbers.
+  The earlier manual-loop TeNPy control understated TeNPy by about
+  `0.002` to `0.005` per site, so the previous "Pepsy beats TeNPy on 6 by 6
+  by about `0.006`" interpretation was inflated.
+
+### Final corrected TeNPy comparison
+
+5 by 6, converged at 50 sweeps:
+
+| engine | energy/N - U/4 | wall |
+|---|---:|---:|
+| TeNPy `eng.run()` | -2.426742 | 65 s |
+| Pepsy random-unitary+off | -2.421614 | 935 s |
+| Pepsy product+off | -2.421133 | 968 s |
+
+TeNPy wins the 5 by 6 case by about `0.005` per site. The 30 to 50 sweep
+plateau did not close the gap for Pepsy.
+
+6 by 6:
+
+| engine | energy/N - U/4 | wall |
+|---|---:|---:|
+| Pepsy product+off, 30 sweeps | -2.429772 | 710 s |
+| TeNPy `eng.run()`, 50 sweeps | -2.429620 | 86 s |
+| TeNPy `eng.run()`, 30 sweeps | -2.429475 | 55 s |
+| Pepsy random-unitary+off, 30 sweeps | -2.426783 | 764 s |
+
+The 6 by 6 case is a dead heat on energy: Pepsy product+off edges the 50-sweep
+TeNPy control by only about `0.0002` per site. The speed gap remains the real
+headline, with Pepsy about 13 to 14 times slower on these controls.
+
+The corrected story is:
+
+- Pepsy accuracy is competitive on the even-width 6 by 6 mapped-PBC case.
+- Pepsy still trails by about `0.005` per site on the harder odd-width 5 by 6
+  geometry. The most likely explanation is that TeNPy's density-matrix mixer is
+  helping where the current Pepsy controls use `mixer="none"` and Pepsy's
+  current mixer is not the right lever.
+- The product+off path is confirmed healthy on both sizes: no regression to
+  the bad `-2.236` basin, and Lanczos behavior remains stable.
+- Throughput, not asymptotic accuracy on 6 by 6, is now the dominant gap.
+  Profile data points at the per-matvec/local-eigensolver region, now roughly
+  60 percent of wall time.
 
 ## Validation
 
@@ -83,19 +126,12 @@ python -m py_compile src/pepsy/optimizers/sym_dmrg.py tests/test_sym_dmrg.py
 
 ## Remaining work
 
-- Re-run the 6 by 6 random-unitary control on `ec8984a` and compare counters
-  against the Ritz-gate baseline and then against the compiled-block-plan
-  branch:
-  - final energy density,
-  - `avg_lanczos_matvecs`,
-  - `lanczos_stop_reasons`,
-  - `num_local_eig_p_tol_updates`,
-  - `last_local_eig_p_tol_update`,
-  - projected-problem cache hits,
-  - compiled block-plan uses,
-  - matvec timing totals.
+- Implement and test a correct density-matrix mixer, then rerun the 5 by 6
+  odd-width control to see whether the `~0.005` per-site accuracy gap closes.
+- Continue attacking per-matvec/local-eigensolver throughput using:
+  `avg_lanczos_matvecs`, `lanczos_stop_reasons`, projected-problem cache hits,
+  compiled block-plan uses, and matvec timing totals.
 - If compiled block plans improve per-matvec cost without energy drift, keep
-  them as the default hot-loop route for NumPy-backed Symmray DMRG.
-- If the wall-time gap remains large after compiled block plans, continue with
-  allocation reuse, fused projected-problem routing, and lower-level block
-  contraction kernels.
+  them as the default hot-loop route for NumPy-backed Symmray DMRG. If the
+  13 to 14 times wall-time gap remains, continue with allocation reuse, fused
+  projected-problem routing, and lower-level block contraction kernels.

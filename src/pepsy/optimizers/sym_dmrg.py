@@ -687,6 +687,32 @@ def _tensor_block_linear_combination(template, terms):
     return _tensor_with_data(template, _array_with_blocks_like(template.data, blocks))
 
 
+def _tensor_block_add_scaled(tensor, other, coeff):
+    """Return ``tensor + coeff * other``, updating ``tensor`` blocks when safe."""
+    _check_same_block_layout(tensor, other)
+    coeff_dtype = np.asarray(coeff).dtype
+    can_update = True
+    for sector, block in tensor.data.blocks.items():
+        target = _to_numpy(block)
+        source = _to_numpy(other.data.blocks[sector])
+        dtype = np.result_type(target.dtype, source.dtype, coeff_dtype)
+        if not isinstance(block, np.ndarray) or dtype != target.dtype:
+            can_update = False
+            break
+
+    if not can_update:
+        return _tensor_block_linear_combination(
+            tensor,
+            ((1.0, tensor), (coeff, other)),
+        )
+
+    for sector, block in tensor.data.blocks.items():
+        target = _to_numpy(block)
+        source = _to_numpy(other.data.blocks[sector])
+        np.add(target, coeff * source, out=target, casting="unsafe")
+    return tensor
+
+
 def _tensor_block_scale(tensor, coeff):
     coeff_dtype = np.asarray(coeff).dtype
     blocks = {}
@@ -4767,20 +4793,16 @@ class SymDMRG2:
             basis.append(q)
             z = self.two_site_matvec(site, q)
             alpha = _tensor_block_inner(q, z)
-            terms = [(1.0, z), (-alpha, q)]
             if q_prev is not None:
-                terms.append((-beta_prev, q_prev))
-            z = _tensor_block_linear_combination(theta, terms)
+                z = _tensor_block_add_scaled(z, q_prev, -beta_prev)
+            z = _tensor_block_add_scaled(z, q, -alpha)
 
             # Full reorthogonalization keeps the small projected problem stable
             # while retaining the Krylov basis as block tensors.
             for basis_tensor in basis:
                 overlap = _tensor_block_inner(basis_tensor, z)
                 if abs(overlap) > 1e-13:
-                    z = _tensor_block_linear_combination(
-                        theta,
-                        ((1.0, z), (-overlap, basis_tensor)),
-                    )
+                    z = _tensor_block_add_scaled(z, basis_tensor, -overlap)
 
             beta = _tensor_block_norm(z)
             alphas.append(float(np.real(alpha)))
