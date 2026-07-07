@@ -479,7 +479,16 @@ class MpsSampler:
             probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(
                 torch.finfo(probs.dtype).tiny
             )
-            choices = torch.multinomial(probs, 1, generator=generator).reshape(-1)
+            if phys_dim == 2:
+                draws = torch.rand(
+                    (int(n_samples),),
+                    dtype=probs.dtype,
+                    device=device,
+                    generator=generator,
+                )
+                choices = (draws >= probs[:, 0]).to(dtype=torch.long)
+            else:
+                choices = torch.multinomial(probs, 1, generator=generator).reshape(-1)
             selected_probs = probs[batch, choices]
             vec = amps[batch, choices, :] / torch.sqrt(selected_probs).clamp_min(
                 torch.finfo(selected_probs.dtype).tiny
@@ -501,6 +510,7 @@ class MpsSampler:
         batch = xp.arange(int(n_samples))
         configs = []
         rng = xp.random.default_rng(seed)
+        use_binary_draw = backend == "cupy"
 
         for branch_mat, phys_dim, right_dim in site_ops:
             amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
@@ -509,10 +519,13 @@ class MpsSampler:
                 probs.sum(axis=1, keepdims=True),
                 np.finfo(float).tiny,
             )
-            cdf = xp.cumsum(probs, axis=1)
             draws = rng.random(int(n_samples))
-            choices = xp.sum(draws[:, None] > cdf, axis=1).astype(np.int64)
-            choices = xp.minimum(choices, probs.shape[1] - 1)
+            if use_binary_draw and phys_dim == 2:
+                choices = (draws >= probs[:, 0]).astype(np.int64)
+            else:
+                cdf = xp.cumsum(probs, axis=1)
+                choices = xp.sum(draws[:, None] > cdf, axis=1).astype(np.int64)
+                choices = xp.minimum(choices, probs.shape[1] - 1)
             selected_probs = probs[batch, choices]
             vec = amps[batch, choices, :] / xp.sqrt(
                 xp.maximum(selected_probs, np.finfo(float).tiny)
