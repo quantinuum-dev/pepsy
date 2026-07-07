@@ -265,6 +265,45 @@ def test_mps_sampler_native_numpy_evaluates_batched_configs():
     np.testing.assert_allclose(amplitudes, np.sqrt(expected_probs))
 
 
+def test_mps_sampler_native_numpy_matches_dense_random_mps():
+    """Native NumPy evaluation should match exact dense Born probabilities."""
+    L = 6
+    psi = qtn.MPS_rand_state(L, bond_dim=4, phys_dim=2, dtype=float, seed=123)
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {site: (site, 0) for site in range(L)},
+        backend="native",
+    )
+    configs = np.array([
+        [int(bit) for bit in format(index, f"0{L}b")]
+        for index in range(2**L)
+    ], dtype=np.int64)
+
+    probabilities = sampler.probabilities(configs)
+    amplitudes = sampler.amplitudes(configs)
+    dense = psi.to_dense().reshape(-1)
+    expected = np.abs(dense) ** 2
+    expected = expected / expected.sum()
+
+    np.testing.assert_allclose(probabilities, expected, atol=1e-12)
+    np.testing.assert_allclose(np.abs(amplitudes) ** 2, expected, atol=1e-12)
+    assert probabilities.sum() == pytest.approx(1.0)
+
+
+def test_mps_sampler_native_numpy_agrees_with_quimb_sample_probabilities():
+    """Native probabilities should agree with quimb for quimb-sampled configs."""
+    L = 6
+    psi = qtn.MPS_rand_state(L, bond_dim=4, phys_dim=2, dtype=float, seed=123)
+    mapping = {site: (site, 0) for site in range(L)}
+    quimb_sampler = sampler_mod.MpsSampler(psi, mapping, backend="quimb")
+    native_sampler = sampler_mod.MpsSampler(psi, mapping, backend="native")
+
+    configs, quimb_probs = quimb_sampler.sample_arrays(16, seed=7)
+    native_probs = native_sampler.probabilities(configs)
+
+    np.testing.assert_allclose(native_probs, quimb_probs, atol=1e-12)
+
+
 def test_mps_sampler_native_torch_keeps_tensors_on_torch():
     """Torch MPS tensors should stay on Torch through native sampling."""
     torch = pytest.importorskip("torch")
@@ -367,6 +406,51 @@ def test_mps_sampler_native_torch_evaluates_batched_configs_on_torch():
     torch.testing.assert_close(amplitudes, torch.sqrt(expected_probs))
 
 
+def test_mps_sampler_native_torch_matches_numpy_random_mps():
+    """Torch native evaluation should agree with the NumPy dense reference."""
+    torch = pytest.importorskip("torch")
+    L = 6
+    psi_np = qtn.MPS_rand_state(L, bond_dim=4, phys_dim=2, dtype=float, seed=123)
+    psi_torch = psi_np.copy()
+    psi_torch.apply_to_arrays(
+        lambda array: torch.as_tensor(array, dtype=torch.float64)
+    )
+    sampler = sampler_mod.MpsSampler(
+        psi_torch,
+        {site: (site, 0) for site in range(L)},
+        backend="native",
+    )
+    configs_np = np.array([
+        [int(bit) for bit in format(index, f"0{L}b")]
+        for index in range(2**L)
+    ], dtype=np.int64)
+    configs = torch.as_tensor(configs_np, dtype=torch.long)
+
+    probabilities = sampler.probabilities(configs, to_numpy=False)
+    amplitudes = sampler.amplitudes(configs, to_numpy=False)
+    dense = psi_np.to_dense().reshape(-1)
+    expected = torch.as_tensor(
+        np.abs(dense) ** 2 / np.sum(np.abs(dense) ** 2),
+        dtype=torch.float64,
+    )
+    batch = sampler.sample_batch(8, seed=5)
+    batch_probabilities = sampler.probabilities(batch.configs, to_numpy=False)
+
+    torch.testing.assert_close(probabilities, expected, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(
+        amplitudes.abs().square(),
+        expected,
+        atol=1e-12,
+        rtol=1e-12,
+    )
+    torch.testing.assert_close(
+        batch.probs,
+        batch_probabilities,
+        atol=1e-12,
+        rtol=1e-12,
+    )
+
+
 def test_mps_sampler_native_cupy_evaluates_batched_configs_on_cupy():
     """CuPy probability/amplitude evaluation should stay on CuPy."""
     cupy = pytest.importorskip("cupy")
@@ -437,6 +521,45 @@ def test_mps_sampler_native_cupy_sample_arrays_stays_on_cupy():
         cupy.asarray([[1, 0]] * 3, dtype=cupy.int64),
     )
     assert isinstance(batch.to_numpy().configs, np.ndarray)
+
+
+def test_mps_sampler_native_cupy_matches_numpy_random_mps():
+    """CuPy native evaluation should agree with the NumPy dense reference."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+
+    L = 6
+    psi_np = qtn.MPS_rand_state(L, bond_dim=4, phys_dim=2, dtype=float, seed=123)
+    psi_cupy = psi_np.copy()
+    psi_cupy.apply_to_arrays(lambda array: cupy.asarray(array, dtype=cupy.float64))
+    sampler = sampler_mod.MpsSampler(
+        psi_cupy,
+        {site: (site, 0) for site in range(L)},
+        backend="native",
+    )
+    configs_np = np.array([
+        [int(bit) for bit in format(index, f"0{L}b")]
+        for index in range(2**L)
+    ], dtype=np.int64)
+    configs = cupy.asarray(configs_np, dtype=cupy.int64)
+
+    probabilities = sampler.probabilities(configs, to_numpy=False)
+    amplitudes = sampler.amplitudes(configs, to_numpy=False)
+    dense = psi_np.to_dense().reshape(-1)
+    expected = cupy.asarray(
+        np.abs(dense) ** 2 / np.sum(np.abs(dense) ** 2),
+        dtype=cupy.float64,
+    )
+    batch = sampler.sample_batch(8, seed=5)
+    batch_probabilities = sampler.probabilities(batch.configs, to_numpy=False)
+
+    cupy.testing.assert_allclose(probabilities, expected, atol=1e-12)
+    cupy.testing.assert_allclose(cupy.abs(amplitudes) ** 2, expected, atol=1e-12)
+    cupy.testing.assert_allclose(batch.probs, batch_probabilities, atol=1e-12)
 
 
 def test_mps_sampler_rejects_explicit_native_backend_mismatch():
