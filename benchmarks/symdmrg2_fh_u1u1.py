@@ -127,7 +127,7 @@ def run_benchmark(
     mixer_bond_dim=None,
     matvec_backend="auto",
     matvec_layout="unfused",
-    norm_check="strict",
+    norm_check="off",
     norm_check_interval=1,
     residual_check="sampled",
     residual_check_interval=1,
@@ -332,7 +332,7 @@ def build_arg_parser():
     parser.add_argument("--mixer-bond-dim", type=int, default=None)
     parser.add_argument("--matvec-backend", default="auto")
     parser.add_argument("--matvec-layout", default="unfused")
-    parser.add_argument("--norm-check", default="strict")
+    parser.add_argument("--norm-check", default="off")
     parser.add_argument("--norm-check-interval", type=int, default=1)
     parser.add_argument("--residual-check", default="sampled")
     parser.add_argument("--residual-check-interval", type=int, default=1)

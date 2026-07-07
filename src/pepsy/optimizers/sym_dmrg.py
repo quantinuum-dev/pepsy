@@ -1807,6 +1807,7 @@ class SymDMRG2:
         self._last_lanczos_info = None
         self._force_norm_check_after_skipped_canonize = False
         self._force_norm_check_reason = None
+        self._assume_effective_norm_identity = False
         self.projected_problem_cache_hits = 0
         self.projected_problem_cache_misses = 0
         self.svd_diagnostics = []
@@ -2196,23 +2197,14 @@ class SymDMRG2:
             reused=True,
         )
 
-    def _ensure_sweep_environments(
-        self,
-        kind,
-        direction,
-        *,
-        assume_canonical_norm=False,
-    ):
+    def _ensure_sweep_environments(self, kind, direction):
         if self._has_valid_sweep_environments(kind, direction):
             self._record_reused_sweep_environments(kind, direction)
             return
         if kind == "dense":
             self.build_sweep_environments(direction)
         elif kind == "norm":
-            self.build_sweep_norm_environments(
-                direction,
-                assume_canonical=assume_canonical_norm,
-            )
+            self.build_sweep_norm_environments(direction)
         elif kind == "block":
             self.build_sweep_block_environments(direction)
         else:
@@ -3767,12 +3759,7 @@ class SymDMRG2:
         self._set_environment_valid_sides("norm", {"left", "right"})
         return left, right
 
-    def _identity_norm_environment_for_bond(self, bond):
-        index = self._dense_index_for_state_ind(bond)
-        dim = sum(int(size) for size in index.chargemap.values())
-        return np.eye(dim, dtype=self._state_block_dtype())
-
-    def build_sweep_norm_environments(self, direction, *, assume_canonical=False):
+    def build_sweep_norm_environments(self, direction):
         """Build only norm environments needed for one sweep direction."""
         if self.backend != "symmray":
             raise ValueError("build_sweep_norm_environments is only used by backend='symmray'.")
@@ -3781,28 +3768,18 @@ class SymDMRG2:
 
         direction = str(direction).strip().lower()
         profile_start = self._profile_start()
-        bra = None if assume_canonical else self._make_bra()
+        bra = self._make_bra()
         left = [None] * (self._state.L + 1)
         right = [None] * (self._state.L + 1)
         if direction == "right":
             left[0] = np.asarray(1.0 + 0.0j)
             right[self._state.L] = np.asarray(1.0 + 0.0j)
             for site in reversed(range(2, self._state.L)):
-                if assume_canonical:
-                    right[site] = self._identity_norm_environment_for_bond(
-                        self._state.bond(site - 1, site)
-                    )
-                else:
-                    right[site] = self._norm_right_env_step(site, right[site + 1], bra)
+                right[site] = self._norm_right_env_step(site, right[site + 1], bra)
         elif direction == "left":
             left[0] = np.asarray(1.0 + 0.0j)
             for site in range(max(self._state.L - 2, 0)):
-                if assume_canonical:
-                    left[site + 1] = self._identity_norm_environment_for_bond(
-                        self._state.bond(site, site + 1)
-                    )
-                else:
-                    left[site + 1] = self._norm_left_env_step(site, left[site], bra)
+                left[site + 1] = self._norm_left_env_step(site, left[site], bra)
             right[self._state.L] = np.asarray(1.0 + 0.0j)
         else:
             raise ValueError("direction must be 'right' or 'left'.")
@@ -3815,7 +3792,6 @@ class SymDMRG2:
             direction=direction,
             built_sites=max(int(self._state.L) - 2, 0),
             reused=False,
-            canonical_identity=bool(assume_canonical),
         )
         return left, right
 
@@ -4808,9 +4784,17 @@ class SymDMRG2:
     def _should_track_norm_environments(self):
         if self.local_solver == "generalized_dense":
             return True
-        if self.norm_check != "off":
+        if self._force_norm_check_after_skipped_canonize:
             return True
-        return bool(self._force_norm_check_after_skipped_canonize)
+        if self.norm_check == "strict":
+            return True
+        if self.norm_check == "sampled":
+            return True
+        if self.norm_check == "first_sweep":
+            return len(self.energies) == 0
+        if self.norm_check == "off":
+            return False
+        raise ValueError(f"Unknown normalized norm_check mode {self.norm_check!r}.")
 
     def _should_run_residual_check(self, site):
         mode = self.residual_check
@@ -4853,6 +4837,7 @@ class SymDMRG2:
             samples=0,
             skipped=True,
             mode=self.norm_check,
+            reason=str(reason),
         )
         return diagnostic
 
@@ -5154,7 +5139,12 @@ class SymDMRG2:
             )
         else:
             norm_error = None
-            self._record_skipped_norm_identity(site, dim=dim)
+            skip_reason = (
+                "assumed_canonical"
+                if self._assume_effective_norm_identity
+                else "scheduled"
+            )
+            self._record_skipped_norm_identity(site, dim=dim, reason=skip_reason)
 
         solver_start = self._profile_start()
         self._last_lanczos_info = None
@@ -5441,15 +5431,16 @@ class SymDMRG2:
         sweep_profile_start = self._profile_start()
         self._force_norm_check_after_skipped_canonize = False
         self._force_norm_check_reason = None
-        assume_canonical_norm = False
+        self._assume_effective_norm_identity = not bool(canonize)
         use_block_h_envs = self._resolved_matvec_backend() == "symmray"
         if canonize:
             canonized = self._canonize_for_sweep(direction)
             if not canonized:
                 self._force_norm_check_after_skipped_canonize = True
                 self._force_norm_check_reason = f"{direction}_canonize_unavailable"
+                self._assume_effective_norm_identity = False
             else:
-                assume_canonical_norm = True
+                self._assume_effective_norm_identity = True
         if (
             prepare_variational_basis
             and self._should_prepare_variational_sector_basis(chi)
@@ -5467,9 +5458,9 @@ class SymDMRG2:
                 if not canonized:
                     self._force_norm_check_after_skipped_canonize = True
                     self._force_norm_check_reason = f"{direction}_canonize_unavailable"
-                    assume_canonical_norm = False
+                    self._assume_effective_norm_identity = False
                 else:
-                    assume_canonical_norm = True
+                    self._assume_effective_norm_identity = True
         if use_block_h_envs:
             self.left_envs = None
             self.right_envs = None
@@ -5481,11 +5472,7 @@ class SymDMRG2:
             self._ensure_sweep_environments("dense", direction)
         track_norm_envs = self._should_track_norm_environments()
         if track_norm_envs:
-            self._ensure_sweep_environments(
-                "norm",
-                direction,
-                assume_canonical_norm=assume_canonical_norm,
-            )
+            self._ensure_sweep_environments("norm", direction)
         else:
             self.left_norm_envs = None
             self.right_norm_envs = None
@@ -5551,6 +5538,7 @@ class SymDMRG2:
             self._current_sweep_direction = previous_direction
             self._force_norm_check_after_skipped_canonize = False
             self._force_norm_check_reason = None
+            self._assume_effective_norm_identity = False
         finish_start = self._profile_start()
         self._finish_sweep_direction_environments(
             direction,

@@ -24,9 +24,11 @@ local eigensolves, `H_eff` matvecs, SVD splits, enrichment, sweeps, and solves.
 The development harness `benchmarks/symdmrg2_fh_u1u1.py` runs deterministic
 chain and mapped-square-lattice Fermi-Hubbard U1U1 cases and emits this
 profiling data as JSON. By default the benchmark skips the startup
-`initial_energy` estimate and samples local residual and matvec diagnostics,
-so runs spend their extra correctness and profiling budget on the two-site
-solves being timed. Use `--periodic`/`--pbc` with `--lattice-shape LX LY` to
+`initial_energy` estimate, skips per-window dense norm identity checks after
+successful canonicalization, and samples local residual and matvec
+diagnostics, so runs spend their extra correctness and profiling budget on the
+two-site solves being timed. Use `--norm-check strict` when profiling the full
+dense `N_eff` debug guard. Use `--periodic`/`--pbc` with `--lattice-shape LX LY` to
 encode periodic square-lattice edges as long-range OBC-MPO terms.
 
 For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain and a
@@ -118,10 +120,9 @@ Hamiltonians. If a requested state canonicalization method is unavailable,
 SymDMRG2 forces `N_eff ~= I` checks for that H-only sweep even when
 `norm_check="off"`, so the wrong metric cannot be used silently. The default
 `norm_check="strict"` validates every two-site window.
-After a successful canonicalization, SymDMRG2 seeds those norm checks with
-identity left/right norm environments instead of rebuilding the full
-`<psi|psi>` stack; skipped-canonicalization and generalized-dense diagnostics
-still use explicit dense norm environments.
+Strict and generalized-dense diagnostics build explicit dense norm
+environments; skipped checks in canonical H-only modes are recorded as
+canonical assumptions rather than as measured `N_eff` validations.
 For larger trusted runs, `norm_check="sampled"` checks boundary windows plus
 every `norm_check_interval`-th interior window, `norm_check="first_sweep"`
 checks only the first sweep, and `norm_check="off"` skips this expensive
