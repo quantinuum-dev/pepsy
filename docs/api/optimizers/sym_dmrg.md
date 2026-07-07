@@ -50,12 +50,10 @@ later sweeps need them. `variational_sector_basis="bond_dim"` reopens them only
 when the requested sweep bond dimension increases, allowing equal-chi
 turnarounds to reuse maintained environments but narrowing the later search
 space. Adaptive zero-sector widening retargets already maintained block
-environments into the expanded bond charge maps, so equal-chi turnarounds can
-reuse block environments without giving up the wider local search space. Fresh
-zero-sector widening with no maintained block environment is recanonicalized
-before H-only local solves. Retargeted maintained block environments keep the
-reuse path intact in production `norm_check="off"` runs, while explicit
-norm-tracking audit modes recanonicalize after retargeting.
+environments into the expanded bond charge maps, then any actual zero-sector
+widening recanonicalizes the MPS before H-only local solves. This means
+equal-chi turnarounds with new adaptive sectors rebuild block environments in
+the refreshed gauge rather than trusting a stale `N_eff = I` assumption.
 Noisy sector enrichment still clears environments because it changes the
 represented state. By default, Symmray `H_eff` matvecs use a block-native projected contraction;
 `matvec_backend="dense_reference"` keeps the older

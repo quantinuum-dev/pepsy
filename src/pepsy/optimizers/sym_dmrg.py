@@ -5577,16 +5577,10 @@ class SymDMRG2:
                 self._variational_sector_basis_max_bond,
                 int(chi),
             )
-            # Fresh zero-sector widening needs a new canonical center for H-only
-            # local solves. Strict/sample norm audits also recanonicalize after
-            # retargeting; production norm_check="off" keeps that reuse path.
-            if variational_diagnostic is not None and (
-                self._should_track_norm_environments()
-                or not variational_diagnostic.get(
-                    "preserved_block_environments",
-                    False,
-                )
-            ):
+            # Zero-sector widening changes the active virtual charge maps. Even
+            # when block H environments can be retargeted, H-only local solves
+            # still need a fresh canonical center before assuming N_eff == I.
+            if variational_diagnostic is not None:
                 canonized = self._canonize_for_sweep(direction)
                 if not canonized:
                     self._force_norm_check_after_skipped_canonize = True

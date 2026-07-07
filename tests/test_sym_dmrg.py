@@ -670,8 +670,8 @@ def test_symdmrg2_turnaround_reuses_maintained_block_environment(monkeypatch):
     assert reuse_events[0]["built_sites"] == 0
 
 
-def test_symdmrg2_adaptive_basis_preserves_maintained_block_environment(monkeypatch):
-    """Zero-sector adaptive widening should not force block-env rebuilds."""
+def test_symdmrg2_adaptive_basis_recanonicalizes_after_env_retarget(monkeypatch):
+    """Retargeted zero-sector widening still refreshes the canonical center."""
     pytest.importorskip("symmray")
     state, mpo = _fh_u1u1_chain(4, [(1, 0), (0, 1), (1, 0), (0, 1)])
     opt = pepsy.SymDMRG2(
@@ -701,7 +701,7 @@ def test_symdmrg2_adaptive_basis_preserves_maintained_block_environment(monkeypa
 
     opt.solve(max_sweeps=2, sweep_sequence="RL", tol=0.0)
 
-    assert build_directions == ["right"]
+    assert build_directions == ["right", "left"]
     assert len(opt.variational_sector_diagnostics) == 2
     assert opt.variational_sector_diagnostics[0][
         "preserved_block_environments"
@@ -712,6 +712,12 @@ def test_symdmrg2_adaptive_basis_preserves_maintained_block_environment(monkeypa
     assert opt.variational_sector_diagnostics[1][
         "retargeted_block_environments"
     ] > 0
+    assert any(
+        event["phase"] == "canonize"
+        and event["direction"] == "left"
+        and not event["skipped"]
+        for event in opt.profile_diagnostics
+    )
     reuse_events = [
         event
         for event in opt.profile_diagnostics
@@ -719,8 +725,7 @@ def test_symdmrg2_adaptive_basis_preserves_maintained_block_environment(monkeypa
         and event.get("direction") == "left"
         and event.get("reused")
     ]
-    assert len(reuse_events) == 1
-    assert reuse_events[0]["built_sites"] == 0
+    assert reuse_events == []
 
 
 @pytest.mark.parametrize(
@@ -2451,6 +2456,7 @@ def test_symdmrg2_nucleates_sectors_from_product_state_without_enrichment():
 
     opt.solve(tol=0.0, max_sweeps=2, sweep_sequence="RL")
 
+    assert opt.summary()["norm_check"] == "off"
     assert sum(block.size for block in current_theta.data.blocks.values()) == 1
     assert sum(block.size for block in variational_theta.data.blocks.values()) > 1
     assert opt.energy == pytest.approx(ed_energy, abs=1e-10)
