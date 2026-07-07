@@ -220,6 +220,10 @@ def _block_data_layout(data):
     )
 
 
+def _shape_size(shape):
+    return int(np.prod(tuple(shape), dtype=np.int64)) if shape else 1
+
+
 def _flatten_blocks(data):
     pieces = []
     metadata = []
@@ -730,6 +734,7 @@ class _BlockPairContraction:
         self.compiled_block_plan_uses = 0
         self.compiled_block_plan_terms = 0
         self.compiled_block_plan_output_blocks = 0
+        self.compiled_block_plan_mode = None
         self.compiled_block_plan_disabled_reason = None
 
         if not self.shared:
@@ -857,25 +862,72 @@ class _BlockPairContraction:
             key = tuple(left_sector[axis] for axis in self.left_axes)
             left_output = tuple(left_sector[axis] for axis in self.left_output_axes)
             left_array = _to_numpy(left_block)
+            left_output_shape = tuple(
+                left_array.shape[axis] for axis in self.left_output_axes
+            )
+            shared_shape = tuple(left_array.shape[axis] for axis in self.left_axes)
+            left_matrix = np.transpose(
+                left_array,
+                self.left_output_axes + self.left_axes,
+            ).reshape(_shape_size(left_output_shape), _shape_size(shared_shape))
             for right_sector, _, _ in right_by_shared.get(key, ()):
                 output_sector = left_output + tuple(
                     right_sector[axis] for axis in self.right_output_axes
                 )
                 if output_sector not in output_sectors:
                     continue
-                terms_by_output[output_sector].append((left_array, right_sector))
+                right_shape = tuple(getattr(right.data.blocks[right_sector], "shape", ()))
+                right_shared_shape = tuple(
+                    right_shape[axis] for axis in self.right_axes
+                )
+                if right_shared_shape != shared_shape:
+                    self.compiled_block_plan_disabled_reason = (
+                        "shared_degeneracy_mismatch"
+                    )
+                    return
+                right_output_shape = tuple(
+                    right_shape[axis] for axis in self.right_output_axes
+                )
+                terms_by_output[output_sector].append(
+                    (
+                        left_matrix,
+                        right_sector,
+                        _shape_size(shared_shape),
+                        _shape_size(right_output_shape),
+                    )
+                )
                 num_terms += 1
+
+        compiled_plan = []
+        for sector, terms in terms_by_output.items():
+            if not terms:
+                continue
+            left_matrices = tuple(term[0] for term in terms)
+            left_matrix = (
+                left_matrices[0]
+                if len(left_matrices) == 1
+                else np.concatenate(left_matrices, axis=1)
+            )
+            right_specs = tuple(
+                (right_sector, shared_size, right_output_size)
+                for _, right_sector, shared_size, right_output_size in terms
+            )
+            compiled_plan.append(
+                (
+                    sector,
+                    tuple(getattr(output.data.blocks[sector], "shape", ())),
+                    left_matrix,
+                    right_specs,
+                )
+            )
 
         self.compiled_output_template = output.data
         self.compiled_right_layout = _block_data_layout(right.data)
-        self.compiled_block_plan = tuple(
-            (sector, tuple(terms))
-            for sector, terms in terms_by_output.items()
-            if terms
-        )
+        self.compiled_block_plan = tuple(compiled_plan)
         self.compiled_block_plan_builds += 1
         self.compiled_block_plan_terms = int(num_terms)
         self.compiled_block_plan_output_blocks = len(self.compiled_block_plan)
+        self.compiled_block_plan_mode = "output_block_matmul"
         self.compiled_block_plan_disabled_reason = None
 
     def _apply_compiled_block_plan(self, right, *, timings=None, prefix="contract"):
@@ -889,24 +941,28 @@ class _BlockPairContraction:
             for sector, block in right_blocks.items()
         }
         template_blocks = self.compiled_output_template.blocks
-        for output_sector, terms in self.compiled_block_plan:
-            template_block = _to_numpy(template_blocks[output_sector])
-            first_left, first_right_sector = terms[0]
-            out = np.tensordot(
-                first_left,
-                right_arrays[first_right_sector],
-                axes=(self.left_axes, self.right_axes),
-            )
-            if out.dtype != template_block.dtype:
-                out = np.asarray(out, dtype=template_block.dtype)
-            for left_array, right_sector in terms[1:]:
-                piece = np.tensordot(
-                    left_array,
-                    right_arrays[right_sector],
-                    axes=(self.left_axes, self.right_axes),
+        right_perm = self.right_axes + self.right_output_axes
+        for output_sector, output_shape, left_matrix, right_specs in (
+            self.compiled_block_plan
+        ):
+            right_matrices = []
+            for right_sector, shared_size, right_output_size in right_specs:
+                right_matrices.append(
+                    np.transpose(right_arrays[right_sector], right_perm).reshape(
+                        shared_size,
+                        right_output_size,
+                    )
                 )
-                np.add(out, piece, out=out, casting="unsafe")
-            blocks[output_sector] = out
+            right_matrix = (
+                right_matrices[0]
+                if len(right_matrices) == 1
+                else np.concatenate(right_matrices, axis=0)
+            )
+            out = left_matrix @ right_matrix
+            template_dtype = _block_dtype(template_blocks[output_sector])
+            if out.dtype != template_dtype:
+                out = np.asarray(out, dtype=template_dtype)
+            blocks[output_sector] = out.reshape(output_shape)
         data = _array_with_blocks_like(self.compiled_output_template, blocks)
         self.compiled_block_plan_uses += 1
         _add_elapsed(timings, f"{prefix}_compiled_block_elapsed", step_start)
@@ -1044,6 +1100,7 @@ class _BlockPairContraction:
             f"{prefix}_compiled_block_plan_output_blocks": int(
                 self.compiled_block_plan_output_blocks
             ),
+            f"{prefix}_compiled_block_plan_mode": self.compiled_block_plan_mode,
             f"{prefix}_compiled_block_plan_disabled_reason": (
                 self.compiled_block_plan_disabled_reason
             ),

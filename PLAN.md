@@ -235,8 +235,8 @@ constructions, plus the fermionic Fermi-Hubbard starters in
 - The first per-matvec speed step compiles cached block-sector pair schedules
   inside each projected problem. After the first Symmray contraction establishes
   the exact output block template, non-fermionic NumPy-backed cache-hit matvecs
-  reuse that sector-pair plan directly instead of asking Symmray to rediscover
-  the same block routing.
+  reuse that sector-pair plan as output-block-level dense matmuls instead of
+  asking Symmray to rediscover the same block routing.
 - The next DMRG step is to run the 6 by 6 mapped-PBC control with compiled
   block plans enabled and compare `avg_lanczos_matvecs`,
   `lanczos_stop_reasons`, projected-problem cache hits, compiled block-plan

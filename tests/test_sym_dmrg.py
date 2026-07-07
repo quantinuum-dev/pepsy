@@ -1287,6 +1287,12 @@ def test_symdmrg2_block_native_matvec_reuses_projected_problem_cache(monkeypatch
     assert problem_summary["left_contract_compiled_block_plan_uses"] == 1
     assert problem_summary["right_contract_compiled_block_plan_terms"] > 0
     assert problem_summary["left_contract_compiled_block_plan_terms"] > 0
+    assert problem_summary["right_contract_compiled_block_plan_mode"] == (
+        "output_block_matmul"
+    )
+    assert problem_summary["left_contract_compiled_block_plan_mode"] == (
+        "output_block_matmul"
+    )
     for sector in theta.data.blocks:
         assert native_a.data.blocks[sector] == pytest.approx(dense_a.data.blocks[sector])
         assert native_b.data.blocks[sector] == pytest.approx(dense_b.data.blocks[sector])
@@ -1352,6 +1358,12 @@ def test_symdmrg2_matvec_diagnostics_record_cache_and_projector_stats():
     assert first["left_contract_compiled_block_plan_uses"] == 0
     assert second["right_contract_compiled_block_plan_uses"] == 1
     assert second["left_contract_compiled_block_plan_uses"] == 1
+    assert second["right_contract_compiled_block_plan_mode"] == (
+        "output_block_matmul"
+    )
+    assert second["left_contract_compiled_block_plan_mode"] == (
+        "output_block_matmul"
+    )
     assert second["matvec_right_contract_compiled_block_elapsed"] >= 0.0
     assert second["matvec_left_contract_compiled_block_elapsed"] >= 0.0
     assert first["matvec_input_reindex_elapsed"] >= 0.0

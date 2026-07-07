@@ -194,5 +194,6 @@ the interruption.
   `chi=32`, so the next useful speed layer is per-matvec work. Cached projected
   problems now compile non-fermionic NumPy-backed block-sector pair schedules
   after the first exact Symmray contraction, then reuse those schedules on
-  cache-hit Lanczos matvecs. This keeps correctness anchored to Symmray's block
-  template while avoiding repeated block-routing discovery in the hot loop.
+  cache-hit Lanczos matvecs as output-block-level dense matmuls. This keeps
+  correctness anchored to Symmray's block template while avoiding repeated
+  block-routing discovery in the hot loop.

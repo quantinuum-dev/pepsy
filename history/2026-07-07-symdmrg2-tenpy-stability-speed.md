@@ -36,7 +36,8 @@
   - Each cached projected problem still uses Symmray for the first exact
     contraction, which establishes the output block template.
   - For later cache-hit matvecs with the same block layout, non-fermionic
-    NumPy-backed contractions reuse a compiled block-sector pair schedule.
+    NumPy-backed contractions reuse a compiled block-sector pair schedule as
+    output-block-level dense matmuls.
   - Other backends and direct fermionic arrays stay on Symmray's original
     `tensordot` path.
 
@@ -64,8 +65,8 @@
   safe but inert at `chi=32`; the bottleneck is per-matvec cost.
 - A small 3 by 3 mapped-PBC cache-hit probe showed the compiled block-plan path
   engaging on repeated matvecs (`compiled_block_plan_uses > 0`) and reducing
-  cached hot-loop time on the local probe. This is only a micro-control; the
-  6 by 6 run remains the meaningful next benchmark.
+  the compiled contraction substep on the local probe. This is only a
+  micro-control; the 6 by 6 run remains the meaningful next benchmark.
 
 ## Validation
 
