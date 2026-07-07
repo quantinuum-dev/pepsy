@@ -141,6 +141,14 @@ sweep, which can reintroduce valid sectors after SVD truncation prunes them.
 `sector_enrichment_diagnostics` records the added blocks and template bond
 sectors.
 
+For a genuinely random but well-conditioned Symmray initial MPS, use
+`SymMPS.random_unitary_evolution(...)` or
+`SymMPS.random_unitary_for_model(...)`. These constructors grow a
+charge-correct product state with charge-preserving two-site random unitaries
+and canonicalize the result before DMRG. Raw `SymMPS.random(bond_dim=chi)`
+still exists, but it is a lower-level block-fill constructor and should be
+treated as a robustness stress test on hard mapped-2D PBC cases.
+
 When the optional subspace mixer is active, SymDMRG2 uses it as a temporary
 exploration aid rather than a final convergence state. If the sweep convergence
 criteria are met while the mixer was still active, the Symmray path records a

@@ -61,6 +61,37 @@ fh = py.SymMPS.for_model(
 fh.overall_charge()  # (8, 8)
 ```
 
+## Random-unitary MPS starts
+
+For DMRG-style random starts, prefer ``SymMPS.random_unitary_evolution`` or the
+model-aware ``SymMPS.random_unitary_for_model`` over raw block-filled
+``SymMPS.random``. The unitary path starts from the requested product charge
+sector, applies charge-preserving two-site random unitary layers, splits back
+to the requested bond dimension, canonicalizes, and normalizes. This gives a
+well-conditioned random MPS in the same spirit as TeNPy's random-unitary MPS
+initialization.
+
+```python
+half_filled_6x6 = py.site_charge_from_occupations(
+    [(1, 0), (0, 1)] * 18,
+)
+
+dmrg_init = py.SymMPS.random_unitary_for_model(
+    "fermi_hubbard_u1u1",
+    36,
+    bond_dim=32,
+    site_charge=half_filled_6x6,
+    seed=7,
+    dtype="complex128",
+)
+
+dmrg_init.overall_charge()  # (18, 18)
+```
+
+``SymMPS.random`` remains available when a workflow intentionally wants the
+lower-level raw random block fill, for example as an initialization stress
+test.
+
 For direct fermionic Fermi-Hubbard examples, use Gao et al., "Fermionic tensor
 network contraction for arbitrary geometries", Phys. Rev. Research 7, 023193
 (2025), https://doi.org/10.1103/PhysRevResearch.7.023193 as the primary

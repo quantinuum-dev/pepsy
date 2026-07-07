@@ -617,6 +617,48 @@ def _finite_double_layer_norm(tn):
     return np.isfinite(np.real(norm))
 
 
+def test_symmps_random_unitary_evolution_grows_product_state():
+    """Random-unitary initialization should avoid raw random block filling."""
+    state = SymMPS.random_unitary_evolution(
+        4,
+        symmetry="U1U1",
+        fermionic=True,
+        phys_dim=4,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations(
+            [(1, 0), (0, 1), (1, 0), (0, 1)]
+        ),
+        seed=123,
+        dtype="complex128",
+        rounds=20,
+    )
+
+    assert state.tn.max_bond() > 1
+    assert state.tn.max_bond() <= 4
+    assert state.overall_charge() == (2, 2)
+    assert _all_tensor_data_symmray(state.tn)
+    assert _finite_double_layer_norm(state.tn)
+    assert np.real(state.norm()) == pytest.approx(1.0)
+
+    model_state = SymMPS.random_unitary_for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations(
+            [(1, 0), (0, 1), (1, 0), (0, 1)]
+        ),
+        seed=123,
+        dtype="complex128",
+        rounds=20,
+    )
+
+    assert model_state.model == "fermi_hubbard_u1u1"
+    assert model_state.symmetry == "U1U1"
+    assert model_state.fermionic
+    assert model_state.tn.max_bond() > 1
+    assert model_state.overall_charge() == (2, 2)
+
+
 def _raw_mps_norm(mps):
     """Return an MPS norm with PEPSY's stored exponent removed."""
     raw = mps.copy()

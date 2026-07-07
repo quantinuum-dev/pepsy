@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from itertools import product
 from numbers import Integral
 
 import autoray as ar
@@ -3754,6 +3755,53 @@ def symm_operator_from_dense(
     )
 
 
+def _random_orthogonal_or_unitary(rng, size, dtype):
+    dtype = np.dtype(dtype)
+    matrix = rng.standard_normal((size, size))
+    if np.issubdtype(dtype, np.complexfloating):
+        matrix = matrix + 1.0j * rng.standard_normal((size, size))
+    q, r = np.linalg.qr(matrix)
+    diag = np.diag(r)
+    phase = np.ones_like(diag)
+    nonzero = np.abs(diag) > 0.0
+    phase[nonzero] = diag[nonzero] / np.abs(diag[nonzero])
+    return np.asarray(q * phase.conj(), dtype=dtype)
+
+
+def _random_charge_preserving_two_site_dense(sectors, symmetry, rng, dtype):
+    sectors = dict(sectors)
+    charges = [
+        charge
+        for charge, size in sectors.items()
+        for _ in range(int(size))
+    ]
+    phys_dim = len(charges)
+    out = np.eye(phys_dim * phys_dim, dtype=np.dtype(dtype))
+    by_total_charge = {}
+    for dense_index, (left_charge, right_charge) in enumerate(
+        product(charges, repeat=2)
+    ):
+        total = _charge_add(left_charge, right_charge, symmetry)
+        by_total_charge.setdefault(total, []).append(dense_index)
+
+    for positions in by_total_charge.values():
+        block = _random_orthogonal_or_unitary(rng, len(positions), dtype)
+        out[np.ix_(positions, positions)] = block
+    return out
+
+
+def _right_canonize_mps(mps):
+    method = getattr(mps, "right_canonize", None)
+    if callable(method):
+        try:
+            result = method(bra=None)
+        except TypeError:
+            result = method()
+        if result is not None:
+            return result
+    return mps
+
+
 class SymGateStream(tuple):
     """Tuple-like bundled stream of Symmray local gates."""
 
@@ -6023,7 +6071,7 @@ class SymMPS(_SymState):
         to_backend=None,
         **kwargs,
     ):
-        """Create a random symmetric open-chain MPS."""
+        """Create a raw block-filled random symmetric open-chain MPS."""
         edges = _open_chain_edges(L)
         site_charge_use = _default_site_charge(symmetry) if site_charge is None else site_charge
         phys_sectors = _resolve_phys_sectors(symmetry, phys_dim)
@@ -6062,8 +6110,139 @@ class SymMPS(_SymState):
         )
 
     @classmethod
+    def random_unitary_evolution(
+        cls,
+        L,
+        *,
+        symmetry="U1",
+        bond_dim=4,
+        phys_dim=2,
+        seed=None,
+        dtype="float64",
+        fermionic=False,
+        site_charge=None,
+        rounds=1000,
+        stall_rounds=8,
+        cutoff=1e-12,
+        contraction_opt="auto-hq",
+        to_backend=None,
+        **kwargs,
+    ):
+        """Create a canonical random MPS by growing a product state.
+
+        This mirrors TeNPy's robust random-initial-state construction more
+        closely than raw block filling: start from a same-charge product MPS,
+        apply random charge-preserving two-site unitaries on alternating
+        nearest-neighbor layers, truncate to ``bond_dim``, and canonicalize.
+        ``stall_rounds`` stops early when symmetry constraints prevent further
+        bond growth.
+        """
+        bond_dim = int(bond_dim)
+        if bond_dim < 1:
+            raise ValueError("bond_dim must be a positive integer.")
+        rounds = int(rounds)
+        if rounds < 1:
+            raise ValueError("rounds must be a positive integer.")
+        if stall_rounds is not None:
+            stall_rounds = int(stall_rounds)
+            if stall_rounds < 1:
+                raise ValueError("stall_rounds must be positive or None.")
+
+        site_charge_use = (
+            _default_site_charge(symmetry) if site_charge is None else site_charge
+        )
+        phys_sectors = _resolve_phys_sectors(symmetry, phys_dim)
+        state = cls.random(
+            L,
+            symmetry=symmetry,
+            bond_dim=1,
+            phys_dim=phys_dim,
+            seed=seed,
+            dtype=dtype,
+            fermionic=fermionic,
+            site_charge=site_charge_use,
+            subsizes="maximal",
+            contraction_opt=contraction_opt,
+            **kwargs,
+        )
+        if int(L) < 2 or bond_dim <= 1:
+            state.psi = _right_canonize_mps(state.psi)
+            state.normalize()
+            _apply_to_tensor_network_arrays(state.psi, to_backend)
+            return state
+
+        rng = np.random.default_rng(seed)
+        best_bond = int(state.psi.max_bond())
+        stalled = 0
+        for _ in range(rounds):
+            for parity in (0, 1):
+                gates = []
+                for site in range(parity, int(L) - 1, 2):
+                    gate_dense = _random_charge_preserving_two_site_dense(
+                        phys_sectors,
+                        symmetry,
+                        rng,
+                        dtype,
+                    )
+                    gates.append(
+                        (
+                            symm_operator_from_dense(
+                                gate_dense,
+                                phys_sectors,
+                                symmetry=symmetry,
+                                charge=_zero_like_charge(next(iter(phys_sectors))),
+                                fermionic=fermionic,
+                                sites=2,
+                            ),
+                            (site, site + 1),
+                        )
+                    )
+                if gates:
+                    state.apply_gates(
+                        gates,
+                        method="direct",
+                        contract="split",
+                        max_bond=bond_dim,
+                        cutoff=cutoff,
+                        normalize=True,
+                        inplace=True,
+                    )
+            state.psi = _right_canonize_mps(state.psi)
+            current_bond = int(state.psi.max_bond())
+            if current_bond >= bond_dim:
+                break
+            if current_bond > best_bond:
+                best_bond = current_bond
+                stalled = 0
+            else:
+                stalled += 1
+                if stall_rounds is not None and stalled >= stall_rounds:
+                    break
+        state.psi = _right_canonize_mps(state.psi)
+        state.normalize()
+        _apply_to_tensor_network_arrays(state.psi, to_backend)
+        return state
+
+    @classmethod
+    def random_unitary_for_model(
+        cls, model, L, *, symmetry=None, fermionic=None, phys_dim=None, **kwargs
+    ):
+        """Create a random-unitary MPS with defaults suitable for a model."""
+        model_norm = _normalize_model(model)
+        defaults = _MODEL_DEFAULTS[model_norm]
+        state = cls.random_unitary_evolution(
+            L,
+            symmetry=defaults["symmetry"] if symmetry is None else symmetry,
+            fermionic=defaults["fermionic"] if fermionic is None else fermionic,
+            phys_dim=defaults["phys_dim"] if phys_dim is None else phys_dim,
+            **kwargs,
+        )
+        state.model = model_norm
+        return state
+
+    @classmethod
     def for_model(cls, model, L, *, symmetry=None, fermionic=None, phys_dim=None, **kwargs):
-        """Create a random MPS with defaults suitable for a named model."""
+        """Create a raw random MPS with defaults suitable for a named model."""
         model_norm = _normalize_model(model)
         defaults = _MODEL_DEFAULTS[model_norm]
         state = cls.random(
