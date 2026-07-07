@@ -968,17 +968,24 @@ class _BlockPairContraction:
         }
         template_blocks = self.compiled_output_template.blocks
         right_perm = self.right_axes + self.right_output_axes
+        right_matrix_cache = {}
         for output_sector, output_shape, left_matrix, right_specs in (
             self.compiled_block_plan
         ):
             right_matrices = []
             for right_sector, shared_size, right_output_size in right_specs:
-                right_matrices.append(
-                    np.transpose(right_arrays[right_sector], right_perm).reshape(
+                cache_key = (right_sector, shared_size, right_output_size)
+                right_matrix = right_matrix_cache.get(cache_key)
+                if right_matrix is None:
+                    right_matrix = np.transpose(
+                        right_arrays[right_sector],
+                        right_perm,
+                    ).reshape(
                         shared_size,
                         right_output_size,
                     )
-                )
+                    right_matrix_cache[cache_key] = right_matrix
+                right_matrices.append(right_matrix)
             right_matrix = (
                 right_matrices[0]
                 if len(right_matrices) == 1
