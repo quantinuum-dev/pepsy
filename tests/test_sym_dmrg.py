@@ -655,6 +655,59 @@ def test_symdmrg2_turnaround_reuses_maintained_block_environment(monkeypatch):
     assert reuse_events[0]["built_sites"] == 0
 
 
+def test_symdmrg2_adaptive_basis_preserves_maintained_block_environment(monkeypatch):
+    """Zero-sector adaptive widening should not force block-env rebuilds."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(4, [(1, 0), (0, 1), (1, 0), (0, 1)])
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=2,
+        norm_check="off",
+        variational_sector_basis="adaptive",
+        compute_initial_energy=False,
+        profile=True,
+    )
+
+    build_directions = []
+    build_sweep_block_environments = opt.build_sweep_block_environments
+
+    def counted_build_sweep_block_environments(direction):
+        build_directions.append(direction)
+        return build_sweep_block_environments(direction)
+
+    monkeypatch.setattr(
+        opt,
+        "build_sweep_block_environments",
+        counted_build_sweep_block_environments,
+    )
+
+    opt.solve(max_sweeps=2, sweep_sequence="RL", tol=0.0)
+
+    assert build_directions == ["right"]
+    assert len(opt.variational_sector_diagnostics) == 2
+    assert opt.variational_sector_diagnostics[0][
+        "preserved_block_environments"
+    ] is False
+    assert opt.variational_sector_diagnostics[1][
+        "preserved_block_environments"
+    ] is True
+    assert opt.variational_sector_diagnostics[1][
+        "retargeted_block_environments"
+    ] > 0
+    reuse_events = [
+        event
+        for event in opt.profile_diagnostics
+        if event["phase"] == "build_block_environments"
+        and event.get("direction") == "left"
+        and event.get("reused")
+    ]
+    assert len(reuse_events) == 1
+    assert reuse_events[0]["built_sites"] == 0
+
+
 def test_symdmrg2_accepts_quimb_style_solve_controls():
     """SymDMRG2 should accept DMRG2-style p0/bond_dims/cutoffs controls."""
     pytest.importorskip("symmray")

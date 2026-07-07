@@ -2828,6 +2828,104 @@ class SymDMRG2:
             "copied_blocks": int(copied_blocks),
         }
 
+    def _retarget_zero_expanded_block_env(self, tensor, bond_maps):
+        if tensor is None:
+            return None, False
+
+        env_bond_maps = {}
+        for bond, chargemap in bond_maps.items():
+            env_bond_maps[self._bra_bond_ind(bond)] = chargemap
+            env_bond_maps[self._input_ind(bond)] = chargemap
+
+        old_data = tensor.data
+        new_indices = []
+        changed_indices = 0
+        for ind, index in zip(tensor.inds, old_data.indices):
+            if ind in env_bond_maps:
+                chargemap = self._merge_chargemaps(
+                    index.chargemap,
+                    env_bond_maps[ind],
+                )
+                if chargemap != self._index_chargemap(index):
+                    changed_indices += 1
+                new_indices.append(index.copy_with(chargemap=chargemap))
+            else:
+                new_indices.append(index)
+
+        if changed_indices == 0:
+            return tensor, False
+
+        old_blocks = getattr(old_data, "blocks", {})
+        if old_blocks:
+            dtype = _block_dtype(next(iter(old_blocks.values())))
+        else:
+            dtype = self._state_block_dtype()
+
+        def fill_fn(shape):
+            return np.zeros(shape, dtype=dtype)
+
+        new_data = type(old_data).from_fill_fn(
+            fill_fn,
+            tuple(new_indices),
+            charge=old_data.charge,
+            symmetry=old_data.symmetry,
+        )
+        for sector, old_block in old_blocks.items():
+            if sector not in new_data.blocks:
+                continue
+            target = np.array(_to_numpy(new_data.blocks[sector]), copy=True)
+            old_dense = _to_numpy(old_block)
+            slices = tuple(slice(0, size) for size in old_dense.shape)
+            target[slices] = old_dense
+            new_data.set_block(sector, np.asarray(target, dtype=target.dtype))
+
+        return _tensor_with_data(tensor, new_data), True
+
+    def _retarget_zero_expanded_block_environments(self, bond_maps):
+        if self.left_block_envs is None and self.right_block_envs is None:
+            return {
+                "preserved": False,
+                "retargeted_tensors": 0,
+                "reason": "missing_block_environments",
+            }
+
+        try:
+            retargeted = 0
+            for envs_name in ("left_block_envs", "right_block_envs"):
+                envs = getattr(self, envs_name)
+                if envs is None:
+                    continue
+                new_envs = list(envs)
+                for i, tensor in enumerate(envs):
+                    new_tensor, changed = self._retarget_zero_expanded_block_env(
+                        tensor,
+                        bond_maps,
+                    )
+                    new_envs[i] = new_tensor
+                    retargeted += int(changed)
+                setattr(self, envs_name, new_envs)
+        except (AttributeError, TypeError, ValueError, KeyError):
+            return {
+                "preserved": False,
+                "retargeted_tensors": 0,
+                "reason": "retarget_failed",
+            }
+
+        return {
+            "preserved": True,
+            "retargeted_tensors": int(retargeted),
+            "reason": None,
+        }
+
+    def _clear_nonblock_environments(self):
+        self._invalidate_projected_problem_cache()
+        self.left_envs = None
+        self.right_envs = None
+        self.left_norm_envs = None
+        self.right_norm_envs = None
+        self._set_environment_valid_sides("dense", ())
+        self._set_environment_valid_sides("norm", ())
+
     def _expand_sector_chargemaps(
         self,
         *,
@@ -2873,8 +2971,22 @@ class SymDMRG2:
             diagnostic["modified"] = bool(modified)
             site_diagnostics.append(diagnostic)
 
+        block_env_preserve = {
+            "preserved": False,
+            "retargeted_tensors": 0,
+            "reason": "not_modified",
+        }
         if modified_tensors:
-            self._clear_environments()
+            if noise == 0.0:
+                block_env_preserve = (
+                    self._retarget_zero_expanded_block_environments(bond_maps)
+                )
+            else:
+                block_env_preserve["reason"] = "nonzero_noise"
+            if block_env_preserve["preserved"]:
+                self._clear_nonblock_environments()
+            else:
+                self._clear_environments()
         diagnostic = {
             "mode": "template" if mode is None else str(mode),
             "sweep": None if sweep is None else int(sweep),
@@ -2893,6 +3005,11 @@ class SymDMRG2:
             "sites": site_diagnostics,
             "added_blocks": sum(item["added_blocks"] for item in site_diagnostics),
             "modified_tensors": int(modified_tensors),
+            "preserved_block_environments": bool(block_env_preserve["preserved"]),
+            "retargeted_block_environments": int(
+                block_env_preserve["retargeted_tensors"]
+            ),
+            "block_environment_preserve_reason": block_env_preserve["reason"],
         }
         self._record_profile_elapsed(
             profile_phase,
@@ -2902,6 +3019,10 @@ class SymDMRG2:
             bond_dim=int(bond_dim),
             modified_tensors=int(modified_tensors),
             map_source=diagnostic["map_source"],
+            preserved_block_environments=diagnostic["preserved_block_environments"],
+            retargeted_block_environments=diagnostic[
+                "retargeted_block_environments"
+            ],
         )
         return diagnostic
 

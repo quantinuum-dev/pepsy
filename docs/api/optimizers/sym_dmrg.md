@@ -49,7 +49,11 @@ from a narrow product or low-bond initial state. The default
 later sweeps need them. `variational_sector_basis="bond_dim"` reopens them only
 when the requested sweep bond dimension increases, allowing equal-chi
 turnarounds to reuse maintained environments but narrowing the later search
-space. By default, Symmray `H_eff` matvecs use a block-native projected contraction;
+space. Adaptive zero-sector widening retargets already maintained block
+environments into the expanded bond charge maps, so equal-chi turnarounds can
+reuse block environments without giving up the wider local search space.
+Noisy sector enrichment still clears environments because it changes the
+represented state. By default, Symmray `H_eff` matvecs use a block-native projected contraction;
 `matvec_backend="dense_reference"` keeps the older
 NumPy dense-aligned matvec available as a validator. During a local
 dense/Lanczos solve, the block-native path caches the static projected
