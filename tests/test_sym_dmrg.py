@@ -708,6 +708,69 @@ def test_symdmrg2_adaptive_basis_preserves_maintained_block_environment(monkeypa
     assert reuse_events[0]["built_sites"] == 0
 
 
+@pytest.mark.parametrize(
+    ("direction", "expected_side"),
+    (("right", "left"), ("left", "right")),
+)
+def test_symdmrg2_adaptive_basis_reused_block_env_matches_rebuild(
+    direction,
+    expected_side,
+):
+    """Zero-sector env retargeting should preserve the effective operator."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(4, [(1, 0), (0, 1), (1, 0), (0, 1)])
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=2,
+        norm_check="off",
+        variational_sector_basis="adaptive",
+        compute_initial_energy=False,
+        profile=True,
+    )
+
+    opt._prepare_variational_sector_basis(sweep=0, max_bond=4)
+    opt._canonize_for_sweep(direction)
+    opt.build_sweep_block_environments(direction)
+    opt.sweep(
+        direction[0].upper(),
+        max_bond=4,
+        cutoff=1e-10,
+        canonize=False,
+        prepare_variational_basis=False,
+    )
+
+    diagnostic = opt._prepare_variational_sector_basis(sweep=1, max_bond=4)
+    assert diagnostic["preserved_block_environments"] is True
+    assert diagnostic["retargeted_block_environments"] > 0
+    assert opt._block_env_valid_sides == {expected_side}
+    reused_envs = [
+        None if tensor is None else tensor.copy()
+        for tensor in (
+            opt.left_block_envs
+            if expected_side == "left"
+            else opt.right_block_envs
+        )
+    ]
+
+    opt.left_block_envs = None
+    opt.right_block_envs = None
+    opt.build_block_environments()
+    rebuilt_envs = (
+        opt.left_block_envs if expected_side == "left" else opt.right_block_envs
+    )
+
+    for reused, rebuilt in zip(reused_envs, rebuilt_envs):
+        if reused is None:
+            assert rebuilt is None
+            continue
+        reused_dense = np.asarray(reused.data.to_dense())
+        rebuilt_dense = np.asarray(rebuilt.data.to_dense())
+        assert reused_dense == pytest.approx(rebuilt_dense)
+
+
 def test_symdmrg2_accepts_quimb_style_solve_controls():
     """SymDMRG2 should accept DMRG2-style p0/bond_dims/cutoffs controls."""
     pytest.importorskip("symmray")

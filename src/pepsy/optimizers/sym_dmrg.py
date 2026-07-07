@@ -2856,28 +2856,30 @@ class SymDMRG2:
             return tensor, False
 
         old_blocks = getattr(old_data, "blocks", {})
-        if old_blocks:
-            dtype = _block_dtype(next(iter(old_blocks.values())))
-        else:
-            dtype = self._state_block_dtype()
+        blocks = {}
+        # Block Hamiltonian environments are open intermediates from
+        # ``preserve_array=True`` contractions, so keep their existing sectors
+        # instead of filtering through a symmetry-conserving ``from_fill_fn``.
+        for sector, old_block in old_blocks.items():
+            shape = []
+            for axis, charge in enumerate(sector):
+                size = new_indices[axis].chargemap.get(charge)
+                if size is None:
+                    break
+                shape.append(int(size))
+            else:
+                old_dense = _to_numpy(old_block)
+                target = np.zeros(tuple(shape), dtype=old_dense.dtype)
+                slices = tuple(slice(0, size) for size in old_dense.shape)
+                target[slices] = old_dense
+                blocks[sector] = target
 
-        def fill_fn(shape):
-            return np.zeros(shape, dtype=dtype)
-
-        new_data = type(old_data).from_fill_fn(
-            fill_fn,
-            tuple(new_indices),
+        new_data = type(old_data)(
+            indices=tuple(new_indices),
             charge=old_data.charge,
+            blocks=blocks,
             symmetry=old_data.symmetry,
         )
-        for sector, old_block in old_blocks.items():
-            if sector not in new_data.blocks:
-                continue
-            target = np.array(_to_numpy(new_data.blocks[sector]), copy=True)
-            old_dense = _to_numpy(old_block)
-            slices = tuple(slice(0, size) for size in old_dense.shape)
-            target[slices] = old_dense
-            new_data.set_block(sector, np.asarray(target, dtype=target.dtype))
 
         return _tensor_with_data(tensor, new_data), True
 
