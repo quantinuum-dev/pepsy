@@ -29,6 +29,11 @@ import quimb.tensor as qtn
 from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate
 from ...tensors.core import tn_fidelity, tn_norm
+from .layout import (
+    MpsGateStreamLayoutFinder,
+    _normalize_layout_support,
+    _unique_ordered,
+)
 
 __all__ = [
     "MpsOptimizer",
@@ -196,7 +201,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         support ``where``. :meth:`submpo_event` builds the tuple form.
     chi : int
         Maximum bond dimension used by MPO/swap/SVD compression modes.
-    mode : {"dmrg", "mpo", "swap", "svd", "exact"}, default="dmrg"
+    mode : {"dmrg", "mpo", "mix", "swap", "svd", "exact"}, default="dmrg"
         Optimization backend.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
@@ -229,7 +234,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         fidelities, computed from accumulated log fidelities for stability.
     """
 
-    _ALLOWED_MODES = frozenset({"dmrg", "mpo", "swap", "svd", "exact"})
+    _ALLOWED_MODES = frozenset({"dmrg", "mpo", "mix", "swap", "svd", "exact"})
+    LayoutFinder = MpsGateStreamLayoutFinder
     _ALLOWED_SUBMPO_METHODS = frozenset(
         {
             "direct",
@@ -258,6 +264,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     _PROGBAR_COLORS = {
         "dmrg": "#1f77b4",
         "mpo": "#2ca02c",
+        "mix": "#17becf",
         "swap": "#ff7f0e",
         "svd": "#d62728",
         "exact": "#9467bd",
@@ -315,6 +322,120 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return is_submpo_event(entry)
 
+    @classmethod
+    def gate_stream_layout(  # pylint: disable=too-many-locals
+        cls,
+        gate_stream,
+        *,
+        sites=None,
+        L=None,
+        order="quality",
+        refine_passes=8,
+        refine_numba=True,
+        spectral_dense_max=512,
+        recursive_dense_max=1024,
+        nevergrad_budget=64,
+        nevergrad_seed=0,
+        nevergrad_optimizer="OnePlusOne",
+        kahypar_config_path=None,
+        kahypar_seed=0,
+        weight_fn=None,
+        weight_mode="auto",
+        schmidt_max_dim=4,
+    ):
+        """Find a good 1D MPS layout for a bundled gate stream.
+
+        The layout depends only on the stream supports, not on MPS tensor
+        values.  The returned plan includes the optimized site order,
+        old-site to new-position map, original stream locations, and internal
+        mapped locations. It does not mutate or return a replacement gate
+        stream.
+
+        Parameters
+        ----------
+        gate_stream
+            Canonical bundled stream accepted by :class:`MpsOptimizer`,
+            including explicit sub-MPO events.
+        sites : sequence[hashable] | None
+            Complete logical site labels to arrange. If omitted, sites are
+            inferred from first use in ``gate_stream`` unless ``L`` is given.
+        L : int | None
+            Convenience for ``sites=range(L)``.
+        order : str
+            One of ``"quality"``/``"auto"``/``"best"``, ``"recursive"``,
+            ``"input"``, ``"degree"``, ``"bfs"``, ``"spectral"``,
+            ``"nevergrad"``, ``"kahypar"``, or the ``"*_refined"`` variants.
+        refine_passes : int
+            Number of greedy adjacent-swap improvement passes.
+        refine_numba : bool
+            Use the optional numba polish kernel when numba is installed.
+        spectral_dense_max : int
+            Maximum site count for dense spectral ordering. ``"auto"`` falls
+            back to non-spectral candidates above this size.
+        recursive_dense_max : int
+            Maximum site count for dense recursive spectral bisection.
+        nevergrad_budget : int
+            Black-box optimization budget for optional nevergrad candidates.
+        nevergrad_seed : int | None
+            NumPy seed used while constructing the optional nevergrad candidate.
+        nevergrad_optimizer : str
+            Name of the nevergrad optimizer class to use.
+        kahypar_config_path : path-like | None
+            KaHyPar ``.ini`` config path. If omitted, ``PEPSY_KAHYPAR_CONFIG``
+            is used. KaHyPar is skipped unless a config is supplied.
+        kahypar_seed : int
+            Seed forwarded to KaHyPar recursive bisection.
+        weight_fn : callable | None
+            Optional ``weight_fn(payload, support, event_type)`` override for
+            per-event layout weights.
+        weight_mode : {"auto", "count", "angle", "operator_schmidt"}
+            Built-in event weighting heuristic. ``"auto"`` uses angle metadata
+            when present, otherwise a cheap two-site operator-Schmidt proxy for
+            small dense gates, falling back to count weights.
+        schmidt_max_dim : int
+            Maximum local dimension for the optional operator-Schmidt proxy.
+
+        Returns
+        -------
+        dict
+            Layout plan with ``qubit_inds``/``site_order``, ``layout``/
+            ``site_map``, original ``where``, internal ``mapped_where``,
+            ``stats``, and ``candidate_scores``.
+        """
+
+        finder = cls.LayoutFinder(gate_stream, sites=sites, L=L)
+        return finder.run(
+            order=order,
+            refine_passes=refine_passes,
+            refine_numba=refine_numba,
+            spectral_dense_max=spectral_dense_max,
+            recursive_dense_max=recursive_dense_max,
+            nevergrad_budget=nevergrad_budget,
+            nevergrad_seed=nevergrad_seed,
+            nevergrad_optimizer=nevergrad_optimizer,
+            kahypar_config_path=kahypar_config_path,
+            kahypar_seed=kahypar_seed,
+            weight_fn=weight_fn,
+            weight_mode=weight_mode,
+            schmidt_max_dim=schmidt_max_dim,
+        )
+
+    @classmethod
+    def find_gate_stream_layout(cls, gate_stream, **kwargs):
+        """Alias for :meth:`gate_stream_layout`."""
+
+        return cls.gate_stream_layout(gate_stream, **kwargs)
+
+    def layout_finder(self, *, sites=None, L=None):
+        """Return a layout finder for the currently queued gate stream."""
+
+        return type(self).LayoutFinder.from_optimizer(self, sites=sites, L=L)
+
+    def current_gate_stream_layout(self, *, sites=None, L=None, **kwargs):
+        """Find a layout for the optimizer's currently queued gate stream."""
+
+        return self.layout_finder(sites=sites, L=L).run(**kwargs)
+
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         p,
@@ -350,6 +471,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.true_infidelities = [0.0]
         self.infidelity_samples = []
         self.norm_infidelity_samples = []
+        self.last_layout_plan = None
+        self.mix_history = []
+        self.last_mix_summary = None
         self._true_fidelity_log_sum = 0.0
         self._true_fidelity_count = 0
         self._norm_fidelity_proxy = 1.0
@@ -416,6 +540,24 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             cls._is_symmray_array(tensor.data)
             for tensor in getattr(tn, "tensors", ())
         )
+
+    @staticmethod
+    def _mps_data_is_finite(p):
+        """Return whether dense numeric tensor data contains only finite values."""
+        for tensor in getattr(p, "tensors", ()):
+            try:
+                data = np.asarray(tensor.data)
+            except Exception:
+                continue
+            if not np.issubdtype(data.dtype, np.number):
+                continue
+            if not np.all(np.isfinite(data)):
+                return False
+        exponent = getattr(p, "exponent", 0.0)
+        try:
+            return bool(np.isfinite(float(exponent)))
+        except (TypeError, ValueError):
+            return True
 
     @staticmethod
     def _is_nearest_neighbor_1d(where):
@@ -560,6 +702,262 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.event_types.extend(event_types_new)
         return self
 
+    @staticmethod
+    def _layout_request_enabled(layout):
+        return layout is not None and layout is not False
+
+    @staticmethod
+    def _coalesce_layout_request(use_layout_finder, layout):
+        """Resolve the explicit layout-finder keyword and compatibility alias."""
+        primary = use_layout_finder
+        alias = layout
+        if (
+            primary is not None
+            and primary is not False
+            and alias is not None
+            and alias is not False
+        ):
+            raise ValueError(
+                "Specify only one of use_layout_finder=... or layout=...."
+            )
+        if primary is not None and primary is not False:
+            return primary
+        return alias
+
+    def _resolve_run_layout(self, layout, layout_order, layout_kwargs):
+        """Return ``(finder, plan)`` for a run-time layout request."""
+        self.last_layout_plan = None
+        if not self._layout_request_enabled(layout):
+            return None, None
+        if self.mode == "exact":
+            raise ValueError("layout-aware replay requires an MPS mode, not exact.")
+
+        if isinstance(layout, Mapping):
+            plan = dict(layout)
+            finder = self.layout_finder()
+        else:
+            order = layout_order
+            if isinstance(layout, str):
+                order = layout
+            finder = self.layout_finder()
+            kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
+            plan = finder.run(order=order, **kwargs)
+
+        self._validate_layout_plan_for_mps(plan)
+        self.last_layout_plan = plan
+        return finder, plan
+
+    def _validate_layout_plan_for_mps(self, plan):
+        """Validate that a layout plan can be used by this MPS."""
+        L = int(getattr(self.p, "L", 0))
+        original_order = tuple(range(L))
+        site_order = tuple(plan.get("site_order", plan.get("qubit_inds", ())))
+        if set(site_order) != set(original_order):
+            raise ValueError(
+                "layout-aware MpsOptimizer replay currently requires a "
+                "permutation of integer MPS sites range(L)."
+            )
+        if len(site_order) != L:
+            raise ValueError("layout site_order length must match p.L.")
+        site_map = plan.get("site_map", plan.get("layout"))
+        if not isinstance(site_map, Mapping):
+            raise ValueError("layout plan must contain a site_map/layout mapping.")
+        if set(site_map) != set(original_order):
+            raise ValueError("layout site_map keys must match range(p.L).")
+        if set(site_map.values()) != set(original_order):
+            raise ValueError("layout site_map values must be a permutation of range(p.L).")
+
+    def _reorder_mps_to_logical_order(self, target_order, *, current_order=None):
+        """Physically permute MPS site contents into ``target_order``."""
+        target = list(target_order)
+        current = (
+            list(range(int(getattr(self.p, "L", 0))))
+            if current_order is None
+            else list(current_order)
+        )
+        if set(target) != set(current) or len(target) != len(current):
+            raise ValueError("target_order must be a permutation of current_order.")
+
+        for target_pos, logical_site in enumerate(target):
+            current_pos = current.index(logical_site)
+            if current_pos == target_pos:
+                continue
+            self.p.swap_site_to_(
+                current_pos,
+                target_pos,
+                info=self.info_c,
+                method="svd",
+                cutoff=0.0,
+            )
+            moved = current.pop(current_pos)
+            current.insert(target_pos, moved)
+
+        self._current_orthog(self.p)
+        return tuple(current)
+
+    def _normalize_visible_mps_order(self):
+        """Make cached visible MPS order match canonical site order."""
+        L = int(getattr(self.p, "L", 0))
+        site_inds = [self.p.site_ind(site) for site in range(L)]
+        outer_inds = getattr(self.p, "_outer_inds", None)
+        if outer_inds is not None:
+            outer_set = set(outer_inds)
+            ordered_outer = [ind for ind in site_inds if ind in outer_set]
+            ordered_outer.extend(ind for ind in outer_inds if ind not in site_inds)
+            self.p._outer_inds = type(outer_inds)(ordered_outer)
+
+        tid_to_site = self.p._get_tid_to_site_map()
+        if tid_to_site:
+            ordered_tensors = {}
+            for site in range(L):
+                for tid, mapped_site in tid_to_site.items():
+                    if mapped_site == site:
+                        ordered_tensors[tid] = self.p.tensor_map[tid]
+            for tid, tensor in self.p.tensor_map.items():
+                ordered_tensors.setdefault(tid, tensor)
+            self.p.tensor_map.clear()
+            self.p.tensor_map.update(ordered_tensors)
+
+    @staticmethod
+    def _copy_submpo_for_layout(submpo, site_map, support):
+        """Return a copied sub-MPO with site labels remapped by ``site_map``."""
+        support = _unique_ordered(support)
+        if not support:
+            return submpo
+
+        mpo = submpo.copy()
+        token = f"_pepsy_layout_{id(mpo)}"
+        reindex_to_temp = {}
+        reindex_to_final = {}
+        retag_to_temp = {}
+        retag_to_final = {}
+
+        for count, old_site in enumerate(support):
+            new_site = site_map[old_site]
+            if old_site == new_site:
+                continue
+
+            for kind in ("upper_ind", "lower_ind"):
+                ind_fn = getattr(mpo, kind, None)
+                if ind_fn is None:
+                    continue
+                old_ind = ind_fn(old_site)
+                new_ind = ind_fn(new_site)
+                tmp_ind = f"{token}_{count}_{kind}"
+                reindex_to_temp[old_ind] = tmp_ind
+                reindex_to_final[tmp_ind] = new_ind
+
+            site_tag = getattr(mpo, "site_tag", None)
+            if site_tag is not None:
+                old_tag = site_tag(old_site)
+                new_tag = site_tag(new_site)
+                tmp_tag = f"{token}_{count}_tag"
+                retag_to_temp[old_tag] = tmp_tag
+                retag_to_final[tmp_tag] = new_tag
+
+        if reindex_to_temp:
+            mpo.reindex_(reindex_to_temp)
+            mpo.reindex_(reindex_to_final)
+        if retag_to_temp:
+            mpo.retag_(retag_to_temp)
+            mpo.retag_(retag_to_final)
+        return mpo
+
+    def _layout_run_sequences(self, G_seq, where_seq, event_seq, plan):
+        """Return run-local payloads and mapped locations for ``plan``."""
+        site_map = plan.get("site_map", plan.get("layout"))
+        mapped_G = []
+        mapped_where = []
+        for payload, where, event_type in zip(G_seq, where_seq, event_seq):
+            support = _normalize_layout_support(where)
+            mapped = tuple(site_map[site] for site in support)
+            if event_type == "submpo":
+                payload = self._copy_submpo_for_layout(payload, site_map, support)
+            mapped_G.append(payload)
+            mapped_where.append(mapped)
+        return mapped_G, mapped_where
+
+    @staticmethod
+    def _format_layout_value(value):
+        """Format one layout diagnostic value compactly."""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.6g}"
+
+    @classmethod
+    def _format_layout_reduction(cls, before, after):
+        """Format ``before -> after`` with a percent decrease when meaningful."""
+        before = float(before or 0.0)
+        after = float(after or 0.0)
+        text = f"{cls._format_layout_value(before)} -> {cls._format_layout_value(after)}"
+        if before > 0.0:
+            reduction = 100.0 * (before - after) / before
+            text += f" ({reduction:.1f}% lower)"
+        return text
+
+    @classmethod
+    def _layout_report_text(cls, plan):
+        """Return a concise human-readable layout improvement report."""
+        stats = plan.get("stats", {})
+        input_stats = plan.get("input_stats", {})
+        if not input_stats:
+            return None
+        selected = plan.get("selected_order", "<unknown>")
+        site_order = plan.get("site_order", plan.get("qubit_inds", ()))
+        weight_mode = plan.get("weight_mode", "count")
+        lines = [
+            (
+                "MpsOptimizer layout finder: "
+                f"order={selected}, sites={len(site_order)}, "
+                f"events={stats.get('num_events', input_stats.get('num_events', 0))}, "
+                f"weight_mode={weight_mode}"
+            ),
+            (
+                "  long-range events: "
+                + cls._format_layout_reduction(
+                    input_stats.get("long_range_events", 0),
+                    stats.get("long_range_events", 0),
+                )
+                + " | weighted: "
+                + cls._format_layout_reduction(
+                    input_stats.get("weighted_long_range_events", 0.0),
+                    stats.get("weighted_long_range_events", 0.0),
+                )
+            ),
+            (
+                "  event span max/mean: "
+                + cls._format_layout_value(input_stats.get("max_event_span", 0))
+                + "/"
+                + cls._format_layout_value(input_stats.get("weighted_mean_event_span", 0.0))
+                + " -> "
+                + cls._format_layout_value(stats.get("max_event_span", 0))
+                + "/"
+                + cls._format_layout_value(stats.get("weighted_mean_event_span", 0.0))
+            ),
+            (
+                "  score: "
+                + cls._format_layout_reduction(
+                    input_stats.get("loss", input_stats.get("score", 0.0)),
+                    stats.get("loss", stats.get("score", 0.0)),
+                )
+                + " | graph span: "
+                + cls._format_layout_reduction(
+                    input_stats.get("weighted_total_span", input_stats.get("total_span", 0.0)),
+                    stats.get("weighted_total_span", stats.get("total_span", 0.0)),
+                )
+                + " | cut L2: "
+                + cls._format_layout_reduction(
+                    input_stats.get("weighted_cut_congestion_l2", 0.0),
+                    stats.get("weighted_cut_congestion_l2", 0.0),
+                )
+            ),
+        ]
+        return "\n".join(lines)
+
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         n_iter=5,
@@ -576,6 +974,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         track_norm_infidelity=False,
         track_infidelity=False,
         submpo_method="direct",
+        use_layout_finder=False,
+        layout_order="quality",
+        layout_kwargs=None,
+        layout=None,
+        layout_report=True,
     ):
         """Run the currently queued gates.
 
@@ -591,7 +994,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode : str, default="rsum2"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
             ``tensor_network_1d_compress``.
-        mode : {"dmrg", "mpo", "swap", "svd", "exact"} | None, default=None
+        mode : {"dmrg", "mpo", "mix", "swap", "svd", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
         fidelity_samples : int | None, default=None
@@ -608,6 +1011,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             DMRG mode only: number of sequential two-qubit gates to batch
             into one local FIT update. The FIT window uses the batch-wide
             ``[xmin, xmax]`` from all two-qubit gate locations in the batch.
+            ``mode="mix"`` currently switches at gate-step granularity and
+            requires ``k_2q_batch=1``.
         non_unitary : bool, default=False
             Convenience flag for non-unitary gate streams. Normalization is
             only available when this is ``True``; default/unitary runs never
@@ -642,6 +1047,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             MPO mode only: compression method used for explicit sub-MPO stream
             events. This is forwarded to quimb's
             ``MatrixProductState.gate_with_submpo_``.
+        use_layout_finder : bool | str | Mapping, default=False
+            If enabled, call :meth:`layout_finder`, temporarily replay the
+            stream in the selected 1D site order, then restore the returned
+            MPS to original site order. ``True`` uses ``layout_order``; a
+            string is used as the order name; a mapping is treated as a
+            precomputed layout plan. The queued gate stream is not mutated.
+        layout_order : str, default="quality"
+            Order passed to :meth:`layout_finder().run` when
+            ``use_layout_finder=True``.
+        layout_kwargs : Mapping | None, default=None
+            Extra keyword arguments forwarded to ``layout_finder().run``.
+        layout : bool | str | Mapping | None, default=None
+            Compatibility alias for ``use_layout_finder``.
+        layout_report : bool, default=True
+            Print a concise before/after layout summary when layout-aware
+            replay is used.
 
         Returns
         -------
@@ -651,6 +1072,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if mode is not None:
             self.set_mode(mode)
 
+        self.last_layout_plan = None
         G_seq = list(self.G)
         where_seq = list(self.where)
         event_seq = list(self.event_types)
@@ -658,6 +1080,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
         self._validate_symmray_mode_support()
         self._validate_event_stream_for_run(G_seq, where_seq, event_seq)
+        layout_request = self._coalesce_layout_request(use_layout_finder, layout)
+        _, layout_plan = self._resolve_run_layout(
+            layout_request,
+            layout_order,
+            layout_kwargs,
+        )
+        layout_current_order = None
+        if layout_plan is not None:
+            if layout_report:
+                report = self._layout_report_text(layout_plan)
+                if report:
+                    print(report)
+            layout_order_tuple = tuple(layout_plan["site_order"])
+            G_seq, where_seq = self._layout_run_sequences(
+                G_seq,
+                where_seq,
+                event_seq,
+                layout_plan,
+            )
+            layout_current_order = self._reorder_mps_to_logical_order(
+                layout_order_tuple
+            )
 
         non_unitary = bool(non_unitary)
         if not non_unitary:
@@ -675,6 +1119,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         track_norm_infidelity = bool(track_norm_infidelity)
         track_infidelity = bool(track_infidelity)
+        if self.mode == "mix":
+            if non_unitary:
+                raise ValueError("mode='mix' is only for unitary gate streams.")
+            if track_norm_infidelity or track_infidelity:
+                raise ValueError(
+                    "mode='mix' does not currently support infidelity diagnostics; "
+                    "use mode='mpo' or mode='dmrg' for those diagnostics."
+                )
+            if k_2q_batch != 1:
+                raise ValueError(
+                    "mode='mix' switches at gate-step granularity and currently "
+                    "requires k_2q_batch=1."
+                )
         if (
             normalize_every is not None
             or track_norm_infidelity
@@ -689,85 +1146,107 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             and not track_infidelity
         )
 
-        if self.mode == "dmrg":
-            self._prepare_dmrg_state()
-            self._run_dmrg(
-                G_seq,
-                where_seq,
-                n_iter=n_iter,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                k_2q_batch=k_2q_batch,
-                normalize_every=normalize_every,
-                normalize_final=normalize_final,
-                normalize_eps=normalize_eps,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
-                record_fit_losses=record_fit_losses,
-            )
-            return self.p
+        try:
+            if self.mode == "dmrg":
+                self._prepare_dmrg_state()
+                self._run_dmrg(
+                    G_seq,
+                    where_seq,
+                    n_iter=n_iter,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    k_2q_batch=k_2q_batch,
+                    normalize_every=normalize_every,
+                    normalize_final=normalize_final,
+                    normalize_eps=normalize_eps,
+                    track_norm_infidelity=track_norm_infidelity,
+                    track_infidelity=track_infidelity,
+                    record_fit_losses=record_fit_losses,
+                )
+                return self.p
 
-        if self.mode == "mpo":
-            self._run_mpo(
-                G_seq,
-                where_seq,
-                event_seq,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
-                normalize_every=normalize_every,
-                normalize_final=normalize_final,
-                normalize_eps=normalize_eps,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
-                submpo_method=submpo_method,
-            )
-            return self.p
+            if self.mode == "mix":
+                self._run_mix(
+                    G_seq,
+                    where_seq,
+                    event_seq,
+                    n_iter=n_iter,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=fidelity_samples,
+                    submpo_method=submpo_method,
+                )
+                return self.p
 
-        if self.mode == "swap":
-            self._run_swap(
-                G_seq,
-                where_seq,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
-                normalize_every=normalize_every,
-                normalize_final=normalize_final,
-                normalize_eps=normalize_eps,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
-            )
-            return self.p
+            if self.mode == "mpo":
+                self._run_mpo(
+                    G_seq,
+                    where_seq,
+                    event_seq,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=fidelity_samples,
+                    normalize_every=normalize_every,
+                    normalize_final=normalize_final,
+                    normalize_eps=normalize_eps,
+                    track_norm_infidelity=track_norm_infidelity,
+                    track_infidelity=track_infidelity,
+                    submpo_method=submpo_method,
+                )
+                return self.p
 
-        if self.mode == "svd":
-            self._run_svd(
-                G_seq,
-                where_seq,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
-                normalize_every=normalize_every,
-                normalize_final=normalize_final,
-                normalize_eps=normalize_eps,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
-            )
-            return self.p
+            if self.mode == "swap":
+                self._run_swap(
+                    G_seq,
+                    where_seq,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=fidelity_samples,
+                    normalize_every=normalize_every,
+                    normalize_final=normalize_final,
+                    normalize_eps=normalize_eps,
+                    track_norm_infidelity=track_norm_infidelity,
+                    track_infidelity=track_infidelity,
+                )
+                return self.p
 
-        if self.mode == "exact":
-            self._run_exact(
-                G_seq,
-                where_seq,
-                progbar=progbar,
-                cutoff=cutoff,
-                cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
-            )
-            return self.p
+            if self.mode == "svd":
+                self._run_svd(
+                    G_seq,
+                    where_seq,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=fidelity_samples,
+                    normalize_every=normalize_every,
+                    normalize_final=normalize_final,
+                    normalize_eps=normalize_eps,
+                    track_norm_infidelity=track_norm_infidelity,
+                    track_infidelity=track_infidelity,
+                )
+                return self.p
+
+            if self.mode == "exact":
+                self._run_exact(
+                    G_seq,
+                    where_seq,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=fidelity_samples,
+                )
+                return self.p
+        finally:
+            if layout_current_order is not None:
+                self._reorder_mps_to_logical_order(
+                    tuple(range(int(getattr(self.p, "L", 0)))),
+                    current_order=layout_current_order,
+                )
+                self._normalize_visible_mps_order()
 
         raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -1335,6 +1814,198 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     inplace=False,
                 )
         return p_g
+
+    def _run_mix_mpo_step(
+        self,
+        gate,
+        where,
+        event_type,
+        *,
+        cutoff,
+        cutoff_mode,
+        submpo_method,
+    ):
+        """Apply one mixed-mode step through the MPO backend."""
+        self._run_mpo(
+            [gate],
+            [where],
+            [event_type],
+            progbar=False,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            fidelity_samples=None,
+            normalize_every=None,
+            normalize_final=False,
+            track_norm_infidelity=False,
+            track_infidelity=False,
+            submpo_method=submpo_method,
+        )
+        if not self._mps_data_is_finite(self.p):
+            raise FloatingPointError("MPO step produced non-finite MPS tensor data.")
+
+    def _run_mix_dmrg_step(
+        self,
+        gate,
+        where,
+        *,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+    ):
+        """Apply one mixed-mode step through the DMRG backend."""
+        self._run_dmrg(
+            [gate],
+            [where],
+            n_iter=n_iter,
+            progbar=False,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            k_2q_batch=1,
+            normalize_every=None,
+            normalize_final=False,
+            track_norm_infidelity=False,
+            track_infidelity=False,
+            record_fit_losses=True,
+        )
+        if not self._mps_data_is_finite(self.p):
+            raise FloatingPointError("DMRG step produced non-finite MPS tensor data.")
+
+    def _run_mix(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        G_seq,
+        where_seq,
+        event_seq,
+        *,
+        n_iter,
+        progbar=False,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+        fidelity_samples=10,
+        submpo_method="direct",
+    ):
+        """Apply a unitary stream with MPO warmup then DMRG at target bond."""
+        if any(event_type == "submpo" for event_type in event_seq):
+            raise ValueError("mode='mix' currently supports gate streams only.")
+
+        self.mix_history = []
+        self.last_mix_summary = None
+        sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
+        pbar = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(
+                total=len(G_seq),
+                desc="mix",
+                leave=True,
+                position=0,
+                ascii=True,
+                colour=self._PROGBAR_COLORS["mix"],
+            )
+
+        mpo_steps = 0
+        dmrg_steps = 0
+        fallback_steps = 0
+        norm_proxy = None if fidelity_samples is None else self.losses[-1]
+
+        try:
+            for idx, (gate, where, event_type) in enumerate(
+                zip(G_seq, where_seq, event_seq),
+                start=1,
+            ):
+                if len(where) not in {1, 2}:
+                    raise ValueError("Each gate location must have one or two sites.")
+
+                start_bond = int(self.p.max_bond())
+                entry = {
+                    "step": int(idx),
+                    "where": tuple(where),
+                    "start_bond": start_bond,
+                }
+
+                if start_bond < int(self.chi):
+                    self._run_mix_mpo_step(
+                        gate,
+                        where,
+                        event_type,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        submpo_method=submpo_method,
+                    )
+                    mpo_steps += 1
+                    entry["backend"] = "mpo"
+                    entry["reason"] = "bond_below_chi"
+                else:
+                    saved_p = self._install_represented_norm(self.p.copy())
+                    saved_info = dict(self.info_c)
+                    saved_lengths = {
+                        "losses": len(self.losses),
+                        "infidelities": len(self.infidelities),
+                        "true_infidelities": len(self.true_infidelities),
+                        "infidelity_samples": len(self.infidelity_samples),
+                        "norm_infidelity_samples": len(self.norm_infidelity_samples),
+                        "normalizations": len(self.normalizations),
+                    }
+                    try:
+                        self._run_mix_dmrg_step(
+                            gate,
+                            where,
+                            n_iter=n_iter,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                        )
+                    except Exception as exc:  # fallback is the point of mix mode
+                        self.p = saved_p
+                        self.info_c = saved_info
+                        for attr, length in saved_lengths.items():
+                            del getattr(self, attr)[length:]
+                        self._run_mix_mpo_step(
+                            gate,
+                            where,
+                            event_type,
+                            cutoff=cutoff,
+                            cutoff_mode=cutoff_mode,
+                            submpo_method=submpo_method,
+                        )
+                        mpo_steps += 1
+                        fallback_steps += 1
+                        entry["backend"] = "mpo"
+                        entry["reason"] = "dmrg_fallback"
+                        entry["fallback_error"] = f"{type(exc).__name__}: {exc}"
+                    else:
+                        dmrg_steps += 1
+                        entry["backend"] = "dmrg"
+                        entry["reason"] = "bond_at_chi"
+
+                entry["end_bond"] = int(self.p.max_bond())
+                self.mix_history.append(entry)
+
+                if idx in sample_steps:
+                    norm_proxy = self._append_norm_proxy_sample(self.p)
+
+                if pbar is not None:
+                    postfix = {
+                        "backend": entry["backend"],
+                        "mpo": mpo_steps,
+                        "dmrg": dmrg_steps,
+                        "fallback": fallback_steps,
+                        "bond": f"{entry['end_bond']}/{self.chi}",
+                    }
+                    if norm_proxy is not None:
+                        postfix["~F"] = self._format_progress_scalar(norm_proxy)
+                    pbar.set_postfix(postfix)
+                    pbar.update(1)
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        self.last_mix_summary = {
+            "mpo_steps": int(mpo_steps),
+            "dmrg_steps": int(dmrg_steps),
+            "fallback_steps": int(fallback_steps),
+            "final_bond": int(self.p.max_bond()),
+            "chi": int(self.chi),
+        }
 
     def _run_dmrg(
         self,

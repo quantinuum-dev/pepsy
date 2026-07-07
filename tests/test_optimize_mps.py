@@ -84,6 +84,72 @@ def test_mps_optimizer_svd_smoke():
     assert opt.p.max_bond() <= 8
 
 
+def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
+    """Mix mode should use MPO below chi and DMRG after reaching chi."""
+    p0 = qtn.MPS_computational_state("000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 1)),
+        (qu.CNOT(), (1, 2)),
+    ]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
+    out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0, n_iter=3)
+
+    assert out.max_bond() <= 2
+    assert [event["backend"] for event in opt.mix_history][:2] == ["mpo", "mpo"]
+    assert opt.mix_history[-1]["backend"] == "dmrg"
+    assert opt.last_mix_summary["mpo_steps"] == 2
+    assert opt.last_mix_summary["dmrg_steps"] == 1
+    assert opt.last_mix_summary["fallback_steps"] == 0
+
+
+def test_mps_optimizer_mix_starts_with_dmrg_at_target_bond():
+    """Mix mode should not do MPO warmup when the initial MPS is already at chi."""
+    p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=17)
+    assert p0.max_bond() == 2
+    gates = [(qu.hadamard(), (1,))]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
+    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    assert opt.mix_history[0]["backend"] == "dmrg"
+    assert opt.mix_history[0]["reason"] == "bond_at_chi"
+
+
+def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
+    """Mix mode should restore and use MPO if DMRG leaves non-finite data."""
+    p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=19)
+    gates = [(qu.hadamard(), (1,))]
+    original_run_dmrg = py.MpsOptimizer._run_dmrg
+
+    def nonfinite_dmrg(self, *args, **kwargs):
+        original_run_dmrg(self, *args, **kwargs)
+        data = np.asarray(self.p[0].data)
+        self.p[0].modify(data=np.full_like(data, np.nan))
+
+    monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", nonfinite_dmrg)
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
+
+    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    assert opt.mix_history[0]["backend"] == "mpo"
+    assert opt.mix_history[0]["reason"] == "dmrg_fallback"
+    assert "non-finite" in opt.mix_history[0]["fallback_error"]
+    assert opt.last_mix_summary["fallback_steps"] == 1
+    assert py.MpsOptimizer._mps_data_is_finite(opt.p)
+
+
+def test_mps_optimizer_mix_rejects_non_unitary_stream_controls():
+    """Mix mode is intentionally restricted to unitary streams."""
+    p0 = qtn.MPS_computational_state("00", dtype="complex128")
+    gates = [(qu.CNOT(), (0, 1))]
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
+
+    with pytest.raises(ValueError, match="only for unitary"):
+        opt.run(non_unitary=True, normalize_every=True)
+
+
 def test_mps_optimizer_accepts_bundled_gate_stream():
     """Construction should accept ``[(gate, where), ...]`` with ``where=None``."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -125,6 +191,220 @@ def test_mps_optimizer_set_and_add_gates_accept_bundled_gate_stream():
 
     assert len(opt.G) == 2
     assert opt.where == [(1,), (0, 3)]
+
+
+def test_mps_optimizer_layout_finder_api_is_separate_module():
+    """Layout finder should live outside the optimizer implementation file."""
+    from pepsy.optimizers.mps import MpsGateStreamLayoutFinder
+    from pepsy.optimizers.mps.layout import MpsGateStreamLayoutFinder as LayoutFinder
+
+    assert MpsGateStreamLayoutFinder is LayoutFinder
+    assert py.MpsOptimizer.LayoutFinder is LayoutFinder
+
+
+def test_mps_optimizer_gate_stream_layout_remaps_long_range_path():
+    """Gate-stream layout should find a short order without changing the stream."""
+    gates = [
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (3, 1)),
+        (qu.CNOT(), (1, 2)),
+    ]
+
+    plan = py.MpsOptimizer.gate_stream_layout(gates, L=4)
+
+    assert set(plan["site_order"]) == {0, 1, 2, 3}
+    assert plan["stats"]["max_span"] == 1
+    assert plan["stats"]["long_range_events"] == 0
+    assert plan["input_stats"]["long_range_events"] == 2
+    assert plan["stats"]["loss"] <= plan["input_stats"]["loss"]
+    assert plan["score"] == plan["stats"]["loss"]
+    assert plan["layout"] == plan["site_map"]
+    assert "recursive_refined" in plan["candidate_scores"]
+    assert "gate_stream" not in plan
+    assert "gates" not in plan
+    assert plan["where"] == tuple(where for _gate, where in gates)
+    assert set(plan["inverse_site_map"]) == {0, 1, 2, 3}
+    assert all(
+        abs(where[0] - where[1]) == 1
+        for where in plan["mapped_where"]
+    )
+
+
+def test_mps_optimizer_gate_stream_layout_accepts_weight_fn():
+    """User event weights should feed the weighted graph and report."""
+    gates = [
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (1, 2)),
+    ]
+
+    def weight_fn(_payload, support, _event_type):
+        return 10.0 if tuple(support) == (0, 3) else 1.0
+
+    plan = py.MpsOptimizer.gate_stream_layout(
+        gates,
+        L=4,
+        order="input",
+        weight_fn=weight_fn,
+    )
+
+    assert plan["event_weights"] == (10.0, 1.0)
+    assert plan["input_stats"]["total_edge_weight"] == pytest.approx(11.0)
+    assert plan["input_stats"]["weighted_long_range_events"] == pytest.approx(10.0)
+
+
+def test_mps_optimizer_gate_stream_layout_can_use_nevergrad():
+    """Optional nevergrad candidate should be usable without touching streams."""
+    pytest.importorskip("nevergrad")
+    gates = [
+        (qu.CNOT(), (0, 4)),
+        (qu.CNOT(), (4, 1)),
+        (qu.CNOT(), (1, 3)),
+        (qu.CNOT(), (3, 2)),
+    ]
+
+    plan = py.MpsOptimizer.gate_stream_layout(
+        gates,
+        L=5,
+        order="nevergrad",
+        nevergrad_budget=8,
+        refine_passes=1,
+    )
+
+    assert plan["selected_order"] == "nevergrad"
+    assert "nevergrad" in plan["candidate_scores"]
+    assert set(plan["site_order"]) == set(range(5))
+    assert plan["where"] == tuple(where for _gate, where in gates)
+
+
+def test_mps_optimizer_gate_stream_layout_kahypar_requires_config(monkeypatch):
+    """Explicit KaHyPar layouts need a user-supplied config path."""
+    monkeypatch.delenv("PEPSY_KAHYPAR_CONFIG", raising=False)
+    gates = [(qu.CNOT(), (0, 3)), (qu.CNOT(), (3, 1))]
+
+    with pytest.raises(ValueError, match="kahypar_config_path"):
+        py.MpsOptimizer.gate_stream_layout(gates, L=4, order="kahypar")
+
+
+def test_mps_optimizer_current_gate_stream_layout_uses_state_length():
+    """Instance helper should include untouched MPS sites via ``p.L``."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=8,
+        mode="svd",
+    )
+
+    plan = opt.current_gate_stream_layout(order="input")
+
+    assert plan["site_order"] == (0, 1, 2, 3)
+    assert plan["where"] == ((0, 2),)
+    assert plan["mapped_where"] == ((0, 2),)
+
+
+def test_mps_optimizer_gate_stream_layout_preserves_submpo_events():
+    """Layout planning should not rewrite explicit sub-MPO stream events."""
+    mpo = _two_branch_flip_submpo(L=4, sites=(0, 3), targets=(0, 3))
+    stream = [
+        py.MpsOptimizer.submpo_event(mpo, (0, 3)),
+        (qu.CNOT(), (3, 1)),
+    ]
+
+    plan = py.MpsOptimizer.gate_stream_layout(stream, L=4)
+
+    assert plan["event_types"] == ("submpo", "gate")
+    assert stream[0][1] is mpo
+    assert stream[0][2] == (0, 3)
+    assert plan["where"][0] == (0, 3)
+    assert plan["mapped_where"][0] != plan["where"][0]
+
+
+def test_mps_optimizer_layout_run_restores_original_mps_order_and_stream():
+    """Layout-aware replay should be internal and return original site labels."""
+    p0 = qtn.MPS_computational_state("0101", dtype="complex128")
+    gates = [
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (3, 1)),
+        (qu.CNOT(), (1, 2)),
+    ]
+    ref = py.MpsOptimizer(
+        p0.copy(),
+        gates=gates,
+        chi=16,
+        mode="svd",
+    ).run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=16, mode="svd")
+    out = opt.run(
+        use_layout_finder=True,
+        progbar=False,
+        cutoff=1e-12,
+        fidelity_samples=0,
+    )
+
+    inds = ["k0", "k1", "k2", "k3"]
+    assert np.allclose(out.to_dense(inds), ref.to_dense(inds))
+    assert out.outer_inds() == tuple(inds)
+    assert opt.where == [(0, 3), (3, 1), (1, 2)]
+    assert all(
+        actual is expected
+        for actual, (expected, _where) in zip(opt.G, gates)
+    )
+    assert opt.last_layout_plan is not None
+
+
+def test_mps_optimizer_layout_run_reports_score_reduction(capsys):
+    """Layout-aware replay should print a concise before/after report."""
+    p0 = qtn.MPS_computational_state("0101", dtype="complex128")
+    gates = [
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (3, 1)),
+        (qu.CNOT(), (1, 2)),
+    ]
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=16, mode="svd")
+
+    opt.run(
+        use_layout_finder=True,
+        progbar=False,
+        cutoff=1e-12,
+        fidelity_samples=0,
+        layout_report=True,
+    )
+
+    report = capsys.readouterr().out
+    assert "MpsOptimizer layout finder:" in report
+    assert "long-range events:" in report
+    assert "score:" in report
+    assert "graph span:" in report
+
+
+def test_mps_optimizer_layout_run_copies_submpo_payloads():
+    """Layout replay should remap sub-MPO copies without mutating the stream."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=4, sites=(0, 3), targets=(0, 3))
+    stream = [py.MpsOptimizer.submpo_event(mpo, (0, 3))]
+    ref = py.MpsOptimizer(
+        p0.copy(),
+        gates=stream,
+        chi=16,
+        mode="mpo",
+    ).run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    opt = py.MpsOptimizer(p0.copy(), gates=stream, chi=16, mode="mpo")
+    out = opt.run(
+        use_layout_finder=True,
+        progbar=False,
+        cutoff=1e-12,
+        fidelity_samples=0,
+    )
+
+    inds = ["k0", "k1", "k2", "k3"]
+    assert np.allclose(out.to_dense(inds), ref.to_dense(inds))
+    assert out.outer_inds() == tuple(inds)
+    assert out.site_inds == tuple(inds)
+    assert stream[0][1] is mpo
+    assert stream[0][2] == (0, 3)
+    assert opt.where == [(0, 3)]
 
 
 def test_mps_optimizer_mpo_mode_applies_submpo_stream_event():
@@ -174,7 +454,6 @@ def test_mps_optimizer_mpo_mode_accepts_submpo_mapping_event():
 
 def test_mps_optimizer_public_submpo_event_helpers():
     """Public helpers should own the sub-MPO stream event contract."""
-    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     mpo = _two_branch_flip_submpo(L=4, sites=(0, 2), targets=(0, 2))
     tuple_event = py.MpsOptimizer.submpo_event(mpo, [0, 2])
     mapping_event = {"kind": "submpo", "mpo": mpo, "where": [0, 2]}
