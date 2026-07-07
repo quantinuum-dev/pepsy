@@ -1171,14 +1171,16 @@ class SymDMRG2:
         uses the dense reference Hamiltonian solve. The default ``0`` keeps
         the block-native path matrix-free unless a caller explicitly opts into
         dense local solves.
-    local_eig_tol, local_eig_energy_tol, local_eig_min_steps, local_eig_ncv, local_eig_maxiter, local_eig_backend
+    local_eig_tol, local_eig_energy_tol, local_eig_p_tol, local_eig_min_gap, local_eig_min_steps, local_eig_ncv, local_eig_maxiter, local_eig_backend
         Krylov/Lanczos eigensolver options. By default, Symmray local solves
         keep the Lanczos basis as block tensors and use dense NumPy only for
-        scalar Rayleigh-Ritz projections. The native-block path uses
-        an energy-change stop once at least ``local_eig_min_steps`` Krylov
-        vectors have been built, and uses ``local_eig_ncv`` as its hard Krylov
-        subspace cap unless ``local_eig_maxiter`` is set explicitly.
-        ``local_eig_energy_tol=None`` disables the energy-change stop.
+        scalar Rayleigh-Ritz projections. The native-block path uses a
+        TeNPy-style Ritz stop once at least ``local_eig_min_steps`` Krylov
+        vectors have been built: the Ritz energy change must satisfy
+        ``local_eig_energy_tol`` and the Ritz residual/gap state-error estimate
+        must satisfy ``local_eig_p_tol``. Set either tolerance to ``None`` to
+        disable that side of the early-stop gate. ``local_eig_ncv`` is the hard
+        Krylov subspace cap unless ``local_eig_maxiter`` is set explicitly.
         ``local_eig_ncv`` can also be a sweep schedule, in which case the last
         entry is repeated. Set ``local_eig_backend`` to an explicit
         quimb/scipy backend to use the older flat LinearOperator adapter.
@@ -1300,8 +1302,10 @@ class SymDMRG2:
         local_solver="auto",
         dense_threshold=0,
         local_eig_tol=1e-8,
-        local_eig_energy_tol=None,
-        local_eig_min_steps=3,
+        local_eig_energy_tol=float("inf"),
+        local_eig_p_tol="auto",
+        local_eig_min_gap=1e-12,
+        local_eig_min_steps=2,
         local_eig_ncv=20,
         local_eig_maxiter=None,
         local_eig_backend=None,
@@ -1370,6 +1374,17 @@ class SymDMRG2:
             if local_eig_energy_tol is None
             else float(local_eig_energy_tol)
         )
+        if isinstance(local_eig_p_tol, str):
+            local_eig_p_tol_key = local_eig_p_tol.strip().lower().replace("-", "_")
+            if local_eig_p_tol_key != "auto":
+                raise ValueError("local_eig_p_tol must be a float, None, or 'auto'.")
+            local_eig_p_tol = (
+                None if self.local_eig_energy_tol is None else 1e-8
+            )
+        self.local_eig_p_tol = (
+            None if local_eig_p_tol is None else float(local_eig_p_tol)
+        )
+        self.local_eig_min_gap = float(local_eig_min_gap)
         self.local_eig_min_steps = int(local_eig_min_steps)
         self._local_eig_ncv_input = local_eig_ncv
         self.local_eig_ncv = None
@@ -1450,6 +1465,10 @@ class SymDMRG2:
             raise ValueError("local_eig_maxiter must be a positive integer.")
         if self.local_eig_energy_tol is not None and self.local_eig_energy_tol < 0.0:
             raise ValueError("local_eig_energy_tol must be non-negative.")
+        if self.local_eig_p_tol is not None and self.local_eig_p_tol < 0.0:
+            raise ValueError("local_eig_p_tol must be non-negative.")
+        if self.local_eig_min_gap <= 0.0:
+            raise ValueError("local_eig_min_gap must be positive.")
         if self.local_eig_min_steps < 1:
             raise ValueError("local_eig_min_steps must be a positive integer.")
         if self.min_sweeps < 0:
@@ -4250,6 +4269,20 @@ class SymDMRG2:
         key = str(which).upper()
         return -1 if key.startswith("L") else 0
 
+    @staticmethod
+    def _native_lanczos_gap(evals, pick, min_gap):
+        """Return the nearest Ritz-value gap used in TeNPy's P-error test."""
+        evals = np.asarray(evals, dtype=float)
+        if evals.size < 2:
+            return float("inf")
+        if pick == 0:
+            gap = evals[1] - evals[0]
+        elif pick == -1 or pick == evals.size - 1:
+            gap = evals[-1] - evals[-2]
+        else:
+            gap = np.min(np.abs(np.delete(evals, pick) - evals[pick]))
+        return max(float(abs(gap)), float(min_gap))
+
     def _native_lanczos_max_steps(self, dim):
         if self.local_eig_maxiter is not None:
             steps = self.local_eig_maxiter
@@ -4288,6 +4321,8 @@ class SymDMRG2:
         best = None
         previous_ritz_energy = None
         energy_tol = self.local_eig_energy_tol
+        p_tol = self.local_eig_p_tol
+        min_gap = self.local_eig_min_gap
         min_steps = min(int(self.local_eig_min_steps), int(max_steps))
 
         for step in range(max_steps):
@@ -4324,18 +4359,43 @@ class SymDMRG2:
                 else float(abs(ritz_energy - previous_ritz_energy))
             )
             residual_estimate = float(beta * abs(coeffs[-1]))
+            ritz_gap = self._native_lanczos_gap(evals, pick, min_gap)
+            ritz_p_error = (
+                0.0
+                if residual_estimate == 0.0
+                else float((residual_estimate / ritz_gap) ** 2)
+            )
+            enough_steps = len(alphas) >= min_steps
             residual_converged = bool(residual_estimate <= tol or beta <= 1e-14)
             energy_converged = bool(
                 energy_tol is not None
                 and ritz_energy_delta is not None
-                and len(alphas) >= min_steps
+                and enough_steps
                 and ritz_energy_delta <= energy_tol
             )
+            p_converged = bool(
+                p_tol is not None
+                and enough_steps
+                and ritz_p_error <= p_tol
+            )
+            if energy_tol is None and p_tol is None:
+                ritz_converged = False
+            elif energy_tol is None:
+                ritz_converged = p_converged
+            elif p_tol is None:
+                ritz_converged = energy_converged
+            else:
+                ritz_converged = bool(energy_converged and p_converged)
             stop_reason = None
             if residual_converged:
                 stop_reason = "residual"
-            elif energy_converged:
-                stop_reason = "energy"
+            elif ritz_converged:
+                if p_tol is None:
+                    stop_reason = "energy"
+                elif energy_tol is None:
+                    stop_reason = "p_error"
+                else:
+                    stop_reason = "ritz"
             elif len(alphas) >= max_steps:
                 stop_reason = "max_steps"
             best = {
@@ -4344,18 +4404,24 @@ class SymDMRG2:
                 "residual_estimate": residual_estimate,
                 "residual_converged": residual_converged,
                 "energy_converged": energy_converged,
+                "p_converged": p_converged,
+                "ritz_converged": ritz_converged,
+                "ritz_gap": ritz_gap,
+                "ritz_p_error": ritz_p_error,
                 "ritz_energy_delta": ritz_energy_delta,
                 "local_eig_energy_tol": energy_tol,
+                "local_eig_p_tol": p_tol,
+                "local_eig_min_gap": min_gap,
                 "local_eig_min_steps": int(min_steps),
                 "num_steps": int(len(alphas)),
                 "num_matvecs": int(len(alphas)),
-                "converged": bool(residual_converged or energy_converged),
+                "converged": bool(residual_converged or ritz_converged),
                 "stop_reason": stop_reason,
                 "max_steps": int(max_steps),
                 "max_steps_source": max_steps_source,
                 "backend": "native_block",
             }
-            if residual_converged or energy_converged:
+            if residual_converged or ritz_converged:
                 break
 
             previous_ritz_energy = ritz_energy
@@ -5532,6 +5598,8 @@ class SymDMRG2:
             "dense_threshold": self.dense_threshold,
             "local_eig_tol": self.local_eig_tol,
             "local_eig_energy_tol": self.local_eig_energy_tol,
+            "local_eig_p_tol": self.local_eig_p_tol,
+            "local_eig_min_gap": self.local_eig_min_gap,
             "local_eig_min_steps": self.local_eig_min_steps,
             "local_eig_ncv": self.local_eig_ncv,
             "local_eig_ncvs": self.local_eig_ncvs,

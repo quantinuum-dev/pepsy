@@ -1690,6 +1690,7 @@ def test_symdmrg2_native_lanczos_energy_stop_cuts_before_ncv():
         dense_threshold=0,
         local_eig_tol=1e-14,
         local_eig_energy_tol=float("inf"),
+        local_eig_p_tol=None,
         local_eig_min_steps=3,
         local_eig_ncv=8,
         norm_check="off",
@@ -1722,6 +1723,47 @@ def test_symdmrg2_native_lanczos_energy_stop_cuts_before_ncv():
     assert summary["num_lanczos_matvecs"] == 3
     assert summary["avg_lanczos_matvecs"] == pytest.approx(3.0)
     assert summary["lanczos_stop_reasons"] == {"energy": 1}
+
+
+def test_symdmrg2_native_lanczos_ritz_p_error_gate_cuts_before_ncv():
+    """Native block Lanczos should expose TeNPy-style Ritz P-error stopping."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(3, [(1, 0), (0, 1), (1, 0)])
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        sweeps=1,
+        local_solver="lanczos",
+        dense_threshold=0,
+        local_eig_tol=1e-14,
+        local_eig_energy_tol=float("inf"),
+        local_eig_p_tol=float("inf"),
+        local_eig_min_gap=1e-12,
+        local_eig_min_steps=2,
+        local_eig_ncv=8,
+        norm_check="off",
+        compute_initial_energy=False,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_block_environments()
+    theta = opt.two_site_variational_theta(0, opt.two_site_theta(0))
+
+    opt.lanczos_local_eigensolve(0, theta=theta)
+    info = opt._last_lanczos_info
+
+    assert info["backend"] == "native_block"
+    assert info["stop_reason"] == "ritz"
+    assert info["num_steps"] == 2
+    assert info["energy_converged"]
+    assert info["p_converged"]
+    assert info["ritz_converged"]
+    assert info["ritz_gap"] >= opt.local_eig_min_gap
+    assert info["ritz_p_error"] >= 0.0
+    assert opt.summary()["local_eig_p_tol"] == float("inf")
+    assert opt.summary()["local_eig_min_gap"] == pytest.approx(1e-12)
 
 
 def test_symdmrg2_local_eig_ncv_accepts_sweep_schedule():

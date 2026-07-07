@@ -70,16 +70,22 @@ Default Symmray Lanczos solves keep Krylov vectors as block tensors and use
 dense NumPy only for block dot products and the small Rayleigh-Ritz projected
 matrix, avoiding a flat-vector Symmray-to-NumPy-to-Symmray round trip for every
 `H_eff` application. The native block path stops when the residual estimate
-meets `local_eig_tol`, when the Krylov basis reaches `local_eig_ncv`, or when a
-caller explicitly opts into an additional Ritz-energy stop with
-`local_eig_energy_tol`. The default `local_eig_energy_tol=None` follows TeNPy's
-more conservative local-solve posture and avoids declaring difficult random
-starts solved after only a few low-accuracy Krylov steps. The default
-`local_eig_ncv=20` mirrors TeNPy's default Krylov cap; it may also be a sweep
-schedule whose last entry repeats, matching `bond_dims` and `cutoffs`. Local
-solve diagnostics record `stop_reason`,
-`ritz_energy_delta`, `num_steps`, and `num_matvecs`. Real block data remains
-real unless the state or MPO data is complex. Before each local solve,
+meets `local_eig_tol`, when the Krylov basis reaches `local_eig_ncv`, or when
+the TeNPy-style Ritz convergence gate passes. The Ritz gate uses the
+Ritz-energy change (`local_eig_energy_tol`) together with the state-error
+estimate `(RitzRes / gap)**2` (`local_eig_p_tol`, with gap floor
+`local_eig_min_gap`). Set either tolerance to `None` to disable that side of
+the gate. The defaults use `local_eig_energy_tol=inf`,
+`local_eig_p_tol="auto"` (resolved to `1e-8`), `local_eig_min_steps=2`, and
+`local_eig_ncv=20`, so a local solve may stop early only when the Ritz vector
+is well resolved by the residual/gap criterion. For compatibility,
+`local_eig_p_tol="auto"` resolves to `None` when
+`local_eig_energy_tol=None`, preserving the explicit full-Krylov-cap mode.
+`local_eig_ncv` may also be a sweep schedule whose last entry repeats, matching
+`bond_dims` and `cutoffs`. Local solve diagnostics record `stop_reason`,
+`ritz_energy_delta`, `ritz_gap`, `ritz_p_error`, `num_steps`, and
+`num_matvecs`. Real block data remains real unless the state or MPO data is
+complex. Before each local solve,
 SymDMRG2 also probes the projected
 block-native `H_eff` support and drops widened zero blocks that are neither
 structurally live nor already populated by the current MPS.
