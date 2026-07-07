@@ -190,8 +190,10 @@ class MpsSampler:
         self.backend = _normalize_mps_sampler_backend(backend)
         self.resolved_backend = None
         self._native_arrays = None
+        self._native_site_ops = None
         self._evaluation_backend = None
         self._evaluation_arrays = None
+        self._evaluation_site_ops = None
         self._psi = None
 
         if self.backend != "quimb":
@@ -227,6 +229,22 @@ class MpsSampler:
                 self._prepare_native_arrays(self._psi)
             )
         return self._evaluation_backend, self._evaluation_arrays
+
+    def _get_native_site_ops(self):
+        if self._native_site_ops is None:
+            self._native_site_ops = self._prepare_site_ops(
+                self.resolved_backend,
+                self._native_arrays,
+            )
+        return self.resolved_backend, self._native_site_ops
+
+    def _get_evaluation_site_ops(self):
+        if self._native_arrays is not None:
+            return self._get_native_site_ops()
+        backend, arrays = self._get_evaluation_arrays()
+        if self._evaluation_site_ops is None:
+            self._evaluation_site_ops = self._prepare_site_ops(backend, arrays)
+        return backend, self._evaluation_site_ops
 
     @staticmethod
     def _canonicalize_for_native(psi):
@@ -275,7 +293,7 @@ class MpsSampler:
         return backend, arrays
 
     @staticmethod
-    def _torch_sample(arrays, n_samples, seed, *, to_numpy):
+    def _torch_site_ops(arrays):
         import torch  # pylint: disable=import-outside-toplevel
 
         device = arrays[0].device
@@ -283,22 +301,66 @@ class MpsSampler:
         if not (torch.is_floating_point(arrays[0]) or torch.is_complex(arrays[0])):
             dtype = torch.float64
         arrays = tuple(array.to(device=device, dtype=dtype) for array in arrays)
+        site_ops = tuple(
+            (
+                array.reshape(array.shape[0], array.shape[1] * array.shape[2])
+                .contiguous(),
+                int(array.shape[1]),
+                int(array.shape[2]),
+            )
+            for array in arrays
+        )
+        return device, dtype, site_ops
+
+    @staticmethod
+    def _array_namespace_site_ops(arrays, *, backend):
+        xp = np
+        if backend == "cupy":
+            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
+
+        dtype = np.dtype(getattr(arrays[0], "dtype", np.float64))
+        if dtype.kind not in {"f", "c"}:
+            dtype = np.dtype(np.float64)
+        arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+        site_ops = tuple(
+            (
+                xp.ascontiguousarray(
+                    array.reshape((array.shape[0], array.shape[1] * array.shape[2]))
+                ),
+                int(array.shape[1]),
+                int(array.shape[2]),
+            )
+            for array in arrays
+        )
+        return xp, dtype, site_ops
+
+    @staticmethod
+    def _prepare_site_ops(backend, arrays):
+        if backend == "torch":
+            return MpsSampler._torch_site_ops(arrays)
+        return MpsSampler._array_namespace_site_ops(arrays, backend=backend)
+
+    @staticmethod
+    def _torch_sample(site_data, n_samples, seed, *, to_numpy):
+        import torch  # pylint: disable=import-outside-toplevel
+
+        device, dtype, site_ops = site_data
         vec = torch.ones((int(n_samples), 1), dtype=dtype, device=device)
         probs_total = torch.ones((int(n_samples),), dtype=torch.float64, device=device)
+        batch = torch.arange(int(n_samples), device=device)
         configs = []
         generator = None
         if seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(seed))
 
-        for array in arrays:
-            amps = torch.einsum("bl,ldr->bdr", vec, array)
+        for branch_mat, phys_dim, right_dim in site_ops:
+            amps = (vec @ branch_mat).reshape(-1, phys_dim, right_dim)
             probs = amps.abs().square().sum(dim=2).real
             probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(
                 torch.finfo(probs.dtype).tiny
             )
             choices = torch.multinomial(probs, 1, generator=generator).reshape(-1)
-            batch = torch.arange(int(n_samples), device=device)
             selected_probs = probs[batch, choices]
             vec = amps[batch, choices, :] / torch.sqrt(selected_probs).clamp_min(
                 torch.finfo(selected_probs.dtype).tiny
@@ -313,22 +375,16 @@ class MpsSampler:
         return configs, probs_total
 
     @staticmethod
-    def _array_namespace_sample(arrays, n_samples, seed, *, backend, to_numpy):
-        xp = np
-        if backend == "cupy":
-            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
-
-        dtype = np.dtype(getattr(arrays[0], "dtype", np.float64))
-        if dtype.kind not in {"f", "c"}:
-            dtype = np.dtype(np.float64)
-        arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+    def _array_namespace_sample(site_data, n_samples, seed, *, backend, to_numpy):
+        xp, dtype, site_ops = site_data
         vec = xp.ones((int(n_samples), 1), dtype=dtype)
         probs_total = xp.ones((int(n_samples),), dtype=np.float64)
+        batch = xp.arange(int(n_samples))
         configs = []
         rng = xp.random.default_rng(seed)
 
-        for array in arrays:
-            amps = xp.einsum("bl,ldr->bdr", vec, array)
+        for branch_mat, phys_dim, right_dim in site_ops:
+            amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
             probs = xp.sum(xp.abs(amps) ** 2, axis=2).real
             probs = probs / xp.maximum(
                 probs.sum(axis=1, keepdims=True),
@@ -338,7 +394,6 @@ class MpsSampler:
             draws = rng.random(int(n_samples))
             choices = xp.sum(draws[:, None] > cdf, axis=1).astype(np.int64)
             choices = xp.minimum(choices, probs.shape[1] - 1)
-            batch = xp.arange(int(n_samples))
             selected_probs = probs[batch, choices]
             vec = amps[batch, choices, :] / xp.sqrt(
                 xp.maximum(selected_probs, np.finfo(float).tiny)
@@ -356,18 +411,19 @@ class MpsSampler:
         return configs, probs_total
 
     def _native_sample_arrays(self, n_samples, seed, *, to_numpy):
-        if self.resolved_backend == "torch":
+        backend, site_data = self._get_native_site_ops()
+        if backend == "torch":
             return self._torch_sample(
-                self._native_arrays,
+                site_data,
                 n_samples,
                 seed,
                 to_numpy=to_numpy,
             )
         return self._array_namespace_sample(
-            self._native_arrays,
+            site_data,
             n_samples,
             seed,
-            backend=self.resolved_backend,
+            backend=backend,
             to_numpy=to_numpy,
         )
 
@@ -398,26 +454,22 @@ class MpsSampler:
         return configs
 
     @staticmethod
-    def _torch_amplitudes(arrays, configs, *, L):
+    def _torch_amplitudes(site_data, configs, *, L):
         import torch  # pylint: disable=import-outside-toplevel
 
-        device = arrays[0].device
-        dtype = arrays[0].dtype
-        if not (torch.is_floating_point(arrays[0]) or torch.is_complex(arrays[0])):
-            dtype = torch.float64
-        arrays = tuple(array.to(device=device, dtype=dtype) for array in arrays)
+        device, dtype, site_ops = site_data
         configs = MpsSampler._torch_configs(configs, device=device, L=L)
         vec = torch.ones((configs.shape[0], 1), dtype=dtype, device=device)
         batch = torch.arange(configs.shape[0], device=device)
 
-        for site, array in enumerate(arrays):
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
             choices = configs[:, site]
-            if bool(((choices < 0) | (choices >= array.shape[1])).any().item()):
+            if bool(((choices < 0) | (choices >= phys_dim)).any().item()):
                 raise ValueError(
                     f"configs contain invalid physical index for site {site}."
                 )
-            selected = torch.index_select(array, 1, choices).permute(1, 0, 2)
-            vec = torch.einsum("bl,blr->br", vec, selected)
+            amps = (vec @ branch_mat).reshape(-1, phys_dim, right_dim)
+            vec = amps[batch, choices, :]
             if vec.shape[0] != batch.shape[0]:  # pragma: no cover - sanity guard
                 raise RuntimeError(
                     "Batched MPS amplitude contraction changed batch size."
@@ -425,21 +477,15 @@ class MpsSampler:
         return vec.reshape(-1)
 
     @staticmethod
-    def _array_namespace_amplitudes(arrays, configs, *, backend, L):
-        xp = np
-        if backend == "cupy":
-            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
-
-        dtype = np.dtype(getattr(arrays[0], "dtype", np.float64))
-        if dtype.kind not in {"f", "c"}:
-            dtype = np.dtype(np.float64)
-        arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+    def _array_namespace_amplitudes(site_data, configs, *, backend, L):
+        xp, dtype, site_ops = site_data
         configs = MpsSampler._array_namespace_configs(configs, backend=backend, L=L)
         vec = xp.ones((configs.shape[0], 1), dtype=dtype)
+        batch = xp.arange(configs.shape[0])
 
-        for site, array in enumerate(arrays):
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
             choices = configs[:, site]
-            invalid = (choices < 0) | (choices >= array.shape[1])
+            invalid = (choices < 0) | (choices >= phys_dim)
             invalid = (
                 bool(invalid.any().get())
                 if backend == "cupy"
@@ -449,19 +495,15 @@ class MpsSampler:
                 raise ValueError(
                     f"configs contain invalid physical index for site {site}."
                 )
-            selected = xp.moveaxis(array[:, choices, :], 1, 0)
-            vec = xp.einsum("bl,blr->br", vec, selected)
+            amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
+            vec = amps[batch, choices, :]
         return vec.reshape(-1)
 
     @staticmethod
-    def _torch_probabilities(arrays, configs, *, L):
+    def _torch_probabilities(site_data, configs, *, L):
         import torch  # pylint: disable=import-outside-toplevel
 
-        device = arrays[0].device
-        dtype = arrays[0].dtype
-        if not (torch.is_floating_point(arrays[0]) or torch.is_complex(arrays[0])):
-            dtype = torch.float64
-        arrays = tuple(array.to(device=device, dtype=dtype) for array in arrays)
+        device, dtype, site_ops = site_data
         configs = MpsSampler._torch_configs(configs, device=device, L=L)
         vec = torch.ones((configs.shape[0], 1), dtype=dtype, device=device)
         probs_total = torch.ones(
@@ -471,14 +513,14 @@ class MpsSampler:
         )
         batch = torch.arange(configs.shape[0], device=device)
 
-        for site, array in enumerate(arrays):
-            amps = torch.einsum("bl,ldr->bdr", vec, array)
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            amps = (vec @ branch_mat).reshape(-1, phys_dim, right_dim)
             probs = amps.abs().square().sum(dim=2).real
             probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(
                 torch.finfo(probs.dtype).tiny
             )
             choices = configs[:, site]
-            if bool(((choices < 0) | (choices >= probs.shape[1])).any().item()):
+            if bool(((choices < 0) | (choices >= phys_dim)).any().item()):
                 raise ValueError(
                     f"configs contain invalid physical index for site {site}."
                 )
@@ -490,29 +532,22 @@ class MpsSampler:
         return probs_total
 
     @staticmethod
-    def _array_namespace_probabilities(arrays, configs, *, backend, L):
-        xp = np
-        if backend == "cupy":
-            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
-
-        dtype = np.dtype(getattr(arrays[0], "dtype", np.float64))
-        if dtype.kind not in {"f", "c"}:
-            dtype = np.dtype(np.float64)
-        arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+    def _array_namespace_probabilities(site_data, configs, *, backend, L):
+        xp, dtype, site_ops = site_data
         configs = MpsSampler._array_namespace_configs(configs, backend=backend, L=L)
         vec = xp.ones((configs.shape[0], 1), dtype=dtype)
         probs_total = xp.ones((configs.shape[0],), dtype=np.float64)
         batch = xp.arange(configs.shape[0])
 
-        for site, array in enumerate(arrays):
-            amps = xp.einsum("bl,ldr->bdr", vec, array)
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
             probs = xp.sum(xp.abs(amps) ** 2, axis=2).real
             probs = probs / xp.maximum(
                 probs.sum(axis=1, keepdims=True),
                 np.finfo(float).tiny,
             )
             choices = configs[:, site]
-            invalid = (choices < 0) | (choices >= probs.shape[1])
+            invalid = (choices < 0) | (choices >= phys_dim)
             invalid = (
                 bool(invalid.any().get())
                 if backend == "cupy"
@@ -544,12 +579,12 @@ class MpsSampler:
         CuPy MPS tensors are contracted in one batched backend-native pass.
         Set ``to_numpy=False`` to keep Torch/CuPy outputs on their device.
         """
-        backend, arrays = self._get_evaluation_arrays()
+        backend, site_data = self._get_evaluation_site_ops()
         if backend == "torch":
-            out = self._torch_amplitudes(arrays, configs, L=self._L)
+            out = self._torch_amplitudes(site_data, configs, L=self._L)
         else:
             out = self._array_namespace_amplitudes(
-                arrays,
+                site_data,
                 configs,
                 backend=backend,
                 L=self._L,
@@ -563,12 +598,12 @@ class MpsSampler:
         with user-supplied physical indices. It avoids looping over
         configurations and runs on Torch/CuPy when the MPS tensors do.
         """
-        backend, arrays = self._get_evaluation_arrays()
+        backend, site_data = self._get_evaluation_site_ops()
         if backend == "torch":
-            out = self._torch_probabilities(arrays, configs, L=self._L)
+            out = self._torch_probabilities(site_data, configs, L=self._L)
         else:
             out = self._array_namespace_probabilities(
-                arrays,
+                site_data,
                 configs,
                 backend=backend,
                 L=self._L,

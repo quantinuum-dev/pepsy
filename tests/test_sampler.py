@@ -163,6 +163,34 @@ def test_mps_sampler_native_numpy_sample_arrays_returns_arrays():
     np.testing.assert_allclose(probs, np.ones(4))
 
 
+def test_mps_sampler_native_site_ops_are_reused(monkeypatch):
+    """Native branch-matrix setup should be cached across calls."""
+    psi = qtn.MPS_computational_state("101")
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0), 2: (2, 0)},
+        backend="native",
+    )
+    real_prepare = sampler_mod.MpsSampler._prepare_site_ops
+    calls = []
+
+    def spy_prepare(backend, arrays):
+        calls.append(backend)
+        return real_prepare(backend, arrays)
+
+    monkeypatch.setattr(
+        sampler_mod.MpsSampler,
+        "_prepare_site_ops",
+        staticmethod(spy_prepare),
+    )
+
+    sampler.sample_arrays(2, seed=1)
+    sampler.probabilities(np.array([[1, 0, 1], [1, 0, 1]]))
+    sampler.amplitudes(np.array([[1, 0, 1], [1, 0, 1]]))
+
+    assert calls == ["numpy"]
+
+
 def test_mps_sampler_native_numpy_reports_born_probabilities():
     """Native sampler should return the probability of each sampled config."""
     site_probs = [(0.8, 0.2), (0.3, 0.7)]
