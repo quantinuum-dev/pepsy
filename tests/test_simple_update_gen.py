@@ -1,5 +1,6 @@
 """Tests for Pepsy's routed SimpleUpdateGen."""
 
+import inspect
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -31,6 +32,16 @@ def _ham_for_edge(edge, term=None):
 
 def _state_vector(tn):
     return np.asarray(tn.to_dense(tn.outer_inds(), optimize="auto-hq"))
+
+
+def _gauge_all_simple_once(tn, gauges):
+    opts = {
+        "max_iterations": 1,
+        "gauges": gauges,
+    }
+    if "fuse_multibonds" in inspect.signature(tn.gauge_all_simple_).parameters:
+        opts["fuse_multibonds"] = False
+    tn.gauge_all_simple_(**opts)
 
 
 def test_simple_update_gen_routes_long_range_gate_where_quimb_fails():
@@ -197,11 +208,7 @@ def test_simple_update_gen_sweep_matches_manual_pepsy_gate_simple():
 
     manual = psi0.copy()
     gauges = {}
-    manual.gauge_all_simple_(
-        max_iterations=1,
-        gauges=gauges,
-        fuse_multibonds=False,
-    )
+    _gauge_all_simple_once(manual, gauges)
     gate = ham.get_gate_expm(where, -tau)
     gate_simple(
         manual,
