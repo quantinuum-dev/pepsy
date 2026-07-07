@@ -17,6 +17,8 @@ With dense Torch or CuPy MPS tensors, `backend="native"` keeps `configs` and
 `batch.to_sample_result()` when the legacy list/grid `MpsSampleResult` is
 needed. `sample_arrays(...)` remains available for direct tuple unpacking, and
 `sample(...)` preserves the original `MpsSampleResult` behavior.
+The native path builds backend-native right environments once, so it does not
+require quimb to canonicalize Torch or CuPy tensors before sampling.
 
 For evaluating existing configurations, use:
 

@@ -276,8 +276,9 @@ class MpsSampler:
 
     The legacy ``backend="quimb"`` path handles GPU→CPU conversion and calls
     quimb's canonical-form sampler. ``backend="native"`` keeps dense NumPy,
-    Torch, or CuPy MPS arrays on their current device, canonicalizes once, and
-    draws all requested samples with batched conditional contractions.
+    Torch, or CuPy MPS arrays on their current device, builds right
+    environments once, and draws all requested samples with batched conditional
+    contractions.
 
     Parameters
     ----------
@@ -366,16 +367,6 @@ class MpsSampler:
         return backend, self._evaluation_site_ops
 
     @staticmethod
-    def _canonicalize_for_native(psi):
-        try:
-            return psi.copy().canonicalize(0)
-        except Exception as exc:  # pragma: no cover - backend-specific failure
-            raise ValueError(
-                "backend-native MPS sampling requires a dense MPS that quimb can "
-                "canonicalize on its current array backend."
-            ) from exc
-
-    @staticmethod
     def _site_array_lr_phys_r(psi, site):
         tensor = psi[site]
         site_ind = psi.site_ind(site)
@@ -393,10 +384,9 @@ class MpsSampler:
         return tensor.transpose(left_ind, site_ind, right_ind).data
 
     def _prepare_native_arrays(self, psi):
-        psi_native = self._canonicalize_for_native(psi)
         arrays = tuple(
-            self._site_array_lr_phys_r(psi_native, site)
-            for site in range(psi_native.L)
+            self._site_array_lr_phys_r(psi, site)
+            for site in range(psi.L)
         )
         if not arrays:
             raise ValueError("Cannot sample an empty MPS.")
@@ -420,6 +410,22 @@ class MpsSampler:
         if not (torch.is_floating_point(arrays[0]) or torch.is_complex(arrays[0])):
             dtype = torch.float64
         arrays = tuple(array.to(device=device, dtype=dtype) for array in arrays)
+        right_envs = [None] * (len(arrays) + 1)
+        right_envs[-1] = torch.ones((1, 1), dtype=dtype, device=device)
+        for i in range(len(arrays) - 1, -1, -1):
+            array = arrays[i]
+            right_envs[i] = torch.einsum(
+                "asb,bc,dsc->ad",
+                array.conj(),
+                right_envs[i + 1],
+                array,
+            )
+        norm = right_envs[0].reshape(()).real
+        if (
+            (not bool(torch.isfinite(norm).detach().cpu().item()))
+            or float(norm.detach().cpu().item()) <= 0.0
+        ):
+            raise ValueError("MPS must have a finite non-zero norm.")
         site_ops = tuple(
             (
                 array.reshape(array.shape[0], array.shape[1] * array.shape[2])
@@ -429,7 +435,7 @@ class MpsSampler:
             )
             for array in arrays
         )
-        return device, dtype, site_ops
+        return device, dtype, site_ops, tuple(right_envs), norm
 
     @staticmethod
     def _array_namespace_site_ops(arrays, *, backend):
@@ -441,6 +447,20 @@ class MpsSampler:
         if dtype.kind not in {"f", "c"}:
             dtype = np.dtype(np.float64)
         arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+        right_envs = [None] * (len(arrays) + 1)
+        right_envs[-1] = xp.ones((1, 1), dtype=dtype)
+        for i in range(len(arrays) - 1, -1, -1):
+            array = arrays[i]
+            right_envs[i] = xp.einsum(
+                "asb,bc,dsc->ad",
+                xp.conjugate(array),
+                right_envs[i + 1],
+                array,
+            )
+        norm = right_envs[0].reshape(()).real
+        norm_value = float(norm.get()) if backend == "cupy" else float(norm)
+        if (not np.isfinite(norm_value)) or norm_value <= 0.0:
+            raise ValueError("MPS must have a finite non-zero norm.")
         site_ops = tuple(
             (
                 xp.ascontiguousarray(
@@ -451,7 +471,7 @@ class MpsSampler:
             )
             for array in arrays
         )
-        return xp, dtype, site_ops
+        return xp, dtype, site_ops, tuple(right_envs), norm
 
     @staticmethod
     def _prepare_site_ops(backend, arrays):
@@ -463,7 +483,7 @@ class MpsSampler:
     def _torch_sample(site_data, n_samples, seed, *, to_numpy):
         import torch  # pylint: disable=import-outside-toplevel
 
-        device, dtype, site_ops = site_data
+        device, dtype, site_ops, right_envs, _norm = site_data
         vec = torch.ones((int(n_samples), 1), dtype=dtype, device=device)
         probs_total = torch.ones((int(n_samples),), dtype=torch.float64, device=device)
         batch = torch.arange(int(n_samples), device=device)
@@ -474,10 +494,13 @@ class MpsSampler:
             generator.manual_seed(int(seed))
 
         for branch_mat, phys_dim, right_dim in site_ops:
+            site = len(configs)
+            right_env = right_envs[site + 1]
             amps = (vec @ branch_mat).reshape(-1, phys_dim, right_dim)
-            probs = amps.abs().square().sum(dim=2).real
-            probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(
-                torch.finfo(probs.dtype).tiny
+            weights = (amps.conj() * (amps @ right_env)).sum(dim=2).real
+            weights = weights.clamp_min(0.0)
+            probs = weights / weights.sum(dim=1, keepdim=True).clamp_min(
+                torch.finfo(weights.dtype).tiny
             )
             if phys_dim == 2:
                 draws = torch.rand(
@@ -489,9 +512,10 @@ class MpsSampler:
                 choices = (draws >= probs[:, 0]).to(dtype=torch.long)
             else:
                 choices = torch.multinomial(probs, 1, generator=generator).reshape(-1)
+            selected_weights = weights[batch, choices]
             selected_probs = probs[batch, choices]
-            vec = amps[batch, choices, :] / torch.sqrt(selected_probs).clamp_min(
-                torch.finfo(selected_probs.dtype).tiny
+            vec = amps[batch, choices, :] / torch.sqrt(selected_weights).clamp_min(
+                torch.finfo(selected_weights.dtype).tiny
             ).reshape(-1, 1).to(dtype=dtype)
             probs_total = probs_total * selected_probs.to(dtype=torch.float64)
             configs.append(choices)
@@ -504,7 +528,7 @@ class MpsSampler:
 
     @staticmethod
     def _array_namespace_sample(site_data, n_samples, seed, *, backend, to_numpy):
-        xp, dtype, site_ops = site_data
+        xp, dtype, site_ops, right_envs, _norm = site_data
         vec = xp.ones((int(n_samples), 1), dtype=dtype)
         probs_total = xp.ones((int(n_samples),), dtype=np.float64)
         batch = xp.arange(int(n_samples))
@@ -512,11 +536,13 @@ class MpsSampler:
         rng = xp.random.default_rng(seed)
         use_binary_draw = backend == "cupy"
 
-        for branch_mat, phys_dim, right_dim in site_ops:
+        for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            right_env = right_envs[site + 1]
             amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
-            probs = xp.sum(xp.abs(amps) ** 2, axis=2).real
-            probs = probs / xp.maximum(
-                probs.sum(axis=1, keepdims=True),
+            weights = xp.sum(xp.conjugate(amps) * (amps @ right_env), axis=2).real
+            weights = xp.maximum(weights, 0.0)
+            probs = weights / xp.maximum(
+                weights.sum(axis=1, keepdims=True),
                 np.finfo(float).tiny,
             )
             draws = rng.random(int(n_samples))
@@ -526,9 +552,10 @@ class MpsSampler:
                 cdf = xp.cumsum(probs, axis=1)
                 choices = xp.sum(draws[:, None] > cdf, axis=1).astype(np.int64)
                 choices = xp.minimum(choices, probs.shape[1] - 1)
+            selected_weights = weights[batch, choices]
             selected_probs = probs[batch, choices]
             vec = amps[batch, choices, :] / xp.sqrt(
-                xp.maximum(selected_probs, np.finfo(float).tiny)
+                xp.maximum(selected_weights, np.finfo(float).tiny)
             )[:, None]
             probs_total = probs_total * selected_probs
             configs.append(choices)
@@ -589,7 +616,7 @@ class MpsSampler:
     def _torch_amplitudes(site_data, configs, *, L):
         import torch  # pylint: disable=import-outside-toplevel
 
-        device, dtype, site_ops = site_data
+        device, dtype, site_ops, _right_envs, norm = site_data
         configs = MpsSampler._torch_configs(configs, device=device, L=L)
         vec = torch.ones((configs.shape[0], 1), dtype=dtype, device=device)
         batch = torch.arange(configs.shape[0], device=device)
@@ -606,11 +633,12 @@ class MpsSampler:
                 raise RuntimeError(
                     "Batched MPS amplitude contraction changed batch size."
                 )
-        return vec.reshape(-1)
+        scale = torch.sqrt(norm.clamp_min(torch.finfo(norm.dtype).tiny)).to(dtype=dtype)
+        return vec.reshape(-1) / scale
 
     @staticmethod
     def _array_namespace_amplitudes(site_data, configs, *, backend, L):
-        xp, dtype, site_ops = site_data
+        xp, dtype, site_ops, _right_envs, norm = site_data
         configs = MpsSampler._array_namespace_configs(configs, backend=backend, L=L)
         vec = xp.ones((configs.shape[0], 1), dtype=dtype)
         batch = xp.arange(configs.shape[0])
@@ -629,13 +657,14 @@ class MpsSampler:
                 )
             amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
             vec = amps[batch, choices, :]
-        return vec.reshape(-1)
+        scale = xp.sqrt(xp.maximum(norm, np.finfo(float).tiny)).astype(dtype)
+        return vec.reshape(-1) / scale
 
     @staticmethod
     def _torch_probabilities(site_data, configs, *, L):
         import torch  # pylint: disable=import-outside-toplevel
 
-        device, dtype, site_ops = site_data
+        device, dtype, site_ops, right_envs, _norm = site_data
         configs = MpsSampler._torch_configs(configs, device=device, L=L)
         vec = torch.ones((configs.shape[0], 1), dtype=dtype, device=device)
         probs_total = torch.ones(
@@ -646,36 +675,41 @@ class MpsSampler:
         batch = torch.arange(configs.shape[0], device=device)
 
         for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            right_env = right_envs[site + 1]
             amps = (vec @ branch_mat).reshape(-1, phys_dim, right_dim)
-            probs = amps.abs().square().sum(dim=2).real
-            probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(
-                torch.finfo(probs.dtype).tiny
+            weights = (amps.conj() * (amps @ right_env)).sum(dim=2).real
+            weights = weights.clamp_min(0.0)
+            probs = weights / weights.sum(dim=1, keepdim=True).clamp_min(
+                torch.finfo(weights.dtype).tiny
             )
             choices = configs[:, site]
             if bool(((choices < 0) | (choices >= phys_dim)).any().item()):
                 raise ValueError(
                     f"configs contain invalid physical index for site {site}."
                 )
+            selected_weights = weights[batch, choices]
             selected_probs = probs[batch, choices]
-            vec = amps[batch, choices, :] / torch.sqrt(selected_probs).clamp_min(
-                torch.finfo(selected_probs.dtype).tiny
+            vec = amps[batch, choices, :] / torch.sqrt(selected_weights).clamp_min(
+                torch.finfo(selected_weights.dtype).tiny
             ).reshape(-1, 1).to(dtype=dtype)
             probs_total = probs_total * selected_probs.to(dtype=torch.float64)
         return probs_total
 
     @staticmethod
     def _array_namespace_probabilities(site_data, configs, *, backend, L):
-        xp, dtype, site_ops = site_data
+        xp, dtype, site_ops, right_envs, _norm = site_data
         configs = MpsSampler._array_namespace_configs(configs, backend=backend, L=L)
         vec = xp.ones((configs.shape[0], 1), dtype=dtype)
         probs_total = xp.ones((configs.shape[0],), dtype=np.float64)
         batch = xp.arange(configs.shape[0])
 
         for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
+            right_env = right_envs[site + 1]
             amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
-            probs = xp.sum(xp.abs(amps) ** 2, axis=2).real
-            probs = probs / xp.maximum(
-                probs.sum(axis=1, keepdims=True),
+            weights = xp.sum(xp.conjugate(amps) * (amps @ right_env), axis=2).real
+            weights = xp.maximum(weights, 0.0)
+            probs = weights / xp.maximum(
+                weights.sum(axis=1, keepdims=True),
                 np.finfo(float).tiny,
             )
             choices = configs[:, site]
@@ -689,9 +723,10 @@ class MpsSampler:
                 raise ValueError(
                     f"configs contain invalid physical index for site {site}."
                 )
+            selected_weights = weights[batch, choices]
             selected_probs = probs[batch, choices]
             vec = amps[batch, choices, :] / xp.sqrt(
-                xp.maximum(selected_probs, np.finfo(float).tiny)
+                xp.maximum(selected_weights, np.finfo(float).tiny)
             )[:, None]
             probs_total = probs_total * selected_probs
         return probs_total

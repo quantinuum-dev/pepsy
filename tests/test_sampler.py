@@ -290,6 +290,40 @@ def test_mps_sampler_native_numpy_matches_dense_random_mps():
     assert probabilities.sum() == pytest.approx(1.0)
 
 
+def test_mps_sampler_native_numpy_handles_noncanonical_gauge():
+    """Native conditionals should not assume right-canonical MPS tensors."""
+    L = 5
+    psi = qtn.MPS_rand_state(L, bond_dim=4, phys_dim=2, dtype=float, seed=123)
+    bond = psi.bond(1, 2)
+    gauge = np.linspace(0.5, 1.7, psi.ind_size(bond))
+
+    for site, weights in ((1, gauge), (2, 1.0 / gauge)):
+        tensor = psi[site]
+        axis = tensor.inds.index(bond)
+        shape = [1] * tensor.data.ndim
+        shape[axis] = len(weights)
+        tensor.modify(data=tensor.data * weights.reshape(shape))
+
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {site: (site, 0) for site in range(L)},
+        backend="native",
+    )
+    configs = np.array([
+        [int(bit) for bit in format(index, f"0{L}b")]
+        for index in range(2**L)
+    ], dtype=np.int64)
+
+    probabilities = sampler.probabilities(configs)
+    amplitudes = sampler.amplitudes(configs)
+    dense = psi.to_dense().reshape(-1)
+    expected = np.abs(dense) ** 2
+    expected = expected / expected.sum()
+
+    np.testing.assert_allclose(probabilities, expected, atol=1e-12)
+    np.testing.assert_allclose(np.abs(amplitudes) ** 2, expected, atol=1e-12)
+
+
 def test_mps_sampler_native_numpy_agrees_with_quimb_sample_probabilities():
     """Native probabilities should agree with quimb for quimb-sampled configs."""
     L = 6
