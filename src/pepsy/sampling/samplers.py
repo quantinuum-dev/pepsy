@@ -275,7 +275,7 @@ class MpsSampler:
         return backend, arrays
 
     @staticmethod
-    def _torch_sample(arrays, n_samples, seed):
+    def _torch_sample(arrays, n_samples, seed, *, to_numpy):
         import torch  # pylint: disable=import-outside-toplevel
 
         device = arrays[0].device
@@ -306,12 +306,14 @@ class MpsSampler:
             probs_total = probs_total * selected_probs.to(dtype=torch.float64)
             configs.append(choices)
 
-        configs = torch.stack(configs, dim=1).detach().cpu().numpy()
-        probs_total = probs_total.detach().cpu().numpy()
+        configs = torch.stack(configs, dim=1)
+        if to_numpy:
+            configs = configs.detach().cpu().numpy()
+            probs_total = probs_total.detach().cpu().numpy()
         return configs, probs_total
 
     @staticmethod
-    def _array_namespace_sample(arrays, n_samples, seed, *, backend):
+    def _array_namespace_sample(arrays, n_samples, seed, *, backend, to_numpy):
         xp = np
         if backend == "cupy":
             import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
@@ -345,19 +347,28 @@ class MpsSampler:
             configs.append(choices)
 
         configs = xp.stack(configs, axis=1)
-        if backend == "cupy":
+        if to_numpy and backend == "cupy":
             configs = configs.get()
             probs_total = probs_total.get()
-        return np.asarray(configs), np.asarray(probs_total)
+        if to_numpy:
+            configs = np.asarray(configs)
+            probs_total = np.asarray(probs_total)
+        return configs, probs_total
 
-    def _native_sample_arrays(self, n_samples, seed):
+    def _native_sample_arrays(self, n_samples, seed, *, to_numpy):
         if self.resolved_backend == "torch":
-            return self._torch_sample(self._native_arrays, n_samples, seed)
+            return self._torch_sample(
+                self._native_arrays,
+                n_samples,
+                seed,
+                to_numpy=to_numpy,
+            )
         return self._array_namespace_sample(
             self._native_arrays,
             n_samples,
             seed,
             backend=self.resolved_backend,
+            to_numpy=to_numpy,
         )
 
     @staticmethod
@@ -564,6 +575,37 @@ class MpsSampler:
             )
         return self._to_numpy_backend_array(out, backend) if to_numpy else out
 
+    def sample_arrays(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        to_numpy: bool = False,
+    ):
+        """Draw samples and return raw ``(configs, probs)`` arrays.
+
+        With ``backend="native"``, this returns backend-native arrays by
+        default: Torch tensors stay on Torch and CuPy arrays stay on CuPy.
+        The returned ``configs`` have shape ``(n_samples, L)`` and ``probs``
+        has shape ``(n_samples,)``. Set ``to_numpy=True`` to force CPU NumPy
+        arrays, matching the legacy :meth:`sample` result conversion.
+        """
+        if int(n_samples) < 1:
+            raise ValueError("n_samples must be a positive integer.")
+        if self._native_arrays is not None:
+            return self._native_sample_arrays(
+                int(n_samples),
+                seed,
+                to_numpy=to_numpy,
+            )
+
+        configs = []
+        probs = []
+        for config, prob in self._psi.sample(int(n_samples), seed=seed):
+            configs.append(config)
+            probs.append(prob)
+        return np.asarray(configs, dtype=np.int64), np.asarray(probs, dtype=float)
+
     def _result_from_arrays(self, configs_array, probs_array):
         configs_1d = []
         configs_2d = []
@@ -600,7 +642,11 @@ class MpsSampler:
         if int(n_samples) < 1:
             raise ValueError("n_samples must be a positive integer.")
         if self._native_arrays is not None:
-            configs, probs = self._native_sample_arrays(int(n_samples), seed)
+            configs, probs = self._native_sample_arrays(
+                int(n_samples),
+                seed,
+                to_numpy=True,
+            )
             return self._result_from_arrays(configs, probs)
 
         configs_1d = []

@@ -144,6 +144,25 @@ def test_mps_sampler_native_numpy_samples_product_state():
     assert result.probs == [1.0] * 4
 
 
+def test_mps_sampler_native_numpy_sample_arrays_returns_arrays():
+    """Native raw sampling should return batched arrays directly."""
+    psi = qtn.MPS_computational_state("101")
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0), 2: (2, 0)},
+        backend="native",
+    )
+
+    configs, probs = sampler.sample_arrays(4, seed=1)
+
+    assert isinstance(configs, np.ndarray)
+    assert isinstance(probs, np.ndarray)
+    assert configs.shape == (4, 3)
+    assert probs.shape == (4,)
+    np.testing.assert_array_equal(configs, np.array([[1, 0, 1]] * 4))
+    np.testing.assert_allclose(probs, np.ones(4))
+
+
 def test_mps_sampler_native_numpy_reports_born_probabilities():
     """Native sampler should return the probability of each sampled config."""
     site_probs = [(0.8, 0.2), (0.3, 0.7)]
@@ -205,6 +224,31 @@ def test_mps_sampler_native_torch_keeps_tensors_on_torch():
     assert result.probs == [1.0] * 3
 
 
+def test_mps_sampler_native_torch_sample_arrays_stays_on_torch():
+    """Torch raw sampling should return a batched tensor result."""
+    torch = pytest.importorskip("torch")
+    psi = qtn.MPS_computational_state("10")
+    psi.apply_to_arrays(lambda array: torch.as_tensor(array, dtype=torch.float64))
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+
+    configs, probs = sampler.sample_arrays(3, seed=2)
+
+    assert isinstance(configs, torch.Tensor)
+    assert isinstance(probs, torch.Tensor)
+    assert configs.device == probs.device
+    assert configs.shape == (3, 2)
+    assert probs.shape == (3,)
+    torch.testing.assert_close(
+        configs,
+        torch.tensor([[1, 0]] * 3, dtype=torch.long, device=configs.device),
+    )
+    torch.testing.assert_close(probs, torch.ones(3, dtype=probs.dtype))
+
+
 def test_mps_sampler_native_torch_evaluates_batched_configs_on_torch():
     """Torch probability/amplitude evaluation should stay on Torch."""
     torch = pytest.importorskip("torch")
@@ -263,6 +307,36 @@ def test_mps_sampler_native_cupy_evaluates_batched_configs_on_cupy():
     cupy.testing.assert_allclose(amplitudes, cupy.sqrt(expected_probs))
 
 
+def test_mps_sampler_native_cupy_sample_arrays_stays_on_cupy():
+    """CuPy raw sampling should return batched arrays on CuPy."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+
+    psi = qtn.MPS_computational_state("10")
+    psi.apply_to_arrays(lambda array: cupy.asarray(array, dtype=cupy.float64))
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+
+    configs, probs = sampler.sample_arrays(3, seed=2)
+
+    assert isinstance(configs, cupy.ndarray)
+    assert isinstance(probs, cupy.ndarray)
+    assert configs.shape == (3, 2)
+    assert probs.shape == (3,)
+    cupy.testing.assert_array_equal(
+        configs,
+        cupy.asarray([[1, 0]] * 3, dtype=cupy.int64),
+    )
+    cupy.testing.assert_allclose(probs, cupy.ones(3, dtype=probs.dtype))
+
+
 def test_mps_sampler_rejects_explicit_native_backend_mismatch():
     """Explicit native backend requests should fail instead of copying devices."""
     psi = qtn.MPS_computational_state("0")
@@ -285,6 +359,15 @@ def test_mps_sampler_batched_config_evaluation_validates_configs():
 
     with pytest.raises(ValueError, match="invalid physical index"):
         sampler.amplitudes(np.array([[0, 2]]))
+
+
+def test_mps_sampler_sample_arrays_validates_sample_count():
+    """Raw batched sampling should reject non-positive sample counts."""
+    psi = qtn.MPS_computational_state("0")
+    sampler = sampler_mod.MpsSampler(psi, {0: (0, 0)}, backend="native")
+
+    with pytest.raises(ValueError, match="positive integer"):
+        sampler.sample_arrays(0)
 
 
 def test_vec_sampler_rejects_invalid_vector_size():
