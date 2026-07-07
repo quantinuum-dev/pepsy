@@ -190,3 +190,9 @@ the interruption.
   next sweep's P-error tolerance from the previous sweep's maximum SVD
   truncation error. For speed comparisons on busy shared machines, prefer these
   algorithmic counters over raw wall time.
+- The 6 by 6 adaptive-P-tolerance control found no truncation-driven updates at
+  `chi=32`, so the next useful speed layer is per-matvec work. Cached projected
+  problems now compile non-fermionic NumPy-backed block-sector pair schedules
+  after the first exact Symmray contraction, then reuse those schedules on
+  cache-hit Lanczos matvecs. This keeps correctness anchored to Symmray's block
+  template while avoiding repeated block-routing discovery in the hot loop.

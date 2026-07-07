@@ -202,6 +202,24 @@ def _sorted_block_items(data):
     return sorted(data.blocks.items(), key=lambda item: repr(item[0]))
 
 
+def _block_dtype(block):
+    dtype = getattr(block, "dtype", None)
+    if dtype is None:
+        dtype = _to_numpy(block).dtype
+    return np.dtype(dtype)
+
+
+def _block_data_layout(data):
+    return tuple(
+        (
+            sector,
+            tuple(getattr(block, "shape", ())),
+            _block_dtype(block).str,
+        )
+        for sector, block in _sorted_block_items(data)
+    )
+
+
 def _flatten_blocks(data):
     pieces = []
     metadata = []
@@ -705,6 +723,14 @@ class _BlockPairContraction:
         self.right_axes = ()
         self.left_output_axes = tuple(range(len(self.left_inds)))
         self.right_output_axes = tuple(range(len(self.right_inds)))
+        self.compiled_block_plan = None
+        self.compiled_right_layout = None
+        self.compiled_output_template = None
+        self.compiled_block_plan_builds = 0
+        self.compiled_block_plan_uses = 0
+        self.compiled_block_plan_terms = 0
+        self.compiled_block_plan_output_blocks = 0
+        self.compiled_block_plan_disabled_reason = None
 
         if not self.shared:
             self.left_axis = None
@@ -788,6 +814,112 @@ class _BlockPairContraction:
         )
         return tuple(ind for ind in fused_inds if ind != self.fused_shared_ind)
 
+    def _compiled_plan_matches(self, right):
+        return (
+            self.compiled_block_plan is not None
+            and self.compiled_right_layout == _block_data_layout(right.data)
+        )
+
+    def _can_compile_block_plan(self, right):
+        if _is_fermionic_symmray_array(self.left.data) or _is_fermionic_symmray_array(
+            right.data
+        ):
+            self.compiled_block_plan_disabled_reason = "fermionic_array"
+            return False
+        if any(
+            not isinstance(block, np.ndarray)
+            for block in tuple(self.left.data.blocks.values())
+            + tuple(right.data.blocks.values())
+        ):
+            self.compiled_block_plan_disabled_reason = "non_numpy_blocks"
+            return False
+        return True
+
+    def _compile_block_plan(self, right, output):
+        if not self._can_compile_block_plan(right):
+            return
+
+        output_sectors = set(output.data.blocks)
+        right_by_shared = {}
+        for right_sector, right_block in _sorted_block_items(right.data):
+            key = tuple(right_sector[axis] for axis in self.right_axes)
+            right_by_shared.setdefault(key, []).append(
+                (
+                    right_sector,
+                    tuple(getattr(right_block, "shape", ())),
+                    _block_dtype(right_block).str,
+                )
+            )
+
+        terms_by_output = {sector: [] for sector in output.data.blocks}
+        num_terms = 0
+        for left_sector, left_block in _sorted_block_items(self.left.data):
+            key = tuple(left_sector[axis] for axis in self.left_axes)
+            left_output = tuple(left_sector[axis] for axis in self.left_output_axes)
+            left_array = _to_numpy(left_block)
+            for right_sector, _, _ in right_by_shared.get(key, ()):
+                output_sector = left_output + tuple(
+                    right_sector[axis] for axis in self.right_output_axes
+                )
+                if output_sector not in output_sectors:
+                    continue
+                terms_by_output[output_sector].append((left_array, right_sector))
+                num_terms += 1
+
+        self.compiled_output_template = output.data
+        self.compiled_right_layout = _block_data_layout(right.data)
+        self.compiled_block_plan = tuple(
+            (sector, tuple(terms))
+            for sector, terms in terms_by_output.items()
+            if terms
+        )
+        self.compiled_block_plan_builds += 1
+        self.compiled_block_plan_terms = int(num_terms)
+        self.compiled_block_plan_output_blocks = len(self.compiled_block_plan)
+        self.compiled_block_plan_disabled_reason = None
+
+    def _apply_compiled_block_plan(self, right, *, timings=None, prefix="contract"):
+        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+        step_start = time.perf_counter() if timings is not None else None
+        blocks = {}
+        right_blocks = right.data.blocks
+        right_arrays = {
+            sector: _to_numpy(block)
+            for sector, block in right_blocks.items()
+        }
+        template_blocks = self.compiled_output_template.blocks
+        for output_sector, terms in self.compiled_block_plan:
+            template_block = _to_numpy(template_blocks[output_sector])
+            first_left, first_right_sector = terms[0]
+            out = np.tensordot(
+                first_left,
+                right_arrays[first_right_sector],
+                axes=(self.left_axes, self.right_axes),
+            )
+            if out.dtype != template_block.dtype:
+                out = np.asarray(out, dtype=template_block.dtype)
+            for left_array, right_sector in terms[1:]:
+                piece = np.tensordot(
+                    left_array,
+                    right_arrays[right_sector],
+                    axes=(self.left_axes, self.right_axes),
+                )
+                np.add(out, piece, out=out, casting="unsafe")
+            blocks[output_sector] = out
+        data = _array_with_blocks_like(self.compiled_output_template, blocks)
+        self.compiled_block_plan_uses += 1
+        _add_elapsed(timings, f"{prefix}_compiled_block_elapsed", step_start)
+
+        step_start = time.perf_counter() if timings is not None else None
+        out = qtn.Tensor(
+            data=data,
+            inds=self.output_inds,
+            tags=self.left.tags | right.tags,
+        )
+        _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
+        return out
+
     def structural_output_sectors(self, right_sectors):
         """Return block sectors possible after this contraction, ignoring values."""
         right_sectors = tuple(right_sectors)
@@ -812,6 +944,13 @@ class _BlockPairContraction:
         if tuple(right.inds) != self.right_inds:
             raise ValueError("Right tensor indices changed for cached block contraction.")
 
+        if self._compiled_plan_matches(right):
+            return self._apply_compiled_block_plan(
+                right,
+                timings=timings,
+                prefix=prefix,
+            )
+
         if not self.shared:
             step_start = time.perf_counter() if timings is not None else None
             data = self.left.data.tensordot(
@@ -828,6 +967,7 @@ class _BlockPairContraction:
                 tags=self.left.tags | right.tags,
             )
             _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
+            self._compile_block_plan(right, out)
             return out
 
         if self.use_fused_shared and self.fused_shared_compatible is not False:
@@ -854,6 +994,7 @@ class _BlockPairContraction:
                     tags=self.left.tags | right.tags,
                 )
                 _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
+                self._compile_block_plan(right, out)
                 return out
             self.fused_shared_compatible = False
             self.last_used_fused_shared = False
@@ -874,6 +1015,7 @@ class _BlockPairContraction:
             tags=self.left.tags | right.tags,
         )
         _add_elapsed(timings, f"{prefix}_tensor_elapsed", step_start)
+        self._compile_block_plan(right, out)
         return out
 
     def summary(self, prefix):
@@ -890,6 +1032,21 @@ class _BlockPairContraction:
             f"{prefix}_fused_shared_attempts": int(self.fused_shared_attempts),
             f"{prefix}_fused_shared_fallbacks": int(self.fused_shared_fallbacks),
             f"{prefix}_fused_contract_ind_size": self.fused_contract_ind_size,
+            f"{prefix}_compiled_block_plan_builds": int(
+                self.compiled_block_plan_builds
+            ),
+            f"{prefix}_compiled_block_plan_uses": int(
+                self.compiled_block_plan_uses
+            ),
+            f"{prefix}_compiled_block_plan_terms": int(
+                self.compiled_block_plan_terms
+            ),
+            f"{prefix}_compiled_block_plan_output_blocks": int(
+                self.compiled_block_plan_output_blocks
+            ),
+            f"{prefix}_compiled_block_plan_disabled_reason": (
+                self.compiled_block_plan_disabled_reason
+            ),
         }
 
 

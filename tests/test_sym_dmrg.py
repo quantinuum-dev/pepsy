@@ -1279,6 +1279,14 @@ def test_symdmrg2_block_native_matvec_reuses_projected_problem_cache(monkeypatch
     assert opt.projected_problem_cache_hits == 1
     assert opt.summary()["projected_problem_cache_hits"] == 1
     assert opt.profile_summary()["projected_problem_cache_misses"] == 1
+    problem = opt._last_matvec_projected_problem
+    problem_summary = problem.summary()
+    assert problem_summary["right_contract_compiled_block_plan_builds"] == 1
+    assert problem_summary["left_contract_compiled_block_plan_builds"] == 1
+    assert problem_summary["right_contract_compiled_block_plan_uses"] == 1
+    assert problem_summary["left_contract_compiled_block_plan_uses"] == 1
+    assert problem_summary["right_contract_compiled_block_plan_terms"] > 0
+    assert problem_summary["left_contract_compiled_block_plan_terms"] > 0
     for sector in theta.data.blocks:
         assert native_a.data.blocks[sector] == pytest.approx(dense_a.data.blocks[sector])
         assert native_b.data.blocks[sector] == pytest.approx(dense_b.data.blocks[sector])
@@ -1338,6 +1346,14 @@ def test_symdmrg2_matvec_diagnostics_record_cache_and_projector_stats():
     assert first["right_projector_num_blocks"] > 0
     assert first["right_contract_shared_inds"] >= 1
     assert first["left_contract_shared_inds"] >= 1
+    assert first["right_contract_compiled_block_plan_builds"] == 1
+    assert first["left_contract_compiled_block_plan_builds"] == 1
+    assert first["right_contract_compiled_block_plan_uses"] == 0
+    assert first["left_contract_compiled_block_plan_uses"] == 0
+    assert second["right_contract_compiled_block_plan_uses"] == 1
+    assert second["left_contract_compiled_block_plan_uses"] == 1
+    assert second["matvec_right_contract_compiled_block_elapsed"] >= 0.0
+    assert second["matvec_left_contract_compiled_block_elapsed"] >= 0.0
     assert first["matvec_input_reindex_elapsed"] >= 0.0
     assert first["matvec_right_contract_elapsed"] >= 0.0
     assert first["matvec_left_contract_elapsed"] >= 0.0
@@ -1442,6 +1458,7 @@ def test_symdmrg2_fused_matvec_layout_matches_dense_reference():
 
         dense = opt.two_site_matvec_dense_reference(site, trial)
         fused = opt.two_site_matvec(site, trial)
+        fused_cached = opt.two_site_matvec(site, trial)
         summary = opt._last_matvec_projected_problem.summary()
         saw_fused_candidate |= (
             summary["left_contract_fused_shared_candidate"]
@@ -1450,9 +1467,14 @@ def test_symdmrg2_fused_matvec_layout_matches_dense_reference():
 
         assert summary["matvec_layout"] == "fused"
         assert fused.inds == dense.inds == theta.inds
+        assert fused_cached.inds == dense.inds
         assert set(fused.data.blocks) == set(dense.data.blocks) == set(theta.data.blocks)
+        assert set(fused_cached.data.blocks) == set(dense.data.blocks)
         for sector in theta.data.blocks:
             assert fused.data.blocks[sector] == pytest.approx(dense.data.blocks[sector])
+            assert fused_cached.data.blocks[sector] == pytest.approx(
+                dense.data.blocks[sector]
+            )
 
     assert saw_fused_candidate
     assert opt.summary()["matvec_layout"] == "fused"
@@ -1463,6 +1485,11 @@ def test_symdmrg2_fused_matvec_layout_matches_dense_reference():
     assert any(
         diagnostic["left_contract_fused_shared_attempts"]
         or diagnostic["right_contract_fused_shared_attempts"]
+        for diagnostic in opt.matvec_diagnostic_records
+    )
+    assert any(
+        diagnostic["left_contract_compiled_block_plan_uses"]
+        or diagnostic["right_contract_compiled_block_plan_uses"]
         for diagnostic in opt.matvec_diagnostic_records
     )
 

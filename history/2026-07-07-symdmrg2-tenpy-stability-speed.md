@@ -31,6 +31,14 @@
     measured maximum SVD truncation error and clamped by min/max bounds.
   - Update records are stored in per-sweep convergence diagnostics and exposed
     through `summary()`.
+- Added the first per-matvec hot-loop speed layer for projected `H_eff`
+  contractions.
+  - Each cached projected problem still uses Symmray for the first exact
+    contraction, which establishes the output block template.
+  - For later cache-hit matvecs with the same block layout, non-fermionic
+    NumPy-backed contractions reuse a compiled block-sector pair schedule.
+  - Other backends and direct fermionic arrays stay on Symmray's original
+    `tensordot` path.
 
 ## Benchmark notes
 
@@ -50,6 +58,14 @@
   For speed decisions, use algorithmic counters from `profile_summary()`:
   `num_lanczos_matvecs`, `avg_lanczos_matvecs`, `max_lanczos_matvecs`, and
   `lanczos_stop_reasons`.
+- The adaptive-P-tolerance 6 by 6 control on `ec8984a` preserved the good
+  energy basin (`E/N - U/4 = -2.426782887`) but reported
+  `num_local_eig_p_tol_updates == 0`. Thus the truncation-coupled tolerance is
+  safe but inert at `chi=32`; the bottleneck is per-matvec cost.
+- A small 3 by 3 mapped-PBC cache-hit probe showed the compiled block-plan path
+  engaging on repeated matvecs (`compiled_block_plan_uses > 0`) and reducing
+  cached hot-loop time on the local probe. This is only a micro-control; the
+  6 by 6 run remains the meaningful next benchmark.
 
 ## Validation
 
@@ -67,14 +83,18 @@ python -m py_compile src/pepsy/optimizers/sym_dmrg.py tests/test_sym_dmrg.py
 ## Remaining work
 
 - Re-run the 6 by 6 random-unitary control on `ec8984a` and compare counters
-  against the Ritz-gate baseline:
+  against the Ritz-gate baseline and then against the compiled-block-plan
+  branch:
   - final energy density,
   - `avg_lanczos_matvecs`,
   - `lanczos_stop_reasons`,
   - `num_local_eig_p_tol_updates`,
-  - `last_local_eig_p_tol_update`.
-- If adaptive P-tolerance lowers matvec count without energy drift, keep it as
-  the default TeNPy-style speed setting.
-- If matvec count is already low but wall time remains high, the next target is
-  per-matvec cost: fused/projected-problem contraction routing, cache reuse, and
-  block-native hot-loop profiling.
+  - `last_local_eig_p_tol_update`,
+  - projected-problem cache hits,
+  - compiled block-plan uses,
+  - matvec timing totals.
+- If compiled block plans improve per-matvec cost without energy drift, keep
+  them as the default hot-loop route for NumPy-backed Symmray DMRG.
+- If the wall-time gap remains large after compiled block plans, continue with
+  allocation reuse, fused projected-problem routing, and lower-level block
+  contraction kernels.

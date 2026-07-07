@@ -228,13 +228,21 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   truncation-aware P-error tolerance. The local solve records residual/gap
   P-error diagnostics and can update the next sweep's `local_eig_p_tol` from
   the observed maximum SVD truncation error.
-- The next DMRG step is to run the 6 by 6 mapped-PBC control on the adaptive
-  P-tolerance commit and compare algorithmic counters, especially
-  `avg_lanczos_matvecs`, `lanczos_stop_reasons`, and
-  `num_local_eig_p_tol_updates`. If local matvec counts are already low but the
-  run is still slower than TeNPy, shift focus to per-matvec cost: fused
-  projected-problem contraction routing, cache reuse, and block-native
-  hot-loop profiling.
+- The 6 by 6 mapped-PBC adaptive-P-tolerance counter run showed
+  `num_local_eig_p_tol_updates == 0`, so truncation-coupled Lanczos tolerance is
+  safe but inert at `chi=32`. The speed bottleneck is per-matvec cost rather
+  than local Krylov iteration count.
+- The first per-matvec speed step compiles cached block-sector pair schedules
+  inside each projected problem. After the first Symmray contraction establishes
+  the exact output block template, non-fermionic NumPy-backed cache-hit matvecs
+  reuse that sector-pair plan directly instead of asking Symmray to rediscover
+  the same block routing.
+- The next DMRG step is to run the 6 by 6 mapped-PBC control with compiled
+  block plans enabled and compare `avg_lanczos_matvecs`,
+  `lanczos_stop_reasons`, projected-problem cache hits, compiled block-plan
+  uses, and per-matvec timing totals. If the gap remains large, continue with
+  deeper hot-loop work: fused projected-problem contraction routing,
+  allocation reuse, and block-native contraction kernels.
 
 ### Validation
 
