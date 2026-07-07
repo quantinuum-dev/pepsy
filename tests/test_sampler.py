@@ -164,6 +164,28 @@ def test_mps_sampler_native_numpy_reports_born_probabilities():
         assert prob == pytest.approx(expected)
 
 
+def test_mps_sampler_native_numpy_evaluates_batched_configs():
+    """Native sampler should evaluate many configs without a Python loop."""
+    site_probs = [(0.8, 0.2), (0.3, 0.7)]
+    psi = qtn.MPS_product_state([
+        np.sqrt(np.array(probs))
+        for probs in site_probs
+    ])
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+    configs = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.int64)
+
+    probabilities = sampler.probabilities(configs)
+    amplitudes = sampler.amplitudes(configs)
+
+    expected_probs = np.array([0.24, 0.56, 0.06, 0.14])
+    np.testing.assert_allclose(probabilities, expected_probs)
+    np.testing.assert_allclose(amplitudes, np.sqrt(expected_probs))
+
+
 def test_mps_sampler_native_torch_keeps_tensors_on_torch():
     """Torch MPS tensors should stay on Torch through native sampling."""
     torch = pytest.importorskip("torch")
@@ -183,12 +205,86 @@ def test_mps_sampler_native_torch_keeps_tensors_on_torch():
     assert result.probs == [1.0] * 3
 
 
+def test_mps_sampler_native_torch_evaluates_batched_configs_on_torch():
+    """Torch probability/amplitude evaluation should stay on Torch."""
+    torch = pytest.importorskip("torch")
+    site_probs = [(0.8, 0.2), (0.3, 0.7)]
+    psi = qtn.MPS_product_state([
+        np.sqrt(np.array(probs))
+        for probs in site_probs
+    ])
+    psi.apply_to_arrays(lambda array: torch.as_tensor(array, dtype=torch.float64))
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+    configs = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=torch.long)
+
+    probabilities = sampler.probabilities(configs, to_numpy=False)
+    amplitudes = sampler.amplitudes(configs, to_numpy=False)
+
+    expected_probs = torch.tensor([0.24, 0.56, 0.06, 0.14], dtype=torch.float64)
+    assert isinstance(probabilities, torch.Tensor)
+    assert isinstance(amplitudes, torch.Tensor)
+    torch.testing.assert_close(probabilities, expected_probs)
+    torch.testing.assert_close(amplitudes, torch.sqrt(expected_probs))
+
+
+def test_mps_sampler_native_cupy_evaluates_batched_configs_on_cupy():
+    """CuPy probability/amplitude evaluation should stay on CuPy."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+
+    site_probs = [(0.8, 0.2), (0.3, 0.7)]
+    psi = qtn.MPS_product_state([
+        np.sqrt(np.array(probs))
+        for probs in site_probs
+    ])
+    psi.apply_to_arrays(lambda array: cupy.asarray(array, dtype=cupy.float64))
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+    configs = cupy.asarray([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=cupy.int64)
+
+    probabilities = sampler.probabilities(configs, to_numpy=False)
+    amplitudes = sampler.amplitudes(configs, to_numpy=False)
+
+    expected_probs = cupy.asarray([0.24, 0.56, 0.06, 0.14], dtype=cupy.float64)
+    assert isinstance(probabilities, cupy.ndarray)
+    assert isinstance(amplitudes, cupy.ndarray)
+    cupy.testing.assert_allclose(probabilities, expected_probs)
+    cupy.testing.assert_allclose(amplitudes, cupy.sqrt(expected_probs))
+
+
 def test_mps_sampler_rejects_explicit_native_backend_mismatch():
     """Explicit native backend requests should fail instead of copying devices."""
     psi = qtn.MPS_computational_state("0")
 
     with pytest.raises(ValueError, match="backend='torch' requested"):
         sampler_mod.MpsSampler(psi, {0: (0, 0)}, backend="torch")
+
+
+def test_mps_sampler_batched_config_evaluation_validates_configs():
+    """Batched probability/amplitude helpers should reject bad configs."""
+    psi = qtn.MPS_computational_state("00")
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        {0: (0, 0), 1: (1, 0)},
+        backend="native",
+    )
+
+    with pytest.raises(ValueError, match=r"shape \(batch, L=2\)"):
+        sampler.probabilities(np.array([[0, 0, 0]]))
+
+    with pytest.raises(ValueError, match="invalid physical index"):
+        sampler.amplitudes(np.array([[0, 2]]))
 
 
 def test_vec_sampler_rejects_invalid_vector_size():
