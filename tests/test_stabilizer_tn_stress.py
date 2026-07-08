@@ -312,3 +312,63 @@ def test_born_sampling_frequencies_match_expectation():
         outs = sim.sample(pauli, where, shots=4000)
         assert set(np.unique(outs)).issubset({-1, 1})
         assert outs.mean() == pytest.approx(exp, abs=0.06)
+
+
+# --------------------------------------------------------------------------- #
+# General dense k-qubit gates (unitary + non-unitary) via Pauli decomposition
+# --------------------------------------------------------------------------- #
+def _haar_unitary(dim, seed):
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((dim, dim)) + 1j * rng.standard_normal((dim, dim))
+    q, r = np.linalg.qr(z)
+    return q * (np.diag(r) / np.abs(np.diag(r)))
+
+
+def test_general_two_qubit_unitary_matches_dense():
+    n = 4
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("rx", 0.7, 3), ("cz", 1, 2)]
+    sim = MpsStabOptimizer(n).apply(stream)
+    psi = sim.to_statevector()
+    U = _haar_unitary(4, 1)
+    sim.apply([(U, (1, 3))])  # non-adjacent 2q unitary
+    ref = _apply_gate_dense(psi, U, (1, 3), n)
+    assert _fid(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_general_two_qubit_nonunitary_matches_dense():
+    n = 4
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("ry", 0.4, 3)]
+    sim = MpsStabOptimizer(n).apply(stream)
+    psi = sim.to_statevector()
+    rng = np.random.default_rng(3)
+    G = rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4))
+    sim.apply([(G, (0, 2))])  # arbitrary non-unitary 2q gate
+    ref = _apply_gate_dense(psi, G, (0, 2), n)
+    got = sim.to_statevector()
+    assert _fid(got, ref) == pytest.approx(1.0, abs=1e-6)
+    # non-unitary gate: represented-state norm tracks |G|psi>| (not renormalized)
+    assert np.linalg.norm(got) == pytest.approx(np.linalg.norm(ref), rel=1e-6)
+
+
+def test_general_three_qubit_unitary_matches_dense():
+    n = 5
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("rx", 0.3, 3), ("cz", 2, 4)]
+    sim = MpsStabOptimizer(n).apply(stream)
+    psi = sim.to_statevector()
+    U3 = _haar_unitary(8, 7)
+    sim.apply([(U3, (1, 2, 4))])
+    ref = _apply_gate_dense(psi, U3, (1, 2, 4), n)
+    assert _fid(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_single_qubit_nonunitary_matches_dense():
+    n = 3
+    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
+    psi = sim.to_statevector()
+    rng = np.random.default_rng(11)
+    G = rng.standard_normal((2, 2)) + 1j * rng.standard_normal((2, 2))
+    sim.apply([(G, 2)])
+    ref = _apply_gate_dense(psi, G, (2,), n)
+    got = sim.to_statevector()
+    assert _fid(got, ref) == pytest.approx(1.0, abs=1e-6)
+    assert np.linalg.norm(got) == pytest.approx(np.linalg.norm(ref), rel=1e-6)

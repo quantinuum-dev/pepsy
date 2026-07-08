@@ -5,14 +5,22 @@ network*: a stim tableau (basis ``B(S, D)``) times a coefficient MPS ``|nu>``
 (see :class:`pepsy.optimizers.stabilizer_tn.STNState`).  A gate stream is replayed against
 the state, routing each entry to the cheap update path:
 
-* **Clifford gates** update only the tableau (``|nu>`` unchanged, free).
+* **Clifford gates** update only the tableau (the coefficient MPS ``p`` is
+  unchanged, free).
 * **Non-Clifford rotations** (single- or multi-qubit Pauli exponentials) update
-  only ``|nu>`` via ``exp(-i theta/2 * A) -> exp(-i theta/2 * C^dagger A C)``,
+  only ``p`` via ``exp(-i theta/2 * A) -> exp(-i theta/2 * C^dagger A C)``,
   applied as an exact bond-dim-2 MPO with optional ``chi`` truncation.
 * **Explicit gate matrices** are classified: Clifford matrices go to the
-  tableau; non-Clifford single-qubit matrices are ZYZ-decomposed into rotations.
-* **Sub-MPO events** apply a user MPO to ``|nu>`` (interpreted in the coefficient
-  frame), matching the ``MpsOptimizer`` sub-MPO contract.
+  tableau; non-Clifford single-qubit *unitaries* are ZYZ-decomposed into
+  rotations; any other ``k``-qubit matrix (any ``k``, unitary **or**
+  non-unitary) is Pauli-decomposed ``G = sum_a c_a P_a`` and applied to ``p`` as
+  ``M = C^dagger G C = sum_a c_a (C^dagger P_a C)`` (a compressed sum of signed
+  Pauli-string branches).  Non-unitary ``G`` is represented without
+  renormalization, so the coefficient norm tracks ``|G|psi>|``.
+* **Sub-MPO events** apply a user MPO directly to ``p`` (interpreted in the
+  *coefficient* frame; any MPO, unitary or not), matching the ``MpsOptimizer``
+  sub-MPO contract.  A *physical*-frame few-qubit operator should instead be
+  supplied as a dense ``(matrix, where)`` entry.
 
 Supported gate-stream entry forms::
 
@@ -22,8 +30,8 @@ Supported gate-stream entry forms::
     ("rxx"|"ryy"|"rzz", theta, a, b)                        # 2q Pauli rotations
     ("rot", theta, "XZ...", where)                          # general Pauli exp
     ("t", q) ("tdg", q)                                     # T / T-dagger
-    (matrix, where)                                         # explicit gate tensor
-    ("submpo", mpo, where)  / {"kind": "submpo", ...}       # sub-MPO event
+    (matrix, where)                                         # any k-qubit gate
+    ("submpo", mpo, where)  / {"kind": "submpo", ...}       # coeff-frame sub-MPO
     ("measure", pauli, where[, outcome])                   # Pauli measurement
 """
 
@@ -40,6 +48,7 @@ from ..mps.optimizer import is_submpo_event, submpo_event_parts
 from ...tensors.core import tn_fidelity
 from .operators import (
     pauli_combo_submpo,
+    pauli_decomposition,
     pauli_matrix,
     single_qubit_combo_matrix,
     single_qubit_rotation_matrix,
@@ -145,10 +154,13 @@ class MpsStabOptimizer:
         return cls(STNState.ghz(n, dtype=dtype), **kwargs)
 
     @classmethod
-    def from_tableau_and_nu(cls, sim, nu, **kwargs) -> "MpsStabOptimizer":
-        """Start from a user stim tableau ``sim`` and coefficient MPS ``nu``."""
+    def from_tableau_and_state(cls, sim, p, **kwargs) -> "MpsStabOptimizer":
+        """Start from a user stim tableau ``sim`` and coefficient MPS ``p``."""
         dtype = kwargs.pop("dtype", "complex128")
-        return cls(STNState.from_tableau_and_nu(sim, nu, dtype=dtype), **kwargs)
+        return cls(STNState.from_tableau_and_state(sim, p, dtype=dtype), **kwargs)
+
+    # Backward-compatible alias.
+    from_tableau_and_nu = from_tableau_and_state
 
     # ------------------------------------------------------------------ #
     # Properties / queue management
@@ -158,9 +170,14 @@ class MpsStabOptimizer:
         return self.state.n
 
     @property
+    def p(self):
+        """The coefficient MPS (the paper's ``|nu>``), matching ``MpsOptimizer.p``."""
+        return self.state.p
+
+    @property
     def nu(self):
-        """The coefficient MPS ``|nu>``."""
-        return self.state.nu
+        """Alias for :attr:`p`."""
+        return self.state.p
 
     def set_gates(self, gates) -> "MpsStabOptimizer":
         """Replace the queued gate stream."""
@@ -244,7 +261,7 @@ class MpsStabOptimizer:
 
     def norm(self) -> float:
         """Norm of the coefficient state ``|nu>`` (represented state norm; ~1)."""
-        return float(abs(self.state.nu.norm()))
+        return float(abs(self.state.p.norm()))
 
     def pseudo_stabilizer_rank(self, tol: float = 1e-12) -> int:
         """Pseudo-stabilizer rank ``xi_tilde`` = number of non-zero ``nu_i``."""
@@ -336,7 +353,7 @@ class MpsStabOptimizer:
             self._apply_clifford_rotation(theta, where, axes)
             return
         phys = pauli_string(axes, where, self.n)
-        m_pauli = self.state.nu_frame_pauli(phys)
+        m_pauli = self.state.frame_pauli(phys)
         terms, sign = hermitian_pauli_terms(m_pauli)
         support = sorted(terms)
         if not support:  # global phase only; no state change
@@ -345,7 +362,7 @@ class MpsStabOptimizer:
         if len(support) == 1:
             q = support[0]
             umat = single_qubit_rotation_matrix(theta, terms[q], sign, self.dtype)
-            self.state.nu.gate_(umat, q, contract=True)
+            self.state.p.gate_(umat, q, contract=True)
             self._record(0.0)
             return
         # Multi-qubit Pauli rotation: windowed bond-dim-2 sub-MPO applied only on
@@ -353,26 +370,26 @@ class MpsStabOptimizer:
         c = np.cos(theta / 2)
         coef = -1j * sign * np.sin(theta / 2)
         mpo, where = pauli_combo_submpo(c, coef, terms, self.n, dtype=self.dtype)
-        self._record(self._evolve_nu(mpo, where))
+        self._record(self._evolve_p(mpo, where))
 
-    def _evolve_nu(self, mpo, where, *, renormalize: bool = False) -> float:
-        """Apply a windowed sub-MPO to ``|nu>`` on ``where`` (``gate_with_submpo_``).
+    def _evolve_p(self, mpo, where, *, renormalize: bool = False) -> float:
+        """Apply a windowed sub-MPO to the coefficient MPS ``p`` on ``where``.
 
         Only the ``[min(where), max(where)]`` region is canonicalized and
         compressed.  ``max_bond=None`` (exact) is lossless via the cutoff, which
         stops the bond-dim-2 MPO from doubling the bond on every application.
         """
-        nu = self.state.nu
+        p = self.state.p
         if self.track_infidelity and self.chi is not None:
-            target = nu.copy()
+            target = p.copy()
             target.gate_with_submpo_(mpo, where=where, cutoff=self.cutoff)
-            nu.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
-            infidelity = max(0.0, float(1.0 - abs(tn_fidelity(nu, target))))
+            p.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
+            infidelity = max(0.0, float(1.0 - abs(tn_fidelity(p, target))))
         else:
-            nu.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
+            p.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
             infidelity = 0.0
         if renormalize:
-            nu.normalize()
+            p.normalize()
         return infidelity
 
     # ------------------------------------------------------------------ #
@@ -386,21 +403,21 @@ class MpsStabOptimizer:
             raise ValueError(f"Pauli {pauli!r} and where {where!r} have different lengths.")
         return pauli_string(axes, where, self.n)
 
-    def _nu_frame_terms(self, pauli, where):
+    def _frame_terms(self, pauli, where):
         """Return ``({site: axis}, sign)`` for the ``|nu>``-frame image of a Pauli."""
-        m_pauli = self.state.nu_frame_pauli(self._phys_pauli(pauli, where))
+        m_pauli = self.state.frame_pauli(self._phys_pauli(pauli, where))
         return hermitian_pauli_terms(m_pauli)
 
     def _pauli_expectation(self, terms, sign) -> float:
-        """Return ``<nu|M|nu> / <nu|nu>`` for the Pauli ``M = sign * prod terms``."""
-        nu = self.state.nu
+        """Return ``<p|M|p> / <p|p>`` for the Pauli ``M = sign * prod terms``."""
+        p = self.state.p
         if not terms:  # M = sign * I
             return float(sign)
-        m_nu = nu.copy()
+        m_p = p.copy()
         for site, axis in terms.items():
-            m_nu.gate_(pauli_matrix(axis).astype(self.dtype), site, contract=True)
-        num = complex(nu.H @ m_nu)
-        den = complex(nu.H @ nu)
+            m_p.gate_(pauli_matrix(axis).astype(self.dtype), site, contract=True)
+        num = complex(p.H @ m_p)
+        den = complex(p.H @ p)
         return float(sign * np.real(num / den))
 
     def expectation(self, pauli, where=None) -> float:
@@ -420,7 +437,7 @@ class MpsStabOptimizer:
                     f"got {len(str(pauli))}."
                 )
             where = tuple(range(self.n))
-        terms, sign = self._nu_frame_terms(pauli, where)
+        terms, sign = self._frame_terms(pauli, where)
         return self._pauli_expectation(terms, sign)
 
     def expectation_pauli_sum(self, terms) -> float:
@@ -466,7 +483,7 @@ class MpsStabOptimizer:
         int
             The measured eigenvalue ``+1`` or ``-1``.
         """
-        terms, sign = self._nu_frame_terms(pauli, where)
+        terms, sign = self._frame_terms(pauli, where)
         exp = self._pauli_expectation(terms, sign)
         p_plus = 0.5 * (1.0 + exp)
         if outcome is None:
@@ -487,12 +504,12 @@ class MpsStabOptimizer:
         if len(support) == 1:
             q = support[0]
             proj = single_qubit_combo_matrix(0.5, coef, terms[q], self.dtype)
-            self.state.nu.gate_(proj, q, contract=True)
-            self.state.nu.normalize()
+            self.state.p.gate_(proj, q, contract=True)
+            self.state.p.normalize()
             self._record(0.0)
             return
         mpo, where = pauli_combo_submpo(0.5, coef, terms, self.n, dtype=self.dtype)
-        infidelity = self._evolve_nu(mpo, where, renormalize=True)
+        infidelity = self._evolve_p(mpo, where, renormalize=True)
         self._record(infidelity)
 
     # ------------------------------------------------------------------ #
@@ -519,7 +536,7 @@ class MpsStabOptimizer:
             self._record(0.0)
             return
 
-        if nq == 1:  # non-Clifford single-qubit -> ZYZ rotations on |nu>
+        if nq == 1 and _is_unitary(gate):  # non-Clifford 1q unitary -> ZYZ
             alpha, theta, beta = _zyz_angles(gate)
             q = where[0]
             self._apply_rotation("rz", (beta, q))
@@ -527,18 +544,75 @@ class MpsStabOptimizer:
             self._apply_rotation("rz", (alpha, q))
             return
 
-        raise NotImplementedError(
-            "Non-Clifford multi-qubit gate matrices are not supported directly. "
-            "Pre-compile to {CNOT, RX, RY, RZ} or supply a Pauli-exponential "
-            "entry such as ('rzz', theta, a, b) / ('rot', theta, pauli, where)."
-        )
+        # General k-qubit gate (any k, unitary or non-unitary): decompose into
+        # Paulis and act on the coefficient MPS via the frame map.
+        self._apply_dense_gate(gate, where)
+
+    def _apply_dense_gate(self, gate: np.ndarray, where) -> None:
+        """Apply an arbitrary k-qubit gate ``G`` (unitary or not) to ``|psi>``.
+
+        ``G = sum_a c_a P_a`` (Pauli decomposition); on the coefficient MPS this
+        is ``M = C^dagger G C = sum_a c_a (C^dagger P_a C)`` where each
+        ``C^dagger P_a C`` is a signed Pauli string.  We form ``M p`` by summing
+        the branch states ``c_a * sign_a * (Pauli string) p`` and compressing.
+        Because ``C M p = G C p = G|psi>`` this is exact up to truncation and
+        needs no renormalization, so it also represents non-unitary ``G``
+        (the coefficient-state norm then tracks ``|G|psi>|``).
+        """
+        where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
+        k = len(where)
+        decomp = pauli_decomposition(gate, k, tol=max(self.cutoff, 1e-14))
+        branches = []  # (weight, {site: axis})
+        for labels, coeff in decomp:
+            phys = pauli_string(labels, where, self.n)
+            frame_terms, sign = hermitian_pauli_terms(self.state.frame_pauli(phys))
+            branches.append((coeff * sign, frame_terms))
+        self._record(self._apply_operator_sum(branches))
+
+    def _apply_operator_sum(self, branches) -> float:
+        """Apply ``M = sum_j w_j (prod_i P_i)`` to the coefficient MPS ``p``.
+
+        Each branch scales a copy of ``p`` by ``w_j`` and applies its
+        (bond-preserving) single-qubit Paulis; the branches are summed and
+        compressed to ``chi``/``cutoff``.  Returns the truncation infidelity.
+        """
+        p = self.state.p
+
+        def build(max_bond):
+            result = None
+            for w, sites in branches:
+                branch = p.copy()
+                for site, axis in sites.items():
+                    branch.gate_(pauli_matrix(axis).astype(self.dtype), site, contract=True)
+                branch = w * branch
+                if result is None:
+                    result = branch
+                else:
+                    result = result + branch
+                    result.compress(max_bond=max_bond, cutoff=self.cutoff)
+            if result is not None:
+                result.compress(max_bond=max_bond, cutoff=self.cutoff)
+            return result
+
+        if self.track_infidelity and self.chi is not None:
+            target = build(None)
+            truncated = build(self.chi)
+            self.state.p = truncated
+            return max(0.0, float(1.0 - abs(tn_fidelity(truncated, target))))
+        self.state.p = build(self.chi)
+        return 0.0
 
     # ------------------------------------------------------------------ #
     # Sub-MPO events (coefficient-frame operator)
     # ------------------------------------------------------------------ #
     def _apply_submpo(self, mpo, where) -> None:
-        """Apply a user MPO to ``|nu>`` (interpreted in the coefficient frame)."""
-        self.state.nu.gate_with_submpo_(
+        """Apply a user MPO to the coefficient MPS ``p`` (coefficient frame).
+
+        The MPO acts directly on ``p`` (any MPO, unitary or not); it is *not*
+        conjugated through the basis Clifford.  For a *physical*-frame operator
+        use a dense ``(matrix, where)`` entry, which is frame-mapped for you.
+        """
+        self.state.p.gate_with_submpo_(
             mpo,
             where=where,
             max_bond=self.chi,
@@ -572,6 +646,12 @@ def _looks_like_stream(gates) -> bool:
         return False
     # First element is a str/number -> ``gates`` is a single named entry.
     return False
+
+
+def _is_unitary(gate: np.ndarray, tol: float = 1e-9) -> bool:
+    """Return whether ``gate`` is unitary within ``tol``."""
+    g = np.asarray(gate, dtype=complex)
+    return np.allclose(g.conj().T @ g, np.eye(g.shape[0]), atol=tol)
 
 
 def _zyz_angles(gate: np.ndarray):

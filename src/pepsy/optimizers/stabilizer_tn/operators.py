@@ -9,7 +9,8 @@ bond-dimension-2 MPO, built here.
 
 from __future__ import annotations
 
-from typing import Sequence
+import itertools
+from typing import List, Sequence, Tuple
 
 import numpy as np
 import quimb.tensor as qtn
@@ -26,6 +27,39 @@ _PAULI = {
 def pauli_matrix(axis: str) -> np.ndarray:
     """Return the 2x2 Pauli matrix for ``'I'/'X'/'Y'/'Z'``."""
     return _PAULI[str(axis).upper()]
+
+
+def _kron_pauli(labels: Sequence[str]) -> np.ndarray:
+    """Return the Kronecker product of the single-qubit Paulis in ``labels``."""
+    mat = _PAULI[str(labels[0]).upper()]
+    for ch in labels[1:]:
+        mat = np.kron(mat, _PAULI[str(ch).upper()])
+    return mat
+
+
+def pauli_decomposition(
+    gate: np.ndarray, k: int, *, tol: float = 1e-12
+) -> List[Tuple[Tuple[str, ...], complex]]:
+    """Decompose a ``2**k x 2**k`` matrix into a Pauli-string basis.
+
+    Returns a list of ``(labels, coeff)`` where ``labels`` is a length-``k``
+    tuple over ``{'I','X','Y','Z'}`` and ``coeff = Tr(P_labels @ gate) / 2**k``,
+    keeping only terms with ``abs(coeff) > tol``.  Works for any (unitary or
+    non-unitary) matrix; ``G = sum_labels coeff * P_labels`` exactly.
+
+    Enumerates ``4**k`` Paulis, so intended for small ``k`` (few-qubit gates).
+    """
+    gate = np.asarray(gate)
+    dim = 2 ** k
+    if gate.shape != (dim, dim):
+        raise ValueError(f"gate must be {dim}x{dim} for k={k}, got {gate.shape}.")
+    scale = 1.0 / dim
+    terms: List[Tuple[Tuple[str, ...], complex]] = []
+    for labels in itertools.product("IXYZ", repeat=k):
+        coeff = scale * np.trace(_kron_pauli(labels) @ gate)
+        if abs(coeff) > tol:
+            terms.append((labels, complex(coeff)))
+    return terms
 
 
 def single_qubit_combo_matrix(

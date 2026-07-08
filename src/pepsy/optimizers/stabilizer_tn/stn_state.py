@@ -73,8 +73,8 @@ class STNState:
         self._sim = stim.TableauSimulator()
         self._sim.set_num_qubits(n)
         self._inv_tableau = None
-        # Coefficient state |nu> = |0...0>, an MPS with chi = 1.
-        self.nu = ps_to_mps(n, dtype=dtype)
+        # Coefficient state ``p`` (the MPS ``|nu>``) = |0...0>, chi = 1.
+        self.p = ps_to_mps(n, dtype=dtype)
 
     # ------------------------------------------------------------------ #
     # Initial-state constructors
@@ -113,21 +113,24 @@ class STNState:
         return state
 
     @classmethod
-    def from_tableau_and_nu(cls, sim, nu, *, dtype: str = "complex128") -> "STNState":
-        """Wrap a user-supplied stim tableau simulator and coefficient MPS.
+    def from_tableau_and_state(cls, sim, p, *, dtype: str = "complex128") -> "STNState":
+        """Wrap a user-supplied stim tableau simulator and coefficient MPS ``p``.
 
         ``sim`` is a :class:`stim.TableauSimulator` (the basis Clifford ``C``)
-        and ``nu`` a quimb MPS coefficient state.  Both must describe the same
-        number of qubits/sites; the state represents ``|psi> = C|nu>``.
+        and ``p`` a quimb MPS coefficient state.  Both must describe the same
+        number of qubits/sites; the state represents ``|psi> = C p``.
         """
         new = cls.__new__(cls)
-        new.n = int(nu.L)
+        new.n = int(p.L)
         new.dtype = dtype
         sim.set_num_qubits(new.n)
         new._sim = sim
-        new.nu = nu
+        new.p = p
         new._inv_tableau = None
         return new
+
+    # Backward-compatible alias.
+    from_tableau_and_nu = from_tableau_and_state
 
     # ------------------------------------------------------------------ #
     # Properties
@@ -136,17 +139,22 @@ class STNState:
     def num_qubits(self) -> int:
         return self.n
 
+    @property
+    def nu(self):
+        """Alias for :attr:`p`, the coefficient MPS (the paper's ``|nu>``)."""
+        return self.p
+
     def max_bond(self) -> int:
-        """Current maximum bond dimension (``chi``) of ``|nu>``."""
-        return self.nu.max_bond()
+        """Current maximum bond dimension (``chi``) of the coefficient MPS ``p``."""
+        return self.p.max_bond()
 
     def copy(self) -> "STNState":
-        """Return an independent copy of the state (tableau + ``|nu>``)."""
+        """Return an independent copy of the state (tableau + coefficient MPS ``p``)."""
         new = STNState.__new__(STNState)
         new.n = self.n
         new.dtype = self.dtype
         new._sim = self._sim.copy()
-        new.nu = self.nu.copy()
+        new.p = self.p.copy()
         new._inv_tableau = None
         return new
 
@@ -156,12 +164,12 @@ class STNState:
         self._inv_tableau = None
         return self
 
-    def nu_frame_pauli(self, phys_pauli):
+    def frame_pauli(self, phys_pauli):
         """Return ``C^dagger P C`` for a physical Pauli ``P`` (a stim.PauliString).
 
-        This is the image, on the coefficient state ``|nu>``, of a physical
-        Pauli operator: for ``|psi> = C|nu>``, a physical operator ``O`` acts as
-        ``C^dagger O C`` on ``|nu>``.  For a Pauli ``P`` this is again a signed
+        This is the image, on the coefficient MPS ``p``, of a physical Pauli
+        operator: for ``|psi> = C p``, a physical operator ``O`` acts as
+        ``C^dagger O C`` on ``p``.  For a Pauli ``P`` this is again a signed
         Pauli string (the basis is a Clifford change of basis), obtained by
         conjugating through the current tableau.  The inverse tableau is cached
         and invalidated whenever the basis changes.
@@ -169,6 +177,9 @@ class STNState:
         if getattr(self, "_inv_tableau", None) is None:
             self._inv_tableau = self._sim.current_inverse_tableau()
         return self._inv_tableau(phys_pauli)
+
+    # Backward-compatible alias.
+    nu_frame_pauli = frame_pauli
 
     # ------------------------------------------------------------------ #
     # Clifford update (basis only; |nu> unchanged)
@@ -259,18 +270,21 @@ class STNState:
         mat = tableau.to_unitary_matrix(endian="big")
         return np.asarray(mat, dtype=self.dtype)
 
-    def nu_dense(self) -> np.ndarray:
-        """Dense coefficient vector ``|nu>`` (big-endian, length ``2**n``)."""
-        return np.asarray(self.nu.to_dense(), dtype=self.dtype).reshape(-1)
+    def p_dense(self) -> np.ndarray:
+        """Dense coefficient vector ``p`` (big-endian, length ``2**n``)."""
+        return np.asarray(self.p.to_dense(), dtype=self.dtype).reshape(-1)
+
+    # Backward-compatible alias.
+    nu_dense = p_dense
 
     def to_statevector(self) -> np.ndarray:
-        """Reconstruct the full statevector ``|psi> = C |nu>`` (small ``n``).
+        """Reconstruct the full statevector ``|psi> = C p`` (small ``n``).
 
         Uses the identity ``d_hat_i |psi_S> = C|i>`` so that
-        ``|psi> = sum_i nu_i C|i> = C|nu>``.  The result is defined up to a
+        ``|psi> = sum_i p_i C|i> = C p``.  The result is defined up to a
         global phase (tableaus do not track global phase).
         """
-        return self.clifford_unitary() @ self.nu_dense()
+        return self.clifford_unitary() @ self.p_dense()
 
     def _bits_to_index(self, bits) -> int:
         """Map a bitstring (str ``'010'`` or 0/1 sequence) to a big-endian index."""

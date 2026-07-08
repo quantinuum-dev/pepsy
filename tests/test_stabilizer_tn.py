@@ -52,9 +52,9 @@ def test_initial_state_is_all_zero():
     st = STNState(3)
     assert st.num_qubits == 3
     assert st.max_bond() == 1
-    # |nu> = |000> = e0
-    np.testing.assert_allclose(st.nu_dense(), np.eye(8)[0])
-    # |psi> = C|nu> = |000>
+    # coefficient MPS p = |000> = e0
+    np.testing.assert_allclose(st.p_dense(), np.eye(8)[0])
+    # |psi> = C p = |000>
     assert _fidelity(st.to_statevector(), np.eye(8)[0]) == pytest.approx(1.0)
     assert st.pseudo_stabilizer_rank() == 1
 
@@ -64,9 +64,9 @@ def test_bell_state_ground_truth():
     st = STNState(2).h(0).cnot(0, 1)
     expected = np.array([1, 0, 0, 1], dtype=complex) / np.sqrt(2)
     assert _fidelity(st.to_statevector(), expected) == pytest.approx(1.0)
-    # Clifford gates do not touch |nu>.
+    # Clifford gates do not touch the coefficient MPS p.
     assert st.max_bond() == 1
-    np.testing.assert_allclose(st.nu_dense(), np.eye(4)[0])
+    np.testing.assert_allclose(st.p_dense(), np.eye(4)[0])
 
 
 def test_ghz_state_ground_truth():
@@ -254,13 +254,13 @@ def test_simulator_random_1q_matrix_matches_dense():
 
 
 def test_simulator_submpo_event_in_nu_frame():
-    # A sub-MPO event acts directly on |nu>; from |0...0> the basis is identity
-    # so it also equals the physical operator.
+    # A sub-MPO event acts directly on the coefficient MPS p; from |0...0> the
+    # basis is identity so it also equals the physical operator.
     sim = MpsStabOptimizer(3)
     mpo = pauli_rotation_mpo(0.8, ["X", "I", "Z"], sign=1.0)
-    exact = mpo.apply(sim.state.nu).to_dense().reshape(-1)
+    exact = mpo.apply(sim.state.p).to_dense().reshape(-1)
     sim.apply([("submpo", mpo, (0, 1, 2))])
-    got = np.asarray(sim.state.nu.to_dense()).reshape(-1)
+    got = np.asarray(sim.state.p.to_dense()).reshape(-1)
     assert _fidelity(got, exact) == pytest.approx(1.0, abs=1e-9)
 
 
@@ -281,11 +281,14 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
     assert max(sim.infidelities) > 0.0  # truncation actually occurred
 
 
-def test_simulator_two_qubit_nonclifford_matrix_rejected():
-    sim = MpsStabOptimizer(2)
-    bad = _rzz(0.5)  # non-Clifford 2q matrix
-    with pytest.raises(NotImplementedError):
-        sim.apply([(bad, (0, 1))])
+def test_simulator_two_qubit_nonclifford_matrix_supported():
+    # A dense non-Clifford 2q matrix is now applied via Pauli decomposition.
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("t", 2)])
+    psi = sim.to_statevector()
+    u = _rzz(0.5)  # non-Clifford 2q matrix
+    sim.apply([(u, (0, 1))])
+    ref = _apply_gate_dense(psi, u, (0, 1), 3)
+    assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
 # --------------------------------------------------------------------------- #
@@ -460,7 +463,7 @@ def test_simulator_inplace_false_preserves_original():
     base = STNState(3)
     sim = MpsStabOptimizer(base, inplace=False).apply([("h", 0), ("rz", 0.7, 0), ("cnot", 0, 1)])
     # original untouched
-    np.testing.assert_allclose(base.nu_dense(), np.eye(8)[0])
+    np.testing.assert_allclose(base.p_dense(), np.eye(8)[0])
     assert base.max_bond() == 1
     # the simulator evolved its own copy
     assert sim.state is not base
@@ -527,8 +530,11 @@ def test_initial_state_from_bits():
 
 def test_from_tableau_and_nu_roundtrip():
     src = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.6, 2), ("t", 1)])
-    rebuilt = MpsStabOptimizer.from_tableau_and_nu(src.state._sim.copy(), src.state.nu.copy())
+    # Primary API is from_tableau_and_state / .p; the *_nu names remain aliases.
+    rebuilt = MpsStabOptimizer.from_tableau_and_state(src.state._sim.copy(), src.state.p.copy())
     assert _fidelity(rebuilt.to_statevector(), src.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+    alias = MpsStabOptimizer.from_tableau_and_nu(src.state._sim.copy(), src.state.nu.copy())
+    assert _fidelity(alias.to_statevector(), src.to_statevector()) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_norm_preserved_after_circuit():

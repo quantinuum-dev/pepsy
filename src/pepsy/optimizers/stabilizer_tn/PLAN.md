@@ -8,9 +8,12 @@ quantum simulator on a basis of stabilizer states*, PRL 133, 230601 (2024),
 arXiv:2403.08724. See `.github/skills/stabilizer-tensor-networks/` for the
 method reference and the verified implementation shortcuts.
 
-State model: `|psi> = C |nu>` — a stim tableau Clifford `C` (basis `B(S, D)`)
-times a coefficient MPS `|nu>` (quimb). Clifford gates update the tableau only;
-non-Clifford gates and measurements update `|nu>`.
+State model: `|psi> = C p` — a stim tableau Clifford `C` (basis `B(S, D)`)
+times a coefficient MPS `p` (quimb; the paper's `|nu>`). Clifford gates update the
+tableau only; non-Clifford gates and measurements update `p`. The coefficient
+MPS is exposed as `.p` (matching `MpsOptimizer.p`); `.nu`, `p_dense`/`nu_dense`,
+`frame_pauli`/`nu_frame_pauli`, and `from_tableau_and_state`/`from_tableau_and_nu`
+are kept as back-compat aliases.
 
 ---
 
@@ -25,16 +28,23 @@ non-Clifford gates and measurements update `|nu>`.
 - **Clifford-angle rotations are free** — angle a multiple of pi/2 routes to the
   tableau (from their reference `n_half_pis`), keeping chi minimal.
 - **Explicit gate matrices** — Clifford via `stim.Tableau.from_unitary_matrix` +
-  `do_tableau`; 1q non-Clifford via ZYZ -> rotations; 2q non-Clifford rejected.
+  `do_tableau`; 1q non-Clifford *unitary* via ZYZ -> rotations; **any other
+  `k`-qubit matrix (any `k`, unitary or non-unitary)** via Pauli decomposition
+  `G = sum_a c_a P_a` -> `M = C^dagger G C = sum_a c_a (C^dagger P_a C)`, applied
+  to `p` as a compressed sum of signed Pauli-string branches (`pauli_decomposition`
+  + `_apply_dense_gate`/`_apply_operator_sum`). Non-unitary `G` is represented
+  without renormalization (coefficient norm tracks `|G|psi>|`).
 - **Measurement (Lemma 3)** — `expectation` = `<nu|M|nu>`; `measure` collapses
   with the fixed-basis projector `(I +- M)/2` + renormalize; Born sampling +
   forced outcomes; `("measure", ...)` stream entry.
-- **Sub-MPO events** — `("submpo", mpo, where)` applied to `|nu>` (coefficient
-  frame), matching the `MpsOptimizer` contract.
+- **Sub-MPO events** — `("submpo", mpo, where)` applied to `p` (coefficient
+  frame; any MPO, unitary or not), matching the `MpsOptimizer` contract. A
+  *physical*-frame few-qubit operator goes through a dense `(matrix, where)`
+  entry instead (frame-mapped automatically).
 - Simulator front end: `MpsStabOptimizer` (gate stream, `chi`, `track_infidelity`,
   `infidelities`, `bond_history`, `set_gates`/`add_gates`/`run`/`apply`).
-- **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_nu` and the
-  matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_nu` classmethods.
+- **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_state` and the
+  matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_state` classmethods.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports running chi
   and cumulative infidelity); `norm()` returns the `|nu>` norm.
 - `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
