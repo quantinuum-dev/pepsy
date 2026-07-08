@@ -25,6 +25,10 @@ outcome[, absorb_basis]])`, and `("reset", where)`.
   (with `inject_t` / `inject_tdg` wrappers) — apply `Rz(phi)` by magic-state gate
   teleportation for `phi` a multiple of `pi/4` (Clifford correction), keeping the
   non-Clifford cost on the pre-loaded ancilla.
+- `run_with_injection(gates, *, ancillas, ...)` and the `with_injection(n_data,
+  gates, *, n_ancilla=1, ...)` classmethod — a circuit-rewrite front end that
+  auto-teleports every `t` / `tdg` / `pi/4`-`rz` in a stream through `inject_rz`,
+  recycling the ancilla pool (a single ancilla suffices).
 
 ## Scalable sampling
 

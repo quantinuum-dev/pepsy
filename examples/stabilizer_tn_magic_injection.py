@@ -61,6 +61,26 @@ def main() -> None:
     print("recycled ancilla for a second T (T^2 on data); reset + reuse OK")
 
     # ------------------------------------------------------------------ #
+    # 2b. Circuit-rewrite front end: auto-teleport every T/Rz(pi/4) in a
+    #     stream through injection with a single recycled ancilla.
+    # ------------------------------------------------------------------ #
+    nd = 4
+    circuit = (
+        [("h", i) for i in range(nd)]
+        + [("cnot", i, i + 1) for i in range(nd - 1)]
+        + [("t", i) for i in range(nd)]          # 4 non-Clifford T gates
+        + [("rz", np.pi / 4, 0), ("tdg", 2)]
+    )
+    direct = py.MpsStabOptimizer(nd).apply(circuit)                 # rotation path
+    auto = py.MpsStabOptimizer.with_injection(nd, circuit, n_ancilla=1)  # 1 recycled ancilla
+    e0 = np.zeros(2, complex); e0[0] = 1.0
+    match = fidelity(auto.to_statevector(), np.kron(direct.to_statevector(), e0))
+    print(
+        f"with_injection: {nd}+1 qubits, all T/Rz(pi/4) teleported via one ancilla, "
+        f"fidelity vs direct = {match:.6f}"
+    )
+
+    # ------------------------------------------------------------------ #
     # 3. Scalable sampling on a Clifford + T circuit, checked vs dense.
     # ------------------------------------------------------------------ #
     n = 4

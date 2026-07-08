@@ -928,3 +928,65 @@ def test_absorb_measure_forced_impossible_raises():
     with pytest.raises(ValueError, match="0 probability"):
         sim.measure("Z", 1, outcome=-1, absorb_basis=True)
 
+
+# --------------------------------------------------------------------------- #
+# Mature: circuit-rewrite front end (auto-inject Z-rotations)
+# --------------------------------------------------------------------------- #
+def _data_marginal_ref(direct_sim, n_ancilla):
+    """Reference full statevector for injection: (direct result) (x) |0>^n_ancilla."""
+    e0 = np.zeros(2 ** n_ancilla, dtype=complex); e0[0] = 1.0
+    return np.kron(direct_sim.to_statevector(), e0)
+
+
+@pytest.mark.parametrize("n_ancilla", [1, 2])
+def test_run_with_injection_matches_direct(n_ancilla):
+    nd = 3
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("tdg", 0),
+              ("rz", np.pi / 4, 1), ("cnot", 1, 2), ("t", 1), ("rz", np.pi / 2, 0)]
+    direct = MpsStabOptimizer(nd).apply(stream)
+    inj = MpsStabOptimizer.with_injection(nd, stream, n_ancilla=n_ancilla)
+    assert inj.n == nd + n_ancilla
+    ref = _data_marginal_ref(direct, n_ancilla)
+    assert _fidelity(inj.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_with_injection_pool_one_recycles_many_t():
+    n = 5
+    stream = ([("h", i) for i in range(n)]
+              + [("cnot", i, i + 1) for i in range(n - 1)]
+              + [("t", i) for i in range(n)] * 2)  # 10 T-gates
+    direct = MpsStabOptimizer(n).apply(stream)
+    inj = MpsStabOptimizer.with_injection(n, stream, n_ancilla=1)  # single recycled ancilla
+    ref = _data_marginal_ref(direct, 1)
+    assert _fidelity(inj.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_run_with_injection_non_pi4_rz_applied_normally():
+    # rz(0.3) is not a pi/4 multiple -> must fall through to the normal path (still correct).
+    nd = 2
+    stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.3, 1), ("t", 0)]
+    direct = MpsStabOptimizer(nd).apply(stream)
+    inj = MpsStabOptimizer.with_injection(nd, stream, n_ancilla=1)
+    assert _fidelity(inj.to_statevector(), _data_marginal_ref(direct, 1)) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_run_with_injection_rejects_target_in_pool():
+    sim = MpsStabOptimizer(3)
+    with pytest.raises(ValueError, match="ancilla pool"):
+        sim.run_with_injection([("t", 2)], ancillas=[2])
+
+
+def test_run_with_injection_no_recycle_exhausts():
+    # two T-gates, single ancilla, recycle disabled -> exhaustion error.
+    sim = MpsStabOptimizer(3)
+    with pytest.raises(RuntimeError, match="exhausted"):
+        sim.run_with_injection([("t", 0), ("t", 1)], ancillas=[2], recycle=False)
+
+
+def test_run_with_injection_reset_ancillas_leaves_zero():
+    sim = MpsStabOptimizer(2)
+    sim.state.h(0)
+    sim.run_with_injection([("t", 0)], ancillas=[1], reset_ancillas=True)
+    # ancilla qubit 1 is back to |0> -> <Z_1> = +1
+    assert sim.expectation("Z", 1) == pytest.approx(1.0, abs=1e-9)
+

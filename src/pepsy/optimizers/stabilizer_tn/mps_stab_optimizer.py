@@ -799,6 +799,141 @@ class MpsStabOptimizer:
         """
         return self.inject_rz(data, ancilla, -math.pi / 4, outcome=outcome)
 
+    def _injectable_rz(self, entry):
+        """Return ``(data_qubit, phi)`` if ``entry`` is an injectable ``Z``-rotation.
+
+        Injectable = a diagonal ``T``/``T-dagger``/``Rz(phi)`` gate that is
+        *non-Clifford* and has ``phi`` a multiple of ``pi/4`` (so the injection
+        correction is Clifford).  Clifford-angle ``Rz`` (multiple of ``pi/2``) is
+        left for the free tableau path, and non-``pi/4`` angles for the normal
+        rotation path; both return ``None``.
+        """
+        if not (isinstance(entry, (list, tuple)) and entry and isinstance(entry[0], str)):
+            return None
+        name = entry[0].strip().lower()
+        if name == "t":
+            return int(entry[1]), math.pi / 4
+        if name == "tdg":
+            return int(entry[1]), -math.pi / 4
+        if name == "rz":
+            phi, q = float(entry[1]), int(entry[2])
+            k = phi / (math.pi / 4)
+            if abs(k - round(k)) < 1e-9 and not self._is_clifford_angle(phi):
+                return q, phi
+        return None
+
+    def run_with_injection(
+        self,
+        gates,
+        *,
+        ancillas,
+        recycle: bool = True,
+        reset_ancillas: bool = True,
+        progbar: bool = False,
+    ) -> "MpsStabOptimizer":
+        """Replay ``gates``, teleporting ``Z``-rotations through magic-state injection.
+
+        Every injectable gate (``("t", q)`` / ``("tdg", q)`` / ``("rz", phi, q)``
+        with ``phi`` a non-Clifford multiple of ``pi/4`` — see
+        :meth:`_injectable_rz`) is applied by :meth:`inject_rz` using a qubit from
+        the reserved ``ancillas`` pool instead of the ``|nu>``-growing rotation
+        path; all other entries replay normally.  Because injection measures the
+        ancilla out immediately, one ancilla can be **recycled** for the whole
+        stream (``reset`` + re-``prepare_magic``), so a pool of size 1 suffices.
+
+        Parameters
+        ----------
+        gates : stream
+            Gate stream (same forms as :meth:`add_gates`).
+        ancillas : sequence[int]
+            Reserved magic-ancilla qubits, disjoint from the data qubits the
+            stream acts on.  Must currently be ``|0>``.
+        recycle : bool
+            If ``True`` (default), reset+reuse a spent ancilla when the pool is
+            exhausted; if ``False``, raise once every pool ancilla is dirty.
+        reset_ancillas : bool
+            If ``True`` (default), reset every used ancilla back to ``|0>`` at the
+            end, so the final state is ``(data result) (x) |0...0>_ancilla``.
+        progbar : bool
+            Show a ``tqdm`` progress bar.
+
+        Returns ``self``.
+        """
+        pool = [int(a) for a in ancillas]
+        if not pool:
+            raise ValueError("run_with_injection needs at least one ancilla qubit.")
+        pool_set = set(pool)
+        entries = self._as_entries(gates)
+        dirty = {a: False for a in pool}
+        nxt = 0  # round-robin cursor into the pool
+
+        pbar = None
+        if progbar and entries:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(total=len(entries), desc="stab-inject", leave=True, ascii=True)
+        for entry in entries:
+            spec = self._injectable_rz(entry)
+            if spec is None:
+                self._apply_entry(entry)
+            else:
+                data, phi = spec
+                if data in pool_set:
+                    raise ValueError(
+                        f"injection target qubit {data} is in the ancilla pool {pool}."
+                    )
+                a = pool[nxt]
+                nxt = (nxt + 1) % len(pool)
+                if dirty[a]:
+                    if not recycle:
+                        raise RuntimeError(
+                            "magic-ancilla pool exhausted (recycle=False); "
+                            "reserve more ancillas or allow recycling."
+                        )
+                    self.reset(a)
+                self.prepare_magic(a, angle=phi)
+                self.inject_rz(data, a, phi)
+                dirty[a] = True
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(chi=self.state.max_bond())
+        if pbar is not None:
+            pbar.close()
+
+        if reset_ancillas:
+            for a in pool:
+                if dirty[a]:
+                    self.reset(a)
+        return self
+
+    @classmethod
+    def with_injection(
+        cls, n_data: int, gates, *, n_ancilla: int = 1, **kwargs
+    ) -> "MpsStabOptimizer":
+        """Build an ``(n_data + n_ancilla)``-qubit simulator and run ``gates`` with injection.
+
+        Data qubits are ``0 .. n_data - 1``; the last ``n_ancilla`` qubits are the
+        recyclable magic-ancilla pool.  All ``T``/``T-dagger``/``pi/4``-``Rz`` gates
+        in ``gates`` are teleported through :meth:`inject_rz` (see
+        :meth:`run_with_injection`), keeping the non-Clifford cost on the ancilla
+        pool instead of the coefficient MPS.  Remaining keyword arguments are
+        forwarded to the constructor (``chi``, ``cutoff``, ``seed``, ...).
+        """
+        n_data = int(n_data)
+        n_ancilla = int(n_ancilla)
+        if n_ancilla < 1:
+            raise ValueError("with_injection needs n_ancilla >= 1.")
+        run_opts = {
+            k: kwargs.pop(k)
+            for k in ("recycle", "reset_ancillas", "progbar")
+            if k in kwargs
+        }
+        sim = cls(n_data + n_ancilla, **kwargs)
+        sim.run_with_injection(
+            gates, ancillas=range(n_data, n_data + n_ancilla), **run_opts
+        )
+        return sim
+
     # ------------------------------------------------------------------ #
     # Explicit gate matrices
     # ------------------------------------------------------------------ #

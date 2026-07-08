@@ -107,7 +107,11 @@ Ordered by value/effort. None are started.
     repeat-until-success gadget (raises for now).
   - Preallocate a magic-ancilla register + a `t_via_injection`/circuit-rewrite
     front end that replaces every `("t", q)` stream entry with an injection so a
-    T-doped circuit never touches the `|nu>` rotation path.
+    T-doped circuit never touches the `|nu>` rotation path. **DONE** —
+    `run_with_injection(gates, ancillas=...)` and the `with_injection(n_data,
+    gates, n_ancilla=...)` classmethod auto-teleport every `t`/`tdg`/`pi/4`-`rz`
+    through `inject_rz`, recycling the ancilla pool (size 1 suffices; inject frees
+    the ancilla immediately). Validated == direct replay on the data marginal.
   - Benchmark: T-doped-Clifford circuit at large `N`, fixed `t` — show `|nu>`
     bond bounded by ~`2^t` independent of `N` (paper Fig. 2).
 
