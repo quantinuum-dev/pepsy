@@ -2,7 +2,7 @@
 
 Analogous to :class:`pepsy.MpsOptimizer`, but the state is a *stabilizer tensor
 network*: a stim tableau (basis ``B(S, D)``) times a coefficient MPS ``|nu>``
-(see :class:`pepsy.stabilizer_tn.STNState`).  A gate stream is replayed against
+(see :class:`pepsy.optimizers.stabilizer_tn.STNState`).  A gate stream is replayed against
 the state, routing each entry to the cheap update path:
 
 * **Clifford gates** update only the tableau (``|nu>`` unchanged, free).
@@ -36,8 +36,8 @@ from typing import List, Optional
 
 import numpy as np
 
-from ..optimizers.mps.optimizer import is_submpo_event, submpo_event_parts
-from ..tensors.core import tn_fidelity
+from ..mps.optimizer import is_submpo_event, submpo_event_parts
+from ...tensors.core import tn_fidelity
 from .operators import (
     pauli_combo_mpo,
     pauli_matrix,
@@ -232,6 +232,17 @@ class MpsStabOptimizer:
         """Dense statevector ``|psi> = C|nu>`` (small ``n`` only)."""
         return self.state.to_statevector()
 
+    def amplitude(self, bits) -> complex:
+        """Amplitude ``<bits|psi>`` for a bitstring (str ``'010'`` or 0/1 seq).
+
+        Qubit 0 is the leftmost bit. Uses the dense reconstruction (small ``n``).
+        """
+        return self.state.amplitude(bits)
+
+    def probability(self, bits) -> float:
+        """Outcome probability ``|<bits|psi>|**2`` (small ``n``)."""
+        return self.state.probability(bits)
+
     def norm(self) -> float:
         """Norm of the coefficient state ``|nu>`` (represented state norm; ~1)."""
         return float(abs(self.state.nu.norm()))
@@ -397,10 +408,50 @@ class MpsStabOptimizer:
         den = complex(nu.H @ nu)
         return float(sign * np.real(num / den))
 
-    def expectation(self, pauli, where) -> float:
-        """Return the expectation ``<psi|O|psi>`` of a Pauli observable (no collapse)."""
+    def expectation(self, pauli, where=None) -> float:
+        """Return the expectation ``<psi|O|psi>`` of a Pauli observable (no collapse).
+
+        Two forms:
+
+        * ``expectation("Z", 0)`` / ``expectation("XZ", (0, 2))`` — a Pauli on
+          the given qubit(s).
+        * ``expectation("IZZ")`` — a full-register Pauli string (``where=None``),
+          length ``n`` with ``"I"`` on idle qubits.
+        """
+        if where is None:
+            if len(str(pauli)) != self.n:
+                raise ValueError(
+                    f"Full-register Pauli string must have length n={self.n}, "
+                    f"got {len(str(pauli))}."
+                )
+            where = tuple(range(self.n))
         terms, sign = self._nu_frame_terms(pauli, where)
         return self._pauli_expectation(terms, sign)
+
+    def expectation_pauli_sum(self, terms) -> float:
+        """Return ``<psi|H|psi>`` for ``H = sum_k coeff_k P_k`` (e.g. a Hamiltonian).
+
+        ``terms`` is an iterable of ``(coeff, pauli)`` or ``(coeff, pauli, where)``
+        entries; ``pauli``/``where`` follow the :meth:`expectation` conventions.
+        """
+        total = 0.0 + 0.0j
+        for term in terms:
+            coeff, pauli = term[0], term[1]
+            where = term[2] if len(term) > 2 else None
+            total += complex(coeff) * self.expectation(pauli, where)
+        return float(np.real(total))
+
+    def sample(self, pauli, where=None, *, shots: int = 1, seed=None):
+        """Draw ``shots`` Born-rule outcomes (+/-1) of a Pauli observable.
+
+        Independent samples of the *current* state; the state is **not**
+        collapsed (unlike :meth:`measure`).  Useful for shot statistics.
+        Returns a length-``shots`` numpy array of +/-1.
+        """
+        exp = self.expectation(pauli, where)
+        p_plus = 0.5 * (1.0 + exp)
+        rng = self._rng if seed is None else np.random.default_rng(seed)
+        return np.where(rng.random(int(shots)) < p_plus, 1, -1)
 
     def measure(self, pauli, where, *, outcome: Optional[int] = None):
         """Measure a Pauli observable, collapse ``|nu>``, and return ``+1``/``-1``.

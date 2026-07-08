@@ -10,7 +10,7 @@ import pytest
 
 stim = pytest.importorskip("stim")
 
-from pepsy.stabilizer_tn import STNState
+from pepsy.optimizers.stabilizer_tn import STNState
 
 
 def _fidelity(a, b):
@@ -117,7 +117,7 @@ def test_zero_qubit_rejected():
 # --------------------------------------------------------------------------- #
 # MpsStabOptimizer simulator (Clifford + non-Clifford rotations, matrices, sub-MPO)
 # --------------------------------------------------------------------------- #
-from pepsy.stabilizer_tn import MpsStabOptimizer, pauli_rotation_mpo  # noqa: E402
+from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer, pauli_rotation_mpo  # noqa: E402
 
 _I = np.eye(2, dtype=complex)
 _X = np.array([[0, 1], [1, 0]], dtype=complex)
@@ -549,6 +549,85 @@ def test_run_progbar_smoke():
 
 
 def test_stabilizermps_backward_alias():
-    from pepsy.stabilizer_tn import StabilizerMps
+    from pepsy.optimizers.stabilizer_tn import StabilizerMps
     assert StabilizerMps is MpsStabOptimizer
+
+
+def test_optimizers_namespace_exports():
+    from pepsy.optimizers import MpsStabOptimizer as M, STNState as S
+    assert M is MpsStabOptimizer
+    assert S is STNState
+
+
+# --------------------------------------------------------------------------- #
+# Amplitude / probability / observable API
+# --------------------------------------------------------------------------- #
+def _pauli_op(pauli, where, n):
+    mats = {"I": _I, "X": _X, "Y": _Y, "Z": _Z}
+    axes = list(pauli)
+    if where is None:
+        where = tuple(range(n))
+    elif isinstance(where, int):
+        where = (where,)
+    else:
+        where = tuple(where)
+    full = [np.eye(2, dtype=complex) for _ in range(n)]
+    for ax, q in zip(axes, where):
+        full[q] = mats[ax]
+    out = full[0]
+    for m in full[1:]:
+        out = np.kron(out, m)
+    return out
+
+
+def test_amplitude_and_probability_match_dense():
+    n = 3
+    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2), ("t", 1)])
+    psi = sim.to_statevector()
+    total = 0.0
+    for k in range(2 ** n):
+        bits = format(k, f"0{n}b")
+        assert sim.amplitude(bits) == pytest.approx(psi[k], abs=1e-6)
+        assert sim.probability(bits) == pytest.approx(abs(psi[k]) ** 2, abs=1e-6)
+        total += sim.probability(bits)
+    assert total == pytest.approx(1.0, abs=1e-6)
+
+
+def test_amplitude_ghz_ground_truth():
+    sim = MpsStabOptimizer.ghz(3)
+    assert sim.probability("000") == pytest.approx(0.5, abs=1e-6)
+    assert sim.probability("111") == pytest.approx(0.5, abs=1e-6)
+    assert sim.probability("010") == pytest.approx(0.0, abs=1e-9)
+
+
+def test_expectation_full_register_string():
+    n = 3
+    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.5, 2)])
+    psi = sim.to_statevector()
+    ref = float(np.real(np.vdot(psi, _pauli_op("ZIZ", None, n) @ psi)))
+    assert sim.expectation("ZIZ") == pytest.approx(ref, abs=1e-6)
+    # equivalent to the (pauli, where) form with identities dropped
+    assert sim.expectation("ZIZ") == pytest.approx(sim.expectation("ZZ", (0, 2)), abs=1e-9)
+
+
+def test_expectation_pauli_sum_matches_dense():
+    n = 3
+    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.4, 2)])
+    psi = sim.to_statevector()
+    terms = [(0.5, "Z", 0), (1.0, "ZZ", (0, 1)), (-0.3, "XIX")]
+    ref = 0.0
+    for c, p, *rest in terms:
+        w = rest[0] if rest else None
+        ref += c * np.real(np.vdot(psi, _pauli_op(p, w, n) @ psi))
+    assert sim.expectation_pauli_sum(terms) == pytest.approx(ref, abs=1e-6)
+
+
+def test_sample_statistics_no_collapse():
+    theta = 0.9
+    sim = MpsStabOptimizer(1, seed=0).apply([("rx", theta, 0)])
+    outs = sim.sample("Z", 0, shots=2000)
+    assert set(np.unique(outs)).issubset({-1, 1})
+    assert outs.mean() == pytest.approx(np.cos(theta), abs=0.08)
+    # sampling did not collapse the state
+    assert sim.expectation("Z", 0) == pytest.approx(np.cos(theta), abs=1e-6)
 

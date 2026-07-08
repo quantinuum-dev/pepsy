@@ -68,9 +68,9 @@ All exported at top level (`import pepsy`); see `src/pepsy/__init__.py`.
   outcome from $\langle\mathcal O\rangle$ computed on `nu`, then apply the matching stim
   tableau update so basis and coefficient state stay consistent.
 
-## Actual module layout (`src/pepsy/stabilizer_tn/`)
+## Actual module layout (`src/pepsy/optimizers/stabilizer_tn/`)
 ```
-src/pepsy/stabilizer_tn/
+src/pepsy/optimizers/stabilizer_tn/
   __init__.py        # public API: STNState, MpsStabOptimizer, MPO builders
   stn_state.py       # STNState: stim tableau + pepsy MPS |nu>, init |0..0>, nu_frame_pauli
   mps_stab_optimizer.py  # MpsStabOptimizer: gate-stream simulator (Clifford/rotation/measure/submpo)

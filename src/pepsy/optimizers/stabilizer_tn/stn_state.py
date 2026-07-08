@@ -1,6 +1,6 @@
 """STN state container: stim tableau basis + pepsy/quimb coefficient MPS.
 
-See :mod:`pepsy.stabilizer_tn` for the formalism.  This file implements Phase 1
+See :mod:`pepsy.optimizers.stabilizer_tn` for the formalism.  This file implements Phase 1
 (state container + statevector reconstruction) and Phase 2 (Clifford update) of
 the stabilizer-tensor-network build.
 """
@@ -11,7 +11,7 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
-from ..tensors import ps_to_mps
+from ...tensors import ps_to_mps
 
 # Clifford gate name -> (stim TableauSimulator method name, number of qubits).
 # Names are normalized to lowercase; a few common aliases are accepted.
@@ -60,7 +60,7 @@ class STNState:
             import stim  # noqa: F401  (imported for the optional dependency)
         except ImportError as exc:  # pragma: no cover - exercised only without stim
             raise ImportError(
-                "pepsy.stabilizer_tn.STNState requires the optional dependency "
+                "pepsy.optimizers.stabilizer_tn.STNState requires the optional dependency "
                 "'stim'. Install it with `python -m pip install stim`."
             ) from exc
 
@@ -258,6 +258,32 @@ class STNState:
         global phase (tableaus do not track global phase).
         """
         return self.clifford_unitary() @ self.nu_dense()
+
+    def _bits_to_index(self, bits) -> int:
+        """Map a bitstring (str ``'010'`` or 0/1 sequence) to a big-endian index."""
+        if isinstance(bits, str):
+            bits = [int(c) for c in bits]
+        bits = [int(b) for b in bits]
+        if len(bits) != self.n:
+            raise ValueError(
+                f"bits must have length n={self.n}, got {len(bits)}."
+            )
+        index = 0
+        for b in bits:
+            index = (index << 1) | (b & 1)
+        return index
+
+    def amplitude(self, bits) -> complex:
+        """Return the amplitude ``<bits|psi>`` (qubit 0 is the leftmost bit).
+
+        Uses the dense reconstruction, so it is only practical for small ``n``.
+        Defined up to the global phase of the tableau reconstruction.
+        """
+        return complex(self.to_statevector()[self._bits_to_index(bits)])
+
+    def probability(self, bits) -> float:
+        """Return the outcome probability ``|<bits|psi>|**2`` (small ``n``)."""
+        return float(abs(self.amplitude(bits)) ** 2)
 
     def pseudo_stabilizer_rank(self, tol: float = 1e-12) -> int:
         """Pseudo-stabilizer rank ``xi_tilde`` = number of non-zero ``nu_i``.

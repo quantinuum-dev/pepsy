@@ -65,11 +65,11 @@ CNOT-cascade rotation, and a worked 5-qubit example live in
 The concrete pepsy + stim call surface is in
 [references/pepsy_stim_api.md](./references/pepsy_stim_api.md).
 
-## Implementation status (already built in `src/pepsy/stabilizer_tn/`)
+## Implementation status (already built in `src/pepsy/optimizers/stabilizer_tn/`)
 Phases 1–4 exist and are validated against dense/stim (`tests/test_stabilizer_tn.py`):
 `STNState` (tableau + `|nu>`), Clifford update, non-Clifford rotations, explicit gate
 matrices, sub-MPO events, and Pauli measurement — all exposed through
-`pepsy.stabilizer_tn.MpsStabOptimizer`, an `MpsOptimizer`-style gate-stream simulator.
+`pepsy.optimizers.MpsStabOptimizer`, an `MpsOptimizer`-style gate-stream simulator.
 
 **Key verified shortcut (use this, not the CNOT-cascade masks).** Because
 $|\psi\rangle = C|\nu\rangle$ with $C$ the tableau Clifford, a physical Pauli operator
@@ -89,7 +89,7 @@ This collapses all of Lemma 2/3's $I_x,I_y,I_z$ mask algebra into one call:
   stabilizer group (a possible future efficiency optimization).
 
 Both $\exp(-i\theta/2\,M)$ and $\tfrac{I\pm M}{2}$ are exact **bond-dim-2 MPOs**
-(`c·I + coef·P`) built by `pepsy.stabilizer_tn.operators.pauli_combo_mpo`; apply via
+(`c·I + coef·P`) built by `pepsy.optimizers.stabilizer_tn.operators.pauli_combo_mpo`; apply via
 `mpo.apply(nu)` then `nu.compress(max_bond=chi)`. Single-support $M$ is applied as a
 bond-preserving 2×2 gate. Explicit matrices: `stim.Tableau.from_unitary_matrix` +
 `sim.do_tableau` for Clifford; ZYZ→rotations for 1q non-Clifford. Rotations whose angle
@@ -98,13 +98,13 @@ is a multiple of $\pi/2$ are Clifford and route to the tableau (free, χ unchang
 ## Roadmap / future improvements
 The prioritized roadmap (magic state injection, Clifford disentangling sweep,
 basis-updating measurement, sampling, packaging) lives in
-`src/pepsy/stabilizer_tn/PLAN.md`, with citations from the PRL-133-230601 citation scan.
+`src/pepsy/optimizers/stabilizer_tn/PLAN.md`, with citations from the PRL-133-230601 citation scan.
 When extending the simulator, update that PLAN and add a dense-validated test.
 
 ## Implementation Workflow
 
 Implement incrementally, validating each phase against a dense statevector / stim before
-moving on. Prefer a small new module (e.g. `src/pepsy/stabilizer_tn/`) that composes
+moving on. Prefer a small module (e.g. `src/pepsy/optimizers/stabilizer_tn/`) that composes
 public APIs; do NOT bolt STN state onto unrelated modules.
 
 ### Phase 0 — Internalize

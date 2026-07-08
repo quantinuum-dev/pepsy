@@ -1,4 +1,4 @@
-# PLAN.md — `pepsy.stabilizer_tn` roadmap
+# PLAN.md — `pepsy.optimizers.stabilizer_tn` roadmap
 
 Status: living document
 Scope: the Stabilizer Tensor Network (STN) simulator subpackage only.
@@ -83,8 +83,9 @@ Ordered by value/effort. None are started.
   through `C`; batched expectation values.
 
 ### R5. Packaging & examples
-- Optionally expose `pepsy.stabilizer_tn` at top-level `pepsy.*` + `docs/api/`
-  (requires updating `tests/test_public_api.py`).
+- Optionally expose `MpsStabOptimizer` at top-level `pepsy.*` + `docs/api/`
+  (already exposed as `pepsy.optimizers.MpsStabOptimizer`; top-level would need
+  updating `tests/test_public_api.py`).
 - A small deterministic example: `|T>^n` at chi=1, and a magic-vs-chi growth demo
   (paper Fig. 2).
 
