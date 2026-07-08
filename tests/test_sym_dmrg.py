@@ -2854,3 +2854,241 @@ def test_symdmrg2_rejects_quimb_backend_for_symmray_arrays():
 
     with pytest.raises(ValueError, match="backend='quimb'"):
         pepsy.SymDMRG2(ham.to_mpo(L=2, compress=False), state, backend="quimb")
+
+
+# --- Non-fermionic (U1 / Z2) SymDMRG2 coverage ------------------------------
+#
+# SymDMRG2 and SymHamiltonian.to_mpo are exercised above only on the fermionic
+# Fermi-Hubbard models. The tests below lock in that the same driver solves
+# non-fermionic spin models (U1 Heisenberg, Z2 transverse-field Ising) to the
+# exact ground-state energy. The ED reference is built by densifying the same
+# symmray two-site terms the MPO represents, so it is convention-exact.
+
+
+def _densify_symmray_term(term):
+    """Dense ``(2, 2, 2, 2) = (out_i, out_j, in_i, in_j)`` form of a term."""
+    return np.asarray(term.to_dense()).reshape(2, 2, 2, 2)
+
+
+def _embed_two_site(op4, i, j, n_sites):
+    """Embed a two-site operator on linear sites ``i``, ``j`` of ``n_sites``."""
+    if i > j:
+        i, j = j, i
+        op4 = op4.transpose(1, 0, 3, 2)
+    args = [op4, [i, j, n_sites + i, n_sites + j]]
+    for k in range(n_sites):
+        if k not in (i, j):
+            args += [np.eye(2), [k, n_sites + k]]
+    args += [list(range(n_sites)) + list(range(n_sites, 2 * n_sites))]
+    return np.einsum(*args).reshape(2 ** n_sites, 2 ** n_sites)
+
+
+def _dense_hamiltonian_from_terms(ham, site_index):
+    """Full dense Hamiltonian summed from densified symmray edge terms."""
+    n_sites = len(site_index)
+    matrix = np.zeros((2 ** n_sites, 2 ** n_sites), dtype=complex)
+    for (left, right), term in ham.terms.items():
+        matrix += _embed_two_site(
+            _densify_symmray_term(term),
+            site_index[left],
+            site_index[right],
+            n_sites,
+        )
+    return matrix
+
+
+def _z2_even_sector_ground_energy(dense, n_sites):
+    """Lowest eigenvalue of ``dense`` among even-Z2-parity eigenstates."""
+    parity = np.array([[1.0, 0.0], [0.0, -1.0]])
+    full_parity = parity
+    for _ in range(n_sites - 1):
+        full_parity = np.kron(full_parity, parity)
+    evals, evecs = np.linalg.eigh(dense)
+    for k in range(evals.size):
+        vec = evecs[:, k]
+        if abs(np.vdot(vec, full_parity @ vec) - 1.0) < 1e-6:
+            return float(evals[k].real)
+    raise AssertionError("no even-parity eigenstate found")
+
+
+def _symdmrg2_solve(mpo, state, chi, *, sweeps=8):
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        bond_dims=[chi],
+        cutoffs=[1e-12],
+        local_solver="auto",
+        which="SA",
+        mixer="none",
+        compute_initial_energy=False,
+    )
+    opt.solve(max_sweeps=sweeps, sweep_sequence="RL", tol=1e-12)
+    return opt
+
+
+def _mps_tensors(mps):
+    """Underlying quimb Tensors of a SymMPS wrapper or a raw quimb MPS."""
+    tn = getattr(mps, "tn", None)
+    return list(tn if tn is not None else mps)
+
+
+def _assert_block_sparse(tensors, symmetry, what):
+    """Assert every tensor is a symmray block-sparse array of ``symmetry`` and
+    that the collection genuinely carries more than one charge block (i.e. it is
+    not a dense-equivalent single-sector object)."""
+    tensors = list(tensors)
+    assert all(
+        type(t.data).__name__.startswith(symmetry) for t in tensors
+    ), f"{what} tensors are not symmray {symmetry} arrays (dense fallback?)"
+    assert max(len(t.data.blocks) for t in tensors) > 1, (
+        f"{what} carries only a single charge block -> not genuinely symmetric"
+    )
+
+
+def _assert_symmetric_pipeline(mpo, state, opt, symmetry):
+    """Assert the MPO, the input MPS, and the solved DMRG state are all
+    block-sparse symmray objects, and DMRG ran on the symmray backend."""
+    assert opt.backend == "symmray"
+    _assert_block_sparse([mpo[i] for i in range(mpo.L)], symmetry, "MPO")
+    _assert_block_sparse(_mps_tensors(state), symmetry, "input MPS")
+    _assert_block_sparse(_mps_tensors(opt.state), symmetry, "solved MPS")
+
+
+def test_symdmrg2_heisenberg_u1_chain_matches_dense_ed():
+    """SymDMRG2 solves a non-fermionic U1 Heisenberg chain to exact ED."""
+    pytest.importorskip("symmray")
+    L = 6
+    state = SymMPS.for_model(
+        "heisenberg",
+        L,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations([1, 0] * (L // 2)),
+        seed=7,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "heisenberg", "U1", [(i, i + 1) for i in range(L - 1)]
+    )
+    mpo = ham.to_mpo(L=L, compress=False)
+
+    opt = _symdmrg2_solve(mpo, state, 2 ** (L // 2))
+    _assert_symmetric_pipeline(mpo, state, opt, "U1")
+    energy = float(np.real(opt.energy))
+
+    dense = _dense_hamiltonian_from_terms(ham, {i: i for i in range(L)})
+    # The AFM Heisenberg ground state lies in the Sz=0 sector for even L.
+    e_ed = float(np.linalg.eigvalsh(dense)[0].real)
+
+    assert energy == pytest.approx(e_ed, abs=1e-8)
+
+
+def test_symdmrg2_tfim_z2_chain_matches_dense_ed():
+    """SymDMRG2 solves a non-fermionic Z2 transverse-field Ising chain to ED."""
+    pytest.importorskip("symmray")
+    L = 6
+    state = SymMPS.for_model(
+        "tfim",
+        L,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations([0] * L),  # even Z2 parity
+        seed=7,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "tfim", "Z2", [(i, i + 1) for i in range(L - 1)], jx=-1.0, hz=-0.5
+    )
+    mpo = ham.to_mpo(L=L, compress=False)
+
+    opt = _symdmrg2_solve(mpo, state, 2 ** (L // 2))
+    _assert_symmetric_pipeline(mpo, state, opt, "Z2")
+    energy = float(np.real(opt.energy))
+
+    dense = _dense_hamiltonian_from_terms(ham, {i: i for i in range(L)})
+    e_ed = _z2_even_sector_ground_energy(dense, L)
+
+    assert energy == pytest.approx(e_ed, abs=1e-8)
+
+
+def test_symdmrg2_heisenberg_u1_2d_lattice_matches_dense_ed():
+    """SymDMRG2 solves a snake-mapped 2D U1 Heisenberg lattice to exact ED."""
+    pytest.importorskip("symmray")
+    Lx, Ly = 2, 3
+    L = Lx * Ly
+    mapper = OneDMap(Lx, Ly, mode="snake")
+    _, coo2idx = mapper.build()
+    coord_edges = [tuple(edge) for edge in qtn.edges_2d_square(Lx, Ly, cyclic=False)]
+    state = SymMPS.for_model(
+        "heisenberg",
+        L,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations([1, 0] * (L // 2)),
+        seed=7,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges("heisenberg", "U1", coord_edges)
+    mpo = ham.to_mpo(mapper=mapper, compress=True, cutoff=1e-12)
+
+    opt = _symdmrg2_solve(mpo, state, 2 ** (L // 2))
+    _assert_symmetric_pipeline(mpo, state, opt, "U1")
+    energy = float(np.real(opt.energy))
+
+    dense = _dense_hamiltonian_from_terms(ham, coo2idx)
+    e_ed = float(np.linalg.eigvalsh(dense)[0].real)
+
+    assert energy == pytest.approx(e_ed, abs=1e-8)
+
+
+def _dense_jw_spinless_ground_energy(L, edges, *, t, V, mu, n_particles):
+    """Jordan-Wigner ED ground energy of the spinless t-V chain in a fixed-N sector."""
+    eye = np.eye(2)
+    zed = np.diag([1.0, -1.0])
+    lower = np.array([[0.0, 1.0], [0.0, 0.0]])
+
+    def annihilate(mode):
+        mats = [zed] * mode + [lower] + [eye] * (L - mode - 1)
+        out = mats[0]
+        for mat in mats[1:]:
+            out = np.kron(out, mat)
+        return out
+
+    ann = [annihilate(m) for m in range(L)]
+    num = [a.conj().T @ a for a in ann]
+    matrix = np.zeros((2 ** L, 2 ** L), dtype=complex)
+    for i, j in edges:
+        hop = ann[i].conj().T @ ann[j]
+        matrix += -t * (hop + hop.conj().T) + V * (num[i] @ num[j])
+    for i in range(L):
+        matrix += -mu * num[i]
+    keep = [b for b in range(2 ** L) if bin(b).count("1") == n_particles]
+    sector = matrix[np.ix_(keep, keep)]
+    return float(np.linalg.eigvalsh(sector)[0].real)
+
+
+def test_symdmrg2_spinless_fermi_hubbard_u1_matches_jw_ed():
+    """SymDMRG2 solves the spinless t-V (U1) fermionic chain to Jordan-Wigner ED."""
+    pytest.importorskip("symmray")
+    L = 8
+    edges = [(i, i + 1) for i in range(L - 1)]
+    t, V, mu = 1.0, 2.0, 0.0
+    state = SymMPS.for_model(
+        "fermi_hubbard_spinless",
+        L,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations([1, 0] * (L // 2)),
+        seed=7,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_spinless", "U1", edges, t=t, V=V, mu=mu
+    )
+    mpo = ham.to_mpo(L=L, compress=False)
+
+    opt = _symdmrg2_solve(mpo, state, 2 ** (L // 2))
+    _assert_symmetric_pipeline(mpo, state, opt, "U1")
+    energy = float(np.real(opt.energy))
+
+    e_ed = _dense_jw_spinless_ground_energy(
+        L, edges, t=t, V=V, mu=mu, n_particles=L // 2
+    )
+
+    assert energy == pytest.approx(e_ed, abs=1e-8)
