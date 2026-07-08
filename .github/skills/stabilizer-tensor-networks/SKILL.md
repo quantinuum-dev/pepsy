@@ -89,7 +89,7 @@ This collapses all of Lemma 2/3's $I_x,I_y,I_z$ mask algebra into one call:
   stabilizer group (a possible future efficiency optimization).
 
 Both $\exp(-i\theta/2\,M)$ and $\tfrac{I\pm M}{2}$ are exact **bond-dim-2 MPOs**
-(`c·I + coef·P`) built by `pepsy.stabilizer_tn.mpo.pauli_combo_mpo`; apply via
+(`c·I + coef·P`) built by `pepsy.stabilizer_tn.operators.pauli_combo_mpo`; apply via
 `mpo.apply(nu)` then `nu.compress(max_bond=chi)`. Single-support $M$ is applied as a
 bond-preserving 2×2 gate. Explicit matrices: `stim.Tableau.from_unitary_matrix` +
 `sim.do_tableau` for Clifford; ZYZ→rotations for 1q non-Clifford. Rotations whose angle

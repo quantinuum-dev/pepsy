@@ -19,9 +19,9 @@ gate-stream simulator supporting Clifford gates, non-Clifford Pauli rotations,
 explicit gate matrices, and sub-MPO events.
 """
 
-from .mpo import pauli_combo_mpo, pauli_rotation_mpo, single_qubit_rotation_matrix
-from .simulator import StabilizerMps
-from .state import STNState
+from .operators import pauli_combo_mpo, pauli_rotation_mpo, single_qubit_rotation_matrix
+from .stabilizer_mps import StabilizerMps
+from .stn_state import STNState
 
 __all__ = [
     "STNState",

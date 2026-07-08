@@ -68,14 +68,15 @@ All exported at top level (`import pepsy`); see `src/pepsy/__init__.py`.
   outcome from $\langle\mathcal O\rangle$ computed on `nu`, then apply the matching stim
   tableau update so basis and coefficient state stay consistent.
 
-## Suggested module layout (compose, don't refactor)
+## Actual module layout (`src/pepsy/stabilizer_tn/`)
 ```
 src/pepsy/stabilizer_tn/
-  __init__.py        # STNState, run_circuit, to_statevector (public API)
-  state.py           # STNState: stim tableau + pepsy MPS |nu>, init |0..0>
-  decompose.py       # Pauli -> basis (alpha, d_hat, s_hat) via stim symplectic products
-  updates.py         # clifford_update / rotation_update (Lemma 2) / measure_update (Lemma 3)
-  cascade.py         # CNOT-cascade multi-qubit Pauli rotation on the MPS
+  __init__.py        # public API: STNState, StabilizerMps, MPO builders
+  stn_state.py       # STNState: stim tableau + pepsy MPS |nu>, init |0..0>, nu_frame_pauli
+  stabilizer_mps.py  # StabilizerMps: gate-stream simulator (Clifford/rotation/measure/submpo)
+  operators.py       # pauli_combo_mpo / pauli_rotation_mpo / single_qubit_* / pauli_matrix
+  paulis.py          # stim Pauli helpers (single_pauli, pauli_string, hermitian_pauli_terms)
+  PLAN.md            # roadmap (magic-state injection, disentangling sweep, ...)
 tests/test_stabilizer_tn.py   # importorskip("stim"); validate vs dense/stim
 ```
 If you add public symbols, follow repo Public API Rules: update the owning subpackage

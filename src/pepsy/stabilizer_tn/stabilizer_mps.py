@@ -38,7 +38,7 @@ import numpy as np
 
 from ..optimizers.mps.optimizer import is_submpo_event, submpo_event_parts
 from ..tensors.core import tn_fidelity
-from .mpo import (
+from .operators import (
     pauli_combo_mpo,
     pauli_matrix,
     pauli_rotation_mpo,
@@ -46,7 +46,7 @@ from .mpo import (
     single_qubit_rotation_matrix,
 )
 from .paulis import hermitian_pauli_terms, pauli_string
-from .state import STNState
+from .stn_state import STNState
 
 __all__ = ["StabilizerMps"]
 
