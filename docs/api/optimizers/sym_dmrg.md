@@ -196,6 +196,21 @@ no-mixer sweep before setting `converged=True`. This matches the TeNPy practice
 of turning the mixer off and doing final clean sweeps once the state has found
 the right Schmidt subspace.
 
+`mixer="density_matrix"` (aliases `"dm"`) selects the White/TeNPy-style
+density-matrix mixer, which is the recommended mode for escaping mixer-off
+convergence plateaus. It perturbs the two-site reduced density matrix with the
+environment-projected Hamiltonian directions (keeping the MPO virtual bond
+open), `rho_mix = rho_theta + mixer_amplitude * rho_pert`, and eigendecomposes
+to a truncated canonical isometry, opening the charge sectors a plain SVD
+truncation would miss without changing the current two-site state. This mirrors
+`tenpy.algorithms.mps_common.DensityMatrixMixer.mix_rho`. On the periodic
+Fermi-Hubbard benchmarks it converges *below* a matched-`chi` TeNPy run: at
+`chi=32` the 5x6 torus improves from the mixer-off plateau `-2.42248` to
+`-2.42881` (TeNPy `-2.42674`) and the 6x6 torus from `-2.42977` to `-2.43428`
+(TeNPy `-2.42962`), energy densities in the `<H>/N - U/4` convention. Use a slow
+`mixer_decay` (default `0.9`) so the mixer stays active across the early sweeps
+and a `mixer_disable_after` budget that leaves a few final clean sweeps.
+
 For a hard periodic benchmark, the 3 by 3 PBC U1U1 Fermi-Hubbard sector-ED
 reference currently used during development is
 `E0 = -7.824105712954`. This case is intentionally not a normal unit test:

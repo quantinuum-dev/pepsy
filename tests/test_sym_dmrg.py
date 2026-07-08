@@ -397,7 +397,7 @@ def test_symdmrg2_mixer_convergence_deactivates_before_final_sweep(monkeypatch):
         chi=8,
         cutoff=1e-10,
         compute_initial_energy=False,
-        mixer="density_matrix",
+        mixer="subspace",
         mixer_amplitude=1e-4,
         mixer_decay=0.5,
         mixer_disable_after=15,
@@ -2637,7 +2637,7 @@ def test_symdmrg2_subspace_mixer_reaches_ed_from_narrow_initial_support():
         local_eig_ncv=16,
         norm_check="strict",
         norm_check_samples=3,
-        mixer="density_matrix",
+        mixer="subspace",
         mixer_bond_dim=12,
         mixer_amplitude=1e-8,
         mixer_decay=0.5,
@@ -2671,6 +2671,46 @@ def test_symdmrg2_subspace_mixer_reaches_ed_from_narrow_initial_support():
     assert all(diagnostic["expansion_norm"] > 0.0 for diagnostic in local_mixer)
     assert all(diagnostic["expanded_theta_dim"] > diagnostic["theta_dim"] for diagnostic in local_mixer)
     assert {diagnostic["sweep"] for diagnostic in local_mixer} == {0}
+
+
+def test_symdmrg2_density_matrix_mixer_reaches_ed_and_respects_chi():
+    """The White/TeNPy density-matrix mixer preserves the exact solution, opens
+    charge sectors, and never exceeds the requested bond dimension."""
+    pytest.importorskip("symmray")
+    edges = [(site, site + 1) for site in range(3)]
+    occupations = [(1, 0), (0, 1), (1, 0), (0, 1)]
+    state, mpo = _fh_u1u1_chain(4, occupations, bond_dim=2, seed=17, U=1.0, mu=0.1)
+    ed_energy = _fixed_u1u1_sector_ground_energy(
+        4, edges, (2, 2), t=1.0, U=1.0, mu=0.1
+    )
+
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=16,
+        cutoff=1e-12,
+        compute_initial_energy=False,
+        norm_check="off",
+        mixer="density_matrix",
+        mixer_amplitude=1e-4,
+        mixer_decay=0.9,
+        mixer_disable_after=4,
+    )
+    opt.solve(max_sweeps=8, sweep_sequence="RL", tol=1e-12)
+
+    summary = opt.summary()
+    assert summary["mixer"] == "density_matrix"
+    assert opt.state.max_bond() <= 16
+    assert opt.energy == pytest.approx(ed_energy, abs=1e-8)
+    density_matrix_splits = [
+        diagnostic
+        for diagnostic in opt.svd_diagnostics
+        if diagnostic.get("mixer_mode") == "density_matrix"
+    ]
+    assert len(density_matrix_splits) > 0
+    assert all(
+        diagnostic["mixer_svd_expansion"] for diagnostic in density_matrix_splits
+    )
 
 
 def test_symdmrg2_adaptive_sector_enrichment_runs_each_sweep():

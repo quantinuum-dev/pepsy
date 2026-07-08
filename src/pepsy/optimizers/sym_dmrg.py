@@ -438,9 +438,9 @@ def _normalize_mixer(mixer):
         "no": "none",
         "subspace": "subspace_expansion",
         "subspace_expansion": "subspace_expansion",
-        "density_matrix": "subspace_expansion",
-        "density_matrix_mixer": "subspace_expansion",
-        "dm": "subspace_expansion",
+        "density_matrix": "density_matrix",
+        "density_matrix_mixer": "density_matrix",
+        "dm": "density_matrix",
         "mixer": "subspace_expansion",
         "true": "subspace_expansion",
         "yes": "subspace_expansion",
@@ -1509,19 +1509,28 @@ class SymDMRG2:
         Absolute random noise scale used for newly valid blocks during sector
         enrichment.
     mixer
-        Optional Symmray Hamiltonian-aware subspace-expansion mixer. ``"none"``
-        keeps the historical behavior. ``"subspace"`` uses an orthogonalized
-        ``H_eff`` direction to choose an expanded SVD basis while preserving
-        the optimized two-site theta up to truncation. If the target sweep
-        bond dimension exceeds the current MPS bond dimension, the existing
+        Optional Symmray Hamiltonian-aware mixer for escaping poor optimization
+        basins / seeding charge sectors. ``"none"`` keeps the historical
+        behavior. ``"subspace"`` uses an orthogonalized ``H_eff`` direction to
+        choose an expanded SVD basis while preserving the optimized two-site
+        theta up to truncation. ``"density_matrix"`` (aliases ``"dm"``) is the
+        White/TeNPy-style density-matrix mixer: it perturbs the reduced density
+        matrix with the environment-projected Hamiltonian directions (keeping the
+        MPO virtual bond open) as ``rho_mix = rho_theta + amplitude * rho_pert``,
+        then eigendecomposes to a truncated canonical isometry. This opens the
+        charge sectors the truncation would otherwise miss and, benchmarked on
+        periodic Fermi-Hubbard, escapes the mixer-off convergence plateau. It is
+        disabled for the final ``mixer_disable_after`` sweeps so the state
+        relaxes to a clean chi-truncated result. If the target sweep bond
+        dimension exceeds the current MPS bond dimension, the existing
         deterministic variational-sector basis still opens legal charge sectors
         before the sweep.
-        ``"density_matrix"`` is accepted as an alias for this Hubig/TeNPy-style
-        SVD-basis mixer.
     mixer_amplitude, mixer_decay, mixer_disable_after
         Initial mixer amplitude, per-sweep decay factor, and optional sweep
         index at which to disable the mixer. The amplitude at sweep ``s`` is
-        ``mixer_amplitude * mixer_decay**s`` while active.
+        ``mixer_amplitude * mixer_decay**s`` while active. The ``0.9`` decay
+        default keeps the mixer active across the early sweeps; a very fast
+        decay makes the mixer effectively inert.
     mixer_bond_dim
         Reserved compatibility option for older mixer sector-expansion runs.
     canonicalize_init
@@ -1588,7 +1597,7 @@ class SymDMRG2:
         sector_enrichment_seed=0,
         mixer="none",
         mixer_amplitude=1e-4,
-        mixer_decay=0.5,
+        mixer_decay=0.9,
         mixer_disable_after=15,
         mixer_bond_dim=None,
         canonicalize_init=True,
@@ -5417,6 +5426,151 @@ class SymDMRG2:
         theta_opt = _tensor_with_data(theta, _array_with_blocks_like(theta.data, blocks))
         return float(energy.real), theta_opt
 
+    def _density_matrix_reduce(self, tensor, keep):
+        """Reduced density matrix ``rho = sum_complement tensor conj(tensor)``.
+
+        ``keep`` are the indices retained (rows); every other index (including a
+        kept-open MPO virtual bond on the perturbation) is summed over.
+        """
+        prime = {ind: f"{ind}__symdmrg_dm_p" for ind in keep}
+        conj = tensor.conj().reindex(prime, inplace=False)
+        return self._contract_block_pair(tensor, conj)
+
+    def _density_matrix_union_add(self, rho, rho_pert, amplitude):
+        """Return ``rho + amplitude * rho_pert`` over the UNION of block sectors.
+
+        The perturbation opens new charge sectors (the point of the mixer), so a
+        plain same-layout add is not valid; both the block dict and the per-leg
+        index chargemaps are unioned.
+        """
+        indices = []
+        for idx_base, idx_pert in zip(rho.data.indices, rho_pert.data.indices):
+            chargemap = dict(idx_base.chargemap)
+            chargemap.update(dict(idx_pert.chargemap))
+            indices.append(idx_base.copy_with(chargemap=chargemap))
+        indices = tuple(indices)
+
+        base_blocks = rho.data.blocks
+        pert_blocks = rho_pert.data.blocks
+        blocks = {}
+        for sector in set(base_blocks) | set(pert_blocks):
+            base = base_blocks.get(sector)
+            pert = pert_blocks.get(sector)
+            if base is None:
+                blocks[sector] = np.asarray(amplitude * _to_numpy(pert))
+            elif pert is None:
+                blocks[sector] = np.array(_to_numpy(base), copy=True)
+            else:
+                blocks[sector] = np.asarray(
+                    _to_numpy(base) + amplitude * _to_numpy(pert)
+                )
+        data = type(rho.data)(
+            indices=indices,
+            charge=rho.data.charge,
+            blocks=blocks,
+            symmetry=rho.data.symmetry,
+        )
+        return _tensor_with_data(rho, data)
+
+    def _replace_two_site_theta_density_matrix(
+        self, site, theta, *, chi, cutoff, direction, cutoff_mode
+    ):
+        """White/Hubig density-matrix mixer split of a two-site ``theta``.
+
+        Builds a perturbation ``P`` from the sweep-toward projector with the MPO
+        virtual bond kept open, forms ``rho_mix = rho_theta + amp * rho_P`` (union
+        of charge sectors), and eigendecomposes to a truncated canonical isometry.
+        The complementary tensor is recomputed by projecting ``theta`` onto the
+        isometry, so the current ``theta`` is preserved exactly while empty
+        environment-seeded sectors are opened for later sweeps.
+        """
+        profile_start = self._profile_start()
+        right_site = site + 1
+        bond = self._state.bond(site, right_site)
+        left_inds = []
+        if site > 0:
+            left_inds.append(self._state.bond(site - 1, site))
+        left_inds.append(self._site_ind(site))
+        left_inds = tuple(left_inds)
+        right_inds = tuple(ind for ind in theta.inds if ind not in left_inds)
+
+        amplitude = self._active_mixer_amplitude()
+        problem, _ = self._get_projected_problem(site, theta)
+
+        if direction == "right":
+            keep = left_inds
+            projector = problem.left_projector
+        else:
+            keep = right_inds
+            projector = problem.right_projector
+
+        theta_in = theta.reindex(
+            {ind: self._input_ind(ind) for ind in keep}, inplace=False
+        )
+        perturbation = self._contract_block_pair(projector, theta_in)
+
+        rho = self._density_matrix_reduce(theta, keep)
+        rho_pert = self._density_matrix_reduce(perturbation, keep)
+        # The projector leg order can differ from theta's, so align rho_pert to
+        # rho's index order before the (position-wise) union add.
+        rho_pert = rho_pert.transpose(*rho.inds)
+        rho_mix = self._density_matrix_union_add(rho, rho_pert, amplitude)
+
+        split_info = {}
+        isometry, _discard = rho_mix.split(
+            left_inds=keep,
+            method="eigh",
+            absorb="right",
+            max_bond=chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            bond_ind=bond,
+            get="tensors",
+        )
+        if direction == "right":
+            other = self._contract_block_pair(isometry.conj(), theta)
+            left_data, left_ix = isometry.data, isometry.inds
+            right_data, right_ix = other.data, other.inds
+        else:
+            other = self._contract_block_pair(theta, isometry.conj())
+            right_data, right_ix = isometry.data, isometry.inds
+            left_data, left_ix = other.data, other.inds
+
+        truncation_error = _optional_float(split_info.get("error"))
+        self._state[site].modify(data=left_data, inds=left_ix)
+        self._state[right_site].modify(data=right_data, inds=right_ix)
+        self._state.site_ind_id = getattr(self._state, "site_ind_id", "k{}")
+        self.svd_diagnostics.append(
+            {
+                "site": int(site),
+                "right_site": int(right_site),
+                "direction": direction,
+                "bond": bond,
+                "chi": int(chi),
+                "cutoff": float(cutoff),
+                "truncation_error": truncation_error,
+                "mixer_svd_expansion": True,
+                "mixer_mode": "density_matrix",
+                "mixer_amplitude": float(amplitude),
+                "left": self._svd_bond_summary(self._state[site], bond),
+                "right": self._svd_bond_summary(self._state[right_site], bond),
+            }
+        )
+        self._invalidate_projected_problem_cache()
+        self._record_profile_elapsed(
+            "svd_split",
+            profile_start,
+            site=int(site),
+            right_site=int(right_site),
+            chi=int(chi),
+            cutoff=float(cutoff),
+            left_bond_dim=int(self.svd_diagnostics[-1]["left"]["bond_dim"]),
+            right_bond_dim=int(self.svd_diagnostics[-1]["right"]["bond_dim"]),
+            truncation_error=truncation_error,
+            mixer_svd_expansion=True,
+        )
+        return self._state[site], self._state[right_site]
+
     def _replace_two_site_theta(
         self,
         site,
@@ -5428,6 +5582,15 @@ class SymDMRG2:
         method="svd",
         cutoff_mode="rel",
     ):
+        if self.mixer == "density_matrix" and self._should_apply_mixer():
+            return self._replace_two_site_theta_density_matrix(
+                site,
+                theta,
+                chi=chi,
+                cutoff=cutoff,
+                direction=direction,
+                cutoff_mode=cutoff_mode,
+            )
         profile_start = self._profile_start()
         right_site = site + 1
         bond = self._state.bond(site, right_site)
