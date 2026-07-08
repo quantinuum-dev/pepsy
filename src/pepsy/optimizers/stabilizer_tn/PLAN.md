@@ -134,6 +134,16 @@ Ordered by value/effort. None are started.
 ### R4. Sampling & observables
 - Computational-basis shot sampling via `pepsy.MpsSampler` on `|nu>` mapped
   through `C`; batched expectation values.
+- **STATUS: first cut DONE** — `sample_bits(shots, seed)` does chain-rule
+  (sequential `Z`-measurement) sampling on a per-shot copy, and
+  `probability_bits(bits)` returns `|<bits|psi>|^2` as a product of conditional
+  Born probabilities — both `O(n)` MPS measurements instead of an `O(2^n)`
+  statevector. **Next:** batched/tree sampling (avoid the per-shot copy) and a
+  `MpsSampler`-backed path for many shots.
+- **Micro-perf (absorb path): DONE** — the basis-updating measurement's CNOT
+  ladder now pivots on the *median* of the support and merges nearest sites
+  first, minimising the MPS swap distance (`swap_sites_with_compress` was the
+  dominant cost; ~3.6x faster on a spread `n=20` measurement).
 
 ### R5. Packaging & examples
 - Optionally expose `MpsStabOptimizer` at top-level `pepsy.*` + `docs/api/`

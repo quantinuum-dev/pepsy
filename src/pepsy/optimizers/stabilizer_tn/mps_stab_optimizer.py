@@ -89,7 +89,10 @@ def _localizing_clifford(terms, n):
     import stim
 
     support = sorted(terms)
-    pivot = support[0]
+    # Pivot = median of the support: the CNOT ladder swaps every other support
+    # site next to the pivot, so the median minimises the total MPS swap distance
+    # (sum_j |j - pivot|) versus using an endpoint.
+    pivot = support[len(support) // 2]
     ops = []
     for j in support:
         axis = terms[j]
@@ -99,9 +102,9 @@ def _localizing_clifford(terms, n):
             ops.append(("sdg", (j,)))  # S^dag then H maps Y -> Z
             ops.append(("h", (j,)))
         # 'Z' needs no single-qubit rotation
-    for j in support:
-        if j != pivot:
-            ops.append(("cnot", (j, pivot)))  # control j, target k: merge Z_j -> Z_k
+    # Merge nearest support sites first so each swap+split spans the shortest gap.
+    for j in sorted((s for s in support if s != pivot), key=lambda s: abs(s - pivot)):
+        ops.append(("cnot", (j, pivot)))  # control j, target pivot: merge Z_j -> Z_k
     vsim = stim.TableauSimulator()
     vsim.set_num_qubits(n)
     for name, targ in ops:
@@ -310,6 +313,64 @@ class MpsStabOptimizer:
     def pseudo_stabilizer_rank(self, tol: float = 1e-12) -> int:
         """Pseudo-stabilizer rank ``xi_tilde`` = number of non-zero ``nu_i``."""
         return self.state.pseudo_stabilizer_rank(tol=tol)
+
+    def copy(self) -> "MpsStabOptimizer":
+        """Return an independent copy (state deep-copied; queue/history reset)."""
+        return MpsStabOptimizer(
+            self.state.copy(),
+            chi=self.chi,
+            cutoff=self.cutoff,
+            track_infidelity=self.track_infidelity,
+            dtype=self.dtype,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Scalable computational-basis sampling (no 2**n statevector)
+    # ------------------------------------------------------------------ #
+    def sample_bits(self, shots: int = 1, *, seed=None) -> np.ndarray:
+        """Sample computational-basis bitstrings ``x ~ |<x|psi>|**2`` (scalable).
+
+        Chain-rule sampling: on an independent copy per shot, measure
+        ``Z_0 ... Z_{n-1}`` with Born collapse — no ``2**n`` statevector is ever
+        formed.  Returns an ``(shots, n)`` ``int8`` array of 0/1 with qubit ``q``
+        in column ``q`` (qubit 0 first).
+
+        Note: this copies the state per shot (``O(shots * n)`` measurements);
+        batched/tree sampling is a future optimisation.
+        """
+        rng = self._rng if seed is None else np.random.default_rng(seed)
+        shots = int(shots)
+        out = np.empty((shots, self.n), dtype=np.int8)
+        for s in range(shots):
+            tmp = self.copy()
+            tmp._rng = rng
+            for q in range(self.n):
+                out[s, q] = 0 if tmp.measure("Z", q) > 0 else 1
+        return out
+
+    def probability_bits(self, bits) -> float:
+        """Return ``|<bits|psi>|**2`` via chain-rule conditionals (scalable).
+
+        Multiplies the per-qubit conditional Born probabilities along a forced
+        ``Z_0 ... Z_{n-1}`` measurement of a copy, so it costs ``O(n)`` MPS
+        measurements instead of an ``O(2**n)`` statevector.  ``bits`` is a string
+        like ``'010'`` or a 0/1 sequence with qubit ``q`` at position ``q``.
+        """
+        if isinstance(bits, str):
+            bits = [int(c) for c in bits]
+        bits = [int(b) for b in bits]
+        if len(bits) != self.n:
+            raise ValueError(f"bits must have length n={self.n}, got {len(bits)}.")
+        tmp = self.copy()
+        prob = 1.0
+        for q, b in enumerate(bits):
+            exp = tmp.expectation("Z", q)  # <Z_q> in the current (collapsed) state
+            pq = 0.5 * (1.0 + (1 if b == 0 else -1) * exp)
+            if pq <= 0.0:
+                return 0.0
+            prob *= pq
+            tmp.measure("Z", q, outcome=(+1 if b == 0 else -1))
+        return float(prob)
 
     # ------------------------------------------------------------------ #
     # Entry dispatch

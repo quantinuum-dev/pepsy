@@ -814,3 +814,57 @@ def test_measure_absorb_via_stream_entry():
     assert len(sim.measurements) == 1 and sim.measurements[0][2] == +1
     assert sim.expectation("Z", 0) == pytest.approx(1.0, abs=1e-9)
 
+
+# --------------------------------------------------------------------------- #
+# R4: scalable computational-basis sampling / probabilities (no 2**n)
+# --------------------------------------------------------------------------- #
+def test_probability_bits_matches_dense():
+    n = 4
+    sim = MpsStabOptimizer(n, seed=0).apply(
+        [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2), ("t", 1), ("ry", 0.5, 3)]
+    )
+    psi = sim.to_statevector()
+    total = 0.0
+    for k in range(2 ** n):
+        b = format(k, f"0{n}b")
+        assert sim.probability_bits(b) == pytest.approx(abs(psi[k]) ** 2, abs=1e-6)
+        total += sim.probability_bits(b)
+    assert total == pytest.approx(1.0, abs=1e-6)
+
+
+def test_probability_bits_does_not_mutate_state():
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
+    before = sim.to_statevector()
+    sim.probability_bits("010")
+    assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_sample_bits_frequencies_match_dense():
+    n = 3
+    sim = MpsStabOptimizer(n, seed=3).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.9, 2)])
+    probs = np.abs(sim.to_statevector()) ** 2
+    shots = 4000
+    s = sim.sample_bits(shots, seed=7)
+    assert s.shape == (shots, n) and set(np.unique(s)).issubset({0, 1})
+    idx = (s.astype(int) * (1 << np.arange(n - 1, -1, -1))).sum(1)
+    freq = np.bincount(idx, minlength=2 ** n) / shots
+    assert 0.5 * np.abs(freq - probs).sum() < 0.04  # total-variation distance
+
+
+def test_sample_bits_stabilizer_ghz_support():
+    # GHZ only has support on 000 and 111.
+    sim = MpsStabOptimizer.ghz(3)
+    s = sim.sample_bits(500, seed=1)
+    rows = {tuple(r) for r in s.tolist()}
+    assert rows.issubset({(0, 0, 0), (1, 1, 1)})
+
+
+def test_copy_is_independent():
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
+    clone = sim.copy()
+    clone.apply([("x", 0), ("rz", 0.5, 2)])
+    # mutating the clone leaves the original untouched
+    assert _fidelity(sim.to_statevector(),
+                     MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)]).to_statevector()) == pytest.approx(1.0, abs=1e-6)
+    assert clone.state is not sim.state
+
