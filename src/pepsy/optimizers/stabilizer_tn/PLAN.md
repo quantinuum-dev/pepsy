@@ -42,10 +42,12 @@ non-Clifford gates and measurements update `|nu>`.
   `expectation(pauli, where=None)` (also full-register strings like `"ZIZ"`);
   `expectation_pauli_sum(terms)` for `H = sum c_k P_k`; `sample(...)` (Born
   outcomes, no collapse).
-- **Speedups** — `pauli_combo_mpo` windows to the operator's support span
-  (bond-1 identity outside), `_evolve_nu` fuses apply+compress
-  (`mpo.apply(compress=True)`), and `STNState` caches `current_inverse_tableau`
-  (invalidated on basis changes). Stress suite ~40% faster; all 63 tests pass.
+- **Speedups** — non-Clifford rotations/projectors apply a **windowed sub-MPO on
+  its true sites** via `gate_with_submpo_` (`pauli_combo_submpo` + `MatrixProduct
+  Operator(sites=..., L=...)`), so only the `[lo,hi]` region is compressed — cost is
+  O(depth·window), **independent of `n`** for local circuits (n=16/24/32 ~0.28s at
+  fixed depth). `STNState` caches `current_inverse_tableau` (invalidated on basis
+  changes). All 63 tests pass; correctness vs quimb = 1.0.
 
 ## Cross-checked against the reference (bsc-quantic/stabilizer-TN v1.1/v1.2)
 

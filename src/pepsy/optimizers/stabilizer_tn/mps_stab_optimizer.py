@@ -39,9 +39,8 @@ import numpy as np
 from ..mps.optimizer import is_submpo_event, submpo_event_parts
 from ...tensors.core import tn_fidelity
 from .operators import (
-    pauli_combo_mpo,
+    pauli_combo_submpo,
     pauli_matrix,
-    pauli_rotation_mpo,
     single_qubit_combo_matrix,
     single_qubit_rotation_matrix,
 )
@@ -349,34 +348,31 @@ class MpsStabOptimizer:
             self.state.nu.gate_(umat, q, contract=True)
             self._record(0.0)
             return
-        # Multi-qubit Pauli rotation: exact bond-dim-2 MPO over the full chain.
-        axes = [terms.get(i, "I") for i in range(self.n)]
-        mpo = pauli_rotation_mpo(theta, axes, sign=sign, dtype=self.dtype)
-        self._apply_nu_mpo(mpo)
+        # Multi-qubit Pauli rotation: windowed bond-dim-2 sub-MPO applied only on
+        # the support span via gate_with_submpo_ (skips identity sites entirely).
+        c = np.cos(theta / 2)
+        coef = -1j * sign * np.sin(theta / 2)
+        mpo, where = pauli_combo_submpo(c, coef, terms, self.n, dtype=self.dtype)
+        self._record(self._evolve_nu(mpo, where))
 
-    def _apply_nu_mpo(self, mpo) -> None:
-        """Apply a full-length ``|nu>`` MPO exactly, then optionally truncate."""
-        infidelity = self._evolve_nu(mpo)
-        self._record(infidelity)
+    def _evolve_nu(self, mpo, where, *, renormalize: bool = False) -> float:
+        """Apply a windowed sub-MPO to ``|nu>`` on ``where`` (``gate_with_submpo_``).
 
-    def _evolve_nu(self, mpo, *, renormalize: bool = False) -> float:
-        """Apply a full-length MPO to ``|nu>`` (fused apply+compress); return infidelity."""
+        Only the ``[min(where), max(where)]`` region is canonicalized and
+        compressed.  ``max_bond=None`` (exact) is lossless via the cutoff, which
+        stops the bond-dim-2 MPO from doubling the bond on every application.
+        """
         nu = self.state.nu
         if self.track_infidelity and self.chi is not None:
-            # Lossless target then a truncated copy, to measure true infidelity.
-            exact = mpo.apply(nu, compress=True, cutoff=self.cutoff)
-            new = exact.copy()
-            new.compress(max_bond=self.chi, cutoff=self.cutoff)
-            infidelity = max(0.0, float(1.0 - abs(tn_fidelity(new, exact))))
+            target = nu.copy()
+            target.gate_with_submpo_(mpo, where=where, cutoff=self.cutoff)
+            nu.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
+            infidelity = max(0.0, float(1.0 - abs(tn_fidelity(nu, target))))
         else:
-            # Fused apply + compress in one sweep. ``max_bond=None`` (exact) is
-            # lossless via the cutoff, which stops the bond-dim-2 MPO from
-            # doubling |nu>'s bond on every application.
-            new = mpo.apply(nu, compress=True, max_bond=self.chi, cutoff=self.cutoff)
+            nu.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
             infidelity = 0.0
         if renormalize:
-            new.normalize()
-        self.state.nu = new
+            nu.normalize()
         return infidelity
 
     # ------------------------------------------------------------------ #
@@ -495,9 +491,8 @@ class MpsStabOptimizer:
             self.state.nu.normalize()
             self._record(0.0)
             return
-        axes = [terms.get(i, "I") for i in range(self.n)]
-        mpo = pauli_combo_mpo(0.5, coef, axes, dtype=self.dtype)
-        infidelity = self._evolve_nu(mpo, renormalize=True)
+        mpo, where = pauli_combo_submpo(0.5, coef, terms, self.n, dtype=self.dtype)
+        infidelity = self._evolve_nu(mpo, where, renormalize=True)
         self._record(infidelity)
 
     # ------------------------------------------------------------------ #

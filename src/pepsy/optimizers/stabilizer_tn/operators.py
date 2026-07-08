@@ -138,3 +138,48 @@ def pauli_rotation_mpo(
     c = np.cos(theta / 2)
     coef = -1j * sign * np.sin(theta / 2)
     return pauli_combo_mpo(c, coef, paulis, dtype=dtype)
+
+
+def pauli_combo_submpo(
+    c: complex,
+    coef: complex,
+    terms: dict,
+    L: int,
+    *,
+    dtype: str = "complex128",
+):
+    """Windowed sub-MPO for ``c I + coef (prod_i P_i)`` placed on its true sites.
+
+    ``terms`` maps ``site -> 'X'/'Y'/'Z'`` (the non-identity support, size >= 2).
+    The returned MPO spans only the contiguous window ``[min, max]`` of the
+    support and is built on those actual sites (so quimb's
+    ``gate_with_submpo_`` aligns and compresses only that region).
+
+    Returns
+    -------
+    (MatrixProductOperator, tuple[int])
+        The sub-MPO and its support ``where`` (contiguous sites ``lo..hi``).
+    """
+    support = sorted(terms)
+    lo, hi = support[0], support[-1]
+    axes = [terms.get(i, "I") for i in range(lo, hi + 1)]
+    w = len(axes)  # >= 2 by contract (single-support handled by the caller)
+    arrays = []
+    for i, ch in enumerate(axes):
+        pmat = _PAULI[ch]
+        if i == 0:
+            t = np.zeros((2, 2, 2), dtype=complex)  # (right, up, down)
+            t[0] = _I
+            t[1] = pmat
+        elif i == w - 1:
+            t = np.zeros((2, 2, 2), dtype=complex)  # (left, up, down)
+            t[0] = c * _I
+            t[1] = coef * pmat
+        else:
+            t = np.zeros((2, 2, 2, 2), dtype=complex)  # (left, right, up, down)
+            t[0, 0] = _I
+            t[1, 1] = pmat
+        arrays.append(t.astype(dtype))
+    where = tuple(range(lo, hi + 1))
+    mpo = qtn.MatrixProductOperator(arrays, sites=where, L=L, shape="lrud")
+    return mpo, where

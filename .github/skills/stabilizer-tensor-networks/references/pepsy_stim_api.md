@@ -94,15 +94,20 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   statevector. `to_unitary_matrix` is **single precision**, so compare states up to global
   phase with a fidelity tolerance ~1e-6, not 1e-9.
 - **Exact mode must still compress losslessly.** The bond-dim-2 rotation/projector MPO
-  multiplies the `|nu>` bond by 2 on every `mpo.apply`. Use `mpo.apply(nu, compress=True,
-  max_bond=None, cutoff=1e-12)` (fused apply+compress; `max_bond=None` = lossless) to strip
-  the redundant bond back to the true Schmidt rank — otherwise bonds grow as
-  `2^(#rotations)` and blow up memory (observed: 512 GiB alloc, 4-qubit exact run).
-- **Window the combo MPO to the operator's support span.** Outside `[min(support),
-  max(support)]` both branches (`c*I` and `coef*P`) are identity, so the operator factors as
-  `I_outside (x) window-op` and the MPO bond there is 1. `pauli_combo_mpo` builds this
-  automatically (callers still pass full-length axes). `gate_with_submpo_` on a *windowed*
-  MPO does NOT match `mpo.apply` here (observed fidelity 0.939) — stick with `mpo.apply`.
+  multiplies the `|nu>` bond by 2 on every application. Use a cutoff (`1e-12`) with no
+  `max_bond` (exact) so the redundant bond is trimmed back to the true Schmidt rank —
+  otherwise bonds grow as `2^(#rotations)` and blow up memory (observed: 512 GiB alloc).
+- **Windowed `gate_with_submpo_` (fast path) — build the sub-MPO ON its target sites.**
+  quimb's `gate_with_submpo_` aligns the sub-MPO to the MPS by the MPO's OWN site labels
+  (via `gate_with_op_lazy_`); `where` only steers which region is canonicalized/compressed.
+  So a windowed MPO labelled `0..w-1` acts on MPS sites `0..w-1` (WRONG — this caused the
+  earlier fidelity 0.939). Build it on the real sites:
+  `qtn.MatrixProductOperator(arrays, sites=(lo..hi), L=n)`, then
+  `nu.gate_with_submpo_(mpo, where=(lo..hi), max_bond=chi, cutoff=1e-12)`. This only
+  canonicalizes/compresses `[lo,hi]`, so cost is O(depth·window) — **independent of `n`**
+  for local circuits (verified: n=16/24/32 at fixed depth all ~0.28s). `pauli_combo_submpo`
+  builds it. NB `|nu>` is always a proper MPS (only 1-qubit gates + sub-MPOs touch it);
+  never apply a 2-qubit gate to `|nu>` with `contract=True` (it merges sites and breaks it).
 - Keep tests tiny/deterministic (fixed seeds, small $n$), per repo Examples guidance.
 
 ## Reference implementation mapping (bsc-quantic/stabilizer-TN)
