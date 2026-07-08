@@ -671,6 +671,11 @@ class MpsStabOptimizer:
             m = 1 if self._rng.random() < p_o_plus else -1
         else:
             m = 1 if int(outcome) >= 0 else -1
+            prob = p_o_plus if m > 0 else (1.0 - p_o_plus)
+            if prob < 1e-12:
+                raise ValueError(
+                    f"forced outcome {outcome} has ~0 probability ({prob:.2e})."
+                )
         zval = m * s  # required Z_k eigenvalue (+1 -> |0>, -1 -> |1>)
         self._project_computational_site(k, 0 if zval > 0 else 1)
         self._record(infidelity)
@@ -726,62 +731,73 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Magic-state injection (R1)
     # ------------------------------------------------------------------ #
-    def prepare_magic(self, ancilla, *, state: str = "T") -> "MpsStabOptimizer":
-        """Prepare the magic state ``|A> = T|+>`` on a fresh ``|0>`` ancilla site.
+    def prepare_magic(self, ancilla, *, angle: float = math.pi / 4) -> "MpsStabOptimizer":
+        """Prepare the magic state ``|M> = Rz(angle)|+>`` on a fresh ``|0>`` ancilla.
 
-        ``state="T"`` prepares ``|A> = T H|0> = (|0> + e^{i pi/4}|1>)/sqrt(2)``,
-        the resource consumed by :meth:`inject_t`.  The ancilla **must currently
-        be** ``|0>`` — freshly initialised, or just returned to ``|0>`` by
-        :meth:`reset` (so ancillas can be recycled).  Implemented physically as a
-        Clifford ``H`` (tableau only) followed by the ``T`` rotation; on a
-        decoupled ``|0>`` qubit this keeps ``|nu>`` compact (chi=1 in the
-        identity-basis case).
+        The default ``angle = pi/4`` gives the ``T`` resource
+        ``|A> = (|0> + e^{i pi/4}|1>)/sqrt(2)`` consumed by :meth:`inject_t`; use
+        the matching ``angle`` for :meth:`inject_rz`.  The ancilla **must
+        currently be** ``|0>`` — freshly initialised, or just returned to ``|0>``
+        by :meth:`reset` (so ancillas can be recycled).  Implemented physically as
+        a Clifford ``H`` (tableau only) followed by the ``Rz(angle)`` rotation; on
+        a decoupled ``|0>`` qubit this keeps ``|nu>`` compact.
         """
-        if state != "T":
-            raise ValueError("only the 'T' magic state |A> is supported.")
         a = int(ancilla)
         self.state.apply_clifford("h", a)  # |0> -> |+>, Clifford (tableau only)
         self._record(0.0)
-        self._apply_rotation("t", (a,))    # |+> -> T|+> = |A>, non-Clifford on |nu>
+        self._apply_rotation("rz", (float(angle), a))  # |+> -> Rz(angle)|+> = |M>
         return self
 
-    def inject_t(self, data, ancilla, *, outcome: Optional[int] = None) -> int:
-        """Apply ``T`` to ``data`` by consuming a magic ancilla (gate teleportation).
+    def inject_rz(self, data, ancilla, phi, *, outcome: Optional[int] = None) -> int:
+        """Apply ``Rz(phi)`` to ``data`` by magic-state injection (gate teleportation).
 
-        Implements R1 magic-state injection.  The ``ancilla`` must already hold
-        the ``|A>`` magic state (call :meth:`prepare_magic` first).  Steps:
+        Generalises :meth:`inject_t`.  ``phi`` must be a multiple of ``pi/4`` so
+        the outcome correction ``Rz(2*phi)`` is Clifford; other angles require a
+        recursive / repeat-until-success gadget (not implemented).  The
+        ``ancilla`` must already hold the matching magic state
+        ``|M> = Rz(phi)|+>`` (call ``prepare_magic(ancilla, angle=phi)`` first).
 
-        1. ``CNOT(control=data, target=ancilla)`` — Clifford, updates the tableau
-           only (free; ``|nu>`` untouched).
-        2. Measure the ancilla in ``Z`` with :meth:`measure` ``absorb_basis=True``
-           so it disentangles from ``|nu>``.
-        3. If the outcome is ``-1`` (ancilla ``|1>``), apply the Clifford ``S``
-           correction on ``data`` — also free.
-
-        The net channel on ``data`` is ``T`` (up to a global phase), while the
-        non-Clifford cost stays confined to the pre-loaded magic ancilla rather
-        than growing ``|nu>`` via a direct ``T`` rotation.
-
-        Parameters
-        ----------
-        data, ancilla : int
-            Data qubit to apply ``T`` to and the magic ancilla to consume.
-        outcome : int | None
-            If given (``+1``/``-1``), post-select the ancilla measurement instead
-            of Born sampling.
+        Steps: ``CNOT(control=data, target=ancilla)`` (Clifford, tableau only);
+        basis-updating ``Z`` measurement of the ancilla (disentangles it from
+        ``|nu>``); if the outcome is ``-1`` apply the Clifford ``Rz(2*phi)``
+        correction on ``data``.  The net channel on ``data`` is ``Rz(phi)`` (up to
+        a global phase), keeping the non-Clifford cost on the pre-loaded ancilla.
 
         Returns the ancilla measurement eigenvalue ``+1``/``-1``.
         """
+        phi = float(phi)
+        k = phi / (math.pi / 4)
+        if abs(k - round(k)) > 1e-9:
+            raise ValueError(
+                "inject_rz requires phi a multiple of pi/4 (so the Rz(2*phi) "
+                "correction is Clifford); general angles need a recursive gadget "
+                "(not implemented)."
+            )
         data, ancilla = int(data), int(ancilla)
         # CNOT(control=data, target=ancilla): Clifford, tableau only.
         self.state.apply_clifford("cnot", data, ancilla)
         self._record(0.0)
         # Measure the ancilla in Z, absorbing it out of |nu>.
         m = self.measure("Z", ancilla, absorb_basis=True, outcome=outcome)
-        if m < 0:  # ancilla collapsed to |1>: outcome-conditioned S correction.
-            self.state.apply_clifford("s", data)
-            self._record(0.0)
+        if m < 0:  # ancilla collapsed to |1>: outcome-conditioned Rz(2*phi) correction.
+            self._apply_rotation("rz", (2.0 * phi, data))
         return m
+
+    def inject_t(self, data, ancilla, *, outcome: Optional[int] = None) -> int:
+        """Apply ``T`` to ``data`` by consuming a magic ancilla (``inject_rz`` at ``pi/4``).
+
+        The ``ancilla`` must already hold ``|A> = T|+>`` (call :meth:`prepare_magic`
+        first).  See :meth:`inject_rz` for the gadget; here the correction is the
+        Clifford ``S``.  Returns the ancilla measurement eigenvalue ``+1``/``-1``.
+        """
+        return self.inject_rz(data, ancilla, math.pi / 4, outcome=outcome)
+
+    def inject_tdg(self, data, ancilla, *, outcome: Optional[int] = None) -> int:
+        """Apply ``T-dagger`` via injection (``inject_rz`` at ``-pi/4``; correction ``S-dag``).
+
+        The ``ancilla`` must hold ``T-dag|+>`` (``prepare_magic(ancilla, angle=-pi/4)``).
+        """
+        return self.inject_rz(data, ancilla, -math.pi / 4, outcome=outcome)
 
     # ------------------------------------------------------------------ #
     # Explicit gate matrices

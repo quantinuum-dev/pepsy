@@ -868,3 +868,63 @@ def test_copy_is_independent():
                      MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)]).to_statevector()) == pytest.approx(1.0, abs=1e-6)
     assert clone.state is not sim.state
 
+
+# --------------------------------------------------------------------------- #
+# Robust: general Rz(phi) injection (pi/4 multiples) + edge guards
+# --------------------------------------------------------------------------- #
+def _rz(theta):
+    return np.diag([np.exp(-1j * theta / 2), np.exp(1j * theta / 2)]).astype(complex)
+
+
+@pytest.mark.parametrize("phi", [np.pi / 4, -np.pi / 4, np.pi / 2, 3 * np.pi / 4])
+@pytest.mark.parametrize("outcome", [+1, -1])
+def test_inject_rz_matches_dense(phi, outcome):
+    sim = MpsStabOptimizer(2)
+    sim.state.h(0)                       # data -> |+>
+    sim.prepare_magic(1, angle=phi)      # ancilla -> Rz(phi)|+>
+    m = sim.inject_rz(0, 1, phi, outcome=outcome)
+    assert m == outcome
+    # dense reference of the same gadget with the same outcome
+    plus = _H @ np.array([1, 0], complex)
+    psi = np.kron(plus, _rz(phi) @ plus)
+    psi = _apply_gate_dense(psi, _CNOT, (0, 1), 2)
+    bit = 0 if m > 0 else 1
+    proj = np.zeros((2, 2), complex); proj[bit, bit] = 1.0
+    psi = _apply_gate_dense(psi, proj, (1,), 2)
+    psi = psi / np.linalg.norm(psi)
+    if m < 0:
+        psi = _apply_gate_dense(psi, _rz(2 * phi), (0,), 2)
+    assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-6)
+    # data qubit is Rz(phi)|+> regardless of branch
+    ref = np.kron(_rz(phi) @ plus, np.array([1, 0], complex) if bit == 0 else np.array([0, 1], complex))
+    assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("outcome", [+1, -1])
+def test_inject_tdg_matches_tdg(outcome):
+    sim = MpsStabOptimizer(2)
+    sim.state.h(0)
+    sim.prepare_magic(1, angle=-np.pi / 4)
+    sim.inject_tdg(0, 1, outcome=outcome)
+    plus = _H @ np.array([1, 0], complex)
+    tdg_plus = _T.conj().T @ plus
+    full = sim.to_statevector().reshape(2, 2)
+    data_vec = full[:, 0] if np.linalg.norm(full[:, 0]) > np.linalg.norm(full[:, 1]) else full[:, 1]
+    assert _fidelity(data_vec, tdg_plus) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_inject_rz_rejects_non_pi4_angle():
+    sim = MpsStabOptimizer(2)
+    sim.state.h(0)
+    sim.prepare_magic(1, angle=0.3)
+    with pytest.raises(ValueError, match="multiple of pi/4"):
+        sim.inject_rz(0, 1, 0.3)
+
+
+def test_absorb_measure_forced_impossible_raises():
+    # GHZ: forcing Z0 = -1 while Z1 = +1 is impossible (they are perfectly correlated).
+    sim = MpsStabOptimizer(2).apply([("h", 0), ("cnot", 0, 1)])
+    sim.measure("Z", 0, outcome=+1, absorb_basis=True)   # collapse to |00>
+    with pytest.raises(ValueError, match="0 probability"):
+        sim.measure("Z", 1, outcome=-1, absorb_basis=True)
+

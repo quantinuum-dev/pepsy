@@ -100,10 +100,11 @@ Ordered by value/effort. None are started.
 - **STATUS: first cut DONE** — `prepare_magic` + `inject_t` (built on the R3
   basis-updating measurement). Only the `T` gate is covered so far, because its
   correction `S = Rz(2*pi/4)` is Clifford. **Next:**
-  - General diagonal `Rz(phi)` injection: the correction `Rz(2 phi)` is
-    non-Clifford for `phi` not a multiple of `pi/4` -> needs a *recursive* /
-    repeat-until-success gadget (inject another magic state for the correction),
-    or a fresh magic type per rotation angle.
+  - General diagonal `Rz(phi)` injection: **DONE for `phi` a multiple of `pi/4`**
+    via `inject_rz(data, ancilla, phi)` (+ `inject_t`/`inject_tdg` wrappers;
+    `prepare_magic(a, angle=phi)`), where the correction `Rz(2*phi)` is Clifford.
+    Angles that are *not* a multiple of `pi/4` still need a *recursive* /
+    repeat-until-success gadget (raises for now).
   - Preallocate a magic-ancilla register + a `t_via_injection`/circuit-rewrite
     front end that replaces every `("t", q)` stream entry with an injection so a
     T-doped circuit never touches the `|nu>` rotation path.
