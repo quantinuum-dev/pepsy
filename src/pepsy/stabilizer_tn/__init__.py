@@ -1,0 +1,32 @@
+"""Stabilizer Tensor Network (STN) simulator.
+
+Implementation of Masot-Llima & Garcia-Saez, *Stabilizer Tensor Networks:
+universal quantum simulator on a basis of stabilizer states*, PRL 133, 230601
+(2024), arXiv:2403.08724.
+
+A state is stored as
+
+    |psi> = sum_i nu_i  d_hat_i |psi_S>
+
+i.e. a **stabilizer basis** ``B(S, D)`` (a tableau of ``n`` stabilizer + ``n``
+destabilizer generators, tracked with :mod:`stim`) times a **coefficient state**
+``|nu>`` (an ``n``-qubit MPS from :mod:`pepsy`/:mod:`quimb`).
+
+This module currently provides the state container :class:`STNState`, the
+Clifford update rule (which changes only the basis, leaving ``|nu>``
+unchanged), and :class:`StabilizerMps`, an :class:`pepsy.MpsOptimizer`-style
+gate-stream simulator supporting Clifford gates, non-Clifford Pauli rotations,
+explicit gate matrices, and sub-MPO events.
+"""
+
+from .mpo import pauli_combo_mpo, pauli_rotation_mpo, single_qubit_rotation_matrix
+from .simulator import StabilizerMps
+from .state import STNState
+
+__all__ = [
+    "STNState",
+    "StabilizerMps",
+    "pauli_combo_mpo",
+    "pauli_rotation_mpo",
+    "single_qubit_rotation_matrix",
+]
