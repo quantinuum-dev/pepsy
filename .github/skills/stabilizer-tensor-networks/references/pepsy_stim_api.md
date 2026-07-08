@@ -94,10 +94,15 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   statevector. `to_unitary_matrix` is **single precision**, so compare states up to global
   phase with a fidelity tolerance ~1e-6, not 1e-9.
 - **Exact mode must still compress losslessly.** The bond-dim-2 rotation/projector MPO
-  multiplies the `|nu>` bond by 2 on every `mpo.apply`. Even with no `chi` cap, call
-  `nu.compress(cutoff=1e-12)` (no `max_bond`) after each apply to strip the redundant bond
-  back to the true Schmidt rank — otherwise bonds grow as `2^(#rotations)` and blow up
-  memory (observed: 512 GiB alloc, 4-qubit exact run).
+  multiplies the `|nu>` bond by 2 on every `mpo.apply`. Use `mpo.apply(nu, compress=True,
+  max_bond=None, cutoff=1e-12)` (fused apply+compress; `max_bond=None` = lossless) to strip
+  the redundant bond back to the true Schmidt rank — otherwise bonds grow as
+  `2^(#rotations)` and blow up memory (observed: 512 GiB alloc, 4-qubit exact run).
+- **Window the combo MPO to the operator's support span.** Outside `[min(support),
+  max(support)]` both branches (`c*I` and `coef*P`) are identity, so the operator factors as
+  `I_outside (x) window-op` and the MPO bond there is 1. `pauli_combo_mpo` builds this
+  automatically (callers still pass full-length axes). `gate_with_submpo_` on a *windowed*
+  MPO does NOT match `mpo.apply` here (observed fidelity 0.939) — stick with `mpo.apply`.
 - Keep tests tiny/deterministic (fixed seeds, small $n$), per repo Examples guidance.
 
 ## Reference implementation mapping (bsc-quantic/stabilizer-TN)

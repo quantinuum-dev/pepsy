@@ -38,6 +38,14 @@ non-Clifford gates and measurements update `|nu>`.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports running chi
   and cumulative infidelity); `norm()` returns the `|nu>` norm.
 - `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
+- **Amplitude / observable API** — `amplitude(bits)`/`probability(bits)`;
+  `expectation(pauli, where=None)` (also full-register strings like `"ZIZ"`);
+  `expectation_pauli_sum(terms)` for `H = sum c_k P_k`; `sample(...)` (Born
+  outcomes, no collapse).
+- **Speedups** — `pauli_combo_mpo` windows to the operator's support span
+  (bond-1 identity outside), `_evolve_nu` fuses apply+compress
+  (`mpo.apply(compress=True)`), and `STNState` caches `current_inverse_tableau`
+  (invalidated on basis changes). Stress suite ~40% faster; all 63 tests pass.
 
 ## Cross-checked against the reference (bsc-quantic/stabilizer-TN v1.1/v1.2)
 

@@ -68,23 +68,63 @@ def pauli_combo_mpo(
             "pauli_combo_mpo requires >= 2 sites; use "
             "single_qubit_combo_matrix for a single-site operator."
         )
+    # Window to the support span: outside [lo, hi] both branches (c*I and coef*P)
+    # are identity, so the operator factors as I_outside (x) window-operator and
+    # the MPO bond there is 1.  This keeps ``mpo.apply`` cheap for local operators.
+    support = [i for i, ch in enumerate(axes) if ch != "I"]
+    if not support:  # pure-identity operator (c + coef) * I (degenerate)
+        lo = hi = 0
+    else:
+        lo, hi = support[0], support[-1]
+
     arrays = []
     for i, ch in enumerate(axes):
         pmat = _PAULI[ch]
-        if i == 0:
-            w = np.zeros((2, 2, 2), dtype=complex)  # (right, up, down)
-            w[0] = _I
-            w[1] = pmat
-        elif i == L - 1:
-            w = np.zeros((2, 2, 2), dtype=complex)  # (left, up, down)
-            w[0] = c * _I
-            w[1] = coef * pmat
-        else:
+        if not support:
+            op = (c + coef) * _I
+            w = _boundary(op, i, L)
+        elif i < lo or i > hi:  # bond-1 identity outside the support span
+            w = _boundary(_I, i, L)
+        elif lo == hi:  # single-site window carries the whole combo
+            w = _boundary(c * _I + coef * pmat, i, L)
+        elif i == lo:  # open the two channels: left bond 1, right bond 2
+            if i == 0:
+                w = np.zeros((2, 2, 2), dtype=complex)  # (right, up, down)
+                w[0] = _I
+                w[1] = pmat
+            else:
+                w = np.zeros((1, 2, 2, 2), dtype=complex)  # (left, right, up, down)
+                w[0, 0] = _I
+                w[0, 1] = pmat
+        elif i == hi:  # close the channels: left bond 2, right bond 1
+            if i == L - 1:
+                w = np.zeros((2, 2, 2), dtype=complex)  # (left, up, down)
+                w[0] = c * _I
+                w[1] = coef * pmat
+            else:
+                w = np.zeros((2, 1, 2, 2), dtype=complex)  # (left, right, up, down)
+                w[0, 0] = c * _I
+                w[1, 0] = coef * pmat
+        else:  # middle of the window: bond 2
             w = np.zeros((2, 2, 2, 2), dtype=complex)  # (left, right, up, down)
             w[0, 0] = _I
             w[1, 1] = pmat
         arrays.append(w.astype(dtype))
     return qtn.MatrixProductOperator(arrays, shape="lrud")
+
+
+def _boundary(op: np.ndarray, i: int, L: int) -> np.ndarray:
+    """Return a bond-1 MPO site tensor carrying single-site operator ``op``."""
+    if i == 0:
+        w = np.zeros((1, 2, 2), dtype=complex)  # (right, up, down)
+        w[0] = op
+    elif i == L - 1:
+        w = np.zeros((1, 2, 2), dtype=complex)  # (left, up, down)
+        w[0] = op
+    else:
+        w = np.zeros((1, 1, 2, 2), dtype=complex)  # (left, right, up, down)
+        w[0, 0] = op
+    return w
 
 
 def pauli_rotation_mpo(

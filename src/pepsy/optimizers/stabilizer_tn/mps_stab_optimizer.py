@@ -326,7 +326,7 @@ class MpsStabOptimizer:
         dim = pmat.shape[0]
         umat = np.cos(theta / 2) * np.eye(dim) - 1j * np.sin(theta / 2) * pmat
         tableau = stim.Tableau.from_unitary_matrix(umat, endian="big")
-        self.state._sim.do_tableau(tableau, list(where))
+        self.state.do_tableau(tableau, where)
         self._record(0.0)
 
     def _apply_rotation(self, name, params) -> None:
@@ -360,21 +360,20 @@ class MpsStabOptimizer:
         self._record(infidelity)
 
     def _evolve_nu(self, mpo, *, renormalize: bool = False) -> float:
-        """Apply a full-length MPO to ``|nu>``; truncate/renormalize; return infidelity."""
-        exact = mpo.apply(self.state.nu)
-        if self.chi is None:
-            # Lossless compression: strip the redundant bond dimension introduced
-            # by the bond-dim-2 MPO (keeps |nu> at its true Schmidt rank, which is
-            # otherwise multiplied by 2 on every application).
-            new = exact
-            new.compress(cutoff=self.cutoff)
-            infidelity = 0.0
-        else:
+        """Apply a full-length MPO to ``|nu>`` (fused apply+compress); return infidelity."""
+        nu = self.state.nu
+        if self.track_infidelity and self.chi is not None:
+            # Lossless target then a truncated copy, to measure true infidelity.
+            exact = mpo.apply(nu, compress=True, cutoff=self.cutoff)
             new = exact.copy()
             new.compress(max_bond=self.chi, cutoff=self.cutoff)
+            infidelity = max(0.0, float(1.0 - abs(tn_fidelity(new, exact))))
+        else:
+            # Fused apply + compress in one sweep. ``max_bond=None`` (exact) is
+            # lossless via the cutoff, which stops the bond-dim-2 MPO from
+            # doubling |nu>'s bond on every application.
+            new = mpo.apply(nu, compress=True, max_bond=self.chi, cutoff=self.cutoff)
             infidelity = 0.0
-            if self.track_infidelity:
-                infidelity = max(0.0, float(1.0 - abs(tn_fidelity(new, exact))))
         if renormalize:
             new.normalize()
         self.state.nu = new
@@ -521,7 +520,7 @@ class MpsStabOptimizer:
             tableau = None
 
         if tableau is not None:  # Clifford -> tableau update
-            self.state._sim.do_tableau(tableau, list(where))
+            self.state.do_tableau(tableau, where)
             self._record(0.0)
             return
 

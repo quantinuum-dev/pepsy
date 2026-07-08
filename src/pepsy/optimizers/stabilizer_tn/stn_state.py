@@ -72,6 +72,7 @@ class STNState:
         self.dtype = dtype
         self._sim = stim.TableauSimulator()
         self._sim.set_num_qubits(n)
+        self._inv_tableau = None
         # Coefficient state |nu> = |0...0>, an MPS with chi = 1.
         self.nu = ps_to_mps(n, dtype=dtype)
 
@@ -125,6 +126,7 @@ class STNState:
         sim.set_num_qubits(new.n)
         new._sim = sim
         new.nu = nu
+        new._inv_tableau = None
         return new
 
     # ------------------------------------------------------------------ #
@@ -145,7 +147,14 @@ class STNState:
         new.dtype = self.dtype
         new._sim = self._sim.copy()
         new.nu = self.nu.copy()
+        new._inv_tableau = None
         return new
+
+    def do_tableau(self, tableau, targets) -> "STNState":
+        """Apply a stim Clifford tableau to the basis on ``targets`` (|nu> unchanged)."""
+        self._sim.do_tableau(tableau, list(targets))
+        self._inv_tableau = None
+        return self
 
     def nu_frame_pauli(self, phys_pauli):
         """Return ``C^dagger P C`` for a physical Pauli ``P`` (a stim.PauliString).
@@ -154,9 +163,12 @@ class STNState:
         Pauli operator: for ``|psi> = C|nu>``, a physical operator ``O`` acts as
         ``C^dagger O C`` on ``|nu>``.  For a Pauli ``P`` this is again a signed
         Pauli string (the basis is a Clifford change of basis), obtained by
-        conjugating through the current tableau.
+        conjugating through the current tableau.  The inverse tableau is cached
+        and invalidated whenever the basis changes.
         """
-        return self._sim.current_inverse_tableau()(phys_pauli)
+        if getattr(self, "_inv_tableau", None) is None:
+            self._inv_tableau = self._sim.current_inverse_tableau()
+        return self._inv_tableau(phys_pauli)
 
     # ------------------------------------------------------------------ #
     # Clifford update (basis only; |nu> unchanged)
@@ -193,6 +205,7 @@ class STNState:
                     f"Qubit index {q!r} out of range for {self.n}-qubit state."
                 )
         getattr(self._sim, method_name)(*(int(q) for q in targets))
+        self._inv_tableau = None
         return self
 
     def apply_clifford_circuit(
