@@ -164,6 +164,27 @@ class STNState:
         self._inv_tableau = None
         return self
 
+    def absorb_basis_clifford(self, v_tableau) -> "STNState":
+        """Absorb ``V^dagger`` into the basis: ``C -> C V^dagger`` (|psi> preserved).
+
+        Used by the basis-updating measurement: if a Clifford ``V`` has been
+        applied to the coefficient MPS ``p`` (``p -> V p``), absorbing ``V^dagger``
+        into the basis keeps ``|psi> = C p`` invariant, because
+        ``(C V^dagger)(V p) = C p``.  ``v_tableau`` is the :class:`stim.Tableau`
+        of ``V``.
+        """
+        import stim
+
+        c_tab = self._sim.current_inverse_tableau().inverse()
+        # Operator ``C V^dagger`` = "apply V^dagger first, then C".
+        c_new = v_tableau.inverse().then(c_tab)
+        new_sim = stim.TableauSimulator()
+        new_sim.set_num_qubits(self.n)
+        new_sim.do_tableau(c_new, list(range(self.n)))
+        self._sim = new_sim
+        self._inv_tableau = None
+        return self
+
     def frame_pauli(self, phys_pauli):
         """Return ``C^dagger P C`` for a physical Pauli ``P`` (a stim.PauliString).
 

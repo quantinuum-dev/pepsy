@@ -37,6 +37,21 @@ are kept as back-compat aliases.
 - **Measurement (Lemma 3)** — `expectation` = `<nu|M|nu>`; `measure` collapses
   with the fixed-basis projector `(I +- M)/2` + renormalize; Born sampling +
   forced outcomes; `("measure", ...)` stream entry.
+- **Basis-updating (canonical) measurement** — `measure(..., absorb_basis=True)`:
+  a Clifford `V` localises the frame image `M = C^dagger O C` to a single
+  coefficient qubit (`V M V^dagger = +-Z_k`, built via `_localizing_clifford`),
+  `V` is applied to `|nu>` and `V^dagger` absorbed into the basis
+  (`STNState.absorb_basis_clifford`, `|psi>` preserved), then qubit `k` is
+  projected to a definite value — so the measured qubit **leaves** `|nu>`
+  (disentangled). Validated to match the fixed-basis form (fidelity 1.0) and a
+  dense projector across Z/X/Y/ZZ and both outcomes. This is R3 below.
+- **Magic-state injection (R1, T-gate)** — `prepare_magic(a)` loads the
+  offline-prepared `|A> = T|+>` onto a fresh coefficient site (product, chi=1);
+  `inject_t(data, ancilla)` teleports a `T` via `CNOT` (tableau) +
+  basis-updating `Z`-measurement of the ancilla + conditional Clifford `S`. The
+  ancilla's magic is consumed and absorbed out of `|nu>`. Validated == direct
+  `T` (dense) for both outcomes, including on a Clifford-entangled data register
+  with `|nu>` bond staying bounded.
 - **Sub-MPO events** — `("submpo", mpo, where)` applied to `p` (coefficient
   frame; any MPO, unitary or not), matching the `MpsOptimizer` contract. A
   *physical*-frame few-qubit operator goes through a dense `(matrix, where)`
@@ -82,6 +97,18 @@ Ordered by value/effort. None are started.
 - Impact: turns our exact non-Clifford path from chi-growing into poly-scaling for
   T-doped circuits. Needs an ancilla-qubit + measurement-conditioned Clifford
   correction protocol layered on `MpsStabOptimizer`.
+- **STATUS: first cut DONE** — `prepare_magic` + `inject_t` (built on the R3
+  basis-updating measurement). Only the `T` gate is covered so far, because its
+  correction `S = Rz(2*pi/4)` is Clifford. **Next:**
+  - General diagonal `Rz(phi)` injection: the correction `Rz(2 phi)` is
+    non-Clifford for `phi` not a multiple of `pi/4` -> needs a *recursive* /
+    repeat-until-success gadget (inject another magic state for the correction),
+    or a fresh magic type per rotation angle.
+  - Preallocate a magic-ancilla register + a `t_via_injection`/circuit-rewrite
+    front end that replaces every `("t", q)` stream entry with an injection so a
+    T-doped circuit never touches the `|nu>` rotation path.
+  - Benchmark: T-doped-Clifford circuit at large `N`, fixed `t` — show `|nu>`
+    bond bounded by ~`2^t` independent of `N` (paper Fig. 2).
 
 ### R2. Clifford disentangling sweep (repo-aligned)
 - CAMPS: Qian, Huang, Qin, PRL 133, 190402 (arXiv:2405.09217); Clifford-dressed
@@ -97,6 +124,12 @@ Ordered by value/effort. None are started.
   the stabilizer group and project qubit `k` to `|0>`, keeping `|nu>` support
   compact. Add as `measure(..., absorb_basis=True)` (keep fixed-basis default).
 - Impact: smaller `|nu>` after measurement-heavy circuits. Low/medium effort.
+- **STATUS: DONE** — `measure(..., absorb_basis=True)` localises `M` with a
+  Clifford `V` (`_localizing_clifford`), applies `V` to `|nu>`, absorbs
+  `V^dagger` into the basis (`STNState.absorb_basis_clifford`), and single-site
+  projects/disentangles the pivot qubit. Fixed-basis remains the default.
+  Follow-ups: choose the pivot / CNOT-ladder to minimise the transient bond
+  (currently `k = min(support)`); reuse the R2 disentangler to pre-localise `M`.
 
 ### R4. Sampling & observables
 - Computational-basis shot sampling via `pepsy.MpsSampler` on `|nu>` mapped

@@ -84,9 +84,18 @@ This collapses all of Lemma 2/3's $I_x,I_y,I_z$ mask algebra into one call:
 - **Non-Clifford rotation** $\exp(-i\theta/2\,O) \to \exp(-i\theta/2\,M)$ on $|\nu\rangle$.
 - **Measurement** $\langle O\rangle = \langle\nu|M|\nu\rangle$; collapse projector
   $\tfrac{I\pm O}{2}\to\tfrac{I\pm M}{2}$ on $|\nu\rangle$ (basis fixed), then renormalize.
-  This fixed-basis collapse is equivalent to the paper's basis-updating form and is
-  self-consistent (repeated measurement is deterministic); it does not absorb $O$ into the
-  stabilizer group (a possible future efficiency optimization).
+  This fixed-basis collapse is `measure(pauli, where)` (the default), is self-consistent
+  (repeated measurement is deterministic), and does **not** absorb $O$ into the stabilizer
+  group. The **basis-updating** form is `measure(pauli, where, absorb_basis=True)`: a
+  Clifford $V$ localizes $M=C^\dagger O C$ to $\pm Z_k$, is applied to $|\nu\rangle$ with
+  $V^\dagger$ absorbed into the basis ($|\psi\rangle$ preserved), and qubit $k$ is projected
+  out — so the measured qubit **disentangles from** $|\nu\rangle$.
+- **Reset / injection** built on the basis-updating measurement: `reset(where)` returns
+  qubit(s) to $|0\rangle$ (disentangled); `prepare_magic(a)` + `inject_t(data, a)` apply a
+  `T` by magic-state gate teleportation (Clifford `CNOT` + $Z$-measure + conditional `S`),
+  keeping the non-Clifford cost on the pre-loaded ancilla rather than growing $|\nu\rangle$.
+  Stream entries: `("measure", pauli, where[, outcome[, absorb_basis]])` and
+  `("reset", where)`.
 
 Both $\exp(-i\theta/2\,M)$ and $\tfrac{I\pm M}{2}$ are exact **bond-dim-2 MPOs**
 (`c·I + coef·P`) built by `pepsy.optimizers.stabilizer_tn.operators.pauli_combo_mpo`; apply via
@@ -99,7 +108,11 @@ is a multiple of $\pi/2$ are Clifford and route to the tableau (free, χ unchang
 The prioritized roadmap (magic state injection, Clifford disentangling sweep,
 basis-updating measurement, sampling, packaging) lives in
 `src/pepsy/optimizers/stabilizer_tn/PLAN.md`, with citations from the PRL-133-230601 citation scan.
-When extending the simulator, update that PLAN and add a dense-validated test.
+**R3 (basis-updating measurement) and a first cut of R1 (magic-state injection, `T`-gate
+only) are done** (`absorb_basis=True`, `reset`, `prepare_magic`/`inject_t`); the open R1
+work is general $R_z(\phi)$ injection (recursive gadget) and a large-$N$/fixed-$t$
+poly-scaling benchmark. When extending the simulator, update that PLAN and add a
+dense-validated test.
 
 ## Implementation Workflow
 

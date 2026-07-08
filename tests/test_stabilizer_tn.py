@@ -637,3 +637,180 @@ def test_sample_statistics_no_collapse():
     # sampling did not collapse the state
     assert sim.expectation("Z", 0) == pytest.approx(np.cos(theta), abs=1e-6)
 
+
+# --------------------------------------------------------------------------- #
+# Basis-updating (absorb) measurement + R1 magic-state injection
+# --------------------------------------------------------------------------- #
+_CNOT = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], complex)
+_S = np.diag([1, 1j]).astype(complex)
+_MAGIC = np.array([1.0, np.exp(1j * np.pi / 4)], complex) / np.sqrt(2)
+
+
+def _absorb_stream(n, seed, depth=6):
+    """A random Clifford + non-Clifford stream that gives a nontrivial |nu>."""
+    rng = np.random.default_rng(seed)
+    cliff = ["h", "s", "sdg", "x", "y", "z"]
+    stream = []
+    for _ in range(depth):
+        for q in range(n):
+            stream.append((rng.choice(cliff), q))
+        for q in range(n - 1):
+            if rng.random() < 0.5:
+                stream.append(("cnot", q, q + 1))
+        stream.append(("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
+        stream.append(("rx", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
+    return stream
+
+
+@pytest.mark.parametrize("seed", [0, 1, 4, 7])
+@pytest.mark.parametrize("pauli,where", [("Z", 2), ("X", 1), ("Y", 0), ("ZZ", (1, 3))])
+@pytest.mark.parametrize("outcome", [+1, -1])
+def test_measure_absorb_matches_fixed_basis(seed, pauli, where, outcome):
+    n = 4
+    stream = _absorb_stream(n, seed)
+    ref = MpsStabOptimizer(n).apply(stream)
+    # skip (near) impossible forced outcomes
+    p_plus = 0.5 * (1 + ref.expectation(pauli, where))
+    if (outcome > 0 and p_plus < 1e-6) or (outcome < 0 and (1 - p_plus) < 1e-6):
+        pytest.skip("outcome has ~0 probability")
+    m_ref = ref.measure(pauli, where, outcome=outcome)          # fixed-basis
+    a = MpsStabOptimizer(n).apply(stream)
+    m_abs = a.measure(pauli, where, outcome=outcome, absorb_basis=True)  # basis-updating
+    assert m_abs == m_ref
+    assert _fidelity(a.to_statevector(), ref.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_measure_absorb_forced_outcome_matches_dense_projector():
+    n = 3
+    stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.9, 2)]
+    for axis in ("X", "Y", "Z"):
+        for q in range(n):
+            for m in (+1, -1):
+                sim = MpsStabOptimizer(n).apply(stream)
+                psi = sim.to_statevector()
+                o = {"X": _X, "Y": _Y, "Z": _Z}[axis]
+                p = 0.5 * (1 + m * float(np.real(np.vdot(psi, _apply_gate_dense(psi.copy(), o, (q,), n)))))
+                if p < 1e-6:
+                    continue
+                sim.measure(axis, q, outcome=m, absorb_basis=True)
+                proj = _apply_gate_dense(psi.copy(), (np.eye(2) + m * o) / 2, (q,), n)
+                proj = proj / np.linalg.norm(proj)
+                assert _fidelity(sim.to_statevector(), proj) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_measure_absorb_disentangles_product_ancilla():
+    # Entangled data (GHZ chain) tensor a lone rotated ancilla; measuring the
+    # ancilla out with absorb_basis must not blow up the bond.
+    sim = MpsStabOptimizer(4, chi=None)
+    sim.apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2), ("rz", 0.7, 3)])
+    sim.measure("Z", 3, absorb_basis=True, outcome=+1)
+    assert sim.state.max_bond() == 1  # GHZ stays in the basis, ancilla removed
+    assert sim.norm() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_prepare_magic_is_product_state():
+    n = 3
+    sim = MpsStabOptimizer(n)
+    for q in range(n):
+        sim.prepare_magic(q)
+    assert sim.state.max_bond() == 1  # |A>^n is a product state
+    ref = _MAGIC
+    for _ in range(n - 1):
+        ref = np.kron(ref, _MAGIC)
+    assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("outcome", [+1, -1])
+def test_inject_t_reproduces_t_gate(outcome):
+    # data = |+> on qubit 0, magic ancilla on qubit 1; inject_t must realize T.
+    sim = MpsStabOptimizer(2)
+    sim.state.h(0)          # data -> |+>
+    sim.prepare_magic(1)    # ancilla -> |A>
+    m = sim.inject_t(0, 1, outcome=outcome)
+    assert m == outcome
+    # dense reference of the same gadget with the same outcome
+    psi = np.kron(_H @ np.array([1, 0], complex), _MAGIC)   # |+>|A>
+    psi = _apply_gate_dense(psi, _CNOT, (0, 1), 2)
+    bit = 0 if m > 0 else 1
+    proj = np.zeros((2, 2), complex); proj[bit, bit] = 1.0
+    psi = _apply_gate_dense(psi, proj, (1,), 2)
+    psi = psi / np.linalg.norm(psi)
+    if m < 0:
+        psi = _apply_gate_dense(psi, _S, (0,), 2)
+    assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-6)
+    # data qubit is T|+> regardless of branch: full state = (T|+>)_0 (x) |bit>_1
+    tplus = _T @ (_H @ np.array([1, 0], complex))
+    ref = np.kron(tplus, np.array([1, 0], complex) if bit == 0 else np.array([0, 1], complex))
+    assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("outcome", [+1, -1])
+def test_inject_t_on_entangled_data_matches_direct_t(outcome):
+    # T injected on one qubit of a Clifford-entangled register equals a direct T,
+    # and the coefficient MPS bond stays tiny (magic confined to the ancilla).
+    sim = MpsStabOptimizer(4, chi=None)
+    sim.apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2)])  # GHZ on data 0,1,2
+    sim.prepare_magic(3)
+    m = sim.inject_t(0, 3, outcome=outcome)
+    # dense reference: same gadget on |GHZ>_012 (x) |A>_3
+    base = _apply_gate_dense(_apply_gate_dense(_apply_gate_dense(np.eye(8)[0], _H, (0,), 3), _CNOT, (0, 1), 3), _CNOT, (1, 2), 3)
+    psi = np.kron(base, _MAGIC)
+    psi = _apply_gate_dense(psi, _CNOT, (0, 3), 4)
+    bit = 0 if m > 0 else 1
+    proj = np.zeros((2, 2), complex); proj[bit, bit] = 1.0
+    psi = _apply_gate_dense(psi, proj, (3,), 4)
+    psi = psi / np.linalg.norm(psi)
+    if m < 0:
+        psi = _apply_gate_dense(psi, _S, (0,), 4)
+    assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-6)
+    assert sim.state.max_bond() <= 2  # magic stays confined; |nu> bond bounded
+
+
+def test_reset_stream_entry_resets_to_zero():
+    n = 3
+    # entangle + rotate, then reset qubit 2 to |0> via the stream entry.
+    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.8, 2)])
+    sim.apply([("reset", 2)])
+    assert sim.expectation("Z", 2) == pytest.approx(1.0, abs=1e-9)  # |0> -> <Z> = +1
+    assert sim.probability("000") + sim.probability("110") == pytest.approx(1.0, abs=1e-6)
+    # reset is not recorded as a measurement
+    assert sim.measurements == []
+
+
+def test_reset_multiqubit_and_disentangles():
+    # GHZ chain; reset the whole register back to |000..0>.
+    n = 4
+    sim = MpsStabOptimizer(n, chi=None).apply(
+        [("h", 0), ("cnot", 0, 1), ("cnot", 1, 2), ("cnot", 2, 3), ("rz", 0.5, 3)]
+    )
+    sim.reset(range(n))
+    ref = np.zeros(2 ** n, dtype=complex); ref[0] = 1.0
+    assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+    assert sim.state.max_bond() == 1
+
+
+def test_reset_then_reuse_ancilla_for_injection():
+    # Reset a used qubit, then re-prepare magic and inject again (ancilla reuse).
+    sim = MpsStabOptimizer(2)
+    sim.state.h(0)
+    sim.prepare_magic(1)
+    sim.inject_t(0, 1, outcome=+1)   # data qubit -> T|+>, ancilla consumed
+    sim.reset(1)                      # free the ancilla back to |0>
+    sim.prepare_magic(1)              # reload magic on the same site
+    m = sim.inject_t(0, 1, outcome=+1)  # apply another T -> T^2|+>
+    assert m == +1
+    tt_plus = _T @ (_T @ (_H @ np.array([1, 0], complex)))
+    full = sim.to_statevector().reshape(2, 2)
+    data_vec = full[:, 0] if np.linalg.norm(full[:, 0]) > np.linalg.norm(full[:, 1]) else full[:, 1]
+    assert _fidelity(data_vec, tt_plus) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_measure_absorb_via_stream_entry():
+    n = 3
+    stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2)]
+    sim = MpsStabOptimizer(n).apply(stream)
+    # ("measure", pauli, where, outcome, absorb_basis)
+    sim.apply([("measure", "Z", 0, +1, True)])
+    assert len(sim.measurements) == 1 and sim.measurements[0][2] == +1
+    assert sim.expectation("Z", 0) == pytest.approx(1.0, abs=1e-9)
+

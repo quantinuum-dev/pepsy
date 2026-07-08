@@ -32,7 +32,8 @@ Supported gate-stream entry forms::
     ("t", q) ("tdg", q)                                     # T / T-dagger
     (matrix, where)                                         # any k-qubit gate
     ("submpo", mpo, where)  / {"kind": "submpo", ...}       # coeff-frame sub-MPO
-    ("measure", pauli, where[, outcome])                   # Pauli measurement
+    ("measure", pauli, where[, outcome[, absorb_basis]])   # Pauli measurement
+    ("reset", where)                                        # reset qubit(s) to |0>
 """
 
 from __future__ import annotations
@@ -64,6 +65,49 @@ _CLIFFORD_NAMES = {
 }
 _ROTATION_AXES = {"rx": "X", "ry": "Y", "rz": "Z"}
 _ROTATION_AXES_2Q = {"rxx": "X", "ryy": "Y", "rzz": "Z"}
+
+# Single-qubit Clifford matrices used to localize a signed Pauli string onto one
+# qubit for the basis-updating measurement (H, S-dagger, CNOT).
+_H_MAT = np.array([[1, 1], [1, -1]], dtype=complex) / np.sqrt(2)
+_SDG_MAT = np.array([[1, 0], [0, -1j]], dtype=complex)
+_CNOT_MAT = np.array(
+    [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], dtype=complex
+)
+
+
+def _localizing_clifford(terms, n):
+    """Return ``(ops, v_tableau, pivot)`` for a Clifford ``V`` with ``V M V^dag = +/-Z_k``.
+
+    ``terms`` maps ``site -> 'X'/'Y'/'Z'`` (the support of the signed Pauli ``M``
+    on the coefficient qubits).  ``ops`` is a list of ``(name, targets)`` gates
+    applied to ``|nu>`` in order (``'h'``, ``'sdg'``, ``'cnot'``); ``v_tableau``
+    is the matching :class:`stim.Tableau`; ``pivot`` is the target qubit ``k``.
+    Single-qubit axes are rotated to ``Z`` (``X`` via ``H``; ``Y`` via ``S^dag``
+    then ``H``) and a CNOT ladder (control ``j``, target ``k``) merges every
+    ``Z_j`` onto the pivot ``Z_k``.
+    """
+    import stim
+
+    support = sorted(terms)
+    pivot = support[0]
+    ops = []
+    for j in support:
+        axis = terms[j]
+        if axis == "X":
+            ops.append(("h", (j,)))
+        elif axis == "Y":
+            ops.append(("sdg", (j,)))  # S^dag then H maps Y -> Z
+            ops.append(("h", (j,)))
+        # 'Z' needs no single-qubit rotation
+    for j in support:
+        if j != pivot:
+            ops.append(("cnot", (j, pivot)))  # control j, target k: merge Z_j -> Z_k
+    vsim = stim.TableauSimulator()
+    vsim.set_num_qubits(n)
+    for name, targ in ops:
+        getattr(vsim, "s_dag" if name == "sdg" else name)(*targ)
+    v_tableau = vsim.current_inverse_tableau().inverse()
+    return ops, v_tableau, pivot
 
 
 class MpsStabOptimizer:
@@ -291,10 +335,15 @@ class MpsStabOptimizer:
                     self._apply_rotation(name, entry[1:])
                     return
                 if name == "measure":
-                    # ("measure", pauli, where[, outcome])
+                    # ("measure", pauli, where[, outcome[, absorb_basis]])
                     pauli, where = entry[1], entry[2]
                     outcome = entry[3] if len(entry) > 3 else None
-                    self.measure(pauli, where, outcome=outcome)
+                    absorb = bool(entry[4]) if len(entry) > 4 else False
+                    self.measure(pauli, where, outcome=outcome, absorb_basis=absorb)
+                    return
+                if name == "reset":
+                    # ("reset", where)  where = int or sequence of ints
+                    self.reset(entry[1])
                     return
                 raise ValueError(f"Unknown gate name {head!r} in stream entry {entry!r}.")
             # matrix form: (gate_tensor, where)
@@ -465,7 +514,8 @@ class MpsStabOptimizer:
         rng = self._rng if seed is None else np.random.default_rng(seed)
         return np.where(rng.random(int(shots)) < p_plus, 1, -1)
 
-    def measure(self, pauli, where, *, outcome: Optional[int] = None):
+    def measure(self, pauli, where, *, outcome: Optional[int] = None,
+                absorb_basis: bool = False):
         """Measure a Pauli observable, collapse ``|nu>``, and return ``+1``/``-1``.
 
         Parameters
@@ -477,12 +527,28 @@ class MpsStabOptimizer:
         outcome : int | None
             If given (``+1`` or ``-1``), force this outcome (post-selection);
             otherwise sample according to the Born rule.
+        absorb_basis : bool
+            If ``True``, use the **basis-updating** (canonical Lemma-3) form: a
+            Clifford ``V`` localises the frame image ``M = C^dagger O C`` onto a
+            single coefficient qubit ``k`` (``V M V^dagger = +/-Z_k``), ``V`` is
+            applied to ``|nu>`` and ``V^dagger`` absorbed into the basis ``C``
+            (``|psi>`` preserved), and qubit ``k`` is projected to a definite
+            computational value.  The measured qubit is thereby disentangled from
+            ``|nu>``, so its support/entanglement leaves the coefficient state —
+            the key primitive for magic-state injection (see :meth:`inject_t`).
+            The default (``False``) keeps the cheaper fixed-basis projector
+            ``(I +- M)/2`` applied directly to ``|nu>``.
 
         Returns
         -------
         int
             The measured eigenvalue ``+1`` or ``-1``.
         """
+        if absorb_basis:
+            m_pauli = self.state.frame_pauli(self._phys_pauli(pauli, where))
+            m = self._absorb_measure(m_pauli, outcome)
+            self.measurements.append((pauli, where, m))
+            return m
         terms, sign = self._frame_terms(pauli, where)
         exp = self._pauli_expectation(terms, sign)
         p_plus = 0.5 * (1.0 + exp)
@@ -493,6 +559,90 @@ class MpsStabOptimizer:
         self._apply_projector(terms, sign, m)
         self.measurements.append((pauli, where, m))
         return m
+
+    def reset(self, where) -> "MpsStabOptimizer":
+        """Reset qubit(s) to ``|0>`` (mid-circuit reset).
+
+        Each target is measured in ``Z`` with the basis-updating path
+        (so it disentangles from ``|nu>``); if the outcome is ``|1>`` a Clifford
+        ``X`` flips it back to ``|0>``.  The qubit is left as a fresh product
+        ``|0>`` (chi-1 at that site), ready to be reused — e.g. re-loaded with
+        :meth:`prepare_magic` for another :meth:`inject_t`.  Available in a gate
+        stream as ``("reset", where)`` with ``where`` an int or sequence of ints.
+        The internal ``Z`` measurements are *not* appended to
+        :attr:`measurements` (a reset is an operation, not a recorded readout).
+        """
+        where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
+        for q in where:
+            m_pauli = self.state.frame_pauli(self._phys_pauli("Z", q))
+            m = self._absorb_measure(m_pauli, None)
+            if m < 0:  # qubit collapsed to |1> -> flip to |0>
+                self.state.apply_clifford("x", q)
+                self._record(0.0)
+        return self
+
+    def _absorb_measure(self, m_pauli, outcome) -> int:
+        """Basis-updating measurement of the frame Pauli ``m_pauli``; returns ``+/-1``.
+
+        ``m_pauli`` is the signed :class:`stim.PauliString` image
+        ``M = C^dagger O C`` of the physical observable on the coefficient qubits.
+        """
+        terms, sign = hermitian_pauli_terms(m_pauli)
+        support = sorted(terms)
+        if not support:  # M = +/- I: deterministic, state unchanged
+            self._record(0.0)
+            return int(sign)
+        ops, v_tableau, k = _localizing_clifford(terms, self.n)
+        conj_terms, s = hermitian_pauli_terms(v_tableau(m_pauli))  # V M V^dag
+        if conj_terms != {k: "Z"}:  # pragma: no cover - localizer invariant
+            raise RuntimeError(
+                f"localizer produced {conj_terms!r}, expected Z on qubit {k}."
+            )
+        infidelity = self._apply_localizer_to_p(ops)
+        self.state.absorb_basis_clifford(v_tableau)
+        # Single-qubit Z_k measurement on the reframed coefficient state.
+        p = self.state.p
+        z_p = p.copy()
+        z_p.gate_(pauli_matrix("Z").astype(self.dtype), k, contract=True)
+        zexp = float(np.real(complex(p.H @ z_p) / complex(p.H @ p)))
+        p_o_plus = 0.5 * (1.0 + s * zexp)  # prob(outcome O = +1)
+        if outcome is None:
+            m = 1 if self._rng.random() < p_o_plus else -1
+        else:
+            m = 1 if int(outcome) >= 0 else -1
+        zval = m * s  # required Z_k eigenvalue (+1 -> |0>, -1 -> |1>)
+        self._project_computational_site(k, 0 if zval > 0 else 1)
+        self._record(infidelity)
+        return m
+
+    def _apply_localizer_to_p(self, ops) -> float:
+        """Apply the localizing Clifford ``ops`` to ``|nu>``; return truncation infidelity."""
+        p = self.state.p
+        infidelity = 0.0
+        for name, targ in ops:
+            if name == "h":
+                p.gate_(_H_MAT.astype(self.dtype), targ[0], contract=True)
+            elif name == "sdg":
+                p.gate_(_SDG_MAT.astype(self.dtype), targ[0], contract=True)
+            elif name == "cnot":
+                cnot = _CNOT_MAT.astype(self.dtype)
+                if self.track_infidelity and self.chi is not None:
+                    target = p.copy()
+                    target.gate_(cnot, targ, contract="swap+split", cutoff=self.cutoff)
+                    p.gate_(cnot, targ, contract="swap+split",
+                            max_bond=self.chi, cutoff=self.cutoff)
+                    infidelity += max(0.0, float(1.0 - abs(tn_fidelity(p, target))))
+                else:
+                    p.gate_(cnot, targ, contract="swap+split",
+                            max_bond=self.chi, cutoff=self.cutoff)
+        return infidelity
+
+    def _project_computational_site(self, k, keep_bit) -> None:
+        """Project coefficient site ``k`` onto ``|keep_bit>`` and renormalize ``|nu>``."""
+        proj = np.zeros((2, 2), dtype=self.dtype)
+        proj[keep_bit, keep_bit] = 1.0
+        self.state.p.gate_(proj, k, contract=True)
+        self.state.p.normalize()
 
     def _apply_projector(self, terms, sign, m) -> None:
         """Apply ``(I + m M)/2`` to ``|nu>`` and renormalize (M = sign * prod terms)."""
@@ -511,6 +661,66 @@ class MpsStabOptimizer:
         mpo, where = pauli_combo_submpo(0.5, coef, terms, self.n, dtype=self.dtype)
         infidelity = self._evolve_p(mpo, where, renormalize=True)
         self._record(infidelity)
+
+    # ------------------------------------------------------------------ #
+    # Magic-state injection (R1)
+    # ------------------------------------------------------------------ #
+    def prepare_magic(self, ancilla, *, state: str = "T") -> "MpsStabOptimizer":
+        """Prepare the magic state ``|A> = T|+>`` on a fresh ``|0>`` ancilla site.
+
+        ``state="T"`` prepares ``|A> = T H|0> = (|0> + e^{i pi/4}|1>)/sqrt(2)``,
+        the resource consumed by :meth:`inject_t`.  The ancilla **must currently
+        be** ``|0>`` — freshly initialised, or just returned to ``|0>`` by
+        :meth:`reset` (so ancillas can be recycled).  Implemented physically as a
+        Clifford ``H`` (tableau only) followed by the ``T`` rotation; on a
+        decoupled ``|0>`` qubit this keeps ``|nu>`` compact (chi=1 in the
+        identity-basis case).
+        """
+        if state != "T":
+            raise ValueError("only the 'T' magic state |A> is supported.")
+        a = int(ancilla)
+        self.state.apply_clifford("h", a)  # |0> -> |+>, Clifford (tableau only)
+        self._record(0.0)
+        self._apply_rotation("t", (a,))    # |+> -> T|+> = |A>, non-Clifford on |nu>
+        return self
+
+    def inject_t(self, data, ancilla, *, outcome: Optional[int] = None) -> int:
+        """Apply ``T`` to ``data`` by consuming a magic ancilla (gate teleportation).
+
+        Implements R1 magic-state injection.  The ``ancilla`` must already hold
+        the ``|A>`` magic state (call :meth:`prepare_magic` first).  Steps:
+
+        1. ``CNOT(control=data, target=ancilla)`` — Clifford, updates the tableau
+           only (free; ``|nu>`` untouched).
+        2. Measure the ancilla in ``Z`` with :meth:`measure` ``absorb_basis=True``
+           so it disentangles from ``|nu>``.
+        3. If the outcome is ``-1`` (ancilla ``|1>``), apply the Clifford ``S``
+           correction on ``data`` — also free.
+
+        The net channel on ``data`` is ``T`` (up to a global phase), while the
+        non-Clifford cost stays confined to the pre-loaded magic ancilla rather
+        than growing ``|nu>`` via a direct ``T`` rotation.
+
+        Parameters
+        ----------
+        data, ancilla : int
+            Data qubit to apply ``T`` to and the magic ancilla to consume.
+        outcome : int | None
+            If given (``+1``/``-1``), post-select the ancilla measurement instead
+            of Born sampling.
+
+        Returns the ancilla measurement eigenvalue ``+1``/``-1``.
+        """
+        data, ancilla = int(data), int(ancilla)
+        # CNOT(control=data, target=ancilla): Clifford, tableau only.
+        self.state.apply_clifford("cnot", data, ancilla)
+        self._record(0.0)
+        # Measure the ancilla in Z, absorbing it out of |nu>.
+        m = self.measure("Z", ancilla, absorb_basis=True, outcome=outcome)
+        if m < 0:  # ancilla collapsed to |1>: outcome-conditioned S correction.
+            self.state.apply_clifford("s", data)
+            self._record(0.0)
+        return m
 
     # ------------------------------------------------------------------ #
     # Explicit gate matrices
