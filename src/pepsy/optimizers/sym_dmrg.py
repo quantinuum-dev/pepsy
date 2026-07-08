@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import itertools
 from itertools import product
+import math
 import time
 import warnings
 
@@ -99,6 +100,8 @@ def _normalize_backend(backend):
 
 
 def _to_numpy(array):
+    if type(array) is np.ndarray:
+        return array
     if hasattr(array, "detach") and hasattr(array, "cpu"):
         array = array.detach().cpu()
     if hasattr(array, "numpy"):
@@ -223,7 +226,7 @@ def _block_data_layout_map(data):
 
 
 def _shape_size(shape):
-    return int(np.prod(tuple(shape), dtype=np.int64)) if shape else 1
+    return int(math.prod(shape)) if shape else 1
 
 
 def _flatten_blocks(data):
