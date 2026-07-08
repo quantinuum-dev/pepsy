@@ -188,6 +188,37 @@ and canonicalize the result before DMRG. Raw `SymMPS.random(bond_dim=chi)`
 still exists, but it is a lower-level block-fill constructor and should be
 treated as a robustness stress test on hard mapped-2D PBC cases.
 
+## Initialization robustness (benchmark findings)
+
+Under the recommended setting (a product or `random_unitary` initial state plus
+the `density_matrix` mixer) SymDMRG2 is variationally correct, monotone in `chi`,
+and reproduces exact diagonalization to machine precision at the exact Schmidt
+bound. On a 6-site Fermi-Hubbard chain at `chi=64` it reaches the exact
+fixed-sector ground state to `~1e-14` for `U in {1, 4, 8}` from product,
+`random_unitary`, and even raw block-fill starts; on the frustrated `3x3` PBC
+torus the three initial states converge together as `chi` grows (init spread
+`5.8e-2 -> 1.0e-2 -> 1.0e-3` for `chi in {16, 32, 64}`), always above ED.
+
+On the hard periodic `6x6` `U/t=8` torus at `chi=32`, the recommended inits are
+robust and beat a matched-`chi` TeNPy run across all of TeNPy's own settings
+(`<H>/N - U/4`):
+
+| initial state                    | SymDMRG2 + `density_matrix` mixer |
+| -------------------------------- | --------------------------------- |
+| product (ramped)                 | `-2.43436`                        |
+| `random_unitary`                 | `-2.43137`                        |
+| raw `SymMPS.random` block-fill   | `-2.40812` (stuck)                |
+
+For comparison, TeNPy at `chi=32` lands in `[-2.42502, -2.43095]` across
+mixer-on/off and product/random-unitary starts. So the recommended-init results
+sit at or below TeNPy's best. The one caveat is the raw block-fill start: on this
+far-from-converged large case it locks into a poor charge-sector layout that the
+mixer cannot escape even with a `30x` larger, longer-lived amplitude. TeNPy has
+no equivalent pathological start because its random init is well-conditioned by
+construction; the Pepsy analog is `SymMPS.random_unitary_for_model`. Prefer a
+product or `random_unitary` start; reserve raw `SymMPS.random(bond_dim=chi)` for
+deliberate stress testing.
+
 When the optional subspace mixer is active, SymDMRG2 uses it as a temporary
 exploration aid rather than a final convergence state. If the sweep convergence
 criteria are met while the mixer was still active, the Symmray path records a
