@@ -159,13 +159,13 @@ class STNState:
         return new
 
     def do_tableau(self, tableau, targets) -> "STNState":
-        """Apply a stim Clifford tableau to the basis on ``targets`` (|nu> unchanged)."""
+        """Apply a stim Clifford tableau to the basis on ``targets`` (``|nu>`` unchanged)."""
         self._sim.do_tableau(tableau, list(targets))
         self._inv_tableau = None
         return self
 
     def absorb_basis_clifford(self, v_tableau) -> "STNState":
-        """Absorb ``V^dagger`` into the basis: ``C -> C V^dagger`` (|psi> preserved).
+        """Absorb ``V^dagger`` into the basis: ``C -> C V^dagger`` (``|psi>`` preserved).
 
         Used by the basis-updating measurement: if a Clifford ``V`` has been
         applied to the coefficient MPS ``p`` (``p -> V p``), absorbing ``V^dagger``

@@ -152,6 +152,12 @@ Ordered by value/effort. None are started.
   updating `tests/test_public_api.py`).
 - A small deterministic example: `|T>^n` at chi=1, and a magic-vs-chi growth demo
   (paper Fig. 2).
+- **STATUS: DONE** — `pepsy.MpsStabOptimizer` and `pepsy.STNState` are exported at
+  top level (symbol map + `__all__` + eager import + `tests/test_public_api.py`),
+  documented at `docs/api/optimizers/stabilizer_tn.md`, and demonstrated by
+  `examples/stabilizer_tn_magic_injection.py` (Clifford-free GHZ, `inject_t` +
+  ancilla recycling, scalable sampling, all dense-validated). **Next:** a
+  large-`N`/fixed-`t` magic-vs-chi benchmark (paper Fig. 2).
 
 ### R7. Long-range gates / layout (subtle — different from `MpsOptimizer`)
 `MpsOptimizer.LayoutFinder` reorders MPS sites from the *physical* gate supports to

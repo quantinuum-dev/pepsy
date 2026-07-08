@@ -26,6 +26,7 @@ _EXPECTED_IN_ALL = [
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "make_numpy_array_caster", "to_float", "SweepOptimizer",
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult",
     "PepsBpSampler", "MpsSampler", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "tn_fidelity", "tn_norm",
+    "MpsStabOptimizer", "STNState",
     "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
     "default_physical_sectors", "draw_symmray_blocks", "draw_symmray_mps", "draw_symmray_mpo", "draw_symmray_peps",
     "fermi_hubbard_u1u1_gate_stream", "fermi_hubbard_u1u1_hopping_gate_stream",

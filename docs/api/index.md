@@ -20,6 +20,7 @@ optimizers/energy
 optimizers/mps
 optimizers/mpo
 optimizers/peps
+optimizers/stabilizer_tn
 optimizers/sym_dmrg
 solvers/gradient
 solvers/finite_difference
