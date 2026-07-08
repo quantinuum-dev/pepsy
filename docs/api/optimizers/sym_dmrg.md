@@ -219,6 +219,19 @@ construction; the Pepsy analog is `SymMPS.random_unitary_for_model`. Prefer a
 product or `random_unitary` start; reserve raw `SymMPS.random(bond_dim=chi)` for
 deliberate stress testing.
 
+For speed and seed-stability together, pair the density-matrix mixer with
+`variational_sector_basis="off"`. The adaptive zero-sector basis is redundant
+once the mixer performs the sector exploration, and profiling shows it is both
+the dominant per-sweep overhead and a source of seed-to-seed variance. Turning
+it off is variationally identical where it matters (it still reaches exact ED to
+`~1e-14` on solvable cases), makes SymDMRG2 ~1.5-3.7x faster per sweep, and
+tightens the random-init seed spread to TeNPy's level: on a mixed `6x6` `U/t=8`
+scan across `chi in {8, 12, 32}` the `random_unitary` seed spread is
+`6.2e-4 / 9.7e-7 / 5.5e-4` versus TeNPy's `5.7e-3 / 2.3e-2 / 2.9e-4`, with
+Pepsy's best energy below TeNPy at every `chi`. After this change the block-
+sparse local matvec is the remaining cost (~50% of wall time); TeNPy is still
+faster in absolute wall time per run.
+
 When the optional subspace mixer is active, SymDMRG2 uses it as a temporary
 exploration aid rather than a final convergence state. If the sweep convergence
 criteria are met while the mixer was still active, the Symmray path records a
