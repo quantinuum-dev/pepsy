@@ -209,15 +209,17 @@ def _block_dtype(block):
     return np.dtype(dtype)
 
 
-def _block_data_layout(data):
-    return tuple(
-        (
-            sector,
-            tuple(getattr(block, "shape", ())),
-            _block_dtype(block).str,
-        )
-        for sector, block in _sorted_block_items(data)
-    )
+def _block_data_layout_map(data):
+    """Order-independent block layout used to detect compiled-plan invalidation.
+
+    Maps each block sector to its ``(shape, dtype)``; comparing two of these maps
+    detects any change in sectors, shapes, or dtypes. Used on the hot per-matvec
+    compiled-plan match check, so it avoids sorting the block sectors.
+    """
+    return {
+        sector: (tuple(getattr(block, "shape", ())), _block_dtype(block).str)
+        for sector, block in data.blocks.items()
+    }
 
 
 def _shape_size(shape):
@@ -848,7 +850,7 @@ class _BlockPairContraction:
     def _compiled_plan_matches(self, right):
         return (
             self.compiled_block_plan is not None
-            and self.compiled_right_layout == _block_data_layout(right.data)
+            and self.compiled_right_layout == _block_data_layout_map(right.data)
         )
 
     def _can_compile_block_plan(self, right):
@@ -948,7 +950,7 @@ class _BlockPairContraction:
             )
 
         self.compiled_output_template = output.data
-        self.compiled_right_layout = _block_data_layout(right.data)
+        self.compiled_right_layout = _block_data_layout_map(right.data)
         self.compiled_block_plan = tuple(compiled_plan)
         self.compiled_block_plan_builds += 1
         self.compiled_block_plan_terms = int(num_terms)
