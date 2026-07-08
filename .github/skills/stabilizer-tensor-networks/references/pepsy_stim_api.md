@@ -71,9 +71,9 @@ All exported at top level (`import pepsy`); see `src/pepsy/__init__.py`.
 ## Actual module layout (`src/pepsy/stabilizer_tn/`)
 ```
 src/pepsy/stabilizer_tn/
-  __init__.py        # public API: STNState, StabilizerMps, MPO builders
+  __init__.py        # public API: STNState, MpsStabOptimizer, MPO builders
   stn_state.py       # STNState: stim tableau + pepsy MPS |nu>, init |0..0>, nu_frame_pauli
-  stabilizer_mps.py  # StabilizerMps: gate-stream simulator (Clifford/rotation/measure/submpo)
+  mps_stab_optimizer.py  # MpsStabOptimizer: gate-stream simulator (Clifford/rotation/measure/submpo)
   operators.py       # pauli_combo_mpo / pauli_rotation_mpo / single_qubit_* / pauli_matrix
   paulis.py          # stim Pauli helpers (single_pauli, pauli_string, hermitian_pauli_terms)
   PLAN.md            # roadmap (magic-state injection, disentangling sweep, ...)

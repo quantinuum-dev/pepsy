@@ -115,9 +115,9 @@ def test_zero_qubit_rejected():
 
 
 # --------------------------------------------------------------------------- #
-# StabilizerMps simulator (Clifford + non-Clifford rotations, matrices, sub-MPO)
+# MpsStabOptimizer simulator (Clifford + non-Clifford rotations, matrices, sub-MPO)
 # --------------------------------------------------------------------------- #
-from pepsy.stabilizer_tn import StabilizerMps, pauli_rotation_mpo  # noqa: E402
+from pepsy.stabilizer_tn import MpsStabOptimizer, pauli_rotation_mpo  # noqa: E402
 
 _I = np.eye(2, dtype=complex)
 _X = np.array([[0, 1], [1, 0]], dtype=complex)
@@ -182,7 +182,7 @@ def test_simulator_single_nonclifford_rotations_match_dense():
         for theta in (0.3, 1.1, -0.7):
             for prep in ([], [("h", 0)], [("h", 0), ("cnot", 0, 1)]):
                 stream = prep + [(axis, theta, 0)]
-                sim = StabilizerMps(2).apply(stream)
+                sim = MpsStabOptimizer(2).apply(stream)
                 ref = _dense_reference(2, stream)
                 assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
@@ -192,7 +192,7 @@ def test_simulator_full_circuit_matches_dense():
         ("h", 0), ("cnot", 0, 1), ("rz", 0.6, 1), ("ry", -0.4, 2),
         ("cz", 1, 2), ("rzz", 0.9, 0, 2), ("s", 0), ("rx", 0.5, 1), ("t", 2),
     ]
-    sim = StabilizerMps(3).apply(stream)
+    sim = MpsStabOptimizer(3).apply(stream)
     ref = _dense_reference(3, stream)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
@@ -200,7 +200,7 @@ def test_simulator_full_circuit_matches_dense():
 def test_simulator_t_layer_stays_chi_one():
     n = 5
     stream = [("h", q) for q in range(n)] + [("t", q) for q in range(n)]
-    sim = StabilizerMps(n).apply(stream)
+    sim = MpsStabOptimizer(n).apply(stream)
     assert sim.state.max_bond() == 1  # Corollary 2.1: free non-Clifford ops
 
 
@@ -214,7 +214,7 @@ def test_simulator_clifford_angle_rotations_are_free():
         ("rz", math.pi / 2, 1), ("rx", math.pi, 0), ("ry", -math.pi / 2, 2),
         ("rzz", math.pi, 0, 2), ("rz", math.pi / 2, 2),
     ]
-    sim = StabilizerMps(n).apply(stream)
+    sim = MpsStabOptimizer(n).apply(stream)
     assert sim.state.max_bond() == 1  # all Clifford -> free
     psi = np.zeros(2 ** n, dtype=complex)
     psi[0] = 1.0
@@ -235,7 +235,7 @@ def test_simulator_clifford_angle_rotations_are_free():
 def test_simulator_matrix_entries_clifford_and_nonclifford():
     # Clifford matrix (H) -> tableau; non-Clifford matrix (T) -> |nu> ZYZ path.
     stream = [(_H, 0), (_T, 0), (_H, 1), (_T, 1)]
-    sim = StabilizerMps(2).apply(stream)
+    sim = MpsStabOptimizer(2).apply(stream)
     ref_stream = [("h", 0), ("t", 0), ("h", 1), ("t", 1)]
     ref = _dense_reference(2, ref_stream)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
@@ -247,7 +247,7 @@ def test_simulator_random_1q_matrix_matches_dense():
     q, r = np.linalg.qr(a)
     u = q @ np.diag(np.exp(1j * np.angle(np.diag(r))))  # Haar-ish U(2)
     prep = [("h", 0), ("cnot", 0, 1)]
-    sim = StabilizerMps(2).apply(prep + [(u, 1)])
+    sim = MpsStabOptimizer(2).apply(prep + [(u, 1)])
     psi = _dense_reference(2, prep)
     psi = _apply_gate_dense(psi, u, (1,), 2)
     assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-6)
@@ -256,7 +256,7 @@ def test_simulator_random_1q_matrix_matches_dense():
 def test_simulator_submpo_event_in_nu_frame():
     # A sub-MPO event acts directly on |nu>; from |0...0> the basis is identity
     # so it also equals the physical operator.
-    sim = StabilizerMps(3)
+    sim = MpsStabOptimizer(3)
     mpo = pauli_rotation_mpo(0.8, ["X", "I", "Z"], sign=1.0)
     exact = mpo.apply(sim.state.nu).to_dense().reshape(-1)
     sim.apply([("submpo", mpo, (0, 1, 2))])
@@ -275,14 +275,14 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
         a, b = rng.choice(n, size=2, replace=False)
         stream.append(("cnot", int(a), int(b)))
         stream.append(("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
-    sim = StabilizerMps(n, chi=4, track_infidelity=True).apply(stream)
+    sim = MpsStabOptimizer(n, chi=4, track_infidelity=True).apply(stream)
     assert sim.state.max_bond() <= 4
     assert all(inf >= 0.0 for inf in sim.infidelities)
     assert max(sim.infidelities) > 0.0  # truncation actually occurred
 
 
 def test_simulator_two_qubit_nonclifford_matrix_rejected():
-    sim = StabilizerMps(2)
+    sim = MpsStabOptimizer(2)
     bad = _rzz(0.5)  # non-Clifford 2q matrix
     with pytest.raises(NotImplementedError):
         sim.apply([(bad, (0, 1))])
@@ -300,7 +300,7 @@ def test_measure_expectation_matches_dense():
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.9, 2),
               ("rx", 0.5, 0)]
     n = 3
-    sim = StabilizerMps(n).apply(stream)
+    sim = MpsStabOptimizer(n).apply(stream)
     psi = sim.to_statevector()
     for axis in ("X", "Y", "Z"):
         for q in range(n):
@@ -315,7 +315,7 @@ def test_measure_forced_outcome_collapses_to_dense():
     for axis in ("X", "Y", "Z"):
         for q in range(n):
             for m in (+1, -1):
-                sim = StabilizerMps(n).apply(stream)
+                sim = MpsStabOptimizer(n).apply(stream)
                 psi = sim.to_statevector()
                 # skip impossible outcomes (probability ~0)
                 p = 0.5 * (1 + m * _expectation_dense(psi, axis, q, n))
@@ -330,7 +330,7 @@ def test_measure_forced_outcome_collapses_to_dense():
 
 def test_measure_is_repeatable():
     # Measuring the same observable twice returns the same outcome deterministically.
-    sim = StabilizerMps(3).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.6, 2)])
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.6, 2)])
     first = sim.measure("Z", 0)
     for _ in range(5):
         assert sim.measure("Z", 0) == first
@@ -345,7 +345,7 @@ def test_measure_born_statistics():
     plus = 0
     shots = 400
     for s in range(shots):
-        sim = StabilizerMps(1, seed=s).apply([("rx", theta, 0)])
+        sim = MpsStabOptimizer(1, seed=s).apply([("rx", theta, 0)])
         if sim.measure("Z", 0) == 1:
             plus += 1
     freq_exp = (2 * plus / shots) - 1  # <Z> = p+ - p-
@@ -355,7 +355,7 @@ def test_measure_born_statistics():
 def test_measure_multiqubit_pauli_and_stream_entry():
     n = 3
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.5, 2)]
-    sim = StabilizerMps(n).apply(stream)
+    sim = MpsStabOptimizer(n).apply(stream)
     psi = sim.to_statevector()
     zz = np.kron(_Z, _Z)
     ref = float(np.real(np.vdot(psi, _apply_gate_dense(psi.copy(), zz, (0, 1), n))))
@@ -426,7 +426,7 @@ def test_simulator_tdg_rot_rxx_ryy_match_dense():
         ("h", 0), ("cnot", 0, 1), ("tdg", 1), ("rxx", 0.8, 0, 2),
         ("ryy", -0.6, 1, 2), ("rot", 1.1, "XZ", (0, 2)), ("rot", 0.4, "Y", 1),
     ]
-    sim = StabilizerMps(n).apply(stream)
+    sim = MpsStabOptimizer(n).apply(stream)
     ref = _dense_stream(n, stream)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
@@ -451,14 +451,14 @@ def test_simulator_random_exact_circuit_matches_dense(seed):
         else:
             a, b = rng.choice(n, size=2, replace=False)
             stream.append((rng.choice(["rxx", "rzz"]), float(rng.uniform(0.1, 1.3)), int(a), int(b)))
-    sim = StabilizerMps(n).apply(stream)  # exact (chi=None)
+    sim = MpsStabOptimizer(n).apply(stream)  # exact (chi=None)
     ref = _dense_stream(n, stream)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_simulator_inplace_false_preserves_original():
     base = STNState(3)
-    sim = StabilizerMps(base, inplace=False).apply([("h", 0), ("rz", 0.7, 0), ("cnot", 0, 1)])
+    sim = MpsStabOptimizer(base, inplace=False).apply([("h", 0), ("rz", 0.7, 0), ("cnot", 0, 1)])
     # original untouched
     np.testing.assert_allclose(base.nu_dense(), np.eye(8)[0])
     assert base.max_bond() == 1
@@ -468,8 +468,8 @@ def test_simulator_inplace_false_preserves_original():
 
 def test_simulator_incremental_add_gates_equivalent_to_single_run():
     stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.6, 1), ("ry", -0.4, 2), ("t", 2)]
-    full = StabilizerMps(3).apply(stream)
-    inc = StabilizerMps(3)
+    full = MpsStabOptimizer(3).apply(stream)
+    inc = MpsStabOptimizer(3)
     inc.add_gates(stream[:2]).run()
     inc.add_gates(stream[2:]).run()
     assert _fidelity(inc.to_statevector(), full.to_statevector()) == pytest.approx(1.0, abs=1e-6)
@@ -477,7 +477,7 @@ def test_simulator_incremental_add_gates_equivalent_to_single_run():
 
 def test_expectation_of_stabilizer_is_deterministic():
     # After a Clifford circuit, Z-basis stabilizers have expectation +-1.
-    sim = StabilizerMps(3).apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2)])
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2)])
     # Z0 Z1 and Z1 Z2 are stabilizers of the GHZ state -> expectation +1.
     assert sim.expectation("ZZ", (0, 1)) == pytest.approx(1.0, abs=1e-9)
     assert sim.expectation("ZZ", (1, 2)) == pytest.approx(1.0, abs=1e-9)
@@ -487,7 +487,7 @@ def test_pseudo_stabilizer_rank_t_state_is_maximal():
     # |T>^n = prod T prod H |0> has maximal pseudo-stabilizer rank 2^n (paper Eq. 11-12).
     for n in (2, 3):
         stream = [("h", q) for q in range(n)] + [("t", q) for q in range(n)]
-        sim = StabilizerMps(n).apply(stream)
+        sim = MpsStabOptimizer(n).apply(stream)
         assert sim.state.max_bond() == 1
         assert sim.pseudo_stabilizer_rank() == 2 ** n
 
@@ -495,11 +495,60 @@ def test_pseudo_stabilizer_rank_t_state_is_maximal():
 def test_submpo_truncation_caps_bond():
     # Apply a spread rotation MPO as a sub-MPO event with a chi cap.
     n = 6
-    sim = StabilizerMps(n, chi=4)
+    sim = MpsStabOptimizer(n, chi=4)
     sim.apply([("h", q) for q in range(n)])
     for a in range(n - 1):
         sim.apply([("cnot", a, a + 1)])
     mpo = pauli_rotation_mpo(0.7, ["X"] + ["I"] * (n - 2) + ["Z"], sign=1.0)
     sim.apply([("submpo", mpo, tuple(range(n)))])
     assert sim.state.max_bond() <= 4
+
+
+# --------------------------------------------------------------------------- #
+# Initial states, norm, progress bar, alias
+# --------------------------------------------------------------------------- #
+def test_initial_state_ghz_is_stabilizer():
+    n = 4
+    sim = MpsStabOptimizer.ghz(n)
+    assert sim.state.max_bond() == 1  # GHZ is a stabilizer state -> chi=1
+    exp = np.zeros(2 ** n, dtype=complex)
+    exp[0] = exp[-1] = 1 / np.sqrt(2)
+    assert _fidelity(sim.to_statevector(), exp) == pytest.approx(1.0, abs=1e-6)
+    assert sim.norm() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_initial_state_from_bits():
+    sim = MpsStabOptimizer.from_bits("1010")
+    exp = np.zeros(16, dtype=complex)
+    exp[int("1010", 2)] = 1.0
+    assert _fidelity(sim.to_statevector(), exp) == pytest.approx(1.0, abs=1e-6)
+    assert sim.state.max_bond() == 1
+
+
+def test_from_tableau_and_nu_roundtrip():
+    src = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.6, 2), ("t", 1)])
+    rebuilt = MpsStabOptimizer.from_tableau_and_nu(src.state._sim.copy(), src.state.nu.copy())
+    assert _fidelity(rebuilt.to_statevector(), src.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_norm_preserved_after_circuit():
+    sim = MpsStabOptimizer(3).apply(
+        [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.9, 2), ("t", 0)]
+    )
+    assert sim.norm() == pytest.approx(1.0, abs=1e-9)
+    # and after a measurement, still normalized
+    sim.measure("Z", 0)
+    assert sim.norm() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_run_progbar_smoke():
+    pytest.importorskip("tqdm")
+    sim = MpsStabOptimizer(3)
+    sim.set_gates([("h", 0), ("cnot", 0, 1), ("rz", 0.5, 2), ("t", 1)]).run(progbar=True)
+    assert sim.state.max_bond() >= 1
+
+
+def test_stabilizermps_backward_alias():
+    from pepsy.stabilizer_tn import StabilizerMps
+    assert StabilizerMps is MpsStabOptimizer
 

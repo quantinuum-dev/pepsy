@@ -1,4 +1,4 @@
-"""``StabilizerMps``: an ``MpsOptimizer``-style gate-stream simulator for STN.
+"""``MpsStabOptimizer``: an ``MpsOptimizer``-style gate-stream simulator for STN.
 
 Analogous to :class:`pepsy.MpsOptimizer`, but the state is a *stabilizer tensor
 network*: a stim tableau (basis ``B(S, D)``) times a coefficient MPS ``|nu>``
@@ -48,7 +48,7 @@ from .operators import (
 from .paulis import hermitian_pauli_terms, pauli_string
 from .stn_state import STNState
 
-__all__ = ["StabilizerMps"]
+__all__ = ["MpsStabOptimizer"]
 
 _CLIFFORD_NAMES = {
     "h", "x", "y", "z", "s", "sdg", "sdag", "sqrt_x", "sqrt_x_dag",
@@ -58,7 +58,7 @@ _ROTATION_AXES = {"rx": "X", "ry": "Y", "rz": "Z"}
 _ROTATION_AXES_2Q = {"rxx": "X", "ryy": "Y", "rzz": "Z"}
 
 
-class StabilizerMps:
+class MpsStabOptimizer:
     """Replay a gate stream against a stabilizer + MPS (STN) state.
 
     Parameters
@@ -131,6 +131,27 @@ class StabilizerMps:
             self.add_gates(gates)
 
     # ------------------------------------------------------------------ #
+    # Initial-state constructors (product / GHZ / user tableau+MPS)
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def from_bits(cls, bits, **kwargs) -> "MpsStabOptimizer":
+        """Start from a computational-basis product state (``bits`` = str or 0/1 seq)."""
+        dtype = kwargs.pop("dtype", "complex128")
+        return cls(STNState.from_bits(bits, dtype=dtype), **kwargs)
+
+    @classmethod
+    def ghz(cls, n: int, **kwargs) -> "MpsStabOptimizer":
+        """Start from the ``n``-qubit GHZ state (a stabilizer state, chi=1)."""
+        dtype = kwargs.pop("dtype", "complex128")
+        return cls(STNState.ghz(n, dtype=dtype), **kwargs)
+
+    @classmethod
+    def from_tableau_and_nu(cls, sim, nu, **kwargs) -> "MpsStabOptimizer":
+        """Start from a user stim tableau ``sim`` and coefficient MPS ``nu``."""
+        dtype = kwargs.pop("dtype", "complex128")
+        return cls(STNState.from_tableau_and_nu(sim, nu, dtype=dtype), **kwargs)
+
+    # ------------------------------------------------------------------ #
     # Properties / queue management
     # ------------------------------------------------------------------ #
     @property
@@ -142,12 +163,12 @@ class StabilizerMps:
         """The coefficient MPS ``|nu>``."""
         return self.state.nu
 
-    def set_gates(self, gates) -> "StabilizerMps":
+    def set_gates(self, gates) -> "MpsStabOptimizer":
         """Replace the queued gate stream."""
         self._queue = list(self._as_entries(gates))
         return self
 
-    def add_gates(self, gates) -> "StabilizerMps":
+    def add_gates(self, gates) -> "MpsStabOptimizer":
         """Append to the queued gate stream."""
         self._queue.extend(self._as_entries(gates))
         return self
@@ -175,20 +196,45 @@ class StabilizerMps:
     # ------------------------------------------------------------------ #
     # Execution
     # ------------------------------------------------------------------ #
-    def run(self) -> "StabilizerMps":
-        """Apply all queued gates in order, then clear the queue."""
-        for entry in self._queue:
+    def run(self, *, progbar: bool = False) -> "MpsStabOptimizer":
+        """Apply all queued gates in order, then clear the queue.
+
+        Parameters
+        ----------
+        progbar : bool
+            Show a ``tqdm`` progress bar reporting the running ``|nu>`` bond
+            dimension and cumulative truncation infidelity.
+        """
+        queue = self._queue
+        pbar = None
+        if progbar and queue:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(total=len(queue), desc="stab-mps", leave=True, ascii=True)
+        for entry in queue:
             self._apply_entry(entry)
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(
+                    chi=self.state.max_bond(),
+                    infid=f"{sum(self.infidelities):.2e}",
+                )
+        if pbar is not None:
+            pbar.close()
         self._queue = []
         return self
 
-    def apply(self, gates) -> "StabilizerMps":
+    def apply(self, gates, *, progbar: bool = False) -> "MpsStabOptimizer":
         """Convenience: queue ``gates`` and run immediately."""
-        return self.set_gates(gates).run()
+        return self.set_gates(gates).run(progbar=progbar)
 
     def to_statevector(self) -> np.ndarray:
         """Dense statevector ``|psi> = C|nu>`` (small ``n`` only)."""
         return self.state.to_statevector()
+
+    def norm(self) -> float:
+        """Norm of the coefficient state ``|nu>`` (represented state norm; ~1)."""
+        return float(abs(self.state.nu.norm()))
 
     def pseudo_stabilizer_rank(self, tol: float = 1e-12) -> int:
         """Pseudo-stabilizer rank ``xi_tilde`` = number of non-zero ``nu_i``."""
@@ -464,7 +510,7 @@ class StabilizerMps:
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return (
-            f"StabilizerMps(n={self.n}, chi={self.chi}, "
+            f"MpsStabOptimizer(n={self.n}, chi={self.chi}, "
             f"queued={len(self._queue)}, current_chi={self.state.max_bond()})"
         )
 

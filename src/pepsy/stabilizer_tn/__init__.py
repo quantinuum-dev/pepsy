@@ -14,17 +14,21 @@ destabilizer generators, tracked with :mod:`stim`) times a **coefficient state**
 
 This module currently provides the state container :class:`STNState`, the
 Clifford update rule (which changes only the basis, leaving ``|nu>``
-unchanged), and :class:`StabilizerMps`, an :class:`pepsy.MpsOptimizer`-style
+unchanged), and :class:`MpsStabOptimizer`, an :class:`pepsy.MpsOptimizer`-style
 gate-stream simulator supporting Clifford gates, non-Clifford Pauli rotations,
-explicit gate matrices, and sub-MPO events.
+explicit gate matrices, sub-MPO events, and Pauli measurements.
 """
 
+from .mps_stab_optimizer import MpsStabOptimizer
 from .operators import pauli_combo_mpo, pauli_rotation_mpo, single_qubit_rotation_matrix
-from .stabilizer_mps import StabilizerMps
 from .stn_state import STNState
+
+# Backwards-compatible alias (the class was briefly named ``StabilizerMps``).
+StabilizerMps = MpsStabOptimizer
 
 __all__ = [
     "STNState",
+    "MpsStabOptimizer",
     "StabilizerMps",
     "pauli_combo_mpo",
     "pauli_rotation_mpo",

@@ -69,7 +69,7 @@ The concrete pepsy + stim call surface is in
 Phases 1–4 exist and are validated against dense/stim (`tests/test_stabilizer_tn.py`):
 `STNState` (tableau + `|nu>`), Clifford update, non-Clifford rotations, explicit gate
 matrices, sub-MPO events, and Pauli measurement — all exposed through
-`pepsy.stabilizer_tn.StabilizerMps`, an `MpsOptimizer`-style gate-stream simulator.
+`pepsy.stabilizer_tn.MpsStabOptimizer`, an `MpsOptimizer`-style gate-stream simulator.
 
 **Key verified shortcut (use this, not the CNOT-cascade masks).** Because
 $|\psi\rangle = C|\nu\rangle$ with $C$ the tableau Clifford, a physical Pauli operator

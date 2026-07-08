@@ -31,8 +31,13 @@ non-Clifford gates and measurements update `|nu>`.
   forced outcomes; `("measure", ...)` stream entry.
 - **Sub-MPO events** — `("submpo", mpo, where)` applied to `|nu>` (coefficient
   frame), matching the `MpsOptimizer` contract.
-- Simulator front end: `StabilizerMps` (gate stream, `chi`, `track_infidelity`,
+- Simulator front end: `MpsStabOptimizer` (gate stream, `chi`, `track_infidelity`,
   `infidelities`, `bond_history`, `set_gates`/`add_gates`/`run`/`apply`).
+- **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_nu` and the
+  matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_nu` classmethods.
+- **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports running chi
+  and cumulative infidelity); `norm()` returns the `|nu>` norm.
+- `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
 
 ## Cross-checked against the reference (bsc-quantic/stabilizer-TN v1.1/v1.2)
 
@@ -56,7 +61,7 @@ Ordered by value/effort. None are started.
   hidden bit shift).
 - Impact: turns our exact non-Clifford path from chi-growing into poly-scaling for
   T-doped circuits. Needs an ancilla-qubit + measurement-conditioned Clifford
-  correction protocol layered on `StabilizerMps`.
+  correction protocol layered on `MpsStabOptimizer`.
 
 ### R2. Clifford disentangling sweep (repo-aligned)
 - CAMPS: Qian, Huang, Qin, PRL 133, 190402 (arXiv:2405.09217); Clifford-dressed
@@ -82,6 +87,24 @@ Ordered by value/effort. None are started.
   (requires updating `tests/test_public_api.py`).
 - A small deterministic example: `|T>^n` at chi=1, and a magic-vs-chi growth demo
   (paper Fig. 2).
+
+### R7. Long-range gates / layout (subtle — different from `MpsOptimizer`)
+`MpsOptimizer.LayoutFinder` reorders MPS sites from the *physical* gate supports to
+avoid long-range (SWAP-heavy, chi-growing) gates. That pre-pass does **not** carry
+over directly to the STN: a *physical* local non-Clifford gate becomes an operator
+`M = C^dagger O C` on `|nu>` whose support is set by the *running tableau* `C` and
+can be spread/non-contiguous, and it changes as Clifford gates accumulate. So the
+`|nu>`-side "gate stream" is dynamic, not statically known from the input circuit.
+Options, in order of value:
+- Reduce spread at the source with the **R2 Clifford disentangling sweep** (absorb a
+  2-qubit Clifford into `C` to localize/shrink the current `M`) — the principled fix.
+- Center the multi-qubit rotation on the innermost affected `|nu>` site (paper Fig. 4)
+  and/or adapt the TN geometry to connectivity to hit the `4·chi` (not `16·chi`) bound.
+- A dynamic per-step layout: permute `|nu>` sites (= relabel destabilizer generators,
+  a basis choice tracked in the tableau) to cluster the current `M` support before a
+  spread rotation. This is a real feature but must stay consistent with the tableau.
+Do **not** reuse `MpsOptimizer.gate_stream_layout` on the physical stream expecting it
+to minimize `|nu>` long-range gates.
 
 ### R6. Further leads (not prioritized)
 - Hybrid Stabilizer MPO (arXiv:2405.06045) for operator/density-matrix simulation.

@@ -76,6 +76,58 @@ class STNState:
         self.nu = ps_to_mps(n, dtype=dtype)
 
     # ------------------------------------------------------------------ #
+    # Initial-state constructors
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def zero(cls, n: int, *, dtype: str = "complex128") -> "STNState":
+        """Return the ``|0...0>`` state (same as ``STNState(n)``)."""
+        return cls(n, dtype=dtype)
+
+    @classmethod
+    def from_bits(cls, bits, *, dtype: str = "complex128") -> "STNState":
+        """Return a computational-basis product state from ``bits``.
+
+        ``bits`` may be a string like ``"0110"`` or a sequence of 0/1.
+        """
+        if isinstance(bits, str):
+            bits = [int(b) for b in bits]
+        bits = [int(b) for b in bits]
+        state = cls(len(bits), dtype=dtype)
+        for i, b in enumerate(bits):
+            if b:
+                state.x(i)
+        return state
+
+    @classmethod
+    def ghz(cls, n: int, *, dtype: str = "complex128") -> "STNState":
+        """Return the ``n``-qubit GHZ state ``(|0...0> + |1...1>)/sqrt(2)``.
+
+        Built from a Clifford circuit (H + CNOT chain), so it is a stabilizer
+        state: the tableau carries the entanglement and ``|nu>`` stays chi=1.
+        """
+        state = cls(n, dtype=dtype)
+        state.h(0)
+        for i in range(n - 1):
+            state.cnot(i, i + 1)
+        return state
+
+    @classmethod
+    def from_tableau_and_nu(cls, sim, nu, *, dtype: str = "complex128") -> "STNState":
+        """Wrap a user-supplied stim tableau simulator and coefficient MPS.
+
+        ``sim`` is a :class:`stim.TableauSimulator` (the basis Clifford ``C``)
+        and ``nu`` a quimb MPS coefficient state.  Both must describe the same
+        number of qubits/sites; the state represents ``|psi> = C|nu>``.
+        """
+        new = cls.__new__(cls)
+        new.n = int(nu.L)
+        new.dtype = dtype
+        sim.set_num_qubits(new.n)
+        new._sim = sim
+        new.nu = nu
+        return new
+
+    # ------------------------------------------------------------------ #
     # Properties
     # ------------------------------------------------------------------ #
     @property
