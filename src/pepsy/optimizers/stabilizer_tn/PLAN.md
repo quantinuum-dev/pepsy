@@ -103,8 +103,13 @@ Ordered by value/effort. None are started.
   - General diagonal `Rz(phi)` injection: **DONE for `phi` a multiple of `pi/4`**
     via `inject_rz(data, ancilla, phi)` (+ `inject_t`/`inject_tdg` wrappers;
     `prepare_magic(a, angle=phi)`), where the correction `Rz(2*phi)` is Clifford.
-    Angles that are *not* a multiple of `pi/4` still need a *recursive* /
-    repeat-until-success gadget (raises for now).
+    For an *arbitrary* angle injection has **no scaling benefit** (the resource
+    `Rz(phi)|+>` is itself prepared with a `|nu>` rotation), so those stay on the
+    exact rotation path or should be compiled to Clifford+T (gridsynth) and
+    injected — a RUS gadget is intentionally not added.
+  - Injection locality: `run_with_injection` picks the **nearest clean ancilla**
+    to each data qubit (shorter localizer span); a spread ancilla pool then cuts
+    the swap cost the scaling benchmark exposed for a single trailing ancilla.
   - Preallocate a magic-ancilla register + a `t_via_injection`/circuit-rewrite
     front end that replaces every `("t", q)` stream entry with an injection so a
     T-doped circuit never touches the `|nu>` rotation path. **DONE** —
@@ -143,12 +148,12 @@ Ordered by value/effort. None are started.
 ### R4. Sampling & observables
 - Computational-basis shot sampling via `pepsy.MpsSampler` on `|nu>` mapped
   through `C`; batched expectation values.
-- **STATUS: first cut DONE** — `sample_bits(shots, seed)` does chain-rule
-  (sequential `Z`-measurement) sampling on a per-shot copy, and
-  `probability_bits(bits)` returns `|<bits|psi>|^2` as a product of conditional
-  Born probabilities — both `O(n)` MPS measurements instead of an `O(2^n)`
-  statevector. **Next:** batched/tree sampling (avoid the per-shot copy) and a
-  `MpsSampler`-backed path for many shots.
+- **STATUS: first cut DONE** — `sample_bits(shots, seed)` does **perfect (tree)**
+  sampling (shots sharing a measured prefix share the collapsed state — one state
+  copy per genuine branch, not per shot), and `probability_bits(bits)` returns
+  `|<bits|psi>|^2` as a product of conditional Born probabilities — both `O(n)`
+  MPS measurements instead of an `O(2^n)` statevector. **Next:** a
+  `MpsSampler`-backed path for very large shot counts.
 - **Micro-perf (absorb path): DONE** — the basis-updating measurement's CNOT
   ladder now pivots on the *median* of the support and merges nearest sites
   first, minimising the MPS swap distance (`swap_sites_with_compress` was the

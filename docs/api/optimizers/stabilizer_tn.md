@@ -28,12 +28,17 @@ outcome[, absorb_basis]])`, and `("reset", where)`.
 - `run_with_injection(gates, *, ancillas, ...)` and the `with_injection(n_data,
   gates, *, n_ancilla=1, ...)` classmethod — a circuit-rewrite front end that
   auto-teleports every `t` / `tdg` / `pi/4`-`rz` in a stream through `inject_rz`,
-  recycling the ancilla pool (a single ancilla suffices).
+  recycling the ancilla pool (a single ancilla suffices). It picks the nearest
+  clean ancilla to each data qubit, so a spread pool shortens the localizer span.
+  Arbitrary (non-`pi/4`) `rz` angles stay on the exact rotation path (injecting
+  them has no scaling benefit; compile to Clifford+T to inject).
 
 ## Scalable sampling
 
-- `sample_bits(shots, *, seed=None)` — computational-basis bitstrings sampled by
-  the chain rule (sequential `Z`-measurement), avoiding an `O(2**n)` statevector.
+- `sample_bits(shots, *, seed=None)` — computational-basis bitstrings by **perfect
+  (tree) sampling**: shots sharing a measured prefix share the collapsed state, so
+  the collapse work is done once per distinct prefix, not per shot (a large saving
+  for structured/low-rank `|nu>`). No `O(2**n)` statevector is formed.
 - `probability_bits(bits)` — `|<bits|psi>|**2` as a product of conditional Born
   probabilities.
 

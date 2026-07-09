@@ -376,22 +376,45 @@ class MpsStabOptimizer:
     def sample_bits(self, shots: int = 1, *, seed=None) -> np.ndarray:
         """Sample computational-basis bitstrings ``x ~ |<x|psi>|**2`` (scalable).
 
-        Chain-rule sampling: on an independent copy per shot, measure
-        ``Z_0 ... Z_{n-1}`` with Born collapse — no ``2**n`` statevector is ever
-        formed.  Returns an ``(shots, n)`` ``int8`` array of 0/1 with qubit ``q``
-        in column ``q`` (qubit 0 first).
-
-        Note: this copies the state per shot (``O(shots * n)`` measurements);
-        batched/tree sampling is a future optimisation.
+        Uses **perfect (tree) sampling**: shots that share a measured prefix
+        share the collapsed state, so the ``Z_0 ... Z_{n-1}`` collapse work is
+        done once per distinct prefix rather than once per shot — a large saving
+        for low-rank/structured ``|nu>`` (e.g. a state copy happens only at a
+        genuine branch point, not per shot).  Returns an ``(shots, n)`` ``int8``
+        array of 0/1 with qubit ``q`` in column ``q`` (qubit 0 first).  Rows are
+        grouped by prefix (order is irrelevant for i.i.d. samples).
         """
         rng = self._rng if seed is None else np.random.default_rng(seed)
         shots = int(shots)
         out = np.empty((shots, self.n), dtype=np.int8)
-        for s in range(shots):
-            tmp = self.copy()
-            tmp._rng = rng
-            for q in range(self.n):
-                out[s, q] = 0 if tmp.measure("Z", q) > 0 else 1
+        if shots == 0:
+            return out
+        # Stack of (collapsed_sim, qubit, lo, hi): rows [lo:hi) share this state.
+        stack = [(self.copy(), 0, 0, shots)]
+        while stack:
+            sim, q, lo, hi = stack.pop()
+            count = hi - lo
+            exp = sim.expectation("Z", q)
+            p0 = min(max(0.5 * (1.0 + exp), 0.0), 1.0)  # P(bit q = 0 | prefix)
+            if p0 <= 1e-12:
+                n0 = 0
+            elif p0 >= 1.0 - 1e-12:
+                n0 = count
+            else:
+                n0 = int(rng.binomial(count, p0))
+            mid = lo + n0
+            out[lo:mid, q] = 0
+            out[mid:hi, q] = 1
+            if q + 1 == self.n:
+                continue  # last qubit: bits written, nothing left to collapse
+            both = 0 < n0 < count
+            if n0 > 0:
+                s0 = sim.copy() if both else sim
+                s0.measure("Z", q, outcome=+1)  # collapse this branch to |0>_q
+                stack.append((s0, q + 1, lo, mid))
+            if n0 < count:
+                sim.measure("Z", q, outcome=-1)  # reuse original for the |1> branch
+                stack.append((sim, q + 1, mid, hi))
         return out
 
     def probability_bits(self, bits) -> float:
@@ -798,9 +821,12 @@ class MpsStabOptimizer:
         """Apply ``Rz(phi)`` to ``data`` by magic-state injection (gate teleportation).
 
         Generalises :meth:`inject_t`.  ``phi`` must be a multiple of ``pi/4`` so
-        the outcome correction ``Rz(2*phi)`` is Clifford; other angles require a
-        recursive / repeat-until-success gadget (not implemented).  The
-        ``ancilla`` must already hold the matching magic state
+        the outcome correction ``Rz(2*phi)`` is Clifford.  For an *arbitrary*
+        angle there is no scaling benefit to injecting: the resource state
+        ``Rz(phi)|+>`` would itself be prepared with a rotation on ``|nu>``, so
+        just apply the gate directly (``("rz", phi, q)`` routes to the exact
+        rotation path) or compile it to Clifford+T (e.g. gridsynth) and inject
+        each ``T``.  The ``ancilla`` must already hold the matching magic state
         ``|M> = Rz(phi)|+>`` (call ``prepare_magic(ancilla, angle=phi)`` first).
 
         Steps: ``CNOT(control=data, target=ancilla)`` (Clifford, tableau only);
@@ -816,8 +842,9 @@ class MpsStabOptimizer:
         if abs(k - round(k)) > 1e-9:
             raise ValueError(
                 "inject_rz requires phi a multiple of pi/4 (so the Rz(2*phi) "
-                "correction is Clifford); general angles need a recursive gadget "
-                "(not implemented)."
+                "correction is Clifford). For an arbitrary angle, apply it "
+                "directly as ('rz', phi, q) (exact rotation path) or compile to "
+                "Clifford+T (e.g. gridsynth) and inject each T."
             )
         data, ancilla = int(data), int(ancilla)
         # CNOT(control=data, target=ancilla): Clifford, tableau only.
@@ -911,7 +938,6 @@ class MpsStabOptimizer:
         pool_set = set(pool)
         entries = self._as_entries(gates)
         dirty = {a: False for a in pool}
-        nxt = 0  # round-robin cursor into the pool
 
         pbar = None
         if progbar and entries:
@@ -928,15 +954,20 @@ class MpsStabOptimizer:
                     raise ValueError(
                         f"injection target qubit {data} is in the ancilla pool {pool}."
                     )
-                a = pool[nxt]
-                nxt = (nxt + 1) % len(pool)
-                if dirty[a]:
-                    if not recycle:
-                        raise RuntimeError(
-                            "magic-ancilla pool exhausted (recycle=False); "
-                            "reserve more ancillas or allow recycling."
-                        )
+                # Prefer the nearest *clean* ancilla to the data qubit (shorter
+                # localizer span -> fewer MPS swaps); recycle the nearest dirty
+                # one only if no clean ancilla is left.
+                clean = [a for a in pool if not dirty[a]]
+                if clean:
+                    a = min(clean, key=lambda x: abs(x - data))
+                elif recycle:
+                    a = min(pool, key=lambda x: abs(x - data))
                     self.reset(a)
+                else:
+                    raise RuntimeError(
+                        "magic-ancilla pool exhausted (recycle=False); "
+                        "reserve more ancillas or allow recycling."
+                    )
                 self.prepare_magic(a, angle=phi)
                 self.inject_rz(data, a, phi)
                 dirty[a] = True

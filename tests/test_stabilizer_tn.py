@@ -859,6 +859,13 @@ def test_sample_bits_stabilizer_ghz_support():
     assert rows.issubset({(0, 0, 0), (1, 1, 1)})
 
 
+def test_sample_bits_deterministic_product_state():
+    # A computational-basis product state samples that bitstring with certainty.
+    sim = MpsStabOptimizer.from_bits("1011")
+    s = sim.sample_bits(64, seed=0)
+    assert np.all(s == np.array([1, 0, 1, 1], dtype=np.int8))
+
+
 def test_copy_is_independent():
     sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
     clone = sim.copy()
@@ -981,6 +988,21 @@ def test_run_with_injection_no_recycle_exhausts():
     sim = MpsStabOptimizer(3)
     with pytest.raises(RuntimeError, match="exhausted"):
         sim.run_with_injection([("t", 0), ("t", 1)], ancillas=[2], recycle=False)
+
+
+def test_run_with_injection_spread_pool_matches_direct():
+    # Ancillas interspersed among data qubits (nearest-pick locality path).
+    # Injecting the T gates must equal applying them directly on the same register.
+    n = 5
+    pool = [1, 3]
+    stream = [("h", 0), ("cnot", 0, 2), ("t", 4), ("rz", np.pi / 4, 0),
+              ("cnot", 2, 4), ("t", 2), ("tdg", 0)]
+    direct = MpsStabOptimizer(n).apply(stream)   # T applied directly; qubits 1,3 stay |0>
+    inj = MpsStabOptimizer(n)
+    inj.run_with_injection(stream, ancillas=pool)  # teleport via spread ancillas, reset at end
+    assert _fidelity(inj.to_statevector(), direct.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+    for a in pool:  # ancillas returned to |0>
+        assert inj.expectation("Z", a) == pytest.approx(1.0, abs=1e-9)
 
 
 def test_run_with_injection_reset_ancillas_leaves_zero():
