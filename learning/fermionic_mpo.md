@@ -78,6 +78,37 @@ are produced by the native fermionic contraction. The bridge now:
 This is the part that makes high-bond evolved states agree, not just small
 product-state or two-site checks.
 
+## Debosonization (`SymDMRG2.fermionic_state()`)
+
+The inverse bridge turns a bosonic JW MPS (a `SymDMRG2` ground state) back into
+a native fermionic Symmray MPS, so the literal DMRG state can drive fermionic
+gate streams and observables. `MpsEnergyOptimizer._debosonize_fermionic_tn`
+undoes the bosonization sign flips (they are self-inverse) and rebuilds each
+site with `FermionicArray.from_blocks(..., label=site)` so odd-parity tensors
+regain their dummy mode. `SymDMRG2.fermionic_state()` wraps this using the
+fermionic `init_mps` as the metadata template. It is a per-site gauge change:
+bond dimensions, charges, block sectors, and shapes are all preserved.
+
+Leg-order gotcha: `from_blocks` is leg-order sensitive. `for_model` and the
+bosonization keep the physical leg last (`('b0-1','k0')`), but quimb's `DMRG2`
+leaves the physical leg first on the boundary tensor (`('k0','b0-1')`).
+Reconstructing from that order silently corrupts the fermionic swap phases: the
+bosonic-MPO sandwich energy and all diagonal / even-parity observables stay
+correct, but the native-fermionic term energy and odd (single-fermion)
+correlators come out wrong, so `SymMPS.energy(terms)` no longer equals the MPO
+energy. The fix normalizes each site to physical-leg-last (a phase-free bosonic
+transpose) before reconstruction.
+
+Because the corruption is invisible to diagonal observables and to the MPO
+energy, the correctness criterion is the same terms-vs-MPO check used in
+`fh_mps.ipynb`: `SymMPS.energy(ham.terms) == <psi|H_mpo|psi>`, cross-checked
+against dense Jordan-Wigner ED (doublon and eta-pairing correlators match
+exactly). A separate, pre-existing caveat: measuring a *single-fermion*
+`<c^dag_i c_j>` via `measure([Cdag, C])` needs odd-parity operators with
+dummy-mode labels, so it can differ from ED with an "odd parity, no label"
+warning; that is a measurement-operator issue, not a state bug, and it affects a
+native reference state identically.
+
 ## Validation Status
 
 Committed implementation:

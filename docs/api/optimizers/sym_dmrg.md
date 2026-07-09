@@ -35,7 +35,21 @@ For Symmray Fermi-Hubbard MPOs, Pepsy assumes an OBC MPS/MPO chain and a
 bosonic/Jordan-Wigner Symmray MPO whenever the input MPS uses fermionic
 Symmray arrays that need bosonization; fermionic Symmray tensors in that MPO
 are rejected before the state is bosonized. Periodic lattice edges should be
-encoded as long-range terms in that OBC MPO, not as a cyclic MPS. Pepsy builds
+encoded as long-range terms in that OBC MPO, not as a cyclic MPS.
+
+`SymDMRG2` optimizes in this bosonic Jordan-Wigner representation, so its
+`state` holds ordinary abelian Symmray arrays. `SymDMRG2.fermionic_state()`
+converts that converged state back into a native fermionic Symmray `SymMPS`
+with exactly the same bond dimension, ready for fermionic gate streams (for
+example real-time light-pulse evolution) and fermionic observables. The
+conversion is the exact inverse of the bosonization; it normalizes each site
+tensor to physical-leg-last before rebuilding the fermionic array, because
+quimb's `DMRG2` can leave the physical leg first on the boundary tensor and the
+fermionic reconstruction is leg-order sensitive. It requires the optimizer to
+have been built from a fermionic `SymMPS` `init_mps` template, which supplies
+the fermionic metadata (physical sectors, edges).
+
+Pepsy builds
 dense left/right environments for `<psi|MPO|psi>`, block-sparse environments
 for the projected `H_eff`, and dense debug environments for `N_eff`. Before
 Symmray sweeps that are not already using explicit sector enrichment or the
