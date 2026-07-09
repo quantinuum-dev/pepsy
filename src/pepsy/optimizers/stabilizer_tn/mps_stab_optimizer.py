@@ -1025,17 +1025,25 @@ class MpsStabOptimizer:
 
         import stim
 
-        try:
-            tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-        except (ValueError, RuntimeError):
-            tableau = None
+        # NOTE: stim.Tableau.from_unitary_matrix does NOT verify unitarity, so a
+        # non-unitary matrix that happens to be close to a Clifford (e.g. the
+        # near-identity weighted "coin" (1-p)I + pX) would be silently accepted
+        # as that Clifford and misapplied. Only attempt the tableau route when the
+        # gate is actually unitary.
+        tableau = None
+        gate_is_unitary = _is_unitary(gate)
+        if gate_is_unitary:
+            try:
+                tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
+            except (ValueError, RuntimeError):
+                tableau = None
 
         if tableau is not None:  # Clifford -> tableau update
             self.state.do_tableau(tableau, where)
             self._record(0.0)
             return
 
-        if nq == 1 and _is_unitary(gate):  # non-Clifford 1q unitary -> ZYZ
+        if nq == 1 and gate_is_unitary:  # non-Clifford 1q unitary -> ZYZ
             alpha, theta, beta = _zyz_angles(gate)
             q = where[0]
             self._apply_rotation("rz", (beta, q))

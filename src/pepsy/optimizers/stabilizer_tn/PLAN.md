@@ -361,6 +361,20 @@ contracted by `[1,1]`, weights on cap or edges).
   distance-3 patch, and plot logical margin + truncation infidelity vs the `chi`
   cap; diff `|nu>` bond against the existing plain capped detector-MPS to see if
   offloading the fan-out CNOTs to the tableau shrinks it.
+- **Empirical (2026-07, `/tmp/stn_dem_bond.py`, exact `chi=None`).** For graph-like
+  DEMs the tableau does **not** shrink the marginal bond: repetition-code d=5 gives
+  `chi(plain)=chi(STN)=2` (states identical, fid=1.0). Reason: the bond-2->bond-1
+  win holds only for an *isolated* mechanism; once mechanisms **overlap** (share a
+  detector) a later coin's frame image `C^dag X_{pivot} C` spreads through the
+  accumulated tableau, so `|nu>` reacquires the bond. So the image/kernel split is
+  defeated by mechanism overlap, and the plain `to_mps` marginal (already bond ~2
+  for graph-like codes) is not beaten by the STN. Still worth checking on
+  higher-degree / circuit-level (hyperedge) DEMs where the plain bond is larger,
+  but the graph-like case is a negative result. **Caught + fixed a real
+  `MpsStabOptimizer` bug in the process:** `stim.Tableau.from_unitary_matrix` does
+  not verify unitarity, so a near-Clifford *non-unitary* gate (the coin
+  `(1-p)I+pX`) was silently accepted as the identity tableau; `_apply_matrix` now
+  guards with `_is_unitary(gate)` first (regression tests added).
 
 ---
 

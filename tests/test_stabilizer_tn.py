@@ -291,6 +291,34 @@ def test_simulator_two_qubit_nonclifford_matrix_supported():
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_near_clifford_nonunitary_matrix_not_misrouted_to_tableau():
+    # (1-p)I + pX is NON-unitary but close to the identity Clifford; because
+    # stim.Tableau.from_unitary_matrix does not verify unitarity, it must not be
+    # accepted as a tableau and applied as a no-op. (Regression: DEM "coin".)
+    p = 0.1
+    coin = (1 - p) * _I + p * _X
+    for n, q in [(1, 0), (3, 1)]:
+        sim = MpsStabOptimizer(n).apply([(coin, q)])
+        psi = sim.to_statevector()
+        zero = np.zeros(2 ** n, dtype=complex); zero[0] = 1.0
+        ref = _apply_gate_dense(zero, coin, (q,), n)
+        assert _fidelity(psi, ref) == pytest.approx(1.0, abs=1e-9)
+        assert not np.allclose(psi, zero)  # state actually changed
+
+
+def test_weighted_xor_matrix_matches_dense():
+    # (1-p)I + p X^{⊗k} weighted-XOR gate (the capped DEM mechanism), non-unitary
+    # and near-Clifford, on non-adjacent qubits.
+    p = 0.2
+    xx = np.kron(_X, _X)
+    wxor = (1 - p) * np.eye(4, dtype=complex) + p * xx
+    prep = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1)])
+    psi0 = prep.to_statevector()
+    prep.apply([(wxor, (0, 2))])
+    ref = _apply_gate_dense(psi0, wxor, (0, 2), 3)
+    assert _fidelity(prep.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
 # --------------------------------------------------------------------------- #
 # Measurement (Lemma 3): expectation, forced collapse, Born sampling
 # --------------------------------------------------------------------------- #
