@@ -1901,6 +1901,32 @@ class SymDMRG2:
         """Current optimized state, or the initial state before solving."""
         return self._state
 
+    def fermionic_state(self):
+        """Return the current state as a native fermionic Symmray ``SymMPS``.
+
+        ``SymDMRG2`` optimizes in a Jordan-Wigner *bosonic* representation, so
+        :attr:`state` holds plain abelian Symmray tensors (``U1``/``U1U1``).
+        This converts that state back into a native fermionic MPS with exactly
+        the same bond dimension, suitable for fermionic gate streams (for
+        example real-time light-pulse evolution) and fermionic observables.
+
+        Requires that the optimizer was built from a fermionic ``SymMPS``
+        template via ``init_mps``; that template supplies the fermionic
+        metadata (physical sectors, edges) for the returned state.
+        """
+        from .energy.peps import MpsEnergyOptimizer
+
+        template = self.init_mps
+        if template is None or not hasattr(template, "psi"):
+            raise ValueError(
+                "fermionic_state() requires a fermionic SymMPS `init_mps` "
+                "template to supply the fermionic metadata."
+            )
+        fermionic_tn = MpsEnergyOptimizer._debosonize_fermionic_tn(self.state)
+        result = template.copy()
+        result.psi = fermionic_tn
+        return result
+
     @property
     def initial_energy(self):
         """Initial energy estimate, optionally computed lazily."""

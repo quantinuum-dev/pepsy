@@ -3092,3 +3092,101 @@ def test_symdmrg2_spinless_fermi_hubbard_u1_matches_jw_ed():
     )
 
     assert energy == pytest.approx(e_ed, abs=1e-8)
+
+
+def _u1u1_ground_doublon_densities(L, edges, total_charge, *, t, U, mu):
+    """Per-site double-occupancy densities of the fixed-sector JW ground state."""
+    n_modes = 2 * L
+    dense = _dense_jw_fermi_hubbard(L, edges, t=t, U=U, mu=mu)
+    sector = _u1u1_sector_indices(L, total_charge)
+    sector_ham = (dense[np.ix_(sector, sector)]).copy()
+    sector_ham = (sector_ham + sector_ham.conj().T) / 2
+    evals, evecs = np.linalg.eigh(sector_ham)
+    psi = np.zeros(2**n_modes, dtype=complex)
+    psi[sector] = evecs[:, 0]
+    eye = np.eye(2)
+    zed = np.array([[1.0, 0.0], [0.0, -1.0]])
+    lower = np.array([[0.0, 1.0], [0.0, 0.0]])
+
+    def annihilate(mode):
+        mats = [zed] * mode + [lower] + [eye] * (n_modes - mode - 1)
+        out = mats[0]
+        for mat in mats[1:]:
+            out = np.kron(out, mat)
+        return out
+
+    densities = []
+    for site in range(L):
+        num_up = annihilate(2 * site).conj().T @ annihilate(2 * site)
+        num_dn = annihilate(2 * site + 1).conj().T @ annihilate(2 * site + 1)
+        densities.append(float(np.real(psi.conj() @ (num_up @ num_dn) @ psi)))
+    return float(evals[0].real), densities
+
+
+def test_symdmrg2_fermionic_state_roundtrip_and_observables():
+    """`SymDMRG2.fermionic_state()` returns a bond-preserving native fermionic
+    MPS whose observables match dense Jordan-Wigner ED, and the underlying
+    debosonize inverts bosonize exactly."""
+    pytest.importorskip("symmray")
+    L = 4
+    t, U = 1.0, 6.0
+    occ = [(1, 0), (0, 1)] * (L // 2)
+    edges = [(s, s + 1) for s in range(L - 1)]
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", edges, t=t, U=U, mu=0.0
+    )
+    mpo = ham.to_mpo(L=L, compress=True, cutoff=1e-12)
+    init = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        L,
+        bond_dim=1,
+        site_charge=site_charge_from_occupations(occ),
+        seed=7,
+        dtype="complex128",
+    )
+
+    # debosonize(bosonize(x)) == x on an entangled fermionic state, with the
+    # bond dimension preserved (per-site gauge change, so chi is unchanged).
+    meo = pepsy.MpsEnergyOptimizer
+    rnd = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        L,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations(occ),
+        seed=3,
+        dtype="complex128",
+    )
+    back = meo._debosonize_fermionic_tn(meo._bosonize_fermionic_tn(rnd.tn))
+    overlap = abs(complex((rnd.tn.H & back).contract(all, optimize="auto-hq")))
+    norm = abs(complex((rnd.tn.H & rnd.tn).contract(all, optimize="auto-hq")))
+    assert overlap / norm == pytest.approx(1.0, abs=1e-9)
+    assert int(back.max_bond()) == int(rnd.tn.max_bond())
+
+    opt = _symdmrg2_solve(mpo, init, 16, sweeps=15)
+    gs = opt.fermionic_state()
+
+    # the fermionic image has exactly the DMRG bond dimension ...
+    assert int(gs.tn.max_bond()) == int(opt.state.max_bond())
+    # ... and its native fermionic tensors carry genuine block structure.
+    _assert_block_sparse(_mps_tensors(gs), "U1U1", "fermionic_state()")
+
+    # the DMRG energy matches dense Jordan-Wigner ED for this sector, and the
+    # fermionic image reproduces that same energy through the bosonic MPO
+    # sandwich (fermionic_state -> bosonize -> <psi|H|psi>).
+    e_ed, dd_ed = _u1u1_ground_doublon_densities(
+        L, edges, opt.total_charge, t=t, U=U, mu=0.0
+    )
+    assert float(np.real(opt.energy)) == pytest.approx(e_ed, abs=1e-6)
+    e_ferm = complex(
+        meo(gs, mpo, energy_per_site=False, real=False).energy().energy
+    )
+    assert e_ferm.real == pytest.approx(float(np.real(opt.energy)), abs=1e-9)
+
+    # native fermionic observables of the debosonized state match ED exactly.
+    doublon = np.diag([0.0, 0.0, 0.0, 1.0]).astype(complex)
+    dd_gs = [
+        float(np.real(gs.measure(doublon, where=s, charge=(0, 0),
+                                 contraction_opt="auto-hq")))
+        for s in range(L)
+    ]
+    assert np.allclose(dd_gs, dd_ed, atol=1e-6)

@@ -936,6 +936,106 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         return target
 
     @classmethod
+    def _debosonize_fermionic_tn(cls, tn):
+        """Inverse of :meth:`_bosonize_fermionic_tn`.
+
+        Convert a bosonic Jordan-Wigner Symmray MPS (for example a ``SymDMRG2``
+        ground state, whose site tensors are plain abelian ``U1``/``U1U1``
+        arrays) back into a native fermionic Symmray MPS. It undoes the
+        left-to-right contraction sign flips introduced by bosonization and
+        restores the fermionic dummy modes via ``from_blocks(..., label=site)``.
+
+        The transform is a per-site gauge change: bond dimensions, tensor
+        charges, block sectors, and block shapes are all preserved, so the
+        fermionized MPS has exactly the same bond dimension as the input. The
+        sign pattern is self-inverse, hence ``debosonize(bosonize(x)) == x``.
+        """
+        import symmray.utils as sr_utils  # pylint: disable=import-outside-toplevel
+
+        target = tn.copy()
+        if not hasattr(target, "L"):
+            tensors = tuple(target)
+        else:
+            tensors = tuple(target[site] for site in range(int(target.L)))
+
+        tensor_charges = [
+            getattr(getattr(tensor, "data", None), "charge", None)
+            for tensor in tensors
+        ]
+        # Sites whose bosonic array we convert back to a fermionic array.
+        tensor_is_target = [
+            cls._is_symmray_array(getattr(tensor, "data", None))
+            and not cls._is_fermionic_array(getattr(tensor, "data", None))
+            for tensor in tensors
+        ]
+        prefix_charge = None
+        for site, tensor in enumerate(tensors):
+            data = getattr(tensor, "data", None)
+            if not tensor_is_target[site]:
+                if cls._is_symmray_array(data):
+                    prefix_charge = cls._charge_add(
+                        prefix_charge,
+                        getattr(data, "charge", None),
+                    )
+                continue
+            symmetry = cls._symmray_symmetry_name(data)
+            if symmetry is None:
+                continue
+            array_cls = sr_utils.get_array_cls(symmetry, fermionic=True)
+            tensor_charge = getattr(data, "charge", None)
+            if prefix_charge is None:
+                prefix_charge = cls._charge_zero_like(tensor_charge)
+            prefix_after = cls._charge_add(prefix_charge, tensor_charge)
+
+            phys_ind = f"k{site}"
+            try:
+                phys_axis = tensor.inds.index(phys_ind)
+            except ValueError:
+                phys_axis = len(tensor.inds) - 1
+
+            right_axis = None
+            if site + 1 < len(tensors):
+                right_inds = [
+                    ind
+                    for ind in tensor.inds
+                    if ind in set(tensors[site + 1].inds)
+                ]
+                if right_inds:
+                    right_axis = tensor.inds.index(right_inds[0])
+            next_dummy_parity = (
+                cls._charge_parity(tensor_charges[site + 1])
+                if site + 1 < len(tensors) and tensor_is_target[site + 1]
+                else 0
+            )
+            dummy_crossing_parity = (
+                cls._charge_parity(prefix_after) & next_dummy_parity
+            )
+
+            blocks = {}
+            for sector, block in data.blocks.items():
+                exponent = 0
+                if right_axis is not None:
+                    # Same left-to-right fermionic contraction phase used by
+                    # bosonization; applying it a second time inverts it.
+                    right_parity = cls._charge_parity(sector[right_axis])
+                    phys_parity = cls._charge_parity(sector[phys_axis])
+                    exponent ^= right_parity & (phys_parity ^ 1)
+                    exponent ^= dummy_crossing_parity
+                block = cls._copy_array_like(block)
+                blocks[sector] = -block if exponent else block
+            tensor.modify(
+                data=array_cls.from_blocks(
+                    blocks,
+                    duals=data.duals,
+                    charge=tensor_charge,
+                    symmetry=symmetry,
+                    label=site,
+                )
+            )
+            prefix_charge = prefix_after
+        return target
+
+    @classmethod
     def _terms_from_hamiltonian(cls, hamiltonian):
         if cls._is_mpo_hamiltonian(hamiltonian):
             return hamiltonian
