@@ -137,6 +137,12 @@ class MpsStabOptimizer:
         Seed for the random-number generator used by measurement sampling.
     dtype : str
         Coefficient-state dtype (used when creating a state from ``n``).
+    to_backend : callable | None
+        Optional array converter (e.g. ``pepsy.backend_torch(...)`` /
+        ``pepsy.backend_cupy(...)`` / ``pepsy.backend_jax(...)``).  When given,
+        the coefficient MPS ``|nu>`` and every gate/MPO applied to it are placed
+        on that backend, so the heavy MPS contractions run on GPU/torch/JAX.  The
+        stim tableau (classical Clifford tracking) stays on the CPU.
     inplace : bool
         If ``True`` (default) mutate the provided ``state``; otherwise operate
         on a copy.
@@ -163,6 +169,7 @@ class MpsStabOptimizer:
         track_infidelity: bool = False,
         seed: Optional[int] = None,
         dtype: str = "complex128",
+        to_backend=None,
         inplace: bool = True,
     ):
         if isinstance(state, STNState):
@@ -177,6 +184,13 @@ class MpsStabOptimizer:
         self.track_infidelity = bool(track_infidelity)
         self.dtype = self.state.dtype
         self._rng = np.random.default_rng(seed)
+
+        self.to_backend = to_backend
+        self._bk_cache: dict = {}
+        if to_backend is not None:
+            # Place the coefficient MPS |nu> on the requested backend; gate/MPO
+            # arrays are converted on the fly by the _bk* helpers below.
+            self.state.p.apply_to_arrays(to_backend)
 
         self._queue: List[object] = []
         self.infidelities: List[float] = []
@@ -308,7 +322,7 @@ class MpsStabOptimizer:
 
     def norm(self) -> float:
         """Norm of the coefficient state ``|nu>`` (represented state norm; ~1)."""
-        return float(abs(self.state.p.norm()))
+        return float(abs(self._to_scalar(self.state.p.norm())))
 
     def pseudo_stabilizer_rank(self, tol: float = 1e-12) -> int:
         """Pseudo-stabilizer rank ``xi_tilde`` = number of non-zero ``nu_i``."""
@@ -322,7 +336,39 @@ class MpsStabOptimizer:
             cutoff=self.cutoff,
             track_infidelity=self.track_infidelity,
             dtype=self.dtype,
+            to_backend=self.to_backend,
         )
+
+    # ------------------------------------------------------------------ #
+    # Backend helpers (place |nu> gates/MPOs on the configured backend)
+    # ------------------------------------------------------------------ #
+    def _bk(self, mat) -> np.ndarray:
+        """Backend copy of a (possibly parametrized) gate matrix (dtype-cast)."""
+        arr = np.asarray(mat, dtype=self.dtype)
+        return self.to_backend(arr) if self.to_backend is not None else arr
+
+    def _bk_const(self, tag: str, mat):
+        """Backend copy of a *constant* gate matrix, cached by ``tag``."""
+        if self.to_backend is None:
+            return np.asarray(mat, dtype=self.dtype)
+        cached = self._bk_cache.get(tag)
+        if cached is None:
+            cached = self.to_backend(np.asarray(mat, dtype=self.dtype))
+            self._bk_cache[tag] = cached
+        return cached
+
+    def _bk_mpo(self, mpo):
+        """Place a sub-MPO's arrays on the configured backend (in place)."""
+        if self.to_backend is not None:
+            mpo.apply_to_arrays(self.to_backend)
+        return mpo
+
+    @staticmethod
+    def _to_scalar(x) -> complex:
+        """Convert a (possibly backend) 0-d tensor/array to a Python complex."""
+        from autoray import to_numpy  # pylint: disable=import-outside-toplevel
+
+        return complex(np.asarray(to_numpy(x)))
 
     # ------------------------------------------------------------------ #
     # Scalable computational-basis sampling (no 2**n statevector)
@@ -472,7 +518,7 @@ class MpsStabOptimizer:
         if len(support) == 1:
             q = support[0]
             umat = single_qubit_rotation_matrix(theta, terms[q], sign, self.dtype)
-            self.state.p.gate_(umat, q, contract=True)
+            self.state.p.gate_(self._bk(umat), q, contract=True)
             self._record(0.0)
             return
         # Multi-qubit Pauli rotation: windowed bond-dim-2 sub-MPO applied only on
@@ -480,7 +526,7 @@ class MpsStabOptimizer:
         c = np.cos(theta / 2)
         coef = -1j * sign * np.sin(theta / 2)
         mpo, where = pauli_combo_submpo(c, coef, terms, self.n, dtype=self.dtype)
-        self._record(self._evolve_p(mpo, where))
+        self._record(self._evolve_p(self._bk_mpo(mpo), where))
 
     def _evolve_p(self, mpo, where, *, renormalize: bool = False) -> float:
         """Apply a windowed sub-MPO to the coefficient MPS ``p`` on ``where``.
@@ -494,7 +540,7 @@ class MpsStabOptimizer:
             target = p.copy()
             target.gate_with_submpo_(mpo, where=where, cutoff=self.cutoff)
             p.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
-            infidelity = max(0.0, float(1.0 - abs(tn_fidelity(p, target))))
+            infidelity = max(0.0, float(1.0 - abs(self._to_scalar(tn_fidelity(p, target)))))
         else:
             p.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
             infidelity = 0.0
@@ -525,9 +571,9 @@ class MpsStabOptimizer:
             return float(sign)
         m_p = p.copy()
         for site, axis in terms.items():
-            m_p.gate_(pauli_matrix(axis).astype(self.dtype), site, contract=True)
-        num = complex(p.H @ m_p)
-        den = complex(p.H @ p)
+            m_p.gate_(self._bk_const("P" + axis, pauli_matrix(axis)), site, contract=True)
+        num = self._to_scalar(p.H @ m_p)
+        den = self._to_scalar(p.H @ p)
         return float(sign * np.real(num / den))
 
     def expectation(self, pauli, where=None) -> float:
@@ -664,8 +710,8 @@ class MpsStabOptimizer:
         # Single-qubit Z_k measurement on the reframed coefficient state.
         p = self.state.p
         z_p = p.copy()
-        z_p.gate_(pauli_matrix("Z").astype(self.dtype), k, contract=True)
-        zexp = float(np.real(complex(p.H @ z_p) / complex(p.H @ p)))
+        z_p.gate_(self._bk_const("PZ", pauli_matrix("Z")), k, contract=True)
+        zexp = float(np.real(self._to_scalar(p.H @ z_p) / self._to_scalar(p.H @ p)))
         p_o_plus = 0.5 * (1.0 + s * zexp)  # prob(outcome O = +1)
         if outcome is None:
             m = 1 if self._rng.random() < p_o_plus else -1
@@ -687,17 +733,17 @@ class MpsStabOptimizer:
         infidelity = 0.0
         for name, targ in ops:
             if name == "h":
-                p.gate_(_H_MAT.astype(self.dtype), targ[0], contract=True)
+                p.gate_(self._bk_const("H", _H_MAT), targ[0], contract=True)
             elif name == "sdg":
-                p.gate_(_SDG_MAT.astype(self.dtype), targ[0], contract=True)
+                p.gate_(self._bk_const("SDG", _SDG_MAT), targ[0], contract=True)
             elif name == "cnot":
-                cnot = _CNOT_MAT.astype(self.dtype)
+                cnot = self._bk_const("CNOT", _CNOT_MAT)
                 if self.track_infidelity and self.chi is not None:
                     target = p.copy()
                     target.gate_(cnot, targ, contract="swap+split", cutoff=self.cutoff)
                     p.gate_(cnot, targ, contract="swap+split",
                             max_bond=self.chi, cutoff=self.cutoff)
-                    infidelity += max(0.0, float(1.0 - abs(tn_fidelity(p, target))))
+                    infidelity += max(0.0, float(1.0 - abs(self._to_scalar(tn_fidelity(p, target)))))
                 else:
                     p.gate_(cnot, targ, contract="swap+split",
                             max_bond=self.chi, cutoff=self.cutoff)
@@ -707,7 +753,7 @@ class MpsStabOptimizer:
         """Project coefficient site ``k`` onto ``|keep_bit>`` and renormalize ``|nu>``."""
         proj = np.zeros((2, 2), dtype=self.dtype)
         proj[keep_bit, keep_bit] = 1.0
-        self.state.p.gate_(proj, k, contract=True)
+        self.state.p.gate_(self._bk(proj), k, contract=True)
         self.state.p.normalize()
 
     def _apply_projector(self, terms, sign, m) -> None:
@@ -720,12 +766,12 @@ class MpsStabOptimizer:
         if len(support) == 1:
             q = support[0]
             proj = single_qubit_combo_matrix(0.5, coef, terms[q], self.dtype)
-            self.state.p.gate_(proj, q, contract=True)
+            self.state.p.gate_(self._bk(proj), q, contract=True)
             self.state.p.normalize()
             self._record(0.0)
             return
         mpo, where = pauli_combo_submpo(0.5, coef, terms, self.n, dtype=self.dtype)
-        infidelity = self._evolve_p(mpo, where, renormalize=True)
+        infidelity = self._evolve_p(self._bk_mpo(mpo), where, renormalize=True)
         self._record(infidelity)
 
     # ------------------------------------------------------------------ #
@@ -1005,7 +1051,7 @@ class MpsStabOptimizer:
             for w, sites in branches:
                 branch = p.copy()
                 for site, axis in sites.items():
-                    branch.gate_(pauli_matrix(axis).astype(self.dtype), site, contract=True)
+                    branch.gate_(self._bk_const("P" + axis, pauli_matrix(axis)), site, contract=True)
                 branch = w * branch
                 if result is None:
                     result = branch
@@ -1020,7 +1066,7 @@ class MpsStabOptimizer:
             target = build(None)
             truncated = build(self.chi)
             self.state.p = truncated
-            return max(0.0, float(1.0 - abs(tn_fidelity(truncated, target))))
+            return max(0.0, float(1.0 - abs(self._to_scalar(tn_fidelity(truncated, target)))))
         self.state.p = build(self.chi)
         return 0.0
 
@@ -1035,7 +1081,7 @@ class MpsStabOptimizer:
         use a dense ``(matrix, where)`` entry, which is frame-mapped for you.
         """
         self.state.p.gate_with_submpo_(
-            mpo,
+            self._bk_mpo(mpo),
             where=where,
             max_bond=self.chi,
             cutoff=self.cutoff,

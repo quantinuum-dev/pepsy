@@ -293,7 +293,9 @@ class STNState:
 
     def p_dense(self) -> np.ndarray:
         """Dense coefficient vector ``p`` (big-endian, length ``2**n``)."""
-        return np.asarray(self.p.to_dense(), dtype=self.dtype).reshape(-1)
+        from autoray import to_numpy  # pylint: disable=import-outside-toplevel
+
+        return np.asarray(to_numpy(self.p.to_dense()), dtype=self.dtype).reshape(-1)
 
     # Backward-compatible alias.
     nu_dense = p_dense

@@ -990,3 +990,60 @@ def test_run_with_injection_reset_ancillas_leaves_zero():
     # ancilla qubit 1 is back to |0> -> <Z_1> = +1
     assert sim.expectation("Z", 1) == pytest.approx(1.0, abs=1e-9)
 
+
+# --------------------------------------------------------------------------- #
+# Backend / GPU: |nu> and gates on a torch backend (skips without torch)
+# --------------------------------------------------------------------------- #
+def _torch_backend():
+    torch = pytest.importorskip("torch")
+    import pepsy as py
+    return py.backend_torch(dtype=torch.complex128, device="cpu")
+
+
+def test_torch_backend_matches_numpy():
+    tb = _torch_backend()
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("rz", np.pi / 4, 1),
+              ("ry", 0.7, 3), ("cnot", 2, 3), ("tdg", 0)]
+    cpu = MpsStabOptimizer(4, seed=0).apply(stream)
+    gpu = MpsStabOptimizer(4, seed=0, to_backend=tb).apply(stream)
+    # |nu> tensors live on the torch backend
+    assert type(gpu.state.p[0].data).__module__.split(".")[0] == "torch"
+    assert _fidelity(cpu.to_statevector(), gpu.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+    for axis in ("X", "Y", "Z"):
+        for q in range(4):
+            assert gpu.expectation(axis, q) == pytest.approx(cpu.expectation(axis, q), abs=1e-6)
+    assert gpu.norm() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_torch_backend_absorb_measure_matches_numpy():
+    tb = _torch_backend()
+    circ = [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 1), ("ry", 0.9, 2)]
+    for m in (+1, -1):
+        cpu = MpsStabOptimizer(3).apply(circ)
+        cpu.measure("Z", 1, outcome=m, absorb_basis=True)
+        gpu = MpsStabOptimizer(3, to_backend=tb).apply(circ)
+        gpu.measure("Z", 1, outcome=m, absorb_basis=True)
+        assert _fidelity(cpu.to_statevector(), gpu.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_torch_backend_injection_and_sampling():
+    tb = _torch_backend()
+    # injection on the torch backend reproduces T
+    sim = MpsStabOptimizer(2, to_backend=tb)
+    sim.state.h(0)
+    sim.prepare_magic(1)
+    sim.inject_t(0, 1, outcome=+1)
+    ref = MpsStabOptimizer(1).apply([("h", 0), ("t", 0)])
+    full = sim.to_statevector().reshape(2, 2)
+    dv = full[:, 0] if np.linalg.norm(full[:, 0]) > np.linalg.norm(full[:, 1]) else full[:, 1]
+    assert _fidelity(dv, ref.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+    # probability_bits and sampling work off the backend state
+    circ = [("h", 0), ("cnot", 0, 1), ("t", 1)]
+    gpu = MpsStabOptimizer(2, to_backend=tb).apply(circ)
+    cpu = MpsStabOptimizer(2).apply(circ)
+    for k in range(4):
+        b = format(k, "02b")
+        assert gpu.probability_bits(b) == pytest.approx(cpu.probability_bits(b), abs=1e-6)
+    s = gpu.sample_bits(64, seed=0)
+    assert s.shape == (64, 2) and set(np.unique(s)).issubset({0, 1})
+

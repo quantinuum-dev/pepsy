@@ -37,6 +37,18 @@ outcome[, absorb_basis]])`, and `("reset", where)`.
 - `probability_bits(bits)` — `|<bits|psi>|**2` as a product of conditional Born
   probabilities.
 
+## Backends (GPU / torch / JAX)
+
+Pass `to_backend=` (e.g. `pepsy.backend_torch(dtype=torch.complex128,
+device="cuda")`, `pepsy.backend_cupy(...)`, `pepsy.backend_jax(...)`) to the
+constructor or `with_injection`.  The coefficient MPS `|nu>` and every gate/MPO
+applied to it are then placed on that backend, so the heavy MPS contractions
+(SVD, `swap+split`, sub-MPO application) run on GPU/torch/JAX.  The stim tableau
+(classical Clifford tracking) stays on the CPU.  Constant gate matrices are
+cached per backend; expectation/fidelity scalars are converted back to Python
+floats.  `to_statevector` / `amplitude` bring `|nu>` back to NumPy and are for
+small-`n` validation only.
+
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.stabilizer_tn.mps_stab_optimizer
    :members:

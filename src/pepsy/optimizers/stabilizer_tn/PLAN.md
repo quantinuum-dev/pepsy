@@ -149,6 +149,11 @@ Ordered by value/effort. None are started.
   ladder now pivots on the *median* of the support and merges nearest sites
   first, minimising the MPS swap distance (`swap_sites_with_compress` was the
   dominant cost; ~3.6x faster on a spread `n=20` measurement).
+- **Backend / GPU: DONE** — `MpsStabOptimizer(..., to_backend=...)` (e.g.
+  `pepsy.backend_torch` / `backend_cupy` / `backend_jax`) places `|nu>` and every
+  gate/MPO on that backend; the stim tableau stays on the CPU. Validated: torch
+  `|nu>` matches the NumPy path (fidelity 1.0) for gates, absorb-measurement,
+  injection, and sampling.
 
 ### R5. Packaging & examples
 - Optionally expose `MpsStabOptimizer` at top-level `pepsy.*` + `docs/api/`
