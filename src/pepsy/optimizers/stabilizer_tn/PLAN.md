@@ -203,6 +203,83 @@ to minimize `|nu>` long-range gates.
 
 ---
 
+## Big directions (research, not scheduled)
+
+### R8. Stabilizer PEPS (Clifford tableau x 2D coefficient PEPS)
+Generalise `|psi> = C |nu>` from an MPS `|nu>` to a **2D PEPS** coefficient state,
+keeping the stim tableau `C` for the Clifford/stabilizer part. Motivation: a 2D
+system's physical entanglement obeys a 2D area law, so an MPS `|nu>` must snake
+through 2D and its bond blows up, while a PEPS `|nu>` respects the lattice; the
+tableau absorbs the stabilizer entanglement (free), leaving a compact "magic
+PEPS". Natural fit for 2D stabilizer codes (surface/color) with magic/coherent
+noise — the natively-2D analog of the decoder idea below.
+- Reuse: `STNState` tableau + `frame_pauli`; `pepsy.ps_to_peps`, `PepsOptimizer`,
+  `SimpleUpdateGen` for gate application; `build_bra_ket` -> `BdyMPS` ->
+  `contract_boundary` + `normalize`/`infidelity` for expectations/normalisation;
+  `SymDMRG2` on the **boundary MPS** inside the PEPS contraction.
+- Hard parts: (1) frame image `M = C^dag O C` can spread across the lattice and a
+  spread operator on a PEPS is expensive -> the **localizer + R2 disentangling
+  become load-bearing** (absorb Cliffords so each `M` is geometrically local
+  before touching the PEPS); (2) PEPS contraction is approximate (boundary bond
+  `chi_b`), so measurement/normalisation lose the 1D STN's exactness; (3) R2 both
+  shrinks the PEPS bond and localises the frame operators.
+- Tradeoff: 1D STN buys exactness; 2D buys geometry. Wins iff the entanglement is
+  mostly Clifford (large for codes, marginal for generic). First target: a
+  surface-code patch + a few `T`s.
+- Minimal de-risking slice: `PepsStabOptimizer` skeleton (tableau + `ps_to_peps`
+  `|nu>`); one **local** non-Clifford rotation via frame-map -> localizer ->
+  small gate/PEPO -> truncate; expectation via `contract_boundary`; validate
+  `|psi> = C|nu>` against dense / `MpsStabOptimizer` on a 2x2 / 2x3 lattice
+  (exact) before any surface-code demo.
+
+### R9. STN-native DEM / maximum-likelihood decoder
+Decode a detector error model (DEM) directly on `MpsStabOptimizer`. A DEM gate
+stream (Tensy `_dem_gate_stream`) is **all-Clifford XORs (CNOTs) plus one
+single-qubit non-unitary branch weight per mechanism**, which is exactly the STN
+split: XORs -> tableau (free), branch weights -> `|nu>`.
+- **Key structure.** Branch weight `[[w0,0],[w1,0]]` on a fresh `|0>` error site
+  `e_i` gives `w0|0> + w1|1>` (a biased-coin *product* magic state), so after all
+  mechanisms `|nu>` is a **product state (bond 1)** and the linear XOR parity map
+  lives entirely in the tableau `C`. All the decoding cost is in **conditioning
+  the detectors on the observed syndrome**: measuring `Z_{d_j}` has frame image
+  `M_j = C^dag Z_{d_j} C = Z_{d_j} * prod_{i in j} Z_{e_i}` (the detector's error
+  neighborhood — geometrically local), and projecting `|nu>` onto the syndrome
+  signs is what grows the coefficient bond.
+- **Why small chi should work.** After conditioning, `|nu>`'s entanglement is the
+  entanglement of the *posterior* `P(e | syndrome)`. Below threshold the posterior
+  has a short correlation length (sparse, local errors) -> area law -> small `chi`;
+  `chi` grows with the posterior correlation length as `p` -> threshold. So `chi`
+  is a principled knob that **interpolates MWPM (chi=1) <-> exact MLD (chi=inf)**,
+  capturing the leading soft-decoding corrections to MWPM.
+- **p -> 0 (and beta -> inf) becomes easy.** `w1 = p^beta -> 0`, so each error site
+  `-> |0>` (stabilizer) and `|nu> -> |0...0>` (bond 1); the posterior concentrates
+  on the minimum-weight error, i.e. decoding reduces to MWPM and is exact at
+  `chi=1`. Equivalently `chi` sets the order of the low-`p` series: bond
+  `2^k` captures error configurations up to `k` excess faults. (Tempering
+  `beta -> inf` coincides with the `p -> 0` concentration.)
+- **Parallelism / tricks.**
+  - Apply all branch weights first (product, free); the tableau `C` and the frame
+    operators `M_j = C^dag Z_{d_j} C`, `M_L = C^dag Z_L C` are computed **once**,
+    independent of the syndrome.
+  - Across shots the operators are identical and only the projector **signs**
+    (the syndrome) differ -> **vmap/batch the signs** (mirrors Tensy
+    `decode_tn_signed` with `chunk_size`).
+  - Both logical cosets come from one conditioned `|nu>` via
+    `<nu| (I +- M_L)/2 |nu>` -> a single margin read.
+  - Order the `e_i` sites with the Tensy `LayoutFinder` so each `M_j` is
+    contiguous (local projections -> small `chi`); process detectors in a
+    sweep/frontier order so `|nu>` only carries a local entangled frontier
+    (matches the MPS-frontier layout objective).
+  - `absorb_basis=True` conditioning keeps the projected detector qubits out of
+    `|nu>`; R2 disentangling localises spread `M_j`.
+- **First slice.** Name->index adapter from Tensy `GateStreamModel`
+  (`e*`/`k*` string sites, `kind="branch_weight"|"xor"`) to `MpsStabOptimizer`
+  int qubits + `(matrix, where)` / Clifford entries; decode by conditioning on a
+  Stim detector sample and reading the `M_L` margin; validate against the exact
+  DEM-TN contraction on a distance-3 surface code, then sweep `chi` vs `p`.
+
+---
+
 ## Validation
 
 Run `pytest -q tests/test_stabilizer_tn.py`. Every new update rule must be
