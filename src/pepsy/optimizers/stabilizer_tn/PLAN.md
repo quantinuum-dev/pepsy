@@ -315,6 +315,47 @@ contracted by `[1,1]`, weights on cap or edges).
   plateaus** (the tracked truncation infidelity signals when `chi` is too small).
   Needed `chi` is small below threshold, grows toward threshold, `= 1` exact at
   `p -> 0` / `beta -> inf`.
+- **The tableau is always there (correction).** When the capped stream is built
+  *on `MpsStabOptimizer`*, every fan-out CNOT goes into the tableau and only the
+  single-qubit coin touches `|nu>`, so the Clifford split is preserved by
+  construction — capping never "gives it up". (Earlier wording that plain capping
+  discards the tableau was wrong: `MpsStabOptimizer` always factors out the
+  Clifford; only a *plain* MPS build with no tableau, i.e. `to_mps`, keeps the XOR
+  in the bond.) Concretely, one error flipping `d1,d2` gives marginal
+  `w0|00> + w1|11>` = **bond 2 as a plain MPS** (`to_mps`), but
+  `= CNOT(d1->d2) (w0|0>+w1|1>)_{d1} |0>_{d2}` = **one tableau CNOT x a bond-1
+  coin** — so the tableau turns bond 2 into bond 1.
+- **What `|nu>`'s bond measures: image vs kernel.** The tableau absorbs the
+  *injective* part of the syndrome map (unique error <-> syndrome, tree-like); it
+  is the **image** of the check matrix and is free. `|nu>`'s bond grows only from
+  **degeneracy** — several error patterns giving the *same* syndrome, i.e. the
+  **kernel/cycles** of the check matrix (stabilizer relations + logicals),
+  weighted by `p`. So `chi(|nu>) <= chi(to_mps)`, with `|nu>` bond `= 1` for a
+  tree-like Tanner graph or `p -> 0`, and `> 1` only from the code's degeneracy —
+  exactly the decoding-relevant part. `to_mps` (no tableau) instead carries the
+  full image+kernel correlation in its bond.
+- **Logical via `[1,-1]` cap (free).** Capping the logical leg with `[1,-1]`
+  reads the **margin** `P(L=0) - P(L=1)` directly and folds each logical-flipping
+  mechanism into a **sign** on its coin (`M_i = (1-p)I +- p X_{S_i^det}`); the
+  logical is not a kept site. Clamping the observed syndrome on the detector legs
+  is then the margin.
+- **Gate/truncation counts.** Per mechanism: `2(|S_i|-1)` CNOTs (graph-like `~2`,
+  boundary `0`) -> tableau (free); exactly **one** coin (non-Clifford) -> `|nu>`.
+  So `~2 * #mechanisms` free CNOTs and `#mechanisms` truncation-bearing coins.
+- **Cap at the beginning vs end vs don't-cap (same object, different cost).** The
+  final `|nu>` bond is identical (it is the kernel/degeneracy structure); only the
+  path differs:
+  - *Cap at the beginning* (stream weighted-XOR gates onto the **detector-only**
+    register): incremental, `chi`-truncation-controlled sweep — best for building
+    a reusable open-leg marginal MPS (build once, clamp many syndromes).
+  - *Cap at the end* (build the bond-1 un-capped STN on errors+detectors, then sum
+    the error legs): bigger register, and all bond growth dumped into one
+    poorly-controlled final contraction — worse as a build.
+  - *Don't cap — condition*: keep the trivially cheap bond-1 un-capped STN and
+    project the detectors onto each observed syndrome; the tableau stays and
+    `|nu>` grows only by the conditioned degeneracy — the cheapest path for actual
+    decoding (operators are syndrome-independent; batch over shots by flipping
+    projector signs).
 - **Experiment.** Build the capped weighted-XOR stream (`("cnot", ...)` fan-outs
   in the tableau + `((1-p)I + p X, s0)` coins) on `MpsStabOptimizer`, decode a
   distance-3 patch, and plot logical margin + truncation infidelity vs the `chi`
