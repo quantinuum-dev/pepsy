@@ -981,13 +981,27 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             symmetry = cls._symmray_symmetry_name(data)
             if symmetry is None:
                 continue
+            # Normalize the leg order so the physical index is last, matching
+            # the convention assumed by the fermionic sign reconstruction (and
+            # produced by ``_bosonize_fermionic_tn`` / ``SymMPS.for_model``).
+            # Some producers (notably quimb's ``DMRG2``) leave the physical leg
+            # first on the boundary tensor; reconstructing the fermionic array
+            # from that order corrupts the fermionic swap phases and yields a
+            # state that is right for the bosonic sandwich but wrong for native
+            # fermionic gates/off-diagonal correlators. A bosonic transpose is
+            # phase-free, so this reorder is safe and gauge-preserving.
+            phys_ind = f"k{site}"
+            if phys_ind in tensor.inds and tensor.inds[-1] != phys_ind:
+                new_order = [ind for ind in tensor.inds if ind != phys_ind]
+                new_order.append(phys_ind)
+                tensor.transpose(*new_order, inplace=True)
+                data = tensor.data
             array_cls = sr_utils.get_array_cls(symmetry, fermionic=True)
             tensor_charge = getattr(data, "charge", None)
             if prefix_charge is None:
                 prefix_charge = cls._charge_zero_like(tensor_charge)
             prefix_after = cls._charge_add(prefix_charge, tensor_charge)
 
-            phys_ind = f"k{site}"
             try:
                 phys_axis = tensor.inds.index(phys_ind)
             except ValueError:

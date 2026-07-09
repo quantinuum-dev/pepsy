@@ -3182,6 +3182,18 @@ def test_symdmrg2_fermionic_state_roundtrip_and_observables():
     )
     assert e_ferm.real == pytest.approx(float(np.real(opt.energy)), abs=1e-9)
 
+    # CRITICAL operator-consistency check: the *native fermionic* energy path
+    # (``SymMPS.energy`` applies the fermionic two-site terms directly, which is
+    # leg-order sensitive) must also reproduce the DMRG energy. This is what
+    # fails if the fermionic swap phases are wrong -- e.g. quimb's ``DMRG2``
+    # leaves the physical leg first on the boundary tensor, so the fermionic
+    # reconstruction must renormalize the leg order. "terms == MPO" is the
+    # off-diagonal correctness criterion (a bad state gives the right diagonal
+    # observables and MPO energy but a wrong term-based energy).
+    e_terms = complex(gs.energy(hamiltonian=ham))
+    assert e_terms.real == pytest.approx(float(np.real(opt.energy)), abs=1e-6)
+    assert abs(e_terms.imag) < 1e-6
+
     # native fermionic observables of the debosonized state match ED exactly.
     doublon = np.diag([0.0, 0.0, 0.0, 1.0]).astype(complex)
     dd_gs = [
