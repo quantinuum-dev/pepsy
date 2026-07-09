@@ -278,6 +278,49 @@ split: XORs -> tableau (free), branch weights -> `|nu>`.
   Stim detector sample and reading the `M_L` margin; validate against the exact
   DEM-TN contraction on a distance-3 surface code, then sweep `chi` vs `p`.
 
+#### R9a. Capped variant (detectors as sites, errors summed out)
+The dual construction that matches the existing Tensy output-MPS decoders
+(`DemTn(coalesce_errors=True)`, `to_mps` output-only). Here the MPS **sites are
+the detectors (+ logical)** and each error mechanism is **capped/summed** (leg
+contracted by `[1,1]`, weights on cap or edges).
+- **Capping = a weighted-XOR gate.** Summing error `e_i` collapses mechanism `i`
+  to `M_i = (1-p) I + p * X_{S_i}` on its incident detectors+logical `S_i`
+  (non-unitary, non-Clifford; only **two** Pauli terms).
+- **It is still "CNOTs + non-Clifford".** With pivot `s0 in S_i` and
+  `V = prod CNOT(s0 -> s)`, `V X_{s0} V^dag = X_{S_i}`, so
+  `M_i = V [ (1-p)I + p X_{s0} ] V^dag` = CNOT fan-out (Clifford) . single-qubit
+  non-unitary coin . CNOT fan-out. So the capped stream is CNOTs + 1-qubit
+  non-unitary coins, now running **detector<->detector** with coins on detector
+  sites (error ancillas folded away).
+- **Capping does NOT kill the stabilizer split** *iff* the fan-out CNOTs stay in
+  the **tableau** (free) instead of being contracted into an MPS bond. Then
+  `|nu>` is a **detector-site** coefficient MPS with the linear/XOR structure
+  offloaded to `C` — the synthesis of "detectors as sites" + "linear map free".
+  A *plain* capped detector-MPS (direct tensor contraction, no tableau) instead
+  bakes that XOR into the bond; that is the representation to beat. Realise `M_i`
+  either as `_apply_dense_gate` (2-branch `(1-p)I + p C^dag X_{S_i} C`) or as the
+  explicit coin + tableau CNOTs.
+- **Where the bond grows.** Un-capped: `|nu>` product until conditioning. Capped:
+  coins hit shared, already-entangled detector sites, so `|nu>`'s bond builds up
+  **during the sweep** (same total entanglement, paid earlier). Duals across the
+  check matrix (error-site MPS <-> detector-site MPS); which has the smaller bond
+  depends on the DEM degree structure (errors vs detectors), so pick the side
+  with the lower-degree/more-local operators.
+- **chi as the accuracy dial (both variants).** Applying a coin **grows** the raw
+  bond (its frame image `C^dag X_S C` is generally spread -> ~doubles bond on its
+  support); the variational/`chi`-truncation step then **caps** it. So the sweep
+  is grow(gate) -> compress(optimize) -> repeat; the optimizer keeps `chi`
+  bounded, it does not raise it. `chi = 1` ~ BP/MWPM, `chi -> inf` = exact MLD, so
+  you **raise the `chi` cap until the logical margin `<nu|(I +- M_L)/2|nu>`
+  plateaus** (the tracked truncation infidelity signals when `chi` is too small).
+  Needed `chi` is small below threshold, grows toward threshold, `= 1` exact at
+  `p -> 0` / `beta -> inf`.
+- **Experiment.** Build the capped weighted-XOR stream (`("cnot", ...)` fan-outs
+  in the tableau + `((1-p)I + p X, s0)` coins) on `MpsStabOptimizer`, decode a
+  distance-3 patch, and plot logical margin + truncation infidelity vs the `chi`
+  cap; diff `|nu>` bond against the existing plain capped detector-MPS to see if
+  offloading the fan-out CNOTs to the tableau shrinks it.
+
 ---
 
 ## Validation
