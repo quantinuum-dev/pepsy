@@ -113,7 +113,11 @@ Ordered by value/effort. None are started.
     through `inject_rz`, recycling the ancilla pool (size 1 suffices; inject frees
     the ancilla immediately). Validated == direct replay on the data marginal.
   - Benchmark: T-doped-Clifford circuit at large `N`, fixed `t` — show `|nu>`
-    bond bounded by ~`2^t` independent of `N` (paper Fig. 2).
+    bond bounded by ~`2^t` independent of `N` (paper Fig. 2). **DONE** —
+    `benchmarks/stabilizer_tn_magic_scaling.py` sweeps `N` at fixed `t` (direct
+    and injection modes, any backend) and reports the max `|nu>` bond / rank /
+    time; confirms the bond stays `<= 2^t` and flat in `N`. Smoke-tested in
+    `tests/test_stabilizer_tn.py`.
 
 ### R2. Clifford disentangling sweep (repo-aligned)
 - CAMPS: Qian, Huang, Qin, PRL 133, 190402 (arXiv:2405.09217); Clifford-dressed

@@ -1047,3 +1047,31 @@ def test_torch_backend_injection_and_sampling():
     s = gpu.sample_bits(64, seed=0)
     assert s.shape == (64, 2) and set(np.unique(s)).issubset({0, 1})
 
+
+# --------------------------------------------------------------------------- #
+# Benchmark smoke test (keeps benchmarks/stabilizer_tn_magic_scaling.py working)
+# --------------------------------------------------------------------------- #
+def _load_magic_scaling_benchmark():
+    import importlib.util
+    import pathlib
+
+    path = (pathlib.Path(__file__).resolve().parents[1]
+            / "benchmarks" / "stabilizer_tn_magic_scaling.py")
+    spec = importlib.util.spec_from_file_location("stn_magic_scaling_bench", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_magic_scaling_benchmark_smoke():
+    bench = _load_magic_scaling_benchmark()
+    # circuit generator produces exactly t T-gates, independent of n
+    stream = bench.random_clifford_t_circuit(n=5, t=3, depth=4, seed=0)
+    assert sum(1 for e in stream if e[0] == "t") == 3
+    # both modes keep the |nu> bond bounded by 2^t
+    for mode in ("direct", "injection"):
+        res = bench.run_case(n=5, t=3, depth=4, seed=0, chi=None,
+                             mode=mode, to_backend=None, rank_max_n=8)
+        assert res["max_nu_bond"] <= 2 ** 3
+        assert res["pseudo_stabilizer_rank"] is not None
+
