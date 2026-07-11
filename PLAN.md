@@ -1,7 +1,7 @@
 # PLAN.md — pepsy roadmap
 
 Status: living document
-Last updated: 2026-07-03
+Last updated: 2026-07-11
 Owners: pepsy maintainers + coding agents
 
 This document tracks the planned workstreams for `pepsy` (boundary-MPS tools for
@@ -13,7 +13,8 @@ Current package version: `0.2.0` (`pepsy.__version__` / `pyproject.toml`).
 
 Four headline workstreams drive the roadmap:
 
-1. **Belief propagation** contraction (+ loop / cluster expansion corrections).
+1. **Belief propagation** contraction (+ loop / cluster expansion corrections,
+   + disordered-memory / relay-BP convergence robustness).
 2. **quimb integration** — lean on `quimb` / `cotengra` / `autoray` rather than
    reimplementing tensor-network primitives.
 3. **Symmetric & fermionic tensors** via `symmray`.
@@ -62,6 +63,56 @@ boundary-MPS / CTMRG become impractical.
 - Concept note: `learning/bp.md`.
 - Alkabetz & Arad (2021); Tindall & Fishman (2023).
 
+### Convergence robustness — disordered-memory / relay-BP
+
+Raw BP (§1) and the loop expansion (§2) both need a **converged, normalized BP
+fixed point**. On frustrated / degenerate networks — and on QEC decoding graphs
+in particular — BP often fails to converge: symmetric messages oscillate on
+short-cycle trapping sets. Plan a convergence-robust BP mode in `pepsy.bp`:
+
+- Start from quimb's **1-norm** BP (`L1BP` / `HV1BP` / `D1BP`) for the
+  partition-function-style (nonnegative) contractions that decoding needs,
+  wrapped per §3 rather than hand-rolled.
+- Add a **disordered-memory / relay-BP** extension (Müller et al.,
+  arXiv:2506.01779): per-variable random memory strengths `gamma_i` (including
+  negative “anti-memory”) that break the symmetric fixed points, plus **relay**
+  legs (warm-start + re-randomized disorder, keep the best result). quimb's
+  `damping` is a *uniform* `(old, new)` callable, so the per-node disorder needs
+  a small `BeliefPropagationCommon` subclass overriding the message update
+  (~tens of lines); the relay outer loop reuses `messages=` warm-start +
+  `run(info=...)` convergence flags.
+- Return the standard `BPResult` gauge/messages so a converged fixed point is
+  available to **feed §2 loop corrections** (which require a normalized fixed
+  point) and to gauge the optimizers. Track the per-run message residual as a
+  first-class convergence signal.
+
+**Prototyped (2026-07-11):** `pepsy.bp.relay_bp` / `one_norm_bp` (new
+`src/pepsy/bp/` subpackage) wrap quimb's 1-norm BP (`L1BP` / `HV1BP` / `D1BP`)
+and apply per-node disordered memory around quimb's `iterate` on the public
+`messages` dict (quimb's `damping` is uniform, so the per-node strength is
+applied in a thin driver), with relayed warm-started legs returning the
+best-converged fixed point as a `RelayBPResult`. Kept out of the lazy top-level
+namespace (`import pepsy.bp`) while it is a prototype; tests in
+`tests/test_bp_relay.py`. Next: recompute the post-mix residual for the
+convergence check, expose the fixed point as a `BPResult` gauge, and wire it to
+the §2 loop corrections.
+
+#### Relationship to tensy
+
+tensy already ships a **standalone classical** relay-BP on the DEM Tanner graph
+(`tensy.decoders.RelayBpDecoder`, NumPy normalized min-sum) as the QEC-decoder
+baseline. The pepsy work is the **tensor-network** generalization: relay-BP on
+quimb TN messages plus loop corrections, exposed as a clean pepsy public API
+that tensy's Phase-E TN-BP / tensor-network-message-passing decoder consumes.
+Keep decoder-specific glue in tensy and the TN-BP machinery in pepsy.
+
+#### References
+
+- Müller et al., *Improved belief propagation is sufficient for real-time
+  decoding of quantum memory*, arXiv:2506.01779 (relay-BP / disordered memory).
+- Wang et al., *Tensor Network Message Passing*, Phys. Rev. Lett. 132, 117401
+  (2024), arXiv:2305.01874 (exact short-loop clusters + BP messages).
+
 ---
 
 ## 2. Loop / cluster expansion corrections
@@ -87,6 +138,20 @@ exponential suppression of high-degree loops.
 
 - Show the dominant (genus-1) loop correction improves on raw BP by orders of
   magnitude toward the large-`chi` boundary-MPS reference.
+
+**Prototyped (2026-07-11):** `pepsy.bp.loop_cluster_expand` / `LoopClusterResult`
+(`src/pepsy/bp/cluster.py`) wrap quimb's generalized-loop **cluster** expansion
+(`D2BP` / `D1BP`.`contract_gloop_expand`), with the product (Eq. 2) and sum
+(Eq. 1) formulas, message reuse (`.expand(gloops)`), and a `norm` toggle
+(`"2norm"` = `D2BP` wavefunction norm, `"1norm"` = `D1BP` scalar TN). Validated in
+`tests/test_bp_cluster.py`: on a 3×3 `D=2` PEPS the error falls 22 % (BP) →
+machine-exact as the cluster covers the lattice, and — the key point of
+arXiv:2510.05647 — at a system-covering cluster the estimate is **bit-identical**
+for converged vs unconverged BP messages, i.e. the cluster expansion does not
+need a BP fixed point for correctness. It is more convergence-robust than the
+loop *series* expansion (whose `I − m⊗m` projectors rely on the fixed point).
+Next: a PEPS local-observable / energy helper (product & sum formulas) with
+Wynn-ε extrapolation.
 
 ### References
 
