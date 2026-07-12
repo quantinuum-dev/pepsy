@@ -181,6 +181,32 @@ SVD truncation against that better environment:
   `RegionGraph` for the cluster environment; feed the result to the boundary /
   PEPS optimizers (§4) as a drop-in higher-fidelity `chi`-reduction.
 
+**How the truncation uses the environment.** The cluster expansion only supplies
+a better *metric* — the environment `N` (a positive Gram matrix / two-site
+reduced density matrix) — not the truncation itself. Compressing a bond `A—B`
+means finding `Ã, B̃` (bond `D`) that minimise the **environment-weighted**
+error `‖ψ(Ã,B̃) − ψ(A,B)‖²`, a quadratic form `x†N x − x†b − b†x` in
+`x = (Ã, B̃)`. So plain SVD is optimal only for `N = I`; with a real environment
+there are two regimes:
+
+- **One-shot environment-weighted SVD** when `N` factorises into left/right
+  positive factors `N ≈ X_L†X_L ⊗ X_R†X_R`: absorb the `X` square-roots, SVD,
+  keep the top `D`, peel them off. *Simple update / BP-gauge is exactly this*
+  with `X` = the bond-weight / BP-message square-roots (diagonal `N`) — which is
+  why it is a single SVD with no search.
+- **Variational ALS “deep search”** when `N` is a general cluster / boundary
+  environment (it does not factorise cleanly): because the state is *bilinear*
+  in `(Ã, B̃)`, alternately solve the normal equations `N_A Ã = b_A`, then
+  `N_B B̃ = b_B`, sweeping until the `N`-weighted error stops dropping — the
+  full-update fit (a.k.a. variational / fit compression).
+
+Both run on **reduced tensors** — QR the off-bond legs first (`A = Q_A R_A`,
+`B = Q_B R_B`) and project `N` onto the small `R_A, R_B` — so the deep search is
+cheap. The cluster environment therefore slots *between* simple update (rank-1,
+one-shot) and full update (boundary, ALS) in the **same** machinery; only the
+metric `N` gets better, and either truncation path (positivise+factorise → env-
+SVD, or ALS) then applies unchanged.
+
 This is the explicit hook Gray et al. (arXiv:2510.05647) flag — the loop cluster
 expansion "can be used to approximate the environment when compressing tensors …
 generalizing the so-called cluster update" — and it is cheaper than a full
@@ -195,6 +221,11 @@ boundary environment while strictly better than the rank-1 BP-message default.
   Problems*, arXiv:2510.05647.
 - Lubasch, Cirac, Bañuls, *Algorithms for finite PEPS* / *Unifying PEPS
   contractions* (2014) — simple- vs cluster- vs full-update environments.
+- Corboz, *Variational optimization with infinite PEPS* (full update with
+  reduced tensors), Phys. Rev. B 94, 035133 (2016); Jordan, Orús, Vidal,
+  Verstraete, Cirac (iPEPS full update), Phys. Rev. Lett. 101, 250602 (2008).
+- Phien, Bengua, Tuan, Corboz, Orús, *Fast full update*, Phys. Rev. B 92,
+  035142 (2015) — the environment-weighted (oblique) SVD truncation.
 - Tindall & Fishman, *Gauging tensor networks with belief propagation*,
   SciPost Phys. 15, 222 (2023) — the BP-gauge (simple-update) compression this
   generalizes.
