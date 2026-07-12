@@ -153,6 +153,39 @@ loop *series* expansion (whose `I − m⊗m` projectors rely on the fixed point)
 Next: a PEPS local-observable / energy helper (product & sum formulas) with
 Wynn-ε extrapolation.
 
+### Cluster-corrected bond compression (better than naive BP messages)
+
+BP-gauge compression (quimb `compress_l2bp` / `compress_d2bp`, Tindall–Fishman
+gauging) truncates a bond using the **rank-1 product of BP messages** as the bond
+environment — i.e. the *simple-update* reduced density matrix. That environment
+ignores the inter-tensor loop correlations *around* the bond, so the truncated
+singular vectors are sub-optimal exactly where loops matter (frustration,
+criticality, short cycles).
+
+Plan a **cluster-corrected compression** in `pepsy.bp` that builds the bond
+environment from a **local cluster** (the bond's tensor + a few neighbours,
+loop-corrected via §2) instead of the naive BP-message product, then does the
+SVD truncation against that better environment:
+
+- Compute the bond's reduced density matrix / environment from a loop-cluster
+  expansion (`loop_cluster_expand` restricted to the bond's neighbourhood, or a
+  small exact cluster contraction closed with BP messages on its boundary),
+  rather than `m_ij ⊗ m_ji`.
+- Truncate with that environment (generalized/oblique SVD), giving a
+  **cluster-update**-quality compression that interpolates *simple update*
+  (cluster size 0 = rank-1 BP messages) → *cluster update* → *full update*
+  (χ_env → ∞ ≈ boundary environment), with the **cluster size as the single
+  knob** — the same dial as §2 and the tensy RG-BPLC decoder.
+- Keep it thin over quimb: reuse `compress_l2bp` / `compress_d2bp` message
+  machinery for the boundary closure and `contract_gloop_expand` /
+  `RegionGraph` for the cluster environment; feed the result to the boundary /
+  PEPS optimizers (§4) as a drop-in higher-fidelity `chi`-reduction.
+
+This is the explicit hook Gray et al. (arXiv:2510.05647) flag — the loop cluster
+expansion "can be used to approximate the environment when compressing tensors …
+generalizing the so-called cluster update" — and it is cheaper than a full
+boundary environment while strictly better than the rank-1 BP-message default.
+
 ### References
 
 - Concept note: `learning/bp.md` (loop / cluster expansion sections).
@@ -160,6 +193,11 @@ Wynn-ε extrapolation.
   Phys. Rev. Research 8, 013245 (2026), DOI `10.1103/vqks-cr6x`.
 - Gray et al., *Tensor Network Loop Cluster Expansions for Quantum Many-Body
   Problems*, arXiv:2510.05647.
+- Lubasch, Cirac, Bañuls, *Algorithms for finite PEPS* / *Unifying PEPS
+  contractions* (2014) — simple- vs cluster- vs full-update environments.
+- Tindall & Fishman, *Gauging tensor networks with belief propagation*,
+  SciPost Phys. 15, 222 (2023) — the BP-gauge (simple-update) compression this
+  generalizes.
 
 ---
 
