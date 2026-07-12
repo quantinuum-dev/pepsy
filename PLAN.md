@@ -167,10 +167,19 @@ environment from a **local cluster** (the bond's tensor + a few neighbours,
 loop-corrected via §2) instead of the naive BP-message product, then does the
 SVD truncation against that better environment:
 
-- Compute the bond's reduced density matrix / environment from a loop-cluster
-  expansion (`loop_cluster_expand` restricted to the bond's neighbourhood, or a
-  small exact cluster contraction closed with BP messages on its boundary),
-  rather than `m_ij ⊗ m_ji`.
+- Compute the bond's environment / reduced density matrix from **BP + loops**,
+  *not* a single full cluster contraction (the expensive step we avoid).
+  `D2BP.partial_trace` gives the **rank-1 BP environment** (simple update);
+  `D2BP.partial_trace_gloop_expand` / `partial_trace_loop_series_expansion`
+  correct it as a **sum of small loop contractions around the bond** — Gray et
+  al.'s loop expansion applied to the *RDM* (open bond legs) rather than the
+  scalar `Z`. Each loop term is cheap and the series is truncated by loop weight,
+  so you get cluster-update-quality `N` from many small contractions instead of
+  one huge exact cluster contraction (parallel, convergence-robust).
+- **Positivise `N` before using it as a metric.** A loop-*truncated* environment
+  can be slightly non-Hermitian / non-positive; take the Hermitian part and clip
+  negative eigenvalues (`eigh`) so `N` is a valid positive metric for the env-SVD
+  / ALS truncation above.
 - Truncate with that environment (generalized/oblique SVD), giving a
   **cluster-update**-quality compression that interpolates *simple update*
   (cluster size 0 = rank-1 BP messages) → *cluster update* → *full update*
