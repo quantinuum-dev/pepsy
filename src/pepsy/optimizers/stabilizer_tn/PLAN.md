@@ -17,6 +17,53 @@ are kept as back-compat aliases.
 
 ---
 
+## Implementation-quality review (2026-07-13)
+
+Overall assessment: the `C|p>` decomposition, cached frame mapping, localized
+measurement, and true-support sub-MPO updates form a strong research-grade
+core. Production readiness depends on completing the correctness and
+performance hardening below. Correct state semantics take priority over adding
+new simulator features.
+
+### Correctness hardening completed in the first review batch
+
+- Quimb's base-10 MPS `exponent` is included in norm and expectation
+  calculations and remains correct when a projected state is normalized.
+- Forced measurement outcomes require exactly `+1` or `-1`. An impossible
+  postselection is detected before tableau/MPS mutation, including the
+  basis-updating path.
+- `run()` consumes each successfully applied queue entry. If an entry fails,
+  that entry and its suffix remain queued without replaying the successful
+  prefix on retry.
+- Tree-sampled rows receive a final uniform permutation, preserving the shared
+  prefix optimization while producing exchangeable i.i.d. row positions.
+- Bitstrings, Pauli axes/supports, and tableau/MPS sizes are validated without
+  lossy integer coercion or silent support truncation.
+
+### Remaining priorities from the review
+
+1. Separate operator-decomposition tolerance from MPS SVD `cutoff`; define and
+   test zero-operator behavior instead of allowing an empty branch sum.
+2. Replace dense `2**k x 2**k` Clifford-Pauli rotation classification with a
+   direct Stim/tableau circuit synthesis using basis changes and a parity
+   ladder.
+3. Bound the arbitrary dense-gate API explicitly. Its Pauli decomposition has
+   `4**k` terms; structured or larger operators should use an MPO path and
+   branch sums should use balanced reduction.
+4. Redesign infidelity diagnostics: use MPS-specialized overlaps, include
+   sub-MPO truncation, and distinguish per-step loss from cumulative fidelity.
+5. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
+   untouched by ordinary stream entries).
+6. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
+   and Torch paths; avoid mutating caller-owned MPOs during backend conversion.
+7. Clarify the simulator-facing API with typed measurement/diagnostic records
+   and consider `StabilizerMpsSimulator` as the preferred name while preserving
+   `MpsStabOptimizer` as a compatibility alias.
+8. Reconcile roadmap references to any intentionally removed benchmark/example
+   files so documentation and the executable repository remain aligned.
+
+---
+
 ## Done (validated against dense/stim; `tests/test_stabilizer_tn.py`)
 
 - **State container** — `STNState`: stim tableau + `|nu>` MPS, `|0...0>` init,
@@ -72,7 +119,7 @@ are kept as back-compat aliases.
   Operator(sites=..., L=...)`), so only the `[lo,hi]` region is compressed — cost is
   O(depth·window), **independent of `n`** for local circuits (n=16/24/32 ~0.28s at
   fixed depth). `STNState` caches `current_inverse_tableau` (invalidated on basis
-  changes). All 63 tests pass; correctness vs quimb = 1.0.
+  changes). Correctness is validated by the focused STN and stress suites.
 
 ## Cross-checked against the reference (bsc-quantic/stabilizer-TN v1.1/v1.2)
 
@@ -143,7 +190,8 @@ Ordered by value/effort. None are started.
   `V^dagger` into the basis (`STNState.absorb_basis_clifford`), and single-site
   projects/disentangles the pivot qubit. Fixed-basis remains the default.
   Follow-ups: choose the pivot / CNOT-ladder to minimise the transient bond
-  (currently `k = min(support)`); reuse the R2 disentangler to pre-localise `M`.
+  (currently the support median with nearest-first merging); reuse the R2
+  disentangler to pre-localise `M`.
 
 ### R4. Sampling & observables
 - Computational-basis shot sampling via `pepsy.MpsSampler` on `|nu>` mapped

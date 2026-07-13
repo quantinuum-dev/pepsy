@@ -506,6 +506,35 @@ def test_simulator_incremental_add_gates_equivalent_to_single_run():
     assert _fidelity(inc.to_statevector(), full.to_statevector()) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_run_failure_consumes_only_successful_queue_prefix():
+    sim = MpsStabOptimizer(1)
+    sim.add_gates([("x", 0), ("not-a-gate", 0)])
+
+    with pytest.raises(ValueError, match="Unknown gate"):
+        sim.run()
+
+    assert sim.expectation("Z", 0) == pytest.approx(-1.0)
+    assert sim._queue == [("not-a-gate", 0)]
+
+    with pytest.raises(ValueError, match="Unknown gate"):
+        sim.run()
+    assert sim.expectation("Z", 0) == pytest.approx(-1.0)
+
+
+@pytest.mark.parametrize(
+    "entry, message",
+    [
+        (("rot", 0.3, "XZ", (0,)), "different lengths"),
+        (("rot", 0.3, "XZ", (0, 0)), "distinct"),
+        (("rot", 0.3, "XA", (0, 1)), "Invalid Pauli axis"),
+        (("rot", 0.3, "XZ", (0, 2)), "out of range"),
+    ],
+)
+def test_general_rotation_validates_pauli_support(entry, message):
+    with pytest.raises(ValueError, match=message):
+        MpsStabOptimizer(2).apply([entry])
+
+
 def test_expectation_of_stabilizer_is_deterministic():
     # After a Clifford circuit, Z-basis stabilizers have expectation +-1.
     sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("cnot", 1, 2)])
@@ -556,6 +585,12 @@ def test_initial_state_from_bits():
     assert sim.state.max_bond() == 1
 
 
+@pytest.mark.parametrize("bits", ["102", [0, 2], [0.0, 1.0]])
+def test_bit_inputs_must_be_binary_integers(bits):
+    with pytest.raises(ValueError, match="0 or 1"):
+        MpsStabOptimizer.from_bits(bits)
+
+
 def test_from_tableau_and_nu_roundtrip():
     src = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("rz", 0.6, 2), ("t", 1)])
     # Primary API is from_tableau_and_state / .p; the *_nu names remain aliases.
@@ -563,6 +598,16 @@ def test_from_tableau_and_nu_roundtrip():
     assert _fidelity(rebuilt.to_statevector(), src.to_statevector()) == pytest.approx(1.0, abs=1e-6)
     alias = MpsStabOptimizer.from_tableau_and_nu(src.state._sim.copy(), src.state.nu.copy())
     assert _fidelity(alias.to_statevector(), src.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_from_tableau_and_state_rejects_size_mismatch_without_mutation():
+    tableau_state = STNState(1)
+    coefficient_state = STNState(2).p
+
+    with pytest.raises(ValueError, match="same number of qubits"):
+        STNState.from_tableau_and_state(tableau_state._sim, coefficient_state)
+
+    assert tableau_state._sim.num_qubits == 1
 
 
 def test_norm_preserved_after_circuit():
@@ -573,6 +618,18 @@ def test_norm_preserved_after_circuit():
     # and after a measurement, still normalized
     sim.measure("Z", 0)
     assert sim.norm() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_norm_expectation_and_measurement_respect_mps_exponent():
+    sim = MpsStabOptimizer(2)
+    sim.state.p.exponent = 2.0
+
+    assert sim.norm() == pytest.approx(100.0)
+    assert sim.expectation("Z", 0) == pytest.approx(1.0)
+
+    sim.measure("Z", 0, outcome=+1)
+    assert sim.norm() == pytest.approx(1.0)
+    assert np.linalg.norm(sim.to_statevector()) == pytest.approx(1.0)
 
 
 def test_run_progbar_smoke():
@@ -867,6 +924,11 @@ def test_probability_bits_does_not_mutate_state():
     assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
 
 
+def test_probability_bits_rejects_non_binary_values():
+    with pytest.raises(ValueError, match="0 or 1"):
+        MpsStabOptimizer(2).probability_bits([0, 2])
+
+
 def test_sample_bits_frequencies_match_dense():
     n = 3
     sim = MpsStabOptimizer(n, seed=3).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.9, 2)])
@@ -877,6 +939,17 @@ def test_sample_bits_frequencies_match_dense():
     idx = (s.astype(int) * (1 << np.arange(n - 1, -1, -1))).sum(1)
     freq = np.bincount(idx, minlength=2 ** n) / shots
     assert 0.5 * np.abs(freq - probs).sum() < 0.04  # total-variation distance
+
+
+def test_sample_bits_rows_are_exchangeable():
+    sim = MpsStabOptimizer(1).apply([("h", 0)])
+    draws = np.array([
+        sim.sample_bits(2, seed=seed)[:, 0]
+        for seed in range(300)
+    ])
+
+    assert draws[:, 0].mean() == pytest.approx(0.5, abs=0.1)
+    assert draws[:, 1].mean() == pytest.approx(0.5, abs=0.1)
 
 
 def test_sample_bits_stabilizer_ghz_support():
@@ -960,8 +1033,36 @@ def test_absorb_measure_forced_impossible_raises():
     # GHZ: forcing Z0 = -1 while Z1 = +1 is impossible (they are perfectly correlated).
     sim = MpsStabOptimizer(2).apply([("h", 0), ("cnot", 0, 1)])
     sim.measure("Z", 0, outcome=+1, absorb_basis=True)   # collapse to |00>
+    before_p = sim.state.p_dense()
+    before_tableau = sim.state._sim.current_inverse_tableau()
+    before_history = (len(sim.infidelities), len(sim.bond_history), len(sim.measurements))
     with pytest.raises(ValueError, match="0 probability"):
         sim.measure("Z", 1, outcome=-1, absorb_basis=True)
+    np.testing.assert_allclose(sim.state.p_dense(), before_p)
+    assert sim.state._sim.current_inverse_tableau() == before_tableau
+    assert (len(sim.infidelities), len(sim.bond_history), len(sim.measurements)) == before_history
+
+
+def test_fixed_basis_forced_impossible_preserves_state():
+    sim = MpsStabOptimizer(2).apply([("h", 0), ("cnot", 0, 1)])
+    sim.measure("Z", 0, outcome=+1)
+    before = sim.to_statevector()
+    before_history = (len(sim.infidelities), len(sim.bond_history), len(sim.measurements))
+
+    with pytest.raises(ValueError, match="0 probability"):
+        sim.measure("Z", 1, outcome=-1)
+
+    assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
+    assert (len(sim.infidelities), len(sim.bond_history), len(sim.measurements)) == before_history
+
+
+@pytest.mark.parametrize("outcome", [0, 2, -2, 0.5])
+def test_measure_rejects_invalid_forced_outcome_without_mutation(outcome):
+    sim = MpsStabOptimizer(1).apply([("h", 0)])
+    before = sim.to_statevector()
+    with pytest.raises(ValueError, match=r"exactly \+1 or -1"):
+        sim.measure("Z", 0, outcome=outcome)
+    assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
 
 
 # --------------------------------------------------------------------------- #
@@ -1124,4 +1225,3 @@ def test_magic_scaling_benchmark_smoke():
                              mode=mode, to_backend=None, rank_max_n=8)
         assert res["max_nu_bond"] <= 2 ** 3
         assert res["pseudo_stabilizer_rank"] is not None
-

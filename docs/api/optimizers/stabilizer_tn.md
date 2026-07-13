@@ -42,6 +42,29 @@ outcome[, absorb_basis]])`, and `("reset", where)`.
 - `probability_bits(bits)` — `|<bits|psi>|**2` as a product of conditional Born
   probabilities.
 
+## Correctness and failure semantics
+
+- Bitstrings contain exactly binary integer values, Pauli supports use distinct
+  in-range sites, and forced measurement outcomes are exactly `+1` or `-1`.
+- Impossible postselection raises `ValueError` before changing the tableau,
+  coefficient MPS, measurement log, or diagnostics.
+- `run()` removes successfully applied entries from its queue. If a later entry
+  fails, that entry and the remaining suffix stay queued, so retrying does not
+  replay the successful prefix.
+- `norm()` and normalized measurements account for Quimb's separate MPS
+  `exponent` scale as well as the tensor data.
+
+## Performance boundaries
+
+Tree sampling shares work for repeated prefixes, but high-entropy states can
+still generate a number of live branches proportional to the shot count.
+Arbitrary dense `k`-qubit matrices use a `4**k` Pauli decomposition and are
+therefore intended for few-qubit gates. Multi-qubit Clifford-angle Pauli
+rotations currently build a dense tableau on each use. Prefer named Clifford
+gates, Pauli rotations with small support, and structured sub-MPOs for larger
+operators. `track_infidelity=True` performs additional exact-reference overlaps
+and is a diagnostic mode rather than the fastest execution path.
+
 ## Backends (GPU / torch / JAX)
 
 Pass `to_backend=` (e.g. `pepsy.backend_torch(dtype=torch.complex128,

@@ -26,9 +26,26 @@ def pauli_string(paulis: Iterable[str], where: Iterable[int], n: int):
     """Return a length-``n`` :class:`stim.PauliString` from per-qubit axes."""
     import stim
 
+    axes = tuple(str(ch).lower() for ch in paulis)
+    sites = tuple(int(q) for q in where)
+    if len(axes) != len(sites):
+        raise ValueError(
+            f"Pauli axes {axes!r} and where {sites!r} have different lengths."
+        )
+    if len(set(sites)) != len(sites):
+        raise ValueError(f"Pauli support sites must be distinct, got {sites!r}.")
+    for axis in axes:
+        if axis not in _AXIS_CODE:
+            raise ValueError(
+                f"Invalid Pauli axis {axis!r}; expected only I, X, Y, or Z."
+            )
+    for q in sites:
+        if not 0 <= q < int(n):
+            raise ValueError(f"Qubit index {q} out of range for {n}-qubit state.")
+
     ps = stim.PauliString(n)
-    for ch, q in zip(paulis, where):
-        ps[int(q)] = _AXIS_CODE[str(ch).lower()]
+    for axis, q in zip(axes, sites):
+        ps[q] = _AXIS_CODE[axis]
     return ps
 
 

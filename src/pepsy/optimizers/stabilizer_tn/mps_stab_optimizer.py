@@ -55,7 +55,7 @@ from .operators import (
     single_qubit_rotation_matrix,
 )
 from .paulis import hermitian_pauli_terms, pauli_string
-from .stn_state import STNState
+from .stn_state import STNState, _validate_bits
 
 __all__ = ["MpsStabOptimizer"]
 
@@ -274,7 +274,11 @@ class MpsStabOptimizer:
     # Execution
     # ------------------------------------------------------------------ #
     def run(self, *, progbar: bool = False) -> "MpsStabOptimizer":
-        """Apply all queued gates in order, then clear the queue.
+        """Apply all queued gates in order, consuming successful entries.
+
+        If an entry raises, successfully applied entries are removed while the
+        failed entry and its remaining suffix stay queued. Retrying therefore
+        never replays an already-applied prefix.
 
         Parameters
         ----------
@@ -282,23 +286,28 @@ class MpsStabOptimizer:
             Show a ``tqdm`` progress bar reporting the running ``|nu>`` bond
             dimension and cumulative truncation infidelity.
         """
-        queue = self._queue
+        queue = tuple(self._queue)
+        completed = 0
         pbar = None
         if progbar and queue:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
             pbar = tqdm(total=len(queue), desc="stab-mps", leave=True, ascii=True)
-        for entry in queue:
-            self._apply_entry(entry)
+        try:
+            for entry in queue:
+                self._apply_entry(entry)
+                completed += 1
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        chi=self.state.max_bond(),
+                        infid=f"{sum(self.infidelities):.2e}",
+                    )
+        finally:
             if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix(
-                    chi=self.state.max_bond(),
-                    infid=f"{sum(self.infidelities):.2e}",
-                )
-        if pbar is not None:
-            pbar.close()
-        self._queue = []
+                pbar.close()
+            if completed:
+                del self._queue[:completed]
         return self
 
     def apply(self, gates, *, progbar: bool = False) -> "MpsStabOptimizer":
@@ -381,8 +390,9 @@ class MpsStabOptimizer:
         done once per distinct prefix rather than once per shot — a large saving
         for low-rank/structured ``|nu>`` (e.g. a state copy happens only at a
         genuine branch point, not per shot).  Returns an ``(shots, n)`` ``int8``
-        array of 0/1 with qubit ``q`` in column ``q`` (qubit 0 first).  Rows are
-        grouped by prefix (order is irrelevant for i.i.d. samples).
+        array of 0/1 with qubit ``q`` in column ``q`` (qubit 0 first). The final
+        uniform row permutation converts prefix-grouped branch counts into an
+        exchangeable i.i.d. sample sequence.
         """
         rng = self._rng if seed is None else np.random.default_rng(seed)
         shots = int(shots)
@@ -415,6 +425,7 @@ class MpsStabOptimizer:
             if n0 < count:
                 sim.measure("Z", q, outcome=-1)  # reuse original for the |1> branch
                 stack.append((sim, q + 1, mid, hi))
+        rng.shuffle(out, axis=0)
         return out
 
     def probability_bits(self, bits) -> float:
@@ -425,11 +436,7 @@ class MpsStabOptimizer:
         measurements instead of an ``O(2**n)`` statevector.  ``bits`` is a string
         like ``'010'`` or a 0/1 sequence with qubit ``q`` at position ``q``.
         """
-        if isinstance(bits, str):
-            bits = [int(c) for c in bits]
-        bits = [int(b) for b in bits]
-        if len(bits) != self.n:
-            raise ValueError(f"bits must have length n={self.n}, got {len(bits)}.")
+        bits = _validate_bits(bits, expected_length=self.n)
         tmp = self.copy()
         prob = 1.0
         for q, b in enumerate(bits):
@@ -526,12 +533,13 @@ class MpsStabOptimizer:
 
     def _apply_rotation(self, name, params) -> None:
         theta, where, axes = self._rotation_spec(name, params)
+        # Validate the complete support before either the tableau or MPS changes.
+        phys = pauli_string(axes, where, self.n)
         # Clifford rotations (angle a multiple of pi/2) are free: update the
         # tableau and leave |nu> untouched (paper's "Clifford = free" principle).
         if self._is_clifford_angle(theta):
             self._apply_clifford_rotation(theta, where, axes)
             return
-        phys = pauli_string(axes, where, self.n)
         m_pauli = self.state.frame_pauli(phys)
         terms, sign = hermitian_pauli_terms(m_pauli)
         support = sorted(terms)
@@ -581,6 +589,23 @@ class MpsStabOptimizer:
         if len(axes) != len(where):
             raise ValueError(f"Pauli {pauli!r} and where {where!r} have different lengths.")
         return pauli_string(axes, where, self.n)
+
+    @staticmethod
+    def _validate_outcome(outcome):
+        """Return a forced Pauli outcome, requiring exactly integer +/-1."""
+        if outcome is None:
+            return None
+        if isinstance(outcome, (bool, np.bool_)) or not isinstance(outcome, Integral):
+            raise ValueError(f"outcome must be exactly +1 or -1, got {outcome!r}.")
+        value = int(outcome)
+        if value not in (-1, 1):
+            raise ValueError(f"outcome must be exactly +1 or -1, got {outcome!r}.")
+        return value
+
+    @staticmethod
+    def _outcome_probability(expectation, outcome):
+        """Return a numerically clipped Pauli-outcome probability."""
+        return min(max(0.5 * (1.0 + outcome * expectation), 0.0), 1.0)
 
     def _frame_terms(self, pauli, where):
         """Return ``({site: axis}, sign)`` for the ``|nu>``-frame image of a Pauli."""
@@ -681,11 +706,17 @@ class MpsStabOptimizer:
             return m
         terms, sign = self._frame_terms(pauli, where)
         exp = self._pauli_expectation(terms, sign)
-        p_plus = 0.5 * (1.0 + exp)
-        if outcome is None:
+        forced = self._validate_outcome(outcome)
+        if forced is None:
+            p_plus = self._outcome_probability(exp, +1)
             m = 1 if self._rng.random() < p_plus else -1
         else:
-            m = 1 if int(outcome) >= 0 else -1
+            m = forced
+            probability = self._outcome_probability(exp, m)
+            if probability <= 1e-12:
+                raise ValueError(
+                    f"forced outcome {m:+d} has ~0 probability ({probability:.2e})."
+                )
         self._apply_projector(terms, sign, m)
         self.measurements.append((pauli, where, m))
         return m
@@ -718,6 +749,16 @@ class MpsStabOptimizer:
         ``M = C^dagger O C`` of the physical observable on the coefficient qubits.
         """
         terms, sign = hermitian_pauli_terms(m_pauli)
+        forced = self._validate_outcome(outcome)
+        if forced is not None:
+            probability = self._outcome_probability(
+                self._pauli_expectation(terms, sign), forced
+            )
+            if probability <= 1e-12:
+                raise ValueError(
+                    f"forced outcome {forced:+d} has ~0 probability "
+                    f"({probability:.2e})."
+                )
         support = sorted(terms)
         if not support:  # M = +/- I: deterministic, state unchanged
             self._record(0.0)
@@ -736,15 +777,10 @@ class MpsStabOptimizer:
         z_p.gate_(self._bk_const("PZ", pauli_matrix("Z")), k, contract=True)
         zexp = float(np.real(self._to_scalar(p.H @ z_p) / self._to_scalar(p.H @ p)))
         p_o_plus = 0.5 * (1.0 + s * zexp)  # prob(outcome O = +1)
-        if outcome is None:
+        if forced is None:
             m = 1 if self._rng.random() < p_o_plus else -1
         else:
-            m = 1 if int(outcome) >= 0 else -1
-            prob = p_o_plus if m > 0 else (1.0 - p_o_plus)
-            if prob < 1e-12:
-                raise ValueError(
-                    f"forced outcome {outcome} has ~0 probability ({prob:.2e})."
-                )
+            m = forced
         zval = m * s  # required Z_k eigenvalue (+1 -> |0>, -1 -> |1>)
         self._project_computational_site(k, 0 if zval > 0 else 1)
         self._record(infidelity)

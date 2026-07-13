@@ -7,6 +7,7 @@ the stabilizer-tensor-network build.
 
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -31,6 +32,35 @@ _CLIFFORD_GATES = {
     "cz": ("cz", 2),
     "swap": ("swap", 2),
 }
+
+
+def _validate_bits(bits, *, expected_length=None):
+    """Return ``bits`` as binary integers, rejecting lossy coercions."""
+    if isinstance(bits, str):
+        raw = list(bits)
+        if any(bit not in ("0", "1") for bit in raw):
+            raise ValueError(f"bits must contain only integer values 0 or 1, got {bits!r}.")
+        values = [int(bit) for bit in raw]
+    else:
+        try:
+            raw = list(bits)
+        except TypeError as exc:
+            raise TypeError("bits must be a bitstring or a sequence of 0/1 integers.") from exc
+        values = []
+        for bit in raw:
+            if isinstance(bit, (bool, np.bool_)):
+                values.append(int(bit))
+            elif isinstance(bit, Integral) and int(bit) in (0, 1):
+                values.append(int(bit))
+            else:
+                raise ValueError(
+                    f"bits must contain only integer values 0 or 1, got {bit!r}."
+                )
+    if expected_length is not None and len(values) != int(expected_length):
+        raise ValueError(
+            f"bits must have length n={expected_length}, got {len(values)}."
+        )
+    return values
 
 
 class STNState:
@@ -90,9 +120,7 @@ class STNState:
 
         ``bits`` may be a string like ``"0110"`` or a sequence of 0/1.
         """
-        if isinstance(bits, str):
-            bits = [int(b) for b in bits]
-        bits = [int(b) for b in bits]
+        bits = _validate_bits(bits)
         state = cls(len(bits), dtype=dtype)
         for i, b in enumerate(bits):
             if b:
@@ -120,10 +148,16 @@ class STNState:
         and ``p`` a quimb MPS coefficient state.  Both must describe the same
         number of qubits/sites; the state represents ``|psi> = C p``.
         """
+        n = int(p.L)
+        sim_n = int(sim.num_qubits)
+        if sim_n != n:
+            raise ValueError(
+                "sim and p must describe the same number of qubits/sites, "
+                f"got {sim_n} and {n}."
+            )
         new = cls.__new__(cls)
-        new.n = int(p.L)
+        new.n = n
         new.dtype = dtype
-        sim.set_num_qubits(new.n)
         new._sim = sim
         new.p = p
         new._inv_tableau = None
@@ -311,16 +345,10 @@ class STNState:
 
     def _bits_to_index(self, bits) -> int:
         """Map a bitstring (str ``'010'`` or 0/1 sequence) to a big-endian index."""
-        if isinstance(bits, str):
-            bits = [int(c) for c in bits]
-        bits = [int(b) for b in bits]
-        if len(bits) != self.n:
-            raise ValueError(
-                f"bits must have length n={self.n}, got {len(bits)}."
-            )
+        bits = _validate_bits(bits, expected_length=self.n)
         index = 0
         for b in bits:
-            index = (index << 1) | (b & 1)
+            index = (index << 1) | b
         return index
 
     def amplitude(self, bits) -> complex:
