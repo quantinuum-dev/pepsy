@@ -1351,6 +1351,79 @@ def test_mps_optimizer_norm_infidelity_uses_single_center_norm(monkeypatch):
     assert opt.info_c["cur_orthog"] == (3, 3)
 
 
+def test_mps_optimizer_unitary_norm_infidelity_mpo_skips_target_build(monkeypatch):
+    """Unitary MPO norm diagnostics should not build an unbounded target MPS."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 3)),
+    ]
+
+    def fail_build_target(*_args, **_kwargs):
+        raise AssertionError("unitary norm tracking should use the pre-gate norm")
+
+    monkeypatch.setattr(py.MpsOptimizer, "_build_norm_target", fail_build_target)
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode="mpo")
+    opt.run(
+        progbar=False,
+        cutoff=1e-12,
+        fidelity_samples=0,
+        track_norm_infidelity=True,
+    )
+
+    samples = opt.get_norm_infidelity_samples()
+    assert len(samples) == 1
+    assert samples[0]["step"] == 2
+    assert samples[0]["where"] == (0, 3)
+    assert samples[0]["target_norm"] == pytest.approx(1.0)
+    assert opt.p.max_bond() <= 1
+
+
+def test_mps_optimizer_unitary_submpo_norm_infidelity_skips_target_gate(monkeypatch):
+    """Unitary sub-MPO norm diagnostics should not apply an uncapped target."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    flip = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.complex128)
+    mpo = qtn.MPO_product_operator(
+        [flip.copy(), flip.copy()],
+        sites=(0, 3),
+        L=4,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+    )
+    max_bonds = []
+    original_gate_with_submpo = qtn.MatrixProductState.gate_with_submpo_
+
+    def wrapped_gate_with_submpo(self, *args, **kwargs):
+        max_bonds.append(kwargs.get("max_bond"))
+        if kwargs.get("max_bond") is None:
+            raise AssertionError("unitary sub-MPO diagnostics should be target-free")
+        return original_gate_with_submpo(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        qtn.MatrixProductState,
+        "gate_with_submpo_",
+        wrapped_gate_with_submpo,
+    )
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[py.MpsOptimizer.submpo_event(mpo, (0, 3))],
+        chi=1,
+        mode="mpo",
+    )
+    opt.run(
+        progbar=False,
+        cutoff=1e-12,
+        fidelity_samples=0,
+        track_norm_infidelity=True,
+    )
+
+    samples = opt.get_norm_infidelity_samples()
+    assert max_bonds == [1]
+    assert len(samples) == 1
+    assert samples[0]["target_norm"] == pytest.approx(1.0)
+    assert samples[0]["approx_norm"] == pytest.approx(1.0)
+
+
 def test_mps_optimizer_non_unitary_norm_infidelity_matches_svd_target():
     """SVD non-unitary proxy should match quimb's target infidelity."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")

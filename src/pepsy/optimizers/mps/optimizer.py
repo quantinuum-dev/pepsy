@@ -34,10 +34,14 @@ active MPS tensor data after compressed updates while accumulating the removed
 scale into ``p.exponent``.  Quimb includes that exponent in ``p.norm()``, so
 ``p.norm()`` still reports the represented state norm; inspect a copy with
 ``exponent=0`` to see the rescaled data norm. Diagnostics are separate opt-ins:
-``track_norm_infidelity=True`` records a cheap norm-ratio proxy, while
-``track_infidelity=True`` records a true normalized-overlap metric, reports
-cumulative infidelity in progress bars, and keeps the running geometric mean
-of measured local true fidelities in ``losses`` for compatibility.
+``track_norm_infidelity=True`` records a cheap norm-ratio proxy. For the
+default unitary stream it reads the target norm from the pre-gate canonical
+state rather than building an uncompressed target. Non-unitary norm tracking
+and ``track_infidelity=True`` still build the target they need for the
+diagnostic. ``track_infidelity=True`` records a true normalized-overlap metric,
+reports cumulative infidelity in progress bars, and keeps the running
+geometric mean of measured local true fidelities in ``losses`` for
+compatibility.
 """
 
 from __future__ import annotations
@@ -1642,10 +1646,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Retained for compatibility with older full-normalization paths.
             Local tensor scale control does not use this value.
         track_norm_infidelity : bool, default=False
-            If ``True``, build pre-compression norm targets and append the
-            cumulative norm-ratio infidelity proxy for compressed two-site
-            updates. This diagnostic is intentionally off by default for the
-            fast non-unitary path.
+            If ``True``, append the cumulative norm-ratio infidelity proxy for
+            compressed two-site updates. For the default unitary stream, the
+            target norm is the pre-gate canonical norm and no uncompressed
+            diagnostic target is built unless ``track_infidelity=True`` also
+            needs it. Non-unitary streams still build pre-compression norm
+            targets because their gates can change the norm. This diagnostic is
+            intentionally off by default for the fast non-unitary path.
         track_infidelity : bool, default=False
             If ``True``, build the pre-compression target and measure the true
             normalized-overlap fidelity with :func:`pepsy.tensors.core.tn_fidelity`
@@ -1992,6 +1999,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 normalize_every=normalize_every,
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
+                non_unitary=non_unitary,
                 track_norm_infidelity=track_norm_infidelity,
                 track_infidelity=track_infidelity,
             )
@@ -2711,6 +2719,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         state_info["cur_orthog"] = (center, center)
         return p[center].norm()
 
+    def _unitary_pre_gate_target_norm(self, p, where):
+        """Return the unitary target norm without building a target copy."""
+        target_norm = self._canonical_span_norm(p, where)
+        # The following gate application can safely start from the wider span;
+        # this preserves the pre-diagnostic metadata contract for live states.
+        self._record_orthog_span(p, where)
+        return target_norm
+
     @staticmethod
     def _norm_ratio_fidelity(approx_norm, target_norm):
         """Return clipped ``(||approx|| / ||target||)**2``."""
@@ -3334,6 +3350,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     two_qubit_count += 1
                     xmin, xmax = sorted(where)
                     self.canonize_mps(p, (xmin, xmax))
+                    if track_norm_infidelity and not track_infidelity and not non_unitary:
+                        target_norm = self._unitary_pre_gate_target_norm(
+                            p,
+                            (xmin, xmax),
+                        )
+                    else:
+                        target_norm = None
 
                     p_g = self._build_norm_target(
                         p,
@@ -3342,11 +3365,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff,
                         cutoff_mode,
                     )
-                    target_norm = (
-                        self._canonical_span_norm(p_g, (xmin, xmax))
-                        if track_norm_infidelity
-                        else None
-                    )
+                    if track_norm_infidelity and target_norm is None:
+                        target_norm = self._canonical_span_norm(p_g, (xmin, xmax))
                     fit = FIT(
                         p_g,
                         p=p,
@@ -3394,12 +3414,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     batch_span_sites = [site for where_i in batch_where for site in where_i]
                     xmin, xmax = min(batch_span_sites), max(batch_span_sites)
                     self.canonize_mps(p, (xmin, xmax))
+                    if track_norm_infidelity and not track_infidelity and not non_unitary:
+                        target_norm = self._unitary_pre_gate_target_norm(
+                            p,
+                            (xmin, xmax),
+                        )
+                    else:
+                        target_norm = None
                     p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff, cutoff_mode)
-                    target_norm = (
-                        self._canonical_span_norm(p_g, (xmin, xmax))
-                        if track_norm_infidelity
-                        else None
-                    )
+                    if track_norm_infidelity and target_norm is None:
+                        target_norm = self._canonical_span_norm(p_g, (xmin, xmax))
                     fit = FIT(
                         p_g,
                         p=p,
@@ -3543,7 +3567,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 submpo_compress_opts = self._submpo_compress_opts(method)
                 if track_norm_infidelity:
                     self.canonize_mps(p, (xmin, xmax))
-                if track_norm_infidelity or track_infidelity:
+                if track_norm_infidelity and not track_infidelity and not non_unitary:
+                    target_norm = self._unitary_pre_gate_target_norm(
+                        p,
+                        (xmin, xmax),
+                    )
+                    p_target = None
+                elif track_norm_infidelity or track_infidelity:
                     p_target = p.copy()
                     p_target.gate_with_submpo_(
                         gate,
@@ -3556,11 +3586,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode=cutoff_mode,
                         **submpo_compress_opts,
                     )
+                    target_norm = (
+                        self._canonical_span_norm(p_target, (xmin, xmax))
+                        if track_norm_infidelity
+                        else None
+                    )
                 else:
                     p_target = None
-                if track_norm_infidelity:
-                    target_norm = self._canonical_span_norm(p_target, (xmin, xmax))
-                else:
                     target_norm = None
 
                 p.gate_with_submpo_(
@@ -3621,7 +3653,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
                 if track_norm_infidelity:
                     self.canonize_mps(p, (xmin, xmax))
-                if track_norm_infidelity or track_infidelity:
+                if track_norm_infidelity and not track_infidelity and not non_unitary:
+                    target_norm = self._unitary_pre_gate_target_norm(
+                        p,
+                        (xmin, xmax),
+                    )
+                    p_target = None
+                elif track_norm_infidelity or track_infidelity:
                     if use_symmray_auto_swap:
                         p_target = self._build_symmray_auto_swap_target(
                             p,
@@ -3638,11 +3676,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff,
                             cutoff_mode,
                         )
+                    target_norm = (
+                        self._canonical_span_norm(p_target, (xmin, xmax))
+                        if track_norm_infidelity
+                        else None
+                    )
                 else:
                     p_target = None
-                if track_norm_infidelity:
-                    target_norm = self._canonical_span_norm(p_target, (xmin, xmax))
-                else:
                     target_norm = None
                 if use_symmray_auto_swap:
                     self._apply_symmray_auto_swap_gate(
@@ -3827,7 +3867,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 xmin, xmax = sorted(where)
                 if track_norm_infidelity:
                     self.canonize_mps(p, (xmin, xmax))
-                if track_norm_infidelity or track_infidelity:
+                if track_norm_infidelity and not track_infidelity and not non_unitary:
+                    target_norm = self._unitary_pre_gate_target_norm(
+                        p,
+                        (xmin, xmax),
+                    )
+                    p_target = None
+                elif track_norm_infidelity or track_infidelity:
                     p_target = self._build_norm_target(
                         p,
                         gate,
@@ -3835,11 +3881,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff,
                         cutoff_mode,
                     )
+                    target_norm = (
+                        self._canonical_span_norm(p_target, (xmin, xmax))
+                        if track_norm_infidelity
+                        else None
+                    )
                 else:
                     p_target = None
-                if track_norm_infidelity:
-                    target_norm = self._canonical_span_norm(p_target, (xmin, xmax))
-                else:
                     target_norm = None
 
                 compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
@@ -4003,7 +4051,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 if track_norm_infidelity:
                     self.canonize_mps(p, (xmin, xmax))
                 if use_symmray_auto_swap:
-                    if track_norm_infidelity or track_infidelity:
+                    if track_norm_infidelity and not track_infidelity and not non_unitary:
+                        target_norm = self._unitary_pre_gate_target_norm(
+                            p,
+                            (xmin, xmax),
+                        )
+                        p_target = None
+                    elif track_norm_infidelity or track_infidelity:
                         p_target = self._build_symmray_auto_swap_target(
                             p,
                             gate,
@@ -4011,13 +4065,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff,
                             cutoff_mode,
                         )
+                        target_norm = (
+                            self._canonical_span_norm(p_target, (xmin, xmax))
+                            if track_norm_infidelity
+                            else None
+                        )
                     else:
                         p_target = None
-                    target_norm = (
-                        self._canonical_span_norm(p_target, (xmin, xmax))
-                        if track_norm_infidelity
-                        else None
-                    )
+                        target_norm = None
                     self._apply_symmray_auto_swap_gate(
                         p,
                         gate,
@@ -4027,6 +4082,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         max_bond=self.chi,
                     )
                 else:
+                    if track_norm_infidelity and not track_infidelity and not non_unitary:
+                        target_norm = self._unitary_pre_gate_target_norm(
+                            p,
+                            (xmin, xmax),
+                        )
+                    else:
+                        target_norm = None
                     self._apply_gate(
                         p,
                         gate,
@@ -4036,11 +4098,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode=cutoff_mode,
                         inplace=True,
                     )
-                    target_norm = (
-                        self._canonical_span_norm(p, (xmin, xmax))
-                        if track_norm_infidelity
-                        else None
-                    )
+                    if track_norm_infidelity and target_norm is None:
+                        target_norm = self._canonical_span_norm(p, (xmin, xmax))
                     p_target = p.copy() if track_infidelity else None
                     self.canonize_mps(p, (xmin, xmax))
 

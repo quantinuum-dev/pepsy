@@ -51,10 +51,14 @@ use a compatibility overlap contraction instead.
 Normalization and norm diagnostics follow the same canonical-center contract.
 `track_norm_infidelity=True` uses a one-site center norm after moving the
 tracked range to the gate support; it does not build a global doubled-network
-contraction. Non-unitary scale control records the removed factor in
-`p.exponent`, while temporary diagnostic targets never modify the live
-`info_c` cache. `mode="exact"` deliberately skips canonical metadata; switching
-back to an MPS mode rebuilds and canonicalizes the contracted state.
+contraction. For default unitary streams, the target norm is the pre-gate
+canonical norm, so no uncompressed target copy is built unless
+`track_infidelity=True` also needs it. Non-unitary norm diagnostics still build
+their pre-compression targets because those updates can change the norm.
+Non-unitary scale control records the removed factor in `p.exponent`, while
+temporary diagnostic targets never modify the live `info_c` cache.
+`mode="exact"` deliberately skips canonical metadata; switching back to an MPS
+mode rebuilds and canonicalizes the contracted state.
 
 For a logical gate stream whose site order has not been chosen yet,
 `MpsOptimizer.LayoutFinder(gates, L=...)` or
