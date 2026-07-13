@@ -26,7 +26,8 @@ The public simulator types are exported at top level (`import pepsy`); see
   - `chi=cap` bounds the coefficient bond. Add `track_infidelity=True` to record cumulative
     `1 - ||p||^2` after compressed unitary updates. The norm comes from the tracked
     canonical centre, with no uncapped target or overlap contraction. Non-unitary updates
-    emit no sample. Read `.infidelities` and `.bond_history`.
+    emit no sample. Read `.infidelities` and `.bond_history`, but do not align or zip them:
+    the former is sparse while the latter records ordinary simulator bookkeeping.
 - **Named physical stream entries**:
   - Clifford: `("h"|"s"|"sdg"|"x"|"y"|"z", q)`,
     `("cnot"|"cx"|"cy"|"cz"|"swap", a, b)`.
@@ -63,6 +64,9 @@ The public simulator types are exported at top level (`import pepsy`); see
   `sim.pseudo_stabilizer_rank()` (dense/small-n), `.measurements`, `.infidelities`, and
   `.bond_history`. General non-unitary matrix entries intentionally change the norm and
   suspend the unitary norm-loss proxy until a projective normalization resets its baseline.
+  A coefficient-frame `submpo` does the same because its event has no unitary metadata.
+  Projective normalization appends no sample, and previous historical samples remain in
+  the list. Never sum `.infidelities`: each sample is already cumulative for its segment.
 - **Canonical centre**: pass the simulator-managed orthogonality info through quimb
   operations that can move the centre. Use its canonicalization/renormalization helpers
   when extending projective paths; do not replace them with a blind full-MPS normalization.
@@ -138,6 +142,11 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   established once, and threaded through sub-MPO/swap+split operations. Local measurement,
   normalization, and unitary norm-loss diagnostics then touch only the centre tensor.
   Operator-sum rebuilds reset the tracker to the rebuilt MPS centre.
+- **Interpret the proxy narrowly.** For a normalized unitary segment, bounded compression
+  is left unnormalized and the emitted value is clipped `1 - ||p||^2`. This avoids a target
+  copy and doubled overlap network, but is not exact state fidelity or a sum of discarded
+  SVD weights. Validate the latest emitted sample against `1 - sim.norm()**2`, and validate
+  physical accuracy independently against dense evolution on small systems.
 - Keep tests tiny/deterministic (fixed seeds, small $n$), per repo Examples guidance.
 
 ## Reference implementation mapping (bsc-quantic/stabilizer-TN)

@@ -54,7 +54,10 @@ new simulator features.
   `1 - ||nu||^2`, evaluated from the tracked one-site canonical centre. This
   avoids uncapped target copies and overlap contractions. Non-unitary and
   projective updates emit no infidelity sample; projective normalization starts
-  a fresh unitary segment.
+  a fresh unitary segment. The trace is sparse, is not aligned with
+  `bond_history`, and must not be summed or interpreted as exact overlap
+  fidelity/discarded-SVD weight. Coefficient-frame sub-MPOs invalidate the
+  proxy because their event API does not certify unitarity.
 
 ### Remaining priorities from the review
 

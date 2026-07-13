@@ -86,7 +86,10 @@ centre. Unitary updates are not renormalized, so lost norm remains visible.
 Projectors, measurements, coefficient-frame sub-MPOs, and arbitrary
 non-unitary matrices do not emit infidelity samples; an unnormalized
 non-unitary map also suspends later samples until projection restores a
-normalized baseline.
+normalized baseline. The public `infidelities` trace is therefore sparse and
+historical, is not index-aligned with `bond_history`, and must not be summed.
+The proxy is not exact overlap fidelity or a discarded-SVD-weight report;
+validate physical accuracy independently when that distinction matters.
 
 ## Backends (GPU / torch / JAX)
 

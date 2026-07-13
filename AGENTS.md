@@ -75,6 +75,25 @@ At the start of a new task:
   with persistent layouts. Measurement/reset bookkeeping remains in logical
   site labels.
 
+### Stabilizer tensor-network workflow
+
+- Read `.github/skills/stabilizer-tensor-networks/SKILL.md` and its method/API
+  references before changing `MpsStabOptimizer` or `STNState`.
+- Preserve `|psi> = C|p>`: Clifford gates update the Stim tableau `C`; physical
+  non-Clifford operators are frame-mapped through `C`; `submpo` acts directly
+  in the coefficient frame.
+- Preserve the coefficient-MPS canonical-centre tracker through Quimb updates.
+  Use its one-site tensor norm, including the MPS exponent, for local norms and
+  unitary truncation diagnostics.
+- `track_infidelity` records sparse cumulative `1 - ||p||^2` samples only for
+  normalized unitary segments. It is not exact overlap fidelity or discarded
+  SVD weight. Do not renormalize unitary evolution or sum `infidelities`.
+  Non-unitary matrices and coefficient-frame sub-MPOs emit no sample and
+  invalidate the proxy until a normalized projective collapse resets it.
+- Keep dense Pauli decomposition bounded by
+  `max_pauli_decomposition_qubits`; prefer named gates, Pauli rotations, or a
+  coefficient-frame sub-MPO over opting into uncontrolled `4**k` enumeration.
+
 ## Upstream Tensor-Network Substrate
 
 - Treat `autoray`, `cotengra`, `cotengrust`, and `quimb` as first-class
@@ -205,6 +224,7 @@ Focused validation guide:
 - Solver changes: `pytest -q tests/test_gradient_solver.py`
 - Optimizers: `pytest -q tests/test_optimize_global.py tests/test_optimize_sweep_plot.py tests/test_optimize_mps.py tests/test_optimize_mpo.py`
 - MPS layout/canonicalization review: `pytest -q tests/test_optimize_mps.py tests/test_optimize_mpo.py tests/test_symmetric_tensors.py`
+- Stabilizer tensor networks: `pytest -q tests/test_stabilizer_tn.py tests/test_stabilizer_tn_stress.py`
 - Sampling: `pytest -q tests/test_sampler.py`
 - Docs/API behavior changes: run focused tests plus `sphinx-build -W -b html docs docs/_build/html`
 

@@ -168,6 +168,20 @@ and applies it with quimb `gate_with_submpo_`. The basis-updating measurement do
 one-way Clifford localizer (axis changes plus a CNOT ladder), because it must move the
 measured information onto one coefficient site before absorbing the basis change.
 
+## Pepsy approximation diagnostic (not a paper fidelity formula)
+
+For a normalized unitary segment, Pepsy does not renormalize the bounded coefficient MPS
+after compression. It can therefore sample the cumulative norm-loss proxy
+$1-\lVert p\rVert^2$ from the tracked one-site canonical centre. This is cheaper than
+constructing an uncapped target and contracting an overlap, and it works uniformly across
+the unitary sub-MPO and Pauli-branch-sum paths without requiring discarded-SVD metadata.
+
+This proxy is not an exact overlap fidelity and must not be used for arbitrary non-unitary
+evolution, where changing norm is physical. Such updates, including coefficient-frame
+`submpo` events whose unitarity is unspecified, emit no sample and invalidate the current
+segment. A normalized projective collapse establishes a new unit-norm baseline without
+reporting the projection itself as infidelity.
+
 ## Resource / cost facts
 - Free operations: all Clifford gates + non-Clifford ops satisfying Corollary 2.1.
 - $\chi$ growth per single non-Clifford rotation: worst case $\chi'\le4\chi$ (MPS-local

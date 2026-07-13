@@ -40,10 +40,8 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
     numerical redundancy so repeated bond-dimension-2 MPOs do not double bonds forever.
   - *Approximate*: `MpsStabOptimizer(..., chi=cap, track_infidelity=True)`. Each compressed
-    unitary update records cumulative norm loss `1 - ||p||^2` in `.infidelities`;
-    `.bond_history` records every resulting coefficient-MPS bond. This reads the norm from
-    the one-site canonical centre and does not build an uncapped target or contract an
-    overlap. Non-unitary/projective updates emit no sample.
+    unitary update can record cumulative norm loss `1 - ||p||^2`; bounded evolution does
+    not renormalize `p`, so compression loss remains visible.
 - **Canonical-centre discipline** → preserve the simulator's `cur_orthog` info through
   quimb operations. Canonicalize explicitly before local projection, evaluate local
   expectations and unitary norm loss at the tracked centre, and renormalize the centre
@@ -52,6 +50,24 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   renormalized, but invalidate the norm-loss proxy because their norm change is physical.
 - Keep the wrapper thin and Pepsy-idiomatic (see repo `AGENTS.md`): prefer upstream
   quimb/autoray/cotengra behavior over reimplementation.
+
+## Diagnostic contract
+
+- Treat `track_infidelity` as a **normalized-unitary norm-loss proxy**, not exact overlap
+  fidelity, per-gate discarded SVD weight, or a general non-unitary error metric.
+- Read `1 - ||p||^2` from the tracked one-site canonical centre, including Quimb's MPS
+  `exponent`. Do not build an uncapped target, contract `<target|p>`, or renormalize after
+  a unitary update.
+- `.infidelities` is a sparse historical trace. Clifford gates, bond-preserving one-site
+  unitaries, measurements/projectors, arbitrary non-unitary matrices, and `submpo` events
+  emit no sample. Never sum this list; each emitted value is already cumulative within its
+  normalized unitary segment.
+- An unnormalized non-unitary matrix or coefficient-frame `submpo` invalidates the proxy,
+  so later unitaries remain unreported. A normalized projective collapse starts a fresh
+  segment at zero but does not itself append a sample.
+- Keep `.bond_history` independent from `.infidelities`; their indices are not aligned.
+- Remember the limitation: norm loss detects compression that removes norm, but it is not
+  a proof of state fidelity and cannot detect every norm-preserving directional error.
 
 ## Reference implementation (for cross-checking, not vendoring)
 `github.com/bsc-quantic/stabilizer-TN` — `v1.1` is a single `stabilizers.py`; `v1.2` (latest)
@@ -130,8 +146,9 @@ $\pi/2$ are Clifford and route to the tableau (free, $\chi$ unchanged).
 - **Explicit matrix** → check true unitarity *before* asking stim whether it is Clifford;
   stim does not reject all non-unitary near-Clifford matrices. Non-Clifford 1q unitaries use
   ZYZ; remaining matrices within `max_pauli_decomposition_qubits` use a balanced
-  Pauli-branch operator sum without normalization. For larger physical-frame operators,
-  prefer supported gate/rotation decompositions; `submpo` is coefficient-frame only.
+  Pauli-branch operator sum without normalization. Only a matrix verified unitary can emit
+  a norm-loss sample. For larger physical-frame operators, prefer supported gate/rotation
+  decompositions; `submpo` is coefficient-frame only and carries no unitarity declaration.
 - **Backend conversion** → stim/tableau classification remains NumPy/CPU; coefficient MPS,
   local gates, and MPO arrays use `to_backend`. Convert user matrix entries to NumPy for
   classification before converting coefficient-side operations back to the chosen backend.
@@ -186,7 +203,8 @@ invariant at every intermediate step.
 - [ ] Normalized unitary/measurement paths keep norm one; general non-unitary matrices keep
   the dense reference norm instead of being normalized.
 - [ ] Bounded `chi` is respected and the unitary norm-loss proxy decreases toward zero as
-  `chi` increases; non-unitary paths emit no infidelity sample.
+  `chi` increases; its latest emitted value equals `1 - norm()**2`; non-unitary and
+  coefficient-frame sub-MPO paths emit no sample.
 - [ ] Optional backends keep `p` and applied MPS-side arrays on that backend.
 
 ## Common pitfalls
@@ -205,6 +223,9 @@ invariant at every intermediate step.
 - **Canonical-centre metadata is part of the algorithm.** Blind rescans/full-network
   normalization erase the measurement performance gain; stale metadata produces incorrect
   local norms. Update or deliberately invalidate `state.info["cur_orthog"]` after rebuilds.
+- **Do not reinterpret diagnostics.** Quimb does not expose one uniform discarded-SVD
+  record across sub-MPO, branch-sum, and other compression paths. Do not synthesize one or
+  sum `.infidelities`; preserve the unitary norm-loss contract above.
 - **Long-range cost is dynamic.** A local physical gate can have a spread frame image after
   Clifford evolution. Static `MpsOptimizer` layout analysis of the physical stream does not
   optimize these evolving coefficient supports.

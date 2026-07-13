@@ -1,7 +1,6 @@
 ---
 name: mps-optimizer
 description: 'Run, review, debug, or extend pepsy.MpsOptimizer for MPS gate-stream replay, MPO/SVD/DMRG/swap compression, persistent graph layouts, canonical-center diagnostics, normalization, control events, and exact-mode transitions.'
-argument-hint: 'e.g. "install a persistent layout for this 3D gate stream" or "review MpsOptimizer canonicalization and norm diagnostics"'
 ---
 
 # MPS Optimizer in pepsy
@@ -69,6 +68,11 @@ After a mutation that invalidates canonicality, either canonicalize explicitly
 or invalidate the cache before any canonical-only operation. Unitary one-site
 gates preserve the isometry structure; non-unitary one-site gates need explicit
 recanonicalization.
+
+Do not transfer diagnostic semantics from `MpsOptimizer` to
+`MpsStabOptimizer`. The stabilizer coefficient-MPS simulator has its own sparse
+normalized-unitary norm-loss contract; read
+`.github/skills/stabilizer-tensor-networks/SKILL.md` before changing it.
 
 ## Backend rules
 
