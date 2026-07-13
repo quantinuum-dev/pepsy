@@ -306,6 +306,73 @@ def test_near_clifford_nonunitary_matrix_not_misrouted_to_tableau():
         assert not np.allclose(psi, zero)  # state actually changed
 
 
+@pytest.mark.parametrize(
+    "gate_dtype, small_coeff, atol",
+    [(np.complex64, 1e-5, 1e-7), (np.complex128, 1e-6, 1e-12)],
+)
+def test_operator_tolerance_is_independent_of_svd_cutoff(
+    gate_dtype, small_coeff, atol
+):
+    gate = np.eye(2, dtype=gate_dtype) + small_coeff * _X.astype(gate_dtype)
+    sim = MpsStabOptimizer(1, cutoff=1e-2).apply([(gate, 0)])
+
+    np.testing.assert_allclose(
+        sim.to_statevector(), np.array([1.0, small_coeff]), atol=atol
+    )
+
+
+def test_explicit_operator_tolerance_can_prune_small_pauli_terms():
+    gate = _I + 1e-3 * _X
+    sim = MpsStabOptimizer(1, cutoff=0.0, operator_tol=1e-2).apply([(gate, 0)])
+
+    np.testing.assert_allclose(sim.to_statevector(), np.array([1.0, 0.0]))
+
+
+@pytest.mark.parametrize("operator_tol", [-1.0, np.nan, np.inf])
+def test_operator_tolerance_must_be_finite_and_nonnegative(operator_tol):
+    with pytest.raises(ValueError, match="operator_tol"):
+        MpsStabOptimizer(1, operator_tol=operator_tol)
+
+
+def test_zero_operator_produces_valid_zero_mps():
+    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True).apply(
+        [(np.zeros((2, 2), dtype=complex), 0)]
+    )
+
+    assert sim.state.p is not None
+    assert sim.state.max_bond() == 1
+    assert sim.norm() == pytest.approx(0.0)
+    np.testing.assert_allclose(sim.to_statevector(), np.zeros(4))
+    assert sim.amplitude("00") == pytest.approx(0.0)
+    assert sim.probability("00") == pytest.approx(0.0)
+    assert sim.infidelities[-1] == pytest.approx(0.0)
+
+    sim.apply([("h", 1), (_I + 0.2 * _X, 0)])
+    assert sim.norm() == pytest.approx(0.0)
+
+
+def test_normalized_observables_reject_zero_norm_state_without_mutation():
+    sim = MpsStabOptimizer(2).apply([(np.zeros((2, 2), dtype=complex), 0)])
+    before = sim.to_statevector()
+    before_history = (len(sim.infidelities), len(sim.bond_history), len(sim.measurements))
+
+    calls = [
+        lambda: sim.expectation("Z", 0),
+        lambda: sim.expectation_pauli_sum([(1.0, "Z", 0)]),
+        lambda: sim.sample("Z", 0),
+        lambda: sim.probability_bits("00"),
+        lambda: sim.sample_bits(1),
+        lambda: sim.measure("Z", 0),
+        lambda: sim.measure("Z", 0, absorb_basis=True),
+    ]
+    for call in calls:
+        with pytest.raises(ValueError, match="zero-norm state"):
+            call()
+
+    np.testing.assert_allclose(sim.to_statevector(), before)
+    assert (len(sim.infidelities), len(sim.bond_history), len(sim.measurements)) == before_history
+
+
 def test_weighted_xor_matrix_matches_dense():
     # (1-p)I + p X^{⊗k} weighted-XOR gate (the capped DEM mechanism), non-unitary
     # and near-Clifford, on non-adjacent qubits.

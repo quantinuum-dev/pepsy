@@ -25,7 +25,7 @@ core. Production readiness depends on completing the correctness and
 performance hardening below. Correct state semantics take priority over adding
 new simulator features.
 
-### Correctness hardening completed in the first review batch
+### Completed correctness hardening
 
 - Quimb's base-10 MPS `exponent` is included in norm and expectation
   calculations and remains correct when a projected state is normalized.
@@ -39,27 +39,29 @@ new simulator features.
   prefix optimization while producing exchangeable i.i.d. row positions.
 - Bitstrings, Pauli axes/supports, and tableau/MPS sizes are validated without
   lossy integer coercion or silent support truncation.
+- Dense-operator pruning now has an independent, dtype-aware `operator_tol`;
+  MPS `cutoff` is used only for SVD compression. Empty Pauli decompositions
+  install a valid compact zero MPS, and normalized observable/measurement APIs
+  reject zero-norm states before mutation.
 
 ### Remaining priorities from the review
 
-1. Separate operator-decomposition tolerance from MPS SVD `cutoff`; define and
-   test zero-operator behavior instead of allowing an empty branch sum.
-2. Replace dense `2**k x 2**k` Clifford-Pauli rotation classification with a
+1. Replace dense `2**k x 2**k` Clifford-Pauli rotation classification with a
    direct Stim/tableau circuit synthesis using basis changes and a parity
    ladder.
-3. Bound the arbitrary dense-gate API explicitly. Its Pauli decomposition has
+2. Bound the arbitrary dense-gate API explicitly. Its Pauli decomposition has
    `4**k` terms; structured or larger operators should use an MPO path and
    branch sums should use balanced reduction.
-4. Redesign infidelity diagnostics: use MPS-specialized overlaps, include
+3. Redesign infidelity diagnostics: use MPS-specialized overlaps, include
    sub-MPO truncation, and distinguish per-step loss from cumulative fidelity.
-5. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
+4. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
    untouched by ordinary stream entries).
-6. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
+5. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
    and Torch paths; avoid mutating caller-owned MPOs during backend conversion.
-7. Clarify the simulator-facing API with typed measurement/diagnostic records
+6. Clarify the simulator-facing API with typed measurement/diagnostic records
    and consider `StabilizerMpsSimulator` as the preferred name while preserving
    `MpsStabOptimizer` as a compatibility alias.
-8. Reconcile roadmap references to any intentionally removed benchmark/example
+7. Reconcile roadmap references to any intentionally removed benchmark/example
    files so documentation and the executable repository remain aligned.
 
 ---
@@ -81,6 +83,8 @@ new simulator features.
   to `p` as a compressed sum of signed Pauli-string branches (`pauli_decomposition`
   + `_apply_dense_gate`/`_apply_operator_sum`). Non-unitary `G` is represented
   without renormalization (coefficient norm tracks `|G|psi>|`).
+  Pauli-coefficient pruning uses `operator_tol` independently of MPS SVD
+  `cutoff`; a zero operator is represented by a valid zero-norm MPS.
 - **Measurement (Lemma 3)** — `expectation` = `<nu|M|nu>`; `measure` collapses
   with the fixed-basis projector `(I +- M)/2` + renormalize; Born sampling +
   forced outcomes; `("measure", ...)` stream entry.

@@ -53,6 +53,13 @@ outcome[, absorb_basis]])`, and `("reset", where)`.
   replay the successful prefix.
 - `norm()` and normalized measurements account for Quimb's separate MPS
   `exponent` scale as well as the tensor data.
+- Dense-operator coefficient pruning is controlled by `operator_tol`, never by
+  the MPS SVD `cutoff`. With `operator_tol=None`, the threshold is relative to
+  the matrix scale and input dtype; an explicit value is an absolute tolerance.
+- A zero operator produces a valid zero-norm MPS. `norm()`, dense amplitudes,
+  and dense probabilities remain available, while expectation, sampling,
+  conditional-probability, reset, and measurement APIs raise `ValueError`
+  because normalized probabilities are undefined for a zero state.
 
 ## Performance boundaries
 

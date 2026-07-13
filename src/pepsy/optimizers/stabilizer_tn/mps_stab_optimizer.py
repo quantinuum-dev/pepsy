@@ -128,6 +128,10 @@ class MpsStabOptimizer:
         evolution exact (no truncation).
     cutoff : float
         Singular-value cutoff used when truncating ``|nu>``.
+    operator_tol : float | None
+        Absolute tolerance for pruning Pauli coefficients when decomposing an
+        explicit dense operator. ``None`` chooses a matrix-scale-relative
+        tolerance from the operator dtype. This is independent of ``cutoff``.
     track_infidelity : bool
         If ``True``, record the true truncation infidelity (via
         :func:`pepsy.tn_fidelity`) for each compressed ``|nu>`` update.  When
@@ -166,6 +170,7 @@ class MpsStabOptimizer:
         *,
         chi: Optional[int] = None,
         cutoff: float = 1e-12,
+        operator_tol: Optional[float] = None,
         track_infidelity: bool = False,
         seed: Optional[int] = None,
         dtype: str = "complex128",
@@ -181,6 +186,14 @@ class MpsStabOptimizer:
 
         self.chi = None if chi is None else int(chi)
         self.cutoff = float(cutoff)
+        if operator_tol is not None:
+            operator_tol = float(operator_tol)
+            if not np.isfinite(operator_tol) or operator_tol < 0.0:
+                raise ValueError(
+                    "operator_tol must be finite and nonnegative, "
+                    f"got {operator_tol!r}."
+                )
+        self.operator_tol = operator_tol
         self.track_infidelity = bool(track_infidelity)
         self.dtype = self.state.dtype
         self._rng = np.random.default_rng(seed)
@@ -333,6 +346,25 @@ class MpsStabOptimizer:
         """Norm of the coefficient state ``|nu>`` (represented state norm; ~1)."""
         return float(abs(self._to_scalar(self.state.p.norm())))
 
+    def _norm_squared(self) -> float:
+        """Return ``<nu|nu>`` as a nonnegative Python float."""
+        return float(abs(self._to_scalar(self.state.p.H @ self.state.p)))
+
+    def _require_nonzero_state(self, action: str) -> float:
+        """Return the norm squared or reject a normalized zero-state operation."""
+        norm_squared = self._norm_squared()
+        if not np.isfinite(norm_squared):
+            raise ValueError(
+                f"Cannot {action}: coefficient state has invalid norm squared "
+                f"{norm_squared!r}."
+            )
+        if norm_squared <= 0.0:
+            raise ValueError(
+                f"Cannot {action} a zero-norm state; normalized probabilities "
+                "and expectation values are undefined."
+            )
+        return norm_squared
+
     def pseudo_stabilizer_rank(self, tol: float = 1e-12) -> int:
         """Pseudo-stabilizer rank ``xi_tilde`` = number of non-zero ``nu_i``."""
         return self.state.pseudo_stabilizer_rank(tol=tol)
@@ -343,6 +375,7 @@ class MpsStabOptimizer:
             self.state.copy(),
             chi=self.chi,
             cutoff=self.cutoff,
+            operator_tol=self.operator_tol,
             track_infidelity=self.track_infidelity,
             dtype=self.dtype,
             to_backend=self.to_backend,
@@ -615,13 +648,13 @@ class MpsStabOptimizer:
     def _pauli_expectation(self, terms, sign) -> float:
         """Return ``<p|M|p> / <p|p>`` for the Pauli ``M = sign * prod terms``."""
         p = self.state.p
+        den = self._require_nonzero_state("compute an expectation value for")
         if not terms:  # M = sign * I
             return float(sign)
         m_p = p.copy()
         for site, axis in terms.items():
             m_p.gate_(self._bk_const("P" + axis, pauli_matrix(axis)), site, contract=True)
         num = self._to_scalar(p.H @ m_p)
-        den = self._to_scalar(p.H @ p)
         return float(sign * np.real(num / den))
 
     def expectation(self, pauli, where=None) -> float:
@@ -650,6 +683,7 @@ class MpsStabOptimizer:
         ``terms`` is an iterable of ``(coeff, pauli)`` or ``(coeff, pauli, where)``
         entries; ``pauli``/``where`` follow the :meth:`expectation` conventions.
         """
+        self._require_nonzero_state("compute an expectation value for")
         total = 0.0 + 0.0j
         for term in terms:
             coeff, pauli = term[0], term[1]
@@ -748,6 +782,7 @@ class MpsStabOptimizer:
         ``m_pauli`` is the signed :class:`stim.PauliString` image
         ``M = C^dagger O C`` of the physical observable on the coefficient qubits.
         """
+        self._require_nonzero_state("measure")
         terms, sign = hermitian_pauli_terms(m_pauli)
         forced = self._validate_outcome(outcome)
         if forced is not None:
@@ -1030,7 +1065,8 @@ class MpsStabOptimizer:
         in ``gates`` are teleported through :meth:`inject_rz` (see
         :meth:`run_with_injection`), keeping the non-Clifford cost on the ancilla
         pool instead of the coefficient MPS.  Remaining keyword arguments are
-        forwarded to the constructor (``chi``, ``cutoff``, ``seed``, ...).
+        forwarded to the constructor (``chi``, ``cutoff``, ``operator_tol``,
+        ``seed``, ...).
         """
         n_data = int(n_data)
         n_ancilla = int(n_ancilla)
@@ -1104,7 +1140,7 @@ class MpsStabOptimizer:
         """
         where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
         k = len(where)
-        decomp = pauli_decomposition(gate, k, tol=max(self.cutoff, 1e-14))
+        decomp = pauli_decomposition(gate, k, tol=self.operator_tol)
         branches = []  # (weight, {site: axis})
         for labels, coeff in decomp:
             phys = pauli_string(labels, where, self.n)
@@ -1120,6 +1156,10 @@ class MpsStabOptimizer:
         compressed to ``chi``/``cutoff``.  Returns the truncation infidelity.
         """
         p = self.state.p
+        branches = tuple(branches)
+        if not branches or self._norm_squared() <= 0.0:
+            self._set_zero_coefficient_state()
+            return 0.0
 
         def build(max_bond):
             result = None
@@ -1141,9 +1181,26 @@ class MpsStabOptimizer:
             target = build(None)
             truncated = build(self.chi)
             self.state.p = truncated
+            target_norm = float(abs(self._to_scalar(target.H @ target)))
+            truncated_norm = float(abs(self._to_scalar(truncated.H @ truncated)))
+            if target_norm <= 0.0:
+                self._set_zero_coefficient_state()
+                return 0.0
+            if truncated_norm <= 0.0:
+                return 1.0
             return max(0.0, float(1.0 - abs(self._to_scalar(tn_fidelity(truncated, target)))))
         self.state.p = build(self.chi)
         return 0.0
+
+    def _set_zero_coefficient_state(self) -> None:
+        """Install a valid, compact zero MPS with the current site structure."""
+        p = self.state.p.copy()
+        first = p[p.site_tag(0)]
+        first.modify(data=first.data * 0)
+        p.exponent = 0.0
+        p.compress(max_bond=1, cutoff=0.0)
+        p.exponent = 0.0
+        self.state.p = p
 
     # ------------------------------------------------------------------ #
     # Sub-MPO events (coefficient-frame operator)
@@ -1173,6 +1230,7 @@ class MpsStabOptimizer:
     def __repr__(self) -> str:  # pragma: no cover - cosmetic
         return (
             f"MpsStabOptimizer(n={self.n}, chi={self.chi}, "
+            f"operator_tol={self.operator_tol}, "
             f"queued={len(self._queue)}, current_chi={self.state.max_bond()})"
         )
 

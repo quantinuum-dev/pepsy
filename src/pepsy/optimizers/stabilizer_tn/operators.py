@@ -38,14 +38,16 @@ def _kron_pauli(labels: Sequence[str]) -> np.ndarray:
 
 
 def pauli_decomposition(
-    gate: np.ndarray, k: int, *, tol: float = 1e-12
+    gate: np.ndarray, k: int, *, tol: float | None = None
 ) -> List[Tuple[Tuple[str, ...], complex]]:
     """Decompose a ``2**k x 2**k`` matrix into a Pauli-string basis.
 
     Returns a list of ``(labels, coeff)`` where ``labels`` is a length-``k``
     tuple over ``{'I','X','Y','Z'}`` and ``coeff = Tr(P_labels @ gate) / 2**k``,
-    keeping only terms with ``abs(coeff) > tol``.  Works for any (unitary or
-    non-unitary) matrix; ``G = sum_labels coeff * P_labels`` exactly.
+    keeping only terms with ``abs(coeff) > tol``. If ``tol`` is ``None``, use a
+    matrix-scale-relative threshold derived from the input dtype. Works for any
+    (unitary or non-unitary) matrix; ``G = sum_labels coeff * P_labels`` up to
+    the requested numerical tolerance.
 
     Enumerates ``4**k`` Paulis, so intended for small ``k`` (few-qubit gates).
     """
@@ -53,6 +55,19 @@ def pauli_decomposition(
     dim = 2 ** k
     if gate.shape != (dim, dim):
         raise ValueError(f"gate must be {dim}x{dim} for k={k}, got {gate.shape}.")
+    if tol is None:
+        if np.issubdtype(gate.dtype, np.complexfloating):
+            real_dtype = np.empty((), dtype=gate.dtype).real.dtype
+        elif np.issubdtype(gate.dtype, np.floating):
+            real_dtype = gate.dtype
+        else:
+            real_dtype = np.dtype("float64")
+        matrix_scale = float(np.max(np.abs(gate), initial=0.0))
+        tol = dim * np.finfo(real_dtype).eps * matrix_scale
+    else:
+        tol = float(tol)
+        if not np.isfinite(tol) or tol < 0.0:
+            raise ValueError(f"tol must be finite and nonnegative, got {tol!r}.")
     scale = 1.0 / dim
     terms: List[Tuple[Tuple[str, ...], complex]] = []
     for labels in itertools.product("IXYZ", repeat=k):
