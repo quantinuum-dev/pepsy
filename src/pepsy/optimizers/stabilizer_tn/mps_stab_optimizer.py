@@ -46,7 +46,6 @@ from typing import List, Optional
 import numpy as np
 
 from ..mps.optimizer import is_submpo_event, submpo_event_parts
-from ...tensors.core import tn_fidelity
 from .operators import (
     pauli_combo_submpo,
     pauli_decomposition,
@@ -138,10 +137,10 @@ class MpsStabOptimizer:
         disables the guard. Clifford matrices and one-qubit unitary matrices
         use their specialized paths and do not consume this budget.
     track_infidelity : bool
-        If ``True``, record the true truncation infidelity (via
-        :func:`pepsy.tn_fidelity`) for each compressed ``|nu>`` update.  When
-        ``False`` (default) truncation still happens but ``infidelities`` stores
-        ``0.0`` placeholders (cheaper).
+        If ``True``, record ``1 - ||nu||**2`` after compressed unitary updates.
+        The normalized initial coefficient state is not renormalized during
+        unitary evolution, so this is a cheap cumulative norm-loss proxy read
+        from the canonical centre. Non-unitary updates do not produce samples.
     seed : int | None
         Seed for the random-number generator used by measurement sampling.
     dtype : str
@@ -161,7 +160,7 @@ class MpsStabOptimizer:
     state : STNState
         The evolving stabilizer tensor-network state.
     infidelities : list[float]
-        Per-``|nu>``-update truncation infidelity (0.0 for exact/Clifford steps).
+        Cumulative norm-loss samples from compressed unitary ``|nu>`` updates.
     bond_history : list[int]
         ``|nu>`` max bond dimension after each applied entry.
     measurements : list[tuple]
@@ -216,6 +215,9 @@ class MpsStabOptimizer:
                 )
         self.max_pauli_decomposition_qubits = max_pauli_decomposition_qubits
         self.track_infidelity = bool(track_infidelity)
+        self._norm_infidelity_valid = True
+        self._current_norm_infidelity = 0.0 if self.track_infidelity else None
+        self._p_info = {"cur_orthog": None}
         self.dtype = self.state.dtype
         self._rng = np.random.default_rng(seed)
 
@@ -319,7 +321,7 @@ class MpsStabOptimizer:
         ----------
         progbar : bool
             Show a ``tqdm`` progress bar reporting the running ``|nu>`` bond
-            dimension and cumulative truncation infidelity.
+            dimension and current unitary norm-loss proxy.
         """
         queue = tuple(self._queue)
         completed = 0
@@ -334,9 +336,10 @@ class MpsStabOptimizer:
                 completed += 1
                 if pbar is not None:
                     pbar.update(1)
+                    infidelity = self._current_norm_infidelity
                     pbar.set_postfix(
                         chi=self.state.max_bond(),
-                        infid=f"{sum(self.infidelities):.2e}",
+                        infid=("n/a" if infidelity is None else f"{infidelity:.2e}"),
                     )
         finally:
             if pbar is not None:
@@ -372,6 +375,45 @@ class MpsStabOptimizer:
         """Return ``<nu|nu>`` as a nonnegative Python float."""
         return float(abs(self._to_scalar(self.state.p.H @ self.state.p)))
 
+    def _ensure_p_center(self) -> None:
+        """Establish the coefficient MPS canonical-centre tracker once."""
+        if self._p_info.get("cur_orthog") not in (None, "calc"):
+            return
+        p = self.state.p
+        p.canonize([0], cur_orthog="calc", info=self._p_info)
+        self._p_info["cur_orthog"] = (0, 0)
+
+    def _unitary_norm_infidelity(self) -> Optional[float]:
+        """Return cumulative unitary norm loss from the canonical centre."""
+        if not self.track_infidelity or not self._norm_infidelity_valid:
+            return None
+
+        self._ensure_p_center()
+        lo, hi = self._p_info["cur_orthog"]
+        if lo != hi:
+            self.state.p.canonize(
+                [lo], cur_orthog=(lo, hi), info=self._p_info
+            )
+            self._p_info["cur_orthog"] = (lo, lo)
+
+        center = self.state.p[self.state.p.site_tag(lo)]
+        center_norm = float(abs(self._to_scalar(center.norm())))
+        exponent = float(getattr(self.state.p, "exponent", 0.0))
+        norm_squared = center_norm * center_norm * (10.0 ** (2.0 * exponent))
+        infidelity = min(1.0, max(0.0, 1.0 - norm_squared))
+        self._current_norm_infidelity = infidelity
+        return infidelity
+
+    def _invalidate_norm_infidelity(self) -> None:
+        """Stop unitary norm-loss reporting after an unnormalized update."""
+        self._norm_infidelity_valid = False
+        self._current_norm_infidelity = None
+
+    def _reset_norm_infidelity(self) -> None:
+        """Start a fresh normalized unitary segment after projection."""
+        self._norm_infidelity_valid = True
+        self._current_norm_infidelity = 0.0 if self.track_infidelity else None
+
     def _require_nonzero_state(self, action: str) -> float:
         """Return the norm squared or reject a normalized zero-state operation."""
         norm_squared = self._norm_squared()
@@ -393,7 +435,7 @@ class MpsStabOptimizer:
 
     def copy(self) -> "MpsStabOptimizer":
         """Return an independent copy (state deep-copied; queue/history reset)."""
-        return MpsStabOptimizer(
+        copied = MpsStabOptimizer(
             self.state.copy(),
             chi=self.chi,
             cutoff=self.cutoff,
@@ -403,6 +445,10 @@ class MpsStabOptimizer:
             dtype=self.dtype,
             to_backend=self.to_backend,
         )
+        copied._norm_infidelity_valid = self._norm_infidelity_valid
+        copied._current_norm_infidelity = self._current_norm_infidelity
+        copied._p_info = dict(self._p_info)
+        return copied
 
     # ------------------------------------------------------------------ #
     # Backend helpers (place |nu> gates/MPOs on the configured backend)
@@ -520,7 +566,7 @@ class MpsStabOptimizer:
                 name = head.strip().lower()
                 if name in _CLIFFORD_NAMES:
                     self.state.apply_clifford(name, *entry[1:])
-                    self._record(0.0)
+                    self._record()
                     return
                 if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name in (
                     "rot", "t", "tdg",
@@ -622,7 +668,7 @@ class MpsStabOptimizer:
             tableau = stim.Tableau.from_circuit(circuit)
             self._clifford_rot_cache[key] = tableau
         self.state.do_tableau(tableau, where)
-        self._record(0.0)
+        self._record()
 
     def _apply_rotation(self, name, params) -> None:
         theta, where, axes = self._rotation_spec(name, params)
@@ -637,22 +683,24 @@ class MpsStabOptimizer:
         terms, sign = hermitian_pauli_terms(m_pauli)
         support = sorted(terms)
         if not support:  # global phase only; no state change
-            self._record(0.0)
+            self._record()
             return
         if len(support) == 1:
             q = support[0]
             umat = single_qubit_rotation_matrix(theta, terms[q], sign, self.dtype)
             self.state.p.gate_(self._bk(umat), q, contract=True)
-            self._record(0.0)
+            self._record()
             return
         # Multi-qubit Pauli rotation: windowed bond-dim-2 sub-MPO applied only on
         # the support span via gate_with_submpo_ (skips identity sites entirely).
         c = np.cos(theta / 2)
         coef = -1j * sign * np.sin(theta / 2)
         mpo, where = pauli_combo_submpo(c, coef, terms, self.n, dtype=self.dtype)
-        self._record(self._evolve_p(self._bk_mpo(mpo), where))
+        self._record(self._evolve_p(self._bk_mpo(mpo), where, unitary=True))
 
-    def _evolve_p(self, mpo, where, *, renormalize: bool = False) -> float:
+    def _evolve_p(
+        self, mpo, where, *, unitary: bool = False, renormalize: bool = False
+    ) -> Optional[float]:
         """Apply a windowed sub-MPO to the coefficient MPS ``p`` on ``where``.
 
         Only the ``[min(where), max(where)]`` region is canonicalized and
@@ -660,16 +708,19 @@ class MpsStabOptimizer:
         stops the bond-dim-2 MPO from doubling the bond on every application.
         """
         p = self.state.p
-        if self.track_infidelity and self.chi is not None:
-            target = p.copy()
-            target.gate_with_submpo_(mpo, where=where, cutoff=self.cutoff)
-            p.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
-            infidelity = max(0.0, float(1.0 - abs(self._to_scalar(tn_fidelity(p, target)))))
-        else:
-            p.gate_with_submpo_(mpo, where=where, max_bond=self.chi, cutoff=self.cutoff)
-            infidelity = 0.0
+        self._ensure_p_center()
+        p.gate_with_submpo_(
+            mpo,
+            where=where,
+            max_bond=self.chi,
+            cutoff=self.cutoff,
+            info=self._p_info,
+        )
+        infidelity = self._unitary_norm_infidelity() if unitary else None
         if renormalize:
             p.normalize()
+            self._p_info["cur_orthog"] = None
+            self._reset_norm_infidelity()
         return infidelity
 
     # ------------------------------------------------------------------ #
@@ -833,7 +884,7 @@ class MpsStabOptimizer:
             m = self._absorb_measure(m_pauli, None)
             if m < 0:  # qubit collapsed to |1> -> flip to |0>
                 self.state.apply_clifford("x", q)
-                self._record(0.0)
+                self._record()
         return self
 
     def _absorb_measure(self, m_pauli, outcome) -> int:
@@ -856,7 +907,7 @@ class MpsStabOptimizer:
                 )
         support = sorted(terms)
         if not support:  # M = +/- I: deterministic, state unchanged
-            self._record(0.0)
+            self._record()
             return int(sign)
         ops, v_tableau, k = _localizing_clifford(terms, self.n)
         conj_terms, s = hermitian_pauli_terms(v_tableau(m_pauli))  # V M V^dag
@@ -864,7 +915,7 @@ class MpsStabOptimizer:
             raise RuntimeError(
                 f"localizer produced {conj_terms!r}, expected Z on qubit {k}."
             )
-        infidelity = self._apply_localizer_to_p(ops)
+        self._apply_localizer_to_p(ops)
         self.state.absorb_basis_clifford(v_tableau)
         # Single-qubit Z_k measurement on the reframed coefficient state.
         p = self.state.p
@@ -878,13 +929,13 @@ class MpsStabOptimizer:
             m = forced
         zval = m * s  # required Z_k eigenvalue (+1 -> |0>, -1 -> |1>)
         self._project_computational_site(k, 0 if zval > 0 else 1)
-        self._record(infidelity)
+        self._record()
         return m
 
-    def _apply_localizer_to_p(self, ops) -> float:
-        """Apply the localizing Clifford ``ops`` to ``|nu>``; return truncation infidelity."""
+    def _apply_localizer_to_p(self, ops) -> None:
+        """Apply the measurement's localizing Clifford to ``|nu>``."""
         p = self.state.p
-        infidelity = 0.0
+        self._ensure_p_center()
         for name, targ in ops:
             if name == "h":
                 p.gate_(self._bk_const("H", _H_MAT), targ[0], contract=True)
@@ -892,16 +943,15 @@ class MpsStabOptimizer:
                 p.gate_(self._bk_const("SDG", _SDG_MAT), targ[0], contract=True)
             elif name == "cnot":
                 cnot = self._bk_const("CNOT", _CNOT_MAT)
-                if self.track_infidelity and self.chi is not None:
-                    target = p.copy()
-                    target.gate_(cnot, targ, contract="swap+split", cutoff=self.cutoff)
-                    p.gate_(cnot, targ, contract="swap+split",
-                            max_bond=self.chi, cutoff=self.cutoff)
-                    infidelity += max(0.0, float(1.0 - abs(self._to_scalar(tn_fidelity(p, target)))))
-                else:
-                    p.gate_(cnot, targ, contract="swap+split",
-                            max_bond=self.chi, cutoff=self.cutoff)
-        return infidelity
+                p.gate_(
+                    cnot,
+                    targ,
+                    contract="swap+split",
+                    max_bond=self.chi,
+                    cutoff=self.cutoff,
+                    info=self._p_info,
+                    cur_orthog=self._p_info.get("cur_orthog"),
+                )
 
     def _project_computational_site(self, k, keep_bit) -> None:
         """Project coefficient site ``k`` onto ``|keep_bit>`` and renormalize ``|nu>``."""
@@ -909,12 +959,14 @@ class MpsStabOptimizer:
         proj[keep_bit, keep_bit] = 1.0
         self.state.p.gate_(self._bk(proj), k, contract=True)
         self.state.p.normalize()
+        self._p_info["cur_orthog"] = None
+        self._reset_norm_infidelity()
 
     def _apply_projector(self, terms, sign, m) -> None:
         """Apply ``(I + m M)/2`` to ``|nu>`` and renormalize (M = sign * prod terms)."""
         support = sorted(terms)
         if not support:  # M = +/- I: outcome is deterministic, state unchanged
-            self._record(0.0)
+            self._record()
             return
         coef = 0.5 * m * sign
         if len(support) == 1:
@@ -922,11 +974,13 @@ class MpsStabOptimizer:
             proj = single_qubit_combo_matrix(0.5, coef, terms[q], self.dtype)
             self.state.p.gate_(self._bk(proj), q, contract=True)
             self.state.p.normalize()
-            self._record(0.0)
+            self._p_info["cur_orthog"] = None
+            self._reset_norm_infidelity()
+            self._record()
             return
         mpo, where = pauli_combo_submpo(0.5, coef, terms, self.n, dtype=self.dtype)
-        infidelity = self._evolve_p(self._bk_mpo(mpo), where, renormalize=True)
-        self._record(infidelity)
+        self._evolve_p(self._bk_mpo(mpo), where, renormalize=True)
+        self._record()
 
     # ------------------------------------------------------------------ #
     # Magic-state injection (R1)
@@ -944,7 +998,7 @@ class MpsStabOptimizer:
         """
         a = int(ancilla)
         self.state.apply_clifford("h", a)  # |0> -> |+>, Clifford (tableau only)
-        self._record(0.0)
+        self._record()
         self._apply_rotation("rz", (float(angle), a))  # |+> -> Rz(angle)|+> = |M>
         return self
 
@@ -980,7 +1034,7 @@ class MpsStabOptimizer:
         data, ancilla = int(data), int(ancilla)
         # CNOT(control=data, target=ancilla): Clifford, tableau only.
         self.state.apply_clifford("cnot", data, ancilla)
-        self._record(0.0)
+        self._record()
         # Measure the ancilla in Z, absorbing it out of |nu>.
         m = self.measure("Z", ancilla, absorb_basis=True, outcome=outcome)
         if m < 0:  # ancilla collapsed to |1>: outcome-conditioned Rz(2*phi) correction.
@@ -1172,7 +1226,7 @@ class MpsStabOptimizer:
 
         if tableau is not None:  # Clifford -> tableau update
             self.state.do_tableau(tableau, where)
-            self._record(0.0)
+            self._record()
             return
 
         if nq == 1 and gate_is_unitary:  # non-Clifford 1q unitary -> ZYZ
@@ -1185,9 +1239,11 @@ class MpsStabOptimizer:
 
         # General k-qubit gate (any k, unitary or non-unitary): decompose into
         # Paulis and act on the coefficient MPS via the frame map.
-        self._apply_dense_gate(gate, where)
+        self._apply_dense_gate(gate, where, unitary=gate_is_unitary)
 
-    def _apply_dense_gate(self, gate: np.ndarray, where) -> None:
+    def _apply_dense_gate(
+        self, gate: np.ndarray, where, *, unitary: bool = False
+    ) -> None:
         """Apply an arbitrary k-qubit gate ``G`` (unitary or not) to ``|psi>``.
 
         ``G = sum_a c_a P_a`` (Pauli decomposition); on the coefficient MPS this
@@ -1219,20 +1275,24 @@ class MpsStabOptimizer:
             phys = pauli_string(labels, where, self.n)
             frame_terms, sign = hermitian_pauli_terms(self.state.frame_pauli(phys))
             branches.append((coeff * sign, frame_terms))
-        self._record(self._apply_operator_sum(branches))
+        self._record(self._apply_operator_sum(branches, unitary=unitary))
 
-    def _apply_operator_sum(self, branches) -> float:
+    def _apply_operator_sum(self, branches, *, unitary: bool) -> Optional[float]:
         """Apply ``M = sum_j w_j (prod_i P_i)`` to the coefficient MPS ``p``.
 
         Each branch scales a copy of ``p`` by ``w_j`` and applies its
         (bond-preserving) single-qubit Paulis; the branches are summed and
-        compressed to ``chi``/``cutoff``.  Returns the truncation infidelity.
+        compressed to ``chi``/``cutoff``. Unitary sums return the cumulative
+        norm-loss proxy; arbitrary non-unitary sums invalidate that diagnostic.
         """
         p = self.state.p
         branches = tuple(branches)
         if not branches or self._norm_squared() <= 0.0:
             self._set_zero_coefficient_state()
-            return 0.0
+            if unitary:
+                return self._unitary_norm_infidelity()
+            self._invalidate_norm_infidelity()
+            return None
 
         def combine(left, right, max_bond):
             result = left + right
@@ -1272,20 +1332,12 @@ class MpsStabOptimizer:
             result.compress(max_bond=max_bond, cutoff=self.cutoff)
             return result
 
-        if self.track_infidelity and self.chi is not None:
-            target = build(None)
-            truncated = build(self.chi)
-            self.state.p = truncated
-            target_norm = float(abs(self._to_scalar(target.H @ target)))
-            truncated_norm = float(abs(self._to_scalar(truncated.H @ truncated)))
-            if target_norm <= 0.0:
-                self._set_zero_coefficient_state()
-                return 0.0
-            if truncated_norm <= 0.0:
-                return 1.0
-            return max(0.0, float(1.0 - abs(self._to_scalar(tn_fidelity(truncated, target)))))
         self.state.p = build(self.chi)
-        return 0.0
+        self._p_info["cur_orthog"] = (0, 0)
+        if unitary:
+            return self._unitary_norm_infidelity()
+        self._invalidate_norm_infidelity()
+        return None
 
     def _set_zero_coefficient_state(self) -> None:
         """Install a valid, compact zero MPS with the current site structure."""
@@ -1296,6 +1348,7 @@ class MpsStabOptimizer:
         p.compress(max_bond=1, cutoff=0.0)
         p.exponent = 0.0
         self.state.p = p
+        self._p_info["cur_orthog"] = (0, 0)
 
     # ------------------------------------------------------------------ #
     # Sub-MPO events (coefficient-frame operator)
@@ -1307,19 +1360,23 @@ class MpsStabOptimizer:
         conjugated through the basis Clifford.  For a *physical*-frame operator
         use a dense ``(matrix, where)`` entry, which is frame-mapped for you.
         """
+        self._ensure_p_center()
         self.state.p.gate_with_submpo_(
             self._bk_mpo(mpo),
             where=where,
             max_bond=self.chi,
             cutoff=self.cutoff,
+            info=self._p_info,
         )
-        self._record(0.0)
+        self._invalidate_norm_infidelity()
+        self._record()
 
     # ------------------------------------------------------------------ #
     # Bookkeeping
     # ------------------------------------------------------------------ #
-    def _record(self, infidelity: float) -> None:
-        self.infidelities.append(float(infidelity))
+    def _record(self, infidelity: Optional[float] = None) -> None:
+        if infidelity is not None:
+            self.infidelities.append(float(infidelity))
         self.bond_history.append(self.state.max_bond())
 
     def __repr__(self) -> str:  # pragma: no cover - cosmetic

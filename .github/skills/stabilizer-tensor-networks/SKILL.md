@@ -40,14 +40,16 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
     numerical redundancy so repeated bond-dimension-2 MPOs do not double bonds forever.
   - *Approximate*: `MpsStabOptimizer(..., chi=cap, track_infidelity=True)`. Each compressed
-    update is compared with an uncapped local target and recorded in `.infidelities`;
-    `.bond_history` records the resulting coefficient-MPS bond. With tracking disabled,
-    truncation still occurs and the history contains zero infidelity placeholders.
-- **Canonical-centre discipline** → preserve `STNState.info["cur_orthog"]` through quimb
-  operations. Canonicalize explicitly before local projection, evaluate local expectations
-  at the tracked centre, and renormalize the centre tensor rather than contracting and
-  normalizing the full MPS. Full arbitrary non-unitary matrix entries are intentionally
-  *not* renormalized: `norm()` then reports the represented state's norm.
+    unitary update records cumulative norm loss `1 - ||p||^2` in `.infidelities`;
+    `.bond_history` records every resulting coefficient-MPS bond. This reads the norm from
+    the one-site canonical centre and does not build an uncapped target or contract an
+    overlap. Non-unitary/projective updates emit no sample.
+- **Canonical-centre discipline** → preserve the simulator's `cur_orthog` info through
+  quimb operations. Canonicalize explicitly before local projection, evaluate local
+  expectations and unitary norm loss at the tracked centre, and renormalize the centre
+  tensor only after projection. Never renormalize bounded unitary evolution: its lost norm
+  is the diagnostic. Full arbitrary non-unitary matrix entries are also intentionally not
+  renormalized, but invalidate the norm-loss proxy because their norm change is physical.
 - Keep the wrapper thin and Pepsy-idiomatic (see repo `AGENTS.md`): prefer upstream
   quimb/autoray/cotengra behavior over reimplementation.
 
@@ -161,8 +163,8 @@ invariant at every intermediate step.
    genuine multi-term matrix. Label every sub-MPO with its real MPS sites.
 4. **Maintain numerical state.** Thread the `info` orthogonality-centre tracker through
    quimb splitting/canonicalization calls. Preserve the configured backend for MPS-side
-   arrays. Normalize only projective/unitary workflows that promise a normalized state;
-   retain the norm of arbitrary non-unitary gates.
+   arrays. Normalize projective collapse, but do not normalize unitary evolution or
+   arbitrary non-unitary gates. Report norm loss only across normalized unitary segments.
 5. **Validate the physical state.** For small `n`, compare `C @ p_dense` with an independent
    dense circuit up to global phase. Compare Clifford-only behavior with stim. Test exact
    `chi=None` first, then a bounded-`chi` path and backend variants when touched.
@@ -183,7 +185,8 @@ invariant at every intermediate step.
   non-unitary matrices all follow their intended dispatch paths.
 - [ ] Normalized unitary/measurement paths keep norm one; general non-unitary matrices keep
   the dense reference norm instead of being normalized.
-- [ ] Bounded `chi` is respected and tracked infidelity converges toward exact evolution.
+- [ ] Bounded `chi` is respected and the unitary norm-loss proxy decreases toward zero as
+  `chi` increases; non-unitary paths emit no infidelity sample.
 - [ ] Optional backends keep `p` and applied MPS-side arrays on that backend.
 
 ## Common pitfalls

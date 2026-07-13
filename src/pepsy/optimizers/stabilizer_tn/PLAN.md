@@ -50,19 +50,22 @@ new simulator features.
   `max_pauli_decomposition_qubits` (default `2`, explicit opt-in supported).
   Accepted Pauli branches use a streaming balanced MPS reduction rather than a
   sequential left fold.
+- Unitary truncation diagnostics use the cumulative coefficient-norm loss
+  `1 - ||nu||^2`, evaluated from the tracked one-site canonical centre. This
+  avoids uncapped target copies and overlap contractions. Non-unitary and
+  projective updates emit no infidelity sample; projective normalization starts
+  a fresh unitary segment.
 
 ### Remaining priorities from the review
 
-1. Redesign infidelity diagnostics: use MPS-specialized overlaps, include
-   sub-MPO truncation, and distinguish per-step loss from cumulative fidelity.
-2. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
+1. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
    untouched by ordinary stream entries).
-3. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
+2. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
    and Torch paths; avoid mutating caller-owned MPOs during backend conversion.
-4. Clarify the simulator-facing API with typed measurement/diagnostic records
+3. Clarify the simulator-facing API with typed measurement/diagnostic records
    and consider `StabilizerMpsSimulator` as the preferred name while preserving
    `MpsStabOptimizer` as a compatibility alias.
-5. Reconcile roadmap references to any intentionally removed benchmark/example
+4. Reconcile roadmap references to any intentionally removed benchmark/example
    files so documentation and the executable repository remain aligned.
 
 ---
@@ -113,7 +116,7 @@ new simulator features.
 - **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_state` and the
   matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_state` classmethods.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports running chi
-  and cumulative infidelity); `norm()` returns the `|nu>` norm.
+  and the current unitary norm-loss proxy); `norm()` returns the `|nu>` norm.
 - `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
 - **Amplitude / observable API** — `amplitude(bits)`/`probability(bits)`;
   `expectation(pauli, where=None)` (also full-register strings like `"ZIZ"`);
@@ -365,7 +368,7 @@ contracted by `[1,1]`, weights on cap or edges).
   is grow(gate) -> compress(optimize) -> repeat; the optimizer keeps `chi`
   bounded, it does not raise it. `chi = 1` ~ BP/MWPM, `chi -> inf` = exact MLD, so
   you **raise the `chi` cap until the logical margin `<nu|(I +- M_L)/2|nu>`
-  plateaus** (the tracked truncation infidelity signals when `chi` is too small).
+  plateaus** (tracked unitary norm loss signals when `chi` is too small).
   Needed `chi` is small below threshold, grows toward threshold, `= 1` exact at
   `p -> 0` / `beta -> inf`.
 - **The tableau is always there (correction).** When the capped stream is built
@@ -411,7 +414,7 @@ contracted by `[1,1]`, weights on cap or edges).
     projector signs).
 - **Experiment.** Build the capped weighted-XOR stream (`("cnot", ...)` fan-outs
   in the tableau + `((1-p)I + p X, s0)` coins) on `MpsStabOptimizer`, decode a
-  distance-3 patch, and plot logical margin + truncation infidelity vs the `chi`
+  distance-3 patch, and plot logical margin + unitary norm loss vs the `chi`
   cap; diff `|nu>` bond against the existing plain capped detector-MPS to see if
   offloading the fan-out CNOTs to the tableau shrinks it.
 - **Empirical (2026-07, `/tmp/stn_dem_bond.py`, exact `chi=None`).** For graph-like

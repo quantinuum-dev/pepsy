@@ -23,8 +23,10 @@ The public simulator types are exported at top level (`import pepsy`); see
 - **Exact/approximate control**:
   - `chi=None` is exact evolution; keep a small `cutoff` to remove numerically redundant
     Schmidt values introduced by bond-dimension-2 operators.
-  - `chi=cap` bounds the coefficient bond. Add `track_infidelity=True` to compare each
-    capped update with its uncapped local target. Read `.infidelities` and `.bond_history`.
+  - `chi=cap` bounds the coefficient bond. Add `track_infidelity=True` to record cumulative
+    `1 - ||p||^2` after compressed unitary updates. The norm comes from the tracked
+    canonical centre, with no uncapped target or overlap contraction. Non-unitary updates
+    emit no sample. Read `.infidelities` and `.bond_history`.
 - **Named physical stream entries**:
   - Clifford: `("h"|"s"|"sdg"|"x"|"y"|"z", q)`,
     `("cnot"|"cx"|"cy"|"cz"|"swap", a, b)`.
@@ -59,10 +61,11 @@ The public simulator types are exported at top level (`import pepsy`); see
   `reset` restores that precondition for reuse.
 - **Norm and diagnostics**: `sim.norm()`, `sim.state.max_bond()`,
   `sim.pseudo_stabilizer_rank()` (dense/small-n), `.measurements`, `.infidelities`, and
-  `.bond_history`. General non-unitary matrix entries intentionally change the norm.
-- **Canonical centre**: pass `sim.state.info` through quimb operations that can move the
-  centre. Use the simulator's canonicalization/renormalization helpers when extending
-  projective paths; do not replace them with a blind full-MPS normalization.
+  `.bond_history`. General non-unitary matrix entries intentionally change the norm and
+  suspend the unitary norm-loss proxy until a projective normalization resets its baseline.
+- **Canonical centre**: pass the simulator-managed orthogonality info through quimb
+  operations that can move the centre. Use its canonicalization/renormalization helpers
+  when extending projective paths; do not replace them with a blind full-MPS normalization.
 - **Site ordering**: stim qubit `q`, MPS site `q`, and dense big-endian bit position `q`
   must agree. Physical supports can become dynamically spread after frame mapping, so a
   static physical-stream layout is not generally valid for `p`.
@@ -131,10 +134,10 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   for local circuits (verified: n=16/24/32 at fixed depth all ~0.28s). `pauli_combo_submpo`
   builds it. `|p>` stays a proper MPS: use `swap+split` for the measurement localizer's
   two-qubit gates; never merge two sites with an un-split `contract=True` update.
-- **Track the canonical centre.** `STNState.info["cur_orthog"]` is initialized unknown,
-  established once, and threaded through sub-MPO/swap+split operations. Local measurement
-  expectations and normalization then touch only the centre tensor. Operator-sum rebuilds
-  reset the tracker to the rebuilt MPS centre.
+- **Track the canonical centre.** The simulator's `cur_orthog` info is initialized unknown,
+  established once, and threaded through sub-MPO/swap+split operations. Local measurement,
+  normalization, and unitary norm-loss diagnostics then touch only the centre tensor.
+  Operator-sum rebuilds reset the tracker to the rebuilt MPS centre.
 - Keep tests tiny/deterministic (fixed seeds, small $n$), per repo Examples guidance.
 
 ## Reference implementation mapping (bsc-quantic/stabilizer-TN)

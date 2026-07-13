@@ -308,12 +308,13 @@ def test_simulator_random_1q_matrix_matches_dense():
 def test_simulator_submpo_event_in_nu_frame():
     # A sub-MPO event acts directly on the coefficient MPS p; from |0...0> the
     # basis is identity so it also equals the physical operator.
-    sim = MpsStabOptimizer(3)
+    sim = MpsStabOptimizer(3, track_infidelity=True)
     mpo = pauli_rotation_mpo(0.8, ["X", "I", "Z"], sign=1.0)
     exact = mpo.apply(sim.state.p).to_dense().reshape(-1)
     sim.apply([("submpo", mpo, (0, 1, 2))])
     got = np.asarray(sim.state.p.to_dense()).reshape(-1)
     assert _fidelity(got, exact) == pytest.approx(1.0, abs=1e-9)
+    assert sim.infidelities == []
 
 
 def test_simulator_truncation_caps_bond_and_tracks_infidelity():
@@ -329,8 +330,33 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
         stream.append(("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
     sim = MpsStabOptimizer(n, chi=4, track_infidelity=True).apply(stream)
     assert sim.state.max_bond() <= 4
-    assert all(inf >= 0.0 for inf in sim.infidelities)
+    assert all(0.0 <= inf <= 1.0 for inf in sim.infidelities)
+    assert np.all(np.diff(sim.infidelities) >= -1e-10)
     assert max(sim.infidelities) > 0.0  # truncation actually occurred
+    assert sim.infidelities[-1] == pytest.approx(
+        1.0 - sim.norm() ** 2, abs=1e-10
+    )
+
+
+def test_norm_infidelity_excludes_nonunitary_segments():
+    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True)
+    sim.apply([(_I + 0.2 * _X, 0)])
+    assert sim.infidelities == []
+
+    # A later unitary cannot interpret norm change from the arbitrary map as
+    # truncation loss, so tracking remains unavailable for this segment.
+    sim.apply([("rxx", 0.8, 0, 1)])
+    assert sim.infidelities == []
+
+    # Projection restores a normalized baseline without itself reporting a
+    # metric. Subsequent unitary compression can be tracked again.
+    sim.measure("Z", 0, outcome=+1)
+    assert sim.infidelities == []
+    sim.apply([("rxx", 0.8, 0, 1)])
+    assert len(sim.infidelities) == 1
+    assert sim.infidelities[-1] == pytest.approx(
+        1.0 - sim.norm() ** 2, abs=1e-10
+    )
 
 
 def test_simulator_two_qubit_nonclifford_matrix_supported():
@@ -500,7 +526,7 @@ def test_zero_operator_produces_valid_zero_mps():
     np.testing.assert_allclose(sim.to_statevector(), np.zeros(4))
     assert sim.amplitude("00") == pytest.approx(0.0)
     assert sim.probability("00") == pytest.approx(0.0)
-    assert sim.infidelities[-1] == pytest.approx(0.0)
+    assert sim.infidelities == []
 
     sim.apply([("h", 1), (_I + 0.2 * _X, 0)])
     assert sim.norm() == pytest.approx(0.0)

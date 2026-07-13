@@ -79,8 +79,14 @@ already expressed in the coefficient frame. Clifford-angle Pauli rotations are
 synthesized directly as linear-size Stim basis-change and parity circuits, then
 cached; they do not form a `2**k x 2**k` dense matrix. Prefer structured
 coefficient-frame sub-MPOs where applicable. `track_infidelity=True` performs
-additional exact-reference overlaps and is a diagnostic mode rather than the
-fastest execution path.
+no reference-state copy or overlap contraction. For normalized unitary
+evolution it records the cumulative proxy `1 - ||nu||**2` after compressed
+coefficient-MPS updates, reading the norm from the tracked one-site canonical
+centre. Unitary updates are not renormalized, so lost norm remains visible.
+Projectors, measurements, coefficient-frame sub-MPOs, and arbitrary
+non-unitary matrices do not emit infidelity samples; an unnormalized
+non-unitary map also suspends later samples until projection restores a
+normalized baseline.
 
 ## Backends (GPU / torch / JAX)
 
@@ -91,7 +97,7 @@ applied to it are then placed on that backend, so the heavy MPS contractions
 (SVD, `swap+split`, sub-MPO application) run on GPU/torch/JAX.  The stim tableau
 (classical Clifford tracking) stays on the CPU.  Constant gate matrices are
 cached per backend; expectation/fidelity scalars are converted back to Python
-floats.  `to_statevector` / `amplitude` bring `|nu>` back to NumPy and are for
+floats. `to_statevector` / `amplitude` bring `|nu>` back to NumPy and are for
 small-`n` validation only.
 
 ```{eval-rst}
