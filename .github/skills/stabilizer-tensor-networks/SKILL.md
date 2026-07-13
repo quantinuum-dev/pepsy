@@ -212,6 +212,22 @@ physical qubit $q$.
 - Do not vendor stim/quimb internals; isolate any workaround behind a small adapter and
   test it against the closest public API (repo `AGENTS.md`).
 
+## Follow-up ideas (related work)
+- **arXiv:2607.08396** (Deger, Koutsioumpas, Webster, Sayginel, Roffe, Browne, 2026),
+  *code-compiled tensor networks* — a **different, complementary** route (plain physical
+  MPS + CSS-code-compiled circuits), **not** a tableau + $|\nu\rangle$ STN. Two portable
+  techniques worth trying here:
+  - **Classical permutation tracking** (a qubit-relabel register) instead of SWAP
+    networks — directly attacks the "long-range rotations / non-local Clifford
+    localizers are the worst case ($\le 16\chi$ via SWAPs)" pitfall above and the slow
+    `cycle=2` STN measurements: track permutations classically and relabel MPS sites
+    lazily rather than applying SWAP/localizer gates that span the chain.
+  - **Phase-polynomial backend** for diagonal (phase) magic — an exact backend whose
+    cost is set by phase-polynomial degree, not entanglement; a companion to the
+    coefficient MPS $|\nu\rangle$ when the non-Clifford part is diagonal-heavy.
+  - Framing takeaway: entanglement, magic, and non-Gaussianity are each individually
+    insufficient to indicate simulation hardness — which supports the STN premise.
+
 ## References
 - Paper: arXiv:2403.08724 (PRL 133, 230601). Reference implementation:
   `github.com/bsc-quantic/stabilizer-TN`.
