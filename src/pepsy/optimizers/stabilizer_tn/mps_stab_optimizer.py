@@ -200,6 +200,7 @@ class MpsStabOptimizer:
 
         self.to_backend = to_backend
         self._bk_cache: dict = {}
+        self._clifford_rot_cache: dict = {}
         if to_backend is not None:
             # Place the coefficient MPS |nu> on the requested backend; gate/MPO
             # arrays are converted on the fly by the _bk* helpers below.
@@ -552,15 +553,52 @@ class MpsStabOptimizer:
         return abs(k - round(k)) < 1e-9
 
     def _apply_clifford_rotation(self, theta, where, axes) -> None:
-        """Apply a Clifford Pauli rotation ``exp(-i theta/2 P)`` to the tableau only."""
+        """Apply a Clifford Pauli rotation to the tableau without dense matrices.
+
+        The resulting Clifford depends only on the Pauli axes and the angle
+        modulo ``2*pi``, so the directly synthesized tableau is cached.
+        """
         import stim
 
-        pmat = pauli_matrix(axes[0])
-        for ax in axes[1:]:
-            pmat = np.kron(pmat, pauli_matrix(ax))
-        dim = pmat.shape[0]
-        umat = np.cos(theta / 2) * np.eye(dim) - 1j * np.sin(theta / 2) * pmat
-        tableau = stim.Tableau.from_unitary_matrix(umat, endian="big")
+        k = int(round(theta / (math.pi / 2))) % 4
+        axes = tuple(str(axis).upper() for axis in axes)
+        key = (axes, k)
+        tableau = self._clifford_rot_cache.get(key)
+        if tableau is None:
+            circuit = stim.Circuit()
+            # Ensure the tableau includes identity and trailing-identity sites.
+            circuit.append("I", range(len(axes)))
+            support = [q for q, axis in enumerate(axes) if axis != "I"]
+            if support and k:
+                pivot = support[0]
+
+                # B P B^dagger = product(Z), then a CNOT parity network maps
+                # product(Z) to Z on the pivot. Undoing both around Rz gives
+                # exp(-i k*pi/4 P), up to the global phase omitted by tableaus.
+                for q in support:
+                    if axes[q] == "X":
+                        circuit.append("H", [q])
+                    elif axes[q] == "Y":
+                        circuit.append("S_DAG", [q])
+                        circuit.append("H", [q])
+                for q in support:
+                    if q != pivot:
+                        circuit.append("CX", [q, pivot])
+
+                circuit.append({1: "S", 2: "Z", 3: "S_DAG"}[k], [pivot])
+
+                for q in reversed(support):
+                    if q != pivot:
+                        circuit.append("CX", [q, pivot])
+                for q in reversed(support):
+                    if axes[q] == "X":
+                        circuit.append("H", [q])
+                    elif axes[q] == "Y":
+                        circuit.append("H", [q])
+                        circuit.append("S", [q])
+
+            tableau = stim.Tableau.from_circuit(circuit)
+            self._clifford_rot_cache[key] = tableau
         self.state.do_tableau(tableau, where)
         self._record(0.0)
 

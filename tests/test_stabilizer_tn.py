@@ -232,6 +232,58 @@ def test_simulator_clifford_angle_rotations_are_free():
     assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("axes", "theta"),
+    [
+        ("X", np.pi / 2),
+        ("Y", -np.pi / 2),
+        ("IZX", np.pi),
+        ("XYZI", 3 * np.pi / 2),
+        ("IIII", np.pi / 2),
+        ("YZX", 5 * np.pi / 2),
+    ],
+)
+def test_clifford_pauli_rotation_tableau_matches_dense(axes, theta):
+    n = len(axes)
+    sim = MpsStabOptimizer(n).apply(
+        [("rot", theta, axes, tuple(range(n)))]
+    )
+
+    matrices = {"I": _I, "X": _X, "Y": _Y, "Z": _Z}
+    pmat = matrices[axes[0]]
+    for axis in axes[1:]:
+        pmat = np.kron(pmat, matrices[axis])
+    unitary = (
+        np.cos(theta / 2) * np.eye(2**n)
+        - 1j * np.sin(theta / 2) * pmat
+    )
+    expected = stim.Tableau.from_unitary_matrix(unitary, endian="big")
+    actual = sim.state._sim.current_inverse_tableau().inverse()
+
+    assert actual == expected
+    np.testing.assert_allclose(sim.state.p_dense(), np.eye(2**n)[0])
+    assert sim.state.max_bond() in (None, 1)
+
+
+def test_large_clifford_pauli_rotation_avoids_dense_construction(monkeypatch):
+    import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
+
+    n = 128
+    sim = MpsStabOptimizer(n)
+
+    def forbid_dense_path(*args, **kwargs):
+        raise AssertionError("Clifford Pauli rotation used a dense conversion")
+
+    monkeypatch.setattr(optimizer_module.np, "kron", forbid_dense_path)
+    monkeypatch.setattr(stim.Tableau, "from_unitary_matrix", forbid_dense_path)
+
+    entry = ("rot", np.pi / 2, "IXYZ" * (n // 4), tuple(range(n)))
+    sim.apply([entry, entry])
+
+    assert sim.state.max_bond() == 1
+    assert len(sim._clifford_rot_cache) == 1
+
+
 def test_simulator_matrix_entries_clifford_and_nonclifford():
     # Clifford matrix (H) -> tableau; non-Clifford matrix (T) -> |nu> ZYZ path.
     stream = [(_H, 0), (_T, 0), (_H, 1), (_T, 1)]

@@ -66,11 +66,12 @@ outcome[, absorb_basis]])`, and `("reset", where)`.
 Tree sampling shares work for repeated prefixes, but high-entropy states can
 still generate a number of live branches proportional to the shot count.
 Arbitrary dense `k`-qubit matrices use a `4**k` Pauli decomposition and are
-therefore intended for few-qubit gates. Multi-qubit Clifford-angle Pauli
-rotations currently build a dense tableau on each use. Prefer named Clifford
-gates, Pauli rotations with small support, and structured sub-MPOs for larger
-operators. `track_infidelity=True` performs additional exact-reference overlaps
-and is a diagnostic mode rather than the fastest execution path.
+therefore intended for few-qubit gates. Clifford-angle Pauli rotations are
+synthesized directly as linear-size Stim basis-change and parity circuits, then
+cached; they do not form a `2**k x 2**k` dense matrix. Prefer structured
+sub-MPOs for larger non-Clifford operators. `track_infidelity=True` performs
+additional exact-reference overlaps and is a diagnostic mode rather than the
+fastest execution path.
 
 ## Backends (GPU / torch / JAX)
 

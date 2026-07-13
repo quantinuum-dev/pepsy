@@ -43,25 +43,25 @@ new simulator features.
   MPS `cutoff` is used only for SVD compression. Empty Pauli decompositions
   install a valid compact zero MPS, and normalized observable/measurement APIs
   reject zero-norm states before mutation.
+- Clifford-angle Pauli rotations are synthesized as linear-size Stim circuits
+  using local basis changes and a parity network. No `2**k x 2**k` dense
+  matrix is formed, and repeated axis/angle patterns reuse a cached tableau.
 
 ### Remaining priorities from the review
 
-1. Replace dense `2**k x 2**k` Clifford-Pauli rotation classification with a
-   direct Stim/tableau circuit synthesis using basis changes and a parity
-   ladder.
-2. Bound the arbitrary dense-gate API explicitly. Its Pauli decomposition has
+1. Bound the arbitrary dense-gate API explicitly. Its Pauli decomposition has
    `4**k` terms; structured or larger operators should use an MPO path and
    branch sums should use balanced reduction.
-3. Redesign infidelity diagnostics: use MPS-specialized overlaps, include
+2. Redesign infidelity diagnostics: use MPS-specialized overlaps, include
    sub-MPO truncation, and distinguish per-step loss from cumulative fidelity.
-4. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
+3. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
    untouched by ordinary stream entries).
-5. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
+4. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
    and Torch paths; avoid mutating caller-owned MPOs during backend conversion.
-6. Clarify the simulator-facing API with typed measurement/diagnostic records
+5. Clarify the simulator-facing API with typed measurement/diagnostic records
    and consider `StabilizerMpsSimulator` as the preferred name while preserving
    `MpsStabOptimizer` as a compatibility alias.
-7. Reconcile roadmap references to any intentionally removed benchmark/example
+6. Reconcile roadmap references to any intentionally removed benchmark/example
    files so documentation and the executable repository remain aligned.
 
 ---

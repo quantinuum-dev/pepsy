@@ -78,6 +78,10 @@ The public simulator types are exported at top level (`import pepsy`); see
 - **Direct tableau**: `stim.Tableau(n)` (identity), compose with
   `tab.append(gate, targets)` or `tab.then(...)`. `tab.to_numpy()` gives the boolean
   tableau blocks if you need raw $x,z,r$ entries.
+- **Clifford Pauli rotations**: for $\exp(-ik\pi P/4)$, map each non-identity
+  factor of $P$ to `Z`, gather its parity onto one support qubit with CNOTs,
+  apply `S`/`Z`/`S_DAG` for `k mod 4`, and uncompute. Compile that linear-size
+  circuit with `stim.Tableau.from_circuit`; do not build a dense unitary.
 - **STN measurement**: do not call stim measurement as an independent second simulation.
   `MpsStabOptimizer.measure` computes the Born rule from the coefficient frame. The default
   fixed-basis path leaves the tableau unchanged; `absorb_basis=True` applies a localizing

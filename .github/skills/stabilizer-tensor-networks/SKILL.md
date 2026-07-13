@@ -114,6 +114,9 @@ $\pi/2$ are Clifford and route to the tableau (free, $\chi$ unchanged).
   leave `p` and its canonical centre unchanged.
 - **Named Pauli rotation** → build physical `P`, compute `M=C^dagger P C` with
   `frame_pauli`, extract its real sign/support, then use a local gate or windowed sub-MPO.
+  For Clifford angles, synthesize the tableau directly with local basis changes,
+  a CNOT parity network, and `S`/`Z`/`S_DAG`; never form the exponentially large
+  Pauli rotation matrix.
 - **Fixed-basis measurement** → compute the Born probability only for sampled outcomes;
   apply `(I + mM)/2`, reject zero-probability forced outcomes, and normalize at the tracked
   centre. The tableau is unchanged.
