@@ -14,6 +14,15 @@ non-Clifford Pauli rotations, `("t", q)` / `("tdg", q)`, explicit `(matrix,
 where)` gates, `("submpo", mpo, where)` events, `("measure", pauli, where[,
 outcome[, absorb_basis]])`, and `("reset", where)`.
 
+`disentangle_cliffords(sweeps=1, *, bonds=None, tol=None)` is an optional
+Clifford-gauge optimization: it applies a local coefficient-frame Clifford
+`D`, then absorbs `D^dagger` into the tableau, so `(C D^dagger)(D |nu>) = C
+|nu>`. It can also be placed at an exact point in a stream as
+`("disentangle",)` or `("disentangle", {"sweeps": 1, "bonds": ..., "tol": ...})`.
+It preserves the represented physical state up to its explicitly selected
+numerical cutoff, changes no infidelity samples, and records a bond-history
+point.
+
 ## Measurement, reset, and magic-state injection
 
 - `measure(pauli, where, *, outcome=None, absorb_basis=False)` — fixed-basis
@@ -91,6 +100,13 @@ historical, is not index-aligned with `bond_history`, and must not be summed.
 The proxy is not exact overlap fidelity or a discarded-SVD-weight report;
 validate physical accuracy independently when that distinction matters.
 
+The disentangling sweep scores the local Schmidt spectrum for the 20 two-qubit
+Clifford classes modulo output-local Cliffords, rather than brute-forcing all
+11,520 two-qubit Cliffords or copying the full MPS per candidate. Its `tol`
+controls both the relative numerical-rank decision and the local SVD split:
+use `tol=0` to retain every numerical singular value, or the normal MPS cutoff
+to remove round-off-sized values and expose the lower bond dimension.
+
 ## Backends (GPU / torch / JAX)
 
 Pass `to_backend=` (e.g. `pepsy.backend_torch(dtype=torch.complex128,
@@ -100,7 +116,7 @@ applied to it are then placed on that backend, so the heavy MPS contractions
 (SVD, `swap+split`, sub-MPO application) run on GPU/torch/JAX.  The stim tableau
 (classical Clifford tracking) stays on the CPU.  Constant gate matrices are
 cached per backend; expectation/fidelity scalars are converted back to Python
-floats. `to_statevector` / `amplitude` bring `|nu>` back to NumPy and are for
+floats.  `to_statevector` / `amplitude` bring `|nu>` back to NumPy and are for
 small-`n` validation only.
 
 ```{eval-rst}

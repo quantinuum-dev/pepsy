@@ -34,6 +34,8 @@ Supported gate-stream entry forms::
     ("submpo", mpo, where)  / {"kind": "submpo", ...}       # coeff-frame sub-MPO
     ("measure", pauli, where[, outcome[, absorb_basis]])   # Pauli measurement
     ("reset", where)                                        # reset qubit(s) to |0>
+    ("disentangle"[, {"sweeps": ..., "bonds": ..., "tol": ...}])
+                                                              # Clifford gauge sweep
 """
 
 from __future__ import annotations
@@ -72,6 +74,103 @@ _SDG_MAT = np.array([[1, 0], [0, -1j]], dtype=complex)
 _CNOT_MAT = np.array(
     [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], dtype=complex
 )
+_S_MAT = np.array([[1, 0], [0, 1j]], dtype=complex)
+
+# Populated lazily by ``_two_qubit_clifford_representatives``.  There are 20
+# two-qubit Cliffords modulo a Clifford acting independently on each *output*
+# qubit.  Such output-local Cliffords leave the Schmidt spectrum invariant, so
+# testing one representative per coset finds the same best entanglement score
+# as testing all 11,520 two-qubit Cliffords.
+_TWO_Q_CLIFFORD_REPS = None
+
+
+def _cnot_matrix(control: int, target: int) -> np.ndarray:
+    """Return the big-endian two-qubit CNOT matrix for local sites 0 and 1."""
+    gate = np.zeros((4, 4), dtype=complex)
+    for x in range(4):
+        bits = [(x >> 1) & 1, x & 1]
+        bits[target] ^= bits[control]
+        y = (bits[0] << 1) | bits[1]
+        gate[y, x] = 1.0
+    return gate
+
+
+def _two_qubit_tableau_unitary(tableau) -> np.ndarray:
+    """Synthesize an exact NumPy unitary for a two-qubit stim tableau.
+
+    ``Tableau.to_unitary_matrix`` currently returns ``complex64``.  The local
+    gauge sweep can run repeatedly, so replay its elimination circuit (H, S,
+    and CX only) using the exact double-precision matrices instead.
+    """
+    unitary = np.eye(4, dtype=complex)
+    for instruction in tableau.to_circuit("elimination"):
+        name = instruction.name
+        targets = [target.value for target in instruction.targets_copy()]
+        if name == "H":
+            for target in targets:
+                gate = np.kron(_H_MAT, _I2) if target == 0 else np.kron(_I2, _H_MAT)
+                unitary = gate @ unitary
+        elif name == "S":
+            for target in targets:
+                gate = np.kron(_S_MAT, _I2) if target == 0 else np.kron(_I2, _S_MAT)
+                unitary = gate @ unitary
+        elif name == "CX":
+            if len(targets) % 2:
+                raise ValueError("stim emitted a CX instruction with an odd target count.")
+            for control, target in zip(targets[::2], targets[1::2]):
+                unitary = _cnot_matrix(control, target) @ unitary
+        else:  # pragma: no cover - stim's documented elimination basis is H/S/CX
+            raise ValueError(f"Unsupported tableau-elimination gate {name!r}.")
+    return unitary
+
+
+_I2 = np.eye(2, dtype=complex)
+
+
+def _two_qubit_clifford_representatives():
+    """Return 20 ``(stim.Tableau, unitary)`` entanglement representatives.
+
+    The representatives are left cosets of the local-Clifford subgroup.  If
+    ``D`` is a representative and ``L`` is local, ``L D`` has the same
+    Schmidt spectrum across the two sites as ``D``.  This keeps a sweep small
+    enough to use at every selected MPS bond while retaining the complete
+    two-qubit Clifford search space for the chosen objective.
+    """
+    global _TWO_Q_CLIFFORD_REPS
+    if _TWO_Q_CLIFFORD_REPS is not None:
+        return _TWO_Q_CLIFFORD_REPS
+
+    import stim
+
+    one_qubit = tuple(stim.Tableau.iter_all(1))
+    local = []
+    for first in one_qubit:
+        for second in one_qubit:
+            tableau = stim.Tableau(2)
+            tableau.append(first, [0])
+            tableau.append(second, [1])
+            local.append(tableau)
+
+    unseen = {str(tableau): tableau for tableau in stim.Tableau.iter_all(2)}
+    identity = stim.Tableau(2)
+    representatives = []
+    while unseen:
+        # Keep I first: a bond that cannot improve avoids needless gate work.
+        tableau = unseen.pop(str(identity), None)
+        if tableau is None:
+            _, tableau = unseen.popitem()
+        representatives.append((tableau, _two_qubit_tableau_unitary(tableau)))
+        # ``D.then(L)`` is the circuit D followed by local L, i.e. L D.
+        for local_tableau in local:
+            unseen.pop(str(tableau.then(local_tableau)), None)
+
+    if len(representatives) != 20:  # pragma: no cover - guards stim API changes
+        raise RuntimeError(
+            "Expected 20 two-qubit Clifford local-equivalence representatives, "
+            f"got {len(representatives)}."
+        )
+    _TWO_Q_CLIFFORD_REPS = tuple(representatives)
+    return _TWO_Q_CLIFFORD_REPS
 
 
 def _localizing_clifford(terms, n):
@@ -217,7 +316,6 @@ class MpsStabOptimizer:
         self.track_infidelity = bool(track_infidelity)
         self._norm_infidelity_valid = True
         self._current_norm_infidelity = 0.0 if self.track_infidelity else None
-        self._p_info = {"cur_orthog": None}
         self.dtype = self.state.dtype
         self._rng = np.random.default_rng(seed)
 
@@ -368,39 +466,36 @@ class MpsStabOptimizer:
         return self.state.probability(bits)
 
     def norm(self) -> float:
-        """Norm of the coefficient state ``|nu>`` (represented state norm; ~1)."""
-        return float(abs(self._to_scalar(self.state.p.norm())))
+        """Norm of the coefficient state ``|nu>`` (represented state norm; ~1).
+
+        Computed from :meth:`_norm_squared`, which uses the tracked orthogonality
+        centre when available (no full ``<nu|nu>`` contraction) and never mutates
+        the state.
+        """
+        return float(self._norm_squared() ** 0.5)
 
     def _norm_squared(self) -> float:
-        """Return ``<nu|nu>`` as a nonnegative Python float."""
-        return float(abs(self._to_scalar(self.state.p.H @ self.state.p)))
+        """Return ``<nu|nu>`` (real) without mutating the state.
 
-    def _ensure_p_center(self) -> None:
-        """Establish the coefficient MPS canonical-centre tracker once."""
-        if self._p_info.get("cur_orthog") not in (None, "calc"):
-            return
-        p = self.state.p
-        p.canonize([0], cur_orthog="calc", info=self._p_info)
-        self._p_info["cur_orthog"] = (0, 0)
+        When the tracked orthogonality centre is a single site, ``<nu|nu>`` is the
+        squared Frobenius norm of that centre tensor; otherwise the full closed
+        ``<nu|nu>`` network is contracted.
+        """
+        cur = self.state.info.get("cur_orthog")
+        if isinstance(cur, tuple) and len(cur) == 2 and cur[0] == cur[1]:
+            center = self.state.p[self.state.p.site_tag(int(cur[0]))]
+            nrm = float(abs(self._to_scalar(center.norm())))
+            exponent = float(getattr(self.state.p, "exponent", 0.0))
+            return nrm * nrm * (10.0 ** (2.0 * exponent))
+        return float(abs(self._to_scalar(self.state.p.H @ self.state.p)))
 
     def _unitary_norm_infidelity(self) -> Optional[float]:
         """Return cumulative unitary norm loss from the canonical centre."""
         if not self.track_infidelity or not self._norm_infidelity_valid:
             return None
 
-        self._ensure_p_center()
-        lo, hi = self._p_info["cur_orthog"]
-        if lo != hi:
-            self.state.p.canonize(
-                [lo], cur_orthog=(lo, hi), info=self._p_info
-            )
-            self._p_info["cur_orthog"] = (lo, lo)
-
-        center = self.state.p[self.state.p.site_tag(lo)]
-        center_norm = float(abs(self._to_scalar(center.norm())))
-        exponent = float(getattr(self.state.p, "exponent", 0.0))
-        norm_squared = center_norm * center_norm * (10.0 ** (2.0 * exponent))
-        infidelity = min(1.0, max(0.0, 1.0 - norm_squared))
+        self._canonize_p_single()
+        infidelity = min(1.0, max(0.0, 1.0 - self._norm_squared()))
         self._current_norm_infidelity = infidelity
         return infidelity
 
@@ -429,6 +524,63 @@ class MpsStabOptimizer:
             )
         return norm_squared
 
+    # ------------------------------------------------------------------ #
+    # Canonical-centre tracking for the coefficient MPS ``|nu>``
+    # ------------------------------------------------------------------ #
+    def _ensure_p_center(self) -> None:
+        """Guarantee a concrete tracked orthogonality centre (never a blind scan).
+
+        When the centre is unknown (fresh state, or invalidated by a full
+        rebuild such as an operator-sum branch) it is established by a single
+        full-span canonicalization to site ``0`` rather than a
+        ``calc_current_orthog_center`` rescan.
+        """
+        info = self.state.info
+        if info.get("cur_orthog") not in (None, "calc"):
+            return
+        p = self.state.p
+        L = int(getattr(p, "L", 0))
+        if L <= 0:
+            return
+        p.canonize([0], cur_orthog=(0, max(0, L - 1)))
+        info["cur_orthog"] = (0, 0)
+
+    def _canonize_p_single(self) -> int:
+        """Reduce the tracked centre to a single site and return it."""
+        self._ensure_p_center()
+        lo, hi = self.state.info["cur_orthog"]
+        if lo != hi:
+            self._canonize_p(lo)
+            return lo
+        return lo
+
+    def _canonize_p(self, site) -> int:
+        """Move the coefficient-MPS orthogonality centre to ``site`` (tracked)."""
+        self._ensure_p_center()
+        site = int(site)
+        info = self.state.info
+        self.state.p.canonize([site], cur_orthog=info["cur_orthog"], info=info)
+        info["cur_orthog"] = (site, site)
+        return site
+
+    def _renorm_p_at(self, site) -> None:
+        """Rescale the canonical centre tensor at ``site`` to unit norm.
+
+        Raises when the centre norm is ~0, which means a projective collapse hit
+        a ~0-probability (e.g. forced / post-selected) outcome.
+        """
+        center = self.state.p[self.state.p.site_tag(int(site))]
+        nrm = float(abs(self._to_scalar(center.norm())))
+        if nrm < 1e-12:
+            raise ValueError(
+                "projective collapse produced a ~0-norm coefficient state; the "
+                f"measured/forced outcome has ~0 probability (centre norm={nrm:.2e})."
+            )
+        center.modify(data=center.data / nrm)
+        # Quimb stores an additional base-10 network scale separately from the
+        # tensors. The centre is now normalized, so that scale must be cleared.
+        self.state.p.exponent = 0.0
+
     def pseudo_stabilizer_rank(self, tol: float = 1e-12) -> int:
         """Pseudo-stabilizer rank ``xi_tilde`` = number of non-zero ``nu_i``."""
         return self.state.pseudo_stabilizer_rank(tol=tol)
@@ -447,8 +599,221 @@ class MpsStabOptimizer:
         )
         copied._norm_infidelity_valid = self._norm_infidelity_valid
         copied._current_norm_infidelity = self._current_norm_infidelity
-        copied._p_info = dict(self._p_info)
         return copied
+
+    # ------------------------------------------------------------------ #
+    # Clifford gauge disentangling (p -> D p, C -> C D^dagger)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _disentangle_score(singular_values, tol: float) -> tuple[int, float]:
+        """Rank/entropy score of one Schmidt spectrum for a local sweep.
+
+        ``tol`` is a *relative singular-value* threshold.  It is used only to
+        decide numerical rank; entropy always uses the normalized full spectrum
+        so equal-rank candidates still prefer a less-entangled coefficient MPS.
+        """
+        singular_values = np.abs(np.asarray(singular_values).reshape(-1))
+        if singular_values.size == 0 or singular_values.max(initial=0.0) == 0.0:
+            return (0, 0.0)
+        weights = singular_values**2
+        weights /= weights.sum()
+        rank = int(np.count_nonzero(singular_values > tol * singular_values.max()))
+        entropy = float(-np.sum(weights[weights > 0.0] * np.log(weights[weights > 0.0])))
+        return rank, entropy
+
+    def _bond_singular_values(self, bond: int) -> np.ndarray:
+        """Canonicalize at ``bond`` and return its Schmidt singular values.
+
+        The canonicalization deliberately updates the live ``cur_orthog``
+        tracker.  Candidate evaluation below only reads the resulting two-site
+        tensor, so it never copies or mutates the live coefficient state.
+        """
+        from autoray import to_numpy  # pylint: disable=import-outside-toplevel
+
+        singular_values = self.state.p.singular_values(
+            int(bond) + 1, info=self.state.info
+        )
+        return np.asarray(to_numpy(singular_values))
+
+    def _candidate_bond_singular_values(self, bond: int, unitary) -> np.ndarray:
+        """Return a candidate's central Schmidt values from the local MPS block.
+
+        :meth:`_bond_singular_values` has put the MPS in mixed canonical form,
+        hence the two virtual environments are isometric.  Applying a candidate
+        only to that two-site tensor and SVDing it gives the exact score for the
+        full MPS while avoiding twenty MPS copies and twenty global sweeps.
+        """
+        from autoray import to_numpy  # pylint: disable=import-outside-toplevel
+
+        p = self.state.p
+        left = p[int(bond)]
+        right = p[int(bond) + 1]
+        (shared,) = left.bonds(right)
+        physical_left = p.site_ind(int(bond))
+        physical_right = p.site_ind(int(bond) + 1)
+        left_outer = tuple(
+            ind for ind in left.inds if ind not in (physical_left, shared)
+        )
+        right_outer = tuple(
+            ind for ind in right.inds if ind not in (physical_right, shared)
+        )
+        left_data = np.asarray(to_numpy(
+            left.transpose(*left_outer, physical_left, shared).data
+        ))
+        right_data = np.asarray(to_numpy(
+            right.transpose(shared, physical_right, *right_outer).data
+        ))
+        shared_dim = left_data.shape[-1]
+        left_dim = left_data.size // (2 * shared_dim)
+        right_dim = right_data.size // (2 * shared_dim)
+        pair = np.tensordot(left_data, right_data, axes=(-1, 0)).reshape(
+            left_dim, 2, 2, right_dim
+        )
+        transformed = np.einsum(
+            "abij,lijr->labr", np.asarray(unitary).reshape(2, 2, 2, 2), pair
+        )
+        return np.linalg.svd(
+            transformed.reshape(2 * left_dim, 2 * right_dim), compute_uv=False
+        )
+
+    @staticmethod
+    def _disentangle_bonds(bonds, n: int) -> tuple[int, ...]:
+        """Validate and normalize a requested ordered sequence of MPS bonds."""
+        if bonds is None:
+            return tuple(range(n - 1))
+        if isinstance(bonds, Integral) and not isinstance(bonds, (bool, np.bool_)):
+            bonds = (int(bonds),)
+        else:
+            try:
+                bonds = tuple(int(bond) for bond in bonds)
+            except TypeError as exc:
+                raise TypeError("bonds must be an integer, iterable of integers, or None.") from exc
+        if any(bond < 0 or bond >= n - 1 for bond in bonds):
+            raise ValueError(f"bonds must lie in [0, {n - 2}], got {bonds!r}.")
+        return bonds
+
+    def disentangle_cliffords(self, sweeps: int = 1, *, bonds=None,
+                               tol: Optional[float] = None) -> list[dict]:
+        """Reduce coefficient-MPS entanglement using local Clifford gauge moves.
+
+        For each selected adjacent MPS bond, evaluate the 20 two-qubit Clifford
+        classes modulo output-local Cliffords using the local Schmidt spectrum.
+        If one improves the lexicographic ``(numerical rank, entropy)`` score,
+        apply its representative ``D`` to ``|nu>`` and absorb ``D^dagger`` into
+        the tableau.  Thus ``|psi> = C|nu>`` is unchanged (up to the explicitly
+        requested numerical cutoff) while entanglement moves from ``|nu>`` into
+        the free stabilizer frame.
+
+        Parameters
+        ----------
+        sweeps : int
+            Number of ordered left-to-right passes.  A pass stops early when no
+            bond improves.  The usual periodic use needs only ``1``.
+        bonds : int | iterable[int] | None
+            MPS bond(s) to visit, represented by the left site index.  ``None``
+            means all adjacent bonds in left-to-right order.
+        tol : float | None
+            Relative singular-value rank threshold and SVD compression cutoff.
+            ``None`` uses this simulator's ``cutoff``.  Set ``tol=0`` for a
+            strictly lossless numerical split (which may retain round-off-sized
+            singular values rather than lower the stored bond dimension).
+
+        Returns
+        -------
+        list[dict]
+            One compact diagnostic dictionary per accepted local gauge move.
+            The operation records one ``bond_history`` point but intentionally
+            records no ``infidelities`` sample: it is a representation change,
+            not a physical unitary time-evolution step.
+        """
+        if isinstance(sweeps, (bool, np.bool_)) or not isinstance(sweeps, Integral):
+            raise TypeError("sweeps must be a nonnegative integer.")
+        sweeps = int(sweeps)
+        if sweeps < 0:
+            raise ValueError("sweeps must be nonnegative.")
+        if tol is None:
+            tol = self.cutoff
+        tol = float(tol)
+        if not np.isfinite(tol) or tol < 0.0:
+            raise ValueError("tol must be finite and nonnegative.")
+        bonds = self._disentangle_bonds(bonds, self.n)
+        moves = []
+        if sweeps == 0 or not bonds:
+            self._record()
+            return moves
+
+        import stim
+
+        representatives = _two_qubit_clifford_representatives()
+        for sweep in range(sweeps):
+            improved = False
+            for bond in bonds:
+                before_svals = self._bond_singular_values(bond)
+                before_score = self._disentangle_score(before_svals, tol)
+                best_index = None
+                best_score = before_score
+                for index, (_, unitary) in enumerate(representatives):
+                    score = self._disentangle_score(
+                        self._candidate_bond_singular_values(bond, unitary), tol
+                    )
+                    if score < best_score:
+                        best_index = index
+                        best_score = score
+                if best_index is None:
+                    continue
+
+                tableau, unitary = representatives[best_index]
+                # The selected rank is no larger than the original rank.  Do
+                # not impose ``self.chi`` here: this is a gauge transform, not
+                # a physical evolution whose temporary split may be truncated.
+                info = self.state.info
+                self.state.p.gate_(
+                    self._bk(unitary),
+                    (bond, bond + 1),
+                    contract="swap+split",
+                    max_bond=None,
+                    cutoff=tol,
+                    info=info,
+                    cur_orthog=info.get("cur_orthog"),
+                )
+                full_tableau = stim.Tableau(self.n)
+                full_tableau.append(tableau, [bond, bond + 1])
+                self.state.absorb_basis_clifford(full_tableau)
+                moves.append({
+                    "sweep": sweep,
+                    "bond": bond,
+                    "candidate": best_index,
+                    "score_before": before_score,
+                    "score_after": best_score,
+                })
+                improved = True
+            if not improved:
+                break
+        self._record()
+        return moves
+
+    def _disentangle_event(self, params) -> list[dict]:
+        """Dispatch ``("disentangle", ...)`` stream options to the public API."""
+        if len(params) == 0:
+            return self.disentangle_cliffords()
+        if len(params) != 1:
+            raise ValueError(
+                '"disentangle" accepts no options, an integer sweep count, or one mapping.'
+            )
+        option = params[0]
+        if isinstance(option, Integral) and not isinstance(option, (bool, np.bool_)):
+            return self.disentangle_cliffords(sweeps=int(option))
+        if not isinstance(option, Mapping):
+            raise TypeError(
+                '"disentangle" options must be an integer sweep count or a mapping.'
+            )
+        options = dict(option)
+        unknown = set(options).difference({"sweeps", "bonds", "tol"})
+        if unknown:
+            raise ValueError(
+                'Unknown "disentangle" options: ' + ", ".join(sorted(map(str, unknown)))
+            )
+        return self.disentangle_cliffords(**options)
 
     # ------------------------------------------------------------------ #
     # Backend helpers (place |nu> gates/MPOs on the configured backend)
@@ -480,6 +845,17 @@ class MpsStabOptimizer:
         from autoray import to_numpy  # pylint: disable=import-outside-toplevel
 
         return complex(np.asarray(to_numpy(x)))
+
+    @staticmethod
+    def _gate_to_numpy(gate) -> np.ndarray:
+        """Return a NumPy view/copy of a (possibly backend) gate matrix.
+
+        Explicit gate matrices are classified and Pauli-decomposed with stim and
+        NumPy, so a torch/cupy/jax array input is first materialized on the CPU.
+        """
+        from autoray import to_numpy  # pylint: disable=import-outside-toplevel
+
+        return np.asarray(to_numpy(gate))
 
     # ------------------------------------------------------------------ #
     # Scalable computational-basis sampling (no 2**n statevector)
@@ -560,10 +936,13 @@ class MpsStabOptimizer:
             self._apply_submpo(mpo, where)
             return
 
-        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+        if isinstance(entry, (list, tuple)) and len(entry) >= 1:
             head = entry[0]
             if isinstance(head, str):
                 name = head.strip().lower()
+                if name == "disentangle":
+                    self._disentangle_event(entry[1:])
+                    return
                 if name in _CLIFFORD_NAMES:
                     self.state.apply_clifford(name, *entry[1:])
                     self._record()
@@ -585,9 +964,11 @@ class MpsStabOptimizer:
                     self.reset(entry[1])
                     return
                 raise ValueError(f"Unknown gate name {head!r} in stream entry {entry!r}.")
+            if len(entry) != 2:
+                raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
             # matrix form: (gate_tensor, where)
             gate, where = entry
-            self._apply_matrix(np.asarray(gate), where)
+            self._apply_matrix(self._gate_to_numpy(gate), where)
             return
 
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
@@ -688,6 +1069,8 @@ class MpsStabOptimizer:
         if len(support) == 1:
             q = support[0]
             umat = single_qubit_rotation_matrix(theta, terms[q], sign, self.dtype)
+            # A single-qubit unitary preserves canonical form and the tracked
+            # orthogonality centre, so it is applied without touching the tracker.
             self.state.p.gate_(self._bk(umat), q, contract=True)
             self._record()
             return
@@ -709,17 +1092,18 @@ class MpsStabOptimizer:
         """
         p = self.state.p
         self._ensure_p_center()
+        info = self.state.info
         p.gate_with_submpo_(
             mpo,
             where=where,
             max_bond=self.chi,
             cutoff=self.cutoff,
-            info=self._p_info,
+            info=info,
         )
         infidelity = self._unitary_norm_infidelity() if unitary else None
         if renormalize:
-            p.normalize()
-            self._p_info["cur_orthog"] = None
+            site = self._canonize_p_single()
+            self._renorm_p_at(site)
             self._reset_norm_infidelity()
         return infidelity
 
@@ -850,14 +1234,17 @@ class MpsStabOptimizer:
             self.measurements.append((pauli, where, m))
             return m
         terms, sign = self._frame_terms(pauli, where)
-        exp = self._pauli_expectation(terms, sign)
         forced = self._validate_outcome(outcome)
         if forced is None:
-            p_plus = self._outcome_probability(exp, +1)
+            p_plus = self._outcome_probability(
+                self._pauli_expectation(terms, sign), +1
+            )
             m = 1 if self._rng.random() < p_plus else -1
         else:
             m = forced
-            probability = self._outcome_probability(exp, m)
+            probability = self._outcome_probability(
+                self._pauli_expectation(terms, sign), m
+            )
             if probability <= 1e-12:
                 raise ValueError(
                     f"forced outcome {m:+d} has ~0 probability ({probability:.2e})."
@@ -915,13 +1302,20 @@ class MpsStabOptimizer:
             raise RuntimeError(
                 f"localizer produced {conj_terms!r}, expected Z on qubit {k}."
             )
+        # Establish a tracked orthogonality centre before the localizer so the
+        # whole measurement runs on a canonical coefficient MPS.
+        self._ensure_p_center()
         self._apply_localizer_to_p(ops)
         self.state.absorb_basis_clifford(v_tableau)
-        # Single-qubit Z_k measurement on the reframed coefficient state.
-        p = self.state.p
-        z_p = p.copy()
-        z_p.gate_(self._bk_const("PZ", pauli_matrix("Z")), k, contract=True)
-        zexp = float(np.real(self._to_scalar(p.H @ z_p) / self._to_scalar(p.H @ p)))
+        # Single-qubit ``Z_k`` expectation from the tracked canonical centre: this
+        # moves the centre to ``k`` and contracts only that site instead of the
+        # whole ``<p|Z_k|p>`` / ``<p|p>`` networks.
+        zexp = float(np.real(self._to_scalar(
+            self.state.p.local_expectation_canonical(
+                self._bk_const("PZ", pauli_matrix("Z")), k,
+                normalized=True, info=self.state.info,
+            )
+        )))
         p_o_plus = 0.5 * (1.0 + s * zexp)  # prob(outcome O = +1)
         if forced is None:
             m = 1 if self._rng.random() < p_o_plus else -1
@@ -935,9 +1329,10 @@ class MpsStabOptimizer:
     def _apply_localizer_to_p(self, ops) -> None:
         """Apply the measurement's localizing Clifford to ``|nu>``."""
         p = self.state.p
-        self._ensure_p_center()
+        info = self.state.info
         for name, targ in ops:
             if name == "h":
+                # Unitary single-qubit Cliffords preserve the tracked centre.
                 p.gate_(self._bk_const("H", _H_MAT), targ[0], contract=True)
             elif name == "sdg":
                 p.gate_(self._bk_const("SDG", _SDG_MAT), targ[0], contract=True)
@@ -949,17 +1344,20 @@ class MpsStabOptimizer:
                     contract="swap+split",
                     max_bond=self.chi,
                     cutoff=self.cutoff,
-                    info=self._p_info,
-                    cur_orthog=self._p_info.get("cur_orthog"),
+                    info=info,
+                    cur_orthog=info.get("cur_orthog"),
                 )
 
     def _project_computational_site(self, k, keep_bit) -> None:
         """Project coefficient site ``k`` onto ``|keep_bit>`` and renormalize ``|nu>``."""
         proj = np.zeros((2, 2), dtype=self.dtype)
         proj[keep_bit, keep_bit] = 1.0
-        self.state.p.gate_(self._bk(proj), k, contract=True)
-        self.state.p.normalize()
-        self._p_info["cur_orthog"] = None
+        # Move the centre to k so the projector acts at the orthogonality centre
+        # (keeping the state canonical there) and renormalize that centre tensor.
+        self._canonize_p(k)
+        self.state.p.gate_(self._bk(proj), k, contract=True, info=self.state.info)
+        self.state.info["cur_orthog"] = (int(k), int(k))
+        self._renorm_p_at(k)
         self._reset_norm_infidelity()
 
     def _apply_projector(self, terms, sign, m) -> None:
@@ -972,9 +1370,10 @@ class MpsStabOptimizer:
         if len(support) == 1:
             q = support[0]
             proj = single_qubit_combo_matrix(0.5, coef, terms[q], self.dtype)
-            self.state.p.gate_(self._bk(proj), q, contract=True)
-            self.state.p.normalize()
-            self._p_info["cur_orthog"] = None
+            self._canonize_p(q)
+            self.state.p.gate_(self._bk(proj), q, contract=True, info=self.state.info)
+            self.state.info["cur_orthog"] = (int(q), int(q))
+            self._renorm_p_at(q)
             self._reset_norm_infidelity()
             self._record()
             return
@@ -1333,7 +1732,8 @@ class MpsStabOptimizer:
             return result
 
         self.state.p = build(self.chi)
-        self._p_info["cur_orthog"] = (0, 0)
+        # compress() leaves the rebuilt MPS canonical with the centre at site 0.
+        self.state.info["cur_orthog"] = (0, 0)
         if unitary:
             return self._unitary_norm_infidelity()
         self._invalidate_norm_infidelity()
@@ -1348,7 +1748,7 @@ class MpsStabOptimizer:
         p.compress(max_bond=1, cutoff=0.0)
         p.exponent = 0.0
         self.state.p = p
-        self._p_info["cur_orthog"] = (0, 0)
+        self.state.info["cur_orthog"] = (0, 0)
 
     # ------------------------------------------------------------------ #
     # Sub-MPO events (coefficient-frame operator)
@@ -1366,7 +1766,7 @@ class MpsStabOptimizer:
             where=where,
             max_bond=self.chi,
             cutoff=self.cutoff,
-            info=self._p_info,
+            info=self.state.info,
         )
         self._invalidate_norm_infidelity()
         self._record()

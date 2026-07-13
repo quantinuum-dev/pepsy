@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 stim = pytest.importorskip("stim")
+qtn = pytest.importorskip("quimb.tensor")
 
 from pepsy.optimizers.stabilizer_tn import STNState
 
@@ -175,6 +176,47 @@ def _dense_reference(n, stream):
         else:
             raise AssertionError(f"unhandled {name}")
     return psi
+
+
+def _coefficient_bell_optimizer():
+    """A Bell state stored in ``p`` rather than in the free tableau frame."""
+    p = qtn.MatrixProductState.from_dense(
+        np.array([1, 0, 0, 1], dtype=complex) / np.sqrt(2), dims=[2, 2]
+    )
+    tableau = stim.TableauSimulator()
+    tableau.set_num_qubits(2)
+    return MpsStabOptimizer.from_tableau_and_state(tableau, p, chi=2)
+
+
+def test_clifford_disentangling_moves_bell_entanglement_into_tableau():
+    sim = _coefficient_bell_optimizer()
+    before = sim.to_statevector()
+
+    moves = sim.disentangle_cliffords()
+
+    assert len(moves) == 1
+    assert moves[0]["bond"] == 0
+    assert moves[0]["score_before"][0] == 2
+    assert moves[0]["score_after"][0] == 1
+    assert sim.state.max_bond() == 1
+    assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-12)
+    # A gauge update is not physical compressed unitary evolution.
+    assert sim.infidelities == []
+    assert sim.bond_history == [2, 1]
+
+
+def test_disentangle_stream_event_preserves_following_physical_gate_order():
+    theta = 0.37
+    sim = _coefficient_bell_optimizer()
+    before = sim.to_statevector()
+    expected = _apply_gate_dense(before, _rot("Z", theta), (0,), 2)
+
+    sim.apply([("disentangle", {"sweeps": 1}), ("rz", theta, 0)])
+
+    assert sim.state.max_bond() == 1
+    assert _fidelity(sim.to_statevector(), expected) == pytest.approx(1.0, abs=1e-12)
+    assert sim.infidelities == []
+    assert len(sim.bond_history) == 3
 
 
 def test_simulator_single_nonclifford_rotations_match_dense():
@@ -528,6 +570,7 @@ def test_zero_operator_produces_valid_zero_mps():
     assert sim.probability("00") == pytest.approx(0.0)
     assert sim.infidelities == []
 
+    # Further linear evolution keeps the valid zero state instead of crashing.
     sim.apply([("h", 1), (_I + 0.2 * _X, 0)])
     assert sim.norm() == pytest.approx(0.0)
 
@@ -764,6 +807,7 @@ def test_run_failure_consumes_only_successful_queue_prefix():
     assert sim.expectation("Z", 0) == pytest.approx(-1.0)
     assert sim._queue == [("not-a-gate", 0)]
 
+    # Retrying the remaining failed entry must not replay the successful X.
     with pytest.raises(ValueError, match="Unknown gate"):
         sim.run()
     assert sim.expectation("Z", 0) == pytest.approx(-1.0)
@@ -871,12 +915,14 @@ def test_norm_preserved_after_circuit():
 def test_norm_expectation_and_measurement_respect_mps_exponent():
     sim = MpsStabOptimizer(2)
     sim.state.p.exponent = 2.0
+    sim.state.info["cur_orthog"] = (0, 0)
 
     assert sim.norm() == pytest.approx(100.0)
     assert sim.expectation("Z", 0) == pytest.approx(1.0)
 
     sim.measure("Z", 0, outcome=+1)
     assert sim.norm() == pytest.approx(1.0)
+    assert sim.state.p.exponent == pytest.approx(0.0)
     assert np.linalg.norm(sim.to_statevector()) == pytest.approx(1.0)
 
 
@@ -1291,15 +1337,15 @@ def test_absorb_measure_forced_impossible_raises():
     assert (len(sim.infidelities), len(sim.bond_history), len(sim.measurements)) == before_history
 
 
-def test_fixed_basis_forced_impossible_preserves_state():
+def test_fixed_basis_forced_impossible_raises():
+    # Same impossible post-selection via the default fixed-basis path: it must
+    # raise on the ~0-norm collapse rather than silently keep a garbage state.
     sim = MpsStabOptimizer(2).apply([("h", 0), ("cnot", 0, 1)])
-    sim.measure("Z", 0, outcome=+1)
+    sim.measure("Z", 0, outcome=+1)   # collapse to |00>
     before = sim.to_statevector()
     before_history = (len(sim.infidelities), len(sim.bond_history), len(sim.measurements))
-
     with pytest.raises(ValueError, match="0 probability"):
         sim.measure("Z", 1, outcome=-1)
-
     assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
     assert (len(sim.infidelities), len(sim.bond_history), len(sim.measurements)) == before_history
 
@@ -1423,6 +1469,20 @@ def test_torch_backend_absorb_measure_matches_numpy():
         gpu = MpsStabOptimizer(3, to_backend=tb).apply(circ)
         gpu.measure("Z", 1, outcome=m, absorb_basis=True)
         assert _fidelity(cpu.to_statevector(), gpu.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_torch_backend_matrix_gate_input():
+    tb = _torch_backend()
+    import torch
+    # A torch-native (non-unitary) gate matrix passed as an explicit
+    # (matrix, where) entry is materialized on the CPU for classification.
+    coin = torch.tensor([[0.9, 0.1], [0.1, 0.9]], dtype=torch.complex128)
+    sim = MpsStabOptimizer(2, to_backend=tb).apply([(coin, 0)])
+    ref = _apply_gate_dense(
+        np.array([1, 0, 0, 0], complex),
+        np.array([[0.9, 0.1], [0.1, 0.9]], complex), (0,), 2,
+    )
+    assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_torch_backend_injection_and_sampling():

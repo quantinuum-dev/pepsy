@@ -15,6 +15,67 @@ MPS is exposed as `.p` (matching `MpsOptimizer.p`); `.nu`, `p_dense`/`nu_dense`,
 `frame_pauli`/`nu_frame_pauli`, and `from_tableau_and_state`/`from_tableau_and_nu`
 are kept as back-compat aliases.
 
+## Mental model: how `MpsStabOptimizer` executes a circuit
+
+This is a hybrid **Clifford frame + coefficient MPS** simulator, not a plain
+physical-state MPS simulator and not a nested `MpsOptimizer`. Its exact
+representation invariant is
+
+$$
+|\psi\rangle = C |p\rangle,
+$$
+
+where `C` is represented by `STNState._sim` (`stim.TableauSimulator`) and
+`p` is the Quimb MPS `STNState.p`. The tableau stores the stabilizer basis (and
+therefore can hold a large amount of Clifford entanglement); the MPS stores the
+remaining coefficient amplitudes, including the non-stabilizer or ``magic''
+part. `STNState.info["cur_orthog"]` is part of the MPS numerical state: it
+tracks the canonical centre used for local projections, normalization, and
+bounded-bond diagnostics.
+
+"Free Clifford" means that a Clifford gate does not grow the MPS bond
+dimension `chi`; Stim still performs the polynomial-size tableau update.
+
+| Physical stream event | Tableau/frame update | Coefficient-MPS update |
+| --- | --- | --- |
+| Clifford `G` | `C -> G C` in Stim | none |
+| Pauli rotation `exp(-i theta P / 2)` | frame-map `M = C^dagger P C` | apply `exp(-i theta M / 2)` |
+| Pauli measurement of `O` | frame-map `M = C^dagger O C` | sample/project with `(I + m M) / 2` and normalize |
+| Basis-updating measurement | after a localizer, `C -> C V^dagger` | apply `V`, then project one coefficient site to `0` or `1` |
+
+The central shortcut is that a Clifford maps any Pauli to another signed Pauli.
+Thus `STNState.frame_pauli(P)` obtains `M = C^dagger P C` directly from Stim;
+the implementation does not reconstruct the paper's destabilizer/stabilizer
+bit masks during normal execution. A single-site `M` is a bond-preserving 2x2
+gate. A multi-site rotation or projector has the form `c I + d M`, so it is an
+exact bond-dimension-2 MPO. It is built on the *actual contiguous MPS support
+window* and applied with Quimb's `gate_with_submpo_`, with `chi=None` for exact
+evolution or a finite `chi` for controlled compression.
+
+There are two measurement forms:
+
+- **Fixed basis (default):** leave `C` unchanged, evaluate the Born rule from
+  `<p|M|p> / <p|p>`, then apply `(I + m M) / 2` to `p` and normalize. Repeating
+  the same measurement is deterministic.
+- **Basis updating (`absorb_basis=True`):** construct a Clifford `V` that maps
+  `M` to signed `Z_k`; apply `V` to `p`, absorb `V^dagger` into `C` so the
+  physical state is preserved, then project coefficient site `k` to `|0>` or
+  `|1>`. This disentangles that coefficient degree of freedom and is the
+  primitive used by reset and magic-state injection.
+
+A measurement is not automatically a projection onto a full bitstring such as
+`|010001...>`. To produce such a physical computational-basis outcome, measure
+every physical `Z_q`; `sample_bits` performs those conditional measurements on
+copies using prefix-tree sharing, so the source simulator remains unchanged.
+
+Dense `(matrix, where)` events are physical-frame operations: Clifford matrices
+go to Stim, one-qubit non-Clifford unitaries are decomposed as ZYZ rotations,
+and remaining small matrices are Pauli-decomposed and frame-mapped branch by
+branch. This last fallback costs `4**k`, so structured Pauli rotations,
+Clifford+T compilation/magic injection, or a coefficient-frame `("submpo",
+mpo, where)` event are preferable for larger operations. A `submpo` is the
+intentional exception: it already acts on `p` and must **not** be frame-mapped.
+
 ---
 
 ## Implementation-quality review (2026-07-13)
@@ -27,8 +88,9 @@ new simulator features.
 
 ### Completed correctness hardening
 
-- Quimb's base-10 MPS `exponent` is included in norm and expectation
-  calculations and remains correct when a projected state is normalized.
+- Quimb's base-10 MPS `exponent` is included in canonical-center norm and
+  expectation calculations, and is cleared when a projected state is
+  normalized.
 - Forced measurement outcomes require exactly `+1` or `-1`. An impossible
   postselection is detected before tableau/MPS mutation, including the
   basis-updating path.
@@ -190,6 +252,16 @@ Ordered by value/effort. None are started.
   into the tableau `C` to reduce `|nu>` bond dimension — the paper's "store
   potential entanglement in the basis" future-work item.
 - Impact: directly attacks chi growth; keeps exact semantics. Medium effort.
+- **STATUS: DONE (local greedy sweep)** — `MpsStabOptimizer.disentangle_cliffords`
+  tests the 20 two-qubit Clifford classes modulo output-local Cliffords from
+  local Schmidt/SVD data (no full-MPS candidate copies), applies an improving
+  `D` to `|nu>`, and absorbs `D^dagger` with
+  `STNState.absorb_basis_clifford`. The physical invariant
+  `(C D^dagger)(D |nu>) = C|nu>` is dense-validated. The ordered stream event
+  `("disentangle", {"sweeps": ..., "bonds": ..., "tol": ...})` makes it
+  possible to schedule the sweep between circuit operations. `tol=0` retains
+  every numerical singular value; the normal cutoff removes round-off-sized
+  values to reveal the reduced stored bond.
 
 ### R3. Basis-updating (canonical Lemma-3) measurement
 - Reference `meas_tableau` + `P_k` projection: absorb the measured observable into

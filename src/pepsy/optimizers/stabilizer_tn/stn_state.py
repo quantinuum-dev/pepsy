@@ -105,6 +105,11 @@ class STNState:
         self._inv_tableau = None
         # Coefficient state ``p`` (the MPS ``|nu>``) = |0...0>, chi = 1.
         self.p = ps_to_mps(n, dtype=dtype)
+        # Tracked orthogonality centre for ``p`` (never a blind rescan): a
+        # ``{"cur_orthog": (lo, hi)}`` dict maintained by the simulator so
+        # measurements/norms reuse the canonical centre. ``None`` means the
+        # centre is not yet established.
+        self.info = {"cur_orthog": None}
 
     # ------------------------------------------------------------------ #
     # Initial-state constructors
@@ -161,6 +166,7 @@ class STNState:
         new._sim = sim
         new.p = p
         new._inv_tableau = None
+        new.info = {"cur_orthog": None}
         return new
 
     # Backward-compatible alias.
@@ -190,6 +196,7 @@ class STNState:
         new._sim = self._sim.copy()
         new.p = self.p.copy()
         new._inv_tableau = None
+        new.info = dict(self.info)
         return new
 
     def do_tableau(self, tableau, targets) -> "STNState":
