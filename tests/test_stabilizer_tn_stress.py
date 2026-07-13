@@ -353,7 +353,7 @@ def test_general_two_qubit_nonunitary_matches_dense():
 def test_general_three_qubit_unitary_matches_dense():
     n = 5
     stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("rx", 0.3, 3), ("cz", 2, 4)]
-    sim = MpsStabOptimizer(n).apply(stream)
+    sim = MpsStabOptimizer(n, max_pauli_decomposition_qubits=3).apply(stream)
     psi = sim.to_statevector()
     U3 = _haar_unitary(8, 7)
     sim.apply([(U3, (1, 2, 4))])

@@ -343,6 +343,92 @@ def test_simulator_two_qubit_nonclifford_matrix_supported():
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_three_qubit_dense_matrix_explicit_opt_in_balanced_sum_matches_dense():
+    matrices = {"I": _I, "X": _X, "Y": _Y, "Z": _Z}
+    weighted_paulis = [
+        (0.31, "III"),
+        (-0.17j, "XII"),
+        (0.23, "IYI"),
+        (-0.11, "IIZ"),
+        (0.07j, "XXI"),
+        (0.19, "XIZ"),
+        (-0.13j, "ZYX"),
+        (0.29, "YYY"),
+    ]
+    gate = np.zeros((8, 8), dtype=complex)
+    for weight, labels in weighted_paulis:
+        pmat = matrices[labels[0]]
+        for label in labels[1:]:
+            pmat = np.kron(pmat, matrices[label])
+        gate += weight * pmat
+
+    sim = MpsStabOptimizer(
+        3, max_pauli_decomposition_qubits=3
+    ).apply(
+        [("h", 0), ("cnot", 0, 1), ("t", 2)]
+    )
+    before = sim.to_statevector()
+
+    sim.apply([(gate, (2, 0, 1))])
+    expected = _apply_gate_dense(before, gate, (2, 0, 1), 3)
+    actual = sim.to_statevector()
+
+    assert _fidelity(actual, expected) == pytest.approx(1.0, abs=1e-6)
+    assert np.linalg.norm(actual) == pytest.approx(
+        np.linalg.norm(expected), rel=1e-8
+    )
+
+
+def test_dense_gate_budget_rejects_before_decomposition_or_state_mutation(
+    monkeypatch,
+):
+    import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
+
+    sim = MpsStabOptimizer(3)
+    gate = np.eye(8, dtype=complex)
+    gate[0, 0] = 0.5
+    before = sim.to_statevector()
+    before_history = (tuple(sim.infidelities), tuple(sim.bond_history))
+
+    def forbid_decomposition(*args, **kwargs):
+        raise AssertionError("Pauli decomposition ran before its budget check")
+
+    monkeypatch.setattr(
+        optimizer_module, "pauli_decomposition", forbid_decomposition
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"3-qubit dense gate would enumerate 64 candidate terms.*"
+            r"max_pauli_decomposition_qubits=2"
+        ),
+    ):
+        sim.apply([(gate, tuple(range(3)))])
+
+    np.testing.assert_allclose(sim.to_statevector(), before)
+    assert (tuple(sim.infidelities), tuple(sim.bond_history)) == before_history
+
+
+def test_dense_gate_budget_does_not_limit_clifford_matrix_dispatch(monkeypatch):
+    import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
+
+    gate = np.kron(np.kron(_H, _X), _Z)
+    sim = MpsStabOptimizer(3)
+
+    def forbid_decomposition(*args, **kwargs):
+        raise AssertionError("Clifford matrix reached Pauli decomposition")
+
+    monkeypatch.setattr(
+        optimizer_module, "pauli_decomposition", forbid_decomposition
+    )
+    sim.apply([(gate, tuple(range(3)))])
+
+    expected = gate @ np.eye(8)[0]
+    assert _fidelity(sim.to_statevector(), expected) == pytest.approx(
+        1.0, abs=1e-6
+    )
+
+
 def test_near_clifford_nonunitary_matrix_not_misrouted_to_tableau():
     # (1-p)I + pX is NON-unitary but close to the identity Clifford; because
     # stim.Tableau.from_unitary_matrix does not verify unitarity, it must not be
@@ -384,6 +470,23 @@ def test_explicit_operator_tolerance_can_prune_small_pauli_terms():
 def test_operator_tolerance_must_be_finite_and_nonnegative(operator_tol):
     with pytest.raises(ValueError, match="operator_tol"):
         MpsStabOptimizer(1, operator_tol=operator_tol)
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [(-1, ValueError), (1.5, TypeError), (True, TypeError)],
+)
+def test_pauli_decomposition_budget_validation(value, error):
+    with pytest.raises(error, match="max_pauli_decomposition_qubits"):
+        MpsStabOptimizer(1, max_pauli_decomposition_qubits=value)
+
+
+def test_copy_preserves_pauli_decomposition_budget():
+    sim = MpsStabOptimizer(2, max_pauli_decomposition_qubits=None)
+    copied = sim.copy()
+
+    assert copied.max_pauli_decomposition_qubits is None
+    assert "max_pauli_decomposition_qubits=None" in repr(copied)
 
 
 def test_zero_operator_produces_valid_zero_mps():

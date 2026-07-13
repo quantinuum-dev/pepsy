@@ -46,22 +46,23 @@ new simulator features.
 - Clifford-angle Pauli rotations are synthesized as linear-size Stim circuits
   using local basis changes and a parity network. No `2**k x 2**k` dense
   matrix is formed, and repeated axis/angle patterns reuse a cached tableau.
+- Fallback dense-gate decomposition is rejected before `4**k` enumeration above
+  `max_pauli_decomposition_qubits` (default `2`, explicit opt-in supported).
+  Accepted Pauli branches use a streaming balanced MPS reduction rather than a
+  sequential left fold.
 
 ### Remaining priorities from the review
 
-1. Bound the arbitrary dense-gate API explicitly. Its Pauli decomposition has
-   `4**k` terms; structured or larger operators should use an MPO path and
-   branch sums should use balanced reduction.
-2. Redesign infidelity diagnostics: use MPS-specialized overlaps, include
+1. Redesign infidelity diagnostics: use MPS-specialized overlaps, include
    sub-MPO truncation, and distinguish per-step loss from cumulative fidelity.
-3. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
+2. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
    untouched by ordinary stream entries).
-4. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
+3. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
    and Torch paths; avoid mutating caller-owned MPOs during backend conversion.
-5. Clarify the simulator-facing API with typed measurement/diagnostic records
+4. Clarify the simulator-facing API with typed measurement/diagnostic records
    and consider `StabilizerMpsSimulator` as the preferred name while preserving
    `MpsStabOptimizer` as a compatibility alias.
-6. Reconcile roadmap references to any intentionally removed benchmark/example
+5. Reconcile roadmap references to any intentionally removed benchmark/example
    files so documentation and the executable repository remain aligned.
 
 ---

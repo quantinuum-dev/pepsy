@@ -32,7 +32,9 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
     support window followed by `p.gate_with_submpo_`. This is the live replacement for the
     paper/reference implementation's CNOT-cascade execution.
   - General few-qubit matrices are Pauli-decomposed, frame-mapped branch by branch, summed,
-    and compressed. A `("submpo", mpo, where)` event instead acts directly in the
+    and compressed with a balanced streaming reduction. The fallback defaults to at most
+    two qubits via `max_pauli_decomposition_qubits=2`; larger values explicitly opt into
+    the `4**k` cost. A `("submpo", mpo, where)` event instead acts directly in the
     coefficient frame.
 - **Exact vs approximate (bounded-$\chi$) mode** is selected on `MpsStabOptimizer`:
   - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
@@ -125,7 +127,9 @@ $\pi/2$ are Clifford and route to the tableau (free, $\chi$ unchanged).
   there. This is the reset/injection primitive.
 - **Explicit matrix** → check true unitarity *before* asking stim whether it is Clifford;
   stim does not reject all non-unitary near-Clifford matrices. Non-Clifford 1q unitaries use
-  ZYZ; all remaining matrices use a Pauli-branch operator sum without normalization.
+  ZYZ; remaining matrices within `max_pauli_decomposition_qubits` use a balanced
+  Pauli-branch operator sum without normalization. For larger physical-frame operators,
+  prefer supported gate/rotation decompositions; `submpo` is coefficient-frame only.
 - **Backend conversion** → stim/tableau classification remains NumPy/CPU; coefficient MPS,
   local gates, and MPO arrays use `to_backend`. Convert user matrix entries to NumPy for
   classification before converting coefficient-side operations back to the chosen backend.

@@ -16,7 +16,8 @@ The public simulator types are exported at top level (`import pepsy`); see
 `src/pepsy/__init__.py`. Helpers such as `pauli_combo_submpo` remain internal.
 
 - **Create a simulator**: `sim = pepsy.MpsStabOptimizer(n, gates=None, chi=None,
-  cutoff=1e-12, track_infidelity=False, seed=None, to_backend=None)`. It owns an
+  cutoff=1e-12, operator_tol=None, max_pauli_decomposition_qubits=2,
+  track_infidelity=False, seed=None, to_backend=None)`. It owns an
   `STNState`; `sim.p` / `sim.state.p` is the coefficient MPS and `sim.nu` is an alias.
   `STNState` constructs the initial product MPS with `pepsy.ps_to_mps(n)`.
 - **Exact/approximate control**:
@@ -36,14 +37,16 @@ The public simulator types are exported at top level (`import pepsy`); see
     non-Clifford 1q unitaries use ZYZ; all other few-qubit matrices use a frame-mapped
     Pauli decomposition, whose `4**k` cost makes it a few-qubit path. Matrix inputs may be
     backend arrays: they are converted to NumPy for classification and then coefficient
-    operations return to `to_backend`.
+    operations return to `to_backend`. The fallback is limited to two qubits by default;
+    increase `max_pauli_decomposition_qubits` only as an explicit cost opt-in.
   - Coefficient-frame MPO: `("submpo", mpo, where)` or the matching mapping event. It acts
     directly on `p`; do not use it for a physical-frame operator.
 - **Internal coefficient updates**:
   - One-site frame images use `p.gate_(matrix, site, contract=True)`.
   - Multi-site two-branch operators use `pauli_combo_submpo(...)` followed by
     `p.gate_with_submpo_(..., where=true_window, max_bond=chi, cutoff=cutoff, info=state.info)`.
-  - General Pauli sums copy/apply/weight branches, add them, and compress after additions.
+  - General Pauli sums copy/apply/weight branches, then combine them with a balanced,
+    streaming MPS reduction and compress after additions.
 - **Observables and collapse**: use `sim.expectation`, `sim.expectation_pauli_sum`,
   `sim.sample` (no collapse), and `sim.measure` (collapse). `absorb_basis=True` localizes
   the frame Pauli, updates both basis and MPS, and disentangles the projected pivot.

@@ -12,8 +12,8 @@ the state, routing each entry to the cheap update path:
   applied as an exact bond-dim-2 MPO with optional ``chi`` truncation.
 * **Explicit gate matrices** are classified: Clifford matrices go to the
   tableau; non-Clifford single-qubit *unitaries* are ZYZ-decomposed into
-  rotations; any other ``k``-qubit matrix (any ``k``, unitary **or**
-  non-unitary) is Pauli-decomposed ``G = sum_a c_a P_a`` and applied to ``p`` as
+  rotations; other few-qubit matrices (unitary **or** non-unitary) are
+  Pauli-decomposed ``G = sum_a c_a P_a`` and applied to ``p`` as
   ``M = C^dagger G C = sum_a c_a (C^dagger P_a C)`` (a compressed sum of signed
   Pauli-string branches).  Non-unitary ``G`` is represented without
   renormalization, so the coefficient norm tracks ``|G|psi>|``.
@@ -30,7 +30,7 @@ Supported gate-stream entry forms::
     ("rxx"|"ryy"|"rzz", theta, a, b)                        # 2q Pauli rotations
     ("rot", theta, "XZ...", where)                          # general Pauli exp
     ("t", q) ("tdg", q)                                     # T / T-dagger
-    (matrix, where)                                         # any k-qubit gate
+    (matrix, where)                                         # bounded few-qubit gate
     ("submpo", mpo, where)  / {"kind": "submpo", ...}       # coeff-frame sub-MPO
     ("measure", pauli, where[, outcome[, absorb_basis]])   # Pauli measurement
     ("reset", where)                                        # reset qubit(s) to |0>
@@ -132,6 +132,11 @@ class MpsStabOptimizer:
         Absolute tolerance for pruning Pauli coefficients when decomposing an
         explicit dense operator. ``None`` chooses a matrix-scale-relative
         tolerance from the operator dtype. This is independent of ``cutoff``.
+    max_pauli_decomposition_qubits : int | None
+        Maximum qubit count for the fallback dense-matrix Pauli decomposition.
+        The default, ``2``, bounds its ``4**k`` candidate-term cost. ``None``
+        disables the guard. Clifford matrices and one-qubit unitary matrices
+        use their specialized paths and do not consume this budget.
     track_infidelity : bool
         If ``True``, record the true truncation infidelity (via
         :func:`pepsy.tn_fidelity`) for each compressed ``|nu>`` update.  When
@@ -171,6 +176,7 @@ class MpsStabOptimizer:
         chi: Optional[int] = None,
         cutoff: float = 1e-12,
         operator_tol: Optional[float] = None,
+        max_pauli_decomposition_qubits: Optional[int] = 2,
         track_infidelity: bool = False,
         seed: Optional[int] = None,
         dtype: str = "complex128",
@@ -194,6 +200,21 @@ class MpsStabOptimizer:
                     f"got {operator_tol!r}."
                 )
         self.operator_tol = operator_tol
+        if max_pauli_decomposition_qubits is not None:
+            if (
+                isinstance(max_pauli_decomposition_qubits, bool)
+                or not isinstance(max_pauli_decomposition_qubits, Integral)
+            ):
+                raise TypeError(
+                    "max_pauli_decomposition_qubits must be an integer or None."
+                )
+            max_pauli_decomposition_qubits = int(max_pauli_decomposition_qubits)
+            if max_pauli_decomposition_qubits < 0:
+                raise ValueError(
+                    "max_pauli_decomposition_qubits must be nonnegative or None, "
+                    f"got {max_pauli_decomposition_qubits}."
+                )
+        self.max_pauli_decomposition_qubits = max_pauli_decomposition_qubits
         self.track_infidelity = bool(track_infidelity)
         self.dtype = self.state.dtype
         self._rng = np.random.default_rng(seed)
@@ -377,6 +398,7 @@ class MpsStabOptimizer:
             chi=self.chi,
             cutoff=self.cutoff,
             operator_tol=self.operator_tol,
+            max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
             track_infidelity=self.track_infidelity,
             dtype=self.dtype,
             to_backend=self.to_backend,
@@ -1104,7 +1126,7 @@ class MpsStabOptimizer:
         :meth:`run_with_injection`), keeping the non-Clifford cost on the ancilla
         pool instead of the coefficient MPS.  Remaining keyword arguments are
         forwarded to the constructor (``chi``, ``cutoff``, ``operator_tol``,
-        ``seed``, ...).
+        ``max_pauli_decomposition_qubits``, ``seed``, ...).
         """
         n_data = int(n_data)
         n_ancilla = int(n_ancilla)
@@ -1178,6 +1200,19 @@ class MpsStabOptimizer:
         """
         where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
         k = len(where)
+        # Validate support before either the complexity guard or decomposition.
+        pauli_string(("I",) * k, where, self.n)
+        limit = self.max_pauli_decomposition_qubits
+        if limit is not None and k > limit:
+            raise ValueError(
+                f"Pauli decomposition of a {k}-qubit dense gate would enumerate "
+                f"{4**k} candidate terms, exceeding "
+                f"max_pauli_decomposition_qubits={limit} (at most {4**limit} "
+                "terms). Decompose the physical operator into supported gates "
+                "or Pauli rotations; use a submpo event only for an operator "
+                "already expressed in the coefficient frame; or raise the "
+                "limit explicitly."
+            )
         decomp = pauli_decomposition(gate, k, tol=self.operator_tol)
         branches = []  # (weight, {site: axis})
         for labels, coeff in decomp:
@@ -1199,20 +1234,42 @@ class MpsStabOptimizer:
             self._set_zero_coefficient_state()
             return 0.0
 
+        def combine(left, right, max_bond):
+            result = left + right
+            result.compress(max_bond=max_bond, cutoff=self.cutoff)
+            return result
+
         def build(max_bond):
-            result = None
+            # Binary-carry accumulation produces a balanced addition tree while
+            # retaining only one partial sum per level (O(log(branches)) live
+            # partials instead of materializing every branch MPS at once).
+            partials = []
             for w, sites in branches:
                 branch = p.copy()
                 for site, axis in sites.items():
                     branch.gate_(self._bk_const("P" + axis, pauli_matrix(axis)), site, contract=True)
                 branch = w * branch
-                if result is None:
-                    result = branch
+
+                level = 0
+                while level < len(partials) and partials[level] is not None:
+                    branch = combine(partials[level], branch, max_bond)
+                    partials[level] = None
+                    level += 1
+                if level == len(partials):
+                    partials.append(branch)
                 else:
-                    result = result + branch
-                    result.compress(max_bond=max_bond, cutoff=self.cutoff)
-            if result is not None:
-                result.compress(max_bond=max_bond, cutoff=self.cutoff)
+                    partials[level] = branch
+
+            result = None
+            for partial in reversed(partials):
+                if partial is None:
+                    continue
+                result = (
+                    partial
+                    if result is None
+                    else combine(result, partial, max_bond)
+                )
+            result.compress(max_bond=max_bond, cutoff=self.cutoff)
             return result
 
         if self.track_infidelity and self.chi is not None:
@@ -1269,6 +1326,8 @@ class MpsStabOptimizer:
         return (
             f"MpsStabOptimizer(n={self.n}, chi={self.chi}, "
             f"operator_tol={self.operator_tol}, "
+            f"max_pauli_decomposition_qubits="
+            f"{self.max_pauli_decomposition_qubits}, "
             f"queued={len(self._queue)}, current_chi={self.state.max_bond()})"
         )
 

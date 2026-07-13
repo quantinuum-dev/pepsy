@@ -56,6 +56,11 @@ outcome[, absorb_basis]])`, and `("reset", where)`.
 - Dense-operator coefficient pruning is controlled by `operator_tol`, never by
   the MPS SVD `cutoff`. With `operator_tol=None`, the threshold is relative to
   the matrix scale and input dtype; an explicit value is an absolute tolerance.
+- Fallback Pauli decomposition is limited by
+  `max_pauli_decomposition_qubits=2` before its `4**k` enumeration begins.
+  Set a larger integer, or `None`, only when accepting that cost explicitly.
+  Clifford matrices and one-qubit unitaries use specialized paths and bypass
+  this fallback limit.
 - A zero operator produces a valid zero-norm MPS. `norm()`, dense amplitudes,
   and dense probabilities remain available, while expectation, sampling,
   conditional-probability, reset, and measurement APIs raise `ValueError`
@@ -65,11 +70,15 @@ outcome[, absorb_basis]])`, and `("reset", where)`.
 
 Tree sampling shares work for repeated prefixes, but high-entropy states can
 still generate a number of live branches proportional to the shot count.
-Arbitrary dense `k`-qubit matrices use a `4**k` Pauli decomposition and are
-therefore intended for few-qubit gates. Clifford-angle Pauli rotations are
+Fallback dense matrices use a `4**k` Pauli decomposition and are limited to two
+qubits by default. Allowed branches are combined with a balanced, streaming MPS
+sum; this improves reduction depth but does not remove the exponential number
+of candidate Paulis. For larger physical-frame operators, decompose into named
+gates or Pauli rotations. A `submpo` event is appropriate only when the MPO is
+already expressed in the coefficient frame. Clifford-angle Pauli rotations are
 synthesized directly as linear-size Stim basis-change and parity circuits, then
 cached; they do not form a `2**k x 2**k` dense matrix. Prefer structured
-sub-MPOs for larger non-Clifford operators. `track_infidelity=True` performs
+coefficient-frame sub-MPOs where applicable. `track_infidelity=True` performs
 additional exact-reference overlaps and is a diagnostic mode rather than the
 fastest execution path.
 
