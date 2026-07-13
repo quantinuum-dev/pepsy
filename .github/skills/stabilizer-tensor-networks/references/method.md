@@ -48,6 +48,26 @@ current basis as $P=\alpha\,\delta_{\hat d}\,\sigma_{\hat s}$:
   `TableauSimulator.current_inverse_tableau()`) to map $P$ onto the generator basis; the
   resulting X/Z support gives $\hat d,\hat s$ and the sign gives $\alpha$.
 
+## Live Pepsy shortcut: conjugate the physical operator
+
+Pepsy stores the same basis information as a Clifford unitary $C$, so the representation is
+exactly $|\psi\rangle=C|p\rangle$. For a physical Pauli $P$, call
+`STNState.frame_pauli(P)` to obtain
+
+$$M=C^\dagger P C=\alpha\prod_j P_j.$$
+
+This signed Pauli is the executable form of the basis decomposition above. The current
+implementation does not reconstruct $\hat d,\hat s$ or the $I_x,I_y,I_z$ masks during
+normal evolution:
+
+- $\exp(-i\theta P/2)|\psi\rangle=C\exp(-i\theta M/2)|p\rangle$;
+- $\langle\psi|P|\psi\rangle=\langle p|M|p\rangle/\langle p|p\rangle$;
+- $(I+mP)|\psi\rangle/2=C(I+mM)|p\rangle/2$ for fixed-basis collapse.
+
+The equations below remain the derivation and an independent sign/phase cross-check. For
+execution, prefer the direct stim conjugation and the exact `c I + coef M` local/sub-MPO
+builders.
+
 ## Update rule 1 — Clifford gate G
 
 Conjugate the basis by $G$ (standard tableau update, Appendix D / stim). The coefficient
@@ -116,7 +136,23 @@ $$\tilde{\mathcal R}_{\text{1q}}=\tfrac12\begin{pmatrix}1&\pm\alpha(-i)^{|I_y|}\
 
 When $\hat n=0$ (measuring a stabilizer) the basis is unchanged and there is no projector.
 
-## CNOT-cascade rotation (implementing $\mathcal R_{X^{I_x}Y^{I_y}Z^{I_z}}$)
+### Measurement policies in Pepsy
+
+`MpsStabOptimizer` deliberately exposes two equivalent collapse representations:
+
+- **Fixed basis (default):** leave $C$ unchanged and apply $(I+mM)/2$ directly to $|p\rangle$.
+  Use a local 2x2 projector for one-site support or a windowed bond-dimension-2 sub-MPO for
+  multi-site support, then normalize at the tracked canonical centre.
+- **Basis updating (`absorb_basis=True`):** choose a Clifford $V$ with
+  $VMV^\dagger=sZ_k$, apply $V$ to $|p\rangle$, replace $C$ by $CV^\dagger$, and project
+  site $k$ onto the required computational value. Before projection,
+  $(CV^\dagger)(V|p\rangle)=C|p\rangle$; afterward the pivot is disentangled. The
+  localizer uses a median support pivot and merges nearer support sites first.
+
+Reset and magic-state injection use the basis-updating path because they need a reusable,
+disentangled ancilla.
+
+## Paper/reference CNOT-cascade rotation
 
 A multi-qubit Pauli rotation is realized by: basis-change single-qubit gates ($X\to Y,Z$ per
 $I_x,I_y,I_z$), a CNOT cascade collecting parity onto the innermost affected qubit, one
@@ -124,6 +160,13 @@ central single-qubit rotation ($R_X$ for Lemma 2, or $\tilde{\mathcal R}_{\text{
 Lemma 3), then the reverse CNOT cascade and basis changes. The paper's implementation uses
 **two cascades centered on the middle qubit** (Fig. 4). Centering on the innermost qubit and
 adapting the TN geometry to circuit connectivity limits $\chi$ growth.
+
+This construction explains the paper's bond-growth bounds and is useful for cross-checking.
+The live Pepsy rotation/projector path does **not** emit this cascade: it represents
+$cI+\mathrm{coef}\,M$ directly as an exact bond-dimension-2 MPO on the true support window
+and applies it with quimb `gate_with_submpo_`. The basis-updating measurement does use a
+one-way Clifford localizer (axis changes plus a CNOT ladder), because it must move the
+measured information onto one coefficient site before absorbing the basis change.
 
 ## Resource / cost facts
 - Free operations: all Clifford gates + non-Clifford ops satisfying Corollary 2.1.

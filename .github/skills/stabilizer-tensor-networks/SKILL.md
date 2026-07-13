@@ -1,7 +1,6 @@
 ---
 name: stabilizer-tensor-networks
-description: 'Learn and implement the Stabilizer Tensor Network (STN) universal quantum simulator from Masot-Llima & Garcia-Saez (PRL 133, 230601, 2024 / arXiv:2403.08724) inside pepsy. Use when the user asks to implement, prototype, port, study, or extend stabilizer tensor networks, the generalized tableau formalism, a stabilizer-basis MPS, |nu>/coefficient-state simulation, Clifford+non-Clifford circuit simulation with an amplitude MPS, or stim-tableau + quimb/pepsy-MPS hybrid simulation. Also use for questions about the STN update rules (Clifford, non-Clifford rotation, measurement), the stabilizer basis B(S,D), pseudo-stabilizer rank, or bond-dimension growth bounds from that paper.'
-argument-hint: 'e.g. "implement the Clifford update" or "build the |nu> MPS + stim tableau state"'
+description: 'Learn and implement the Stabilizer Tensor Network (STN) universal quantum simulator from Masot-Llima & Garcia-Saez (PRL 133, 230601, 2024 / arXiv:2403.08724) inside pepsy. Use when the user asks to implement, prototype, port, study, or extend stabilizer tensor networks, the generalized tableau formalism, a stabilizer-basis MPS, nu/coefficient-state simulation, Clifford plus non-Clifford circuit simulation with an amplitude MPS, or stim-tableau plus quimb/pepsy-MPS hybrid simulation. Also use for questions about the STN update rules (Clifford, non-Clifford rotation, measurement), the stabilizer basis B(S,D), pseudo-stabilizer rank, or bond-dimension growth bounds from that paper.'
 ---
 
 # Stabilizer Tensor Networks (STN) in pepsy
@@ -17,34 +16,36 @@ stabilizer + $n$ destabilizer generators, tracked with **stim**) plus a **coeffi
 state** $|\nu\rangle$ (an $n$-qubit **MPS** in pepsy/quimb). Entanglement lives in the
 basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 
-## When to Use
-- Implement or extend an STN simulator in this repo (tableau + amplitude MPS).
-- Add/verify one of the three update rules: Clifford, non-Clifford rotation, measurement.
-- Answer conceptual questions about $\mathcal B(\mathcal S,\mathcal D)$, $|\nu\rangle$,
-  free operations, pseudo-stabilizer rank $\tilde\xi$, or $\chi$-growth bounds.
-
-## Do NOT use for
-- Plain stabilizer-only (Clifford) simulation → use stim directly.
-- Plain MPS/PEPS circuit simulation with no stabilizer basis → use pepsy `gate`/`gate_simple`.
+## Scope boundaries
+- Use stim directly for plain stabilizer-only (Clifford) simulation.
+- Use Pepsy's ordinary gate/optimizer paths for MPS/PEPS simulation with no stabilizer basis.
 
 ## Substrate (decided for this repo)
 - **Tableau / basis $\mathcal B(\mathcal S,\mathcal D)$** → `stim` (`stim.TableauSimulator`,
   `stim.Tableau`, `stim.PauliString`). Never hand-roll the $O(n^2)$ tableau updates
   unless stim genuinely cannot express the step; the paper's own outlook recommends stim.
-- **Coefficient MPS $|\nu\rangle$** → pepsy/quimb MPS.
-  - Build initial state with `pepsy.ps_to_mps`; norm/fidelity via `pepsy.tn_norm` /
-    `pepsy.tn_fidelity`; expectations via `pepsy.expec_mpo` / `pepsy.measure_obs`; sampling
-    via `pepsy.MpsSampler`.
-  - **Apply the non-Clifford / measurement gate streams (CNOT cascades + central rotation)
-    with `pepsy.MpsOptimizer`** — it consumes a canonical bundled stream
-    `((gate, where), ...)`, applies it to the MPS, and is the truncation engine (below).
-    Use `pepsy.gate` / `pepsy.gate_simple` only for one-off/exact application of a single
-    gate when an optimizer is overkill.
-- **Exact vs approximate (bounded-$\chi$) mode** — both go through `MpsOptimizer`:
-  - *Exact*: `MpsOptimizer(nu, gates, mode="exact")` — no truncation, ground truth for tests.
-  - *Approximate*: pick a compressed mode (`"dmrg"`, `"svd"`, `"mpo"`, `"swap"`, `"mix"`) with
-    a `chi` cap; monitor accuracy via its `infidelities` / `losses` traces
-    (`track_infidelity=True`). This is how the STN caps $\chi$ growth from non-Clifford gates.
+- **Coefficient MPS $|p\rangle$ (the paper's $|\nu\rangle$)** → quimb MPS owned by
+  `STNState.p`; `.nu` is a compatibility alias. Construct and evolve it through
+  `MpsStabOptimizer`, not through a nested `MpsOptimizer`.
+  - Single-support frame Paulis use `p.gate_(..., contract=True)` and do not grow a bond.
+  - Multi-support rotations/projectors use `pauli_combo_submpo` on the true contiguous
+    support window followed by `p.gate_with_submpo_`. This is the live replacement for the
+    paper/reference implementation's CNOT-cascade execution.
+  - General few-qubit matrices are Pauli-decomposed, frame-mapped branch by branch, summed,
+    and compressed. A `("submpo", mpo, where)` event instead acts directly in the
+    coefficient frame.
+- **Exact vs approximate (bounded-$\chi$) mode** is selected on `MpsStabOptimizer`:
+  - *Exact*: `MpsStabOptimizer(..., chi=None)`. The SVD `cutoff` still removes exact
+    numerical redundancy so repeated bond-dimension-2 MPOs do not double bonds forever.
+  - *Approximate*: `MpsStabOptimizer(..., chi=cap, track_infidelity=True)`. Each compressed
+    update is compared with an uncapped local target and recorded in `.infidelities`;
+    `.bond_history` records the resulting coefficient-MPS bond. With tracking disabled,
+    truncation still occurs and the history contains zero infidelity placeholders.
+- **Canonical-centre discipline** → preserve `STNState.info["cur_orthog"]` through quimb
+  operations. Canonicalize explicitly before local projection, evaluate local expectations
+  at the tracked centre, and renormalize the centre tensor rather than contracting and
+  normalizing the full MPS. Full arbitrary non-unitary matrix entries are intentionally
+  *not* renormalized: `norm()` then reports the represented state's norm.
 - Keep the wrapper thin and Pepsy-idiomatic (see repo `AGENTS.md`): prefer upstream
   quimb/autoray/cotengra behavior over reimplementation.
 
@@ -54,22 +55,24 @@ is packaged under `src/` and adds disentangling experiments. Its main class `gen
 inherits **Qiskit's** `Clifford` for the tableau and a **quimb** MPS for the complex
 coefficient vector; `gen_clifford.compose(...)` accepts non-Clifford unitaries, decomposed by
 their own methods. **We deliberately differ:** use **stim** (not Qiskit `Clifford`) for the
-tableau and **`MpsOptimizer`** for the MPS side. Consult their `stabilizers_example.ipynb`
-and `.compose` logic to validate the decomposition/update math, but do not copy internals
-(repo `AGENTS.md`).
+tableau and direct quimb MPS operations orchestrated by **`MpsStabOptimizer`** for the
+coefficient side. Consult their `stabilizers_example.ipynb` and `.compose` logic to validate
+the decomposition/update math, but do not copy internals (repo `AGENTS.md`).
 
 ## Read the method first
 The dense equations, the three update rules, the tableau→basis Pauli decomposition, the
-CNOT-cascade rotation, and a worked 5-qubit example live in
+paper's CNOT-cascade construction, and a worked 5-qubit example live in
 [references/method.md](./references/method.md). Read it before writing update-rule code.
 The concrete pepsy + stim call surface is in
 [references/pepsy_stim_api.md](./references/pepsy_stim_api.md).
 
 ## Implementation status (already built in `src/pepsy/optimizers/stabilizer_tn/`)
-Phases 1–4 exist and are validated against dense/stim (`tests/test_stabilizer_tn.py`):
-`STNState` (tableau + `|nu>`), Clifford update, non-Clifford rotations, explicit gate
-matrices, sub-MPO events, and Pauli measurement — all exposed through
-`pepsy.optimizers.MpsStabOptimizer`, an `MpsOptimizer`-style gate-stream simulator.
+The simulator is mature and validated against dense/stim (`tests/test_stabilizer_tn.py` and
+`tests/test_stabilizer_tn_stress.py`): `STNState` (tableau + `|p>`), Clifford and
+non-Clifford evolution, arbitrary few-qubit matrices, fixed/basis-updating measurement,
+reset, recyclable magic-state injection, perfect computational-basis sampling, and optional
+torch/JAX/CuPy-style coefficient backends. It is exposed as `pepsy.MpsStabOptimizer` and
+`pepsy.STNState`.
 
 **Key verified shortcut (use this, not the CNOT-cascade masks).** Because
 $|\psi\rangle = C|\nu\rangle$ with $C$ the tableau Clifford, a physical Pauli operator
@@ -77,7 +80,7 @@ $O$ acts on $|\nu\rangle$ as $M = C^\dagger O C$ — a signed Pauli obtained dir
 stim by conjugating through the tableau:
 
 ```python
-M = state.nu_frame_pauli(P)   # == sim.current_inverse_tableau()(P); sign is real ±1
+M = state.frame_pauli(P)   # == sim.current_inverse_tableau()(P); sign is real ±1
 ```
 
 This collapses all of Lemma 2/3's $I_x,I_y,I_z$ mask algebra into one call:
@@ -98,119 +101,107 @@ This collapses all of Lemma 2/3's $I_x,I_y,I_z$ mask algebra into one call:
   `("reset", where)`.
 
 Both $\exp(-i\theta/2\,M)$ and $\tfrac{I\pm M}{2}$ are exact **bond-dim-2 MPOs**
-(`c·I + coef·P`) built by `pepsy.optimizers.stabilizer_tn.operators.pauli_combo_mpo`; apply via
-`mpo.apply(nu)` then `nu.compress(max_bond=chi)`. Single-support $M$ is applied as a
-bond-preserving 2×2 gate. Explicit matrices: `stim.Tableau.from_unitary_matrix` +
-`sim.do_tableau` for Clifford; ZYZ→rotations for 1q non-Clifford. Rotations whose angle
-is a multiple of $\pi/2$ are Clifford and route to the tableau (free, χ unchanged).
+(`c·I + coef·P`) built on the real support window by
+`pepsy.optimizers.stabilizer_tn.operators.pauli_combo_submpo`; apply with
+`gate_with_submpo_` and the configured `chi`/`cutoff`. Single-support $M$ is applied as a
+bond-preserving 2×2 gate. Explicit matrices: first verify unitarity, then try
+`stim.Tableau.from_unitary_matrix` for Clifford; use ZYZ rotations for a 1q non-Clifford
+unitary; Pauli-decompose every other matrix. Rotations whose angle is a multiple of
+$\pi/2$ are Clifford and route to the tableau (free, $\chi$ unchanged).
+
+## Live execution paths
+- **Named Clifford** → `STNState.apply_clifford`; invalidate the cached inverse tableau;
+  leave `p` and its canonical centre unchanged.
+- **Named Pauli rotation** → build physical `P`, compute `M=C^dagger P C` with
+  `frame_pauli`, extract its real sign/support, then use a local gate or windowed sub-MPO.
+- **Fixed-basis measurement** → compute the Born probability only for sampled outcomes;
+  apply `(I + mM)/2`, reject zero-probability forced outcomes, and normalize at the tracked
+  centre. The tableau is unchanged.
+- **Basis-updating measurement** → localize `M` to signed `Z_k` with a median-pivot
+  Clifford `V`, apply `V` to `p`, absorb `V^dagger` into `C`, project site `k`, and normalize
+  there. This is the reset/injection primitive.
+- **Explicit matrix** → check true unitarity *before* asking stim whether it is Clifford;
+  stim does not reject all non-unitary near-Clifford matrices. Non-Clifford 1q unitaries use
+  ZYZ; all remaining matrices use a Pauli-branch operator sum without normalization.
+- **Backend conversion** → stim/tableau classification remains NumPy/CPU; coefficient MPS,
+  local gates, and MPO arrays use `to_backend`. Convert user matrix entries to NumPy for
+  classification before converting coefficient-side operations back to the chosen backend.
 
 ## Roadmap / future improvements
-The prioritized roadmap (magic state injection, Clifford disentangling sweep,
-basis-updating measurement, sampling, packaging) lives in
+The prioritized roadmap (Clifford disentangling, dynamic layout, future PEPS/decoder work,
+and completed injection/measurement/sampling milestones) lives in
 `src/pepsy/optimizers/stabilizer_tn/PLAN.md`, with citations from the PRL-133-230601 citation scan.
-**R3 (basis-updating measurement) and a first cut of R1 (magic-state injection, `T`-gate
-only) are done** (`absorb_basis=True`, `reset`, `prepare_magic`/`inject_t`); the open R1
-work is general $R_z(\phi)$ injection (recursive gadget) and a large-$N$/fixed-$t$
-poly-scaling benchmark. When extending the simulator, update that PLAN and add a
-dense-validated test.
+R1 supports `inject_rz` for $\phi$ a multiple of $\pi/4$, `inject_t`/`inject_tdg`, nearest
+clean-ancilla selection, recycling, and stream rewriting via `run_with_injection` /
+`with_injection`. Arbitrary-angle injection is intentionally excluded because preparing its
+resource state has the same non-Clifford cost; use direct rotation or compile to Clifford+T.
+When extending the simulator, update that PLAN and add a dense-validated test.
 
-## Implementation Workflow
+## Extension workflow
 
-Implement incrementally, validating each phase against a dense statevector / stim before
-moving on. Prefer a small module (e.g. `src/pepsy/optimizers/stabilizer_tn/`) that composes
-public APIs; do NOT bolt STN state onto unrelated modules.
+The simulator already exists. Extend it incrementally and preserve the representation
+invariant at every intermediate step.
 
-### Phase 0 — Internalize
-1. Read [references/method.md](./references/method.md) end to end.
-2. Confirm the invariant: **Clifford gates change only the basis; non-Clifford gates and
-   measurements change only $|\nu\rangle$** (the basis is updated separately for
-   measurements). Entanglement in the circuit becomes "potential entanglement" stored in
-   the basis, not fictitious $\chi$ in $|\nu\rangle$.
+1. **Internalize the invariant.** Read [references/method.md](./references/method.md), then
+   reason from $|\psi\rangle=C|p\rangle$. Clifford gates change `C`; physical
+   non-Clifford operators act on `p` through $C^\dagger O C$; basis-updating measurement
+   changes both in a coordinated way that preserves the physical state before projection.
+2. **Choose the correct frame.** Named physical gates and dense `(matrix, where)` entries
+   must be frame-mapped. A `submpo` event is deliberately coefficient-frame and must not be
+   conjugated through `C` a second time.
+3. **Choose the narrowest coefficient update.** Use a local 2x2 gate for one support site,
+   `pauli_combo_submpo` for a two-branch Pauli operator, and the branch-sum path only for a
+   genuine multi-term matrix. Label every sub-MPO with its real MPS sites.
+4. **Maintain numerical state.** Thread the `info` orthogonality-centre tracker through
+   quimb splitting/canonicalization calls. Preserve the configured backend for MPS-side
+   arrays. Normalize only projective/unitary workflows that promise a normalized state;
+   retain the norm of arbitrary non-unitary gates.
+5. **Validate the physical state.** For small `n`, compare `C @ p_dense` with an independent
+   dense circuit up to global phase. Compare Clifford-only behavior with stim. Test exact
+   `chi=None` first, then a bounded-`chi` path and backend variants when touched.
+6. **Keep APIs synchronized.** If a public symbol or stream form changes, update the owning
+   `__all__`, top-level lazy exports, `docs/api/`, `tests/test_public_api.py`, and the PLAN.
 
-### Phase 1 — State container
-1. Define an `STNState` holding: an `n`-qubit stim tableau (basis) and an `n`-qubit
-   coefficient MPS `nu`.
-2. Initial state $|\psi\rangle=|0\rangle^{\otimes n}$: tableau = identity
-   ($s_i=Z_i,\ d_i=X_i$), `nu` = product MPS with $\nu_0=1$ (all qubits `|0>`,
-   `pepsy.ps_to_mps`). So $|\nu\rangle=|0\dots0\rangle$, $\chi=1$.
-3. Add a `to_statevector()` reconstruction (small $n$ only) for testing: expand
-   $\sum_i \nu_i\,\hat d_{\hat i}|\psi_{\mathcal S}\rangle$ from the tableau + dense `nu`.
-   **Validate:** random Clifford circuit → STN statevector equals stim's.
+## Validation checklist
+- [ ] Clifford-only circuits leave `p` at $\chi=1$ and match stim.
+- [ ] X/Y/Z and long-range Pauli rotations match dense evolution with `chi=None`.
+- [ ] Local frame images use the bond-preserving fast path; multi-site images stay on the
+  true support window.
+- [ ] Fixed-basis and basis-updating measurements match dense probabilities and collapsed
+  states; repeated measurements are deterministic; impossible forced outcomes raise.
+- [ ] Reset disentangles its targets; direct and injected T/T-dagger/pi/4-multiple Rz paths
+  agree, including ancilla recycling.
+- [ ] `sample_bits`/`probability_bits` match dense probabilities without mutating the source.
+- [ ] Clifford matrices, 1q non-Clifford unitaries, general unitary matrices, and
+  non-unitary matrices all follow their intended dispatch paths.
+- [ ] Normalized unitary/measurement paths keep norm one; general non-unitary matrices keep
+  the dense reference norm instead of being normalized.
+- [ ] Bounded `chi` is respected and tracked infidelity converges toward exact evolution.
+- [ ] Optional backends keep `p` and applied MPS-side arrays on that backend.
 
-### Phase 2 — Clifford update (basis only)
-1. For each Clifford gate $G$ (H, S, CNOT, Pauli, …): update ONLY the stim tableau by
-   conjugation. Leave `nu` untouched (Eq. 4: $G|\nu\rangle=|\nu\rangle$).
-2. Optionally support the alternate policy from the paper's outlook: apply a Clifford
-   directly to $|\nu\rangle$ instead of the basis (kept for future $\chi$-allocation
-   experiments; default = update the basis).
-   **Validate:** any Clifford circuit keeps `nu` a trivial $\chi=1$ MPS and matches stim.
-
-### Phase 3 — Non-Clifford single-qubit rotation (Lemma 2)
-Compile the circuit to `{CNOT, RX, RY, RZ}` so every non-Clifford op is a single-qubit
-rotation $\mathcal R_P(2\theta)=\cos\theta\,I - i\sin\theta\,P$ with $P\in\{X,Y,Z\}$ on
-physical qubit $q$.
-1. Decompose the axis Pauli $P_q$ into the current basis:
-   $P_q = \alpha\,\delta_{\hat d}\,\sigma_{\hat s}$ (X-part $\hat d$ over destabilizers,
-   Z-part $\hat s$ over stabilizers) using the tableau symplectic products — see
-   references/method.md §"Pauli → basis decomposition".
-2. Apply the Clifford part $\delta_{\hat d}\sigma_{\hat s}$ to `nu` as $X_{\hat d}Z_{\hat s}$
-   (Eq. 16), then apply the multi-qubit rotation $\mathcal R_{X^{I_x}Y^{I_y}Z^{I_z}}(2\theta)$
-   with masks $I_x,I_y,I_z$ from Eq. 20/33, implemented as a **CNOT cascade + one central
-   single-qubit rotation** (references/method.md §"CNOT-cascade rotation"). Emit this as a
-   bundled stream `((pepsy.cnot(), where), ..., (pepsy.rx(2θ), q_center), ...)` and apply it
-   through `pepsy.MpsOptimizer` (`mode="exact"` or a compressed mode + `chi`).
-3. Corollary 2.1 fast path: if the axis is (up to Clifford) a single basis generator, the
-   op is a **local** $R$ on one qubit of `nu` — no $\chi$ growth. Detect and take it.
-   **Validate:** single T-gate / RZ on a random Clifford tableau reproduces the expected
-   statevector; the $|T\rangle^{\otimes n}$ state stays $\chi=1$ (paper Eq. 11–12).
-
-### Phase 4 — Measurement / observable (Lemma 3)
-1. Decompose observable $\mathcal O=\alpha\,\delta_{\hat n}\sigma_{\hat m}$ in the basis.
-2. Expectation: $\langle\mathcal O\rangle=\alpha\,\langle\nu|X_{\hat n}Z_{\hat m}|\nu\rangle$
-   (Eq. 29) via `pepsy.expec_mpo` / `pepsy.measure_obs`.
-3. Sample outcome $m\in\{+,-\}$ with $p_+=(1+\langle\mathcal O\rangle)/2$.
-4. Update the stim tableau for the measurement, then apply the **non-unitary**
-   $\tilde{\mathcal R}=\tfrac12 I \pm \alpha(-i)^{|I_y|}X^{I_x}Y^{I_y}Z^{I_z}$ (CNOT cascade
-   with the central 1-qubit op of Eq. 44 as a custom gate tensor in the `MpsOptimizer`
-   stream), a projector $P_k=|0\rangle\langle0|_k$ on qubit $k$ (first 1 of $\hat n$), and
-   renormalize by $\sqrt{(1\pm\langle\mathcal O\rangle)/2}$ (Eq. 43). Masks from Eq. 33.
-   **Validate:** measurement statistics + post-measurement state match a dense simulator
-   over many shots.
-
-### Phase 5 — End-to-end validation, truncation & resources
-1. Compare full `{CNOT,RX,RY,RZ}` circuits against dense statevector for small $n$ using
-   `MpsOptimizer(mode="exact")`.
-2. Track `nu.max_bond()` per gate; confirm empirical $\chi$ growth stays within the paper's
-   bounds ($\chi' \le 4\chi$ MPS-local, $\le 16\chi$ with SWAPs; avg $\sim 2^{2.46}$ per
-   T-gate, Fig. 2).
-3. **Approximate mode:** run the same streams through `MpsOptimizer` with a compressed mode
-   + `chi` cap and `track_infidelity=True`; expose the accumulated `infidelities`/`losses`
-   as the accuracy budget so users trade $\chi$ for precision explicitly.
-4. Expose a pseudo-stabilizer rank $\tilde\xi$ = number of non-zero `nu` coefficients.
-5. Add focused tests (`tests/`), keep optional deps optional
-   (`pytest.importorskip("stim")`), update `docs/`/`__all__` if you add public symbols
-   (repo Public API Rules).
-
-## Validation Checklist
-- [ ] Clifford-only circuits: `nu` stays $\chi=1$; STN statevector == stim.
-- [ ] $|T\rangle^{\otimes n}$ builds with $\chi=1$ (Clifford H layer + free T rotations).
-- [ ] Single non-Clifford rotation matches dense statevector (all three axes).
-- [ ] Corollary-2.1 local rotations do not grow $\chi$.
-- [ ] Measurement expectation, sampling probabilities, and collapsed state match dense.
-- [ ] Norm stays 1 after every step (`pepsy.tn_norm(nu) ≈ 1`).
-- [ ] Optional-dependency guards + focused tests pass (`pytest -q tests/test_...`).
-
-## Common Pitfalls
-- **Sign/phase bugs** dominate. Track the $\alpha$ phase from the basis decomposition and
-  the $\delta_1\cdot\sigma_2$ sign in Lemma 2; validate every phase against dense output.
-- **Basis vs $|\nu\rangle$ confusion.** Clifford → basis only. Non-Clifford → $|\nu\rangle$
-  only. Measurement → both. Never apply a non-Clifford gate to the tableau.
-- **Qubit ordering / MPS site order** must be identical between the stim tableau and the
-  pepsy MPS. Fix one convention (`OneDMap`) and assert it.
-- **Long-range rotations are the worst case** ($\le 16\chi$ via SWAPs). Keep the CNOT
-  cascade centered on the innermost affected qubit (paper Fig. 4) to limit $\chi$.
-- Do not vendor stim/quimb internals; isolate any workaround behind a small adapter and
-  test it against the closest public API (repo `AGENTS.md`).
+## Common pitfalls
+- **Sign/phase bugs dominate.** Preserve the real sign returned by
+  `hermitian_pauli_terms`; validate physical states up to global phase because stim's dense
+  tableau unitary is single precision and has no global phase.
+- **Physical frame vs coefficient frame.** Clifford → tableau only; physical non-Clifford
+  → frame-map then `p`; `submpo` → `p` directly; basis-updating measurement → coordinated
+  `p -> Vp`, `C -> CV^dagger`, then projection.
+- **Stim's unitary parser is not a unitary validator.** Call the explicit unitarity check
+  before `stim.Tableau.from_unitary_matrix`, or weighted non-unitary coins can be silently
+  misrouted as Cliffords.
+- **Sub-MPO labels control where the operator acts.** `where` controls the compression
+  region, but quimb aligns the MPO from its own site labels. Building a local MPO on sites
+  `0..w-1` and passing a different `where` applies it to the wrong qubits.
+- **Canonical-centre metadata is part of the algorithm.** Blind rescans/full-network
+  normalization erase the measurement performance gain; stale metadata produces incorrect
+  local norms. Update or deliberately invalidate `state.info["cur_orthog"]` after rebuilds.
+- **Long-range cost is dynamic.** A local physical gate can have a spread frame image after
+  Clifford evolution. Static `MpsOptimizer` layout analysis of the physical stream does not
+  optimize these evolving coefficient supports.
+- **Qubit ordering must agree.** Stim, dense reconstruction, and MPS sites use the same
+  big-endian convention with qubit 0 first.
+- Do not vendor stim/quimb internals; isolate any workaround behind a small adapter and test
+  it against the closest public API (repo `AGENTS.md`).
 
 ## Follow-up ideas (related work)
 - **arXiv:2607.08396** (Deger, Koutsioumpas, Webster, Sayginel, Roffe, Browne, 2026),
