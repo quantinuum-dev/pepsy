@@ -53,6 +53,28 @@ At the start of a new task:
 - `pepsy.sampling`: `MpsSampler`, `VecSampler`, `PepsBpSampler`, and result dataclasses.
 - `pepsy._internal`: private formatting and small utility helpers only.
 
+### MPS optimizer workflow
+
+- Read `.github/skills/mps-optimizer/SKILL.md` before changing
+  `pepsy.optimizers.mps.optimizer`.
+- For repeated layout-aware evolution, install a layout once with
+  `MpsOptimizer.apply_layout(...)`. It stores `logical_order` as
+  position-to-logical-site labels and intentionally never swaps the MPS back.
+  Use `logical_site`, `position`, `remap_sample`, and `to_dense` for readout.
+- A product-state reorder is free exactly when `p.max_bond() == 1`. An
+  initially entangled state must raise by default; `allow_lossy_reorder=True`
+  permits one caller-controlled-cutoff reorder only.
+- Treat `info_c["cur_orthog"]` as algorithm state. Pass it through Quimb gate,
+  canonicalization, control-event, and normalization paths. Temporary target
+  MPS copies must use isolated metadata and must not overwrite the live cache.
+  Prefer a tracked one-site canonical norm over a full doubled-network norm.
+- `mode="exact"` is a dense TensorNetwork path and does not use canonical
+  metadata. Leaving exact mode must rebuild an MPS before any MPS operation;
+  persistent layouts cannot be switched into exact mode silently.
+- Control events that change MPS length, especially `cap`, are incompatible
+  with persistent layouts. Measurement/reset bookkeeping remains in logical
+  site labels.
+
 ## Upstream Tensor-Network Substrate
 
 - Treat `autoray`, `cotengra`, `cotengrust`, and `quimb` as first-class
@@ -182,6 +204,7 @@ Focused validation guide:
 - Hamiltonian or lattice mapping: `pytest -q tests/test_ham.py`
 - Solver changes: `pytest -q tests/test_gradient_solver.py`
 - Optimizers: `pytest -q tests/test_optimize_global.py tests/test_optimize_sweep_plot.py tests/test_optimize_mps.py tests/test_optimize_mpo.py`
+- MPS layout/canonicalization review: `pytest -q tests/test_optimize_mps.py tests/test_optimize_mpo.py tests/test_symmetric_tensors.py`
 - Sampling: `pytest -q tests/test_sampler.py`
 - Docs/API behavior changes: run focused tests plus `sphinx-build -W -b html docs docs/_build/html`
 

@@ -586,3 +586,26 @@ New public symbols must be threaded consistently:
 - BP-gauge initializer wired into the existing sweep / global / PEPS optimizers.
 - Shared reporting for BP-vs-boundary-MPS accuracy/cost traces.
 - Fermionic optimizer path (gradient-based) once §4 norms/energies validate.
+
+---
+
+## 10. MPS optimizer decisions (completed 2026-07-13)
+
+`MpsOptimizer` now has a persistent layout workflow for iterated gate-stream
+evolution. `apply_layout(...)` stores a position-to-logical-site permutation,
+relabels product MPS states without SVD swaps, and requires an explicit
+caller-controlled cutoff for a one-time entangled-state reorder. Repeated
+`run()` calls reuse the layout and readout remaps samples or dense axes instead
+of restoring the original order.
+
+Canonical-center metadata is treated as numerical state: local expectation and
+norm diagnostics reuse `info_c["cur_orthog"]`, temporary target copies own
+isolated metadata, and local normalization accumulates scale in `p.exponent`.
+Exact mode remains separate from MPS canonicalization and reconstructs an MPS
+when switching back. The compatibility `use_layout_finder=True` path is
+deprecated because it retains the expensive swap-back behavior.
+
+Validation: `tests/test_optimize_mps.py`, `tests/test_optimize_mpo.py`, and
+`tests/test_symmetric_tensors.py` cover persistent layouts, control-event
+bookkeeping, canonical-center reuse, exact-mode transitions, normalization,
+and Symmray MPS backends.

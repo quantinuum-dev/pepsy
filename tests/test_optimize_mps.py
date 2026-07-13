@@ -52,9 +52,28 @@ def _mps_data_norm(mps):
     return mps_data.norm()
 
 
+def _perm_mps_to_logical_dense(opt):
+    """Return a permuted-mode MPS dense state in logical site order."""
+    physical = opt.p.to_dense().reshape((2,) * opt.p.L)
+    logical_axes = [opt.qubits.index(site) for site in range(opt.p.L)]
+    return np.transpose(physical, logical_axes).reshape(-1)
+
+
 def _tensor_data_norm(mps, site):
     """Return the Frobenius norm of one MPS tensor's data."""
     return float(np.linalg.norm(np.asarray(mps[site].data)))
+
+
+def _nonuniform_product_mps():
+    """Return a non-translationally-invariant complex product state."""
+    return qtn.MPS_product_state(
+        [
+            np.array([1.0, 0.0], dtype=complex),
+            np.array([0.0, 1.0], dtype=complex),
+            np.array([np.cos(0.3), np.sin(0.3)], dtype=complex),
+            np.array([np.cos(0.5), 1j * np.sin(0.5)], dtype=complex),
+        ]
+    )
 
 
 def _assert_event_sites_locally_normalized(mps, event):
@@ -68,6 +87,57 @@ def test_mps_optimizer_accepts_svd_mode():
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     opt = py.MpsOptimizer(p0, gates=[], chi=8, mode="svd")
     assert opt.mode == "svd"
+
+
+def test_mps_optimizer_accepts_perm_mode():
+    """Perm mode should expose an identity logical-to-physical ordering initially."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    opt = py.MpsOptimizer(p0, gates=[], chi=8, mode="perm")
+
+    assert opt.mode == "perm"
+    assert opt.qubits == [0, 1, 2, 3]
+
+
+def test_mps_optimizer_perm_tracks_lazy_order_and_logical_state():
+    """Perm mode should leave swaps in place while preserving logical evolution."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (0, 2)),
+    ]
+    perm = py.MpsOptimizer(p0.copy(), gates=gates, chi=16, mode="perm")
+    reference = py.MpsOptimizer(p0.copy(), gates=gates, chi=16, mode="swap")
+
+    perm.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    assert perm.qubits == [0, 2, 3, 1]
+    assert np.allclose(_perm_mps_to_logical_dense(perm), reference.p.to_dense().reshape(-1))
+
+    perm.restore_qubit_order()
+    assert perm.qubits == [0, 1, 2, 3]
+    assert np.allclose(perm.p.to_dense().reshape(-1), reference.p.to_dense().reshape(-1))
+
+
+def test_mps_optimizer_perm_maps_control_events_to_logical_sites():
+    """Controls after lazy swaps should still address their logical site labels."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        [
+            (qu.hadamard(), (0,)),
+            (qu.CNOT(), (0, 3)),
+            ("measure", "Z", 3, +1),
+        ],
+        chi=8,
+        mode="perm",
+    )
+
+    opt.run(progbar=False, fidelity_samples=0)
+
+    assert opt.qubits == [0, 3, 1, 2]
+    assert opt.measurements[0][1] == (3,)
+    assert opt.measurements[0][2] == 1
 
 
 def test_mps_optimizer_svd_smoke():
@@ -351,6 +421,176 @@ def test_mps_optimizer_layout_run_restores_original_mps_order_and_stream():
         for actual, (expected, _where) in zip(opt.G, gates)
     )
     assert opt.last_layout_plan is not None
+
+
+def test_mps_optimizer_apply_layout_relabels_product_state_without_swaps(monkeypatch):
+    """A nonuniform bond-one state should relabel without any SVD swaps."""
+    calls = []
+    original = qtn.MatrixProductState.swap_site_to_
+
+    def fail_swap(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductState, "swap_site_to_", fail_swap)
+
+    opt = py.MpsOptimizer(
+        _nonuniform_product_mps(),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=8,
+        mode="svd",
+    )
+    opt.apply_layout((0, 2, 3, 1), layout_report=False)
+
+    assert calls == []
+    assert opt.logical_order == [0, 2, 3, 1]
+    assert opt.p.max_bond() == 1
+    assert [opt.logical_site(pos) for pos in range(4)] == [0, 2, 3, 1]
+    assert [opt.position(site) for site in range(4)] == [0, 3, 1, 2]
+
+
+def test_mps_optimizer_persistent_layout_reuses_order_and_remaps_readout():
+    """Persistent layout replay should agree with identity replay over repeats."""
+    gates = [
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (3, 1)),
+    ]
+    reference = py.MpsOptimizer(
+        _nonuniform_product_mps(), gates=gates, chi=8, mode="svd"
+    )
+    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    laid_out = py.MpsOptimizer(
+        _nonuniform_product_mps(), gates=gates, chi=8, mode="svd"
+    )
+    laid_out.apply_layout((0, 2, 3, 1), layout_report=False)
+    laid_out.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    laid_out.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    reference_dense = np.asarray(reference.to_dense()).reshape(-1)
+    laid_out_dense = np.asarray(laid_out.to_dense()).reshape(-1)
+    overlap = np.vdot(reference_dense, laid_out_dense)
+    assert abs(overlap) == pytest.approx(1.0, abs=1e-10)
+    assert laid_out.logical_order == [0, 2, 3, 1]
+    assert laid_out.p.max_bond() <= laid_out.chi
+    assert laid_out.layout_plan is laid_out.last_layout_plan
+
+    physical_configs = py.MpsSampler(laid_out.p, backend="quimb").sample(
+        n_samples=24, seed=19
+    ).configs_1d
+    physical_dense = np.asarray(laid_out.p.to_dense()).reshape(-1)
+    for physical_config in physical_configs:
+        logical_config = laid_out.remap_sample(physical_config).tolist()
+        physical_index = int("".join(map(str, physical_config)), 2)
+        logical_index = int("".join(map(str, logical_config)), 2)
+        assert abs(physical_dense[physical_index]) ** 2 == pytest.approx(
+            abs(reference_dense[logical_index]) ** 2,
+            abs=1e-10,
+        )
+
+
+def test_mps_optimizer_persistent_layout_rejects_entangled_state_by_default():
+    """Entangled initialization needs explicit permission for one-time loss."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(4, bond_dim=2, dtype="complex128", seed=23),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=8,
+        mode="svd",
+    )
+    before = np.asarray(opt.p.to_dense()).copy()
+
+    with pytest.raises(ValueError, match="initially product MPS"):
+        opt.apply_layout((0, 2, 3, 1), layout_report=False)
+
+    assert opt.logical_order == [0, 1, 2, 3]
+    assert np.allclose(np.asarray(opt.p.to_dense()), before)
+
+
+def test_mps_optimizer_persistent_layout_entangled_reorder_uses_cutoff(monkeypatch):
+    """Lossy persistent initialization should use the caller's cutoff once."""
+    calls = []
+    original = qtn.MatrixProductState.swap_site_to_
+
+    def counting(self, *args, **kwargs):
+        calls.append(kwargs.copy())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductState, "swap_site_to_", counting)
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(4, bond_dim=2, dtype="complex128", seed=23),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=8,
+        mode="svd",
+    )
+    opt.apply_layout(
+        (0, 2, 3, 1),
+        cutoff=1e-7,
+        allow_lossy_reorder=True,
+        layout_report=False,
+    )
+
+    assert opt.logical_order == [0, 2, 3, 1]
+    assert calls
+    assert all(call["cutoff"] == pytest.approx(1e-7) for call in calls)
+
+
+def test_mps_optimizer_persistent_layout_controls_keep_logical_labels():
+    """Persistent layout control events execute physically but record logically."""
+    opt = py.MpsOptimizer(
+        _nonuniform_product_mps(),
+        gates=[
+            (qu.hadamard(), (3,)),
+            (qu.CNOT(), (0, 3)),
+            ("measure", "Z", 3, +1),
+        ],
+        chi=8,
+        mode="mpo",
+    )
+    opt.apply_layout((0, 2, 3, 1), layout_report=False)
+    opt.run(progbar=False, fidelity_samples=0)
+
+    assert opt.measurements[0][0:3] == ("Z", (3,), 1)
+    assert np.isclose(
+        py.MpsOptimizer._real_float(
+            opt._state_expectation("Z", (opt.position(3),))
+        ),
+        1.0,
+    )
+
+
+def test_mps_optimizer_persistent_layout_remaps_submpo_without_mutating_stream():
+    """Persistent layout should copy/remap each sub-MPO on every replay."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    mpo = _two_branch_flip_submpo(L=4, sites=(0, 3), targets=(0, 3))
+    stream = [py.MpsOptimizer.submpo_event(mpo, (0, 3))]
+    reference = py.MpsOptimizer(p0.copy(), gates=stream, chi=16, mode="mpo")
+    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    opt = py.MpsOptimizer(p0.copy(), gates=stream, chi=16, mode="mpo")
+    opt.apply_layout((0, 2, 3, 1), layout_report=False)
+    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+
+    assert np.allclose(
+        np.abs(np.asarray(opt.to_dense()).reshape(-1)),
+        np.abs(np.asarray(reference.to_dense()).reshape(-1)),
+    )
+    assert stream[0][1] is mpo
+    assert stream[0][2] == (0, 3)
+
+
+def test_mps_optimizer_persistent_layout_rejects_cap_events():
+    """Persistent layout cannot survive a stream that changes MPS length."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        gates=[("cap", 1, [1.0, 1.0])],
+        chi=8,
+        mode="mpo",
+    )
+    with pytest.raises(ValueError, match="cap control events"):
+        opt.apply_layout((0, 2, 3, 1), layout_report=False)
 
 
 def test_mps_optimizer_layout_run_reports_score_reduction(capsys):
@@ -697,7 +937,7 @@ def test_mps_optimizer_run_returns_state_for_empty_queue():
     assert out is opt.p
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "mpo", "svd", "exact"])
+@pytest.mark.parametrize("mode", ["dmrg", "mpo", "perm", "svd", "exact"])
 def test_mps_optimizer_run_returns_state_after_updates(mode):
     """run() should return the updated MPS for every execution mode."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -711,7 +951,7 @@ def test_mps_optimizer_run_returns_state_after_updates(mode):
     assert out is opt.p
 
 
-@pytest.mark.parametrize("mode", ["mpo", "svd", "swap"])
+@pytest.mark.parametrize("mode", ["mpo", "perm", "svd", "swap"])
 def test_mps_optimizer_compression_modes_sample_norm_proxy(mode):
     """Compression modes should append norm-proxy samples to fidelity trace."""
     p0 = qtn.MPS_computational_state("00000", dtype="complex128")
@@ -880,7 +1120,7 @@ def test_mps_optimizer_non_unitary_scale_control_skips_diagnostics():
     _assert_event_sites_locally_normalized(opt.p, events[0])
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "svd"])
+@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "perm", "svd"])
 def test_mps_optimizer_normalization_insert_site_stays_inside_span(mode):
     """Normalization events should insert factors inside the canonical span."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -953,6 +1193,36 @@ def test_mps_optimizer_track_infidelity_rejects_exact_mode():
         opt.run(progbar=False, track_infidelity=True)
 
 
+def test_mps_optimizer_exact_mode_keeps_canonical_metadata_separate():
+    """Switching through exact mode rebuilds an MPS before canonical use."""
+    p0 = qtn.MPS_computational_state("000", dtype="complex128")
+    gates = [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 2))]
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=8, mode="svd")
+
+    opt.set_mode("exact")
+    opt.run(progbar=False)
+    assert opt.info_c == {}
+
+    exact_dense = opt.to_dense()
+    opt.set_gates([])
+    opt.set_mode("svd")
+
+    assert isinstance(opt.p, qtn.MatrixProductState)
+    assert opt.info_c["cur_orthog"] not in (None, "calc")
+    assert np.allclose(opt.p.to_dense().reshape(-1), exact_dense)
+
+
+def test_mps_optimizer_persistent_layout_rejects_exact_mode_switch():
+    """Exact mode cannot silently discard a persistent logical-site map."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000"), gates=[], chi=4, mode="svd"
+    )
+    opt.apply_layout((2, 0, 1), layout_report=False)
+
+    with pytest.raises(ValueError, match="persistent-layout"):
+        opt.set_mode("exact")
+
+
 def test_mps_optimizer_rejects_invalid_normalize_every():
     """normalize_every should fail clearly for non-positive intervals."""
     p0 = qtn.MPS_computational_state("00", dtype="complex128")
@@ -985,18 +1255,68 @@ def test_mps_optimizer_canonical_span_norm_matches_full_target_norm(where):
 
     xmin, xmax = sorted(where)
     opt.canonize_mps(opt.p, (xmin, xmax))
-    target = py.gate(
+    target = opt._build_norm_target(  # pylint: disable=protected-access
         opt.p,
         gate,
         where,
-        contract="split-gate",
         cutoff=1e-12,
         cutoff_mode="rel",
-        inplace=False,
     )
 
     local_norm = opt._canonical_span_norm(target, (xmin, xmax))  # pylint: disable=protected-access
     assert local_norm == pytest.approx(target.norm())
+
+
+def test_mps_optimizer_target_norm_does_not_mutate_live_canonical_metadata():
+    """Temporary norm targets must not overwrite the live MPS center cache."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128", seed=8),
+        gates=[],
+        chi=8,
+        mode="svd",
+    )
+    opt.canonize_mps(opt.p, (0, 1))
+    before = dict(opt.info_c)
+    target = opt._build_norm_target(  # pylint: disable=protected-access
+        opt.p,
+        _non_unitary_entangling_gate(),
+        (0, 3),
+        cutoff=1e-12,
+    )
+
+    measured = opt._canonical_span_norm(  # pylint: disable=protected-access
+        target, (0, 3)
+    )
+
+    assert measured == pytest.approx(target.norm())
+    assert opt.info_c == before
+
+
+def test_mps_optimizer_local_normalization_reuses_tracked_center(monkeypatch):
+    """Local scale control should not rescan a live canonical MPS."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128", seed=9),
+        gates=[],
+        chi=8,
+        mode="svd",
+    )
+    opt.canonize_mps(opt.p, (0, 2))
+
+    def fail_scan(*args, **kwargs):
+        raise AssertionError("normalization should reuse the tracked centre")
+
+    monkeypatch.setattr(qtn.MatrixProductState, "calc_current_orthog_center", fail_scan)
+    event = opt._normalize_orthog_tensors(  # pylint: disable=protected-access
+        opt.p,
+        (0, 2),
+        step=1,
+        reason="test",
+        canonicalize=False,
+    )
+
+    assert event is not None
+    assert event["insert"] in (0, 1, 2)
+    assert opt.info_c["cur_orthog"] == (0, 2)
 
 
 def test_mps_optimizer_canonical_span_norm_ignores_stored_exponent():
@@ -1013,39 +1333,22 @@ def test_mps_optimizer_canonical_span_norm_ignores_stored_exponent():
     assert opt.p.exponent == pytest.approx(3.0)
 
 
-def test_mps_optimizer_norm_infidelity_uses_tn_norm_strip_exponent(monkeypatch):
-    """Norm-infidelity diagnostics should measure raw norms through ``tn_norm``."""
-    calls = []
-    original_tn_norm = mps_optimizer_module.tn_norm
+def test_mps_optimizer_norm_infidelity_uses_single_center_norm(monkeypatch):
+    """Norm diagnostics should avoid a full doubled-network contraction."""
+    def _fail_tn_norm(*args, **kwargs):
+        raise AssertionError("single-center norm should not call tn_norm")
 
-    def _spy_tn_norm(*args, **kwargs):
-        calls.append(kwargs.copy())
-        return original_tn_norm(*args, **kwargs)
+    monkeypatch.setattr(mps_optimizer_module, "tn_norm", _fail_tn_norm, raising=False)
 
-    monkeypatch.setattr(mps_optimizer_module, "tn_norm", _spy_tn_norm)
+    p0 = qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128", seed=3)
+    opt = py.MpsOptimizer(p0.copy(), gates=[], chi=8, mode="svd")
+    raw = opt.p.copy()
+    raw.exponent = 0.0
 
-    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
-    gates = [
-        (qu.hadamard(), (0,)),
-        (qu.hadamard(), (1,)),
-        (_non_unitary_entangling_gate(), (0, 1)),
-    ]
+    measured = opt._canonical_span_norm(opt.p, (0, 3))  # pylint: disable=protected-access
 
-    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode="mpo")
-    opt.run(
-        progbar=False,
-        cutoff=1e-12,
-        non_unitary=True,
-        normalize_every=True,
-        normalize_final=True,
-        track_norm_infidelity=True,
-    )
-
-    samples = opt.get_norm_infidelity_samples()
-    assert len(samples) == 1
-    assert len(calls) >= 2
-    assert all(call["strip_exponent"] is True for call in calls)
-    assert all(call["contraction_opt"] == opt.contraction_opt for call in calls)
+    assert measured == pytest.approx(raw.norm())
+    assert opt.info_c["cur_orthog"] == (3, 3)
 
 
 def test_mps_optimizer_non_unitary_norm_infidelity_matches_svd_target():
@@ -1326,7 +1629,7 @@ def test_mps_optimizer_dmrg_non_unitary_matches_mpo_accuracy():
     )
 
 
-@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "svd"])
+@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "perm", "svd"])
 def test_mps_optimizer_non_unitary_norm_infidelity_smoke_other_modes(mode):
     """All compressed modes should expose a bounded non-unitary proxy."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -1355,3 +1658,423 @@ def test_mps_optimizer_non_unitary_norm_infidelity_smoke_other_modes(mode):
     assert 0.0 <= opt.get_infidelities()[-1] <= 1.0
     _assert_event_sites_locally_normalized(opt.p, opt.get_normalizations()[-1])
     assert opt.p.norm() > 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Control events: measure / cap / reset
+# --------------------------------------------------------------------------- #
+_PAULI_1Q_TEST = {
+    "I": np.eye(2, dtype=complex),
+    "X": np.array([[0, 1], [1, 0]], dtype=complex),
+    "Y": np.array([[0, -1j], [1j, 0]], dtype=complex),
+    "Z": np.array([[1, 0], [0, -1]], dtype=complex),
+}
+
+
+def _dense_pauli_expectation(mps, pauli, where):
+    """Return ``<psi|P|psi> / <psi|psi>`` from the dense statevector."""
+    psi = mps.to_dense().reshape(-1)
+    ops = [np.eye(2, dtype=complex) for _ in range(mps.L)]
+    for axis, site in zip(pauli, where):
+        ops[site] = _PAULI_1Q_TEST[axis]
+    operator = ops[0]
+    for op in ops[1:]:
+        operator = np.kron(operator, op)
+    return complex(psi.conj() @ (operator @ psi) / (psi.conj() @ psi)).real
+
+
+def _full_network_pauli_expectation(mps, pauli, where, optimize="auto-hq"):
+    """Return a Pauli expectation from an explicit full MPS overlap."""
+    op = _PAULI_1Q_TEST[pauli[0]]
+    for axis in pauli[1:]:
+        op = np.kron(op, _PAULI_1Q_TEST[axis])
+
+    acted = mps.copy()
+    acted.gate_nonlocal_(
+        op,
+        tuple(int(site) for site in where),
+        max_bond=None,
+        info={},
+        method="direct",
+        cutoff=0.0,
+        cutoff_mode="abs",
+    )
+    numerator = (mps.H & acted).contract(all, output_inds=(), optimize=optimize)
+    denominator = (mps.H & mps).contract(all, output_inds=(), optimize=optimize)
+    return float(np.real(complex(numerator / denominator)))
+
+
+def test_mps_optimizer_measure_forced_outcome_collapses_and_records():
+    """A forced measurement should collapse the state and record the result."""
+    m = qtn.MPS_rand_state(6, 4, seed=2)
+    opt = py.MpsOptimizer(m.copy(), [("measure", "Z", 2, +1)], chi=8, mode="mpo")
+    opt.run(progbar=False)
+
+    assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (2,)), 1.0)
+    assert np.isclose(float(abs(opt.p.norm())), 1.0)
+    assert len(opt.measurements) == 1
+    pauli, where, outcome, prob = opt.measurements[0]
+    assert pauli == "Z"
+    assert where == (2,)
+    assert outcome == 1
+    assert 0.0 <= prob <= 1.0
+
+
+def test_mps_optimizer_measure_multisite_pauli():
+    """Multi-qubit Pauli measurements should collapse onto the eigenspace."""
+    m = qtn.MPS_rand_state(6, 4, seed=2)
+    opt = py.MpsOptimizer(m.copy(), [("measure", "ZZ", (1, 3), -1)], chi=8, mode="mpo")
+    opt.run(progbar=False)
+
+    assert np.isclose(_dense_pauli_expectation(opt.p, "ZZ", (1, 3)), -1.0)
+    assert opt.measurements[0][:3] == ("ZZ", (1, 3), -1)
+
+
+def test_mps_optimizer_expectation_uses_local_canonical_path(monkeypatch):
+    """MPS expectations should use Quimb's local canonical evaluator."""
+    calls = []
+    original = qtn.MatrixProductState.local_expectation_canonical
+
+    def counting(self, *args, **kwargs):
+        calls.append(kwargs.copy())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.MatrixProductState, "local_expectation_canonical", counting)
+
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(6, 4, seed=7), gates=[], chi=8, mode="mpo"
+    )
+    observed = opt._state_expectation("ZZ", (1, 4))  # pylint: disable=protected-access
+    expected = _dense_pauli_expectation(opt.p, "ZZ", (1, 4))
+
+    assert observed == pytest.approx(expected)
+    assert len(calls) == 1
+    assert calls[0]["normalized"] is True
+    assert calls[0]["info"] is opt.info_c
+
+
+@pytest.mark.parametrize(
+    ("pauli", "where"),
+    [("X", (4,)), ("YZ", (1, 4))],
+)
+def test_mps_optimizer_expectation_reuses_tracked_center_without_rescan(
+    monkeypatch, pauli, where
+):
+    """Local Pauli expectations should move a known centre without rescanning."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(6, 4, seed=11), gates=[], chi=8, mode="mpo"
+    )
+    opt.canonize_mps(opt.p, 0)
+    assert opt.info_c["cur_orthog"] == (0, 0)
+
+    def fail_scan(*args, **kwargs):
+        raise AssertionError("expectation should reuse the tracked canonical centre")
+
+    monkeypatch.setattr(qtn.MatrixProductState, "calc_current_orthog_center", fail_scan)
+
+    observed = opt._state_expectation(pauli, where)  # pylint: disable=protected-access
+    expected = _dense_pauli_expectation(opt.p, pauli, where)
+
+    assert observed == pytest.approx(expected)
+    center = opt.info_c["cur_orthog"]
+    assert center[0] == center[1]
+    assert min(where) <= center[0] <= max(where)
+
+
+@pytest.mark.parametrize(
+    ("pauli", "where"),
+    [("X", (4,)), ("YZ", (1, 4))],
+)
+def test_mps_optimizer_local_expectation_matches_full_network(pauli, where):
+    """Local canonical and full-network Pauli expectations should agree."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(6, 4, seed=13), gates=[], chi=8, mode="mpo"
+    )
+
+    local = opt._state_expectation(pauli, where)  # pylint: disable=protected-access
+    full = _full_network_pauli_expectation(opt.p, pauli, where)
+
+    assert local == pytest.approx(full, abs=1e-10)
+
+
+def test_mps_optimizer_measure_born_statistics():
+    """Sampled outcomes should follow the Born rule for a biased qubit."""
+    theta = np.pi / 3
+    ry = np.array(
+        [
+            [np.cos(theta / 2), -np.sin(theta / 2)],
+            [np.sin(theta / 2), np.cos(theta / 2)],
+        ],
+        dtype=complex,
+    )
+    n_shots = 800
+    plus = 0
+    for shot in range(n_shots):
+        opt = py.MpsOptimizer(
+            qtn.MPS_computational_state("0"),
+            [(ry, (0,)), ("measure", "Z", 0)],
+            chi=2,
+            mode="mpo",
+        )
+        opt.run(progbar=False, seed=shot)
+        if opt.measurements[0][2] == 1:
+            plus += 1
+    expected = np.cos(theta / 2) ** 2
+    assert abs(plus / n_shots - expected) < 0.05
+
+
+def test_mps_optimizer_measure_forced_zero_probability_raises():
+    """Forcing an impossible outcome should fail clearly."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0"),
+        [("measure", "Z", 0, -1)],
+        chi=2,
+        mode="mpo",
+    )
+    with pytest.raises(ValueError, match="probability"):
+        opt.run(progbar=False)
+
+
+def test_mps_optimizer_cap_matches_dense_projection_and_shortens():
+    """A cap event should shorten the MPS and match the dense contraction."""
+    m = qtn.MPS_rand_state(6, 4, seed=2)
+    vec = np.array([1.0, 1.0])
+    dense = m.to_dense().reshape([2] * 6)
+    expected = np.tensordot(dense, vec, axes=([2], [0]))
+
+    for absorb in ("left", "right"):
+        opt = py.MpsOptimizer(m.copy(), [("cap", 2, vec, absorb)], chi=8, mode="mpo")
+        opt.run(progbar=False)
+        assert isinstance(opt.p, qtn.MatrixProductState)
+        assert opt.p.L == 5
+        got = opt.p.to_dense().reshape([2] * 5)
+        assert np.allclose(got, expected)
+
+
+def test_mps_optimizer_cap_boundary_sites():
+    """Capping the first or last site should stay a valid shorter MPS."""
+    m = qtn.MPS_rand_state(5, 3, seed=7)
+    dense = m.to_dense().reshape([2] * 5)
+
+    first = py.MpsOptimizer(m.copy(), [("cap", 0, [1.0, 0.0])], chi=8, mode="svd")
+    first.run(progbar=False)
+    assert first.p.L == 4
+    assert np.allclose(
+        first.p.to_dense().reshape([2] * 4),
+        np.tensordot([1.0, 0.0], dense, axes=([0], [0])),
+    )
+
+    last = py.MpsOptimizer(m.copy(), [("cap", 4, [0.0, 1.0])], chi=8, mode="svd")
+    last.run(progbar=False)
+    assert last.p.L == 4
+    assert np.allclose(
+        last.p.to_dense().reshape([2] * 4),
+        np.tensordot(dense, [0.0, 1.0], axes=([4], [0])),
+    )
+
+
+def test_mps_optimizer_cap_length_one_raises():
+    """Capping the single site of a length-1 MPS should fail clearly."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0"),
+        [("cap", 0, [1.0, 1.0])],
+        chi=2,
+        mode="mpo",
+    )
+    with pytest.raises(ValueError, match="length-1"):
+        opt.run(progbar=False)
+
+
+def test_mps_optimizer_reset_returns_qubit_to_zero():
+    """Reset should leave the target qubit in |0> without changing length."""
+    hadamard = qu.hadamard()
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000"),
+        [(hadamard, (1,)), ("reset", 1)],
+        chi=4,
+        mode="mpo",
+    )
+    opt.run(progbar=False, seed=0)
+
+    assert opt.p.L == 3
+    assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (1,)), 1.0)
+    assert opt.measurements == []
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "mpo", "mix", "swap", "perm", "svd", "exact"])
+def test_mps_optimizer_control_events_all_modes(mode):
+    """measure/cap/reset should work in every run mode."""
+    m = qtn.MPS_rand_state(6, 4, seed=2)
+    opt = py.MpsOptimizer(
+        m.copy(),
+        [("measure", "Z", 2, +1), ("reset", 0), ("cap", 4, [1.0, 1.0])],
+        chi=8,
+        mode=mode,
+    )
+    if mode == "swap" and not hasattr(opt.p, "gate_with_auto_swap_"):
+        pytest.skip("swap mode requires gate_with_auto_swap_ in this quimb version.")
+    opt.run(progbar=False, seed=3)
+
+    assert opt.p.L == 5
+    assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (2,)), 1.0)
+    assert len(opt.measurements) == 1
+
+
+def test_mps_optimizer_gates_and_control_interleaved():
+    """Gates and control events should interleave and stay consistent."""
+    hadamard = qu.hadamard()
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]], dtype=complex
+    )
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        [
+            (hadamard, (0,)),
+            (cnot, (0, 1)),
+            ("measure", "Z", 0, +1),
+            ("cap", 3, [1.0, 1.0]),
+        ],
+        chi=8,
+        mode="mpo",
+    )
+    opt.run(progbar=False)
+
+    # H then CNOT builds a Bell pair on (0, 1); forcing Z_0 = +1 puts both in |0>.
+    assert opt.p.L == 3
+    assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (0,)), 1.0)
+    assert np.isclose(_dense_pauli_expectation(opt.p, "Z", (1,)), 1.0)
+    assert opt.measurements[0][:3] == ("Z", (0,), 1)
+
+
+def test_mps_optimizer_control_event_seed_is_reproducible():
+    """The same seed should reproduce sampled measurement outcomes."""
+    hadamard = qu.hadamard()
+    stream = [(hadamard, (0,)), ("measure", "Z", 0)]
+    first = py.MpsOptimizer(qtn.MPS_computational_state("0"), stream, chi=2, mode="mpo")
+    first.run(progbar=False, seed=123)
+    second = py.MpsOptimizer(qtn.MPS_computational_state("0"), stream, chi=2, mode="mpo")
+    second.run(progbar=False, seed=123)
+    assert first.measurements[0][2] == second.measurements[0][2]
+
+
+def test_mps_optimizer_control_event_mapping_forms():
+    """Mapping-form control events should parse into the same queue metadata."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000"),
+        [
+            {"kind": "measure", "pauli": "Z", "where": 1, "outcome": +1},
+            {"kind": "cap", "where": 2, "vec": [1.0, 1.0]},
+        ],
+        chi=4,
+        mode="mpo",
+    )
+    assert opt.event_types == ["measure", "cap"]
+    assert opt.where == [(1,), (2,)]
+    opt.run(progbar=False)
+    assert opt.p.L == 2
+    assert opt.measurements[0][:3] == ("Z", (1,), 1)
+
+
+def test_mps_optimizer_control_event_public_helpers():
+    """Public event builders and detectors should own the control contract."""
+    measure = py.MpsOptimizer.measure_event("Z", 2, +1)
+    cap = py.MpsOptimizer.cap_event(1, [1, 1], absorb="right")
+    reset = py.MpsOptimizer.reset_event([0, 3])
+
+    assert measure == ("measure", "Z", (2,), 1)
+    assert cap[0] == "cap" and cap[1] == 1 and cap[3] == "right"
+    assert reset == ("reset", (0, 3))
+
+    assert py.MpsOptimizer.is_control_event(measure)
+    assert py.MpsOptimizer.is_control_event(cap)
+    assert not py.MpsOptimizer.is_control_event((np.eye(2), (0,)))
+
+    name, payload, where = py.MpsOptimizer.control_event_parts(measure)
+    assert name == "measure"
+    assert payload["pauli"] == "Z"
+    assert payload["outcome"] == 1
+    assert where == (2,)
+
+
+def test_mps_optimizer_measure_reset_support_layout_finder():
+    """measure/reset should replay correctly under the layout finder."""
+    su4 = qu.rand_uni(4, seed=5)
+    hadamard = qu.hadamard()
+    stream = [
+        (su4, (0, 7)),
+        (su4, (1, 6)),
+        (hadamard, (3,)),
+        ("measure", "Z", 3, +1),
+        (su4, (2, 5)),
+        ("reset", 0),
+        ("measure", "ZZ", (1, 6), +1),
+    ]
+    init = qtn.MPS_computational_state("0" * 8, dtype="complex128")
+
+    ref = py.MpsOptimizer(init.copy(), list(stream), chi=32, mode="mpo")
+    ref.run(progbar=False, seed=7)
+
+    lay = py.MpsOptimizer(init.copy(), list(stream), chi=32, mode="mpo")
+    lay.run(progbar=False, seed=7, use_layout_finder=True, layout_report=False)
+
+    inds = [f"k{i}" for i in range(8)]
+    assert isinstance(lay.p, qtn.MatrixProductState)
+    assert lay.p.site_inds == tuple(inds)
+    # Recorded sites use logical labels, not layout-order labels.
+    assert [rec[:2] for rec in lay.measurements] == [("Z", (3,)), ("ZZ", (1, 6))]
+    assert [rec[:2] for rec in ref.measurements] == [("Z", (3,)), ("ZZ", (1, 6))]
+    assert np.allclose(np.abs(lay.p.to_dense(inds)), np.abs(ref.p.to_dense(inds)))
+
+
+def test_mps_optimizer_cap_events_reject_layout_finder():
+    """cap events change the MPS length, so the layout finder is rejected."""
+    su4 = qu.rand_uni(4, seed=1)
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        [(su4, (0, 3)), ("cap", 1, [1.0, 1.0])],
+        chi=8,
+        mode="mpo",
+    )
+    with pytest.raises(ValueError, match="cap control"):
+        opt.run(progbar=False, use_layout_finder=True)
+
+
+def test_mps_optimizer_control_events_track_canonical_center(monkeypatch):
+    """Control events move the orthogonality centre explicitly (never a rescan)."""
+    calls = {"n": 0}
+    original = qtn.MatrixProductState.calc_current_orthog_center
+
+    def counting(self, *args, **kwargs):
+        calls["n"] += 1
+        return original(self, *args, **kwargs)
+
+    su4 = qu.rand_uni(4, seed=5)
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(6, 4, seed=2),
+        [
+            (su4, (0, 3)),
+            ("measure", "Z", 2, +1),
+            ("reset", 0),
+            ("measure", "ZZ", (1, 4), +1),
+            ("cap", 4, [1.0, 1.0]),
+        ],
+        chi=16,
+        mode="mpo",
+    )
+    # Prime the queued gate segment (which legitimately locates the centre once),
+    # then assert no rescans happen while the control events run.
+    monkeypatch.setattr(
+        qtn.MatrixProductState, "calc_current_orthog_center", counting
+    )
+    opt.run(progbar=False, seed=1)
+
+    assert calls["n"] == 0
+    center = opt.info_c.get("cur_orthog")
+    assert isinstance(center, tuple) and len(center) == 2
+    assert center not in ("calc", None)
+    # The tracked centre is a genuine orthogonality centre of the final MPS.
+    canonical = opt.p.copy()
+    canonical.canonize(list(center))
+    assert np.allclose(
+        np.abs(canonical.to_dense()), np.abs(opt.p.to_dense())
+    )

@@ -42,6 +42,18 @@ and contraction from scratch.
   an older quimb lacks a feature.
 - **Reuse pepsy's optimizer builders** for contraction; don't introduce parallel
   contraction config.
+- For MPS gate streams, treat Quimb's `info`/`cur_orthog` metadata as part of
+  the algorithm state. Reuse a known canonical range for local expectations
+  and one-site norms; do not replace it with a full-network norm contraction.
+  When building an uncapped diagnostic target from `p.copy()`, use a separate
+  info dictionary so the target cannot corrupt the live optimizer's center.
+- A persistent site layout is a bookkeeping permutation over an MPS. It can be
+  relabelled without SVD only for `p.max_bond() == 1`; otherwise make the
+  one-time reorder explicit and caller-controlled. Keep logical readout as an
+  axis/sample remap rather than restoring the physical MPS order every step.
+- Exact MPS replay is a separate contracted-TensorNetwork path. It does not
+  consume canonical metadata, and returning to an MPS backend requires
+  rebuilding and canonicalizing an MPS first.
 - **Decision to record (M1):** how much BP logic lives in pepsy vs. is delegated
   to quimb. Write the outcome into `history/` and into `PLAN.md` §7.
 

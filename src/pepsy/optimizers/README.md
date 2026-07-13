@@ -72,6 +72,28 @@ scalar sweep-time normalization and infidelity use Quimb's
 `PepsOptimizer(boundary_engine="auto")` keeps this same policy when it delegates
 to sweep cleanup.
 
+## MPS gate-stream optimizer
+
+`MpsOptimizer` replays bundled gate streams through the `dmrg`, `mpo`, `swap`,
+`perm`, `svd`, `mix`, or `exact` backends. For repeated evolution on a graph
+with a useful one-dimensional layout, call `opt.apply_layout("quality")` once.
+The MPS then stays in the selected physical order across `run()` calls and
+logical readout goes through `opt.logical_order`, `opt.remap_sample(...)`, or
+`opt.to_dense()`.
+
+The persistent reorder is free only for a product MPS (`p.max_bond() == 1`).
+For an entangled initial state, the default is to raise; an explicit
+`allow_lossy_reorder=True` opts into one reorder using the caller's cutoff.
+The deprecated `run(use_layout_finder=True)` compatibility path still performs
+the old temporary reorder and swap-back and should not be used for iterated
+time evolution.
+
+Canonical metadata in `opt.info_c["cur_orthog"]` is part of the numerical state.
+Local expectation and norm diagnostics should move from this tracked range,
+not rescan or contract the full MPS. Any target MPS copy needs isolated
+metadata. Exact mode intentionally has no canonical cache; switching back to
+an MPS mode rebuilds and canonicalizes the state.
+
 ## Import style
 
 Use clean class imports at API boundaries:

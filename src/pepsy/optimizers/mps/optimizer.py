@@ -2,15 +2,38 @@
 
 :class:`MpsOptimizer` replays a canonical bundled gate stream
 ``[(gate, where), ...]`` against an MPS, using one of several compression
-backends.  ``mode="mpo"`` also accepts explicit sub-MPO events of the form
+backends. ``mode="perm"`` uses a lazy permutation swap network: non-local
+two-site gates swap the right endpoint next to the left endpoint, apply the
+gate, and leave the resulting physical ordering in place. The current
+physical-site-to-logical-site ordering is available as ``optimizer.qubits``.
+For repeated layout-aware evolution, :meth:`MpsOptimizer.apply_layout`
+installs a persistent position-to-logical mapping and never performs a
+swap-back; logical readout is available through ``logical_order``,
+``remap_sample``, and ``to_dense``.
+``mode="mpo"`` also accepts explicit sub-MPO events of the form
 ``("submpo", mpo, where)`` or
-``{"kind": "submpo", "mpo": mpo, "where": where}``.  The default path assumes
-a norm-preserving stream and does not renormalize.  Non-unitary streams should use ``non_unitary=True``; when
-``normalize_every`` is enabled this normalizes the active MPS tensor data after
-compressed updates while accumulating the removed scale into ``p.exponent``.
-Quimb includes that exponent in ``p.norm()``, so ``p.norm()`` still reports the
-represented state norm; inspect a copy with ``exponent=0`` to see the rescaled
-data norm. Diagnostics are separate opt-ins:
+``{"kind": "submpo", "mpo": mpo, "where": where}``.  In every mode the stream
+may also carry *control events* that are state operations rather than gates:
+
+* ``("measure", pauli, where[, outcome])`` — projectively measure a Pauli
+  observable, collapse the MPS onto a sampled (or forced ``outcome``)
+  eigenvalue, and append ``(pauli, where, outcome, prob)`` to
+  :attr:`MpsOptimizer.measurements`.
+* ``("cap", where, vec[, absorb])`` — contract site ``where``'s physical index
+  with ``vec`` (e.g. ``[1, 1]``) and absorb the result into the ``absorb``
+  (``"left"``/``"right"``) neighbour, shortening the MPS by one site.
+* ``("reset", where)`` — mid-circuit reset of qubit(s) to ``|0>`` (measure ``Z``
+  then conditionally flip with ``X``); the MPS length is unchanged.
+
+Control events split the stream into gate/subMPO segments run through the
+active mode and are applied directly to the state between segments, so the same
+stream works in every mode.  The default gate path assumes a norm-preserving
+stream and does not renormalize.  Non-unitary streams should use
+``non_unitary=True``; when ``normalize_every`` is enabled this normalizes the
+active MPS tensor data after compressed updates while accumulating the removed
+scale into ``p.exponent``.  Quimb includes that exponent in ``p.norm()``, so
+``p.norm()`` still reports the represented state norm; inspect a copy with
+``exponent=0`` to see the rescaled data norm. Diagnostics are separate opt-ins:
 ``track_norm_infidelity=True`` records a cheap norm-ratio proxy, while
 ``track_infidelity=True`` records a true normalized-overlap metric, reports
 cumulative infidelity in progress bars, and keeps the running geometric mean
@@ -22,13 +45,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from numbers import Integral
 import types
+import warnings
 import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
 from ...fitting.local import FIT
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate
-from ...tensors.core import tn_fidelity, tn_norm
+from ...tensors.core import tn_fidelity
 from .layout import (
     MpsGateStreamLayoutFinder,
     _normalize_layout_support,
@@ -130,6 +154,131 @@ def is_submpo_event(entry):
     return submpo_event_parts(entry) is not None
 
 
+_CONTROL_EVENT_NAMES = frozenset({"measure", "cap", "reset"})
+
+_PAULI_1Q = {
+    "I": np.array([[1, 0], [0, 1]], dtype=complex),
+    "X": np.array([[0, 1], [1, 0]], dtype=complex),
+    "Y": np.array([[0, -1j], [1j, 0]], dtype=complex),
+    "Z": np.array([[1, 0], [0, -1]], dtype=complex),
+}
+
+
+def _normalize_control_where(where, *, single=False):
+    """Return canonical support sites for a control (measure/cap/reset) event."""
+    if isinstance(where, Integral):
+        sites = (int(where),)
+    elif (
+        isinstance(where, (tuple, list))
+        and len(where) > 0
+        and all(isinstance(site, Integral) for site in where)
+    ):
+        sites = tuple(int(site) for site in where)
+    else:
+        raise ValueError(
+            "control event where must be an int or non-empty sequence of ints."
+        )
+    if single and len(sites) != 1:
+        raise ValueError("cap event where must reference exactly one site.")
+    return sites
+
+
+def _normalize_absorb(absorb):
+    """Validate and normalize a cap absorption direction."""
+    direction = str(absorb).strip().lower()
+    if direction not in {"left", "right"}:
+        raise ValueError("cap absorb direction must be 'left' or 'right'.")
+    return direction
+
+
+def _parse_control_tuple(name, entry):
+    """Return ``(name, payload, where)`` for a tuple-form control event."""
+    if name == "measure":
+        if len(entry) < 3:
+            raise ValueError(
+                "measure event must be ('measure', pauli, where[, outcome])."
+            )
+        pauli = str(entry[1])
+        where = _normalize_control_where(entry[2])
+        outcome = None if len(entry) <= 3 or entry[3] is None else int(entry[3])
+        return "measure", {"pauli": pauli, "outcome": outcome}, where
+    if name == "cap":
+        if len(entry) < 3:
+            raise ValueError("cap event must be ('cap', where, vec[, absorb]).")
+        where = _normalize_control_where(entry[1], single=True)
+        vec = np.asarray(entry[2], dtype=complex).ravel()
+        absorb = _normalize_absorb(entry[3]) if len(entry) > 3 else "left"
+        return "cap", {"vec": vec, "absorb": absorb}, where
+    if name == "reset":
+        if len(entry) < 2:
+            raise ValueError("reset event must be ('reset', where).")
+        where = _normalize_control_where(entry[1])
+        return "reset", {}, where
+    raise ValueError(f"Unknown control event {name!r}.")
+
+
+def _parse_control_mapping(name, entry):
+    """Return ``(name, payload, where)`` for a mapping-form control event."""
+    if name == "measure":
+        pauli = entry.get("pauli", entry.get("observable", _MISSING))
+        where = entry.get("where", entry.get("sites", _MISSING))
+        if pauli is _MISSING or where is _MISSING:
+            raise ValueError("measure event mapping needs 'pauli' and 'where'.")
+        outcome = entry.get("outcome", None)
+        return (
+            "measure",
+            {"pauli": str(pauli), "outcome": None if outcome is None else int(outcome)},
+            _normalize_control_where(where),
+        )
+    if name == "cap":
+        where = entry.get("where", entry.get("site", _MISSING))
+        vec = entry.get("vec", entry.get("vector", _MISSING))
+        if where is _MISSING or vec is _MISSING:
+            raise ValueError("cap event mapping needs 'where' and 'vec'.")
+        absorb = _normalize_absorb(entry.get("absorb", "left"))
+        return (
+            "cap",
+            {"vec": np.asarray(vec, dtype=complex).ravel(), "absorb": absorb},
+            _normalize_control_where(where, single=True),
+        )
+    if name == "reset":
+        where = entry.get("where", entry.get("sites", _MISSING))
+        if where is _MISSING:
+            raise ValueError("reset event mapping needs 'where'.")
+        return "reset", {}, _normalize_control_where(where)
+    raise ValueError(f"Unknown control event {name!r}.")
+
+
+def _control_event_parts(entry):
+    """Return ``(name, payload, where)`` for a control event, else ``None``.
+
+    Control events extend the gate stream with state operations that are not
+    plain gates: Pauli measurements, physical-index caps that shorten the MPS,
+    and mid-circuit resets. Tuple forms are
+    ``("measure", pauli, where[, outcome])``, ``("cap", where, vec[, absorb])``,
+    and ``("reset", where)``; equivalent mapping forms use a
+    ``"kind"``/``"type"``/``"event"`` selector.
+    """
+    if (
+        isinstance(entry, tuple)
+        and len(entry) >= 1
+        and isinstance(entry[0], str)
+    ):
+        name = _normalize_event_name(entry[0])
+        if name in _CONTROL_EVENT_NAMES:
+            return _parse_control_tuple(name, entry)
+    if isinstance(entry, Mapping):
+        kind = entry.get("kind", entry.get("type", entry.get("event", _MISSING)))
+        if kind is not _MISSING and _normalize_event_name(kind) in _CONTROL_EVENT_NAMES:
+            return _parse_control_mapping(_normalize_event_name(kind), entry)
+    return None
+
+
+def _is_control_event(entry):
+    """Return whether ``entry`` is a measure/cap/reset control event."""
+    return _control_event_parts(entry) is not None
+
+
 def _normalize_gate_where(where):
     """Return canonical one-/two-site gate locations for MPS replay."""
     if isinstance(where, Integral):
@@ -146,8 +295,13 @@ def _normalize_gate_queue(gates):
         mpo, where = submpo_parts
         return [mpo], [_normalize_submpo_where(where)], ["submpo"]
 
+    control_parts = _control_event_parts(gates)
+    if control_parts is not None:
+        name, payload, where = control_parts
+        return [payload], [where], [name]
+
     if isinstance(gates, (tuple, list)) and any(
-        _is_submpo_event(entry) for entry in gates
+        _is_submpo_event(entry) or _is_control_event(entry) for entry in gates
     ):
         payloads = []
         wheres = []
@@ -159,6 +313,13 @@ def _normalize_gate_queue(gates):
                 payloads.append(mpo)
                 wheres.append(_normalize_submpo_where(where))
                 event_types.append("submpo")
+                continue
+            control_parts = _control_event_parts(entry)
+            if control_parts is not None:
+                name, payload, where = control_parts
+                payloads.append(payload)
+                wheres.append(where)
+                event_types.append(name)
                 continue
             gate_entries = _normalize_gate_entries(
                 (entry,),
@@ -199,9 +360,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``("submpo", mpo, where)`` or mapping form
         ``{"kind": "submpo", "mpo": mpo, "where": where}``, with a 1D
         support ``where``. :meth:`submpo_event` builds the tuple form.
+        In any mode the stream may also carry control events
+        ``("measure", pauli, where[, outcome])``,
+        ``("cap", where, vec[, absorb])``, and ``("reset", where)`` (built by
+        :meth:`measure_event`, :meth:`cap_event`, and :meth:`reset_event`); a
+        ``cap`` event shortens the MPS, so later event site labels refer to the
+        shortened chain.
     chi : int
-        Maximum bond dimension used by MPO/swap/SVD compression modes.
-    mode : {"dmrg", "mpo", "mix", "swap", "svd", "exact"}, default="dmrg"
+        Maximum bond dimension used by MPO/swap/perm/SVD compression modes.
+    mode : {"dmrg", "mpo", "mix", "swap", "perm", "svd", "exact"}, default="dmrg"
         Optimization backend.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
@@ -214,6 +381,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     Attributes
     ----------
+    measurements : list[tuple]
+        Results of ``("measure", ...)`` control events, appended in order as
+        ``(pauli, where, outcome, prob)`` where ``outcome`` is ``+1``/``-1`` and
+        ``prob`` is the Born probability of that outcome before collapse.
+        Mid-circuit ``reset`` measurements are not recorded here.
     normalizations : list[dict]
         Automatic normalization events recorded during :meth:`run`. Each entry
         stores the 1-based gate step, removed local squared scale,
@@ -232,9 +404,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         norm-preservation proxy samples. With ``track_infidelity=True`` it
         instead stores the running geometric mean of the measured local true
         fidelities, computed from accumulated log fidelities for stability.
+    logical_order : list[int]
+        Persistent-layout mapping from physical MPS position to logical site.
+        The list is identity until :meth:`apply_layout` is called.
     """
 
-    _ALLOWED_MODES = frozenset({"dmrg", "mpo", "mix", "swap", "svd", "exact"})
+    _ALLOWED_MODES = frozenset(
+        {"dmrg", "mpo", "mix", "swap", "perm", "svd", "exact"}
+    )
     LayoutFinder = MpsGateStreamLayoutFinder
     _ALLOWED_SUBMPO_METHODS = frozenset(
         {
@@ -266,6 +443,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         "mpo": "#2ca02c",
         "mix": "#17becf",
         "swap": "#ff7f0e",
+        "perm": "#8c564b",
         "svd": "#d62728",
         "exact": "#9467bd",
     }
@@ -321,6 +499,53 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Return whether ``entry`` is an explicit sub-MPO stream event."""
 
         return is_submpo_event(entry)
+
+    @staticmethod
+    def measure_event(pauli, where, outcome=None):
+        """Return a canonical Pauli-measurement stream event.
+
+        Collapses the MPS onto a sampled (or forced ``outcome``) eigenvalue of
+        the Pauli observable ``pauli`` on ``where`` and appends the result to
+        :attr:`measurements`. ``pauli`` is a string such as ``"Z"`` or ``"ZZ"``
+        with one axis per site in ``where``.
+        """
+        where = _normalize_control_where(where)
+        if outcome is None:
+            return ("measure", str(pauli), where)
+        return ("measure", str(pauli), where, int(outcome))
+
+    @staticmethod
+    def cap_event(where, vec, absorb="left"):
+        """Return a canonical cap stream event.
+
+        Contracts the physical index of site ``where`` with ``vec`` (e.g.
+        ``[1, 1]``) and absorbs the resulting matrix into the ``absorb``
+        neighbour (``"left"`` or ``"right"``), shortening the MPS by one site.
+        """
+        (site,) = _normalize_control_where(where, single=True)
+        return ("cap", site, np.asarray(vec, dtype=complex).ravel(), _normalize_absorb(absorb))
+
+    @staticmethod
+    def reset_event(where):
+        """Return a canonical mid-circuit reset stream event.
+
+        Resets qubit(s) ``where`` to ``|0>`` by a ``Z`` measurement collapse
+        followed by an ``X`` flip when the outcome is ``|1>``. The MPS length is
+        unchanged and the internal ``Z`` measurements are not recorded.
+        """
+        return ("reset", _normalize_control_where(where))
+
+    @staticmethod
+    def control_event_parts(entry):
+        """Return ``(name, payload, where)`` when ``entry`` is a control event."""
+
+        return _control_event_parts(entry)
+
+    @staticmethod
+    def is_control_event(entry):
+        """Return whether ``entry`` is a measure/cap/reset control event."""
+
+        return _is_control_event(entry)
 
     @classmethod
     def gate_stream_layout(  # pylint: disable=too-many-locals
@@ -465,29 +690,52 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.ind_id = str(ind_id)
 
         self.info_c = {}
+        # Physical MPS position -> logical site. ``perm`` mode updates this
+        # lazily as non-local gates leave their swap network in place.
+        self.qubits = list(range(int(getattr(self.p, "L", 0))))
+        # Persistent layout position -> logical site. Unlike ``qubits`` this
+        # mapping is installed once by ``apply_layout`` and is never restored.
+        self.logical_order = list(self.qubits)
+        self._persistent_layout_plan = None
+        self.layout_plan = None
         self.losses = [1.0]
         self.normalizations = []
         self.infidelities = [0.0]
         self.true_infidelities = [0.0]
         self.infidelity_samples = []
         self.norm_infidelity_samples = []
-        self.last_layout_plan = None
+        self.last_layout_plan = self._persistent_layout_plan
         self.mix_history = []
         self.last_mix_summary = None
+        self.measurements = []
+        self._rng = np.random.default_rng()
         self._true_fidelity_log_sum = 0.0
         self._true_fidelity_count = 0
         self._norm_fidelity_proxy = 1.0
         self._init_canonicalization()
 
-    def _current_orthog(self, p=None):
+    def _info_for_state(self, p, info=None):
+        """Return canonical metadata owned by ``p``.
+
+        ``info_c`` describes the live optimizer state only. Diagnostic and
+        target-building paths frequently work on MPS copies, for which using
+        that dictionary would make a temporary state's center look like the
+        live state's center. Such copies get an isolated metadata dictionary.
+        """
+        if info is not None:
+            return info
+        return self.info_c if p is self.p else {}
+
+    def _current_orthog(self, p=None, *, info=None):
         """Return cached ``(min_site, max_site)`` orthogonality span.
 
         Cached entries may be ``"calc"`` / ``None`` (recompute), an ``int``,
         or a 1- or 2-tuple. The stored form is always a 2-tuple with
         ``min <= max``.
         """
-        cur = self.info_c.get("cur_orthog", "calc")
         state = self.p if p is None else p
+        state_info = self._info_for_state(state, info)
+        cur = state_info.get("cur_orthog", "calc")
         if cur == "calc" or cur is None:
             lo, hi = state.calc_current_orthog_center()
             cur = (int(lo), int(hi))
@@ -500,8 +748,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         else:
             raise ValueError("cur_orthog must be an int, (int,), or (int, int).")
 
-        self.info_c["cur_orthog"] = cur
+        state_info["cur_orthog"] = cur
         return cur
+
+    def _record_orthog_span(self, p, where, *, info=None):
+        """Record a span known to remain canonical after a state update."""
+        state_info = self._info_for_state(p, info)
+        state_info["cur_orthog"] = self._normalize_span(where)
+        return state_info["cur_orthog"]
 
     def _format_ind(self, site):
         """Format a site id using ``self.ind_id``."""
@@ -647,6 +901,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def set_p(self, p):
         """Assign a new state and reset canonicalization metadata."""
         self.p = self._install_represented_norm(p if self.inplace else p.copy())
+        self.qubits = list(range(int(getattr(self.p, "L", 0))))
+        self.logical_order = list(self.qubits)
+        self._persistent_layout_plan = None
+        self.layout_plan = None
+        self.last_layout_plan = None
         self._init_canonicalization()
 
     def normalize(self, eps=1e-15, insert=None):
@@ -673,13 +932,160 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return old_norm
 
     def set_mode(self, mode):
-        """Switch optimization mode while keeping ``p`` and ``info_c``."""
+        """Switch optimization mode while preserving the represented state."""
         old_mode = self.mode
-        self.mode = self._normalize_mode(mode)
+        new_mode = self._normalize_mode(mode)
+        if new_mode == "exact" and self._persistent_layout_plan is not None:
+            raise ValueError(
+                "cannot switch a persistent-layout optimizer to mode='exact'; "
+                "read out the logical state or create a new optimizer."
+            )
+        if old_mode == "perm" and new_mode != "perm":
+            # Other modes interpret integer ``where`` values as physical MPS
+            # positions, so restore the logical ordering before switching.
+            self._restore_permutation()
+        elif old_mode != "perm" and new_mode == "perm":
+            if self._persistent_layout_plan is not None:
+                raise ValueError(
+                    "cannot switch a persistent layout into mode='perm'; "
+                    "use the persistent layout mapping for replay instead."
+                )
+            self.qubits = list(range(int(getattr(self.p, "L", 0))))
+            self.logical_order = list(self.qubits)
+        if new_mode == "exact":
+            # Exact contractions do not consume canonical metadata. Discard
+            # the MPS-only cache so it cannot be mistaken for the contracted
+            # TensorNetwork's state.
+            self.info_c = {}
+        self.mode = new_mode
         if old_mode == "exact" and self.mode != "exact":
-            # Recreate canonical metadata when leaving exact mode.
+            # Exact mode stores a fully contracted TensorNetwork, so rebuild an
+            # MPS before recreating canonical metadata for an MPS mode.
+            self._ensure_mps_state()
             self._init_canonicalization()
         return self
+
+    def _restore_permutation(self):
+        """Restore logical site order after a lazy-permutation replay."""
+        if self._persistent_layout_plan is not None:
+            raise ValueError(
+                "persistent layouts are intentionally not restored; use "
+                "to_dense(logical_order=True) or remap_sample(...) for readout."
+            )
+        target = tuple(range(int(getattr(self.p, "L", 0))))
+        current = tuple(self.qubits)
+        if current != target:
+            self._reorder_mps_to_logical_order(target, current_order=current)
+        self.qubits = list(target)
+        self.logical_order = list(target)
+
+    def restore_qubit_order(self):
+        """Restore ``p`` to logical site order and return the managed state."""
+        self._restore_permutation()
+        return self.p
+
+    def _logical_to_physical_where(self, where):
+        """Map logical site locations to current physical MPS positions."""
+        if self._persistent_layout_plan is None and self.mode != "perm":
+            return tuple(int(site) for site in where)
+        order = self.logical_order if self._persistent_layout_plan is not None else self.qubits
+        try:
+            return tuple(order.index(int(site)) for site in where)
+        except ValueError as exc:
+            raise ValueError(
+                f"logical site in {where!r} is not present in the current "
+                f"permutation {order!r}."
+            ) from exc
+
+    def _record_permutation_move(self, where):
+        """Record the no-swap-back movement made by a two-site gate."""
+        i, j = sorted(map(int, where))
+        moved = self.qubits.pop(j)
+        self.qubits.insert(i + 1, moved)
+        self.logical_order = list(self.qubits)
+
+    def _update_permutation_after_cap(self, logical_site, physical_site):
+        """Remove a capped logical site and renumber the shortened chain."""
+        logical_site = int(logical_site)
+        physical_site = int(physical_site)
+        if self.qubits[physical_site] != logical_site:
+            raise ValueError(
+                "cap permutation bookkeeping lost the logical site mapping."
+            )
+        remaining = [
+            logical
+            for physical, logical in enumerate(self.qubits)
+            if physical != physical_site
+        ]
+        self.qubits = [
+            logical if logical < logical_site else logical - 1
+            for logical in remaining
+        ]
+        self.logical_order = list(self.qubits)
+
+    def logical_site(self, position):
+        """Return the logical site currently stored at physical ``position``."""
+        position = int(position)
+        if not 0 <= position < len(self.logical_order):
+            raise IndexError(
+                f"physical position {position} is outside the MPS range "
+                f"[0, {len(self.logical_order)})."
+            )
+        return int(self.logical_order[position])
+
+    def position(self, site):
+        """Return the physical position currently holding logical ``site``."""
+        site = int(site)
+        try:
+            return int(self.logical_order.index(site))
+        except ValueError as exc:
+            raise ValueError(
+                f"logical site {site} is not present in the current order "
+                f"{self.logical_order!r}."
+            ) from exc
+
+    def remap_sample(self, config):
+        """Remap a physical-order sample/configuration into logical order.
+
+        ``config`` can be a length-``L`` vector or a batch with ``L`` as its
+        final dimension. The returned NumPy array has logical site ``i`` at
+        index ``i``.
+        """
+        if isinstance(config, Mapping):
+            return {
+                self.logical_site(position): value
+                for position, value in config.items()
+            }
+        config = np.asarray(config)
+        if config.ndim == 0 or config.shape[-1] != len(self.logical_order):
+            raise ValueError(
+                "sample configuration must have MPS length as its final "
+                f"dimension, got shape {config.shape}."
+            )
+        logical = np.empty_like(config)
+        logical[..., np.asarray(self.logical_order, dtype=int)] = config
+        return logical
+
+    def to_dense(self, logical_order=True, **kwargs):
+        """Return the statevector with optional logical-site axis ordering.
+
+        With ``logical_order=True`` (the default), axes are ordered by logical
+        site labels even when the managed MPS is stored in a persistent layout.
+        ``logical_order=False`` returns the underlying physical MPS ordering.
+        """
+        if not hasattr(self.p, "L"):
+            # Exact mode stores a contracted TensorNetwork rather than an MPS,
+            # so its output indices must be supplied explicitly to Quimb.
+            inds = (
+                [self._format_ind(site) for site in range(len(self.logical_order))]
+                if logical_order
+                else list(self.p.outer_inds())
+            )
+            return self.p.to_dense(inds, **kwargs)
+        if not logical_order or self.logical_order == list(range(self.p.L)):
+            return self.p.to_dense(**kwargs)
+        logical_inds = [self.p.site_ind(self.position(site)) for site in range(self.p.L)]
+        return self.p.to_dense(logical_inds, **kwargs)
 
     def set_gates(self, gates):
         """Replace the current gate list.
@@ -766,8 +1172,210 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError("layout site_map keys must match range(p.L).")
         if set(site_map.values()) != set(original_order):
             raise ValueError("layout site_map values must be a permutation of range(p.L).")
+        expected_map = {site: position for position, site in enumerate(site_order)}
+        if dict(site_map) != expected_map:
+            raise ValueError(
+                "layout site_map must map each logical site to its position in "
+                "site_order."
+            )
 
-    def _reorder_mps_to_logical_order(self, target_order, *, current_order=None):
+    def _explicit_layout_plan(self, site_order):
+        """Build the standard layout-plan mapping from an explicit site order."""
+        site_order = tuple(int(site) for site in site_order)
+        site_map = {site: position for position, site in enumerate(site_order)}
+        return {
+            "kind": "mps_gate_stream_layout",
+            "selected_order": "explicit",
+            "qubit_inds": site_order,
+            "site_order": site_order,
+            "order": site_order,
+            "layout": site_map,
+            "site_map": site_map,
+            "inverse_site_map": {
+                position: site for site, position in site_map.items()
+            },
+        }
+
+    def _resolve_layout_plan_argument(self, plan_or_order, layout_kwargs=None):
+        """Resolve a persistent-layout argument without touching the MPS."""
+        if isinstance(plan_or_order, Mapping):
+            plan = dict(plan_or_order)
+        elif isinstance(plan_or_order, str):
+            kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
+            plan = self.layout_finder().run(order=plan_or_order, **kwargs)
+        else:
+            try:
+                plan = self._explicit_layout_plan(plan_or_order)
+            except TypeError as exc:
+                raise TypeError(
+                    "plan_or_order must be a layout mapping, an order name, "
+                    "or a permutation of logical sites."
+                ) from exc
+        self._validate_layout_plan_for_mps(plan)
+        return plan
+
+    @staticmethod
+    def _product_site_vector(p, physical_site):
+        """Extract one local vector from a bond-one MPS tensor."""
+        tensor = p[p.site_tag(int(physical_site))]
+        physical_ind = p.site_ind(int(physical_site))
+        try:
+            physical_axis = tensor.inds.index(physical_ind)
+        except ValueError as exc:  # pragma: no cover - defensive quimb guard
+            raise ValueError(
+                "product-state relabeling could not locate a physical site index."
+            ) from exc
+
+        if any(
+            int(size) != 1
+            for axis, size in enumerate(tensor.shape)
+            if axis != physical_axis
+        ):
+            raise ValueError(
+                "product-state relabeling requires every virtual dimension to "
+                "be one."
+            )
+        axes = [axis for axis in range(tensor.ndim) if axis != physical_axis]
+        axes.append(physical_axis)
+        data = ar.do("transpose", tensor.data, tuple(axes))
+        return data.reshape(-1)
+
+    def _relabel_product_mps(self, target_order, *, current_order):
+        """Rebuild a bond-one MPS in a new site order without SVD swaps."""
+        p = self.p
+        if getattr(p, "cyclic", False):
+            raise ValueError(
+                "persistent layout relabeling currently requires an open-boundary MPS."
+            )
+
+        vectors = {
+            logical_site: self._product_site_vector(p, physical_site)
+            for physical_site, logical_site in enumerate(current_order)
+        }
+        arrays = [vectors[logical_site] for logical_site in target_order]
+        new_p = qtn.MPS_product_state(
+            arrays,
+            site_ind_id=p.site_ind_id,
+            site_tag_id=p.site_tag_id,
+        )
+        if hasattr(p, "exponent") and hasattr(new_p, "exponent"):
+            new_p.exponent = p.exponent
+        self.p = self._install_represented_norm(new_p)
+        self.info_c = {}
+        self._init_canonicalization()
+
+    def apply_layout(
+        self,
+        plan_or_order="quality",
+        *,
+        cutoff=None,
+        cutoff_mode="rsum2",
+        allow_lossy_reorder=False,
+        layout_kwargs=None,
+        layout_report=True,
+    ):
+        """Install a layout permanently and return this optimizer.
+
+        Parameters
+        ----------
+        plan_or_order : mapping | str | sequence, default="quality"
+            A plan returned by :meth:`gate_stream_layout`, a finder order name,
+            or an explicit position-to-logical-site permutation.
+        cutoff : float | None, default=None
+            Cutoff for the one-time reorder of an initially entangled MPS.
+            ``None`` uses ``1e-12``. This value is never used for product-state
+            relabeling and is never used to restore the original order.
+        cutoff_mode : str, default="rsum2"
+            Cutoff mode for the optional one-time entangled-state reorder.
+        allow_lossy_reorder : bool, default=False
+            Allow the one-time reorder when ``p.max_bond() > 1``. If false,
+            entangled initial states raise before mutation.
+        layout_kwargs : mapping | None, default=None
+            Extra keyword arguments passed to the layout finder for string
+            ``plan_or_order`` values.
+        layout_report : bool, default=True
+            Print the usual layout summary when a finder plan is selected.
+
+        Notes
+        -----
+        The installed ``logical_order`` maps physical MPS positions to logical
+        site labels. Subsequent :meth:`run` calls reuse this map and do not
+        reorder the MPS back to logical order. Use :meth:`to_dense` or
+        :meth:`remap_sample` for logical-order readout.
+        """
+        if self.mode == "exact":
+            raise ValueError("persistent layouts require an MPS execution mode, not exact.")
+        if self.mode == "perm":
+            raise ValueError(
+                "persistent layouts cannot be combined with mode='perm'; choose one."
+            )
+        if any(event_type == "cap" for event_type in self.event_types):
+            raise ValueError(
+                "persistent layouts are not supported with cap control events "
+                "because cap changes the MPS length."
+            )
+
+        plan = self._resolve_layout_plan_argument(plan_or_order, layout_kwargs)
+        target_order = tuple(plan["site_order"])
+        current_order = tuple(self.logical_order)
+
+        if self._persistent_layout_plan is not None:
+            if target_order != current_order:
+                raise ValueError(
+                    "a persistent layout is already installed; use the existing "
+                    "logical_order or create a new optimizer for another layout."
+                )
+            return self
+
+        identity = tuple(range(int(getattr(self.p, "L", 0))))
+        if current_order != identity:
+            raise ValueError(
+                "cannot install a persistent layout while the MPS already has "
+                "a lazy permutation; restore it or create a new optimizer."
+            )
+
+        if target_order != current_order:
+            if int(self.p.max_bond()) == 1:
+                self._relabel_product_mps(target_order, current_order=current_order)
+            elif not allow_lossy_reorder:
+                raise ValueError(
+                    "persistent layout requires an initially product MPS "
+                    "(p.max_bond() == 1); got max_bond={} . Set "
+                    "allow_lossy_reorder=True to pay a one-time reorder cost, "
+                    "or apply the layout before entangling the state.".format(
+                        self.p.max_bond()
+                    )
+                )
+            else:
+                reorder_cutoff = 1e-12 if cutoff is None else float(cutoff)
+                if reorder_cutoff < 0.0:
+                    raise ValueError("cutoff must be non-negative.")
+                self._reorder_mps_to_logical_order(
+                    target_order,
+                    current_order=current_order,
+                    cutoff=reorder_cutoff,
+                    cutoff_mode=cutoff_mode,
+                )
+
+        self.logical_order = list(target_order)
+        self.qubits = list(target_order)
+        self._persistent_layout_plan = plan
+        self.layout_plan = plan
+        self.last_layout_plan = plan
+        if layout_report:
+            report = self._layout_report_text(plan)
+            if report:
+                print(report)
+        return self
+
+    def _reorder_mps_to_logical_order(
+        self,
+        target_order,
+        *,
+        current_order=None,
+        cutoff=0.0,
+        cutoff_mode="abs",
+    ):
         """Physically permute MPS site contents into ``target_order``."""
         target = list(target_order)
         current = (
@@ -787,7 +1395,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 target_pos,
                 info=self.info_c,
                 method="svd",
-                cutoff=0.0,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
             )
             moved = current.pop(current_pos)
             current.insert(target_pos, moved)
@@ -979,6 +1588,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         layout_kwargs=None,
         layout=None,
         layout_report=True,
+        measure_renormalize=True,
+        seed=None,
     ):
         """Run the currently queued gates.
 
@@ -994,11 +1605,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode : str, default="rsum2"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
             ``tensor_network_1d_compress``.
-        mode : {"dmrg", "mpo", "mix", "swap", "svd", "exact"} | None, default=None
+        mode : {"dmrg", "mpo", "mix", "swap", "perm", "svd", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
         fidelity_samples : int | None, default=None
-            Compression modes (``mpo``/``swap``/``svd``): number of
+            Compression modes (``mpo``/``swap``/``perm``/``svd``): number of
             intermediate norm-preservation proxy samples taken during the run.
             ``None`` keeps the historical default of ``10`` for
             unitary/default runs and disables norm-proxy sampling for
@@ -1048,11 +1659,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             events. This is forwarded to quimb's
             ``MatrixProductState.gate_with_submpo_``.
         use_layout_finder : bool | str | Mapping, default=False
-            If enabled, call :meth:`layout_finder`, temporarily replay the
-            stream in the selected 1D site order, then restore the returned
-            MPS to original site order. ``True`` uses ``layout_order``; a
-            string is used as the order name; a mapping is treated as a
-            precomputed layout plan. The queued gate stream is not mutated.
+            Deprecated compatibility path. If enabled, call
+            :meth:`layout_finder`, temporarily replay the stream in the
+            selected 1D site order, then restore the MPS to original site
+            order. Use :meth:`apply_layout` for repeated evolution. ``True``
+            uses ``layout_order``; a string is used as the order name; a
+            mapping is treated as a precomputed layout plan.
         layout_order : str, default="quality"
             Order passed to :meth:`layout_finder().run` when
             ``use_layout_finder=True``.
@@ -1063,6 +1675,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         layout_report : bool, default=True
             Print a concise before/after layout summary when layout-aware
             replay is used.
+        measure_renormalize : bool, default=True
+            Whether ``("measure", ...)`` and ``("reset", ...)`` control events
+            renormalize the MPS to unit norm after the projective collapse. The
+            outcome's Born probability is still recorded in
+            :attr:`measurements`. The layout finder works with measure/reset
+            control events (recorded sites always use the logical labels) but
+            not with ``cap`` events, which change the MPS length.
+        seed : int | None, default=None
+            If given, reseed the internal RNG used to sample ``measure``/
+            ``reset`` outcomes before running, for reproducible collapses.
 
         Returns
         -------
@@ -1072,7 +1694,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if mode is not None:
             self.set_mode(mode)
 
-        self.last_layout_plan = None
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+
+        self.last_layout_plan = self._persistent_layout_plan
         G_seq = list(self.G)
         where_seq = list(self.where)
         event_seq = list(self.event_types)
@@ -1080,15 +1705,56 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
         self._validate_symmray_mode_support()
         self._validate_event_stream_for_run(G_seq, where_seq, event_seq)
-        layout_request = self._coalesce_layout_request(use_layout_finder, layout)
-        _, layout_plan = self._resolve_run_layout(
-            layout_request,
-            layout_order,
-            layout_kwargs,
+        has_control = any(
+            event_type in _CONTROL_EVENT_NAMES for event_type in event_seq
         )
+        has_cap = any(event_type == "cap" for event_type in event_seq)
+        layout_request = self._coalesce_layout_request(use_layout_finder, layout)
+        persistent_layout_active = self._persistent_layout_plan is not None
+        if self.mode == "perm" and (
+            persistent_layout_active or self._layout_request_enabled(layout_request)
+        ):
+            raise ValueError(
+                "mode='perm' keeps a lazy logical-to-physical permutation; "
+                "use either the perm mode or a persistent/transient layout, "
+                "not both."
+            )
+        if has_cap and (
+            persistent_layout_active or self._layout_request_enabled(layout_request)
+        ):
+            raise ValueError(
+                "layout replay is not supported together with cap control events "
+                "because cap changes the MPS length; run cap streams without a "
+                "layout. measure/reset control events support layouts."
+            )
+        # Preserve the logical (pre-layout) event locations so control-event
+        # bookkeeping (e.g. recorded measurement sites) always refers to the
+        # user's site labels even when the run replays in a layout order.
+        logical_where_seq = list(where_seq)
+        if persistent_layout_active:
+            if self._layout_request_enabled(layout_request):
+                raise ValueError(
+                    "a persistent layout is already installed; call run() without "
+                    "use_layout_finder/layout arguments."
+                )
+            layout_plan = self._persistent_layout_plan
+            self.last_layout_plan = layout_plan
+        else:
+            if self._layout_request_enabled(layout_request):
+                warnings.warn(
+                    "use_layout_finder/layout performs a temporary reorder and "
+                    "swap-back; call apply_layout(...) for a persistent layout.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            _, layout_plan = self._resolve_run_layout(
+                layout_request,
+                layout_order,
+                layout_kwargs,
+            )
         layout_current_order = None
         if layout_plan is not None:
-            if layout_report:
+            if layout_report and not persistent_layout_active:
                 report = self._layout_report_text(layout_plan)
                 if report:
                     print(report)
@@ -1099,9 +1765,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 event_seq,
                 layout_plan,
             )
-            layout_current_order = self._reorder_mps_to_logical_order(
-                layout_order_tuple
-            )
+            if not persistent_layout_active:
+                layout_current_order = self._reorder_mps_to_logical_order(
+                    layout_order_tuple
+                )
 
         non_unitary = bool(non_unitary)
         if not non_unitary:
@@ -1146,100 +1813,52 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             and not track_infidelity
         )
 
+        mode_kwargs = dict(
+            n_iter=n_iter,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            fidelity_samples=fidelity_samples,
+            k_2q_batch=k_2q_batch,
+            normalize_every=normalize_every,
+            normalize_final=normalize_final,
+            normalize_eps=normalize_eps,
+            non_unitary=non_unitary,
+            track_norm_infidelity=track_norm_infidelity,
+            track_infidelity=track_infidelity,
+            record_fit_losses=record_fit_losses,
+            submpo_method=submpo_method,
+        )
+
+        if has_control:
+            try:
+                return self._run_segmented(
+                    G_seq,
+                    where_seq,
+                    event_seq,
+                    logical_where_seq=logical_where_seq,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    measure_renormalize=measure_renormalize,
+                    where_is_physical=persistent_layout_active,
+                    mode_kwargs=mode_kwargs,
+                )
+            finally:
+                if layout_current_order is not None:
+                    self._reorder_mps_to_logical_order(
+                        tuple(range(int(getattr(self.p, "L", 0)))),
+                        current_order=layout_current_order,
+                    )
+                    self._normalize_visible_mps_order()
+
         try:
-            if self.mode == "dmrg":
-                self._prepare_dmrg_state()
-                self._run_dmrg(
-                    G_seq,
-                    where_seq,
-                    n_iter=n_iter,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    k_2q_batch=k_2q_batch,
-                    normalize_every=normalize_every,
-                    normalize_final=normalize_final,
-                    normalize_eps=normalize_eps,
-                    track_norm_infidelity=track_norm_infidelity,
-                    track_infidelity=track_infidelity,
-                    record_fit_losses=record_fit_losses,
-                )
-                return self.p
-
-            if self.mode == "mix":
-                self._run_mix(
-                    G_seq,
-                    where_seq,
-                    event_seq,
-                    n_iter=n_iter,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    fidelity_samples=fidelity_samples,
-                    submpo_method=submpo_method,
-                )
-                return self.p
-
-            if self.mode == "mpo":
-                self._run_mpo(
-                    G_seq,
-                    where_seq,
-                    event_seq,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    fidelity_samples=fidelity_samples,
-                    normalize_every=normalize_every,
-                    normalize_final=normalize_final,
-                    normalize_eps=normalize_eps,
-                    track_norm_infidelity=track_norm_infidelity,
-                    track_infidelity=track_infidelity,
-                    submpo_method=submpo_method,
-                )
-                return self.p
-
-            if self.mode == "swap":
-                self._run_swap(
-                    G_seq,
-                    where_seq,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    fidelity_samples=fidelity_samples,
-                    normalize_every=normalize_every,
-                    normalize_final=normalize_final,
-                    normalize_eps=normalize_eps,
-                    track_norm_infidelity=track_norm_infidelity,
-                    track_infidelity=track_infidelity,
-                )
-                return self.p
-
-            if self.mode == "svd":
-                self._run_svd(
-                    G_seq,
-                    where_seq,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    fidelity_samples=fidelity_samples,
-                    normalize_every=normalize_every,
-                    normalize_final=normalize_final,
-                    normalize_eps=normalize_eps,
-                    track_norm_infidelity=track_norm_infidelity,
-                    track_infidelity=track_infidelity,
-                )
-                return self.p
-
-            if self.mode == "exact":
-                self._run_exact(
-                    G_seq,
-                    where_seq,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    fidelity_samples=fidelity_samples,
-                )
-                return self.p
+            return self._execute_mode(
+                G_seq,
+                where_seq,
+                event_seq,
+                progbar=progbar,
+                **mode_kwargs,
+            )
         finally:
             if layout_current_order is not None:
                 self._reorder_mps_to_logical_order(
@@ -1248,7 +1867,612 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
                 self._normalize_visible_mps_order()
 
+    def _execute_mode(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        G_seq,
+        where_seq,
+        event_seq,
+        *,
+        n_iter,
+        progbar,
+        cutoff,
+        cutoff_mode,
+        fidelity_samples,
+        k_2q_batch,
+        normalize_every,
+        normalize_final,
+        normalize_eps,
+        non_unitary,
+        track_norm_infidelity,
+        track_infidelity,
+        record_fit_losses,
+        submpo_method,
+    ):
+        """Dispatch a gate/subMPO segment to the active mode backend.
+
+        This is the mode-specific core of :meth:`run`; ``G_seq``/``where_seq``/
+        ``event_seq`` must contain only ``"gate"``/``"submpo"`` events. Control
+        events (measure/cap/reset) are handled by :meth:`_run_segmented`.
+        """
+        if self.mode == "dmrg":
+            self._prepare_dmrg_state()
+            self._run_dmrg(
+                G_seq,
+                where_seq,
+                n_iter=n_iter,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                k_2q_batch=k_2q_batch,
+                normalize_every=normalize_every,
+                normalize_final=normalize_final,
+                normalize_eps=normalize_eps,
+                non_unitary=non_unitary,
+                track_norm_infidelity=track_norm_infidelity,
+                track_infidelity=track_infidelity,
+                record_fit_losses=record_fit_losses,
+            )
+            return self.p
+
+        if self.mode == "mix":
+            self._run_mix(
+                G_seq,
+                where_seq,
+                event_seq,
+                n_iter=n_iter,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+                submpo_method=submpo_method,
+            )
+            return self.p
+
+        if self.mode == "mpo":
+            self._run_mpo(
+                G_seq,
+                where_seq,
+                event_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+                normalize_every=normalize_every,
+                normalize_final=normalize_final,
+                normalize_eps=normalize_eps,
+                non_unitary=non_unitary,
+                track_norm_infidelity=track_norm_infidelity,
+                track_infidelity=track_infidelity,
+                submpo_method=submpo_method,
+            )
+            return self.p
+
+        if self.mode == "swap":
+            self._run_swap(
+                G_seq,
+                where_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+                normalize_every=normalize_every,
+                normalize_final=normalize_final,
+                normalize_eps=normalize_eps,
+                non_unitary=non_unitary,
+                track_norm_infidelity=track_norm_infidelity,
+                track_infidelity=track_infidelity,
+            )
+            return self.p
+
+        if self.mode == "perm":
+            self._run_perm(
+                G_seq,
+                where_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+                normalize_every=normalize_every,
+                normalize_final=normalize_final,
+                normalize_eps=normalize_eps,
+                non_unitary=non_unitary,
+                track_norm_infidelity=track_norm_infidelity,
+                track_infidelity=track_infidelity,
+            )
+            return self.p
+
+        if self.mode == "svd":
+            self._run_svd(
+                G_seq,
+                where_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+                normalize_every=normalize_every,
+                normalize_final=normalize_final,
+                normalize_eps=normalize_eps,
+                track_norm_infidelity=track_norm_infidelity,
+                track_infidelity=track_infidelity,
+            )
+            return self.p
+
+        if self.mode == "exact":
+            self._run_exact(
+                G_seq,
+                where_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                fidelity_samples=fidelity_samples,
+            )
+            return self.p
+
         raise ValueError(f"Unknown mode: {self.mode}")
+
+    def _run_segmented(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        G_seq,
+        where_seq,
+        event_seq,
+        *,
+        logical_where_seq=None,
+        progbar,
+        cutoff,
+        cutoff_mode,
+        measure_renormalize,
+        where_is_physical=False,
+        mode_kwargs,
+    ):
+        """Replay a stream containing measure/cap/reset control events.
+
+        Consecutive ``"gate"``/``"submpo"`` events are grouped into segments run
+        through :meth:`_execute_mode` (using the active mode), while control
+        events are applied directly to ``self.p`` between segments so the same
+        stream works in every mode. ``cap`` events change the MPS length, so
+        later event site labels refer to the shortened chain.
+
+        ``where_seq`` holds the execution locations (already mapped into the
+        active layout order when a layout is used); ``logical_where_seq`` holds
+        the matching user-facing locations for bookkeeping such as recorded
+        measurement sites. When no layout is active the two are identical.
+        ``where_is_physical`` prevents persistent-layout locations from being
+        mapped a second time by the control-event dispatcher.
+        """
+        if logical_where_seq is None:
+            logical_where_seq = where_seq
+        seg_G = []
+        seg_where = []
+        seg_event = []
+
+        def flush():
+            if seg_G:
+                self._execute_mode(
+                    list(seg_G),
+                    list(seg_where),
+                    list(seg_event),
+                    progbar=progbar,
+                    **mode_kwargs,
+                )
+                seg_G.clear()
+                seg_where.clear()
+                seg_event.clear()
+
+        for payload, where, logical_where, event_type in zip(
+            G_seq, where_seq, logical_where_seq, event_seq
+        ):
+            if event_type in _CONTROL_EVENT_NAMES:
+                flush()
+                self._apply_control_event(
+                    event_type,
+                    payload,
+                    where,
+                    record_where=logical_where,
+                    where_is_physical=where_is_physical,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    measure_renormalize=measure_renormalize,
+                )
+            else:
+                seg_G.append(payload)
+                seg_where.append(where)
+                seg_event.append(event_type)
+
+        flush()
+        return self.p
+
+    # ------------------------------------------------------------------ #
+    # Control events (measure / cap / reset)
+    # ------------------------------------------------------------------ #
+    def _apply_control_event(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        name,
+        payload,
+        where,
+        *,
+        record_where=None,
+        where_is_physical=False,
+        cutoff,
+        cutoff_mode,
+        measure_renormalize,
+    ):
+        """Apply one measure/cap/reset control event to ``self.p``."""
+        if record_where is None:
+            record_where = where
+        self._ensure_mps_state()
+        self._ensure_tracked_center()
+        execution_where = (
+            tuple(int(site) for site in where)
+            if where_is_physical
+            else self._logical_to_physical_where(where)
+        )
+        if name == "measure":
+            self._apply_measure_event(
+                payload["pauli"],
+                execution_where,
+                payload.get("outcome"),
+                record_where=record_where,
+                renormalize=measure_renormalize,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+        elif name == "cap":
+            logical_site = int(where[0])
+            physical_site = int(execution_where[0])
+            self._apply_cap_event(
+                execution_where,
+                payload["vec"],
+                payload.get("absorb", "left"),
+            )
+            self._update_permutation_after_cap(logical_site, physical_site)
+        elif name == "reset":
+            self._apply_reset_event(
+                execution_where,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+        else:  # pragma: no cover - guarded by parsing
+            raise ValueError(f"Unknown control event {name!r}.")
+
+    def _ensure_mps_state(self):
+        """Ensure ``self.p`` is a :class:`qtn.MatrixProductState`.
+
+        ``mode="exact"`` fully contracts the state into a single dense tensor;
+        control events operate on MPS structure, so rebuild an MPS from the
+        physical indices (in ``self.ind_id`` order) when needed.
+        """
+        p = self.p
+        if isinstance(p, qtn.MatrixProductState):
+            return p
+        outer = set(p.outer_inds())
+        ordered = []
+        site = 0
+        while True:
+            ind = self._format_ind(site)
+            if ind not in outer:
+                break
+            ordered.append(ind)
+            site += 1
+        if len(ordered) != len(outer):
+            raise ValueError(
+                "cannot rebuild an MPS for a control event: physical indices "
+                "are not the standard 1D site-index family."
+            )
+        dense = p.contract(all, output_inds=ordered, optimize=self.contraction_opt)
+        arr = np.asarray(ar.to_numpy(dense.data if hasattr(dense, "data") else dense))
+        mps = qtn.MatrixProductState.from_dense(arr, [d for d in arr.shape])
+        self.p = self._install_represented_norm(mps)
+        # Freshly rebuilt: mark the centre as unknown so the next control event
+        # establishes a tracked orthogonality centre (never via a blind scan).
+        self.info_c["cur_orthog"] = None
+        return self.p
+
+    def _ensure_tracked_center(self):
+        """Guarantee ``info_c['cur_orthog']`` is a concrete tracked centre.
+
+        Control events always move the orthogonality centre explicitly rather
+        than rescanning with ``calc_current_orthog_center``. When the centre is
+        unknown (e.g. a freshly rebuilt exact-mode state, or an ``exact``-mode
+        run that never canonicalized), establish one by canonicalizing to site
+        ``0`` with a full-span ``cur_orthog`` and record it.
+        """
+        cur = self.info_c.get("cur_orthog")
+        if cur not in (None, "calc"):
+            return
+        L = int(getattr(self.p, "L", 0))
+        if L <= 0:
+            return
+        self.p.canonize([0], cur_orthog=(0, max(0, L - 1)))
+        self.info_c["cur_orthog"] = (0, 0)
+
+    def _state_backend_like(self):
+        """Return a representative backend array from ``self.p`` tensor data."""
+        for tensor in getattr(self.p, "tensors", ()):
+            return tensor.data
+        return None
+
+    def _to_state_backend(self, array):
+        """Return ``array`` cast to ``self.p``'s backend and complex dtype."""
+        arr = np.asarray(array, dtype=complex)
+        like = self._state_backend_like()
+        if like is None:
+            return arr
+        return ar.do("array", arr, like=like)
+
+    def _pauli_operator(self, pauli, where):
+        """Return the dense Pauli operator (numpy) for ``pauli`` on ``where``."""
+        chars = [c for c in str(pauli).upper() if not c.isspace()]
+        if len(chars) != len(where):
+            raise ValueError(
+                f"pauli string {pauli!r} has {len(chars)} axes but where {where!r} "
+                f"has {len(where)} site(s)."
+            )
+        try:
+            op = _PAULI_1Q[chars[0]]
+            for axis in chars[1:]:
+                op = np.kron(op, _PAULI_1Q[axis])
+        except KeyError as exc:  # pragma: no cover - guarded by dict lookup
+            raise ValueError(f"unknown Pauli axis in {pauli!r}.") from exc
+        return op
+
+    def _apply_dense_operator(self, p, op, where, *, max_bond, cutoff, cutoff_mode, info=None):
+        """Apply a dense operator ``op`` on ``where`` sites of MPS ``p`` in place.
+
+        ``info`` is the canonicalization tracking dict; it defaults to
+        ``self.info_c`` for operations on ``self.p`` and should be an isolated
+        dict when acting on a throwaway copy so the tracked centre is preserved.
+        """
+        if info is None:
+            info = self._info_for_state(p)
+        where = tuple(int(site) for site in where)
+        op_b = self._to_state_backend(op)
+        if len(where) == 1:
+            self._apply_gate(
+                p,
+                op_b,
+                where,
+                contract=True,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                inplace=True,
+            )
+        else:
+            p.gate_nonlocal_(
+                op_b,
+                where,
+                dims=None,
+                max_bond=max_bond,
+                info=info,
+                method="direct",
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+        return p
+
+    def _state_expectation(self, pauli, where):
+        """Return the normalized expectation ``<P> = Re <psi|P|psi> / <psi|psi>``.
+
+        For MPS implementations exposing ``local_expectation_canonical``, move
+        the tracked orthogonality centre around the support and contract only
+        the local reduced density matrix. This keeps the cost proportional to
+        the support span rather than the full chain. The fallback preserves
+        compatibility with older Quimb versions without that method.
+        """
+        p = self.p
+        op = self._pauli_operator(pauli, where)
+        local_expectation = getattr(p, "local_expectation_canonical", None)
+        if callable(local_expectation):
+            return self._real_float(
+                local_expectation(
+                    op,
+                    tuple(int(site) for site in where),
+                    normalized=True,
+                    info=self.info_c,
+                    optimize=self.contraction_opt,
+                )
+            )
+
+        # Compatibility path for older Quimb releases without local MPS
+        # expectation support.
+        p_op = p.copy()
+        self._apply_dense_operator(
+            p_op, op, where, max_bond=None, cutoff=0.0, cutoff_mode="abs", info={}
+        )
+        overlap = (p.H & p_op).contract(
+            all, output_inds=(), optimize=self.contraction_opt
+        )
+        norm_sq = (p.H & p).contract(
+            all, output_inds=(), optimize=self.contraction_opt
+        )
+        norm_val = self._real_float(norm_sq)
+        if norm_val == 0.0:
+            return 0.0
+        return self._real_float(overlap) / norm_val
+
+    def _recanonize_center(self, site, *, renormalize):
+        """Move the orthogonality centre to ``site`` and track it exactly.
+
+        Canonicalizes from the currently tracked centre (never a blind scan) so
+        ``site`` becomes a single-site orthogonality centre, records it in
+        ``info_c``, and, when ``renormalize`` is set, rescales that centre tensor
+        to unit norm (its Frobenius norm equals the represented state norm).
+        """
+        site = int(site)
+        self.p.canonize([site], cur_orthog=self._current_orthog(self.p))
+        self.info_c["cur_orthog"] = (site, site)
+        if not renormalize:
+            return
+        center = self.p[self.p.site_tag(site)]
+        norm = self._real_float(center.norm())
+        if norm > 0.0:
+            center.modify(data=center.data / norm)
+        if hasattr(self.p, "exponent"):
+            self.p.exponent = 0.0
+
+    def _apply_measure_event(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+        self,
+        pauli,
+        where,
+        outcome,
+        *,
+        record_where=None,
+        renormalize,
+        cutoff,
+        cutoff_mode,
+    ):
+        """Measure Pauli ``pauli`` on ``where``, collapse, and record the result.
+
+        ``where`` is the execution location; ``record_where`` (defaulting to
+        ``where``) is the user-facing location stored in :attr:`measurements`.
+        """
+        if record_where is None:
+            record_where = where
+        exp = self._state_expectation(pauli, where)
+        p_plus = min(max(0.5 * (1.0 + exp), 0.0), 1.0)
+        if outcome is None:
+            m = 1 if self._rng.random() < p_plus else -1
+        else:
+            m = 1 if int(outcome) >= 0 else -1
+        prob = p_plus if m > 0 else (1.0 - p_plus)
+        if outcome is not None and prob < 1e-12:
+            raise ValueError(
+                f"forced measure outcome {outcome} has ~0 probability ({prob:.2e})."
+            )
+        op = self._pauli_operator(pauli, where)
+        dim = op.shape[0]
+        projector = 0.5 * (np.eye(dim, dtype=complex) + m * op)
+        # Move the orthogonality centre to the (anchor) collapse site so the
+        # projector acts at the centre and truncation/renormalization stay
+        # local and exactly tracked.
+        anchor = min(int(site) for site in where)
+        self.canonize_mps(self.p, anchor)
+        self._apply_dense_operator(
+            self.p,
+            projector,
+            where,
+            max_bond=self.chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+        )
+        self._recanonize_center(anchor, renormalize=renormalize)
+        self.measurements.append(
+            (str(pauli), tuple(int(site) for site in record_where), int(m), float(prob))
+        )
+        return m
+
+    def _apply_reset_event(self, where, *, cutoff, cutoff_mode):
+        """Reset each qubit in ``where`` to ``|0>`` (measure Z, flip if ``|1>``)."""
+        for site in where:
+            q = int(site)
+            exp = self._state_expectation("Z", (q,))
+            p_zero = min(max(0.5 * (1.0 + exp), 0.0), 1.0)
+            m = 1 if self._rng.random() < p_zero else -1
+            projector = (
+                np.array([[1, 0], [0, 0]], dtype=complex)
+                if m > 0
+                else np.array([[0, 0], [0, 1]], dtype=complex)
+            )
+            # Centre at q, collapse, renormalize, and (if needed) flip |1> -> |0>,
+            # keeping the tracked centre at q throughout.
+            self.canonize_mps(self.p, q)
+            self._apply_dense_operator(
+                self.p,
+                projector,
+                (q,),
+                max_bond=self.chi,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+            self._recanonize_center(q, renormalize=True)
+            if m < 0:
+                self._apply_dense_operator(
+                    self.p,
+                    _PAULI_1Q["X"],
+                    (q,),
+                    max_bond=self.chi,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                )
+                # A single-site gate at the centre keeps the centre at q.
+                self.info_c["cur_orthog"] = (q, q)
+        return self.p
+
+    def _apply_cap_event(self, where, vec, absorb):
+        """Contract site ``where``'s physical index with ``vec`` and shorten the MPS."""
+        (q,) = (int(site) for site in where)
+        p = self.p
+        L = int(p.L)
+        if not 0 <= q < L:
+            raise ValueError(
+                f"cap site {q} is outside the MPS range [0, {L})."
+            )
+        if L <= 1:
+            raise ValueError("cannot cap the only site of a length-1 MPS.")
+
+        vec_arr = np.asarray(vec, dtype=complex).ravel()
+        phys_ind = p.site_ind(q)
+        phys_dim = p.ind_size(phys_ind)
+        if vec_arr.shape[0] != phys_dim:
+            raise ValueError(
+                f"cap vector length {vec_arr.shape[0]} does not match the "
+                f"physical dimension {phys_dim} of site {q}."
+            )
+
+        site_ind_id = p.site_ind_id
+        site_tag_id = p.site_tag_id
+        if absorb == "left":
+            neighbour = q - 1 if q > 0 else q + 1
+        else:
+            neighbour = q + 1 if q < L - 1 else q - 1
+
+        # Move the orthogonality centre onto the absorbing neighbour first: the
+        # capped site is then an isometry adjacent to the centre, so merging it
+        # in leaves the centre exactly on the (renumbered) neighbour. This keeps
+        # the tracked centre exact without any rescan.
+        self.canonize_mps(p, neighbour)
+        new_center = neighbour if neighbour < q else neighbour - 1
+
+        cap_tensor = qtn.Tensor(self._to_state_backend(vec_arr), inds=(phys_ind,))
+        site_tensor = p[p.site_tag(q)]
+        neighbour_tensor = p[p.site_tag(neighbour)]
+        merged = qtn.tensor_contract(site_tensor, cap_tensor, neighbour_tensor)
+
+        p.delete(p.site_tag(q))
+        p.delete(p.site_tag(neighbour))
+        merged.modify(tags=(p.site_tag(neighbour),))
+        p |= merged
+
+        # Renumber every site above the removed one down by one position.
+        temp_reindex = {}
+        temp_retag = {}
+        for old in range(q + 1, L):
+            temp_reindex[site_ind_id.format(old)] = f"__pepsy_cap_k{old - 1}"
+            temp_retag[site_tag_id.format(old)] = f"__pepsy_cap_I{old - 1}"
+        if temp_reindex:
+            p.reindex_(temp_reindex)
+        if temp_retag:
+            p.retag_(temp_retag)
+        final_reindex = {
+            f"__pepsy_cap_k{i}": site_ind_id.format(i) for i in range(q, L - 1)
+        }
+        final_retag = {
+            f"__pepsy_cap_I{i}": site_tag_id.format(i) for i in range(q, L - 1)
+        }
+        if final_reindex:
+            p.reindex_(final_reindex)
+        if final_retag:
+            p.retag_(final_retag)
+
+        capped = p.view_as_(
+            qtn.MatrixProductState,
+            L=L - 1,
+            cyclic=False,
+            site_ind_id=site_ind_id,
+            site_tag_id=site_tag_id,
+        )
+        self.p = self._install_represented_norm(capped)
+        self.info_c["cur_orthog"] = (new_center, new_center)
+        return self.p
 
     def _validate_event_stream_for_run(self, G_seq, where_seq, event_seq):
         """Validate queued event metadata before replay."""
@@ -1258,7 +2482,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "payloads, wheres, and event types must have the same length."
             )
 
-        unknown = sorted(set(event_seq) - {"gate", "submpo"})
+        unknown = sorted(set(event_seq) - {"gate", "submpo"} - _CONTROL_EVENT_NAMES)
         if unknown:
             raise ValueError(f"Unknown MPS stream event type(s): {unknown!r}.")
 
@@ -1266,9 +2490,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if has_submpo and self.mode != "mpo":
             raise ValueError("subMPO stream events currently require mode='mpo'.")
 
+        has_cap = any(event_type == "cap" for event_type in event_seq)
         if not has_submpo:
             return
 
+        # ``cap`` events shorten the MPS mid-stream, so a static site-range
+        # check against the initial length is unreliable; those events are
+        # validated dynamically as they are applied.
         L = int(getattr(self.p, "L", 0))
         for step, (where, event_type) in enumerate(
             zip(where_seq, event_seq),
@@ -1280,6 +2508,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 raise ValueError(
                     f"subMPO event at step {step} has repeated site(s): {where!r}."
                 )
+            if has_cap:
+                continue
             out_of_range = [site for site in where if site < 0 or site >= L]
             if out_of_range:
                 raise ValueError(
@@ -1447,29 +2677,39 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         raise ValueError("where must be an int, (int,), or (int, int).")
 
     def _canonical_span_norm(self, p, where, *, fallback=True):
-        """Return the raw working-data norm without densifying wide spans.
+        """Return the raw norm from a single-site orthogonality center.
 
-        Normalization needs the norm of the current tensor data, excluding the
-        accumulated ``p.exponent`` scale. Contracting a canonical span into a
-        dense block can explode for long-range gates because the span retains
-        all physical legs, so use ``tn_norm``'s double-layer contraction instead.
+        The active span is deliberately canonicalized to one site rather than
+        contracted as an open multi-site block. Once the MPS is mixed
+        canonical around that site, the center tensor's Frobenius norm is the
+        represented norm of the raw working data and does not include
+        ``p.exponent``. ``p`` can be a target copy, so cached optimizer metadata
+        is used as a hint but is never updated for copies.
         """
-        _ = where, fallback
-        exponent = getattr(p, "exponent", None)
-        try:
-            if exponent is not None:
-                p.exponent = 0.0
-            mantissa, exponent_sq = tn_norm(
-                p,
-                contraction_opt=self.contraction_opt,
-                strip_exponent=True,
-            )
-            return ar.do("sqrt", ar.do("abs", mantissa)) * 10 ** (
-                float(exponent_sq) / 2.0
-            )
-        finally:
-            if exponent is not None:
-                p.exponent = exponent
+        requested_span = self._normalize_span(where)
+        state_info = self._info_for_state(p)
+        cached = state_info.get("cur_orthog", "calc")
+        if cached in ("calc", None):
+            if fallback:
+                current_span = requested_span
+            else:
+                current_span = self._normalize_span(p.calc_current_orthog_center())
+        else:
+            current_span = self._normalize_span(cached)
+
+        # A gate can enlarge the non-canonical region from the previous center
+        # to its support. Treat that union as the known current span, allowing
+        # Quimb to move either boundary without a center rescan.
+        current_span = (
+            min(current_span[0], requested_span[0]),
+            max(current_span[1], requested_span[1]),
+        )
+        center = int(requested_span[1])
+        if current_span != (center, center):
+            p.canonize([center], cur_orthog=current_span)
+
+        state_info["cur_orthog"] = (center, center)
+        return p[center].norm()
 
     @staticmethod
     def _norm_ratio_fidelity(approx_norm, target_norm):
@@ -1558,15 +2798,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
             return p_target
 
-        return self._apply_gate(
-            p_target,
+        if self._has_symmray_data(p_target):
+            return self._apply_gate(
+                p_target,
+                gate,
+                where,
+                contract="split-gate",
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                inplace=False,
+            )
+
+        p_target.gate_nonlocal_(
             gate,
             where,
-            contract="split-gate",
+            dims=self._infer_gate_dims(gate, where),
+            max_bond=None,
+            info={},
+            method="direct",
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            inplace=False,
         )
+        return p_target
 
     @staticmethod
     def _normalize_every_interval(normalize_every, non_unitary=False):
@@ -1590,9 +2843,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return True
 
     @staticmethod
-    def _normalization_insert_site(p, fallback_span):
+    def _normalization_insert_site(p, fallback_span, *, current_span=None):
         """Choose an insertion site inside ``fallback_span``."""
         span = MpsOptimizer._normalize_span(fallback_span)
+        if current_span is not None:
+            current = MpsOptimizer._normalize_span(current_span)
+            site = int(current[-1])
+            if span[0] <= site <= span[1]:
+                return site
+            return int(span[-1])
         try:
             lo, hi = p.calc_current_orthog_center()
             site = int(hi if hi is not None else lo)
@@ -1636,16 +2895,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Rescale tensors in the active orthogonality span and track exponent."""
         fallback_span = self._normalize_span(where)
+        state_info = self._info_for_state(p)
         if canonicalize:
-            span = self.canonize_mps(p, fallback_span)
+            span = self.canonize_mps(p, fallback_span, info=state_info)
         else:
             try:
-                span = self._current_orthog(p)
+                span = self._current_orthog(p, info=state_info)
             except Exception:  # pragma: no cover - defensive for quimb variants
                 span = fallback_span
             if not (span[0] <= fallback_span[0] and fallback_span[1] <= span[1]):
                 span = fallback_span
-                self.info_c["cur_orthog"] = span
+                state_info["cur_orthog"] = span
 
         sites = tuple(range(int(span[0]), int(span[1]) + 1))
         scaled_sites = []
@@ -1674,8 +2934,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not scaled_sites:
             return None
 
-        self.info_c["cur_orthog"] = span
-        insert = self._normalization_insert_site(p, span)
+        state_info["cur_orthog"] = span
+        insert = self._normalization_insert_site(p, span, current_span=span)
         event = {
             "step": int(step),
             "old_norm": self._event_old_norm_from_log10(2.0 * log10_total_scale),
@@ -1804,14 +3064,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     inplace=True,
                 )
             else:
-                p_g = self._apply_gate(
+                p_g = self._build_norm_target(
                     p_g,
                     gate,
                     where,
-                    contract="split-gate",
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    inplace=False,
+                    cutoff,
+                    cutoff_mode,
                 )
         return p_g
 
@@ -2019,6 +3277,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_every=None,
         normalize_final=True,
         normalize_eps=1e-15,
+        non_unitary=False,
         track_norm_infidelity=False,
         track_infidelity=False,
         record_fit_losses=True,
@@ -2062,6 +3321,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff_mode=cutoff_mode,
                     inplace=True,
                 )
+                if non_unitary:
+                    self.canonize_mps(p, where)
                 idx += 1
                 advanced = 1
                 last_where = where
@@ -2074,14 +3335,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     xmin, xmax = sorted(where)
                     self.canonize_mps(p, (xmin, xmax))
 
-                    p_g = self._apply_gate(
+                    p_g = self._build_norm_target(
                         p,
                         gate,
                         where,
-                        contract="split-gate",
-                        cutoff=cutoff,
-                        cutoff_mode=cutoff_mode,
-                        inplace=False,
+                        cutoff,
+                        cutoff_mode,
                     )
                     target_norm = (
                         self._canonical_span_norm(p_g, (xmin, xmax))
@@ -2100,6 +3359,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     fit.run_gate(n_iter=n_iter, verbose=False)
 
                     p = self._install_represented_norm(fit.p)
+                    self.p = p
+                    self._record_orthog_span(p, (xmin, xmax))
                     if record_fit_losses:
                         self.losses.append(self._real_float(fit.local_norm_trace[-1]))
                     if track_norm_infidelity:
@@ -2150,6 +3411,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     fit.run_gate(n_iter=n_iter, verbose=False)
 
                     p = self._install_represented_norm(fit.p)
+                    self.p = p
+                    self._record_orthog_span(p, (xmin, xmax))
                     if record_fit_losses:
                         self.losses.append(self._real_float(fit.local_norm_trace[-1]))
                     if track_norm_infidelity:
@@ -2214,6 +3477,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             last_normalized_step = idx
 
         self.p = self._install_represented_norm(p)
+        self._record_orthog_span(self.p, last_where)
 
     def _run_mpo(  # pylint: disable=too-many-locals
         self,
@@ -2227,6 +3491,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_every=None,
         normalize_final=True,
         normalize_eps=1e-15,
+        non_unitary=False,
         track_norm_infidelity=False,
         track_infidelity=False,
         submpo_method="direct",
@@ -2340,6 +3605,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff_mode=cutoff_mode,
                     inplace=True,
                 )
+                if non_unitary:
+                    self.canonize_mps(p, where)
                 idx += 1
                 advanced = 1
                 last_where = where
@@ -2464,8 +3731,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             last_normalized_step = idx
 
         self.p = self._install_represented_norm(p)
+        self._record_orthog_span(self.p, last_where)
 
-    def _run_swap(  # pylint: disable=too-many-locals
+    def _run_swap(self, *args, **kwargs):
+        """Apply gates with swap-network compression, swapping back."""
+        return self._run_swap_network(*args, swap_back=True, mode_name="swap", **kwargs)
+
+    def _run_perm(self, *args, **kwargs):
+        """Apply gates with lazy swap-network compression."""
+        return self._run_swap_network(*args, swap_back=False, mode_name="perm", **kwargs)
+
+    def _run_swap_network(  # pylint: disable=too-many-locals,too-many-arguments
         self,
         G_seq,
         where_seq,
@@ -2476,12 +3752,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_every=None,
         normalize_final=True,
         normalize_eps=1e-15,
+        non_unitary=False,
         track_norm_infidelity=False,
         track_infidelity=False,
+        *,
+        swap_back,
+        mode_name,
     ):
         """Apply gates with swap-network compression for nonlocal 2-site gates.
 
-        Uses in-place ``gate_with_auto_swap_`` for two-site gates.
+        Uses in-place ``gate_with_auto_swap_`` for two-site gates. When
+        ``swap_back`` is false, ``where_seq`` is interpreted as logical sites,
+        the current ``self.qubits`` mapping translates them to physical sites,
+        and the right endpoint remains at the left endpoint's neighbour.
         """
         p = self.p
         two_qubit_count = 0
@@ -2505,17 +3788,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
             pbar = tqdm(
                 total=len(G_seq),
-                desc="swap",
+                desc=mode_name,
                 leave=True,
                 position=0,
                 ascii=True,
-                colour=self._PROGBAR_COLORS["swap"],
+                colour=self._PROGBAR_COLORS[mode_name],
             )
 
         idx = 0
         while idx < len(G_seq):
             compressed = False
-            where = where_seq[idx]
+            logical_where = where_seq[idx]
+            where = (
+                tuple(int(site) for site in logical_where)
+                if swap_back
+                else self._logical_to_physical_where(logical_where)
+            )
             gate = G_seq[idx]
             if len(where) == 1:
                 self._apply_gate(
@@ -2527,6 +3815,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff_mode=cutoff_mode,
                     inplace=True,
                 )
+                if non_unitary:
+                    self.canonize_mps(p, where)
                 idx += 1
                 advanced = 1
                 last_where = where
@@ -2558,9 +3848,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     where,
                     info=self.info_c,
                     max_bond=self.chi,
-                    swap_back=True,
+                    swap_back=swap_back,
                     **compress_opts,
                 )
+                if not swap_back:
+                    self._record_permutation_move(where)
 
                 idx += 1
                 advanced = 1
@@ -2627,6 +3919,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             last_normalized_step = idx
 
         self.p = self._install_represented_norm(p)
+        self._record_orthog_span(self.p, last_where)
 
     def _run_svd(  # pylint: disable=too-many-locals
         self,
@@ -2639,6 +3932,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_every=None,
         normalize_final=True,
         normalize_eps=1e-15,
+        non_unitary=False,
         track_norm_infidelity=False,
         track_infidelity=False,
     ):
@@ -2693,6 +3987,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff_mode=cutoff_mode,
                     inplace=True,
                 )
+                if non_unitary:
+                    self.canonize_mps(p, where)
                 idx += 1
                 advanced = 1
                 last_where = where
@@ -2822,6 +4118,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             last_normalized_step = idx
 
         self.p = self._install_represented_norm(p)
+        self._record_orthog_span(self.p, last_where)
 
     def _run_exact(  # pylint: disable=too-many-locals
         self,
@@ -2838,6 +4135,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """
         self.p = self.p.contract(all, optimize="auto-hq")
         self.p = self._install_represented_norm(qtn.TensorNetwork([self.p]))
+        self.info_c = {}
         p = self.p
         two_qubit_count = 0
         # Keep parameter for API compatibility; exact mode does not sample fidelity.
@@ -2890,7 +4188,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.p = self._install_represented_norm(p)
 
-    def canonize_mps(self, p, where):
+    def canonize_mps(self, p, where, *, info=None):
         """Update canonical form around a one- or two-site gate span.
 
         ``where`` may be an int, a 1-tuple ``(site,)``, or a 2-tuple
@@ -2913,9 +4211,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         else:
             raise ValueError("where must be an int, (int,), or (int, int).")
 
-        p.canonize(where_canon, cur_orthog=self._current_orthog(p))
+        state_info = self._info_for_state(p, info)
+        p.canonize(
+            where_canon,
+            cur_orthog=self._current_orthog(p, info=state_info),
+        )
         # Preserve the fitting-window semantics expected by gate updates.
-        self.info_c["cur_orthog"] = target_orthog
+        state_info["cur_orthog"] = target_orthog
         return target_orthog
 
     def get_fidelities(self):

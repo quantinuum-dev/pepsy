@@ -1254,7 +1254,12 @@ class MpsGateStreamLayoutFinder:
 
     @classmethod
     def from_optimizer(cls, optimizer, *, sites=None, L=None):
-        """Construct from an optimizer's queued stream without mutating it."""
+        """Construct from an optimizer's queued stream without mutating it.
+
+        Control events (measure/cap/reset) do not constrain gate locality, so
+        they are omitted from the layout search; every site is still covered
+        through ``L``/``sites`` so the resulting plan is a full permutation.
+        """
         if sites is None and L is None:
             L = getattr(optimizer.p, "L", None)
         stream = []
@@ -1265,8 +1270,10 @@ class MpsGateStreamLayoutFinder:
         ):
             if event_type == "submpo":
                 stream.append(("submpo", payload, where))
-            else:
+            elif event_type == "gate":
                 stream.append((payload, where))
+            # measure/cap/reset control events are skipped: they do not change
+            # the optimal gate layout.
         return cls(stream, sites=sites, L=L)
 
     def run(

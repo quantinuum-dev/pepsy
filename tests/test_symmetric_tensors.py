@@ -1834,7 +1834,7 @@ def test_symmps_mps_optimizer_coerces_dense_hamiltonian_terms():
 
 
 @pytest.mark.parametrize("case_name", ["itf_z2", "xy_u1", "fermi_hubbard_u1"])
-@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "svd", "exact"])
+@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "perm", "svd", "exact"])
 def test_symmps_mps_optimizer_3x3_streams_cover_supported_modes(case_name, mode):
     """Explicit 3x3 Symmray streams should run through supported MPS modes."""
     state, hamiltonian, gates, non_unitary, expected_charge = _build_3x3_symmray_mps_case(
