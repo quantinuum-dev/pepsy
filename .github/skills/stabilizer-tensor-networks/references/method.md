@@ -180,7 +180,11 @@ This proxy is not an exact overlap fidelity and must not be used for arbitrary n
 evolution, where changing norm is physical. Such updates, including coefficient-frame
 `submpo` events whose unitarity is unspecified, emit no sample and invalidate the current
 segment. A normalized projective collapse establishes a new unit-norm baseline without
-reporting the projection itself as infidelity.
+appending to `.infidelities`, but Pepsy records a separate `.norm_events` boundary:
+`pre_norm_sq`, the physical Born `branch_probability`, the actual `projected_norm_sq`
+before renormalization, and `projector_infidelity = 1 - projected_norm_sq /
+(pre_norm_sq * branch_probability)` when the denominator is nonzero. This separates
+projector-compression loss from measurement probability.
 
 ## Resource / cost facts
 - Free operations: all Clifford gates + non-Clifford ops satisfying Corollary 2.1.

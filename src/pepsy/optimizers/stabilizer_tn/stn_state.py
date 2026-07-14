@@ -63,6 +63,29 @@ def _validate_bits(bits, *, expected_length=None):
     return values
 
 
+def _validate_qubit_mps(p):
+    """Return the number of sites in ``p``, requiring qubit physical legs."""
+    if not hasattr(p, "L"):
+        raise TypeError("coefficient state must be a qubit MatrixProductState.")
+    n = int(p.L)
+    if n < 1:
+        raise ValueError("coefficient MPS must have at least one qubit site.")
+    for q in range(n):
+        try:
+            phys_ind = p.site_ind(q)
+            phys_dim = p.ind_size(phys_ind)
+        except Exception as exc:  # pragma: no cover - guards MPS-like API changes
+            raise TypeError(
+                "coefficient state must expose quimb MPS site indices and sizes."
+            ) from exc
+        if int(phys_dim) != 2:
+            raise ValueError(
+                "coefficient MPS must have physical dimension 2 at every site; "
+                f"site {q} has dimension {phys_dim}."
+            )
+    return n
+
+
 class STNState:
     """A stabilizer tensor-network state.
 
@@ -153,7 +176,7 @@ class STNState:
         and ``p`` a quimb MPS coefficient state.  Both must describe the same
         number of qubits/sites; the state represents ``|psi> = C p``.
         """
-        n = int(p.L)
+        n = _validate_qubit_mps(p)
         sim_n = int(sim.num_qubits)
         if sim_n != n:
             raise ValueError(

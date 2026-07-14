@@ -10,6 +10,7 @@ bond-dimension-2 MPO, built here.
 from __future__ import annotations
 
 import itertools
+from collections.abc import Mapping
 from typing import List, Sequence, Tuple
 
 import numpy as np
@@ -230,5 +231,76 @@ def pauli_combo_submpo(
             t[1, 1] = pmat
         arrays.append(t.astype(dtype))
     where = tuple(range(lo, hi + 1))
+    mpo = qtn.MatrixProductOperator(arrays, sites=where, L=L, shape="lrud")
+    return mpo, where
+
+
+def pauli_sum_submpo(
+    weighted_terms: Sequence[Tuple[complex, Mapping[int, str]]],
+    L: int,
+    *,
+    dtype: str = "complex128",
+):
+    """Windowed sub-MPO for a sparse sum of coefficient-frame Pauli strings.
+
+    ``weighted_terms`` is an iterable of ``(weight, terms)`` pairs where
+    ``terms`` maps ``site -> 'X'/'Y'/'Z'``. Identity factors are implicit. If
+    there are ``r`` product-string branches, the returned exact MPO has bond
+    dimension at most ``r`` and spans only the contiguous support window.
+
+    Returns
+    -------
+    (MatrixProductOperator, tuple[int])
+        The sub-MPO and its contiguous support window.
+    """
+    terms = []
+    for weight, sites in weighted_terms:
+        clean = {}
+        for site, axis in sites.items():
+            site = int(site)
+            if not 0 <= site < L:
+                raise ValueError(f"Pauli term site {site} is outside [0, {L}).")
+            axis = str(axis).upper()
+            if axis == "I":
+                continue
+            if axis not in _PAULI:
+                raise ValueError(f"invalid Pauli axis {axis!r}.")
+            clean[site] = axis
+        terms.append((complex(weight), clean))
+    if not terms:
+        raise ValueError("pauli_sum_submpo requires at least one term.")
+
+    support = sorted({site for _, sites in terms for site in sites})
+    if support:
+        lo, hi = support[0], support[-1]
+    else:  # pure scalar times identity; place it on site 0.
+        lo = hi = 0
+    where = tuple(range(lo, hi + 1))
+    width = len(where)
+
+    if width == 1:
+        q = where[0]
+        op = sum(weight * _PAULI[sites.get(q, "I")] for weight, sites in terms)
+        mpo = qtn.MatrixProductOperator(
+            [op.astype(dtype)], sites=where, L=L, shape="lrud"
+        )
+        return mpo, where
+
+    rank = len(terms)
+    arrays = []
+    for j, site in enumerate(where):
+        if j == 0:
+            tensor = np.zeros((rank, 2, 2), dtype=complex)  # (right, up, down)
+            for r, (weight, sites) in enumerate(terms):
+                tensor[r] = weight * _PAULI[sites.get(site, "I")]
+        elif j == width - 1:
+            tensor = np.zeros((rank, 2, 2), dtype=complex)  # (left, up, down)
+            for r, (_, sites) in enumerate(terms):
+                tensor[r] = _PAULI[sites.get(site, "I")]
+        else:
+            tensor = np.zeros((rank, rank, 2, 2), dtype=complex)
+            for r, (_, sites) in enumerate(terms):
+                tensor[r, r] = _PAULI[sites.get(site, "I")]
+        arrays.append(tensor.astype(dtype))
     mpo = qtn.MatrixProductOperator(arrays, sites=where, L=L, shape="lrud")
     return mpo, where

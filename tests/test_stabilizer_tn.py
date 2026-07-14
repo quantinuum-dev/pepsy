@@ -149,6 +149,12 @@ def _apply_gate_dense(psi, u, where, n):
     return t.reshape(-1)
 
 
+def _cap_dense(psi, vec, where, n):
+    """Contract a qubit leg with ``vec`` and remove it from a dense state."""
+    tensor = psi.reshape([2] * n)
+    return np.tensordot(tensor, np.asarray(vec, dtype=complex), axes=([where], [0])).reshape(-1)
+
+
 def _dense_reference(n, stream):
     """Dense statevector after applying a named gate stream to |0...0>."""
     psi = np.zeros(2 ** n, dtype=complex)
@@ -217,6 +223,64 @@ def test_disentangle_stream_event_preserves_following_physical_gate_order():
     assert _fidelity(sim.to_statevector(), expected) == pytest.approx(1.0, abs=1e-12)
     assert sim.infidelities == []
     assert len(sim.bond_history) == 3
+
+
+def test_static_frame_layout_uses_dynamic_tableau_support():
+    sim = MpsStabOptimizer(3)
+    sim.set_gates([("cnot", 0, 2), ("rz", 0.4, 2)])
+
+    plan = sim.current_frame_layout(order="auto")
+
+    assert plan["kind"] == "stn_frame_layout"
+    assert plan["frame_events"][0]["support"] == (0, 2)
+    pos = plan["site_map"]
+    assert abs(pos[0] - pos[2]) == 1
+    assert plan["input_stats"]["max_event_span"] == 2
+    assert plan["stats"]["max_event_span"] == 1
+
+
+def test_static_frame_layout_run_matches_unlaid_reference():
+    stream = [
+        ("h", 0),
+        ("cnot", 0, 2),
+        ("rz", 0.37, 2),
+        ("rx", -0.22, 1),
+        ("rzz", 0.19, 0, 1),
+    ]
+    ref = MpsStabOptimizer(3).apply(stream)
+    laid = MpsStabOptimizer(3, stream, layout="auto", layout_report=False).run()
+
+    assert laid.logical_order != [0, 1, 2]
+    assert _fidelity(laid.to_statevector(), ref.to_statevector()) == pytest.approx(
+        1.0, abs=1e-12
+    )
+
+
+def test_static_frame_layout_absorb_measure_matches_reference():
+    stream = [("h", 0), ("cnot", 0, 2), ("rz", 0.37, 2), ("ry", 0.41, 1)]
+    ref = MpsStabOptimizer(3).apply(stream)
+    laid = (
+        MpsStabOptimizer(3)
+        .set_gates(stream)
+        .apply_layout([2, 0, 1], layout_report=False)
+        .run()
+    )
+
+    m_ref = ref.measure("Z", 2, outcome=+1, absorb_basis=True)
+    m_laid = laid.measure("Z", 2, outcome=+1, absorb_basis=True)
+
+    assert m_laid == m_ref
+    assert _fidelity(laid.to_statevector(), ref.to_statevector()) == pytest.approx(
+        1.0, abs=1e-12
+    )
+
+
+def test_static_frame_layout_rejects_entangled_coefficient_mps():
+    sim = _coefficient_bell_optimizer()
+    sim.set_gates([("rz", 0.2, 0)])
+
+    with pytest.raises(ValueError, match="product coefficient MPS"):
+        sim.apply_layout([1, 0], layout_report=False)
 
 
 def test_simulator_single_nonclifford_rotations_match_dense():
@@ -394,10 +458,115 @@ def test_norm_infidelity_excludes_nonunitary_segments():
     # metric. Subsequent unitary compression can be tracked again.
     sim.measure("Z", 0, outcome=+1)
     assert sim.infidelities == []
+    assert sim.norm_events[-1]["valid"] is False
+    assert sim.norm_diagnostics()["completed_segments"] == 0
     sim.apply([("rxx", 0.8, 0, 1)])
     assert len(sim.infidelities) == 1
     assert sim.infidelities[-1] == pytest.approx(
         1.0 - sim.norm() ** 2, abs=1e-10
+    )
+
+
+def test_norm_events_close_segment_before_measurement_normalizes_after():
+    rng = np.random.default_rng(2)
+    n = 6
+    stream = []
+    for q in range(n):
+        stream.append(("h", q))
+    for _ in range(20):
+        a, b = rng.choice(n, size=2, replace=False)
+        stream.append(("cnot", int(a), int(b)))
+        stream.append(("rz", float(rng.uniform(0.2, 1.2)), int(rng.integers(n))))
+
+    sim = MpsStabOptimizer(n, chi=4, track_infidelity=True).apply(stream)
+    pre_loss = sim.infidelities[-1]
+    pre_norm = sim.norm()
+
+    sim.measure("Z", 0)
+
+    assert sim.infidelities[-1] == pytest.approx(pre_loss)
+    assert sim.norm() == pytest.approx(1.0, abs=1e-10)
+    event = sim.norm_events[-1]
+    assert event["kind"] == "measure"
+    assert event["valid"] is True
+    assert event["pre_norm"] == pytest.approx(pre_norm, abs=1e-10)
+    assert event["pre_norm_sq"] == pytest.approx(pre_norm ** 2, abs=1e-10)
+    assert event["segment_infidelity"] == pytest.approx(pre_loss, abs=1e-10)
+    assert 0.0 <= event["branch_probability"] <= 1.0
+    assert event["expected_projected_norm_sq"] == pytest.approx(
+        event["pre_norm_sq"] * event["branch_probability"], abs=1e-10
+    )
+    assert event["projected_norm_sq"] == pytest.approx(
+        event["projected_norm"] ** 2, abs=1e-10
+    )
+    assert event["projector_survival"] == pytest.approx(
+        min(
+            1.0,
+            event["projected_norm_sq"] / event["expected_projected_norm_sq"],
+        ),
+        abs=1e-10,
+    )
+    assert event["post_norm"] == pytest.approx(1.0, abs=1e-10)
+
+    diagnostics = sim.norm_diagnostics()
+    assert diagnostics["completed_segments"] == 1
+    assert diagnostics["segments_including_current"] == 1
+    expected_total_survival = pre_norm ** 2 * event["projector_survival"]
+    assert diagnostics["total_survival_proxy"] == pytest.approx(
+        expected_total_survival
+    )
+    assert diagnostics["total_infidelity_proxy"] == pytest.approx(
+        1.0 - expected_total_survival
+    )
+    assert diagnostics["geometric_mean_norm"] == pytest.approx(
+        expected_total_survival ** 0.5
+    )
+
+
+def test_norm_events_mark_reset_boundaries():
+    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True).apply(
+        [("rxx", 0.8, 0, 1)]
+    )
+    pre_loss = sim.infidelities[-1]
+
+    sim.reset(0)
+
+    assert sim.norm() == pytest.approx(1.0, abs=1e-10)
+    event = sim.norm_events[-1]
+    assert event["kind"] == "reset"
+    assert event["valid"] is True
+    assert event["segment_infidelity"] >= pre_loss - 1e-10
+    assert event["projector_survival"] is not None
+    assert event["post_norm"] == pytest.approx(1.0, abs=1e-10)
+
+
+def test_norm_events_track_projector_compression_loss_separately():
+    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True)
+
+    sim.measure("XX", (0, 1), outcome=+1)
+
+    event = sim.norm_events[-1]
+    assert event["kind"] == "measure"
+    assert event["segment_infidelity"] == pytest.approx(0.0, abs=1e-12)
+    assert event["branch_probability"] == pytest.approx(0.5, abs=1e-12)
+    assert event["expected_projected_norm_sq"] == pytest.approx(0.5, abs=1e-12)
+    assert 0.0 < event["projected_norm_sq"] < event["expected_projected_norm_sq"]
+    assert 0.0 < event["projector_survival"] < 1.0
+    assert event["projector_infidelity"] == pytest.approx(
+        1.0 - event["projector_survival"]
+    )
+    assert sim.norm() == pytest.approx(1.0, abs=1e-10)
+
+    diagnostics = sim.norm_diagnostics()
+    assert diagnostics["completed_segment_infidelities"] == pytest.approx([0.0])
+    assert diagnostics["completed_projector_infidelities"] == pytest.approx(
+        [event["projector_infidelity"]]
+    )
+    assert diagnostics["total_survival_proxy"] == pytest.approx(
+        event["projector_survival"]
+    )
+    assert diagnostics["total_infidelity_proxy"] == pytest.approx(
+        event["projector_infidelity"]
     )
 
 
@@ -409,6 +578,48 @@ def test_simulator_two_qubit_nonclifford_matrix_supported():
     sim.apply([(u, (0, 1))])
     ref = _apply_gate_dense(psi, u, (0, 1), 3)
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_sparse_dense_matrix_uses_submpo_instead_of_branch_sum(monkeypatch):
+    import pepsy.optimizers.stabilizer_tn.mps_stab_optimizer as optimizer_module
+
+    xx = np.kron(_X, _X)
+    yy = np.kron(_Y, _Y)
+    zz = np.kron(_Z, _Z)
+    gate = (
+        0.41 * np.eye(4, dtype=complex)
+        - 0.23j * xx
+        + 0.17 * yy
+        + 0.11j * zz
+    )
+    sim = MpsStabOptimizer(4).apply([("h", 0), ("cnot", 0, 2), ("t", 3)])
+    before = sim.to_statevector()
+    calls = []
+    original = optimizer_module.pauli_sum_submpo
+
+    def spy_pauli_sum_submpo(branches, *args, **kwargs):
+        calls.append(tuple(branches))
+        return original(branches, *args, **kwargs)
+
+    def forbid_branch_sum(self, branches, *, unitary):
+        raise AssertionError("sparse Pauli sum should use the sub-MPO fast path")
+
+    monkeypatch.setattr(optimizer_module, "pauli_sum_submpo", spy_pauli_sum_submpo)
+    monkeypatch.setattr(
+        optimizer_module.MpsStabOptimizer,
+        "_apply_operator_sum",
+        forbid_branch_sum,
+    )
+
+    sim.apply([(gate, (0, 2))])
+
+    expected = _apply_gate_dense(before, gate, (0, 2), 4)
+    actual = sim.to_statevector()
+    assert calls and len(calls[0]) == 4
+    assert _fidelity(actual, expected) == pytest.approx(1.0, abs=1e-6)
+    assert np.linalg.norm(actual) == pytest.approx(
+        np.linalg.norm(expected), rel=1e-8
+    )
 
 
 def test_three_qubit_dense_matrix_explicit_opt_in_balanced_sum_matches_dense():
@@ -550,11 +761,26 @@ def test_pauli_decomposition_budget_validation(value, error):
 
 
 def test_copy_preserves_pauli_decomposition_budget():
-    sim = MpsStabOptimizer(2, max_pauli_decomposition_qubits=None)
+    sim = MpsStabOptimizer(
+        2,
+        max_pauli_decomposition_qubits=None,
+        max_dense_cap_qubits=None,
+    )
     copied = sim.copy()
 
     assert copied.max_pauli_decomposition_qubits is None
+    assert copied.max_dense_cap_qubits is None
     assert "max_pauli_decomposition_qubits=None" in repr(copied)
+    assert "max_dense_cap_qubits=None" in repr(copied)
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [(-1, ValueError), (1.5, TypeError), (True, TypeError)],
+)
+def test_dense_cap_budget_validation(value, error):
+    with pytest.raises(error, match="max_dense_cap_qubits"):
+        MpsStabOptimizer(1, max_dense_cap_qubits=value)
 
 
 def test_zero_operator_produces_valid_zero_mps():
@@ -877,6 +1103,38 @@ def test_initial_state_from_bits():
     assert sim.state.max_bond() == 1
 
 
+def test_constructor_accepts_computational_basis_mps_directly():
+    rng = np.random.default_rng(12)
+    psi = rng.normal(size=8) + 1j * rng.normal(size=8)
+    psi = psi / np.linalg.norm(psi)
+    p = qtn.MatrixProductState.from_dense(psi, dims=[2, 2, 2])
+
+    sim = MpsStabOptimizer(p, chi=None, inplace=False)
+
+    assert sim.state.p is not p
+    assert _fidelity(sim.to_statevector(), psi) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_direct_mps_constructor_uses_identity_tableau_for_later_cliffords():
+    rng = np.random.default_rng(13)
+    psi = rng.normal(size=4) + 1j * rng.normal(size=4)
+    psi = psi / np.linalg.norm(psi)
+    p = qtn.MatrixProductState.from_dense(psi, dims=[2, 2])
+    expected = _apply_gate_dense(psi, _H, (0,), 2)
+
+    sim = MpsStabOptimizer.from_mps(p, chi=None).apply([("h", 0)])
+
+    assert _fidelity(sim.to_statevector(), expected) == pytest.approx(1.0, abs=1e-6)
+    assert sim.state.p is p
+
+
+def test_direct_mps_constructor_rejects_non_qubit_physical_dim():
+    p = qtn.MatrixProductState.from_dense(np.ones(3, dtype=complex), dims=[3])
+
+    with pytest.raises(ValueError, match="physical dimension 2"):
+        MpsStabOptimizer(p)
+
+
 @pytest.mark.parametrize("bits", ["102", [0, 2], [0.0, 1.0]])
 def test_bit_inputs_must_be_binary_integers(bits):
     with pytest.raises(ValueError, match="0 or 1"):
@@ -1154,6 +1412,50 @@ def test_reset_stream_entry_resets_to_zero():
     assert sim.probability("000") + sim.probability("110") == pytest.approx(1.0, abs=1e-6)
     # reset is not recorded as a measurement
     assert sim.measurements == []
+
+
+@pytest.mark.parametrize("axis", ["X", "Y", "Z"])
+def test_reset_stream_entry_supports_pauli_bases(axis):
+    sim = MpsStabOptimizer(1).apply([("h", 0), ("reset", 0, axis)])
+
+    assert sim.expectation(axis, 0) == pytest.approx(1.0, abs=1e-9)
+    assert sim.measurements == []
+
+
+@pytest.mark.parametrize(
+    ("axis", "bits", "outcome"),
+    [("Z", "1", -1), ("X", "0", -1), ("Y", "0", -1)],
+)
+def test_measure_reset_stream_entry_records_then_resets(axis, bits, outcome):
+    sim = MpsStabOptimizer.from_bits(bits).apply(
+        [("measure_reset", axis, 0, outcome)]
+    )
+
+    assert sim.measurements == [(axis, 0, outcome)]
+    assert sim.expectation(axis, 0) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_cap_stream_entry_contracts_physical_qubit_and_shortens():
+    n = 3
+    sim = MpsStabOptimizer(n, chi=None).apply(
+        [("h", 0), ("cnot", 0, 1), ("ry", 0.4, 2)]
+    )
+    before = sim.to_statevector()
+    vec = np.array([1.0, 1.0], dtype=complex)
+    expected = _cap_dense(before, vec, 1, n)
+
+    sim.apply([("cap", 1, vec)])
+
+    assert sim.n == 2
+    np.testing.assert_allclose(sim.to_statevector(), expected, atol=1e-10)
+    assert sim.bond_history[-1] == sim.state.max_bond()
+
+
+def test_cap_stream_entry_obeys_dense_qubit_guard():
+    sim = MpsStabOptimizer(3, max_dense_cap_qubits=2)
+
+    with pytest.raises(ValueError, match="max_dense_cap_qubits"):
+        sim.apply([("cap", 0, [1.0, 1.0])])
 
 
 def test_reset_multiqubit_and_disentangles():

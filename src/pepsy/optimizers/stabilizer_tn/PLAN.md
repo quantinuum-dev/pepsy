@@ -115,11 +115,16 @@ new simulator features.
 - Unitary truncation diagnostics use the cumulative coefficient-norm loss
   `1 - ||nu||^2`, evaluated from the tracked one-site canonical centre. This
   avoids uncapped target copies and overlap contractions. Non-unitary and
-  projective updates emit no infidelity sample; projective normalization starts
-  a fresh unitary segment. The trace is sparse, is not aligned with
-  `bond_history`, and must not be summed or interpreted as exact overlap
-  fidelity/discarded-SVD weight. Coefficient-frame sub-MPOs invalidate the
-  proxy because their event API does not certify unitarity.
+  projective updates emit no `.infidelities` sample; projective normalization
+  starts a fresh unitary segment. Measurement/reset boundaries are preserved in
+  `.norm_events`: pre-collapse norm, Born branch probability, actual projected
+  norm before normalization, and `projector_infidelity` for MPS compression
+  incurred by the projector itself. `norm_diagnostics()` combines unitary and
+  projector-compression survival factors, not measurement probabilities. The
+  traces are sparse, not aligned with `bond_history`, and must not be summed or
+  interpreted as exact overlap fidelity/discarded-SVD weight.
+  Coefficient-frame sub-MPOs invalidate the proxy because their event API does
+  not certify unitarity.
 
 ### Remaining priorities from the review
 
@@ -318,6 +323,12 @@ can be spread/non-contiguous, and it changes as Clifford gates accumulate. So th
 Options, in order of value:
 - Reduce spread at the source with the **R2 Clifford disentangling sweep** (absorb a
   2-qubit Clifford into `C` to localize/shrink the current `M`) — the principled fix.
+- **Static frame auto-layout: DONE (first cut)** — `apply_layout("auto")` /
+  `current_frame_layout(...)` dry-run the queued Clifford/basis-update skeleton,
+  collect weighted coefficient-frame supports `C^dag O C`, and install an MPS
+  order that shortens those dynamic supports. The installer is exact only while
+  `|nu>` is product (`state.max_bond() == 1`); physical qubit/tableau labels
+  stay stable while coefficient-frame operations are mapped through the layout.
 - Center the multi-qubit rotation on the innermost affected `|nu>` site (paper Fig. 4)
   and/or adapt the TN geometry to connectivity to hit the `4·chi` (not `16·chi`) bound.
 - A dynamic per-step layout: permute `|nu>` sites (= relabel destabilizer generators,

@@ -65,6 +65,13 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 - An unnormalized non-unitary matrix or coefficient-frame `submpo` invalidates the proxy,
   so later unitaries remain unreported. A normalized projective collapse starts a fresh
   segment at zero but does not itself append a sample.
+- Projective measurement/reset boundaries are recorded separately in `.norm_events`.
+  Each event snapshots the pre-collapse unitary segment norm, the physical Born branch
+  probability, the actual projected norm before renormalization, and the post-normalized
+  norm. Compare `projected_norm_sq` to `pre_norm_sq * branch_probability` to get the
+  projector-compression proxy `projector_infidelity`. Use `norm_diagnostics()` for
+  product/geometric summaries that multiply unitary and projector compression-survival
+  factors, but never measurement probabilities.
 - Keep `.bond_history` independent from `.infidelities`; their indices are not aligned.
 - Remember the limitation: norm loss detects compression that removes norm, but it is not
   a proof of state fidelity and cannot detect every norm-preserving directional error.
@@ -181,7 +188,9 @@ invariant at every intermediate step.
 4. **Maintain numerical state.** Thread the `info` orthogonality-centre tracker through
    quimb splitting/canonicalization calls. Preserve the configured backend for MPS-side
    arrays. Normalize projective collapse, but do not normalize unitary evolution or
-   arbitrary non-unitary gates. Report norm loss only across normalized unitary segments.
+   arbitrary non-unitary gates. Report norm loss only across normalized unitary segments;
+   if a projector is compressed before normalization, record that projector-survival
+   factor separately from the Born probability.
 5. **Validate the physical state.** For small `n`, compare `C @ p_dense` with an independent
    dense circuit up to global phase. Compare Clifford-only behavior with stim. Test exact
    `chi=None` first, then a bounded-`chi` path and backend variants when touched.

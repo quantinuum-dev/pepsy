@@ -17,7 +17,8 @@ Clifford update rule (which changes only the basis, leaving ``|nu>``
 unchanged), and :class:`MpsStabOptimizer`, an :class:`pepsy.MpsOptimizer`-style
 gate-stream simulator supporting Clifford gates, non-Clifford Pauli rotations,
 explicit gate matrices, sub-MPO events, Pauli measurements (fixed-basis and
-basis-updating), mid-circuit reset, and magic-state injection.
+basis-updating), basis-aware mid-circuit reset / measure-reset, guarded physical
+cap events, and magic-state injection.
 """
 
 from .mps_stab_optimizer import MpsStabOptimizer
