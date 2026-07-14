@@ -41,8 +41,12 @@ active research frontier.**
   (2026), arXiv:2510.05647. Loop **cluster** expansion (NLCE-style): product /
   sum of **exact contractions of growing loopy regions**, inclusion-exclusion
   counting numbers. *Simplifies GBP by avoiding generalized messages.*
-  **Convergence-robust**: messages only close each region's boundary, so it
-  reaches exact with cluster size for **any** message state. **[quimb**
+  **Convergence-robust** in the finite-cluster sense: messages only close each
+  region's boundary, so a system-covering cluster is exact and independent of
+  the boundary messages.  The formal BP loop-cluster cancellations and
+  tree/dangling reductions, however, assume fixed-point BP messages; arbitrary
+  or unconverged messages should be interpreted as a boundary-closure cluster
+  approximation and checked by sweeping cluster size. **[quimb**
   `contract_gloop_expand`; **pepsy** `loop_cluster_expand` **]**.
 - **Midha, Zhang**, *Beyond Belief Propagation: Cluster-Corrected Tensor Network
   Contraction with Exponential Convergence*, arXiv:2510.02290 (2025). Expands
@@ -82,6 +86,18 @@ realization of the same "regions beyond BP" idea.
 - **Tindall, Fishman**, *Gauging tensor networks with belief propagation*,
   SciPost Phys. **15**, 222 (2023). BP messages ↔ TN gauge; the practical
   BP-gauging recipe.
+- **Implementation note.** quimb also exposes simple-update gauge cluster
+  helpers such as `TensorNetworkGenVector.norm_gloop_expand(gauges=...)`.
+  Those helpers use supplied SU/simple gauges as cluster-boundary data and do
+  **not** run BP inside the cluster call.  As Gray emphasized, once simple
+  gauges are converged for the same closed scalar/norm tensor network, they are
+  BP/super-orthogonal fixed-point gauges up to message-gauge normalization, so
+  tree-like regions are trivial and dangling/tree reductions are valid.  If the
+  gauges are unconverged or borrowed from a different projected network, read
+  the result as a gauge-boundary approximation and check by BP residual or
+  cluster-size sweep.  The quimb issue found here was instead an `nfactor`
+  normalization bug: `normalize_simple(gauges)` already returns the norm
+  scaling, so `norm_gloop_expand` should not square-root that factor again.
 - **Guo, Poletti, Arad**, *Block belief propagation algorithm for two-dimensional
   tensor networks*, Phys. Rev. B **108**, 125111 (2023).
 - **Pancotti, Gray**, *One-step replica symmetry breaking in the language of

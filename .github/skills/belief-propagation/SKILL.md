@@ -37,6 +37,10 @@ annotated paper trail lives in [`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy
   messages, run_bp, max_iterations, tol, damping, ...) -> LoopClusterResult` —
   loop **cluster** expansion (quimb `contract_gloop_expand`). `.expand(gloops)`
   reuses the converged messages; `.messages` exposes them.
+- SU/simple-gauge bridge helpers: `simple_update_messages_from_gauges`,
+  `d1bp_from_simple_update_gauges`, `run_d1bp_from_simple_update_gauges`,
+  `simple_update_bp_residual`, and `norm1_gloop_expand`. Use these for
+  scalar 1-norm cluster work with externally supplied simple gauges.
 - Result dataclasses: `RelayBPResult` (`.bp`, `.converged`, `.iterations`,
   `.max_mdiff`, `.contract()`, `.messages`, `.snapshot()`), `LoopClusterResult`
   (`.estimate`, `.bp_converged`, `.bp_iterations`, `.expand()`, `.messages`).
@@ -63,10 +67,11 @@ annotated paper trail lives in [`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy
 ## Convergence — the key mental model (keep straight)
 Loop corrections split by how much they need a **converged BP fixed point**:
 - **Loop cluster expansion** (`contract_gloop_expand`): exact contractions of
-  growing regions; messages only close each region's **boundary** → converges to
-  exact with cluster size for **any** message state (verified bit-identical for
-  converged vs 1-iteration messages once a cluster covers the graph). **Robust to
-  non-convergence.** This is the "way forward" for a robust corrector.
+  growing regions; messages only close each region's **boundary**. A
+  system-covering region is exact and message-independent, but finite loop-only
+  cancellations and tree/dangling reductions assume fixed-point messages.
+  With arbitrary messages, interpret the result as a boundary-closure cluster
+  approximation and sweep cluster size.
 - **Loop series expansion** (`contract_loop_series_expansion`): inserts
   `I − m⊗m` projectors that vanish **only at the fixed point**; also combinatorially
   divergent in the thermodynamic limit. **Fixed-point-sensitive.**
@@ -83,9 +88,32 @@ Loop corrections split by how much they need a **converged BP fixed point**:
 - **Relay-BP** (`relay_bp`): the *dynamical* fixed-point hardener (disordered
   memory + relay). Complements the above; does **not** guarantee convergence.
 
+## SU gauges, Gray's correction, and quimb `norm_gloop_expand`
+- Corrected point from J. Gray: for the **same closed scalar/norm TN**,
+  converged simple-update gauges correspond to a BP / super-orthogonal fixed
+  point up to message-gauge normalization. Thus tree-like correlations are
+  trivial after `normalize_simple(gauges)`, and `autoreduce=True` is valid.
+- Do **not** claim converged SU gauges generally fail tree reductions. The real
+  caveats are: gauges must be converged for the same projected scalar network;
+  borrowed/open-PEPS gauges are only a warm start; signed amplitude networks can
+  be outside the natural nonnegative 1-norm BP regime.
+- Gray identified the actual quimb bug we reproduced: in
+  `TensorNetworkGenVector.norm_gloop_expand(gauges=...)`, `nfactor` returned by
+  `normalize_simple(gauges)` is already the norm scaling, so the final formula
+  should effectively be `nfactor * sqrt(loop_product)`, not
+  `sqrt(nfactor * loop_product)`. On a two-site tree, current quimb produced
+  `z**2 == exact_norm`; the fixed formula gives `z == exact_norm`.
+- For scalar BP residual tests from SU gauges, the tight convention is often
+  `message_power=1.0`; the symmetric default `sqrt(gauge)` is the clean
+  round-trip convention for mapping opposite messages back to an SU-like gauge.
+
 ## Gotchas
 - `D2BP` = one super-site per lattice site (reaches exact at moderate cluster
   size); `D1BP` on a raw `peps.H & peps` (double the tensors) needs larger `C`.
+- Raw DEM factor TNs are nonnegative and good for D1BP, but their factor graph
+  can be huge and mostly tree-like. Small generalized-loop corrections may
+  barely change rare logical-sector probabilities; use exact/MPS references
+  and inspect log-likelihood margins before treating BP+LCE as a decoder.
 - `norm="2norm"` + `combine="sum"` is rejected (D2BP is product-only).
 - Keep `pepsy.bp` out of the lazy top-level namespace (import `pepsy.bp`); do
   **not** edit `src/pepsy/__init__.py` for it.

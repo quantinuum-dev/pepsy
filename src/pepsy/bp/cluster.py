@@ -1,8 +1,13 @@
 """Loop cluster expansion: a systematic, convergence-robust correction to BP.
 
-This is a thin wrapper over quimb's generalized-loop cluster expansion
-(:meth:`D2BP.contract_gloop_expand` / :meth:`D1BP.contract_gloop_expand`),
-following
+This wraps quimb's 2-norm generalized-loop cluster expansion and supplies a
+scalar 1-norm implementation with an explicit Bethe baseline.  The latter is
+important: a scalar BP loop expansion must include the singleton regions at
+``C=0``.  Quimb's :meth:`D1BP.contract_gloop_expand` currently only combines
+the explicitly supplied loop regions, so an empty loop set evaluates to one
+rather than to the BP contraction.
+
+The implementation follows
 
     J. Gray, G. Park, G. Evenbly, N. Pancotti, E. F. Kjønstad, G. K.-L. Chan,
     *Tensor Network Loop Cluster Expansions for Quantum Many-Body Problems*,
@@ -20,15 +25,28 @@ surrounding BP messages and weighted by an inclusion-exclusion counting number
     Z ~= prod_r  Z_r ** c(r)         (product formula)
     <O> ~= sum_r c(r) * <O>_r        (sum formula, for observables)
 
-**On BP convergence.**  The BP messages only supply the *boundary closure* of
-each finite cluster, so as the maximum cluster size grows the expansion
-converges to the exact contraction *regardless of whether the underlying BP
-messages reached a fixed point* -- at a system-covering cluster the estimate is
-exact and completely message-independent.  A converged BP fixed point is what
-makes the expansion *efficient* (clean loop-only structure, fastest
-convergence), not what makes it *correct*.  See
-:func:`~pepsy.bp.loop_cluster_expand` and the accompanying tests for an
-empirical demonstration.
+**On BP convergence.**  In this wrapper the cluster boundary is supplied by a
+quimb BP object.  :func:`loop_cluster_expand` runs BP by default; set
+``run_bp=False`` only when you intentionally want to expand with the supplied
+message state.  The messages only close finite-cluster boundaries, so the
+cluster estimate becomes exact when the chosen cluster set contains a
+system-covering region.  Before that limit, a non-fixed-point message state is
+best viewed as a boundary approximation: useful, but not the formal BP fixed
+point loop expansion.  A converged BP fixed point is what justifies the clean
+loop-only cancellations, tree/dangling-region reductions, and typically fastest
+cluster-size convergence.  Without fixed-point messages, sweep the cluster size
+and avoid reductions that assume tree cancellations unless you are treating
+them as an extra approximation.
+
+**SU gauges are a different path.**  quimb's
+``TensorNetworkGenVector.norm_gloop_expand(gauges=...)`` does *not* run BP
+inside the cluster call.  It uses the supplied simple-update gauges as
+cluster-boundary data.  When those gauges have converged for the same
+norm/scalar network, they represent the corresponding BP/super-orthogonal
+fixed-point gauge and tree-like correlations are trivial.  If the gauges are
+unconverged, or borrowed from a different projected tensor network, then the
+same contractions are best read as a gauge-boundary cluster approximation and
+should be checked by sweeping cluster size or by measuring the BP residual.
 
 This complements :mod:`pepsy.bp.relay` (convergence-robust message passing):
 relay-BP hardens the *fixed point*, while the loop cluster expansion buys back
@@ -39,10 +57,18 @@ sensitive to the fixed-point condition).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import chain
 from typing import Any
 
-__all__ = ["LoopClusterResult", "loop_cluster_expand"]
+import autoray as ar
+
+__all__ = [
+    "LoopClusterResult",
+    "ScalarClusterCache",
+    "loop_cluster_expand",
+    "norm1_gloop_expand",
+]
 
 # norm keyword -> quimb belief-propagation class name.
 #   "2norm" -> D2BP: form the 2-norm <psi|psi> of a wavefunction / PEPS-like TN
@@ -62,6 +88,159 @@ def _cluster_bp_class(norm: str):
     from quimb.tensor import belief_propagation as _bp
 
     return key, getattr(_bp, _CLUSTER_BP_CLASSES[key])
+
+
+_GAUGE_INIT_ONLY_BP_OPTS = {
+    "insert_gauges",
+    "message_power",
+    "smudge",
+    "missing",
+    "normalize_initial",
+}
+
+
+def _filter_gauge_init_only_bp_opts(bp_opts: dict[str, Any]) -> dict[str, Any]:
+    """Drop options used only to initialize D1BP from SU gauges."""
+    return {
+        key: value
+        for key, value in bp_opts.items()
+        if key not in _GAUGE_INIT_ONLY_BP_OPTS
+    }
+
+
+@dataclass
+class ScalarClusterCache:
+    """Cache reusable scalar cluster *geometry* for a fixed TN topology.
+
+    The cached generalized loops and inclusion-exclusion counts only depend on
+    tensor ids and the graph connectivity, not on tensor values or BP messages.
+    Reuse this object for repeated contractions of a TN with unchanged topology.
+    Region contractions themselves are deliberately not cached because they
+    depend on the current BP messages.
+    """
+
+    loops_by_max_size: dict[int, tuple[frozenset, ...]] = field(
+        default_factory=dict
+    )
+    counted_regions: dict[
+        tuple[frozenset[frozenset], bool], tuple[tuple[frozenset, int], ...]
+    ] = field(default_factory=dict)
+
+    def regions_for(
+        self,
+        tn,
+        gloops,
+        *,
+        autocomplete: bool = True,
+    ) -> tuple[tuple[frozenset, int], ...]:
+        """Return singleton-baseline regions plus loop intersections."""
+        from quimb.tensor.belief_propagation.regions import gen_region_counts
+
+        if gloops is None:
+            loops = tuple(frozenset(region) for region in tn.gen_gloops())
+        elif isinstance(gloops, int):
+            try:
+                loops = self.loops_by_max_size[gloops]
+            except KeyError:
+                loops = tuple(
+                    frozenset(region)
+                    for region in tn.gen_gloops(max_size=gloops)
+                )
+                self.loops_by_max_size[gloops] = loops
+        else:
+            loops = tuple(frozenset(region) for region in gloops)
+
+        loop_key = (frozenset(loops), bool(autocomplete))
+        try:
+            return self.counted_regions[loop_key]
+        except KeyError:
+            singleton_regions = tuple((tid,) for tid in tn.tensor_map)
+            regions = tuple(
+                gen_region_counts(
+                    chain(loops, singleton_regions),
+                    autocomplete=autocomplete,
+                )
+            )
+            self.counted_regions[loop_key] = regions
+            return regions
+
+
+def _remove_dangling(region, neighbors):
+    """Remove tree branches from a tensor-id region."""
+    region = set(region)
+    changed = True
+    while changed:
+        changed = False
+        for tid in tuple(region):
+            degree = sum(ntid in region for ntid in neighbors[tid])
+            if degree < 2:
+                region.remove(tid)
+                changed = True
+    return frozenset(region)
+
+
+def _expand_scalar_bp(
+    bp,
+    gloops,
+    combine,
+    optimize,
+    strip_exponent,
+    cache: ScalarClusterCache,
+    *,
+    autocomplete: bool = True,
+    autoreduce: bool = False,
+    progbar: bool = False,
+    **contract_opts,
+):
+    """Evaluate a scalar BP loop-cluster expansion with a Bethe baseline."""
+    from quimb.tensor.belief_propagation import combine_local_contractions
+
+    if combine not in {"prod", "sum"}:
+        raise ValueError("combine must be either 'prod' or 'sum'")
+
+    # With this convention the product of singleton regions is exactly the
+    # BP/Bethe contraction. It is also the convention used in the paper.
+    bp.normalize_message_pairs()
+    if combine == "sum" or autoreduce:
+        bp.normalize_tensors()
+
+    region_counts = cache.regions_for(
+        bp.tn,
+        gloops,
+        autocomplete=autocomplete,
+    )
+    if progbar:
+        from quimb.utils import progbar as Progbar
+
+        region_counts = Progbar(region_counts)
+
+    neighbors = bp.tn.get_tid_neighbor_map() if autoreduce else None
+    zvals = []
+    for region, count in region_counts:
+        if autoreduce:
+            region = _remove_dangling(region, neighbors)
+            if not region:
+                continue
+
+        z_region = bp.get_cluster(region).contract(
+            optimize=optimize,
+            **contract_opts,
+        )
+        zvals.append((z_region, count))
+
+    if combine == "sum":
+        mantissa = bp.sign * sum(z_region * count for z_region, count in zvals)
+        if strip_exponent:
+            return mantissa, bp.exponent
+        return mantissa * 10**bp.exponent
+
+    return combine_local_contractions(
+        zvals,
+        backend=bp.backend,
+        strip_exponent=strip_exponent,
+        mantissa=bp.sign,
+        exponent=bp.exponent,
+    )
 
 
 def _expand(bp, norm, gloops, combine, optimize, strip_exponent, progbar):
@@ -100,6 +279,9 @@ class LoopClusterResult:
     bp :
         The underlying quimb BP object, whose messages can be reused (see
         :meth:`expand` and :attr:`messages`).
+    region_counts :
+        The scalar regions and inclusion-exclusion counts used for the initial
+        estimate. ``None`` for the 2-norm quimb implementation.
     """
 
     estimate: Any
@@ -110,6 +292,8 @@ class LoopClusterResult:
     bp_iterations: int | None
     bp_max_mdiff: float | None
     bp: Any
+    region_counts: tuple[tuple[frozenset, int], ...] | None = None
+    _scalar_cache: ScalarClusterCache | None = field(default=None, repr=False)
 
     @property
     def messages(self):
@@ -121,9 +305,12 @@ class LoopClusterResult:
         gloops,
         *,
         combine: str | None = None,
+        autocomplete: bool = True,
+        autoreduce: bool = False,
         optimize: str = "auto-hq",
         strip_exponent: bool = False,
         progbar: bool = False,
+        **contract_opts,
     ):
         """Re-run the cluster expansion at a new size, reusing the BP messages.
 
@@ -137,6 +324,19 @@ class LoopClusterResult:
                 "norm='2norm' (D2BP) implements only the product formula "
                 "(combine='prod'); use norm='1norm' for the sum formula."
             )
+        if self.norm == "1norm":
+            return _expand_scalar_bp(
+                self.bp,
+                gloops,
+                combine,
+                optimize,
+                strip_exponent,
+                self._scalar_cache or ScalarClusterCache(),
+                autocomplete=autocomplete,
+                autoreduce=autoreduce,
+                progbar=progbar,
+                **contract_opts,
+            )
         return _expand(
             self.bp, self.norm, gloops, combine, optimize, strip_exponent, progbar
         )
@@ -149,14 +349,22 @@ def loop_cluster_expand(
     norm: str = "2norm",
     combine: str = "prod",
     messages=None,
+    gauges=None,
     run_bp: bool = True,
+    bp_runner: str = "plain",
+    relay_opts: dict[str, Any] | None = None,
     max_iterations: int = 1000,
     tol: float = 5e-6,
     damping: float = 0.0,
     update: str = "sequential",
+    require_fixed_point: bool = True,
+    cache: ScalarClusterCache | None = None,
+    autocomplete: bool = True,
+    autoreduce: bool = False,
     optimize: str = "auto-hq",
     strip_exponent: bool = False,
     progbar: bool = False,
+    contract_opts: dict[str, Any] | None = None,
     **bp_opts,
 ) -> LoopClusterResult:
     """Estimate a tensor-network contraction with the loop cluster expansion.
@@ -164,10 +372,13 @@ def loop_cluster_expand(
     A systematic, convergence-robust correction to belief propagation
     (arXiv:2510.05647): the contraction is approximated by exact contractions of
     growing clusters closed with BP messages, weighted by inclusion-exclusion
-    counting numbers.  The error decreases approximately exponentially with the
-    maximum cluster size, and the estimate converges to the *exact* value as the
-    cluster covers the system -- independently of whether the BP messages
-    reached a fixed point (see the module docstring).
+    counting numbers.  With converged fixed-point messages this is the formal
+    BP loop-cluster expansion and usually converges quickly with cluster size.
+    If BP has not converged, or if ``run_bp=False`` is used with arbitrary
+    messages, the same contractions define a boundary-closed cluster
+    approximation rather than the fixed-point loop expansion.  The estimate is
+    still exact once a cluster covers the whole system, but intermediate
+    cluster sizes need not improve monotonically (see the module docstring).
 
     Parameters
     ----------
@@ -186,21 +397,47 @@ def loop_cluster_expand(
     messages : dict, optional
         Initial BP messages to warm-start from (e.g. reused from a previous
         run).  Defaults to all-ones messages.
+    gauges : dict, optional
+        Simple-update gauge vectors for ``norm="1norm"``.  They are inserted
+        into a TN copy and converted into directed D1BP messages using the
+        ``sqrt(lambda)`` convention.
     run_bp : bool, optional
         Whether to run BP before the expansion.  Set ``False`` to expand using
-        exactly the supplied ``messages`` (or the all-ones default).
+        exactly the supplied ``messages`` (or the all-ones default).  This is a
+        useful diagnostic/warm-start path, but then the result should be read as
+        a boundary-closure cluster approximation unless those messages are
+        already a BP fixed point.
+    bp_runner : {"plain", "relay"}, optional
+        Which fixed-point runner to use for ``norm="1norm"``. ``"relay"`` uses
+        :func:`pepsy.bp.relay_bp` with ``method="d1bp"`` and supports
+        ``relay_opts``.
+    relay_opts : dict, optional
+        Extra options for relay-BP, e.g. ``{"num_relays": 4, "seed": 0}``.
     max_iterations, tol : int, float, optional
         BP convergence controls.
     damping : float, optional
         BP message damping ``damping * old + (1 - damping) * new``.
     update : {"sequential", "parallel"}, optional
         BP message update order.
+    require_fixed_point : bool, optional
+        For ``norm="1norm"``, require that BP has converged before using the
+        loop-only region family. Set this to ``False`` only to deliberately
+        evaluate a boundary-closed approximation with unconverged messages.
+    cache : ScalarClusterCache, optional
+        Reusable scalar region-geometry cache. Only valid while the tensor
+        network topology and tensor ids are unchanged.
+    autocomplete, autoreduce : bool, optional
+        Scalar-region graph controls. ``autoreduce`` removes dangling tree
+        branches after local BP/SU normalization; it assumes fixed-point quality
+        messages, just like quimb's gauge-based norm expansion.
     optimize : str or PathOptimizer, optional
         Contraction path optimizer for the cluster contractions.
     strip_exponent : bool, optional
         If ``True`` the estimate is returned as a ``(mantissa, exponent)`` pair.
     progbar : bool, optional
         Show a progress bar over the clusters (``norm="2norm"`` only).
+    contract_opts : dict, optional
+        Extra options for scalar cluster contractions.
     bp_opts
         Extra keyword arguments forwarded to the BP class constructor
         (e.g. ``normalize``, ``distance``, ``local_convergence``,
@@ -211,28 +448,137 @@ def loop_cluster_expand(
     LoopClusterResult
     """
     key, bp_cls = _cluster_bp_class(norm)
+    contract_opts = {} if contract_opts is None else dict(contract_opts)
     if key == "2norm" and combine != "prod":
         raise ValueError(
             "norm='2norm' (D2BP) implements only the product formula "
             "(combine='prod'); use norm='1norm' for the sum formula."
         )
-
-    ctor: dict[str, Any] = dict(messages=messages, damping=damping, update=update)
-    if key == "2norm":
-        # only D2BP takes an optimize kwarg at construction time.
-        ctor["optimize"] = optimize
-    ctor.update(bp_opts)
-    bp = bp_cls(tn, **ctor)
+    if gauges is not None and key != "1norm":
+        raise ValueError("simple-update gauges are only supported for norm='1norm'")
+    if gauges is not None and messages is not None:
+        raise ValueError("pass either messages or gauges, not both")
+    if bp_runner not in {"plain", "relay"}:
+        raise ValueError("bp_runner must be either 'plain' or 'relay'")
+    if bp_runner == "relay" and key != "1norm":
+        raise ValueError("bp_runner='relay' is only supported for norm='1norm'")
 
     info: dict[str, Any] = {}
-    if run_bp:
-        bp.run(
-            max_iterations=max_iterations, tol=tol, info=info, progbar=progbar
-        )
+    if key == "1norm" and gauges is not None:
+        from .gauges import d1bp_from_simple_update_gauges
 
-    estimate = _expand(
-        bp, key, gloops, combine, optimize, strip_exponent, progbar
-    )
+        bp = d1bp_from_simple_update_gauges(
+            tn,
+            gauges,
+            damping=damping,
+            update=update,
+            **bp_opts,
+        )
+        if run_bp and bp_runner == "relay":
+            from .relay import relay_bp
+
+            init_messages = {
+                msg_key: ar.do("copy", value)
+                for msg_key, value in bp.messages.items()
+            }
+            relay_kwargs = {} if relay_opts is None else dict(relay_opts)
+            relay_res = relay_bp(
+                bp.tn,
+                method="d1bp",
+                init_messages=init_messages,
+                max_iterations=max_iterations,
+                tol=tol,
+                damping=damping,
+                update=update,
+                **relay_kwargs,
+                **_filter_gauge_init_only_bp_opts(bp_opts),
+            )
+            bp = relay_res.bp
+            info = {
+                "converged": relay_res.converged,
+                "iterations": relay_res.iterations,
+                "max_mdiff": relay_res.max_mdiff,
+            }
+        elif run_bp:
+            bp.run(
+                max_iterations=max_iterations,
+                tol=tol,
+                info=info,
+                progbar=progbar,
+            )
+    elif key == "1norm" and run_bp and bp_runner == "relay":
+        from .relay import relay_bp
+
+        relay_kwargs = {} if relay_opts is None else dict(relay_opts)
+        relay_res = relay_bp(
+            tn,
+            method="d1bp",
+            init_messages=messages,
+            max_iterations=max_iterations,
+            tol=tol,
+            damping=damping,
+            update=update,
+            **relay_kwargs,
+            **bp_opts,
+        )
+        bp = relay_res.bp
+        info = {
+            "converged": relay_res.converged,
+            "iterations": relay_res.iterations,
+            "max_mdiff": relay_res.max_mdiff,
+        }
+    else:
+        ctor: dict[str, Any] = dict(
+            messages=messages,
+            damping=damping,
+            update=update,
+        )
+        if key == "2norm":
+            # only D2BP takes an optimize kwarg at construction time.
+            ctor["optimize"] = optimize
+        ctor.update(bp_opts)
+        bp = bp_cls(tn, **ctor)
+
+        if run_bp:
+            bp.run(
+                max_iterations=max_iterations,
+                tol=tol,
+                info=info,
+                progbar=progbar,
+            )
+
+    region_counts = None
+    scalar_cache = None
+    if key == "1norm":
+        if require_fixed_point and run_bp and not info.get("converged", False):
+            raise RuntimeError(
+                "1-norm loop-cluster expansion requires converged BP messages "
+                "for loop-only tree cancellations. Pass "
+                "require_fixed_point=False to use an unconverged boundary "
+                "approximation explicitly."
+            )
+        scalar_cache = cache or ScalarClusterCache()
+        estimate = _expand_scalar_bp(
+            bp,
+            gloops,
+            combine,
+            optimize,
+            strip_exponent,
+            scalar_cache,
+            autocomplete=autocomplete,
+            autoreduce=autoreduce,
+            progbar=progbar,
+            **contract_opts,
+        )
+        region_counts = scalar_cache.regions_for(
+            bp.tn,
+            gloops,
+            autocomplete=autocomplete,
+        )
+    else:
+        estimate = _expand(
+            bp, key, gloops, combine, optimize, strip_exponent, progbar
+        )
     return LoopClusterResult(
         estimate=estimate,
         gloops=gloops,
@@ -242,4 +588,76 @@ def loop_cluster_expand(
         bp_iterations=info.get("iterations"),
         bp_max_mdiff=info.get("max_mdiff"),
         bp=bp,
+        region_counts=region_counts,
+        _scalar_cache=scalar_cache,
     )
+
+
+def norm1_gloop_expand(
+    tn,
+    gloops=None,
+    *,
+    autocomplete: bool = False,
+    autoreduce: bool = True,
+    gauges=None,
+    messages=None,
+    run_bp: bool = False,
+    bp_runner: str = "plain",
+    relay_opts: dict[str, Any] | None = None,
+    max_iterations: int = 1000,
+    tol: float = 5e-6,
+    damping: float = 0.0,
+    update: str = "sequential",
+    require_fixed_point: bool | None = None,
+    combine: str = "prod",
+    cache: ScalarClusterCache | None = None,
+    optimize: str = "auto",
+    strip_exponent: bool = False,
+    progbar: bool = False,
+    return_result: bool = False,
+    **contract_opts,
+):
+    """1-norm generalized-loop expansion with SU gauges or BP messages.
+
+    This is the scalar/D1 analogue of quimb's
+    ``norm_gloop_expand(gauges=...)``.  It accepts simple-update gauges as
+    boundary data, includes singleton tensor regions for the Bethe/tree
+    baseline, and can optionally run plain or relay D1BP from that SU
+    initialization before contracting the clusters.
+
+    By default ``run_bp=False`` to mirror quimb's gauge-based norm expansion:
+    the supplied ``gauges`` are used directly as boundary data.  If the gauges
+    were converged for this same scalar TN, they should already be BP-like.
+    Set ``run_bp=True`` and, for harder or projection-changed cases,
+    ``bp_runner="relay"`` to refine the SU initialization into D1BP messages.
+    """
+    if require_fixed_point is None:
+        require_fixed_point = bool(run_bp)
+
+    result = loop_cluster_expand(
+        tn,
+        gloops,
+        norm="1norm",
+        combine=combine,
+        messages=messages,
+        gauges=gauges,
+        run_bp=run_bp,
+        bp_runner=bp_runner,
+        relay_opts=relay_opts,
+        max_iterations=max_iterations,
+        tol=tol,
+        damping=damping,
+        update=update,
+        require_fixed_point=require_fixed_point,
+        cache=cache,
+        autocomplete=autocomplete,
+        autoreduce=autoreduce,
+        optimize=optimize,
+        strip_exponent=strip_exponent,
+        progbar=progbar,
+        contract_opts=contract_opts,
+    )
+
+    if return_result:
+        return result
+    return result.estimate

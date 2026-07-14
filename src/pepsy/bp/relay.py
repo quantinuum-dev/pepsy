@@ -48,9 +48,31 @@ def _bp_class(method: str):
     return getattr(_bp, _ONE_NORM_CLASSES[key])
 
 
+def _message_data(message):
+    """Return the array carried by either quimb message representation.
+
+    ``L1BP`` and ``HV1BP`` store messages as ``Tensor`` objects, whereas
+    ``D1BP`` stores the bare backend arrays directly in ``messages``.
+    Checking for ``modify`` deliberately avoids ``ndarray.data``, which is a
+    memory-view rather than the message array.
+    """
+    return message.data if hasattr(message, "modify") else message
+
+
+def _set_message(bp, key, message, data) -> None:
+    """Replace one message, supporting Tensor and bare-array BPs."""
+    if hasattr(message, "modify"):
+        message.modify(data=data)
+    else:
+        bp.messages[key] = data
+
+
 def _snapshot(messages) -> dict:
     """Backend-agnostic copy of the current message arrays keyed by bond."""
-    return {key: ar.do("copy", tm.data) for key, tm in messages.items()}
+    return {
+        key: ar.do("copy", _message_data(message))
+        for key, message in messages.items()
+    }
 
 
 def _set_messages(bp, messages) -> None:
@@ -60,10 +82,10 @@ def _set_messages(bp, messages) -> None:
     tensor-network *topology* is unchanged and only the tensor values differ
     (as when reusing a fixed point across successive rounds / shots).
     """
-    for key, tm in bp.messages.items():
+    for key, message in bp.messages.items():
         data = messages.get(key)
         if data is not None:
-            tm.modify(data=ar.do("copy", data))
+            _set_message(bp, key, message, ar.do("copy", data))
 
 
 @dataclass
@@ -237,12 +259,14 @@ def relay_bp(
                 prev = _snapshot(bp.messages)
                 bp.iterate(tol=tol)
                 sweep_mdiff = 0.0
-                for key, tm in bp.messages.items():
+                for key, message in bp.messages.items():
                     g = gamma[key[0]]
+                    data = _message_data(message)
                     if g != 0.0:
-                        tm.modify(data=g * prev[key] + (1.0 - g) * tm.data)
+                        data = g * prev[key] + (1.0 - g) * data
+                        _set_message(bp, key, message, data)
                     # post-mix change of this message (proper convergence metric)
-                    delta = float(ar.do("max", ar.do("abs", tm.data - prev[key])))
+                    delta = float(ar.do("max", ar.do("abs", data - prev[key])))
                     sweep_mdiff = max(sweep_mdiff, delta)
                 max_mdiff = sweep_mdiff
                 if sweep_mdiff < tol:
@@ -255,6 +279,5 @@ def relay_bp(
         # relay: keep bp.messages as the warm start for the next leg.
 
     _, converged, iteration, max_mdiff, snapshot = best
-    for key, tm in bp.messages.items():
-        tm.modify(data=snapshot[key])
+    _set_messages(bp, snapshot)
     return RelayBPResult(bp, converged, iteration, max_mdiff, num_relays)

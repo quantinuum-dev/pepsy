@@ -7,11 +7,21 @@ import pytest
 
 qtn = pytest.importorskip("quimb.tensor")
 
-from pepsy.bp import RelayBPResult, one_norm_bp, relay_bp
+from pepsy.bp import RelayBPResult, one_norm_bp, relay_bp  # noqa: E402
 
 
 def _ising_tn(length: int = 3, beta: float = 0.3):
     return qtn.TN2D_classical_ising_partition_function(length, length, beta=beta)
+
+
+def _scalar_two_site_tree():
+    """A minimal scalar tree, whose exact contraction is 13."""
+    return qtn.TensorNetwork(
+        [
+            qtn.Tensor(data=np.array([1.0, 2.0]), inds=("bond",)),
+            qtn.Tensor(data=np.array([3.0, 5.0]), inds=("bond",)),
+        ]
+    )
 
 
 def test_one_norm_bp_close_to_exact_on_small_grid():
@@ -74,6 +84,34 @@ def test_message_reuse_warm_start_reaches_same_fixed_point():
     # one_norm_bp also accepts the warm start.
     third = one_norm_bp(_ising_tn(3, 0.3), init_messages=msgs, tol=1e-10)
     assert third.converged
+
+
+def test_d1bp_message_snapshot_warm_start_and_relay_memory():
+    """D1BP uses bare arrays, unlike L1BP's Tensor message objects."""
+    first = one_norm_bp(_scalar_two_site_tree(), method="d1bp", tol=1e-12)
+    assert first.converged
+    msgs = first.snapshot()
+    assert all(isinstance(message, np.ndarray) for message in msgs.values())
+
+    second = one_norm_bp(
+        _scalar_two_site_tree(), method="d1bp", init_messages=msgs, tol=1e-12
+    )
+    assert second.converged
+    assert np.isclose(float(second.contract()), 13.0)
+
+    # Exercise relay's disordered-memory replacement path for bare arrays.
+    relay = relay_bp(
+        _scalar_two_site_tree(),
+        method="d1bp",
+        num_relays=2,
+        memory_first_leg=True,
+        gamma_range=(0.1, 0.2),
+        max_iterations=100,
+        tol=1e-10,
+        seed=0,
+    )
+    assert relay.converged
+    assert np.isclose(float(relay.contract()), 13.0)
 
 
 def test_parallel_update_runs():
