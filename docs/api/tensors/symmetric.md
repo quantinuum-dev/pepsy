@@ -338,6 +338,12 @@ mpo = ham.to_mpo(L=8)                 # energy / SymDMRG2
 gates = ham.jw_trotter_gates(0.05, order=2)   # consistent time-evolution gates
 ```
 
+``ham.jw_energy(state)`` reads the energy of a bosonic (``fermionic=False``)
+``SymMPS`` back from the same conversion -- a sum of local Jordan-Wigner term
+expectations via the state's symmetry-aware ``measure`` -- so imaginary-time
+evolution driven by ``jw_trotter_gates`` converges to the ``SymDMRG2`` ground
+energy.
+
 For a flattened MPS path, feed the same canonical bundled stream to
 ``MpsOptimizer``:
 

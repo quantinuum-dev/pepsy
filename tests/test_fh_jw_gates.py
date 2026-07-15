@@ -251,3 +251,89 @@ def test_jw_trotter_gates_guards():
         SymHamiltonian.from_edges(
             "fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0
         ).jw_trotter_gates(dt, order=3)
+
+
+def test_jw_energy_of_neel_product_state_is_zero():
+    pytest.importorskip("symmray")
+    from pepsy.tensors import (
+        SymHamiltonian,
+        SymMPS,
+        site_charge_from_occupations,
+    )
+
+    L = 4
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(i, i + 1) for i in range(L - 1)],
+        t=1.0,
+        U=4.0,
+        mu=0.0,
+    )
+    psi = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        L,
+        bond_dim=1,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0), (0, 1)]),
+        seed=3,
+        dtype="complex128",
+        fermionic=False,
+    )
+    # A Neel product state has no double occupancy and no hopping expectation.
+    assert abs(ham.jw_energy(psi)) < 1e-10
+
+
+def test_jw_energy_rejects_non_symmps():
+    pytest.importorskip("symmray")
+    import quimb.tensor as qtn
+
+    from pepsy.tensors import SymHamiltonian
+
+    ham = SymHamiltonian.from_edges("fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0)
+    with pytest.raises(TypeError):
+        ham.jw_energy(qtn.MPS_rand_state(2, 2))
+
+
+def test_jw_imaginary_time_evolution_reaches_ground_state():
+    """End-to-end: jw_trotter_gates imaginary time + jw_energy reach the DMRG GS."""
+    pytest.importorskip("symmray")
+    import pepsy
+    from pepsy.tensors import (
+        SymHamiltonian,
+        SymMPS,
+        site_charge_from_occupations,
+    )
+
+    L = 4
+    edges = [(i, i + 1) for i in range(L - 1)]
+    sc = site_charge_from_occupations([(1, 0), (0, 1), (1, 0), (0, 1)])
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", edges, t=1.0, U=4.0, mu=0.0
+    )
+    mpo = ham.to_mpo(L=L, compress=False)
+
+    ref = SymMPS.for_model(
+        "fermi_hubbard_u1u1", L, bond_dim=1, site_charge=sc, seed=1, dtype="complex128"
+    )
+    opt = pepsy.SymDMRG2(
+        mpo,
+        ref,
+        bond_dims=[1, 2, 4, 8, 16],
+        cutoffs=[1e-10],
+        mixer="density_matrix",
+        compute_initial_energy=False,
+    )
+    opt.solve(max_sweeps=20, sweep_sequence="RL", tol=1e-11)
+    e_gs = float(opt.energy)
+
+    psi = SymMPS.for_model(
+        "fermi_hubbard_u1u1", L, bond_dim=1, site_charge=sc, seed=2,
+        dtype="complex128", fermionic=False,
+    )
+    step = ham.jw_trotter_gates(0.05, imaginary=True, order=2)
+    for _ in range(200):
+        psi.apply_gates(step, method="direct", max_bond=16, cutoff=1e-10, normalize=True)
+
+    e_final = float(ham.jw_energy(psi))
+    assert e_final < -1.0  # well below the product-state energy (0)
+    assert abs(e_final - e_gs) < 5e-3
