@@ -206,6 +206,13 @@ new simulator features.
   errors into the tableau, while `MpsOptimizer` replays the identical stream.
   Detector/observable annotations remain Stim/decoder concerns and do not alter
   the quantum trajectory.
+- **User-defined trajectory noise** — `TrajectoryEvent` embeds a local
+  `TrajectoryChannel` directly in an ordinary Pepsy gate stream. Fixed
+  random-unitary mixtures sample a concrete gate without a state; complete
+  Kraus channels evaluate Born branch weights on the live `MpsOptimizer` or
+  `MpsStabOptimizer`, apply one selected branch, and normalize it before the
+  following gate segment. This makes state-dependent channels such as amplitude
+  damping independent of Stim while retaining one-MPS-per-shot scaling.
 
 ## Cross-checked against the reference (bsc-quantic/stabilizer-TN v1.1/v1.2)
 

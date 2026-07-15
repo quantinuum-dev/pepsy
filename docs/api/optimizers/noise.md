@@ -40,6 +40,60 @@ holds concise `(gate_index, site, pauli)` records. Use
 `sample_noisy_gate_stream(...)` or `sample_noisy_gate_streams(...)` when only
 stream construction is needed.
 
+## User-defined quantum trajectories
+
+`TrajectoryEvent` is the general independent noise-simulation interface. Put
+one directly inside an ordinary gate stream and run independently sampled shots
+with either `MpsOptimizer` or `MpsStabOptimizer`. It does not require Stim or a
+density matrix.
+
+Use a `mixture` for a user-defined random-unitary channel. Its outcomes have
+explicit probabilities, so `sample_trajectory_stream(...)` can make a concrete
+noisy stream without an optimizer:
+
+```python
+import numpy as np
+import pepsy
+
+x = np.array([[0, 1], [1, 0]], dtype=complex)
+bit_flip = pepsy.TrajectoryChannel.mixture([
+    ("I", 0.99, np.eye(2)),
+    ("X", 0.01, x),
+])
+stream = [
+    (pepsy.h(), 0),
+    pepsy.TrajectoryEvent(bit_flip, 0),
+]
+sample = pepsy.sample_trajectory_stream(stream, seed=7)
+```
+
+Use `kraus` when the branch probability must be computed from the evolving
+state. Each selected branch is normalized before the later stream entries run;
+this supports non-Pauli channels such as amplitude damping:
+
+```python
+stream = [
+    (pepsy.x(), 0),
+    pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.02), 0),
+    (pepsy.h(), 0),
+]
+result = pepsy.run_trajectory_shots(
+    lambda: pepsy.MpsStabOptimizer(1, chi=32),
+    stream,
+    shots=10_000,
+    seed=7,
+)
+
+# One named result per noise event in each shot.
+print(result.records[0])
+```
+
+`TrajectoryChannel.kraus([("no_jump", K0), ("jump", K1)])` accepts any
+complete local qubit channel (`sum(K.conj().T @ K) == I`) on the corresponding
+one- or multi-qubit `TrajectoryEvent` support. For ordinary MPS replay, replace
+the factory above with a fresh `MpsOptimizer(initial_mps, ...)` and pass its
+usual options through `run_kwargs`.
+
 ## Reading a Stim circuit
 
 `compile_stim_circuit(...)` accepts `stim.Circuit` or Stim source text. It

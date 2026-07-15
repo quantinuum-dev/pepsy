@@ -24,13 +24,21 @@ __all__ = [
     "StimHerald",
     "StimNoiseSample",
     "StimShotResult",
+    "TrajectoryChannel",
+    "TrajectoryEvent",
+    "TrajectoryOutcome",
+    "TrajectoryRecord",
+    "TrajectorySample",
+    "TrajectoryShotResult",
     "compile_stim_circuit",
     "run_noisy_shots",
     "run_stim_shots",
+    "run_trajectory_shots",
     "sample_noisy_gate_stream",
     "sample_noisy_gate_streams",
     "sample_stim_circuit",
     "sample_stim_circuits",
+    "sample_trajectory_stream",
 ]
 
 
@@ -289,11 +297,237 @@ class StimShotResult:
         return tuple(sample.heralds for sample in self.samples)
 
 
+@dataclass(frozen=True)
+class TrajectoryOutcome:
+    """One named outcome of a local stochastic gate channel."""
+
+    label: str
+    gate: Any
+    probability: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class TrajectoryChannel:
+    """A user-defined local channel sampled as quantum trajectories.
+
+    Create a fixed random-unitary mixture with :meth:`mixture`, or an arbitrary
+    normalized single-site Kraus channel with :meth:`kraus`. Kraus channels
+    sample the outcome from the evolving MPS state, then normalize the selected
+    branch before later gates run. This is suitable for channels such as
+    amplitude damping that cannot be represented as a fixed Pauli draw.
+    """
+
+    outcomes: tuple[TrajectoryOutcome, ...]
+    mode: str
+
+    def __post_init__(self):
+        if self.mode not in {"mixture", "kraus"}:
+            raise ValueError("TrajectoryChannel mode must be 'mixture' or 'kraus'.")
+        if not self.outcomes:
+            raise ValueError("TrajectoryChannel needs at least one outcome.")
+        labels = [outcome.label for outcome in self.outcomes]
+        if len(labels) != len(set(labels)):
+            raise ValueError("TrajectoryChannel outcome labels must be unique.")
+        matrices = tuple(_trajectory_matrix(outcome.gate) for outcome in self.outcomes)
+        dim = matrices[0].shape[0]
+        if any(matrix.shape != (dim, dim) for matrix in matrices):
+            raise ValueError("TrajectoryChannel outcomes must be square matrices of one size.")
+        nqubits = _trajectory_num_qubits(dim)
+        if nqubits < 1:
+            raise ValueError("TrajectoryChannel outcomes must act on at least one qubit.")
+        if self.mode == "mixture":
+            probabilities = [outcome.probability for outcome in self.outcomes]
+            if any(probability is None for probability in probabilities):
+                raise ValueError("Every mixture outcome needs an explicit probability.")
+            probabilities = np.asarray(probabilities, dtype=float)
+            if (
+                not np.all(np.isfinite(probabilities))
+                or np.any(probabilities < 0.0)
+                or not np.isclose(probabilities.sum(), 1.0, atol=1e-12)
+            ):
+                raise ValueError("Trajectory mixture probabilities must be nonnegative and sum to one.")
+            if not all(_is_unitary_matrix(matrix) for matrix in matrices):
+                raise ValueError("Trajectory mixture outcomes must be unitary matrices.")
+        else:
+            if any(outcome.probability is not None for outcome in self.outcomes):
+                raise ValueError("Kraus outcomes infer probabilities from the evolving state.")
+            completeness = sum(
+                matrix.conj().T @ matrix for matrix in matrices
+            )
+            if not np.allclose(completeness, np.eye(dim), atol=1e-10, rtol=1e-10):
+                raise ValueError("Kraus operators must satisfy sum(K^dagger K) = I.")
+
+    @classmethod
+    def mixture(cls, outcomes) -> "TrajectoryChannel":
+        """Build a fixed-probability random-unitary channel.
+
+        ``outcomes`` contains ``(label, probability, matrix)`` entries.
+        """
+        return cls(
+            tuple(
+                TrajectoryOutcome(str(label), gate, float(probability))
+                for label, probability, gate in outcomes
+            ),
+            "mixture",
+        )
+
+    @classmethod
+    def kraus(cls, outcomes) -> "TrajectoryChannel":
+        """Build a state-dependent channel from ``(label, Kraus_matrix)`` entries."""
+        return cls(
+            tuple(TrajectoryOutcome(str(label), gate) for label, gate in outcomes),
+            "kraus",
+        )
+
+    @classmethod
+    def depolarizing(cls, probability: float) -> "TrajectoryChannel":
+        """Return a one-qubit depolarizing random-unitary channel."""
+        probability = _unit_interval_probability(probability, "depolarizing")
+        identity = np.eye(2, dtype=complex)
+        return cls.mixture(
+            (
+                ("I", 1.0 - probability, identity),
+                ("X", probability / 3.0, _PAULI_MATRICES["X"]),
+                ("Y", probability / 3.0, _PAULI_MATRICES["Y"]),
+                ("Z", probability / 3.0, _PAULI_MATRICES["Z"]),
+            )
+        )
+
+    @classmethod
+    def amplitude_damping(cls, gamma: float) -> "TrajectoryChannel":
+        """Return a normalized single-qubit amplitude-damping Kraus channel."""
+        gamma = _unit_interval_probability(gamma, "amplitude-damping")
+        return cls.kraus(
+            (
+                (
+                    "no_jump",
+                    np.array([[1.0, 0.0], [0.0, np.sqrt(1.0 - gamma)]], dtype=complex),
+                ),
+                (
+                    "jump",
+                    np.array([[0.0, np.sqrt(gamma)], [0.0, 0.0]], dtype=complex),
+                ),
+            )
+        )
+
+
+@dataclass(frozen=True)
+class TrajectoryEvent:
+    """A user-defined channel event embedded in an otherwise ordinary gate stream."""
+
+    channel: TrajectoryChannel
+    where: Any
+
+    def __post_init__(self):
+        if not isinstance(self.channel, TrajectoryChannel):
+            raise TypeError("TrajectoryEvent channel must be a TrajectoryChannel.")
+        where = _trajectory_where(self.where)
+        dimension = _trajectory_matrix(self.channel.outcomes[0].gate).shape[0]
+        if len(where) != _trajectory_num_qubits(dimension):
+            raise ValueError(
+                "TrajectoryEvent support size must match its channel matrix dimension."
+            )
+        object.__setattr__(self, "where", where)
+
+
+@dataclass(frozen=True)
+class TrajectoryRecord:
+    """The sampled outcome of one :class:`TrajectoryEvent`."""
+
+    event_index: int
+    where: tuple[int, ...]
+    label: str
+    probability: float
+
+
+@dataclass(frozen=True)
+class TrajectorySample:
+    """One sampled fixed-mixture stream and its selected channel outcomes."""
+
+    gate_stream: tuple[object, ...]
+    records: tuple[TrajectoryRecord, ...]
+
+
+@dataclass(frozen=True)
+class TrajectoryShotResult:
+    """Independent MPS trajectory replays from a user-defined noisy gate stream.
+
+    ``gate_streams`` record the normal gate events and selected channel matrices
+    for each shot. Kraus-branch normalization is reflected in the retained final
+    optimizer state rather than encoded as an additional gate-stream event.
+    """
+
+    optimizers: tuple[Any, ...]
+    gate_streams: tuple[tuple[object, ...], ...]
+    records: tuple[tuple[TrajectoryRecord, ...], ...]
+
+    @property
+    def shots(self) -> int:
+        """Number of independently replayed trajectories."""
+        return len(self.optimizers)
+
+
 def _unit_interval_probability(value, label: str) -> float:
     value = float(value)
     if not np.isfinite(value) or not 0.0 <= value <= 1.0:
         raise ValueError(f"{label} probability must lie in [0, 1].")
     return value
+
+
+def _trajectory_matrix(gate) -> np.ndarray:
+    """Convert a channel outcome to a small dense matrix for validation."""
+    matrix = np.asarray(gate, dtype=complex)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("Trajectory channel outcomes must be square matrices.")
+    return matrix
+
+
+def _trajectory_num_qubits(dimension: int) -> int:
+    """Return the qubit arity of a square local channel dimension."""
+    if dimension < 1:
+        raise ValueError("Trajectory channel outcomes cannot have zero dimension.")
+    nqubits = int(round(np.log2(dimension)))
+    if 2**nqubits != dimension:
+        raise ValueError(
+            "Trajectory channel outcomes must have a 2**k by 2**k qubit dimension."
+        )
+    return nqubits
+
+
+def _trajectory_where(where) -> tuple[int, ...]:
+    """Normalize a local trajectory support to logical qubit labels."""
+    if isinstance(where, Integral):
+        return (int(where),)
+    if (
+        isinstance(where, (tuple, list))
+        and where
+        and all(isinstance(site, Integral) for site in where)
+    ):
+        return tuple(int(site) for site in where)
+    raise ValueError("TrajectoryEvent where must be an integer or non-empty integer tuple.")
+
+
+def _is_unitary_matrix(matrix: np.ndarray, *, atol: float = 1e-10) -> bool:
+    """Return whether a dense channel outcome is unitary."""
+    return bool(
+        np.allclose(
+            matrix.conj().T @ matrix,
+            np.eye(matrix.shape[0], dtype=matrix.dtype),
+            atol=atol,
+            rtol=atol,
+        )
+    )
+
+
+def _trajectory_real_scalar(value, *, label: str) -> float:
+    """Convert a backend scalar expected to be real into a Python float."""
+    item = getattr(value, "item", None)
+    if callable(item):
+        value = item()
+    value = complex(value)
+    if abs(value.imag) > 1e-9:
+        raise ValueError(f"{label} must be real, got {value!r}.")
+    return float(value.real)
 
 
 def _as_entries(gates) -> list[object]:
@@ -480,6 +714,289 @@ def run_noisy_shots(
         faults.append(shot_faults)
 
     return NoisyShotResult(tuple(optimizers), tuple(streams), tuple(faults))
+
+
+# ---------------------------------------------------------------------------
+# User-defined quantum-trajectory channels in ordinary gate streams.
+# ---------------------------------------------------------------------------
+def _trajectory_entries(gates) -> list[object]:
+    """Normalize a stream that may itself be a single trajectory event."""
+    if isinstance(gates, TrajectoryEvent):
+        return [gates]
+    return _as_entries(gates)
+
+
+def _entry_from_trajectory_outcome(outcome: TrajectoryOutcome | Any, where):
+    """Turn a selected local outcome into a normal bundled matrix gate."""
+    support = _trajectory_where(where)
+    gate = outcome.gate if isinstance(outcome, TrajectoryOutcome) else outcome
+    return (gate, support[0] if len(support) == 1 else support)
+
+
+def _sample_trajectory_mixture(channel: TrajectoryChannel, rng):
+    """Choose a state-independent random-unitary outcome."""
+    probabilities = np.asarray(
+        [outcome.probability for outcome in channel.outcomes], dtype=float
+    )
+    index = int(rng.choice(len(channel.outcomes), p=probabilities))
+    return channel.outcomes[index], float(probabilities[index])
+
+
+def sample_trajectory_stream(gates, *, seed=None) -> TrajectorySample:
+    """Sample fixed random-unitary events in a user-defined gate stream.
+
+    The input is an ordinary gate stream with :class:`TrajectoryEvent` entries
+    inserted wherever a local noisy channel should act. Only
+    :meth:`TrajectoryChannel.mixture` events can be sampled without a state;
+    a :meth:`TrajectoryChannel.kraus` event needs the evolving state and must
+    use :func:`run_trajectory_shots` instead.
+    """
+    rng = np.random.default_rng(seed)
+    stream = []
+    records = []
+    for event_index, entry in enumerate(_trajectory_entries(gates)):
+        if not isinstance(entry, TrajectoryEvent):
+            stream.append(entry)
+            continue
+        if entry.channel.mode != "mixture":
+            raise ValueError(
+                "State-dependent Kraus channels require run_trajectory_shots(...); "
+                "they cannot be sampled from a gate stream alone."
+            )
+        outcome, probability = _sample_trajectory_mixture(entry.channel, rng)
+        stream.append(_entry_from_trajectory_outcome(outcome, entry.where))
+        records.append(
+            TrajectoryRecord(event_index, entry.where, outcome.label, probability)
+        )
+    return TrajectorySample(tuple(stream), tuple(records))
+
+
+def _check_trajectory_optimizer(optimizer):
+    if not hasattr(optimizer, "set_gates") or not hasattr(optimizer, "run"):
+        raise TypeError(
+            "optimizer_factory must return an optimizer with set_gates(...) and run(...)."
+        )
+
+
+def _is_stabilizer_trajectory_optimizer(optimizer) -> bool:
+    """Recognize the STN optimizer without importing it during package setup."""
+    return all(
+        callable(getattr(optimizer, attr, None))
+        for attr in ("copy", "_mps_site", "_canonize_p", "_renorm_p_at")
+    )
+
+
+def _trajectory_norm_squared(optimizer) -> float:
+    """Read the represented state norm through either public MPS optimizer API."""
+    norm = getattr(optimizer, "norm", None)
+    if callable(norm):
+        value = _trajectory_real_scalar(norm(), label="trajectory state norm")
+    else:
+        p = getattr(optimizer, "p", None)
+        if p is None or not hasattr(p, "norm"):
+            raise TypeError("trajectory optimizer must expose a state norm through norm() or p.norm().")
+        value = _trajectory_real_scalar(p.norm(), label="trajectory state norm")
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("Cannot sample a trajectory channel from a zero- or invalid-norm state.")
+    return value * value
+
+
+def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
+    """Evaluate one Kraus branch on a copied ordinary MPS without mutation."""
+    if getattr(optimizer, "mode", None) == "exact":
+        raise ValueError(
+            "State-dependent trajectory channels require an MPS mode, not mode='exact'."
+        )
+    p = getattr(optimizer, "p", None)
+    apply_gate = getattr(optimizer, "_apply_gate", None)
+    remap = getattr(optimizer, "_logical_to_physical_where", None)
+    if p is None or not callable(apply_gate) or not callable(remap):
+        raise TypeError(
+            "State-dependent trajectory channels require MpsOptimizer or MpsStabOptimizer."
+        )
+    matrix = _to_trajectory_backend(matrix, optimizer)
+    physical_where = tuple(remap(where))
+    candidate = apply_gate(
+        p.copy(),
+        matrix,
+        physical_where[0] if len(physical_where) == 1 else physical_where,
+        contract=True,
+    )
+    value = _trajectory_real_scalar(candidate.norm(), label="Kraus branch norm")
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError("Kraus branch produced an invalid MPS norm.")
+    return value * value
+
+
+def _stn_outcome_norm_squared(optimizer, matrix, where) -> float:
+    """Evaluate one physical Kraus branch in an independent STN frame copy."""
+    candidate = optimizer.copy()
+    candidate.set_gates([_entry_from_trajectory_outcome(matrix, where)]).run()
+    value = _trajectory_real_scalar(candidate.norm(), label="Kraus branch norm")
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError("Kraus branch produced an invalid STN norm.")
+    return value * value
+
+
+def _to_trajectory_backend(matrix, optimizer):
+    """Convert generated NumPy matrices to the ordinary MPS state backend."""
+    converter = getattr(optimizer, "_to_state_backend", None)
+    return converter(matrix) if callable(converter) else matrix
+
+
+def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.ndarray:
+    """Compute normalized state-dependent probabilities for a local channel."""
+    base_norm_squared = _trajectory_norm_squared(optimizer)
+    if _is_stabilizer_trajectory_optimizer(optimizer):
+        branch_norm_squared = np.asarray(
+            [
+                _stn_outcome_norm_squared(optimizer, outcome.gate, where)
+                for outcome in channel.outcomes
+            ],
+            dtype=float,
+        )
+    else:
+        branch_norm_squared = np.asarray(
+            [
+                _mps_outcome_norm_squared(optimizer, outcome.gate, where)
+                for outcome in channel.outcomes
+            ],
+            dtype=float,
+        )
+    probabilities = branch_norm_squared / base_norm_squared
+    if not np.all(np.isfinite(probabilities)) or np.any(probabilities < -1e-10):
+        raise ValueError("Kraus channel produced invalid trajectory probabilities.")
+    probabilities = np.maximum(probabilities, 0.0)
+    total = float(probabilities.sum())
+    if total <= 0.0:
+        raise ValueError("Kraus channel has no nonzero trajectory outcome for this state.")
+    # A complete channel sums to one. Normalize the tiny residual caused by
+    # finite-MPS truncation so the shot sampler remains a proper distribution.
+    return probabilities / total
+
+
+def _run_trajectory_entries(optimizer, entries, run_kwargs, *, non_unitary=False):
+    """Run one contiguous ordinary-gate segment on its optimizer backend."""
+    if not entries:
+        return
+    optimizer.set_gates(_stream_on_optimizer_backend(entries, optimizer))
+    kwargs = dict(run_kwargs)
+    if non_unitary and not _is_stabilizer_trajectory_optimizer(optimizer):
+        kwargs["non_unitary"] = True
+        kwargs["normalize_every"] = False
+        kwargs["normalize_final"] = False
+    optimizer.run(**kwargs)
+
+
+def _normalize_trajectory_branch(optimizer, where):
+    """Normalize a selected Kraus branch while keeping MPS metadata valid."""
+    if _is_stabilizer_trajectory_optimizer(optimizer):
+        site = optimizer._mps_site(_trajectory_where(where)[0])
+        optimizer._canonize_p(site)
+        optimizer._renorm_p_at(site)
+        return
+    normalize = getattr(optimizer, "normalize", None)
+    if not callable(normalize):
+        raise TypeError(
+            "State-dependent trajectory channels require an optimizer with normalize()."
+        )
+    normalize()
+    # MpsOptimizer stores removed scale in ``p.exponent`` so norm diagnostics
+    # see the represented non-unitary norm. A quantum-trajectory branch is
+    # physically renormalized, therefore clear that bookkeeping scale.
+    p = optimizer.p
+    if hasattr(p, "exponent"):
+        p.exponent = 0.0
+
+
+def _apply_trajectory_event(optimizer, event, rng, event_index, run_kwargs):
+    """Sample and apply one channel event, returning its inspectable record."""
+    channel = event.channel
+    if channel.mode == "mixture":
+        outcome, probability = _sample_trajectory_mixture(channel, rng)
+        non_unitary = False
+    else:
+        probabilities = _kraus_probabilities(optimizer, channel, event.where)
+        index = int(rng.choice(len(channel.outcomes), p=probabilities))
+        outcome = channel.outcomes[index]
+        probability = float(probabilities[index])
+        non_unitary = True
+    _run_trajectory_entries(
+        optimizer,
+        [_entry_from_trajectory_outcome(outcome, event.where)],
+        run_kwargs,
+        non_unitary=non_unitary,
+    )
+    if non_unitary:
+        _normalize_trajectory_branch(optimizer, event.where)
+    return TrajectoryRecord(event_index, event.where, outcome.label, probability)
+
+
+def run_trajectory_shots(
+    optimizer_factory: Callable[[], Any],
+    gates,
+    shots: int,
+    *,
+    seed=None,
+    run_kwargs: Optional[Mapping[str, Any]] = None,
+) -> TrajectoryShotResult:
+    """Replay user-defined noisy gate-stream trajectories on either MPS optimizer.
+
+    Insert :class:`TrajectoryEvent` directly into an ordinary Pepsy gate
+    stream. A ``mixture`` selects a known unitary branch by its explicit
+    probability. A ``kraus`` channel evaluates all local branch norms on the
+    current MPS, samples the conditional probability, applies the chosen
+    branch, and normalizes before evolution continues. This includes
+    non-Pauli channels such as amplitude damping without forming a density
+    matrix.
+
+    ``optimizer_factory`` must create a fresh :class:`MpsOptimizer` or
+    :class:`MpsStabOptimizer` per shot. Gate segments between channel events
+    are batched, so a trajectory does not rebuild an optimizer for every gate.
+    """
+    if not callable(optimizer_factory):
+        raise TypeError("optimizer_factory must construct a fresh optimizer per shot.")
+    if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+        raise ValueError("shots must be a nonnegative integer.")
+    if run_kwargs is None:
+        run_kwargs = {}
+    elif not isinstance(run_kwargs, Mapping):
+        raise TypeError("run_kwargs must be a mapping or None.")
+
+    entries = _trajectory_entries(gates)
+    optimizers = []
+    gate_streams = []
+    records = []
+    for child_seed in np.random.SeedSequence(seed).spawn(int(shots)):
+        optimizer = optimizer_factory()
+        _check_trajectory_optimizer(optimizer)
+        rng = np.random.default_rng(child_seed)
+        pending = []
+        shot_stream = []
+        shot_records = []
+        for event_index, entry in enumerate(entries):
+            if not isinstance(entry, TrajectoryEvent):
+                pending.append(entry)
+                continue
+            _run_trajectory_entries(optimizer, pending, run_kwargs)
+            shot_stream.extend(pending)
+            pending.clear()
+            record = _apply_trajectory_event(
+                optimizer, entry, rng, event_index, run_kwargs
+            )
+            shot_records.append(record)
+            outcome = next(
+                outcome
+                for outcome in entry.channel.outcomes
+                if outcome.label == record.label
+            )
+            shot_stream.append(_entry_from_trajectory_outcome(outcome, entry.where))
+        _run_trajectory_entries(optimizer, pending, run_kwargs)
+        shot_stream.extend(pending)
+        optimizers.append(optimizer)
+        gate_streams.append(tuple(shot_stream))
+        records.append(tuple(shot_records))
+    return TrajectoryShotResult(tuple(optimizers), tuple(gate_streams), tuple(records))
 
 
 # ---------------------------------------------------------------------------
