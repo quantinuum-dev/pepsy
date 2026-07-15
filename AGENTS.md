@@ -55,8 +55,9 @@ At the start of a new task:
 
 ### BP and simple-update gauge workflow
 
-- The experimental BP integration is isolated in `src/pepsy/bp/`; import it as
-  `pepsy.bp` rather than promoting its symbols to the lazy top-level namespace.
+- The experimental BP integration is isolated in `src/pepsy/bp/`. Its supported
+  top-level exception is `pepsy.gauge_all_simple`; keep its remaining symbols
+  under `pepsy.bp` until they are individually promoted.
 - `gauge_all_simple` is the single simple-update gauge path. Its optional
   `RelayGaugeOptions` enables convergence acceleration. It must preserve the
   represented tensor network exactly when it mixes an external bond gauge:
