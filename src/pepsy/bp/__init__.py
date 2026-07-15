@@ -21,10 +21,12 @@ from .cluster import (
     norm1_gloop_expand,
 )
 from .gauges import (
+    RelayGaugeOptions,
     compare_simple_update_gauges,
     compare_simple_update_to_bp,
     copy_gauges,
     d1bp_from_simple_update_gauges,
+    gauge_all_simple,
     gauge_all_simple_with_bp_check,
     relay_gauge_all_simple,
     run_d1bp_from_simple_update_gauges,
@@ -37,11 +39,13 @@ from .relay import RelayBPResult, one_norm_bp, relay_bp
 
 __all__ = [
     "LoopClusterResult",
+    "RelayGaugeOptions",
     "ScalarClusterCache",
     "compare_simple_update_gauges",
     "compare_simple_update_to_bp",
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
+    "gauge_all_simple",
     "gauge_all_simple_with_bp_check",
     "relay_gauge_all_simple",
     "RelayBPResult",

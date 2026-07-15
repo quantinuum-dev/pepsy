@@ -17,10 +17,12 @@ pytest.importorskip("quimb.tensor.belief_propagation")
 
 from pepsy.bp import (  # noqa: E402
     LoopClusterResult,
+    RelayGaugeOptions,
     ScalarClusterCache,
     compare_simple_update_gauges,
     compare_simple_update_to_bp,
     d1bp_from_simple_update_gauges,
+    gauge_all_simple,
     gauge_all_simple_with_bp_check,
     loop_cluster_expand,
     norm1_gloop_expand,
@@ -44,14 +46,14 @@ def test_exports():
 
     assert {
         "LoopClusterResult",
+        "RelayGaugeOptions",
         "ScalarClusterCache",
         "compare_simple_update_gauges",
         "compare_simple_update_to_bp",
         "d1bp_from_simple_update_gauges",
-        "gauge_all_simple_with_bp_check",
+        "gauge_all_simple",
         "loop_cluster_expand",
         "norm1_gloop_expand",
-        "relay_gauge_all_simple",
         "run_d1bp_from_simple_update_gauges",
         "simple_update_bp_residual",
         "simple_update_core_and_gauges_from_messages",
@@ -401,19 +403,20 @@ def test_simple_update_bp_residual_is_finite():
     assert residual >= 0.0
 
 
-def test_gauge_all_simple_with_bp_check_records_su_and_bp_traces():
+def test_gauge_all_simple_records_su_and_bp_traces():
     tn = _projected_scalar_ladder()
 
-    core, gauges, info = gauge_all_simple_with_bp_check(
+    core, gauges, info = gauge_all_simple(
         tn,
         max_iterations=3,
-        su_tol=0.0,
+        tol=0.0,
         bp_check_every=1,
     )
 
     assert core is not tn
     assert len(gauges) == len(tn.inner_inds())
     assert info["iterations"] == 3
+    assert info["num_legs_run"] == 1
     assert len(info["su_max_sdiffs"]) == 3
     assert len(info["bp_max_mdiffs"]) == 3
     assert all(np.isfinite(x) for x in info["su_max_sdiffs"])
@@ -421,10 +424,10 @@ def test_gauge_all_simple_with_bp_check_records_su_and_bp_traces():
 
 
 def test_gauge_bp_check_always_refreshes_the_returned_state():
-    _, _, info = gauge_all_simple_with_bp_check(
+    _, _, info = gauge_all_simple(
         _projected_scalar_ladder(),
         max_iterations=3,
-        su_tol=0.0,
+        tol=0.0,
         bp_tol=0.0,
         bp_check_every=2,
     )
@@ -432,6 +435,22 @@ def test_gauge_bp_check_always_refreshes_the_returned_state():
     # Sweep 2 is the regular cadence; sweep 3 is the mandatory final refresh.
     assert [check["iteration"] for check in info["bp_checks"]] == [2, 3]
     assert info["bp_checks"][-1]["max_mdiff"] == info["bp_max_mdiff"]
+
+
+def test_legacy_simple_update_entry_points_are_deprecation_wrappers():
+    with pytest.deprecated_call():
+        core, gauges, _ = gauge_all_simple_with_bp_check(
+            _projected_scalar_ladder(),
+            max_iterations=1,
+        )
+    assert len(gauges) == len(core.inner_inds())
+
+    with pytest.deprecated_call():
+        core, gauges, _ = relay_gauge_all_simple(
+            _projected_scalar_ladder(),
+            max_iterations=1,
+        )
+    assert len(gauges) == len(core.inner_inds())
 
 
 def test_relay_simple_update_breaks_a_real_su_gauge_stall():
@@ -450,14 +469,16 @@ def test_relay_simple_update_breaks_a_real_su_gauge_stall():
     )
     assert plain_info["max_sdiff"] > 1e-2
 
-    core, gauges, info = relay_gauge_all_simple(
+    core, gauges, info = gauge_all_simple(
         tn,
         max_iterations=200,
         tol=1e-2,
-        num_relays=3,
-        memory_first_leg=True,
-        gamma_range=(0.8, 0.95),
-        seed=0,
+        relay=RelayGaugeOptions(
+            num_legs=3,
+            memory_first_leg=True,
+            gamma_range=(0.8, 0.95),
+            seed=0,
+        ),
     )
     rebuilt = core.copy()
     rebuilt.gauge_simple_insert(gauges)
@@ -472,13 +493,13 @@ def test_parallel_relay_simple_update_preserves_the_tensor_network():
     tn = _projected_scalar_ladder()
     exact = tn.contract()
 
-    core, gauges, info = relay_gauge_all_simple(
+    core, gauges, info = gauge_all_simple(
         tn,
         max_iterations=3,
-        num_relays=1,
+        relay=RelayGaugeOptions(num_legs=1),
         damping=0.3,
         diis={"max_history": 3, "beta": 0.5},
-        parallel=True,
+        schedule="parallel",
         max_workers=2,
     )
     rebuilt = core.copy()
@@ -492,16 +513,20 @@ def test_parallel_relay_simple_update_preserves_the_tensor_network():
 
 def test_relay_simple_update_validates_nonnegative_memory_controls():
     with pytest.raises(ValueError, match="0 <= min"):
-        relay_gauge_all_simple(_projected_scalar_ladder(), gamma_range=(-0.1, 0.2))
-    with pytest.raises(ValueError, match="fuse_multibonds=False"):
-        relay_gauge_all_simple(
+        gauge_all_simple(
             _projected_scalar_ladder(),
+            relay=RelayGaugeOptions(gamma_range=(-0.1, 0.2)),
+        )
+    with pytest.raises(ValueError, match="fuse_multibonds=False"):
+        gauge_all_simple(
+            _projected_scalar_ladder(),
+            relay=RelayGaugeOptions(),
             fuse_multibonds=True,
         )
     with pytest.raises(ValueError, match="damping"):
-        relay_gauge_all_simple(_projected_scalar_ladder(), damping=1.0)
+        gauge_all_simple(_projected_scalar_ladder(), damping=1.0)
     with pytest.raises(TypeError, match="diis"):
-        relay_gauge_all_simple(_projected_scalar_ladder(), diis="yes")
+        gauge_all_simple(_projected_scalar_ladder(), diis="yes")
 
 
 def test_norm1_gloop_expand_with_su_gauges_full_region_is_exact():

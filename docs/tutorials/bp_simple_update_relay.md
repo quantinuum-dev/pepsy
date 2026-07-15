@@ -46,28 +46,31 @@ positive D1BP message products it returns a lossless `(core, gauges)` pair;
 if a real SU run has singular products, pass an explicit small `smudge` to
 obtain a regularized but still representation-preserving SU initializer.
 
-## Relay simple-update gauges
+## Simple-update gauges and Relay
 
-`relay_gauge_all_simple` applies the same relay idea directly to real Quimb
-simple-update gauges. Each memory leg assigns a nonnegative, per-bond damping
-strength, mixes old and new singular-value gauges, and compensates the core so
-the returned `(core, gauges)` represents exactly the original TN. Use it when
+`gauge_all_simple` is the single entry point for real Quimb simple-update
+gauges. With its default `relay=None`, it runs ordinary sequential SU. Passing
+`RelayGaugeOptions` adds per-bond relay memory; every memory leg mixes old and
+new nonnegative singular-value gauges and compensates the core so the returned
+`(core, gauges)` represents exactly the original TN. Use Relay when
 `peps.gauge_all_simple_` stalls, not as a claim that every PEPS will converge
 faster:
 
 ```python
-from pepsy.bp import relay_gauge_all_simple
+from pepsy.bp import RelayGaugeOptions, gauge_all_simple
 
-core, gauges, info = relay_gauge_all_simple(
+core, gauges, info = gauge_all_simple(
     peps,
     max_iterations=200,
     tol=1e-8,
-    num_relays=3,
-    memory_first_leg=True,
-    gamma_range=(0.6, 0.9),
+    relay=RelayGaugeOptions(
+        num_legs=3,
+        memory_first_leg=True,
+        gamma_range=(0.6, 0.9),
+        seed=0,
+    ),
     damping=0.1,
     diis={"max_history": 6, "beta": 0.5},
-    seed=0,
 )
 ```
 
@@ -77,8 +80,9 @@ keeping `fuse_multibonds=False` so the external gauges, DIIS history, and warm
 starts retain a stable topology. `damping` is applied directly to the external
 gauge update, so it composes safely with per-bond Relay memory.
 
-For CPU NumPy tensors, `parallel=True` uses edge-coloured batches: bonds that
-share no tensor endpoint update concurrently. This changes the sweep order, so
-benchmark it for the target lattice; it is restricted to stable pairwise
-topologies (`fuse_multibonds=False`) and preserves the full represented tensor
-network exactly.
+Set `bp_check_every` (and optionally `bp_tol`) to record the D1BP residual of
+the current SU gauges. For CPU NumPy tensors, `schedule="parallel"` uses
+edge-coloured batches: bonds that share no tensor endpoint update concurrently.
+This changes the sweep order, so benchmark it for the target lattice; it is
+restricted to stable pairwise topologies (`fuse_multibonds=False`) and preserves
+the full represented tensor network exactly.

@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import warnings
 from typing import Any
 
 import autoray as ar
 import numpy as np
 
 __all__ = [
+    "RelayGaugeOptions",
     "compare_simple_update_gauges",
     "compare_simple_update_to_bp",
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
+    "gauge_all_simple",
     "gauge_all_simple_with_bp_check",
     "relay_gauge_all_simple",
     "run_d1bp_from_simple_update_gauges",
@@ -21,6 +25,21 @@ __all__ = [
     "simple_update_gauges_from_messages",
     "simple_update_messages_from_gauges",
 ]
+
+
+@dataclass(frozen=True)
+class RelayGaugeOptions:
+    """Optional disordered-memory controls for :func:`gauge_all_simple`.
+
+    ``None`` selects ordinary simple-update gauging. Supplying this object
+    runs several warm-started legs and mixes each memory leg's updated
+    nonnegative bond gauge with its preceding value.
+    """
+
+    num_legs: int = 3
+    gamma_range: tuple[float, float] = (0.0, 0.5)
+    memory_first_leg: bool = False
+    seed: int | None = None
 
 
 def _copy_array(x):
@@ -308,151 +327,39 @@ def gauge_all_simple_with_bp_check(
     inplace: bool = False,
     **gauge_opts,
 ):
-    """Run simple-update gauging and check BP fixed-point residuals.
+    """Deprecated compatibility wrapper for :func:`gauge_all_simple`.
 
-    The returned gauges are external SU bond gauges.  After each requested SU
-    sweep, the current gauges are mapped to D1BP messages and a one-update BP
-    residual is recorded.  This distinguishes Quimb's SU convergence measure
-    ``max_sdiff`` from actual 1-norm BP fixed-point quality ``max_mdiff``.
-
-    Parameters
-    ----------
-    tn : TensorNetwork
-        Closed scalar graph tensor network to gauge.
-    max_iterations : int, optional
-        Number of simple-gauge sweeps.
-    su_tol : float, optional
-        Stop when Quimb's simple-gauge ``max_sdiff`` is below this value.  Set
-        to ``0.0`` to run all sweeps unless ``bp_tol`` stops first.
-    bp_tol : float or None, optional
-        If supplied, also stop once the SU-induced D1BP residual is below this
-        value.  If ``su_tol > 0`` both criteria must pass.
-    bp_check_every : int, optional
-        Compute the BP residual every this many SU sweeps.
-    gauges : dict, optional
-        Gauge dictionary to update.  If omitted, one is created and returned.
-    info : dict, optional
-        Filled with convergence traces.
-    bp_opts : dict, optional
-        Options for :func:`d1bp_from_simple_update_gauges`.
-    inplace : bool, optional
-        Whether to gauge ``tn`` in-place.  The ``gauges`` dictionary is always
-        updated in-place if supplied.
-    gauge_opts
-        Extra options forwarded to Quimb's ``gauge_all_simple_`` for each
-        one-sweep update, e.g. ``smudge``, ``damping``, or ``fuse_multibonds``.
-
-    Returns
-    -------
-    tn_out, gauges, info : tuple
-        The gauged core tensor network, external SU gauges, and diagnostics.
+    The generic routine now owns ordinary SU, optional BP diagnostics, Relay
+    memory, and the edge-coloured parallel schedule.
     """
-    if bp_check_every < 1:
-        raise ValueError("bp_check_every must be >= 1")
-    if max_iterations < 0:
-        raise ValueError("max_iterations must be >= 0")
-
-    work = tn if inplace else tn.copy()
-    gauges = {} if gauges is None else gauges
-    info = {} if info is None else info
-    bp_opts = {} if bp_opts is None else dict(bp_opts)
-
-    su_mdiffs = info.setdefault("su_max_sdiffs", [])
-    bp_checks = info.setdefault("bp_checks", [])
-    bp_mdiffs = info.setdefault("bp_max_mdiffs", [])
-
-    last_bp_mdiff = None
-    last_bp_check_iteration = None
-    converged = False
-    # Quimb only computes max_sdiff when tol > 0 or progbar is active.  Use an
-    # infinite one-sweep tolerance to request the diagnostic without enabling
-    # early stopping inside the one-sweep call.
-    diff_tol = su_tol if su_tol > 0.0 else float("inf")
-
-    for iteration in range(1, max_iterations + 1):
-        step_info: dict[str, Any] = {}
-        work.gauge_all_simple_(
-            max_iterations=1,
-            tol=diff_tol,
-            gauges=gauges,
-            info=step_info,
-            **gauge_opts,
-        )
-        su_mdiff = float(step_info.get("max_sdiff", float("nan")))
-        su_mdiffs.append(su_mdiff)
-
-        if (iteration % bp_check_every) == 0:
-            last_bp_mdiff = simple_update_bp_residual(
-                work,
-                gauges,
-                bp_tol=0.0 if bp_tol is None else bp_tol,
-                bp_opts=bp_opts,
-            )
-            bp_mdiffs.append(last_bp_mdiff)
-            bp_checks.append(
-                {
-                    "iteration": iteration,
-                    "max_mdiff": last_bp_mdiff,
-                }
-            )
-            last_bp_check_iteration = iteration
-
-        # A BP residual describes the *current* SU gauges only.  Do not stop
-        # based on a stale residual from an earlier sweep when checks are
-        # intentionally sparse.
-        checked_current_bp = (
-            bp_tol is None or last_bp_check_iteration == iteration
-        )
-        if checked_current_bp and _should_stop(
-            su_tol, su_mdiff, bp_tol, last_bp_mdiff
-        ):
-            converged = True
-            break
-
-    # The final reported BP status must describe the returned gauges. This
-    # costs one additional residual only when the cadence skipped the last
-    # sweep and the caller requested BP-tolerance semantics.
-    if (
-        bp_tol is not None
-        and max_iterations
-        and last_bp_check_iteration != iteration
-    ):
-        last_bp_mdiff = simple_update_bp_residual(
-            work,
-            gauges,
-            bp_tol=bp_tol,
-            bp_opts=bp_opts,
-        )
-        bp_mdiffs.append(last_bp_mdiff)
-        bp_checks.append(
-            {
-                "iteration": iteration,
-                "max_mdiff": last_bp_mdiff,
-            }
-        )
-        last_bp_check_iteration = iteration
-
-    if not converged:
-        converged = _should_stop(
-            su_tol,
-            su_mdiffs[-1] if su_mdiffs else float("nan"),
-            bp_tol,
-            last_bp_mdiff,
-        )
-
-    info["iterations"] = iteration if max_iterations else 0
-    info["converged"] = converged
+    warnings.warn(
+        "gauge_all_simple_with_bp_check is deprecated; use "
+        "gauge_all_simple(..., bp_check_every=...) instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    work, gauges, info = gauge_all_simple(
+        tn,
+        max_iterations=max_iterations,
+        tol=su_tol,
+        bp_tol=bp_tol,
+        bp_check_every=bp_check_every,
+        gauges=gauges,
+        info=info,
+        bp_opts=bp_opts,
+        inplace=inplace,
+        **gauge_opts,
+    )
     info["su_converged"] = bool(
-        su_tol > 0.0 and su_mdiffs and su_mdiffs[-1] <= su_tol
+        su_tol > 0.0
+        and info["su_max_sdiffs"]
+        and info["su_max_sdiffs"][-1] <= su_tol
     )
     info["bp_converged"] = bool(
         bp_tol is not None
-        and last_bp_mdiff is not None
-        and last_bp_mdiff <= bp_tol
+        and info["bp_max_mdiff"] is not None
+        and info["bp_max_mdiff"] <= bp_tol
     )
-    info["max_sdiff"] = su_mdiffs[-1] if su_mdiffs else float("nan")
-    info["bp_max_mdiff"] = last_bp_mdiff
-
     return work, gauges, info
 
 
@@ -658,60 +565,18 @@ def _make_gauge_diis(diis):
     return DIIS(**diis) if isinstance(diis, dict) else DIIS()
 
 
-def relay_gauge_all_simple(
-    tn,
-    *,
-    max_iterations: int = 20,
-    tol: float = 0.0,
-    num_relays: int = 3,
-    gamma_range: tuple[float, float] = (0.0, 0.5),
-    damping: float = 0.0,
-    diis: bool | dict[str, Any] = False,
-    memory_first_leg: bool = False,
-    seed: int | None = None,
-    gauges=None,
-    parallel: bool = False,
-    max_workers: int | None = None,
-    info: dict[str, Any] | None = None,
-    inplace: bool = False,
-    **gauge_opts,
-):
-    """Converge Quimb simple-update gauges with Relay-style bond memory.
-
-    Each relay leg warm-starts from the preceding SU gauges. A memory leg
-    draws one damping strength per *bond* and mixes the newly updated positive
-    singular-value gauge with its previous value. ``damping`` adds a uniform
-    component to that mixing, including a plain first leg. The core is compensated so
-    that the returned ``(core, gauges)`` represents exactly the input tensor
-    network. Unlike BP relay, ``gamma_range`` is restricted to
-    ``0 <= gamma < 1`` because SU singular values must remain nonnegative.
-
-    ``diis=True`` (or a DIIS options dictionary) applies Quimb's Pulay/DIIS
-    extrapolator to the external gauge vectors after each sweep. Its
-    extrapolation is projected back to positive normalized singular values.
-
-    Set ``parallel=True`` to use an edge-coloured schedule: bonds sharing no
-    tensor endpoint update concurrently in CPU threads. It is opt-in, limited
-    to NumPy arrays, and requires ``fuse_multibonds=False`` (the default here)
-    so the topology remains fixed. It changes the sweep ordering, so benchmark
-    it on the target PEPS rather than expecting bitwise-identical gauges.
-
-    Parameters mirror :meth:`quimb.tensor.TensorNetwork.gauge_all_simple_`
-    where applicable. ``tol`` is a strict post-memory L2 gauge residual; set
-    it to zero to run every requested sweep.
-    """
-    if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
-        raise ValueError("max_iterations must be a positive integer")
-    if not isinstance(num_relays, (int, np.integer)) or num_relays < 1:
-        raise ValueError("num_relays must be a positive integer")
-    if tol < 0.0:
-        raise ValueError("tol must be nonnegative")
-    if not np.isfinite(damping) or not 0.0 <= damping < 1.0:
-        raise ValueError("damping must satisfy finite 0 <= damping < 1")
+def _validate_relay_options(relay: RelayGaugeOptions | None):
+    """Return validated Relay controls, or the ordinary-SU one-leg defaults."""
+    if relay is None:
+        return 1, 0.0, 0.0, False, None
+    if not isinstance(relay, RelayGaugeOptions):
+        raise TypeError("relay must be a RelayGaugeOptions instance or None")
+    if not isinstance(relay.num_legs, (int, np.integer)) or relay.num_legs < 1:
+        raise ValueError("relay.num_legs must be a positive integer")
     try:
-        gamma_min, gamma_max = map(float, gamma_range)
+        gamma_min, gamma_max = map(float, relay.gamma_range)
     except (TypeError, ValueError) as exc:
-        raise ValueError("gamma_range must contain two finite floats") from exc
+        raise ValueError("relay.gamma_range must contain two finite floats") from exc
     if not (
         np.isfinite(gamma_min)
         and np.isfinite(gamma_max)
@@ -720,29 +585,94 @@ def relay_gauge_all_simple(
         raise ValueError(
             "SU relay gamma_range must satisfy finite 0 <= min <= max < 1"
         )
+    return relay.num_legs, gamma_min, gamma_max, relay.memory_first_leg, relay.seed
+
+
+def gauge_all_simple(
+    tn,
+    *,
+    max_iterations: int = 20,
+    tol: float = 0.0,
+    bp_tol: float | None = None,
+    bp_check_every: int | None = None,
+    relay: RelayGaugeOptions | None = None,
+    damping: float = 0.0,
+    diis: bool | dict[str, Any] = False,
+    schedule: str = "sequential",
+    max_workers: int | None = None,
+    gauges=None,
+    info: dict[str, Any] | None = None,
+    bp_opts: dict[str, Any] | None = None,
+    inplace: bool = False,
+    **gauge_opts,
+):
+    """Converge simple-update gauges, optionally with BP checks or Relay.
+
+    Ordinary simple-update gauging is the default. Supply
+    :class:`RelayGaugeOptions` to add disordered-memory relay legs, and set
+    ``schedule="parallel"`` to update edge-coloured, tensor-disjoint bonds in
+    CPU threads. ``bp_tol`` and ``bp_check_every`` optionally check the
+    D1BP residual induced by the current external SU gauges.
+
+    ``tol`` measures the final external-gauge L2 residual, after optional
+    Relay memory, damping, and DIIS. The raw Quimb SU residual is retained in
+    ``info["su_max_sdiffs"]`` for diagnostics. When both ``tol`` and
+    ``bp_tol`` are nonzero, both must pass for convergence.
+
+    Relay, DIIS, and the parallel schedule require stable external bond ids,
+    and therefore require ``fuse_multibonds=False``. The returned core and
+    external gauges always represent the input tensor network exactly.
+    """
+    if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 0:
+        raise ValueError("max_iterations must be a nonnegative integer")
+    if tol < 0.0:
+        raise ValueError("tol must be nonnegative")
+    if bp_tol is not None and bp_tol < 0.0:
+        raise ValueError("bp_tol must be nonnegative or None")
+    if not np.isfinite(damping) or not 0.0 <= damping < 1.0:
+        raise ValueError("damping must satisfy finite 0 <= damping < 1")
+    if schedule not in {"sequential", "parallel"}:
+        raise ValueError("schedule must be 'sequential' or 'parallel'")
     if max_workers is not None and (
         not isinstance(max_workers, (int, np.integer)) or max_workers < 1
     ):
         raise ValueError("max_workers must be a positive integer or None")
+    if bp_check_every is None and bp_tol is not None:
+        bp_check_every = 1
+    if bp_check_every is not None and bp_check_every < 1:
+        raise ValueError("bp_check_every must be >= 1 or None")
 
+    num_legs, gamma_min, gamma_max, memory_first_leg, seed = (
+        _validate_relay_options(relay)
+    )
+    parallel = schedule == "parallel"
     gauge_opts = dict(gauge_opts)
-    controlled = {"gauges", "info", "inplace", "max_iterations", "tol", "damping"}
+    controlled = {
+        "gauges", "info", "inplace", "max_iterations", "tol", "bp_tol",
+        "bp_check_every", "relay", "damping", "diis", "schedule",
+        "max_workers",
+    }
     forbidden = controlled & set(gauge_opts)
     if forbidden:
         names = ", ".join(sorted(forbidden))
-        raise TypeError(f"pass {names} directly to relay_gauge_all_simple")
-    gauge_opts.setdefault("fuse_multibonds", False)
-    if gauge_opts["fuse_multibonds"]:
-        raise ValueError(
-            "relay simple-update requires fuse_multibonds=False so external "
-            "gauge keys and warm starts remain stable"
-        )
+        raise TypeError(f"pass {names} directly to gauge_all_simple")
+
+    needs_stable_gauges = (
+        relay is not None or damping != 0.0 or bool(diis) or parallel
+    )
+    if needs_stable_gauges:
+        gauge_opts.setdefault("fuse_multibonds", False)
+        if gauge_opts["fuse_multibonds"]:
+            raise ValueError(
+                "Relay, DIIS, or parallel simple-update requires "
+                "fuse_multibonds=False so external gauge keys remain stable"
+            )
 
     work = tn if inplace else tn.copy()
     gauges = {} if gauges is None else gauges
     info = {} if info is None else info
+    bp_opts = {} if bp_opts is None else dict(bp_opts)
     progbar = gauge_opts.pop("progbar", False)
-    rng = np.random.default_rng(seed)
     bonds = tuple(work._inner_inds)
     if not bonds:
         info.update(
@@ -750,7 +680,34 @@ def relay_gauge_all_simple(
                 "converged": True,
                 "iterations": 0,
                 "max_sdiff": 0.0,
+                "raw_max_sdiff": 0.0,
+                "su_max_sdiffs": [],
+                "bp_max_mdiff": None,
+                "bp_max_mdiffs": [],
+                "bp_checks": [],
                 "num_legs_run": 0,
+                "best_leg": None,
+                "schedule": schedule,
+                "parallel": parallel,
+                "legs": [],
+            }
+        )
+        return work, gauges, info
+    if max_iterations == 0:
+        info.update(
+            {
+                "converged": False,
+                "iterations": 0,
+                "max_sdiff": float("nan"),
+                "raw_max_sdiff": float("nan"),
+                "su_max_sdiffs": [],
+                "bp_max_mdiff": None,
+                "bp_max_mdiffs": [],
+                "bp_checks": [],
+                "num_legs_run": 0,
+                "best_leg": None,
+                "schedule": schedule,
+                "parallel": parallel,
                 "legs": [],
             }
         )
@@ -759,30 +716,34 @@ def relay_gauge_all_simple(
     if progbar:
         import tqdm
 
-        pbar = tqdm.tqdm(total=max_iterations * num_relays)
+        pbar = tqdm.tqdm(total=max_iterations * num_legs)
     else:
         pbar = None
 
     best = None
     legs = []
-    for leg in range(num_relays):
-        use_memory = memory_first_leg or leg > 0
+    rng = np.random.default_rng(seed)
+    for leg in range(num_legs):
+        use_memory = relay is not None and (memory_first_leg or leg > 0)
         relay_gamma_by_bond = (
             {index: float(rng.uniform(gamma_min, gamma_max)) for index in bonds}
             if use_memory
             else {index: 0.0 for index in bonds}
         )
-        # Applying uniform damping after each raw SU sweep is compatible with
-        # the per-bond Relay mix and works identically for sequential and
-        # edge-coloured parallel schedules.
         gamma_by_bond = {
             index: damping + (1.0 - damping) * gamma
             for index, gamma in relay_gamma_by_bond.items()
         }
         accelerator = _make_gauge_diis(diis)
+        raw_sdiffs = []
         residuals = []
+        bp_mdiffs = []
+        bp_checks = []
+        last_bp_mdiff = None
+        last_bp_check_iteration = None
         diis_steps = 0
         converged = False
+        iteration = 0
         for iteration in range(1, max_iterations + 1):
             previous = copy_gauges(gauges)
             raw_sdiff = _simple_gauge_sweep(
@@ -792,24 +753,55 @@ def relay_gauge_all_simple(
                 max_workers=max_workers,
                 gauge_opts=gauge_opts,
             )
+            raw_sdiffs.append(raw_sdiff)
             if any(gamma_by_bond.values()):
-                _mix_relay_gauges(
-                    work,
-                    gauges,
-                    previous,
-                    gamma_by_bond,
-                )
+                _mix_relay_gauges(work, gauges, previous, gamma_by_bond)
             if accelerator is not None and set(previous) == set(gauges):
                 diis_steps += _apply_gauge_diis(work, gauges, accelerator)
             max_sdiff = _external_gauge_residual(previous, gauges)
             residuals.append(max_sdiff)
+
+            if bp_check_every is not None and iteration % bp_check_every == 0:
+                last_bp_mdiff = simple_update_bp_residual(
+                    work,
+                    gauges,
+                    bp_tol=0.0 if bp_tol is None else bp_tol,
+                    bp_opts=bp_opts,
+                )
+                bp_mdiffs.append(last_bp_mdiff)
+                bp_checks.append({"iteration": iteration, "max_mdiff": last_bp_mdiff})
+                last_bp_check_iteration = iteration
+
             if pbar is not None:
                 pbar.update()
                 pbar.set_description(f"max|dS|={max_sdiff:.2e}")
-            if tol > 0.0 and max_sdiff < tol:
+            checked_current_bp = (
+                bp_tol is None or last_bp_check_iteration == iteration
+            )
+            if checked_current_bp and _should_stop(
+                tol, max_sdiff, bp_tol, last_bp_mdiff
+            ):
                 converged = True
                 break
 
+        if (
+            bp_tol is not None
+            and iteration
+            and last_bp_check_iteration != iteration
+        ):
+            last_bp_mdiff = simple_update_bp_residual(
+                work,
+                gauges,
+                bp_tol=bp_tol,
+                bp_opts=bp_opts,
+            )
+            bp_mdiffs.append(last_bp_mdiff)
+            bp_checks.append({"iteration": iteration, "max_mdiff": last_bp_mdiff})
+            last_bp_check_iteration = iteration
+
+        final_sdiff = residuals[-1] if residuals else float("nan")
+        if not converged:
+            converged = _should_stop(tol, final_sdiff, bp_tol, last_bp_mdiff)
         leg_info = {
             "leg": leg,
             "memory": use_memory or damping > 0.0,
@@ -817,12 +809,22 @@ def relay_gauge_all_simple(
             "diis_steps": diis_steps,
             "iterations": iteration,
             "converged": converged,
-            "max_sdiff": residuals[-1],
-            "raw_max_sdiff": raw_sdiff,
+            "gauge_converged": bool(tol > 0.0 and final_sdiff <= tol),
+            "bp_converged": bool(
+                bp_tol is not None
+                and last_bp_mdiff is not None
+                and last_bp_mdiff <= bp_tol
+            ),
+            "max_sdiff": final_sdiff,
+            "raw_max_sdiff": raw_sdiffs[-1] if raw_sdiffs else float("nan"),
             "max_sdiffs": residuals,
+            "su_max_sdiffs": raw_sdiffs,
+            "bp_max_mdiff": last_bp_mdiff,
+            "bp_max_mdiffs": bp_mdiffs,
+            "bp_checks": bp_checks,
         }
         legs.append(leg_info)
-        score = (0 if converged else 1, residuals[-1])
+        score = (0 if converged else 1, final_sdiff)
         if best is None or score < best[0]:
             best = (score, work.copy(), copy_gauges(gauges), leg_info)
 
@@ -841,13 +843,67 @@ def relay_gauge_all_simple(
             "converged": best_leg["converged"],
             "iterations": best_leg["iterations"],
             "max_sdiff": best_leg["max_sdiff"],
-            "num_legs_run": num_relays,
+            "raw_max_sdiff": best_leg["raw_max_sdiff"],
+            "su_max_sdiffs": best_leg["su_max_sdiffs"],
+            "bp_max_mdiff": best_leg["bp_max_mdiff"],
+            "bp_max_mdiffs": best_leg["bp_max_mdiffs"],
+            "bp_checks": best_leg["bp_checks"],
+            "num_legs_run": num_legs,
             "best_leg": best_leg["leg"],
+            "schedule": schedule,
             "parallel": parallel,
             "legs": legs,
         }
     )
     return work, gauges, info
+
+
+def relay_gauge_all_simple(
+    tn,
+    *,
+    max_iterations: int = 20,
+    tol: float = 0.0,
+    num_relays: int = 3,
+    gamma_range: tuple[float, float] = (0.0, 0.5),
+    damping: float = 0.0,
+    diis: bool | dict[str, Any] = False,
+    memory_first_leg: bool = False,
+    seed: int | None = None,
+    gauges=None,
+    parallel: bool = False,
+    max_workers: int | None = None,
+    info: dict[str, Any] | None = None,
+    inplace: bool = False,
+    **gauge_opts,
+):
+    """Deprecated compatibility wrapper for :func:`gauge_all_simple`."""
+    warnings.warn(
+        "relay_gauge_all_simple is deprecated; use gauge_all_simple with "
+        "relay=RelayGaugeOptions(...) instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer")
+    return gauge_all_simple(
+        tn,
+        max_iterations=max_iterations,
+        tol=tol,
+        relay=RelayGaugeOptions(
+            num_legs=num_relays,
+            gamma_range=gamma_range,
+            memory_first_leg=memory_first_leg,
+            seed=seed,
+        ),
+        damping=damping,
+        diis=diis,
+        schedule="parallel" if parallel else "sequential",
+        max_workers=max_workers,
+        gauges=gauges,
+        info=info,
+        inplace=inplace,
+        **gauge_opts,
+    )
 
 
 def simple_update_gauges_from_messages(

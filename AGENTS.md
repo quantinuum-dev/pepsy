@@ -57,15 +57,17 @@ At the start of a new task:
 
 - The experimental BP integration is isolated in `src/pepsy/bp/`; import it as
   `pepsy.bp` rather than promoting its symbols to the lazy top-level namespace.
-- `relay_gauge_all_simple` is the convergence-accelerated simple-update path.
-  It must preserve the represented tensor network exactly when it mixes an
-  external bond gauge: compensate the two adjacent core tensors before
-  returning `(core, gauges)`. Relay memory and DIIS candidates are projected
-  back to nonnegative, L2-normalized singular-value gauges.
+- `gauge_all_simple` is the single simple-update gauge path. Its optional
+  `RelayGaugeOptions` enables convergence acceleration. It must preserve the
+  represented tensor network exactly when it mixes an external bond gauge:
+  compensate the two adjacent core tensors before returning `(core, gauges)`.
+  Relay memory and DIIS candidates are projected back to nonnegative,
+  L2-normalized singular-value gauges.
 - Relay/SU state, DIIS history, and warm starts are keyed by the stable external
   bond ids, so this path intentionally rejects `fuse_multibonds=True`. Its
-  `parallel=True` mode schedules edge-coloured, non-overlapping bond batches on
-  threads for CPU NumPy networks; retain the serial route for other backends.
+  `schedule="parallel"` mode schedules edge-coloured, non-overlapping bond
+  batches on threads for CPU NumPy networks; retain the serial route for other
+  backends.
 - For D1BP warm starts from simple update, use
   `simple_update_core_and_gauges_from_messages` and
   `run_d1bp_from_simple_update_gauges`; validate the post-update residual rather
