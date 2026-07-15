@@ -206,6 +206,11 @@ new simulator features.
   errors into the tableau, while `MpsOptimizer` replays the identical stream.
   Detector/observable annotations remain Stim/decoder concerns and do not alter
   the quantum trajectory.
+- **Single-STN Stim convenience** — `MpsStabOptimizer.from_stim(...)` infers the
+  register, compiles and samples one Stim trajectory, and retains its plan/sample
+  on the simulator. Its `stream_transform` hook permits external schedules to
+  add physical Pepsy gates or remove terminal readout without duplicating Stim
+  noise parsing; the transform never changes the retained raw fault record.
 - **User-defined trajectory noise** — `TrajectoryEvent` embeds a local
   `TrajectoryChannel` directly in an ordinary Pepsy gate stream. Fixed
   random-unitary mixtures sample a concrete gate without a state; complete

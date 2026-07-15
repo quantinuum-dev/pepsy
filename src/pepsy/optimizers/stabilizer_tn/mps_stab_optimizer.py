@@ -452,6 +452,13 @@ class MpsStabOptimizer:
         ``|nu>`` max bond dimension after each applied entry.
     measurements : list[tuple]
         Recorded ``(pauli, where, outcome)`` for each measurement performed.
+    stim_plan : pepsy.StimCircuitPlan | None
+        Compiled source circuit retained by :meth:`from_stim`; otherwise
+        ``None``.
+    stim_sample : pepsy.StimNoiseSample | None
+        Raw sampled source trajectory retained by :meth:`from_stim`; otherwise
+        ``None``. Its fault and herald records are unchanged by any
+        ``stream_transform`` supplied to that constructor.
     """
 
     def __init__(
@@ -552,6 +559,11 @@ class MpsStabOptimizer:
         self.norm_events: List[dict] = []
         self.bond_history: List[int] = [self.state.max_bond()]
         self.measurements: List[tuple] = []
+        # These are populated by ``from_stim``. Keeping the raw compiled
+        # trajectory separate from the queued stream makes optional caller-side
+        # stream transforms explicit and reproducible.
+        self.stim_plan = None
+        self.stim_sample = None
         if gates is not None:
             self.add_gates(gates)
         if layout is not None and layout is not False:
@@ -589,6 +601,57 @@ class MpsStabOptimizer:
     def from_mps(cls, p, **kwargs) -> "MpsStabOptimizer":
         """Start from a qubit MPS in the ordinary computational basis."""
         return cls(p, **kwargs)
+
+    @classmethod
+    def from_stim(
+        cls, circuit, *, seed: Optional[int] = None, stream_transform=None, **kwargs
+    ) -> "MpsStabOptimizer":
+        """Build one STN trajectory directly from a Stim circuit.
+
+        The circuit is compiled once by :func:`pepsy.compile_stim_circuit`, then
+        every native Stim stochastic Pauli channel is sampled once using
+        ``seed``. The same seed initializes the later measurement sampler on
+        the returned STN (with an independent random-number generator). The
+        inferred Stim qubit count creates the initial ``|0...0>`` STN state,
+        and the resulting physical Pepsy stream is queued for a later
+        :meth:`run`.
+
+        ``stream_transform``, when supplied, receives the immutable sampled
+        gate-stream tuple and must return the replacement Pepsy gate stream.
+        It is useful for an external circuit producer to insert physical
+        non-Stim gates or to omit a terminal readout while preserving Pepsy's
+        Stim parsing and noise sampling. The raw :attr:`stim_plan` and
+        :attr:`stim_sample` remain available on the returned simulator for
+        reproducibility and fault/herald inspection.
+
+        ``state`` and ``gates`` are intentionally not accepted in ``kwargs``:
+        this constructor derives the initial register and queued stream from
+        the Stim circuit. Use :meth:`from_tableau_and_state` or the regular
+        constructor for a non-default initial STN state.
+        """
+        if "state" in kwargs or "gates" in kwargs:
+            raise TypeError(
+                "MpsStabOptimizer.from_stim derives state and gates from the "
+                "Stim circuit; use stream_transform for stream edits."
+            )
+        if stream_transform is not None and not callable(stream_transform):
+            raise TypeError("stream_transform must be callable or None.")
+
+        # Local imports keep Stim optional and avoid coupling the STN core to
+        # the generic trajectory module during ordinary construction.
+        from ..noise import compile_stim_circuit, sample_stim_circuit
+
+        plan = compile_stim_circuit(circuit)
+        sample = sample_stim_circuit(plan, seed=seed)
+        gates = (
+            sample.gate_stream
+            if stream_transform is None
+            else stream_transform(sample.gate_stream)
+        )
+        optimizer = cls(plan.num_qubits, gates=gates, seed=seed, **kwargs)
+        optimizer.stim_plan = plan
+        optimizer.stim_sample = sample
+        return optimizer
 
     # ------------------------------------------------------------------ #
     # Properties / queue management

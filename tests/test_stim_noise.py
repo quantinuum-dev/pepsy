@@ -120,6 +120,41 @@ def test_stim_sampled_trajectory_replays_with_stn_and_ordinary_mps():
     assert all(sample.faults == (pepsy.PauliFault(1, 0, "Z"),) for sample in stn.samples)
 
 
+def test_mps_stab_optimizer_from_stim_keeps_sample_and_transforms_stream():
+    circuit = "H 0\nZ_ERROR(1) 0\nM 0"
+    received = []
+
+    def omit_terminal_readout(stream):
+        received.append(stream)
+        return stream[:-1]
+
+    sim = pepsy.MpsStabOptimizer.from_stim(
+        circuit,
+        seed=7,
+        stream_transform=omit_terminal_readout,
+        chi=2,
+    )
+
+    assert sim.n == 1
+    assert sim.stim_plan.num_qubits == 1
+    expected_sample = pepsy.sample_stim_circuit(circuit, seed=7)
+    assert sim.stim_sample.faults == expected_sample.faults
+    assert sim.stim_sample.heralds == expected_sample.heralds
+    assert received[0] is sim.stim_sample.gate_stream
+    assert sim.stim_sample.faults == (pepsy.PauliFault(1, 0, "Z"),)
+
+    sim.run()
+    expected = np.array([1.0, -1.0], dtype=complex) / np.sqrt(2)
+    np.testing.assert_allclose(sim.to_statevector(), expected, atol=1e-6)
+
+
+def test_mps_stab_optimizer_from_stim_rejects_conflicting_inputs():
+    with pytest.raises(TypeError, match="derives state and gates"):
+        pepsy.MpsStabOptimizer.from_stim("H 0", gates=[])
+    with pytest.raises(TypeError, match="stream_transform"):
+        pepsy.MpsStabOptimizer.from_stim("H 0", stream_transform=False)
+
+
 def test_stim_replay_matches_the_ordinary_mps_backend():
     torch = pytest.importorskip("torch")
 

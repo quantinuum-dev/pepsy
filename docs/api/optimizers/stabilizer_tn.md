@@ -22,6 +22,21 @@ identity tableau, so initially `C = I` and `|psi> = |p>`. Use this for an
 already-prepared MPS ground state. Pass `inplace=False` to copy the supplied
 MPS before evolution.
 
+For one sampled Stim trajectory, use
+`MpsStabOptimizer.from_stim(circuit, seed=...)`. It compiles the Stim circuit,
+infers its qubit count, samples native Pauli noise once, and queues the resulting
+stream. The seed also deterministically initializes its later measurement sampling.
+The returned simulator retains `.stim_plan` and `.stim_sample`, including
+the selected faults and herald bits. `stream_transform=` receives the immutable
+sampled stream and can insert ordinary physical Pepsy gates or remove a terminal
+readout before replay; this keeps the Stim-to-Pepsy parsing in one public path.
+
+```python
+sim = pepsy.MpsStabOptimizer.from_stim(circuit, chi=32, seed=7)
+sim.run(progbar=True)
+print(sim.stim_sample.faults)
+```
+
 `disentangle_cliffords(sweeps=1, *, bonds=None, tol=None)` is an optional
 Clifford-gauge optimization: it applies a local coefficient-frame Clifford
 `D`, then absorbs `D^dagger` into the tableau, so `(C D^dagger)(D |nu>) = C
