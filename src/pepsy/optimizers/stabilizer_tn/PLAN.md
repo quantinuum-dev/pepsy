@@ -198,6 +198,14 @@ new simulator features.
   O(depth·window), **independent of `n`** for local circuits (n=16/24/32 ~0.28s at
   fixed depth). `STNState` caches `current_inverse_tableau` (invalidated on basis
   changes). Correctness is validated by the focused STN and stress suites.
+- **Stim circuit noise trajectories** — `pepsy.compile_stim_circuit`,
+  `sample_stim_circuit`, and `run_stim_shots` compile one-/two-qubit Clifford
+  circuit operations once and sample every native Stim Pauli noise channel as
+  local physical Pauli entries. This includes correlated and heralded channels;
+  herald records are retained with each trajectory. The STN routes the sampled
+  errors into the tableau, while `MpsOptimizer` replays the identical stream.
+  Detector/observable annotations remain Stim/decoder concerns and do not alter
+  the quantum trajectory.
 
 ## Cross-checked against the reference (bsc-quantic/stabilizer-TN v1.1/v1.2)
 
