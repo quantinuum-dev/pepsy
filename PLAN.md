@@ -163,6 +163,25 @@ loop *series* expansion (whose `I − m⊗m` projectors rely on the fixed point)
 Next: a PEPS local-observable / energy helper (product & sum formulas) with
 Wynn-ε extrapolation.
 
+**Implemented (2026-07-15):** `pepsy.bp.linked_cluster_expand` is the separate
+Midha--Zhang connected-loop/Ursell expansion of `log Z` for closed pairwise
+D1BP networks. It retains the excited *bond* set (so chorded regions are not
+silently conflated), enumerates connected loop multisets including repetitions,
+and returns `Z_BP * exp(connected correction)`. `LinkedClusterCache` reuses
+loop/cluster geometry across topology-preserving time steps or BP candidates;
+`tail_by_weight` supplies a low-order convergence diagnostic and
+`select_bp_candidate` uses it to rank already-converged multi-start/Relay
+fixed points. This complements rather than replaces the Quimb region-cluster
+wrapper above. Tests verify the repeated-loop `log(1 + w)` series on a ring.
+
+**Implemented (2026-07-15):** `BPState.update_local` restores a D1BP fixed
+point after value-only changes and starts D1BP's scheduler from the changed
+tensors. A finite radius is deliberately marked as an unfinished light-cone
+approximation; `radius=None` continues to a new D1BP fixed point. This is a
+practical warm-start use of the locality insight in arXiv:2604.21919, not a
+claim that arbitrary Pepsy tensor networks satisfy its strong-injectivity
+hypotheses.
+
 ### Cluster-corrected bond compression (better than naive BP messages)
 
 BP-gauge compression (quimb `compress_l2bp` / `compress_d2bp`, Tindall–Fishman

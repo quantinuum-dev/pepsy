@@ -16,10 +16,18 @@ and :func:`pepsy.gauge_all_simple`.
 """
 
 from .cluster import (
+    BPCandidateScore,
+    BPCandidateSelection,
+    ConnectedLoop,
+    LinkedClusterCache,
+    LinkedClusterResult,
+    LinkedClusterTerm,
     ScalarClusterCache,
     LoopClusterResult,
+    linked_cluster_expand,
     loop_cluster_expand,
     norm1_gloop_expand,
+    select_bp_candidate,
 )
 from .gauges import (
     GaugeResult,
@@ -38,10 +46,18 @@ from .gauges import (
     simple_update_gauges_from_messages,
     simple_update_messages_from_gauges,
 )
-from .relay import RelayBPResult, one_norm_bp, relay_bp
+from .relay import BPState, BPUpdateResult, RelayBPResult, one_norm_bp, relay_bp
 
 __all__ = [
     "GaugeResult",
+    "BPCandidateScore",
+    "BPCandidateSelection",
+    "BPState",
+    "BPUpdateResult",
+    "ConnectedLoop",
+    "LinkedClusterCache",
+    "LinkedClusterResult",
+    "LinkedClusterTerm",
     "LoopClusterResult",
     "RelayGaugeOptions",
     "ScalarClusterCache",
@@ -55,6 +71,7 @@ __all__ = [
     "relay_gauge_all_simple",
     "RelayBPResult",
     "loop_cluster_expand",
+    "linked_cluster_expand",
     "norm1_gloop_expand",
     "one_norm_bp",
     "relay_bp",
@@ -63,4 +80,5 @@ __all__ = [
     "simple_update_core_and_gauges_from_messages",
     "simple_update_gauges_from_messages",
     "simple_update_messages_from_gauges",
+    "select_bp_candidate",
 ]

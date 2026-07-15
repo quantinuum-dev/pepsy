@@ -3,7 +3,7 @@
 Annotated bibliography for the `pepsy.bp` subpackage (BP contraction, loop /
 cluster corrections, convergence robustness) and the sibling **tensy** BP-decoder
 work. Kept next to the code so the reference trail is not lost. Last updated
-2026-07-11.
+2026-07-15.
 
 Legend: **[pepsy]** implemented/wrapped here · **[quimb]** available upstream in
 `quimb.tensor.belief_propagation` · **[tensy]** consumed by the tensy decoder
@@ -16,8 +16,10 @@ side · **[roots]** foundational / prior art.
 | API | what | paper |
 | --- | --- | --- |
 | `one_norm_bp`, `relay_bp`, `RelayBPResult` | 1-norm BP + disordered-memory / relay-BP convergence robustness | Müller et al. 2506.01779 |
+| `BPState`, `BPUpdateResult` | cached D1BP messages and a bounded/local warm-update light cone for value-only topology-preserving changes | Midha et al. 2604.21919 (algorithmic-locality motivation; Pepsy scope documented in API) |
 | `gauge_all`, `simple_update_core_and_gauges_from_messages`, `run_d1bp_from_simple_update_gauges`, `gauge_all_simple` | nonnegative simple-update ↔ D1BP gauge bridge; ordinary/relay/DIIS simple-update gauging with exact core compensation | Alkabetz & Arad (2021); Tindall & Fishman (2023); Müller et al. 2506.01779 |
 | `loop_cluster_expand`, `LoopClusterResult` | loop **cluster** expansion (thin wrapper over quimb `contract_gloop_expand`) | Gray et al. 2510.05647 |
+| `linked_cluster_expand`, `LinkedClusterCache`, `select_bp_candidate` | connected-loop/Ursell expansion of `log Z`, cached graph enumeration, and cluster-tail fixed-point selection | Midha & Zhang 2510.02290 |
 
 ---
 
@@ -57,6 +59,14 @@ active research frontier.**
   `|Z_l| ≤ e^{−c|l|}`, `d = c − log(2(Δ−1)) − 1/2`. Size-independent. Built
   **around** the BP fixed point (fixed-point-sensitive). Forthcoming decoding
   paper (degeneracy / qLDPC threshold). ITensor.
+- **Midha, Zhang, and collaborators**, *Algorithmic Locality via Provable
+  Convergence in Quantum Tensor Networks*, arXiv:2604.21919 (2026). In its
+  strong-injectivity regime, a unique convergent BP-like fixed point has
+  exponentially decaying response to a local tensor perturbation. This
+  motivates Pepsy's `BPState.update_local`: it is a scheduler-level warm start
+  for D1BP, not a universal proof that arbitrary Pepsy tensors satisfy those
+  hypotheses. A finite `radius` is therefore labelled a bounded local
+  approximation; `radius=None` runs until D1BP's local queue is empty.
 - **Sim, Park, Kim, Zang, Zou, Kim, Yang, … (Myung / UNIST group)**, *Stochastic
   Loop Corrections to Belief Propagation for Tensor Network Contraction*,
   arXiv:2603.08427 (2026). **Monte-Carlo** loop correction: exact factorization

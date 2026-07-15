@@ -16,7 +16,11 @@ qtn = pytest.importorskip("quimb.tensor")
 pytest.importorskip("quimb.tensor.belief_propagation")
 
 from pepsy.bp import (  # noqa: E402
+    BPState,
+    BPCandidateSelection,
     GaugeResult,
+    LinkedClusterCache,
+    LinkedClusterResult,
     LoopClusterResult,
     RelayGaugeOptions,
     ScalarClusterCache,
@@ -26,10 +30,12 @@ from pepsy.bp import (  # noqa: E402
     gauge_all,
     gauge_all_simple,
     gauge_all_simple_with_bp_check,
+    linked_cluster_expand,
     loop_cluster_expand,
     norm1_gloop_expand,
     relay_gauge_all_simple,
     run_d1bp_from_simple_update_gauges,
+    select_bp_candidate,
     simple_update_bp_residual,
     simple_update_core_and_gauges_from_messages,
     simple_update_gauges_from_messages,
@@ -47,7 +53,11 @@ def test_exports():
     from pepsy import bp
 
     assert {
+        "BPState",
+        "BPCandidateSelection",
         "GaugeResult",
+        "LinkedClusterCache",
+        "LinkedClusterResult",
         "LoopClusterResult",
         "RelayGaugeOptions",
         "ScalarClusterCache",
@@ -56,12 +66,14 @@ def test_exports():
         "d1bp_from_simple_update_gauges",
         "gauge_all",
         "gauge_all_simple",
+        "linked_cluster_expand",
         "loop_cluster_expand",
         "norm1_gloop_expand",
         "run_d1bp_from_simple_update_gauges",
         "simple_update_bp_residual",
         "simple_update_core_and_gauges_from_messages",
         "simple_update_gauges_from_messages",
+        "select_bp_candidate",
     } <= set(bp.__all__)
 
 
@@ -166,6 +178,96 @@ def _positive_triangle():
             ),
         ]
     )
+
+
+def _locally_perturbed_triangle():
+    """Return a triangle with one changed tensor and its changed tensor id."""
+    tn = _positive_triangle()
+    tid = next(iter(tn.tensor_map))
+    tensor = tn.tensor_map[tid]
+    tensor.modify(
+        data=tensor.data * np.array([[1.03, 0.97], [1.01, 0.99]])
+    )
+    return tn, tid
+
+
+def test_linked_cluster_repeated_loops_converge_to_a_single_ring_exactly():
+    """Repeated-loop Ursell terms reproduce the log(1 + loop) expansion."""
+    tn = _positive_triangle()
+    exact = tn.contract()
+    cache = LinkedClusterCache()
+
+    first = linked_cluster_expand(
+        tn,
+        max_loop_weight=3,
+        max_cluster_weight=3,
+        cache=cache,
+        tol=1e-12,
+    )
+    fourth = linked_cluster_expand(
+        tn,
+        max_loop_weight=3,
+        max_cluster_weight=12,
+        cache=cache,
+        tol=1e-12,
+    )
+
+    assert isinstance(first, LinkedClusterResult)
+    assert len(first.loops) == 1
+    assert [term.ursell for term in fourth.terms] == [1.0, -0.5, 1 / 3, -0.25]
+    assert sorted(fourth.tail_by_weight) == [3, 6, 9, 12]
+    assert len(cache.loops_by_max_weight) == 1
+    assert abs(fourth.estimate - exact) < abs(first.estimate - exact) / 1e5
+
+
+def test_bp_state_local_update_matches_a_fresh_d1bp_fixed_point():
+    """A value-only local update propagates the warm start to the same BP FP."""
+    from pepsy.bp import one_norm_bp
+
+    original = _positive_triangle()
+    state = BPState.from_result(one_norm_bp(original, method="d1bp", tol=1e-12))
+    changed, changed_tid = _locally_perturbed_triangle()
+
+    updated = state.update_local(changed, [changed_tid], tol=1e-12)
+    fresh = one_norm_bp(changed, method="d1bp", tol=1e-12)
+
+    assert updated.used_local_scheduler
+    assert updated.fully_converged
+    assert changed_tid in updated.updated_tids
+    assert not updated.boundary_tids
+    assert np.isclose(updated.result.contract(), fresh.contract())
+
+
+def test_bp_state_radius_reports_an_unpropagated_boundary():
+    from pepsy.bp import one_norm_bp
+
+    original = _positive_triangle()
+    state = BPState.from_result(one_norm_bp(original, method="d1bp", tol=1e-12))
+    changed, changed_tid = _locally_perturbed_triangle()
+
+    limited = state.update_local(changed, [changed_tid], radius=0, tol=1e-12)
+
+    assert limited.used_local_scheduler
+    assert not limited.fully_converged
+    assert limited.updated_tids == (changed_tid,)
+    assert limited.boundary_tids
+
+
+def test_cluster_tail_selects_among_converged_d1bp_candidates():
+    from pepsy.bp import one_norm_bp
+
+    tn = _positive_triangle()
+    candidate = one_norm_bp(tn, method="d1bp", tol=1e-12)
+    selection = select_bp_candidate(
+        tn,
+        (candidate, candidate),
+        max_loop_weight=3,
+        max_cluster_weight=6,
+    )
+
+    assert isinstance(selection, BPCandidateSelection)
+    assert selection.selected_index == 0
+    assert all(score.tail_abs > 0.0 for score in selection.scores)
 
 
 def _real_su_triangle():

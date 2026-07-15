@@ -1,4 +1,4 @@
-"""Loop cluster expansion: a systematic, convergence-robust correction to BP.
+"""Systematic BP corrections: region loop clusters and linked loop clusters.
 
 This wraps quimb's 2-norm generalized-loop cluster expansion and supplies a
 scalar 1-norm implementation with an explicit Bethe baseline.  The latter is
@@ -53,22 +53,39 @@ relay-BP hardens the *fixed point*, while the loop cluster expansion buys back
 the accuracy that BP misses due to loops, and is the more convergence-robust of
 the two loop corrections quimb exposes (the loop *series* expansion is more
 sensitive to the fixed-point condition).
+
+Alongside that region/NLCE path, :func:`linked_cluster_expand` implements the
+edge-resolved connected-polymer/Ursell expansion of ``log(Z)`` in Midha and
+Zhang, arXiv:2510.02290. It intentionally remains a separate API: a
+system-covering region cluster is exact with arbitrary boundary messages,
+whereas the rank-one-vacuum loop projectors in the linked expansion require a
+D1BP fixed point for their formal cancellations.
 """
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
-from itertools import chain
+from itertools import chain, combinations
+from math import factorial
 from typing import Any
 
 import autoray as ar
 import numpy as np
 
 __all__ = [
+    "BPCandidateScore",
+    "BPCandidateSelection",
+    "ConnectedLoop",
+    "LinkedClusterCache",
+    "LinkedClusterResult",
+    "LinkedClusterTerm",
     "LoopClusterResult",
     "ScalarClusterCache",
+    "linked_cluster_expand",
     "loop_cluster_expand",
     "norm1_gloop_expand",
+    "select_bp_candidate",
 ]
 
 # norm keyword -> quimb belief-propagation class name.
@@ -220,6 +237,317 @@ class ScalarClusterCache:
             )
             self.counted_regions[loop_key] = regions
             return regions
+
+
+@dataclass(frozen=True)
+class ConnectedLoop:
+    """A connected generalized loop represented by its excited bond indices.
+
+    Unlike quimb's region-oriented ``gen_gloops`` helper, this representation
+    retains the *edge set*. That distinction matters whenever a tensor region
+    contains a chord: the Midha--Zhang expansion resolves an identity on every
+    bond and therefore treats different excited-edge subsets separately.
+    """
+
+    edges: tuple[Any, ...]
+    tids: frozenset
+
+    @property
+    def weight(self) -> int:
+        """Number of excited bonds in this loop."""
+        return len(self.edges)
+
+
+@dataclass(frozen=True)
+class _LinkedClusterGeometry:
+    """Topology-only connected multiset of loops and its Ursell coefficient."""
+
+    loop_ids: tuple[int, ...]
+    weight: int
+    ursell: float
+
+
+@dataclass
+class LinkedClusterCache:
+    """Cache connected-loop and Ursell-cluster geometry for one TN topology.
+
+    Enumeration is independent of tensor values and BP messages. Reuse one
+    cache across a time sequence or across several candidate BP fixed points
+    on the same graph; only the small loop contractions are then recomputed.
+    """
+
+    loops_by_max_weight: dict[int, tuple[ConnectedLoop, ...]] = field(
+        default_factory=dict
+    )
+    clusters_by_cutoff: dict[
+        tuple[int, int], tuple[_LinkedClusterGeometry, ...]
+    ] = field(default_factory=dict)
+    _topology_signature: Any = field(default=None, init=False, repr=False)
+
+    @staticmethod
+    def _signature(tn):
+        return (
+            frozenset(tn.tensor_map),
+            frozenset(
+                (index, frozenset(tids)) for index, tids in tn.ind_map.items()
+            ),
+        )
+
+    def _check_topology(self, tn) -> None:
+        signature = self._signature(tn)
+        if self._topology_signature is None:
+            self._topology_signature = signature
+        elif self._topology_signature != signature:
+            raise ValueError(
+                "LinkedClusterCache belongs to a different tensor-network "
+                "topology or tensor-id layout; create a fresh cache"
+            )
+
+    def loops_for(self, tn, max_loop_weight: int) -> tuple[ConnectedLoop, ...]:
+        """Return all connected generalized loops through this edge cutoff."""
+        self._check_topology(tn)
+        try:
+            return self.loops_by_max_weight[max_loop_weight]
+        except KeyError:
+            loops = _connected_generalized_loops(tn, max_loop_weight)
+            self.loops_by_max_weight[max_loop_weight] = loops
+            return loops
+
+    def clusters_for(
+        self,
+        tn,
+        max_loop_weight: int,
+        max_cluster_weight: int,
+    ) -> tuple[tuple[ConnectedLoop, ...], tuple[_LinkedClusterGeometry, ...]]:
+        """Return cached loop and connected-cluster enumerations."""
+        loops = self.loops_for(tn, max_loop_weight)
+        key = (max_loop_weight, max_cluster_weight)
+        try:
+            return loops, self.clusters_by_cutoff[key]
+        except KeyError:
+            clusters = _connected_cluster_geometries(loops, max_cluster_weight)
+            self.clusters_by_cutoff[key] = clusters
+            return loops, clusters
+
+
+def _validate_cluster_cutoff(name: str, value: int) -> int:
+    if not isinstance(value, (int, np.integer)) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _connected_generalized_loops(tn, max_weight: int) -> tuple[ConnectedLoop, ...]:
+    """Enumerate connected edge-induced generalized loops up to ``max_weight``.
+
+    The search grows connected edge sets rather than checking all subsets of
+    bonds. A set is retained only when every incident tensor has degree at
+    least two, exactly the generalized-loop condition after resolving the BP
+    vacuum projector on all other bonds.
+    """
+    max_weight = _validate_cluster_cutoff("max_loop_weight", max_weight)
+    edges = []
+    for index, tids in tn.ind_map.items():
+        if len(tids) != 2:
+            raise ValueError(
+                "linked_cluster_expand requires a closed pairwise tensor graph"
+            )
+        left, right = tuple(tids)
+        edges.append((index, left, right))
+
+    edge_neighbors = [set() for _ in edges]
+    by_tid: dict[Any, list[int]] = {}
+    for edge_id, (_, left, right) in enumerate(edges):
+        by_tid.setdefault(left, []).append(edge_id)
+        by_tid.setdefault(right, []).append(edge_id)
+    for edge_ids in by_tid.values():
+        for edge_id in edge_ids:
+            edge_neighbors[edge_id].update(edge_ids)
+            edge_neighbors[edge_id].discard(edge_id)
+
+    seen: set[frozenset[int]] = set()
+    pending = [frozenset((edge_id,)) for edge_id in range(len(edges))]
+    loops: list[ConnectedLoop] = []
+    while pending:
+        selection = pending.pop()
+        if selection in seen:
+            continue
+        seen.add(selection)
+
+        degrees: dict[Any, int] = {}
+        for edge_id in selection:
+            _, left, right = edges[edge_id]
+            degrees[left] = degrees.get(left, 0) + 1
+            degrees[right] = degrees.get(right, 0) + 1
+        if all(degree >= 2 for degree in degrees.values()):
+            loop_edges = tuple(edges[edge_id][0] for edge_id in sorted(selection))
+            loops.append(ConnectedLoop(loop_edges, frozenset(degrees)))
+
+        if len(selection) == max_weight:
+            continue
+        frontier = set()
+        for edge_id in selection:
+            frontier.update(edge_neighbors[edge_id])
+        for edge_id in frontier.difference(selection):
+            expanded = selection | {edge_id}
+            if expanded not in seen:
+                pending.append(frozenset(expanded))
+
+    return tuple(
+        sorted(loops, key=lambda loop: (loop.weight, tuple(map(repr, loop.edges))))
+    )
+
+
+def _interaction_edges(
+    loops: tuple[ConnectedLoop, ...], loop_ids: tuple[int, ...]
+) -> tuple[tuple[int, int], ...]:
+    """Return incompatibility edges for one (possibly repeated) loop multiset."""
+    edges = []
+    for left, right in combinations(range(len(loop_ids)), 2):
+        a = loop_ids[left]
+        b = loop_ids[right]
+        if a == b or loops[a].tids.intersection(loops[b].tids):
+            edges.append((left, right))
+    return tuple(edges)
+
+
+def _is_connected_graph(num_vertices: int, edges) -> bool:
+    if num_vertices <= 1:
+        return True
+    neighbors = [set() for _ in range(num_vertices)]
+    for left, right in edges:
+        neighbors[left].add(right)
+        neighbors[right].add(left)
+    seen = {0}
+    pending = [0]
+    while pending:
+        vertex = pending.pop()
+        for neighbor in neighbors[vertex].difference(seen):
+            seen.add(neighbor)
+            pending.append(neighbor)
+    return len(seen) == num_vertices
+
+
+def _ursell_coefficient(
+    loops: tuple[ConnectedLoop, ...], loop_ids: tuple[int, ...]
+) -> float:
+    """Compute the grouped hard-core-polymer Ursell coefficient exactly."""
+    num_loops = len(loop_ids)
+    if num_loops == 1:
+        return 1.0
+    interaction = _interaction_edges(loops, loop_ids)
+    if not _is_connected_graph(num_loops, interaction):
+        return 0.0
+
+    # Sum (-1)^|E| over connected spanning subgraphs of the interaction graph.
+    # The divided multiplicity factorials convert ordered polymer lists into
+    # the multiset convention used by the linked-cluster expansion.
+    ursell_sum = 0
+    for num_edges in range(num_loops - 1, len(interaction) + 1):
+        for subgraph in combinations(interaction, num_edges):
+            if _is_connected_graph(num_loops, subgraph):
+                ursell_sum += (-1) ** num_edges
+    multiplicities = Counter(loop_ids)
+    denominator = 1
+    for multiplicity in multiplicities.values():
+        denominator *= factorial(multiplicity)
+    return ursell_sum / denominator
+
+
+def _connected_cluster_geometries(
+    loops: tuple[ConnectedLoop, ...], max_weight: int
+) -> tuple[_LinkedClusterGeometry, ...]:
+    """Enumerate connected multisets of loops, retaining only nonzero terms."""
+    max_weight = _validate_cluster_cutoff("max_cluster_weight", max_weight)
+    clusters: list[_LinkedClusterGeometry] = []
+
+    def _grow(start: int, selected: tuple[int, ...], weight: int) -> None:
+        if selected:
+            ursell = _ursell_coefficient(loops, selected)
+            if ursell:
+                clusters.append(
+                    _LinkedClusterGeometry(
+                        loop_ids=selected,
+                        weight=weight,
+                        ursell=ursell,
+                    )
+                )
+        for loop_id in range(start, len(loops)):
+            next_weight = weight + loops[loop_id].weight
+            if next_weight <= max_weight:
+                _grow(loop_id, selected + (loop_id,), next_weight)
+
+    _grow(0, (), 0)
+    return tuple(
+        sorted(clusters, key=lambda cluster: (cluster.weight, cluster.loop_ids))
+    )
+
+
+def _cluster_excitation_weight(bp, loop: ConnectedLoop, *, optimize, contract_opts):
+    """Contract one arbitrary edge-set excitation over a BP-normalized TN.
+
+    Quimb exposes a region-level excited-cluster helper. Here an edge-level
+    adapter is needed because the linked expansion distinguishes a loop from a
+    chorded region containing that loop. All bonds outside ``loop.edges`` are
+    closed with their BP vacuum messages; selected bonds receive ``I - |m><m|``.
+    """
+    tnr = bp.tn._select_tids(loop.tids, virtual=False)
+    excited_edges = set(loop.edges)
+    for index, region_tids in tuple(tnr.ind_map.items()):
+        if index in excited_edges:
+            left, right = bp.tn.ind_map[index]
+            left_message = bp.messages[index, left]
+            right_message = bp.messages[index, right]
+            vacuum = ar.do("einsum", "i,j->ij", left_message, right_message)
+            excitation = ar.do("eye", ar.do("shape", vacuum)[0]) - vacuum
+            tnr.tensor_map[right].gate_(excitation, index)
+        else:
+            # This includes both physical boundary bonds and unexcited chords
+            # between two selected loop vertices. Reducing both endpoints in
+            # the latter case realizes the rank-one BP vacuum projector.
+            for tid in region_tids:
+                tnr.tensor_map[tid].vector_reduce_(index, bp.messages[index, tid])
+    return tnr.contract(optimize=optimize, **contract_opts)
+
+
+@dataclass
+class LinkedClusterTerm:
+    """One connected-Ursell contribution to the correction of ``log(Z)``."""
+
+    loops: tuple[ConnectedLoop, ...]
+    weight: int
+    ursell: float
+    contribution: Any
+
+
+@dataclass
+class LinkedClusterResult:
+    """Connected-loop correction of a D1BP contraction.
+
+    ``estimate`` is ``Z_BP * exp(log_correction)``. ``tail_by_weight`` groups
+    terms in the additive log correction by total excited-edge weight; its
+    highest available order is a useful, heuristic convergence indicator for
+    selecting among converged BP fixed points.
+    """
+
+    estimate: Any
+    bp_estimate: Any
+    log_correction: Any
+    max_loop_weight: int
+    max_cluster_weight: int
+    loops: tuple[ConnectedLoop, ...]
+    loop_corrections: dict[ConnectedLoop, Any]
+    terms: tuple[LinkedClusterTerm, ...]
+    tail_by_weight: dict[int, Any]
+    bp: Any
+    bp_converged: bool | None
+    bp_iterations: int | None
+    bp_max_mdiff: float | None
+    _cache: LinkedClusterCache = field(repr=False)
+
+    @property
+    def messages(self):
+        """The BP messages closing the loop-projector contractions."""
+        return self.bp.messages
 
 
 def _remove_dangling(region, neighbors):
@@ -398,6 +726,298 @@ class LoopClusterResult:
         return _expand(
             self.bp, self.norm, gloops, combine, optimize, strip_exponent, progbar
         )
+
+
+def linked_cluster_expand(
+    tn,
+    max_loop_weight: int,
+    *,
+    max_cluster_weight: int | None = None,
+    messages=None,
+    run_bp: bool = True,
+    bp_runner: str = "plain",
+    relay_opts: dict[str, Any] | None = None,
+    max_iterations: int = 1000,
+    tol: float = 5e-6,
+    tol_abs: float | None = None,
+    tol_rolling_diff: float | None = 0.0,
+    damping: float = 0.0,
+    update: str = "sequential",
+    diis: bool | dict[str, Any] = True,
+    require_fixed_point: bool | None = None,
+    cache: LinkedClusterCache | None = None,
+    optimize: str = "auto-hq",
+    contract_opts: dict[str, Any] | None = None,
+    **bp_opts,
+) -> LinkedClusterResult:
+    """Correct a D1BP contraction with the connected-loop cluster expansion.
+
+    This implements the connected-polymer/Ursell re-summation of Midha and
+    Zhang (arXiv:2510.02290), separately from :func:`loop_cluster_expand`.
+    It expands the *logarithm* of the BP-normalized contraction, so disconnected
+    loops cancel analytically and only connected multisets of loops are
+    enumerated. The returned estimate is
+
+    ``Z_BP * exp(sum_connected_clusters Ursell(cluster) * product(loop_weights))``.
+
+    ``max_loop_weight`` bounds individual connected generalized loops in
+    excited *bond* count. ``max_cluster_weight`` bounds the total bond count of
+    a connected multiset, including repeated loops. Repetitions are essential:
+    on a single ring they generate the Taylor series of ``log(1 + w)``.
+
+    The algorithm is intentionally D1BP-only and requires a closed pairwise
+    TN. The D1 messages define the rank-one BP vacuum; non-vacuum bonds use
+    ``I - |m><m|``. A finite linked-cluster truncation is a controlled
+    correction only around a fixed point, so a converged BP run is required by
+    default. Set ``require_fixed_point=False`` when supplying an externally
+    certified message snapshot (for example during candidate selection).
+    """
+    max_loop_weight = _validate_cluster_cutoff(
+        "max_loop_weight", max_loop_weight
+    )
+    if max_cluster_weight is None:
+        max_cluster_weight = max_loop_weight
+    max_cluster_weight = _validate_cluster_cutoff(
+        "max_cluster_weight", max_cluster_weight
+    )
+    if max_cluster_weight < max_loop_weight:
+        raise ValueError("max_cluster_weight must be >= max_loop_weight")
+    if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer")
+    if bp_runner not in {"plain", "relay"}:
+        raise ValueError("bp_runner must be either 'plain' or 'relay'")
+    if require_fixed_point is None:
+        require_fixed_point = bool(run_bp)
+
+    from .gauges import _validate_d1_graph
+
+    _validate_d1_graph(tn)
+    if run_bp:
+        if bp_runner == "plain":
+            from .relay import one_norm_bp
+
+            bp_result = one_norm_bp(
+                tn,
+                method="d1bp",
+                max_iterations=max_iterations,
+                tol=tol,
+                tol_abs=tol_abs,
+                tol_rolling_diff=tol_rolling_diff,
+                damping=damping,
+                update=update,
+                diis=diis,
+                init_messages=messages,
+                **bp_opts,
+            )
+        else:
+            from .relay import relay_bp
+
+            relay_kwargs = {} if relay_opts is None else dict(relay_opts)
+            bp_result = relay_bp(
+                tn,
+                method="d1bp",
+                max_iterations=max_iterations,
+                tol=tol,
+                tol_abs=tol_abs,
+                tol_rolling_diff=tol_rolling_diff,
+                damping=damping,
+                update=update,
+                diis=diis,
+                init_messages=messages,
+                **relay_kwargs,
+                **bp_opts,
+            )
+        bp = bp_result.bp
+        bp_converged = bp_result.converged
+        bp_iterations = bp_result.iterations
+        bp_max_mdiff = bp_result.max_mdiff
+    else:
+        from quimb.tensor.belief_propagation import D1BP
+
+        from .relay import _set_messages
+
+        bp = D1BP(tn, damping=damping, update=update, **bp_opts)
+        if messages is not None:
+            _set_messages(bp, messages)
+        bp_converged = None
+        bp_iterations = None
+        bp_max_mdiff = None
+
+    if require_fixed_point and not bp_converged:
+        raise RuntimeError(
+            "linked_cluster_expand requires converged D1BP messages; pass "
+            "require_fixed_point=False only for an externally certified or "
+            "explicitly exploratory message state"
+        )
+
+    contract_opts = {} if contract_opts is None else dict(contract_opts)
+    # Capture the Bethe value before normalizing the BP vacuum. Normalization
+    # makes every local vacuum amplitude one, so each excitation contraction is
+    # a dimensionless loop correction.
+    bp_estimate = bp.contract()
+    bp.normalize_message_pairs()
+    bp.normalize_tensors()
+
+    cache = cache or LinkedClusterCache()
+    loops, geometries = cache.clusters_for(
+        bp.tn,
+        max_loop_weight,
+        max_cluster_weight,
+    )
+    loop_corrections = {
+        loop: _cluster_excitation_weight(
+            bp,
+            loop,
+            optimize=optimize,
+            contract_opts=contract_opts,
+        )
+        for loop in loops
+    }
+
+    log_correction = 0.0
+    tails: dict[int, Any] = {}
+    terms = []
+    for geometry in geometries:
+        cluster_loops = tuple(loops[loop_id] for loop_id in geometry.loop_ids)
+        contribution = geometry.ursell
+        for loop in cluster_loops:
+            contribution = contribution * loop_corrections[loop]
+        log_correction = log_correction + contribution
+        tails[geometry.weight] = tails.get(geometry.weight, 0.0) + contribution
+        terms.append(
+            LinkedClusterTerm(
+                loops=cluster_loops,
+                weight=geometry.weight,
+                ursell=geometry.ursell,
+                contribution=contribution,
+            )
+        )
+
+    estimate = bp_estimate * ar.do("exp", log_correction)
+    return LinkedClusterResult(
+        estimate=estimate,
+        bp_estimate=bp_estimate,
+        log_correction=log_correction,
+        max_loop_weight=max_loop_weight,
+        max_cluster_weight=max_cluster_weight,
+        loops=loops,
+        loop_corrections=loop_corrections,
+        terms=tuple(terms),
+        tail_by_weight=tails,
+        bp=bp,
+        bp_converged=bp_converged,
+        bp_iterations=bp_iterations,
+        bp_max_mdiff=bp_max_mdiff,
+        _cache=cache,
+    )
+
+
+def _scalar_abs(value) -> float:
+    """Convert a scalar correction magnitude to a portable host float."""
+    return float(np.asarray(ar.to_numpy(ar.do("abs", value))))
+
+
+@dataclass
+class BPCandidateScore:
+    """Low-order linked-cluster quality score for one converged BP candidate."""
+
+    index: int
+    result: Any
+    correction: LinkedClusterResult
+    tail_weight: int | None
+    tail_abs: float
+
+
+@dataclass
+class BPCandidateSelection:
+    """A BP fixed point selected by the smallest linked-cluster tail."""
+
+    selected: Any
+    selected_index: int
+    scores: tuple[BPCandidateScore, ...]
+
+
+def select_bp_candidate(
+    tn,
+    candidates,
+    max_loop_weight: int,
+    *,
+    max_cluster_weight: int | None = None,
+    cache: LinkedClusterCache | None = None,
+    **linked_options,
+) -> BPCandidateSelection:
+    """Select among converged D1BP fixed points by a connected-cluster tail.
+
+    This is intended for independently seeded plain/relay BP runs. It does
+    *not* rank candidates by residual alone: every supplied result must already
+    satisfy its residual tolerance, then the absolute contribution at the
+    highest retained linked-cluster order is minimized. Residual is used only
+    as a deterministic tie-breaker.
+    """
+    candidates = tuple(candidates)
+    if not candidates:
+        raise ValueError("candidates must contain at least one RelayBPResult")
+    forbidden = {
+        "messages",
+        "run_bp",
+        "require_fixed_point",
+        "max_loop_weight",
+        "max_cluster_weight",
+        "cache",
+    }.intersection(linked_options)
+    if forbidden:
+        names = ", ".join(sorted(forbidden))
+        raise TypeError(f"select_bp_candidate controls {names}")
+
+    max_cluster_weight = (
+        max_loop_weight if max_cluster_weight is None else max_cluster_weight
+    )
+    cache = cache or LinkedClusterCache()
+    scores = []
+    for index, result in enumerate(candidates):
+        if result.bp.__class__.__name__ != "D1BP":
+            raise ValueError("all BP candidates must use method='d1bp'")
+        if not result.converged:
+            raise ValueError(
+                "all BP candidates must meet the absolute residual tolerance"
+            )
+        correction = linked_cluster_expand(
+            tn,
+            max_loop_weight,
+            max_cluster_weight=max_cluster_weight,
+            messages=result.snapshot(),
+            run_bp=False,
+            require_fixed_point=False,
+            cache=cache,
+            **linked_options,
+        )
+        # A weight cutoff need not itself be realizable (e.g. triangle loops
+        # have weights 3, 6, 9, ...), so use the highest *present* order.
+        tail_weight = max(correction.tail_by_weight, default=None)
+        tail = (
+            0.0
+            if tail_weight is None
+            else correction.tail_by_weight[tail_weight]
+        )
+        scores.append(
+            BPCandidateScore(
+                index=index,
+                result=result,
+                correction=correction,
+                tail_weight=tail_weight,
+                tail_abs=_scalar_abs(tail),
+            )
+        )
+
+    best = min(
+        scores,
+        key=lambda score: (score.tail_abs, score.result.max_mdiff, score.index),
+    )
+    return BPCandidateSelection(
+        selected=best.result,
+        selected_index=best.index,
+        scores=tuple(scores),
+    )
 
 
 def loop_cluster_expand(

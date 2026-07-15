@@ -26,13 +26,19 @@ Tanner-graph ``tensy.decoders.RelayBpDecoder``.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import autoray as ar
 import numpy as np
 
-__all__ = ["RelayBPResult", "one_norm_bp", "relay_bp"]
+__all__ = [
+    "BPState",
+    "BPUpdateResult",
+    "RelayBPResult",
+    "one_norm_bp",
+    "relay_bp",
+]
 
 _ONE_NORM_CLASSES = {"l1bp": "L1BP", "hv1bp": "HV1BP", "d1bp": "D1BP"}
 _RELAY_METHODS = {"l1bp", "d1bp"}
@@ -249,6 +255,225 @@ class RelayBPResult:
         BP from the previous fixed point.
         """
         return _snapshot(self.bp.messages)
+
+
+def _d1_topology_signature(tn):
+    """Return the stable pairwise topology identity used by D1BP warm starts."""
+    return (
+        frozenset(tn.tensor_map),
+        frozenset(
+            (index, frozenset(tids)) for index, tids in tn.ind_map.items()
+        ),
+    )
+
+
+@dataclass
+class BPUpdateResult:
+    """Outcome of :meth:`BPState.update_local`.
+
+    ``result`` is the updated D1BP state. ``updated_tids`` records the tensor
+    sources whose outgoing messages were recomputed. A finite ``radius`` is a
+    deliberately truncated light-cone update, so it is *not* a global BP
+    fixed-point certificate; ``boundary_tids`` are the next sources that would
+    need an update to extend that light cone.
+    """
+
+    result: RelayBPResult
+    updated_tids: tuple[Any, ...]
+    boundary_tids: tuple[Any, ...]
+    radius: int | None
+    fully_converged: bool
+    used_local_scheduler: bool
+
+
+@dataclass
+class BPState:
+    """Reusable D1BP fixed point for value-only changes on one TN topology.
+
+    Construct this from a converged :class:`RelayBPResult` and call
+    :meth:`update_local` after changing a known set of tensor values. It
+    restores the old messages and seeds Quimb D1BP's incremental scheduler at
+    exactly those tensors. With ``radius=None`` (the default), propagation
+    continues until it reaches the new fixed point. With a finite radius it
+    performs a bounded light-cone update, useful when only local observables
+    are subsequently queried.
+
+    The caller must list every tensor whose data changed, and the TN topology
+    (tensor ids, index names, and bonds) must remain unchanged. This state is
+    intentionally D1BP-only: its one-message-per-directed-bond layout makes
+    the affected region explicit and is the layout shared with SU gauges.
+    """
+
+    result: RelayBPResult
+    damping: float | None = None
+    update: str | None = None
+    bp_options: dict[str, Any] = field(default_factory=dict)
+    _topology_signature: Any = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.result.bp.__class__.__name__ != "D1BP":
+            raise ValueError("BPState currently requires a D1BP result")
+
+        bp = self.result.bp
+        self._topology_signature = _d1_topology_signature(bp.tn)
+        if self.damping is None:
+            self.damping = float(getattr(bp, "_damping", 0.0))
+        if self.update is None:
+            self.update = getattr(bp, "update", "sequential")
+
+        # Preserve the numerical convention of the supplied fixed point by
+        # default; callers can deliberately override these at construction.
+        defaults = {
+            "normalize": getattr(bp, "_normalize", None),
+            "distance": getattr(bp, "_distance", None),
+            "local_convergence": getattr(bp, "local_convergence", True),
+            "contract_every": getattr(bp, "contract_every", None),
+        }
+        defaults.update(self.bp_options)
+        self.bp_options = defaults
+
+    @classmethod
+    def from_result(cls, result: RelayBPResult, **kwargs) -> "BPState":
+        """Create a reusable state from a converged D1BP result.
+
+        The result need not be rejected solely because a caller chose to keep
+        an exploratory BP approximation, but a local update inherits that
+        approximation. For fixed-point guarantees, construct the state from a
+        result with ``result.converged`` true.
+        """
+        return cls(result=result, **kwargs)
+
+    def update_local(
+        self,
+        tn,
+        changed_tids,
+        *,
+        radius: int | None = None,
+        max_iterations: int = 1000,
+        tol: float = 5e-6,
+        tol_abs: float | None = None,
+        damping: float | None = None,
+        update: str | None = None,
+        **bp_overrides,
+    ) -> BPUpdateResult:
+        """Warm-update D1BP after changing tensor values in ``changed_tids``.
+
+        ``radius`` counts propagation hops beyond the changed tensors. A value
+        of zero recomputes only their outgoing messages; ``None`` continues
+        until D1BP's local scheduler is empty and returns a fixed-point
+        certificate. Unlike a full :func:`one_norm_bp` call, this path does
+        not use DIIS because its extrapolated history is nonlocal.
+        """
+        if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
+            raise ValueError("max_iterations must be a positive integer")
+        if radius is not None and (
+            not isinstance(radius, (int, np.integer)) or radius < 0
+        ):
+            raise ValueError("radius must be a nonnegative integer or None")
+        if _d1_topology_signature(tn) != self._topology_signature:
+            raise ValueError(
+                "BPState belongs to a different tensor-network topology; "
+                "local warm updates require the same tensor ids and bonds"
+            )
+
+        changed_tids = tuple(dict.fromkeys(changed_tids))
+        if not changed_tids:
+            raise ValueError("changed_tids must contain at least one tensor id")
+        missing = set(changed_tids).difference(tn.tensor_map)
+        if missing:
+            raise ValueError(f"changed_tids are not present in the TN: {missing}")
+
+        from .gauges import _validate_d1_graph
+
+        _validate_d1_graph(tn)
+        bp_cls = _bp_class("d1bp")
+        opts = dict(self.bp_options)
+        opts.update(bp_overrides)
+        if not opts.get("local_convergence", True):
+            raise ValueError(
+                "BPState.update_local requires local_convergence=True; "
+                "otherwise Quimb schedules a full BP sweep"
+            )
+        bp = bp_cls(
+            tn,
+            **_bp_constructor_kwargs(
+                "d1bp",
+                self.damping if damping is None else damping,
+                self.update if update is None else update,
+                opts,
+            ),
+        )
+        _set_messages(bp, self.result.snapshot())
+
+        # Current Quimb D1BP exposes ``touched`` as its concrete scheduler state:
+        # it computes sources in this set, then enqueues only destinations
+        # whose messages changed above tolerance. Feature-detect it so a
+        # future upstream change fails safely rather than silently pretending
+        # to have performed a local update.
+        try:
+            bp.touched = type(bp.touched)(changed_tids)
+        except (AttributeError, TypeError):
+            full = one_norm_bp(
+                tn,
+                method="d1bp",
+                max_iterations=max_iterations,
+                tol=tol,
+                tol_abs=tol_abs,
+                damping=self.damping if damping is None else damping,
+                update=self.update if update is None else update,
+                init_messages=self.result.snapshot(),
+                **opts,
+            )
+            self.result = full
+            return BPUpdateResult(
+                result=full,
+                updated_tids=tuple(tn.tensor_map),
+                boundary_tids=(),
+                radius=radius,
+                fully_converged=full.converged,
+                used_local_scheduler=False,
+            )
+
+        threshold = tol if tol_abs is None else tol_abs
+        updated_tids: list[Any] = []
+        max_mdiff = float("inf")
+        boundary_tids: tuple[Any, ...] = ()
+        fully_converged = False
+        iterations = 0
+        max_hops = None if radius is None else radius + 1
+
+        for iterations in range(1, max_iterations + 1):
+            active = tuple(bp.touched)
+            updated_tids.extend(active)
+            info = bp.iterate(tol=threshold)
+            max_mdiff = float(info.get("max_mdiff", float("nan")))
+            boundary_tids = tuple(bp.touched)
+
+            if not boundary_tids:
+                fully_converged = bool(
+                    np.isfinite(max_mdiff) and max_mdiff < threshold
+                )
+                break
+            if max_hops is not None and iterations >= max_hops:
+                break
+
+        result = RelayBPResult(
+            bp=bp,
+            converged=fully_converged,
+            iterations=iterations,
+            max_mdiff=max_mdiff,
+            num_legs_run=1,
+            quimb_converged=None,
+        )
+        self.result = result
+        return BPUpdateResult(
+            result=result,
+            updated_tids=tuple(dict.fromkeys(updated_tids)),
+            boundary_tids=boundary_tids,
+            radius=radius,
+            fully_converged=fully_converged,
+            used_local_scheduler=True,
+        )
 
 
 def one_norm_bp(

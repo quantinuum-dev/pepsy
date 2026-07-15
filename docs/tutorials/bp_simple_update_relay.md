@@ -132,3 +132,74 @@ edge-coloured batches: bonds that share no tensor endpoint update concurrently.
 This changes the sweep order, so benchmark it for the target lattice; it is
 restricted to stable pairwise topologies (`fuse_multibonds=False`) and preserves
 the full represented tensor network exactly.
+
+## Connected-loop corrections and local warm updates
+
+`loop_cluster_expand` is a region/NLCE-style correction. For a closed pairwise
+scalar network, `linked_cluster_expand` implements the different free-energy
+cluster expansion of Midha and Zhang: it resolves the BP vacuum on every bond,
+contracts connected excited loops, and sums their connected (Ursell) multisets
+in `log(Z)`. This removes disconnected-loop proliferation rather than replacing
+the existing region-cluster method.
+
+```python
+from pepsy.bp import LinkedClusterCache, linked_cluster_expand
+
+cache = LinkedClusterCache()  # reuse while tensor ids and bonds are unchanged
+corrected = linked_cluster_expand(
+    tn,
+    max_loop_weight=4,       # maximum excited bonds in an individual loop
+    max_cluster_weight=8,    # total weight, including repeated loops
+    tol=1e-10,
+    cache=cache,
+)
+
+z_bp = corrected.bp_estimate
+z_corrected = corrected.estimate
+tail_weight = max(corrected.tail_by_weight, default=None)
+tail = 0.0 if tail_weight is None else corrected.tail_by_weight[tail_weight]
+```
+
+The BP messages must be at a D1BP fixed point: unlike a system-covering region
+cluster, this `I - |m><m|` construction relies on BP-vacuum cancellations.
+Increase both cutoffs and inspect the highest-order `tail_by_weight` term; it
+is a convergence diagnostic, not a certified error bar outside the loop-decay
+regime. The enumeration grows exponentially, so keep the first cutoffs small
+and reuse `LinkedClusterCache` for time steps and multi-start candidates.
+
+For a value-only perturbation of a fixed-topology TN, cache the D1BP messages
+and seed Quimb's local scheduler only at the changed tensors:
+
+```python
+from pepsy.bp import BPState
+
+initial = py.one_norm_bp(tn, method="d1bp", tol=1e-10)
+state = BPState.from_result(initial)
+
+# `tn_next` has the same tensor ids/bonds; only these tensor data changed.
+update = state.update_local(tn_next, changed_tids={17, 18}, tol=1e-10)
+assert update.fully_converged
+next_bp = update.result
+```
+
+Passing `radius=0` updates only the changed tensors' outgoing messages;
+`radius=r` permits `r` propagation hops beyond them. Such a bounded result is
+explicitly marked `fully_converged=False` and exposes `boundary_tids`; use it
+only for a deliberately local calculation. The default `radius=None`
+propagates to the new D1BP fixed point. Every changed tensor must be listed.
+
+When several random/Relay BP starts have all converged, rank them by the
+highest retained connected-cluster tail rather than by residual alone:
+
+```python
+from pepsy.bp import select_bp_candidate
+
+selection = select_bp_candidate(
+    tn,
+    d1bp_candidates,
+    max_loop_weight=4,
+    max_cluster_weight=8,
+    cache=cache,
+)
+chosen = selection.selected
+```
