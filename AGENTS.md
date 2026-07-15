@@ -90,6 +90,16 @@ At the start of a new task:
   SVD weight. Do not renormalize unitary evolution or sum `infidelities`.
   Non-unitary matrices and coefficient-frame sub-MPOs emit no sample and
   invalidate the proxy until a normalized projective collapse resets it.
+- `norm_diagnostics()` combines completed/current segment survival factors:
+  `total_survival_proxy` is their product and `total_norm_proxy` is its square
+  root. `geometric_mean_norm` is only the per-segment geometric mean. Never
+  multiply physical Born probabilities into these compression proxies; progress
+  reports `Ntotal` and `Itotal` for the total norm and infidelity proxies.
+- A selected Kraus `TrajectoryEvent` outcome is a normalized trajectory
+  boundary. Snapshot the preceding unitary segment before applying its
+  non-unitary matrix, then normalize, reset the proxy, and commit the boundary
+  record (`kind="trajectory_kraus"`). This is how later unitary evolution
+  resumes valid STN norm tracking.
 - Keep dense Pauli decomposition bounded by
   `max_pauli_decomposition_qubits`; prefer named gates, Pauli rotations, or a
   coefficient-frame sub-MPO over opting into uncontrolled `4**k` enumeration.

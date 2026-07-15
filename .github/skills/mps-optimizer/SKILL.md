@@ -74,6 +74,12 @@ Do not transfer diagnostic semantics from `MpsOptimizer` to
 normalized-unitary norm-loss contract; read
 `.github/skills/stabilizer-tensor-networks/SKILL.md` before changing it.
 
+`TrajectoryEvent` Kraus branches are normalized physical-state updates. The
+trajectory runner applies the selected branch with `non_unitary=True`, calls
+`normalize()`, and clears `p.exponent` so the next gate sees a truly normalized
+MPS. This does **not** turn ordinary-MPS `track_infidelity` (a local normalized
+overlap diagnostic) into the STN norm-loss proxy: keep the contracts separate.
+
 ## Backend rules
 
 Use Quimb and Autoray APIs. Preserve Symmray arrays and route symmetric target

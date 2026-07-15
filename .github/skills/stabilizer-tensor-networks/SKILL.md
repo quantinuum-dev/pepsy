@@ -71,7 +71,16 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   norm. Compare `projected_norm_sq` to `pre_norm_sq * branch_probability` to get the
   projector-compression proxy `projector_infidelity`. Use `norm_diagnostics()` for
   product/geometric summaries that multiply unitary and projector compression-survival
-  factors, but never measurement probabilities.
+  factors, but never measurement probabilities. `total_norm_proxy` is the
+  square root of `total_survival_proxy`; `geometric_mean_norm` is only the
+  per-segment geometric mean, not the total norm proxy.
+- A selected `TrajectoryEvent` Kraus outcome is a normalized trajectory
+  boundary. Before applying its non-unitary matrix, snapshot the current
+  segment with its branch probability; normalize the selected branch at the
+  canonical centre, reset the proxy, and commit a `"trajectory_kraus"` norm
+  event. This lets later unitary steps track a fresh segment without treating
+  the Born probability as compression loss. STN progress reports this total as
+  `Ntotal` and its infidelity complement as `Itotal`.
 - Keep `.bond_history` independent from `.infidelities`; their indices are not aligned.
 - Remember the limitation: norm loss detects compression that removes norm, but it is not
   a proof of state fidelity and cannot detect every norm-preserving directional error.

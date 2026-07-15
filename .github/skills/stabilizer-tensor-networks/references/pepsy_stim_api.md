@@ -69,10 +69,12 @@ The public simulator types are exported at top level (`import pepsy`); see
   suspend the unitary norm-loss proxy until a projective normalization resets its baseline.
   A coefficient-frame `submpo` does the same because its event has no unitary metadata.
   Projective normalization appends no `.infidelities` sample, and previous historical
-  samples remain in the list. `.norm_events` snapshots the current segment at measurement
-  and reset boundaries, including the Born `branch_probability` and the actual
-  `projected_norm_sq` before normalization; compare it to
-  `pre_norm_sq * branch_probability` for the separate projector-compression proxy.
+  samples remain in the list. `.norm_events` snapshots the current segment at measurement,
+  reset, and normalized Kraus-trajectory boundaries, including the Born
+  `branch_probability` and the actual `projected_norm_sq` before normalization; compare it
+  to `pre_norm_sq * branch_probability` for the separate compression-survival proxy.
+  `norm_diagnostics()["total_norm_proxy"]` is the square root of the product of completed
+  and current segment survivals; `geometric_mean_norm` is only a per-segment average.
   Never sum `.infidelities`: each sample is already cumulative for its segment.
 - **Canonical centre**: pass the simulator-managed orthogonality info through quimb
   operations that can move the centre. Use its canonicalization/renormalization helpers
@@ -154,8 +156,11 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   copy and doubled overlap network, but is not exact state fidelity or a sum of discarded
   SVD weights. Validate the latest emitted sample against `1 - sim.norm()**2`. Projective
   compression is reported separately in `.norm_events` as `projector_infidelity`, while
-  physical measurement probabilities remain separate. Validate physical accuracy
-  independently against dense evolution on small systems.
+  physical measurement probabilities remain separate. A normalized selected Kraus branch
+  likewise closes the current segment and starts a fresh one; it must not leave the proxy
+  invalid. `total_norm_proxy = sqrt(total_survival_proxy)` is the total compression-norm
+  value used by STN progress (`Ntotal`), alongside `Itotal` for its infidelity complement.
+  Validate physical accuracy independently against dense evolution on small systems.
 - Keep tests tiny/deterministic (fixed seeds, small $n$), per repo Examples guidance.
 
 ## Reference implementation mapping (bsc-quantic/stabilizer-TN)
