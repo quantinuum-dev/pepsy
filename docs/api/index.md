@@ -19,6 +19,7 @@ optimizers/global_opt
 optimizers/energy
 optimizers/mps
 optimizers/mpo
+optimizers/noise
 optimizers/peps
 optimizers/stabilizer_tn
 optimizers/sym_dmrg
