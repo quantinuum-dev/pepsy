@@ -16,18 +16,26 @@ qtn = pytest.importorskip("quimb.tensor")
 pytest.importorskip("quimb.tensor.belief_propagation")
 
 from pepsy.bp import (  # noqa: E402
+    BPState,
+    BPCandidateSelection,
+    GaugeResult,
+    LinkedClusterCache,
+    LinkedClusterResult,
     LoopClusterResult,
     RelayGaugeOptions,
     ScalarClusterCache,
     compare_simple_update_gauges,
     compare_simple_update_to_bp,
     d1bp_from_simple_update_gauges,
+    gauge_all,
     gauge_all_simple,
     gauge_all_simple_with_bp_check,
+    linked_cluster_expand,
     loop_cluster_expand,
     norm1_gloop_expand,
     relay_gauge_all_simple,
     run_d1bp_from_simple_update_gauges,
+    select_bp_candidate,
     simple_update_bp_residual,
     simple_update_core_and_gauges_from_messages,
     simple_update_gauges_from_messages,
@@ -45,19 +53,27 @@ def test_exports():
     from pepsy import bp
 
     assert {
+        "BPState",
+        "BPCandidateSelection",
+        "GaugeResult",
+        "LinkedClusterCache",
+        "LinkedClusterResult",
         "LoopClusterResult",
         "RelayGaugeOptions",
         "ScalarClusterCache",
         "compare_simple_update_gauges",
         "compare_simple_update_to_bp",
         "d1bp_from_simple_update_gauges",
+        "gauge_all",
         "gauge_all_simple",
+        "linked_cluster_expand",
         "loop_cluster_expand",
         "norm1_gloop_expand",
         "run_d1bp_from_simple_update_gauges",
         "simple_update_bp_residual",
         "simple_update_core_and_gauges_from_messages",
         "simple_update_gauges_from_messages",
+        "select_bp_candidate",
     } <= set(bp.__all__)
 
 
@@ -162,6 +178,129 @@ def _positive_triangle():
             ),
         ]
     )
+
+
+def _locally_perturbed_triangle():
+    """Return a triangle with one changed tensor and its changed tensor id."""
+    tn = _positive_triangle()
+    tid = next(iter(tn.tensor_map))
+    tensor = tn.tensor_map[tid]
+    tensor.modify(
+        data=tensor.data * np.array([[1.03, 0.97], [1.01, 0.99]])
+    )
+    return tn, tid
+
+
+def test_linked_cluster_repeated_loops_converge_to_a_single_ring_exactly():
+    """Repeated-loop Ursell terms reproduce the log(1 + loop) expansion."""
+    tn = _positive_triangle()
+    exact = tn.contract()
+    cache = LinkedClusterCache()
+
+    first = linked_cluster_expand(
+        tn,
+        max_loop_weight=3,
+        max_cluster_weight=3,
+        cache=cache,
+        tol=1e-12,
+    )
+    fourth = linked_cluster_expand(
+        tn,
+        max_loop_weight=12,
+        max_cluster_weight=12,
+        cache=cache,
+        tol=1e-12,
+    )
+
+    assert isinstance(first, LinkedClusterResult)
+    assert len(first.loops) == 1
+    assert [term.ursell for term in fourth.terms] == [1.0, -0.5, 1 / 3, -0.25]
+    assert sorted(fourth.tail_by_weight) == [3, 6, 9, 12]
+    assert len(cache.loops_by_max_weight) == 2
+    assert abs(fourth.estimate - exact) < abs(first.estimate - exact) / 1e5
+
+
+def test_linked_cluster_closes_unexcited_chords_with_bp_vacua():
+    """A selected triangle in K4 leaves an internal chord to vacuum-reduce."""
+    rng = np.random.default_rng(123)
+    tn = qtn.TensorNetwork(
+        [
+            qtn.Tensor(0.2 + rng.random((2, 2, 2)), inds=("ab", "ac", "ad")),
+            qtn.Tensor(0.2 + rng.random((2, 2, 2)), inds=("ab", "bc", "bd")),
+            qtn.Tensor(0.2 + rng.random((2, 2, 2)), inds=("ac", "bc", "cd")),
+            qtn.Tensor(0.2 + rng.random((2, 2, 2)), inds=("ad", "bd", "cd")),
+        ]
+    )
+
+    result = linked_cluster_expand(
+        tn,
+        max_loop_weight=3,
+        max_cluster_weight=3,
+        tol=1e-12,
+    )
+
+    assert len(result.loops) == 4  # the four triangles of K4
+    assert np.isfinite(result.estimate)
+
+
+def test_linked_cluster_rejects_an_incomplete_cluster_cutoff_by_default():
+    with pytest.raises(ValueError, match="max_loop_weight >= max_cluster_weight"):
+        linked_cluster_expand(
+            _positive_triangle(),
+            max_loop_weight=3,
+            max_cluster_weight=6,
+            tol=1e-12,
+        )
+
+
+def test_bp_state_local_update_matches_a_fresh_d1bp_fixed_point():
+    """A value-only local update propagates the warm start to the same BP FP."""
+    from pepsy.bp import one_norm_bp
+
+    original = _positive_triangle()
+    state = BPState.from_result(one_norm_bp(original, method="d1bp", tol=1e-12))
+    changed, changed_tid = _locally_perturbed_triangle()
+
+    updated = state.update_local(changed, [changed_tid], tol=1e-12)
+    fresh = one_norm_bp(changed, method="d1bp", tol=1e-12)
+
+    assert updated.used_local_scheduler
+    assert updated.fully_converged
+    assert changed_tid in updated.updated_tids
+    assert not updated.boundary_tids
+    assert np.isclose(updated.result.contract(), fresh.contract())
+
+
+def test_bp_state_radius_reports_an_unpropagated_boundary():
+    from pepsy.bp import one_norm_bp
+
+    original = _positive_triangle()
+    state = BPState.from_result(one_norm_bp(original, method="d1bp", tol=1e-12))
+    changed, changed_tid = _locally_perturbed_triangle()
+
+    limited = state.update_local(changed, [changed_tid], radius=0, tol=1e-12)
+
+    assert limited.used_local_scheduler
+    assert not limited.fully_converged
+    assert limited.updated_tids == (changed_tid,)
+    assert limited.boundary_tids
+
+
+def test_cluster_tail_selects_among_converged_d1bp_candidates():
+    from pepsy.bp import one_norm_bp
+
+    tn = _positive_triangle()
+    candidate = one_norm_bp(tn, method="d1bp", tol=1e-12)
+    selection = select_bp_candidate(
+        tn,
+        (candidate, candidate),
+        max_loop_weight=6,
+        max_cluster_weight=6,
+    )
+
+    assert isinstance(selection, BPCandidateSelection)
+    assert selection.selected_index == 0
+    assert all(score.tail_abs > 0.0 for score in selection.scores)
 
 
 def _real_su_triangle():
@@ -324,6 +463,55 @@ def test_d1bp_messages_round_trip_losslessly_through_su_core_and_gauges():
         simple_update_gauges_from_messages(round_trip.bp),
     )
     assert comparison["max_rel_l2"] < 1e-7
+
+
+def test_gauge_all_runs_su_then_d1bp_and_retains_both_gauges():
+    result = gauge_all(
+        _projected_scalar_ladder(),
+        start="su",
+        target="bp",
+        su_options={"max_iterations": 3},
+        bp_options={"run_opts": {"max_iterations": 100, "tol": 1e-10}},
+    )
+
+    assert isinstance(result, GaugeResult)
+    assert result.su_info is not None
+    assert result.su_gauges is result.gauges
+    assert len(result.su_gauges) == len(result.core.inner_inds())
+    assert result.bp_result.converged
+    assert result.bp is result.bp_result.bp
+    assert result.messages is result.bp_result.messages
+
+
+def test_gauge_all_passes_external_su_gauges_to_d1bp():
+    core, gauges = _projected_scalar_ladder_su_core()
+
+    result = gauge_all(
+        core,
+        start="su",
+        target="bp",
+        su_gauges=gauges,
+        bp_options={"run_opts": {"max_iterations": 100, "tol": 1e-10}},
+    )
+
+    assert result.su_info is None
+    assert result.bp_result.converged
+    comparison = compare_simple_update_gauges(gauges, result.su_gauges)
+    assert comparison["max_rel_l2"] < 1e-12
+
+
+def test_gauge_all_runs_d1bp_then_converts_to_su_losslessly():
+    result = gauge_all(
+        _positive_triangle(),
+        start="bp",
+        target="su",
+        bp_options={"run_opts": {"max_iterations": 100, "tol": 1e-10}},
+    )
+
+    assert result.bp_result.converged
+    rebuilt = result.core.copy()
+    rebuilt.gauge_simple_insert(result.su_gauges)
+    _assert_same_tensor_data(rebuilt, result.bp.tn)
 
 
 def test_relay_bp_runs_from_real_quimb_su_and_can_return_to_su():

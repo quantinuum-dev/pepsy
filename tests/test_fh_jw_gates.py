@@ -23,6 +23,12 @@ def _dense(arr):
     return np.asarray(arr.to_dense())
 
 
+def _dense_operator(arr):
+    """Dense NumPy operator from a Symmray gate or MPO (double densify)."""
+    out = arr.to_dense()
+    return np.asarray(out.to_dense() if hasattr(out, "to_dense") else out)
+
+
 def _dense_jw_two_site(*, t=1.0, U=0.0, mu=0.0):
     """Independent two-site spinful FH Hamiltonian via explicit Jordan-Wigner.
 
@@ -175,3 +181,185 @@ def test_jw_hopping_rejects_non_adjacent_and_bad_order():
         fermi_hubbard_u1u1_jw_gate_stream([(0, 1)], dt, order=3)
     with pytest.raises(ValueError):
         fermi_hubbard_u1u1_jw_interaction_gate_stream([], dt)
+
+
+def test_jw_trotter_gates_matches_low_level_wiring():
+    """SymHamiltonian.jw_trotter_gates wires terms/params into the low-level stream."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian
+
+    dt = 0.1
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", [(0, 1), (1, 2)], t=1.3, U=5.0, mu=0.4
+    )
+    method = ham.jw_trotter_gates(dt, order=2)
+    manual = fermi_hubbard_u1u1_jw_gate_stream(
+        [(0, 1), (1, 2)], dt, sites=range(3), t=1.3, U=5.0, mu=0.4, order=2
+    )
+    assert isinstance(method, SymGateStream)
+    assert len(method) == len(manual)
+    for (gate_m, where_m), (gate_l, where_l) in zip(method, manual):
+        assert where_m == where_l
+        assert np.allclose(_dense(gate_m), _dense(gate_l), atol=1e-12)
+
+
+def test_jw_trotter_gates_spectrum_consistent_with_to_mpo():
+    """jw_trotter_gates and to_mpo share one Jordan-Wigner conversion (same spectrum)."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian
+
+    dt = 0.1
+    # Pure hopping (U=0, mu=0): the whole L=2 MPO is exactly the hopping term.
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0, U=0.0, mu=0.0
+    )
+    mpo_ham = _dense_operator(ham.to_mpo(L=2, compress=False)).reshape(16, 16)
+    mpo_ham = (mpo_ham + mpo_ham.conj().T) / 2
+
+    hop = [
+        gate
+        for gate, where in ham.jw_trotter_gates(dt, order=1)
+        if isinstance(where, tuple) and len(where) == 2
+    ][0]
+    gate = _dense(hop).reshape(16, 16)
+
+    gate_spectrum = np.sort(-np.angle(np.linalg.eigvals(gate)) / dt)
+    mpo_spectrum = np.sort(np.linalg.eigvalsh(mpo_ham))
+    assert np.allclose(gate_spectrum, mpo_spectrum, atol=1e-8)
+
+
+def test_jw_trotter_gates_guards():
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian
+
+    dt = 0.1
+    # A bond that maps to non-adjacent chain sites is not a two-site JW gate.
+    with pytest.raises(ValueError):
+        SymHamiltonian.from_edges(
+            "fermi_hubbard_u1u1", "U1U1", [(0, 1), (0, 2)], t=1.0
+        ).jw_trotter_gates(dt)
+    # The density-density V term is not yet supported by the gate path.
+    with pytest.raises(NotImplementedError):
+        SymHamiltonian.from_edges(
+            "fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0, V=0.5
+        ).jw_trotter_gates(dt)
+    # Only the spinful U1U1 Fermi-Hubbard model has a Jordan-Wigner gate path.
+    with pytest.raises(NotImplementedError):
+        SymHamiltonian.from_edges("heisenberg", "U1", [(0, 1)]).jw_trotter_gates(dt)
+    # Only Lie/Strang Trotter orders are defined.
+    with pytest.raises(ValueError):
+        SymHamiltonian.from_edges(
+            "fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0
+        ).jw_trotter_gates(dt, order=3)
+
+
+def test_jw_energy_of_neel_product_state_is_zero():
+    pytest.importorskip("symmray")
+    from pepsy.tensors import (
+        SymHamiltonian,
+        SymMPS,
+        site_charge_from_occupations,
+    )
+
+    L = 4
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(i, i + 1) for i in range(L - 1)],
+        t=1.0,
+        U=4.0,
+        mu=0.0,
+    )
+    psi = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        L,
+        bond_dim=1,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1), (1, 0), (0, 1)]),
+        seed=3,
+        dtype="complex128",
+        fermionic=False,
+    )
+    # A Neel product state has no double occupancy and no hopping expectation.
+    assert abs(ham.jw_energy(psi)) < 1e-10
+
+
+def test_jw_energy_rejects_non_symmps():
+    pytest.importorskip("symmray")
+    import quimb.tensor as qtn
+
+    from pepsy.tensors import SymHamiltonian
+
+    ham = SymHamiltonian.from_edges("fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0)
+    with pytest.raises(TypeError):
+        ham.jw_energy(qtn.MPS_rand_state(2, 2))
+
+
+def test_jw_imaginary_time_evolution_reaches_ground_state():
+    """End-to-end: jw_trotter_gates imaginary time + jw_energy reach the DMRG GS."""
+    pytest.importorskip("symmray")
+    import pepsy
+    from pepsy.tensors import (
+        SymHamiltonian,
+        SymMPS,
+        site_charge_from_occupations,
+    )
+
+    L = 4
+    edges = [(i, i + 1) for i in range(L - 1)]
+    sc = site_charge_from_occupations([(1, 0), (0, 1), (1, 0), (0, 1)])
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", edges, t=1.0, U=4.0, mu=0.0
+    )
+    mpo = ham.to_mpo(L=L, compress=False)
+
+    ref = SymMPS.for_model(
+        "fermi_hubbard_u1u1", L, bond_dim=1, site_charge=sc, seed=1, dtype="complex128"
+    )
+    opt = pepsy.SymDMRG2(
+        mpo,
+        ref,
+        bond_dims=[1, 2, 4, 8, 16],
+        cutoffs=[1e-10],
+        mixer="density_matrix",
+        compute_initial_energy=False,
+    )
+    opt.solve(max_sweeps=20, sweep_sequence="RL", tol=1e-11)
+    e_gs = float(opt.energy)
+
+    psi = SymMPS.for_model(
+        "fermi_hubbard_u1u1", L, bond_dim=1, site_charge=sc, seed=2,
+        dtype="complex128", fermionic=False,
+    )
+    step = ham.jw_trotter_gates(0.05, imaginary=True, order=2)
+    for _ in range(200):
+        psi.apply_gates(step, method="direct", max_bond=16, cutoff=1e-10, normalize=True)
+
+    e_final = float(ham.jw_energy(psi))
+    assert e_final < -1.0  # well below the product-state energy (0)
+    assert abs(e_final - e_gs) < 5e-3
+
+
+def test_jw_bond_layout_classifies_adjacent_and_long_range():
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian
+
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", [(0, 1), (1, 2), (0, 2), (2, 3)], t=1.0
+    )
+    layout = ham.jw_bond_layout()
+    assert layout["adjacent"] == [(0, 1), (1, 2), (2, 3)]
+    assert layout["long_range"] == [(0, 2)]
+    assert layout["sites"] == [0, 1, 2, 3]
+
+
+def test_jw_bond_layout_with_2d_snake_mapper():
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian, OneDMap
+
+    edges = [((0, 0), (0, 1)), ((0, 0), (1, 0)), ((0, 1), (1, 1)), ((1, 0), (1, 1))]
+    ham = SymHamiltonian.from_edges("fermi_hubbard_u1u1", "U1U1", edges, t=1.0, U=4.0)
+    layout = ham.jw_bond_layout(mapper=OneDMap(2, 2, mode="snake"))
+    # A snake ordering of a 2x2 lattice makes at least one bond long-range.
+    assert len(layout["long_range"]) >= 1
+    assert len(layout["adjacent"]) + len(layout["long_range"]) == 4
+    assert layout["sites"] == [0, 1, 2, 3]

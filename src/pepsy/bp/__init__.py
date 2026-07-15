@@ -10,22 +10,33 @@ convergence-robust improvements:
   the system. Fixed-point BP messages are still what justify the formal loop
   cancellations and fastest finite-cluster convergence.
 
-It is imported explicitly as ``pepsy.bp`` (kept out of the lazy top-level
-namespace while it is a prototype).
+Most BP tools are imported explicitly as ``pepsy.bp``. The supported top-level
+workflow entry points are :func:`pepsy.one_norm_bp`, :func:`pepsy.gauge_all`,
+and :func:`pepsy.gauge_all_simple`.
 """
 
 from .cluster import (
+    BPCandidateScore,
+    BPCandidateSelection,
+    ConnectedLoop,
+    LinkedClusterCache,
+    LinkedClusterResult,
+    LinkedClusterTerm,
     ScalarClusterCache,
     LoopClusterResult,
+    linked_cluster_expand,
     loop_cluster_expand,
     norm1_gloop_expand,
+    select_bp_candidate,
 )
 from .gauges import (
+    GaugeResult,
     RelayGaugeOptions,
     compare_simple_update_gauges,
     compare_simple_update_to_bp,
     copy_gauges,
     d1bp_from_simple_update_gauges,
+    gauge_all,
     gauge_all_simple,
     gauge_all_simple_with_bp_check,
     relay_gauge_all_simple,
@@ -35,9 +46,18 @@ from .gauges import (
     simple_update_gauges_from_messages,
     simple_update_messages_from_gauges,
 )
-from .relay import RelayBPResult, one_norm_bp, relay_bp
+from .relay import BPState, BPUpdateResult, RelayBPResult, one_norm_bp, relay_bp
 
 __all__ = [
+    "GaugeResult",
+    "BPCandidateScore",
+    "BPCandidateSelection",
+    "BPState",
+    "BPUpdateResult",
+    "ConnectedLoop",
+    "LinkedClusterCache",
+    "LinkedClusterResult",
+    "LinkedClusterTerm",
     "LoopClusterResult",
     "RelayGaugeOptions",
     "ScalarClusterCache",
@@ -45,11 +65,13 @@ __all__ = [
     "compare_simple_update_to_bp",
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
+    "gauge_all",
     "gauge_all_simple",
     "gauge_all_simple_with_bp_check",
     "relay_gauge_all_simple",
     "RelayBPResult",
     "loop_cluster_expand",
+    "linked_cluster_expand",
     "norm1_gloop_expand",
     "one_norm_bp",
     "relay_bp",
@@ -58,4 +80,5 @@ __all__ = [
     "simple_update_core_and_gauges_from_messages",
     "simple_update_gauges_from_messages",
     "simple_update_messages_from_gauges",
+    "select_bp_candidate",
 ]

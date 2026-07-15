@@ -4126,12 +4126,14 @@ def _fh_u1u1_jw_hopping_term(*, t=1.0, peierls_angle=0.0, dtype="complex128"):
     conjugate ``exp(-i A)``.
     """
     ops = _fh_u1u1_jw_local_ops(dtype)
-    dtype = np.dtype(dtype)
+    out_dtype = np.dtype(dtype)
     parity = ops["parity"]
     t_u, t_d = _as_spin_pair(t, name="t")
     phase = np.exp(1j * float(peierls_angle))
     phase_conj = np.conjugate(phase)
-    dense = np.zeros((16, 16), dtype=dtype)
+    # Peierls phases are complex, so accumulate in a complex buffer and cast to
+    # the requested dtype once (lossless when peierls_angle == 0).
+    dense = np.zeros((16, 16), dtype=np.complex128)
     for t_sigma, create, annihilate in (
         (t_u, ops["create_u"], ops["annihilate_u"]),
         (t_d, ops["create_d"], ops["annihilate_d"]),
@@ -4144,12 +4146,34 @@ def _fh_u1u1_jw_hopping_term(*, t=1.0, peierls_angle=0.0, dtype="complex128"):
         dense += (-t_sigma * phase) * forward
         dense += (-t_sigma * phase_conj) * backward
     return symm_operator_from_dense(
-        dense,
+        dense.astype(out_dtype, copy=False),
         default_physical_sectors(model="fermi_hubbard_u1u1"),
         symmetry="U1U1",
         charge=(0, 0),
         fermionic=False,
         sites=2,
+    )
+
+
+def _fh_u1u1_jw_onsite_term(*, U=8.0, mu=0.0, dtype="complex128"):
+    """Return the bosonic Jordan-Wigner one-site Fermi-Hubbard onsite term.
+
+    ``U n_up n_down - mu_up n_up - mu_down n_down`` as a diagonal bosonic U1U1
+    array, for measuring the onsite energy of a Jordan-Wigner state.
+    """
+    out_dtype = np.dtype(dtype)
+    mu_u, mu_d = _as_spin_pair(mu, name="mu")
+    number_u = np.array([0.0, 1.0, 0.0, 1.0])
+    number_d = np.array([0.0, 0.0, 1.0, 1.0])
+    double = np.array([0.0, 0.0, 0.0, 1.0])
+    diag = U * double - mu_u * number_u - mu_d * number_d
+    return symm_operator_from_dense(
+        np.diag(diag).astype(out_dtype),
+        default_physical_sectors(model="fermi_hubbard_u1u1"),
+        symmetry="U1U1",
+        charge=(0, 0),
+        fermionic=False,
+        sites=1,
     )
 
 
@@ -5761,6 +5785,199 @@ class SymHamiltonian:
             site_tag_id=site_tag_id,
             to_backend=to_backend,
         )
+
+    def jw_trotter_gates(
+        self,
+        dt,
+        *,
+        mapper=None,
+        idx2coo=None,
+        coo2idx=None,
+        order=2,
+        imaginary=False,
+        peierls_angle=0.0,
+        dtype=None,
+        to_backend=None,
+    ):
+        """Return a bosonic Jordan-Wigner Trotter gate stream consistent with ``to_mpo``.
+
+        This is the gate-based counterpart of :meth:`to_mpo` for the
+        ``model="fermi_hubbard_u1u1"`` Jordan-Wigner (bosonic) picture. It reads
+        the *same* Jordan-Wigner conversion the MPO path uses -- the site
+        ordering (from ``mapper``/``idx2coo``/``coo2idx``), the one-site
+        operators, and the parity-string convention -- and the model parameters
+        (``t``, ``U``, ``mu``) from :attr:`parameters`. The returned gate stream
+        therefore agrees with the MPO by construction, so an energy computed from
+        :meth:`to_mpo` and a time evolution driven by these gates use one and the
+        same Jordan-Wigner conversion.
+
+        Only bonds that map to **nearest-neighbour** chain sites are supported: a
+        bond whose mapped endpoints are non-adjacent has a Jordan-Wigner string
+        that spans the intervening sites and is not a two-site gate. Such a bond
+        raises; reorder the sites (choose a ``mapper``) so every bond is
+        nearest-neighbour, or use :meth:`to_mpo` for the long-range path.
+
+        The static :meth:`to_mpo` Hamiltonian carries no Peierls phase, so
+        ``peierls_angle`` (for real-time driven hopping) defaults to ``0``.
+        """
+        edges, sites, params = self._resolve_jw_fermi_hubbard(
+            mapper=mapper, idx2coo=idx2coo, coo2idx=coo2idx
+        )
+        if order not in {1, 2}:
+            raise ValueError("order must be 1 or 2.")
+        dtype = "complex128" if dtype is None else np.dtype(dtype)
+        return fermi_hubbard_u1u1_jw_gate_stream(
+            edges,
+            dt,
+            sites=sites,
+            t=params["t"],
+            U=params["U"],
+            mu=params["mu"],
+            peierls_angle=peierls_angle,
+            imaginary=imaginary,
+            order=order,
+            dtype=dtype,
+            to_backend=to_backend,
+        )
+
+    def _resolve_jw_fermi_hubbard(self, *, mapper=None, idx2coo=None, coo2idx=None):
+        """Resolve the shared U1U1 Fermi-Hubbard Jordan-Wigner conversion.
+
+        Returns ``(edges, sites, params)`` where ``edges`` are the mapped
+        nearest-neighbour bonds, ``sites`` covers every chain site, and
+        ``params`` is ``{"t", "U", "mu"}``. Both :meth:`jw_trotter_gates` and
+        :meth:`jw_energy` use this, so the evolution gates and the measured
+        energy share one conversion. Validates the model/symmetry, rejects the
+        unsupported ``V`` term, and rejects bonds that map to non-adjacent chain
+        sites.
+        """
+        if self.model != "fermi_hubbard_u1u1" or self.symmetry != "U1U1":
+            raise NotImplementedError(
+                "Jordan-Wigner gate/energy paths require "
+                "model='fermi_hubbard_u1u1' with U1U1 symmetry; got "
+                f"model={self.model!r}, symmetry={self.symmetry!r}. Use to_mpo "
+                "for the MPO path or trotter_gates for native fermionic gates."
+            )
+        V = self.parameters.get("V", 0.0)
+        if (
+            callable(V)
+            or isinstance(V, Mapping)
+            or not np.all(np.asarray(V, dtype=complex) == 0)
+        ):
+            raise NotImplementedError(
+                "Jordan-Wigner gate/energy paths do not yet support the "
+                "density-density 'V' term; use "
+                "to_mpo(model='fermi_hubbard_u1u1'), or set V=0."
+            )
+        _, coo2idx_use, mapped_L = _resolve_mpo_mapping(
+            mapper=mapper, idx2coo=idx2coo, coo2idx=coo2idx
+        )
+        raw_edges = _as_edges(self.edges)
+        edges = _map_edges_to_mpo_indices(raw_edges, coo2idx_use)
+        long_range = [
+            (int(i), int(j)) for i, j in edges if abs(int(i) - int(j)) != 1
+        ]
+        if long_range:
+            raise ValueError(
+                "Jordan-Wigner two-site gates/terms need nearest-neighbour "
+                f"bonds; {len(long_range)} bond(s) map to non-adjacent chain "
+                f"sites under this ordering (e.g. {long_range[:3]}). Reorder "
+                "sites via mapper=OneDMap(...) so every bond is "
+                "nearest-neighbour, or use to_mpo(model='fermi_hubbard_u1u1') "
+                "for the long-range Jordan-Wigner path."
+            )
+        if mapped_L is not None:
+            sites = tuple(range(int(mapped_L)))
+        else:
+            sites = tuple(sorted({int(s) for edge in edges for s in edge}))
+        params = {
+            "t": self.parameters.get("t", 1.0),
+            "U": self.parameters.get("U", 8.0),
+            "mu": self.parameters.get("mu", 0.0),
+        }
+        return edges, sites, params
+
+    def jw_energy(
+        self,
+        state,
+        *,
+        mapper=None,
+        idx2coo=None,
+        coo2idx=None,
+        normalize=True,
+        dtype=None,
+    ):
+        """Return the Jordan-Wigner energy of a bosonic state.
+
+        Sums the local Jordan-Wigner term expectations -- onsite
+        ``U n_up n_down - mu n`` on every site and nearest-neighbour hopping on
+        every bond -- built from the *same* conversion as :meth:`to_mpo` and
+        :meth:`jw_trotter_gates`. It therefore reads out the energy of a bosonic
+        (``fermionic=False``) state evolved by :meth:`jw_trotter_gates`, using
+        the state's own symmetry-aware :meth:`SymMPS.measure` contraction.
+
+        With ``normalize=True`` (default) the returned value is
+        ``<psi|H|psi> / <psi|psi>``. Nearest-neighbour bonds only.
+        """
+        if not isinstance(state, _SymState):
+            raise TypeError(
+                "jw_energy expects a bosonic SymMPS/SymPEPS with a "
+                "symmetry-aware .measure; got "
+                f"{type(state).__name__}. Wrap a raw MPS via "
+                "SymMPS(mps=..., symmetry='U1U1', edges=..., fermionic=False), "
+                "or read a DMRG energy from SymDMRG2.energy."
+            )
+        edges, sites, params = self._resolve_jw_fermi_hubbard(
+            mapper=mapper, idx2coo=idx2coo, coo2idx=coo2idx
+        )
+        dtype = "complex128" if dtype is None else np.dtype(dtype)
+        onsite = _fh_u1u1_jw_onsite_term(
+            U=params["U"], mu=params["mu"], dtype=dtype
+        )
+        hopping = _fh_u1u1_jw_hopping_term(t=params["t"], dtype=dtype)
+        total = 0.0 + 0.0j
+        for site in sites:
+            total += complex(
+                state.measure(onsite, int(site), normalize=normalize)
+            )
+        for i, j in edges:
+            lo, hi = (int(i), int(j)) if int(i) < int(j) else (int(j), int(i))
+            total += complex(
+                state.measure(hopping, (lo, hi), normalize=normalize)
+            )
+        return total.real if abs(total.imag) < 1e-9 else total
+
+    def jw_bond_layout(self, *, mapper=None, idx2coo=None, coo2idx=None):
+        """Classify Fermi-Hubbard bonds by Jordan-Wigner locality under an ordering.
+
+        Returns ``{"adjacent": [...], "long_range": [...], "sites": [...]}``: the
+        mapped bonds that are nearest-neighbour (usable as two-site gates by
+        :meth:`jw_trotter_gates`) versus those whose Jordan-Wigner string spans
+        intervening sites (currently reachable only through :meth:`to_mpo`). Use
+        it to choose a site ordering (``mapper``) that maximizes the number of
+        nearest-neighbour bonds. Unlike :meth:`jw_trotter_gates`, this does not
+        raise on long-range bonds -- it reports them.
+        """
+        if self.model != "fermi_hubbard_u1u1" or self.symmetry != "U1U1":
+            raise NotImplementedError(
+                "jw_bond_layout requires model='fermi_hubbard_u1u1' with U1U1 "
+                f"symmetry; got model={self.model!r}, symmetry={self.symmetry!r}."
+            )
+        _, coo2idx_use, mapped_L = _resolve_mpo_mapping(
+            mapper=mapper, idx2coo=idx2coo, coo2idx=coo2idx
+        )
+        raw_edges = _as_edges(self.edges)
+        edges = _map_edges_to_mpo_indices(raw_edges, coo2idx_use)
+        adjacent = []
+        long_range = []
+        for i, j in edges:
+            lo, hi = (int(i), int(j)) if int(i) < int(j) else (int(j), int(i))
+            (adjacent if hi - lo == 1 else long_range).append((lo, hi))
+        if mapped_L is not None:
+            sites = list(range(int(mapped_L)))
+        else:
+            sites = sorted({int(s) for edge in edges for s in edge})
+        return {"adjacent": adjacent, "long_range": long_range, "sites": sites}
 
     def trotter_gates(self, dt, *, imaginary=False, order=1):
         """Return local gate entries ``[(gate, edge), ...]`` for one Trotter step."""

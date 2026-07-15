@@ -1,5 +1,8 @@
 """Regression tests for user-defined MPS quantum-trajectory channels."""
 
+import importlib.util
+from pathlib import Path
+
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -131,3 +134,147 @@ def test_kraus_trajectory_starts_a_fresh_stn_norm_diagnostic_segment():
     assert diagnostics["total_norm_proxy"] == pytest.approx(
         diagnostics["total_survival_proxy"] ** 0.5
     )
+
+
+def test_coalesced_pauli_ensemble_reuses_the_ideal_no_error_state():
+    """A zero-rate ensemble should build one optimizer for all represented shots."""
+    calls = 0
+
+    def factory():
+        nonlocal calls
+        calls += 1
+        return pepsy.MpsOptimizer(
+            qtn.MPS_computational_state("0"), chi=4, mode="mpo"
+        )
+
+    result = pepsy.run_coalesced_noisy_shots(
+        factory,
+        [(_X, 0)],
+        pepsy.PauliErrorModel(),
+        shots=64,
+        seed=8,
+        run_kwargs={"progbar": False},
+    )
+
+    assert calls == 1
+    assert result.shots == 64
+    assert result.branches == 1
+    assert result.counts == (64,)
+    assert result.leaves[0].faults == ()
+    np.testing.assert_allclose(_statevector(result.leaves[0].optimizer), [0.0, 1.0])
+
+
+def test_coalesced_trajectory_branches_mid_circuit_measurements_by_count():
+    """A shared ancilla-like measurement should use exact binomial branch counts."""
+    calls = 0
+
+    def factory():
+        nonlocal calls
+        calls += 1
+        return pepsy.MpsOptimizer(
+            qtn.MPS_computational_state("0"), chi=4, mode="mpo"
+        )
+
+    result = pepsy.run_coalesced_trajectory_shots(
+        factory,
+        [
+            (
+                np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0),
+                0,
+            ),
+            ("measure", "Z", 0),
+        ],
+        shots=64,
+        seed=9,
+        run_kwargs={"progbar": False},
+    )
+
+    assert calls == 1
+    assert result.shots == 64
+    assert result.branches == 2
+    assert {leaf.measurements[0].outcome for leaf in result.leaves} == {-1, 1}
+    assert all(leaf.measurements[0].probability == pytest.approx(0.5) for leaf in result.leaves)
+    assert all(leaf.gate_stream[-1][0] == "measure" for leaf in result.leaves)
+
+
+def test_coalesced_kraus_ensemble_uses_one_copy_per_nonempty_outcome():
+    """State-dependent channel probabilities are evaluated once per live node."""
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [
+            (_X, 0),
+            pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.5), 0),
+        ],
+        shots=64,
+        seed=10,
+    )
+
+    assert result.shots == 64
+    assert result.branches == 2
+    leaves = {leaf.records[0].label: leaf for leaf in result.leaves}
+    assert set(leaves) == {"jump", "no_jump"}
+    assert all(leaf.records[0].probability == pytest.approx(0.5) for leaf in leaves.values())
+    np.testing.assert_allclose(_statevector(leaves["jump"].optimizer), [1.0, 0.0])
+    np.testing.assert_allclose(_statevector(leaves["no_jump"].optimizer), [0.0, 1.0])
+
+
+def test_coalesced_terminal_sampling_reads_each_mps_leaf_in_one_batch():
+    """Terminal samples expand rows, never the represented optimizer state."""
+    result = pepsy.run_coalesced_noisy_shots(
+        lambda: pepsy.MpsOptimizer(
+            qtn.MPS_computational_state("0"), chi=4, mode="mpo"
+        ),
+        [(_X, 0)],
+        pepsy.PauliErrorModel(),
+        shots=12,
+        seed=4,
+        run_kwargs={"progbar": False},
+    )
+
+    samples = result.sample_bits(seed=12, shuffle=False)
+
+    assert samples.shots == 12
+    assert samples.branches == 1
+    np.testing.assert_array_equal(samples.configs, np.ones((12, 1), dtype=np.int8))
+    np.testing.assert_array_equal(samples.leaf_indices, np.zeros(12, dtype=np.int64))
+    np.testing.assert_allclose(samples.probs, np.ones(12))
+
+
+def test_coalesced_terminal_sampling_uses_stn_tree_sampler_without_probs():
+    """STN leaves retain their scalable bit sampler and avoid dense probabilities."""
+    result = pepsy.run_coalesced_noisy_shots(
+        lambda: pepsy.MpsStabOptimizer(2, chi=4),
+        [],
+        pepsy.PauliErrorModel(),
+        shots=10,
+        seed=4,
+    )
+
+    samples = pepsy.sample_coalesced_bits(result, seed=13, shuffle=False)
+
+    assert samples.probs is None
+    np.testing.assert_array_equal(samples.configs, np.zeros((10, 2), dtype=np.int8))
+
+
+def test_coalesced_trajectory_benchmark_reports_branch_reduction():
+    """The benchmark remains a lightweight, JSON-ready downstream harness."""
+    path = Path(__file__).resolve().parents[1] / "benchmarks" / "coalesced_trajectory_scaling.py"
+    spec = importlib.util.spec_from_file_location("coalesced_trajectory_benchmark", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    row = module.run_case(
+        n=2,
+        depth=1,
+        shots=4,
+        probability=0.0,
+        chi=2,
+        seed=4,
+    )
+
+    assert row["represented_shots"] == 4
+    assert row["independent_states"] == 4
+    assert row["coalesced_states"] == 1
+    assert row["state_reduction"] == pytest.approx(4.0)
+    assert row["expected_faults"] == 0.0

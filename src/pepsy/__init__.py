@@ -96,6 +96,10 @@ _SYMBOL_MODULES = {
     "MpsEnergyOptimizer": ".optimizers",
     "MpsOptimizer": ".optimizers",
     "MpsStabOptimizer": ".optimizers",
+    "CoalescedMeasurementRecord": ".optimizers",
+    "CoalescedSampleResult": ".optimizers",
+    "CoalescedTrajectoryLeaf": ".optimizers",
+    "CoalescedTrajectoryResult": ".optimizers",
     "NoisyShotResult": ".optimizers",
     "PauliErrorModel": ".optimizers",
     "PauliFault": ".optimizers",
@@ -116,6 +120,9 @@ _SYMBOL_MODULES = {
     "SymDMRG2": ".optimizers",
     "SweepOptimizer": ".optimizers",
     "compile_stim_circuit": ".optimizers",
+    "run_coalesced_noisy_shots": ".optimizers",
+    "run_coalesced_stim_shots": ".optimizers",
+    "run_coalesced_trajectory_shots": ".optimizers",
     "run_noisy_shots": ".optimizers",
     "run_stim_shots": ".optimizers",
     "run_trajectory_shots": ".optimizers",
@@ -124,6 +131,7 @@ _SYMBOL_MODULES = {
     "sample_stim_circuit": ".optimizers",
     "sample_stim_circuits": ".optimizers",
     "sample_trajectory_stream": ".optimizers",
+    "sample_coalesced_bits": ".optimizers",
     "MpsBatchSampleResult": ".sampling",
     "MpsSampleResult": ".sampling",
     "MpsSampler": ".sampling",
@@ -192,7 +200,9 @@ _SYMBOL_MODULES = {
     "tn_norm": ".tensors",
     "tns_align": ".tensors",
     "validate_tensor_network_tags": ".tensors",
+    "gauge_all": ".bp",
     "gauge_all_simple": ".bp",
+    "one_norm_bp": ".bp",
 }
 
 __all__ = [
@@ -245,7 +255,9 @@ __all__ = [
     "fsimg",
     "gate",
     "gate_simple",
+    "gauge_all",
     "gauge_all_simple",
+    "one_norm_bp",
     "h",
     "hadamard",
     "ham_tn",
@@ -276,6 +288,10 @@ __all__ = [
     "MpsEnergyOptimizer",
     "MpsOptimizer",
     "MpsStabOptimizer",
+    "CoalescedMeasurementRecord",
+    "CoalescedSampleResult",
+    "CoalescedTrajectoryLeaf",
+    "CoalescedTrajectoryResult",
     "NoisyShotResult",
     "PauliErrorModel",
     "PauliFault",
@@ -296,6 +312,9 @@ __all__ = [
     "SymDMRG2",
     "SweepOptimizer",
     "compile_stim_circuit",
+    "run_coalesced_noisy_shots",
+    "run_coalesced_stim_shots",
+    "run_coalesced_trajectory_shots",
     "run_noisy_shots",
     "run_stim_shots",
     "run_trajectory_shots",
@@ -304,6 +323,7 @@ __all__ = [
     "sample_stim_circuit",
     "sample_stim_circuits",
     "sample_trajectory_stream",
+    "sample_coalesced_bits",
     "MpsBatchSampleResult",
     "MpsSampleResult",
     "MpsSampler",
@@ -376,7 +396,7 @@ def __getattr__(name):
 
 
 if TYPE_CHECKING:
-    from .bp import gauge_all_simple
+    from .bp import gauge_all, gauge_all_simple, one_norm_bp
     from . import backends, boundary, fitting, operators, optimizers, sampling, solvers, tensors, vmc
     from .backends import (
         get_default_array_backend,

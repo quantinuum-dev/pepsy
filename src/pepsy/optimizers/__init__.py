@@ -7,6 +7,10 @@ from .global_opt import GlobalOptimizer
 from .mpo import MpoOptimizer
 from .mps import MpsOptimizer
 from .noise import (
+    CoalescedMeasurementRecord,
+    CoalescedSampleResult,
+    CoalescedTrajectoryLeaf,
+    CoalescedTrajectoryResult,
     NoisyShotResult,
     PauliErrorModel,
     PauliFault,
@@ -21,6 +25,9 @@ from .noise import (
     TrajectorySample,
     TrajectoryShotResult,
     compile_stim_circuit,
+    run_coalesced_noisy_shots,
+    run_coalesced_stim_shots,
+    run_coalesced_trajectory_shots,
     run_noisy_shots,
     run_stim_shots,
     run_trajectory_shots,
@@ -29,6 +36,7 @@ from .noise import (
     sample_stim_circuit,
     sample_stim_circuits,
     sample_trajectory_stream,
+    sample_coalesced_bits,
 )
 from .peps import PepsOptimizer, SimpleUpdateGen
 from .stabilizer_tn import MpsStabOptimizer, STNState
@@ -36,6 +44,10 @@ from .sym_dmrg import SymDMRG2
 from .sweep import SweepOptimizer
 
 __all__ = [
+    "CoalescedMeasurementRecord",
+    "CoalescedSampleResult",
+    "CoalescedTrajectoryLeaf",
+    "CoalescedTrajectoryResult",
     "EnergyEstimate",
     "GlobalOptimizer",
     "MpoOptimizer",
@@ -62,6 +74,9 @@ __all__ = [
     "SymDMRG2",
     "SweepOptimizer",
     "compile_stim_circuit",
+    "run_coalesced_noisy_shots",
+    "run_coalesced_stim_shots",
+    "run_coalesced_trajectory_shots",
     "run_noisy_shots",
     "run_stim_shots",
     "run_trajectory_shots",
@@ -70,6 +85,7 @@ __all__ = [
     "sample_stim_circuit",
     "sample_stim_circuits",
     "sample_trajectory_stream",
+    "sample_coalesced_bits",
     "energy",
     "global_opt",
     "mpo",

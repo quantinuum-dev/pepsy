@@ -46,6 +46,52 @@ positive D1BP message products it returns a lossless `(core, gauges)` pair;
 if a real SU run has singular products, pass an explicit small `smudge` to
 obtain a regularized but still representation-preserving SU initializer.
 
+## Unified SU ↔ D1BP workflow
+
+`pepsy.gauge_all` is the high-level bridge. It keeps the SU and D1BP numerical
+updates separate, but handles their warm starts and lossless conversions in one
+place. For example, first find SU gauges, then use them to initialize D1BP:
+
+```python
+import pepsy as py
+
+result = py.gauge_all(
+    tn,
+    start="su",
+    target="bp",
+    su_options={"max_iterations": 50},
+    bp_options={"run_opts": {"tol": 1e-10}},
+)
+
+su_core = result.core
+su_gauges = result.su_gauges
+bp = result.bp
+```
+
+The reverse direction runs D1BP and returns its lossless SU-core split:
+
+```python
+result = py.gauge_all(
+    tn,
+    start="bp",
+    target="su",
+    bp_options={"run_opts": {"tol": 1e-10}},
+)
+```
+
+This BP-to-SU route is deliberately D1BP-only. It requires strictly positive,
+real products of opposite directed messages; pass
+`conversion_options={"smudge": 1e-10}` for a regularized SU initializer when
+a bond product is singular.
+
+For plain 1-norm BP without an SU bridge, use `pepsy.one_norm_bp`. It supports
+L1BP, HV1BP, and D1BP; select D1BP for the SU-compatible directed-message
+representation:
+
+```python
+bp_result = py.one_norm_bp(tn, method="d1bp", tol=1e-10)
+```
+
 ## Simple-update gauges and Relay
 
 `gauge_all_simple` is the single entry point for real Quimb simple-update
@@ -86,3 +132,78 @@ edge-coloured batches: bonds that share no tensor endpoint update concurrently.
 This changes the sweep order, so benchmark it for the target lattice; it is
 restricted to stable pairwise topologies (`fuse_multibonds=False`) and preserves
 the full represented tensor network exactly.
+
+## Connected-loop corrections and local warm updates
+
+`loop_cluster_expand` is a region/NLCE-style correction. For a closed pairwise
+scalar network, `linked_cluster_expand` implements the different free-energy
+cluster expansion of Midha and Zhang: it resolves the BP vacuum on every bond,
+contracts connected excited loops, and sums their connected (Ursell) multisets
+in `log(Z)`. This removes disconnected-loop proliferation rather than replacing
+the existing region-cluster method.
+
+```python
+from pepsy.bp import LinkedClusterCache, linked_cluster_expand
+
+cache = LinkedClusterCache()  # reuse while tensor ids and bonds are unchanged
+corrected = linked_cluster_expand(
+    tn,
+    max_loop_weight=8,       # all individual loops through weight 8
+    max_cluster_weight=8,    # total weight, including repeated loops
+    tol=1e-10,
+    cache=cache,
+)
+
+z_bp = corrected.bp_estimate
+z_corrected = corrected.estimate
+tail_weight = max(corrected.tail_by_weight, default=None)
+tail = 0.0 if tail_weight is None else corrected.tail_by_weight[tail_weight]
+```
+
+The BP messages must be at a D1BP fixed point: unlike a system-covering region
+cluster, this `I - |m><m|` construction relies on BP-vacuum cancellations.
+For a systematic order `K`, use `max_loop_weight=max_cluster_weight=K` (or a
+larger loop cutoff): otherwise single loops that should enter at order `K` are
+missing. Pepsy rejects that incomplete setup by default; it is available only
+as an explicitly labelled exploratory mode. Increase the complete cutoff and
+inspect the highest-order `tail_by_weight` term; it is a convergence diagnostic,
+not a certified error bar outside the loop-decay regime. The enumeration grows
+exponentially, so keep the first cutoffs small and reuse `LinkedClusterCache`
+for time steps and multi-start candidates.
+
+For a value-only perturbation of a fixed-topology TN, cache the D1BP messages
+and seed Quimb's local scheduler only at the changed tensors:
+
+```python
+from pepsy.bp import BPState
+
+initial = py.one_norm_bp(tn, method="d1bp", tol=1e-10)
+state = BPState.from_result(initial)
+
+# `tn_next` has the same tensor ids/bonds; only these tensor data changed.
+update = state.update_local(tn_next, changed_tids={17, 18}, tol=1e-10)
+assert update.fully_converged
+next_bp = update.result
+```
+
+Passing `radius=0` updates only the changed tensors' outgoing messages;
+`radius=r` permits `r` propagation hops beyond them. Such a bounded result is
+explicitly marked `fully_converged=False` and exposes `boundary_tids`; use it
+only for a deliberately local calculation. The default `radius=None`
+propagates to the new D1BP fixed point. Every changed tensor must be listed.
+
+When several random/Relay BP starts have all converged, rank them by the
+highest retained connected-cluster tail rather than by residual alone:
+
+```python
+from pepsy.bp import select_bp_candidate
+
+selection = select_bp_candidate(
+    tn,
+    d1bp_candidates,
+    max_loop_weight=4,
+    max_cluster_weight=8,
+    cache=cache,
+)
+chosen = selection.selected
+```

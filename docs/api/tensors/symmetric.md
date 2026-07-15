@@ -323,6 +323,50 @@ jw_step = py.fermi_hubbard_u1u1_jw_gate_stream(
 )
 ```
 
+For a **single, controlled Jordan-Wigner conversion**, build the gates and the
+MPO from the *same* ``SymHamiltonian`` and ordering. ``jw_trotter_gates`` reads
+the same terms, site ordering (``mapper``), local operators, and parity-string
+convention as ``to_mpo``, so an energy from the MPO and a time evolution driven
+by the gates agree by construction. Non-nearest-neighbour mapped bonds raise
+(their string spans intervening sites); use ``to_mpo`` for those, and
+``ham.jw_bond_layout(mapper=...)`` to see which bonds are nearest-neighbour
+versus long-range under a given ordering.
+
+```python
+ham = py.SymHamiltonian.from_edges(
+    "fermi_hubbard_u1u1", "U1U1", [(i, i + 1) for i in range(7)], t=1.0, U=8.0
+)
+mpo = ham.to_mpo(L=8)                 # energy / SymDMRG2
+gates = ham.jw_trotter_gates(0.05, order=2)   # consistent time-evolution gates
+```
+
+``ham.jw_energy(state)`` reads the energy of a bosonic (``fermionic=False``)
+``SymMPS`` back from the same conversion -- a sum of local Jordan-Wigner term
+expectations via the state's symmetry-aware ``measure`` -- so imaginary-time
+evolution driven by ``jw_trotter_gates`` converges to the ``SymDMRG2`` ground
+energy.
+
+**Implementation status (long-range / 2D).** The Jordan-Wigner *gate* path is
+currently **nearest-neighbour only**. A long-range hop (every perpendicular bond
+of a snaked 2D lattice) has a parity string spanning the sites between its
+endpoints, so it is not a two-site gate; ``jw_trotter_gates`` and
+``fermi_hubbard_u1u1_jw_*_gate_stream`` raise on such bonds, and
+``jw_bond_layout`` reports them. The exact long-range gate has a validated
+parity-sector sub-MPO form,
+
+```text
+exp(scale * H_ij) = (I_int / 2) x (G+ + G-)  +  (S_int / 2) x (G+ - G-),
+```
+
+with ``G+- = exp(+- scale * H_hop)`` the adjacent two-site gates and
+``S_int = prod_k P_k`` the intervening parity string (constant bond dimension,
+linear in span). Landing it on a symmetric MPS needs a Symmray-aware multi-site
+MPO gate application (upstream ``gate_nonlocal`` / MPS-addition are not yet
+Symmray-compatible), so it is deferred. For 2D today: order the lattice with
+``OneDMap(..., mode="folded-snake")`` to maximize nearest-neighbour bonds, use
+``to_mpo`` for the residual long-range terms, or evolve via a Symmray MPO-TDVP
+sweep (which preserves U1xU1 without gates).
+
 For a flattened MPS path, feed the same canonical bundled stream to
 ``MpsOptimizer``:
 
