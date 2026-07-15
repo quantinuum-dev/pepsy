@@ -337,3 +337,29 @@ def test_jw_imaginary_time_evolution_reaches_ground_state():
     e_final = float(ham.jw_energy(psi))
     assert e_final < -1.0  # well below the product-state energy (0)
     assert abs(e_final - e_gs) < 5e-3
+
+
+def test_jw_bond_layout_classifies_adjacent_and_long_range():
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian
+
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", [(0, 1), (1, 2), (0, 2), (2, 3)], t=1.0
+    )
+    layout = ham.jw_bond_layout()
+    assert layout["adjacent"] == [(0, 1), (1, 2), (2, 3)]
+    assert layout["long_range"] == [(0, 2)]
+    assert layout["sites"] == [0, 1, 2, 3]
+
+
+def test_jw_bond_layout_with_2d_snake_mapper():
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian, OneDMap
+
+    edges = [((0, 0), (0, 1)), ((0, 0), (1, 0)), ((0, 1), (1, 1)), ((1, 0), (1, 1))]
+    ham = SymHamiltonian.from_edges("fermi_hubbard_u1u1", "U1U1", edges, t=1.0, U=4.0)
+    layout = ham.jw_bond_layout(mapper=OneDMap(2, 2, mode="snake"))
+    # A snake ordering of a 2x2 lattice makes at least one bond long-range.
+    assert len(layout["long_range"]) >= 1
+    assert len(layout["adjacent"]) + len(layout["long_range"]) == 4
+    assert layout["sites"] == [0, 1, 2, 3]

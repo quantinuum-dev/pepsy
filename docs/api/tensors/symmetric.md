@@ -328,7 +328,9 @@ MPO from the *same* ``SymHamiltonian`` and ordering. ``jw_trotter_gates`` reads
 the same terms, site ordering (``mapper``), local operators, and parity-string
 convention as ``to_mpo``, so an energy from the MPO and a time evolution driven
 by the gates agree by construction. Non-nearest-neighbour mapped bonds raise
-(their string spans intervening sites); use ``to_mpo`` for those.
+(their string spans intervening sites); use ``to_mpo`` for those, and
+``ham.jw_bond_layout(mapper=...)`` to see which bonds are nearest-neighbour
+versus long-range under a given ordering.
 
 ```python
 ham = py.SymHamiltonian.from_edges(

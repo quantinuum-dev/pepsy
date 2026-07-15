@@ -5947,6 +5947,38 @@ class SymHamiltonian:
             )
         return total.real if abs(total.imag) < 1e-9 else total
 
+    def jw_bond_layout(self, *, mapper=None, idx2coo=None, coo2idx=None):
+        """Classify Fermi-Hubbard bonds by Jordan-Wigner locality under an ordering.
+
+        Returns ``{"adjacent": [...], "long_range": [...], "sites": [...]}``: the
+        mapped bonds that are nearest-neighbour (usable as two-site gates by
+        :meth:`jw_trotter_gates`) versus those whose Jordan-Wigner string spans
+        intervening sites (currently reachable only through :meth:`to_mpo`). Use
+        it to choose a site ordering (``mapper``) that maximizes the number of
+        nearest-neighbour bonds. Unlike :meth:`jw_trotter_gates`, this does not
+        raise on long-range bonds -- it reports them.
+        """
+        if self.model != "fermi_hubbard_u1u1" or self.symmetry != "U1U1":
+            raise NotImplementedError(
+                "jw_bond_layout requires model='fermi_hubbard_u1u1' with U1U1 "
+                f"symmetry; got model={self.model!r}, symmetry={self.symmetry!r}."
+            )
+        _, coo2idx_use, mapped_L = _resolve_mpo_mapping(
+            mapper=mapper, idx2coo=idx2coo, coo2idx=coo2idx
+        )
+        raw_edges = _as_edges(self.edges)
+        edges = _map_edges_to_mpo_indices(raw_edges, coo2idx_use)
+        adjacent = []
+        long_range = []
+        for i, j in edges:
+            lo, hi = (int(i), int(j)) if int(i) < int(j) else (int(j), int(i))
+            (adjacent if hi - lo == 1 else long_range).append((lo, hi))
+        if mapped_L is not None:
+            sites = list(range(int(mapped_L)))
+        else:
+            sites = sorted({int(s) for edge in edges for s in edge})
+        return {"adjacent": adjacent, "long_range": long_range, "sites": sites}
+
     def trotter_gates(self, dt, *, imaginary=False, order=1):
         """Return local gate entries ``[(gate, edge), ...]`` for one Trotter step."""
         if order not in {1, 2}:
