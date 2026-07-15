@@ -206,7 +206,7 @@ def test_linked_cluster_repeated_loops_converge_to_a_single_ring_exactly():
     )
     fourth = linked_cluster_expand(
         tn,
-        max_loop_weight=3,
+        max_loop_weight=12,
         max_cluster_weight=12,
         cache=cache,
         tol=1e-12,
@@ -216,7 +216,7 @@ def test_linked_cluster_repeated_loops_converge_to_a_single_ring_exactly():
     assert len(first.loops) == 1
     assert [term.ursell for term in fourth.terms] == [1.0, -0.5, 1 / 3, -0.25]
     assert sorted(fourth.tail_by_weight) == [3, 6, 9, 12]
-    assert len(cache.loops_by_max_weight) == 1
+    assert len(cache.loops_by_max_weight) == 2
     assert abs(fourth.estimate - exact) < abs(first.estimate - exact) / 1e5
 
 
@@ -241,6 +241,16 @@ def test_linked_cluster_closes_unexcited_chords_with_bp_vacua():
 
     assert len(result.loops) == 4  # the four triangles of K4
     assert np.isfinite(result.estimate)
+
+
+def test_linked_cluster_rejects_an_incomplete_cluster_cutoff_by_default():
+    with pytest.raises(ValueError, match="max_loop_weight >= max_cluster_weight"):
+        linked_cluster_expand(
+            _positive_triangle(),
+            max_loop_weight=3,
+            max_cluster_weight=6,
+            tol=1e-12,
+        )
 
 
 def test_bp_state_local_update_matches_a_fresh_d1bp_fixed_point():
@@ -284,7 +294,7 @@ def test_cluster_tail_selects_among_converged_d1bp_candidates():
     selection = select_bp_candidate(
         tn,
         (candidate, candidate),
-        max_loop_weight=3,
+        max_loop_weight=6,
         max_cluster_weight=6,
     )
 

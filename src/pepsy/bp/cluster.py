@@ -69,6 +69,7 @@ from dataclasses import dataclass, field
 from itertools import chain, combinations
 from math import factorial
 from typing import Any
+import warnings
 
 import autoray as ar
 import numpy as np
@@ -532,7 +533,9 @@ class LinkedClusterResult:
     ``estimate`` is ``Z_BP * exp(log_correction)``. ``tail_by_weight`` groups
     terms in the additive log correction by total excited-edge weight; its
     highest available order is a useful, heuristic convergence indicator for
-    selecting among converged BP fixed points.
+    selecting among converged BP fixed points. It is meaningful only when
+    ``complete_cutoff`` is true, i.e. every individual loop through the total
+    cluster-weight cutoff was included.
     """
 
     estimate: Any
@@ -540,6 +543,7 @@ class LinkedClusterResult:
     log_correction: Any
     max_loop_weight: int
     max_cluster_weight: int
+    complete_cutoff: bool
     loops: tuple[ConnectedLoop, ...]
     loop_corrections: dict[ConnectedLoop, Any]
     terms: tuple[LinkedClusterTerm, ...]
@@ -739,6 +743,7 @@ def linked_cluster_expand(
     max_loop_weight: int,
     *,
     max_cluster_weight: int | None = None,
+    allow_incomplete: bool = False,
     messages=None,
     run_bp: bool = True,
     bp_runner: str = "plain",
@@ -769,7 +774,12 @@ def linked_cluster_expand(
     ``max_loop_weight`` bounds individual connected generalized loops in
     excited *bond* count. ``max_cluster_weight`` bounds the total bond count of
     a connected multiset, including repeated loops. Repetitions are essential:
-    on a single ring they generate the Taylor series of ``log(1 + w)``.
+    on a single ring they generate the Taylor series of ``log(1 + w)``. A
+    systematic order-``K`` truncation must include every individual loop of
+    weight through ``K``: use ``max_loop_weight=max_cluster_weight=K`` (the
+    default) or set a larger loop cutoff. Passing a smaller loop cutoff is
+    rejected unless ``allow_incomplete=True``; such a partial series is useful
+    for experiments but its tail is not a convergence/error diagnostic.
 
     The algorithm is intentionally D1BP-only and requires a closed pairwise
     TN. The D1 messages define the rank-one BP vacuum; non-vacuum bonds use
@@ -786,8 +796,22 @@ def linked_cluster_expand(
     max_cluster_weight = _validate_cluster_cutoff(
         "max_cluster_weight", max_cluster_weight
     )
-    if max_cluster_weight < max_loop_weight:
-        raise ValueError("max_cluster_weight must be >= max_loop_weight")
+    complete_cutoff = max_loop_weight >= max_cluster_weight
+    if not complete_cutoff:
+        if not allow_incomplete:
+            raise ValueError(
+                "a systematic linked-cluster cutoff requires "
+                "max_loop_weight >= max_cluster_weight; use equal cutoffs "
+                "or pass allow_incomplete=True for an exploratory partial "
+                "series"
+            )
+        warnings.warn(
+            "max_loop_weight < max_cluster_weight omits individual loop "
+            "terms from this linked-cluster order; tail_by_weight is not a "
+            "convergence/error diagnostic for this incomplete series",
+            UserWarning,
+            stacklevel=2,
+        )
     if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
     if bp_runner not in {"plain", "relay"}:
@@ -906,6 +930,7 @@ def linked_cluster_expand(
         log_correction=log_correction,
         max_loop_weight=max_loop_weight,
         max_cluster_weight=max_cluster_weight,
+        complete_cutoff=complete_cutoff,
         loops=loops,
         loop_corrections=loop_corrections,
         terms=tuple(terms),
@@ -970,6 +995,7 @@ def select_bp_candidate(
         "max_loop_weight",
         "max_cluster_weight",
         "cache",
+        "allow_incomplete",
     }.intersection(linked_options)
     if forbidden:
         names = ", ".join(sorted(forbidden))

@@ -148,7 +148,7 @@ from pepsy.bp import LinkedClusterCache, linked_cluster_expand
 cache = LinkedClusterCache()  # reuse while tensor ids and bonds are unchanged
 corrected = linked_cluster_expand(
     tn,
-    max_loop_weight=4,       # maximum excited bonds in an individual loop
+    max_loop_weight=8,       # all individual loops through weight 8
     max_cluster_weight=8,    # total weight, including repeated loops
     tol=1e-10,
     cache=cache,
@@ -162,10 +162,14 @@ tail = 0.0 if tail_weight is None else corrected.tail_by_weight[tail_weight]
 
 The BP messages must be at a D1BP fixed point: unlike a system-covering region
 cluster, this `I - |m><m|` construction relies on BP-vacuum cancellations.
-Increase both cutoffs and inspect the highest-order `tail_by_weight` term; it
-is a convergence diagnostic, not a certified error bar outside the loop-decay
-regime. The enumeration grows exponentially, so keep the first cutoffs small
-and reuse `LinkedClusterCache` for time steps and multi-start candidates.
+For a systematic order `K`, use `max_loop_weight=max_cluster_weight=K` (or a
+larger loop cutoff): otherwise single loops that should enter at order `K` are
+missing. Pepsy rejects that incomplete setup by default; it is available only
+as an explicitly labelled exploratory mode. Increase the complete cutoff and
+inspect the highest-order `tail_by_weight` term; it is a convergence diagnostic,
+not a certified error bar outside the loop-decay regime. The enumeration grows
+exponentially, so keep the first cutoffs small and reuse `LinkedClusterCache`
+for time steps and multi-start candidates.
 
 For a value-only perturbation of a fixed-topology TN, cache the D1BP messages
 and seed Quimb's local scheduler only at the changed tensors:
