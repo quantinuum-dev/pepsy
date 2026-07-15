@@ -54,7 +54,12 @@ def test_sampled_pauli_stream_replays_with_stn_and_stays_clifford():
         shots=3,
         seed=2,
     )
-    expected = qu.pauli("X") @ qu.hadamard() @ np.array([1.0, 0.0])
+    expected = (
+        np.array([[0.0, 1.0], [1.0, 0.0]])
+        @ np.array([[1.0, 1.0], [1.0, -1.0]])
+        @ np.array([1.0, 0.0])
+        / np.sqrt(2.0)
+    )
     assert result.shots == 3
     assert all(
         _fidelity(shot.p.to_dense(), np.array([1.0, 0.0])) == pytest.approx(1.0)
@@ -83,6 +88,33 @@ def test_sampled_pauli_stream_replays_with_mps_optimizer():
     expected = qu.pauli("Z") @ qu.hadamard() @ np.array([1.0, 0.0])
     for optimizer in result.optimizers:
         assert _fidelity(optimizer.p.to_dense(), expected) == pytest.approx(1.0)
+
+
+def test_sampled_pauli_stream_replays_with_backend_matched_torch_gates():
+    """Independent Pauli sampling keeps generated faults on the gate backend."""
+    torch = pytest.importorskip("torch")
+    state = qtn.MPS_computational_state("0", dtype="complex128")
+    state.apply_to_arrays(
+        lambda array: torch.as_tensor(array, dtype=torch.complex128)
+    )
+    gate = torch.tensor(
+        np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0),
+        dtype=torch.complex128,
+    )
+
+    result = pepsy.run_noisy_shots(
+        lambda: pepsy.MpsOptimizer(state, chi=2, mode="mpo"),
+        [(gate, 0)],
+        pepsy.PauliErrorModel.bit_flip(1.0),
+        shots=1,
+        seed=3,
+        run_kwargs={"progbar": False},
+    )
+
+    optimizer = result.optimizers[0]
+    assert type(optimizer.p[0].data).__module__.split(".", 1)[0] == "torch"
+    expected = qu.pauli("X") @ qu.hadamard() @ np.array([1.0, 0.0])
+    assert _fidelity(optimizer.p.to_dense(), expected) == pytest.approx(1.0)
 
 
 def test_noisy_shots_require_fresh_compatible_optimizers():

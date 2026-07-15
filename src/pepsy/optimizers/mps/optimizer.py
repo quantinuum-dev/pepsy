@@ -48,6 +48,7 @@ compatibility.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from collections.abc import Mapping
 from numbers import Integral
 import types
@@ -1125,6 +1126,53 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._accumulate_exponent(self.p, old_norm**0.5)
         self._current_orthog(self.p)
         return old_norm
+
+    def copy(self) -> "MpsOptimizer":
+        """Return an independent optimizer copy at its current MPS state.
+
+        The copied optimizer owns a deep copy of the represented MPS and an
+        independent canonical-centre cache.  Queue entries are intentionally
+        retained (without copying immutable gate payloads), so callers can
+        continue a partially prepared replay independently.  This is useful
+        for exact branch/tree sampling, where a state is copied only at a
+        genuine stochastic split.
+        """
+        copied = type(self)(
+            self.p.copy(),
+            gates=[],
+            chi=self.chi,
+            mode=self.mode,
+            contraction_opt=self.contraction_opt,
+            ind_id=self.ind_id,
+            inplace=True,
+        )
+        # The constructor establishes a valid canonical form for the copied
+        # MPS. Restore the source's tracked centre afterwards: it describes
+        # the same represented state and must remain optimizer-local.
+        copied.info_c = deepcopy(self.info_c)
+        copied.inplace = self.inplace
+        copied.G = list(self.G)
+        copied.where = list(self.where)
+        copied.event_types = list(self.event_types)
+        copied.qubits = list(self.qubits)
+        copied.logical_order = list(self.logical_order)
+        copied._persistent_layout_plan = deepcopy(self._persistent_layout_plan)
+        copied.layout_plan = deepcopy(self.layout_plan)
+        copied.last_layout_plan = deepcopy(self.last_layout_plan)
+        copied.losses = list(self.losses)
+        copied.normalizations = deepcopy(self.normalizations)
+        copied.infidelities = list(self.infidelities)
+        copied.true_infidelities = list(self.true_infidelities)
+        copied.infidelity_samples = deepcopy(self.infidelity_samples)
+        copied.norm_infidelity_samples = deepcopy(self.norm_infidelity_samples)
+        copied.mix_history = deepcopy(self.mix_history)
+        copied.last_mix_summary = deepcopy(self.last_mix_summary)
+        copied.measurements = deepcopy(self.measurements)
+        copied._true_fidelity_log_sum = self._true_fidelity_log_sum
+        copied._true_fidelity_count = self._true_fidelity_count
+        copied._norm_fidelity_proxy = self._norm_fidelity_proxy
+        copied._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
+        return copied
 
     def set_mode(self, mode):
         """Switch optimization mode while preserving the represented state."""

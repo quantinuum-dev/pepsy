@@ -63,6 +63,17 @@ def test_stim_compiler_samples_all_native_error_channel_forms():
     assert sample.heralds[-2].site == 0
     assert sample.heralds[-2].value is True
 
+    coalesced = pepsy.run_coalesced_stim_shots(
+        lambda: pepsy.MpsStabOptimizer(3), circuit, shots=8, seed=5
+    )
+    assert coalesced.shots == 8
+    assert all(len(leaf.heralds) == 2 for leaf in coalesced.leaves)
+    assert all(
+        (pepsy.PauliFault(0, 0, "X") in leaf.faults)
+        and (pepsy.PauliFault(14, 1, "Z") in leaf.faults)
+        for leaf in coalesced.leaves
+    )
+
 
 def test_stim_compiler_flattens_repeats_and_translates_standard_operations():
     circuit = stim.Circuit(
@@ -130,3 +141,28 @@ def test_stim_replay_matches_the_ordinary_mps_backend():
 def test_stim_else_correlated_error_requires_a_contiguous_chain():
     with pytest.raises(ValueError, match="must immediately follow"):
         pepsy.sample_stim_circuit("ELSE_CORRELATED_ERROR(1) X0", seed=1)
+
+
+def test_coalesced_stim_shots_share_ideal_prefix_and_retain_measurement_counts():
+    """Compiled Stim noise and ancilla-like measurements use the shared tree."""
+    calls = 0
+
+    def factory():
+        nonlocal calls
+        calls += 1
+        return pepsy.MpsStabOptimizer(1, chi=4)
+
+    result = pepsy.run_coalesced_stim_shots(
+        factory,
+        "H 0\nX_ERROR(0.1) 0\nM 0\nMR 0",
+        shots=128,
+        seed=11,
+    )
+
+    assert calls == 1
+    assert result.shots == 128
+    assert result.branches == 4
+    assert {bool(leaf.faults) for leaf in result.leaves} == {False, True}
+    assert all(len(leaf.measurements) == 2 for leaf in result.leaves)
+    assert all(leaf.measurements[0].probability == pytest.approx(0.5) for leaf in result.leaves)
+    assert all(np.allclose(leaf.optimizer.to_statevector(), [1.0, 0.0]) for leaf in result.leaves)

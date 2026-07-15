@@ -40,6 +40,50 @@ holds concise `(gate_index, site, pauli)` records. Use
 `sample_noisy_gate_stream(...)` or `sample_noisy_gate_streams(...)` when only
 stream construction is needed.
 
+## Exact coalesced ensembles for rare noise
+
+When the total fault rate is small, avoid replaying the same no-error prefix
+once per shot. `run_coalesced_noisy_shots(...)` holds one optimizer state per
+distinct sampled branch and its number of represented shots. It runs an ideal
+prefix once, samples exact multinomial branch counts at each Pauli channel,
+and copies an MPS only when two nonempty branches genuinely diverge:
+
+```python
+result = pepsy.run_coalesced_noisy_shots(
+    lambda: pepsy.MpsStabOptimizer(6, chi=32),
+    gates,
+    pepsy.PauliErrorModel.depolarizing(1e-3),
+    shots=100_000,
+    seed=7,
+)
+
+assert sum(result.counts) == 100_000
+for leaf in result.leaves:
+    print(leaf.count, leaf.faults)
+```
+
+The represented samples are still independent draws; only their identical
+state evolution is shared. `run_coalesced_trajectory_shots(...)` provides the
+same exact tree for `TrajectoryEvent` mixtures and state-dependent Kraus
+channels. It also branches mid-circuit `measure`, `reset`, and
+`measure_reset` controls with exact binomial counts, which is useful for
+ancilla-based circuits. Its leaf `measurements` records the selected outcomes.
+
+This is normally more useful than `torch.vmap` for rare faults: after a fault
+or collapse, states have different tensor data and often different bond
+profiles, while a coalesced no-error group stays one ordinary MPS/STN replay.
+For terminal readout, call `result.sample_bits(...)` (or
+`sample_coalesced_bits(result, ...)`). It invokes one batched `MpsSampler`
+call per ordinary-MPS leaf and the STN tree sampler per STN leaf, returning
+only terminal rows plus the source `leaf_indices`—never one optimizer per row:
+
+```python
+samples = result.sample_bits(seed=8)
+assert samples.shots == result.shots
+# samples.configs: (shots, n) computational-basis rows
+# samples.leaf_indices: source coalesced leaf for each row
+```
+
 ## User-defined quantum trajectories
 
 `TrajectoryEvent` is the general independent noise-simulation interface. Put
@@ -122,6 +166,12 @@ result = pepsy.run_stim_shots(
 print(result.faults[0])
 print(result.heralds[0])
 ```
+
+`run_coalesced_stim_shots(...)` has the same output shape as the coalesced
+ordinary trajectory runner and supports the complete compiled native Stim
+noise set, including two-qubit, heralded, and `E`/`ELSE_CORRELATED_ERROR`
+chains. It shares all ideal segments and records per-leaf Pauli faults and
+herald bits.
 
 Supported Stim error channels are `X_ERROR`, `Y_ERROR`, `Z_ERROR`,
 `DEPOLARIZE1`, `DEPOLARIZE2`, `PAULI_CHANNEL_1`, `PAULI_CHANNEL_2`,
