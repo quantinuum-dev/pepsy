@@ -323,6 +323,21 @@ jw_step = py.fermi_hubbard_u1u1_jw_gate_stream(
 )
 ```
 
+For a **single, controlled Jordan-Wigner conversion**, build the gates and the
+MPO from the *same* ``SymHamiltonian`` and ordering. ``jw_trotter_gates`` reads
+the same terms, site ordering (``mapper``), local operators, and parity-string
+convention as ``to_mpo``, so an energy from the MPO and a time evolution driven
+by the gates agree by construction. Non-nearest-neighbour mapped bonds raise
+(their string spans intervening sites); use ``to_mpo`` for those.
+
+```python
+ham = py.SymHamiltonian.from_edges(
+    "fermi_hubbard_u1u1", "U1U1", [(i, i + 1) for i in range(7)], t=1.0, U=8.0
+)
+mpo = ham.to_mpo(L=8)                 # energy / SymDMRG2
+gates = ham.jw_trotter_gates(0.05, order=2)   # consistent time-evolution gates
+```
+
 For a flattened MPS path, feed the same canonical bundled stream to
 ``MpsOptimizer``:
 

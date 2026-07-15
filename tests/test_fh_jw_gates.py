@@ -23,6 +23,12 @@ def _dense(arr):
     return np.asarray(arr.to_dense())
 
 
+def _dense_operator(arr):
+    """Dense NumPy operator from a Symmray gate or MPO (double densify)."""
+    out = arr.to_dense()
+    return np.asarray(out.to_dense() if hasattr(out, "to_dense") else out)
+
+
 def _dense_jw_two_site(*, t=1.0, U=0.0, mu=0.0):
     """Independent two-site spinful FH Hamiltonian via explicit Jordan-Wigner.
 
@@ -175,3 +181,73 @@ def test_jw_hopping_rejects_non_adjacent_and_bad_order():
         fermi_hubbard_u1u1_jw_gate_stream([(0, 1)], dt, order=3)
     with pytest.raises(ValueError):
         fermi_hubbard_u1u1_jw_interaction_gate_stream([], dt)
+
+
+def test_jw_trotter_gates_matches_low_level_wiring():
+    """SymHamiltonian.jw_trotter_gates wires terms/params into the low-level stream."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian
+
+    dt = 0.1
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", [(0, 1), (1, 2)], t=1.3, U=5.0, mu=0.4
+    )
+    method = ham.jw_trotter_gates(dt, order=2)
+    manual = fermi_hubbard_u1u1_jw_gate_stream(
+        [(0, 1), (1, 2)], dt, sites=range(3), t=1.3, U=5.0, mu=0.4, order=2
+    )
+    assert isinstance(method, SymGateStream)
+    assert len(method) == len(manual)
+    for (gate_m, where_m), (gate_l, where_l) in zip(method, manual):
+        assert where_m == where_l
+        assert np.allclose(_dense(gate_m), _dense(gate_l), atol=1e-12)
+
+
+def test_jw_trotter_gates_spectrum_consistent_with_to_mpo():
+    """jw_trotter_gates and to_mpo share one Jordan-Wigner conversion (same spectrum)."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian
+
+    dt = 0.1
+    # Pure hopping (U=0, mu=0): the whole L=2 MPO is exactly the hopping term.
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0, U=0.0, mu=0.0
+    )
+    mpo_ham = _dense_operator(ham.to_mpo(L=2, compress=False)).reshape(16, 16)
+    mpo_ham = (mpo_ham + mpo_ham.conj().T) / 2
+
+    hop = [
+        gate
+        for gate, where in ham.jw_trotter_gates(dt, order=1)
+        if isinstance(where, tuple) and len(where) == 2
+    ][0]
+    gate = _dense(hop).reshape(16, 16)
+
+    gate_spectrum = np.sort(-np.angle(np.linalg.eigvals(gate)) / dt)
+    mpo_spectrum = np.sort(np.linalg.eigvalsh(mpo_ham))
+    assert np.allclose(gate_spectrum, mpo_spectrum, atol=1e-8)
+
+
+def test_jw_trotter_gates_guards():
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymHamiltonian
+
+    dt = 0.1
+    # A bond that maps to non-adjacent chain sites is not a two-site JW gate.
+    with pytest.raises(ValueError):
+        SymHamiltonian.from_edges(
+            "fermi_hubbard_u1u1", "U1U1", [(0, 1), (0, 2)], t=1.0
+        ).jw_trotter_gates(dt)
+    # The density-density V term is not yet supported by the gate path.
+    with pytest.raises(NotImplementedError):
+        SymHamiltonian.from_edges(
+            "fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0, V=0.5
+        ).jw_trotter_gates(dt)
+    # Only the spinful U1U1 Fermi-Hubbard model has a Jordan-Wigner gate path.
+    with pytest.raises(NotImplementedError):
+        SymHamiltonian.from_edges("heisenberg", "U1", [(0, 1)]).jw_trotter_gates(dt)
+    # Only Lie/Strang Trotter orders are defined.
+    with pytest.raises(ValueError):
+        SymHamiltonian.from_edges(
+            "fermi_hubbard_u1u1", "U1U1", [(0, 1)], t=1.0
+        ).jw_trotter_gates(dt, order=3)
