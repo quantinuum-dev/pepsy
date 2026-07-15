@@ -346,6 +346,27 @@ expectations via the state's symmetry-aware ``measure`` -- so imaginary-time
 evolution driven by ``jw_trotter_gates`` converges to the ``SymDMRG2`` ground
 energy.
 
+**Implementation status (long-range / 2D).** The Jordan-Wigner *gate* path is
+currently **nearest-neighbour only**. A long-range hop (every perpendicular bond
+of a snaked 2D lattice) has a parity string spanning the sites between its
+endpoints, so it is not a two-site gate; ``jw_trotter_gates`` and
+``fermi_hubbard_u1u1_jw_*_gate_stream`` raise on such bonds, and
+``jw_bond_layout`` reports them. The exact long-range gate has a validated
+parity-sector sub-MPO form,
+
+```text
+exp(scale * H_ij) = (I_int / 2) x (G+ + G-)  +  (S_int / 2) x (G+ - G-),
+```
+
+with ``G+- = exp(+- scale * H_hop)`` the adjacent two-site gates and
+``S_int = prod_k P_k`` the intervening parity string (constant bond dimension,
+linear in span). Landing it on a symmetric MPS needs a Symmray-aware multi-site
+MPO gate application (upstream ``gate_nonlocal`` / MPS-addition are not yet
+Symmray-compatible), so it is deferred. For 2D today: order the lattice with
+``OneDMap(..., mode="folded-snake")`` to maximize nearest-neighbour bonds, use
+``to_mpo`` for the residual long-range terms, or evolve via a Symmray MPO-TDVP
+sweep (which preserves U1xU1 without gates).
+
 For a flattened MPS path, feed the same canonical bundled stream to
 ``MpsOptimizer``:
 
