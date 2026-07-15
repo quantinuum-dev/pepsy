@@ -145,6 +145,19 @@ def test_mps_sampler_native_numpy_samples_product_state():
     assert result.probs == [1.0] * 4
 
 
+def test_mps_sampler_defaults_to_trivial_1d_site_map():
+    """Omitting one_d_to_two_d should infer a trivial single-row 1D layout."""
+    psi = qtn.MPS_computational_state("101")
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+
+    assert sampler.one_d_to_two_d == {0: (0, 0), 1: (1, 0), 2: (2, 0)}
+    assert (sampler.Lx, sampler.Ly) == (3, 1)
+
+    result = sampler.sample(4, seed=1)
+    assert sampler.resolved_backend == "numpy"
+    assert result.configs_1d == [[1, 0, 1]] * 4
+
+
 def test_mps_sampler_native_numpy_sample_arrays_returns_arrays():
     """Native raw sampling should return batched arrays directly."""
     psi = qtn.MPS_computational_state("101")
@@ -221,6 +234,72 @@ def test_mps_sampler_native_site_ops_are_reused(monkeypatch):
     sampler.amplitudes(np.array([[1, 0, 1], [1, 0, 1]]))
 
     assert calls == ["numpy"]
+
+
+def test_mps_sampler_refresh_rebuilds_cached_native_state():
+    """Refreshing should pick up replacement MPS tensors after caching."""
+    psi = qtn.MPS_computational_state("00")
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+
+    configs_before, _ = sampler.sample_arrays(3, seed=1)
+    np.testing.assert_array_equal(configs_before, np.zeros((3, 2), dtype=int))
+    assert sampler._native_site_ops is not None
+
+    for site in range(psi.L):
+        tensor = psi[site]
+        physical_axis = tensor.inds.index(psi.site_ind(site))
+        tensor.modify(data=np.flip(tensor.data, axis=physical_axis).copy())
+
+    assert sampler.refresh() is sampler
+    assert sampler._native_site_ops is None
+    configs_after, _ = sampler.sample_arrays(3, seed=1)
+    np.testing.assert_array_equal(configs_after, np.ones((3, 2), dtype=int))
+
+
+def test_mps_sampler_refresh_rejects_a_different_mps_length():
+    """Refresh keeps the fixed site-map length explicit."""
+    psi = qtn.MPS_computational_state("00")
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+
+    with pytest.raises(ValueError, match="site map has length 2"):
+        sampler.refresh(qtn.MPS_computational_state("000"))
+
+    assert sampler._source_psi is psi
+
+
+def test_mps_sampler_refresh_rebuilds_the_quimb_snapshot():
+    """Refresh should also replace the copied historical Quimb state."""
+    psi = qtn.MPS_computational_state("00")
+    sampler = sampler_mod.MpsSampler(psi)
+    configs_before, _ = sampler.sample_arrays(2, seed=1)
+    np.testing.assert_array_equal(configs_before, np.zeros((2, 2), dtype=int))
+
+    for site in range(psi.L):
+        tensor = psi[site]
+        physical_axis = tensor.inds.index(psi.site_ind(site))
+        tensor.modify(data=np.flip(tensor.data, axis=physical_axis).copy())
+
+    sampler.refresh()
+    configs_after, _ = sampler.sample_arrays(2, seed=1)
+    np.testing.assert_array_equal(configs_after, np.ones((2, 2), dtype=int))
+
+
+def test_mps_sampler_numpy_qubit_path_avoids_generic_cdf(monkeypatch):
+    """Binary NumPy sampling uses the direct Bernoulli draw path."""
+    psi = qtn.MPS_product_state([
+        np.sqrt(np.array([0.8, 0.2])),
+        np.sqrt(np.array([0.3, 0.7])),
+    ])
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+
+    def fail_cumsum(*args, **kwargs):
+        raise AssertionError("binary NumPy sampling should not build a CDF")
+
+    monkeypatch.setattr(sampler_mod.np, "cumsum", fail_cumsum)
+    configs, probs = sampler.sample_arrays(4, seed=3)
+
+    assert configs.shape == (4, 2)
+    assert probs.shape == (4,)
 
 
 def test_mps_sampler_native_numpy_reports_born_probabilities():
@@ -379,6 +458,88 @@ def test_mps_sampler_native_torch_sample_arrays_stays_on_torch():
         configs,
         torch.tensor([[1, 0]] * 3, dtype=torch.long, device=configs.device),
     )
+    torch.testing.assert_close(probs, torch.ones(3, dtype=probs.dtype))
+
+
+def test_mps_sampler_torch_sampling_defaults_to_inference_mode():
+    """Sampling should not retain a graph unless the caller opts in."""
+    torch = pytest.importorskip("torch")
+    psi = qtn.MPS_product_state([
+        np.sqrt(np.array([0.8, 0.2])),
+        np.sqrt(np.array([0.3, 0.7])),
+    ])
+    psi.apply_to_arrays(
+        lambda array: torch.tensor(
+            array,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+    )
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+
+    _, inference_probs = sampler.sample_arrays(4, seed=3)
+    _, tracked_probs = sampler.sample_arrays(4, seed=3, track_grad=True)
+
+    assert not inference_probs.requires_grad
+    assert tracked_probs.requires_grad
+    tracked_probs.sum().backward()
+    assert any(psi[site].data.grad is not None for site in range(psi.L))
+
+
+def test_mps_sampler_torch_compile_is_cached_when_available(monkeypatch):
+    """The optional compiled inference path should reuse its compiled runner."""
+    torch = pytest.importorskip("torch")
+    psi = qtn.MPS_computational_state("10")
+    psi.apply_to_arrays(lambda array: torch.as_tensor(array, dtype=torch.float64))
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        backend="native",
+        torch_compile=True,
+    )
+    calls = []
+
+    def fake_compile(fn, **kwargs):
+        calls.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(
+        sampler_mod.MpsSampler,
+        "_torch_compile_supported",
+        staticmethod(lambda _torch: True),
+    )
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    configs_1, probs_1 = sampler.sample_arrays(3)
+    configs_2, probs_2 = sampler.sample_arrays(3)
+
+    assert len(calls) == 1
+    torch.testing.assert_close(configs_1, configs_2)
+    torch.testing.assert_close(probs_1, probs_2)
+
+
+def test_mps_sampler_torch_compile_falls_back_to_eager(monkeypatch):
+    """Compiler failures must not prevent native Torch sampling."""
+    torch = pytest.importorskip("torch")
+    psi = qtn.MPS_computational_state("10")
+    psi.apply_to_arrays(lambda array: torch.as_tensor(array, dtype=torch.float64))
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        backend="native",
+        torch_compile=True,
+    )
+
+    def fail_compile(*args, **kwargs):
+        raise RuntimeError("compiler unavailable")
+
+    monkeypatch.setattr(
+        sampler_mod.MpsSampler,
+        "_torch_compile_supported",
+        staticmethod(lambda _torch: True),
+    )
+    monkeypatch.setattr(torch, "compile", fail_compile)
+    configs, probs = sampler.sample_arrays(3)
+
+    assert sampler._torch_compile_disabled
+    torch.testing.assert_close(configs, torch.tensor([[1, 0]] * 3))
     torch.testing.assert_close(probs, torch.ones(3, dtype=probs.dtype))
 
 

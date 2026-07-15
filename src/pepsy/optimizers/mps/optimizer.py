@@ -22,8 +22,10 @@ may also carry *control events* that are state operations rather than gates:
 * ``("cap", where, vec[, absorb])`` — contract site ``where``'s physical index
   with ``vec`` (e.g. ``[1, 1]``) and absorb the result into the ``absorb``
   (``"left"``/``"right"``) neighbour, shortening the MPS by one site.
-* ``("reset", where)`` — mid-circuit reset of qubit(s) to ``|0>`` (measure ``Z``
-  then conditionally flip with ``X``); the MPS length is unchanged.
+* ``("reset", where[, basis])`` — mid-circuit reset of qubit(s) to the ``+1``
+  eigenstate of ``basis`` (default ``"Z"``); the MPS length is unchanged.
+* ``("measure_reset", basis, where[, outcome])`` — measure each target in
+  ``basis``, record the outcome(s), then reset to the ``+1`` eigenstate.
 
 Control events split the stream into gate/subMPO segments run through the
 active mode and are applied directly to the state between segments, so the same
@@ -158,7 +160,28 @@ def is_submpo_event(entry):
     return submpo_event_parts(entry) is not None
 
 
-_CONTROL_EVENT_NAMES = frozenset({"measure", "cap", "reset"})
+_CONTROL_EVENT_NAMES = frozenset({"measure", "cap", "reset", "measure_reset"})
+_MEASURE_RESET_ALIASES = {
+    "measure_reset": None,
+    "mr": None,
+    "mreset": None,
+    "measure_and_reset": None,
+}
+_MEASURE_RESET_AXIS_ALIASES = {
+    "mrx": "X",
+    "mry": "Y",
+    "mrz": "Z",
+}
+_RESET_AXIS_ALIASES = {
+    "reset_x": "X",
+    "reset_y": "Y",
+    "reset_z": "Z",
+}
+_RESET_FLIP_AXES = {
+    "X": "Z",
+    "Y": "X",
+    "Z": "X",
+}
 
 _PAULI_1Q = {
     "I": np.array([[1, 0], [0, 1]], dtype=complex),
@@ -195,7 +218,114 @@ def _normalize_absorb(absorb):
     return direction
 
 
-def _parse_control_tuple(name, entry):
+def _canonical_control_name(name):
+    """Return ``(canonical_name, default_axis)`` for a control event name."""
+    name = _normalize_event_name(name)
+    if name in _CONTROL_EVENT_NAMES:
+        return name, None
+    if name in _MEASURE_RESET_ALIASES:
+        return "measure_reset", _MEASURE_RESET_ALIASES[name]
+    if name in _MEASURE_RESET_AXIS_ALIASES:
+        return "measure_reset", _MEASURE_RESET_AXIS_ALIASES[name]
+    if name in _RESET_AXIS_ALIASES:
+        return "reset", _RESET_AXIS_ALIASES[name]
+    return None
+
+
+def _is_axis_string(value):
+    """Return whether ``value`` is a non-empty X/Y/Z Pauli-basis string."""
+    if not isinstance(value, str):
+        return False
+    axes = [c for c in value.upper() if not c.isspace()]
+    return bool(axes) and all(axis in _RESET_FLIP_AXES for axis in axes)
+
+
+def _normalize_control_axes(pauli, where, *, event):
+    """Return one X/Y/Z axis per site for reset-like controls."""
+    axes = [c for c in str(pauli).upper() if not c.isspace()]
+    if not axes:
+        raise ValueError(f"{event} basis must contain at least one Pauli axis.")
+    invalid = [axis for axis in axes if axis not in _RESET_FLIP_AXES]
+    if invalid:
+        raise ValueError(
+            f"{event} basis must use only X, Y, or Z axes, got {pauli!r}."
+        )
+    if len(axes) == 1 and len(where) > 1:
+        axes = axes * len(where)
+    if len(axes) != len(where):
+        raise ValueError(
+            f"{event} basis {pauli!r} has {len(axes)} axis/axes but where "
+            f"{where!r} has {len(where)} site(s)."
+        )
+    return tuple(axes)
+
+
+def _normalize_control_outcomes(outcome, where, *, event):
+    """Return one optional forced outcome per site."""
+    if outcome is None:
+        return (None,) * len(where)
+    if isinstance(outcome, Integral):
+        return (int(outcome),) * len(where)
+    if isinstance(outcome, (tuple, list)):
+        if len(outcome) != len(where):
+            raise ValueError(
+                f"{event} outcome sequence has length {len(outcome)} but where "
+                f"{where!r} has {len(where)} site(s)."
+            )
+        return tuple(None if value is None else int(value) for value in outcome)
+    raise ValueError(
+        f"{event} outcome must be an int, None, or a sequence matching where."
+    )
+
+
+def _parse_reset_tuple(entry, default_axis):
+    """Return reset payload and support for tuple-form reset aliases."""
+    if len(entry) < 2:
+        raise ValueError("reset event must be ('reset', where[, basis]).")
+    if default_axis is not None:
+        where = _normalize_control_where(entry[1])
+        if len(entry) > 2:
+            raise ValueError(f"{entry[0]!r} does not accept an explicit basis.")
+        basis = default_axis
+    elif len(entry) >= 3 and _is_axis_string(entry[1]):
+        basis = entry[1]
+        where = _normalize_control_where(entry[2])
+    else:
+        where = _normalize_control_where(entry[1])
+        basis = entry[2] if len(entry) >= 3 else "Z"
+    return "reset", {"axes": _normalize_control_axes(basis, where, event="reset")}, where
+
+
+def _parse_measure_reset_tuple(entry, default_axis):
+    """Return measure-reset payload and support for tuple-form events."""
+    if default_axis is None:
+        if len(entry) < 3:
+            raise ValueError(
+                "measure_reset event must be "
+                "('measure_reset', basis, where[, outcome])."
+            )
+        basis = entry[1]
+        where = _normalize_control_where(entry[2])
+        outcome = entry[3] if len(entry) > 3 else None
+    else:
+        if len(entry) < 2:
+            raise ValueError(f"{entry[0]!r} event must specify where.")
+        basis = default_axis
+        where = _normalize_control_where(entry[1])
+        outcome = entry[2] if len(entry) > 2 else None
+    return (
+        "measure_reset",
+        {
+            "axes": _normalize_control_axes(basis, where, event="measure_reset"),
+            "outcomes": _normalize_control_outcomes(
+                outcome, where, event="measure_reset"
+            ),
+        },
+        where,
+    )
+
+
+def _parse_control_tuple(name, entry, default_axis=None):
     """Return ``(name, payload, where)`` for a tuple-form control event."""
     if name == "measure":
         if len(entry) < 3:
@@ -214,14 +344,13 @@ def _parse_control_tuple(name, entry):
         absorb = _normalize_absorb(entry[3]) if len(entry) > 3 else "left"
         return "cap", {"vec": vec, "absorb": absorb}, where
     if name == "reset":
-        if len(entry) < 2:
-            raise ValueError("reset event must be ('reset', where).")
-        where = _normalize_control_where(entry[1])
-        return "reset", {}, where
+        return _parse_reset_tuple(entry, default_axis)
+    if name == "measure_reset":
+        return _parse_measure_reset_tuple(entry, default_axis)
     raise ValueError(f"Unknown control event {name!r}.")
 
 
-def _parse_control_mapping(name, entry):
+def _parse_control_mapping(name, entry, default_axis=None):
     """Return ``(name, payload, where)`` for a mapping-form control event."""
     if name == "measure":
         pauli = entry.get("pauli", entry.get("observable", _MISSING))
@@ -249,7 +378,37 @@ def _parse_control_mapping(name, entry):
         where = entry.get("where", entry.get("sites", _MISSING))
         if where is _MISSING:
             raise ValueError("reset event mapping needs 'where'.")
-        return "reset", {}, _normalize_control_where(where)
+        where = _normalize_control_where(where)
+        basis = entry.get("basis", entry.get("pauli", default_axis or "Z"))
+        return (
+            "reset",
+            {"axes": _normalize_control_axes(basis, where, event="reset")},
+            where,
+        )
+    if name == "measure_reset":
+        where = entry.get("where", entry.get("sites", _MISSING))
+        if where is _MISSING:
+            raise ValueError("measure_reset event mapping needs 'where'.")
+        where = _normalize_control_where(where)
+        basis = entry.get(
+            "basis",
+            entry.get("pauli", entry.get("observable", default_axis)),
+        )
+        if basis is None:
+            raise ValueError("measure_reset event mapping needs 'basis' or 'pauli'.")
+        outcome = entry.get("outcome", None)
+        return (
+            "measure_reset",
+            {
+                "axes": _normalize_control_axes(
+                    basis, where, event="measure_reset"
+                ),
+                "outcomes": _normalize_control_outcomes(
+                    outcome, where, event="measure_reset"
+                ),
+            },
+            where,
+        )
     raise ValueError(f"Unknown control event {name!r}.")
 
 
@@ -260,7 +419,8 @@ def _control_event_parts(entry):
     plain gates: Pauli measurements, physical-index caps that shorten the MPS,
     and mid-circuit resets. Tuple forms are
     ``("measure", pauli, where[, outcome])``, ``("cap", where, vec[, absorb])``,
-    and ``("reset", where)``; equivalent mapping forms use a
+    ``("reset", where[, basis])``, and
+    ``("measure_reset", basis, where[, outcome])``; equivalent mapping forms use a
     ``"kind"``/``"type"``/``"event"`` selector.
     """
     if (
@@ -268,13 +428,17 @@ def _control_event_parts(entry):
         and len(entry) >= 1
         and isinstance(entry[0], str)
     ):
-        name = _normalize_event_name(entry[0])
-        if name in _CONTROL_EVENT_NAMES:
-            return _parse_control_tuple(name, entry)
+        parsed = _canonical_control_name(entry[0])
+        if parsed is not None:
+            name, default_axis = parsed
+            return _parse_control_tuple(name, entry, default_axis)
     if isinstance(entry, Mapping):
         kind = entry.get("kind", entry.get("type", entry.get("event", _MISSING)))
-        if kind is not _MISSING and _normalize_event_name(kind) in _CONTROL_EVENT_NAMES:
-            return _parse_control_mapping(_normalize_event_name(kind), entry)
+        if kind is not _MISSING:
+            parsed = _canonical_control_name(kind)
+            if parsed is not None:
+                name, default_axis = parsed
+                return _parse_control_mapping(name, entry, default_axis)
     return None
 
 
@@ -366,8 +530,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         support ``where``. :meth:`submpo_event` builds the tuple form.
         In any mode the stream may also carry control events
         ``("measure", pauli, where[, outcome])``,
-        ``("cap", where, vec[, absorb])``, and ``("reset", where)`` (built by
-        :meth:`measure_event`, :meth:`cap_event`, and :meth:`reset_event`); a
+        ``("cap", where, vec[, absorb])``, ``("reset", where[, basis])``, and
+        ``("measure_reset", basis, where[, outcome])`` (built by
+        :meth:`measure_event`, :meth:`cap_event`, :meth:`reset_event`, and
+        :meth:`measure_reset_event`); a
         ``cap`` event shortens the MPS, so later event site labels refer to the
         shortened chain.
     chi : int
@@ -530,14 +696,39 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return ("cap", site, np.asarray(vec, dtype=complex).ravel(), _normalize_absorb(absorb))
 
     @staticmethod
-    def reset_event(where):
+    def reset_event(where, basis="Z"):
         """Return a canonical mid-circuit reset stream event.
 
-        Resets qubit(s) ``where`` to ``|0>`` by a ``Z`` measurement collapse
-        followed by an ``X`` flip when the outcome is ``|1>``. The MPS length is
-        unchanged and the internal ``Z`` measurements are not recorded.
+        Resets qubit(s) ``where`` to the ``+1`` eigenstate of ``basis`` by a
+        measurement collapse followed by a conditional anticommuting Pauli flip.
+        The MPS length is unchanged and the internal measurements are not
+        recorded. The legacy ``basis="Z"`` form returns ``("reset", where)``.
         """
-        return ("reset", _normalize_control_where(where))
+        where = _normalize_control_where(where)
+        axes = _normalize_control_axes(basis, where, event="reset")
+        if all(axis == "Z" for axis in axes):
+            return ("reset", where)
+        return ("reset", where, "".join(axes))
+
+    @staticmethod
+    def measure_reset_event(pauli, where, outcome=None):
+        """Return a canonical measure-then-reset stream event.
+
+        Each target is measured in the corresponding single-site Pauli basis,
+        the outcome is appended to :attr:`measurements`, and the target is then
+        reset to the ``+1`` eigenstate of that basis. A one-character ``pauli``
+        is broadcast across multiple sites.
+        """
+        where = _normalize_control_where(where)
+        axes = _normalize_control_axes(pauli, where, event="measure_reset")
+        if outcome is None:
+            return ("measure_reset", "".join(axes), where)
+        outcomes = _normalize_control_outcomes(
+            outcome, where, event="measure_reset"
+        )
+        if len(outcomes) == 1:
+            return ("measure_reset", "".join(axes), where, outcomes[0])
+        return ("measure_reset", "".join(axes), where, outcomes)
 
     @staticmethod
     def control_event_parts(entry):
@@ -547,7 +738,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def is_control_event(entry):
-        """Return whether ``entry`` is a measure/cap/reset control event."""
+        """Return whether ``entry`` is a measure/cap/reset/MR control event."""
 
         return _is_control_event(entry)
 
@@ -2136,6 +2327,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         elif name == "reset":
             self._apply_reset_event(
                 execution_where,
+                payload.get("axes"),
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+        elif name == "measure_reset":
+            self._apply_measure_reset_event(
+                payload["axes"],
+                execution_where,
+                payload["outcomes"],
+                record_where=record_where,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
             )
@@ -2368,17 +2569,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return m
 
-    def _apply_reset_event(self, where, *, cutoff, cutoff_mode):
-        """Reset each qubit in ``where`` to ``|0>`` (measure Z, flip if ``|1>``)."""
-        for site in where:
+    def _apply_basis_flip(self, q, axis, *, cutoff, cutoff_mode):
+        """Flip the ``-axis`` eigenstate at site ``q`` to the ``+axis`` eigenstate."""
+        flip_axis = _RESET_FLIP_AXES[axis]
+        self._apply_dense_operator(
+            self.p,
+            _PAULI_1Q[flip_axis],
+            (q,),
+            max_bond=self.chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+        )
+        # A single-site gate at the centre keeps the centre at q.
+        self.info_c["cur_orthog"] = (q, q)
+
+    def _apply_reset_event(self, where, axes=None, *, cutoff, cutoff_mode):
+        """Reset each qubit in ``where`` to the requested + Pauli eigenstate."""
+        if axes is None:
+            axes = ("Z",) * len(where)
+        for site, axis in zip(where, axes):
             q = int(site)
-            exp = self._state_expectation("Z", (q,))
-            p_zero = min(max(0.5 * (1.0 + exp), 0.0), 1.0)
-            m = 1 if self._rng.random() < p_zero else -1
-            projector = (
-                np.array([[1, 0], [0, 0]], dtype=complex)
-                if m > 0
-                else np.array([[0, 0], [0, 1]], dtype=complex)
+            exp = self._state_expectation(axis, (q,))
+            p_plus = min(max(0.5 * (1.0 + exp), 0.0), 1.0)
+            m = 1 if self._rng.random() < p_plus else -1
+            projector = 0.5 * (
+                np.eye(2, dtype=complex) + m * _PAULI_1Q[axis]
             )
             # Centre at q, collapse, renormalize, and (if needed) flip |1> -> |0>,
             # keeping the tracked centre at q throughout.
@@ -2393,16 +2608,40 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
             self._recanonize_center(q, renormalize=True)
             if m < 0:
-                self._apply_dense_operator(
-                    self.p,
-                    _PAULI_1Q["X"],
-                    (q,),
-                    max_bond=self.chi,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
+                self._apply_basis_flip(
+                    q, axis, cutoff=cutoff, cutoff_mode=cutoff_mode
                 )
-                # A single-site gate at the centre keeps the centre at q.
-                self.info_c["cur_orthog"] = (q, q)
+        return self.p
+
+    def _apply_measure_reset_event(  # pylint: disable=too-many-arguments
+        self,
+        axes,
+        where,
+        outcomes,
+        *,
+        record_where,
+        cutoff,
+        cutoff_mode,
+    ):
+        """Measure each target, record it, then reset it to the + Pauli eigenstate."""
+        record_sites = tuple(int(site) for site in record_where)
+        for axis, site, record_site, outcome in zip(
+            axes, where, record_sites, outcomes
+        ):
+            q = int(site)
+            m = self._apply_measure_event(
+                axis,
+                (q,),
+                outcome,
+                record_where=(record_site,),
+                renormalize=True,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+            )
+            if m < 0:
+                self._apply_basis_flip(
+                    q, axis, cutoff=cutoff, cutoff_mode=cutoff_mode
+                )
         return self.p
 
     def _apply_cap_event(self, where, vec, absorb):

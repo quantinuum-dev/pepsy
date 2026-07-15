@@ -1974,6 +1974,40 @@ def test_mps_optimizer_reset_returns_qubit_to_zero():
     assert opt.measurements == []
 
 
+@pytest.mark.parametrize("axis", ["X", "Y", "Z"])
+def test_mps_optimizer_reset_supports_pauli_bases(axis):
+    """Reset should return the target to the +1 eigenstate of X/Y/Z."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0"),
+        [(qu.hadamard(), (0,)), ("reset", 0, axis)],
+        chi=4,
+        mode="mpo",
+    )
+    opt.run(progbar=False, seed=7)
+
+    assert opt.p.L == 1
+    assert np.isclose(_dense_pauli_expectation(opt.p, axis, (0,)), 1.0)
+    assert opt.measurements == []
+
+
+@pytest.mark.parametrize(
+    ("axis", "bits", "outcome"),
+    [("Z", "1", -1), ("X", "0", -1), ("Y", "0", -1)],
+)
+def test_mps_optimizer_measure_reset_records_then_resets(axis, bits, outcome):
+    """MR should record the measured eigenvalue and leave the + basis state."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state(bits),
+        [("measure_reset", axis, 0, outcome)],
+        chi=4,
+        mode="mpo",
+    )
+    opt.run(progbar=False)
+
+    assert opt.measurements[0][:3] == (axis, (0,), outcome)
+    assert np.isclose(_dense_pauli_expectation(opt.p, axis, (0,)), 1.0)
+
+
 @pytest.mark.parametrize("mode", ["dmrg", "mpo", "mix", "swap", "perm", "svd", "exact"])
 def test_mps_optimizer_control_events_all_modes(mode):
     """measure/cap/reset should work in every run mode."""
@@ -2053,13 +2087,19 @@ def test_mps_optimizer_control_event_public_helpers():
     measure = py.MpsOptimizer.measure_event("Z", 2, +1)
     cap = py.MpsOptimizer.cap_event(1, [1, 1], absorb="right")
     reset = py.MpsOptimizer.reset_event([0, 3])
+    reset_x = py.MpsOptimizer.reset_event(0, basis="X")
+    measure_reset = py.MpsOptimizer.measure_reset_event("Y", 1, -1)
 
     assert measure == ("measure", "Z", (2,), 1)
     assert cap[0] == "cap" and cap[1] == 1 and cap[3] == "right"
     assert reset == ("reset", (0, 3))
+    assert reset_x == ("reset", (0,), "X")
+    assert measure_reset == ("measure_reset", "Y", (1,), -1)
 
     assert py.MpsOptimizer.is_control_event(measure)
     assert py.MpsOptimizer.is_control_event(cap)
+    assert py.MpsOptimizer.is_control_event(measure_reset)
+    assert py.MpsOptimizer.is_control_event(("mrx", 0, -1))
     assert not py.MpsOptimizer.is_control_event((np.eye(2), (0,)))
 
     name, payload, where = py.MpsOptimizer.control_event_parts(measure)

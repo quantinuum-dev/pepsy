@@ -15,6 +15,17 @@ helper `MpsOptimizer.submpo_event(mpo, where)` builds the tuple form. These
 events are applied with `gate_with_submpo_` and compressed to `chi`; they are
 only accepted in `mode="mpo"`.
 
+Streams may also include control events. `("measure", pauli, where[, outcome])`
+collapses onto a Pauli eigenvalue and records `(pauli, where, outcome, prob)`.
+`("reset", where[, basis])` resets each target to the `+1` eigenstate of
+`basis` (`"Z"` by default, so the legacy form resets to `|0>`); the internal
+measurement is not recorded. `("measure_reset", basis, where[, outcome])`
+measures each target in `basis`, records the result, then resets it to the
+`+1` eigenstate. The aliases `("mrx", where[, outcome])`, `("mry", ...)`, and
+`("mrz", ...)` are accepted. `("cap", where, vec[, absorb])` contracts one
+physical leg with `vec`, absorbs it into the selected neighbour, and shortens
+the MPS by one site.
+
 `mode="mix"` is a unitary gate-stream mode that warms up with MPO replay while
 `p.max_bond() < chi`, then switches to DMRG replay once the working MPS reaches
 the target bond. If a DMRG step raises or produces non-finite tensor data, the

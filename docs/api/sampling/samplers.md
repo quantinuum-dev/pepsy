@@ -19,6 +19,21 @@ needed. `sample_arrays(...)` remains available for direct tuple unpacking, and
 `sample(...)` preserves the original `MpsSampleResult` behavior.
 The native path builds backend-native right environments once, so it does not
 require quimb to canonicalize Torch or CuPy tensors before sampling.
+It caches those environments for the current MPS tensors: after modifying the
+MPS, call `sampler.refresh()` before sampling again.
+
+Torch sampling is inference-only by default, avoiding an autograd graph for
+the discrete draw and its sampled probabilities. Use `track_grad=True` only
+when those sampled Born probabilities need gradients:
+
+```python
+configs, probs = sampler.sample_arrays(1024, track_grad=True)
+```
+
+For repeated, device-resident, unseeded Torch batches, construct with
+`torch_compile=True` to opt into `torch.compile`. If the installed compiler
+cannot support the workload, the sampler automatically uses its eager path.
+Seeded sampling and calls that convert results to NumPy always use eager mode.
 
 For evaluating existing configurations, use:
 

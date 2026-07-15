@@ -40,6 +40,9 @@ Contraction helpers include:
 
 - `build_optimizer(...)` and `build_compressed_optimizer(...)`
 - `contract_hypercompressed_tn(...)`
+- `contract_hypercompressed_tn_batch(...)` — torch-only batched amplitudes
+  ``<x|psi>`` for many int64 configs via `torch.vmap`, reusing one fixed
+  compressed contraction tree (one-hot selection; requires `cutoff=0.0`)
 - `tn_norm(...)`, `tn_fidelity(...)`, and `tns_align(...)`
 
 Backend helpers manage package-wide defaults and optional linalg shims:

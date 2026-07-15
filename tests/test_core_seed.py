@@ -519,6 +519,54 @@ def test_contract_hypercompressed_tn_passes_custom_seq(monkeypatch):
     assert out.simplify_kwargs["inplace"] is True
 
 
+def test_contract_hypercompressed_tn_batch_requires_torch_samples():
+    """Non-torch `samples` should raise a clear TypeError (torch-only path)."""
+    tn = qtn.PEPS.rand(2, 2, bond_dim=2, phys_dim=2, seed=0)
+    with pytest.raises(TypeError, match="torch"):
+        core.contract_hypercompressed_tn_batch(tn, np.zeros((3, 4), dtype=int), chi=4)
+
+
+def test_contract_hypercompressed_tn_batch_vmap_cutoff_guard():
+    """vmap=True with a positive cutoff must raise (data-dependent SVD rank)."""
+    torch = pytest.importorskip("torch")
+    tn = qtn.PEPS.rand(2, 2, bond_dim=2, phys_dim=2, seed=0)
+    samples = torch.zeros((3, 4), dtype=torch.int64)
+    with pytest.raises(ValueError, match="cutoff=0.0"):
+        core.contract_hypercompressed_tn_batch(tn, samples, chi=4, cutoff=1e-10)
+
+
+def test_contract_hypercompressed_tn_batch_matches_exact():
+    """vmap/loop batch amplitudes match exact isel contraction (cutoff=0, big chi)."""
+    torch = pytest.importorskip("torch")
+    dtype = torch.complex128
+    peps = qtn.PEPS.rand(3, 3, bond_dim=2, phys_dim=2, seed=1, dtype="complex128")
+    peps.apply_to_arrays(lambda a: torch.tensor(np.asarray(a), dtype=dtype))
+    site_inds = [peps.site_ind(s) for s in peps.sites]
+    n = len(site_inds)
+    rng = np.random.default_rng(1)
+    samples = torch.tensor(rng.integers(0, 2, size=(12, n)), dtype=torch.int64)
+
+    # chi large enough that cutoff=0 fixed-rank truncation is exact here.
+    (man, expo), tree = core.contract_hypercompressed_tn_batch(
+        peps, samples, chi=16, return_tree=True
+    )
+    recon = man.cpu().numpy() * 10.0 ** expo.cpu().numpy()
+
+    def exact(x):
+        sel = {site_inds[i]: int(x[i]) for i in range(n)}
+        return complex(peps.copy().isel(sel).contract(all))
+
+    ref = np.array([exact(samples[b]) for b in range(len(samples))])
+    assert np.max(np.abs(recon - ref) / np.abs(ref)) < 1e-10
+
+    # Reuse the warm-up tree, use the loop path, and pass column-major samples.
+    man2, expo2 = core.contract_hypercompressed_tn_batch(
+        peps, samples.transpose(0, 1), chi=16, tree=tree, vmap=False
+    )
+    recon2 = man2.cpu().numpy() * 10.0 ** expo2.cpu().numpy()
+    assert np.max(np.abs(recon2 - ref) / np.abs(ref)) < 1e-10
+
+
 def test_measure_obs_normalizes_when_bra_not_provided():
     """Default branch should compute <tn|O|tn>/<tn|tn>."""
     mps = qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128", seed=11)

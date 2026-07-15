@@ -284,22 +284,44 @@ class MpsSampler:
     ----------
     psi : MatrixProductState
         The MPS to sample from (can be on any backend).
-    one_d_to_two_d : dict[int, tuple[int, int]]
-        Mapping from 1D site index to (x, y) lattice coordinate.
+    one_d_to_two_d : dict[int, tuple[int, int]], optional
+        Mapping from 1D site index to (x, y) lattice coordinate. When omitted,
+        a trivial single-row 1D layout ``{i: (i, 0)}`` inferred from the MPS
+        length is used, so a plain 1D chain can be sampled without a 2D map.
     backend : {"quimb", "native", "auto", "numpy", "torch", "cupy"}
         Sampling implementation. ``"quimb"`` preserves the historical CPU
         behavior. ``"native"`` accepts dense NumPy/Torch/CuPy tensors.
         ``"auto"`` tries native sampling and falls back to ``"quimb"`` when
         the MPS layout is unsupported.
+    torch_compile : bool, default=False
+        Opt into ``torch.compile`` for repeated, device-resident, unseeded
+        Torch inference batches. Unsupported compiler environments and calls
+        that need eager-only behavior fall back to eager sampling.
+
+    Notes
+    -----
+    Native right environments are cached. Call :meth:`refresh` after changing
+    the source MPS; otherwise the sampler continues to represent its previous
+    tensor data.
     """
 
     def __init__(
         self,
         psi,
-        one_d_to_two_d: dict[int, tuple[int, int]],
+        one_d_to_two_d: dict[int, tuple[int, int]] | None = None,
         *,
         backend: str | None = "quimb",
+        torch_compile: bool = False,
     ):
+        if one_d_to_two_d is None:
+            inferred_L = getattr(psi, "L", None)
+            if inferred_L is None:
+                raise ValueError(
+                    "one_d_to_two_d is required when the MPS does not expose an "
+                    "'L' attribute to infer the 1D chain length."
+                )
+            # Default to a trivial single-row 1D chain layout.
+            one_d_to_two_d = {site: (site, 0) for site in range(int(inferred_L))}
         self._L = _validate_one_d_to_two_d(
             one_d_to_two_d,
             expected_L=getattr(psi, "L", None),
@@ -308,13 +330,60 @@ class MpsSampler:
         self.Lx = max(x for x, y in one_d_to_two_d.values()) + 1
         self.Ly = max(y for x, y in one_d_to_two_d.values()) + 1
         self.backend = _normalize_mps_sampler_backend(backend)
+        if not isinstance(torch_compile, (bool, np.bool_)):
+            raise TypeError("torch_compile must be a boolean.")
+        self.torch_compile = bool(torch_compile)
         self.resolved_backend = None
+        self._source_psi = None
         self._native_arrays = None
         self._native_site_ops = None
+        self._native_inference_site_ops = None
         self._evaluation_backend = None
         self._evaluation_arrays = None
         self._evaluation_site_ops = None
         self._psi = None
+        self._torch_compiled_sample_fns = {}
+        self._torch_compile_disabled = False
+
+        self.refresh(psi)
+
+    def refresh(self, psi=None):
+        """Refresh cached state from ``psi`` or the original source MPS.
+
+        The native sampler caches tensor views and right environments for
+        repeated sampling. Call this method after an MPS is changed in place
+        or its tensors are replaced with ``Tensor.modify(...)``. Supplying
+        ``psi`` also changes the source MPS, provided its length matches the
+        sampler's fixed site map.
+
+        Returns
+        -------
+        MpsSampler
+            This sampler, with all derived state rebuilt lazily on its next
+            sampling or evaluation call.
+        """
+        if psi is None:
+            psi = self._source_psi
+        if psi is None:
+            raise ValueError("refresh requires an MPS before sampler initialization.")
+
+        source_L = getattr(psi, "L", None)
+        if source_L is not None and int(source_L) != self._L:
+            raise ValueError(
+                "Cannot refresh MpsSampler with an MPS of length "
+                f"{int(source_L)}; its site map has length {self._L}."
+            )
+        self._source_psi = psi
+
+        self._native_arrays = None
+        self._native_site_ops = None
+        self._native_inference_site_ops = None
+        self._evaluation_backend = None
+        self._evaluation_arrays = None
+        self._evaluation_site_ops = None
+        self._psi = None
+        self._torch_compiled_sample_fns.clear()
+        self._torch_compile_disabled = False
 
         if self.backend != "quimb":
             try:
@@ -329,7 +398,7 @@ class MpsSampler:
                     )
                 self.resolved_backend = native_backend
                 self._native_arrays = native_arrays
-                return
+                return self
             except Exception:
                 if self.backend != "auto":
                     raise
@@ -340,6 +409,7 @@ class MpsSampler:
         self._psi.apply_to_arrays(
             lambda x: x.get() if hasattr(x, "get") else np.asarray(x)
         )
+        return self
 
     def _get_evaluation_arrays(self):
         if self._native_arrays is not None:
@@ -350,7 +420,18 @@ class MpsSampler:
             )
         return self._evaluation_backend, self._evaluation_arrays
 
-    def _get_native_site_ops(self):
+    def _get_native_site_ops(self, *, track_grad=True):
+        if self.resolved_backend == "torch" and not track_grad:
+            if self._native_inference_site_ops is None:
+                import torch  # pylint: disable=import-outside-toplevel
+
+                arrays = tuple(array.detach() for array in self._native_arrays)
+                with torch.no_grad():
+                    self._native_inference_site_ops = self._prepare_site_ops(
+                        self.resolved_backend,
+                        arrays,
+                    )
+            return self.resolved_backend, self._native_inference_site_ops
         if self._native_site_ops is None:
             self._native_site_ops = self._prepare_site_ops(
                 self.resolved_backend,
@@ -360,7 +441,7 @@ class MpsSampler:
 
     def _get_evaluation_site_ops(self):
         if self._native_arrays is not None:
-            return self._get_native_site_ops()
+            return self._get_native_site_ops(track_grad=True)
         backend, arrays = self._get_evaluation_arrays()
         if self._evaluation_site_ops is None:
             self._evaluation_site_ops = self._prepare_site_ops(backend, arrays)
@@ -534,8 +615,6 @@ class MpsSampler:
         batch = xp.arange(int(n_samples))
         configs = []
         rng = xp.random.default_rng(seed)
-        use_binary_draw = backend == "cupy"
-
         for site, (branch_mat, phys_dim, right_dim) in enumerate(site_ops):
             right_env = right_envs[site + 1]
             amps = (vec @ branch_mat).reshape((-1, phys_dim, right_dim))
@@ -546,8 +625,14 @@ class MpsSampler:
                 np.finfo(float).tiny,
             )
             draws = rng.random(int(n_samples))
-            if use_binary_draw and phys_dim == 2:
-                choices = (draws >= probs[:, 0]).astype(np.int64)
+            if phys_dim == 2:
+                # Keep NumPy's historical CDF tie behavior while preserving
+                # CuPy's existing direct-Bernoulli convention.
+                if backend == "cupy":
+                    compare = draws >= probs[:, 0]
+                else:
+                    compare = draws > probs[:, 0]
+                choices = compare.astype(np.int64)
             else:
                 cdf = xp.cumsum(probs, axis=1)
                 choices = xp.sum(draws[:, None] > cdf, axis=1).astype(np.int64)
@@ -569,9 +654,75 @@ class MpsSampler:
             probs_total = np.asarray(probs_total)
         return configs, probs_total
 
-    def _native_sample_arrays(self, n_samples, seed, *, to_numpy):
-        backend, site_data = self._get_native_site_ops()
+    @staticmethod
+    def _torch_compile_supported(torch):
+        """Check whether the local Torch compiler has its Python headers."""
+        if not hasattr(torch, "compile"):
+            return False
+        import sysconfig  # pylint: disable=import-outside-toplevel
+        from pathlib import Path  # pylint: disable=import-outside-toplevel
+
+        include_dir = sysconfig.get_path("include")
+        return include_dir is None or (Path(include_dir) / "Python.h").is_file()
+
+    def _compiled_torch_sample(self, site_data, n_samples, *, track_grad):
+        """Run a cached compiled Torch inference batch when available."""
+        if (
+            not self.torch_compile
+            or track_grad
+            or self._torch_compile_disabled
+        ):
+            return None
+
+        import torch  # pylint: disable=import-outside-toplevel
+
+        if not self._torch_compile_supported(torch):
+            self._torch_compile_disabled = True
+            return None
+
+        key = (id(site_data), int(n_samples))
+        compiled = self._torch_compiled_sample_fns.get(key)
+        if compiled is None:
+            def run():
+                return self._torch_sample(
+                    site_data,
+                    n_samples,
+                    None,
+                    to_numpy=False,
+                )
+
+            try:
+                compiled = torch.compile(
+                    run,
+                    fullgraph=False,
+                    dynamic=False,
+                    mode="reduce-overhead",
+                )
+                result = compiled()
+            except Exception:  # pragma: no cover - compiler/version dependent
+                self._torch_compile_disabled = True
+                return None
+            self._torch_compiled_sample_fns[key] = compiled
+            return result
+
+        try:
+            return compiled()
+        except Exception:  # pragma: no cover - compiler/version dependent
+            self._torch_compiled_sample_fns.pop(key, None)
+            self._torch_compile_disabled = True
+            return None
+
+    def _native_sample_arrays(self, n_samples, seed, *, to_numpy, track_grad):
+        backend, site_data = self._get_native_site_ops(track_grad=track_grad)
         if backend == "torch":
+            if seed is None and not to_numpy:
+                compiled = self._compiled_torch_sample(
+                    site_data,
+                    n_samples,
+                    track_grad=track_grad,
+                )
+                if compiled is not None:
+                    return compiled
             return self._torch_sample(
                 site_data,
                 n_samples,
@@ -779,6 +930,7 @@ class MpsSampler:
         seed: int | None = None,
         *,
         to_numpy: bool = False,
+        track_grad: bool = False,
     ):
         """Draw samples and return raw ``(configs, probs)`` arrays.
 
@@ -787,14 +939,19 @@ class MpsSampler:
         The returned ``configs`` have shape ``(n_samples, L)`` and ``probs``
         has shape ``(n_samples,)``. Set ``to_numpy=True`` to force CPU NumPy
         arrays, matching the legacy :meth:`sample` result conversion.
+        Sampling is inference-only by default; set ``track_grad=True`` to
+        retain a Torch autograd graph for the sampled Born probabilities.
         """
         if int(n_samples) < 1:
             raise ValueError("n_samples must be a positive integer.")
+        if not isinstance(track_grad, (bool, np.bool_)):
+            raise TypeError("track_grad must be a boolean.")
         if self._native_arrays is not None:
             return self._native_sample_arrays(
                 int(n_samples),
                 seed,
                 to_numpy=to_numpy,
+                track_grad=bool(track_grad),
             )
 
         configs = []
@@ -810,6 +967,7 @@ class MpsSampler:
         seed: int | None = None,
         *,
         to_numpy: bool = False,
+        track_grad: bool = False,
     ) -> MpsBatchSampleResult:
         """Draw samples and return a named batched result.
 
@@ -823,6 +981,7 @@ class MpsSampler:
             n_samples,
             seed=seed,
             to_numpy=to_numpy,
+            track_grad=track_grad,
         )
         backend = (
             "numpy"
@@ -838,7 +997,13 @@ class MpsSampler:
             backend=backend,
         )
 
-    def sample(self, n_samples: int = 1, seed: int | None = None) -> MpsSampleResult:
+    def sample(
+        self,
+        n_samples: int = 1,
+        seed: int | None = None,
+        *,
+        track_grad: bool = False,
+    ) -> MpsSampleResult:
         """Draw ``n_samples`` configurations from the MPS.
 
         The native backend uses batched conditional contractions on the MPS
@@ -854,6 +1019,7 @@ class MpsSampler:
             n_samples,
             seed=seed,
             to_numpy=True,
+            track_grad=track_grad,
         ).to_sample_result()
 
 

@@ -22,6 +22,9 @@ __all__ += [
     "fermi_hubbard_u1u1_hopping_gate_stream",
     "fermi_hubbard_u1u1_interaction_gate_stream",
     "fermi_hubbard_u1u1_light_pulse_gate_stream",
+    "fermi_hubbard_u1u1_jw_gate_stream",
+    "fermi_hubbard_u1u1_jw_hopping_gate_stream",
+    "fermi_hubbard_u1u1_jw_interaction_gate_stream",
     "sector_index_map",
     "site_charge_alternating",
     "site_charge_from_map",
@@ -4077,6 +4080,274 @@ def fermi_hubbard_u1u1_gate_stream(
                 sites,
                 half,
                 U=U,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+    )
+    return SymGateStream(entries, dt=dt, imaginary=imaginary, order=order)
+
+
+def _require_jw_adjacent_edge(left, right):
+    """Validate that a Jordan-Wigner hopping bond is nearest-neighbour.
+
+    A bosonic Jordan-Wigner hop is only a two-site gate when the sites are
+    adjacent in the chain; otherwise the parity string spans the intervening
+    sites and cannot be written as a single two-site operator.
+    """
+    try:
+        li, ri = int(left), int(right)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Jordan-Wigner hopping gate streams require integer nearest-neighbour "
+            f"chain sites; got edge ({left!r}, {right!r})."
+        ) from None
+    if abs(li - ri) != 1:
+        raise ValueError(
+            f"Jordan-Wigner hopping on non-adjacent bond ({left}, {right}) is not "
+            "a two-site gate: the parity string spans the sites between them. "
+            "Order the sites so hopping is nearest-neighbour, or use "
+            "SymHamiltonian.to_mpo(model='fermi_hubbard_u1u1') for the long-range "
+            "Jordan-Wigner path."
+        )
+
+
+def _fh_u1u1_jw_hopping_term(*, t=1.0, peierls_angle=0.0, dtype="complex128"):
+    """Return the bosonic Jordan-Wigner two-site spinful FH hopping term.
+
+    This is the nearest-neighbour hopping term the ``fermi_hubbard_u1u1``
+    :meth:`SymHamiltonian.to_mpo` path places on an adjacent bond, written as a
+    *bosonic* Symmray array. The on-site Jordan-Wigner parity string is absorbed
+    into the lower-site endpoint (``create @ parity`` and ``parity @
+    annihilate``), so no fermionic swap phases are introduced and the term acts
+    on a bosonic (Jordan-Wigner) MPS. ``peierls_angle`` is the ascending-site
+    bond angle ``A``: forward hopping receives ``exp(+i A)`` and its Hermitian
+    conjugate ``exp(-i A)``.
+    """
+    ops = _fh_u1u1_jw_local_ops(dtype)
+    dtype = np.dtype(dtype)
+    parity = ops["parity"]
+    t_u, t_d = _as_spin_pair(t, name="t")
+    phase = np.exp(1j * float(peierls_angle))
+    phase_conj = np.conjugate(phase)
+    dense = np.zeros((16, 16), dtype=dtype)
+    for t_sigma, create, annihilate in (
+        (t_u, ops["create_u"], ops["annihilate_u"]),
+        (t_d, ops["create_d"], ops["annihilate_d"]),
+    ):
+        if t_sigma == 0:
+            continue
+        # Site-major JW: the parity string endpoint lives on the lower site.
+        forward = np.kron(create @ parity, annihilate)   # c_i^dag P_i (x) c_j
+        backward = np.kron(parity @ annihilate, create)  # P_i c_i     (x) c_j^dag
+        dense += (-t_sigma * phase) * forward
+        dense += (-t_sigma * phase_conj) * backward
+    return symm_operator_from_dense(
+        dense,
+        default_physical_sectors(model="fermi_hubbard_u1u1"),
+        symmetry="U1U1",
+        charge=(0, 0),
+        fermionic=False,
+        sites=2,
+    )
+
+
+def _fh_u1u1_jw_onsite_interaction_gate(
+    site,
+    dt,
+    *,
+    U=8.0,
+    mu=0.0,
+    imaginary=False,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Return a bosonic Jordan-Wigner onsite ``U n_up n_down - mu n`` gate."""
+    dtype = np.dtype(dtype)
+    scale = -dt if imaginary else -1j * dt
+    U_site = _node_parameter(U, site)
+    mu_u, mu_d = _as_spin_pair(_node_parameter(mu, site), name="mu")
+    number_u = np.array([0.0, 1.0, 0.0, 1.0], dtype=dtype)
+    number_d = np.array([0.0, 0.0, 1.0, 1.0], dtype=dtype)
+    double = np.array([0.0, 0.0, 0.0, 1.0], dtype=dtype)
+    onsite = U_site * double - mu_u * number_u - mu_d * number_d
+    gate_dense = np.diag(np.exp(scale * onsite)).astype(dtype, copy=False)
+    gate = symm_operator_from_dense(
+        gate_dense,
+        default_physical_sectors(model="fermi_hubbard_u1u1"),
+        symmetry="U1U1",
+        charge=(0, 0),
+        fermionic=False,
+        sites=1,
+    )
+    return _apply_to_array_blocks(gate, to_backend)
+
+
+def fermi_hubbard_u1u1_jw_hopping_gate_stream(
+    edges,
+    dt,
+    *,
+    t=1.0,
+    peierls_angle=0.0,
+    imaginary=False,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Return bosonic Jordan-Wigner ``U1U1`` Fermi-Hubbard hopping gates.
+
+    Bosonic (Jordan-Wigner spin-picture) counterpart of
+    :func:`fermi_hubbard_u1u1_hopping_gate_stream`. The Jordan-Wigner parity
+    string is written explicitly into the two-site operator, so these gates act
+    on a bosonic Jordan-Wigner MPS -- the representation used by
+    ``SymHamiltonian.to_mpo(model="fermi_hubbard_u1u1")`` and
+    :class:`pepsy.SymDMRG2` -- without introducing fermionic swap phases.
+
+    Only **nearest-neighbour** chain bonds are supported: a long-range
+    Jordan-Wigner hop is not a two-site gate because its parity string spans the
+    intervening sites. Order the sites so hopping is nearest-neighbour, or use
+    ``SymHamiltonian.to_mpo(model="fermi_hubbard_u1u1")`` for the long-range
+    Jordan-Wigner path. ``peierls_angle`` is the ascending-site bond angle and
+    may be a scalar, edge mapping, or ``callable(left, right)``.
+    """
+    edges = _as_edges(edges)
+    entries = []
+    for left, right in edges:
+        _require_jw_adjacent_edge(left, right)
+        lo, hi = (left, right) if int(left) < int(right) else (right, left)
+        term = _fh_u1u1_jw_hopping_term(
+            t=_edge_parameter(t, lo, hi),
+            peierls_angle=_edge_angle_parameter(peierls_angle, lo, hi),
+            dtype=dtype,
+        )
+        gate = _gate_from_term(term, dt, imaginary=imaginary)
+        gate = _apply_to_array_blocks(gate, to_backend)
+        entries.append((gate, (lo, hi)))
+    return SymGateStream(entries, dt=dt, imaginary=imaginary, order=1)
+
+
+def fermi_hubbard_u1u1_jw_interaction_gate_stream(
+    sites,
+    dt,
+    *,
+    U=8.0,
+    mu=0.0,
+    imaginary=False,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Return bosonic Jordan-Wigner onsite ``U n_up n_down`` gates.
+
+    Bosonic (Jordan-Wigner spin-picture) counterpart of
+    :func:`fermi_hubbard_u1u1_interaction_gate_stream`. The onsite term
+    ``U n_up n_down - mu_up n_up - mu_down n_down`` is diagonal, so each gate is a
+    charge-preserving bosonic one-site gate that mixes with the bosonic hopping
+    stream. ``mu`` may be a scalar or a ``(mu_up, mu_down)`` pair.
+    """
+    sites = tuple(sites)
+    if not sites:
+        raise ValueError("sites must not be empty.")
+    entries = [
+        (
+            _fh_u1u1_jw_onsite_interaction_gate(
+                site,
+                dt,
+                U=U,
+                mu=mu,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            ),
+            site,
+        )
+        for site in sites
+    ]
+    return SymGateStream(entries, dt=dt, imaginary=imaginary, order=1)
+
+
+def fermi_hubbard_u1u1_jw_gate_stream(
+    edges,
+    dt,
+    *,
+    sites=None,
+    t=1.0,
+    U=8.0,
+    mu=0.0,
+    peierls_angle=0.0,
+    imaginary=False,
+    order=2,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Return a bosonic Jordan-Wigner ``U1U1`` Fermi-Hubbard Trotter stream.
+
+    Bosonic (Jordan-Wigner spin-picture) counterpart of
+    :func:`fermi_hubbard_u1u1_gate_stream`. ``order=1`` returns a Lie step
+    ``U_int(dt) U_hop(dt)``; ``order=2`` returns the Strang step
+    ``U_int(dt/2) U_hop(dt) U_int(dt/2)``. All gates are bosonic Symmray arrays
+    that act on a Jordan-Wigner MPS; hopping bonds must be nearest-neighbour.
+    """
+    if order not in {1, 2}:
+        raise ValueError("order must be 1 or 2.")
+    edges = _as_edges(edges)
+    sites = _sites_from_edges(edges, sites)
+    if order == 1:
+        entries = (
+            tuple(
+                fermi_hubbard_u1u1_jw_interaction_gate_stream(
+                    sites,
+                    dt,
+                    U=U,
+                    mu=mu,
+                    imaginary=imaginary,
+                    dtype=dtype,
+                    to_backend=to_backend,
+                )
+            )
+            + tuple(
+                fermi_hubbard_u1u1_jw_hopping_gate_stream(
+                    edges,
+                    dt,
+                    t=t,
+                    peierls_angle=peierls_angle,
+                    imaginary=imaginary,
+                    dtype=dtype,
+                    to_backend=to_backend,
+                )
+            )
+        )
+        return SymGateStream(entries, dt=dt, imaginary=imaginary, order=order)
+
+    half = dt / 2
+    entries = (
+        tuple(
+            fermi_hubbard_u1u1_jw_interaction_gate_stream(
+                sites,
+                half,
+                U=U,
+                mu=mu,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+        + tuple(
+            fermi_hubbard_u1u1_jw_hopping_gate_stream(
+                edges,
+                dt,
+                t=t,
+                peierls_angle=peierls_angle,
+                imaginary=imaginary,
+                dtype=dtype,
+                to_backend=to_backend,
+            )
+        )
+        + tuple(
+            fermi_hubbard_u1u1_jw_interaction_gate_stream(
+                sites,
+                half,
+                U=U,
+                mu=mu,
                 imaginary=imaginary,
                 dtype=dtype,
                 to_backend=to_backend,

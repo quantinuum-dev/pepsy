@@ -304,6 +304,25 @@ pulse = py.fermi_hubbard_u1u1_light_pulse_gate_stream(
 )
 ```
 
+For the **Jordan-Wigner spin picture** -- the bosonic representation used by
+``SymHamiltonian.to_mpo(model="fermi_hubbard_u1u1")`` and ``SymDMRG2`` -- Pepsy
+also exposes matching *bosonic* gate streams. The Jordan-Wigner parity string is
+written explicitly into the two-site hopping operator, so these gates act on a
+bosonic Jordan-Wigner MPS without fermionic swap phases. Hopping bonds must be
+nearest-neighbour in the chain; use ``to_mpo`` for long-range Jordan-Wigner
+strings.
+
+```python
+edges = [(i, i + 1) for i in range(7)]
+jw_step = py.fermi_hubbard_u1u1_jw_gate_stream(
+    edges,
+    dt=0.05,
+    t=1.0,
+    U=8.0,
+    order=2,
+)
+```
+
 For a flattened MPS path, feed the same canonical bundled stream to
 ``MpsOptimizer``:
 
@@ -345,7 +364,8 @@ peps.apply_gates(
 )
 ```
 
-For Symmray-backed MPS gate streams, ``mode="swap"`` and ``mode="svd"`` use
+For Symmray-backed MPS gate streams, ``mode="swap"``, ``mode="perm"``, and
+``mode="svd"`` use
 quimb's block-aware auto-swap split path for nonlocal 1D gate streams such as a
 row-major square lattice. ``mode="mpo"`` uses its usual sub-MPO compression for
 nearest-neighbor gates and falls back to the same Symmray auto-swap path for
