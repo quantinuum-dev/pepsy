@@ -84,6 +84,14 @@ real products of opposite directed messages; pass
 `conversion_options={"smudge": 1e-10}` for a regularized SU initializer when
 a bond product is singular.
 
+For plain 1-norm BP without an SU bridge, use `pepsy.one_norm_bp`. It supports
+L1BP, HV1BP, and D1BP; select D1BP for the SU-compatible directed-message
+representation:
+
+```python
+bp_result = py.one_norm_bp(tn, method="d1bp", tol=1e-10)
+```
+
 ## Simple-update gauges and Relay
 
 `gauge_all_simple` is the single entry point for real Quimb simple-update

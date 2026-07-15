@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pepsy as py
 import pytest
 from pathlib import Path
 import runpy
@@ -46,6 +47,13 @@ def test_one_norm_bp_close_to_exact_on_small_grid():
     z_bp = float(res.contract())
     # Loopy BP is a good (not exact) approximation on this weakly-correlated grid.
     assert abs(z_bp - exact) / exact < 0.05
+
+
+def test_top_level_one_norm_bp_runs_d1bp():
+    result = py.one_norm_bp(_scalar_two_site_tree(), method="d1bp", tol=1e-12)
+
+    assert result.converged
+    assert np.isclose(float(result.contract()), 13.0)
 
 
 def test_relay_bp_returns_plain_fixed_point_when_easy():

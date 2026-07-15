@@ -194,6 +194,7 @@ _SYMBOL_MODULES = {
     "validate_tensor_network_tags": ".tensors",
     "gauge_all": ".bp",
     "gauge_all_simple": ".bp",
+    "one_norm_bp": ".bp",
 }
 
 __all__ = [
@@ -248,6 +249,7 @@ __all__ = [
     "gate_simple",
     "gauge_all",
     "gauge_all_simple",
+    "one_norm_bp",
     "h",
     "hadamard",
     "ham_tn",
@@ -378,7 +380,7 @@ def __getattr__(name):
 
 
 if TYPE_CHECKING:
-    from .bp import gauge_all, gauge_all_simple
+    from .bp import gauge_all, gauge_all_simple, one_norm_bp
     from . import backends, boundary, fitting, operators, optimizers, sampling, solvers, tensors, vmc
     from .backends import (
         get_default_array_backend,

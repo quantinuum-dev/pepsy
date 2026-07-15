@@ -56,8 +56,9 @@ At the start of a new task:
 ### BP and simple-update gauge workflow
 
 - The experimental BP integration is isolated in `src/pepsy/bp/`. The supported
-  top-level workflows are `pepsy.gauge_all` and `pepsy.gauge_all_simple`; keep
-  its remaining symbols under `pepsy.bp` until they are individually promoted.
+  top-level workflows are `pepsy.one_norm_bp`, `pepsy.gauge_all`, and
+  `pepsy.gauge_all_simple`; keep its remaining symbols under `pepsy.bp` until
+  they are individually promoted.
 - `gauge_all_simple` is the single simple-update gauge path. Its optional
   `RelayGaugeOptions` enables convergence acceleration. It must preserve the
   represented tensor network exactly when it mixes an external bond gauge:
@@ -67,6 +68,9 @@ At the start of a new task:
 - `gauge_all` is the SU <-> D1BP orchestrator. It may share conversions,
   schedules, and relay controls with SU and BP, but must not collapse their
   distinct numerical update loops into one implementation.
+- `one_norm_bp` is the primary plain 1-norm BP runner. It supports L1BP,
+  HV1BP, and D1BP; use `method="d1bp"` for the SU-compatible directed-message
+  representation.
 - Relay/SU state, DIIS history, and warm starts are keyed by the stable external
   bond ids, so this path intentionally rejects `fuse_multibonds=True`. Its
   `schedule="parallel"` mode schedules edge-coloured, non-overlapping bond

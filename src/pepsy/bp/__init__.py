@@ -11,8 +11,8 @@ convergence-robust improvements:
   cancellations and fastest finite-cluster convergence.
 
 Most BP tools are imported explicitly as ``pepsy.bp``. The supported top-level
-workflow entry points are :func:`pepsy.gauge_all` and
-:func:`pepsy.gauge_all_simple`.
+workflow entry points are :func:`pepsy.one_norm_bp`, :func:`pepsy.gauge_all`,
+and :func:`pepsy.gauge_all_simple`.
 """
 
 from .cluster import (
