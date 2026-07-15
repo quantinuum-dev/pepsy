@@ -16,12 +16,14 @@ qtn = pytest.importorskip("quimb.tensor")
 pytest.importorskip("quimb.tensor.belief_propagation")
 
 from pepsy.bp import (  # noqa: E402
+    GaugeResult,
     LoopClusterResult,
     RelayGaugeOptions,
     ScalarClusterCache,
     compare_simple_update_gauges,
     compare_simple_update_to_bp,
     d1bp_from_simple_update_gauges,
+    gauge_all,
     gauge_all_simple,
     gauge_all_simple_with_bp_check,
     loop_cluster_expand,
@@ -45,12 +47,14 @@ def test_exports():
     from pepsy import bp
 
     assert {
+        "GaugeResult",
         "LoopClusterResult",
         "RelayGaugeOptions",
         "ScalarClusterCache",
         "compare_simple_update_gauges",
         "compare_simple_update_to_bp",
         "d1bp_from_simple_update_gauges",
+        "gauge_all",
         "gauge_all_simple",
         "loop_cluster_expand",
         "norm1_gloop_expand",
@@ -324,6 +328,55 @@ def test_d1bp_messages_round_trip_losslessly_through_su_core_and_gauges():
         simple_update_gauges_from_messages(round_trip.bp),
     )
     assert comparison["max_rel_l2"] < 1e-7
+
+
+def test_gauge_all_runs_su_then_d1bp_and_retains_both_gauges():
+    result = gauge_all(
+        _projected_scalar_ladder(),
+        start="su",
+        target="bp",
+        su_options={"max_iterations": 3},
+        bp_options={"run_opts": {"max_iterations": 100, "tol": 1e-10}},
+    )
+
+    assert isinstance(result, GaugeResult)
+    assert result.su_info is not None
+    assert result.su_gauges is result.gauges
+    assert len(result.su_gauges) == len(result.core.inner_inds())
+    assert result.bp_result.converged
+    assert result.bp is result.bp_result.bp
+    assert result.messages is result.bp_result.messages
+
+
+def test_gauge_all_passes_external_su_gauges_to_d1bp():
+    core, gauges = _projected_scalar_ladder_su_core()
+
+    result = gauge_all(
+        core,
+        start="su",
+        target="bp",
+        su_gauges=gauges,
+        bp_options={"run_opts": {"max_iterations": 100, "tol": 1e-10}},
+    )
+
+    assert result.su_info is None
+    assert result.bp_result.converged
+    comparison = compare_simple_update_gauges(gauges, result.su_gauges)
+    assert comparison["max_rel_l2"] < 1e-12
+
+
+def test_gauge_all_runs_d1bp_then_converts_to_su_losslessly():
+    result = gauge_all(
+        _positive_triangle(),
+        start="bp",
+        target="su",
+        bp_options={"run_opts": {"max_iterations": 100, "tol": 1e-10}},
+    )
+
+    assert result.bp_result.converged
+    rebuilt = result.core.copy()
+    rebuilt.gauge_simple_insert(result.su_gauges)
+    _assert_same_tensor_data(rebuilt, result.bp.tn)
 
 
 def test_relay_bp_runs_from_real_quimb_su_and_can_return_to_su():

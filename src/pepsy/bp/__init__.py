@@ -10,8 +10,9 @@ convergence-robust improvements:
   the system. Fixed-point BP messages are still what justify the formal loop
   cancellations and fastest finite-cluster convergence.
 
-It is imported explicitly as ``pepsy.bp`` (kept out of the lazy top-level
-namespace while it is a prototype).
+Most BP tools are imported explicitly as ``pepsy.bp``. The supported top-level
+workflow entry points are :func:`pepsy.gauge_all` and
+:func:`pepsy.gauge_all_simple`.
 """
 
 from .cluster import (
@@ -21,11 +22,13 @@ from .cluster import (
     norm1_gloop_expand,
 )
 from .gauges import (
+    GaugeResult,
     RelayGaugeOptions,
     compare_simple_update_gauges,
     compare_simple_update_to_bp,
     copy_gauges,
     d1bp_from_simple_update_gauges,
+    gauge_all,
     gauge_all_simple,
     gauge_all_simple_with_bp_check,
     relay_gauge_all_simple,
@@ -38,6 +41,7 @@ from .gauges import (
 from .relay import RelayBPResult, one_norm_bp, relay_bp
 
 __all__ = [
+    "GaugeResult",
     "LoopClusterResult",
     "RelayGaugeOptions",
     "ScalarClusterCache",
@@ -45,6 +49,7 @@ __all__ = [
     "compare_simple_update_to_bp",
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
+    "gauge_all",
     "gauge_all_simple",
     "gauge_all_simple_with_bp_check",
     "relay_gauge_all_simple",

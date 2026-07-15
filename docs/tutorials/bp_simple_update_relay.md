@@ -46,6 +46,44 @@ positive D1BP message products it returns a lossless `(core, gauges)` pair;
 if a real SU run has singular products, pass an explicit small `smudge` to
 obtain a regularized but still representation-preserving SU initializer.
 
+## Unified SU ↔ D1BP workflow
+
+`pepsy.gauge_all` is the high-level bridge. It keeps the SU and D1BP numerical
+updates separate, but handles their warm starts and lossless conversions in one
+place. For example, first find SU gauges, then use them to initialize D1BP:
+
+```python
+import pepsy as py
+
+result = py.gauge_all(
+    tn,
+    start="su",
+    target="bp",
+    su_options={"max_iterations": 50},
+    bp_options={"run_opts": {"tol": 1e-10}},
+)
+
+su_core = result.core
+su_gauges = result.su_gauges
+bp = result.bp
+```
+
+The reverse direction runs D1BP and returns its lossless SU-core split:
+
+```python
+result = py.gauge_all(
+    tn,
+    start="bp",
+    target="su",
+    bp_options={"run_opts": {"tol": 1e-10}},
+)
+```
+
+This BP-to-SU route is deliberately D1BP-only. It requires strictly positive,
+real products of opposite directed messages; pass
+`conversion_options={"smudge": 1e-10}` for a regularized SU initializer when
+a bond product is singular.
+
 ## Simple-update gauges and Relay
 
 `gauge_all_simple` is the single entry point for real Quimb simple-update

@@ -97,13 +97,13 @@ records Quimb's broader termination flag separately.
 
 **Simple-update bridge (2026-07-14):**
 `simple_update_core_and_gauges_from_messages` converts a completed nonnegative
-simple update into a D1BP warm snapshot, and `gauge_all_simple` unifies ordinary
+simple update into a D1BP warm snapshot. `gauge_all_simple` unifies ordinary
 SU, optional BP-residual checks, Relay memory, projected DIIS, and parallel
-edge-coloured sweeps. Relay mixing is compensated into each adjacent core
-tensor, so the returned `(core, gauges)` represents exactly the same TN. CPU
-NumPy networks can update independent bonds in threads; Relay, DIIS, and the
-parallel schedule require `fuse_multibonds=False`. Kept out of the lazy
-top-level namespace (`import pepsy.bp`) while it is a prototype; tests in
+edge-coloured sweeps; `gauge_all` is the top-level SU <-> D1BP workflow that
+returns both representations. Relay mixing is compensated into each adjacent
+core tensor, so the returned `(core, gauges)` represents exactly the same TN.
+CPU NumPy networks can update independent bonds in threads; Relay, DIIS, and
+the parallel schedule require `fuse_multibonds=False`. Tests are in
 `tests/test_bp_relay.py`. The remaining work is to use converged BP/SU gauges
 as optimizer inputs and wire them to the §2 loop corrections.
 

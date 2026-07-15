@@ -11,11 +11,13 @@ import autoray as ar
 import numpy as np
 
 __all__ = [
+    "GaugeResult",
     "RelayGaugeOptions",
     "compare_simple_update_gauges",
     "compare_simple_update_to_bp",
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
+    "gauge_all",
     "gauge_all_simple",
     "gauge_all_simple_with_bp_check",
     "relay_gauge_all_simple",
@@ -40,6 +42,38 @@ class RelayGaugeOptions:
     gamma_range: tuple[float, float] = (0.0, 0.5)
     memory_first_leg: bool = False
     seed: int | None = None
+
+
+@dataclass
+class GaugeResult:
+    """Representations and diagnostics produced by :func:`gauge_all`.
+
+    ``core`` and ``su_gauges`` are a simple-update representation whenever
+    ``su_gauges`` is not ``None``. ``bp_result`` is the standard
+    :class:`~pepsy.bp.RelayBPResult` wrapper when a D1BP stage was run.
+    """
+
+    core: Any
+    su_gauges: dict | None
+    bp_result: Any | None
+    su_info: dict[str, Any] | None
+    start: str
+    target: str
+
+    @property
+    def gauges(self):
+        """Alias for the external simple-update gauges."""
+        return self.su_gauges
+
+    @property
+    def bp(self):
+        """The underlying D1BP object, when a BP stage was run."""
+        return None if self.bp_result is None else self.bp_result.bp
+
+    @property
+    def messages(self):
+        """D1BP messages, when a BP stage was run."""
+        return None if self.bp_result is None else self.bp_result.messages
 
 
 def _copy_array(x):
@@ -856,6 +890,129 @@ def gauge_all_simple(
         }
     )
     return work, gauges, info
+
+
+def gauge_all(
+    tn,
+    *,
+    start: str = "su",
+    target: str = "bp",
+    su_gauges=None,
+    bp_messages=None,
+    su_options: dict[str, Any] | None = None,
+    bp_options: dict[str, Any] | None = None,
+    conversion_options: dict[str, Any] | None = None,
+    inplace: bool = False,
+) -> GaugeResult:
+    """Run and bridge simple-update (SU) and directed 1-norm BP gauges.
+
+    ``start`` and ``target`` are each ``"su"`` or ``"bp"``. A change of
+    representation runs the source solver, then performs the appropriate
+    lossless D1BP <-> SU conversion. For example, ordinary SU followed by a
+    D1BP refinement is:
+
+    .. code-block:: python
+
+        result = gauge_all(
+            tn,
+            start="su",
+            target="bp",
+            su_options={"max_iterations": 50},
+            bp_options={"run_opts": {"tol": 1e-10}},
+        )
+
+    Supplying ``su_gauges`` skips the initial SU solve and uses the provided
+    external gauges as the D1BP warm start. Supplying ``bp_messages`` starts
+    D1BP from that compatible directed-message snapshot. ``su_options`` are
+    forwarded to :func:`gauge_all_simple`; ``bp_options`` are forwarded to
+    :func:`run_d1bp_from_simple_update_gauges` and thus support plain or Relay
+    D1BP. ``conversion_options`` are forwarded to
+    :func:`simple_update_core_and_gauges_from_messages` for BP-to-SU output.
+
+    BP-to-SU conversion is intentionally restricted to D1BP: external
+    nonnegative SU gauges are the invariant products of opposite directed
+    D1BP messages. Other BP layouts do not generally have that representation.
+    """
+    valid_representations = {"su", "bp"}
+    if start not in valid_representations:
+        raise ValueError("start must be 'su' or 'bp'")
+    if target not in valid_representations:
+        raise ValueError("target must be 'su' or 'bp'")
+    if start == "su" and bp_messages is not None:
+        raise ValueError("bp_messages can only be supplied when start='bp'")
+    if start == "bp" and su_gauges is not None:
+        raise ValueError("su_gauges can only be supplied when start='su'")
+
+    su_options = {} if su_options is None else dict(su_options)
+    bp_options = {} if bp_options is None else dict(bp_options)
+    conversion_options = (
+        {} if conversion_options is None else dict(conversion_options)
+    )
+    if "inplace" in su_options:
+        raise TypeError("pass inplace directly to gauge_all")
+
+    core = tn if inplace else tn.copy()
+    su_info = None
+    bp_result = None
+
+    if start == "su":
+        if su_gauges is None:
+            core, su_gauges, su_info = gauge_all_simple(
+                tn,
+                inplace=inplace,
+                **su_options,
+            )
+        else:
+            su_gauges = copy_gauges(su_gauges)
+
+        if target == "bp":
+            bp_result = run_d1bp_from_simple_update_gauges(
+                core,
+                su_gauges,
+                **bp_options,
+            )
+        return GaugeResult(
+            core=core,
+            su_gauges=su_gauges,
+            bp_result=bp_result,
+            su_info=su_info,
+            start=start,
+            target=target,
+        )
+
+    run_opts = dict(bp_options.pop("run_opts", {}))
+    if bp_messages is not None:
+        if "init_messages" in run_opts:
+            raise TypeError(
+                "pass BP warm messages either as bp_messages or "
+                "bp_options['run_opts']['init_messages'], not both"
+            )
+        run_opts["init_messages"] = bp_messages
+    if run_opts:
+        bp_options["run_opts"] = run_opts
+
+    bp_result = run_d1bp_from_simple_update_gauges(
+        core,
+        gauges=None,
+        **bp_options,
+    )
+    if target == "su":
+        core, su_gauges = simple_update_core_and_gauges_from_messages(
+            bp_result.bp,
+            **conversion_options,
+        )
+    else:
+        core = bp_result.bp.tn
+        su_gauges = None
+
+    return GaugeResult(
+        core=core,
+        su_gauges=su_gauges,
+        bp_result=bp_result,
+        su_info=su_info,
+        start=start,
+        target=target,
+    )
 
 
 def relay_gauge_all_simple(

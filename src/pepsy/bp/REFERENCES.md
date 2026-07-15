@@ -16,7 +16,7 @@ side · **[roots]** foundational / prior art.
 | API | what | paper |
 | --- | --- | --- |
 | `one_norm_bp`, `relay_bp`, `RelayBPResult` | 1-norm BP + disordered-memory / relay-BP convergence robustness | Müller et al. 2506.01779 |
-| `simple_update_core_and_gauges_from_messages`, `run_d1bp_from_simple_update_gauges`, `gauge_all_simple` | nonnegative simple-update ↔ D1BP gauge bridge; ordinary/relay/DIIS simple-update gauging with exact core compensation | Alkabetz & Arad (2021); Tindall & Fishman (2023); Müller et al. 2506.01779 |
+| `gauge_all`, `simple_update_core_and_gauges_from_messages`, `run_d1bp_from_simple_update_gauges`, `gauge_all_simple` | nonnegative simple-update ↔ D1BP gauge bridge; ordinary/relay/DIIS simple-update gauging with exact core compensation | Alkabetz & Arad (2021); Tindall & Fishman (2023); Müller et al. 2506.01779 |
 | `loop_cluster_expand`, `LoopClusterResult` | loop **cluster** expansion (thin wrapper over quimb `contract_gloop_expand`) | Gray et al. 2510.05647 |
 
 ---
