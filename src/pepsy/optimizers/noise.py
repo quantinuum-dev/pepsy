@@ -782,7 +782,15 @@ def _is_stabilizer_trajectory_optimizer(optimizer) -> bool:
     """Recognize the STN optimizer without importing it during package setup."""
     return all(
         callable(getattr(optimizer, attr, None))
-        for attr in ("copy", "_mps_site", "_canonize_p", "_renorm_p_at")
+        for attr in (
+            "copy",
+            "_mps_site",
+            "_canonize_p",
+            "_renorm_p_at",
+            "_make_norm_event",
+            "_reset_norm_infidelity",
+            "_commit_norm_event",
+        )
     )
 
 
@@ -888,12 +896,17 @@ def _run_trajectory_entries(optimizer, entries, run_kwargs, *, non_unitary=False
     optimizer.run(**kwargs)
 
 
-def _normalize_trajectory_branch(optimizer, where):
+def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
     """Normalize a selected Kraus branch while keeping MPS metadata valid."""
     if _is_stabilizer_trajectory_optimizer(optimizer):
         site = optimizer._mps_site(_trajectory_where(where)[0])
         optimizer._canonize_p(site)
-        optimizer._renorm_p_at(site)
+        projected_norm = optimizer._renorm_p_at(site)
+        # A selected Kraus outcome is a normalized quantum-trajectory branch:
+        # close the preceding unitary segment without counting its Born weight
+        # as compression loss, then establish the new unit-norm baseline.
+        optimizer._reset_norm_infidelity()
+        optimizer._commit_norm_event(norm_event, projected_norm=projected_norm)
         return
     normalize = getattr(optimizer, "normalize", None)
     if not callable(normalize):
@@ -921,6 +934,11 @@ def _apply_trajectory_event(optimizer, event, rng, event_index, run_kwargs):
         outcome = channel.outcomes[index]
         probability = float(probabilities[index])
         non_unitary = True
+    norm_event = (
+        optimizer._make_norm_event("trajectory_kraus", branch_probability=probability)
+        if non_unitary and _is_stabilizer_trajectory_optimizer(optimizer)
+        else None
+    )
     _run_trajectory_entries(
         optimizer,
         [_entry_from_trajectory_outcome(outcome, event.where)],
@@ -928,7 +946,7 @@ def _apply_trajectory_event(optimizer, event, rng, event_index, run_kwargs):
         non_unitary=non_unitary,
     )
     if non_unitary:
-        _normalize_trajectory_branch(optimizer, event.where)
+        _normalize_trajectory_branch(optimizer, event.where, norm_event=norm_event)
     return TrajectoryRecord(event_index, event.where, outcome.label, probability)
 
 

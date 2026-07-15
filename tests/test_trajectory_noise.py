@@ -103,3 +103,31 @@ def test_state_dependent_kraus_branches_are_sampled_from_the_current_state(kind)
         expected = [1.0, 0.0] if records[0].label == "jump" else [0.0, 1.0]
         np.testing.assert_allclose(_statevector(optimizer), expected, atol=1e-8)
         assert abs(optimizer.p.norm()) == pytest.approx(1.0, abs=1e-8)
+
+
+def test_kraus_trajectory_starts_a_fresh_stn_norm_diagnostic_segment():
+    stream = [
+        ("rxx", 0.8, 0, 1),
+        (_X, 0),
+        pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(1.0), 0),
+        ("rxx", 0.8, 0, 1),
+    ]
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(2, chi=1, track_infidelity=True),
+        stream,
+        shots=1,
+        seed=7,
+    )
+
+    simulator = result.optimizers[0]
+    event = simulator.norm_events[-1]
+    diagnostics = simulator.norm_diagnostics()
+    assert event["kind"] == "trajectory_kraus"
+    assert event["valid"] is True
+    assert event["branch_probability"] == pytest.approx(result.records[0][0].probability)
+    assert event["post_norm"] == pytest.approx(1.0, abs=1e-10)
+    assert diagnostics["current_valid"] is True
+    assert diagnostics["total_survival_proxy"] is not None
+    assert diagnostics["total_norm_proxy"] == pytest.approx(
+        diagnostics["total_survival_proxy"] ** 0.5
+    )

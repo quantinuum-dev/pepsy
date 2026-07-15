@@ -5,6 +5,9 @@ Covers Phase 1 (state container + statevector reconstruction) and Phase 2
 (arXiv:2403.08724).
 """
 
+import sys
+import types
+
 import numpy as np
 import pytest
 
@@ -518,6 +521,9 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
     assert diagnostics["total_infidelity_proxy"] == pytest.approx(
         1.0 - expected_total_survival
     )
+    assert diagnostics["total_norm_proxy"] == pytest.approx(
+        expected_total_survival ** 0.5
+    )
     assert diagnostics["geometric_mean_norm"] == pytest.approx(
         expected_total_survival ** 0.5
     )
@@ -568,6 +574,39 @@ def test_norm_events_track_projector_compression_loss_separately():
     assert diagnostics["total_infidelity_proxy"] == pytest.approx(
         event["projector_infidelity"]
     )
+    assert diagnostics["total_norm_proxy"] == pytest.approx(
+        event["projector_survival"] ** 0.5
+    )
+
+
+def test_norm_progress_reports_total_norm_proxy(monkeypatch):
+    progress_instances = []
+
+    class _FakeTqdm:
+        def __init__(self, **kwargs):
+            self.total = kwargs["total"]
+            self.n = 0
+            self.postfix_calls = []
+            progress_instances.append(self)
+
+        def set_postfix(self, **kwargs):
+            self.postfix_calls.append(dict(kwargs))
+
+        def update(self, amount):
+            self.n += amount
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
+    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True)
+    sim.apply([("rxx", 0.8, 0, 1)], progbar=True)
+
+    progress = progress_instances[-1]
+    assert progress.n == 1
+    last = progress.postfix_calls[-1]
+    assert last["Ntotal"] == f"{sim.norm_diagnostics()['total_norm_proxy']:.2e}"
+    assert last["Itotal"] == f"{sim.norm_diagnostics()['total_infidelity_proxy']:.2e}"
 
 
 def test_simulator_two_qubit_nonclifford_matrix_supported():

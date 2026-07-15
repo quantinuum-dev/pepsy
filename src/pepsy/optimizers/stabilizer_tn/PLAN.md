@@ -212,7 +212,12 @@ new simulator features.
   Kraus channels evaluate Born branch weights on the live `MpsOptimizer` or
   `MpsStabOptimizer`, apply one selected branch, and normalize it before the
   following gate segment. This makes state-dependent channels such as amplitude
-  damping independent of Stim while retaining one-MPS-per-shot scaling.
+  damping independent of Stim while retaining one-MPS-per-shot scaling. A
+  normalized Kraus outcome closes the prior unitary norm-proxy segment and
+  starts a fresh one; its Born probability is not counted as compression loss.
+  `norm_diagnostics()["total_norm_proxy"]` reports the square root of the
+  product of segment survival proxies even though the current state has been
+  renormalized.
 
 ## Cross-checked against the reference (bsc-quantic/stabilizer-TN v1.1/v1.2)
 

@@ -1229,10 +1229,16 @@ class MpsStabOptimizer:
                     infidelity = self._current_norm_infidelity
                     diagnostics = self.norm_diagnostics()
                     total_infidelity = diagnostics["total_infidelity_proxy"]
+                    total_norm = diagnostics["total_norm_proxy"]
                     pbar.set_postfix(
                         chi=self.state.max_bond(),
                         infid=("n/a" if infidelity is None else f"{infidelity:.2e}"),
-                        total=(
+                        Ntotal=(
+                            "n/a"
+                            if total_norm is None
+                            else f"{total_norm:.2e}"
+                        ),
+                        Itotal=(
                             "n/a"
                             if total_infidelity is None
                             else f"{total_infidelity:.2e}"
@@ -1496,6 +1502,9 @@ class MpsStabOptimizer:
             "total_survival_proxy": total_survival,
             "total_infidelity_proxy": (
                 None if total_survival is None else float(1.0 - total_survival)
+            ),
+            "total_norm_proxy": (
+                None if total_survival is None else float(total_survival ** 0.5)
             ),
             "geometric_mean_survival": geometric_mean_survival,
             "geometric_mean_norm": (

@@ -94,6 +94,13 @@ one- or multi-qubit `TrajectoryEvent` support. For ordinary MPS replay, replace
 the factory above with a fresh `MpsOptimizer(initial_mps, ...)` and pass its
 usual options through `run_kwargs`.
 
+For `MpsStabOptimizer(track_infidelity=True)`, a selected Kraus outcome is a
+normalized trajectory boundary, just like a measurement/reset: its Born weight
+is retained in the trajectory record but is not treated as compression loss.
+`sim.norm_diagnostics()["total_norm_proxy"]` is the square root of the product
+of all completed/current segment survival proxies, so it remains meaningful
+after state renormalization.
+
 ## Reading a Stim circuit
 
 `compile_stim_circuit(...)` accepts `stim.Circuit` or Stim source text. It
