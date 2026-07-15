@@ -86,16 +86,26 @@ short-cycle trapping sets. Plan a convergence-robust BP mode in `pepsy.bp`:
   point) and to gauge the optimizers. Track the per-run message residual as a
   first-class convergence signal.
 
-**Prototyped (2026-07-11):** `pepsy.bp.relay_bp` / `one_norm_bp` (new
-`src/pepsy/bp/` subpackage) wrap quimb's 1-norm BP (`L1BP` / `HV1BP` / `D1BP`)
-and apply per-node disordered memory around quimb's `iterate` on the public
-`messages` dict (quimb's `damping` is uniform, so the per-node strength is
-applied in a thin driver), with relayed warm-started legs returning the
-best-converged fixed point as a `RelayBPResult`. Kept out of the lazy top-level
-namespace (`import pepsy.bp`) while it is a prototype; tests in
-`tests/test_bp_relay.py`. Next: recompute the post-mix residual for the
-convergence check, expose the fixed point as a `BPResult` gauge, and wire it to
-the §2 loop corrections.
+**Prototyped (2026-07-11, hardened 2026-07-14):** `pepsy.bp.one_norm_bp`
+wraps quimb's 1-norm BP (`L1BP` / `HV1BP` / `D1BP`) with compatible snapshots
+and warm starts. `relay_bp` applies per-*source-node* disordered memory to the
+directed `L1BP` and `D1BP` layouts; `HV1BP` remains available for plain BP but
+is deliberately excluded from relay because its public state is batched. The
+runner measures the post-memory residual with Quimb's selected distance metric,
+uses absolute residual convergence by default (no rolling-plateau stop), and
+records Quimb's broader termination flag separately.
+
+**Simple-update bridge (2026-07-14):**
+`simple_update_core_and_gauges_from_messages` converts a completed nonnegative
+simple update into a D1BP warm snapshot, and `relay_gauge_all_simple` applies
+relay memory (plus optional projected DIIS) directly to Quimb's external SU
+bond gauges. The relay mix is compensated into each adjacent core tensor, so
+the returned `(core, gauges)` represents exactly the same TN. CPU NumPy
+networks can update independent, edge-coloured bonds in threads; stable relay,
+DIIS, and warm-start ids require `fuse_multibonds=False`. Kept out of the lazy
+top-level namespace (`import pepsy.bp`) while it is a prototype; tests in
+`tests/test_bp_relay.py`. The remaining work is to use converged BP/SU gauges
+as optimizer inputs and wire them to the §2 loop corrections.
 
 #### Relationship to tensy
 

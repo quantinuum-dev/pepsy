@@ -16,6 +16,7 @@ side · **[roots]** foundational / prior art.
 | API | what | paper |
 | --- | --- | --- |
 | `one_norm_bp`, `relay_bp`, `RelayBPResult` | 1-norm BP + disordered-memory / relay-BP convergence robustness | Müller et al. 2506.01779 |
+| `simple_update_core_and_gauges_from_messages`, `run_d1bp_from_simple_update_gauges`, `relay_gauge_all_simple` | nonnegative simple-update ↔ D1BP gauge bridge; relay/DIIS simple-update acceleration with exact core compensation | Alkabetz & Arad (2021); Tindall & Fishman (2023); Müller et al. 2506.01779 |
 | `loop_cluster_expand`, `LoopClusterResult` | loop **cluster** expansion (thin wrapper over quimb `contract_gloop_expand`) | Gray et al. 2510.05647 |
 
 ---
@@ -98,6 +99,14 @@ realization of the same "regions beyond BP" idea.
   cluster-size sweep.  The quimb issue found here was instead an `nfactor`
   normalization bug: `normalize_simple(gauges)` already returns the norm
   scaling, so `norm_gloop_expand` should not square-root that factor again.
+- **Relay-SU implementation note (2026-07-14).**
+  `relay_gauge_all_simple` layers per-bond, nonnegative disordered memory over
+  Quimb's simple update. After mixing an external gauge it inversely rescales
+  the two incident core tensor legs, preserving the represented TN exactly.
+  Optional DIIS is likewise projected to a positive normalized gauge before
+  compensation. The CPU NumPy parallel route uses edge-coloured, disjoint bond
+  batches, not concurrent writes to neighbouring tensors; stable external bond
+  ids are consequently required and multibond fusion is disabled.
 - **Guo, Poletti, Arad**, *Block belief propagation algorithm for two-dimensional
   tensor networks*, Phys. Rev. B **108**, 125111 (2023).
 - **Pancotti, Gray**, *One-step replica symmetry breaking in the language of

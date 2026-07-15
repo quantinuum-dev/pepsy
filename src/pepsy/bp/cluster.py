@@ -62,6 +62,7 @@ from itertools import chain
 from typing import Any
 
 import autoray as ar
+import numpy as np
 
 __all__ = [
     "LoopClusterResult",
@@ -99,6 +100,39 @@ _GAUGE_INIT_ONLY_BP_OPTS = {
 }
 
 
+def _strict_converged(info: dict[str, Any], tol: float, tol_abs: float | None) -> bool:
+    """Distinguish a true residual tolerance from quimb's rolling stop."""
+    threshold = tol if tol_abs is None else tol_abs
+    max_mdiff = float(info.get("max_mdiff", float("nan")))
+    return bool(np.isfinite(max_mdiff) and max_mdiff < threshold)
+
+
+def _run_plain_bp(
+    bp,
+    *,
+    max_iterations: int,
+    tol: float,
+    tol_abs: float | None,
+    tol_rolling_diff: float | None,
+    diis: bool | dict[str, Any],
+    progbar: bool,
+) -> dict[str, Any]:
+    """Run quimb BP and record strict rather than plateau convergence."""
+    info: dict[str, Any] = {}
+    bp.run(
+        max_iterations=max_iterations,
+        tol=tol,
+        tol_abs=tol_abs,
+        tol_rolling_diff=tol_rolling_diff,
+        diis=diis,
+        info=info,
+        progbar=progbar,
+    )
+    info["quimb_converged"] = bool(info.get("converged", False))
+    info["converged"] = _strict_converged(info, tol, tol_abs)
+    return info
+
+
 def _filter_gauge_init_only_bp_opts(bp_opts: dict[str, Any]) -> dict[str, Any]:
     """Drop options used only to initialize D1BP from SU gauges."""
     return {
@@ -125,6 +159,27 @@ class ScalarClusterCache:
     counted_regions: dict[
         tuple[frozenset[frozenset], bool], tuple[tuple[frozenset, int], ...]
     ] = field(default_factory=dict)
+    _topology_signature: Any = field(default=None, init=False, repr=False)
+
+    @staticmethod
+    def _signature(tn):
+        """Identify the tensor ids and bond graph a region cache belongs to."""
+        return (
+            frozenset(tn.tensor_map),
+            frozenset(
+                (index, frozenset(tids)) for index, tids in tn.ind_map.items()
+            ),
+        )
+
+    def _check_topology(self, tn) -> None:
+        signature = self._signature(tn)
+        if self._topology_signature is None:
+            self._topology_signature = signature
+        elif self._topology_signature != signature:
+            raise ValueError(
+                "ScalarClusterCache belongs to a different tensor-network "
+                "topology or tensor-id layout; create a fresh cache"
+            )
 
     def regions_for(
         self,
@@ -135,6 +190,8 @@ class ScalarClusterCache:
     ) -> tuple[tuple[frozenset, int], ...]:
         """Return singleton-baseline regions plus loop intersections."""
         from quimb.tensor.belief_propagation.regions import gen_region_counts
+
+        self._check_topology(tn)
 
         if gloops is None:
             loops = tuple(frozenset(region) for region in tn.gen_gloops())
@@ -274,8 +331,9 @@ class LoopClusterResult:
     combine :
         ``"prod"`` (product formula, Eq. 2) or ``"sum"`` (sum formula, Eq. 1).
     bp_converged, bp_iterations, bp_max_mdiff :
-        Convergence info from the underlying BP run (``None`` if ``run_bp`` was
-        ``False``).
+        Strict absolute-residual convergence info from the underlying BP run
+        (``None`` if ``run_bp`` was ``False``). This deliberately excludes
+        quimb's optional rolling-difference plateau stop.
     bp :
         The underlying quimb BP object, whose messages can be reused (see
         :meth:`expand` and :attr:`messages`).
@@ -355,6 +413,9 @@ def loop_cluster_expand(
     relay_opts: dict[str, Any] | None = None,
     max_iterations: int = 1000,
     tol: float = 5e-6,
+    tol_abs: float | None = None,
+    tol_rolling_diff: float | None = 0.0,
+    diis: bool | dict[str, Any] = False,
     damping: float = 0.0,
     update: str = "sequential",
     require_fixed_point: bool = True,
@@ -413,8 +474,11 @@ def loop_cluster_expand(
         ``relay_opts``.
     relay_opts : dict, optional
         Extra options for relay-BP, e.g. ``{"num_relays": 4, "seed": 0}``.
-    max_iterations, tol : int, float, optional
-        BP convergence controls.
+    max_iterations, tol, tol_abs, tol_rolling_diff, diis
+        BP convergence controls. The default ``tol_rolling_diff=0.0`` requires
+        an absolute residual rather than quimb's rolling plateau stop. Set a
+        positive rolling tolerance explicitly only for an exploratory,
+        non-fixed-point estimate.
     damping : float, optional
         BP message damping ``damping * old + (1 - damping) * new``.
     update : {"sequential", "parallel"}, optional
@@ -449,6 +513,14 @@ def loop_cluster_expand(
     """
     key, bp_cls = _cluster_bp_class(norm)
     contract_opts = {} if contract_opts is None else dict(contract_opts)
+    if run_bp and (
+        not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1
+    ):
+        raise ValueError("max_iterations must be a positive integer when run_bp=True")
+    if key == "1norm":
+        from .gauges import _validate_d1_graph
+
+        _validate_d1_graph(tn)
     if key == "2norm" and combine != "prod":
         raise ValueError(
             "norm='2norm' (D2BP) implements only the product formula "
@@ -488,6 +560,8 @@ def loop_cluster_expand(
                 init_messages=init_messages,
                 max_iterations=max_iterations,
                 tol=tol,
+                tol_abs=tol_abs,
+                tol_rolling_diff=tol_rolling_diff,
                 damping=damping,
                 update=update,
                 **relay_kwargs,
@@ -498,12 +572,16 @@ def loop_cluster_expand(
                 "converged": relay_res.converged,
                 "iterations": relay_res.iterations,
                 "max_mdiff": relay_res.max_mdiff,
+                "quimb_converged": relay_res.quimb_converged,
             }
         elif run_bp:
-            bp.run(
+            info = _run_plain_bp(
+                bp,
                 max_iterations=max_iterations,
                 tol=tol,
-                info=info,
+                tol_abs=tol_abs,
+                tol_rolling_diff=tol_rolling_diff,
+                diis=diis,
                 progbar=progbar,
             )
     elif key == "1norm" and run_bp and bp_runner == "relay":
@@ -516,6 +594,8 @@ def loop_cluster_expand(
             init_messages=messages,
             max_iterations=max_iterations,
             tol=tol,
+            tol_abs=tol_abs,
+            tol_rolling_diff=tol_rolling_diff,
             damping=damping,
             update=update,
             **relay_kwargs,
@@ -526,6 +606,7 @@ def loop_cluster_expand(
             "converged": relay_res.converged,
             "iterations": relay_res.iterations,
             "max_mdiff": relay_res.max_mdiff,
+            "quimb_converged": relay_res.quimb_converged,
         }
     else:
         ctor: dict[str, Any] = dict(
@@ -540,10 +621,13 @@ def loop_cluster_expand(
         bp = bp_cls(tn, **ctor)
 
         if run_bp:
-            bp.run(
+            info = _run_plain_bp(
+                bp,
                 max_iterations=max_iterations,
                 tol=tol,
-                info=info,
+                tol_abs=tol_abs,
+                tol_rolling_diff=tol_rolling_diff,
+                diis=diis,
                 progbar=progbar,
             )
 
@@ -606,6 +690,9 @@ def norm1_gloop_expand(
     relay_opts: dict[str, Any] | None = None,
     max_iterations: int = 1000,
     tol: float = 5e-6,
+    tol_abs: float | None = None,
+    tol_rolling_diff: float | None = 0.0,
+    diis: bool | dict[str, Any] = False,
     damping: float = 0.0,
     update: str = "sequential",
     require_fixed_point: bool | None = None,
@@ -646,6 +733,9 @@ def norm1_gloop_expand(
         relay_opts=relay_opts,
         max_iterations=max_iterations,
         tol=tol,
+        tol_abs=tol_abs,
+        tol_rolling_diff=tol_rolling_diff,
+        diis=diis,
         damping=damping,
         update=update,
         require_fixed_point=require_fixed_point,

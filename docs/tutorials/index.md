@@ -7,4 +7,5 @@ These tutorials explain full workflows, not just isolated API calls.
 
 contract_norm
 fidelity_diagnostics
+bp_simple_update_relay
 ```

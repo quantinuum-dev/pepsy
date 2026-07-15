@@ -3,6 +3,7 @@
 ## Primary walkthrough
 
 - [Tutorial: Contract a PEPS Norm](tutorials/contract_norm.md)
+- [Tutorial: Simple-update Initialization and Relay-BP](tutorials/bp_simple_update_relay.md)
 
 This is the recommended first end-to-end walkthrough for interactive usage.
 
@@ -25,5 +26,10 @@ It demonstrates:
   simple-update term: raw `quimb.SimpleUpdateGen` fails on the non-adjacent
   endpoints, while `pepsy.SimpleUpdateGen` routes the gate through SWAPs and
   reports the resulting max bond, gauge count, and cluster energy.
+- `examples/RelayBP/simple_update_relay_comparison.py` compares exact
+  contraction with plain D1BP, simple-update-initialized D1BP, and
+  simple-update-initialized Relay-BP on a small loopy factor network.
+- `examples/RelayBP/odd_cycle_stress.py` provides deterministic positive
+  odd-cycle cases where polarized parallel D1BP stalls and Relay-BP converges.
 
 For a cleaner, docs-first narrative, start from [tutorials](tutorials/index.md).

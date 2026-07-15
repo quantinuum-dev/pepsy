@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from pathlib import Path
+import runpy
 
 qtn = pytest.importorskip("quimb.tensor")
 
 from pepsy.bp import RelayBPResult, one_norm_bp, relay_bp  # noqa: E402
+from pepsy.bp.relay import _relay_message_sources  # noqa: E402
 
 
 def _ising_tn(length: int = 3, beta: float = 0.3):
@@ -20,6 +23,17 @@ def _scalar_two_site_tree():
         [
             qtn.Tensor(data=np.array([1.0, 2.0]), inds=("bond",)),
             qtn.Tensor(data=np.array([3.0, 5.0]), inds=("bond",)),
+        ]
+    )
+
+
+def _scalar_three_site_chain():
+    """A D1BP chain whose middle tensor sends on two different bonds."""
+    return qtn.TensorNetwork(
+        [
+            qtn.Tensor(data=np.array([1.0, 2.0]), inds=("left",)),
+            qtn.Tensor(data=np.ones((2, 2)), inds=("left", "right")),
+            qtn.Tensor(data=np.array([3.0, 5.0]), inds=("right",)),
         ]
     )
 
@@ -114,7 +128,90 @@ def test_d1bp_message_snapshot_warm_start_and_relay_memory():
     assert np.isclose(float(relay.contract()), 13.0)
 
 
+def test_d1bp_relay_groups_disorder_by_source_tensor_not_bond():
+    from quimb.tensor.belief_propagation import D1BP
+
+    bp = D1BP(_scalar_three_site_chain())
+    sources = _relay_message_sources(bp, "d1bp")
+    left_tids = set(bp.tn.ind_map["left"])
+    right_tids = set(bp.tn.ind_map["right"])
+    (middle,) = left_tids & right_tids
+    (left,) = left_tids - {middle}
+    (right,) = right_tids - {middle}
+
+    # These two directed messages leave the same middle tensor. Their relay
+    # memory strength must therefore be shared even though their bonds differ.
+    assert sources["left", left] == middle
+    assert sources["right", right] == middle
+
+
+def test_hv1bp_plain_api_snapshots_and_warm_starts():
+    first = one_norm_bp(_ising_tn(3, 0.25), method="hv1bp", tol=1e-10)
+    assert first.converged
+    messages = first.snapshot()
+    assert isinstance(messages, tuple) and len(messages) == 2
+
+    second = one_norm_bp(
+        _ising_tn(3, 0.25),
+        method="hv1bp",
+        init_messages=messages,
+        tol=1e-10,
+    )
+    assert second.converged
+    assert np.isclose(float(second.contract()), float(first.contract()))
+
+
+def test_relay_rejects_hv1bp_and_invalid_controls():
+    tn = _ising_tn(3)
+    with pytest.raises(ValueError, match="max_iterations"):
+        one_norm_bp(tn, max_iterations=0)
+    with pytest.raises(ValueError, match="only 'l1bp' and 'd1bp'"):
+        relay_bp(tn, method="hv1bp")
+    with pytest.raises(ValueError, match="positive integer"):
+        relay_bp(tn, num_relays=0)
+    with pytest.raises(ValueError, match="max < 1"):
+        relay_bp(tn, gamma_range=(0.0, 1.0))
+
+
+def test_d1bp_rejects_open_tensor_networks_cleanly():
+    open_tn = qtn.TensorNetwork([qtn.Tensor(np.array([1.0, 2.0]), inds=("x",))])
+    with pytest.raises(ValueError, match="closed graph"):
+        one_norm_bp(open_tn, method="d1bp")
+    with pytest.raises(ValueError, match="closed graph"):
+        relay_bp(open_tn, method="d1bp")
+
+
+def test_warm_start_rejects_a_different_message_topology():
+    messages = one_norm_bp(_ising_tn(3), tol=1e-10).snapshot()
+    with pytest.raises(ValueError, match="topology"):
+        one_norm_bp(_ising_tn(4), init_messages=messages, tol=1e-10)
+
+
 def test_parallel_update_runs():
     tn = _ising_tn(3, 0.3)
     res = relay_bp(tn, num_relays=2, update="parallel", seed=0)
     assert np.isfinite(float(res.contract()))
+
+
+def test_relay_d1bp_odd_cycle_stress_cases_converge_strictly():
+    """Relay damps deterministic parallel D1BP stalls on odd parity cycles."""
+    example_path = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "RelayBP"
+        / "odd_cycle_stress.py"
+    )
+    records = runpy.run_path(str(example_path))["run_stress_cases"]()
+
+    assert len(records) == 2
+    for record in records:
+        assert record["exact"] > 0.0
+        assert record["plain_converged"] is False
+        assert record["plain_max_mdiff"] > 1e-3
+        assert record["relay_converged"] is True
+        assert record["relay_num_legs"] == 5
+        assert record["relay_iterations"] < 100
+        assert record["relay_max_mdiff"] < 1e-10
+        # The exact reference measures the uncontrolled loopy-BP error;
+        # convergence alone intentionally makes no accuracy guarantee.
+        assert np.isfinite(record["relay_relative_error"])

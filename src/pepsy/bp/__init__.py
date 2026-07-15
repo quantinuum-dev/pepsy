@@ -26,8 +26,10 @@ from .gauges import (
     copy_gauges,
     d1bp_from_simple_update_gauges,
     gauge_all_simple_with_bp_check,
+    relay_gauge_all_simple,
     run_d1bp_from_simple_update_gauges,
     simple_update_bp_residual,
+    simple_update_core_and_gauges_from_messages,
     simple_update_gauges_from_messages,
     simple_update_messages_from_gauges,
 )
@@ -41,6 +43,7 @@ __all__ = [
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
     "gauge_all_simple_with_bp_check",
+    "relay_gauge_all_simple",
     "RelayBPResult",
     "loop_cluster_expand",
     "norm1_gloop_expand",
@@ -48,6 +51,7 @@ __all__ = [
     "relay_bp",
     "run_d1bp_from_simple_update_gauges",
     "simple_update_bp_residual",
+    "simple_update_core_and_gauges_from_messages",
     "simple_update_gauges_from_messages",
     "simple_update_messages_from_gauges",
 ]
