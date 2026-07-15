@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import time
+from pathlib import Path
 
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
 
@@ -94,13 +95,26 @@ def _state_factory(n: int, chi: int, backend: str, device: str | None):
     return lambda: MpsOptimizer(state, chi=int(chi), mode="mpo")
 
 
-def _median_elapsed(fn, repeats: int):
+def noisy_target_count(n: int, depth: int) -> int:
+    """Count post-gate Pauli-channel targets in :func:`brickwall_gate_stream`."""
+    targets = 0
+    for layer in range(int(depth)):
+        targets += sum((layer + site) % 2 == 0 for site in range(int(n)))
+        targets += 2 * len(range(layer % 2, int(n) - 1, 2))
+    return targets
+
+
+def _median_elapsed(fn, repeats: int, *, synchronize=None):
     """Return the median wall time and final value of a repeated callable."""
     elapsed = []
     value = None
     for _ in range(int(repeats)):
+        if synchronize is not None:
+            synchronize()
         start = time.perf_counter()
         value = fn()
+        if synchronize is not None:
+            synchronize()
         elapsed.append(time.perf_counter() - start)
     return float(np.median(elapsed)), value
 
@@ -131,26 +145,37 @@ def run_case(
         raise ValueError("n >= 2, depth >= 1, and shots >= 1 are required.")
     stream = brickwall_gate_stream(n, depth, backend=backend, device=device)
     model = PauliErrorModel.depolarizing(float(probability))
+    noisy_targets = noisy_target_count(n, depth)
     factory = _state_factory(n, chi, backend, device)
     run_kwargs = {"progbar": False, "fidelity_samples": 0}
+    synchronize = None
+    torch_device = "cuda" if backend == "cuda" and device is None else device
+    if backend in {"torch", "cuda"} and str(torch_device or "").startswith("cuda"):
+        import torch
+
+        synchronize = lambda: torch.cuda.synchronize(torch_device)
 
     baseline_s, baseline = _median_elapsed(
         lambda: run_noisy_shots(
             factory, stream, model, shots, seed=seed, run_kwargs=run_kwargs
         ),
         repeats,
+        synchronize=synchronize,
     )
     coalesced_s, coalesced = _median_elapsed(
         lambda: run_coalesced_noisy_shots(
             factory, stream, model, shots, seed=seed, run_kwargs=run_kwargs
         ),
         repeats,
+        synchronize=synchronize,
     )
     branches = coalesced.branches
     return {
         "n": n,
         "depth": depth,
         "gates": len(stream),
+        "noisy_targets": noisy_targets,
+        "expected_faults": noisy_targets * float(probability),
         "shots": shots,
         "probability": float(probability),
         "chi": int(chi),
@@ -166,55 +191,105 @@ def run_case(
     }
 
 
-def run(args):
+def _case_key(row):
+    """Return the resume key for one benchmark case."""
+    return (
+        row["n"],
+        row["depth"],
+        row["shots"],
+        row["probability"],
+        row["chi"],
+        row["backend"],
+        row["device"],
+    )
+
+
+def _with_derived_metrics(row):
+    """Fill report-only fields omitted by checkpoints from older scripts."""
+    row = dict(row)
+    noisy_targets = noisy_target_count(row["n"], row["depth"])
+    row.setdefault("noisy_targets", noisy_targets)
+    row.setdefault("expected_faults", noisy_targets * row["probability"])
+    return row
+
+
+def _report_config(args, probabilities, depths, shots_list):
+    """Build the JSON-stable benchmark configuration section."""
+    return {
+        "n": int(args.n),
+        "p_list": probabilities,
+        "depth_list": depths,
+        "shots_list": shots_list,
+        "chi": int(args.chi),
+        "seed": int(args.seed),
+        "repeats": int(args.repeats),
+        "backend": args.backend,
+        "device": args.device,
+    }
+
+
+def run(args, *, existing_results=(), checkpoint=None):
     """Run the requested probability/depth/shot sweep."""
     probabilities = _parse_csv(args.p_list, float)
     depths = _parse_csv(args.depth_list, int)
     shots_list = _parse_csv(args.shots_list, int)
-    results = []
+    report = {
+        "config": _report_config(args, probabilities, depths, shots_list),
+        "results": [],
+    }
+    existing = {_case_key(row): row for row in existing_results}
     for probability in probabilities:
         for depth in depths:
             for shots in shots_list:
-                results.append(
-                    run_case(
-                        n=args.n,
-                        depth=depth,
-                        shots=shots,
-                        probability=probability,
-                        chi=args.chi,
-                        seed=args.seed,
-                        repeats=args.repeats,
-                        backend=args.backend,
-                        device=args.device,
-                    )
+                key = (
+                    int(args.n),
+                    int(depth),
+                    int(shots),
+                    float(probability),
+                    int(args.chi),
+                    str(args.backend),
+                    args.device,
                 )
-    return {
-        "config": {
-            "n": int(args.n),
-            "p_list": probabilities,
-            "depth_list": depths,
-            "shots_list": shots_list,
-            "chi": int(args.chi),
-            "seed": int(args.seed),
-            "repeats": int(args.repeats),
-            "backend": args.backend,
-            "device": args.device,
-        },
-        "results": results,
-    }
+                if key in existing:
+                    report["results"].append(_with_derived_metrics(existing[key]))
+                    continue
+                row = run_case(
+                    n=args.n,
+                    depth=depth,
+                    shots=shots,
+                    probability=probability,
+                    chi=args.chi,
+                    seed=args.seed,
+                    repeats=args.repeats,
+                    backend=args.backend,
+                    device=args.device,
+                )
+                report["results"].append(row)
+                if getattr(args, "progress", False):
+                    print(
+                        "completed "
+                        f"p={probability:.2e}, depth={depth}, shots={shots}: "
+                        f"speedup={row['speedup']:.2f}, "
+                        f"leaves={row['coalesced_states']}",
+                        flush=True,
+                    )
+                if checkpoint is not None:
+                    checkpoint(report)
+    return report
 
 
 def _print_table(report):
     """Print a compact comparison table alongside optional JSON output."""
     header = (
-        f"{'p':>9} {'depth':>5} {'shots':>7} {'ind[s]':>10} {'coal[s]':>10} "
+        f"{'p':>9} {'lambda':>8} {'depth':>5} {'shots':>7} {'ind[s]':>10} {'coal[s]':>10} "
         f"{'speedup':>8} {'states':>12} {'reduction':>10}"
     )
     print(header)
     print("-" * len(header))
     for row in report["results"]:
         print(
-            f"{row['probability']:>9.2e} {row['depth']:>5} {row['shots']:>7} "
+            f"{row['probability']:>9.2e} {row['expected_faults']:>8.2e} "
+            f"{row['depth']:>5} {row['shots']:>7} "
             f"{row['independent_s']:>10.4f} {row['coalesced_s']:>10.4f} "
             f"{row['speedup']:>8.2f} "
             f"{row['coalesced_states']:>5}/{row['independent_states']:<6} "
@@ -235,17 +310,44 @@ def build_arg_parser():
     parser.add_argument("--backend", choices=("numpy", "torch", "cuda"), default="numpy")
     parser.add_argument("--device", default=None, help="Torch device, e.g. cuda:0")
     parser.add_argument("--json", default=None, help="optional path for JSON report")
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="print each completed probability/depth/shot case immediately",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="reuse completed matching cases from --json and checkpoint every case",
+    )
     return parser
+
+
+def _write_json(path, report):
+    """Atomically checkpoint a JSON-ready benchmark report."""
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+    temporary.replace(path)
 
 
 def main():
     """Run the command-line benchmark."""
     args = build_arg_parser().parse_args()
-    report = run(args)
+    if args.resume and not args.json:
+        raise SystemExit("--resume requires --json PATH.")
+    existing_results = ()
+    if args.resume and Path(args.json).is_file():
+        with open(args.json, encoding="utf-8") as handle:
+            existing_results = json.load(handle).get("results", ())
+    checkpoint = (
+        (lambda report: _write_json(args.json, report)) if args.json else None
+    )
+    report = run(args, existing_results=existing_results, checkpoint=checkpoint)
     _print_table(report)
     if args.json:
-        with open(args.json, "w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2)
+        _write_json(args.json, report)
         print(f"\nwrote {args.json}")
 
 

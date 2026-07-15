@@ -2450,11 +2450,24 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _to_state_backend(self, array):
         """Return ``array`` cast to ``self.p``'s backend and complex dtype."""
-        arr = np.asarray(array, dtype=complex)
         like = self._state_backend_like()
         if like is None:
-            return arr
-        return ar.do("array", arr, like=like)
+            return np.asarray(array, dtype=complex)
+        dtype = getattr(like, "dtype", complex)
+        if "complex" not in str(dtype):
+            dtype = getattr(
+                ar.do("array", np.asarray(1.0j), like=like), "dtype", complex
+            )
+        if (
+            getattr(array, "device", None) == getattr(like, "device", None)
+            and getattr(array, "dtype", None) == dtype
+        ):
+            return array
+        # ``np.asarray`` would try to materialize a CUDA/Torch gate on the CPU.
+        # Let autoray move/cast any foreign array directly to the MPS backend.
+        # The final astype also preserves the complex dtype of the live state.
+        arr = ar.do("array", array, like=like)
+        return ar.do("astype", arr, dtype)
 
     def _pauli_operator(self, pauli, where):
         """Return the dense Pauli operator (numpy) for ``pauli`` on ``where``."""

@@ -84,6 +84,37 @@ assert samples.shots == result.shots
 # samples.leaf_indices: source coalesced leaf for each row
 ```
 
+### Conservative automatic strategy
+
+`run_noisy_shots(...)` keeps its backward-compatible independent replay by
+default. For ordinary Pauli gate streams, `strategy="auto"` selects exact
+count coalescing only when the expected per-shot number of non-identity faults
+is small:
+
+```python
+result = pepsy.run_noisy_shots(
+    factory,
+    gates,
+    pepsy.PauliErrorModel.depolarizing(1e-3),
+    shots=512,
+    strategy="auto",
+    max_branches=128,
+)
+```
+
+The automatic threshold is `lambda = (# noisy gate targets) *
+(p_x + p_y + p_z) <= 0.1`. This is deliberately conservative: coalescing is
+strongest when most shots take the no-fault path. An unforced `measure`,
+`reset`, or `measure_reset` makes the policy choose independent trajectories,
+because its physical collapse branches can dominate even when noise is rare.
+
+The live-leaf cap is exact safety control, not truncation. If a selected
+coalesced run would retain more than `max_branches`, automatic mode discards
+the partial tree and restarts the whole ensemble independently. Pass
+`strategy="coalesced"` to request coalescing explicitly; its same cap raises
+instead of silently changing strategy. `auto_max_expected_faults` can tune the
+default `0.1` threshold when profiling a different workload.
+
 ## User-defined quantum trajectories
 
 `TrajectoryEvent` is the general independent noise-simulation interface. Put

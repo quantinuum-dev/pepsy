@@ -127,6 +127,8 @@ _STIM_PAULI_2_OUTCOMES = tuple(
     if (left, right) != ("I", "I")
 )
 _STIM_UNITARY_CACHE: dict[str, np.ndarray] = {}
+_AUTO_MAX_EXPECTED_FAULTS = 0.1
+_AUTO_MAX_BRANCHES = 128
 
 
 @dataclass(frozen=True)
@@ -782,6 +784,64 @@ def sample_noisy_gate_streams(
     ]
 
 
+def _validate_strategy(strategy):
+    """Normalize an independent/coalesced trajectory-replay strategy."""
+    strategy = str(strategy).lower()
+    if strategy not in {"independent", "coalesced", "auto"}:
+        raise ValueError(
+            "strategy must be 'independent', 'coalesced', or 'auto'."
+        )
+    return strategy
+
+
+def _validate_max_branches(max_branches):
+    """Validate an optional positive cap for retained coalesced leaves."""
+    if max_branches is None:
+        return None
+    if (
+        isinstance(max_branches, bool)
+        or not isinstance(max_branches, Integral)
+        or max_branches < 1
+    ):
+        raise ValueError("max_branches must be a positive integer or None.")
+    return int(max_branches)
+
+
+def _expected_pauli_faults(entries, error_model):
+    """Return lambda, the expected non-identity Pauli faults per shot."""
+    targets = sum(
+        len(support)
+        for entry in entries
+        if (support := _event_support(entry)) is not None
+    )
+    return targets * (error_model.p_x + error_model.p_y + error_model.p_z)
+
+
+def _has_unforced_branching_control(entries):
+    """Return whether a stream contains a control that needs count splitting."""
+    for entry in entries:
+        parts = MpsOptimizer.control_event_parts(entry)
+        if parts is None:
+            continue
+        name, payload, _where = parts
+        if name in {"reset", "cap"}:
+            return True
+        if name == "measure" and payload.get("outcome") is None:
+            return True
+        if name == "measure_reset" and any(
+            outcome is None for outcome in payload.get("outcomes", ())
+        ):
+            return True
+    return False
+
+
+def _auto_prefers_coalescing(entries, error_model, max_expected_faults):
+    """Choose the rare-fault branch only when it is structurally favorable."""
+    if _has_unforced_branching_control(entries):
+        return False
+    return _expected_pauli_faults(entries, error_model) <= max_expected_faults
+
+
 def run_noisy_shots(
     optimizer_factory: Callable[[], Any],
     gates,
@@ -790,7 +850,10 @@ def run_noisy_shots(
     *,
     seed=None,
     run_kwargs: Optional[Mapping[str, Any]] = None,
-) -> NoisyShotResult:
+    strategy: str = "independent",
+    max_branches: int | None = _AUTO_MAX_BRANCHES,
+    auto_max_expected_faults: float = _AUTO_MAX_EXPECTED_FAULTS,
+) -> NoisyShotResult | CoalescedTrajectoryResult:
     """Build and replay independent noisy trajectories with either MPS optimizer.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer` or
@@ -803,6 +866,15 @@ def run_noisy_shots(
 
     The result retains the final optimizers, concrete streams, and sampled
     faults. ``run_kwargs`` is forwarded unchanged to each optimizer's ``run``.
+
+    Set ``strategy="coalesced"`` to return the exact count-coalesced result
+    from :func:`run_coalesced_noisy_shots`. ``strategy="auto"`` chooses that
+    representation only when the expected per-shot fault count ``lambda`` is
+    at most ``auto_max_expected_faults`` (default ``0.1``) and the stream has
+    no unforced mid-circuit control. If live leaves exceed ``max_branches``
+    (default ``128``), it restarts as independent trajectories; no sample is
+    dropped or approximated. The default stays ``"independent"`` for full
+    backward compatibility.
     """
     if not callable(optimizer_factory):
         raise TypeError("optimizer_factory must construct a fresh optimizer per shot.")
@@ -815,13 +887,51 @@ def run_noisy_shots(
     elif not isinstance(run_kwargs, Mapping):
         raise TypeError("run_kwargs must be a mapping or None.")
 
+    strategy = _validate_strategy(strategy)
+    max_branches = _validate_max_branches(max_branches)
+    auto_max_expected_faults = float(auto_max_expected_faults)
+    if (
+        not np.isfinite(auto_max_expected_faults)
+        or auto_max_expected_faults < 0.0
+    ):
+        raise ValueError("auto_max_expected_faults must be finite and nonnegative.")
+    entries = _as_entries(gates)
+
+    if strategy == "coalesced":
+        return run_coalesced_noisy_shots(
+            optimizer_factory,
+            entries,
+            error_model,
+            shots,
+            seed=seed,
+            run_kwargs=run_kwargs,
+            max_branches=max_branches,
+        )
+    if strategy == "auto" and _auto_prefers_coalescing(
+        entries, error_model, auto_max_expected_faults
+    ):
+        try:
+            return run_coalesced_noisy_shots(
+                optimizer_factory,
+                entries,
+                error_model,
+                shots,
+                seed=seed,
+                run_kwargs=run_kwargs,
+                max_branches=max_branches,
+            )
+        except _CoalescedBranchCapExceeded:
+            # Restart from fresh optimizers. This changes neither the target
+            # distribution nor its independent-trajectory semantics.
+            pass
+
     child_seeds = np.random.SeedSequence(seed).spawn(int(shots))
     optimizers = []
     streams = []
     faults = []
     for child_seed in child_seeds:
         stream, shot_faults = _sample_gate_stream(
-            gates, error_model, np.random.default_rng(child_seed)
+            entries, error_model, np.random.default_rng(child_seed)
         )
         optimizer = optimizer_factory()
         if not hasattr(optimizer, "set_gates") or not hasattr(optimizer, "run"):
@@ -1087,6 +1197,10 @@ class _CoalescedNode:
     measurements: list[CoalescedMeasurementRecord] = field(default_factory=list)
 
 
+class _CoalescedBranchCapExceeded(RuntimeError):
+    """Internal signal used by auto strategy to restart independently."""
+
+
 def _check_coalesced_optimizer(optimizer):
     """Validate the additional copy contract needed for branch coalescing."""
     _check_trajectory_optimizer(optimizer)
@@ -1149,7 +1263,16 @@ def _coalesced_probabilities(probabilities, *, context):
     return probabilities / total
 
 
-def _split_coalesced_nodes(nodes, outcomes, probabilities, apply, rng, *, context):
+def _split_coalesced_nodes(
+    nodes,
+    outcomes,
+    probabilities,
+    apply,
+    rng,
+    *,
+    context,
+    max_branches=None,
+):
     """Split count-bearing nodes with exact multinomial branch counts."""
     probabilities = _coalesced_probabilities(probabilities, context=context)
     if len(outcomes) != len(probabilities):
@@ -1162,6 +1285,11 @@ def _split_coalesced_nodes(nodes, outcomes, probabilities, apply, rng, *, contex
             for outcome, probability, count in zip(outcomes, probabilities, counts)
             if int(count) > 0
         ]
+        if max_branches is not None and len(split) + len(nonempty) > max_branches:
+            raise _CoalescedBranchCapExceeded(
+                f"coalesced trajectory branch cap ({max_branches}) exceeded "
+                f"while splitting {context}."
+            )
         # Clone every child from the *pre-branch* parent. Applying the first
         # outcome before making later copies would incorrectly include that
         # first outcome in every sibling branch.
@@ -1176,7 +1304,9 @@ def _split_coalesced_nodes(nodes, outcomes, probabilities, apply, rng, *, contex
     return split
 
 
-def _run_coalesced_entries(nodes, indexed_entries, run_kwargs, rng):
+def _run_coalesced_entries(
+    nodes, indexed_entries, run_kwargs, rng, *, max_branches=None
+):
     """Replay ordinary segments once per current node, splitting controls exactly."""
     pending = []
 
@@ -1203,6 +1333,7 @@ def _run_coalesced_entries(nodes, indexed_entries, run_kwargs, rng):
             run_kwargs,
             rng,
             absorb_basis=_coalesced_control_absorb_basis(entry, parts[0]),
+            max_branches=max_branches,
         )
     flush()
     return nodes
@@ -1255,6 +1386,7 @@ def _apply_coalesced_measurement(
     absorb_basis,
     run_kwargs,
     rng,
+    max_branches=None,
 ):
     """Branch a Pauli collapse, optionally followed by a reset."""
     where = tuple(int(site) for site in where)
@@ -1312,13 +1444,21 @@ def _apply_coalesced_measurement(
                 apply,
                 rng,
                 context="measurement",
+                max_branches=max_branches,
             )
         )
     return result
 
 
 def _coalesced_control_event(
-    nodes, event_index, parts, run_kwargs, rng, *, absorb_basis=False
+    nodes,
+    event_index,
+    parts,
+    run_kwargs,
+    rng,
+    *,
+    absorb_basis=False,
+    max_branches=None,
 ):
     """Branch an unforced measure/reset event one physical collapse at a time."""
     name, payload, where = parts
@@ -1335,6 +1475,7 @@ def _coalesced_control_event(
             absorb_basis=absorb_basis,
             run_kwargs=run_kwargs,
             rng=rng,
+            max_branches=max_branches,
         )
 
     axes = tuple(payload["axes"])
@@ -1351,6 +1492,7 @@ def _coalesced_control_event(
             absorb_basis=absorb_basis,
             run_kwargs=run_kwargs,
             rng=rng,
+            max_branches=max_branches,
         )
     return nodes
 
@@ -1656,6 +1798,7 @@ def run_coalesced_noisy_shots(
     *,
     seed=None,
     run_kwargs: Optional[Mapping[str, Any]] = None,
+    max_branches: int | None = None,
 ) -> CoalescedTrajectoryResult:
     """Replay independent Pauli-noise shots using exact count coalescing.
 
@@ -1664,18 +1807,24 @@ def run_coalesced_noisy_shots(
     total fault rate, the no-error branch therefore carries most shots and is
     simulated just once, on either CPU or GPU. The probability distribution is
     identical to :func:`run_noisy_shots`; only the retained representation is
-    different.
+    different. ``max_branches`` optionally stops replay before retaining more
+    than that many live leaves. It raises :class:`RuntimeError` rather than
+    dropping samples; ``run_noisy_shots(strategy="auto")`` catches that
+    condition and restarts independently.
     """
     if not isinstance(error_model, PauliErrorModel):
         raise TypeError("error_model must be a PauliErrorModel.")
     shots, run_kwargs = _coalesced_inputs(optimizer_factory, shots, run_kwargs)
+    max_branches = _validate_max_branches(max_branches)
     nodes = _initial_coalesced_nodes(optimizer_factory, shots)
     rng = np.random.default_rng(seed)
     pending = []
 
     def flush():
         nonlocal nodes, pending
-        nodes = _run_coalesced_entries(nodes, pending, run_kwargs, rng)
+        nodes = _run_coalesced_entries(
+            nodes, pending, run_kwargs, rng, max_branches=max_branches
+        )
         pending = []
 
     outcomes = ("I", "X", "Y", "Z")
@@ -1703,6 +1852,7 @@ def run_coalesced_noisy_shots(
                 apply,
                 rng,
                 context="Pauli error model",
+                max_branches=max_branches,
             )
     return _coalesced_result(nodes)
 

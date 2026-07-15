@@ -277,3 +277,4 @@ def test_coalesced_trajectory_benchmark_reports_branch_reduction():
     assert row["independent_states"] == 4
     assert row["coalesced_states"] == 1
     assert row["state_reduction"] == pytest.approx(4.0)
+    assert row["expected_faults"] == 0.0
