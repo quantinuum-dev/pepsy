@@ -220,6 +220,29 @@ def test_linked_cluster_repeated_loops_converge_to_a_single_ring_exactly():
     assert abs(fourth.estimate - exact) < abs(first.estimate - exact) / 1e5
 
 
+def test_linked_cluster_closes_unexcited_chords_with_bp_vacua():
+    """A selected triangle in K4 leaves an internal chord to vacuum-reduce."""
+    rng = np.random.default_rng(123)
+    tn = qtn.TensorNetwork(
+        [
+            qtn.Tensor(0.2 + rng.random((2, 2, 2)), inds=("ab", "ac", "ad")),
+            qtn.Tensor(0.2 + rng.random((2, 2, 2)), inds=("ab", "bc", "bd")),
+            qtn.Tensor(0.2 + rng.random((2, 2, 2)), inds=("ac", "bc", "cd")),
+            qtn.Tensor(0.2 + rng.random((2, 2, 2)), inds=("ad", "bd", "cd")),
+        ]
+    )
+
+    result = linked_cluster_expand(
+        tn,
+        max_loop_weight=3,
+        max_cluster_weight=3,
+        tol=1e-12,
+    )
+
+    assert len(result.loops) == 4  # the four triangles of K4
+    assert np.isfinite(result.estimate)
+
+
 def test_bp_state_local_update_matches_a_fresh_d1bp_fixed_point():
     """A value-only local update propagates the warm start to the same BP FP."""
     from pepsy.bp import one_norm_bp

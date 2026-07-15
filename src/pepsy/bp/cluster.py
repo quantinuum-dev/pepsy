@@ -492,7 +492,13 @@ def _cluster_excitation_weight(bp, loop: ConnectedLoop, *, optimize, contract_op
     """
     tnr = bp.tn._select_tids(loop.tids, virtual=False)
     excited_edges = set(loop.edges)
-    for index, region_tids in tuple(tnr.ind_map.items()):
+    # ``vector_reduce_`` removes an index from the selected TN. Snapshot both
+    # the map entries and their mutable ordered tensor-id containers before
+    # applying any vacuum reductions (a chord has two such reductions).
+    region_bonds = tuple(
+        (index, tuple(region_tids)) for index, region_tids in tnr.ind_map.items()
+    )
+    for index, region_tids in region_bonds:
         if index in excited_edges:
             left, right = bp.tn.ind_map[index]
             left_message = bp.messages[index, left]
