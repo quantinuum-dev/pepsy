@@ -76,18 +76,43 @@ class QMeraAnsatz:
         return self.schedule.draw_schematic(layer=layer, **kwargs)
 
 
-def _coerce_geometry(geometry=None, *, shape=None, boundary="open", mapper=None):
+def _coerce_geometry(
+    geometry=None,
+    *,
+    shape=None,
+    boundary="open",
+    mapper=None,
+    site_modes=None,
+    mode_order="site-major",
+):
     if isinstance(geometry, QMeraGeometry):
         return geometry
     if geometry is not None:
         if isinstance(geometry, Mapping):
-            return QMeraGeometry(**dict(geometry))
+            opts = dict(geometry)
+            if site_modes is not None:
+                opts.setdefault("site_modes", site_modes)
+            if mode_order != "site-major":
+                opts.setdefault("mode_order", mode_order)
+            return QMeraGeometry(**opts)
         if shape is not None:
             raise TypeError("Provide either geometry or shape, not both.")
-        return QMeraGeometry(geometry, boundary=boundary, mapper=mapper)
+        return QMeraGeometry(
+            geometry,
+            boundary=boundary,
+            mapper=mapper,
+            site_modes=site_modes,
+            mode_order=mode_order,
+        )
     if shape is None:
         raise TypeError("QMeraBuilder requires geometry or shape.")
-    return QMeraGeometry(shape, boundary=boundary, mapper=mapper)
+    return QMeraGeometry(
+        shape,
+        boundary=boundary,
+        mapper=mapper,
+        site_modes=site_modes,
+        mode_order=mode_order,
+    )
 
 
 def _coerce_block_spec(value, *, kind, gate_family):
@@ -110,6 +135,8 @@ class QMeraBuilder:
         shape=None,
         boundary="open",
         mapper=None,
+        site_modes=None,
+        mode_order="site-major",
         physical_dim: int = 2,
         disentangler=None,
         isometry=None,
@@ -128,6 +155,8 @@ class QMeraBuilder:
             shape=shape,
             boundary=boundary,
             mapper=mapper,
+            site_modes=site_modes,
+            mode_order=mode_order,
         )
         self.physical_dim = int(physical_dim)
         if self.physical_dim != 2:
@@ -483,7 +512,7 @@ class QMeraBuilder:
         return tensors
 
     def _initial_state(self):
-        binary = "0" * self.geometry.num_sites
+        binary = "0" * self.geometry.num_modes
         return qtn.MPS_computational_state(
             binary,
             site_ind_id="k{}",
@@ -524,6 +553,10 @@ class QMeraBuilder:
             "shape": self.geometry.shape,
             "boundary": self.geometry.boundary,
             "physical_dim": self.physical_dim,
+            "num_sites": self.geometry.num_sites,
+            "num_modes": self.geometry.num_modes,
+            "site_modes": self.geometry.site_modes,
+            "mode_order": self.geometry.mode_order,
             "num_gates": schedule.num_gates,
             "num_layers": len(schedule.layers),
             "top_sites": schedule.top_sites,

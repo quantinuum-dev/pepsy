@@ -647,6 +647,11 @@ def build_qmera_schedule(
             top_size=top_size,
         )
     elif geometry.ndim == 2:
+        if geometry.num_modes != geometry.num_sites:
+            raise NotImplementedError(
+                "2D qMERA schedules with multiple modes per lattice site need an "
+                "explicit mode-blocking convention; use 1D mode schedules for now."
+            )
         layers, top_sites, _ = _build_qmera_schedule_2d(
             geometry,
             disentangler=disentangler,

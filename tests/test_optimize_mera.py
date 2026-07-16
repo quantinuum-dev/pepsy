@@ -204,6 +204,43 @@ def test_qmera_geometry_explicit_lattice_and_mapper():
     assert ((0, 2), (0, 0)) in geom.nearest_neighbor_edges()
 
 
+def test_qmera_geometry_tracks_modes_and_register_order():
+    """Fermionic mode labels should be explicit register objects."""
+    geom = QMeraGeometry(shape=3, site_modes=("up", "down"))
+
+    assert geom.num_sites == 3
+    assert geom.num_modes == 6
+    assert geom.register_sites == (0, 1, 2, 3, 4, 5)
+    assert geom.register_to_mode == (
+        (0, "up"),
+        (0, "down"),
+        (1, "up"),
+        (1, "down"),
+        (2, "up"),
+        (2, "down"),
+    )
+    assert geom.mode_label(1, "down") == (1, "down")
+    assert geom.mode_register(1, "down") == 3
+    assert geom.to_register((1, "down")) == 3
+    assert geom.to_register(3) == 3
+    assert geom.to_site(3) == 1
+    assert geom.to_mode(3) == (1, "down")
+    assert geom.modes_on_site(1) == ((1, "up"), (1, "down"))
+    assert geom.site_ind((1, "down")) == "k3"
+    assert geom.onsite_mode_pairs()[1] == ((1, "up"), (1, "down"))
+    assert geom.nearest_neighbor_mode_edges(modes=("up",)) == (
+        ((0, "up"), (1, "up")),
+        ((1, "up"), (2, "up")),
+    )
+
+    mode_major = QMeraGeometry(
+        shape=3,
+        site_modes=("up", "down"),
+        mode_order="mode-major",
+    )
+    assert mode_major.to_register((1, "down")) == 4
+
+
 def test_qmera_schedule_has_disentangler_and_isometry_blocks():
     """Builder schedules should expose block stages before gate tensors."""
     builder = QMeraBuilder(
@@ -279,6 +316,46 @@ def test_qmera_2d_schedule_uses_rg_blocks_and_face_disentanglers():
     assert any(placement.axis == "y" for placement in first.isometries)
 
 
+def test_qmera_1d_mode_geometry_schedules_register_modes():
+    """1D qMERA schedules should operate on mode/register positions."""
+    builder = QMeraBuilder(
+        shape=2,
+        site_modes=("up", "down"),
+        gate_family="fsim",
+        isometry_gate_family="fsim",
+        max_layers=1,
+    )
+
+    schedule = builder.build_schedule()
+    first = schedule.layers[0]
+    chunks = builder.parametric_lightcone_chunks(
+        {((0, "up"), (0, "down")): _zz_term()},
+        schedule,
+    )
+    ansatz = builder.build()
+
+    assert schedule.geometry.num_sites == 2
+    assert schedule.geometry.num_modes == 4
+    assert first.input_sites == (0, 1, 2, 3)
+    assert first.isometry_blocks == ((0, 1), (2, 3))
+    assert schedule.geometry.to_register_where(((0, "up"), (0, "down"))) == (0, 1)
+    assert chunks[0].term.where == (0, 1)
+    assert chunks[0].term.metadata["original_where"] == ((0, "up"), (0, "down"))
+    assert ansatz.metadata["num_sites"] == 2
+    assert ansatz.metadata["num_modes"] == 4
+    assert ansatz.metadata["site_modes"] == ("up", "down")
+    assert ansatz.state.num_tensors >= schedule.geometry.num_modes
+    assert "I3" in ansatz.state.tags
+
+
+def test_qmera_2d_multi_mode_schedule_requires_explicit_design():
+    """2D multi-mode qMERA should fail before silently dropping modes."""
+    builder = QMeraBuilder(shape=(2, 2), site_modes=("up", "down"))
+
+    with pytest.raises(NotImplementedError, match="mode-blocking"):
+        builder.build_schedule()
+
+
 def test_qmera_gate_registry_generates_parametrized_two_qubit_gates():
     """The registry should produce backend-ready two-qubit gate tensors."""
     registry = default_gate_registry()
@@ -287,9 +364,19 @@ def test_qmera_gate_registry_generates_parametrized_two_qubit_gates():
 
     assert isinstance(spec, GateSpec)
     assert spec.arity == 2
+    assert spec.arity_kind == "qubit"
+    assert spec.family == "spin"
+    assert not spec.is_fermionic
     assert spec.num_params == 1
     assert gate.shape == (2, 2, 2, 2)
     assert "su4" in registry.names(arity=2)
+
+    fsim_spec = registry.get("fsim")
+    assert fsim_spec.is_fermionic
+    assert fsim_spec.arity_kind == "mode"
+    assert fsim_spec.preserves_parity is True
+    assert fsim_spec.mode_order == "register"
+    assert "fsim" in registry.names(family="fermion", arity_kind="mode")
 
     custom = UserGateFamily(
         name="diag-phase",
@@ -298,9 +385,17 @@ def test_qmera_gate_registry_generates_parametrized_two_qubit_gates():
         generator=lambda params: np.diag(
             [1.0, 1.0, 1.0, np.exp(1.0j * params[0])]
         ).reshape(2, 2, 2, 2),
+        family="fermion",
+        arity_kind="mode",
+        preserves_parity=True,
+        mode_order="site-major",
     )
     registry.register(custom)
-    custom_gate = registry.get("diag-phase").matrix([0.3])
+    custom_spec = registry.get("diag-phase")
+    custom_gate = custom_spec.matrix([0.3])
+    assert custom_spec.family == "fermion"
+    assert custom_spec.arity_kind == "mode"
+    assert custom_spec.mode_order == "site-major"
     assert custom_gate.shape == (2, 2, 2, 2)
     assert custom_gate.reshape(4, 4)[-1, -1] == pytest.approx(np.exp(0.3j))
 
