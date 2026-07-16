@@ -235,6 +235,36 @@ def test_qmera_periodic_schedule_wraps_boundary_disentangler():
     assert first.disentanglers[-1].where == (7, 0)
 
 
+def test_qmera_2d_schedule_uses_rg_blocks_and_face_disentanglers():
+    """2D qMERA should coarse-grain coordinate blocks bottom-to-top."""
+    builder = QMeraBuilder(
+        shape=(4, 4),
+        disentangler={"block_size": 2, "circuit_depth": 1, "gate_family": "rxx"},
+        isometry={"block_size": (2, 2), "circuit_depth": 2, "gate_family": "rzz"},
+    )
+
+    schedule = builder.build_schedule()
+    first = schedule.layers[0]
+
+    assert schedule.num_scales == 2
+    assert first.isometry_blocks[0] == (0, 1, 4, 5)
+    assert first.output_sites == (0, 2, 8, 10)
+    assert (4, 5, 8, 9) in first.disentangler_blocks
+    assert (1, 5, 2, 6) in first.disentangler_blocks
+    assert any(
+        placement.axis == "x" and placement.where == (4, 8)
+        for placement in first.disentanglers
+    )
+    assert any(
+        placement.axis == "y" and placement.where == (1, 2)
+        for placement in first.disentanglers
+    )
+    assert any("AXIS_X" in placement.tags for placement in first.disentanglers)
+    assert any("AXIS_Y" in placement.tags for placement in first.disentanglers)
+    assert any(placement.axis == "x" for placement in first.isometries)
+    assert any(placement.axis == "y" for placement in first.isometries)
+
+
 def test_qmera_gate_registry_generates_parametrized_two_qubit_gates():
     """The registry should produce backend-ready two-qubit gate tensors."""
     registry = default_gate_registry()
@@ -298,6 +328,26 @@ def test_qmera_builder_outputs_parameters_gates_state_and_lightcone_tags():
     assert np.isfinite(float(opt.loss()))
 
 
+def test_qmera_2d_builder_outputs_direct_gate_tensor_network():
+    """A 2D RG schedule should feed the direct-gate tensor-network builder."""
+    builder = QMeraBuilder(
+        shape=(4, 4),
+        disentangler={"block_size": 2, "circuit_depth": 1},
+        isometry={"block_size": (2, 2), "circuit_depth": 2},
+        param_scale=0.0,
+    )
+
+    ansatz = builder.build()
+
+    assert ansatz.metadata["state_kind"] == "direct-gate-tn"
+    assert ansatz.metadata["num_layers"] == 2
+    assert ansatz.metadata["num_gates"] == 28
+    assert "DISENTANGLER" in ansatz.state.tags
+    assert "ISOMETRY" in ansatz.state.tags
+    assert "AXIS_X" in ansatz.state.tags
+    assert "AXIS_Y" in ansatz.state.tags
+
+
 def test_qmera_schematic_blocks_group_disentanglers_and_isometries():
     """Schematic data should expose visible block groupings per layer."""
     builder = QMeraBuilder(
@@ -322,6 +372,46 @@ def test_qmera_schematic_blocks_group_disentanglers_and_isometries():
     assert any(block.round == 1 for block in blocks if block.stage == "disentangler")
 
 
+def test_qmera_2d_schematic_blocks_expose_coordinate_rg_windows():
+    """2D schematic blocks should show full isometry and boundary windows."""
+    builder = QMeraBuilder(
+        shape=(4, 4),
+        disentangler={"block_size": 2, "circuit_depth": 1},
+        isometry={"block_size": (2, 2), "circuit_depth": 2},
+    )
+    schedule = builder.build_schedule()
+
+    blocks = schedule.schematic_blocks(layer=0)
+
+    assert any(
+        block.stage == "isometry"
+        and block.round == 0
+        and block.register_sites == (0, 1, 4, 5)
+        and block.sites == ((0, 0), (0, 1), (1, 0), (1, 1))
+        and block.axis == "x"
+        for block in blocks
+    )
+    assert any(
+        block.stage == "isometry"
+        and block.round == 1
+        and block.register_sites == (0, 1, 4, 5)
+        and block.axis == "y"
+        for block in blocks
+    )
+    assert any(
+        block.stage == "disentangler"
+        and block.register_sites == (4, 5, 8, 9)
+        and block.axis == "x"
+        for block in blocks
+    )
+    assert any(
+        block.stage == "disentangler"
+        and block.register_sites == (1, 5, 2, 6)
+        and block.axis == "y"
+        for block in blocks
+    )
+
+
 def test_qmera_draw_schematic_builds_quimb_drawing():
     """The quimb schematic wrapper should draw layer blocking without a Circuit."""
     matplotlib = pytest.importorskip("matplotlib")
@@ -344,3 +434,24 @@ def test_qmera_draw_schematic_builds_quimb_drawing():
         builder.build(build_state=False).draw_schematic(layer=0, scale_figsize=False),
         schematic.Drawing,
     )
+
+
+def test_qmera_2d_draw_schematic_builds_quimb_drawing():
+    """The schematic wrapper should handle 2D RG blocking."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    from quimb import schematic
+
+    builder = QMeraBuilder(
+        shape=(4, 4),
+        disentangler={"block_size": 2, "circuit_depth": 1},
+        isometry={"block_size": (2, 2), "circuit_depth": 2},
+    )
+
+    drawing = builder.draw_schematic(
+        layer=0,
+        label_sites=False,
+        scale_figsize=False,
+    )
+
+    assert isinstance(drawing, schematic.Drawing)

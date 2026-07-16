@@ -9,6 +9,7 @@ blocks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import product
 
 from .geometry import QMeraGeometry
 
@@ -49,17 +50,21 @@ class QMeraBlockSpec:
     """Local qMERA block layout for one operation family."""
 
     kind: str
-    block_size: int = 2
+    block_size: int | tuple[int, ...] = 2
     circuit_depth: int = 1
     structure: str = "brickwall"
     gate_family: str = "rxx"
 
     def __post_init__(self):
         kind = _normalize_stage(self.kind)
-        block_size = int(self.block_size)
+        if isinstance(self.block_size, (tuple, list)):
+            block_size = tuple(int(size) for size in self.block_size)
+        else:
+            block_size = int(self.block_size)
         circuit_depth = int(self.circuit_depth)
-        if block_size < 2:
-            raise ValueError("block_size must be >= 2.")
+        sizes = block_size if isinstance(block_size, tuple) else (block_size,)
+        if any(size < 2 for size in sizes):
+            raise ValueError("block_size entries must be >= 2.")
         if circuit_depth < 0:
             raise ValueError("circuit_depth must be >= 0.")
         object.__setattr__(self, "kind", kind)
@@ -82,6 +87,7 @@ class QMeraGatePlacement:
     block: int
     gate_family: str
     tags: tuple[str, ...]
+    axis: str | None = None
 
     @property
     def arity(self):
@@ -238,16 +244,52 @@ def _pairs_for_round(block, round_index, *, periodic=False):
     return tuple(pairs)
 
 
-def _placement_tags(gate_id, *, scale, stage, round_index, block, gate_family):
+def _block_shape(block_size, ndim):
+    if isinstance(block_size, (tuple, list)):
+        shape = tuple(int(size) for size in block_size)
+    else:
+        shape = (int(block_size),) * int(ndim)
+    if len(shape) != ndim:
+        raise ValueError(f"block_size={block_size!r} does not match ndim={ndim}.")
+    return shape
+
+
+def _placement_tags(gate_id, *, scale, stage, round_index, block, gate_family, axis=None):
     stage_tag = "DISENTANGLER" if stage == "disentangler" else "ISOMETRY"
-    return (
+    tags = [
         f"GATE_{gate_id}",
         f"LAYER{scale}",
         stage_tag,
         f"ROUND{round_index}",
         f"BLOCK{block}",
         f"FAMILY_{_tag_token(gate_family)}",
-    )
+    ]
+    if axis is not None:
+        tags.append(f"AXIS_{str(axis).upper()}")
+    return tuple(tags)
+
+
+def _pairs_for_2d_block(block, round_index, coords_by_site):
+    axis = "x" if (round_index % 2 == 0) else "y"
+    block_set = set(block)
+    pairs = []
+    if axis == "x":
+        ys = sorted({coords_by_site[site][1] for site in block})
+        for y in ys:
+            row = sorted(
+                (site for site in block_set if coords_by_site[site][1] == y),
+                key=lambda site: coords_by_site[site][0],
+            )
+            pairs.extend((row[idx], row[idx + 1]) for idx in range(0, len(row) - 1, 2))
+    else:
+        xs = sorted({coords_by_site[site][0] for site in block})
+        for x in xs:
+            col = sorted(
+                (site for site in block_set if coords_by_site[site][0] == x),
+                key=lambda site: coords_by_site[site][1],
+            )
+            pairs.extend((col[idx], col[idx + 1]) for idx in range(0, len(col) - 1, 2))
+    return tuple(pairs), axis
 
 
 def _stage_placements(
@@ -256,6 +298,9 @@ def _stage_placements(
     scale,
     stage_spec,
     counter_start,
+    coords_by_site=None,
+    boundary_pairs_by_block=None,
+    block_axes=None,
 ):
     placements = []
     counter = counter_start
@@ -263,7 +308,15 @@ def _stage_placements(
     short = "DIS" if stage == "disentangler" else "ISO"
     for round_index in range(stage_spec.circuit_depth):
         for block_index, block in _block_ranges(blocks):
-            for pair in _pairs_for_round(block, round_index, periodic=False):
+            if boundary_pairs_by_block is not None:
+                pairs = boundary_pairs_by_block[block_index]
+                axis = None if block_axes is None else block_axes[block_index]
+            elif coords_by_site is not None:
+                pairs, axis = _pairs_for_2d_block(block, round_index, coords_by_site)
+            else:
+                pairs = _pairs_for_round(block, round_index, periodic=False)
+                axis = None
+            for pair in pairs:
                 gate_id = f"L{scale}_{short}_{counter:04d}"
                 placements.append(
                     QMeraGatePlacement(
@@ -282,7 +335,9 @@ def _stage_placements(
                             round_index=round_index,
                             block=block_index,
                             gate_family=stage_spec.gate_family,
+                            axis=axis,
                         ),
+                        axis=axis,
                     )
                 )
                 counter += 1
@@ -291,6 +346,264 @@ def _stage_placements(
 
 def _coarse_grain(isometry_blocks):
     return tuple(block[0] for block in isometry_blocks if block)
+
+
+def _active_coords_by_site(geometry, active):
+    coords_by_site = {}
+    for site in active:
+        coo = geometry.to_site(site)
+        if not (isinstance(coo, tuple) and len(coo) == 2):
+            raise ValueError("2D qMERA schedules require coordinate site labels.")
+        coords_by_site[site] = coo
+    return coords_by_site
+
+
+def _nonoverlapping_blocks_2d(active, geometry, block_shape):
+    coords_by_site = _active_coords_by_site(geometry, active)
+    site_by_coord = {coo: site for site, coo in coords_by_site.items()}
+    xs = sorted({coo[0] for coo in site_by_coord})
+    ys = sorted({coo[1] for coo in site_by_coord})
+    bx_size, by_size = block_shape
+    blocks = []
+    block_grid = {}
+    for bix, x_start in enumerate(range(0, len(xs), bx_size)):
+        x_vals = xs[x_start : x_start + bx_size]
+        for biy, y_start in enumerate(range(0, len(ys), by_size)):
+            y_vals = ys[y_start : y_start + by_size]
+            block = tuple(
+                site_by_coord[(x, y)]
+                for x, y in product(x_vals, y_vals)
+                if (x, y) in site_by_coord
+            )
+            if block:
+                block_grid[(bix, biy)] = block
+                blocks.append(block)
+    return tuple(blocks), block_grid, coords_by_site
+
+
+def _slab_sites(block, coords_by_site, *, axis, side, depth=1):
+    coord_axis = 0 if axis == "x" else 1
+    other_axis = 1 - coord_axis
+    values = sorted({coords_by_site[site][coord_axis] for site in block})
+    values = values[-depth:] if side in {"right", "top"} else values[:depth]
+    selected = [
+        site
+        for site in block
+        if coords_by_site[site][coord_axis] in values
+    ]
+    return tuple(
+        sorted(
+            selected,
+            key=lambda site: (
+                coords_by_site[site][other_axis],
+                coords_by_site[site][coord_axis],
+            ),
+        )
+    )
+
+
+def _face_pairs(left_face, right_face, coords_by_site, *, axis):
+    match_axis = 1 if axis == "x" else 0
+    left_by_coord = {coords_by_site[site][match_axis]: site for site in left_face}
+    right_by_coord = {coords_by_site[site][match_axis]: site for site in right_face}
+    pairs = []
+    for value in sorted(set(left_by_coord).intersection(right_by_coord)):
+        pairs.append((left_by_coord[value], right_by_coord[value]))
+    return tuple(pairs)
+
+
+def _boundary_blocks_2d(block_grid, coords_by_site, *, boundary, width=2):
+    depth = max(1, int(width) // 2)
+    blocks = []
+    pairs_by_block = []
+    axes = []
+    bx_values = sorted({key[0] for key in block_grid})
+    by_values = sorted({key[1] for key in block_grid})
+
+    for bx in bx_values[:-1]:
+        for by in by_values:
+            left = block_grid.get((bx, by))
+            right = block_grid.get((bx + 1, by))
+            if left is None or right is None:
+                continue
+            left_face = _slab_sites(left, coords_by_site, axis="x", side="right", depth=depth)
+            right_face = _slab_sites(right, coords_by_site, axis="x", side="left", depth=depth)
+            pairs = _face_pairs(left_face, right_face, coords_by_site, axis="x")
+            if pairs:
+                blocks.append(tuple(left_face + right_face))
+                pairs_by_block.append(pairs)
+                axes.append("x")
+
+    for bx in bx_values:
+        for by in by_values[:-1]:
+            bottom = block_grid.get((bx, by))
+            top = block_grid.get((bx, by + 1))
+            if bottom is None or top is None:
+                continue
+            bottom_face = _slab_sites(bottom, coords_by_site, axis="y", side="top", depth=depth)
+            top_face = _slab_sites(top, coords_by_site, axis="y", side="bottom", depth=depth)
+            pairs = _face_pairs(bottom_face, top_face, coords_by_site, axis="y")
+            if pairs:
+                blocks.append(tuple(bottom_face + top_face))
+                pairs_by_block.append(pairs)
+                axes.append("y")
+
+    if boundary == "periodic":
+        if len(bx_values) > 2:
+            bx_left = bx_values[-1]
+            bx_right = bx_values[0]
+            for by in by_values:
+                left = block_grid.get((bx_left, by))
+                right = block_grid.get((bx_right, by))
+                if left is None or right is None:
+                    continue
+                left_face = _slab_sites(left, coords_by_site, axis="x", side="right", depth=depth)
+                right_face = _slab_sites(right, coords_by_site, axis="x", side="left", depth=depth)
+                pairs = _face_pairs(left_face, right_face, coords_by_site, axis="x")
+                if pairs:
+                    blocks.append(tuple(left_face + right_face))
+                    pairs_by_block.append(pairs)
+                    axes.append("x")
+        if len(by_values) > 2:
+            by_bottom = by_values[-1]
+            by_top = by_values[0]
+            for bx in bx_values:
+                bottom = block_grid.get((bx, by_bottom))
+                top = block_grid.get((bx, by_top))
+                if bottom is None or top is None:
+                    continue
+                bottom_face = _slab_sites(bottom, coords_by_site, axis="y", side="top", depth=depth)
+                top_face = _slab_sites(top, coords_by_site, axis="y", side="bottom", depth=depth)
+                pairs = _face_pairs(bottom_face, top_face, coords_by_site, axis="y")
+                if pairs:
+                    blocks.append(tuple(bottom_face + top_face))
+                    pairs_by_block.append(pairs)
+                    axes.append("y")
+
+    return tuple(blocks), tuple(pairs_by_block), tuple(axes)
+
+
+def _build_qmera_schedule_1d(
+    geometry,
+    *,
+    disentangler,
+    isometry,
+    max_layers,
+    top_size,
+):
+    isometry_size = _block_shape(isometry.block_size, 1)[0]
+    disentangler_size = _block_shape(disentangler.block_size, 1)[0]
+
+    active = geometry.register_sites
+    layers = []
+    gate_counter = 0
+    scale = 0
+    while len(active) > top_size and (max_layers is None or scale < max_layers):
+        isometry_blocks = _nonoverlapping_blocks(active, isometry_size)
+        disentangler_blocks = _boundary_blocks(
+            isometry_blocks,
+            disentangler_size,
+            periodic=geometry.boundary == "periodic",
+        )
+        dis, gate_counter = _stage_placements(
+            disentangler_blocks,
+            scale=scale,
+            stage_spec=disentangler,
+            counter_start=gate_counter,
+        )
+        iso, gate_counter = _stage_placements(
+            _placement_blocks(isometry_blocks),
+            scale=scale,
+            stage_spec=isometry,
+            counter_start=gate_counter,
+        )
+        output_sites = _coarse_grain(isometry_blocks)
+        if output_sites == active:
+            break
+        layers.append(
+            QMeraLayerSpec(
+                scale=scale,
+                input_sites=active,
+                output_sites=output_sites,
+                disentangler_blocks=disentangler_blocks,
+                isometry_blocks=isometry_blocks,
+                disentanglers=dis,
+                isometries=iso,
+            )
+        )
+        active = output_sites
+        scale += 1
+
+    return layers, active, gate_counter
+
+
+def _build_qmera_schedule_2d(
+    geometry,
+    *,
+    disentangler,
+    isometry,
+    max_layers,
+    top_size,
+):
+    if top_size != 1:
+        raise NotImplementedError("2D qMERA schedules currently support top_size=1.")
+    isometry_shape = _block_shape(isometry.block_size, 2)
+    if isinstance(disentangler.block_size, tuple):
+        disentangler_width = max(disentangler.block_size)
+    else:
+        disentangler_width = _block_shape(disentangler.block_size, 1)[0]
+
+    active = geometry.register_sites
+    layers = []
+    gate_counter = 0
+    scale = 0
+    while len(active) > top_size and (max_layers is None or scale < max_layers):
+        isometry_blocks, block_grid, coords_by_site = _nonoverlapping_blocks_2d(
+            active,
+            geometry,
+            isometry_shape,
+        )
+        (
+            disentangler_blocks,
+            dis_pairs_by_block,
+            dis_axes,
+        ) = _boundary_blocks_2d(
+            block_grid,
+            coords_by_site,
+            boundary=geometry.boundary,
+            width=disentangler_width,
+        )
+        dis, gate_counter = _stage_placements(
+            disentangler_blocks,
+            scale=scale,
+            stage_spec=disentangler,
+            counter_start=gate_counter,
+            boundary_pairs_by_block=dis_pairs_by_block,
+            block_axes=dis_axes,
+        )
+        iso, gate_counter = _stage_placements(
+            _placement_blocks(isometry_blocks),
+            scale=scale,
+            stage_spec=isometry,
+            counter_start=gate_counter,
+            coords_by_site=coords_by_site,
+        )
+        output_sites = _coarse_grain(isometry_blocks)
+        layers.append(
+            QMeraLayerSpec(
+                scale=scale,
+                input_sites=active,
+                output_sites=output_sites,
+                disentangler_blocks=disentangler_blocks,
+                isometry_blocks=isometry_blocks,
+                disentanglers=dis,
+                isometries=iso,
+            )
+        )
+        active = output_sites
+        scale += 1
+
+    return layers, active, gate_counter
 
 
 def build_qmera_schedule(
@@ -325,50 +638,29 @@ def build_qmera_schedule(
     if max_layers is not None and max_layers < 0:
         raise ValueError("max_layers must be >= 0.")
 
-    active = geometry.register_sites
-    layers = []
-    gate_counter = 0
-    scale = 0
-    while len(active) > top_size and (max_layers is None or scale < max_layers):
-        isometry_blocks = _nonoverlapping_blocks(active, isometry.block_size)
-        disentangler_blocks = _boundary_blocks(
-            isometry_blocks,
-            disentangler.block_size,
-            periodic=geometry.boundary == "periodic",
+    if geometry.ndim == 1:
+        layers, top_sites, _ = _build_qmera_schedule_1d(
+            geometry,
+            disentangler=disentangler,
+            isometry=isometry,
+            max_layers=max_layers,
+            top_size=top_size,
         )
-        dis, gate_counter = _stage_placements(
-            disentangler_blocks,
-            scale=scale,
-            stage_spec=disentangler,
-            counter_start=gate_counter,
+    elif geometry.ndim == 2:
+        layers, top_sites, _ = _build_qmera_schedule_2d(
+            geometry,
+            disentangler=disentangler,
+            isometry=isometry,
+            max_layers=max_layers,
+            top_size=top_size,
         )
-        iso, gate_counter = _stage_placements(
-            _placement_blocks(isometry_blocks),
-            scale=scale,
-            stage_spec=isometry,
-            counter_start=gate_counter,
-        )
-        output_sites = _coarse_grain(isometry_blocks)
-        if output_sites == active:
-            break
-        layers.append(
-            QMeraLayerSpec(
-                scale=scale,
-                input_sites=active,
-                output_sites=output_sites,
-                disentangler_blocks=disentangler_blocks,
-                isometry_blocks=isometry_blocks,
-                disentanglers=dis,
-                isometries=iso,
-            )
-        )
-        active = output_sites
-        scale += 1
+    else:
+        raise NotImplementedError("qMERA schedules currently support 1D and 2D.")
 
     return QMeraSchedule(
         geometry=geometry,
         layers=tuple(layers),
         disentangler=disentangler,
         isometry=isometry,
-        top_sites=active,
+        top_sites=top_sites,
     )

@@ -25,6 +25,7 @@ class QMeraSchematicBlock:
     gate_ids: tuple[str, ...]
     gate_family: str
     tags: tuple[str, ...]
+    axis: str | None = None
 
     @property
     def stage_label(self):
@@ -42,6 +43,17 @@ def _layer_indices(schedule, layer=None):
 
 def _placement_group_key(placement):
     return (placement.scale, placement.stage, placement.round, placement.block)
+
+
+def _block_sites_for_group(layer_spec, stage, block_index, fallback):
+    source = (
+        layer_spec.disentangler_blocks
+        if stage == "disentangler"
+        else layer_spec.isometry_blocks
+    )
+    if 0 <= block_index < len(source):
+        return tuple(source[block_index])
+    return tuple(fallback)
 
 
 def qmera_schematic_blocks(schedule, *, layer=None):
@@ -65,11 +77,17 @@ def qmera_schematic_blocks(schedule, *, layer=None):
         for key, group in groupby(placements, key=_placement_group_key):
             scale, stage, round_index, block_index = key
             group = tuple(group)
-            register_sites = []
+            placement_sites = []
             for placement in group:
                 for site in placement.where:
-                    if site not in register_sites:
-                        register_sites.append(site)
+                    if site not in placement_sites:
+                        placement_sites.append(site)
+            register_sites = _block_sites_for_group(
+                layers[layer_index],
+                stage,
+                block_index,
+                placement_sites,
+            )
             blocks.append(
                 QMeraSchematicBlock(
                     scale=scale,
@@ -81,6 +99,7 @@ def qmera_schematic_blocks(schedule, *, layer=None):
                     gate_ids=tuple(placement.gate_id for placement in group),
                     gate_family=group[0].gate_family,
                     tags=tuple(tag for placement in group for tag in placement.tags),
+                    axis=group[0].axis,
                 )
             )
     return tuple(sorted(blocks, key=lambda block: (
@@ -100,6 +119,19 @@ def _site_x(active_sites):
     return {site: float(pos) for pos, site in enumerate(active_sites)}
 
 
+def _site_grid_positions(geometry, active_sites, *, x0, y0):
+    coords = {site: geometry.to_site(site) for site in active_sites}
+    xs = sorted({coord[0] for coord in coords.values()})
+    ys = sorted({coord[1] for coord in coords.values()})
+    x_rank = {value: pos for pos, value in enumerate(xs)}
+    y_rank = {value: pos for pos, value in enumerate(ys)}
+    positions = {
+        site: (x0 + float(x_rank[coord[0]]), y0 - float(y_rank[coord[1]]))
+        for site, coord in coords.items()
+    }
+    return positions, coords, len(xs), len(ys)
+
+
 def _draw_site_row(drawing, active_sites, y, *, label_sites):
     for pos, site in enumerate(active_sites):
         coo = (float(pos), y)
@@ -108,6 +140,28 @@ def _draw_site_row(drawing, active_sites, y, *, label_sites):
             drawing.text((float(pos), y + 0.22), str(site), preset="site_label")
         if pos + 1 < len(active_sites):
             drawing.line((float(pos) + 0.09, y), (float(pos + 1) - 0.09, y), preset="wire")
+
+
+def _draw_site_grid(drawing, positions, coords, *, label_sites):
+    site_by_coord = {coord: site for site, coord in coords.items()}
+    xs = sorted({coord[0] for coord in coords.values()})
+    ys = sorted({coord[1] for coord in coords.values()})
+    for left, right in zip(xs, xs[1:]):
+        for y in ys:
+            a = site_by_coord.get((left, y))
+            b = site_by_coord.get((right, y))
+            if a is not None and b is not None:
+                drawing.line(positions[a], positions[b], preset="wire")
+    for bottom, top in zip(ys, ys[1:]):
+        for x in xs:
+            a = site_by_coord.get((x, bottom))
+            b = site_by_coord.get((x, top))
+            if a is not None and b is not None:
+                drawing.line(positions[a], positions[b], preset="wire")
+    for site, coo in positions.items():
+        drawing.circle(coo, radius=0.09, preset="site")
+        if label_sites:
+            drawing.text((coo[0], coo[1] + 0.20), str(site), preset="site_label")
 
 
 def _patch_block(drawing, coos, *, block, label_blocks):
@@ -128,6 +182,62 @@ def _patch_block(drawing, coos, *, block, label_blocks):
         x = sum(coo[0] for coo in coos) / len(coos)
         y = sum(coo[1] for coo in coos) / len(coos)
         drawing.text((x, y), block.stage_label, preset="block_label")
+
+
+def _draw_2d_layers(
+    drawing,
+    schedule,
+    layer_indices,
+    blocks_by_layer,
+    *,
+    label_sites,
+    label_blocks,
+):
+    row_stride = float(max(schedule.geometry.shape[1], 1)) + 3.5
+    for row, layer_index in enumerate(layer_indices):
+        if layer_index < 0 or layer_index >= len(schedule.layers):
+            raise IndexError(f"qMERA layer index out of range: {layer_index}.")
+        layer_spec = schedule.layers[layer_index]
+        base_y = -row_stride * row
+        positions, coords, nx, ny = _site_grid_positions(
+            schedule.geometry,
+            layer_spec.input_sites,
+            x0=0.0,
+            y0=base_y,
+        )
+
+        drawing.text((-0.75, base_y), f"L{layer_index}", preset="layer_label")
+        _draw_site_grid(drawing, positions, coords, label_sites=label_sites)
+
+        for block in blocks_by_layer.get(layer_index, ()):
+            coos = [
+                positions[site]
+                for site in block.register_sites
+                if site in positions
+            ]
+            if coos:
+                _patch_block(drawing, coos, block=block, label_blocks=label_blocks)
+
+        output_y = base_y - float(max(ny, 1)) - 0.9
+        out_positions, out_coords, _, _ = _site_grid_positions(
+            schedule.geometry,
+            layer_spec.output_sites,
+            x0=max(float(nx) + 1.0, 2.2),
+            y0=base_y,
+        )
+        _draw_site_grid(
+            drawing,
+            out_positions,
+            out_coords,
+            label_sites=label_sites,
+        )
+        for site in layer_spec.output_sites:
+            source = positions.get(site)
+            target = out_positions.get(site)
+            if source is not None and target is not None:
+                mid = (0.5 * (source[0] + target[0]), output_y)
+                drawing.line(source, mid, preset="wire")
+                drawing.line(mid, target, preset="wire")
 
 
 def draw_qmera_schedule(
@@ -214,6 +324,19 @@ def draw_qmera_schedule(
     blocks_by_layer = {}
     for block in blocks:
         blocks_by_layer.setdefault(block.scale, []).append(block)
+
+    if schedule.geometry.ndim == 2:
+        _draw_2d_layers(
+            drawing,
+            schedule,
+            layer_indices,
+            blocks_by_layer,
+            label_sites=label_sites,
+            label_blocks=label_blocks,
+        )
+        if scale_figsize:
+            drawing.scale_figsize(1.0)
+        return drawing
 
     for row, layer_index in enumerate(layer_indices):
         if layer_index < 0 or layer_index >= len(layers):
