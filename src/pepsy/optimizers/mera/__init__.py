@@ -1,5 +1,14 @@
 """MERA and qMERA energy optimization helpers."""
 
+from .builders import QMeraAnsatz, QMeraBuilder
+from .gates import (
+    GateRegistry,
+    GateSpec,
+    UserGateFamily,
+    default_gate_registry,
+    resolve_gate_spec,
+)
+from .geometry import QMeraGeometry
 from .lightcones import (
     LightconeChunk,
     build_lightcone_chunks,
@@ -8,15 +17,35 @@ from .lightcones import (
     site_tags_for_where,
 )
 from .optimizer import MeraEnergyOptimizer
+from .schedules import (
+    QMeraBlockSpec,
+    QMeraGatePlacement,
+    QMeraLayerSpec,
+    QMeraSchedule,
+    build_qmera_schedule,
+)
 from .terms import LocalTerm, normalize_local_terms
 
 __all__ = [
+    "GateRegistry",
+    "GateSpec",
     "LightconeChunk",
     "LocalTerm",
     "MeraEnergyOptimizer",
+    "QMeraAnsatz",
+    "QMeraBlockSpec",
+    "QMeraBuilder",
+    "QMeraGatePlacement",
+    "QMeraGeometry",
+    "QMeraLayerSpec",
+    "QMeraSchedule",
+    "UserGateFamily",
     "build_lightcone_chunks",
+    "build_qmera_schedule",
+    "default_gate_registry",
     "local_lightcone_expectation",
     "normalize_local_terms",
+    "resolve_gate_spec",
     "select_lightcone",
     "site_tags_for_where",
 ]

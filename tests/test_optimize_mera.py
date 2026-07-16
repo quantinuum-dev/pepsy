@@ -6,9 +6,15 @@ import quimb.tensor as qtn
 
 from pepsy.optimizers.energy import EnergyEstimate
 from pepsy.optimizers.mera import (
+    GateSpec,
     LocalTerm,
     MeraEnergyOptimizer,
+    QMeraBlockSpec,
+    QMeraBuilder,
+    QMeraGeometry,
+    UserGateFamily,
     build_lightcone_chunks,
+    default_gate_registry,
     local_lightcone_expectation,
     normalize_local_terms,
 )
@@ -165,3 +171,105 @@ def test_mera_energy_make_tn_optimizer_and_optimize(monkeypatch):
     assert opt.state is out
     assert losses == (2.0, 1.0)
     assert calls[-1] == ("optimize", 3, {})
+
+
+def test_qmera_geometry_explicit_lattice_and_mapper():
+    """Geometry should keep physical labels separate from register sites."""
+    geom = QMeraGeometry(shape=(2, 3), mapper="snake", boundary="periodic")
+
+    assert geom.shape == (2, 3)
+    assert geom.boundary == "periodic"
+    assert geom.num_sites == 6
+    assert geom.register_sites == (0, 1, 2, 3, 4, 5)
+    assert geom.to_register((0, 0)) == 0
+    assert geom.to_site(0) == (0, 0)
+    assert geom.site_tag((0, 0)) == "I0"
+    assert ((0, 2), (0, 0)) in geom.nearest_neighbor_edges()
+
+
+def test_qmera_schedule_has_disentangler_and_isometry_blocks():
+    """Builder schedules should expose block stages before gate tensors."""
+    builder = QMeraBuilder(
+        shape=8,
+        disentangler={"block_size": 2, "circuit_depth": 1, "gate_family": "rxx"},
+        isometry={"block_size": 2, "circuit_depth": 1, "gate_family": "rzz"},
+    )
+
+    schedule = builder.build_schedule()
+    first = schedule.layers[0]
+
+    assert isinstance(schedule.disentangler, QMeraBlockSpec)
+    assert first.input_sites == tuple(range(8))
+    assert first.output_sites == (0, 2, 4, 6)
+    assert first.disentanglers
+    assert first.isometries
+    assert first.disentanglers[0].stage == "disentangler"
+    assert first.isometries[0].stage == "isometry"
+    assert first.disentanglers[0].gate_family == "rxx"
+    assert first.isometries[0].gate_family == "rzz"
+    assert "DISENTANGLER" in first.disentanglers[0].tags
+    assert "ISOMETRY" in first.isometries[0].tags
+    assert schedule.top_sites == (0,)
+
+
+def test_qmera_gate_registry_generates_parametrized_two_qubit_gates():
+    """The registry should produce backend-ready two-qubit gate tensors."""
+    registry = default_gate_registry()
+    spec = registry.get("rxx")
+    gate = spec.matrix([0.25])
+
+    assert isinstance(spec, GateSpec)
+    assert spec.arity == 2
+    assert spec.num_params == 1
+    assert gate.shape == (2, 2, 2, 2)
+    assert "su4" in registry.names(arity=2)
+
+    custom = UserGateFamily(
+        name="diag-phase",
+        arity=2,
+        num_params=1,
+        generator=lambda params: np.diag(
+            [1.0, 1.0, 1.0, np.exp(1.0j * params[0])]
+        ).reshape(2, 2, 2, 2),
+    )
+    registry.register(custom)
+    custom_gate = registry.get("diag-phase").matrix([0.3])
+    assert custom_gate.shape == (2, 2, 2, 2)
+    assert custom_gate.reshape(4, 4)[-1, -1] == pytest.approx(np.exp(0.3j))
+
+
+def test_qmera_builder_outputs_parameters_gates_state_and_lightcone_tags():
+    """QMeraBuilder should assemble a deterministic direct-gate TN payload."""
+    builder = QMeraBuilder(
+        shape=4,
+        gate_family="rxx",
+        isometry_gate_family="rzz",
+        seed=7,
+        param_scale=0.0,
+    )
+
+    ansatz = builder.build()
+
+    assert ansatz.state is not None
+    assert ansatz.metadata["state_kind"] == "direct-gate-tn"
+    assert ansatz.metadata["num_layers"] == 2
+    assert tuple(ansatz.parameters) == ansatz.schedule.param_keys
+    assert set(ansatz.gate_tensors) == {
+        placement.gate_id for placement in ansatz.schedule.placements
+    }
+    assert all(value.shape[0] in {0, 1} for value in ansatz.parameters.values())
+
+    tags = ansatz.reverse_lightcone_tags((0, 1))
+    assert "I0" in tags
+    assert "I1" in tags
+    assert any(tag.startswith("GATE_L0_DIS") for tag in tags)
+    assert "DISENTANGLER" in ansatz.state.tags
+    assert "ISOMETRY" in ansatz.state.tags
+
+    opt = MeraEnergyOptimizer(
+        ansatz.state,
+        {(0, 1): _zz_term()},
+        energy_per_site=False,
+        contraction_opt="auto-hq",
+    )
+    assert np.isfinite(float(opt.loss()))
