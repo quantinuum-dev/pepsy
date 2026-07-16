@@ -36,6 +36,14 @@ class QMeraAnsatz:
         """Return schedule tags in the reverse lightcone of ``where``."""
         return self.schedule.reverse_lightcone_tags(where)
 
+    def schematic_blocks(self, *, layer=None):
+        """Return display-oriented disentangler/isometry blocks."""
+        return self.schedule.schematic_blocks(layer=layer)
+
+    def draw_schematic(self, *, layer=None, **kwargs):
+        """Draw qMERA blocking for this ansatz."""
+        return self.schedule.draw_schematic(layer=layer, **kwargs)
+
 
 def _coerce_geometry(geometry=None, *, shape=None, boundary="open", mapper=None):
     if isinstance(geometry, QMeraGeometry):
@@ -124,6 +132,14 @@ class QMeraBuilder:
             max_layers=self.max_layers,
             top_size=self.top_size,
         )
+
+    def schematic_blocks(self, *, layer=None):
+        """Return display-oriented disentangler/isometry blocks."""
+        return self.build_schedule().schematic_blocks(layer=layer)
+
+    def draw_schematic(self, *, layer=None, **kwargs):
+        """Draw the qMERA blocking implied by this builder."""
+        return self.build_schedule().draw_schematic(layer=layer, **kwargs)
 
     def _parameter_converter(self):
         if self.parameter_backend is not None:

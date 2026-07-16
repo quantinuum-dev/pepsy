@@ -85,6 +85,9 @@ change or API decision.
   for every Hamiltonian support and expose diagnostics for causal-cone width.
   For fixed qMERA architecture the selected lightcone width should remain
   bounded rather than growing with total system size.
+- Provide schematic views of the explicit qMERA schedule. Users should be able
+  to inspect disentangler and isometry blocking at every layer before running
+  optimization.
 - Compute energy by contracting only each Hamiltonian term's lightcone chunk, or
   groups of compatible term chunks, not the whole state. Use reusable
   cotengra/quimb contraction optimizers and cache term selectors.

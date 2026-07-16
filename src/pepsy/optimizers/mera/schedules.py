@@ -156,6 +156,18 @@ class QMeraSchedule:
                 add(tag)
         return tuple(tags)
 
+    def schematic_blocks(self, *, layer=None):
+        """Return display-oriented disentangler/isometry blocks."""
+        from .schematics import qmera_schematic_blocks
+
+        return qmera_schematic_blocks(self, layer=layer)
+
+    def draw_schematic(self, *, layer=None, **kwargs):
+        """Draw a schematic of qMERA blocking for one or more layers."""
+        from .schematics import draw_qmera_schedule
+
+        return draw_qmera_schedule(self, layer=layer, **kwargs)
+
 
 def _block_ranges(active, block_size):
     for start in range(0, len(active), block_size):

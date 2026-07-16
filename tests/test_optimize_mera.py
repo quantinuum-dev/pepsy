@@ -12,11 +12,14 @@ from pepsy.optimizers.mera import (
     QMeraBlockSpec,
     QMeraBuilder,
     QMeraGeometry,
+    QMeraSchematicBlock,
     UserGateFamily,
     build_lightcone_chunks,
     default_gate_registry,
+    draw_qmera_schedule,
     local_lightcone_expectation,
     normalize_local_terms,
+    qmera_schematic_blocks,
 )
 from pepsy.optimizers.mera.optimizer import (
     MeraEnergyOptimizer as ModuleMeraEnergyOptimizer,
@@ -273,3 +276,47 @@ def test_qmera_builder_outputs_parameters_gates_state_and_lightcone_tags():
         contraction_opt="auto-hq",
     )
     assert np.isfinite(float(opt.loss()))
+
+
+def test_qmera_schematic_blocks_group_disentanglers_and_isometries():
+    """Schematic data should expose visible block groupings per layer."""
+    builder = QMeraBuilder(
+        shape=8,
+        disentangler={"block_size": 4, "circuit_depth": 2, "gate_family": "rxx"},
+        isometry={"block_size": 2, "circuit_depth": 1, "gate_family": "rzz"},
+    )
+    schedule = builder.build_schedule()
+
+    blocks = schedule.schematic_blocks(layer=0)
+    direct_blocks = qmera_schematic_blocks(schedule, layer=0)
+
+    assert blocks == direct_blocks
+    assert all(isinstance(block, QMeraSchematicBlock) for block in blocks)
+    assert {block.stage for block in blocks} == {"disentangler", "isometry"}
+    assert {block.stage_label for block in blocks} == {"D", "W"}
+    assert any(block.register_sites == (0, 1, 2, 3) for block in blocks)
+    assert any(block.round == 1 for block in blocks if block.stage == "disentangler")
+
+
+def test_qmera_draw_schematic_builds_quimb_drawing():
+    """The quimb schematic wrapper should draw layer blocking without a Circuit."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    from quimb import schematic
+
+    builder = QMeraBuilder(shape=4, gate_family="rxx", isometry_gate_family="rzz")
+    schedule = builder.build_schedule()
+
+    drawing = draw_qmera_schedule(
+        schedule,
+        layer=0,
+        label_sites=False,
+        scale_figsize=False,
+    )
+
+    assert isinstance(drawing, schematic.Drawing)
+    assert isinstance(builder.draw_schematic(layer=0, scale_figsize=False), schematic.Drawing)
+    assert isinstance(
+        builder.build(build_state=False).draw_schematic(layer=0, scale_figsize=False),
+        schematic.Drawing,
+    )

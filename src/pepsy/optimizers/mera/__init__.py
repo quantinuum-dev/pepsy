@@ -24,6 +24,11 @@ from .schedules import (
     QMeraSchedule,
     build_qmera_schedule,
 )
+from .schematics import (
+    QMeraSchematicBlock,
+    draw_qmera_schedule,
+    qmera_schematic_blocks,
+)
 from .terms import LocalTerm, normalize_local_terms
 
 __all__ = [
@@ -39,12 +44,15 @@ __all__ = [
     "QMeraGeometry",
     "QMeraLayerSpec",
     "QMeraSchedule",
+    "QMeraSchematicBlock",
     "UserGateFamily",
     "build_lightcone_chunks",
     "build_qmera_schedule",
     "default_gate_registry",
+    "draw_qmera_schedule",
     "local_lightcone_expectation",
     "normalize_local_terms",
+    "qmera_schematic_blocks",
     "resolve_gate_spec",
     "select_lightcone",
     "site_tags_for_where",

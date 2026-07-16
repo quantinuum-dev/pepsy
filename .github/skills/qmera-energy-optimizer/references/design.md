@@ -116,6 +116,7 @@ src/pepsy/optimizers/mera/
   lightcones.py
   gates.py           # only when qMERA construction is implemented
   builders.py        # only when qMERA construction is implemented
+  schematics.py      # manual layer/block drawings from schedules
   fermions.py        # only when FH/JW/native fermion helpers are implemented
   adapters.py        # only if wrapping experimental quimb merabuilder
 ```
@@ -133,6 +134,8 @@ Second milestone:
 
 - `gates.py`: parametrized spin/fermion gate registry
 - `builders.py`: `QMeraBuilder` for small 1D/2D brickwall qMERA schedules
+- `schematics.py`: quimb-schematic visualizations of per-layer
+  disentangler/isometry blocking
 - `fermions.py`: Fermi-Hubbard conventions, two-site gate-family adapters, and
   consistency checks against `SymHamiltonian`
 - optional prototype parity tests against `~/mera` examples if the prototype is
@@ -519,6 +522,7 @@ Keep qMERA construction out of the energy optimizer. A builder should expose:
 - user-defined two-qubit gate family hooks;
 - fermion convention and validation policy;
 - tags for layer, operation, and site lightcones;
+- schematic views of disentangler and isometry blocks at every layer;
 - reverse-lightcone cache construction;
 - explicit parameter initialization and packing;
 - reproducible initialization.
