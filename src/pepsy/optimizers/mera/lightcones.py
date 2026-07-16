@@ -5,14 +5,23 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import autoray as ar
+import numpy as np
+import quimb.tensor as qtn
 
-from .terms import LocalTerm
+from ...backends import get_default_array_backend
+from .gates import default_gate_registry, resolve_gate_spec
+from .terms import LocalTerm, convert_local_terms, normalize_local_terms
 
 __all__ = [
     "LightconeChunk",
+    "QMeraParametricLightconeChunk",
     "build_lightcone_chunks",
     "build_qmera_lightcone_chunks",
+    "build_qmera_parametric_lightcone_chunks",
+    "local_qmera_parametric_lightcone_expectation",
     "local_lightcone_expectation",
+    "qmera_parametric_energy",
+    "qmera_parametric_lightcone_state",
     "select_lightcone",
     "site_tags_for_where",
 ]
@@ -48,6 +57,40 @@ class LightconeChunk:
         if not self.schedule_width_by_scale:
             return self.support_size
         return max(width for _, width in self.schedule_width_by_scale)
+
+
+@dataclass(frozen=True)
+class QMeraParametricLightconeChunk:
+    """Schedule-only lightcone metadata for rebuilding a local qMERA cone."""
+
+    term: LocalTerm
+    tags: tuple[str, ...]
+    input_sites: tuple[int, ...]
+    schedule_placement_ids: tuple[str, ...]
+    schedule_width_by_scale: tuple[tuple[int, int], ...]
+    source: str = "parametric-schedule"
+
+    @property
+    def support_size(self):
+        """Number of physical sites in the Hamiltonian support."""
+        return len(self.term.where)
+
+    @property
+    def physical_width(self):
+        """Number of product-state sites needed by this local cone."""
+        return len(self.input_sites)
+
+    @property
+    def schedule_width(self):
+        """Largest register support touched by the schedule lightcone."""
+        if not self.schedule_width_by_scale:
+            return self.support_size
+        return max(width for _, width in self.schedule_width_by_scale)
+
+    @property
+    def num_gates(self):
+        """Number of parametrized gates rebuilt for this local cone."""
+        return len(self.schedule_placement_ids)
 
 
 def _default_site_tag(site):
@@ -173,6 +216,19 @@ def _chunk_for_schedule_term(state, schedule, term, *, validate=True):
     )
 
 
+def _schedule_placements_for_term(schedule, term):
+    term = _term_on_schedule_registers(schedule, term)
+    placements = schedule.reverse_lightcone_placements(term.where)
+    return term, placements
+
+
+def _input_sites_for_placements(schedule, term, placements):
+    support = set(term.where)
+    for placement in placements:
+        support.update(placement.where)
+    return tuple(site for site in schedule.geometry.register_sites if site in support)
+
+
 def build_qmera_lightcone_chunks(state, schedule, terms, *, validate=True):
     """Precompute lightcone chunks from an explicit qMERA schedule.
 
@@ -184,6 +240,29 @@ def build_qmera_lightcone_chunks(state, schedule, terms, *, validate=True):
     """
     return tuple(
         _chunk_for_schedule_term(state, schedule, term, validate=validate)
+        for term in terms
+    )
+
+
+def _parametric_chunk_for_schedule_term(schedule, term):
+    term, placements = _schedule_placements_for_term(schedule, term)
+    return QMeraParametricLightconeChunk(
+        term=term.with_tags(schedule.reverse_lightcone_tags(term.where)),
+        tags=schedule.reverse_lightcone_tags(term.where),
+        input_sites=_input_sites_for_placements(schedule, term, placements),
+        schedule_placement_ids=tuple(placement.gate_id for placement in placements),
+        schedule_width_by_scale=_schedule_width_trace(
+            schedule,
+            term.where,
+            placements,
+        ),
+    )
+
+
+def build_qmera_parametric_lightcone_chunks(schedule, terms):
+    """Precompute qMERA local cones without requiring a built global state."""
+    return tuple(
+        _parametric_chunk_for_schedule_term(schedule, term)
         for term in terms
     )
 
@@ -204,6 +283,187 @@ def _maybe_simplify(tn, simplify):
 
 def _contract(tn, *, optimize, contract_opts):
     return tn.contract(all, optimize=optimize, **dict(contract_opts or {}))
+
+
+def _site_ind(site):
+    return f"k{site}"
+
+
+def _product_state_on_sites(sites, *, physical_dim=2, array_backend=None):
+    tensors = []
+    base = np.zeros((int(physical_dim),), dtype=np.complex128)
+    base[0] = 1.0
+    for site in tuple(sites):
+        data = base if array_backend is None else array_backend(base)
+        tensors.append(qtn.Tensor(data, inds=(_site_ind(site),), tags=(f"I{site}",)))
+    return qtn.TensorNetwork(tensors)
+
+
+def _resolve_array_backend(array_backend):
+    return get_default_array_backend() if array_backend is None else array_backend
+
+
+def _placements_by_id(schedule):
+    by_id = schedule.placements_by_id()
+    return by_id if isinstance(by_id, dict) else dict(by_id)
+
+
+def _gate_for_placement(placement, parameters, *, gate_registry, array_backend=None):
+    try:
+        params = parameters[placement.param_key]
+    except KeyError as exc:
+        raise KeyError(
+            f"Missing parameter {placement.param_key!r} for qMERA gate "
+            f"{placement.gate_id!r}."
+        ) from exc
+    spec = resolve_gate_spec(placement.gate_family, gate_registry)
+    if spec.arity != placement.arity:
+        raise ValueError(
+            f"Gate family {spec.name!r} has arity {spec.arity}, "
+            f"but placement {placement.gate_id} acts on {placement.arity} sites."
+        )
+    return spec.matrix(params, array_backend=array_backend)
+
+
+def qmera_parametric_lightcone_state(
+    schedule,
+    chunk: QMeraParametricLightconeChunk,
+    parameters,
+    *,
+    gate_registry=None,
+    array_backend=None,
+    physical_dim=2,
+    contract=False,
+):
+    """Build only the local qMERA cone selected by ``chunk`` from parameters."""
+    gate_registry = default_gate_registry() if gate_registry is None else gate_registry
+    array_backend = _resolve_array_backend(array_backend)
+    placements = _placements_by_id(schedule)
+    state = _product_state_on_sites(
+        chunk.input_sites,
+        physical_dim=physical_dim,
+        array_backend=array_backend,
+    )
+    for gate_id in chunk.schedule_placement_ids:
+        placement = placements[gate_id]
+        gate = _gate_for_placement(
+            placement,
+            parameters,
+            gate_registry=gate_registry,
+            array_backend=array_backend,
+        )
+        state = state.gate_inds(
+            gate,
+            inds=tuple(_site_ind(site) for site in placement.where),
+            contract=contract,
+            tags=placement.tags,
+            inplace=False,
+        )
+    return state
+
+
+def local_qmera_parametric_lightcone_expectation(
+    schedule,
+    chunk: QMeraParametricLightconeChunk,
+    parameters,
+    *,
+    gate_registry=None,
+    array_backend=None,
+    physical_dim=2,
+    optimize="auto-hq",
+    normalized=True,
+    real=True,
+    simplify=False,
+    gate_contract=True,
+    contract_opts=None,
+):
+    """Contract one qMERA local term by rebuilding only its scheduled cone."""
+    ket = qmera_parametric_lightcone_state(
+        schedule,
+        chunk,
+        parameters,
+        gate_registry=gate_registry,
+        array_backend=array_backend,
+        physical_dim=physical_dim,
+        contract=False,
+    )
+    term = chunk.term
+    ket_g = ket.gate_inds(
+        term.operator,
+        inds=tuple(_site_ind(site) for site in term.where),
+        contract=gate_contract,
+        inplace=False,
+    )
+    expec = _maybe_simplify(ket.H & ket_g, simplify)
+    value = _contract(expec, optimize=optimize, contract_opts=contract_opts)
+
+    if normalized:
+        norm = _contract(
+            _maybe_simplify(ket.H & ket, simplify),
+            optimize=optimize,
+            contract_opts=contract_opts,
+        )
+        value = value / norm
+
+    if term.weight != 1.0:
+        value = value * term.weight
+
+    if real:
+        value = _maybe_real(value)
+    return value
+
+
+def qmera_parametric_energy(
+    schedule,
+    parameters,
+    hamiltonian=None,
+    *,
+    chunks=None,
+    gate_registry=None,
+    array_backend=None,
+    convert_terms=True,
+    physical_dim=2,
+    optimize="auto-hq",
+    normalized=True,
+    energy_per_site=True,
+    real=True,
+    simplify=False,
+    gate_contract=True,
+    contract_opts=None,
+):
+    """Evaluate a qMERA energy by rebuilding each scheduled lightcone only."""
+    array_backend = _resolve_array_backend(array_backend)
+    if chunks is None:
+        if hamiltonian is None:
+            raise ValueError("qmera_parametric_energy requires hamiltonian or chunks.")
+        terms = normalize_local_terms(hamiltonian)
+        if convert_terms:
+            terms = convert_local_terms(terms, array_backend)
+        chunks = build_qmera_parametric_lightcone_chunks(schedule, terms)
+    value = None
+    for chunk in chunks:
+        term_value = local_qmera_parametric_lightcone_expectation(
+            schedule,
+            chunk,
+            parameters,
+            gate_registry=gate_registry,
+            array_backend=array_backend,
+            physical_dim=physical_dim,
+            optimize=optimize,
+            normalized=normalized,
+            real=False,
+            simplify=simplify,
+            gate_contract=gate_contract,
+            contract_opts=contract_opts,
+        )
+        value = term_value if value is None else value + term_value
+    if value is None:
+        raise ValueError("hamiltonian contains no local terms.")
+    if energy_per_site:
+        value = value / schedule.geometry.num_sites
+    if real:
+        value = _maybe_real(value)
+    return value
 
 
 def local_lightcone_expectation(

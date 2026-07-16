@@ -13,13 +13,18 @@ from pepsy.optimizers.mera import (
     QMeraBuilder,
     QMeraGeometry,
     QMeraSchematicBlock,
+    QMeraParametricLightconeChunk,
     UserGateFamily,
     build_lightcone_chunks,
     build_qmera_lightcone_chunks,
+    build_qmera_parametric_lightcone_chunks,
     default_gate_registry,
     draw_qmera_schedule,
+    local_qmera_parametric_lightcone_expectation,
     local_lightcone_expectation,
     normalize_local_terms,
+    qmera_parametric_energy,
+    qmera_parametric_lightcone_state,
     qmera_schematic_blocks,
 )
 from pepsy.optimizers.mera.optimizer import (
@@ -405,6 +410,110 @@ def test_qmera_schedule_lightcone_chunks_map_coordinate_terms():
     assert chunk.schedule_placement_ids
     assert chunk.schedule_width_by_scale
     assert complex(opt.loss(real=False)) == pytest.approx(complex(direct))
+
+
+def test_qmera_parametric_lightcone_loss_rebuilds_local_cone_from_params():
+    """Parameterized qMERA loss should not need a prebuilt global state."""
+    builder = QMeraBuilder(
+        shape=(4, 4),
+        disentangler={"block_size": 2, "circuit_depth": 1, "gate_family": "rxx"},
+        isometry={"block_size": (2, 2), "circuit_depth": 2, "gate_family": "rzz"},
+        seed=31,
+        param_scale=0.04,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    hamiltonian = {((0, 0), (0, 1)): _zz_term()}
+
+    chunks = builder.parametric_lightcone_chunks(hamiltonian, schedule)
+    value = builder.parametric_loss(
+        params,
+        schedule=schedule,
+        chunks=chunks,
+        energy_per_site=False,
+        real=False,
+        contraction_opt="auto-hq",
+    )
+    state, _ = builder.build_state(params, schedule)
+    direct = state.compute_local_expectation_exact(
+        {(0, 1): _zz_term()},
+        optimize="auto-hq",
+        normalized=True,
+    )
+
+    assert isinstance(chunks[0], QMeraParametricLightconeChunk)
+    assert chunks[0].source == "parametric-schedule"
+    assert chunks[0].term.where == (0, 1)
+    assert chunks[0].num_gates < schedule.num_gates
+    assert complex(value) == pytest.approx(complex(direct))
+
+
+def test_qmera_parametric_energy_helpers_match_builder_loss():
+    """Low-level parametric helpers should compose with schedule/chunk metadata."""
+    builder = QMeraBuilder(
+        shape=(4, 4),
+        disentangler={"block_size": 2, "circuit_depth": 1},
+        isometry={"block_size": (2, 2), "circuit_depth": 2},
+        seed=32,
+        param_scale=0.02,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    terms = normalize_local_terms({((0, 0), (0, 1)): _zz_term()})
+    chunks = build_qmera_parametric_lightcone_chunks(schedule, terms)
+
+    local_state = qmera_parametric_lightcone_state(
+        schedule,
+        chunks[0],
+        params,
+        gate_registry=builder.gate_registry,
+    )
+    local_value = local_qmera_parametric_lightcone_expectation(
+        schedule,
+        chunks[0],
+        params,
+        gate_registry=builder.gate_registry,
+        optimize="auto-hq",
+        real=False,
+    )
+    energy_value = qmera_parametric_energy(
+        schedule,
+        params,
+        chunks=chunks,
+        gate_registry=builder.gate_registry,
+        energy_per_site=False,
+        optimize="auto-hq",
+        real=False,
+    )
+    builder_value = builder.parametric_loss(
+        params,
+        schedule=schedule,
+        chunks=chunks,
+        energy_per_site=False,
+        real=False,
+        contraction_opt="auto-hq",
+    )
+
+    assert local_state.num_tensors == len(chunks[0].input_sites) + chunks[0].num_gates
+    assert complex(local_value) == pytest.approx(complex(energy_value))
+    assert complex(energy_value) == pytest.approx(complex(builder_value))
+
+
+def test_qmera_parametric_loss_reports_missing_gate_parameter():
+    """A missing parameter key should fail at the scheduled gate that needs it."""
+    builder = QMeraBuilder(shape=4, gate_family="rxx", isometry_gate_family="rzz")
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    missing_key = schedule.placements[0].param_key
+    params.pop(missing_key)
+
+    with pytest.raises(KeyError, match=missing_key):
+        builder.parametric_loss(
+            params,
+            {(0, 1): _zz_term()},
+            schedule=schedule,
+            energy_per_site=False,
+        )
 
 
 def test_qmera_2d_builder_outputs_direct_gate_tensor_network():

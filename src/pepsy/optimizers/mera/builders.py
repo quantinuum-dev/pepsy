@@ -12,7 +12,12 @@ import quimb.tensor as qtn
 from ...backends import get_default_array_backend, get_default_grad_backend
 from .gates import GateRegistry, default_gate_registry, resolve_gate_spec
 from .geometry import QMeraGeometry
+from .lightcones import (
+    build_qmera_parametric_lightcone_chunks,
+    qmera_parametric_energy,
+)
 from .schedules import QMeraBlockSpec, QMeraSchedule, build_qmera_schedule
+from .terms import convert_local_terms, normalize_local_terms
 
 __all__ = ["QMeraAnsatz", "QMeraBuilder"]
 
@@ -140,6 +145,62 @@ class QMeraBuilder:
     def draw_schematic(self, *, layer=None, **kwargs):
         """Draw the qMERA blocking implied by this builder."""
         return self.build_schedule().draw_schematic(layer=layer, **kwargs)
+
+    def parametric_lightcone_chunks(
+        self,
+        hamiltonian,
+        schedule=None,
+        *,
+        array_backend=None,
+        convert_terms=True,
+    ):
+        """Compile schedule-only qMERA lightcone chunks for local terms."""
+        schedule = self.build_schedule() if schedule is None else schedule
+        terms = normalize_local_terms(hamiltonian)
+        if convert_terms:
+            backend = self.array_backend if array_backend is None else array_backend
+            if backend is None:
+                backend = get_default_array_backend()
+            terms = convert_local_terms(terms, backend)
+        return build_qmera_parametric_lightcone_chunks(schedule, terms)
+
+    def parametric_loss(
+        self,
+        parameters,
+        hamiltonian=None,
+        schedule=None,
+        *,
+        chunks=None,
+        array_backend=None,
+        convert_terms=True,
+        normalized=True,
+        energy_per_site=True,
+        real=True,
+        contraction_opt="auto-hq",
+        simplify=False,
+        gate_contract=True,
+        contract_opts=None,
+    ):
+        """Evaluate qMERA energy from params by rebuilding local cones only."""
+        schedule = self.build_schedule() if schedule is None else schedule
+        backend = self.array_backend if array_backend is None else array_backend
+        return qmera_parametric_energy(
+            schedule,
+            parameters,
+            hamiltonian,
+            chunks=chunks,
+            gate_registry=self.gate_registry,
+            array_backend=backend,
+            convert_terms=convert_terms,
+            physical_dim=self.physical_dim,
+            optimize=contraction_opt,
+            normalized=normalized,
+            energy_per_site=energy_per_site,
+            real=real,
+            simplify=simplify,
+            gate_contract=gate_contract,
+            contract_opts=contract_opts,
+        )
 
     def _parameter_converter(self):
         if self.parameter_backend is not None:
