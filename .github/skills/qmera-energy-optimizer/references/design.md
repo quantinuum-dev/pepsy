@@ -19,6 +19,39 @@ Key design points for Pepsy:
 - Unitary/isometric constraints should be enforced by differentiable projection
   from parameters to constrained tensors or by explicit circuit gates.
 
+## Current Pepsy State
+
+As of July 2026, Pepsy has a real `src/pepsy/optimizers/mera/` package rather
+than only a design sketch. The important implemented pieces are:
+
+- dense/isometric `MeraEnergyOptimizer` for MERA-like tensor networks;
+- explicit `QMeraGeometry` lattice/register objects, including per-site mode
+  expansion for fermionic registers;
+- RG-style `QMeraSchedule` objects with non-overlapping isometry blocks,
+  boundary disentangler windows, and bottom-to-top layer metadata;
+- `QMeraBuilder` for schedule creation, parameter initialization/casting,
+  optional direct-gate TN construction, schematics, and local lightcone losses;
+- parameterized two-qubit gate registries through `GateSpec`,
+  `GateRegistry`, and `UserGateFamily`;
+- schedule-owned reverse-lightcone chunking through
+  `build_qmera_parametric_lightcone_chunks(...)`;
+- explicit local-cone tensor networks through `QMeraLightconeTN`,
+  `qmera_parametric_lightcone_tn(...)`, and
+  `contract_qmera_lightcone_tn(...)`;
+- compiled dense local-cone contractions through cotengra
+  `array_contract_expression`, suitable for JAX/Torch array losses when the
+  schedule and chunks are static;
+- `QMeraParametricEnergyOptimizer`, which routes parameter dictionaries through
+  Pepsy `GradientOptimizer`;
+- Symmray-native fermion support for two-state modes, Fermi-Hubbard local
+  terms, and a contextual `symmray-fsim` gate family.
+
+The main invariant to preserve is that the qMERA energy path is schedule-first:
+local terms consume the `QMeraSchedule` and rebuild only their reverse
+lightcone chunks from the parameter dictionary. A prebuilt full direct-gate TN
+is useful for debugging and comparisons, but should not become the primary
+parametric loss route.
+
 ## quimb Anchors
 
 quimb has two relevant layers:
@@ -104,9 +137,9 @@ For JAX JIT, the static objects are geometry, schedule, term selectors,
 lightcone chunks, and contraction trees. The dynamic objects are only the
 backend-native arrays in the parameter dictionary.
 
-## Proposed Pepsy Package
+## Current Pepsy Package
 
-Add:
+Current layout:
 
 ```text
 src/pepsy/optimizers/mera/
@@ -114,32 +147,39 @@ src/pepsy/optimizers/mera/
   optimizer.py
   terms.py
   lightcones.py
-  gates.py           # only when qMERA construction is implemented
-  builders.py        # only when qMERA construction is implemented
-  schematics.py      # manual layer/block drawings from schedules
-  fermions.py        # only when FH/JW/native fermion helpers are implemented
-  adapters.py        # only if wrapping experimental quimb merabuilder
+  geometry.py
+  schedules.py
+  gates.py
+  builders.py
+  compiled.py
+  parametric.py
+  schematics.py
+  fermions.py
 ```
 
-First milestone:
+The implemented responsibilities are:
 
-- `optimizer.py`: `MeraEnergyOptimizer`
-- `terms.py`: geometry/Hamiltonian term normalization
-- `lightcones.py`: reverse-lightcone tag caching and chunk formation
-- backend plumbing: use Pepsy backend casters/defaults for state, gates,
-  parameters, and scalar conversion
-- tests in `tests/test_optimize_mera.py`
+- `optimizer.py`: `MeraEnergyOptimizer` for dense/isometric MERA-like states.
+- `terms.py`: `LocalTerm`, input normalization, and local operator conversion.
+- `geometry.py`: explicit lattice labels, register sites, mapper support, and
+  optional mode labels such as spin-up/spin-down.
+- `schedules.py`: RG block placement and reverse-lightcone placement queries.
+- `gates.py`: parameterized gate registry and context-aware gate generation.
+- `builders.py`: `QMeraBuilder`, `QMeraAnsatz`, parameter casting, direct-gate
+  state construction, and local-cone loss helpers.
+- `lightcones.py`: tag-based dense MERA cones plus schedule-first qMERA cones.
+- `compiled.py`: static contraction expressions for dense local qMERA cones.
+- `parametric.py`: parameter-dict optimizer shell over `GradientOptimizer`.
+- `schematics.py`: inspection drawings of disentangler/isometry blocking.
+- `fermions.py`: Symmray-native fermion mode backend and Fermi-Hubbard terms.
 
-Second milestone:
+Still-open package work:
 
-- `gates.py`: parametrized spin/fermion gate registry
-- `builders.py`: `QMeraBuilder` for small 1D/2D brickwall qMERA schedules
-- `schematics.py`: quimb-schematic visualizations of per-layer
-  disentangler/isometry blocking
-- `fermions.py`: Fermi-Hubbard conventions, two-site gate-family adapters, and
-  consistency checks against `SymHamiltonian`
-- optional prototype parity tests against `~/mera` examples if the prototype is
-  available on the local machine
+- document examples for the implemented public path;
+- local-cone grouping and cotengra path-cache ergonomics;
+- explicit 2D multi-mode/Fermi-Hubbard RG design;
+- broader comparison tests between direct-gate TNs and schedule-only chunks;
+- possible top-level export decisions for selected qMERA symbols.
 
 ## Design Data Flow
 
@@ -631,36 +671,43 @@ than rebuilding tensor networks inside a traced function.
 - A DMRG-like local gate optimizer from the paper is a later milestone. Start
   with global autodiff since it matches existing Pepsy energy optimizer style.
 
-## Validation Milestones
+## Validation Checklist
 
-1. Dense 1D MERA smoke:
-   - `qtn.MERA.rand(L=8, max_bond=4)` or current quimb signature equivalent.
-   - nearest-neighbor Heisenberg terms.
-   - `loss()` returns finite real scalar.
+Run the focused qMERA suite after implementation changes:
 
-2. Causal-cone correctness:
-   - compare a local expectation from selected tags with a full exact
-     contraction for `L <= 8`.
-   - assert lightcone width diagnostics remain bounded when increasing system
-     size at fixed architecture.
+```bash
+env NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX=/tmp \
+  /home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pytest -q tests/test_optimize_mera.py
+```
 
-3. Optimizer construction:
-   - `make_tn_optimizer(autodiff_backend="torch", optimizer="adam", n=1)` runs
-     or cleanly skips if torch is unavailable.
-   - JAX loss and `jax.jit(loss)` agree for a tiny frozen chunk or skip cleanly
-     if JAX is unavailable.
-   - Pepsy `GradientOptimizer` with `solver="jax-adam"` runs one tiny
-     explicit-parameter qMERA step or skips cleanly if JAX/Optax is unavailable.
+The focused suite should continue to cover:
 
-4. Public API:
-   - if exported, update public tests and docs in the same patch.
+- dense 1D MERA local expectation and energy smoke tests;
+- causal-cone metadata and bounded schedule-width diagnostics;
+- `QMeraGeometry` lattice, mapper, register, and mode ordering behavior;
+- 1D and 2D RG schedules with non-overlapping isometry blocks and boundary
+  disentanglers;
+- schematic block extraction and drawing construction;
+- parameterized gate registry behavior and user-defined gate families;
+- direct-gate TN construction as a debugging/comparison path;
+- schedule-first parametric lightcone chunks that rebuild only local cones;
+- explicit `QMeraLightconeTN` construction and cotengra contraction;
+- compiled dense local-cone contractions matching rebuilt local cones;
+- Torch optimizer smoke through `QMeraParametricEnergyOptimizer`;
+- JAX JIT smoke for the compiled parameter-dict loss, skipped cleanly when JAX
+  or Optax is unavailable;
+- Symmray-native Fermi-Hubbard local terms and `symmray-fsim` lightcone tests,
+  skipped cleanly when Symmray is unavailable.
 
-5. qMERA builder:
-   - start with tiny deterministic schedules and assert the output is an
-     isometric/circuit tensor network with expected site tags and finite local
-     energy.
-   - user-defined two-qubit gate family gets placed correctly and participates
-     in reverse-lightcone tagging.
-   - Fermi-Hubbard U1U1 nearest-neighbor JW path agrees with
-     `SymHamiltonian.jw_energy(...)` or skips with a clear explanation when the
-     mapped bonds are not nearest-neighbor.
+For API/export changes, also run:
+
+```bash
+env NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX=/tmp \
+  /home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pytest -q tests/test_public_api.py tests/test_package_layout.py
+```
+
+For syntax-only checks:
+
+```bash
+/home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pyflakes src/pepsy/optimizers/mera tests/test_optimize_mera.py
+```
