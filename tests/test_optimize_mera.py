@@ -11,6 +11,7 @@ from pepsy.optimizers.mera import (
     MeraEnergyOptimizer,
     QMeraBlockSpec,
     QMeraBuilder,
+    QMeraCompiledLightconeChunk,
     QMeraGeometry,
     QMeraSchematicBlock,
     QMeraParametricEnergyOptimizer,
@@ -19,11 +20,14 @@ from pepsy.optimizers.mera import (
     build_lightcone_chunks,
     build_qmera_lightcone_chunks,
     build_qmera_parametric_lightcone_chunks,
+    compile_qmera_parametric_lightcones,
     default_gate_registry,
     draw_qmera_schedule,
+    local_qmera_compiled_lightcone_expectation,
     local_qmera_parametric_lightcone_expectation,
     local_lightcone_expectation,
     normalize_local_terms,
+    qmera_compiled_parametric_energy,
     qmera_parametric_energy,
     qmera_parametric_lightcone_state,
     qmera_schematic_blocks,
@@ -500,6 +504,63 @@ def test_qmera_parametric_energy_helpers_match_builder_loss():
     assert complex(energy_value) == pytest.approx(complex(builder_value))
 
 
+def test_qmera_compiled_parametric_loss_matches_rebuilt_cone():
+    """Compiled qMERA expressions should match the local TN rebuild path."""
+    builder = QMeraBuilder(
+        shape=4,
+        gate_family="rxx",
+        isometry_gate_family="rzz",
+        seed=34,
+        param_scale=0.07,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    terms = normalize_local_terms({(0, 1): _zz_term()})
+    chunks = build_qmera_parametric_lightcone_chunks(schedule, terms)
+    compiled = compile_qmera_parametric_lightcones(
+        schedule,
+        chunks,
+        gate_registry=builder.gate_registry,
+    )
+
+    local_value = local_qmera_compiled_lightcone_expectation(
+        schedule,
+        compiled[0],
+        params,
+        gate_registry=builder.gate_registry,
+        real=False,
+    )
+    compiled_value = qmera_compiled_parametric_energy(
+        schedule,
+        params,
+        compiled_chunks=compiled,
+        gate_registry=builder.gate_registry,
+        energy_per_site=False,
+        real=False,
+    )
+    builder_value = builder.compiled_parametric_loss(
+        params,
+        schedule=schedule,
+        compiled_chunks=compiled,
+        energy_per_site=False,
+        real=False,
+    )
+    rebuilt_value = builder.parametric_loss(
+        params,
+        schedule=schedule,
+        chunks=chunks,
+        energy_per_site=False,
+        real=False,
+    )
+
+    assert isinstance(compiled[0], QMeraCompiledLightconeChunk)
+    assert compiled[0].num_gates == chunks[0].num_gates
+    assert compiled[0].num_numerator_tensors >= compiled[0].num_denominator_tensors
+    assert complex(local_value) == pytest.approx(complex(rebuilt_value))
+    assert complex(compiled_value) == pytest.approx(complex(rebuilt_value))
+    assert complex(builder_value) == pytest.approx(complex(rebuilt_value))
+
+
 def test_qmera_parametric_loss_reports_missing_gate_parameter():
     """A missing parameter key should fail at the scheduled gate that needs it."""
     builder = QMeraBuilder(shape=4, gate_family="rxx", isometry_gate_family="rzz")
@@ -542,8 +603,8 @@ def test_qmera_builder_cast_params_to_torch_backend():
     assert not frozen["theta"].requires_grad
 
 
-def test_qmera_parametric_optimizer_runs_torch_solver():
-    """The parametric optimizer shell should expose loss(params) to solvers."""
+def test_qmera_parametric_optimizer_runs_compiled_torch_solver():
+    """The parametric optimizer shell should expose compiled loss to solvers."""
     pytest.importorskip("torch")
     builder = QMeraBuilder(
         shape=4,
@@ -569,6 +630,7 @@ def test_qmera_parametric_optimizer_runs_torch_solver():
         n_steps=2,
         log_every=1,
         options={"lr": 0.05},
+        compiled=True,
     )
 
     assert isinstance(opt, QMeraParametricEnergyOptimizer)
@@ -576,8 +638,47 @@ def test_qmera_parametric_optimizer_runs_torch_solver():
     assert result.solver == "torch-adam"
     assert len(result.history) == 2
     assert result.history[-1] <= result.history[0]
+    assert opt.compiled_chunks
     assert opt.losses == result.history
     assert set(result.params) == set(params)
+
+
+def test_qmera_compiled_parametric_loss_jax_jit_smoke():
+    """Compiled local-cone loss should be JAX-jittable over params."""
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    from pepsy.backends import backend_jax
+
+    jax.config.update("jax_enable_x64", True)
+    to_array = backend_jax(dtype=jnp.complex128)
+    to_param = backend_jax(dtype=jnp.float64)
+    builder = QMeraBuilder(
+        shape=4,
+        gate_family="rxx",
+        isometry_gate_family="rzz",
+        seed=35,
+        param_scale=0.05,
+        parameter_backend=to_param,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    compiled = builder.compile_parametric_lightcones(
+        {(0, 1): _zz_term()},
+        schedule,
+        array_backend=to_array,
+    )
+    loss_fn = builder.compiled_parametric_loss_fn(
+        schedule=schedule,
+        compiled_chunks=compiled,
+        energy_per_site=False,
+        real=True,
+    )
+
+    value = jax.jit(loss_fn)(params)
+    grads = jax.grad(loss_fn)(params)
+
+    assert np.isfinite(float(value))
+    assert set(grads) == set(params)
 
 
 def test_qmera_2d_builder_outputs_direct_gate_tensor_network():

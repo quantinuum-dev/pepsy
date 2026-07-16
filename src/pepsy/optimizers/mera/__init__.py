@@ -1,6 +1,13 @@
 """MERA and qMERA energy optimization helpers."""
 
 from .builders import QMeraAnsatz, QMeraBuilder
+from .compiled import (
+    QMeraCompiledLightconeChunk,
+    compile_qmera_parametric_lightcone,
+    compile_qmera_parametric_lightcones,
+    local_qmera_compiled_lightcone_expectation,
+    qmera_compiled_parametric_energy,
+)
 from .gates import (
     GateRegistry,
     GateSpec,
@@ -47,6 +54,7 @@ __all__ = [
     "QMeraAnsatz",
     "QMeraBlockSpec",
     "QMeraBuilder",
+    "QMeraCompiledLightconeChunk",
     "QMeraGatePlacement",
     "QMeraGeometry",
     "QMeraLayerSpec",
@@ -59,11 +67,15 @@ __all__ = [
     "build_qmera_lightcone_chunks",
     "build_qmera_parametric_lightcone_chunks",
     "build_qmera_schedule",
+    "compile_qmera_parametric_lightcone",
+    "compile_qmera_parametric_lightcones",
     "default_gate_registry",
     "draw_qmera_schedule",
+    "local_qmera_compiled_lightcone_expectation",
     "local_qmera_parametric_lightcone_expectation",
     "local_lightcone_expectation",
     "normalize_local_terms",
+    "qmera_compiled_parametric_energy",
     "qmera_parametric_energy",
     "qmera_parametric_lightcone_state",
     "qmera_schematic_blocks",

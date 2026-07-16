@@ -16,6 +16,10 @@ from ...backends import (
     get_default_array_backend,
     get_default_grad_backend,
 )
+from .compiled import (
+    compile_qmera_parametric_lightcones,
+    qmera_compiled_parametric_energy,
+)
 from .gates import GateRegistry, default_gate_registry, resolve_gate_spec
 from .geometry import QMeraGeometry
 from .lightcones import (
@@ -301,6 +305,103 @@ class QMeraBuilder:
                 hamiltonian=hamiltonian,
                 schedule=schedule,
                 chunks=chunks,
+                **loss_kwargs,
+            )
+
+        return _loss
+
+    def compile_parametric_lightcones(
+        self,
+        hamiltonian=None,
+        schedule=None,
+        *,
+        chunks=None,
+        array_backend=None,
+        convert_terms=True,
+        contraction_opt="auto-hq",
+        expression_opts=None,
+    ):
+        """Compile static contraction expressions for qMERA local cones."""
+        schedule = self.build_schedule() if schedule is None else schedule
+        backend = self.array_backend if array_backend is None else array_backend
+        if chunks is None:
+            if hamiltonian is None:
+                raise ValueError(
+                    "compile_parametric_lightcones requires hamiltonian or chunks."
+                )
+            chunks = self.parametric_lightcone_chunks(
+                hamiltonian,
+                schedule,
+                array_backend=backend,
+                convert_terms=convert_terms,
+            )
+        return compile_qmera_parametric_lightcones(
+            schedule,
+            chunks,
+            gate_registry=self.gate_registry,
+            array_backend=backend,
+            physical_dim=self.physical_dim,
+            optimize=contraction_opt,
+            expression_opts=expression_opts,
+        )
+
+    def compiled_parametric_loss(
+        self,
+        parameters,
+        hamiltonian=None,
+        schedule=None,
+        *,
+        chunks=None,
+        compiled_chunks=None,
+        array_backend=None,
+        gate_array_backend=None,
+        convert_terms=True,
+        normalized=True,
+        energy_per_site=True,
+        real=True,
+        contraction_opt="auto-hq",
+        expression_opts=None,
+    ):
+        """Evaluate qMERA energy with precompiled local-cone contractions."""
+        schedule = self.build_schedule() if schedule is None else schedule
+        backend = self.array_backend if array_backend is None else array_backend
+        return qmera_compiled_parametric_energy(
+            schedule,
+            parameters,
+            hamiltonian,
+            compiled_chunks=compiled_chunks,
+            chunks=chunks,
+            gate_registry=self.gate_registry,
+            array_backend=backend,
+            gate_array_backend=gate_array_backend,
+            convert_terms=convert_terms,
+            physical_dim=self.physical_dim,
+            optimize=contraction_opt,
+            normalized=normalized,
+            energy_per_site=energy_per_site,
+            real=real,
+            expression_opts=expression_opts,
+        )
+
+    def compiled_parametric_loss_fn(
+        self,
+        hamiltonian=None,
+        schedule=None,
+        *,
+        chunks=None,
+        compiled_chunks=None,
+        **loss_kwargs,
+    ):
+        """Return ``loss(params)`` using precompiled qMERA local cones."""
+        schedule = self.build_schedule() if schedule is None else schedule
+
+        def _loss(parameters):
+            return self.compiled_parametric_loss(
+                parameters,
+                hamiltonian=hamiltonian,
+                schedule=schedule,
+                chunks=chunks,
+                compiled_chunks=compiled_chunks,
                 **loss_kwargs,
             )
 

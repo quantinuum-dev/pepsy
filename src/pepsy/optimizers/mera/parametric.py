@@ -47,6 +47,7 @@ class QMeraParametricEnergyOptimizer:
     schedule: Any
     hamiltonian: Any
     chunks: Any = None
+    compiled_chunks: Any = None
     parameters: Mapping[str, Any] | None = None
     loss_kwargs: Mapping[str, Any] | None = None
     result: GradSolverResult | None = None
@@ -123,6 +124,62 @@ class QMeraParametricEnergyOptimizer:
 
         return _loss
 
+    def compile(
+        self,
+        *,
+        chunks=None,
+        array_backend=None,
+        convert_terms=True,
+        contraction_opt="auto-hq",
+        expression_opts=None,
+    ):
+        """Compile static contraction expressions for configured local cones."""
+        chunks = self._chunks_for_backend(
+            chunks=chunks if chunks is not None else self.chunks,
+            array_backend=array_backend,
+            convert_terms=convert_terms,
+        )
+        self.chunks = chunks
+        self.compiled_chunks = self.builder.compile_parametric_lightcones(
+            schedule=self.schedule,
+            chunks=chunks,
+            array_backend=array_backend,
+            convert_terms=convert_terms,
+            contraction_opt=contraction_opt,
+            expression_opts=expression_opts,
+        )
+        return self.compiled_chunks
+
+    def compiled_loss(self, parameters=None, **kwargs):
+        """Evaluate loss with precompiled local-cone contraction expressions."""
+        params = self.parameters if parameters is None else parameters
+        opts = self._merge_opts(self.loss_kwargs, kwargs)
+        compiled_chunks = opts.pop("compiled_chunks", self.compiled_chunks)
+        if compiled_chunks is None:
+            compiled_chunks = self.compile(
+                chunks=opts.get("chunks", self.chunks),
+                array_backend=opts.get("array_backend"),
+                convert_terms=opts.get("convert_terms", True),
+                contraction_opt=opts.get("contraction_opt", "auto-hq"),
+                expression_opts=opts.get("expression_opts"),
+            )
+        return self.builder.compiled_parametric_loss(
+            params,
+            self.hamiltonian,
+            schedule=self.schedule,
+            chunks=opts.pop("chunks", self.chunks),
+            compiled_chunks=compiled_chunks,
+            **opts,
+        )
+
+    def compiled_loss_fn(self, **kwargs):
+        """Return a pure compiled ``loss(params) -> scalar`` callable."""
+
+        def _loss(parameters):
+            return self.compiled_loss(parameters, **kwargs)
+
+        return _loss
+
     def run(
         self,
         params_init=None,
@@ -139,6 +196,8 @@ class QMeraParametricEnergyOptimizer:
         progress: bool = False,
         desc: str | None = None,
         progress_callback=None,
+        compiled: bool = False,
+        expression_opts=None,
         **loss_kwargs,
     ):
         """Optimize parameters with :class:`pepsy.solvers.GradientOptimizer`."""
@@ -163,6 +222,16 @@ class QMeraParametricEnergyOptimizer:
             convert_terms=opts.get("convert_terms", True),
         )
         opts["chunks"] = chunks
+        if compiled:
+            self.compiled_chunks = self.builder.compile_parametric_lightcones(
+                schedule=self.schedule,
+                chunks=chunks,
+                array_backend=array_backend,
+                convert_terms=opts.get("convert_terms", True),
+                contraction_opt=opts.get("contraction_opt", "auto-hq"),
+                expression_opts=expression_opts,
+            )
+            opts["compiled_chunks"] = self.compiled_chunks
 
         runner = GradientOptimizer(
             solver=solver,
@@ -174,7 +243,7 @@ class QMeraParametricEnergyOptimizer:
         )
         result = runner.run(
             params_init=params,
-            loss_fn=self.loss_fn(**opts),
+            loss_fn=self.compiled_loss_fn(**opts) if compiled else self.loss_fn(**opts),
             progress_callback=progress_callback,
         )
         self.result = result
