@@ -204,15 +204,35 @@ def test_qmera_schedule_has_disentangler_and_isometry_blocks():
     assert isinstance(schedule.disentangler, QMeraBlockSpec)
     assert first.input_sites == tuple(range(8))
     assert first.output_sites == (0, 2, 4, 6)
+    assert first.isometry_blocks == ((0, 1), (2, 3), (4, 5), (6, 7))
+    assert first.disentangler_blocks == ((1, 2), (3, 4), (5, 6))
     assert first.disentanglers
     assert first.isometries
     assert first.disentanglers[0].stage == "disentangler"
     assert first.isometries[0].stage == "isometry"
+    assert first.disentanglers[0].where == (1, 2)
+    assert first.isometries[0].where == (0, 1)
     assert first.disentanglers[0].gate_family == "rxx"
     assert first.isometries[0].gate_family == "rzz"
     assert "DISENTANGLER" in first.disentanglers[0].tags
     assert "ISOMETRY" in first.isometries[0].tags
     assert schedule.top_sites == (0,)
+    assert schedule.num_scales == 3
+
+
+def test_qmera_periodic_schedule_wraps_boundary_disentangler():
+    """Periodic 1D schedules should connect the last and first isometry blocks."""
+    builder = QMeraBuilder(
+        shape=8,
+        boundary="periodic",
+        disentangler={"block_size": 2, "circuit_depth": 1},
+        isometry={"block_size": 2, "circuit_depth": 1},
+    )
+
+    first = builder.build_schedule().layers[0]
+
+    assert first.disentangler_blocks[-1] == (7, 0)
+    assert first.disentanglers[-1].where == (7, 0)
 
 
 def test_qmera_gate_registry_generates_parametrized_two_qubit_gates():
@@ -295,6 +315,10 @@ def test_qmera_schematic_blocks_group_disentanglers_and_isometries():
     assert {block.stage for block in blocks} == {"disentangler", "isometry"}
     assert {block.stage_label for block in blocks} == {"D", "W"}
     assert any(block.register_sites == (0, 1, 2, 3) for block in blocks)
+    assert any(
+        block.stage == "disentangler" and block.register_sites == (2, 3, 4, 5)
+        for block in blocks
+    )
     assert any(block.round == 1 for block in blocks if block.stage == "disentangler")
 
 

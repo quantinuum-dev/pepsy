@@ -71,9 +71,11 @@ change or API decision.
   lattice shape, boundary conditions, site labels, optional 1D mapper, and local
   terms. Accept `{where_tuple: operator}` or iterable `(where_tuple, operator)`
   pairs as the canonical first term format.
-- Design disentangler and isometry blocks separately. The builder should expose
-  block size, gate depth, and local circuit structure for each kind of block;
-  assume two-qubit gates by default, with optional one-qubit rotations.
+- Design disentangler and isometry blocks separately and in RG order. At each
+  bottom-to-top scale, isometry blocks form a non-overlapping covering
+  partition of the active lattice/register, while disentangler blocks are
+  shifted boundary windows connecting neighboring isometry blocks before
+  coarse-graining.
 - Make circuit gate families explicit and fully parametrized. Spin gates from
   Pepsy/quimb (`U3`, `SU4`, `RXX`, `RYY`, `RZZ`, etc.), Pepsy symmetric
   Fermi-Hubbard streams, and user-defined two-qubit gates should flow through a

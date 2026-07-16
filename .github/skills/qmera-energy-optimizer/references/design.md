@@ -219,7 +219,19 @@ convention in ansatz metadata and energy diagnostics.
 
 ## Disentangler and Isometry Blocks
 
-Design disentanglers and isometries as separate schedule families:
+Design disentanglers and isometries as separate schedule families in the actual
+RG order. The schedule is not a generic brickwall circuit over all active
+sites. At each scale:
+
+1. partition active sites into non-overlapping isometry blocks;
+2. form shifted boundary windows between neighboring isometry blocks;
+3. place disentangler circuit layers on those boundary windows;
+4. place isometry circuit layers inside each isometry block;
+5. ascend one representative or output site per isometry block.
+
+Thus isometry blocks cover the active lattice/register, while disentangler
+blocks connect the boundaries of those blocks. This is the structural reason
+local lightcones remain bounded.
 
 ```python
 QMeraBlockSpec(
@@ -235,14 +247,26 @@ Default assumptions:
 
 - gates inside a block are two-qubit gates;
 - optional one-qubit rotations may be inserted before/after two-qubit layers;
-- disentanglers preserve the number of active sites;
-- isometry blocks coarse-grain active sites to fewer upper sites;
-- each MERA scale has a disentangler stage followed by an isometry stage;
+- disentanglers preserve the active site set and straddle isometry-block
+  boundaries;
+- isometry blocks are non-overlapping and coarse-grain active sites to fewer
+  upper sites;
+- each MERA scale has boundary disentangler stages followed by covering
+  isometry stages;
 - the builder repeats scales until a cap/top tensor is reached.
 
 The depth of the local circuit inside a disentangler block and the depth inside
 an isometry block should be independent parameters. For example, a user should
 be able to set `disentangler_depth=4` and `isometry_depth=2`.
+
+For 1D binary/q-ary MERA, the number of RG scales should be
+`ceil(log_q(L / top_size))`, up to finite-size edge handling. For 2D qMERA, the
+scale count should follow the spatial side-length reduction, e.g.
+`O(log(Lx))` for square systems, with x/y or block-local coarse-graining
+substeps at each scale. The prototype in `~/mera` uses this style: functions
+like `iso_(...)` form covering blocks, `uni_(...)` forms shifted/wrapped
+boundary blocks, and 2D builders alternate horizontal/vertical unitary and
+isometry sublayers before capping.
 
 For dense MERA, block tensors can be direct quimb isometries. For qMERA, dense
 blocks are replaced by local parameterized circuit layers whose contraction
@@ -518,6 +542,8 @@ Keep qMERA construction out of the energy optimizer. A builder should expose:
 - disentangler block size and depth;
 - isometry block size and depth;
 - structure: `"brickwall"` first, then `"ladder"` or `"tree"` if needed;
+- non-overlapping isometry block partitions per scale;
+- boundary disentangler windows derived from adjacent isometry blocks;
 - gate set/family: spin or fermionic, fully parameterized;
 - user-defined two-qubit gate family hooks;
 - fermion convention and validation policy;

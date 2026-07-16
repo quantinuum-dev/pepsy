@@ -1,4 +1,10 @@
-"""qMERA block schedules and reverse-lightcone metadata."""
+"""qMERA RG schedules and reverse-lightcone metadata.
+
+The schedule grammar is bottom-to-top MERA-like rather than a generic brickwall
+circuit: isometry blocks form a non-overlapping covering partition of active
+sites, and disentangler blocks are boundary windows between adjacent isometry
+blocks.
+"""
 
 from __future__ import annotations
 
@@ -85,11 +91,13 @@ class QMeraGatePlacement:
 
 @dataclass(frozen=True)
 class QMeraLayerSpec:
-    """One MERA scale with disentangler and isometry stages."""
+    """One MERA scale with boundary disentanglers and covering isometries."""
 
     scale: int
     input_sites: tuple[int, ...]
     output_sites: tuple[int, ...]
+    disentangler_blocks: tuple[tuple[int, ...], ...]
+    isometry_blocks: tuple[tuple[int, ...], ...]
     disentanglers: tuple[QMeraGatePlacement, ...]
     isometries: tuple[QMeraGatePlacement, ...]
 
@@ -123,6 +131,11 @@ class QMeraSchedule:
     def num_gates(self):
         """Number of scheduled parametrized gates."""
         return len(self.placements)
+
+    @property
+    def num_scales(self):
+        """Number of bottom-to-top RG scales."""
+        return len(self.layers)
 
     def placements_by_id(self):
         """Return a mapping from gate id to placement."""
@@ -169,11 +182,47 @@ class QMeraSchedule:
         return draw_qmera_schedule(self, layer=layer, **kwargs)
 
 
-def _block_ranges(active, block_size):
-    for start in range(0, len(active), block_size):
-        block = tuple(active[start : start + block_size])
+def _nonoverlapping_blocks(active, block_size):
+    return tuple(
+        tuple(active[start : start + block_size])
+        for start in range(0, len(active), block_size)
+        if active[start : start + block_size]
+    )
+
+
+def _placement_blocks(blocks):
+    return tuple(block for block in blocks if len(block) >= 2)
+
+
+def _boundary_window(left_block, right_block, width):
+    left_count = min(len(left_block), max(1, width // 2))
+    right_count = min(len(right_block), max(1, width - left_count))
+    return tuple(left_block[-left_count:] + right_block[:right_count])
+
+
+def _boundary_blocks(isometry_blocks, disentangler_block_size, *, periodic=False):
+    if len(isometry_blocks) < 2:
+        return ()
+
+    blocks = [
+        _boundary_window(left, right, disentangler_block_size)
+        for left, right in zip(isometry_blocks, isometry_blocks[1:])
+    ]
+    if periodic and len(isometry_blocks) > 2:
+        blocks.append(
+            _boundary_window(
+                isometry_blocks[-1],
+                isometry_blocks[0],
+                disentangler_block_size,
+            )
+        )
+    return tuple(block for block in blocks if len(block) >= 2)
+
+
+def _block_ranges(blocks):
+    for block_index, block in enumerate(blocks):
         if len(block) >= 2:
-            yield start // block_size, block
+            yield block_index, block
 
 
 def _pairs_for_round(block, round_index, *, periodic=False):
@@ -202,21 +251,19 @@ def _placement_tags(gate_id, *, scale, stage, round_index, block, gate_family):
 
 
 def _stage_placements(
-    active,
+    blocks,
     *,
     scale,
     stage_spec,
     counter_start,
-    boundary,
 ):
     placements = []
     counter = counter_start
     stage = stage_spec.kind
     short = "DIS" if stage == "disentangler" else "ISO"
-    periodic = boundary == "periodic"
     for round_index in range(stage_spec.circuit_depth):
-        for block_index, block in _block_ranges(active, stage_spec.block_size):
-            for pair in _pairs_for_round(block, round_index, periodic=periodic):
+        for block_index, block in _block_ranges(blocks):
+            for pair in _pairs_for_round(block, round_index, periodic=False):
                 gate_id = f"L{scale}_{short}_{counter:04d}"
                 placements.append(
                     QMeraGatePlacement(
@@ -242,13 +289,8 @@ def _stage_placements(
     return tuple(placements), counter
 
 
-def _coarse_grain(active, block_size):
-    outputs = []
-    for start in range(0, len(active), block_size):
-        block = tuple(active[start : start + block_size])
-        if block:
-            outputs.append(block[0])
-    return tuple(outputs)
+def _coarse_grain(isometry_blocks):
+    return tuple(block[0] for block in isometry_blocks if block)
 
 
 def build_qmera_schedule(
@@ -288,21 +330,25 @@ def build_qmera_schedule(
     gate_counter = 0
     scale = 0
     while len(active) > top_size and (max_layers is None or scale < max_layers):
+        isometry_blocks = _nonoverlapping_blocks(active, isometry.block_size)
+        disentangler_blocks = _boundary_blocks(
+            isometry_blocks,
+            disentangler.block_size,
+            periodic=geometry.boundary == "periodic",
+        )
         dis, gate_counter = _stage_placements(
-            active,
+            disentangler_blocks,
             scale=scale,
             stage_spec=disentangler,
             counter_start=gate_counter,
-            boundary=geometry.boundary,
         )
         iso, gate_counter = _stage_placements(
-            active,
+            _placement_blocks(isometry_blocks),
             scale=scale,
             stage_spec=isometry,
             counter_start=gate_counter,
-            boundary=geometry.boundary,
         )
-        output_sites = _coarse_grain(active, isometry.block_size)
+        output_sites = _coarse_grain(isometry_blocks)
         if output_sites == active:
             break
         layers.append(
@@ -310,6 +356,8 @@ def build_qmera_schedule(
                 scale=scale,
                 input_sites=active,
                 output_sites=output_sites,
+                disentangler_blocks=disentangler_blocks,
+                isometry_blocks=isometry_blocks,
                 disentanglers=dis,
                 isometries=iso,
             )
