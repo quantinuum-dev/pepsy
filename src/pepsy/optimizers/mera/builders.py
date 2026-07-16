@@ -9,7 +9,13 @@ from typing import Any
 import numpy as np
 import quimb.tensor as qtn
 
-from ...backends import get_default_array_backend, get_default_grad_backend
+from ...backends import (
+    backend_jax,
+    backend_numpy,
+    backend_torch,
+    get_default_array_backend,
+    get_default_grad_backend,
+)
 from .gates import GateRegistry, default_gate_registry, resolve_gate_spec
 from .geometry import QMeraGeometry
 from .lightcones import (
@@ -20,6 +26,21 @@ from .schedules import QMeraBlockSpec, QMeraSchedule, build_qmera_schedule
 from .terms import convert_local_terms, normalize_local_terms
 
 __all__ = ["QMeraAnsatz", "QMeraBuilder"]
+
+
+def _backend_from_name(backend, *, trainable=True, dtype=None, device="cpu"):
+    if backend is None or callable(backend):
+        return backend
+    key = str(backend).strip().lower().replace("_", "-")
+    if key in {"torch", "pytorch"}:
+        return backend_torch(device=device, dtype=dtype, requires_grad=bool(trainable))
+    if key == "jax":
+        return backend_jax(device=device, dtype=dtype)
+    if key in {"numpy", "np"}:
+        return backend_numpy(dtype=np.float64 if dtype is None else dtype)
+    raise ValueError(
+        "backend must be a callable, None, or one of 'torch', 'jax', or 'numpy'."
+    )
 
 
 @dataclass(frozen=True)
@@ -172,6 +193,7 @@ class QMeraBuilder:
         *,
         chunks=None,
         array_backend=None,
+        gate_array_backend=None,
         convert_terms=True,
         normalized=True,
         energy_per_site=True,
@@ -191,6 +213,7 @@ class QMeraBuilder:
             chunks=chunks,
             gate_registry=self.gate_registry,
             array_backend=backend,
+            gate_array_backend=gate_array_backend,
             convert_terms=convert_terms,
             physical_dim=self.physical_dim,
             optimize=contraction_opt,
@@ -229,6 +252,90 @@ class QMeraBuilder:
                 values = rng.normal(scale=scale, size=(spec.num_params,))
             params[placement.param_key] = values if converter is None else converter(values)
         return params
+
+    def cast_params(
+        self,
+        values,
+        *,
+        trainable: bool = True,
+        backend=None,
+        dtype=None,
+        device="cpu",
+        stop_grad_fn=None,
+    ):
+        """Cast a parameter dictionary to a Pepsy-supported backend."""
+        if backend is None:
+            converter = self._parameter_converter() if trainable else self.array_backend
+        else:
+            converter = _backend_from_name(
+                backend,
+                trainable=trainable,
+                dtype=dtype,
+                device=device,
+            )
+        if converter is None:
+            return dict(values)
+        out = {}
+        for key, value in values.items():
+            if stop_grad_fn is not None:
+                value = stop_grad_fn(value)
+            out[key] = converter(value)
+        return out
+
+    cast_parameters = cast_params
+
+    def parametric_loss_fn(
+        self,
+        hamiltonian=None,
+        schedule=None,
+        *,
+        chunks=None,
+        **loss_kwargs,
+    ):
+        """Return a pure ``loss(params)`` callable for qMERA parameters."""
+        schedule = self.build_schedule() if schedule is None else schedule
+
+        def _loss(parameters):
+            return self.parametric_loss(
+                parameters,
+                hamiltonian=hamiltonian,
+                schedule=schedule,
+                chunks=chunks,
+                **loss_kwargs,
+            )
+
+        return _loss
+
+    def parametric_optimizer(
+        self,
+        hamiltonian,
+        *,
+        schedule=None,
+        chunks=None,
+        parameters=None,
+        **loss_kwargs,
+    ):
+        """Create a parameter-dict qMERA energy optimizer shell."""
+        from .parametric import QMeraParametricEnergyOptimizer
+
+        schedule = self.build_schedule() if schedule is None else schedule
+        if chunks is None:
+            chunks = self.parametric_lightcone_chunks(
+                hamiltonian,
+                schedule,
+                array_backend=loss_kwargs.get("array_backend"),
+                convert_terms=loss_kwargs.get("convert_terms", True),
+            )
+        if parameters is None:
+            parameters = self.initialize_parameters(schedule)
+        return QMeraParametricEnergyOptimizer(
+            builder=self,
+            schedule=schedule,
+            hamiltonian=hamiltonian,
+            chunks=chunks,
+            parameters=parameters,
+            loss_kwargs=loss_kwargs,
+        )
 
     def gate_tensors(self, parameters, schedule=None):
         """Generate gate tensors for every scheduled placement."""

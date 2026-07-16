@@ -13,6 +13,7 @@ from pepsy.optimizers.mera import (
     QMeraBuilder,
     QMeraGeometry,
     QMeraSchematicBlock,
+    QMeraParametricEnergyOptimizer,
     QMeraParametricLightconeChunk,
     UserGateFamily,
     build_lightcone_chunks,
@@ -514,6 +515,69 @@ def test_qmera_parametric_loss_reports_missing_gate_parameter():
             schedule=schedule,
             energy_per_site=False,
         )
+
+
+def test_qmera_builder_cast_params_to_torch_backend():
+    """qMERA parameter dicts should cast through Pepsy backend helpers."""
+    torch = pytest.importorskip("torch")
+    builder = QMeraBuilder(shape=4)
+    params = {"theta": np.array([0.25], dtype=np.float64)}
+
+    trainable = builder.cast_params(
+        params,
+        backend="torch",
+        trainable=True,
+        dtype=torch.float64,
+    )
+    frozen = builder.cast_params(
+        params,
+        backend="torch",
+        trainable=False,
+        dtype=torch.float64,
+    )
+
+    assert isinstance(trainable["theta"], torch.Tensor)
+    assert trainable["theta"].requires_grad
+    assert trainable["theta"].dtype == torch.float64
+    assert not frozen["theta"].requires_grad
+
+
+def test_qmera_parametric_optimizer_runs_torch_solver():
+    """The parametric optimizer shell should expose loss(params) to solvers."""
+    pytest.importorskip("torch")
+    builder = QMeraBuilder(
+        shape=4,
+        gate_family="rxx",
+        isometry_gate_family="rzz",
+        seed=33,
+        param_scale=0.1,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    opt = builder.parametric_optimizer(
+        {(0, 1): _zz_term()},
+        schedule=schedule,
+        parameters=params,
+        energy_per_site=False,
+        real=True,
+        contraction_opt="auto-hq",
+    )
+
+    initial = opt.loss_fn()(params)
+    result = opt.run(
+        solver="torch-adam",
+        n_steps=2,
+        log_every=1,
+        options={"lr": 0.05},
+    )
+
+    assert isinstance(opt, QMeraParametricEnergyOptimizer)
+    assert np.isfinite(float(initial))
+    assert result.solver == "torch-adam"
+    assert len(result.history) == 2
+    assert result.history[-1] <= result.history[0]
+    assert opt.losses == result.history
+    assert set(result.params) == set(params)
 
 
 def test_qmera_2d_builder_outputs_direct_gate_tensor_network():

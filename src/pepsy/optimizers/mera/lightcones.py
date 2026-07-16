@@ -332,6 +332,7 @@ def qmera_parametric_lightcone_state(
     *,
     gate_registry=None,
     array_backend=None,
+    gate_array_backend=None,
     physical_dim=2,
     contract=False,
 ):
@@ -350,7 +351,7 @@ def qmera_parametric_lightcone_state(
             placement,
             parameters,
             gate_registry=gate_registry,
-            array_backend=array_backend,
+            array_backend=gate_array_backend,
         )
         state = state.gate_inds(
             gate,
@@ -369,6 +370,7 @@ def local_qmera_parametric_lightcone_expectation(
     *,
     gate_registry=None,
     array_backend=None,
+    gate_array_backend=None,
     physical_dim=2,
     optimize="auto-hq",
     normalized=True,
@@ -384,6 +386,7 @@ def local_qmera_parametric_lightcone_expectation(
         parameters,
         gate_registry=gate_registry,
         array_backend=array_backend,
+        gate_array_backend=gate_array_backend,
         physical_dim=physical_dim,
         contract=False,
     )
@@ -421,6 +424,7 @@ def qmera_parametric_energy(
     chunks=None,
     gate_registry=None,
     array_backend=None,
+    gate_array_backend=None,
     convert_terms=True,
     physical_dim=2,
     optimize="auto-hq",
@@ -448,6 +452,7 @@ def qmera_parametric_energy(
             parameters,
             gate_registry=gate_registry,
             array_backend=array_backend,
+            gate_array_backend=gate_array_backend,
             physical_dim=physical_dim,
             optimize=optimize,
             normalized=normalized,

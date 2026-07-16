@@ -23,6 +23,7 @@ from .lightcones import (
     site_tags_for_where,
 )
 from .optimizer import MeraEnergyOptimizer
+from .parametric import QMeraParametricEnergyOptimizer
 from .schedules import (
     QMeraBlockSpec,
     QMeraGatePlacement,
@@ -50,6 +51,7 @@ __all__ = [
     "QMeraGeometry",
     "QMeraLayerSpec",
     "QMeraParametricLightconeChunk",
+    "QMeraParametricEnergyOptimizer",
     "QMeraSchedule",
     "QMeraSchematicBlock",
     "UserGateFamily",
