@@ -363,7 +363,14 @@ def _placements_by_id(schedule):
     return by_id if isinstance(by_id, dict) else dict(by_id)
 
 
-def _gate_for_placement(placement, parameters, *, gate_registry, array_backend=None):
+def _gate_for_placement(
+    placement,
+    parameters,
+    *,
+    gate_registry,
+    array_backend=None,
+    schedule=None,
+):
     try:
         params = parameters[placement.param_key]
     except KeyError as exc:
@@ -377,7 +384,12 @@ def _gate_for_placement(placement, parameters, *, gate_registry, array_backend=N
             f"Gate family {spec.name!r} has arity {spec.arity}, "
             f"but placement {placement.gate_id} acts on {placement.arity} sites."
         )
-    return spec.matrix(params, array_backend=array_backend)
+    return spec.matrix_for_placement(
+        params,
+        placement=placement,
+        schedule=schedule,
+        array_backend=array_backend,
+    )
 
 
 def qmera_parametric_lightcone_state(
@@ -410,6 +422,7 @@ def qmera_parametric_lightcone_state(
             parameters,
             gate_registry=gate_registry,
             array_backend=gate_array_backend,
+            schedule=schedule,
         )
         state = state.gate_inds(
             gate,

@@ -11,6 +11,7 @@ from .compiled import (
 from .fermions import (
     QMeraSymmrayFermionBackend,
     qmera_symmray_fermi_hubbard_terms,
+    symmray_fermion_gate_registry,
 )
 from .gates import (
     GateRegistry,
@@ -94,4 +95,5 @@ __all__ = [
     "resolve_gate_spec",
     "select_lightcone",
     "site_tags_for_where",
+    "symmray_fermion_gate_registry",
 ]

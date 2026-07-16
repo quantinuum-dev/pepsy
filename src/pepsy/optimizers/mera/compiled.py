@@ -114,6 +114,7 @@ def _static_lightcone_state(
             params,
             gate_registry=gate_registry,
             array_backend=None,
+            schedule=schedule,
         )
         state = state.gate_inds(
             gate,
@@ -255,6 +256,7 @@ def _placement_gates(schedule, compiled, parameters, *, gate_registry, gate_arra
             parameters,
             gate_registry=gate_registry,
             array_backend=gate_array_backend,
+            schedule=schedule,
         )
     return gates
 

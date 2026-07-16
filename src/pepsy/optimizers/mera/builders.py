@@ -509,8 +509,10 @@ class QMeraBuilder:
                     f"Gate family {spec.name!r} has arity {spec.arity}, "
                     f"but placement {placement.gate_id} acts on {placement.arity} sites."
                 )
-            tensors[placement.gate_id] = spec.matrix(
+            tensors[placement.gate_id] = spec.matrix_for_placement(
                 parameters[placement.param_key],
+                placement=placement,
+                schedule=schedule,
                 array_backend=self.array_backend,
             )
         return tensors
@@ -537,14 +539,23 @@ class QMeraBuilder:
                 array_backend=self.array_backend,
             )
         for placement in schedule.placements:
-            state = state.gate(
-                tensors[placement.gate_id],
-                placement.where,
-                contract=contract,
-                tags=placement.tags,
-                propagate_tags="sites",
-                inplace=False,
-            )
+            if callable(getattr(state, "gate", None)):
+                state = state.gate(
+                    tensors[placement.gate_id],
+                    placement.where,
+                    contract=contract,
+                    tags=placement.tags,
+                    propagate_tags="sites",
+                    inplace=False,
+                )
+            else:
+                state = state.gate_inds(
+                    tensors[placement.gate_id],
+                    inds=tuple(f"k{site}" for site in placement.where),
+                    contract=contract,
+                    tags=placement.tags,
+                    inplace=False,
+                )
         return state, tensors
 
     def build(self, parameters=None, *, build_state=True, contract=False):

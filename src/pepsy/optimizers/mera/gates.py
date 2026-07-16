@@ -88,6 +88,7 @@ class GateSpec:
     arity_kind: str = "qubit"
     preserves_parity: bool | None = None
     mode_order: str | None = None
+    contextual_generator: Callable[..., Any] | None = None
 
     def __post_init__(self):
         arity = int(self.arity)
@@ -122,8 +123,32 @@ class GateSpec:
 
     def matrix(self, params=None, *, array_backend=None):
         """Generate a backend-compatible gate tensor."""
+        if self.contextual_generator is not None:
+            raise ValueError(
+                f"Gate family {self.name!r} requires placement context; use "
+                "matrix_for_placement(..., placement=..., schedule=...)."
+            )
         gate = self.generator(self.parameters(params))
         return _convert_array(gate, array_backend)
+
+    def matrix_for_placement(
+        self,
+        params=None,
+        *,
+        placement=None,
+        schedule=None,
+        array_backend=None,
+    ):
+        """Generate a gate tensor, optionally using placement context."""
+        params = self.parameters(params)
+        if self.contextual_generator is None:
+            return _convert_array(self.generator(params), array_backend)
+        return self.contextual_generator(
+            params,
+            placement=placement,
+            schedule=schedule,
+            array_backend=array_backend,
+        )
 
 
 @dataclass(frozen=True)
@@ -140,6 +165,7 @@ class UserGateFamily:
     arity_kind: str = "qubit"
     preserves_parity: bool | None = None
     mode_order: str | None = None
+    contextual_generator: Callable[..., Any] | None = None
 
     def to_gate_spec(self):
         """Convert to a registry-ready :class:`GateSpec`."""
@@ -154,6 +180,7 @@ class UserGateFamily:
             arity_kind=self.arity_kind,
             preserves_parity=self.preserves_parity,
             mode_order=self.mode_order,
+            contextual_generator=self.contextual_generator,
         )
 
 

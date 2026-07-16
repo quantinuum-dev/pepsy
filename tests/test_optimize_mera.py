@@ -36,6 +36,7 @@ from pepsy.optimizers.mera import (
     qmera_parametric_lightcone_tn,
     qmera_schematic_blocks,
     qmera_symmray_fermi_hubbard_terms,
+    symmray_fermion_gate_registry,
 )
 from pepsy.optimizers.mera.optimizer import (
     MeraEnergyOptimizer as ModuleMeraEnergyOptimizer,
@@ -374,6 +375,97 @@ def test_qmera_symmray_fermion_backend_builds_native_hubbard_terms():
     assert terms[-1].where == ((1, "down"), (2, "down"))
     with pytest.raises(ValueError, match="spin-changing"):
         backend.hopping_operator((0, "up"), (0, "down"))
+
+
+def test_qmera_symmray_fsim_runs_full_fermionic_lightcone():
+    """Symmray qMERA gates, state, and terms should share one fermion path."""
+    pytest.importorskip("symmray")
+    backend = QMeraSymmrayFermionBackend()
+    registry = symmray_fermion_gate_registry(backend=backend)
+    spec = registry.get("symmray-fsim")
+
+    assert spec.is_fermionic
+    assert spec.arity_kind == "mode"
+    assert spec.preserves_parity is True
+    with pytest.raises(ValueError, match="placement context"):
+        spec.matrix([0.0, 0.0])
+
+    builder = QMeraBuilder(
+        shape=2,
+        site_modes=backend.site_modes,
+        mode_order="mode-major",
+        disentangler={"block_size": 2, "circuit_depth": 0},
+        isometry={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        gate_registry=registry,
+        max_layers=1,
+        seed=43,
+        param_scale=0.05,
+        product_state_factory=backend.product_state,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    gate_tensors = builder.gate_tensors(params, schedule)
+    ansatz = builder.build(params)
+    terms = backend.fermi_hubbard_terms(
+        schedule.geometry,
+        t=0.5,
+        U=0.0,
+        mu=0.0,
+    )
+    chunks = build_qmera_parametric_lightcone_chunks(schedule, terms[:1])
+    lightcone = builder.parametric_lightcone_tn(
+        chunks[0],
+        params,
+        schedule=schedule,
+    )
+    value = contract_qmera_lightcone_tn(
+        lightcone,
+        optimize="auto-hq",
+        real=False,
+    )
+
+    assert schedule.geometry.register_to_mode == (
+        (0, "up"),
+        (1, "up"),
+        (0, "down"),
+        (1, "down"),
+    )
+    assert schedule.layers[0].isometries[0].where == (0, 1)
+    assert all(
+        "FermionicArray" in type(gate).__name__
+        for gate in gate_tensors.values()
+    )
+    assert all(
+        "FermionicArray" in type(tensor.data).__name__
+        for tensor in ansatz.state
+    )
+    assert chunks[0].term.where == (0, 1)
+    assert all(
+        "FermionicArray" in type(tensor.data).__name__
+        for tensor in lightcone.ket
+    )
+    assert complex(value) == pytest.approx(0.0)
+
+    bad_builder = QMeraBuilder(
+        shape=1,
+        site_modes=backend.site_modes,
+        gate_registry=registry,
+        isometry={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        max_layers=1,
+    )
+    with pytest.raises(ValueError, match="spin-changing"):
+        bad_builder.gate_tensors(
+            bad_builder.initialize_parameters(),
+            bad_builder.build_schedule(),
+        )
 
 
 def test_qmera_symmray_fermion_lightcone_contracts_native_term():

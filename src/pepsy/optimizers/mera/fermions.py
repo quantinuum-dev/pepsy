@@ -9,11 +9,14 @@ from typing import Any
 import numpy as np
 import quimb.tensor as qtn
 
+from ...operators import fsim as dense_fsim
+from .gates import GateSpec, default_gate_registry
 from .terms import LocalTerm
 
 __all__ = [
     "QMeraSymmrayFermionBackend",
     "qmera_symmray_fermi_hubbard_terms",
+    "symmray_fermion_gate_registry",
 ]
 
 
@@ -215,6 +218,38 @@ class QMeraSymmrayFermionBackend:
         )
         return _apply_to_array_blocks(array, self.to_backend)
 
+    def operator_from_dense(self, array, mode_labels):
+        """Convert a dense local mode operator to a Symmray fermionic array."""
+        sr = _require_symmray()
+        mode_labels = tuple(mode_labels)
+        if not mode_labels:
+            raise ValueError("mode_labels must not be empty.")
+        arr = np.asarray(array, dtype=self.dtype)
+        if arr.ndim == 2:
+            dim = 2 ** len(mode_labels)
+            if arr.shape != (dim, dim):
+                raise ValueError(
+                    f"dense operator shape {arr.shape} does not match "
+                    f"{len(mode_labels)} two-state modes."
+                )
+            arr = arr.reshape((2,) * (2 * len(mode_labels)))
+        expected = (2,) * (2 * len(mode_labels))
+        if tuple(arr.shape) != expected:
+            raise ValueError(
+                f"dense operator shape {arr.shape} does not match expected {expected}."
+            )
+        index_maps = [self.mode_index_map(mode) for mode in mode_labels]
+        array = sr.utils.from_dense(
+            arr,
+            self.symmetry,
+            index_maps=index_maps * 2,
+            duals=[False] * len(mode_labels) + [True] * len(mode_labels),
+            fermionic=True,
+            charge=self.zero_charge,
+            flat=self.flat,
+        )
+        return _apply_to_array_blocks(array, self.to_backend)
+
     def number_operator(self, mode_label, *, coefficient=1.0):
         """Return ``coefficient * n`` for one fermionic mode."""
         return self._fermionic_operator(
@@ -231,11 +266,7 @@ class QMeraSymmrayFermionBackend:
 
     def hopping_operator(self, left_mode, right_mode, *, t=1.0, peierls_angle=0.0):
         """Return native fermionic ``-t c_l^dag c_r + h.c.`` on two modes."""
-        if self.mode_index_map(left_mode) != self.mode_index_map(right_mode):
-            raise ValueError(
-                "hopping_operator requires two modes with matching charge maps; "
-                "spin-changing hopping is not neutral in this backend."
-            )
+        self._require_matching_mode_maps(left_mode, right_mode, name="hopping_operator")
         phase = np.exp(1.0j * peierls_angle)
         phase_conj = np.conjugate(phase)
         return self._fermionic_operator(
@@ -245,6 +276,18 @@ class QMeraSymmrayFermionBackend:
             ),
             (left_mode, right_mode),
         )
+
+    def fsim_gate(self, left_mode, right_mode, *, theta=0.0, phi=0.0):
+        """Return a native Symmray fermionic fSim gate for two like modes."""
+        self._require_matching_mode_maps(left_mode, right_mode, name="fsim_gate")
+        return self.operator_from_dense(dense_fsim((theta, phi)), (left_mode, right_mode))
+
+    def _require_matching_mode_maps(self, left_mode, right_mode, *, name):
+        if self.mode_index_map(left_mode) != self.mode_index_map(right_mode):
+            raise ValueError(
+                f"{name} requires two modes with matching charge maps; "
+                "spin-changing operations are not neutral in this backend."
+            )
 
     def fermi_hubbard_terms(
         self,
@@ -355,3 +398,44 @@ def qmera_symmray_fermi_hubbard_terms(geometry, **kwargs):
             site_modes=tuple(geometry.site_modes or ("up", "down"))
         )
     return backend.fermi_hubbard_terms(geometry, **kwargs)
+
+
+def _null_context_gate(_params):
+    raise ValueError("This qMERA gate family requires placement context.")
+
+
+def symmray_fermion_gate_registry(backend=None, *, base_registry=None):
+    """Return a qMERA gate registry with Symmray-native fermionic gates."""
+    backend = QMeraSymmrayFermionBackend() if backend is None else backend
+    registry = (
+        default_gate_registry()
+        if base_registry is None
+        else base_registry.copy()
+    )
+
+    def fsim_context(params, *, placement=None, schedule=None, array_backend=None):
+        _ = array_backend
+        if placement is None or schedule is None:
+            raise ValueError("symmray-fsim requires qMERA placement and schedule.")
+        left, right = (
+            schedule.geometry.to_mode(register_site)
+            for register_site in placement.where
+        )
+        return backend.fsim_gate(left, right, theta=params[0], phi=params[1])
+
+    registry.register(
+        GateSpec(
+            "symmray-fsim",
+            2,
+            2,
+            _null_context_gate,
+            family="fermion",
+            convention="symmray-fermionic-mode",
+            default_tags=("SYMMRAY_FSIM", "FSIM"),
+            arity_kind="mode",
+            preserves_parity=True,
+            mode_order="register",
+            contextual_generator=fsim_context,
+        )
+    )
+    return registry
