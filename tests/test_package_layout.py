@@ -15,13 +15,19 @@ from pepsy.boundary import (
 )
 from pepsy.operators import gate, rx
 from pepsy.optimizers import (
+    MeraEnergyOptimizer,
     MpsEnergyOptimizer,
     MpsOptimizer,
     PepsEnergyOptimizer,
     PepsOptimizer,
+    QMeraBuilder,
+    QMeraGeometry,
+    QMeraParametricEnergyOptimizer,
     SimpleUpdateGen,
     SymDMRG2,
     SweepOptimizer,
+    build_qmera_contraction_optimizer,
+    mera as mera_module,
 )
 from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
@@ -79,9 +85,15 @@ def test_new_namespace_imports_resolve():
     assert callable(gate)
     assert callable(rx)
     assert MpsOptimizer is not None
+    assert MeraEnergyOptimizer is not None
     assert MpsEnergyOptimizer is not None
     assert PepsEnergyOptimizer is not None
     assert PepsOptimizer is not None
+    assert QMeraBuilder is not None
+    assert QMeraGeometry is not None
+    assert QMeraParametricEnergyOptimizer is not None
+    assert callable(build_qmera_contraction_optimizer)
+    assert mera_module is not None
     assert SimpleUpdateGen is not None
     assert SymDMRG2 is not None
     assert SweepOptimizer is not None

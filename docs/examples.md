@@ -22,6 +22,9 @@ It demonstrates:
 
 ## Runnable scripts
 
+- `examples/QMeraEnergy/qmera_energy.py` builds a small schedule-first qMERA,
+  evaluates local ZZ energy from rebuilt and compiled lightcones, and can run a
+  short optional Torch Adam optimization with `--steps`.
 - `examples/SimpleUpdateGen/long_range_peps.py` demonstrates a long-range PEPS
   simple-update term: raw `quimb.SimpleUpdateGen` fails on the non-adjacent
   endpoints, while `pepsy.SimpleUpdateGen` routes the gate through SWAPs and

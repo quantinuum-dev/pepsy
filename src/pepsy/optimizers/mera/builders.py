@@ -20,6 +20,7 @@ from .compiled import (
     compile_qmera_parametric_lightcones,
     qmera_compiled_parametric_energy,
 )
+from .cache import build_qmera_contraction_optimizer
 from .gates import GateRegistry, default_gate_registry, resolve_gate_spec
 from .geometry import QMeraGeometry
 from .lightcones import (
@@ -202,6 +203,10 @@ class QMeraBuilder:
     def draw_schematic(self, *, layer=None, **kwargs):
         """Draw the qMERA blocking implied by this builder."""
         return self.build_schedule().draw_schematic(layer=layer, **kwargs)
+
+    def contraction_optimizer(self, **kwargs):
+        """Build a reusable contraction optimizer for repeated local cones."""
+        return build_qmera_contraction_optimizer(**kwargs)
 
     def parametric_lightcone_chunks(
         self,

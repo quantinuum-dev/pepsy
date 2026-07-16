@@ -20,6 +20,7 @@ from pepsy.optimizers.mera import (
     QMeraSymmrayFermionBackend,
     UserGateFamily,
     build_lightcone_chunks,
+    build_qmera_contraction_optimizer,
     build_qmera_lightcone_chunks,
     build_qmera_parametric_lightcone_chunks,
     compile_qmera_parametric_lightcones,
@@ -50,6 +51,46 @@ def _zz_term():
 
 def _small_mera(seed=23):
     return qtn.MERA.rand(L=8, max_bond=2, dtype="complex128", seed=seed)
+
+
+def test_qmera_contraction_optimizer_helper_delegates(monkeypatch):
+    """qMERA cache helper should expose Pepsy's reusable cotengra builder."""
+    calls = []
+
+    def fake_build_optimizer(**kwargs):
+        calls.append(kwargs)
+        return "optimizer"
+
+    monkeypatch.setattr(
+        "pepsy.optimizers.mera.cache.build_optimizer",
+        fake_build_optimizer,
+    )
+
+    opt = build_qmera_contraction_optimizer(directory="/tmp/qmera-cache", max_repeats=3)
+
+    assert opt == "optimizer"
+    assert calls[0]["directory"] == "/tmp/qmera-cache"
+    assert calls[0]["max_repeats"] == 3
+
+
+def test_qmera_builder_exposes_contraction_optimizer(monkeypatch):
+    """QMeraBuilder should provide the same cache helper at the builder level."""
+    calls = []
+
+    def fake_build_qmera_contraction_optimizer(**kwargs):
+        calls.append(kwargs)
+        return "optimizer"
+
+    monkeypatch.setattr(
+        "pepsy.optimizers.mera.builders.build_qmera_contraction_optimizer",
+        fake_build_qmera_contraction_optimizer,
+    )
+
+    builder = QMeraBuilder(shape=4)
+    opt = builder.contraction_optimizer(directory="/tmp/qmera-cache")
+
+    assert opt == "optimizer"
+    assert calls == [{"directory": "/tmp/qmera-cache"}]
 
 
 def test_normalize_local_terms_accepts_mapping_iterable_and_local_term():

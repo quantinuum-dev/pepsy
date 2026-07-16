@@ -1,9 +1,16 @@
-"""High-level MPS, MPO, and PEPS optimizers."""
+"""High-level tensor-network optimizers."""
 
 from importlib import import_module
 
 from .energy import EnergyEstimate, MpsEnergyOptimizer, PepsEnergyOptimizer
 from .global_opt import GlobalOptimizer
+from .mera import (
+    MeraEnergyOptimizer,
+    QMeraBuilder,
+    QMeraGeometry,
+    QMeraParametricEnergyOptimizer,
+    build_qmera_contraction_optimizer,
+)
 from .mpo import MpoOptimizer
 from .mps import MpsOptimizer
 from .noise import (
@@ -50,6 +57,7 @@ __all__ = [
     "CoalescedTrajectoryResult",
     "EnergyEstimate",
     "GlobalOptimizer",
+    "MeraEnergyOptimizer",
     "MpoOptimizer",
     "MpsEnergyOptimizer",
     "MpsOptimizer",
@@ -70,10 +78,14 @@ __all__ = [
     "STNState",
     "PepsEnergyOptimizer",
     "PepsOptimizer",
+    "QMeraBuilder",
+    "QMeraGeometry",
+    "QMeraParametricEnergyOptimizer",
     "SimpleUpdateGen",
     "SymDMRG2",
     "SweepOptimizer",
     "compile_stim_circuit",
+    "build_qmera_contraction_optimizer",
     "run_coalesced_noisy_shots",
     "run_coalesced_stim_shots",
     "run_coalesced_trajectory_shots",
@@ -88,6 +100,7 @@ __all__ = [
     "sample_coalesced_bits",
     "energy",
     "global_opt",
+    "mera",
     "mpo",
     "mps",
     "peps",
@@ -98,6 +111,6 @@ __all__ = [
 
 
 def __getattr__(name):
-    if name in {"energy", "global_opt", "mpo", "mps", "noise", "peps", "stabilizer_tn", "sym_dmrg", "sweep"}:
+    if name in {"energy", "global_opt", "mera", "mpo", "mps", "noise", "peps", "stabilizer_tn", "sym_dmrg", "sweep"}:
         return import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

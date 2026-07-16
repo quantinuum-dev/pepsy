@@ -28,6 +28,9 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `environments.py`: Quimb MPS boundary store and engine selection helpers.
   - `local_objective.py`: extraction target for local objective assembly.
   - `traces.py`: extraction target for sweep traces and progress summaries.
+- `mera/`: dense MERA and schedule-first qMERA local-energy objectives,
+  parameter dictionaries, compiled lightcone contractions, schematics, and
+  Symmray-native fermion helpers.
 - `global_opt.py`: whole-network variational optimization helpers.
 
 ## PEPS optimizer stack
@@ -99,7 +102,7 @@ an MPS mode rebuilds and canonicalizes the state.
 Use clean class imports at API boundaries:
 
 ```python
-from pepsy.optimizers import MpsOptimizer, PepsOptimizer, SweepOptimizer
+from pepsy.optimizers import MpsOptimizer, PepsOptimizer, QMeraBuilder, SweepOptimizer
 ```
 
 Use implementation leaves when a test or internal change needs module globals:

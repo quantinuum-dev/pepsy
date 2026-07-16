@@ -1,6 +1,7 @@
 """MERA and qMERA energy optimization helpers."""
 
 from .builders import QMeraAnsatz, QMeraBuilder
+from .cache import build_qmera_contraction_optimizer
 from .compiled import (
     QMeraCompiledLightconeChunk,
     compile_qmera_parametric_lightcone,
@@ -74,6 +75,7 @@ __all__ = [
     "QMeraSymmrayFermionBackend",
     "UserGateFamily",
     "build_lightcone_chunks",
+    "build_qmera_contraction_optimizer",
     "build_qmera_lightcone_chunks",
     "build_qmera_parametric_lightcone_chunks",
     "build_qmera_schedule",

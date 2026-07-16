@@ -17,6 +17,7 @@ operators/hamiltonians
 optimizers/sweep
 optimizers/global_opt
 optimizers/energy
+optimizers/mera
 optimizers/mps
 optimizers/mpo
 optimizers/noise
