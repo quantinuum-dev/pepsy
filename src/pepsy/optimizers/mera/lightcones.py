@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import autoray as ar
 
@@ -11,6 +11,7 @@ from .terms import LocalTerm
 __all__ = [
     "LightconeChunk",
     "build_lightcone_chunks",
+    "build_qmera_lightcone_chunks",
     "local_lightcone_expectation",
     "select_lightcone",
     "site_tags_for_where",
@@ -27,6 +28,9 @@ class LightconeChunk:
     num_indices: int
     outer_inds: tuple[str, ...]
     physical_outer_inds: tuple[str, ...]
+    source: str = "tags"
+    schedule_placement_ids: tuple[str, ...] = ()
+    schedule_width_by_scale: tuple[tuple[int, int], ...] = ()
 
     @property
     def support_size(self):
@@ -37,6 +41,13 @@ class LightconeChunk:
     def physical_width(self):
         """Number of physical outer legs left by the selected lightcone."""
         return len(self.physical_outer_inds)
+
+    @property
+    def schedule_width(self):
+        """Largest register support touched by the schedule lightcone."""
+        if not self.schedule_width_by_scale:
+            return self.support_size
+        return max(width for _, width in self.schedule_width_by_scale)
 
 
 def _default_site_tag(site):
@@ -117,6 +128,64 @@ def _chunk_for_term(state, term, *, validate=True):
 def build_lightcone_chunks(state, terms, *, validate=True):
     """Precompute one lightcone chunk per normalized local term."""
     return tuple(_chunk_for_term(state, term, validate=validate) for term in terms)
+
+
+def _term_on_schedule_registers(schedule, term):
+    register_where = schedule.geometry.to_register_where(term.where)
+    metadata = dict(term.metadata or {})
+    metadata.setdefault("original_where", tuple(term.where))
+    metadata["register_where"] = register_where
+    return replace(term, where=register_where, metadata=metadata)
+
+
+def _schedule_width_trace(schedule, where, placements):
+    selected_ids = {placement.gate_id for placement in placements}
+    support = set(schedule.geometry.to_register_where(where))
+    width_by_scale = {}
+    for placement in reversed(schedule.placements):
+        if placement.gate_id not in selected_ids:
+            continue
+        support.update(placement.where)
+        width_by_scale[placement.scale] = max(
+            width_by_scale.get(placement.scale, 0),
+            len(support),
+        )
+    return tuple(
+        (scale, width_by_scale[scale])
+        for scale in sorted(width_by_scale)
+    )
+
+
+def _chunk_for_schedule_term(state, schedule, term, *, validate=True):
+    term = _term_on_schedule_registers(schedule, term)
+    placements = schedule.reverse_lightcone_placements(term.where)
+    tags = schedule.reverse_lightcone_tags(term.where)
+    chunk = _chunk_for_term(state, term.with_tags(tags), validate=validate)
+    return replace(
+        chunk,
+        source="schedule",
+        schedule_placement_ids=tuple(placement.gate_id for placement in placements),
+        schedule_width_by_scale=_schedule_width_trace(
+            schedule,
+            term.where,
+            placements,
+        ),
+    )
+
+
+def build_qmera_lightcone_chunks(state, schedule, terms, *, validate=True):
+    """Precompute lightcone chunks from an explicit qMERA schedule.
+
+    Unlike :func:`build_lightcone_chunks`, this follows
+    :class:`~pepsy.optimizers.mera.QMeraSchedule` placements first and only then
+    turns the selected sites/gates into tensor-network tags. This keeps local
+    energy chunks tied to the designed RG blocks rather than to a generic tag
+    query on an already-built network.
+    """
+    return tuple(
+        _chunk_for_schedule_term(state, schedule, term, validate=validate)
+        for term in terms
+    )
 
 
 def _maybe_real(value):

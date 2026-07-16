@@ -15,6 +15,7 @@ from pepsy.optimizers.mera import (
     QMeraSchematicBlock,
     UserGateFamily,
     build_lightcone_chunks,
+    build_qmera_lightcone_chunks,
     default_gate_registry,
     draw_qmera_schedule,
     local_lightcone_expectation,
@@ -326,6 +327,84 @@ def test_qmera_builder_outputs_parameters_gates_state_and_lightcone_tags():
         contraction_opt="auto-hq",
     )
     assert np.isfinite(float(opt.loss()))
+
+
+def test_qmera_schedule_lightcone_chunks_follow_placements():
+    """Schedule chunks should select the RG reverse cone, not only site tags."""
+    builder = QMeraBuilder(
+        shape=4,
+        gate_family="rxx",
+        isometry_gate_family="rzz",
+        seed=19,
+        param_scale=0.1,
+    )
+    ansatz = builder.build()
+    op = _zz_term()
+
+    chunks = build_qmera_lightcone_chunks(
+        ansatz.state,
+        ansatz.schedule,
+        normalize_local_terms({(0, 1): op}),
+    )
+    opt = MeraEnergyOptimizer(
+        ansatz,
+        {(0, 1): op},
+        energy_per_site=False,
+        contraction_opt="auto-hq",
+    )
+    direct = ansatz.state.compute_local_expectation_exact(
+        {(0, 1): op},
+        optimize="auto-hq",
+        normalized=True,
+    )
+    expected_ids = tuple(
+        placement.gate_id
+        for placement in ansatz.schedule.reverse_lightcone_placements((0, 1))
+    )
+
+    assert opt.schedule is ansatz.schedule
+    assert opt.lightcones[0].tags == chunks[0].tags
+    assert opt.lightcones[0].schedule_placement_ids == chunks[0].schedule_placement_ids
+    assert chunks[0].source == "schedule"
+    assert chunks[0].schedule_placement_ids == expected_ids
+    assert any(tag.startswith("GATE_L0_DIS") for tag in chunks[0].tags)
+    assert chunks[0].schedule_width >= chunks[0].support_size
+    assert complex(opt.loss(real=False)) == pytest.approx(complex(direct))
+    assert opt.energy().metadata["lightcone_sources"] == ("schedule",)
+
+
+def test_qmera_schedule_lightcone_chunks_map_coordinate_terms():
+    """Coordinate-lattice terms should compile to qMERA register supports."""
+    builder = QMeraBuilder(
+        shape=(4, 4),
+        disentangler={"block_size": 2, "circuit_depth": 1},
+        isometry={"block_size": (2, 2), "circuit_depth": 2},
+        seed=20,
+        param_scale=0.03,
+    )
+    ansatz = builder.build()
+    op = _zz_term()
+
+    opt = MeraEnergyOptimizer(
+        ansatz,
+        {((0, 0), (0, 1)): op},
+        energy_per_site=False,
+        contraction_opt="auto-hq",
+    )
+    chunk = opt.lightcones[0]
+    direct = ansatz.state.compute_local_expectation_exact(
+        {(0, 1): op},
+        optimize="auto-hq",
+        normalized=True,
+    )
+
+    assert chunk.source == "schedule"
+    assert chunk.term.where == (0, 1)
+    assert chunk.term.metadata["original_where"] == ((0, 0), (0, 1))
+    assert chunk.term.metadata["register_where"] == (0, 1)
+    assert chunk.schedule_placement_ids
+    assert chunk.schedule_width_by_scale
+    assert complex(opt.loss(real=False)) == pytest.approx(complex(direct))
 
 
 def test_qmera_2d_builder_outputs_direct_gate_tensor_network():

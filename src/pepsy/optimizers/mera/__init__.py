@@ -12,6 +12,7 @@ from .geometry import QMeraGeometry
 from .lightcones import (
     LightconeChunk,
     build_lightcone_chunks,
+    build_qmera_lightcone_chunks,
     local_lightcone_expectation,
     select_lightcone,
     site_tags_for_where,
@@ -47,6 +48,7 @@ __all__ = [
     "QMeraSchematicBlock",
     "UserGateFamily",
     "build_lightcone_chunks",
+    "build_qmera_lightcone_chunks",
     "build_qmera_schedule",
     "default_gate_registry",
     "draw_qmera_schedule",

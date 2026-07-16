@@ -17,7 +17,11 @@ from ...backends import (
 from ...tensors import build_optimizer, reg_rel_svd_jax, reg_rel_svd_torch
 from ..energy import EnergyEstimate
 from ..global_opt import GlobalOptimizer
-from .lightcones import build_lightcone_chunks, local_lightcone_expectation
+from .lightcones import (
+    build_lightcone_chunks,
+    build_qmera_lightcone_chunks,
+    local_lightcone_expectation,
+)
 from .terms import convert_local_terms, normalize_local_terms
 
 __all__ = ["MeraEnergyOptimizer"]
@@ -54,6 +58,7 @@ class MeraEnergyOptimizer:
         real: bool = True,
         isometrize_method: str | None = "exp",
         contraction_opt: Any = "auto-hq",
+        schedule=None,
         array_backend=None,
         convert_terms: bool = True,
         precompute_tags: bool = True,
@@ -62,6 +67,7 @@ class MeraEnergyOptimizer:
         contract_opts: Mapping[str, Any] | None = None,
         loss_kwargs: Mapping[str, Any] | None = None,
     ):
+        self.schedule = self._resolve_schedule(state, schedule)
         self.state = self._as_mera_state(state)
         self.hamiltonian = hamiltonian
         self.terms = normalize_local_terms(hamiltonian)
@@ -81,7 +87,11 @@ class MeraEnergyOptimizer:
         }
         if loss_kwargs is not None:
             self.set_loss_kwargs(**loss_kwargs)
-        self.lightcones = self._build_chunks_if_requested(self.state, self.terms)
+        self.lightcones = self._build_chunks_if_requested(
+            self.state,
+            self.terms,
+            schedule=self.schedule,
+        )
 
     @classmethod
     def loss_kwarg_names(cls):
@@ -111,12 +121,25 @@ class MeraEnergyOptimizer:
     def _as_mera_state(state):
         if hasattr(state, "select") and hasattr(state, "gate"):
             return state
+        ansatz_state = getattr(state, "state", None)
+        if (
+            ansatz_state is not None
+            and hasattr(ansatz_state, "select")
+            and hasattr(ansatz_state, "gate")
+        ):
+            return ansatz_state
         tn = getattr(state, "tn", None)
         if tn is not None and hasattr(tn, "select") and hasattr(tn, "gate"):
             return tn
         raise TypeError(
             "state must be a MERA-like TensorNetwork with select() and gate()."
         )
+
+    @staticmethod
+    def _resolve_schedule(state, schedule=None):
+        if schedule is not None:
+            return schedule
+        return getattr(state, "schedule", None)
 
     @staticmethod
     def _num_sites(state):
@@ -181,7 +204,7 @@ class MeraEnergyOptimizer:
         backend = cls._array_backend_for_state(state, array_backend)
         return convert_local_terms(terms, backend)
 
-    def _build_chunks_if_requested(self, state, terms, *, opts=None):
+    def _build_chunks_if_requested(self, state, terms, *, schedule=None, opts=None):
         opts = self.loss_kwargs if opts is None else opts
         if not opts.get("precompute_tags", True):
             return None
@@ -191,10 +214,12 @@ class MeraEnergyOptimizer:
             array_backend=opts.get("array_backend"),
             convert_terms=opts.get("convert_terms", True),
         )
+        if schedule is not None:
+            return build_qmera_lightcone_chunks(state, schedule, prepared_terms)
         return build_lightcone_chunks(state, prepared_terms)
 
     @classmethod
-    def _chunks_for_loss(cls, state, terms, *, chunks=None, **opts):
+    def _chunks_for_loss(cls, state, terms, *, chunks=None, schedule=None, **opts):
         if chunks is not None:
             return chunks
         prepared_terms = cls._prepare_terms(
@@ -203,6 +228,8 @@ class MeraEnergyOptimizer:
             array_backend=opts.get("array_backend"),
             convert_terms=opts.get("convert_terms", True),
         )
+        if schedule is not None:
+            return build_qmera_lightcone_chunks(state, schedule, prepared_terms)
         return build_lightcone_chunks(state, prepared_terms)
 
     @classmethod
@@ -212,6 +239,7 @@ class MeraEnergyOptimizer:
         *,
         terms,
         chunks=None,
+        schedule=None,
         normalized=True,
         energy_per_site=True,
         real=True,
@@ -231,6 +259,7 @@ class MeraEnergyOptimizer:
             state,
             terms,
             chunks=chunks,
+            schedule=schedule,
             array_backend=array_backend,
             convert_terms=convert_terms,
         )
@@ -256,19 +285,24 @@ class MeraEnergyOptimizer:
         return value
 
     @staticmethod
-    def _tnopt_loss(state, *, terms, chunks=None, **loss_kwargs):
+    def _tnopt_loss(state, *, terms, chunks=None, schedule=None, **loss_kwargs):
         """Adapter for :class:`quimb.tensor.TNOptimizer`."""
         return MeraEnergyOptimizer._loss_state(
             state,
             terms=terms,
             chunks=chunks,
+            schedule=schedule,
             **loss_kwargs,
         )
 
     def set_loss_kwargs(self, **kwargs):
         """Update stored defaults for energy loss evaluation."""
         self.loss_kwargs.update(self._pick_loss_kwargs(kwargs))
-        self.lightcones = self._build_chunks_if_requested(self.state, self.terms)
+        self.lightcones = self._build_chunks_if_requested(
+            self.state,
+            self.terms,
+            schedule=self.schedule,
+        )
         return self
 
     def loss(self, state=None, *, hamiltonian=None, terms=None, **kwargs):
@@ -288,7 +322,13 @@ class MeraEnergyOptimizer:
             or opts.get("convert_terms") != self.loss_kwargs.get("convert_terms")
         ):
             chunks = None
-        return self._loss_state(state, terms=terms_use, chunks=chunks, **opts)
+        return self._loss_state(
+            state,
+            terms=terms_use,
+            chunks=chunks,
+            schedule=self.schedule,
+            **opts,
+        )
 
     def energy(self, state=None, *, hamiltonian=None, terms=None, **kwargs):
         """Return full and per-site MERA energy estimates."""
@@ -339,9 +379,12 @@ class MeraEnergyOptimizer:
             "max_lightcone_tensors": max(chunk.num_tensors for chunk in chunks),
             "max_lightcone_indices": max(chunk.num_indices for chunk in chunks),
             "max_physical_width": max(chunk.physical_width for chunk in chunks),
+            "max_schedule_width": max(chunk.schedule_width for chunk in chunks),
+            "lightcone_sources": tuple(chunk.source for chunk in chunks),
             "num_tensors_by_term": tuple(chunk.num_tensors for chunk in chunks),
             "num_indices_by_term": tuple(chunk.num_indices for chunk in chunks),
             "physical_width_by_term": tuple(chunk.physical_width for chunk in chunks),
+            "schedule_width_by_term": tuple(chunk.schedule_width for chunk in chunks),
         }
 
     def _norm_fn(self, state):
@@ -378,7 +421,7 @@ class MeraEnergyOptimizer:
             "chunks",
             self.lightcones if merged_loss_kwargs.get("precompute_tags", True) else None,
         )
-        constants = {"terms": terms, "chunks": chunks}
+        constants = {"terms": terms, "chunks": chunks, "schedule": self.schedule}
         constants.update(incoming_constants)
         return qtn.TNOptimizer(
             self.state,
@@ -415,7 +458,11 @@ class MeraEnergyOptimizer:
         out = tnopt.optimize(n=n, **optimize_kwargs)
         self.losses = list(getattr(tnopt, "losses", ()))
         self.state = out
-        self.lightcones = self._build_chunks_if_requested(self.state, self.terms)
+        self.lightcones = self._build_chunks_if_requested(
+            self.state,
+            self.terms,
+            schedule=self.schedule,
+        )
         if return_losses:
             return out, tuple(self.losses)
         return out
