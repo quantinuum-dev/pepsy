@@ -8,8 +8,11 @@ the state, routing each entry to the cheap update path:
 * **Clifford gates** update only the tableau (the coefficient MPS ``p`` is
   unchanged, free).
 * **Non-Clifford rotations** (single- or multi-qubit Pauli exponentials) update
-  only ``p`` via ``exp(-i theta/2 * A) -> exp(-i theta/2 * C^dagger A C)``,
-  applied as an exact bond-dim-2 MPO with optional ``chi`` truncation.
+  only ``p`` via ``exp(-i theta/2 * A) -> exp(-i theta/2 * C^dagger A C)``.
+  When a separable stabilizer coefficient site permits the constructive exact
+  cooling identity, the update is reduced to a one-site rotation and a
+  tableau-only controlled-Pauli cascade; otherwise it is applied as an exact
+  bond-dim-2 MPO with optional ``chi`` truncation.
 * **Explicit gate matrices** are classified: Clifford matrices go to the
   tableau; non-Clifford single-qubit *unitaries* are ZYZ-decomposed into
   rotations; other few-qubit matrices (unitary **or** non-unitary) are
@@ -45,9 +48,11 @@ Supported gate-stream entry forms::
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+import time
+from collections.abc import Mapping, MutableMapping
+from dataclasses import dataclass, fields
 from numbers import Integral
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import autoray as ar
 import numpy as np
@@ -66,7 +71,21 @@ from .operators import (
 from .paulis import hermitian_pauli_terms, pauli_string
 from .stn_state import STNState, _validate_bits
 
-__all__ = ["MpsStabOptimizer"]
+__all__ = [
+    "DeferredInjectionRecord",
+    "DeferredInjectionReport",
+    "DeferredProjectionRecord",
+    "ImmediateInjectionReport",
+    "ImmediateProjectionRecord",
+    "MeasurementRecord",
+    "MpsStabOptimizer",
+    "NormEventRecord",
+    "StabilizerMpsSettingsAdvice",
+    "StabilizerMpsSimulator",
+    "StabilizerMpsRunResult",
+    "StreamAnalysisRecord",
+    "run_stabilizer_mps_stream",
+]
 
 _CLIFFORD_NAMES = {
     "h", "x", "y", "z", "s", "sdg", "sdag", "sqrt_x", "sqrt_x_dag",
@@ -95,6 +114,205 @@ _S_MAT = np.array([[1, 0], [0, 1j]], dtype=complex)
 # testing one representative per coset finds the same best entanglement score
 # as testing all 11,520 two-qubit Cliffords.
 _TWO_Q_CLIFFORD_REPS = None
+
+
+class _TypedRecord(MutableMapping):
+    """Mutable mapping facade for small typed diagnostic records."""
+
+    @classmethod
+    def _field_names(cls):
+        return tuple(field.name for field in fields(cls))
+
+    def __getitem__(self, key):
+        if key in self._field_names():
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __setitem__(self, key, value):
+        if key not in self._field_names():
+            raise KeyError(key)
+        setattr(self, key, value)
+
+    def __delitem__(self, key):  # pragma: no cover - diagnostics are fixed-shape
+        raise TypeError(f"{type(self).__name__} fields cannot be deleted.")
+
+    def __iter__(self):
+        return iter(self._field_names())
+
+    def __len__(self):
+        return len(self._field_names())
+
+    def as_dict(self) -> dict:
+        """Return a plain-``dict`` snapshot."""
+        return {name: getattr(self, name) for name in self._field_names()}
+
+
+class MeasurementRecord(NamedTuple):
+    """One recorded Pauli measurement.
+
+    Kept tuple-compatible as ``(pauli, where, outcome)`` for existing callers.
+    """
+
+    pauli: object
+    where: object
+    outcome: int
+
+
+@dataclass
+class NormEventRecord(_TypedRecord):
+    """Projective normalization boundary for STN norm-loss diagnostics."""
+
+    kind: str
+    valid: bool
+    pre_norm: Optional[float] = None
+    pre_norm_sq: Optional[float] = None
+    segment_infidelity: Optional[float] = None
+    branch_probability: Optional[float] = None
+    expected_projected_norm: Optional[float] = None
+    expected_projected_norm_sq: Optional[float] = None
+    projected_norm: Optional[float] = None
+    projected_norm_sq: Optional[float] = None
+    projector_survival: Optional[float] = None
+    projector_survival_raw: Optional[float] = None
+    projector_infidelity: Optional[float] = None
+    post_norm: Optional[float] = None
+    post_norm_sq: Optional[float] = None
+
+
+@dataclass
+class ImmediateProjectionRecord(_TypedRecord):
+    """Per-gadget projection diagnostics for immediate magic injection."""
+
+    data: int
+    ancilla: int
+    angle: float
+    outcome: int
+    elapsed_s: float
+    bond_before: int
+    bond_after: int
+
+
+@dataclass
+class DeferredInjectionRecord(_TypedRecord):
+    """Deferred-MAST magic gadget awaiting end-of-circuit projection."""
+
+    index: int
+    ancilla: int
+    data: int
+    angle: float
+    outcome: int
+
+
+@dataclass
+class DeferredProjectionRecord(_TypedRecord):
+    """Per-ancilla projection diagnostics for deferred magic injection."""
+
+    index: int
+    ancilla: int
+    data: int
+    angle: float
+    outcome: int
+    order: int
+    support_size: int
+    mps_span: int
+    bond_before: int
+    bond_after: int
+
+
+@dataclass
+class ImmediateInjectionReport(_TypedRecord):
+    """Aggregate diagnostics for one immediate-injection run."""
+
+    n_injections: int
+    projection_elapsed_s: float
+    projection_peak_bond: int
+
+
+@dataclass
+class DeferredInjectionReport(_TypedRecord):
+    """Aggregate diagnostics for one deferred-MAST injection run."""
+
+    n_injections: int
+    projection_order: object
+    replay_elapsed_s: float
+    projection_elapsed_s: float
+    pre_projection_peak_bond: int
+    projection_peak_bond: int
+    peak_bond: int
+
+
+@dataclass
+class StreamAnalysisRecord(_TypedRecord):
+    """Pepsy-native gate-stream design summary for STN configuration advice."""
+
+    total_entries: int
+    n_qubits: Optional[int]
+    estimated_qubits: Optional[int]
+    touched_qubits: tuple[int, ...]
+    max_qubit: Optional[int]
+    clifford_entries: int
+    injectable_entries: int
+    other_nonclifford_entries: int
+    structural_entries: int
+    control_entries: int
+    opaque_entries: int
+    dense_matrix_entries: int
+    unitary_matrix_entries: int
+    nonunitary_matrix_entries: int
+    submpo_entries: int
+    measurement_entries: int
+    reset_entries: int
+    measure_reset_entries: int
+    cap_entries: int
+    is_clifford_only: bool
+    is_clifford_t_like: bool
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass
+class StabilizerMpsSettingsAdvice(_TypedRecord):
+    """Advisory STN execution and constructor settings for a Pepsy stream."""
+
+    goal: str
+    recommended_mode: str
+    execution_method: str
+    settings: dict
+    analysis: StreamAnalysisRecord
+    magic_strategy: object
+    immediate_ancillas_required: int
+    deferred_ancillas_required: int
+    ancilla_budget: Optional[int]
+    deferred_feasible: Optional[bool]
+    disentangle_checkpoints_recommended: bool
+    warnings: tuple[str, ...]
+    message: str
+
+
+@dataclass
+class StabilizerMpsRunResult(_TypedRecord):
+    """Result record for one explicit Pepsy-stream STN replay."""
+
+    simulator: object
+    mode: str
+    requested_mode: str
+    execution_method: str
+    settings: dict
+    run_options: dict
+    analysis: StreamAnalysisRecord
+    advice: StabilizerMpsSettingsAdvice
+    elapsed_s: float
+    replay_elapsed_s: float
+    projection_elapsed_s: float
+    final_bond: int
+    peak_bond: int
+    norm: float
+    norm_diagnostics: dict
+    measurements: tuple
+    norm_events: tuple
+    immediate_projection_events: tuple
+    deferred_projection_events: tuple
+    injection_report: object
+    remaining_queue: int
 
 
 def _normalize_event_name(name):
@@ -412,6 +630,11 @@ class MpsStabOptimizer:
         Projective measurement/reset boundaries additionally snapshot the
         current segment norm in :attr:`norm_events` before normalizing the
         selected branch.
+    exact_cooling : bool
+        If ``True`` (default), recognize the constructive exact-cooling case
+        before a multi-site Pauli rotation. A usable separable stabilizer site
+        keeps the coefficient MPS bond unchanged by moving the controlled-Pauli
+        part of the update into the Clifford tableau.
     seed : int | None
         Seed for the random-number generator used by measurement sampling.
     dtype : str
@@ -444,13 +667,28 @@ class MpsStabOptimizer:
         The evolving stabilizer tensor-network state.
     infidelities : list[float]
         Cumulative norm-loss samples from compressed unitary ``|nu>`` updates.
-    norm_events : list[dict]
+    norm_events : list[NormEventRecord]
         Segment-boundary snapshots made immediately before projective
         measurement/reset normalization. These preserve the pre-collapse
         truncation proxy separately from the Born branch probability.
     bond_history : list[int]
         ``|nu>`` max bond dimension after each applied entry.
-    measurements : list[tuple]
+    exact_cooling_events : list[dict]
+        Successful constructive exact-cooling updates. Greedy Clifford cooling
+        remains the explicit :meth:`disentangle_cliffords` operation.
+    immediate_projection_events : list[ImmediateProjectionRecord]
+        Per-gadget projection diagnostics from the most recent
+        :meth:`run_with_injection` call.
+    last_immediate_injection_report : ImmediateInjectionReport | None
+        Aggregate projection timing and peak-bond diagnostics from the most
+        recent :meth:`run_with_injection` call.
+    deferred_projection_events : list[DeferredProjectionRecord]
+        Per-ancilla diagnostics from the most recent deferred magic-state
+        injection run, in the order the magic register was projected.
+    last_deferred_injection_report : DeferredInjectionReport | None
+        Aggregate timing and peak-bond diagnostics from the most recent
+        :meth:`run_with_deferred_injection` call.
+    measurements : list[MeasurementRecord]
         Recorded ``(pauli, where, outcome)`` for each measurement performed.
     stim_plan : pepsy.StimCircuitPlan | None
         Compiled source circuit retained by :meth:`from_stim`; otherwise
@@ -472,6 +710,7 @@ class MpsStabOptimizer:
         max_pauli_decomposition_qubits: Optional[int] = 2,
         max_dense_cap_qubits: Optional[int] = 10,
         track_infidelity: bool = False,
+        exact_cooling: bool = True,
         seed: Optional[int] = None,
         dtype: str = "complex128",
         to_backend=None,
@@ -536,6 +775,7 @@ class MpsStabOptimizer:
                 )
         self.max_dense_cap_qubits = max_dense_cap_qubits
         self.track_infidelity = bool(track_infidelity)
+        self.exact_cooling = bool(exact_cooling)
         self._norm_infidelity_valid = True
         self._current_norm_infidelity = 0.0 if self.track_infidelity else None
         self._norm_segment_open = False
@@ -549,6 +789,7 @@ class MpsStabOptimizer:
         self.to_backend = to_backend
         self._bk_cache: dict = {}
         self._clifford_rot_cache: dict = {}
+        self._localizer_cache: dict = {}
         if to_backend is not None:
             # Place the coefficient MPS |nu> on the requested backend; gate/MPO
             # arrays are converted on the fly by the _bk* helpers below.
@@ -556,9 +797,15 @@ class MpsStabOptimizer:
 
         self._queue: List[object] = []
         self.infidelities: List[float] = []
-        self.norm_events: List[dict] = []
+        self.norm_events: List[NormEventRecord] = []
         self.bond_history: List[int] = [self.state.max_bond()]
-        self.measurements: List[tuple] = []
+        self.exact_cooling_events: List[dict] = []
+        self.immediate_projection_events: List[ImmediateProjectionRecord] = []
+        self.last_immediate_injection_report = None
+        self._last_injection_projection_event = None
+        self.deferred_projection_events: List[DeferredProjectionRecord] = []
+        self.last_deferred_injection_report = None
+        self.measurements: List[MeasurementRecord] = []
         # These are populated by ``from_stim``. Keeping the raw compiled
         # trajectory separate from the queued stream makes optional caller-side
         # stream transforms explicit and reproducible.
@@ -699,6 +946,817 @@ class MpsStabOptimizer:
                 return list(gates)
             return [gates]
         raise TypeError(f"Unsupported gate stream: {gates!r}")
+
+    def _stream_entry_sites(self, entry) -> Optional[set[int]]:
+        """Return physical logical sites touched by one stream entry.
+
+        ``None`` means the entry shape is too opaque for a magic-ancilla
+        scheduler to prove that the reserved pool is untouched.
+        """
+        parts = submpo_event_parts(entry, normalize_where=True)
+        if parts is not None:
+            _mpo, where = parts
+            return set(_normalize_sites(where))
+
+        if not (isinstance(entry, (list, tuple)) and entry):
+            return None
+        head = entry[0]
+        if not isinstance(head, str):
+            if len(entry) != 2:
+                return None
+            return set(_normalize_sites(entry[1]))
+
+        name = _normalize_event_name(head)
+        if name == "disentangle":
+            if len(entry) <= 1:
+                return set(range(self.n))
+            if len(entry) > 2:
+                return None
+            option = entry[1]
+            if isinstance(option, Mapping):
+                bonds = option.get("bonds")
+            elif isinstance(option, Integral):
+                bonds = None
+            else:
+                return None
+            if bonds is None:
+                return set(range(self.n))
+            sites = set()
+            for bond in self._disentangle_bonds(bonds, self.n):
+                sites.update((int(bond), int(bond) + 1))
+            return sites
+        if name in _CLIFFORD_NAMES:
+            try:
+                return {int(site) for site in entry[1:]}
+            except (TypeError, ValueError):
+                return None
+        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name in (
+            "rot", "t", "tdg",
+        ):
+            try:
+                _theta, where, _axes = self._rotation_spec(name, entry[1:])
+            except (TypeError, ValueError, IndexError):
+                return None
+            return set(where)
+        if name == "measure":
+            if len(entry) < 3:
+                return None
+            return set(_normalize_sites(entry[2]))
+        if name == "reset" or name in _RESET_AXIS_ALIASES:
+            try:
+                _axes, where = _parse_reset_args(
+                    entry[1:],
+                    default_axis=_RESET_AXIS_ALIASES.get(name),
+                )
+            except (TypeError, ValueError, IndexError):
+                return None
+            return set(where)
+        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
+            try:
+                _axes, where, _outcomes, _absorb = _parse_measure_reset_args(
+                    entry[1:],
+                    default_axis=_MR_AXIS_ALIASES.get(name),
+                )
+            except (TypeError, ValueError, IndexError):
+                return None
+            return set(where)
+        if name == "cap":
+            if len(entry) < 3:
+                return None
+            return set(_normalize_sites(entry[1]))
+        return None
+
+    def _validate_magic_ancilla_pool(
+        self,
+        ancillas,
+        *,
+        require_nonempty: bool,
+    ) -> tuple[int, ...]:
+        """Normalize and validate a reserved magic-ancilla pool."""
+        try:
+            pool = tuple(int(ancilla) for ancilla in ancillas)
+        except TypeError as exc:
+            raise TypeError("ancillas must be a sequence of qubit indices.") from exc
+        if require_nonempty and not pool:
+            raise ValueError("magic injection needs at least one ancilla qubit.")
+        if len(set(pool)) != len(pool):
+            raise ValueError(f"ancillas must be unique, got {pool!r}.")
+        invalid = [ancilla for ancilla in pool if not 0 <= ancilla < self.n]
+        if invalid:
+            raise ValueError(
+                f"ancilla index/indices {tuple(invalid)!r} outside qubit range "
+                f"[0, {self.n})."
+            )
+        return pool
+
+    def _assert_magic_ancillas_clean(self, pool, *, tol: float = 1e-9) -> None:
+        """Require each reserved magic ancilla to be a clean physical ``|0>``."""
+        for ancilla in pool:
+            z_exp = self.expectation("Z", ancilla)
+            if abs(z_exp - 1.0) > tol:
+                raise ValueError(
+                    f"magic ancilla {ancilla} must start clean in physical |0> "
+                    f"(expected <Z>=+1, got {z_exp:.6g})."
+                )
+
+    def _validate_magic_stream_protection(
+        self,
+        entries,
+        specs,
+        pool,
+        *,
+        mode: str,
+    ) -> None:
+        """Reject stream entries that would act on reserved magic ancillas."""
+        pool_set = set(pool)
+        if not pool_set:
+            return
+        for entry, spec in zip(entries, specs):
+            if spec is not None:
+                data, _phi = spec
+                if not 0 <= data < self.n:
+                    raise ValueError(
+                        f"{mode} injection target qubit {data} is outside "
+                        f"qubit range [0, {self.n})."
+                    )
+                if data in pool_set:
+                    raise ValueError(
+                        f"{mode} injection target qubit {data} is in the "
+                        f"reserved ancilla pool {pool}."
+                    )
+                continue
+            sites = self._stream_entry_sites(entry)
+            if sites is None:
+                raise ValueError(
+                    f"{mode} injection cannot verify that stream entry {entry!r} "
+                    "leaves the reserved magic-ancilla pool untouched."
+                )
+            touched = sorted(pool_set.intersection(sites))
+            if touched:
+                raise ValueError(
+                    f"{mode} injection reserved ancilla(s) {tuple(touched)!r} "
+                    f"are touched by ordinary stream entry {entry!r}."
+                )
+
+    @classmethod
+    def _analysis_matrix_kind(cls, entry) -> str:
+        """Classify a dense matrix entry for stream-level advice."""
+        if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+            return "opaque"
+        try:
+            gate = np.asarray(entry[0], dtype=complex)
+        except (TypeError, ValueError):
+            return "opaque"
+        if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
+            return "opaque"
+        dim = gate.shape[0]
+        nq = int(round(math.log2(dim))) if dim > 0 else -1
+        if nq < 0 or 2 ** nq != dim:
+            return "opaque"
+        if not np.allclose(gate.conj().T @ gate, np.eye(dim), atol=1e-6):
+            return "nonunitary_matrix"
+        try:
+            import stim
+
+            stim.Tableau.from_unitary_matrix(gate, endian="big")
+        except (ImportError, IndexError, TypeError, ValueError, RuntimeError):
+            return "nonclifford_matrix"
+        return "clifford_matrix"
+
+    @classmethod
+    def _analysis_entry_kind(cls, entry) -> str:
+        """Classify one Pepsy stream entry for whole-stream advice."""
+        if submpo_event_parts(entry, normalize_where=True) is not None:
+            return "submpo"
+        if not (isinstance(entry, (list, tuple)) and entry):
+            return "opaque"
+        head = entry[0]
+        if not isinstance(head, str):
+            return cls._analysis_matrix_kind(entry)
+
+        name = _normalize_event_name(head)
+        if name in _CLIFFORD_NAMES:
+            return "clifford"
+        if name == "disentangle":
+            return "control"
+        try:
+            if cls._injectable_rz(entry) is not None:
+                return "injectable"
+        except (IndexError, TypeError, ValueError):
+            return "opaque"
+        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name == "rot":
+            try:
+                theta = float(entry[1])
+            except (IndexError, TypeError, ValueError):
+                return "opaque"
+            return "clifford" if cls._is_clifford_angle(theta) else "nonclifford"
+        if name == "measure":
+            return "measure"
+        if name == "reset" or name in _RESET_AXIS_ALIASES:
+            return "reset"
+        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
+            return "measure_reset"
+        if name == "cap":
+            return "cap"
+        return "opaque"
+
+    @classmethod
+    def _progress_entry_part(cls, entry) -> str:
+        """Return a compact progress-bar label for one stream entry."""
+        kind = cls._analysis_entry_kind(entry)
+        return {
+            "injectable": "T",
+            "measure": "measurement",
+            "measure_reset": "measure_reset",
+            "clifford_matrix": "clifford",
+            "nonclifford_matrix": "nonclifford",
+            "nonunitary_matrix": "nonunitary",
+        }.get(kind, kind)
+
+    @classmethod
+    def _analysis_entry_sites(cls, entry, n_qubits: Optional[int]) -> Optional[set[int]]:
+        """Return touched physical sites for a stream entry, if cheaply known."""
+        parts = submpo_event_parts(entry, normalize_where=True)
+        if parts is not None:
+            _mpo, where = parts
+            return set(_normalize_sites(where))
+
+        if not (isinstance(entry, (list, tuple)) and entry):
+            return None
+        head = entry[0]
+        if not isinstance(head, str):
+            if len(entry) != 2:
+                return None
+            return set(_normalize_sites(entry[1]))
+
+        name = _normalize_event_name(head)
+        if name == "disentangle":
+            if len(entry) <= 1:
+                return None if n_qubits is None else set(range(n_qubits))
+            if len(entry) > 2:
+                return None
+            option = entry[1]
+            if isinstance(option, Mapping):
+                bonds = option.get("bonds")
+            elif isinstance(option, Integral):
+                bonds = None
+            else:
+                return None
+            if n_qubits is None:
+                return None
+            sites = set()
+            for bond in cls._disentangle_bonds(bonds, n_qubits):
+                sites.update((int(bond), int(bond) + 1))
+            return sites
+        if name in _CLIFFORD_NAMES:
+            return {int(site) for site in entry[1:]}
+        if name in _ROTATION_AXES:
+            return {int(entry[2])}
+        if name in _ROTATION_AXES_2Q:
+            return {int(entry[2]), int(entry[3])}
+        if name in ("t", "tdg"):
+            return {int(entry[1])}
+        if name == "rot":
+            return set(_normalize_sites(entry[3]))
+        if name == "measure":
+            if len(entry) < 3:
+                return None
+            return set(_normalize_sites(entry[2]))
+        if name == "reset" or name in _RESET_AXIS_ALIASES:
+            _axes, where = _parse_reset_args(
+                entry[1:],
+                default_axis=_RESET_AXIS_ALIASES.get(name),
+            )
+            return set(where)
+        if name in _MR_ALIASES or name in _MR_AXIS_ALIASES:
+            _axes, where, _outcomes, _absorb = _parse_measure_reset_args(
+                entry[1:],
+                default_axis=_MR_AXIS_ALIASES.get(name),
+            )
+            return set(where)
+        if name == "cap":
+            if len(entry) < 3:
+                return None
+            return set(_normalize_sites(entry[1]))
+        return None
+
+    @classmethod
+    def analyze_stream(cls, gates, *, n_qubits: Optional[int] = None) -> StreamAnalysisRecord:
+        """Inspect a Pepsy-native gate stream without executing it.
+
+        This is the stream-first companion to the Stim adapter: it accepts the
+        same Pepsy entries as :meth:`apply`, counts the design features that
+        affect STN settings, and returns a typed mapping-compatible record.
+        """
+        if n_qubits is not None:
+            if isinstance(n_qubits, bool) or not isinstance(n_qubits, Integral):
+                raise TypeError("n_qubits must be a nonnegative integer or None.")
+            n_qubits = int(n_qubits)
+            if n_qubits < 0:
+                raise ValueError("n_qubits must be nonnegative.")
+
+        entries = cls._as_entries(gates)
+        counts = {
+            "clifford": 0,
+            "injectable": 0,
+            "nonclifford": 0,
+            "structural": 0,
+            "control": 0,
+            "opaque": 0,
+            "dense_matrix": 0,
+            "unitary_matrix": 0,
+            "nonunitary_matrix": 0,
+            "submpo": 0,
+            "measure": 0,
+            "reset": 0,
+            "measure_reset": 0,
+            "cap": 0,
+        }
+        touched: set[int] = set()
+        unknown_support = 0
+        invalid_sites: list[int] = []
+
+        for entry in entries:
+            kind = cls._analysis_entry_kind(entry)
+            if kind == "clifford" or kind == "clifford_matrix":
+                counts["clifford"] += 1
+            elif kind == "injectable":
+                counts["injectable"] += 1
+            elif kind == "nonclifford" or kind == "nonclifford_matrix":
+                counts["nonclifford"] += 1
+            elif kind in {"measure", "reset", "measure_reset", "cap"}:
+                counts["structural"] += 1
+            elif kind == "control":
+                counts["control"] += 1
+            else:
+                counts["opaque"] += 1
+
+            if kind in {"clifford_matrix", "nonclifford_matrix", "nonunitary_matrix"}:
+                counts["dense_matrix"] += 1
+            if kind in {"clifford_matrix", "nonclifford_matrix"}:
+                counts["unitary_matrix"] += 1
+            if kind == "nonunitary_matrix":
+                counts["nonunitary_matrix"] += 1
+            if kind == "submpo":
+                counts["submpo"] += 1
+            if kind == "measure":
+                counts["measure"] += 1
+            elif kind == "reset":
+                counts["reset"] += 1
+            elif kind == "measure_reset":
+                counts["measure_reset"] += 1
+            elif kind == "cap":
+                counts["cap"] += 1
+
+            try:
+                sites = cls._analysis_entry_sites(entry, n_qubits)
+            except (IndexError, TypeError, ValueError):
+                sites = None
+            if sites is None:
+                unknown_support += 1
+            else:
+                touched.update(sites)
+                invalid_sites.extend(site for site in sites if site < 0)
+
+        if invalid_sites:
+            raise ValueError(
+                f"stream touches negative qubit index/indices "
+                f"{tuple(sorted(set(invalid_sites)))!r}."
+            )
+        max_qubit = max(touched) if touched else None
+        if n_qubits is not None and max_qubit is not None and max_qubit >= n_qubits:
+            raise ValueError(
+                f"stream touches qubit {max_qubit}, outside n_qubits={n_qubits}."
+            )
+        estimated_qubits = n_qubits if n_qubits is not None else (
+            None if max_qubit is None else max_qubit + 1
+        )
+
+        warnings = []
+        if unknown_support:
+            warnings.append(
+                f"{unknown_support} stream entry/entries have unknown qubit support."
+            )
+        if counts["opaque"]:
+            warnings.append(
+                "Opaque entries cannot be fully priced by the advisor; validate "
+                "them with small exact runs."
+            )
+        if counts["dense_matrix"]:
+            warnings.append(
+                "Dense matrix entries use classification and possibly Pauli "
+                "decomposition; keep them few-qubit or decompose into named gates."
+            )
+        if counts["nonunitary_matrix"] or counts["submpo"]:
+            warnings.append(
+                "Non-unitary matrices and coefficient-frame sub-MPOs can change "
+                "normalization physically and suspend the unitary norm-loss proxy."
+            )
+        if counts["nonclifford"] and counts["injectable"]:
+            warnings.append(
+                "Only the T-family subset is injectable; other non-Clifford work "
+                "stays on the direct STN path."
+            )
+        if counts["cap"]:
+            warnings.append(
+                "Cap entries change the qubit/MPS length and disable static "
+                "stream-layout assumptions past the cap."
+            )
+
+        nonmagic_work = counts["nonclifford"] + counts["opaque"]
+        is_clifford_t_like = (
+            counts["injectable"] > 0
+            and counts["nonclifford"] == 0
+            and counts["opaque"] == 0
+        )
+        is_clifford_only = (
+            counts["injectable"] == 0
+            and nonmagic_work == 0
+        )
+
+        return StreamAnalysisRecord(
+            total_entries=int(len(entries)),
+            n_qubits=n_qubits,
+            estimated_qubits=estimated_qubits,
+            touched_qubits=tuple(sorted(touched)),
+            max_qubit=None if max_qubit is None else int(max_qubit),
+            clifford_entries=int(counts["clifford"]),
+            injectable_entries=int(counts["injectable"]),
+            other_nonclifford_entries=int(counts["nonclifford"]),
+            structural_entries=int(counts["structural"]),
+            control_entries=int(counts["control"]),
+            opaque_entries=int(counts["opaque"]),
+            dense_matrix_entries=int(counts["dense_matrix"]),
+            unitary_matrix_entries=int(counts["unitary_matrix"]),
+            nonunitary_matrix_entries=int(counts["nonunitary_matrix"]),
+            submpo_entries=int(counts["submpo"]),
+            measurement_entries=int(counts["measure"]),
+            reset_entries=int(counts["reset"]),
+            measure_reset_entries=int(counts["measure_reset"]),
+            cap_entries=int(counts["cap"]),
+            is_clifford_only=bool(is_clifford_only),
+            is_clifford_t_like=bool(is_clifford_t_like),
+            warnings=tuple(_unique_ordered(warnings)),
+        )
+
+    @classmethod
+    def _magic_strategy_entry_kind(cls, entry) -> str:
+        """Classify one stream entry for :meth:`recommend_magic_strategy`."""
+        if not (isinstance(entry, (list, tuple)) and entry):
+            return "opaque"
+        if not isinstance(entry[0], str):
+            # Stim's compiler emits its ideal Clifford operations as float32
+            # matrices. Recognize small unitary matrices without examining the
+            # large/opaque operator forms that this advisory API cannot price.
+            if len(entry) != 2:
+                return "opaque"
+            try:
+                gate = np.asarray(entry[0], dtype=complex)
+                dim = gate.shape[0]
+                nq = int(round(math.log2(dim)))
+                if (
+                    gate.ndim != 2
+                    or gate.shape != (dim, dim)
+                    or 2 ** nq != dim
+                    or nq > 2
+                    or not np.allclose(
+                        gate.conj().T @ gate, np.eye(dim), atol=1e-6
+                    )
+                ):
+                    return "opaque"
+                import stim
+
+                stim.Tableau.from_unitary_matrix(gate, endian="big")
+            except (ImportError, IndexError, TypeError, ValueError, RuntimeError):
+                return "nonclifford"
+            return "clifford"
+
+        name = _normalize_event_name(entry[0])
+        if name in _CLIFFORD_NAMES:
+            return "clifford"
+        if name == "disentangle":
+            return "control"
+        try:
+            if cls._injectable_rz(entry) is not None:
+                return "injectable"
+        except (IndexError, TypeError, ValueError):
+            return "opaque"
+
+        if name in _ROTATION_AXES or name in _ROTATION_AXES_2Q or name == "rot":
+            try:
+                theta = float(entry[1])
+            except (IndexError, TypeError, ValueError):
+                return "opaque"
+            return "clifford" if cls._is_clifford_angle(theta) else "nonclifford"
+        if name in {
+            "measure", "reset", "cap", *(_RESET_AXIS_ALIASES),
+            *(_MR_ALIASES), *(_MR_AXIS_ALIASES),
+        }:
+            return "structural"
+        return "opaque"
+
+    @classmethod
+    def recommend_magic_strategy(
+        cls,
+        gates,
+        *,
+        ancilla_budget: Optional[int] = None,
+        prioritize_peak_bond: bool = False,
+    ) -> dict:
+        """Analyze a gate stream and recommend an explicit STN execution mode.
+
+        The report is advisory: it never rewrites or executes ``gates``. It
+        recognizes injectable ``T``/``T-dagger``/non-Clifford ``Rz(k*pi/4)``
+        entries using the same criterion as :meth:`with_injection`, counts other
+        non-Clifford rotations, and returns a plain-English ``"message"`` plus
+        machine-readable counts. Dense matrices and coefficient-frame sub-MPOs
+        are reported as ``opaque`` because classifying them here could be costly
+        or require changing their execution behavior.
+
+        ``ancilla_budget`` is the number of extra clean ancillas available for
+        injection. With no stated budget, immediate injection is the conservative
+        recommendation for an injectable stream. Set
+        ``prioritize_peak_bond=True`` together with a budget at least equal to
+        the injectable-gate count to recommend deferred MAST instead.
+
+        For a :meth:`from_stim` simulator, call the instance convenience method
+        :meth:`queued_magic_strategy` before :meth:`run`; it analyzes the queued
+        sampled/``stream_transform``-produced Pepsy stream.
+        """
+        if ancilla_budget is not None:
+            if isinstance(ancilla_budget, bool) or not isinstance(ancilla_budget, Integral):
+                raise TypeError("ancilla_budget must be a nonnegative integer or None.")
+            ancilla_budget = int(ancilla_budget)
+            if ancilla_budget < 0:
+                raise ValueError("ancilla_budget must be nonnegative.")
+
+        counts = {
+            "clifford": 0,
+            "injectable": 0,
+            "nonclifford": 0,
+            "structural": 0,
+            "control": 0,
+            "opaque": 0,
+        }
+        for entry in cls._as_entries(gates):
+            counts[cls._magic_strategy_entry_kind(entry)] += 1
+
+        injections = counts["injectable"]
+        deferred_feasible = (
+            None if ancilla_budget is None else ancilla_budget >= injections
+        )
+        complete_clifford_t = (
+            injections > 0
+            and counts["nonclifford"] == 0
+            and counts["opaque"] == 0
+        )
+        if injections == 0 or ancilla_budget == 0:
+            mode = "direct"
+        elif (
+            prioritize_peak_bond
+            and ancilla_budget is not None
+            and ancilla_budget >= injections
+        ):
+            mode = "deferred"
+        else:
+            mode = "immediate"
+
+        if injections == 0:
+            if counts["nonclifford"]:
+                message = (
+                    f"The stream has {counts['nonclifford']} non-Clifford rotation(s), "
+                    "but none are injectable T-family Rz rotations. Use direct STN "
+                    "execution with exact_cooling=True; schedule greedy cooling only at "
+                    "explicit checkpoints if the coefficient bond grows."
+                )
+            else:
+                message = (
+                    "The stream has no injectable T-family rotations. Use direct STN "
+                    "execution; magic injection is not applicable."
+                )
+        elif ancilla_budget == 0:
+            message = (
+                f"The stream has {injections} injectable T-family rotation(s), but the "
+                "ancilla budget is zero. Use direct STN execution with exact_cooling=True."
+            )
+        elif mode == "deferred":
+            message = (
+                f"The stream has {injections} injectable T-family rotation(s). With "
+                f"{ancilla_budget} available ancilla(s) and peak bond prioritized, use "
+                "deferred MAST: with_deferred_injection(..., "
+                "projection_order='middle_out'). It reserves one ancilla per injected "
+                "gate and moves basis-updating projections to the end."
+            )
+        elif complete_clifford_t:
+            message = (
+                f"The stream is Clifford+T-like with {injections} injectable T-family "
+                "rotation(s). Use immediate injection as the default: "
+                "with_injection(..., n_ancilla=1). It rewrites every eligible rotation, "
+                "measures the ancilla immediately, and reuses it. Deferred MAST is an "
+                f"alternative when {injections} fresh ancillas and lower replay-phase "
+                "peak bond are worth a final projection phase."
+            )
+        else:
+            message = (
+                f"The stream has {injections} injectable T-family rotation(s), "
+                f"{counts['nonclifford']} other non-Clifford rotation(s), and "
+                f"{counts['opaque']} opaque entry/entries. Use immediate injection for "
+                "the eligible subset; the remaining non-Clifford work stays on the "
+                "direct STN path with exact_cooling=True."
+            )
+
+        return {
+            "recommended_mode": mode,
+            "message": message,
+            "total_entries": int(sum(counts.values())),
+            "clifford_entries": int(counts["clifford"]),
+            "injectable_entries": int(injections),
+            "other_nonclifford_entries": int(counts["nonclifford"]),
+            "structural_entries": int(counts["structural"]),
+            "control_entries": int(counts["control"]),
+            "opaque_entries": int(counts["opaque"]),
+            "is_clifford_t_like": bool(complete_clifford_t),
+            "exact_cooling_recommended": True,
+            "immediate_ancillas_required": 1 if injections else 0,
+            "deferred_ancillas_required": int(injections),
+            "ancilla_budget": ancilla_budget,
+            "deferred_feasible": deferred_feasible,
+            "prioritize_peak_bond": bool(prioritize_peak_bond),
+        }
+
+    def queued_magic_strategy(self, **kwargs) -> dict:
+        """Recommend a mode for the currently queued Pepsy gate stream.
+
+        This is particularly useful immediately after :meth:`from_stim` and an
+        optional ``stream_transform``. Call it before :meth:`run`, because that
+        method consumes successfully executed queue entries.
+        """
+        return type(self).recommend_magic_strategy(self._queue, **kwargs)
+
+    @classmethod
+    def recommend_settings(
+        cls,
+        gates,
+        *,
+        n_qubits: Optional[int] = None,
+        ancilla_budget: Optional[int] = None,
+        prioritize_peak_bond: bool = False,
+        goal: str = "run",
+    ) -> StabilizerMpsSettingsAdvice:
+        """Recommend STN settings from a Pepsy stream design.
+
+        The returned advice is intentionally non-executing. It keeps the Pepsy
+        stream as the primary interface, uses :meth:`analyze_stream` for facts,
+        and calls :meth:`recommend_magic_strategy` for the direct/immediate/
+        deferred injection choice.
+        """
+        normalized_goal = _normalize_event_name(goal)
+        if normalized_goal not in {"validate", "run", "benchmark"}:
+            raise ValueError(
+                "goal must be one of 'validate', 'run', or 'benchmark', "
+                f"got {goal!r}."
+            )
+
+        analysis = cls.analyze_stream(gates, n_qubits=n_qubits)
+        magic = cls.recommend_magic_strategy(
+            gates,
+            ancilla_budget=ancilla_budget,
+            prioritize_peak_bond=prioritize_peak_bond,
+        )
+        mode = magic["recommended_mode"]
+        execution_method = {
+            "direct": "apply",
+            "immediate": "with_injection",
+            "deferred": "with_deferred_injection",
+        }[mode]
+
+        nonclifford_pressure = (
+            analysis.injectable_entries
+            + analysis.other_nonclifford_entries
+            + analysis.opaque_entries
+        )
+        settings = {
+            "chi": None,
+            "cutoff": 1e-12,
+            "track_infidelity": False,
+            "exact_cooling": True,
+        }
+        if normalized_goal != "validate" and nonclifford_pressure:
+            settings["chi"] = 64
+            settings["track_infidelity"] = True
+        if (
+            mode in {"direct", "immediate", "deferred"}
+            and normalized_goal != "validate"
+            and nonclifford_pressure
+            and not analysis.cap_entries
+        ):
+            settings["layout"] = "auto"
+            settings["layout_report"] = False
+
+        warnings = list(analysis.warnings)
+        if settings["chi"] is not None:
+            warnings.append(
+                "chi=64 is a starting cap, not a convergence claim; sweep chi "
+                "for production accuracy."
+            )
+        elif (
+            normalized_goal != "validate"
+            and nonclifford_pressure
+            and analysis.estimated_qubits is not None
+            and analysis.estimated_qubits > 16
+        ):
+            warnings.append(
+                "Exact chi=None can become expensive for larger non-Clifford "
+                "streams; use it first as a correctness reference."
+            )
+        if mode == "immediate" and prioritize_peak_bond and not magic["deferred_feasible"]:
+            warnings.append(
+                "Deferred MAST was requested by priority, but it needs one fresh "
+                "ancilla per injectable gate."
+            )
+        if normalized_goal == "benchmark":
+            warnings.append(
+                "Benchmark direct, immediate, and deferred modes separately before "
+                "drawing performance conclusions."
+            )
+
+        disentangle_recommended = (
+            normalized_goal != "validate"
+            and settings["chi"] is not None
+            and (
+                analysis.other_nonclifford_entries
+                + analysis.opaque_entries
+                + analysis.submpo_entries
+            )
+            >= 4
+        )
+        if disentangle_recommended:
+            warnings.append(
+                "Consider explicit disentangle checkpoints after sizeable "
+                "non-Clifford blocks, not after every gate."
+            )
+
+        message_parts = [
+            f"Use {execution_method} for {normalized_goal} mode "
+            f"({mode} execution)."
+        ]
+        if mode == "immediate":
+            message_parts.append(
+                "Immediate injection uses one reusable clean magic ancilla by default."
+            )
+        elif mode == "deferred":
+            message_parts.append(
+                "Deferred MAST reserves one clean ancilla per injectable gate and "
+                "moves projections to the end."
+            )
+        else:
+            message_parts.append(
+                "Direct execution keeps all non-Clifford work on the coefficient "
+                "MPS path."
+            )
+        message_parts.append(
+            "Constructor settings: "
+            + ", ".join(f"{key}={value!r}" for key, value in settings.items())
+            + "."
+        )
+        if warnings:
+            message_parts.append("Warnings: " + " ".join(warnings))
+
+        return StabilizerMpsSettingsAdvice(
+            goal=normalized_goal,
+            recommended_mode=mode,
+            execution_method=execution_method,
+            settings=settings,
+            analysis=analysis,
+            magic_strategy=magic,
+            immediate_ancillas_required=int(magic["immediate_ancillas_required"]),
+            deferred_ancillas_required=int(magic["deferred_ancillas_required"]),
+            ancilla_budget=magic["ancilla_budget"],
+            deferred_feasible=magic["deferred_feasible"],
+            disentangle_checkpoints_recommended=bool(disentangle_recommended),
+            warnings=tuple(_unique_ordered(warnings)),
+            message=" ".join(message_parts),
+        )
+
+    def queued_stream_analysis(self, **kwargs) -> StreamAnalysisRecord:
+        """Analyze the currently queued Pepsy stream without consuming it."""
+        kwargs.setdefault("n_qubits", self.n)
+        return type(self).analyze_stream(self._queue, **kwargs)
+
+    def queued_recommend_settings(self, **kwargs) -> StabilizerMpsSettingsAdvice:
+        """Recommend settings for the currently queued Pepsy stream."""
+        kwargs.setdefault("n_qubits", self.n)
+        return type(self).recommend_settings(self._queue, **kwargs)
+
+    def run_queued_stream(self, **kwargs) -> StabilizerMpsRunResult:
+        """Replay the currently queued Pepsy stream through the public runner.
+
+        The current simulator is not mutated. This is useful after
+        :meth:`from_stim`, where the Stim circuit has already been sampled and
+        converted into a Pepsy stream.
+        """
+        kwargs.setdefault("n_qubits", self.n)
+        return run_stabilizer_mps_stream(self._queue, **kwargs)
 
     # ------------------------------------------------------------------ #
     # Static STN frame auto-layout
@@ -1105,7 +2163,7 @@ class MpsStabOptimizer:
 
     @staticmethod
     def _product_site_vector(p, physical_site):
-        """Extract one local vector from a bond-one coefficient MPS tensor."""
+        """Extract a local vector from an isolated coefficient-MPS site."""
         tensor = p[p.site_tag(int(physical_site))]
         physical_ind = p.site_ind(int(physical_site))
         try:
@@ -1120,7 +2178,8 @@ class MpsStabOptimizer:
             if axis != physical_axis
         ):
             raise ValueError(
-                "product-state relabeling requires every virtual dimension to be one."
+                "extracting a local product vector requires every virtual dimension "
+                "to be one."
             )
         axes = [axis for axis in range(tensor.ndim) if axis != physical_axis]
         axes.append(physical_axis)
@@ -1245,13 +2304,14 @@ class MpsStabOptimizer:
                 raise ValueError(
                     "static STN layout requires a product coefficient MPS "
                     "(state.max_bond() == 1); got max_bond={} . Apply the "
-                    "layout before non-Clifford evolution entangles |p>.".format(
+                "layout before non-Clifford evolution entangles |p>.".format(
                         self.state.max_bond()
                     )
                 )
             self._relabel_product_mps(target_order, current_order=current_order)
         self.logical_order = list(target_order)
         self._refresh_layout_map()
+        self._localizer_cache.clear()
         self.layout_plan = plan
         self.last_layout_plan = plan
         if layout_report:
@@ -1259,6 +2319,28 @@ class MpsStabOptimizer:
             if report:
                 print(report)
         return self
+
+    def _apply_layout_from_entries(
+        self,
+        entries,
+        layout,
+        *,
+        layout_kwargs=None,
+        layout_report: bool = True,
+    ) -> None:
+        """Install a static layout found from ``entries`` without queuing them."""
+        if layout is None or layout is False:
+            return
+        old_queue = self._queue
+        self._queue = list(entries)
+        try:
+            self.apply_layout(
+                layout,
+                layout_kwargs=layout_kwargs,
+                layout_report=layout_report,
+            )
+        finally:
+            self._queue = old_queue
 
     # ------------------------------------------------------------------ #
     # Execution
@@ -1273,8 +2355,8 @@ class MpsStabOptimizer:
         Parameters
         ----------
         progbar : bool
-            Show a ``tqdm`` progress bar reporting the running ``|nu>`` bond
-            dimension and current unitary norm-loss proxy.
+            Show a ``tqdm`` progress bar reporting the current stream part and
+            ``norm_infidelity`` diagnostic.
         """
         queue = tuple(self._queue)
         completed = 0
@@ -1285,26 +2367,19 @@ class MpsStabOptimizer:
             pbar = tqdm(total=len(queue), desc="stab-mps", leave=True, ascii=True)
         try:
             for entry in queue:
+                part = self._progress_entry_part(entry)
                 self._apply_entry(entry)
                 completed += 1
                 if pbar is not None:
                     pbar.update(1)
-                    infidelity = self._current_norm_infidelity
                     diagnostics = self.norm_diagnostics()
-                    total_infidelity = diagnostics["total_infidelity_proxy"]
-                    total_norm = diagnostics["total_norm_proxy"]
+                    norm_infidelity = diagnostics["norm_infidelity"]
                     pbar.set_postfix(
-                        chi=self.state.max_bond(),
-                        infid=("n/a" if infidelity is None else f"{infidelity:.2e}"),
-                        Ntotal=(
+                        part=part,
+                        norm_infidelity=(
                             "n/a"
-                            if total_norm is None
-                            else f"{total_norm:.2e}"
-                        ),
-                        Itotal=(
-                            "n/a"
-                            if total_infidelity is None
-                            else f"{total_infidelity:.2e}"
+                            if norm_infidelity is None
+                            else f"{norm_infidelity:.2e}"
                         ),
                     )
         finally:
@@ -1397,7 +2472,7 @@ class MpsStabOptimizer:
         kind: str,
         *,
         branch_probability: Optional[float] = None,
-    ) -> Optional[dict]:
+    ) -> Optional[NormEventRecord]:
         """Snapshot the current unitary segment before projective normalization."""
         if not self.track_infidelity:
             return None
@@ -1405,23 +2480,11 @@ class MpsStabOptimizer:
         if branch_probability is not None:
             branch_probability = min(1.0, max(0.0, float(branch_probability)))
 
-        event = {
-            "kind": str(kind),
-            "valid": bool(self._norm_infidelity_valid),
-            "pre_norm": None,
-            "pre_norm_sq": None,
-            "segment_infidelity": None,
-            "branch_probability": branch_probability,
-            "expected_projected_norm": None,
-            "expected_projected_norm_sq": None,
-            "projected_norm": None,
-            "projected_norm_sq": None,
-            "projector_survival": None,
-            "projector_survival_raw": None,
-            "projector_infidelity": None,
-            "post_norm": None,
-            "post_norm_sq": None,
-        }
+        event = NormEventRecord(
+            kind=str(kind),
+            valid=bool(self._norm_infidelity_valid),
+            branch_probability=branch_probability,
+        )
         if not self._norm_infidelity_valid:
             return event
 
@@ -1439,14 +2502,15 @@ class MpsStabOptimizer:
 
     def _commit_norm_event(
         self,
-        event: Optional[dict],
+        event: Optional[NormEventRecord],
         *,
         projected_norm: Optional[float] = None,
     ) -> None:
         """Record a pre-normalization event after projection succeeded."""
         if event is None:
             return
-        event = dict(event)
+        if not isinstance(event, NormEventRecord):
+            event = NormEventRecord(**dict(event))
         if projected_norm is not None:
             projected_norm = float(projected_norm)
             projected_norm_sq = max(0.0, projected_norm * projected_norm)
@@ -1545,6 +2609,11 @@ class MpsStabOptimizer:
             None if current_loss is None
             else float(max(0.0, 1.0 - current_loss) ** 0.5)
         )
+        norm_infidelity = (
+            None if total_survival is None else float(1.0 - total_survival)
+        )
+        norm_survival = total_survival
+        norm = None if total_survival is None else float(total_survival ** 0.5)
         return {
             "tracking": self.track_infidelity,
             "current_valid": bool(self._norm_infidelity_valid),
@@ -1562,13 +2631,12 @@ class MpsStabOptimizer:
             ],
             "current_segment_norm": current_norm,
             "current_segment_infidelity": current_loss,
-            "total_survival_proxy": total_survival,
-            "total_infidelity_proxy": (
-                None if total_survival is None else float(1.0 - total_survival)
-            ),
-            "total_norm_proxy": (
-                None if total_survival is None else float(total_survival ** 0.5)
-            ),
+            "norm_survival": norm_survival,
+            "norm_infidelity": norm_infidelity,
+            "norm": norm,
+            "total_survival_proxy": norm_survival,
+            "total_infidelity_proxy": norm_infidelity,
+            "total_norm_proxy": norm,
             "geometric_mean_survival": geometric_mean_survival,
             "geometric_mean_norm": (
                 None if geometric_mean_survival is None
@@ -1688,6 +2756,7 @@ class MpsStabOptimizer:
             max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
             max_dense_cap_qubits=self.max_dense_cap_qubits,
             track_infidelity=self.track_infidelity,
+            exact_cooling=self.exact_cooling,
             dtype=self.dtype,
             to_backend=self.to_backend,
         )
@@ -1700,6 +2769,7 @@ class MpsStabOptimizer:
         copied.last_layout_plan = (
             None if self.last_layout_plan is None else dict(self.last_layout_plan)
         )
+        copied._localizer_cache = dict(self._localizer_cache)
         return copied
 
     # ------------------------------------------------------------------ #
@@ -1966,30 +3036,169 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Scalable computational-basis sampling (no 2**n statevector)
     # ------------------------------------------------------------------ #
-    def sample_bits(self, shots: int = 1, *, seed=None) -> np.ndarray:
+    def _bit_measurement_order(self, order=None) -> tuple[int, ...]:
+        """Return a validated physical-qubit order for computational readout."""
+        if order is None:
+            order = "physical"
+        if isinstance(order, str):
+            key = order.strip().replace("-", "_").lower()
+            if key in ("physical", "index", "default"):
+                return tuple(range(self.n))
+            if key in ("mps", "layout"):
+                return tuple(int(q) for q in self.logical_order)
+            if key == "auto":
+                return (
+                    tuple(range(self.n))
+                    if self._layout_is_identity()
+                    else tuple(int(q) for q in self.logical_order)
+                )
+            raise ValueError(
+                "order must be 'physical', 'mps', 'auto', or a permutation "
+                f"of range({self.n}); got {order!r}."
+            )
+        try:
+            order = tuple(int(q) for q in order)
+        except TypeError as exc:
+            raise TypeError(
+                "order must be a string or a permutation of qubit indices."
+            ) from exc
+        if len(order) != self.n or sorted(order) != list(range(self.n)):
+            raise ValueError(
+                f"order must be a permutation of range({self.n}), got {order!r}."
+            )
+        return order
+
+    def _computational_z_frame_terms(self, order) -> dict[int, tuple[dict, int]]:
+        """Precompute ``C^dagger Z_q C`` frame images for a readout order.
+
+        Fixed-basis computational measurements leave the tableau unchanged, so a
+        whole readout tree can reuse these frame terms across every branch.
+        """
+        return {int(q): self._frame_terms("Z", int(q)) for q in order}
+
+    @staticmethod
+    def _prob_zero_from_expectation(exp: float) -> float:
+        """Return clipped ``P(bit=0)`` for a computational-basis Z readout."""
+        return min(max(0.5 * (1.0 + float(exp)), 0.0), 1.0)
+
+    def _sample_rng(self, seed):
+        """Return the RNG used by shot-sampling helpers."""
+        if seed is None:
+            return self._rng
+        if isinstance(seed, np.random.Generator):
+            return seed
+        return np.random.default_rng(seed)
+
+    @staticmethod
+    def pack_bit_samples(samples) -> np.ndarray:
+        """Pack an ``(shots, n)`` 0/1 sample array along the qubit axis."""
+        arr = np.asarray(samples, dtype=np.uint8)
+        if arr.ndim != 2:
+            raise ValueError("samples must be a 2D array of 0/1 bit values.")
+        return np.packbits(arr, axis=1, bitorder="big")
+
+    def _condition_computational_bit(
+        self,
+        terms,
+        sign,
+        bit: int,
+        *,
+        probability: Optional[float] = None,
+    ) -> Optional[float]:
+        """Condition this simulator copy on one computational-basis bit.
+
+        Returns the branch probability, or ``None`` if the branch is numerically
+        impossible.  The tableau is intentionally unchanged: this is the fixed
+        basis projector path used by computational readout.
+        """
+        outcome = +1 if int(bit) == 0 else -1
+        if probability is None:
+            probability = self._outcome_probability(
+                self._pauli_expectation(terms, sign),
+                outcome,
+            )
+        probability = float(probability)
+        if probability <= 1e-12:
+            return None
+        self._apply_projector(terms, sign, outcome)
+        return probability
+
+    @staticmethod
+    def _bits_matrix(bitstrings, *, expected_length: int) -> np.ndarray:
+        """Normalize one or more bitstrings to an ``(rows, n)`` int8 matrix."""
+        if isinstance(bitstrings, str):
+            rows = [_validate_bits(bitstrings, expected_length=expected_length)]
+        else:
+            arr = np.asarray(bitstrings)
+            if arr.ndim == 2:
+                rows = [
+                    _validate_bits(row.tolist(), expected_length=expected_length)
+                    for row in arr
+                ]
+            else:
+                try:
+                    values = list(bitstrings)
+                except TypeError as exc:
+                    raise TypeError(
+                        "bitstrings must be a bitstring, a sequence of bitstrings, "
+                        "or a 2D array-like of 0/1 values."
+                    ) from exc
+                if not values:
+                    return np.empty((0, expected_length), dtype=np.int8)
+                first = values[0]
+                if isinstance(first, str):
+                    rows = [
+                        _validate_bits(row, expected_length=expected_length)
+                        for row in values
+                    ]
+                else:
+                    rows = [_validate_bits(values, expected_length=expected_length)]
+        return np.asarray(rows, dtype=np.int8)
+
+    def sample_bits(
+        self,
+        shots: int = 1,
+        *,
+        seed=None,
+        order=None,
+        shuffle: bool = True,
+        packed: bool = False,
+    ) -> np.ndarray:
         """Sample computational-basis bitstrings ``x ~ |<x|psi>|**2`` (scalable).
 
         Uses **perfect (tree) sampling**: shots that share a measured prefix
         share the collapsed state, so the ``Z_0 ... Z_{n-1}`` collapse work is
         done once per distinct prefix rather than once per shot — a large saving
         for low-rank/structured ``|nu>`` (e.g. a state copy happens only at a
-        genuine branch point, not per shot).  Returns an ``(shots, n)`` ``int8``
-        array of 0/1 with qubit ``q`` in column ``q`` (qubit 0 first). The final
-        uniform row permutation converts prefix-grouped branch counts into an
-        exchangeable i.i.d. sample sequence.
+        genuine branch point, not per shot).  ``order`` controls the commuting
+        ``Z``-measurement order: ``"physical"`` keeps the historical ``0..n-1``
+        order, ``"mps"`` follows the current coefficient-MPS layout, ``"auto"``
+        uses the layout order only when a nontrivial layout is installed, and an
+        explicit permutation is also accepted.  Returns an ``(shots, n)``
+        ``int8`` array of 0/1 with qubit ``q`` in column ``q``. The final uniform
+        row permutation converts prefix-grouped branch counts into an
+        exchangeable i.i.d. sample sequence; set ``shuffle=False`` to keep the
+        prefix grouping and avoid the final memory shuffle. Set ``packed=True``
+        to return ``np.packbits(..., axis=1, bitorder="big")`` output with dtype
+        ``uint8`` and ``ceil(n / 8)`` columns.
         """
-        rng = self._rng if seed is None else np.random.default_rng(seed)
+        rng = self._sample_rng(seed)
         shots = int(shots)
         out = np.empty((shots, self.n), dtype=np.int8)
         if shots == 0:
-            return out
-        # Stack of (collapsed_sim, qubit, lo, hi): rows [lo:hi) share this state.
+            return self.pack_bit_samples(out) if packed else out
+        order = self._bit_measurement_order(order)
+        frame_terms = self._computational_z_frame_terms(order)
+        # Stack of (collapsed_sim, order_position, lo, hi): rows [lo:hi) share
+        # this state and have measured the prefix order[:order_position].
         stack = [(self.copy(), 0, 0, shots)]
         while stack:
-            sim, q, lo, hi = stack.pop()
+            sim, pos, lo, hi = stack.pop()
+            q = order[pos]
             count = hi - lo
-            exp = sim.expectation("Z", q)
-            p0 = min(max(0.5 * (1.0 + exp), 0.0), 1.0)  # P(bit q = 0 | prefix)
+            terms, sign = frame_terms[q]
+            exp = sim._pauli_expectation(terms, sign)
+            p0 = self._prob_zero_from_expectation(exp)
             if p0 <= 1e-12:
                 n0 = 0
             elif p0 >= 1.0 - 1e-12:
@@ -1999,38 +3208,133 @@ class MpsStabOptimizer:
             mid = lo + n0
             out[lo:mid, q] = 0
             out[mid:hi, q] = 1
-            if q + 1 == self.n:
+            if pos + 1 == self.n:
                 continue  # last qubit: bits written, nothing left to collapse
             both = 0 < n0 < count
             if n0 > 0:
                 s0 = sim.copy() if both else sim
-                s0.measure("Z", q, outcome=+1)  # collapse this branch to |0>_q
-                stack.append((s0, q + 1, lo, mid))
+                s0._condition_computational_bit(terms, sign, 0, probability=p0)
+                stack.append((s0, pos + 1, lo, mid))
             if n0 < count:
-                sim.measure("Z", q, outcome=-1)  # reuse original for the |1> branch
-                stack.append((sim, q + 1, mid, hi))
-        rng.shuffle(out, axis=0)
-        return out
+                sim._condition_computational_bit(terms, sign, 1, probability=1.0 - p0)
+                stack.append((sim, pos + 1, mid, hi))
+        if shuffle:
+            rng.shuffle(out, axis=0)
+        return self.pack_bit_samples(out) if packed else out
 
-    def probability_bits(self, bits) -> float:
+    def probability_bits(self, bits, *, order=None) -> float:
         """Return ``|<bits|psi>|**2`` via chain-rule conditionals (scalable).
 
         Multiplies the per-qubit conditional Born probabilities along a forced
-        ``Z_0 ... Z_{n-1}`` measurement of a copy, so it costs ``O(n)`` MPS
+        computational-basis measurement of a copy, so it costs ``O(n)`` MPS
         measurements instead of an ``O(2**n)`` statevector.  ``bits`` is a string
         like ``'010'`` or a 0/1 sequence with qubit ``q`` at position ``q``.
+        ``order`` accepts the same values as :meth:`sample_bits`.
         """
         bits = _validate_bits(bits, expected_length=self.n)
+        order = self._bit_measurement_order(order)
+        frame_terms = self._computational_z_frame_terms(order)
         tmp = self.copy()
         prob = 1.0
-        for q, b in enumerate(bits):
-            exp = tmp.expectation("Z", q)  # <Z_q> in the current (collapsed) state
-            pq = 0.5 * (1.0 + (1 if b == 0 else -1) * exp)
-            if pq <= 0.0:
+        for q in order:
+            b = int(bits[q])
+            terms, sign = frame_terms[q]
+            exp = tmp._pauli_expectation(terms, sign)
+            p0 = self._prob_zero_from_expectation(exp)
+            pq = p0 if b == 0 else 1.0 - p0
+            # ``measure(..., outcome=...)`` rejects post-selection below this
+            # tolerance. Treat the same numerically zero branch as a zero
+            # probability here instead of attempting an impossible collapse.
+            if pq <= 1e-12:
                 return 0.0
             prob *= pq
-            tmp.measure("Z", q, outcome=(+1 if b == 0 else -1))
+            tmp._condition_computational_bit(terms, sign, b, probability=pq)
         return float(prob)
+
+    def probability_bits_many(self, bitstrings, *, order=None) -> np.ndarray:
+        """Return probabilities for many computational-basis bitstrings.
+
+        This is the batched counterpart to :meth:`probability_bits`.  Rows with
+        a shared measured prefix share one collapsed simulator copy, so repeated
+        or prefix-clustered bitstrings avoid replaying the full chain-rule
+        readout independently.
+        """
+        bits = self._bits_matrix(bitstrings, expected_length=self.n)
+        probs = np.zeros(bits.shape[0], dtype=float)
+        if bits.shape[0] == 0:
+            return probs
+        order = self._bit_measurement_order(order)
+        frame_terms = self._computational_z_frame_terms(order)
+        stack = [(self.copy(), 0, np.arange(bits.shape[0]), 1.0)]
+        while stack:
+            sim, pos, indices, prefix_prob = stack.pop()
+            if indices.size == 0:
+                continue
+            q = order[pos]
+            terms, sign = frame_terms[q]
+            exp = sim._pauli_expectation(terms, sign)
+            p0 = self._prob_zero_from_expectation(exp)
+            branch_specs = (
+                (0, indices[bits[indices, q] == 0], p0),
+                (1, indices[bits[indices, q] == 1], 1.0 - p0),
+            )
+            live = [
+                (bit, idx, float(p_branch))
+                for bit, idx, p_branch in branch_specs
+                if idx.size > 0 and p_branch > 1e-12
+            ]
+            for _bit, idx, p_branch in branch_specs:
+                if idx.size > 0 and p_branch <= 1e-12:
+                    probs[idx] = 0.0
+            for branch_index, (bit, idx, p_branch) in enumerate(live):
+                branch_prob = prefix_prob * p_branch
+                if pos + 1 == self.n:
+                    probs[idx] = branch_prob
+                    continue
+                child = sim.copy() if branch_index < len(live) - 1 else sim
+                child._condition_computational_bit(
+                    terms,
+                    sign,
+                    bit,
+                    probability=p_branch,
+                )
+                stack.append((child, pos + 1, idx, branch_prob))
+        return probs
+
+    def iter_sample_bits(
+        self,
+        shots: int,
+        *,
+        chunk_size: int,
+        seed=None,
+        order=None,
+        shuffle: bool = True,
+        packed: bool = False,
+    ):
+        """Yield computational-basis samples in chunks.
+
+        Each yielded array has at most ``chunk_size`` rows and the same column
+        convention as :meth:`sample_bits`.  A single RNG is shared across chunks,
+        so seeded chunked sampling does not repeat the first chunk.
+        """
+        shots = int(shots)
+        chunk_size = int(chunk_size)
+        if shots < 0:
+            raise ValueError("shots must be nonnegative.")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive.")
+        rng = self._sample_rng(seed)
+        done = 0
+        while done < shots:
+            take = min(chunk_size, shots - done)
+            yield self.sample_bits(
+                take,
+                seed=rng,
+                order=order,
+                shuffle=shuffle,
+                packed=packed,
+            )
+            done += take
 
     # ------------------------------------------------------------------ #
     # Entry dispatch
@@ -2181,6 +3485,136 @@ class MpsStabOptimizer:
         self.state.do_tableau(tableau, where)
         self._record()
 
+    @staticmethod
+    def _stabilizer_product_eigenstate(vector, *, tol: float = 1e-10):
+        """Return the signed Pauli eigenstate of a normalized local vector.
+
+        A site is usable by constructive exact cooling only when it is both
+        isolated in the coefficient MPS and exactly a one-qubit stabilizer
+        state. Returning ``(axis, sign)`` means ``sign * axis`` has eigenvalue
+        ``+1`` on the vector; otherwise return ``None``.
+        """
+        from autoray import to_numpy  # pylint: disable=import-outside-toplevel
+
+        vec = np.array(to_numpy(vector), dtype=complex, copy=True).reshape(-1)
+        if vec.shape != (2,):  # pragma: no cover - guarded by the qubit MPS API
+            return None
+        norm = float(np.linalg.norm(vec))
+        if norm <= tol:
+            return None
+        vec /= norm
+        bloch = {
+            axis: float(np.real(np.vdot(vec, pauli_matrix(axis) @ vec)))
+            for axis in ("X", "Y", "Z")
+        }
+        axis = max(bloch, key=lambda key: abs(bloch[key]))
+        if abs(abs(bloch[axis]) - 1.0) > tol:
+            return None
+        if any(abs(bloch[other]) > tol for other in bloch if other != axis):
+            return None
+        return axis, (1 if bloch[axis] >= 0.0 else -1)
+
+    @staticmethod
+    def _exact_cooling_basis_tableau(axis: str, sign: int):
+        """Build a one-qubit Clifford mapping ``sign * axis`` to ``+Z``."""
+        import stim
+
+        axis = str(axis).upper()
+        sign = int(sign)
+        sim = stim.TableauSimulator()
+        sim.set_num_qubits(1)
+        if sign < 0:
+            {"X": sim.z, "Y": sim.x, "Z": sim.x}[axis](0)
+        if axis == "X":
+            sim.h(0)
+        elif axis == "Y":
+            sim.s_dag(0)
+            sim.h(0)
+        elif axis != "Z":  # pragma: no cover - internal Pauli validation
+            raise ValueError(f"Unknown Pauli axis {axis!r}.")
+        return sim.current_inverse_tableau().inverse()
+
+    def _exact_controlled_pauli_tableau(self, pivot, pivot_axis, pivot_sign, terms):
+        """Return the Clifford cascade for one constructive exact-cooling step.
+
+        The pivot starts in the ``+1`` eigenspace of
+        ``pivot_sign * pivot_axis``. The resulting Clifford applies the Pauli
+        string on the remaining support exactly when the local rotation flips
+        that eigenvalue.
+        """
+        import stim
+
+        pivot = int(pivot)
+        basis = self._exact_cooling_basis_tableau(pivot_axis, pivot_sign)
+        sim = stim.TableauSimulator()
+        sim.set_num_qubits(self.n)
+        sim.do_tableau(basis, [pivot])
+        for target, axis in terms.items():
+            if int(target) == pivot:
+                continue
+            target = int(target)
+            axis = str(axis).upper()
+            if axis == "X":
+                sim.cnot(pivot, target)
+            elif axis == "Z":
+                sim.cz(pivot, target)
+            elif axis == "Y":
+                # CY = S(target) CX S-dagger(target), written in execution order.
+                sim.s_dag(target)
+                sim.cnot(pivot, target)
+                sim.s(target)
+            else:  # pragma: no cover - internal Pauli validation
+                raise ValueError(f"Unknown Pauli axis {axis!r}.")
+        sim.do_tableau(basis.inverse(), [pivot])
+        return sim.current_inverse_tableau().inverse()
+
+    def _try_exact_cooling(self, theta, terms, sign) -> bool:
+        """Apply the constructive exact-cooling identity when its pivot exists.
+
+        For ``M = sign * A_i * Q`` and an isolated stabilizer coefficient site
+        ``i`` whose stabilizer anticommutes with ``A_i``,
+        ``R_M(theta)|nu> = G R_Ai(sign * theta)|nu>``. ``G`` is a
+        controlled-Pauli Clifford, so it is absorbed into the tableau while the
+        coefficient MPS receives only the local rotation.
+        """
+        if not self.exact_cooling or len(terms) < 2:
+            return False
+
+        p = self.state.p
+        for pivot in sorted(terms, key=lambda site: (self._mps_site(site), int(site))):
+            mps_pivot = self._mps_site(pivot)
+            try:
+                vector = self._product_site_vector(p, mps_pivot)
+            except ValueError:
+                continue
+            stabilizer = self._stabilizer_product_eigenstate(vector)
+            if stabilizer is None:
+                continue
+            pivot_axis, pivot_sign = stabilizer
+            rotation_axis = terms[pivot]
+            if rotation_axis == pivot_axis:
+                continue  # commuting local Pauli: this site cannot be a pivot
+
+            cascade = self._exact_controlled_pauli_tableau(
+                pivot, pivot_axis, pivot_sign, terms
+            )
+            local_rotation = single_qubit_rotation_matrix(
+                theta, rotation_axis, sign, self.dtype
+            )
+            p.gate_(self._bk(local_rotation), mps_pivot, contract=True)
+            # ``absorb_basis_clifford(V)`` sends C -> C V-dagger. Here V = G-dagger,
+            # hence the physical representation becomes C G R_Ai |nu>.
+            self.state.absorb_basis_clifford(cascade.inverse())
+            self.exact_cooling_events.append({
+                "pivot": int(pivot),
+                "mps_site": int(mps_pivot),
+                "support": tuple(sorted(int(site) for site in terms)),
+                "pivot_stabilizer": f"{'+' if pivot_sign > 0 else '-'}{pivot_axis}",
+            })
+            self._record()
+            return True
+        return False
+
     def _apply_rotation(self, name, params) -> None:
         theta, where, axes = self._rotation_spec(name, params)
         # Validate the complete support before either the tableau or MPS changes.
@@ -2195,6 +3629,8 @@ class MpsStabOptimizer:
         support = sorted(terms)
         if not support:  # global phase only; no state change
             self._record()
+            return
+        if self._try_exact_cooling(theta, terms, sign):
             return
         if len(support) == 1:
             q = support[0]
@@ -2220,7 +3656,7 @@ class MpsStabOptimizer:
         *,
         unitary: bool = False,
         renormalize: bool = False,
-        norm_event: Optional[dict] = None,
+        norm_event: Optional[NormEventRecord] = None,
     ) -> Optional[float]:
         """Apply a windowed sub-MPO to the coefficient MPS ``p`` on ``where``.
 
@@ -2374,7 +3810,7 @@ class MpsStabOptimizer:
                 outcome,
                 norm_event_kind="measure_absorb",
             )
-            self.measurements.append((pauli, where, m))
+            self.measurements.append(MeasurementRecord(pauli, where, int(m)))
             return m
         terms, sign = self._frame_terms(pauli, where)
         forced = self._validate_outcome(outcome)
@@ -2400,7 +3836,7 @@ class MpsStabOptimizer:
             else None
         )
         self._apply_projector(terms, sign, m, norm_event=norm_event)
-        self.measurements.append((pauli, where, m))
+        self.measurements.append(MeasurementRecord(pauli, where, int(m)))
         return m
 
     def reset(self, where, basis="Z") -> "MpsStabOptimizer":
@@ -2511,9 +3947,27 @@ class MpsStabOptimizer:
         tableau = stim.TableauSimulator()
         tableau.set_num_qubits(n - 1)
         self.state = STNState.from_tableau_and_state(tableau, p, dtype=self.dtype)
+        self._localizer_cache.clear()
         self._invalidate_norm_infidelity()
         self._record()
         return self
+
+    def _localizing_clifford_cached(self, terms):
+        """Return the cached measurement localizer for ``terms`` and layout."""
+        key = (
+            tuple(self.logical_order),
+            tuple(sorted((int(site), str(axis)) for site, axis in terms.items())),
+        )
+        cached = self._localizer_cache.get(key)
+        if cached is None:
+            ops, v_tableau, k = _localizing_clifford(
+                terms,
+                self.n,
+                site_position=self._mps_site,
+            )
+            cached = (tuple(ops), v_tableau, int(k))
+            self._localizer_cache[key] = cached
+        return cached
 
     def _absorb_measure(
         self,
@@ -2543,11 +3997,7 @@ class MpsStabOptimizer:
         if not support:  # M = +/- I: deterministic, state unchanged
             self._record()
             return int(sign)
-        ops, v_tableau, k = _localizing_clifford(
-            terms,
-            self.n,
-            site_position=self._mps_site,
-        )
+        ops, v_tableau, k = self._localizing_clifford_cached(terms)
         conj_terms, s = hermitian_pauli_terms(v_tableau(m_pauli))  # V M V^dag
         if conj_terms != {k: "Z"}:  # pragma: no cover - localizer invariant
             raise RuntimeError(
@@ -2614,7 +4064,7 @@ class MpsStabOptimizer:
         k,
         keep_bit,
         *,
-        norm_event: Optional[dict] = None,
+        norm_event: Optional[NormEventRecord] = None,
     ) -> None:
         """Project coefficient site ``k`` onto ``|keep_bit>`` and renormalize ``|nu>``."""
         mps_k = self._mps_site(k)
@@ -2635,7 +4085,7 @@ class MpsStabOptimizer:
         sign,
         m,
         *,
-        norm_event: Optional[dict] = None,
+        norm_event: Optional[NormEventRecord] = None,
     ) -> None:
         """Apply ``(I + m M)/2`` to ``|nu>`` and renormalize (M = sign * prod terms)."""
         support = sorted(terms)
@@ -2679,7 +4129,11 @@ class MpsStabOptimizer:
         a Clifford ``H`` (tableau only) followed by the ``Rz(angle)`` rotation; on
         a decoupled ``|0>`` qubit this keeps ``|nu>`` compact.
         """
-        a = int(ancilla)
+        (a,) = self._validate_magic_ancilla_pool(
+            [ancilla],
+            require_nonempty=True,
+        )
+        self._assert_magic_ancillas_clean((a,))
         self.state.apply_clifford("h", a)  # |0> -> |+>, Clifford (tableau only)
         self._record()
         self._apply_rotation("rz", (float(angle), a))  # |+> -> Rz(angle)|+> = |M>
@@ -2715,13 +4169,34 @@ class MpsStabOptimizer:
                 "Clifford+T (e.g. gridsynth) and inject each T."
             )
         data, ancilla = int(data), int(ancilla)
+        if not 0 <= data < self.n:
+            raise ValueError(
+                f"injection data qubit {data} is outside qubit range [0, {self.n})."
+            )
+        if not 0 <= ancilla < self.n:
+            raise ValueError(
+                f"injection ancilla qubit {ancilla} is outside qubit range [0, {self.n})."
+            )
+        if data == ancilla:
+            raise ValueError("injection data and ancilla qubits must be distinct.")
         # CNOT(control=data, target=ancilla): Clifford, tableau only.
         self.state.apply_clifford("cnot", data, ancilla)
         self._record()
         # Measure the ancilla in Z, absorbing it out of |nu>.
+        bond_before = self.state.max_bond()
+        projection_start = time.perf_counter()
         m = self.measure("Z", ancilla, absorb_basis=True, outcome=outcome)
         if m < 0:  # ancilla collapsed to |1>: outcome-conditioned Rz(2*phi) correction.
             self._apply_rotation("rz", (2.0 * phi, data))
+        self._last_injection_projection_event = ImmediateProjectionRecord(
+            data=data,
+            ancilla=ancilla,
+            angle=phi,
+            outcome=int(m),
+            elapsed_s=float(time.perf_counter() - projection_start),
+            bond_before=int(bond_before),
+            bond_after=int(self.state.max_bond()),
+        )
         return m
 
     def inject_t(self, data, ancilla, *, outcome: Optional[int] = None) -> int:
@@ -2740,7 +4215,8 @@ class MpsStabOptimizer:
         """
         return self.inject_rz(data, ancilla, -math.pi / 4, outcome=outcome)
 
-    def _injectable_rz(self, entry):
+    @classmethod
+    def _injectable_rz(cls, entry):
         """Return ``(data_qubit, phi)`` if ``entry`` is an injectable ``Z``-rotation.
 
         Injectable = a diagonal ``T``/``T-dagger``/``Rz(phi)`` gate that is
@@ -2759,9 +4235,107 @@ class MpsStabOptimizer:
         if name == "rz":
             phi, q = float(entry[1]), int(entry[2])
             k = phi / (math.pi / 4)
-            if abs(k - round(k)) < 1e-9 and not self._is_clifford_angle(phi):
+            if abs(k - round(k)) < 1e-9 and not cls._is_clifford_angle(phi):
                 return q, phi
         return None
+
+    @staticmethod
+    def _magic_prepare_layout_entries(ancilla, phi):
+        """Synthetic layout entries for preparing one magic ancilla."""
+        return [("h", int(ancilla)), ("rz", float(phi), int(ancilla))]
+
+    @staticmethod
+    def _magic_measure_layout_entry(ancilla, outcome=+1):
+        """Synthetic layout entry for a basis-updating magic projection."""
+        return ("measure", "Z", int(ancilla), int(outcome), True)
+
+    def _nearest_magic_ancilla(self, candidates, data):
+        """Choose the candidate ancilla nearest to ``data`` in current MPS order."""
+        return min(
+            candidates,
+            key=lambda ancilla: abs(self._mps_site(ancilla) - self._mps_site(data)),
+        )
+
+    def _immediate_injection_layout_entries(
+        self,
+        entries,
+        specs,
+        pool,
+        *,
+        recycle: bool,
+        reset_ancillas: bool,
+    ) -> list:
+        """Return a layout-only stream for the immediate-injection replay."""
+        layout_entries = []
+        dirty = {a: False for a in pool}
+        for entry, spec in zip(entries, specs):
+            if spec is None:
+                layout_entries.append(entry)
+                continue
+            data, phi = spec
+            clean = [a for a in pool if not dirty[a]]
+            if clean:
+                ancilla = self._nearest_magic_ancilla(clean, data)
+            elif recycle:
+                ancilla = self._nearest_magic_ancilla(pool, data)
+                layout_entries.append(("reset", ancilla))
+            else:
+                ancilla = self._nearest_magic_ancilla(pool, data)
+            layout_entries.extend(self._magic_prepare_layout_entries(ancilla, phi))
+            layout_entries.append(("cnot", int(data), int(ancilla)))
+            layout_entries.append(self._magic_measure_layout_entry(ancilla))
+            dirty[ancilla] = True
+        if reset_ancillas:
+            layout_entries.extend(("reset", ancilla) for ancilla, is_dirty in dirty.items() if is_dirty)
+        return layout_entries
+
+    def _deferred_injection_layout_entries(
+        self,
+        entries,
+        specs,
+        pool,
+        outcomes,
+        *,
+        projection_order,
+        reset_ancillas: bool,
+    ) -> list:
+        """Return a layout-only stream for the deferred-injection replay."""
+        layout_entries = []
+        pending = []
+        injection_index = 0
+        for entry, spec in zip(entries, specs):
+            if spec is None:
+                layout_entries.append(entry)
+                continue
+            data, phi = spec
+            ancilla = pool[injection_index]
+            outcome = outcomes[injection_index]
+            layout_entries.extend(self._magic_prepare_layout_entries(ancilla, phi))
+            layout_entries.append(("cnot", int(data), int(ancilla)))
+            if outcome < 0:
+                layout_entries.append(("rz", 2.0 * float(phi), int(data)))
+            pending.append(DeferredInjectionRecord(
+                index=injection_index,
+                ancilla=int(ancilla),
+                data=int(data),
+                angle=float(phi),
+                outcome=int(outcome),
+            ))
+            injection_index += 1
+
+        sequence = self._deferred_projection_sequence(pending, projection_order)
+        if sequence is None:
+            sequence = list(pending)
+        for event in sequence:
+            layout_entries.append(
+                self._magic_measure_layout_entry(
+                    event["ancilla"],
+                    outcome=event["outcome"],
+                )
+            )
+            if reset_ancillas and event["outcome"] < 0:
+                layout_entries.append(("x", int(event["ancilla"])))
+        return layout_entries
 
     def run_with_injection(
         self,
@@ -2771,6 +4345,9 @@ class MpsStabOptimizer:
         recycle: bool = True,
         reset_ancillas: bool = True,
         progbar: bool = False,
+        layout=None,
+        layout_kwargs=None,
+        layout_report: bool = True,
     ) -> "MpsStabOptimizer":
         """Replay ``gates``, teleporting ``Z``-rotations through magic-state injection.
 
@@ -2797,42 +4374,60 @@ class MpsStabOptimizer:
             end, so the final state is ``(data result) (x) |0...0>_ancilla``.
         progbar : bool
             Show a ``tqdm`` progress bar.
+        layout : str | mapping | sequence | None
+            Optional static frame layout installed before replay. ``"auto"``
+            uses a synthetic stream containing the magic preparation,
+            injection-CNOT, and basis-updating projection supports.
 
         Returns ``self``.
         """
-        pool = [int(a) for a in ancillas]
-        if not pool:
-            raise ValueError("run_with_injection needs at least one ancilla qubit.")
-        pool_set = set(pool)
+        pool = self._validate_magic_ancilla_pool(
+            ancillas,
+            require_nonempty=True,
+        )
         entries = self._as_entries(gates)
+        specs = [self._injectable_rz(entry) for entry in entries]
+        self._validate_magic_stream_protection(
+            entries,
+            specs,
+            pool,
+            mode="immediate",
+        )
+        self._assert_magic_ancillas_clean(pool)
+        self._apply_layout_from_entries(
+            self._immediate_injection_layout_entries(
+                entries,
+                specs,
+                pool,
+                recycle=recycle,
+                reset_ancillas=reset_ancillas,
+            ),
+            layout,
+            layout_kwargs=layout_kwargs,
+            layout_report=layout_report,
+        )
         dirty = {a: False for a in pool}
+        self.immediate_projection_events = []
+        self.last_immediate_injection_report = None
 
         pbar = None
         if progbar and entries:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
 
             pbar = tqdm(total=len(entries), desc="stab-inject", leave=True, ascii=True)
-        for entry in entries:
-            spec = self._injectable_rz(entry)
+        for entry, spec in zip(entries, specs):
             if spec is None:
                 self._apply_entry(entry)
             else:
                 data, phi = spec
-                if data in pool_set:
-                    raise ValueError(
-                        f"injection target qubit {data} is in the ancilla pool {pool}."
-                    )
                 # Prefer the nearest *clean* ancilla to the data qubit (shorter
                 # localizer span -> fewer MPS swaps); recycle the nearest dirty
                 # one only if no clean ancilla is left.
                 clean = [a for a in pool if not dirty[a]]
-                def mps_distance(a):
-                    return abs(self._mps_site(a) - self._mps_site(data))
-
                 if clean:
-                    a = min(clean, key=mps_distance)
+                    a = self._nearest_magic_ancilla(clean, data)
                 elif recycle:
-                    a = min(pool, key=mps_distance)
+                    a = self._nearest_magic_ancilla(pool, data)
                     self.reset(a)
                 else:
                     raise RuntimeError(
@@ -2841,6 +4436,9 @@ class MpsStabOptimizer:
                     )
                 self.prepare_magic(a, angle=phi)
                 self.inject_rz(data, a, phi)
+                self.immediate_projection_events.append(
+                    self._last_injection_projection_event
+                )
                 dirty[a] = True
             if pbar is not None:
                 pbar.update(1)
@@ -2852,6 +4450,19 @@ class MpsStabOptimizer:
             for a in pool:
                 if dirty[a]:
                     self.reset(a)
+        self.last_immediate_injection_report = ImmediateInjectionReport(
+            n_injections=len(self.immediate_projection_events),
+            projection_elapsed_s=float(sum(
+                event["elapsed_s"] for event in self.immediate_projection_events
+            )),
+            projection_peak_bond=int(max(
+                (
+                    max(event["bond_before"], event["bond_after"])
+                    for event in self.immediate_projection_events
+                ),
+                default=self.state.max_bond(),
+            )),
+        )
         return self
 
     @classmethod
@@ -2874,12 +4485,321 @@ class MpsStabOptimizer:
             raise ValueError("with_injection needs n_ancilla >= 1.")
         run_opts = {
             k: kwargs.pop(k)
-            for k in ("recycle", "reset_ancillas", "progbar")
+            for k in (
+                "recycle",
+                "reset_ancillas",
+                "progbar",
+                "layout",
+                "layout_kwargs",
+                "layout_report",
+            )
             if k in kwargs
         }
         sim = cls(n_data + n_ancilla, **kwargs)
         sim.run_with_injection(
             gates, ancillas=range(n_data, n_data + n_ancilla), **run_opts
+        )
+        return sim
+
+    @staticmethod
+    def _deferred_injection_outcomes(outcomes, count, rng) -> tuple[int, ...]:
+        """Normalize predetermined magic-measurement outcomes."""
+        if outcomes is None:
+            return tuple(1 if rng.random() < 0.5 else -1 for _ in range(count))
+        try:
+            values = tuple(outcomes)
+        except TypeError as exc:
+            raise TypeError("outcomes must be a sequence of +1/-1 values or None.") from exc
+        if len(values) != count:
+            raise ValueError(
+                f"outcomes must contain one value per injectable gate ({count}), "
+                f"got {len(values)}."
+            )
+        return tuple(MpsStabOptimizer._validate_outcome(value) for value in values)
+
+    def _deferred_projection_metrics(self, ancilla) -> tuple[int, int]:
+        """Return current coefficient-frame support size and MPS span for ``Z_a``."""
+        terms, _sign = self._frame_terms("Z", ancilla)
+        positions = [self._mps_site(site) for site in terms]
+        if not positions:
+            return 0, 0
+        return len(positions), int(max(positions) - min(positions))
+
+    def _deferred_projection_sequence(self, pending, projection_order):
+        """Return a static order, or the ``min_span`` sentinel, for pending ancillas."""
+        pending = tuple(pending)
+        ancillas = tuple(event["ancilla"] for event in pending)
+        if isinstance(projection_order, str):
+            key = projection_order.replace("-", "_").strip().lower()
+            if key in ("input", "injection"):
+                return list(pending)
+            if key in ("middle_out", "middle"):
+                ordered = sorted(
+                    pending,
+                    key=lambda event: (self._mps_site(event["ancilla"]), event["index"]),
+                )
+                if len(ordered) % 2:
+                    centre = len(ordered) // 2
+                    result = [ordered[centre]]
+                    left, right = centre - 1, centre + 1
+                else:
+                    result = []
+                    left, right = len(ordered) // 2 - 1, len(ordered) // 2
+                while left >= 0 or right < len(ordered):
+                    if left >= 0:
+                        result.append(ordered[left])
+                        left -= 1
+                    if right < len(ordered):
+                        result.append(ordered[right])
+                        right += 1
+                return result
+            if key in ("min_span", "greedy"):
+                return None
+            raise ValueError(
+                "projection_order must be 'middle_out', 'input', 'min_span', "
+                "or an explicit permutation of the used ancillas."
+            )
+        try:
+            requested = tuple(int(ancilla) for ancilla in projection_order)
+        except TypeError as exc:
+            raise TypeError(
+                "projection_order must be a supported string or an ancilla sequence."
+            ) from exc
+        if len(requested) != len(ancillas) or set(requested) != set(ancillas):
+            raise ValueError(
+                "an explicit projection_order must be a permutation of the used "
+                f"ancillas {ancillas!r}, got {requested!r}."
+            )
+        by_ancilla = {event["ancilla"]: event for event in pending}
+        return [by_ancilla[ancilla] for ancilla in requested]
+
+    def run_with_deferred_injection(
+        self,
+        gates,
+        *,
+        ancillas,
+        outcomes=None,
+        projection_order="middle_out",
+        reset_ancillas: bool = True,
+        progbar: bool = False,
+        layout=None,
+        layout_kwargs=None,
+        layout_report: bool = True,
+    ) -> "MpsStabOptimizer":
+        """Replay a circuit using MAST-style deferred magic-state projections.
+
+        Each injectable ``T``/``T-dagger``/non-Clifford ``pi/4``-multiple
+        ``Rz`` receives a distinct fresh magic ancilla. The gadget CNOT and its
+        preselected branch correction are applied during replay, but the ancilla
+        ``Z`` projections are delayed until the circuit has completed. Thus the
+        coefficient MPS holds only a product magic register while the circuit is
+        replayed; the costly basis-updating projections are concentrated at the
+        end, where their order can be chosen.
+
+        The supplied circuit must not act on ``ancillas``. Deferred injection is
+        restricted to angles whose feed-forward correction is Clifford, exactly
+        as :meth:`inject_rz` is.
+
+        Parameters
+        ----------
+        ancillas : sequence[int]
+            Reserved fresh ancillas. Deferred injection does not recycle them:
+            there must be at least one ancilla for every injectable entry.
+        outcomes : sequence[int] | None
+            Optional predetermined ``+1``/``-1`` magic-measurement outcomes in
+            injection order. ``None`` samples their uniform outcomes from this
+            simulator's RNG before replay.
+        projection_order : {"middle_out", "input", "min_span"} | sequence[int]
+            End-of-circuit magic-register projection order. ``middle_out`` is
+            the MAST-style default for a contiguous register. ``min_span`` is a
+            greedy tableau-only planner that repeatedly chooses the current
+            ancilla with the shortest coefficient-MPS frame span.
+        reset_ancillas : bool
+            Reset measured ancillas to ``|0>`` after projection, leaving the
+            direct data result tensored with clean ancillas.
+        layout : str | mapping | sequence | None
+            Optional static frame layout installed before replay. ``"auto"``
+            uses a synthetic stream containing magic preparation, branch
+            corrections, and final projection supports.
+        """
+        pool = self._validate_magic_ancilla_pool(
+            ancillas,
+            require_nonempty=False,
+        )
+        entries = self._as_entries(gates)
+        specs = [self._injectable_rz(entry) for entry in entries]
+        n_injections = sum(spec is not None for spec in specs)
+        if len(pool) < n_injections:
+            raise ValueError(
+                "deferred injection needs one fresh ancilla per injectable gate: "
+                f"need {n_injections}, got {len(pool)}."
+            )
+        self._validate_magic_stream_protection(
+            entries,
+            specs,
+            pool,
+            mode="deferred",
+        )
+        self._assert_magic_ancillas_clean(pool)
+        selected_outcomes = self._deferred_injection_outcomes(
+            outcomes, n_injections, self._rng
+        )
+        self._apply_layout_from_entries(
+            self._deferred_injection_layout_entries(
+                entries,
+                specs,
+                pool,
+                selected_outcomes,
+                projection_order=projection_order,
+                reset_ancillas=reset_ancillas,
+            ),
+            layout,
+            layout_kwargs=layout_kwargs,
+            layout_report=layout_report,
+        )
+        self.deferred_projection_events = []
+        self.last_deferred_injection_report = None
+        history_start = len(self.bond_history)
+        replay_start = time.perf_counter()
+        pending = []
+        injection_index = 0
+
+        pbar = None
+        if progbar and entries:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(total=len(entries), desc="stab-deferred", leave=True, ascii=True)
+        try:
+            for entry, spec in zip(entries, specs):
+                if spec is None:
+                    self._apply_entry(entry)
+                else:
+                    data, phi = spec
+                    ancilla = pool[injection_index]
+                    outcome = selected_outcomes[injection_index]
+                    self.prepare_magic(ancilla, angle=phi)
+                    self.state.apply_clifford("cnot", data, ancilla)
+                    self._record()
+                    if outcome < 0:
+                        # The branch correction must occur at the original gate
+                        # location so subsequent physical Clifford gates see it.
+                        self._apply_rotation("rz", (2.0 * phi, data))
+                    pending.append(DeferredInjectionRecord(
+                        index=injection_index,
+                        ancilla=ancilla,
+                        data=int(data),
+                        angle=float(phi),
+                        outcome=int(outcome),
+                    ))
+                    injection_index += 1
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(chi=self.state.max_bond())
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        replay_elapsed = time.perf_counter() - replay_start
+        pre_projection_peak = max(self.bond_history[history_start:], default=self.state.max_bond())
+        projection_history_start = len(self.bond_history)
+        projection_start = time.perf_counter()
+        sequence = self._deferred_projection_sequence(pending, projection_order)
+        if sequence is None:
+            remaining = list(pending)
+            sequence = []
+            while remaining:
+                event = min(
+                    remaining,
+                    key=lambda candidate: (
+                        self._deferred_projection_metrics(candidate["ancilla"])[1],
+                        self._deferred_projection_metrics(candidate["ancilla"])[0],
+                        candidate["index"],
+                    ),
+                )
+                sequence.append(event)
+                remaining.remove(event)
+
+        for order, event in enumerate(sequence):
+            ancilla = event["ancilla"]
+            support_size, span = self._deferred_projection_metrics(ancilla)
+            before_bond = self.state.max_bond()
+            self.measure("Z", ancilla, outcome=event["outcome"], absorb_basis=True)
+            after_bond = self.state.max_bond()
+            if reset_ancillas and event["outcome"] < 0:
+                self.state.apply_clifford("x", ancilla)
+                self._record()
+            self.deferred_projection_events.append(DeferredProjectionRecord(
+                index=int(event["index"]),
+                ancilla=int(event["ancilla"]),
+                data=int(event["data"]),
+                angle=float(event["angle"]),
+                outcome=int(event["outcome"]),
+                order=int(order),
+                support_size=int(support_size),
+                mps_span=int(span),
+                bond_before=int(before_bond),
+                bond_after=int(after_bond),
+            ))
+
+        projection_elapsed = time.perf_counter() - projection_start
+        projection_peak = max(
+            self.bond_history[projection_history_start:], default=self.state.max_bond()
+        )
+        self.last_deferred_injection_report = DeferredInjectionReport(
+            n_injections=int(n_injections),
+            projection_order=projection_order,
+            replay_elapsed_s=float(replay_elapsed),
+            projection_elapsed_s=float(projection_elapsed),
+            pre_projection_peak_bond=int(pre_projection_peak),
+            projection_peak_bond=int(projection_peak),
+            peak_bond=int(max(
+                self.bond_history[history_start:],
+                default=self.state.max_bond(),
+            )),
+        )
+        return self
+
+    @classmethod
+    def with_deferred_injection(
+        cls, n_data: int, gates, *, n_ancilla: Optional[int] = None, **kwargs
+    ) -> "MpsStabOptimizer":
+        """Build a simulator and replay ``gates`` with deferred magic projections.
+
+        When ``n_ancilla`` is omitted, allocate exactly one trailing ancilla for
+        each injectable gate. Supplying more is allowed; unused ancillas remain
+        in ``|0>``. Unlike :meth:`with_injection`, this constructor cannot reuse
+        a one-qubit ancilla pool because all projections are intentionally
+        delayed until the end of the circuit.
+        """
+        n_data = int(n_data)
+        entries = cls._as_entries(gates)
+        required = sum(cls._injectable_rz(entry) is not None for entry in entries)
+        if n_ancilla is None:
+            n_ancilla = required
+        n_ancilla = int(n_ancilla)
+        if n_ancilla < required:
+            raise ValueError(
+                "with_deferred_injection needs at least one ancilla per injectable "
+                f"gate: need {required}, got {n_ancilla}."
+            )
+        if n_ancilla < 0:
+            raise ValueError("n_ancilla must be nonnegative.")
+        run_opts = {
+            key: kwargs.pop(key)
+            for key in (
+                "outcomes",
+                "projection_order",
+                "reset_ancillas",
+                "progbar",
+                "layout",
+                "layout_kwargs",
+                "layout_report",
+            )
+            if key in kwargs
+        }
+        sim = cls(n_data + n_ancilla, **kwargs)
+        sim.run_with_deferred_injection(
+            entries, ancillas=range(n_data, n_data + n_ancilla), **run_opts
         )
         return sim
 
@@ -3158,6 +5078,251 @@ class MpsStabOptimizer:
             f"max_dense_cap_qubits={self.max_dense_cap_qubits}, "
             f"queued={len(self._queue)}, current_chi={self.state.max_bond()})"
         )
+
+
+def _normalize_runner_mode(mode) -> tuple[str, str]:
+    """Return ``(requested_mode, actual_or_sentinel_mode)`` for the stream runner."""
+    requested = _normalize_event_name(mode)
+    aliases = {
+        "recommended": "recommended",
+        "advice": "recommended",
+        "auto": "recommended",
+        "direct": "direct",
+        "apply": "direct",
+        "immediate": "immediate",
+        "injection": "immediate",
+        "with_injection": "immediate",
+        "deferred": "deferred",
+        "mast": "deferred",
+        "with_deferred_injection": "deferred",
+    }
+    if requested not in aliases:
+        raise ValueError(
+            "mode must be 'direct', 'immediate', 'deferred', or "
+            f"'recommended', got {mode!r}."
+        )
+    return requested, aliases[requested]
+
+
+def _runner_data_qubits(analysis: StreamAnalysisRecord, n_qubits) -> int:
+    """Choose the data-qubit count for a run from explicit or inferred input."""
+    if n_qubits is not None:
+        if isinstance(n_qubits, bool) or not isinstance(n_qubits, Integral):
+            raise TypeError("n_qubits must be a nonnegative integer or None.")
+        n_data = int(n_qubits)
+        if n_data < 0:
+            raise ValueError("n_qubits must be nonnegative.")
+        return n_data
+    if analysis.estimated_qubits is None:
+        raise ValueError(
+            "n_qubits is required when the stream has no inferable qubit support."
+        )
+    return int(analysis.estimated_qubits)
+
+
+def _runner_constructor_settings(
+    advice: StabilizerMpsSettingsAdvice,
+    settings,
+    *,
+    seed,
+    mode: str,
+) -> dict:
+    """Merge advised settings with caller overrides for simulator construction."""
+    ctor = dict(advice.settings)
+    if settings is not None:
+        if not isinstance(settings, Mapping):
+            raise TypeError("settings must be a mapping or None.")
+        ctor.update(dict(settings))
+    if seed is not None:
+        ctor["seed"] = seed
+    return ctor
+
+
+def _runner_bond_value(value) -> int:
+    """Normalize Quimb's one-site ``None`` max-bond convention to bond 1."""
+    return 1 if value is None else int(value)
+
+
+def _runner_collect_result(
+    sim: MpsStabOptimizer,
+    *,
+    mode: str,
+    requested_mode: str,
+    execution_method: str,
+    settings_used: dict,
+    run_options: dict,
+    analysis: StreamAnalysisRecord,
+    advice: StabilizerMpsSettingsAdvice,
+    elapsed_s: float,
+    replay_elapsed_s: float,
+    projection_elapsed_s: float,
+    injection_report,
+) -> StabilizerMpsRunResult:
+    """Build the public typed result record for one completed stream replay."""
+    return StabilizerMpsRunResult(
+        simulator=sim,
+        mode=mode,
+        requested_mode=requested_mode,
+        execution_method=execution_method,
+        settings=settings_used,
+        run_options=dict(run_options),
+        analysis=analysis,
+        advice=advice,
+        elapsed_s=float(elapsed_s),
+        replay_elapsed_s=float(replay_elapsed_s),
+        projection_elapsed_s=float(projection_elapsed_s),
+        final_bond=_runner_bond_value(sim.state.max_bond()),
+        peak_bond=max(
+            (_runner_bond_value(value) for value in sim.bond_history),
+            default=_runner_bond_value(sim.state.max_bond()),
+        ),
+        norm=float(sim.norm()),
+        norm_diagnostics=sim.norm_diagnostics(),
+        measurements=tuple(sim.measurements),
+        norm_events=tuple(sim.norm_events),
+        immediate_projection_events=tuple(sim.immediate_projection_events),
+        deferred_projection_events=tuple(sim.deferred_projection_events),
+        injection_report=injection_report,
+        remaining_queue=int(len(sim._queue)),
+    )
+
+
+def run_stabilizer_mps_stream(
+    gates,
+    *,
+    n_qubits: Optional[int] = None,
+    mode: str = "direct",
+    settings=None,
+    advice: Optional[StabilizerMpsSettingsAdvice] = None,
+    ancilla_budget: Optional[int] = None,
+    prioritize_peak_bond: bool = False,
+    goal: str = "validate",
+    n_ancilla: Optional[int] = None,
+    run_options=None,
+    seed: Optional[int] = None,
+) -> StabilizerMpsRunResult:
+    """Run one Pepsy STN stream explicitly and return a typed result record.
+
+    ``mode`` defaults to ``"direct"``. Use ``mode="recommended"`` only when the
+    caller explicitly wants to execute the mode selected by
+    :meth:`MpsStabOptimizer.recommend_settings`.
+    """
+    entries = MpsStabOptimizer._as_entries(gates)
+    if advice is None:
+        advice = MpsStabOptimizer.recommend_settings(
+            entries,
+            n_qubits=n_qubits,
+            ancilla_budget=ancilla_budget,
+            prioritize_peak_bond=prioritize_peak_bond,
+            goal=goal,
+        )
+    elif not isinstance(advice, StabilizerMpsSettingsAdvice):
+        raise TypeError("advice must be a StabilizerMpsSettingsAdvice or None.")
+
+    requested_mode, normalized_mode = _normalize_runner_mode(mode)
+    actual_mode = advice.recommended_mode if normalized_mode == "recommended" else normalized_mode
+    execution_method = {
+        "direct": "apply",
+        "immediate": "with_injection",
+        "deferred": "with_deferred_injection",
+    }[actual_mode]
+    n_data = _runner_data_qubits(advice.analysis, n_qubits)
+    ctor = _runner_constructor_settings(
+        advice,
+        settings,
+        seed=seed,
+        mode=actual_mode,
+    )
+    run_opts = {} if run_options is None else dict(run_options)
+
+    if actual_mode == "direct":
+        settings_used = {"n_qubits": n_data, **ctor}
+        start = time.perf_counter()
+        sim = MpsStabOptimizer(n_data, entries, **ctor)
+        sim.run(**run_opts)
+        elapsed = time.perf_counter() - start
+        return _runner_collect_result(
+            sim,
+            mode=actual_mode,
+            requested_mode=requested_mode,
+            execution_method=execution_method,
+            settings_used=settings_used,
+            run_options=run_opts,
+            analysis=advice.analysis,
+            advice=advice,
+            elapsed_s=elapsed,
+            replay_elapsed_s=elapsed,
+            projection_elapsed_s=0.0,
+            injection_report=None,
+        )
+
+    if actual_mode == "immediate":
+        if n_ancilla is None:
+            n_ancilla = max(1, int(advice.immediate_ancillas_required))
+        n_ancilla = int(n_ancilla)
+        settings_used = {"n_data": n_data, "n_ancilla": n_ancilla, **ctor}
+        kwargs = {**ctor, **run_opts}
+        start = time.perf_counter()
+        sim = MpsStabOptimizer.with_injection(
+            n_data,
+            entries,
+            n_ancilla=n_ancilla,
+            **kwargs,
+        )
+        elapsed = time.perf_counter() - start
+        report = sim.last_immediate_injection_report
+        projection = 0.0 if report is None else float(report.projection_elapsed_s)
+        return _runner_collect_result(
+            sim,
+            mode=actual_mode,
+            requested_mode=requested_mode,
+            execution_method=execution_method,
+            settings_used=settings_used,
+            run_options=run_opts,
+            analysis=advice.analysis,
+            advice=advice,
+            elapsed_s=elapsed,
+            replay_elapsed_s=max(0.0, elapsed - projection),
+            projection_elapsed_s=projection,
+            injection_report=report,
+        )
+
+    if actual_mode == "deferred":
+        if n_ancilla is None:
+            n_ancilla = int(advice.deferred_ancillas_required)
+        n_ancilla = int(n_ancilla)
+        settings_used = {"n_data": n_data, "n_ancilla": n_ancilla, **ctor}
+        kwargs = {**ctor, **run_opts}
+        start = time.perf_counter()
+        sim = MpsStabOptimizer.with_deferred_injection(
+            n_data,
+            entries,
+            n_ancilla=n_ancilla,
+            **kwargs,
+        )
+        elapsed = time.perf_counter() - start
+        report = sim.last_deferred_injection_report
+        replay = elapsed if report is None else float(report.replay_elapsed_s)
+        projection = 0.0 if report is None else float(report.projection_elapsed_s)
+        return _runner_collect_result(
+            sim,
+            mode=actual_mode,
+            requested_mode=requested_mode,
+            execution_method=execution_method,
+            settings_used=settings_used,
+            run_options=run_opts,
+            analysis=advice.analysis,
+            advice=advice,
+            elapsed_s=elapsed,
+            replay_elapsed_s=replay,
+            projection_elapsed_s=projection,
+            injection_report=report,
+        )
+
+    raise AssertionError(f"unreachable mode {actual_mode!r}")  # pragma: no cover
+
+
+StabilizerMpsSimulator = MpsStabOptimizer
 
 
 def _looks_like_stream(gates) -> bool:

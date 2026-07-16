@@ -121,7 +121,21 @@ def test_zero_qubit_rejected():
 # --------------------------------------------------------------------------- #
 # MpsStabOptimizer simulator (Clifford + non-Clifford rotations, matrices, sub-MPO)
 # --------------------------------------------------------------------------- #
-from pepsy.optimizers.stabilizer_tn import MpsStabOptimizer, pauli_rotation_mpo  # noqa: E402
+from pepsy.optimizers.stabilizer_tn import (  # noqa: E402
+    DeferredInjectionReport,
+    DeferredProjectionRecord,
+    ImmediateInjectionReport,
+    ImmediateProjectionRecord,
+    MeasurementRecord,
+    MpsStabOptimizer,
+    NormEventRecord,
+    StabilizerMpsSettingsAdvice,
+    StabilizerMpsRunResult,
+    StabilizerMpsSimulator,
+    StreamAnalysisRecord,
+    pauli_rotation_mpo,
+    run_stabilizer_mps_stream,
+)
 
 _I = np.eye(2, dtype=complex)
 _X = np.array([[0, 1], [1, 0]], dtype=complex)
@@ -306,6 +320,57 @@ def test_simulator_full_circuit_matches_dense():
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
+@pytest.mark.parametrize(
+    ("pivot", "frame"),
+    [
+        (np.array([1, 0], dtype=complex), [("h", 0), ("cnot", 0, 1)]),
+        (np.array([0, 1], dtype=complex), [("h", 0), ("cnot", 0, 1)]),
+        (np.array([1, 1], dtype=complex) / np.sqrt(2), [("cnot", 0, 1)]),
+        (np.array([1, 1j], dtype=complex) / np.sqrt(2), [("h", 0), ("cnot", 0, 1)]),
+        (np.array([1, 0], dtype=complex), [("z", 0), ("h", 0), ("cnot", 0, 1)]),
+    ],
+)
+def test_exact_cooling_moves_controlled_pauli_into_tableau(pivot, frame):
+    # The trailing Rz maps through ``frame`` to a two-site Pauli. Site 0 is a
+    # stabilizer pivot, whereas site 1 is magic so the ordinary MPO update
+    # would entangle the coefficient MPS.
+    theta = 0.37
+    magic = np.array([np.cos(0.19), -1j * np.sin(0.19)], dtype=complex)
+    p = qtn.MPS_product_state([pivot, magic])
+    stream = [*frame, ("rz", theta, 1)]
+
+    cooled = MpsStabOptimizer.from_mps(p.copy(), chi=None).apply(stream)
+    plain = MpsStabOptimizer.from_mps(
+        p.copy(), chi=None, exact_cooling=False
+    ).apply(stream)
+
+    assert len(cooled.exact_cooling_events) == 1
+    assert cooled.state.max_bond() == 1
+    assert plain.state.max_bond() == 2
+    assert _fidelity(cooled.to_statevector(), plain.to_statevector()) == pytest.approx(
+        1.0, abs=1e-9
+    )
+
+
+def test_exact_cooling_falls_back_when_no_stabilizer_pivot_exists():
+    theta = 0.37
+    magic_a = np.array([np.cos(0.19), -1j * np.sin(0.19)], dtype=complex)
+    magic_b = np.array([np.cos(0.31), -1j * np.sin(0.31)], dtype=complex)
+    p = qtn.MPS_product_state([magic_a, magic_b])
+    stream = [("h", 0), ("cnot", 0, 1), ("rz", theta, 1)]
+
+    cooled = MpsStabOptimizer.from_mps(p.copy(), chi=None).apply(stream)
+    plain = MpsStabOptimizer.from_mps(
+        p.copy(), chi=None, exact_cooling=False
+    ).apply(stream)
+
+    assert cooled.exact_cooling_events == []
+    assert cooled.state.max_bond() == plain.state.max_bond() == 2
+    assert _fidelity(cooled.to_statevector(), plain.to_statevector()) == pytest.approx(
+        1.0, abs=1e-9
+    )
+
+
 def test_simulator_t_layer_stays_chi_one():
     n = 5
     stream = [("h", q) for q in range(n)] + [("t", q) for q in range(n)]
@@ -448,7 +513,9 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
 
 
 def test_norm_infidelity_excludes_nonunitary_segments():
-    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True)
+    sim = MpsStabOptimizer(
+        2, chi=1, track_infidelity=True, exact_cooling=False
+    )
     sim.apply([(_I + 0.2 * _X, 0)])
     assert sim.infidelities == []
 
@@ -490,7 +557,9 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
     assert sim.infidelities[-1] == pytest.approx(pre_loss)
     assert sim.norm() == pytest.approx(1.0, abs=1e-10)
     event = sim.norm_events[-1]
+    assert isinstance(event, NormEventRecord)
     assert event["kind"] == "measure"
+    assert event.kind == "measure"
     assert event["valid"] is True
     assert event["pre_norm"] == pytest.approx(pre_norm, abs=1e-10)
     assert event["pre_norm_sq"] == pytest.approx(pre_norm ** 2, abs=1e-10)
@@ -524,21 +593,27 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
     assert diagnostics["total_norm_proxy"] == pytest.approx(
         expected_total_survival ** 0.5
     )
+    assert diagnostics["norm_survival"] == pytest.approx(expected_total_survival)
+    assert diagnostics["norm_infidelity"] == pytest.approx(
+        1.0 - expected_total_survival
+    )
+    assert diagnostics["norm"] == pytest.approx(expected_total_survival ** 0.5)
     assert diagnostics["geometric_mean_norm"] == pytest.approx(
         expected_total_survival ** 0.5
     )
 
 
 def test_norm_events_mark_reset_boundaries():
-    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True).apply(
-        [("rxx", 0.8, 0, 1)]
-    )
+    sim = MpsStabOptimizer(
+        2, chi=1, track_infidelity=True, exact_cooling=False
+    ).apply([("rxx", 0.8, 0, 1)])
     pre_loss = sim.infidelities[-1]
 
     sim.reset(0)
 
     assert sim.norm() == pytest.approx(1.0, abs=1e-10)
     event = sim.norm_events[-1]
+    assert isinstance(event, NormEventRecord)
     assert event["kind"] == "reset"
     assert event["valid"] is True
     assert event["segment_infidelity"] >= pre_loss - 1e-10
@@ -579,7 +654,7 @@ def test_norm_events_track_projector_compression_loss_separately():
     )
 
 
-def test_norm_progress_reports_total_norm_proxy(monkeypatch):
+def test_norm_progress_reports_entry_part_and_norm_infidelity(monkeypatch):
     progress_instances = []
 
     class _FakeTqdm:
@@ -599,14 +674,23 @@ def test_norm_progress_reports_total_norm_proxy(monkeypatch):
             pass
 
     monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
-    sim = MpsStabOptimizer(2, chi=1, track_infidelity=True)
-    sim.apply([("rxx", 0.8, 0, 1)], progbar=True)
+    sim = MpsStabOptimizer(1, chi=1, track_infidelity=True, seed=7)
+    sim.apply([("h", 0), ("t", 0), ("measure", "Z", 0)], progbar=True)
 
     progress = progress_instances[-1]
-    assert progress.n == 1
+    assert progress.n == 3
+    assert [call["part"] for call in progress.postfix_calls] == [
+        "clifford",
+        "T",
+        "measurement",
+    ]
     last = progress.postfix_calls[-1]
-    assert last["Ntotal"] == f"{sim.norm_diagnostics()['total_norm_proxy']:.2e}"
-    assert last["Itotal"] == f"{sim.norm_diagnostics()['total_infidelity_proxy']:.2e}"
+    assert sorted(last) == ["norm_infidelity", "part"]
+    assert last["norm_infidelity"] == (
+        "n/a"
+        if sim.norm_diagnostics()["norm_infidelity"] is None
+        else f"{sim.norm_diagnostics()['norm_infidelity']:.2e}"
+    )
 
 
 def test_simulator_two_qubit_nonclifford_matrix_supported():
@@ -1233,12 +1317,18 @@ def test_run_progbar_smoke():
 def test_stabilizermps_backward_alias():
     from pepsy.optimizers.stabilizer_tn import StabilizerMps
     assert StabilizerMps is MpsStabOptimizer
+    assert StabilizerMpsSimulator is MpsStabOptimizer
 
 
 def test_optimizers_namespace_exports():
-    from pepsy.optimizers import MpsStabOptimizer as M, STNState as S
+    from pepsy.optimizers import (
+        MpsStabOptimizer as M,
+        STNState as S,
+        StabilizerMpsSimulator as SMS,
+    )
     assert M is MpsStabOptimizer
     assert S is STNState
+    assert SMS is MpsStabOptimizer
 
 
 # --------------------------------------------------------------------------- #
@@ -1471,6 +1561,8 @@ def test_measure_reset_stream_entry_records_then_resets(axis, bits, outcome):
     )
 
     assert sim.measurements == [(axis, 0, outcome)]
+    assert isinstance(sim.measurements[0], MeasurementRecord)
+    assert sim.measurements[0].pauli == axis
     assert sim.expectation(axis, 0) == pytest.approx(1.0, abs=1e-9)
 
 
@@ -1535,6 +1627,19 @@ def test_measure_absorb_via_stream_entry():
     assert sim.expectation("Z", 0) == pytest.approx(1.0, abs=1e-9)
 
 
+def test_measurement_localizer_cache_keys_on_layout_and_terms():
+    sim = MpsStabOptimizer(3)
+    terms = {0: "X", 2: "Z"}
+
+    first = sim._localizing_clifford_cached(terms)
+    second = sim._localizing_clifford_cached(dict(reversed(tuple(terms.items()))))
+
+    assert first is second
+    assert len(sim._localizer_cache) == 1
+    sim.apply_layout([2, 1, 0], layout_report=False)
+    assert sim._localizer_cache == {}
+
+
 # --------------------------------------------------------------------------- #
 # R4: scalable computational-basis sampling / probabilities (no 2**n)
 # --------------------------------------------------------------------------- #
@@ -1552,16 +1657,55 @@ def test_probability_bits_matches_dense():
     assert total == pytest.approx(1.0, abs=1e-6)
 
 
+def test_probability_bits_accepts_mps_order_with_layout():
+    n = 4
+    sim = MpsStabOptimizer(n, seed=0, layout=[2, 0, 3, 1], layout_report=False).apply(
+        [("h", 0), ("cnot", 0, 1), ("rz", 0.7, 2), ("t", 1), ("ry", 0.5, 3)]
+    )
+    psi = sim.to_statevector()
+    for k in (0, 3, 9, 15):
+        b = format(k, f"0{n}b")
+        ref = abs(psi[k]) ** 2
+        assert sim.probability_bits(b, order="physical") == pytest.approx(ref, abs=1e-6)
+        assert sim.probability_bits(b, order="mps") == pytest.approx(ref, abs=1e-6)
+        assert sim.probability_bits(b, order="auto") == pytest.approx(ref, abs=1e-6)
+
+
+def test_probability_bits_many_matches_scalar_and_dense():
+    n = 4
+    sim = MpsStabOptimizer(n, seed=1).apply(
+        [("h", 0), ("cnot", 0, 1), ("rz", 0.4, 2), ("t", 3), ("ry", 0.6, 1)]
+    )
+    bitstrings = ["0000", "0011", "0011", "1010", "1111"]
+    got = sim.probability_bits_many(bitstrings)
+    scalar = np.array([sim.probability_bits(bits) for bits in bitstrings])
+    psi = sim.to_statevector()
+    dense = np.array([abs(psi[int(bits, 2)]) ** 2 for bits in bitstrings])
+    np.testing.assert_allclose(got, scalar, atol=1e-9)
+    np.testing.assert_allclose(got, dense, atol=1e-6)
+
+
+def test_probability_bits_many_empty_and_single_bitstring():
+    sim = MpsStabOptimizer(2).apply([("h", 0)])
+    assert sim.probability_bits_many([]).shape == (0,)
+    got = sim.probability_bits_many("00")
+    assert got.shape == (1,)
+    assert got[0] == pytest.approx(sim.probability_bits("00"), abs=1e-12)
+
+
 def test_probability_bits_does_not_mutate_state():
     sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
     before = sim.to_statevector()
     sim.probability_bits("010")
+    sim.probability_bits_many(["010", "111"])
     assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
 
 
 def test_probability_bits_rejects_non_binary_values():
     with pytest.raises(ValueError, match="0 or 1"):
         MpsStabOptimizer(2).probability_bits([0, 2])
+    with pytest.raises(ValueError, match="0 or 1"):
+        MpsStabOptimizer(2).probability_bits_many([[0, 1], [0, 2]])
 
 
 def test_sample_bits_frequencies_match_dense():
@@ -1574,6 +1718,52 @@ def test_sample_bits_frequencies_match_dense():
     idx = (s.astype(int) * (1 << np.arange(n - 1, -1, -1))).sum(1)
     freq = np.bincount(idx, minlength=2 ** n) / shots
     assert 0.5 * np.abs(freq - probs).sum() < 0.04  # total-variation distance
+
+
+def test_sample_bits_accepts_mps_order_with_layout():
+    n = 3
+    sim = MpsStabOptimizer(n, seed=3, layout=[2, 0, 1], layout_report=False).apply(
+        [("h", 0), ("cnot", 0, 1), ("ry", 0.9, 2)]
+    )
+    probs = np.abs(sim.to_statevector()) ** 2
+    shots = 4000
+    s = sim.sample_bits(shots, seed=7, order="mps")
+    assert s.shape == (shots, n) and set(np.unique(s)).issubset({0, 1})
+    idx = (s.astype(int) * (1 << np.arange(n - 1, -1, -1))).sum(1)
+    freq = np.bincount(idx, minlength=2 ** n) / shots
+    assert 0.5 * np.abs(freq - probs).sum() < 0.04
+
+
+def test_sample_bits_packed_matches_unpacked_samples():
+    n = 5
+    sim = MpsStabOptimizer(n, seed=3).apply(
+        [("h", 0), ("cnot", 0, 1), ("ry", 0.9, 2), ("t", 4)]
+    )
+    raw = sim.sample_bits(64, seed=7, shuffle=False)
+    packed = sim.sample_bits(64, seed=7, shuffle=False, packed=True)
+    assert packed.shape == (64, 1)
+    assert packed.dtype == np.uint8
+    unpacked = np.unpackbits(packed, axis=1, bitorder="big")[:, :n]
+    np.testing.assert_array_equal(unpacked, raw)
+
+
+def test_iter_sample_bits_chunks_and_packed_output():
+    n = 3
+    sim = MpsStabOptimizer(n).apply([("h", 0), ("cnot", 0, 1), ("ry", 0.4, 2)])
+    chunks = list(sim.iter_sample_bits(17, chunk_size=6, seed=11, packed=True))
+    assert [chunk.shape for chunk in chunks] == [(6, 1), (6, 1), (5, 1)]
+    unpacked = np.vstack([
+        np.unpackbits(chunk, axis=1, bitorder="big")[:, :n]
+        for chunk in chunks
+    ])
+    assert unpacked.shape == (17, n)
+    assert set(np.unique(unpacked)).issubset({0, 1})
+
+
+def test_sample_bits_shuffle_false_keeps_prefix_grouping():
+    sim = MpsStabOptimizer(1).apply([("h", 0)])
+    s = sim.sample_bits(40, seed=5, shuffle=False)[:, 0]
+    assert np.array_equal(s, np.sort(s))
 
 
 def test_sample_bits_rows_are_exchangeable():
@@ -1721,6 +1911,26 @@ def test_run_with_injection_matches_direct(n_ancilla):
     assert _fidelity(inj.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_with_injection_auto_layout_matches_direct():
+    nd = 3
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 2), ("tdg", 0),
+              ("rz", np.pi / 4, 1), ("cnot", 1, 2), ("t", 1)]
+    direct = MpsStabOptimizer(nd).apply(stream)
+    inj = MpsStabOptimizer.with_injection(
+        nd,
+        stream,
+        n_ancilla=1,
+        layout="auto",
+        layout_report=False,
+    )
+
+    assert inj.layout_plan is not None
+    assert inj.layout_plan["source"] == "queued_frame_supports"
+    assert _fidelity(inj.to_statevector(), _data_marginal_ref(direct, 1)) == pytest.approx(
+        1.0, abs=1e-6
+    )
+
+
 def test_with_injection_pool_one_recycles_many_t():
     n = 5
     stream = ([("h", i) for i in range(n)]
@@ -1745,6 +1955,33 @@ def test_run_with_injection_rejects_target_in_pool():
     sim = MpsStabOptimizer(3)
     with pytest.raises(ValueError, match="ancilla pool"):
         sim.run_with_injection([("t", 2)], ancillas=[2])
+
+
+@pytest.mark.parametrize("ancillas", [[2, 2], [3], [-1]])
+def test_run_with_injection_rejects_invalid_ancilla_pool(ancillas):
+    sim = MpsStabOptimizer(3)
+    with pytest.raises(ValueError, match="ancilla"):
+        sim.run_with_injection([("t", 0)], ancillas=ancillas)
+
+
+def test_run_with_injection_rejects_dirty_ancilla_before_mutation():
+    sim = MpsStabOptimizer(2).apply([("x", 1)])
+    before = sim.to_statevector()
+
+    with pytest.raises(ValueError, match="must start clean"):
+        sim.run_with_injection([("t", 0)], ancillas=[1])
+
+    assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_run_with_injection_rejects_ordinary_entry_touching_pool_before_mutation():
+    sim = MpsStabOptimizer(2)
+    before = sim.to_statevector()
+
+    with pytest.raises(ValueError, match="ordinary stream entry"):
+        sim.run_with_injection([("h", 1), ("t", 0)], ancillas=[1])
+
+    assert _fidelity(sim.to_statevector(), before) == pytest.approx(1.0, abs=1e-9)
 
 
 def test_run_with_injection_no_recycle_exhausts():
@@ -1775,6 +2012,390 @@ def test_run_with_injection_reset_ancillas_leaves_zero():
     sim.run_with_injection([("t", 0)], ancillas=[1], reset_ancillas=True)
     # ancilla qubit 1 is back to |0> -> <Z_1> = +1
     assert sim.expectation("Z", 1) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_magic_strategy_recommends_explicit_clifford_t_execution_modes():
+    stream = [
+        ("h", 0), ("cnot", 0, 1), ("t", 0),
+        ("tdg", 1), ("rz", np.pi / 4, 0),
+    ]
+
+    default = MpsStabOptimizer.recommend_magic_strategy(stream)
+    assert default["recommended_mode"] == "immediate"
+    assert default["is_clifford_t_like"]
+    assert default["injectable_entries"] == 3
+    assert default["deferred_ancillas_required"] == 3
+    assert default["deferred_feasible"] is None
+    assert "with_injection" in default["message"]
+
+    deferred = MpsStabOptimizer.recommend_magic_strategy(
+        stream, ancilla_budget=3, prioritize_peak_bond=True
+    )
+    assert deferred["recommended_mode"] == "deferred"
+    assert deferred["deferred_feasible"]
+    assert "with_deferred_injection" in deferred["message"]
+
+    constrained = MpsStabOptimizer.recommend_magic_strategy(
+        stream, ancilla_budget=1, prioritize_peak_bond=True
+    )
+    assert constrained["recommended_mode"] == "immediate"
+    assert not constrained["deferred_feasible"]
+
+    queued = MpsStabOptimizer(2, gates=stream)
+    assert queued.queued_magic_strategy()["message"] == default["message"]
+    assert len(queued._queue) == len(stream)
+
+
+def test_magic_strategy_identifies_direct_and_mixed_streams():
+    direct = MpsStabOptimizer.recommend_magic_strategy(
+        [("h", 0), ("rxx", 0.31, 0, 1)]
+    )
+    assert direct["recommended_mode"] == "direct"
+    assert direct["other_nonclifford_entries"] == 1
+    assert "exact_cooling=True" in direct["message"]
+
+    mixed = MpsStabOptimizer.recommend_magic_strategy(
+        [("t", 0), ("rx", 0.31, 1)]
+    )
+    assert mixed["recommended_mode"] == "immediate"
+    assert mixed["injectable_entries"] == 1
+    assert mixed["other_nonclifford_entries"] == 1
+    assert not mixed["is_clifford_t_like"]
+
+
+def test_magic_strategy_recognizes_stim_style_clifford_matrices():
+    stim_h = np.asarray(_H, dtype=np.complex64)
+    report = MpsStabOptimizer.recommend_magic_strategy([(stim_h, 0), ("t", 0)])
+
+    assert report["recommended_mode"] == "immediate"
+    assert report["clifford_entries"] == 1
+    assert report["injectable_entries"] == 1
+    assert report["is_clifford_t_like"]
+
+
+def test_stream_analysis_summarizes_pepsy_native_design():
+    stream = [
+        ("h", 0),
+        ("cnot", 0, 1),
+        ("t", 0),
+        ("tdg", 1),
+        ("rz", np.pi / 4, 0),
+        ("rx", 0.31, 2),
+        ("measure", "Z", 0),
+        ("reset", 1),
+        ("measure_reset", "X", 2),
+    ]
+
+    analysis = MpsStabOptimizer.analyze_stream(stream, n_qubits=3)
+
+    assert isinstance(analysis, StreamAnalysisRecord)
+    assert analysis.total_entries == 9
+    assert analysis["injectable_entries"] == 3
+    assert analysis.other_nonclifford_entries == 1
+    assert analysis.measurement_entries == 1
+    assert analysis.reset_entries == 1
+    assert analysis.measure_reset_entries == 1
+    assert analysis.touched_qubits == (0, 1, 2)
+    assert analysis.estimated_qubits == 3
+    assert analysis.is_clifford_t_like is False
+
+
+def test_stream_analysis_identifies_dense_matrices_as_cost_drivers():
+    nonunitary = np.array([[1.0, 0.0], [0.25, 0.0]], dtype=complex)
+    stream = [(np.asarray(_H, dtype=np.complex64), 0), (nonunitary, 1)]
+
+    analysis = MpsStabOptimizer.analyze_stream(stream, n_qubits=2)
+
+    assert analysis.clifford_entries == 1
+    assert analysis.dense_matrix_entries == 2
+    assert analysis.unitary_matrix_entries == 1
+    assert analysis.nonunitary_matrix_entries == 1
+    assert analysis.opaque_entries == 1
+    assert any("Non-unitary" in warning for warning in analysis.warnings)
+
+
+def test_recommend_settings_wraps_magic_strategy_and_settings():
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 0), ("tdg", 1)]
+
+    advice = MpsStabOptimizer.recommend_settings(
+        stream,
+        n_qubits=2,
+        ancilla_budget=2,
+        prioritize_peak_bond=True,
+        goal="benchmark",
+    )
+
+    assert isinstance(advice, StabilizerMpsSettingsAdvice)
+    assert advice.recommended_mode == "deferred"
+    assert advice.execution_method == "with_deferred_injection"
+    assert advice.settings["chi"] == 64
+    assert advice.settings["layout"] == "auto"
+    assert advice.settings["layout_report"] is False
+    assert advice["settings"]["track_infidelity"] is True
+    assert advice.deferred_ancillas_required == 2
+    assert advice.analysis.injectable_entries == 2
+    assert advice.magic_strategy["recommended_mode"] == "deferred"
+    assert "Benchmark direct" in " ".join(advice.warnings)
+
+
+def test_recommend_settings_validate_goal_prefers_exact_reference():
+    advice = MpsStabOptimizer.recommend_settings(
+        [("t", 0), ("rx", 0.31, 1)],
+        n_qubits=2,
+        goal="validate",
+    )
+
+    assert advice.settings["chi"] is None
+    assert advice.settings["track_infidelity"] is False
+    assert advice.recommended_mode == "immediate"
+    assert advice.execution_method == "with_injection"
+
+
+def test_queued_recommend_settings_does_not_consume_queue():
+    stream = [("h", 0), ("t", 0), ("rx", 0.31, 1)]
+    sim = MpsStabOptimizer(2, gates=stream)
+
+    analysis = sim.queued_stream_analysis()
+    advice = sim.queued_recommend_settings(ancilla_budget=1)
+
+    assert analysis.estimated_qubits == 2
+    assert advice.analysis.total_entries == len(stream)
+    assert advice.recommended_mode == "immediate"
+    assert len(sim._queue) == len(stream)
+
+
+def test_run_stabilizer_mps_stream_direct_matches_stim_clifford():
+    stream = [("h", 0), ("cnot", 0, 1), ("s", 1), ("cz", 0, 1)]
+
+    result = run_stabilizer_mps_stream(stream, n_qubits=2)
+
+    assert isinstance(result, StabilizerMpsRunResult)
+    assert result.mode == "direct"
+    assert result.execution_method == "apply"
+    assert result.remaining_queue == 0
+    assert result.final_bond == 1
+    assert result.peak_bond == 1
+    assert result["settings"]["n_qubits"] == 2
+    assert _fidelity(
+        result.simulator.to_statevector(),
+        _stim_reference_state(2, stream),
+    ) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_run_stabilizer_mps_stream_immediate_matches_direct_magic():
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 0), ("tdg", 1)]
+
+    direct = run_stabilizer_mps_stream(stream, n_qubits=2, mode="direct")
+    injected = run_stabilizer_mps_stream(
+        stream,
+        n_qubits=2,
+        mode="immediate",
+        n_ancilla=1,
+        seed=4,
+    )
+
+    assert injected.mode == "immediate"
+    assert injected.execution_method == "with_injection"
+    assert injected.injection_report.n_injections == 2
+    assert injected.projection_elapsed_s >= 0.0
+    assert len(injected.immediate_projection_events) == 2
+    assert _fidelity(
+        injected.simulator.to_statevector(),
+        _data_marginal_ref(direct.simulator, 1),
+    ) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_run_stabilizer_mps_stream_deferred_matches_direct_magic():
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 0), ("tdg", 1)]
+
+    direct = run_stabilizer_mps_stream(stream, n_qubits=2, mode="direct")
+    deferred = run_stabilizer_mps_stream(
+        stream,
+        n_qubits=2,
+        mode="deferred",
+        n_ancilla=2,
+        run_options={"outcomes": (1, -1), "projection_order": "input"},
+    )
+
+    assert deferred.mode == "deferred"
+    assert deferred.execution_method == "with_deferred_injection"
+    assert deferred.injection_report.n_injections == 2
+    assert deferred.injection_report.projection_order == "input"
+    assert deferred.projection_elapsed_s >= 0.0
+    assert len(deferred.deferred_projection_events) == 2
+    assert _fidelity(
+        deferred.simulator.to_statevector(),
+        _data_marginal_ref(direct.simulator, 2),
+    ) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_run_stabilizer_mps_stream_recommended_mode_is_explicit():
+    stream = [("h", 0), ("t", 0)]
+
+    default = run_stabilizer_mps_stream(stream, n_qubits=1)
+    recommended = run_stabilizer_mps_stream(
+        stream,
+        n_qubits=1,
+        mode="recommended",
+        n_ancilla=1,
+        seed=2,
+    )
+
+    assert default.mode == "direct"
+    assert recommended.requested_mode == "recommended"
+    assert recommended.mode == "immediate"
+    assert recommended.injection_report.n_injections == 1
+    assert _fidelity(
+        recommended.simulator.to_statevector(),
+        _data_marginal_ref(default.simulator, 1),
+    ) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_from_stim_queue_can_use_settings_advice_and_runner():
+    def add_t_after_stim_prefix(stream):
+        return [*stream[:-1], ("t", 0)]
+
+    sim = MpsStabOptimizer.from_stim(
+        "H 0\nM 0",
+        seed=7,
+        stream_transform=add_t_after_stim_prefix,
+    )
+    analysis = sim.queued_stream_analysis()
+    advice = sim.queued_recommend_settings(goal="validate")
+
+    result = sim.run_queued_stream(mode="direct", goal="validate")
+    expected = MpsStabOptimizer(1).apply([("h", 0), ("t", 0)])
+
+    assert analysis.total_entries == 2
+    assert advice.recommended_mode == "immediate"
+    assert result.mode == "direct"
+    assert result.remaining_queue == 0
+    assert sim.queued_stream_analysis().total_entries == analysis.total_entries
+    assert _fidelity(
+        result.simulator.to_statevector(),
+        expected.to_statevector(),
+    ) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_run_with_injection_records_projection_costs():
+    sim = MpsStabOptimizer(3)
+    sim.run_with_injection([("t", 0), ("tdg", 1)], ancillas=[2])
+
+    report = sim.last_immediate_injection_report
+    assert isinstance(report, ImmediateInjectionReport)
+    assert report["n_injections"] == 2
+    assert len(sim.immediate_projection_events) == 2
+    assert isinstance(sim.immediate_projection_events[0], ImmediateProjectionRecord)
+    assert sim.immediate_projection_events[0].ancilla == 2
+    assert report["projection_elapsed_s"] == pytest.approx(sum(
+        event["elapsed_s"] for event in sim.immediate_projection_events
+    ))
+    assert report["projection_peak_bond"] >= 1
+
+
+@pytest.mark.parametrize("projection_order", ["input", "middle_out", "min_span"])
+def test_deferred_injection_matches_direct_circuit(projection_order):
+    n_data = 3
+    stream = [
+        ("h", 0), ("cnot", 0, 1), ("t", 2), ("tdg", 0),
+        ("rz", np.pi / 4, 1), ("cnot", 1, 2), ("t", 1),
+        ("rz", np.pi / 2, 0),
+    ]
+    outcomes = [+1, -1, +1, -1]
+    direct = MpsStabOptimizer(n_data).apply(stream)
+    deferred = MpsStabOptimizer.with_deferred_injection(
+        n_data,
+        stream,
+        outcomes=outcomes,
+        projection_order=projection_order,
+    )
+
+    assert deferred.n == n_data + len(outcomes)
+    assert _fidelity(
+        deferred.to_statevector(), _data_marginal_ref(direct, len(outcomes))
+    ) == pytest.approx(1.0, abs=1e-6)
+    assert [event["outcome"] for event in sorted(
+        deferred.deferred_projection_events, key=lambda event: event["index"]
+    )] == outcomes
+    assert isinstance(deferred.deferred_projection_events[0], DeferredProjectionRecord)
+    assert isinstance(deferred.last_deferred_injection_report, DeferredInjectionReport)
+    assert deferred.last_deferred_injection_report["n_injections"] == len(outcomes)
+    assert deferred.last_deferred_injection_report["projection_elapsed_s"] >= 0.0
+    for ancilla in range(n_data, deferred.n):
+        assert deferred.expectation("Z", ancilla) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_deferred_injection_auto_layout_matches_direct_circuit():
+    n_data = 3
+    stream = [
+        ("h", 0), ("cnot", 0, 1), ("t", 2), ("tdg", 0),
+        ("rz", np.pi / 4, 1), ("cnot", 1, 2), ("t", 1),
+    ]
+    outcomes = [+1, -1, +1, -1]
+    direct = MpsStabOptimizer(n_data).apply(stream)
+    deferred = MpsStabOptimizer.with_deferred_injection(
+        n_data,
+        stream,
+        outcomes=outcomes,
+        projection_order="input",
+        layout="auto",
+        layout_report=False,
+    )
+
+    assert deferred.layout_plan is not None
+    assert deferred.layout_plan["source"] == "queued_frame_supports"
+    assert _fidelity(
+        deferred.to_statevector(),
+        _data_marginal_ref(direct, len(outcomes)),
+    ) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_deferred_injection_accepts_an_explicit_projection_order():
+    n_data = 2
+    stream = [("h", 0), ("t", 0), ("tdg", 1), ("t", 1)]
+    direct = MpsStabOptimizer(n_data).apply(stream)
+    ancillas = [2, 3, 4]
+    deferred = MpsStabOptimizer(n_data + len(ancillas))
+    deferred.run_with_deferred_injection(
+        stream,
+        ancillas=ancillas,
+        outcomes=[-1, +1, -1],
+        projection_order=list(reversed(ancillas)),
+    )
+
+    assert [event["ancilla"] for event in deferred.deferred_projection_events] == list(
+        reversed(ancillas)
+    )
+    assert _fidelity(
+        deferred.to_statevector(), _data_marginal_ref(direct, len(ancillas))
+    ) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_deferred_injection_middle_out_projects_each_odd_register_ancilla_once():
+    stream = [("h", 0), ("t", 0), ("tdg", 1), ("t", 1)]
+    deferred = MpsStabOptimizer.with_deferred_injection(
+        2,
+        stream,
+        outcomes=[+1, -1, +1],
+        projection_order="middle_out",
+    )
+
+    assert [event["index"] for event in deferred.deferred_projection_events] == [1, 0, 2]
+    assert len({event["ancilla"] for event in deferred.deferred_projection_events}) == 3
+
+
+def test_deferred_injection_requires_a_fresh_ancilla_per_gate():
+    with pytest.raises(ValueError, match="ancilla per injectable gate"):
+        MpsStabOptimizer.with_deferred_injection(
+            2, [("t", 0), ("t", 1)], n_ancilla=1
+        )
+
+
+def test_deferred_injection_rejects_ordinary_entry_touching_reserved_pool():
+    with pytest.raises(ValueError, match="ordinary stream entry"):
+        MpsStabOptimizer.with_deferred_injection(
+            2, [("h", 2), ("t", 0)], n_ancilla=1
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1846,6 +2467,82 @@ def test_torch_backend_injection_and_sampling():
         assert gpu.probability_bits(b) == pytest.approx(cpu.probability_bits(b), abs=1e-6)
     s = gpu.sample_bits(64, seed=0)
     assert s.shape == (64, 2) and set(np.unique(s)).issubset({0, 1})
+
+
+def _jax_backend():
+    jax = pytest.importorskip("jax")
+    try:
+        jax.config.update("jax_enable_x64", True)
+    except Exception:  # pragma: no cover - depends on JAX import state
+        pass
+    import jax.numpy as jnp
+    import pepsy as py
+    return py.backend_jax(device="cpu", dtype=jnp.complex128)
+
+
+def _cupy_backend():
+    cp = pytest.importorskip("cupy")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy installed but no CUDA device is available.")
+    except Exception as exc:  # pragma: no cover - driver/runtime dependent
+        pytest.skip(f"CuPy CUDA runtime is unavailable: {exc}")
+    import pepsy as py
+    return py.backend_cupy(dtype=cp.complex128)
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "backend_factory", "module_token"),
+    [
+        ("jax", _jax_backend, "jax"),
+        ("cupy", _cupy_backend, "cupy"),
+    ],
+)
+def test_optional_array_backends_match_numpy_for_stn_paths(
+    backend_name,
+    backend_factory,
+    module_token,
+):
+    backend = backend_factory()
+    stream = [
+        ("h", 0),
+        ("cnot", 0, 1),
+        ("rz", 0.7, 1),
+        ("ry", 0.4, 2),
+        ("t", 0),
+    ]
+    cpu = MpsStabOptimizer(3, seed=0).apply(stream)
+    other = MpsStabOptimizer(3, seed=0, to_backend=backend).apply(stream)
+    assert module_token in type(other.state.p[0].data).__module__
+    assert _fidelity(cpu.to_statevector(), other.to_statevector()) == pytest.approx(
+        1.0, abs=1e-6
+    )
+
+    for outcome in (+1, -1):
+        cpu_m = MpsStabOptimizer(3).apply(stream)
+        other_m = MpsStabOptimizer(3, to_backend=backend).apply(stream)
+        cpu_m.measure("Z", 1, outcome=outcome, absorb_basis=True)
+        other_m.measure("Z", 1, outcome=outcome, absorb_basis=True)
+        assert _fidelity(
+            cpu_m.to_statevector(), other_m.to_statevector()
+        ) == pytest.approx(1.0, abs=1e-6)
+
+    inj = MpsStabOptimizer(2, to_backend=backend)
+    inj.state.h(0)
+    inj.prepare_magic(1)
+    inj.inject_t(0, 1, outcome=+1)
+    ref = MpsStabOptimizer(1).apply([("h", 0), ("t", 0)])
+    full = inj.to_statevector().reshape(2, 2)
+    data_vec = (
+        full[:, 0]
+        if np.linalg.norm(full[:, 0]) >= np.linalg.norm(full[:, 1])
+        else full[:, 1]
+    )
+    assert _fidelity(data_vec, ref.to_statevector()) == pytest.approx(1.0, abs=1e-6)
+
+    samples = other.sample_bits(16, seed=0)
+    assert samples.shape == (16, 3)
+    assert set(np.unique(samples)).issubset({0, 1})
 
 
 # --------------------------------------------------------------------------- #

@@ -7,14 +7,55 @@ MPS `|nu>` (the paper's coefficient state, exposed as `.p`). Clifford gates
 update only the tableau (free, `|nu>` unchanged); non-Clifford gates and
 measurements update `|nu>`.
 
-`MpsStabOptimizer` is an `MpsOptimizer`-style gate-stream simulator and is
-available at top level as `pepsy.MpsStabOptimizer` (state container:
-`pepsy.STNState`). Supported gate-stream entries include Clifford gates,
+`StabilizerMpsSimulator` is the descriptive public name for the simulator, with
+`MpsStabOptimizer` kept as the long-standing compatibility alias. Both are
+available at top level as `pepsy.StabilizerMpsSimulator` and
+`pepsy.MpsStabOptimizer` (state container: `pepsy.STNState`). Supported
+gate-stream entries include Clifford gates,
 non-Clifford Pauli rotations, `("t", q)` / `("tdg", q)`, explicit `(matrix,
 where)` gates, `("submpo", mpo, where)` events, `("measure", pauli, where[,
 outcome[, absorb_basis]])`, `("reset", where[, basis])`,
 `("measure_reset", basis, where[, outcome[, absorb_basis]])`, and guarded
-physical cap events `("cap", where, vec[, absorb])`.
+physical cap events `("cap", where, vec[, absorb])`. Stochastic/error entries
+such as `("depolarize1", p, q)`, `("pauli_channel1", probs, q)`, and
+PECOS-style stateful leakage entries such as `("leakage", p, q)` and
+`("measure_leaked", q)` are also Pepsy stream entries, but they are sampled by
+the trajectory runners rather than plain `sim.run()`.
+
+For an end-to-end choice between direct simulation, immediate injection,
+deferred MAST, and the two cooling mechanisms, see the
+[STN magic and cooling how-to](../../howto/stabilizer_tn_magic.md).
+
+Before choosing settings, start with the Pepsy-native stream advisor:
+`MpsStabOptimizer.analyze_stream(gates, n_qubits=...)` returns a typed
+`StreamAnalysisRecord` with counts for Clifford entries, injectable T-family
+rotations, other non-Clifford rotations, dense matrices, coefficient-frame
+sub-MPOs, measurements, resets, caps, touched qubits, and warnings. Then
+`MpsStabOptimizer.recommend_settings(gates, goal="run" | "validate" |
+"benchmark", ...)` returns a typed `StabilizerMpsSettingsAdvice` containing
+constructor settings (`chi`, `cutoff`, `track_infidelity`, `exact_cooling`),
+an explicit execution method (`apply`, `with_injection`, or
+`with_deferred_injection`), ancilla requirements, warnings, and a
+human-readable `message`.
+
+`recommend_settings` calls the narrower
+`MpsStabOptimizer.recommend_magic_strategy(gates, ...)` internally for the
+`direct` / `immediate` / `deferred` decision. On an unrun simulator,
+`queued_stream_analysis()` and `queued_recommend_settings()` read its queue,
+including a `from_stim(..., stream_transform=...)` result. All of these APIs are
+advisory only: `apply()` continues to use direct STN execution unless the caller
+explicitly selects an injection constructor.
+
+For a small correctness or smoke run, use the explicit validation runner:
+`run_stabilizer_mps_stream(gates, n_qubits=..., mode="direct" | "immediate" |
+"deferred" | "recommended", ...)` returns a typed `StabilizerMpsRunResult`.
+The default `mode` is `direct`; `mode="recommended"` is an explicit opt-in to
+the mode selected by `recommend_settings`. The result records the simulator,
+actual mode, settings used, replay/projection timing, final and peak
+coefficient-MPS bond, norm diagnostics, measurements, projection events,
+injection report, and remaining queue length. On a `from_stim` simulator,
+`sim.run_queued_stream(...)` replays the already sampled Pepsy queue through the
+same runner without mutating the original queued simulator.
 
 You can initialize from an ordinary computational-basis qubit MPS directly:
 `MpsStabOptimizer(p)` or `MpsStabOptimizer.from_mps(p)` wraps `p` with the
@@ -30,6 +71,9 @@ The returned simulator retains `.stim_plan` and `.stim_sample`, including
 the selected faults and herald bits. `stream_transform=` receives the immutable
 sampled stream and can insert ordinary physical Pepsy gates or remove a terminal
 readout before replay; this keeps the Stim-to-Pepsy parsing in one public path.
+Stim parsing is a convenience adapter, not a requirement for the advisor: the
+same `analyze_stream` and `recommend_settings` APIs operate directly on any
+Pepsy stream.
 
 ```python
 sim = pepsy.MpsStabOptimizer.from_stim(circuit, chi=32, seed=7)
@@ -37,14 +81,26 @@ sim.run(progbar=True)
 print(sim.stim_sample.faults)
 ```
 
-`disentangle_cliffords(sweeps=1, *, bonds=None, tol=None)` is an optional
-Clifford-gauge optimization: it applies a local coefficient-frame Clifford
-`D`, then absorbs `D^dagger` into the tableau, so `(C D^dagger)(D |nu>) = C
-|nu>`. It can also be placed at an exact point in a stream as
+With `progbar=True`, the STN progress bar reports the current stream
+`part` (`clifford`, `T`, `measurement`, `reset`, `nonclifford`, ...) and the
+single diagnostic field `norm_infidelity`.
+
+`exact_cooling=True` is the default constructive pre-check for multi-site
+non-Clifford Pauli rotations. If the frame image has an isolated product
+stabilizer pivot, the optimizer performs one local coefficient rotation and
+absorbs the controlled-Pauli remainder into the tableau. The update is exact,
+deterministic, and does not grow the coefficient-MPS bond. Successful uses are
+recorded in `exact_cooling_events`. Set `exact_cooling=False` only when testing
+or benchmarking the ordinary MPO fallback.
+
+`disentangle_cliffords(sweeps=1, *, bonds=None, tol=None)` is the separate,
+optional greedy Clifford-gauge optimization: it scores local two-qubit Clifford
+candidates from Schmidt/SVD data, applies an improving coefficient-frame
+Clifford `D`, then absorbs `D^dagger` into the tableau, so `(C D^dagger)(D
+|nu>) = C |nu>`. It can also be placed at an exact point in a stream as
 `("disentangle",)` or `("disentangle", {"sweeps": 1, "bonds": ..., "tol": ...})`.
-It preserves the represented physical state up to its explicitly selected
-numerical cutoff, changes no infidelity samples, and records a bond-history
-point.
+It can lower a bond that already exists, but it is not free. Schedule it at a
+few explicit checkpoints instead of after every T gate or rotation.
 
 `apply_layout("auto")` installs a **static STN frame layout** before replay:
 it dry-runs the queued Clifford/basis-update skeleton, collects the expensive
@@ -54,7 +110,10 @@ keeps those supports short. This is intentionally different from
 only while the coefficient MPS is product (`state.max_bond() == 1`); apply it
 before non-Clifford evolution entangles `|nu>`. The constructor accepts
 `layout="auto"` / `layout_kwargs={...}`, and `current_frame_layout(...)`
-returns the plan without mutating the simulator.
+returns the plan without mutating the simulator. Immediate and deferred
+injection runners also accept `layout="auto"`; they build a synthetic layout
+stream from the magic-ancilla gadgets and final projections, rather than using
+the original data-only stream.
 
 ## Measurement, reset, and magic-state injection
 
@@ -81,16 +140,56 @@ returns the plan without mutating the simulator.
   recycling the ancilla pool (a single ancilla suffices). It picks the nearest
   clean ancilla to each data qubit, so a spread pool shortens the localizer span.
   Arbitrary (non-`pi/4`) `rz` angles stay on the exact rotation path (injecting
-  them has no scaling benefit; compile to Clifford+T to inject).
+  them has no scaling benefit; compile to Clifford+T to inject). The reserved
+  ancilla pool is checked before replay: indices must be unique, in range, and
+  initially clean physical `|0>` qubits, and ordinary stream entries must not
+  touch the pool. Pass `layout="auto"` to choose a coefficient-MPS order from
+  the rewritten injection-gadget stream before replay.
+- `run_with_deferred_injection(gates, *, ancillas, projection_order=...)` and
+  `with_deferred_injection(n_data, gates, *, n_ancilla=None, ...)` implement
+  deferred MAST injection. Each injectable gate gets one distinct fresh ancilla;
+  the magic gadgets replay first and their basis-updating `Z` projections occur
+  at the end. `middle_out` is the default projection order; `input` retains
+  injection order and `min_span` chooses the current shortest frame span.
+  Deferred mode cannot recycle ancillas. The same unique/in-range/clean and
+  ordinary-entry isolation contracts are enforced before replay. Inspect
+  `deferred_projection_events` and `last_deferred_injection_report` for the
+  per-projection support/bond data and replay versus projection timing. Pass
+  `layout="auto"` to include the magic preparation, branch corrections, and
+  final projection supports in the static layout prepass.
+  Immediate injection analogously exposes `immediate_projection_events` and
+  `last_immediate_injection_report`.
+
+Measurement and diagnostic logs use typed records while preserving older access
+patterns: `measurements` contains tuple-compatible `MeasurementRecord` objects;
+`norm_events`, projection events, and injection reports contain mapping-like
+records such as `NormEventRecord`, `ImmediateProjectionRecord`,
+`DeferredProjectionRecord`, `ImmediateInjectionReport`, and
+`DeferredInjectionReport`. Both `event.field` and `event["field"]` work.
 
 ## Scalable sampling
 
-- `sample_bits(shots, *, seed=None)` — computational-basis bitstrings by **perfect
-  (tree) sampling**: shots sharing a measured prefix share the collapsed state, so
-  the collapse work is done once per distinct prefix, not per shot (a large saving
-  for structured/low-rank `|nu>`). No `O(2**n)` statevector is formed.
-- `probability_bits(bits)` — `|<bits|psi>|**2` as a product of conditional Born
-  probabilities.
+- `sample_bits(shots, *, seed=None, order=None, shuffle=True, packed=False)` —
+  computational-basis bitstrings by **perfect (tree) sampling**: shots sharing a
+  measured prefix share the collapsed state, so the collapse work is done once
+  per distinct prefix, not per shot (a large saving for structured/low-rank
+  `|nu>`). No `O(2**n)` statevector is formed. `order="physical"` preserves the
+  historical `Z_0...Z_{n-1}` readout, `order="mps"` follows the current static
+  coefficient-MPS layout, `order="auto"` uses the layout order only after a
+  nontrivial layout has been installed, and an explicit qubit permutation is
+  also accepted. Set `shuffle=False` to keep prefix-grouped rows and skip the
+  final row permutation. Set `packed=True` to return `np.packbits` output with
+  `ceil(n / 8)` byte columns.
+- `iter_sample_bits(shots, *, chunk_size, seed=None, order=None, shuffle=True,
+  packed=False)` — chunked sample generation with a shared RNG across chunks,
+  for large shot counts where materializing one full `(shots, n)` array is
+  inconvenient.
+- `probability_bits(bits, *, order=None)` — `|<bits|psi>|**2` as a product of
+  conditional Born probabilities.
+- `probability_bits_many(bitstrings, *, order=None)` — batched computational
+  bitstring probabilities using the same prefix-sharing readout tree as
+  `sample_bits`, so duplicate or prefix-clustered bitstrings avoid independent
+  full readout passes.
 
 ## Correctness and failure semantics
 
@@ -98,6 +197,9 @@ returns the plan without mutating the simulator.
   in-range sites, and forced measurement outcomes are exactly `+1` or `-1`.
 - Impossible postselection raises `ValueError` before changing the tableau,
   coefficient MPS, measurement log, or diagnostics.
+- Immediate and deferred magic-injection schedules validate their reserved
+  ancillas before replay, so duplicate/out-of-range/dirty pools or ordinary
+  stream entries touching the pool fail without partially applying the stream.
 - `run()` removes successfully applied entries from its queue. If a later entry
   fails, that entry and the remaining suffix stay queued, so retrying does not
   replay the successful prefix.
@@ -155,7 +257,9 @@ post-projector norm with `pre_norm**2 * branch_probability` gives a separate
 The post-collapse state is then normalized. Use `norm_diagnostics()` to form
 product/geometric-mean survival summaries across completed segments plus the
 current open segment; these summaries multiply unitary- and projector-
-compression survival factors, but not measurement probabilities.
+compression survival factors, but not measurement probabilities. The preferred
+summary keys are `norm_infidelity`, `norm_survival`, and `norm`; the older
+`total_*_proxy` keys remain as compatibility aliases.
 The proxy is not exact overlap fidelity or a discarded-SVD-weight report;
 validate physical accuracy independently when that distinction matters.
 
@@ -166,17 +270,19 @@ controls both the relative numerical-rank decision and the local SVD split:
 use `tol=0` to retain every numerical singular value, or the normal MPS cutoff
 to remove round-off-sized values and expose the lower bond dimension.
 
-## Backends (GPU / torch / JAX)
+## Backends (Torch / JAX / CuPy)
 
 Pass `to_backend=` (e.g. `pepsy.backend_torch(dtype=torch.complex128,
 device="cuda")`, `pepsy.backend_cupy(...)`, `pepsy.backend_jax(...)`) to the
 constructor or `with_injection`.  The coefficient MPS `|nu>` and every gate/MPO
 applied to it are then placed on that backend, so the heavy MPS contractions
-(SVD, `swap+split`, sub-MPO application) run on GPU/torch/JAX.  The stim tableau
+(SVD, `swap+split`, sub-MPO application) run on that array backend.  The stim tableau
 (classical Clifford tracking) stays on the CPU.  Constant gate matrices are
 cached per backend; expectation/fidelity scalars are converted back to Python
 floats.  `to_statevector` / `amplitude` bring `|nu>` back to NumPy and are for
-small-`n` validation only.
+small-`n` validation only. The focused STN tests exercise NumPy, Torch, JAX, and
+CuPy paths; optional JAX/CuPy tests skip only when the dependency or CUDA runtime
+is unavailable.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.stabilizer_tn.mps_stab_optimizer
