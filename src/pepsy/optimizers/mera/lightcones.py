@@ -14,14 +14,17 @@ from .terms import LocalTerm, convert_local_terms, normalize_local_terms
 
 __all__ = [
     "LightconeChunk",
+    "QMeraLightconeTN",
     "QMeraParametricLightconeChunk",
     "build_lightcone_chunks",
     "build_qmera_lightcone_chunks",
     "build_qmera_parametric_lightcone_chunks",
+    "contract_qmera_lightcone_tn",
     "local_qmera_parametric_lightcone_expectation",
     "local_lightcone_expectation",
     "qmera_parametric_energy",
     "qmera_parametric_lightcone_state",
+    "qmera_parametric_lightcone_tn",
     "select_lightcone",
     "site_tags_for_where",
 ]
@@ -91,6 +94,36 @@ class QMeraParametricLightconeChunk:
     def num_gates(self):
         """Number of parametrized gates rebuilt for this local cone."""
         return len(self.schedule_placement_ids)
+
+
+@dataclass(frozen=True)
+class QMeraLightconeTN:
+    """Explicit tensor networks for one scheduled qMERA local term."""
+
+    chunk: QMeraParametricLightconeChunk
+    ket: qtn.TensorNetwork
+    numerator: qtn.TensorNetwork
+    denominator: qtn.TensorNetwork
+
+    @property
+    def term(self):
+        """Local Hamiltonian term represented by this lightcone."""
+        return self.chunk.term
+
+    @property
+    def num_gates(self):
+        """Number of qMERA gates rebuilt inside this lightcone."""
+        return self.chunk.num_gates
+
+    @property
+    def num_numerator_tensors(self):
+        """Number of tensors in the expectation-value network."""
+        return int(self.numerator.num_tensors)
+
+    @property
+    def num_denominator_tensors(self):
+        """Number of tensors in the norm network."""
+        return int(self.denominator.num_tensors)
 
 
 def _default_site_tag(site):
@@ -363,7 +396,7 @@ def qmera_parametric_lightcone_state(
     return state
 
 
-def local_qmera_parametric_lightcone_expectation(
+def qmera_parametric_lightcone_tn(
     schedule,
     chunk: QMeraParametricLightconeChunk,
     parameters,
@@ -372,14 +405,10 @@ def local_qmera_parametric_lightcone_expectation(
     array_backend=None,
     gate_array_backend=None,
     physical_dim=2,
-    optimize="auto-hq",
-    normalized=True,
-    real=True,
     simplify=False,
     gate_contract=True,
-    contract_opts=None,
 ):
-    """Contract one qMERA local term by rebuilding only its scheduled cone."""
+    """Build explicit numerator and norm TNs for one scheduled qMERA cone."""
     ket = qmera_parametric_lightcone_state(
         schedule,
         chunk,
@@ -397,23 +426,83 @@ def local_qmera_parametric_lightcone_expectation(
         contract=gate_contract,
         inplace=False,
     )
-    expec = _maybe_simplify(ket.H & ket_g, simplify)
-    value = _contract(expec, optimize=optimize, contract_opts=contract_opts)
+    numerator = _maybe_simplify(ket.H & ket_g, simplify)
+    denominator = _maybe_simplify(ket.H & ket, simplify)
+    return QMeraLightconeTN(
+        chunk=chunk,
+        ket=ket,
+        numerator=numerator,
+        denominator=denominator,
+    )
+
+
+def contract_qmera_lightcone_tn(
+    lightcone: QMeraLightconeTN,
+    *,
+    optimize="auto-hq",
+    normalized=True,
+    real=True,
+    contract_opts=None,
+):
+    """Contract an explicit qMERA local-cone TN with a cotengra optimizer."""
+    value = _contract(
+        lightcone.numerator,
+        optimize=optimize,
+        contract_opts=contract_opts,
+    )
 
     if normalized:
         norm = _contract(
-            _maybe_simplify(ket.H & ket, simplify),
+            lightcone.denominator,
             optimize=optimize,
             contract_opts=contract_opts,
         )
         value = value / norm
 
+    term = lightcone.term
     if term.weight != 1.0:
         value = value * term.weight
 
     if real:
         value = _maybe_real(value)
     return value
+
+
+def local_qmera_parametric_lightcone_expectation(
+    schedule,
+    chunk: QMeraParametricLightconeChunk,
+    parameters,
+    *,
+    gate_registry=None,
+    array_backend=None,
+    gate_array_backend=None,
+    physical_dim=2,
+    optimize="auto-hq",
+    normalized=True,
+    real=True,
+    simplify=False,
+    gate_contract=True,
+    contract_opts=None,
+):
+    """Contract one qMERA local term by rebuilding only its scheduled cone."""
+    lightcone = qmera_parametric_lightcone_tn(
+        schedule,
+        chunk,
+        parameters,
+        gate_registry=gate_registry,
+        array_backend=array_backend,
+        gate_array_backend=gate_array_backend,
+        physical_dim=physical_dim,
+        simplify=simplify,
+        gate_contract=gate_contract,
+    )
+    return contract_qmera_lightcone_tn(
+        lightcone,
+        optimize=optimize,
+        normalized=normalized,
+        real=real,
+        contract_opts=contract_opts,
+    )
 
 
 def qmera_parametric_energy(

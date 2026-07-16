@@ -13,6 +13,7 @@ from pepsy.optimizers.mera import (
     QMeraBuilder,
     QMeraCompiledLightconeChunk,
     QMeraGeometry,
+    QMeraLightconeTN,
     QMeraSchematicBlock,
     QMeraParametricEnergyOptimizer,
     QMeraParametricLightconeChunk,
@@ -21,6 +22,7 @@ from pepsy.optimizers.mera import (
     build_qmera_lightcone_chunks,
     build_qmera_parametric_lightcone_chunks,
     compile_qmera_parametric_lightcones,
+    contract_qmera_lightcone_tn,
     default_gate_registry,
     draw_qmera_schedule,
     local_qmera_compiled_lightcone_expectation,
@@ -30,6 +32,7 @@ from pepsy.optimizers.mera import (
     qmera_compiled_parametric_energy,
     qmera_parametric_energy,
     qmera_parametric_lightcone_state,
+    qmera_parametric_lightcone_tn,
     qmera_schematic_blocks,
 )
 from pepsy.optimizers.mera.optimizer import (
@@ -473,6 +476,22 @@ def test_qmera_parametric_energy_helpers_match_builder_loss():
         params,
         gate_registry=builder.gate_registry,
     )
+    lightcone_tn = qmera_parametric_lightcone_tn(
+        schedule,
+        chunks[0],
+        params,
+        gate_registry=builder.gate_registry,
+    )
+    builder_lightcone_tn = builder.parametric_lightcone_tn(
+        chunks[0],
+        params,
+        schedule=schedule,
+    )
+    tn_value = contract_qmera_lightcone_tn(
+        lightcone_tn,
+        optimize="auto-hq",
+        real=False,
+    )
     local_value = local_qmera_parametric_lightcone_expectation(
         schedule,
         chunks[0],
@@ -500,6 +519,13 @@ def test_qmera_parametric_energy_helpers_match_builder_loss():
     )
 
     assert local_state.num_tensors == len(chunks[0].input_sites) + chunks[0].num_gates
+    assert isinstance(lightcone_tn, QMeraLightconeTN)
+    assert isinstance(builder_lightcone_tn, QMeraLightconeTN)
+    assert lightcone_tn.num_gates == chunks[0].num_gates
+    assert builder_lightcone_tn.num_gates == lightcone_tn.num_gates
+    assert lightcone_tn.num_numerator_tensors > lightcone_tn.ket.num_tensors
+    assert lightcone_tn.num_denominator_tensors == 2 * lightcone_tn.ket.num_tensors
+    assert complex(tn_value) == pytest.approx(complex(local_value))
     assert complex(local_value) == pytest.approx(complex(energy_value))
     assert complex(energy_value) == pytest.approx(complex(builder_value))
 

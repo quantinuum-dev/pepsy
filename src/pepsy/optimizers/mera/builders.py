@@ -25,6 +25,7 @@ from .geometry import QMeraGeometry
 from .lightcones import (
     build_qmera_parametric_lightcone_chunks,
     qmera_parametric_energy,
+    qmera_parametric_lightcone_tn,
 )
 from .schedules import QMeraBlockSpec, QMeraSchedule, build_qmera_schedule
 from .terms import convert_local_terms, normalize_local_terms
@@ -309,6 +310,32 @@ class QMeraBuilder:
             )
 
         return _loss
+
+    def parametric_lightcone_tn(
+        self,
+        chunk,
+        parameters,
+        schedule=None,
+        *,
+        array_backend=None,
+        gate_array_backend=None,
+        simplify=False,
+        gate_contract=True,
+    ):
+        """Build explicit TNs for one scheduled qMERA local-energy chunk."""
+        schedule = self.build_schedule() if schedule is None else schedule
+        backend = self.array_backend if array_backend is None else array_backend
+        return qmera_parametric_lightcone_tn(
+            schedule,
+            chunk,
+            parameters,
+            gate_registry=self.gate_registry,
+            array_backend=backend,
+            gate_array_backend=gate_array_backend,
+            physical_dim=self.physical_dim,
+            simplify=simplify,
+            gate_contract=gate_contract,
+        )
 
     def compile_parametric_lightcones(
         self,
