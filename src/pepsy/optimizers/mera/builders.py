@@ -149,6 +149,7 @@ class QMeraBuilder:
         param_scale: float = 0.0,
         array_backend=None,
         parameter_backend=None,
+        product_state_factory=None,
     ):
         self.geometry = _coerce_geometry(
             geometry,
@@ -182,6 +183,7 @@ class QMeraBuilder:
         self.param_scale = float(param_scale)
         self.array_backend = array_backend
         self.parameter_backend = parameter_backend
+        self.product_state_factory = product_state_factory
 
     def build_schedule(self):
         """Build the static qMERA schedule."""
@@ -257,6 +259,7 @@ class QMeraBuilder:
             simplify=simplify,
             gate_contract=gate_contract,
             contract_opts=contract_opts,
+            product_state_factory=self.product_state_factory,
         )
 
     def _parameter_converter(self):
@@ -364,6 +367,7 @@ class QMeraBuilder:
             physical_dim=self.physical_dim,
             simplify=simplify,
             gate_contract=gate_contract,
+            product_state_factory=self.product_state_factory,
         )
 
     def compile_parametric_lightcones(
@@ -523,7 +527,15 @@ class QMeraBuilder:
         """Build a quimb tensor network by directly applying scheduled gates."""
         schedule = self.build_schedule() if schedule is None else schedule
         tensors = self.gate_tensors(parameters, schedule)
-        state = self._initial_state()
+        if self.product_state_factory is None:
+            state = self._initial_state()
+        else:
+            state = self.product_state_factory(
+                schedule,
+                schedule.geometry.register_sites,
+                physical_dim=self.physical_dim,
+                array_backend=self.array_backend,
+            )
         for placement in schedule.placements:
             state = state.gate(
                 tensors[placement.gate_id],

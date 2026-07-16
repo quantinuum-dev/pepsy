@@ -8,6 +8,10 @@ from .compiled import (
     local_qmera_compiled_lightcone_expectation,
     qmera_compiled_parametric_energy,
 )
+from .fermions import (
+    QMeraSymmrayFermionBackend,
+    qmera_symmray_fermi_hubbard_terms,
+)
 from .gates import (
     GateRegistry,
     GateSpec,
@@ -66,6 +70,7 @@ __all__ = [
     "QMeraParametricEnergyOptimizer",
     "QMeraSchedule",
     "QMeraSchematicBlock",
+    "QMeraSymmrayFermionBackend",
     "UserGateFamily",
     "build_lightcone_chunks",
     "build_qmera_lightcone_chunks",
@@ -85,6 +90,7 @@ __all__ = [
     "qmera_parametric_lightcone_state",
     "qmera_parametric_lightcone_tn",
     "qmera_schematic_blocks",
+    "qmera_symmray_fermi_hubbard_terms",
     "resolve_gate_spec",
     "select_lightcone",
     "site_tags_for_where",

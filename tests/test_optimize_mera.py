@@ -17,6 +17,7 @@ from pepsy.optimizers.mera import (
     QMeraSchematicBlock,
     QMeraParametricEnergyOptimizer,
     QMeraParametricLightconeChunk,
+    QMeraSymmrayFermionBackend,
     UserGateFamily,
     build_lightcone_chunks,
     build_qmera_lightcone_chunks,
@@ -34,6 +35,7 @@ from pepsy.optimizers.mera import (
     qmera_parametric_lightcone_state,
     qmera_parametric_lightcone_tn,
     qmera_schematic_blocks,
+    qmera_symmray_fermi_hubbard_terms,
 )
 from pepsy.optimizers.mera.optimizer import (
     MeraEnergyOptimizer as ModuleMeraEnergyOptimizer,
@@ -346,6 +348,80 @@ def test_qmera_1d_mode_geometry_schedules_register_modes():
     assert ansatz.metadata["site_modes"] == ("up", "down")
     assert ansatz.state.num_tensors >= schedule.geometry.num_modes
     assert "I3" in ansatz.state.tags
+
+
+def test_qmera_symmray_fermion_backend_builds_native_hubbard_terms():
+    """qMERA Hubbard terms should be native Symmray fermionic mode arrays."""
+    pytest.importorskip("symmray")
+    geometry = QMeraGeometry(shape=3, site_modes=("up", "down"))
+    backend = QMeraSymmrayFermionBackend()
+
+    terms = qmera_symmray_fermi_hubbard_terms(
+        geometry,
+        backend=backend,
+        t=0.5,
+        U=4.0,
+        mu=0.0,
+    )
+    kinds = [term.metadata["kind"] for term in terms]
+
+    assert kinds.count("hubbard-onsite") == 3
+    assert kinds.count("hubbard-hopping") == 4
+    assert all(term.metadata["backend"] == "symmray" for term in terms)
+    assert all(term.metadata["fermionic"] is True for term in terms)
+    assert all("FermionicArray" in type(term.operator).__name__ for term in terms)
+    assert terms[0].where == ((0, "up"), (0, "down"))
+    assert terms[-1].where == ((1, "down"), (2, "down"))
+    with pytest.raises(ValueError, match="spin-changing"):
+        backend.hopping_operator((0, "up"), (0, "down"))
+
+
+def test_qmera_symmray_fermion_lightcone_contracts_native_term():
+    """Scheduled qMERA lightcones should consume Symmray fermionic TNs."""
+    pytest.importorskip("symmray")
+    backend = QMeraSymmrayFermionBackend()
+    builder = QMeraBuilder(
+        shape=2,
+        site_modes=backend.site_modes,
+        max_layers=0,
+        product_state_factory=backend.product_state,
+    )
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
+    terms = backend.fermi_hubbard_terms(
+        schedule.geometry,
+        t=0.0,
+        U=4.0,
+        mu=0.0,
+    )
+    chunks = build_qmera_parametric_lightcone_chunks(schedule, terms[:1])
+
+    lightcone = builder.parametric_lightcone_tn(
+        chunks[0],
+        params,
+        schedule=schedule,
+    )
+    value = contract_qmera_lightcone_tn(
+        lightcone,
+        optimize="auto-hq",
+        real=False,
+    )
+    builder_value = builder.parametric_loss(
+        params,
+        schedule=schedule,
+        chunks=chunks,
+        energy_per_site=False,
+        real=False,
+    )
+
+    assert isinstance(lightcone, QMeraLightconeTN)
+    assert lightcone.ket.num_tensors == 2
+    assert all(
+        "FermionicArray" in type(tensor.data).__name__
+        for tensor in lightcone.ket
+    )
+    assert complex(value) == pytest.approx(0.0)
+    assert complex(builder_value) == pytest.approx(complex(value))
 
 
 def test_qmera_2d_multi_mode_schedule_requires_explicit_design():

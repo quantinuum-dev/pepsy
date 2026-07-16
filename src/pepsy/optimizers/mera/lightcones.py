@@ -332,6 +332,28 @@ def _product_state_on_sites(sites, *, physical_dim=2, array_backend=None):
     return qtn.TensorNetwork(tensors)
 
 
+def _product_state_for_schedule(
+    schedule,
+    sites,
+    *,
+    physical_dim=2,
+    array_backend=None,
+    product_state_factory=None,
+):
+    if product_state_factory is None:
+        return _product_state_on_sites(
+            sites,
+            physical_dim=physical_dim,
+            array_backend=array_backend,
+        )
+    return product_state_factory(
+        schedule,
+        tuple(sites),
+        physical_dim=physical_dim,
+        array_backend=array_backend,
+    )
+
+
 def _resolve_array_backend(array_backend):
     return get_default_array_backend() if array_backend is None else array_backend
 
@@ -368,15 +390,18 @@ def qmera_parametric_lightcone_state(
     gate_array_backend=None,
     physical_dim=2,
     contract=False,
+    product_state_factory=None,
 ):
     """Build only the local qMERA cone selected by ``chunk`` from parameters."""
     gate_registry = default_gate_registry() if gate_registry is None else gate_registry
     array_backend = _resolve_array_backend(array_backend)
     placements = _placements_by_id(schedule)
-    state = _product_state_on_sites(
+    state = _product_state_for_schedule(
+        schedule,
         chunk.input_sites,
         physical_dim=physical_dim,
         array_backend=array_backend,
+        product_state_factory=product_state_factory,
     )
     for gate_id in chunk.schedule_placement_ids:
         placement = placements[gate_id]
@@ -407,6 +432,7 @@ def qmera_parametric_lightcone_tn(
     physical_dim=2,
     simplify=False,
     gate_contract=True,
+    product_state_factory=None,
 ):
     """Build explicit numerator and norm TNs for one scheduled qMERA cone."""
     ket = qmera_parametric_lightcone_state(
@@ -418,6 +444,7 @@ def qmera_parametric_lightcone_tn(
         gate_array_backend=gate_array_backend,
         physical_dim=physical_dim,
         contract=False,
+        product_state_factory=product_state_factory,
     )
     term = chunk.term
     ket_g = ket.gate_inds(
@@ -483,6 +510,7 @@ def local_qmera_parametric_lightcone_expectation(
     simplify=False,
     gate_contract=True,
     contract_opts=None,
+    product_state_factory=None,
 ):
     """Contract one qMERA local term by rebuilding only its scheduled cone."""
     lightcone = qmera_parametric_lightcone_tn(
@@ -495,6 +523,7 @@ def local_qmera_parametric_lightcone_expectation(
         physical_dim=physical_dim,
         simplify=simplify,
         gate_contract=gate_contract,
+        product_state_factory=product_state_factory,
     )
     return contract_qmera_lightcone_tn(
         lightcone,
@@ -523,6 +552,7 @@ def qmera_parametric_energy(
     simplify=False,
     gate_contract=True,
     contract_opts=None,
+    product_state_factory=None,
 ):
     """Evaluate a qMERA energy by rebuilding each scheduled lightcone only."""
     array_backend = _resolve_array_backend(array_backend)
@@ -549,6 +579,7 @@ def qmera_parametric_energy(
             simplify=simplify,
             gate_contract=gate_contract,
             contract_opts=contract_opts,
+            product_state_factory=product_state_factory,
         )
         value = term_value if value is None else value + term_value
     if value is None:
