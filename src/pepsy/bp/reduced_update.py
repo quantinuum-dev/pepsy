@@ -17,10 +17,13 @@ import numpy as np
 
 __all__ = [
     "ExactReducedUpdateProblem",
+    "LoopClusterReducedUpdateProblem",
+    "LoopClusterTerm",
     "ReducedALSSolution",
     "ReducedBondPair",
     "SUClusterReducedUpdateProblem",
     "exact_reduced_update_problem",
+    "loop_cluster_reduced_update_problem",
     "prepare_reduced_bond_pair",
     "solve_reduced_als",
     "su_cluster_reduced_update_problem",
@@ -268,18 +271,34 @@ class ReducedBondPair:
         # diag(lambda), with bra index first and ket index second.
         return np.diag(gauge)
 
-    def _cluster_environment_tensor(self, radius: int):
-        """Contract an SU-closed local exterior with reduced legs open.
+    def _cluster_environment_from_tids(self, cluster_tids):
+        """Contract an arbitrary SU-closed exterior with reduced legs open.
 
-        The cluster contains all spectator tensors at tensor-graph distance at
-        most ``radius`` from either active site, plus the fixed QR/LQ outer
-        factors. Every virtual bond cut by the cluster is closed by its stored
-        unnormalized two-norm SU density ``diag(lambda)``. A system-covering
-        radius has no cut bonds and returns the exact exterior.
+        The cluster contains the selected spectator tensors plus the fixed
+        QR/LQ outer factors. Every virtual bond cut by the cluster is closed by
+        its stored unnormalized two-norm SU density ``diag(lambda)``. A
+        system-covering cluster has no cut bonds and returns the exact
+        exterior.
         """
         import quimb.tensor as qtn
 
-        cluster_tids = self._cluster_tids(radius)
+        active_tids = {self.left_tid, self.right_tid}
+        ordered_cluster_tids = []
+        seen_tids = set()
+        for tid in cluster_tids:
+            if tid not in seen_tids:
+                seen_tids.add(tid)
+                ordered_cluster_tids.append(tid)
+        cluster_tids = tuple(ordered_cluster_tids)
+        unknown_tids = set(cluster_tids).difference(self.tn.tensor_map)
+        if unknown_tids:
+            raise ValueError(f"unknown cluster tensor ids: {unknown_tids!r}")
+        if active_tids.intersection(cluster_tids):
+            raise ValueError(
+                "cluster_tids must contain only spectator tensor ids; the "
+                "active pair is represented by q_left and q_right"
+            )
+
         inner_inds = set(self.tn.inner_inds())
         dual_inds = {ix: qtn.rand_uuid() for ix in inner_inds}
         tensors = [self.q_left.copy(), self.q_right.copy()]
@@ -324,6 +343,15 @@ class ReducedBondPair:
             cluster_tids,
             tuple(boundary_inds),
         )
+
+    def _cluster_environment_tensor(self, radius: int):
+        """Contract an SU-closed local exterior with reduced legs open.
+
+        The cluster contains all spectator tensors at tensor-graph distance at
+        most ``radius`` from either active site, plus the fixed QR/LQ outer
+        factors.
+        """
+        return self._cluster_environment_from_tids(self._cluster_tids(radius))
 
     def _environment_tensor(self):
         """Contract the exact exterior metric with reduced virtual legs open."""
@@ -422,6 +450,59 @@ class SUClusterReducedUpdateProblem:
 
     def cost(self, theta) -> float:
         """Return the SU-cluster squared error for a joint reduced tensor."""
+        delta = _as_numpy(theta).reshape(-1) - self.target.reshape(-1)
+        return float(np.real(np.vdot(delta, self.metric @ delta)))
+
+
+@dataclass(frozen=True)
+class LoopClusterTerm:
+    """One operator-valued loop-cluster region in the open-leg sum."""
+
+    region_tids: frozenset[Any]
+    count: int
+    cluster_tids: tuple[Any, ...]
+    boundary_inds: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LoopClusterReducedUpdateProblem:
+    """Additive open-leg loop-cluster approximation to a reduced update.
+
+    Every counted region includes the active QR/LQ outer factors, so each
+    contraction returns the same open-leg operator ``N_C``. These operators are
+    combined with inclusion-exclusion counting numbers,
+    ``N_red ~= sum_C c_C N_C``. Boundaries are closed only with the stored
+    two-norm SU messages ``diag(lambda)``; no D2BP solve is run.
+    """
+
+    pair: ReducedBondPair
+    gate: Any
+    base_radius: int
+    max_loop_size: int
+    full_radius: int
+    loop_regions: tuple[frozenset[Any], ...]
+    terms: tuple[LoopClusterTerm, ...]
+    metric: np.ndarray
+    raw_metric: np.ndarray
+    linear_term: np.ndarray
+    target: np.ndarray
+    psd_projected: bool
+    raw_min_eigenvalue: float
+    clipped_eigenvalues: int
+
+    @property
+    def shape(self) -> tuple[int, int, int, int]:
+        """Joint reduced-tensor shape ``(r_L, p_L, p_R, r_R)``."""
+        return self.pair.theta_shape
+
+    @property
+    def target_norm(self) -> float:
+        """Loop-cluster estimate of the untruncated target norm."""
+        target = self.target.reshape(-1)
+        return float(np.real(np.vdot(target, self.metric @ target)))
+
+    def cost(self, theta) -> float:
+        """Return the loop-cluster squared error for a joint reduced tensor."""
         delta = _as_numpy(theta).reshape(-1) - self.target.reshape(-1)
         return float(np.real(np.vdot(delta, self.metric @ delta)))
 
@@ -676,6 +757,190 @@ def su_cluster_reduced_update_problem(
     )
 
 
+def _region_sort_key(region) -> tuple[int, tuple[str, ...]]:
+    """Deterministic ordering for tensor-id regions with arbitrary id types."""
+    return (len(region), tuple(sorted(map(repr, region))))
+
+
+def _region_is_connected(tn, region) -> bool:
+    """Return whether a tensor-id region is connected in the TN graph."""
+    region = frozenset(region)
+    if not region:
+        return False
+
+    start = next(iter(region))
+    seen = {start}
+    pending = deque((start,))
+    while pending:
+        tid = pending.popleft()
+        for ix in tn.tensor_map[tid].inds:
+            for neighbor in tn.ind_map.get(ix, ()):
+                if neighbor in region and neighbor not in seen:
+                    seen.add(neighbor)
+                    pending.append(neighbor)
+    return len(seen) == len(region)
+
+
+def _loop_cluster_region_counts(
+    pair: ReducedBondPair,
+    *,
+    max_loop_size: int,
+    base_radius: int,
+    include_full_system: bool | None,
+    autocomplete: bool,
+):
+    """Return active-anchored open-leg loop regions and counting numbers."""
+    from quimb.tensor.belief_propagation.regions import gen_region_counts
+
+    if not isinstance(max_loop_size, (int, np.integer)) or max_loop_size < 0:
+        raise ValueError("max_loop_size must be a nonnegative integer")
+    max_loop_size = int(max_loop_size)
+
+    anchor = frozenset(
+        {pair.left_tid, pair.right_tid, *pair._cluster_tids(base_radius)}
+    )
+    known_tids = frozenset(pair.tn.tensor_map)
+    regions = {anchor}
+    loop_regions = []
+
+    if max_loop_size:
+        for loop in pair.tn.gen_gloops(max_size=max_loop_size):
+            loop = frozenset(loop)
+            unknown_tids = loop.difference(known_tids)
+            if unknown_tids:
+                raise RuntimeError(
+                    "quimb generated a loop region with unknown tensor ids: "
+                    f"{unknown_tids!r}"
+                )
+
+            region = frozenset(anchor | loop)
+            if region == anchor or not _region_is_connected(pair.tn, region):
+                continue
+            regions.add(region)
+            loop_regions.append(loop)
+
+    if include_full_system is None:
+        include_full_system = max_loop_size >= len(pair.tn.tensor_map)
+    if include_full_system:
+        regions.add(known_tids)
+
+    region_counts = tuple(
+        sorted(
+            gen_region_counts(
+                sorted(regions, key=_region_sort_key),
+                autocomplete=autocomplete,
+            ),
+            key=lambda item: _region_sort_key(item[0]),
+        )
+    )
+    loop_regions = tuple(sorted(set(loop_regions), key=_region_sort_key))
+    return region_counts, loop_regions
+
+
+def _psd_project_metric(metric: np.ndarray, psd_floor: float):
+    """Return a Hermitian PSD projection and projection diagnostics."""
+    if psd_floor < 0.0:
+        raise ValueError("psd_floor must be nonnegative")
+
+    hermitian = 0.5 * (metric + metric.conj().T)
+    eigenvalues, eigenvectors = np.linalg.eigh(hermitian)
+    raw_min = float(eigenvalues.min()) if eigenvalues.size else 0.0
+    scale = max(1.0, float(np.max(np.abs(eigenvalues)))) if eigenvalues.size else 1.0
+    floor = float(psd_floor) * scale
+    clipped = np.maximum(eigenvalues, floor)
+    projected = (eigenvectors * clipped) @ eigenvectors.conj().T
+    projected = 0.5 * (projected + projected.conj().T)
+    return projected, raw_min, int(np.count_nonzero(eigenvalues < floor))
+
+
+def loop_cluster_reduced_update_problem(
+    pair: ReducedBondPair,
+    gate,
+    *,
+    max_loop_size: int = 0,
+    base_radius: int = 0,
+    include_full_system: bool | None = None,
+    autocomplete: bool = True,
+    psd_project: bool = True,
+    psd_floor: float = 0.0,
+) -> LoopClusterReducedUpdateProblem:
+    """Build an additive open-leg loop-cluster ``N_red`` approximation.
+
+    ``base_radius`` first chooses the SU-boundary cluster that represents the
+    observable support. Each generalized loop up to ``max_loop_size`` is then
+    augmented by that active support, disconnected augmented regions are
+    dropped, and the remaining regions are combined by the region
+    inclusion-exclusion sum. Every contracted term keeps the reduced bra/ket
+    legs open and closes only its outer boundary with stored SU messages.
+
+    ``max_loop_size=0`` returns the same metric as
+    :func:`su_cluster_reduced_update_problem` at ``base_radius``. When
+    ``include_full_system`` is true, or when ``max_loop_size`` is at least the
+    number of PEPS site tensors, the system-covering region is included and
+    the smaller nested regions cancel, yielding the dense exact oracle.
+    """
+    region_counts, loop_regions = _loop_cluster_region_counts(
+        pair,
+        max_loop_size=max_loop_size,
+        base_radius=base_radius,
+        include_full_system=include_full_system,
+        autocomplete=autocomplete,
+    )
+
+    active_tids = {pair.left_tid, pair.right_tid}
+    size = int(np.prod(pair.theta_shape))
+    raw_metric = np.zeros((size, size), dtype=complex)
+    terms = []
+    for region, count in region_counts:
+        cluster_tids = tuple(
+            tid
+            for tid in pair.tn.tensor_map
+            if tid in region and tid not in active_tids
+        )
+        environment, cluster_tids, boundary_inds = (
+            pair._cluster_environment_from_tids(cluster_tids)
+        )
+        raw_metric = raw_metric + count * _metric_from_environment(
+            pair,
+            environment,
+        )
+        terms.append(
+            LoopClusterTerm(
+                region_tids=frozenset(region),
+                count=int(count),
+                cluster_tids=cluster_tids,
+                boundary_inds=boundary_inds,
+            )
+        )
+
+    raw_metric = 0.5 * (raw_metric + raw_metric.conj().T)
+    if psd_project:
+        metric, raw_min, clipped = _psd_project_metric(raw_metric, psd_floor)
+    else:
+        eigenvalues = np.linalg.eigvalsh(raw_metric)
+        raw_min = float(eigenvalues.min()) if eigenvalues.size else 0.0
+        metric = raw_metric
+        clipped = 0
+
+    target = _apply_two_site_gate(pair.theta_array(), gate)
+    return LoopClusterReducedUpdateProblem(
+        pair=pair,
+        gate=gate,
+        base_radius=base_radius,
+        max_loop_size=int(max_loop_size),
+        full_radius=pair.full_cluster_radius(),
+        loop_regions=loop_regions,
+        terms=tuple(terms),
+        metric=metric,
+        raw_metric=raw_metric,
+        linear_term=metric @ target.reshape(-1),
+        target=target,
+        psd_projected=bool(psd_project),
+        raw_min_eigenvalue=raw_min,
+        clipped_eigenvalues=clipped,
+    )
+
+
 def _svd_initial_factors(target: np.ndarray, max_bond: int):
     """Return a rank-``max_bond`` two-factor split of a joint reduced tensor."""
     left_dim, physical_left, physical_right, right_dim = target.shape
@@ -694,7 +959,11 @@ def _solve_normal_equations(matrix, rhs, rcond: float):
 
 
 def solve_reduced_als(
-    problem: ExactReducedUpdateProblem | SUClusterReducedUpdateProblem,
+    problem: (
+        ExactReducedUpdateProblem
+        | SUClusterReducedUpdateProblem
+        | LoopClusterReducedUpdateProblem
+    ),
     *,
     max_bond: int | None = None,
     max_iterations: int = 20,

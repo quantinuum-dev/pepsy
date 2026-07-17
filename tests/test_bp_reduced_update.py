@@ -8,6 +8,7 @@ qtn = pytest.importorskip("quimb.tensor")
 from pepsy.bp import (  # noqa: E402
     exact_reduced_update_problem,
     gauge_all_simple,
+    loop_cluster_reduced_update_problem,
     prepare_reduced_bond_pair,
     solve_reduced_als,
     su_cluster_reduced_update_problem,
@@ -144,6 +145,63 @@ def test_radius_zero_su_cluster_is_psd_and_has_a_consistent_als_objective():
     )
 
 
+def test_zero_loop_open_leg_cluster_matches_the_su_boundary_cluster():
+    pair = _pair()
+    su_cluster = su_cluster_reduced_update_problem(pair, _cnot(), radius=0)
+    loop_cluster = loop_cluster_reduced_update_problem(
+        pair,
+        _cnot(),
+        max_loop_size=0,
+        base_radius=0,
+        psd_project=False,
+    )
+
+    assert not loop_cluster.loop_regions
+    assert len(loop_cluster.terms) == 1
+    assert loop_cluster.terms[0].count == 1
+    assert loop_cluster.terms[0].cluster_tids == su_cluster.cluster_tids
+    assert loop_cluster.terms[0].boundary_inds == su_cluster.boundary_inds
+    assert np.allclose(
+        loop_cluster.metric,
+        su_cluster.metric,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+    assert np.allclose(
+        loop_cluster.linear_term,
+        su_cluster.linear_term,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+def test_full_open_leg_loop_cluster_recovers_the_exact_metric():
+    pair = _pair()
+    exact = exact_reduced_update_problem(pair, _cnot())
+    loop_cluster = loop_cluster_reduced_update_problem(
+        pair,
+        _cnot(),
+        max_loop_size=len(pair.tn.tensor_map),
+        psd_project=False,
+    )
+
+    assert len(loop_cluster.terms) == 1
+    assert loop_cluster.terms[0].region_tids == frozenset(pair.tn.tensor_map)
+    assert not loop_cluster.terms[0].boundary_inds
+    assert np.allclose(
+        loop_cluster.raw_metric,
+        exact.metric,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+    assert np.allclose(
+        loop_cluster.linear_term,
+        exact.linear_term,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
 def test_su_cluster_radius_grows_through_a_nontrivial_three_by_three_peps():
     core, gauges = _su_gauged_peps(3, 3, seed=9)
     pair = prepare_reduced_bond_pair(core, gauges, where=((1, 1), (1, 2)))
@@ -160,3 +218,39 @@ def test_su_cluster_radius_grows_through_a_nontrivial_three_by_three_peps():
     assert radius_one.boundary_inds
     assert not full.boundary_inds
     assert np.allclose(full.metric, exact.metric, atol=1e-8, rtol=1e-10)
+
+
+def test_open_leg_loop_cluster_adds_plaquette_regions_additively():
+    core, gauges = _su_gauged_peps(3, 3, seed=9)
+    pair = prepare_reduced_bond_pair(core, gauges, where=((1, 1), (1, 2)))
+    loop_cluster = loop_cluster_reduced_update_problem(
+        pair,
+        _cnot(),
+        max_loop_size=4,
+    )
+    active_tids = {pair.left_tid, pair.right_tid}
+    solution = solve_reduced_als(loop_cluster, max_iterations=12, rcond=1e-11)
+
+    assert loop_cluster.loop_regions
+    assert len(loop_cluster.terms) > 1
+    assert all(
+        active_tids.issubset(term.region_tids)
+        for term in loop_cluster.terms
+    )
+    assert any(term.count < 0 for term in loop_cluster.terms)
+    assert loop_cluster.psd_projected
+    assert np.allclose(
+        loop_cluster.metric,
+        loop_cluster.metric.conj().T,
+        atol=1e-10,
+    )
+    assert np.linalg.eigvalsh(loop_cluster.metric).min() >= -1e-10
+    assert np.allclose(
+        loop_cluster.linear_term,
+        loop_cluster.metric @ loop_cluster.target.reshape(-1),
+        atol=1e-10,
+    )
+    assert all(
+        later <= earlier + 1e-9 * max(1.0, earlier)
+        for earlier, later in zip(solution.costs, solution.costs[1:])
+    )
