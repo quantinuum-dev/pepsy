@@ -59,9 +59,18 @@ from .relay import (
     relay_bp,
     two_norm_bp,
 )
+from .reduced_update import (
+    ExactReducedUpdateProblem,
+    ReducedALSSolution,
+    ReducedBondPair,
+    exact_reduced_update_problem,
+    prepare_reduced_bond_pair,
+    solve_reduced_als,
+)
 
 __all__ = [
     "GaugeResult",
+    "ExactReducedUpdateProblem",
     "BPCandidateScore",
     "BPCandidateSelection",
     "BPState",
@@ -72,12 +81,15 @@ __all__ = [
     "LinkedClusterTerm",
     "LoopClusterResult",
     "RelayGaugeOptions",
+    "ReducedALSSolution",
+    "ReducedBondPair",
     "ScalarClusterCache",
     "compare_simple_update_gauges",
     "compare_simple_update_to_bp",
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
     "d2bp_from_simple_update_gauges",
+    "exact_reduced_update_problem",
     "gauge_all",
     "gauge_all_simple",
     "gauge_all_simple_with_bp_check",
@@ -87,6 +99,7 @@ __all__ = [
     "linked_cluster_expand",
     "norm1_gloop_expand",
     "one_norm_bp",
+    "prepare_reduced_bond_pair",
     "relay_bp",
     "run_d1bp_from_simple_update_gauges",
     "run_d2bp_from_simple_update_gauges",
@@ -96,5 +109,6 @@ __all__ = [
     "simple_update_gauges_from_messages",
     "simple_update_messages_from_gauges",
     "select_bp_candidate",
+    "solve_reduced_als",
     "two_norm_bp",
 ]
