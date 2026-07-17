@@ -44,6 +44,7 @@ __all__ = [
     "RelayBPResult",
     "one_norm_bp",
     "relay_bp",
+    "two_norm_bp",
 ]
 
 _ONE_NORM_CLASSES = {"l1bp": "L1BP", "hv1bp": "HV1BP", "d1bp": "D1BP"}
@@ -519,6 +520,55 @@ def one_norm_bp(
     bp = bp_class(
         tn,
         **_bp_constructor_kwargs(method_key, damping, update, bp_opts),
+    )
+    if init_messages is not None:
+        _set_messages(bp, init_messages)
+    info: dict = {}
+    bp.run(
+        max_iterations=max_iterations,
+        tol=tol,
+        diis=diis,
+        progbar=progbar,
+        info=info,
+        **_run_options(tol_abs, tol_rolling_diff),
+    )
+    max_mdiff = float(info.get("max_mdiff", float("nan")))
+    return RelayBPResult(
+        bp=bp,
+        converged=_strict_converged(max_mdiff, tol, tol_abs),
+        iterations=int(info.get("iterations", 0)),
+        max_mdiff=max_mdiff,
+        num_legs_run=1,
+        quimb_converged=bool(info.get("converged", False)),
+    )
+
+
+def two_norm_bp(
+    tn,
+    *,
+    max_iterations: int = 1000,
+    tol: float = 5e-6,
+    tol_abs: float | None = None,
+    tol_rolling_diff: float | None = 0.0,
+    damping: float = 0.0,
+    update: str | None = None,
+    diis: bool | dict[str, Any] = True,
+    progbar: bool = False,
+    init_messages: Any | None = None,
+    **bp_opts,
+) -> RelayBPResult:
+    """Run plain quimb D2BP to a fixed point on a wavefunction-like TN.
+
+    D2BP contracts the 2-norm internally, so ``tn`` must be the physical
+    state/PEPS-like tensor network, not its explicitly doubled norm network.
+    The result uses the same wrapper as :func:`one_norm_bp` and
+    :func:`relay_bp`, including detached message snapshots for warm starts.
+    """
+    if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
+        raise ValueError("max_iterations must be a positive integer")
+    bp = _bp_class("d2bp")(
+        tn,
+        **_bp_constructor_kwargs("d2bp", damping, update, bp_opts),
     )
     if init_messages is not None:
         _set_messages(bp, init_messages)

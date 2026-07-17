@@ -1,4 +1,4 @@
-"""Simple-update gauge bridges for 1-norm BP."""
+"""Simple-update gauge bridges for 1-norm and dense 2-norm BP."""
 
 from __future__ import annotations
 
@@ -17,13 +17,16 @@ __all__ = [
     "compare_simple_update_to_bp",
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
+    "d2bp_from_simple_update_gauges",
     "gauge_all",
     "gauge_all_simple",
     "gauge_all_simple_with_bp_check",
     "relay_gauge_all_simple",
     "run_d1bp_from_simple_update_gauges",
+    "run_d2bp_from_simple_update_gauges",
     "simple_update_bp_residual",
     "simple_update_core_and_gauges_from_messages",
+    "simple_update_core_and_gauges_from_d2bp",
     "simple_update_gauges_from_messages",
     "simple_update_messages_from_gauges",
 ]
@@ -50,7 +53,7 @@ class GaugeResult:
 
     ``core`` and ``su_gauges`` are a simple-update representation whenever
     ``su_gauges`` is not ``None``. ``bp_result`` is the standard
-    :class:`~pepsy.bp.RelayBPResult` wrapper when a D1BP stage was run.
+    :class:`~pepsy.bp.RelayBPResult` wrapper when a D1BP or D2BP stage was run.
     """
 
     core: Any
@@ -67,12 +70,12 @@ class GaugeResult:
 
     @property
     def bp(self):
-        """The underlying D1BP object, when a BP stage was run."""
+        """The underlying D1BP or D2BP object, when a BP stage was run."""
         return None if self.bp_result is None else self.bp_result.bp
 
     @property
     def messages(self):
-        """D1BP messages, when a BP stage was run."""
+        """D1BP or D2BP messages, when a BP stage was run."""
         return None if self.bp_result is None else self.bp_result.messages
 
 
@@ -108,6 +111,21 @@ def _validate_d1_graph(tn) -> None:
             "D1 1-norm BP needs a closed graph tensor network: every index "
             "must connect exactly two tensors. Project or trace dangling "
             f"indices first. Bad index arities: {bad!r}"
+        )
+
+
+def _validate_d2_graph(tn) -> None:
+    """Validate the pairwise virtual-bond structure required by D2BP."""
+    bad = {
+        ix: len(tids)
+        for ix, tids in tn.ind_map.items()
+        if len(tids) not in {1, 2}
+    }
+    if bad:
+        raise ValueError(
+            "D2BP needs a PEPS-like pairwise tensor graph: virtual bonds must "
+            "connect two tensors and physical/output indices must be dangling. "
+            f"Bad index arities: {bad!r}"
         )
 
 
@@ -248,6 +266,122 @@ def d1bp_from_simple_update_gauges(
     return bp
 
 
+def _d2bp_messages_from_simple_update_gauges(
+    tn,
+    gauges=None,
+    *,
+    smudge: float = 0.0,
+    missing: str = "ones",
+):
+    """Create diagonal PSD D2BP messages from Vidal/SU bond gauges."""
+    _validate_d2_graph(tn)
+    gauges = {} if gauges is None else gauges
+    messages = {}
+
+    for ix, tids in tn.ind_map.items():
+        if len(tids) != 2:
+            continue
+        if ix in gauges:
+            gauge = _copy_array(gauges[ix])
+        elif missing == "ones":
+            gauge = _ones_for_index(tn, ix)
+        elif missing == "raise":
+            raise KeyError(f"missing simple-update gauge for index {ix!r}")
+        else:
+            raise ValueError("missing must be 'ones' or 'raise'")
+
+        gauge_np = np.real_if_close(_as_numpy(gauge))
+        if gauge_np.ndim != 1 or gauge_np.shape[0] != tn.ind_size(ix):
+            raise ValueError(
+                f"SU gauge for {ix!r} must be a length-{tn.ind_size(ix)} vector"
+            )
+        if not np.all(np.isfinite(gauge_np)):
+            raise ValueError(f"SU gauge for {ix!r} is not finite")
+        if np.iscomplexobj(gauge_np) or np.any(gauge_np < 0.0):
+            raise ValueError(
+                "D2BP SU initialization requires real nonnegative Vidal "
+                f"gauges; bond {ix!r} is invalid"
+            )
+        if smudge:
+            gauge = _smudge_gauge(gauge, smudge)
+
+        # In the symmetric PEPS gauge, sqrt(lambda) is absorbed on each
+        # physical-site tensor. D2BP sees both layers, hence its directed
+        # density message is diag(lambda), rather than the D1 sqrt(lambda).
+        message = ar.do("diag", gauge)
+        tida, tidb = tids
+        messages[ix, tida] = _copy_array(message)
+        messages[ix, tidb] = _copy_array(message)
+
+    return messages
+
+
+def d2bp_from_simple_update_gauges(
+    tn,
+    gauges=None,
+    *,
+    insert_gauges: bool = True,
+    smudge: float = 0.0,
+    missing: str = "ones",
+    normalize_initial: bool = True,
+    output_inds=None,
+    optimize: str = "auto-hq",
+    damping: float = 0.0,
+    update: str = "sequential",
+    normalize=None,
+    distance=None,
+    local_convergence: bool = False,
+    contract_every=None,
+    **contract_opts,
+):
+    """Build D2BP from a physical PEPS and Vidal/SU bond gauges.
+
+    ``tn`` is the single-layer wavefunction-like network, not its explicitly
+    doubled norm network. With ``insert_gauges=True`` (the default), the
+    external gauge ``lambda`` is split as ``sqrt(lambda)`` onto both endpoint
+    tensors. The D2BP messages are then initialized as ``diag(lambda)`` on
+    both directions of each virtual bond, the density-matrix counterpart of
+    :func:`d1bp_from_simple_update_gauges`.
+
+    This is a rank-one/SU environment initializer. For a loopy PEPS, run D2BP
+    afterwards and use its residual rather than treating the diagonal seed as
+    a D2BP fixed point.
+    """
+    from quimb.tensor.belief_propagation import D2BP
+
+    _validate_d2_graph(tn)
+    work = tn.copy()
+    gauges_copy = copy_gauges(gauges)
+    if insert_gauges:
+        work.gauge_simple_insert(gauges_copy, smudge=smudge)
+
+    messages = _d2bp_messages_from_simple_update_gauges(
+        work,
+        gauges_copy,
+        smudge=smudge,
+        missing=missing,
+    )
+    bp = D2BP(
+        work,
+        messages=messages,
+        output_inds=output_inds,
+        optimize=optimize,
+        damping=damping,
+        update=update,
+        normalize=normalize,
+        distance=distance,
+        local_convergence=local_convergence,
+        contract_every=contract_every,
+        inplace=True,
+        **contract_opts,
+    )
+    if normalize_initial:
+        bp.messages = {
+            key: bp._normalize_fn(value) for key, value in bp.messages.items()
+        }
+    return bp
+
+
 def _snapshot_messages(messages) -> dict:
     return {key: _copy_array(value) for key, value in messages.items()}
 
@@ -306,6 +440,55 @@ def run_d1bp_from_simple_update_gauges(
     return one_norm_bp(
         initial.tn,
         method="d1bp",
+        init_messages=init_messages,
+        **kwargs,
+    )
+
+
+def run_d2bp_from_simple_update_gauges(
+    tn,
+    gauges=None,
+    *,
+    use_relay: bool = False,
+    bp_opts: dict[str, Any] | None = None,
+    run_opts: dict[str, Any] | None = None,
+    relay_opts: dict[str, Any] | None = None,
+):
+    """Run plain or relay D2BP from a Vidal/SU-gauge initialization."""
+    from .relay import relay_bp, two_norm_bp
+
+    bp_opts = {} if bp_opts is None else dict(bp_opts)
+    run_opts = {} if run_opts is None else dict(run_opts)
+    relay_opts = {} if relay_opts is None else dict(relay_opts)
+
+    initial = d2bp_from_simple_update_gauges(tn, gauges, **bp_opts)
+    init_messages = run_opts.pop("init_messages", None)
+    if init_messages is None:
+        init_messages = _snapshot_messages(initial.messages)
+    run_bp_opts = {
+        key: value
+        for key, value in bp_opts.items()
+        if key
+        not in {
+            "insert_gauges",
+            "smudge",
+            "missing",
+            "normalize_initial",
+        }
+    }
+
+    if use_relay:
+        kwargs = {**run_bp_opts, **run_opts, **relay_opts}
+        return relay_bp(
+            initial.tn,
+            method="d2bp",
+            init_messages=init_messages,
+            **kwargs,
+        )
+
+    kwargs = {**run_bp_opts, **run_opts}
+    return two_norm_bp(
+        initial.tn,
         init_messages=init_messages,
         **kwargs,
     )
@@ -897,6 +1080,7 @@ def gauge_all(
     *,
     start: str = "su",
     target: str = "bp",
+    norm: str = "1norm",
     su_gauges=None,
     bp_messages=None,
     su_options: dict[str, Any] | None = None,
@@ -904,12 +1088,14 @@ def gauge_all(
     conversion_options: dict[str, Any] | None = None,
     inplace: bool = False,
 ) -> GaugeResult:
-    """Run and bridge simple-update (SU) and directed 1-norm BP gauges.
+    """Run and bridge SU gauges with D1BP or dense D2BP.
 
     ``start`` and ``target`` are each ``"su"`` or ``"bp"``. A change of
     representation runs the source solver, then performs the appropriate
-    lossless D1BP <-> SU conversion. For example, ordinary SU followed by a
-    D1BP refinement is:
+    BP <-> SU conversion. ``norm="1norm"`` is the existing closed-scalar
+    D1BP path; ``norm="2norm"`` is the physical PEPS path using D2BP's
+    positive-semidefinite matrix messages. For example, ordinary SU followed
+    by a D1BP refinement is:
 
     .. code-block:: python
 
@@ -922,16 +1108,17 @@ def gauge_all(
         )
 
     Supplying ``su_gauges`` skips the initial SU solve and uses the provided
-    external gauges as the D1BP warm start. Supplying ``bp_messages`` starts
-    D1BP from that compatible directed-message snapshot. ``su_options`` are
-    forwarded to :func:`gauge_all_simple`; ``bp_options`` are forwarded to
-    :func:`run_d1bp_from_simple_update_gauges` and thus support plain or Relay
-    D1BP. ``conversion_options`` are forwarded to
-    :func:`simple_update_core_and_gauges_from_messages` for BP-to-SU output.
+    external gauges as a D1BP or D2BP warm start. Supplying ``bp_messages``
+    starts the corresponding BP method from that compatible directed-message
+    snapshot. ``su_options`` are forwarded to :func:`gauge_all_simple`;
+    ``bp_options`` are forwarded to :func:`run_d1bp_from_simple_update_gauges`
+    or :func:`run_d2bp_from_simple_update_gauges`. ``conversion_options`` are
+    forwarded to the corresponding BP-to-SU conversion.
 
-    BP-to-SU conversion is intentionally restricted to D1BP: external
-    nonnegative SU gauges are the invariant products of opposite directed
-    D1BP messages. Other BP layouts do not generally have that representation.
+    D1BP uses vector messages on an already scalar network. D2BP instead runs
+    on the physical, single-layer state and maps its PSD matrix-message pairs
+    to Vidal/SU gauges with the BP-gauging transformation. These conventions
+    are deliberately separate.
     """
     valid_representations = {"su", "bp"}
     if start not in valid_representations:
@@ -942,6 +1129,9 @@ def gauge_all(
         raise ValueError("bp_messages can only be supplied when start='bp'")
     if start == "bp" and su_gauges is not None:
         raise ValueError("su_gauges can only be supplied when start='su'")
+    norm_key = str(norm).lower()
+    if norm_key not in {"1norm", "2norm"}:
+        raise ValueError("norm must be either '1norm' or '2norm'")
 
     su_options = {} if su_options is None else dict(su_options)
     bp_options = {} if bp_options is None else dict(bp_options)
@@ -966,11 +1156,18 @@ def gauge_all(
             su_gauges = copy_gauges(su_gauges)
 
         if target == "bp":
-            bp_result = run_d1bp_from_simple_update_gauges(
-                core,
-                su_gauges,
-                **bp_options,
-            )
+            if norm_key == "1norm":
+                bp_result = run_d1bp_from_simple_update_gauges(
+                    core,
+                    su_gauges,
+                    **bp_options,
+                )
+            else:
+                bp_result = run_d2bp_from_simple_update_gauges(
+                    core,
+                    su_gauges,
+                    **bp_options,
+                )
         return GaugeResult(
             core=core,
             su_gauges=su_gauges,
@@ -991,16 +1188,29 @@ def gauge_all(
     if run_opts:
         bp_options["run_opts"] = run_opts
 
-    bp_result = run_d1bp_from_simple_update_gauges(
-        core,
-        gauges=None,
-        **bp_options,
-    )
-    if target == "su":
-        core, su_gauges = simple_update_core_and_gauges_from_messages(
-            bp_result.bp,
-            **conversion_options,
+    if norm_key == "1norm":
+        bp_result = run_d1bp_from_simple_update_gauges(
+            core,
+            gauges=None,
+            **bp_options,
         )
+    else:
+        bp_result = run_d2bp_from_simple_update_gauges(
+            core,
+            gauges=None,
+            **bp_options,
+        )
+    if target == "su":
+        if norm_key == "1norm":
+            core, su_gauges = simple_update_core_and_gauges_from_messages(
+                bp_result.bp,
+                **conversion_options,
+            )
+        else:
+            core, su_gauges = simple_update_core_and_gauges_from_d2bp(
+                bp_result.bp,
+                **conversion_options,
+            )
     else:
         core = bp_result.bp.tn
         su_gauges = None
@@ -1188,6 +1398,139 @@ def simple_update_core_and_gauges_from_messages(
     core = bp.tn.copy()
     core.gauge_simple_insert(inverse_gauges)
     return core, copy_gauges(effective_gauges)
+
+
+def _hermitize(matrix):
+    """Return the Hermitian part of a D2BP density message."""
+    return 0.5 * (matrix + ar.dag(matrix))
+
+
+def _psd_eigh(matrix, *, smudge: float, label: str):
+    """Diagonalize a PSD message, clipping only numerical null modes."""
+    if smudge < 0.0:
+        raise ValueError("smudge must be nonnegative")
+    matrix = _hermitize(matrix)
+    values, vectors = ar.do("linalg.eigh", matrix)
+    values_np = np.real_if_close(_as_numpy(values))
+    if np.iscomplexobj(values_np) or not np.all(np.isfinite(values_np)):
+        raise ValueError(f"D2BP message for {label} has invalid eigenvalues")
+    scale = float(np.max(np.abs(values_np)))
+    if scale == 0.0:
+        raise ValueError(f"D2BP message for {label} is identically zero")
+
+    numerical_tol = 100.0 * np.finfo(float).eps * scale
+    if float(np.min(values_np)) < -numerical_tol:
+        raise ValueError(
+            f"D2BP message for {label} is not positive semidefinite; "
+            "run a PSD-preserving D2BP solve before BP-to-SU conversion"
+        )
+    floor = smudge * scale
+    if floor == 0.0 and float(np.min(values_np)) <= numerical_tol:
+        raise ValueError(
+            f"D2BP message for {label} is singular; pass smudge>0 to form "
+            "a regularized Vidal/SU gauge"
+        )
+    return ar.do("clip", values, floor, None), vectors
+
+
+def _psd_sqrt_and_inverse(matrix, *, smudge: float, label: str):
+    """Return the Hermitian square root and regularized inverse square root."""
+    import quimb.tensor as qtn
+
+    values, vectors = _psd_eigh(matrix, smudge=smudge, label=label)
+    roots = ar.do("sqrt", values)
+    sqrt = qtn.decomp.rdmul(vectors, roots) @ ar.dag(vectors)
+    sqrt_inv = qtn.decomp.rdmul(vectors, 1.0 / roots) @ ar.dag(vectors)
+    return sqrt, sqrt_inv
+
+
+def simple_update_core_and_gauges_from_d2bp(
+    bp,
+    *,
+    smudge: float = 1e-12,
+):
+    """Convert converged D2BP density messages into a Vidal/SU PEPS gauge.
+
+    This implements the BP-gauging construction for a physical, single-layer
+    PEPS-like TN. On each virtual bond, the two positive-semidefinite directed
+    D2BP messages are simultaneously diagonalized in the metric induced by
+    one message. Their shared diagonal spectrum becomes the external Vidal/SU
+    gauge. The required inverse/square-root and SVD-like transformations are
+    absorbed into a copied core, so
+
+    ``core.copy().gauge_simple_insert(gauges)``
+
+    represents exactly the same state as ``bp.tn`` (up to numerical roundoff).
+    On a tree at a D2BP fixed point this is the ordinary Vidal gauge. On a
+    loopy PEPS it is the BP/Vidal gauge approximation: it preserves the state
+    exactly, while the local isometry interpretation is controlled by the
+    D2BP fixed-point quality.
+
+    ``smudge`` clips tiny message eigenvalues before inversion. This does not
+    change the represented state—the clipping only selects a regularized,
+    invertible gauge—but it means the returned lambdas are a regularized
+    BP-gauge diagnostic on singular bonds.
+    """
+    if bp.__class__.__name__ != "D2BP":
+        raise ValueError("BP-to-SU conversion requires a D2BP object")
+    _validate_d2_graph(bp.tn)
+
+    expected_keys = {
+        (ix, tid)
+        for ix, tids in bp.tn.ind_map.items()
+        if len(tids) == 2
+        for tid in tids
+    }
+    if not isinstance(bp.messages, dict) or set(bp.messages) != expected_keys:
+        raise ValueError(
+            "D2BP-to-SU conversion requires one matrix message for each "
+            "endpoint of every virtual bond"
+        )
+
+    import quimb.tensor as qtn
+
+    core = bp.tn.copy()
+    gauges = {}
+    for ix, tids in bp.tn.ind_map.items():
+        if len(tids) != 2:
+            continue
+        tida, tidb = tids
+        # ``(ix, tidb)`` is the message sourced at ``tida``. D2BP stores bra
+        # then ket indices, so the opposite source enters transposed when we
+        # solve the simultaneous congruence problem on this bond.
+        m_from_a = bp.messages[ix, tidb]
+        m_from_b = bp.messages[ix, tida]
+        sqrt_a, sqrt_a_inv = _psd_sqrt_and_inverse(
+            m_from_a,
+            smudge=smudge,
+            label=f"bond {ix!r}, source {tida!r}",
+        )
+        metric_product = _hermitize(
+            sqrt_a @ ar.do("transpose", m_from_b) @ sqrt_a
+        )
+        lambda_squared, vectors = _psd_eigh(
+            metric_product,
+            smudge=smudge,
+            label=f"bond {ix!r}",
+        )
+        gauge = ar.do("sqrt", lambda_squared)
+        sqrt_gauge = ar.do("sqrt", gauge)
+
+        # If G is the metric-whitening transform, then
+        # G^dag m_from_a G = Lambda and
+        # (G^-1)^* m_from_b (G^-1)^T = Lambda.
+        # The transposed first gate and inverse second gate preserve the
+        # single-layer contraction exactly; removing sqrt(Lambda) from both
+        # tensors exposes the external SU gauge.
+        G = sqrt_a_inv @ qtn.decomp.rdmul(vectors, sqrt_gauge)
+        G_inv = qtn.decomp.lddiv(sqrt_gauge, ar.dag(vectors)) @ sqrt_a
+        core.tensor_map[tida].gate_(ar.do("transpose", G), ix)
+        core.tensor_map[tidb].gate_(G_inv, ix)
+        core.tensor_map[tida].multiply_index_diagonal_(ix, 1.0 / sqrt_gauge)
+        core.tensor_map[tidb].multiply_index_diagonal_(ix, 1.0 / sqrt_gauge)
+        gauges[ix] = _copy_array(gauge)
+
+    return core, gauges
 
 
 def compare_simple_update_gauges(

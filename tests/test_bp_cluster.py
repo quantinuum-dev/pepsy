@@ -27,6 +27,7 @@ from pepsy.bp import (  # noqa: E402
     compare_simple_update_gauges,
     compare_simple_update_to_bp,
     d1bp_from_simple_update_gauges,
+    d2bp_from_simple_update_gauges,
     gauge_all,
     gauge_all_simple,
     gauge_all_simple_with_bp_check,
@@ -35,10 +36,13 @@ from pepsy.bp import (  # noqa: E402
     norm1_gloop_expand,
     relay_gauge_all_simple,
     run_d1bp_from_simple_update_gauges,
+    run_d2bp_from_simple_update_gauges,
     select_bp_candidate,
     simple_update_bp_residual,
+    simple_update_core_and_gauges_from_d2bp,
     simple_update_core_and_gauges_from_messages,
     simple_update_gauges_from_messages,
+    two_norm_bp,
 )
 
 
@@ -64,16 +68,20 @@ def test_exports():
         "compare_simple_update_gauges",
         "compare_simple_update_to_bp",
         "d1bp_from_simple_update_gauges",
+        "d2bp_from_simple_update_gauges",
         "gauge_all",
         "gauge_all_simple",
         "linked_cluster_expand",
         "loop_cluster_expand",
         "norm1_gloop_expand",
         "run_d1bp_from_simple_update_gauges",
+        "run_d2bp_from_simple_update_gauges",
         "simple_update_bp_residual",
+        "simple_update_core_and_gauges_from_d2bp",
         "simple_update_core_and_gauges_from_messages",
         "simple_update_gauges_from_messages",
         "select_bp_candidate",
+        "two_norm_bp",
     } <= set(bp.__all__)
 
 
@@ -177,6 +185,121 @@ def _scalar_two_site_tree():
             qtn.Tensor(np.array([3.0, 5.0]), inds=("x",)),
         ]
     )
+
+
+def _complex_mps_tree():
+    return qtn.MPS_rand_state(
+        3,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="complex128",
+        seed=25,
+    )
+
+
+def test_d2bp_su_initialization_uses_diagonal_density_messages():
+    psi = _complex_mps_tree()
+    core, gauges, _ = gauge_all_simple(psi, max_iterations=10)
+    bp = d2bp_from_simple_update_gauges(core, gauges, normalize="L2")
+
+    assert bp.__class__.__name__ == "D2BP"
+    for ix, tids in bp.tn.ind_map.items():
+        if len(tids) != 2:
+            continue
+        expected = np.diag(gauges[ix] / np.linalg.norm(gauges[ix]))
+        for tid in tids:
+            assert np.allclose(bp.messages[ix, tid], expected)
+
+
+def test_d2bp_to_su_round_trip_preserves_state_and_fixed_messages():
+    psi = _complex_mps_tree()
+    result = two_norm_bp(psi, max_iterations=100, tol=1e-12, normalize="L2")
+    assert result.converged
+
+    core, gauges = simple_update_core_and_gauges_from_d2bp(result.bp)
+    rebuilt = core.copy()
+    rebuilt.gauge_simple_insert(gauges)
+    assert np.allclose(rebuilt.to_dense(), psi.to_dense(), atol=1e-10)
+
+    restarted = run_d2bp_from_simple_update_gauges(
+        core,
+        gauges,
+        bp_opts={"normalize": "L2"},
+        run_opts={"max_iterations": 100, "tol": 1e-12},
+    )
+    assert restarted.converged
+    for ix, tids in restarted.bp.tn.ind_map.items():
+        if len(tids) != 2:
+            continue
+        expected = np.diag(gauges[ix] / np.linalg.norm(gauges[ix]))
+        for tid in tids:
+            assert np.allclose(restarted.messages[ix, tid], expected, atol=1e-10)
+
+
+def test_d2bp_su_initialization_can_run_through_relay_bp():
+    psi = _complex_mps_tree()
+    core, gauges, _ = gauge_all_simple(psi, max_iterations=10)
+
+    result = run_d2bp_from_simple_update_gauges(
+        core,
+        gauges,
+        use_relay=True,
+        bp_opts={"normalize": "L2"},
+        run_opts={"max_iterations": 100, "tol": 1e-12},
+        relay_opts={
+            "num_relays": 2,
+            "gamma_range": (0.1, 0.2),
+            "memory_first_leg": True,
+            "seed": 4,
+        },
+    )
+
+    assert result.bp.__class__.__name__ == "D2BP"
+    assert result.converged
+
+
+def test_d2bp_to_su_conversion_preserves_a_loopy_complex_peps():
+    peps = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        dtype="complex128",
+        seed=9,
+    )
+    result = two_norm_bp(peps, max_iterations=200, tol=1e-10, normalize="L2")
+    assert result.converged
+
+    core, gauges = simple_update_core_and_gauges_from_d2bp(result.bp)
+    rebuilt = core.copy()
+    rebuilt.gauge_simple_insert(gauges)
+    assert np.allclose(rebuilt.to_dense(), peps.to_dense(), atol=1e-10)
+
+
+def test_gauge_all_supports_the_separate_d2bp_su_bridge():
+    psi = _complex_mps_tree()
+    result = gauge_all(
+        psi,
+        start="bp",
+        target="su",
+        norm="2norm",
+        bp_options={"run_opts": {"max_iterations": 100, "tol": 1e-12}},
+    )
+    assert result.bp.__class__.__name__ == "D2BP"
+    rebuilt = result.core.copy()
+    rebuilt.gauge_simple_insert(result.su_gauges)
+    assert np.allclose(rebuilt.to_dense(), psi.to_dense(), atol=1e-10)
+
+    refined = gauge_all(
+        result.core,
+        start="su",
+        target="bp",
+        norm="2norm",
+        su_gauges=result.su_gauges,
+        bp_options={"run_opts": {"max_iterations": 100, "tol": 1e-12}},
+    )
+    assert refined.bp.__class__.__name__ == "D2BP"
+    assert refined.bp_result.converged
 
 
 def _positive_triangle():

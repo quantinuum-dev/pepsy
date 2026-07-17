@@ -5,7 +5,8 @@ convergence-robust improvements:
 
 * :func:`relay_bp` -- the disordered-memory / relay-BP extension that hardens
   the 1-norm or dense 2-norm BP *fixed point* (arXiv:2506.01779).
-  :func:`one_norm_bp` provides the plain 1-norm BP runner.
+  :func:`one_norm_bp` and :func:`two_norm_bp` provide the corresponding plain
+  runners.
 * :func:`loop_cluster_expand` -- the loop cluster expansion (arXiv:2510.05647),
   a systematic loop correction that becomes exact when the cluster set covers
   the system. Fixed-point BP messages are still what justify the formal loop
@@ -37,17 +38,27 @@ from .gauges import (
     compare_simple_update_to_bp,
     copy_gauges,
     d1bp_from_simple_update_gauges,
+    d2bp_from_simple_update_gauges,
     gauge_all,
     gauge_all_simple,
     gauge_all_simple_with_bp_check,
     relay_gauge_all_simple,
     run_d1bp_from_simple_update_gauges,
+    run_d2bp_from_simple_update_gauges,
     simple_update_bp_residual,
+    simple_update_core_and_gauges_from_d2bp,
     simple_update_core_and_gauges_from_messages,
     simple_update_gauges_from_messages,
     simple_update_messages_from_gauges,
 )
-from .relay import BPState, BPUpdateResult, RelayBPResult, one_norm_bp, relay_bp
+from .relay import (
+    BPState,
+    BPUpdateResult,
+    RelayBPResult,
+    one_norm_bp,
+    relay_bp,
+    two_norm_bp,
+)
 
 __all__ = [
     "GaugeResult",
@@ -66,6 +77,7 @@ __all__ = [
     "compare_simple_update_to_bp",
     "copy_gauges",
     "d1bp_from_simple_update_gauges",
+    "d2bp_from_simple_update_gauges",
     "gauge_all",
     "gauge_all_simple",
     "gauge_all_simple_with_bp_check",
@@ -77,9 +89,12 @@ __all__ = [
     "one_norm_bp",
     "relay_bp",
     "run_d1bp_from_simple_update_gauges",
+    "run_d2bp_from_simple_update_gauges",
     "simple_update_bp_residual",
+    "simple_update_core_and_gauges_from_d2bp",
     "simple_update_core_and_gauges_from_messages",
     "simple_update_gauges_from_messages",
     "simple_update_messages_from_gauges",
     "select_bp_candidate",
+    "two_norm_bp",
 ]

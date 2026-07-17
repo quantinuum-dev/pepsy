@@ -15,9 +15,10 @@ side · **[roots]** foundational / prior art.
 
 | API | what | paper |
 | --- | --- | --- |
-| `one_norm_bp`, `relay_bp`, `RelayBPResult` | 1-norm BP + disordered-memory / relay-BP convergence robustness | Müller et al. 2506.01779 |
+| `one_norm_bp`, `two_norm_bp`, `relay_bp`, `RelayBPResult` | plain D1BP / D2BP plus disordered-memory / relay-BP convergence robustness | Müller et al. 2506.01779 |
 | `BPState`, `BPUpdateResult` | cached D1BP messages and a bounded/local warm-update light cone for value-only topology-preserving changes | Midha et al. 2604.21919 (algorithmic-locality motivation; Pepsy scope documented in API) |
-| `gauge_all`, `simple_update_core_and_gauges_from_messages`, `run_d1bp_from_simple_update_gauges`, `gauge_all_simple` | nonnegative simple-update ↔ D1BP gauge bridge; ordinary/relay/DIIS simple-update gauging with exact core compensation | Alkabetz & Arad (2021); Tindall & Fishman (2023); Müller et al. 2506.01779 |
+| `gauge_all`, `simple_update_core_and_gauges_from_messages`, `run_d1bp_from_simple_update_gauges`, `gauge_all_simple` | nonnegative simple-update ↔ D1BP vector-message bridge; ordinary/relay/DIIS simple-update gauging with exact core compensation | Alkabetz & Arad (2021); Tindall & Fishman (2023); Müller et al. 2506.01779 |
+| `d2bp_from_simple_update_gauges`, `run_d2bp_from_simple_update_gauges`, `simple_update_core_and_gauges_from_d2bp`, `gauge_all(norm="2norm")` | physical PEPS simple-update/Vidal ↔ D2BP density-message bridge: `diag(lambda)` initialization and PSD metric gauge conversion | Tindall & Fishman (2023); Gray et al. 2510.05647 |
 | `loop_cluster_expand`, `LoopClusterResult` | loop **cluster** expansion (thin wrapper over quimb `contract_gloop_expand`) | Gray et al. 2510.05647 |
 | `linked_cluster_expand`, `LinkedClusterCache`, `select_bp_candidate` | connected-loop/Ursell expansion of `log Z`, cached graph enumeration, and cluster-tail fixed-point selection | Midha & Zhang 2510.02290 |
 

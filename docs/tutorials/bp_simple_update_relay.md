@@ -79,8 +79,8 @@ result = py.gauge_all(
 )
 ```
 
-This BP-to-SU route is deliberately D1BP-only. It requires strictly positive,
-real products of opposite directed messages; pass
+This *vector-product* BP-to-SU route is deliberately D1BP-only. It requires
+strictly positive, real products of opposite directed messages; pass
 `conversion_options={"smudge": 1e-10}` for a regularized SU initializer when
 a bond product is singular.
 
@@ -91,6 +91,32 @@ representation:
 ```python
 bp_result = py.one_norm_bp(tn, method="d1bp", tol=1e-10)
 ```
+
+## 2-norm: PEPS SU ↔ D2BP
+
+For a physical PEPS/state, use the distinct dense-2-norm bridge. Pass the
+single-layer state—not the explicitly doubled ``peps.H & peps`` norm network.
+The SU gauge ``lambda`` is inserted symmetrically as ``sqrt(lambda)`` on each
+endpoint, and D2BP is initialized with the positive semidefinite matrix
+``diag(lambda)`` in both directions of the virtual bond:
+
+```python
+result = py.gauge_all(
+    peps,
+    start="su",
+    target="bp",
+    norm="2norm",
+    su_options={"max_iterations": 50},
+    bp_options={"run_opts": {"tol": 1e-10}},
+)
+```
+
+The reverse ``start="bp", target="su", norm="2norm"`` route uses both
+D2BP density messages on each bond. It takes their PSD square roots and a
+metric SVD to form the Vidal/SU spectrum, then absorbs the corresponding
+matrix gauges into the returned core. The returned ``(core, gauges)`` exactly
+reconstructs the input state, while its Vidal/isometry quality is controlled
+by the D2BP residual on a loopy PEPS.
 
 ## Simple-update gauges and Relay
 
