@@ -17,11 +17,13 @@ import numpy as np
 
 __all__ = [
     "ExactReducedUpdateProblem",
+    "ReducedLoopClusterGateResult",
     "LoopClusterReducedUpdateProblem",
     "LoopClusterTerm",
     "ReducedALSSolution",
     "ReducedBondPair",
     "SUClusterReducedUpdateProblem",
+    "apply_reduced_loop_cluster_gate",
     "exact_reduced_update_problem",
     "loop_cluster_reduced_update_problem",
     "prepare_reduced_bond_pair",
@@ -136,26 +138,26 @@ class ReducedBondPair:
         else:
             left = _as_numpy(left)
             right = _as_numpy(right)
-            expected_left = (
-                self.theta_shape[0],
-                self.theta_shape[1],
-                self.bond_dimension,
-            )
-            expected_right = (
-                self.bond_dimension,
-                self.theta_shape[2],
-                self.theta_shape[3],
-            )
-            if left.shape != expected_left:
+            expected_left_prefix = self.theta_shape[:2]
+            expected_right_suffix = self.theta_shape[2:]
+            if left.ndim != 3 or left.shape[:2] != expected_left_prefix:
                 raise ValueError(
                     f"left reduced tensor has shape {left.shape}, expected "
-                    f"{expected_left}"
+                    f"({expected_left_prefix[0]}, {expected_left_prefix[1]}, bond)"
                 )
-            if right.shape != expected_right:
+            if right.ndim != 3 or right.shape[1:] != expected_right_suffix:
                 raise ValueError(
                     f"right reduced tensor has shape {right.shape}, expected "
-                    f"{expected_right}"
+                    f"(bond, {expected_right_suffix[0]}, "
+                    f"{expected_right_suffix[1]})"
                 )
+            if left.shape[2] != right.shape[0]:
+                raise ValueError(
+                    "left and right reduced tensors disagree on the active "
+                    f"bond dimension: {left.shape[2]} != {right.shape[0]}"
+                )
+            if left.shape[2] < 1:
+                raise ValueError("active bond dimension must be positive")
             r_left = qtn.Tensor(
                 left,
                 inds=(
@@ -518,6 +520,20 @@ class ReducedALSSolution:
     def theta(self) -> np.ndarray:
         """Return the optimized joint reduced tensor."""
         return np.einsum("aps,sqb->apqb", self.left, self.right)
+
+
+@dataclass(frozen=True)
+class ReducedLoopClusterGateResult:
+    """Result of one SU-gauged reduced loop-cluster PEPS gate update."""
+
+    core: Any
+    gauges: dict[str, Any]
+    physical_tn: Any
+    pair: ReducedBondPair
+    problem: LoopClusterReducedUpdateProblem
+    solution: ReducedALSSolution
+    su_info: dict[str, Any]
+    reused_gauge_count: int
 
 
 def prepare_reduced_bond_pair(tn, gauges, *, where, smudge: float = 0.0):
@@ -1038,3 +1054,143 @@ def solve_reduced_als(
             break
 
     return ReducedALSSolution(left=left, right=right, costs=tuple(costs))
+
+
+def _valid_warm_start_gauge(tn, index: str, gauge) -> np.ndarray | None:
+    """Return a positive matching gauge vector, or ``None`` if unusable."""
+    if gauge is None:
+        return None
+
+    gauge = np.real_if_close(_as_numpy(gauge))
+    if gauge.ndim != 1 or gauge.shape != (tn.ind_size(index),):
+        return None
+    if np.iscomplexobj(gauge) or not np.all(np.isfinite(gauge)):
+        return None
+    if np.any(gauge <= 0.0):
+        return None
+    return np.array(gauge, copy=True)
+
+
+def _warm_start_core_from_physical_tn(physical_tn, gauges):
+    """Return ``(core, initial_gauges, reused)`` for compensated SU gauging."""
+    gauges = {} if gauges is None else gauges
+    initial_gauges = {}
+    reused = 0
+
+    for index in physical_tn.inner_inds():
+        gauge = _valid_warm_start_gauge(physical_tn, index, gauges.get(index))
+        if gauge is None:
+            gauge = np.ones(physical_tn.ind_size(index), dtype=float)
+        else:
+            reused += 1
+        initial_gauges[index] = gauge
+
+    core = physical_tn.copy()
+    if initial_gauges:
+        core.gauge_simple_insert(
+            {index: 1.0 / gauge for index, gauge in initial_gauges.items()}
+        )
+    return core, initial_gauges, reused
+
+
+def _restore_tensor_network_data(destination, source) -> None:
+    """Copy tensor data/exponent from ``source`` into a same-topology TN."""
+    if set(destination.tensor_map) != set(source.tensor_map):
+        raise ValueError("cannot update inplace with changed tensor ids")
+    for tid, tensor in destination.tensor_map.items():
+        source_tensor = source.tensor_map[tid]
+        if tensor.inds != source_tensor.inds:
+            raise ValueError("cannot update inplace with changed tensor indices")
+        tensor.modify(data=_as_numpy(source_tensor.data).copy())
+    destination.exponent = source.exponent
+
+
+def apply_reduced_loop_cluster_gate(
+    tn,
+    gauges,
+    gate,
+    *,
+    where,
+    max_bond: int | None = None,
+    max_loop_size: int = 0,
+    base_radius: int = 0,
+    include_full_system: bool | None = None,
+    autocomplete: bool = True,
+    psd_project: bool = True,
+    psd_floor: float = 0.0,
+    smudge: float = 0.0,
+    als_opts: dict[str, Any] | None = None,
+    regauge_opts: dict[str, Any] | None = None,
+    inplace: bool = False,
+) -> ReducedLoopClusterGateResult:
+    """Apply one adjacent two-site PEPS gate with the reduced loop metric.
+
+    ``tn`` and ``gauges`` are interpreted as a simple-update representation:
+    ``tn.copy().gauge_simple_insert(gauges)`` is the physical PEPS. The helper
+    builds the QR/LQ reduced pair, solves the loop-cluster weighted ALS
+    problem, reconstructs the updated physical PEPS, and then re-gauges it
+    into a fresh SU core/gauge representation. The re-gauging is warm-started
+    without double-counting old gauges: matching positive old gauges are first
+    compensated out of the reconstructed physical state.
+    """
+    if gauges is None:
+        raise TypeError("apply_reduced_loop_cluster_gate() requires SU gauges")
+
+    als_opts = {} if als_opts is None else dict(als_opts)
+    regauge_opts = {} if regauge_opts is None else dict(regauge_opts)
+    forbidden_regauge = {"gauges", "info", "inplace"}
+    forbidden = forbidden_regauge.intersection(regauge_opts)
+    if forbidden:
+        names = ", ".join(sorted(forbidden))
+        raise TypeError(f"pass {names} via the reduced gate helper, not regauge_opts")
+
+    pair = prepare_reduced_bond_pair(tn, gauges, where=where, smudge=smudge)
+    problem = loop_cluster_reduced_update_problem(
+        pair,
+        gate,
+        max_loop_size=max_loop_size,
+        base_radius=base_radius,
+        include_full_system=include_full_system,
+        autocomplete=autocomplete,
+        psd_project=psd_project,
+        psd_floor=psd_floor,
+    )
+    solution = solve_reduced_als(problem, max_bond=max_bond, **als_opts)
+    physical_tn = pair.reconstruct_tn(solution.left, solution.right)
+
+    from .gauges import copy_gauges, gauge_all_simple
+
+    regauge_core, initial_gauges, reused = _warm_start_core_from_physical_tn(
+        physical_tn,
+        gauges,
+    )
+    su_info: dict[str, Any] = {}
+    regauge_opts.setdefault("max_iterations", 20)
+    regauge_opts.setdefault("tol", 0.0)
+    core, updated_gauges, su_info = gauge_all_simple(
+        regauge_core,
+        gauges=initial_gauges,
+        info=su_info,
+        inplace=True,
+        **regauge_opts,
+    )
+
+    if inplace:
+        _restore_tensor_network_data(tn, core)
+        gauges.clear()
+        gauges.update(copy_gauges(updated_gauges))
+        core = tn
+        updated_gauges = gauges
+    else:
+        updated_gauges = copy_gauges(updated_gauges)
+
+    return ReducedLoopClusterGateResult(
+        core=core,
+        gauges=updated_gauges,
+        physical_tn=physical_tn,
+        pair=pair,
+        problem=problem,
+        solution=solution,
+        su_info=su_info,
+        reused_gauge_count=reused,
+    )

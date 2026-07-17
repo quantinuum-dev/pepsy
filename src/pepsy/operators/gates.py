@@ -23,6 +23,7 @@ from ..tensors.core import add_cycle, id_to_mpo, id_to_pepo
 
 __all__ = [
     "gate",
+    "gate_loop_cluster",
     "gate_simple",
     "renorm_gauge",
     "build_pepo_from_gates",
@@ -2054,6 +2055,149 @@ def gate_simple(
             path_compress_opts=path_compress_opts,
         )
 
+    return tn_work
+
+
+def gate_loop_cluster(
+    tn,
+    G,
+    where=None,
+    gauges=None,
+    *,
+    which=None,
+    ind_id=None,
+    max_bond=None,
+    max_loop_size: int = 0,
+    base_radius: int = 0,
+    include_full_system: bool | None = None,
+    autocomplete: bool = True,
+    psd_project: bool = True,
+    psd_floor: float = 0.0,
+    smudge: float = 0.0,
+    als_opts=None,
+    regauge_opts=None,
+    inplace=True,
+    return_results: bool = False,
+):
+    """Apply a PEPS gate stream with SU-gauged reduced loop-cluster updates.
+
+    This is the gate-stream bridge for
+    :func:`pepsy.bp.apply_reduced_loop_cluster_gate`. Adjacent two-site gates
+    are updated by the open-leg loop-cluster metric and re-gauged into the
+    supplied SU ``gauges`` dictionary. One-site gates are applied with quimb's
+    simple-update path and do not change the gauges. Long-range routing is not
+    part of this first nearest-neighbour TEBD path.
+    """
+    if gauges is None and isinstance(where, dict):
+        gauges = where
+        where = None
+    if gauges is None:
+        raise TypeError("gate_loop_cluster() requires a gauges dictionary.")
+
+    tn_work = tn if inplace else (tn.copy() if hasattr(tn, "copy") else tn)
+    entries = _normalize_gate_entries(
+        G, where=where, allow_empty=True, allow_which=True
+    )
+    which_default = _normalize_gate_which(which)
+    results = []
+
+    for gate_payload, where_payload, which_payload in entries:
+        if _is_explicit_index_where(where_payload):
+            raise ValueError(
+                "gate_loop_cluster() requires lattice site coordinates, not "
+                "explicit index-name selectors."
+            )
+
+        arity = _infer_where_arity_for_gate(tn_work, where_payload)
+        if arity == 1:
+            where_norm = _normalize_where_arg_1d(where_payload)
+        elif arity == 2:
+            where_norm = _normalize_where_arg_2d(where_payload)
+        elif arity == 3:
+            where_norm = _normalize_where_arg_3d(where_payload)
+        elif arity is not None and arity > 3:
+            raise NotImplementedError(
+                "gate_loop_cluster currently supports only 1D, 2D, and 3D "
+                "coordinates."
+            )
+        else:
+            raise ValueError("Could not infer gate dimensionality from where.")
+
+        ind_id_local = ind_id
+        if which_payload is not None:
+            ind_id_local = _ind_id_from_which(which_payload, arity)
+        elif which_default is not None:
+            ind_id_local = _ind_id_from_which(which_default, arity)
+        if ind_id_local is not None:
+            _validate_gate_target_inds_exist(tn_work, where_norm, ind_id_local)
+
+        has_site_ind_id = hasattr(tn_work, "site_ind_id")
+        old_site_ind_id = getattr(tn_work, "site_ind_id", None)
+        if ind_id_local is not None:
+            if not has_site_ind_id:
+                raise ValueError(
+                    "gate_loop_cluster() can only use ind_id/which on tensor "
+                    "networks with a site_ind_id attribute."
+                )
+            tn_work.site_ind_id = ind_id_local
+
+        try:
+            if len(where_norm) == 1:
+                tn_work.gate_simple_(
+                    gate_payload,
+                    where=where_norm,
+                    gauges=gauges,
+                    renorm=False,
+                    smudge=smudge,
+                    inplace=True,
+                )
+                continue
+
+            if len(where_norm) != 2:
+                raise ValueError(
+                    "gate_loop_cluster() supports only one-site and two-site "
+                    "gates."
+                )
+
+            site_a, site_b = where_norm
+            if site_a == site_b:
+                raise ValueError("Two-site gate requires distinct coordinates.")
+            if not qtn.bonds(
+                tn_work[tn_work.site_tag(site_a)],
+                tn_work[tn_work.site_tag(site_b)],
+            ):
+                raise ValueError(
+                    "gate_loop_cluster() currently requires adjacent two-site "
+                    "gates; route long-range gates before this update."
+                )
+
+            from ..bp import apply_reduced_loop_cluster_gate
+
+            results.append(
+                apply_reduced_loop_cluster_gate(
+                    tn_work,
+                    gauges,
+                    gate_payload,
+                    where=where_norm,
+                    max_bond=max_bond,
+                    max_loop_size=max_loop_size,
+                    base_radius=base_radius,
+                    include_full_system=include_full_system,
+                    autocomplete=autocomplete,
+                    psd_project=psd_project,
+                    psd_floor=psd_floor,
+                    smudge=smudge,
+                    als_opts=als_opts,
+                    regauge_opts=regauge_opts,
+                    inplace=True,
+                )
+            )
+        finally:
+            if ind_id_local is not None and has_site_ind_id:
+                tn_work.site_ind_id = old_site_ind_id
+
+    if return_results:
+        return tn_work, tuple(results)
     return tn_work
 
 

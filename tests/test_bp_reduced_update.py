@@ -6,6 +6,7 @@ import pytest
 qtn = pytest.importorskip("quimb.tensor")
 
 from pepsy.bp import (  # noqa: E402
+    apply_reduced_loop_cluster_gate,
     exact_reduced_update_problem,
     gauge_all_simple,
     loop_cluster_reduced_update_problem,
@@ -13,6 +14,7 @@ from pepsy.bp import (  # noqa: E402
     solve_reduced_als,
     su_cluster_reduced_update_problem,
 )
+from pepsy.operators import gate_loop_cluster  # noqa: E402
 
 
 def _su_gauged_peps(rows=2, cols=2, seed=23):
@@ -49,6 +51,12 @@ def _pair():
     return prepare_reduced_bond_pair(core, gauges, where=((0, 0), (0, 1)))
 
 
+def _physical_tn(core, gauges):
+    out = core.copy()
+    out.gauge_simple_insert(gauges)
+    return out
+
+
 def test_reduced_pair_reconstructs_the_su_gauged_state_exactly():
     pair = _pair()
     rebuilt = pair.reconstruct_tn()
@@ -59,6 +67,21 @@ def test_reduced_pair_reconstructs_the_su_gauged_state_exactly():
         atol=1e-10,
         rtol=1e-10,
     )
+
+
+def test_reduced_pair_reconstructs_a_truncated_active_bond():
+    pair = _pair()
+    problem = exact_reduced_update_problem(pair, _cnot())
+    solution = solve_reduced_als(
+        problem,
+        max_bond=1,
+        max_iterations=12,
+        rcond=1e-11,
+    )
+    rebuilt = pair.reconstruct_tn(solution.left, solution.right)
+
+    assert rebuilt.ind_size(pair.bond_ind) == 1
+    assert np.all(np.isfinite(rebuilt.to_dense()))
 
 
 def test_exact_reduced_problem_is_hermitian_psd_and_has_the_full_norm():
@@ -253,4 +276,119 @@ def test_open_leg_loop_cluster_adds_plaquette_regions_additively():
     assert all(
         later <= earlier + 1e-9 * max(1.0, earlier)
         for earlier, later in zip(solution.costs, solution.costs[1:])
+    )
+
+
+def test_apply_reduced_loop_cluster_gate_regauges_the_updated_peps():
+    core, gauges = _su_gauged_peps()
+    result = apply_reduced_loop_cluster_gate(
+        core,
+        gauges,
+        _cnot(),
+        where=((0, 0), (0, 1)),
+        max_loop_size=0,
+        regauge_opts={"max_iterations": 6, "tol": 0.0},
+        als_opts={"max_iterations": 12, "rcond": 1e-11},
+    )
+    rebuilt = _physical_tn(result.core, result.gauges)
+
+    assert result.core is not core
+    assert result.gauges is not gauges
+    assert result.reused_gauge_count >= 1
+    assert np.allclose(
+        rebuilt.to_dense(),
+        result.physical_tn.to_dense(),
+        atol=1e-9,
+        rtol=1e-9,
+    )
+    assert np.allclose(
+        result.problem.linear_term,
+        result.problem.metric @ result.problem.target.reshape(-1),
+        atol=1e-10,
+    )
+
+
+def test_apply_reduced_loop_cluster_gate_matches_exact_full_system_update():
+    core, gauges = _su_gauged_peps()
+    result = apply_reduced_loop_cluster_gate(
+        core,
+        gauges,
+        _cnot(),
+        where=((0, 0), (0, 1)),
+        max_loop_size=0,
+        include_full_system=True,
+        psd_project=False,
+        regauge_opts={"max_iterations": 4, "tol": 0.0},
+        als_opts={"max_iterations": 12, "rcond": 1e-11},
+    )
+    exact = exact_reduced_update_problem(result.pair, _cnot())
+    exact_solution = solve_reduced_als(
+        exact,
+        max_iterations=12,
+        rcond=1e-11,
+    )
+    expected = result.pair.reconstruct_tn(
+        exact_solution.left,
+        exact_solution.right,
+    )
+
+    assert np.allclose(result.problem.raw_metric, exact.metric, atol=1e-10)
+    assert np.allclose(
+        result.physical_tn.to_dense(),
+        expected.to_dense(),
+        atol=1e-9,
+        rtol=1e-9,
+    )
+
+
+def test_apply_reduced_loop_cluster_gate_truncates_and_can_update_inplace():
+    core, gauges = _su_gauged_peps()
+    original_physical = _physical_tn(core, gauges)
+    result = apply_reduced_loop_cluster_gate(
+        core,
+        gauges,
+        _cnot(),
+        where=((0, 0), (0, 1)),
+        max_bond=1,
+        max_loop_size=0,
+        regauge_opts={"max_iterations": 4, "tol": 0.0},
+        als_opts={"max_iterations": 12, "rcond": 1e-11},
+        inplace=True,
+    )
+    rebuilt = _physical_tn(core, gauges)
+
+    assert result.core is core
+    assert result.gauges is gauges
+    assert result.physical_tn.ind_size(result.pair.bond_ind) == 1
+    assert core.ind_size(result.pair.bond_ind) == 1
+    assert np.allclose(
+        rebuilt.to_dense(),
+        result.physical_tn.to_dense(),
+        atol=1e-9,
+        rtol=1e-9,
+    )
+    assert not np.allclose(rebuilt.to_dense(), original_physical.to_dense())
+
+
+def test_gate_loop_cluster_wrapper_applies_a_nearest_neighbor_stream():
+    core, gauges = _su_gauged_peps()
+    out, results = gate_loop_cluster(
+        core,
+        ((_cnot(), ((0, 0), (0, 1))),),
+        gauges=gauges,
+        max_loop_size=0,
+        regauge_opts={"max_iterations": 4, "tol": 0.0},
+        als_opts={"max_iterations": 12, "rcond": 1e-11},
+        inplace=False,
+        return_results=True,
+    )
+    rebuilt = _physical_tn(out, gauges)
+
+    assert out is not core
+    assert len(results) == 1
+    assert np.allclose(
+        rebuilt.to_dense(),
+        results[0].physical_tn.to_dense(),
+        atol=1e-9,
+        rtol=1e-9,
     )
