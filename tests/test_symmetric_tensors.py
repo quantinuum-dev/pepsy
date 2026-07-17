@@ -2150,6 +2150,80 @@ def test_sympeps_gate_stream_runs_pepsy_gate_and_gate_simple():
     assert np.isfinite(np.real(out_simple.norm()))
 
 
+def test_sympeps_gate_stream_runs_loop_cluster_method():
+    """Dense SymPEPS wrappers should expose the loop-cluster update path."""
+    import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+    state = SymPEPS(
+        peps=qtn.PEPS.rand(
+            2,
+            2,
+            bond_dim=2,
+            phys_dim=2,
+            dtype="complex128",
+            seed=19,
+        ),
+        symmetry="dense",
+        edges=tuple(qtn.edges_2d_square(2, 2)),
+        site_ind_id="k{},{}",
+    )
+    gates = (
+        (
+            np.array(
+                [
+                    [1, 0, 0, 0],
+                    [0, 1, 0, 0],
+                    [0, 0, 0, 1],
+                    [0, 0, 1, 0],
+                ],
+                dtype=complex,
+            ),
+            ((0, 0), (0, 1)),
+        ),
+    )
+    gauges = {}
+
+    out = state.copy().apply_gates(
+        gates,
+        method="loop_cluster",
+        gauges=gauges,
+        max_bond=2,
+        gate_kwargs={
+            "max_loop_size": 0,
+            "regauge_opts": {"max_iterations": 4, "tol": 0.0},
+            "als_opts": {"max_iterations": 8, "rcond": 1e-11},
+        },
+    )
+
+    assert out.tn.max_bond() <= 2
+    assert out.gauges is gauges
+    assert len(gauges) > 0
+    assert np.isfinite(np.real(out.norm()))
+
+
+def test_sympeps_loop_cluster_rejects_block_sparse_tensors_cleanly():
+    """Symmray block-sparse PEPS needs a later symmetry-aware reduced update."""
+    state = SymPEPS.for_model(
+        "heisenberg",
+        2,
+        2,
+        bond_dim=2,
+        seed=19,
+        dtype="complex128",
+    )
+    gates = state.build_hamiltonian().gate_stream(0.002)
+
+    with pytest.raises(NotImplementedError, match="dense PEPS tensor arrays"):
+        state.copy().apply_gates(
+            gates[:1],
+            method="loop_cluster",
+            gauges={},
+            gate_kwargs={
+                "regauge_opts": {"max_iterations": 1, "tol": 0.0},
+            },
+        )
+
+
 @pytest.mark.parametrize("case_name", ["itf_z2", "xy_u1", "fermi_hubbard_u1"])
 @pytest.mark.parametrize("method", ["gate", "simple"])
 def test_sympeps_gate_wrappers_3x3_streams_cover_symmetries(case_name, method):

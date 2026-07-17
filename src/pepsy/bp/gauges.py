@@ -80,10 +80,20 @@ class GaugeResult:
 
 
 def _copy_array(x):
+    if hasattr(x, "copy"):
+        try:
+            y = x.copy()
+            if tuple(ar.do("shape", y)) == tuple(ar.do("shape", x)):
+                return y
+        except Exception:
+            pass
     try:
-        return ar.do("copy", x)
+        y = ar.do("copy", x)
+        if tuple(ar.do("shape", y)) == tuple(ar.do("shape", x)):
+            return y
     except Exception:
-        return np.array(x, copy=True)
+        pass
+    return np.array(x, copy=True)
 
 
 def _as_numpy(x):

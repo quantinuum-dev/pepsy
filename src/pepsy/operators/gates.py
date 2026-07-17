@@ -2086,7 +2086,8 @@ def gate_loop_cluster(
     are updated by the open-leg loop-cluster metric and re-gauged into the
     supplied SU ``gauges`` dictionary. One-site gates are applied with quimb's
     simple-update path and do not change the gauges. Long-range routing is not
-    part of this first nearest-neighbour TEBD path.
+    part of this first nearest-neighbour TEBD path. The current reduced solver
+    is dense and rejects symmray block-sparse tensor arrays.
     """
     if gauges is None and isinstance(where, dict):
         gauges = where
@@ -2100,8 +2101,40 @@ def gate_loop_cluster(
     )
     which_default = _normalize_gate_which(which)
     results = []
+    regauge_opts_use = {} if regauge_opts is None else dict(regauge_opts)
+
+    if any(hasattr(tensor.data, "blocks") for tensor in tn_work.tensor_map.values()):
+        raise NotImplementedError(
+            "gate_loop_cluster currently requires dense PEPS tensor arrays; "
+            "symmetry-block-aware reduced loop-cluster updates are not "
+            "implemented yet."
+        )
+
+    if entries and any(index not in gauges for index in tn_work.inner_inds()):
+        from ..bp import gauge_all_simple
+
+        initial_gauge_opts = dict(regauge_opts_use)
+        initial_gauge_opts.setdefault("max_iterations", 20)
+        initial_gauge_opts.setdefault("tol", 0.0)
+        gauge_all_simple(
+            tn_work,
+            gauges=gauges,
+            inplace=True,
+            **initial_gauge_opts,
+        )
+
+    if any(hasattr(tensor.data, "to_dense") for tensor in tn_work.tensor_map.values()):
+        for tensor in tn_work.tensor_map.values():
+            if hasattr(tensor.data, "to_dense"):
+                tensor.modify(data=np.asarray(tensor.data.to_dense()))
+        for index, gauge in tuple(gauges.items()):
+            if hasattr(gauge, "to_dense"):
+                gauges[index] = np.asarray(gauge.to_dense())
 
     for gate_payload, where_payload, which_payload in entries:
+        if hasattr(gate_payload, "to_dense"):
+            gate_payload = np.asarray(gate_payload.to_dense())
+
         if _is_explicit_index_where(where_payload):
             raise ValueError(
                 "gate_loop_cluster() requires lattice site coordinates, not "
@@ -2188,7 +2221,7 @@ def gate_loop_cluster(
                     psd_floor=psd_floor,
                     smudge=smudge,
                     als_opts=als_opts,
-                    regauge_opts=regauge_opts,
+                    regauge_opts=regauge_opts_use,
                     inplace=True,
                 )
             )

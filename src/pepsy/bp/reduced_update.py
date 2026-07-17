@@ -34,6 +34,8 @@ __all__ = [
 
 def _as_numpy(value) -> np.ndarray:
     """Convert an array-like value to the NumPy dense oracle representation."""
+    if hasattr(value, "to_dense"):
+        value = value.to_dense()
     try:
         import autoray as ar
 

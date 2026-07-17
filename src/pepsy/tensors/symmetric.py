@@ -6406,8 +6406,33 @@ class _SymState:
                 target.normalize()
             return target
 
+        if method in {"loop_cluster", "gate_loop_cluster", "su_loop_cluster"}:
+            if type(target).__name__ != "SymPEPS":
+                raise ValueError("method='loop_cluster' is only supported for SymPEPS.")
+            from ..operators import gate_loop_cluster
+
+            gauges_use = gauges
+            if gauges_use is None:
+                gauges_use = target.gauges if target.gauges is not None else {}
+            opts = dict(compress_opts)
+            opts.pop("cutoff", None)
+            opts.update({} if gate_kwargs is None else dict(gate_kwargs))
+            target.psi = gate_loop_cluster(
+                target.psi,
+                tuple(gates),
+                gauges=gauges_use,
+                inplace=True,
+                **opts,
+            )
+            target.gauges = gauges_use
+            if normalize:
+                target.normalize()
+            return target
+
         if method not in {"direct", "qtn", "tensor_network_gate_inds"}:
-            raise ValueError("method must be 'direct', 'gate', or 'simple'.")
+            raise ValueError(
+                "method must be 'direct', 'gate', 'simple', or 'loop_cluster'."
+            )
 
         for gate, where in gates:
             sites = _sites_from_gate_where(where, target.site_ind_id)
