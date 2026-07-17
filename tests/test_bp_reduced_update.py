@@ -10,17 +10,18 @@ from pepsy.bp import (  # noqa: E402
     gauge_all_simple,
     prepare_reduced_bond_pair,
     solve_reduced_als,
+    su_cluster_reduced_update_problem,
 )
 
 
-def _su_gauged_peps():
+def _su_gauged_peps(rows=2, cols=2, seed=23):
     peps = qtn.PEPS.rand(
-        2,
-        2,
+        rows,
+        cols,
         bond_dim=2,
         phys_dim=2,
         dtype="complex128",
-        seed=23,
+        seed=seed,
     )
     core, gauges, _ = gauge_all_simple(
         peps,
@@ -96,3 +97,66 @@ def test_exact_reduced_als_decreases_the_true_gate_projection_error():
     )
     assert solution.costs[-1] < solution.costs[0]
     assert np.allclose(direct_error, solution.costs[-1], atol=1e-9)
+
+
+def test_su_cluster_full_radius_recovers_the_exact_open_leg_metric():
+    pair = _pair()
+    exact = exact_reduced_update_problem(pair, _cnot())
+    cluster = su_cluster_reduced_update_problem(
+        pair,
+        _cnot(),
+        radius=pair.full_cluster_radius(),
+    )
+
+    assert cluster.radius == cluster.full_radius
+    assert not cluster.boundary_inds
+    assert set(cluster.cluster_tids) == {
+        tid
+        for tid in pair.tn.tensor_map
+        if tid not in {pair.left_tid, pair.right_tid}
+    }
+    assert np.allclose(cluster.metric, exact.metric, atol=1e-10, rtol=1e-10)
+    assert np.allclose(
+        cluster.linear_term,
+        exact.linear_term,
+        atol=1e-10,
+        rtol=1e-10,
+    )
+
+
+def test_radius_zero_su_cluster_is_psd_and_has_a_consistent_als_objective():
+    pair = _pair()
+    cluster = su_cluster_reduced_update_problem(pair, _cnot(), radius=0)
+    solution = solve_reduced_als(cluster, max_iterations=12, rcond=1e-11)
+
+    assert not cluster.cluster_tids
+    assert cluster.boundary_inds
+    assert np.allclose(cluster.metric, cluster.metric.conj().T, atol=1e-10)
+    assert np.linalg.eigvalsh(cluster.metric).min() >= -1e-10
+    assert np.allclose(
+        cluster.linear_term,
+        cluster.metric @ cluster.target.reshape(-1),
+        atol=1e-10,
+    )
+    assert all(
+        later <= earlier + 1e-9 * max(1.0, earlier)
+        for earlier, later in zip(solution.costs, solution.costs[1:])
+    )
+
+
+def test_su_cluster_radius_grows_through_a_nontrivial_three_by_three_peps():
+    core, gauges = _su_gauged_peps(3, 3, seed=9)
+    pair = prepare_reduced_bond_pair(core, gauges, where=((1, 1), (1, 2)))
+    exact = exact_reduced_update_problem(pair, _cnot())
+    radius_one = su_cluster_reduced_update_problem(pair, _cnot(), radius=1)
+    full = su_cluster_reduced_update_problem(
+        pair,
+        _cnot(),
+        radius=pair.full_cluster_radius(),
+    )
+
+    assert pair.full_cluster_radius() == 2
+    assert radius_one.cluster_tids
+    assert radius_one.boundary_inds
+    assert not full.boundary_inds
+    assert np.allclose(full.metric, exact.metric, atol=1e-8, rtol=1e-10)

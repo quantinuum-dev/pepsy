@@ -63,9 +63,11 @@ from .reduced_update import (
     ExactReducedUpdateProblem,
     ReducedALSSolution,
     ReducedBondPair,
+    SUClusterReducedUpdateProblem,
     exact_reduced_update_problem,
     prepare_reduced_bond_pair,
     solve_reduced_als,
+    su_cluster_reduced_update_problem,
 )
 
 __all__ = [
@@ -83,6 +85,7 @@ __all__ = [
     "RelayGaugeOptions",
     "ReducedALSSolution",
     "ReducedBondPair",
+    "SUClusterReducedUpdateProblem",
     "ScalarClusterCache",
     "compare_simple_update_gauges",
     "compare_simple_update_to_bp",
@@ -110,5 +113,6 @@ __all__ = [
     "simple_update_messages_from_gauges",
     "select_bp_candidate",
     "solve_reduced_als",
+    "su_cluster_reduced_update_problem",
     "two_norm_bp",
 ]

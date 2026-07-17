@@ -1,14 +1,15 @@
-"""Exact reduced-tensor update oracles for SU-gauged PEPS.
+"""Reduced-tensor update environments for SU-gauged PEPS.
 
-This module deliberately implements the *finite-system exact* first stage of
-the SU-gauged loop-cluster update plan. It has no BP or loop approximation:
-the environment outside an active two-site reduced tensor is contracted in
-full. Later local-cluster and loop-series implementations should replace only
-that environment contraction while preserving this API and its tests.
+The finite-system exact contraction is the reference for the SU-gauged
+loop-cluster update plan. The local SU-boundary cluster approximation retains
+the same QR/LQ-reduced open legs, replacing only that exterior contraction.
+Neither path runs BP; future loop-series corrections can likewise operate on
+the same open-leg metric API.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,9 +19,11 @@ __all__ = [
     "ExactReducedUpdateProblem",
     "ReducedALSSolution",
     "ReducedBondPair",
+    "SUClusterReducedUpdateProblem",
     "exact_reduced_update_problem",
     "prepare_reduced_bond_pair",
     "solve_reduced_als",
+    "su_cluster_reduced_update_problem",
 ]
 
 
@@ -77,6 +80,7 @@ class ReducedBondPair:
     q_right: Any
     left_original_inds: tuple[str, ...]
     right_original_inds: tuple[str, ...]
+    su_gauges: dict[str, Any]
 
     @property
     def bond_dimension(self) -> int:
@@ -185,6 +189,142 @@ class ReducedBondPair:
         """Return the untruncated, gate-applied target state for this bond."""
         return self.tn.gate(gate, where=self.where, contract=True)
 
+    def _site_distances(self) -> dict[Any, int]:
+        """Return shortest tensor-graph distances from the active bond."""
+        active_tids = {self.left_tid, self.right_tid}
+        distances = {tid: 0 for tid in active_tids}
+        pending = deque(active_tids)
+
+        while pending:
+            tid = pending.popleft()
+            for ix in self.tn.tensor_map[tid].inds:
+                for neighbor in self.tn.ind_map.get(ix, ()):
+                    if neighbor not in distances:
+                        distances[neighbor] = distances[tid] + 1
+                        pending.append(neighbor)
+
+        return distances
+
+    def full_cluster_radius(self) -> int:
+        """Smallest radius whose cluster contains every spectator site.
+
+        The active sites themselves are represented by ``q_left`` and
+        ``q_right``. Thus a radius zero cluster contains only these fixed outer
+        factors, and this value is the largest graph distance among the
+        remaining physical-site tensors.
+        """
+        distances = self._site_distances()
+        return max(
+            (
+                distance
+                for tid, distance in distances.items()
+                if tid not in {self.left_tid, self.right_tid}
+            ),
+            default=0,
+        )
+
+    def _cluster_tids(self, radius: int) -> tuple[Any, ...]:
+        """Return spectator tensors inside an active-bond-centred cluster."""
+        if not isinstance(radius, int) or radius < 0:
+            raise ValueError("radius must be a nonnegative integer")
+        active_tids = {self.left_tid, self.right_tid}
+        distances = self._site_distances()
+        return tuple(
+            tid
+            for tid in self.tn.tensor_map
+            if (
+                tid not in active_tids
+                and distances.get(tid, float("inf")) <= radius
+            )
+        )
+
+    def _su_boundary_message(self, index: str) -> np.ndarray:
+        """Return the unnormalized two-norm SU closure on one cut bond."""
+        try:
+            gauge = self.su_gauges[index]
+        except KeyError as exc:
+            raise ValueError(
+                "SU-boundary cluster needs a stored gauge for each cut "
+                f"virtual bond; missing gauge for {index!r}"
+            ) from exc
+
+        gauge = np.real_if_close(_as_numpy(gauge))
+        if gauge.ndim != 1 or gauge.shape != (self.tn.ind_size(index),):
+            raise ValueError(
+                f"SU gauge for {index!r} has shape {gauge.shape}, expected "
+                f"({self.tn.ind_size(index)},)"
+            )
+        if np.iscomplexobj(gauge) or not np.all(np.isfinite(gauge)):
+            raise ValueError(
+                f"SU gauge for {index!r} must be a finite real vector"
+            )
+        if np.any(gauge < 0.0):
+            raise ValueError(
+                f"SU gauge for {index!r} must be nonnegative"
+            )
+
+        # gauge_simple_insert has put sqrt(lambda) on both endpoint tensors.
+        # The discarded endpoint's two-layer (D2) SU environment is therefore
+        # diag(lambda), with bra index first and ket index second.
+        return np.diag(gauge)
+
+    def _cluster_environment_tensor(self, radius: int):
+        """Contract an SU-closed local exterior with reduced legs open.
+
+        The cluster contains all spectator tensors at tensor-graph distance at
+        most ``radius`` from either active site, plus the fixed QR/LQ outer
+        factors. Every virtual bond cut by the cluster is closed by its stored
+        unnormalized two-norm SU density ``diag(lambda)``. A system-covering
+        radius has no cut bonds and returns the exact exterior.
+        """
+        import quimb.tensor as qtn
+
+        cluster_tids = self._cluster_tids(radius)
+        inner_inds = set(self.tn.inner_inds())
+        dual_inds = {ix: qtn.rand_uuid() for ix in inner_inds}
+        tensors = [self.q_left.copy(), self.q_right.copy()]
+        tensors.extend(self.tn.tensor_map[tid].copy() for tid in cluster_tids)
+
+        bra_tensors = []
+        for tensor in tensors:
+            bra = tensor.conj()
+            reindex_map = {
+                ix: dual_inds[ix] for ix in tensor.inds if ix in dual_inds
+            }
+            if self.reduced_left_ind in tensor.inds:
+                reindex_map[self.reduced_left_ind] = self.reduced_left_bra_ind
+            if self.reduced_right_ind in tensor.inds:
+                reindex_map[self.reduced_right_ind] = self.reduced_right_bra_ind
+            bra.reindex_(reindex_map)
+            bra_tensors.append(bra)
+
+        environment = qtn.TensorNetwork((*tensors, *bra_tensors))
+        boundary_inds = []
+        current_outer = set(environment.outer_inds())
+        for ix in self.tn.inner_inds():
+            ixc = dual_inds[ix]
+            if ix in current_outer:
+                if ixc not in current_outer:
+                    raise RuntimeError(
+                        f"cluster boundary index {ix!r} lacks its bra leg"
+                    )
+                environment.add_tensor(
+                    qtn.Tensor(self._su_boundary_message(ix), inds=(ixc, ix))
+                )
+                boundary_inds.append(ix)
+
+        output_inds = (
+            self.reduced_left_ind,
+            self.reduced_right_ind,
+            self.reduced_left_bra_ind,
+            self.reduced_right_bra_ind,
+        )
+        return (
+            environment.contract(output_inds=output_inds, optimize="auto-hq"),
+            cluster_tids,
+            tuple(boundary_inds),
+        )
+
     def _environment_tensor(self):
         """Contract the exact exterior metric with reduced virtual legs open."""
         import quimb.tensor as qtn
@@ -244,6 +384,44 @@ class ExactReducedUpdateProblem:
 
     def cost(self, theta) -> float:
         """Return the exact squared state error for a joint reduced tensor."""
+        delta = _as_numpy(theta).reshape(-1) - self.target.reshape(-1)
+        return float(np.real(np.vdot(delta, self.metric @ delta)))
+
+
+@dataclass(frozen=True)
+class SUClusterReducedUpdateProblem:
+    """SU-boundary cluster approximation to a reduced PEPS gate update.
+
+    ``radius=0`` retains only the QR/LQ outer factors around the active bond.
+    Larger radii retain physical-site tensors in the active-bond-centred
+    cluster. The stored SU gauges close only the bonds cut by that cluster; no
+    BP iteration is run. At :attr:`full_radius`, no boundary closure remains
+    and the metric is the finite-system exact metric.
+    """
+
+    pair: ReducedBondPair
+    gate: Any
+    radius: int
+    full_radius: int
+    cluster_tids: tuple[Any, ...]
+    boundary_inds: tuple[str, ...]
+    metric: np.ndarray
+    linear_term: np.ndarray
+    target: np.ndarray
+
+    @property
+    def shape(self) -> tuple[int, int, int, int]:
+        """Joint reduced-tensor shape ``(r_L, p_L, p_R, r_R)``."""
+        return self.pair.theta_shape
+
+    @property
+    def target_norm(self) -> float:
+        """SU-cluster estimate of the untruncated target norm."""
+        target = self.target.reshape(-1)
+        return float(np.real(np.vdot(target, self.metric @ target)))
+
+    def cost(self, theta) -> float:
+        """Return the SU-cluster squared error for a joint reduced tensor."""
         delta = _as_numpy(theta).reshape(-1) - self.target.reshape(-1)
         return float(np.real(np.vdot(delta, self.metric @ delta)))
 
@@ -374,6 +552,14 @@ def prepare_reduced_bond_pair(tn, gauges, *, where, smudge: float = 0.0):
         q_right=q_right,
         left_original_inds=tuple(left_tensor.inds),
         right_original_inds=tuple(right_tensor.inds),
+        # The cluster closure must correspond to the same physical state as
+        # the QR/LQ factors, even if a time-evolution driver subsequently
+        # updates its mutable gauge dictionary in place.
+        su_gauges=(
+            {}
+            if gauges is None
+            else {index: _as_numpy(gauge).copy() for index, gauge in gauges.items()}
+        ),
     )
 
 
@@ -394,16 +580,9 @@ def _apply_two_site_gate(theta: np.ndarray, gate) -> np.ndarray:
     return np.einsum("xyuv,auvb->axyb", gate, theta, optimize=True)
 
 
-def exact_reduced_update_problem(pair: ReducedBondPair, gate):
-    """Build exact dense ``N_red`` and ``b_red`` for one reduced bond pair.
-
-    ``N_red`` is returned in the conventional matrix orientation satisfying
-    ``theta.conj() @ N_red @ theta``. The gate only changes the target joint
-    reduced tensor, so consistency gives ``b_red = N_red @ theta_target``.
-    Later open-leg loop-series code must preserve that same relationship by
-    using an identical cluster family for both quantities.
-    """
-    environment = _as_numpy(pair._environment_tensor().data)
+def _metric_from_environment(pair: ReducedBondPair, environment) -> np.ndarray:
+    """Convert an open two-layer exterior tensor into ``N_red``."""
+    environment = _as_numpy(environment.data)
     left_dim, physical_left, physical_right, right_dim = pair.theta_shape
     expected_environment_shape = (left_dim, right_dim, left_dim, right_dim)
     if environment.shape != expected_environment_shape:
@@ -425,7 +604,19 @@ def exact_reduced_update_problem(pair: ReducedBondPair, gate):
     )
     size = int(np.prod(pair.theta_shape))
     metric = metric.reshape(size, size)
-    metric = 0.5 * (metric + metric.conj().T)
+    return 0.5 * (metric + metric.conj().T)
+
+
+def exact_reduced_update_problem(pair: ReducedBondPair, gate):
+    """Build exact dense ``N_red`` and ``b_red`` for one reduced bond pair.
+
+    ``N_red`` is returned in the conventional matrix orientation satisfying
+    ``theta.conj() @ N_red @ theta``. The gate only changes the target joint
+    reduced tensor, so consistency gives ``b_red = N_red @ theta_target``.
+    Later open-leg loop-series code must preserve that same relationship by
+    using an identical cluster family for both quantities.
+    """
+    metric = _metric_from_environment(pair, pair._environment_tensor())
 
     target = _apply_two_site_gate(pair.theta_array(), gate)
     linear_term = metric @ target.reshape(-1)
@@ -434,6 +625,53 @@ def exact_reduced_update_problem(pair: ReducedBondPair, gate):
         gate=gate,
         metric=metric,
         linear_term=linear_term,
+        target=target,
+    )
+
+
+def su_cluster_reduced_update_problem(
+    pair: ReducedBondPair,
+    gate,
+    *,
+    radius: int = 0,
+) -> SUClusterReducedUpdateProblem:
+    """Build an SU-boundary cluster ``N_red`` and matching ``b_red``.
+
+    This is the scalable zeroth-order environment in the SU-gauged
+    loop-cluster workflow. It neither runs nor assumes a new D2BP solve: the
+    stored converged Vidal gauges close the cluster boundary as density
+    messages ``diag(lambda)``. Since the physical gate acts only inside the
+    fixed QR/LQ reduced pair, the consistent linear term is computed as
+    ``b_red = N_red @ theta_target``.
+
+    Parameters
+    ----------
+    pair
+        A reduced bond pair prepared with the SU gauges that are to close the
+        cluster boundary.
+    gate
+        The two-site physical gate, in matrix or rank-four tensor form.
+    radius
+        Nonnegative tensor-graph radius about either active site. Radius zero
+        keeps no spectator physical-site tensors. At or above
+        ``pair.full_cluster_radius()``, the cluster contains every spectator
+        and this function equals :func:`exact_reduced_update_problem` up to
+        numerical contraction error.
+    """
+    environment, cluster_tids, boundary_inds = pair._cluster_environment_tensor(
+        radius
+    )
+    metric = _metric_from_environment(pair, environment)
+    target = _apply_two_site_gate(pair.theta_array(), gate)
+    return SUClusterReducedUpdateProblem(
+        pair=pair,
+        gate=gate,
+        radius=radius,
+        full_radius=pair.full_cluster_radius(),
+        cluster_tids=cluster_tids,
+        boundary_inds=boundary_inds,
+        metric=metric,
+        linear_term=metric @ target.reshape(-1),
         target=target,
     )
 
@@ -456,18 +694,18 @@ def _solve_normal_equations(matrix, rhs, rcond: float):
 
 
 def solve_reduced_als(
-    problem: ExactReducedUpdateProblem,
+    problem: ExactReducedUpdateProblem | SUClusterReducedUpdateProblem,
     *,
     max_bond: int | None = None,
     max_iterations: int = 20,
     rcond: float = 1e-12,
     tol: float = 1e-12,
 ) -> ReducedALSSolution:
-    """Solve the exact reduced two-site projection by alternating least squares.
+    """Solve a reduced two-site projection by alternating least squares.
 
     This dense NumPy reference is deliberately small-system only. It performs
-    exact normal-equation updates for ``R_L`` and ``L_R`` against ``N_red`` and
-    records the true full-environment objective after every block update.
+    normal-equation updates for ``R_L`` and ``L_R`` against the supplied
+    ``N_red`` and records that problem's objective after every block update.
     """
     if not isinstance(max_iterations, int) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
