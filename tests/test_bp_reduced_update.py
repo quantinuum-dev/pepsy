@@ -5,6 +5,7 @@ import pytest
 
 qtn = pytest.importorskip("quimb.tensor")
 
+from pepsy import build_optimizer  # noqa: E402
 from pepsy.bp import (  # noqa: E402
     apply_reduced_loop_cluster_gate,
     exact_reduced_update_problem,
@@ -55,6 +56,10 @@ def _physical_tn(core, gauges):
     out = core.copy()
     out.gauge_simple_insert(gauges)
     return out
+
+
+def _relative_error(actual, expected):
+    return abs(actual - expected) / max(1.0, abs(expected))
 
 
 def test_reduced_pair_reconstructs_the_su_gauged_state_exactly():
@@ -223,6 +228,77 @@ def test_full_open_leg_loop_cluster_recovers_the_exact_metric():
         atol=1e-10,
         rtol=1e-10,
     )
+
+
+@pytest.mark.parametrize("bond_dim", [2, 3])
+def test_four_by_four_full_gloop_matches_exact_nred_and_bred(bond_dim):
+    """System-covering gloops should reproduce exact dense 4x4 N_red/b_red."""
+    peps = qtn.PEPS.rand(
+        4,
+        4,
+        bond_dim=bond_dim,
+        phys_dim=2,
+        dtype="complex128",
+        seed=80 + bond_dim,
+    )
+    pair = prepare_reduced_bond_pair(
+        peps,
+        {},
+        where=((1, 1), (1, 2)),
+    )
+    optimize = build_optimizer(
+        progbar=False,
+        max_time=1.0,
+        max_repeats=64,
+    )
+    gate = _cnot()
+    exact = exact_reduced_update_problem(pair, gate, optimize=optimize)
+    gloop = loop_cluster_reduced_update_problem(
+        pair,
+        gate,
+        max_loop_size=4,
+        include_full_system=True,
+        psd_project=False,
+        optimize=optimize,
+    )
+
+    metric_scale = max(1.0, np.linalg.norm(exact.metric))
+    linear_scale = max(1.0, np.linalg.norm(exact.linear_term))
+    assert gloop.loop_regions
+    assert len(gloop.terms) == 1
+    assert gloop.terms[0].region_tids == frozenset(pair.tn.tensor_map)
+    assert not gloop.terms[0].boundary_inds
+    assert np.linalg.norm(gloop.raw_metric - exact.metric) / metric_scale < 1e-8
+    assert (
+        np.linalg.norm(gloop.linear_term - exact.linear_term) / linear_scale
+        < 1e-8
+    )
+
+    rng = np.random.default_rng(200 + bond_dim)
+    left = rng.normal(
+        size=(pair.theta_shape[0], pair.theta_shape[1], pair.bond_dimension)
+    ) + 1j * rng.normal(
+        size=(pair.theta_shape[0], pair.theta_shape[1], pair.bond_dimension)
+    )
+    right = rng.normal(
+        size=(pair.bond_dimension, pair.theta_shape[2], pair.theta_shape[3])
+    ) + 1j * rng.normal(
+        size=(pair.bond_dimension, pair.theta_shape[2], pair.theta_shape[3])
+    )
+    theta = np.einsum("aps,sqb->apqb", left, right, optimize=True).reshape(-1)
+    candidate = pair.reconstruct_tn(left, right)
+    target = pair.gate_target_tn(gate)
+    candidate_dense = np.asarray(candidate.to_dense(optimize=optimize)).reshape(-1)
+    target_dense = np.asarray(target.to_dense(optimize=optimize)).reshape(-1)
+
+    exact_norm = np.vdot(candidate_dense, candidate_dense)
+    exact_overlap = np.vdot(candidate_dense, target_dense)
+    metric_norm = np.vdot(theta, gloop.metric @ theta)
+    metric_overlap = np.vdot(theta, gloop.linear_term)
+
+    assert _relative_error(metric_norm, exact_norm) < 1e-8
+    assert _relative_error(metric_overlap, exact_overlap) < 1e-8
+    assert _relative_error(gloop.target_norm, np.vdot(target_dense, target_dense)) < 1e-8
 
 
 def test_su_cluster_radius_grows_through_a_nontrivial_three_by_three_peps():

@@ -275,7 +275,7 @@ class ReducedBondPair:
         # diag(lambda), with bra index first and ket index second.
         return np.diag(gauge)
 
-    def _cluster_environment_from_tids(self, cluster_tids):
+    def _cluster_environment_from_tids(self, cluster_tids, *, optimize="auto-hq"):
         """Contract an arbitrary SU-closed exterior with reduced legs open.
 
         The cluster contains the selected spectator tensors plus the fixed
@@ -343,21 +343,24 @@ class ReducedBondPair:
             self.reduced_right_bra_ind,
         )
         return (
-            environment.contract(output_inds=output_inds, optimize="auto-hq"),
+            environment.contract(output_inds=output_inds, optimize=optimize),
             cluster_tids,
             tuple(boundary_inds),
         )
 
-    def _cluster_environment_tensor(self, radius: int):
+    def _cluster_environment_tensor(self, radius: int, *, optimize="auto-hq"):
         """Contract an SU-closed local exterior with reduced legs open.
 
         The cluster contains all spectator tensors at tensor-graph distance at
         most ``radius`` from either active site, plus the fixed QR/LQ outer
         factors.
         """
-        return self._cluster_environment_from_tids(self._cluster_tids(radius))
+        return self._cluster_environment_from_tids(
+            self._cluster_tids(radius),
+            optimize=optimize,
+        )
 
-    def _environment_tensor(self):
+    def _environment_tensor(self, *, optimize="auto-hq"):
         """Contract the exact exterior metric with reduced virtual legs open."""
         import quimb.tensor as qtn
 
@@ -390,7 +393,7 @@ class ReducedBondPair:
             self.reduced_left_bra_ind,
             self.reduced_right_bra_ind,
         )
-        return environment.contract(output_inds=output_inds, optimize="auto-hq")
+        return environment.contract(output_inds=output_inds, optimize=optimize)
 
 
 @dataclass(frozen=True)
@@ -706,7 +709,7 @@ def _metric_from_environment(pair: ReducedBondPair, environment) -> np.ndarray:
     return 0.5 * (metric + metric.conj().T)
 
 
-def exact_reduced_update_problem(pair: ReducedBondPair, gate):
+def exact_reduced_update_problem(pair: ReducedBondPair, gate, *, optimize="auto-hq"):
     """Build exact dense ``N_red`` and ``b_red`` for one reduced bond pair.
 
     ``N_red`` is returned in the conventional matrix orientation satisfying
@@ -715,7 +718,10 @@ def exact_reduced_update_problem(pair: ReducedBondPair, gate):
     Later open-leg loop-series code must preserve that same relationship by
     using an identical cluster family for both quantities.
     """
-    metric = _metric_from_environment(pair, pair._environment_tensor())
+    metric = _metric_from_environment(
+        pair,
+        pair._environment_tensor(optimize=optimize),
+    )
 
     target = _apply_two_site_gate(pair.theta_array(), gate)
     linear_term = metric @ target.reshape(-1)
@@ -733,6 +739,7 @@ def su_cluster_reduced_update_problem(
     gate,
     *,
     radius: int = 0,
+    optimize="auto-hq",
 ) -> SUClusterReducedUpdateProblem:
     """Build an SU-boundary cluster ``N_red`` and matching ``b_red``.
 
@@ -758,7 +765,8 @@ def su_cluster_reduced_update_problem(
         numerical contraction error.
     """
     environment, cluster_tids, boundary_inds = pair._cluster_environment_tensor(
-        radius
+        radius,
+        optimize=optimize,
     )
     metric = _metric_from_environment(pair, environment)
     target = _apply_two_site_gate(pair.theta_array(), gate)
@@ -881,6 +889,7 @@ def loop_cluster_reduced_update_problem(
     autocomplete: bool = True,
     psd_project: bool = True,
     psd_floor: float = 0.0,
+    optimize="auto-hq",
 ) -> LoopClusterReducedUpdateProblem:
     """Build an additive open-leg loop-cluster ``N_red`` approximation.
 
@@ -916,7 +925,10 @@ def loop_cluster_reduced_update_problem(
             if tid in region and tid not in active_tids
         )
         environment, cluster_tids, boundary_inds = (
-            pair._cluster_environment_from_tids(cluster_tids)
+            pair._cluster_environment_from_tids(
+                cluster_tids,
+                optimize=optimize,
+            )
         )
         raw_metric = raw_metric + count * _metric_from_environment(
             pair,
@@ -1120,6 +1132,7 @@ def apply_reduced_loop_cluster_gate(
     autocomplete: bool = True,
     psd_project: bool = True,
     psd_floor: float = 0.0,
+    optimize="auto-hq",
     smudge: float = 0.0,
     als_opts: dict[str, Any] | None = None,
     regauge_opts: dict[str, Any] | None = None,
@@ -1156,6 +1169,7 @@ def apply_reduced_loop_cluster_gate(
         autocomplete=autocomplete,
         psd_project=psd_project,
         psd_floor=psd_floor,
+        optimize=optimize,
     )
     solution = solve_reduced_als(problem, max_bond=max_bond, **als_opts)
     physical_tn = pair.reconstruct_tn(solution.left, solution.right)
