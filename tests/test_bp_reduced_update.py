@@ -62,6 +62,28 @@ def _relative_error(actual, expected):
     return abs(actual - expected) / max(1.0, abs(expected))
 
 
+def _relative_norm_error(actual, expected):
+    return np.linalg.norm(actual - expected) / max(1.0, np.linalg.norm(expected))
+
+
+def _scale_aligned_relative_norm_error(actual, expected):
+    """Relative error after removing one common scalar normalization.
+
+    Local loop-cluster metrics can have a very different global normalization
+    from the exact finite PEPS metric. That scalar cancels from the reduced
+    normal equations when ``N_red`` and ``b_red`` are scaled together, so this
+    measures the metric shape error rather than the irrelevant overall scale.
+    """
+    actual_flat = actual.reshape(-1)
+    expected_flat = expected.reshape(-1)
+    denom = np.vdot(actual_flat, actual_flat)
+    if abs(denom) == 0.0:
+        scale = 0.0
+    else:
+        scale = np.vdot(actual_flat, expected_flat) / denom
+    return _relative_norm_error(scale * actual, expected)
+
+
 def test_reduced_pair_reconstructs_the_su_gauged_state_exactly():
     pair = _pair()
     rebuilt = pair.reconstruct_tn()
@@ -299,6 +321,72 @@ def test_four_by_four_full_gloop_matches_exact_nred_and_bred(bond_dim):
     assert _relative_error(metric_norm, exact_norm) < 1e-8
     assert _relative_error(metric_overlap, exact_overlap) < 1e-8
     assert _relative_error(gloop.target_norm, np.vdot(target_dense, target_dense)) < 1e-8
+
+
+@pytest.mark.parametrize("bond_dim", [2, 3])
+def test_four_by_four_loop_error_profile_improves_toward_exact(bond_dim):
+    """Dense 4x4 loop corrections improve the scale-aligned N_red/b_red error."""
+    peps = qtn.PEPS.rand(
+        4,
+        4,
+        bond_dim=bond_dim,
+        phys_dim=2,
+        dtype="complex128",
+        seed=150 + bond_dim,
+    )
+    core, gauges, info = gauge_all_simple(
+        peps,
+        max_iterations=50,
+        tol=1e-10,
+    )
+    assert info["converged"]
+
+    pair = prepare_reduced_bond_pair(
+        core,
+        gauges,
+        where=((1, 1), (1, 2)),
+    )
+    gate = _cnot()
+    exact = exact_reduced_update_problem(pair, gate, optimize="greedy")
+    profile = {}
+    for label, kwargs in (
+        ("su", {"max_loop_size": 0}),
+        ("g4", {"max_loop_size": 4}),
+        ("g8", {"max_loop_size": 8}),
+        ("full", {"max_loop_size": 0, "include_full_system": True}),
+    ):
+        problem = loop_cluster_reduced_update_problem(
+            pair,
+            gate,
+            psd_project=False,
+            optimize="greedy",
+            **kwargs,
+        )
+        profile[label] = {
+            "raw_n": _relative_norm_error(problem.raw_metric, exact.metric),
+            "raw_b": _relative_norm_error(
+                problem.linear_term,
+                exact.linear_term,
+            ),
+            "shape_n": _scale_aligned_relative_norm_error(
+                problem.raw_metric,
+                exact.metric,
+            ),
+            "shape_b": _scale_aligned_relative_norm_error(
+                problem.linear_term,
+                exact.linear_term,
+            ),
+        }
+
+    assert profile["g4"]["shape_n"] < profile["su"]["shape_n"]
+    assert profile["g4"]["shape_b"] < profile["su"]["shape_b"]
+    assert profile["g8"]["shape_n"] < profile["g4"]["shape_n"]
+    assert profile["g8"]["shape_b"] < profile["g4"]["shape_b"]
+
+    assert profile["full"]["raw_n"] < 1e-8
+    assert profile["full"]["raw_b"] < 1e-8
+    assert profile["full"]["shape_n"] < 1e-8
+    assert profile["full"]["shape_b"] < 1e-8
 
 
 def test_su_cluster_radius_grows_through_a_nontrivial_three_by_three_peps():
