@@ -182,73 +182,69 @@ practical warm-start use of the locality insight in arXiv:2604.21919, not a
 claim that arbitrary Pepsy tensor networks satisfy its strong-injectivity
 hypotheses.
 
-### Cluster-corrected bond compression (better than naive BP messages)
+### SU-gauged open-leg loop-cluster update
 
-BP-gauge compression (quimb `compress_l2bp` / `compress_d2bp`, Tindall–Fishman
-gauging) truncates a bond using the **rank-1 product of BP messages** as the bond
-environment — i.e. the *simple-update* reduced density matrix. That environment
-ignores the inter-tensor loop correlations *around* the bond, so the truncated
-singular vectors are sub-optimal exactly where loops matter (frustration,
-criticality, short cycles).
+**Agreed architecture (2026-07-17).** Evolve a PEPS while maintaining a
+converged simple-update / Vidal gauge. Store the nonnegative bond vectors
+`lambda`; in the symmetric gauge they are already the dense-2-norm BP boundary
+messages, with `M[i -> j] = M[j -> i] = diag(lambda[i, j])`. Thus this route
+does **not** run a separate D2BP solve once SU has converged. D2BP is only a
+convenient message-layout/container for Quimb loop-expansion primitives.
+Following every physical gate update, re-converge SU gauges warm-started from
+the previous `lambda`s; it is a state-preserving gauge relaxation. Relay D2BP
+is optional only for a deliberate general non-diagonal message gauge.
 
-Plan a **cluster-corrected compression** in `pepsy.bp` that builds the bond
-environment from a **local cluster** (the bond's tensor + a few neighbours,
-loop-corrected via §2) instead of the naive BP-message product, then does the
-SVD truncation against that better environment:
+For an active nearest-neighbour bond, absorb spectator `sqrt(lambda)` factors
+and make the reduced-tensor split
 
-- Compute the bond's environment / reduced density matrix from **BP + loops**,
-  *not* a single full cluster contraction (the expensive step we avoid).
-  `D2BP.partial_trace` gives the **rank-1 BP environment** (simple update);
-  `D2BP.partial_trace_gloop_expand` / `partial_trace_loop_series_expansion`
-  correct it as a **sum of small loop contractions around the bond** — Gray et
-  al.'s loop expansion applied to the *RDM* (open bond legs) rather than the
-  scalar `Z`. Each loop term is cheap and the series is truncated by loop weight,
-  so you get cluster-update-quality `N` from many small contractions instead of
-  one huge exact cluster contraction (parallel, convergence-robust).
-- **Positivise `N` before using it as a metric.** A loop-*truncated* environment
-  can be slightly non-Hermitian / non-positive; take the Hermitian part and clip
-  negative eigenvalues (`eigh`) so `N` is a valid positive metric for the env-SVD
-  / ALS truncation above.
-- Truncate with that environment (generalized/oblique SVD), giving a
-  **cluster-update**-quality compression that interpolates *simple update*
-  (cluster size 0 = rank-1 BP messages) → *cluster update* → *full update*
-  (χ_env → ∞ ≈ boundary environment), with the **cluster size as the single
-  knob** — the same dial as §2 and the tensy RG-BPLC decoder.
-- Keep it thin over quimb: reuse `compress_l2bp` / `compress_d2bp` message
-  machinery for the boundary closure and `contract_gloop_expand` /
-  `RegionGraph` for the cluster environment; feed the result to the boundary /
-  PEPS optimizers (§4) as a drop-in higher-fidelity `chi`-reduction.
+``A = Q_L R_L,    B = L_R Q_R``.
 
-**How the truncation uses the environment.** The cluster expansion only supplies
-a better *metric* — the environment `N` (a positive Gram matrix / two-site
-reduced density matrix) — not the truncation itself. Compressing a bond `A—B`
-means finding `Ã, B̃` (bond `D`) that minimise the **environment-weighted**
-error `‖ψ(Ã,B̃) − ψ(A,B)‖²`, a quadratic form `x†N x − x†b − b†x` in
-`x = (Ã, B̃)`. So plain SVD is optimal only for `N = I`; with a real environment
-there are two regimes:
+`Q_L` and `Q_R` retain untouched outer virtual legs; `R_L` and `L_R` retain
+the physical legs and active bond and are the only variational tensors. This
+is the finite-PEPS reduced-tensor construction, rather than a physical-site
+RDM calculation.
 
-- **One-shot environment-weighted SVD** when `N` factorises into left/right
-  positive factors `N ≈ X_L†X_L ⊗ X_R†X_R`: absorb the `X` square-roots, SVD,
-  keep the top `D`, peel them off. *Simple update / BP-gauge is exactly this*
-  with `X` = the bond-weight / BP-message square-roots (diagonal `N`) — which is
-  why it is a single SVD with no search.
-- **Variational ALS “deep search”** when `N` is a general cluster / boundary
-  environment (it does not factorise cleanly): because the state is *bilinear*
-  in `(Ã, B̃)`, alternately solve the normal equations `N_A Ã = b_A`, then
-  `N_B B̃ = b_B`, sweeping until the `N`-weighted error stops dropping — the
-  full-update fit (a.k.a. variational / fit compression).
+Construct a matched open-leg variational problem. Remove `R_L` and `L_R` from
+both layers of the norm network but leave their bra/ket legs open to obtain
 
-Both run on **reduced tensors** — QR the off-bond legs first (`A = Q_A R_A`,
-`B = Q_B R_B`) and project `N` onto the small `R_A, R_B` — so the deep search is
-cheap. The cluster environment therefore slots *between* simple update (rank-1,
-one-shot) and full update (boundary, ALS) in the **same** machinery; only the
-metric `N` gets better, and either truncation path (positivise+factorise → env-
-SVD, or ALS) then applies unchanged.
+``N_red[(r_L*, r_R*), (r_L, r_R)]``.
 
-This is the explicit hook Gray et al. (arXiv:2510.05647) flag — the loop cluster
-expansion "can be used to approximate the environment when compressing tensors …
-generalizing the so-called cluster update" — and it is cheaper than a full
-boundary environment while strictly better than the rank-1 BP-message default.
+The Trotter gate `U` is absent from `N_red`. For the linear term, put
+`U(R_L L_R)` on the target side and leave the variational-side reduced legs open
+to obtain `b_red[(r_L*, r_R*)]`. The update minimizes
+
+``||psi(R_L, L_R) - U psi||^2
+ = x^dag N_red x - 2 Re(x^dag b_red) + const``.
+
+Every selected loop/cluster must contribute to both `N_red` and `b_red` with
+the same counting coefficient; correcting only the metric is invalid.
+
+For each target-connected generalized loop or cluster `C`, contract the
+double-layer region exactly, close only its outer boundary with stored
+`diag(lambda)` messages, and retain the reduced bra/ket legs. Use the
+operator-valued loop **sum**
+
+``N_red = sum_C c_C N_C,    b_red = sum_C c_C b_C``.
+
+Do **not** apply a scalar loop-cluster product formula to `N_red`: it is a
+noncommuting open-leg metric and has no basis-independent product rule. Do not
+normalize individual cluster tensors either; only a common rescaling of the
+final `N_red` and `b_red` leaves the variational objective unchanged.
+
+At finite loop order use the safe metric
+
+``N_red <- PSD((N_red + N_red^dag) / 2)``
+
+and solve the reduced ALS with a relative pseudoinverse cutoff. First implement
+a direct buffered cluster (radius 0, then 1, then 2): with PSD SU-message
+closures it is a Gram matrix. Add open-leg loop-series / cluster-sum terms as
+the systematic acceleration and radius-convergence diagnostic.
+
+For a finite PEPS, a complete loop series is exact; equivalently, once the
+cluster family contains the complete system, its boundary disappears and it
+returns exact `N_red` and `b_red` independently of the SU messages. The
+subsequent ALS is then exact **within fixed `Q_L`, `Q_R`**. It becomes a
+full-tensor full update only if later sweeps also vary the outer factors.
 
 ### References
 
