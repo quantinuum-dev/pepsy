@@ -1121,9 +1121,12 @@ def loop_cluster_expand(
         a boundary-closure cluster approximation unless those messages are
         already a BP fixed point.
     bp_runner : {"plain", "relay"}, optional
-        Which fixed-point runner to use for ``norm="1norm"``. ``"relay"`` uses
-        :func:`pepsy.bp.relay_bp` with ``method="d1bp"`` and supports
-        ``relay_opts``.
+        Which fixed-point runner to use. ``"relay"`` uses
+        :func:`pepsy.bp.relay_bp` with ``method="d1bp"`` for ``norm="1norm"``
+        or ``method="d2bp"`` for ``norm="2norm"``, and supports
+        ``relay_opts``. D2BP relay memory is restricted to nonnegative
+        strengths so its density-matrix messages remain positive
+        semidefinite.
     relay_opts : dict, optional
         Extra options for relay-BP, e.g. ``{"num_relays": 4, "seed": 0}``.
     max_iterations, tol, tol_abs, tol_rolling_diff, diis
@@ -1184,9 +1187,6 @@ def loop_cluster_expand(
         raise ValueError("pass either messages or gauges, not both")
     if bp_runner not in {"plain", "relay"}:
         raise ValueError("bp_runner must be either 'plain' or 'relay'")
-    if bp_runner == "relay" and key != "1norm":
-        raise ValueError("bp_runner='relay' is only supported for norm='1norm'")
-
     info: dict[str, Any] = {}
     if key == "1norm" and gauges is not None:
         from .gauges import d1bp_from_simple_update_gauges
@@ -1236,13 +1236,18 @@ def loop_cluster_expand(
                 diis=diis,
                 progbar=progbar,
             )
-    elif key == "1norm" and run_bp and bp_runner == "relay":
+    elif run_bp and bp_runner == "relay":
         from .relay import relay_bp
 
         relay_kwargs = {} if relay_opts is None else dict(relay_opts)
+        relay_bp_opts = dict(bp_opts)
+        if key == "2norm":
+            # ``optimize`` is an explicit ``D2BP`` constructor option rather
+            # than part of relay_bp's common controls.
+            relay_bp_opts["optimize"] = optimize
         relay_res = relay_bp(
             tn,
-            method="d1bp",
+            method="d1bp" if key == "1norm" else "d2bp",
             init_messages=messages,
             max_iterations=max_iterations,
             tol=tol,
@@ -1251,7 +1256,7 @@ def loop_cluster_expand(
             damping=damping,
             update=update,
             **relay_kwargs,
-            **bp_opts,
+            **relay_bp_opts,
         )
         bp = relay_res.bp
         info = {

@@ -3,8 +3,9 @@
 This subpackage wraps quimb's belief propagation and adds two
 convergence-robust improvements:
 
-* :func:`relay_bp` / :func:`one_norm_bp` -- the disordered-memory / relay-BP
-  extension that hardens the BP *fixed point* (arXiv:2506.01779).
+* :func:`relay_bp` -- the disordered-memory / relay-BP extension that hardens
+  the 1-norm or dense 2-norm BP *fixed point* (arXiv:2506.01779).
+  :func:`one_norm_bp` provides the plain 1-norm BP runner.
 * :func:`loop_cluster_expand` -- the loop cluster expansion (arXiv:2510.05647),
   a systematic loop correction that becomes exact when the cluster set covers
   the system. Fixed-point BP messages are still what justify the formal loop

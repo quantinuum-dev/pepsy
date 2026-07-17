@@ -153,6 +153,22 @@ def test_1norm_sum_and_prod_run():
         assert res.norm == "1norm" and res.combine == combine
 
 
+def test_2norm_loop_cluster_expand_can_use_relay_bp():
+    peps, _ = _peps_and_exact()
+    res = loop_cluster_expand(
+        peps,
+        gloops=3,
+        bp_runner="relay",
+        relay_opts={"num_relays": 2, "seed": 0},
+        max_iterations=100,
+        tol=1e-10,
+    )
+
+    assert res.bp.__class__.__name__ == "D2BP"
+    assert res.bp_converged is True
+    assert np.isfinite(res.estimate)
+
+
 def _scalar_two_site_tree():
     """Closed scalar tree whose exact contraction is 13."""
     return qtn.TensorNetwork(

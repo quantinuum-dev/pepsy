@@ -1,4 +1,4 @@
-"""Tests for pepsy.bp relay-BP (disordered-memory 1-norm belief propagation)."""
+"""Tests for pepsy.bp relay-BP (disordered-memory belief propagation)."""
 
 from __future__ import annotations
 
@@ -37,6 +37,10 @@ def _scalar_three_site_chain():
             qtn.Tensor(data=np.array([3.0, 5.0]), inds=("right",)),
         ]
     )
+
+
+def _peps_2x2():
+    return qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=2, seed=10)
 
 
 def test_one_norm_bp_close_to_exact_on_small_grid():
@@ -153,6 +157,31 @@ def test_d1bp_relay_groups_disorder_by_source_tensor_not_bond():
     assert sources["right", right] == middle
 
 
+def test_d2bp_relay_runs_with_positive_memory_and_preserves_hermiticity():
+    res = relay_bp(
+        _peps_2x2(),
+        method="d2bp",
+        num_relays=2,
+        memory_first_leg=True,
+        gamma_range=(0.1, 0.2),
+        max_iterations=100,
+        tol=1e-10,
+        seed=0,
+    )
+
+    assert res.bp.__class__.__name__ == "D2BP"
+    assert res.converged
+    assert np.isfinite(float(res.contract()))
+    for message in res.messages.values():
+        assert np.allclose(message, message.conj().T)
+        assert np.linalg.eigvalsh(message).min() >= -1e-10
+
+
+def test_d2bp_relay_rejects_negative_memory():
+    with pytest.raises(ValueError, match="positive-semidefinite"):
+        relay_bp(_peps_2x2(), method="d2bp", gamma_range=(-0.1, 0.5))
+
+
 def test_hv1bp_plain_api_snapshots_and_warm_starts():
     first = one_norm_bp(_ising_tn(3, 0.25), method="hv1bp", tol=1e-10)
     assert first.converged
@@ -173,7 +202,7 @@ def test_relay_rejects_hv1bp_and_invalid_controls():
     tn = _ising_tn(3)
     with pytest.raises(ValueError, match="max_iterations"):
         one_norm_bp(tn, max_iterations=0)
-    with pytest.raises(ValueError, match="only 'l1bp' and 'd1bp'"):
+    with pytest.raises(ValueError, match="only 'l1bp', 'd1bp', and 'd2bp'"):
         relay_bp(tn, method="hv1bp")
     with pytest.raises(ValueError, match="positive integer"):
         relay_bp(tn, num_relays=0)

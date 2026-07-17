@@ -1,10 +1,11 @@
-"""Relay-BP: disordered-memory 1-norm belief propagation on a tensor network.
+"""Relay-BP: disordered-memory belief propagation on a tensor network.
 
 This wraps quimb's **1-norm** belief propagation (``L1BP`` / ``HV1BP`` /
-``D1BP``) for nonnegative / partition-function-style contractions. Plain
-:func:`one_norm_bp` supports all three; the per-node disordered-memory
-:func:`relay_bp` extension supports the directed ``L1BP`` and ``D1BP`` message
-layouts only:
+``D1BP``) for nonnegative / partition-function-style contractions, plus its
+dense **2-norm** ``D2BP`` for wavefunction / PEPS-like networks. Plain
+:func:`one_norm_bp` supports the three 1-norm implementations; the per-node
+disordered-memory :func:`relay_bp` extension supports the directed ``L1BP``,
+``D1BP``, and ``D2BP`` message layouts:
 
 * **Disordered memory.**  Each tensor node ``i`` is given a random *memory
   strength* ``gamma_i`` (drawn i.i.d. per node, possibly **negative**).  After
@@ -17,6 +18,11 @@ layouts only:
 * **Relay.**  Several BP *legs* are run; each leg warm-starts from the previous
   leg's messages but re-draws the ``gamma`` disorder, and the best-converged
   fixed point over all legs is returned.
+
+For D2BP, relay memory is restricted to a convex mixture (``0 <= gamma < 1``)
+so that positive-semidefinite density-matrix messages stay positive
+semidefinite.  The anti-memory values allowed for 1-norm relay BP are therefore
+not available in the 2-norm path.
 
 pepsy PLAN.md section 1 ("Convergence robustness -- disordered-memory /
 relay-BP").  This is the tensor-network generalisation of tensy's standalone
@@ -41,32 +47,32 @@ __all__ = [
 ]
 
 _ONE_NORM_CLASSES = {"l1bp": "L1BP", "hv1bp": "HV1BP", "d1bp": "D1BP"}
-_RELAY_METHODS = {"l1bp", "d1bp"}
+_RELAY_CLASSES = {**_ONE_NORM_CLASSES, "d2bp": "D2BP"}
+_RELAY_METHODS = {"l1bp", "d1bp", "d2bp"}
 
 
-def _method_key(method: str) -> str:
-    """Validate and normalize a public 1-norm BP method name."""
+def _method_key(method: str, classes: Mapping[str, str]) -> str:
+    """Validate and normalize a public BP method name against ``classes``."""
     key = str(method).lower()
-    if key not in _ONE_NORM_CLASSES:
+    if key not in classes:
         raise ValueError(
-            f"method must be one of {sorted(_ONE_NORM_CLASSES)}; got {method!r}"
+            f"method must be one of {sorted(classes)}; got {method!r}"
         )
     return key
 
 
-def _bp_class(method: str):
-    """Return the quimb 1-norm BP class for ``method``."""
+def _bp_class(method_key: str):
+    """Return the quimb BP class for a validated method key."""
     from quimb.tensor import belief_propagation as _bp
 
-    key = _method_key(method)
-    return getattr(_bp, _ONE_NORM_CLASSES[key])
+    return getattr(_bp, _RELAY_CLASSES[method_key])
 
 
 def _message_data(message):
     """Return the array carried by either quimb message representation.
 
-    ``L1BP`` stores individual ``Tensor`` messages, while ``D1BP`` and
-    ``HV1BP`` expose backend arrays (the latter in batched containers).
+    ``L1BP`` stores individual ``Tensor`` messages, while ``D1BP``, ``D2BP``,
+    and ``HV1BP`` expose backend arrays (the latter in batched containers).
     Checking for ``modify`` deliberately avoids ``ndarray.data``, which is a
     memory-view rather than the message array.
     """
@@ -84,10 +90,10 @@ def _set_message(bp, key, message, data) -> None:
 def _snapshot(messages):
     """Detach any quimb BP message representation.
 
-    ``L1BP`` and ``D1BP`` expose a dictionary of messages, while ``HV1BP``
-    exposes a pair of dictionaries containing batched arrays.  Preserve that
-    public representation so a snapshot can be passed straight back as
-    ``init_messages`` to :func:`one_norm_bp`.
+    ``L1BP``, ``D1BP``, and ``D2BP`` expose a dictionary of messages, while
+    ``HV1BP`` exposes a pair of dictionaries containing batched arrays.
+    Preserve that public representation so a snapshot can be passed straight
+    back as ``init_messages`` to :func:`one_norm_bp` or :func:`relay_bp`.
     """
     if isinstance(messages, Mapping):
         return {key: _snapshot(value) for key, value in messages.items()}
@@ -178,10 +184,11 @@ def _strict_converged(max_mdiff: float, tol: float, tol_abs: float | None) -> bo
 def _relay_message_sources(bp, method_key: str) -> dict:
     """Map each relay message key to the tensor/site that sends it.
 
-    Quimb's lazy ``L1BP`` messages are keyed by ``(source, target)``.  Dense
-    ``D1BP`` messages instead use ``(bond_index, destination_tensor)``; the
-    source is the other endpoint of that bond.  Relay-BP disorder is per
-    *source node*, not per bond or destination.
+    Quimb's lazy ``L1BP`` messages are keyed by ``(source, target)``. Dense
+    ``D1BP`` and ``D2BP`` messages instead use
+    ``(bond_index, destination_tensor)``; the source is the other endpoint of
+    that bond. Relay-BP disorder is per *source node*, not per bond or
+    destination.
     """
     keys = tuple(bp.messages)
     if any((not isinstance(key, tuple)) or len(key) != 2 for key in keys):
@@ -193,7 +200,7 @@ def _relay_message_sources(bp, method_key: str) -> dict:
     if method_key == "l1bp":
         return {key: key[0] for key in keys}
 
-    if method_key != "d1bp":  # guarded at the public entry point
+    if method_key not in {"d1bp", "d2bp"}:  # guarded at the public entry point
         raise ValueError(f"relay_bp does not support method={method_key!r}")
 
     sources = {}
@@ -201,7 +208,7 @@ def _relay_message_sources(bp, method_key: str) -> dict:
         tids = tuple(bp.tn.ind_map.get(index, ()))
         if len(tids) != 2 or destination not in tids:
             raise ValueError(
-                "D1BP relay requires a closed pairwise tensor graph; "
+                "dense relay BP requires a closed pairwise tensor graph; "
                 f"invalid message key {(index, destination)!r}"
             )
         sources[index, destination] = tids[1] if tids[0] == destination else tids[0]
@@ -501,7 +508,7 @@ def one_norm_bp(
     sequential updates. Pass ``init_messages`` (a previous
     :meth:`RelayBPResult.snapshot`) to warm-start an identical topology.
     """
-    method_key = _method_key(method)
+    method_key = _method_key(method, _ONE_NORM_CLASSES)
     if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
     if method_key == "d1bp":
@@ -541,7 +548,7 @@ def relay_bp(
     method: str = "l1bp",
     num_relays: int = 6,
     max_iterations: int = 200,
-    gamma_range: tuple[float, float] = (-0.3, 0.9),
+    gamma_range: tuple[float, float] | None = None,
     tol: float = 5e-6,
     tol_abs: float | None = None,
     tol_rolling_diff: float | None = 0.0,
@@ -558,11 +565,13 @@ def relay_bp(
     Parameters
     ----------
     tn :
-        A quimb ``TensorNetwork`` (nonnegative / factor network).
+        A quimb ``TensorNetwork``. ``L1BP`` / ``D1BP`` expect a nonnegative
+        factor network; ``D2BP`` expects a wavefunction / PEPS-like network.
     method :
-        Which BP representation to use (``"l1bp"`` or ``"d1bp"``).
-        ``HV1BP`` is intentionally unsupported: its batched arrays do not
-        expose a per-source message update for disordered memory.
+        Which BP representation to use (``"l1bp"``, ``"d1bp"``, or
+        ``"d2bp"``). ``HV1BP`` is intentionally unsupported: its batched
+        arrays do not expose a per-source message update for disordered
+        memory.
     num_relays :
         Number of relay legs.  Each leg warm-starts from the previous leg's
         messages and re-draws the ``gamma`` disorder; the best-converged fixed
@@ -571,8 +580,11 @@ def relay_bp(
         Message-passing sweeps per leg.
     gamma_range :
         Range from which per-node memory strengths are drawn uniformly and
-        i.i.d. for each memory leg. It must satisfy ``min <= max < 1``;
-        negative values give symmetry-breaking anti-memory.
+        i.i.d. for each memory leg. For 1-norm BP it must satisfy
+        ``min <= max < 1``; negative values give symmetry-breaking
+        anti-memory. For D2BP it must satisfy ``0 <= min <= max < 1`` to
+        preserve the positive-semidefinite message cone. Defaults to
+        ``(-0.3, 0.9)`` for 1-norm BP and ``(0.0, 0.9)`` for D2BP.
     memory_first_leg :
         If ``False`` (default) the first leg is plain BP (no memory), so an
         easy / well-behaved network still returns the exact plain-BP fixed
@@ -587,16 +599,18 @@ def relay_bp(
     -------
     RelayBPResult
     """
-    method_key = _method_key(method)
+    method_key = _method_key(method, _RELAY_CLASSES)
     if method_key not in _RELAY_METHODS:
         raise ValueError(
-            "relay_bp supports only 'l1bp' and 'd1bp'; HV1BP's batched "
+            "relay_bp supports only 'l1bp', 'd1bp', and 'd2bp'; HV1BP's batched "
             "message representation cannot apply per-node memory safely"
         )
     if not isinstance(num_relays, (int, np.integer)) or num_relays < 1:
         raise ValueError("num_relays must be a positive integer")
     if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
+    if gamma_range is None:
+        gamma_range = (0.0, 0.9) if method_key == "d2bp" else (-0.3, 0.9)
     try:
         gamma_min, gamma_max = map(float, gamma_range)
     except (TypeError, ValueError) as exc:
@@ -609,6 +623,11 @@ def relay_bp(
         raise ValueError(
             "gamma_range must satisfy finite min <= max < 1.0; gamma=1 "
             "would freeze a message and fake convergence"
+        )
+    if method_key == "d2bp" and gamma_min < 0.0:
+        raise ValueError(
+            "D2BP relay requires gamma_range with 0 <= min <= max < 1.0 "
+            "to preserve positive-semidefinite messages"
         )
     if method_key == "d1bp":
         from .gauges import _validate_d1_graph
@@ -646,7 +665,7 @@ def relay_bp(
             converged = _strict_converged(max_mdiff, tol, tol_abs)
             quimb_converged = bool(info.get("converged", False))
         else:
-            # Out-of-band per-node memory injection invalidates D1BP's local
+            # Out-of-band per-node memory injection invalidates quimb's local
             # convergence bookkeeping, so a memory leg must recompute every
             # message. Keep quimb's default local convergence for an initial
             # plain leg: on some sequential D1BP graphs, forcing full sweeps
