@@ -113,6 +113,30 @@ At the start of a new task:
 - Preserve the coefficient-MPS canonical-centre tracker through Quimb updates.
   Use its one-site tensor norm, including the MPS exponent, for local norms and
   unitary truncation diagnostics.
+- Keep the two cooling mechanisms separate. `exact_cooling=True` is the default
+  deterministic pre-check on a multi-site non-Clifford Pauli rotation. When it
+  finds a product stabilizer pivot, it uses one local coefficient rotation and
+  absorbs the controlled-Pauli remainder into the tableau, avoiding the
+  bond-growing MPO. It is not a sweep and does not perform trial SVDs. Test the
+  ordinary MPO fallback explicitly with `exact_cooling=False` when changing that
+  path. `disentangle_cliffords(...)` is the distinct, SVD-scored greedy
+  two-qubit Clifford sweep; leave it caller-scheduled at sparse checkpoints,
+  never on every T gate or normal rotation.
+- Keep the two magic-injection schedules separate. `with_injection(...)` is the
+  immediate, recycled-ancilla path and is the normal low-ancilla-throughput
+  choice. `with_deferred_injection(...)` is the MAST path: it needs one fresh
+  reserved ancilla per injectable gate, replays the circuit before the final
+  basis-updating projections, and exposes their cost separately. The input
+  stream must not act on either reserved ancilla pool. Do not call the greedy
+  disentangler between deferred replay and its final projections.
+- Use `recommend_magic_strategy(gates, ...)`, or `queued_magic_strategy()` on
+  a not-yet-run `from_stim` simulator, to give callers an explicit stream-based
+  recommendation. It is advisory by design: never make `apply()` silently
+  select direct, immediate, or deferred execution from that report.
+- When comparing direct, immediate, and deferred execution, report peak
+  `|nu>` bond plus projection cost, not only final bond or total wall time. Use
+  `benchmarks/stabilizer_tn_magic_scaling.py --no-exact-cooling` to isolate
+  injection/MAST effects from the constructive exact-cooling pre-check.
 - `track_infidelity` records sparse cumulative `1 - ||p||^2` samples only for
   normalized unitary segments. It is not exact overlap fidelity or discarded
   SVD weight. Do not renormalize unitary evolution or sum `infidelities`.

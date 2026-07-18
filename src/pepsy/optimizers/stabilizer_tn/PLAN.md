@@ -126,16 +126,25 @@ new simulator features.
   Coefficient-frame sub-MPOs invalidate the proxy because their event API does
   not certify unitarity.
 
+### Completed review follow-ups
+
+- Magic-ancilla pool contracts are enforced before immediate/deferred replay:
+  reserved ancillas must be unique, in range, clean physical `|0>` qubits, and
+  ordinary stream entries must not touch them.
+- Optional backend tests now exercise the real STN paths for Torch, JAX, and
+  CuPy when those dependencies/runtimes are present. The exact-cooling local
+  vector path copies backend materialized arrays before in-place normalization,
+  so read-only JAX NumPy views are handled safely.
+- Measurement and diagnostic logs use typed, backward-compatible records:
+  `MeasurementRecord`, `NormEventRecord`, `ImmediateProjectionRecord`,
+  `DeferredProjectionRecord`, `ImmediateInjectionReport`, and
+  `DeferredInjectionReport`.
+- `StabilizerMpsSimulator` is exported as the clearer public name while
+  `MpsStabOptimizer` remains the compatibility alias.
+
 ### Remaining priorities from the review
 
-1. Enforce magic-ancilla pool contracts (unique, in range, initially clean, and
-   untouched by ordinary stream entries).
-2. Add optional JAX/CuPy coverage before claiming parity with the tested NumPy
-   and Torch paths; avoid mutating caller-owned MPOs during backend conversion.
-3. Clarify the simulator-facing API with typed measurement/diagnostic records
-   and consider `StabilizerMpsSimulator` as the preferred name while preserving
-   `MpsStabOptimizer` as a compatibility alias.
-4. Reconcile roadmap references to any intentionally removed benchmark/example
+1. Reconcile roadmap references to any intentionally removed benchmark/example
    files so documentation and the executable repository remain aligned.
 
 ---
@@ -185,8 +194,8 @@ new simulator features.
   `infidelities`, `bond_history`, `set_gates`/`add_gates`/`run`/`apply`).
 - **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_state` and the
   matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_state` classmethods.
-- **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports running chi
-  and the current unitary norm-loss proxy); `norm()` returns the `|nu>` norm.
+- **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports the current
+  stream part and `norm_infidelity`); `norm()` returns the `|nu>` norm.
 - `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
 - **Amplitude / observable API** — `amplitude(bits)`/`probability(bits)`;
   `expectation(pauli, where=None)` (also full-register strings like `"ZIZ"`);
@@ -220,9 +229,26 @@ new simulator features.
   damping independent of Stim while retaining one-MPS-per-shot scaling. A
   normalized Kraus outcome closes the prior unitary norm-proxy segment and
   starts a fresh one; its Born probability is not counted as compression loss.
-  `norm_diagnostics()["total_norm_proxy"]` reports the square root of the
-  product of segment survival proxies even though the current state has been
-  renormalized.
+  `norm_diagnostics()["norm"]` reports the square root of the product of segment
+  survivals even though the current state has been renormalized. The older
+  `total_norm_proxy` key remains an alias.
+- **Pepsy-native stochastic stream entries** — stream-local noise is the main
+  design. Entries such as `("x_error", p, q)`, `("depolarize1", p, q)`,
+  `("depolarize2", p, q0, q1)`, `("pauli_channel1", probs, q)`,
+  `("pauli_channel2", probs, q0, q1)`, and
+  `("amplitude_damping", gamma, q)` lower to the same trajectory machinery.
+  `PauliErrorModel` remains a convenience macro for clean streams, not the
+  fundamental noise interface. Sampling policy belongs in trajectory settings:
+  shots, seed, `strategy="independent"|"coalesced"|"auto"`, branch caps, and
+  `run_kwargs`.
+- **PECOS-style leakage trajectories** — Pepsy stream entries
+  `("leakage", p, q)`, `("leakage_return", p, q)`, `("measure_leaked", q)`,
+  `("leak2depolar", enabled)`, and `("leakage_depolarize", p, q)` carry
+  shot-local leakage state outside the qubit MPS. Leaked qubits suppress
+  ordinary gates, `reset`/`measure_reset` clear leakage, `measure_leaked`
+  records ternary `0/1/2` outcomes, and `leak2depolar` provides the fast
+  stabilizer approximation. These entries currently replay as independent
+  trajectories; exact count coalescing for leakage state remains future work.
 
 ## Cross-checked against the reference (bsc-quantic/stabilizer-TN v1.1/v1.2)
 
@@ -235,7 +261,7 @@ bond-dim-2 MPO instead of their CNOT cascade.
 
 ## Roadmap — improvements from the literature (citation scan of PRL 133, 230601)
 
-Ordered by value/effort. None are started.
+Ordered by value/effort. Completed items remain here as implementation guidance.
 
 ### R1. Magic state injection (highest value)
 - Nakhl, Harper, West, et al., *Stabilizer Tensor Networks with Magic State
@@ -247,32 +273,45 @@ Ordered by value/effort. None are started.
 - Impact: turns our exact non-Clifford path from chi-growing into poly-scaling for
   T-doped circuits. Needs an ancilla-qubit + measurement-conditioned Clifford
   correction protocol layered on `MpsStabOptimizer`.
-- **STATUS: first cut DONE** — `prepare_magic` + `inject_t` (built on the R3
-  basis-updating measurement). Only the `T` gate is covered so far, because its
-  correction `S = Rz(2*pi/4)` is Clifford. **Next:**
-  - General diagonal `Rz(phi)` injection: **DONE for `phi` a multiple of `pi/4`**
-    via `inject_rz(data, ancilla, phi)` (+ `inject_t`/`inject_tdg` wrappers;
-    `prepare_magic(a, angle=phi)`), where the correction `Rz(2*phi)` is Clifford.
-    For an *arbitrary* angle injection has **no scaling benefit** (the resource
-    `Rz(phi)|+>` is itself prepared with a `|nu>` rotation), so those stay on the
-    exact rotation path or should be compiled to Clifford+T (gridsynth) and
-    injected — a RUS gadget is intentionally not added.
-  - Injection locality: `run_with_injection` picks the **nearest clean ancilla**
-    to each data qubit (shorter localizer span); a spread ancilla pool then cuts
-    the swap cost the scaling benchmark exposed for a single trailing ancilla.
-  - Preallocate a magic-ancilla register + a `t_via_injection`/circuit-rewrite
-    front end that replaces every `("t", q)` stream entry with an injection so a
-    T-doped circuit never touches the `|nu>` rotation path. **DONE** —
-    `run_with_injection(gates, ancillas=...)` and the `with_injection(n_data,
-    gates, n_ancilla=...)` classmethod auto-teleport every `t`/`tdg`/`pi/4`-`rz`
-    through `inject_rz`, recycling the ancilla pool (size 1 suffices; inject frees
-    the ancilla immediately). Validated == direct replay on the data marginal.
-  - Benchmark: T-doped-Clifford circuit at large `N`, fixed `t` — show `|nu>`
-    bond bounded by ~`2^t` independent of `N` (paper Fig. 2). **DONE** —
-    `benchmarks/stabilizer_tn_magic_scaling.py` sweeps `N` at fixed `t` (direct
-    and injection modes, any backend) and reports the max `|nu>` bond / rank /
-    time; confirms the bond stays `<= 2^t` and flat in `N`. Smoke-tested in
-    `tests/test_stabilizer_tn.py`.
+- **STATUS: DONE, with two schedules.** `inject_rz(data, ancilla, phi)` plus
+  `inject_t` / `inject_tdg` inject every non-Clifford `phi = k*pi/4` diagonal
+  rotation, whose `Rz(2*phi)` correction is Clifford. Arbitrary angles have no
+  injection scaling benefit because preparing their resource state already costs
+  a non-Clifford coefficient rotation; leave them direct or compile to
+  Clifford+T.
+  - **Immediate injection:** `run_with_injection(gates, ancillas=...)` and
+    `with_injection(n_data, gates, n_ancilla=...)` auto-rewrite injectable gates,
+    basis-update measure each ancilla immediately, and recycle it. A single
+    ancilla is enough; a larger spread pool lets the scheduler choose the nearest
+    clean ancilla. This is the usual throughput/low-ancilla mode.
+  - **Deferred MAST:** `run_with_deferred_injection(...)` and
+    `with_deferred_injection(...)` reserve one fresh ancilla per injectable gate.
+    They replay the magic gadgets first, then basis-update project the magic
+    register at the end. `projection_order="middle_out"` is the default;
+    `"input"`, `"min_span"`, and an explicit permutation are available. This
+    exposes a low replay-phase bond but intentionally pays a final projection
+    phase and uses `t` extra ancillas. Ordinary stream entries must not touch the
+    reserved ancillas.
+  - **Benchmark:** `benchmarks/stabilizer_tn_magic_scaling.py` now compares
+    `direct`, `immediate`, and `deferred`, reporting peak/final `|nu>` bond,
+    replay time, projection peak bond, projection time, and total time. Use
+    `--no-exact-cooling` to isolate the injection/MAST comparison. The benchmark
+    keeps the legacy `injection` mode name as an alias for `immediate`.
+  - **Stream advice:** `analyze_stream(gates, ...)` and
+    `recommend_settings(gates, ...)` inspect a user or Stim-converted Pepsy
+    stream first, returning typed, mapping-compatible analysis and settings
+    advice records. The narrower `recommend_magic_strategy(gates, ...)` still
+    supplies the explicit direct/immediate/deferred injection recommendation.
+    `queued_stream_analysis()` and `queued_recommend_settings()` read an unrun
+    simulator's queued stream. This remains advisory: direct `apply()` never
+    silently selects an injection schedule or rewrites settings.
+  - **Validation runner:** `run_stabilizer_mps_stream(gates, mode=...)` performs
+    one explicit Pepsy-stream replay and returns a typed `StabilizerMpsRunResult`
+    with the simulator, actual mode/settings, replay/projection timing,
+    final/peak bond, norm diagnostics, measurements, projection events, and
+    injection report. The default is direct; `mode="recommended"` is an explicit
+    opt-in to the advisor's mode. `run_queued_stream(...)` applies the same
+    runner to an unrun converted queue without mutating the source simulator.
 
 ### R2. Clifford disentangling sweep (repo-aligned)
 - CAMPS: Qian, Huang, Qin, PRL 133, 190402 (arXiv:2405.09217); Clifford-dressed
@@ -282,16 +321,25 @@ Ordered by value/effort. None are started.
   into the tableau `C` to reduce `|nu>` bond dimension — the paper's "store
   potential entanglement in the basis" future-work item.
 - Impact: directly attacks chi growth; keeps exact semantics. Medium effort.
-- **STATUS: DONE (local greedy sweep)** — `MpsStabOptimizer.disentangle_cliffords`
-  tests the 20 two-qubit Clifford classes modulo output-local Cliffords from
-  local Schmidt/SVD data (no full-MPS candidate copies), applies an improving
-  `D` to `|nu>`, and absorbs `D^dagger` with
-  `STNState.absorb_basis_clifford`. The physical invariant
-  `(C D^dagger)(D |nu>) = C|nu>` is dense-validated. The ordered stream event
-  `("disentangle", {"sweeps": ..., "bonds": ..., "tol": ...})` makes it
-  possible to schedule the sweep between circuit operations. `tol=0` retains
-  every numerical singular value; the normal cutoff removes round-off-sized
-  values to reveal the reduced stored bond.
+- **STATUS: DONE, two complementary tools.**
+  - **Constructive exact cooling (default):** before the ordinary multi-site
+    rotation MPO path, `_try_exact_cooling` searches for an isolated product
+    coefficient site whose Pauli stabilizer anticommutes with the local frame
+    axis. For `M = sign * A_i * Q`, it applies the local `A_i` rotation and
+    absorbs the controlled-`Q` Clifford cascade into the tableau. This exact,
+    deterministic pre-check has no candidate SVD loop and leaves that update's
+    coefficient bond unchanged. It records `exact_cooling_events`; set
+    `exact_cooling=False` only to exercise or benchmark the normal MPO fallback.
+  - **Greedy sweep (explicit):** `MpsStabOptimizer.disentangle_cliffords` tests
+    the 20 two-qubit Clifford classes modulo output-local Cliffords from local
+    Schmidt/SVD data (no full-MPS candidate copies), applies an improving `D` to
+    `|nu>`, and absorbs `D^dagger` with `STNState.absorb_basis_clifford`. The
+    physical invariant `(C D^dagger)(D |nu>) = C|nu>` is dense-validated. The
+    ordered stream event `("disentangle", {"sweeps": ..., "bonds": ..., "tol":
+    ...})` makes it possible to schedule sparse checkpoints. `tol=0` retains
+    every numerical singular value; the normal cutoff removes round-off-sized
+    values to reveal the reduced stored bond. Do not run this sweep after every
+    T gate: its local SVD work is purposeful but not free.
 
 ### R3. Basis-updating (canonical Lemma-3) measurement
 - Reference `meas_tableau` + `P_k` projection: absorb the measured observable into
@@ -321,9 +369,9 @@ Ordered by value/effort. None are started.
   dominant cost; ~3.6x faster on a spread `n=20` measurement).
 - **Backend / GPU: DONE** — `MpsStabOptimizer(..., to_backend=...)` (e.g.
   `pepsy.backend_torch` / `backend_cupy` / `backend_jax`) places `|nu>` and every
-  gate/MPO on that backend; the stim tableau stays on the CPU. Validated: torch
-  `|nu>` matches the NumPy path (fidelity 1.0) for gates, absorb-measurement,
-  injection, and sampling.
+  gate/MPO on that backend; the stim tableau stays on the CPU. Validated against
+  the NumPy path for Torch, JAX, and CuPy (when optional dependencies/runtimes
+  are available) across gates, absorb-measurement, injection, and sampling.
 
 ### R5. Packaging & examples
 - Optionally expose `MpsStabOptimizer` at top-level `pepsy.*` + `docs/api/`
@@ -331,8 +379,9 @@ Ordered by value/effort. None are started.
   updating `tests/test_public_api.py`).
 - A small deterministic example: `|T>^n` at chi=1, and a magic-vs-chi growth demo
   (paper Fig. 2).
-- **STATUS: DONE** — `pepsy.MpsStabOptimizer` and `pepsy.STNState` are exported at
-  top level (symbol map + `__all__` + eager import + `tests/test_public_api.py`),
+- **STATUS: DONE** — `pepsy.StabilizerMpsSimulator`, `pepsy.MpsStabOptimizer`,
+  `pepsy.STNState`, and the typed STN diagnostic records are exported at top
+  level (symbol map + `__all__` + eager import + `tests/test_public_api.py`),
   documented at `docs/api/optimizers/stabilizer_tn.md`, and demonstrated by
   `examples/stabilizer_tn_magic_injection.py` (Clifford-free GHZ, `inject_t` +
   ancilla recycling, scalable sampling, all dense-validated). **Next:** a

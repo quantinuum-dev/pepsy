@@ -15,11 +15,12 @@ If stim is missing: `python -m pip install stim`.
 The public simulator types are exported at top level (`import pepsy`); see
 `src/pepsy/__init__.py`. Helpers such as `pauli_combo_submpo` remain internal.
 
-- **Create a simulator**: `sim = pepsy.MpsStabOptimizer(n, gates=None, chi=None,
+- **Create a simulator**: `sim = pepsy.StabilizerMpsSimulator(n, gates=None, chi=None,
   cutoff=1e-12, operator_tol=None, max_pauli_decomposition_qubits=2,
-  track_infidelity=False, seed=None, to_backend=None)`. It owns an
+  track_infidelity=False, exact_cooling=True, seed=None, to_backend=None)`. It owns an
   `STNState`; `sim.p` / `sim.state.p` is the coefficient MPS and `sim.nu` is an alias.
-  `STNState` constructs the initial product MPS with `pepsy.ps_to_mps(n)`.
+  `MpsStabOptimizer` is the compatibility alias for the same class. `STNState`
+  constructs the initial product MPS with `pepsy.ps_to_mps(n)`.
 - **Exact/approximate control**:
   - `chi=None` is exact evolution; keep a small `cutoff` to remove numerically redundant
     Schmidt values introduced by bond-dimension-2 operators.
@@ -59,9 +60,83 @@ The public simulator types are exported at top level (`import pepsy`); see
   `sim.sample_bits(shots, seed=...)` use conditional measurements on copies and do not form
   the dense statevector. `sim.amplitude` / `sim.probability` reconstruct densely and are for
   small systems only.
+- **Cooling**: `exact_cooling=True` is the default deterministic pre-check for a multi-site
+  non-Clifford Pauli rotation. When a product stabilizer pivot exists, it performs a local
+  rotation and moves the controlled-Pauli remainder into the tableau, so this update leaves
+  the coefficient bond unchanged. `sim.exact_cooling_events` records successes. It is not
+  the same as `sim.disentangle_cliffords(...)`, an explicit SVD-scored greedy two-qubit
+  Clifford sweep that can reduce an existing bond and should be called at sparse checkpoints.
 - **Magic-state injection**: `prepare_magic`, `inject_rz` (pi/4 multiples), `inject_t`,
-  `inject_tdg`, `run_with_injection`, and `with_injection`. Ancillas must start in `|0>`;
-  `reset` restores that precondition for reuse.
+  `inject_tdg`, `run_with_injection`, and `with_injection` implement immediate injection:
+  each ancilla is measured and can be reset/reused. `run_with_deferred_injection` and
+  `with_deferred_injection` implement deferred MAST: one distinct clean ancilla per
+  injectable gate, then final basis-updating ancilla projections in `middle_out` (default),
+  `input`, `min_span`, or an explicit used-ancilla permutation. The circuit stream must not
+  act on the reserved pool. The pool is validated before replay: unique, in-range, clean
+  physical `|0>` ancillas, with no ordinary stream entries touching them. Inspect
+  `.immediate_projection_events` / `.last_immediate_injection_report` or
+  `.deferred_projection_events` / `.last_deferred_injection_report` for per-gadget and
+  aggregate projection diagnostics.
+  Arbitrary-angle `rz` is intentionally not injected because preparing its resource state
+  has the same non-Clifford cost; compile to Clifford+T or use the direct path.
+- **Native stochastic stream entries**:
+  Stream-local noise is the preferred Pepsy design. Use entries such as
+  `("x_error", p, q)`, `("depolarize1", p, q)`,
+  `("depolarize2", p, q0, q1)`, `("pauli_channel1", probs, q)`,
+  `("pauli_channel2", probs, q0, q1)`, and
+  `("amplitude_damping", gamma, q)` exactly where the channel acts. They lower to
+  `TrajectoryEvent` internally and must be sampled through
+  `run_trajectory_shots(...)` or `run_coalesced_trajectory_shots(...)`; plain
+  `sim.run()` is for deterministic streams. `PauliErrorModel` remains a macro for
+  adding uniform post-gate Pauli faults to a clean stream, not the fundamental
+  noise API. Sampling policy belongs in runner settings: shots, seed,
+  `strategy="independent"|"coalesced"|"auto"`, branch caps, and `run_kwargs`.
+- **Stateful leakage stream entries**:
+  Pepsy also supports PECOS-style leakage events directly in the stream:
+  `("leakage", p, q)`, `("leakage_return", p, q)`,
+  `("measure_leaked", q)`, `("leak2depolar", enabled)`, and
+  `("leakage_depolarize", p, q)`. The trajectory runner carries a per-shot
+  leaked-qubit set outside the qubit MPS: leaked qubits suppress ordinary
+  gates, reset/measure-reset clears the flag, and `measure_leaked` records
+  ternary `0/1/2` outcomes in `TrajectoryShotResult.leakage_records`.
+  `leak2depolar` keeps the fast stabilizer approximation by replacing later
+  leakage events with full one-qubit depolarizing draws. Exact count coalescing
+  for this stateful leakage layer is future work, so `strategy="auto"` remains
+  independent and explicit coalescing raises for leakage streams.
+- **Stream and settings advice**:
+  `MpsStabOptimizer.analyze_stream(gates, n_qubits=None)` is the Pepsy-native
+  front door. It returns a typed, mapping-compatible `StreamAnalysisRecord`
+  with counts for Clifford entries, injectable T-family rotations, other
+  non-Clifford work, dense matrices, non-unitary matrices, coefficient-frame
+  sub-MPOs, measurements/resets/caps, touched qubits, and warnings.
+  `MpsStabOptimizer.recommend_settings(gates, n_qubits=None,
+  ancilla_budget=None, prioritize_peak_bond=False, goal="run")` returns a
+  typed `StabilizerMpsSettingsAdvice` with constructor settings, execution
+  method, ancilla requirements, warnings, and a message. It calls the narrower
+  `recommend_magic_strategy(...)` internally for the direct/immediate/deferred
+  decision. `sim.queued_stream_analysis(...)` and
+  `sim.queued_recommend_settings(...)` apply the same Pepsy-stream analysis to
+  an unrun queue, including a sampled Stim stream after
+  `from_stim(..., stream_transform=...)`. These APIs are advisory only and
+  never change `apply()` behavior.
+- **Explicit stream runner**:
+  `run_stabilizer_mps_stream(gates, n_qubits=None, mode="direct",
+  settings=None, advice=None, n_ancilla=None, run_options=None, ...)` performs
+  one Pepsy-stream replay and returns a typed, mapping-compatible
+  `StabilizerMpsRunResult`. The default mode is direct; `mode="recommended"`
+  is the explicit opt-in to the mode from `recommend_settings`. The result
+  records the simulator, actual mode, constructor settings used, run options,
+  replay/projection timing, final and peak coefficient-MPS bond, norm
+  diagnostics, measurements, projection events, injection report, and remaining
+  queue length. `sim.run_queued_stream(...)` applies the same runner to an
+  unrun converted queue (for example after `from_stim`) without mutating the
+  source simulator.
+- **Magic-only strategy advice**: `MpsStabOptimizer.recommend_magic_strategy(gates,
+  ancilla_budget=None, prioritize_peak_bond=False)` classifies a Pepsy stream and returns
+  an explicit direct/immediate/deferred recommendation, counts, ancilla requirements, and a
+  plain-English `message`. It recognizes the small physical Clifford matrices emitted by
+  Stim; larger/non-unitary matrices and coefficient-frame MPOs remain opaque.
+  `sim.queued_magic_strategy(...)` applies the same analysis to an unrun simulator queue.
 - **Norm and diagnostics**: `sim.norm()`, `sim.state.max_bond()`,
   `sim.pseudo_stabilizer_rank()` (dense/small-n), `.measurements`, `.infidelities`,
   `.norm_events`, `.norm_diagnostics()`, and `.bond_history`. General non-unitary
@@ -73,9 +148,13 @@ The public simulator types are exported at top level (`import pepsy`); see
   reset, and normalized Kraus-trajectory boundaries, including the Born
   `branch_probability` and the actual `projected_norm_sq` before normalization; compare it
   to `pre_norm_sq * branch_probability` for the separate compression-survival proxy.
-  `norm_diagnostics()["total_norm_proxy"]` is the square root of the product of completed
-  and current segment survivals; `geometric_mean_norm` is only a per-segment average.
+  Prefer `norm_diagnostics()["norm_infidelity"]`, `["norm_survival"]`, and `["norm"]`;
+  the older `total_*_proxy` keys remain compatibility aliases. `geometric_mean_norm`
+  is only a per-segment average.
   Never sum `.infidelities`: each sample is already cumulative for its segment.
+  `.measurements` stores tuple-compatible `MeasurementRecord` objects; `.norm_events`,
+  projection events, and injection reports store mapping-compatible typed records such as
+  `NormEventRecord`, `ImmediateProjectionRecord`, and `DeferredInjectionReport`.
 - **Canonical centre**: pass the simulator-managed orthogonality info through quimb
   operations that can move the centre. Use its canonicalization/renormalization helpers
   when extending projective paths; do not replace them with a blind full-MPS normalization.
@@ -158,8 +237,9 @@ If you add public symbols, follow repo Public API Rules: update the owning subpa
   compression is reported separately in `.norm_events` as `projector_infidelity`, while
   physical measurement probabilities remain separate. A normalized selected Kraus branch
   likewise closes the current segment and starts a fresh one; it must not leave the proxy
-  invalid. `total_norm_proxy = sqrt(total_survival_proxy)` is the total compression-norm
-  value used by STN progress (`Ntotal`), alongside `Itotal` for its infidelity complement.
+  invalid. STN progress reports a compact stream `part` label and `norm_infidelity`;
+  use `norm = sqrt(norm_survival)` from `norm_diagnostics()` when the norm-survival
+  summary is needed programmatically.
   Validate physical accuracy independently against dense evolution on small systems.
 - Keep tests tiny/deterministic (fixed seeds, small $n$), per repo Examples guidance.
 

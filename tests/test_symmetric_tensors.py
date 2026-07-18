@@ -8,6 +8,9 @@ from pepsy.operators import gate, gate_simple
 from pepsy.tensors import symmetric as symmetric_mod
 from pepsy.tensors import (
     OneDMap,
+    SpinfulFermion,
+    SpinfulFermionHubbard,
+    SymmFermions,
     SymGateStream,
     SymHamiltonian,
     SymMPS,
@@ -35,6 +38,55 @@ from pepsy.tensors import (
 
 
 sr = pytest.importorskip("symmray")
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "expected_model", "expected_charge"),
+    [
+        ("U1", "fermi_hubbard", 4),
+        ("U1U1", "fermi_hubbard_u1u1", (2, 2)),
+    ],
+)
+def test_spinful_fermion_helper_bundles_symmetry_aware_building_blocks(
+    symmetry, expected_model, expected_charge
+):
+    """The convenience helper should cover the native U1 and U1U1 workflows."""
+    fermions = SpinfulFermion(symmetry=symmetry, t=1.0, U=3.0)
+
+    assert SpinfulFermionHubbard is SpinfulFermion
+    assert isinstance(SymmFermions.spinful(symmetry=symmetry), SpinfulFermion)
+    assert pepsy.SpinfulFermion is SpinfulFermion
+    assert pepsy.SymmFermions is SymmFermions
+    occupations = fermions.half_filled_occupations(4)
+    assert fermions.model == expected_model
+    assert fermions.total_charge(occupations) == expected_charge
+    assert fermions.physical_sectors == default_physical_sectors(model=expected_model)
+    assert np.allclose(
+        fermions.dense_operator("pair_create")
+        @ fermions.dense_operator("pair_annihilate"),
+        fermions.dense_operator("doublon"),
+    )
+
+    pair_create = fermions.observable("pair_create")
+    assert pair_create is fermions.observable("pair_create")
+    assert tuple(pair_create.shape) == (4, 4)
+    assert fermions.operator_charge("pair_create") == fermions.pair_charge
+
+    edges = ((0, 1), (1, 2), (2, 3), (3, 0))
+    assert fermions.edge_coloring_layers(edges) == (
+        ((0, 1), (2, 3)),
+        ((1, 2), (3, 0)),
+    )
+    stream = fermions.strang_gate_stream(edges, 0.02, sites=range(4))
+    assert isinstance(stream, SymGateStream)
+    assert stream.order == 2
+    assert len(stream) == 16
+    assert all(len(where) == 2 for _, where in stream[4:12])
+
+    ham = fermions.hamiltonian(((0, 1), (1, 2)), mu=0.1)
+    assert isinstance(ham, SymHamiltonian)
+    assert ham.model == expected_model
+    assert ham.symmetry == symmetry
 
 
 def test_symmray_block_summary_and_schematic_for_z2_gate():
@@ -1406,8 +1458,16 @@ def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_maps_2d_long_range_edge():
     assert complex(energy(mpo_from_mapper)) == pytest.approx(complex(energy(mpo_from_flat)))
 
 
-def test_spinful_fermi_hubbard_total_u1_mpo_fails_clearly():
-    """Spinful FH total-U1 MPOs are intentionally not routed through U1U1."""
+def test_spinful_fermi_hubbard_total_u1_mpo_builds_energy_path():
+    """Spinful FH total-U1 MPOs should use the same JW path as U1U1."""
+    state = SymMPS.for_model(
+        "fermi_hubbard",
+        2,
+        bond_dim=3,
+        site_charge=site_charge_from_occupations([1, 1]),
+        seed=11,
+        dtype="complex128",
+    )
     ham = SymHamiltonian.from_edges(
         "fermi_hubbard",
         "U1",
@@ -1416,9 +1476,22 @@ def test_spinful_fermi_hubbard_total_u1_mpo_fails_clearly():
         U=4.0,
         mu=0.1,
     )
+    mpo = ham.to_mpo(L=2, compress=False)
 
-    with pytest.raises(NotImplementedError, match="total-U1"):
-        ham.to_mpo(L=2)
+    mpo_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        mpo,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+    term_energy = pepsy.MpsEnergyOptimizer(
+        state,
+        ham.terms,
+        energy_per_site=False,
+        real=False,
+    ).energy().energy
+
+    assert complex(mpo_energy) == pytest.approx(complex(term_energy))
 
 
 def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
@@ -2417,6 +2490,31 @@ def test_fermi_hubbard_u1u1_mpo_matches_dense_jw_spectrum(L, edges):
 
     matrix = _mpo_to_dense_matrix(mpo, L)
     assert np.max(np.abs(matrix - matrix.conj().T)) < 1e-10  # Hermitian
+
+    reference = _dense_jw_fermi_hubbard(L, edges, t=t, U=U, mu=mu)
+    spec_mpo = np.sort(np.linalg.eigvalsh((matrix + matrix.conj().T) / 2).real)
+    spec_ref = np.sort(np.linalg.eigvalsh(reference).real)
+    np.testing.assert_allclose(spec_mpo, spec_ref, atol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "L,edges",
+    [
+        (2, [(0, 1)]),
+        (3, [(0, 2)]),
+        (4, [(0, 1), (1, 2), (2, 3), (0, 3)]),
+    ],
+)
+def test_fermi_hubbard_total_u1_mpo_matches_dense_jw_spectrum(L, edges):
+    """The total-U1 spinful FH MPO should match dense JW exactly."""
+    t, U, mu = 1.0, 4.0, 0.3
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard", "U1", edges, t=t, U=U, mu=mu
+    )
+    mpo = ham.to_mpo(L=L, compress=False)
+
+    matrix = _mpo_to_dense_matrix(mpo, L)
+    assert np.max(np.abs(matrix - matrix.conj().T)) < 1e-10
 
     reference = _dense_jw_fermi_hubbard(L, edges, t=t, U=U, mu=mu)
     spec_mpo = np.sort(np.linalg.eigvalsh((matrix + matrix.conj().T) / 2).real)

@@ -1331,6 +1331,20 @@ def test_optimizers_namespace_exports():
     assert SMS is MpsStabOptimizer
 
 
+def test_clean_class_api_runner_aliases():
+    stream = [("h", 0), ("cnot", 0, 1), ("t", 0)]
+
+    result = MpsStabOptimizer.run_stream(stream, n_qubits=2, mode="direct")
+    alias = StabilizerMpsSimulator.simulate(stream, n_qubits=2, mode="direct")
+
+    assert isinstance(result, StabilizerMpsRunResult)
+    assert alias.mode == result.mode == "direct"
+    assert _fidelity(
+        alias.simulator.to_statevector(),
+        result.simulator.to_statevector(),
+    ) == pytest.approx(1.0, abs=1e-9)
+
+
 # --------------------------------------------------------------------------- #
 # Amplitude / probability / observable API
 # --------------------------------------------------------------------------- #
@@ -1758,6 +1772,29 @@ def test_iter_sample_bits_chunks_and_packed_output():
     ])
     assert unpacked.shape == (17, n)
     assert set(np.unique(unpacked)).issubset({0, 1})
+
+
+def test_bitstring_api_aliases_match_existing_methods():
+    sim = MpsStabOptimizer(3).apply([("h", 0), ("cnot", 0, 1), ("t", 2)])
+
+    np.testing.assert_array_equal(
+        sim.sample_bitstrings(16, seed=5, shuffle=False),
+        sim.sample_bits(16, seed=5, shuffle=False),
+    )
+    assert sim.bitstring_probability("010") == pytest.approx(
+        sim.probability_bits("010"),
+        abs=1e-12,
+    )
+    np.testing.assert_allclose(
+        sim.bitstring_probabilities(["000", "010", "111"]),
+        sim.probability_bits_many(["000", "010", "111"]),
+        atol=1e-12,
+    )
+    alias_chunks = list(sim.iter_sample_bitstrings(7, chunk_size=3, seed=9))
+    original_chunks = list(sim.iter_sample_bits(7, chunk_size=3, seed=9))
+    assert [chunk.shape for chunk in alias_chunks] == [(3, 3), (3, 3), (1, 3)]
+    for alias_chunk, original_chunk in zip(alias_chunks, original_chunks):
+        np.testing.assert_array_equal(alias_chunk, original_chunk)
 
 
 def test_sample_bits_shuffle_false_keeps_prefix_grouping():

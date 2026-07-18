@@ -74,12 +74,33 @@ def _u1u1_sector_indices(L, total_charge):
     return np.asarray(indices, dtype=int)
 
 
+def _u1_sector_indices(L, total_charge):
+    n_modes = 2 * L
+    indices = []
+    for basis in range(2**n_modes):
+        count = 0
+        for mode in range(n_modes):
+            count += (basis >> (n_modes - 1 - mode)) & 1
+        if count == int(total_charge):
+            indices.append(basis)
+    return np.asarray(indices, dtype=int)
+
+
 def _fixed_u1u1_sector_ground_energy(L, edges, total_charge, *, t=1.0, U=4.0, mu=0.3):
     ham = _dense_jw_fermi_hubbard(L, edges, t=t, U=U, mu=mu)
     sector = _u1u1_sector_indices(L, total_charge)
     sector_ham = ham[np.ix_(sector, sector)]
     sector_ham = (sector_ham + sector_ham.conj().T) / 2
     return float(np.linalg.eigvalsh(sector_ham)[0].real)
+
+
+def _fixed_u1_sector_ground_energy(L, edges, total_charge, *, t=1.0, U=4.0, mu=0.3):
+    ham = _dense_jw_fermi_hubbard(L, edges, t=t, U=U, mu=mu)
+    sector = _u1_sector_indices(L, total_charge)
+    sector_ham = ham[np.ix_(sector, sector)]
+    sector_ham = (sector_ham + sector_ham.conj().T) / 2
+    return float(np.linalg.eigvalsh(sector_ham)[0].real)
+
 
 
 def test_symdmrg2_delegates_dense_mpo_to_quimb_dmrg2():
@@ -3092,6 +3113,97 @@ def test_symdmrg2_spinless_fermi_hubbard_u1_matches_jw_ed():
     )
 
     assert energy == pytest.approx(e_ed, abs=1e-8)
+
+
+def test_symdmrg2_spinful_fermi_hubbard_total_u1_matches_jw_ed():
+    """SymDMRG2 should solve spinful Fermi-Hubbard with total U1 only."""
+    pytest.importorskip("symmray")
+    L = 4
+    edges = [(site, site + 1) for site in range(L - 1)]
+    t, U, mu = 1.0, 6.0, 0.0
+    state = SymMPS.for_model(
+        "fermi_hubbard",
+        L,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations([1] * L),
+        seed=7,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard", "U1", edges, t=t, U=U, mu=mu
+    )
+    mpo = ham.to_mpo(L=L, compress=True, cutoff=1e-12)
+
+    opt = _symdmrg2_solve(mpo, state, 16, sweeps=12)
+    _assert_symmetric_pipeline(mpo, state, opt, "U1")
+    gs = opt.fermionic_state()
+    _assert_block_sparse(_mps_tensors(gs), "U1", "fermionic_state()")
+
+    energy = float(np.real(opt.energy))
+    e_ed = _fixed_u1_sector_ground_energy(
+        L, edges, L, t=t, U=U, mu=mu
+    )
+    assert energy == pytest.approx(e_ed, abs=1e-6)
+
+    native_energy = pepsy.MpsEnergyOptimizer(
+        gs,
+        ham.terms,
+        energy_per_site=False,
+        normalized=True,
+        real=True,
+    ).energy().energy
+    assert float(np.real(native_energy)) == pytest.approx(energy, abs=1e-8)
+
+
+def test_mps_energy_fermionic_symhamiltonian_matches_mapped_mpo_after_dmrg():
+    """A DMRG-converted native MPS should measure mapped FH energy via the MPO path."""
+    pytest.importorskip("symmray")
+    Lx, Ly = 2, 2
+    L = Lx * Ly
+    mapper = OneDMap(Lx, Ly, mode="snake")
+    _, coo2idx = mapper.build()
+    coord_edges = list(qtn.edges_2d_square(Lx, Ly, cyclic=False))
+    chain_edges = sorted(
+        tuple(sorted((coo2idx[a], coo2idx[b])))
+        for a, b in coord_edges
+    )
+    t, U, mu = 1.0, 6.0, 0.0
+    ham_coord = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", coord_edges, t=t, U=U, mu=mu
+    )
+    ham_chain = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", chain_edges, t=t, U=U, mu=mu
+    )
+    mpo = ham_coord.to_mpo(mapper=mapper, compress=True, cutoff=1e-12)
+    init = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        L,
+        bond_dim=2,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)] * (L // 2)),
+        seed=7,
+        dtype="complex128",
+    )
+
+    opt = _symdmrg2_solve(mpo, init, 16, sweeps=10)
+    gs = opt.fermionic_state()
+    energy = float(np.real(opt.energy))
+    e_ham = pepsy.MpsEnergyOptimizer(
+        gs,
+        ham_chain,
+        energy_per_site=False,
+        normalized=True,
+        real=True,
+    ).energy().energy
+    e_mpo = pepsy.MpsEnergyOptimizer(
+        gs,
+        mpo,
+        energy_per_site=False,
+        normalized=True,
+        real=True,
+    ).energy().energy
+
+    assert float(np.real(e_ham)) == pytest.approx(energy, abs=1e-9)
+    assert float(np.real(e_ham)) == pytest.approx(float(np.real(e_mpo)), abs=1e-9)
 
 
 def _u1u1_ground_doublon_densities(L, edges, total_charge, *, t, U, mu):

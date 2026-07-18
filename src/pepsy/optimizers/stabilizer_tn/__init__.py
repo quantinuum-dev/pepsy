@@ -21,7 +21,21 @@ basis-updating), basis-aware mid-circuit reset / measure-reset, guarded physical
 cap events, and magic-state injection.
 """
 
-from .mps_stab_optimizer import MpsStabOptimizer
+from .mps_stab_optimizer import (
+    DeferredInjectionRecord,
+    DeferredInjectionReport,
+    DeferredProjectionRecord,
+    ImmediateInjectionReport,
+    ImmediateProjectionRecord,
+    MeasurementRecord,
+    MpsStabOptimizer,
+    NormEventRecord,
+    StabilizerMpsSettingsAdvice,
+    StabilizerMpsSimulator,
+    StabilizerMpsRunResult,
+    StreamAnalysisRecord,
+    run_stabilizer_mps_stream,
+)
 from .operators import pauli_combo_mpo, pauli_rotation_mpo, single_qubit_rotation_matrix
 from .stn_state import STNState
 
@@ -29,10 +43,22 @@ from .stn_state import STNState
 StabilizerMps = MpsStabOptimizer
 
 __all__ = [
-    "STNState",
+    "DeferredInjectionRecord",
+    "DeferredInjectionReport",
+    "DeferredProjectionRecord",
+    "ImmediateInjectionReport",
+    "ImmediateProjectionRecord",
+    "MeasurementRecord",
     "MpsStabOptimizer",
+    "NormEventRecord",
+    "STNState",
+    "StabilizerMpsSettingsAdvice",
     "StabilizerMps",
+    "StabilizerMpsSimulator",
+    "StabilizerMpsRunResult",
+    "StreamAnalysisRecord",
     "pauli_combo_mpo",
     "pauli_rotation_mpo",
+    "run_stabilizer_mps_stream",
     "single_qubit_rotation_matrix",
 ]

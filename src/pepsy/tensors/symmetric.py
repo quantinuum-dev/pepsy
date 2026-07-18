@@ -11,7 +11,13 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-__all__ = ["SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS"]
+__all__ = [
+    "SpinfulFermion",
+    "SymGateStream",
+    "SymHamiltonian",
+    "SymMPS",
+    "SymPEPS",
+]
 __all__ += [
     "default_physical_sectors",
     "draw_symmray_blocks",
@@ -5104,14 +5110,14 @@ def _fh_u1u1_dense_local_ops(dtype):
     return _fh_spinful_dense_local_ops("U1U1", dtype)
 
 
-def _fh_u1u1_jw_local_ops(dtype):
+def _fh_spinful_jw_local_ops(symmetry, dtype):
     """Return ITensor/JW one-site spinful FH operator matrices.
 
     Symmray's fermionic local dense helper returns raw tensor data whose signs
     are completed by fermionic contraction. A two-site bosonic MPO needs the
     explicit one-site Jordan-Wigner matrices instead.
     """
-    ops = _fh_spinful_dense_local_ops("U1U1", dtype)
+    ops = _fh_spinful_dense_local_ops(symmetry, dtype)
     dtype = np.dtype(dtype)
 
     annihilate_u = np.zeros((4, 4), dtype=dtype)
@@ -5134,6 +5140,11 @@ def _fh_u1u1_jw_local_ops(dtype):
         }
     )
     return ops
+
+
+def _fh_u1u1_jw_local_ops(dtype):
+    """Return U1U1 ITensor/JW one-site spinful FH operator matrices."""
+    return _fh_spinful_jw_local_ops("U1U1", dtype)
 
 
 def _fh_spinful_dense_local_ops(symmetry, dtype):
@@ -5653,14 +5664,11 @@ class SymHamiltonian:
                 dtype=dtype,
             )
 
-        if self.model == "fermi_hubbard":
-            raise NotImplementedError(
-                "SymHamiltonian.to_mpo supports spinful Fermi-Hubbard through "
-                "model='fermi_hubbard_u1u1' with U1U1 symmetry. The total-U1 "
-                "spinful Fermi-Hubbard MPO path is not implemented yet."
-            )
-
-        if self.model != "fermi_hubbard_u1u1" or self.symmetry != "U1U1":
+        is_spinful_fh_mpo = (
+            (self.model == "fermi_hubbard" and self.symmetry == "U1")
+            or (self.model == "fermi_hubbard_u1u1" and self.symmetry == "U1U1")
+        )
+        if not is_spinful_fh_mpo:
             return _generic_symhamiltonian_to_mpo(
                 self,
                 L,
@@ -5698,9 +5706,9 @@ class SymHamiltonian:
             raise ValueError(f"L={L} does not match MPO mapping length {mapped_L}.")
 
         dtype = _dtype_from_hamiltonian_terms(self.terms) if dtype is None else np.dtype(dtype)
-        ops = _fh_u1u1_jw_local_ops(dtype)
+        ops = _fh_spinful_jw_local_ops(self.symmetry, dtype)
         phys_map = list(ops["index_map"])
-        zero = (0, 0)
+        zero = _zero_like_charge(next(iter(phys_map)))
         start = ("start",)
         done = ("done",)
 
@@ -5722,9 +5730,15 @@ class SymHamiltonian:
                 transitions[site].append((start, done, onsite))
 
         parity = ops["parity"]
+        if self.symmetry == "U1U1":
+            create_u_charge = (0, 1)
+            create_d_charge = (1, 0)
+        else:
+            create_u_charge = 1
+            create_d_charge = 1
         mode_terms = (
-            (t_u, ops["create_u"], ops["annihilate_u"], (0, 1), "u"),
-            (t_d, ops["create_d"], ops["annihilate_d"], (1, 0), "d"),
+            (t_u, ops["create_u"], ops["annihilate_u"], create_u_charge, "u"),
+            (t_d, ops["create_d"], ops["annihilate_d"], create_d_charge, "d"),
         )
         number = ops["number_u"] + ops["number_d"]
         for edge_pos, (raw_edge, edge) in enumerate(zip(raw_edges, edges)):
@@ -6562,6 +6576,292 @@ class _SymState:
             contraction_opt=contraction_opt,
             **params,
         ) / self.num_sites
+
+
+@dataclass
+class SpinfulFermion:
+    """Native spinful-fermion observables and gates for ``U1`` or ``U1U1``.
+
+    The helper keeps the symmetry convention, local fermionic operators, and
+    optional hopping/interaction parameters together.  It is intended for direct
+    Symmray-backed fermionic MPS or PEPS workflows; it does not introduce a
+    qubit or Jordan-Wigner circuit representation. ``hamiltonian(...)`` is a
+    convenience only; the object is equally useful for measurements and gates.
+
+    ``strang_gate_stream`` uses a deterministic edge colouring and a
+    forward/reverse half-step sequence.  Consequently its hopping layers are
+    vertex-disjoint and the complete interaction-plus-hopping product formula
+    is second order even when hopping terms on neighbouring edges do not
+    commute.
+    """
+
+    symmetry: str = "U1U1"
+    t: object = 1.0
+    U: object = 8.0
+    dtype: object = "complex128"
+    to_backend: object = None
+    _dense_ops: dict = field(default_factory=dict, init=False, repr=False)
+    _observable_cache: dict = field(default_factory=dict, init=False, repr=False)
+    _gate_cache: dict = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self):
+        self.symmetry = str(self.symmetry)
+        if self.symmetry not in {"U1", "U1U1"}:
+            raise ValueError("symmetry must be 'U1' or 'U1U1'.")
+        self.dtype = np.dtype(self.dtype)
+
+    @property
+    def model(self):
+        """The matching :class:`SymHamiltonian` model name."""
+        return "fermi_hubbard" if self.symmetry == "U1" else "fermi_hubbard_u1u1"
+
+    @property
+    def physical_sectors(self):
+        """Return the four-state local spinful-fermion charge sectors."""
+        return default_physical_sectors(model=self.model)
+
+    @property
+    def zero_charge(self):
+        """Return the neutral local operator charge."""
+        return 0 if self.symmetry == "U1" else (0, 0)
+
+    @property
+    def pair_charge(self):
+        """Return the charge of a local pair-creation operator."""
+        return 2 if self.symmetry == "U1" else (1, 1)
+
+    @property
+    def pair_annihilation_charge(self):
+        """Return the charge of a local pair-annihilation operator."""
+        return _neg_charge(self.pair_charge)
+
+    def half_filled_occupations(self, L):
+        """Return a half-filled product-state charge pattern of length ``L``."""
+        if not isinstance(L, Integral) or int(L) < 1:
+            raise ValueError("L must be a positive integer.")
+        L = int(L)
+        if self.symmetry == "U1":
+            return (1,) * L
+        return tuple((1, 0) if site % 2 == 0 else (0, 1) for site in range(L))
+
+    def total_charge(self, occupations):
+        """Return the charge sum for an occupation/charge sequence."""
+        occupations = tuple(occupations)
+        if not occupations:
+            return self.zero_charge
+        if self.symmetry == "U1":
+            return sum(int(charge) for charge in occupations)
+        return tuple(
+            sum(int(charge[axis]) for charge in occupations)
+            for axis in range(2)
+        )
+
+    def half_filled_site_charge(self, L):
+        """Return the site-charge callable for ``half_filled_occupations(L)``."""
+        return site_charge_from_occupations(self.half_filled_occupations(L))
+
+    def _local_ops(self):
+        if not self._dense_ops:
+            ops = _fh_spinful_dense_local_ops(self.symmetry, self.dtype)
+            ops["charge"] = ops["number_u"] + ops["number_d"]
+            ops["sz"] = 0.5 * (ops["number_u"] - ops["number_d"])
+            ops["pair_create"] = ops["create_u"] @ ops["create_d"]
+            ops["pair_annihilate"] = ops["annihilate_d"] @ ops["annihilate_u"]
+            self._dense_ops = ops
+        return self._dense_ops
+
+    @staticmethod
+    def _operator_name(name):
+        aliases = {
+            "n_up": "number_u",
+            "number_up": "number_u",
+            "n_down": "number_d",
+            "number_down": "number_d",
+            "doublon": "double",
+            "pair_annihilation": "pair_annihilate",
+            "spin_z": "sz",
+        }
+        return aliases.get(str(name), str(name))
+
+    def dense_operator(self, name):
+        """Return a dense one-site operator in Symmray's spinful basis order.
+
+        Supported names include ``number_up``, ``number_down``, ``doublon``,
+        ``charge``, ``sz``, ``pair_create``, and ``pair_annihilate``.  The
+        lower-level names ``number_u``, ``number_d``, and ``double`` are also
+        accepted.
+        """
+        name = self._operator_name(name)
+        try:
+            return self._local_ops()[name]
+        except KeyError as exc:
+            allowed = ", ".join(sorted(self._local_ops()))
+            raise ValueError(
+                "Unknown spinful Fermi-Hubbard operator "
+                f"{name!r}; expected one of {allowed}."
+            ) from exc
+
+    def operator_charge(self, name):
+        """Return the Abelian charge carried by ``dense_operator(name)``."""
+        name = self._operator_name(name)
+        if name in {"create_u", "annihilate_u", "create_d", "annihilate_d"}:
+            if self.symmetry == "U1":
+                charge = 1
+            elif name.endswith("_u"):
+                charge = (0, 1)
+            else:
+                charge = (1, 0)
+            return charge if name.startswith("create") else _neg_charge(charge)
+        if name == "pair_create":
+            return self.pair_charge
+        if name == "pair_annihilate":
+            return self.pair_annihilation_charge
+        return self.zero_charge
+
+    def observable(self, name):
+        """Return a cached one-site fermionic Symmray operator for ``name``."""
+        name = self._operator_name(name)
+        if name not in self._observable_cache:
+            operator = symm_operator_from_dense(
+                self.dense_operator(name),
+                self.physical_sectors,
+                symmetry=self.symmetry,
+                charge=self.operator_charge(name),
+                fermionic=True,
+                sites=1,
+            )
+            self._observable_cache[name] = _apply_to_array_blocks(operator, self.to_backend)
+        return self._observable_cache[name]
+
+    def _cached_gate(self, key, build):
+        key = tuple(repr(value) for value in key)
+        if key not in self._gate_cache:
+            self._gate_cache[key] = build()
+        return self._gate_cache[key]
+
+    def interaction_gate(self, dt, *, site=None, imaginary=False):
+        """Return a one-site ``exp(-i dt U n_up n_down)`` gate.
+
+        With a site-dependent ``U`` mapping or callable, pass ``site`` so the
+        corresponding local value can be selected.
+        """
+        U = self.U if site is None else _node_parameter(self.U, site)
+
+        def build():
+            scale = -dt if imaginary else -1j * dt
+            doublon = self.dense_operator("double")
+            occupancies = np.real(np.diag(doublon))
+            dense = np.diag(np.exp(scale * U * occupancies)).astype(self.dtype)
+            gate = symm_operator_from_dense(
+                dense,
+                self.physical_sectors,
+                symmetry=self.symmetry,
+                charge=self.zero_charge,
+                fermionic=True,
+                sites=1,
+            )
+            return _apply_to_array_blocks(gate, self.to_backend)
+
+        return self._cached_gate(("interaction", dt, site, U, imaginary), build)
+
+    def hopping_gate(self, dt, *, t=None, peierls_angle=0.0, imaginary=False):
+        """Return a two-site native fermionic hopping gate with Peierls phase."""
+        t = self.t if t is None else t
+
+        def build():
+            term = _fh_spinful_peierls_hopping_array(
+                self.symmetry,
+                t=t,
+                peierls_angle=peierls_angle,
+                dtype=self.dtype,
+            )
+            gate = _gate_from_term(term, dt, imaginary=imaginary)
+            return _apply_to_array_blocks(gate, self.to_backend)
+
+        return self._cached_gate(("hopping", dt, t, peierls_angle, imaginary), build)
+
+    @staticmethod
+    def edge_coloring_layers(edges):
+        """Partition edges into deterministic vertex-disjoint layers."""
+        edges = _as_edges(edges)
+        layers = []
+        occupied_sites = []
+        for edge in edges:
+            if edge[0] == edge[1]:
+                raise ValueError(
+                    "A hopping edge must connect distinct sites; "
+                    f"got {edge!r}."
+                )
+            endpoints = frozenset(edge)
+            for layer, occupied in zip(layers, occupied_sites):
+                if endpoints.isdisjoint(occupied):
+                    layer.append(edge)
+                    occupied.update(endpoints)
+                    break
+            else:
+                layers.append([edge])
+                occupied_sites.append(set(endpoints))
+        return tuple(tuple(layer) for layer in layers)
+
+    def strang_gate_stream(
+        self,
+        edges,
+        dt,
+        *,
+        sites=None,
+        peierls_angle=0.0,
+        imaginary=False,
+    ):
+        """Return an edge-coloured second-order native fermionic gate stream."""
+        edges = _as_edges(edges)
+        sites = _sites_from_edges(edges, sites)
+        half_dt = dt / 2
+        layers = self.edge_coloring_layers(edges)
+        entries = [
+            (self.interaction_gate(half_dt, site=site, imaginary=imaginary), site)
+            for site in sites
+        ]
+        for layer in layers:
+            entries.extend(
+                (
+                    self.hopping_gate(
+                        half_dt,
+                        t=_edge_parameter(self.t, left, right),
+                        peierls_angle=_edge_angle_parameter(peierls_angle, left, right),
+                        imaginary=imaginary,
+                    ),
+                    (left, right),
+                )
+                for left, right in layer
+            )
+        for layer in reversed(layers):
+            entries.extend(
+                (
+                    self.hopping_gate(
+                        half_dt,
+                        t=_edge_parameter(self.t, left, right),
+                        peierls_angle=_edge_angle_parameter(peierls_angle, left, right),
+                        imaginary=imaginary,
+                    ),
+                    (left, right),
+                )
+                for left, right in layer
+            )
+        entries.extend(
+            (self.interaction_gate(half_dt, site=site, imaginary=imaginary), site)
+            for site in sites
+        )
+        return SymGateStream(entries, dt=dt, imaginary=imaginary, order=2)
+
+    def hamiltonian(self, edges, **params):
+        """Build a matching native spinful :class:`SymHamiltonian`."""
+        params = {"t": self.t, "U": self.U, **params}
+        return SymHamiltonian.from_edges(self.model, self.symmetry, edges, **params)
+
+
+# Kept for callers that adopted the initial public name before it was
+# generalized to the operator/gate-focused ``SpinfulFermion`` helper.
+SpinfulFermionHubbard = SpinfulFermion
 
 
 class SymMPS(_SymState):

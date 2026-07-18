@@ -3838,6 +3838,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             else self.losses[-1]
         )
         true_cumulative_infidelity = None
+        norm_cumulative_infidelity = None
         last_where = self._current_orthog(p)
         last_normalized_step = None
 
@@ -3912,7 +3913,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 last_where = (xmin, xmax)
                 compressed = True
                 if track_norm_infidelity:
-                    self._append_norm_infidelity_sample(
+                    norm_cumulative_infidelity = self._append_norm_infidelity_sample(
                         self._canonical_span_norm(p, (xmin, xmax)),
                         target_norm,
                         step=idx,
@@ -4009,7 +4010,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 last_where = (xmin, xmax)
                 compressed = True
                 if track_norm_infidelity:
-                    self._append_norm_infidelity_sample(
+                    norm_cumulative_infidelity = self._append_norm_infidelity_sample(
                         self._canonical_span_norm(p, (xmin, xmax)),
                         target_norm,
                         step=idx,
@@ -4050,6 +4051,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     postfix["mpo"] = submpo_count
                 if track_infidelity and true_cumulative_infidelity is not None:
                     postfix["Icum"] = self._format_progress_infidelity(true_cumulative_infidelity)
+                elif track_norm_infidelity and norm_cumulative_infidelity is not None:
+                    postfix["infidelity"] = self._format_progress_infidelity(norm_cumulative_infidelity)
                 elif norm_proxy is not None:
                     postfix["~F"] = self._format_progress_scalar(norm_proxy)
                 pbar.set_postfix(postfix)

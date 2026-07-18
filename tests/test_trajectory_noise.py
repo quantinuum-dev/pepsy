@@ -52,6 +52,147 @@ def test_random_unitary_channel_samples_directly_in_a_gate_stream():
         )
 
 
+def test_native_stochastic_pauli_entries_are_gate_stream_events():
+    stream = [
+        ("h", 0),
+        ("x_error", 1.0, 0),
+        ("pauli_channel1", {"z": 1.0}, 0),
+    ]
+
+    sample = pepsy.sample_trajectory_stream(stream, seed=5)
+
+    assert sample.records == (
+        pepsy.TrajectoryRecord(1, (0,), "X", 1.0),
+        pepsy.TrajectoryRecord(2, (0,), "Z", 1.0),
+    )
+    assert sample.gate_stream[0] == ("h", 0)
+    np.testing.assert_allclose(sample.gate_stream[1][0], _X)
+    np.testing.assert_allclose(sample.gate_stream[2][0], np.diag([1.0, -1.0]))
+
+
+def test_native_stochastic_entries_use_trajectory_runner_not_external_macro():
+    stream = [("x_error", 0.1, 0)]
+
+    with pytest.raises(ValueError, match="Stream-local stochastic entries"):
+        pepsy.sample_noisy_gate_stream(stream, pepsy.PauliErrorModel())
+
+    with pytest.raises(ValueError, match="Stream-local stochastic entries"):
+        pepsy.run_noisy_shots(
+            lambda: pepsy.MpsStabOptimizer(1),
+            stream,
+            pepsy.PauliErrorModel(),
+            shots=1,
+        )
+
+
+def test_leakage_entries_use_trajectory_runner_not_external_macro():
+    stream = [("leakage", 0.1, 0)]
+
+    with pytest.raises(ValueError, match="Stateful leakage entries"):
+        pepsy.sample_noisy_gate_stream(stream, pepsy.PauliErrorModel())
+
+    with pytest.raises(ValueError, match="Stateful leakage entries"):
+        pepsy.sample_trajectory_stream(stream)
+
+
+@pytest.mark.parametrize("kind", ("mps", "stn"))
+def test_leakage_suppresses_gates_and_measure_leaked_reports_two(kind):
+    stream = [(_X, 0), ("leakage", 1.0, 0), (_X, 0), ("measure_leaked", 0)]
+
+    result = pepsy.run_trajectory_shots(
+        _factory(kind), stream, shots=1, seed=5, run_kwargs=_run_kwargs(kind)
+    )
+
+    records = result.leakage_records[0]
+    assert records[0] == pepsy.LeakageRecord(
+        event_index=1,
+        kind="leakage",
+        site=0,
+        probability=1.0,
+        occurred=True,
+        initially_leaked=False,
+        finally_leaked=True,
+        branch="leaked",
+    )
+    assert records[1].kind == "measure_leaked"
+    assert records[1].measurement == 2
+    assert records[1].finally_leaked is True
+    np.testing.assert_allclose(_statevector(result.optimizers[0]), [1.0, 0.0], atol=1e-8)
+
+
+@pytest.mark.parametrize("kind", ("mps", "stn"))
+def test_reset_clears_leakage_before_later_gates(kind):
+    stream = [
+        ("leakage", 1.0, 0),
+        ("reset", 0),
+        (_X, 0),
+        ("measure_leaked", 0),
+    ]
+
+    result = pepsy.run_trajectory_shots(
+        _factory(kind), stream, shots=1, seed=5, run_kwargs=_run_kwargs(kind)
+    )
+
+    assert result.leakage_records[0][0].finally_leaked is True
+    assert result.leakage_records[0][1].measurement == 1
+    assert result.leakage_records[0][1].finally_leaked is False
+    np.testing.assert_allclose(_statevector(result.optimizers[0]), [0.0, 1.0], atol=1e-8)
+
+
+@pytest.mark.parametrize("kind", ("mps", "stn"))
+def test_leakage_return_unleaks_to_a_computational_branch(kind):
+    stream = [("leakage", 1.0, 0), ("leakage_return", 1.0, 0), ("measure_leaked", 0)]
+
+    result = pepsy.run_trajectory_shots(
+        _factory(kind), stream, shots=1, seed=9, run_kwargs=_run_kwargs(kind)
+    )
+
+    records = result.leakage_records[0]
+    assert records[1].kind == "leakage_return"
+    assert records[1].occurred is True
+    assert records[1].initially_leaked is True
+    assert records[1].finally_leaked is False
+    assert records[1].branch in {"return_0", "return_1"}
+    assert records[2].kind == "measure_leaked"
+    assert records[2].measurement in {0, 1}
+
+
+def test_leak2depolar_replaces_later_leakage_with_pauli_approximation():
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [("leak2depolar", True), ("leakage", 1.0, 0), ("measure_leaked", 0)],
+        shots=1,
+        seed=4,
+    )
+
+    records = result.leakage_records[0]
+    assert records[0].kind == "leak2depolar"
+    assert records[1].kind == "leakage_depolarize"
+    assert records[1].occurred is True
+    assert records[1].finally_leaked is False
+    assert records[2].measurement in {0, 1}
+
+
+def test_stateful_leakage_auto_strategy_stays_independent_for_now():
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [("leakage", 1.0, 0)],
+        shots=3,
+        seed=4,
+        strategy="auto",
+    )
+
+    assert isinstance(result, pepsy.TrajectoryShotResult)
+    with pytest.raises(NotImplementedError, match="stateful leakage"):
+        pepsy.run_trajectory_shots(
+            lambda: pepsy.MpsStabOptimizer(1, chi=4),
+            [("leakage", 1.0, 0)],
+            shots=3,
+            seed=4,
+            strategy="coalesced",
+        )
+
+
 def test_trajectory_channel_validates_probabilities_dimensions_and_kraus_sum():
     with pytest.raises(ValueError, match="sum to one"):
         pepsy.TrajectoryChannel.mixture((("I", 0.8, _I), ("X", 0.3, _X)))
@@ -62,6 +203,22 @@ def test_trajectory_channel_validates_probabilities_dimensions_and_kraus_sum():
     channel = pepsy.TrajectoryChannel.depolarizing(0.1)
     with pytest.raises(ValueError, match="support size"):
         pepsy.TrajectoryEvent(channel, (0, 1))
+
+
+@pytest.mark.parametrize("kind", ("mps", "stn"))
+def test_native_amplitude_damping_entry_replays_as_kraus_channel(kind):
+    stream = [(_X, 0), ("amplitude_damping", 1.0, 0), (_X, 0)]
+
+    result = pepsy.run_trajectory_shots(
+        _factory(kind), stream, shots=2, seed=4, run_kwargs=_run_kwargs(kind)
+    )
+
+    assert all(
+        records == (pepsy.TrajectoryRecord(1, (0,), "jump", 1.0),)
+        for records in result.records
+    )
+    for optimizer in result.optimizers:
+        np.testing.assert_allclose(_statevector(optimizer), [0.0, 1.0], atol=1e-8)
 
 
 @pytest.mark.parametrize("kind", ("mps", "stn"))
@@ -87,6 +244,43 @@ def test_amplitude_damping_trajectory_replays_and_normalizes_on_both_optimizers(
     for optimizer in result.optimizers:
         np.testing.assert_allclose(_statevector(optimizer), [0.0, 1.0], atol=1e-8)
         assert abs(optimizer.p.norm()) == pytest.approx(1.0, abs=1e-8)
+
+
+def test_coalesced_native_pauli_channel2_uses_stream_local_noise():
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(2, chi=4),
+        [("pauli_channel2", {"XI": 1.0}, 0, 1)],
+        shots=16,
+        seed=11,
+    )
+
+    assert result.shots == 16
+    assert result.branches == 1
+    assert result.leaves[0].records == (
+        pepsy.TrajectoryRecord(0, (0, 1), "XI", 1.0),
+    )
+    expected = np.zeros(4, dtype=complex)
+    expected[2] = 1.0
+    np.testing.assert_allclose(_statevector(result.leaves[0].optimizer), expected)
+
+
+def test_trajectory_runner_strategy_setting_can_select_coalescing():
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [("x_error", 1.0, 0)],
+        shots=12,
+        seed=12,
+        strategy="coalesced",
+        max_branches=4,
+    )
+
+    assert isinstance(result, pepsy.CoalescedTrajectoryResult)
+    assert result.shots == 12
+    assert result.branches == 1
+    assert result.leaves[0].records == (
+        pepsy.TrajectoryRecord(0, (0,), "X", 1.0),
+    )
+    np.testing.assert_allclose(_statevector(result.leaves[0].optimizer), [0.0, 1.0])
 
 
 @pytest.mark.parametrize("kind", ("mps", "stn"))

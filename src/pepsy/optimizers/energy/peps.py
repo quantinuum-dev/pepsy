@@ -1053,6 +1053,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     def _terms_from_hamiltonian(cls, hamiltonian):
         if cls._is_mpo_hamiltonian(hamiltonian):
             return hamiltonian
+        if cls._is_fermionic_sym_hamiltonian(hamiltonian):
+            return hamiltonian
         return super()._terms_from_hamiltonian(hamiltonian)
 
     @staticmethod
@@ -1093,6 +1095,33 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             edge: cls._convert_term_array(term, converter)
             for edge, term in dict(terms).items()
         }
+
+    @classmethod
+    def _is_fermionic_sym_hamiltonian(cls, hamiltonian):
+        terms = getattr(hamiltonian, "terms", None)
+        to_mpo = getattr(hamiltonian, "to_mpo", None)
+        return (
+            terms is not None
+            and callable(to_mpo)
+            and cls._terms_use_fermionic_symmray(terms)
+        )
+
+    @classmethod
+    def _fermionic_hamiltonian_mpo_for_state(cls, hamiltonian, state):
+        try:
+            return hamiltonian.to_mpo(
+                L=cls._num_sites(state),
+                compress=True,
+                cutoff=1e-12,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Fermionic SymHamiltonian energy on an MPS is evaluated through "
+                "the string-aware MPO path. If the Hamiltonian edges use lattice "
+                "coordinates, build the MPO explicitly with "
+                "`hamiltonian.to_mpo(mapper=...)` and pass that MPO to "
+                "MpsEnergyOptimizer."
+            ) from exc
 
     @classmethod
     def _iter_tn_data(cls, state):
@@ -1181,6 +1210,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     ):
         state = cls._as_mps_state(state)
         terms = cls._terms_from_hamiltonian(terms)
+        if cls._is_fermionic_sym_hamiltonian(terms):
+            terms = cls._fermionic_hamiltonian_mpo_for_state(terms, state)
         if cls._is_mpo_hamiltonian(terms):
             value = cls._mpo_expectation(
                 state,
@@ -1289,6 +1320,8 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         self._prepare_autodiff_backend(autodiff_backend)
         incoming_constants = dict(loss_constants or {})
         terms = incoming_constants.pop("terms", self.terms)
+        if self._is_fermionic_sym_hamiltonian(terms):
+            terms = self._fermionic_hamiltonian_mpo_for_state(terms, self.state)
         if self._is_mpo_hamiltonian(terms):
             constants = {"terms": terms}
             constants.update(incoming_constants)

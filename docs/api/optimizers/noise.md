@@ -1,10 +1,80 @@
 # `pepsy.optimizers.noise`
 
-`PauliErrorModel` samples independent **physical Pauli trajectories**, not a
-density matrix. Each non-identity X/Y/Z fault is inserted into a concrete gate
-stream after every target of an ordinary gate. The resulting stream can be
-replayed by either `MpsOptimizer` or `MpsStabOptimizer`; for STN, every sampled
-fault is a Clifford that is absorbed by the Stim tableau.
+Pepsy's native noise design is **stream-local**: put stochastic entries directly
+where the hardware schedule says the channel acts, then choose trajectory
+sampling settings (`shots`, `seed`, independent/coalesced replay, and
+`run_kwargs`) at the runner.
+
+```python
+stream = [
+    ("h", 0),
+    ("x_error", 1e-4, 0),
+    ("cnot", 0, 1),
+    ("depolarize2", 1e-3, 0, 1),
+    ("t", 0),
+    ("pauli_channel1", {"z": 2e-4}, 0),
+]
+
+result = pepsy.run_coalesced_trajectory_shots(
+    lambda: pepsy.MpsStabOptimizer(2, chi=64),
+    stream,
+    shots=10_000,
+    seed=7,
+)
+```
+
+Equivalently, select the sampling strategy on the trajectory runner:
+
+```python
+result = pepsy.run_trajectory_shots(
+    lambda: pepsy.MpsStabOptimizer(2, chi=64),
+    stream,
+    shots=10_000,
+    seed=7,
+    strategy="coalesced",   # or "independent" / "auto"
+    max_branches=256,
+)
+```
+
+Supported first-cut stochastic entries are:
+
+- `("x_error", p, q)`, `("y_error", p, q)`, `("z_error", p, q)`
+- `("depolarize1", p, q)`, `("depolarize2", p, q0, q1)`
+- `("pauli_channel1", probs, q)`, where `probs` is `(p_x, p_y, p_z)` or a mapping
+- `("pauli_channel2", probs, q0, q1)`, using Stim's 15 non-identity two-qubit Pauli labels
+- `("amplitude_damping", gamma, q)`, sampled with the state-dependent trajectory runner
+
+Stateful leakage entries are also Pepsy-native trajectory events:
+
+- `("leakage", p, q)` or `("leak", p, q)` marks `q` leaked with probability `p`
+- `("leakage_return", p, q)`, `("seepage", p, q)`, or `("unleak", p, q)`
+  returns an already leaked qubit to a random computational-basis branch with
+  probability `p`
+- `("measure_leaked", q)` records a ternary PECOS/Selene-style result:
+  `0` or `1` for a normal computational-basis measurement, and `2` when the
+  trajectory state knows the qubit is leaked
+- `("leak2depolar", enabled)` makes later `("leakage", p, q)` events use a
+  full one-qubit depolarizing replacement instead of marking leakage
+- `("leakage_depolarize", p, q)` applies that depolarizing replacement for a
+  single event regardless of the current `leak2depolar` mode
+
+Leakage state is carried per shot outside the qubit MPS. While a qubit is
+leaked, ordinary gates touching it are suppressed. `reset` and `measure_reset`
+clear the leakage flag; `measure_reset` first records the leaked-qubit
+measurement as bit `1`. The sampled diagnostics live in
+`TrajectoryShotResult.leakage_records` as `LeakageRecord` objects. Because this
+state changes which later gates are replayed, leakage entries currently use
+independent trajectories; `run_trajectory_shots(..., strategy="auto")` stays
+independent, and explicit `strategy="coalesced"` raises for leakage streams.
+
+`PauliErrorModel` remains a convenience macro for clean deterministic streams.
+It samples independent **physical Pauli trajectories**, not a density matrix.
+Each non-identity X/Y/Z fault is inserted into a concrete gate stream after every
+target of an ordinary gate. The resulting stream can be replayed by either
+`MpsOptimizer` or `MpsStabOptimizer`; for STN, every sampled fault is a Clifford
+that is absorbed by the Stim tableau. Do not mix this macro with stream-local
+stochastic entries; use `run_trajectory_shots(...)` or
+`run_coalesced_trajectory_shots(...)` when the stream already contains noise.
 
 ```python
 import pepsy
@@ -172,9 +242,10 @@ usual options through `run_kwargs`.
 For `MpsStabOptimizer(track_infidelity=True)`, a selected Kraus outcome is a
 normalized trajectory boundary, just like a measurement/reset: its Born weight
 is retained in the trajectory record but is not treated as compression loss.
-`sim.norm_diagnostics()["total_norm_proxy"]` is the square root of the product
-of all completed/current segment survival proxies, so it remains meaningful
-after state renormalization.
+`sim.norm_diagnostics()["norm"]` is the square root of the product of all
+completed/current segment survivals, so it remains meaningful after state
+renormalization. The older `total_norm_proxy` key remains as a compatibility
+alias.
 
 ## Reading a Stim circuit
 

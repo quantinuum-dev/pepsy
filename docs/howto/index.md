@@ -8,4 +8,5 @@ Task-oriented references for common operational questions.
 choose_parameters
 solver_tuning
 troubleshooting
+stabilizer_tn_magic
 ```

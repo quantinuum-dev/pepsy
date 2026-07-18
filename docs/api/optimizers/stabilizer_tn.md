@@ -10,7 +10,11 @@ measurements update `|nu>`.
 `StabilizerMpsSimulator` is the descriptive public name for the simulator, with
 `MpsStabOptimizer` kept as the long-standing compatibility alias. Both are
 available at top level as `pepsy.StabilizerMpsSimulator` and
-`pepsy.MpsStabOptimizer` (state container: `pepsy.STNState`). Supported
+`pepsy.MpsStabOptimizer` (state container: `pepsy.STNState`). For new code,
+prefer the descriptive class name and the explicit bitstring helpers
+(`sample_bitstrings`, `bitstring_probability`, and
+`bitstring_probabilities`); the shorter historical names remain supported.
+Supported
 gate-stream entries include Clifford gates,
 non-Clifford Pauli rotations, `("t", q)` / `("tdg", q)`, explicit `(matrix,
 where)` gates, `("submpo", mpo, where)` events, `("measure", pauli, where[,
@@ -47,10 +51,12 @@ advisory only: `apply()` continues to use direct STN execution unless the caller
 explicitly selects an injection constructor.
 
 For a small correctness or smoke run, use the explicit validation runner:
-`run_stabilizer_mps_stream(gates, n_qubits=..., mode="direct" | "immediate" |
-"deferred" | "recommended", ...)` returns a typed `StabilizerMpsRunResult`.
-The default `mode` is `direct`; `mode="recommended"` is an explicit opt-in to
-the mode selected by `recommend_settings`. The result records the simulator,
+`StabilizerMpsSimulator.run_stream(gates, n_qubits=..., mode="direct" |
+"immediate" | "deferred" | "recommended", ...)` returns a typed
+`StabilizerMpsRunResult`. `StabilizerMpsSimulator.simulate(...)` is an alias,
+and the historical module-level `run_stabilizer_mps_stream(...)` remains
+available. The default `mode` is `direct`; `mode="recommended"` is an explicit
+opt-in to the mode selected by `recommend_settings`. The result records the simulator,
 actual mode, settings used, replay/projection timing, final and peak
 coefficient-MPS bond, norm diagnostics, measurements, projection events,
 injection report, and remaining queue length. On a `from_stim` simulator,
@@ -169,7 +175,8 @@ records such as `NormEventRecord`, `ImmediateProjectionRecord`,
 
 ## Scalable sampling
 
-- `sample_bits(shots, *, seed=None, order=None, shuffle=True, packed=False)` —
+- `sample_bitstrings(shots, *, seed=None, order=None, shuffle=True,
+  packed=False)` (`sample_bits` compatibility alias) —
   computational-basis bitstrings by **perfect (tree) sampling**: shots sharing a
   measured prefix share the collapsed state, so the collapse work is done once
   per distinct prefix, not per shot (a large saving for structured/low-rank
@@ -180,16 +187,17 @@ records such as `NormEventRecord`, `ImmediateProjectionRecord`,
   also accepted. Set `shuffle=False` to keep prefix-grouped rows and skip the
   final row permutation. Set `packed=True` to return `np.packbits` output with
   `ceil(n / 8)` byte columns.
-- `iter_sample_bits(shots, *, chunk_size, seed=None, order=None, shuffle=True,
-  packed=False)` — chunked sample generation with a shared RNG across chunks,
-  for large shot counts where materializing one full `(shots, n)` array is
-  inconvenient.
-- `probability_bits(bits, *, order=None)` — `|<bits|psi>|**2` as a product of
-  conditional Born probabilities.
-- `probability_bits_many(bitstrings, *, order=None)` — batched computational
-  bitstring probabilities using the same prefix-sharing readout tree as
-  `sample_bits`, so duplicate or prefix-clustered bitstrings avoid independent
-  full readout passes.
+- `iter_sample_bitstrings(shots, *, chunk_size, seed=None, order=None,
+  shuffle=True, packed=False)` (`iter_sample_bits` compatibility alias) —
+  chunked sample generation with a shared RNG across chunks, for large shot
+  counts where materializing one full `(shots, n)` array is inconvenient.
+- `bitstring_probability(bits, *, order=None)` (`probability_bits`
+  compatibility alias) — `|<bits|psi>|**2` as a product of conditional Born
+  probabilities.
+- `bitstring_probabilities(bitstrings, *, order=None)` (`probability_bits_many`
+  compatibility alias) — batched computational bitstring probabilities using
+  the same prefix-sharing readout tree as bitstring sampling, so duplicate or
+  prefix-clustered bitstrings avoid independent full readout passes.
 
 ## Correctness and failure semantics
 

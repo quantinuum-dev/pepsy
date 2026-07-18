@@ -24,6 +24,7 @@ optimizers/noise
 optimizers/peps
 optimizers/stabilizer_tn
 optimizers/sym_dmrg
+optimizers/tree
 solvers/gradient
 solvers/finite_difference
 sampling/samplers

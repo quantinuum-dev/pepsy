@@ -1,6 +1,6 @@
 ---
 name: stabilizer-tensor-networks
-description: 'Learn and implement the Stabilizer Tensor Network (STN) universal quantum simulator from Masot-Llima & Garcia-Saez (PRL 133, 230601, 2024 / arXiv:2403.08724) inside pepsy. Use when the user asks to implement, prototype, port, study, or extend stabilizer tensor networks, the generalized tableau formalism, a stabilizer-basis MPS, nu/coefficient-state simulation, Clifford plus non-Clifford circuit simulation with an amplitude MPS, or stim-tableau plus quimb/pepsy-MPS hybrid simulation. Also use for questions about the STN update rules (Clifford, non-Clifford rotation, measurement), the stabilizer basis B(S,D), pseudo-stabilizer rank, or bond-dimension growth bounds from that paper.'
+description: 'Learn and implement the Stabilizer Tensor Network (STN) universal quantum simulator from Masot-Llima & Garcia-Saez (PRL 133, 230601, 2024 / arXiv:2403.08724) inside pepsy. Use when the user asks to implement, prototype, port, study, or extend stabilizer tensor networks, the generalized tableau formalism, a stabilizer-basis MPS, nu/coefficient-state simulation, Clifford plus non-Clifford circuit simulation with an amplitude MPS, or stim-tableau plus quimb/pepsy-MPS hybrid simulation. Also use for questions about STN cooling, magic-state injection including deferred MAST projection, the STN update rules (Clifford, non-Clifford rotation, measurement), the stabilizer basis B(S,D), pseudo-stabilizer rank, or bond-dimension growth bounds from that paper.'
 ---
 
 # Stabilizer Tensor Networks (STN) in pepsy
@@ -71,16 +71,23 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   norm. Compare `projected_norm_sq` to `pre_norm_sq * branch_probability` to get the
   projector-compression proxy `projector_infidelity`. Use `norm_diagnostics()` for
   product/geometric summaries that multiply unitary and projector compression-survival
-  factors, but never measurement probabilities. `total_norm_proxy` is the
-  square root of `total_survival_proxy`; `geometric_mean_norm` is only the
-  per-segment geometric mean, not the total norm proxy.
+  factors, but never measurement probabilities. Prefer `norm_infidelity`,
+  `norm_survival`, and `norm`; the older `total_*_proxy` keys are compatibility
+  aliases. `geometric_mean_norm` is only the per-segment geometric mean, not the
+  total norm summary.
 - A selected `TrajectoryEvent` Kraus outcome is a normalized trajectory
   boundary. Before applying its non-unitary matrix, snapshot the current
   segment with its branch probability; normalize the selected branch at the
   canonical centre, reset the proxy, and commit a `"trajectory_kraus"` norm
   event. This lets later unitary steps track a fresh segment without treating
-  the Born probability as compression loss. STN progress reports this total as
-  `Ntotal` and its infidelity complement as `Itotal`.
+  the Born probability as compression loss. STN progress reports only
+  `norm_infidelity` plus a compact stream `part` label.
+- Treat stream-local stochastic entries as the primary Pepsy noise design.
+  `("x_error", p, q)`, `("depolarize1", p, q)`,
+  `("depolarize2", p, q0, q1)`, `("pauli_channel1", probs, q)`,
+  `("pauli_channel2", probs, q0, q1)`, and
+  `("amplitude_damping", gamma, q)` lower to trajectory events. Use
+  `PauliErrorModel` only as a macro for clean deterministic streams.
 - Keep `.bond_history` independent from `.infidelities`; their indices are not aligned.
 - Remember the limitation: norm loss detects compression that removes norm, but it is not
   a proof of state fidelity and cannot detect every norm-preserving directional error.
@@ -105,10 +112,12 @@ The concrete pepsy + stim call surface is in
 ## Implementation status (already built in `src/pepsy/optimizers/stabilizer_tn/`)
 The simulator is mature and validated against dense/stim (`tests/test_stabilizer_tn.py` and
 `tests/test_stabilizer_tn_stress.py`): `STNState` (tableau + `|p>`), Clifford and
-non-Clifford evolution, arbitrary few-qubit matrices, fixed/basis-updating measurement,
-reset, recyclable magic-state injection, perfect computational-basis sampling, and optional
-torch/JAX/CuPy-style coefficient backends. It is exposed as `pepsy.MpsStabOptimizer` and
-`pepsy.STNState`.
+non-Clifford evolution, constructive exact cooling, explicit greedy Clifford cooling,
+immediate and deferred-MAST magic-state injection, fixed/basis-updating measurement, reset,
+perfect computational-basis sampling, and optional Torch/JAX/CuPy coefficient backends
+covered by focused tests when the dependencies/runtimes are available.
+It is exposed as `pepsy.StabilizerMpsSimulator` / `pepsy.MpsStabOptimizer` and
+`pepsy.STNState`, with typed measurement/projection/norm/injection diagnostic records.
 
 **Key verified shortcut (use this, not the CNOT-cascade masks).** Because
 $|\psi\rangle = C|\nu\rangle$ with $C$ the tableau Clifford, a physical Pauli operator
@@ -133,8 +142,11 @@ This collapses all of Lemma 2/3's $I_x,I_y,I_z$ mask algebra into one call:
   qubit(s) to $|0\rangle$ (disentangled); `prepare_magic(a)` + `inject_t(data, a)` apply a
   `T` by magic-state gate teleportation (Clifford `CNOT` + $Z$-measure + conditional `S`),
   keeping the non-Clifford cost on the pre-loaded ancilla rather than growing $|\nu\rangle$.
-  Stream entries: `("measure", pauli, where[, outcome[, absorb_basis]])` and
-  `("reset", where)`.
+  `with_injection` measures and recycles an ancilla immediately. The separate
+  `with_deferred_injection` MAST path assigns one fresh ancilla to each injectable gate,
+  performs the Clifford gadget and branch correction during replay, then defers the physical
+  basis-updating ancilla projections to a chosen final order. Stream entries:
+  `("measure", pauli, where[, outcome[, absorb_basis]])` and `("reset", where)`.
 
 Both $\exp(-i\theta/2\,M)$ and $\tfrac{I\pm M}{2}$ are exact **bond-dim-2 MPOs**
 (`c·I + coef·P`) built on the real support window by
@@ -169,14 +181,73 @@ $\pi/2$ are Clifford and route to the tableau (free, $\chi$ unchanged).
   local gates, and MPO arrays use `to_backend`. Convert user matrix entries to NumPy for
   classification before converting coefficient-side operations back to the chosen backend.
 
+## Cooling and magic-injection policy
+
+There are two deliberately different ways to control coefficient-MPS bond dimension:
+
+- **Constructive exact cooling (`exact_cooling=True`, default):** before a multi-site
+  non-Clifford Pauli rotation, inspect its frame image. If an isolated product coefficient
+  site has a Pauli stabilizer that anticommutes with the local rotation axis, replace the
+  multi-site MPO by one local rotation and absorb the controlled-Pauli remainder into the
+  tableau. The represented state is exact and that update does not increase `|nu>` bond.
+  This is a deterministic, cheap applicability check, not a global optimization. Leave it
+  enabled in ordinary simulation; use `exact_cooling=False` only to test or benchmark the
+  normal MPO fallback.
+- **Greedy Clifford cooling (`disentangle_cliffords`):** score local two-qubit Clifford
+  candidates with Schmidt/SVD data, apply an improving candidate, and absorb its inverse
+  into the tableau. It can reduce an already-grown bond, but costs local SVD work over each
+  selected bond. Invoke it explicitly at a few meaningful circuit checkpoints; never hide it
+  in every T gate or every non-Clifford rotation.
+
+For magic injection, choose the schedule rather than treating deferred MAST as an automatic
+replacement:
+
+- `with_injection(n_data, gates, n_ancilla=1, ...)` is the immediate path. It measures each
+  gadget immediately and reuses a clean ancilla. Prefer it when ancilla count and steady
+  throughput matter most.
+- `with_deferred_injection(n_data, gates, n_ancilla=None, projection_order="middle_out", ...)`
+  is the MAST path. It reserves one clean ancilla per injectable `t`, `tdg`, or non-Clifford
+  `rz(k*pi/4)` gate, keeps those projections until after circuit replay, and reports replay
+  and projection costs separately. Prefer it when a low replay-phase peak bond is valuable
+  and a final projection phase plus `t` extra ancillas are acceptable. The circuit itself
+  must not touch the reserved ancillas. `middle_out` is the default static order; `input`
+  preserves injection order; `min_span` greedily selects the current shortest frame span.
+
+Use `MpsStabOptimizer.analyze_stream(gates, ...)` and
+`MpsStabOptimizer.recommend_settings(gates, ...)` before selecting settings. These are
+Pepsy-stream-first APIs: they inspect Clifford, T-family, other non-Clifford, dense matrix,
+sub-MPO, measurement/reset/cap, and qubit-use features, then return typed,
+mapping-compatible advice records. `recommend_settings` delegates only the
+direct/immediate/deferred part to `MpsStabOptimizer.recommend_magic_strategy(gates, ...)`,
+which remains available when the caller wants just the injection schedule. On an unrun
+`from_stim` simulator, `sim.queued_stream_analysis()` and
+`sim.queued_recommend_settings()` analyze the sampled and optionally transformed Pepsy
+stream. This is deliberately advice, not an `auto` executor: `apply()` must retain direct
+semantics unless the caller explicitly selects `with_injection` or
+`with_deferred_injection`.
+For correctness smoke runs before benchmarking, use
+`run_stabilizer_mps_stream(gates, mode=...)`, which returns a typed
+`StabilizerMpsRunResult` recording the actual mode/settings, replay/projection timings,
+bond data, norm diagnostics, measurements, and injection reports. Its default mode is
+direct; `mode="recommended"` is an explicit opt-in to execute the advisor's mode.
+`sim.run_queued_stream(...)` applies that runner to an unrun converted queue without
+mutating the source simulator.
+
+`benchmarks/stabilizer_tn_magic_scaling.py` compares `direct`, `immediate`, and `deferred`
+execution. Read peak `|nu>` bond together with `proj-bond` and `proj[s]`; final bond alone
+does not show the deferred projection cost. Add `--no-exact-cooling` when isolating MAST from
+the constructive pre-check.
+
 ## Roadmap / future improvements
 The prioritized roadmap (Clifford disentangling, dynamic layout, future PEPS/decoder work,
 and completed injection/measurement/sampling milestones) lives in
 `src/pepsy/optimizers/stabilizer_tn/PLAN.md`, with citations from the PRL-133-230601 citation scan.
-R1 supports `inject_rz` for $\phi$ a multiple of $\pi/4$, `inject_t`/`inject_tdg`, nearest
-clean-ancilla selection, recycling, and stream rewriting via `run_with_injection` /
-`with_injection`. Arbitrary-angle injection is intentionally excluded because preparing its
-resource state has the same non-Clifford cost; use direct rotation or compile to Clifford+T.
+R1 supports `inject_rz` for $\phi$ a multiple of $\pi/4$, `inject_t`/`inject_tdg`, immediate
+nearest-clean-ancilla recycling through `run_with_injection` / `with_injection`, and deferred
+MAST projection through `run_with_deferred_injection` / `with_deferred_injection`.
+Arbitrary-angle injection is intentionally excluded because preparing its resource state has
+the same non-Clifford cost; use direct rotation or compile to Clifford+T. R2 also includes the
+default constructive exact-cooling pre-check and the explicit greedy disentangling sweep.
 When extending the simulator, update that PLAN and add a dense-validated test.
 
 ## Extension workflow
@@ -191,9 +262,11 @@ invariant at every intermediate step.
 2. **Choose the correct frame.** Named physical gates and dense `(matrix, where)` entries
    must be frame-mapped. A `submpo` event is deliberately coefficient-frame and must not be
    conjugated through `C` a second time.
-3. **Choose the narrowest coefficient update.** Use a local 2x2 gate for one support site,
-   `pauli_combo_submpo` for a two-branch Pauli operator, and the branch-sum path only for a
-   genuine multi-term matrix. Label every sub-MPO with its real MPS sites.
+3. **Choose the narrowest coefficient update.** Let constructive exact cooling attempt its
+   deterministic local-pivot identity before a multi-site rotation. If it does not apply,
+   use a local 2x2 gate for one support site, `pauli_combo_submpo` for a two-branch Pauli
+   operator, and the branch-sum path only for a genuine multi-term matrix. Label every
+   sub-MPO with its real MPS sites.
 4. **Maintain numerical state.** Thread the `info` orthogonality-centre tracker through
    quimb splitting/canonicalization calls. Preserve the configured backend for MPS-side
    arrays. Normalize projective collapse, but do not normalize unitary evolution or
@@ -203,7 +276,11 @@ invariant at every intermediate step.
 5. **Validate the physical state.** For small `n`, compare `C @ p_dense` with an independent
    dense circuit up to global phase. Compare Clifford-only behavior with stim. Test exact
    `chi=None` first, then a bounded-`chi` path and backend variants when touched.
-6. **Keep APIs synchronized.** If a public symbol or stream form changes, update the owning
+6. **Schedule expensive optimizations deliberately.** Keep exact cooling on in ordinary
+   replay. Use the greedy disentangler only at explicit checkpoints. For magic circuits,
+   choose immediate recycled injection or deferred MAST based on ancilla budget and whether
+   final projection cost is acceptable; do not mix their ancilla-lifetime assumptions.
+7. **Keep APIs synchronized.** If a public symbol or stream form changes, update the owning
    `__all__`, top-level lazy exports, `docs/api/`, `tests/test_public_api.py`, and the PLAN.
 
 ## Validation checklist
@@ -215,6 +292,10 @@ invariant at every intermediate step.
   states; repeated measurements are deterministic; impossible forced outcomes raise.
 - [ ] Reset disentangles its targets; direct and injected T/T-dagger/pi/4-multiple Rz paths
   agree, including ancilla recycling.
+- [ ] Exact cooling agrees with the ordinary MPO path when a stabilizer pivot exists and
+  correctly falls back when it does not. Greedy cooling is tested only when explicitly called.
+- [ ] Deferred MAST matches direct replay for forced outcomes and every supported projection
+  order; an odd-sized `middle_out` register projects every fresh ancilla exactly once.
 - [ ] `sample_bits`/`probability_bits` match dense probabilities without mutating the source.
 - [ ] Clifford matrices, 1q non-Clifford unitaries, general unitary matrices, and
   non-unitary matrices all follow their intended dispatch paths.
@@ -247,6 +328,12 @@ invariant at every intermediate step.
 - **Long-range cost is dynamic.** A local physical gate can have a spread frame image after
   Clifford evolution. Static `MpsOptimizer` layout analysis of the physical stream does not
   optimize these evolving coefficient supports.
+- **Do not conflate cooling schedules.** Exact cooling prevents a specific next update from
+  growing; the greedy sweep tries to reduce a bond that already exists. The latter is useful
+  but should not run after every T gate.
+- **Deferred MAST does not recycle.** Its ancillas remain reserved until final projection;
+  ordinary circuit entries must not act on them. `min_span` is a greedy *projection-order*
+  planner, not the greedy Clifford cooler.
 - **Qubit ordering must agree.** Stim, dense reconstruction, and MPS sites use the same
   big-endian convention with qubit 0 first.
 - Do not vendor stim/quimb internals; isolate any workaround behind a small adapter and test

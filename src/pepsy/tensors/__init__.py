@@ -31,6 +31,11 @@ from .symmetric import (
     symmray_peps_summary,
     symm_operator_from_dense,
 )
+from .symm_fermions import (
+    SpinfulFermion,
+    SpinfulFermionHubbard,
+    SymmFermions,
+)
 from .core import (
     OneDMap,
     add_cycle,
@@ -78,6 +83,9 @@ from .core import (
 
 __all__ = [
     "OneDMap",
+    "SpinfulFermion",
+    "SpinfulFermionHubbard",
+    "SymmFermions",
     "SymGateStream",
     "SymHamiltonian",
     "SymMPS",

@@ -1,21 +1,23 @@
 """Benchmark the Stabilizer Tensor Network (STN) magic-vs-chi scaling.
 
-Demonstrates the central STN claim (Masot-Llima & Garcia-Saez, PRL 133, 230601,
-Fig. 2; magic-state injection follow-up arXiv:2411.12482): the coefficient MPS
-``|nu>`` bond of ``pepsy.MpsStabOptimizer`` is bounded by the *number of
-non-Clifford (T) gates* ``t`` — at most ``2**t`` — and stays flat as the qubit
-count ``N`` grows.  Clifford gates are free (they only update the stim tableau),
-so a T-doped Clifford circuit costs ``O(poly N)`` at fixed ``t``.
+Compares three STN treatments of T-doped Clifford circuits:
 
-For each ``N`` the script builds a deterministic random Clifford circuit with
-``t`` interspersed ``T`` gates and runs it two ways:
+* ``direct`` applies every T rotation to ``|nu>``;
+* ``immediate`` teleports every T through one recycled ancilla and immediately
+  projects it;
+* ``deferred`` implements the MAST protocol: one fresh magic ancilla per T,
+  then end-of-circuit basis-updating projections in a chosen order.
 
-* direct: every ``T`` acts on ``|nu>`` via the exact rotation path;
-* injection: every ``T`` is teleported through a single recycled magic ancilla
-  (``with_injection``), keeping the non-Clifford cost off ``|nu>``.
+The report separates circuit replay and final-projection time for deferred
+MAST, and records the peak coefficient-MPS bond rather than only its final
+value. Clifford gates are free tableau updates; non-Clifford resource handling
+is the quantity being compared.
 
-It records the max ``|nu>`` bond, the pseudo-stabilizer rank (for small ``N``),
-and wall time, and emits JSON plus a human-readable table.
+For each ``N`` the script uses the same deterministic random circuit in every
+mode, records peak/final ``|nu>`` bond, pseudo-stabilizer rank (for small
+systems), total wall time, and deferred replay/projection times, then emits JSON
+and a human-readable table. Use ``--no-exact-cooling`` to isolate injection from
+the constructive exact-cooling pre-check.
 
 Examples
 --------
@@ -79,32 +81,85 @@ def _resolve_backend(name):
     raise ValueError(f"unknown backend {name!r} (use numpy/torch/cupy/jax).")
 
 
-def run_case(n, t, depth, seed, chi, mode, to_backend, rank_max_n):
+def run_case(
+    n,
+    t,
+    depth,
+    seed,
+    chi,
+    mode,
+    to_backend,
+    rank_max_n,
+    exact_cooling=True,
+    deferred_projection_order="middle_out",
+):
     """Run one (n, mode) case and return a metrics dict."""
     from pepsy.optimizers import MpsStabOptimizer
 
     stream = random_clifford_t_circuit(n, t, depth, seed)
     n_two_qubit = sum(1 for e in stream if e[0] == "cnot")
 
+    mode = str(mode).strip().lower()
+    common = {
+        "chi": chi,
+        "to_backend": to_backend,
+        "exact_cooling": exact_cooling,
+    }
     start = time.perf_counter()
-    if mode == "injection":
+    projection_report = None
+    if mode in ("immediate", "injection"):
         sim = MpsStabOptimizer.with_injection(
-            n, stream, n_ancilla=1, chi=chi, to_backend=to_backend
+            n, stream, n_ancilla=1, **common
         )
+        projection_report = sim.last_immediate_injection_report
+        mode = "immediate"
+    elif mode == "deferred":
+        sim = MpsStabOptimizer.with_deferred_injection(
+            n,
+            stream,
+            projection_order=deferred_projection_order,
+            **common,
+        )
+        projection_report = sim.last_deferred_injection_report
+    elif mode == "direct":
+        sim = MpsStabOptimizer(n, **common).apply(stream)
     else:
-        sim = MpsStabOptimizer(n, chi=chi, to_backend=to_backend).apply(stream)
+        raise ValueError(
+            f"unknown mode {mode!r}; use direct, immediate, deferred, or injection."
+        )
     elapsed = time.perf_counter() - start
 
-    rank = sim.pseudo_stabilizer_rank() if n <= rank_max_n else None
+    rank = sim.pseudo_stabilizer_rank() if sim.n <= rank_max_n else None
     return {
         "n": int(n),
         "t": int(t),
         "mode": mode,
         "gates": len(stream),
         "two_qubit_gates": int(n_two_qubit),
-        "max_nu_bond": int(sim.state.max_bond()),
+        "peak_nu_bond": int(max(sim.bond_history)),
+        # Backward-compatible name retained for callers of the original benchmark.
+        "max_nu_bond": int(max(sim.bond_history)),
+        "final_nu_bond": int(sim.state.max_bond()),
         "bond_bound_2_to_t": int(2 ** t),
         "pseudo_stabilizer_rank": None if rank is None else int(rank),
+        "replay_elapsed_s": float(
+            elapsed
+            if mode == "direct"
+            else (
+                projection_report["replay_elapsed_s"]
+                if mode == "deferred"
+                else elapsed - projection_report["projection_elapsed_s"]
+            )
+        ),
+        "projection_elapsed_s": float(
+            0.0 if mode == "direct" else projection_report["projection_elapsed_s"]
+        ),
+        "pre_projection_peak_bond": (
+            None if mode != "deferred" else projection_report["pre_projection_peak_bond"]
+        ),
+        "projection_peak_bond": (
+            None if mode == "direct" else projection_report["projection_peak_bond"]
+        ),
         "elapsed_s": float(elapsed),
     }
 
@@ -125,6 +180,8 @@ def run(args):
                 mode=mode,
                 to_backend=to_backend,
                 rank_max_n=args.rank_max_n,
+                exact_cooling=args.exact_cooling,
+                deferred_projection_order=args.deferred_projection_order,
             )
             results.append(res)
     return {
@@ -136,6 +193,8 @@ def run(args):
             "chi": args.chi,
             "modes": modes,
             "backend": args.backend or "numpy",
+            "exact_cooling": bool(args.exact_cooling),
+            "deferred_projection_order": args.deferred_projection_order,
         },
         "results": results,
     }
@@ -147,29 +206,41 @@ def _print_table(report):
         f"# STN magic-vs-chi scaling  (t={cfg['t']} T-gates, depth={cfg['depth']}, "
         f"chi={cfg['chi']}, backend={cfg['backend']})"
     )
-    print(f"# bond bound 2^t = {2 ** cfg['t']}; expect max |nu> bond flat in N\n")
-    header = f"{'mode':>10} {'N':>5} {'gates':>7} {'2q':>5} {'maxBond':>8} {'rank':>6} {'time[s]':>9}"
+    print(
+        f"# exact_cooling={cfg['exact_cooling']}; deferred order="
+        f"{cfg['deferred_projection_order']}\n"
+    )
+    header = (
+        f"{'mode':>10} {'N':>5} {'gates':>7} {'2q':>5} {'peak':>6} "
+        f"{'final':>6} {'rank':>6} {'replay[s]':>10} {'proj-bond':>10} {'proj[s]':>9} {'total[s]':>9}"
+    )
     print(header)
     print("-" * len(header))
     for r in report["results"]:
         rank = "-" if r["pseudo_stabilizer_rank"] is None else r["pseudo_stabilizer_rank"]
+        replay = "-" if r["replay_elapsed_s"] is None else f"{r['replay_elapsed_s']:.3f}"
+        projection = (
+            f"{r['projection_elapsed_s']:.3f}"
+        )
+        projection_bond = (
+            "-" if r["projection_peak_bond"] is None else r["projection_peak_bond"]
+        )
         print(
             f"{r['mode']:>10} {r['n']:>5} {r['gates']:>7} {r['two_qubit_gates']:>5} "
-            f"{r['max_nu_bond']:>8} {str(rank):>6} {r['elapsed_s']:>9.3f}"
+            f"{r['peak_nu_bond']:>6} {r['final_nu_bond']:>6} {str(rank):>6} "
+            f"{replay:>10} {str(projection_bond):>10} {projection:>9} {r['elapsed_s']:>9.3f}"
         )
-    # headline: is the bond flat in N (per mode)?
     print()
     for mode in cfg["modes"]:
-        bonds = [r["max_nu_bond"] for r in report["results"] if r["mode"] == mode]
+        label = "immediate" if mode == "injection" else mode
+        bonds = [r["peak_nu_bond"] for r in report["results"] if r["mode"] == label]
         print(
-            f"{mode}: max |nu> bond over N = {bonds}  "
-            f"(<= 2^t = {2 ** cfg['t']}: {all(b <= 2 ** cfg['t'] for b in bonds)})"
+            f"{label}: peak |nu> bond over N = {bonds}"
         )
     print(
-        "\nnote: both modes keep the |nu> bond bounded by 2^t and flat in N (the STN "
-        "property).\n      'injection' additionally confines magic to a recyclable "
-        "ancilla; its cost\n      depends on the ancilla-to-data distance (localizer "
-        "swaps), so it can be\n      slower than 'direct' for small t on a 1D layout."
+        "\nnote: immediate injection recycles one ancilla, whereas deferred MAST "
+        "uses one fresh ancilla per injected rotation and reports its final "
+        "projection cost separately."
     )
 
 
@@ -182,8 +253,20 @@ def build_arg_parser():
     parser.add_argument("--seed", type=int, default=20260708)
     parser.add_argument("--chi", type=int, default=None,
                         help="max |nu> bond (None = exact)")
-    parser.add_argument("--modes", default="direct,injection",
-                        help="comma-separated: direct, injection")
+    parser.add_argument("--modes", default="direct,immediate,deferred",
+                        help="comma-separated: direct, immediate, deferred (or injection alias)")
+    parser.add_argument(
+        "--exact-cooling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable constructive exact cooling (use --no-exact-cooling to isolate MAST)",
+    )
+    parser.add_argument(
+        "--deferred-projection-order",
+        default="middle_out",
+        choices=("middle_out", "input", "min_span"),
+        help="end-of-circuit magic-register projection order for deferred mode",
+    )
     parser.add_argument("--backend", default=None,
                         help="numpy (default), torch, cupy, or jax")
     parser.add_argument("--rank-max-n", type=int, default=12,

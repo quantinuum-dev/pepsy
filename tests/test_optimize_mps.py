@@ -1606,6 +1606,50 @@ def test_mps_optimizer_true_infidelity_progress_reports_infidelity(monkeypatch):
     assert last["Icum"] == opt._format_progress_infidelity(opt.get_infidelities()[-1])
 
 
+def test_mps_optimizer_norm_infidelity_progress_reports_norm_proxy(monkeypatch):
+    """With track_norm_infidelity=True, MPO tqdm postfix should show norm loss."""
+    progress_instances = []
+
+    class _FakeTqdm:
+        def __init__(self, **kwargs):
+            self.total = kwargs["total"]
+            self.n = 0
+            self.postfix_calls = []
+            progress_instances.append(self)
+
+        def set_postfix(self, postfix):
+            self.postfix_calls.append(dict(postfix))
+
+        def update(self, amount):
+            self.n += amount
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
+
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 3)),
+    ]
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode="mpo")
+
+    opt.run(
+        progbar=True,
+        cutoff=1e-12,
+        fidelity_samples=0,
+        track_norm_infidelity=True,
+    )
+
+    progress = progress_instances[-1]
+    assert progress.n == len(gates)
+    last = progress.postfix_calls[-1]
+    assert "infidelity" in last
+    assert "Icum" not in last
+    assert last["infidelity"] == opt._format_progress_infidelity(opt.get_infidelities()[-1])
+
+
 def test_mps_optimizer_progress_infidelity_uses_compact_scientific_format():
     """Tiny displayed infidelities should not round to 0.000000."""
     assert py.MpsOptimizer._format_progress_infidelity(1e-9) == "1.e-9"

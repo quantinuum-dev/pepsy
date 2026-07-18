@@ -28,6 +28,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   - `environments.py`: Quimb MPS boundary store and engine selection helpers.
   - `local_objective.py`: extraction target for local objective assembly.
   - `traces.py`: extraction target for sweep traces and progress summaries.
+- `stabilizer_tn/`: `StabilizerMpsSimulator` / `MpsStabOptimizer`, `STNState`,
+  and typed STN diagnostic records for the Stim-tableau plus coefficient-MPS
+  simulator. See `stabilizer_tn/PLAN.md` for its implementation record and
+  `docs/howto/stabilizer_tn_magic.md` for exact cooling, greedy checkpoints,
+  and immediate versus deferred MAST injection.
 - `mera/`: dense MERA and schedule-first qMERA local-energy objectives,
   parameter dictionaries, compiled lightcone contractions, schematics, and
   Symmray-native fermion helpers.

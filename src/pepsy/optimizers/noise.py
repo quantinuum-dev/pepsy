@@ -1,11 +1,12 @@
-"""Stochastic Pauli-noise gate streams and trajectory replay.
+"""Stochastic gate-stream entries and trajectory replay.
 
-The helpers in this module sample a *concrete* Pauli-fault trajectory for
-each shot. They deliberately do not construct a density matrix: a sampled
-stream can be replayed by either :class:`MpsOptimizer` or
-:class:`MpsStabOptimizer`. In particular, sampled faults remain Clifford, so
-the STN simulator routes them through its stim tableau without growing the
-coefficient MPS.
+Pepsy's native design is stream-local: users can place stochastic instructions
+such as ``("depolarize1", p, q)`` or ``("amplitude_damping", gamma, q)`` exactly
+where the hardware schedule says the channel acts. The trajectory runners
+sample a *concrete* branch for each shot and replay the resulting ordinary gate
+stream with either :class:`MpsOptimizer` or :class:`MpsStabOptimizer`. The older
+``PauliErrorModel`` helpers remain convenience macros for inserting uniform
+post-gate Pauli faults into a clean deterministic stream.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ __all__ = [
     "StimHerald",
     "StimNoiseSample",
     "StimShotResult",
+    "LeakageRecord",
     "TrajectoryChannel",
     "TrajectoryEvent",
     "TrajectoryOutcome",
@@ -61,6 +63,40 @@ _ONE_QUBIT_NAMES = frozenset({"h", "s", "sdg", "x", "y", "z", "t", "tdg"})
 _TWO_QUBIT_NAMES = frozenset({"cnot", "cx", "cy", "cz", "swap"})
 _ONE_QUBIT_ROTATIONS = frozenset({"rx", "ry", "rz"})
 _TWO_QUBIT_ROTATIONS = frozenset({"rxx", "ryy", "rzz"})
+_STOCHASTIC_SINGLE_PAULI_NAMES = {
+    "x_error": "X",
+    "y_error": "Y",
+    "z_error": "Z",
+}
+_STOCHASTIC_EVENT_NAMES = frozenset(
+    {
+        *(_STOCHASTIC_SINGLE_PAULI_NAMES),
+        "depolarize1",
+        "depolarize_1",
+        "depolarize2",
+        "depolarize_2",
+        "pauli_channel1",
+        "pauli_channel_1",
+        "pauli_channel2",
+        "pauli_channel_2",
+        "amplitude_damping",
+    }
+)
+_LEAKAGE_EVENT_NAMES = frozenset(
+    {
+        "leak",
+        "leakage",
+        "leakage_depolarize",
+        "leakage_return",
+        "leakage_seepage",
+        "measure_leakage",
+        "measure_leaked",
+        "seepage",
+        "unleak",
+        "leak2depolar",
+        "leak_to_depolar",
+    }
+)
 _CONTROL_NAMES = frozenset(
     {
         "measure",
@@ -453,6 +489,26 @@ class TrajectoryRecord:
 
 
 @dataclass(frozen=True)
+class LeakageRecord:
+    """One stateful leakage event sampled during a trajectory replay.
+
+    ``measurement`` uses the PECOS/Selene ternary convention for
+    ``measure_leaked``: ``0`` and ``1`` are computational-basis bits, while
+    ``2`` means the qubit was known to be leaked.
+    """
+
+    event_index: int
+    kind: str
+    site: Optional[int] = None
+    probability: Optional[float] = None
+    occurred: Optional[bool] = None
+    initially_leaked: Optional[bool] = None
+    finally_leaked: Optional[bool] = None
+    measurement: Optional[int] = None
+    branch: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class TrajectorySample:
     """One sampled fixed-mixture stream and its selected channel outcomes."""
 
@@ -472,6 +528,7 @@ class TrajectoryShotResult:
     optimizers: tuple[Any, ...]
     gate_streams: tuple[tuple[object, ...], ...]
     records: tuple[tuple[TrajectoryRecord, ...], ...]
+    leakage_records: tuple[tuple[LeakageRecord, ...], ...] = ()
 
     @property
     def shots(self) -> int:
@@ -515,6 +572,7 @@ class CoalescedTrajectoryLeaf:
     faults: tuple[PauliFault, ...] = ()
     heralds: tuple[StimHerald, ...] = ()
     measurements: tuple[CoalescedMeasurementRecord, ...] = ()
+    leakage_records: tuple[LeakageRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -683,6 +741,10 @@ def _sites(where) -> tuple[int, ...]:
     raise ValueError(f"Cannot determine integer gate support from {where!r}.")
 
 
+def _normalize_stream_name(name) -> str:
+    return str(name).strip().lower().replace("-", "_")
+
+
 def _event_support(entry) -> Optional[tuple[int, ...]]:
     """Return the physical support that should receive independent Pauli noise."""
     if isinstance(entry, Mapping):
@@ -695,7 +757,11 @@ def _event_support(entry) -> Optional[tuple[int, ...]]:
 
     head = entry[0]
     if isinstance(head, str):
-        name = head.strip().lower().replace("-", "_")
+        name = _normalize_stream_name(head)
+        if name in _STOCHASTIC_EVENT_NAMES:
+            return None
+        if name in _LEAKAGE_EVENT_NAMES:
+            return None
         if name in _CONTROL_NAMES:
             return None
         if name in _ONE_QUBIT_NAMES:
@@ -740,10 +806,217 @@ def _pauli_matrix(label: str, *, like=None):
         return matrix
 
 
+def _identity_matrix(nqubits: int) -> np.ndarray:
+    return np.eye(2 ** int(nqubits), dtype=complex)
+
+
+def _pauli_product_matrix(label: str) -> np.ndarray:
+    label = str(label).upper()
+    matrices = []
+    for axis in label:
+        if axis == "I":
+            matrices.append(_identity_matrix(1))
+        elif axis in _PAULI_MATRICES:
+            matrices.append(_PAULI_MATRICES[axis])
+        else:
+            raise ValueError(f"Unknown Pauli label {label!r}.")
+    out = matrices[0]
+    for matrix in matrices[1:]:
+        out = np.kron(out, matrix)
+    return out
+
+
+def _mapping_probability(mapping, label: str) -> float:
+    keys = (
+        label,
+        label.lower(),
+        tuple(label),
+        tuple(axis.lower() for axis in label),
+    )
+    for key in keys:
+        if key in mapping:
+            return float(mapping[key])
+    return 0.0
+
+
+def _pauli_channel_probabilities(probabilities, labels, *, event: str) -> list[float]:
+    if isinstance(probabilities, Mapping):
+        values = [_mapping_probability(probabilities, label) for label in labels]
+    else:
+        values = [float(value) for value in probabilities]
+        if len(values) != len(labels):
+            raise ValueError(
+                f"{event} needs {len(labels)} probability values, got {len(values)}."
+            )
+    if not all(np.isfinite(value) and value >= 0.0 for value in values):
+        raise ValueError(f"{event} probabilities must be finite and nonnegative.")
+    total = float(sum(values))
+    if total > 1.0 + 1e-12:
+        raise ValueError(f"{event} probabilities must sum to at most one.")
+    return values
+
+
+def _trajectory_event_from_stochastic_entry(entry):
+    """Lower a Pepsy stochastic stream entry into a trajectory event."""
+    if not (isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str)):
+        return None
+    name = _normalize_stream_name(entry[0])
+    if name not in _STOCHASTIC_EVENT_NAMES:
+        return None
+
+    if name in _STOCHASTIC_SINGLE_PAULI_NAMES:
+        if len(entry) != 3:
+            raise ValueError(f"{entry[0]!r} expects probability and target qubit.")
+        probability = _unit_interval_probability(entry[1], name)
+        axis = _STOCHASTIC_SINGLE_PAULI_NAMES[name]
+        channel = TrajectoryChannel.mixture(
+            (
+                ("I", 1.0 - probability, _identity_matrix(1)),
+                (axis, probability, _PAULI_MATRICES[axis]),
+            )
+        )
+        return TrajectoryEvent(channel, entry[2])
+
+    if name in {"depolarize1", "depolarize_1"}:
+        if len(entry) != 3:
+            raise ValueError(f"{entry[0]!r} expects probability and target qubit.")
+        return TrajectoryEvent(TrajectoryChannel.depolarizing(entry[1]), entry[2])
+
+    if name in {"depolarize2", "depolarize_2"}:
+        if len(entry) != 4:
+            raise ValueError(f"{entry[0]!r} expects probability and two target qubits.")
+        probability = _unit_interval_probability(entry[1], name)
+        labels = ["".join(pair) for pair in _STIM_PAULI_2_OUTCOMES]
+        channel = TrajectoryChannel.mixture(
+            [("II", 1.0 - probability, _identity_matrix(2))]
+            + [
+                (label, probability / 15.0, _pauli_product_matrix(label))
+                for label in labels
+            ]
+        )
+        return TrajectoryEvent(channel, (entry[2], entry[3]))
+
+    if name in {"pauli_channel1", "pauli_channel_1"}:
+        if len(entry) != 3:
+            raise ValueError(f"{entry[0]!r} expects probabilities and target qubit.")
+        labels = ("X", "Y", "Z")
+        values = _pauli_channel_probabilities(entry[1], labels, event=name)
+        channel = TrajectoryChannel.mixture(
+            [("I", 1.0 - float(sum(values)), _identity_matrix(1))]
+            + [
+                (label, probability, _PAULI_MATRICES[label])
+                for label, probability in zip(labels, values)
+            ]
+        )
+        return TrajectoryEvent(channel, entry[2])
+
+    if name in {"pauli_channel2", "pauli_channel_2"}:
+        if len(entry) != 4:
+            raise ValueError(f"{entry[0]!r} expects probabilities and two target qubits.")
+        labels = tuple("".join(pair) for pair in _STIM_PAULI_2_OUTCOMES)
+        values = _pauli_channel_probabilities(entry[1], labels, event=name)
+        channel = TrajectoryChannel.mixture(
+            [("II", 1.0 - float(sum(values)), _identity_matrix(2))]
+            + [
+                (label, probability, _pauli_product_matrix(label))
+                for label, probability in zip(labels, values)
+            ]
+        )
+        return TrajectoryEvent(channel, (entry[2], entry[3]))
+
+    if name == "amplitude_damping":
+        if len(entry) != 3:
+            raise ValueError(f"{entry[0]!r} expects gamma and target qubit.")
+        return TrajectoryEvent(TrajectoryChannel.amplitude_damping(entry[1]), entry[2])
+
+    raise AssertionError(f"Unhandled stochastic stream entry {entry!r}.")
+
+
+def _leakage_event_parts(entry):
+    """Return ``(kind, payload, where)`` for a stateful leakage stream entry."""
+    if isinstance(entry, Mapping):
+        kind = entry.get("kind", entry.get("type", entry.get("event", None)))
+        if kind is None:
+            return None
+        name = _normalize_stream_name(kind)
+        if name not in _LEAKAGE_EVENT_NAMES:
+            return None
+        if name in {"leak2depolar", "leak_to_depolar"}:
+            return (
+                "leak2depolar",
+                {"enabled": bool(entry.get("enabled", entry.get("value", True)))},
+                (),
+            )
+        where = entry.get("where", entry.get("site", entry.get("qubit", None)))
+        if where is None:
+            raise ValueError(f"{kind!r} leakage event needs a target qubit.")
+        (site,) = _trajectory_where(where)
+        if name in {"measure_leaked", "measure_leakage"}:
+            return "measure_leaked", {}, (site,)
+        probability = _unit_interval_probability(
+            entry.get("probability", entry.get("p", 0.0)), name
+        )
+        if name in {"leak", "leakage"}:
+            return "leakage", {"probability": probability, "depolarize": False}, (site,)
+        if name == "leakage_depolarize":
+            return "leakage", {"probability": probability, "depolarize": True}, (site,)
+        if name in {"leakage_return", "leakage_seepage", "seepage", "unleak"}:
+            return "leakage_return", {"probability": probability}, (site,)
+        raise AssertionError(f"Unhandled leakage event {entry!r}.")
+
+    if not (isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str)):
+        return None
+    name = _normalize_stream_name(entry[0])
+    if name not in _LEAKAGE_EVENT_NAMES:
+        return None
+
+    if name in {"leak2depolar", "leak_to_depolar"}:
+        if len(entry) != 2:
+            raise ValueError(f"{entry[0]!r} expects a boolean enabled flag.")
+        return "leak2depolar", {"enabled": bool(entry[1])}, ()
+
+    if name in {"measure_leaked", "measure_leakage"}:
+        if len(entry) != 2:
+            raise ValueError(f"{entry[0]!r} expects a target qubit.")
+        (site,) = _trajectory_where(entry[1])
+        return "measure_leaked", {}, (site,)
+
+    if len(entry) != 3:
+        raise ValueError(f"{entry[0]!r} expects probability and target qubit.")
+    probability = _unit_interval_probability(entry[1], name)
+    (site,) = _trajectory_where(entry[2])
+    if name in {"leak", "leakage"}:
+        return "leakage", {"probability": probability, "depolarize": False}, (site,)
+    if name == "leakage_depolarize":
+        return "leakage", {"probability": probability, "depolarize": True}, (site,)
+    if name in {"leakage_return", "leakage_seepage", "seepage", "unleak"}:
+        return "leakage_return", {"probability": probability}, (site,)
+    raise AssertionError(f"Unhandled leakage event {entry!r}.")
+
+
+def _contains_stochastic_entries(entries) -> bool:
+    return any(_trajectory_event_from_stochastic_entry(entry) is not None for entry in entries)
+
+
+def _contains_leakage_entries(entries) -> bool:
+    return any(_leakage_event_parts(entry) is not None for entry in entries)
+
+
 def _sample_gate_stream(gates, error_model: PauliErrorModel, rng):
     stream = []
     faults = []
     for gate_index, entry in enumerate(_as_entries(gates)):
+        if _trajectory_event_from_stochastic_entry(entry) is not None:
+            raise ValueError(
+                "Stream-local stochastic entries require run_trajectory_shots(...) "
+                "or run_coalesced_trajectory_shots(...). PauliErrorModel is a "
+                "convenience macro for clean deterministic streams."
+            )
+        if _leakage_event_parts(entry) is not None:
+            raise ValueError(
+                "Stateful leakage entries require run_trajectory_shots(...). "
+                "PauliErrorModel is a convenience macro for clean deterministic streams."
+            )
         stream.append(entry)
         support = _event_support(entry)
         if support is None:
@@ -896,6 +1169,17 @@ def run_noisy_shots(
     ):
         raise ValueError("auto_max_expected_faults must be finite and nonnegative.")
     entries = _as_entries(gates)
+    if _contains_stochastic_entries(entries):
+        raise ValueError(
+            "Stream-local stochastic entries require run_trajectory_shots(...) "
+            "or run_coalesced_trajectory_shots(...). PauliErrorModel is a "
+            "convenience macro for clean deterministic streams."
+        )
+    if _contains_leakage_entries(entries):
+        raise ValueError(
+            "Stateful leakage entries require run_trajectory_shots(...). "
+            "PauliErrorModel is a convenience macro for clean deterministic streams."
+        )
 
     if strategy == "coalesced":
         return run_coalesced_noisy_shots(
@@ -954,7 +1238,11 @@ def _trajectory_entries(gates) -> list[object]:
     """Normalize a stream that may itself be a single trajectory event."""
     if isinstance(gates, TrajectoryEvent):
         return [gates]
-    return _as_entries(gates)
+    entries = []
+    for entry in _as_entries(gates):
+        trajectory_event = _trajectory_event_from_stochastic_entry(entry)
+        entries.append(entry if trajectory_event is None else trajectory_event)
+    return entries
 
 
 def _entry_from_trajectory_outcome(outcome: TrajectoryOutcome | Any, where):
@@ -976,16 +1264,22 @@ def _sample_trajectory_mixture(channel: TrajectoryChannel, rng):
 def sample_trajectory_stream(gates, *, seed=None) -> TrajectorySample:
     """Sample fixed random-unitary events in a user-defined gate stream.
 
-    The input is an ordinary gate stream with :class:`TrajectoryEvent` entries
-    inserted wherever a local noisy channel should act. Only
-    :meth:`TrajectoryChannel.mixture` events can be sampled without a state;
-    a :meth:`TrajectoryChannel.kraus` event needs the evolving state and must
-    use :func:`run_trajectory_shots` instead.
+    The input is an ordinary gate stream with either :class:`TrajectoryEvent`
+    objects or Pepsy stochastic entries such as ``("x_error", p, q)`` inserted
+    wherever a local noisy channel should act. Only fixed-mixture events can be
+    sampled without a state; a :meth:`TrajectoryChannel.kraus` event, including
+    ``("amplitude_damping", gamma, q)``, needs the evolving state and must use
+    :func:`run_trajectory_shots` instead.
     """
     rng = np.random.default_rng(seed)
     stream = []
     records = []
     for event_index, entry in enumerate(_trajectory_entries(gates)):
+        if _leakage_event_parts(entry) is not None:
+            raise ValueError(
+                "Stateful leakage entries require run_trajectory_shots(...); "
+                "they cannot be sampled from a gate stream alone."
+            )
         if not isinstance(entry, TrajectoryEvent):
             stream.append(entry)
             continue
@@ -1156,6 +1450,286 @@ def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
         p.exponent = 0.0
 
 
+@dataclass
+class _LeakageState:
+    """Classical per-shot leakage state carried outside the qubit MPS."""
+
+    leaked: set[int] = field(default_factory=set)
+    leak2depolar: bool = False
+
+
+def _single_leakage_site(where) -> int:
+    where = _trajectory_where(where)
+    if len(where) != 1:
+        raise ValueError("leakage entries act on exactly one qubit.")
+    return int(where[0])
+
+
+def _reset_zero_entry(site: int) -> tuple[str, int]:
+    return ("reset", int(site))
+
+
+def _pauli_gate_entry(axis: str, site: int) -> tuple[object, int]:
+    return (_PAULI_MATRICES[str(axis).upper()], int(site))
+
+
+def _append_optimizer_measurement(optimizer, pauli, where, outcome, probability=1.0):
+    """Append a manually forced leakage measurement in the local record format."""
+    measurements = getattr(optimizer, "measurements", None)
+    if not isinstance(measurements, list):
+        return
+    where = tuple(int(site) for site in where)
+    outcome = int(outcome)
+    if _is_stabilizer_trajectory_optimizer(optimizer):
+        record_where = where[0] if len(where) == 1 else where
+        try:
+            from .stabilizer_tn import MeasurementRecord  # pylint: disable=import-outside-toplevel
+
+            measurements.append(MeasurementRecord(str(pauli), record_where, outcome))
+        except Exception:  # pragma: no cover - fallback during unusual import states
+            measurements.append((str(pauli), record_where, outcome))
+    else:
+        measurements.append((str(pauli), where, outcome, float(probability)))
+
+
+def _last_measurement_bit(optimizer) -> int:
+    """Return the computational bit of the optimizer's last Pauli measurement."""
+    measurements = getattr(optimizer, "measurements", None)
+    if not measurements:
+        raise ValueError("measure_leaked did not produce a measurement record.")
+    record = measurements[-1]
+    outcome = getattr(record, "outcome", record[2])
+    return 0 if int(outcome) >= 0 else 1
+
+
+def _run_leakage_entries(optimizer, entries, run_kwargs, shot_stream):
+    if not entries:
+        return
+    _run_trajectory_entries(optimizer, entries, run_kwargs)
+    shot_stream.extend(entries)
+
+
+def _entry_touches_leaked_qubit(entry, state: _LeakageState) -> bool:
+    """Return whether an ordinary gate entry should be suppressed by leakage."""
+    if not state.leaked:
+        return False
+    try:
+        support = _event_support(entry)
+    except ValueError:
+        return False
+    return support is not None and any(int(site) in state.leaked for site in support)
+
+
+def _apply_leakage_reset_control(
+    optimizer,
+    entry,
+    state: _LeakageState,
+    run_kwargs,
+    shot_stream,
+):
+    """Replay a reset/prep-style control and clear leakage on its targets."""
+    parts = MpsOptimizer.control_event_parts(entry)
+    if parts is None or parts[0] != "reset":
+        return False
+    _name, _payload, where = parts
+    _run_leakage_entries(optimizer, (entry,), run_kwargs, shot_stream)
+    for site in where:
+        state.leaked.discard(int(site))
+    return True
+
+
+def _apply_leaked_measurement_control(
+    optimizer,
+    entry,
+    state: _LeakageState,
+    event_index,
+    run_kwargs,
+    shot_stream,
+    leakage_records,
+):
+    """Handle ordinary measure/measure-reset controls that touch leaked qubits."""
+    parts = MpsOptimizer.control_event_parts(entry)
+    if parts is None:
+        return False
+    name, payload, where = parts
+    where = tuple(int(site) for site in where)
+    touched = [site for site in where if site in state.leaked]
+    if name not in {"measure", "measure_reset"} or not touched:
+        return False
+    if len(where) != 1:
+        raise NotImplementedError(
+            "leakage-aware multi-qubit measurements are not implemented yet; "
+            "use single-site measure or measure_reset entries."
+        )
+    (site,) = where
+    if name == "measure":
+        pauli = payload["pauli"]
+        _append_optimizer_measurement(optimizer, pauli, where, -1)
+        leakage_records.append(
+            LeakageRecord(
+                event_index=event_index,
+                kind="measure",
+                site=site,
+                initially_leaked=True,
+                finally_leaked=True,
+                measurement=1,
+                branch="leaked",
+            )
+        )
+        return True
+
+    axis = payload["axes"][0]
+    _append_optimizer_measurement(optimizer, axis, where, -1)
+    reset_entry = _reset_zero_entry(site) if axis == "Z" else ("reset", site, axis)
+    state.leaked.discard(site)
+    _run_leakage_entries(optimizer, (reset_entry,), run_kwargs, shot_stream)
+    leakage_records.append(
+        LeakageRecord(
+            event_index=event_index,
+            kind="measure_reset",
+            site=site,
+            initially_leaked=True,
+            finally_leaked=False,
+            measurement=1,
+            branch="leaked_reset",
+        )
+    )
+    return True
+
+
+def _apply_depolarized_leakage(optimizer, site, rng, run_kwargs, shot_stream) -> str:
+    """Replace one leakage event by a full one-qubit depolarizing draw."""
+    axis = str(rng.choice(("I", "X", "Y", "Z")))
+    if axis != "I":
+        _run_leakage_entries(
+            optimizer,
+            (_pauli_gate_entry(axis, site),),
+            run_kwargs,
+            shot_stream,
+        )
+    return f"depolarize_{axis}"
+
+
+def _apply_leakage_event(
+    optimizer,
+    parts,
+    state: _LeakageState,
+    rng,
+    event_index,
+    run_kwargs,
+    shot_stream,
+    leakage_records,
+):
+    """Sample and apply one Pepsy-native leakage event."""
+    kind, payload, where = parts
+    if kind == "leak2depolar":
+        state.leak2depolar = bool(payload["enabled"])
+        leakage_records.append(
+            LeakageRecord(
+                event_index=event_index,
+                kind="leak2depolar",
+                branch="enabled" if state.leak2depolar else "disabled",
+            )
+        )
+        return
+
+    site = _single_leakage_site(where)
+    initially_leaked = site in state.leaked
+
+    if kind == "measure_leaked":
+        if initially_leaked:
+            leakage_records.append(
+                LeakageRecord(
+                    event_index=event_index,
+                    kind="measure_leaked",
+                    site=site,
+                    initially_leaked=True,
+                    finally_leaked=True,
+                    measurement=2,
+                    branch="leaked",
+                )
+            )
+            return
+        entry = ("measure", "Z", site)
+        _run_leakage_entries(optimizer, (entry,), run_kwargs, shot_stream)
+        bit = _last_measurement_bit(optimizer)
+        leakage_records.append(
+            LeakageRecord(
+                event_index=event_index,
+                kind="measure_leaked",
+                site=site,
+                initially_leaked=False,
+                finally_leaked=False,
+                measurement=bit,
+                branch=f"bit_{bit}",
+            )
+        )
+        return
+
+    probability = float(payload["probability"])
+    occurred = bool(rng.random() < probability)
+    if kind == "leakage":
+        depolarize = bool(payload.get("depolarize", False) or state.leak2depolar)
+        branch = "none"
+        if occurred:
+            if depolarize:
+                branch = _apply_depolarized_leakage(
+                    optimizer, site, rng, run_kwargs, shot_stream
+                )
+            elif initially_leaked:
+                branch = "already_leaked"
+            else:
+                _run_leakage_entries(
+                    optimizer,
+                    (_reset_zero_entry(site),),
+                    run_kwargs,
+                    shot_stream,
+                )
+                state.leaked.add(site)
+                branch = "leaked"
+        leakage_records.append(
+            LeakageRecord(
+                event_index=event_index,
+                kind="leakage_depolarize" if depolarize else "leakage",
+                site=site,
+                probability=probability,
+                occurred=occurred,
+                initially_leaked=initially_leaked,
+                finally_leaked=site in state.leaked,
+                branch=branch,
+            )
+        )
+        return
+
+    if kind == "leakage_return":
+        occurred = bool(initially_leaked and rng.random() < probability)
+        branch = "not_leaked" if not initially_leaked else "still_leaked"
+        if occurred:
+            state.leaked.discard(site)
+            entries: list[object] = [_reset_zero_entry(site)]
+            if bool(rng.random() < 0.5):
+                entries.append(_pauli_gate_entry("X", site))
+                branch = "return_1"
+            else:
+                branch = "return_0"
+            _run_leakage_entries(optimizer, tuple(entries), run_kwargs, shot_stream)
+        leakage_records.append(
+            LeakageRecord(
+                event_index=event_index,
+                kind="leakage_return",
+                site=site,
+                probability=probability,
+                occurred=occurred,
+                initially_leaked=initially_leaked,
+                finally_leaked=site in state.leaked,
+                branch=branch,
+            )
+        )
+        return
+
+    raise AssertionError(f"Unhandled leakage event kind {kind!r}.")
+
+
 def _apply_trajectory_event(optimizer, event, rng, event_index, run_kwargs):
     """Sample and apply one channel event, returning its inspectable record."""
     channel = event.channel
@@ -1195,6 +1769,7 @@ class _CoalescedNode:
     faults: list[PauliFault] = field(default_factory=list)
     heralds: list[StimHerald] = field(default_factory=list)
     measurements: list[CoalescedMeasurementRecord] = field(default_factory=list)
+    leakage_records: list[LeakageRecord] = field(default_factory=list)
 
 
 class _CoalescedBranchCapExceeded(RuntimeError):
@@ -1224,6 +1799,7 @@ def _copy_coalesced_node(node: _CoalescedNode) -> _CoalescedNode:
         faults=list(node.faults),
         heralds=list(node.heralds),
         measurements=list(node.measurements),
+        leakage_records=list(node.leakage_records),
     )
 
 
@@ -1509,6 +2085,7 @@ def _coalesced_result(nodes) -> CoalescedTrajectoryResult:
                 faults=tuple(node.faults),
                 heralds=tuple(node.heralds),
                 measurements=tuple(node.measurements),
+                leakage_records=tuple(node.leakage_records),
             )
             for node in nodes
         )
@@ -1619,20 +2196,25 @@ def run_trajectory_shots(
     *,
     seed=None,
     run_kwargs: Optional[Mapping[str, Any]] = None,
-) -> TrajectoryShotResult:
+    strategy: str = "independent",
+    max_branches: int | None = _AUTO_MAX_BRANCHES,
+) -> TrajectoryShotResult | CoalescedTrajectoryResult:
     """Replay user-defined noisy gate-stream trajectories on either MPS optimizer.
 
-    Insert :class:`TrajectoryEvent` directly into an ordinary Pepsy gate
-    stream. A ``mixture`` selects a known unitary branch by its explicit
-    probability. A ``kraus`` channel evaluates all local branch norms on the
-    current MPS, samples the conditional probability, applies the chosen
-    branch, and normalizes before evolution continues. This includes
-    non-Pauli channels such as amplitude damping without forming a density
-    matrix.
+    Insert :class:`TrajectoryEvent` objects or Pepsy stochastic entries directly
+    into an ordinary gate stream. A ``mixture`` selects a known unitary branch
+    by its explicit probability. A ``kraus`` channel evaluates all local branch
+    norms on the current MPS, samples the conditional probability, applies the
+    chosen branch, and normalizes before evolution continues. This includes
+    non-Pauli channels such as ``("amplitude_damping", gamma, q)`` without
+    forming a density matrix.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer` or
     :class:`MpsStabOptimizer` per shot. Gate segments between channel events
     are batched, so a trajectory does not rebuild an optimizer for every gate.
+    Set ``strategy="coalesced"`` to share deterministic prefixes and retain one
+    optimizer per distinct sampled branch. ``strategy="auto"`` tries coalescing
+    and restarts independently if ``max_branches`` would be exceeded.
     """
     if not callable(optimizer_factory):
         raise TypeError("optimizer_factory must construct a fresh optimizer per shot.")
@@ -1643,24 +2225,102 @@ def run_trajectory_shots(
     elif not isinstance(run_kwargs, Mapping):
         raise TypeError("run_kwargs must be a mapping or None.")
 
+    strategy = _validate_strategy(strategy)
+    max_branches = _validate_max_branches(max_branches)
     entries = _trajectory_entries(gates)
+    has_leakage = _contains_leakage_entries(entries)
+    if strategy == "coalesced":
+        if has_leakage:
+            raise NotImplementedError(
+                "coalesced trajectory replay does not yet support stateful "
+                "leakage entries; use strategy='independent' or 'auto'."
+            )
+        return run_coalesced_trajectory_shots(
+            optimizer_factory,
+            entries,
+            shots,
+            seed=seed,
+            run_kwargs=run_kwargs,
+            max_branches=max_branches,
+        )
+    if strategy == "auto" and not has_leakage:
+        try:
+            return run_coalesced_trajectory_shots(
+                optimizer_factory,
+                entries,
+                shots,
+                seed=seed,
+                run_kwargs=run_kwargs,
+                max_branches=max_branches,
+            )
+        except _CoalescedBranchCapExceeded:
+            pass
+
     optimizers = []
     gate_streams = []
     records = []
+    leakage_records = []
     for child_seed in np.random.SeedSequence(seed).spawn(int(shots)):
         optimizer = optimizer_factory()
         _check_trajectory_optimizer(optimizer)
         rng = np.random.default_rng(child_seed)
+        leakage_state = _LeakageState()
         pending = []
         shot_stream = []
         shot_records = []
-        for event_index, entry in enumerate(entries):
-            if not isinstance(entry, TrajectoryEvent):
-                pending.append(entry)
-                continue
+        shot_leakage_records = []
+
+        def flush_pending():
+            nonlocal pending
             _run_trajectory_entries(optimizer, pending, run_kwargs)
             shot_stream.extend(pending)
-            pending.clear()
+            pending = []
+
+        for event_index, entry in enumerate(entries):
+            if not isinstance(entry, TrajectoryEvent):
+                leakage_parts = _leakage_event_parts(entry)
+                if leakage_parts is not None:
+                    flush_pending()
+                    _apply_leakage_event(
+                        optimizer,
+                        leakage_parts,
+                        leakage_state,
+                        rng,
+                        event_index,
+                        run_kwargs,
+                        shot_stream,
+                        shot_leakage_records,
+                    )
+                    continue
+                control_parts = MpsOptimizer.control_event_parts(entry)
+                if control_parts is not None:
+                    if control_parts[0] == "reset":
+                        flush_pending()
+                        _apply_leakage_reset_control(
+                            optimizer,
+                            entry,
+                            leakage_state,
+                            run_kwargs,
+                            shot_stream,
+                        )
+                        continue
+                    if any(int(site) in leakage_state.leaked for site in control_parts[2]):
+                        flush_pending()
+                        if _apply_leaked_measurement_control(
+                            optimizer,
+                            entry,
+                            leakage_state,
+                            event_index,
+                            run_kwargs,
+                            shot_stream,
+                            shot_leakage_records,
+                        ):
+                            continue
+                if _entry_touches_leaked_qubit(entry, leakage_state):
+                    continue
+                pending.append(entry)
+                continue
+            flush_pending()
             record = _apply_trajectory_event(
                 optimizer, entry, rng, event_index, run_kwargs
             )
@@ -1671,12 +2331,17 @@ def run_trajectory_shots(
                 if outcome.label == record.label
             )
             shot_stream.append(_entry_from_trajectory_outcome(outcome, entry.where))
-        _run_trajectory_entries(optimizer, pending, run_kwargs)
-        shot_stream.extend(pending)
+        flush_pending()
         optimizers.append(optimizer)
         gate_streams.append(tuple(shot_stream))
         records.append(tuple(shot_records))
-    return TrajectoryShotResult(tuple(optimizers), tuple(gate_streams), tuple(records))
+        leakage_records.append(tuple(shot_leakage_records))
+    return TrajectoryShotResult(
+        tuple(optimizers),
+        tuple(gate_streams),
+        tuple(records),
+        tuple(leakage_records),
+    )
 
 
 def _apply_coalesced_trajectory_outcome(
@@ -1717,6 +2382,7 @@ def run_coalesced_trajectory_shots(
     *,
     seed=None,
     run_kwargs: Optional[Mapping[str, Any]] = None,
+    max_branches: int | None = None,
 ) -> CoalescedTrajectoryResult:
     """Replay an exact count-coalesced ensemble of quantum trajectories.
 
@@ -1729,16 +2395,29 @@ def run_coalesced_trajectory_shots(
 
     The returned result has one :class:`CoalescedTrajectoryLeaf` per distinct
     final branch, rather than one independently mutable optimizer per shot.
-    Use ``leaf.count`` as that branch's multiplicity.
+    Use ``leaf.count`` as that branch's multiplicity. ``max_branches`` is an
+    exact safety cap: exceeding it raises before retaining more live leaves.
     """
     shots, run_kwargs = _coalesced_inputs(optimizer_factory, shots, run_kwargs)
+    max_branches = _validate_max_branches(max_branches)
+    if _contains_leakage_entries(_trajectory_entries(gates)):
+        raise NotImplementedError(
+            "coalesced trajectory replay does not yet support stateful leakage entries; "
+            "use run_trajectory_shots(..., strategy='independent') instead."
+        )
     nodes = _initial_coalesced_nodes(optimizer_factory, shots)
     rng = np.random.default_rng(seed)
     pending = []
 
     def flush():
         nonlocal nodes, pending
-        nodes = _run_coalesced_entries(nodes, pending, run_kwargs, rng)
+        nodes = _run_coalesced_entries(
+            nodes,
+            pending,
+            run_kwargs,
+            rng,
+            max_branches=max_branches,
+        )
         pending = []
 
     for event_index, entry in enumerate(_trajectory_entries(gates)):
@@ -1762,6 +2441,7 @@ def run_coalesced_trajectory_shots(
                 apply,
                 rng,
                 context="trajectory mixture",
+                max_branches=max_branches,
             )
         else:
             split = []
@@ -1783,6 +2463,7 @@ def run_coalesced_trajectory_shots(
                         apply,
                         rng,
                         context="trajectory Kraus channel",
+                        max_branches=max_branches,
                     )
                 )
             nodes = split
@@ -1816,6 +2497,17 @@ def run_coalesced_noisy_shots(
         raise TypeError("error_model must be a PauliErrorModel.")
     shots, run_kwargs = _coalesced_inputs(optimizer_factory, shots, run_kwargs)
     max_branches = _validate_max_branches(max_branches)
+    entries = _as_entries(gates)
+    if _contains_stochastic_entries(entries):
+        raise ValueError(
+            "Stream-local stochastic entries require run_coalesced_trajectory_shots(...). "
+            "PauliErrorModel is a convenience macro for clean deterministic streams."
+        )
+    if _contains_leakage_entries(entries):
+        raise ValueError(
+            "Stateful leakage entries require run_trajectory_shots(...). "
+            "PauliErrorModel is a convenience macro for clean deterministic streams."
+        )
     nodes = _initial_coalesced_nodes(optimizer_factory, shots)
     rng = np.random.default_rng(seed)
     pending = []
@@ -1829,7 +2521,7 @@ def run_coalesced_noisy_shots(
 
     outcomes = ("I", "X", "Y", "Z")
     probabilities = tuple(error_model.probabilities[label] for label in outcomes)
-    for gate_index, entry in enumerate(_as_entries(gates)):
+    for gate_index, entry in enumerate(entries):
         pending.append((gate_index, entry))
         flush()
         support = _event_support(entry)

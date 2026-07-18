@@ -1758,6 +1758,21 @@ class MpsStabOptimizer:
         kwargs.setdefault("n_qubits", self.n)
         return run_stabilizer_mps_stream(self._queue, **kwargs)
 
+    @classmethod
+    def run_stream(cls, gates, **kwargs) -> StabilizerMpsRunResult:
+        """Run one Pepsy STN gate stream and return a typed result record.
+
+        This is the class-level spelling of :func:`run_stabilizer_mps_stream`
+        for new code that already works through :class:`MpsStabOptimizer` /
+        :class:`StabilizerMpsSimulator`.
+        """
+        return run_stabilizer_mps_stream(gates, **kwargs)
+
+    @classmethod
+    def simulate(cls, gates, **kwargs) -> StabilizerMpsRunResult:
+        """Alias for :meth:`run_stream`."""
+        return cls.run_stream(gates, **kwargs)
+
     # ------------------------------------------------------------------ #
     # Static STN frame auto-layout
     # ------------------------------------------------------------------ #
@@ -3222,6 +3237,24 @@ class MpsStabOptimizer:
             rng.shuffle(out, axis=0)
         return self.pack_bit_samples(out) if packed else out
 
+    def sample_bitstrings(
+        self,
+        shots: int = 1,
+        *,
+        seed=None,
+        order=None,
+        shuffle: bool = True,
+        packed: bool = False,
+    ) -> np.ndarray:
+        """Alias for :meth:`sample_bits` with a more explicit public name."""
+        return self.sample_bits(
+            shots,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+            packed=packed,
+        )
+
     def probability_bits(self, bits, *, order=None) -> float:
         """Return ``|<bits|psi>|**2`` via chain-rule conditionals (scalable).
 
@@ -3301,6 +3334,14 @@ class MpsStabOptimizer:
                 stack.append((child, pos + 1, idx, branch_prob))
         return probs
 
+    def bitstring_probability(self, bits, *, order=None) -> float:
+        """Alias for :meth:`probability_bits`."""
+        return self.probability_bits(bits, order=order)
+
+    def bitstring_probabilities(self, bitstrings, *, order=None) -> np.ndarray:
+        """Alias for :meth:`probability_bits_many`."""
+        return self.probability_bits_many(bitstrings, order=order)
+
     def iter_sample_bits(
         self,
         shots: int,
@@ -3335,6 +3376,26 @@ class MpsStabOptimizer:
                 packed=packed,
             )
             done += take
+
+    def iter_sample_bitstrings(
+        self,
+        shots: int,
+        *,
+        chunk_size: int,
+        seed=None,
+        order=None,
+        shuffle: bool = True,
+        packed: bool = False,
+    ):
+        """Alias for :meth:`iter_sample_bits` with an explicit bitstring name."""
+        yield from self.iter_sample_bits(
+            shots,
+            chunk_size=chunk_size,
+            seed=seed,
+            order=order,
+            shuffle=shuffle,
+            packed=packed,
+        )
 
     # ------------------------------------------------------------------ #
     # Entry dispatch

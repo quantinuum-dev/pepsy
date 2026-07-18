@@ -61,6 +61,42 @@ fh = py.SymMPS.for_model(
 fh.overall_charge()  # (8, 8)
 ```
 
+## Native spinful-fermion helper
+
+``SpinfulFermion`` bundles the local spinful operators, half-filled product
+charge pattern, native Symmray observables, and gate construction for the
+total-number ``U1`` or spin-resolved ``U1U1`` formulation. It keeps the
+simulation in the direct fermionic representation -- it does not construct a
+qubit or Jordan-Wigner circuit. It is not limited to Hamiltonian construction:
+the same object supplies local operators, charged observables, and evolution
+gates.
+
+```python
+fermions = py.SpinfulFermion(
+    symmetry="U1U1",  # use "U1" to conserve only total particle number
+    t=1.0,
+    U=8.0,
+)
+
+site_charge = fermions.half_filled_site_charge(L=16)
+number_up = fermions.observable("number_up")
+pair_create = fermions.observable("pair_create")
+hamiltonian = fermions.hamiltonian(edges)
+
+# A symmetric, edge-coloured second-order step.  Each colour contains
+# vertex-disjoint hopping bonds; forward then reverse colours make the hopping
+# product formula second order as well.
+gates = fermions.strang_gate_stream(edges, dt=0.01, sites=range(16))
+```
+
+``py.SymmFermions`` is the companion namespace for future symmetric-fermion
+helpers. ``py.SymmFermions.spinful(...)`` returns the same ``SpinfulFermion``
+object when a workflow prefers a model-family entry point.
+
+``pair_create`` and ``pair_annihilate`` carry charge ``+2`` and ``-2`` for
+``U1``, or ``(1, 1)`` and ``(-1, -1)`` for ``U1U1``.  Pass those charges to
+``SymMPS.measure`` when evaluating a charged pairing correlator.
+
 ## Random-unitary MPS starts
 
 For DMRG-style random starts, prefer ``SymMPS.random_unitary_evolution`` or the

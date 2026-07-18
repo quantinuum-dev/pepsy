@@ -18,6 +18,7 @@ from .noise import (
     CoalescedSampleResult,
     CoalescedTrajectoryLeaf,
     CoalescedTrajectoryResult,
+    LeakageRecord,
     NoisyShotResult,
     PauliErrorModel,
     PauliFault,
@@ -46,9 +47,25 @@ from .noise import (
     sample_coalesced_bits,
 )
 from .peps import PepsOptimizer, SimpleUpdateGen
-from .stabilizer_tn import MpsStabOptimizer, STNState
+from .stabilizer_tn import (
+    DeferredInjectionRecord,
+    DeferredInjectionReport,
+    DeferredProjectionRecord,
+    ImmediateInjectionReport,
+    ImmediateProjectionRecord,
+    MeasurementRecord,
+    MpsStabOptimizer,
+    NormEventRecord,
+    STNState,
+    StabilizerMpsSettingsAdvice,
+    StabilizerMpsSimulator,
+    StabilizerMpsRunResult,
+    StreamAnalysisRecord,
+    run_stabilizer_mps_stream,
+)
 from .sym_dmrg import SymDMRG2
 from .sweep import SweepOptimizer
+from .tree import TreeOptimizer
 
 __all__ = [
     "CoalescedMeasurementRecord",
@@ -57,11 +74,19 @@ __all__ = [
     "CoalescedTrajectoryResult",
     "EnergyEstimate",
     "GlobalOptimizer",
+    "DeferredInjectionRecord",
+    "DeferredInjectionReport",
+    "DeferredProjectionRecord",
+    "ImmediateInjectionReport",
+    "ImmediateProjectionRecord",
+    "LeakageRecord",
+    "MeasurementRecord",
     "MeraEnergyOptimizer",
     "MpoOptimizer",
     "MpsEnergyOptimizer",
     "MpsOptimizer",
     "MpsStabOptimizer",
+    "NormEventRecord",
     "NoisyShotResult",
     "PauliErrorModel",
     "PauliFault",
@@ -76,6 +101,10 @@ __all__ = [
     "TrajectorySample",
     "TrajectoryShotResult",
     "STNState",
+    "StabilizerMpsSettingsAdvice",
+    "StabilizerMpsSimulator",
+    "StabilizerMpsRunResult",
+    "StreamAnalysisRecord",
     "PepsEnergyOptimizer",
     "PepsOptimizer",
     "QMeraBuilder",
@@ -84,12 +113,14 @@ __all__ = [
     "SimpleUpdateGen",
     "SymDMRG2",
     "SweepOptimizer",
+    "TreeOptimizer",
     "compile_stim_circuit",
     "build_qmera_contraction_optimizer",
     "run_coalesced_noisy_shots",
     "run_coalesced_stim_shots",
     "run_coalesced_trajectory_shots",
     "run_noisy_shots",
+    "run_stabilizer_mps_stream",
     "run_stim_shots",
     "run_trajectory_shots",
     "sample_noisy_gate_stream",
@@ -107,10 +138,23 @@ __all__ = [
     "stabilizer_tn",
     "sym_dmrg",
     "sweep",
+    "tree",
 ]
 
 
 def __getattr__(name):
-    if name in {"energy", "global_opt", "mera", "mpo", "mps", "noise", "peps", "stabilizer_tn", "sym_dmrg", "sweep"}:
+    if name in {
+        "energy",
+        "global_opt",
+        "mera",
+        "mpo",
+        "mps",
+        "noise",
+        "peps",
+        "stabilizer_tn",
+        "sym_dmrg",
+        "sweep",
+        "tree",
+    }:
         return import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
