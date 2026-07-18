@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any
 import warnings
 
@@ -697,10 +698,15 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     ``<psi|H|psi>/<psi|psi>``. Local-term Hamiltonians are evaluated with
     ``MPS.compute_local_expectation_exact(...)``. MPO Hamiltonians are evaluated
     directly as ``(<psi| & H_mpo & |psi>).contract(all, optimize=...)``, using
-    ``contraction_opt`` for the full network contraction. Hamiltonians can be
-    supplied as a ``qtn.MatrixProductOperator``, a ``qtn.LocalHam1D``-like
-    object with ``.terms``, a Pepsy symmetric Hamiltonian, or a plain local-term
-    mapping.
+    ``contraction_opt`` for the full network contraction. Native fermionic
+    Symmray states use native local terms by default when a mapped
+    ``SymHamiltonian`` is supplied. A bosonic/Jordan-Wigner Symmray MPO cannot
+    be silently contracted with a native fermionic state, since the required
+    re-encoding can create very large block contractions; pass
+    ``allow_encoding_conversion=True`` to explicitly request that conversion.
+    Hamiltonians can be supplied as a ``qtn.MatrixProductOperator``, a
+    ``qtn.LocalHam1D``-like object with ``.terms``, a Pepsy symmetric
+    Hamiltonian, or a plain local-term mapping.
     """
 
     _LOSS_KEYS = frozenset({
@@ -710,6 +716,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         "contraction_opt",
         "compute_kwargs",
         "progbar",
+        "allow_encoding_conversion",
     })
 
     def __init__(
@@ -724,6 +731,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         progbar: bool = False,
         compute_kwargs: Mapping[str, Any] | None = None,
         loss_kwargs: Mapping[str, Any] | None = None,
+        allow_encoding_conversion: bool = False,
     ):
         self.state = self._as_mps_state(state)
         self.hamiltonian = hamiltonian
@@ -736,6 +744,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             "contraction_opt": contraction_opt,
             "progbar": progbar,
             "compute_kwargs": {} if compute_kwargs is None else dict(compute_kwargs),
+            "allow_encoding_conversion": bool(allow_encoding_conversion),
         }
         if loss_kwargs is not None:
             self.set_loss_kwargs(**loss_kwargs)
@@ -785,15 +794,42 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
 
     @staticmethod
     def _is_fermionic_array(value):
+        if bool(getattr(value, "fermionic", False)):
+            return True
         return "fermionic" in type(value).__name__.lower()
 
     @classmethod
+    def _symmray_encoding(cls, value):
+        """Infer the representation encoding of a Symmray TN-like object."""
+        encoding = getattr(value, "encoding", None)
+        if encoding in {"native_fermionic", "bosonic_symmray", "mixed_symmray"}:
+            return encoding
+
+        fermionic = getattr(value, "fermionic", None)
+        if fermionic is not None:
+            nested = getattr(value, "tn", None)
+            if nested is not None and nested is not value:
+                nested_encoding = cls._symmray_encoding(nested)
+                if nested_encoding is not None:
+                    return nested_encoding
+            if cls._is_symmray_array(value) or hasattr(value, "fermionic"):
+                return "native_fermionic" if bool(fermionic) else "bosonic_symmray"
+
+        flags = []
+        for data in cls._iter_tn_data(value):
+            if cls._is_symmray_array(data):
+                flags.append(cls._is_fermionic_array(data))
+        if not flags:
+            return None
+        if all(flags):
+            return "native_fermionic"
+        if not any(flags):
+            return "bosonic_symmray"
+        return "mixed_symmray"
+
+    @classmethod
     def _mpo_uses_bosonic_symmray(cls, mpo):
-        for tensor in mpo:
-            data = getattr(tensor, "data", None)
-            if cls._is_symmray_array(data) and not cls._is_fermionic_array(data):
-                return True
-        return False
+        return cls._symmray_encoding(mpo) == "bosonic_symmray"
 
     @staticmethod
     def _symmray_symmetry_name(data):
@@ -1138,14 +1174,11 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
 
     @classmethod
     def _state_uses_bosonic_symmray(cls, state):
-        found_symmray = False
-        for data in cls._iter_tn_data(state):
-            if not cls._is_symmray_array(data):
-                continue
-            found_symmray = True
-            if cls._is_fermionic_array(data):
-                return False
-        return found_symmray
+        return cls._symmray_encoding(state) == "bosonic_symmray"
+
+    @classmethod
+    def _state_uses_fermionic_symmray(cls, state):
+        return cls._symmray_encoding(state) == "native_fermionic"
 
     @classmethod
     def _terms_use_fermionic_symmray(cls, terms):
@@ -1167,6 +1200,19 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             )
 
     @classmethod
+    def _can_use_native_local_terms(cls, hamiltonian, state):
+        """Whether a symmetric Hamiltonian is already indexed by MPS sites."""
+        if not cls._state_uses_fermionic_symmray(state):
+            return False
+        if not cls._terms_use_fermionic_symmray(hamiltonian.terms):
+            return False
+        return all(
+            len(edge) == 2
+            and all(isinstance(site, Integral) for site in edge)
+            for edge in hamiltonian.edges
+        )
+
+    @classmethod
     def _mpo_expectation(
         cls,
         state,
@@ -1174,10 +1220,26 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         *,
         normalized=True,
         contraction_opt="auto-hq",
+        allow_encoding_conversion=False,
     ):
         if contraction_opt is None:
             contraction_opt = build_optimizer(progbar=False)
         state = cls._as_mps_state(state)
+        state_encoding = cls._symmray_encoding(state)
+        mpo_encoding = cls._symmray_encoding(mpo)
+        if (
+            state_encoding == "native_fermionic"
+            and mpo_encoding == "bosonic_symmray"
+            and not allow_encoding_conversion
+        ):
+            raise ValueError(
+                "Symmray encoding mismatch in MPS energy evaluation: the state "
+                "is native fermionic but the MPO is bosonic/Jordan-Wigner. "
+                "Use a mapped native local-term Hamiltonian (for example "
+                "`hamiltonian=ham.terms`) for large-chi energy evaluation, or "
+                "pass `allow_encoding_conversion=True` to explicitly request "
+                "the potentially memory-intensive re-encoding."
+            )
         if cls._mpo_uses_bosonic_symmray(mpo):
             ket = cls._bosonize_fermionic_tn(state)
         else:
@@ -1207,17 +1269,22 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         contraction_opt="auto-hq",
         compute_kwargs=None,
         progbar=False,
+        allow_encoding_conversion=False,
     ):
         state = cls._as_mps_state(state)
         terms = cls._terms_from_hamiltonian(terms)
         if cls._is_fermionic_sym_hamiltonian(terms):
-            terms = cls._fermionic_hamiltonian_mpo_for_state(terms, state)
+            if cls._can_use_native_local_terms(terms, state):
+                terms = terms.terms
+            else:
+                terms = cls._fermionic_hamiltonian_mpo_for_state(terms, state)
         if cls._is_mpo_hamiltonian(terms):
             value = cls._mpo_expectation(
                 state,
                 terms,
                 normalized=normalized,
                 contraction_opt=contraction_opt,
+                allow_encoding_conversion=allow_encoding_conversion,
             )
             if energy_per_site:
                 value = value / cls._num_sites(state)

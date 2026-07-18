@@ -1196,15 +1196,44 @@ def test_fermi_hubbard_u1u1_hamiltonian_builds_mpo_energy_path():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert complex(mpo_energy) == pytest.approx(complex(term_energy))
+
+
+def test_native_fermionic_mps_rejects_bosonic_mpo_without_opt_in():
+    """MPO re-encoding must be explicit for native fermionic MPS states."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        bond_dim=2,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)]),
+        seed=12,
+        dtype="complex128",
+    )
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        [(0, 1)],
+        t=1.0,
+        U=8.0,
+    )
+    mpo = ham.to_mpo(L=2, compress=False)
+
+    with pytest.raises(ValueError, match="encoding mismatch"):
+        pepsy.MpsEnergyOptimizer(
+            state,
+            mpo,
+            energy_per_site=False,
+        ).energy()
 
 
 def test_fermi_hubbard_u1u1_mpo_energy_matches_high_bond_fermionic_mps():
@@ -1234,12 +1263,14 @@ def test_fermi_hubbard_u1u1_mpo_energy_matches_high_bond_fermionic_mps():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert not hasattr(mpo, "_pepsy_source_terms")
@@ -1276,12 +1307,14 @@ def test_symmetric_hamiltonian_to_mpo_supports_spin_models(
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert mpo.L == 2
@@ -1314,6 +1347,7 @@ def test_spinless_fermi_hubbard_u1_hamiltonian_builds_mpo_energy_path():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = state.energy(
         hamiltonian=ham,
@@ -1351,6 +1385,7 @@ def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_matches_shifted_edges():
             mpo,
             energy_per_site=False,
             real=False,
+            allow_encoding_conversion=True,
         ).energy().energy
         term_energy = state.energy(
             hamiltonian=ham,
@@ -1387,18 +1422,21 @@ def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_compresses_long_range():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     energy_compressed = pepsy.MpsEnergyOptimizer(
         state,
         mpo_compressed,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert mpo.max_bond() >= 3
@@ -1452,6 +1490,7 @@ def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_maps_2d_long_range_edge():
             mpo,
             energy_per_site=False,
             real=False,
+            allow_encoding_conversion=True,
         ).energy().energy
 
     assert abs(coo2idx[edge_2d[0]] - coo2idx[edge_2d[1]]) > 1
@@ -1483,12 +1522,14 @@ def test_spinful_fermi_hubbard_total_u1_mpo_builds_energy_path():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert complex(mpo_energy) == pytest.approx(complex(term_energy))
@@ -1520,18 +1561,21 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_handles_long_range_string():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     energy_compressed = pepsy.MpsEnergyOptimizer(
         state,
         mpo_compressed,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert mpo.max_bond() >= 3
@@ -1569,18 +1613,21 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_supports_long_range_density_v():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     energy_compressed = pepsy.MpsEnergyOptimizer(
         state,
         mpo_compressed,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert mpo.max_bond() >= 3
@@ -1628,12 +1675,14 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_matches_two_site_sectors(
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert complex(mpo_energy) == pytest.approx(complex(term_energy))
@@ -1666,6 +1715,7 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_matches_shifted_edges():
                 mpo,
                 energy_per_site=False,
                 real=False,
+                allow_encoding_conversion=True,
             ).energy().energy
             term_energy = state.energy(
                 hamiltonian=ham,
@@ -1701,12 +1751,14 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_builds_pbc_wrap_edge():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     term_energy = pepsy.MpsEnergyOptimizer(
         state,
         ham.terms,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert mpo.L == 4
@@ -1764,6 +1816,7 @@ def test_fermi_hubbard_u1u1_hamiltonian_mpo_maps_2d_edges_with_onedmap():
             mpo,
             energy_per_site=False,
             real=False,
+            allow_encoding_conversion=True,
         ).energy().energy
 
     energy_flat = energy(mpo_from_flat)
@@ -2569,6 +2622,7 @@ def test_fermi_hubbard_u1u1_mpo_matches_terms_on_2d_snake_lattice():
             mpo,
             energy_per_site=False,
             real=False,
+            allow_encoding_conversion=True,
             contraction_opt="greedy",
         ).energy().energy
         term_energy = pepsy.MpsEnergyOptimizer(
@@ -2576,6 +2630,7 @@ def test_fermi_hubbard_u1u1_mpo_matches_terms_on_2d_snake_lattice():
             ham.terms,
             energy_per_site=False,
             real=False,
+            allow_encoding_conversion=True,
             contraction_opt="greedy",
         ).energy().energy
 

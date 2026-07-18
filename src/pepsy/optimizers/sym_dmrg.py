@@ -2568,8 +2568,19 @@ class SymDMRG2:
         if self.init_mps is None:
             return None
         try:
+            initial_state = getattr(self.init_mps, "tn", self.init_mps)
+            if MpsEnergyOptimizer._symmray_encoding(initial_state) == (
+                "native_fermionic"
+            ):
+                # DMRG works with the bosonic/Jordan-Wigner MPO. Convert the
+                # initial state explicitly, before the expectation network is
+                # built, rather than asking the energy optimizer to perform a
+                # hidden encoding conversion inside a large contraction.
+                initial_state = MpsEnergyOptimizer._bosonize_fermionic_tn(
+                    initial_state
+                )
             estimate = MpsEnergyOptimizer(
-                self.init_mps,
+                initial_state,
                 self.mpo,
                 energy_per_site=False,
                 real=False,

@@ -154,6 +154,7 @@ def test_symdmrg2_solves_two_site_symmray_fh_u1u1_dense_reference():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert opt.backend == "symmray"
@@ -172,6 +173,7 @@ def test_symdmrg2_solves_two_site_symmray_fh_u1u1_dense_reference():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert out is opt
@@ -472,6 +474,7 @@ def test_symdmrg2_solves_longer_chain_with_effective_norm():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     left, right = opt.build_environments()
@@ -501,6 +504,7 @@ def test_symdmrg2_solves_longer_chain_with_effective_norm():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert out is opt
@@ -1822,6 +1826,7 @@ def test_symdmrg2_bosonized_state_rejects_fermionic_local_term_energy():
             ham.terms,
             energy_per_site=False,
             real=False,
+            allow_encoding_conversion=True,
         ).energy()
 
     mpo_energy = pepsy.MpsEnergyOptimizer(
@@ -1829,6 +1834,7 @@ def test_symdmrg2_bosonized_state_rejects_fermionic_local_term_energy():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert complex(mpo_energy) == pytest.approx(opt.environment_energy())
@@ -2321,6 +2327,7 @@ def test_symdmrg2_forces_lanczos_sweep_on_four_site_chain():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert out is opt
@@ -2399,6 +2406,7 @@ def test_symdmrg2_lanczos_reaches_fixed_sector_ed_with_full_initial_support():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy.real
 
     opt = pepsy.SymDMRG2(
@@ -2421,6 +2429,7 @@ def test_symdmrg2_lanczos_reaches_fixed_sector_ed_with_full_initial_support():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert opt.energy == pytest.approx(ed_energy, abs=1e-10)
@@ -2580,6 +2589,7 @@ def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy.real
 
     opt = pepsy.SymDMRG2(
@@ -2605,6 +2615,7 @@ def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
     enrichment = opt.sector_enrichment_diagnostics[0]
 
@@ -2838,6 +2849,7 @@ def test_symdmrg2_lanczos_stress_obc_six_site_chain_tracks_svd_sectors():
         mpo,
         energy_per_site=False,
         real=False,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert out is opt
@@ -3200,6 +3212,7 @@ def test_mps_energy_fermionic_symhamiltonian_matches_mapped_mpo_after_dmrg():
         energy_per_site=False,
         normalized=True,
         real=True,
+        allow_encoding_conversion=True,
     ).energy().energy
 
     assert float(np.real(e_ham)) == pytest.approx(energy, abs=1e-9)
@@ -3290,7 +3303,13 @@ def test_symdmrg2_fermionic_state_roundtrip_and_observables():
     )
     assert float(np.real(opt.energy)) == pytest.approx(e_ed, abs=1e-6)
     e_ferm = complex(
-        meo(gs, mpo, energy_per_site=False, real=False).energy().energy
+        meo(
+            gs,
+            mpo,
+            energy_per_site=False,
+            real=False,
+            allow_encoding_conversion=True,
+        ).energy().energy
     )
     assert e_ferm.real == pytest.approx(float(np.real(opt.energy)), abs=1e-9)
 
