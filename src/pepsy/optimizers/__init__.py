@@ -65,7 +65,7 @@ from .stabilizer_tn import (
 )
 from .sym_dmrg import SymDMRG2
 from .sweep import SweepOptimizer
-from .tree import TreeOptimizer
+from .tree import TreeOptimizer, TreeTensorNetwork
 
 __all__ = [
     "CoalescedMeasurementRecord",
@@ -114,6 +114,7 @@ __all__ = [
     "SymDMRG2",
     "SweepOptimizer",
     "TreeOptimizer",
+    "TreeTensorNetwork",
     "compile_stim_circuit",
     "build_qmera_contraction_optimizer",
     "run_coalesced_noisy_shots",

@@ -25,6 +25,40 @@ geodesic with per-edge canonicalisation (Quimb `canonize_between`), mirroring
 the `info_c["cur_orthog"]` centre tracking of `MpsOptimizer`. When the centre is
 unknown it is established once with Quimb `canonize_around`.
 
+## Tree state class
+
+`TreeTensorNetwork` is the tree analogue of Quimb's `MatrixProductState`: a
+geometry-owning subclass of Quimb's arbitrary-geometry vector class
+`quimb.tensor.TensorNetworkGenVector`. It *is* a Quimb tensor network, so all of
+Quimb's arbitrary-geometry methods (`canonize_around`, `canonize_between`,
+`compress_between`, `gate_inds`, `local_expectation`, `to_dense`, `copy`, ...)
+apply directly; the class adds the naming and geometry glue on top of a
+`TreePlan`:
+
+- every node (leaf **and** internal) is one tensor tagged with the structural
+  node tag `node_tag_id.format(nid)` (default `"N{}"`);
+- leaf tensors additionally carry the Quimb site tag `site_tag_id.format(q)`
+  (default `"I{}"`) and physical index `site_ind_id.format(q)` (default `"k{}"`)
+  for qubit `q`, so the inherited site / `local_expectation` machinery treats the
+  leaves as the sites;
+- adjacent nodes share the deterministic virtual bond `_tb{lo}_{hi}`.
+
+Because the geometry (`plan`) and naming live in `_EXTRA_PROPS`, they survive
+`.copy()` and every Quimb view, exactly like `site_ind_id` does for an MPS.
+Build one with `TreeTensorNetwork.from_plan(plan)` (product `|0...0>`),
+`TreeTensorNetwork.from_order(order, structure=...)` (build the plan and the
+product state in one step), or `TreeTensorNetwork.rand(plan, D=..., seed=...)`
+(a random state, canonicalised around the root by default). `TreeOptimizer`
+builds and evolves its state on this class, delegating all node/qubit naming and
+geometry queries to it.
+
+`TreeTensorNetwork.show()` prints a top-down ASCII drawing of the tree -- the
+tree analogue of a quimb MPS `show()` -- with the root at the top and the qubit
+leaves at the bottom, internal nodes marked `●`, leaves `◆` labelled by their
+qubit, and every branch annotated with its current virtual bond dimension
+(`ascii_tree()` returns the same drawing as a string).
+`TreeOptimizer.show()` delegates to it.
+
 ## Tree structure
 
 The tree structure is chosen by `TreeLayoutFinder`, which builds a weighted
@@ -103,6 +137,11 @@ state to unit norm and `max_bond()` reports the largest virtual bond.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.tree.optimizer
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+.. automodule:: pepsy.optimizers.tree.ttn
    :members:
    :undoc-members:
    :show-inheritance:

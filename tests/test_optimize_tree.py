@@ -3,7 +3,12 @@
 import numpy as np
 import pytest
 
-from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer, TreePlan
+from pepsy.optimizers.tree import (
+    TreeLayoutFinder,
+    TreeOptimizer,
+    TreePlan,
+    TreeTensorNetwork,
+)
 
 
 # -- exact statevector reference ----------------------------------------------
@@ -434,5 +439,130 @@ def test_measure_is_seed_reproducible():
     a = TreeOptimizer([(h, 0)], n=2, seed=42).measure(0)
     b = TreeOptimizer([(h, 0)], n=2, seed=42).measure(0)
     assert a == b
+
+
+# -- TreeTensorNetwork class --------------------------------------------------
+
+
+def test_ttn_from_plan_is_product_state():
+    """from_plan builds |0...0> with the expected tags, indices, and sites."""
+    plan = TreePlan.from_order(range(5), structure="balanced")
+    ttn = TreeTensorNetwork.from_plan(plan)
+    assert isinstance(ttn, TreeTensorNetwork)
+    assert ttn.nqubits == 5 == ttn.nsites
+    assert tuple(ttn.sites) == (0, 1, 2, 3, 4)
+    # site index / tag / node tag conventions
+    assert ttn.site_ind(2) == "k2"
+    assert ttn.site_tag(2) == "I2"
+    assert ttn.node_tag(plan.root) == f"N{plan.root}"
+    # dense state is exactly |0...0>
+    sv = ttn.to_statevector()
+    assert sv.shape == (2**5,)
+    assert abs(sv[0] - 1.0) < 1e-12
+    assert np.linalg.norm(sv[1:]) < 1e-12
+
+
+def test_ttn_copy_preserves_geometry_and_type():
+    """copy() keeps the plan, ids, and class, with an independent tid cache."""
+    plan = TreePlan.from_order(range(6), structure="balanced")
+    ttn = TreeTensorNetwork.from_plan(plan)
+    other = ttn.copy()
+    assert type(other) is TreeTensorNetwork
+    assert other.plan is ttn.plan
+    assert other.site_ind_id == ttn.site_ind_id
+    assert other.node_tag_id == ttn.node_tag_id
+    # tid cache is rebuilt lazily on the copy (fresh tensor identities)
+    assert other.node_tid(2) in other.tensor_map
+
+
+def test_ttn_geometry_helpers_match_plan():
+    """Geometry delegators agree with the underlying TreePlan."""
+    plan = TreePlan.from_order(range(6), structure="balanced")
+    ttn = TreeTensorNetwork.from_plan(plan)
+    root = ttn.root
+    for child in ttn.children(root):
+        assert ttn.parent(child) == root
+        assert root in ttn.neighbors(child)
+        # deterministic, symmetric bond name
+        assert ttn.bond(child, root) == ttn.bond(root, child)
+    leaf = ttn.leaf_of_qubit(0)
+    assert ttn.qubit_of_leaf(leaf) == 0
+    assert ttn.is_leaf(leaf)
+    # steiner subtree of two leaves == their node path
+    la, lb = ttn.leaf_of_qubit(0), ttn.leaf_of_qubit(5)
+    assert ttn.steiner_nodes([la, lb]) == set(ttn.node_path(la, lb))
+    with pytest.raises(ValueError):
+        ttn.bond(la, lb)  # non-adjacent
+
+
+def test_ttn_rand_is_canonical_around_root():
+    """rand(canonicalize=True) leaves the root tensor as the orthogonality centre."""
+    import quimb.tensor as qtn
+
+    plan = TreePlan.from_order(range(6), structure="balanced")
+    ttn = TreeTensorNetwork.rand(plan, D=4, seed=0)
+    root_t = ttn.node_tensor(ttn.root)
+    canon_norm = float(
+        np.sqrt(np.abs(qtn.tensor_contract(root_t.H, root_t, output_inds=[])))
+    )
+    full_norm = float(np.sqrt(np.abs((ttn.H & ttn).contract(output_inds=[]))))
+    assert np.isclose(canon_norm, full_norm)
+
+
+@pytest.mark.filterwarnings(
+    "ignore:The contraction tree is not a compressed one"
+)
+def test_ttn_gate_and_local_expectation():
+    """Inherited gate/canonicalisation/expectation work on the tree."""
+    plan = TreePlan.from_order(range(5), structure="balanced")
+    ttn = TreeTensorNetwork.from_plan(plan)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    z = np.array([[1.0, 0.0], [0.0, -1.0]], dtype=complex)
+    ttn.gate_inds_(x, [ttn.site_ind(2)], contract=True)
+    ttn.canonize_around_node_(ttn.leaf_of_qubit(2))
+    val = ttn.local_expectation(z, [2], max_bond=None, optimize="auto")
+    assert abs(val + 1.0) < 1e-9  # <Z> = -1 after X
+
+
+def test_optimizer_state_is_a_tree_tensor_network():
+    """TreeOptimizer builds its state on the TreeTensorNetwork class."""
+    opt = TreeOptimizer(None, n=4)
+    assert isinstance(opt.tn, TreeTensorNetwork)
+    assert opt.tn.plan is opt.plan
+
+
+def test_ttn_show_ascii_tree(capsys):
+    """show() prints a top-down tree with leaf/qubit labels and bond dims."""
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    ttn = TreeTensorNetwork.from_plan(plan)
+    text = ttn.ascii_tree()
+    # root marker on top, qubit leaves labelled at the bottom
+    assert text.splitlines()[0].strip() == "\u25cf"
+    for q in range(4):
+        assert f"q{q}" in text
+    assert "\u25c6" in text  # leaf markers drawn
+    # box-drawing connectors are used
+    assert "\u2534" in text and "\u250c" in text
+
+    def dim_rows(drawing):
+        # bond-dim annotation rows contain only digits and whitespace
+        return [
+            ln for ln in drawing.splitlines()
+            if ln.strip() and all(c.isdigit() or c.isspace() for c in ln)
+        ]
+
+    # product state: every annotated bond dimension is 1
+    rows = dim_rows(text)
+    assert rows and all(set(ln.split()) <= {"1"} for ln in rows)
+    # dropping bond dims removes the annotation rows but keeps the structure
+    assert not dim_rows(ttn.ascii_tree(bond_dims=False))
+    # show() prints the same drawing (+ trailing newline)
+    ttn.show()
+    assert capsys.readouterr().out.rstrip("\n") == text
+    # optimizer delegates to the state's drawing
+    TreeOptimizer(None, n=4).show()
+    assert capsys.readouterr().out.rstrip("\n") == text
+
+
 
 

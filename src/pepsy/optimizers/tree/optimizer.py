@@ -41,6 +41,7 @@ import quimb.tensor as qtn
 
 from ...operators.gates import _normalize_gate_entries
 from .layout import TreeLayoutFinder, TreePlan
+from .ttn import TreeTensorNetwork
 
 __all__ = ["TreeOptimizer"]
 
@@ -98,8 +99,8 @@ class TreeOptimizer:
 
     Attributes
     ----------
-    tn : quimb.tensor.TensorNetwork
-        The live tree tensor network.
+    tn : TreeTensorNetwork
+        The live tree tensor network (a geometry-owning ``quimb`` subclass).
     plan : TreePlan
         The tree structure.
     center : int or None
@@ -138,9 +139,6 @@ class TreeOptimizer:
             raise TypeError("tree must be a TreePlan or None.")
         self.plan = tree
 
-        # Cache node-id -> tensor-id so the hot path avoids re-scanning the tag
-        # map on every gate; entries self-heal when a tensor is replaced.
-        self._nid_to_tid = {}
         self.tn = self._build_product_state()
         # A freshly built product state has every virtual bond at dimension 1,
         # so each tensor is trivially isometric and the state is already in
@@ -166,25 +164,14 @@ class TreeOptimizer:
     # -- construction ---------------------------------------------------------
 
     def _phys(self, q):
-        return f"k{q}"
+        return self.tn.site_ind(q)
 
     def _tag(self, nid):
-        return f"N{nid}"
+        return self.tn.node_tag(nid)
 
     def _tid(self, nid):
-        """Return the tensor id of node ``nid`` via a self-healing cache.
-
-        The cached id is validated against the live tensor map: quimb replaces a
-        tensor's identity when it is rebuilt (e.g. ``gate_inds_`` on a leaf), so
-        a stale entry simply misses the ``tensor_map`` check and is recomputed.
-        Tensor ids are unique and never reused, so this is always safe.
-        """
-        tid = self._nid_to_tid.get(nid)
-        if tid is not None and tid in self.tn.tensor_map:
-            return tid
-        tid = next(iter(self.tn.tag_map[self._tag(nid)]))
-        self._nid_to_tid[nid] = tid
-        return tid
+        """Return the tensor id of node ``nid`` (self-healing cache on the TTN)."""
+        return self.tn.node_tid(nid)
 
     def _thread_ctx(self):
         """Context manager capping BLAS/OpenMP threads for the small tree ops."""
@@ -198,49 +185,14 @@ class TreeOptimizer:
 
     def _neighbors(self, nid):
         """Return the adjacent node ids of ``nid`` (children plus parent)."""
-        nbrs = list(self.plan.children[nid])
-        up = self.plan.parent.get(nid)
-        if up is not None:
-            nbrs.append(up)
-        return nbrs
+        return self.tn.neighbors(nid)
 
     def _steiner_nodes(self, leaves):
-        """Return the node set of the minimal subtree spanning ``leaves``.
-
-        The tree has a unique path between any two nodes, so the union of the
-        paths from ``leaves[0]`` to every other leaf is exactly the minimal
-        connected subtree (Steiner tree) that contains all of them.
-        """
-        root_leaf = leaves[0]
-        nodes = set()
-        for lf in leaves:
-            nodes.update(self.plan.node_path(root_leaf, lf))
-        return nodes
+        """Return the node set of the minimal subtree spanning ``leaves``."""
+        return self.tn.steiner_nodes(leaves)
 
     def _build_product_state(self):
-        plan = self.plan
-        tensors = []
-        for nid in plan.nodes():
-            inds = []
-            shape = []
-            if plan.is_leaf(nid):
-                q = plan.qubit_of_leaf[nid]
-                inds.append(self._phys(q))
-                shape.append(2)
-            for child in plan.children[nid]:
-                inds.append(self._bond_name(nid, child))
-                shape.append(1)
-            up = plan.parent.get(nid)
-            if up is not None:
-                inds.append(self._bond_name(nid, up))
-                shape.append(1)
-            if plan.is_leaf(nid):
-                data = np.zeros(shape, dtype=self.dtype)
-                data[tuple([0] * len(shape))] = 1.0  # |0>
-            else:
-                data = np.ones(shape, dtype=self.dtype)
-            tensors.append(qtn.Tensor(data, inds=inds, tags=[self._tag(nid)]))
-        return qtn.TensorNetwork(tensors)
+        return TreeTensorNetwork.from_plan(self.plan, dtype=self.dtype)
 
     # -- canonical centre tracking -------------------------------------------
 
@@ -445,6 +397,16 @@ class TreeOptimizer:
         """Return the largest virtual bond dimension in the tree."""
         return self.tn.max_bond()
 
+    def show(self, *, bond_dims=True, node_ids=False):
+        """Print a top-down ASCII drawing of the tree with current bond dims.
+
+        Delegates to :meth:`TreeTensorNetwork.show`: the root sits at the top,
+        the qubit leaves at the bottom, internal nodes are ``●``, leaves ``◆``
+        labelled with their qubit, and each edge carries its virtual-bond
+        dimension -- the tree analogue of a ``quimb`` MPS ``show``.
+        """
+        self.tn.show(bond_dims=bond_dims, node_ids=node_ids)
+
     def bond_report(self):
         """Return a summary of the current virtual bond dimensions.
 
@@ -468,9 +430,8 @@ class TreeOptimizer:
 
     def to_dense(self):
         """Return the dense statevector with index order ``k0, k1, ..., k(n-1)``."""
-        out_inds = [self._phys(q) for q in range(self.n)]
         with self._thread_ctx():
-            return np.asarray(self.tn.to_dense(out_inds)).reshape(-1)
+            return self.tn.to_statevector(range(self.n))
 
     def norm(self):
         """Return the state norm ``<psi|psi>**0.5``.
@@ -617,7 +578,6 @@ class TreeOptimizer:
         )
         other.tn = self.tn.copy()
         other.center = self.center
-        other._nid_to_tid = {}  # tids are fresh on copy; rebuilt lazily
         other.G = list(self.G)
         other.where = list(self.where)
         return other

@@ -8,9 +8,11 @@ describe the tree structure.
 
 from .layout import TreeLayoutFinder, TreePlan
 from .optimizer import TreeOptimizer
+from .ttn import TreeTensorNetwork
 
 __all__ = [
     "TreeOptimizer",
+    "TreeTensorNetwork",
     "TreeLayoutFinder",
     "TreePlan",
 ]

@@ -27,13 +27,50 @@ whose leaves carry the physical qubit indices; a bundled gate stream
 `[(gate, where), ...]` is replayed. `where` is an `int` (1q) or a pair of `int`
 (2q); three-plus-qubit supports raise `NotImplementedError`.
 
+## Tree state class (`TreeTensorNetwork`)
+
+`pepsy.TreeTensorNetwork` (also `pepsy.optimizers.TreeTensorNetwork`, source
+`src/pepsy/optimizers/tree/ttn.py`) is the tree analogue of quimb's
+`MatrixProductState`: a geometry-owning subclass of
+`quimb.tensor.TensorNetworkGenVector` (import from `quimb.tensor`, **not** the
+deprecated `tensor_arbgeom`). It owns a `TreePlan` plus the node/site/index
+naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
+`compress_between`, `gate_inds`, `local_expectation`, `to_dense`, `copy`) work
+directly.
+
+- `_EXTRA_PROPS = ("_sites", "_site_tag_id", "_site_ind_id", "_plan",
+  "_node_tag_id")` -- these are copied on `.copy()`/every quimb view. The
+  `__init__` copy-branch guard `if isinstance(ts, TensorNetwork): super().
+  __init__(ts, **o); return` lets the base copy the extra props without the
+  fresh-construction defaults clobbering `_plan`.
+- Each leaf tensor carries **both** the structural node tag `N{nid}` and the
+  quimb site tag `I{q}` plus physical index `k{q}`; internal nodes carry only
+  `N{nid}`. So quimb sees the leaves as the `nsites` sites and internal nodes as
+  ancillary bond carriers -- `local_expectation(G, where=[q], max_bond=None,
+  optimize="auto")` works (emits a cosmetic "not a compressed tree" warning).
+- `node_tid(nid)` is a self-healing tid cache kept in `__dict__` (not
+  `_EXTRA_PROPS`) so a copy starts with a fresh, independent cache.
+- Builders: `from_plan(plan)` (product `|0...0>`), `from_order(order,
+  structure=...)` (plan + product in one call), `rand(plan, D=, seed=,
+  canonicalize=True)` (random state, canonicalised around the root).
+- `show()` prints a top-down ASCII tree (root on top, qubit leaves `◆ q{q}` at
+  the bottom, internal `●`, each branch annotated with its bond dim);
+  `ascii_tree()` returns that string. `TreeOptimizer.show()` delegates to it.
+- `TreeOptimizer.tn` **is** a `TreeTensorNetwork`; the optimizer delegates
+  `_phys->tn.site_ind`, `_tag->tn.node_tag`, `_tid->tn.node_tid`,
+  `_neighbors->tn.neighbors`, `_steiner_nodes->tn.steiner_nodes`, and
+  `_build_product_state->TreeTensorNetwork.from_plan`. Keep these names/values
+  identical (`k{q}`, `N{nid}`, `_tb{lo}_{hi}`) so behaviour is unchanged.
+
 ## Conventions (must stay consistent across optimizer + layout)
 
-- Node ids are ints from `TreePlan`. Tensor tag = `N{nid}` (`_tag`).
-- Physical index of qubit `q` = `k{q}` (`_phys`) -- ket-leg convention.
+- Node ids are ints from `TreePlan`. Tensor tag = `N{nid}` (`TreeTensorNetwork.
+  node_tag`, via optimizer `_tag`).
+- Physical index of qubit `q` = `k{q}` (`TreeTensorNetwork.site_ind`, via
+  optimizer `_phys`) -- ket-leg convention. Leaves also carry site tag `I{q}`.
 - Virtual bond between adjacent nodes `u,v` = `_tb{lo}_{hi}` with `lo<hi`
-  (`_bond_name`). This deterministic name lets splits keep tree-edge identity
-  via `bond_ind=`.
+  (`TreeTensorNetwork.bond` / optimizer `_bond_name`). This deterministic name
+  lets splits keep tree-edge identity via `bond_ind=`.
 - `plan.node_path(a, b)` is the inclusive node-id geodesic (unique in a tree);
   `plan.tree_distance(qa, qb)` is the leaf-to-leaf path length.
 
