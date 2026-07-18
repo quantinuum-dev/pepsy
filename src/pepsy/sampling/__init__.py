@@ -10,6 +10,7 @@ from .samplers import (
     PepsBpSampler,
     VecSampler,
 )
+from .tree import TreeBatchSampleResult, TreeSampleResult, TreeSampler
 
 __all__ = [
     "MpsBatchSampleResult",
@@ -17,14 +18,18 @@ __all__ = [
     "MpsSampler",
     "PEPSSampleResult",
     "PepsBpSampler",
+    "TreeBatchSampleResult",
+    "TreeSampleResult",
+    "TreeSampler",
     "VecSampler",
     "mps",
     "peps",
+    "tree",
     "vector",
 ]
 
 
 def __getattr__(name):
-    if name in {"mps", "peps", "vector"}:
+    if name in {"mps", "peps", "tree", "vector"}:
         return import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

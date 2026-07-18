@@ -28,5 +28,6 @@ optimizers/tree
 solvers/gradient
 solvers/finite_difference
 sampling/samplers
+sampling/tree
 vmc
 ```

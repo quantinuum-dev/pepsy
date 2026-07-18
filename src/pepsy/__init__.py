@@ -153,6 +153,9 @@ _SYMBOL_MODULES = {
     "PEPSSampleResult": ".sampling",
     "PepsBpSampler": ".sampling",
     "VecSampler": ".sampling",
+    "TreeBatchSampleResult": ".sampling",
+    "TreeSampleResult": ".sampling",
+    "TreeSampler": ".sampling",
     "FDSolver": ".solvers",
     "GradSolverResult": ".solvers",
     "GradientOptimizer": ".solvers",
@@ -363,6 +366,9 @@ __all__ = [
     "PEPSSampleResult",
     "PepsBpSampler",
     "VecSampler",
+    "TreeBatchSampleResult",
+    "TreeSampleResult",
+    "TreeSampler",
     "FDSolver",
     "OneDMap",
     "SpinfulFermion",
@@ -505,7 +511,7 @@ if TYPE_CHECKING:
         z,
     )
     from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeOptimizer, run_stabilizer_mps_stream
-    from .sampling import MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, VecSampler
+    from .sampling import MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler
     from .solvers import FDSolver
     from .tensors import (
         OneDMap,
