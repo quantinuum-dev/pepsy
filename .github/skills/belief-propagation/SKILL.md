@@ -1,18 +1,23 @@
 ---
 name: belief-propagation
-description: 'Belief-propagation tensor-network contraction and its loop / cluster / generalized corrections inside pepsy (the `pepsy.bp` subpackage). Use when the user asks to run, build, extend, wrap, or debug: 1-norm BP (`one_norm_bp`) or 2-norm BP for a quimb tensor network; the loop cluster expansion / generalized-loop correction (`loop_cluster_expand`, quimb `contract_gloop_expand`); the loop series expansion (`contract_loop_series_expansion`); disordered-memory / relay-BP convergence robustness (`relay_bp`, `RelayBPResult`); generalized belief propagation (GBP / region graphs, `RegionGraph`, `gen_region_counts`); message reuse / warm-starting; or questions about whether a loop correction needs BP to converge, the cluster-vs-series distinction, the Midha–Zhang free-energy cluster expansion + Kotecký–Preiss error bound, stochastic (MCMC) loop corrections, or how pepsy BP feeds the tensy DEM decoder. Not for QEC-decoder-specific glue (that is the tensy `bp-decoding` skill).'
+description: 'Belief-propagation tensor-network contraction and its loop / cluster / partitioned corrections inside pepsy (the `pepsy.bp` subpackage). Use when the user asks to run, build, extend, wrap, or debug: 1-norm BP (`one_norm_bp`) or 2-norm BP for a quimb tensor network; the loop cluster expansion (`loop_cluster_expand`); the edge-resolved loop series (`loop_series_expand`); partitioned network expansion / PNE (`partitioned_expand`, explicit or higher-rank projectors, recursive schedules, open outputs); Appendix-C weight passing (`weight_pass`); disordered-memory / relay-BP convergence robustness (`relay_bp`, `RelayBPResult`); generalized belief propagation (GBP / region graphs, `RegionGraph`, `gen_region_counts`); message reuse / warm-starting; or questions about whether a loop correction needs BP to converge, the cluster-vs-series-vs-PNE distinction, the Midha–Zhang free-energy cluster expansion + Kotecký–Preiss error bound, stochastic (MCMC) loop corrections, or how pepsy BP feeds the tensy DEM decoder. Not for QEC-decoder-specific glue (that is the tensy `bp-decoding` skill).'
 argument-hint: 'e.g. "run the loop cluster expansion on a PEPS" or "wrap quimb GBP as pepsy region_bp" or "does this correction need BP to converge?"'
 ---
 
-# Belief propagation & loop/cluster corrections in pepsy
+# Belief propagation, loop/cluster corrections, and PNE in pepsy
 
-`pepsy.bp` wraps quimb's belief propagation and adds convergence-robust
-improvements. Keep wrappers **thin** over `quimb.tensor.belief_propagation`; the
-annotated paper trail lives in [`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy/bp/REFERENCES.md).
+`pepsy.bp` wraps quimb's belief propagation and exposes three deliberately
+different correction families: edge-resolved loop series, tensor-region loop
+clusters, and partitioned network expansions (PNE). Keep BP wrappers **thin**
+over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
+[`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy/bp/REFERENCES.md).
 
 ## When to use
 - Run / wrap / extend BP contraction of a quimb `TensorNetwork` in pepsy.
 - Add or debug a **loop / cluster / generalized** correction to BP.
+- Add or debug a partitioned network expansion, including explicit or
+  higher-rank projectors, recursive schedules, residue diagnostics, and open
+  outputs.
 - Reason about **convergence** (does a given correction need a BP fixed point?),
   the cluster-vs-series distinction, or error bounds.
 - Expose a clean pepsy BP/loop-correction API that **tensy** consumes for DEM
@@ -37,6 +42,26 @@ annotated paper trail lives in [`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy
   messages, run_bp, max_iterations, tol, damping, ...) -> LoopClusterResult` —
   loop **cluster** expansion (quimb `contract_gloop_expand`). `.expand(gloops)`
   reuses the converged messages; `.messages` exposes them.
+- `loop_series_expand(tn, gloops, *, norm="2norm"|"1norm", ...)` —
+  edge-resolved loop **series** with explicit excited-bond terms. Its integer
+  cutoff is a maximum excited-bond degree, not a tensor-region size.
+- `partitioned_expand(tn, partition_inds=... | partitions=..., *,
+  norm="2norm"|"1norm", form="linear"|"combinatorial", ...)` — PNE from
+  Evenbly, Gray, and Chan (arXiv:2512.10910). It inserts complementary
+  `P`/`Q=I-P` projectors on selected pairwise virtual indices, optionally
+  retains the residue, supports explicit higher-rank projectors, D1/D2 open
+  outputs, and does not require a converged BP fixed point when projectors or
+  messages are supplied explicitly.
+- `recursive_partitioned_expand(tn, partition_levels, ...)` — fixed recursive
+  PNE schedule. The paper's cost-driven repartitioning is a policy layer; do
+  not silently infer a contraction budget or claim automatic cost optimality.
+- `select_pne_partitions(...)`, `pne_projectors(...)`, and
+  `pne_projector_diagnostics(...)` — residue-based partition selection and
+  projector inspection. Selection is a heuristic, not a rigorous error bound.
+- `weight_pass(tn, *, alpha=0.8, ...) -> WeightPassingResult` — Appendix-C
+  positive-weight passing on a closed pairwise network. Call
+  `result.projectors(rank=r)` and pass the returned projectors to PNE on the
+  returned gauge-transformed network.
 - SU/simple-gauge bridge helpers: `simple_update_messages_from_gauges`,
   `d1bp_from_simple_update_gauges`, `run_d1bp_from_simple_update_gauges`,
   `simple_update_bp_residual`, and `norm1_gloop_expand`. Use these for
@@ -44,6 +69,21 @@ annotated paper trail lives in [`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy
 - Result dataclasses: `RelayBPResult` (`.bp`, `.converged`, `.iterations`,
   `.max_mdiff`, `.contract()`, `.messages`, `.snapshot()`), `LoopClusterResult`
   (`.estimate`, `.bp_converged`, `.bp_iterations`, `.expand()`, `.messages`).
+
+## Keep the correction APIs distinct
+
+Use `loop_expand` only as a selector; do not translate one cutoff into
+another:
+
+| expansion | object being expanded | cutoff / selection |
+| --- | --- | --- |
+| `series` | individual excited bonds and generalized-loop supports | `gloops` = excited-bond degree |
+| `cluster` | tensor regions with counting numbers | `gloops` = tensor-region size or explicit regions |
+| `pne` | selected index partitions into `P` and `Q` subspaces | `partition_inds` or factorized `partitions` |
+
+PNE terms are not loop-cluster regions. A PNE residue is the all-`Q` network;
+retaining it gives the exact projector identity, while dropping it is the
+approximation whose error should be monitored.
 
 ## quimb substrate (do not reimplement)
 `quimb.tensor.belief_propagation`:
@@ -87,6 +127,10 @@ Loop corrections split by how much they need a **converged BP fixed point**:
   loops into regions), but generalized messages can be **harder to converge**.
 - **Relay-BP** (`relay_bp`): the *dynamical* fixed-point hardener (disordered
   memory + relay). Complements the above; does **not** guarantee convergence.
+- **PNE** (`partitioned_expand`): complementary projector identities are exact
+  for any projectors, so a converged BP fixed point is not a mathematical
+  prerequisite. BP messages provide a convenient rank-one choice, while
+  explicit projectors or `weight_pass` provide non-BP and higher-rank choices.
 
 ## SU gauges, Gray's correction, and quimb `norm_gloop_expand`
 - Corrected point from J. Gray: for the **same closed scalar/norm TN**,
@@ -115,13 +159,22 @@ Loop corrections split by how much they need a **converged BP fixed point**:
   barely change rare logical-sector probabilities; use exact/MPS references
   and inspect log-likelihood margins before treating BP+LCE as a decoder.
 - `norm="2norm"` + `combine="sum"` is rejected (D2BP is product-only).
+- PNE selected indices must be pairwise internal virtual indices. Use
+  `form="combinatorial"` for factorized multi-index partitions.
+- D1 open PNE currently requires `allow_open=True` and explicit messages or
+  projectors with `run_bp=False`; D2 open outputs are physical ket/bra pairs.
+- `weight_pass` is intentionally restricted to closed pairwise networks; for a
+  D2 calculation, obtain the environment on the appropriate closed
+  double-layer network before supplying projectors to D2 PNE.
 - Keep `pepsy.bp` out of the lazy top-level namespace (import `pepsy.bp`); do
   **not** edit `src/pepsy/__init__.py` for it.
-- Tests: `tests/test_bp_relay.py`, `tests/test_bp_cluster.py`. Env: py312
+- Tests: `tests/test_bp_relay.py`, `tests/test_bp_cluster.py`,
+  `tests/test_bp_series.py`, and `tests/test_bp_pne.py`. Env: py312
   (`source ~/envs/py312/bin/activate`, `NUMBA_CACHE_DIR=/tmp/numba_cache`).
 
 ## References
 Full annotated list: [`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy/bp/REFERENCES.md).
-Core: Gray et al. 2510.05647 · Midha–Zhang 2510.02290 · Evenbly et al.
-2409.03108 · Tindall et al. 2604.24760 · Sim et al. 2603.08427 · Müller et al.
-2506.01779 · Alkabetz–Arad PRR 3 023073 · Tindall–Fishman SciPost 15 222.
+Core: Evenbly–Gray–Chan 2512.10910 · Gray et al. 2510.05647 · Midha–Zhang
+2510.02290 · Evenbly et al. 2409.03108 · Tindall et al. 2604.24760 · Sim et al.
+2603.08427 · Müller et al. 2506.01779 · Alkabetz–Arad PRR 3 023073 ·
+Tindall–Fishman SciPost 15 222.

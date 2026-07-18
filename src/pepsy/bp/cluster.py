@@ -68,7 +68,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from itertools import chain, combinations
 from math import factorial
-from typing import Any
+from typing import Any, ClassVar
 import warnings
 
 import autoray as ar
@@ -680,6 +680,9 @@ class LoopClusterResult:
         estimate. ``None`` for the 2-norm quimb implementation.
     """
 
+    expansion: ClassVar[str] = "cluster"
+    cutoff_kind: ClassVar[str] = "tensor-region-size"
+
     estimate: Any
     gloops: Any
     norm: str
@@ -1054,7 +1057,7 @@ def select_bp_candidate(
 
 def loop_cluster_expand(
     tn,
-    gloops,
+    gloops=None,
     *,
     norm: str = "2norm",
     combine: str = "prod",
@@ -1099,9 +1102,10 @@ def loop_cluster_expand(
         For ``norm="2norm"`` (default) a wavefunction / PEPS-like network whose
         2-norm ``<psi|psi>`` is formed and contracted.  For ``norm="1norm"`` a
         scalar-valued (closed) tensor network contracted directly.
-    gloops : int or iterable of tuples
-        The cluster specification.  An ``int`` uses all generalized loops up to
-        that many sites; an iterable specifies the generalized loops explicitly.
+    gloops : int or iterable of tuples, optional
+        The cluster specification. An ``int`` uses all generalized loops up to
+        that many tensor sites; an iterable specifies the generalized loops
+        explicitly. ``None`` uses all generalized loops supported by Quimb.
     norm : {"2norm", "1norm"}, optional
         Which BP family to use: ``D2BP`` (2-norm, default) or ``D1BP`` (1-norm).
     combine : {"prod", "sum"}, optional

@@ -20,6 +20,10 @@ side · **[roots]** foundational / prior art.
 | `gauge_all`, `simple_update_core_and_gauges_from_messages`, `run_d1bp_from_simple_update_gauges`, `gauge_all_simple` | nonnegative simple-update ↔ D1BP vector-message bridge; ordinary/relay/DIIS simple-update gauging with exact core compensation | Alkabetz & Arad (2021); Tindall & Fishman (2023); Müller et al. 2506.01779 |
 | `d2bp_from_simple_update_gauges`, `run_d2bp_from_simple_update_gauges`, `simple_update_core_and_gauges_from_d2bp`, `gauge_all(norm="2norm")` | physical PEPS simple-update/Vidal ↔ D2BP density-message bridge: `diag(lambda)` initialization and PSD metric gauge conversion | Tindall & Fishman (2023); Gray et al. 2510.05647 |
 | `loop_cluster_expand`, `LoopClusterResult` | loop **cluster** expansion (thin wrapper over quimb `contract_gloop_expand`) | Gray et al. 2510.05647 |
+| `loop_series_expand`, `LoopSeriesTerm`, `LoopSeriesCache` | edge-resolved `P + Q` loop series for D1BP and D2BP; retains excited-bond degree and distinct embeddings/chord subsets | Evenbly et al. 2409.03108 |
+| `loop_expand` | explicit selector between the edge loop series and region loop-cluster expansion; preserves each method's cutoff and result metadata | Pepsy API |
+| `partitioned_expand`, `pne_expand`, `PNEExpansionResult` | linear and combinatorial partitioned network expansions for D1BP/D2BP, with optional residue, explicit projectors, open outputs, and fixed recursive schedules | Evenbly, Gray & Chan 2512.10910 |
+| `weight_pass`, `WeightPassingResult` | Appendix-C positive-weight passing on closed pairwise networks and rank-`r` projectors in the returned gauge | Evenbly, Gray & Chan 2512.10910 |
 | `linked_cluster_expand`, `LinkedClusterCache`, `select_bp_candidate` | connected-loop/Ursell expansion of `log Z`, cached graph enumeration, and cluster-tail fixed-point selection | Midha & Zhang 2510.02290 |
 
 ---
@@ -32,10 +36,13 @@ active research frontier.**
 - **Evenbly, Pancotti, Milsted, Gray, Chan**, *Loop series expansions for tensor
   networks*, Phys. Rev. Research **8**, 013245 (2026), arXiv:2409.03108.
   The loop **series**: resolve each edge as `|m><m|/I + P⊥`, sum generalized-loop
-  excitations. **[quimb** `contract_loop_series_expansion` **]**. Caveat: the
-  series **diverges in the thermodynamic limit** (combinatorial disconnected
-  loops) — the problem the cluster expansions below fix. Inserts `I − m⊗m`
-  projectors → **fixed-point-sensitive**.
+  excitations. **[quimb** `contract_loop_series_expansion`; **pepsy**
+  `loop_series_expand` **]**. Pepsy keeps the actual excited bond set rather
+  than using only a tensor-region length, so chorded supports and separate
+  lattice embeddings remain distinct. Caveat: the series **diverges in the
+  thermodynamic limit** (combinatorial disconnected loops) — the problem the
+  cluster expansions below fix. Inserts `I − m⊗m` projectors →
+  **fixed-point-sensitive**.
 - **Park, Gray, Chan**, *Simulating quantum dynamics in 2D lattices with tensor
   network influence functional belief propagation*, Phys. Rev. B **112**, 174310
   (2025). Influence-functional BP + linked-cluster expansion; the direct

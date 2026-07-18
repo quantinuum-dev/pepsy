@@ -252,6 +252,37 @@ def test_full_open_leg_loop_cluster_recovers_the_exact_metric():
     )
 
 
+def test_open_leg_loop_selection_cuts_active_bond_and_keeps_both_targets():
+    """Open-bond loops use the two-site dangle condition, not closed gloops."""
+    core, gauges = _su_gauged_peps(4, 4, seed=41)
+    pair = prepare_reduced_bond_pair(
+        core,
+        gauges,
+        where=((1, 1), (1, 2)),
+    )
+    problem = loop_cluster_reduced_update_problem(
+        pair,
+        _cnot(),
+        max_loop_size=4,
+        psd_project=False,
+    )
+
+    active_tids = frozenset((pair.left_tid, pair.right_tid))
+    assert problem.loop_regions
+    assert all(active_tids.issubset(loop) for loop in problem.loop_regions)
+
+    # The intact PEPS has one-sided plaquettes at this cutoff. They must not
+    # become open two-site loop terms merely by unioning them with the anchor.
+    intact_one_sided = {
+        frozenset(loop)
+        for loop in pair.tn.gen_gloops(max_size=4)
+        if bool(active_tids.intersection(loop))
+        and not active_tids.issubset(loop)
+    }
+    assert intact_one_sided
+    assert not intact_one_sided.intersection(problem.loop_regions)
+
+
 @pytest.mark.parametrize("bond_dim", [2, 3])
 def test_four_by_four_full_gloop_matches_exact_nred_and_bred(bond_dim):
     """System-covering gloops should reproduce exact dense 4x4 N_red/b_red."""

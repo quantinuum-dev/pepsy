@@ -788,25 +788,6 @@ def _region_sort_key(region) -> tuple[int, tuple[str, ...]]:
     return (len(region), tuple(sorted(map(repr, region))))
 
 
-def _region_is_connected(tn, region) -> bool:
-    """Return whether a tensor-id region is connected in the TN graph."""
-    region = frozenset(region)
-    if not region:
-        return False
-
-    start = next(iter(region))
-    seen = {start}
-    pending = deque((start,))
-    while pending:
-        tid = pending.popleft()
-        for ix in tn.tensor_map[tid].inds:
-            for neighbor in tn.ind_map.get(ix, ()):
-                if neighbor in region and neighbor not in seen:
-                    seen.add(neighbor)
-                    pending.append(neighbor)
-    return len(seen) == len(region)
-
-
 def _loop_cluster_region_counts(
     pair: ReducedBondPair,
     *,
@@ -815,8 +796,17 @@ def _loop_cluster_region_counts(
     include_full_system: bool | None,
     autocomplete: bool,
 ):
-    """Return active-anchored open-leg loop regions and counting numbers."""
+    """Return active-anchored open-leg loop regions and counting numbers.
+
+    The active bond is not an environment bond: it belongs to the variational
+    tensors ``R_L`` and ``L_R`` and is therefore absent from ``N_red``. Loop
+    enumeration has to use that open topology as well. The active sites are
+    retained as the target support and may dangle, as in quimb's local
+    observable loop construction, but every target site is included in each
+    generated loop cluster.
+    """
     from quimb.tensor.belief_propagation.regions import gen_region_counts
+    import quimb.tensor as qtn
 
     if not isinstance(max_loop_size, (int, np.integer)) or max_loop_size < 0:
         raise ValueError("max_loop_size must be a nonnegative integer")
@@ -830,7 +820,21 @@ def _loop_cluster_region_counts(
     loop_regions = []
 
     if max_loop_size:
-        for loop in pair.tn.gen_gloops(max_size=max_loop_size):
+        # The active virtual bond is carried by R_L and L_R, which are removed
+        # when forming the open-leg environment. Break it before finding
+        # loops, otherwise a path through the spectator tensors can be
+        # incorrectly closed by that bond and classified as an ordinary
+        # generalized loop.
+        loop_tn = pair.tn.copy()
+        loop_tn.tensor_map[pair.right_tid].reindex_({
+            pair.bond_ind: qtn.rand_uuid(),
+        })
+
+        for loop in loop_tn.gen_gloops(
+            max_size=max_loop_size,
+            tids=(pair.left_tid, pair.right_tid),
+            grow_from="alldangle",
+        ):
             loop = frozenset(loop)
             unknown_tids = loop.difference(known_tids)
             if unknown_tids:
@@ -840,7 +844,7 @@ def _loop_cluster_region_counts(
                 )
 
             region = frozenset(anchor | loop)
-            if region == anchor or not _region_is_connected(pair.tn, region):
+            if region == anchor:
                 continue
             regions.add(region)
             loop_regions.append(loop)
@@ -1119,6 +1123,60 @@ def _restore_tensor_network_data(destination, source) -> None:
     destination.exponent = source.exponent
 
 
+def _finish_reduced_gate(
+    tn,
+    gauges,
+    pair: ReducedBondPair,
+    problem,
+    *,
+    max_bond,
+    als_opts,
+    regauge_opts,
+    inplace,
+    result_type,
+):
+    """Solve, reconstruct, and re-gauge any reduced environment problem."""
+    solution = solve_reduced_als(problem, max_bond=max_bond, **als_opts)
+    physical_tn = pair.reconstruct_tn(solution.left, solution.right)
+
+    from .gauges import copy_gauges, gauge_all_simple
+
+    regauge_core, initial_gauges, reused = _warm_start_core_from_physical_tn(
+        physical_tn,
+        gauges,
+    )
+    su_info: dict[str, Any] = {}
+    regauge_opts.setdefault("max_iterations", 20)
+    regauge_opts.setdefault("tol", 0.0)
+    core, updated_gauges, su_info = gauge_all_simple(
+        regauge_core,
+        gauges=initial_gauges,
+        info=su_info,
+        inplace=True,
+        **regauge_opts,
+    )
+
+    if inplace:
+        _restore_tensor_network_data(tn, core)
+        gauges.clear()
+        gauges.update(copy_gauges(updated_gauges))
+        core = tn
+        updated_gauges = gauges
+    else:
+        updated_gauges = copy_gauges(updated_gauges)
+
+    return result_type(
+        core=core,
+        gauges=updated_gauges,
+        physical_tn=physical_tn,
+        pair=pair,
+        problem=problem,
+        solution=solution,
+        su_info=su_info,
+        reused_gauge_count=reused,
+    )
+
+
 def apply_reduced_loop_cluster_gate(
     tn,
     gauges,
@@ -1171,42 +1229,14 @@ def apply_reduced_loop_cluster_gate(
         psd_floor=psd_floor,
         optimize=optimize,
     )
-    solution = solve_reduced_als(problem, max_bond=max_bond, **als_opts)
-    physical_tn = pair.reconstruct_tn(solution.left, solution.right)
-
-    from .gauges import copy_gauges, gauge_all_simple
-
-    regauge_core, initial_gauges, reused = _warm_start_core_from_physical_tn(
-        physical_tn,
+    return _finish_reduced_gate(
+        tn,
         gauges,
-    )
-    su_info: dict[str, Any] = {}
-    regauge_opts.setdefault("max_iterations", 20)
-    regauge_opts.setdefault("tol", 0.0)
-    core, updated_gauges, su_info = gauge_all_simple(
-        regauge_core,
-        gauges=initial_gauges,
-        info=su_info,
-        inplace=True,
-        **regauge_opts,
-    )
-
-    if inplace:
-        _restore_tensor_network_data(tn, core)
-        gauges.clear()
-        gauges.update(copy_gauges(updated_gauges))
-        core = tn
-        updated_gauges = gauges
-    else:
-        updated_gauges = copy_gauges(updated_gauges)
-
-    return ReducedLoopClusterGateResult(
-        core=core,
-        gauges=updated_gauges,
-        physical_tn=physical_tn,
-        pair=pair,
-        problem=problem,
-        solution=solution,
-        su_info=su_info,
-        reused_gauge_count=reused,
+        pair,
+        problem,
+        max_bond=max_bond,
+        als_opts=als_opts,
+        regauge_opts=regauge_opts,
+        inplace=inplace,
+        result_type=ReducedLoopClusterGateResult,
     )

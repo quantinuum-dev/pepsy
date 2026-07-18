@@ -1,16 +1,19 @@
 """Belief-propagation contraction tools for pepsy (pepsy PLAN.md section 1).
 
-This subpackage wraps quimb's belief propagation and adds two
-convergence-robust improvements:
+This subpackage wraps quimb's belief propagation and exposes the BP
+contractions and corrections used by Pepsy:
 
 * :func:`relay_bp` -- the disordered-memory / relay-BP extension that hardens
   the 1-norm or dense 2-norm BP *fixed point* (arXiv:2506.01779).
   :func:`one_norm_bp` and :func:`two_norm_bp` provide the corresponding plain
   runners.
 * :func:`loop_cluster_expand` -- the loop cluster expansion (arXiv:2510.05647),
-  a systematic loop correction that becomes exact when the cluster set covers
-  the system. Fixed-point BP messages are still what justify the formal loop
-  cancellations and fastest finite-cluster convergence.
+* :func:`loop_series_expand` -- the edge-resolved ``P + Q`` loop series
+  (arXiv:2409.03108),
+* :func:`loop_expand` -- an explicit selector between the correction families.
+* :func:`partitioned_expand` -- the partitioned network expansion (PNE,
+  arXiv:2512.10910), with :func:`recursive_partitioned_expand` for fixed
+  recursive schedules. :func:`weight_pass` supplies higher-rank projectors.
 
 Most BP tools are imported explicitly as ``pepsy.bp``. The supported top-level
 workflow entry points are :func:`pepsy.one_norm_bp`, :func:`pepsy.gauge_all`,
@@ -31,6 +34,27 @@ from .cluster import (
     norm1_gloop_expand,
     select_bp_candidate,
 )
+from .series import (
+    LoopSeriesCache,
+    LoopSeriesResult,
+    LoopSeriesTerm,
+    loop_series_expand,
+)
+from .expansion import loop_expand
+from .pne import (
+    PNEExpansionResult,
+    PNEExpansionTerm,
+    PNEPartitionScore,
+    PNEPartitionSelection,
+    RecursivePNEExpansionResult,
+    pne_expand,
+    pne_projector_diagnostics,
+    pne_projectors,
+    partitioned_expand,
+    recursive_partitioned_expand,
+    select_pne_partitions,
+)
+from .weights import WeightPassingResult, weight_pass
 from .gauges import (
     GaugeResult,
     RelayGaugeOptions,
@@ -89,6 +113,9 @@ __all__ = [
     "LoopClusterReducedUpdateProblem",
     "LoopClusterResult",
     "LoopClusterTerm",
+    "LoopSeriesCache",
+    "LoopSeriesResult",
+    "LoopSeriesTerm",
     "RelayGaugeOptions",
     "ReducedALSSolution",
     "ReducedBondPair",
@@ -111,6 +138,21 @@ __all__ = [
     "loop_cluster_expand",
     "linked_cluster_expand",
     "norm1_gloop_expand",
+    "loop_series_expand",
+    "loop_expand",
+    "PNEExpansionResult",
+    "PNEExpansionTerm",
+    "PNEPartitionScore",
+    "PNEPartitionSelection",
+    "RecursivePNEExpansionResult",
+    "WeightPassingResult",
+    "pne_expand",
+    "pne_projector_diagnostics",
+    "pne_projectors",
+    "partitioned_expand",
+    "recursive_partitioned_expand",
+    "select_pne_partitions",
+    "weight_pass",
     "one_norm_bp",
     "prepare_reduced_bond_pair",
     "relay_bp",
