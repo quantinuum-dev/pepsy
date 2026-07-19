@@ -40,6 +40,28 @@ the `orthogonality_center` name-parity alias), `shift_orthogonality_center(node)
 and `is_canonical_form(center)` delegate to the state, so the optimizer and its
 `TreeTensorNetwork` speak the same canonicalisation vocabulary.
 
+## Range / subtree canonicalisation
+
+The single orthogonality centre generalises to a connected **canonical region**
+-- the tree analogue of an MPS mixed-canonical range. `canonical_region` is a
+frozenset of node ids tracked on the `TreeTensorNetwork` alongside (in fact,
+underlying) `orthogonality_center`, which is simply the one-node special case:
+when the region spans more than one node `orthogonality_center` honestly reads
+`None`. `TreeTensorNetwork.canonize_subtree_(nodes)` gauges every tensor
+*outside* a connected subtree to point inward (Quimb `canonize_around` with
+`which="any"`), so the whole state norm is carried by the region tensors --
+contracting just the region against its conjugate reproduces the squared norm,
+exactly as the single centre tensor does for a one-node region. Disconnected
+`nodes` raise unless `span=True` auto-expands to the minimal connected subtree
+that spans them (`subtree_span`). `canonize_around_qubits_(qubits)` is the
+qubit-level entry point: it canonicalises around the minimal subtree spanning
+those qubits' leaves, so the reduced state on a set of qubits is captured by one
+subtree. `is_subtree_canonical_form(nodes)` verifies the outside-is-isometric
+property directly; `is_canonical_form` is its one-node case. `TreeOptimizer`
+mirrors this too: `canonical_region`, `canonize_subtree(nodes, span=...)`,
+`canonize_around_qubits(qubits)`, and `is_subtree_canonical_form(nodes)` all
+delegate to the state.
+
 ## Tree state class
 
 `TreeTensorNetwork` is the tree analogue of Quimb's `MatrixProductState`: a

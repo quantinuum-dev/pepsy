@@ -827,6 +827,116 @@ def test_nonbinary_center_movement_is_canonical():
         assert _fidelity(sv0, ttn.to_statevector()) > 1 - 1e-10
 
 
+def test_subtree_canonicalisation_lossless_and_isometric():
+    """Canonicalising around a connected subtree is lossless and gauges outside inward."""
+    ttn = _entangled_ttn(seed=1)
+    region = {ttn.root, *ttn.children(ttn.root)}
+    assert len(region) > 1
+    sv0 = ttn.to_statevector()
+    ttn.canonize_subtree_(region)
+    assert ttn.canonical_region == frozenset(region)
+    # a multi-node region has no single orthogonality centre
+    assert ttn.orthogonality_center is None
+    assert ttn.is_subtree_canonical_form()          # tracked region
+    assert ttn.is_subtree_canonical_form(region)    # explicit region
+    assert _fidelity(sv0, ttn.to_statevector()) > 1 - 1e-10
+
+
+def test_subtree_norm_concentrates_on_region():
+    """After subtree canonicalisation the whole squared norm is carried by the region."""
+    import quimb.tensor as qtn
+    ttn = _entangled_ttn(seed=2)
+    region = {ttn.root, *ttn.children(ttn.root)}
+    ttn.canonize_subtree_(region)
+    full = float(abs((ttn.H | ttn) ^ all))
+    reg = qtn.TensorNetwork([ttn.node_tensor(n).copy() for n in region])
+    assert np.isclose(float(abs((reg.H | reg) ^ all)), full)
+
+
+def test_single_node_subtree_is_orthogonality_center():
+    """A one-node subtree is exactly an orthogonality centre."""
+    ttn = _entangled_ttn(seed=3)
+    leaf = ttn.leaf_of_qubit(4)
+    ttn.canonize_subtree_({leaf})
+    assert ttn.canonical_region == frozenset({leaf})
+    assert ttn.orthogonality_center == leaf
+    assert ttn.is_canonical_form()
+    assert ttn.is_subtree_canonical_form({leaf})
+
+
+def test_subtree_span_and_connectivity_validation():
+    """subtree_span links arbitrary nodes; a disconnected region needs span=True."""
+    ttn = _entangled_ttn(seed=4)
+    la, lb = ttn.leaf_of_qubit(0), ttn.leaf_of_qubit(5)
+    span = ttn.subtree_span({la, lb})
+    assert set(ttn.node_path(la, lb)) == span
+    # a disconnected node set raises unless auto-spanned
+    with pytest.raises(ValueError):
+        ttn.canonize_subtree_({la, lb})
+    ttn.canonize_subtree_({la, lb}, span=True)
+    assert ttn.canonical_region == frozenset(span)
+    assert ttn.is_subtree_canonical_form()
+
+
+def test_canonize_around_qubits_range():
+    """Qubit-level range canonicalisation spans the right subtree and stays canonical."""
+    ttn = _entangled_ttn(seed=5)
+    sv0 = ttn.to_statevector()
+    ttn.canonize_around_qubits_([1, 2, 3])
+    leaves = [ttn.leaf_of_qubit(q) for q in (1, 2, 3)]
+    assert ttn.canonical_region == frozenset(ttn.subtree_span(leaves))
+    assert ttn.is_subtree_canonical_form()
+    assert _fidelity(sv0, ttn.to_statevector()) > 1 - 1e-10
+    # a single qubit collapses to a one-leaf orthogonality centre
+    ttn.canonize_around_qubits_([2])
+    assert ttn.orthogonality_center == ttn.leaf_of_qubit(2)
+
+
+def test_subtree_region_survives_copy():
+    """A multi-node canonical region rides along with a copy."""
+    ttn = _entangled_ttn(seed=6)
+    region = {ttn.root, *ttn.children(ttn.root)}
+    ttn.canonize_subtree_(region)
+    clone = ttn.copy()
+    assert clone.canonical_region == ttn.canonical_region
+    assert clone.orthogonality_center is None
+    assert clone.is_subtree_canonical_form()
+
+
+def test_nonbinary_subtree_canonicalisation():
+    """Subtree canonicalisation works around an internal star node on a non-binary tree."""
+    plan = _nonbinary_plan()
+    ttn = TreeTensorNetwork.rand(plan, D=3, seed=7)
+    sv0 = ttn.to_statevector()
+    region = {8, 6, 7}  # root plus both arity-3 star nodes
+    ttn.canonize_subtree_(region)
+    assert ttn.canonical_region == frozenset(region)
+    assert ttn.is_subtree_canonical_form()
+    assert _fidelity(sv0, ttn.to_statevector()) > 1 - 1e-10
+
+
+def test_optimizer_subtree_canonicalisation_api():
+    """TreeOptimizer mirrors the state's public subtree-canonicalisation surface."""
+    rng = np.random.default_rng(31)
+    n = 6
+    opt = TreeOptimizer(_random_stream(n, 16, rng), n=n, chi=1 << n)  # exact
+    region = {opt.plan.root, *opt.plan.children[opt.plan.root]}
+    # public canonize_subtree returns self and installs the shared region view
+    assert opt.canonize_subtree(region) is opt
+    assert opt.canonical_region == opt.tn.canonical_region == frozenset(region)
+    assert opt.is_subtree_canonical_form()
+    # qubit-level range entry point
+    assert opt.canonize_around_qubits([0, 5]) is opt
+    leaves = [opt.plan.leaf_of_qubit[q] for q in (0, 5)]
+    assert opt.canonical_region == frozenset(opt.tn.subtree_span(leaves))
+    assert opt.is_subtree_canonical_form()
+    # the region setter writes straight through to the network
+    opt.canonical_region = {opt.plan.root}
+    assert opt.tn.canonical_region == frozenset({opt.plan.root})
+    assert opt.orthogonality_center == opt.plan.root
+
+
+
 
 
 

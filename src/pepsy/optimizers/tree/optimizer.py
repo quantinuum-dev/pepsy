@@ -267,6 +267,54 @@ class TreeOptimizer:
         """
         return self.tn.is_canonical_form(center, tol=tol)
 
+    @property
+    def canonical_region(self):
+        """Frozenset of node ids forming the canonicalised subtree (``None`` if unknown).
+
+        A thin view onto :attr:`TreeTensorNetwork.canonical_region`, the range /
+        subtree generalisation of :attr:`center`: every tensor outside the region
+        points inward toward it.  Assigning validates connectedness.
+        """
+        return self.tn.canonical_region
+
+    @canonical_region.setter
+    def canonical_region(self, value):
+        self.tn.canonical_region = value
+
+    def canonize_subtree(self, nodes, *, span=False):
+        """Canonicalise the state around the connected subtree ``nodes``.
+
+        The range / subtree generalisation of :meth:`shift_orthogonality_center`:
+        every tensor outside the subtree is gauged to point inward, so the whole
+        state norm is carried by the subtree tensors.  Delegates to
+        :meth:`TreeTensorNetwork.canonize_subtree_`; pass ``span=True`` to
+        auto-expand to the minimal connected subtree spanning ``nodes``.  Returns
+        ``self`` so calls chain.
+        """
+        self.tn.canonize_subtree_(nodes, span=span)
+        return self
+
+    def canonize_around_qubits(self, qubits):
+        """Canonicalise around the minimal subtree spanning ``qubits``.
+
+        The qubit-level "range canonicalisation" entry point: gauge every tensor
+        outside the minimal connected subtree spanning the given qubits' leaves
+        to point inward, so the reduced state on those qubits is captured by that
+        subtree.  Delegates to :meth:`TreeTensorNetwork.canonize_around_qubits_`.
+        Returns ``self``.
+        """
+        self.tn.canonize_around_qubits_(qubits)
+        return self
+
+    def is_subtree_canonical_form(self, nodes=None, *, span=False, tol=1e-9):
+        """Whether the state is canonical about the subtree ``nodes``.
+
+        ``nodes`` defaults to the tracked :attr:`canonical_region`.  Delegates to
+        :meth:`TreeTensorNetwork.is_subtree_canonical_form`: every tensor outside
+        the subtree must be an isometry pointing inward.  A diagnostic / test aid.
+        """
+        return self.tn.is_subtree_canonical_form(nodes, span=span, tol=tol)
+
     # -- gate application -----------------------------------------------------
 
     def run(self, gates=None):

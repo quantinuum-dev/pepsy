@@ -77,11 +77,14 @@ directly.
 
 ## Canonical-centre contract (core invariant)
 
-The orthogonality centre is a single node id **owned by the `TreeTensorNetwork`**
-(`ttn.orthogonality_center`, declared in `_EXTRA_PROPS` so it survives `.copy()`
-and quimb views). `TreeOptimizer.center` is a thin property view onto it, so the
+The orthogonality centre is a single node id **owned by the `TreeTensorNetwork`**,
+and it is the one-node case of the more general **canonical region** (a connected
+node set) tracked in `ttn._canonical_region` (declared in `_EXTRA_PROPS` so it
+survives `.copy()` and quimb views). `ttn.orthogonality_center` is *derived* from
+that region: the sole node when the region has size 1, else `None` (honest "no
+single centre"). `TreeOptimizer.center` is a thin property view onto it, so the
 optimizer and the state can never disagree. It is **algorithm state**, not
-cosmetic: every other tensor must be isometric pointing toward the centre so it
+cosmetic: every tensor outside the region must be isometric pointing inward so it
 telescopes to identity between bra and ket.
 
 - `TreeTensorNetwork.shift_orthogonality_center(node)` is the primitive: it walks
@@ -112,6 +115,32 @@ telescopes to identity between bra and ket.
   contraction. Keep this fast path.
 - Any operation that moves/rebuilds the centre must update the tracked centre
   (via `self.center = ...`, i.e. `ttn.orthogonality_center`).
+
+### Range / subtree canonicalisation
+
+The centre generalises to a connected subtree — the tree analogue of an MPS
+mixed-canonical range. Do **not** reintroduce a separate `_orthog_center` field:
+`_canonical_region` is the single source of truth and the single centre is its
+one-node case.
+
+- `ttn.canonize_subtree_(nodes, span=False, absorb="right")` gauges every tensor
+  outside a connected subtree inward via quimb `canonize_around_(tags,
+  which="any")` (**`which="any"`** selects the union of region tags — `"all"`
+  would intersect to empty). The whole norm concentrates on the region:
+  `(region.H | region) ^ all` equals the full squared norm. Sets
+  `_canonical_region`. `canonize_around_node_({nid})` is the one-node delegate.
+- Disconnected `nodes` raise unless `span=True`, which expands to the minimal
+  connected subtree via `ttn.subtree_span(nodes)` (union of tree paths from
+  `nodes[0]`; generalises `steiner_nodes` to arbitrary internal nodes).
+- `ttn.canonize_around_qubits_(qubits)` is the qubit-level "range" entry point =
+  `canonize_subtree_(leaves_of(qubits), span=True)`.
+- `ttn.is_subtree_canonical_form(nodes=None, span=False)` verifies every outside
+  tensor is an inward isometry (defaults to the tracked region);
+  `is_canonical_form` is its one-node case and delegates to it.
+- `TreeOptimizer` mirrors all of this: `canonical_region` property,
+  `canonize_subtree(nodes, span=...)`, `canonize_around_qubits(qubits)`,
+  `is_subtree_canonical_form(nodes)` — all thin delegates to the state.
+
 
 ## Two-qubit gate = exact threading + one compression sweep
 

@@ -89,7 +89,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         "_site_ind_id",
         "_plan",
         "_node_tag_id",
-        "_orthog_center",
+        "_canonical_region",
     )
 
     def __init__(self, ts=(), *, plan=None, sites=None, site_tag_id="I{}",
@@ -110,10 +110,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self._site_tag_id = site_tag_id
         self._site_ind_id = site_ind_id
         self._node_tag_id = node_tag_id
-        # Node id of the current orthogonality centre (``None`` if unknown).
+        # Frozenset of node ids forming the canonicalised subtree (``None`` if
+        # unknown); a one-node region is exactly an orthogonality centre.
         # Tracked here -- surviving ``.copy()`` via ``_EXTRA_PROPS`` -- so the
         # canonical form is a property of the *state*, not of any one driver.
-        self._orthog_center = None
+        self._canonical_region = None
 
     # -- geometry / naming ----------------------------------------------------
 
@@ -139,24 +140,56 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         This is the tree analogue of an MPS canonical centre: when it is a node
         ``c`` every *other* tensor is an isometry whose legs point toward ``c``
         (``absorb="right"`` convention), so the whole state norm collapses onto
-        the single centre tensor.  It is updated in place by
+        the single centre tensor.  It is the one-node special case of
+        :attr:`canonical_region`; it is updated in place by
         :meth:`shift_orthogonality_center` and :meth:`canonize_around_node_`,
-        and -- being declared in :attr:`_EXTRA_PROPS` -- it survives ``.copy()``
-        and every ``quimb`` view/selection, so any holder of the state (the
-        :class:`~pepsy.optimizers.tree.TreeOptimizer`, a sampler, a direct user)
-        reads a single consistent centre rather than tracking its own.
+        and -- being derived from a field declared in :attr:`_EXTRA_PROPS` -- it
+        survives ``.copy()`` and every ``quimb`` view/selection, so any holder
+        of the state (the :class:`~pepsy.optimizers.tree.TreeOptimizer`, a
+        sampler, a direct user) reads a single consistent centre rather than
+        tracking its own.  It reads ``None`` whenever the canonicalised region
+        spans more than one node (an honest "no single centre").
         """
-        return getattr(self, "_orthog_center", None)
+        reg = self.canonical_region
+        if reg is not None and len(reg) == 1:
+            return next(iter(reg))
+        return None
 
     @orthogonality_center.setter
     def orthogonality_center(self, value):
-        if value is not None and value not in self._plan.children:
+        if value is None:
+            self._canonical_region = None
+            return
+        if value not in self._plan.children:
             raise ValueError(f"{value!r} is not a node of the tree.")
-        self._orthog_center = value
+        self._canonical_region = frozenset({value})
+
+    @property
+    def canonical_region(self):
+        """Frozenset of node ids forming the canonicalised subtree (``None`` if unknown).
+
+        The range / subtree generalisation of :attr:`orthogonality_center`: when
+        it is a connected node set ``R`` every tensor *outside* ``R`` is an
+        isometry whose legs point inward toward ``R`` (``absorb="right"``
+        convention), so the entire state norm is carried by the region tensors
+        -- contracting just the region against its conjugate gives the squared
+        norm, exactly as the single centre tensor does for a one-node region.
+        It is updated in place by :meth:`canonize_subtree_` (and its qubit-level
+        entry point :meth:`canonize_around_qubits_`) and, being declared in
+        :attr:`_EXTRA_PROPS`, survives ``.copy()`` and every ``quimb`` view.
+        """
+        return getattr(self, "_canonical_region", None)
+
+    @canonical_region.setter
+    def canonical_region(self, value):
+        if value is None:
+            self._canonical_region = None
+            return
+        self._canonical_region = self._validated_region(value)
 
     def _with_center(self, nid):
         """Set the tracked centre and return ``self`` (builder convenience)."""
-        self._orthog_center = nid
+        self._canonical_region = frozenset({nid})
         return self
 
     @property
@@ -249,6 +282,57 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             nodes.update(self._plan.node_path(root_leaf, lf))
         return nodes
 
+    def subtree_span(self, nodes):
+        """Return the node set of the minimal connected subtree spanning ``nodes``.
+
+        Generalises :meth:`steiner_nodes` to *arbitrary* nodes (leaves and
+        internal): the union of the unique tree paths from ``nodes[0]`` to every
+        other node is the minimal connected subtree containing them all.
+        """
+        nodes = list(nodes)
+        if not nodes:
+            raise ValueError("need at least one node to span a subtree.")
+        for nid in nodes:
+            if nid not in self._plan.children:
+                raise ValueError(f"{nid!r} is not a node of the tree.")
+        anchor = nodes[0]
+        span = set()
+        for nid in nodes:
+            span.update(self._plan.node_path(anchor, nid))
+        return span
+
+    def _validated_region(self, nodes, *, span=False):
+        """Return a frozenset for the canonical region defined by ``nodes``.
+
+        Validates every id is a real node.  With ``span=True`` the result is the
+        minimal connected subtree spanning ``nodes`` (via :meth:`subtree_span`);
+        with ``span=False`` the ``nodes`` must *already* form a connected
+        subtree, else a :class:`ValueError` names the missing linking nodes.
+        """
+        want = set(nodes)
+        if not want:
+            raise ValueError("a canonical region needs at least one node.")
+        span_set = self.subtree_span(want)
+        if span:
+            return frozenset(span_set)
+        if span_set != want:
+            missing = sorted(span_set - want)
+            raise ValueError(
+                f"nodes {sorted(want)} are not a connected subtree; the minimal "
+                f"spanning subtree also needs {missing} (pass span=True to "
+                f"include them)."
+            )
+        return frozenset(want)
+
+    def _toward_region(self, nid, region):
+        """Return the neighbour of ``nid`` that steps toward the subtree ``region``."""
+        best = None
+        for r in region:
+            p = self._plan.node_path(nid, r)
+            if best is None or len(p) < len(best):
+                best = p
+        return best[1]
+
     # -- edge-level canonical / compression helpers ---------------------------
 
     def _track_edge_center(self, a, b, absorb):
@@ -262,11 +346,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """
         cur = self.orthogonality_center
         if absorb == "right" and cur == a:
-            self._orthog_center = b
+            self._canonical_region = frozenset({b})
         elif absorb == "left" and cur == b:
-            self._orthog_center = a
+            self._canonical_region = frozenset({a})
         else:
-            self._orthog_center = None
+            self._canonical_region = None
 
     def canonize_edge_(self, a, b, absorb="right"):
         """Canonicalise across the tree edge ``a -> b`` in place.
@@ -306,13 +390,46 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         the state norm collapses onto the ``nid`` tensor; :attr:`orthogonality_center`
         is set to ``nid``.  This is the O(N) "establish a centre from scratch"
         path -- prefer :meth:`shift_orthogonality_center` for an incremental move
-        from a *known* centre.
+        from a *known* centre.  It is the one-node special case of
+        :meth:`canonize_subtree_`.
         """
         if nid not in self._plan.children:
             raise ValueError(f"{nid!r} is not a node of the tree.")
-        self.canonize_around_(self.node_tag(nid))
-        self._orthog_center = nid
+        return self.canonize_subtree_({nid})
+
+    def canonize_subtree_(self, nodes, *, span=False, absorb="right"):
+        """Canonicalise the tree around the connected subtree ``nodes`` in place.
+
+        The range / subtree generalisation of :meth:`canonize_around_node_`:
+        every tensor *outside* the subtree becomes an isometry pointing inward
+        toward it (inward QR gauging via
+        :meth:`quimb.tensor.TensorNetwork.canonize_around`), so the entire state
+        norm is carried by the subtree tensors -- contracting just the subtree
+        against its conjugate reproduces the squared norm.  The tracked
+        :attr:`canonical_region` is set to the subtree (and
+        :attr:`orthogonality_center` reads that node iff the subtree is a single
+        node).
+
+        ``nodes`` must form a connected subtree; pass ``span=True`` to auto-expand
+        to the minimal connected subtree that spans them.  Returns ``self``.
+        """
+        region = self._validated_region(nodes, span=span)
+        tags = [self.node_tag(n) for n in region]
+        self.canonize_around_(tags, which="any", absorb=absorb)
+        self._canonical_region = region
         return self
+
+    def canonize_around_qubits_(self, qubits, *, absorb="right"):
+        """Canonicalise around the minimal subtree spanning ``qubits`` in place.
+
+        The qubit-level "range canonicalisation" entry point: given a set of
+        qubit labels, gauge every tensor outside the minimal connected subtree
+        that spans those qubits' leaves to point inward, so the reduced state on
+        those qubits is captured by that subtree.  Equivalent to
+        ``canonize_subtree_(leaves_of(qubits), span=True)``.  Returns ``self``.
+        """
+        leaves = [self.leaf_of_qubit(q) for q in qubits]
+        return self.canonize_subtree_(leaves, span=True, absorb=absorb)
 
     def shift_orthogonality_center(self, new, *, absorb="right"):
         """Move the tracked orthogonality centre to node ``new`` in place.
@@ -341,7 +458,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         for u, v in zip(path, path[1:]):
             self.canonize_between(self.node_tag(u), self.node_tag(v),
                                   absorb=absorb)
-        self._orthog_center = new
+        self._canonical_region = frozenset({new})
         return self
 
     def is_canonical_form(self, center=None, *, tol=1e-9):
@@ -352,16 +469,36 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         ``center`` are treated as inputs (i.e. ``T @ T^dagger`` over those legs is
         the identity on the toward-centre bond).  ``center`` defaults to the
         tracked :attr:`orthogonality_center`; an unknown centre returns ``False``.
-        Primarily a diagnostic / test aid.
+        Primarily a diagnostic / test aid; it is the one-node case of
+        :meth:`is_subtree_canonical_form`.
         """
         if center is None:
             center = self.orthogonality_center
         if center is None:
             return False
+        return self.is_subtree_canonical_form({center}, tol=tol)
+
+    def is_subtree_canonical_form(self, nodes=None, *, span=False, tol=1e-9):
+        """Return whether the tree is canonical about the subtree ``nodes``.
+
+        Checks the defining property directly: every tensor *outside* the
+        subtree must be an isometry when all its legs *except* the one pointing
+        inward toward the subtree are treated as inputs (``T @ T^dagger`` over
+        those legs is the identity on the inward bond).  ``nodes`` defaults to
+        the tracked :attr:`canonical_region`; an unknown region returns
+        ``False``.  Pass ``span=True`` to test against the minimal connected
+        subtree spanning ``nodes``.  Primarily a diagnostic / test aid.
+        """
+        if nodes is None:
+            region = self.canonical_region
+            if region is None:
+                return False
+        else:
+            region = self._validated_region(nodes, span=span)
         for nid in self._plan.nodes():
-            if nid == center:
+            if nid in region:
                 continue
-            toward = self._plan.node_path(nid, center)[1]
+            toward = self._toward_region(nid, region)
             t = self.node_tensor(nid)
             bond = next(iter(qtn.bonds(t, self.node_tensor(toward))))
             tc = t.H.reindex({bond: bond + "*"})
