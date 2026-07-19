@@ -681,8 +681,9 @@ class TreeOptimizer:
             threads=self.threads,
             run=False,
         )
-        # ``TreeTensorNetwork.copy`` carries ``_orthog_center`` (an _EXTRA_PROPS
-        # field), so the copied network already reports the right centre.
+        # ``TreeTensorNetwork.copy`` carries ``_canonical_region`` (an
+        # _EXTRA_PROPS field), so the copied network already reports the right
+        # centre / canonical region.
         other.tn = self.tn.copy()
         other.G = list(self.G)
         other.where = list(self.where)
