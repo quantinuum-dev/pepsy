@@ -326,7 +326,13 @@ class TreeOptimizer:
         return self
 
     def apply_gate(self, gate, where):
-        """Apply a one- or two-qubit gate at qubit support ``where``."""
+        """Apply a gate at qubit support ``where``.
+
+        One- and two-qubit gates take the optimised leaf-absorb / geodesic
+        threading paths (:meth:`apply_1q`, :meth:`apply_2q`); gates on three or
+        more qubits are applied in one shot over their minimal spanning subtree
+        via :meth:`apply_subtree_operator`.
+        """
         where = _normalize_where(where)
         with self._thread_ctx():
             if len(where) == 1:
@@ -339,9 +345,12 @@ class TreeOptimizer:
                     )
                 self.apply_2q(gate, where[0], where[1])
             else:
-                raise NotImplementedError(
-                    "TreeOptimizer supports one- and two-qubit gates only."
-                )
+                if len(set(where)) != len(where):
+                    raise ValueError(
+                        "A multi-qubit gate needs distinct qubits; "
+                        f"got where={where}."
+                    )
+                self.apply_subtree_operator(gate, where)
 
     def apply_1q(self, gate, q):
         """Absorb a one-qubit gate into the leaf tensor of qubit ``q``."""
@@ -495,6 +504,155 @@ class TreeOptimizer:
                 absorb="right",
             )
         self.center = path[0]
+
+    # -- general multi-qubit / sub-MPO application ----------------------------
+
+    def apply_subtree_operator(self, op, where, *, max_bond=None,
+                               cutoff=None, renormalize=False):
+        """Apply a general multi-qubit operator over its minimal subtree.
+
+        The one-shot generalisation of :meth:`apply_2q` to an operator on
+        ``k >= 1`` qubits -- a ``k``-qubit gate (e.g. a Toffoli), a multi-site
+        non-unitary / Kraus operator, or a whole Trotter block -- applied as a
+        single object rather than decomposed into one- and two-qubit gates.
+
+        The operator is contracted onto the *minimal connected subtree* (Steiner
+        subtree) spanning the target leaves and the result is re-split back into
+        that subtree with truncating SVDs: the tree analogue of a sub-MPO applied
+        over the covering range and then compressed (cf. ``quimb``'s
+        ``MatrixProductState.gate_with_submpo``, which exists for the 1D chain
+        only).  The orthogonality centre is first moved onto a target leaf so the
+        whole exterior is isometric and every re-split truncation sees the
+        complete operator against an isometric environment; the centre is left on
+        a node inside the subtree.
+
+        ``op`` acts on ``len(where)`` qubits: an array reshaped to ``(2,) * 2k``
+        with output indices first, ``op[o_0..o_{k-1}, i_0..i_{k-1}]`` (a
+        ``(2**k, 2**k)`` matrix is accepted and reshaped).  It need **not** be
+        unitary; pass ``renormalize=True`` to renormalise the state afterwards
+        (e.g. after a Kraus/projection operator).  ``max_bond`` / ``cutoff``
+        default to the optimizer's ``chi`` / ``cutoff``.  Returns ``self``.
+        """
+        where = _normalize_where(where)
+        k = len(where)
+        if len(set(where)) != k:
+            raise ValueError(
+                f"apply_subtree_operator needs distinct qubits; got {where}."
+            )
+        max_bond = self.chi if max_bond is None else int(max_bond)
+        cutoff = self.cutoff if cutoff is None else float(cutoff)
+        phys = [self._phys(q) for q in where]
+        op_arr = np.asarray(op).reshape([2] * (2 * k))
+
+        with self._thread_ctx():
+            if k == 1:
+                # Single-site operator (possibly non-unitary): centre on the leaf
+                # so it holds the (rescaled) norm, then absorb the operator.
+                leaf = self.plan.leaf_of_qubit[where[0]]
+                self._move_center(leaf)
+                self.tn.gate_inds_(op_arr, [phys[0]], contract=True)
+                self.center = leaf
+                if renormalize:
+                    self.normalize()
+                return self
+
+            leaves = [self.plan.leaf_of_qubit[q] for q in where]
+            snodes = self._steiner_nodes(leaves)
+            # Centre on a target leaf so the whole exterior is isometric toward
+            # the subtree; every re-split truncation then measures true state
+            # error (the isometric exterior cancels between bra and ket).
+            if self.center not in snodes:
+                self._move_center(leaves[0])
+
+            # Record, from the *live* tensors, the index names each subtree node
+            # owns and keeps after contraction -- its physical leg and its
+            # boundary bonds to exterior nodes (gate application renames bonds off
+            # the deterministic scheme, so these must be read, not reconstructed).
+            snode_set = set(snodes)
+            owned = self._subtree_owned_inds(snodes, snode_set)
+
+            # Contract the whole subtree (copies) into one blob, apply the
+            # operator to the physical legs, then re-split back into the subtree.
+            order, hub = self._peel_order(snodes)
+            ket_ts = [
+                self.tn.tensor_map[self._tid(nid)].copy() for nid in snodes
+            ]
+            blob = qtn.tensor_contract(*ket_ts)
+            gt = qtn.Tensor(op_arr, inds=[p + "*" for p in phys] + phys)
+            blob = qtn.tensor_contract(blob, gt).reindex_(
+                {p + "*": p for p in phys}
+            )
+
+            # Peel each subtree-leaf toward the hub with a truncating SVD; the
+            # peeled tensor is isometric (``absorb="right"``) and the norm rides
+            # into the shrinking blob, ending on the hub tensor.  Each new bond
+            # is registered on its hub-side node so a later peel keeps it.
+            for u, v in order:
+                left_inds = [ix for ix in blob.inds if ix in owned[u]]
+                new_bond = self._bond_name(u, v)
+                tu, blob = blob.split(
+                    left_inds=left_inds, method="svd", max_bond=max_bond,
+                    cutoff=cutoff, absorb="right", get="tensors",
+                    bond_ind=new_bond,
+                )
+                node_t = self.tn.tensor_map[self._tid(u)]
+                node_t.modify(data=tu.data, inds=tu.inds)
+                owned[v].add(new_bond)
+            hub_t = self.tn.tensor_map[self._tid(hub)]
+            hub_t.modify(data=blob.data, inds=blob.inds)
+            self.center = hub
+
+            if renormalize:
+                self.normalize()
+        return self
+
+    def _subtree_owned_inds(self, snodes, snode_set):
+        """Return ``{node: {index names it keeps after contraction}}``.
+
+        For each subtree node this is its physical index (if a leaf) plus the
+        actual boundary-bond indices it shares with nodes *outside* the subtree,
+        read from the live tensors (gate application renames bonds off the
+        deterministic scheme, so the real names must be observed).  Bonds
+        internal to the subtree are omitted -- they are contracted into the blob.
+        """
+        owned = {}
+        for u in snodes:
+            t_u = self.tn.tensor_map[self._tid(u)]
+            ixs = set()
+            q = self.plan.qubit_of_leaf.get(u)
+            if q is not None:
+                ixs.add(self._phys(q))
+            for w in self._neighbors(u):
+                if w not in snode_set:
+                    t_w = self.tn.tensor_map[self._tid(w)]
+                    ixs.update(qtn.bonds(t_u, t_w))
+            owned[u] = ixs
+        return owned
+
+    def _peel_order(self, snodes):
+        """Return ``(peels, hub)`` for re-splitting a contracted subtree.
+
+        ``peels`` is a list of ``(u, v)`` edges: repeatedly a current
+        subtree-leaf ``u`` (with a single remaining subtree neighbour ``v``) is
+        peeled off toward ``v`` until a single ``hub`` node remains -- the node
+        the orthogonality centre ends on.  Deterministic (smallest id first).
+        """
+        remaining = set(snodes)
+        adj = {
+            u: [w for w in self._neighbors(u) if w in remaining]
+            for u in remaining
+        }
+        peels = []
+        while len(remaining) > 1:
+            leaf = next(
+                u for u in sorted(remaining)
+                if sum(1 for w in adj[u] if w in remaining) == 1
+            )
+            v = next(w for w in adj[leaf] if w in remaining)
+            peels.append((leaf, v))
+            remaining.discard(leaf)
+        hub = next(iter(remaining))
+        return peels, hub
 
     # -- readout --------------------------------------------------------------
 

@@ -21,6 +21,11 @@ through the same machinery. Gates are absorbed into the tree:
   `chi` -- so each truncation sees the complete gate, markedly more accurate at
   finite `chi` than truncating each hop as the bond is threaded (Seitz et al.,
   Figs. 3-6).
+- **operators on three or more qubits** -- a `k`-qubit gate (Toffoli, Fredkin),
+  a multi-site non-unitary / Kraus operator, or a whole Trotter block -- are
+  applied *in one shot* over their minimal spanning subtree by
+  `apply_subtree_operator`; `apply_gate` routes any support with `len(where) >= 3`
+  there automatically (see *Multi-qubit / sub-MPO application*).
 
 The orthogonality centre is a single node id tracked on the
 `TreeTensorNetwork` itself (`orthogonality_center`), so the state -- not any one
@@ -61,6 +66,30 @@ property directly; `is_canonical_form` is its one-node case. `TreeOptimizer`
 mirrors this too: `canonical_region`, `canonize_subtree(nodes, span=...)`,
 `canonize_around_qubits(qubits)`, and `is_subtree_canonical_form(nodes)` all
 delegate to the state.
+
+## Multi-qubit / sub-MPO application
+
+`apply_subtree_operator(op, where, *, max_bond=None, cutoff=None, renormalize=False)`
+applies a general operator on `k >= 1` qubits as a single object, the one-shot
+generalisation of the two-qubit gate: a `k`-qubit gate, a multi-site
+**non-unitary / Kraus** operator, or a whole **Trotter block**. It is the tree
+analogue of a sub-MPO applied over the covering range and then compressed (cf.
+Quimb's `MatrixProductState.gate_with_submpo`, which exists for the 1D chain
+only). The operator is contracted onto the **minimal connected subtree** (Steiner
+subtree) spanning the target leaves and the result re-split back into that
+subtree with truncating SVDs. The orthogonality centre is first moved onto a
+target leaf so the whole exterior is isometric and every re-split truncation sees
+the complete operator against an isometric environment; the centre is left inside
+the subtree, so the state stays in canonical form.
+
+`op` acts on `len(where)` qubits: an array reshaped to `(2,) * 2k` with output
+indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
+accepted). It need **not** be unitary; pass `renormalize=True` to renormalise
+afterwards (e.g. after a Kraus/projection operator). `max_bond` / `cutoff`
+default to the optimizer's `chi` / `cutoff`. `apply_gate` dispatches `len(where)
+== 1` and `== 2` to the optimised leaf-absorb / geodesic-threading paths and any
+larger support to `apply_subtree_operator`; the cost scales with the operator's
+spread (the boundary of its spanning subtree) rather than the whole tree.
 
 ## Tree state class
 

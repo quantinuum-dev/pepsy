@@ -26,7 +26,8 @@ Quantum 7, 964, 2023; arXiv:2206.01000). The state is a rooted TTN (internal
 nodes of **any arity**; binary is the default, see *Non-binary trees* below)
 whose leaves carry the physical qubit indices; a bundled gate stream
 `[(gate, where), ...]` is replayed. `where` is an `int` (1q) or a pair of `int`
-(2q); three-plus-qubit supports raise `NotImplementedError`.
+(2q); supports with `len(where) >= 3` route through
+`apply_subtree_operator` (see *Multi-qubit / sub-MPO application*).
 
 ## Tree state class (`TreeTensorNetwork`)
 
@@ -173,6 +174,39 @@ new centre). Both new bonds keep their canonical `_tb...` names via `bond_ind=`.
 This is the common case in a good layout and avoids the QR hops and double-bond
 fusion. Leaves are never directly bonded (both bond only to the parent), so the
 correlation flows through the parent blob -- this is exact up to the truncation.
+
+## Multi-qubit / sub-MPO application (`apply_subtree_operator`)
+
+`apply_subtree_operator(op, where, *, max_bond=None, cutoff=None,
+renormalize=False)` applies a general operator on `k >= 1` qubits in one shot --
+a `k`-qubit gate, a multi-site **non-unitary / Kraus** operator, or a whole
+**Trotter block**. It is the arbitrary-`k` generalisation of `_apply_2q_siblings`
+to the whole spanning subtree, the tree analogue of a sub-MPO applied over a
+covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductState`
+-only; the tree base `TensorNetworkGenVector` has no such method).
+
+1. `snodes = _steiner_nodes(leaves)` -- minimal connected subtree spanning the
+   target leaves.
+2. Move the centre onto a target leaf if it is not already inside `snodes`
+   (`_move_center(leaves[0])`, incremental) so the **whole exterior is isometric
+   toward the subtree** -- each re-split truncation then measures true state
+   error.
+3. Contract copies of all `snodes` tensors into one blob; apply `op`
+   (`op[o_0..,i_0..]`, output indices first) on the physical legs.
+4. `_peel_order(snodes)` -> peel each current subtree-leaf toward a hub with a
+   truncating SVD (`absorb="right"` -> peeled tensor isometric, norm rides into
+   the shrinking blob); the last node is the hub / new centre.
+5. `renormalize=True` renormalises afterwards (for Kraus/projection).
+
+**Critical gotcha:** identify each node's kept legs from the **live tensors**,
+not from `_bond_name`. Gate application renames bonds off the deterministic
+`_tb{lo}_{hi}` scheme (quimb mints `_...` uuids in every split), so
+`_subtree_owned_inds` reads the real boundary-bond names via
+`qtn.bonds(t_u, t_w)` for exterior neighbours `w`; only the **new** peel bonds
+are (re)named with `_bond_name(u, v)` and registered on the hub-side node so a
+later peel keeps them. `apply_gate` routes `len(where) >= 3` here; `k == 1`/`k ==
+2` still take the optimised leaf-absorb / threading paths (but `k == 1`
+non-unitary and `k == 2` Kraus can be sent here explicitly).
 
 ## Readout
 

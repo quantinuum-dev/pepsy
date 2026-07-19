@@ -27,6 +27,15 @@ def _sv_apply_2q(psi, g, a, b, n):
     return np.moveaxis(psi, [0, 1], [a, b]).reshape(-1)
 
 
+def _sv_apply_kq(psi, g, where, n):
+    """Exact statevector application of a ``k``-qubit operator on ``where``."""
+    k = len(where)
+    g = np.asarray(g).reshape([2] * (2 * k))
+    psi = psi.reshape([2] * n)
+    psi = np.tensordot(g, psi, axes=(list(range(k, 2 * k)), list(where)))
+    return np.moveaxis(psi, range(k), where).reshape(-1)
+
+
 def _rand_unitary(k, rng):
     m = rng.standard_normal((2**k, 2**k)) + 1j * rng.standard_normal((2**k, 2**k))
     q, _ = np.linalg.qr(m)
@@ -304,6 +313,114 @@ def test_two_qubit_gate_rejects_repeated_qubit():
     opt = TreeOptimizer(None, n=4, chi=8)
     with pytest.raises(ValueError, match="two distinct qubits"):
         opt.apply_gate(_rand_unitary(2, rng), (2, 2))
+
+
+@pytest.mark.parametrize("where", [(0, 3, 5), (1, 2, 6), (0, 1, 2)])
+def test_apply_subtree_operator_3q_matches_dense(where):
+    """A three-qubit gate over its spanning subtree matches the dense state."""
+    rng = np.random.default_rng(20)
+    n = 7
+    stream = _random_stream(n, 24, rng, two_qubit_frac=0.7)
+    opt = TreeOptimizer(stream, n=n, chi=64)
+    psi = _exact_state(stream, n)
+
+    g3 = _rand_unitary(3, rng)
+    opt.apply_subtree_operator(g3, where)
+    psi = _sv_apply_kq(psi, g3, where, n)
+
+    assert _fidelity(psi, opt.to_dense()) > 1 - 1e-9
+    # unitary gate preserves the norm and leaves a valid canonical form
+    assert abs(opt.norm() - np.linalg.norm(psi)) < 1e-9
+    assert opt.is_canonical_form()
+
+
+def test_apply_gate_routes_three_qubit_gate_to_subtree():
+    """apply_gate on three qubits routes to apply_subtree_operator (no error)."""
+    rng = np.random.default_rng(21)
+    n = 6
+    stream = _random_stream(n, 18, rng, two_qubit_frac=0.6)
+    opt = TreeOptimizer(stream, n=n, chi=64)
+    psi = _exact_state(stream, n)
+
+    g3 = _rand_unitary(3, rng)
+    opt.apply_gate(g3, (0, 2, 4))
+    psi = _sv_apply_kq(psi, g3, (0, 2, 4), n)
+    assert _fidelity(psi, opt.to_dense()) > 1 - 1e-9
+
+
+def test_apply_gate_four_qubit_trotter_block_matches_dense():
+    """A four-qubit block applied in one shot matches the dense reference."""
+    rng = np.random.default_rng(22)
+    n = 8
+    stream = _random_stream(n, 30, rng, two_qubit_frac=0.7)
+    opt = TreeOptimizer(stream, n=n, chi=128)
+    psi = _exact_state(stream, n)
+
+    block = _rand_unitary(4, rng)
+    where = (1, 3, 5, 7)
+    opt.apply_gate(block, where)
+    psi = _sv_apply_kq(psi, block, where, n)
+
+    assert _fidelity(psi, opt.to_dense()) > 1 - 1e-8
+    assert opt.is_canonical_form()
+
+
+def test_apply_gate_rejects_repeated_qubit_multi():
+    """A multi-qubit gate with a repeated qubit is rejected loudly."""
+    rng = np.random.default_rng(23)
+    opt = TreeOptimizer(None, n=6, chi=8)
+    with pytest.raises(ValueError, match="distinct qubits"):
+        opt.apply_gate(_rand_unitary(3, rng), (1, 3, 1))
+
+
+def test_apply_subtree_operator_nonunitary_renormalizes():
+    """A non-unitary (Kraus) operator with renormalize keeps a unit-norm state."""
+    rng = np.random.default_rng(24)
+    n = 7
+    stream = _random_stream(n, 24, rng, two_qubit_frac=0.7)
+    opt = TreeOptimizer(stream, n=n, chi=64)
+    psi = _exact_state(stream, n)
+
+    kraus = 0.3 * (
+        rng.standard_normal((8, 8)) + 1j * rng.standard_normal((8, 8))
+    )
+    where = (2, 5, 6)
+    opt.apply_subtree_operator(kraus, where, renormalize=True)
+    psi = _sv_apply_kq(psi, kraus, where, n)
+    psi = psi / np.linalg.norm(psi)
+
+    assert _fidelity(psi, opt.to_dense()) > 1 - 1e-9
+    assert abs(opt.norm() - 1.0) < 1e-9
+    assert opt.is_canonical_form()
+
+
+def test_apply_subtree_operator_single_qubit_nonunitary():
+    """A single-qubit non-unitary operator centres on the leaf and applies exactly."""
+    rng = np.random.default_rng(25)
+    n = 5
+    stream = _random_stream(n, 16, rng)
+    opt = TreeOptimizer(stream, n=n, chi=32)
+    psi = _exact_state(stream, n)
+
+    op = rng.standard_normal((2, 2)) + 1j * rng.standard_normal((2, 2))
+    opt.apply_subtree_operator(op, 3)
+    psi = _sv_apply_kq(psi, op, (3,), n)
+
+    assert _fidelity(psi, opt.to_dense()) > 1 - 1e-10
+    assert opt.center == opt.plan.leaf_of_qubit[3]
+    assert opt.is_canonical_form()
+
+
+def test_apply_subtree_operator_respects_max_bond():
+    """The re-split truncation honours an explicit max_bond override."""
+    rng = np.random.default_rng(26)
+    n = 8
+    stream = _random_stream(n, 36, rng, two_qubit_frac=0.8)
+    opt = TreeOptimizer(stream, n=n, chi=64)
+
+    opt.apply_subtree_operator(_rand_unitary(4, rng), (0, 2, 5, 7), max_bond=6)
+    assert opt.max_bond() <= 6
+    assert opt.is_canonical_form()
 
 
 def test_tid_cache_self_heals_after_leaf_replacement():
