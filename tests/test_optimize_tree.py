@@ -564,5 +564,270 @@ def test_ttn_show_ascii_tree(capsys):
     assert capsys.readouterr().out.rstrip("\n") == text
 
 
+# -- non-binary / arbitrary-arity trees ---------------------------------------
+
+
+def _nonbinary_plan():
+    """Two arity-3 star nodes under a binary root over qubits 0..5."""
+    children = {
+        0: (), 1: (), 2: (), 3: (), 4: (), 5: (),
+        6: (0, 1, 2), 7: (3, 4, 5), 8: (6, 7),
+    }
+    qubit_of_leaf = {i: i for i in range(6)}
+    return TreePlan.from_children(children, qubit_of_leaf)
+
+
+def test_from_children_builds_and_validates():
+    """from_children builds an arbitrary-arity tree and validates its shape."""
+    plan = _nonbinary_plan()
+    assert plan.n == 6
+    assert plan.root == 8
+    assert plan.max_arity() == 3
+    assert not plan.is_binary()
+    assert plan.parent[6] == 8 and plan.parent[0] == 6
+    # star geodesics inside a clique are length two (vs up to three when split)
+    assert plan.tree_distance(0, 1) == 2
+    assert plan.tree_distance(0, 2) == 2
+
+
+def test_from_children_rejects_invalid_trees():
+    """from_children raises on malformed children / leaf maps."""
+    # a node with two parents
+    with pytest.raises(ValueError):
+        TreePlan.from_children(
+            {0: (), 1: (), 2: (0, 1), 3: (0,)}, {0: 0, 1: 1}
+        )
+    # a leaf missing its qubit assignment
+    with pytest.raises(ValueError):
+        TreePlan.from_children({0: (), 1: (), 2: (0, 1)}, {0: 0})
+    # leaf qubits must be 0..n-1 without gaps
+    with pytest.raises(ValueError):
+        TreePlan.from_children(
+            {0: (), 1: (), 2: (0, 1)}, {0: 0, 1: 2}
+        )
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_nonbinary_tree_matches_statevector(seed):
+    """Untruncated replay on a hand-built non-binary tree is exact."""
+    rng = np.random.default_rng(seed)
+    n = 6
+    plan = _nonbinary_plan()
+    stream = _random_stream(n, 8 * n, rng)
+    opt = TreeOptimizer(stream, n=n, tree=plan, chi=256)
+    psi = _exact_state(stream, n)
+    assert _fidelity(psi, opt.to_dense()) > 1 - 1e-8
+
+
+@pytest.mark.parametrize("max_arity", [3, 4])
+def test_kary_layout_flatter_and_exact(max_arity):
+    """k-ary layouts raise the arity and still replay exactly at large chi."""
+    rng = np.random.default_rng(11)
+    n = 8
+    plan = TreePlan.from_order(range(n), structure="balanced",
+                               max_arity=max_arity)
+    assert plan.max_arity() <= max_arity
+    assert plan.max_arity() > 2  # genuinely non-binary
+    stream = _random_stream(n, 40, rng)
+    opt = TreeOptimizer(stream, n=n, tree=plan, chi=1 << n)
+    psi = _exact_state(stream, n)
+    assert _fidelity(psi, opt.to_dense()) > 1 - 1e-8
+
+
+def test_binary_defaults_unchanged():
+    """max_arity=2 keeps the strictly-binary tree for every structure."""
+    for structure in ("quality", "balanced"):
+        plan = TreePlan.from_order(range(9), structure=structure)
+        assert plan.is_binary()
+    # the layout finder default is still a binary tree
+    rng = np.random.default_rng(2)
+    stream = _random_stream(8, 60, rng)
+    assert TreeLayoutFinder(stream, n=8).run().is_binary()
+
+
+def test_adaptive_layout_emits_star_for_cliques():
+    """Adaptive layout collapses mutually coupled cliques into flat stars."""
+    stream = []
+    for _ in range(20):
+        for a, b in [(0, 1), (1, 2), (0, 2), (3, 4), (4, 5), (3, 5)]:
+            stream.append((np.eye(4, dtype=complex), (a, b)))
+    stream.append((np.eye(4, dtype=complex), (2, 3)))  # weak cross link
+    finder = TreeLayoutFinder(stream, n=6, structure="adaptive",
+                              max_arity=None)
+    plan = finder.run()
+    assert plan.max_arity() == 3  # each clique becomes an arity-3 star
+    # every intra-clique geodesic is the star length two
+    for a, b in [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5)]:
+        assert plan.tree_distance(a, b) == 2
+    # and it is a better structure than the binary layout for these weights
+    binary = TreePlan.from_order(range(6), weights=finder._similarity_weights(),
+                                 structure="quality", max_arity=2)
+    assert finder.score(plan) < finder.score(binary)
+
+
+def test_adaptive_layout_replays_exactly():
+    """A star-containing adaptive tree replays a random circuit exactly."""
+    rng = np.random.default_rng(7)
+    n = 6
+    # build an adaptive plan from a clustered stream, then replay a fresh one
+    layout_stream = []
+    for _ in range(15):
+        for a, b in [(0, 1), (1, 2), (0, 2), (3, 4), (4, 5), (3, 5)]:
+            layout_stream.append((_rand_unitary(2, rng), (a, b)))
+    plan = TreeLayoutFinder(layout_stream, n=n, structure="adaptive",
+                            max_arity=None).run()
+    assert not plan.is_binary()
+    stream = _random_stream(n, 40, rng)
+    opt = TreeOptimizer(stream, n=n, tree=plan, chi=1 << n)
+    psi = _exact_state(stream, n)
+    assert _fidelity(psi, opt.to_dense()) > 1 - 1e-8
+
+
+def test_nonbinary_ascii_tree_renders_arity():
+    """ascii_tree draws an internal node with more than two children."""
+    plan = _nonbinary_plan()
+    ttn = TreeTensorNetwork.from_plan(plan)
+    text = ttn.ascii_tree()
+    for q in range(6):
+        assert f"q{q}" in text
+    # an arity-3 star centres the middle child under the parent stem ('┼')
+    assert "\u253c" in text
+
+
+# -- orthogonality-centre movement --------------------------------------------
+
+
+def _entangled_ttn(seed=0, n=6, D=3, structure="balanced"):
+    """A canonical-at-root random tree state for centre-movement tests."""
+    plan = TreePlan.from_order(range(n), structure=structure)
+    return TreeTensorNetwork.rand(plan, D=D, seed=seed)
+
+
+def test_shift_center_lossless_and_recanonical():
+    """Shifting the centre preserves the state exactly and re-canonicalises."""
+    ttn = _entangled_ttn(seed=1)
+    assert ttn.orthogonality_center == ttn.root
+    assert ttn.is_canonical_form()  # about the tracked centre
+    sv0 = ttn.to_statevector()
+    for target in (
+        ttn.leaf_of_qubit(5), ttn.leaf_of_qubit(0), ttn.root,
+        ttn.leaf_of_qubit(3),
+    ):
+        ttn.shift_orthogonality_center(target)
+        assert ttn.orthogonality_center == target
+        assert ttn.is_canonical_form(target)
+        assert _fidelity(sv0, ttn.to_statevector()) > 1 - 1e-10
+
+
+def test_shift_center_idempotent_touches_nothing():
+    """Shifting to the current centre is a no-op that mutates no tensor."""
+    ttn = _entangled_ttn(seed=2)
+    snap = {nid: np.array(ttn.node_tensor(nid).data) for nid in ttn.plan.nodes()}
+    ttn.shift_orthogonality_center(ttn.orthogonality_center)
+    for nid in ttn.plan.nodes():
+        assert np.array_equal(ttn.node_tensor(nid).data, snap[nid])
+
+
+def test_shift_center_from_unknown_canonicalises_once():
+    """An unknown centre falls back to a full canonicalisation about the target."""
+    plan = TreePlan.from_order(range(6), structure="balanced")
+    ttn = TreeTensorNetwork.rand(plan, D=3, seed=3, canonicalize=False)
+    assert ttn.orthogonality_center is None
+    assert not ttn.is_canonical_form()
+    leaf = ttn.leaf_of_qubit(4)
+    ttn.shift_orthogonality_center(leaf)
+    assert ttn.orthogonality_center == leaf
+    assert ttn.is_canonical_form(leaf)
+
+
+def test_center_move_only_touches_geodesic():
+    """A centre move is O(path length): off-geodesic tensors are untouched."""
+    ttn = _entangled_ttn(seed=4)
+    src = ttn.orthogonality_center
+    dst = ttn.leaf_of_qubit(5)
+    path = set(ttn.node_path(src, dst))
+    off = [nid for nid in ttn.plan.nodes() if nid not in path]
+    assert off  # the geodesic does not span the whole tree
+    snap = {nid: np.array(ttn.node_tensor(nid).data) for nid in off}
+    ttn.shift_orthogonality_center(dst)
+    for nid in off:
+        assert np.array_equal(ttn.node_tensor(nid).data, snap[nid])
+
+
+def test_shift_center_validates_node():
+    """Shifting to a non-node raises loudly."""
+    ttn = _entangled_ttn(seed=5)
+    with pytest.raises(ValueError):
+        ttn.shift_orthogonality_center(9999)
+
+
+def test_canonize_edge_tracks_centre_honestly():
+    """A lone edge move advances the centre by one hop or marks it unknown."""
+    ttn = _entangled_ttn(seed=6)  # centre at root
+    root = ttn.root
+    c0, c1 = ttn.children(root)[:2]
+    ttn.canonize_edge_(root, c0, absorb="right")  # centre root -> c0
+    assert ttn.orthogonality_center == c0
+    # an edge move not starting at the centre cannot leave a global centre
+    ttn.canonize_edge_(root, c1, absorb="right")
+    assert ttn.orthogonality_center is None
+
+
+def test_center_survives_copy():
+    """The tracked centre rides along with a network / optimizer copy."""
+    opt = TreeOptimizer(None, n=6, chi=8)
+    opt._move_center(opt.plan.leaf_of_qubit[4])
+    ttn2 = opt.tn.copy()
+    assert ttn2.orthogonality_center == opt.tn.orthogonality_center
+    other = opt.copy()
+    assert other.center == opt.center
+    assert other.tn.orthogonality_center == opt.tn.orthogonality_center
+
+
+def test_optimizer_center_is_network_view():
+    """optimizer.center is a single value shared with the network; moves stay canonical."""
+    rng = np.random.default_rng(11)
+    n = 6
+    opt = TreeOptimizer(_random_stream(n, 20, rng), n=n, chi=1 << n)  # exact
+    assert opt.center == opt.tn.orthogonality_center
+    for q in (0, 5, 2):
+        leaf = opt.plan.leaf_of_qubit[q]
+        opt._move_center(leaf)
+        assert opt.center == leaf == opt.tn.orthogonality_center
+        assert opt.tn.is_canonical_form(leaf)
+
+
+def test_optimizer_public_canonicalisation_api():
+    """TreeOptimizer exposes the same public canonicalisation surface as its state."""
+    rng = np.random.default_rng(21)
+    n = 6
+    opt = TreeOptimizer(_random_stream(n, 18, rng), n=n, chi=1 << n)  # exact
+    # name-parity alias reads the single shared centre
+    assert opt.orthogonality_center == opt.center == opt.tn.orthogonality_center
+    # public shift returns self and moves the shared centre, staying canonical
+    leaf = opt.plan.leaf_of_qubit[4]
+    assert opt.shift_orthogonality_center(leaf) is opt
+    assert opt.center == leaf
+    assert opt.is_canonical_form()  # about the tracked centre
+    assert opt.is_canonical_form(leaf)
+    # the alias setter writes straight through to the network
+    opt.orthogonality_center = opt.plan.root
+    assert opt.tn.orthogonality_center == opt.plan.root
+
+
+def test_nonbinary_center_movement_is_canonical():
+    """Centre movement is exact and canonical on a non-binary tree, incl. internal nodes."""
+    plan = _nonbinary_plan()
+    ttn = TreeTensorNetwork.rand(plan, D=3, seed=7)
+    sv0 = ttn.to_statevector()
+    for target in (ttn.leaf_of_qubit(0), 6, 7, ttn.leaf_of_qubit(5), ttn.root):
+        ttn.shift_orthogonality_center(target)
+        assert ttn.orthogonality_center == target
+        assert ttn.is_canonical_form(target)
+        assert _fidelity(sv0, ttn.to_statevector()) > 1 - 1e-10
+
+
+
+
 
 

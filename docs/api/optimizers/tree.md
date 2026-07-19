@@ -5,8 +5,10 @@ gate stream `[(gate, where), ...]` on a **rooted tree tensor network**, after
 *Simulating quantum circuits using tree tensor networks* (Seitz, Medina, Cruz,
 Huang, Mendl; Quantum 7, 964, 2023; [arXiv:2206.01000](https://arxiv.org/abs/2206.01000)).
 
-The state is stored with one leaf tensor per qubit. Gates are absorbed into the
-tree:
+The state is stored with one leaf tensor per qubit. Internal nodes may have
+**any arity** -- the default is a strictly-binary tree, but flatter `k`-ary
+trees or gate-connectivity-driven communities (see *Tree structure*) work
+through the same machinery. Gates are absorbed into the tree:
 
 - **single-qubit gates** are contracted into the leaf tensor with no bond
   growth; a unitary one-qubit gate preserves the tree canonical form regardless
@@ -20,10 +22,23 @@ tree:
   finite `chi` than truncating each hop as the bond is threaded (Seitz et al.,
   Figs. 3-6).
 
-The orthogonality centre is tracked as a node id and moved along the tree
-geodesic with per-edge canonicalisation (Quimb `canonize_between`), mirroring
-the `info_c["cur_orthog"]` centre tracking of `MpsOptimizer`. When the centre is
-unknown it is established once with Quimb `canonize_around`.
+The orthogonality centre is a single node id tracked on the
+`TreeTensorNetwork` itself (`orthogonality_center`), so the state -- not any one
+driver -- owns the canonical form; it survives `.copy()` and is what
+`TreeOptimizer.center` reads. It is moved with
+`TreeTensorNetwork.shift_orthogonality_center(node)`, the tree analogue of
+Quimb's MPS `shift_orthogonality_center`: the centre is walked to the target
+along the unique tree geodesic with a per-edge lossless QR (Quimb
+`canonize_between`), touching only the tensors on that path (an O(path length)
+move, not O(N)). The move is idempotent when already centred; when the centre is
+unknown it is established once with Quimb `canonize_around`. This mirrors the
+`info_c["cur_orthog"]` centre tracking of `MpsOptimizer`.
+`TreeTensorNetwork.is_canonical_form(center)` verifies the property directly
+(every non-centre tensor is an isometry toward the centre) as a diagnostic/test
+aid. `TreeOptimizer` mirrors this public surface: `TreeOptimizer.center` (with
+the `orthogonality_center` name-parity alias), `shift_orthogonality_center(node)`
+and `is_canonical_form(center)` delegate to the state, so the optimizer and its
+`TreeTensorNetwork` speak the same canonicalisation vocabulary.
 
 ## Tree state class
 
@@ -63,18 +78,38 @@ qubit, and every branch annotated with its current virtual bond dimension
 
 The tree structure is chosen by `TreeLayoutFinder`, which builds a weighted
 interaction graph from the two-qubit supports of the gate stream and applies
-recursive spectral (Fiedler) bisection, keeping the bisection dendrogram as the
-rooted binary tree (`structure="quality"`). This reuses the interaction-graph
-and spectral machinery of `pepsy.optimizers.mps.layout`; where the MPS finder
-flattens the recursion into a 1D order, the tree finder keeps the tree. Strongly
-coupled qubits become nearby leaves, minimising the tree-path length that
-two-qubit gates thread across. `structure="balanced"` splits the qubit index
-order in half at each level. `TreeLayoutFinder.score(plan)` returns the total
+recursive spectral (Fiedler) partition, keeping the recursion as the rooted
+tree (`structure="quality"`). This reuses the interaction-graph and spectral
+machinery of `pepsy.optimizers.mps.layout`; where the MPS finder flattens the
+recursion into a 1D order, the tree finder keeps the tree. Strongly coupled
+qubits become nearby leaves, minimising the tree-path length that two-qubit
+gates thread across. `structure="balanced"` splits the qubit index order in
+half at each level. `TreeLayoutFinder.score(plan)` returns the total
 interaction-weighted tree-path length that the structure minimises.
 
-A caller may bypass the finder by passing an explicit `TreePlan` via
-`TreeOptimizer(..., tree=plan)`; build one with
-`TreePlan.from_order(order, weights=..., structure=...)`.
+The structure is **not restricted to binary trees**. Internal nodes may have
+any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
+/ `TreeOptimizer`:
+
+- `max_arity` caps the children per internal node. The default `2` reproduces
+  the strictly-binary tree exactly; larger values give flatter `k`-ary trees
+  with shorter geodesics; `None` leaves the arity unbounded.
+- `structure="adaptive"` reads the gate-stream interaction graph and lets each
+  level branch into as many children as it has strongly coupled communities
+  (edges above `community_frac` times the level's strongest edge). A densely
+  coupled block -- a near-clique with a present-strong-edge fraction of at
+  least `star_frac` -- is collapsed into a single flat **star** node, so all
+  its pairwise geodesics are length two instead of the up-to-`log2 m` of a
+  bisection. Binary trees remain a valid special case (`max_arity=2`).
+
+A caller may bypass the finder entirely by passing an explicit `TreePlan` via
+`TreeOptimizer(..., tree=plan)`. Build one with
+`TreePlan.from_order(order, weights=..., structure=..., max_arity=...)`, or -- for
+a fully hand-specified arbitrary-arity tree -- with
+`TreePlan.from_children(children, qubit_of_leaf)`, which validates that the
+children map and leaf assignment describe a single rooted tree covering qubits
+`0..n-1` exactly once. `TreePlan.max_arity()` and `TreePlan.is_binary()` report
+the shape.
 
 ## Diagnostics
 
@@ -126,14 +161,19 @@ state to unit norm and `max_bond()` reports the largest virtual bond.
   limiting uses `threadpoolctl` when available and is a no-op otherwise.
 - **Lazy canonical centre.** A freshly built product state has every virtual
   bond at dimension 1, so it is already canonical with the root as
-  orthogonality centre; the centre is declared there rather than recomputed on
-  the first gate.
+  orthogonality centre; `from_plan` records that centre on the network rather
+  than recomputing it on the first gate.
+- **State-owned centre.** The orthogonality centre lives on the
+  `TreeTensorNetwork` (`orthogonality_center`, an `_EXTRA_PROPS` field), so the
+  optimizer and the state cannot disagree and the centre is carried by
+  `.copy()`. Incremental moves (`shift_orthogonality_center`) touch only the
+  geodesic between old and new centre.
 - **Self-healing tid cache.** Node-to-tensor lookups are cached and validated
   against the live tensor map, so the hot path avoids re-scanning tags while
   staying correct when a gate rebuilds a tensor.
 - **`copy()`.** Returns an independent optimizer that shares the immutable
-  `TreePlan` but owns its own tensor network and centre tracker, for branching
-  experiments or trial gate sequences.
+  `TreePlan` but owns its own tensor network (which carries the tracked
+  orthogonality centre), for branching experiments or trial gate sequences.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.tree.optimizer

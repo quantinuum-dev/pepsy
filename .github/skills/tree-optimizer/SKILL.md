@@ -9,7 +9,7 @@ Use this skill for `pepsy.TreeOptimizer` (also `pepsy.optimizers.TreeOptimizer`)
 and its implementation under `src/pepsy/optimizers/tree/`:
 
 - [`optimizer.py`](../../../src/pepsy/optimizers/tree/optimizer.py) -- `TreeOptimizer` (state + gate replay + readout).
-- [`layout.py`](../../../src/pepsy/optimizers/tree/layout.py) -- `TreePlan` (pure rooted-binary-tree structure) and `TreeLayoutFinder` (entanglement-adapted structure search).
+- [`layout.py`](../../../src/pepsy/optimizers/tree/layout.py) -- `TreePlan` (pure rooted-tree structure, any arity) and `TreeLayoutFinder` (entanglement-adapted structure search).
 - [`__init__.py`](../../../src/pepsy/optimizers/tree/__init__.py) -- subpackage exports.
 - Docs: [`docs/api/optimizers/tree.md`](../../../docs/api/optimizers/tree.md).
 - Tests: [`tests/test_optimize_tree.py`](../../../tests/test_optimize_tree.py).
@@ -22,7 +22,8 @@ tensor splitting, tree path finding) uses `quimb` primitives.
 
 The rooted tree-tensor-network circuit simulator of *Simulating quantum
 circuits using tree tensor networks* (Seitz, Medina, Cruz, Huang, Mendl;
-Quantum 7, 964, 2023; arXiv:2206.01000). The state is a rooted **binary** TTN
+Quantum 7, 964, 2023; arXiv:2206.01000). The state is a rooted TTN (internal
+nodes of **any arity**; binary is the default, see *Non-binary trees* below)
 whose leaves carry the physical qubit indices; a bundled gate stream
 `[(gate, where), ...]` is replayed. `where` is an `int` (1q) or a pair of `int`
 (2q); three-plus-qubit supports raise `NotImplementedError`.
@@ -76,16 +77,32 @@ directly.
 
 ## Canonical-centre contract (core invariant)
 
-`self.center` is the node id of the orthogonality centre and is **algorithm
-state**, not cosmetic. Every other tensor must be isometric pointing toward the
-centre so it telescopes to identity between bra and ket.
+The orthogonality centre is a single node id **owned by the `TreeTensorNetwork`**
+(`ttn.orthogonality_center`, declared in `_EXTRA_PROPS` so it survives `.copy()`
+and quimb views). `TreeOptimizer.center` is a thin property view onto it, so the
+optimizer and the state can never disagree. It is **algorithm state**, not
+cosmetic: every other tensor must be isometric pointing toward the centre so it
+telescopes to identity between bra and ket.
 
-- `_move_center(target)` walks the geodesic with `canonize_between(absorb="right")`
-  per edge; it is the tree analogue of `MpsOptimizer.info_c["cur_orthog"]`.
+- `TreeTensorNetwork.shift_orthogonality_center(node)` is the primitive: it walks
+  the geodesic from the current centre to `node` with `canonize_between(absorb=
+  "right")` per edge (lossless QR), touching only the path tensors (O(path
+  length), not O(N)); it is idempotent when already centred and falls back once
+  to `canonize_around_node_` (O(N)) when the centre is unknown (`None`). This is
+  the tree analogue of quimb's MPS `shift_orthogonality_center` /
+  `MpsOptimizer.info_c["cur_orthog"]`.
+- `TreeOptimizer._move_center(target)` simply delegates to it.
+- `ttn.is_canonical_form(center)` verifies the invariant directly (every
+  non-centre tensor is an isometry toward the centre) — use it in tests/diagnostics.
 - A freshly built product state is **already canonical at the root** (all
-  virtual bonds are dim 1, so every tensor is trivially isometric). `__init__`
-  declares `self.center = self.plan.root` to skip an O(N) canonicalisation on
-  the first gate. Do not reset this to `None`.
+  virtual bonds are dim 1, so every tensor is trivially isometric). `from_plan`
+  records `orthogonality_center = root`, so the first gate skips an O(N)
+  canonicalisation. Do not reset this to `None`.
+- `canonize_edge_` / `compress_edge_` advance the tracked centre by one hop when
+  it starts on the isometric side, else set it to `None` (honest: a lone edge
+  move cannot leave a global centre). The optimizer's hot paths call quimb
+  `canonize_between` / `compress_between` **directly** and set `self.center`
+  explicitly afterward — keep that.
 - Unitary 1q gates preserve canonical form regardless of centre (absorbed into
   the leaf, no bond growth, no centre move). Non-unitary 1q operators
   (projectors in `measure`) keep the centre on that leaf but require a
@@ -93,7 +110,8 @@ centre so it telescopes to identity between bra and ket.
 - `norm()` uses the single centre tensor when `center is not None` (one-site
   canonical norm); only the unknown-centre fallback does a full doubled-tree
   contraction. Keep this fast path.
-- Any operation that moves/rebuilds the centre must update `self.center`.
+- Any operation that moves/rebuilds the centre must update the tracked centre
+  (via `self.center = ...`, i.e. `ttn.orthogonality_center`).
 
 ## Two-qubit gate = exact threading + one compression sweep
 
@@ -171,21 +189,46 @@ correlation flows through the parent blob -- this is exact up to the truncation.
 ## Layout (TreeLayoutFinder / TreePlan)
 
 `TreeLayoutFinder` reuses the MPS interaction-graph + recursive spectral
-(Fiedler) bisection machinery, but **keeps the bisection dendrogram as the
-rooted binary tree** (the MPS finder flattens it to 1D). Strongly coupled qubits
-become nearby leaves, minimising the geodesic a 2q gate must thread.
+(Fiedler) partition machinery, but **keeps the recursion as the rooted tree**
+(the MPS finder flattens it to 1D). Strongly coupled qubits become nearby
+leaves, minimising the geodesic a 2q gate must thread.
 
-- Bisection uses `_similarity_weights()` = Seitz Eq. 1:
+- Partition uses `_similarity_weights()` = Seitz Eq. 1:
   `s(qi,qj) = |G(qi) & G(qj)| + 1/(deg_i + deg_j)`. The co-occurrence term is
   the accumulated `pair_weights`; the `1/(deg)` term is a tie-breaker.
 - `score(plan)` uses the **pure** `pair_weights` (weighted geodesic sum, lower
-  is better) -- keep it separate from the augmented bisection similarity.
+  is better) -- keep it separate from the augmented partition similarity.
 - `report(plan)` compares against a naive `structure="balanced"` index-order
   tree (`score_ratio_vs_balanced`). Quality must be `<=` balanced.
-- `TreePlan.from_order(order, weights=, structure=)`: `"quality"` = spectral
-  bisection; `"balanced"` = split `order` in half at each level (useful in tests
-  to force sibling relationships, e.g. `range(4)` -> `(0,1)` and `(2,3)` are
-  siblings).
+- `TreePlan.from_order(order, weights=, structure=, max_arity=2, community_frac=,
+  star_frac=)`: `"quality"` = spectral reorder + split; `"balanced"` = split
+  `order` directly (useful in tests to force sibling relationships, e.g.
+  `range(4)` -> `(0,1)` and `(2,3)` are siblings); `"adaptive"` = community /
+  clique-driven variable arity.
+
+### Non-binary trees (arity is a knob, not a constraint)
+
+The **data structures and all algorithms are already arity-agnostic** -- every
+builder, geometry query, `ascii_tree`, the optimizer's geodesic threading +
+sibling fast path, and `TreeSampler` loop over `plan.children[nid]` generically.
+The *only* binary-specific piece was construction. Controls:
+
+- `max_arity` (default `2`) caps children per internal node. `2` reproduces the
+  strictly-binary tree **exactly** (cut points use `floor(i*L/k)` so the 2-way
+  case matches the old `mid = L//2` bisection); larger values / `None` give
+  flatter `k`-ary trees.
+- `structure="adaptive"` branches per strongly coupled community
+  (`community_frac` of the level's strongest edge) and collapses a near-clique
+  (present-strong-edge fraction `>= star_frac`) into a flat **star** node
+  (all intra-clique geodesics length 2 vs up to 3 for a bisection).
+- `TreePlan.from_children(children, qubit_of_leaf, root=None)` validates and
+  builds an arbitrary hand-specified tree (checks single parent, leaf/qubit
+  coverage of `0..n-1`, reachability, no cycles).
+- `TreePlan.max_arity()` / `TreePlan.is_binary()` report the shape.
+- All these are plumbed identically through `TreeLayoutFinder`, `TreeOptimizer`,
+  `TreeOptimizer.find_tree_layout`, `TreeOptimizer.convergence_sweep`, and
+  `TreeTensorNetwork.from_order`. The `TreeLayoutFinder` default is still binary
+  so existing behaviour is unchanged.
 
 ## Gotchas / teaching notes
 

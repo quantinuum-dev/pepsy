@@ -2,8 +2,9 @@
 
 This is the tree analogue of ``quimb``'s :class:`quimb.tensor.MatrixProductState`:
 a thin, geometry-owning subclass of ``quimb``'s arbitrary-geometry vector class
-:class:`quimb.tensor.TensorNetworkGenVector`.  It carries a rooted-binary
-:class:`~pepsy.optimizers.tree.TreePlan`, a configurable physical-index /
+:class:`quimb.tensor.TensorNetworkGenVector`.  It carries a rooted
+:class:`~pepsy.optimizers.tree.TreePlan` (internal nodes of any arity, not just
+binary), a configurable physical-index /
 site-tag / node-tag naming scheme, and deterministic tree-edge bond names, so
 that higher-level code (notably :class:`~pepsy.optimizers.tree.TreeOptimizer`)
 can talk in *node ids* and *qubit labels* while all the heavy lifting --
@@ -72,8 +73,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     ts : sequence of quimb.tensor.Tensor or quimb.tensor.TensorNetwork
         The tensors of the network, or an existing network to cast/copy.
     plan : TreePlan
-        The rooted-binary tree structure.  Required unless ``ts`` is an existing
-        tensor network being copied/cast (then it is taken from ``ts``).
+        The rooted tree structure (internal nodes may have any arity).  Required
+        unless ``ts`` is an existing tensor network being copied/cast (then it
+        is taken from ``ts``).
     sites : sequence, optional
         The site (qubit) labels.  Defaults to ``range(plan.n)``.
     site_tag_id, site_ind_id, node_tag_id : str
@@ -87,6 +89,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         "_site_ind_id",
         "_plan",
         "_node_tag_id",
+        "_orthog_center",
     )
 
     def __init__(self, ts=(), *, plan=None, sites=None, site_tag_id="I{}",
@@ -107,6 +110,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self._site_tag_id = site_tag_id
         self._site_ind_id = site_ind_id
         self._node_tag_id = node_tag_id
+        # Node id of the current orthogonality centre (``None`` if unknown).
+        # Tracked here -- surviving ``.copy()`` via ``_EXTRA_PROPS`` -- so the
+        # canonical form is a property of the *state*, not of any one driver.
+        self._orthog_center = None
 
     # -- geometry / naming ----------------------------------------------------
 
@@ -124,6 +131,33 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def root(self):
         """The root node id of the tree."""
         return self._plan.root
+
+    @property
+    def orthogonality_center(self):
+        """Node id of the tracked orthogonality centre (``None`` if unknown).
+
+        This is the tree analogue of an MPS canonical centre: when it is a node
+        ``c`` every *other* tensor is an isometry whose legs point toward ``c``
+        (``absorb="right"`` convention), so the whole state norm collapses onto
+        the single centre tensor.  It is updated in place by
+        :meth:`shift_orthogonality_center` and :meth:`canonize_around_node_`,
+        and -- being declared in :attr:`_EXTRA_PROPS` -- it survives ``.copy()``
+        and every ``quimb`` view/selection, so any holder of the state (the
+        :class:`~pepsy.optimizers.tree.TreeOptimizer`, a sampler, a direct user)
+        reads a single consistent centre rather than tracking its own.
+        """
+        return getattr(self, "_orthog_center", None)
+
+    @orthogonality_center.setter
+    def orthogonality_center(self, value):
+        if value is not None and value not in self._plan.children:
+            raise ValueError(f"{value!r} is not a node of the tree.")
+        self._orthog_center = value
+
+    def _with_center(self, nid):
+        """Set the tracked centre and return ``self`` (builder convenience)."""
+        self._orthog_center = nid
+        return self
 
     @property
     def nqubits(self):
@@ -217,14 +251,33 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
     # -- edge-level canonical / compression helpers ---------------------------
 
+    def _track_edge_center(self, a, b, absorb):
+        """Update the tracked centre after a gauge move across edge ``a -> b``.
+
+        A single ``absorb="right"`` move makes ``a`` isometric and pushes the
+        centre onto ``b``; it therefore advances a centre sitting on ``a`` to
+        ``b`` (and symmetrically for ``"left"``).  Any other prior centre is no
+        longer the global centre after a lone edge move, so it is set to
+        ``None`` (unknown) rather than left lying about the canonical form.
+        """
+        cur = self.orthogonality_center
+        if absorb == "right" and cur == a:
+            self._orthog_center = b
+        elif absorb == "left" and cur == b:
+            self._orthog_center = a
+        else:
+            self._orthog_center = None
+
     def canonize_edge_(self, a, b, absorb="right"):
         """Canonicalise across the tree edge ``a -> b`` in place.
 
         Thin wrapper over :meth:`quimb.tensor.TensorNetwork.canonize_between`
         that resolves node ids to node tags; ``absorb="right"`` leaves node ``a``
-        isometric and pushes the orthogonality centre onto node ``b``.
+        isometric and pushes the orthogonality centre onto node ``b``.  The
+        tracked :attr:`orthogonality_center` is advanced accordingly.
         """
         self.canonize_between(self.node_tag(a), self.node_tag(b), absorb=absorb)
+        self._track_edge_center(a, b, absorb)
         return self
 
     def compress_edge_(self, a, b, *, max_bond=None, cutoff=1e-12,
@@ -233,7 +286,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         Thin wrapper over :meth:`quimb.tensor.TensorNetwork.compress_between`
         (local reduced compression, ``canonize_distance=0``) resolving node ids
-        to node tags.
+        to node tags.  The tracked :attr:`orthogonality_center` is advanced as
+        for :meth:`canonize_edge_` (compression moves the gauge the same way).
         """
         self.compress_between(
             self.node_tag(a),
@@ -242,12 +296,80 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             cutoff=cutoff,
             absorb=absorb,
         )
+        self._track_edge_center(a, b, absorb)
         return self
 
     def canonize_around_node_(self, nid):
-        """Canonicalise the whole tree around node ``nid`` (its tensor becomes the centre)."""
+        """Canonicalise the whole tree around node ``nid`` and track it as centre.
+
+        Every non-``nid`` tensor becomes an isometry pointing toward ``nid``, so
+        the state norm collapses onto the ``nid`` tensor; :attr:`orthogonality_center`
+        is set to ``nid``.  This is the O(N) "establish a centre from scratch"
+        path -- prefer :meth:`shift_orthogonality_center` for an incremental move
+        from a *known* centre.
+        """
+        if nid not in self._plan.children:
+            raise ValueError(f"{nid!r} is not a node of the tree.")
         self.canonize_around_(self.node_tag(nid))
+        self._orthog_center = nid
         return self
+
+    def shift_orthogonality_center(self, new, *, absorb="right"):
+        """Move the tracked orthogonality centre to node ``new`` in place.
+
+        The tree analogue of :meth:`quimb.tensor.MatrixProductState.shift_orthogonality_center`:
+        the centre is walked to ``new`` along the *unique tree geodesic* from the
+        current centre, canonicalising one edge at a time with a lossless QR
+        (:meth:`quimb.tensor.TensorNetwork.canonize_between`).  Only the tensors
+        on that path are touched, so a nearby move is O(path length), not O(N).
+
+        * If the centre is already ``new`` this is a no-op (idempotent).
+        * If the centre is currently unknown (``None``) it falls back once to the
+          O(N) :meth:`canonize_around_node_`, then subsequent moves are
+          incremental.
+
+        Returns ``self`` so moves can be chained.
+        """
+        if new not in self._plan.children:
+            raise ValueError(f"{new!r} is not a node of the tree.")
+        cur = self.orthogonality_center
+        if cur == new:
+            return self
+        if cur is None:
+            return self.canonize_around_node_(new)
+        path = self._plan.node_path(cur, new)
+        for u, v in zip(path, path[1:]):
+            self.canonize_between(self.node_tag(u), self.node_tag(v),
+                                  absorb=absorb)
+        self._orthog_center = new
+        return self
+
+    def is_canonical_form(self, center=None, *, tol=1e-9):
+        """Return whether the tree is in canonical form about ``center``.
+
+        Checks the defining property directly: every node other than ``center``
+        must be an isometry when all its legs *except* the one pointing toward
+        ``center`` are treated as inputs (i.e. ``T @ T^dagger`` over those legs is
+        the identity on the toward-centre bond).  ``center`` defaults to the
+        tracked :attr:`orthogonality_center`; an unknown centre returns ``False``.
+        Primarily a diagnostic / test aid.
+        """
+        if center is None:
+            center = self.orthogonality_center
+        if center is None:
+            return False
+        for nid in self._plan.nodes():
+            if nid == center:
+                continue
+            toward = self._plan.node_path(nid, center)[1]
+            t = self.node_tensor(nid)
+            bond = next(iter(qtn.bonds(t, self.node_tensor(toward))))
+            tc = t.H.reindex({bond: bond + "*"})
+            prod = qtn.tensor_contract(t, tc, output_inds=[bond, bond + "*"])
+            d = int(prod.shape[0])
+            if not np.allclose(np.asarray(prod.data), np.eye(d), atol=tol):
+                return False
+        return True
 
     # -- dense read-out -------------------------------------------------------
 
@@ -419,19 +541,24 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             site_tag_id=site_tag_id,
             site_ind_id=site_ind_id,
             node_tag_id=node_tag_id,
-        )
+        )._with_center(plan.root)
 
     @classmethod
     def from_order(cls, order, *, weights=None, structure="quality",
+                   max_arity=2, community_frac=0.35, star_frac=0.75,
                    dtype=complex, site_tag_id="I{}", site_ind_id="k{}",
                    node_tag_id="N{}"):
-        """Build a product state on a tree bisected from ``order``.
+        """Build a product state on a tree partitioned from ``order``.
 
         Convenience wrapper that first builds a :class:`TreePlan` with
-        :meth:`TreePlan.from_order` and then :meth:`from_plan`.
+        :meth:`TreePlan.from_order` and then :meth:`from_plan`.  ``max_arity``
+        and ``structure`` control the tree shape (see
+        :meth:`TreePlan.from_order`); the defaults reproduce the binary tree.
         """
         plan = TreePlan.from_order(
-            order, weights=weights, structure=structure
+            order, weights=weights, structure=structure,
+            max_arity=max_arity, community_frac=community_frac,
+            star_frac=star_frac,
         )
         return cls.from_plan(
             plan,

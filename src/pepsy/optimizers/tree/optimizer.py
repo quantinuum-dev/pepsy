@@ -4,9 +4,12 @@
 simulator of *Simulating quantum circuits using tree tensor networks*
 (Seitz, Medina, Cruz, Huang, Mendl; Quantum 7, 964, 2023; arXiv:2206.01000).
 
-A quantum state is stored as a rooted binary tree tensor network whose leaves
-carry the physical qubit indices.  A bundled gate stream ``[(gate, where), ...]``
-is replayed:
+A quantum state is stored as a rooted tree tensor network whose leaves
+carry the physical qubit indices.  Internal nodes may have any arity: the
+default structure is a strictly-binary tree, but flatter ``k``-ary trees
+(``max_arity``) or gate-connectivity-driven communities
+(``structure="adaptive"``) are supported unchanged.  A bundled gate stream
+``[(gate, where), ...]`` is replayed:
 
 * single-qubit gates are absorbed into the leaf tensor (no bond growth); a
   unitary one-qubit gate preserves the tree canonical form regardless of where
@@ -24,7 +27,7 @@ The orthogonality centre is tracked as a node id and moved *smartly* along the
 tree geodesic with per-edge canonicalisation, mirroring the
 ``info_c["cur_orthog"]`` centre tracking of :class:`pepsy.MpsOptimizer`.  The
 tree structure is chosen by :class:`TreeLayoutFinder` (entanglement-adapted
-recursive bisection) unless an explicit :class:`TreePlan` is supplied.
+recursive partition) unless an explicit :class:`TreePlan` is supplied.
 
 This is the tensor-network glue only: the heavy lifting (arbitrary-geometry
 canonicalisation, bond compression, tensor splitting, tree path finding) uses
@@ -76,11 +79,15 @@ class TreeOptimizer:
         Maximum virtual bond dimension enforced during two-qubit threading.
     cutoff : float
         Relative singular-value cutoff for truncations.
-    structure : {"quality", "balanced"}
+    structure : {"quality", "balanced", "adaptive"}
         Tree-structure strategy used when ``tree`` is not supplied.
+    max_arity : int or None
+        Maximum children per internal node for the auto-built structure.  ``2``
+        (default) gives a binary tree; larger values or ``None`` give flatter /
+        wider trees.  Ignored when an explicit ``tree`` is supplied.
     tree : TreePlan, optional
-        Explicit tree structure.  When omitted a :class:`TreeLayoutFinder`
-        builds one from the gate stream.
+        Explicit tree structure (any arity).  When omitted a
+        :class:`TreeLayoutFinder` builds one from the gate stream.
     dtype : numpy dtype
         Data type of the initial product state (default ``complex128``).
     threads : int or None
@@ -108,7 +115,8 @@ class TreeOptimizer:
     """
 
     def __init__(self, gates=None, n=None, *, chi=64, cutoff=1e-12,
-                 structure="quality", tree=None, dtype=complex, threads=1,
+                 structure="quality", max_arity=2, community_frac=0.35,
+                 star_frac=0.75, tree=None, dtype=complex, threads=1,
                  seed=None, run=True):
         self.G, self.where = self._normalize_gate_queue(gates)
 
@@ -127,13 +135,18 @@ class TreeOptimizer:
         self.chi = int(chi)
         self.cutoff = float(cutoff)
         self.structure = structure
+        self.max_arity = None if max_arity is None else int(max_arity)
+        self.community_frac = float(community_frac)
+        self.star_frac = float(star_frac)
         self.dtype = dtype
         self.threads = None if threads is None else int(threads)
         self.rng = np.random.default_rng(seed)
 
         if tree is None:
             tree = TreeLayoutFinder(
-                gates=gates, n=self.n, structure=structure
+                gates=gates, n=self.n, structure=structure,
+                max_arity=self.max_arity, community_frac=self.community_frac,
+                star_frac=self.star_frac,
             ).run()
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan or None.")
@@ -143,7 +156,8 @@ class TreeOptimizer:
         # A freshly built product state has every virtual bond at dimension 1,
         # so each tensor is trivially isometric and the state is already in
         # canonical form with the root as orthogonality centre (norm 1).
-        # Declaring it here skips an O(N) canonicalisation on the first gate.
+        # ``from_plan`` records that centre on the network; assert it here so the
+        # first gate skips an O(N) canonicalisation.
         self.center = self.plan.root
         self._thread_ind = None
 
@@ -196,19 +210,62 @@ class TreeOptimizer:
 
     # -- canonical centre tracking -------------------------------------------
 
+    @property
+    def center(self):
+        """Node id of the current orthogonality centre (``None`` if unknown).
+
+        A thin view onto the *single* centre tracked by the underlying
+        :class:`TreeTensorNetwork` (:attr:`TreeTensorNetwork.orthogonality_center`),
+        so the optimizer and the state can never disagree about the canonical
+        form; it is carried across :meth:`copy` with the network.
+        :attr:`orthogonality_center` is a name-parity alias.
+        """
+        return self.tn.orthogonality_center
+
+    @center.setter
+    def center(self, value):
+        self.tn.orthogonality_center = value
+
+    @property
+    def orthogonality_center(self):
+        """Alias of :attr:`center` matching :attr:`TreeTensorNetwork.orthogonality_center`."""
+        return self.tn.orthogonality_center
+
+    @orthogonality_center.setter
+    def orthogonality_center(self, value):
+        self.tn.orthogonality_center = value
+
     def _move_center(self, target):
-        """Move the orthogonality centre to node ``target`` with minimal moves."""
-        if self.center == target:
-            return
-        if self.center is None:
-            self.tn.canonize_around_(self._tag(target))
-        else:
-            path = self.plan.node_path(self.center, target)
-            for u, v in zip(path, path[1:]):
-                self.tn.canonize_between(
-                    self._tag(u), self._tag(v), absorb="right"
-                )
-        self.center = target
+        """Move the orthogonality centre to node ``target`` along the geodesic.
+
+        Delegates to :meth:`TreeTensorNetwork.shift_orthogonality_center`: a
+        no-op when already centred, an incremental per-edge QR walk along the
+        tree geodesic from a known centre, or a single O(N) canonicalisation
+        when the centre is unknown.
+        """
+        self.tn.shift_orthogonality_center(target)
+
+    def shift_orthogonality_center(self, node):
+        """Move the orthogonality centre to ``node`` along the tree geodesic.
+
+        Public entry point to the same incremental per-edge canonicalisation the
+        optimizer runs internally before gates and read-outs: the centre is
+        walked to ``node`` with a lossless per-edge QR (a no-op when already
+        centred, or a single O(N) canonicalisation when the centre is unknown),
+        mirroring :meth:`TreeTensorNetwork.shift_orthogonality_center` and the
+        MPS ``shift_orthogonality_center``.  Returns ``self`` so moves chain.
+        """
+        self._move_center(node)
+        return self
+
+    def is_canonical_form(self, center=None, *, tol=1e-9):
+        """Whether the state is in canonical form about ``center``.
+
+        ``center`` defaults to the tracked :attr:`center`.  Delegates to
+        :meth:`TreeTensorNetwork.is_canonical_form`: every non-centre tensor must
+        be an isometry pointing toward the centre.  A diagnostic / test aid.
+        """
+        return self.tn.is_canonical_form(center, tol=tol)
 
     # -- gate application -----------------------------------------------------
 
@@ -559,11 +616,11 @@ class TreeOptimizer:
     def copy(self):
         """Return an independent optimizer at the current tree state.
 
-        The returned optimizer owns its own copy of the live tensor network and
-        an independent canonical-centre tracker, so it can be evolved separately
-        -- useful for branching experiments or trial gate sequences.  The
-        immutable :class:`TreePlan` is shared; the gate queue is retained (gate
-        payloads are not copied) but not replayed.
+        The returned optimizer owns its own copy of the live tensor network --
+        which carries the tracked orthogonality centre with it -- so it can be
+        evolved separately, useful for branching experiments or trial gate
+        sequences.  The immutable :class:`TreePlan` is shared; the gate queue is
+        retained (gate payloads are not copied) but not replayed.
         """
         other = type(self)(
             None,
@@ -576,20 +633,27 @@ class TreeOptimizer:
             threads=self.threads,
             run=False,
         )
+        # ``TreeTensorNetwork.copy`` carries ``_orthog_center`` (an _EXTRA_PROPS
+        # field), so the copied network already reports the right centre.
         other.tn = self.tn.copy()
-        other.center = self.center
         other.G = list(self.G)
         other.where = list(self.where)
         return other
 
     @classmethod
-    def find_tree_layout(cls, gates, n=None, *, structure="quality"):
+    def find_tree_layout(cls, gates, n=None, *, structure="quality",
+                         max_arity=2, community_frac=0.35, star_frac=0.75):
         """Return the :class:`TreePlan` a :class:`TreeLayoutFinder` would use."""
-        return TreeLayoutFinder(gates=gates, n=n, structure=structure).run()
+        return TreeLayoutFinder(
+            gates=gates, n=n, structure=structure,
+            max_arity=max_arity, community_frac=community_frac,
+            star_frac=star_frac,
+        ).run()
 
     @classmethod
     def convergence_sweep(cls, gates, n=None, chi_values=(2, 4, 8, 16, 32), *,
-                          ops=None, structure="quality", tree=None,
+                          ops=None, structure="quality", max_arity=2,
+                          community_frac=0.35, star_frac=0.75, tree=None,
                           dense_cap=1 << 14):
         """Replay ``gates`` at several ``chi`` and report convergence.
 
@@ -623,7 +687,9 @@ class TreeOptimizer:
         """
         chi_values = sorted(int(c) for c in chi_values)
         if tree is None:
-            probe = cls(gates, n=n, structure=structure, run=False)
+            probe = cls(gates, n=n, structure=structure, max_arity=max_arity,
+                        community_frac=community_frac, star_frac=star_frac,
+                        run=False)
             tree = probe.plan
             n = probe.n
         elif n is None:
