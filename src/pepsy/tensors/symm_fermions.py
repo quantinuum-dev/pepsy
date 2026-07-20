@@ -6,23 +6,42 @@ future spinless or multicomponent helpers can live alongside ``SpinfulFermion``
 without making the symmetry implementation module into a model catalogue.
 """
 
-from .symmetric import SpinfulFermion
+from .symmetric import Fermion
 
-__all__ = ["SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions"]
+SpinfulFermion = Fermion
+SpinfulFermionHubbard = Fermion
+
+__all__ = [
+    "Fermion",
+    "SpinfulFermion",
+    "SpinfulFermionHubbard",
+    "SymmFermions",
+]
 
 
 class SymmFermions:
     """Namespace for direct Symmray-backed fermion helper factories."""
 
     @staticmethod
+    def fermion(*args, **kwargs):
+        """Build the unified :class:`Fermion` helper."""
+        return Fermion(*args, **kwargs)
+
+    @staticmethod
     def spinful(*args, **kwargs):
-        """Build a :class:`SpinfulFermion` helper.
+        """Build a spinful :class:`Fermion` helper.
 
         This namespace makes it possible to add other local fermion spaces
         later while keeping the direct ``SpinfulFermion(...)`` form concise.
         """
-        return SpinfulFermion(*args, **kwargs)
+        return Fermion(*args, **kwargs)
+
+    @staticmethod
+    def spinless(*args, **kwargs):
+        """Build a spinless :class:`Fermion` helper."""
+        kwargs.setdefault("spinful", False)
+        kwargs.setdefault("symmetry", "U1")
+        return Fermion(*args, **kwargs)
 
 
 # Compatibility spelling for the initial, overly model-specific public name.
-SpinfulFermionHubbard = SpinfulFermion

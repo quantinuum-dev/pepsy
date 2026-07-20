@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pepsy Fermion Operators"
+  short_description: "Design native spinless and spinful fermion APIs."
+  default_prompt: "Use $pepsy-fermion-operators to design or extend Pepsy native Symmray fermion operators and gates."

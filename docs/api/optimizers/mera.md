@@ -79,7 +79,47 @@ result = param_opt.run(solver="torch-adam", n_steps=10, compiled=True)
 Native Symmray fermion helpers are available under this module, but the
 fermion convention is explicit. Use `QMeraGeometry(site_modes=("up", "down"))`
 and `qmera_symmray_fermi_hubbard_terms(...)` for the native graded-array path;
-do not mix it silently with dense spin or Jordan-Wigner local operators.
+do not mix it silently with dense spin or Jordan-Wigner local operators. The
+same model can supply both site-native MPS terms and qMERA mode terms:
+
+```python
+import pepsy
+from pepsy.optimizers.mera import QMeraGeometry
+
+fermion = pepsy.Fermion(
+    spinful=True,
+    symmetry="U1U1",
+    t=1.0,
+    U=8.0,
+)
+edges = ((0, 1), (1, 2))
+
+site_terms = fermion.local_terms(edges)
+gate_stream = fermion.gate_stream(edges, dt=0.01, sites=range(3))
+
+geometry = QMeraGeometry(shape=3, site_modes=("up", "down"))
+qmera_terms = fermion.local_terms(geometry, layout="qmera")
+```
+
+When the builder owns the geometry, it can perform the same conversion and
+construct the optimizer directly:
+
+```python
+builder = QMeraBuilder(
+    geometry=geometry,
+    site_modes=("up", "down"),
+    mode_order="mode-major",
+    # use a Symmray fermion gate registry and product-state factory here
+)
+terms = builder.fermion_terms(fermion)
+optimizer = builder.fermion_parametric_optimizer(
+    fermion,
+    energy_per_site=False,
+)
+```
+
+For a complete native Torch example, see
+`examples/FermiHubbardQMera/fermion_qmera_energy.py`.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.mera

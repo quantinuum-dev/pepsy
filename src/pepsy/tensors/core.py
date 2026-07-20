@@ -2247,8 +2247,22 @@ def ps_to_3dpeps(
     return peps
 
 
-def ps_to_mps(L: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False, chi: int = 1, rand_strength: float = 0.0):
-    """Create a product-state MPS parameterized by ``theta``.
+def ps_to_mps(
+    L: int,
+    dtype: str = "complex128",
+    theta: float = 0.0,
+    cyclic: bool = False,
+    chi: int = 1,
+    rand_strength: float = 0.0,
+    *,
+    fermion=None,
+    occupations=None,
+    site_charge=None,
+    seed=666,
+    random_rounds=1000,
+    to_backend=None,
+):
+    """Create a product-state MPS, optionally in a Fermion charge sector.
 
     Each site tensor is set so the physical vector is
     ``[cos(theta), sin(theta)]`` with trivial virtual bonds.
@@ -2269,12 +2283,93 @@ def ps_to_mps(L: int, dtype: str = "complex128", theta: float = 0.0, cyclic: boo
     rand_strength : float, optional
         Random noise strength passed to ``expand_bond_dimension``.
 
+    fermion : :class:`~pepsy.tensors.Fermion`, optional
+        If supplied, construct a native fermionic Symmray MPS using the
+        model's physical sectors and symmetry. With ``chi=1`` this is a
+        charge-fixed product state. For ``chi>1`` a charge-preserving random
+        unitary growth produces a symmetric initial MPS.
+    occupations : sequence, optional
+        Local charge labels used to select the product sector. If omitted,
+        ``fermion.half_filled_occupations(L)`` is used.
+    site_charge : callable or mapping, optional
+        Advanced override for the per-site charge pattern. By default this is
+        derived from ``occupations``.
+    seed : int, optional
+        Seed for the Fermion-aware construction and the ordinary constructor.
+    random_rounds : int, optional
+        Maximum number of charge-preserving random-unitary rounds used when
+        ``fermion`` is supplied with ``chi > 1``.
+    to_backend : callable, optional
+        Backend mapper applied to Fermion-aware Symmray blocks.
+
     Returns
     -------
     quimb.tensor.MatrixProductState
-        Initialized MPS with bond dimension ``chi``.
+        Initialized MPS with bond dimension ``chi``. When ``fermion`` is
+        supplied, the physical tensors are native fermionic Symmray arrays.
     """
-    mps = qtn.MPS_rand_state(L=L, bond_dim=1, phys_dim=2, cyclic=cyclic, seed=666, dtype=dtype)
+    if fermion is not None:
+        from .symmetric import (  # pylint: disable=import-outside-toplevel
+            Fermion,
+            SymMPS,
+            site_charge_from_occupations,
+        )
+
+        if not isinstance(fermion, Fermion):
+            raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
+        if cyclic:
+            raise ValueError("Fermion-aware ps_to_mps currently requires an open chain.")
+        if occupations is not None:
+            occupations = tuple(occupations)
+            if len(occupations) != int(L):
+                raise ValueError("occupations must contain exactly L charge labels.")
+        if occupations is None:
+            occupations = fermion.half_filled_occupations(L)
+        if site_charge is None:
+            site_charge = site_charge_from_occupations(occupations)
+        chi = int(chi)
+        if chi < 1:
+            raise ValueError("chi must be a positive integer.")
+        if chi == 1:
+            state = SymMPS.random(
+                L,
+                symmetry=fermion.symmetry,
+                bond_dim=1,
+                phys_dim=fermion.physical_sectors,
+                seed=seed,
+                dtype=dtype,
+                fermionic=True,
+                site_charge=site_charge,
+                to_backend=to_backend,
+            )
+        else:
+            state = SymMPS.random_unitary_evolution(
+                L,
+                symmetry=fermion.symmetry,
+                bond_dim=chi,
+                phys_dim=fermion.physical_sectors,
+                seed=seed,
+                dtype=dtype,
+                fermionic=True,
+                site_charge=site_charge,
+                rounds=random_rounds,
+                to_backend=to_backend,
+            )
+        return state.mps
+
+    if occupations is not None or site_charge is not None:
+        raise ValueError("occupations and site_charge require fermion=...")
+    if to_backend is not None:
+        raise ValueError("to_backend requires fermion=...")
+
+    mps = qtn.MPS_rand_state(
+        L=L,
+        bond_dim=1,
+        phys_dim=2,
+        cyclic=cyclic,
+        seed=seed,
+        dtype=dtype,
+    )
     local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
 
     for i in range(L):

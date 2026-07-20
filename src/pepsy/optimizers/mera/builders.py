@@ -226,6 +226,67 @@ class QMeraBuilder:
             terms = convert_local_terms(terms, backend)
         return build_qmera_parametric_lightcone_chunks(schedule, terms)
 
+    def fermion_terms(self, fermion, **params):
+        """Return qMERA mode terms from a unified :class:`Fermion` helper.
+
+        qMERA's fermionic path represents each physical site as the explicit
+        ``("up", "down")`` pair of two-state modes. Keeping this conversion
+        on the builder makes the representation choice visible while allowing
+        the regular local-term and optimizer machinery to handle the result.
+        """
+        if not callable(getattr(fermion, "local_terms", None)):
+            raise TypeError("fermion must provide local_terms(...).")
+        if not getattr(fermion, "spinful", False):
+            raise ValueError("qMERA Hubbard terms require a spinful Fermion helper.")
+        if tuple(self.geometry.site_modes or ()) != ("up", "down"):
+            raise ValueError(
+                "Fermion qMERA integration requires "
+                "site_modes=('up', 'down')."
+            )
+        return tuple(
+            fermion.local_terms(
+                self.geometry,
+                layout="qmera",
+                **params,
+            )
+        )
+
+    def fermion_parametric_loss(
+        self,
+        fermion,
+        parameters,
+        schedule=None,
+        *,
+        term_params=None,
+        **loss_kwargs,
+    ):
+        """Evaluate qMERA energy directly from a unified ``Fermion`` model."""
+        schedule = self.build_schedule() if schedule is None else schedule
+        terms = self.fermion_terms(fermion, **dict(term_params or {}))
+        return self.parametric_loss(
+            parameters,
+            terms,
+            schedule=schedule,
+            **loss_kwargs,
+        )
+
+    def fermion_parametric_optimizer(
+        self,
+        fermion,
+        *,
+        schedule=None,
+        term_params=None,
+        **optimizer_kwargs,
+    ):
+        """Create a qMERA optimizer directly from a unified ``Fermion`` model."""
+        schedule = self.build_schedule() if schedule is None else schedule
+        terms = self.fermion_terms(fermion, **dict(term_params or {}))
+        return self.parametric_optimizer(
+            terms,
+            schedule=schedule,
+            **optimizer_kwargs,
+        )
+
     def parametric_loss(
         self,
         parameters,

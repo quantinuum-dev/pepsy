@@ -32,6 +32,7 @@ from pepsy.optimizers import (
 from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
 from pepsy.tensors import (
+    Fermion,
     OneDMap,
     SpinfulFermion,
     SpinfulFermionHubbard,
@@ -104,6 +105,7 @@ def test_new_namespace_imports_resolve():
     assert PepsBpSampler is not None
     assert FDSolver is not None
     assert OneDMap is not None
+    assert Fermion is not None
     assert SpinfulFermion is not None
     assert SpinfulFermionHubbard is not None
     assert SymmFermions is not None

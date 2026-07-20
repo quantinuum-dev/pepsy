@@ -20,6 +20,9 @@ from .symmetric import (
     fermi_hubbard_u1u1_jw_gate_stream,
     fermi_hubbard_u1u1_jw_hopping_gate_stream,
     fermi_hubbard_u1u1_jw_interaction_gate_stream,
+    fermion_density_param_gen,
+    fermion_hopping_param_gen,
+    fermion_interaction_param_gen,
     sector_index_map,
     site_charge_alternating,
     site_charge_from_map,
@@ -32,6 +35,7 @@ from .symmetric import (
     symm_operator_from_dense,
 )
 from .symm_fermions import (
+    Fermion,
     SpinfulFermion,
     SpinfulFermionHubbard,
     SymmFermions,
@@ -83,6 +87,7 @@ from .core import (
 
 __all__ = [
     "OneDMap",
+    "Fermion",
     "SpinfulFermion",
     "SpinfulFermionHubbard",
     "SymmFermions",
@@ -112,6 +117,9 @@ __all__ = [
     "fermi_hubbard_u1u1_jw_gate_stream",
     "fermi_hubbard_u1u1_jw_hopping_gate_stream",
     "fermi_hubbard_u1u1_jw_interaction_gate_stream",
+    "fermion_density_param_gen",
+    "fermion_hopping_param_gen",
+    "fermion_interaction_param_gen",
     "get_default_array_backend",
     "get_default_grad_backend",
     "haar_random_state",

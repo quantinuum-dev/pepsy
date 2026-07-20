@@ -1901,8 +1901,8 @@ class SymDMRG2:
         """Current optimized state, or the initial state before solving."""
         return self._state
 
-    def fermionic_state(self):
-        """Return the current state as a native fermionic Symmray ``SymMPS``.
+    def fermionic_state(self, fermion=None):
+        """Return the current state as a native fermionic Symmray MPS.
 
         ``SymDMRG2`` optimizes in a Jordan-Wigner *bosonic* representation, so
         :attr:`state` holds plain abelian Symmray tensors (``U1``/``U1U1``).
@@ -1910,22 +1910,29 @@ class SymDMRG2:
         the same bond dimension, suitable for fermionic gate streams (for
         example real-time light-pulse evolution) and fermionic observables.
 
-        Requires that the optimizer was built from a fermionic ``SymMPS``
-        template via ``init_mps``; that template supplies the fermionic
-        metadata (physical sectors, edges) for the returned state.
+        The optimizer may be built from a fermionic ``SymMPS`` template or
+        from a raw native fermionic MPS. For a raw MPS, pass the corresponding
+        ``fermion`` helper explicitly; the model is intentionally not stored
+        as hidden metadata on the quimb MPS.
         """
         from .energy.peps import MpsEnergyOptimizer
 
         template = self.init_mps
-        if template is None or not hasattr(template, "psi"):
+        if template is None:
             raise ValueError(
-                "fermionic_state() requires a fermionic SymMPS `init_mps` "
-                "template to supply the fermionic metadata."
+                "fermionic_state() requires a fermionic init_mps template."
             )
         fermionic_tn = MpsEnergyOptimizer._debosonize_fermionic_tn(self.state)
-        result = template.copy()
-        result.psi = fermionic_tn
-        return result
+        if hasattr(template, "psi"):
+            result = template.copy()
+            result.psi = fermionic_tn
+            return result
+
+        if fermion is None:
+            raise ValueError(
+                "raw init_mps requires fermion=... for fermionic_state()."
+            )
+        return fermionic_tn
 
     @property
     def initial_energy(self):

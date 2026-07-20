@@ -149,30 +149,67 @@ class QMeraSymmrayFermionBackend:
         mode = self.mode_from_label(mode_label)
         return list(self._mode_charges[mode])
 
-    def vacuum_vector(self, mode_label):
-        """Return the Symmray fermionic ``|0>`` vector for one mode."""
+    def vacuum_vector(self, mode_label, *, occupied=False):
+        """Return the Symmray fermionic ``|0>`` or ``|1>`` mode vector."""
         sr = _require_symmray()
-        data = np.array([1.0, 0.0], dtype=self.dtype)
+        data = np.array(
+            [0.0, 1.0] if occupied else [1.0, 0.0],
+            dtype=self.dtype,
+        )
         vector = sr.utils.from_dense(
             data,
             symmetry=self.symmetry,
             index_maps=[self.mode_index_map(mode_label)],
             duals=[False],
             fermionic=True,
-            charge=self.zero_charge,
+            charge=(
+                self.zero_charge
+                if not occupied
+                else self._mode_charges[self.mode_from_label(mode_label)][1]
+            ),
+            label=None if not occupied else f"pepsy_mode_{mode_label!r}",
             flat=self.flat,
         )
         return _apply_to_array_blocks(vector, self.to_backend)
 
-    def product_state(self, schedule, sites, *, physical_dim=2, array_backend=None):
-        """Return a quimb TN vacuum state on scheduled qMERA register sites."""
+    def product_state(
+        self,
+        schedule,
+        sites,
+        *,
+        physical_dim=2,
+        array_backend=None,
+        occupations=None,
+    ):
+        """Return a product state on scheduled qMERA register sites.
+
+        ``occupations`` can be a sequence aligned with ``sites`` or a mapping
+        keyed by register-site or mode labels. The default is the vacuum.
+        """
         if int(physical_dim) != 2:
             raise NotImplementedError("Symmray qMERA fermion modes are two-state.")
         _ = array_backend
+        sites = tuple(sites)
+        if occupations is None:
+            occupation_values = (False,) * len(sites)
+        elif isinstance(occupations, Mapping):
+            occupation_values = tuple(
+                bool(
+                    occupations.get(
+                        register_site,
+                        occupations.get(schedule.geometry.to_mode(register_site), False),
+                    )
+                )
+                for register_site in sites
+            )
+        else:
+            occupation_values = tuple(bool(value) for value in occupations)
+            if len(occupation_values) != len(sites):
+                raise ValueError("occupations must align with the register sites.")
         tensors = []
-        for register_site in tuple(sites):
+        for register_site, occupied in zip(sites, occupation_values):
             mode = schedule.geometry.to_mode(register_site)
-            data = self.vacuum_vector(mode)
+            data = self.vacuum_vector(mode, occupied=occupied)
             tensors.append(
                 qtn.Tensor(
                     data,
@@ -224,7 +261,12 @@ class QMeraSymmrayFermionBackend:
         mode_labels = tuple(mode_labels)
         if not mode_labels:
             raise ValueError("mode_labels must not be empty.")
-        arr = np.asarray(array, dtype=self.dtype)
+        # Keep Torch/JAX/CuPy values on their original backend. In particular,
+        # a trainable Torch fSim parameter cannot be converted through NumPy.
+        if isinstance(array, np.ndarray) or not hasattr(array, "shape"):
+            arr = np.asarray(array, dtype=self.dtype)
+        else:
+            arr = array
         if arr.ndim == 2:
             dim = 2 ** len(mode_labels)
             if arr.shape != (dim, dim):
@@ -248,7 +290,10 @@ class QMeraSymmrayFermionBackend:
             charge=self.zero_charge,
             flat=self.flat,
         )
-        return _apply_to_array_blocks(array, self.to_backend)
+        # A backend converter configured for non-trainable state data must not
+        # detach a computed gate carrying a Torch autodiff graph.
+        to_backend = None if getattr(arr, "requires_grad", False) else self.to_backend
+        return _apply_to_array_blocks(array, to_backend)
 
     def number_operator(self, mode_label, *, coefficient=1.0):
         """Return ``coefficient * n`` for one fermionic mode."""
@@ -390,13 +435,40 @@ class QMeraSymmrayFermionBackend:
         return tuple(terms)
 
 
-def qmera_symmray_fermi_hubbard_terms(geometry, **kwargs):
-    """Return native Symmray fermionic Hubbard terms for a qMERA geometry."""
+def qmera_symmray_fermi_hubbard_terms(geometry, *, fermion=None, **kwargs):
+    """Return native Symmray fermionic Hubbard terms for a qMERA geometry.
+
+    Parameters
+    ----------
+    geometry : QMeraGeometry
+        Geometry whose physical sites are expanded into two-state modes.
+    fermion : pepsy.Fermion, optional
+        Unified model helper supplying ``symmetry``, ``t``, ``U``, and ``mu``.
+        qMERA deliberately remains mode-native, so this adapter accepts only
+        a spinful ``U1U1`` helper and does not turn a four-state site tensor
+        into a qMERA register tensor.
+    """
+    if fermion is not None:
+        if not getattr(fermion, "spinful", False):
+            raise ValueError("qMERA Hubbard terms require a spinful Fermion helper.")
+        if str(getattr(fermion, "symmetry", "")) != "U1U1":
+            raise ValueError(
+                "qMERA Hubbard terms currently require Fermion(symmetry='U1U1')."
+            )
+        kwargs = {
+            "t": getattr(fermion, "t", 1.0),
+            "U": getattr(fermion, "U", 8.0),
+            "mu": getattr(fermion, "mu", 0.0),
+            **kwargs,
+        }
     backend = kwargs.pop("backend", None)
     if backend is None:
         backend = QMeraSymmrayFermionBackend(
-            site_modes=tuple(geometry.site_modes or ("up", "down"))
+            symmetry=getattr(fermion, "symmetry", "U1U1"),
+            site_modes=tuple(geometry.site_modes or ("up", "down")),
         )
+    elif fermion is not None and str(backend.symmetry) != str(fermion.symmetry):
+        raise ValueError("The qMERA backend symmetry must match the Fermion helper.")
     return backend.fermi_hubbard_terms(geometry, **kwargs)
 
 

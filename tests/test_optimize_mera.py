@@ -42,6 +42,7 @@ from pepsy.optimizers.mera import (
 from pepsy.optimizers.mera.optimizer import (
     MeraEnergyOptimizer as ModuleMeraEnergyOptimizer,
 )
+from pepsy.tensors import Fermion
 
 
 def _zz_term():
@@ -416,6 +417,97 @@ def test_qmera_symmray_fermion_backend_builds_native_hubbard_terms():
     assert terms[-1].where == ((1, "down"), (2, "down"))
     with pytest.raises(ValueError, match="spin-changing"):
         backend.hopping_operator((0, "up"), (0, "down"))
+
+
+def test_unified_fermion_helper_adapts_to_qmera_mode_terms():
+    """One Fermion model should feed both site and qMERA energy layouts."""
+    pytest.importorskip("symmray")
+    geometry = QMeraGeometry(shape=3, site_modes=("up", "down"))
+    fermion = Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=0.5,
+        U=4.0,
+        mu=0.1,
+    )
+
+    site_terms = fermion.local_terms(((0, 1), (1, 2)))
+    mode_terms = fermion.local_terms(geometry, layout="qmera")
+    direct_terms = qmera_symmray_fermi_hubbard_terms(
+        geometry,
+        fermion=fermion,
+    )
+
+    assert set(site_terms) == {(0, 1), (1, 2)}
+    assert len(mode_terms) == len(direct_terms) == 13
+    assert [term.metadata["kind"] for term in mode_terms] == [
+        term.metadata["kind"] for term in direct_terms
+    ]
+    assert all("FermionicArray" in type(term.operator).__name__ for term in mode_terms)
+    assert mode_terms[0].where == ((0, "up"), (0, "down"))
+    assert all(term.metadata["backend"] == "symmray" for term in mode_terms)
+
+
+def test_unified_fermion_qmera_optimizer_runs_torch_autodiff():
+    """The builder convenience should run a native qMERA energy step."""
+    pytest.importorskip("symmray")
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    array_backend = backend_torch(dtype=torch.complex128)
+    backend = QMeraSymmrayFermionBackend(to_backend=array_backend)
+    registry = symmray_fermion_gate_registry(backend=backend)
+
+    def product_state_factory(schedule, sites, **kwargs):
+        return backend.product_state(
+            schedule,
+            sites,
+            occupations={0: 1, 1: 0, 2: 0, 3: 1},
+            **kwargs,
+        )
+
+    builder = QMeraBuilder(
+        shape=2,
+        site_modes=backend.site_modes,
+        mode_order="mode-major",
+        gate_registry=registry,
+        array_backend=array_backend,
+        disentangler={"block_size": 2, "circuit_depth": 0},
+        isometry={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        max_layers=1,
+        seed=44,
+        param_scale=0.01,
+        product_state_factory=product_state_factory,
+    )
+    fermion = Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=0.2,
+        U=0.5,
+        mu=0.1,
+    )
+
+    terms = builder.fermion_terms(fermion)
+    optimizer = builder.fermion_parametric_optimizer(
+        fermion,
+        energy_per_site=False,
+    )
+    initial = optimizer.loss(energy_per_site=False)
+    result = optimizer.run(
+        solver="torch-adam",
+        n_steps=1,
+        log_every=1,
+        options={"lr": 0.01},
+    )
+
+    assert len(terms) == 8
+    assert np.isfinite(float(initial))
+    assert len(result.history) == 1
+    assert np.isfinite(float(result.history[-1]))
 
 
 def test_qmera_symmray_fsim_runs_full_fermionic_lightcone():

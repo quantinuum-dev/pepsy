@@ -61,11 +61,124 @@ fh = py.SymMPS.for_model(
 fh.overall_charge()  # (8, 8)
 ```
 
+For a user-facing MPS constructor, ``ps_to_mps`` accepts the same ``Fermion``
+model and returns the underlying native fermionic MPS directly; callers do not
+need to instantiate ``SymMPS``:
+
+```python
+fh = py.Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0)
+psi = py.ps_to_mps(8, fermion=fh, seed=7)
+
+# Override the product-state charge pattern when needed.
+psi = py.ps_to_mps(
+    8,
+    fermion=fh,
+    occupations=fh.half_filled_occupations(8),
+)
+```
+
+With ``chi=1`` this creates a charge-fixed product MPS. A larger ``chi`` uses
+charge-preserving random-unitary growth while keeping the same global sector.
+``hrps_to_mps`` retains its ordinary local-Haar meaning and is not used for
+fixed-charge Fermion states, since a generic local Haar vector breaks the
+conserved sector.
+
+## Unified native fermion helper
+
+``Fermion`` is the model-facing helper for both one-mode spinless fermions
+and four-state spinful Hubbard sites. ``spinful`` selects the local space;
+``symmetry`` selects the conserved charge group. Spinless helpers support
+``U1`` and ``Z2``; spinful helpers support ``U1``, ``Z2``, ``U1U1``, and
+``Z2Z2``.
+
+```python
+spinless = py.Fermion(
+    spinful=False,
+    symmetry="U1",
+    t=1.0,
+    V=0.5,
+    mu=0.0,
+)
+
+spinful = py.Fermion(
+    spinful=True,
+    symmetry="U1U1",
+    t=1.0,
+    U=8.0,
+)
+
+spinless.operator("number")
+spinful.operator("n_up")
+spinful.onsite_gate(dt=0.01, site=0)
+spinful.gate("interaction", dt=0.01)
+spinless.gate_stream(edges, dt=0.01, order=2)
+spinful.local_terms(edges)  # native terms for energy optimization
+```
+
+The site-layout ``local_terms`` mapping is keyed by edges. Its onsite
+Hubbard and chemical-potential pieces are divided by each site's coordination
+inside the incident edge tensors, so summing the mapping still includes each
+one-site contribution exactly once. If those pieces should be visibly
+separate, build the edge terms with ``U=0`` and ``mu=0`` and add one-site
+terms such as ``U * spinful.observable("double")`` under keys ``(site,)``.
+
+``onsite_gate`` is the complete local Hubbard term, ``U n_up n_down - mu n``
+for spinful sites and ``-mu n`` for spinless sites. ``density_gate`` supplies
+the optional nearest-neighbor ``V n_i n_j`` term (total density for spinful
+sites). The same ``U``, ``V``, and ``mu`` parameters are included in
+``hamiltonian`` and in the returned gate stream; ``stream.hamiltonian`` gives
+the corresponding native term container.
+
+For a finite PEPS, request a boundary-controlled energy estimate with the
+same measurement options used for local observables:
+
+```python
+energy = peps.energy(hamiltonian, chi=64)
+energy = peps.energy(hamiltonian, measure_kwargs={"mode": "mps"})
+```
+
+Without ``chi`` or measurement options, ``SymPEPS.energy`` retains its exact
+doubled-network contraction path. ``energy_density`` accepts the same options.
+
+For qMERA, keep the same ``Fermion`` parameters but request the explicit
+two-state mode layout. This returns qMERA ``LocalTerm`` objects rather than
+four-state site tensors, matching ``QMeraGeometry(site_modes=("up", "down"))``:
+
+```python
+from pepsy.optimizers.mera import QMeraGeometry
+
+geometry = QMeraGeometry(shape=3, site_modes=("up", "down"))
+qmera_terms = spinful.local_terms(geometry, layout="qmera")
+# Equivalent shorthand:
+qmera_terms = spinful.qmera_terms(geometry)
+```
+
+The spinful interaction gate is the exact native Symmray operator
+``exp(-i dt U n_up n_down)``. Its local diagonal is
+``(1, 1, 1, exp(-i dt U))`` in Symmray's ordered Hubbard basis. Pass
+``imaginary=True`` to use the corresponding ``exp(-dt U n_up n_down)`` gate.
+
+``param_gate(name, params)`` and the module-level fermion gate generators
+(``fermion_interaction_param_gen``, ``fermion_density_param_gen``, and
+``fermion_hopping_param_gen``) follow the Quimb parameter-generator
+convention: ``params[0]`` is kept on its original Autoray backend, so Torch
+and JAX gradients are not routed through NumPy.
+
+For a custom neutral local Hamiltonian, ``exponential`` accepts terms such as
+``(coefficient, ((site, "create_up"), (site, "annihilate_down")))`` and builds
+the native Symmray gate directly. ``imaginary=True`` changes the evolution to
+``exp(-dt H)``. The local exponential must be neutral so it remains in one
+conserved charge sector.
+
+``SpinfulFermion`` and ``SpinfulFermionHubbard`` remain compatibility aliases
+for ``Fermion``. ``SymmFermions.spinless(...)`` and
+``SymmFermions.spinful(...)`` are factory-style alternatives.
+
 ## Native spinful-fermion helper
 
 ``SpinfulFermion`` bundles the local spinful operators, half-filled product
 charge pattern, native Symmray observables, and gate construction for the
-total-number ``U1`` or spin-resolved ``U1U1`` formulation. It keeps the
+total-number ``U1``/``Z2`` or spin-resolved ``U1U1``/``Z2Z2`` formulation. It keeps the
 simulation in the direct fermionic representation -- it does not construct a
 qubit or Jordan-Wigner circuit. It is not limited to Hamiltonian construction:
 the same object supplies local operators, charged observables, and evolution
@@ -94,8 +207,8 @@ helpers. ``py.SymmFermions.spinful(...)`` returns the same ``SpinfulFermion``
 object when a workflow prefers a model-family entry point.
 
 ``pair_create`` and ``pair_annihilate`` carry charge ``+2`` and ``-2`` for
-``U1``, or ``(1, 1)`` and ``(-1, -1)`` for ``U1U1``.  Pass those charges to
-``SymMPS.measure`` when evaluating a charged pairing correlator.
+``U1``, ``0`` for ``Z2``, and ``(1, 1)`` for ``U1U1``/``Z2Z2``. Pass those
+charges to ``SymMPS.measure`` when evaluating a charged pairing correlator.
 
 ## Random-unitary MPS starts
 
