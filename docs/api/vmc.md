@@ -79,6 +79,33 @@ sample = pvmc.metropolis_exchange_sweep(
     hopping_rate=0.25,
     encoding=encoding,
 )
+
+# NetKet-like stateful sampling. ``n_samples`` is total across chains.
+sampler = pvmc.TorchMetropolisSampler(
+    model,
+    graph,
+    configs,
+    proposal="spinful",
+    n_chains=128,  # normally inferred from configs
+    seed=2,
+)
+samples = sampler.sample(
+    n_samples=1024,
+    n_discard_per_chain=500,
+    sweep_size=graph.n_sites,
+)
+print(samples.configs.shape)  # (chain_length, n_chains, n_sites)
+
+# ``n_discard`` and ``n_thin`` are convenience aliases.
+samples = pvmc.metropolis_local_sampler(
+    configs,
+    model,
+    graph,
+    n_samples=1024,
+    n_discard=500,
+    n_thin=graph.n_sites,
+    seed=2,
+)
 conn = pvmc.spinful_fermi_hubbard_connections(
     sample.configs,
     graph,
@@ -93,6 +120,14 @@ eloc = pvmc.local_energy_from_connections(
     model,
 )
 ```
+
+If the amplitude model exposes `forward_log(configs)` and returns
+`(phase, log_abs)`, Metropolis acceptance uses
+`exp(min(0, 2 * (log_abs_new - log_abs_old)))` instead of dividing raw
+amplitudes. Models without that method retain the raw-amplitude fallback.
+After measuring an observable, `result.chain_diagnostics` reports `r_hat`, the
+integrated autocorrelation time, and an effective sample size when there are
+at least two chains and two retained samples per chain.
 
 `TorchPEPSAmplitude.parameters()` returns the packed PEPS tensor leaves as
 torch parameters, so plain torch optimizers and the lightweight SR/minSR
@@ -127,26 +162,138 @@ current amplitudes, Hamiltonian connection metadata, sampling, local-energy
 evaluation, and optional SR updates together. Local-energy evaluation reuses
 diagonal connected amplitudes, supports chunked off-diagonal amplitude calls,
 and uses `connected_amplitudes(...)` automatically when the model provides it.
+For native Pepsy Hamiltonians, pass the explicit term mapping and let the
+driver build all connected configurations directly from those one- and
+two-site operators:
 
 ```python
+ham = fermion.hamiltonian(terms)
 driver = pvmc.TorchVMCDriver(
     model,
     graph,
     configs,
-    connection_fn="fermi_hubbard",
-    connection_kwargs={"t": 1.0, "U": 8.0, "encoding": encoding},
+    terms=ham.terms,
+    site_order=tuple(peps.sites),
     proposal="spinful",
     hopping_rate=0.25,
     chunk_size=64,
 )
 
-result = driver.step(
-    sr=True,
-    learning_rate=0.02,
-    sr_diag_shift=1e-3,
+result = driver.estimate_observable(
+    burn_in=20,
+    n_measurements=8,
+    sweeps_between=2,
+    progress=True,
 )
-print(result.energy_mean, result.acceptance_rate)
+print(
+    result.energy_mean,
+    result.energy_stderr,
+    result.samples_per_second,
+)
 ```
+
+The explicit-term route is Hamiltonian-agnostic and is the preferred
+measurement path when the caller already has `ham.terms`. The older
+`connection_fn="fermi_hubbard"` / `connection_kwargs={...}` route remains
+available for lightweight custom loops. `FermionSiteEncoding.vmc_torch()` is
+the default torch spinful encoding: `0=empty, 1=down, 2=up, 3=double`.
+The estimate result retains the legacy `energy_mean`, `energy_variance`, and
+`energy_stderr` field names; they contain statistics for the configured
+observable. `estimate_energy(...)` remains as a compatibility alias.
+
+For a coordinate-labelled PEPS, use `TorchFermionVMC` to derive the lattice,
+physical charge ordering, initial sector, and sampler rule in one place. Pass
+`fermion` to generate the default Hamiltonian, or omit it when supplying
+explicit `terms`:
+
+```python
+from pepsy import Fermion
+
+fermion = Fermion(spinful=True, symmetry="U1U1", t=t, U=U)
+vmc = pvmc.TorchFermionVMC(
+    peps,
+    fermion,
+    n_walkers=128,
+    contraction="exact",  # or "boundary" / "ctmrg" / "hotrg"
+    chi=None,  # set this when using an approximate contraction
+    dtype=torch.complex128,
+    seed=1,
+)
+result = vmc.estimate_observable(
+    burn_in=20,
+    n_measurements=8,
+    sweeps_between=2,
+)
+```
+
+For the chain-preserving interface, call
+`vmc.estimate_observable(n_samples=..., n_discard_per_chain=...,`
+`sweep_size=...)`. The older `burn_in`/`n_measurements`/
+`sweeps_between` form remains available. For spinful fermions, the selected
+proposal is symmetry-aware rather than a literal single-site flip: `U1U1`
+preserves both flavor counts, `U1` preserves total particle number, and `Z2`
+preserves parity.
+
+`U1U1` uses moves that preserve `(N_up, N_down)`. For spinful `U1`, the
+default proposal also includes single-site spin flips, so only
+`N_up + N_down` is fixed. Spinful `Z2` adds empty/double pair toggles, so it
+preserves parity without freezing total particle number. Pass an explicit
+`terms={site_or_edge: operator}` mapping to measure a custom observable; site
+labels may be PEPS labels or positional integers. If a dense PEPS does not
+expose its charge sector, pass `sector=...` or valid `configs=...` explicitly.
+The adapter refuses to apply an unverified local basis permutation.
+
+For an importance proposal from Pepsy's dense 2-norm BP sampler, use BP only
+to propose configurations and let the torch PEPS model measure amplitudes and
+local energies:
+
+```python
+from pepsy.sampling import PepsBpSampler
+
+bp_sampler = PepsBpSampler(native_peps)
+importance = driver.importance_energy_estimate(
+    bp_sampler,
+    n_samples=512,
+    sample_kwargs={"method": "mps", "chi": 32, "cutoff": 1e-10},
+    progress=True,
+)
+print(importance.energy_mean, importance.effective_sample_size)
+```
+
+The importance result uses self-normalized weights
+`|psi(x)|**2 / q_BP(x)` and reports the effective sample size, so a small BP
+proposal overlap is visible instead of being mistaken for a precise VMC
+estimate.
+
+For large nonlocal BP moves with an exact Metropolis correction, use the BP
+sampler as an independence proposal. `TorchFermionVMC` infers the PEPS
+encoding, symmetry, and sector automatically:
+
+```python
+bp_mcmc = vmc.make_bp_sampler(
+    n_chains=64,
+    bp_sampler_kwargs={"max_iterations": 100},
+    sample_kwargs={"method": "mps", "chi": 32, "cutoff": 1e-10},
+    seed=3,
+)
+samples = bp_mcmc.sample(
+    n_samples=1024,
+    n_discard=100,
+    n_thin=4,
+)
+```
+
+Each proposal uses
+
+`min(1, |psi(y)|**2 q_BP(x) / (|psi(x)|**2 q_BP(y)))`.
+
+The BP adapter supports four-state spinful fermion PEPS with `U1`, `U1U1`,
+`Z2`, and `Z2Z2` physical symmetries. Since Quimb's current D2BP interface
+samples binary output legs, a four-state physical leg is represented as two
+occupation bits in a private dense BP copy. The original Symmray PEPS remains
+block-sparse and is still used for Torch amplitudes and local energies. BP
+proposals outside a fixed Fermion sector are rejected before they can enter a
+chain.
 
 The torch PEPS wrapper is validated for dense quimb PEPS and Symmray
 block-sparse fermionic PEPS. Symmray tensors are packed through their own
@@ -160,11 +307,11 @@ Symmray's batch-GPU fermionic-amplitude example. Do not assume the same flat
 supported through sparse block contractions, so their batching/performance
 profile should be benchmarked separately.
 
-The default spinful encoding matches Pepsy/Symmray physical indices
-`0=empty, 1=double, 2=up, 3=down`. Use
-`FermionSiteEncoding.vmc_torch()` when consuming configs from
-`sjdu10/vmc_torch`, where the convention is
-`0=empty, 1=down, 2=up, 3=double`.
+Torch VMC uses the physical-index order
+`0=empty, 1=down, 2=up, 3=double`, matching the native four-sector fermionic
+PEPS and the `sjdu10/vmc_torch` convention. Use
+`FermionSiteEncoding.symmray()` only when interoperating with a caller that
+explicitly uses its alternate legacy labels.
 
 Available connected-config helpers include
 `spinful_fermi_hubbard_connections`, `heisenberg_connections`, and

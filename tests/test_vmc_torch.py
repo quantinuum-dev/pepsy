@@ -2,14 +2,26 @@
 
 import pytest
 import quimb.tensor as qtn
+import numpy as np
+from types import SimpleNamespace
 
 torch = pytest.importorskip("torch")
 
+from pepsy.tensors import Fermion, ps_to_peps  # noqa: E402
+from pepsy.sampling import PepsBpSampler  # noqa: E402
 from pepsy.vmc.torch import (  # noqa: E402
     FermionSiteEncoding,
     TorchPEPSAmplitude,
     TorchPEPSBoundaryAmplitude,
+    TorchFermionVMC,
+    TorchFermionVMCMetadata,
+    TorchChainDiagnostics,
+    TorchMCMCSamples,
+    TorchMetropolisSampler,
+    TorchBPMetropolisSampler,
     TorchVMCDriver,
+    TorchVMCEnergyEstimate,
+    TorchVMCImportanceEstimate,
     TorchVMCStepResult,
     TorchSquareLattice,
     apply_torch_sr_update,
@@ -17,15 +29,21 @@ from pepsy.vmc.torch import (  # noqa: E402
     heisenberg_connections,
     local_energy_from_connections,
     make_torch_peps_amplitude_model,
+    metropolis_local_sampler,
     metropolis_exchange_sweep,
     propose_spin_exchange,
     propose_spinful_exchange_or_hopping,
+    propose_spinful_u1_exchange_or_hopping,
+    propose_spinful_z2_exchange_or_hopping,
+    propose_spinful_z2z2_exchange_or_hopping,
     random_spin_configs,
     random_spinful_configs,
     solve_torch_sr,
     spinful_fermi_hubbard_connections,
     torch_log_derivative_matrix,
     transverse_ising_connections,
+    torch_hamiltonian_connections,
+    torch_chain_diagnostics,
 )
 
 
@@ -49,6 +67,23 @@ class CountingAmplitude:
         return torch.ones(configs.shape[0], dtype=torch.float64, device=configs.device)
 
 
+class LogOnlyAmplitude:
+    """Amplitude whose raw values underflow but whose log values are usable."""
+
+    def __call__(self, configs):
+        return torch.zeros(configs.shape[0], dtype=torch.float64)
+
+    def forward_log(self, configs):
+        high = configs[:, 0] == 1
+        log_abs = torch.where(
+            high,
+            torch.full((configs.shape[0],), -900.0, dtype=torch.float64),
+            torch.full((configs.shape[0],), -1000.0, dtype=torch.float64),
+        )
+        phase = torch.ones(configs.shape[0], dtype=torch.complex128)
+        return phase, log_abs
+
+
 def test_fermion_site_encoding_supports_symmray_and_vmc_torch_orders():
     symm = FermionSiteEncoding.symmray()
     vmct = FermionSiteEncoding.vmc_torch()
@@ -67,6 +102,80 @@ def test_fermion_site_encoding_supports_symmray_and_vmc_torch_orders():
 
     with pytest.raises(ValueError, match="Unknown fermion site code"):
         symm.decode(torch.tensor([[9]]))
+
+
+def test_fermion_site_encoding_derives_u1u1_peps_charge_order():
+    fermion = Fermion(spinful=True, symmetry="U1U1")
+    encoding = FermionSiteEncoding.from_fermion(
+        fermion,
+        physical_charges=((0, 0), (0, 1), (1, 0), (1, 1)),
+    )
+    assert encoding == FermionSiteEncoding.vmc_torch()
+    assert encoding.encode(torch.tensor([[1, 0]]), torch.tensor([[0, 1]])).tolist() == [[2, 1]]
+
+
+def test_spinful_u1_proposal_preserves_total_and_can_change_spin_sector():
+    encoding = FermionSiteEncoding.vmc_torch()
+    configs = torch.tensor([[encoding.up, encoding.down]])
+    before_up, before_down = count_spinful_particles(configs, encoding=encoding)
+    proposed, changed = propose_spinful_u1_exchange_or_hopping(
+        0,
+        1,
+        configs,
+        spin_flip_rate=1.0,
+        encoding=encoding,
+        generator=torch.Generator().manual_seed(7),
+    )
+    after_up, after_down = count_spinful_particles(proposed, encoding=encoding)
+    assert changed.tolist() == [True]
+    assert (after_up + after_down).tolist() == (before_up + before_down).tolist()
+    assert (
+        not torch.equal(after_up, before_up)
+        or not torch.equal(after_down, before_down)
+    )
+
+
+def test_spinful_z2_proposal_preserves_parity_and_can_change_number():
+    encoding = FermionSiteEncoding.symmray()
+    configs = torch.tensor([[encoding.empty, encoding.empty]])
+    before_up, before_down = count_spinful_particles(configs, encoding=encoding)
+    proposed, changed = propose_spinful_z2_exchange_or_hopping(
+        0,
+        1,
+        configs,
+        hopping_rate=0.0,
+        spin_flip_rate=0.0,
+        pair_toggle_rate=1.0,
+        encoding=encoding,
+        generator=torch.Generator().manual_seed(8),
+    )
+    after_up, after_down = count_spinful_particles(proposed, encoding=encoding)
+    assert changed.tolist() == [True]
+    assert ((after_up + after_down) % 2).tolist() == (
+        (before_up + before_down) % 2
+    ).tolist()
+    assert (after_up + after_down).tolist() == [2]
+
+
+def test_spinful_z2z2_proposal_preserves_resolved_parities():
+    encoding = FermionSiteEncoding.vmc_torch()
+    configs = torch.tensor([[encoding.empty, encoding.empty]])
+    before_up, before_down = count_spinful_particles(configs, encoding=encoding)
+    proposed, changed = propose_spinful_z2z2_exchange_or_hopping(
+        0,
+        1,
+        configs,
+        hopping_rate=0.0,
+        pair_toggle_rate=1.0,
+        encoding=encoding,
+        generator=torch.Generator().manual_seed(8),
+    )
+    after_up, after_down = count_spinful_particles(proposed, encoding=encoding)
+    assert changed.tolist() == [True]
+    assert ((after_up % 2).tolist(), (after_down % 2).tolist()) == (
+        (before_up % 2).tolist(),
+        (before_down % 2).tolist(),
+    )
 
 
 def test_torch_square_lattice_edges_match_row_major_open_boundary():
@@ -345,6 +454,320 @@ def test_torch_vmc_driver_can_apply_sr_update():
     assert torch.allclose(driver.amplitudes, model(driver.configs))
 
 
+def test_torch_hamiltonian_connections_accept_explicit_local_terms():
+    configs = torch.tensor([[0], [1]], dtype=torch.long)
+    term = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float64)
+
+    conn = torch_hamiltonian_connections(configs, {0: term})
+    rows = [
+        (tuple(row.tolist()), float(coeff), int(batch_id))
+        for row, coeff, batch_id in zip(
+            conn.configs,
+            conn.coeffs,
+            conn.batch_ids,
+        )
+    ]
+
+    assert ((0,), 1.0, 0) in rows
+    assert ((1,), 3.0, 0) in rows
+    assert ((0,), 2.0, 1) in rows
+    assert ((1,), 4.0, 1) in rows
+
+
+def test_torch_vmc_driver_accepts_explicit_terms_and_estimates_sampling_rate():
+    model = ProductAmplitude()
+    configs = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+    term = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
+    driver = TorchVMCDriver(
+        model,
+        [(0, 1)],
+        configs,
+        terms={0: term},
+        proposal="spin",
+        generator=torch.Generator().manual_seed(5),
+    )
+
+    result = driver.estimate_observable(
+        burn_in=1,
+        n_measurements=2,
+        sweeps_between=1,
+    )
+
+    assert isinstance(result, TorchVMCEnergyEstimate)
+    assert result.n_samples == 4
+    assert result.n_measurements == 2
+    assert result.elapsed_seconds > 0.0
+    assert result.samples_per_second > 0.0
+    assert torch.isfinite(result.energy_mean)
+    assert torch.isfinite(result.energy_stderr)
+    assert result.chain_diagnostics is not None
+    assert result.chain_diagnostics.n_chains == 2
+
+    legacy = driver.estimate_energy(
+        burn_in=0,
+        n_measurements=1,
+        sweeps_between=1,
+    )
+    assert isinstance(legacy, TorchVMCEnergyEstimate)
+
+
+def test_torch_metropolis_sampler_preserves_chains_and_accepts_netket_aliases():
+    model = ProductAmplitude()
+    configs = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+    sampler = TorchMetropolisSampler(
+        model,
+        [(0, 1)],
+        configs,
+        proposal="spin",
+        seed=11,
+    )
+
+    result = sampler.sample(
+        n_samples=5,
+        n_discard=2,
+        n_thin=2,
+    )
+
+    assert isinstance(result, TorchMCMCSamples)
+    assert result.configs.shape == (3, 2, 2)
+    assert result.amplitudes.shape == (3, 2)
+    assert result.n_samples == 6
+    assert result.n_samples_per_chain == 3
+    assert result.n_chains == 2
+    assert result.n_discard_per_chain == 2
+    assert result.sweep_size == 2
+    assert result.n_proposed >= result.n_accepted >= 0
+    assert result.elapsed_seconds > 0.0
+
+
+def test_metropolis_exchange_sweep_uses_log_amplitude_ratio_when_available():
+    result = metropolis_exchange_sweep(
+        torch.tensor([[0, 1]], dtype=torch.long),
+        LogOnlyAmplitude(),
+        [(0, 1)],
+        proposal="spin",
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    assert result.configs.tolist() == [[1, 0]]
+    assert result.log_abs_amplitudes.tolist() == [-900.0]
+    assert result.nonzero_amplitudes.tolist() == [True]
+
+
+def test_torch_chain_diagnostics_reports_rhat_tau_and_effective_sample_size():
+    values = torch.arange(8, dtype=torch.float64).reshape(8, 1).repeat(1, 4)
+    diagnostics = torch_chain_diagnostics(values)
+
+    assert isinstance(diagnostics, TorchChainDiagnostics)
+    assert diagnostics.r_hat >= 1.0
+    assert diagnostics.integrated_autocorrelation_time >= 1.0
+    assert 0.0 < diagnostics.effective_sample_size <= 32.0
+    assert diagnostics.rhat == diagnostics.r_hat
+    assert diagnostics.tau == diagnostics.integrated_autocorrelation_time
+
+
+def test_metropolis_local_sampler_infers_sites_and_chain_count():
+    model = ProductAmplitude()
+    configs = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+
+    result = metropolis_local_sampler(
+        configs,
+        model,
+        [(0, 1)],
+        n_sites=2,
+        n_samples=4,
+        n_chains=2,
+        n_discard_per_chain=0,
+        sweep_size=1,
+        proposal="spin",
+        seed=12,
+    )
+
+    assert result.configs.shape == (2, 2, 2)
+    assert result.n_samples == 4
+
+
+def test_torch_vmc_driver_exposes_chain_preserving_sampling():
+    model = ProductAmplitude()
+    driver = TorchVMCDriver(
+        model,
+        [(0, 1)],
+        torch.tensor([[0, 1], [1, 0]], dtype=torch.long),
+        terms={0: torch.eye(2, dtype=torch.float64)},
+        proposal="spin",
+    )
+
+    result = driver.sample(
+        n_samples=3,
+        n_discard=1,
+        n_thin=1,
+        seed=13,
+    )
+
+    assert result.configs.shape == (2, 2, 2)
+    assert driver.configs.shape == (2, 2)
+    assert torch.allclose(driver.amplitudes, model(driver.configs))
+
+    estimate = driver.estimate_observable(
+        n_samples=3,
+        n_discard=1,
+        n_thin=1,
+        seed=14,
+    )
+    assert estimate.configs.shape == (2, 2, 2)
+    assert estimate.local_energies.shape == (2, 2)
+    assert estimate.n_samples == 4
+    assert torch.isfinite(estimate.energy_mean)
+
+
+def test_torch_vmc_driver_importance_estimate_uses_proposal_weights():
+    model = ProductAmplitude()
+    configs = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
+    driver = TorchVMCDriver(
+        model,
+        [(0, 1)],
+        configs,
+        connection_fn="heisenberg",
+        proposal="spin",
+    )
+
+    class Proposal:
+        def sample(self, *, samples, progbar=False):
+            assert samples == 2
+            assert progbar is False
+            return SimpleNamespace(
+                configs=[[0, 1], [1, 0]],
+                omegas=([1.0, 1.0], [0, 0]),
+            )
+
+    result = driver.importance_energy_estimate(Proposal(), n_samples=2)
+
+    assert isinstance(result, TorchVMCImportanceEstimate)
+    assert result.n_samples == 2
+    assert result.n_valid == 2
+    assert torch.allclose(
+        result.effective_sample_size,
+        torch.tensor(2.0, dtype=torch.float64),
+    )
+    assert torch.isfinite(result.energy_mean)
+    assert torch.isfinite(result.energy_stderr)
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "encoding"),
+    [
+        ("Z2", FermionSiteEncoding.symmray()),
+        ("U1", FermionSiteEncoding.vmc_torch()),
+        ("Z2Z2", FermionSiteEncoding.vmc_torch()),
+        ("U1U1", FermionSiteEncoding.vmc_torch()),
+    ],
+)
+def test_torch_bp_metropolis_filters_fermion_symmetry_sectors(symmetry, encoding):
+    class Amplitude:
+        def __call__(self, rows):
+            return torch.ones(rows.shape[0], dtype=torch.float64)
+
+    if symmetry == "U1":
+        valid, invalid, sector = [0, 3], [0, 0], 2
+    elif symmetry == "U1U1":
+        valid, invalid, sector = [2, 1], [0, 0], (1, 1)
+    elif symmetry == "Z2":
+        valid, invalid, sector = [0, 0], [2, 0], 0
+    else:
+        valid, invalid, sector = [2, 1], [0, 0], (1, 1)
+
+    class Proposal:
+        def __init__(self):
+            self.calls = 0
+
+        def sample(self, *, samples, progbar=False):
+            self.calls += 1
+            rows = [valid] * samples if self.calls == 1 else [invalid] * samples
+            return SimpleNamespace(
+                configs=rows,
+                omegas=([1.0] * samples, [0] * samples),
+            )
+
+    sampler = TorchBPMetropolisSampler(
+        Amplitude(),
+        [],
+        Proposal(),
+        n_chains=2,
+        symmetry=symmetry,
+        sector=sector,
+        encoding=encoding,
+        seed=7,
+    )
+    initial = sampler.configs.clone()
+    result = sampler.sample_sweep()
+
+    assert result.n_proposed == 2
+    assert result.n_accepted == 0
+    assert torch.equal(sampler.configs, initial)
+
+
+def test_torch_bp_metropolis_acceptance_uses_independence_log_ratio():
+    class Amplitude:
+        def __call__(self, rows):
+            return torch.where(
+                rows[:, 0] == 0,
+                torch.ones(rows.shape[0], dtype=torch.float64),
+                torch.full((rows.shape[0],), 2.0, dtype=torch.float64),
+            )
+
+    class Proposal:
+        def __init__(self):
+            self.calls = 0
+
+        def sample(self, *, samples, progbar=False):
+            self.calls += 1
+            rows = [[0]] * samples if self.calls == 1 else [[1]] * samples
+            # q(0) = 3/4 and q(1) = 1/4, so the move 0 -> 1 has ratio
+            # |2|^2 * (3/4) / (|1|^2 * (1/4)) = 12 and must accept.
+            probs = ([0.75] * samples, [0] * samples)
+            if self.calls > 1:
+                probs = ([0.25] * samples, [0] * samples)
+            return SimpleNamespace(configs=rows, omegas=probs)
+
+    sampler = TorchBPMetropolisSampler(
+        Amplitude(),
+        [],
+        Proposal(),
+        n_chains=2,
+        seed=3,
+    )
+    result = sampler.sample_sweep()
+    assert result.n_accepted == 2
+    assert sampler.configs.tolist() == [[1], [1]]
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "encoding"),
+    [
+        ("Z2", FermionSiteEncoding.symmray()),
+        ("U1", FermionSiteEncoding.vmc_torch()),
+        ("Z2Z2", FermionSiteEncoding.vmc_torch()),
+        ("U1U1", FermionSiteEncoding.vmc_torch()),
+    ],
+)
+def test_peps_bp_sampler_supports_four_state_symmray_fermions(symmetry, encoding):
+    peps = _symmray_fermionic_peps(symmetry)
+    result = PepsBpSampler(peps, encoding=encoding).sample(
+        samples=1,
+        method="exact",
+        seed=2,
+        bp_kwargs={"max_iterations": 3},
+    )
+
+    assert len(result.configs) == 1
+    assert len(result.configs[0]) == 4
+    assert all(value in {0, 1, 2, 3} for value in result.configs[0])
+    assert np.isfinite(np.asarray(result.omegas[0])).all()
+    assert np.isfinite(np.asarray(result.omegas[1])).all()
+    assert np.isfinite(np.asarray(result.ps[0])).all()
+    assert np.isfinite(np.asarray(result.ps[1])).all()
+
+
 def _symmray_site_charge(symmetry):
     if symmetry == "U1":
         return lambda site: 0 if (site[0] + site[1]) % 2 == 0 else 1
@@ -452,6 +875,97 @@ def test_symmray_fermionic_peps_feeds_hubbard_local_energy_kernel():
 
     assert energy.shape == (1,)
     assert torch.isfinite(energy).all()
+
+
+def test_torch_fermion_vmc_infers_geometry_sector_encoding_and_terms():
+    fermion = Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=1.0,
+        U=2.0,
+    )
+    peps = ps_to_peps(
+        2,
+        2,
+        fermion=fermion,
+        occupations=[(1, 0), (0, 1), (1, 0), (0, 1)],
+        seed=21,
+        dtype="complex128",
+    )
+    vmc = TorchFermionVMC(
+        peps,
+        fermion,
+        n_walkers=2,
+        dtype=torch.complex128,
+        seed=22,
+    )
+
+    assert isinstance(vmc.metadata, TorchFermionVMCMetadata)
+    assert (vmc.Lx, vmc.Ly) == (2, 2)
+    assert vmc.site_order == tuple(peps.sites)
+    assert vmc.sector == (2, 2)
+    assert vmc.encoding == FermionSiteEncoding.vmc_torch()
+    assert vmc.metadata.graph_edges == ((0, 1), (2, 3), (0, 2), (1, 3))
+    assert torch.isfinite(vmc.local_energies()).all()
+
+    sample = vmc.sample_sweep()
+    n_up, n_down = count_spinful_particles(sample.configs, encoding=vmc.encoding)
+    assert n_up.tolist() == [2, 2]
+    assert n_down.tolist() == [2, 2]
+
+
+def test_torch_fermion_vmc_accepts_z2_and_explicit_observable_terms():
+    fermion = Fermion(spinful=True, symmetry="Z2", t=1.0, U=2.0)
+    peps = ps_to_peps(1, 2, fermion=fermion, seed=23, dtype="complex128")
+    terms = {
+        (0, 1): -fermion.hopping_operator(),
+        0: fermion.onsite_term(0),
+        1: fermion.onsite_term(1),
+    }
+    vmc = TorchFermionVMC(
+        peps,
+        terms=terms,
+        configs=[[2, 3]],
+        dtype=torch.complex128,
+        seed=24,
+    )
+
+    assert vmc.proposal == "spinful_z2"
+    assert vmc.sector == 0
+    assert vmc.encoding == FermionSiteEncoding.symmray()
+    assert torch.isfinite(vmc.local_energies()).all()
+
+    sample = vmc.sample_sweep()
+    n_up, n_down = count_spinful_particles(sample.configs, encoding=vmc.encoding)
+    assert ((n_up + n_down) % 2).tolist() == [0]
+
+
+def test_torch_fermion_vmc_accepts_z2z2_and_bp_sampling():
+    fermion = Fermion(spinful=True, symmetry="Z2Z2", t=1.0, U=2.0)
+    peps = ps_to_peps(2, 2, fermion=fermion, seed=25, dtype="complex128")
+    vmc = TorchFermionVMC(
+        peps,
+        fermion,
+        n_walkers=2,
+        dtype=torch.complex128,
+        seed=26,
+    )
+
+    assert vmc.proposal == "spinful_z2z2"
+    assert vmc.sector == (0, 0)
+    sampler = vmc.make_bp_sampler(
+        n_chains=2,
+        bp_sampler_kwargs={"max_iterations": 3},
+        sample_kwargs={"method": "exact"},
+        seed=27,
+    )
+    result = sampler.sample(n_samples=2, n_discard=1, n_thin=1)
+    n_up, n_down = count_spinful_particles(
+        result.configs.reshape(-1, vmc.n_sites),
+        encoding=vmc.encoding,
+    )
+    assert ((n_up % 2) == 0).all()
+    assert ((n_down % 2) == 0).all()
 
 
 def test_spinful_exchange_hopping_proposal_preserves_particle_counts():

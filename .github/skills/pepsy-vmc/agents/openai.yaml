@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pepsy VMC"
+  short_description: "Build and debug Pepsy VMC workflows"
+  default_prompt: "Use $pepsy-vmc to design or implement a Pepsy VMC sampling and measurement workflow."

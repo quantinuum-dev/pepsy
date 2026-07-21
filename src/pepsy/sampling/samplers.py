@@ -104,6 +104,157 @@ def _backend_array_to_numpy(array):
     return np.asarray(array)
 
 
+def _fermion_code_order(encoding, *, default=(0, 1, 2, 3)):
+    """Return physical codes ordered by ``(n_up, n_down)`` bits."""
+    if encoding is None:
+        codes = {
+            "empty": int(default[0]),
+            "down": int(default[1]),
+            "up": int(default[2]),
+            "double": int(default[3]),
+        }
+    else:
+        try:
+            codes = {
+                "empty": int(encoding.empty),
+                "double": int(encoding.double),
+                "up": int(encoding.up),
+                "down": int(encoding.down),
+            }
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise TypeError(
+                "encoding must expose integer empty, double, up, and down "
+                "codes, for example FermionSiteEncoding."
+            ) from exc
+    values = (
+        codes["empty"],
+        codes["down"],
+        codes["up"],
+        codes["double"],
+    )
+    if sorted(values) != [0, 1, 2, 3]:
+        raise ValueError(
+            "A spinful fermion encoding must contain exactly the physical "
+            "codes 0, 1, 2, and 3."
+        )
+    return values
+
+
+def _infer_fermion_code_order(tn, sites):
+    """Infer a four-state code order from PEPS symmetry metadata when possible."""
+    default = (0, 1, 2, 3)
+    if not sites:
+        return default
+    tensor = tn[sites[0]]
+    data = getattr(tensor, "data", None)
+    symmetry = str(getattr(data, "symmetry", "")).upper()
+    if symmetry == "Z2":
+        # The two even states precede the two odd states in Symmray's
+        # charge-collapsed physical index.
+        return (0, 3, 2, 1)
+    if symmetry not in {"U1U1", "Z2Z2"}:
+        return default
+    try:
+        site_ind = tn.site_ind(sites[0])
+        axis = tensor.inds.index(site_ind)
+        charges = tuple(data.indices[axis].chargemap)
+        position = {tuple(charge): i for i, charge in enumerate(charges)}
+        required = ((0, 0), (0, 1), (1, 0), (1, 1))
+        if all(charge in position for charge in required):
+            return tuple(position[charge] for charge in required)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        pass
+    return default
+
+
+def _to_dense_numpy(array):
+    """Convert a dense or Symmray array to a NumPy array for BP sampling."""
+    if hasattr(array, "to_dense"):
+        array = array.to_dense()
+    detach = getattr(array, "detach", None)
+    if callable(detach):
+        array = detach()
+        cpu = getattr(array, "cpu", None)
+        if callable(cpu):
+            array = cpu()
+        numpy = getattr(array, "numpy", None)
+        if callable(numpy):
+            array = numpy()
+    return np.asarray(array)
+
+
+def _prepare_bp_binary_network(tn, *, site_order=None, encoding=None):
+    """Prepare a binary-output copy for Quimb's binary ``sample_d2bp``.
+
+    Quimb's public D2BP sampler currently samples each output index from
+    ``[0, 1]``. A four-state fermionic physical leg is therefore represented
+    as two occupation legs, while all tensor data are converted to dense
+    NumPy arrays in the private BP copy. The source network is never mutated.
+    """
+    network = getattr(tn, "tn", tn)
+    if not hasattr(network, "sites") or not hasattr(network, "copy"):
+        return network, {}, tuple(), (0, 1, 2, 3)
+
+    sites = tuple(network.sites if site_order is None else site_order)
+    missing = [site for site in sites if site not in network.sites]
+    if missing:
+        raise ValueError(f"site_order contains site(s) not in PEPS: {missing!r}")
+
+    work = network.copy()
+    code_order = (
+        _fermion_code_order(encoding)
+        if encoding is not None
+        else _infer_fermion_code_order(network, sites)
+    )
+    split_inds = {}
+    existing_inds = set(work.ind_map)
+
+    for site in sites:
+        tensor = work[site]
+        site_ind = work.site_ind(site)
+        try:
+            axis = tensor.inds.index(site_ind)
+        except ValueError as exc:
+            raise ValueError(
+                f"Could not locate physical index for PEPS site {site!r}."
+            ) from exc
+
+        data = _to_dense_numpy(tensor.data)
+        physical_dim = int(data.shape[axis])
+        if physical_dim == 2:
+            if hasattr(tensor.data, "to_dense"):
+                tensor.modify(data=data)
+            continue
+        if physical_dim != 4:
+            raise ValueError(
+                "Quimb BP sampling supports binary physical legs directly "
+                "and spinful fermion legs through a four-state adapter; got "
+                f"dimension {physical_dim} at site {site!r}."
+            )
+
+        # ``code_order`` maps flattened (up, down) bits back to the PEPS
+        # physical-index order. Reshaping after this permutation gives BP two
+        # binary output indices with the intended fermion convention.
+        data = np.take(data, code_order, axis=axis)
+        data = data.reshape(
+            data.shape[:axis] + (2, 2) + data.shape[axis + 1:]
+        )
+        up_ind = f"{site_ind}_bp_up"
+        down_ind = f"{site_ind}_bp_down"
+        suffix = 0
+        while up_ind in existing_inds or down_ind in existing_inds:
+            suffix += 1
+            up_ind = f"{site_ind}_bp_up_{suffix}"
+            down_ind = f"{site_ind}_bp_down_{suffix}"
+        existing_inds.update((up_ind, down_ind))
+        inds = list(tensor.inds)
+        inds[axis:axis + 1] = [up_ind, down_ind]
+        tensor.modify(data=data, inds=inds)
+        split_inds[site] = (up_ind, down_ind)
+
+    return work, split_inds, sites, code_order
+
+
 def _configs_to_sample_result(configs, probs, *, Lx, Ly, one_d_to_two_d):
     configs_1d = []
     configs_2d = []
@@ -1134,14 +1285,39 @@ class PepsBpSampler:
     proposal probability ``omega(x)``, contracts the projected PEPS amplitude
     ``p(x)``, and returns the ingredients for the PEPS norm estimator
     ``E_q[|p(x)|^2 / omega(x)]``.
+
+    Quimb's public D2BP sampler currently samples binary output indices. For a
+    four-state spinful PEPS this class transparently samples two binary
+    occupation legs per site and maps them back to the requested local
+    fermion encoding. Symmray inputs are densified only in the private BP
+    proposal copy; the original network remains block-sparse.
     """
 
-    def __init__(self, tn, *, optimizer=None, sample_kwargs: dict[str, Any] | None = None):
-        self.tn = tn
-        self.Lx = tn.Lx
-        self.Ly = tn.Ly
+    def __init__(
+        self,
+        tn,
+        *,
+        optimizer=None,
+        sample_kwargs: dict[str, Any] | None = None,
+        encoding=None,
+        site_order=None,
+    ):
+        self.tn = getattr(tn, "tn", tn)
+        self.Lx = self.tn.Lx
+        self.Ly = self.tn.Ly
         self.optimizer = optimizer
         self.sample_kwargs = dict(sample_kwargs or {})
+        self.encoding = encoding
+        (
+            self._bp_tn,
+            self._split_inds,
+            self.site_order,
+            self._code_order,
+        ) = _prepare_bp_binary_network(
+            self.tn,
+            site_order=site_order,
+            encoding=encoding,
+        )
 
     @staticmethod
     def mantissa_exponent10(w: float) -> tuple[float, int]:
@@ -1171,6 +1347,33 @@ class PepsBpSampler:
         return self.optimizer
 
     def _config_list(self, config: dict[str, Any]) -> list[int]:
+        if self._split_inds:
+            out = []
+            code_order = self._code_order
+            # Invert the (up, down) -> physical-code map built above.
+            code_from_bits = {
+                (0, 0): code_order[0],
+                (0, 1): code_order[1],
+                (1, 0): code_order[2],
+                (1, 1): code_order[3],
+            }
+            for site in self.site_order:
+                up_ind, down_ind = self._split_inds[site]
+                bits = (int(config[up_ind]), int(config[down_ind]))
+                out.append(code_from_bits[bits])
+            return out
+
+        if self.site_order:
+            out = []
+            for site in self.site_order:
+                try:
+                    site_ind = self.tn.site_ind(site)
+                except (AttributeError, KeyError):
+                    site_ind = f"k{site[0]},{site[1]}"
+                out.append(int(config[site_ind]))
+            return out
+
+        # Keep the small dummy-network/testing protocol backwards compatible.
         out = [None] * (self.Lx * self.Ly)
         for i in range(self.Lx):
             for j in range(self.Ly):
@@ -1200,7 +1403,7 @@ class PepsBpSampler:
 
             sample_d2bp = _sample_d2bp
 
-        return sample_d2bp(self.tn, **kwargs)
+        return sample_d2bp(self._bp_tn, **kwargs)
 
     def _contract_sample(
         self,
@@ -1214,31 +1417,77 @@ class PepsBpSampler:
     ):
         optimizer = self._get_optimizer()
 
+        def scaled_is_finite(value):
+            if isinstance(value, (tuple, list)) and len(value) == 2:
+                return bool(np.isfinite(value[0]) and np.isfinite(value[1]))
+            return bool(np.isfinite(value))
+
+        def as_scaled(value):
+            if isinstance(value, (tuple, list)) and len(value) == 2:
+                return value
+            return self.mantissa_exponent10(value)
+
         if method == "mps":
-            return tn_flat.contract_boundary(
+            opts = {
+                "optimize": optimizer,
+                "strip_exponent": True,
+            }
+            result = tn_flat.contract_boundary(
                 max_bond=int(chi),
                 mode="mps",
-                final_contract_opts={"optimize": optimizer, "strip_exponent": True},
+                final_contract_opts=opts,
                 max_separation=max_separation,
                 cutoff=cutoff,
                 sequence=["xmin", "xmax", "ymin", "ymax"],
                 equalize_norms=equalize_norms,
                 progbar=False,
             )
+            if not scaled_is_finite(result):
+                opts["strip_exponent"] = False
+                result = tn_flat.contract_boundary(
+                    max_bond=int(chi),
+                    mode="mps",
+                    final_contract_opts=opts,
+                    max_separation=max_separation,
+                    cutoff=cutoff,
+                    sequence=["xmin", "xmax", "ymin", "ymax"],
+                    equalize_norms=equalize_norms,
+                    progbar=False,
+                )
+            return as_scaled(result)
 
         if method == "ctmrg":
-            return tn_flat.contract_ctmrg(
+            opts = {
+                "optimize": optimizer,
+                "strip_exponent": True,
+            }
+            result = tn_flat.contract_ctmrg(
                 max_bond=int(chi),
-                final_contract_opts={"optimize": optimizer, "strip_exponent": True},
+                final_contract_opts=opts,
                 max_separation=max_separation,
                 cutoff=cutoff,
                 inplace=False,
                 equalize_norms=equalize_norms,
                 progbar=False,
             )
+            if not scaled_is_finite(result):
+                opts["strip_exponent"] = False
+                result = tn_flat.contract_ctmrg(
+                    max_bond=int(chi),
+                    final_contract_opts=opts,
+                    max_separation=max_separation,
+                    cutoff=cutoff,
+                    inplace=False,
+                    equalize_norms=equalize_norms,
+                    progbar=False,
+                )
+            return as_scaled(result)
 
         if method == "exact":
-            return tn_flat.contract(all, optimize=optimizer, strip_exponent=True)
+            result = tn_flat.contract(all, optimize=optimizer, strip_exponent=True)
+            if not scaled_is_finite(result):
+                result = tn_flat.contract(all, optimize=optimizer, strip_exponent=False)
+            return as_scaled(result)
 
         raise ValueError(f"Unknown contraction method: {method!r}")
 
