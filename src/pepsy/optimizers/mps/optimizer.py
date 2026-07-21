@@ -15,6 +15,12 @@ swap-back; logical readout is available through ``logical_order``,
 ``{"kind": "submpo", "mpo": mpo, "where": where}``.  In every mode the stream
 may also carry *control events* that are state operations rather than gates:
 
+``mode="su"`` is the simple-update backend. It keeps the MPS core and its
+bond gauges separate, initializes missing gauges with
+``p.gauge_all_simple_(gauges=..., progbar=False)``, and applies each gate with
+``pepsy.gate_simple(..., renorm=True)``. The simple-update core is not
+canonicalized and does not produce compression-infidelity samples.
+
 * ``("measure", pauli, where[, outcome])`` — projectively measure a Pauli
   observable, collapse the MPS onto a sampled (or forced ``outcome``)
   eigenvalue, and append ``(pauli, where, outcome, prob)`` to
@@ -31,19 +37,19 @@ Control events split the stream into gate/subMPO segments run through the
 active mode and are applied directly to the state between segments, so the same
 stream works in every mode.  The default gate path assumes a norm-preserving
 stream and does not renormalize.  Non-unitary streams should use
-``non_unitary=True``; when ``normalize_every`` is enabled this normalizes the
-active MPS tensor data after compressed updates while accumulating the removed
-scale into ``p.exponent``.  Quimb includes that exponent in ``p.norm()``, so
-``p.norm()`` still reports the represented state norm; inspect a copy with
-``exponent=0`` to see the rescaled data norm. Diagnostics are separate opt-ins:
-``track_norm_infidelity=True`` records a cheap norm-ratio proxy. For the
-default unitary stream it reads the target norm from the pre-gate canonical
-state rather than building an uncompressed target. Non-unitary norm tracking
-and ``track_infidelity=True`` still build the target they need for the
-diagnostic. ``track_infidelity=True`` records a true normalized-overlap metric,
-reports cumulative infidelity in progress bars, and keeps the running
-geometric mean of measured local true fidelities in ``losses`` for
-compatibility.
+``non_unitary=True``; when ``normalize_every`` is enabled this moves the
+orthogonality center to one site after every replay step, normalizes that
+center tensor, and accumulates the removed scale into ``p.exponent``. Quimb
+includes that exponent in ``p.norm()``, so ``p.norm()`` still reports the
+represented state norm; inspect a copy with ``exponent=0`` to see the
+rescaled data norm. Compression infidelity is
+measured at every compressed two-site update. The local fidelity is the
+retained canonical norm ratio, and cumulative fidelity is the product of
+those local fidelities. This is the estimator used in the MPS
+circuit-simulation literature and does not require a copied perfect-state
+target for unitary streams. Infidelity is always recorded after compressed
+two-site updates and is available through ``get_infidelities()`` and
+``get_infidelity_samples()``.
 """
 
 from __future__ import annotations
@@ -58,8 +64,11 @@ import numpy as np
 import quimb.tensor as qtn
 
 from ...fitting.local import FIT
-from ...operators.gates import _normalize_gate_entries, gate as apply_gate
-from ...tensors.core import tn_fidelity
+from ...operators.gates import (
+    _normalize_gate_entries,
+    gate as apply_gate,
+    gate_simple as apply_gate_simple,
+)
 from .layout import (
     MpsGateStreamLayoutFinder,
     _normalize_layout_support,
@@ -76,6 +85,7 @@ __all__ = [
 
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
+_NORM_INCLUDES_EXPONENT_CACHE = {}
 
 
 def _normalize_event_name(name):
@@ -538,8 +548,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``cap`` event shortens the MPS, so later event site labels refer to the
         shortened chain.
     chi : int
-        Maximum bond dimension used by MPO/swap/perm/SVD compression modes.
-    mode : {"dmrg", "mpo", "mix", "swap", "perm", "svd", "exact"}, default="dmrg"
+        Maximum bond dimension used by MPO/swap/perm/SVD/simple-update modes.
+    mode : {"dmrg", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
         Optimization backend.
     contraction_opt : object | None, default="auto-hq"
         Canonical contraction path optimizer keyword.
@@ -549,6 +559,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     inplace : bool, default=False
         Whether to optimize the provided input state object directly. If
         ``False``, a copy is made and the original input remains unchanged.
+    gauges : dict | None, default=None
+        Simple-update bond gauges used only by ``mode="su"``. The dictionary
+        is mutated in place and is exposed as :attr:`gauges`. If omitted, the
+        optimizer initializes it with ``p.gauge_all_simple_(...)`` before the
+        first simple-update gate.
 
     Attributes
     ----------
@@ -565,23 +580,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         represented norm remains available through ``p.norm()`` because quimb
         applies ``p.exponent``.
     infidelities : list[float]
-        Cumulative infidelity trace. When ``track_infidelity=True``, compressed
-        two-site updates append the true normalized-overlap infidelity from
-        :func:`pepsy.tensors.core.tn_fidelity`. Otherwise, when
-        ``track_norm_infidelity=True``, they append the cheaper norm-ratio
-        proxy ``1 - product((||approx|| / ||target||)**2)``.
-    losses : list[float]
-        Fidelity-like progress trace. By default this stores legacy
-        norm-preservation proxy samples. With ``track_infidelity=True`` it
-        instead stores the running geometric mean of the measured local true
-        fidelities, computed from accumulated log fidelities for stability.
+        Cumulative canonical norm-ratio infidelity trace, starting at ``0.0``.
+        A value is appended after every compressed two-site update.
+    infidelity_samples : list[dict]
+        Per-update canonical norm-ratio records. Each record contains the
+        target and retained canonical norms, local fidelity, and cumulative
+        infidelity.
+    gauges : dict
+        Simple-update bond gauges. In ``mode="su"``, ``p`` is the gauged core
+        and the physical state is recovered with ``p.gauge_simple_insert(gauges)``.
+    p_ungauged : qtn.MatrixProductState | None
+        In ``mode="su"``, an automatically refreshed physical-state copy with
+        the current simple-update gauges inserted. ``p`` remains the core used
+        for continued simple-update evolution.
     logical_order : list[int]
         Persistent-layout mapping from physical MPS position to logical site.
         The list is identity until :meth:`apply_layout` is called.
     """
 
     _ALLOWED_MODES = frozenset(
-        {"dmrg", "mpo", "mix", "swap", "perm", "svd", "exact"}
+        {"dmrg", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}
     )
     LayoutFinder = MpsGateStreamLayoutFinder
     _ALLOWED_SUBMPO_METHODS = frozenset(
@@ -616,6 +634,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         "swap": "#ff7f0e",
         "perm": "#8c564b",
         "svd": "#d62728",
+        "su": "#e377c2",
         "exact": "#9467bd",
     }
 
@@ -866,6 +885,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         contraction_opt="auto-hq",
         ind_id="k{}",
         inplace=False,
+        gauges=None,
     ):
         if chi is None:
             if isinstance(gates, Integral):
@@ -884,6 +904,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.mode = self._normalize_mode(mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
         self.ind_id = str(ind_id)
+        if gauges is not None and not isinstance(gauges, dict):
+            raise TypeError("gauges must be a mutable dictionary or None.")
+        self.gauges = {} if gauges is None else gauges
+        self.p_ungauged = None
+        self._su_gauges_supplied = gauges is not None
+        self._su_gauges_ready = False
+        self._su_gauges_state = None
+        self._su_force_regauge = False
 
         self.info_c = {}
         # Physical MPS position -> logical site. ``perm`` mode updates this
@@ -894,20 +922,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.logical_order = list(self.qubits)
         self._persistent_layout_plan = None
         self.layout_plan = None
-        self.losses = [1.0]
         self.normalizations = []
         self.infidelities = [0.0]
-        self.true_infidelities = [0.0]
         self.infidelity_samples = []
-        self.norm_infidelity_samples = []
         self.last_layout_plan = self._persistent_layout_plan
         self.mix_history = []
         self.last_mix_summary = None
         self.measurements = []
         self._rng = np.random.default_rng()
-        self._true_fidelity_log_sum = 0.0
-        self._true_fidelity_count = 0
-        self._norm_fidelity_proxy = 1.0
+        self._infidelity_log_fidelity = 0.0
+        self._unitary_initial_norm = None
+        self._unitary_previous_norm = None
+        self._unitary_global_norm_tracking = False
         self._init_canonicalization()
 
     def _info_for_state(self, p, info=None):
@@ -1024,6 +1050,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not self._has_symmray_data(self.p):
             return
 
+        if self.mode == "su":
+            raise NotImplementedError(
+                "mode='su' currently requires dense MPS tensor data; "
+                "quimb's simple-update split is not Symmray-safe yet."
+            )
+
         if self.mode == "dmrg" and self.p.max_bond() < self.chi:
             raise ValueError(
                 "Symmray MPS data cannot be automatically expanded for "
@@ -1079,8 +1111,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def _init_canonicalization(self):
         """Initialize canonical form and orthogonality center."""
-        if self.mode == "exact":
-            # Exact evolution does not require a canonicalized input state.
+        if self.mode in {"exact", "su"}:
+            # Exact and simple-update evolution do not use canonical metadata.
             self.info_c = {}
             return
         center = self.p.L // 2
@@ -1088,9 +1120,47 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.p.canonicalize_([center], cur_orthog="calc", info=self.info_c)
         self._current_orthog(self.p)
 
+    def _prepare_su_state(self):
+        """Prepare the MPS core and bond gauges for simple-update replay."""
+        if self._su_gauges_ready and self._su_gauges_state is self.p:
+            return
+
+        inner_inds = tuple(self.p.inner_inds())
+        missing_gauges = any(index not in self.gauges for index in inner_inds)
+        if (
+            self._su_force_regauge
+            or not self._su_gauges_supplied
+            or missing_gauges
+        ):
+            self.p.gauge_all_simple_(gauges=self.gauges, progbar=False)
+
+        self._su_gauges_ready = True
+        self._su_gauges_state = self.p
+        self._su_force_regauge = False
+
+    def _refresh_su_physical_state(self):
+        """Store a physical copy of the SU core with its gauges inserted."""
+        physical = self.p.copy()
+        physical.gauge_simple_insert(self.gauges)
+        self.p_ungauged = physical
+        return physical
+
     def _prepare_dmrg_state(self):
         """Ensure DMRG starts from at least ``chi`` bond dimension."""
         if self.p.max_bond() < self.chi:
+            self.p.expand_bond_dimension(self.chi, inplace=True)
+            self._init_canonicalization()
+
+    def _prepare_mix_dmrg_state(self):
+        """Ensure every bond can support a mixed-mode DMRG update."""
+        if self.chi <= 1 or getattr(self.p, "L", 0) <= 1:
+            return
+
+        bond_sizes = [
+            int(self.p.bond_size(site, site + 1))
+            for site in range(int(self.p.L) - 1)
+        ]
+        if any(bond_size < int(self.chi) for bond_size in bond_sizes):
             self.p.expand_bond_dimension(self.chi, inplace=True)
             self._init_canonicalization()
 
@@ -1102,6 +1172,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._persistent_layout_plan = None
         self.layout_plan = None
         self.last_layout_plan = None
+        self._su_gauges_supplied = False
+        self._su_gauges_ready = False
+        self._su_gauges_state = None
+        self._su_force_regauge = self.mode == "su"
+        self.p_ungauged = None
         self._init_canonicalization()
 
     def normalize(self, eps=1e-15, insert=None):
@@ -1145,10 +1220,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             contraction_opt=self.contraction_opt,
             ind_id=self.ind_id,
             inplace=True,
+            gauges=deepcopy(self.gauges),
         )
-        # The constructor establishes a valid canonical form for the copied
-        # MPS. Restore the source's tracked centre afterwards: it describes
-        # the same represented state and must remain optimizer-local.
+        # Restore the source's tracked centre afterwards. It describes the
+        # same represented state and must remain optimizer-local.
         copied.info_c = deepcopy(self.info_c)
         copied.inplace = self.inplace
         copied.G = list(self.G)
@@ -1159,18 +1234,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied._persistent_layout_plan = deepcopy(self._persistent_layout_plan)
         copied.layout_plan = deepcopy(self.layout_plan)
         copied.last_layout_plan = deepcopy(self.last_layout_plan)
-        copied.losses = list(self.losses)
         copied.normalizations = deepcopy(self.normalizations)
         copied.infidelities = list(self.infidelities)
-        copied.true_infidelities = list(self.true_infidelities)
         copied.infidelity_samples = deepcopy(self.infidelity_samples)
-        copied.norm_infidelity_samples = deepcopy(self.norm_infidelity_samples)
         copied.mix_history = deepcopy(self.mix_history)
         copied.last_mix_summary = deepcopy(self.last_mix_summary)
         copied.measurements = deepcopy(self.measurements)
-        copied._true_fidelity_log_sum = self._true_fidelity_log_sum
-        copied._true_fidelity_count = self._true_fidelity_count
-        copied._norm_fidelity_proxy = self._norm_fidelity_proxy
+        copied._infidelity_log_fidelity = self._infidelity_log_fidelity
+        copied._unitary_initial_norm = self._unitary_initial_norm
+        copied._unitary_previous_norm = self._unitary_previous_norm
+        copied._unitary_global_norm_tracking = self._unitary_global_norm_tracking
+        copied._su_gauges_supplied = True
+        copied._su_gauges_ready = self._su_gauges_ready
+        copied._su_gauges_state = copied.p if self._su_gauges_ready else None
+        copied._su_force_regauge = self._su_force_regauge
+        copied.p_ungauged = (
+            self.p_ungauged.copy() if self.p_ungauged is not None else None
+        )
         copied._rng.bit_generator.state = deepcopy(self._rng.bit_generator.state)
         return copied
 
@@ -1183,6 +1263,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 "cannot switch a persistent-layout optimizer to mode='exact'; "
                 "read out the logical state or create a new optimizer."
             )
+        if old_mode == "su" and new_mode != "su":
+            if self._su_gauges_ready:
+                self.p.gauge_simple_insert(self.gauges)
+                self.p_ungauged = self.p.copy()
+            self._su_gauges_supplied = False
+            self._su_gauges_ready = False
+            self._su_gauges_state = None
+            self._su_force_regauge = True
         if old_mode == "perm" and new_mode != "perm":
             # Other modes interpret integer ``where`` values as physical MPS
             # positions, so restore the logical ordering before switching.
@@ -1201,6 +1289,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             # TensorNetwork's state.
             self.info_c = {}
         self.mode = new_mode
+        if self.mode == "su":
+            self.info_c = {}
+            self.p_ungauged = None
+            if old_mode != "su":
+                self._su_gauges_ready = False
+                self._su_gauges_state = None
+                self._su_force_regauge = True
+        elif old_mode == "su":
+            self._init_canonicalization()
         if old_mode == "exact" and self.mode != "exact":
             # Exact mode stores a fully contracted TensorNetwork, so rebuild an
             # MPS before recreating canonical metadata for an MPS mode.
@@ -1817,14 +1914,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff=1e-12,
         cutoff_mode="rsum2",
         mode=None,
-        fidelity_samples=None,
         k_2q_batch=1,
         non_unitary=False,
         normalize_every=False,
         normalize_final=False,
         normalize_eps=1e-15,
-        track_norm_infidelity=False,
-        track_infidelity=False,
         submpo_method="direct",
         use_layout_finder=False,
         layout_order="quality",
@@ -1848,19 +1942,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode : str, default="rsum2"
             Truncation mode forwarded to ``tensor_network_gate_inds`` and
             ``tensor_network_1d_compress``.
-        mode : {"dmrg", "mpo", "mix", "swap", "perm", "svd", "exact"} | None, default=None
+        mode : {"dmrg", "mpo", "mix", "swap", "perm", "svd", "su", "exact"} | None, default=None
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
-        fidelity_samples : int | None, default=None
-            Compression modes (``mpo``/``swap``/``perm``/``svd``): number of
-            intermediate norm-preservation proxy samples taken during the run.
-            ``None`` keeps the historical default of ``10`` for
-            unitary/default runs and disables norm-proxy sampling for
-            ``non_unitary=True``. When an integer is supplied, a final sample
-            is always recorded at the end; use ``0`` to record only the final
-            sample. This legacy trace is returned by :meth:`get_fidelities`;
-            it is not the true overlap diagnostic controlled by
-            ``track_infidelity``.
         k_2q_batch : int, default=1
             DMRG mode only: number of sequential two-qubit gates to batch
             into one local FIT update. The FIT window uses the batch-wide
@@ -1870,36 +1954,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         non_unitary : bool, default=False
             Convenience flag for non-unitary gate streams. Normalization is
             only available when this is ``True``; default/unitary runs never
-            normalize. If enabled, local tensor scale control runs after every
-            compressed two-site update or DMRG batch. No trailing
-            normalization is performed unless ``normalize_final=True``.
+            normalize. If enabled, local tensor scale control moves the
+            orthogonality center to one site and normalizes it after every
+            replay step. In DMRG, a step containing a multi-gate batch is
+            normalized once after that batch. The removed scale is accumulated
+            in ``p.exponent``.
         normalize_every : int | bool | None, default=False
-            Compatibility switch for non-unitary local scale control. Any
-            positive integer or ``True`` enables normalization after compressed
-            updates; ``False`` or ``None`` disables it.
+            Enable one-site normalization after every replay step for a
+            non-unitary stream. Use ``True`` (or any positive integer); use
+            ``False`` or ``None`` to leave tensor scales untouched. Integer
+            values are accepted as a boolean-style convenience and do not
+            select an interval.
         normalize_final : bool, default=False
-            If local scale control is enabled, also normalize once at the end
-            of the run when the final gate was not already normalized. This
-            also requires ``non_unitary=True``.
+            Normalize a trailing state if the final replay step was not
+            already normalized. Requires ``non_unitary=True``.
         normalize_eps : float, default=1e-15
-            Retained for compatibility with older full-normalization paths.
-            Local tensor scale control does not use this value.
-        track_norm_infidelity : bool, default=False
-            If ``True``, append the cumulative norm-ratio infidelity proxy for
-            compressed two-site updates. For the default unitary stream, the
-            target norm is the pre-gate canonical norm and no uncompressed
-            diagnostic target is built unless ``track_infidelity=True`` also
-            needs it. Non-unitary streams still build pre-compression norm
-            targets because their gates can change the norm. This diagnostic is
-            intentionally off by default for the fast non-unitary path.
-        track_infidelity : bool, default=False
-            If ``True``, build the pre-compression target and measure the true
-            normalized-overlap fidelity with :func:`pepsy.tensors.core.tn_fidelity`
-            after each compressed two-site update or DMRG batch. The progress
-            bar then reports cumulative infidelity. For compatibility,
-            :meth:`get_fidelities` still reports the running geometric mean of
-            these local true fidelities. This is expensive and disabled by
-            default.
+            Numerical threshold used by the final normalization path.
         submpo_method : str, default="direct"
             MPO mode only: compression method used for explicit sub-MPO stream
             events. This is forwarded to quimb's
@@ -1947,16 +2017,34 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         G_seq = list(self.G)
         where_seq = list(self.where)
         event_seq = list(self.event_types)
+        if self.mode == "mix":
+            self.mix_history = []
+            self.last_mix_summary = None
         if not G_seq:
+            if self.mode == "su":
+                self._prepare_su_state()
+                self._refresh_su_physical_state()
             return self.p
         self._validate_symmray_mode_support()
         self._validate_event_stream_for_run(G_seq, where_seq, event_seq)
         has_control = any(
             event_type in _CONTROL_EVENT_NAMES for event_type in event_seq
         )
+        if self.mode == "su" and has_control:
+            raise ValueError(
+                "mode='su' supports gate-only streams; control events require "
+                "a canonical MPS mode."
+            )
         has_cap = any(event_type == "cap" for event_type in event_seq)
         layout_request = self._coalesce_layout_request(use_layout_finder, layout)
         persistent_layout_active = self._persistent_layout_plan is not None
+        if self.mode == "su" and (
+            persistent_layout_active or self._layout_request_enabled(layout_request)
+        ):
+            raise ValueError(
+                "mode='su' does not support layout replay because its gauges "
+                "belong to the current MPS site order."
+            )
         if self.mode == "perm" and (
             persistent_layout_active or self._layout_request_enabled(layout_request)
         ):
@@ -2017,61 +2105,41 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
 
         non_unitary = bool(non_unitary)
+        self._unitary_initial_norm = None
+        self._unitary_previous_norm = None
+        self._unitary_global_norm_tracking = not non_unitary and not has_control
         if not non_unitary:
             if normalize_every is not None and normalize_every is not False:
                 raise ValueError("normalize_every requires non_unitary=True.")
             if normalize_final:
                 raise ValueError("normalize_final requires non_unitary=True.")
-        fidelity_samples = self._resolve_fidelity_samples(
-            fidelity_samples,
-            non_unitary=non_unitary,
-        )
         normalize_every = self._normalize_every_interval(
             normalize_every,
             non_unitary=non_unitary,
         )
-        track_norm_infidelity = bool(track_norm_infidelity)
-        track_infidelity = bool(track_infidelity)
         if self.mode == "mix":
             if non_unitary:
                 raise ValueError("mode='mix' is only for unitary gate streams.")
-            if track_norm_infidelity or track_infidelity:
-                raise ValueError(
-                    "mode='mix' does not currently support infidelity diagnostics; "
-                    "use mode='mpo' or mode='dmrg' for those diagnostics."
-                )
             if k_2q_batch != 1:
                 raise ValueError(
                     "mode='mix' switches at gate-step granularity and currently "
                     "requires k_2q_batch=1."
                 )
-        if (
-            normalize_every is not None
-            or track_norm_infidelity
-            or track_infidelity
-        ) and self.mode == "exact":
+        if normalize_every is not None and self.mode == "exact":
             raise ValueError(
-                "automatic normalization and infidelity diagnostics use "
-                "MPS canonicalization and are not available in exact mode."
+                "automatic normalization uses MPS canonicalization and is not "
+                "available in exact mode."
             )
-        record_fit_losses = (
-            ((not non_unitary) or (fidelity_samples is not None))
-            and not track_infidelity
-        )
 
         mode_kwargs = dict(
             n_iter=n_iter,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            fidelity_samples=fidelity_samples,
             k_2q_batch=k_2q_batch,
             normalize_every=normalize_every,
             normalize_final=normalize_final,
             normalize_eps=normalize_eps,
             non_unitary=non_unitary,
-            track_norm_infidelity=track_norm_infidelity,
-            track_infidelity=track_infidelity,
-            record_fit_losses=record_fit_losses,
             submpo_method=submpo_method,
         )
 
@@ -2123,15 +2191,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         progbar,
         cutoff,
         cutoff_mode,
-        fidelity_samples,
         k_2q_batch,
         normalize_every,
         normalize_final,
         normalize_eps,
         non_unitary,
-        track_norm_infidelity,
-        track_infidelity,
-        record_fit_losses,
         submpo_method,
     ):
         """Dispatch a gate/subMPO segment to the active mode backend.
@@ -2154,9 +2218,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
-                record_fit_losses=record_fit_losses,
             )
             return self.p
 
@@ -2169,7 +2230,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 progbar=progbar,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
                 submpo_method=submpo_method,
             )
             return self.p
@@ -2182,13 +2242,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 progbar=progbar,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
                 normalize_every=normalize_every,
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
                 submpo_method=submpo_method,
             )
             return self.p
@@ -2200,13 +2257,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 progbar=progbar,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
                 normalize_every=normalize_every,
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
             )
             return self.p
 
@@ -2217,13 +2271,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 progbar=progbar,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
                 normalize_every=normalize_every,
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
             )
             return self.p
 
@@ -2234,13 +2285,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 progbar=progbar,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
                 normalize_every=normalize_every,
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
-                track_norm_infidelity=track_norm_infidelity,
-                track_infidelity=track_infidelity,
+            )
+            return self.p
+
+        if self.mode == "su":
+            self._run_su(
+                G_seq,
+                where_seq,
+                event_seq,
+                progbar=progbar,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
             )
             return self.p
 
@@ -2251,7 +2310,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 progbar=progbar,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
-                fidelity_samples=fidelity_samples,
             )
             return self.p
 
@@ -2826,41 +2884,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
 
     @staticmethod
-    def _normalize_fidelity_samples(fidelity_samples):
-        """Validate and normalize fidelity-sample count."""
-        if fidelity_samples is None:
-            return None
-        samples = int(fidelity_samples)
-        if samples < 0:
-            raise ValueError("fidelity_samples must be >= 0.")
-        return samples
-
-    @classmethod
-    def _resolve_fidelity_samples(cls, fidelity_samples, *, non_unitary):
-        """Resolve run-time norm-proxy sampling defaults."""
-        if fidelity_samples is None:
-            return None if non_unitary else 10
-        return cls._normalize_fidelity_samples(fidelity_samples)
-
-    @staticmethod
-    def _sampling_steps(total_steps, fidelity_samples):
-        """Return gate-step indices at which to sample norm proxy."""
-        if total_steps <= 0 or fidelity_samples is None:
-            return set()
-
-        samples = MpsOptimizer._normalize_fidelity_samples(fidelity_samples)
-        sample_steps = set()
-
-        if total_steps > 1 and samples > 0:
-            interior_count = min(samples, total_steps - 1)
-            for step in np.linspace(1, total_steps - 1, num=interior_count, dtype=int):
-                sample_steps.add(int(step))
-
-        # Always include final progress step.
-        sample_steps.add(total_steps)
-        return sample_steps
-
-    @staticmethod
     def _real_float(value):
         """Convert backend scalar/tensor-like values to Python float (real part)."""
         real_value = ar.do("real", value)
@@ -2872,33 +2895,116 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 pass
         return float(real_value)
 
-    def _append_norm_proxy_sample(self, p):
-        """Append current state norm proxy as a real float and return it."""
-        norm_val = self._real_float(p.norm())
-        self.losses.append(norm_val)
-        return norm_val
+    def _append_compression_infidelity_sample(
+        self,
+        approx_norm,
+        target_norm,
+        *,
+        step,
+        where,
+    ):
+        """Append the canonical norm-ratio infidelity for one compression.
 
-    def _record_true_fidelity_progress(self, local_fidelity):
-        """Append stable geometric-mean true fidelity progress."""
-        fidelity = self._clip_fidelity(local_fidelity)
-        self._true_fidelity_count += 1
-
-        if fidelity <= 0.0 or np.isneginf(self._true_fidelity_log_sum):
-            self._true_fidelity_log_sum = -np.inf
+        In mixed canonical form the center tensor contains the complete norm
+        of the represented state. For a compression target with norm ``T`` and
+        retained center norm ``A``, the local fidelity is ``(A / T) ** 2``.
+        The local ratio is retained for diagnostics. Unitary streams replace
+        the public cumulative value with the retained norm relative to the
+        initial run norm, while non-unitary streams use the product of local
+        ratios. Accumulating ``log(F)`` avoids losing information to
+        floating-point underflow on long non-unitary streams.
+        """
+        local_fidelity = self._norm_ratio_fidelity(approx_norm, target_norm)
+        if local_fidelity <= 0.0 or np.isneginf(self._infidelity_log_fidelity):
+            self._infidelity_log_fidelity = -np.inf
         else:
-            self._true_fidelity_log_sum += float(np.log(fidelity))
+            self._infidelity_log_fidelity += float(np.log(local_fidelity))
+        cumulative_infidelity = (
+            1.0
+            if np.isneginf(self._infidelity_log_fidelity)
+            else float(-np.expm1(self._infidelity_log_fidelity))
+        )
+        sample = {
+            "step": int(step),
+            "where": tuple(where),
+            "target_norm": self._real_float(target_norm),
+            "approx_norm": self._real_float(approx_norm),
+            "fidelity": local_fidelity,
+            "local_fidelity": local_fidelity,
+            "local_infidelity": 1.0 - local_fidelity,
+            "infidelity": cumulative_infidelity,
+        }
+        self.infidelity_samples.append(sample)
+        self.infidelities.append(cumulative_infidelity)
+        return sample
 
-        if np.isneginf(self._true_fidelity_log_sum):
-            cumulative_fidelity = 0.0
-            geometric_fidelity = 0.0
-        else:
-            cumulative_fidelity = float(np.exp(self._true_fidelity_log_sum))
-            geometric_fidelity = float(
-                np.exp(self._true_fidelity_log_sum / self._true_fidelity_count)
+    def _start_unitary_norm_tracking(self, p):
+        """Initialize or refresh scalar norm tracking for a unitary stream."""
+        if (
+            self._unitary_global_norm_tracking
+            and self._unitary_previous_norm is not None
+        ):
+            return
+        # The live MPS already has a tracked orthogonality span. Move its
+        # right edge to a one-site centre and read the raw centre norm instead
+        # of contracting the full doubled MPS network once at stream start.
+        current_span = self._current_orthog(p)
+        current_norm = self._real_float(
+            self._canonical_span_norm(p, current_span)
+        )
+        if self._unitary_initial_norm is None:
+            self._unitary_initial_norm = current_norm
+        self._unitary_previous_norm = current_norm
+
+    def _append_unitary_compression_infidelity_sample(
+        self,
+        approx_norm,
+        *,
+        step,
+        where,
+    ):
+        """Record loss from the post-compression norm of a unitary stream.
+
+        A unitary gate preserves the norm of the current approximate MPS. The
+        current post-compression norm therefore carries the global retained
+        fidelity relative to the initial run norm. The previous norm is kept
+        only to expose the optional local diagnostic without another network
+        contraction.
+        """
+        if self._unitary_previous_norm is None:
+            raise RuntimeError("unitary norm tracking was not initialized")
+        previous_norm = self._unitary_previous_norm
+        sample = self._append_compression_infidelity_sample(
+            approx_norm,
+            previous_norm,
+            step=step,
+            where=where,
+        )
+        if self._unitary_initial_norm is None:
+            self._unitary_initial_norm = previous_norm
+        if self._unitary_global_norm_tracking:
+            global_fidelity = self._norm_ratio_fidelity(
+                approx_norm,
+                self._unitary_initial_norm,
             )
-
-        self.losses.append(geometric_fidelity)
-        return cumulative_fidelity, geometric_fidelity
+            global_infidelity = 1.0 - global_fidelity
+            sample["fidelity"] = global_fidelity
+            sample["global_fidelity"] = global_fidelity
+            sample["global_infidelity"] = global_infidelity
+            sample["infidelity"] = global_infidelity
+            self.infidelities[-1] = global_infidelity
+            self.infidelity_samples[-1].update(
+                {
+                    "fidelity": global_fidelity,
+                    "global_fidelity": global_fidelity,
+                    "global_infidelity": global_infidelity,
+                    "infidelity": global_infidelity,
+                }
+            )
+        self._unitary_previous_norm = self._real_float(approx_norm)
+        sample["target_norm_source"] = "previous_retained_norm"
+        sample["global_target_norm"] = self._real_float(self._unitary_initial_norm)
+        return sample
 
     @staticmethod
     def _accumulate_exponent(p, scale):
@@ -2949,7 +3055,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ):
             return p
 
-        if MpsOptimizer._class_norm_includes_exponent(p):
+        norm_cache_key = type(p)
+        norm_includes_exponent = _NORM_INCLUDES_EXPONENT_CACHE.get(
+            norm_cache_key,
+            _MISSING,
+        )
+        if norm_includes_exponent is _MISSING:
+            norm_includes_exponent = MpsOptimizer._class_norm_includes_exponent(p)
+            _NORM_INCLUDES_EXPONENT_CACHE[norm_cache_key] = norm_includes_exponent
+
+        if norm_includes_exponent:
             p._pepsy_norm_includes_exponent = True
             return p
 
@@ -3028,6 +3143,60 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return target_norm
 
     @staticmethod
+    def _raw_state_norm(p):
+        """Return a copied-target norm without changing its represented scale."""
+        exponent = getattr(p, "exponent", None)
+        if exponent is None:
+            return p.norm()
+        try:
+            p.exponent = 0.0
+            return p.norm()
+        finally:
+            p.exponent = exponent
+
+    def _gate_target_norm_from_expectation(self, p, gate, where):
+        """Measure a dense two-site gate target norm without copying ``p``.
+
+        For a non-unitary gate ``G``, the post-gate norm is
+        ``sqrt(<p|G^dagger G|p>)``. Canonical local expectation contracts this
+        quantity directly and therefore avoids materializing an uncompressed
+        target MPS. ``None`` is returned for unsupported backends so callers
+        can use their backend-specific target construction as a fallback.
+        """
+        if len(where) != 2:
+            return None
+        try:
+            if self._has_symmray_data(p):
+                to_dense = getattr(gate, "to_dense", None)
+                if not callable(to_dense):
+                    return None
+                gate = np.asarray(to_dense())
+            shape = tuple(int(dim) for dim in gate.shape)
+            if len(shape) != 2:
+                dims = self._infer_gate_dims(gate, where)
+                if dims is None:
+                    return None
+                size = int(np.prod(dims))
+                gate = ar.do("reshape", gate, (size, size))
+            gate_dagger = ar.do("transpose", ar.do("conj", gate))
+            gram = ar.do("matmul", gate_dagger, gate)
+            value = p.local_expectation_canonical(
+                gram,
+                tuple(where),
+                normalized=False,
+                info=self.info_c,
+            )
+            value = self._real_float(value)
+            if value < 0.0:
+                if value > -1.0e-12:
+                    value = 0.0
+                else:
+                    return None
+            return float(np.sqrt(value))
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+
+    @staticmethod
     def _norm_ratio_fidelity(approx_norm, target_norm):
         """Return clipped ``(||approx|| / ||target||)**2``."""
         approx = MpsOptimizer._real_float(approx_norm)
@@ -3038,66 +3207,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         fidelity = (approx / target) ** 2
         return min(1.0, max(0.0, float(fidelity)))
-
-    @staticmethod
-    def _clip_fidelity(value):
-        """Convert a fidelity scalar to ``[0, 1]`` as a Python float."""
-        fidelity = MpsOptimizer._real_float(value)
-        return min(1.0, max(0.0, fidelity))
-
-    def _append_true_infidelity_sample(self, target, approx, *, step, where):
-        """Append cumulative true infidelity for a compressed update."""
-        local_fidelity = self._clip_fidelity(
-            tn_fidelity(
-                approx,
-                target,
-                contraction_opt=self.contraction_opt,
-            )
-        )
-        cumulative_fidelity, geometric_fidelity = self._record_true_fidelity_progress(
-            local_fidelity
-        )
-        cumulative_infidelity = 1.0 - cumulative_fidelity
-
-        sample = {
-            "step": int(step),
-            "where": tuple(where),
-            "fidelity": local_fidelity,
-            "geometric_fidelity": geometric_fidelity,
-            "local_infidelity": 1.0 - local_fidelity,
-            "infidelity": cumulative_infidelity,
-        }
-        self.infidelity_samples.append(sample)
-        self.true_infidelities.append(cumulative_infidelity)
-        self.infidelities.append(cumulative_infidelity)
-        return sample
-
-    def _append_norm_infidelity_sample(
-        self,
-        approx_norm,
-        target_norm,
-        *,
-        step,
-        where,
-        record_trace=True,
-    ):
-        """Append cumulative norm-ratio infidelity for a compressed update."""
-        local_fidelity = self._norm_ratio_fidelity(approx_norm, target_norm)
-        self._norm_fidelity_proxy *= local_fidelity
-        cumulative_infidelity = 1.0 - self._norm_fidelity_proxy
-
-        sample = {
-            "step": int(step),
-            "where": tuple(where),
-            "target_norm": self._real_float(target_norm),
-            "approx_norm": self._real_float(approx_norm),
-            "local_infidelity": 1.0 - local_fidelity,
-            "infidelity": cumulative_infidelity,
-        }
-        self.norm_infidelity_samples.append(sample)
-        if record_trace:
-            self.infidelities.append(cumulative_infidelity)
-        return cumulative_infidelity
 
     def _build_norm_target(self, p, gate, where, cutoff, cutoff_mode="rsum2"):
         """Build the pre-chi-compression target used for norm diagnostics."""
@@ -3159,30 +3268,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         return True
 
     @staticmethod
-    def _normalization_insert_site(p, fallback_span, *, current_span=None):
-        """Choose an insertion site inside ``fallback_span``."""
-        span = MpsOptimizer._normalize_span(fallback_span)
-        if current_span is not None:
-            current = MpsOptimizer._normalize_span(current_span)
-            site = int(current[-1])
-            if span[0] <= site <= span[1]:
-                return site
-            return int(span[-1])
-        try:
-            lo, hi = p.calc_current_orthog_center()
-            site = int(hi if hi is not None else lo)
-            if span[0] <= site <= span[1]:
-                return site
-        except Exception:  # pragma: no cover - defensive for quimb variants
-            pass
-        return int(span[-1])
-
-    @staticmethod
-    def _tensor_local_scale(data):
-        """Return a cheap local Frobenius scale for one tensor's data."""
-        return ar.do("linalg.norm", data)
-
-    @staticmethod
     def _accumulate_exponent_log10(p, log10_scale):
         """Accumulate an extracted base-10 log scale into ``p.exponent``."""
         if hasattr(p, "exponent"):
@@ -3209,94 +3294,78 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         reason,
         canonicalize=False,
     ):
-        """Rescale tensors in the active orthogonality span and track exponent."""
-        fallback_span = self._normalize_span(where)
-        state_info = self._info_for_state(p)
-        if canonicalize:
-            span = self.canonize_mps(p, fallback_span, info=state_info)
-        else:
-            try:
-                span = self._current_orthog(p, info=state_info)
-            except Exception:  # pragma: no cover - defensive for quimb variants
-                span = fallback_span
-            if not (span[0] <= fallback_span[0] and fallback_span[1] <= span[1]):
-                span = fallback_span
-                state_info["cur_orthog"] = span
+        """Compatibility wrapper for the one-site center normalizer."""
+        _ = canonicalize
+        return self._normalize_canonical_center(
+            p,
+            where,
+            step=step,
+            reason=reason,
+        )
 
-        sites = tuple(range(int(span[0]), int(span[1]) + 1))
-        scaled_sites = []
-        scales = []
-        log10_scales = []
-        log10_total_scale = 0.0
+    def _normalize_in_canonical_range(self, p, where, *, step, eps=1e-15):
+        """Canonicalize ``where`` and apply one-site scale control."""
+        _ = eps
+        return self._normalize_canonical_center(
+            p,
+            where,
+            step=step,
+            reason="final",
+        )
 
-        for site in sites:
-            data = p[site].data
-            scale = self._tensor_local_scale(data)
-            scale_abs = ar.do("abs", scale)
-            scale_float = self._real_float(scale_abs)
-            if scale_float == 0.0 or not np.isfinite(scale_float):
-                continue
+    def _normalize_canonical_center(self, p, where, *, step, reason):
+        """Normalize one canonical center and preserve its scale in exponent.
 
-            p[site].modify(data=data / scale)
-            log10_scale = ar.do("log10", scale_abs)
-            self._accumulate_exponent_log10(p, log10_scale)
-
-            log10_scale_float = self._real_float(log10_scale)
-            scaled_sites.append(int(site))
-            scales.append(scale_float)
-            log10_scales.append(log10_scale_float)
-            log10_total_scale += log10_scale_float
-
-        if not scaled_sites:
+        The canonical center is the right edge of ``where``. Canonicalizing
+        there makes its Frobenius norm the norm of the raw working MPS, so
+        only that one tensor needs to be divided by the extracted scale.
+        """
+        span = self._normalize_span(where)
+        scale = self._canonical_span_norm(p, span)
+        scale_float = self._real_float(ar.do("abs", scale))
+        if scale_float == 0.0 or not np.isfinite(scale_float):
             return None
 
-        state_info["cur_orthog"] = span
-        insert = self._normalization_insert_site(p, span, current_span=span)
+        center = int(span[1])
+        p[center].modify(data=p[center].data / scale)
+        log10_scale = self._real_float(ar.do("log10", ar.do("abs", scale)))
+        self._accumulate_exponent_log10(p, log10_scale)
+        self._record_orthog_span(p, (center, center))
+
         event = {
             "step": int(step),
-            "old_norm": self._event_old_norm_from_log10(2.0 * log10_total_scale),
-            "span": tuple(span),
-            "insert": int(insert),
-            "sites": tuple(scaled_sites),
-            "scales": tuple(scales),
-            "log10_scale": float(log10_total_scale),
-            "log10_scales": tuple(log10_scales),
+            "old_norm": self._event_old_norm_from_log10(2.0 * log10_scale),
+            "span": span,
+            "insert": center,
+            "sites": (center,),
+            "scales": (scale_float,),
+            "log10_scale": log10_scale,
+            "log10_scales": (log10_scale,),
             "reason": str(reason),
-            "method": "local_tensors",
+            "method": "canonical_center",
             "exponent": self._real_float(getattr(p, "exponent", 0.0)),
         }
         self.normalizations.append(event)
         return event
 
-    def _normalize_in_canonical_range(self, p, where, *, step, eps=1e-15):
-        """Canonicalize ``where`` and apply local tensor scale control."""
-        _ = eps
-        return self._normalize_orthog_tensors(
-            p,
-            where,
-            step=step,
-            reason="final",
-            canonicalize=True,
-        )
-
-    def _maybe_normalize_after_compression(
+    def _maybe_normalize_after_step(
         self,
         p,
         *,
         step,
         where,
         normalize_every,
+        reason,
     ):
-        """Apply local scale control after a compressed update when enabled."""
-        if normalize_every is not None:
-            return self._normalize_orthog_tensors(
-                p,
-                where,
-                step=step,
-                reason="compression",
-                canonicalize=False,
-            )
-        return None
+        """Apply one-site scale control after an enabled replay step."""
+        if normalize_every is None:
+            return None
+        return self._normalize_canonical_center(
+            p,
+            where,
+            step=step,
+            reason=reason,
+        )
 
     def _maybe_normalize_final(
         self,
@@ -3395,11 +3464,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where,
         event_type,
         *,
+        step,
         cutoff,
         cutoff_mode,
         submpo_method,
     ):
         """Apply one mixed-mode step through the MPO backend."""
+        sample_start = len(self.infidelity_samples)
         self._run_mpo(
             [gate],
             [where],
@@ -3407,13 +3478,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             progbar=False,
             cutoff=cutoff,
             cutoff_mode=cutoff_mode,
-            fidelity_samples=None,
             normalize_every=None,
             normalize_final=False,
-            track_norm_infidelity=False,
-            track_infidelity=False,
             submpo_method=submpo_method,
         )
+        self._renumber_mix_infidelity_samples(sample_start, step)
         if not self._mps_data_is_finite(self.p):
             raise FloatingPointError("MPO step produced non-finite MPS tensor data.")
 
@@ -3422,11 +3491,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         gate,
         where,
         *,
+        step,
         n_iter,
         cutoff,
         cutoff_mode,
     ):
         """Apply one mixed-mode step through the DMRG backend."""
+        sample_start = len(self.infidelity_samples)
         self._run_dmrg(
             [gate],
             [where],
@@ -3437,12 +3508,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             k_2q_batch=1,
             normalize_every=None,
             normalize_final=False,
-            track_norm_infidelity=False,
-            track_infidelity=False,
-            record_fit_losses=True,
         )
+        self._renumber_mix_infidelity_samples(sample_start, step)
         if not self._mps_data_is_finite(self.p):
             raise FloatingPointError("DMRG step produced non-finite MPS tensor data.")
+
+    def _renumber_mix_infidelity_samples(self, sample_start, step):
+        """Assign the global gate-stream step to samples from one mix step."""
+        for sample in self.infidelity_samples[sample_start:]:
+            sample["step"] = int(step)
 
     def _run_mix(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -3454,16 +3528,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
-        fidelity_samples=10,
         submpo_method="direct",
     ):
         """Apply a unitary stream with MPO warmup then DMRG at target bond."""
         if any(event_type == "submpo" for event_type in event_seq):
             raise ValueError("mode='mix' currently supports gate streams only.")
 
-        self.mix_history = []
-        self.last_mix_summary = None
-        sample_steps = self._sampling_steps(len(G_seq), fidelity_samples)
         pbar = None
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
@@ -3477,15 +3547,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 colour=self._PROGBAR_COLORS["mix"],
             )
 
-        mpo_steps = 0
-        dmrg_steps = 0
-        fallback_steps = 0
-        norm_proxy = None if fidelity_samples is None else self.losses[-1]
+        mix_step_offset = len(self.mix_history)
+        mpo_steps = sum(event["backend"] == "mpo" for event in self.mix_history)
+        dmrg_steps = sum(event["backend"] == "dmrg" for event in self.mix_history)
+        fallback_steps = sum(
+            event.get("reason") == "dmrg_fallback" for event in self.mix_history
+        )
 
         try:
             for idx, (gate, where, event_type) in enumerate(
                 zip(G_seq, where_seq, event_seq),
-                start=1,
+                start=mix_step_offset + 1,
             ):
                 if len(where) not in {1, 2}:
                     raise ValueError("Each gate location must have one or two sites.")
@@ -3502,6 +3574,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         gate,
                         where,
                         event_type,
+                        step=idx,
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
                         submpo_method=submpo_method,
@@ -3512,18 +3585,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 else:
                     saved_p = self._install_represented_norm(self.p.copy())
                     saved_info = dict(self.info_c)
+                    saved_infidelity_log = self._infidelity_log_fidelity
                     saved_lengths = {
-                        "losses": len(self.losses),
                         "infidelities": len(self.infidelities),
-                        "true_infidelities": len(self.true_infidelities),
                         "infidelity_samples": len(self.infidelity_samples),
-                        "norm_infidelity_samples": len(self.norm_infidelity_samples),
                         "normalizations": len(self.normalizations),
                     }
                     try:
+                        self._prepare_mix_dmrg_state()
                         self._run_mix_dmrg_step(
                             gate,
                             where,
+                            step=idx,
                             n_iter=n_iter,
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
@@ -3531,12 +3604,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     except Exception as exc:  # fallback is the point of mix mode
                         self.p = saved_p
                         self.info_c = saved_info
+                        self._infidelity_log_fidelity = saved_infidelity_log
                         for attr, length in saved_lengths.items():
                             del getattr(self, attr)[length:]
                         self._run_mix_mpo_step(
                             gate,
                             where,
                             event_type,
+                            step=idx,
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
                             submpo_method=submpo_method,
@@ -3549,13 +3624,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     else:
                         dmrg_steps += 1
                         entry["backend"] = "dmrg"
-                        entry["reason"] = "bond_at_chi"
+                        entry["reason"] = (
+                            "bond_at_chi"
+                            if start_bond == int(self.chi)
+                            else "bond_above_chi"
+                        )
 
                 entry["end_bond"] = int(self.p.max_bond())
                 self.mix_history.append(entry)
-
-                if idx in sample_steps:
-                    norm_proxy = self._append_norm_proxy_sample(self.p)
 
                 if pbar is not None:
                     postfix = {
@@ -3565,8 +3641,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         "fallback": fallback_steps,
                         "bond": f"{entry['end_bond']}/{self.chi}",
                     }
-                    if norm_proxy is not None:
-                        postfix["~F"] = self._format_progress_scalar(norm_proxy)
+                    postfix["infidelity"] = self._format_progress_infidelity(
+                        self.infidelities[-1]
+                    )
                     pbar.set_postfix(postfix)
                     pbar.update(1)
         finally:
@@ -3594,9 +3671,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_final=True,
         normalize_eps=1e-15,
         non_unitary=False,
-        track_norm_infidelity=False,
-        track_infidelity=False,
-        record_fit_losses=True,
     ):
         """Apply gates with local DMRG-style fitting."""
         if k_2q_batch < 1:
@@ -3606,7 +3680,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         two_qubit_count = 0
         last_where = self._current_orthog(p)
         last_normalized_step = None
-        true_cumulative_infidelity = None
+        cumulative_infidelity = None
+        track_unitary_norm = not non_unitary
+        if track_unitary_norm and (
+            not self._unitary_global_norm_tracking
+            or self._unitary_previous_norm is None
+        ):
+            self._start_unitary_norm_tracking(p)
 
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
@@ -3650,13 +3730,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     two_qubit_count += 1
                     xmin, xmax = sorted(where)
                     self.canonize_mps(p, (xmin, xmax))
-                    if track_norm_infidelity and not track_infidelity and not non_unitary:
-                        target_norm = self._unitary_pre_gate_target_norm(
-                            p,
-                            (xmin, xmax),
-                        )
-                    else:
-                        target_norm = None
+                    target_norm = None
 
                     p_g = self._build_norm_target(
                         p,
@@ -3665,8 +3739,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff,
                         cutoff_mode,
                     )
-                    if track_norm_infidelity and target_norm is None:
-                        target_norm = self._canonical_span_norm(p_g, (xmin, xmax))
+                    if not track_unitary_norm:
+                        target_norm = self._raw_state_norm(p_g)
                     fit = FIT(
                         p_g,
                         p=p,
@@ -3678,27 +3752,24 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     fit.run_gate(n_iter=n_iter, verbose=False)
 
+                    approx_norm = fit.local_norm_trace[-1]
                     p = self._install_represented_norm(fit.p)
                     self.p = p
                     self._record_orthog_span(p, (xmin, xmax))
-                    if record_fit_losses:
-                        self.losses.append(self._real_float(fit.local_norm_trace[-1]))
-                    if track_norm_infidelity:
-                        self._append_norm_infidelity_sample(
-                            self._canonical_span_norm(p, (xmin, xmax)),
+                    if track_unitary_norm:
+                        sample = self._append_unitary_compression_infidelity_sample(
+                            approx_norm,
+                            step=idx + 1,
+                            where=(xmin, xmax),
+                        )
+                    else:
+                        sample = self._append_compression_infidelity_sample(
+                            approx_norm,
                             target_norm,
                             step=idx + 1,
                             where=(xmin, xmax),
-                            record_trace=not track_infidelity,
                         )
-                    if track_infidelity:
-                        sample = self._append_true_infidelity_sample(
-                            p_g,
-                            p,
-                            step=idx + 1,
-                            where=(xmin, xmax),
-                        )
-                        true_cumulative_infidelity = sample["infidelity"]
+                    cumulative_infidelity = sample["infidelity"]
                     idx += 1
                     advanced = 1
                     last_where = (xmin, xmax)
@@ -3714,16 +3785,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     batch_span_sites = [site for where_i in batch_where for site in where_i]
                     xmin, xmax = min(batch_span_sites), max(batch_span_sites)
                     self.canonize_mps(p, (xmin, xmax))
-                    if track_norm_infidelity and not track_infidelity and not non_unitary:
-                        target_norm = self._unitary_pre_gate_target_norm(
-                            p,
-                            (xmin, xmax),
-                        )
-                    else:
-                        target_norm = None
+                    target_norm = None
                     p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff, cutoff_mode)
-                    if track_norm_infidelity and target_norm is None:
-                        target_norm = self._canonical_span_norm(p_g, (xmin, xmax))
+                    if not track_unitary_norm:
+                        target_norm = self._raw_state_norm(p_g)
                     fit = FIT(
                         p_g,
                         p=p,
@@ -3734,41 +3799,35 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                     fit.run_gate(n_iter=n_iter, verbose=False)
 
+                    approx_norm = fit.local_norm_trace[-1]
                     p = self._install_represented_norm(fit.p)
                     self.p = p
                     self._record_orthog_span(p, (xmin, xmax))
-                    if record_fit_losses:
-                        self.losses.append(self._real_float(fit.local_norm_trace[-1]))
-                    if track_norm_infidelity:
-                        self._append_norm_infidelity_sample(
-                            self._canonical_span_norm(p, (xmin, xmax)),
+                    if track_unitary_norm:
+                        sample = self._append_unitary_compression_infidelity_sample(
+                            approx_norm,
+                            step=next_idx,
+                            where=(xmin, xmax),
+                        )
+                    else:
+                        sample = self._append_compression_infidelity_sample(
+                            approx_norm,
                             target_norm,
                             step=next_idx,
                             where=(xmin, xmax),
-                            record_trace=not track_infidelity,
                         )
-                    if track_infidelity:
-                        sample = self._append_true_infidelity_sample(
-                            p_g,
-                            p,
-                            step=next_idx,
-                            where=(xmin, xmax),
-                        )
-                        true_cumulative_infidelity = sample["infidelity"]
+                    cumulative_infidelity = sample["infidelity"]
                     advanced = next_idx - idx
                     idx = next_idx
                     last_where = (xmin, xmax)
                     compressed = True
 
-            event = (
-                self._maybe_normalize_after_compression(
-                    p,
-                    step=idx,
-                    where=last_where,
-                    normalize_every=normalize_every,
-                )
-                if compressed
-                else None
+            event = self._maybe_normalize_after_step(
+                p,
+                step=idx,
+                where=last_where,
+                normalize_every=normalize_every,
+                reason="compression" if compressed else "step",
             )
             if event is not None:
                 last_normalized_step = idx
@@ -3778,10 +3837,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "2q": two_qubit_count,
                     "bnd": p.max_bond(),
                 }
-                if track_infidelity and true_cumulative_infidelity is not None:
-                    postfix["Icum"] = self._format_progress_infidelity(true_cumulative_infidelity)
-                elif record_fit_losses:
-                    postfix["~F"] = self._format_progress_scalar(self.losses[-1])
+                postfix["infidelity"] = self._format_progress_infidelity(
+                    self.infidelities[-1]
+                    if cumulative_infidelity is None
+                    else cumulative_infidelity
+                )
                 pbar.set_postfix(postfix)
                 pbar.update(advanced)
 
@@ -3803,6 +3863,80 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.p = self._install_represented_norm(p)
         self._record_orthog_span(self.p, last_where)
 
+    def _run_su(
+        self,
+        G_seq,
+        where_seq,
+        event_seq,
+        *,
+        progbar=False,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+    ):
+        """Apply a gate stream with simple-update bond gauges.
+
+        ``self.p`` remains the simple-update core and ``self.gauges`` stores
+        the external bond factors. This path intentionally does not
+        canonicalize the MPS or append compression-infidelity samples.
+        """
+        self._prepare_su_state()
+        p = self.p
+
+        pbar = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(
+                total=len(G_seq),
+                desc="su",
+                leave=True,
+                position=0,
+                ascii=True,
+                colour=self._PROGBAR_COLORS["su"],
+            )
+
+        try:
+            for step, (gate, where, event_type) in enumerate(
+                zip(G_seq, where_seq, event_seq),
+                start=1,
+            ):
+                if event_type != "gate":
+                    raise ValueError(
+                        "mode='su' supports gate-only streams; subMPO events "
+                        "are not supported."
+                    )
+                if len(where) not in {1, 2}:
+                    raise ValueError(
+                        "Each simple-update gate location must have one or two sites."
+                    )
+
+                p = apply_gate_simple(
+                    p,
+                    gate,
+                    where,
+                    gauges=self.gauges,
+                    ind_id=self.ind_id,
+                    renorm=True,
+                    max_bond=self.chi,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    inplace=True,
+                )
+                if pbar is not None:
+                    pbar.set_postfix(
+                        {"bnd": p.max_bond(), "gauges": len(self.gauges)}
+                    )
+                    pbar.update(1)
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        self.p = p
+        self.info_c = {}
+        self._su_gauges_ready = True
+        self._su_gauges_state = self.p
+        self._refresh_su_physical_state()
+
     def _run_mpo(  # pylint: disable=too-many-locals
         self,
         G_seq,
@@ -3811,13 +3945,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
-        fidelity_samples=10,
         normalize_every=None,
         normalize_final=True,
         normalize_eps=1e-15,
         non_unitary=False,
-        track_norm_infidelity=False,
-        track_infidelity=False,
         submpo_method="direct",
     ):
         """Apply gates with MPO-style nonlocal compression.
@@ -3825,20 +3956,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Uses :meth:`qtn.MatrixProductState.gate_nonlocal_` for two-qubit gates.
         """
         p = self.p
+        if not non_unitary:
+            self._start_unitary_norm_tracking(p)
         two_qubit_count = 0
         submpo_count = 0
-        sample_steps = (
-            set()
-            if track_infidelity
-            else self._sampling_steps(len(G_seq), fidelity_samples)
-        )
-        norm_proxy = (
-            None
-            if track_infidelity or fidelity_samples is None
-            else self.losses[-1]
-        )
-        true_cumulative_infidelity = None
-        norm_cumulative_infidelity = None
+        norm_cumulative_infidelity = self.infidelities[-1]
         last_where = self._current_orthog(p)
         last_normalized_step = None
 
@@ -3866,15 +3988,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 xmin, xmax = min(where), max(where)
                 method = self._normalize_submpo_method(submpo_method)
                 submpo_compress_opts = self._submpo_compress_opts(method)
-                if track_norm_infidelity:
-                    self.canonize_mps(p, (xmin, xmax))
-                if track_norm_infidelity and not track_infidelity and not non_unitary:
-                    target_norm = self._unitary_pre_gate_target_norm(
-                        p,
-                        (xmin, xmax),
-                    )
-                    p_target = None
-                elif track_norm_infidelity or track_infidelity:
+                self.canonize_mps(p, (xmin, xmax))
+                if non_unitary:
                     p_target = p.copy()
                     p_target.gate_with_submpo_(
                         gate,
@@ -3887,13 +4002,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode=cutoff_mode,
                         **submpo_compress_opts,
                     )
-                    target_norm = (
-                        self._canonical_span_norm(p_target, (xmin, xmax))
-                        if track_norm_infidelity
-                        else None
-                    )
+                    target_norm = self._raw_state_norm(p_target)
                 else:
-                    p_target = None
                     target_norm = None
 
                 p.gate_with_submpo_(
@@ -3912,22 +4022,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if track_norm_infidelity:
-                    norm_cumulative_infidelity = self._append_norm_infidelity_sample(
-                        self._canonical_span_norm(p, (xmin, xmax)),
+                approx_norm = self._canonical_span_norm(p, (xmin, xmax))
+                if non_unitary:
+                    sample = self._append_compression_infidelity_sample(
+                        approx_norm,
                         target_norm,
                         step=idx,
                         where=(xmin, xmax),
-                        record_trace=not track_infidelity,
                     )
-                if track_infidelity:
-                    sample = self._append_true_infidelity_sample(
-                        p_target,
-                        p,
+                else:
+                    sample = self._append_unitary_compression_infidelity_sample(
+                        approx_norm,
                         step=idx,
                         where=(xmin, xmax),
                     )
-                    true_cumulative_infidelity = sample["infidelity"]
+                norm_cumulative_infidelity = sample["infidelity"]
             elif len(where) == 1:
                 self._apply_gate(
                     p,
@@ -3952,38 +4061,24 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self._has_symmray_data(p)
                     and not self._is_nearest_neighbor_1d(where)
                 )
-                if track_norm_infidelity:
-                    self.canonize_mps(p, (xmin, xmax))
-                if track_norm_infidelity and not track_infidelity and not non_unitary:
-                    target_norm = self._unitary_pre_gate_target_norm(
-                        p,
-                        (xmin, xmax),
-                    )
-                    p_target = None
-                elif track_norm_infidelity or track_infidelity:
+                self.canonize_mps(p, (xmin, xmax))
+                p_target = None
+                if non_unitary:
                     if use_symmray_auto_swap:
                         p_target = self._build_symmray_auto_swap_target(
-                            p,
-                            gate,
-                            where,
-                            cutoff,
-                            cutoff_mode,
+                            p, gate, where, cutoff, cutoff_mode
                         )
+                        target_norm = self._raw_state_norm(p_target)
                     else:
-                        p_target = self._build_norm_target(
-                            p,
-                            gate,
-                            where,
-                            cutoff,
-                            cutoff_mode,
+                        target_norm = self._gate_target_norm_from_expectation(
+                            p, gate, where
                         )
-                    target_norm = (
-                        self._canonical_span_norm(p_target, (xmin, xmax))
-                        if track_norm_infidelity
-                        else None
-                    )
+                        if target_norm is None:
+                            p_target = self._build_norm_target(
+                                p, gate, where, cutoff, cutoff_mode
+                            )
+                            target_norm = self._raw_state_norm(p_target)
                 else:
-                    p_target = None
                     target_norm = None
                 if use_symmray_auto_swap:
                     self._apply_symmray_auto_swap_gate(
@@ -4009,38 +4104,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if track_norm_infidelity:
-                    norm_cumulative_infidelity = self._append_norm_infidelity_sample(
-                        self._canonical_span_norm(p, (xmin, xmax)),
+                approx_norm = self._canonical_span_norm(p, (xmin, xmax))
+                if non_unitary:
+                    sample = self._append_compression_infidelity_sample(
+                        approx_norm,
                         target_norm,
                         step=idx,
                         where=(xmin, xmax),
-                        record_trace=not track_infidelity,
                     )
-                if track_infidelity:
-                    sample = self._append_true_infidelity_sample(
-                        p_target,
-                        p,
+                else:
+                    sample = self._append_unitary_compression_infidelity_sample(
+                        approx_norm,
                         step=idx,
                         where=(xmin, xmax),
                     )
-                    true_cumulative_infidelity = sample["infidelity"]
+                norm_cumulative_infidelity = sample["infidelity"]
 
-            event = (
-                self._maybe_normalize_after_compression(
-                    p,
-                    step=idx,
-                    where=last_where,
-                    normalize_every=normalize_every,
-                )
-                if compressed
-                else None
+            event = self._maybe_normalize_after_step(
+                p,
+                step=idx,
+                where=last_where,
+                normalize_every=normalize_every,
+                reason="compression" if compressed else "step",
             )
             if event is not None:
                 last_normalized_step = idx
-
-            if idx in sample_steps:
-                norm_proxy = self._append_norm_proxy_sample(p)
 
             if pbar is not None:
                 postfix = {
@@ -4049,12 +4137,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 }
                 if submpo_count:
                     postfix["mpo"] = submpo_count
-                if track_infidelity and true_cumulative_infidelity is not None:
-                    postfix["Icum"] = self._format_progress_infidelity(true_cumulative_infidelity)
-                elif track_norm_infidelity and norm_cumulative_infidelity is not None:
-                    postfix["infidelity"] = self._format_progress_infidelity(norm_cumulative_infidelity)
-                elif norm_proxy is not None:
-                    postfix["~F"] = self._format_progress_scalar(norm_proxy)
+                postfix["infidelity"] = self._format_progress_infidelity(
+                    norm_cumulative_infidelity
+                )
                 pbar.set_postfix(postfix)
                 pbar.update(advanced)
 
@@ -4091,13 +4176,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
-        fidelity_samples=10,
         normalize_every=None,
         normalize_final=True,
         normalize_eps=1e-15,
         non_unitary=False,
-        track_norm_infidelity=False,
-        track_infidelity=False,
         *,
         swap_back,
         mode_name,
@@ -4110,18 +4192,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         and the right endpoint remains at the left endpoint's neighbour.
         """
         p = self.p
+        if not non_unitary:
+            self._start_unitary_norm_tracking(p)
         two_qubit_count = 0
-        sample_steps = (
-            set()
-            if track_infidelity
-            else self._sampling_steps(len(G_seq), fidelity_samples)
-        )
-        norm_proxy = (
-            None
-            if track_infidelity or fidelity_samples is None
-            else self.losses[-1]
-        )
-        true_cumulative_infidelity = None
+        cumulative_infidelity = self.infidelities[-1]
         last_where = self._current_orthog(p)
         last_normalized_step = None
 
@@ -4168,29 +4242,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     raise ValueError("Each gate location must have one or two sites.")
                 two_qubit_count += 1
                 xmin, xmax = sorted(where)
-                if track_norm_infidelity:
-                    self.canonize_mps(p, (xmin, xmax))
-                if track_norm_infidelity and not track_infidelity and not non_unitary:
-                    target_norm = self._unitary_pre_gate_target_norm(
-                        p,
-                        (xmin, xmax),
+                self.canonize_mps(p, (xmin, xmax))
+                p_target = None
+                if non_unitary:
+                    target_norm = self._gate_target_norm_from_expectation(
+                        p, gate, where
                     )
-                    p_target = None
-                elif track_norm_infidelity or track_infidelity:
-                    p_target = self._build_norm_target(
-                        p,
-                        gate,
-                        where,
-                        cutoff,
-                        cutoff_mode,
-                    )
-                    target_norm = (
-                        self._canonical_span_norm(p_target, (xmin, xmax))
-                        if track_norm_infidelity
-                        else None
-                    )
+                    if target_norm is None:
+                        p_target = self._build_norm_target(
+                            p, gate, where, cutoff, cutoff_mode
+                        )
+                        target_norm = self._raw_state_norm(p_target)
                 else:
-                    p_target = None
                     target_norm = None
 
                 compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
@@ -4209,48 +4272,40 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if track_norm_infidelity:
-                    self._append_norm_infidelity_sample(
-                        self._canonical_span_norm(p, (xmin, xmax)),
+                approx_norm = self._canonical_span_norm(p, (xmin, xmax))
+                if non_unitary:
+                    sample = self._append_compression_infidelity_sample(
+                        approx_norm,
                         target_norm,
                         step=idx,
                         where=(xmin, xmax),
-                        record_trace=not track_infidelity,
                     )
-                if track_infidelity:
-                    sample = self._append_true_infidelity_sample(
-                        p_target,
-                        p,
+                else:
+                    sample = self._append_unitary_compression_infidelity_sample(
+                        approx_norm,
                         step=idx,
                         where=(xmin, xmax),
                     )
-                    true_cumulative_infidelity = sample["infidelity"]
+                cumulative_infidelity = sample["infidelity"]
 
-            event = (
-                self._maybe_normalize_after_compression(
-                    p,
-                    step=idx,
-                    where=last_where,
-                    normalize_every=normalize_every,
-                )
-                if compressed
-                else None
+            event = self._maybe_normalize_after_step(
+                p,
+                step=idx,
+                where=last_where,
+                normalize_every=normalize_every,
+                reason="compression" if compressed else "step",
             )
             if event is not None:
                 last_normalized_step = idx
-
-            if idx in sample_steps:
-                norm_proxy = self._append_norm_proxy_sample(p)
 
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
                     "bnd": p.max_bond(),
                 }
-                if track_infidelity and true_cumulative_infidelity is not None:
-                    postfix["Icum"] = self._format_progress_infidelity(true_cumulative_infidelity)
-                elif norm_proxy is not None:
-                    postfix["~F"] = self._format_progress_scalar(norm_proxy)
+                postfix["infidelity"] = self._format_progress_infidelity(
+                    cumulative_infidelity
+                )
                 pbar.set_postfix(postfix)
                 pbar.update(advanced)
 
@@ -4279,13 +4334,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
-        fidelity_samples=10,
         normalize_every=None,
         normalize_final=True,
         normalize_eps=1e-15,
         non_unitary=False,
-        track_norm_infidelity=False,
-        track_infidelity=False,
     ):
         """Apply gates with local SVD compression for nonlocal 2-site gates.
 
@@ -4295,18 +4347,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``reduce-split`` loses Symmray fusion metadata in current quimb/Symmray.
         """
         p = self.p
+        if not non_unitary:
+            self._start_unitary_norm_tracking(p)
         two_qubit_count = 0
-        sample_steps = (
-            set()
-            if track_infidelity
-            else self._sampling_steps(len(G_seq), fidelity_samples)
-        )
-        norm_proxy = (
-            None
-            if track_infidelity or fidelity_samples is None
-            else self.losses[-1]
-        )
-        true_cumulative_infidelity = None
+        cumulative_infidelity = self.infidelities[-1]
         last_where = self._current_orthog(p)
         last_normalized_step = None
 
@@ -4351,16 +4395,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 compress_opts = {"cutoff": cutoff, "cutoff_mode": cutoff_mode}
                 xmin, xmax = sorted(where)
                 use_symmray_auto_swap = self._has_symmray_data(p)
-                if track_norm_infidelity:
-                    self.canonize_mps(p, (xmin, xmax))
+                self.canonize_mps(p, (xmin, xmax))
                 if use_symmray_auto_swap:
-                    if track_norm_infidelity and not track_infidelity and not non_unitary:
-                        target_norm = self._unitary_pre_gate_target_norm(
-                            p,
-                            (xmin, xmax),
-                        )
+                    if not non_unitary:
+                        target_norm = None
                         p_target = None
-                    elif track_norm_infidelity or track_infidelity:
+                    else:
                         p_target = self._build_symmray_auto_swap_target(
                             p,
                             gate,
@@ -4368,14 +4408,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff,
                             cutoff_mode,
                         )
-                        target_norm = (
-                            self._canonical_span_norm(p_target, (xmin, xmax))
-                            if track_norm_infidelity
-                            else None
-                        )
-                    else:
-                        p_target = None
-                        target_norm = None
+                        target_norm = self._raw_state_norm(p_target)
                     self._apply_symmray_auto_swap_gate(
                         p,
                         gate,
@@ -4385,11 +4418,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         max_bond=self.chi,
                     )
                 else:
-                    if track_norm_infidelity and not track_infidelity and not non_unitary:
-                        target_norm = self._unitary_pre_gate_target_norm(
-                            p,
-                            (xmin, xmax),
-                        )
+                    if not non_unitary:
+                        target_norm = None
                     else:
                         target_norm = None
                     self._apply_gate(
@@ -4401,9 +4431,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff_mode=cutoff_mode,
                         inplace=True,
                     )
-                    if track_norm_infidelity and target_norm is None:
+                    if non_unitary and target_norm is None:
                         target_norm = self._canonical_span_norm(p, (xmin, xmax))
-                    p_target = p.copy() if track_infidelity else None
                     self.canonize_mps(p, (xmin, xmax))
 
                     for i in range(xmax, xmin, -1):
@@ -4419,48 +4448,40 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if track_norm_infidelity:
-                    self._append_norm_infidelity_sample(
-                        self._canonical_span_norm(p, (xmin, xmax)),
+                approx_norm = self._canonical_span_norm(p, (xmin, xmax))
+                if non_unitary:
+                    sample = self._append_compression_infidelity_sample(
+                        approx_norm,
                         target_norm,
                         step=idx,
                         where=(xmin, xmax),
-                        record_trace=not track_infidelity,
                     )
-                if track_infidelity:
-                    sample = self._append_true_infidelity_sample(
-                        p_target,
-                        p,
+                else:
+                    sample = self._append_unitary_compression_infidelity_sample(
+                        approx_norm,
                         step=idx,
                         where=(xmin, xmax),
                     )
-                    true_cumulative_infidelity = sample["infidelity"]
+                cumulative_infidelity = sample["infidelity"]
 
-            event = (
-                self._maybe_normalize_after_compression(
-                    p,
-                    step=idx,
-                    where=last_where,
-                    normalize_every=normalize_every,
-                )
-                if compressed
-                else None
+            event = self._maybe_normalize_after_step(
+                p,
+                step=idx,
+                where=last_where,
+                normalize_every=normalize_every,
+                reason="compression" if compressed else "step",
             )
             if event is not None:
                 last_normalized_step = idx
-
-            if idx in sample_steps:
-                norm_proxy = self._append_norm_proxy_sample(p)
 
             if pbar is not None:
                 postfix = {
                     "2q": two_qubit_count,
                     "bnd": p.max_bond(),
                 }
-                if track_infidelity and true_cumulative_infidelity is not None:
-                    postfix["Icum"] = self._format_progress_infidelity(true_cumulative_infidelity)
-                elif norm_proxy is not None:
-                    postfix["~F"] = self._format_progress_scalar(norm_proxy)
+                postfix["infidelity"] = self._format_progress_infidelity(
+                    cumulative_infidelity
+                )
                 pbar.set_postfix(postfix)
                 pbar.update(advanced)
 
@@ -4489,7 +4510,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
-        fidelity_samples=10,
     ):
         """Apply gates exactly using in-place ``contract=True`` application.
 
@@ -4500,9 +4520,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.info_c = {}
         p = self.p
         two_qubit_count = 0
-        # Keep parameter for API compatibility; exact mode does not sample fidelity.
-        _ = fidelity_samples
-
         pbar = None
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
@@ -4582,48 +4599,26 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         state_info["cur_orthog"] = target_orthog
         return target_orthog
 
-    def get_fidelities(self):
-        """Return the active fidelity-like progress trace.
-
-        This returns ``self.losses`` for compatibility. With
-        ``track_infidelity=True``, entries after the initial ``1.0`` are the
-        running geometric mean of measured local true fidelities. Otherwise,
-        default/unitary compressed runs use this as the legacy represented-norm
-        proxy trace sampled by ``fidelity_samples``. For ``non_unitary=True``
-        without diagnostics this trace stays at ``[1.0]`` unless
-        ``fidelity_samples`` is supplied explicitly.
-        """
-        return self.losses
-
     def get_infidelities(self):
         """Return the cumulative infidelity trace.
 
-        The initial value is ``0.0``. A new value is appended for each
-        compressed two-site update sampled while ``track_infidelity=True`` or,
-        when that is disabled, ``track_norm_infidelity=True``.
+        The initial value is ``0.0``. A new value is appended after every
+        compressed two-site update. For unitary streams, values are computed
+        from the current retained norm relative to the initial run norm. For
+        non-unitary streams, values use the multiplicative canonical
+        norm-ratio estimator.
         """
         return self.infidelities
 
-    def get_true_infidelities(self):
-        """Return the cumulative true normalized-overlap infidelity trace."""
-        return self.true_infidelities
-
     def get_infidelity_samples(self):
-        """Return detailed true normalized-overlap infidelity sample records.
-
-        Each record contains ``step``, ``where``, local ``fidelity``, running
-        ``geometric_fidelity``, ``local_infidelity``, and cumulative
-        ``infidelity``.
-        """
-        return self.infidelity_samples
-
-    def get_norm_infidelity_samples(self):
-        """Return detailed norm-ratio infidelity sample records.
+        """Return detailed canonical norm-ratio infidelity sample records.
 
         Each record contains ``step``, ``where``, ``target_norm``,
-        ``approx_norm``, ``local_infidelity``, and cumulative ``infidelity``.
+        ``approx_norm``, ``local_fidelity``, ``local_infidelity``, and
+        cumulative ``infidelity``. Unitary records additionally contain
+        ``global_fidelity`` and ``global_infidelity``.
         """
-        return self.norm_infidelity_samples
+        return self.infidelity_samples
 
     def get_normalizations(self):
         """Return automatic normalization events recorded during ``run``.

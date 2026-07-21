@@ -204,6 +204,36 @@ def test_ps_to_mps_fermion_custom_occupations_preserve_global_sector():
     assert fermion.total_charge(occupations) == (2, 2)
 
 
+def test_ps_to_peps_accepts_fermion_coordinate_occupations():
+    """The public PEPS constructor should build a native fixed-charge seed."""
+    fermion = Fermion(spinful=True, symmetry="U1U1", U=2.0)
+    occupations = {
+        (x, y): (1, 0) if (x + y) % 2 == 0 else (0, 1)
+        for x in range(2)
+        for y in range(3)
+    }
+
+    peps = pepsy.ps_to_peps(
+        (2, 3),
+        fermion=fermion,
+        occupations=occupations,
+        chi=1,
+        seed=19,
+        dtype="complex128",
+    )
+
+    assert (peps.Lx, peps.Ly) == (2, 3)
+    assert peps.max_bond() == 1
+    assert all(
+        type(peps[x, y].data).__name__ == "U1U1FermionicArray"
+        for x, y in occupations
+    )
+    assert [
+        peps[x, y].data.charge
+        for x, y in ((0, 0), (0, 1), (1, 0))
+    ] == [(1, 0), (0, 1), (0, 1)]
+
+
 def test_symdmrg_fermionic_state_accepts_raw_fermion_constructor_output():
     """SymDMRG should restore native tensors without a SymMPS wrapper input."""
     fermion = Fermion(spinful=True, symmetry="U1U1", t=0.5, U=2.0)
@@ -261,6 +291,135 @@ def test_unified_spinful_fermion_hamiltonian_keeps_mu_parameter():
     assert dense[0, 2, 0, 2] == pytest.approx(-0.4)
     assert dense[3, 0, 3, 0] == pytest.approx(3.0 - 0.2 - 0.4)
     assert dense[0, 3, 0, 3] == pytest.approx(3.0 - 0.2 - 0.4)
+
+
+def test_fermion_exposes_explicit_native_operator_terms():
+    """Named and generic APIs return the unexponentiated fermion terms."""
+    fermion = Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=1.7,
+        U=3.0,
+        mu=0.4,
+        V=0.6,
+    )
+
+    hopping = fermion.hopping_operator()
+    reference_hopping = fermion.hamiltonian(
+        ((0, 1),), t=1.7, U=0.0, mu=0.0, V=0.0
+    ).terms[(0, 1)]
+    np.testing.assert_allclose(
+        hopping.to_dense(), -reference_hopping.to_dense() / 1.7
+    )
+
+    spin_up = fermion.hopping_operator(spin="up")
+    explicit_spin_up = fermion.operator_term(
+        [
+            (1.0, ((0, "create_up"), (1, "annihilate_up"))),
+            (1.0, ((1, "create_up"), (0, "annihilate_up"))),
+        ],
+        sites=(0, 1),
+    )
+    np.testing.assert_allclose(spin_up.to_dense(), explicit_spin_up.to_dense())
+
+    np.testing.assert_allclose(
+        np.diag(fermion.interaction_operator().to_dense()),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+    np.testing.assert_allclose(
+        np.diag(fermion.chemical_potential_operator().to_dense()),
+        (0.0, 1.0, 1.0, 2.0),
+    )
+    np.testing.assert_allclose(
+        np.diag(fermion.onsite_term(0).to_dense()),
+        (0.0, -0.4, -0.4, 3.0 - 0.8),
+    )
+
+    density = fermion.density_operator()
+    reference_density = fermion.hamiltonian(
+        ((0, 1),), t=0.0, U=0.0, mu=0.0, V=0.6
+    ).terms[(0, 1)]
+    np.testing.assert_allclose(
+        0.6 * density.to_dense(), reference_density.to_dense()
+    )
+
+    explicit_terms = {
+        (0, 1): -1.7 * hopping,
+        0: 3.0 * fermion.interaction_operator(),
+        1: 3.0 * fermion.interaction_operator(),
+    }
+    explicit_hamiltonian = fermion.hamiltonian(explicit_terms)
+    assert explicit_hamiltonian.explicit_terms
+    assert set(explicit_hamiltonian.terms) == {(0, 1), (0,), (1,)}
+    explicit_mpo = explicit_hamiltonian.to_mpo(L=2, compress=False)
+    reference_mpo = fermion.hamiltonian(
+        ((0, 1),), t=1.7, U=3.0, mu=0.0, V=0.0
+    ).to_mpo(L=2, compress=False)
+    np.testing.assert_allclose(
+        _mpo_to_dense_matrix(explicit_mpo, 2),
+        _mpo_to_dense_matrix(reference_mpo, 2),
+    )
+
+
+def test_mps_energy_uses_explicit_fermion_terms_natively():
+    """An explicit one- plus two-site SymHamiltonian stays on native MPS terms."""
+    fermion = Fermion(spinful=True, symmetry="U1U1", U=2.0, mu=0.0)
+    ham = fermion.hamiltonian(
+        {
+            (0, 1): -fermion.hopping_operator(),
+            0: 2.0 * fermion.interaction_operator(),
+            1: 2.0 * fermion.interaction_operator(),
+        }
+    )
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        bond_dim=2,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)]),
+        seed=17,
+        dtype="complex128",
+    )
+
+    optimizer = pepsy.MpsEnergyOptimizer(
+        state,
+        terms=ham,
+        energy_per_site=False,
+        real=False,
+    )
+
+    assert optimizer._can_use_native_local_terms(ham, state)
+    assert np.isfinite(np.real(optimizer.energy().energy))
+
+
+def test_fermion_explicit_coordinate_terms_preserve_peps_locations():
+    """Coordinate-site terms remain usable by PEPS and mapped MPO workflows."""
+    fermion = Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=1.0,
+        U=3.0,
+        mu=0.2,
+    )
+    edges = (
+        ((0, 0), (0, 1)),
+        ((0, 0), (1, 0)),
+        ((1, 0), (1, 1)),
+    )
+    sites = tuple(sorted({site for edge in edges for site in edge}))
+    terms = {edge: -fermion.hopping_operator() for edge in edges}
+    terms |= {site: fermion.onsite_term(site) for site in sites}
+
+    hamiltonian = fermion.hamiltonian(terms)
+
+    assert set(hamiltonian.terms) == set(edges) | set(sites)
+    assert hamiltonian.terms[(0, 0)].shape == (4, 4)
+    assert hamiltonian.terms[edges[0]].shape == (4, 4, 4, 4)
+
+    mpo = hamiltonian.to_mpo(
+        mapper=OneDMap(2, 2, mode="snake"),
+        compress=False,
+    )
+    assert mpo.L == 4
 
 
 def test_unified_fermion_peps_energy_accepts_boundary_chi():
@@ -341,6 +500,117 @@ def test_fermion_generic_exponential_matches_named_interaction_gate():
         fermion.interaction_gate(0.2).to_dense(),
     )
     assert type(generic).__name__ == "U1U1FermionicArray"
+
+
+def test_fermion_hopping_gate_matches_native_hamiltonian_exponential():
+    """Native hopping imaginary time must lower the matching term energy."""
+    fermion = Fermion(spinful=True, symmetry="U1U1", t=1.0, U=0.0)
+    ham = fermion.hamiltonian({(0, 1): -fermion.hopping_operator()})
+    named = fermion.hopping_gate(0.01, imaginary=True)
+    reference = ham.trotter_gates(0.01, imaginary=True)[0][0]
+
+    np.testing.assert_allclose(named.to_dense(), reference.to_dense())
+
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        bond_dim=1,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)]),
+        seed=3,
+        dtype="complex128",
+    )
+    before = pepsy.MpsEnergyOptimizer(
+        state.tn,
+        terms=ham,
+        normalized=True,
+        energy_per_site=False,
+        real=True,
+    ).energy().energy
+    out = pepsy.MpsOptimizer(
+        state.tn.copy(),
+        [(named, (0, 1))],
+        chi=8,
+        mode="mpo",
+        inplace=True,
+    ).run(
+        progbar=False,
+        cutoff=0.0,
+        non_unitary=True,
+        normalize_final=False,
+    )
+    after = pepsy.MpsEnergyOptimizer(
+        out,
+        terms=ham,
+        normalized=True,
+        energy_per_site=False,
+        real=True,
+    ).energy().energy
+
+    assert before == pytest.approx(0.0)
+    assert after < -1.0e-4
+
+
+def _native_mps_dense_amplitudes(state):
+    """Read amplitudes from a dense fixed-charge native MPS contraction."""
+    dense = state.to_dense()
+    configs = []
+    for config_map in dense.indices[0]._subinfo.extents.values():
+        for config, multiplicity in config_map.items():
+            configs.extend([config] * multiplicity)
+    values = next(iter(dense.blocks.values()))[:, 0]
+    assert len(configs) == len(values)
+    return dict(zip(configs, np.asarray(values)))
+
+
+@pytest.mark.parametrize(
+    ("spinful", "initial", "moved"),
+    [
+        (False, (1, 1, 0), (0, 1, 1)),
+        (True, ((1, 0), (0, 1), (0, 0)), ((0, 0), (0, 1), (1, 0))),
+    ],
+)
+@pytest.mark.parametrize("imaginary", [False, True])
+def test_native_hopping_gate_has_correct_long_range_parity_sign(
+    spinful, initial, moved, imaginary
+):
+    """Native gates retain the Jordan-Wigner sign across an occupied site."""
+    fermion = Fermion(
+        spinful=spinful,
+        symmetry="U1U1" if spinful else "U1",
+        t=1.3,
+    )
+    dt = 0.13
+    state = pepsy.ps_to_mps(
+        len(initial),
+        fermion=fermion,
+        occupations=initial,
+        chi=1,
+        seed=123,
+        dtype="complex128",
+    )
+    out = pepsy.MpsOptimizer(
+        state,
+        [(fermion.hopping_gate(dt, t=1.3, imaginary=imaginary), (0, 2))],
+        chi=4,
+        mode="mpo",
+        inplace=True,
+    ).run(
+        progbar=False,
+        cutoff=1e-12,
+        non_unitary=imaginary,
+        normalize_every=False,
+        normalize_final=False,
+    )
+    amplitudes = _native_mps_dense_amplitudes(out)
+    ratio = amplitudes[tuple(moved)] / amplitudes[tuple(initial)]
+    intermediate_parity = sum(
+        sum(charge) if isinstance(charge, tuple) else charge
+        for charge in initial[1:-1]
+    ) % 2
+    sign = (-1) ** intermediate_parity
+    angle = 1.3 * dt
+    expected = sign * (np.tanh(angle) if imaginary else 1j * np.tan(angle))
+    np.testing.assert_allclose(ratio, expected, atol=1e-11, rtol=1e-11)
 
 
 def test_fermion_parameter_generators_preserve_torch_autodiff():
@@ -1434,7 +1704,7 @@ def test_fermi_hubbard_u1u1_streams_run_mps_optimizer_and_direct_gate():
 
     direct = state.copy().apply_gates(interaction, method="direct", inplace=False)
     opt = pepsy.MpsOptimizer(state.tn.copy(), stream, chi=4, mode="mpo")
-    out = opt.run(progbar=False, cutoff=1e-10, fidelity_samples=0)
+    out = opt.run(progbar=False, cutoff=1e-10)
 
     assert len(interaction) == 3
     assert len(hopping) == 2
@@ -2171,7 +2441,7 @@ def test_symmps_gate_stream_runs_mps_optimizer_mpo_heisenberg():
     gates = ham.gate_stream(0.01)
 
     opt = pepsy.MpsOptimizer(state.tn.copy(), gates, chi=4, mode="mpo")
-    out = opt.run(progbar=False, cutoff=1e-10, fidelity_samples=0)
+    out = opt.run(progbar=False, cutoff=1e-10)
 
     assert out.L == 4
     assert out.max_bond() <= 4
@@ -2266,7 +2536,7 @@ def test_symmps_mps_optimizer_coerces_dense_hamiltonian_terms():
         hamiltonian=dense_hamiltonian,
         chi=4,
         mode="mpo",
-        run_kwargs={"progbar": False, "fidelity_samples": 5},
+        run_kwargs={"progbar": False},
         inplace=False,
     )
 
@@ -2296,7 +2566,6 @@ def test_symmps_mps_optimizer_3x3_streams_cover_supported_modes(case_name, mode)
     run_kwargs = {
         "progbar": False,
         "cutoff": 1.0e-10,
-        "fidelity_samples": 0,
         "n_iter": 4,
     }
     if non_unitary and mode != "exact":
@@ -2323,9 +2592,9 @@ def test_symmps_mps_optimizer_3x3_streams_cover_supported_modes(case_name, mode)
         events = opt.get_normalizations()
         raw_norm = _raw_mps_norm(out)
         assert len(events) == len(gates)
-        assert all(event["method"] == "local_tensors" for event in events)
+        assert all(event["method"] == "canonical_center" for event in events)
         assert all(event["reason"] == "compression" for event in events)
-        assert all(event["sites"] for event in events)
+        assert all(len(event["sites"]) == 1 for event in events)
         assert all(np.isfinite(event["log10_scale"]) for event in events)
         assert np.isfinite(np.real(raw_norm))
         assert np.real(raw_norm) > 0.0
@@ -2372,7 +2641,7 @@ def test_symmps_mps_optimizer_symmray_dmrg_expansion_caveat_is_explicit():
             gates,
             chi=2,
             mode=mode,
-        ).run(progbar=False, cutoff=1.0e-10, fidelity_samples=0)
+        ).run(progbar=False, cutoff=1.0e-10)
         assert out.L == 4
         assert out.max_bond() <= 2
 
@@ -2383,8 +2652,8 @@ def test_symmps_mps_optimizer_symmray_dmrg_expansion_caveat_is_explicit():
 
 
 @pytest.mark.parametrize("mode", ["mpo", "svd"])
-def test_symmps_mps_optimizer_symmray_auto_swap_tracks_infidelity(mode):
-    """Symmray auto-swap fallbacks should still support true infidelity samples."""
+def test_symmps_mps_optimizer_symmray_auto_swap_reports_infidelity(mode):
+    """Symmray auto-swap fallbacks should report canonical infidelity samples."""
     state = SymMPS.random(
         4,
         symmetry="Z2",
@@ -2411,8 +2680,6 @@ def test_symmps_mps_optimizer_symmray_auto_swap_tracks_infidelity(mode):
     out = opt.run(
         progbar=False,
         cutoff=1.0e-10,
-        fidelity_samples=0,
-        track_infidelity=True,
     )
 
     samples = opt.get_infidelity_samples()

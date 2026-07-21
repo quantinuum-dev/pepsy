@@ -83,6 +83,29 @@ charge-preserving random-unitary growth while keeping the same global sector.
 fixed-charge Fermion states, since a generic local Haar vector breaks the
 conserved sector.
 
+The matching PEPS constructor is ``ps_to_peps``. Pass ``(Lx, Ly)`` (or one
+integer for a square lattice), a coordinate occupation mapping, and the same
+``Fermion`` object:
+
+```python
+occupations = {
+    (x, y): (1, 0) if (x + y) % 2 == 0 else (0, 1)
+    for x in range(Lx)
+    for y in range(Ly)
+}
+seed = py.ps_to_peps(
+    (Lx, Ly),
+    fermion=fh,
+    occupations=occupations,
+    chi=1,
+    seed=7,
+)
+```
+
+This returns the underlying PEPS with native fermionic Symmray tensors; use
+``SymPEPS`` only when the wrapper methods or stored Hamiltonian metadata are
+needed.
+
 ## Unified native fermion helper
 
 ``Fermion`` is the model-facing helper for both one-mode spinless fermions
@@ -109,11 +132,76 @@ spinful = py.Fermion(
 
 spinless.operator("number")
 spinful.operator("n_up")
+spinful.hopping_operator(spin="up")
+spinful.interaction_operator()
+spinful.chemical_potential_operator()
 spinful.onsite_gate(dt=0.01, site=0)
 spinful.gate("interaction", dt=0.01)
 spinless.gate_stream(edges, dt=0.01, order=2)
 spinful.local_terms(edges)  # native terms for energy optimization
 ```
+
+The bare ``*_operator`` methods return explicit native fermionic operators,
+not exponentiated gates or model coefficients. For example,
+``spinful.hopping_operator(spin="up")`` returns
+``c_a^dagger c_b + c_b^dagger c_a`` for canonical two-site locations,
+``spinful.interaction_operator()`` returns ``n_up n_down``,
+``spinful.chemical_potential_operator()`` returns ``n_up + n_down``, and
+``spinful.density_operator()`` returns the bare nearest-neighbor density
+product. Use ``hopping_term(edge, t=...)``, ``interaction_term(site, U=...)``,
+``chemical_potential_term(site, mu=...)``, ``onsite_term(site, ...)``, or
+``density_term(edge, V=...)`` when a location-aware weighted term is desired.
+
+For arbitrary sums of local fermion monomials, use ``operator_term``. The
+site order is the order of the returned operator and should match the ``where``
+argument used for measurement:
+
+```python
+hopping_up = spinful.operator_term([
+    (-t, ((i, "create_up"), (j, "annihilate_up"))),
+    (-t, ((j, "create_up"), (i, "annihilate_up"))),
+], sites=(i, j))
+
+double_occupancy = spinful.operator_term(
+    [(U, ((i, "number_up"), (i, "number_down")))],
+    sites=(i,),
+)
+
+# A complete explicit Hamiltonian can be wrapped for MPO/DMRG conversion.
+terms = {
+    edge: -t * spinful.hopping_operator()
+    for edge in edges
+}
+terms.update({site: U * spinful.interaction_operator() for site in sites})
+terms.update({site: -mu * spinful.chemical_potential_operator() for site in sites})
+ham_dmrg = spinful.hamiltonian(terms)
+H_mpo = ham_dmrg.to_mpo(L=L)
+```
+
+For a term mapping, scalar site keys are normalized to ``(site,)``. The
+``SymHamiltonian`` returned by ``fermion.hamiltonian(terms)`` retains the
+locations, symmetry, and fermionic ordering metadata needed by ``to_mpo``;
+passing the raw dictionary directly to ``to_mpo`` would lose that context.
+
+For a PEPS mapping, use coordinate edges together with flat coordinate site
+keys. The nested edge keys disambiguate a coordinate such as ``(x, y)`` from
+an MPS edge ``(i, j)``, and the coordinate keys remain available to PEPS
+expectation routines:
+
+```python
+edges = tuple(peps.edges)  # ((x0, y0), (x1, y1))
+sites = tuple(peps.sites)
+terms = {edge: -t * fermion.hopping_operator() for edge in edges}
+terms |= {site: fermion.onsite_term(site) for site in sites}
+ham_peps = fermion.hamiltonian(terms)
+```
+
+Available local names include ``create_up``, ``annihilate_up``,
+``number_up``, ``create_down``, ``annihilate_down``, ``number_down``,
+``double``, ``pair_create``, ``pair_annihilate``, ``number``, and ``sz``
+for spinful fermions; spinless helpers provide ``create``, ``annihilate``,
+``number``, and ``parity``. All returned operators retain the selected
+Symmray Abelian symmetry and fermionic grading.
 
 The site-layout ``local_terms`` mapping is keyed by edges. Its onsite
 Hubbard and chemical-potential pieces are divided by each site's coordination
@@ -541,7 +629,7 @@ pulse = py.fermi_hubbard_u1u1_light_pulse_gate_stream(
 )
 
 opt = py.MpsOptimizer(psi.tn, pulse, chi=64, mode="mpo", inplace=True)
-psi_t = opt.run(progbar=True, cutoff=1e-10, fidelity_samples=0)
+psi_t = opt.run(progbar=True, cutoff=1e-10)
 ```
 
 For a PEPS path, apply the same stream through routed simple update:

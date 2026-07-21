@@ -1,6 +1,5 @@
 """Tests for :mod:`pepsy.optimizers.mps.optimizer`."""
 
-from numbers import Real
 import sys
 import types
 
@@ -82,6 +81,18 @@ def _assert_event_sites_locally_normalized(mps, event):
         assert _tensor_data_norm(mps, site) == pytest.approx(1.0)
 
 
+def test_mps_optimizer_has_one_infidelity_result_api():
+    """Infidelity is always available through the canonical result methods."""
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    opt = py.MpsOptimizer(state, gates=[], chi=2, mode="svd")
+
+    assert not hasattr(opt, "get_fidelities")
+    assert not hasattr(opt, "get_true_infidelities")
+    assert not hasattr(opt, "get_norm_infidelity_samples")
+    with pytest.raises(TypeError, match="fidelity_samples"):
+        opt.run(progbar=False, fidelity_samples=0)
+
+
 def test_mps_optimizer_accepts_svd_mode():
     """SVD mode should be accepted by ``MpsOptimizer`` mode validation."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -98,6 +109,66 @@ def test_mps_optimizer_accepts_perm_mode():
     assert opt.qubits == [0, 1, 2, 3]
 
 
+def test_mps_optimizer_simple_update_initializes_and_keeps_gauges_separate():
+    """Simple-update mode keeps its core and external bond gauges separate."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gauges = {}
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="su",
+        gauges=gauges,
+    )
+
+    out = opt.run(progbar=False, cutoff=1e-12)
+
+    assert out is opt.p
+    assert opt.gauges is gauges
+    assert len(gauges) == out.L - 1
+    assert opt.info_c == {}
+    assert opt.get_infidelities() == [0.0]
+    assert opt.get_infidelity_samples() == []
+    assert opt.p_ungauged is not None
+
+    physical = out.copy()
+    physical.gauge_simple_insert(gauges)
+    assert physical.norm() == pytest.approx(1.0, rel=1e-10, abs=1e-10)
+    assert opt.p_ungauged.norm() == pytest.approx(physical.norm())
+    assert np.allclose(opt.p_ungauged.to_dense(), physical.to_dense())
+
+
+def test_mps_optimizer_simple_update_forwards_gate_simple_options(monkeypatch):
+    """SU mode should use ``gate_simple`` with fixed renormalization."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gauges = {}
+    p0.gauge_all_simple_(gauges=gauges, progbar=False)
+    calls = []
+
+    def fake_gate_simple(tn, gate, where, **kwargs):
+        calls.append((tn, gate, where, kwargs))
+        return tn
+
+    monkeypatch.setattr(mps_optimizer_module, "apply_gate_simple", fake_gate_simple)
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=3,
+        mode="su",
+        gauges=gauges,
+    )
+    opt.run(progbar=False, cutoff=1e-9, cutoff_mode="rel")
+
+    assert len(calls) == 1
+    _, _, where, kwargs = calls[0]
+    assert where == (0, 3)
+    assert kwargs["gauges"] is gauges
+    assert kwargs["renorm"] is True
+    assert kwargs["max_bond"] == 3
+    assert kwargs["cutoff"] == pytest.approx(1e-9)
+    assert kwargs["cutoff_mode"] == "rel"
+
+
 def test_mps_optimizer_perm_tracks_lazy_order_and_logical_state():
     """Perm mode should leave swaps in place while preserving logical evolution."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -109,8 +180,8 @@ def test_mps_optimizer_perm_tracks_lazy_order_and_logical_state():
     perm = py.MpsOptimizer(p0.copy(), gates=gates, chi=16, mode="perm")
     reference = py.MpsOptimizer(p0.copy(), gates=gates, chi=16, mode="swap")
 
-    perm.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
-    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    perm.run(progbar=False, cutoff=1e-12)
+    reference.run(progbar=False, cutoff=1e-12)
 
     assert perm.qubits == [0, 2, 3, 1]
     assert np.allclose(_perm_mps_to_logical_dense(perm), reference.p.to_dense().reshape(-1))
@@ -133,7 +204,7 @@ def test_mps_optimizer_perm_maps_control_events_to_logical_sites():
         mode="perm",
     )
 
-    opt.run(progbar=False, fidelity_samples=0)
+    opt.run(progbar=False)
 
     assert opt.qubits == [0, 3, 1, 2]
     assert opt.measurements[0][1] == (3,)
@@ -164,7 +235,7 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     ]
 
     opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
-    out = opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0, n_iter=3)
+    out = opt.run(progbar=False, cutoff=1e-12, n_iter=3)
 
     assert out.max_bond() <= 2
     assert [event["backend"] for event in opt.mix_history][:2] == ["mpo", "mpo"]
@@ -174,6 +245,72 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     assert opt.last_mix_summary["fallback_steps"] == 0
 
 
+def test_mps_optimizer_mix_expands_bonds_before_dmrg_handoff():
+    """Mixed DMRG must retain entanglement on a previously short bond."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 1)),
+        (qu.CNOT(), (1, 2)),
+        (qu.CNOT(), (2, 3)),
+    ]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
+    out = opt.run(progbar=False, cutoff=1e-12, n_iter=8)
+
+    expected = np.zeros(16, dtype=complex)
+    expected[[0, 15]] = 1.0 / np.sqrt(2.0)
+    assert np.allclose(out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1), expected)
+    assert opt.mix_history[2]["backend"] == "dmrg"
+    assert opt.mix_history[2]["reason"] == "bond_at_chi"
+    assert [sample["step"] for sample in opt.infidelity_samples] == [2, 3, 4]
+
+
+def test_mps_optimizer_mix_history_accumulates_control_segments():
+    """Mixed-mode diagnostics should cover all gate segments in one run."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("00"),
+        gates=[
+            (qu.hadamard(), (0,)),
+            ("measure", "Z", 0, +1),
+            (qu.CNOT(), (0, 1)),
+        ],
+        chi=2,
+        mode="mix",
+    )
+
+    opt.run(progbar=False, seed=7)
+
+    assert [event["step"] for event in opt.mix_history] == [1, 2]
+    assert [event["backend"] for event in opt.mix_history] == ["mpo", "mpo"]
+    assert opt.last_mix_summary["mpo_steps"] == 2
+    assert opt.last_mix_summary["dmrg_steps"] == 0
+
+
+def test_mps_optimizer_mix_global_infidelity_tracks_current_norm():
+    """Unitary mix infidelity should equal loss from the current raw norm."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000"),
+        gates=[
+            (qu.hadamard(), (0,)),
+            (qu.CNOT(), (0, 1)),
+            (qu.CNOT(), (1, 2)),
+        ],
+        chi=1,
+        mode="mix",
+    )
+
+    opt.run(progbar=False, n_iter=8)
+
+    raw = opt.p.copy()
+    raw.exponent = 0.0
+    expected_infidelity = 1.0 - float(np.real(raw.norm())) ** 2
+    assert opt.get_infidelities()[-1] == pytest.approx(expected_infidelity)
+    assert opt.infidelity_samples[-1]["global_fidelity"] == pytest.approx(
+        1.0 - expected_infidelity
+    )
+
+
 def test_mps_optimizer_mix_starts_with_dmrg_at_target_bond():
     """Mix mode should not do MPO warmup when the initial MPS is already at chi."""
     p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=17)
@@ -181,7 +318,7 @@ def test_mps_optimizer_mix_starts_with_dmrg_at_target_bond():
     gates = [(qu.hadamard(), (1,))]
 
     opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
-    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    opt.run(progbar=False, cutoff=1e-12)
 
     assert opt.mix_history[0]["backend"] == "dmrg"
     assert opt.mix_history[0]["reason"] == "bond_at_chi"
@@ -201,7 +338,7 @@ def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
     monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", nonfinite_dmrg)
     opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
 
-    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    opt.run(progbar=False, cutoff=1e-12)
 
     assert opt.mix_history[0]["backend"] == "mpo"
     assert opt.mix_history[0]["reason"] == "dmrg_fallback"
@@ -402,14 +539,13 @@ def test_mps_optimizer_layout_run_restores_original_mps_order_and_stream():
         gates=gates,
         chi=16,
         mode="svd",
-    ).run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    ).run(progbar=False, cutoff=1e-12)
 
     opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=16, mode="svd")
     out = opt.run(
         use_layout_finder=True,
         progbar=False,
         cutoff=1e-12,
-        fidelity_samples=0,
     )
 
     inds = ["k0", "k1", "k2", "k3"]
@@ -458,15 +594,15 @@ def test_mps_optimizer_persistent_layout_reuses_order_and_remaps_readout():
     reference = py.MpsOptimizer(
         _nonuniform_product_mps(), gates=gates, chi=8, mode="svd"
     )
-    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
-    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    reference.run(progbar=False, cutoff=1e-12)
+    reference.run(progbar=False, cutoff=1e-12)
 
     laid_out = py.MpsOptimizer(
         _nonuniform_product_mps(), gates=gates, chi=8, mode="svd"
     )
     laid_out.apply_layout((0, 2, 3, 1), layout_report=False)
-    laid_out.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
-    laid_out.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    laid_out.run(progbar=False, cutoff=1e-12)
+    laid_out.run(progbar=False, cutoff=1e-12)
 
     reference_dense = np.asarray(reference.to_dense()).reshape(-1)
     laid_out_dense = np.asarray(laid_out.to_dense()).reshape(-1)
@@ -548,7 +684,7 @@ def test_mps_optimizer_persistent_layout_controls_keep_logical_labels():
         mode="mpo",
     )
     opt.apply_layout((0, 2, 3, 1), layout_report=False)
-    opt.run(progbar=False, fidelity_samples=0)
+    opt.run(progbar=False)
 
     assert opt.measurements[0][0:3] == ("Z", (3,), 1)
     assert np.isclose(
@@ -565,13 +701,13 @@ def test_mps_optimizer_persistent_layout_remaps_submpo_without_mutating_stream()
     mpo = _two_branch_flip_submpo(L=4, sites=(0, 3), targets=(0, 3))
     stream = [py.MpsOptimizer.submpo_event(mpo, (0, 3))]
     reference = py.MpsOptimizer(p0.copy(), gates=stream, chi=16, mode="mpo")
-    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
-    reference.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    reference.run(progbar=False, cutoff=1e-12)
+    reference.run(progbar=False, cutoff=1e-12)
 
     opt = py.MpsOptimizer(p0.copy(), gates=stream, chi=16, mode="mpo")
     opt.apply_layout((0, 2, 3, 1), layout_report=False)
-    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
-    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    opt.run(progbar=False, cutoff=1e-12)
+    opt.run(progbar=False, cutoff=1e-12)
 
     assert np.allclose(
         np.abs(np.asarray(opt.to_dense()).reshape(-1)),
@@ -607,7 +743,6 @@ def test_mps_optimizer_layout_run_reports_score_reduction(capsys):
         use_layout_finder=True,
         progbar=False,
         cutoff=1e-12,
-        fidelity_samples=0,
         layout_report=True,
     )
 
@@ -628,14 +763,13 @@ def test_mps_optimizer_layout_run_copies_submpo_payloads():
         gates=stream,
         chi=16,
         mode="mpo",
-    ).run(progbar=False, cutoff=1e-12, fidelity_samples=0)
+    ).run(progbar=False, cutoff=1e-12)
 
     opt = py.MpsOptimizer(p0.copy(), gates=stream, chi=16, mode="mpo")
     out = opt.run(
         use_layout_finder=True,
         progbar=False,
         cutoff=1e-12,
-        fidelity_samples=0,
     )
 
     inds = ["k0", "k1", "k2", "k3"]
@@ -658,7 +792,7 @@ def test_mps_optimizer_mpo_mode_applies_submpo_stream_event():
         mode="mpo",
     )
 
-    out = opt.run(progbar=False, cutoff=0.0, fidelity_samples=0)
+    out = opt.run(progbar=False, cutoff=0.0)
     vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
     expected = np.zeros(16, dtype=np.complex128)
     expected[0] = 0.7
@@ -681,7 +815,7 @@ def test_mps_optimizer_mpo_mode_accepts_submpo_mapping_event():
         mode="mpo",
     )
 
-    out = opt.run(progbar=False, cutoff=0.0, fidelity_samples=0)
+    out = opt.run(progbar=False, cutoff=0.0)
     vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
     expected = np.zeros(16, dtype=np.complex128)
     expected[0] = 0.7
@@ -731,16 +865,14 @@ def test_mps_optimizer_submpo_diagnostics_do_not_consume_event_mpo():
     out = opt.run(
         progbar=False,
         cutoff=0.0,
-        fidelity_samples=0,
         non_unitary=True,
-        track_norm_infidelity=True,
     )
     vec = out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
     expected = np.zeros(16, dtype=np.complex128)
     expected[0] = 0.7
     expected[5] = 0.3
 
-    assert len(opt.get_norm_infidelity_samples()) == 1
+    assert len(opt.get_infidelity_samples()) == 1
     assert np.allclose(vec, expected)
 
     reuse = py.MpsOptimizer(
@@ -748,7 +880,7 @@ def test_mps_optimizer_submpo_diagnostics_do_not_consume_event_mpo():
         gates=[py.MpsOptimizer.submpo_event(mpo, (1, 3))],
         chi=8,
         mode="mpo",
-    ).run(progbar=False, cutoff=0.0, fidelity_samples=0)
+    ).run(progbar=False, cutoff=0.0)
     reuse_vec = reuse.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1)
     assert np.allclose(reuse_vec, expected)
 
@@ -791,7 +923,6 @@ def test_mps_optimizer_submpo_method_and_optimize_are_forwarded(monkeypatch):
     direct.run(
         progbar=False,
         cutoff=0.0,
-        fidelity_samples=0,
         submpo_method="direct",
     )
 
@@ -805,7 +936,6 @@ def test_mps_optimizer_submpo_method_and_optimize_are_forwarded(monkeypatch):
     opt.run(
         progbar=False,
         cutoff=0.0,
-        fidelity_samples=0,
         submpo_method="fit-zipup",
     )
 
@@ -946,14 +1076,14 @@ def test_mps_optimizer_run_returns_state_after_updates(mode):
     gates = list(zip(G, where))
     opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=8, mode=mode)
 
-    out = opt.run(progbar=False, cutoff=1e-12, n_iter=2, fidelity_samples=1)
+    out = opt.run(progbar=False, cutoff=1e-12, n_iter=2)
 
     assert out is opt.p
 
 
 @pytest.mark.parametrize("mode", ["mpo", "perm", "svd", "swap"])
-def test_mps_optimizer_compression_modes_sample_norm_proxy(mode):
-    """Compression modes should append norm-proxy samples to fidelity trace."""
+def test_mps_optimizer_compression_modes_report_infidelity(mode):
+    """Compression modes should report one sample per two-site update."""
     p0 = qtn.MPS_computational_state("00000", dtype="complex128")
     G = [qu.hadamard(), qu.CNOT(), qu.phase_gate(0.2), qu.CNOT()]
     where = [(1,), (0, 4), (2,), (1, 3)]
@@ -963,23 +1093,22 @@ def test_mps_optimizer_compression_modes_sample_norm_proxy(mode):
     if mode == "swap" and not hasattr(opt.p, "gate_with_auto_swap_"):
         pytest.skip("swap mode requires gate_with_auto_swap_ in this quimb version.")
 
-    before = len(opt.get_fidelities())
-    opt.run(progbar=False, cutoff=1e-12, fidelity_samples=2)
-    trace = opt.get_fidelities()
+    opt.run(progbar=False, cutoff=1e-12)
+    samples = opt.get_infidelity_samples()
 
-    assert len(trace) >= before + 1
-    assert isinstance(trace[-1], Real)
+    assert len(samples) == 2
+    assert all(0.0 <= sample["infidelity"] <= 1.0 for sample in samples)
 
 
-def test_mps_optimizer_unitary_default_still_samples_norm_proxy():
-    """Default/unitary runs should keep the historical norm-proxy sampling."""
+def test_mps_optimizer_unitary_default_reports_infidelity():
+    """Default unitary runs should report canonical compression infidelity."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     gates = [(qu.hadamard(), (1,)), (qu.CNOT(), (0, 3))]
 
     opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=8, mode="svd")
     opt.run(progbar=False, cutoff=1e-12)
 
-    assert len(opt.get_fidelities()) > 1
+    assert len(opt.get_infidelities()) == 2
 
 
 def test_mps_optimizer_svd_forwards_cutoff_mode_to_final_compression(monkeypatch):
@@ -1004,18 +1133,6 @@ def test_mps_optimizer_svd_forwards_cutoff_mode_to_final_compression(monkeypatch
     assert calls[-1]["cutoff_mode"] == "rsum2"
 
 
-def test_mps_optimizer_rejects_negative_fidelity_samples():
-    """Negative fidelity_samples should fail clearly."""
-    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
-    G = [qu.CNOT()]
-    where = [(0, 3)]
-    gates = list(zip(G, where))
-
-    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=8, mode="mpo")
-    with pytest.raises(ValueError, match="fidelity_samples must be >= 0"):
-        opt.run(progbar=False, cutoff=1e-12, fidelity_samples=-1)
-
-
 def test_mps_optimizer_non_unitary_flag_normalizes_one_site_gate():
     """non_unitary=True should normalize at run end for short streams."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -1035,7 +1152,7 @@ def test_mps_optimizer_non_unitary_flag_normalizes_one_site_gate():
     assert opt.p.norm() == pytest.approx(2.0)
     assert opt.p.exponent == pytest.approx(np.log10(2.0))
     assert opt.get_infidelities() == [0.0]
-    assert opt.get_norm_infidelity_samples() == []
+    assert opt.get_infidelity_samples() == []
     assert len(events) == 1
     assert events[0]["step"] == 1
     assert events[0]["old_norm"] == pytest.approx(4.0)
@@ -1087,8 +1204,8 @@ def test_mps_optimizer_non_unitary_default_does_not_normalize():
     assert opt_none.p.exponent == pytest.approx(0.0)
 
 
-def test_mps_optimizer_non_unitary_scale_control_skips_diagnostics():
-    """Fast non-unitary scale control should not collect diagnostics by default."""
+def test_mps_optimizer_non_unitary_scale_control_reports_infidelity():
+    """Fast non-unitary scale control still reports cheap compression infidelity."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -1110,14 +1227,45 @@ def test_mps_optimizer_non_unitary_scale_control_skips_diagnostics():
     events = opt.get_normalizations()
     assert opt.p.norm() == pytest.approx(ref.p.norm())
     assert opt.p.exponent == pytest.approx(sum(event["log10_scale"] for event in events))
-    assert opt.get_fidelities() == [1.0]
-    assert opt.get_infidelities() == [0.0]
-    assert opt.get_true_infidelities() == [0.0]
-    assert opt.get_infidelity_samples() == []
-    assert opt.get_norm_infidelity_samples() == []
-    assert [event["step"] for event in events] == [3]
-    assert events[0]["reason"] == "compression"
-    _assert_event_sites_locally_normalized(opt.p, events[0])
+    assert len(opt.get_infidelities()) == 2
+    assert 0.0 <= opt.get_infidelities()[-1] <= 1.0
+    assert len(opt.get_infidelity_samples()) == 1
+    assert opt.get_infidelity_samples()[0]["step"] == 3
+    assert [event["step"] for event in events] == [1, 2, 3]
+    assert [event["reason"] for event in events] == ["step", "step", "compression"]
+    assert all(event["sites"] == (event["insert"],) for event in events)
+    _assert_event_sites_locally_normalized(opt.p, events[-1])
+
+
+@pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "svd"])
+def test_mps_optimizer_non_unitary_infidelity_reports_without_flags(mode):
+    """Non-unitary compression infidelity is reported without opt-in flags."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.hadamard(), (1,)),
+        (_non_unitary_entangling_gate(), (0, 1)),
+    ]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode=mode)
+    if mode == "swap" and not hasattr(opt.p, "gate_with_auto_swap_"):
+        pytest.skip("swap mode requires gate_with_auto_swap_ in this quimb version.")
+
+    opt.run(
+        progbar=False,
+        cutoff=1e-12,
+        n_iter=4,
+        non_unitary=True,
+        normalize_every=True,
+    )
+
+    samples = opt.get_infidelity_samples()
+    assert len(samples) == 1
+    sample = samples[0]
+    assert sample["target_norm"] > 0.0
+    assert sample["approx_norm"] >= 0.0
+    assert 0.0 <= sample["local_fidelity"] <= 1.0
+    assert opt.get_infidelities()[-1] == pytest.approx(sample["infidelity"])
 
 
 @pytest.mark.parametrize("mode", ["dmrg", "mpo", "swap", "perm", "svd"])
@@ -1139,8 +1287,8 @@ def test_mps_optimizer_normalization_insert_site_stays_inside_span(mode):
     )
 
 
-def test_mps_optimizer_normalize_every_enables_compression_and_final():
-    """Enabled normalize_every should scale compressed updates and final tails."""
+def test_mps_optimizer_normalize_every_normalizes_every_step():
+    """Enabled normalize_every should scale each replay step at one center."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     scale = np.array([[2.0, 0.0], [0.0, 0.5]], dtype=complex)
     gates = [(scale, (0,)), (_non_unitary_entangling_gate(), (0, 1)), (scale, (0,))]
@@ -1152,14 +1300,15 @@ def test_mps_optimizer_normalize_every_enables_compression_and_final():
 
     events = opt.get_normalizations()
     assert opt.p.norm() == pytest.approx(ref.p.norm())
-    assert [event["step"] for event in events] == [2, 3]
-    assert [event["reason"] for event in events] == ["compression", "final"]
+    assert [event["step"] for event in events] == [1, 2, 3]
+    assert [event["reason"] for event in events] == ["step", "compression", "step"]
+    assert all(event["sites"] == (event["insert"],) for event in events)
     assert opt.p.exponent == pytest.approx(sum(event["log10_scale"] for event in events))
     _assert_event_sites_locally_normalized(opt.p, events[-1])
 
 
 def test_mps_optimizer_normalize_final_can_be_disabled():
-    """normalize_final=False should skip the trailing normalization."""
+    """Per-step normalization should not depend on normalize_final."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     scale = np.array([[2.0, 0.0], [0.0, 0.5]], dtype=complex)
     gates = [(scale, (0,)), (_non_unitary_entangling_gate(), (0, 1)), (scale, (0,))]
@@ -1170,8 +1319,10 @@ def test_mps_optimizer_normalize_final_can_be_disabled():
     ref.run(progbar=False, cutoff=1e-12, non_unitary=True, normalize_every=False)
 
     assert opt.p.norm() == pytest.approx(ref.p.norm())
-    assert [event["step"] for event in opt.get_normalizations()] == [2]
-    assert opt.get_normalizations()[0]["reason"] == "compression"
+    events = opt.get_normalizations()
+    assert [event["step"] for event in events] == [1, 2, 3]
+    assert events[1]["reason"] == "compression"
+    assert all(event["sites"] == (event["insert"],) for event in events)
 
 
 def test_mps_optimizer_automatic_normalization_rejects_exact_mode():
@@ -1184,13 +1335,14 @@ def test_mps_optimizer_automatic_normalization_rejects_exact_mode():
         opt.run(progbar=False, non_unitary=True, normalize_every=True)
 
 
-def test_mps_optimizer_track_infidelity_rejects_exact_mode():
-    """Exact mode has no compressed target for infidelity diagnostics."""
+def test_mps_optimizer_exact_mode_has_no_compression_infidelity():
+    """Exact mode runs without compression infidelity samples."""
     p0 = qtn.MPS_computational_state("00", dtype="complex128")
     opt = py.MpsOptimizer(p0.copy(), gates=[(qu.CNOT(), (0, 1))], chi=8, mode="exact")
 
-    with pytest.raises(ValueError, match="not available in exact mode"):
-        opt.run(progbar=False, track_infidelity=True)
+    opt.run(progbar=False)
+    assert opt.get_infidelities() == [0.0]
+    assert opt.get_infidelity_samples() == []
 
 
 def test_mps_optimizer_exact_mode_keeps_canonical_metadata_separate():
@@ -1315,8 +1467,9 @@ def test_mps_optimizer_local_normalization_reuses_tracked_center(monkeypatch):
     )
 
     assert event is not None
-    assert event["insert"] in (0, 1, 2)
-    assert opt.info_c["cur_orthog"] == (0, 2)
+    assert event["insert"] == 2
+    assert event["sites"] == (2,)
+    assert opt.info_c["cur_orthog"] == (2, 2)
 
 
 def test_mps_optimizer_canonical_span_norm_ignores_stored_exponent():
@@ -1351,6 +1504,29 @@ def test_mps_optimizer_norm_infidelity_uses_single_center_norm(monkeypatch):
     assert opt.info_c["cur_orthog"] == (3, 3)
 
 
+def test_mps_optimizer_represented_norm_capability_check_is_cached(monkeypatch):
+    """Repeated FIT results should not re-contract the full MPS norm."""
+    p0 = qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128", seed=13)
+    cache = mps_optimizer_module._NORM_INCLUDES_EXPONENT_CACHE  # pylint: disable=protected-access
+    cache.pop(type(p0), None)
+    original = py.MpsOptimizer._class_norm_includes_exponent
+    calls = []
+
+    def count_checks(state):
+        calls.append(state)
+        return original(state)
+
+    monkeypatch.setattr(
+        py.MpsOptimizer,
+        "_class_norm_includes_exponent",
+        staticmethod(count_checks),
+    )
+    py.MpsOptimizer._install_represented_norm(p0.copy())  # pylint: disable=protected-access
+    py.MpsOptimizer._install_represented_norm(p0.copy())  # pylint: disable=protected-access
+
+    assert len(calls) == 1
+
+
 def test_mps_optimizer_unitary_norm_infidelity_mpo_skips_target_build(monkeypatch):
     """Unitary MPO norm diagnostics should not build an unbounded target MPS."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -1367,16 +1543,99 @@ def test_mps_optimizer_unitary_norm_infidelity_mpo_skips_target_build(monkeypatc
     opt.run(
         progbar=False,
         cutoff=1e-12,
-        fidelity_samples=0,
-        track_norm_infidelity=True,
     )
 
-    samples = opt.get_norm_infidelity_samples()
+    samples = opt.get_infidelity_samples()
     assert len(samples) == 1
     assert samples[0]["step"] == 2
     assert samples[0]["where"] == (0, 3)
     assert samples[0]["target_norm"] == pytest.approx(1.0)
     assert opt.p.max_bond() <= 1
+
+
+def test_mps_optimizer_unitary_norm_tracking_uses_canonical_center(monkeypatch):
+    """Unitary tracking should not contract the full MPS norm at startup."""
+    p0 = qtn.MPS_rand_state(6, bond_dim=2, phys_dim=2, dtype="complex128", seed=12)
+    opt = py.MpsOptimizer(
+        p0.copy(),
+        gates=[(qu.CNOT(), (0, 5))],
+        chi=2,
+        mode="mpo",
+    )
+
+    def fail_full_norm(*_args, **_kwargs):
+        raise AssertionError("unitary startup tracking should use the canonical center")
+
+    monkeypatch.setattr(py.MpsOptimizer, "_raw_state_norm", fail_full_norm)
+    opt._start_unitary_norm_tracking(opt.p)  # pylint: disable=protected-access
+
+    assert opt._unitary_previous_norm == pytest.approx(  # pylint: disable=protected-access
+        opt._canonical_span_norm(opt.p, opt.info_c["cur_orthog"])  # pylint: disable=protected-access
+    )
+
+
+def test_mps_optimizer_reports_unitary_infidelity_by_default(monkeypatch):
+    """The canonical cheap estimator is on without diagnostic flags."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.CNOT(), (0, 3)),
+    ]
+
+    def fail_build_target(*_args, **_kwargs):
+        raise AssertionError("the unitary estimator must not build a target")
+
+    monkeypatch.setattr(py.MpsOptimizer, "_build_norm_target", fail_build_target)
+
+    def fail_pre_gate_norm(*_args, **_kwargs):
+        raise AssertionError("unitary tracking must not measure a pre-gate target")
+
+    monkeypatch.setattr(
+        py.MpsOptimizer,
+        "_unitary_pre_gate_target_norm",
+        fail_pre_gate_norm,
+    )
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode="mpo")
+    opt.run(progbar=False, cutoff=1e-12)
+
+    samples = opt.get_infidelity_samples()
+    assert len(samples) == 1
+    assert samples[0]["step"] == 2
+    assert samples[0]["fidelity"] == pytest.approx(
+        (samples[0]["approx_norm"] / samples[0]["target_norm"]) ** 2
+    )
+    assert opt.get_infidelities()[-1] == pytest.approx(
+        samples[0]["infidelity"]
+    )
+
+
+def test_mps_optimizer_non_unitary_norm_uses_local_expectation_without_target(
+    monkeypatch,
+):
+    """Dense non-unitary gates measure ``G†G`` without copying the MPS."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [
+        (qu.hadamard(), (0,)),
+        (qu.hadamard(), (1,)),
+        (_non_unitary_entangling_gate(), (0, 1)),
+    ]
+
+    def fail_build_target(*_args, **_kwargs):
+        raise AssertionError("local expectation should provide the target norm")
+
+    monkeypatch.setattr(py.MpsOptimizer, "_build_norm_target", fail_build_target)
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode="mpo")
+    opt.run(
+        progbar=False,
+        cutoff=1e-12,
+        non_unitary=True,
+        normalize_every=True,
+    )
+
+    samples = opt.get_infidelity_samples()
+    assert len(samples) == 1
+    assert samples[0]["target_norm"] > 0.0
+    assert 0.0 <= samples[0]["local_infidelity"] <= 1.0
 
 
 def test_mps_optimizer_unitary_submpo_norm_infidelity_skips_target_gate(monkeypatch):
@@ -1413,11 +1672,9 @@ def test_mps_optimizer_unitary_submpo_norm_infidelity_skips_target_gate(monkeypa
     opt.run(
         progbar=False,
         cutoff=1e-12,
-        fidelity_samples=0,
-        track_norm_infidelity=True,
     )
 
-    samples = opt.get_norm_infidelity_samples()
+    samples = opt.get_infidelity_samples()
     assert max_bonds == [1]
     assert len(samples) == 1
     assert samples[0]["target_norm"] == pytest.approx(1.0)
@@ -1453,10 +1710,9 @@ def test_mps_optimizer_non_unitary_norm_infidelity_matches_svd_target():
         non_unitary=True,
         normalize_every=True,
         normalize_final=True,
-        track_norm_infidelity=True,
     )
 
-    samples = opt.get_norm_infidelity_samples()
+    samples = opt.get_infidelity_samples()
     proxy = opt.get_infidelities()[-1]
     actual = target.distance_normalized(opt.p, normalized="infidelity", optimize="auto-hq")
 
@@ -1469,8 +1725,8 @@ def test_mps_optimizer_non_unitary_norm_infidelity_matches_svd_target():
     assert opt.p.norm() > 0.0
 
 
-def test_mps_optimizer_true_infidelity_matches_tn_fidelity():
-    """track_infidelity=True should record the true normalized-overlap metric."""
+def test_mps_optimizer_infidelity_matches_tn_fidelity():
+    """The canonical norm-ratio infidelity matches this retained overlap."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -1498,7 +1754,6 @@ def test_mps_optimizer_true_infidelity_matches_tn_fidelity():
         non_unitary=True,
         normalize_every=True,
         normalize_final=True,
-        track_infidelity=True,
     )
 
     samples = opt.get_infidelity_samples()
@@ -1510,15 +1765,13 @@ def test_mps_optimizer_true_infidelity_matches_tn_fidelity():
     assert samples[0]["where"] == (0, 1)
     assert samples[0]["fidelity"] == pytest.approx(actual_fidelity)
     assert samples[0]["local_infidelity"] == pytest.approx(1.0 - actual_fidelity)
-    assert opt.get_true_infidelities()[-1] == pytest.approx(1.0 - actual_fidelity)
     assert opt.get_infidelities()[-1] == pytest.approx(1.0 - actual_fidelity)
-    assert opt.get_norm_infidelity_samples() == []
     _assert_event_sites_locally_normalized(opt.p, opt.get_normalizations()[-1])
     assert opt.p.norm() > 0.0
 
 
-def test_mps_optimizer_true_infidelity_losses_are_geometric_mean():
-    """True-fidelity tracking should store geometric-mean progress in losses."""
+def test_mps_optimizer_infidelity_accumulates_multiplicatively():
+    """Canonical infidelity should accumulate as a product of local fidelities."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     h_gate = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
     filter_gate = _non_unitary_entangling_gate()
@@ -1538,31 +1791,21 @@ def test_mps_optimizer_true_infidelity_losses_are_geometric_mean():
         cutoff=1e-12,
         non_unitary=True,
         normalize_every=1,
-        fidelity_samples=5,
-        track_infidelity=True,
     )
 
-    log_sum = 0.0
+    cumulative_fidelity = 1.0
     expected = []
-    for count, sample in enumerate(opt.get_infidelity_samples(), start=1):
-        fidelity = sample["fidelity"]
-        if fidelity <= 0.0 or np.isneginf(log_sum):
-            log_sum = -np.inf
-            geometric_fidelity = 0.0
-        else:
-            log_sum += np.log(fidelity)
-            geometric_fidelity = float(np.exp(log_sum / count))
-        expected.append(geometric_fidelity)
-        assert sample["geometric_fidelity"] == pytest.approx(geometric_fidelity)
+    for sample in opt.get_infidelity_samples():
+        cumulative_fidelity *= sample["local_fidelity"]
+        expected.append(1.0 - cumulative_fidelity)
+        assert sample["infidelity"] == pytest.approx(expected[-1])
 
     assert len(opt.get_infidelity_samples()) == 3
-    assert opt.get_fidelities()[0] == pytest.approx(1.0)
-    assert opt.get_fidelities()[1:] == pytest.approx(expected)
-    assert len(opt.get_fidelities()) == len(opt.get_infidelity_samples()) + 1
+    assert opt.get_infidelities() == pytest.approx([0.0] + expected)
 
 
-def test_mps_optimizer_true_infidelity_progress_reports_infidelity(monkeypatch):
-    """With track_infidelity=True, tqdm postfix should show infidelity."""
+def test_mps_optimizer_infidelity_progress_reports_infidelity(monkeypatch):
+    """Progress bars should always show canonical infidelity."""
     progress_instances = []
 
     class _FakeTqdm:
@@ -1595,19 +1838,21 @@ def test_mps_optimizer_true_infidelity_progress_reports_infidelity(monkeypatch):
         cutoff=1e-12,
         non_unitary=True,
         normalize_every=1,
-        track_infidelity=True,
     )
 
     progress = progress_instances[-1]
     assert progress.n == len(gates)
+    assert all("infidelity" in postfix for postfix in progress.postfix_calls)
     last = progress.postfix_calls[-1]
-    assert "Icum" in last
+    assert "infidelity" in last
     assert "Fgeom" not in last
-    assert last["Icum"] == opt._format_progress_infidelity(opt.get_infidelities()[-1])
+    assert last["infidelity"] == opt._format_progress_infidelity(
+        opt.get_infidelities()[-1]
+    )
 
 
-def test_mps_optimizer_norm_infidelity_progress_reports_norm_proxy(monkeypatch):
-    """With track_norm_infidelity=True, MPO tqdm postfix should show norm loss."""
+def test_mps_optimizer_infidelity_progress_reports_norm_proxy(monkeypatch):
+    """MPO progress bars should report canonical infidelity."""
     progress_instances = []
 
     class _FakeTqdm:
@@ -1638,16 +1883,69 @@ def test_mps_optimizer_norm_infidelity_progress_reports_norm_proxy(monkeypatch):
     opt.run(
         progbar=True,
         cutoff=1e-12,
-        fidelity_samples=0,
-        track_norm_infidelity=True,
     )
 
     progress = progress_instances[-1]
     assert progress.n == len(gates)
+    assert all("infidelity" in postfix for postfix in progress.postfix_calls)
     last = progress.postfix_calls[-1]
     assert "infidelity" in last
     assert "Icum" not in last
     assert last["infidelity"] == opt._format_progress_infidelity(opt.get_infidelities()[-1])
+
+
+@pytest.mark.parametrize("mode", ["mpo", "swap", "svd", "mix"])
+def test_mps_optimizer_compression_progress_always_reports_infidelity(
+    monkeypatch, mode
+):
+    """MPO, swap, and SVD progress bars expose one infidelity field always."""
+    progress_instances = []
+
+    class _FakeTqdm:
+        def __init__(self, **kwargs):
+            self.total = kwargs["total"]
+            self.n = 0
+            self.postfix_calls = []
+            progress_instances.append(self)
+
+        def set_postfix(self, postfix):
+            self.postfix_calls.append(dict(postfix))
+
+        def update(self, amount):
+            self.n += amount
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "tqdm", types.SimpleNamespace(tqdm=_FakeTqdm))
+
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 3))]
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode=mode)
+    if mode == "swap" and not hasattr(opt.p, "gate_with_auto_swap_"):
+        pytest.skip("swap mode requires gate_with_auto_swap_ in this quimb version.")
+
+    def fail_pre_gate_norm(*_args, **_kwargs):
+        raise AssertionError("unitary tracking must not measure a pre-gate target")
+
+    monkeypatch.setattr(
+        py.MpsOptimizer,
+        "_unitary_pre_gate_target_norm",
+        fail_pre_gate_norm,
+    )
+
+    opt.run(progbar=True, cutoff=1e-12)
+
+    progress = progress_instances[-1]
+    assert progress.n == len(gates)
+    assert all("infidelity" in postfix for postfix in progress.postfix_calls)
+    assert all("Icum" not in postfix for postfix in progress.postfix_calls)
+    assert progress.postfix_calls[0]["infidelity"] == opt._format_progress_infidelity(
+        0.0
+    )
+    assert progress.postfix_calls[-1]["infidelity"] == (
+        opt._format_progress_infidelity(opt.get_infidelities()[-1])
+    )
 
 
 def test_mps_optimizer_progress_infidelity_uses_compact_scientific_format():
@@ -1657,8 +1955,8 @@ def test_mps_optimizer_progress_infidelity_uses_compact_scientific_format():
 
 
 @pytest.mark.parametrize("mode", ["dmrg", "mpo"])
-def test_mps_optimizer_true_infidelity_smoke_other_modes(mode):
-    """Other compressed modes should support the true infidelity diagnostic."""
+def test_mps_optimizer_infidelity_smoke_other_modes(mode):
+    """Other compressed modes should expose canonical infidelity."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -1674,15 +1972,13 @@ def test_mps_optimizer_true_infidelity_smoke_other_modes(mode):
         non_unitary=True,
         normalize_every=True,
         normalize_final=True,
-        track_infidelity=True,
     )
 
     samples = opt.get_infidelity_samples()
     assert len(samples) == 1
     assert 0.0 <= samples[0]["fidelity"] <= 1.0
     assert 0.0 <= samples[0]["local_infidelity"] <= 1.0
-    assert 0.0 <= opt.get_true_infidelities()[-1] <= 1.0
-    assert opt.get_norm_infidelity_samples() == []
+    assert 0.0 <= opt.get_infidelities()[-1] <= 1.0
     _assert_event_sites_locally_normalized(opt.p, opt.get_normalizations()[-1])
     assert opt.p.norm() > 1.0
 
@@ -1715,7 +2011,6 @@ def test_mps_optimizer_dmrg_non_unitary_matches_mpo_accuracy():
             n_iter=20,
             non_unitary=True,
             normalize_every=1,
-            track_infidelity=True,
         )
 
         fidelity = float(np.real(py.tn_fidelity(opt.p, target, contraction_opt="auto-hq")))
@@ -1726,8 +2021,18 @@ def test_mps_optimizer_dmrg_non_unitary_matches_mpo_accuracy():
         }
 
         events = opt.get_normalizations()
-        assert len(events) == 3
-        assert all(event["reason"] == "compression" for event in events)
+        assert len(events) == len(gates)
+        assert [event["step"] for event in events] == list(range(1, len(gates) + 1))
+        assert [event["reason"] for event in events] == [
+            "step",
+            "step",
+            "step",
+            "step",
+            "compression",
+            "compression",
+            "compression",
+        ]
+        assert all(event["sites"] == (event["insert"],) for event in events)
         _assert_event_sites_locally_normalized(opt.p, events[-1])
         assert len(opt.get_infidelity_samples()) == 3
         assert fidelity > 0.92
@@ -1766,10 +2071,9 @@ def test_mps_optimizer_non_unitary_norm_infidelity_smoke_other_modes(mode):
         non_unitary=True,
         normalize_every=True,
         normalize_final=True,
-        track_norm_infidelity=True,
     )
 
-    samples = opt.get_norm_infidelity_samples()
+    samples = opt.get_infidelity_samples()
     assert len(samples) == 1
     assert 0.0 <= samples[0]["local_infidelity"] <= 1.0
     assert 0.0 <= opt.get_infidelities()[-1] <= 1.0

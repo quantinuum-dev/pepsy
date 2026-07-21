@@ -34,6 +34,22 @@ The mixed replay history is stored in `opt.mix_history` and summarized in
 `opt.last_mix_summary`. With `progbar=True`, the progress bar shows the current
 backend, cumulative MPO/DMRG/fallback counts, and `bond=current/chi`.
 
+`mode="su"` uses simple-update evolution for imaginary-time or other
+non-unitary gate streams. It keeps `opt.p` as the simple-update core and
+stores the external bond factors in `opt.gauges`. After every run,
+`opt.p_ungauged` is refreshed as a physical copy with those gauges inserted.
+If the supplied dictionary
+does not contain the current bond gauges, the optimizer initializes it with
+`opt.p.gauge_all_simple_(gauges=opt.gauges, progbar=False)`, then applies each
+gate through `pepsy.gate_simple(..., renorm=True)`. This mode does not
+canonicalize the MPS and does not report compression infidelity. Use
+`opt.p_ungauged` for the physical state and `opt.p` for continued SU updates.
+If an independent physical copy is needed, use:
+
+```python
+physical = opt.p_ungauged.copy()
+```
+
 `mode="swap"` applies non-local two-site gates through a swap-and-split path
 and swaps the sites back after each gate. `mode="perm"` uses the same
 swap-and-split path but leaves the swaps in place, tracking the current
@@ -59,17 +75,45 @@ observable support, and records the new range. A concrete tracked range avoids
 an orthogonality-center scan. Older Quimb versions without the local evaluator
 use a compatibility overlap contraction instead.
 
-Normalization and norm diagnostics follow the same canonical-center contract.
-`track_norm_infidelity=True` uses a one-site center norm after moving the
-tracked range to the gate support; it does not build a global doubled-network
-contraction. For default unitary streams, the target norm is the pre-gate
-canonical norm, so no uncompressed target copy is built unless
-`track_infidelity=True` also needs it. Non-unitary norm diagnostics still build
-their pre-compression targets because those updates can change the norm.
-Non-unitary scale control records the removed factor in `p.exponent`, while
-temporary diagnostic targets never modify the live `info_c` cache.
-`mode="exact"` deliberately skips canonical metadata; switching back to an MPS
+Normalization and infidelity use the same canonical-center contract. For a
+non-unitary run with `normalize_every` enabled, after every replay step the
+optimizer moves the tracked range to a one-site center, normalizes that center
+tensor, and stores the removed scale in `p.exponent`. Thus `p.norm()` restores
+the represented norm, while a copy with `exponent=0` exposes the normalized
+working data. For DMRG, a multi-gate batch is one replay step for this purpose.
+For unitary streams,
+`get_infidelities()` uses the current retained norm divided by the initial
+run norm, squared; this is the global retained-fidelity estimate and is
+equivalent to multiplying the per-gate fidelities without requiring a
+pre-gate target measurement. Local ratios remain available in detailed
+samples for diagnostics. The trace is populated by default; no diagnostic
+flag is needed. For dense two-site non-unitary gates, the target
+norm is obtained from the local expectation of `G†G`, so no copied target MPS
+is needed. Symmray and general sub-MPO backends use a raw target-norm fallback
+where that local expectation is not available. DMRG still materializes its
+target because FIT needs it, but the diagnostic uses FIT's final local norm
+trace as the current retained norm.
+Temporary fallback targets never modify the live `info_c` cache.
+The `mpo`, `swap`, and `svd` progress bars always show the same cumulative
+`infidelity` field, starting at zero before the first compressed two-site gate.
+`mode="exact"` and `mode="su"` deliberately skip canonical metadata; switching back to an MPS
 mode rebuilds and canonicalizes the contracted state.
+
+The result API is intentionally small:
+
+```python
+opt.run(non_unitary=True, normalize_every=True)
+
+opt.get_infidelities()        # [0.0, cumulative infidelity, ...]
+opt.get_infidelity_samples()  # detailed per-compression records
+opt.get_normalizations()      # scale events and accumulated exponents
+```
+
+Infidelity is recorded automatically whenever a compressed two-site update
+occurs; no sampling or tracking option is needed. `get_infidelities()` is the
+cheap cumulative trace for progress and stopping criteria. Use
+`get_infidelity_samples()` when the target norm, retained norm, local ratio, or
+step metadata is needed.
 
 For a logical gate stream whose site order has not been chosen yet,
 `MpsOptimizer.LayoutFinder(gates, L=...)` or
