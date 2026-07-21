@@ -1,6 +1,6 @@
 ---
 name: tree-optimizer
-description: 'Run, review, debug, benchmark, or extend pepsy.TreeOptimizer -- the rooted tree-tensor-network (TTN) gate-stream circuit simulator of Seitz et al. (Quantum 7, 964, 2023; arXiv:2206.01000). Use when the user asks to replay a circuit on a tree tensor network; build or score a TreeLayoutFinder / TreePlan (entanglement-adapted recursive spectral bisection); tune the exact 2q-gate threading + single canonical compression sweep; work on the sibling-leaf fast path, canonical single-/multi-site local_expectation (Steiner subtree), measure/reset, the BLAS thread cap, the canonical-centre tracker, the tid cache, convergence_sweep / bond_report diagnostics, or copy(); or asks why TTN truncation is more accurate than per-hop truncation, how the tree geodesic threading works, or how to add sampling / stream-wired control events. Not for MPS (pepsy.MpsOptimizer -> mps-optimizer skill), MERA (qmera-energy-optimizer), stabilizer TN (stabilizer-tensor-networks), or BP.'
+description: 'Run, review, debug, benchmark, or extend pepsy.TreeOptimizer -- the rooted tree-tensor-network (TTN) gate-stream circuit simulator of Seitz et al. (Quantum 7, 964, 2023; arXiv:2206.01000). Use when the user asks to replay a circuit on a tree tensor network; build or score a TreeLayoutFinder / TreePlan (entanglement-adapted recursive spectral bisection); handle exact product-state handoff, TTN layout safety, or Torch/CuPy backend compatibility; tune the exact 2q-gate threading + single canonical compression sweep; work on the sibling-leaf fast path, canonical single-/multi-site local_expectation (Steiner subtree), measure/reset, the BLAS thread cap, the canonical-centre tracker, the tid cache, convergence_sweep / bond_report diagnostics, or copy(); or asks why TTN truncation is more accurate than per-hop truncation, how the tree geodesic threading works, or how to add sampling / stream-wired control events. Not for MPS (pepsy.MpsOptimizer -> mps-optimizer skill), MERA (qmera-energy-optimizer), stabilizer TN (stabilizer-tensor-networks), or BP.'
 ---
 
 # Tree Optimizer in pepsy
@@ -29,6 +29,49 @@ whose leaves carry the physical qubit indices; a bundled gate stream
 (2q); supports with `len(where) >= 3` route through
 `apply_subtree_operator` (see *Multi-qubit / sub-MPO application*).
 
+Preferred public handoff:
+
+```python
+finder = TreeLayoutFinder(gate_stream, n=n, objective="congestion")
+choice = finder.recommend_arities((2, 3, 4))
+optimizer = TreeOptimizer(gate_stream, tree=choice["plan"], chi=chi)
+```
+
+Alternatively pass the finder itself with `layout=finder`. An initial
+non-product or entangled state must be passed explicitly as `state=` (alias
+`tn=`). `tree=` and `layout=` accept only `TreePlan` / `TreeLayoutFinder`; a
+`TreeTensorNetwork` passed there must raise a clear error rather than being
+silently replaced by the default `|0...0>` state.
+
+### State/layout handoff and backend contract
+
+`TreeLayoutFinder` is **circuit-only**: it accepts a gate stream or explicit
+supports, never a `TreeTensorNetwork`. Passing a TTN to it must raise a clear
+`TypeError`; construct the plan from the circuit, then pass the state separately
+to `TreeOptimizer`.
+
+- An entangled `TreeTensorNetwork` (`max_bond() > 1`) can be installed only on
+  its matching `TreePlan`. A different `tree=` / `layout=` must raise before
+  tensor work: implicit relayout would be lossy and hide a fidelity decision.
+- A product `TreeTensorNetwork` (`max_bond() == 1`) may be remounted **exactly**
+  on a requested plan; warn that its geometry changed. Preserve the product
+  vectors and any distributed global scalar/phase.
+- A bond-one Quimb `MatrixProductState` is also a geometry-neutral product input
+  and may be mounted exactly on the selected tree. Reject an entangled MPS;
+  converting it to a tree is an explicit caller-controlled operation.
+- All live state tensors must use one backend, dtype, and device.
+  `backend_info()` reports this. Reject a mixed state at construction or
+  `set_tn`, rather than choosing an arbitrary execution backend.
+- Callers should convert every gate/operator/sub-MPO/observable/cap vector with
+  the same backend converter as the state. Explicit array mismatches are
+  coerced for compatibility with a one-time `UserWarning` per source/target
+  signature; untyped Python lists/scalars are convenience inputs and are
+  materialized silently. Internal Pauli, projector, reset, and tree-MPO helper
+  tensors must be built on the state backend without warning.
+- Backend-aware contractions must stay in Autoray/Quimb. Convert only scalar
+  readouts intentionally (`to_float`); `to_dense()` intentionally returns a
+  host NumPy vector for interoperability while the live TTN remains native.
+
 ## Tree state class (`TreeTensorNetwork`)
 
 `pepsy.TreeTensorNetwork` (also `pepsy.optimizers.TreeTensorNetwork`, source
@@ -41,10 +84,11 @@ naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
 directly.
 
 - `_EXTRA_PROPS = ("_sites", "_site_tag_id", "_site_ind_id", "_plan",
-  "_node_tag_id")` -- these are copied on `.copy()`/every quimb view. The
-  `__init__` copy-branch guard `if isinstance(ts, TensorNetwork): super().
-  __init__(ts, **o); return` lets the base copy the extra props without the
-  fresh-construction defaults clobbering `_plan`.
+  "_node_tag_id", "_canonical_region")` -- these are copied on `.copy()`/
+  every quimb view. The `__init__` copy-branch guard
+  `if isinstance(ts, TensorNetwork): super().__init__(ts, **o); return` lets
+  the base copy the extra props without the fresh-construction defaults
+  clobbering `_plan`.
 - Each leaf tensor carries **both** the structural node tag `N{nid}` and the
   quimb site tag `I{q}` plus physical index `k{q}`; internal nodes carry only
   `N{nid}`. So quimb sees the leaves as the `nsites` sites and internal nodes as
@@ -70,9 +114,10 @@ directly.
   node_tag`, via optimizer `_tag`).
 - Physical index of qubit `q` = `k{q}` (`TreeTensorNetwork.site_ind`, via
   optimizer `_phys`) -- ket-leg convention. Leaves also carry site tag `I{q}`.
-- Virtual bond between adjacent nodes `u,v` = `_tb{lo}_{hi}` with `lo<hi`
-  (`TreeTensorNetwork.bond` / optimizer `_bond_name`). This deterministic name
-  lets splits keep tree-edge identity via `bond_ind=`.
+- Newly created virtual bonds between adjacent nodes `u,v` use `_tb{lo}_{hi}`
+  with `lo<hi` (`optimizer._bond_name`), but Quimb may mint UUIDs during
+  threading or canonicalisation. `TreeTensorNetwork.bond(u, v)` resolves the
+  live shared index; use it for diagnostics and readout.
 - `plan.node_path(a, b)` is the inclusive node-id geodesic (unique in a tree);
   `plan.tree_distance(qa, qb)` is the leaf-to-leaf path length.
 
@@ -92,10 +137,15 @@ telescopes to identity between bra and ket.
   the geodesic from the current centre to `node` with `canonize_between(absorb=
   "right")` per edge (lossless QR), touching only the path tensors (O(path
   length), not O(N)); it is idempotent when already centred and falls back once
-  to `canonize_around_node_` (O(N)) when the centre is unknown (`None`). This is
-  the tree analogue of quimb's MPS `shift_orthogonality_center` /
+  to `canonize_around_node_` (O(N)) only when the centre and canonical region
+  are both unknown. This is the tree analogue of quimb's MPS
+  `shift_orthogonality_center` /
   `MpsOptimizer.info_c["cur_orthog"]`.
 - `TreeOptimizer._move_center(target)` simply delegates to it.
+- When the centre is unknown but `_canonical_region` contains multiple nodes,
+  `shift_orthogonality_center` first peels that region with lossless QR and
+  then walks only the remaining path. Do not regress this regional recovery to
+  an unconditional O(N) recanonicalisation.
 - `ttn.is_canonical_form(center)` verifies the invariant directly (every
   non-centre tensor is an isometry toward the centre) — use it in tests/diagnostics.
 - A freshly built product state is **already canonical at the root** (all
@@ -187,26 +237,35 @@ covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductStat
 
 1. `snodes = _steiner_nodes(leaves)` -- minimal connected subtree spanning the
    target leaves.
-2. Move the centre onto a target leaf if it is not already inside `snodes`
-   (`_move_center(leaves[0])`, incremental) so the **whole exterior is isometric
-   toward the subtree** -- each re-split truncation then measures true state
-   error.
-3. Contract copies of all `snodes` tensors into one blob; apply `op`
-   (`op[o_0..,i_0..]`, output indices first) on the physical legs.
-4. `_peel_order(snodes)` -> peel each current subtree-leaf toward a hub with a
-   truncating SVD (`absorb="right"` -> peeled tensor isometric, norm rides into
-   the shrinking blob); the last node is the hub / new centre.
+2. Move the centre onto a target leaf (`_move_center(leaves[0])`, incremental)
+   so the **whole exterior is isometric toward the subtree** -- each local
+   truncation then measures true state error.
+3. Factor `op` into an exact tree-MPO on the same Steiner tree by packing each
+   `(output,input)` physical pair into a dimension-four leg and applying
+   leaf-to-hub SVDs.
+4. Absorb the tree-MPO into copied local state tensors. For each
+   `_peel_order(snodes)` edge, split the child message while retaining all
+   physical and exterior state legs, then contract its new state bond into the
+   parent together with the old state/operator bonds. No dense state tensor for
+   the whole Steiner subtree is formed; the last node is the hub / new centre.
 5. `renormalize=True` renormalises afterwards (for Kraus/projection).
 
-**Critical gotcha:** identify each node's kept legs from the **live tensors**,
-not from `_bond_name`. Gate application renames bonds off the deterministic
-`_tb{lo}_{hi}` scheme (quimb mints `_...` uuids in every split), so
-`_subtree_owned_inds` reads the real boundary-bond names via
-`qtn.bonds(t_u, t_w)` for exterior neighbours `w`; only the **new** peel bonds
-are (re)named with `_bond_name(u, v)` and registered on the hub-side node so a
-later peel keeps them. `apply_gate` routes `len(where) >= 3` here; `k == 1`/`k ==
-2` still take the optimised leaf-absorb / threading paths (but `k == 1`
-non-unitary and `k == 2` Kraus can be sent here explicitly).
+State bonds are always read from the live tensors because gate application can
+rename them. New state message bonds are fresh per-update names, while operator
+bonds are private to the temporary tree-MPO. `apply_gate` routes
+`len(where) >= 3` here; `k == 1`/`k == 2` still take the optimised
+leaf-absorb / threading paths (but `k == 1` non-unitary and `k == 2` Kraus
+can be sent here explicitly).
+
+### Native streamed sub-MPOs
+
+An explicit `("submpo", mpo, where)` stream event first attempts a native
+leaf-to-hub MPO message sweep. Quimb MPO payloads expose their active site
+tags, tensor map, and operator bond indices, so their virtual bonds can be
+carried through the TTN without calling `mpo.to_dense()`. `estimate_bonds()`
+uses the product of MPO bond dimensions crossing a cut as a conservative
+operator-Schmidt bound. Payloads without that interface use the dense
+`to_dense()` fallback and remain subject to `max_operator_qubits`.
 
 ## Readout
 
@@ -225,12 +284,48 @@ non-unitary and `k == 2` Kraus can be sent here explicitly).
   normalise), sample via `self.rng.choice` or force `outcome`, project with a
   one-hot `apply_1q`, then `normalize()`. Returns the outcome bit. `reset(q)` =
   `measure` then conditional `X`. `seed` in `__init__` sets `self.rng`; `copy()`
-  gets a fresh independent RNG.
-- `to_dense()` returns the statevector in `k0, k1, ..., k(n-1)` order.
-- `bond_report()` / `max_bond()` / `convergence_sweep(...)` are diagnostics.
+  derives a deterministic child seed for a fresh independent RNG.
+- Stream control events follow the MPS tuple/mapping contract for `measure`,
+  `cap`, `reset`, and `measure_reset`. Pauli measurements support product observables
+  on distinct qubits, use `+1`/`-1` eigenvalue outcomes, and append
+  `(pauli, where, outcome, probability)` to `measurements`; reset measurements
+  are internal and are not recorded. A cap contracts and removes one leaf,
+  compacts labels above it by default, and absorbs into the unique tree parent;
+  `stable_labels=True` / `compact_labels=False` preserves caller-facing labels
+  while storage remains compact. `measure_pauli` returns outcome and Born
+  probability directly; `project_pauli(..., renormalize=False)` preserves the
+  branch norm, and both can return support/span/bond/norm diagnostics.
+- `to_dense()` returns a host NumPy statevector in `k0, k1, ..., k(n-1)` order;
+  it is a readout boundary, not evidence that a Torch/CuPy live state moved.
+- `run(progbar=True)` shows a tqdm replay bar with one-/two-/multi-qubit
+  counts, current bond usage, norm, and cumulative norm-based `Icum` for
+  unitary events; control/non-unitary events reset that proxy.
+- `bond_report()` / `estimate_bonds()` / `max_bond()` /
+  `convergence_sweep(...)` are diagnostics. `estimate_bonds()` is the
+  non-mutating Eq. (4) dry run: it multiplies operator-Schmidt ranks on each
+  crossed edge and can conservatively flag a `chi` that will truncate.
+- `TreeTensorNetwork.validate()` checks the live tensor/bond structure against
+  its `TreePlan`; use `check_canonical=True` for the more expensive isometry
+  check. `TreeOptimizer.preflight(...)` adds `max_bond`,
+  `max_operator_qubits`, and `max_subtree_nodes` resource limits before replay;
+  the constructor defaults to finite dense/operator-subtree guards, and
+  `None` disables either guard. Product-Pauli measurement uses a factorized
+  parity projector rather than a dense `4**k` matrix.
   `convergence_sweep` builds the tree once and reuses it across `chi` so the
   comparison isolates truncation from layout; it reports `fidelity` (only when
   `2**n <= dense_cap`) and reference-free `max_drift`.
+- `record_history=False` disables retained per-edge and per-update history for
+  long replays. `TreeTensorNetwork` invalidates its canonical-region metadata
+  after direct Quimb mutators; use `invalidate_canonical_form()` after raw
+  tensor edits. The optimizer's state-aware wrappers restore a known centre
+  only for operations proven to preserve canonicality.
+- `truncation_report()` returns the per-edge compression / split history with
+  before/after dimensions. `track_truncation=True` additionally probes the
+  untruncated local singular spectrum and records absolute discarded weight and
+  relative discarded fraction. Leave it false on performance runs: the
+  spectrum probe adds one local SVD per truncation edge. The report's
+  gate-level `updates` group edge events by support and include cumulative
+  relative loss, analogous to the MPS infidelity trace.
 
 ## Performance / stability (do not regress)
 
@@ -247,7 +342,8 @@ non-unitary and `k == 2` Kraus can be sent here explicitly).
   rebuilt via `gate_inds_`); a stale entry just misses and is recomputed. Tensor
   ids are unique and never reused, so this is always safe.
 - `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
-  tid cache, and gets a fresh RNG.
+  tid cache, and derives a deterministic child seed for a fresh independent
+  RNG.
 
 ## Layout (TreeLayoutFinder / TreePlan)
 
@@ -262,7 +358,8 @@ leaves, minimising the geodesic a 2q gate must thread.
 - `score(plan)` uses the **pure** `pair_weights` (weighted geodesic sum, lower
   is better) -- keep it separate from the augmented partition similarity.
 - `report(plan)` compares against a naive `structure="balanced"` index-order
-  tree (`score_ratio_vs_balanced`). Quality must be `<=` balanced.
+  tree (`score_ratio_vs_balanced`). The path-objective quality layout should be
+  `<=` balanced; congestion mode is selected by edge-load cost instead.
 - `TreePlan.from_order(order, weights=, structure=, max_arity=2, community_frac=,
   star_frac=)`: `"quality"` = spectral reorder + split; `"balanced"` = split
   `order` directly (useful in tests to force sibling relationships, e.g.
@@ -276,10 +373,10 @@ builder, geometry query, `ascii_tree`, the optimizer's geodesic threading +
 sibling fast path, and `TreeSampler` loop over `plan.children[nid]` generically.
 The *only* binary-specific piece was construction. Controls:
 
-- `max_arity` (default `2`) caps children per internal node. `2` reproduces the
-  strictly-binary tree **exactly** (cut points use `floor(i*L/k)` so the 2-way
-  case matches the old `mid = L//2` bisection); larger values / `None` give
-  flatter `k`-ary trees.
+- `max_arity` defaults to the candidate search `(2, 3, 4)`; pass scalar `2` to
+  force a strictly binary tree. `2` reproduces the original binary partition
+  exactly (cut points use `floor(i*L/k)` so the 2-way case matches the old
+  `mid = L//2` bisection); larger values / `None` give flatter `k`-ary trees.
 - `structure="adaptive"` branches per strongly coupled community
   (`community_frac` of the level's strongest edge) and collapses a near-clique
   (present-strong-edge fraction `>= star_frac`) into a flat **star** node
@@ -288,10 +385,40 @@ The *only* binary-specific piece was construction. Controls:
   builds an arbitrary hand-specified tree (checks single parent, leaf/qubit
   coverage of `0..n-1`, reachability, no cycles).
 - `TreePlan.max_arity()` / `TreePlan.is_binary()` report the shape.
+- `TreeLayoutFinder.recommend_arities((2, 3, 4))` compares candidate arities
+  using path cost or the rank-aware congestion objective and reports local
+  virtual degree, edge load, and peak bond growth. `report(plan)` also exposes
+  `is_binary`, `max_arity`, and `arity_histogram`.
+- `objective="congestion"` compares interaction, congestion-aware, and
+  balanced candidates using predicted `log2` operator-Schmidt rank load on
+  each edge. `objective="path"` remains the backward-compatible default.
+- `weight_mode` accepts `count`, `auto`, `angle`, and `operator_schmidt` for
+  interaction-graph event weighting. `TreeOptimizer` exposes these as
+  `layout_objective` and `layout_weight_mode`.
+- `layered(block_size=...)` is deliberately a fixed construction: it uses the
+  spectral order but does not score block sizes or use `chi`. Prefer
+  `recommend_layered((2, 3, 4), chi=...)` for selection; when `chi` is omitted
+  it inherits the finder's configured value (pass `chi=None` to compare blind).
+  `weight_mode="operator_schmidt"` is a two-site entangling-strength proxy;
+  `objective="congestion"` performs the actual rank-per-tree-edge selection.
+- `objective="hybrid"` combines normalized weighted path, maximum edge load,
+  and total edge load using `hybrid_weights=(path, max_edge_load,
+  total_edge_load)`. It is a fixed-tree replay/runtime-and-bond-cost proxy;
+  it does not permit layout rewrites during simulation.
+- `recommend_layered` / `recommend_arities` accept `refine="greedy"` for a
+  bounded deterministic pre-simulation adjacent leaf-label swap pass. It keeps
+  parent/child topology fixed and returns planning metadata per candidate.
+  `search="nevergrad"` is a separate optional offline search, seeded and
+  budgeted per candidate, requiring `pepsy[layout]`; it starts from the
+  spectral/greedy plan and retains only objective improvements. Keep both
+  opt-in: default layout construction stays fast and reproducible.
+- Layout hot paths matter for long streams: `edge_loads` must traverse only the
+  support's Steiner subtree, and a dense gate's Schmidt-rank cache key must use
+  wire positions rather than global labels so one repeated CNOT/CZ is factored
+  once per distinct partition.
 - All these are plumbed identically through `TreeLayoutFinder`, `TreeOptimizer`,
   `TreeOptimizer.find_tree_layout`, `TreeOptimizer.convergence_sweep`, and
-  `TreeTensorNetwork.from_order`. The `TreeLayoutFinder` default is still binary
-  so existing behaviour is unchanged.
+  `TreeTensorNetwork.from_order`.
 
 ## Gotchas / teaching notes
 
@@ -305,12 +432,10 @@ The *only* binary-specific piece was construction. Controls:
 
 ## Roadmap / not yet implemented
 
-- **Sampling** (batched bitstring sampling from the canonical tree) is the next
-  natural feature and is *not* done. It should reuse the `measure` centre-on-leaf
-  Born-probability read plus conditional propagation, mirroring `MpsSampler`.
-- Stream-wired control events: `measure`/`reset` are explicit methods; the
-  `[(gate, where)]` stream does not yet carry measurement/reset event markers
-  (unlike `MpsOptimizer` control events).
+- Chain-only MPS execution modes (`svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`,
+  and `mix`) are not meaningful on arbitrary tree geometry. Opaque sub-MPO
+  payloads still use the dense recursive fallback; native replay requires the
+  Quimb MPO site interface described above.
 
 ## Validation
 
@@ -331,6 +456,8 @@ sphinx-build -W -b html docs docs/_build/html
 ```
 
 The safety-net tests are `test_tree_matches_statevector` (untruncated fidelity
-must stay exactly 1.0) and the multi-site / sibling / measurement regressions.
+must stay exactly 1.0), the multi-site / sibling / measurement regressions, and
+the state-handoff/backend cases: exact product TTN/MPS mounting, rejected
+entangled relayouts, native Torch controls/readout, and mixed-backend rejection.
 Add a regression test for every new behaviour and prefer `structure="balanced"`
 plans when a test needs deterministic sibling relationships.

@@ -17,21 +17,298 @@ The structure is not restricted to strictly-binary trees.  Internal nodes may
 have any arity: ``max_arity`` gives flatter ``k``-ary trees (shallower
 geodesics), while ``structure="adaptive"`` reads the gate-stream interaction
 graph and lets each level branch into as many children as it has strongly
-coupled communities.  Binary trees remain the default and a valid special case
-(``max_arity=2``).
+coupled communities.  By default the finder *searches* a small set of
+candidate arities (``max_arity=(2, 3, 4)``) and keeps the objective-best plan;
+pass a scalar ``max_arity=2`` to opt back into a single fixed binary tree.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from numbers import Integral
+
+import autoray as ar
+import numpy as np
+
 from ..mps.layout import (
     _gate_stream_adjacency,
+    _gate_stream_event_weights,
     _gate_stream_pair_weights,
     _gate_stream_spectral_order,
     _normalize_layout_gate_queue,
     _normalize_layout_support,
+    _normalize_weight_mode,
 )
+from ..mps.optimizer import _control_event_parts as _mps_control_event_parts
 
 __all__ = ["TreePlan", "TreeLayoutFinder"]
+
+_DEFAULT_MAX_ARITY = object()
+_DEFAULT_CHI = object()
+_DEFAULT_SEARCH_OPTION = object()
+
+
+def _looks_like_tree_tensor_network(value):
+    """Identify a TTN input without importing ``ttn`` (avoids a cycle)."""
+    return (
+        getattr(value, "plan", None) is not None
+        and getattr(value, "tensor_map", None) is not None
+    )
+
+
+def _normalize_hybrid_weights(weights):
+    """Validate path / peak-load / total-load hybrid objective weights."""
+    if weights is None:
+        values = (1.0, 1.0, 0.25)
+    elif isinstance(weights, Mapping):
+        aliases = {
+            "path": "path",
+            "max_edge_load": "max_edge_load",
+            "peak_load": "max_edge_load",
+            "total_edge_load": "total_edge_load",
+            "total_load": "total_edge_load",
+        }
+        normalized = {}
+        for key, value in weights.items():
+            name = aliases.get(str(key).replace("-", "_").strip().lower())
+            if name is None:
+                raise ValueError(
+                    "hybrid_weights keys must be 'path', 'max_edge_load', "
+                    "or 'total_edge_load'."
+                )
+            if name in normalized:
+                raise ValueError(f"duplicate hybrid weight {name!r}.")
+            normalized[name] = value
+        values = tuple(
+            normalized.get(name, 0.0)
+            for name in ("path", "max_edge_load", "total_edge_load")
+        )
+    else:
+        try:
+            values = tuple(weights)
+        except TypeError as exc:
+            raise ValueError(
+                "hybrid_weights must be a three-item sequence, mapping, or None."
+            ) from exc
+        if len(values) != 3:
+            raise ValueError(
+                "hybrid_weights must contain path, max-edge-load, and "
+                "total-edge-load weights."
+            )
+    try:
+        values = tuple(float(value) for value in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("hybrid_weights must be finite non-negative numbers.") from exc
+    if any(not np.isfinite(value) or value < 0.0 for value in values):
+        raise ValueError("hybrid_weights must be finite non-negative numbers.")
+    if not any(values):
+        raise ValueError("at least one hybrid weight must be positive.")
+    return values
+
+
+def _normalize_layout_refinement(refine):
+    """Normalize an optional deterministic fixed-plan refinement mode."""
+    if refine is None or refine is False:
+        return None
+    name = str(refine).replace("-", "_").strip().lower()
+    aliases = {
+        "adjacent": "greedy",
+        "adjacent_swaps": "greedy",
+        "local": "greedy",
+    }
+    name = aliases.get(name, name)
+    if name != "greedy":
+        raise ValueError("refine must be None or 'greedy'.")
+    return name
+
+
+def _normalize_layout_search(search):
+    """Normalize an optional offline fixed-plan search mode."""
+    if search is None or search is False:
+        return None
+    name = str(search).replace("-", "_").strip().lower()
+    aliases = {"ng": "nevergrad", "never_grad": "nevergrad"}
+    name = aliases.get(name, name)
+    if name != "nevergrad":
+        raise ValueError("search must be None or 'nevergrad'.")
+    return name
+
+
+def _validate_search_budget(value, name):
+    """Validate a positive bounded layout-search evaluation budget."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer.") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer.")
+    return value
+
+
+def _safe_exp2(value):
+    """Return ``2**value`` without emitting overflow warnings."""
+    if value > np.log2(np.finfo(float).max):
+        return float("inf")
+    return float(np.exp2(value))
+
+
+def _normalize_layout_objective(objective):
+    """Normalize the tree-layout objective name."""
+    name = str(objective).replace("-", "_").strip().lower()
+    aliases = {
+        "distance": "path",
+        "path_length": "path",
+        "edge": "congestion",
+        "edge_load": "congestion",
+        "bond": "congestion",
+        "bond_load": "congestion",
+        "combined": "hybrid",
+    }
+    name = aliases.get(name, name)
+    if name not in {"path", "congestion", "hybrid"}:
+        raise ValueError(
+            f"Unknown tree layout objective {objective!r}. "
+            "Expected 'path', 'congestion', or 'hybrid'."
+        )
+    return name
+
+
+def _operator_schmidt_rank(payload, support, left_support):
+    """Return an operator-Schmidt rank across a support bipartition."""
+    support = tuple(support)
+    left_support = tuple(left_support)
+    left_set = set(left_support)
+    if not left_set or left_set == set(support):
+        return 1
+    try:
+        array = ar.to_numpy(payload)
+    except Exception:
+        return 2
+    if array.size != 4 ** len(support):
+        return 2
+    try:
+        array = array.reshape((2,) * (2 * len(support)))
+        positions = {site: pos for pos, site in enumerate(support)}
+        left_positions = [positions[site] for site in left_support]
+        right_positions = [
+            positions[site] for site in support if site not in left_set
+        ]
+        axes = (
+            left_positions
+            + [len(support) + pos for pos in left_positions]
+            + right_positions
+            + [len(support) + pos for pos in right_positions]
+        )
+        matrix = array.transpose(axes).reshape(
+            4 ** len(left_positions),
+            4 ** len(right_positions),
+        )
+        return max(1, int(np.linalg.matrix_rank(matrix)))
+    except (TypeError, ValueError, np.linalg.LinAlgError):
+        return 2
+
+
+def _submpo_schmidt_rank_bound(payload, support, left_support):
+    """Return an MPO-bond upper bound without calling ``to_dense``.
+
+    An MPO's operator Schmidt rank across a site bipartition is bounded by the
+    product of the virtual MPO bonds crossing that bipartition.  This is a
+    conservative diagnostic, but unlike lowering an MPO to a dense matrix it
+    remains cheap for wide supports.  ``None`` means that ``payload`` does not
+    expose the Quimb MPO site interface.
+    """
+    gen_sites = getattr(payload, "gen_sites_present", None)
+    site_tag = getattr(payload, "site_tag", None)
+    tag_map = getattr(payload, "tag_map", None)
+    tensor_map = getattr(payload, "tensor_map", None)
+    if not all((callable(gen_sites), callable(site_tag),
+                tag_map is not None, tensor_map is not None)):
+        return None
+    try:
+        present = tuple(gen_sites())
+        support = tuple(support)
+        if set(present) != set(support):
+            return None
+        tensors = []
+        for site in present:
+            tids = tuple(tag_map[site_tag(site)])
+            if len(tids) != 1:
+                return None
+            tensors.append(tensor_map[tids[0]])
+        left = set(left_support)
+        if not left or left == set(support):
+            return 1
+        rank = 1
+        for left_site, right_site, left_tensor, right_tensor in zip(
+            present, present[1:], tensors, tensors[1:]
+        ):
+            if (left_site in left) == (right_site in left):
+                continue
+            shared = set(left_tensor.inds).intersection(right_tensor.inds)
+            if len(shared) != 1:
+                return None
+            rank *= int(payload.ind_size(next(iter(shared))))
+        return max(1, int(rank))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _validate_chi(chi):
+    """Coerce and validate an optional ``chi`` selection budget."""
+    if chi is None:
+        return None
+    chi = int(chi)
+    if chi < 1:
+        raise ValueError("chi must be a positive integer.")
+    return chi
+
+
+def _normalize_arity_candidates(max_arity):
+    """Return ``(representative_arity, candidates)`` from a ``max_arity`` arg.
+
+    ``max_arity`` may be a single int (a fixed arity), ``None`` (unbounded), or
+    an iterable of candidate arities to *search* (the finder default
+    ``(2, 3, 4)``).  ``candidates`` is ``None`` unless a search set was given;
+    the representative single arity is what the legacy single-plan builders use
+    and is the first concrete candidate.
+    """
+    if max_arity is None:
+        return None, None
+    if isinstance(max_arity, Integral):
+        return int(max_arity), None
+    if isinstance(max_arity, (str, bytes)):
+        return int(max_arity), None
+    if hasattr(max_arity, "__iter__"):
+        cand = []
+        for a in max_arity:
+            key = None if a is None else int(a)
+            if key is not None and key < 2:
+                raise ValueError("arity candidates must be >= 2 or None.")
+            if key not in cand:
+                cand.append(key)
+        if not cand:
+            raise ValueError("max_arity iterable must be non-empty.")
+        representative = next((a for a in cand if a is not None), None)
+        return representative, tuple(cand)
+    return int(max_arity), None
+
+
+
+def _chi_cut_fields(plan, chi):
+    """Return ``{max_bond_cut, chi_overflow, exact_at_chi}`` for ``plan``.
+
+    ``max_bond_cut`` is the widest qubit bipartition any bond induces.  With a
+    finite ``chi`` the structure can hold an arbitrary state exactly only when
+    ``2 ** max_bond_cut <= chi``; ``chi_overflow`` is how many qubits the widest
+    bond exceeds ``log2(chi)`` (0 when the structure is exact at ``chi``).
+    """
+    mbc = plan.max_bond_cut()
+    fields = {"max_bond_cut": mbc}
+    if chi is not None:
+        log_chi = float(np.log2(chi))
+        fields["chi_overflow"] = max(0.0, mbc - log_chi)
+        fields["exact_at_chi"] = mbc <= log_chi
+    return fields
 
 
 class TreePlan:
@@ -53,6 +330,7 @@ class TreePlan:
         self.qubit_of_leaf = dict(qubit_of_leaf)
         self.leaf_of_qubit = {q: nid for nid, q in self.qubit_of_leaf.items()}
         self.n = len(self.qubit_of_leaf)
+        self._path_cache = {}
 
     # -- construction ---------------------------------------------------------
 
@@ -96,6 +374,20 @@ class TreePlan:
             Maximum subsystem size for dense spectral reordering.
         """
         order = list(order)
+        if not order:
+            raise ValueError("order must contain at least one qubit.")
+        try:
+            order = [int(q) for q in order]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("order must contain integer qubit labels.") from exc
+        if sorted(order) != list(range(len(order))):
+            raise ValueError(
+                "order must be a permutation of qubit labels 0..n-1."
+            )
+        if structure not in {"quality", "balanced", "adaptive"}:
+            raise ValueError(
+                "structure must be 'quality', 'balanced', or 'adaptive'."
+            )
         if max_arity is not None:
             max_arity = int(max_arity)
             if max_arity < 2:
@@ -140,7 +432,7 @@ class TreePlan:
             the previous ``mid = len(qs) // 2`` bisection exactly.
             """
             length = len(qs)
-            k = 2 if max_arity is None else max_arity
+            k = length if max_arity is None else max_arity
             k = min(k, length)
             if k <= 1:
                 return [qs]
@@ -324,6 +616,116 @@ class TreePlan:
             )
         return cls(root, children, parent, qubit_of_leaf)
 
+    #: Fixed number of legs on the top tensor of a :meth:`build_layered` tree.
+    LAYERED_ROOT_ARITY = 3
+
+    @classmethod
+    def build_layered(cls, order, *, block_size=4):
+        """Build a fixed-structure layered tree with a ternary top tensor.
+
+        The structure is fixed; only ``block_size`` is tunable:
+
+        * **First layer** (leaf-parent "blocking" nodes): each node groups
+          ``block_size`` consecutive qubits from ``order`` into one virtual
+          bond.  This is the only choosable layer.
+        * **Middle layers**: strictly binary (two bonds in, one out).
+        * **Top tensor (root)**: always :attr:`LAYERED_ROOT_ARITY` (three)
+          children when there are at least three blocks; fewer only in the
+          degenerate small-``n`` case where three blocks do not exist.
+
+        Parameters
+        ----------
+        order : sequence of int
+            Qubit labels ``0..n-1`` in the desired spatial order.  Strongly
+            coupled qubits should be consecutive so they land in the same
+            block; use :meth:`TreeLayoutFinder.qubit_order` to obtain an
+            entanglement-adapted ordering, or
+            :meth:`TreeLayoutFinder.recommend_layered` to also search
+            ``block_size``.
+        block_size : int
+            Number of physical qubits per leaf-parent node. Default 4.
+        """
+        order = list(order)
+        if not order:
+            raise ValueError("order must be non-empty.")
+        order = [int(q) for q in order]
+        n = len(order)
+        if sorted(order) != list(range(n)):
+            raise ValueError("order must be a permutation of 0..n-1.")
+        if not isinstance(block_size, Integral):
+            raise ValueError("block_size must be an integer >= 1.")
+        block_size = int(block_size)
+        if block_size < 1:
+            raise ValueError("block_size must be >= 1.")
+
+        counter = [0]
+        children_map = {}
+        qubit_of_leaf = {}
+
+        def new_node():
+            nid = counter[0]
+            counter[0] += 1
+            return nid
+
+        # Leaves: one node per qubit in the given order.
+        leaf_ids = []
+        for q in order:
+            nid = new_node()
+            children_map[nid] = ()
+            qubit_of_leaf[nid] = q
+            leaf_ids.append(nid)
+
+        # First layer: group block_size leaves into one blocking node.
+        # A single-leaf chunk skips the parent and uses the leaf directly.
+        block_nodes = []
+        for start in range(0, n, block_size):
+            chunk = leaf_ids[start: start + block_size]
+            if len(chunk) == 1:
+                block_nodes.append(chunk[0])
+            else:
+                nid = new_node()
+                children_map[nid] = tuple(chunk)
+                block_nodes.append(nid)
+
+        # Middle layers: binary tree over block_nodes.
+        def binary_subtree(nodes):
+            if len(nodes) == 1:
+                return nodes[0]
+            mid = len(nodes) // 2
+            left = binary_subtree(nodes[:mid])
+            right = binary_subtree(nodes[mid:])
+            nid = new_node()
+            children_map[nid] = (left, right)
+            return nid
+
+        # Top tensor: fixed ternary root (or fewer only when < 3 blocks exist).
+        num_blocks = len(block_nodes)
+        if num_blocks == 1:
+            # The blocking node is already a valid root.  In particular, do
+            # not add a unary wrapper for n=1 or n <= block_size: it adds a
+            # useless bond and makes the fixed layered family less efficient.
+            return cls.from_children(
+                children_map, qubit_of_leaf, root=block_nodes[0]
+            )
+        root_arity = min(cls.LAYERED_ROOT_ARITY, num_blocks)
+        if num_blocks <= root_arity:
+            # Fewer blocks than the target arity: root takes them all directly.
+            root_nid = new_node()
+            children_map[root_nid] = tuple(block_nodes)
+        else:
+            # Split blocks into root_arity contiguous groups; each group is a
+            # binary middle subtree whose root becomes a direct child of the
+            # top tensor.
+            root_children = []
+            for i in range(root_arity):
+                start = num_blocks * i // root_arity
+                end = num_blocks * (i + 1) // root_arity
+                root_children.append(binary_subtree(block_nodes[start:end]))
+            root_nid = new_node()
+            children_map[root_nid] = tuple(root_children)
+
+        return cls.from_children(children_map, qubit_of_leaf, root=root_nid)
+
     # -- queries --------------------------------------------------------------
 
     def nodes(self):
@@ -345,10 +747,47 @@ class TreePlan:
         """Return ``True`` when every internal node has exactly two children."""
         return all(len(ch) in (0, 2) for ch in self.children.values())
 
+    def max_bond_cut(self):
+        """Return the largest qubit bipartition induced by any tree bond.
+
+        Every parent-child bond splits the qubits into the child's subtree
+        (``k`` qubits) and the rest (``n - k``).  The Schmidt rank that bond can
+        carry is bounded by ``2 ** min(k, n - k)``, so this maximum
+        ``min(k, n - k)`` over all bonds is a purely structural, ``chi``-free
+        accuracy ceiling: the tree can represent an *arbitrary* state exactly
+        only when ``chi >= 2 ** max_bond_cut``.  A structure whose
+        ``max_bond_cut`` exceeds ``log2(chi)`` must truncate at its widest bond
+        regardless of the gate stream.
+        """
+        # One post-order pass to size every subtree, then reduce over bonds.
+        visit = []
+        stack = [self.root]
+        while stack:
+            x = stack.pop()
+            visit.append(x)
+            stack.extend(self.children[x])
+        size = {}
+        for x in reversed(visit):
+            ch = self.children[x]
+            size[x] = sum(size[c] for c in ch) if ch else 1
+        best = 0
+        for x, s in size.items():
+            if x == self.root:
+                continue
+            best = max(best, min(s, self.n - s))
+        return best
+
     def node_path(self, a, b):
         """Return the node id path from node ``a`` to node ``b`` (inclusive)."""
+        if a not in self.children or b not in self.children:
+            raise ValueError(f"nodes {a!r} and {b!r} must belong to the tree")
+        cached = self._path_cache.get((a, b))
+        if cached is not None:
+            return list(cached)
         if a == b:
-            return [a]
+            result = [a]
+            self._path_cache[(a, b)] = tuple(result)
+            return result
         ancestors = []
         x = a
         while x is not None:
@@ -363,13 +802,78 @@ class TreePlan:
             if x is None:
                 raise ValueError("nodes are not in the same tree")
         lca = x
-        return ancestors[: depth[lca] + 1] + list(reversed(tail))
+        result = ancestors[: depth[lca] + 1] + list(reversed(tail))
+        self._path_cache[(a, b)] = tuple(result)
+        return result
+
+    def subtree_qubit_masks(self):
+        """Return an integer bit mask of qubits below every node.
+
+        Integer masks make repeated layout and preflight cut tests much cheaper
+        than rebuilding Python ``set`` objects for every edge. Python integers
+        remain exact for arbitrary qubit counts.
+        """
+        visit = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            visit.append(node)
+            stack.extend(self.children[node])
+        masks = {}
+        for node in reversed(visit):
+            if self.is_leaf(node):
+                masks[node] = 1 << self.qubit_of_leaf[node]
+            else:
+                mask = 0
+                for child in self.children[node]:
+                    mask |= masks[child]
+                masks[node] = mask
+        return masks
 
     def tree_distance(self, qa, qb):
         """Return the leaf-to-leaf path length between qubits ``qa`` and ``qb``."""
         la = self.leaf_of_qubit[qa]
         lb = self.leaf_of_qubit[qb]
         return len(self.node_path(la, lb)) - 1
+
+    def remove_leaf(self, q):
+        """Return a plan with qubit ``q`` capped and its unary parent removed.
+
+        The remaining logical labels are compacted in the same way as a
+        one-dimensional MPS cap: labels above ``q`` shift down by one. The
+        surviving parent node is retained when possible, which keeps tensor
+        identities stable for callers holding live node references.
+        """
+        if q not in self.leaf_of_qubit:
+            raise ValueError(f"qubit {q!r} is not present in the tree.")
+        if self.n <= 1:
+            raise ValueError("cannot remove the only qubit from a tree.")
+        leaf = self.leaf_of_qubit[q]
+        parent = self.parent.get(leaf)
+        if parent is None:
+            raise ValueError("cannot remove the root leaf from a multi-qubit tree.")
+
+        children = {node: tuple(ch) for node, ch in self.children.items()}
+        qubit_of_leaf = dict(self.qubit_of_leaf)
+        children[parent] = tuple(c for c in children[parent] if c != leaf)
+        del children[leaf]
+        del qubit_of_leaf[leaf]
+
+        # A tree node may not become unary. Keep the old parent id and absorb
+        # its only surviving child into it; this also handles a two-leaf root.
+        if len(children[parent]) == 1:
+            child = children[parent][0]
+            children[parent] = children[child]
+            del children[child]
+            if child in qubit_of_leaf:
+                qubit_of_leaf[parent] = qubit_of_leaf.pop(child)
+
+        for node, old_q in tuple(qubit_of_leaf.items()):
+            if old_q > q:
+                qubit_of_leaf[node] = old_q - 1
+        return type(self).from_children(
+            children, qubit_of_leaf, root=self.root
+        )
 
     def __repr__(self):
         n_internal = sum(1 for nid in self.nodes() if not self.is_leaf(nid))
@@ -386,7 +890,9 @@ class TreeLayoutFinder:
     ----------
     gates : bundled gate stream, optional
         ``[(gate, where), ...]`` entries.  Two-qubit ``where`` supports define
-        the weighted interaction graph.  Ignored when ``supports`` is given.
+        the weighted interaction graph. This finder does not accept a tensor
+        network state: pass that separately as ``state=`` to
+        :class:`TreeOptimizer`. Ignored when ``supports`` is given.
     n : int, optional
         Number of qubits.  Inferred from the stream when omitted.
     supports : sequence of sequences, optional
@@ -397,9 +903,17 @@ class TreeLayoutFinder:
         and ``"balanced"`` build strictly-binary trees when ``max_arity=2``;
         ``"adaptive"`` lets each level branch into its strongly coupled
         communities so the arity follows the gate connectivity.
-    max_arity : int or None
-        Maximum children per internal node (``2`` gives the binary tree; larger
-        values or ``None`` give flatter / wider trees).
+    max_arity : int, None, or iterable of ints
+        Maximum children per internal node.  A scalar builds one fixed tree
+        (``2`` gives the binary tree; larger values or ``None`` give flatter /
+        wider trees).  An iterable of candidate arities makes :meth:`run` *search*
+        them and keep the objective-best plan; this is the default
+        ``(2, 3, 4)``.  Pass a scalar to opt back into a single fixed tree.
+    chi : int, optional
+        Bond-dimension budget used to bias the default arity search toward plans
+        that stay exact at ``chi`` (see :meth:`recommend_arities`).  ``None``
+        keeps the search purely objective-driven.  :class:`TreeOptimizer`
+        forwards its own ``chi`` here automatically.
     community_frac : float
         Strong-edge fraction for ``structure="adaptive"`` (see
         :meth:`TreePlan.from_order`).
@@ -408,63 +922,1150 @@ class TreeLayoutFinder:
         (see :meth:`TreePlan.from_order`).
     dense_max : int
         Maximum subsystem size for dense spectral reordering.
+    objective : {"path", "congestion", "hybrid"}
+        Layout objective. `"path"` preserves the co-occurrence/path-length
+        heuristic; `"congestion"` selects among layout candidates using the
+        predicted operator-Schmidt load on tree edges. `"hybrid"` combines
+        normalized path, peak-edge-load, and total-edge-load costs using
+        ``hybrid_weights``.
+    hybrid_weights : mapping or sequence of three floats, optional
+        Weights for the hybrid path, maximum edge load, and total edge load.
+        The default is ``(1.0, 1.0, 0.25)``.
+    refine : {None, "greedy"}
+        Optional fixed-plan local search used by :meth:`run` and recommendation
+        methods. `"greedy"` tries adjacent leaf-label swaps before simulation;
+        it never changes a live :class:`TreeOptimizer` tree.
+    refine_budget : int, optional
+        Maximum greedy swap proposals per candidate plan. Defaults to at most
+        64 proposals when refinement is enabled.
+    search : {None, "nevergrad"}
+        Optional offline derivative-free refinement. It is never run unless
+        requested and requires the optional ``nevergrad`` package.
+    search_budget : int
+        Number of Nevergrad objective evaluations per candidate plan.
+    seed : int
+        Reproducible seed used by the optional Nevergrad stage.
+    nevergrad_optimizer : str
+        Nevergrad registry optimizer name, default ``"OnePlusOne"``.
+    weight_mode : {"count", "auto", "angle", "operator_schmidt"}
+        Event weighting used for the interaction graph. `"count"` is the
+        backward-compatible default.
     """
 
     def __init__(self, gates=None, n=None, *, supports=None, structure="quality",
-                 max_arity=2, community_frac=0.35, star_frac=0.75,
-                 dense_max=512):
+                 max_arity=(2, 3, 4), community_frac=0.35, star_frac=0.75,
+                 dense_max=512, objective="path", weight_mode="count", chi=None,
+                 max_operator_qubits=8, hybrid_weights=None, refine=None,
+                 refine_budget=None, search=None, search_budget=128, seed=0,
+                 nevergrad_optimizer="OnePlusOne"):
+        if (
+            _looks_like_tree_tensor_network(gates)
+            or _looks_like_tree_tensor_network(supports)
+        ):
+            raise TypeError(
+                "TreeLayoutFinder accepts a circuit gate stream or supports, "
+                "not a TreeTensorNetwork. Build the layout from the circuit "
+                "and pass the TTN separately as TreeOptimizer(state=...)."
+            )
         if supports is None:
-            supports = self._supports_from_gates(gates)
+            payloads, wheres, event_types = self._events_from_gates(gates)
+            supports = wheres
+        else:
+            supports = list(supports)
+            payloads = [None] * len(supports)
+            event_types = ["support"] * len(supports)
         supports = [tuple(_normalize_layout_support(s)) for s in supports]
-        self.supports = supports
-
+        self.payloads = tuple(payloads)
+        self.event_types = tuple(event_types)
         inferred = -1
         for support in supports:
             for site in support:
-                if isinstance(site, int):
+                if isinstance(site, Integral):
                     inferred = max(inferred, site)
         if n is None:
             n = inferred + 1
+        try:
+            n = int(n)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("n must be a positive integer.") from exc
         if n <= 0:
             raise ValueError(
                 "Could not infer qubit count; pass n explicitly."
             )
-        self.n = int(n)
+        normalized_supports = []
+        for support in supports:
+            if len(set(support)) != len(support):
+                raise ValueError(
+                    f"layout support contains duplicate qubits: {support!r}."
+                )
+            for site in support:
+                if not isinstance(site, Integral):
+                    raise ValueError(
+                        "tree layout supports must contain integer qubits; "
+                        f"got {site!r}."
+                    )
+                if not 0 <= int(site) < n:
+                    raise ValueError(
+                        f"layout support qubit {site!r} is outside 0..{n - 1}."
+                    )
+            normalized_supports.append(tuple(int(site) for site in support))
+        self.n = n
+        self.supports = tuple(normalized_supports)
         self.structure = structure
-        self.max_arity = None if max_arity is None else int(max_arity)
+        self.max_arity, self.arity_candidates = _normalize_arity_candidates(
+            max_arity
+        )
+        self.chi = _validate_chi(chi)
         self.community_frac = float(community_frac)
         self.star_frac = float(star_frac)
         self.dense_max = int(dense_max)
+        self.objective = _normalize_layout_objective(objective)
+        self.hybrid_weights = _normalize_hybrid_weights(hybrid_weights)
+        self.weight_mode = _normalize_weight_mode(weight_mode)
+        self.refine = _normalize_layout_refinement(refine)
+        if refine_budget is not None:
+            refine_budget = _validate_search_budget(refine_budget, "refine_budget")
+        self.refine_budget = refine_budget
+        self.search = _normalize_layout_search(search)
+        self.search_budget = _validate_search_budget(search_budget, "search_budget")
+        try:
+            self.seed = int(seed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("seed must be an integer.") from exc
+        self.nevergrad_optimizer = str(nevergrad_optimizer)
+        if not self.nevergrad_optimizer:
+            raise ValueError("nevergrad_optimizer must be a non-empty string.")
+        if max_operator_qubits is not None:
+            try:
+                max_operator_qubits = int(max_operator_qubits)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "max_operator_qubits must be a positive integer or None."
+                ) from exc
+            if max_operator_qubits < 1:
+                raise ValueError(
+                    "max_operator_qubits must be a positive integer or None."
+                )
+        self.max_operator_qubits = max_operator_qubits
+
+        # Layout search asks for the same structural quantities several times
+        # (once per candidate arity and once per diagnostic).  Keep these
+        # caches local to this immutable stream description; callers still get
+        # fresh dictionaries from the public diagnostic methods below.
+        self._plan_cache = {}
+        self._edge_load_cache = {}
+        self._schmidt_rank_cache = {}
+        self._similarity_cache = {}
+        self._congestion_weights_cache = None
+        self._balanced_plan_cache = None
 
         sites = list(range(self.n))
-        self.pair_weights = _gate_stream_pair_weights(supports, sites)
+        self.event_weights = tuple(
+            _gate_stream_event_weights(
+                self.payloads,
+                self.supports,
+                self.event_types,
+                weight_mode=self.weight_mode,
+            )
+        )
+        self.event_weights = tuple(
+            0.0 if str(event_type).lower() in {
+                "measure", "reset", "measure_reset", "cap"
+            } else weight
+            for weight, event_type in zip(self.event_weights, self.event_types)
+        )
+        self.pair_weights = _gate_stream_pair_weights(
+            supports, sites, self.event_weights
+        )
+
+    @staticmethod
+    def _events_from_gates(gates):
+        """Return payloads, supports, and event types for layout analysis."""
+        if gates is None:
+            return [], [], []
+
+        # ``_normalize_gate_entries`` intentionally accepts concrete bundled
+        # sequences, not one-shot iterators.  A gate stream is commonly a
+        # generator, and the optimizer may pass the same stream to both its
+        # queue normalizer and this finder, so materialize it exactly once at
+        # the boundary.
+        if hasattr(gates, "__next__"):
+            gates = list(gates)
+
+        # Control events carry support but are not gate entries.  Strip them
+        # before delegating ordinary entries to the MPS layout normalizer, so
+        # a mixed stream can still build an interaction-aware tree.
+        control = _mps_control_event_parts(gates)
+        if control is not None:
+            return [None], [control[2]], [control[0]]
+        if isinstance(gates, (tuple, list)):
+            if not any(
+                _mps_control_event_parts(entry) is not None
+                for entry in gates
+            ):
+                return _normalize_layout_gate_queue(gates)
+            payloads = []
+            supports = []
+            event_types = []
+            for entry in gates:
+                control = _mps_control_event_parts(entry)
+                if control is not None:
+                    payloads.append(None)
+                    supports.append(control[2])
+                    event_types.append(control[0])
+                    continue
+                one_payload, one_where, one_type = _normalize_layout_gate_queue(
+                    (entry,)
+                )
+                payloads.extend(one_payload)
+                supports.extend(one_where)
+                event_types.extend(one_type)
+            return payloads, supports, event_types
+
+        payloads, supports, event_types = _normalize_layout_gate_queue(gates)
+        return payloads, supports, event_types
 
     @staticmethod
     def _supports_from_gates(gates):
-        if gates is None:
-            return []
-        _, wheres, event_types = _normalize_layout_gate_queue(gates)
-        supports = []
-        for where, etype in zip(wheres, event_types):
-            support = _normalize_layout_support(where)
-            if len(support) >= 2:
-                supports.append(support)
-        return supports
+        """Return only multi-site supports for compatibility with old callers."""
+        _payloads, supports, _event_types = TreeLayoutFinder._events_from_gates(gates)
+        return [
+            tuple(_normalize_layout_support(support))
+            for support in supports
+            if len(_normalize_layout_support(support)) >= 2
+        ]
 
-    def run(self):
-        """Return a :class:`TreePlan` for the interaction graph."""
-        order = list(range(self.n))
-        return TreePlan.from_order(
-            order,
-            weights=self._similarity_weights(),
-            structure=self.structure,
-            max_arity=self.max_arity,
+    def _resolve_search_settings(
+        self,
+        *,
+        refine=_DEFAULT_SEARCH_OPTION,
+        refine_budget=_DEFAULT_SEARCH_OPTION,
+        search=_DEFAULT_SEARCH_OPTION,
+        search_budget=_DEFAULT_SEARCH_OPTION,
+        seed=_DEFAULT_SEARCH_OPTION,
+        nevergrad_optimizer=_DEFAULT_SEARCH_OPTION,
+    ):
+        """Resolve method overrides against finder-owned search defaults."""
+        if refine is _DEFAULT_SEARCH_OPTION:
+            refine = self.refine
+        else:
+            refine = _normalize_layout_refinement(refine)
+        if refine_budget is _DEFAULT_SEARCH_OPTION:
+            refine_budget = self.refine_budget
+        elif refine_budget is not None:
+            refine_budget = _validate_search_budget(
+                refine_budget, "refine_budget"
+            )
+        if refine is not None and refine_budget is None:
+            refine_budget = max(1, min(self.n - 1, 64))
+
+        if search is _DEFAULT_SEARCH_OPTION:
+            search = self.search
+        else:
+            search = _normalize_layout_search(search)
+        if search_budget is _DEFAULT_SEARCH_OPTION:
+            search_budget = self.search_budget
+        else:
+            search_budget = _validate_search_budget(search_budget, "search_budget")
+        if seed is _DEFAULT_SEARCH_OPTION:
+            seed = self.seed
+        else:
+            try:
+                seed = int(seed)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("seed must be an integer.") from exc
+        if nevergrad_optimizer is _DEFAULT_SEARCH_OPTION:
+            nevergrad_optimizer = self.nevergrad_optimizer
+        else:
+            nevergrad_optimizer = str(nevergrad_optimizer)
+            if not nevergrad_optimizer:
+                raise ValueError("nevergrad_optimizer must be a non-empty string.")
+        return {
+            "refine": refine,
+            "refine_budget": refine_budget,
+            "search": search,
+            "search_budget": search_budget,
+            "seed": seed,
+            "nevergrad_optimizer": nevergrad_optimizer,
+        }
+
+    @staticmethod
+    def _leaf_nodes(plan):
+        """Return the deterministic leaf-position order of a plan."""
+        return tuple(sorted(plan.qubit_of_leaf))
+
+    def _leaf_order(self, plan):
+        """Return the qubit label assigned to each deterministic leaf position."""
+        return tuple(plan.qubit_of_leaf[leaf] for leaf in self._leaf_nodes(plan))
+
+    def _plan_with_leaf_order(self, plan, order):
+        """Return ``plan``'s immutable topology with a new leaf assignment."""
+        order = tuple(int(q) for q in order)
+        if sorted(order) != list(range(self.n)):
+            raise ValueError("leaf order must be a permutation of 0..n-1.")
+        qubit_of_leaf = dict(plan.qubit_of_leaf)
+        for leaf, qubit in zip(self._leaf_nodes(plan), order):
+            qubit_of_leaf[leaf] = qubit
+        return TreePlan.from_children(
+            plan.children, qubit_of_leaf, root=plan.root
+        )
+
+    def _plan_with_leaf_swap(self, plan, left_leaf, right_leaf):
+        """Swap two labels while retaining the tree topology exactly."""
+        qubit_of_leaf = dict(plan.qubit_of_leaf)
+        qubit_of_leaf[left_leaf], qubit_of_leaf[right_leaf] = (
+            qubit_of_leaf[right_leaf],
+            qubit_of_leaf[left_leaf],
+        )
+        return TreePlan.from_children(
+            plan.children, qubit_of_leaf, root=plan.root
+        )
+
+    def _path_score_and_max(self, plan):
+        """Return the weighted interaction path sum and longest active path."""
+        score = 0.0
+        max_path = 0
+        for (qa, qb), weight in self.pair_weights.items():
+            distance = plan.tree_distance(qa, qb)
+            score += float(weight) * distance
+            max_path = max(max_path, distance)
+        return float(score), int(max_path)
+
+    def _path_score_after_leaf_swap(self, plan, left_leaf, right_leaf, score):
+        """Return the exact path-score update for a two-label leaf swap."""
+        qa = plan.qubit_of_leaf[left_leaf]
+        qb = plan.qubit_of_leaf[right_leaf]
+        change = 0.0
+        for q in range(self.n):
+            if q == qa or q == qb:
+                continue
+            weight_a = self.pair_weights.get(tuple(sorted((qa, q))), 0.0)
+            weight_b = self.pair_weights.get(tuple(sorted((qb, q))), 0.0)
+            if weight_a:
+                change += float(weight_a) * (
+                    plan.tree_distance(qb, q) - plan.tree_distance(qa, q)
+                )
+            if weight_b:
+                change += float(weight_b) * (
+                    plan.tree_distance(qa, q) - plan.tree_distance(qb, q)
+                )
+        return float(score + change)
+
+    @staticmethod
+    def _normalized_cost(value, reference):
+        """Normalize a non-negative layout metric against a fixed baseline."""
+        if reference > 0.0:
+            return float(value / reference)
+        return 0.0 if value == 0.0 else float(value)
+
+    def _hybrid_key(self, plan):
+        """Return normalized distance and rank-load cost for hybrid selection."""
+        score, max_path = self._path_score_and_max(plan)
+        loads = self.edge_loads(plan)
+        max_load = max(loads.values(), default=0.0)
+        total_load = sum(loads.values())
+
+        balanced = self._balanced_plan()
+        balanced_score, _ = self._path_score_and_max(balanced)
+        balanced_loads = self.edge_loads(balanced)
+        balanced_max_load = max(balanced_loads.values(), default=0.0)
+        balanced_total_load = sum(balanced_loads.values())
+        path_weight, max_load_weight, total_load_weight = self.hybrid_weights
+        hybrid = (
+            path_weight * self._normalized_cost(score, balanced_score)
+            + max_load_weight * self._normalized_cost(max_load, balanced_max_load)
+            + total_load_weight * self._normalized_cost(
+                total_load, balanced_total_load
+            )
+        )
+        return (
+            float(hybrid),
+            float(max_load),
+            float(total_load),
+            float(score),
+            int(max_path),
+        )
+
+    def _objective_key(self, plan):
+        """Return the selected objective's deterministic comparison key."""
+        if self.objective == "path":
+            return self._path_score_and_max(plan)
+        if self.objective == "congestion":
+            return self._congestion_key(plan)
+        return self._hybrid_key(plan)
+
+    def _selection_key(self, plan, chi):
+        """Return the objective key with the optional chi feasibility prefix."""
+        key = self._objective_key(plan)
+        if chi is not None:
+            return (_chi_cut_fields(plan, chi)["chi_overflow"],) + key
+        return key
+
+    def _selection_loss(self, plan, chi):
+        """Return a scalar surrogate for derivative-free layout search."""
+        key = self._objective_key(plan)
+        if self.objective == "path":
+            value = key[0]
+        elif self.objective == "congestion":
+            value = key[0] + 1.0e-6 * key[1] + 1.0e-12 * key[2]
+        else:
+            value = key[0]
+        if chi is not None:
+            value += 1.0e6 * _chi_cut_fields(plan, chi)["chi_overflow"]
+        return float(value)
+
+    def _discard_plan_cache(self, plan):
+        """Release diagnostics retained only for a rejected temporary plan."""
+        cached = self._edge_load_cache.get(id(plan))
+        if cached is not None and cached[0] is plan:
+            del self._edge_load_cache[id(plan)]
+
+    def _refine_plan_greedy(self, plan, *, chi, budget):
+        """Greedily improve a fixed topology through adjacent leaf swaps."""
+        initial_key = self._selection_key(plan, chi)
+        leaf_nodes = self._leaf_nodes(plan)
+        if len(leaf_nodes) < 2 or budget < 1:
+            return plan, {
+                "method": "greedy",
+                "evaluations": 0,
+                "accepted_moves": 0,
+                "initial_key": initial_key,
+                "final_key": initial_key,
+            }
+
+        current = plan
+        current_key = initial_key
+        current_path_score = self.score(current)
+        evaluations = 0
+        accepted_moves = 0
+        position = 0
+        while position < len(leaf_nodes) - 1 and evaluations < budget:
+            left_leaf = leaf_nodes[position]
+            right_leaf = leaf_nodes[position + 1]
+            evaluations += 1
+            if self.objective == "path":
+                candidate_path_score = self._path_score_after_leaf_swap(
+                    current, left_leaf, right_leaf, current_path_score
+                )
+                if candidate_path_score >= current_path_score - 1.0e-12:
+                    position += 1
+                    continue
+                candidate = self._plan_with_leaf_swap(
+                    current, left_leaf, right_leaf
+                )
+                candidate_key = self._selection_key(candidate, chi)
+            else:
+                candidate = self._plan_with_leaf_swap(
+                    current, left_leaf, right_leaf
+                )
+                candidate_key = self._selection_key(candidate, chi)
+                candidate_path_score = None
+
+            if candidate_key < current_key:
+                self._discard_plan_cache(current)
+                current = candidate
+                current_key = candidate_key
+                if candidate_path_score is None:
+                    current_path_score = self.score(current)
+                else:
+                    current_path_score = candidate_path_score
+                accepted_moves += 1
+                position = max(0, position - 1)
+            else:
+                self._discard_plan_cache(candidate)
+                position += 1
+        return current, {
+            "method": "greedy",
+            "evaluations": evaluations,
+            "accepted_moves": accepted_moves,
+            "initial_key": initial_key,
+            "final_key": current_key,
+        }
+
+    def _refine_plan_nevergrad(
+        self, plan, *, chi, budget, seed, optimizer_name
+    ):
+        """Use Nevergrad to refine a leaf assignment before simulation starts."""
+        try:
+            import nevergrad as ng
+        except ImportError as exc:
+            raise ImportError(
+                "Nevergrad tree-layout search requires the optional dependency. "
+                "Install it with `pip install pepsy[layout]`."
+            ) from exc
+
+        try:
+            optimizer_class = ng.optimizers.registry[optimizer_name]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown Nevergrad optimizer {optimizer_name!r}."
+            ) from exc
+
+        initial_plan = plan
+        initial_key = self._selection_key(initial_plan, chi)
+        initial_order = self._leaf_order(initial_plan)
+        priorities = np.empty(self.n, dtype=float)
+        for position, qubit in enumerate(initial_order):
+            priorities[qubit] = position
+        parametrization = ng.p.Array(init=priorities)
+        if hasattr(parametrization, "set_bounds"):
+            parametrization.set_bounds(-float(self.n), float(2 * self.n))
+        optimizer = optimizer_class(parametrization=parametrization, budget=budget)
+        random_state = getattr(optimizer.parametrization, "random_state", None)
+        if random_state is not None:
+            random_state.seed(seed)
+
+        losses = {}
+
+        def loss(values):
+            values = np.asarray(values)
+            order = tuple(
+                int(q) for q in np.argsort(values, kind="stable")
+            )
+            cached = losses.get(order)
+            if cached is not None:
+                return cached
+            candidate = self._plan_with_leaf_order(initial_plan, order)
+            value = self._selection_loss(candidate, chi)
+            losses[order] = value
+            self._discard_plan_cache(candidate)
+            return value
+
+        recommendation = optimizer.minimize(loss)
+        final_order = tuple(
+            int(q)
+            for q in np.argsort(np.asarray(recommendation.value), kind="stable")
+        )
+        candidate = self._plan_with_leaf_order(initial_plan, final_order)
+        candidate_key = self._selection_key(candidate, chi)
+        if candidate_key < initial_key:
+            final_plan = candidate
+            improved = True
+        else:
+            self._discard_plan_cache(candidate)
+            final_plan = initial_plan
+            improved = False
+        return final_plan, {
+            "method": "nevergrad",
+            "optimizer": optimizer_name,
+            "budget": budget,
+            "evaluations": len(losses),
+            "seed": seed,
+            "initial_key": initial_key,
+            "final_key": self._selection_key(final_plan, chi),
+            "improved": improved,
+        }
+
+    def _improve_plan(self, plan, *, chi, settings):
+        """Run the requested pre-simulation plan refinements in sequence."""
+        initial_order = self._leaf_order(plan)
+        initial_key = self._selection_key(plan, chi)
+        info = {
+            "initial_order": initial_order,
+            "initial_key": initial_key,
+            "refinement": None,
+            "search": None,
+        }
+        if settings["refine"] == "greedy":
+            plan, info["refinement"] = self._refine_plan_greedy(
+                plan, chi=chi, budget=settings["refine_budget"]
+            )
+        if settings["search"] == "nevergrad":
+            plan, info["search"] = self._refine_plan_nevergrad(
+                plan,
+                chi=chi,
+                budget=settings["search_budget"],
+                seed=settings["seed"],
+                optimizer_name=settings["nevergrad_optimizer"],
+            )
+        info["final_order"] = self._leaf_order(plan)
+        info["final_key"] = self._selection_key(plan, chi)
+        return plan, info
+
+    def _build_plan(self, weights, *, structure=None,
+                    max_arity=_DEFAULT_MAX_ARITY):
+        """Build one deterministic candidate tree from pair weights."""
+        if max_arity is _DEFAULT_MAX_ARITY:
+            max_arity = self.max_arity
+        structure = self.structure if structure is None else structure
+        key = (structure, max_arity, id(weights))
+        # ``weights`` is normally one of the finder-owned cached mappings.  The
+        # identity component avoids returning a plan built from a different
+        # caller-supplied weighting mapping with the same arity.
+        cached = self._plan_cache.get(key)
+        if cached is not None and cached[0] is weights:
+            return cached[1]
+        plan = TreePlan.from_order(
+            range(self.n),
+            weights=weights,
+            structure=structure,
+            max_arity=max_arity,
             community_frac=self.community_frac,
             star_frac=self.star_frac,
             dense_max=self.dense_max,
         )
+        self._plan_cache[key] = (weights, plan)
+        return plan
 
-    def _similarity_weights(self):
+    def _schmidt_rank(self, payload, support, left_support):
+        """Return a cached operator-Schmidt rank for layout diagnostics."""
+        if (
+            self.max_operator_qubits is not None
+            and len(support) > self.max_operator_qubits
+        ):
+            # Keep layout search bounded. This is a conservative rank proxy;
+            # callers that need exact wide-operator layout costs can opt out
+            # with max_operator_qubits=None.
+            return 2
+        # For an ordinary dense gate, its Schmidt rank depends on the operator
+        # data and *wire positions* in ``support``, not on the global qubit
+        # labels. Reusing the same CNOT/CZ/parameterized matrix across many
+        # pairs should therefore reuse the small SVD. A structured MPO carries
+        # explicit site labels, so retain its label-sensitive cache key.
+        support = tuple(support)
+        left_set = frozenset(left_support)
+        is_structured_mpo = callable(getattr(payload, "gen_sites_present", None))
+        if is_structured_mpo:
+            partition_key = left_set
+            support_key = support
+        else:
+            positions = {site: pos for pos, site in enumerate(support)}
+            partition_key = tuple(
+                positions[site] for site in support if site in left_set
+            )
+            support_key = len(support)
+        key = (id(payload), support_key, partition_key)
+        cached = self._schmidt_rank_cache.get(key)
+        if cached is not None and cached[0] is payload:
+            return cached[1]
+        rank = _submpo_schmidt_rank_bound(payload, support, left_support)
+        if rank is None:
+            rank = _operator_schmidt_rank(payload, support, left_support)
+        self._schmidt_rank_cache[key] = (payload, rank)
+        return rank
+
+    def _candidate_plans(self, max_arity):
+        """Build the candidate plans considered by the selected objective."""
+        interaction_plan = self._build_plan(self._similarity_weights())
+        if max_arity != self.max_arity:
+            interaction_plan = self._build_plan(
+                self._similarity_weights(), max_arity=max_arity
+            )
+        if self.objective == "path":
+            return {"interaction": interaction_plan}
+
+        congestion_plan = self._build_plan(
+            self._similarity_weights(self._congestion_pair_weights()),
+            max_arity=max_arity,
+        )
+        balanced_plan = self._build_plan(
+            self._similarity_weights(), structure="balanced",
+            max_arity=max_arity,
+        )
+        return {
+            "interaction": interaction_plan,
+            "congestion": congestion_plan,
+            "balanced": balanced_plan,
+        }
+
+    def _select_plan(self, max_arity):
+        """Select one plan without changing the finder's stored diagnostics."""
+        candidates = self._candidate_plans(max_arity)
+        selected = min(
+            candidates,
+            key=lambda name: self._objective_key(candidates[name]),
+        )
+        return candidates[selected]
+
+    def qubit_order(self):
+        """Return a spectral qubit ordering adapted to the gate-stream interactions.
+
+        The order is the global Fiedler spectral reordering of all qubits
+        under the similarity weights used internally by the layout finder.
+        Strongly coupled qubits end up consecutive, which is the ideal input
+        for :meth:`TreePlan.build_layered` so that blocks group entangled
+        qubits together.
+
+        Returns
+        -------
+        list of int
+            A permutation of ``0..n-1``.
+        """
+        weights = self._similarity_weights()
+        order = _gate_stream_spectral_order(
+            list(range(self.n)), weights, dense_max=self.dense_max
+        )
+        return order if order else list(range(self.n))
+
+    def layered(self, block_size=4, *, order=None):
+        """Build a fixed layered tree for a chosen ``block_size`` (no search).
+
+        This is the direct, single-``block_size`` counterpart to
+        :meth:`recommend_layered`.  It orders the qubits with the spectral
+        :meth:`qubit_order` (so strongly coupled qubits share a block) and
+        returns the :class:`TreePlan` from :meth:`TreePlan.build_layered`
+        straight away -- no candidate sweep, no wrapper dict.
+
+        ``block_size`` is a cost/accuracy knob, not something to maximize
+        blindly.  A blocking node fuses ``block_size`` physical qubits into one
+        tensor, so every intra-block correlation is represented *exactly*, but
+        that tensor has ``2 ** block_size`` physical dimension.  Larger blocks
+        are therefore more accurate at fixed ``chi`` yet exponentially more
+        expensive: pick the largest block that fits your memory budget rather
+        than searching, since a congestion search cannot see the block tensor's
+        exponential cost and simply trends toward the widest block.
+
+        Parameters
+        ----------
+        block_size : int
+            Number of physical qubits per leaf-parent (blocking) node.
+        order : sequence of int, optional
+            Qubit order fed to :meth:`TreePlan.build_layered`.  Defaults to the
+            spectral :meth:`qubit_order`.
+
+        Returns
+        -------
+        TreePlan
+            The layered plan (blocking layer, binary middle, ternary top).
+        """
+        if order is None:
+            order = self.qubit_order()
+        else:
+            order = [int(q) for q in order]
+        return TreePlan.build_layered(order, block_size=block_size)
+
+    def recommend_layered(
+        self,
+        block_sizes=(2, 3, 4),
+        *,
+        order=None,
+        chi=_DEFAULT_CHI,
+        refine=_DEFAULT_SEARCH_OPTION,
+        refine_budget=_DEFAULT_SEARCH_OPTION,
+        search=_DEFAULT_SEARCH_OPTION,
+        search_budget=_DEFAULT_SEARCH_OPTION,
+        seed=_DEFAULT_SEARCH_OPTION,
+        nevergrad_optimizer=_DEFAULT_SEARCH_OPTION,
+    ):
+        """Optimize the fixed layered structure over ``block_size``.
+
+        The structure family is fixed by :meth:`TreePlan.build_layered`
+        (a ``block_size`` blocking layer, binary middle layers, and a ternary
+        top tensor); only the blocking width is free.  This builds one layered
+        plan per candidate ``block_size`` on the entanglement-adapted qubit
+        order and returns the plan that minimizes the selected layout
+        objective, mirroring :meth:`recommend_arities`.
+
+        Parameters
+        ----------
+        block_sizes : iterable of int
+            Candidate blocking widths (physical qubits per leaf-parent node).
+        order : sequence of int, optional
+            Qubit order fed to :meth:`TreePlan.build_layered`.  Defaults to the
+            spectral :meth:`qubit_order` so strongly coupled qubits share a
+            block.
+        chi : int, optional
+            Bond-dimension budget.  The path/congestion objectives are
+            ``chi``-blind cost proxies that can favour a wider block whose
+            widest bond overflows ``chi`` (see :meth:`TreePlan.max_bond_cut`).
+            When ``chi`` is given the recommendation is made ``chi``-aware:
+            candidates are ranked first by ``chi_overflow`` (how far the widest
+            bond exceeds ``log2(chi)``), so a structure that is *exact* at
+            ``chi`` is preferred, and the layout objective only breaks ties
+            among equally-overflowing candidates.  Each candidate additionally
+            reports ``max_bond_cut``, ``chi_overflow``, and ``exact_at_chi``.
+            When omitted, uses the ``chi`` supplied to the finder; pass
+            ``chi=None`` explicitly for a chi-blind comparison.
+        refine : {None, "greedy"}, optional
+            Override the finder refinement setting. `"greedy"` performs a
+            bounded adjacent leaf-swap search on each candidate tree.
+        refine_budget : int, optional
+            Maximum greedy proposals per candidate. When omitted, an enabled
+            greedy search uses at most ``min(n - 1, 64)`` proposals.
+        search : {None, "nevergrad"}, optional
+            Override the finder offline search setting. Nevergrad optimizes
+            only the returned fixed plan; it never mutates a live TTN.
+        search_budget, seed, nevergrad_optimizer
+            Optional Nevergrad configuration for each candidate plan.
+
+        Returns
+        -------
+        dict
+            ``{"objective", "recommended_block_size", "order", "chi", "plan",
+            "candidates"}``.  Each candidate carries its ``block_size``, the
+            :class:`TreePlan`, ``max_bond_cut``, and the same structural/cost
+            summary fields as :meth:`recommend_arities`.
+        """
+        if chi is _DEFAULT_CHI:
+            chi = self.chi
+        else:
+            chi = _validate_chi(chi)
+        settings = self._resolve_search_settings(
+            refine=refine,
+            refine_budget=refine_budget,
+            search=search,
+            search_budget=search_budget,
+            seed=seed,
+            nevergrad_optimizer=nevergrad_optimizer,
+        )
+        options = []
+        for bs in block_sizes:
+            key = int(bs)
+            if key < 1:
+                raise ValueError("block_sizes must be >= 1.")
+            if key not in options:
+                options.append(key)
+        if not options:
+            raise ValueError("block_sizes must contain at least one option.")
+
+        if order is None:
+            order = self.qubit_order()
+        else:
+            order = [int(q) for q in order]
+
+        candidates = []
+        for bs in options:
+            plan = TreePlan.build_layered(order, block_size=bs)
+            plan, planning = self._improve_plan(
+                plan, chi=chi, settings=settings
+            )
+            report = self.report(
+                plan, include_edge_loads=self.objective != "path"
+            )
+            arity_histogram = {}
+            for node, children in plan.children.items():
+                if not children:
+                    continue
+                arity_histogram[len(children)] = (
+                    arity_histogram.get(len(children), 0) + 1
+                )
+            candidates.append({
+                "block_size": bs,
+                "actual_max_arity": plan.max_arity(),
+                "root_arity": len(plan.children[plan.root]),
+                "arity_histogram": arity_histogram,
+                "score": report["score"],
+                "max_path": report["max_path"],
+                "max_edge_load": report["max_edge_load"],
+                "peak_bond_growth": report["peak_bond_growth"],
+                **_chi_cut_fields(plan, chi),
+                "order": self._leaf_order(plan),
+                "planning": planning,
+                "plan": plan,
+            })
+
+        def candidate_key(candidate):
+            return self._selection_key(candidate["plan"], chi) + (
+                candidate["block_size"],
+            )
+
+        recommended = min(candidates, key=candidate_key)
+        return {
+            "objective": self.objective,
+            "recommended_block_size": recommended["block_size"],
+            "initial_order": tuple(order),
+            "order": recommended["order"],
+            "chi": chi,
+            "refine": settings["refine"],
+            "search": settings["search"],
+            "plan": recommended["plan"],
+            "candidates": candidates,
+        }
+
+    def run(self):
+        """Return a TreePlan for the selected layout objective.
+
+        When the finder was built with a set of candidate arities (the default
+        ``max_arity=(2, 3, 4)``), this searches them with
+        :meth:`recommend_arities` -- ``chi``-aware when the finder carries a
+        ``chi`` -- and returns the objective-best plan.  A scalar ``max_arity``
+        builds one fixed plan.
+        """
+        if self.arity_candidates is not None:
+            rec = self.recommend_arities(self.arity_candidates, chi=self.chi)
+            self._last_arity_recommendation = rec
+            self._selected_candidate = f"arity={rec['recommended_max_arity']}"
+            self._last_candidate_scores = {
+                f"arity={cand['max_arity']}": self._selection_key(
+                    cand["plan"], rec["chi"]
+                )
+                for cand in rec["candidates"]
+            }
+            return rec["plan"]
+        candidates = self._candidate_plans(self.max_arity)
+        settings = self._resolve_search_settings()
+        if settings["refine"] is not None or settings["search"] is not None:
+            candidates = {
+                name: self._improve_plan(plan, chi=self.chi, settings=settings)[0]
+                for name, plan in candidates.items()
+            }
+        selected = min(
+            candidates,
+            key=lambda name: self._selection_key(candidates[name], self.chi),
+        )
+        self._last_candidates = candidates
+        self._last_candidate_scores = {
+            name: self._selection_key(plan, self.chi)
+            for name, plan in candidates.items()
+        }
+        self._selected_candidate = selected
+        return candidates[selected]
+
+    def recommend_arities(
+        self,
+        max_arities=(2, 3, 4),
+        *,
+        chi=_DEFAULT_CHI,
+        refine=_DEFAULT_SEARCH_OPTION,
+        refine_budget=_DEFAULT_SEARCH_OPTION,
+        search=_DEFAULT_SEARCH_OPTION,
+        search_budget=_DEFAULT_SEARCH_OPTION,
+        seed=_DEFAULT_SEARCH_OPTION,
+        nevergrad_optimizer=_DEFAULT_SEARCH_OPTION,
+    ):
+        """Compare binary and wider trees and return the best candidate.
+
+        The returned mapping contains the recommended :class:`TreePlan` under
+        ``"plan"`` and candidate plans alongside structural/cost summaries
+        under ``"candidates"``.  Wider arities shorten paths but increase local
+        tensor degree, so the recommendation uses the selected layout
+        objective and reports both effects.
+
+        Parameters
+        ----------
+        max_arities : iterable of int or None
+            Candidate maximum arities (``2`` = binary; ``None`` = unbounded).
+        chi : int, optional
+            Bond-dimension budget.  When given, the recommendation is made
+            ``chi``-aware exactly as in :meth:`recommend_layered`: candidates
+            are ranked first by ``chi_overflow`` so a structure that stays
+            exact at ``chi`` (widest bond ``<= log2(chi)``) is preferred, and
+            the layout objective only breaks ties.  Each candidate reports
+            ``max_bond_cut``, ``chi_overflow``, and ``exact_at_chi``.
+            When omitted, uses the ``chi`` supplied to the finder; pass
+            ``chi=None`` explicitly for a chi-blind comparison.
+        refine, refine_budget, search, search_budget, seed, nevergrad_optimizer
+            Optional fixed-plan search controls with the same meaning as in
+            :meth:`recommend_layered`. They are applied to each arity candidate
+            before selecting one final immutable plan.
+        """
+        if chi is _DEFAULT_CHI:
+            chi = self.chi
+        else:
+            chi = _validate_chi(chi)
+        settings = self._resolve_search_settings(
+            refine=refine,
+            refine_budget=refine_budget,
+            search=search,
+            search_budget=search_budget,
+            seed=seed,
+            nevergrad_optimizer=nevergrad_optimizer,
+        )
+        options = []
+        for arity in max_arities:
+            if arity is None:
+                key = None
+            else:
+                key = int(arity)
+                if key < 2:
+                    raise ValueError("max_arities must be >= 2 or None.")
+            if key not in options:
+                options.append(key)
+        if not options:
+            raise ValueError("max_arities must contain at least one option.")
+
+        candidates = []
+        for arity in options:
+            plan = self._select_plan(arity)
+            plan, planning = self._improve_plan(
+                plan, chi=chi, settings=settings
+            )
+            report = self.report(
+                plan, include_edge_loads=self.objective != "path"
+            )
+            arity_histogram = {}
+            for node, children in plan.children.items():
+                if not children:
+                    continue
+                arity_histogram[len(children)] = (
+                    arity_histogram.get(len(children), 0) + 1
+                )
+            candidates.append({
+                "max_arity": arity,
+                "actual_max_arity": plan.max_arity(),
+                "is_binary": plan.is_binary(),
+                "arity_histogram": arity_histogram,
+                "max_virtual_degree": max(
+                    (
+                        len(children) + (1 if node in plan.parent else 0)
+                        for node, children in plan.children.items()
+                        if children
+                    ),
+                    default=0,
+                ),
+                "score": report["score"],
+                "max_path": report["max_path"],
+                "max_edge_load": report["max_edge_load"],
+                "peak_bond_growth": report["peak_bond_growth"],
+                **_chi_cut_fields(plan, chi),
+                "order": self._leaf_order(plan),
+                "planning": planning,
+                "plan": plan,
+            })
+
+        def candidate_key(candidate):
+            return self._selection_key(candidate["plan"], chi) + (
+                candidate["actual_max_arity"],
+            )
+
+        recommended = min(candidates, key=candidate_key)
+        return {
+            "objective": self.objective,
+            "recommended_max_arity": recommended["max_arity"],
+            "chi": chi,
+            "refine": settings["refine"],
+            "search": settings["search"],
+            "plan": recommended["plan"],
+            "candidates": candidates,
+        }
+
+    def recommend_layout(self, max_arities=(2, 3, 4), **kwargs):
+        """Alias for :meth:`recommend_arities` with a layout-oriented name."""
+        return self.recommend_arities(max_arities=max_arities, **kwargs)
+
+    def _congestion_pair_weights(self):
+        """Return pair weights proportional to gate Schmidt load."""
+        cached = getattr(self, "_congestion_weights_cache", None)
+        if cached is not None:
+            return cached
+        event_weights = []
+        for payload, support, event_type in zip(
+            self.payloads, self.supports, self.event_types
+        ):
+            if len(support) < 2 or str(event_type).lower() in {
+                "measure", "reset", "measure_reset", "cap"
+            }:
+                event_weights.append(0.0)
+                continue
+            if payload is None:
+                event_weights.append(1.0)
+                continue
+            support = tuple(dict.fromkeys(support))
+            logs = []
+            if len(support) <= 8:
+                for mask in range(1, (1 << len(support)) - 1):
+                    left = tuple(
+                        site for i, site in enumerate(support)
+                        if mask & (1 << i)
+                    )
+                    rank = self._schmidt_rank(payload, support, left)
+                    logs.append(float(np.log2(rank)))
+            else:
+                for site in support:
+                    rank = self._schmidt_rank(payload, support, (site,))
+                    logs.append(float(np.log2(rank)))
+            event_weights.append(max(logs, default=1.0))
+        self._congestion_weights_cache = _gate_stream_pair_weights(
+            self.supports,
+            range(self.n),
+            event_weights,
+        )
+        return self._congestion_weights_cache
+
+    def _subtree_qubits(self, plan):
+        """Return the qubits below each node of plan."""
+        return {
+            node: frozenset(
+                q for q in range(self.n) if mask & (1 << q)
+            )
+            for node, mask in plan.subtree_qubit_masks().items()
+        }
+
+    def edge_loads(self, plan=None):
+        """Return predicted log-bond growth for every tree edge."""
+        if plan is None:
+            plan = self.run()
+        cache_key = id(plan)
+        cached = self._edge_load_cache.get(cache_key)
+        if cached is not None and cached[0] is plan:
+            return dict(cached[1])
+        below = plan.subtree_qubit_masks()
+        loads = {
+            (parent, child): 0.0
+            for parent, children in plan.children.items()
+            for child in children
+        }
+        for payload, support, event_type in zip(
+            self.payloads, self.supports, self.event_types
+        ):
+            support = tuple(dict.fromkeys(support))
+            if len(support) < 2 or str(event_type).lower() in {
+                "measure", "reset", "measure_reset", "cap"
+            }:
+                continue
+            support_mask = 0
+            for site in support:
+                support_mask |= 1 << site
+
+            # An edge crosses the support iff it belongs to the minimal
+            # subtree spanning the support leaves. Scanning every tree edge
+            # is needlessly O(n) for each event; for the dominant two-qubit
+            # case this reduces the work to the leaf-to-leaf geodesic.
+            leaves = [plan.leaf_of_qubit[site] for site in support]
+            if len(leaves) == 2:
+                # This branch dominates ordinary circuit layout. Avoid sets
+                # and an all-node parent scan: every path hop is one crossed
+                # rooted tree edge.
+                path = plan.node_path(leaves[0], leaves[1])
+                crossed_edges = [
+                    (u, v) if plan.parent.get(v) == u else (v, u)
+                    for u, v in zip(path, path[1:])
+                ]
+            else:
+                span_nodes = set()
+                anchor = leaves[0]
+                for leaf in leaves:
+                    span_nodes.update(plan.node_path(anchor, leaf))
+                crossed_edges = [
+                    (parent, node)
+                    for node in span_nodes
+                    if (parent := plan.parent.get(node)) in span_nodes
+                ]
+
+            for edge in crossed_edges:
+                _parent, child = edge
+                left_mask = support_mask & below[child]
+                if not left_mask or left_mask == support_mask:
+                    continue
+                left = tuple(
+                    site for site in support if left_mask & (1 << site)
+                )
+                rank = (
+                    self._schmidt_rank(payload, support, left)
+                    if payload is not None else 2
+                )
+                loads[edge] += float(np.log2(rank))
+        # Retain the plan alongside its id so a future id reuse cannot return
+        # diagnostics for an unrelated short-lived plan.
+        self._edge_load_cache[cache_key] = (plan, dict(loads))
+        return dict(loads)
+
+    def _congestion_key(self, plan):
+        """Return the lexicographic key used by the load-aware objective."""
+        loads = self.edge_loads(plan)
+        values = tuple(loads.values())
+        return (
+            max(values, default=0.0),
+            sum(values),
+            self.score(plan),
+            max(
+                (plan.tree_distance(a, b) for a in range(self.n)
+                 for b in range(a + 1, self.n)),
+                default=0,
+            ),
+        )
+
+    def _similarity_weights(self, pair_weights=None):
         """Return the qubit-pair similarity of Seitz et al. (Eq. 1).
 
         ``s(qi, qj) = |G(qi) & G(qj)| + 1 / (|G(qi)| + |G(qj)|)`` where ``G(q)``
@@ -476,17 +2077,25 @@ class TreeLayoutFinder:
         subtrees when co-occurrence counts tie.  Only the bisection uses this
         augmented similarity; :meth:`score` keeps the pure interaction weight.
         """
+        if pair_weights is None:
+            pair_weights = self.pair_weights
+        cache_key = id(pair_weights)
+        cached = self._similarity_cache.get(cache_key)
+        if cached is not None and cached[0] is pair_weights:
+            return cached[1]
+
         degree = {q: 0.0 for q in range(self.n)}
         for support in self.supports:
             for site in set(support):
                 if isinstance(site, int) and 0 <= site < self.n:
                     degree[site] += 1.0
-        sim = dict(self.pair_weights)
+        sim = dict(pair_weights)
         for qi in range(self.n):
             for qj in range(qi + 1, self.n):
                 deg = degree[qi] + degree[qj]
                 if deg > 0.0:
                     sim[(qi, qj)] = sim.get((qi, qj), 0.0) + 1.0 / deg
+        self._similarity_cache[cache_key] = (pair_weights, sim)
         return sim
 
     def score(self, plan):
@@ -495,12 +2104,17 @@ class TreeLayoutFinder:
         Lower is better: this is the quantity the tree structure minimises
         (short leaf-to-leaf paths for strongly coupled qubits).
         """
-        total = 0.0
-        for (qa, qb), weight in self.pair_weights.items():
-            total += float(weight) * plan.tree_distance(qa, qb)
-        return total
+        return self._path_score_and_max(plan)[0]
 
-    def report(self, plan=None):
+    def _balanced_plan(self):
+        """Return the cached index-order balanced comparison plan."""
+        if self._balanced_plan_cache is None:
+            self._balanced_plan_cache = TreePlan.from_order(
+                range(self.n), structure="balanced"
+            )
+        return self._balanced_plan_cache
+
+    def report(self, plan=None, *, include_edge_loads=True):
         """Return layout-quality diagnostics for ``plan`` (or a fresh run).
 
         The dominant lever for tree-tensor-network accuracy at fixed ``chi`` is
@@ -522,11 +2136,46 @@ class TreeLayoutFinder:
             weighted_sum += float(weight) * d
             total_weight += float(weight)
         n_pairs = len(dists)
-        balanced = TreePlan.from_order(range(self.n), structure="balanced")
+        balanced = self._balanced_plan()
         balanced_score = self.score(balanced)
+        if include_edge_loads:
+            loads = self.edge_loads(plan)
+            balanced_loads = self.edge_loads(balanced)
+        else:
+            loads = None
+            balanced_loads = None
+        max_load = max(loads.values(), default=0.0) if loads is not None else None
+        total_load = sum(loads.values()) if loads is not None else None
+        balanced_max_load = (
+            max(balanced_loads.values(), default=0.0)
+            if balanced_loads is not None else None
+        )
+        balanced_total_load = (
+            sum(balanced_loads.values())
+            if balanced_loads is not None else None
+        )
+        hybrid_cost = None
+        if self.objective == "hybrid" and loads is not None:
+            hybrid_cost = self._hybrid_key(plan)[0]
+        arity_histogram = {}
+        for node, children in plan.children.items():
+            if children:
+                arity_histogram[len(children)] = (
+                    arity_histogram.get(len(children), 0) + 1
+                )
         return {
             "n_qubits": self.n,
             "n_interacting_pairs": n_pairs,
+            "objective": self.objective,
+            "weight_mode": self.weight_mode,
+            "hybrid_weights": (
+                self.hybrid_weights if self.objective == "hybrid" else None
+            ),
+            "hybrid_cost": hybrid_cost,
+            "root": plan.root,
+            "is_binary": plan.is_binary(),
+            "max_arity": plan.max_arity(),
+            "arity_histogram": arity_histogram,
             "score": float(weighted_sum),
             "max_path": int(max(dists)) if dists else 0,
             "mean_path": float(sum(dists) / n_pairs) if n_pairs else 0.0,
@@ -537,4 +2186,31 @@ class TreeLayoutFinder:
             "score_ratio_vs_balanced": (
                 float(weighted_sum / balanced_score) if balanced_score else 0.0
             ),
+            "edge_loads": loads,
+            "total_edge_load": float(total_load) if total_load is not None else None,
+            "max_edge_load": float(max_load) if max_load is not None else None,
+            "peak_bond_growth": (
+                _safe_exp2(max_load) if max_load is not None else None
+            ),
+            "balanced_max_edge_load": (
+                float(balanced_max_load)
+                if balanced_max_load is not None else None
+            ),
+            "balanced_total_edge_load": (
+                float(balanced_total_load)
+                if balanced_total_load is not None else None
+            ),
+            "balanced_peak_bond_growth": (
+                _safe_exp2(balanced_max_load)
+                if balanced_max_load is not None else None
+            ),
+            "peak_bond_growth_log2": (
+                float(max_load) if max_load is not None else None
+            ),
+            "balanced_peak_bond_growth_log2": (
+                float(balanced_max_load)
+                if balanced_max_load is not None else None
+            ),
+            "selected_candidate": getattr(self, "_selected_candidate", "interaction"),
+            "candidate_scores": getattr(self, "_last_candidate_scores", {}),
         }

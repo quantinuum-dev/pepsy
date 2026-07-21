@@ -31,14 +31,64 @@ MPS.
 
 from __future__ import annotations
 
+import re
+
+import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
-from quimb.tensor import TensorNetworkGenVector
 from quimb.tensor.tensor_core import TensorNetwork
+from numbers import Integral
 
 from .layout import TreePlan
 
 __all__ = ["TreeTensorNetwork"]
+
+
+try:  # quimb renamed/removed this generic-vector base across releases.
+    from quimb.tensor import TensorNetworkGenVector
+except ImportError:  # pragma: no cover - exercised with older quimb releases
+    class TensorNetworkGenVector(TensorNetwork):
+        """Small compatibility base for quimb versions without GenVector."""
+
+        @property
+        def nsites(self):
+            return len(getattr(self, "_sites", ()))
+
+        @property
+        def sites(self):
+            return tuple(getattr(self, "_sites", ()))
+
+        @property
+        def site_ind_id(self):
+            return self._site_ind_id
+
+        @property
+        def site_tag_id(self):
+            return self._site_tag_id
+
+        def site_ind(self, site):
+            return self._site_ind_id.format(site)
+
+        def site_tag(self, site):
+            return self._site_tag_id.format(site)
+
+        def local_expectation(self, operator, where, *, optimize="auto-hq", **kwargs):
+            """Evaluate a local expectation using a generic TN contraction."""
+            if isinstance(where, Integral):
+                where = (int(where),)
+            else:
+                where = tuple(where)
+            operated = qtn.tensor_network_gate_inds(
+                self,
+                operator,
+                [self.site_ind(site) for site in where],
+                contract=False,
+                inplace=False,
+                tags=[],
+            )
+            numerator = (self.H | operated).contract(all, optimize=optimize)
+            denominator = (self.H | self).contract(all, optimize=optimize)
+            return numerator / denominator
 
 
 def _bond_index(a, b):
@@ -47,11 +97,46 @@ def _bond_index(a, b):
     return f"_tb{lo}_{hi}"
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(s):
+    """Length of ``s`` ignoring any ANSI colour escape sequences."""
+    return len(_ANSI_RE.sub("", s))
+
+
 def _ascii_place(s, width, col):
-    """Return ``s`` padded to ``width`` with its centre aligned at column ``col``."""
-    start = col - (len(s) - 1) // 2
-    start = max(0, min(start, width - len(s)))
-    return " " * start + s + " " * (width - start - len(s))
+    """Return ``s`` padded to ``width`` with its centre aligned at column ``col``.
+
+    ANSI-colour aware: the padding is computed from the *visible* length so that
+    embedded colour escapes never shift the drawing.
+    """
+    vis = _visible_len(s)
+    start = col - (vis - 1) // 2
+    start = max(0, min(start, width - vis))
+    return " " * start + s + " " * (width - start - vis)
+
+
+# Depth-cycled palette for the internal-node markers, a distinct leaf colour,
+# and a dim style for the bond numbers / connector lines so the coloured nodes
+# stand out.  256-colour SGR codes (rendered by VS Code notebooks and modern
+# terminals); on a mono terminal they degrade to plain text.
+_LAYER_COLORS = (
+    "\x1b[1;38;5;213m",  # root  -> bright magenta / pink
+    "\x1b[1;38;5;45m",   #          bright cyan
+    "\x1b[1;38;5;82m",   #          bright green
+    "\x1b[1;38;5;220m",  #          gold
+    "\x1b[1;38;5;208m",  #          orange
+    "\x1b[1;38;5;99m",   #          violet
+)
+_LEAF_COLOR = "\x1b[1;38;5;39m"   # leaves (◆) -> strong blue
+_DIM_STYLE = "\x1b[38;5;244m"     # bond dims + connectors -> grey
+_RESET = "\x1b[0m"
+
+
+def _color(s, code, enable):
+    """Wrap ``s`` in the SGR ``code`` when ``enable`` is set, else return ``s``."""
+    return f"{code}{s}{_RESET}" if enable and code else s
 
 
 
@@ -99,6 +184,28 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         # avoids clobbering them with the fresh-construction defaults below.
         if isinstance(ts, TensorNetwork):
             super().__init__(ts, **tn_opts)
+            if isinstance(ts, TreeTensorNetwork):
+                if plan is not None and (
+                    plan.root != ts.plan.root
+                    or plan.children != ts.plan.children
+                    or plan.qubit_of_leaf != ts.plan.qubit_of_leaf
+                ):
+                    raise ValueError(
+                        "plan does not match the TreeTensorNetwork being copied."
+                    )
+                return
+            if plan is None:
+                raise TypeError(
+                    "casting a plain TensorNetwork to TreeTensorNetwork requires "
+                    "an explicit TreePlan."
+                )
+            self._plan = plan
+            self._sites = tuple(range(plan.n)) if sites is None else tuple(sites)
+            self._site_tag_id = site_tag_id
+            self._site_ind_id = site_ind_id
+            self._node_tag_id = node_tag_id
+            self._canonical_region = None
+            self.validate()
             return
         super().__init__(ts, **tn_opts)
         if plan is None:
@@ -115,6 +222,47 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         # Tracked here -- surviving ``.copy()`` via ``_EXTRA_PROPS`` -- so the
         # canonical form is a property of the *state*, not of any one driver.
         self._canonical_region = None
+
+    # -- mutation / canonical metadata --------------------------------------
+
+    def invalidate_canonical_form(self):
+        """Forget the tracked canonical region after an unmanaged mutation.
+
+        Quimb exposes mutating tensor-network methods and tensors themselves
+        can be modified in place. The TTN cannot intercept every such mutation,
+        so direct callers should use this method after changing tensor data
+        outside the state-aware wrappers below.
+        """
+        self._canonical_region = None
+        return self
+
+    def _invalidate_after_mutation(self, result):
+        self._canonical_region = None
+        return result
+
+    def gate_inds_(self, *args, **kwargs):
+        """Apply a Quimb gate and invalidate canonical metadata."""
+        return self._invalidate_after_mutation(
+            super().gate_inds_(*args, **kwargs)
+        )
+
+    def canonize_between(self, *args, **kwargs):
+        """Canonicalize through Quimb and invalidate the tracked centre."""
+        return self._invalidate_after_mutation(
+            super().canonize_between(*args, **kwargs)
+        )
+
+    def compress_between(self, *args, **kwargs):
+        """Compress through Quimb and invalidate the tracked centre."""
+        return self._invalidate_after_mutation(
+            super().compress_between(*args, **kwargs)
+        )
+
+    def canonize_around_(self, *args, **kwargs):
+        """Canonicalize around tags through Quimb and invalidate metadata."""
+        return self._invalidate_after_mutation(
+            super().canonize_around_(*args, **kwargs)
+        )
 
     # -- geometry / naming ----------------------------------------------------
 
@@ -225,10 +373,153 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self.tensor_map[self.node_tid(nid)]
 
     def bond(self, a, b):
-        """Return the shared virtual-bond index name for adjacent nodes ``a``/``b``."""
+        """Return the live shared virtual-bond index for adjacent nodes."""
         if b not in self.neighbors(a):
             raise ValueError(f"nodes {a} and {b} are not adjacent in the tree.")
-        return _bond_index(a, b)
+        shared = qtn.bonds(self.node_tensor(a), self.node_tensor(b))
+        if len(shared) != 1:
+            raise ValueError(
+                f"nodes {a} and {b} must share exactly one bond; "
+                f"found {sorted(shared)}."
+            )
+        return next(iter(shared))
+
+    def validate(self, *, check_canonical=False, tol=1e-9):
+        """Validate the live network against its :class:`TreePlan`.
+
+        The check is intentionally structural by default and therefore cheap
+        enough for construction and resource-preflight paths.  It verifies that
+        every planned node has exactly one tensor, every leaf owns exactly one
+        physical index, every plan edge has exactly one live bond, and there are
+        no extra tensors or malformed shared indices.  Pass
+        ``check_canonical=True`` to additionally verify the tracked canonical
+        region; that part performs tensor contractions and is more expensive.
+
+        Raises
+        ------
+        ValueError
+            If the plan and live tensor network disagree.  The message names
+            the first invariant that failed.  Returns ``self`` when valid.
+        """
+        plan_nodes = tuple(self._plan.nodes())
+        plan_node_set = set(plan_nodes)
+        node_tids = {}
+        for nid in plan_nodes:
+            tag = self.node_tag(nid)
+            tids = set(self.tag_map.get(tag, ()))
+            if len(tids) != 1:
+                raise ValueError(
+                    f"tree node {nid} must have exactly one tensor tagged "
+                    f"{tag!r}; found {len(tids)}."
+                )
+            node_tids[nid] = next(iter(tids))
+
+        live_tids = set(self.tensor_map)
+        if set(node_tids.values()) != live_tids:
+            extra = live_tids - set(node_tids.values())
+            missing = set(node_tids.values()) - live_tids
+            raise ValueError(
+                "TreeTensorNetwork tensor set disagrees with TreePlan "
+                f"(extra={sorted(extra)!r}, missing={sorted(missing)!r})."
+            )
+
+        physical_inds = {self.site_ind(q) for q in range(self._plan.n)}
+        owners = {ind: [] for ind in physical_inds}
+        for nid, tid in node_tids.items():
+            tensor = self.tensor_map[tid]
+            node_phys = physical_inds.intersection(tensor.inds)
+            if self._plan.is_leaf(nid):
+                q = self._plan.qubit_of_leaf[nid]
+                expected = self.site_ind(q)
+                if expected not in tensor.inds:
+                    raise ValueError(
+                        f"leaf node {nid} (qubit {q}) is missing physical "
+                        f"index {expected!r}."
+                    )
+                if len(node_phys) != 1 or expected not in node_phys:
+                    raise ValueError(
+                        f"leaf node {nid} must own only physical index "
+                        f"{expected!r}; found {sorted(node_phys)!r}."
+                    )
+                if self.site_tag(q) not in tensor.tags:
+                    raise ValueError(
+                        f"leaf node {nid} is missing site tag {self.site_tag(q)!r}."
+                    )
+            elif node_phys:
+                raise ValueError(
+                    f"internal node {nid} unexpectedly carries physical "
+                    f"indices {sorted(node_phys)!r}."
+                )
+            for ind in node_phys:
+                owners[ind].append(nid)
+
+        for ind, ind_owners in owners.items():
+            if len(ind_owners) != 1:
+                raise ValueError(
+                    f"physical index {ind!r} must belong to one leaf; "
+                    f"found nodes {ind_owners!r}."
+                )
+
+        expected_edges = {
+            frozenset((parent, child))
+            for parent, children in self._plan.children.items()
+            for child in children
+        }
+        edge_bonds = {}
+        for parent, children in self._plan.children.items():
+            for child in children:
+                shared = qtn.bonds(
+                    self.tensor_map[node_tids[parent]],
+                    self.tensor_map[node_tids[child]],
+                )
+                if len(shared) != 1:
+                    raise ValueError(
+                        f"tree edge ({parent}, {child}) must have exactly one "
+                        f"live bond; found {sorted(shared)!r}."
+                    )
+                edge_bonds[frozenset((parent, child))] = next(iter(shared))
+
+        actual_inner = set(self.inner_inds())
+        if actual_inner != set(edge_bonds.values()):
+            raise ValueError(
+                "live internal indices do not match the TreePlan edges "
+                f"(extra={sorted(actual_inner - set(edge_bonds.values()))!r}, "
+                f"missing={sorted(set(edge_bonds.values()) - actual_inner)!r})."
+            )
+        tid_to_node = {tid: nid for nid, tid in node_tids.items()}
+        for ind in actual_inner:
+            tids = set(self.ind_map.get(ind, ()))
+            if len(tids) != 2:
+                raise ValueError(
+                    f"internal index {ind!r} must occur on two tensors; "
+                    f"found {len(tids)}."
+                )
+            owners = frozenset(tid_to_node[tid] for tid in tids)
+            if owners not in expected_edges:
+                raise ValueError(
+                    f"internal index {ind!r} joins non-adjacent nodes "
+                    f"{sorted(owners)!r}."
+                )
+            if int(self.ind_size(ind)) < 1:
+                raise ValueError(
+                    f"internal index {ind!r} has invalid dimension "
+                    f"{self.ind_size(ind)!r}."
+                )
+
+        region = self.canonical_region
+        if region is not None:
+            if not set(region).issubset(plan_node_set):
+                raise ValueError(
+                    f"canonical region contains unknown nodes "
+                    f"{sorted(set(region) - plan_node_set)!r}."
+                )
+            if self._validated_region(region) != region:
+                raise ValueError("canonical region is not a connected subtree.")
+            if check_canonical and not self.is_subtree_canonical_form(
+                region, tol=tol
+            ):
+                raise ValueError("tracked canonical region failed the isometry check.")
+        return self
 
     # -- plan delegators ------------------------------------------------------
 
@@ -276,6 +567,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         connected subtree (Steiner tree) that contains all of them.
         """
         leaves = list(leaves)
+        if not leaves:
+            raise ValueError("need at least one leaf to span a subtree.")
+        for leaf in leaves:
+            if leaf not in self._plan.children:
+                raise ValueError(f"{leaf!r} is not a node of the tree.")
         root_leaf = leaves[0]
         nodes = set()
         for lf in leaves:
@@ -335,7 +631,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
     # -- edge-level canonical / compression helpers ---------------------------
 
-    def _track_edge_center(self, a, b, absorb):
+    def _track_edge_center(self, a, b, absorb, *, previous=None):
         """Update the tracked centre after a gauge move across edge ``a -> b``.
 
         A single ``absorb="right"`` move makes ``a`` isometric and pushes the
@@ -344,7 +640,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         longer the global centre after a lone edge move, so it is set to
         ``None`` (unknown) rather than left lying about the canonical form.
         """
-        cur = self.orthogonality_center
+        cur = self.orthogonality_center if previous is None else previous
         if absorb == "right" and cur == a:
             self._canonical_region = frozenset({b})
         elif absorb == "left" and cur == b:
@@ -360,8 +656,15 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         isometric and pushes the orthogonality centre onto node ``b``.  The
         tracked :attr:`orthogonality_center` is advanced accordingly.
         """
-        self.canonize_between(self.node_tag(a), self.node_tag(b), absorb=absorb)
-        self._track_edge_center(a, b, absorb)
+        previous = self.orthogonality_center
+        self.canonize_between(
+            self.node_tag(a),
+            self.node_tag(b),
+            absorb=absorb,
+            method="qr",
+            cutoff=0.0,
+        )
+        self._track_edge_center(a, b, absorb, previous=previous)
         return self
 
     def compress_edge_(self, a, b, *, max_bond=None, cutoff=1e-12,
@@ -373,6 +676,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         to node tags.  The tracked :attr:`orthogonality_center` is advanced as
         for :meth:`canonize_edge_` (compression moves the gauge the same way).
         """
+        previous = self.orthogonality_center
         self.compress_between(
             self.node_tag(a),
             self.node_tag(b),
@@ -380,7 +684,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             cutoff=cutoff,
             absorb=absorb,
         )
-        self._track_edge_center(a, b, absorb)
+        self._track_edge_center(a, b, absorb, previous=previous)
         return self
 
     def canonize_around_node_(self, nid):
@@ -415,7 +719,13 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """
         region = self._validated_region(nodes, span=span)
         tags = [self.node_tag(n) for n in region]
-        self.canonize_around_(tags, which="any", absorb=absorb)
+        self.canonize_around_(
+            tags,
+            which="any",
+            absorb=absorb,
+            method="qr",
+            cutoff=0.0,
+        )
         self._canonical_region = region
         return self
 
@@ -428,8 +738,56 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         those qubits is captured by that subtree.  Equivalent to
         ``canonize_subtree_(leaves_of(qubits), span=True)``.  Returns ``self``.
         """
+        if isinstance(qubits, Integral):
+            qubits = (qubits,)
         leaves = [self.leaf_of_qubit(q) for q in qubits]
         return self.canonize_subtree_(leaves, span=True, absorb=absorb)
+
+    def _recover_center_from_region(self, region, target, *, absorb="right"):
+        """Recover one centre by peeling a tracked canonical region.
+
+        A multi-node canonical region already has every exterior branch
+        pointing inward. Peeling the region's leaves toward ``target`` with
+        lossless QR therefore establishes a single centre without touching
+        tensors outside the region.
+        """
+        region = set(region)
+        if target not in region:
+            raise ValueError("target centre must lie inside the canonical region.")
+        if absorb not in {"right", "left"}:
+            raise ValueError("absorb must be 'right' or 'left'.")
+
+        remaining = set(region)
+        while len(remaining) > 1:
+            candidates = [
+                node for node in remaining
+                if node != target
+                and sum(
+                    neighbour in remaining
+                    for neighbour in self.neighbors(node)
+                ) == 1
+            ]
+            if not candidates:
+                raise ValueError(
+                    "canonical region is not a connected tree containing target."
+                )
+            # The region is a tree, so any non-target leaf can be peeled.
+            # Sorting keeps the QR sequence deterministic across set order.
+            node = min(candidates)
+            neighbour = next(
+                neighbour
+                for neighbour in self.neighbors(node)
+                if neighbour in remaining
+            )
+            if absorb == "right":
+                a, b = node, neighbour
+            else:
+                a, b = neighbour, node
+            self.canonize_edge_(a, b, absorb=absorb)
+            remaining.remove(node)
+
+        self._canonical_region = frozenset({target})
+        return self
 
     def shift_orthogonality_center(self, new, *, absorb="right"):
         """Move the tracked orthogonality centre to node ``new`` in place.
@@ -441,9 +799,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         on that path are touched, so a nearby move is O(path length), not O(N).
 
         * If the centre is already ``new`` this is a no-op (idempotent).
-        * If the centre is currently unknown (``None``) it falls back once to the
-          O(N) :meth:`canonize_around_node_`, then subsequent moves are
-          incremental.
+        * If the centre is unknown but a multi-node canonical region is tracked,
+          only that region is QR-canonicalised first. Otherwise it falls back
+          once to the O(N) :meth:`canonize_around_node_`.
 
         Returns ``self`` so moves can be chained.
         """
@@ -453,11 +811,33 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         if cur == new:
             return self
         if cur is None:
-            return self.canonize_around_node_(new)
+            region = self.canonical_region
+            if region:
+                if new in region:
+                    return self._recover_center_from_region(
+                        region, new, absorb=absorb
+                    )
+                entry = min(
+                    region,
+                    key=lambda node: len(self._plan.node_path(node, new)),
+                )
+                self._recover_center_from_region(
+                    region, entry, absorb=absorb
+                )
+                cur = entry
+            else:
+                return self.canonize_around_node_(new)
         path = self._plan.node_path(cur, new)
         for u, v in zip(path, path[1:]):
-            self.canonize_between(self.node_tag(u), self.node_tag(v),
-                                  absorb=absorb)
+            if absorb == "right":
+                a, b = u, v
+            elif absorb == "left":
+                # ``absorb='left'`` centres the first tag. Reverse the edge
+                # orientation so that the target ``v`` receives the factor.
+                a, b = v, u
+            else:
+                raise ValueError("absorb must be 'right' or 'left'.")
+            self.canonize_edge_(a, b, absorb=absorb)
         self._canonical_region = frozenset({new})
         return self
 
@@ -504,9 +884,99 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             tc = t.H.reindex({bond: bond + "*"})
             prod = qtn.tensor_contract(t, tc, output_inds=[bond, bond + "*"])
             d = int(prod.shape[0])
-            if not np.allclose(np.asarray(prod.data), np.eye(d), atol=tol):
+            if not np.allclose(ar.to_numpy(prod.data), np.eye(d), atol=tol):
                 return False
         return True
+
+    def cap_qubit_(self, q, vec):
+        """Contract qubit ``q`` with ``vec`` and remove that leaf in place.
+
+        This is the tree counterpart of an MPS physical-index cap. The capped
+        leaf is absorbed into its parent; if that creates a unary parent, the
+        parent and its remaining child are fused. Remaining qubit labels are
+        compacted above ``q`` so subsequent stream entries retain MPS-style
+        positional semantics.
+        """
+        q = int(q)
+        if q not in self._plan.leaf_of_qubit:
+            raise ValueError(f"cap qubit {q} is outside the tree state.")
+        if self._plan.n <= 1:
+            raise ValueError("cannot cap the only qubit in a tree state.")
+        leaf = self._plan.leaf_of_qubit[q]
+        parent = self._plan.parent.get(leaf)
+        if parent is None:
+            raise ValueError("cannot cap the root leaf of a multi-qubit tree.")
+        like = self.node_tensor(leaf).data
+        try:
+            compatible = (
+                ar.infer_backend(vec) == ar.infer_backend(like)
+                and ar.get_dtype_name(vec) == ar.get_dtype_name(like)
+                and str(getattr(vec, "device", None))
+                == str(getattr(like, "device", None))
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            compatible = False
+        if not compatible:
+            vec = ar.do("array", vec, like=like)
+        vec = ar.do("reshape", vec, (-1,))
+        phys = self.site_ind(q)
+        if int(ar.shape(vec)[0]) != int(self.ind_size(phys)):
+            raise ValueError(
+                f"cap vector length {ar.shape(vec)[0]} does not match the "
+                f"physical dimension {self.ind_size(phys)} of qubit {q}."
+            )
+
+        # Put the absorbing parent at the centre before contraction, so the
+        # remaining state stays canonical without a full-tree rescan.
+        self.shift_orthogonality_center(parent)
+        self._canonical_region = None
+        leaf_t = self.node_tensor(leaf).copy()
+        parent_t = self.node_tensor(parent).copy()
+        cap_t = qtn.Tensor(vec, inds=(phys,))
+        leaf_message = qtn.tensor_contract(leaf_t, cap_t)
+        merged = qtn.tensor_contract(parent_t, leaf_message)
+
+        collapse = len(self._plan.children[parent]) == 2
+        child = None
+        tags = set(parent_t.tags)
+        if collapse:
+            child = next(c for c in self._plan.children[parent] if c != leaf)
+            child_t = self.node_tensor(child).copy()
+            merged = qtn.tensor_contract(merged, child_t)
+            tags.update(set(child_t.tags) - {self.node_tag(child)})
+        tags.discard(self.node_tag(leaf))
+        tags.add(self.node_tag(parent))
+
+        self.delete(self.node_tag(leaf))
+        if child is not None:
+            self.delete(self.node_tag(child))
+        live_parent = self.node_tensor(parent)
+        live_parent.modify(data=merged.data, inds=merged.inds, tags=tags)
+
+        # Compact physical indices and site tags with temporary names to avoid
+        # collisions when k(q+1) is renamed to the removed kq.
+        old_n = self._plan.n
+        temp_inds = {
+            old: f"_ttn_cap_ind_{old}" for old in range(q + 1, old_n)
+        }
+        temp_tags = {
+            old: f"_ttn_cap_tag_{old}" for old in range(q + 1, old_n)
+        }
+        if temp_inds:
+            self.reindex_({self.site_ind(old): temp for old, temp in temp_inds.items()})
+        if temp_tags:
+            self.retag_({self.site_tag(old): temp for old, temp in temp_tags.items()})
+        if temp_inds:
+            self.reindex_({temp: self.site_ind(old - 1) for old, temp in temp_inds.items()})
+        if temp_tags:
+            self.retag_({temp: self.site_tag(old - 1) for old, temp in temp_tags.items()})
+
+        self._plan = self._plan.remove_leaf(q)
+        self._sites = tuple(range(self._plan.n))
+        self.__dict__.pop("_node_tid_cache", None)
+        self._canonical_region = frozenset({parent})
+        self.validate()
+        return self
 
     # -- dense read-out -------------------------------------------------------
 
@@ -521,16 +991,19 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         if order is None:
             order = range(self._plan.n)
         out_inds = [self.site_ind(q) for q in order]
-        return np.asarray(self.to_dense(out_inds)).reshape(-1)
+        return ar.to_numpy(self.to_dense(out_inds)).reshape(-1)
 
     # -- ascii drawing --------------------------------------------------------
 
     def _bond_dim(self, a, b):
         """Return the virtual-bond dimension of the tree edge ``(a, b)`` (1 if absent)."""
-        ix = _bond_index(a, b)
+        try:
+            ix = self.bond(a, b)
+        except ValueError:
+            return 1
         return int(self.ind_size(ix)) if ix in self.ind_map else 1
 
-    def ascii_tree(self, *, bond_dims=True, node_ids=False):
+    def ascii_tree(self, *, bond_dims=True, node_ids=False, color=False):
         """Return a top-down ASCII drawing of the tree, drawn root-first.
 
         The tree analogue of a ``quimb`` MPS ``show``: the root sits at the top
@@ -555,22 +1028,32 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             Annotate each branch with its virtual-bond dimension (default True).
         node_ids : bool
             Also print the structural node id next to each ``●`` (default False).
+        color : bool
+            Colour the ``●`` markers by tree depth (a per-layer palette), the
+            ``◆`` leaves in a distinct colour, and dim the bond numbers and
+            connector lines with ANSI SGR codes so each layer reads clearly
+            (default False).  The drawing stays width-correct because padding
+            ignores the colour escapes.
         """
         plan = self._plan
         gap = 3  # blank columns between sibling subtrees
 
-        def render(nid):
+        def render(nid, depth):
             """Return ``(lines, root_col, width)`` for the subtree rooted at ``nid``."""
             if plan.is_leaf(nid):
                 label = f"q{plan.qubit_of_leaf[nid]}"
                 w = max(1, len(label))
                 col = (w - 1) // 2
-                return [_ascii_place("◆", w, col), label.center(w)], col, w
+                marker = _color("◆", _LEAF_COLOR, color)
+                lbl = _color(label, _LEAF_COLOR, color)
+                return [_ascii_place(marker, w, col),
+                        _ascii_place(lbl, w, col)], col, w
 
-            marker = f"●{nid}" if node_ids else "●"
+            dot = f"●{nid}" if node_ids else "●"
+            marker = _color(dot, _LAYER_COLORS[depth % len(_LAYER_COLORS)], color)
             blocks = []
             for child in plan.children[nid]:
-                lines, col, w = render(child)
+                lines, col, w = render(child, depth + 1)
                 if bond_dims:
                     d = str(self._bond_dim(child, nid))
                     if len(d) > w:  # widen so a fat bond number still fits
@@ -580,7 +1063,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                             for ln in lines
                         ]
                         col, w = col + lp, len(d)
-                    lines = [_ascii_place(d, w, col)] + lines
+                    lines = [_ascii_place(_color(d, _DIM_STYLE, color), w, col)] + lines
                 blocks.append((lines, col, w))
 
             # lay the child subtrees side by side, recording each root column
@@ -605,6 +1088,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             conn[pcol] = {
                 " ": "┴", "─": "┴", "┌": "├", "┐": "┤", "┬": "┼",
             }[conn[pcol]]
+            raw = "".join(conn)
+            drawn = raw.rstrip()  # keep trailing pad outside the colour escape
+            conn_line = _color(drawn, _DIM_STYLE, color) + raw[len(drawn):]
 
             # stack the child blocks under parent marker + connector rows
             height = max(len(lines) for lines, _, _ in blocks)
@@ -619,22 +1105,23 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
             lines = [
                 _ascii_place(marker, total_w, pcol),
-                "".join(conn),
+                conn_line,
             ] + body
             return lines, pcol, total_w
 
-        lines, _, _ = render(plan.root)
+        lines, _, _ = render(plan.root, 0)
         return "\n".join(line.rstrip() for line in lines)
 
-    def show(self, *, bond_dims=True, node_ids=False):
+    def show(self, *, bond_dims=True, node_ids=False, color=True):
         """Print the top-down ASCII drawing of the tree (see :meth:`ascii_tree`).
 
         The tree analogue of a ``quimb`` MPS ``show``: the root is at the top,
         the qubit leaves at the bottom, internal nodes are ``●`` and leaves
         ``◆`` labelled with their qubit, and every edge is annotated with its
-        current virtual-bond dimension.
+        current virtual-bond dimension.  By default the markers are coloured by
+        tree layer; pass ``color=False`` for plain text.
         """
-        print(self.ascii_tree(bond_dims=bond_dims, node_ids=node_ids))
+        print(self.ascii_tree(bond_dims=bond_dims, node_ids=node_ids, color=color))
 
 
     # -- builders -------------------------------------------------------------
@@ -678,7 +1165,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             site_tag_id=site_tag_id,
             site_ind_id=site_ind_id,
             node_tag_id=node_tag_id,
-        )._with_center(plan.root)
+        )._with_center(plan.root).validate()
 
     @classmethod
     def from_order(cls, order, *, weights=None, structure="quality",
@@ -752,7 +1239,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         )
         if canonicalize:
             ttn.canonize_around_node_(plan.root)
-        return ttn
+        return ttn.validate()
 
     # -- repr -----------------------------------------------------------------
 
