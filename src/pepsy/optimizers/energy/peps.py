@@ -434,6 +434,75 @@ class PepsEnergyOptimizer:
                 return True
         return False
 
+    @staticmethod
+    def _is_symmray_array(value):
+        """Return whether ``value`` is a native Symmray block array."""
+        return hasattr(value, "blocks") and hasattr(value, "indices")
+
+    @classmethod
+    def _terms_use_symmray(cls, terms):
+        return all(cls._is_symmray_array(term) for term in terms.values())
+
+    @staticmethod
+    def _term_sites(state, where):
+        """Normalize a local-term key to the corresponding PEPS sites."""
+        has_site = getattr(state, "has_site", None)
+        if callable(has_site) and has_site(where):
+            return (where,)
+        if not isinstance(where, (tuple, list)):
+            return (where,)
+        sites = tuple(where)
+        if len(sites) not in {1, 2}:
+            raise ValueError("PEPS exact energy terms must act on one or two sites.")
+        return sites
+
+    @classmethod
+    def _symmray_exact_local_expectation(
+        cls,
+        state,
+        terms,
+        *,
+        optimize,
+        normalized,
+        contract_opts,
+    ):
+        """Contract native Symmray local terms without forming a dense RDM.
+
+        Quimb's generic ``compute_local_expectation_exact`` forms a reduced
+        density matrix and fuses its physical legs. Individual Symmray blocks
+        do not carry the full physical rank, so that dense-only fusion fails.
+        Directly contracting each operator-inserted ket with the bra preserves
+        the native block structure and fermionic metadata.
+        """
+        bra = state.H
+        total = 0
+        for where, term in terms.items():
+            sites = cls._term_sites(state, where)
+            inds = [state.site_ind(site) for site in sites]
+            gated = qtn.tensor_network_gate_inds(
+                state,
+                term,
+                inds,
+                contract="split",
+                tags=[],
+                info=None,
+                inplace=False,
+            )
+            total = total + (bra | gated).contract(
+                all,
+                optimize=optimize,
+                **contract_opts,
+            )
+
+        if normalized:
+            norm = (state.H & state).contract(
+                all,
+                optimize=optimize,
+                **contract_opts,
+            )
+            total = total / norm
+        return total
+
     @classmethod
     def _stabilize_state(cls, state):
         if hasattr(state, "balance_bonds_") and not cls._state_uses_symmray(state):
@@ -468,22 +537,31 @@ class PepsEnergyOptimizer:
         kwargs = dict(compute_kwargs or {})
         mode = cls._boundary_mode(boundary_mode)
         if mode == "exact":
-            exact_expectation = getattr(
-                state,
-                "compute_local_expectation_exact",
-                None,
-            )
-            if not callable(exact_expectation):
-                raise TypeError(
-                    "boundary_mode='exact' requires a PEPS-like state with "
-                    "compute_local_expectation_exact()."
+            if cls._state_uses_symmray(state) and cls._terms_use_symmray(terms):
+                value = cls._symmray_exact_local_expectation(
+                    state,
+                    terms,
+                    optimize=contraction_opt,
+                    normalized=bool(normalized),
+                    contract_opts=kwargs,
                 )
-            value = exact_expectation(
-                terms,
-                optimize=contraction_opt,
-                normalized=bool(normalized),
-                **kwargs,
-            )
+            else:
+                exact_expectation = getattr(
+                    state,
+                    "compute_local_expectation_exact",
+                    None,
+                )
+                if not callable(exact_expectation):
+                    raise TypeError(
+                        "boundary_mode='exact' requires a PEPS-like state with "
+                        "compute_local_expectation_exact()."
+                    )
+                value = exact_expectation(
+                    terms,
+                    optimize=contraction_opt,
+                    normalized=bool(normalized),
+                    **kwargs,
+                )
         else:
             value = state.compute_local_expectation(
                 terms,

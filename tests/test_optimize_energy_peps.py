@@ -7,6 +7,7 @@ import quimb.tensor as qtn
 import pepsy
 from pepsy.optimizers import EnergyEstimate, PepsEnergyOptimizer
 from pepsy.optimizers.energy.peps import PepsEnergyOptimizer as ModulePepsEnergyOptimizer
+from pepsy.tensors import SymPEPS
 
 
 class _FakePeps:
@@ -193,6 +194,56 @@ def test_peps_energy_exact_loss_matches_direct_quimb_exact_expectation():
     )
 
     assert complex(opt.loss()) == pytest.approx(complex(direct))
+
+
+def test_peps_energy_exact_native_symmray_terms_support_torch_gradient():
+    """Native exact energy avoids dense reduced-density-matrix fusion."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("symmray")
+
+    to_backend = pepsy.backend_torch(dtype=torch.float64)
+    occupations = {
+        (0, 0): (1, 0),
+        (0, 1): (0, 1),
+        (1, 0): (0, 1),
+        (1, 1): (1, 0),
+    }
+    state = SymPEPS.for_model(
+        "fermi_hubbard_u1u1",
+        2,
+        2,
+        bond_dim=2,
+        site_charge=pepsy.site_charge_from_occupations(occupations),
+        seed=25,
+        dtype="float64",
+        to_backend=to_backend,
+    )
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=1.0,
+        U=4.0,
+        to_backend=to_backend,
+    )
+    hamiltonian = fermion.hamiltonian(state.edges)
+    expected = state.energy(hamiltonian)
+
+    opt = PepsEnergyOptimizer(
+        state.peps,
+        hamiltonian.terms,
+        boundary_mode="exact",
+        energy_per_site=False,
+        contraction_opt="auto-hq",
+    )
+    assert float(opt.loss()) == pytest.approx(float(expected))
+
+    tnopt = opt.make_tn_optimizer(
+        optimizer="L-BFGS-B",
+        autodiff_backend="torch",
+        progbar=False,
+    )
+    _, gradient = tnopt.vectorized_value_and_grad(tnopt.vectorizer.vector.copy())
+    assert np.isfinite(gradient).all()
 
 
 def test_peps_energy_make_tn_optimizer_and_optimize(monkeypatch):
