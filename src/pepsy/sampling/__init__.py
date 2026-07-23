@@ -3,6 +3,8 @@
 from importlib import import_module
 
 from .samplers import (
+    FermionConfigurationEncoding,
+    MpsDiagonalEstimate,
     MpsBatchSampleResult,
     MpsSampleResult,
     MpsSampler,
@@ -13,6 +15,8 @@ from .samplers import (
 from .tree import TreeBatchSampleResult, TreeSampleResult, TreeSampler
 
 __all__ = [
+    "FermionConfigurationEncoding",
+    "MpsDiagonalEstimate",
     "MpsBatchSampleResult",
     "MpsSampleResult",
     "MpsSampler",
