@@ -1347,6 +1347,38 @@ def test_mps_sampler_fermion_configuration_encoding_rejects_wrong_symmetry():
         )
 
 
+def test_mps_sampler_bound_fermion_sets_the_batch_configuration_contract():
+    """A bound Fermion removes VMC code-convention boilerplate per batch."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry="Z2")
+    psi = SymMPS.random(
+        3,
+        symmetry="Z2",
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(3),
+        bond_dim=4,
+        seed=43,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray", fermion=fermion)
+
+    encoding = sampler.fermion_configuration_encoding()
+    batch = sampler.sample_batch(8, seed=7, to_numpy=True)
+
+    assert sampler.fermion is fermion
+    assert batch.configuration_encoding == encoding
+    np.testing.assert_array_equal(batch.occupations(), encoding.decode(batch.configs))
+
+    codes = np.repeat(np.arange(4, dtype=np.int64)[:, None], psi.L, axis=1)
+    np.testing.assert_allclose(
+        sampler.fermion_diagonal_values(codes, "total_charge"),
+        (0.0, 6.0, 3.0, 3.0),
+    )
+
+
 def test_mps_sampler_symmray_cached_branches_prune_charge_forbidden_work():
     """The sparse path skips impossible charge branches without densifying."""
     pytest.importorskip("symmray")

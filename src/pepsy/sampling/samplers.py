@@ -786,6 +786,12 @@ class MpsSampler:
         Maximum active Symmray prefix groups before the ``"auto"`` strategy
         switches the remaining suffixes to serial sampling. ``None`` permits
         all distinct prefixes. This has no effect on dense MPS backends.
+    fermion : pepsy.tensors.Fermion, optional
+        Fermionic physical-space convention associated with this sampler. When
+        supplied, :meth:`sample_batch` attaches its symmetry-aware
+        configuration encoding by default, and the fermionic diagonal helpers
+        can omit the repeated ``fermion`` argument. A per-call ``fermion=``
+        argument remains supported and takes precedence.
 
     Notes
     -----
@@ -808,6 +814,7 @@ class MpsSampler:
         torch_compile: bool = False,
         prefix_strategy: str = "auto",
         max_prefix_groups: int | None = 256,
+        fermion=None,
     ):
         if one_d_to_two_d is None:
             inferred_L = getattr(psi, "L", None)
@@ -839,6 +846,7 @@ class MpsSampler:
                 )
             max_prefix_groups = int(max_prefix_groups)
         self.max_prefix_groups = max_prefix_groups
+        self.fermion = fermion
         self.resolved_backend = None
         self._source_psi = None
         self._native_arrays = None
@@ -854,6 +862,21 @@ class MpsSampler:
         self._torch_compile_disabled = False
 
         self.refresh(psi)
+
+    def _resolve_fermion(self, fermion):
+        """Use a call-specific Fermion or the sampler's bound convention."""
+        fermion = self.fermion if fermion is None else fermion
+        if fermion is None:
+            raise TypeError(
+                "fermion is required. Pass fermion=... when constructing "
+                "MpsSampler or to this call."
+            )
+        if not all(hasattr(fermion, name) for name in ("spinful", "symmetry")):
+            raise TypeError(
+                "fermion must be a pepsy.tensors.Fermion instance or expose "
+                "spinful and symmetry attributes."
+            )
+        return fermion
 
     def refresh(self, psi=None):
         """Refresh cached state from ``psi`` or the original source MPS.
@@ -1905,7 +1928,7 @@ class MpsSampler:
             raise RuntimeError("Symmray sampler state has not been initialized.")
         return self._symmray_state
 
-    def fermion_configuration_encoding(self, fermion) -> FermionConfigurationEncoding:
+    def fermion_configuration_encoding(self, fermion=None) -> FermionConfigurationEncoding:
         """Return the physical-code/occupation contract for a fermionic MPS.
 
         This is the explicit bridge from MPS Born samples to a VMC walker or
@@ -1913,11 +1936,7 @@ class MpsSampler:
         source physical-sector maps retained by the Symmray sampler, rather
         than assuming a dense-basis or VMC-specific code convention.
         """
-        if not all(hasattr(fermion, name) for name in ("spinful", "symmetry")):
-            raise TypeError(
-                "fermion must be a pepsy.tensors.Fermion instance or expose "
-                "spinful and symmetry attributes."
-            )
+        fermion = self._resolve_fermion(fermion)
         state = self._require_symmray_state()
         state_symmetry = str(state["sites"][0]["data"].symmetry).upper()
         symmetry = str(fermion.symmetry).upper()
@@ -2034,11 +2053,7 @@ class MpsSampler:
 
     def _fermion_diagonal_tables(self, fermion):
         """Build physical-code lookup tables for occupation and doublon values."""
-        if not all(hasattr(fermion, name) for name in ("spinful", "symmetry")):
-            raise TypeError(
-                "fermion must be a pepsy.tensors.Fermion instance or expose "
-                "spinful and symmetry attributes."
-            )
+        fermion = self._resolve_fermion(fermion)
 
         if self._symmray_state is None:
             try:
@@ -2087,8 +2102,8 @@ class MpsSampler:
     def fermion_diagonal_values(
         self,
         configs,
-        fermion,
-        observable,
+        fermion=None,
+        observable=None,
         *,
         sites=None,
         pairs=None,
@@ -2103,6 +2118,11 @@ class MpsSampler:
         Symmray physical codes are decoded from the source charge map, so the
         spinful Z2 even-sector ordering remains correct.
         """
+        if observable is None:
+            observable, fermion = fermion, None
+        if observable is None:
+            raise TypeError("observable is required.")
+        fermion = self._resolve_fermion(fermion)
         observable = self._normalize_fermion_diagonal_observable(observable)
         configs = self._symmray_config_rows(configs, L=self._L)
         tables = self._fermion_diagonal_tables(fermion)
@@ -2140,8 +2160,8 @@ class MpsSampler:
 
     def estimate_fermion_diagonal(
         self,
-        fermion,
-        observable,
+        fermion=None,
+        observable=None,
         n_samples: int = 1024,
         seed: int | None = None,
         *,
@@ -2155,6 +2175,11 @@ class MpsSampler:
         hopping, pairing, and spin-flip observables require a fermionic local
         estimator based on amplitude ratios.
         """
+        if observable is None:
+            observable, fermion = fermion, None
+        if observable is None:
+            raise TypeError("observable is required.")
+        fermion = self._resolve_fermion(fermion)
         configs, _ = self.sample_arrays(
             n_samples,
             seed=seed,
@@ -2757,8 +2782,10 @@ class MpsSampler:
             one_d_to_two_d=dict(self.one_d_to_two_d),
             backend=backend,
             configuration_encoding=(
-                self.fermion_configuration_encoding(fermion)
-                if fermion is not None
+                self.fermion_configuration_encoding(
+                    self.fermion if fermion is None else fermion
+                )
+                if (self.fermion is not None or fermion is not None)
                 else None
             ),
         )

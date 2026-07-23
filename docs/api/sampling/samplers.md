@@ -67,19 +67,25 @@ Python control flow.
 ### Fermionic configuration codes
 
 `configs` are always physical-index codes, not universal occupation labels.
-Pass the same `Fermion` definition to `sample_batch` to attach an explicit,
-symmetry-aware code map before using the batch in a VMC or local-estimator
-workflow:
+Bind the `Fermion` definition when constructing the sampler to attach an
+explicit, symmetry-aware code map to every batch before using it in a VMC or
+local-estimator workflow:
 
 ```python
 fermion = pepsy.Fermion(spinful=True, symmetry="Z2")
-batch = sampler.sample_batch(4096, seed=0, fermion=fermion)
+sampler = MpsSampler(psi, backend="symmray", fermion=fermion)
+batch = sampler.sample_batch(4096, seed=0)
 
 physical_configs = batch.configs       # shape (batch, n_sites)
 occupations = batch.occupations()      # shape (batch, n_sites, 2), (n_up, n_down)
 encoding = batch.configuration_encoding
 assert np.array_equal(encoding.encode(occupations), physical_configs)
 ```
+
+Passing `fermion=...` directly to `sample_batch` remains supported when one
+sampler is intentionally shared across compatible workflows. A bound Fermion
+also lets `fermion_configuration_encoding()` and the diagonal-observable
+helpers omit their repeated Fermion argument.
 
 This is essential for collapsed sectors: spinful Symmray `Z2` uses physical
 codes in `empty, double, up, down` order, while resolved `U1`, `U1U1`, and
@@ -150,8 +156,8 @@ block-ordering of spinful Symmray `Z2`, `U1`, and `U1U1` physical indices:
 
 ```python
 fermion = pepsy.Fermion(spinful=True, symmetry="U1U1")
+sampler = MpsSampler(psi, backend="symmray", fermion=fermion)
 estimate = sampler.estimate_fermion_diagonal(
-    fermion,
     "doublon",             # average n_up n_down per site
     n_samples=16_384,
     seed=0,
@@ -159,7 +165,6 @@ estimate = sampler.estimate_fermion_diagonal(
 print(estimate.mean, estimate.standard_error)
 
 density_corr = sampler.estimate_fermion_diagonal(
-    fermion,
     "density_correlation", # average n_i n_j over the listed pairs
     pairs=((0, 1), (2, 3)),
     n_samples=16_384,
