@@ -1161,7 +1161,7 @@ def build_optimizer(
     directory=False,
     hash_method: str = "b",
     overwrite=False,
-    on_trial_error: str = "warn",
+    on_trial_error: str = "ignore",
     slicing_opts: dict | None = None,
     reconf_opts: dict | None = None,
     slicing_reconf_opts: dict | None = None,
@@ -1193,7 +1193,9 @@ def build_optimizer(
     overwrite : bool | str, optional
         Cache overwrite behavior.
     on_trial_error : str, optional
-        How to handle individual trial failures.
+        How to handle individual trial failures. Defaults to ``"ignore"``
+        because one invalid candidate path does not make the reusable search
+        itself invalid; pass ``"warn"`` or ``"raise"`` to inspect failures.
     slicing_opts : dict | None, optional
         Options passed to cotengra slicing heuristics.
     reconf_opts : dict | None, optional
