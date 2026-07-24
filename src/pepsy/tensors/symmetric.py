@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from itertools import product
@@ -5466,11 +5467,49 @@ def _assemble_symmray_mpo(
     )
     if to_backend is not None:
         _apply_to_tensor_network_arrays(mpo, to_backend)
+    raw_max_bond = int(mpo.max_bond())
+    did_compress = bool(compress and L > 1)
     if compress and L > 1:
         compress_opts = {"cutoff": cutoff}
         if max_bond is not None:
             compress_opts["max_bond"] = int(max_bond)
         mpo.compress(**compress_opts)
+
+    requested_max_bond = None if max_bond is None else int(max_bond)
+    final_max_bond = int(mpo.max_bond())
+    report = {
+        "compressed": did_compress,
+        "cutoff": cutoff,
+        "requested_max_bond": requested_max_bond,
+        "raw_max_bond": raw_max_bond,
+        "final_max_bond": final_max_bond,
+        "rank_reduced": final_max_bond < raw_max_bond,
+        "cap_bound": (
+            did_compress
+            and requested_max_bond is not None
+            and raw_max_bond > requested_max_bond
+        ),
+        "max_bond_exceeded": (
+            did_compress
+            and requested_max_bond is not None
+            and final_max_bond > requested_max_bond
+        ),
+    }
+    # This record describes MPO construction only; it is not used during
+    # contraction and can safely travel with the returned MPO as user-facing
+    # build metadata.
+    mpo.pepsy_compression_report = report
+    if report["max_bond_exceeded"]:
+        warnings.warn(
+            "SymHamiltonian.to_mpo requested "
+            f"max_bond={requested_max_bond}, but Symmray compression returned "
+            f"max bond {final_max_bond}. Tied singular values at the "
+            "truncation threshold can make this a soft cap; inspect "
+            "mpo.pepsy_compression_report before relying on a hard memory "
+            "limit.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     return mpo
 
 

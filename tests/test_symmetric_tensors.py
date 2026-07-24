@@ -2032,6 +2032,44 @@ def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_compresses_long_range():
     assert complex(energy_compressed) == pytest.approx(complex(energy))
 
 
+def test_symhamiltonian_mpo_compression_report_warns_for_soft_bond_cap():
+    """A tied Symmray cutoff must not silently exceed the requested cap."""
+    lx, ly = 4, 3
+    length = lx * ly
+    edges = []
+    for x in range(lx):
+        for y in range(ly):
+            site = x * ly + y
+            edges.append((site, ((x + 1) % lx) * ly + y))
+            edges.append((site, x * ly + ((y + 1) % ly)))
+    ham = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1",
+        "U1U1",
+        edges,
+        t=1.0,
+        U=8.0,
+    )
+
+    with pytest.warns(RuntimeWarning, match="requested max_bond=16"):
+        mpo = ham.to_mpo(
+            L=length,
+            compress=True,
+            max_bond=16,
+            cutoff=1e-12,
+        )
+
+    report = mpo.pepsy_compression_report
+    assert report["compressed"] is True
+    assert report["cutoff"] == 1e-12
+    assert report["requested_max_bond"] == 16
+    assert report["raw_max_bond"] > report["final_max_bond"]
+    assert report["final_max_bond"] == mpo.max_bond()
+    assert report["rank_reduced"] is True
+    assert report["cap_bound"] is True
+    assert report["max_bond_exceeded"] is True
+    assert report["final_max_bond"] > report["requested_max_bond"]
+
+
 def test_spinless_fermi_hubbard_u1_hamiltonian_mpo_maps_2d_long_range_edge():
     """Spinless FH coordinate edges should match their mapped flat edge."""
     mapper = OneDMap(2, 2, mode="snake")

@@ -483,6 +483,28 @@ ham = py.SymHamiltonian.from_edges(
 mpo = ham.to_mpo(L=3, compress=True, max_bond=16, cutoff=1e-12)
 ```
 
+### MPO compression diagnostics
+
+Every MPO built by ``SymHamiltonian.to_mpo`` carries a construction record in
+``mpo.pepsy_compression_report``. It records the raw and final maximum bond,
+the requested cap, whether compression reduced the represented rank, and
+whether Symmray returned a bond larger than the requested cap:
+
+```python
+report = mpo.pepsy_compression_report
+print(report["raw_max_bond"], report["final_max_bond"])
+if report["max_bond_exceeded"]:
+    print("The requested max_bond was a soft cap for this compression.")
+```
+
+Pepsy emits a ``RuntimeWarning`` in the latter case. This can occur when a
+positive cutoff leaves singular values tied at the selected threshold. The
+report's ``rank_reduced`` flag says that the MPO bond rank changed; it is not
+an error estimate. For a hard numerical cap, use ``cutoff=0.0`` and verify the
+returned ``final_max_bond``. When the cap binds, also check convergence against
+a larger cap because the compressed MPO can represent an approximation to the
+original Hamiltonian.
+
 ``to_mpo`` also accepts ``to_backend=`` to map each stored Symmray block to an
 array backend, and ``dtype=`` to choose the dense local operator dtype used
 before conversion to block-sparse arrays. The implementation is validated by
