@@ -103,6 +103,35 @@ At the start of a new task:
   with persistent layouts. Measurement/reset bookkeeping remains in logical
   site labels.
 
+### Tree optimizer workflow
+
+- Read `.github/skills/tree-optimizer/SKILL.md` before changing
+  `pepsy.optimizers.tree` code, tests, or documentation.
+- `TreeLayoutFinder` is circuit-only: derive a `TreePlan` from a gate stream or
+  supports, then pass a coefficient state separately to `TreeOptimizer`.
+  Reject a `TreeTensorNetwork` supplied to the finder rather than guessing a
+  circuit or silently relayouting it.
+- An entangled TTN must retain its existing plan. A requested mismatched
+  `tree=`/`layout=` is an error, never an implicit compression or warning-only
+  conversion. Bond-one TTNs and bond-one Quimb MPSs may be remounted exactly on
+  a selected tree; warn only when replacing a product TTN's old geometry.
+- Treat backend, dtype, and device as one state invariant: every live TTN
+  tensor must match. Reject mixed initial states. Callers should provide gates,
+  operators, sub-MPOs, observables, and cap vectors on the state backend;
+  preserve the optimizer's one-time warning when an explicit array must be
+  coerced. Internal Pauli/control tensors must follow the live backend without
+  producing user-facing transfer warnings.
+- Layout is fixed before replay. Never rewrite a live tree during optimization;
+  `refine="greedy"` and Nevergrad are bounded pre-simulation leaf-label searches
+  that retain the parent/child topology.
+- `TreeOptimizer` supports the shared noisy-trajectory runner. Independent
+  replay handles random-unitary mixtures, depolarizing channels, and
+  state-dependent Kraus channels by evaluating branch norms on copied TTNs;
+  selected branches are normalized before replay continues. Coalesced replay
+  branches `measure`, `reset`, and `measure_reset` through
+  `expectation_pauli`. Use matrix-valued gates such as `pepsy.h()` in direct
+  Tree streams; textual MPS gate aliases are not normalized by the Tree parser.
+
 ### Stabilizer tensor-network workflow
 
 - Read `.github/skills/stabilizer-tensor-networks/SKILL.md` and its method/API
@@ -201,7 +230,9 @@ At the start of a new task:
 - `infidelity(...)` returns a dict with `infidelity`, `norm`, `norm_target`, `overlap`, and reused/created boundary handles.
 - PEPS-like networks should carry lattice tags `X{i}`, `Y{j}`, `I...`; physical outer indices conventionally use `k...` for ket legs and `b...` for bra/operator-output legs.
 - Gate streams should use canonical bundled entries like `[(gate, where), ...]`. The ambiguous single bundled alias `(gate, where)` is intentionally rejected.
-- User-provided gate tensors are not backend-coerced automatically; keep gate tensors and tensor-network arrays on compatible backends.
+- Keep user-provided gate tensors and tensor-network arrays on compatible
+  backends. Where an optimizer intentionally performs a compatibility coercion,
+  retain its explicit warning/diagnostic rather than silently transferring data.
 - `OneDMap` supports `snake`, `snake-row-major`, `row-major`, `col-major`, `hilbert`, `hilbert-row-major`, and `diag` modes. PEPO conversion is restricted; check `tests/test_ham.py` before changing mapper behavior.
 
 ## Public API Rules
@@ -269,6 +300,12 @@ NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX
 - Do not modify generated notebook outputs unless explicitly requested.
 - When changing public examples, verify that imports use current namespaces and public API names.
 - If a notebook or helper still shows an old flat import path, migrate it deliberately instead of copying that pattern into new code.
+- For any matplotlib figure (examples, notebooks, benchmark plots), aim for
+  clear, legible, decent-looking plots (labeled axes, readable fonts, a legend
+  when there is more than one series, a light grid, a distinct reference curve,
+  and vector/PNG saves for keep-worthy figures). See `plot_policy.md` at the
+  repo root for the principles and a recommended house-style starting point —
+  it is guidance, not a rigid template to copy verbatim.
 
 ## Validation
 

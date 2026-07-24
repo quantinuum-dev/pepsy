@@ -2,8 +2,11 @@
 
 from types import SimpleNamespace
 
+import numpy as np
+import quimb as qu
 import quimb.tensor as qtn
 import pytest
+import torch
 
 import pepsy.optimizers.sweep.optimizer as sweep_mod
 from pepsy.optimizers.sweep.environments import QuimbMpsBoundaryStore
@@ -69,6 +72,31 @@ def test_scaled_overlap_fidelity_uses_mantissa_exponent_pairs():
     )
 
     assert fidelity == pytest.approx(1.0)
+
+
+def test_scaled_overlap_fidelity_accepts_quimb_scalar_wrapper():
+    """A stripped Quimb scalar should not be sent to nonexistent quimb.abs."""
+    fidelity = SweepOptimizer._scaled_overlap_fidelity(
+        overlap=(qu.qarray(1.0 + 2.0j), 0.0),
+        norm=(qu.qarray(5.0), 0.0),
+        target_norm=(qu.qarray(1.0), 0.0),
+    )
+
+    assert float(fidelity) == pytest.approx(1.0)
+
+
+def test_scaled_overlap_fidelity_unwraps_scalar_tensor_and_preserves_autograd():
+    """Zero-index Quimb Tensor wrappers must expose their Torch scalar data."""
+    overlap = torch.tensor(2.0, dtype=torch.float64, requires_grad=True)
+    fidelity = SweepOptimizer._scaled_overlap_fidelity(
+        overlap=(qtn.Tensor(data=overlap, inds=()), 0.0),
+        norm=(qtn.Tensor(data=overlap * overlap, inds=()), 0.0),
+        target_norm=(qtn.Tensor(data=torch.tensor(1.0), inds=()), 0.0),
+    )
+    fidelity.backward()
+
+    assert fidelity.item() == pytest.approx(1.0)
+    assert overlap.grad.item() == pytest.approx(0.0)
 
 
 def test_set_target_norm_accepts_scaled_pair():
@@ -1483,21 +1511,144 @@ def test_sweep_quimb_mps_refreshes_real_quimb_environments():
     assert opt.bdy_overlap.update_count == 1
 
 
-def test_sweep_quimb_mps_half_sweep_refreshes_per_slice(monkeypatch):
-    """Quimb sweep branch should rebuild environments before each slice."""
+@pytest.mark.parametrize(
+    ("axis", "update_side", "seed_index"),
+    (
+        ("y", "left", 0),
+        ("y", "right", 2),
+        ("x", "left", 0),
+        ("x", "right", 1),
+    ),
+)
+def test_sweep_quimb_mps_incremental_boundaries_match_fresh_environments(
+    axis,
+    update_side,
+    seed_index,
+):
+    """Directional cache seeds must agree with a full Quimb recomputation."""
+    peps = qtn.PEPS.rand(Lx=2, Ly=3, bond_dim=2, seed=41, dtype="complex128")
+    target = qtn.PEPS.rand(Lx=2, Ly=3, bond_dim=2, seed=42, dtype="complex128")
+    opt = SweepOptimizer(
+        peps,
+        target,
+        chi=8,
+        boundary_engine="quimb-mps",
+        renormalize_state=False,
+    )
+    norm_tn, _ = opt._prepare_current_double_layers()
+    cached = QuimbMpsBoundaryStore(chi=8)
+    fresh = QuimbMpsBoundaryStore(chi=8)
+
+    cached.start_sweep(norm_tn, axis, update_side)
+    cached.advance_sweep(
+        norm_tn,
+        seed_index,
+        axis=axis,
+        update_side=update_side,
+    )
+    fresh.update_axis(norm_tn, axis)
+
+    for key, cached_env in cached.envs.items():
+        fresh_env = fresh.envs[key]
+        if not cached_env.tensor_map:
+            assert not fresh_env.tensor_map
+            continue
+        np.testing.assert_allclose(
+            cached_env.contract(all).data,
+            fresh_env.contract(all).data,
+            rtol=1.0e-10,
+            atol=1.0e-11,
+        )
+
+
+def test_sweep_quimb_mps_numpy_slice_uses_finite_differences_without_backend_leak():
+    """Dense NumPy Quimb sweeps must not inject Torch slice data into environments."""
+    pytest.importorskip("torch")
+    peps = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=1, seed=31, dtype="complex128")
+    target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=1, seed=32, dtype="complex128")
+    opt = SweepOptimizer(
+        peps,
+        target,
+        chi=4,
+        boundary_engine="quimb-mps",
+        renormalize_state=False,
+    )
+    norm_tn, overlap_tn = opt._prepare_current_double_layers()
+    opt.bdy.start_sweep(norm_tn, "y", "left")
+    opt.bdy_overlap.start_sweep(overlap_tn, "y", "left")
+
+    run = opt._optimize_axis_slice_with_current_env(
+        0,
+        axis="y",
+        solver="torch-adam",
+        solver_options={"n_steps": 1, "fd_method": "forward", "fd_eps": 1.0e-4},
+    )
+
+    assert np.isfinite(run["loss_initial"])
+    assert np.isfinite(run["loss_final"])
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "numpy"
+        for tensor in opt.state.tensor_map.values()
+    )
+
+
+def test_sweep_quimb_mps_numpy_round_trip_keeps_boundaries_and_state_numpy():
+    """The former NumPy/Torch boundary crash must stay fixed across a round trip."""
+    pytest.importorskip("torch")
+    state = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=1, seed=81, dtype="complex128")
+    target = qtn.PEPS.rand(Lx=2, Ly=2, bond_dim=1, seed=82, dtype="complex128")
+    target.mangle_inner_()
+    opt = SweepOptimizer(
+        state,
+        target,
+        chi=4,
+        boundary_engine="quimb-mps",
+        renormalize_state=False,
+    )
+
+    runs = opt.optimize_axis(
+        "y",
+        n_round_trips=1,
+        solver="torch-adam",
+        solver_options={"n_steps": 1, "fd_method": "forward", "fd_eps": 1.0e-4},
+        renormalize=False,
+    )
+
+    assert [(run["sweep"], run["index"]) for run in runs] == [
+        ("forward", 0),
+        ("forward", 1),
+        ("backward", 0),
+        ("forward", 1),
+    ]
+    assert all(
+        type(tensor.data).__module__.split(".", 1)[0] == "numpy"
+        for tensor in opt.state.tensor_map.values()
+    )
+
+
+def test_sweep_quimb_mps_half_sweep_advances_cached_boundary(monkeypatch):
+    """Quimb sweep branch should build once and move its boundary per slice."""
+
+    class _FakeStore:
+        def __init__(self):
+            self.norm = 1.0
+            self.mps_b = {}
+            self.starts = []
+            self.advances = []
+
+        def start_sweep(self, tn, axis, update_side, *, progress=False):
+            self.starts.append((tn, axis, update_side, progress))
+
+        def advance_sweep(self, tn, index, *, axis=None, update_side=None):
+            self.advances.append((tn, index, axis, update_side))
+
     opt = object.__new__(SweepOptimizer)
     opt.boundary_engine = "quimb-mps"
-    opt.bdy = SimpleNamespace(norm=1.0)
-    opt.bdy_overlap = SimpleNamespace(norm=1.0)
-
-    refreshes = []
+    opt.bdy = _FakeStore()
+    opt.bdy_overlap = _FakeStore()
 
     def _fake_prepare():
         return object(), object()
-
-    def _fake_refresh(norm_tn, overlap_tn, axis, *, progress=False):
-        refreshes.append((norm_tn, overlap_tn, axis, progress))
-        return {"norm": None, "overlap": None}
 
     def _fake_optimize(index, *, axis, solver, solver_options):
         return {
@@ -1507,13 +1658,13 @@ def test_sweep_quimb_mps_half_sweep_refreshes_per_slice(monkeypatch):
             "history": [0.2, 0.1 + index],
         }
 
-    def _boom_make_comp(*args, **kwargs):  # pylint: disable=unused-argument
-        raise AssertionError("CompBdy path should not run for quimb-mps")
-
     monkeypatch.setattr(opt, "_prepare_current_double_layers", _fake_prepare)
-    monkeypatch.setattr(opt, "_refresh_quimb_axis_boundaries", _fake_refresh)
     monkeypatch.setattr(opt, "_optimize_axis_slice_with_current_env", _fake_optimize)
-    monkeypatch.setattr(opt, "_make_comp_pair", _boom_make_comp)
+    monkeypatch.setattr(
+        opt,
+        "_update_quimb_double_layer_slice",
+        lambda *args: None,
+    )
 
     runs = SweepOptimizer._run_axis_half_sweep(
         opt,
@@ -1526,5 +1677,70 @@ def test_sweep_quimb_mps_half_sweep_refreshes_per_slice(monkeypatch):
     )
 
     assert [run["index"] for run in runs] == [0, 1]
-    assert len(refreshes) == 2
-    assert all(item[2] == "y" for item in refreshes)
+    assert len(opt.bdy.starts) == 1
+    assert len(opt.bdy_overlap.starts) == 1
+    assert len(opt.bdy.advances) == 2
+    assert len(opt.bdy_overlap.advances) == 2
+    assert all(item[1] == index for item, index in zip(opt.bdy.advances, (0, 1)))
+
+
+def test_sweep_quimb_mps_backward_and_return_forward_seed_boundaries(monkeypatch):
+    """Round-trip directions must seed their already-updated endpoint once."""
+
+    class _FakeStore:
+        def __init__(self):
+            self.norm = 1.0
+            self.mps_b = {}
+            self.starts = []
+            self.advances = []
+
+        def start_sweep(self, tn, axis, update_side, *, progress=False):
+            self.starts.append((tn, axis, update_side, progress))
+
+        def advance_sweep(self, tn, index, *, axis=None, update_side=None):
+            self.advances.append((tn, index, axis, update_side))
+
+    opt = object.__new__(SweepOptimizer)
+    opt.boundary_engine = "quimb-mps"
+    opt.bdy = _FakeStore()
+    opt.bdy_overlap = _FakeStore()
+    opt.Lx = 2
+    opt.Ly = 2
+
+    monkeypatch.setattr(opt, "_prepare_current_double_layers", lambda: (object(), object()))
+    monkeypatch.setattr(
+        opt,
+        "_optimize_axis_slice_with_current_env",
+        lambda index, **kwargs: {
+            "axis": kwargs["axis"],
+            "index": index,
+            "loss_final": 0.1,
+            "history": [0.1],
+        },
+    )
+    monkeypatch.setattr(opt, "_update_quimb_double_layer_slice", lambda *args: None)
+
+    SweepOptimizer._run_axis_half_sweep(
+        opt,
+        range(0, -1, -1),
+        axis="y",
+        update_side="right",
+        sweep_name="backward",
+        solver="scipy",
+        solver_options=None,
+    )
+    assert [item[1] for item in opt.bdy.advances] == [1, 0]
+
+    opt.bdy.advances.clear()
+    opt.bdy_overlap.advances.clear()
+    SweepOptimizer._run_axis_half_sweep(
+        opt,
+        range(1, 2),
+        axis="y",
+        update_side="left",
+        sweep_name="return-forward",
+        solver="scipy",
+        solver_options=None,
+    )
+    assert [item[1] for item in opt.bdy.advances] == [0, 1]
+    assert [call[2] for call in opt.bdy.starts] == ["right", "left"]

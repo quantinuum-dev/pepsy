@@ -1,5 +1,7 @@
 """Tests for PEPS BP importance sampling helpers."""
 
+from itertools import product
+
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -35,6 +37,22 @@ class DummyFlatTN:
         assert kwargs["inplace"] is False
         assert kwargs["progbar"] is False
         return 4.5 + self.label, -1
+
+
+def _dense_mps_from_symmray(psi):
+    """Convert an ungraded Symmray MPS to an ordinary dense quimb MPS."""
+    arrays = [
+        sampler_mod.MpsSampler._site_array_lr_phys_r(psi, site).to_dense()
+        for site in range(psi.L)
+    ]
+    return qtn.MatrixProductState(
+        [
+            arrays[0][0].T,
+            *(array.transpose(0, 2, 1) for array in arrays[1:-1]),
+            arrays[-1][:, :, 0],
+        ],
+        shape="lrp",
+    )
 
 
 def test_sampler_exact_method_collects_configs_and_scalars(monkeypatch):
@@ -108,6 +126,8 @@ def test_sampler_public_exports_resolve():
     """Sampler helpers should be available from the package namespace."""
     assert pepsy.PepsBpSampler is sampler_mod.PepsBpSampler
     assert pepsy.PEPSSampleResult is sampler_mod.PEPSSampleResult
+    assert pepsy.FermionConfigurationEncoding is sampler_mod.FermionConfigurationEncoding
+    assert pepsy.MpsDiagonalEstimate is sampler_mod.MpsDiagonalEstimate
     assert pepsy.MpsBatchSampleResult is sampler_mod.MpsBatchSampleResult
 
 
@@ -814,6 +834,747 @@ def test_mps_sampler_quimb_sample_batch_returns_numpy_result():
     assert isinstance(batch.probs, np.ndarray)
     assert batch.configs_1d() == [[1, 0]] * 3
     assert batch.to_sample_result().configs_1d == [[1, 0]] * 3
+
+
+def test_mps_sampler_detects_symmray_u1u1_product_without_densifying(monkeypatch):
+    """A U1U1 product MPS should retain its Symmray representation to sample."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, ps_to_mps
+
+    fermion = Fermion(spinful=True, symmetry="U1U1")
+    psi = ps_to_mps(
+        4,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
+    )
+    source_maps = [
+        dict(psi[site].data.indices[psi[site].inds.index(psi.site_ind(site))].chargemap)
+        for site in range(psi.L)
+    ]
+
+    def fail_dense(*args, **kwargs):  # pylint: disable=unused-argument
+        raise AssertionError("Symmray MPS sampling must not densify tensor data")
+
+    monkeypatch.setattr(type(psi[0].data), "to_dense", fail_dense)
+    sampler = sampler_mod.MpsSampler(psi)
+    configs, probs = sampler.sample_arrays(4, seed=7)
+
+    assert sampler.resolved_backend == "symmray"
+    np.testing.assert_array_equal(configs, np.array([[2, 1, 2, 1]] * 4))
+    np.testing.assert_allclose(probs, np.ones(4))
+    assert [
+        dict(psi[site].data.indices[psi[site].inds.index(psi.site_ind(site))].chargemap)
+        for site in range(psi.L)
+    ] == source_maps
+
+
+@pytest.mark.parametrize("symmetry", ("Z2", "U1", "U1U1"))
+def test_mps_sampler_symmray_fermionic_matches_direct_amplitudes(symmetry):
+    """Entangled fermionic branches agree with direct sparse contraction."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    psi = SymMPS.random(
+        4,
+        symmetry=symmetry,
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(4),
+        bond_dim=8,
+        seed=3,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs, sampled_probs = sampler.sample_arrays(6, seed=9)
+    probs = sampler.probabilities(configs)
+    amplitudes = sampler.amplitudes(configs)
+    norm = (psi.H @ psi).real
+
+    assert sampler.resolved_backend == "symmray"
+    np.testing.assert_allclose(probs, sampled_probs, atol=1e-12)
+    np.testing.assert_allclose(np.abs(amplitudes) ** 2, sampled_probs, atol=1e-12)
+    for config, probability in zip(configs, sampled_probs):
+        branch = psi.copy()
+        branch.isel_({
+            branch.site_ind(site): int(code)
+            for site, code in enumerate(config)
+        })
+        amplitude = np.asarray(branch.contract(all).data).item()
+        assert probability == pytest.approx(abs(amplitude) ** 2 / norm)
+
+
+@pytest.mark.parametrize("symmetry", ("Z2", "U1", "U1U1"))
+def test_mps_sampler_symmray_fermionic_sector_probabilities_are_exhaustive(
+    symmetry,
+):
+    """All allowed physical codes normalize and forbidden sectors vanish."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    L = 3
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    psi = SymMPS.random(
+        L,
+        symmetry=symmetry,
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(L),
+        bond_dim=4,
+        seed=11,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs = np.asarray(list(product(range(4), repeat=L)), dtype=np.int64)
+    probabilities = sampler.probabilities(configs)
+    amplitudes = sampler.amplitudes(configs)
+    charge_maps = sampler.physical_code_maps
+    target_charge = fermion.total_charge(fermion.half_filled_occupations(L))
+    allowed = np.asarray(
+        [
+            fermion.total_charge(
+                charge_maps[site][int(code)][0]
+                for site, code in enumerate(config)
+            )
+            == target_charge
+            for config in configs
+        ]
+    )
+
+    np.testing.assert_allclose(probabilities.sum(), 1.0, atol=1e-12)
+    np.testing.assert_allclose(
+        probabilities,
+        np.abs(amplitudes) ** 2,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(probabilities[~allowed], 0.0, atol=1e-12)
+    assert np.any(probabilities[allowed] > 1e-12)
+
+
+@pytest.mark.parametrize("symmetry", ("U1", "U1U1"))
+def test_mps_sampler_symmray_dense_and_quimb_baselines_match(symmetry):
+    """The benchmark's dense baselines preserve U1 fermionic Born weights."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    psi = SymMPS.random(
+        4,
+        symmetry=symmetry,
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(4),
+        bond_dim=4,
+        seed=13,
+        dtype="complex128",
+    ).mps
+    sparse_sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    dense_psi = _dense_mps_from_symmray(psi)
+    native_sampler = sampler_mod.MpsSampler(dense_psi, backend="native")
+    quimb_sampler = sampler_mod.MpsSampler(dense_psi, backend="quimb")
+
+    configs, sparse_probabilities = sparse_sampler.sample_arrays(16, seed=5)
+    np.testing.assert_allclose(
+        native_sampler.probabilities(configs),
+        sparse_probabilities,
+        atol=1e-12,
+    )
+    quimb_configs, quimb_probabilities = quimb_sampler.sample_arrays(16, seed=5)
+    np.testing.assert_allclose(
+        sparse_sampler.probabilities(quimb_configs),
+        quimb_probabilities,
+        atol=1e-12,
+    )
+
+
+@pytest.mark.parametrize("symmetry", ("Z2", "U1", "U1U1"))
+def test_mps_sampler_fermion_diagonal_values_follow_symmray_physical_codes(
+    symmetry,
+):
+    """Diagonal values use the physical code order of each fermionic symmetry."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    psi = SymMPS.random(
+        3,
+        symmetry=symmetry,
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(3),
+        bond_dim=4,
+        seed=15,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs = np.repeat(np.arange(4, dtype=np.int64)[:, None], psi.L, axis=1)
+    expected_occupation = np.diag(fermion.observable("number").to_dense()).real
+    expected_doublon = np.diag(fermion.observable("double").to_dense()).real
+
+    np.testing.assert_allclose(
+        sampler.fermion_diagonal_values(
+            configs,
+            fermion,
+            "occupation",
+            sites=0,
+        ),
+        expected_occupation,
+    )
+    np.testing.assert_allclose(
+        sampler.fermion_diagonal_values(
+            configs,
+            fermion,
+            "doublon",
+            sites=0,
+        ),
+        expected_doublon,
+    )
+    np.testing.assert_allclose(
+        sampler.fermion_diagonal_values(
+            configs,
+            fermion,
+            "density_correlation",
+            pairs=(0, 1),
+        ),
+        expected_occupation**2,
+    )
+
+
+@pytest.mark.parametrize("symmetry", ("Z2", "U1", "U1U1"))
+def test_mps_sampler_fermion_diagonal_estimates_match_exact_born_sums(symmetry):
+    """Sampled fermion observables agree with exact MPS Born sums."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    L = 3
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    psi = SymMPS.random(
+        L,
+        symmetry=symmetry,
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(L),
+        bond_dim=4,
+        seed=17,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs = np.asarray(list(product(range(4), repeat=L)), dtype=np.int64)
+    probabilities = sampler.probabilities(configs)
+    observables = (
+        ("occupation", {"sites": (0, 2)}),
+        ("total_charge", {}),
+        ("doublon", {}),
+        ("density_correlation", {"pairs": ((0, 1), (1, 2))}),
+    )
+
+    for observable, kwargs in observables:
+        exact = float(np.dot(
+            probabilities,
+            sampler.fermion_diagonal_values(configs, fermion, observable, **kwargs),
+        ))
+        estimate = sampler.estimate_fermion_diagonal(
+            fermion,
+            observable,
+            n_samples=4096,
+            seed=19,
+            **kwargs,
+        )
+
+        assert isinstance(estimate, sampler_mod.MpsDiagonalEstimate)
+        assert estimate.n_samples == 4096
+        assert estimate.observable == observable
+        assert abs(estimate.mean - exact) <= 7 * estimate.standard_error + 0.01
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "occupations"),
+    (
+        ("Z2", (1, 1, 0, 2)),
+        ("U1", (1, 1, 0, 2)),
+        ("U1U1", ((1, 0), (0, 1), (0, 0), (1, 1))),
+        ("Z2Z2", ((1, 0), (0, 1), (0, 0), (1, 1))),
+    ),
+)
+def test_mps_sampler_symmray_supports_spinful_fermion_symmetries(
+    monkeypatch,
+    symmetry,
+    occupations,
+):
+    """Fermionic charge maps, including degenerate sectors, stay sparse."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, ps_to_mps
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    psi = ps_to_mps(4, fermion=fermion, occupations=occupations)
+    source_maps = [
+        dict(psi[site].data.indices[psi[site].inds.index(psi.site_ind(site))].chargemap)
+        for site in range(psi.L)
+    ]
+
+    def fail_dense(*args, **kwargs):  # pylint: disable=unused-argument
+        raise AssertionError("Symmray MPS sampling must not densify tensor data")
+
+    monkeypatch.setattr(type(psi[0].data), "to_dense", fail_dense)
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs, sampled_probs = sampler.sample_arrays(16, seed=4)
+
+    assert sampler.resolved_backend == "symmray"
+    assert configs.shape == (16, 4)
+    assert np.all((0 <= configs) & (configs < 4))
+    np.testing.assert_allclose(
+        sampler.probabilities(configs),
+        sampled_probs,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        np.abs(sampler.amplitudes(configs)) ** 2,
+        sampled_probs,
+        atol=1e-12,
+    )
+    assert [
+        dict(psi[site].data.indices[psi[site].inds.index(psi.site_ind(site))].chargemap)
+        for site in range(psi.L)
+    ] == source_maps
+
+
+@pytest.mark.parametrize("symmetry", ("Z2", "U1"))
+def test_mps_sampler_symmray_supports_spinless_fermion_symmetries(symmetry):
+    """The same physical-code reconstruction handles spinless fermions."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, ps_to_mps
+
+    psi = ps_to_mps(
+        4,
+        fermion=Fermion(spinful=False, symmetry=symmetry),
+        occupations=(0, 1, 0, 1),
+    )
+    sampler = sampler_mod.MpsSampler(psi)
+    configs, sampled_probs = sampler.sample_arrays(16, seed=4)
+
+    assert sampler.resolved_backend == "symmray"
+    np.testing.assert_array_equal(configs, np.array([[0, 1, 0, 1]] * 16))
+    np.testing.assert_allclose(sampled_probs, np.ones(16))
+    np.testing.assert_allclose(sampler.probabilities(configs), sampled_probs)
+
+
+def test_mps_sampler_symmray_reuses_prefix_boundaries(monkeypatch):
+    """A batch builds one conditional per distinct sampled prefix."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, ps_to_mps
+
+    psi = ps_to_mps(
+        4,
+        fermion=Fermion(spinful=True, symmetry="U1"),
+        occupations=(1, 1, 0, 2),
+    )
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    real_candidates = sampler_mod.MpsSampler._symmray_candidates.__func__
+    calls = []
+
+    def spy_candidates(cls, state, site, boundary):
+        calls.append(site)
+        return real_candidates(cls, state, site, boundary)
+
+    monkeypatch.setattr(
+        sampler_mod.MpsSampler,
+        "_symmray_candidates",
+        classmethod(spy_candidates),
+    )
+    configs, probs = sampler.sample_arrays(32, seed=3)
+
+    assert calls[0] == 0
+    assert len(calls) < 32 * psi.L
+    np.testing.assert_allclose(sampler.probabilities(configs), probs, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "physical_sectors", "site_charges"),
+    (
+        ("Z2", {0: 1, 1: 1}, (0, 1, 0)),
+        ("U1", {0: 1, 1: 1, 2: 1}, (1, 1, 1)),
+        (
+            "U1U1",
+            {(0, 0): 1, (0, 1): 1, (1, 0): 1, (1, 1): 1},
+            ((1, 0), (0, 1), (1, 0)),
+        ),
+        (
+            "Z2Z2",
+            {(0, 0): 1, (0, 1): 1, (1, 0): 1, (1, 1): 1},
+            ((1, 0), (0, 1), (1, 0)),
+        ),
+    ),
+)
+def test_mps_sampler_symmray_supports_generic_abelian_mps(
+    monkeypatch,
+    symmetry,
+    physical_sectors,
+    site_charges,
+):
+    """Non-fermionic Symmray MPSs use the same no-densification sampler."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymMPS, site_charge_from_occupations
+
+    psi = SymMPS.random(
+        3,
+        symmetry=symmetry,
+        fermionic=False,
+        bond_dim=4,
+        phys_dim=physical_sectors,
+        site_charge=site_charge_from_occupations(site_charges),
+        seed=7,
+        dtype="complex128",
+    ).mps
+
+    def fail_dense(*args, **kwargs):  # pylint: disable=unused-argument
+        raise AssertionError("Generic Symmray MPS sampling must not densify data")
+
+    monkeypatch.setattr(type(psi[0].data), "to_dense", fail_dense)
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    local_dim = sum(physical_sectors.values())
+    configs = np.asarray(list(product(range(local_dim), repeat=psi.L)), dtype=int)
+    probabilities = sampler.probabilities(configs)
+    amplitudes = sampler.amplitudes(configs)
+    sampled_configs, sampled_probs = sampler.sample_arrays(32, seed=3)
+
+    assert sampler.resolved_backend == "symmray"
+    assert sampler.physical_code_maps is not None
+    assert all(
+        set(code_map) == set(range(local_dim))
+        for code_map in sampler.physical_code_maps
+    )
+    np.testing.assert_allclose(np.abs(amplitudes) ** 2, probabilities, atol=1e-12)
+    np.testing.assert_allclose(
+        sampler.probabilities(sampled_configs),
+        sampled_probs,
+        atol=1e-12,
+    )
+
+    for config in sampled_configs[:4]:
+        branch = psi.copy()
+        branch.isel_({
+            branch.site_ind(site): int(code)
+            for site, code in enumerate(config)
+        })
+        value = branch.contract(all).data
+        if hasattr(value, "get_scalar_element"):
+            value = value.phase_sync().get_scalar_element()
+        else:
+            value = np.asarray(value).item()
+        expected = abs(value) ** 2 / (psi.H @ psi).real
+        assert sampler.probabilities(config[None, :])[0] == pytest.approx(expected)
+
+
+def test_mps_sampler_symmray_physical_code_maps_retain_degenerate_sectors():
+    """Source physical sectors remain interpretable after canonical pruning."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, ps_to_mps
+
+    psi = ps_to_mps(
+        3,
+        fermion=Fermion(spinful=True, symmetry="U1"),
+        occupations=(1, 1, 0),
+    )
+    sampler = sampler_mod.MpsSampler(psi)
+    maps = sampler.physical_code_maps
+
+    assert maps == (
+        {0: (0, 0), 1: (1, 0), 2: (1, 1), 3: (2, 0)},
+    ) * 3
+    maps[0].clear()
+    assert sampler.physical_code_maps[0][2] == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "expected"),
+    (
+        ("Z2", ((0, 0), (1, 1), (1, 0), (0, 1))),
+        ("U1", ((0, 0), (0, 1), (1, 0), (1, 1))),
+        ("U1U1", ((0, 0), (0, 1), (1, 0), (1, 1))),
+        ("Z2Z2", ((0, 0), (0, 1), (1, 0), (1, 1))),
+    ),
+)
+def test_mps_sampler_fermion_configuration_encoding_is_symmetry_aware(
+    symmetry,
+    expected,
+):
+    """Raw MPS codes decode consistently before entering a VMC workflow."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    psi = SymMPS.random(
+        3,
+        symmetry=symmetry,
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(3),
+        bond_dim=4,
+        seed=37,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    encoding = sampler.fermion_configuration_encoding(fermion)
+    codes = np.repeat(np.arange(4, dtype=np.int64)[:, None], psi.L, axis=1)
+
+    assert encoding.symmetry == symmetry
+    assert encoding.spinful
+    assert encoding.code_to_occupations == (expected,) * psi.L
+    occupations = encoding.decode(codes)
+    np.testing.assert_array_equal(occupations[:, 0], np.asarray(expected))
+    np.testing.assert_array_equal(encoding.encode(occupations), codes)
+
+    batch = sampler.sample_batch(8, seed=7, to_numpy=True, fermion=fermion)
+    assert batch.configuration_encoding == encoding
+    np.testing.assert_array_equal(batch.occupations(), encoding.decode(batch.configs))
+
+
+def test_mps_sampler_fermion_configuration_encoding_rejects_wrong_symmetry():
+    """MPS samples cannot silently reuse a codec from another symmetry."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, ps_to_mps
+
+    psi = ps_to_mps(
+        2,
+        fermion=Fermion(spinful=True, symmetry="U1"),
+        occupations=(1, 1),
+    )
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+
+    with pytest.raises(ValueError, match="must match"):
+        sampler.fermion_configuration_encoding(
+            Fermion(spinful=True, symmetry="Z2")
+        )
+
+
+def test_mps_sampler_bound_fermion_sets_the_batch_configuration_contract():
+    """A bound Fermion removes VMC code-convention boilerplate per batch."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry="Z2")
+    psi = SymMPS.random(
+        3,
+        symmetry="Z2",
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(3),
+        bond_dim=4,
+        seed=43,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray", fermion=fermion)
+
+    encoding = sampler.fermion_configuration_encoding()
+    batch = sampler.sample_batch(8, seed=7, to_numpy=True)
+
+    assert sampler.fermion is fermion
+    assert batch.configuration_encoding == encoding
+    np.testing.assert_array_equal(batch.occupations(), encoding.decode(batch.configs))
+
+    codes = np.repeat(np.arange(4, dtype=np.int64)[:, None], psi.L, axis=1)
+    np.testing.assert_allclose(
+        sampler.fermion_diagonal_values(codes, "total_charge"),
+        (0.0, 6.0, 3.0, 3.0),
+    )
+
+
+def test_mps_sampler_symmray_cached_branches_prune_charge_forbidden_work():
+    """The sparse path skips impossible charge branches without densifying."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry="U1")
+    psi = SymMPS.random(
+        4,
+        symmetry="U1",
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(4),
+        bond_dim=4,
+        seed=41,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs, probs = sampler.sample_arrays(32, seed=5)
+    stats = sampler.symmray_sampling_stats
+
+    assert stats["cached_local_slices"]
+    assert stats["charge_pruned_branches"] > 0
+    assert stats["candidate_contractions"] < 4 * stats["conditional_evaluations"]
+    np.testing.assert_allclose(sampler.probabilities(configs), probs, atol=1e-12)
+
+
+def test_mps_sampler_symmray_prefix_controls_bound_high_entropy_batches():
+    """Prefix sharing reduces work and the auto cap falls back safely."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymMPS, site_charge_from_occupations
+
+    psi = SymMPS.random(
+        4,
+        symmetry="U1",
+        fermionic=False,
+        bond_dim=4,
+        phys_dim={0: 1, 1: 1, 2: 1},
+        site_charge=site_charge_from_occupations((1, 1, 1, 1)),
+        seed=7,
+        dtype="complex128",
+    ).mps
+    shared = sampler_mod.MpsSampler(
+        psi,
+        backend="symmray",
+        prefix_strategy="prefix",
+        max_prefix_groups=None,
+    )
+    shared_configs, shared_probs = shared.sample_arrays(64, seed=3)
+    bounded = sampler_mod.MpsSampler(
+        psi,
+        backend="symmray",
+        prefix_strategy="auto",
+        max_prefix_groups=1,
+    )
+    bounded_configs, bounded_probs = bounded.sample_arrays(64, seed=3)
+    serial = sampler_mod.MpsSampler(
+        psi,
+        backend="symmray",
+        prefix_strategy="serial",
+    )
+    serial_configs, serial_probs = serial.sample_arrays(64, seed=3)
+    adaptive = sampler_mod.MpsSampler(
+        psi,
+        backend="symmray",
+        prefix_strategy="auto",
+        max_prefix_groups=None,
+    )
+    adaptive_configs, adaptive_probs = adaptive.sample_arrays(64, seed=3)
+
+    assert shared.symmray_sampling_stats["conditional_evaluations"] < 64 * psi.L
+    assert not shared.symmray_sampling_stats["serial_fallback"]
+    assert bounded.symmray_sampling_stats["serial_fallback"]
+    assert bounded.symmray_sampling_stats["max_active_prefix_groups"] <= 1
+    assert serial.symmray_sampling_stats["conditional_evaluations"] == 64 * psi.L
+    assert adaptive.symmray_sampling_stats["adaptive_serial_fallback"]
+    np.testing.assert_allclose(
+        shared.probabilities(shared_configs),
+        shared_probs,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        bounded.probabilities(bounded_configs),
+        bounded_probs,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        serial.probabilities(serial_configs),
+        serial_probs,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        adaptive.probabilities(adaptive_configs),
+        adaptive_probs,
+        atol=1e-12,
+    )
+
+
+def test_mps_sampler_rejects_invalid_symmray_prefix_controls():
+    """Prefix controls should be explicit before any MPS preprocessing."""
+    psi = qtn.MPS_computational_state("0")
+
+    with pytest.raises(ValueError, match="Unknown Symmray prefix strategy"):
+        sampler_mod.MpsSampler(psi, prefix_strategy="branchy")
+    with pytest.raises(ValueError, match="max_prefix_groups"):
+        sampler_mod.MpsSampler(psi, max_prefix_groups=0)
+
+
+def test_mps_sampler_symmray_torch_nonfermionic_blocks_stay_on_torch():
+    """Generic Symmray Torch blocks preserve device-resident outputs."""
+    pytest.importorskip("symmray")
+    torch = pytest.importorskip("torch")
+    from pepsy.tensors import SymMPS, site_charge_from_occupations
+
+    psi = SymMPS.random(
+        3,
+        symmetry="U1",
+        fermionic=False,
+        bond_dim=3,
+        phys_dim={0: 1, 1: 1, 2: 1},
+        site_charge=site_charge_from_occupations((1, 1, 1)),
+        seed=7,
+        dtype="complex128",
+        to_backend=torch.as_tensor,
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs, probs = sampler.sample_arrays(8, seed=3)
+
+    assert isinstance(configs, torch.Tensor)
+    assert isinstance(probs, torch.Tensor)
+    torch.testing.assert_close(
+        sampler.probabilities(configs, to_numpy=False),
+        probs,
+    )
+
+
+def test_mps_sampler_symmray_cupy_nonfermionic_blocks_stay_on_cupy():
+    """Generic Symmray CuPy blocks preserve device-resident outputs."""
+    pytest.importorskip("symmray")
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+    from pepsy.tensors import SymMPS, site_charge_from_occupations
+
+    psi = SymMPS.random(
+        3,
+        symmetry="U1",
+        fermionic=False,
+        bond_dim=3,
+        phys_dim={0: 1, 1: 1, 2: 1},
+        site_charge=site_charge_from_occupations((1, 1, 1)),
+        seed=7,
+        dtype="complex128",
+        to_backend=cupy.asarray,
+    ).mps
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs, probs = sampler.sample_arrays(8, seed=3)
+
+    assert isinstance(configs, cupy.ndarray)
+    assert isinstance(probs, cupy.ndarray)
+    cupy.testing.assert_allclose(
+        sampler.probabilities(configs, to_numpy=False),
+        probs,
+    )
+
+
+def test_mps_sampler_symmray_torch_blocks_stay_on_torch():
+    """The Symmray path should keep Torch-backed blocks and samples on Torch."""
+    pytest.importorskip("symmray")
+    torch = pytest.importorskip("torch")
+    from pepsy.tensors import Fermion, ps_to_mps
+
+    fermion = Fermion(spinful=True, symmetry="U1U1")
+    psi = ps_to_mps(
+        3,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0)),
+        to_backend=lambda array: torch.as_tensor(array),
+    )
+    sampler = sampler_mod.MpsSampler(psi, backend="symmray")
+    configs, probs = sampler.sample_arrays(3, seed=7)
+    batch = sampler.sample_batch(3, seed=7, fermion=fermion)
+
+    assert sampler.resolved_backend == "symmray"
+    assert isinstance(configs, torch.Tensor)
+    assert isinstance(probs, torch.Tensor)
+    assert batch.backend == "torch"
+    assert isinstance(batch.occupations(), torch.Tensor)
+    assert tuple(batch.occupations().shape) == (3, 3, 2)
+    torch.testing.assert_close(
+        configs,
+        torch.tensor([[2, 1, 2]] * 3, dtype=torch.long, device=configs.device),
+    )
+    torch.testing.assert_close(probs, torch.ones(3, dtype=probs.dtype))
 
 
 def test_vec_sampler_rejects_invalid_vector_size():

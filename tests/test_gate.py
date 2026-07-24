@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import quimb.tensor as qtn
 
-from pepsy import ps_to_3dpeps, ps_to_peps
+from pepsy import hrs_to_peps, ps_to_3dpeps, ps_to_peps
 from pepsy.operators.gates import (
     build_mpo_from_gates,
     build_pepo_from_gates,
@@ -1231,7 +1231,7 @@ def test_gate_simple_2d_routes_swaps_with_real_torch_dtype():
     """Internal SWAP tensors should match real torch PEPS dtype."""
     torch = pytest.importorskip("torch")
 
-    peps = ps_to_peps(2, 3, dtype="float64", chi=2)
+    peps = hrs_to_peps(2, 3, dtype="float64", chi=2)
     peps.apply_to_arrays(lambda x: torch.as_tensor(x, dtype=torch.float64))
     gate = torch.eye(4, dtype=torch.float64).reshape(2, 2, 2, 2)
     gauges = {}

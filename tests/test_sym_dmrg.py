@@ -372,6 +372,39 @@ def test_symdmrg2_auto_ramp_blocks_early_energy_convergence(monkeypatch):
     assert opt.convergence_diagnostics[-1]["bond_schedule_ready"] is True
 
 
+def test_symdmrg2_explicit_held_bond_schedule_can_converge(monkeypatch):
+    """An explicit final-bond hold should not need an extra hidden sweep."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=1,
+    )
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=2,
+        bond_dims=[1, 2, 2],
+        cutoff=1e-10,
+        compute_initial_energy=False,
+        norm_check="off",
+    )
+    seen_bonds = []
+
+    def flat_sweep(direction, canonize=True, **kwargs):
+        del direction, canonize
+        seen_bonds.append(kwargs["max_bond"])
+        return 0.0
+
+    monkeypatch.setattr(opt, "sweep", flat_sweep)
+    opt.solve(max_sweeps=3, sweep_sequence="R", tol=1e-10)
+
+    assert seen_bonds == [1, 2, 2]
+    assert opt.converged is True
+    assert opt.convergence_diagnostics[-1]["bond_schedule_ready"] is True
+    assert opt.convergence_diagnostics[-1]["previous_bond_is_final"] is True
+
+
 def test_symdmrg2_min_sweeps_blocks_early_energy_convergence(monkeypatch):
     """Sweep convergence should require a clean comparison window."""
     pytest.importorskip("symmray")
@@ -965,6 +998,8 @@ def test_symdmrg2_profile_records_phase_timings():
     assert all(event["elapsed"] >= 0.0 for event in opt.profile_diagnostics)
     assert summary["enabled"]
     assert summary["num_events"] == len(opt.profile_diagnostics)
+    assert summary["wall_elapsed"] == pytest.approx(summary["phase_totals"]["solve"])
+    assert summary["phase_wall_fractions"]["solve"] == pytest.approx(1.0)
     assert summary["num_matvecs"] >= 1
     assert summary["phase_counts"]["matvec"] >= 1
     assert opt.summary()["num_profile_diagnostics"] == len(opt.profile_diagnostics)
@@ -1507,18 +1542,19 @@ def test_symdmrg2_block_native_matvec_reuses_projected_problem_cache(monkeypatch
     native_a = opt.two_site_matvec_symmray(site, trial_a)
     dense_b = opt.two_site_matvec_dense_reference(site, trial_b)
     native_b = opt.two_site_matvec_symmray(site, trial_b)
+    native_c = opt.two_site_matvec_symmray(site, trial_a)
 
     assert calls == [site, site + 1]
     assert opt.projected_problem_cache_misses == 1
-    assert opt.projected_problem_cache_hits == 1
-    assert opt.summary()["projected_problem_cache_hits"] == 1
+    assert opt.projected_problem_cache_hits == 2
+    assert opt.summary()["projected_problem_cache_hits"] == 2
     assert opt.profile_summary()["projected_problem_cache_misses"] == 1
     problem = opt._last_matvec_projected_problem
     problem_summary = problem.summary()
     assert problem_summary["right_contract_compiled_block_plan_builds"] == 1
     assert problem_summary["left_contract_compiled_block_plan_builds"] == 1
-    assert problem_summary["right_contract_compiled_block_plan_uses"] == 1
-    assert problem_summary["left_contract_compiled_block_plan_uses"] == 1
+    assert problem_summary["right_contract_compiled_block_plan_uses"] == 2
+    assert problem_summary["left_contract_compiled_block_plan_uses"] == 2
     assert problem_summary["right_contract_compiled_block_plan_terms"] > 0
     assert problem_summary["left_contract_compiled_block_plan_terms"] > 0
     assert problem_summary["right_contract_compiled_block_plan_mode"] == (
@@ -1527,9 +1563,22 @@ def test_symdmrg2_block_native_matvec_reuses_projected_problem_cache(monkeypatch
     assert problem_summary["left_contract_compiled_block_plan_mode"] == (
         "output_block_matmul"
     )
+    assert problem_summary["right_contract_compiled_block_plan_layout_frozen"]
+    assert problem_summary["left_contract_compiled_block_plan_layout_frozen"]
+    assert problem_summary["right_contract_compiled_block_plan_layout_checks"] == 1
+    assert problem_summary["left_contract_compiled_block_plan_layout_checks"] == 1
+    assert (
+        problem_summary["right_contract_compiled_block_plan_layout_fastpath_uses"]
+        >= 1
+    )
+    assert (
+        problem_summary["left_contract_compiled_block_plan_layout_fastpath_uses"]
+        >= 1
+    )
     for sector in theta.data.blocks:
         assert native_a.data.blocks[sector] == pytest.approx(dense_a.data.blocks[sector])
         assert native_b.data.blocks[sector] == pytest.approx(dense_b.data.blocks[sector])
+        assert native_c.data.blocks[sector] == pytest.approx(native_a.data.blocks[sector])
 
 
 def test_symdmrg2_matvec_diagnostics_record_cache_and_projector_stats():
@@ -2561,6 +2610,48 @@ def test_symdmrg2_prunes_projected_dead_variational_blocks_on_mapped_2d_case():
     assert diagnostic["method"] == "structural"
     assert diagnostic["live_blocks"] <= diagnostic["kept_blocks"]
     assert set(pruned.data.blocks) < set(theta.data.blocks)
+
+
+def test_symdmrg2_pruning_skips_norm_scan_when_all_sectors_are_live(monkeypatch):
+    """Fully supported theta layouts should not scan every block norm."""
+    pytest.importorskip("symmray")
+    state, mpo = _fh_u1u1_chain(
+        4,
+        [(1, 0), (0, 1), (1, 0), (0, 1)],
+        bond_dim=2,
+        seed=37,
+    )
+    opt = pepsy.SymDMRG2(
+        mpo,
+        state,
+        chi=4,
+        cutoff=1e-10,
+        local_solver="lanczos",
+        dense_threshold=0,
+        norm_check="off",
+        compute_initial_energy=False,
+    )
+    opt._canonize_for_sweep("right")
+    opt.build_block_environments()
+    theta = opt.two_site_theta(1)
+    problem, _ = opt._get_projected_problem(1, theta)
+    all_sectors = set(theta.data.blocks)
+    monkeypatch.setattr(
+        problem,
+        "structural_output_sectors",
+        lambda: set(all_sectors),
+    )
+
+    def fail_block_norm(_block):
+        raise AssertionError("fully live layouts should skip block norm scans")
+
+    monkeypatch.setattr(opt, "_block_norm", fail_block_norm)
+    pruned, diagnostic = opt._prune_theta_to_projected_support(1, theta)
+
+    assert pruned is theta
+    assert diagnostic["removed_blocks"] == 0
+    assert diagnostic["nonzero_input_blocks"] is None
+    assert diagnostic["nonzero_input_scan_skipped"] is True
 
 
 def test_symdmrg2_sector_enrichment_reaches_ed_from_narrow_initial_support():

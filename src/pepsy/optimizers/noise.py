@@ -1320,7 +1320,7 @@ def _is_stabilizer_trajectory_optimizer(optimizer) -> bool:
 
 
 def _trajectory_norm_squared(optimizer) -> float:
-    """Read the represented state norm through either public MPS optimizer API."""
+    """Read the represented state norm through the optimizer's public API."""
     norm = getattr(optimizer, "norm", None)
     if callable(norm):
         value = _trajectory_real_scalar(norm(), label="trajectory state norm")
@@ -1361,6 +1361,30 @@ def _mps_outcome_norm_squared(optimizer, matrix, where) -> float:
     return value * value
 
 
+def _tree_outcome_norm_squared(optimizer, matrix, where) -> float:
+    """Evaluate one Kraus branch on a copied ordinary TTN without mutation."""
+    copy = getattr(optimizer, "copy", None)
+    if not callable(copy):
+        raise TypeError(
+            "State-dependent trajectory channels require an optimizer with copy()."
+        )
+    candidate = copy()
+    apply_gate = getattr(candidate, "apply_gate", None)
+    if not callable(apply_gate):
+        raise TypeError(
+            "State-dependent trajectory channels require TreeOptimizer "
+            "apply_gate(...)."
+        )
+    matrix = _to_trajectory_backend(matrix, candidate)
+    support = _trajectory_where(where)
+    target = support[0] if len(support) == 1 else support
+    apply_gate(matrix, target)
+    value = _trajectory_real_scalar(candidate.norm(), label="Kraus branch norm")
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError("Kraus branch produced an invalid TTN norm.")
+    return value * value
+
+
 def _stn_outcome_norm_squared(optimizer, matrix, where) -> float:
     """Evaluate one physical Kraus branch in an independent STN frame copy."""
     candidate = optimizer.copy()
@@ -1372,9 +1396,14 @@ def _stn_outcome_norm_squared(optimizer, matrix, where) -> float:
 
 
 def _to_trajectory_backend(matrix, optimizer):
-    """Convert generated NumPy matrices to the ordinary MPS state backend."""
+    """Convert generated NumPy matrices to the live MPS or TTN backend."""
     converter = getattr(optimizer, "_to_state_backend", None)
-    return converter(matrix) if callable(converter) else matrix
+    if callable(converter):
+        return converter(matrix)
+    converter = getattr(optimizer, "_as_state_backend", None)
+    if callable(converter):
+        return converter(matrix, warn=False)
+    return matrix
 
 
 def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.ndarray:
@@ -1384,6 +1413,14 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
         branch_norm_squared = np.asarray(
             [
                 _stn_outcome_norm_squared(optimizer, outcome.gate, where)
+                for outcome in channel.outcomes
+            ],
+            dtype=float,
+        )
+    elif callable(getattr(optimizer, "apply_gate", None)):
+        branch_norm_squared = np.asarray(
+            [
+                _tree_outcome_norm_squared(optimizer, outcome.gate, where)
                 for outcome in channel.outcomes
             ],
             dtype=float,
@@ -1782,7 +1819,7 @@ def _check_coalesced_optimizer(optimizer):
     if not callable(getattr(optimizer, "copy", None)):
         raise TypeError(
             "coalesced trajectory replay requires an optimizer with copy(); "
-            "use MpsOptimizer or MpsStabOptimizer."
+            "use MpsOptimizer, TreeOptimizer, or MpsStabOptimizer."
         )
 
 
@@ -1939,12 +1976,17 @@ def _coalesced_measurement_probability(optimizer, pauli, where) -> float:
         arg = where[0] if len(where) == 1 else where
         value = expectation(pauli, arg)
     else:
+        expectation_pauli = getattr(optimizer, "expectation_pauli", None)
+        if callable(expectation_pauli):
+            arg = where[0] if len(where) == 1 else where
+            value = expectation_pauli(pauli, arg)
+            return min(max(0.5 * (1.0 + float(value)), 0.0), 1.0)
         mapped = getattr(optimizer, "_logical_to_physical_where", None)
         state_expectation = getattr(optimizer, "_state_expectation", None)
         if not callable(mapped) or not callable(state_expectation):
             raise TypeError(
-                "coalesced measurement branching requires MpsOptimizer or "
-                "MpsStabOptimizer expectation support."
+                "coalesced measurement branching requires MpsOptimizer, "
+                "MpsStabOptimizer, or TreeOptimizer expectation support."
             )
         value = state_expectation(pauli, mapped(where))
     return min(max(0.5 * (1.0 + float(value)), 0.0), 1.0)
@@ -2199,19 +2241,20 @@ def run_trajectory_shots(
     strategy: str = "independent",
     max_branches: int | None = _AUTO_MAX_BRANCHES,
 ) -> TrajectoryShotResult | CoalescedTrajectoryResult:
-    """Replay user-defined noisy gate-stream trajectories on either MPS optimizer.
+    """Replay user-defined noisy gate-stream trajectories on MPS or tree optimizers.
 
     Insert :class:`TrajectoryEvent` objects or Pepsy stochastic entries directly
     into an ordinary gate stream. A ``mixture`` selects a known unitary branch
     by its explicit probability. A ``kraus`` channel evaluates all local branch
-    norms on the current MPS, samples the conditional probability, applies the
+    norms on the current MPS or TTN, samples the conditional probability, applies the
     chosen branch, and normalizes before evolution continues. This includes
     non-Pauli channels such as ``("amplitude_damping", gamma, q)`` without
     forming a density matrix.
 
-    ``optimizer_factory`` must create a fresh :class:`MpsOptimizer` or
-    :class:`MpsStabOptimizer` per shot. Gate segments between channel events
-    are batched, so a trajectory does not rebuild an optimizer for every gate.
+    ``optimizer_factory`` must create a fresh :class:`MpsOptimizer`,
+    :class:`TreeOptimizer`, or :class:`MpsStabOptimizer` per shot. Gate segments
+    between channel events are batched, so a trajectory does not rebuild an
+    optimizer for every gate.
     Set ``strategy="coalesced"`` to share deterministic prefixes and retain one
     optimizer per distinct sampled branch. ``strategy="auto"`` tries coalescing
     and restarts independently if ``max_branches`` would be exceeded.
@@ -2921,10 +2964,7 @@ def sample_stim_circuits(circuit, shots: int, *, seed=None) -> list[StimNoiseSam
 
 
 def _stream_on_optimizer_backend(stream, optimizer):
-    """Convert library-generated dense gates to an ordinary MPS backend."""
-    converter = getattr(optimizer, "_to_state_backend", None)
-    if not callable(converter):
-        return stream
+    """Convert library-generated dense gates to the live MPS/TTN backend."""
     converted = []
     for entry in stream:
         if (
@@ -2933,7 +2973,7 @@ def _stream_on_optimizer_backend(stream, optimizer):
             and not isinstance(entry[0], str)
             and hasattr(entry[0], "shape")
         ):
-            converted.append((converter(entry[0]), entry[1]))
+            converted.append((_to_trajectory_backend(entry[0], optimizer), entry[1]))
         else:
             converted.append(entry)
     return tuple(converted)

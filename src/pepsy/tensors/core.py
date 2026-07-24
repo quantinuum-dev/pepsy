@@ -2,6 +2,7 @@
 
 import math
 import warnings
+from collections.abc import Mapping
 from numbers import Integral
 from string import Formatter
 from typing import Any
@@ -51,12 +52,17 @@ __all__ = [
     "ps_to_peps",
     "ps_to_3dpeps",
     "ps_to_mps",
+    "ps_to_ttn",
     "ps_to_pepo",
     "ps_to_mpo",
     "haar_random_state",
     "random_haar_qubit",
+    "hrs_to_peps",
+    "hrs_to_mps",
+    "hrs_to_ttn",
     "hrps_to_peps",
     "hrps_to_mps",
+    "hrps_to_ttn",
     "id_to_pepo",
     "add_cycle",
 ]
@@ -1161,7 +1167,7 @@ def build_optimizer(
     directory=False,
     hash_method: str = "b",
     overwrite=False,
-    on_trial_error: str = "warn",
+    on_trial_error: str = "ignore",
     slicing_opts: dict | None = None,
     reconf_opts: dict | None = None,
     slicing_reconf_opts: dict | None = None,
@@ -1193,7 +1199,9 @@ def build_optimizer(
     overwrite : bool | str, optional
         Cache overwrite behavior.
     on_trial_error : str, optional
-        How to handle individual trial failures.
+        How to handle individual trial failures. Defaults to ``"ignore"``
+        because one invalid candidate path does not make the reusable search
+        itself invalid; pass ``"warn"`` or ``"raise"`` to inspect failures.
     slicing_opts : dict | None, optional
         Options passed to cotengra slicing heuristics.
     reconf_opts : dict | None, optional
@@ -2128,36 +2136,131 @@ def expec_mpo(mpo, mps, *, contraction_opt=None):
     return (mps_h | mpo | mps_n).contract(all, optimize=contraction_opt) / divisor
 
 
-def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, cyclic: bool = False, chi: int = 1, rand_strength: float = 0.0):
-    """Create a product-state PEPS parameterized by ``theta``.
+def ps_to_peps(
+    Lx: int,
+    Ly: int | None = None,
+    dtype: str = "complex128",
+    theta: float = 0.0,
+    cyclic: bool = False,
+    *,
+    fermion=None,
+    occupations=None,
+    site_charge=None,
+    seed=666,
+    contraction_opt="auto-hq",
+    to_backend=None,
+):
+    """Create a product-state PEPS, optionally in a Fermion charge sector.
 
     Each site tensor is set so the physical vector is
     ``[cos(theta), sin(theta)]`` with trivial virtual bonds.
+
+    If only ``Lx`` is supplied, a square ``Lx x Lx`` lattice is built. For a
+    Fermion-aware state, ``occupations`` can be a mapping keyed by PEPS
+    coordinates or a row-major sequence of ``Lx * Ly`` local charge labels.
+    The returned object is the underlying quimb PEPS, matching
+    :func:`ps_to_mps`; its physical tensors are native Symmray arrays.
 
     Parameters
     ----------
     Lx : int
         Lattice size in x direction.
     Ly : int
-        Lattice size in y direction.
+        Lattice size in y direction. If omitted, use a square lattice.
     dtype : str, optional
         Tensor dtype passed to numpy/quimb.
     theta : float, optional
         Product-state angle controlling local amplitudes.
     cyclic : bool, optional
-        If True, add periodic bonds (bond dimension 1) via :func:`add_cycle`.
-    chi : int, optional
-        Target bond dimension. If greater than 1, the bond dimension is
-        expanded via ``expand_bond_dimension`` after initialization.
-    rand_strength : float, optional
-        Random noise strength passed to ``expand_bond_dimension``.
+        If True, add periodic bonds. Fermion-aware states use the native
+        Symmray PEPS constructor so periodic fermionic bonds are retained.
+    fermion : :class:`~pepsy.tensors.Fermion`, optional
+        If supplied, construct a native fermionic Symmray PEPS using the
+        model's physical sectors and symmetry.
+    occupations : mapping or sequence, optional
+        Local charge labels selecting the product-state sector. Mappings use
+        ``(x, y)`` keys; sequences are interpreted in row-major coordinate
+        order. If omitted, the Fermion half-filled pattern is used.
+    site_charge : callable or mapping, optional
+        Advanced override for the per-site charge pattern. By default this is
+        derived from ``occupations``.
+    seed : int, optional
+        Random seed for the Fermion-aware and ordinary constructors.
+    contraction_opt : object, optional
+        Contraction optimizer stored by the internal symmetric wrapper while
+        constructing a Fermion-aware PEPS.
+    to_backend : callable, optional
+        Backend mapper applied to Fermion-aware Symmray blocks.
 
     Returns
     -------
     quimb.tensor.PEPS
-        Initialized PEPS with bond dimension ``chi``.
+        Initialized bond-one PEPS.
     """
-    peps = qtn.PEPS.rand(Lx=Lx, Ly=Ly, bond_dim=1, seed=666, dtype=dtype)
+    if Ly is None:
+        if isinstance(Lx, (tuple, list)):
+            if len(Lx) != 2:
+                raise ValueError("A PEPS shape must contain exactly two dimensions.")
+            Lx, Ly = Lx
+        else:
+            Ly = Lx
+    Lx = int(Lx)
+    Ly = int(Ly)
+    if Lx < 1 or Ly < 1:
+        raise ValueError("PEPS dimensions must be positive integers.")
+
+    if fermion is not None:
+        from .symmetric import (  # pylint: disable=import-outside-toplevel
+            Fermion,
+            SymPEPS,
+            site_charge_from_occupations,
+        )
+
+        if not isinstance(fermion, Fermion):
+            raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
+
+        coordinates = tuple(
+            (x, y)
+            for x in range(Lx)
+            for y in range(Ly)
+        )
+        if occupations is None:
+            occupation_values = fermion.half_filled_occupations(len(coordinates))
+            occupations = dict(zip(coordinates, occupation_values))
+        elif isinstance(occupations, Mapping):
+            occupations = dict(occupations)
+        else:
+            occupations = tuple(occupations)
+            if len(occupations) != len(coordinates):
+                raise ValueError(
+                    "occupations must contain exactly Lx * Ly charge labels."
+                )
+            occupations = dict(zip(coordinates, occupations))
+        if site_charge is None:
+            site_charge = site_charge_from_occupations(occupations)
+
+        state = SymPEPS.random(
+            Lx,
+            Ly,
+            symmetry=fermion.symmetry,
+            bond_dim=1,
+            phys_dim=fermion.physical_sectors,
+            cyclic=cyclic,
+            seed=seed,
+            dtype=dtype,
+            fermionic=True,
+            site_charge=site_charge,
+            contraction_opt=contraction_opt,
+            to_backend=to_backend,
+        )
+        return state.peps
+
+    if occupations is not None or site_charge is not None:
+        raise ValueError("occupations and site_charge require fermion=...")
+    if to_backend is not None:
+        raise ValueError("to_backend requires fermion=...")
+
+    peps = qtn.PEPS.rand(Lx=Lx, Ly=Ly, bond_dim=1, seed=seed, dtype=dtype)
     local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
     for x in range(Lx):
         for y in range(Ly):
@@ -2173,8 +2276,6 @@ def ps_to_peps(Lx: int, Ly: int, dtype: str = "complex128", theta: float = 0.0, 
     peps.astype_(dtype)
     if cyclic:
         peps = add_cycle(peps, bond_dim=1)
-    if chi > 1:
-        peps.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return peps
 
 
@@ -2247,22 +2348,98 @@ def ps_to_3dpeps(
     return peps
 
 
+def _fermionic_site_charge_values(site_charge, n):
+    """Resolve a Fermion constructor's public site-charge input to a map."""
+    if callable(site_charge):
+        return {site: site_charge(site) for site in range(n)}
+    try:
+        return {site: site_charge[site] for site in range(n)}
+    except (KeyError, TypeError) as exc:
+        raise TypeError(
+            "site_charge must be callable or map every site 0 .. n - 1."
+        ) from exc
+
+
+def _fermionic_product_fock_specs(fermion, n, occupations, site_charge):
+    """Resolve charge labels to definite local Fermion Fock basis states."""
+    requested_charges = (
+        None
+        if site_charge is None
+        else _fermionic_site_charge_values(site_charge, n)
+    )
+    if occupations is None:
+        if requested_charges is None:
+            occupations = tuple(fermion.half_filled_occupations(n))
+        else:
+            occupations = tuple(requested_charges[site] for site in range(n))
+    else:
+        occupations = tuple(occupations)
+        if len(occupations) != n:
+            raise ValueError("occupations must contain exactly one label per site.")
+
+    specs = {
+        site: fermion.local_fock_state(occupation, site=site)
+        for site, occupation in enumerate(occupations)
+    }
+    if requested_charges is not None:
+        for site, requested in requested_charges.items():
+            requested_charge, _ = fermion.local_fock_state(requested, site=site)
+            if requested_charge != specs[site][0]:
+                raise ValueError(
+                    f"site_charge at site {site} is incompatible with its "
+                    "requested Fock occupation."
+                )
+
+    return specs, {site: charge for site, (charge, _) in specs.items()}
+
+
+def _set_fermionic_product_leaf(tensor, physical_index, *, charge, basis_index):
+    """Replace a Symmray leaf by one selected Fock-basis vector in-place."""
+    data = tensor.data
+    physical_axis = tensor.inds.index(physical_index)
+    chargemap = data.indices[physical_axis].chargemap
+    local_index = None
+    for sector, size in chargemap.items():
+        size = int(size)
+        if sector == charge:
+            local_index = int(basis_index)
+            if not 0 <= local_index < size:
+                raise ValueError(
+                    f"Fock basis index {basis_index} is outside charge sector "
+                    f"{charge!r}."
+                )
+            break
+    if local_index is None:
+        raise ValueError(f"physical index has no sector for charge {charge!r}.")
+
+    selected = False
+    for block_sector, block in data.blocks.items():
+        block[...] = 0
+        if block_sector[physical_axis] == charge:
+            entry = [0] * block.ndim
+            entry[physical_axis] = local_index
+            block[tuple(entry)] = 1
+            selected = True
+    if not selected:
+        raise ValueError(
+            f"no compatible Symmray block exists for physical charge {charge!r}."
+        )
+    tensor.modify(data=data)
+
+
 def ps_to_mps(
     L: int,
     dtype: str = "complex128",
     theta: float = 0.0,
     cyclic: bool = False,
-    chi: int = 1,
-    rand_strength: float = 0.0,
     *,
     fermion=None,
     occupations=None,
     site_charge=None,
     seed=666,
-    random_rounds=1000,
     to_backend=None,
 ):
-    """Create a product-state MPS, optionally in a Fermion charge sector.
+    """Create a bond-one product-state MPS, optionally in a Fermion sector.
 
     Each site tensor is set so the physical vector is
     ``[cos(theta), sin(theta)]`` with trivial virtual bonds.
@@ -2277,41 +2454,34 @@ def ps_to_mps(
         Product-state angle controlling local amplitudes.
     cyclic : bool, optional
         If True, create a periodic MPS with bond dimension 1.
-    chi : int, optional
-        Target bond dimension. If greater than 1, the bond dimension is
-        expanded via ``expand_bond_dimension`` after initialization.
-    rand_strength : float, optional
-        Random noise strength passed to ``expand_bond_dimension``.
-
     fermion : :class:`~pepsy.tensors.Fermion`, optional
         If supplied, construct a native fermionic Symmray MPS using the
-        model's physical sectors and symmetry. With ``chi=1`` this is a
-        charge-fixed product state. For ``chi>1`` a charge-preserving random
-        unitary growth produces a symmetric initial MPS.
+        model's physical sectors and symmetry. The result always has bond
+        dimension one and is fixed to the requested Fock basis state.
     occupations : sequence, optional
-        Local charge labels used to select the product sector. If omitted,
-        ``fermion.half_filled_occupations(L)`` is used.
+        Local Fock occupations. A spinful value can be a scalar particle count
+        or an explicit ``(n_up, n_down)`` pair. If omitted,
+        ``fermion.half_filled_occupations(L)`` is used. A scalar spinful
+        charge-one value selects the deterministic checkerboard spin pattern.
     site_charge : callable or mapping, optional
         Advanced override for the per-site charge pattern. By default this is
         derived from ``occupations``.
     seed : int, optional
         Seed for the Fermion-aware construction and the ordinary constructor.
-    random_rounds : int, optional
-        Maximum number of charge-preserving random-unitary rounds used when
-        ``fermion`` is supplied with ``chi > 1``.
     to_backend : callable, optional
         Backend mapper applied to Fermion-aware Symmray blocks.
 
     Returns
     -------
     quimb.tensor.MatrixProductState
-        Initialized MPS with bond dimension ``chi``. When ``fermion`` is
-        supplied, the physical tensors are native fermionic Symmray arrays.
+        Initialized bond-one MPS. When ``fermion`` is supplied, the physical
+        tensors are native fermionic Symmray arrays.
     """
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
             Fermion,
             SymMPS,
+            _apply_to_tensor_network_arrays,
             site_charge_from_occupations,
         )
 
@@ -2319,42 +2489,26 @@ def ps_to_mps(
             raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
         if cyclic:
             raise ValueError("Fermion-aware ps_to_mps currently requires an open chain.")
-        if occupations is not None:
-            occupations = tuple(occupations)
-            if len(occupations) != int(L):
-                raise ValueError("occupations must contain exactly L charge labels.")
-        if occupations is None:
-            occupations = fermion.half_filled_occupations(L)
-        if site_charge is None:
-            site_charge = site_charge_from_occupations(occupations)
-        chi = int(chi)
-        if chi < 1:
-            raise ValueError("chi must be a positive integer.")
-        if chi == 1:
-            state = SymMPS.random(
-                L,
-                symmetry=fermion.symmetry,
-                bond_dim=1,
-                phys_dim=fermion.physical_sectors,
-                seed=seed,
-                dtype=dtype,
-                fermionic=True,
-                site_charge=site_charge,
-                to_backend=to_backend,
+        fock_specs, leaf_charges = _fermionic_product_fock_specs(
+            fermion, int(L), occupations, site_charge,
+        )
+        state = SymMPS.random(
+            L,
+            symmetry=fermion.symmetry,
+            bond_dim=1,
+            phys_dim=fermion.physical_sectors,
+            seed=seed,
+            dtype=dtype,
+            fermionic=True,
+            site_charge=site_charge_from_occupations(leaf_charges),
+            to_backend=None,
+        )
+        for site, (charge, basis_index) in fock_specs.items():
+            _set_fermionic_product_leaf(
+                state.mps[site], state.mps.site_ind(site),
+                charge=charge, basis_index=basis_index,
             )
-        else:
-            state = SymMPS.random_unitary_evolution(
-                L,
-                symmetry=fermion.symmetry,
-                bond_dim=chi,
-                phys_dim=fermion.physical_sectors,
-                seed=seed,
-                dtype=dtype,
-                fermionic=True,
-                site_charge=site_charge,
-                rounds=random_rounds,
-                to_backend=to_backend,
-            )
+        _apply_to_tensor_network_arrays(state.mps, to_backend)
         return state.mps
 
     if occupations is not None or site_charge is not None:
@@ -2384,9 +2538,350 @@ def ps_to_mps(
         tensor.modify(data=data)
 
     mps.astype_(dtype)
-    if chi > 1:
-        mps.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return mps
+
+
+def ps_to_ttn(
+    n: int,
+    dtype: str = "complex128",
+    theta: float = 0.0,
+    *,
+    tree=None,
+    order=None,
+    structure="balanced",
+    max_arity=2,
+    community_frac=0.35,
+    star_frac=0.75,
+    chi: int = 1,
+    rand_strength: float = 0.0,
+    seed=666,
+    site_tag_id="I{}",
+    site_ind_id="k{}",
+    node_tag_id="N{}",
+    fermion=None,
+    occupations=None,
+    site_charge=None,
+    to_backend=None,
+):
+    """Create a product-state tree tensor network.
+
+    This is the TTN counterpart of :func:`ps_to_mps`: every qubit starts in
+    the local state ``[cos(theta), sin(theta)]`` and the tree virtual bonds
+    start at dimension one.  Supply ``tree=`` with an explicit
+    :class:`~pepsy.optimizers.tree.TreePlan`, or use ``order=`` and the tree
+    construction options to choose the geometry.
+
+    Parameters
+    ----------
+    n : int
+        Number of qubits.  Qubit labels are ``0 .. n - 1``.
+    dtype : str, optional
+        Tensor dtype passed to the tree tensors.
+    theta : float, optional
+        Product-state angle controlling each local amplitude vector.
+    tree : TreePlan, optional
+        Explicit rooted tree geometry.  When omitted, a plan is built from
+        ``order`` (or ``range(n)``) using ``structure``.
+    order : sequence of int, optional
+        Leaf order used to build a plan when ``tree`` is not supplied.
+    structure, max_arity, community_frac, star_frac
+        Forwarded to :meth:`TreePlan.from_order`.
+    chi : int, optional
+        If greater than one, expand every virtual bond to at least ``chi``.
+    rand_strength : float, optional
+        Random noise strength for the newly added bond entries, matching the
+        corresponding ``ps_to_mps`` option.  The resulting TTN is
+        re-canonicalised around its root.
+    seed : int, optional
+        Seed used by Quimb when ``rand_strength`` adds random entries.
+    fermion : :class:`~pepsy.tensors.Fermion`, optional
+        Build a native fermionic Symmray TTN using the model's local sectors.
+        This Fock-fixed product-state path requires ``chi=1``.
+    occupations : sequence or mapping, optional
+        Local Fock occupations selecting the product state. A mapping is keyed
+        by qubit label; omitted occupations use the Fermion half-filled
+        pattern. A spinful value can be a scalar particle count or an explicit
+        ``(n_up, n_down)`` pair; scalar charge one selects the deterministic
+        checkerboard spin representative.
+    site_charge : callable or mapping, optional
+        Advanced override for the local charge pattern.
+    to_backend : callable, optional
+        Backend mapper applied to the native Symmray blocks.
+
+    Returns
+    -------
+    TreeTensorNetwork
+        The initialized tree state.
+    """
+    from ..optimizers.tree import TreePlan, TreeTensorNetwork
+
+    try:
+        n = int(n)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("n must be a positive integer.") from exc
+    if n < 1:
+        raise ValueError("n must be a positive integer.")
+    if chi is None:
+        chi = 1
+    try:
+        chi = int(chi)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("chi must be a positive integer.") from exc
+    if chi < 1:
+        raise ValueError("chi must be a positive integer.")
+
+    if tree is not None and order is not None:
+        raise ValueError("pass either tree= or order=, not both.")
+    if tree is None:
+        if order is None:
+            order = range(n)
+        plan = TreePlan.from_order(
+            order,
+            structure=structure,
+            max_arity=max_arity,
+            community_frac=community_frac,
+            star_frac=star_frac,
+        )
+    else:
+        if not isinstance(tree, TreePlan):
+            raise TypeError("tree must be a TreePlan.")
+        plan = tree
+        if plan.n != n:
+            raise ValueError(
+                f"tree contains {plan.n} qubits, but n={n} was requested."
+            )
+
+    if fermion is not None:
+        from .symmetric import (  # pylint: disable=import-outside-toplevel
+            Fermion,
+            _apply_to_tensor_network_arrays,
+        )
+
+        if not isinstance(fermion, Fermion):
+            raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
+        if chi != 1:
+            raise ValueError(
+                "Fermion-aware ps_to_ttn is a charge-fixed product-state "
+                "constructor and requires chi=1; use hrs_to_ttn for chi > 1."
+            )
+        if theta != 0.0:
+            raise ValueError("theta is not supported with fermion=...")
+        if isinstance(occupations, Mapping):
+            try:
+                occupations = tuple(occupations[q] for q in range(n))
+            except KeyError as exc:
+                raise ValueError(
+                    "occupations mapping must contain every qubit 0 .. n - 1."
+                ) from exc
+        elif occupations is not None:
+            occupations = tuple(occupations)
+        fock_specs, leaf_charges = _fermionic_product_fock_specs(
+            fermion, n, occupations, site_charge,
+        )
+        ttn = TreeTensorNetwork.from_symmray_plan(
+            plan,
+            symmetry=fermion.symmetry,
+            physical_sectors=fermion.physical_sectors,
+            leaf_charges=leaf_charges,
+            bond_dim=1,
+            fermionic=True,
+            seed=seed,
+            dtype=dtype,
+            site_tag_id=site_tag_id,
+            site_ind_id=site_ind_id,
+            node_tag_id=node_tag_id,
+        )
+        for qubit, (charge, basis_index) in fock_specs.items():
+            _set_fermionic_product_leaf(
+                ttn.node_tensor(ttn.leaf_of_qubit(qubit)), ttn.site_ind(qubit),
+                charge=charge, basis_index=basis_index,
+            )
+        _apply_to_tensor_network_arrays(ttn, to_backend)
+        norm_sq = np.asarray(
+            ar.to_numpy(ttn._fermionic_norm_squared())
+        ).item()
+        norm = math.sqrt(abs(complex(norm_sq)))
+        if norm == 0.0:
+            raise ValueError("fermionic TTN product state has zero norm.")
+        root_tensor = ttn.node_tensor(ttn.root)
+        root_tensor.modify(data=root_tensor.data / norm)
+        # The norm readout is cached on native TTNs; this direct final scaling
+        # changes the state without going through a TTN mutator wrapper.
+        ttn._invalidate_norm_cache()
+        return ttn
+
+    if occupations is not None or site_charge is not None:
+        raise ValueError("occupations and site_charge require fermion=...")
+    if to_backend is not None:
+        raise ValueError("to_backend requires fermion=...")
+
+    ttn = TreeTensorNetwork.from_plan(
+        plan,
+        dtype=dtype,
+        site_tag_id=site_tag_id,
+        site_ind_id=site_ind_id,
+        node_tag_id=node_tag_id,
+    )
+    local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
+    for q in range(n):
+        tensor = ttn.node_tensor(ttn.leaf_of_qubit(q))
+        phys_axis = tensor.inds.index(ttn.site_ind(q))
+        data = np.zeros_like(tensor.data, dtype=dtype)
+        slicer = [0] * data.ndim
+        slicer[phys_axis] = slice(None)
+        data[tuple(slicer)] = local_vec
+        tensor.modify(data=data)
+
+    if chi > 1:
+        if rand_strength:
+            from quimb import seed_rand
+
+            seed_rand(seed)
+        ttn.expand_bond_dimension_(chi, rand_strength=rand_strength)
+        ttn.canonize_around_node_(plan.root)
+    return ttn.validate()
+
+
+def hrs_to_ttn(
+    n: int,
+    dtype: str = "complex128",
+    *,
+    tree=None,
+    order=None,
+    structure="balanced",
+    max_arity=2,
+    community_frac=0.35,
+    star_frac=0.75,
+    seed=None,
+    perturb: float = 0.0,
+    haar_params=None,
+    chi: int = 1,
+    rand_strength: float = 0.0,
+    fermion=None,
+    occupations=None,
+    site_charge=None,
+    to_backend=None,
+):
+    """Create a random product or charge-preserving Symmray TTN.
+
+    With ``fermion=`` the leaves receive the model's physical charge sectors,
+    while internal tree nodes are neutral and every virtual tree edge is a
+    conjugate pair of Symmray charge-sector indices. ``chi`` is the requested
+    total virtual-bond dimension. All block-sparse and fermionic operations
+    are delegated to Symmray/Quimb.
+    """
+    from ..optimizers.tree import TreePlan, TreeTensorNetwork
+
+    try:
+        n = int(n)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("n must be a positive integer.") from exc
+    if n < 1:
+        raise ValueError("n must be a positive integer.")
+    try:
+        chi = int(chi)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("chi must be a positive integer.") from exc
+    if chi < 1:
+        raise ValueError("chi must be a positive integer.")
+    if tree is not None and order is not None:
+        raise ValueError("pass either tree= or order=, not both.")
+    if tree is None:
+        plan = TreePlan.from_order(
+            range(n) if order is None else order,
+            structure=structure,
+            max_arity=max_arity,
+            community_frac=community_frac,
+            star_frac=star_frac,
+        )
+    else:
+        if not isinstance(tree, TreePlan):
+            raise TypeError("tree must be a TreePlan.")
+        if tree.n != n:
+            raise ValueError(f"tree contains {tree.n} qubits, but n={n} was requested.")
+        plan = tree
+
+    if fermion is not None:
+        from .symmetric import (  # pylint: disable=import-outside-toplevel
+            Fermion,
+            _apply_to_tensor_network_arrays,
+            site_charge_from_occupations,
+        )
+
+        if not isinstance(fermion, Fermion):
+            raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
+        if haar_params is not None:
+            raise ValueError("haar_params is not supported with fermion=...")
+        if occupations is None:
+            occupations = tuple(fermion.half_filled_occupations(n))
+        elif isinstance(occupations, Mapping):
+            try:
+                occupations = tuple(occupations[q] for q in range(n))
+            except KeyError as exc:
+                raise ValueError(
+                    "occupations mapping must contain every qubit 0 .. n - 1."
+                ) from exc
+        else:
+            occupations = tuple(occupations)
+        if len(occupations) != n:
+            raise ValueError("occupations must contain exactly n charge labels.")
+        if site_charge is None:
+            site_charge = site_charge_from_occupations(occupations)
+        if callable(site_charge):
+            leaf_charges = {q: site_charge(q) for q in range(n)}
+        else:
+            try:
+                leaf_charges = {q: site_charge[q] for q in range(n)}
+            except (KeyError, TypeError) as exc:
+                raise TypeError(
+                    "site_charge must be callable or map every qubit label."
+                ) from exc
+        ttn = TreeTensorNetwork.from_symmray_plan(
+            plan,
+            symmetry=fermion.symmetry,
+            physical_sectors=fermion.physical_sectors,
+            leaf_charges=leaf_charges,
+            bond_dim=chi,
+            fermionic=True,
+            seed=seed,
+            dtype=dtype,
+        )
+        _apply_to_tensor_network_arrays(ttn, to_backend)
+        return ttn
+
+    if occupations is not None or site_charge is not None:
+        raise ValueError("occupations and site_charge require fermion=...")
+    if to_backend is not None:
+        raise ValueError("to_backend requires fermion=...")
+    ttn = TreeTensorNetwork.from_plan(plan, dtype=dtype)
+    if haar_params is not None:
+        if len(haar_params) != n:
+            raise ValueError(f"haar_params must have length {n}.")
+        params = tuple(haar_params)
+    else:
+        params = tuple(
+            random_haar_qubit(
+                None if seed is None else int(seed) + q,
+                perturb=perturb,
+            )
+            for q in range(n)
+        )
+    for q, (theta, phi) in enumerate(params):
+        local_vec = np.array(
+            [np.cos(theta / 2.0), np.exp(1j * phi) * np.sin(theta / 2.0)],
+            dtype=dtype,
+        )
+        tensor = ttn.node_tensor(ttn.leaf_of_qubit(q))
+        physical_axis = tensor.inds.index(ttn.site_ind(q))
+        data = np.zeros_like(tensor.data, dtype=dtype)
+        selector = [0] * data.ndim
+        selector[physical_axis] = slice(None)
+        data[tuple(selector)] = local_vec
+        tensor.modify(data=data)
+    if chi > 1:
+        ttn.expand_bond_dimension_(chi, rand_strength=rand_strength)
+        ttn.canonize_around_node_(plan.root)
+    return ttn.validate()
 
 
 def ps_to_pepo(
@@ -2531,7 +3026,7 @@ def haar_random_state(
     """Create a dense Haar-random ``L``-qubit state.
 
     This samples a full Hilbert-space state, so the result is generally
-    entangled. Unlike :func:`hrps_to_mps`, this is not a product-state tensor
+    entangled. Unlike :func:`hrs_to_mps`, this is not a product-state tensor
     network: it returns dense amplitudes with ``2**L`` entries.
 
     Parameters
@@ -2589,9 +3084,9 @@ def haar_random_state(
     return state
 
 
-def hrps_to_peps(
+def hrs_to_peps(
     Lx: int,
-    Ly: int,
+    Ly: int | None = None,
     dtype: str = "complex128",
     cyclic: bool = False,
     seed=None,
@@ -2599,22 +3094,161 @@ def hrps_to_peps(
     haar_params=None,
     chi: int = 1,
     rand_strength: float = 0.0,
+    *,
+    fermion=None,
+    occupations=None,
+    site_charge=None,
+    method="direct",
+    subsizes="maximal",
+    contraction_opt="auto-hq",
+    to_backend=None,
 ):
-    """Create a PEPS with per-site single-qubit Haar states.
+    """Create a random product or Fermion-symmetric PEPS.
 
-    If ``haar_params`` is omitted, each site uses :func:`random_haar_qubit`.
-    With ``seed`` set, site ``k`` uses ``seed + k`` for reproducible but
-    distinct samples.
+    Without ``fermion``, each site is an independent single-qubit Haar state.
+    With ``fermion``, construct a native charge-preserving random PEPS instead:
+    ``method="direct"`` uses Symmray's direct block-filled random PEPS, with
+    ``chi`` controlling the virtual bond dimension. The direct state is
+    normalized before it is returned. A unitary PEPS-growth method is not yet
+    implemented.
+    In the fermionic branch, ``haar_params`` and ``perturb`` do not apply.
 
     Parameters
     ----------
+    Lx, Ly : int or tuple[int, int]
+        Lattice dimensions. If only ``Lx`` is supplied, use a square lattice.
+    dtype : str, optional
+        Tensor dtype passed to numpy/quimb or Symmray.
+    cyclic : bool, optional
+        Whether to create periodic PEPS bonds.
+    seed : int, optional
+        Random seed. In the ordinary branch, site ``k`` uses ``seed + k`` for
+        reproducible but distinct Haar samples.
+    perturb : float, optional
+        Perturbation applied to ordinary single-qubit Haar angles.
+    haar_params : sequence, optional
+        Explicit ``(theta, phi)`` pairs for the ordinary branch.
     chi : int, optional
-        Target bond dimension. If greater than 1, the bond dimension is
-        expanded via ``expand_bond_dimension`` after initialization.
+        Target virtual bond dimension. In the Fermion branch this controls
+        the symmetric random-state construction directly.
     rand_strength : float, optional
-        Random noise strength passed to ``expand_bond_dimension``.
+        Random noise passed to ordinary ``expand_bond_dimension``.
+    fermion : :class:`~pepsy.tensors.Fermion`, optional
+        Build a native fermionic Symmray PEPS using this model's symmetry and
+        physical sectors.
+    occupations : mapping or sequence, optional
+        Local charge labels selecting the Fermion sector. Mappings use
+        ``(x, y)`` keys; sequences use row-major order. If omitted, the
+        Fermion half-filled pattern is used.
+    site_charge : callable or mapping, optional
+        Advanced override for the per-site charge pattern.
+    method : {"direct"}, optional
+        Fermion-aware random-state construction. ``"direct"`` fills allowed
+        Symmray blocks using ``PEPS_fermionic_rand`` and normalizes the result.
+    subsizes : object, optional
+        Symmray charge-sector sizing policy used by ``method="direct"``.
+    contraction_opt : object, optional
+        Contraction optimizer stored by the internal symmetric wrapper.
+    to_backend : callable, optional
+        Backend mapper applied to Fermion-aware Symmray blocks.
+
+    Returns
+    -------
+    quimb.tensor.PEPS
+        The initialized PEPS. Fermion-aware states use native Symmray arrays.
     """
-    peps = ps_to_peps(Lx=Lx, Ly=Ly, dtype=dtype, theta=0.0, cyclic=cyclic)
+    if Ly is None:
+        if isinstance(Lx, (tuple, list)):
+            if len(Lx) != 2:
+                raise ValueError("A PEPS shape must contain exactly two dimensions.")
+            Lx, Ly = Lx
+        else:
+            Ly = Lx
+    Lx = int(Lx)
+    Ly = int(Ly)
+    if Lx < 1 or Ly < 1:
+        raise ValueError("PEPS dimensions must be positive integers.")
+
+    method = str(method).strip().lower().replace("-", "_")
+    if method not in {"direct", "unitary"}:
+        raise ValueError("method must be 'direct' or 'unitary'.")
+
+    if fermion is not None:
+        from .symmetric import (  # pylint: disable=import-outside-toplevel
+            Fermion,
+            SymPEPS,
+            site_charge_from_occupations,
+        )
+
+        if not isinstance(fermion, Fermion):
+            raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
+        if method == "unitary":
+            raise NotImplementedError(
+                "hrs_to_peps(method='unitary') is not implemented; use "
+                "method='direct'."
+            )
+        if haar_params is not None:
+            raise ValueError("haar_params is not supported with fermion=...")
+
+        coordinates = tuple(
+            (x, y)
+            for x in range(Lx)
+            for y in range(Ly)
+        )
+        if occupations is None:
+            occupation_values = fermion.half_filled_occupations(len(coordinates))
+            occupations = dict(zip(coordinates, occupation_values))
+        elif isinstance(occupations, Mapping):
+            occupations = dict(occupations)
+            missing = set(coordinates).difference(occupations)
+            if missing:
+                raise ValueError(
+                    "occupations is missing PEPS coordinates: "
+                    f"{sorted(missing)!r}."
+                )
+        else:
+            occupations = tuple(occupations)
+            if len(occupations) != len(coordinates):
+                raise ValueError(
+                    "occupations must contain exactly Lx * Ly charge labels."
+                )
+            occupations = dict(zip(coordinates, occupations))
+        if site_charge is None:
+            site_charge = site_charge_from_occupations(occupations)
+
+        state = SymPEPS.random(
+            Lx,
+            Ly,
+            symmetry=fermion.symmetry,
+            bond_dim=chi,
+            phys_dim=fermion.physical_sectors,
+            cyclic=cyclic,
+            seed=seed,
+            dtype=dtype,
+            fermionic=True,
+            site_charge=site_charge,
+            subsizes=subsizes,
+            contraction_opt=contraction_opt,
+            to_backend=None,
+        )
+        state.normalize()
+        if to_backend is not None:
+            state.apply_to_arrays(to_backend)
+        return state.peps
+
+    if occupations is not None or site_charge is not None:
+        raise ValueError("occupations and site_charge require fermion=...")
+    if to_backend is not None:
+        raise ValueError("to_backend requires fermion=...")
+
+    peps = ps_to_peps(
+        Lx=Lx,
+        Ly=Ly,
+        dtype=dtype,
+        theta=0.0,
+        cyclic=cyclic,
+        seed=seed,
+    )
 
     n_sites = Lx * Ly
     if haar_params is not None:
@@ -2651,7 +3285,7 @@ def hrps_to_peps(
     return peps
 
 
-def hrps_to_mps(
+def hrs_to_mps(
     L: int,
     dtype: str = "complex128",
     cyclic: bool = False,
@@ -2660,22 +3294,185 @@ def hrps_to_mps(
     haar_params=None,
     chi: int = 1,
     rand_strength: float = 0.0,
+    *,
+    fermion=None,
+    occupations=None,
+    site_charge=None,
+    method="unitary",
+    subsizes="maximal",
+    random_rounds=1000,
+    stall_rounds=8,
+    cutoff=1e-12,
+    contraction_opt="auto-hq",
+    to_backend=None,
 ):
-    """Create a MPS with per-site single-qubit Haar states.
+    """Create a random product or Fermion-symmetric MPS.
 
-    If ``haar_params`` is omitted, each site uses :func:`random_haar_qubit`.
-    With ``seed`` set, site ``k`` uses ``seed + k`` for reproducible but
-    distinct samples.
+    Without ``fermion``, each site is an independent single-qubit Haar state.
+    With ``fermion``, construct a native charge-preserving random MPS instead:
+    ``method="unitary"`` (the default) starts from a random product state and
+    applies random charge-preserving two-site unitaries, while
+    ``method="direct"`` calls Symmray's direct block-filled random-MPS
+    constructor. In both cases ``chi`` controls the target total bond
+    dimension and the resulting state is normalized. In the fermionic branch,
+    ``haar_params`` and ``perturb`` do not apply.
 
     Parameters
     ----------
+    L : int
+        Number of sites.
+    dtype : str, optional
+        Tensor dtype passed to numpy/quimb or Symmray.
+    cyclic : bool, optional
+        Whether to create periodic bonds. Fermion-aware MPS currently require
+        an open chain.
+    seed : int, optional
+        Random seed. In the ordinary branch, site ``k`` uses ``seed + k`` for
+        reproducible but distinct Haar samples.
+    perturb : float, optional
+        Perturbation applied to ordinary single-qubit Haar angles.
+    haar_params : sequence, optional
+        Explicit ``(theta, phi)`` pairs for the ordinary branch.
     chi : int, optional
-        Target bond dimension. If greater than 1, the bond dimension is
-        expanded via ``expand_bond_dimension`` after initialization.
+        Target virtual bond dimension. In the Fermion branch this controls
+        the symmetric random-state construction directly.
     rand_strength : float, optional
-        Random noise strength passed to ``expand_bond_dimension``.
+        Random noise passed to ordinary ``expand_bond_dimension``.
+    fermion : :class:`~pepsy.tensors.Fermion`, optional
+        Build a native fermionic Symmray MPS using this model's symmetry and
+        physical sectors.
+    occupations : sequence, optional
+        Local charge labels selecting the Fermion sector. If omitted, the
+        Fermion half-filled pattern is used.
+    site_charge : callable or mapping, optional
+        Advanced override for the per-site charge pattern.
+    method : {"unitary", "direct"}, optional
+        Fermion-aware random-state construction. ``"unitary"`` grows from a
+        product state using random neutral two-site unitaries. ``"direct"``
+        uses :func:`symmray.MPS_fermionic_rand` to fill allowed random blocks
+        directly, then right-canonicalizes and normalizes the result.
+    subsizes : object, optional
+        Symmray charge-sector sizing policy used by ``method="direct"``.
+        The default ``"maximal"`` keeps as many charge sectors as possible.
+        This option is ignored by the unitary and non-fermionic branches.
+    random_rounds : int, optional
+        Maximum number of random charge-preserving unitary rounds for
+        ``chi > 1``.
+    stall_rounds : int, optional
+        Stop after this many rounds without increasing the bond dimension.
+    cutoff : float, optional
+        Truncation cutoff used during charge-preserving growth.
+    contraction_opt : object, optional
+        Contraction optimizer stored by the internal symmetric wrapper.
+    to_backend : callable, optional
+        Backend mapper applied to Fermion-aware Symmray blocks.
+
+    Returns
+    -------
+    quimb.tensor.MatrixProductState
+        The initialized MPS. Fermion-aware states use native Symmray arrays.
     """
-    mps = ps_to_mps(L=L, dtype=dtype, theta=0.0, cyclic=cyclic)
+    method = str(method).strip().lower().replace("-", "_")
+    if method not in {"unitary", "direct"}:
+        raise ValueError("method must be 'unitary' or 'direct'.")
+    if fermion is None and method == "direct":
+        raise ValueError("method='direct' requires fermion=... .")
+
+    if fermion is not None:
+        from .symmetric import (  # pylint: disable=import-outside-toplevel
+            Fermion,
+            SymMPS,
+            site_charge_from_occupations,
+        )
+
+        if not isinstance(fermion, Fermion):
+            raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
+        if cyclic:
+            raise ValueError("Fermion-aware hrs_to_mps currently requires an open chain.")
+        if haar_params is not None:
+            raise ValueError("haar_params is not supported with fermion=...")
+
+        if occupations is None:
+            occupations = fermion.half_filled_occupations(L)
+        elif isinstance(occupations, Mapping):
+            try:
+                occupations = tuple(occupations[i] for i in range(int(L)))
+            except KeyError as exc:
+                raise ValueError(
+                    "occupations mapping must contain every site 0 .. L - 1."
+                ) from exc
+        else:
+            occupations = tuple(occupations)
+        if len(occupations) != int(L):
+            raise ValueError("occupations must contain exactly L charge labels.")
+        if site_charge is None:
+            site_charge = site_charge_from_occupations(occupations)
+
+        chi = int(chi)
+        if chi < 1:
+            raise ValueError("chi must be a positive integer.")
+
+        if method == "direct":
+            try:
+                import symmray as sr  # pylint: disable=import-outside-toplevel
+            except ImportError as exc:
+                raise ImportError(
+                    "hrs_to_mps(method='direct') requires the optional "
+                    "dependency 'symmray'."
+                ) from exc
+
+            constructor = getattr(sr, "MPS_fermionic_rand", None)
+            if constructor is None:  # pragma: no cover - old Symmray fallback
+                raise ImportError(
+                    "The installed Symmray version does not provide "
+                    "MPS_fermionic_rand."
+                )
+            state = constructor(
+                fermion.symmetry,
+                int(L),
+                bond_dim=chi,
+                phys_dim=fermion.physical_sectors,
+                cyclic=False,
+                seed=seed,
+                dtype=dtype,
+                site_charge=site_charge,
+                subsizes=subsizes,
+            )
+            state.right_canonize()
+            state.normalize()
+            if to_backend is not None:
+                state.apply_to_arrays(to_backend)
+            return state
+
+        state = SymMPS.random_unitary_evolution(
+            L,
+            symmetry=fermion.symmetry,
+            bond_dim=chi,
+            phys_dim=fermion.physical_sectors,
+            seed=seed,
+            dtype=dtype,
+            fermionic=True,
+            site_charge=site_charge,
+            rounds=random_rounds,
+            stall_rounds=stall_rounds,
+            cutoff=cutoff,
+            contraction_opt=contraction_opt,
+            to_backend=to_backend,
+        )
+        return state.mps
+
+    if occupations is not None or site_charge is not None:
+        raise ValueError("occupations and site_charge require fermion=...")
+    if to_backend is not None:
+        raise ValueError("to_backend requires fermion=...")
+
+    mps = ps_to_mps(
+        L=L,
+        dtype=dtype,
+        theta=0.0,
+        cyclic=cyclic,
+        seed=seed,
+    )
 
     if haar_params is not None:
         if len(haar_params) != L:
@@ -2707,3 +3504,9 @@ def hrps_to_mps(
     if chi > 1:
         mps.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return mps
+
+
+# Backwards-compatible aliases for the original longer spelling.
+hrps_to_peps = hrs_to_peps
+hrps_to_mps = hrs_to_mps
+hrps_to_ttn = hrs_to_ttn

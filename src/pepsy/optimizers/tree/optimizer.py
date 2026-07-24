@@ -37,13 +37,27 @@ canonicalisation, bond compression, tensor splitting, tree path finding) uses
 from __future__ import annotations
 
 import contextlib
+from copy import deepcopy
+import heapq
 from numbers import Integral
+import warnings
 
+import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...backends import infer_backend_converter_from_sample, to_float
 from ...operators.gates import _normalize_gate_entries
-from .layout import TreeLayoutFinder, TreePlan
+from ..mps.optimizer import (
+    _control_event_parts as _mps_control_event_parts,
+    normalize_submpo_where,
+    submpo_event_parts,
+)
+from .layout import (
+    TreeLayoutFinder,
+    TreePlan,
+    _submpo_schmidt_rank_bound,
+)
 from .ttn import TreeTensorNetwork
 
 __all__ = ["TreeOptimizer"]
@@ -65,26 +79,253 @@ def _normalize_where(where):
     return tuple(int(site) for site in where)
 
 
+def _submpo_to_dense(submpo, where):
+    """Materialize an explicit sub-MPO on its declared support.
+
+    TTNs do not have a 1D sub-MPO absorption primitive. Their recursive
+    subtree-operator path is the equivalent operation, so stream markers are
+    lowered to the same dense support operator used by ``apply_gate``. The
+    support-size guard is checked by the caller before this conversion.
+    """
+    to_dense = getattr(submpo, "to_dense", None)
+    if not callable(to_dense):
+        raise TypeError(
+            "TreeOptimizer submpo events require an MPO-like payload with "
+            "a to_dense() method."
+        )
+    try:
+        dense = to_dense()
+    except Exception as exc:
+        raise ValueError("could not materialize the submpo event payload.") from exc
+    expected = 4 ** len(where)
+    size = int(np.prod(ar.shape(dense)))
+    if size != expected:
+        raise ValueError(
+            f"submpo payload has {size} entries, but support {where!r} "
+            f"requires {expected}."
+        )
+    return ar.do("reshape", dense, (2 ** len(where), 2 ** len(where)))
+
+
+def _same_tree_plan(left, right):
+    """Return whether two plans describe the same rooted tree geometry."""
+    return (
+        isinstance(left, TreePlan)
+        and isinstance(right, TreePlan)
+        and left.root == right.root
+        and left.children == right.children
+        and left.qubit_of_leaf == right.qubit_of_leaf
+    )
+
+
+def _is_product_tensor_network(state):
+    """Return whether every virtual bond of ``state`` has dimension one."""
+    max_bond = getattr(state, "max_bond", None)
+    if not callable(max_bond):
+        return False
+    try:
+        return int(max_bond()) <= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_symmray_array(array):
+    """Return whether ``array`` is a Symmray block-sparse / fermionic array.
+
+    Symmray gate payloads (e.g. native Fermi-Hubbard hopping/onsite gates) are
+    block-sparse arrays whose physical legs already carry the correct symmetry
+    charges and, for fermions, the anticommutation signs. They must never be
+    reshaped into base-2 sub-legs the way a dense qubit gate is; the raw
+    symmetric array is handed straight to the Symmray-aware Quimb split /
+    contract primitives.
+    """
+    try:
+        return ar.infer_backend(array) == "symmray"
+    except Exception:  # pragma: no cover - defensive backend inference
+        return False
+
+
+def _array_backend_signature(array):
+    """Return comparable backend / dtype / device metadata for an array."""
+    backend = ar.infer_backend(array)
+    try:
+        dtype = ar.get_dtype_name(array)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        dtype = str(getattr(array, "dtype", None))
+    device = getattr(array, "device", None)
+    return backend, str(dtype), None if device is None else str(device)
+
+
+def _operator_schmidt_rank(op, where, left_where):
+    """Return the operator-Schmidt rank across a support bipartition.
+
+    ``where`` fixes the operator's qubit ordering.  The returned rank is the
+    exact rank of the operator viewed as a matrix from the input/output legs on
+    ``left_where`` to those on the complementary support.  For a two-qubit
+    gate this is the ``k`` introduced by the gate SVD in the paper; for a
+    higher-order operator it is the corresponding conservative generalisation.
+    """
+    where = tuple(where)
+    left_where = tuple(left_where)
+    left = {q: i for i, q in enumerate(where)}
+    left_set = set(left_where)
+    left_positions = [left[q] for q in left_where]
+    right_positions = [
+        i for i, q in enumerate(where) if q not in left_set
+    ]
+    k = len(where)
+    try:
+        array = ar.to_numpy(op).reshape((2,) * (2 * k))
+    except Exception as exc:
+        # Symmray arrays intentionally cannot be flattened through the generic
+        # autoray ``to_numpy`` path: their blocks carry charge sectors and, for
+        # fermions, graded signs.  Preflight only needs a safe upper bound, so
+        # use the explicit operator leg dimensions without materialising the
+        # structured array.  This is exact for the usual dense qubit shape and
+        # conservative for a native/sparse backend.
+        if not _is_symmray_array(op):
+            raise ValueError(
+                f"operator on support {where!r} must contain "
+                f"{4 ** k} entries."
+            ) from exc
+        try:
+            shape = tuple(int(dim) for dim in ar.shape(op))
+        except (AttributeError, TypeError, ValueError) as shape_exc:
+            raise ValueError(
+                f"operator on support {where!r} must contain "
+                f"{4 ** k} entries."
+            ) from shape_exc
+        if len(shape) == 2 and shape == (2 ** k, 2 ** k):
+            shape = (2,) * (2 * k)
+        if len(shape) != 2 * k or any(dim < 1 for dim in shape):
+            raise ValueError(
+                f"operator on support {where!r} must have {2 * k} "
+                f"operator legs; got shape {shape}."
+            ) from exc
+        left_dim = int(np.prod([
+            shape[i] * shape[k + i] for i in left_positions
+        ], dtype=int))
+        right_dim = int(np.prod([
+            shape[i] * shape[k + i] for i in right_positions
+        ], dtype=int))
+        return max(1, min(left_dim, right_dim))
+
+    axes = (
+        left_positions
+        + [k + i for i in left_positions]
+        + right_positions
+        + [k + i for i in right_positions]
+    )
+    matrix = array.transpose(axes).reshape(
+        4 ** len(left_positions), 4 ** len(right_positions)
+    )
+    # A zero operator has Schmidt rank zero mathematically, but it cannot
+    # reduce a pre-existing bond.  Treat it as rank one for this upper bound.
+    return max(1, int(np.linalg.matrix_rank(matrix)))
+
+
+_PAULI_1Q = {
+    "X": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex),
+    "Y": np.array([[0.0, -1.0j], [1.0j, 0.0]], dtype=complex),
+    "Z": np.array([[1.0, 0.0], [0.0, -1.0]], dtype=complex),
+}
+_RESET_FLIP_AXES = {"X": "Z", "Y": "X", "Z": "X"}
+_DEFAULT_MAX_OPERATOR_QUBITS = 8
+_DEFAULT_MAX_SUBTREE_NODES = 128
+
+
+def _normalize_control_where(where):
+    """Return a non-empty tuple of integer qubit labels for a control."""
+    if isinstance(where, Integral):
+        return (int(where),)
+    if (
+        isinstance(where, (tuple, list))
+        and where
+        and all(isinstance(site, Integral) for site in where)
+    ):
+        return tuple(int(site) for site in where)
+    raise ValueError(
+        "Tree control event where must be an int or non-empty sequence of ints."
+    )
+
+
+def _normalize_control_axes(axes, where, *, event):
+    """Return one X/Y/Z axis per control-event site."""
+    axes = tuple(char for char in str(axes).upper() if not char.isspace())
+    if not axes or any(axis not in _PAULI_1Q for axis in axes):
+        raise ValueError(f"{event} basis must use only X, Y, or Z axes.")
+    if len(axes) == 1 and len(where) > 1:
+        axes = axes * len(where)
+    if len(axes) != len(where):
+        raise ValueError(
+            f"{event} basis has {len(axes)} axis/axes but where {where!r} "
+            f"has {len(where)} site(s)."
+        )
+    return axes
+
+
+def _normalize_measure_axes(pauli, where):
+    """Return one X/Y/Z axis per measured site."""
+    axes = tuple(char for char in str(pauli).upper() if not char.isspace())
+    if not axes or any(axis not in _PAULI_1Q for axis in axes):
+        raise ValueError("measure pauli must use only X, Y, or Z axes.")
+    if len(axes) != len(where):
+        raise ValueError(
+            f"measure pauli {pauli!r} has {len(axes)} axis/axes but where "
+            f"{where!r} has {len(where)} site(s)."
+        )
+    return axes
+
+
 class TreeOptimizer:
     """Replay a bundled gate stream on a rooted tree tensor network.
 
     Parameters
     ----------
     gates : bundled gate stream, optional
-        ``[(gate, where), ...]`` entries with ``where`` an int (one-qubit) or a
-        pair of ints (two-qubit).  Replayed eagerly on construction when given.
+        ``[(gate, where), ...]`` entries with ``where`` an int or a sequence
+        of distinct qubits. Replayed eagerly on construction when given.
     n : int, optional
         Number of qubits.  Inferred from ``gates`` / ``tree`` when omitted.
     chi : int
         Maximum virtual bond dimension enforced during two-qubit threading.
     cutoff : float
         Relative singular-value cutoff for truncations.
+    mode : {"auto", "direct", "mpo"}
+        Implementation used for two-site gates. ``"direct"`` uses the
+        specialised gate-SVD/QR path threading algorithm. ``"mpo"`` first
+        factorises every two-site gate with Quimb into a two-tensor sub-MPO,
+        routes that MPO bond exactly through the tree, then compresses the
+        affected path once. ``"auto"`` (the default) selects direct threading
+        for every two-site gate; choose ``"mpo"`` explicitly when inspecting
+        or benchmarking the operator-TN formulation. The modes represent the
+        same update and can differ only through floating-point roundoff at an
+        exact bond dimension, or through the usual final ``chi``/``cutoff``
+        truncation.
     structure : {"quality", "balanced", "adaptive"}
         Tree-structure strategy used when ``tree`` is not supplied.
-    max_arity : int or None
-        Maximum children per internal node for the auto-built structure.  ``2``
-        (default) gives a binary tree; larger values or ``None`` give flatter /
-        wider trees.  Ignored when an explicit ``tree`` is supplied.
+    max_arity : int, None, or iterable of ints
+        Maximum children per internal node for the auto-built structure.  A
+        scalar builds one fixed tree (``2`` = binary; larger values or ``None``
+        = flatter / wider).  An iterable of candidate arities makes the finder
+        *search* them and keep the objective-best plan; this is the default
+        ``(2, 3, 4)`` and is made ``chi``-aware automatically using this
+        optimizer's ``chi`` (structures that stay exact at ``chi`` are
+        preferred).  Pass ``max_arity=2`` to force a fixed binary tree.  Ignored
+        when an explicit ``tree`` is supplied.
+    layout_objective : {"path", "congestion", "hybrid"}
+        Objective used when building an automatic tree.  ``"path"`` is the
+        backward-compatible interaction-path heuristic; ``"congestion"``
+        selects a candidate using predicted operator-Schmidt edge load;
+        ``"hybrid"`` combines normalized path, peak-load, and total-load
+        costs. Pass a configured :class:`TreeLayoutFinder` through ``layout=``
+        to customize its hybrid weights or enable pre-simulation refinement.
+    layout_weight_mode : {"count", "auto", "angle", "operator_schmidt"}
+        Event weighting used by the automatic layout interaction graph.
+    layout : TreeLayoutFinder or TreePlan, optional
+        A precomputed layout finder or its resulting plan.  This is an alias
+        layer over ``tree=`` and is useful when the finder also provides
+        arity/cost diagnostics.
     tree : TreePlan, optional
         Explicit tree structure (any arity).  When omitted a
         :class:`TreeLayoutFinder` builds one from the gate stream.
@@ -101,6 +342,34 @@ class TreeOptimizer:
     seed : int or None
         Seed for the internal random generator used by :meth:`measure` and
         :meth:`reset`.
+    track_truncation : bool
+        Whether to probe the full local singular spectrum before each
+        truncating split/compression and record discarded-weight diagnostics.
+        The extra spectrum probes are disabled by default.
+    max_intermediate_bond : int, optional
+        Conservative preflight limit for the untruncated crossing-bond bound.
+        When set, eager replay raises :class:`MemoryError` before tensor work if
+        :meth:`estimate_bonds` predicts a larger intermediate bond.
+    max_operator_qubits : int, optional
+        Maximum support size allowed for dense multi-qubit operators.  The
+        default is conservative protection against accidental ``4**k``
+        allocations; pass ``None`` to disable it. Product-Pauli measurements
+        use a factorized path and do not consume this dense budget.
+    max_subtree_nodes : int, optional
+        Maximum Steiner-subtree size allowed for multi-qubit application and
+        preflight.  The default limits the number of recursive local messages;
+        pass ``None`` to disable it.
+    tn : TreeTensorNetwork or product MatrixProductState, optional
+        Initial coefficient state. A tree state is copied and canonicalised if
+        needed. Its plan must match ``tree``/``layout`` when it is entangled;
+        a bond-dimension-one product TTN is instead remounted exactly on the
+        requested plan (with a warning). A bond-dimension-one Quimb MPS is also
+        accepted and mounted exactly. When omitted, the optimizer starts from
+        the product state ``|0...0>``.
+    state : TreeTensorNetwork or product MatrixProductState, optional
+        Explicit alias for ``tn``. All initial-state tensors must share one
+        backend, dtype, and device. User-provided gates/operators should use
+        that same backend; a mismatch is converted with a one-time warning.
     run : bool
         Whether to replay ``gates`` immediately (default ``True``).
 
@@ -114,11 +383,107 @@ class TreeOptimizer:
         Node id of the current orthogonality centre (``None`` if unknown).
     """
 
+    @staticmethod
+    def _normalize_mode(mode):
+        """Validate and normalize the two-site gate implementation mode."""
+        mode = str(mode).strip().lower()
+        if mode not in {"auto", "direct", "mpo"}:
+            raise ValueError("mode must be 'auto', 'direct', or 'mpo'.")
+        return mode
+
     def __init__(self, gates=None, n=None, *, chi=64, cutoff=1e-12,
-                 structure="quality", max_arity=2, community_frac=0.35,
-                 star_frac=0.75, tree=None, dtype=complex, threads=1,
-                 seed=None, run=True):
-        self.G, self.where = self._normalize_gate_queue(gates)
+                 mode="auto", two_site_mode=None,
+                 structure="quality", max_arity=(2, 3, 4), community_frac=0.35,
+                 star_frac=0.75, layout_objective="path",
+                 layout_weight_mode="count", layout=None, tree=None,
+                 dtype=complex, threads=1, seed=None, run=True, tn=None,
+                 state=None, track_truncation=False,
+                 max_intermediate_bond=None,
+                 max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
+                 max_subtree_nodes=_DEFAULT_MAX_SUBTREE_NODES,
+                 record_history=True):
+        # Preserve one-shot streams for both queue normalization and automatic
+        # layout discovery.  Materializing only inside
+        # ``_normalize_gate_queue`` would leave the finder with an exhausted
+        # iterator and silently degrade to an interaction-free layout.
+        if hasattr(gates, "__next__"):
+            gates = list(gates)
+        if layout is not None:
+            if tree is not None:
+                raise ValueError("pass either layout= or tree=, not both.")
+            if isinstance(layout, TreeLayoutFinder):
+                if n is not None and int(n) != layout.n:
+                    raise ValueError("n does not match the supplied layout.")
+                n = layout.n if n is None else n
+                tree = layout.run()
+            elif isinstance(layout, TreePlan):
+                tree = layout
+            else:
+                raise TypeError(
+                    "layout must be a TreeLayoutFinder or TreePlan; "
+                    "pass an entangled TreeTensorNetwork as state= or tn=."
+                )
+        if state is not None:
+            if tn is not None:
+                raise ValueError("pass either state= or tn=, not both.")
+            tn = state
+        if isinstance(tree, TreeTensorNetwork):
+            raise TypeError(
+                "tree= expects a TreePlan, not a TreeTensorNetwork; "
+                "pass the entangled state as state= or tn=."
+            )
+        self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
+        self.layout_finder = layout if isinstance(layout, TreeLayoutFinder) else None
+
+        product_state_source = None
+        if tn is not None:
+            if isinstance(tn, TreeTensorNetwork):
+                tn.validate()
+                source_n = tn.nqubits
+                if tree is not None and tree is not tn.plan:
+                    if _same_tree_plan(tree, tn.plan):
+                        tree = tn.plan
+                    elif _is_product_tensor_network(tn):
+                        product_state_source = tn
+                        warnings.warn(
+                            "Requested tree/layout differs from a product "
+                            "TreeTensorNetwork; rebuilding the product state "
+                            "exactly on the selected tree plan.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    else:
+                        raise ValueError(
+                            "tree/layout geometry differs from the supplied "
+                            "entangled TreeTensorNetwork. Refusing a potentially "
+                            "lossy relayout; construct the state on the selected "
+                            "TreePlan or explicitly convert it first."
+                        )
+                else:
+                    tree = tn.plan
+            elif isinstance(tn, qtn.MatrixProductState):
+                if not _is_product_tensor_network(tn):
+                    raise TypeError(
+                        "TreeOptimizer accepts an MPS initial state only when "
+                        "max_bond() == 1. Convert an entangled MPS explicitly "
+                        "to a TreeTensorNetwork on the requested TreePlan."
+                    )
+                source_n = int(tn.nsites)
+                sites = tuple(tn.sites)
+                if tuple(sorted(sites)) != tuple(range(source_n)):
+                    raise ValueError(
+                        "Product MPS sites must be the compact labels 0..n-1 "
+                        "to initialize TreeOptimizer."
+                    )
+                product_state_source = tn
+            else:
+                raise TypeError(
+                    "tn/state must be a TreeTensorNetwork, or a product "
+                    "quimb MatrixProductState with max_bond() == 1."
+                )
+            if n is not None and int(n) != source_n:
+                raise ValueError("n does not match the supplied initial state.")
+            n = source_n
 
         if n is None:
             if tree is not None:
@@ -131,37 +496,109 @@ class TreeOptimizer:
         self.n = int(n)
         if self.n <= 0:
             raise ValueError("Could not infer qubit count; pass n explicitly.")
+        # The TTN itself always uses compact physical positions.  This facade
+        # optionally preserves caller-facing logical labels across a cap while
+        # keeping Quimb's internal site/index space contiguous.
+        self._logical_qubits = list(range(self.n))
+        self._logical_positions = {q: q for q in self._logical_qubits}
 
         self.chi = int(chi)
+        if self.chi < 1:
+            raise ValueError("chi must be a positive integer.")
         self.cutoff = float(cutoff)
+        if self.cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative.")
+        self.mode = self._normalize_mode(mode)
+        if two_site_mode is not None:
+            legacy_mode = self._normalize_mode(two_site_mode)
+            if self.mode != "auto" and self.mode != legacy_mode:
+                raise ValueError(
+                    "pass either mode= or two_site_mode=, or give them "
+                    "the same value."
+                )
+            warnings.warn(
+                "two_site_mode= is deprecated; use mode= instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.mode = legacy_mode
         self.structure = structure
-        self.max_arity = None if max_arity is None else int(max_arity)
+        # ``max_arity`` may be a scalar (fixed tree), ``None`` (unbounded), or an
+        # iterable of candidate arities to search; forward it to the finder,
+        # which normalizes and (for a candidate set) searches it chi-aware.
+        self.max_arity = max_arity
         self.community_frac = float(community_frac)
         self.star_frac = float(star_frac)
+        self.layout_objective = str(layout_objective)
+        self.layout_weight_mode = str(layout_weight_mode)
         self.dtype = dtype
         self.threads = None if threads is None else int(threads)
+        if self.threads is not None and self.threads < 1:
+            raise ValueError("threads must be positive or None.")
         self.rng = np.random.default_rng(seed)
+        self.track_truncation = bool(track_truncation)
+        self.max_intermediate_bond = self._positive_limit(
+            max_intermediate_bond, "max_intermediate_bond"
+        )
+        self.max_operator_qubits = self._positive_limit(
+            max_operator_qubits, "max_operator_qubits"
+        )
+        self.max_subtree_nodes = self._positive_limit(
+            max_subtree_nodes, "max_subtree_nodes"
+        )
+        self.record_history = bool(record_history)
+        self.measurements = []
+        self.truncation_history = []
+        self.update_history = []
+        # Keep the same readout attributes as MpsOptimizer. Tree infidelity
+        # samples are populated when ``track_truncation`` is enabled; without
+        # the spectrum probes the only honest trace is the initial zero.
+        self.infidelities = [0.0]
+        self.infidelity_samples = []
+        self.normalizations = []
+        self.projection_diagnostics = []
+        self._backend_conversion_warnings = set()
+        self._active_update = None
+        self._truncation_survival = 1.0
 
         if tree is None:
-            tree = TreeLayoutFinder(
-                gates=gates, n=self.n, structure=structure,
+            self.layout_finder = TreeLayoutFinder(
+                gates=self._layout_gate_stream(), n=self.n, structure=structure,
                 max_arity=self.max_arity, community_frac=self.community_frac,
                 star_frac=self.star_frac,
-            ).run()
+                objective=self.layout_objective,
+                weight_mode=self.layout_weight_mode,
+                chi=self.chi,
+                max_operator_qubits=self.max_operator_qubits,
+            )
+            tree = self.layout_finder.run()
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan or None.")
         self.plan = tree
 
-        self.tn = self._build_product_state()
-        # A freshly built product state has every virtual bond at dimension 1,
-        # so each tensor is trivially isometric and the state is already in
-        # canonical form with the root as orthogonality centre (norm 1).
-        # ``from_plan`` records that centre on the network; assert it here so the
-        # first gate skips an O(N) canonicalisation.
-        self.center = self.plan.root
+        if product_state_source is not None:
+            self.tn = self._remount_product_state(product_state_source)
+            self.center = self.plan.root
+        elif tn is None:
+            self.tn = self._build_product_state()
+            # A freshly built product state has every virtual bond at dimension
+            # 1, so it is already canonical at the root.
+            self.center = self.plan.root
+        else:
+            self._install_tn(tn)
         self._thread_ind = None
 
         if run and self.G:
+            if (
+                self.max_intermediate_bond is not None
+                or self.max_operator_qubits is not None
+                or self.max_subtree_nodes is not None
+            ):
+                self.preflight(
+                    max_bond=self.max_intermediate_bond,
+                    max_operator_qubits=self.max_operator_qubits,
+                    max_subtree_nodes=self.max_subtree_nodes,
+                )
             self.run()
 
     # -- stream normalization -------------------------------------------------
@@ -169,16 +606,281 @@ class TreeOptimizer:
     @staticmethod
     def _normalize_gate_queue(gates):
         if gates is None:
-            return [], []
+            return [], [], []
+
+        # The low-level normalizer deliberately distinguishes a bundled
+        # sequence from a single gate.  Materialize one-shot iterators here so
+        # generator-based gate streams behave like the documented bundled
+        # sequence and remain available for automatic layout discovery.
+        if hasattr(gates, "__next__"):
+            gates = list(gates)
+
+        submpo_parts = submpo_event_parts(gates)
+        if submpo_parts is not None:
+            submpo, where = submpo_parts
+            return [submpo], [normalize_submpo_where(where)], ["submpo"]
+
+        control_parts = _mps_control_event_parts(gates)
+        if control_parts is not None:
+            name, payload, where = control_parts
+            return [payload], [where], [name]
+
+        if isinstance(gates, (tuple, list)) and any(
+            submpo_event_parts(entry) is not None
+            or _mps_control_event_parts(entry) is not None
+            for entry in gates
+        ):
+            payloads = []
+            wheres = []
+            event_types = []
+            for entry in gates:
+                submpo_parts = submpo_event_parts(entry)
+                if submpo_parts is not None:
+                    submpo, where = submpo_parts
+                    payloads.append(submpo)
+                    wheres.append(normalize_submpo_where(where))
+                    event_types.append("submpo")
+                    continue
+                control_parts = _mps_control_event_parts(entry)
+                if control_parts is not None:
+                    name, payload, where = control_parts
+                    payloads.append(payload)
+                    wheres.append(where)
+                    event_types.append(name)
+                    continue
+                gate_entries = _normalize_gate_entries(
+                    (entry,), where=None, allow_empty=False
+                )
+                gate, where = gate_entries[0]
+                payloads.append(gate)
+                wheres.append(_normalize_where(where))
+                event_types.append("gate")
+            return payloads, wheres, event_types
+
         entries = _normalize_gate_entries(gates, where=None, allow_empty=True)
         payloads = [g for g, _ in entries]
         wheres = [_normalize_where(w) for _, w in entries]
-        return payloads, wheres
+        return payloads, wheres, ["gate"] * len(payloads)
+
+    def _layout_gate_stream(self):
+        """Return a layout stream remapped through preceding cap events.
+
+        The live TTN compacts physical positions after a cap, while callers may
+        keep either compact or stable logical labels. Automatic layout is built
+        once before replay, so it must translate every later support back to
+        the original leaf labels before constructing the initial tree.
+        """
+        active_labels = list(range(self.n))
+        original_labels = list(range(self.n))
+        stream = []
+        for payload, where, event_type in zip(
+            self.G, self.where, self.event_types
+        ):
+            logical_where = _normalize_where(where)
+            try:
+                original_where = tuple(
+                    original_labels[active_labels.index(q)]
+                    for q in logical_where
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "cannot build a tree layout: event support references "
+                    f"inactive labels {logical_where!r} after a cap."
+                ) from exc
+
+            if event_type == "gate":
+                stream.append((payload, original_where))
+            elif event_type == "submpo":
+                stream.append(self.submpo_event(payload, original_where))
+            elif event_type == "measure":
+                stream.append({
+                    "kind": "measure",
+                    "pauli": payload["pauli"],
+                    "where": original_where,
+                    "outcome": payload.get("outcome"),
+                })
+            elif event_type == "reset":
+                stream.append({
+                    "kind": "reset",
+                    "where": original_where,
+                    "basis": "".join(payload["axes"]),
+                })
+            elif event_type == "measure_reset":
+                stream.append({
+                    "kind": "measure_reset",
+                    "where": original_where,
+                    "basis": "".join(payload["axes"]),
+                    "outcome": payload.get("outcomes"),
+                })
+            elif event_type == "cap":
+                stream.append({
+                    "kind": "cap",
+                    "where": original_where[0],
+                    "vec": payload["vec"],
+                    "absorb": payload.get("absorb", "left"),
+                    "compact_labels": payload.get("compact_labels", True),
+                })
+            else:  # pragma: no cover - normalized streams are exhaustive
+                raise ValueError(f"unknown tree layout event {event_type!r}.")
+
+            if event_type == "cap":
+                capped = logical_where[0]
+                position = active_labels.index(capped)
+                active_labels.pop(position)
+                original_labels.pop(position)
+                if payload.get("compact_labels", True):
+                    active_labels = [
+                        label - 1 if label > capped else label
+                        for label in active_labels
+                    ]
+        return stream
+
+    def _validate_event_stream_for_run(self):
+        """Validate stream labels, including optional stable-label caps."""
+        active = list(self._logical_qubits)
+        for step, (payload, where, event_type) in enumerate(
+            zip(self.G, self.where, self.event_types), start=1
+        ):
+            support = _normalize_where(where)
+            if event_type == "cap":
+                if len(support) != 1:
+                    raise ValueError(
+                        f"cap event at step {step} must reference one qubit."
+                    )
+                q = support[0]
+                if len(active) <= 1:
+                    raise ValueError(
+                        f"cap event at step {step} cannot remove the only qubit."
+                    )
+                if q not in active:
+                    raise ValueError(
+                        f"cap event at step {step} references qubit {q}, "
+                        f"outside the current active labels {active!r}."
+                    )
+                active.remove(q)
+                if payload.get("compact_labels", True):
+                    active = [label - 1 if label > q else label for label in active]
+                continue
+            out_of_range = [q for q in support if q not in active]
+            if out_of_range:
+                raise ValueError(
+                    f"event at step {step} references qubit(s) outside the "
+                    f"current active labels {active!r}: {out_of_range!r}."
+                )
 
     # -- construction ---------------------------------------------------------
 
+    @staticmethod
+    def _positive_limit(value, name):
+        """Validate an optional positive integer resource limit."""
+        if value is None:
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a positive integer or None.") from exc
+        if value < 1:
+            raise ValueError(f"{name} must be a positive integer or None.")
+        return value
+
+    @staticmethod
+    def _format_progress_infidelity(value):
+        """Format a norm-based progress infidelity compactly."""
+        text = f"{float(value):#.0e}"
+        if "e" not in text:
+            return text
+        mantissa, exponent = text.split("e", 1)
+        sign = exponent[0] if exponent[:1] in "+-" else ""
+        digits = exponent[1:] if sign else exponent
+        digits = digits.lstrip("0") or "0"
+        return f"{mantissa}e{sign}{digits}"
+
     def _phys(self, q):
         return self.tn.site_ind(q)
+
+    def _state_like(self):
+        """Return a live state array for backend-coercing operator payloads."""
+        return self.tn.node_tensor(self.plan.root).data
+
+    def _invalidate_state_norm_cache(self):
+        """Invalidate state-owned readout caches before direct tensor updates."""
+        invalidate = getattr(self.tn, "_invalidate_norm_cache", None)
+        if callable(invalidate):
+            invalidate()
+
+    @staticmethod
+    def _state_backend_info(state):
+        """Validate and describe the common backend of every state tensor."""
+        tensor_map = getattr(state, "tensor_map", None)
+        if not tensor_map:
+            raise ValueError("initial state contains no tensors.")
+        data = [tensor.data for tensor in tensor_map.values()]
+        signature = _array_backend_signature(data[0])
+        mismatched = []
+        for array in data[1:]:
+            candidate = _array_backend_signature(array)
+            if candidate != signature:
+                mismatched.append(candidate)
+        if mismatched:
+            raise TypeError(
+                "Initial state tensors must use one compatible backend, dtype, "
+                "and device. Convert every tensor with the same backend "
+                "converter before constructing TreeOptimizer; found "
+                f"{signature!r} and {mismatched[0]!r}."
+            )
+        backend, dtype, device = signature
+        return {"backend": backend, "dtype": dtype, "device": device}
+
+    def backend_info(self):
+        """Return the common backend, dtype, and device of the live TTN."""
+        return self._state_backend_info(self.tn)
+
+    def _as_state_backend(self, array, *, warn=True):
+        """Return an operator payload compatible with the live TTN backend.
+
+        Matching arrays pass through unchanged. A mismatched gate is converted
+        for compatibility, but emits one warning per source/target signature so
+        callers can keep data transfer and dtype promotion under their control.
+        """
+        like = self._state_like()
+        state_info = self.backend_info()
+        target_signature = (
+            state_info["backend"], state_info["dtype"], state_info["device"]
+        )
+        source_signature = _array_backend_signature(array)
+        if source_signature == target_signature:
+            return array
+        warning_key = (source_signature, target_signature)
+        # Python sequences/scalars are ordinary convenience inputs rather than
+        # a selected numerical backend. Materialize those silently; explicit
+        # array backends/dtypes still receive the transfer/cast warning.
+        is_untyped_input = source_signature[0] == "builtins"
+        if (
+            warn
+            and not is_untyped_input
+            and warning_key not in self._backend_conversion_warnings
+        ):
+            self._backend_conversion_warnings.add(warning_key)
+            warnings.warn(
+                "TreeOptimizer is converting a gate/operator payload from "
+                f"backend/dtype/device {source_signature!r} to the TTN state "
+                f"{target_signature!r}. Provide backend-compatible gate "
+                "arrays to avoid this transfer or cast.",
+                UserWarning,
+                stacklevel=3,
+            )
+        converter = infer_backend_converter_from_sample(like)
+        if converter is not None:
+            return converter(array)
+        if state_info["backend"] == "numpy":
+            return ar.to_numpy(array)
+        return ar.do("array", array, like=like)
+
+    def _coerce_tensor_network_backend(self, tn, *, warn=True):
+        """Convert every tensor of an operator TN to the live state backend."""
+        for tensor in tn.tensor_map.values():
+            tensor.modify(data=self._as_state_backend(tensor.data, warn=warn))
+        return tn
 
     def _tag(self, nid):
         return self.tn.node_tag(nid)
@@ -189,9 +891,28 @@ class TreeOptimizer:
 
     def _thread_ctx(self):
         """Context manager capping BLAS/OpenMP threads for the small tree ops."""
-        if _THREAD_CONTROLLER is not None and self.threads is not None:
-            return _THREAD_CONTROLLER.limit(limits=self.threads)
-        return contextlib.nullcontext()
+        @contextlib.contextmanager
+        def managed():
+            depth = getattr(self, "_thread_ctx_depth", 0)
+            if depth:
+                self._thread_ctx_depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._thread_ctx_depth -= 1
+                return
+
+            self._thread_ctx_depth = 1
+            try:
+                if _THREAD_CONTROLLER is not None and self.threads is not None:
+                    with _THREAD_CONTROLLER.limit(limits=self.threads):
+                        yield
+                else:
+                    yield
+            finally:
+                self._thread_ctx_depth = 0
+
+        return managed()
 
     def _bond_name(self, u, v):
         lo, hi = (u, v) if u < v else (v, u)
@@ -208,7 +929,208 @@ class TreeOptimizer:
     def _build_product_state(self):
         return TreeTensorNetwork.from_plan(self.plan, dtype=self.dtype)
 
+    @staticmethod
+    def _product_site_vector(state, q):
+        """Extract one qubit's vector from a bond-dimension-one TN site."""
+        if isinstance(state, TreeTensorNetwork):
+            tensor = state.node_tensor(state.leaf_of_qubit(q))
+            physical_index = state.site_ind(q)
+        else:
+            site_tag = state.site_tag(q)
+            tids = tuple(state.tag_map[site_tag])
+            if len(tids) != 1:
+                raise ValueError(
+                    f"Product MPS site {q} must own exactly one tensor."
+                )
+            tensor = state.tensor_map[tids[0]]
+            physical_index = state.site_ind(q)
+        try:
+            physical_axis = tensor.inds.index(physical_index)
+        except ValueError as exc:
+            raise ValueError(
+                f"Initial product state is missing physical index {physical_index!r}."
+            ) from exc
+        moved = ar.do("moveaxis", tensor.data, physical_axis, 0)
+        if int(np.prod(ar.shape(moved))) != 2:
+            raise ValueError(
+                "TreeOptimizer product-state remounting requires qubit "
+                "physical dimension two and unit virtual bonds."
+            )
+        return ar.do("reshape", moved, (2,))
+
+    def _remount_product_state(self, state):
+        """Rebuild a product TTN exactly on ``self.plan`` using state vectors."""
+        self._state_backend_info(state)
+        if not _is_product_tensor_network(state):
+            raise ValueError("only bond-dimension-one product states can be remounted.")
+        target = TreeTensorNetwork.from_plan(self.plan, dtype=complex)
+        sample = next(iter(state.tensor_map.values())).data
+        for node in self.plan.nodes():
+            tensor = target.node_tensor(node)
+            if self.plan.is_leaf(node):
+                q = self.plan.qubit_of_leaf[node]
+                vector = self._product_site_vector(state, q)
+                tensor.modify(data=ar.do("reshape", vector, ar.shape(tensor.data)))
+            else:
+                tensor.modify(
+                    data=ar.do("ones", ar.shape(tensor.data), like=sample)
+                )
+
+        # In a product TTN, every internal tensor is a scalar because every
+        # virtual bond has dimension one. Preserve any distributed global
+        # normalization/phase by collecting those scalars on the new root.
+        if isinstance(state, TreeTensorNetwork):
+            factor = None
+            for node in state.plan.nodes():
+                if state.plan.is_leaf(node):
+                    continue
+                scalar = ar.do("reshape", state.node_tensor(node).data, ())
+                factor = scalar if factor is None else factor * scalar
+            if factor is not None:
+                root_tensor = target.node_tensor(target.plan.root)
+                root_tensor.modify(data=root_tensor.data * factor)
+
+        target._with_center(self.plan.root).validate()
+        self._state_backend_info(target)
+        return target
+
+    def _install_tn(self, tn):
+        """Install an independent, canonical copy of a supplied tree state."""
+        self._state_backend_info(tn)
+        tn.validate()
+        self.tn = tn.copy()
+        self.plan = self.tn.plan
+        self.tn.validate()
+        self.n = self.tn.nqubits
+        self._logical_qubits = list(range(self.n))
+        self._logical_positions = {q: q for q in self._logical_qubits}
+        if (
+            self.tn.canonical_region is None
+            or not self.tn.is_subtree_canonical_form()
+        ):
+            self.tn.canonize_around_node_(self.plan.root)
+
+    def set_tn(self, tn):
+        """Replace the live tree state with a canonical independent copy."""
+        if not isinstance(tn, TreeTensorNetwork):
+            raise TypeError("tn must be a TreeTensorNetwork.")
+        self._install_tn(tn)
+        self.truncation_history.clear()
+        self.update_history.clear()
+        self.infidelities[:] = [0.0]
+        self.infidelity_samples.clear()
+        self.normalizations.clear()
+        self.projection_diagnostics.clear()
+        self._truncation_survival = 1.0
+        return self
+
+    def set_p(self, tn):
+        """MPS-compatible alias for :meth:`set_tn`.
+
+        The name lets a shared coefficient-backend frontend install either an
+        MPS or a tree coefficient state without branching on assignment APIs.
+        """
+        return self.set_tn(tn)
+
+    def _validate_qubit(self, q):
+        """Return the compact TTN position for a logical qubit label."""
+        if not isinstance(q, Integral):
+            raise ValueError(f"qubit label must be an integer; got {q!r}.")
+        q = int(q)
+        try:
+            return self._logical_positions[q]
+        except KeyError:
+            raise ValueError(f"qubit {q} is outside the tree state.")
+
+    def _validate_support(self, where, *, min_size=1, resolve=True):
+        """Validate a logical support and optionally return TTN positions."""
+        where = tuple(int(q) for q in where)
+        if len(where) < min_size:
+            raise ValueError(
+                f"gate support must contain at least {min_size} qubit(s); "
+                f"got {where}."
+            )
+        if resolve:
+            return tuple(self._validate_qubit(q) for q in where)
+        for q in where:
+            if q not in self.plan.leaf_of_qubit:
+                raise ValueError(f"tree position {q} is outside the state.")
+        return where
+
+    def _require_dense_qubit_state(self, operation):
+        """Reject qubit-only helpers on native graded physical spaces."""
+        native = bool(getattr(self.tn, "fermionic", False))
+        if not native:
+            try:
+                native = any(
+                    _is_symmray_array(tensor.data)
+                    for tensor in self.tn.tensor_map.values()
+                )
+            except AttributeError:
+                native = False
+        if native:
+            raise NotImplementedError(
+                f"TreeOptimizer.{operation} is a dense two-level qubit API; "
+                "native fermionic TTNs require a model-native Symmray "
+                "observable or projector via TreeTensorNetwork.local_expectation."
+            )
+
+    def _check_operator_limits(self, where, *, dense=True):
+        """Reject dense operators and oversized operator subtrees."""
+        if (
+            dense
+            and
+            self.max_operator_qubits is not None
+            and len(where) > self.max_operator_qubits
+        ):
+            raise MemoryError(
+                f"operator support of {len(where)} qubits exceeds the configured "
+                f"max_operator_qubits={self.max_operator_qubits}."
+            )
+        if self.max_subtree_nodes is not None and len(where) > 1:
+            leaves = [self.plan.leaf_of_qubit[q] for q in where]
+            span = self._steiner_nodes(leaves)
+            if len(span) > self.max_subtree_nodes:
+                raise MemoryError(
+                    f"operator Steiner subtree has {len(span)} nodes, exceeding "
+                    f"max_subtree_nodes={self.max_subtree_nodes}."
+                )
+
+    def _projection_snapshot(self, where):
+        """Return compact support/span/bond diagnostics for a projection."""
+        leaves = [self.plan.leaf_of_qubit[q] for q in where]
+        span = frozenset(self._steiner_nodes(leaves))
+        bonds = {}
+        for node in span:
+            for neighbour in self._neighbors(node):
+                if neighbour not in span or node > neighbour:
+                    continue
+                edge = (node, neighbour)
+                bonds[edge] = int(
+                    self.tn.ind_size(self.tn.bond(node, neighbour))
+                )
+        return {
+            "support": tuple(self._logical_qubits[q] for q in where),
+            "span": tuple(sorted(span)),
+            "bonds": bonds,
+            "max_bond": max(bonds.values(), default=1),
+        }
+
     # -- canonical centre tracking -------------------------------------------
+
+    @property
+    def p(self):
+        """The current :class:`TreeTensorNetwork` state.
+
+        A convenience alias for :attr:`tn` that mirrors the ``MpsOptimizer.p``
+        interface, so code written against either engine can read the state via
+        ``engine.p``.
+        """
+        return self.tn
+
+    @p.setter
+    def p(self, value):
+        self._install_tn(value)
 
     @property
     def center(self):
@@ -240,10 +1162,37 @@ class TreeOptimizer:
 
         Delegates to :meth:`TreeTensorNetwork.shift_orthogonality_center`: a
         no-op when already centred, an incremental per-edge QR walk along the
-        tree geodesic from a known centre, or a single O(N) canonicalisation
-        when the centre is unknown.
+        tree geodesic from a known centre, or regional QR recovery followed by
+        a path walk when a multi-node canonical region is known. Only an
+        otherwise uncatalogued state requires a full O(N) canonicalisation.
         """
         self.tn.shift_orthogonality_center(target)
+
+    def _nearest_anchor(self, nodes):
+        """Choose the closest node to the current centre or canonical region.
+
+        Ties preserve the supplied order, keeping gate application
+        deterministic. If no canonical location is known, the first node is
+        used and the subsequent centre move establishes one.
+        """
+        nodes = tuple(nodes)
+        if not nodes:
+            raise ValueError("at least one anchor node is required.")
+        center = self.center
+        region = self.canonical_region
+        if center is not None:
+            return min(
+                nodes,
+                key=lambda node: len(self.plan.node_path(center, node)),
+            )
+        if region:
+            return min(
+                nodes,
+                key=lambda node: min(
+                    len(self.plan.node_path(r, node)) for r in region
+                ),
+            )
+        return nodes[0]
 
     def shift_orthogonality_center(self, node):
         """Move the orthogonality centre to ``node`` along the tree geodesic.
@@ -281,6 +1230,16 @@ class TreeOptimizer:
     def canonical_region(self, value):
         self.tn.canonical_region = value
 
+    def layout_report(self):
+        """Return the stored layout diagnostics for the live tree, if available."""
+        if self.layout_finder is None:
+            return {
+                "n_qubits": self.n,
+                "is_binary": self.plan.is_binary(),
+                "max_arity": self.plan.max_arity(),
+            }
+        return self.layout_finder.report(self.plan)
+
     def canonize_subtree(self, nodes, *, span=False):
         """Canonicalise the state around the connected subtree ``nodes``.
 
@@ -315,47 +1274,511 @@ class TreeOptimizer:
         """
         return self.tn.is_subtree_canonical_form(nodes, span=span, tol=tol)
 
+    def canonize_mps(self, p, where, *, info=None):
+        """Compatibility canonicalization entry point for shared frontends.
+
+        The name is retained because ``MpsOptimizer`` exposes it publicly. For
+        a tree, an integer or singleton support moves the centre to that
+        qubit's leaf; a two-qubit support canonicalizes the minimal spanning
+        subtree. ``info['cur_orthog']`` is updated when an info mapping is
+        supplied, matching the MPS metadata convention.
+        """
+        if not isinstance(p, TreeTensorNetwork):
+            raise TypeError("p must be a TreeTensorNetwork for tree canonicalization.")
+        if isinstance(where, Integral):
+            sites = (int(where),)
+        else:
+            try:
+                sites = tuple(int(q) for q in where)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "where must be an int or a one-/two-qubit support."
+                ) from exc
+        if len(sites) not in {1, 2}:
+            raise ValueError("where must be an int, (int,), or (int, int).")
+        for q in sites:
+            if q not in p.plan.leaf_of_qubit:
+                raise ValueError(f"qubit {q} is outside the tree state.")
+        if len(sites) == 1:
+            p.shift_orthogonality_center(p.plan.leaf_of_qubit[sites[0]])
+            target = (sites[0], sites[0])
+        else:
+            p.canonize_around_qubits_(sites)
+            target = (min(sites), max(sites))
+        if info is not None:
+            info["cur_orthog"] = target
+        return target
+
     # -- gate application -----------------------------------------------------
 
-    def run(self, gates=None):
-        """Replay ``gates`` (or the construction stream) on the tree. Returns self."""
-        if gates is not None:
-            self.G, self.where = self._normalize_gate_queue(gates)
-        for gate, where in zip(self.G, self.where):
-            self.apply_gate(gate, where)
-        return self
+    def _begin_update(self, kind, where):
+        """Start aggregating edge truncations for one state update."""
+        if self._active_update is not None:
+            return False
+        self._active_update = {
+            "kind": str(kind),
+            "support": tuple(int(q) for q in where),
+            "edge_start": len(self.truncation_history),
+        }
+        return True
 
-    def apply_gate(self, gate, where):
-        """Apply a gate at qubit support ``where``.
+    def _abort_update(self):
+        """Discard a partial aggregation after a failed state update."""
+        if self._active_update is None:
+            return
+        start = self._active_update["edge_start"]
+        del self.truncation_history[start:]
+        self._active_update = None
 
-        One- and two-qubit gates take the optimised leaf-absorb / geodesic
-        threading paths (:meth:`apply_1q`, :meth:`apply_2q`); gates on three or
-        more qubits are applied in one shot over their minimal spanning subtree
-        via :meth:`apply_subtree_operator`.
-        """
-        where = _normalize_where(where)
+    def _finish_update(self):
+        """Commit one gate-level truncation aggregation."""
+        active = self._active_update
+        if active is None:
+            return
+        if not self.record_history:
+            self._active_update = None
+            return
+        start = active["edge_start"]
+        edge_events = self.truncation_history[start:]
+        tracked = [
+            event for event in edge_events
+            if event["discarded_fraction"] is not None
+        ]
+        if tracked:
+            edge_survival = float(np.prod([
+                max(0.0, 1.0 - event["discarded_fraction"])
+                for event in tracked
+            ]))
+            relative_loss = float(1.0 - edge_survival)
+            absolute_loss = float(
+                sum(event["discarded_weight"] for event in tracked)
+            )
+            max_edge_loss = float(
+                max(event["discarded_weight"] for event in tracked)
+            )
+            max_edge_fraction = float(
+                max(event["discarded_fraction"] for event in tracked)
+            )
+            self._truncation_survival *= edge_survival
+            cumulative_loss = float(1.0 - self._truncation_survival)
+        else:
+            if self.track_truncation:
+                relative_loss = 0.0
+                absolute_loss = 0.0
+                max_edge_loss = 0.0
+                max_edge_fraction = 0.0
+                cumulative_loss = float(1.0 - self._truncation_survival)
+            else:
+                relative_loss = None
+                absolute_loss = None
+                max_edge_loss = None
+                max_edge_fraction = None
+                cumulative_loss = None
+
+        self.update_history.append({
+            "update": len(self.update_history),
+            "kind": active["kind"],
+            "support": active["support"],
+            "edge_event_indices": list(range(start, len(self.truncation_history))),
+            "edge_count": len(edge_events),
+            "truncated_edges": sum(event["truncated"] for event in edge_events),
+            "absolute_discarded_weight": absolute_loss,
+            "relative_discarded_weight": relative_loss,
+            "cumulative_relative_discarded_weight": cumulative_loss,
+            "max_edge_discarded_weight": max_edge_loss,
+            "max_edge_discarded_fraction": max_edge_fraction,
+        })
+        if tracked:
+            local_infidelity = float(relative_loss)
+            self.infidelities.append(float(cumulative_loss))
+            self.infidelity_samples.append({
+                "step": len(self.infidelity_samples) + 1,
+                "where": active["support"],
+                "edge_count": len(edge_events),
+                "local_fidelity": float(1.0 - local_infidelity),
+                "local_infidelity": local_infidelity,
+                "infidelity": float(cumulative_loss),
+                "cumulative_infidelity": float(cumulative_loss),
+                "method": "tree_edge_spectrum",
+            })
+        self._active_update = None
+
+    def apply_gate(self, gate, where, *, renormalize=False):
+        """Apply a gate and aggregate its edge truncation diagnostics."""
+        started = self._begin_update("gate", _normalize_where(where))
+        try:
+            result = self._apply_gate_impl(gate, where, renormalize=renormalize)
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
+        if started:
+            self._finish_update()
+        return result
+
+    def _apply_gate_impl(self, gate, where, *, renormalize=False):
+        """Apply a gate without opening a nested diagnostic update."""
+        logical_where = _normalize_where(where)
+        where = self._validate_support(logical_where)
+        self._check_operator_limits(where)
         with self._thread_ctx():
             if len(where) == 1:
-                self.apply_1q(gate, where[0])
+                self.apply_1q(
+                    gate, logical_where[0], renormalize=renormalize
+                )
             elif len(where) == 2:
                 if where[0] == where[1]:
                     raise ValueError(
                         "A two-qubit gate needs two distinct qubits; "
                         f"got where={where}."
                     )
-                self.apply_2q(gate, where[0], where[1])
+                self.apply_2q(gate, logical_where[0], logical_where[1])
+                if renormalize:
+                    self.normalize()
             else:
                 if len(set(where)) != len(where):
                     raise ValueError(
                         "A multi-qubit gate needs distinct qubits; "
                         f"got where={where}."
                     )
-                self.apply_subtree_operator(gate, where)
+                self.apply_subtree_operator(
+                    gate, logical_where, renormalize=renormalize
+                )
+        return self
 
-    def apply_1q(self, gate, q):
+    def run(self, gates=None, *, progbar=False, mode=None, non_unitary=False,
+            normalize_every=False, normalize_final=False,
+            normalize_eps=1e-15, seed=None):
+        """Replay ``gates`` (or the construction stream) on the tree.
+
+        Parameters
+        ----------
+        gates : bundled gate stream, optional
+            Replacement stream to replay. If omitted, replay the queued stream.
+        progbar : bool, default=False
+            Show a tqdm progress bar with the two-qubit gate count and a
+            norm-based truncation proxy. Both dense and native trees report
+            ``1 - (norm / reference_norm)**2``; the reference is established
+            at run start and reset after control/non-unitary events.
+        mode : {"auto", "direct", "mpo"} | {"tree", "ttn"} | None, default=None
+            Optional persistent two-site implementation selection, matching
+            ``MpsOptimizer.run(mode=...)``: a supplied value updates
+            :attr:`mode` before replay and remains active for future runs and
+            copies. ``"tree"``/``"ttn"`` are deprecated no-op compatibility
+            selectors for shared coefficient frontends.
+        non_unitary : bool, default=False
+            Mark the stream as non-unitary when using automatic normalization.
+        normalize_every : bool, default=False
+            Normalize after every replay event. Requires ``non_unitary=True``.
+        normalize_final : bool, default=False
+            Normalize once after replay. Requires ``non_unitary=True``.
+        normalize_eps : float, default=1e-15
+            Zero-state threshold used by automatic normalization.
+        seed : int | None, default=None
+            Reseed measurement/reset sampling before replay.
+        """
+        if mode is not None:
+            requested_mode = str(mode).strip().lower()
+            if requested_mode in {"tree", "ttn", "tree_tensor_network"}:
+                warnings.warn(
+                    "run(mode='tree'/'ttn') is a deprecated no-op; use "
+                    "mode='auto', 'direct', or 'mpo' to select a two-site "
+                    "implementation.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            else:
+                self.mode = self._normalize_mode(requested_mode)
+        non_unitary = bool(non_unitary)
+        if not non_unitary and normalize_every not in (False, None):
+            raise ValueError("normalize_every requires non_unitary=True.")
+        if not non_unitary and normalize_final:
+            raise ValueError("normalize_final requires non_unitary=True.")
+        normalize_every = bool(normalize_every)
+        normalize_eps = float(normalize_eps)
+        if normalize_eps < 0.0:
+            raise ValueError("normalize_eps must be non-negative.")
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        if gates is not None:
+            self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
+        self._validate_event_stream_for_run()
+        pbar = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(
+                total=len(self.G),
+                desc="tree",
+                leave=True,
+                position=0,
+                ascii=True,
+                colour="green",
+            )
+
+        one_qubit_count = 0
+        two_qubit_count = 0
+        multi_qubit_count = 0
+        control_count = 0
+        progress_reference_norm = (
+            self.norm()
+            if pbar is not None
+            else None
+        )
+
+        try:
+            for step, (payload, where, event_type) in enumerate(zip(
+                self.G, self.where, self.event_types
+            ), start=1):
+                support = _normalize_where(where)
+                if event_type == "gate":
+                    if len(support) == 1:
+                        one_qubit_count += 1
+                    elif len(support) == 2:
+                        two_qubit_count += 1
+                    else:
+                        multi_qubit_count += 1
+                    self.apply_gate(payload, support)
+                elif event_type == "submpo":
+                    started = self._begin_update(event_type, support)
+                    try:
+                        support = self._validate_support(support)
+                        self._check_operator_limits(support, dense=False)
+                        with self._thread_ctx():
+                            applied = self._try_apply_native_submpo(
+                                payload, support, max_bond=self.chi,
+                                cutoff=self.cutoff,
+                            )
+                            if applied is None:
+                                self._check_operator_limits(support)
+                                operator = _submpo_to_dense(payload, support)
+                                self._apply_subtree_operator_impl(
+                                    operator, support
+                                )
+                    except Exception:
+                        if started:
+                            self._abort_update()
+                        raise
+                    if started:
+                        self._finish_update()
+                    multi_qubit_count += 1
+                else:
+                    control_count += 1
+                    started = self._begin_update(event_type, support)
+                    try:
+                        self._apply_control_event(event_type, payload, support)
+                    except Exception:
+                        if started:
+                            self._abort_update()
+                        raise
+                    if started:
+                        self._finish_update()
+
+                if normalize_every:
+                    old_norm = self.norm()
+                    self.normalize(eps=normalize_eps)
+                    self.normalizations.append({
+                        "step": step,
+                        "old_norm": float(old_norm * old_norm),
+                        "span": tuple(support),
+                        "insert": self.center,
+                        "sites": tuple(support),
+                        "scales": (float(old_norm),),
+                        "reason": "step",
+                    })
+
+                if pbar is not None:
+                    # Use the same squared survival proxy for every backend.
+                    # Control and explicitly non-unitary events change the
+                    # physical norm for reasons unrelated to truncation, so
+                    # reset the reference after those events.
+                    state_norm = self.norm()
+                    reset_progress = non_unitary or event_type != "gate"
+                    if reset_progress:
+                        truncation_infidelity = 0.0
+                        progress_reference_norm = state_norm
+                    elif progress_reference_norm in (None, 0.0):
+                        truncation_infidelity = 0.0
+                    else:
+                        survival = state_norm / progress_reference_norm
+                        truncation_infidelity = max(
+                            0.0,
+                            1.0 - survival * survival,
+                        )
+                    postfix = {
+                        "2q": two_qubit_count,
+                        "infidelity": self._format_progress_infidelity(
+                            truncation_infidelity
+                        ),
+                    }
+                    if multi_qubit_count:
+                        postfix["kq"] = multi_qubit_count
+                    if control_count:
+                        postfix["ctrl"] = control_count
+                    pbar.set_postfix(postfix)
+                    pbar.update(1)
+        finally:
+            if pbar is not None:
+                pbar.close()
+        if normalize_final and self.G:
+            old_norm = self.norm()
+            self.normalize(eps=normalize_eps)
+            self.normalizations.append({
+                "step": len(self.G),
+                "old_norm": float(old_norm * old_norm),
+                "span": (),
+                "insert": self.center,
+                "sites": (),
+                "scales": (float(old_norm),),
+                "reason": "final",
+            })
+        return self
+
+    def set_gates(self, gates):
+        """Replace the queued gate stream and return ``self``."""
+        self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
+        return self
+
+    def add_gates(self, gates):
+        """Append gates to the queued stream and return ``self``."""
+        G_new, where_new, event_types_new = self._normalize_gate_queue(gates)
+        self.G.extend(G_new)
+        self.where.extend(where_new)
+        self.event_types.extend(event_types_new)
+        return self
+
+    @staticmethod
+    def measure_event(pauli, where, outcome=None):
+        """Return a Pauli-measurement event in the MPS-compatible format."""
+        where = _normalize_control_where(where)
+        _normalize_measure_axes(pauli, where)
+        if outcome is None:
+            return ("measure", str(pauli), where)
+        if not isinstance(outcome, Integral) or int(outcome) not in (-1, 1):
+            raise ValueError("measure event outcome must be +1 or -1.")
+        return ("measure", str(pauli), where, int(outcome))
+
+    @staticmethod
+    def cap_event(where, vec, absorb="left", *, compact_labels=True):
+        """Return an MPS-compatible physical-index cap event.
+
+        A tree cap contracts a leaf into its parent; ``absorb`` is accepted for
+        stream compatibility and must be ``"left"`` or ``"right"``.  Set
+        ``compact_labels=False`` to preserve the caller-facing logical label
+        gap; this form is represented as a mapping so the option survives
+        stream normalization.
+        """
+        where = _normalize_control_where(where)
+        if len(where) != 1:
+            raise ValueError("cap event where must reference exactly one site.")
+        if absorb not in {"left", "right"}:
+            raise ValueError("cap absorb direction must be 'left' or 'right'.")
+        try:
+            vec = ar.do("reshape", vec, (-1,))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("cap event vector must be array-like.") from exc
+        if int(ar.shape(vec)[0]) != 2:
+            raise ValueError("cap event vector must have exactly two entries.")
+        if compact_labels:
+            return ("cap", where[0], vec, absorb)
+        return {
+            "kind": "cap", "where": where[0], "vec": vec,
+            "absorb": absorb, "compact_labels": False,
+        }
+
+    @staticmethod
+    def reset_event(where, basis="Z"):
+        """Return a mid-circuit reset event in the MPS-compatible format."""
+        where = _normalize_control_where(where)
+        axes = _normalize_control_axes(basis, where, event="reset")
+        if all(axis == "Z" for axis in axes):
+            return ("reset", where)
+        return ("reset", where, "".join(axes))
+
+    @staticmethod
+    def measure_reset_event(pauli, where, outcome=None):
+        """Return a measure-then-reset event in the MPS-compatible format."""
+        where = _normalize_control_where(where)
+        axes = _normalize_control_axes(pauli, where, event="measure_reset")
+        if outcome is None:
+            return ("measure_reset", "".join(axes), where)
+        if isinstance(outcome, Integral):
+            outcome = int(outcome)
+            if outcome not in (-1, 1):
+                raise ValueError("measure_reset outcome must be +1 or -1.")
+            return ("measure_reset", "".join(axes), where, outcome)
+        outcomes = tuple(int(value) for value in outcome)
+        if len(outcomes) != len(where) or any(value not in (-1, 1) for value in outcomes):
+            raise ValueError(
+                "measure_reset outcomes must be +1/-1 and match where."
+            )
+        return ("measure_reset", "".join(axes), where, outcomes)
+
+    @staticmethod
+    def control_event_parts(entry):
+        """Return ``(name, payload, where)`` for an MPS-style control event."""
+        return _mps_control_event_parts(entry)
+
+    @staticmethod
+    def is_control_event(entry):
+        """Return whether ``entry`` is an MPS-style control event."""
+        return _mps_control_event_parts(entry) is not None
+
+    @staticmethod
+    def submpo_event(submpo, where):
+        """Return an explicit sub-MPO stream marker for TTN replay."""
+        return ("submpo", submpo, normalize_submpo_where(where))
+
+    @staticmethod
+    def submpo_event_parts(entry):
+        """Return ``(submpo, where)`` for an explicit marker, else ``None``."""
+        return submpo_event_parts(entry, normalize_where=True)
+
+    @staticmethod
+    def is_submpo_event(entry):
+        """Return whether ``entry`` is an explicit sub-MPO stream marker."""
+        return submpo_event_parts(entry) is not None
+
+    def apply_1q(self, gate, q, *, renormalize=False):
         """Absorb a one-qubit gate into the leaf tensor of qubit ``q``."""
-        gate = np.asarray(gate).reshape(2, 2)
+        self._invalidate_state_norm_cache()
+        with self._thread_ctx():
+            return self._apply_1q_impl(gate, q, renormalize=renormalize)
+
+    def _apply_1q_impl(self, gate, q, *, renormalize=False):
+        """Apply a one-qubit gate without opening another thread context."""
+        q = self._validate_qubit(q)
+        gate = self._as_state_backend(gate)
+        d = int(self.tn.ind_size(self._phys(q)))
+        if _is_symmray_array(gate):
+            # A Symmray gate is already a (d, d) symmetric operator; reshaping
+            # into base-2 sub-legs would destroy its block/charge structure. Its
+            # unitarity cannot be cheaply certified here, so take the always-safe
+            # non-unitary branch (move the centre onto the leaf first).
+            unitary = False
+        else:
+            if tuple(ar.shape(gate)) != (d, d):
+                gate = ar.do("reshape", gate, (d, d))
+            gate_np = ar.to_numpy(gate)
+            unitary = np.allclose(
+                gate_np.conj().T @ gate_np, np.eye(d, dtype=gate_np.dtype),
+                rtol=1e-10, atol=1e-12,
+            )
+        if not unitary:
+            self._move_center(self.plan.leaf_of_qubit[q])
+        region = self.tn.canonical_region
         self.tn.gate_inds_(gate, [self._phys(q)], contract=True)
+        if unitary:
+            # A physical unitary preserves the isometric exterior, but the
+            # state-owned gate mutator deliberately invalidates metadata for
+            # direct callers. Restore the known region only for this proven
+            # canonical-preserving operation.
+            self.tn.canonical_region = region
+        if not unitary:
+            self.center = self.plan.leaf_of_qubit[q]
+            if renormalize:
+                self.normalize()
+        return self
 
     def apply_2q(self, gate, qa, qb):
         """Apply a two-qubit gate to leaves ``qa`` and ``qb``.
@@ -367,67 +1790,263 @@ class TreeOptimizer:
         are present is a single canonical compression sweep run back along the
         path, so every bond truncation sees the complete gate.
         """
-        plan = self.plan
-        la = plan.leaf_of_qubit[qa]
-        lb = plan.leaf_of_qubit[qb]
+        self._invalidate_state_norm_cache()
+        with self._thread_ctx():
+            return self._apply_2q_impl(gate, qa, qb)
+
+    @staticmethod
+    def _as_gate_tensor4(gate, da, db):
+        """Return a two-site gate as a rank-4 (out_a, out_b, in_a, in_b) tensor.
+
+        Dense qubit gates arrive as a ``(da*db, da*db)`` matrix (or an already
+        rank-4 array) and are reshaped to the ``(da, db, da, db)`` convention.
+        A Symmray gate is already a rank-4 symmetric array whose legs carry the
+        charge/fermion-sign structure, so it is returned untouched -- reshaping
+        it into base-2 sub-legs would corrupt the block structure.
+        """
+        if _is_symmray_array(gate):
+            if len(ar.shape(gate)) != 4:
+                raise ValueError(
+                    "A Symmray two-site gate must be a rank-4 "
+                    "(out_a, out_b, in_a, in_b) array; got shape "
+                    f"{tuple(ar.shape(gate))}."
+                )
+            return gate
+        if tuple(ar.shape(gate)) == (da, db, da, db):
+            return gate
+        return ar.do("reshape", gate, (da, db, da, db))
+
+    def _apply_2q_impl(self, gate, qa, qb, *, max_bond=None, cutoff=None):
+        """Apply a two-site gate using the selected direct or MPO route.
+
+        ``mode='direct'`` splits the gate locally and ``mode='mpo'`` lets Quimb
+        make the equivalent two-tensor MPO. Both immediately enter the same
+        two-factor attach/QR-thread/compress kernel. ``'auto'`` selects direct
+        factorization for every backend; use ``'mpo'`` explicitly to select
+        Quimb's operator-TN factorization.
+        """
+        gate = self._as_state_backend(gate)
+        if self.mode in {"auto", "direct"}:
+            return self._apply_2q_path_thread_impl(
+                gate, qa, qb, max_bond=max_bond, cutoff=cutoff
+            )
+        return self._apply_2q_mpo_impl(
+            gate, qa, qb, max_bond=max_bond, cutoff=cutoff
+        )
+
+    def _apply_2q_mpo_impl(
+        self, gate, qa, qb, *, max_bond=None, cutoff=None,
+    ):
+        """Apply a two-site gate as a Quimb sub-MPO without nested updates."""
+
+        qa = self._validate_qubit(qa)
+        qb = self._validate_qubit(qb)
+        if qa == qb:
+            raise ValueError("A two-qubit gate needs two distinct qubits.")
+        self._check_operator_limits((qa, qb))
+
+        if _is_symmray_array(gate):
+            # ``TensorNetwork.ind_size`` currently reports the size of a
+            # selected Symmray block after a native one-site gate, rather than
+            # the complete graded physical dimension. The native rank-four
+            # gate's explicit axes are authoritative for ``from_dense``.
+            gate_shape = tuple(int(dim) for dim in ar.shape(gate))
+            if len(gate_shape) != 4:
+                raise ValueError(
+                    "A native two-site gate must have rank four; got shape "
+                    f"{gate_shape}."
+                )
+            da, db = gate_shape[:2]
+        else:
+            da = int(self.tn.ind_size(self._phys(qa)))
+            db = int(self.tn.ind_size(self._phys(qb)))
+        gate = self._as_gate_tensor4(gate, da, db)
+
+        # ``MatrixProductOperator.from_dense`` is backend-generic: for a
+        # Symmray FermionicArray its block-aware SVD returns native fermionic
+        # MPO tensors, including virtual-sector data and graded index
+        # orientations. Its Tensor.split default has a nonzero cutoff, so make
+        # the gate factorisation explicitly lossless; ``chi``/``self.cutoff``
+        # are applied only after the complete gate reaches the TTN path.
+        submpo = qtn.MatrixProductOperator.from_dense(
+            gate, dims=(da, db), sites=(qa, qb), L=self.n,
+            max_bond=None, cutoff=0.0,
+        )
+        factors = self._two_site_mpo_factors(submpo, qa, qb)
+        if factors is None:
+            raise TypeError(
+                "two-site gate could not be represented as a Quimb sub-MPO "
+                "with one local factor per requested site."
+            )
+        return self._apply_2q_factors_impl(
+            *factors, qa, qb, max_bond=max_bond, cutoff=cutoff
+        )
+
+    def _two_site_mpo_factors(self, submpo, qa, qb, *, site_where=None):
+        """Extract and normalize a two-site Quimb MPO into local factors.
+
+        The returned factors have exactly the same interface as a direct
+        gate-SVD factorization: each has one output leg, one state physical
+        input leg, and their shared operator-Schmidt bond. Crucially, factors
+        are found by their site tags rather than MPO tensor order, so a
+        descending support ``(qb, qa)`` remains correct.
+        """
+        if site_where is None:
+            site_where = (qa, qb)
+        else:
+            site_where = tuple(site_where)
+        if len(site_where) != 2:
+            raise ValueError("a two-site MPO support must contain two sites.")
+        site_a, site_b = site_where
+        gen_sites = getattr(submpo, "gen_sites_present", None)
+        site_tag = getattr(submpo, "site_tag", None)
+        upper_id = getattr(submpo, "upper_ind_id", None)
+        lower_id = getattr(submpo, "lower_ind_id", None)
+        tag_map = getattr(submpo, "tag_map", None)
+        tensor_map = getattr(submpo, "tensor_map", None)
+        if not all((gen_sites, callable(site_tag), upper_id, lower_id,
+                    tag_map is not None, tensor_map is not None)):
+            return None
+        try:
+            if set(gen_sites()) != {site_a, site_b}:
+                return None
+            raw_factors = {}
+            for qubit, site in ((qa, site_a), (qb, site_b)):
+                tids = tuple(tag_map[site_tag(site)])
+                if len(tids) != 1:
+                    return None
+                factor = tensor_map[tids[0]].copy()
+                upper = upper_id.format(site)
+                lower = lower_id.format(site)
+                if upper not in factor.inds or lower not in factor.inds:
+                    return None
+                raw_factors[qubit] = (factor, upper, lower)
+            bonds = tuple(qtn.bonds(
+                raw_factors[qa][0], raw_factors[qb][0]
+            ))
+        except (KeyError, TypeError, ValueError):
+            return None
+        if len(bonds) != 1:
+            return None
+
+        thread_ind = qtn.rand_uuid()
+        factors = {}
+        outputs = {}
+        for qubit, (factor, upper, lower) in raw_factors.items():
+            output = qtn.rand_uuid()
+            factor.reindex_({
+                upper: output,
+                lower: self._phys(qubit),
+                bonds[0]: thread_ind,
+            })
+            factors[qubit] = factor
+            outputs[qubit] = output
+        return factors, outputs, thread_ind
+
+    def _apply_2q_path_thread_impl(
+        self, gate, qa, qb, *, max_bond=None, cutoff=None,
+    ):
+        """Apply a two-qubit gate without opening another thread context."""
+        gate = self._as_state_backend(gate)
+        qa = self._validate_qubit(qa)
+        qb = self._validate_qubit(qb)
+        if qa == qb:
+            raise ValueError("A two-qubit gate needs two distinct qubits.")
+        self._check_operator_limits((qa, qb))
         pa, pb = self._phys(qa), self._phys(qb)
-
-        # Fast path: sibling leaves share a parent, so the gate correlation is
-        # carried entirely by the parent blob -- a single two-site update
-        # (contract the three tensors, apply the gate, re-split by SVD) avoids
-        # the QR threading and double-bond fusion of the general geodesic route.
-        parent = plan.parent.get(la)
-        if parent is not None and plan.parent.get(lb) == parent:
-            self._apply_2q_siblings(gate, qa, qb, la, lb, parent)
-            return
-
-        # Centre on the source leaf so the exact threading pushes an isometric
-        # front toward leaf b (the orthogonality centre rides the virtual bond).
-        self._move_center(la)
-
-        gate = np.asarray(gate).reshape(2, 2, 2, 2)  # (out_a, out_b, in_a, in_b)
-        self._thread_ind = qtn.rand_uuid()
-        gt = qtn.Tensor(gate, inds=("_na", "_nb", pa, pb))
-        left, right = gt.split(
-            left_inds=("_na", pa),
+        da, db = int(self.tn.ind_size(pa)), int(self.tn.ind_size(pb))
+        gate = self._as_gate_tensor4(gate, da, db)
+        thread_ind = qtn.rand_uuid()
+        output_a, output_b = qtn.rand_uuid(), qtn.rand_uuid()
+        gate_tensor = qtn.Tensor(
+            gate, inds=(output_a, output_b, pa, pb),
+        )
+        left, right = gate_tensor.split(
+            left_inds=(output_a, pa),
             method="svd",
             cutoff=0.0,
             absorb="both",
             get="tensors",
-            bond_ind=self._thread_ind,
+            bond_ind=thread_ind,
+        )
+        return self._apply_2q_factors_impl(
+            {qa: left, qb: right},
+            {qa: output_a, qb: output_b},
+            thread_ind,
+            qa,
+            qb,
+            max_bond=max_bond,
+            cutoff=cutoff,
         )
 
-        # Absorb the left factor into leaf a; its new physical index keeps name.
-        ta = self.tn.tensor_map[self._tid(la)]
-        merged_a = qtn.tensor_contract(ta, left).reindex_({"_na": pa})
-        ta.modify(data=merged_a.data, inds=merged_a.inds)
+    def _apply_2q_factors_impl(
+        self, factors, outputs, thread_ind, qa, qb, *, max_bond=None,
+        cutoff=None,
+    ):
+        """Apply two local operator factors with one shared path-thread kernel.
 
-        # Thread the virtual bond exactly along the tree geodesic to leaf b.
-        path = plan.node_path(la, lb)
-        for u, v in zip(path, path[1:]):
-            self._thread_hop(u, v)
+        ``direct`` supplies factors from its gate SVD and ``mpo`` supplies the
+        two factors Quimb made for its sub-MPO. From here onward they have
+        identical handling: choose the closest source leaf, attach its factor,
+        QR-thread the shared operator bond, attach the other factor, then make
+        one canonical compression sweep.
+        """
+        plan = self.plan
+        la = plan.leaf_of_qubit[qa]
+        lb = plan.leaf_of_qubit[qb]
+        parent = plan.parent.get(la)
+        if parent is not None and plan.parent.get(lb) == parent:
+            return self._apply_2q_sibling_factors(
+                factors, outputs, qa, qb, la, lb, parent,
+                max_bond=max_bond, cutoff=cutoff,
+            )
 
-        # Absorb the right factor into leaf b, consuming the virtual bond.
-        tb = self.tn.tensor_map[self._tid(lb)]
-        merged_b = qtn.tensor_contract(right, tb).reindex_({"_nb": pb})
-        tb.modify(data=merged_b.data, inds=merged_b.inds)
-        self.center = lb
-        self._thread_ind = None
+        source, destination = (
+            (qa, qb)
+            if self._nearest_anchor((la, lb)) == la
+            else (qb, qa)
+        )
+        source_leaf = plan.leaf_of_qubit[source]
+        destination_leaf = plan.leaf_of_qubit[destination]
+        self._move_center(source_leaf)
+        self._thread_ind = thread_ind
+        try:
+            source_tensor = self.tn.tensor_map[self._tid(source_leaf)]
+            merged_source = qtn.tensor_contract(
+                source_tensor, factors[source]
+            ).reindex_({outputs[source]: self._phys(source)})
+            source_tensor.modify(
+                data=merged_source.data, inds=merged_source.inds,
+            )
 
-        # Canonical compression sweep back along the path, now with both gate
-        # factors present, truncating every touched bond to ``chi``.
-        self._compress_path(path)
+            path = plan.node_path(source_leaf, destination_leaf)
+            for u, v in zip(path, path[1:]):
+                self._thread_hop(u, v)
 
-    def _apply_2q_siblings(self, gate, qa, qb, la, lb, parent):
-        """Apply a two-qubit gate to sibling leaves sharing ``parent``.
+            destination_tensor = self.tn.tensor_map[self._tid(destination_leaf)]
+            merged_destination = qtn.tensor_contract(
+                factors[destination], destination_tensor,
+            ).reindex_({outputs[destination]: self._phys(destination)})
+            destination_tensor.modify(
+                data=merged_destination.data, inds=merged_destination.inds,
+            )
+            self.center = destination_leaf
+            self._compress_path(path, max_bond=max_bond, cutoff=cutoff)
+        finally:
+            self._thread_ind = None
+        return self
 
-        The two leaves and their shared parent are contracted into one blob, the
-        gate is applied, and the blob is re-split by two truncating SVDs -- a
-        direct two-site update (cf. the MPS two-site gate) that needs no bond
-        threading because both leaves already meet at ``parent``.  With the
-        centre first moved onto ``parent`` the surrounding tree is isometric, so
-        each SVD truncates against an isometric environment and both gate
-        factors are present before any truncation.
+    def _apply_2q_sibling_factors(
+        self, factors, outputs, qa, qb, la, lb, parent, *, max_bond=None,
+        cutoff=None,
+    ):
+        """Apply two local factors to sibling leaves through their parent.
+
+        There is no intermediate tree edge on which to thread the shared
+        operator bond. Absorb both factors, contract the two leaves and parent
+        into one blob (which consumes that bond), then make the usual two
+        truncating splits. This is the sibling specialization of
+        :meth:`_apply_2q_factors_impl`, shared by direct and MPO factors.
         """
         pa, pb = self._phys(qa), self._phys(qb)
         self._move_center(parent)
@@ -437,29 +2056,31 @@ class TreeOptimizer:
         e_la = self._bond_name(la, parent)
         e_lb = self._bond_name(lb, parent)
 
-        blob = qtn.tensor_contract(tla, tp, tlb)
-        g = qtn.Tensor(
-            np.asarray(gate).reshape(2, 2, 2, 2),
-            inds=(pa + "*", pb + "*", pa, pb),
+        merged_a = qtn.tensor_contract(tla, factors[qa]).reindex_(
+            {outputs[qa]: pa}
         )
-        blob = qtn.tensor_contract(blob, g).reindex_(
-            {pa + "*": pa, pb + "*": pb}
+        merged_b = qtn.tensor_contract(tlb, factors[qb]).reindex_(
+            {outputs[qb]: pb}
         )
+        blob = qtn.tensor_contract(merged_a, tp, merged_b)
 
         # Split off leaf a (isometric), then leaf b, leaving the centre at the
         # parent; both new bonds keep their canonical tree-edge names.
-        la_t, rem = blob.split(
-            left_inds=[pa], method="svd", max_bond=self.chi,
-            cutoff=self.cutoff, absorb="right", get="tensors", bond_ind=e_la,
+        la_t, rem = self._split_with_diagnostics(
+            blob, [pa], edge=(la, parent), bond_ind=e_la,
+            max_bond=self.chi if max_bond is None else max_bond,
+            cutoff=self.cutoff if cutoff is None else cutoff,
         )
-        lb_t, p_t = rem.split(
-            left_inds=[pb], method="svd", max_bond=self.chi,
-            cutoff=self.cutoff, absorb="right", get="tensors", bond_ind=e_lb,
+        lb_t, p_t = self._split_with_diagnostics(
+            rem, [pb], edge=(lb, parent), bond_ind=e_lb,
+            max_bond=self.chi if max_bond is None else max_bond,
+            cutoff=self.cutoff if cutoff is None else cutoff,
         )
         tla.modify(data=la_t.data, inds=la_t.inds)
         tlb.modify(data=lb_t.data, inds=lb_t.inds)
         tp.modify(data=p_t.data, inds=p_t.inds)
         self.center = parent
+        return self
 
     def _thread_hop(self, u, v):
         """Thread the virtual bond exactly from node ``u`` to adjacent ``v``.
@@ -469,9 +2090,14 @@ class TreeOptimizer:
         upper-triangular ``R`` carries the virtual bond forward to ``v``, moving
         the orthogonality centre with it.  QR is lossless and cheaper than the
         SVD used for the final truncating sweep, so a single gate grows a
-        crossed bond by at most the gate rank ``k <= 4`` above its pre-gate
-        size, and that growth is undone by :meth:`_compress_path`.
+        crossed bond by at most its operator-Schmidt rank (bounded by
+        ``min(d_a**2, d_b**2)`` for local dimensions ``d_a`` and ``d_b``)
+        above its pre-gate size, and that growth is undone by
+        :meth:`_compress_path`.
         """
+        if self.tn.fermionic:
+            return self._fermionic_thread_hop(u, v)
+
         tu = self.tn.tensor_map[self._tid(u)]
         tv = self.tn.tensor_map[self._tid(v)]
         edge = next(iter(qtn.bonds(tu, tv)))
@@ -486,7 +2112,271 @@ class TreeOptimizer:
         tu.modify(data=keep.data, inds=keep.inds)
         tv.modify(data=merged_v.data, inds=merged_v.inds)
 
-    def _compress_path(self, path):
+    def _fermionic_thread_hop(self, u, v):
+        """QR-route the operator bond without leaving native graded arrays."""
+        tu = self.tn.tensor_map[self._tid(u)]
+        tv = self.tn.tensor_map[self._tid(v)]
+        edge = self.tn.bond(u, v)
+        left_inds = [
+            index
+            for index in tu.inds
+            if index not in (edge, self._thread_ind)
+        ]
+        right_inds = [
+            index
+            for index in tu.inds
+            if index not in left_inds
+        ]
+        keep, carry = tu.split(
+            left_inds=left_inds,
+            right_inds=right_inds,
+            method="qr",
+            absorb="right",
+            cutoff=0.0,
+            get="tensors",
+        )
+        merged_v = qtn.tensor_contract(carry, tv)
+        tu.modify(
+            data=keep.data,
+            inds=keep.inds,
+            left_inds=keep.left_inds,
+        )
+        tv.modify(
+            data=merged_v.data,
+            inds=merged_v.inds,
+            left_inds=None,
+        )
+
+    @staticmethod
+    def _tensor_ind_size(tensor, ind):
+        """Return the dimension of ``ind`` on ``tensor``."""
+        return int(tensor.shape[tensor.inds.index(ind)])
+
+    @staticmethod
+    def _split_rank_bound(tensor, left_inds):
+        """Return the matrix-rank upper bound for a tensor split."""
+        left_inds = set(left_inds)
+        left_dim = int(np.prod([
+            TreeOptimizer._tensor_ind_size(tensor, ind) for ind in left_inds
+        ], dtype=int))
+        right_dim = int(np.prod([
+            TreeOptimizer._tensor_ind_size(tensor, ind)
+            for ind in tensor.inds if ind not in left_inds
+        ], dtype=int))
+        return min(left_dim, right_dim)
+
+    @staticmethod
+    def _spectrum_to_numpy(values):
+        """Flatten a dense or block-sparse singular spectrum by magnitude."""
+        if hasattr(values, "blocks"):
+            parts = [
+                np.abs(np.asarray(ar.to_numpy(block))).ravel()
+                for block in values.blocks.values()
+            ]
+            spectrum = (
+                np.concatenate(parts)
+                if parts
+                else np.empty(0, dtype=float)
+            )
+        else:
+            spectrum = np.abs(np.asarray(ar.to_numpy(values))).ravel()
+        # Keep a deterministic ordering for dense diagnostics and rank display.
+        return np.sort(spectrum.astype(float, copy=False))[::-1]
+
+    @staticmethod
+    def _spectrum_payload(values, kept_values=None):
+        """Package full/kept spectra for exact native truncation diagnostics."""
+        payload = {"values": TreeOptimizer._spectrum_to_numpy(values)}
+        if hasattr(values, "blocks") and kept_values is not None:
+            payload["kept_values"] = TreeOptimizer._spectrum_to_numpy(
+                kept_values
+            )
+        return payload
+
+    @staticmethod
+    def _probe_bond_spectrum(ta, tb, *, max_bond=None, cutoff=0.0):
+        """Return full/kept singular spectra for a two-tensor bond."""
+        info = {}
+        qtn.tensor_compress_bond(
+            ta.copy(), tb.copy(), max_bond=None, cutoff=0.0,
+            cutoff_mode="rel", absorb=None, info=info,
+        )
+        values = info.get("singular_values")
+        if values is None:
+            return {"values": np.empty(0, dtype=float)}
+        kept_values = None
+        if hasattr(values, "blocks") and (
+            max_bond is not None or float(cutoff) != 0.0
+        ):
+            kept_info = {}
+            qtn.tensor_compress_bond(
+                ta.copy(), tb.copy(), max_bond=max_bond,
+                cutoff=cutoff, cutoff_mode="rel", absorb=None,
+                info=kept_info,
+            )
+            kept_values = kept_info.get("singular_values")
+        return TreeOptimizer._spectrum_payload(values, kept_values)
+
+    @staticmethod
+    def _probe_split_spectrum(
+        tensor, left_inds, *, max_bond=None, cutoff=0.0,
+    ):
+        """Return full/kept singular spectra for a tensor split."""
+        _, values, _ = tensor.split(
+            left_inds=left_inds,
+            method="svd",
+            cutoff=0.0,
+            max_bond=None,
+            cutoff_mode="rel",
+            absorb=None,
+            get="arrays",
+        )
+        kept_values = None
+        if hasattr(values, "blocks") and (
+            max_bond is not None or float(cutoff) != 0.0
+        ):
+            _, kept_values, _ = tensor.split(
+                left_inds=left_inds,
+                method="svd",
+                cutoff=cutoff,
+                max_bond=max_bond,
+                cutoff_mode="rel",
+                absorb=None,
+                get="arrays",
+            )
+        return TreeOptimizer._spectrum_payload(values, kept_values)
+
+    def _record_truncation(
+        self, *, kind, edge, before_bond, after_bond, bond_ind,
+        full_spectrum=None, max_bond=None, cutoff=None,
+    ):
+        """Record one edge split/compression and optional discarded weight."""
+        if not self.record_history:
+            return
+        discarded_weight = None
+        discarded_fraction = None
+        spectrum_norm_sq = None
+        spectrum_rank = None
+        if full_spectrum is not None:
+            if isinstance(full_spectrum, dict):
+                spectrum = np.asarray(
+                    full_spectrum["values"], dtype=float,
+                ).ravel()
+                kept = full_spectrum.get("kept_values")
+            else:
+                spectrum = np.asarray(full_spectrum, dtype=float).ravel()
+                kept = None
+            spectrum_rank = int(spectrum.size)
+            spectrum_norm_sq = float(np.sum(spectrum * spectrum))
+            if kept is not None:
+                kept = np.asarray(kept, dtype=float).ravel()
+                kept_norm_sq = float(np.sum(kept * kept))
+                discarded_weight = max(0.0, spectrum_norm_sq - kept_norm_sq)
+            else:
+                discarded = spectrum[int(after_bond):]
+                discarded_weight = float(np.sum(discarded * discarded))
+            if spectrum_norm_sq > 0.0:
+                discarded_fraction = float(discarded_weight / spectrum_norm_sq)
+            else:
+                discarded_fraction = 0.0
+
+        self.truncation_history.append({
+            "kind": str(kind),
+            "edge": tuple(int(x) for x in edge),
+            "bond": bond_ind,
+            "before_bond": int(before_bond),
+            "after_bond": int(after_bond),
+            "truncated": bool(after_bond < before_bond),
+            "spectrum_rank": spectrum_rank,
+            "spectrum_norm_sq": spectrum_norm_sq,
+            "discarded_weight": discarded_weight,
+            "discarded_fraction": discarded_fraction,
+            # ``None`` is meaningful: native MPO routing uses an uncapped,
+            # lossless split before the final ``chi``-limited path sweep.
+            "max_bond": None if max_bond is None else int(max_bond),
+            "cutoff": float(self.cutoff if cutoff is None else cutoff),
+        })
+
+    def _split_with_diagnostics(
+        self, tensor, left_inds, *, edge, bond_ind, max_bond, cutoff,
+    ):
+        """Split ``tensor`` and record the resulting virtual edge."""
+        before_bond = self._split_rank_bound(tensor, left_inds)
+        # An uncapped zero-cutoff routing split is provably lossless. Avoid an
+        # otherwise redundant full SVD spectrum probe when diagnostics are on;
+        # the subsequent final compression remains fully tracked.
+        lossless = max_bond is None and float(cutoff) == 0.0
+        full_spectrum = (
+            self._probe_split_spectrum(
+                tensor,
+                left_inds,
+                max_bond=max_bond,
+                cutoff=cutoff,
+            )
+            if self.track_truncation and not lossless else None
+        )
+        left, right = tensor.split(
+            left_inds=left_inds, method="svd", max_bond=max_bond,
+            cutoff=cutoff, absorb="right", get="tensors", bond_ind=bond_ind,
+        )
+        after_bond = self._tensor_ind_size(left, bond_ind)
+        self._record_truncation(
+            kind="split", edge=edge, before_bond=before_bond,
+            after_bond=after_bond, bond_ind=bond_ind,
+            full_spectrum=full_spectrum,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+        return left, right
+
+    def _compress_edge_with_diagnostics(
+        self, u, v, *, max_bond=None, cutoff=None,
+    ):
+        """Compress one live tree edge and record its truncation diagnostics."""
+        max_bond = self.chi if max_bond is None else int(max_bond)
+        cutoff = self.cutoff if cutoff is None else float(cutoff)
+        bond_before = self.tn.bond(u, v)
+        before_bond = int(self.tn.ind_size(bond_before))
+        if (
+            not self.track_truncation
+            and cutoff == 0.0
+            and before_bond <= max_bond
+        ):
+            # No singular value can be removed in this case. A lossless QR
+            # still moves the centre across the edge, but avoids an SVD.
+            self.tn.canonize_edge_(u, v, absorb="right")
+            bond_after = self.tn.bond(u, v)
+            self._record_truncation(
+                kind="canonize", edge=(u, v), before_bond=before_bond,
+                after_bond=int(self.tn.ind_size(bond_after)),
+                bond_ind=bond_after, max_bond=max_bond, cutoff=cutoff,
+            )
+            return
+        full_spectrum = None
+        if self.track_truncation:
+            ta = self.tn.tensor_map[self._tid(u)]
+            tb = self.tn.tensor_map[self._tid(v)]
+            full_spectrum = self._probe_bond_spectrum(
+                ta,
+                tb,
+                max_bond=max_bond,
+                cutoff=cutoff,
+            )
+
+        # Keep the live canonical-region metadata in one place: the TTN edge
+        # wrapper performs the compression and advances its tracked centre.
+        self.tn.compress_edge_(
+            u, v, max_bond=max_bond, cutoff=cutoff, absorb="right"
+        )
+        bond_after = self.tn.bond(u, v)
+        after_bond = int(self.tn.ind_size(bond_after))
+        self._record_truncation(
+            kind="compress", edge=(u, v), before_bond=before_bond,
+            after_bond=after_bond, bond_ind=bond_after,
+            full_spectrum=full_spectrum, max_bond=max_bond, cutoff=cutoff,
+        )
+
+    def _compress_path(self, path, *, max_bond=None, cutoff=None):
         """Canonically compress every bond along ``path`` down to ``chi``.
 
         The orthogonality centre sits at ``path[-1]`` on entry; sweeping back to
@@ -496,18 +2386,271 @@ class TreeOptimizer:
         sweep of Seitz et al. (Fig. 6) applied along the gate geodesic.
         """
         for v, u in zip(path[::-1], path[-2::-1]):
-            self.tn.compress_between(
-                self._tag(v),
-                self._tag(u),
-                max_bond=self.chi,
-                cutoff=self.cutoff,
-                absorb="right",
+            self._compress_edge_with_diagnostics(
+                v, u, max_bond=max_bond, cutoff=cutoff,
             )
         self.center = path[0]
+
+    def _compress_subtree(self, snodes, hub, *, max_bond=None, cutoff=None):
+        """Canonically compress every edge of a connected updated subtree.
+
+        Starting at ``hub``, descend each branch. Compressing ``node -> child``
+        moves the centre onto the child; a lossless QR move returns it before
+        the next branch. Thus every SVD sees the completed operator update with
+        an isometric environment, while every edge is truncated exactly once.
+        """
+        snodes = frozenset(snodes)
+        self._move_center(hub)
+
+        def descend(node, parent):
+            children = sorted(
+                neighbor
+                for neighbor in self._neighbors(node)
+                if neighbor in snodes and neighbor != parent
+            )
+            for child in children:
+                self._compress_edge_with_diagnostics(
+                    node, child, max_bond=max_bond, cutoff=cutoff,
+                )
+                descend(child, node)
+                self.tn.canonize_edge_(child, node, absorb="right")
+
+        descend(hub, None)
+        self.center = hub
+
+    @staticmethod
+    def _qr_route_message(tensor, left_inds, *, bond_ind):
+        """Split one subtree message losslessly while carrying operator legs."""
+        return tensor.split(
+            left_inds=left_inds,
+            method="qr",
+            absorb="right",
+            get="tensors",
+            bond_ind=bond_ind,
+        )
+
+    def _route_subtree_messages(
+        self, local, state_inds, operator_inds, order, *, token,
+    ):
+        """QR-route open MPO bonds from subtree leaves to their common hub."""
+        for u, v in order:
+            state_bond = self.tn.bond(u, v)
+            left_inds = [
+                index for index in local[u].inds
+                if index != state_bond and index not in operator_inds[u]
+            ]
+            new_bond = f"_ttn_mpo_route_{token}_{u}_{v}"
+            kept, message = self._qr_route_message(
+                local[u], left_inds, bond_ind=new_bond,
+            )
+            local[u] = kept
+            local[v] = qtn.tensor_contract(local[v], message)
+            state_inds[v].discard(state_bond)
+            state_inds[v].add(new_bond)
+            operator_inds[v] = set(local[v].inds) - state_inds[v]
 
     # -- general multi-qubit / sub-MPO application ----------------------------
 
     def apply_subtree_operator(self, op, where, *, max_bond=None,
+                               cutoff=None, renormalize=False):
+        """Apply a subtree operator and aggregate its edge truncations."""
+        self._invalidate_state_norm_cache()
+        started = self._begin_update("subtree", _normalize_where(where))
+        try:
+            result = self._apply_subtree_operator_impl(
+                op, where, max_bond=max_bond, cutoff=cutoff,
+                renormalize=renormalize,
+            )
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
+        if started:
+            self._finish_update()
+        return result
+
+    def apply_submpo(self, submpo, where, *, max_bond=None, cutoff=None):
+        """Apply an explicit MPO on ``where`` using the native tree path.
+
+        This is the backend-neutral coefficient-state entry point used by
+        stabilizer and ordinary operator-sum frontends. MPOs exposing Quimb's
+        site interface stay structured; opaque MPO-like payloads fall back to
+        dense :meth:`apply_subtree_operator` lowering.
+        """
+        self._invalidate_state_norm_cache()
+        logical_where = _normalize_where(where)
+        where = self._validate_support(logical_where)
+        return self._apply_submpo_resolved(
+            submpo, where, logical_where=logical_where,
+            max_bond=max_bond, cutoff=cutoff,
+        )
+
+    def _apply_submpo_resolved(self, submpo, where, *, max_bond=None,
+                               cutoff=None, logical_where=None):
+        """Apply a sub-MPO whose support is already in compact TTN positions."""
+        where = tuple(where)
+        if logical_where is None:
+            logical_where = where
+        else:
+            logical_where = tuple(logical_where)
+        if len(logical_where) != len(where):
+            raise ValueError(
+                "logical and compact sub-MPO supports must have equal length."
+            )
+        self._check_operator_limits(where, dense=False)
+        max_bond = self.chi if max_bond is None else int(max_bond)
+        cutoff = self.cutoff if cutoff is None else float(cutoff)
+        if max_bond < 1 or cutoff < 0.0:
+            raise ValueError("max_bond must be positive and cutoff non-negative.")
+        started = self._begin_update("submpo", where)
+        try:
+            with self._thread_ctx():
+                applied = None
+                if len(where) == 2:
+                    factors = self._two_site_mpo_factors(
+                        submpo, where[0], where[1],
+                        site_where=(logical_where[0], logical_where[1]),
+                    )
+                    if factors is not None:
+                        self._apply_2q_factors_impl(
+                            *factors, where[0], where[1],
+                            max_bond=max_bond, cutoff=cutoff,
+                        )
+                        applied = True
+                if applied is None:
+                    applied = self._try_apply_native_submpo(
+                        submpo, where, payload_where=logical_where,
+                        max_bond=max_bond, cutoff=cutoff,
+                    )
+                if applied is None:
+                    self._check_operator_limits(where)
+                    self._apply_subtree_operator_impl(
+                        _submpo_to_dense(submpo, logical_where), logical_where,
+                        max_bond=max_bond, cutoff=cutoff,
+                    )
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
+        if started:
+            self._finish_update()
+        return self
+
+    def apply_pauli_rotation(self, theta, pauli, where, *, sign=1.0):
+        """Apply ``exp(-i theta * sign * P / 2)`` on a Pauli support.
+
+        The operator is represented as a bond-two MPO on the true support
+        window, so this remains efficient when ``where`` is sparse or long.
+        This method is deliberately frame-neutral: callers such as a future
+        stabilizer wrapper may pass a tableau-conjugated Pauli here.
+        """
+        self._require_dense_qubit_state("apply_pauli_rotation")
+        from ..stabilizer_tn.operators import (
+            pauli_combo_submpo,
+            single_qubit_rotation_matrix,
+        )
+
+        logical_where = _normalize_where(where)
+        where = self._validate_support(logical_where)
+        axes = _normalize_measure_axes(pauli, logical_where)
+        sign = float(sign)
+        if sign not in (-1.0, 1.0):
+            raise ValueError("Pauli rotation sign must be +1 or -1.")
+        if len(where) == 1:
+            self.apply_gate(
+                self._as_state_backend(
+                    single_qubit_rotation_matrix(
+                        float(theta), axes[0], sign=sign, dtype=self.dtype
+                    ),
+                    warn=False,
+                ),
+                logical_where,
+            )
+            return self
+        terms = dict(zip(where, axes))
+        c = np.cos(float(theta) / 2.0)
+        coef = -1j * sign * np.sin(float(theta) / 2.0)
+        mpo, mpo_where = pauli_combo_submpo(
+            c, coef, terms, self.n, dtype=self.dtype
+        )
+        self._coerce_tensor_network_backend(mpo, warn=False)
+        return self._apply_submpo_resolved(mpo, mpo_where)
+
+    def apply_pauli_sum(self, weighted_terms, *, max_bond=None, cutoff=None):
+        """Apply a weighted sum of Pauli products as one tree MPO.
+
+        ``weighted_terms`` contains ``(coefficient, mapping)`` pairs, where
+        each mapping is ``{qubit: 'X'|'Y'|'Z'}``. The exact MPO bond is bounded
+        by the number of branches and is compressed by the usual tree path
+        message sweep.
+        """
+        self._require_dense_qubit_state("apply_pauli_sum")
+        from ..stabilizer_tn.operators import pauli_sum_submpo
+
+        terms = tuple(weighted_terms)
+        if not terms:
+            raise ValueError("weighted_terms must contain at least one term.")
+        resolved_terms = []
+        for weight, term in terms:
+            resolved_terms.append((
+                weight,
+                {
+                    self._validate_qubit(q): axis
+                    for q, axis in term.items()
+                },
+            ))
+        mpo, where = pauli_sum_submpo(
+            resolved_terms, self.n, dtype=self.dtype
+        )
+        self._coerce_tensor_network_backend(mpo, warn=False)
+        return self._apply_submpo_resolved(
+            mpo, where, max_bond=max_bond, cutoff=cutoff
+        )
+
+    def expectation_pauli(self, pauli, where, *, sign=1.0):
+        """Return the normalized expectation of a product Pauli operator."""
+        self._require_dense_qubit_state("expectation_pauli")
+        where = self._validate_support(_normalize_where(where))
+        axes = _normalize_measure_axes(pauli, where)
+        sign = float(sign)
+        if sign not in (-1.0, 1.0):
+            raise ValueError("Pauli expectation sign must be +1 or -1.")
+        return sign * to_float(
+            self._product_pauli_expectation(axes, where), real=True
+        )
+
+    def project_pauli(self, pauli, where, outcome, *, sign=1.0,
+                      renormalize=True, normalize=None,
+                      return_diagnostics=False):
+        """Project onto a product-Pauli eigenvalue.
+
+        By default the post-projection state is normalized.  Set
+        ``renormalize=False`` (or the compatibility alias ``normalize=False``)
+        to retain the physical projection norm, which is useful for composing
+        Kraus branches and for survival-probability accounting.  With
+        ``return_diagnostics=True`` a dictionary containing the norm change and
+        support/tree/bond snapshots is returned instead of ``self``.
+        """
+        self._require_dense_qubit_state("project_pauli")
+        logical_where = _normalize_where(where)
+        where = self._validate_support(logical_where)
+        if not isinstance(outcome, Integral) or int(outcome) not in (-1, 1):
+            raise ValueError("Pauli projection outcome must be +1 or -1.")
+        sign = float(sign)
+        if sign not in (-1.0, 1.0):
+            raise ValueError("Pauli projection sign must be +1 or -1.")
+        if normalize is not None:
+            renormalize = bool(normalize)
+        axes = _normalize_measure_axes(pauli, logical_where)
+        diagnostics = self._apply_product_pauli_projector(
+            axes, where, int(outcome) * int(sign),
+            renormalize=bool(renormalize),
+            return_diagnostics=return_diagnostics,
+            logical_support=logical_where,
+        )
+        return diagnostics if return_diagnostics else self
+
+    def _apply_subtree_operator_impl(self, op, where, *, max_bond=None,
                                cutoff=None, renormalize=False):
         """Apply a general multi-qubit operator over its minimal subtree.
 
@@ -516,15 +2659,17 @@ class TreeOptimizer:
         non-unitary / Kraus operator, or a whole Trotter block -- applied as a
         single object rather than decomposed into one- and two-qubit gates.
 
-        The operator is contracted onto the *minimal connected subtree* (Steiner
-        subtree) spanning the target leaves and the result is re-split back into
-        that subtree with truncating SVDs: the tree analogue of a sub-MPO applied
-        over the covering range and then compressed (cf. ``quimb``'s
-        ``MatrixProductState.gate_with_submpo``, which exists for the 1D chain
-        only).  The orthogonality centre is first moved onto a target leaf so the
-        whole exterior is isometric and every re-split truncation sees the
-        complete operator against an isometric environment; the centre is left on
-        a node inside the subtree.
+        The operator is first factorized into an exact tree-MPO on the
+        *minimal connected subtree* (Steiner subtree) spanning the target
+        leaves. It is then applied recursively from the subtree leaves toward
+        a hub: each local state/operator message is QR-split losslessly on one
+        edge and immediately absorbed by its parent. Thus no dense state tensor
+        for the whole Steiner subtree is formed. This is the tree analogue of a
+        sub-MPO applied over a covering range and then compressed (cf.
+        ``quimb``'s ``MatrixProductState.gate_with_submpo``, which exists for
+        the 1D chain only). Once the complete operator has reached the hub, a
+        canonical subtree sweep truncates every affected edge once against an
+        isometric environment.
 
         ``op`` acts on ``len(where)`` qubits: an array reshaped to ``(2,) * 2k``
         with output indices first, ``op[o_0..o_{k-1}, i_0..i_{k-1}]`` (a
@@ -533,16 +2678,74 @@ class TreeOptimizer:
         (e.g. after a Kraus/projection operator).  ``max_bond`` / ``cutoff``
         default to the optimizer's ``chi`` / ``cutoff``.  Returns ``self``.
         """
-        where = _normalize_where(where)
-        k = len(where)
+        logical_where = _normalize_where(where)
+        k = len(logical_where)
+        if k < 1:
+            raise ValueError("apply_subtree_operator needs at least one qubit.")
+        where = self._validate_support(logical_where)
+        self._check_operator_limits(where)
         if len(set(where)) != k:
             raise ValueError(
                 f"apply_subtree_operator needs distinct qubits; got {where}."
             )
         max_bond = self.chi if max_bond is None else int(max_bond)
+        if max_bond < 1:
+            raise ValueError("max_bond must be a positive integer.")
         cutoff = self.cutoff if cutoff is None else float(cutoff)
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative.")
+
+        if _is_symmray_array(op):
+            op_shape = tuple(int(dim) for dim in ar.shape(op))
+            if len(op_shape) != 2 * k:
+                raise ValueError(
+                    "native subtree operators must have one output and one "
+                    f"input leg per site; got shape {op_shape}."
+                )
+            if tuple(op_shape[:k]) != tuple(op_shape[k:]):
+                raise ValueError(
+                    "native subtree operator output and input dimensions "
+                    f"must match; got shape {op_shape}."
+                )
+            with self._thread_ctx():
+                if k == 1:
+                    self._apply_1q_impl(op, logical_where[0])
+                elif k == 2:
+                    # Keep the public logical labels here. The two-site kernel
+                    # resolves them exactly once, which is essential after a
+                    # stable-label cap.
+                    self._apply_2q_impl(
+                        op, logical_where[0], logical_where[1],
+                        max_bond=max_bond, cutoff=cutoff,
+                    )
+                else:
+                    # Native multi-site arrays are lowered to a native MPO;
+                    # unlike the dense path this preserves charge sectors and
+                    # graded signs. The generated MPO uses compact site tags,
+                    # while the outer update retains the caller's labels.
+                    submpo = qtn.MatrixProductOperator.from_dense(
+                        self._as_state_backend(op),
+                        dims=op_shape[:k],
+                        sites=where,
+                        L=self.n,
+                        max_bond=None,
+                        cutoff=0.0,
+                    )
+                    self._apply_submpo_resolved(
+                        submpo,
+                        where,
+                        logical_where=where,
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                    )
+            if renormalize:
+                self.normalize()
+            return self
+
         phys = [self._phys(q) for q in where]
-        op_arr = np.asarray(op).reshape([2] * (2 * k))
+        op_arr = ar.do(
+            "reshape", self._as_state_backend(op), [2] * (2 * k)
+        )
 
         with self._thread_ctx():
             if k == 1:
@@ -559,99 +2762,474 @@ class TreeOptimizer:
             leaves = [self.plan.leaf_of_qubit[q] for q in where]
             snodes = self._steiner_nodes(leaves)
             # Centre on a target leaf so the whole exterior is isometric toward
-            # the subtree; every re-split truncation then measures true state
-            # error (the isometric exterior cancels between bra and ket).
-            if self.center not in snodes:
-                self._move_center(leaves[0])
+            # the subtree. Operator bonds are routed losslessly first; the
+            # final subtree sweep then measures true state error against that
+            # complete operator update.
+            anchor = self._nearest_anchor(leaves)
+            if self.center != anchor:
+                self._move_center(anchor)
 
-            # Record, from the *live* tensors, the index names each subtree node
-            # owns and keeps after contraction -- its physical leg and its
-            # boundary bonds to exterior nodes (gate application renames bonds off
-            # the deterministic scheme, so these must be read, not reconstructed).
-            snode_set = set(snodes)
-            owned = self._subtree_owned_inds(snodes, snode_set)
-
-            # Contract the whole subtree (copies) into one blob, apply the
-            # operator to the physical legs, then re-split back into the subtree.
+            # Factor the operator into an exact tree-MPO and apply it by
+            # leaf-to-hub message passing. This is the tree generalisation of
+            # the paper's two-qubit SVD + thread + compress update. In
+            # particular, no state tensor in the Steiner subtree is contracted
+            # with any other state tensor: each edge creates one local message,
+            # which is immediately absorbed by its parent and split again.
             order, hub = self._peel_order(snodes)
-            ket_ts = [
-                self.tn.tensor_map[self._tid(nid)].copy() for nid in snodes
-            ]
-            blob = qtn.tensor_contract(*ket_ts)
-            gt = qtn.Tensor(op_arr, inds=[p + "*" for p in phys] + phys)
-            blob = qtn.tensor_contract(blob, gt).reindex_(
-                {p + "*": p for p in phys}
+            op_factors, op_bonds = self._decompose_tree_operator(
+                op_arr, where, snodes, order, hub,
             )
-
-            # Peel each subtree-leaf toward the hub with a truncating SVD; the
-            # peeled tensor is isometric (``absorb="right"``) and the norm rides
-            # into the shrinking blob, ending on the hub tensor.  Each new bond
-            # is registered on its hub-side node so a later peel keeps it.
-            for u, v in order:
-                left_inds = [ix for ix in blob.inds if ix in owned[u]]
-                new_bond = self._bond_name(u, v)
-                tu, blob = blob.split(
-                    left_inds=left_inds, method="svd", max_bond=max_bond,
-                    cutoff=cutoff, absorb="right", get="tensors",
-                    bond_ind=new_bond,
-                )
-                node_t = self.tn.tensor_map[self._tid(u)]
-                node_t.modify(data=tu.data, inds=tu.inds)
-                owned[v].add(new_bond)
-            hub_t = self.tn.tensor_map[self._tid(hub)]
-            hub_t.modify(data=blob.data, inds=blob.inds)
-            self.center = hub
+            self._apply_factorized_subtree_operator_impl(
+                op_factors, op_bonds, where, snodes, order, hub,
+                max_bond=max_bond, cutoff=cutoff,
+            )
 
             if renormalize:
                 self.normalize()
         return self
 
-    def _subtree_owned_inds(self, snodes, snode_set):
-        """Return ``{node: {index names it keeps after contraction}}``.
+    def _try_apply_native_submpo(
+        self, submpo, where, *, max_bond, cutoff, payload_where=None,
+    ):
+        """Apply an MPO payload without materialising ``to_dense()``.
 
-        For each subtree node this is its physical index (if a leaf) plus the
-        actual boundary-bond indices it shares with nodes *outside* the subtree,
-        read from the live tensors (gate application renames bonds off the
-        deterministic scheme, so the real names must be observed).  Bonds
-        internal to the subtree are omitted -- they are contracted into the blob.
+        A MatrixProductOperator is itself a tensor network. Its open operator
+        bonds are QR-routed through the same leaf-to-hub sweep as the TTN state
+        bonds: each peeled state tensor retains all currently open MPO bonds,
+        and they contract when their partner reaches the same accumulated
+        subtree. Only after the operator is complete is the affected subtree
+        canonically SVD-compressed. This works for arbitrary MPO bond
+        dimensions and does not require the MPO chain to match the TTN geometry.
+
+        ``None`` is returned when the payload does not expose the Quimb MPO
+        site interface; callers then use the legacy dense fallback.
         """
-        owned = {}
-        for u in snodes:
-            t_u = self.tn.tensor_map[self._tid(u)]
-            ixs = set()
-            q = self.plan.qubit_of_leaf.get(u)
-            if q is not None:
-                ixs.add(self._phys(q))
-            for w in self._neighbors(u):
-                if w not in snode_set:
-                    t_w = self.tn.tensor_map[self._tid(w)]
-                    ixs.update(qtn.bonds(t_u, t_w))
-            owned[u] = ixs
-        return owned
+        where = tuple(where)
+        if payload_where is None:
+            payload_where = where
+        else:
+            payload_where = tuple(payload_where)
+        if len(payload_where) != len(where):
+            raise ValueError(
+                "logical and compact sub-MPO supports must have equal length."
+            )
+        payload_for_compact = dict(zip(where, payload_where))
+        gen_sites = getattr(submpo, "gen_sites_present", None)
+        site_tag = getattr(submpo, "site_tag", None)
+        upper_id = getattr(submpo, "upper_ind_id", None)
+        lower_id = getattr(submpo, "lower_ind_id", None)
+        tag_map = getattr(submpo, "tag_map", None)
+        tensor_map = getattr(submpo, "tensor_map", None)
+        if not all((gen_sites, callable(site_tag), upper_id, lower_id,
+                    tag_map is not None, tensor_map is not None)):
+            return None
+        try:
+            present = tuple(gen_sites())
+        except Exception:
+            return None
+        if set(present) != set(payload_where):
+            return None
+
+        leaves = [self.plan.leaf_of_qubit[q] for q in where]
+        snodes = self._steiner_nodes(leaves)
+        self._move_center(self._nearest_anchor(leaves))
+        order, hub = self._peel_order(snodes)
+        local = {}
+        state_inds = {}
+        operator_inds = {}
+        for nid in snodes:
+            state_t = self.tn.tensor_map[self._tid(nid)].copy()
+            state_inds[nid] = set(state_t.inds)
+            q = self.plan.qubit_of_leaf.get(nid)
+            if q is None:
+                local[nid] = state_t
+                operator_inds[nid] = set()
+                continue
+            try:
+                payload_q = payload_for_compact[q]
+                tids = tuple(tag_map[site_tag(payload_q)])
+                if len(tids) != 1:
+                    return None
+                op_t = tensor_map[tids[0]].copy()
+                op_t.modify(data=self._as_state_backend(op_t.data))
+                upper = upper_id.format(payload_q)
+                lower = lower_id.format(payload_q)
+                if upper not in op_t.inds or lower not in op_t.inds:
+                    return None
+                op_t.reindex_({upper: self._phys(q) + "*",
+                               lower: self._phys(q)})
+                operator_inds[nid] = set(op_t.inds) - {
+                    self._phys(q) + "*", self._phys(q)
+                }
+                local[nid] = qtn.tensor_contract(state_t, op_t).reindex_(
+                    {self._phys(q) + "*": self._phys(q)}
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        self._route_subtree_messages(
+            local, state_inds, operator_inds, order, token=qtn.rand_uuid(),
+        )
+
+        if operator_inds[hub]:
+            raise ValueError(
+                "native sub-MPO application left open operator bonds; "
+                "use an MPO with a closed tensor-network contraction."
+            )
+        for nid in snodes:
+            node_t = self.tn.tensor_map[self._tid(nid)]
+            node_t.modify(data=local[nid].data, inds=local[nid].inds)
+        # The exterior remained isometric toward the updated Steiner subtree.
+        # Recover a single centre within it by QR, then truncate only now that
+        # every MPO virtual bond has reached its destination.
+        self.tn.canonical_region = frozenset(snodes)
+        self._move_center(hub)
+        self._compress_subtree(
+            snodes, hub, max_bond=max_bond, cutoff=cutoff,
+        )
+        return True
+
+    def _apply_factorized_subtree_operator_impl(
+        self, op_factors, op_bonds, where, snodes, order, hub, *,
+        max_bond, cutoff,
+    ):
+        """Apply a factorized tree-MPO by QR routing then one final sweep."""
+        local = {}
+        state_inds = {}
+        operator_inds = {}
+        for nid in snodes:
+            state_t = self.tn.tensor_map[self._tid(nid)].copy()
+            state_inds[nid] = set(state_t.inds)
+            op_t = op_factors[nid]
+            q = self.plan.qubit_of_leaf.get(nid)
+            if q is not None and q in where:
+                # Operator sites are packed into one dimension-four leg. Split
+                # that leg only at physical leaves, then contract its input leg
+                # with the live state physical index.
+                op_t = self._expand_tree_operator_leaf(
+                    op_t,
+                    op_bonds["physical"][q],
+                    self._phys(q),
+                )
+            local[nid] = qtn.tensor_contract(state_t, op_t)
+            if q is not None and q in where:
+                local[nid].reindex_({f"{self._phys(q)}*": self._phys(q)})
+            operator_inds[nid] = set(local[nid].inds) - state_inds[nid]
+
+        self._route_subtree_messages(
+            local, state_inds, operator_inds, order, token=qtn.rand_uuid(),
+        )
+        if operator_inds[hub]:
+            raise ValueError(
+                "factorized subtree operator left open operator bonds at its hub."
+            )
+
+        for nid in snodes:
+            node_t = self.tn.tensor_map[self._tid(nid)]
+            node_t.modify(data=local[nid].data, inds=local[nid].inds)
+        self.tn.canonical_region = frozenset(snodes)
+        self._move_center(hub)
+        self._compress_subtree(
+            snodes, hub, max_bond=max_bond, cutoff=cutoff,
+        )
+
+    def _decompose_tree_operator(self, op_arr, where, snodes, order, hub):
+        """Factor a dense operator into tensors on a Steiner tree.
+
+        The operator is first viewed as a tensor with one dimension-four leg
+        per target qubit, where that leg packs (output, input). Repeated
+        leaf-to-hub SVDs then produce the exact hierarchical/tree-MPO factors.
+        Unlike the old state contraction path, this decomposition never sees a
+        state tensor and is performed once on the operator payload itself.
+
+        Returns
+        -------
+        factors : dict[int, qtn.Tensor]
+            One operator factor for each Steiner node.
+        bonds : dict
+            (child, parent) -> operator bond plus
+            "physical" -> qubit -> packed physical index.
+        """
+        where = tuple(where)
+        op_axes = [f"_ttn_op_phys_{qtn.rand_uuid()}_{q}" for q in where]
+        # op_arr has all output axes followed by all input axes. Interleave
+        # them before packing each pair into one dimension-four operator leg.
+        interleaved = ar.do(
+            "transpose",
+            op_arr,
+            [i for q in range(len(where)) for i in (q, len(where) + q)],
+        )
+        interleaved = ar.do("reshape", interleaved, (4,) * len(where))
+        blob = qtn.Tensor(interleaved, inds=op_axes)
+
+        leaf_for_q = {
+            self.plan.leaf_of_qubit[q]: q for q in where
+        }
+        owned = {nid: set() for nid in snodes}
+        for leaf, q in leaf_for_q.items():
+            owned[leaf].add(op_axes[where.index(q)])
+
+        factors = {}
+        op_bonds = {"physical": dict(zip(where, op_axes))}
+        for u, v in order:
+            left_inds = [ix for ix in blob.inds if ix in owned[u]]
+            if not left_inds:
+                raise RuntimeError(
+                    "tree-MPO decomposition encountered an empty child block "
+                    f"at node {u} on edge {(u, v)}."
+                )
+            bond = f"_ttn_op_bond_{qtn.rand_uuid()}_{u}_{v}"
+            left, blob = blob.split(
+                left_inds=left_inds,
+                method="svd",
+                max_bond=None,
+                cutoff=0.0,
+                absorb="right",
+                bond_ind=bond,
+            )
+            factors[u] = left
+            op_bonds[(u, v)] = bond
+            owned[v].add(bond)
+
+        factors[hub] = blob
+        return factors, op_bonds
+
+    def _apply_product_pauli_projector_impl(
+        self, axes, where, snodes, order, hub, outcome, *, max_bond, cutoff,
+    ):
+        """Apply ``(I + outcome P) / 2`` with a dimension-two branch index."""
+        target_axes = dict(zip(where, axes))
+        local = {}
+        branch_index = {}
+        for nid in snodes:
+            state_t = self.tn.tensor_map[self._tid(nid)].copy()
+            q = self.plan.qubit_of_leaf.get(nid)
+            if q in target_axes:
+                p = self._phys(q)
+                branch = f"_ttn_pauli_branch_{qtn.rand_uuid()}"
+                operators = np.stack(
+                    (
+                        np.eye(2, dtype=complex),
+                        outcome * _PAULI_1Q[target_axes[q]],
+                    ),
+                    axis=-1,
+                )
+                op_t = qtn.Tensor(
+                    self._as_state_backend(operators, warn=False),
+                    inds=(p + "*", p, branch),
+                )
+                local[nid] = qtn.tensor_contract(state_t, op_t).reindex_(
+                    {p + "*": p}
+                )
+                branch_index[nid] = branch
+            else:
+                local[nid] = state_t
+
+        # Carry one dimension-two branch through the tree. When multiple child
+        # messages meet, a three-leg copy tensor enforces the same branch while
+        # keeping the representation linear in the node degree (rather than
+        # forming a high-rank 2**degree copy tensor at a wide hub).
+        update_token = qtn.rand_uuid()
+        for u, v in order:
+            state_bond = self.tn.bond(u, v)
+            branch = branch_index[u]
+            left_inds = [
+                ix for ix in local[u].inds
+                if ix not in {state_bond, branch}
+            ]
+            new_bond = f"_ttn_pauli_apply_{update_token}_{u}_{v}"
+            tu, message = self._split_with_diagnostics(
+                local[u], left_inds, edge=(u, v), bond_ind=new_bond,
+                max_bond=max_bond, cutoff=cutoff,
+            )
+            local[u] = tu
+
+            parent_branch = branch_index.get(v)
+            if parent_branch is None:
+                local[v] = qtn.tensor_contract(local[v], message)
+                branch_index[v] = branch
+            else:
+                branch_out = f"_ttn_pauli_branch_{qtn.rand_uuid()}"
+                copy_tensor = np.zeros((2, 2, 2), dtype=complex)
+                copy_tensor[0, 0, 0] = 1.0
+                copy_tensor[1, 1, 1] = 1.0
+                copy_tensor = qtn.Tensor(
+                    self._as_state_backend(copy_tensor, warn=False),
+                    inds=(parent_branch, branch, branch_out),
+                )
+                local[v] = qtn.tensor_contract(
+                    local[v], message, copy_tensor
+                )
+                branch_index[v] = branch_out
+
+        root_branch = branch_index[hub]
+        local[hub] = qtn.tensor_contract(
+            local[hub],
+            qtn.Tensor(
+                self._as_state_backend(
+                    np.array([0.5, 0.5], dtype=complex), warn=False
+                ),
+                inds=(root_branch,),
+            ),
+        )
+        for nid in snodes:
+            node_t = self.tn.tensor_map[self._tid(nid)]
+            node_t.modify(data=local[nid].data, inds=local[nid].inds)
+        self.center = hub
+
+    def _apply_product_pauli_projector(
+        self, axes, where, outcome, *, renormalize=True,
+        return_diagnostics=False, logical_support=None, probability=None,
+    ):
+        """Apply a product-Pauli parity projector without dense materialization."""
+        # Callers of this private helper have already resolved logical labels
+        # to compact TTN positions.
+        where = self._validate_support(where, resolve=False)
+        self._check_operator_limits(where, dense=False)
+        if len(set(where)) != len(where):
+            raise ValueError(
+                f"product-Pauli measurement needs distinct qubits; got {where}."
+            )
+        before_norm = self.norm()
+        before = self._projection_snapshot(where)
+        started = self._begin_update("measure", where)
+        try:
+            if len(where) == 1:
+                projector = 0.5 * (
+                    np.eye(2, dtype=complex)
+                    + outcome * _PAULI_1Q[axes[0]]
+                )
+                self.apply_subtree_operator(
+                    self._as_state_backend(projector, warn=False),
+                    tuple(self._logical_qubits[q] for q in where),
+                    max_bond=self.chi,
+                    cutoff=self.cutoff, renormalize=renormalize,
+                )
+            else:
+                leaves = [self.plan.leaf_of_qubit[q] for q in where]
+                snodes = self._steiner_nodes(leaves)
+                anchor = self._nearest_anchor(leaves)
+                if self.center != anchor:
+                    self._move_center(anchor)
+                order, hub = self._peel_order(snodes)
+                with self._thread_ctx():
+                    self._apply_product_pauli_projector_impl(
+                        axes, where, snodes, order, hub, outcome,
+                        max_bond=self.chi, cutoff=self.cutoff,
+                    )
+                    if renormalize:
+                        self.normalize()
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
+        if started:
+            self._finish_update()
+        after_norm = self.norm()
+        after = self._projection_snapshot(where)
+        diagnostics = {
+            "support": tuple(
+                before["support"] if logical_support is None
+                else tuple(logical_support)
+            ),
+            "span_before": before["span"],
+            "span_after": after["span"],
+            "bonds_before": before["bonds"],
+            "bonds_after": after["bonds"],
+            "max_bond_before": before["max_bond"],
+            "max_bond_after": after["max_bond"],
+            "norm_before": float(before_norm),
+            "norm_after": float(after_norm),
+            "norm_ratio": float(after_norm / before_norm)
+            if before_norm > 0.0 else 0.0,
+            "renormalized": bool(renormalize),
+            "outcome": int(outcome),
+        }
+        if probability is not None:
+            diagnostics["probability"] = float(probability)
+        self.projection_diagnostics.append(diagnostics)
+        if started and self.record_history and self.update_history:
+            self.update_history[-1]["projection"] = deepcopy(diagnostics)
+        return diagnostics if return_diagnostics else None
+
+    def _product_pauli_expectation(self, axes, where):
+        """Evaluate a product-Pauli expectation using one-site insertions."""
+        leaves = [self.plan.leaf_of_qubit[q] for q in where]
+        snodes = self._steiner_nodes(leaves)
+        if self.center not in snodes:
+            self._move_center(leaves[0])
+
+        internal = set()
+        for nid in snodes:
+            for nb in self._neighbors(nid):
+                if nb in snodes:
+                    internal.add(self.tn.bond(nid, nb))
+        ket = qtn.TensorNetwork([
+            self.tn.tensor_map[self._tid(nid)].copy() for nid in snodes
+        ])
+        phys = [self._phys(q) for q in where]
+        with self._thread_ctx():
+            internal_map = {ix: qtn.rand_uuid() for ix in internal}
+            bra_num = ket.H.reindex({
+                **internal_map,
+                **{p: p + "*" for p in phys},
+            })
+            numerator = bra_num & ket
+            for axis, p in zip(axes, phys):
+                numerator = numerator & qtn.Tensor(
+                    self._as_state_backend(_PAULI_1Q[axis], warn=False),
+                    inds=(p + "*", p),
+                )
+            num = numerator.contract(output_inds=[])
+            den = (ket.H.reindex(internal_map) & ket).contract(output_inds=[])
+        return num / den
+
+    @staticmethod
+    def _expand_tree_operator_leaf(op_tensor, packed_ind, physical_ind):
+        """Unpack one dimension-four tree-MPO leg into output and input legs."""
+        axis = op_tensor.inds.index(packed_ind)
+        data = ar.do("moveaxis", op_tensor.data, axis, 0)
+        data = ar.do("reshape", data, (2, 2) + tuple(data.shape[1:]))
+        rest_inds = [ind for ind in op_tensor.inds if ind != packed_ind]
+        return qtn.Tensor(
+            data,
+            inds=[f"{physical_ind}*", physical_ind] + rest_inds,
+        )
 
     def _peel_order(self, snodes):
-        """Return ``(peels, hub)`` for re-splitting a contracted subtree.
+        """Return ``(peels, hub)`` for recursive leaf-to-hub application.
 
         ``peels`` is a list of ``(u, v)`` edges: repeatedly a current
         subtree-leaf ``u`` (with a single remaining subtree neighbour ``v``) is
         peeled off toward ``v`` until a single ``hub`` node remains -- the node
-        the orthogonality centre ends on.  Deterministic (smallest id first).
+        the orthogonality centre ends on. Deterministic (smallest id first).
         """
         remaining = set(snodes)
         adj = {
-            u: [w for w in self._neighbors(u) if w in remaining]
+            u: tuple(w for w in self._neighbors(u) if w in remaining)
             for u in remaining
         }
+        degree = {
+            u: sum(w in remaining for w in neighbours)
+            for u, neighbours in adj.items()
+        }
+        leaves = [u for u, degree_u in degree.items() if degree_u == 1]
+        heapq.heapify(leaves)
         peels = []
         while len(remaining) > 1:
-            leaf = next(
-                u for u in sorted(remaining)
-                if sum(1 for w in adj[u] if w in remaining) == 1
-            )
+            while leaves and leaves[0] not in remaining:
+                heapq.heappop(leaves)
+            if not leaves:
+                raise ValueError("subtree peel order requires a connected tree")
+            leaf = heapq.heappop(leaves)
             v = next(w for w in adj[leaf] if w in remaining)
             peels.append((leaf, v))
             remaining.discard(leaf)
-        hub = next(iter(remaining))
+            degree[leaf] = 0
+            degree[v] -= 1
+            if degree[v] == 1:
+                heapq.heappush(leaves, v)
+        hub = min(remaining)
         return peels, hub
 
     # -- readout --------------------------------------------------------------
@@ -660,15 +3238,16 @@ class TreeOptimizer:
         """Return the largest virtual bond dimension in the tree."""
         return self.tn.max_bond()
 
-    def show(self, *, bond_dims=True, node_ids=False):
+    def show(self, *, bond_dims=True, node_ids=False, color=True):
         """Print a top-down ASCII drawing of the tree with current bond dims.
 
         Delegates to :meth:`TreeTensorNetwork.show`: the root sits at the top,
         the qubit leaves at the bottom, internal nodes are ``●``, leaves ``◆``
         labelled with their qubit, and each edge carries its virtual-bond
-        dimension -- the tree analogue of a ``quimb`` MPS ``show``.
+        dimension -- the tree analogue of a ``quimb`` MPS ``show``.  Markers are
+        coloured by tree layer by default; pass ``color=False`` for plain text.
         """
-        self.tn.show(bond_dims=bond_dims, node_ids=node_ids)
+        self.tn.show(bond_dims=bond_dims, node_ids=node_ids, color=color)
 
     def bond_report(self):
         """Return a summary of the current virtual bond dimensions.
@@ -691,94 +3270,502 @@ class TreeOptimizer:
             "chi": self.chi,
         }
 
-    def to_dense(self):
-        """Return the dense statevector with index order ``k0, k1, ..., k(n-1)``."""
+    def estimate_bonds(self, gates=None, *, max_operator_qubits=None):
+        """Estimate untruncated bond growth from the fixed tree and gate stream.
+
+        This is the paper's conservative dry-run bound (Eq. 4), not a
+        contraction of the live state.  Each gate contributes its
+        operator-Schmidt rank to every tree edge that separates its support;
+        the reported edge dimensions are the product of those ranks over the
+        stream.  Single-qubit gates and gates wholly contained on one side of
+        an edge contribute one.  Because cancellations and state-specific rank
+        deficiencies are intentionally ignored, the estimate is safe but can
+        overestimate the dimensions reached by an actual replay.
+
+        Parameters
+        ----------
+        gates : bundled gate stream, optional
+            Stream to estimate.  When omitted, the optimizer's queued stream is
+            used.  Control events are included in the event trace but do not
+            change the bound.
+        max_operator_qubits : int, optional
+            If supplied, skip dense rank calculation for larger operators and
+            mark those events with ``rank_skipped=True``.  This lets
+            :meth:`preflight` reject oversized operators before allocating a
+            dense ``4**k`` array.
+
+        Returns
+        -------
+        dict
+            ``edge_bonds`` maps undirected tree edges to their estimated bond
+            dimensions; ``max_bond`` is their maximum (or ``1`` for a one-leaf
+            tree); ``requires_truncation`` compares that bound to ``chi``; and
+            ``events`` records the crossing edges and ranks contributed by each
+            stream item.
+        """
+        max_operator_qubits = self._positive_limit(
+            max_operator_qubits, "max_operator_qubits"
+        )
+        if gates is None:
+            payloads = self.G
+            wheres = self.where
+            event_types = self.event_types
+        else:
+            payloads, wheres, event_types = self._normalize_gate_queue(gates)
+
+        def edge_key(a, b):
+            return (a, b) if a < b else (b, a)
+
+        sim_plan = self.plan
+        active = list(self._logical_qubits)
+        edge_bonds = {}
+
+        def plan_steiner(plan, support):
+            leaves = [plan.leaf_of_qubit[q] for q in support]
+            if len(leaves) == 1:
+                return {leaves[0]}
+            nodes = set()
+            anchor = leaves[0]
+            for leaf in leaves[1:]:
+                nodes.update(plan.node_path(anchor, leaf))
+            return nodes
+
+        def plan_edges(plan):
+            return {
+                edge_key(parent, child): child
+                for parent, children in plan.children.items()
+                for child in children
+            }
+
+        events = []
+        for index, (payload, where, event_type) in enumerate(
+            zip(payloads, wheres, event_types)
+        ):
+            logical_support = _normalize_where(where)
+            try:
+                support = tuple(active.index(q) for q in logical_support)
+            except ValueError as exc:
+                raise ValueError(
+                    f"event at step {index + 1} references qubit(s) outside "
+                    f"the current active labels {active!r}: {logical_support!r}."
+                ) from exc
+            if len(support) > 1 and len(set(support)) != len(support):
+                raise ValueError(
+                    f"gate support must contain distinct qubits; got {support}."
+                )
+            span_nodes = len(plan_steiner(sim_plan, support))
+            subtree_masks = sim_plan.subtree_qubit_masks()
+            edge_sides = {
+                edge: subtree_masks[child]
+                for edge, child in plan_edges(sim_plan).items()
+            }
+            current_edges = set(edge_sides)
+            edge_bonds = {
+                edge: edge_bonds.get(edge, 1) for edge in current_edges
+            }
+            crossing = {}
+            rank_skipped = bool(
+                max_operator_qubits is not None
+                and event_type in {"gate", "submpo"}
+                and len(logical_support) > max_operator_qubits
+            )
+            rank_payload = payload
+            if (
+                event_type in {"gate", "submpo"}
+                and len(logical_support) > 1
+                and not rank_skipped
+            ):
+                support_mask = 0
+                for site in support:
+                    support_mask |= 1 << site
+                for edge, side in edge_sides.items():
+                    left_mask = support_mask & side
+                    if not left_mask or left_mask == support_mask:
+                        continue
+                    left_positions = tuple(
+                        q for q in support if left_mask & (1 << q)
+                    )
+                    left_where = tuple(
+                        logical_support[support.index(q)] for q in left_positions
+                    )
+                    if event_type == "submpo":
+                        rank = _submpo_schmidt_rank_bound(
+                            rank_payload, logical_support, left_where
+                        )
+                        if rank is None:
+                            rank = _operator_schmidt_rank(
+                                _submpo_to_dense(
+                                    rank_payload, logical_support
+                                ),
+                                logical_support,
+                                left_where,
+                            )
+                    else:
+                        rank = _operator_schmidt_rank(
+                            rank_payload, logical_support, left_where
+                        )
+                    crossing[edge] = rank
+                    edge_bonds[edge] *= rank
+            events.append({
+                "index": index,
+                "kind": event_type,
+                "support": support,
+                "span_nodes": span_nodes,
+                "rank_skipped": rank_skipped,
+                "crossing_edges": dict(crossing),
+                "edge_bonds": dict(edge_bonds),
+            })
+
+            if event_type == "cap":
+                if len(logical_support) != 1:
+                    raise ValueError(
+                        f"cap event at step {index + 1} must reference one site."
+                    )
+                if len(active) <= 1:
+                    raise ValueError(
+                        f"cap event at step {index + 1} cannot remove the only site."
+                    )
+                sim_plan = sim_plan.remove_leaf(support[0])
+                capped = logical_support[0]
+                active.remove(capped)
+                if payload.get("compact_labels", True):
+                    active = [label - 1 if label > capped else label
+                              for label in active]
+
+        max_bond = max(edge_bonds.values(), default=1)
+        return {
+            "edge_bonds": edge_bonds,
+            "max_bond": int(max_bond),
+            "chi": self.chi,
+            "requires_truncation": bool(max_bond > self.chi),
+            "events": events,
+        }
+
+    def preflight(self, gates=None, *, max_bond=None,
+                  max_operator_qubits=None, max_subtree_nodes=None,
+                  raise_on_error=True):
+        """Check conservative resource limits before replaying a stream.
+
+        The bond limit uses :meth:`estimate_bonds` and is deliberately an
+        upper bound: it ignores cancellations and state-specific rank loss. The
+        operator and subtree limits protect dense operator allocation and bound
+        the number of recursive Steiner-tree messages.
+        With ``raise_on_error=False`` the method returns a report containing the
+        violations instead of raising :class:`MemoryError`.
+
+        The optimizer invokes this automatically before eager replay when any
+        of its ``max_*`` constructor limits are set.  Direct calls to
+        :meth:`apply_gate` and :meth:`apply_subtree_operator` still enforce the
+        operator/subtree limits immediately.
+        """
+        max_bond = self._positive_limit(max_bond, "max_bond")
+        max_operator_qubits = self._positive_limit(
+            max_operator_qubits, "max_operator_qubits"
+        )
+        max_subtree_nodes = self._positive_limit(
+            max_subtree_nodes, "max_subtree_nodes"
+        )
+        report = self.estimate_bonds(
+            gates, max_operator_qubits=max_operator_qubits
+        )
+        violations = []
+        if max_bond is not None and report["max_bond"] > max_bond:
+            violations.append(
+                f"estimated max bond {report['max_bond']} exceeds "
+                f"max_bond={max_bond}"
+            )
+        for event in report["events"]:
+            if (
+                max_operator_qubits is not None
+                and event["kind"] in {"gate", "submpo"}
+                and len(event["support"]) > max_operator_qubits
+            ):
+                violations.append(
+                    f"event {event['index']} has {len(event['support'])} "
+                    f"operator qubits, exceeding max_operator_qubits="
+                    f"{max_operator_qubits}"
+                )
+            if (
+                max_subtree_nodes is not None
+                and event["span_nodes"] > max_subtree_nodes
+            ):
+                violations.append(
+                    f"event {event['index']} spans {event['span_nodes']} "
+                    f"tree nodes, exceeding max_subtree_nodes="
+                    f"{max_subtree_nodes}"
+                )
+        result = dict(report)
+        result["limits"] = {
+            "max_bond": max_bond,
+            "max_operator_qubits": max_operator_qubits,
+            "max_subtree_nodes": max_subtree_nodes,
+        }
+        result["violations"] = violations
+        result["ok"] = not violations
+        if violations and raise_on_error:
+            raise MemoryError(
+                "TreeOptimizer preflight failed: " + "; ".join(violations)
+            )
+        return result
+
+    def truncation_report(self):
+        """Return per-edge truncation diagnostics collected during replay.
+
+        The ``events`` list contains both ordinary edge compressions and local
+        SVD splits from sibling or subtree updates.  Each event reports the
+        bond dimension before and after the update.  When
+        ``track_truncation=True`` was requested, it also reports the local
+        singular-spectrum norm, absolute discarded weight, and relative
+        discarded fraction.  Spectrum-based fields are ``None`` otherwise so
+        callers can distinguish an untracked run from a zero-loss truncation.
+        """
+        events = deepcopy(self.truncation_history)
+        tracked = [
+            event for event in events
+            if event["discarded_weight"] is not None
+        ]
+        if tracked:
+            total_discarded = float(
+                sum(event["discarded_weight"] for event in tracked)
+            )
+            max_discarded = float(
+                max(event["discarded_weight"] for event in tracked)
+            )
+            max_fraction = float(
+                max(event["discarded_fraction"] for event in tracked)
+            )
+        else:
+            total_discarded = None
+            max_discarded = None
+            max_fraction = None
+        return {
+            "track_truncation": self.track_truncation,
+            "n_events": len(events),
+            "n_truncated": sum(event["truncated"] for event in events),
+            "n_tracked": len(tracked),
+            "total_discarded_weight": total_discarded,
+            "max_discarded_weight": max_discarded,
+            "max_discarded_fraction": max_fraction,
+            "events": events,
+            "updates": deepcopy(self.update_history),
+        }
+
+    def to_dense(self, logical_order=True):
+        """Return the dense statevector in logical qubit order.
+
+        ``logical_order`` is accepted for MPS interface compatibility. Tree
+        storage has no separate physical permutation, so both values produce
+        the same ``k0, k1, ..., k(n-1)`` ordering.
+        """
+        _ = logical_order
         with self._thread_ctx():
             return self.tn.to_statevector(range(self.n))
+
+    @property
+    def qubits(self):
+        """Return the active caller-facing qubit labels in logical order.
+
+        With the default compact cap behavior this is ``range(self.n)``.  A
+        stable-label cap can leave gaps here while the underlying TTN remains
+        compact.
+        """
+        return list(self._logical_qubits)
+
+    @property
+    def logical_order(self):
+        """Return active logical labels ordered by their compact TTN position."""
+        return list(self._logical_qubits)
+
+    def logical_site(self, position):
+        """Return the logical qubit at compact tree position ``position``."""
+        position = int(position)
+        if not 0 <= position < self.n:
+            raise IndexError(
+                f"tree position {position} is outside the range [0, {self.n})."
+            )
+        return self._logical_qubits[position]
+
+    def position(self, site):
+        """Return the tree position of logical qubit ``site``."""
+        return self._validate_qubit(site)
+
+    def remap_sample(self, config):
+        """Return a sample in active logical order."""
+        if isinstance(config, dict):
+            return dict(config)
+        config = np.asarray(config)
+        if config.ndim == 0 or config.shape[-1] != self.n:
+            raise ValueError(
+                "sample configuration must have tree size as its final "
+                f"dimension, got shape {config.shape}."
+            )
+        return config.copy()
+
+    def restore_qubit_order(self):
+        """Return the state; tree storage is always already in logical order."""
+        return self.tn
 
     def norm(self):
         """Return the state norm ``<psi|psi>**0.5``.
 
-        When the orthogonality centre is known the norm is the norm of that
-        single centre tensor: every other tensor is isometric and telescopes to
-        the identity between bra and ket.  This is the tree analogue of the
-        one-site canonical norm tracked by :class:`pepsy.MpsOptimizer`.  With an
-        unknown centre it falls back to the full doubled-tree contraction.
+        Native fermionic trees use a graded one-tensor center contraction when
+        a canonical center is known, with the complete doubled-network
+        contraction as the unknown-gauge fallback. Dense/nonfermionic trees
+        use the ordinary single-centre contraction when known and otherwise
+        the full doubled-tree path.
         """
+        if self.tn.fermionic:
+            with self._thread_ctx():
+                val = self.tn._fermionic_center_norm_squared()
+            return float(np.sqrt(abs(to_float(val, real=True))))
         if self.center is not None:
             t = self.tn.tensor_map[self._tid(self.center)]
             val = qtn.tensor_contract(t.H, t, output_inds=[])
-            return float(np.sqrt(np.abs(val)))
+            return float(np.sqrt(abs(to_float(val, real=True))))
         with self._thread_ctx():
             val = (self.tn.H & self.tn).contract(output_inds=[])
-        return float(np.sqrt(np.abs(val)))
+        return float(np.sqrt(abs(to_float(val, real=True))))
 
-    def normalize(self):
-        """Normalise the state in place. Returns the previous norm."""
+    def _leaf_canonical_norm(self):
+        """Return a cheap dense canonical norm or the exact fermionic norm.
+
+        Dense/nonfermionic trees move the orthogonality centre onto a
+        first-layer leaf and read that tensor's Frobenius norm. Native
+        fermionic trees must retain the complete graded exterior, so they
+        dispatch to :meth:`norm` instead of using the one-tensor shortcut.
+        """
+        if self.tn.fermionic:
+            return self.norm()
+        leaf = self.plan.leaf_of_qubit[min(self.plan.leaf_of_qubit)]
+        self._move_center(leaf)
+        t = self.tn.tensor_map[self._tid(leaf)]
+        val = qtn.tensor_contract(t.H, t, output_inds=[])
+        return float(np.sqrt(abs(to_float(val, real=True))))
+
+    def normalize(self, eps=1e-15, insert=None):
+        """Normalise the state in place and return the previous norm.
+
+        ``eps`` and ``insert`` are accepted for compatibility with
+        :meth:`MpsOptimizer.normalize`; a tree has no chain insertion site, so
+        ``insert`` is intentionally ignored.
+        """
+        eps = float(eps)
+        if eps < 0.0:
+            raise ValueError("eps must be non-negative.")
         nrm = self.norm()
-        if nrm > 0:
-            tid = self._tid(self.center) if self.center is not None else self._tid(
-                self.plan.root
-            )
+        if nrm > eps:
+            self._invalidate_state_norm_cache()
+            if self.center is not None:
+                target = self.center
+            elif self.tn.canonical_region is not None:
+                target = next(iter(self.tn.canonical_region))
+            else:
+                target = self.plan.root
+            tid = self._tid(target)
             t = self.tn.tensor_map[tid]
             t.modify(data=t.data / nrm)
         return nrm
 
-    def local_expectation(self, op, where):
-        """Return ``<psi|op|psi> / <psi|psi>`` for an operator on ``where``.
-
-        For a single-site operator this moves the tracked orthogonality centre
-        onto the target leaf and contracts only that centre tensor with ``op``:
-        every other tensor is isometric and cancels between bra and ket, the
-        tree analogue of ``MpsOptimizer.local_expectation_canonical``.  A
-        multi-site operator is contracted over only the **minimal subtree
-        spanning the target leaves**: with the centre inside that subtree every
-        tensor outside it is isometric and its bra/ket copies cancel to the
-        identity on the shared boundary bond, so the cost scales with the
-        operator's spread rather than the whole tree.
-        """
-        where = _normalize_where(where)
-        if len(where) == 1:
-            q = where[0]
-            leaf = self.plan.leaf_of_qubit[q]
-            self._move_center(leaf)
-            t = self.tn.tensor_map[self._tid(leaf)]
-            p = self._phys(q)
-            mat = np.asarray(op).reshape(2, 2)
-            gt = qtn.Tensor(mat, inds=(p + "*", p))
-            bra = t.H.reindex_({p: p + "*"})
-            num = qtn.tensor_contract(bra, gt, t, output_inds=[])
-            den = qtn.tensor_contract(t.H, t, output_inds=[])
-            return num / den
-
-        phys = [self._phys(q) for q in where]
-        leaves = [self.plan.leaf_of_qubit[q] for q in where]
-        snodes = self._steiner_nodes(leaves)
-        # The reduced contraction is exact only when the centre lies inside the
-        # spanning subtree (then the isometric exterior cancels); ensure it.
-        if self.center not in snodes:
-            self._move_center(leaves[0])
-        # Bonds internal to the subtree must be renamed in the bra so they do not
-        # collide with the ket; boundary bonds stay shared so the isometric
-        # exterior contributes an identity between bra and ket.
-        internal = set()
-        for nid in snodes:
-            for nb in self._neighbors(nid):
-                if nb in snodes:
-                    internal.add(self._bond_name(nid, nb))
-        ket_ts = [self.tn.tensor_map[self._tid(nid)].copy() for nid in snodes]
-        ket = qtn.TensorNetwork(ket_ts)
-        mat = np.asarray(op).reshape([2] * (2 * len(where)))
-        gt = qtn.Tensor(mat, inds=[p + "*" for p in phys] + phys)
-        with self._thread_ctx():
-            internal_map = {ix: qtn.rand_uuid() for ix in internal}
-            bra_num = ket.H.reindex(
-                {**internal_map, **{p: p + "*" for p in phys}}
+    def _measure_pauli(self, pauli, where, outcome=None, *, renormalize=True,
+                       return_diagnostics=False):
+        """Measure a Pauli product, collapse, and return ``(outcome, prob)``."""
+        self._require_dense_qubit_state("measure_pauli")
+        logical_where = _normalize_control_where(where)
+        where = self._validate_support(logical_where)
+        axes = _normalize_measure_axes(pauli, logical_where)
+        expectation = to_float(
+            self._product_pauli_expectation(axes, where), real=True
+        )
+        p_plus = min(max(0.5 * (1.0 + expectation), 0.0), 1.0)
+        if outcome is None:
+            outcome = 1 if self.rng.random() < p_plus else -1
+        elif not isinstance(outcome, Integral) or int(outcome) not in (-1, 1):
+            raise ValueError("measure event outcome must be +1 or -1.")
+        else:
+            outcome = int(outcome)
+        probability = p_plus if outcome > 0 else 1.0 - p_plus
+        if probability <= 1e-12:
+            raise ValueError(
+                f"forced measure outcome {outcome} has ~0 probability "
+                f"({probability:.2e})."
             )
-            num = (bra_num & gt & ket).contract(output_inds=[])
-            bra_den = ket.H.reindex(internal_map)
-            den = (bra_den & ket).contract(output_inds=[])
-        return num / den
+        diagnostics = self._apply_product_pauli_projector(
+            axes, where, outcome, renormalize=renormalize,
+            return_diagnostics=return_diagnostics,
+            logical_support=logical_where, probability=probability,
+        )
+        if return_diagnostics:
+            return int(outcome), float(probability), diagnostics
+        return int(outcome), float(probability)
+
+    def measure_pauli(self, pauli, where, outcome=None, *, renormalize=True,
+                      return_diagnostics=False):
+        """Measure a product Pauli and return ``(outcome, probability)``.
+
+        ``pauli`` supplies one ``X``, ``Y``, or ``Z`` axis per site in
+        ``where``.  An outcome is sampled unless forced to ``+1`` or ``-1``.
+        The state is normalized after collapse by default; set
+        ``renormalize=False`` to retain the branch norm.  Requesting
+        diagnostics adds a third return value containing projection norm,
+        support/span, and bond-dimension before/after information.
+        """
+        return self._measure_pauli(
+            pauli, where, outcome, renormalize=renormalize,
+            return_diagnostics=return_diagnostics,
+        )
+
+    def _reset_pauli(self, q, axis):
+        """Reset one qubit to the ``+1`` eigenstate of ``axis``."""
+        outcome, _ = self._measure_pauli(axis, (q,))
+        if outcome < 0:
+            flip = _RESET_FLIP_AXES[axis]
+            self.apply_1q(
+                self._as_state_backend(_PAULI_1Q[flip], warn=False), q
+            )
+
+    def _apply_control_event(self, name, payload, where):
+        """Apply one normalized measure/reset event from the queued stream."""
+        with self._thread_ctx():
+            return self._apply_control_event_impl(name, payload, where)
+
+    def _apply_control_event_impl(self, name, payload, where):
+        """Apply a control event without opening another thread context."""
+        if name == "cap":
+            self.cap(
+                where[0], payload["vec"],
+                absorb=payload.get("absorb", "left"),
+                compact_labels=payload.get("compact_labels", True),
+            )
+            return self
+        if name == "measure":
+            outcome, probability = self._measure_pauli(
+                payload["pauli"], where, payload.get("outcome")
+            )
+            self.measurements.append(
+                (str(payload["pauli"]), tuple(where), outcome, probability)
+            )
+            return self
+        if name == "reset":
+            for q, axis in zip(where, payload["axes"]):
+                self._reset_pauli(q, axis)
+            return self
+        if name == "measure_reset":
+            for q, axis, forced in zip(
+                where, payload["axes"], payload["outcomes"]
+            ):
+                outcome, probability = self._measure_pauli(axis, (q,), forced)
+                self.measurements.append(
+                    (axis, (q,), outcome, probability)
+                )
+                if outcome < 0:
+                    self.apply_1q(
+                        self._as_state_backend(
+                            _PAULI_1Q[_RESET_FLIP_AXES[axis]], warn=False
+                        ),
+                        q,
+                    )
+            return self
+        raise ValueError(f"Unknown TreeOptimizer control event {name!r}.")
 
     def measure(self, q, outcome=None):
         """Projectively measure qubit ``q`` in the computational basis.
@@ -789,14 +3776,17 @@ class TreeOptimizer:
         Returns the outcome bit.  Because the centre sits on the leaf the
         probabilities are exact regardless of the global state norm.
         """
+        self._require_dense_qubit_state("measure")
         with self._thread_ctx():
+            q = self._validate_qubit(q)
             leaf = self.plan.leaf_of_qubit[q]
             self._move_center(leaf)
             t = self.tn.tensor_map[self._tid(leaf)]
             p = self._phys(q)
             ax = t.inds.index(p)
-            arr = np.moveaxis(t.data, ax, 0).reshape(2, -1)
-            w = np.einsum("ij,ij->i", arr, arr.conj()).real
+            arr = ar.do("reshape", ar.do("moveaxis", t.data, ax, 0), (2, -1))
+            w = ar.do("sum", arr * ar.do("conj", arr), axis=1)
+            w = np.real(ar.to_numpy(w))
             total = float(w.sum())
             if total <= 0:
                 raise ValueError("Cannot measure a zero-norm state.")
@@ -805,19 +3795,69 @@ class TreeOptimizer:
             if outcome is None:
                 outcome = int(self.rng.choice(2, p=probs))
             else:
+                if not isinstance(outcome, Integral) or int(outcome) not in (0, 1):
+                    raise ValueError("measurement outcome must be 0 or 1.")
                 outcome = int(outcome)
-            proj = np.zeros((2, 2), dtype=self.dtype)
+                if probs[outcome] <= 1e-12:
+                    raise ValueError(
+                        f"forced measure outcome {outcome} has ~0 probability."
+                    )
+            proj = np.zeros((2, 2), dtype=complex)
             proj[outcome, outcome] = 1.0
-            self.apply_1q(proj, q)
+            self.apply_1q(self._as_state_backend(proj, warn=False), q)
             self.normalize()
         return outcome
 
     def reset(self, q):
         """Reset qubit ``q`` to ``|0>`` (measure, then flip if it was ``|1>``)."""
         if self.measure(q) == 1:
-            x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=self.dtype)
-            self.apply_1q(x, q)
+            x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+            self.apply_1q(self._as_state_backend(x, warn=False), q)
         return 0
+
+    def cap(self, q, vec, *, absorb="left", compact_labels=True,
+            stable_labels=None):
+        """Contract and remove qubit ``q`` from the tree state.
+
+        This is the tree analogue of an MPS physical-index cap. Trees have no
+        left/right chain neighbour at a leaf, so ``absorb`` is accepted for
+        stream compatibility but the unique parent is used.  By default the
+        remaining caller-facing labels are compacted above ``q``.  Set
+        ``compact_labels=False`` (or ``stable_labels=True``) to retain the
+        original logical labels while the internal TTN stays compact.
+        """
+        if stable_labels is not None:
+            compact_labels = not bool(stable_labels)
+        if not isinstance(compact_labels, (bool, np.bool_)):
+            raise ValueError("compact_labels must be boolean.")
+        self._invalidate_state_norm_cache()
+        logical_q = int(q)
+        q = self._validate_qubit(logical_q)
+        if absorb not in {"left", "right"}:
+            raise ValueError("cap absorb direction must be 'left' or 'right'.")
+        started = self._begin_update("cap", (q,))
+        try:
+            self.tn.cap_qubit_(q, self._as_state_backend(vec))
+            self.plan = self.tn.plan
+            self.n = self.tn.nqubits
+            remaining = [label for label in self._logical_qubits if label != logical_q]
+            if compact_labels:
+                remaining = [
+                    label - 1 if label > logical_q else label
+                    for label in remaining
+                ]
+            self._logical_qubits = remaining
+            self._logical_positions = {
+                label: position for position, label in enumerate(remaining)
+            }
+            self.layout_finder = None
+        except Exception:
+            if started:
+                self._abort_update()
+            raise
+        if started:
+            self._finish_update()
+        return self
 
     def copy(self):
         """Return an independent optimizer at the current tree state.
@@ -828,38 +3868,92 @@ class TreeOptimizer:
         sequences.  The immutable :class:`TreePlan` is shared; the gate queue is
         retained (gate payloads are not copied) but not replayed.
         """
+        child_seed = int(self.rng.integers(0, 2**63, dtype=np.uint64))
         other = type(self)(
             None,
             n=self.n,
             chi=self.chi,
             cutoff=self.cutoff,
+            mode=self.mode,
             structure=self.structure,
+            max_arity=self.max_arity,
+            community_frac=self.community_frac,
+            star_frac=self.star_frac,
             tree=self.plan,
             dtype=self.dtype,
             threads=self.threads,
+            layout_objective=self.layout_objective,
+            layout_weight_mode=self.layout_weight_mode,
+            track_truncation=self.track_truncation,
+            max_intermediate_bond=self.max_intermediate_bond,
+            max_operator_qubits=self.max_operator_qubits,
+            max_subtree_nodes=self.max_subtree_nodes,
+            record_history=self.record_history,
+            seed=child_seed,
             run=False,
+            tn=self.tn,
         )
-        # ``TreeTensorNetwork.copy`` carries ``_canonical_region`` (an
-        # _EXTRA_PROPS field), so the copied network already reports the right
-        # centre / canonical region.
-        other.tn = self.tn.copy()
         other.G = list(self.G)
         other.where = list(self.where)
+        other.event_types = list(self.event_types)
+        other.layout_finder = self.layout_finder
+        other.measurements = deepcopy(self.measurements)
+        other.truncation_history = deepcopy(self.truncation_history)
+        other.update_history = deepcopy(self.update_history)
+        other.infidelities = list(self.infidelities)
+        other.infidelity_samples = deepcopy(self.infidelity_samples)
+        other.normalizations = deepcopy(self.normalizations)
+        other.projection_diagnostics = deepcopy(self.projection_diagnostics)
+        other._logical_qubits = list(self._logical_qubits)
+        other._logical_positions = dict(self._logical_positions)
+        other._truncation_survival = self._truncation_survival
         return other
+
+    def get_infidelities(self):
+        """Return cumulative tracked tree-truncation infidelities.
+
+        The first value is ``0.0``. Additional values are recorded after
+        updates for which ``track_truncation=True`` supplied singular spectra.
+        Unlike a chain MPS, a tree has several compression edges per update,
+        so each value aggregates the retained weight over all touched edges.
+        """
+        return self.infidelities
+
+    def get_infidelity_samples(self):
+        """Return detailed cumulative tree-truncation sample records."""
+        return self.infidelity_samples
+
+    def get_normalizations(self):
+        """Return automatic normalization records.
+
+        Tree normalization is explicit rather than an MPS run-time scale
+        controller, so this list remains empty unless a higher-level wrapper
+        records its own normalization events here.
+        """
+        return self.normalizations
+
+    def get_projection_diagnostics(self):
+        """Return projection norm/support/span/bond diagnostics in order."""
+        return self.projection_diagnostics
 
     @classmethod
     def find_tree_layout(cls, gates, n=None, *, structure="quality",
-                         max_arity=2, community_frac=0.35, star_frac=0.75):
+                         max_arity=(2, 3, 4), community_frac=0.35,
+                         star_frac=0.75, layout_objective="path",
+                         layout_weight_mode="count",
+                         max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS):
         """Return the :class:`TreePlan` a :class:`TreeLayoutFinder` would use."""
         return TreeLayoutFinder(
             gates=gates, n=n, structure=structure,
             max_arity=max_arity, community_frac=community_frac,
-            star_frac=star_frac,
+            star_frac=star_frac, objective=layout_objective,
+            weight_mode=layout_weight_mode,
+            max_operator_qubits=max_operator_qubits,
         ).run()
 
     @classmethod
     def convergence_sweep(cls, gates, n=None, chi_values=(2, 4, 8, 16, 32), *,
-                          ops=None, structure="quality", max_arity=2,
+                          ops=None, structure="quality", max_arity=(2, 3, 4),
                           community_frac=0.35, star_frac=0.75, tree=None,
                           dense_cap=1 << 14):
         """Replay ``gates`` at several ``chi`` and report convergence.
@@ -892,6 +3986,8 @@ class TreeOptimizer:
             ``max_drift`` (max ``|Delta<op>|`` from the previous ``chi``, or
             ``None`` for the first).
         """
+        if hasattr(gates, "__next__"):
+            gates = list(gates)
         chi_values = sorted(int(c) for c in chi_values)
         if tree is None:
             probe = cls(gates, n=n, structure=structure, max_arity=max_arity,
@@ -918,7 +4014,13 @@ class TreeOptimizer:
             expectations = {}
             vals = []
             for i, (op, where) in enumerate(ops):
-                val = complex(opt.local_expectation(op, where))
+                # Observable evaluation belongs to the state object. Keep the
+                # replay optimizer focused on state evolution rather than a
+                # qubit-only local-expectation implementation.
+                val = complex(opt.tn.local_expectation(
+                    op, _normalize_where(where), max_bond=None,
+                    optimize="auto",
+                ))
                 expectations[f"op{i}"] = val
                 vals.append(val)
             fidelity = None

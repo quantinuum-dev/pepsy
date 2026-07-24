@@ -16,7 +16,9 @@ build_bra_ket(...) -> BdyMPS(...) -> CompBdy.move_bdy/move_step_bdy(...)
 ```
 
 `boundary_engine="quimb-mps"` uses Quimb MPS environments for local row/column
-boundaries. The adapter lives in `environments.py` and exposes the legacy
+boundaries. At the start of each half-sweep it computes the opposite-side
+environments once, then moves the active boundary one row or column at a time
+and caches it. The adapter lives in `environments.py` and exposes the legacy
 surface expected by the current local objective:
 
 - `mps_b`
@@ -27,6 +29,9 @@ surface expected by the current local objective:
 
 `boundary_engine="auto"` keeps dense inputs on the Pepsy path and routes
 Symmray-looking inputs to Quimb MPS.
+
+Torch-backed Symmray arrays remain on Torch and use autograd local solvers;
+NumPy-backed Symmray arrays use the finite-difference compatibility path.
 
 ## Extraction map
 

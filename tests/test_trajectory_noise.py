@@ -302,6 +302,28 @@ def test_state_dependent_kraus_branches_are_sampled_from_the_current_state(kind)
         assert abs(optimizer.p.norm()) == pytest.approx(1.0, abs=1e-8)
 
 
+def test_tree_state_dependent_kraus_branches_are_sampled_from_the_current_state():
+    """Tree trajectories compute Kraus probabilities from copied TTNs."""
+    stream = [
+        (_X, 0),
+        pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.5), 0),
+    ]
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.TreeOptimizer(None, n=2, chi=4, run=False),
+        stream,
+        shots=12,
+        seed=6,
+    )
+
+    labels = {records[0].label for records in result.records}
+    assert labels == {"jump", "no_jump"}
+    assert all(records[0].probability == pytest.approx(0.5) for records in result.records)
+    for optimizer, records in zip(result.optimizers, result.records):
+        expected = [1.0, 0.0, 0.0, 0.0] if records[0].label == "jump" else [0.0, 0.0, 1.0, 0.0]
+        np.testing.assert_allclose(_statevector(optimizer), expected, atol=1e-8)
+        assert optimizer.norm() == pytest.approx(1.0, abs=1e-8)
+
+
 def test_kraus_trajectory_starts_a_fresh_stn_norm_diagnostic_segment():
     stream = [
         ("rxx", 0.8, 0, 1),
@@ -389,6 +411,35 @@ def test_coalesced_trajectory_branches_mid_circuit_measurements_by_count():
     assert {leaf.measurements[0].outcome for leaf in result.leaves} == {-1, 1}
     assert all(leaf.measurements[0].probability == pytest.approx(0.5) for leaf in result.leaves)
     assert all(leaf.gate_stream[-1][0] == "measure" for leaf in result.leaves)
+
+
+def test_coalesced_tree_trajectory_branches_mid_circuit_measurements_by_count():
+    """Tree expectations support exact coalesced measurement branching."""
+    hadamard = np.array(
+        [[1.0, 1.0], [1.0, -1.0]], dtype=complex
+    ) / np.sqrt(2.0)
+    calls = 0
+
+    def factory():
+        nonlocal calls
+        calls += 1
+        return pepsy.TreeOptimizer(None, n=2, chi=4, run=False)
+
+    result = pepsy.run_coalesced_trajectory_shots(
+        factory,
+        [(hadamard, 0), ("measure", "Z", 0)],
+        shots=64,
+        seed=9,
+    )
+
+    assert calls == 1
+    assert result.shots == 64
+    assert result.branches == 2
+    assert {leaf.measurements[0].outcome for leaf in result.leaves} == {-1, 1}
+    assert all(
+        leaf.measurements[0].probability == pytest.approx(0.5)
+        for leaf in result.leaves
+    )
 
 
 def test_coalesced_kraus_ensemble_uses_one_copy_per_nonempty_outcome():

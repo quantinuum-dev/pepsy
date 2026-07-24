@@ -767,6 +767,13 @@ class _BlockPairContraction:
         self.compiled_block_plan_output_blocks = 0
         self.compiled_block_plan_mode = None
         self.compiled_block_plan_disabled_reason = None
+        # Once a plan has been matched against the first result layout, the
+        # local projected problem is immutable until the plan is discarded.
+        # Avoid rebuilding the same sector/shape/dtype dictionary on every
+        # Krylov matvec, while retaining one validation at plan activation.
+        self.compiled_block_plan_layout_frozen = False
+        self.compiled_block_plan_layout_checks = 0
+        self.compiled_block_plan_layout_fastpath_uses = 0
 
         if not self.shared:
             self.left_axis = None
@@ -851,10 +858,16 @@ class _BlockPairContraction:
         return tuple(ind for ind in fused_inds if ind != self.fused_shared_ind)
 
     def _compiled_plan_matches(self, right):
-        return (
-            self.compiled_block_plan is not None
-            and self.compiled_right_layout == _block_data_layout_map(right.data)
-        )
+        if self.compiled_block_plan is None or self.compiled_right_layout is None:
+            return False
+        if self.compiled_block_plan_layout_frozen:
+            self.compiled_block_plan_layout_fastpath_uses += 1
+            return True
+        self.compiled_block_plan_layout_checks += 1
+        matches = self.compiled_right_layout == _block_data_layout_map(right.data)
+        if matches:
+            self.compiled_block_plan_layout_frozen = True
+        return matches
 
     def _can_compile_block_plan(self, right):
         if _is_fermionic_symmray_array(self.left.data) or _is_fermionic_symmray_array(
@@ -872,6 +885,14 @@ class _BlockPairContraction:
         return True
 
     def _compile_block_plan(self, right, output):
+        # A previous plan may have been invalidated by a changed block layout.
+        # Clear it before attempting a replacement so a failed compilation
+        # cannot leave a stale plan eligible for the next matvec.
+        self.compiled_block_plan = None
+        self.compiled_right_layout = None
+        self.compiled_output_template = None
+        self.compiled_block_plan_layout_frozen = False
+        self.compiled_block_plan_mode = None
         if not self._can_compile_block_plan(right):
             return
 
@@ -955,6 +976,7 @@ class _BlockPairContraction:
         self.compiled_output_template = output.data
         self.compiled_right_layout = _block_data_layout_map(right.data)
         self.compiled_block_plan = tuple(compiled_plan)
+        self.compiled_block_plan_layout_frozen = False
         self.compiled_block_plan_builds += 1
         self.compiled_block_plan_terms = int(num_terms)
         self.compiled_block_plan_output_blocks = len(self.compiled_block_plan)
@@ -1139,6 +1161,15 @@ class _BlockPairContraction:
                 self.compiled_block_plan_output_blocks
             ),
             f"{prefix}_compiled_block_plan_mode": self.compiled_block_plan_mode,
+            f"{prefix}_compiled_block_plan_layout_frozen": bool(
+                self.compiled_block_plan_layout_frozen
+            ),
+            f"{prefix}_compiled_block_plan_layout_checks": int(
+                self.compiled_block_plan_layout_checks
+            ),
+            f"{prefix}_compiled_block_plan_layout_fastpath_uses": int(
+                self.compiled_block_plan_layout_fastpath_uses
+            ),
             f"{prefix}_compiled_block_plan_disabled_reason": (
                 self.compiled_block_plan_disabled_reason
             ),
@@ -1156,6 +1187,13 @@ class _LocalProjectedProblem:
         self.block_layout = self._block_layout(theta)
         self.layout = optimizer.matvec_layout
         self.input_map = {ind: optimizer._input_ind(ind) for ind in self.inds}
+        # Reindexing only changes the Symmray index metadata. Cache that
+        # metadata once and reuse the current theta blocks on every matvec.
+        # The block layout is guarded by ``matches`` below, so this does not
+        # widen or otherwise alter the local variational space.
+        theta_input_template = theta.reindex(self.input_map, inplace=False)
+        self.theta_input_inds = tuple(theta_input_template.inds)
+        self.theta_input_data_template = theta_input_template.data
         self.output_zeros = {
             sector: np.zeros_like(_to_numpy(block))
             for sector, block in theta.data.blocks.items()
@@ -1181,8 +1219,6 @@ class _LocalProjectedProblem:
             if right_env is not None
             else w_right
         )
-        theta_input_inds = tuple(self.input_map.get(ind, ind) for ind in self.inds)
-        self.theta_input_inds = theta_input_inds
         left_stats = self._tensor_block_stats(self.left_projector, "left_projector")
         right_stats = self._tensor_block_stats(self.right_projector, "right_projector")
         # Keep the original right-first route unless the static projector
@@ -1192,7 +1228,7 @@ class _LocalProjectedProblem:
             self.left_contraction = _BlockPairContraction(
                 optimizer,
                 self.left_projector,
-                theta_input_inds,
+                self.theta_input_inds,
                 layout=self.layout,
             )
             self.right_contraction = _BlockPairContraction(
@@ -1206,7 +1242,7 @@ class _LocalProjectedProblem:
             self.right_contraction = _BlockPairContraction(
                 optimizer,
                 self.right_projector,
-                theta_input_inds,
+                self.theta_input_inds,
                 layout=self.layout,
             )
             self.left_contraction = _BlockPairContraction(
@@ -1260,7 +1296,17 @@ class _LocalProjectedProblem:
 
     def apply(self, theta, *, timings=None):
         step_start = time.perf_counter() if timings is not None else None
-        theta_in = theta.reindex(self.input_map, inplace=False)
+        import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
+
+        theta_input_data = _array_with_blocks_like(
+            self.theta_input_data_template,
+            theta.data.blocks,
+        )
+        theta_in = qtn.Tensor(
+            data=theta_input_data,
+            inds=self.theta_input_inds,
+            tags=theta.tags,
+        )
         _add_elapsed(timings, "matvec_input_reindex_elapsed", step_start)
         if self.contraction_order == "left_first":
             step_start = time.perf_counter() if timings is not None else None
@@ -1293,7 +1339,8 @@ class _LocalProjectedProblem:
             )
             _add_elapsed(timings, "matvec_left_contract_elapsed", step_start)
         step_start = time.perf_counter() if timings is not None else None
-        out = out.transpose(*self.inds)
+        if tuple(out.inds) != self.inds:
+            out = out.transpose(*self.inds)
         _add_elapsed(timings, "matvec_transpose_elapsed", step_start)
 
         step_start = time.perf_counter() if timings is not None else None
@@ -2082,7 +2129,13 @@ class SymDMRG2:
         }
 
     def profile_summary(self):
-        """Return aggregate timing/count information for profiling events."""
+        """Return aggregate timing/count information for profiling events.
+
+        ``total_elapsed`` is retained as the cumulative sum of all phase
+        timers, including nested timers. ``wall_elapsed`` and
+        ``phase_wall_fractions`` use the top-level solve timer and are the
+        appropriate values for wall-time attribution.
+        """
         phase_totals = {}
         phase_counts = {}
         matvec_timing_totals = {}
@@ -2097,6 +2150,14 @@ class SymDMRG2:
                             matvec_timing_totals.get(key, 0.0) + float(value)
                         )
         total_elapsed = sum(phase_totals.values())
+        wall_elapsed = float(phase_totals.get("solve", 0.0))
+        if wall_elapsed > 0.0:
+            phase_wall_fractions = {
+                phase: float(elapsed / wall_elapsed)
+                for phase, elapsed in phase_totals.items()
+            }
+        else:
+            phase_wall_fractions = {phase: None for phase in phase_totals}
         lanczos_matvecs = [
             int(entry["num_matvecs"])
             for entry in self.local_solve_diagnostics
@@ -2114,7 +2175,9 @@ class SymDMRG2:
             "enabled": self.profile,
             "num_events": len(self.profile_diagnostics),
             "total_elapsed": float(total_elapsed),
+            "wall_elapsed": wall_elapsed,
             "phase_totals": phase_totals,
+            "phase_wall_fractions": phase_wall_fractions,
             "phase_counts": phase_counts,
             "matvec_timing_totals": matvec_timing_totals,
             "num_matvecs": phase_counts.get("matvec", 0),
@@ -2475,9 +2538,19 @@ class SymDMRG2:
         active_bond_dim = int(active_bond_dim)
         # Energy deltas during a ramp compare different variational spaces. Wait
         # until at least one previous sweep has also used the final bond target.
+        # An explicit schedule can already contain held final-bond sweeps, so
+        # don't require an additional repeated sweep beyond that schedule.
+        previous_bond_dim = None
+        if sweep > 0:
+            previous_bond_dim = (
+                self.bond_dims[sweep - 1]
+                if sweep - 1 < len(self.bond_dims)
+                else final_bond_dim
+            )
+        previous_bond_is_final = previous_bond_dim == final_bond_dim
         schedule_ready = bool(
             active_bond_dim >= final_bond_dim
-            and sweep >= len(self.bond_dims)
+            and previous_bond_is_final
         )
         diagnostic.update(
             {
@@ -2486,6 +2559,8 @@ class SymDMRG2:
                 "active_bond_dim": active_bond_dim,
                 "final_bond_dim": final_bond_dim,
                 "bond_schedule_length": len(self.bond_dims),
+                "previous_bond_dim": previous_bond_dim,
+                "previous_bond_is_final": previous_bond_is_final,
             }
         )
         if raw_converged and not schedule_ready:
@@ -4167,7 +4242,43 @@ class SymDMRG2:
 
         profile_start = self._profile_start()
         problem, _ = self._get_projected_problem(site, theta)
-        live_sectors = problem.structural_output_sectors() & set(theta.data.blocks)
+        all_sectors = set(theta.data.blocks)
+        live_sectors = problem.structural_output_sectors() & all_sectors
+
+        # If every current sector is structurally reachable, numerical block
+        # norms cannot remove anything. This is the common path during the
+        # held-bond phase, and avoiding the scan matters because it runs before
+        # every local eigensolve.
+        if live_sectors == all_sectors:
+            diagnostic = {
+                "site": int(site),
+                "right_site": int(site + 1),
+                "input_blocks": len(all_sectors),
+                "kept_blocks": len(all_sectors),
+                "removed_blocks": 0,
+                "input_dim": self._theta_dim(theta),
+                "kept_dim": self._theta_dim(theta),
+                "live_blocks": len(live_sectors),
+                "nonzero_input_blocks": None,
+                "nonzero_input_scan_skipped": True,
+                "method": "structural",
+            }
+            self._record_profile_elapsed(
+                "variational_sector_prune",
+                profile_start,
+                site=int(site),
+                right_site=int(site + 1),
+                input_blocks=diagnostic["input_blocks"],
+                kept_blocks=diagnostic["kept_blocks"],
+                removed_blocks=0,
+                input_dim=diagnostic["input_dim"],
+                kept_dim=diagnostic["kept_dim"],
+                live_blocks=diagnostic["live_blocks"],
+                method=diagnostic["method"],
+                nonzero_input_scan_skipped=True,
+            )
+            return theta, diagnostic
+
         nonzero_input_sectors = {
             sector for sector, block in theta.data.blocks.items()
             if self._block_norm(block) > 0.0
@@ -4184,6 +4295,7 @@ class SymDMRG2:
                 "kept_dim": self._theta_dim(theta),
                 "live_blocks": len(live_sectors),
                 "nonzero_input_blocks": len(nonzero_input_sectors),
+                "nonzero_input_scan_skipped": False,
                 "method": "structural",
             }
             self._record_profile_elapsed(
@@ -4220,6 +4332,7 @@ class SymDMRG2:
             "kept_dim": self._theta_dim(pruned),
             "live_blocks": len(live_sectors),
             "nonzero_input_blocks": len(nonzero_input_sectors),
+            "nonzero_input_scan_skipped": False,
             "method": "structural",
         }
         self._record_profile_elapsed(

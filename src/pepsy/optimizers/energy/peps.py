@@ -434,6 +434,75 @@ class PepsEnergyOptimizer:
                 return True
         return False
 
+    @staticmethod
+    def _is_symmray_array(value):
+        """Return whether ``value`` is a native Symmray block array."""
+        return hasattr(value, "blocks") and hasattr(value, "indices")
+
+    @classmethod
+    def _terms_use_symmray(cls, terms):
+        return all(cls._is_symmray_array(term) for term in terms.values())
+
+    @staticmethod
+    def _term_sites(state, where):
+        """Normalize a local-term key to the corresponding PEPS sites."""
+        has_site = getattr(state, "has_site", None)
+        if callable(has_site) and has_site(where):
+            return (where,)
+        if not isinstance(where, (tuple, list)):
+            return (where,)
+        sites = tuple(where)
+        if len(sites) not in {1, 2}:
+            raise ValueError("PEPS exact energy terms must act on one or two sites.")
+        return sites
+
+    @classmethod
+    def _symmray_exact_local_expectation(
+        cls,
+        state,
+        terms,
+        *,
+        optimize,
+        normalized,
+        contract_opts,
+    ):
+        """Contract native Symmray local terms without forming a dense RDM.
+
+        Quimb's generic ``compute_local_expectation_exact`` forms a reduced
+        density matrix and fuses its physical legs. Individual Symmray blocks
+        do not carry the full physical rank, so that dense-only fusion fails.
+        Directly contracting each operator-inserted ket with the bra preserves
+        the native block structure and fermionic metadata.
+        """
+        bra = state.H
+        total = 0
+        for where, term in terms.items():
+            sites = cls._term_sites(state, where)
+            inds = [state.site_ind(site) for site in sites]
+            gated = qtn.tensor_network_gate_inds(
+                state,
+                term,
+                inds,
+                contract="split",
+                tags=[],
+                info=None,
+                inplace=False,
+            )
+            total = total + (bra | gated).contract(
+                all,
+                optimize=optimize,
+                **contract_opts,
+            )
+
+        if normalized:
+            norm = (state.H & state).contract(
+                all,
+                optimize=optimize,
+                **contract_opts,
+            )
+            total = total / norm
+        return total
+
     @classmethod
     def _stabilize_state(cls, state):
         if hasattr(state, "balance_bonds_") and not cls._state_uses_symmray(state):
@@ -468,22 +537,31 @@ class PepsEnergyOptimizer:
         kwargs = dict(compute_kwargs or {})
         mode = cls._boundary_mode(boundary_mode)
         if mode == "exact":
-            exact_expectation = getattr(
-                state,
-                "compute_local_expectation_exact",
-                None,
-            )
-            if not callable(exact_expectation):
-                raise TypeError(
-                    "boundary_mode='exact' requires a PEPS-like state with "
-                    "compute_local_expectation_exact()."
+            if cls._state_uses_symmray(state) and cls._terms_use_symmray(terms):
+                value = cls._symmray_exact_local_expectation(
+                    state,
+                    terms,
+                    optimize=contraction_opt,
+                    normalized=bool(normalized),
+                    contract_opts=kwargs,
                 )
-            value = exact_expectation(
-                terms,
-                optimize=contraction_opt,
-                normalized=bool(normalized),
-                **kwargs,
-            )
+            else:
+                exact_expectation = getattr(
+                    state,
+                    "compute_local_expectation_exact",
+                    None,
+                )
+                if not callable(exact_expectation):
+                    raise TypeError(
+                        "boundary_mode='exact' requires a PEPS-like state with "
+                        "compute_local_expectation_exact()."
+                    )
+                value = exact_expectation(
+                    terms,
+                    optimize=contraction_opt,
+                    normalized=bool(normalized),
+                    **kwargs,
+                )
         else:
             value = state.compute_local_expectation(
                 terms,
@@ -706,7 +784,10 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     ``allow_encoding_conversion=True`` to explicitly request that conversion.
     Hamiltonians can be supplied as a ``qtn.MatrixProductOperator``, a
     ``qtn.LocalHam1D``-like object with ``.terms``, a Pepsy symmetric
-    Hamiltonian, or a plain local-term mapping.
+    Hamiltonian, or a plain local-term mapping. Use the explicit ``terms=``
+    constructor keyword when passing a local-term mapping or a Pepsy
+    ``SymHamiltonian``; ``hamiltonian=`` remains supported as a compatibility
+    alias.
     """
 
     _LOSS_KEYS = frozenset({
@@ -722,8 +803,9 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     def __init__(
         self,
         state,
-        hamiltonian,
+        hamiltonian=None,
         *,
+        terms=None,
         normalized: bool = True,
         energy_per_site: bool = True,
         real: bool = True,
@@ -733,6 +815,9 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         loss_kwargs: Mapping[str, Any] | None = None,
         allow_encoding_conversion: bool = False,
     ):
+        if hamiltonian is not None and terms is not None:
+            raise TypeError("pass either hamiltonian or terms, not both")
+        hamiltonian = terms if terms is not None else hamiltonian
         self.state = self._as_mps_state(state)
         self.hamiltonian = hamiltonian
         self.terms = self._terms_from_hamiltonian(hamiltonian)
@@ -1207,9 +1292,9 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         if not cls._terms_use_fermionic_symmray(hamiltonian.terms):
             return False
         return all(
-            len(edge) == 2
-            and all(isinstance(site, Integral) for site in edge)
-            for edge in hamiltonian.edges
+            len(where) in {1, 2}
+            and all(isinstance(site, Integral) for site in where)
+            for where in hamiltonian.edges
         )
 
     @classmethod
@@ -1388,7 +1473,10 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         incoming_constants = dict(loss_constants or {})
         terms = incoming_constants.pop("terms", self.terms)
         if self._is_fermionic_sym_hamiltonian(terms):
-            terms = self._fermionic_hamiltonian_mpo_for_state(terms, self.state)
+            if self._can_use_native_local_terms(terms, self.state):
+                terms = terms.terms
+            else:
+                terms = self._fermionic_hamiltonian_mpo_for_state(terms, self.state)
         if self._is_mpo_hamiltonian(terms):
             constants = {"terms": terms}
             constants.update(incoming_constants)

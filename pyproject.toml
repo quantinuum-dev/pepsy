@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pepsy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Boundary-MPS tools for PEPS norm contraction and DMRG fitting"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,7 @@ dependencies = [
 torch = ["torch"]
 solvers = ["scipy", "nlopt"]
 viz = ["matplotlib"]
+layout = ["nevergrad"]
 docs = ["sphinx>=7", "myst-parser>=2", "pydata-sphinx-theme>=0.15", "nbsphinx>=0.9"]
 dev = ["pytest", "pyflakes", "nbclient", "nbconvert"]
 vmc = ["jax", "flax", "optax", "netket", "symmray"]

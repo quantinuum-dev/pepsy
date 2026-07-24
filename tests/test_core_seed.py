@@ -72,6 +72,7 @@ def test_build_optimizer_constructs_without_seed(monkeypatch):
 
     assert isinstance(out, DummyOpt)
     assert "seed" not in captured
+    assert captured["on_trial_error"] == "ignore"
 
 
 def test_build_optimizer_forwards_slicing_related_options(monkeypatch):

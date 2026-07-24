@@ -114,9 +114,11 @@ new simulator features.
   sequential left fold.
 - Unitary truncation diagnostics use the cumulative coefficient-norm loss
   `1 - ||nu||^2`, evaluated from the tracked one-site canonical centre. This
-  avoids uncapped target copies and overlap contractions. Non-unitary and
-  projective updates emit no `.infidelities` sample; projective normalization
-  starts a fresh unitary segment. Measurement/reset boundaries are preserved in
+  avoids uncapped target copies and overlap contractions. Dense multi-qubit
+  non-unitary matrices use a local physical `G†G` target norm to report retained
+  compression `infidelity`; coefficient-frame sub-MPOs remain uncertified.
+  Projective normalization starts a fresh unitary segment. Measurement/reset
+  boundaries are preserved in
   `.norm_events`: pre-collapse norm, Born branch probability, actual projected
   norm before normalization, and `projector_infidelity` for MPS compression
   incurred by the projector itself. `norm_diagnostics()` combines unitary and
@@ -195,7 +197,9 @@ new simulator features.
 - **Initial states** — `STNState.zero/from_bits/ghz/from_tableau_and_state` and the
   matching `MpsStabOptimizer.from_bits/ghz/from_tableau_and_state` classmethods.
 - **Progress bar + diagnostics** — `run(progbar=True)` (tqdm, reports the current
-  stream part and `norm_infidelity`); `norm()` returns the `|nu>` norm.
+  stream part and MPS-compatible `infidelity`, with `norm_infidelity` retained as
+  an alias); `norm_diagnostics()` reports the same multiplicative `infidelity`
+  and `fidelity` names, and `norm()` returns the `|nu>` norm.
 - `StabilizerMps` is kept as a backward-compatible alias for `MpsStabOptimizer`.
 - **Amplitude / observable API** — `amplitude(bits)`/`probability(bits)`;
   `expectation(pauli, where=None)` (also full-register strings like `"ZIZ"`);

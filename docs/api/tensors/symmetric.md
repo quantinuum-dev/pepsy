@@ -77,11 +77,39 @@ psi = py.ps_to_mps(
 )
 ```
 
-With ``chi=1`` this creates a charge-fixed product MPS. A larger ``chi`` uses
-charge-preserving random-unitary growth while keeping the same global sector.
-``hrps_to_mps`` retains its ordinary local-Haar meaning and is not used for
-fixed-charge Fermion states, since a generic local Haar vector breaks the
-conserved sector.
+``ps_to_mps`` always creates a bond-one, charge-fixed product MPS. For a
+random charge-preserving MPS with a requested bond dimension, use
+``hrs_to_mps``:
+
+```python
+psi = py.hrs_to_mps(
+    8,
+    fermion=fh,
+    occupations=fh.half_filled_occupations(8),
+    chi=4,
+    seed=7,
+)
+```
+
+The random-unitary growth fills only symmetry-compatible sectors and keeps the
+same global charge. The historical alias ``hrps_to_mps`` points to the same
+constructor. For direct Symmray block filling, use ``method="direct"``:
+
+```python
+psi = py.hrs_to_mps(
+    8,
+    fermion=fh,
+    occupations=fh.half_filled_occupations(8),
+    chi=4,
+    method="direct",
+    subsizes="maximal",
+    seed=7,
+)
+```
+
+The direct method uses Symmray's ``MPS_fermionic_rand`` constructor, then
+right-canonicalizes and normalizes the MPS. It is useful when direct random
+block filling is preferred; ``method="unitary"`` remains the default.
 
 The matching PEPS constructor is ``ps_to_peps``. Pass ``(Lx, Ly)`` (or one
 integer for a square lattice), a coordinate occupation mapping, and the same
@@ -97,14 +125,31 @@ seed = py.ps_to_peps(
     (Lx, Ly),
     fermion=fh,
     occupations=occupations,
-    chi=1,
     seed=7,
 )
 ```
 
-This returns the underlying PEPS with native fermionic Symmray tensors; use
-``SymPEPS`` only when the wrapper methods or stored Hamiltonian metadata are
-needed.
+``ps_to_peps`` always returns a bond-one, charge-fixed product PEPS. For a
+random Symmray block-filled PEPS with a requested bond dimension, use
+``hrs_to_peps``:
+
+```python
+psi = py.hrs_to_peps(
+    (Lx, Ly),
+    fermion=fh,
+    occupations=occupations,
+    chi=4,
+    method="direct",
+    subsizes="maximal",
+    seed=7,
+)
+```
+
+The direct method uses Symmray's ``PEPS_fermionic_rand`` constructor and
+normalizes the returned PEPS. A unitary PEPS-growth method is not implemented
+yet. Both constructors return the underlying PEPS with native fermionic
+Symmray tensors; use ``SymPEPS`` only when wrapper methods or stored
+Hamiltonian metadata are needed.
 
 ## Unified native fermion helper
 
@@ -166,6 +211,16 @@ double_occupancy = spinful.operator_term(
     [(U, ((i, "number_up"), (i, "number_down")))],
     sites=(i,),
 )
+
+# Add the correctly ordered fermionic Hermitian conjugate automatically.
+hopping_up = spinful.operator_term(
+    [(1.0, ((0, "create_up"), (1, "annihilate_up")))],
+    sites=(0, 1),
+    add_hc=True,
+)
+
+# Built-in convenience for Delta_0^dagger Delta_1 + h.c.
+eta_pair = spinful.eta_pair_operator()
 
 # A complete explicit Hamiltonian can be wrapped for MPO/DMRG conversion.
 terms = {
@@ -297,6 +352,46 @@ object when a workflow prefers a model-family entry point.
 ``pair_create`` and ``pair_annihilate`` carry charge ``+2`` and ``-2`` for
 ``U1``, ``0`` for ``Z2``, and ``(1, 1)`` for ``U1U1``/``Z2Z2``. Pass those
 charges to ``SymMPS.measure`` when evaluating a charged pairing correlator.
+
+For explicit rectangular PEPS workflows, ``Fermion.lattice_half_filling``
+prepares only the lattice and charge metadata. It does not build a PEPS,
+Hamiltonian, or gate stream, so those steps remain visible in the calling
+notebook:
+
+```python
+setup = fermion.lattice_half_filling(
+    Lx,
+    Ly,
+    pattern="checkerboard",
+    cyclic=True,  # periodic physical Hamiltonian edges
+)
+
+sites = setup.sites
+edges = setup.edges
+occupations = setup.occupations
+
+terms = {edge: -t * fermion.hopping_operator() for edge in edges}
+terms |= {site: fermion.onsite_term(site) for site in sites}
+ham = fermion.hamiltonian(terms)
+
+gate_stream = fermion.strang_gate_stream(
+    edges,
+    dt=0.01,
+    sites=sites,
+    imaginary=True,
+)
+```
+
+The ``cyclic`` option controls only the physical edge list in ``setup``. Native
+fermionic ``ps_to_peps(..., cyclic=True)`` also supports periodic Symmray PEPS
+bonds. An OBC MPS or PEPS can still represent a PBC Hamiltonian by using
+``cyclic=True`` for the physical edge list and ``cyclic=False`` for the state;
+nonlocal wrap-around gates are then routed through the open state network.
+
+For ``U1U1``, ``setup.occupations`` contains ``(n_up, n_down)`` pairs. For
+spinful ``U1`` and ``Z2``, it contains scalar total occupations while
+``setup.spin_occupations`` retains the up/down checkerboard pattern for
+initial walker configurations.
 
 ## Random-unitary MPS starts
 
@@ -482,6 +577,28 @@ ham = py.SymHamiltonian.from_edges(
 
 mpo = ham.to_mpo(L=3, compress=True, max_bond=16, cutoff=1e-12)
 ```
+
+### MPO compression diagnostics
+
+Every MPO built by ``SymHamiltonian.to_mpo`` carries a construction record in
+``mpo.pepsy_compression_report``. It records the raw and final maximum bond,
+the requested cap, whether compression reduced the represented rank, and
+whether Symmray returned a bond larger than the requested cap:
+
+```python
+report = mpo.pepsy_compression_report
+print(report["raw_max_bond"], report["final_max_bond"])
+if report["max_bond_exceeded"]:
+    print("The requested max_bond was a soft cap for this compression.")
+```
+
+Pepsy emits a ``RuntimeWarning`` in the latter case. This can occur when a
+positive cutoff leaves singular values tied at the selected threshold. The
+report's ``rank_reduced`` flag says that the MPO bond rank changed; it is not
+an error estimate. For a hard numerical cap, use ``cutoff=0.0`` and verify the
+returned ``final_max_bond``. When the cap binds, also check convergence against
+a larger cap because the compressed MPO can represent an approximation to the
+original Hamiltonian.
 
 ``to_mpo`` also accepts ``to_backend=`` to map each stored Symmray block to an
 array backend, and ``dtype=`` to choose the dense local operator dtype used

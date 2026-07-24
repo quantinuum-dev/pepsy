@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 import quimb.tensor as qtn
 
+from pepsy.vmc import SymmetryFallbackWarning
+
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("NETKET_NO_TIPS", "1")
@@ -21,9 +23,11 @@ from pepsy.vmc.netket import (  # noqa: E402
     build_heisenberg_vmc,
     build_ising_vmc,
     build_sparse_fermi_hubbard_vmc,
+    build_fermion_vmc,
     choose_netket_chunk_size,
     config_to_phys_indices,
     fermionic_peps_rand,
+    fermion_model_terms,
     make_fermionic_peps_batched_amplitude_function,
     make_fermionic_peps_log_amplitude_model,
     make_netket_autochunk_callback,
@@ -31,15 +35,22 @@ from pepsy.vmc.netket import (  # noqa: E402
     make_netket_vmc_driver,
     make_peps_batched_amplitude_function,
     make_peps_log_amplitude_model,
+    netket_fermion_operator,
     netket_spin_orbital_columns,
     occupation_to_phys_indices,
     pack_fermionic_peps_ansatz,
     pack_peps_ansatz,
     recommend_netket_vmc_settings,
     square_lattice_edges,
+    standard_fermion_observables,
     verify_netket_spin_columns,
+    VMCOptimizeResult,
 )
-from pepsy.vmc.netket import _spinful_phys_lookup  # noqa: E402
+from pepsy.vmc.netket import (  # noqa: E402
+    _site_major_to_netket_jw_phase,
+    _spinful_phys_lookup,
+    _warn_flat_z2_ansatz_fixed_u1u1_sector,
+)
 
 
 def test_square_lattice_edges_open_boundary_order():
@@ -60,6 +71,18 @@ def test_occupation_to_phys_indices_spinful_ordering():
     row = np.array([[0, 1, 0, 1, 0, 1, 1, 0]])
     phys = occupation_to_phys_indices(row, columns)
     assert phys.tolist() == [[0, 1, 2, 3]]
+
+
+def test_site_major_to_netket_jw_phase():
+    columns = SpinOrbitalColumns(up=(4, 5, 6, 7), down=(0, 1, 2, 3))
+    rows = np.array(
+        [
+            [0, 1, 0, 1, 0, 1, 1, 0],
+            [1, 0, 1, 0, 1, 0, 0, 1],
+        ]
+    )
+    phase = _site_major_to_netket_jw_phase(rows, columns)
+    assert phase.tolist() == [-1, 1]
 
 
 def test_config_to_phys_indices_spin_half_ordering():
@@ -286,11 +309,14 @@ def test_fermionic_peps_log_model_matches_direct_contraction():
         for k, site in enumerate(ansatz.sites)
     })
     direct = tnx.contract(all)
+    phase = _site_major_to_netket_jw_phase(
+        np.asarray(row), columns, site_to_orb=ansatz.site_to_orb
+    )[0]
 
     variables = model.init(jax.random.PRNGKey(0), row)
     log_amp = model.apply(variables, row)[0]
     amp = jax.block_until_ready(jnp.exp(log_amp))
-    assert np.allclose(np.asarray(amp), np.asarray(direct))
+    assert np.allclose(np.asarray(amp), phase * np.asarray(direct))
 
 
 def test_fermionic_peps_batched_amplitude_function_matches_direct_contraction():
@@ -340,7 +366,10 @@ def test_fermionic_peps_batched_amplitude_function_matches_direct_contraction():
         })
         direct.append(tnx.contract(all))
 
-    assert np.allclose(np.asarray(amps), np.asarray(direct))
+    direct = np.asarray(direct) * _site_major_to_netket_jw_phase(
+        np.asarray(rows), columns, site_to_orb=ansatz.site_to_orb
+    )
+    assert np.allclose(np.asarray(amps), direct)
 
     batched_me = make_fermionic_peps_batched_amplitude_function(
         ansatz,
@@ -350,7 +379,7 @@ def test_fermionic_peps_batched_amplitude_function_matches_direct_contraction():
         jit=False,
     )
     mantissa, exponent = batched_me(rows)
-    assert np.allclose(np.asarray(mantissa), np.asarray(direct))
+    assert np.allclose(np.asarray(mantissa), direct)
     assert np.allclose(np.asarray(exponent), np.zeros(2))
 
     batched_hotrg = make_fermionic_peps_batched_amplitude_function(
@@ -373,6 +402,49 @@ def test_fermionic_peps_batched_amplitude_function_matches_direct_contraction():
         mantissa, exponent = jax.block_until_ready(batched_boundary(rows))
         assert np.asarray(mantissa).shape == (2,)
         assert np.asarray(exponent).shape == (2,)
+
+
+def test_fermionic_peps_amplitude_rejects_nonzero_cutoff_under_jit():
+    sr = pytest.importorskip("symmray")
+    pytest.importorskip("jax")
+
+    peps = sr.networks.PEPS_fermionic_rand(
+        "Z2",
+        2,
+        2,
+        2,
+        phys_dim=4,
+        subsizes="equal",
+        flat=True,
+        seed=4,
+    )
+    ansatz = pack_fermionic_peps_ansatz(peps, lattice_shape=(2, 2))
+    columns = SpinOrbitalColumns(up=(4, 5, 6, 7), down=(0, 1, 2, 3))
+
+    with pytest.raises(ValueError, match="cutoff=0.0"):
+        make_fermionic_peps_batched_amplitude_function(
+            ansatz,
+            columns,
+            contraction="ctmrg",
+            chi=2,
+            cutoff=1e-8,
+        )
+
+    # cutoff is fine on the non-jitted adaptive path.
+    make_fermionic_peps_batched_amplitude_function(
+        ansatz,
+        columns,
+        contraction="ctmrg",
+        chi=2,
+        cutoff=1e-8,
+        jit=False,
+    )
+
+
+def test_warmup_netket_vmc_is_exported():
+    import pepsy.vmc as pvmc
+
+    assert callable(pvmc.warmup_netket_vmc)
 
 
 def test_build_fermi_hubbard_vmc_tiny_setup():
@@ -410,6 +482,199 @@ def test_build_fermi_hubbard_vmc_tiny_setup():
     assert setup.preconditioner is None
     assert make_netket_vmc_driver(setup) is not None
     assert setup.make_driver() is not None
+
+
+def test_netket_fermion_operator_matches_hubbard():
+    nk = pytest.importorskip("netket")
+    import pepsy as py
+
+    hilbert = nk.hilbert.SpinOrbitalFermions(
+        4, s=1 / 2, n_fermions_per_spin=(2, 2)
+    )
+    graph = nk.graph.Graph(edges=[(0, 1), (1, 2), (2, 3)], n_nodes=4)
+    reference = nk.operator.FermiHubbardJax(
+        hilbert, graph=graph, t=1.0, U=8.0, dtype=float
+    )
+
+    fermion = py.Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0)
+    edges = [(0, 1), (1, 2), (2, 3)]
+    terms = fermion_model_terms(fermion, edges, n_sites=4)
+    general = netket_fermion_operator(hilbert, terms)
+    assert np.allclose(general.to_dense(), reference.to_dense())
+
+    conserving = netket_fermion_operator(hilbert, terms, conserving="auto")
+    assert np.allclose(conserving.to_dense(), reference.to_dense())
+
+
+def test_build_fermion_vmc_tiny_setup_and_observables():
+    nk = pytest.importorskip("netket")
+    pytest.importorskip("flax")
+    sr = pytest.importorskip("symmray")
+    import types
+
+    import pepsy as py
+
+    peps = sr.networks.PEPS_fermionic_rand(
+        "Z2",
+        2,
+        2,
+        2,
+        phys_dim=4,
+        subsizes="equal",
+        flat=True,
+        seed=2,
+    )
+    hilbert = nk.hilbert.SpinOrbitalFermions(
+        4, s=1 / 2, n_fermions_per_spin=(2, 2)
+    )
+    fermion = py.Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0)
+    setup = build_fermion_vmc(
+        peps,
+        fermion=fermion,
+        Lx=2,
+        Ly=2,
+        observables=standard_fermion_observables(hilbert),
+        n_samples=16,
+        n_chains=4,
+        n_discard_per_chain=0,
+        chunk_size=8,
+        seed=1,
+        sampler_seed=2,
+        use_sr=False,
+    )
+    assert setup.hilbert.n_states == 36
+    assert setup.n_sites == 4
+    assert setup.hamiltonian is not None
+    assert set(setup.observables) == {
+        "n_up",
+        "n_down",
+        "n_total",
+        "double_occupancy",
+    }
+    # Hamiltonian reproduces plain Fermi-Hubbard on the same graph.
+    reference = nk.operator.FermiHubbardJax(
+        setup.hilbert, graph=setup.graph, t=1.0, U=8.0, dtype=float
+    )
+    assert np.allclose(setup.hamiltonian.to_dense(), reference.to_dense())
+    # measure() with no observables anywhere raises before touching the state.
+    empty = types.SimpleNamespace(observables=None)
+    with pytest.raises(ValueError):
+        NetKetPEPSVMC.measure(empty)
+
+
+def test_build_fermion_vmc_infers_geometry_from_native_terms():
+    nk = pytest.importorskip("netket")
+    pytest.importorskip("flax")
+    sr = pytest.importorskip("symmray")
+    import types
+
+    import pepsy as py
+
+    peps = sr.networks.PEPS_fermionic_rand(
+        "Z2",
+        2,
+        2,
+        2,
+        phys_dim=4,
+        subsizes="equal",
+        flat=True,
+        seed=2,
+    )
+    fermion = py.Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0)
+    # Native coordinate-keyed terms with only the two vertical edges present,
+    # plus on-site keys. Values are irrelevant to geometry inference.
+    native_terms = {
+        ((0, 0), (1, 0)): 0,
+        ((0, 1), (1, 1)): 0,
+        (0, 0): 0,
+        (0, 1): 0,
+        (1, 0): 0,
+        (1, 1): 0,
+    }
+    # (i, j) -> i * Ly + j on a 2x2 lattice: those edges are (0, 2) and (1, 3).
+    expected_edges = {(0, 2), (1, 3)}
+
+    setup = build_fermion_vmc(
+        peps,
+        fermion=fermion,
+        terms=native_terms,
+        Lx=2,
+        Ly=2,
+        n_samples=16,
+        n_chains=4,
+        n_discard_per_chain=0,
+        chunk_size=8,
+        seed=1,
+        sampler_seed=2,
+        use_sr=False,
+    )
+    got = {tuple(sorted(edge)) for edge in setup.graph.edges()}
+    assert got == expected_edges
+    reference = nk.operator.FermiHubbardJax(
+        setup.hilbert, graph=setup.graph, t=1.0, U=8.0, dtype=float
+    )
+    assert np.allclose(setup.hamiltonian.to_dense(), reference.to_dense())
+
+    # Passing a native SymHamiltonian-like object as hamiltonian= works too.
+    ham_like = types.SimpleNamespace(terms=native_terms)
+    setup2 = build_fermion_vmc(
+        peps,
+        fermion=fermion,
+        hamiltonian=ham_like,
+        Lx=2,
+        Ly=2,
+        n_samples=16,
+        n_chains=4,
+        n_discard_per_chain=0,
+        chunk_size=8,
+        seed=1,
+        sampler_seed=2,
+        use_sr=False,
+    )
+    got2 = {tuple(sorted(edge)) for edge in setup2.graph.edges()}
+    assert got2 == expected_edges
+
+
+def test_netket_vmc_optimize_returns_history():
+    pytest.importorskip("netket")
+    pytest.importorskip("flax")
+
+    peps = qtn.PEPS.rand(
+        Lx=2,
+        Ly=2,
+        bond_dim=2,
+        phys_dim=2,
+        seed=7,
+        dtype="complex128",
+    )
+    setup = build_ising_vmc(
+        peps,
+        Lx=2,
+        Ly=2,
+        h=1.0,
+        J=0.7,
+        n_samples=16,
+        n_chains=4,
+        n_discard_per_chain=0,
+        chunk_size=8,
+        seed=1,
+        sampler_seed=2,
+        use_sr=False,
+    )
+    result = setup.optimize(
+        3,
+        learning_rate=0.01,
+        progress=False,
+        warmup=True,
+        energy_shift=-2.0,
+        per_site=4,
+    )
+    assert isinstance(result, VMCOptimizeResult)
+    assert result.energies.size == 3
+    assert result.steps.shape == result.energies.shape
+    assert np.isfinite(result.final_energy)
+    assert result.compile_seconds is not None
+    assert np.allclose(result.shifted_energies, result.energies - 2.0)
 
 
 def test_build_ising_vmc_tiny_setup_and_expectation():
@@ -561,6 +826,21 @@ def test_spinful_phys_lookup_u1u1_and_z2_fallback():
     # Z2 parity charges (int, 2 sectors) cannot resolve (n_up, n_down): legacy fold.
     assert _spinful_phys_lookup((0, 1)) is None
     assert _spinful_phys_lookup(()) is None
+
+
+def test_flat_z2_ansatz_warns_about_fixed_u1u1_netket_sector():
+    pytest.importorskip("symmray")
+    peps = fermionic_peps_rand(
+        "Z2", 2, 2, 2, seed=3
+    )
+    ansatz = pack_fermionic_peps_ansatz(peps, lattice_shape=(2, 2))
+    assert ansatz.uses_flat_symmray is True
+
+    with pytest.warns(
+        SymmetryFallbackWarning,
+        match=r"flat Z2 fermionic PEPS ansatz.*fixed U1U1 sampling sector",
+    ):
+        _warn_flat_z2_ansatz_fixed_u1u1_sector(ansatz, (1, 1))
 
 
 def test_occupation_fold_switches_on_phys_charges():

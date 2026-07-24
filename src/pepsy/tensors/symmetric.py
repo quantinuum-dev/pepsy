@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from itertools import product
@@ -13,6 +14,7 @@ import quimb.tensor as qtn
 
 __all__ = [
     "Fermion",
+    "FermionLatticeSetup",
     "SpinfulFermion",
     "fermion_density_param_gen",
     "fermion_hopping_param_gen",
@@ -3715,6 +3717,7 @@ def symm_operator_from_dense(
     charge=0,
     fermionic=False,
     sites=None,
+    index_maps=None,
 ):
     """Convert a dense local operator to a Symmray block-sparse array.
 
@@ -3732,6 +3735,10 @@ def symm_operator_from_dense(
         ``charge=+/-1`` for U(1) raising/lowering-style operators.
     sites : int | None
         Number of local sites acted on. Inferred from rank when omitted.
+    index_maps : sequence of mappings, optional
+        Explicit ordered charge maps for the row and column indices. When
+        omitted for a native fermionic one- or two-site operator, Symmray's
+        canonical fermion basis ordering is used.
     """
     # Keep user supplied backend arrays intact. In particular, converting a
     # torch or jax value through ``np.asarray`` either errors for a value that
@@ -3762,8 +3769,24 @@ def symm_operator_from_dense(
     if tuple(int(dim) for dim in ar.shape(arr)) != expected_shape:
         raise ValueError(f"Operator shape {ar.shape(arr)} does not match expected {expected_shape}.")
 
-    index_map = sector_index_map(sectors)
-    index_maps = tuple(dict(index_map) for _ in range(2 * sites))
+    if index_maps is None:
+        index_map = sector_index_map(sectors)
+        if fermionic and phys_dim in {2, 4}:
+            import symmray.fermionic_local_operators as flo  # pylint: disable=import-outside-toplevel
+
+            if phys_dim == 2:
+                charges = flo.get_spinless_charge_indexmap(str(symmetry))
+            else:
+                charges = flo.get_spinful_charge_indexmap(str(symmetry))
+            if len(charges) == phys_dim:
+                index_map = dict(enumerate(charges))
+        index_maps = tuple(dict(index_map) for _ in range(2 * sites))
+    else:
+        index_maps = tuple(dict(index_map) for index_map in index_maps)
+        if len(index_maps) != 2 * sites:
+            raise ValueError(
+                "index_maps must contain one map for each row and column index."
+            )
     duals = (False,) * sites + (True,) * sites
     array_cls = _array_class_for_symmetry(symmetry, fermionic=fermionic)
     kwargs = {}
@@ -3855,6 +3878,28 @@ class SymGateStream(tuple):
             imaginary=self.imaginary,
             order=self.order,
         )
+
+
+@dataclass(frozen=True)
+class FermionLatticeSetup:
+    """Metadata for a spinful half-filled rectangular fermion lattice.
+
+    This container deliberately does not build a PEPS, Hamiltonian, or gate
+    stream. It only centralizes the lattice sites, edges, symmetry-compatible
+    occupations, and conserved charge needed by an explicit workflow.
+    """
+
+    Lx: int
+    Ly: int
+    pattern: str
+    cyclic: bool
+    sites: tuple
+    edges: tuple
+    occupations: Mapping
+    spin_occupations: Mapping
+    target_charge: object
+    target_particles: int
+    site_charge: object
 
 
 def _sites_from_edges(edges, sites):
@@ -5466,11 +5511,49 @@ def _assemble_symmray_mpo(
     )
     if to_backend is not None:
         _apply_to_tensor_network_arrays(mpo, to_backend)
+    raw_max_bond = int(mpo.max_bond())
+    did_compress = bool(compress and L > 1)
     if compress and L > 1:
         compress_opts = {"cutoff": cutoff}
         if max_bond is not None:
             compress_opts["max_bond"] = int(max_bond)
         mpo.compress(**compress_opts)
+
+    requested_max_bond = None if max_bond is None else int(max_bond)
+    final_max_bond = int(mpo.max_bond())
+    report = {
+        "compressed": did_compress,
+        "cutoff": cutoff,
+        "requested_max_bond": requested_max_bond,
+        "raw_max_bond": raw_max_bond,
+        "final_max_bond": final_max_bond,
+        "rank_reduced": final_max_bond < raw_max_bond,
+        "cap_bound": (
+            did_compress
+            and requested_max_bond is not None
+            and raw_max_bond > requested_max_bond
+        ),
+        "max_bond_exceeded": (
+            did_compress
+            and requested_max_bond is not None
+            and final_max_bond > requested_max_bond
+        ),
+    }
+    # This record describes MPO construction only; it is not used during
+    # contraction and can safely travel with the returned MPO as user-facing
+    # build metadata.
+    mpo.pepsy_compression_report = report
+    if report["max_bond_exceeded"]:
+        warnings.warn(
+            "SymHamiltonian.to_mpo requested "
+            f"max_bond={requested_max_bond}, but Symmray compression returned "
+            f"max bond {final_max_bond}. Tied singular values at the "
+            "truncation threshold can make this a soft cap; inspect "
+            "mpo.pepsy_compression_report before relying on a hard memory "
+            "limit.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     return mpo
 
 
@@ -6580,7 +6663,12 @@ class _SymState:
 
     def normalize(self):
         """Normalize the wrapped tensor network in place."""
-        self.psi.normalize()
+        normalized = self.psi.normalize()
+        # MPS normalization is in-place and returns the old scalar norm,
+        # whereas quimb's PEPS normalization returns a new network by
+        # default. Keep the wrapper's state synchronized with both APIs.
+        if hasattr(normalized, "tensors"):
+            self.psi = normalized
         return self
 
     def trotter_gates(self, dt, *, model=None, hamiltonian=None, imaginary=False, order=1, **params):
@@ -7062,6 +7150,8 @@ def _fermion_generic_local_modes(spinful, sites):
                 "create_d": (down.dag,),
                 "number_d": (down.dag, down),
                 "double": (up.dag, up, down.dag, down),
+                "s_plus": (up.dag, down),
+                "s_minus": (down.dag, up),
                 "pair_create": (up.dag, down.dag),
                 "pair_annihilate": (down, up),
             }
@@ -7231,7 +7321,11 @@ class Fermion:
         """The matching :class:`SymHamiltonian` model name."""
         if not self.spinful:
             return "fermi_hubbard_spinless"
-        return "fermi_hubbard" if self.symmetry == "U1" else "fermi_hubbard_u1u1"
+        return (
+            "fermi_hubbard"
+            if self.symmetry in {"U1", "Z2"}
+            else "fermi_hubbard_u1u1"
+        )
 
     @property
     def physical_sectors(self):
@@ -7264,6 +7358,86 @@ class Fermion:
             self.symmetry,
         )
 
+    def lattice_half_filling(
+        self,
+        Lx,
+        Ly=None,
+        *,
+        pattern="checkerboard",
+        cyclic=False,
+    ):
+        """Prepare metadata for an explicit half-filled spinful lattice workflow.
+
+        The returned :class:`FermionLatticeSetup` contains the coordinate
+        sites, nearest-neighbor lattice edges, spin-resolved occupations, and
+        occupations expressed in this fermion's symmetry. It intentionally
+        does not construct a PEPS, Hamiltonian, or gate stream, so callers can
+        keep those steps explicit.
+
+        Parameters
+        ----------
+        Lx, Ly : int
+            Lattice dimensions. If ``Ly`` is omitted, use a square lattice.
+        pattern : {"checkerboard", "neel", "neel_like"}
+            Spin pattern for the one-particle-per-site initial state.
+        cyclic : bool, optional
+            Whether to include periodic physical lattice edges. This metadata
+            flag does not determine the boundary conditions of a PEPS or MPS
+            state built from the returned setup.
+        """
+        if not self.spinful:
+            raise ValueError(
+                "lattice_half_filling is defined for spinful fermions."
+            )
+        if Ly is None:
+            Ly = Lx
+        if not isinstance(Lx, Integral) or int(Lx) < 1:
+            raise ValueError("Lx must be a positive integer.")
+        if not isinstance(Ly, Integral) or int(Ly) < 1:
+            raise ValueError("Ly must be a positive integer.")
+
+        pattern_name = str(pattern).lower().replace("-", "_")
+        if pattern_name not in {"checkerboard", "neel", "neel_like"}:
+            raise ValueError(
+                "pattern must be 'checkerboard', 'neel', or 'neel_like'."
+            )
+
+        Lx = int(Lx)
+        Ly = int(Ly)
+        sites = tuple((x, y) for x in range(Lx) for y in range(Ly))
+        spin_occupations = {
+            site: (1, 0) if (site[0] + site[1]) % 2 == 0 else (0, 1)
+            for site in sites
+        }
+        if self.symmetry == "U1U1":
+            occupations = dict(spin_occupations)
+        else:
+            occupations = {
+                site: n_up + n_down
+                for site, (n_up, n_down) in spin_occupations.items()
+            }
+
+        edges = tuple(
+            tuple(edge)
+            for edge in qtn.edges_2d_square(Lx, Ly, cyclic=cyclic)
+        )
+        target_particles = sum(
+            n_up + n_down for n_up, n_down in spin_occupations.values()
+        )
+        return FermionLatticeSetup(
+            Lx=Lx,
+            Ly=Ly,
+            pattern=pattern_name,
+            cyclic=bool(cyclic),
+            sites=sites,
+            edges=edges,
+            occupations=occupations,
+            spin_occupations=spin_occupations,
+            target_charge=self.total_charge(occupations.values()),
+            target_particles=target_particles,
+            site_charge=site_charge_from_occupations(occupations),
+        )
+
     def half_filled_occupations(self, L):
         """Return a half-filled product-state charge pattern of length ``L``."""
         if not isinstance(L, Integral) or int(L) < 1:
@@ -7274,6 +7448,74 @@ class Fermion:
         if self.symmetry in {"U1", "Z2"}:
             return (1,) * L
         return tuple((1, 0) if site % 2 == 0 else (0, 1) for site in range(L))
+
+    def local_fock_state(self, occupation, *, site=0):
+        """Return ``(physical_charge, sector_index)`` for one local Fock state.
+
+        The physical basis is ``|0>, |up>, |down>, |up down>`` for spinful
+        fermions (and ``|0>, |1>`` for spinless fermions).  A spin-resolved
+        ``(n_up, n_down)`` occupation always chooses that basis state exactly.
+        For spinful ``U1`` and ``Z2`` models, a scalar charge label ``1`` does
+        not resolve the two one-particle states; it therefore denotes the
+        deterministic checkerboard representative: ``|up>`` at even sites and
+        ``|down>`` at odd sites.  Pass a pair to select either spin explicitly.
+
+        This distinction matters for product-state constructors: fixing only a
+        degenerate symmetry sector leaves an arbitrary vector in that sector,
+        whereas a product state must select a definite Fock basis vector.
+        """
+        if self.spinful:
+            if isinstance(occupation, (tuple, list, np.ndarray)):
+                if len(occupation) != 2:
+                    raise ValueError(
+                        "a spinful local occupation must be a scalar or "
+                        "a length-2 (n_up, n_down) pair."
+                    )
+                n_up, n_down = (int(value) for value in occupation)
+                if (n_up, n_down) not in {(0, 0), (0, 1), (1, 0), (1, 1)}:
+                    raise ValueError(
+                        "spinful local occupations must have n_up, n_down in {0, 1}."
+                    )
+            else:
+                number = int(occupation)
+                if number not in {0, 1, 2}:
+                    raise ValueError(
+                        "a scalar spinful local occupation must be 0, 1, or 2."
+                    )
+                if number == 0:
+                    n_up, n_down = 0, 0
+                elif number == 2:
+                    n_up, n_down = 1, 1
+                elif _site_parity(site):
+                    n_up, n_down = 0, 1
+                else:
+                    n_up, n_down = 1, 0
+
+            charge = (
+                n_up + n_down
+                if self.symmetry in {"U1", "Z2"}
+                else (n_up, n_down)
+            )
+            charge = _normalize_group_charge(charge, self.symmetry)
+            if self.symmetry in {"U1", "Z2"}:
+                fock_charges = (0, 1, 1, 2)
+            else:
+                fock_charges = ((0, 0), (1, 0), (0, 1), (1, 1))
+            fock_charges = tuple(
+                _normalize_group_charge(candidate, self.symmetry)
+                for candidate in fock_charges
+            )
+            fock_index = n_up + 2 * n_down
+            return charge, sum(
+                candidate == charge for candidate in fock_charges[:fock_index]
+            )
+
+        if isinstance(occupation, (tuple, list, np.ndarray)):
+            raise ValueError("a spinless local occupation must be the scalar 0 or 1.")
+        number = int(occupation)
+        if number not in {0, 1}:
+            raise ValueError("a spinless local occupation must be 0 or 1.")
+        return _normalize_group_charge(number, self.symmetry), 0
 
     def total_charge(self, occupations):
         """Return the charge sum for an occupation/charge sequence."""
@@ -7300,6 +7542,10 @@ class Fermion:
                 ops["charge"] = ops["number_u"] + ops["number_d"]
                 ops["number"] = ops["charge"]
                 ops["sz"] = 0.5 * (ops["number_u"] - ops["number_d"])
+                ops["s_plus"] = ops["create_u"] @ ops["annihilate_d"]
+                ops["s_minus"] = ops["create_d"] @ ops["annihilate_u"]
+                ops["sx"] = 0.5 * (ops["s_plus"] + ops["s_minus"])
+                ops["sy"] = (-0.5j * ops["s_plus"]) + (0.5j * ops["s_minus"])
                 ops["pair_create"] = ops["create_u"] @ ops["create_d"]
                 ops["pair_annihilate"] = ops["annihilate_d"] @ ops["annihilate_u"]
             else:
@@ -7323,9 +7569,33 @@ class Fermion:
             "annihilate_down": "annihilate_d",
             "doublon": "double",
             "pair_annihilation": "pair_annihilate",
+            "spin_plus": "s_plus",
+            "s_plus": "s_plus",
+            "spin_minus": "s_minus",
+            "s_minus": "s_minus",
+            "spin_x": "sx",
+            "spin_y": "sy",
             "spin_z": "sz",
         }
         return aliases.get(str(name), str(name))
+
+    @classmethod
+    def _adjoint_operator_name(cls, name):
+        """Return the local fermion-operator name for its adjoint."""
+        name = cls._operator_name(name)
+        adjoints = {
+            "create": "annihilate",
+            "annihilate": "create",
+            "create_u": "annihilate_u",
+            "annihilate_u": "create_u",
+            "create_d": "annihilate_d",
+            "annihilate_d": "create_d",
+            "s_plus": "s_minus",
+            "s_minus": "s_plus",
+            "pair_create": "pair_annihilate",
+            "pair_annihilate": "pair_create",
+        }
+        return adjoints.get(name, name)
 
     def dense_operator(self, name):
         """Return a dense one-site operator in the native basis order.
@@ -7347,6 +7617,8 @@ class Fermion:
     def operator_charge(self, name):
         """Return the Abelian charge carried by ``dense_operator(name)``."""
         name = self._operator_name(name)
+        if name in {"s_plus", "s_minus", "sx", "sy", "sz"} and not self.spinful:
+            raise ValueError("Spin operators require spinful fermions.")
         if not self.spinful:
             if name in {"create", "annihilate"}:
                 charge = 1 if name == "create" else -1
@@ -7362,6 +7634,27 @@ class Fermion:
             if not name.startswith("create"):
                 charge = _neg_charge(charge)
             return _normalize_group_charge(charge, self.symmetry)
+        if name in {"s_plus", "s_minus"}:
+            if name == "s_plus":
+                charge = _charge_add(
+                    self.operator_charge("create_u"),
+                    self.operator_charge("annihilate_d"),
+                    self.symmetry,
+                )
+            else:
+                charge = _charge_add(
+                    self.operator_charge("create_d"),
+                    self.operator_charge("annihilate_u"),
+                    self.symmetry,
+                )
+            return _normalize_group_charge(charge, self.symmetry)
+        if name in {"sx", "sy"}:
+            if self.symmetry not in {"U1", "Z2"}:
+                raise ValueError(
+                    f"{name} is not a homogeneous operator under symmetry "
+                    f"{self.symmetry!r}; use symmetry='U1' or 'Z2'."
+                )
+            return self.zero_charge
         if name == "pair_create":
             return self.pair_charge
         if name == "pair_annihilate":
@@ -7372,7 +7665,154 @@ class Fermion:
         """Return the cached native Symmray operator for ``name``."""
         return self.observable(name)
 
-    def operator_term(self, terms, *, sites=None, charge=None, like=None):
+    def _require_spinful(self, feature):
+        if not self.spinful:
+            raise ValueError(f"{feature} requires spinful fermions.")
+
+    def _require_spin_flip_symmetry(self, feature):
+        self._require_spinful(feature)
+        if self.symmetry not in {"U1", "Z2"}:
+            raise ValueError(
+                f"{feature} requires symmetry='U1' or 'Z2'; "
+                f"symmetry={self.symmetry!r} keeps up/down charges separate."
+            )
+
+    @staticmethod
+    def _resolve_operator_parameter(value, *, site=None, edge=None):
+        if site is not None and edge is not None:
+            raise ValueError("Specify either site= or edge=, not both.")
+        if edge is not None:
+            try:
+                left, right = tuple(edge)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("edge must contain exactly two site labels.") from exc
+            if callable(value) or isinstance(value, Mapping):
+                return _edge_parameter(value, left, right)
+            return value
+        if site is not None:
+            if callable(value) or isinstance(value, Mapping):
+                return _node_parameter(value, site)
+            return value
+        if callable(value) or isinstance(value, Mapping):
+            raise ValueError("site= or edge= is required for a site/edge parameter.")
+        return value
+
+    def _spin_flip_operator(self, name):
+        self._require_spin_flip_symmetry(f"{name.upper()} operator")
+        if name == "sx":
+            terms = [
+                (0.5, ((0, "s_plus"),)),
+            ]
+        elif name == "sy":
+            terms = [
+                (-0.5j, ((0, "s_plus"),)),
+            ]
+        else:  # pragma: no cover - private callers pass canonical names.
+            raise ValueError(f"Unknown spin-flip operator {name!r}.")
+        return self.operator_term(terms, sites=(0,), add_hc=True)
+
+    def spin_x_operator(self):
+        """Return the native one-site ``Sx`` operator."""
+        return self.observable("sx")
+
+    def spin_y_operator(self):
+        """Return the native one-site ``Sy`` operator."""
+        return self.observable("sy")
+
+    def spin_z_operator(self):
+        """Return the native one-site ``Sz`` operator."""
+        self._require_spinful("Sz operator")
+        return self.observable("sz")
+
+    def sx_operator(self):
+        """Alias for :meth:`spin_x_operator`."""
+        return self.spin_x_operator()
+
+    def sy_operator(self):
+        """Alias for :meth:`spin_y_operator`."""
+        return self.spin_y_operator()
+
+    def sz_operator(self):
+        """Alias for :meth:`spin_z_operator`."""
+        return self.spin_z_operator()
+
+    def spin_z_correlator(self):
+        """Return the bare native two-site ``Sz_i Sz_j`` operator."""
+        self._require_spinful("Sz-Sz correlators")
+        return self.operator_term(
+            [
+                (0.25, ((0, "number_u"), (1, "number_u"))),
+                (-0.25, ((0, "number_u"), (1, "number_d"))),
+                (-0.25, ((0, "number_d"), (1, "number_u"))),
+                (0.25, ((0, "number_d"), (1, "number_d"))),
+            ],
+            sites=(0, 1),
+            charge=self.zero_charge,
+        )
+
+    def spin_x_correlator(self):
+        """Return the native two-site ``Sx_i Sx_j`` operator."""
+        self._require_spin_flip_symmetry("Sx-Sx correlators")
+        return self.operator_term(
+            [
+                (0.25, ((0, "s_plus"), (1, "s_plus"))),
+                (0.25, ((0, "s_plus"), (1, "s_minus"))),
+                (0.25, ((0, "s_minus"), (1, "s_plus"))),
+                (0.25, ((0, "s_minus"), (1, "s_minus"))),
+            ],
+            sites=(0, 1),
+            charge=self.zero_charge,
+        )
+
+    def spin_y_correlator(self):
+        """Return the native two-site ``Sy_i Sy_j`` operator."""
+        self._require_spin_flip_symmetry("Sy-Sy correlators")
+        return self.operator_term(
+            [
+                (-0.25, ((0, "s_plus"), (1, "s_plus"))),
+                (0.25, ((0, "s_plus"), (1, "s_minus"))),
+                (0.25, ((0, "s_minus"), (1, "s_plus"))),
+                (-0.25, ((0, "s_minus"), (1, "s_minus"))),
+            ],
+            sites=(0, 1),
+            charge=self.zero_charge,
+        )
+
+    def xy_exchange_operator(self):
+        """Return the native ``Sx_i Sx_j + Sy_i Sy_j`` operator."""
+        self._require_spinful("XY exchange operators")
+        return self.operator_term(
+            [(0.5, ((0, "s_plus"), (1, "s_minus")))],
+            sites=(0, 1),
+            charge=self.zero_charge,
+            add_hc=True,
+        )
+
+    def heisenberg_operator(self):
+        """Return the native two-site ``S_i dot S_j`` operator."""
+        self._require_spinful("Heisenberg operators")
+        return self.operator_term(
+            [
+                (0.25, ((0, "number_u"), (1, "number_u"))),
+                (-0.25, ((0, "number_u"), (1, "number_d"))),
+                (-0.25, ((0, "number_d"), (1, "number_u"))),
+                (0.25, ((0, "number_d"), (1, "number_d"))),
+                (0.5, ((0, "s_plus"), (1, "s_minus"))),
+                (0.5, ((1, "s_plus"), (0, "s_minus"))),
+            ],
+            sites=(0, 1),
+            charge=self.zero_charge,
+        )
+
+    def operator_term(
+        self,
+        terms,
+        *,
+        sites=None,
+        charge=None,
+        like=None,
+        add_hc=False,
+    ):
         """Return a native operator made from explicit fermion monomials.
 
         Parameters
@@ -7389,6 +7829,11 @@ class Fermion:
         charge : optional
             Total Abelian operator charge. By default it is inferred and all
             monomials must have the same charge.
+        add_hc : bool, optional
+            Append the Hermitian conjugate of every supplied monomial. The
+            input must then define a self-conjugate charge sector, as required
+            for one homogeneous Symmray operator. Fermionic factor order is
+            reversed when taking the adjoint.
 
 
         This returns the operator itself, not ``exp(-i dt H)``. For example,
@@ -7405,7 +7850,6 @@ class Fermion:
 
         inferred_sites = []
         normalized = []
-        term_charges = []
         for entry in entries:
             if not isinstance(entry, (tuple, list)) or len(entry) != 2:
                 raise ValueError("terms must have form (coefficient, operators).")
@@ -7421,13 +7865,30 @@ class Fermion:
                 if site not in inferred_sites:
                     inferred_sites.append(site)
                 name = self._operator_name(name)
+                expanded.append((site, name))
+            normalized.append((coefficient, tuple(expanded)))
+
+        if add_hc:
+            normalized.extend(
+                (
+                    ar.do("conj", coefficient),
+                    tuple(
+                        (site, self._adjoint_operator_name(name))
+                        for site, name in reversed(references)
+                    ),
+                )
+                for coefficient, references in tuple(normalized)
+            )
+
+        term_charges = []
+        for _, references in normalized:
+            term_charge = self.zero_charge
+            for _, name in references:
                 term_charge = _charge_add(
                     term_charge,
                     self.operator_charge(name),
                     self.symmetry,
                 )
-                expanded.append((site, name))
-            normalized.append((coefficient, tuple(expanded)))
             term_charges.append(term_charge)
 
         if sites is None:
@@ -7446,6 +7907,12 @@ class Fermion:
 
         inferred_charge = term_charges[0]
         if any(term_charge != inferred_charge for term_charge in term_charges[1:]):
+            if add_hc:
+                raise ValueError(
+                    "add_hc requires a self-conjugate operator charge; "
+                    "charged and Hermitian-conjugate monomials cannot be "
+                    "combined into one homogeneous Symmray operator."
+                )
             raise ValueError(
                 "All monomials in one operator_term must carry the same charge."
             )
@@ -7480,8 +7947,40 @@ class Fermion:
             charge=charge,
             fermionic=True,
             sites=len(sites),
+            index_maps=tuple(
+                {
+                    index: value
+                    for index, value in enumerate(self._local_ops()["index_map"])
+                }
+                for _ in range(2 * len(sites))
+            ),
         )
         return _apply_to_array_blocks(operator, self.to_backend)
+
+    def eta_pair_operator(self, *, coefficient=1.0):
+        """Return ``coefficient * Delta_0^dag Delta_1 + h.c.``.
+
+        The returned operator uses canonical two-site locations ``(0, 1)``;
+        place it on physical sites through ``state.measure(..., where=...)``
+        or an explicit VMC term mapping. It is neutral under the selected
+        spinful symmetry and preserves native fermionic grading.
+        """
+        if not self.spinful:
+            raise ValueError(
+                "Eta-pair operators require spinful fermions with up and down "
+                "modes."
+            )
+        return self.operator_term(
+            [
+                (
+                    coefficient,
+                    ((0, "pair_create"), (1, "pair_annihilate")),
+                )
+            ],
+            sites=(0, 1),
+            charge=self.zero_charge,
+            add_hc=True,
+        )
 
     def _hopping_operator_on_sites(
         self,
@@ -7668,14 +8167,24 @@ class Fermion:
         """Return a cached one-site fermionic Symmray operator for ``name``."""
         name = self._operator_name(name)
         if name not in self._observable_cache:
-            operator = symm_operator_from_dense(
-                self.dense_operator(name),
-                self.physical_sectors,
-                symmetry=self.symmetry,
-                charge=self.operator_charge(name),
-                fermionic=True,
-                sites=1,
-            )
+            if name in {"sx", "sy"}:
+                operator = self._spin_flip_operator(name)
+            elif name in {"s_plus", "s_minus"}:
+                self._require_spinful(f"{name} operators")
+                operator = self.operator_term(
+                    [(1.0, ((0, name),))],
+                    sites=(0,),
+                    charge=self.operator_charge(name),
+                )
+            else:
+                operator = symm_operator_from_dense(
+                    self.dense_operator(name),
+                    self.physical_sectors,
+                    symmetry=self.symmetry,
+                    charge=self.operator_charge(name),
+                    fermionic=True,
+                    sites=1,
+                )
             self._observable_cache[name] = _apply_to_array_blocks(operator, self.to_backend)
         return self._observable_cache[name]
 
@@ -7689,6 +8198,99 @@ class Fermion:
         if key not in self._gate_cache:
             self._gate_cache[key] = build()
         return self._gate_cache[key]
+
+    def operator_gate(self, operator, theta, *, imaginary=False):
+        """Exponentiate a native operator as ``exp(-i theta operator)``.
+
+        ``operator`` can be a named one-site observable, one of the built-in
+        two-site names ``sxx``, ``syy``, ``szz``, ``xy``, or ``heisenberg``,
+        or an already-built native Symmray operator from :meth:`operator_term`.
+        Gates require a charge-neutral operator because exponentiation adds the
+        identity term and must remain in one homogeneous symmetry sector.
+        """
+        if isinstance(operator, str):
+            name = self._operator_name(operator)
+            factories = {
+                "sxx": self.spin_x_correlator,
+                "syy": self.spin_y_correlator,
+                "szz": self.spin_z_correlator,
+                "xy": self.xy_exchange_operator,
+                "heisenberg": self.heisenberg_operator,
+            }
+            if name in factories:
+                factory = factories[name]
+            else:
+                factory = lambda: self.observable(name)
+            operator_key = ("name", name)
+        else:
+            factory = lambda: operator
+            operator_key = ("term", id(operator))
+
+        def build():
+            term = factory()
+            charge = getattr(term, "charge", None)
+            if charge is not None and charge != self.zero_charge:
+                raise ValueError(
+                    "operator_gate requires a charge-neutral operator; "
+                    f"got charge {charge!r} for symmetry {self.symmetry!r}."
+                )
+            gate = _gate_from_term(term, theta, imaginary=imaginary)
+            return _apply_to_array_blocks(gate, self.to_backend)
+
+        return self._cached_gate(
+            ("operator", operator_key, theta, imaginary),
+            build,
+        )
+
+    def spin_x_gate(self, theta, *, site=None, imaginary=False):
+        """Return the native one-site ``exp(-i theta Sx)`` gate."""
+        theta = self._resolve_operator_parameter(theta, site=site)
+        return self.operator_gate("sx", theta, imaginary=imaginary)
+
+    def spin_y_gate(self, theta, *, site=None, imaginary=False):
+        """Return the native one-site ``exp(-i theta Sy)`` gate."""
+        theta = self._resolve_operator_parameter(theta, site=site)
+        return self.operator_gate("sy", theta, imaginary=imaginary)
+
+    def spin_z_gate(self, theta, *, site=None, imaginary=False):
+        """Return the native one-site ``exp(-i theta Sz)`` gate."""
+        theta = self._resolve_operator_parameter(theta, site=site)
+        return self.operator_gate("sz", theta, imaginary=imaginary)
+
+    def spin_x_correlator_gate(self, theta, *, edge=None, imaginary=False):
+        """Return the native two-site ``exp(-i theta Sx Sx)`` gate."""
+        theta = self._resolve_operator_parameter(theta, edge=edge)
+        return self.operator_gate("sxx", theta, imaginary=imaginary)
+
+    def spin_y_correlator_gate(self, theta, *, edge=None, imaginary=False):
+        """Return the native two-site ``exp(-i theta Sy Sy)`` gate."""
+        theta = self._resolve_operator_parameter(theta, edge=edge)
+        return self.operator_gate("syy", theta, imaginary=imaginary)
+
+    def spin_z_correlator_gate(self, theta, *, edge=None, imaginary=False):
+        """Return the native two-site ``exp(-i theta Sz Sz)`` gate."""
+        theta = self._resolve_operator_parameter(theta, edge=edge)
+        return self.operator_gate("szz", theta, imaginary=imaginary)
+
+    def xy_exchange_gate(self, theta, *, edge=None, imaginary=False):
+        """Return the native two-site XY-exchange gate."""
+        theta = self._resolve_operator_parameter(theta, edge=edge)
+        return self.operator_gate("xy", theta, imaginary=imaginary)
+
+    def heisenberg_gate(self, theta, *, edge=None, imaginary=False):
+        """Return the native two-site Heisenberg gate."""
+        theta = self._resolve_operator_parameter(theta, edge=edge)
+        return self.operator_gate("heisenberg", theta, imaginary=imaginary)
+
+    # Short gate spellings match the operator aliases and are convenient in
+    # small native gate streams.
+    sx_gate = spin_x_gate
+    sy_gate = spin_y_gate
+    sz_gate = spin_z_gate
+    sxx_gate = spin_x_correlator_gate
+    syy_gate = spin_y_correlator_gate
+    szz_gate = spin_z_correlator_gate
+    xy_gate = xy_exchange_gate
 
     def interaction_gate(self, dt, *, site=None, U=None, imaginary=False):
         """Return the exact onsite interaction gate.
@@ -7826,8 +8428,25 @@ class Fermion:
 
     def gate(self, name, dt, *, site=None, where=None, imaginary=False, **params):
         """Build a named native gate using the model's local conventions."""
+        edge = params.pop("edge", where)
         del where  # Gate locations belong to the stream entry, not the tensor.
         name = str(name).lower().replace("-", "_")
+        if name in {"sx", "spin_x"}:
+            return self.spin_x_gate(dt, site=site, imaginary=imaginary)
+        if name in {"sy", "spin_y"}:
+            return self.spin_y_gate(dt, site=site, imaginary=imaginary)
+        if name in {"sz", "spin_z"}:
+            return self.spin_z_gate(dt, site=site, imaginary=imaginary)
+        if name in {"sxx", "spin_x_x", "sx_sx"}:
+            return self.spin_x_correlator_gate(dt, edge=edge, imaginary=imaginary)
+        if name in {"syy", "spin_y_y", "sy_sy"}:
+            return self.spin_y_correlator_gate(dt, edge=edge, imaginary=imaginary)
+        if name in {"szz", "spin_z_z", "sz_sz"}:
+            return self.spin_z_correlator_gate(dt, edge=edge, imaginary=imaginary)
+        if name in {"xy", "xy_exchange"}:
+            return self.xy_exchange_gate(dt, edge=edge, imaginary=imaginary)
+        if name in {"heisenberg", "heis"}:
+            return self.heisenberg_gate(dt, edge=edge, imaginary=imaginary)
         if name in {"onsite", "hubbard_onsite"}:
             return self.onsite_gate(
                 dt,

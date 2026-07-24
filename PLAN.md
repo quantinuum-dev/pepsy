@@ -9,7 +9,7 @@ PEPS norm contraction and DMRG fitting). It is the "what/when" companion to the
 conceptual notes in `learning/` (the "why/how"), the session journal in
 `history/` (the "what happened"), and the published documentation in `docs/`.
 
-Current package version: `0.2.0` (`pepsy.__version__` / `pyproject.toml`).
+Current package version: `0.3.0` (`pepsy.__version__` / `pyproject.toml`).
 
 Four headline workstreams drive the roadmap:
 

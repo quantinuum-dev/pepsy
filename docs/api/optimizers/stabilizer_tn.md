@@ -89,7 +89,8 @@ print(sim.stim_sample.faults)
 
 With `progbar=True`, the STN progress bar reports the current stream
 `part` (`clifford`, `T`, `measurement`, `reset`, `nonclifford`, ...) and the
-single diagnostic field `norm_infidelity`.
+MPS-compatible diagnostic field `infidelity`. The legacy
+`norm_infidelity` field is emitted with the same value.
 
 `exact_cooling=True` is the default constructive pre-check for multi-site
 non-Clifford Pauli rotations. If the frame image has an isolated product
@@ -251,10 +252,12 @@ no reference-state copy or overlap contraction. For normalized unitary
 evolution it records the cumulative proxy `1 - ||nu||**2` after compressed
 coefficient-MPS updates, reading the norm from the tracked one-site canonical
 centre. Unitary updates are not renormalized, so lost norm remains visible.
-Projectors, measurements, coefficient-frame sub-MPOs, and arbitrary
-non-unitary matrices do not emit infidelity samples; an unnormalized
-non-unitary map also suspends later samples until projection restores a
-normalized baseline. The public `infidelities` trace is therefore sparse and
+For dense multi-qubit non-unitary matrices, the target norm is measured from
+the local physical `G†G` expectation and the retained norm ratio is reported as
+`infidelity`. Coefficient-frame sub-MPOs and arbitrary physical maps without a
+certified target norm do not emit such samples; an unnormalized non-unitary
+map also suspends later unitary samples until projection restores a normalized
+baseline. The public `infidelities` trace is therefore sparse and
 historical, is not index-aligned with `bond_history`, and must not be summed.
 Projective measurement/reset boundaries do preserve the current segment before
 normalization in `norm_events`: the event records the pre-collapse norm,
@@ -266,8 +269,9 @@ The post-collapse state is then normalized. Use `norm_diagnostics()` to form
 product/geometric-mean survival summaries across completed segments plus the
 current open segment; these summaries multiply unitary- and projector-
 compression survival factors, but not measurement probabilities. The preferred
-summary keys are `norm_infidelity`, `norm_survival`, and `norm`; the older
-`total_*_proxy` keys remain as compatibility aliases.
+summary keys are `infidelity`, `fidelity`, `norm_survival`, and `norm`;
+`norm_infidelity` and the older
+`total_*_proxy` keys remain compatibility aliases.
 The proxy is not exact overlap fidelity or a discarded-SVD-weight report;
 validate physical accuracy independently when that distinction matters.
 

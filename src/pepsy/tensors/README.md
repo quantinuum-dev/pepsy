@@ -30,11 +30,13 @@ modes include `snake`, `snake-row-major`, `row-major`, `col-major`, `hilbert`,
 
 Constructors create common tensor-network states and operators:
 
-- `ps_to_mps`, `ps_to_peps`, `ps_to_3dpeps`
+- `ps_to_mps` (bond-one product states), `ps_to_ttn`, `ps_to_peps`, `ps_to_3dpeps`
 - `ps_to_mpo`, `ps_to_pepo`
 - `id_to_mpo`, `id_to_pepo`
 - `haar_random_state`, `random_haar_qubit`
-- `hrps_to_mps`, `hrps_to_peps`
+- `hrs_to_mps` / `hrps_to_mps` (random MPS states), `hrs_to_ttn` /
+  `hrps_to_ttn` (random tree states), `hrs_to_peps` / `hrps_to_peps`
+  (direct Symmray random PEPS states)
 
 Contraction helpers include:
 

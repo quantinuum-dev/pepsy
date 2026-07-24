@@ -17,6 +17,8 @@ from ..sweep import SweepOptimizer
 from ..sweep.environments import (
     canonical_boundary_engine_selector,
     normalize_boundary_engine,
+    symmray_array_backends,
+    uses_symmray_arrays,
 )
 
 __all__ = ["PepsOptimizer"]
@@ -146,9 +148,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
       ``measure_final_infidelity=True``. If final measurement is disabled, the
       optimizer loss used as a fallback can come from the coarser
       ``boundary_chi`` environment while the pre-check used ``evaluation_chi``.
-    - Sweep mode defaults to the optional NLopt ``LD_LBFGS`` solver. Install
-      NLopt or pass an explicit ``optimizer`` / ``sweep_optimize_kwargs`` value
-      for environments where NLopt is unavailable.
+    - Symmray PEPS inputs must be Torch-backed. Their sweep cleanup defaults
+      to NLopt ``LD_LBFGS`` while obtaining gradients from Torch autograd;
+      provide both the PEPS and gates with the same Torch Symmray backend.
     - ``non_unitary=True`` normalizes generated targets and candidates; it does
       not implement the interval scheduling or norm-proxy machinery available
       in :class:`pepsy.optimizers.mps.MpsOptimizer`.
@@ -223,7 +225,8 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         Compact optimizer selection for the chosen variational backend. In
         sweep mode this maps to :class:`SweepOptimizer`'s local solver name;
         when left as ``None`` the sweep local solver defaults to NLopt
-        ``LD_LBFGS``. In global mode, ``"nlopt"`` together with
+        ``LD_LBFGS``. Torch-backed Symmray states still supply gradients via
+        Torch autograd. In global mode, ``"nlopt"`` together with
         ``optimizer_options={"algorithm": "LD_VAR2"}`` routes to
         :meth:`GlobalOptimizer.optimize_nlopt`.
     optimizer_options : mapping, optional
@@ -319,6 +322,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.which = which
         self.inplace = bool(inplace)
         self.state = state if self.inplace else (state.copy() if hasattr(state, "copy") else state)
+        self._require_torch_symmray_backend(self.state, role="state")
         self.gates = _normalize_gate_queue(gates)
 
         self.normalize_initial = bool(normalize_initial)
@@ -376,6 +380,28 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cls._validate_scalar_chi(chi[1], name="boundary_chi[1]"),
             )
         return cls._validate_scalar_chi(chi, name="boundary_chi")
+
+    @staticmethod
+    def _require_torch_symmray_backend(*states, role="inputs"):
+        """Require a single Torch backend whenever Symmray data is present."""
+        states = tuple(state for state in states if state is not None)
+        symmray_flags = tuple(uses_symmray_arrays(state) for state in states)
+        if not any(symmray_flags):
+            return
+        if not all(symmray_flags):
+            raise TypeError(
+                "PepsOptimizer requires matching Torch-backed Symmray arrays "
+                f"for {role}; do not mix Symmray and dense tensor networks."
+            )
+        backends = symmray_array_backends(*states)
+        if backends == {"torch"}:
+            return
+        found = ", ".join(sorted(backends)) or "unknown"
+        raise TypeError(
+            "PepsOptimizer requires Torch-backed Symmray arrays for autograd; "
+            f"{role} use backend(s): {found}. Convert the PEPS and every gate "
+            "with pepsy.backend_torch(...) before optimization."
+        )
 
     def _boundary_chi_max(self):
         if isinstance(self.boundary_chi, tuple):
@@ -1257,6 +1283,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         global_kwargs,
         global_optimize_kwargs,
     ):
+        self._require_torch_symmray_backend(
+            state,
+            target,
+            role="state and target",
+        )
         if mode == "sweep":
             return self._optimize_with_sweep(
                 state,
@@ -1431,6 +1462,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_kwargs=normalize_kwargs,
             normalize_chi=normalize_chi,
         )
+        self._require_torch_symmray_backend(self.state, role="state")
 
         pbar = None
         if show_progress:
@@ -1479,6 +1511,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     opts=opts,
                     inplace=True,
                 )
+                self._require_torch_symmray_backend(
+                    self.state,
+                    role="state after gate application",
+                )
                 if normalize_target:
                     self._normalize_state(
                         self.state,
@@ -1513,6 +1549,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
                     gate_kwargs=gate_kwargs,
+                )
+                self._require_torch_symmray_backend(
+                    state_before,
+                    target,
+                    role="state and gate-generated target",
                 )
                 if normalize_target:
                     self._normalize_state(

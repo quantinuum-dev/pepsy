@@ -189,8 +189,8 @@ default `0.1` threshold when profiling a different workload.
 
 `TrajectoryEvent` is the general independent noise-simulation interface. Put
 one directly inside an ordinary gate stream and run independently sampled shots
-with either `MpsOptimizer` or `MpsStabOptimizer`. It does not require Stim or a
-density matrix.
+with `MpsOptimizer`, `TreeOptimizer`, or `MpsStabOptimizer`. It does not require
+Stim or a density matrix.
 
 Use a `mixture` for a user-defined random-unitary channel. Its outcomes have
 explicit probabilities, so `sample_trajectory_stream(...)` can make a concrete
@@ -235,9 +235,9 @@ print(result.records[0])
 
 `TrajectoryChannel.kraus([("no_jump", K0), ("jump", K1)])` accepts any
 complete local qubit channel (`sum(K.conj().T @ K) == I`) on the corresponding
-one- or multi-qubit `TrajectoryEvent` support. For ordinary MPS replay, replace
-the factory above with a fresh `MpsOptimizer(initial_mps, ...)` and pass its
-usual options through `run_kwargs`.
+one- or multi-qubit `TrajectoryEvent` support. For ordinary MPS or TTN replay,
+replace the factory above with a fresh `MpsOptimizer(initial_mps, ...)` or
+`TreeOptimizer(...)` and pass its usual options through `run_kwargs`.
 
 For `MpsStabOptimizer(track_infidelity=True)`, a selected Kraus outcome is a
 normalized trajectory boundary, just like a measurement/reset: its Born weight
