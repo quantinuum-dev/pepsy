@@ -17,9 +17,9 @@ Layout of a tree state
   structural node tag ``node_tag_id.format(nid)`` (default ``"N{}"``);
 * leaf tensors additionally carry the ``quimb`` site tag
   ``site_tag_id.format(q)`` (default ``"I{}"``) and the physical index
-  ``site_ind_id.format(q)`` (default ``"k{}"``) for qubit ``q`` -- so the
-  inherited ``quimb`` site/ ``local_expectation`` machinery treats the leaves as
-  the sites and the internal nodes as ancillary bond carriers;
+  ``site_ind_id.format(q)`` (default ``"k{}"``) for qubit ``q`` -- so Quimb
+  treats the leaves as the sites and the internal nodes as ancillary bond
+  carriers. This class supplies the tree-specific ``local_expectation`` path;
 * adjacent nodes ``a`` and ``b`` share the deterministic virtual bond index
   ``_tb{lo}_{hi}`` with ``lo, hi = sorted((a, b))``.
 
@@ -100,6 +100,14 @@ def _bond_index(a, b):
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
+def _is_symmray_array(value):
+    """Whether ``value`` is a native Symmray block-sparse array."""
+    try:
+        return ar.infer_backend(value) == "symmray"
+    except (AttributeError, TypeError):
+        return hasattr(value, "blocks") and hasattr(value, "indices")
+
+
 def _visible_len(s):
     """Length of ``s`` ignoring any ANSI colour escape sequences."""
     return len(_ANSI_RE.sub("", s))
@@ -146,9 +154,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     Subclasses :class:`quimb.tensor.TensorNetworkGenVector`, so it *is* a
     ``quimb`` tensor network: all of ``quimb``'s arbitrary-geometry methods
     (``canonize_around``, ``canonize_between``, ``compress_between``,
-    ``gate_inds``, ``local_expectation``, ``to_dense``, ``copy`` ...) work
-    directly.  The tree geometry is owned by a :class:`TreePlan`; this class adds
-    the node/site/index naming glue on top.
+    ``gate_inds``, ``to_dense``, ``copy`` ...) work directly. This class provides
+    the tree-specific ``local_expectation`` implementation and owns the
+    geometry/node/site/index naming glue on top of a :class:`TreePlan`.
 
     Prefer the builders :meth:`from_plan`, :meth:`from_order`, and :meth:`rand`
     over calling the constructor with raw tensors.
@@ -175,10 +183,14 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         "_plan",
         "_node_tag_id",
         "_canonical_region",
+        "_symmetry",
+        "_fermionic",
+        "_physical_sectors",
     )
 
     def __init__(self, ts=(), *, plan=None, sites=None, site_tag_id="I{}",
-                 site_ind_id="k{}", node_tag_id="N{}", **tn_opts):
+                 site_ind_id="k{}", node_tag_id="N{}", symmetry=None,
+                 fermionic=False, physical_sectors=None, **tn_opts):
         # Copy / cast path: quimb's base ``__init__`` copies ``_EXTRA_PROPS``
         # (``_plan``, ``_node_tag_id``, ...) straight off ``ts``; returning here
         # avoids clobbering them with the fresh-construction defaults below.
@@ -193,6 +205,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                     raise ValueError(
                         "plan does not match the TreeTensorNetwork being copied."
                     )
+                self._fermionic_norm_cache = None
+                self._fermionic_norm_cache_version = 0
+                self._fermionic_norm_cache_value_version = None
                 return
             if plan is None:
                 raise TypeError(
@@ -205,6 +220,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             self._site_ind_id = site_ind_id
             self._node_tag_id = node_tag_id
             self._canonical_region = None
+            self._symmetry = symmetry
+            self._fermionic = bool(fermionic)
+            self._physical_sectors = physical_sectors
+            self._fermionic_norm_cache = None
+            self._fermionic_norm_cache_version = 0
+            self._fermionic_norm_cache_value_version = None
             self.validate()
             return
         super().__init__(ts, **tn_opts)
@@ -217,6 +238,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self._site_tag_id = site_tag_id
         self._site_ind_id = site_ind_id
         self._node_tag_id = node_tag_id
+        self._symmetry = symmetry
+        self._fermionic = bool(fermionic)
+        self._physical_sectors = physical_sectors
+        self._fermionic_norm_cache = None
+        self._fermionic_norm_cache_version = 0
+        self._fermionic_norm_cache_value_version = None
         # Frozenset of node ids forming the canonicalised subtree (``None`` if
         # unknown); a one-node region is exactly an orthogonality centre.
         # Tracked here -- surviving ``.copy()`` via ``_EXTRA_PROPS`` -- so the
@@ -234,10 +261,21 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         outside the state-aware wrappers below.
         """
         self._canonical_region = None
+        self._invalidate_norm_cache()
+        return self
+
+    def _invalidate_norm_cache(self):
+        """Invalidate the cached native-fermion norm denominator."""
+        self._fermionic_norm_cache = None
+        self._fermionic_norm_cache_value_version = None
+        self._fermionic_norm_cache_version = (
+            getattr(self, "_fermionic_norm_cache_version", 0) + 1
+        )
         return self
 
     def _invalidate_after_mutation(self, result):
         self._canonical_region = None
+        self._invalidate_norm_cache()
         return result
 
     def gate_inds_(self, *args, **kwargs):
@@ -277,9 +315,236 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self._node_tag_id
 
     @property
+    def symmetry(self):
+        """Native Symmray symmetry label, or ``None`` for dense tensors."""
+        return self._symmetry
+
+    @property
+    def fermionic(self):
+        """Whether the live tensor data uses Symmray's fermionic arrays."""
+        return self._fermionic
+
+    def _fermionic_norm_squared(self):
+        """Return the exact native-fermion norm squared with caching.
+
+        A known centre uses Symmray's graded one-tensor contraction. If the
+        gauge is unknown, contract the complete doubled network so Quimb's
+        fermionic contraction machinery retains all graded boundary phases.
+        The result is cached until a state mutation invalidates it.
+        """
+        if not self.fermionic:
+            raise TypeError("fermionic norm readout requires a fermionic TTN.")
+
+        cache = getattr(self, "_fermionic_norm_cache", None)
+        version = getattr(self, "_fermionic_norm_cache_version", 0)
+        if (
+            cache is not None
+            and getattr(self, "_fermionic_norm_cache_value_version", None)
+            == version
+        ):
+            return cache
+
+        center = self.orthogonality_center
+        if center is not None:
+            value = self._fermionic_center_norm_squared(center)
+        else:
+            value = (self.H | self).contract(all, optimize="auto")
+        self._fermionic_norm_cache = value
+        self._fermionic_norm_cache_value_version = version
+        return value
+
+    def _fermionic_center_norm_squared(self, center=None):
+        """Read a canonical center norm with Symmray's graded conjugation.
+
+        ``Tensor.H`` only conjugates the data. For a fermionic tensor, the
+        one-tensor network conjugation also applies parity phase flips on its
+        outer legs. Those flips are the graded identity supplied by the
+        canonical exterior, so this remains a one-tensor readout while
+        retaining the correct fermionic norm. If no single center is known,
+        use the complete doubled-network contraction instead.
+        """
+        if not self.fermionic:
+            raise TypeError("fermionic center norms require a fermionic TTN.")
+        if center is None:
+            center = self.orthogonality_center
+        if center is None:
+            return self._fermionic_norm_squared()
+        tensor = self.node_tensor(center).copy()
+        singleton = qtn.TensorNetwork([tensor])
+        return (singleton.H & singleton).contract(all, optimize="auto")
+
+    def _fermionic_local_expectation(
+        self, operator, where, *, optimize, normalized,
+    ):
+        """Evaluate a native observable with the complete graded exterior."""
+        inds = [self.site_ind(site) for site in where]
+        operated = qtn.tensor_network_gate_inds(
+            self,
+            operator,
+            inds,
+            contract=False,
+            tags=[],
+            info=None,
+            inplace=False,
+        )
+        numerator = (self.H | operated).contract(
+            all,
+            optimize=optimize,
+        )
+        if not normalized:
+            return numerator
+        denominator = self._fermionic_norm_squared()
+        return numerator / denominator
+
+    def _restore_readout_region(self, region):
+        """Restore a dense readout's tracked canonical region."""
+        if region is None:
+            return
+        if len(region) == 1:
+            self.shift_orthogonality_center(next(iter(region)))
+        else:
+            self.canonize_subtree_(region)
+
+    @property
+    def physical_sectors(self):
+        """Native Symmray physical-sector map when one was supplied."""
+        return self._physical_sectors
+
+    @property
     def root(self):
         """The root node id of the tree."""
         return self._plan.root
+
+    def local_expectation(
+        self, operator, where, *, max_bond=None, optimize="auto",
+        normalized=True, **kwargs,
+    ):
+        """Evaluate a local observable with a backend-specific exact path.
+
+        Dense/nonfermionic trees use the canonical target leaf or minimal
+        Steiner subtree and cancel its ordinary isometric exterior. Native
+        fermionic trees keep the Symmray operator structured and contract the
+        complete doubled tree so graded boundary phases are never discarded.
+
+        ``max_bond`` and extra keyword arguments are accepted for Quimb API
+        compatibility. This exact tree contraction does not truncate.
+        """
+        preserve_gauge = bool(kwargs.pop("_preserve_gauge", True))
+        _ = max_bond, kwargs
+        if isinstance(where, Integral):
+            where = (int(where),)
+        else:
+            where = tuple(int(site) for site in where)
+        if not where or len(set(where)) != len(where):
+            raise ValueError("where must contain distinct tree sites.")
+        if any(site not in self.plan.leaf_of_qubit for site in where):
+            raise ValueError(f"site(s) {where!r} are outside this tree state.")
+
+        if not self.fermionic and preserve_gauge:
+            original_region = self.canonical_region
+            if original_region is None:
+                # An unknown dense gauge cannot be reconstructed after a
+                # target canonicalisation, so perform the readout on an
+                # independent copy. Known regions use the cheaper round-trip
+                # restoration below.
+                work = self.copy()
+                return work.local_expectation(
+                    operator,
+                    where,
+                    max_bond=max_bond,
+                    optimize=optimize,
+                    normalized=normalized,
+                    _preserve_gauge=False,
+                )
+        else:
+            original_region = None
+
+        leaves = [self.plan.leaf_of_qubit[site] for site in where]
+        phys = [self.site_ind(site) for site in where]
+        op = operator
+        if self.symmetry is not None and not _is_symmray_array(op):
+            raise TypeError(
+                "native Symmray TTNs require a native Symmray observable; "
+                "use Fermion.observable(...) or another Symmray operator."
+            )
+        if self.fermionic:
+            expected_rank = 2 * len(where)
+            if len(ar.shape(op)) != expected_rank:
+                raise ValueError(
+                    f"a {len(where)}-site Symmray observable must have "
+                    f"rank {expected_rank}."
+                )
+            return self._fermionic_local_expectation(
+                op,
+                where,
+                optimize=optimize,
+                normalized=normalized,
+            )
+        if len(where) == 1:
+            self.shift_orthogonality_center(leaves[0])
+            tensor = self.node_tensor(leaves[0])
+            physical = phys[0]
+            if not _is_symmray_array(op):
+                dim = int(tensor.shape[tensor.inds.index(physical)])
+                op = ar.do("reshape", op, (dim, dim))
+            elif len(ar.shape(op)) != 2:
+                raise ValueError("a one-site Symmray observable must be rank two.")
+            gate = qtn.Tensor(op, inds=(physical + "*", physical))
+            bra = tensor.H.reindex_({physical: physical + "*"})
+            numerator = qtn.tensor_contract(bra, gate, tensor, output_inds=[])
+            denominator = qtn.tensor_contract(tensor.H, tensor, output_inds=[])
+            result = numerator / denominator if normalized else numerator
+            if preserve_gauge:
+                self._restore_readout_region(original_region)
+            return result
+
+        span = self.steiner_nodes(leaves)
+        if self.orthogonality_center not in span:
+            self.shift_orthogonality_center(leaves[0])
+
+        internal = {
+            self.bond(node, neighbor)
+            for node in span
+            for neighbor in self.neighbors(node)
+            if neighbor in span
+        }
+        ket = qtn.TensorNetwork([
+            self.node_tensor(node).copy() for node in span
+        ])
+        if not _is_symmray_array(op):
+            dims = [
+                int(self.node_tensor(leaf).shape[
+                    self.node_tensor(leaf).inds.index(physical)
+                ])
+                for leaf, physical in zip(leaves, phys)
+            ]
+            op = ar.do("reshape", op, tuple(dims + dims))
+        elif len(ar.shape(op)) != 2 * len(where):
+            raise ValueError(
+                "a multi-site Symmray observable must have one output and "
+                "one input leg per site."
+            )
+        gate = qtn.Tensor(op, inds=[p + "*" for p in phys] + phys)
+        internal_map = {index: qtn.rand_uuid() for index in internal}
+        bra_num = ket.H.reindex({
+            **internal_map,
+            **{physical: physical + "*" for physical in phys},
+        })
+        numerator = (bra_num & gate & ket).contract(
+            output_inds=[], optimize=optimize,
+        )
+        if not normalized:
+            if preserve_gauge:
+                self._restore_readout_region(original_region)
+            return numerator
+        bra_den = ket.H.reindex(internal_map)
+        denominator = (bra_den & ket).contract(
+            output_inds=[], optimize=optimize,
+        )
+        result = numerator / denominator
+        if preserve_gauge:
+            self._restore_readout_region(original_region)
+        return result
 
     @property
     def orthogonality_center(self):
@@ -288,7 +553,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         This is the tree analogue of an MPS canonical centre: when it is a node
         ``c`` every *other* tensor is an isometry whose legs point toward ``c``
         (``absorb="right"`` convention), so the whole state norm collapses onto
-        the single centre tensor.  It is the one-node special case of
+        the single centre tensor under Symmray's graded singleton contraction.
+        It is the one-node special case of
         :attr:`canonical_region`; it is updated in place by
         :meth:`shift_orthogonality_center` and :meth:`canonize_around_node_`,
         and -- being derived from a field declared in :attr:`_EXTRA_PROPS` -- it
@@ -320,8 +586,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         it is a connected node set ``R`` every tensor *outside* ``R`` is an
         isometry whose legs point inward toward ``R`` (``absorb="right"``
         convention), so the entire state norm is carried by the region tensors
-        -- contracting just the region against its conjugate gives the squared
-        norm, exactly as the single centre tensor does for a one-node region.
+        -- contracting just the region against its graded conjugate gives the
+        squared norm, exactly as the single centre tensor does for a one-node
+        region.
         It is updated in place by :meth:`canonize_subtree_` (and its qubit-level
         entry point :meth:`canonize_around_qubits_`) and, being declared in
         :attr:`_EXTRA_PROPS`, survives ``.copy()`` and every ``quimb`` view.
@@ -631,6 +898,77 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
     # -- edge-level canonical / compression helpers ---------------------------
 
+    def _fermionic_canonize_edge_(self, a, b, absorb):
+        """Move a native graded centre across one edge by explicit QR."""
+        if absorb == "right":
+            isometric_node, reduced_node = a, b
+        elif absorb == "left":
+            isometric_node, reduced_node = b, a
+        else:
+            raise ValueError("absorb must be 'right' or 'left'.")
+
+        isometric = self.node_tensor(isometric_node)
+        reduced = self.node_tensor(reduced_node)
+        bond = self.bond(isometric_node, reduced_node)
+        left_inds = [index for index in isometric.inds if index != bond]
+        kept, carry = isometric.split(
+            left_inds=left_inds,
+            right_inds=(bond,),
+            method="qr",
+            absorb="right",
+            cutoff=0.0,
+            get="tensors",
+        )
+        merged = qtn.tensor_contract(carry, reduced)
+        isometric.modify(
+            data=kept.data,
+            inds=kept.inds,
+            left_inds=kept.left_inds,
+        )
+        reduced.modify(
+            data=merged.data,
+            inds=merged.inds,
+            left_inds=None,
+        )
+        return self
+
+    def _fermionic_compress_edge_(
+        self, a, b, *, max_bond, cutoff, absorb,
+    ):
+        """Compress one native graded tree cut by an explicit two-node SVD."""
+        if absorb == "right":
+            isometric_node, reduced_node = a, b
+        elif absorb == "left":
+            isometric_node, reduced_node = b, a
+        else:
+            raise ValueError("absorb must be 'right' or 'left'.")
+
+        isometric = self.node_tensor(isometric_node)
+        reduced = self.node_tensor(reduced_node)
+        bond = self.bond(isometric_node, reduced_node)
+        left_inds = [index for index in isometric.inds if index != bond]
+        theta = qtn.tensor_contract(isometric, reduced)
+        kept, remainder = theta.split(
+            left_inds=left_inds,
+            method="svd",
+            max_bond=max_bond,
+            cutoff=cutoff,
+            absorb="right",
+            get="tensors",
+            bond_ind=bond,
+        )
+        isometric.modify(
+            data=kept.data,
+            inds=kept.inds,
+            left_inds=kept.left_inds,
+        )
+        reduced.modify(
+            data=remainder.data,
+            inds=remainder.inds,
+            left_inds=None,
+        )
+        return self
+
     def _track_edge_center(self, a, b, absorb, *, previous=None):
         """Update the tracked centre after a gauge move across edge ``a -> b``.
 
@@ -651,19 +989,23 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def canonize_edge_(self, a, b, absorb="right"):
         """Canonicalise across the tree edge ``a -> b`` in place.
 
-        Thin wrapper over :meth:`quimb.tensor.TensorNetwork.canonize_between`
-        that resolves node ids to node tags; ``absorb="right"`` leaves node ``a``
-        isometric and pushes the orthogonality centre onto node ``b``.  The
-        tracked :attr:`orthogonality_center` is advanced accordingly.
+        Dense/nonfermionic trees delegate to Quimb's ``canonize_between``.
+        Native fermionic trees use the explicit graded QR helper above.
+        ``absorb="right"`` leaves node ``a`` isometric and pushes the tracked
+        orthogonality centre onto node ``b``.
         """
         previous = self.orthogonality_center
-        self.canonize_between(
-            self.node_tag(a),
-            self.node_tag(b),
-            absorb=absorb,
-            method="qr",
-            cutoff=0.0,
-        )
+        if self.fermionic:
+            self._fermionic_canonize_edge_(a, b, absorb)
+        else:
+            self.canonize_between(
+                self.node_tag(a),
+                self.node_tag(b),
+                absorb=absorb,
+                method="qr",
+                cutoff=0.0,
+            )
+        self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
         return self
 
@@ -671,19 +1013,29 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                        absorb="right"):
         """Compress the tree edge ``a -> b`` in place.
 
-        Thin wrapper over :meth:`quimb.tensor.TensorNetwork.compress_between`
-        (local reduced compression, ``canonize_distance=0``) resolving node ids
-        to node tags.  The tracked :attr:`orthogonality_center` is advanced as
-        for :meth:`canonize_edge_` (compression moves the gauge the same way).
+        Dense/nonfermionic trees delegate to Quimb's ``compress_between``.
+        Native fermionic trees explicitly SVD the complete two-node tensor.
+        The tracked :attr:`orthogonality_center` advances as for
+        :meth:`canonize_edge_`.
         """
         previous = self.orthogonality_center
-        self.compress_between(
-            self.node_tag(a),
-            self.node_tag(b),
-            max_bond=max_bond,
-            cutoff=cutoff,
-            absorb=absorb,
-        )
+        if self.fermionic:
+            self._fermionic_compress_edge_(
+                a,
+                b,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                absorb=absorb,
+            )
+        else:
+            self.compress_between(
+                self.node_tag(a),
+                self.node_tag(b),
+                max_bond=max_bond,
+                cutoff=cutoff,
+                absorb=absorb,
+            )
+        self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
         return self
 
@@ -881,10 +1233,35 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             toward = self._toward_region(nid, region)
             t = self.node_tensor(nid)
             bond = next(iter(qtn.bonds(t, self.node_tensor(toward))))
-            tc = t.H.reindex({bond: bond + "*"})
-            prod = qtn.tensor_contract(t, tc, output_inds=[bond, bond + "*"])
+            if self.fermionic:
+                # A singleton TensorNetwork.H applies the parity phase flips
+                # on all outer legs. The contraction order must also follow
+                # the dual orientation of the open bond, as required by
+                # Symmray's graded matrix product.
+                singleton = qtn.TensorNetwork([t.copy()])
+                tc = next(iter(singleton.H.tensor_map.values()))
+                tc = tc.reindex({bond: bond + "*"})
+                bond_dual = t.data.indices[t.inds.index(bond)].dual
+                if bond_dual:
+                    output_inds = [bond, bond + "*"]
+                    prod = qtn.tensor_contract(t, tc, output_inds=output_inds)
+                else:
+                    output_inds = [bond + "*", bond]
+                    prod = qtn.tensor_contract(tc, t, output_inds=output_inds)
+            else:
+                tc = t.H.reindex({bond: bond + "*"})
+                output_inds = [bond, bond + "*"]
+                prod = qtn.tensor_contract(t, tc, output_inds=output_inds)
             d = int(prod.shape[0])
-            if not np.allclose(ar.to_numpy(prod.data), np.eye(d), atol=tol):
+            data = prod.data
+            # Autoray's generic NumPy conversion deliberately leaves a
+            # Symmray block array intact. Its explicit dense readout is only
+            # used here for this diagnostic, never in a simulation hot path.
+            if hasattr(data, "to_dense"):
+                data = data.to_dense()
+            else:
+                data = ar.to_numpy(data)
+            if not np.allclose(data, np.eye(d), atol=tol):
                 return False
         return True
 
@@ -898,6 +1275,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         positional semantics.
         """
         q = int(q)
+        self._invalidate_norm_cache()
         if q not in self._plan.leaf_of_qubit:
             raise ValueError(f"cap qubit {q} is outside the tree state.")
         if self._plan.n <= 1:
@@ -1127,7 +1505,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     # -- builders -------------------------------------------------------------
 
     @classmethod
-    def from_plan(cls, plan, *, dtype=complex, site_tag_id="I{}",
+    def from_plan(cls, plan, *, dtype=complex, phys_dim=2, site_tag_id="I{}",
                   site_ind_id="k{}", node_tag_id="N{}"):
         """Build the product state ``|0...0>`` on the geometry ``plan``.
 
@@ -1144,7 +1522,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             if leaf:
                 q = plan.qubit_of_leaf[nid]
                 inds.append(site_ind_id.format(q))
-                shape.append(2)
+                shape.append(int(phys_dim))
                 tags.append(site_tag_id.format(q))
             for child in plan.children[nid]:
                 inds.append(_bond_index(nid, child))
@@ -1166,6 +1544,139 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             site_ind_id=site_ind_id,
             node_tag_id=node_tag_id,
         )._with_center(plan.root).validate()
+
+    @classmethod
+    def from_symmray_plan(
+        cls,
+        plan,
+        *,
+        symmetry,
+        physical_sectors,
+        leaf_charges,
+        bond_dim=1,
+        fermionic=False,
+        seed=None,
+        dtype="complex128",
+        site_tag_id="I{}",
+        site_ind_id="k{}",
+        node_tag_id="N{}",
+        subsizes="maximal",
+    ):
+        """Build a native Symmray TTN on ``plan``.
+
+        Symmray supplies the block-sparse / fermionic tensor construction and
+        all subsequent QR/SVD/contraction primitives. This method supplies
+        only the tree geometry: leaf nodes receive physical legs, while
+        internal tree nodes remain virtual tensors with neutral charge.
+        """
+        try:
+            import symmray as sr
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "TreeTensorNetwork.from_symmray_plan requires the optional "
+                "dependency 'symmray'."
+            ) from exc
+
+        bond_dim = int(bond_dim)
+        if bond_dim < 1:
+            raise ValueError("bond_dim must be a positive integer.")
+        leaf_charges = dict(leaf_charges)
+        expected = set(range(plan.n))
+        if set(leaf_charges) != expected:
+            raise ValueError(
+                "leaf_charges must map every qubit label 0 .. n - 1."
+            )
+
+        def zero_charge(value):
+            if isinstance(value, tuple):
+                return tuple(0 for _ in value)
+            return 0
+
+        neutral = zero_charge(next(iter(leaf_charges.values())))
+        edges = [
+            (parent, child)
+            for parent, children in plan.children.items()
+            for child in children
+        ]
+        constructor = (
+            sr.TN_fermionic_from_edges_rand
+            if fermionic
+            else sr.TN_abelian_from_edges_rand
+        )
+
+        if edges:
+            base = constructor(
+                symmetry,
+                edges,
+                bond_dim=bond_dim,
+                phys_dim=None,
+                seed=seed,
+                dtype=dtype,
+                site_tag_id=node_tag_id,
+                site_charge=lambda nid: (
+                    leaf_charges[plan.qubit_of_leaf[nid]]
+                    if plan.is_leaf(nid)
+                    else neutral
+                ),
+                subsizes=subsizes,
+            )
+        else:
+            base = qtn.TensorNetwork()
+
+        for nid in plan.nodes():
+            if edges:
+                tensor = base[node_tag_id.format(nid)]
+                bond_indices = list(tensor.data.indices)
+                bond_duals = list(tensor.data.duals)
+                inds = list(tensor.inds)
+            else:
+                tensor = None
+                bond_indices = []
+                bond_duals = []
+                inds = []
+
+            if plan.is_leaf(nid):
+                q = plan.qubit_of_leaf[nid]
+                physical_index = sr.utils.rand_index(
+                    symmetry,
+                    physical_sectors,
+                    dual=False,
+                    subsizes=subsizes,
+                    seed=None if seed is None else int(seed) + nid,
+                )
+                data = sr.utils.get_rand(
+                    symmetry,
+                    shape=[*bond_indices, physical_index],
+                    duals=[*bond_duals, False],
+                    charge=leaf_charges[q],
+                    fermionic=fermionic,
+                    label=nid,
+                    seed=None if seed is None else int(seed) + nid,
+                    dtype=dtype,
+                    subsizes=subsizes,
+                )
+                tags = (node_tag_id.format(nid), site_tag_id.format(q))
+                inds.append(site_ind_id.format(q))
+                if tensor is None:
+                    base |= qtn.Tensor(data=data, inds=inds, tags=tags)
+                else:
+                    tensor.modify(data=data, inds=inds, tags=tags)
+
+        ttn = cls(
+            base,
+            plan=plan,
+            site_tag_id=site_tag_id,
+            site_ind_id=site_ind_id,
+            node_tag_id=node_tag_id,
+            symmetry=symmetry,
+            fermionic=fermionic,
+            physical_sectors=physical_sectors,
+        )
+        # The generic Symmray constructor creates a valid charge-conserving
+        # tree. Quimb's native block-aware QR establishes the canonical root
+        # and accumulates product-state normalization there as well.
+        ttn.canonize_around_node_(plan.root)
+        return ttn._with_center(plan.root).validate()
 
     @classmethod
     def from_order(cls, order, *, weights=None, structure="quality",

@@ -1,6 +1,6 @@
 ---
 name: tree-optimizer
-description: 'Run, review, debug, benchmark, or extend pepsy.TreeOptimizer -- the rooted tree-tensor-network (TTN) gate-stream circuit simulator of Seitz et al. (Quantum 7, 964, 2023; arXiv:2206.01000). Use when the user asks to replay a circuit on a tree tensor network; build or score a TreeLayoutFinder / TreePlan (entanglement-adapted recursive spectral bisection); handle exact product-state handoff, TTN layout safety, or Torch/CuPy backend compatibility; tune the exact 2q-gate threading + single canonical compression sweep; work on the sibling-leaf fast path, canonical single-/multi-site local_expectation (Steiner subtree), measure/reset, the BLAS thread cap, the canonical-centre tracker, the tid cache, convergence_sweep / bond_report diagnostics, or copy(); or asks why TTN truncation is more accurate than per-hop truncation, how the tree geodesic threading works, or how to add sampling / stream-wired control events. Not for MPS (pepsy.MpsOptimizer -> mps-optimizer skill), MERA (qmera-energy-optimizer), stabilizer TN (stabilizer-tensor-networks), or BP.'
+description: 'Run, review, debug, benchmark, or extend pepsy.TreeOptimizer -- the rooted tree-tensor-network (TTN) gate-stream circuit simulator of Seitz et al. (Quantum 7, 964, 2023; arXiv:2206.01000). Use when the user asks to replay a circuit on a tree tensor network; build or score a TreeLayoutFinder / TreePlan (entanglement-adapted recursive spectral bisection); handle exact product-state handoff, TTN layout safety, or Torch/CuPy backend compatibility; tune the exact 2q-gate threading + single canonical compression sweep; work on TreeTensorNetwork canonical single-/multi-site local_expectation (Steiner subtree), measurement/reset, independent or coalesced noisy trajectories, the BLAS thread cap, the canonical-centre tracker, the tid cache, convergence_sweep / bond_report diagnostics, or copy(); or asks why TTN truncation is more accurate than per-hop truncation, how the tree geodesic threading works, or how to add sampling / stream-wired control events. Not for MPS (pepsy.MpsOptimizer -> mps-optimizer skill), MERA (qmera-energy-optimizer), stabilizer TN (stabilizer-tensor-networks), or BP.'
 ---
 
 # Tree Optimizer in pepsy
@@ -80,11 +80,13 @@ to `TreeOptimizer`.
 `quimb.tensor.TensorNetworkGenVector` (import from `quimb.tensor`, **not** the
 deprecated `tensor_arbgeom`). It owns a `TreePlan` plus the node/site/index
 naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
-`compress_between`, `gate_inds`, `local_expectation`, `to_dense`, `copy`) work
-directly.
+  `compress_between`, `gate_inds`, `to_dense`, `copy`) work directly. The
+  state overrides `local_expectation` with a canonical Steiner-subtree
+  contraction that also supports native Symmray observables.
 
 - `_EXTRA_PROPS = ("_sites", "_site_tag_id", "_site_ind_id", "_plan",
-  "_node_tag_id", "_canonical_region")` -- these are copied on `.copy()`/
+  "_node_tag_id", "_canonical_region", "_symmetry", "_fermionic",
+  "_physical_sectors")` -- these are copied on `.copy()`/
   every quimb view. The `__init__` copy-branch guard
   `if isinstance(ts, TensorNetwork): super().__init__(ts, **o); return` lets
   the base copy the extra props without the fresh-construction defaults
@@ -92,8 +94,10 @@ directly.
 - Each leaf tensor carries **both** the structural node tag `N{nid}` and the
   quimb site tag `I{q}` plus physical index `k{q}`; internal nodes carry only
   `N{nid}`. So quimb sees the leaves as the `nsites` sites and internal nodes as
-  ancillary bond carriers -- `local_expectation(G, where=[q], max_bond=None,
-  optimize="auto")` works (emits a cosmetic "not a compressed tree" warning).
+  ancillary bond carriers --
+  `ttn.local_expectation(G, where=[q], max_bond=None, optimize="auto")` uses
+  the tree's canonical contraction for dense states and an exact complete
+  doubled-tree contraction for native fermionic states.
 - `node_tid(nid)` is a self-healing tid cache kept in `__dict__` (not
   `_EXTRA_PROPS`) so a copy starts with a fresh, independent cache.
 - Builders: `from_plan(plan)` (product `|0...0>`), `from_order(order,
@@ -161,9 +165,12 @@ telescopes to identity between bra and ket.
   the leaf, no bond growth, no centre move). Non-unitary 1q operators
   (projectors in `measure`) keep the centre on that leaf but require a
   subsequent `normalize()`.
-- `norm()` uses the single centre tensor when `center is not None` (one-site
-  canonical norm); only the unknown-centre fallback does a full doubled-tree
-  contraction. Keep this fast path.
+- `norm()` uses the single centre tensor for dense/nonfermionic states when
+  `center is not None`; only their unknown-centre fallback contracts the full
+  doubled tree. Native fermionic states use a one-tensor
+  `TensorNetwork.H` contraction when a centre is known, so Symmray applies the
+  graded outer-leg phase flips; unknown-centre fermionic states use the exact
+  complete doubled-network contraction. Keep the backend dispatch separate.
 - Any operation that moves/rebuilds the centre must update the tracked centre
   (via `self.center = ...`, i.e. `ttn.orthogonality_center`).
 
@@ -214,41 +221,49 @@ absorb, canonize_distance=0, ...)`; **`canonize=` is NOT a valid kwarg** (it is
 forwarded to the SVD and raises `TypeError`). Unique `rand_uuid()` bonds avoid
 "index appears more than twice" errors during threading.
 
-### Sibling-leaf fast path (`_apply_2q_siblings`)
+Native fermionic trees take an isolated version of this kernel:
+`_fermionic_thread_hop` explicitly calls the native Symmray QR and carries its
+graded factor, while `TreeTensorNetwork._fermionic_compress_edge_` forms the
+two-node tensor and performs the native block SVD. Dense/nonfermionic trees
+retain the generic Quimb edge wrappers.
+
+### Sibling-leaf fast path (`_apply_2q_sibling_factors`)
 
 When `plan.parent[la] == plan.parent[lb]` the two leaves meet at a shared
-parent, so no threading is needed. Move the centre to the parent, contract the
-three tensors into one blob, apply the gate, and re-split by two truncating
-SVDs (`absorb="right"` -> the two leaf factors are isometric, the parent is the
-new centre). Both new bonds keep their canonical `_tb...` names via `bond_ind=`.
-This is the common case in a good layout and avoids the QR hops and double-bond
-fusion. Leaves are never directly bonded (both bond only to the parent), so the
-correlation flows through the parent blob -- this is exact up to the truncation.
+parent, so no threading is needed. Both direct-SVD and Quimb-MPO factors are
+absorbed into their leaves, then the two leaves and parent are contracted into
+one blob and re-split by two truncating SVDs (`absorb="right"` -> the two leaf
+factors are isometric, the parent is the new centre). Both new bonds keep their
+canonical `_tb...` names via `bond_ind=`. This is the common case in a good
+layout and avoids QR hops and double-bond fusion. Leaves are never directly
+bonded (both bond only to the parent), so the correlation flows through the
+parent blob -- this is exact up to the truncation.
 
 ## Multi-qubit / sub-MPO application (`apply_subtree_operator`)
 
 `apply_subtree_operator(op, where, *, max_bond=None, cutoff=None,
 renormalize=False)` applies a general operator on `k >= 1` qubits in one shot --
 a `k`-qubit gate, a multi-site **non-unitary / Kraus** operator, or a whole
-**Trotter block**. It is the arbitrary-`k` generalisation of `_apply_2q_siblings`
-to the whole spanning subtree, the tree analogue of a sub-MPO applied over a
+**Trotter block**. It extends the two-factor path-thread kernel to the whole
+spanning subtree: the tree analogue of a sub-MPO applied over a
 covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductState`
 -only; the tree base `TensorNetworkGenVector` has no such method).
 
 1. `snodes = _steiner_nodes(leaves)` -- minimal connected subtree spanning the
    target leaves.
 2. Move the centre onto a target leaf (`_move_center(leaves[0])`, incremental)
-   so the **whole exterior is isometric toward the subtree** -- each local
-   truncation then measures true state error.
+   so the **whole exterior is isometric toward the subtree**.
 3. Factor `op` into an exact tree-MPO on the same Steiner tree by packing each
    `(output,input)` physical pair into a dimension-four leg and applying
    leaf-to-hub SVDs.
 4. Absorb the tree-MPO into copied local state tensors. For each
-   `_peel_order(snodes)` edge, split the child message while retaining all
+   `_peel_order(snodes)` edge, QR-split the child message while retaining all
    physical and exterior state legs, then contract its new state bond into the
    parent together with the old state/operator bonds. No dense state tensor for
-   the whole Steiner subtree is formed; the last node is the hub / new centre.
-5. `renormalize=True` renormalises afterwards (for Kraus/projection).
+   the whole Steiner subtree is formed; the last node is the hub.
+5. Recover the hub centre by QR, then make one depth-first canonical SVD sweep:
+   every affected tree edge is truncated once, after the complete operator has
+   arrived. `renormalize=True` renormalises afterwards (for Kraus/projection).
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator
@@ -259,26 +274,28 @@ can be sent here explicitly).
 
 ### Native streamed sub-MPOs
 
-An explicit `("submpo", mpo, where)` stream event first attempts a native
-leaf-to-hub MPO message sweep. Quimb MPO payloads expose their active site
-tags, tensor map, and operator bond indices, so their virtual bonds can be
-carried through the TTN without calling `mpo.to_dense()`. `estimate_bonds()`
-uses the product of MPO bond dimensions crossing a cut as a conservative
-operator-Schmidt bound. Payloads without that interface use the dense
-`to_dense()` fallback and remain subject to `max_operator_qubits`.
+An explicit `("submpo", mpo, where)` stream event first attempts the native
+leaf-to-hub QR-routing sweep. Quimb MPO payloads expose their active site tags,
+tensor map, and operator bond indices, so their virtual bonds can be carried
+through the TTN without calling `mpo.to_dense()`, then compressed once over the
+affected subtree. `estimate_bonds()` uses the product of MPO bond dimensions
+crossing a cut as a conservative operator-Schmidt bound. Payloads without that
+interface use the dense `to_dense()` fallback and remain subject to
+`max_operator_qubits`.
 
 ## Readout
 
-- `local_expectation(op, where)`: single-site contracts only the centre tensor
-  with `op` (canonical). **Multi-site contracts only the minimal Steiner
-  subtree spanning the target leaves** (`_steiner_nodes` = union of
-  `node_path(leaves[0], leaf)`): move the centre inside that subtree, rename the
-  subtree-**internal** bonds in the bra (fresh `rand_uuid`) while keeping the
-  **boundary** bonds shared between bra and ket. Sharing a boundary bond name
-  implements the isometric-exterior identity `sum_b ket[..b] bra[..b] =
-  sum_{b,b'} ket delta(b,b') bra`. In a binary tree the leaf-leaf path passes
-  only through internal (physical-index-free) nodes, so the subtree's leaves are
-  exactly the targets. Cost scales with operator spread, not `n`.
+- `TreeTensorNetwork.local_expectation(op, where)`: dense/nonfermionic
+  single-site readout contracts the centre tensor; dense multi-site readout
+  contracts the minimal Steiner subtree. Native fermionic readout instead
+  inserts the Symmray operator with `contract=False` and contracts the complete
+  doubled tree. This preserves graded boundary phases and deliberately avoids
+  the ordinary isometric-exterior shortcut. Its `max_bond` argument is
+  compatibility-only: the exact native contraction is not truncated. Dense
+  readout restores a known canonical centre/region and uses a temporary copy
+  when the gauge is unknown; native readout leaves the gauge untouched.
+  Normalized native readout reuses a state-versioned norm denominator until a
+  mutation invalidates it.
 - `measure(q, outcome=None)`: move centre to the leaf, read exact Born
   probabilities from that one tensor (`w_i = sum_bond |t[i,bond]|^2`,
   normalise), sample via `self.rng.choice` or force `outcome`, project with a
@@ -298,8 +315,10 @@ operator-Schmidt bound. Payloads without that interface use the dense
 - `to_dense()` returns a host NumPy statevector in `k0, k1, ..., k(n-1)` order;
   it is a readout boundary, not evidence that a Torch/CuPy live state moved.
 - `run(progbar=True)` shows a tqdm replay bar with one-/two-/multi-qubit
-  counts, current bond usage, norm, and cumulative norm-based `Icum` for
-  unitary events; control/non-unitary events reset that proxy.
+  counts, current bond usage, norm, and a norm-based truncation proxy. Dense and
+  native fermionic replay use the same `1 - (norm / reference_norm)^2` proxy;
+  the reference resets after control or explicitly non-unitary events. This is
+  display-only, not a substitute for truncation history.
 - `bond_report()` / `estimate_bonds()` / `max_bond()` /
   `convergence_sweep(...)` are diagnostics. `estimate_bonds()` is the
   non-mutating Eq. (4) dry run: it multiplies operator-Schmidt ranks on each
@@ -316,16 +335,40 @@ operator-Schmidt bound. Payloads without that interface use the dense
   `2**n <= dense_cap`) and reference-free `max_drift`.
 - `record_history=False` disables retained per-edge and per-update history for
   long replays. `TreeTensorNetwork` invalidates its canonical-region metadata
-  after direct Quimb mutators; use `invalidate_canonical_form()` after raw
-  tensor edits. The optimizer's state-aware wrappers restore a known centre
-  only for operations proven to preserve canonicality.
+  and native norm cache after direct Quimb mutators; use
+  `invalidate_canonical_form()` after raw tensor edits. The optimizer's
+  state-aware wrappers restore a known centre only for operations proven to
+  preserve canonicality.
 - `truncation_report()` returns the per-edge compression / split history with
   before/after dimensions. `track_truncation=True` additionally probes the
   untruncated local singular spectrum and records absolute discarded weight and
-  relative discarded fraction. Leave it false on performance runs: the
-  spectrum probe adds one local SVD per truncation edge. The report's
-  gate-level `updates` group edge events by support and include cumulative
-  relative loss, analogous to the MPS infidelity trace.
+  relative discarded fraction; native Symmray reports use the actually kept
+  charge-block spectrum. Leave it false on performance runs: the spectrum
+  probe adds local SVD work per truncation edge. The report's gate-level
+  `updates` group edge events by support and include cumulative relative loss,
+  analogous to the MPS infidelity trace.
+
+## Noisy trajectory replay
+
+`run_trajectory_shots` and `run_coalesced_trajectory_shots` support
+`TreeOptimizer` factories as well as MPS and stabilizer-TN factories. Use them
+for trajectory simulation without forming a density matrix:
+
+- Independent replay samples random-unitary mixtures, Pauli/depolarizing
+  channels, and state-dependent Kraus channels. For a Kraus event, the runner
+  applies each branch to a copied TTN, obtains its squared norm, samples the
+  conditional probability, then applies and normalizes the selected branch on
+  the live TTN.
+- Coalesced replay shares deterministic prefixes and branches exact
+  mid-circuit `measure`, `reset`, and `measure_reset` events. Tree measurement
+  probabilities come from `TreeOptimizer.expectation_pauli`; each resulting
+  leaf remains normalized.
+- The runner converts generated dense matrices through the live state backend.
+  When constructing a direct Tree stream, use matrix-valued gate payloads such
+  as `pepsy.h()`; textual MPS gate aliases are not normalized by the Tree gate
+  parser.
+- Regression coverage lives in `tests/test_trajectory_noise.py`, including
+  Tree state-dependent Kraus sampling and coalesced measurement branching.
 
 ## Performance / stability (do not regress)
 
@@ -433,9 +476,12 @@ The *only* binary-specific piece was construction. Controls:
 ## Roadmap / not yet implemented
 
 - Chain-only MPS execution modes (`svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`,
-  and `mix`) are not meaningful on arbitrary tree geometry. Opaque sub-MPO
-  payloads still use the dense recursive fallback; native replay requires the
-  Quimb MPO site interface described above.
+  and `mix`) are not meaningful on arbitrary tree geometry. Native structured
+  sub-MPO payloads are routed through the Quimb MPO site interface; only
+  payloads that do not expose that interface use the guarded dense fallback.
+  Pauli and computational-basis measurement helpers are dense two-level qubit
+  APIs and intentionally reject native fermionic TTNs, whose local observables
+  must be supplied through the fermion/Symmray model layer.
 
 ## Validation
 
@@ -461,3 +507,9 @@ the state-handoff/backend cases: exact product TTN/MPS mounting, rejected
 entangled relayouts, native Torch controls/readout, and mixed-backend rejection.
 Add a regression test for every new behaviour and prefer `structure="balanced"`
 plans when a test needs deterministic sibling relationships.
+
+For noisy trajectory changes, also run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 pytest -q tests/test_trajectory_noise.py -k 'not benchmark'
+```

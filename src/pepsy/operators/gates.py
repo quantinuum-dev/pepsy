@@ -75,6 +75,47 @@ def _stop_gradient(x):
         return x
 
 
+def _is_block_sparse_array(value):
+    """Return whether ``value`` looks like a Symmray block-sparse array."""
+    return hasattr(value, "blocks") and hasattr(value, "indices")
+
+
+def _has_block_sparse_data(tn):
+    """Return whether any tensor in ``tn`` stores block-sparse data."""
+    return any(
+        _is_block_sparse_array(tensor.data)
+        for tensor in getattr(tn, "tensors", ())
+    )
+
+
+def _select_simple_update_contract(tn, gate, contract):
+    """Select a split strategy that preserves block-sparse fusion metadata.
+
+    The reduced two-site split path is often faster and works for many cases,
+    including numerous Symmray workloads. However, some block-sparse MPS/PEPS
+    setups have shown fusion-metadata edge cases with reduced splitting. The
+    full ``split`` path is slower but is used as a conservative fallback for
+    Symmray block-sparse data. Dense tensor data keeps the faster reduced path
+    by default.
+    """
+    if contract is not None:
+        contract = str(contract).strip().lower()
+        if contract == "auto":
+            contract = None
+        elif contract not in {"split", "reduce-split"}:
+            raise ValueError(
+                "gate_simple() contract must be 'auto', 'split', or "
+                "'reduce-split'."
+            )
+
+    if contract is None:
+        if _has_block_sparse_data(tn) or _is_block_sparse_array(gate):
+            return "split"
+        return "reduce-split"
+
+    return contract
+
+
 def rx(theta):
     """Return a one-qubit RX gate for angle ``theta``.
 
@@ -1268,7 +1309,15 @@ def _symmray_dense_index_map_from_chargemap(chargemap):
     return index_map
 
 
-def _symmray_dense_gate_from_site_maps(tn, gate, output_sites, input_sites, ind_id):
+def _symmray_dense_gate_from_site_maps(
+    tn,
+    gate,
+    output_sites,
+    input_sites,
+    ind_id,
+    *,
+    inferred_converter=None,
+):
     """Convert a dense site gate to a Symmray array using live site sectors."""
     sample = _symmray_sample_data_from_tn(tn)
     if sample is None:
@@ -1292,16 +1341,38 @@ def _symmray_dense_gate_from_site_maps(tn, gate, output_sites, input_sites, ind_
         if symmetry is not None:
             kwargs["symmetry"] = symmetry
 
+    # Symmray product symmetries (for example ``U1U1`` and ``Z2Z2``) use
+    # tuple-valued charges.  ``charge=0`` is only valid for scalar symmetries;
+    # use the neutral charge with the same shape as the live physical sectors.
+    sample_charge = next(iter(index_maps[0].values()), 0)
+    zero_charge = (
+        tuple(0 for _ in sample_charge)
+        if isinstance(sample_charge, tuple)
+        else 0
+    )
+
+    dense_gate = np.asarray(gate)
+    if inferred_converter is not None:
+        dense_gate = inferred_converter(dense_gate)
+
     return array_cls.from_dense(
-        np.asarray(gate),
+        dense_gate,
         index_maps=tuple(index_maps),
         duals=(False,) * nout + (True,) * nin,
-        charge=0,
+        charge=zero_charge,
         **kwargs,
     )
 
 
-def _symmray_swap_gate_for_site_pair(tn, site_a, site_b, *, ind_id=None, dtype="complex128"):
+def _symmray_swap_gate_for_site_pair(
+    tn,
+    site_a,
+    site_b,
+    *,
+    ind_id=None,
+    dtype="complex128",
+    inferred_converter=None,
+):
     """Return a Symmray block-sparse SWAP for two live physical site legs."""
     sample = _symmray_sample_data_from_tn(tn)
     if sample is None:
@@ -1316,6 +1387,7 @@ def _symmray_swap_gate_for_site_pair(tn, site_a, site_b, *, ind_id=None, dtype="
         output_sites=(site_b, site_a),
         input_sites=(site_a, site_b),
         ind_id=ind_id,
+        inferred_converter=inferred_converter,
     )
 
 
@@ -1345,6 +1417,7 @@ def _swap_gate_for_site_pair(
         site_b,
         ind_id=ind_id,
         dtype=dtype,
+        inferred_converter=inferred_converter,
     )
     if symmray_swap is not None:
         return symmray_swap
@@ -1911,6 +1984,7 @@ def gate_simple(
     max_bond=None,
     cutoff=1e-12,
     cutoff_mode="rsum2",
+    contract=None,
     sequence="auto",
     path_canonize=False,
     path_canonize_distance=1,
@@ -1970,6 +2044,12 @@ def gate_simple(
     cutoff_mode : str, optional
         Cutoff mode passed to ``gate_simple_`` (e.g. ``'rsum2'``, ``'rel'``).
         Default ``'rsum2'``.
+    contract : {None, "auto", "split", "reduce-split"}, optional
+        Two-site split strategy passed to Quimb. The default ``None``/``"auto"``
+        selects ``"split"`` as a conservative fallback for block-sparse
+        Symmray data and ``"reduce-split"`` for dense data. Explicit
+        ``contract="reduce-split"`` remains supported for block-sparse runs
+        when that path is validated for a workload.
     sequence : object, optional
         Long-range routing preference. Defaults to ``"auto"``, which chooses a
         shortest 2D/3D path with the smallest current bond-dimension bottleneck.
@@ -1998,14 +2078,20 @@ def gate_simple(
     )
     which_default = _normalize_gate_which(which)
 
-    gate_opts = {
+    gate_opts_base = {
         "cutoff": cutoff,
         "cutoff_mode": cutoff_mode,
     }
     if max_bond is not None:
-        gate_opts["max_bond"] = int(max_bond)
+        gate_opts_base["max_bond"] = int(max_bond)
 
     for gate_payload, where_payload, which_payload in entries:
+        gate_opts = dict(gate_opts_base)
+        gate_opts["contract"] = _select_simple_update_contract(
+            tn_work,
+            gate_payload,
+            contract,
+        )
         if _is_explicit_index_where(where_payload):
             raise ValueError(
                 "gate_simple() requires lattice site coordinates, not explicit "
@@ -2363,7 +2449,11 @@ def _gate_simple_one_with_current_site_ind_id(
     # Non-adjacent: route through a SWAP chain. Each SWAP is built from the
     # live physical dimensions because routed mixed-dimensional sites exchange
     # their physical index sizes as they move along the path.
-    backend_sample = resolve_backend_sample_data_from_tn(tn_work)
+    symmray_sample = _symmray_sample_data_from_tn(tn_work)
+    if symmray_sample is not None:
+        backend_sample = next(iter(symmray_sample.blocks.values()), None)
+    else:
+        backend_sample = resolve_backend_sample_data_from_tn(tn_work)
     inferred_converter = infer_backend_converter_from_sample(
         backend_sample,
         cast_complex_to_real=True,

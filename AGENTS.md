@@ -124,6 +124,13 @@ At the start of a new task:
 - Layout is fixed before replay. Never rewrite a live tree during optimization;
   `refine="greedy"` and Nevergrad are bounded pre-simulation leaf-label searches
   that retain the parent/child topology.
+- `TreeOptimizer` supports the shared noisy-trajectory runner. Independent
+  replay handles random-unitary mixtures, depolarizing channels, and
+  state-dependent Kraus channels by evaluating branch norms on copied TTNs;
+  selected branches are normalized before replay continues. Coalesced replay
+  branches `measure`, `reset`, and `measure_reset` through
+  `expectation_pauli`. Use matrix-valued gates such as `pepsy.h()` in direct
+  Tree streams; textual MPS gate aliases are not normalized by the Tree parser.
 
 ### Stabilizer tensor-network workflow
 

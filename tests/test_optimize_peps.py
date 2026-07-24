@@ -54,21 +54,33 @@ class _FakeSymmrayArray:
     shape = (2, 2)
     dtype = "complex128"
 
+    def __init__(self, backend="torch"):
+        self.backend = backend
+
 
 _FakeSymmrayArray.__module__ = "symmray.fake"
 
 
 class _FakeTensor:
-    def __init__(self):
-        self.data = _FakeSymmrayArray()
+    def __init__(self, backend="torch"):
+        self.data = _FakeSymmrayArray(backend=backend)
 
 
 class SymmrayDummyState(DummyState):
     """Dummy state carrying Symmray-looking tensor data."""
 
-    def __init__(self, bond=1, name="state"):
+    def __init__(self, bond=1, name="state", backend="torch"):
         super().__init__(bond=bond, name=name)
-        self.tensor_map = {"site": _FakeTensor()}
+        self.backend = backend
+        self.tensor_map = {"site": _FakeTensor(backend=backend)}
+
+    def copy(self):
+        other = type(self)(self.bond, f"{self.name}.copy", backend=self.backend)
+        other.applied = list(self.applied)
+        other.normalized = self.normalized
+        other.normalize_kwargs = [dict(opts) for opts in self.normalize_kwargs]
+        other.mangled = self.mangled
+        return other
 
 
 def _install_fake_gate(monkeypatch):
@@ -214,6 +226,27 @@ def test_peps_optimizer_symmray_defaults_to_quimb_mps_boundaries(monkeypatch):
     assert norm_calls[0][1]["balance_bonds"] is False
     assert infidelity_calls[0]["method"] == "mps"
     assert infidelity_calls[0]["mode_"] == "mps"
+
+
+def test_peps_optimizer_rejects_non_torch_symmray_input():
+    """Symmray PEPS cleanup is deliberately Torch/autograd-only."""
+    with pytest.raises(TypeError, match="Torch-backed Symmray"):
+        PepsOptimizer(
+            SymmrayDummyState(bond=1, backend="numpy"),
+            [],
+            chi=3,
+            normalize_initial=False,
+        )
+
+
+def test_peps_optimizer_rejects_mixed_symmray_and_dense_inputs():
+    """A malformed gate target must not silently drop Symmray structure."""
+    with pytest.raises(TypeError, match="do not mix Symmray and dense"):
+        PepsOptimizer._require_torch_symmray_backend(
+            SymmrayDummyState(bond=1),
+            DummyState(bond=1),
+            role="state and target",
+        )
 
 
 def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
@@ -954,6 +987,8 @@ def test_peps_optimizer_symmray_sweep_uses_quimb_mps_boundaries(monkeypatch):
     assert captured["kwargs"]["normalize_kwargs"]["mode_"] == "mps"
     assert captured["kwargs"]["normalize_kwargs"]["balance_bonds"] is False
     assert captured["optimize_kwargs"]["env_n_iter"] == 10
+    assert captured["optimize_kwargs"]["optimizer"] == "nlopt"
+    assert captured["optimize_kwargs"]["optimizer_options"]["algorithm"] == "LD_LBFGS"
 
 
 def test_peps_optimizer_explicit_quimb_boundary_engine_forwards_options(monkeypatch):

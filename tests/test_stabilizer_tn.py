@@ -512,29 +512,30 @@ def test_simulator_truncation_caps_bond_and_tracks_infidelity():
     )
 
 
-def test_norm_infidelity_excludes_nonunitary_segments():
+def test_nonunitary_dense_gate_reports_gdagger_g_infidelity():
+    """Non-unitary compression is normalized by the exact G-dagger-G norm."""
+    gate = np.diag([1.0, 1.0, 1.0, 0.2]).astype(complex)
     sim = MpsStabOptimizer(
         2, chi=1, track_infidelity=True, exact_cooling=False
     )
-    sim.apply([(_I + 0.2 * _X, 0)])
-    assert sim.infidelities == []
-
-    # A later unitary cannot interpret norm change from the arbitrary map as
-    # truncation loss, so tracking remains unavailable for this segment.
-    sim.apply([("rxx", 0.8, 0, 1)])
-    assert sim.infidelities == []
-
-    # Projection restores a normalized baseline without itself reporting a
-    # metric. Subsequent unitary compression can be tracked again.
-    sim.measure("Z", 0, outcome=+1)
-    assert sim.infidelities == []
-    assert sim.norm_events[-1]["valid"] is False
-    assert sim.norm_diagnostics()["completed_segments"] == 0
-    sim.apply([("rxx", 0.8, 0, 1)])
-    assert len(sim.infidelities) == 1
-    assert sim.infidelities[-1] == pytest.approx(
-        1.0 - sim.norm() ** 2, abs=1e-10
+    sim.apply([("h", 0), ("h", 1)])
+    target_norm = np.linalg.norm(gate @ sim.to_statevector())
+    assert sim._dense_gate_target_norm(gate, (0, 1)) == pytest.approx(
+        target_norm, abs=1e-10
     )
+    sim.apply([(gate, (0, 1))])
+
+    expected = 1.0 - (sim.norm() / target_norm) ** 2
+    assert len(sim.infidelities) == 1
+    assert sim.infidelities[-1] == pytest.approx(expected, abs=1e-10)
+    assert sim.norm_diagnostics()["infidelity"] == pytest.approx(expected, abs=1e-10)
+    assert sim.norm_diagnostics()["current_valid"] is False
+
+    # Measurement restores a normalized physical state without losing the
+    # preceding non-unitary compression diagnostic.
+    sim.measure("Z", 0, outcome=+1)
+    assert sim.norm() == pytest.approx(1.0, abs=1e-10)
+    assert sim.norm_diagnostics()["infidelity"] == pytest.approx(expected, abs=1e-10)
 
 
 def test_norm_events_close_segment_before_measurement_normalizes_after():
@@ -597,6 +598,11 @@ def test_norm_events_close_segment_before_measurement_normalizes_after():
     assert diagnostics["norm_infidelity"] == pytest.approx(
         1.0 - expected_total_survival
     )
+    assert diagnostics["infidelity"] == pytest.approx(
+        1.0 - expected_total_survival
+    )
+    assert diagnostics["fidelity"] == pytest.approx(expected_total_survival)
+    assert sim.get_infidelities() is sim.infidelities
     assert diagnostics["norm"] == pytest.approx(expected_total_survival ** 0.5)
     assert diagnostics["geometric_mean_norm"] == pytest.approx(
         expected_total_survival ** 0.5
@@ -685,12 +691,12 @@ def test_norm_progress_reports_entry_part_and_norm_infidelity(monkeypatch):
         "measurement",
     ]
     last = progress.postfix_calls[-1]
-    assert sorted(last) == ["norm_infidelity", "part"]
-    assert last["norm_infidelity"] == (
-        "n/a"
-        if sim.norm_diagnostics()["norm_infidelity"] is None
-        else f"{sim.norm_diagnostics()['norm_infidelity']:.2e}"
+    assert sorted(last) == ["infidelity", "norm_infidelity", "part"]
+    expected = sim._format_progress_infidelity(
+        sim.norm_diagnostics()["infidelity"]
     )
+    assert last["infidelity"] == expected
+    assert last["norm_infidelity"] == expected
 
 
 def test_simulator_two_qubit_nonclifford_matrix_supported():

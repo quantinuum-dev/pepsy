@@ -63,6 +63,21 @@ def test_mps_energy_loss_calls_exact_local_expectation_with_expected_options():
     assert kwargs["progbar"] is True
 
 
+def test_mps_energy_accepts_explicit_terms_keyword():
+    """The constructor should expose local terms without overloading `hamiltonian`."""
+    state = _FakeMps(value=4.0)
+    terms = {"edge": object()}
+
+    opt = MpsEnergyOptimizer(state, terms=terms, energy_per_site=False)
+
+    assert opt.hamiltonian is terms
+    assert opt.terms is terms
+    assert opt.energy().energy == pytest.approx(4.0)
+
+    with pytest.raises(TypeError, match="either hamiltonian or terms"):
+        MpsEnergyOptimizer(state, terms, terms=terms)
+
+
 def test_mps_energy_compute_kwargs_override_direct_progbar():
     """compute_kwargs should still be able to override the convenience flag."""
     state = _FakeMps()

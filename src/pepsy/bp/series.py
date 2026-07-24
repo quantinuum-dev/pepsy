@@ -2,8 +2,9 @@
 
 This module implements the ``P + Q`` expansion of
 
-    G. Park, J. Gray, and G. K.-L. Chan, *Loop Series Expansions for Tensor
-    Networks*, Phys. Rev. Research 7, 013123 (2025), arXiv:2409.03108.
+    G. Evenbly, N. Pancotti, A. Milsted, J. Gray, and G. K.-L. Chan, *Loop
+    series expansions for tensor networks*, Phys. Rev. Research 8, 013245
+    (2026), arXiv:2409.03108.
 
 It is deliberately separate from :mod:`pepsy.bp.cluster`.  A loop-cluster
 expansion is indexed by tensor regions and inclusion--exclusion counting

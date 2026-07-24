@@ -1218,6 +1218,49 @@ def test_peps_normalize_can_skip_bond_balancing(monkeypatch):
     assert ket.balanced is False
 
 
+def test_peps_normalize_skips_bond_balancing_for_symmray(monkeypatch):
+    """Symmray normalization must not invoke Quimb's unsupported balancer."""
+
+    class _SymmrayLikeData:
+        blocks = {"q0": object()}
+
+        def apply_to_arrays(self, fn):
+            _ = fn
+
+    class _Tensor:
+        data = _SymmrayLikeData()
+
+    class _Ket:
+        tensor_map = {"I0,0": _Tensor()}
+
+        def __init__(self):
+            self.divisor = None
+
+        def __itruediv__(self, value):
+            self.divisor = value
+            return self
+
+        def balance_bonds_(self):
+            raise AssertionError("Symmray normalization should not balance bonds.")
+
+    class _Norm:
+        def contract_boundary(self, **kwargs):
+            _ = kwargs
+            return 16.0
+
+    def fake_build_bra_ket(ket=None, *, bra=None):
+        assert bra is None
+        return ket, _Norm()
+
+    monkeypatch.setattr(pepsy.boundary.metrics, "build_bra_ket", fake_build_bra_ket)
+
+    ket = _Ket()
+    old_norm = pepsy.peps_normalize(ket, chi=7, method="mps")
+
+    assert old_norm == 16.0
+    assert ket.divisor == 4.0
+
+
 def test_peps_normalize_retries_stripped_when_full_cost_is_nonfinite(monkeypatch):
     """normalize should avoid dividing the state by a non-finite full norm."""
 

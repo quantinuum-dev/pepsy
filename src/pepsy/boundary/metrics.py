@@ -67,6 +67,25 @@ def _warn_nonstandard_physical_outer_inds(tn, role):
         )
 
 
+def _uses_symmray_arrays(tn):
+    """Return whether a tensor network stores Symmray block-sparse arrays."""
+    tensor_map = getattr(tn, "tensor_map", None)
+    tensors = tensor_map.values() if tensor_map else tn
+    try:
+        iterator = iter(tensors)
+    except TypeError:
+        iterator = ()
+    for tensor in iterator:
+        data = getattr(tensor, "data", None)
+        if data is None:
+            continue
+        if type(data).__module__.split(".", maxsplit=1)[0] == "symmray":
+            return True
+        if hasattr(data, "blocks") and hasattr(data, "apply_to_arrays"):
+            return True
+    return False
+
+
 def _to_python_scalar(value):
     """Convert backend scalar-like objects (torch/numpy) to python scalar."""
     obj = value
@@ -921,7 +940,9 @@ def peps_normalize(
         stripped representation before mutating ``p`` and emits a
         ``RuntimeWarning``.
     balance_bonds : bool, default=True
-        If ``True``, call ``balance_bonds_()`` after rescaling the state.
+        If ``True``, call ``balance_bonds_()`` after rescaling a dense state.
+        Symmray block-sparse states always skip this step because Quimb's bond
+        balancer currently needs a contraction unsupported by Symmray.
 
     Returns
     -------
@@ -979,7 +1000,7 @@ def peps_normalize(
     _ensure_finite_norm_value(cost)
     old_norm = _format_scaled_output(cost, strip_exponent=strip_exponent)
     _normalize_by_scaled_norm(ket_tagged, cost)
-    if balance_bonds:
+    if balance_bonds and not _uses_symmray_arrays(ket_tagged):
         ket_tagged.balance_bonds_()
     return old_norm
 

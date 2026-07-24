@@ -784,7 +784,10 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     ``allow_encoding_conversion=True`` to explicitly request that conversion.
     Hamiltonians can be supplied as a ``qtn.MatrixProductOperator``, a
     ``qtn.LocalHam1D``-like object with ``.terms``, a Pepsy symmetric
-    Hamiltonian, or a plain local-term mapping.
+    Hamiltonian, or a plain local-term mapping. Use the explicit ``terms=``
+    constructor keyword when passing a local-term mapping or a Pepsy
+    ``SymHamiltonian``; ``hamiltonian=`` remains supported as a compatibility
+    alias.
     """
 
     _LOSS_KEYS = frozenset({
@@ -800,8 +803,9 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     def __init__(
         self,
         state,
-        hamiltonian,
+        hamiltonian=None,
         *,
+        terms=None,
         normalized: bool = True,
         energy_per_site: bool = True,
         real: bool = True,
@@ -811,6 +815,9 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         loss_kwargs: Mapping[str, Any] | None = None,
         allow_encoding_conversion: bool = False,
     ):
+        if hamiltonian is not None and terms is not None:
+            raise TypeError("pass either hamiltonian or terms, not both")
+        hamiltonian = terms if terms is not None else hamiltonian
         self.state = self._as_mps_state(state)
         self.hamiltonian = hamiltonian
         self.terms = self._terms_from_hamiltonian(hamiltonian)
@@ -1285,9 +1292,9 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         if not cls._terms_use_fermionic_symmray(hamiltonian.terms):
             return False
         return all(
-            len(edge) == 2
-            and all(isinstance(site, Integral) for site in edge)
-            for edge in hamiltonian.edges
+            len(where) in {1, 2}
+            and all(isinstance(site, Integral) for site in where)
+            for where in hamiltonian.edges
         )
 
     @classmethod
@@ -1466,7 +1473,10 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         incoming_constants = dict(loss_constants or {})
         terms = incoming_constants.pop("terms", self.terms)
         if self._is_fermionic_sym_hamiltonian(terms):
-            terms = self._fermionic_hamiltonian_mpo_for_state(terms, self.state)
+            if self._can_use_native_local_terms(terms, self.state):
+                terms = terms.terms
+            else:
+                terms = self._fermionic_hamiltonian_mpo_for_state(terms, self.state)
         if self._is_mpo_hamiltonian(terms):
             constants = {"terms": terms}
             constants.update(incoming_constants)

@@ -39,9 +39,9 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
   `measure_final_infidelity=True`. If final measurement is disabled, the
   fallback optimizer loss can come from the coarser `boundary_chi` environment
   while the pre-check used `evaluation_chi`.
-- Sweep mode defaults to the optional NLopt `LD_LBFGS` solver. Install NLopt
-  or pass an explicit `optimizer` / `sweep_optimize_kwargs` value when NLopt is
-  unavailable.
+- Sweep mode defaults to Torch Adam for Torch-backed Symmray states and to the
+  optional NLopt `LD_LBFGS` solver otherwise. Pass an explicit `optimizer` /
+  `sweep_optimize_kwargs` value to override this choice.
 - `non_unitary=True` normalizes generated targets and candidates; it does not
   implement the interval scheduling or norm-proxy machinery available in
   `MpsOptimizer`.

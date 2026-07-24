@@ -26,14 +26,17 @@ into the tree:
 - **operators on three or more qubits** -- a `k`-qubit gate (Toffoli, Fredkin),
   a multi-site non-unitary / Kraus operator, or a whole Trotter block -- are
   applied *in one shot* over their minimal spanning subtree by
-  `apply_subtree_operator`; `apply_gate` routes any support with `len(where) >= 3`
-  there automatically (see *Multi-qubit / sub-MPO application*).
+  `apply_subtree_operator`. All open operator bonds are QR-routed to a subtree
+  hub before a final canonical compression sweep truncates every touched edge
+  once; `apply_gate` routes any support with `len(where) >= 3` there
+  automatically (see *Multi-qubit / sub-MPO application*).
 - **stream events** -- MPS-compatible `measure`, `cap`, `reset`, and
   `measure_reset` entries can be mixed into the stream. Measurements use Pauli
   eigenvalue outcomes (`+1`/`-1`) and are appended to `measurements`;
-  explicit `submpo` markers use a native MPO message sweep when the payload
-  exposes Quimb's MPO site interface, so `to_dense()` is not required; opaque
-  MPO-like payloads fall back to the dense recursive subtree-operator path.
+  explicit `submpo` markers use the same native QR-routing and final subtree
+  compression when the payload exposes Quimb's MPO site interface, so
+  `to_dense()` is not required; opaque MPO-like payloads fall back to the dense
+  recursive subtree-operator path.
   `cap` contracts and removes one tree leaf, compacts the remaining qubit
   labels above it, and keeps the live tree canonical.
 
@@ -61,8 +64,19 @@ edges, and bond ownership against the `TreePlan`; pass
 Direct Quimb mutations such as `gate_inds_`, `canonize_between`,
 `compress_between`, and `canonize_around_` invalidate the tracked canonical
 region. Call `invalidate_canonical_form()` after mutating tensor data directly;
-the optimizer's state-aware wrappers restore the centre only for operations that
-prove canonicality is preserved.
+it also invalidates the native fermionic norm cache. The optimizer's
+state-aware wrappers do both automatically and restore the centre only for
+operations that prove canonicality is preserved.
+
+Native fermionic trees use a separate graded edge path. Centre moves explicitly
+QR-split the Symmray tensor and absorb the native carry into the next node;
+edge compression explicitly forms the two-node tensor and performs its native
+block SVD. Dense and nonfermionic trees continue to use Quimb's generic
+`canonize_between` / `compress_between` wrappers. A graded exterior is not
+assumed to be an ordinary Frobenius identity for readout: a known native
+fermionic centre uses a one-tensor `TensorNetwork.H` contraction (which applies
+the required outer-leg phase flips), while an unknown centre falls back to an
+exact complete doubled-network contraction.
 
 ## Range / subtree canonicalisation
 
@@ -74,7 +88,7 @@ when the region spans more than one node `orthogonality_center` honestly reads
 `None`. `TreeTensorNetwork.canonize_subtree_(nodes)` gauges every tensor
 *outside* a connected subtree to point inward (Quimb `canonize_around` with
 `which="any"`), so the whole state norm is carried by the region tensors --
-contracting just the region against its conjugate reproduces the squared norm,
+contracting just the region against its graded conjugate reproduces the squared norm,
 exactly as the single centre tensor does for a one-node region. Disconnected
 `nodes` raise unless `span=True` auto-expands to the minimal connected subtree
 that spans them (`subtree_span`). `canonize_around_qubits_(qubits)` is the
@@ -97,12 +111,12 @@ Quimb's `MatrixProductState.gate_with_submpo`, which exists for the 1D chain
 only). The dense operator is first factorized into an exact tree-MPO on the
 **minimal connected subtree** (Steiner subtree) spanning the target leaves.
 Application then proceeds recursively from subtree leaves to a hub: each local
-state/operator message is split on one edge and immediately absorbed by its
-parent. No dense state tensor for the whole Steiner subtree is formed. The
-orthogonality centre is first moved onto a target leaf so the whole exterior is
-isometric and every local truncation sees the complete operator against an
-isometric environment; the centre is left on the hub, so the state stays in
-canonical form.
+state/operator message is losslessly QR-split on one edge and absorbed by its
+parent, carrying every still-open operator virtual leg. No dense state tensor
+for the whole Steiner subtree is formed. Once all MPO factors have arrived, the
+tree is canonicalized about the hub and every touched edge is SVD-compressed
+once. Thus every truncation sees the complete operator in an isometric
+environment.
 
 `op` acts on `len(where)` qubits: an array reshaped to `(2,) * 2k` with output
 indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
@@ -117,16 +131,44 @@ state tensor for the whole spanning subtree.
 An explicit MPS-style sub-MPO marker, `("submpo", mpo, where)` (or the
 equivalent mapping form), is accepted in a TreeOptimizer stream. Quimb MPOs are
 applied natively by carrying their virtual operator bonds through the same
-leaf-to-hub message sweep; bond estimates use MPO bond dimensions as a
-conservative Schmidt-rank bound. Payloads without the required site interface
-fall back to `mpo.to_dense()`, which must produce an operator on the declared
-support. `TreeOptimizer.submpo_event(...)` builds the tuple form.
+lossless leaf-to-hub QR sweep followed by one subtree compression sweep; bond
+estimates use MPO bond dimensions as a conservative Schmidt-rank bound.
+Payloads without the required site interface fall back to `mpo.to_dense()`,
+which must produce an operator on the declared support.
+`TreeOptimizer.submpo_event(...)` builds the tuple form.
 
-`TreeOptimizer.apply_submpo(...)` is the direct form of the same operation.
+Both two-site implementations preserve native Symmray gates and their
+block-sparse fermionic grading. Direct mode splits the rank-four gate; MPO mode
+asks Quimb to make the equivalent two-tensor sub-MPO. The resulting two factors
+then enter the *same* TTN kernel: attach one factor, QR-thread its shared
+operator bond along the unique path, attach the other, then make one final
+compression sweep. Neither path converts the gate to a dense qubit array or
+splits it into base-2 legs.
+
+For an ordinary two-site gate, choose `mode="direct"` to use the
+specialised gate-SVD/QR threading implementation, or `mode="mpo"` to
+use the same Quimb gate-to-sub-MPO route. `mode="auto"` is the default:
+it selects direct factorization for every backend, including native Symmray
+fermionic gates. Select `mode="mpo"` explicitly to inspect or benchmark
+Quimb's operator-TN factorization. Direct and MPO share the update kernel and
+defer truncation until the complete gate has reached the affected path, so at
+an exact `chi` they differ only by the factorization gauge and numerical
+roundoff.
+
+`run(mode=...)` has the same persistent semantics as `MpsOptimizer`: it updates
+the optimizer's selected two-site mode for that run, later runs, and copies.
+The old `run(mode="tree")`/`"ttn"` selector is a deprecated no-op retained only
+for shared frontends.
+
+`TreeOptimizer.apply_submpo(...)` is the public form for an explicit MPO of
+arbitrary support. It losslessly QR-routes its virtual bonds, then uses its
+supplied (or configured) `max_bond` / `cutoff` in one final canonical sweep over
+the affected subtree.
 The tree backend also exposes numerical Pauli primitives used by a future
 stabilizer frontend: `apply_pauli_rotation(...)`, `apply_pauli_sum(...)`,
 `expectation_pauli(...)`, `measure_pauli(...)`, and `project_pauli(...)`. These
-operate on the coefficient state and do not require tableau metadata.
+operate on dense two-level qubit coefficient states and do not require tableau
+metadata; they intentionally reject native fermionic TTNs.
 `measure_pauli` returns `(outcome, probability)` and accepts an optional
 `return_diagnostics=True` flag. `project_pauli` normalizes by default; pass
 `renormalize=False` to retain the branch norm. Both APIs can report projection
@@ -140,12 +182,28 @@ snapshots before and after the update. The records are also available through
 ordinary one-/two-/multi-qubit gates, structured sub-MPOs, Pauli expectation
 and projection, measurement, reset, measure-reset, cap, normalization,
 copying, canonicalization, layout construction, dense readout, and truncation
-diagnostics. A cap's `absorb` argument is accepted for stream compatibility,
-but a tree always absorbs into the leaf's unique parent. `cap(q, vec)` compacts
-labels by default; use `stable_labels=True` (or `compact_labels=False`) to
-preserve caller-facing logical IDs across the cap while the internal TTN stays
-compact. `TreeOptimizer.qubits`, `logical_order`, `position`, and
-`logical_site` expose that mapping.
+diagnostics for dense two-level qubit TTNs. A cap's `absorb` argument is
+accepted for stream compatibility, but a tree always absorbs into the leaf's
+unique parent. `cap(q, vec)` compacts labels by default; use
+`stable_labels=True` (or `compact_labels=False`) to preserve caller-facing
+logical IDs across the cap while the internal TTN stays compact.
+`TreeOptimizer.qubits`, `logical_order`, `position`, and `logical_site` expose
+that mapping. Native fermionic TTNs support native Symmray gates and MPOs, but
+the qubit Pauli/measurement/reset helpers intentionally reject them; use the
+fermion model's native observable/projector with
+`TreeTensorNetwork.local_expectation` instead of silently treating a graded
+local space as a qubit.
+
+The shared trajectory runner supports dense-qubit `TreeOptimizer` instances as
+well. Independent trajectories can sample Pauli mixtures, depolarizing
+channels, and state-dependent Kraus channels; branch probabilities are
+evaluated from copied TTNs and selected branches are normalized before replay
+continues. Coalesced trajectory replay supports exact branching of mid-circuit
+measurement, reset, and measure-reset events through `expectation_pauli`. Use
+matrix-valued gate payloads in tree streams (for example `pepsy.h()`), since
+textual MPS gate aliases are not normalized by the tree gate parser. Native
+fermionic trajectories may use native gates/MPOs, but Pauli/control events
+require a model-native observable or projector.
 
 MPS execution modes such as `svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`, and
 `mix` are chain algorithms and are intentionally not copied into
@@ -160,16 +218,15 @@ state and stabilizer-specific bookkeeping above it.
 geometry-owning subclass of Quimb's arbitrary-geometry vector class
 `quimb.tensor.TensorNetworkGenVector`. It *is* a Quimb tensor network, so all of
 Quimb's arbitrary-geometry methods (`canonize_around`, `canonize_between`,
-`compress_between`, `gate_inds`, `local_expectation`, `to_dense`, `copy`, ...)
-apply directly; the class adds the naming and geometry glue on top of a
+`compress_between`, `gate_inds`, `to_dense`, `copy`, ...) apply directly; the
+class adds the naming and geometry glue on top of a
 `TreePlan`:
 
 - every node (leaf **and** internal) is one tensor tagged with the structural
   node tag `node_tag_id.format(nid)` (default `"N{}"`);
 - leaf tensors additionally carry the Quimb site tag `site_tag_id.format(q)`
   (default `"I{}"`) and physical index `site_ind_id.format(q)` (default `"k{}"`)
-  for qubit `q`, so the inherited site / `local_expectation` machinery treats the
-  leaves as the sites;
+  for qubit `q`, so Quimb treats the leaves as the sites;
 - adjacent nodes share one live virtual bond. Newly constructed edges use the
   deterministic `_tb{lo}_{hi}` name, but Quimb may replace it with a UUID during
   threading or canonicalisation; `TreeTensorNetwork.bond(a, b)` resolves the
@@ -184,10 +241,40 @@ product state in one step), or `TreeTensorNetwork.rand(plan, D=..., seed=...)`
 builds and evolves its state on this class, delegating all node/qubit naming and
 geometry queries to it.
 
+`TreeTensorNetwork.local_expectation(op, where, max_bond=None)` has two
+backend-specific exact paths. Dense/nonfermionic TTNs move the centre to the
+target leaf/subtree, cancel the ordinary isometric exterior, and contract only
+the minimal Steiner subtree. Native fermionic TTNs insert the Symmray operator
+without densifying it and contract the complete doubled tree, preserving every
+graded boundary phase. For native fermionic states, `max_bond` is accepted for
+API compatibility but cannot truncate this exact doubled-network contraction.
+Observable readout deliberately belongs to the state, not to `TreeOptimizer`;
+use `optimizer.tn.local_expectation(...)`.
+
+Readout is gauge-preserving: a dense expectation restores the previously
+tracked canonical centre/region, while an unknown dense gauge is evaluated on a
+temporary state copy. Native fermionic expectations do not move the gauge.
+The repeated normalized native-readout denominator is cached and invalidated by
+state mutation, copying, caps, and canonical/gate updates.
+
 For the package-level product-state constructor, matching `ps_to_mps`, use
 `pepsy.ps_to_ttn(n, theta=..., tree=...)`. It builds the requested tree,
 initialises every leaf with `[cos(theta), sin(theta)]`, and optionally expands
 the virtual bonds with `chi`.
+
+For a native Symmray fermionic state, pass a `Fermion` model and occupations:
+`pepsy.ps_to_ttn(n, tree=plan, fermion=fermion, occupations=..., chi=1)`.
+Leaves then carry the model's physical charge/parity sectors, internal nodes
+are neutral, and every tree edge uses conjugate Symmray virtual indices.
+The constructor selects a definite local Fock basis vector, not a random vector
+inside a degenerate charge sector. For spinful `U1`/`Z2`, a scalar occupation
+`1` selects the checkerboard `|up>, |down>, ...` representative; pass
+`(n_up, n_down)` occupations to choose each spin explicitly. The completed
+graded product tree is normalized by an exact graded norm contraction, so its
+represented norm is one rather than an arbitrary constructor scalar.
+`pepsy.hrs_to_ttn(..., chi=...)` creates the corresponding random symmetric
+tree with the requested charge-sector bond dimension. These constructors keep
+the Symmray arrays native; they do not materialize dense tensor data.
 
 `TreeTensorNetwork.show()` prints a top-down ASCII drawing of the tree -- the
 tree analogue of a quimb MPS `show()` -- with the root at the top and the qubit
@@ -475,30 +562,34 @@ finder and optimizer expose diagnostics to choose it:
 - `TreeOptimizer.truncation_report()` exposes the per-edge compression and
   SVD-split history, including before/after bond dimensions. Pass
   `track_truncation=True` to also collect each local full singular spectrum's
-  absolute discarded weight and relative discarded fraction. Spectrum probes
-  are opt-in because they add an SVD per truncation edge. The report also
-  contains gate-level `updates`, grouping edge events by support and reporting
-  the cumulative relative loss.
+  absolute discarded weight and relative discarded fraction. Dense states use
+  the global spectrum; native Symmray states compare the full and actually
+  retained charge-block spectra using the same sector-aware truncation rule as
+  the live update. Spectrum probes are opt-in because they add local SVD work
+  per truncation edge. The report also contains gate-level `updates`, grouping
+  edge events by support and reporting the cumulative relative loss.
 - `TreeOptimizer.convergence_sweep(gates, n, chi_values, ops=...)` replays the
   stream at several `chi` on one fixed tree and returns per-`chi` `max_bond`,
   `norm`, observable `expectations`, `fidelity` against the untruncated state
   (when `2**n <= dense_cap`), and observable `max_drift` between consecutive
-  `chi` -- a reference-free convergence signal for large systems.
+  `chi` -- a reference-free convergence signal for large systems. Optional
+  observables are evaluated by the underlying `TreeTensorNetwork`; they are
+  not a `TreeOptimizer` readout API.
 
 ## Readout
 
 `to_dense()` returns the dense statevector in index order `k0, k1, ..., k(n-1)`.
 `run(progbar=True)` shows a tqdm replay bar with one-/two-/multi-qubit event
-counts, current bond usage, state norm, and cumulative norm-based `Icum`
-truncation infidelity for unitary events. Non-unitary and control events reset
-that proxy. The bar is disabled by default.
-`local_expectation(op, where)` returns `<psi|op|psi> / <psi|psi>`. A single-site
-operator contracts only the canonical centre tensor; a multi-site operator
-contracts only the **minimal subtree spanning the target leaves**, with the
-centre moved inside that subtree so the isometric exterior cancels to the
-identity on the shared boundary bonds (cost scales with the operator's spread,
-not the whole tree). `measure(q, outcome=None)` projectively measures a qubit in
-the computational basis and returns a bit; `reset(q)` returns a qubit to `|0>`.
+counts, current bond usage, state norm, and a norm-based truncation proxy.
+Both dense and native fermionic replay report
+`1 - (norm / reference_norm)^2`; the reference is established at run start and
+reset after control or explicitly non-unitary events. This is display-only and
+is not a replacement for the recorded truncation history. The bar is disabled
+by default.
+For dense two-level qubit TTNs, `measure(q, outcome=None)` projectively
+measures a qubit in the computational basis and returns a bit; `reset(q)`
+returns a qubit to `|0>`. Native fermionic TTNs deliberately do not expose
+these qubit readouts.
 For stream control events, `TreeOptimizer.measure_event`,
 `cap_event`, `reset_event`, and `measure_reset_event` build the same tuple forms as
 `MpsOptimizer`, including Pauli-basis measurement and reset. Their recorded
@@ -529,7 +620,8 @@ available through `truncation_report()`, `get_infidelities()`, and
 - **Lazy canonical centre.** A freshly built product state has every virtual
   bond at dimension 1, so it is already canonical with the root as
   orthogonality centre; `from_plan` records that centre on the network rather
-  than recomputing it on the first gate.
+  than recomputing it on the first gate. Native fermionic product trees are
+  additionally normalized by their exact graded norm readout.
 - **State-owned centre.** The orthogonality centre lives on the
   `TreeTensorNetwork` (`orthogonality_center`, an `_EXTRA_PROPS` field), so the
   optimizer and the state cannot disagree and the centre is carried by

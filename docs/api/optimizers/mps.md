@@ -50,6 +50,10 @@ If an independent physical copy is needed, use:
 physical = opt.p_ungauged.copy()
 ```
 
+For Symmray block-sparse MPS data, `gate_simple` automatically uses Quimb's
+full two-site `split` path so symmetry and fermionic fusion metadata are
+preserved. Dense MPS data keeps the faster `reduce-split` path by default.
+
 `mode="swap"` applies non-local two-site gates through a swap-and-split path
 and swaps the sites back after each gate. `mode="perm"` uses the same
 swap-and-split path but leaves the swaps in place, tracking the current
@@ -86,32 +90,36 @@ For unitary streams,
 run norm, squared; this is the global retained-fidelity estimate and is
 equivalent to multiplying the per-gate fidelities without requiring a
 pre-gate target measurement. Local ratios remain available in detailed
-samples for diagnostics. The trace is populated by default; no diagnostic
-flag is needed. For dense two-site non-unitary gates, the target
+samples for diagnostics. The trace is populated by default. Set
+``track_infidelity=False`` in the constructor, or pass
+``track_infidelity=False`` to ``run()``, to skip target-norm construction,
+retained-norm calculations, samples, and progress-bar infidelity fields. For
+dense two-site non-unitary gates, the target
 norm is obtained from the local expectation of `G†G`, so no copied target MPS
 is needed. Symmray and general sub-MPO backends use a raw target-norm fallback
 where that local expectation is not available. DMRG still materializes its
 target because FIT needs it, but the diagnostic uses FIT's final local norm
 trace as the current retained norm.
 Temporary fallback targets never modify the live `info_c` cache.
-The `mpo`, `swap`, and `svd` progress bars always show the same cumulative
-`infidelity` field, starting at zero before the first compressed two-site gate.
+When tracking is enabled, the `mpo`, `swap`, and `svd` progress bars show the
+same cumulative `infidelity` field, starting at zero before the first
+compressed two-site gate.
 `mode="exact"` and `mode="su"` deliberately skip canonical metadata; switching back to an MPS
 mode rebuilds and canonicalizes the contracted state.
 
 The result API is intentionally small:
 
 ```python
-opt.run(non_unitary=True, normalize_every=True)
+opt.run(non_unitary=True, normalize_every=True, track_infidelity=False)
 
-opt.get_infidelities()        # [0.0, cumulative infidelity, ...]
-opt.get_infidelity_samples()  # detailed per-compression records
+opt.get_infidelities()        # [0.0] when tracking is disabled
+opt.get_infidelity_samples()  # [] when tracking is disabled
 opt.get_normalizations()      # scale events and accumulated exponents
 ```
 
-Infidelity is recorded automatically whenever a compressed two-site update
-occurs; no sampling or tracking option is needed. `get_infidelities()` is the
-cheap cumulative trace for progress and stopping criteria. Use
+When enabled, infidelity is recorded automatically whenever a compressed
+two-site update occurs. `get_infidelities()` is the cheap cumulative trace for
+progress and stopping criteria. Use
 `get_infidelity_samples()` when the target norm, retained norm, local ratio, or
 step metadata is needed.
 

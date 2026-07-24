@@ -23,6 +23,7 @@ from ...tensors.validation import _PHYS_IND_PATTERN, _TAG_X, _TAG_Y
 from .environments import (
     QuimbMpsBoundaryStore,
     normalize_boundary_engine,
+    symmray_array_backends,
     uses_symmray_arrays,
 )
 
@@ -189,6 +190,24 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         return value, 0.0
 
     @staticmethod
+    def _unwrap_contracted_scalar(value, *, name):
+        """Extract the data of a scalar Quimb tensor without touching arrays.
+
+        Quimb normally returns an array scalar from ``contract(all)`` but can
+        retain a zero-index ``Tensor`` wrapper for Symmray contractions. Its
+        data is the backend scalar (a Torch scalar in the differentiable
+        path); unwrapping only this wrapper preserves its autograd graph.
+        """
+        if not isinstance(value, qtn.Tensor):
+            return value
+        if value.inds:
+            raise ValueError(
+                f"{name} contraction did not produce a scalar; "
+                f"remaining indices are {value.inds!r}."
+            )
+        return value.data
+
+    @staticmethod
     def _network_exponent(tn):
         """Return the real base-10 exponent carried by a tensor network."""
         return complex(getattr(tn, "exponent", 0.0)).real
@@ -223,12 +242,21 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         overlap_m, overlap_e = cls._as_scaled_scalar(overlap, name="overlap")
         norm_m, norm_e = cls._as_scaled_scalar(norm, name="norm")
         target_m, target_e = cls._as_scaled_scalar(target_norm, name="target_norm")
+        overlap_m = cls._unwrap_contracted_scalar(overlap_m, name="overlap")
+        norm_m = cls._unwrap_contracted_scalar(norm_m, name="norm")
+        target_m = cls._unwrap_contracted_scalar(target_m, name="target_norm")
 
-        fid_m = (ar.do("abs", overlap_m) ** 2) / (
-            ar.do("abs", norm_m) * ar.do("abs", target_m)
+        # ``contract(..., strip_exponent=True)`` can return Quimb's scalar
+        # wrapper even when the tensor blocks themselves are Torch. Autoray
+        # correctly dispatches most array operations here, but it has no
+        # ``quimb.abs`` registration for that wrapper. Python's ``abs``
+        # calls the scalar / array ``__abs__`` implementation instead: it
+        # works for Quimb qarrays and retains autograd for Torch tensors.
+        fid_m = (abs(overlap_m) ** 2) / (
+            abs(norm_m) * abs(target_m)
         )
         fid_e = 2.0 * overlap_e - norm_e - target_e
-        return ar.do("abs", fid_m) * cls._safe_pow10(fid_e)
+        return abs(fid_m) * cls._safe_pow10(fid_e)
 
     def _local_norm_exponent(self):
         """Exponent for the represented local norm environment."""
@@ -350,6 +378,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         track_boundary_fidelity: bool | None = None,
     ):
         self._ensure_no_common_internal_indices(state, state_target)
+        self._validate_symmray_input_backends(state, state_target)
 
         bdy_obj, bdy_holder = self._resolve_boundary_arg(bdy, "bdy")
         bdy_overlap_obj, bdy_overlap_holder = self._resolve_boundary_arg(
@@ -397,7 +426,27 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         # Store chi as-is (may be int or (int, int) tuple).
         self.chi = chi if chi is not None else getattr(bdy_obj, "chi", None)
         self.single_layer = single_layer
-        self.simplify = simplify
+        self.simplify = bool(simplify)
+        # Symmray block-sparse states need special handling in the local slice
+        # optimizer. NumPy-backed blocks use the finite-difference fallback,
+        # while Torch-backed blocks remain on Torch and use autograd normally.
+        self._symmray_state = bool(uses_symmray_arrays(self.state, self.state_target))
+        self._symmray_backends = symmray_array_backends(
+            self.state,
+            self.state_target,
+        )
+        self._symmray_torch = (
+            self._symmray_state and self._symmray_backends == {"torch"}
+        )
+        self._symmray_requires_fd = self._symmray_state and not self._symmray_torch
+        if self.simplify and self._symmray_state:
+            warnings.warn(
+                "Disabling sweep local full_simplify for Symmray-backed states "
+                "to avoid backend incompatibilities.",
+                UserWarning,
+                stacklevel=2,
+            )
+            self.simplify = False
         self.direction = direction if direction is not None else "y"
         self.max_separation = max_separation if max_separation is not None else 1
 
@@ -409,6 +458,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         self.Lx, self.Ly = self._infer_shape(self.state)
         self._reset_run_traces()
+        self._warned_nested_param_tree = False
 
         init_renormalize_kwargs = self._collect_init_renormalize_kwargs(
             chi=self.chi,
@@ -443,6 +493,27 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         warnings.warn(msg, UserWarning, stacklevel=3)
         raise ValueError(msg)
+
+    @staticmethod
+    def _validate_symmray_input_backends(*states):
+        """Reject mixed dense/Symmray and mixed-backend sweep objectives."""
+        states = tuple(state for state in states if state is not None)
+        symmray_flags = tuple(uses_symmray_arrays(state) for state in states)
+        if not any(symmray_flags):
+            return
+        if not all(symmray_flags):
+            raise TypeError(
+                "SweepOptimizer cannot mix Symmray and dense state/target "
+                "tensor networks. Convert both inputs to the same backend."
+            )
+        backends = symmray_array_backends(*states)
+        if len(backends) != 1:
+            found = ", ".join(sorted(backends)) or "unknown"
+            raise TypeError(
+                "Symmray sweep inputs must use one common array backend; "
+                f"found {found}. Convert both state and state_target before "
+                "constructing SweepOptimizer."
+            )
 
     @staticmethod
     def _call_with_accepted_kwargs(fn, *args, **kwargs):
@@ -1149,6 +1220,26 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return bra
 
+    def _overlap_bra(self, local_tn):
+        """Build a local overlap bra matching the cached double-layer indices.
+
+        ``build_bra_ket(ket=state_target, bra=state)`` renames only the
+        bra-side internal indices that collide with ``state_target``. A target
+        with mangled internal bonds therefore retains the state's original
+        labels on the bra layer. The local objective must follow that same
+        convention in order to attach cached overlap boundaries correctly.
+        """
+        bra = local_tn.conj()
+        shared_inner = set(self.state_target.inner_inds()) & set(self.state.inner_inds())
+        bra.reindex_(
+            {
+                idx: f"{idx}_*"
+                for idx in bra.ind_map
+                if idx in shared_inner
+            }
+        )
+        return bra
+
     @staticmethod
     def _resolve_user_solver(solver):
         """Validate solver names and emit practical warnings."""
@@ -1170,6 +1261,167 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return solver
 
+    @staticmethod
+    def _needs_nested_param_flatten(params):
+        """Return whether ``params`` contains nested Mapping/list/tuple values."""
+        if not isinstance(params, Mapping):
+            return False
+        return any(isinstance(value, (Mapping, list, tuple)) for value in params.values())
+
+    @classmethod
+    def _flatten_param_tree(cls, params):
+        """Flatten a nested parameter pytree into leaf mapping and structure spec."""
+        if not isinstance(params, Mapping):
+            raise TypeError("params must be a mapping")
+
+        flat = {}
+        spec = {}
+
+        def _walk(path, value):
+            if isinstance(value, Mapping):
+                keys = tuple(value.keys())
+                spec[path] = ("mapping", keys)
+                for key in keys:
+                    _walk(path + (("k", key),), value[key])
+                return
+            if isinstance(value, list):
+                spec[path] = ("list", len(value))
+                for idx, item in enumerate(value):
+                    _walk(path + (("i", idx),), item)
+                return
+            if isinstance(value, tuple):
+                spec[path] = ("tuple", len(value))
+                for idx, item in enumerate(value):
+                    _walk(path + (("i", idx),), item)
+                return
+            flat[path] = value
+
+        _walk((), params)
+        return flat, spec
+
+    @classmethod
+    def _unflatten_param_tree(cls, flat, spec):
+        """Rebuild a nested parameter pytree from flattened leaves and spec."""
+        if not isinstance(flat, Mapping):
+            raise TypeError("flat must be a mapping")
+
+        def _build(path):
+            if path in spec:
+                kind, payload = spec[path]
+                if kind == "mapping":
+                    return {
+                        key: _build(path + (("k", key),))
+                        for key in payload
+                    }
+                if kind == "list":
+                    return [
+                        _build(path + (("i", idx),))
+                        for idx in range(payload)
+                    ]
+                if kind == "tuple":
+                    return tuple(
+                        _build(path + (("i", idx),))
+                        for idx in range(payload)
+                    )
+                raise ValueError(f"Unknown tree container kind: {kind!r}")
+            return flat[path]
+
+        return _build(())
+
+    @classmethod
+    def _clone_param_tree(cls, value):
+        """Detach/clone tensor leaves recursively while preserving tree shape."""
+        if isinstance(value, Mapping):
+            return {key: cls._clone_param_tree(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [cls._clone_param_tree(val) for val in value]
+        if isinstance(value, tuple):
+            return tuple(cls._clone_param_tree(val) for val in value)
+        if hasattr(value, "detach"):
+            return value.detach().clone()
+        copy_fn = getattr(value, "copy", None)
+        if callable(copy_fn):
+            try:
+                return copy_fn()
+            except Exception:  # pragma: no cover - defensive copy fallback
+                pass
+        return value
+
+    @staticmethod
+    def _match_leaf_backend(value, reference):
+        """Coerce ``value`` to the array backend of ``reference``.
+
+        The local gradient solver flattens parameters to Torch tensors even
+        when the input state uses a different backend (for example NumPy-backed
+        Symmray blocks). Writing those Torch leaves back into an otherwise
+        NumPy state produces a mixed-backend network that breaks subsequent
+        boundary contractions. This restores each optimized leaf to the backend
+        it came from so the state's array backend is preserved.
+        """
+        try:
+            ref_backend = ar.infer_backend(reference)
+            val_backend = ar.infer_backend(value)
+        except Exception:  # pragma: no cover - defensive backend inference
+            return value
+        if ref_backend == val_backend:
+            return value
+        try:
+            numpy_value = ar.to_numpy(value)
+        except Exception:  # pragma: no cover - fall back to raw value
+            return value
+        if ref_backend == "numpy":
+            return numpy_value
+        try:
+            return ar.do("array", numpy_value, like=reference)
+        except Exception:  # pragma: no cover - last-resort passthrough
+            return value
+
+    @classmethod
+    def _restore_leaf_backends(cls, params_opt, params_ref):
+        """Coerce optimized flat leaves back to their original backends."""
+        if not isinstance(params_opt, Mapping) or not isinstance(params_ref, Mapping):
+            return params_opt
+        restored = {}
+        for key, value in params_opt.items():
+            reference = params_ref.get(key)
+            if reference is None:
+                restored[key] = value
+            else:
+                restored[key] = cls._match_leaf_backend(value, reference)
+        return restored
+
+    @staticmethod
+    def _coerce_leaf_to_numpy(value):
+        """Convert a single array leaf to a NumPy array when needed."""
+        try:
+            backend = ar.infer_backend(value)
+        except Exception:  # pragma: no cover - defensive backend inference
+            return value
+        if backend == "numpy":
+            return value
+        try:
+            return ar.to_numpy(value)
+        except Exception:  # pragma: no cover - last-resort passthrough
+            return value
+
+    @classmethod
+    def _coerce_param_tree_numpy(cls, value):
+        """Recursively coerce array leaves in a param tree to NumPy.
+
+        The autograd solvers hand the local loss function Torch tensors even
+        for NumPy-backed Symmray states. Contracting those against the NumPy
+        target/boundary tensors would mix backends inside Symmray's block
+        ``tensordot``. Coercing every leaf to NumPy keeps the local contraction
+        on a single backend so gradients can be taken by finite differences.
+        """
+        if isinstance(value, Mapping):
+            return {key: cls._coerce_param_tree_numpy(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [cls._coerce_param_tree_numpy(val) for val in value]
+        if isinstance(value, tuple):
+            return tuple(cls._coerce_param_tree_numpy(val) for val in value)
+        return cls._coerce_leaf_to_numpy(value)
+
     def _estimate_slice_contraction_metrics(
         self,
         *,
@@ -1182,7 +1434,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         """Estimate FLOP/peak complexity for local norm and overlap networks."""
         local0 = qtn.unpack(params_init, skeleton)
         bra_norm0 = self._bra_with_reindexed_inner(local0)
-        bra_overlap0 = local0.conj()
+        bra_overlap0 = self._overlap_bra(local0)
         norm_net0 = self._attach_boundaries(
             local0 | bra_norm0,
             self.bdy.mps_b,
@@ -1212,6 +1464,37 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "peak_overlap": peak_overlap,
         }
 
+    @staticmethod
+    def _finite_difference_solver(solver, opts):
+        """Route a non-autograd local objective to a finite-difference solver.
+
+        An explicitly requested ``fd-*`` solver is preserved. Autograd solver
+        requests map to dependency-free ``fd-adam``; explicit SciPy and NLopt
+        requests keep their respective finite-difference implementations so
+        missing optional dependencies produce their normal, actionable errors.
+        """
+        key = str(solver).strip().lower()
+        if key.startswith("fd-"):
+            fd_solver = key
+        elif key.startswith(("torch", "jax")):
+            fd_solver = "fd-adam"
+        elif "scipy" in key:
+            fd_solver = "fd-scipy"
+        elif "nlopt" in key or key.startswith(("ld_", "ln_", "gd_", "gn_")):
+            fd_solver = "fd-nlopt"
+        else:
+            fd_solver = "fd-adam"
+        opts = dict(opts)
+        # ``lr`` is meaningful for finite-difference Adam, but not for the
+        # SciPy/NLopt finite-difference backends.
+        if fd_solver != "fd-adam":
+            opts.pop("lr", None)
+        return fd_solver, opts
+
+    # Kept as a private compatibility alias for callers/tests introduced with
+    # the original Symmray-only finite-difference fallback.
+    _symmray_fd_solver = _finite_difference_solver
+
     def _optimize_packed_params(
         self,
         params_init,
@@ -1221,6 +1504,17 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         solver_options=None,
     ):
         opts = self._merge_solver_options(solver_options)
+        if getattr(self, "_active_local_requires_finite_differences", False):
+            solver, opts = self._finite_difference_solver(solver, opts)
+        elif (
+            isinstance(solver, str)
+            and ("scipy" in solver.lower() or "nlopt" in solver.lower())
+            and "lr" not in dict(solver_options or {})
+        ):
+            # ``lr`` is an Adam-style default, not an NLopt/SciPy control.
+            # Do not emit an irrelevant warning unless the caller explicitly
+            # requested it.
+            opts.pop("lr", None)
         n_steps = int(opts.pop("n_steps", 30))
         # Allow callers to request a per-step gradient progress bar by setting
         # progress=True inside optimizer_options.  We pop it here so it never
@@ -1235,6 +1529,64 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         result = runner.run(params_init=params_init, loss_fn=loss_fn)
         return result.params, result.history
+
+    @classmethod
+    def _param_tree_backends(cls, value):
+        """Return inferred array backends for all leaves of a param tree."""
+        if isinstance(value, Mapping):
+            backends = set()
+            for child in value.values():
+                backends.update(cls._param_tree_backends(child))
+            return frozenset(backends)
+        if isinstance(value, (list, tuple)):
+            backends = set()
+            for child in value:
+                backends.update(cls._param_tree_backends(child))
+            return frozenset(backends)
+        try:
+            return frozenset({str(ar.infer_backend(value)).lower()})
+        except Exception:  # pragma: no cover - non-array metadata leaf
+            return frozenset()
+
+    @classmethod
+    def _params_require_finite_differences(cls, params):
+        """Return whether local params cannot use Torch autograd safely."""
+        backends = cls._param_tree_backends(params)
+        if not backends or backends == {"torch"}:
+            return False
+        if len(backends) != 1:
+            found = ", ".join(sorted(backends))
+            raise TypeError(
+                "Local sweep parameters must use one common array backend; "
+                f"found {found}."
+            )
+        return True
+
+    @classmethod
+    def _match_param_tree_backends(cls, value, reference):
+        """Recursively restore ``value`` leaves to ``reference`` backends."""
+        if isinstance(reference, Mapping):
+            if not isinstance(value, Mapping):
+                raise TypeError("Parameter-tree structure changed during optimization.")
+            return {
+                key: cls._match_param_tree_backends(value[key], ref)
+                for key, ref in reference.items()
+            }
+        if isinstance(reference, list):
+            if not isinstance(value, list) or len(value) != len(reference):
+                raise TypeError("Parameter-tree structure changed during optimization.")
+            return [
+                cls._match_param_tree_backends(item, ref)
+                for item, ref in zip(value, reference)
+            ]
+        if isinstance(reference, tuple):
+            if not isinstance(value, tuple) or len(value) != len(reference):
+                raise TypeError("Parameter-tree structure changed during optimization.")
+            return tuple(
+                cls._match_param_tree_backends(item, ref)
+                for item, ref in zip(value, reference)
+            )
+        return cls._match_leaf_backend(value, reference)
 
     def _apply_slice_update(self, index, params_opt, skeleton, axis):
         tn_opt = qtn.unpack(params_opt, skeleton)
@@ -1258,9 +1610,32 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         slice_state = self.state.select([f"{axis_tag}{index}"], "any")
         slice_target = self.state_target.select([f"{axis_tag}{index}"], "any")
-        params_init, skeleton = qtn.pack(slice_state)
+        params_init_tree, skeleton = qtn.pack(slice_state)
+        requires_finite_differences = self._params_require_finite_differences(
+            params_init_tree
+        )
+        if self._needs_nested_param_flatten(params_init_tree):
+            params_init_opt, param_tree_spec = self._flatten_param_tree(params_init_tree)
+            if not self._warned_nested_param_tree:
+                warnings.warn(
+                    "Detected nested local slice params (for example Symmray "
+                    "block trees); enabling tree-flattened sweep optimization path.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._warned_nested_param_tree = True
+
+            def _restore_params(params_in):
+                return self._unflatten_param_tree(params_in, param_tree_spec)
+
+        else:
+            params_init_opt = params_init_tree
+
+            def _restore_params(params_in):
+                return params_in
+
         metrics = self._estimate_slice_contraction_metrics(
-            params_init=params_init,
+            params_init=params_init_tree,
             skeleton=skeleton,
             slice_target=slice_target,
             right_key=right_key,
@@ -1268,9 +1643,20 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
 
         def loss_fn(params_in):
-            local = qtn.unpack(params_in, skeleton)
+            params_tree = _restore_params(params_in)
+            if requires_finite_differences:
+                # Finite-difference solvers use Torch work tensors internally.
+                # Rebuild the local network with the original array backend
+                # before it touches cached target/boundary environments.
+                params_tree = self._match_param_tree_backends(
+                    params_tree,
+                    params_init_tree,
+                )
+            local = qtn.unpack(params_tree, skeleton)
             bra_norm = self._bra_with_reindexed_inner(local)
-            bra_overlap = local.conj()
+            # Keep the local overlap bra index convention identical to the
+            # full double layer used to build ``bdy_overlap``.
+            bra_overlap = self._overlap_bra(local)
 
             norm_net = self._attach_boundaries(
                 local | bra_norm,
@@ -1317,21 +1703,32 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             infid = 1. - fid
             return infid
 
-        initial_loss = float(loss_fn(params_init))
+        initial_loss = float(loss_fn(params_init_opt))
 
-        params_opt, history = self._optimize_packed_params(
-            params_init,
-            loss_fn,
-            solver=solver,
-            solver_options=solver_options,
+        previous_requires_fd = getattr(
+            self,
+            "_active_local_requires_finite_differences",
+            False,
         )
+        self._active_local_requires_finite_differences = requires_finite_differences
+        try:
+            params_opt, history = self._optimize_packed_params(
+                params_init_opt,
+                loss_fn,
+                solver=solver,
+                solver_options=solver_options,
+            )
+        finally:
+            self._active_local_requires_finite_differences = previous_requires_fd
         history_values = self._to_float_history(history)
         final_loss = history_values[-1] if history_values else initial_loss
-        params_opt = {
-            k: v.detach().clone() if hasattr(v, "detach") else v
-            for k, v in params_opt.items()
-        }
-        self._apply_slice_update(index, params_opt, skeleton, axis)
+        params_opt_tree = _restore_params(params_opt)
+        params_opt_tree = self._match_param_tree_backends(
+            params_opt_tree,
+            params_init_tree,
+        )
+        params_opt_tree = self._clone_param_tree(params_opt_tree)
+        self._apply_slice_update(index, params_opt_tree, skeleton, axis)
         # Track the best state using the minimum non-negative loss observed
         # during this local gradient optimization.
         self._maybe_store_best_state(self._best_nonnegative_from_history(history_values))
@@ -1379,6 +1776,21 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.bdy.update_axis(norm_tn, axis, progress=progress)
         self.bdy_overlap.update_axis(overlap_tn, axis, progress=progress)
         return {"norm": None, "overlap": None}
+
+    def _update_quimb_double_layer_slice(self, norm_tn, overlap_tn, index, axis):
+        """Update the cached double layers after one local slice optimization."""
+        for site_tag in self._site_tensor_tags(axis, index):
+            source = next(iter(self.state.select(site_tag).tensor_map.values()))
+            data = source.data
+
+            for tn, layer, layer_data in (
+                (norm_tn, "KET", data),
+                (norm_tn, "BRA", data.conj()),
+                (overlap_tn, "BRA", data.conj()),
+            ):
+                selected = tn.select([site_tag, layer], "all")
+                for tensor in selected.tensor_map.values():
+                    tensor.modify(data=layer_data)
 
     def _advance_boundary_one_step(
         self,
@@ -1432,29 +1844,73 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         debug_loss_kwargs=None,
     ):
         """Run a single forward or backward half-sweep over *indices*."""
+        indices = tuple(indices)
         runs = []
         comp_norm = None
         comp_overlap = None
         uses_quimb = getattr(self, "boundary_engine", "dmrg") == "quimb-mps"
 
-        for index in indices:
+        if uses_quimb:
             norm_tn, overlap_tn = self._prepare_current_double_layers()
-            if uses_quimb:
-                comp_norm = None
-                comp_overlap = None
-            elif comp_norm is None:
-                comp_norm, comp_overlap = self._make_comp_pair(norm_tn, overlap_tn)
-            else:
-                self._set_comp_norms(comp_norm, comp_overlap, norm_tn=norm_tn, overlap_tn=overlap_tn)
+            self.bdy.start_sweep(norm_tn, axis, update_side, progress=False)
+            self.bdy_overlap.start_sweep(
+                overlap_tn,
+                axis,
+                update_side,
+                progress=False,
+            )
+            # A return-forward pass starts at ``1`` because site ``0`` was
+            # just optimized by the preceding backward pass. Seed the
+            # moving left/bottom boundary with that fixed endpoint before
+            # the first local objective is assembled.
+            if update_side == "left" and indices and indices[0] > 0:
+                self.bdy.advance_sweep(
+                    norm_tn,
+                    0,
+                    axis=axis,
+                    update_side=update_side,
+                )
+                self.bdy_overlap.advance_sweep(
+                    overlap_tn,
+                    0,
+                    axis=axis,
+                    update_side=update_side,
+                )
+            # A round-trip backward pass starts at ``n - 2`` because the
+            # endpoint was just optimized by the preceding forward pass. Seed
+            # the moving right/top boundary with that fixed endpoint before
+            # the first local objective is assembled.
+            if update_side == "right" and indices and indices[0] < self._axis_n(axis) - 1:
+                endpoint = self._axis_n(axis) - 1
+                self.bdy.advance_sweep(
+                    norm_tn,
+                    endpoint,
+                    axis=axis,
+                    update_side=update_side,
+                )
+                self.bdy_overlap.advance_sweep(
+                    overlap_tn,
+                    endpoint,
+                    axis=axis,
+                    update_side=update_side,
+                )
+
+        for index in indices:
+            if not uses_quimb:
+                norm_tn, overlap_tn = self._prepare_current_double_layers()
+                if comp_norm is None:
+                    comp_norm, comp_overlap = self._make_comp_pair(norm_tn, overlap_tn)
+                else:
+                    self._set_comp_norms(
+                        comp_norm,
+                        comp_overlap,
+                        norm_tn=norm_tn,
+                        overlap_tn=overlap_tn,
+                    )
 
             t0 = time.perf_counter()
             if uses_quimb:
-                boundary_fidelity = self._refresh_quimb_axis_boundaries(
-                    norm_tn,
-                    overlap_tn,
-                    axis,
-                    progress=False,
-                )
+                boundary_fidelity = {"norm": None, "overlap": None}
             else:
                 boundary_fidelity = self._advance_boundary_one_step(
                     index,
@@ -1481,6 +1937,28 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 solver_options=solver_options,
             )
             t_opt = time.perf_counter() - t0
+
+            if uses_quimb:
+                t0 = time.perf_counter()
+                self._update_quimb_double_layer_slice(
+                    norm_tn,
+                    overlap_tn,
+                    index,
+                    axis,
+                )
+                self.bdy.advance_sweep(
+                    norm_tn,
+                    index,
+                    axis=axis,
+                    update_side=update_side,
+                )
+                self.bdy_overlap.advance_sweep(
+                    overlap_tn,
+                    index,
+                    axis=axis,
+                    update_side=update_side,
+                )
+                t_bdy += time.perf_counter() - t0
 
             run_info["sweep"] = sweep_name
             run_info["time_boundary"] = t_bdy
@@ -1563,7 +2041,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             old_norm = self._normalize_state(env_n_iter)
             self.norm_trace.append({"state_norm": float(abs(complex(old_norm)))})
 
-        self._refresh_right_boundaries_once(axis, env_n_iter=env_n_iter)
+        if getattr(self, "boundary_engine", "dmrg") != "quimb-mps":
+            self._refresh_right_boundaries_once(axis, env_n_iter=env_n_iter)
 
         sweep_kwargs = dict(
             axis=axis,

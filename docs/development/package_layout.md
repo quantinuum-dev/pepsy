@@ -17,7 +17,7 @@ pepsy.solvers       gradient and finite-difference parameter solvers
 pepsy.fitting       local tensor fitting routines
 pepsy.optimizers    high-level MPS, MPO, and PEPS optimizers
 pepsy.sampling      MPS, vector, and PEPS samplers
-pepsy.vmc           optional NetKet/JAX variational Monte Carlo bridges
+pepsy.vmc           optional Torch and NetKet/JAX VMC adapters (`MCState` + `VMC` portable façade)
 pepsy._internal     private formatting and utility helpers
 ```
 
@@ -29,7 +29,13 @@ Use the clearer namespaces for submodule imports:
 from pepsy.boundary import BdyMPS, contract_boundary
 from pepsy.optimizers import SweepOptimizer, MpsOptimizer, PepsOptimizer, SimpleUpdateGen
 from pepsy.operators import rx, rzz, gate
-from pepsy.tensors import haar_random_state, ps_to_peps, ps_to_3dpeps, ps_to_mps
+from pepsy.tensors import (
+    haar_random_state,
+    ps_to_peps,
+    ps_to_3dpeps,
+    ps_to_mps,
+    ps_to_ttn,
+)
 ```
 
 When a leaf module is needed, import the new implementation path directly:

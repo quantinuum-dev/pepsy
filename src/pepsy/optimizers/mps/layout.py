@@ -337,7 +337,11 @@ def _gate_stream_event_weights(
                 if weight_mode == "auto":
                     weight = _angle_weight(payload)
                 if weight is None and event_type == "gate":
-                    key = (id(payload), tuple(support), int(schmidt_max_dim))
+                    # This proxy only handles two-site operators, and its
+                    # singular values are independent of the global site
+                    # labels. Reuse one small SVD when the same gate object is
+                    # replayed across many pairs.
+                    key = (id(payload), len(support), int(schmidt_max_dim))
                     if key not in schmidt_cache:
                         schmidt_cache[key] = _operator_schmidt_weight(
                             payload,

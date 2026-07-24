@@ -626,10 +626,11 @@ class MpsStabOptimizer:
         If ``True``, record ``1 - ||nu||**2`` after compressed unitary updates.
         The normalized initial coefficient state is not renormalized during
         unitary evolution, so this is a cheap cumulative norm-loss proxy read
-        from the canonical centre. Non-unitary updates do not produce samples.
-        Projective measurement/reset boundaries additionally snapshot the
-        current segment norm in :attr:`norm_events` before normalizing the
-        selected branch.
+        from the canonical centre. Compressing a dense multi-qubit non-unitary
+        matrix also records its retained norm relative to the local
+        ``G^dagger G`` target norm. Projective measurement/reset boundaries
+        additionally snapshot the current segment norm in :attr:`norm_events`
+        before normalizing the selected branch.
     exact_cooling : bool
         If ``True`` (default), recognize the constructive exact-cooling case
         before a multi-site Pauli rotation. A usable separable stabilizer site
@@ -666,7 +667,9 @@ class MpsStabOptimizer:
     state : STNState
         The evolving stabilizer tensor-network state.
     infidelities : list[float]
-        Cumulative norm-loss samples from compressed unitary ``|nu>`` updates.
+        Cumulative ``infidelity`` samples from compressed updates. Dense
+        non-unitary entries use the local ``G^dagger G`` target norm; projective
+        boundaries are additionally represented in :attr:`norm_events`.
     norm_events : list[NormEventRecord]
         Segment-boundary snapshots made immediately before projective
         measurement/reset normalization. These preserve the pre-collapse
@@ -797,6 +800,7 @@ class MpsStabOptimizer:
 
         self._queue: List[object] = []
         self.infidelities: List[float] = []
+        self._nonunitary_infidelities: List[float] = []
         self.norm_events: List[NormEventRecord] = []
         self.bond_history: List[int] = [self.state.max_bond()]
         self.exact_cooling_events: List[dict] = []
@@ -2371,7 +2375,8 @@ class MpsStabOptimizer:
         ----------
         progbar : bool
             Show a ``tqdm`` progress bar reporting the current stream part and
-            ``norm_infidelity`` diagnostic.
+            the MPS-compatible ``infidelity`` diagnostic. The legacy
+            ``norm_infidelity`` key is emitted alongside it.
         """
         queue = tuple(self._queue)
         completed = 0
@@ -2388,14 +2393,14 @@ class MpsStabOptimizer:
                 if pbar is not None:
                     pbar.update(1)
                     diagnostics = self.norm_diagnostics()
-                    norm_infidelity = diagnostics["norm_infidelity"]
+                    infidelity = diagnostics["infidelity"]
+                    formatted_infidelity = self._format_progress_infidelity(
+                        infidelity
+                    )
                     pbar.set_postfix(
                         part=part,
-                        norm_infidelity=(
-                            "n/a"
-                            if norm_infidelity is None
-                            else f"{norm_infidelity:.2e}"
-                        ),
+                        infidelity=formatted_infidelity,
+                        norm_infidelity=formatted_infidelity,
                     )
         finally:
             if pbar is not None:
@@ -2407,6 +2412,24 @@ class MpsStabOptimizer:
     def apply(self, gates, *, progbar: bool = False) -> "MpsStabOptimizer":
         """Convenience: queue ``gates`` and run immediately."""
         return self.set_gates(gates).run(progbar=progbar)
+
+    @staticmethod
+    def _format_progress_infidelity(value) -> str:
+        """Format the shared MPS/STN progress-bar infidelity field."""
+        if value is None:
+            return "n/a"
+        text = f"{float(value):#.0e}"
+        if "e" not in text:
+            return text
+        mantissa, exponent = text.split("e", 1)
+        sign = exponent[0] if exponent[:1] in "+-" else ""
+        digits = exponent[1:] if sign else exponent
+        digits = digits.lstrip("0") or "0"
+        return f"{mantissa}e{sign}{digits}"
+
+    def get_infidelities(self):
+        """Return the cumulative ``infidelity`` trace like ``MpsOptimizer``."""
+        return self.infidelities
 
     def to_statevector(self) -> np.ndarray:
         """Dense statevector ``|psi> = C|nu>`` (small ``n`` only)."""
@@ -2564,7 +2587,8 @@ class MpsStabOptimizer:
         norm is also folded into the product/geometric summaries. The returned
         values are compression/norm-survival proxies only; measurement branch
         probabilities are kept in the individual events and are not multiplied
-        into the truncation total.
+        into the truncation total. Dense non-unitary matrix updates contribute
+        their ``G^dagger G``-normalized compression loss.
         """
         completed = [
             event
@@ -2579,6 +2603,7 @@ class MpsStabOptimizer:
             for event in completed
             if event.get("projector_infidelity") is not None
         ]
+        completed_nonunitary_losses = list(self._nonunitary_infidelities)
         completed_survivals = []
         for event, unitary_loss in zip(completed, completed_unitary_losses):
             unitary_survival = min(1.0, max(0.0, 1.0 - unitary_loss))
@@ -2589,6 +2614,10 @@ class MpsStabOptimizer:
                 unitary_survival * min(1.0, max(0.0, float(projector_survival)))
             )
         survivals = list(completed_survivals)
+        survivals.extend(
+            min(1.0, max(0.0, 1.0 - loss))
+            for loss in completed_nonunitary_losses
+        )
         current_loss = None
         if (
             include_current
@@ -2601,15 +2630,17 @@ class MpsStabOptimizer:
             survivals.append(min(1.0, max(0.0, 1.0 - current_loss)))
 
         if survivals:
-            total_survival = float(np.prod(survivals))
             if any(survival <= 0.0 for survival in survivals):
+                total_survival = 0.0
                 geometric_mean_survival = 0.0
             else:
+                log_survival = sum(math.log(survival) for survival in survivals)
+                total_survival = float(math.exp(log_survival))
                 geometric_mean_survival = float(
-                    math.exp(sum(math.log(survival) for survival in survivals)
-                             / len(survivals))
+                    math.exp(log_survival / len(survivals))
                 )
             event_losses = [1.0 - survival for survival in completed_survivals]
+            event_losses.extend(completed_nonunitary_losses)
             if current_loss is not None:
                 event_losses.append(current_loss)
             mean_segment_infidelity = float(sum(event_losses) / len(event_losses))
@@ -2641,6 +2672,7 @@ class MpsStabOptimizer:
             "completed_projector_infidelities": [
                 event["projector_infidelity"] for event in completed
             ],
+            "completed_nonunitary_infidelities": completed_nonunitary_losses,
             "completed_combined_infidelities": [
                 float(1.0 - survival) for survival in completed_survivals
             ],
@@ -2648,6 +2680,11 @@ class MpsStabOptimizer:
             "current_segment_infidelity": current_loss,
             "norm_survival": norm_survival,
             "norm_infidelity": norm_infidelity,
+            # MpsOptimizer-compatible public names. ``infidelity`` is the
+            # cumulative multiplicative compression infidelity; it never
+            # includes stochastic measurement branch probabilities.
+            "fidelity": norm_survival,
+            "infidelity": norm_infidelity,
             "norm": norm,
             "total_survival_proxy": norm_survival,
             "total_infidelity_proxy": norm_infidelity,
@@ -2778,6 +2815,14 @@ class MpsStabOptimizer:
         copied._norm_infidelity_valid = self._norm_infidelity_valid
         copied._current_norm_infidelity = self._current_norm_infidelity
         copied._norm_segment_open = self._norm_segment_open
+        copied.infidelities = list(self.infidelities)
+        copied._nonunitary_infidelities = list(self._nonunitary_infidelities)
+        copied.norm_events = [
+            NormEventRecord(**event.as_dict())
+            if isinstance(event, NormEventRecord)
+            else dict(event)
+            for event in self.norm_events
+        ]
         copied.logical_order = list(self.logical_order)
         copied._refresh_layout_map()
         copied.layout_plan = None if self.layout_plan is None else dict(self.layout_plan)
@@ -4867,6 +4912,65 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Explicit gate matrices
     # ------------------------------------------------------------------ #
+    def _dense_gate_target_norm(self, gate: np.ndarray, where) -> float:
+        """Evaluate ``||G|psi>||`` from the local physical ``G^dagger G``.
+
+        The Gram operator is Pauli-decomposed and each physical Pauli is
+        evaluated in the coefficient frame. This is the STN analogue of the
+        ordinary MPS canonical local-expectation path and avoids copying an
+        uncompressed target MPS.
+        """
+        where = (
+            (int(where),)
+            if isinstance(where, Integral)
+            else tuple(int(site) for site in where)
+        )
+        k = len(where)
+        norm_squared = self._norm_squared()
+        if not np.isfinite(norm_squared):
+            raise ValueError(
+                "Cannot evaluate a non-unitary gate target norm from an invalid "
+                f"coefficient norm squared {norm_squared!r}."
+            )
+        if norm_squared <= 0.0:
+            return 0.0
+        gram = np.asarray(gate).conj().T @ np.asarray(gate)
+        expectation = 0.0 + 0.0j
+        for labels, coefficient in pauli_decomposition(
+            gram, k, tol=self.operator_tol
+        ):
+            physical = pauli_string(labels, where, self.n)
+            frame_terms, sign = hermitian_pauli_terms(
+                self.state.frame_pauli(physical)
+            )
+            expectation += complex(coefficient) * self._pauli_expectation(
+                frame_terms, sign
+            )
+        target_squared = float(np.real(expectation)) * norm_squared
+        if target_squared < 0.0:
+            if target_squared > -1.0e-10:
+                target_squared = 0.0
+            else:
+                raise ValueError(
+                    "G^dagger G produced a negative target norm squared: "
+                    f"{target_squared!r}."
+                )
+        return float(target_squared ** 0.5)
+
+    def _nonunitary_compression_infidelity(self, target_norm: float) -> float:
+        """Record local compression infidelity relative to ``G^dagger G``."""
+        target_norm = float(target_norm)
+        approx_norm = float(self.norm())
+        if target_norm <= 1.0e-15:
+            fidelity = 1.0 if approx_norm <= 1.0e-15 else 0.0
+        else:
+            fidelity = (approx_norm / target_norm) ** 2
+            fidelity = min(1.0, max(0.0, fidelity))
+        infidelity = float(1.0 - fidelity)
+        self._nonunitary_infidelities.append(infidelity)
+        self._invalidate_norm_infidelity()
+        return infidelity
+
     def _apply_matrix(self, gate: np.ndarray, where) -> None:
         where = (int(where),) if isinstance(where, Integral) else tuple(int(w) for w in where)
         dim = gate.shape[0]
@@ -4936,6 +5040,11 @@ class MpsStabOptimizer:
                 "already expressed in the coefficient frame; or raise the "
                 "limit explicitly."
             )
+        target_norm = (
+            None
+            if unitary or k < 2
+            else self._dense_gate_target_norm(gate, where)
+        )
         decomp = pauli_decomposition(gate, k, tol=self.operator_tol)
         branches = []  # (weight, {site: axis})
         for labels, coeff in decomp:
@@ -4948,9 +5057,17 @@ class MpsStabOptimizer:
             0 < len(branches) <= _MAX_PAULI_SUM_SUBMPO_TERMS
             and len(support) >= 2
         ):
-            self._record(self._apply_pauli_sum_submpo(branches, unitary=unitary))
+            self._record(
+                self._apply_pauli_sum_submpo(
+                    branches, unitary=unitary, target_norm=target_norm
+                )
+            )
         else:
-            self._record(self._apply_operator_sum(branches, unitary=unitary))
+            self._record(
+                self._apply_operator_sum(
+                    branches, unitary=unitary, target_norm=target_norm
+                )
+            )
 
     def _coalesce_operator_sum(self, branches):
         """Combine equal Pauli-string branches and prune exact/tolerant zeros."""
@@ -4967,25 +5084,33 @@ class MpsStabOptimizer:
             if abs(weight) > tol
         )
 
-    def _apply_pauli_sum_submpo(self, branches, *, unitary: bool) -> Optional[float]:
+    def _apply_pauli_sum_submpo(
+        self, branches, *, unitary: bool, target_norm: Optional[float] = None
+    ) -> Optional[float]:
         """Apply a sparse Pauli-product sum as one exact coefficient-frame MPO."""
         mapped = tuple(
             (weight, self._mps_terms(sites))
             for weight, sites in branches
         )
         mpo, where = pauli_sum_submpo(mapped, self.n, dtype=self.dtype)
-        infidelity = self._evolve_p(self._bk_mpo(mpo), where, unitary=unitary)
-        if not unitary:
+        if unitary:
+            return self._evolve_p(self._bk_mpo(mpo), where, unitary=True)
+        self._evolve_p(self._bk_mpo(mpo), where)
+        if target_norm is None:
             self._invalidate_norm_infidelity()
-        return infidelity
+            return None
+        return self._nonunitary_compression_infidelity(target_norm)
 
-    def _apply_operator_sum(self, branches, *, unitary: bool) -> Optional[float]:
+    def _apply_operator_sum(
+        self, branches, *, unitary: bool, target_norm: Optional[float] = None
+    ) -> Optional[float]:
         """Apply ``M = sum_j w_j (prod_i P_i)`` to the coefficient MPS ``p``.
 
         Each branch scales a copy of ``p`` by ``w_j`` and applies its
         (bond-preserving) single-qubit Paulis; the branches are summed and
         compressed to ``chi``/``cutoff``. Unitary sums return the cumulative
-        norm-loss proxy; arbitrary non-unitary sums invalidate that diagnostic.
+        norm-loss proxy. Dense non-unitary sums return the retained norm ratio
+        when a physical ``G^dagger G`` target norm was supplied.
         """
         p = self.state.p
         branches = tuple(branches)
@@ -4993,6 +5118,8 @@ class MpsStabOptimizer:
             self._set_zero_coefficient_state()
             if unitary:
                 return self._unitary_norm_infidelity()
+            if target_norm is not None:
+                return self._nonunitary_compression_infidelity(target_norm)
             self._invalidate_norm_infidelity()
             return None
 
@@ -5039,6 +5166,8 @@ class MpsStabOptimizer:
         self.state.info["cur_orthog"] = (0, 0)
         if unitary:
             return self._unitary_norm_infidelity()
+        if target_norm is not None:
+            return self._nonunitary_compression_infidelity(target_norm)
         self._invalidate_norm_infidelity()
         return None
 

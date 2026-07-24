@@ -100,6 +100,91 @@ def test_mps_optimizer_accepts_svd_mode():
     assert opt.mode == "svd"
 
 
+def test_mps_optimizer_can_disable_infidelity_tracking(monkeypatch):
+    """Disabled tracking skips diagnostic target and retained-norm work."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="svd",
+        track_infidelity=False,
+    )
+
+    def fail_diagnostic(*_args, **_kwargs):
+        raise AssertionError("infidelity diagnostics should be disabled")
+
+    monkeypatch.setattr(py.MpsOptimizer, "_raw_state_norm", fail_diagnostic)
+    monkeypatch.setattr(
+        py.MpsOptimizer,
+        "_canonical_span_norm",
+        fail_diagnostic,
+    )
+
+    out = opt.run(progbar=False, cutoff=1.0e-12)
+
+    assert out.max_bond() <= 2
+    assert opt.get_infidelities() == [0.0]
+    assert opt.get_infidelity_samples() == []
+
+
+def test_mps_optimizer_run_can_override_infidelity_tracking():
+    """A run-level override should enable diagnostics without reconstruction."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="svd",
+        track_infidelity=False,
+    )
+
+    opt.run(progbar=False, cutoff=1.0e-12, track_infidelity=True)
+
+    assert opt.track_infidelity is True
+    assert len(opt.get_infidelity_samples()) == 1
+
+
+def test_mps_optimizer_simple_update_routes_torch_u1u1_long_range_gate():
+    """SU routed SWAPs should stay on the live Torch Symmray backend."""
+    torch = pytest.importorskip("torch")
+
+    backend = py.backend_torch(dtype=torch.float64, device="cpu")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=1.0,
+        U=8.0,
+        dtype="float64",
+    )
+    state = py.hrs_to_mps(
+        4,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
+        chi=4,
+        seed=1,
+        dtype="float64",
+        cyclic=False,
+    )
+    state.apply_to_arrays(backend)
+    fermion.to_backend = backend
+    hopping = fermion.hopping_gate(0.001, imaginary=True)
+
+    optimizer = py.MpsOptimizer(
+        state,
+        gates=[(hopping, (0, 3))],
+        chi=4,
+        mode="su",
+        track_infidelity=False,
+        inplace=True,
+    )
+    out = optimizer.run(progbar=False, cutoff=1.0e-10, non_unitary=True)
+
+    assert type(out[0].data).__name__ == "U1U1FermionicArray"
+    assert out.max_bond() <= 4
+    assert len(optimizer.gauges) == out.L - 1
+
+
 def test_mps_optimizer_accepts_perm_mode():
     """Perm mode should expose an identity logical-to-physical ordering initially."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -2172,6 +2257,54 @@ def test_mps_optimizer_expectation_uses_local_canonical_path(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["normalized"] is True
     assert calls[0]["info"] is opt.info_c
+
+
+def test_mps_optimizer_expectation_converts_operator_to_state_backend(monkeypatch):
+    """The local expectation operator should pass through backend conversion."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(4, 2, seed=8), gates=[], chi=4, mode="mpo"
+    )
+    converted = []
+    original = opt._to_state_backend
+
+    def recording(array):
+        converted.append(array)
+        return original(array)
+
+    monkeypatch.setattr(opt, "_to_state_backend", recording)
+    opt._state_expectation("Z", (1,))  # pylint: disable=protected-access
+
+    assert len(converted) == 1
+    assert converted[0].shape == (2, 2)
+
+
+def test_mps_optimizer_local_expectation_uses_torch_state_backend(monkeypatch):
+    """Torch-backed control expectations should stay on the Torch backend."""
+    torch = pytest.importorskip("torch")
+    vector = torch.tensor([1.0, 1.0], dtype=torch.complex128)
+    vector = vector / torch.linalg.vector_norm(vector)
+    opt = py.MpsOptimizer(
+        qtn.MPS_product_state([vector.clone() for _ in range(3)]),
+        gates=[],
+        chi=4,
+        mode="mpo",
+    )
+    observed_operators = []
+    original = qtn.MatrixProductState.local_expectation_canonical
+
+    def recording(self, operator, *args, **kwargs):
+        observed_operators.append(operator)
+        return original(self, operator, *args, **kwargs)
+
+    monkeypatch.setattr(
+        qtn.MatrixProductState,
+        "local_expectation_canonical",
+        recording,
+    )
+    assert opt._state_expectation("Z", (1,)) == pytest.approx(0.0)
+
+    assert isinstance(observed_operators[0], torch.Tensor)
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in opt.p.tensors)
 
 
 @pytest.mark.parametrize(

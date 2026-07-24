@@ -263,5 +263,36 @@ For public API changes also run the public API and package-layout tests. For
 notebook changes, do not modify generated outputs unless explicitly requested;
 validate the relevant setup and measurement cells in a controlled run.
 
+## Performance baseline and run planning
+
+The native `TorchFermionVMC` path is functionally usable for the current
+4x6, `D=4`, spinful `U1U1` workflow. A completed CPU run with target sector
+`(N_up, N_down) = (12, 12)` produced finite amplitudes, valid-sector
+diagnostics, stable SR linear solves, consistent boundary/CTMRG estimates,
+and a final JSONL record with `status="ok"`. The deterministic PEPS energy
+was `E/N = -0.425322`; the post-optimization boundary estimate was
+`E/N = -0.424972 +/- 0.000691`, and the exact final diagnostic was
+`E/N = -0.425612 +/- 0.000726`. These values are a functional baseline, not
+an optimizer or ground-state convergence certificate.
+
+The same run took about 10.5 hours on CPU. The dominant cost was repeated
+local-estimator amplitude contraction, not DMRG or SR: each 2,000-sample
+boundary or CTMRG measurement took roughly 2.1--2.3 hours, while the eight
+SR steps took only minutes. The final exact 2,000-sample diagnostic took about
+1.3 hours. Boundary and CTMRG were numerically indistinguishable at the
+reported precision in this baseline, but both were still evaluated. The
+connected-amplitude cache also recorded tens of thousands of fallback
+contractions, which explains why sampler acceptance and chain mixing alone do
+not predict runtime.
+
+For development runs, use one measurement contraction, a smaller measurement
+bond (for example `chi=32`), 256--512 diagnostic samples, and one or two VMC
+steps. Omit redundant `measurement_grid` entries until the amplitude and
+estimator paths are validated. Re-enable larger samples, boundary/CTMRG
+cross-checks, and final diagnostics only for a production measurement. CPU
+thread limits such as `OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1` should be
+changed only in controlled benchmarks because extra threads can increase
+memory use and oversubscription.
+
 Preserve unrelated user changes in the worktree. Do not recreate Gaugy,
 Tensy, or an upstream `vmc_torch` package inside Pepsy.

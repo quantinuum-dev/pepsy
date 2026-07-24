@@ -53,8 +53,11 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
 
 ## Diagnostic contract
 
-- Treat `track_infidelity` as a **normalized-unitary norm-loss proxy**, not exact overlap
-  fidelity, per-gate discarded SVD weight, or a general non-unitary error metric.
+- Treat `track_infidelity` as the canonical ``infidelity`` API. For unitary
+  updates it is the normalized norm-loss proxy; for compressed dense
+  non-unitary matrices the retained norm ratio is measured against the local
+  physical ``G^dagger G`` target. It is not a general ideal-circuit overlap
+  calculation.
 - Read `1 - ||p||^2` from the tracked one-site canonical centre, including Quimb's MPS
   `exponent`. Do not build an uncapped target, contract `<target|p>`, or renormalize after
   a unitary update.
@@ -62,26 +65,31 @@ basis; magic / non-stabilizerness lives in $|\nu\rangle$.
   unitaries, measurements/projectors, arbitrary non-unitary matrices, and `submpo` events
   emit no sample. Never sum this list; each emitted value is already cumulative within its
   normalized unitary segment.
-- An unnormalized non-unitary matrix or coefficient-frame `submpo` invalidates the proxy,
-  so later unitaries remain unreported. A normalized projective collapse starts a fresh
-  segment at zero but does not itself append a sample.
+- An unnormalized non-unitary matrix invalidates the current unitary norm
+  segment after recording its ``G^dagger G``-normalized compression loss.
+  A coefficient-frame `submpo` has no certified physical target norm and
+  invalidates the unitary proxy without adding a sample. A normalized
+  projective collapse starts a fresh segment at zero but does not itself append
+  a unitary sample.
 - Projective measurement/reset boundaries are recorded separately in `.norm_events`.
   Each event snapshots the pre-collapse unitary segment norm, the physical Born branch
   probability, the actual projected norm before renormalization, and the post-normalized
   norm. Compare `projected_norm_sq` to `pre_norm_sq * branch_probability` to get the
   projector-compression proxy `projector_infidelity`. Use `norm_diagnostics()` for
   product/geometric summaries that multiply unitary and projector compression-survival
-  factors, but never measurement probabilities. Prefer `norm_infidelity`,
-  `norm_survival`, and `norm`; the older `total_*_proxy` keys are compatibility
-  aliases. `geometric_mean_norm` is only the per-segment geometric mean, not the
+  factors, but never measurement probabilities. Prefer `infidelity`, `fidelity`,
+  `norm_survival`, and `norm`; `norm_infidelity` and
+  the older `total_*_proxy` keys are compatibility aliases. `geometric_mean_norm`
+  is only the per-segment geometric mean, not the
   total norm summary.
 - A selected `TrajectoryEvent` Kraus outcome is a normalized trajectory
   boundary. Before applying its non-unitary matrix, snapshot the current
   segment with its branch probability; normalize the selected branch at the
   canonical centre, reset the proxy, and commit a `"trajectory_kraus"` norm
   event. This lets later unitary steps track a fresh segment without treating
-  the Born probability as compression loss. STN progress reports only
-  `norm_infidelity` plus a compact stream `part` label.
+  the Born probability as compression loss. STN progress reports the shared
+  `infidelity` field plus a compact stream `part` label and retains
+  `norm_infidelity` as a compatibility alias.
 - Treat stream-local stochastic entries as the primary Pepsy noise design.
   `("x_error", p, q)`, `("depolarize1", p, q)`,
   `("depolarize2", p, q0, q1)`, `("pauli_channel1", probs, q)`,

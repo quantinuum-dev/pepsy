@@ -43,8 +43,10 @@ from pepsy.tensors import (
     backend_torch,
     default_physical_sectors,
     haar_random_state,
+    hrs_to_ttn,
     ps_to_3dpeps,
     ps_to_peps,
+    ps_to_ttn,
     reg_complex_qr_torch,
     reg_complex_svd_jax,
     reg_complex_svd_torch,
@@ -56,13 +58,22 @@ from pepsy.tensors import (
     site_charge_from_occupations,
 )
 from pepsy.vmc import (
+    ContractionConfig,
     FermionSiteEncoding,
+    MCState,
+    NetKetVMCSetup,
+    OptimizationConfig,
+    SamplingConfig,
+    SpinlessSiteEncoding,
     TorchPEPSAmplitude,
     TorchPEPSBoundaryAmplitude,
     TorchVMCDriver,
+    TorchVMCSetup,
     TorchVMCStepResult,
     TorchSquareLattice,
     apply_torch_sr_update,
+    build_netket_vmc,
+    build_torch_vmc,
     build_heisenberg_vmc,
     build_ising_vmc,
     heisenberg_connections,
@@ -74,6 +85,12 @@ from pepsy.vmc import (
     spinful_fermi_hubbard_connections,
     square_lattice_edges,
     torch_log_derivative_matrix,
+    VMCBackendCapabilityError,
+    VMCMeasurement,
+    VMCOptimizationResult,
+    VMC,
+    VMCProblem,
+    VMCSamples,
 )
 
 
@@ -115,8 +132,10 @@ def test_new_namespace_imports_resolve():
     assert callable(default_physical_sectors)
     assert callable(backend_torch)
     assert callable(haar_random_state)
+    assert callable(hrs_to_ttn)
     assert callable(ps_to_peps)
     assert callable(ps_to_3dpeps)
+    assert callable(ps_to_ttn)
     assert callable(reg_rel_svd_torch)
     assert callable(reg_real_svd_torch)
     assert callable(reg_complex_svd_torch)
@@ -127,14 +146,29 @@ def test_new_namespace_imports_resolve():
     assert callable(reg_complex_svd_jax)
     assert callable(site_charge_from_occupations)
     assert FermionSiteEncoding is not None
+    assert ContractionConfig is not None
+    assert SamplingConfig is not None
+    assert OptimizationConfig is not None
+    assert MCState is not None
+    assert VMC is not None
+    assert VMCProblem is not None
+    assert VMCSamples is not None
+    assert VMCMeasurement is not None
+    assert VMCOptimizationResult is not None
+    assert issubclass(VMCBackendCapabilityError, NotImplementedError)
+    assert SpinlessSiteEncoding is not None
     assert TorchPEPSAmplitude is not None
     assert TorchPEPSBoundaryAmplitude is not None
     assert TorchVMCDriver is not None
+    assert TorchVMCSetup is not None
+    assert NetKetVMCSetup is not None
     assert TorchVMCStepResult is not None
     assert TorchSquareLattice is not None
     assert callable(apply_torch_sr_update)
     assert callable(build_heisenberg_vmc)
     assert callable(build_ising_vmc)
+    assert callable(build_torch_vmc)
+    assert callable(build_netket_vmc)
     assert callable(heisenberg_connections)
     assert callable(make_fermionic_peps_batched_amplitude_function)
     assert callable(make_peps_batched_amplitude_function)

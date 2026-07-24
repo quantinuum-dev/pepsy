@@ -12,6 +12,14 @@ def test_package_version_available():
     assert pepsy.__version__
 
 
+def test_tree_optimizers_are_available_from_high_level_api():
+    """Tree layout and execution helpers resolve from ``import pepsy as py``."""
+    from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer
+
+    assert pepsy.TreeLayoutFinder is TreeLayoutFinder
+    assert pepsy.TreeOptimizer is TreeOptimizer
+
+
 _EXPECTED_IN_ALL = [
     "backends", "boundary", "fitting", "operators", "optimizers",
     "sampling", "solvers", "tensors", "vmc",
@@ -22,12 +30,13 @@ _EXPECTED_IN_ALL = [
     "pauli", "x", "y", "z", "s", "sdg", "t", "tdg", "h", "hadamard",
     "cnot", "cx", "cy", "cz", "swap", "iswap", "phase", "u1", "u2",
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
-    "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
-    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "make_numpy_array_caster", "to_float", "SweepOptimizer",
+    "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "hrs_to_mps", "hrs_to_peps", "hrs_to_ttn", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
+    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "make_numpy_array_caster", "to_float", "SweepOptimizer",
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult",
     "PepsBpSampler", "MpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "one_norm_bp", "tn_fidelity", "tn_norm",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
     "MpsStabOptimizer", "STNState", "StabilizerMpsSimulator",
+    "TreeLayoutFinder",
     "TreeOptimizer",
     "TreeTensorNetwork",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
@@ -38,7 +47,7 @@ _EXPECTED_IN_ALL = [
     "TrajectoryChannel", "TrajectoryEvent", "TrajectoryOutcome", "TrajectoryRecord", "TrajectorySample", "TrajectoryShotResult",
     "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stim_shots", "run_trajectory_shots",
     "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
-    "Fermion", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
+    "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
     "default_physical_sectors", "draw_symmray_blocks", "draw_symmray_mps", "draw_symmray_mpo", "draw_symmray_peps",
     "fermi_hubbard_u1u1_gate_stream", "fermi_hubbard_u1u1_hopping_gate_stream",
     "fermi_hubbard_u1u1_interaction_gate_stream", "fermi_hubbard_u1u1_light_pulse_gate_stream",
@@ -92,17 +101,18 @@ _CALLABLE_EXPORTS = [
     "x", "y", "z", "s", "sdg", "t", "tdg", "h", "hadamard",
     "cnot", "cx", "cy", "cz", "swap", "iswap", "phase", "u1", "u2",
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
-    "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
-    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "SweepOptimizer",
+    "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "hrs_to_mps", "hrs_to_peps", "hrs_to_ttn", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
+    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "SweepOptimizer",
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "MpsStabOptimizer", "StabilizerMpsSimulator",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
     "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult", "StreamAnalysisRecord",
     "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
+    "TreeLayoutFinder",
     "TreeOptimizer",
     "TreeTensorNetwork",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
-    "tn_fidelity", "tn_norm", "Fermion", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
+    "tn_fidelity", "tn_norm", "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
     "default_physical_sectors", "draw_symmray_blocks", "draw_symmray_mps", "draw_symmray_mpo", "draw_symmray_peps",
     "fermi_hubbard_u1u1_gate_stream", "fermi_hubbard_u1u1_hopping_gate_stream",
     "fermi_hubbard_u1u1_interaction_gate_stream", "fermi_hubbard_u1u1_light_pulse_gate_stream",

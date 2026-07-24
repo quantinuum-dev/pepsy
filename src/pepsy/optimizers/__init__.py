@@ -65,7 +65,7 @@ from .stabilizer_tn import (
 )
 from .sym_dmrg import SymDMRG2
 from .sweep import SweepOptimizer
-from .tree import TreeOptimizer, TreeTensorNetwork
+from .tree import TreeLayoutFinder, TreeOptimizer, TreeTensorNetwork
 
 __all__ = [
     "CoalescedMeasurementRecord",
@@ -113,6 +113,7 @@ __all__ = [
     "SimpleUpdateGen",
     "SymDMRG2",
     "SweepOptimizer",
+    "TreeLayoutFinder",
     "TreeOptimizer",
     "TreeTensorNetwork",
     "compile_stim_circuit",
