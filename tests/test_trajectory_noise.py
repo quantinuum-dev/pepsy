@@ -1,8 +1,5 @@
 """Regression tests for user-defined MPS quantum-trajectory channels."""
 
-import importlib.util
-from pathlib import Path
-
 import numpy as np
 import pytest
 import quimb.tensor as qtn
@@ -499,27 +496,3 @@ def test_coalesced_terminal_sampling_uses_stn_tree_sampler_without_probs():
 
     assert samples.probs is None
     np.testing.assert_array_equal(samples.configs, np.zeros((10, 2), dtype=np.int8))
-
-
-def test_coalesced_trajectory_benchmark_reports_branch_reduction():
-    """The benchmark remains a lightweight, JSON-ready downstream harness."""
-    path = Path(__file__).resolve().parents[1] / "benchmarks" / "coalesced_trajectory_scaling.py"
-    spec = importlib.util.spec_from_file_location("coalesced_trajectory_benchmark", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-
-    row = module.run_case(
-        n=2,
-        depth=1,
-        shots=4,
-        probability=0.0,
-        chi=2,
-        seed=4,
-    )
-
-    assert row["represented_shots"] == 4
-    assert row["independent_states"] == 4
-    assert row["coalesced_states"] == 1
-    assert row["state_reduction"] == pytest.approx(4.0)
-    assert row["expected_faults"] == 0.0

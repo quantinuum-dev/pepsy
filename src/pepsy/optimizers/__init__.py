@@ -1,162 +1,106 @@
-"""High-level tensor-network optimizers."""
+"""High-level tensor-network optimizers.
+
+The optimizer domains are loaded on demand. Several of them depend on
+optional numerical stacks, so importing this namespace stays inexpensive.
+"""
 
 from importlib import import_module
 
-from .energy import EnergyEstimate, MpsEnergyOptimizer, PepsEnergyOptimizer
-from .global_opt import GlobalOptimizer
-from .mera import (
-    MeraEnergyOptimizer,
-    QMeraBuilder,
-    QMeraGeometry,
-    QMeraParametricEnergyOptimizer,
-    build_qmera_contraction_optimizer,
-)
-from .mpo import MpoOptimizer
-from .mps import MpsOptimizer
-from .noise import (
-    CoalescedMeasurementRecord,
-    CoalescedSampleResult,
-    CoalescedTrajectoryLeaf,
-    CoalescedTrajectoryResult,
-    LeakageRecord,
-    NoisyShotResult,
-    PauliErrorModel,
-    PauliFault,
-    StimCircuitPlan,
-    StimHerald,
-    StimNoiseSample,
-    StimShotResult,
-    TrajectoryChannel,
-    TrajectoryEvent,
-    TrajectoryOutcome,
-    TrajectoryRecord,
-    TrajectorySample,
-    TrajectoryShotResult,
-    compile_stim_circuit,
-    run_coalesced_noisy_shots,
-    run_coalesced_stim_shots,
-    run_coalesced_trajectory_shots,
-    run_noisy_shots,
-    run_stim_shots,
-    run_trajectory_shots,
-    sample_noisy_gate_stream,
-    sample_noisy_gate_streams,
-    sample_stim_circuit,
-    sample_stim_circuits,
-    sample_trajectory_stream,
-    sample_coalesced_bits,
-)
-from .peps import PepsOptimizer, SimpleUpdateGen
-from .stabilizer_tn import (
-    DeferredInjectionRecord,
-    DeferredInjectionReport,
-    DeferredProjectionRecord,
-    ImmediateInjectionReport,
-    ImmediateProjectionRecord,
-    MeasurementRecord,
-    MpsStabOptimizer,
-    NormEventRecord,
-    STNState,
-    StabilizerMpsSettingsAdvice,
-    StabilizerMpsSimulator,
-    StabilizerMpsRunResult,
-    StreamAnalysisRecord,
-    run_stabilizer_mps_stream,
-)
-from .sym_dmrg import SymDMRG2
-from .sweep import SweepOptimizer
-from .tree import TreeLayoutFinder, TreeOptimizer, TreeTensorNetwork
 
-__all__ = [
-    "CoalescedMeasurementRecord",
-    "CoalescedSampleResult",
-    "CoalescedTrajectoryLeaf",
-    "CoalescedTrajectoryResult",
-    "EnergyEstimate",
-    "GlobalOptimizer",
-    "DeferredInjectionRecord",
-    "DeferredInjectionReport",
-    "DeferredProjectionRecord",
-    "ImmediateInjectionReport",
-    "ImmediateProjectionRecord",
-    "LeakageRecord",
-    "MeasurementRecord",
-    "MeraEnergyOptimizer",
-    "MpoOptimizer",
-    "MpsEnergyOptimizer",
-    "MpsOptimizer",
-    "MpsStabOptimizer",
-    "NormEventRecord",
-    "NoisyShotResult",
-    "PauliErrorModel",
-    "PauliFault",
-    "StimCircuitPlan",
-    "StimHerald",
-    "StimNoiseSample",
-    "StimShotResult",
-    "TrajectoryChannel",
-    "TrajectoryEvent",
-    "TrajectoryOutcome",
-    "TrajectoryRecord",
-    "TrajectorySample",
-    "TrajectoryShotResult",
-    "STNState",
-    "StabilizerMpsSettingsAdvice",
-    "StabilizerMpsSimulator",
-    "StabilizerMpsRunResult",
-    "StreamAnalysisRecord",
-    "PepsEnergyOptimizer",
-    "PepsOptimizer",
-    "QMeraBuilder",
-    "QMeraGeometry",
-    "QMeraParametricEnergyOptimizer",
-    "SimpleUpdateGen",
-    "SymDMRG2",
-    "SweepOptimizer",
-    "TreeLayoutFinder",
-    "TreeOptimizer",
-    "TreeTensorNetwork",
-    "compile_stim_circuit",
-    "build_qmera_contraction_optimizer",
-    "run_coalesced_noisy_shots",
-    "run_coalesced_stim_shots",
-    "run_coalesced_trajectory_shots",
-    "run_noisy_shots",
-    "run_stabilizer_mps_stream",
-    "run_stim_shots",
-    "run_trajectory_shots",
-    "sample_noisy_gate_stream",
-    "sample_noisy_gate_streams",
-    "sample_stim_circuit",
-    "sample_stim_circuits",
-    "sample_trajectory_stream",
-    "sample_coalesced_bits",
+_SYMBOL_MODULES = {
+    "EnergyEstimate": ".energy",
+    "MpsEnergyOptimizer": ".energy",
+    "PepsEnergyOptimizer": ".energy",
+    "TreeEnergyOptimizer": ".energy",
+    "GlobalOptimizer": ".global_opt",
+    "MeraEnergyOptimizer": ".mera",
+    "QMeraBuilder": ".mera",
+    "QMeraGeometry": ".mera",
+    "QMeraParametricEnergyOptimizer": ".mera",
+    "build_qmera_contraction_optimizer": ".mera",
+    "MpoOptimizer": ".mpo",
+    "MpsOptimizer": ".mps",
+    "PepsOptimizer": ".peps",
+    "SimpleUpdateGen": ".peps",
+    "SymDMRG2": ".sym_dmrg",
+    "SweepOptimizer": ".sweep",
+    "TreeLayoutFinder": ".tree",
+    "TreeOptimizer": ".tree",
+    "TreeStabOptimizer": ".tree_stabilizer",
+    "TreeTensorNetwork": ".tree",
+    "CoalescedMeasurementRecord": ".noise",
+    "CoalescedSampleResult": ".noise",
+    "CoalescedTrajectoryLeaf": ".noise",
+    "CoalescedTrajectoryResult": ".noise",
+    "LeakageRecord": ".noise",
+    "NoisyShotResult": ".noise",
+    "PauliErrorModel": ".noise",
+    "PauliFault": ".noise",
+    "StimCircuitPlan": ".noise",
+    "StimHerald": ".noise",
+    "StimNoiseSample": ".noise",
+    "StimShotResult": ".noise",
+    "TrajectoryChannel": ".noise",
+    "TrajectoryEvent": ".noise",
+    "TrajectoryOutcome": ".noise",
+    "TrajectoryRecord": ".noise",
+    "TrajectorySample": ".noise",
+    "TrajectoryShotResult": ".noise",
+    "compile_stim_circuit": ".noise",
+    "run_coalesced_noisy_shots": ".noise",
+    "run_coalesced_stim_shots": ".noise",
+    "run_coalesced_trajectory_shots": ".noise",
+    "run_noisy_shots": ".noise",
+    "run_stim_shots": ".noise",
+    "run_trajectory_shots": ".noise",
+    "sample_noisy_gate_stream": ".noise",
+    "sample_noisy_gate_streams": ".noise",
+    "sample_stim_circuit": ".noise",
+    "sample_stim_circuits": ".noise",
+    "sample_trajectory_stream": ".noise",
+    "sample_coalesced_bits": ".noise",
+    "DeferredInjectionRecord": ".stabilizer_tn",
+    "DeferredInjectionReport": ".stabilizer_tn",
+    "DeferredProjectionRecord": ".stabilizer_tn",
+    "ImmediateInjectionReport": ".stabilizer_tn",
+    "ImmediateProjectionRecord": ".stabilizer_tn",
+    "MeasurementRecord": ".stabilizer_tn",
+    "MpsStabOptimizer": ".stabilizer_tn",
+    "NormEventRecord": ".stabilizer_tn",
+    "STNState": ".stabilizer_tn",
+    "StabilizerMpsSettingsAdvice": ".stabilizer_tn",
+    "StabilizerMpsSimulator": ".stabilizer_tn",
+    "StabilizerMpsRunResult": ".stabilizer_tn",
+    "StreamAnalysisRecord": ".stabilizer_tn",
+    "run_stabilizer_mps_stream": ".stabilizer_tn",
+}
+
+_SUBMODULES = (
     "energy",
     "global_opt",
     "mera",
     "mpo",
     "mps",
+    "noise",
     "peps",
     "stabilizer_tn",
     "sym_dmrg",
     "sweep",
     "tree",
-]
+    "tree_stabilizer",
+)
+
+__all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 
 
 def __getattr__(name):
-    if name in {
-        "energy",
-        "global_opt",
-        "mera",
-        "mpo",
-        "mps",
-        "noise",
-        "peps",
-        "stabilizer_tn",
-        "sym_dmrg",
-        "sweep",
-        "tree",
-    }:
-        return import_module(f".{name}", __name__)
+    module_name = _SYMBOL_MODULES.get(name)
+    if module_name is not None:
+        value = getattr(import_module(module_name, __name__), name)
+        globals()[name] = value
+        return value
+    if name in _SUBMODULES:
+        value = import_module(f".{name}", __name__)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

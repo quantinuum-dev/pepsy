@@ -15,9 +15,11 @@ pepsy.operators     gates, gate application, MPO/PEPO builders, Hamiltonians
 pepsy.boundary      boundary-MPS states, sweeps, metrics
 pepsy.solvers       gradient and finite-difference parameter solvers
 pepsy.fitting       local tensor fitting routines
-pepsy.optimizers    high-level MPS, MPO, and PEPS optimizers
+pepsy.optimizers    high-level MPS, MPO, PEPS, MERA, BP, and STN optimizers
 pepsy.sampling      MPS, vector, and PEPS samplers
 pepsy.vmc           optional Torch and NetKet/JAX VMC adapters (`MCState` + `VMC` portable façade)
+pepsy.bp            belief propagation, loop expansions, and PNE methods
+pepsy.extensions    lazy, clearly marked entry points for optional/advanced domains
 pepsy._internal     private formatting and utility helpers
 ```
 
@@ -36,6 +38,10 @@ from pepsy.tensors import (
     ps_to_mps,
     ps_to_ttn,
 )
+
+# Optional or advanced domains can be made explicit at the call site.
+from pepsy.extensions.vmc import TorchVMCDriver
+from pepsy.extensions.bp import gauge_all
 ```
 
 When a leaf module is needed, import the new implementation path directly:
@@ -58,8 +64,8 @@ internal development.
 3. Keep the boundary subsystem together: states, sweeps, metrics.
 4. Keep optimizer implementations under `pepsy.optimizers`.
 5. Split `pepsy.tensors.core` into maps, constructors, contractions, and observables.
-6. Split `pepsy.operators.gates` last because it mixes primitives, routing, builders, and
-   1D/2D/3D application logic.
+6. Keep standard gate primitives separate from routing and tensor-network application.
+7. Keep optional/advanced integrations behind `pepsy.extensions` and lazy imports.
 
 After each phase, run:
 

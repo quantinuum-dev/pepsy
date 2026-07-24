@@ -1,117 +1,32 @@
-"""Tensor-network maps, constructors, contractions, and validation."""
+"""Tensor-network maps, constructors, contractions, and validation.
+
+The tensor domains are exposed through a lazy compatibility namespace.  The
+implementation is split into focused modules, while existing imports from
+``pepsy.tensors`` continue to resolve unchanged.
+"""
 
 from importlib import import_module
 
-from .validation import validate_tensor_network_tags
-from .symmetric import (
-    FermionLatticeSetup,
-    SymGateStream,
-    SymHamiltonian,
-    SymMPS,
-    SymPEPS,
-    default_physical_sectors,
-    draw_symmray_blocks,
-    draw_symmray_mps,
-    draw_symmray_mpo,
-    draw_symmray_peps,
-    fermi_hubbard_u1u1_gate_stream,
-    fermi_hubbard_u1u1_hopping_gate_stream,
-    fermi_hubbard_u1u1_interaction_gate_stream,
-    fermi_hubbard_u1u1_light_pulse_gate_stream,
-    fermi_hubbard_u1u1_jw_gate_stream,
-    fermi_hubbard_u1u1_jw_hopping_gate_stream,
-    fermi_hubbard_u1u1_jw_interaction_gate_stream,
-    fermion_density_param_gen,
-    fermion_hopping_param_gen,
-    fermion_interaction_param_gen,
-    sector_index_map,
-    site_charge_alternating,
-    site_charge_from_map,
-    site_charge_from_occupations,
-    site_charge_uniform,
-    symmray_block_summary,
-    symmray_mps_summary,
-    symmray_mpo_summary,
-    symmray_peps_summary,
-    symm_operator_from_dense,
-)
-from .symm_fermions import (
-    Fermion,
-    SpinfulFermion,
-    SpinfulFermionHubbard,
-    SymmFermions,
-)
-from .core import (
-    OneDMap,
-    add_cycle,
-    backend_cupy,
-    backend_jax,
-    backend_numpy,
-    backend_torch,
-    build_compressed_optimizer,
-    build_optimizer,
-    contract_hypercompressed_tn,
-    contract_hypercompressed_tn_batch,
-    expec_mpo,
-    get_default_array_backend,
-    get_default_grad_backend,
-    haar_random_state,
-    hrs_to_mps,
-    hrs_to_peps,
-    hrs_to_ttn,
-    hrps_to_mps,
-    hrps_to_peps,
-    hrps_to_ttn,
-    id_to_mpo,
-    id_to_pepo,
-    measure_obs,
-    ps_to_3dpeps,
-    ps_to_mpo,
-    ps_to_mps,
-    ps_to_ttn,
-    ps_to_pepo,
-    ps_to_peps,
-    random_haar_qubit,
-    reg_complex_qr_torch,
-    reg_complex_svd_jax,
-    reg_complex_svd_torch,
-    reg_real_qr_torch,
-    reg_real_svd_jax,
-    reg_real_svd_torch,
-    reg_rel_svd_jax,
-    reg_rel_svd_torch,
-    reg_stop_gradient_torch,
-    register_torch_linalg,
-    reset_default_backends,
-    set_default_array_backend,
-    set_default_grad_backend,
-    stop_grad,
-    tn_fidelity,
-    tn_norm,
-    tns_align,
-)
 
-__all__ = [
+_SYMBOL_MODULES = {}
+
+
+def _register(module, *names):
+    for name in names:
+        _SYMBOL_MODULES[name] = module
+
+
+_register(
+    ".maps",
     "OneDMap",
-    "Fermion",
+)
+_register(
+    ".symmetric",
     "FermionLatticeSetup",
-    "SpinfulFermion",
-    "SpinfulFermionHubbard",
-    "SymmFermions",
     "SymGateStream",
     "SymHamiltonian",
     "SymMPS",
     "SymPEPS",
-    "add_cycle",
-    "backend_cupy",
-    "backend_jax",
-    "backend_numpy",
-    "backend_torch",
-    "build_compressed_optimizer",
-    "build_optimizer",
-    "contract_hypercompressed_tn",
-    "contract_hypercompressed_tn_batch",
-    "expec_mpo",
     "default_physical_sectors",
     "draw_symmray_blocks",
     "draw_symmray_mps",
@@ -127,8 +42,28 @@ __all__ = [
     "fermion_density_param_gen",
     "fermion_hopping_param_gen",
     "fermion_interaction_param_gen",
-    "get_default_array_backend",
-    "get_default_grad_backend",
+    "sector_index_map",
+    "site_charge_alternating",
+    "site_charge_from_map",
+    "site_charge_from_occupations",
+    "site_charge_uniform",
+    "symmray_block_summary",
+    "symmray_mps_summary",
+    "symmray_mpo_summary",
+    "symmray_peps_summary",
+    "symm_operator_from_dense",
+)
+_register(
+    ".symm_fermions",
+    "Fermion",
+    "SpinfulFermion",
+    "SpinfulFermionHubbard",
+    "SymmFermions",
+)
+_register(
+    ".constructors",
+    "add_cycle",
+    "expec_mpo",
     "haar_random_state",
     "hrs_to_mps",
     "hrs_to_peps",
@@ -138,7 +73,6 @@ __all__ = [
     "hrps_to_ttn",
     "id_to_mpo",
     "id_to_pepo",
-    "measure_obs",
     "ps_to_3dpeps",
     "ps_to_mpo",
     "ps_to_mps",
@@ -146,6 +80,30 @@ __all__ = [
     "ps_to_pepo",
     "ps_to_peps",
     "random_haar_qubit",
+    "tns_align",
+)
+_register(
+    ".contractions",
+    "build_compressed_optimizer",
+    "build_optimizer",
+    "contract_hypercompressed_tn",
+    "contract_hypercompressed_tn_batch",
+    "tn_norm",
+)
+_register(".observables", "measure_obs", "tn_fidelity")
+_register(".validation", "validate_tensor_network_tags")
+_register(
+    "..backends.config",
+    "backend_cupy",
+    "backend_jax",
+    "backend_numpy",
+    "backend_torch",
+    "get_default_array_backend",
+    "get_default_grad_backend",
+    "register_torch_linalg",
+    "reset_default_backends",
+    "set_default_array_backend",
+    "set_default_grad_backend",
     "reg_complex_qr_torch",
     "reg_complex_svd_jax",
     "reg_complex_svd_torch",
@@ -155,35 +113,31 @@ __all__ = [
     "reg_rel_svd_jax",
     "reg_rel_svd_torch",
     "reg_stop_gradient_torch",
-    "register_torch_linalg",
-    "reset_default_backends",
-    "set_default_array_backend",
-    "set_default_grad_backend",
-    "sector_index_map",
-    "site_charge_alternating",
-    "site_charge_from_map",
-    "site_charge_from_occupations",
-    "site_charge_uniform",
     "stop_grad",
-    "symmray_block_summary",
-    "symmray_mps_summary",
-    "symmray_mpo_summary",
-    "symmray_peps_summary",
-    "symm_operator_from_dense",
-    "tn_fidelity",
-    "tn_norm",
-    "tns_align",
-    "validate_tensor_network_tags",
+)
+
+_SUBMODULES = (
     "constructors",
     "contractions",
     "maps",
     "observables",
     "symmetric",
+    "symm_fermions",
     "validation",
-]
+    "core",
+)
+
+__all__ = [*_SYMBOL_MODULES, *_SUBMODULES]
 
 
 def __getattr__(name):
-    if name in {"constructors", "contractions", "maps", "observables", "symmetric", "validation"}:
-        return import_module(f".{name}", __name__)
+    module_name = _SYMBOL_MODULES.get(name)
+    if module_name is not None:
+        value = getattr(import_module(module_name, __name__), name)
+        globals()[name] = value
+        return value
+    if name in _SUBMODULES:
+        value = import_module(f".{name}", __name__)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

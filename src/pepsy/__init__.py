@@ -12,6 +12,8 @@ except PackageNotFoundError:
 _MODULE_EXPORTS = {
     "backends",
     "boundary",
+    "bp",
+    "extensions",
     "fitting",
     "operators",
     "optimizers",
@@ -131,8 +133,10 @@ _SYMBOL_MODULES = {
     "SimpleUpdateGen": ".optimizers",
     "SymDMRG2": ".optimizers",
     "SweepOptimizer": ".optimizers",
+    "TreeEnergyOptimizer": ".optimizers",
     "TreeLayoutFinder": ".optimizers",
     "TreeOptimizer": ".optimizers",
+    "TreeStabOptimizer": ".optimizers",
     "TreeTensorNetwork": ".optimizers",
     "compile_stim_circuit": ".optimizers",
     "run_coalesced_noisy_shots": ".optimizers",
@@ -243,6 +247,8 @@ __all__ = [
     "__version__",
     "backends",
     "boundary",
+    "bp",
+    "extensions",
     "fitting",
     "operators",
     "optimizers",
@@ -357,8 +363,10 @@ __all__ = [
     "SimpleUpdateGen",
     "SymDMRG2",
     "SweepOptimizer",
+    "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeOptimizer",
+    "TreeStabOptimizer",
     "TreeTensorNetwork",
     "compile_stim_circuit",
     "run_coalesced_noisy_shots",
@@ -465,7 +473,7 @@ def __getattr__(name):
 
 if TYPE_CHECKING:
     from .bp import gauge_all, gauge_all_simple, one_norm_bp
-    from . import backends, boundary, fitting, operators, optimizers, sampling, solvers, tensors, vmc
+    from . import backends, boundary, bp, extensions, fitting, operators, optimizers, sampling, solvers, tensors, vmc
     from .backends import (
         get_default_array_backend,
         get_default_grad_backend,
@@ -536,7 +544,7 @@ if TYPE_CHECKING:
         y,
         z,
     )
-    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeLayoutFinder, TreeOptimizer, run_stabilizer_mps_stream
+    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeOptimizer, TreeStabOptimizer, run_stabilizer_mps_stream
     from .sampling import FermionConfigurationEncoding, MpsDiagonalEstimate, MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler
     from .solvers import FDSolver
     from .tensors import (

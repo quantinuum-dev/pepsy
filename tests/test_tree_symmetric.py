@@ -5,6 +5,7 @@ import pytest
 
 import pepsy
 import quimb.tensor as qtn
+from pepsy.optimizers import EnergyEstimate, TreeEnergyOptimizer
 from pepsy.optimizers.tree import TreeOptimizer, TreePlan, TreeTensorNetwork
 from pepsy.tensors import Fermion
 
@@ -256,6 +257,100 @@ def test_native_fermionic_norm_and_observable_use_exact_tree_environment():
 
     assert all(_is_symmray_data(tensor) for tensor in state.tensors)
     assert float(pepsy.tn_fidelity(reference, state)) > 1 - 1e-12
+
+
+def test_tree_local_expectations_match_per_term_readout():
+    """Batched native readout equals summing per-term local_expectation calls."""
+    fermion, engine = _nonbinary_u1u1_case()
+    state = engine.tn
+
+    edges = [(0, 1), (2, 3), (4, 5), (0, 2)]
+    terms = {edge: -1.0 * fermion.hopping_operator() for edge in edges}
+    terms |= {site: fermion.onsite_term(site) for site in range(6)}
+
+    reference = {
+        where: state.local_expectation(
+            op, where, optimize="auto", normalized=True
+        )
+        for where, op in terms.items()
+    }
+    batched = state.local_expectations(terms, optimize="auto", normalized=True)
+
+    assert set(batched) == set(reference)
+    for where in terms:
+        assert complex(batched[where]) == pytest.approx(
+            complex(reference[where]), abs=1e-12
+        )
+
+    # An unnormalized batch differs from the normalized one exactly by the norm.
+    norm_sq = float(state._fermionic_norm_squared().real)
+    raw = state.local_expectations(terms, optimize="auto", normalized=False)
+    for where in terms:
+        assert complex(raw[where]) / norm_sq == pytest.approx(
+            complex(reference[where]), abs=1e-12
+        )
+
+
+def test_tree_energy_optimizer_matches_manual_sum():
+    """TreeEnergyOptimizer.energy() mirrors the MpsEnergyOptimizer surface."""
+    fermion, engine = _nonbinary_u1u1_case()
+    state = engine.tn
+
+    edges = [(0, 1), (2, 3), (4, 5), (0, 2)]
+    terms = {edge: -1.0 * fermion.hopping_operator() for edge in edges}
+    terms |= {site: fermion.onsite_term(site) for site in range(6)}
+
+    total = sum(
+        complex(state.local_expectation(op, where, optimize="auto"))
+        for where, op in terms.items()
+    )
+    num_sites = state.nsites
+
+    estimate = TreeEnergyOptimizer(
+        state, terms=terms, energy_per_site=True, real=True,
+    ).energy()
+
+    assert isinstance(estimate, EnergyEstimate)
+    assert estimate.num_sites == num_sites
+    assert estimate.boundary_mode == "exact"
+    assert estimate.normalized is True
+    assert estimate.chi == state.max_bond()
+    assert float(estimate.energy) == pytest.approx(total.real, abs=1e-10)
+    assert float(estimate.energy_per_site) == pytest.approx(
+        total.real / num_sites, abs=1e-10
+    )
+
+    # loss() returns the per-site scalar; energy_per_site=False gives the total.
+    per_site = TreeEnergyOptimizer(state, terms=terms).loss()
+    assert float(per_site) == pytest.approx(total.real / num_sites, abs=1e-10)
+    full = TreeEnergyOptimizer(
+        state, terms=terms, energy_per_site=False,
+    ).loss()
+    assert float(full) == pytest.approx(total.real, abs=1e-10)
+
+
+def test_tree_energy_optimizer_accepts_symhamiltonian():
+    """A SymHamiltonian exposing .terms is accepted like a raw mapping."""
+    fermion, engine = _nonbinary_u1u1_case()
+    state = engine.tn
+
+    edges = [(0, 1), (2, 3), (4, 5)]
+    terms = {edge: -1.0 * fermion.hopping_operator() for edge in edges}
+    terms |= {site: fermion.onsite_term(site) for site in range(6)}
+    ham = fermion.hamiltonian(terms)
+
+    reference = sum(
+        complex(state.local_expectation(op, where, optimize="auto"))
+        for where, op in ham.terms.items()
+    )
+    estimate = TreeEnergyOptimizer(
+        state, ham, energy_per_site=False, real=True,
+    ).energy()
+    assert float(estimate.energy) == pytest.approx(reference.real, abs=1e-10)
+
+    with pytest.raises(TypeError, match="either hamiltonian or terms"):
+        TreeEnergyOptimizer(state, ham, terms=terms)
+
 
 
 def test_native_fermionic_truncation_spectrum_is_blockwise():

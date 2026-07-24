@@ -263,16 +263,17 @@ At the start of a new task:
 - Use the Python 3.12 environment for commands and tests:
   `source ~/envs/py312/bin/activate`.
 - Run commands from repository root when possible.
-- Install local development dependencies with `python -m pip install -e '.[dev,docs]'` when needed.
+- Install local development dependencies with `python -m pip install -e '.[dev]'` when needed.
 
 ## Common Commands
 
-- Run all tests: `pytest -q`
+- Run the default core tests: `pytest -q`
+- Run all tests, including extended suites: `pytest -q -o addopts=''`
 - Run a focused test file: `pytest -q tests/test_name.py`
 - Run a focused test case: `pytest -q tests/test_name.py::test_case_name`
 - Public API/layout smoke tests: `pytest -q tests/test_public_api.py tests/test_package_layout.py`
 - Check Python syntax/static issues: `python -m pyflakes src tests`
-- Build documentation: `sphinx-build -W -b html docs docs/_build/html`
+- Documentation is maintained as Markdown under `docs/`; no documentation build is required.
 
 If numba, matplotlib, or Python cache directories cause local environment noise, prefer temporary cache locations such as:
 
@@ -325,7 +326,7 @@ Focused validation guide:
 - MPS layout/canonicalization review: `pytest -q tests/test_optimize_mps.py tests/test_optimize_mpo.py tests/test_symmetric_tensors.py`
 - Stabilizer tensor networks: `pytest -q tests/test_stabilizer_tn.py tests/test_stabilizer_tn_stress.py`
 - Sampling: `pytest -q tests/test_sampler.py`
-- Docs/API behavior changes: run focused tests plus `sphinx-build -W -b html docs docs/_build/html`
+- Docs/API behavior changes: run focused tests; documentation is plain Markdown.
 
 ## Safety and Boundaries
 

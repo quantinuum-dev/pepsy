@@ -10,6 +10,10 @@ boundary/metrics
 boundary/states
 boundary/sweeps
 tensors/core
+tensors/maps
+tensors/constructors
+tensors/contractions
+tensors/observables
 tensors/symmetric
 fitting/local
 operators/gates
@@ -25,6 +29,9 @@ optimizers/peps
 optimizers/stabilizer_tn
 optimizers/sym_dmrg
 optimizers/tree
+extensions
+bp
+optimizers/tree_stabilizer
 solvers/gradient
 solvers/finite_difference
 sampling/samplers

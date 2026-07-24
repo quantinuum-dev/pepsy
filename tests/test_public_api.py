@@ -3,7 +3,6 @@
 import importlib.util
 
 import pepsy
-import pytest
 
 
 def test_package_version_available():
@@ -15,9 +14,11 @@ def test_package_version_available():
 def test_tree_optimizers_are_available_from_high_level_api():
     """Tree layout and execution helpers resolve from ``import pepsy as py``."""
     from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer
+    from pepsy.optimizers.tree_stabilizer import TreeStabOptimizer
 
     assert pepsy.TreeLayoutFinder is TreeLayoutFinder
     assert pepsy.TreeOptimizer is TreeOptimizer
+    assert pepsy.TreeStabOptimizer is TreeStabOptimizer
 
 
 _EXPECTED_IN_ALL = [
@@ -36,8 +37,10 @@ _EXPECTED_IN_ALL = [
     "PepsBpSampler", "MpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "one_norm_bp", "tn_fidelity", "tn_norm",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
     "MpsStabOptimizer", "STNState", "StabilizerMpsSimulator",
+    "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeOptimizer",
+    "TreeStabOptimizer",
     "TreeTensorNetwork",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
@@ -80,16 +83,14 @@ _EXPECTED_NOT_IN_ALL = [
 ]
 
 
-@pytest.mark.parametrize("name", _EXPECTED_IN_ALL)
-def test_symbol_exported(name):
-    """Public symbol should be in __all__."""
-    assert name in pepsy.__all__
+def test_symbols_exported():
+    """All documented public symbols should be in ``__all__``."""
+    assert set(_EXPECTED_IN_ALL).issubset(pepsy.__all__)
 
 
-@pytest.mark.parametrize("name", _EXPECTED_NOT_IN_ALL)
-def test_internal_symbol_not_exported(name):
-    """Internal symbol should not leak into __all__."""
-    assert name not in pepsy.__all__
+def test_internal_symbols_not_exported():
+    """Internal symbols should not leak into ``__all__``."""
+    assert set(_EXPECTED_NOT_IN_ALL).isdisjoint(pepsy.__all__)
 
 
 _CALLABLE_EXPORTS = [
@@ -108,8 +109,10 @@ _CALLABLE_EXPORTS = [
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
     "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult", "StreamAnalysisRecord",
     "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
+    "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeOptimizer",
+    "TreeStabOptimizer",
     "TreeTensorNetwork",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
     "tn_fidelity", "tn_norm", "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
@@ -141,29 +144,28 @@ def test_all_exports_are_unique():
     assert len(pepsy.__all__) == len(set(pepsy.__all__))
 
 
-@pytest.mark.parametrize("name", pepsy.__all__)
-def test_all_exports_resolve(name):
+def test_all_exports_resolve():
     """Every advertised public export should resolve."""
-    assert getattr(pepsy, name) is not None
+    missing = [name for name in pepsy.__all__ if getattr(pepsy, name, None) is None]
+    assert not missing, f"unresolved public exports: {missing}"
 
 
-@pytest.mark.parametrize("name", _CALLABLE_EXPORTS)
-def test_lazy_callable_resolves(name):
-    """Lazy callable export should resolve to a callable."""
-    assert callable(getattr(pepsy, name))
+def test_lazy_callables_resolve():
+    """Lazy callable exports should resolve to callables."""
+    invalid = [name for name in _CALLABLE_EXPORTS if not callable(getattr(pepsy, name))]
+    assert not invalid, f"non-callable public exports: {invalid}"
 
 
-@pytest.mark.parametrize("name", _BLOCKED_NAMES)
-def test_blocked_name_raises(name):
+def test_blocked_names_raise():
     """Internal name should raise AttributeError."""
-    with pytest.raises(AttributeError):
-        getattr(pepsy, name)
+    leaked = [name for name in _BLOCKED_NAMES if hasattr(pepsy, name)]
+    assert not leaked, f"blocked names leaked from package: {leaked}"
 
 
-@pytest.mark.parametrize("name", _MODULE_EXPORTS)
-def test_module_export_resolves(name):
+def test_module_exports_resolve():
     """Submodule export should resolve to a non-None value."""
-    assert getattr(pepsy, name) is not None
+    missing = [name for name in _MODULE_EXPORTS if getattr(pepsy, name, None) is None]
+    assert not missing, f"missing module exports: {missing}"
 
 
 def test_optional_linalg_registrations_resolve():

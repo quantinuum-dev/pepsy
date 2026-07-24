@@ -31,3 +31,28 @@ rejects an implicit contraction of that MPO with a native fermionic MPS, since
 the automatic re-encoding can create very large block-sparse intermediates.
 For a deliberately small or explicitly managed conversion, pass
 ``allow_encoding_conversion=True`` to ``MpsEnergyOptimizer``.
+
+## Tree tensor networks
+
+``TreeEnergyOptimizer`` mirrors the ``MpsEnergyOptimizer`` measurement surface
+for a :class:`~pepsy.optimizers.tree.TreeTensorNetwork`. It reports
+``sum_i <psi|H_i|psi> / <psi|psi>`` term by term using the tree's own exact,
+fermion-safe contraction, and returns the same :class:`EnergyEstimate`:
+
+```python
+import pepsy
+
+estimate = pepsy.TreeEnergyOptimizer(
+    tree_state,
+    terms=hamiltonian,        # {where: operator} mapping or a SymHamiltonian
+    energy_per_site=True,
+).energy()
+```
+
+The terms are dispatched through
+:meth:`~pepsy.optimizers.tree.TreeTensorNetwork.local_expectations`, which
+shares one contraction optimiser across every term (pass a reusable
+``pepsy.build_optimizer(...)`` as ``contraction_opt`` to cache paths across
+same-topology contractions) and reuses the memoized graded norm, so the
+result is identical to summing per-term
+:meth:`~pepsy.optimizers.tree.TreeTensorNetwork.local_expectation` calls.

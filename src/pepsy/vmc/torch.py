@@ -1199,6 +1199,9 @@ class TorchPEPSAmplitude:
         has_vmap = callable(getattr(torch, "vmap", None))
         self._vmap_forward_enabled = has_vmap
         self._vmap_log_enabled = has_vmap
+        # Connected estimators and proposal batches are independent fast
+        # paths. A failed ordinary amplitude trace must not poison either one.
+        self._connection_vmap_enabled = has_vmap
 
     @property
     def is_symmray(self):
@@ -1471,7 +1474,7 @@ class TorchPEPSAmplitude:
         reference = self._reference_tensor(params)
         return self._contract_value(self._select_config(tn, config), reference)
 
-    def _try_vmapped_forward(self, configs, *, params=None):
+    def _try_vmapped_forward(self, configs, *, params=None, force=False):
         """Attempt a native batched amplitude contraction.
 
         Symmray fermionic arrays can support ``torch.vmap`` directly when the
@@ -1484,7 +1487,10 @@ class TorchPEPSAmplitude:
             return None
         if self.amplitude_batching == "serial":
             return None
-        if not self._vmap_forward_enabled:
+        if force:
+            if not self._proposal_vmap_enabled:
+                return None
+        elif not self._vmap_forward_enabled:
             return None
         try:
             return torch.vmap(
@@ -1492,7 +1498,10 @@ class TorchPEPSAmplitude:
             )(configs)
         except (AttributeError, IndexError, KeyError, NotImplementedError,
                 RuntimeError, TypeError, ValueError):
-            self._vmap_forward_enabled = False
+            if force:
+                self._proposal_vmap_enabled = False
+            else:
+                self._vmap_forward_enabled = False
             return None
 
     def _try_vmapped_forward_log(self, configs, *, params=None):
@@ -1678,6 +1687,9 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         self.proposal_vmap_min_batch = _check_positive_int(
             "proposal_vmap_min_batch",
             proposal_vmap_min_batch,
+        )
+        self._proposal_vmap_enabled = callable(
+            getattr(_require_torch(), "vmap", None)
         )
         self._boundary_geometry = self._infer_boundary_geometry(self._unpack_tn())
         self.last_connected_reuse_stats = None
@@ -1929,7 +1941,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
 
     def _should_vmap_proposals(self, *, n_changed, device):
         """Whether this proposal batch should prefer full vmapped amplitudes."""
-        if not self._vmap_forward_enabled:
+        if not self._proposal_vmap_enabled:
             return False
         if self.proposal_batching == "cache":
             return False
@@ -1982,6 +1994,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         stats = {
             "num_requests": int(parent_configs.shape[0]),
             "num_vmapped": 0,
+            "num_vmap_fallback": 0,
             "num_transition_cache_hits": 0,
             "num_environment_cache_hits": 0,
             "num_environment_builds": 0,
@@ -1994,7 +2007,21 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             n_changed=n_changed,
             device=parent_configs.device,
         ):
-            vmapped = self._try_vmapped_forward(target_configs[changed])
+            vmapped = self._try_vmapped_forward(
+                target_configs[changed],
+                force=True,
+            )
+            if vmapped is None and self.proposal_batching == "vmap":
+                # Explicit batching is a stable API promise even when a
+                # particular upstream contraction has no native vmap rule.
+                # Evaluate the whole proposal set through the normal batch
+                # entry point rather than rebuilding one boundary per move.
+                vmapped = _call_amplitude_fn(
+                    self,
+                    target_configs[changed],
+                    chunk_size=chunk_size,
+                )
+                stats["num_vmap_fallback"] = n_changed
             if vmapped is not None:
                 out[changed] = vmapped.to(dtype=out.dtype, device=out.device)
                 stats["num_vmapped"] = n_changed
@@ -2276,6 +2303,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             self.last_connected_reuse_stats = {
                 "num_diagonal": 0,
                 "num_reused": 0,
+                "num_batched": 0,
                 "num_groups": 0,
                 "num_grouped_connections": 0,
                 "num_strip_cache_hits": 0,
@@ -2301,6 +2329,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             self.last_connected_reuse_stats = {
                 "num_diagonal": num_diagonal,
                 "num_reused": 0,
+                "num_batched": 0,
                 "num_groups": 0,
                 "num_grouped_connections": 0,
                 "num_strip_cache_hits": 0,
@@ -2322,16 +2351,21 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         offdiag = (~diag).nonzero(as_tuple=True)[0]
         if (
             self.amplitude_batching != "serial"
-            and self._vmap_forward_enabled
+            and self._connection_vmap_enabled
             and offdiag.numel() >= _BOUNDARY_VMAP_CONNECTION_THRESHOLD
         ):
-            result = super().connected_amplitudes(
-                configs,
-                amplitudes,
-                connections,
-                chunk_size=chunk_size,
-                reuse_diagonal=reuse_diagonal,
-            )
+            previous_vmap_state = self._vmap_forward_enabled
+            self._vmap_forward_enabled = True
+            try:
+                result = super().connected_amplitudes(
+                    configs,
+                    amplitudes,
+                    connections,
+                    chunk_size=chunk_size,
+                    reuse_diagonal=reuse_diagonal,
+                )
+            finally:
+                self._vmap_forward_enabled = previous_vmap_state
             self.last_connected_reuse_stats = {
                 "num_diagonal": int(diag.sum().item()),
                 "num_reused": 0,
@@ -2359,6 +2393,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         stats = {
             "num_diagonal": int(diag.sum().item()),
             "num_reused": 0,
+            "num_batched": 0,
             "num_groups": 0,
             "num_grouped_connections": 0,
             "num_environment_cache_hits": 0,

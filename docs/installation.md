@@ -12,11 +12,7 @@ Optional extras:
 pip install -e .[torch]
 pip install -e .[solvers]
 pip install -e .[viz]
-pip install -e .[docs]
 ```
 
-Build docs locally:
-
-```bash
-sphinx-build -W -b html docs docs/_build/html
-```
+Documentation is plain Markdown under `docs/`; no documentation builder is
+needed for package development or installation.

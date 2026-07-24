@@ -205,14 +205,10 @@ measurement order and does not run disentangling SVDs.
 
 ## Compare the modes
 
-The benchmark replays the same deterministic T-doped Clifford circuit in all
-three modes:
-
-```bash
-source ~/envs/py312/bin/activate
-python benchmarks/stabilizer_tn_magic_scaling.py \
-  --n-list 16,32,64 --t 4 --depth 6 --no-exact-cooling
-```
+The same deterministic T-doped Clifford circuit can be replayed through
+``run_stabilizer_mps_stream`` in all three modes. Scaling harnesses are kept
+outside the installed package so the distribution contains only supported API
+examples and tests.
 
 Read the output as follows:
 

@@ -10,7 +10,7 @@ from .convert import (
     resolve_backend_sample_data_from_tn,
     to_float,
 )
-from ..tensors.core import (
+from .config import (
     backend_cupy,
     backend_jax,
     backend_numpy,

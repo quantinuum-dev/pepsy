@@ -2,7 +2,8 @@
 
 <img src="assets/pepsy-icon.svg" alt="pepsy icon" width="220" />
 
-`pepsy` is a Python package for circuit simulation and related DMRG fitting workflows.
+`pepsy` is a tensor-network package for circuit simulation, contraction,
+optimization, sampling, and variational Monte Carlo workflows.
 
 Current package version: `0.3.0` (from `pyproject.toml` / `pepsy.__version__`).
 See the [changelog](CHANGELOG.md) for release history and versioned changes.
@@ -15,23 +16,26 @@ See the [changelog](CHANGELOG.md) for release history and versioned changes.
   - `boundary/`: boundary state initialization (`BdyMPS`), sweeps (`CompBdy`), and metrics
   - `solvers/`: gradient-based and finite-difference solvers
   - `fitting/`: local tensor fitting routines (`FIT`)
-  - `optimizers/`: sweep, global, energy, MPS, MPO, and PEPS optimizers
+  - `optimizers/`: sweep, global, energy, MPS, MPO, PEPS, MERA, BP, and stabilizer optimizers
   - `sampling/`: `MpsSampler` and related sampling utilities
+  - `bp/`: belief-propagation, loop-expansion, and PNE methods
+  - `extensions/`: clearly marked lazy entry points for optional/advanced domains
+  - `vmc/`: optional Torch and NetKet/JAX variational Monte Carlo adapters
   - `_internal/`: private formatting and utility helpers
 - `examples/`: lightweight runnable examples kept with the package
 - `../pepsy_examples/`: external notebooks and smoke examples, including direct
   fermionic Symmray Fermi-Hubbard starters under `fermi_hubbard/`
-- `docs/`: Sphinx documentation source
+- `docs/`: Markdown documentation source
 - `tests/`: package tests
 
 ## Install
 ```bash
-pip install -U --no-deps -e .
+pip install -U -e .
 # Optional backends:
 # pip install -e .[torch]
 # pip install -e .[solvers]
-# jax backend (manual, platform-specific wheels):
-# pip install jax jaxlib
+# pip install -e .[vmc-torch]
+# pip install -e .[vmc-netket]
 # Optional plotting helpers:
 # pip install -e .[viz]
 ```
@@ -86,13 +90,8 @@ assert ordering["methods_reference"]["doi"] == "10.1103/PhysRevResearch.7.023193
 ```
 
 ## Documentation
-Build docs locally:
-
-```bash
-pip install -e .[docs]
-NUMBA_CACHE_DIR=/tmp PYTHONPYCACHEPREFIX=/tmp \
-sphinx-build -W -b html docs docs/_build/html
-```
+Documentation is maintained as Markdown under `docs/`. No documentation
+builder or documentation-specific package extra is required.
 
 Main docs sections:
 
@@ -103,4 +102,4 @@ Main docs sections:
 
 ## Notes
 - `.gitattributes` marks notebooks as binary to avoid noisy diffs.
-- `.gitignore` excludes checkpoints, caches, `cash/`, and `nohup.out`.
+- `.gitignore` excludes checkpoints, generated caches, logs, and build output.

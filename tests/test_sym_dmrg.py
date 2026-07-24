@@ -1,9 +1,6 @@
 """Tests for the SymDMRG2 public driver scaffold."""
 
-import json
 import numpy as np
-import importlib.util
-from pathlib import Path
 import quimb.tensor as qtn
 import pytest
 
@@ -1029,128 +1026,6 @@ def test_symdmrg2_dense_reference_profile_keeps_dense_h_environments():
     assert opt.right_envs is not None
 
 
-def test_symdmrg2_benchmark_harness_returns_json_ready_result():
-    """The benchmark helper should produce structured profiling data."""
-    pytest.importorskip("symmray")
-    bench_path = Path(__file__).resolve().parents[1] / "benchmarks" / "symdmrg2_fh_u1u1.py"
-    spec = importlib.util.spec_from_file_location("symdmrg2_fh_u1u1_benchmark", bench_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    result = module.run_benchmark(
-        length=2,
-        chi=3,
-        initial_bond_dim=2,
-        sweeps=1,
-        local_solver="dense",
-        dense_threshold=100,
-        include_events=True,
-    )
-
-    assert result["case"]["length"] == 2
-    assert result["case"]["norm_check"] == "off"
-    assert result["case"]["norm_check_interval"] == 1
-    assert result["case"]["residual_check"] == "sampled"
-    assert result["case"]["residual_check_interval"] == 1
-    assert result["case"]["residual_check_tol"] is None
-    assert result["case"]["matvec_diagnostics"] == "sampled"
-    assert result["case"]["matvec_diagnostics_interval"] == 1
-    assert result["case"]["compute_initial_energy"] is False
-    assert result["result"]["num_sweeps"] == 1
-    assert isinstance(result["result"]["energy"], float)
-    assert result["result"]["energies"] == pytest.approx([result["result"]["energy"]])
-    assert result["result"]["energy_deltas"] == []
-    assert result["result"]["num_residual_diagnostics"] == 1
-    assert result["result"]["num_matvec_diagnostics"] == result["profile"]["num_matvecs"]
-    assert result["result"]["num_convergence_diagnostics"] == 1
-    assert result["result"]["last_convergence_diagnostic"]["energy"] == pytest.approx(
-        result["result"]["energy"]
-    )
-    assert result["result"]["num_mixer_diagnostics"] == 0
-    assert result["result"]["num_variational_sector_diagnostics"] >= 1
-    json.dumps(result)
-    assert result["profile"]["enabled"]
-    assert result["profile"]["num_events"] == len(result["profile_events"])
-    assert result["profile"]["num_matvec_diagnostics"] == len(
-        result["matvec_diagnostics"]
-    )
-    assert result["profile"]["phase_counts"]["sweep"] == 1
-    assert result["profile"]["phase_counts"]["residual_check"] == 1
-    assert result["profile"]["num_residual_checks"] == 1
-    assert result["profile"]["num_matvecs"] >= 1
-    assert result["compression"]["num_splits"] == result["result"]["num_svd_diagnostics"]
-    assert result["compression"]["max_bond_dim"] <= 3
-
-    mapped = module.run_benchmark(
-        lattice_shape=(2, 2),
-        chi=3,
-        initial_bond_dim=1,
-        sweeps=1,
-        local_solver="dense",
-        dense_threshold=100,
-        norm_check="sampled",
-        norm_check_interval=2,
-        residual_check="sampled",
-        residual_check_interval=2,
-        matvec_diagnostics="sampled",
-        matvec_diagnostics_interval=2,
-        matvec_layout="fused",
-        expected_energy=0.0,
-        expected_energy_tol=1e-12,
-        exact_schmidt_bound=3,
-        compute_initial_energy=False,
-    )
-
-    assert mapped["case"]["length"] == 4
-    assert mapped["case"]["lattice_shape"] == [2, 2]
-    assert mapped["case"]["mapper_mode"] == "snake"
-    assert mapped["case"]["mpo_compress"] is True
-    assert mapped["case"]["matvec_layout"] == "fused"
-    assert mapped["case"]["periodic"] is False
-    assert mapped["case"]["expected_energy"] == 0.0
-    assert mapped["case"]["expected_energy_tol"] == 1e-12
-    assert mapped["case"]["exact_schmidt_bound"] == 3
-    assert mapped["result"]["energy_error"] == pytest.approx(
-        abs(mapped["result"]["energy"])
-    )
-    assert mapped["result"]["reached_expected_energy"] is False
-    assert mapped["case"]["num_edges"] == 4
-    assert mapped["result"]["num_sweeps"] == 1
-    assert mapped["result"]["energies"] == pytest.approx([mapped["result"]["energy"]])
-    assert mapped["result"]["energy_deltas"] == []
-    assert mapped["result"]["last_convergence_diagnostic"]["energy"] == pytest.approx(
-        mapped["result"]["energy"]
-    )
-    json.dumps(mapped)
-    assert mapped["profile"]["enabled"]
-    assert mapped["profile"]["phase_counts"]["sweep"] == 1
-    assert mapped["compression"]["max_bond_dim"] <= 3
-
-    open_case = module.build_fh_u1u1_case(
-        length=1,
-        lattice_shape=(3, 2),
-        periodic=False,
-        bond_dim=1,
-        seed=3,
-        hopping=1.0,
-        interaction=1.0,
-        chemical_potential=0.0,
-    )
-    pbc_case = module.build_fh_u1u1_case(
-        length=1,
-        lattice_shape=(3, 2),
-        periodic=True,
-        bond_dim=1,
-        seed=3,
-        hopping=1.0,
-        interaction=1.0,
-        chemical_potential=0.0,
-    )
-
-    assert open_case["periodic"] is False
-    assert pbc_case["periodic"] is True
-    assert len(pbc_case["edges"]) > len(open_case["edges"])
-    assert pbc_case["mpo"].cyclic is False
 
 
 def test_symdmrg2_norm_check_off_skips_effective_norm_probe(monkeypatch):

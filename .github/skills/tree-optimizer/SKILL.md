@@ -498,8 +498,10 @@ For public-API/layout changes also run:
 ```bash
 pytest -q tests/test_public_api.py tests/test_package_layout.py
 python -m pyflakes src/pepsy/optimizers/tree tests/test_optimize_tree.py
-sphinx-build -W -b html docs docs/_build/html
 ```
+
+Documentation is plain Markdown under `docs/`; no local documentation build is
+required.
 
 The safety-net tests are `test_tree_matches_statevector` (untruncated fidelity
 must stay exactly 1.0), the multi-site / sibling / measurement regressions, and

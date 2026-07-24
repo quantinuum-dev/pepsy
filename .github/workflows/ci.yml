@@ -7,41 +7,78 @@ on:
 
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.10"
+            profile: core
+            extras: dev
+          - python-version: "3.11"
+            profile: core
+            extras: dev
+          - python-version: "3.12"
+            profile: core
+            extras: dev
+          - python-version: "3.12"
+            profile: torch
+            extras: dev,torch
     runs-on: ubuntu-latest
     env:
       NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
+      NUMBA_DISABLE_CACHING: "1"
       PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
       MPLCONFIGDIR: /tmp/mplconfig_pepsy
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - name: Install package
+          python-version: ${{ matrix.python-version }}
+      - name: Install package (${{ matrix.profile }})
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev]
+          pip install -e ".[${{ matrix.extras }}]"
       - name: Validate source syntax
         run: python -m compileall -q -f src tests
       - name: Check Python lint
         run: python -m pyflakes src/pepsy tests
+      - name: Run tests with coverage
+        if: matrix.python-version == '3.12' && matrix.profile == 'core'
+        run: pytest -q --cov=pepsy --cov-report=term-missing
       - name: Run tests
+        if: matrix.python-version != '3.12' || matrix.profile != 'core'
         run: pytest -q
 
-  docs:
+  typecheck:
     runs-on: ubuntu-latest
-    env:
-      NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
-      PYTHONPYCACHEPREFIX: /tmp/pycache_pepsy
-      MPLCONFIGDIR: /tmp/mplconfig_pepsy
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - name: Install docs deps
+          python-version: "3.12"
+      - name: Install type-check dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[docs]
-      - name: Build docs
-        run: sphinx-build -W -b html docs docs/_build/html
+          pip install -e ".[dev]"
+      - name: Run focused type checks
+        run: python -m mypy src/pepsy/tensors/validation.py src/pepsy/vmc/api.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          python -m build --sdist --wheel
+          python -m twine check dist/*
+      - name: Smoke test wheel installation
+        run: |
+          smoke_dir="$(mktemp -d)"
+          python -m venv "$smoke_dir/venv"
+          "$smoke_dir/venv/bin/pip" install --no-deps dist/*.whl
+          "$smoke_dir/venv/bin/python" -c "import pepsy; import pepsy.extensions; assert pepsy.__version__"

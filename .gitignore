@@ -8,10 +8,13 @@ __pycache__/
 .env
 .pytest_cache/
 .mypy_cache/
+.cache/
+cache/
+.numba_cache/
 docs/_build/
 cash/
-cash_ctg/
-ctg_cash/
+ctg_cache/
+cotengra_cache/
 store/
 nohup.out
 
@@ -19,3 +22,9 @@ nohup.out
 .eggs/
 build/
 dist/
+.coverage
+coverage.xml
+htmlcov/
+*.log
+vmc_run*.jsonl
+vmc_run*.log

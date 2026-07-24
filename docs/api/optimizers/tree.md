@@ -208,9 +208,12 @@ require a model-native observable or projector.
 MPS execution modes such as `svd`, `dmrg`, `mpo`, `swap`, `perm`, `su`, and
 `mix` are chain algorithms and are intentionally not copied into
 `TreeOptimizer`. Tree layout is part of the TTN geometry and is selected with
-`tree=`/`layout=` at construction. A later `TreeStabOptimizer` can therefore
-delegate numerical coefficient updates to this class while keeping tableau
-state and stabilizer-specific bookkeeping above it.
+`tree=`/`layout=` at construction. `TreeStabOptimizer` now delegates its first
+milestone of numerical coefficient updates to this class while keeping tableau
+state and stabilizer-specific bookkeeping above it. See the
+[TreeStabOptimizer API](tree_stabilizer.md) for the supported fixed-basis,
+basis-updating, immediate, and deferred magic-injection
+Clifford/rotation/measurement paths.
 
 ## Tree state class
 
@@ -256,6 +259,16 @@ tracked canonical centre/region, while an unknown dense gauge is evaluated on a
 temporary state copy. Native fermionic expectations do not move the gauge.
 The repeated normalized native-readout denominator is cached and invalidated by
 state mutation, copying, caps, and canonical/gate updates.
+
+`TreeTensorNetwork.local_expectations(terms, optimize=..., normalized=True)`
+evaluates many observables at once, where `terms` maps each `where` (an int
+site or a tuple of sites) to its operator. It delegates each term to
+`local_expectation` with a *shared* `optimize` handle, so a reusable
+`pepsy.build_optimizer(...)` caches one contraction path per topology, and it
+reuses the memoized graded norm across the batch. Each returned value matches
+the corresponding single-term call exactly. For a Hamiltonian-level energy
+readout, `pepsy.TreeEnergyOptimizer` wraps this batch path and returns an
+`EnergyEstimate` mirroring `MpsEnergyOptimizer`.
 
 For the package-level product-state constructor, matching `ps_to_mps`, use
 `pepsy.ps_to_ttn(n, theta=..., tree=...)`. It builds the requested tree,

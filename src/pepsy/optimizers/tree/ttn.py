@@ -546,6 +546,34 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             self._restore_readout_region(original_region)
         return result
 
+    def local_expectations(self, terms, *, optimize="auto", normalized=True):
+        """Evaluate many local observables, reusing the path and the norm.
+
+        ``terms`` maps each ``where`` (an int site or a tuple of sites) to its
+        operator. Every term is delegated to :meth:`local_expectation` using a
+        *shared* ``optimize`` handle, so a reusable contraction optimiser (e.g.
+        :func:`pepsy.build_optimizer`) caches one contraction path per
+        contraction topology instead of re-planning for every term. For a native
+        fermionic tree the graded norm denominator is memoized (see
+        :meth:`_fermionic_norm_squared`), so ``normalized=True`` computes it once
+        across the whole batch rather than per term. The per-term graded
+        contraction is unchanged, so each value matches the corresponding
+        :meth:`local_expectation` call exactly.
+
+        Returns a ``{where: value}`` dict following the iteration order of
+        ``terms``.
+        """
+        results = {}
+        for where, operator in terms.items():
+            if isinstance(where, Integral):
+                support = (int(where),)
+            else:
+                support = tuple(int(site) for site in where)
+            results[where] = self.local_expectation(
+                operator, support, optimize=optimize, normalized=normalized,
+            )
+        return results
+
     @property
     def orthogonality_center(self):
         """Node id of the tracked orthogonality centre (``None`` if unknown).
