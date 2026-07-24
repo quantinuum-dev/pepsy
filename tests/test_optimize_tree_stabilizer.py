@@ -17,6 +17,17 @@ CNOT = np.array(
 )
 
 
+def _rzz(theta):
+    return np.diag(
+        [
+            np.exp(-0.5j * theta),
+            np.exp(0.5j * theta),
+            np.exp(0.5j * theta),
+            np.exp(-0.5j * theta),
+        ]
+    ).astype(complex)
+
+
 def _rz(theta):
     return np.diag(
         [np.exp(-0.5j * theta), np.exp(0.5j * theta)]
@@ -43,6 +54,19 @@ def _assert_same_state(left, right):
     pivot = int(np.argmax(np.abs(right)))
     phase = 1.0 if abs(right[pivot]) < 1e-14 else left[pivot] / right[pivot]
     assert np.allclose(left, phase * right, atol=1e-10, rtol=1e-10)
+
+
+def _tree_stab_entangled_coefficient_state():
+    """Build an entangled coefficient TTN with an initially identity frame."""
+    from pepsy.optimizers.tree import TreeOptimizer
+
+    coefficient = TreeOptimizer([ (H, 0), (CNOT, (0, 1)) ], n=2, chi=64)
+    coefficient.run()
+    tableau = stim.TableauSimulator()
+    tableau.set_num_qubits(2)
+    return pepsy.TreeStabOptimizer.from_tableau_and_state(
+        tableau, coefficient.tn, chi=64
+    )
 
 
 def test_tree_stab_is_public_and_cliffords_are_tableau_only():
@@ -283,3 +307,152 @@ def test_tree_stab_tableau_state_constructor_validates_qubit_count():
     opt = pepsy.TreeStabOptimizer(2)
     with pytest.raises(ValueError, match="same number of qubits"):
         pepsy.TreeStabOptimizer.from_tableau_and_state(sim, opt.p)
+
+
+def test_tree_stab_mps_compatibility_aliases_and_tree_diagnostics():
+    import quimb.tensor as qtn
+
+    product = qtn.MPS_computational_state("10", dtype="complex128")
+    opt = pepsy.TreeStabOptimizer.from_mps(product, track_truncation=True)
+
+    assert (
+        pepsy.TreeStabOptimizer.from_tableau_and_nu.__func__
+        is pepsy.TreeStabOptimizer.from_tableau_and_state.__func__
+    )
+    assert opt.max_pauli_decomposition_qubits == opt.max_operator_qubits
+    assert opt.expectation_pauli_sum([(1.0, "Z", 0), (0.5, "Z", 1)]) == pytest.approx(
+        -0.5
+    )
+    assert opt.get_infidelities() is opt.infidelities
+    assert opt.get_infidelity_samples() == []
+    assert opt.truncation_report()["track_truncation"] is True
+
+
+def test_tree_stab_nonclifford_one_qubit_matrix_matches_dense():
+    theta = 0.37
+    prep = [("h", 0), (CNOT, (0, 1))]
+    opt = pepsy.TreeStabOptimizer(2).apply(prep + [(_rz(theta), 1)])
+
+    expected = _apply_local(
+        _apply_local(np.array([1, 0, 0, 0]), H, (0,), 2), CNOT, (0, 1), 2
+    )
+    expected = _apply_local(expected, _rz(theta), (1,), 2)
+    _assert_same_state(opt.to_statevector(), expected)
+    assert opt.norm() == pytest.approx(1.0)
+
+
+def test_tree_stab_nonclifford_two_qubit_matrix_matches_dense():
+    prep = [(H, 0), (CNOT, (0, 2)), ("t", 1)]
+    opt = pepsy.TreeStabOptimizer(3).apply(prep)
+    before = opt.to_statevector()
+    opt.apply([(_rzz(0.5), (0, 1))])
+
+    expected = _apply_local(before, _rzz(0.5), (0, 1), 3)
+    _assert_same_state(opt.to_statevector(), expected)
+    assert opt.norm() == pytest.approx(np.linalg.norm(expected))
+
+
+def test_tree_stab_nonunitary_matrix_matches_dense_without_clifford_coercion():
+    probability = 0.2
+    gate = (1.0 - probability) * np.eye(2, dtype=complex) + probability * X
+    opt = pepsy.TreeStabOptimizer(2).apply([("h", 0), (gate, 0)])
+
+    expected = _apply_local(
+        _apply_local(np.array([1, 0, 0, 0]), H, (0,), 2), gate, (0,), 2
+    )
+    _assert_same_state(opt.to_statevector(), expected)
+    assert opt.norm() == pytest.approx(np.linalg.norm(expected))
+
+
+def test_tree_stab_dense_matrix_budget_is_checked_before_decomposition():
+    gate = np.eye(8, dtype=complex)
+    gate[0, 0] = 0.5
+    opt = pepsy.TreeStabOptimizer(3, max_operator_qubits=2)
+    before = opt.to_statevector()
+
+    with pytest.raises(ValueError, match="max_operator_qubits=2"):
+        opt.apply([(gate, tuple(range(3)))])
+
+    _assert_same_state(opt.to_statevector(), before)
+    assert opt._queue == [(gate, tuple(range(3)))]
+
+
+def test_tree_stab_accepts_mps_decomposition_budget_alias():
+    opt = pepsy.TreeStabOptimizer(2, max_pauli_decomposition_qubits=1)
+    assert opt.max_operator_qubits == 1
+    with pytest.raises(ValueError, match="only one of"):
+        pepsy.TreeStabOptimizer(
+            2,
+            max_operator_qubits=1,
+            max_pauli_decomposition_qubits=1,
+        )
+
+
+def test_tree_stab_exact_cooling_preserves_state_and_avoids_bond_growth():
+    import quimb.tensor as qtn
+
+    pivot = np.array([1.0, 0.0], dtype=complex)
+    magic = np.array([np.cos(0.19), -1j * np.sin(0.19)], dtype=complex)
+    state = qtn.MPS_product_state([pivot, magic])
+    stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.37, 1)]
+
+    cooled = pepsy.TreeStabOptimizer.from_mps(
+        state.copy(), chi=64, exact_cooling=True
+    ).apply(stream)
+    plain = pepsy.TreeStabOptimizer.from_mps(
+        state.copy(), chi=64, exact_cooling=False
+    ).apply(stream)
+
+    assert len(cooled.exact_cooling_events) == 1
+    assert cooled.p.max_bond() == 1
+    assert plain.p.max_bond() == 2
+    _assert_same_state(cooled.to_statevector(), plain.to_statevector())
+
+
+def test_tree_stab_exact_cooling_falls_back_without_a_stabilizer_pivot():
+    import quimb.tensor as qtn
+
+    magic_a = np.array([np.cos(0.19), -1j * np.sin(0.19)], dtype=complex)
+    magic_b = np.array([np.cos(0.31), -1j * np.sin(0.31)], dtype=complex)
+    state = qtn.MPS_product_state([magic_a, magic_b])
+    stream = [("h", 0), ("cnot", 0, 1), ("rz", 0.37, 1)]
+
+    cooled = pepsy.TreeStabOptimizer.from_mps(state.copy()).apply(stream)
+    plain = pepsy.TreeStabOptimizer.from_mps(
+        state.copy(), exact_cooling=False
+    ).apply(stream)
+
+    assert cooled.exact_cooling_events == []
+    assert cooled.p.max_bond() == plain.p.max_bond() == 2
+    _assert_same_state(cooled.to_statevector(), plain.to_statevector())
+
+
+def test_tree_stab_greedy_cliffords_reduce_tree_bonds_without_physical_change():
+    sim = _tree_stab_entangled_coefficient_state()
+    before = sim.to_statevector()
+
+    moves = sim.disentangle_cliffords(bonds=(0, 1))
+
+    assert len(moves) == 1
+    assert moves[0]["bond"] == (0, 1)
+    assert moves[0]["tree_path"] == (0, 2, 1)
+    assert moves[0]["score_after"] < moves[0]["score_before"]
+    assert sim.p.max_bond() == 1
+    assert sim.bond_history == [2, 1]
+    _assert_same_state(sim.to_statevector(), before)
+
+
+def test_tree_stab_disentangle_stream_event_is_caller_scheduled():
+    theta = 0.37
+    sim = _tree_stab_entangled_coefficient_state()
+    before = sim.to_statevector()
+    expected = _apply_local(before, _rz(theta), (0,), 2)
+
+    sim.apply([
+        ("disentangle", {"sweeps": 1, "bonds": ((0, 1),)}),
+        ("rz", theta, 0),
+    ])
+
+    assert len(sim.disentangle_events) == 1
+    assert sim.p.max_bond() == 1
+    _assert_same_state(sim.to_statevector(), expected)

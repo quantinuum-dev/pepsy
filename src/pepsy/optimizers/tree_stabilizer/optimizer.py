@@ -14,8 +14,11 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Mapping
+from itertools import combinations
 from numbers import Integral
 
+import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
@@ -41,6 +44,7 @@ _ROTATION_AXES = {"rx": "X", "ry": "Y", "rz": "Z"}
 _ROTATION_AXES_2Q = {"rxx": "X", "ryy": "Y", "rzz": "Z"}
 _X = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
 _H = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+_S = np.diag([1.0, 1.0j]).astype(complex)
 _SDG = np.array([[1.0, 0.0], [0.0, -1.0j]], dtype=complex)
 _CNOT = np.array(
     [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
@@ -127,6 +131,38 @@ def _looks_like_single_entry(gates):
     return len(gates) == 2 and _is_matrix_like(gates[0])
 
 
+def _is_unitary(gate):
+    """Return whether a dense gate is unitary to the STN tolerance."""
+    gate = np.asarray(gate)
+    if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
+        return False
+    return np.allclose(
+        gate.conj().T @ gate,
+        np.eye(gate.shape[0], dtype=gate.dtype),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+
+def _apply_dense_gate(state, gate, where, n):
+    """Apply a small gate to a dense state in logical big-endian order."""
+    where = tuple(int(q) for q in where)
+    k = len(where)
+    tensor = np.asarray(state).reshape((2,) * n)
+    operator = np.asarray(gate).reshape((2,) * (2 * k))
+    out = np.tensordot(
+        operator,
+        tensor,
+        axes=(tuple(range(k, 2 * k)), where),
+    )
+    remaining = [q for q in range(n) if q not in where]
+    order = [
+        where.index(q) if q in where else k + remaining.index(q)
+        for q in range(n)
+    ]
+    return out.transpose(order).reshape(-1)
+
+
 def _as_entries(gates):
     if gates is None:
         return []
@@ -164,6 +200,10 @@ def _entry_support(entry):
                 if len(entry) < 3:
                     raise ValueError('"measure_reset" expects basis and where.')
                 return _normalize_sites(entry[2])
+            if name == "disentangle":
+                # Representation-only checkpoint: it has no physical support
+                # for automatic tree-layout construction.
+                return ()
             if name in _CLIFFORD_NAMES:
                 if name in {"cnot", "cx", "cy", "cz", "swap"}:
                     return _normalize_sites(entry[1:])
@@ -263,24 +303,77 @@ class _TreeStabilizerFrame:
         return self._inverse_tableau(physical_pauli)
 
     def clifford_unitary(self):
+        """Return a double-precision dense unitary for small-state readout.
+
+        Stim's convenience matrix export is currently ``complex64``.  A
+        TreeStab readout may combine that Clifford with a compressed TTN, so
+        retaining the exact double-precision H/S/CX elimination circuit avoids
+        an artificial norm loss at every tableau change.
+        """
         tableau = self._sim.current_inverse_tableau().inverse()
-        return np.asarray(tableau.to_unitary_matrix(endian="big"), dtype=complex)
+        dimension = 2 ** self.n
+        unitary = np.eye(dimension, dtype=complex)
+        for instruction in tableau.to_circuit("elimination"):
+            name = instruction.name
+            targets = [target.value for target in instruction.targets_copy()]
+            if name == "H":
+                for target in targets:
+                    for column in range(dimension):
+                        unitary[:, column] = _apply_dense_gate(
+                            unitary[:, column], _H, (target,), self.n
+                        )
+            elif name == "S":
+                for target in targets:
+                    for column in range(dimension):
+                        unitary[:, column] = _apply_dense_gate(
+                            unitary[:, column], _S, (target,), self.n
+                        )
+            elif name == "S_DAG":
+                for target in targets:
+                    for column in range(dimension):
+                        unitary[:, column] = _apply_dense_gate(
+                            unitary[:, column], _SDG, (target,), self.n
+                        )
+            elif name == "CX":
+                if len(targets) % 2:
+                    raise ValueError(
+                        "stim emitted a CX instruction with an odd target count."
+                    )
+                for control, target in zip(targets[::2], targets[1::2]):
+                    for column in range(dimension):
+                        unitary[:, column] = _apply_dense_gate(
+                            unitary[:, column], _CNOT,
+                            (control, target), self.n,
+                        )
+            else:  # pragma: no cover - guards future Stim elimination changes
+                raise ValueError(
+                    f"Unsupported tableau-elimination gate {name!r}."
+                )
+        return unitary
 
 
 class TreeStabOptimizer:
+    # Marker consumed by the shared trajectory runner without importing this
+    # module from ``optimizers.noise`` during package initialization.
+    _is_tree_stabilizer_trajectory_optimizer = True
+
     """Replay an STN stream on a tree coefficient state.
 
-    The first milestones support Clifford gates, physical Pauli rotations,
+    The supported tree path includes Clifford gates, physical Pauli rotations,
     fixed- and basis-updating Pauli measurement, reset/measure-reset, immediate
-    and deferred magic-state injection, and Clifford matrix entries.
+    and deferred magic-state injection, bounded dense matrix entries, and
+    constructive exact cooling. ``disentangle_cliffords`` is an explicit,
+    caller-scheduled representation-only cooling checkpoint.
     The coefficient state is a dense two-level :class:`TreeTensorNetwork`
     evolved by :class:`TreeOptimizer`.
 
     Parameters are intentionally close to ``TreeOptimizer`` and
     ``MpsStabOptimizer``. ``gates`` are queued at construction and consumed by
     :meth:`run`; :meth:`apply` queues and immediately replays a stream.
-    Noisy trajectories, cooling, and general non-Clifford matrices are reserved
-    for later milestones.
+    Noisy trajectories and MPS-specific layout/noise APIs remain separate
+    milestones. Dense non-Clifford matrices are supported only up to
+    ``max_operator_qubits`` through bounded Pauli decomposition. Set
+    ``exact_cooling=False`` to exercise the ordinary multi-site rotation path.
     """
 
     def __init__(
@@ -304,8 +397,38 @@ class TreeStabOptimizer:
         inplace=True,
         track_truncation=False,
         max_operator_qubits=8,
+        max_pauli_decomposition_qubits=None,
+        operator_tol=None,
         max_subtree_nodes=None,
+        max_dense_sample_qubits=16,
+        exact_cooling=True,
     ):
+        if max_pauli_decomposition_qubits is not None:
+            if max_operator_qubits != 8:
+                raise ValueError(
+                    "pass only one of max_operator_qubits and "
+                    "max_pauli_decomposition_qubits."
+                )
+            max_operator_qubits = max_pauli_decomposition_qubits
+        if operator_tol is not None:
+            operator_tol = float(operator_tol)
+            if not np.isfinite(operator_tol) or operator_tol < 0.0:
+                raise ValueError(
+                    "operator_tol must be finite and nonnegative, "
+                    f"got {operator_tol!r}."
+                )
+        if max_dense_sample_qubits is not None:
+            if (
+                isinstance(max_dense_sample_qubits, bool)
+                or not isinstance(max_dense_sample_qubits, Integral)
+            ):
+                raise TypeError("max_dense_sample_qubits must be an integer or None.")
+            max_dense_sample_qubits = int(max_dense_sample_qubits)
+            if max_dense_sample_qubits < 0:
+                raise ValueError(
+                    "max_dense_sample_qubits must be nonnegative or None, "
+                    f"got {max_dense_sample_qubits!r}."
+                )
         if (
             state is not None
             and gates is None
@@ -384,6 +507,11 @@ class TreeStabOptimizer:
             max_operator_qubits=max_operator_qubits,
             max_subtree_nodes=max_subtree_nodes,
         )
+        self.max_operator_qubits = max_operator_qubits
+        self.max_pauli_decomposition_qubits = max_operator_qubits
+        self.operator_tol = operator_tol
+        self.max_dense_sample_qubits = max_dense_sample_qubits
+        self.exact_cooling = bool(exact_cooling)
         self.state = _TreeStabilizerFrame(self._tree.n)
         self._queue = list(entries)
         self._rng = np.random.default_rng(seed)
@@ -391,6 +519,8 @@ class TreeStabOptimizer:
         self.bond_history = [self._tree.tn.max_bond()]
         self.projection_diagnostics = self._tree.projection_diagnostics
         self._clifford_rotation_cache = {}
+        self.exact_cooling_events = []
+        self.disentangle_events = []
         self.immediate_projection_events = []
         self.last_immediate_injection_report = None
         self._last_injection_projection_event = None
@@ -427,6 +557,19 @@ class TreeStabOptimizer:
         optimizer = cls(state, **kwargs)
         optimizer.state = _TreeStabilizerFrame(optimizer.n, sim=sim)
         return optimizer
+
+    # Backward-compatible alias shared with ``MpsStabOptimizer``.
+    from_tableau_and_nu = from_tableau_and_state
+
+    @classmethod
+    def from_mps(cls, p, **kwargs):
+        """Start from a product-state MPS on a fixed or inferred tree.
+
+        Product MPS inputs can be remounted exactly by ``TreeOptimizer``.
+        Entangled MPS inputs are rejected there because silently compressing or
+        changing their chain geometry would violate the fixed-tree contract.
+        """
+        return cls(p, **kwargs)
 
     # ------------------------------------------------------------------
     # State and queue properties
@@ -477,29 +620,57 @@ class TreeStabOptimizer:
     # ------------------------------------------------------------------
     # Replay and event dispatch
     # ------------------------------------------------------------------
-    def run(self):
-        """Replay queued entries, leaving a failed entry queued for retry."""
+    def run(self, *, progbar=False):
+        """Replay queued entries, leaving a failed entry queued for retry.
+
+        ``progbar`` is accepted for parity with ``MpsStabOptimizer``. The
+        displayed infidelity is the tree truncation proxy, when tracked.
+        """
         queue = tuple(self._queue)
         completed = 0
+        pbar = None
+        if progbar and queue:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(total=len(queue), desc="stab-tree", leave=True, ascii=True)
         try:
             for entry in queue:
                 self._apply_entry(entry)
                 completed += 1
                 self.bond_history.append(self.p.max_bond())
+                if pbar is not None:
+                    pbar.update(1)
+                    infidelity = self._tree.get_infidelities()[-1]
+                    formatted = self._format_progress_infidelity(infidelity)
+                    pbar.set_postfix(
+                        infidelity=formatted,
+                        norm_infidelity=formatted,
+                    )
         finally:
+            if pbar is not None:
+                pbar.close()
             if completed:
                 del self._queue[:completed]
         return self
 
-    def apply(self, gates):
+    @staticmethod
+    def _format_progress_infidelity(value):
+        if value is None:
+            return "n/a"
+        return f"{float(value):#.0e}"
+
+    def apply(self, gates, *, progbar=False):
         """Queue and immediately replay ``gates``."""
-        return self.set_gates(gates).run()
+        return self.set_gates(gates).run(progbar=progbar)
 
     def _apply_entry(self, entry):
         if isinstance(entry, (tuple, list)) and entry:
             head = entry[0]
             if isinstance(head, str):
                 name = _normalize_name(head)
+                if name == "disentangle":
+                    self._disentangle_event(entry[1:])
+                    return
                 if name in _CLIFFORD_NAMES:
                     self.state.apply_clifford(name, *entry[1:])
                     return
@@ -589,27 +760,320 @@ class TreeStabOptimizer:
             raise ValueError(
                 f"Gate shape {gate.shape} does not match where={where!r}."
             )
-        if not np.allclose(
-            gate.conj().T @ gate,
-            np.eye(dim, dtype=gate.dtype),
-            rtol=1e-10,
-            atol=1e-12,
-        ):
-            raise ValueError(
-                "The first TreeStabOptimizer milestone accepts only unitary "
-                "Clifford matrices; use a named Pauli rotation for non-Clifford "
-                "updates."
-            )
         import stim
 
-        try:
-            tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
-        except (ValueError, RuntimeError) as exc:
+        gate_is_unitary = _is_unitary(gate)
+        tableau = None
+        if gate_is_unitary:
+            # Stim does not verify unitarity itself, so this route is guarded
+            # explicitly before attempting Clifford recognition.
+            try:
+                tableau = stim.Tableau.from_unitary_matrix(gate, endian="big")
+            except (ValueError, RuntimeError):
+                tableau = None
+        if tableau is not None:
+            self.state.do_tableau(tableau, where)
+            return
+
+        limit = self.max_operator_qubits
+        if limit is not None and nq > limit:
             raise ValueError(
-                "The first TreeStabOptimizer milestone accepts only Clifford "
-                "matrix entries."
-            ) from exc
-        self.state.do_tableau(tableau, where)
+                f"Pauli decomposition of a {nq}-qubit dense gate would enumerate "
+                f"{4**nq} candidate terms, exceeding "
+                f"max_operator_qubits={limit} (at most {4**limit} terms)."
+            )
+
+        from ..stabilizer_tn.operators import pauli_decomposition, pauli_matrix
+
+        branches = []
+        for labels, coeff in pauli_decomposition(
+            gate, nq, tol=self.operator_tol
+        ):
+            physical = pauli_string(labels, where, self.n)
+            frame_terms, sign = hermitian_pauli_terms(
+                self.state.frame_pauli(physical)
+            )
+            branches.append((complex(coeff) * float(sign), frame_terms))
+
+        if not branches:
+            # A zero matrix, or an explicitly over-toleranced decomposition,
+            # annihilates the state. Applying a zero one-site operator is the
+            # tree-native way to represent that result without a fake branch.
+            zero = np.zeros((2, 2), dtype=complex)
+            self._tree.apply_1q(zero, where[0])
+            return
+        coefficient_support = {
+            int(site) for _weight, terms in branches for site in terms
+        }
+        if len(coefficient_support) <= 1:
+            # ``pauli_sum_submpo`` intentionally has a multi-site MPO shape;
+            # lower a one-site coefficient-frame sum directly instead. The
+            # frame image may be a different single site from the physical
+            # matrix target, so use the mapped support when one exists.
+            q = next(iter(coefficient_support), where[0])
+            operator = np.zeros((2, 2), dtype=complex)
+            for weight, terms in branches:
+                operator += weight * pauli_matrix(terms.get(q, "I"))
+            self._tree.apply_1q(operator, q)
+            return
+        self._tree.apply_pauli_sum(
+            branches,
+            max_bond=self._tree.chi,
+            cutoff=self._tree.cutoff,
+        )
+
+    # ------------------------------------------------------------------
+    # Clifford gauge disentangling (p -> D p, C -> C D^dagger)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _disentangle_score(singular_values, tol):
+        """Return the numerical-rank/entropy score of one tree edge."""
+        singular_values = np.abs(np.asarray(singular_values).reshape(-1))
+        if singular_values.size == 0 or singular_values.max(initial=0.0) == 0.0:
+            return 0, 0.0
+        weights = singular_values**2
+        weights /= weights.sum()
+        rank = int(np.count_nonzero(
+            singular_values > float(tol) * singular_values.max()
+        ))
+        entropy = float(-np.sum(
+            weights[weights > 0.0] * np.log(weights[weights > 0.0])
+        ))
+        return rank, entropy
+
+    def _disentangle_bonds(self, bonds):
+        """Normalize logical qubit pairs used by the tree Clifford sweep.
+
+        A tree has no single ordered chain of bonds. ``bonds`` therefore uses
+        logical qubit pairs, with ``None`` meaning every unordered pair. The
+        tree geodesic between each pair is the set of coefficient edges scored
+        for that local gauge move.
+        """
+        if bonds is None:
+            return tuple(combinations(range(self.n), 2))
+        if isinstance(bonds, Integral) and not isinstance(bonds, (bool, np.bool_)):
+            raise TypeError(
+                "tree disentangle bonds must be qubit pairs, an iterable of "
+                "pairs, or None."
+            )
+        if isinstance(bonds, (tuple, list, np.ndarray)):
+            values = tuple(bonds)
+            if len(values) == 2 and all(
+                isinstance(value, Integral)
+                and not isinstance(value, (bool, np.bool_))
+                for value in values
+            ):
+                values = (values,)
+        else:
+            try:
+                values = tuple(bonds)
+            except TypeError as exc:
+                raise TypeError(
+                    "bonds must be a qubit pair, an iterable of pairs, or None."
+                ) from exc
+
+        normalized = []
+        seen = set()
+        for pair in values:
+            try:
+                pair = tuple(pair)
+            except TypeError as exc:
+                raise TypeError("each disentangle bond must contain two qubits.") from exc
+            if len(pair) != 2:
+                raise ValueError(
+                    f"each disentangle bond must contain two qubits, got {pair!r}."
+                )
+            if any(
+                isinstance(q, (bool, np.bool_)) or not isinstance(q, Integral)
+                for q in pair
+            ):
+                raise TypeError(f"disentangle qubits must be integers, got {pair!r}.")
+            qa, qb = map(int, pair)
+            if qa == qb or not (0 <= qa < self.n and 0 <= qb < self.n):
+                raise ValueError(
+                    f"disentangle qubit pairs must be distinct and lie in "
+                    f"[0, {self.n - 1}], got {pair!r}."
+                )
+            pair = (qa, qb)
+            if pair in seen or pair[::-1] in seen:
+                continue
+            seen.add(pair)
+            normalized.append(pair)
+        return tuple(normalized)
+
+    def _tree_edge_spectra(self, tree, edges):
+        """Read the exact Schmidt spectra on selected canonical tree edges."""
+        spectra = []
+        for left, right in edges:
+            # Canonicalizing at one endpoint makes the opposite subtree an
+            # isometric environment. The edge spectrum is then the SVD of the
+            # endpoint tensor across its single virtual bond.
+            tree.tn.canonize_around_node_(left)
+            bond = tree.tn.bond(left, right)
+            tensor = tree.tn.node_tensor(left)
+            spectrum = TreeOptimizer._probe_split_spectrum(
+                tensor, (bond,), max_bond=None, cutoff=0.0
+            )["values"]
+            spectra.append(np.asarray(spectrum))
+        return spectra
+
+    def _tree_disentangle_score(self, tree, edges, tol):
+        """Aggregate rank/entropy over a pair's tree-geodesic edges."""
+        edge_scores = [
+            self._disentangle_score(spectrum, tol)
+            for spectrum in self._tree_edge_spectra(tree, edges)
+        ]
+        ranks = tuple(score[0] for score in edge_scores)
+        return (
+            int(sum(ranks)),
+            tuple(sorted(ranks, reverse=True)),
+            float(sum(score[1] for score in edge_scores)),
+        )
+
+    def _candidate_tree_disentangle_score(self, pair, edges, unitary, tol):
+        """Score one two-qubit Clifford without mutating the live TTN."""
+        candidate = self._tree.copy()
+        candidate._invalidate_state_norm_cache()
+        with candidate._thread_ctx():
+            candidate._apply_2q_impl(
+                unitary,
+                pair[0],
+                pair[1],
+                max_bond=None,
+                cutoff=0.0,
+            )
+        return self._tree_disentangle_score(candidate, edges, tol)
+
+    def _apply_tree_disentangle_gauge(self, pair, unitary, tol):
+        """Apply an untruncated coefficient gauge move to the live TTN."""
+        self._tree._invalidate_state_norm_cache()
+        with self._tree._thread_ctx():
+            self._tree._apply_2q_impl(
+                unitary,
+                pair[0],
+                pair[1],
+                max_bond=None,
+                cutoff=tol,
+            )
+
+    def disentangle_cliffords(
+        self, sweeps=1, *, bonds=None, tol=None, _record=True
+    ):
+        """Reduce tree-coefficient entanglement using Clifford gauge moves.
+
+        For every selected logical qubit pair, this evaluates the 20
+        two-qubit Clifford classes modulo output-local Cliffords. A candidate
+        is accepted only when it improves the aggregate numerical-rank and
+        entropy score on the pair's tree geodesic. The selected ``D`` is
+        applied to ``|p>`` and ``D^dagger`` is absorbed into the Stim frame, so
+        ``C|p>`` is unchanged up to the requested numerical cutoff.
+
+        ``bonds`` is tree-specific in representation: it is an integer pair or
+        an iterable of logical qubit pairs. ``None`` visits all unordered
+        pairs in increasing tree-distance order. This method is deliberately
+        caller-scheduled; ordinary replay never invokes it implicitly.
+        """
+        if isinstance(sweeps, (bool, np.bool_)) or not isinstance(sweeps, Integral):
+            raise TypeError("sweeps must be a nonnegative integer.")
+        sweeps = int(sweeps)
+        if sweeps < 0:
+            raise ValueError("sweeps must be nonnegative.")
+        if tol is None:
+            tol = self._tree.cutoff
+        tol = float(tol)
+        if not np.isfinite(tol) or tol < 0.0:
+            raise ValueError("tol must be finite and nonnegative.")
+
+        pairs = list(self._disentangle_bonds(bonds))
+        pairs.sort(key=lambda pair: (self.plan.tree_distance(*pair), pair))
+        moves = []
+        if sweeps == 0 or not pairs:
+            if _record:
+                self.bond_history.append(self.p.max_bond())
+            return moves
+
+        from ..stabilizer_tn.mps_stab_optimizer import (
+            _two_qubit_clifford_representatives,
+        )
+
+        representatives = _two_qubit_clifford_representatives()
+        for sweep in range(sweeps):
+            improved = False
+            for pair in pairs:
+                path = tuple(
+                    self.plan.node_path(
+                        self.plan.leaf_of_qubit[pair[0]],
+                        self.plan.leaf_of_qubit[pair[1]],
+                    )
+                )
+                edges = tuple(zip(path, path[1:]))
+                before_score = self._tree_disentangle_score(
+                    self._tree.copy(), edges, tol
+                )
+                best_index = None
+                best_score = before_score
+                for index, (_tableau, unitary) in enumerate(representatives):
+                    score = self._candidate_tree_disentangle_score(
+                        pair, edges, unitary, tol
+                    )
+                    if score < best_score:
+                        best_index = index
+                        best_score = score
+                if best_index is None:
+                    continue
+
+                import stim
+
+                tableau, unitary = representatives[best_index]
+                self._apply_tree_disentangle_gauge(pair, unitary, tol)
+                full_tableau = stim.Tableau(self.n)
+                full_tableau.append(tableau, list(pair))
+                self.state.absorb_basis_clifford(full_tableau)
+                event = {
+                    "sweep": int(sweep),
+                    "bond": tuple(pair),
+                    "logical_bond": tuple(pair),
+                    "tree_path": path,
+                    "tree_edges": edges,
+                    "candidate": int(best_index),
+                    "score_before": before_score,
+                    "score_after": best_score,
+                }
+                self.disentangle_events.append(event)
+                moves.append(event)
+                improved = True
+            if not improved:
+                break
+
+        if _record:
+            self.bond_history.append(self.p.max_bond())
+        return moves
+
+    def _disentangle_event(self, params):
+        """Dispatch ``("disentangle", ...)`` stream options."""
+        if len(params) == 0:
+            return self.disentangle_cliffords(_record=False)
+        if len(params) != 1:
+            raise ValueError(
+                '"disentangle" accepts no options, an integer sweep count, '
+                "or one mapping."
+            )
+        option = params[0]
+        if isinstance(option, Integral) and not isinstance(option, (bool, np.bool_)):
+            return self.disentangle_cliffords(sweeps=int(option), _record=False)
+        if not isinstance(option, Mapping):
+            raise TypeError(
+                '"disentangle" options must be an integer sweep count or a mapping.'
+            )
+        options = dict(option)
+        unknown = set(options).difference({"sweeps", "bonds", "tol"})
+        if unknown:
+            raise ValueError(
+                'Unknown "disentangle" options: '
+                + ", ".join(sorted(map(str, unknown)))
+            )
+        options["_record"] = False
+        return self.disentangle_cliffords(**options)
 
     # ------------------------------------------------------------------
     # Frame-mapped coefficient operations
@@ -802,12 +1266,161 @@ class TreeStabOptimizer:
         terms = {int(q): str(axis).upper() for q, axis in terms.items()}
         if not terms:
             return self
+        if self._try_exact_cooling(theta, terms, float(sign)):
+            return self
         support = tuple(sorted(terms))
         frame_axes = "".join(terms[q] for q in support)
         self._tree.apply_pauli_rotation(
             theta, frame_axes, support, sign=float(sign)
         )
         return self
+
+    @staticmethod
+    def _stabilizer_product_eigenstate(vector, *, tol=1e-10):
+        """Return ``(axis, sign)`` for a one-qubit stabilizer vector."""
+        from ..stabilizer_tn.operators import pauli_matrix
+
+        vector = np.asarray(ar.to_numpy(vector), dtype=complex).reshape(-1)
+        if vector.shape != (2,):
+            return None
+        norm = float(np.linalg.norm(vector))
+        if norm <= tol:
+            return None
+        vector = vector / norm
+        bloch = {
+            axis: float(np.real(np.vdot(vector, pauli_matrix(axis) @ vector)))
+            for axis in ("X", "Y", "Z")
+        }
+        axis = max(bloch, key=lambda key: abs(bloch[key]))
+        if abs(abs(bloch[axis]) - 1.0) > tol:
+            return None
+        if any(abs(bloch[other]) > tol for other in bloch if other != axis):
+            return None
+        return axis, (1 if bloch[axis] >= 0.0 else -1)
+
+    def _tree_product_site_vector(self, q, *, tol=1e-10):
+        """Extract a local vector when a TTN leaf is rank-one across its edge."""
+        leaf = self.plan.leaf_of_qubit[int(q)]
+        try:
+            self._tree._move_center(leaf)
+            tensor = self.p.node_tensor(leaf)
+            physical = self.p.site_ind(int(q))
+            physical_axis = tensor.inds.index(physical)
+            data = ar.to_numpy(tensor.data)
+            data = np.moveaxis(np.asarray(data), physical_axis, 0)
+            matrix = data.reshape(2, -1)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        if matrix.shape[1] == 0:
+            return None
+        singular_values = np.linalg.svd(matrix, compute_uv=False)
+        scale = float(singular_values[0])
+        if scale <= tol:
+            return None
+        if len(singular_values) > 1 and singular_values[1] > tol * scale:
+            return None
+        left = np.linalg.svd(matrix, full_matrices=False)[0][:, 0]
+        return left
+
+    @staticmethod
+    def _exact_cooling_basis_tableau(axis, sign):
+        """Build a one-qubit Clifford mapping ``sign * axis`` to ``+Z``."""
+        import stim
+
+        axis = str(axis).upper()
+        sign = int(sign)
+        simulator = stim.TableauSimulator()
+        simulator.set_num_qubits(1)
+        if sign < 0:
+            {"X": simulator.z, "Y": simulator.x, "Z": simulator.x}[axis](0)
+        if axis == "X":
+            simulator.h(0)
+        elif axis == "Y":
+            simulator.s_dag(0)
+            simulator.h(0)
+        elif axis != "Z":
+            raise ValueError(f"Unknown Pauli axis {axis!r}.")
+        return simulator.current_inverse_tableau().inverse()
+
+    def _exact_controlled_pauli_tableau(self, pivot, pivot_axis, pivot_sign, terms):
+        """Build a tree-ordered controlled-Pauli Clifford for exact cooling."""
+        import stim
+
+        pivot = int(pivot)
+        basis = self._exact_cooling_basis_tableau(pivot_axis, pivot_sign)
+        simulator = stim.TableauSimulator()
+        simulator.set_num_qubits(self.n)
+        simulator.do_tableau(basis, [pivot])
+        targets = sorted(
+            (int(q) for q in terms if int(q) != pivot),
+            key=lambda q: (self.plan.tree_distance(pivot, q), q),
+        )
+        for target in targets:
+            axis = str(terms[target]).upper()
+            if axis == "X":
+                simulator.cnot(pivot, target)
+            elif axis == "Z":
+                simulator.cz(pivot, target)
+            elif axis == "Y":
+                simulator.s_dag(target)
+                simulator.cnot(pivot, target)
+                simulator.s(target)
+            else:
+                raise ValueError(f"Unknown Pauli axis {axis!r}.")
+        simulator.do_tableau(basis.inverse(), [pivot])
+        return simulator.current_inverse_tableau().inverse()
+
+    def _try_exact_cooling(self, theta, terms, sign):
+        """Apply the constructive tree cooling identity when a pivot exists."""
+        if not self.exact_cooling or len(terms) < 2:
+            return False
+        from ..stabilizer_tn.operators import pauli_matrix
+
+        support = tuple(sorted(int(q) for q in terms))
+        pivots = sorted(
+            support,
+            key=lambda q: (
+                sum(self.plan.tree_distance(q, other) for other in support),
+                q,
+            ),
+        )
+        for pivot in pivots:
+            vector = self._tree_product_site_vector(pivot)
+            if vector is None:
+                continue
+            stabilizer = self._stabilizer_product_eigenstate(vector)
+            if stabilizer is None:
+                continue
+            pivot_axis, pivot_sign = stabilizer
+            rotation_axis = terms[pivot]
+            if rotation_axis == pivot_axis:
+                continue
+
+            cascade = self._exact_controlled_pauli_tableau(
+                pivot, pivot_axis, pivot_sign, terms
+            )
+            local_rotation = (
+                np.cos(float(theta) / 2.0) * np.eye(2, dtype=complex)
+                - 1j * float(sign) * np.sin(float(theta) / 2.0)
+                * pauli_matrix(rotation_axis)
+            )
+            self._tree.apply_1q(
+                self._tree._as_state_backend(local_rotation, warn=False), pivot
+            )
+            # The coefficient state received the local rotation. The
+            # controlled-Pauli remainder is represented for free in C.
+            self.state.absorb_basis_clifford(cascade.inverse())
+            self.exact_cooling_events.append({
+                "pivot": int(pivot),
+                "tree_leaf": int(self.plan.leaf_of_qubit[pivot]),
+                "support": support,
+                "pivot_stabilizer": f"{'+' if pivot_sign > 0 else '-'}{pivot_axis}",
+                "tree_pivot_score": int(
+                    sum(self.plan.tree_distance(pivot, other) for other in support)
+                ),
+            })
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Immediate magic-state injection
@@ -1365,6 +1978,25 @@ class TreeStabOptimizer:
 
     expectation_pauli = expectation
 
+    def expectation_pauli_sum(self, terms):
+        """Return the expectation of a weighted sum of physical Paulis.
+
+        Entries may be ``(coefficient, pauli)`` or
+        ``(coefficient, pauli, where)``, matching
+        :meth:`MpsStabOptimizer.expectation_pauli_sum`.
+        """
+        total = 0.0 + 0.0j
+        for term in terms:
+            if len(term) not in (2, 3):
+                raise ValueError(
+                    "Pauli-sum terms must be (coefficient, pauli) or "
+                    "(coefficient, pauli, where)."
+                )
+            coefficient, pauli = term[:2]
+            where = term[2] if len(term) == 3 else None
+            total += complex(coefficient) * self.expectation(pauli, where)
+        return float(np.real(total))
+
     def _fixed_measure(self, pauli, where, outcome=None, *, return_diagnostics=False):
         where = _normalize_sites(where)
         terms, sign = self._frame_terms(pauli, where, allow_identity=True)
@@ -1506,6 +2138,76 @@ class TreeStabOptimizer:
         rng = self._rng if seed is None else np.random.default_rng(seed)
         return np.where(rng.random(int(shots)) < p_plus, 1, -1)
 
+    def sample_bits(
+        self,
+        shots=1,
+        *,
+        seed=None,
+        order=None,
+        shuffle=True,
+        packed=False,
+    ):
+        """Sample computational-basis bitstrings from dense tree readout.
+
+        TreeStab currently uses dense ``C @ p`` readout for this compatibility
+        path. The columns remain logical qubit labels ``0 .. n-1``; ``order``
+        accepts ``None``/``"tree"``/``"physical"``/``"auto"`` or an explicit
+        permutation. ``shuffle`` is accepted for MPS sampler compatibility;
+        independent dense draws are already exchangeable.
+        """
+        _ = shuffle
+        shots = int(shots)
+        if shots < 0:
+            raise ValueError("shots must be nonnegative.")
+        if order is None or str(order).lower() in {"tree", "physical", "auto"}:
+            permutation = tuple(range(self.n))
+        elif isinstance(order, str):
+            raise ValueError(
+                "TreeStab sample order must be None, 'tree', 'physical', "
+                "'auto', or an explicit permutation."
+            )
+        else:
+            permutation = tuple(int(q) for q in order)
+            if permutation != tuple(sorted(permutation)) or set(permutation) != set(range(self.n)):
+                raise ValueError(
+                    f"sample order must be a permutation of 0..{self.n - 1}."
+                )
+        rng = (
+            self._rng
+            if seed is None
+            else seed
+            if isinstance(seed, np.random.Generator)
+            else np.random.default_rng(seed)
+        )
+        if shots == 0:
+            bits = np.empty((0, self.n), dtype=np.int8)
+            return np.packbits(bits, axis=1, bitorder="big") if packed else bits
+        if (
+            self.max_dense_sample_qubits is not None
+            and self.n > self.max_dense_sample_qubits
+        ):
+            raise ValueError(
+                "TreeStab sample_bits uses dense readout for "
+                f"n={self.n}, exceeding max_dense_sample_qubits="
+                f"{self.max_dense_sample_qubits}."
+            )
+        state = np.asarray(self.to_statevector()).reshape(-1)
+        norm_squared = float(np.vdot(state, state).real)
+        if not np.isfinite(norm_squared) or norm_squared <= 0.0:
+            raise ValueError("cannot sample a zero- or invalid-norm state.")
+        probabilities = np.abs(state) ** 2 / norm_squared
+        indices = rng.choice(2**self.n, size=shots, p=probabilities)
+        bits = (
+            (np.asarray(indices, dtype=np.int64)[:, None]
+             >> np.arange(self.n - 1, -1, -1, dtype=np.int64))
+            & 1
+        ).astype(np.int8)
+        return np.packbits(bits, axis=1, bitorder="big") if packed else bits
+
+    def sample_bitstrings(self, shots=1, **kwargs):
+        """Alias for :meth:`sample_bits`."""
+        return self.sample_bits(shots, **kwargs)
+
     # ------------------------------------------------------------------
     # Dense diagnostics and copies
     # ------------------------------------------------------------------
@@ -1516,9 +2218,45 @@ class TreeStabOptimizer:
     def norm(self):
         return self._tree.norm()
 
+    def normalize(self):
+        """Normalize the coefficient TTN and return ``self``.
+
+        This is primarily the selected-branch boundary used by the shared
+        state-dependent trajectory runner; ordinary unitary replay remains
+        unnormalized by this method unless the caller requests it explicitly.
+        """
+        self._tree.normalize()
+        return self
+
+    @property
+    def infidelities(self):
+        """Cumulative tree-truncation infidelities, if tracking is enabled."""
+        return self._tree.infidelities
+
+    def get_infidelities(self):
+        """Return cumulative tree-truncation infidelities.
+
+        This mirrors the MPS accessor while preserving the tree engine's
+        distinction between tracked truncation loss and the STN norm itself.
+        """
+        return self._tree.get_infidelities()
+
+    def get_infidelity_samples(self):
+        """Return detailed tree truncation samples."""
+        return self._tree.get_infidelity_samples()
+
+    def truncation_report(self):
+        """Return the coefficient-tree truncation report."""
+        return self._tree.truncation_report()
+
     def copy(self):
         other = object.__new__(type(self))
         other._tree = self._tree.copy()
+        other.max_operator_qubits = self.max_operator_qubits
+        other.max_pauli_decomposition_qubits = self.max_pauli_decomposition_qubits
+        other.operator_tol = self.operator_tol
+        other.max_dense_sample_qubits = self.max_dense_sample_qubits
+        other.exact_cooling = self.exact_cooling
         other.state = self.state.copy()
         other._queue = list(self._queue)
         other._rng = np.random.default_rng()
@@ -1526,6 +2264,8 @@ class TreeStabOptimizer:
         other.bond_history = list(self.bond_history)
         other.projection_diagnostics = other._tree.projection_diagnostics
         other._clifford_rotation_cache = dict(self._clifford_rotation_cache)
+        other.exact_cooling_events = list(self.exact_cooling_events)
+        other.disentangle_events = [dict(event) for event in self.disentangle_events]
         other.immediate_projection_events = list(self.immediate_projection_events)
         other.last_immediate_injection_report = self.last_immediate_injection_report
         other._last_injection_projection_event = self._last_injection_projection_event
