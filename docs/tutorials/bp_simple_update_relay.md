@@ -6,13 +6,11 @@ Relay-BP adds per-source-node memory over several warm-started legs to make
 finding a fixed point more robust. It does not, by itself, make a loopy BP
 contraction exact; use an exact small network to measure approximation error.
 
-The runnable example below uses a 3×3 classical Ising factor network. It
-compares all three paths against the exact contraction and records the absolute
-message convergence and relative contraction error:
-
-```{literalinclude} ../../examples/RelayBP/simple_update_relay_comparison.py
-:language: python
-```
+The comparison is covered directly by the BP regression tests and uses only
+the public `gauge_all`, `one_norm_bp`, and
+`run_d1bp_from_simple_update_gauges` APIs. The package repository intentionally
+does not carry a separate runnable script for this workflow; extended example
+scripts belong in the separate `pepsy_examples` repository.
 
 The flow is:
 
@@ -30,15 +28,12 @@ easy fixed point; the reported residual separately verifies convergence.
 
 ## Relay stress cases
 
-The following runnable exact-reference stress cases begin from deliberately
-polarized messages on a near-deterministic odd cycle. Parallel D1BP stalls,
-whereas Relay's per-source memory reaches a strict residual fixed point. The
-reported exact-reference error is intentionally separate: convergence does not
-turn a strongly loopy BP approximation into an exact contraction.
-
-```{literalinclude} ../../examples/RelayBP/odd_cycle_stress.py
-:language: python
-```
+The regression suite also covers exact-reference stress cases beginning from
+deliberately polarized messages on a near-deterministic odd cycle. Parallel
+D1BP stalls, whereas Relay's per-source memory reaches a strict residual fixed
+point. The reported exact-reference error is intentionally separate:
+convergence does not turn a strongly loopy BP approximation into an exact
+contraction.
 
 For the reverse direction, use
 `simple_update_core_and_gauges_from_messages(result.bp)`. For strictly

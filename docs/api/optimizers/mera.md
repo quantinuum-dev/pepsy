@@ -118,8 +118,9 @@ optimizer = builder.fermion_parametric_optimizer(
 )
 ```
 
-For a complete native Torch example, see
-`examples/FermiHubbardQMera/fermion_qmera_energy.py`.
+For a larger native Torch workflow, use the corresponding examples maintained
+in the separate `pepsy_examples` repository; the package API is demonstrated
+by the builder flow above.
 
 ```{eval-rst}
 .. automodule:: pepsy.optimizers.mera

@@ -9,8 +9,6 @@ formal loop cancellations and the cleanest finite-cluster behavior.
 
 import numpy as np
 import pytest
-from pathlib import Path
-import runpy
 
 qtn = pytest.importorskip("quimb.tensor")
 pytest.importorskip("quimb.tensor.belief_propagation")
@@ -698,13 +696,59 @@ def test_relay_bp_runs_from_real_quimb_su_and_can_return_to_su():
 
 def test_exact_su_and_relay_d1bp_comparison_example():
     """The documented comparison tracks convergence and loopy-BP error."""
-    example_path = (
-        Path(__file__).resolve().parents[1]
-        / "examples"
-        / "RelayBP"
-        / "simple_update_relay_comparison.py"
-    )
-    comparison = runpy.run_path(str(example_path))["run_comparison"]()
+    from pepsy.bp import one_norm_bp
+
+    tn = qtn.TN2D_classical_ising_partition_function(3, 3, beta=0.2)
+    exact = float(tn.contract(optimize="auto-hq"))
+    core = tn.copy()
+    gauges = {}
+    core.gauge_all_simple_(gauges=gauges, max_iterations=100, tol=1e-12)
+    rebuilt = core.copy()
+    rebuilt.gauge_simple_insert(gauges)
+    su_representation_error = abs(float(rebuilt.contract()) - exact) / abs(exact)
+
+    runs = {
+        "plain_d1bp": one_norm_bp(
+            tn,
+            method="d1bp",
+            max_iterations=1000,
+            tol=1e-10,
+        ),
+        "su_initialized_d1bp": run_d1bp_from_simple_update_gauges(
+            core,
+            gauges,
+            run_opts={"max_iterations": 1000, "tol": 1e-10},
+        ),
+        "su_initialized_relay_d1bp": run_d1bp_from_simple_update_gauges(
+            core,
+            gauges,
+            use_relay=True,
+            run_opts={"max_iterations": 1000, "tol": 1e-10},
+            relay_opts={
+                "num_relays": 3,
+                "memory_first_leg": False,
+                "gamma_range": (0.1, 0.2),
+                "seed": 0,
+            },
+        ),
+    }
+    records = {}
+    for name, result in runs.items():
+        estimate = float(result.contract())
+        records[name] = {
+            "converged": result.converged,
+            "quimb_converged": result.quimb_converged,
+            "iterations": result.iterations,
+            "num_legs": result.num_legs_run,
+            "max_mdiff": result.max_mdiff,
+            "estimate": estimate,
+            "relative_error": abs(estimate - exact) / abs(exact),
+        }
+    comparison = {
+        "exact": exact,
+        "simple_update_representation_error": su_representation_error,
+        "runs": records,
+    }
 
     assert comparison["simple_update_representation_error"] < 1e-12
     runs = comparison["runs"]

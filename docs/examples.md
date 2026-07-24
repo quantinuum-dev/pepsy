@@ -20,25 +20,12 @@ It demonstrates:
 - [How-To: Choose Parameters](howto/choose_parameters.md)
 - [How-To: Tune Sweep Solvers](howto/solver_tuning.md)
 
-## Runnable scripts
+## Extended examples
 
-- `examples/QMeraEnergy/qmera_energy.py` builds a small schedule-first qMERA,
-  evaluates local ZZ energy from rebuilt and compiled lightcones, and can run a
-  short optional Torch Adam optimization with `--steps`.
-- `examples/FermiHubbardUnified/fermion_workflow.py` uses one
-  `pepsy.Fermion` object to build site-native Hubbard terms and an MPS gate
-  stream, then adapts the same model to qMERA's explicit two-mode layout.
-- `examples/FermiHubbardQMera/fermion_qmera_energy.py` builds native Symmray
-  Hubbard `LocalTerm` objects and optionally optimizes their qMERA energy with
-  Torch Adam using `--steps`.
-- `examples/SimpleUpdateGen/long_range_peps.py` demonstrates a long-range PEPS
-  simple-update term: raw `quimb.SimpleUpdateGen` fails on the non-adjacent
-  endpoints, while `pepsy.SimpleUpdateGen` routes the gate through SWAPs and
-  reports the resulting max bond, gauge count, and cluster energy.
-- `examples/RelayBP/simple_update_relay_comparison.py` compares exact
-  contraction with plain D1BP, simple-update-initialized D1BP, and
-  simple-update-initialized Relay-BP on a small loopy factor network.
-- `examples/RelayBP/odd_cycle_stress.py` provides deterministic positive
-  odd-cycle cases where polarized parallel D1BP stalls and Relay-BP converges.
+The package repository keeps only the lightweight example notebook under
+`examples/`. Larger runnable workflows and experiment scripts are maintained
+in the separate `pepsy_examples` repository. The tests in this repository keep
+the deleted Relay-BP examples' numerical coverage without depending on local
+example files.
 
 For a cleaner, docs-first narrative, start from [tutorials](tutorials/index.md).
