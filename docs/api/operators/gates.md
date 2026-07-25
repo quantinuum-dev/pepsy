@@ -1,8 +1,4 @@
 # `pepsy.operators.gates`
 
-```{eval-rst}
-.. automodule:: pepsy.operators.gates
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

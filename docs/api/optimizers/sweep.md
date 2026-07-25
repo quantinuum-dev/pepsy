@@ -13,9 +13,5 @@
 Torch-backed Symmray blocks use the Torch autograd local solver. NumPy-backed
 Symmray blocks retain the finite-difference fallback.
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.sweep.optimizer
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

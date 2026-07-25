@@ -1,8 +1,12 @@
 """Tests for the responsibility-based package namespaces."""
 
 import importlib
+import importlib.metadata
+import tomllib
+from pathlib import Path
 
 import pytest
+import pepsy
 
 from pepsy.boundary import (
     BdyMPS,
@@ -180,6 +184,33 @@ def test_new_namespace_imports_resolve():
     assert callable(torch_log_derivative_matrix)
 
 
+def test_package_version_matches_installed_distribution():
+    """The runtime version must come from the installed distribution metadata."""
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert pepsy.__version__ == importlib.metadata.version("pepsy") == project["project"]["version"]
+
+
+def test_optional_dependency_profiles_are_declared():
+    """User-facing backend profiles must remain present in project metadata."""
+    metadata = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    extras = metadata["project"]["optional-dependencies"]
+    assert {
+        "layout",
+        "solvers",
+        "stabilizer",
+        "symmetry",
+        "test-extended",
+        "torch",
+        "vmc-netket",
+        "vmc-torch",
+        "viz",
+    } <= set(extras)
+
+
 @pytest.mark.parametrize(
     "old_module",
     [
@@ -200,7 +231,8 @@ def test_new_namespace_imports_resolve():
         "pepsy.sampler",
     ],
 )
-def test_old_layout_modules_are_removed(old_module):
-    """Old flat module paths should no longer be importable."""
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module(old_module)
+def test_old_layout_modules_warn_and_proxy(old_module):
+    """Old flat paths remain usable during the deprecation window."""
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        module = importlib.import_module(old_module)
+    assert module.__all__

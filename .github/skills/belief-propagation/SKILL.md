@@ -10,7 +10,7 @@ argument-hint: 'e.g. "run the loop cluster expansion on a PEPS" or "wrap quimb G
 different correction families: edge-resolved loop series, tensor-region loop
 clusters, and partitioned network expansions (PNE). Keep BP wrappers **thin**
 over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
-[`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy/bp/REFERENCES.md).
+[`docs/development/references/belief_propagation.md`](../../../docs/development/references/belief_propagation.md).
 
 ## When to use
 - Run / wrap / extend BP contraction of a quimb `TensorNetwork` in pepsy.
@@ -168,12 +168,11 @@ Loop corrections split by how much they need a **converged BP fixed point**:
   double-layer network before supplying projectors to D2 PNE.
 - Keep `pepsy.bp` out of the lazy top-level namespace (import `pepsy.bp`); do
   **not** edit `src/pepsy/__init__.py` for it.
-- Tests: `tests/test_bp_relay.py`, `tests/test_bp_cluster.py`,
-  `tests/test_bp_series.py`, and `tests/test_bp_pne.py`. Env: py312
+- Tests: `tests/test_bp_relay.py` and `tests/test_simple_update_gen.py`. Env: py312
   (`source ~/envs/py312/bin/activate`, `NUMBA_CACHE_DIR=/tmp/numba_cache`).
 
 ## References
-Full annotated list: [`src/pepsy/bp/REFERENCES.md`](../../../src/pepsy/bp/REFERENCES.md).
+Full annotated list: [`docs/development/references/belief_propagation.md`](../../../docs/development/references/belief_propagation.md).
 Core: Evenbly–Gray–Chan 2512.10910 · Gray et al. 2510.05647 · Midha–Zhang
 2510.02290 · Evenbly et al. 2409.03108 · Tindall et al. 2604.24760 · Sim et al.
 2603.08427 · Müller et al. 2506.01779 · Alkabetz–Arad PRR 3 023073 ·

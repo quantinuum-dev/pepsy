@@ -24,7 +24,7 @@ so that positive-semidefinite density-matrix messages stay positive
 semidefinite.  The anti-memory values allowed for 1-norm relay BP are therefore
 not available in the 2-norm path.
 
-pepsy PLAN.md section 1 ("Convergence robustness -- disordered-memory /
+Pepsy project plan section 1 ("Convergence robustness -- disordered-memory /
 relay-BP").  This is the tensor-network generalisation of tensy's standalone
 Tanner-graph ``tensy.decoders.RelayBpDecoder``.
 """

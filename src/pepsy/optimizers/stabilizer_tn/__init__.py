@@ -37,6 +37,7 @@ from .mps_stab_optimizer import (
     run_stabilizer_mps_stream,
 )
 from .operators import pauli_combo_mpo, pauli_rotation_mpo, single_qubit_rotation_matrix
+from .records import StabilizerTreeRunResult
 from .stn_state import STNState
 
 # Backwards-compatible alias (the class was briefly named ``StabilizerMps``).
@@ -56,6 +57,7 @@ __all__ = [
     "StabilizerMps",
     "StabilizerMpsSimulator",
     "StabilizerMpsRunResult",
+    "StabilizerTreeRunResult",
     "StreamAnalysisRecord",
     "pauli_combo_mpo",
     "pauli_rotation_mpo",

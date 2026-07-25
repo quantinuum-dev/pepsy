@@ -11,26 +11,34 @@ post-gate Pauli faults into a clean deterministic stream.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Any, Callable, Mapping, Optional
 
 import numpy as np
 
-from .mps.optimizer import MpsOptimizer
+from .mps.optimizer import MpsOptimizer, _resolve_conditional
 
 __all__ = [
     "CoalescedMeasurementRecord",
     "CoalescedSampleResult",
     "CoalescedTrajectoryLeaf",
     "CoalescedTrajectoryResult",
+    "ImportanceSamplingPolicy",
     "NoisyShotResult",
     "PauliErrorModel",
     "PauliFault",
     "StimCircuitPlan",
     "StimHerald",
     "StimNoiseSample",
+    "StimDetector",
+    "StimObservable",
+    "StimSyndromeRecord",
+    "StimObservableRecord",
     "StimShotResult",
+    "TrajectoryMeasurementRecord",
+    "CoherentCrosstalkModel",
     "LeakageRecord",
     "TrajectoryChannel",
     "TrajectoryEvent",
@@ -44,6 +52,9 @@ __all__ = [
     "run_coalesced_trajectory_shots",
     "sample_coalesced_bits",
     "run_noisy_shots",
+    "run_parallel_noisy_shots",
+    "run_parallel_stim_shots",
+    "run_parallel_trajectory_shots",
     "run_stim_shots",
     "run_trajectory_shots",
     "sample_noisy_gate_stream",
@@ -168,6 +179,25 @@ _AUTO_MAX_BRANCHES = 128
 
 
 @dataclass(frozen=True)
+class _TrajectorySeedPair:
+    """Pre-split channel/optimizer seeds used by serial and parallel runners."""
+
+    channel: Any
+    optimizer: Any
+
+
+def _trajectory_seed_pairs(seed, shots):
+    if isinstance(seed, _TrajectorySeedPair):
+        if int(shots) != 1:
+            raise ValueError("a pre-split trajectory seed can only run one shot.")
+        return (seed,)
+    return tuple(
+        _TrajectorySeedPair(*child_seed.spawn(2))
+        for child_seed in np.random.SeedSequence(seed).spawn(int(shots))
+    )
+
+
+@dataclass(frozen=True)
 class PauliFault:
     """One sampled physical Pauli fault.
 
@@ -181,6 +211,101 @@ class PauliFault:
     gate_index: int
     site: int
     pauli: str
+
+
+@dataclass(frozen=True)
+class ImportanceSamplingPolicy:
+    """A proposal distribution for unbiased rare-event trajectory sampling.
+
+    ``proposal`` may be either a mapping from event index to outcome
+    probabilities, a label-to-probability mapping used for every event, or a
+    callable with signature ``(event_index, labels, target_probabilities,
+    optimizer)``.  The target probabilities always come from the physical
+    channel and the runner records the likelihood ratio ``target/proposal``.
+
+    Proposal distributions must have support wherever the target distribution
+    is nonzero.  ``max_likelihood_ratio`` is an optional safety guard against a
+    numerically explosive proposal; it raises before applying a sampled branch.
+    """
+
+    proposal: Any
+    max_likelihood_ratio: float | None = None
+
+    def __post_init__(self):
+        if self.max_likelihood_ratio is not None:
+            value = float(self.max_likelihood_ratio)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    "max_likelihood_ratio must be finite, positive, or None."
+                )
+            object.__setattr__(self, "max_likelihood_ratio", value)
+
+    def probabilities(
+        self,
+        event_index,
+        labels,
+        target_probabilities,
+        optimizer=None,
+    ) -> np.ndarray:
+        """Resolve and validate the proposal probabilities for one event."""
+        labels = tuple(str(label) for label in labels)
+        target = np.asarray(target_probabilities, dtype=float)
+        if target.ndim != 1 or len(target) != len(labels):
+            raise ValueError("importance target probabilities do not match outcomes.")
+        if (
+            not np.all(np.isfinite(target))
+            or np.any(target < -1e-12)
+            or not np.isclose(float(target.sum()), 1.0, atol=1e-10, rtol=1e-10)
+        ):
+            raise ValueError("importance target probabilities must form a distribution.")
+        target = np.maximum(target, 0.0)
+
+        spec = self.proposal
+        if callable(spec):
+            spec = spec(event_index, labels, target.copy(), optimizer)
+        elif isinstance(spec, Mapping):
+            label_keys = set(labels)
+            if not set(spec).intersection(label_keys):
+                event_spec = spec.get(event_index, spec.get("*"))
+                if event_spec is None:
+                    return target
+                spec = event_spec
+
+        if isinstance(spec, Mapping):
+            proposal = np.asarray([spec.get(label, 0.0) for label in labels], dtype=float)
+        else:
+            proposal = np.asarray(spec, dtype=float)
+        if proposal.ndim != 1 or len(proposal) != len(labels):
+            raise ValueError(
+                f"importance proposal for event {event_index} must match outcomes."
+            )
+        if (
+            not np.all(np.isfinite(proposal))
+            or np.any(proposal < -1e-12)
+            or not np.isclose(float(proposal.sum()), 1.0, atol=1e-10, rtol=1e-10)
+        ):
+            raise ValueError(
+                f"importance proposal for event {event_index} must sum to one."
+            )
+        proposal = np.maximum(proposal, 0.0)
+        if np.any((target > 1e-14) & (proposal <= 1e-14)):
+            raise ValueError(
+                f"importance proposal for event {event_index} omits a target branch."
+            )
+        return proposal
+
+
+def _coerce_importance_policy(policy):
+    if policy is None:
+        return None
+    if isinstance(policy, ImportanceSamplingPolicy):
+        return policy
+    if callable(policy) or isinstance(policy, Mapping):
+        return ImportanceSamplingPolicy(policy)
+    raise TypeError(
+        "importance_sampling must be an ImportanceSamplingPolicy, mapping, "
+        "callable, or None."
+    )
 
 
 @dataclass(frozen=True)
@@ -266,11 +391,21 @@ class NoisyShotResult:
     optimizers: tuple[Any, ...]
     gate_streams: tuple[tuple[object, ...], ...]
     faults: tuple[tuple[PauliFault, ...], ...]
+    weights: tuple[float, ...] = ()
 
     @property
     def shots(self) -> int:
         """Number of independently replayed trajectories."""
         return len(self.optimizers)
+
+    def estimate(self, values) -> float:
+        """Estimate a scalar observable from one value per trajectory."""
+        return _weighted_estimate(values, self.weights or (1.0,) * self.shots)
+
+    @property
+    def effective_sample_size(self) -> float:
+        """Return the importance-weight effective sample size."""
+        return _effective_sample_size(self.weights or (1.0,) * self.shots)
 
 
 @dataclass(frozen=True)
@@ -279,6 +414,46 @@ class StimHerald:
 
     instruction_index: int
     site: int
+    value: bool
+
+
+@dataclass(frozen=True)
+class StimDetector:
+    """A compiled Stim detector annotation expressed in measurement offsets."""
+
+    instruction_index: int
+    detector_index: int
+    rec_targets: tuple[tuple[int, bool], ...]
+    coordinates: tuple[float, ...]
+    measurement_count: int
+
+
+@dataclass(frozen=True)
+class StimObservable:
+    """A compiled Stim logical-observable annotation."""
+
+    instruction_index: int
+    observable_index: int
+    rec_targets: tuple[tuple[int, bool], ...]
+    measurement_count: int
+
+
+@dataclass(frozen=True)
+class StimSyndromeRecord:
+    """One resolved detector value from a replayed Stim trajectory."""
+
+    instruction_index: int
+    detector_index: int
+    value: bool
+    coordinates: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class StimObservableRecord:
+    """One resolved logical-observable value from a replayed Stim trajectory."""
+
+    instruction_index: int
+    observable_index: int
     value: bool
 
 
@@ -306,6 +481,8 @@ class StimCircuitPlan:
 
     num_qubits: int
     operations: tuple[_StimPlanOperation, ...]
+    detectors: tuple[StimDetector, ...] = ()
+    observables: tuple[StimObservable, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -315,6 +492,7 @@ class StimNoiseSample:
     gate_stream: tuple[object, ...]
     faults: tuple[PauliFault, ...]
     heralds: tuple[StimHerald, ...]
+    weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -323,6 +501,7 @@ class StimShotResult:
 
     optimizers: tuple[Any, ...]
     samples: tuple[StimNoiseSample, ...]
+    plan: StimCircuitPlan | None = None
 
     @property
     def shots(self) -> int:
@@ -343,6 +522,48 @@ class StimShotResult:
     def heralds(self) -> tuple[tuple[StimHerald, ...], ...]:
         """Herald bits sampled for every trajectory, in circuit order."""
         return tuple(sample.heralds for sample in self.samples)
+
+    @property
+    def weights(self) -> tuple[float, ...]:
+        """Likelihood ratios for importance-sampled Stim trajectories."""
+        return tuple(float(sample.weight) for sample in self.samples)
+
+    def estimate(self, values) -> float:
+        """Estimate a scalar observable from one value per shot."""
+        return _weighted_estimate(values, self.weights)
+
+    @property
+    def effective_sample_size(self) -> float:
+        """Return the importance-weight effective sample size."""
+        return _effective_sample_size(self.weights)
+
+    @property
+    def measurements(self) -> tuple[tuple["TrajectoryMeasurementRecord", ...], ...]:
+        """Structured mid-circuit measurements for every replayed shot."""
+        return tuple(
+            _optimizer_measurement_records(optimizer)
+            for optimizer in self.optimizers
+        )
+
+    @property
+    def syndromes(self):
+        """Resolved detector records, one tuple per shot."""
+        if self.plan is None:
+            return tuple(() for _ in self.optimizers)
+        return tuple(
+            _resolve_stim_annotations(self.plan, optimizer)[0]
+            for optimizer in self.optimizers
+        )
+
+    @property
+    def observables(self):
+        """Resolved logical-observable records, one tuple per shot."""
+        if self.plan is None:
+            return tuple(() for _ in self.optimizers)
+        return tuple(
+            _resolve_stim_annotations(self.plan, optimizer)[1]
+            for optimizer in self.optimizers
+        )
 
 
 @dataclass(frozen=True)
@@ -460,6 +681,81 @@ class TrajectoryChannel:
 
 
 @dataclass(frozen=True)
+class CoherentCrosstalkModel:
+    """Insert coherent nearest-neighbour ``ZZ`` crosstalk into a gate stream.
+
+    Pepsy rotations use ``exp(-i * theta * P / 2)``.  Therefore a physical
+    crosstalk channel ``exp(+i * theta_zz * Z Z)`` from the surface-code model
+    is emitted as ``("rzz", -2 * theta_zz, q0, q1)``.  With no adjacency map,
+    the pair is the two-qubit gate support.  An adjacency mapping can instead
+    add spectator-neighbour pairs touching the active gate support.
+
+    ``sign_mode="random_sign"`` emits ``+theta``/``-theta`` with equal
+    probability, which is useful for comparing coherent noise with an
+    identical Pauli-twirled approximation.
+    """
+
+    theta: float
+    adjacency: Mapping[int, tuple[int, ...]] | None = None
+    sign_mode: str = "fixed"
+    gate_names: tuple[str, ...] = tuple(sorted(_TWO_QUBIT_NAMES))
+
+    def __post_init__(self):
+        theta = float(self.theta)
+        if not np.isfinite(theta):
+            raise ValueError("theta must be finite.")
+        mode = str(self.sign_mode).strip().lower().replace("-", "_")
+        if mode not in {"fixed", "random_sign"}:
+            raise ValueError("sign_mode must be 'fixed' or 'random_sign'.")
+        names = tuple(str(name).strip().lower().replace("-", "_") for name in self.gate_names)
+        if not names:
+            raise ValueError("gate_names must contain at least one two-qubit gate.")
+        object.__setattr__(self, "theta", theta)
+        object.__setattr__(self, "sign_mode", mode)
+        object.__setattr__(self, "gate_names", names)
+
+    def _pairs_for_entry(self, entry):
+        support = _event_support(entry)
+        if support is None or len(support) != 2:
+            return ()
+        if isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
+            name = str(entry[0]).strip().lower().replace("-", "_")
+            if name not in self.gate_names:
+                return ()
+        elif not (
+            isinstance(entry, (tuple, list))
+            and len(entry) == 2
+            and hasattr(entry[0], "shape")
+        ):
+            return ()
+        active = tuple(int(site) for site in support)
+        if self.adjacency is None:
+            return (tuple(sorted(active)),)
+        pairs = set()
+        for left in active:
+            for right in self.adjacency.get(left, ()):
+                right = int(right)
+                if right != left:
+                    pairs.add(tuple(sorted((left, right))))
+        return tuple(sorted(pairs))
+
+    def transform(self, gates, *, seed=None):
+        """Return a stream with coherent ``ZZ`` rotations after active gates."""
+        rng = np.random.default_rng(seed)
+        transformed = []
+        for entry in _as_entries(gates):
+            transformed.append(entry)
+            for left, right in self._pairs_for_entry(entry):
+                sign = 1.0
+                if self.sign_mode == "random_sign":
+                    sign = 1.0 if rng.integers(2) == 0 else -1.0
+                transformed.append(("rzz", -2.0 * self.theta * sign, left, right))
+        return tuple(transformed)
+
+    apply = transform
+
+
+@dataclass(frozen=True)
 class TrajectoryEvent:
     """A user-defined channel event embedded in an otherwise ordinary gate stream."""
 
@@ -486,6 +782,28 @@ class TrajectoryRecord:
     where: tuple[int, ...]
     label: str
     probability: float
+    proposal_probability: float | None = None
+    likelihood_ratio: float = 1.0
+
+
+@dataclass(frozen=True)
+class TrajectoryMeasurementRecord:
+    """One structured mid-circuit measurement produced during replay.
+
+    ``outcome`` is a Pauli eigenvalue (``+1``/``-1``), while computational-basis
+    consumers can map it to ``0``/``1`` with ``bit = (1 - outcome) // 2``.
+    ``probability`` is the Born probability when the backend exposes it;
+    stabilizer backends may leave it as ``None`` because their native public
+    measurement record intentionally stores only the outcome.
+    """
+
+    event_index: int | None
+    pauli: str
+    where: tuple[int, ...]
+    outcome: int
+    probability: float | None = None
+    reset: bool = False
+    instruction_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -514,6 +832,7 @@ class TrajectorySample:
 
     gate_stream: tuple[object, ...]
     records: tuple[TrajectoryRecord, ...]
+    weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -529,11 +848,29 @@ class TrajectoryShotResult:
     gate_streams: tuple[tuple[object, ...], ...]
     records: tuple[tuple[TrajectoryRecord, ...], ...]
     leakage_records: tuple[tuple[LeakageRecord, ...], ...] = ()
+    measurement_records: tuple[tuple[TrajectoryMeasurementRecord, ...], ...] = ()
+    weights: tuple[float, ...] = ()
 
     @property
     def shots(self) -> int:
         """Number of independently replayed trajectories."""
         return len(self.optimizers)
+
+    @property
+    def measurements(self):
+        """Alias for the structured per-shot measurement records."""
+        if self.measurement_records:
+            return self.measurement_records
+        return tuple(_optimizer_measurement_records(optimizer) for optimizer in self.optimizers)
+
+    def estimate(self, values) -> float:
+        """Estimate a scalar observable from one value per trajectory."""
+        return _weighted_estimate(values, self.weights or (1.0,) * self.shots)
+
+    @property
+    def effective_sample_size(self) -> float:
+        """Return the importance-weight effective sample size."""
+        return _effective_sample_size(self.weights or (1.0,) * self.shots)
 
 
 @dataclass(frozen=True)
@@ -559,10 +896,9 @@ class CoalescedTrajectoryLeaf:
 
     The optimizer is one representative of all trajectories in this leaf.
     Its ``gate_stream`` is the concrete replay stream used for the selected
-    noise and forced control outcomes.  Bare reset collapses are represented
-    by their equivalent forced ``measure_reset`` operations so that the state
-    history is fully inspectable; those internal outcomes are flagged with
-    ``reset=True`` in :attr:`measurements`.
+    noise and forced control outcomes. Bare resets are replayed as native
+    trace-preserving reset events and therefore do not add a user-visible
+    measurement record.
     """
 
     optimizer: Any
@@ -573,6 +909,7 @@ class CoalescedTrajectoryLeaf:
     heralds: tuple[StimHerald, ...] = ()
     measurements: tuple[CoalescedMeasurementRecord, ...] = ()
     leakage_records: tuple[LeakageRecord, ...] = ()
+    weight: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -587,6 +924,7 @@ class CoalescedTrajectoryResult:
     """
 
     leaves: tuple[CoalescedTrajectoryLeaf, ...]
+    plan: StimCircuitPlan | None = None
 
     @property
     def shots(self) -> int:
@@ -607,6 +945,53 @@ class CoalescedTrajectoryResult:
     def counts(self) -> tuple[int, ...]:
         """Number of shots represented by each optimizer in :attr:`optimizers`."""
         return tuple(leaf.count for leaf in self.leaves)
+
+    @property
+    def weights(self) -> tuple[float, ...]:
+        """Path likelihood ratios, one per retained coalesced leaf."""
+        return tuple(float(leaf.weight) for leaf in self.leaves)
+
+    def estimate(self, values) -> float:
+        """Estimate a scalar observable from one value per retained leaf."""
+        values = np.asarray(values, dtype=float)
+        if values.ndim != 1 or len(values) != len(self.leaves):
+            raise ValueError("coalesced estimates need one value per retained leaf.")
+        numerator = sum(
+            int(leaf.count) * float(leaf.weight) * float(value)
+            for leaf, value in zip(self.leaves, values)
+        )
+        return float(numerator / self.shots) if self.shots else float("nan")
+
+    @property
+    def effective_sample_size(self) -> float:
+        """Return the count-aware importance-weight effective sample size."""
+        if not self.leaves:
+            return 0.0
+        first = sum(float(leaf.count) * float(leaf.weight) for leaf in self.leaves)
+        second = sum(
+            float(leaf.count) * float(leaf.weight) ** 2 for leaf in self.leaves
+        )
+        return float(first * first / second) if second > 0.0 else 0.0
+
+    @property
+    def syndromes(self):
+        """Resolved Stim detector records, one tuple per coalesced leaf."""
+        if self.plan is None:
+            return tuple(() for _ in self.leaves)
+        return tuple(
+            _resolve_stim_annotations(self.plan, leaf.optimizer)[0]
+            for leaf in self.leaves
+        )
+
+    @property
+    def observables(self):
+        """Resolved Stim observable records, one tuple per coalesced leaf."""
+        if self.plan is None:
+            return tuple(() for _ in self.leaves)
+        return tuple(
+            _resolve_stim_annotations(self.plan, leaf.optimizer)[1]
+            for leaf in self.leaves
+        )
 
     def sample_bits(self, *, seed=None, sampler_kwargs=None, shuffle=True):
         """Sample every leaf ``count`` times without expanding its optimizer state.
@@ -653,6 +1038,25 @@ def _unit_interval_probability(value, label: str) -> float:
     if not np.isfinite(value) or not 0.0 <= value <= 1.0:
         raise ValueError(f"{label} probability must lie in [0, 1].")
     return value
+
+
+def _weighted_estimate(values, weights) -> float:
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if values.ndim != 1 or weights.ndim != 1 or len(values) != len(weights):
+        raise ValueError("weighted estimates need one value and weight per trajectory.")
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(weights)):
+        raise ValueError("weighted estimates require finite values and weights.")
+    return float(np.dot(values, weights) / len(values)) if len(values) else float("nan")
+
+
+def _effective_sample_size(weights) -> float:
+    weights = np.asarray(weights, dtype=float)
+    if weights.ndim != 1 or not np.all(np.isfinite(weights)):
+        raise ValueError("effective sample size requires finite one-dimensional weights.")
+    denominator = float(np.dot(weights, weights))
+    numerator = float(weights.sum()) ** 2
+    return float(numerator / denominator) if denominator > 0.0 else 0.0
 
 
 def _trajectory_matrix(gate) -> np.ndarray:
@@ -1002,9 +1406,25 @@ def _contains_leakage_entries(entries) -> bool:
     return any(_leakage_event_parts(entry) is not None for entry in entries)
 
 
-def _sample_gate_stream(gates, error_model: PauliErrorModel, rng):
+def _sample_gate_stream(
+    gates,
+    error_model: PauliErrorModel,
+    rng,
+    *,
+    proposal_model: PauliErrorModel | None = None,
+    return_weight: bool = False,
+):
+    if proposal_model is not None and not isinstance(proposal_model, PauliErrorModel):
+        raise TypeError("proposal_model must be a PauliErrorModel or None.")
     stream = []
     faults = []
+    weight = 1.0
+    target_probabilities = error_model.probabilities
+    proposal_probabilities = (
+        target_probabilities
+        if proposal_model is None
+        else proposal_model.probabilities
+    )
     for gate_index, entry in enumerate(_as_entries(gates)):
         if _trajectory_event_from_stochastic_entry(entry) is not None:
             raise ValueError(
@@ -1023,11 +1443,21 @@ def _sample_gate_stream(gates, error_model: PauliErrorModel, rng):
             continue
         like = entry[0] if isinstance(entry, (tuple, list)) else None
         for site in support:
-            pauli = error_model.sample(rng)
+            labels = tuple(target_probabilities)
+            pauli = str(
+                rng.choice(labels, p=tuple(proposal_probabilities[label] for label in labels))
+            )
+            target = float(target_probabilities[pauli])
+            proposal = float(proposal_probabilities[pauli])
+            if proposal <= 0.0:
+                raise ValueError("proposal_model sampled a zero-probability branch.")
+            weight *= target / proposal
             if pauli == "I":
                 continue
             stream.append((_pauli_matrix(pauli, like=like), site))
             faults.append(PauliFault(gate_index=gate_index, site=site, pauli=pauli))
+    if return_weight:
+        return stream, tuple(faults), float(weight)
     return stream, tuple(faults)
 
 
@@ -1080,6 +1510,87 @@ def _validate_max_branches(max_branches):
     return int(max_branches)
 
 
+def _validate_max_branch_factor(max_branch_factor):
+    """Validate an optional per-event coalesced branching cap."""
+    if max_branch_factor is None:
+        return None
+    if (
+        isinstance(max_branch_factor, bool)
+        or not isinstance(max_branch_factor, Integral)
+        or max_branch_factor < 1
+    ):
+        raise ValueError("max_branch_factor must be a positive integer or None.")
+    return int(max_branch_factor)
+
+
+def _validate_parallel_workers(parallel_workers):
+    if parallel_workers is None:
+        return 1
+    if (
+        isinstance(parallel_workers, bool)
+        or not isinstance(parallel_workers, Integral)
+        or parallel_workers < 1
+    ):
+        raise ValueError("parallel_workers must be a positive integer or None.")
+    return int(parallel_workers)
+
+
+def _validate_parallel_backend(parallel_backend):
+    backend = str(parallel_backend).strip().lower().replace("-", "_")
+    if backend not in {"thread", "threads", "gpu", "serial"}:
+        raise ValueError(
+            "parallel_backend must be 'thread', 'gpu', or 'serial'."
+        )
+    return backend
+
+
+def _parallel_map_ordered(function, values, parallel_workers, parallel_backend):
+    """Apply independent optimizer work in deterministic input order.
+
+    GPU execution deliberately uses threads rather than processes: optimizer
+    state and device allocations remain in the caller's process. The caller's
+    factory is responsible for selecting the desired device/backend.
+    """
+    values = tuple(values)
+    if parallel_workers <= 1 or parallel_backend == "serial":
+        return [function(value) for value in values]
+    with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+        return list(executor.map(function, values))
+
+
+def _importance_distribution(policy, event_index, outcomes, target, optimizer=None):
+    """Return ``(target, proposal, ratios)`` for one channel event."""
+    return _importance_label_distribution(
+        policy,
+        event_index,
+        tuple(outcome.label for outcome in outcomes),
+        target,
+        optimizer,
+    )
+
+
+def _importance_label_distribution(
+    policy, event_index, labels, target, optimizer=None
+):
+    """Return ``(target, proposal, ratios)`` for arbitrary labelled outcomes."""
+    target = np.asarray(target, dtype=float)
+    target = target / float(target.sum())
+    if policy is None:
+        proposal = target.copy()
+    else:
+        proposal = policy.probabilities(event_index, labels, target, optimizer)
+    ratios = np.zeros_like(target)
+    nonzero = proposal > 0.0
+    ratios[nonzero] = target[nonzero] / proposal[nonzero]
+    if policy is not None and policy.max_likelihood_ratio is not None:
+        if np.any(ratios > policy.max_likelihood_ratio * (1.0 + 1e-12)):
+            raise ValueError(
+                f"importance likelihood ratio exceeds max_likelihood_ratio at "
+                f"event {event_index}."
+            )
+    return target, proposal, ratios
+
+
 def _expected_pauli_faults(entries, error_model):
     """Return lambda, the expected non-identity Pauli faults per shot."""
     targets = sum(
@@ -1126,6 +1637,10 @@ def run_noisy_shots(
     strategy: str = "independent",
     max_branches: int | None = _AUTO_MAX_BRANCHES,
     auto_max_expected_faults: float = _AUTO_MAX_EXPECTED_FAULTS,
+    importance_sampling=None,
+    max_branch_factor: int | None = None,
+    parallel_workers: int = 1,
+    parallel_backend: str = "thread",
 ) -> NoisyShotResult | CoalescedTrajectoryResult:
     """Build and replay independent noisy trajectories with either MPS optimizer.
 
@@ -1162,13 +1677,36 @@ def run_noisy_shots(
 
     strategy = _validate_strategy(strategy)
     max_branches = _validate_max_branches(max_branches)
+    max_branch_factor = _validate_max_branch_factor(max_branch_factor)
+    parallel_workers = _validate_parallel_workers(parallel_workers)
+    parallel_backend = _validate_parallel_backend(parallel_backend)
+    entries = _as_entries(gates)
+    if parallel_workers > 1:
+        if strategy == "auto":
+            raise ValueError(
+                "parallel trajectory execution needs an explicit strategy: "
+                "'independent' or 'coalesced'."
+            )
+        return run_parallel_noisy_shots(
+            optimizer_factory,
+            entries,
+            error_model,
+            shots,
+            seed=seed,
+            run_kwargs=run_kwargs,
+            strategy=strategy,
+            max_branches=max_branches,
+            importance_sampling=importance_sampling,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers,
+            parallel_backend=parallel_backend,
+        )
     auto_max_expected_faults = float(auto_max_expected_faults)
     if (
         not np.isfinite(auto_max_expected_faults)
         or auto_max_expected_faults < 0.0
     ):
         raise ValueError("auto_max_expected_faults must be finite and nonnegative.")
-    entries = _as_entries(gates)
     if _contains_stochastic_entries(entries):
         raise ValueError(
             "Stream-local stochastic entries require run_trajectory_shots(...) "
@@ -1190,6 +1728,8 @@ def run_noisy_shots(
             seed=seed,
             run_kwargs=run_kwargs,
             max_branches=max_branches,
+            importance_sampling=importance_sampling,
+            max_branch_factor=max_branch_factor,
         )
     if strategy == "auto" and _auto_prefers_coalescing(
         entries, error_model, auto_max_expected_faults
@@ -1203,32 +1743,116 @@ def run_noisy_shots(
                 seed=seed,
                 run_kwargs=run_kwargs,
                 max_branches=max_branches,
+                importance_sampling=importance_sampling,
+                max_branch_factor=max_branch_factor,
             )
         except _CoalescedBranchCapExceeded:
             # Restart from fresh optimizers. This changes neither the target
             # distribution nor its independent-trajectory semantics.
             pass
 
-    child_seeds = np.random.SeedSequence(seed).spawn(int(shots))
+    child_seeds = _trajectory_seed_pairs(seed, shots)
     optimizers = []
     streams = []
     faults = []
+    weights = []
     for child_seed in child_seeds:
-        stream, shot_faults = _sample_gate_stream(
-            entries, error_model, np.random.default_rng(child_seed)
+        noise_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
+        stream, shot_faults, weight = _sample_gate_stream(
+            entries,
+            error_model,
+            np.random.default_rng(noise_seed),
+            proposal_model=importance_sampling,
+            return_weight=True,
         )
         optimizer = optimizer_factory()
         if not hasattr(optimizer, "set_gates") or not hasattr(optimizer, "run"):
             raise TypeError(
                 "optimizer_factory must return an optimizer with set_gates(...) and run(...)."
             )
+        _seed_trajectory_optimizer(optimizer, optimizer_seed)
         optimizer.set_gates(stream)
         optimizer.run(**dict(run_kwargs))
         optimizers.append(optimizer)
         streams.append(tuple(stream))
         faults.append(shot_faults)
+        weights.append(weight)
 
-    return NoisyShotResult(tuple(optimizers), tuple(streams), tuple(faults))
+    return NoisyShotResult(
+        tuple(optimizers), tuple(streams), tuple(faults), tuple(weights)
+    )
+
+
+def run_parallel_noisy_shots(
+    optimizer_factory: Callable[[], Any],
+    gates,
+    error_model: PauliErrorModel,
+    shots: int,
+    *,
+    seed=None,
+    run_kwargs: Optional[Mapping[str, Any]] = None,
+    strategy: str = "independent",
+    max_branches: int | None = _AUTO_MAX_BRANCHES,
+    max_branch_factor: int | None = None,
+    importance_sampling=None,
+    parallel_workers: int = 2,
+    parallel_backend: str = "thread",
+) -> NoisyShotResult | CoalescedTrajectoryResult:
+    """Run noisy shots in deterministic parallel batches.
+
+    Independent shots receive fixed child seed streams before any worker is
+    started, so changing the worker count does not change a shot's random
+    stream. Coalesced execution parallelizes independent live leaves while
+    retaining one deterministic branch-splitting RNG. ``parallel_backend='gpu'``
+    uses threads in the current process; the optimizer factory must select the
+    intended GPU backend/device.
+    """
+    strategy = _validate_strategy(strategy)
+    workers = _validate_parallel_workers(parallel_workers)
+    backend = _validate_parallel_backend(parallel_backend)
+    if strategy == "auto":
+        raise ValueError(
+            "parallel noisy execution needs strategy='independent' or 'coalesced'."
+        )
+    if strategy == "coalesced":
+        return run_coalesced_noisy_shots(
+            optimizer_factory,
+            gates,
+            error_model,
+            shots,
+            seed=seed,
+            run_kwargs=run_kwargs,
+            max_branches=max_branches,
+            max_branch_factor=max_branch_factor,
+            importance_sampling=importance_sampling,
+            parallel_workers=workers,
+            parallel_backend=backend,
+        )
+
+    if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+        raise ValueError("shots must be a nonnegative integer.")
+    child_seeds = np.random.SeedSequence(seed).spawn(int(shots))
+
+    def run_one(child_seed):
+        child = _TrajectorySeedPair(*child_seed.spawn(2))
+        return run_noisy_shots(
+            optimizer_factory,
+            gates,
+            error_model,
+            1,
+            seed=child,
+            run_kwargs=run_kwargs,
+            strategy="independent",
+            importance_sampling=importance_sampling,
+        )
+
+    results = _parallel_map_ordered(run_one, child_seeds, workers, backend)
+    return NoisyShotResult(
+        tuple(result.optimizers[0] for result in results),
+        tuple(result.gate_streams[0] for result in results),
+        tuple(result.faults[0] for result in results),
+        tuple(result.weights[0] for result in results),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1261,7 +1885,9 @@ def _sample_trajectory_mixture(channel: TrajectoryChannel, rng):
     return channel.outcomes[index], float(probabilities[index])
 
 
-def sample_trajectory_stream(gates, *, seed=None) -> TrajectorySample:
+def sample_trajectory_stream(
+    gates, *, seed=None, importance_sampling=None
+) -> TrajectorySample:
     """Sample fixed random-unitary events in a user-defined gate stream.
 
     The input is an ordinary gate stream with either :class:`TrajectoryEvent`
@@ -1272,8 +1898,10 @@ def sample_trajectory_stream(gates, *, seed=None) -> TrajectorySample:
     :func:`run_trajectory_shots` instead.
     """
     rng = np.random.default_rng(seed)
+    policy = _coerce_importance_policy(importance_sampling)
     stream = []
     records = []
+    weight = 1.0
     for event_index, entry in enumerate(_trajectory_entries(gates)):
         if _leakage_event_parts(entry) is not None:
             raise ValueError(
@@ -1288,12 +1916,30 @@ def sample_trajectory_stream(gates, *, seed=None) -> TrajectorySample:
                 "State-dependent Kraus channels require run_trajectory_shots(...); "
                 "they cannot be sampled from a gate stream alone."
             )
-        outcome, probability = _sample_trajectory_mixture(entry.channel, rng)
+        target = np.asarray(
+            [outcome.probability for outcome in entry.channel.outcomes], dtype=float
+        )
+        target, proposal, ratios = _importance_distribution(
+            policy, event_index, entry.channel.outcomes, target
+        )
+        index = int(rng.choice(len(entry.channel.outcomes), p=proposal))
+        outcome = entry.channel.outcomes[index]
+        probability = float(target[index])
+        proposal_probability = float(proposal[index]) if policy is not None else None
+        ratio = float(ratios[index])
+        weight *= ratio
         stream.append(_entry_from_trajectory_outcome(outcome, entry.where))
         records.append(
-            TrajectoryRecord(event_index, entry.where, outcome.label, probability)
+            TrajectoryRecord(
+                event_index,
+                entry.where,
+                outcome.label,
+                probability,
+                proposal_probability,
+                ratio,
+            )
         )
-    return TrajectorySample(tuple(stream), tuple(records))
+    return TrajectorySample(tuple(stream), tuple(records), float(weight))
 
 
 def _check_trajectory_optimizer(optimizer):
@@ -1303,8 +1949,157 @@ def _check_trajectory_optimizer(optimizer):
         )
 
 
+def _seed_trajectory_optimizer(optimizer, seed):
+    """Seed every backend RNG used by a trajectory optimizer.
+
+    The noise runner owns the per-shot ``SeedSequence``.  Optimizer-native
+    measurement/reset sampling must consume a separate child stream so a
+    repeated trajectory run is reproducible without coupling channel draws to
+    measurement draws.
+    """
+    rng = np.random.default_rng(seed)
+    if hasattr(optimizer, "_rng"):
+        optimizer._rng = rng
+    if hasattr(optimizer, "rng"):
+        optimizer.rng = rng
+
+
+def _normalize_optimizer_measurement(raw):
+    """Normalize Pepsy MPS, STN, and TTN measurement record shapes."""
+    if isinstance(raw, TrajectoryMeasurementRecord):
+        return raw.pauli, raw.where, raw.outcome, raw.probability
+    pauli = getattr(raw, "pauli", None)
+    where = getattr(raw, "where", None)
+    outcome = getattr(raw, "outcome", None)
+    probability = getattr(raw, "probability", None)
+    if pauli is None and isinstance(raw, Mapping):
+        pauli = raw.get("pauli")
+        where = raw.get("where")
+        outcome = raw.get("outcome")
+        probability = raw.get("probability")
+    if pauli is None:
+        try:
+            pauli, where, outcome = raw[:3]
+            probability = raw[3] if len(raw) > 3 else None
+        except (TypeError, IndexError, ValueError) as exc:
+            raise TypeError(f"Unsupported optimizer measurement record {raw!r}.") from exc
+    if isinstance(where, Integral):
+        where = (int(where),)
+    else:
+        where = tuple(int(site) for site in where)
+    probability = None if probability is None else float(probability)
+    return str(pauli), where, int(outcome), probability
+
+
+def _optimizer_measurement_records(optimizer, *, event_index=None):
+    """Return normalized measurement records already retained by an optimizer."""
+    records = []
+    for raw in getattr(optimizer, "measurements", ()):
+        pauli, where, outcome, probability = _normalize_optimizer_measurement(raw)
+        records.append(
+            TrajectoryMeasurementRecord(
+                event_index=event_index,
+                pauli=pauli,
+                where=where,
+                outcome=outcome,
+                probability=probability,
+            )
+        )
+    return tuple(records)
+
+
+def _resolve_stim_annotations(plan, optimizer):
+    """Resolve compiled ``rec[...]`` annotations against optimizer results."""
+    measurements = _optimizer_measurement_records(optimizer)
+    bits = tuple(int(record.outcome < 0) for record in measurements)
+
+    def parity(annotation):
+        value = 0
+        for offset, inverted in annotation.rec_targets:
+            index = int(annotation.measurement_count) + int(offset)
+            if index < 0 or index >= len(bits):
+                raise ValueError(
+                    f"Stim annotation at instruction {annotation.instruction_index} "
+                    f"references measurement {index}, but replay produced {len(bits)}."
+                )
+            bit = bits[index]
+            value ^= bit ^ int(bool(inverted))
+        return bool(value)
+
+    syndromes = tuple(
+        StimSyndromeRecord(
+            instruction_index=annotation.instruction_index,
+            detector_index=annotation.detector_index,
+            value=parity(annotation),
+            coordinates=annotation.coordinates,
+        )
+        for annotation in plan.detectors
+    )
+    observables = tuple(
+        StimObservableRecord(
+            instruction_index=annotation.instruction_index,
+            observable_index=annotation.observable_index,
+            value=parity(annotation),
+        )
+        for annotation in plan.observables
+    )
+    return syndromes, observables
+
+
+def _measurement_metadata(indexed_entries):
+    """Return ``(event_index, reset)`` metadata for recorded control outcomes."""
+    metadata = []
+    for event_index, entry in indexed_entries:
+        parts = MpsOptimizer.control_event_parts(entry)
+        if parts is None:
+            continue
+        name, _payload, where = parts
+        if name == "measure":
+            metadata.append((int(event_index), False))
+        elif name == "measure_reset":
+            metadata.extend((int(event_index), True) for _ in where)
+    return metadata
+
+
+def _capture_optimizer_measurements(
+    optimizer,
+    start,
+    metadata,
+    destination,
+):
+    """Capture newly appended native records with stream event metadata."""
+    native = list(getattr(optimizer, "measurements", ()))
+    for offset, raw in enumerate(native[int(start):]):
+        pauli, where, outcome, probability = _normalize_optimizer_measurement(raw)
+        event_index, reset = (
+            metadata[offset] if offset < len(metadata) else (None, False)
+        )
+        destination.append(
+            TrajectoryMeasurementRecord(
+                event_index=event_index,
+                pauli=pauli,
+                where=where,
+                outcome=outcome,
+                probability=probability,
+                reset=reset,
+            )
+        )
+
+
 def _is_stabilizer_trajectory_optimizer(optimizer) -> bool:
-    """Recognize the STN optimizer without importing it during package setup."""
+    """Recognize MPS- or tree-backed STN optimizers without importing them."""
+    if _is_tree_stabilizer_trajectory_optimizer(optimizer):
+        return True
+    return _is_mps_stabilizer_trajectory_optimizer(optimizer)
+
+
+def _is_tree_stabilizer_trajectory_optimizer(optimizer) -> bool:
+    """Recognize TreeStabOptimizer through its lightweight protocol marker."""
+    return bool(getattr(optimizer, "_is_tree_stabilizer_trajectory_optimizer", False))
+
+
+def _is_mps_stabilizer_trajectory_optimizer(optimizer) -> bool:
+    """Recognize the chain STN optimizer without importing it at setup time."""
     return all(
         callable(getattr(optimizer, attr, None))
         for attr in (
@@ -1410,13 +2205,28 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
     """Compute normalized state-dependent probabilities for a local channel."""
     base_norm_squared = _trajectory_norm_squared(optimizer)
     if _is_stabilizer_trajectory_optimizer(optimizer):
-        branch_norm_squared = np.asarray(
-            [
-                _stn_outcome_norm_squared(optimizer, outcome.gate, where)
-                for outcome in channel.outcomes
-            ],
-            dtype=float,
-        )
+        # Both STN frontends already expose the exact local Gram-norm path
+        # used by their non-unitary dense-gate implementation.  Evaluating
+        # ``<psi|K^dagger K|psi>`` through Pauli expectations avoids making a
+        # full optimizer copy for every Kraus outcome.  The selected K branch
+        # is still replayed once below, where the trajectory state is updated.
+        target_norm = getattr(optimizer, "_dense_gate_target_norm", None)
+        if callable(target_norm):
+            branch_norm_squared = np.asarray(
+                [
+                    float(target_norm(outcome.gate, where)) ** 2
+                    for outcome in channel.outcomes
+                ],
+                dtype=float,
+            )
+        else:  # pragma: no cover - compatibility with external STN lookalikes
+            branch_norm_squared = np.asarray(
+                [
+                    _stn_outcome_norm_squared(optimizer, outcome.gate, where)
+                    for outcome in channel.outcomes
+                ],
+                dtype=float,
+            )
     elif callable(getattr(optimizer, "apply_gate", None)):
         branch_norm_squared = np.asarray(
             [
@@ -1445,9 +2255,74 @@ def _kraus_probabilities(optimizer, channel: TrajectoryChannel, where) -> np.nda
     return probabilities / total
 
 
-def _run_trajectory_entries(optimizer, entries, run_kwargs, *, non_unitary=False):
+def _run_trajectory_entries(
+    optimizer,
+    entries,
+    run_kwargs,
+    *,
+    non_unitary=False,
+    magic_context=None,
+):
     """Run one contiguous ordinary-gate segment on its optimizer backend."""
     if not entries:
+        return
+    if len(entries) > 1 and any(
+        MpsOptimizer.control_event_parts(entry) is not None for entry in entries
+    ):
+        # The general MPS optimizer accepts a control event as a complete
+        # stream, but deliberately does not mix it with bundled ordinary gate
+        # entries in one ``set_gates`` call.  Keep ordinary runs batched while
+        # isolating each control event; STN and Tree backends follow the same
+        # segmentation, so measurement records stay aligned across backends.
+        pending = []
+
+        def flush_controls_pending():
+            nonlocal pending
+            if pending:
+                _run_trajectory_entries(
+                    optimizer,
+                    pending,
+                    run_kwargs,
+                    non_unitary=non_unitary,
+                    magic_context=magic_context,
+                )
+                pending = []
+
+        for entry in entries:
+            if MpsOptimizer.control_event_parts(entry) is None:
+                pending.append(entry)
+            else:
+                flush_controls_pending()
+                _run_trajectory_entries(
+                    optimizer,
+                    [entry],
+                    run_kwargs,
+                    non_unitary=non_unitary,
+                    magic_context=magic_context,
+                )
+        flush_controls_pending()
+        return
+    if magic_context is not None:
+        pending = []
+
+        def flush_magic_pending():
+            nonlocal pending
+            if pending:
+                _run_trajectory_entries(
+                    optimizer,
+                    pending,
+                    run_kwargs,
+                    non_unitary=non_unitary,
+                )
+                pending = []
+
+        for entry in entries:
+            if _magic_entry_spec(optimizer, entry) is None:
+                pending.append(entry)
+                continue
+            flush_magic_pending()
+            _apply_magic_entry(optimizer, entry, magic_context)
+        flush_magic_pending()
         return
     # A one-entry tuple is itself a valid bundled gate, while optimizers expect
     # a *stream* to distinguish it from that single gate. Keep the outer list
@@ -1461,9 +2336,87 @@ def _run_trajectory_entries(optimizer, entries, run_kwargs, *, non_unitary=False
     optimizer.run(**kwargs)
 
 
+def _magic_entry_spec(optimizer, entry):
+    """Return an injectable ``(data, angle)`` pair when the backend supports it."""
+    classifier = getattr(type(optimizer), "_injectable_rz", None)
+    if not callable(classifier):
+        return None
+    return classifier(entry)
+
+
+def _new_magic_context(optimizer, ancillas, *, recycle=True, reset_ancillas=True):
+    """Validate and initialize incremental immediate-injection state."""
+    validate = getattr(optimizer, "_validate_magic_ancilla_pool", None)
+    if not callable(validate):
+        raise TypeError(
+            "magic injection requires MpsStabOptimizer or TreeStabOptimizer "
+            "with a validated ancilla pool."
+        )
+    try:
+        pool = validate(ancillas, require_nonempty=True)
+    except TypeError:
+        # TreeStab keeps the non-empty default in its signature, while the MPS
+        # frontend exposes the keyword explicitly for deferred injection.
+        pool = validate(ancillas)
+    assert_clean = getattr(optimizer, "_assert_magic_ancillas_clean", None)
+    if callable(assert_clean):
+        assert_clean(pool)
+    return {
+        "pool": tuple(pool),
+        "dirty": {int(ancilla): False for ancilla in pool},
+        "recycle": bool(recycle),
+        "reset_ancillas": bool(reset_ancillas),
+    }
+
+
+def _apply_magic_entry(optimizer, entry, context):
+    """Apply one injectable rotation through a prepared/recycled magic ancilla."""
+    spec = _magic_entry_spec(optimizer, entry)
+    if spec is None:
+        return False
+    data, angle = spec
+    pool = context["pool"]
+    dirty = context["dirty"]
+    clean = [ancilla for ancilla in pool if not dirty[ancilla]]
+    if clean:
+        nearest = getattr(optimizer, "_nearest_magic_ancilla", None)
+        ancilla = nearest(clean, data) if callable(nearest) else clean[0]
+    elif context["recycle"]:
+        nearest = getattr(optimizer, "_nearest_magic_ancilla", None)
+        ancilla = nearest(pool, data) if callable(nearest) else pool[0]
+        optimizer.reset(ancilla)
+        dirty[ancilla] = False
+    else:
+        raise RuntimeError(
+            "magic-ancilla pool exhausted (recycle=False); reserve more ancillas."
+        )
+    optimizer.prepare_magic(ancilla, angle=angle)
+    optimizer.inject_rz(data, ancilla, angle)
+    dirty[ancilla] = True
+    return True
+
+
+def _finish_magic_context(optimizer, context):
+    """Reset dirty immediate-injection ancillas at the end of a trajectory."""
+    if not context["reset_ancillas"]:
+        return
+    for ancilla, dirty in context["dirty"].items():
+        if dirty:
+            optimizer.reset(ancilla)
+            context["dirty"][ancilla] = False
+
+
 def _normalize_trajectory_branch(optimizer, where, *, norm_event=None):
     """Normalize a selected Kraus branch while keeping MPS metadata valid."""
-    if _is_stabilizer_trajectory_optimizer(optimizer):
+    if _is_tree_stabilizer_trajectory_optimizer(optimizer):
+        normalize = getattr(optimizer, "normalize", None)
+        if not callable(normalize):  # pragma: no cover - protocol guard
+            raise TypeError(
+                "TreeStab trajectory channels require normalize()."
+            )
+        normalize()
+        return
+    if _is_mps_stabilizer_trajectory_optimizer(optimizer):
         site = optimizer._mps_site(_trajectory_where(where)[0])
         optimizer._canonize_p(site)
         projected_norm = optimizer._renorm_p_at(site)
@@ -1767,21 +2720,30 @@ def _apply_leakage_event(
     raise AssertionError(f"Unhandled leakage event kind {kind!r}.")
 
 
-def _apply_trajectory_event(optimizer, event, rng, event_index, run_kwargs):
+def _apply_trajectory_event(
+    optimizer, event, rng, event_index, run_kwargs, *, importance_policy=None
+):
     """Sample and apply one channel event, returning its inspectable record."""
     channel = event.channel
     if channel.mode == "mixture":
-        outcome, probability = _sample_trajectory_mixture(channel, rng)
+        target = np.asarray(
+            [outcome.probability for outcome in channel.outcomes], dtype=float
+        )
         non_unitary = False
     else:
-        probabilities = _kraus_probabilities(optimizer, channel, event.where)
-        index = int(rng.choice(len(channel.outcomes), p=probabilities))
-        outcome = channel.outcomes[index]
-        probability = float(probabilities[index])
+        target = _kraus_probabilities(optimizer, channel, event.where)
         non_unitary = True
+    target, proposal, ratios = _importance_distribution(
+        importance_policy, event_index, channel.outcomes, target, optimizer
+    )
+    index = int(rng.choice(len(channel.outcomes), p=proposal))
+    outcome = channel.outcomes[index]
+    probability = float(target[index])
+    proposal_probability = float(proposal[index]) if importance_policy is not None else None
+    likelihood_ratio = float(ratios[index])
     norm_event = (
         optimizer._make_norm_event("trajectory_kraus", branch_probability=probability)
-        if non_unitary and _is_stabilizer_trajectory_optimizer(optimizer)
+        if non_unitary and _is_mps_stabilizer_trajectory_optimizer(optimizer)
         else None
     )
     _run_trajectory_entries(
@@ -1792,7 +2754,14 @@ def _apply_trajectory_event(optimizer, event, rng, event_index, run_kwargs):
     )
     if non_unitary:
         _normalize_trajectory_branch(optimizer, event.where, norm_event=norm_event)
-    return TrajectoryRecord(event_index, event.where, outcome.label, probability)
+    return TrajectoryRecord(
+        event_index,
+        event.where,
+        outcome.label,
+        probability,
+        proposal_probability,
+        likelihood_ratio,
+    ), likelihood_ratio
 
 
 @dataclass
@@ -1801,6 +2770,7 @@ class _CoalescedNode:
 
     optimizer: Any
     count: int
+    weight: float = 1.0
     gate_stream: list[object] = field(default_factory=list)
     records: list[TrajectoryRecord] = field(default_factory=list)
     faults: list[PauliFault] = field(default_factory=list)
@@ -1831,6 +2801,7 @@ def _copy_coalesced_node(node: _CoalescedNode) -> _CoalescedNode:
     return _CoalescedNode(
         optimizer=optimizer,
         count=node.count,
+        weight=node.weight,
         gate_stream=list(node.gate_stream),
         records=list(node.records),
         faults=list(node.faults),
@@ -1885,6 +2856,9 @@ def _split_coalesced_nodes(
     *,
     context,
     max_branches=None,
+    max_branch_factor=None,
+    parallel_workers=1,
+    parallel_backend="thread",
 ):
     """Split count-bearing nodes with exact multinomial branch counts."""
     probabilities = _coalesced_probabilities(probabilities, context=context)
@@ -1903,6 +2877,11 @@ def _split_coalesced_nodes(
                 f"coalesced trajectory branch cap ({max_branches}) exceeded "
                 f"while splitting {context}."
             )
+        if max_branch_factor is not None and len(nonempty) > max_branch_factor:
+            raise _CoalescedBranchCapExceeded(
+                f"coalesced per-event branch budget ({max_branch_factor}) exceeded "
+                f"while splitting {context}."
+            )
         # Clone every child from the *pre-branch* parent. Applying the first
         # outcome before making later copies would incorrectly include that
         # first outcome in every sibling branch.
@@ -1910,15 +2889,32 @@ def _split_coalesced_nodes(
             node if index == 0 else _copy_coalesced_node(node)
             for index in range(len(nonempty))
         ]
-        for child, (outcome, probability, count) in zip(children, nonempty):
+        work = tuple(zip(children, nonempty))
+
+        def apply_child(item):
+            child, (outcome, probability, count) = item
             child.count = count
             apply(child, outcome, probability)
-            split.append(child)
+            return child
+
+        split.extend(
+            _parallel_map_ordered(
+                apply_child, work, parallel_workers, parallel_backend
+            )
+        )
     return split
 
 
 def _run_coalesced_entries(
-    nodes, indexed_entries, run_kwargs, rng, *, max_branches=None
+    nodes,
+    indexed_entries,
+    run_kwargs,
+    rng,
+    *,
+    max_branches=None,
+    max_branch_factor=None,
+    parallel_workers=1,
+    parallel_backend="thread",
 ):
     """Replay ordinary segments once per current node, splitting controls exactly."""
     pending = []
@@ -1928,13 +2924,33 @@ def _run_coalesced_entries(
         if not pending:
             return
         entries = tuple(entry for _index, entry in pending)
-        for node in nodes:
+        def run_node(node):
             _run_trajectory_entries(node.optimizer, entries, run_kwargs)
             node.gate_stream.extend(entries)
+            return node
+
+        nodes[:] = _parallel_map_ordered(
+            run_node, nodes, parallel_workers, parallel_backend
+        )
         pending = []
 
     for event_index, entry in indexed_entries:
         parts = MpsOptimizer.control_event_parts(entry)
+        if parts is not None and parts[0] == "conditional":
+            flush()
+            _name, payload, _where = parts
+            for node in nodes:
+                record_index, expected = _resolve_conditional(
+                    payload, len(getattr(node.optimizer, "measurements", ()))
+                )
+                record = node.optimizer.measurements[record_index]
+                outcome = int(getattr(record, "outcome", record[2]))
+                if int(outcome < 0) == expected:
+                    _run_trajectory_entries(
+                        node.optimizer, (payload["action"],), run_kwargs
+                    )
+                node.gate_stream.append(entry)
+            continue
         if parts is None or parts[0] not in {"measure", "reset", "measure_reset"}:
             pending.append((event_index, entry))
             continue
@@ -1945,8 +2961,12 @@ def _run_coalesced_entries(
             parts,
             run_kwargs,
             rng,
+            entry=entry,
             absorb_basis=_coalesced_control_absorb_basis(entry, parts[0]),
             max_branches=max_branches,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers,
+            parallel_backend=parallel_backend,
         )
     flush()
     return nodes
@@ -2005,6 +3025,9 @@ def _apply_coalesced_measurement(
     run_kwargs,
     rng,
     max_branches=None,
+    max_branch_factor=None,
+    parallel_workers=1,
+    parallel_backend="thread",
 ):
     """Branch a Pauli collapse, optionally followed by a reset."""
     where = tuple(int(site) for site in where)
@@ -2063,6 +3086,9 @@ def _apply_coalesced_measurement(
                 rng,
                 context="measurement",
                 max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                parallel_workers=parallel_workers,
+                parallel_backend=parallel_backend,
             )
         )
     return result
@@ -2075,12 +3101,31 @@ def _coalesced_control_event(
     run_kwargs,
     rng,
     *,
+    entry=None,
     absorb_basis=False,
     max_branches=None,
+    max_branch_factor=None,
+    parallel_workers=1,
+    parallel_backend="thread",
 ):
     """Branch an unforced measure/reset event one physical collapse at a time."""
     name, payload, where = parts
     where = tuple(int(site) for site in where)
+    if name == "reset":
+        # Reset is trace preserving and erases its internal measurement
+        # outcome.  Branching it would create multiple identical leaves and
+        # quickly exhaust the coalescing cap in QEC circuits.  Let the backend
+        # perform its native basis-updating reset once per live state.
+        if entry is None:  # pragma: no cover - defensive protocol guard
+            raise ValueError("coalesced reset replay needs the original entry.")
+        def reset_node(node):
+            _run_trajectory_entries(node.optimizer, (entry,), run_kwargs)
+            node.gate_stream.append(entry)
+            return node
+        nodes = _parallel_map_ordered(
+            reset_node, nodes, parallel_workers, parallel_backend
+        )
+        return nodes
     if name == "measure":
         return _apply_coalesced_measurement(
             nodes,
@@ -2094,6 +3139,9 @@ def _coalesced_control_event(
             run_kwargs=run_kwargs,
             rng=rng,
             max_branches=max_branches,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers,
+            parallel_backend=parallel_backend,
         )
 
     axes = tuple(payload["axes"])
@@ -2111,11 +3159,14 @@ def _coalesced_control_event(
             run_kwargs=run_kwargs,
             rng=rng,
             max_branches=max_branches,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers,
+            parallel_backend=parallel_backend,
         )
     return nodes
 
 
-def _coalesced_result(nodes) -> CoalescedTrajectoryResult:
+def _coalesced_result(nodes, *, plan=None) -> CoalescedTrajectoryResult:
     """Freeze construction nodes into the public memory-efficient result."""
     return CoalescedTrajectoryResult(
         tuple(
@@ -2128,9 +3179,11 @@ def _coalesced_result(nodes) -> CoalescedTrajectoryResult:
                 heralds=tuple(node.heralds),
                 measurements=tuple(node.measurements),
                 leakage_records=tuple(node.leakage_records),
+                weight=float(node.weight),
             )
             for node in nodes
-        )
+        ),
+        plan=plan,
     )
 
 
@@ -2240,24 +3293,42 @@ def run_trajectory_shots(
     run_kwargs: Optional[Mapping[str, Any]] = None,
     strategy: str = "independent",
     max_branches: int | None = _AUTO_MAX_BRANCHES,
+    magic_strategy: str = "direct",
+    magic_ancillas=None,
+    magic_recycle: bool = True,
+    magic_reset_ancillas: bool = True,
+    magic_projection_order="middle_out",
+    importance_sampling=None,
+    max_branch_factor: int | None = None,
+    parallel_workers: int = 1,
+    parallel_backend: str = "thread",
 ) -> TrajectoryShotResult | CoalescedTrajectoryResult:
     """Replay user-defined noisy gate-stream trajectories on MPS or tree optimizers.
 
     Insert :class:`TrajectoryEvent` objects or Pepsy stochastic entries directly
     into an ordinary gate stream. A ``mixture`` selects a known unitary branch
     by its explicit probability. A ``kraus`` channel evaluates all local branch
-    norms on the current MPS or TTN, samples the conditional probability, applies the
-    chosen branch, and normalizes before evolution continues. This includes
-    non-Pauli channels such as ``("amplitude_damping", gamma, q)`` without
-    forming a density matrix.
+    norms on the current MPS, TTN, or TreeStab state, samples the conditional
+    probability, applies the chosen branch, and normalizes before evolution
+    continues. This includes non-Pauli channels such as
+    ``("amplitude_damping", gamma, q)`` without forming a density matrix.
 
     ``optimizer_factory`` must create a fresh :class:`MpsOptimizer`,
-    :class:`TreeOptimizer`, or :class:`MpsStabOptimizer` per shot. Gate segments
+    :class:`TreeOptimizer`, :class:`MpsStabOptimizer`, or
+    :class:`TreeStabOptimizer` per shot. Gate segments
     between channel events are batched, so a trajectory does not rebuild an
     optimizer for every gate.
     Set ``strategy="coalesced"`` to share deterministic prefixes and retain one
     optimizer per distinct sampled branch. ``strategy="auto"`` tries coalescing
     and restarts independently if ``max_branches`` would be exceeded.
+
+    ``magic_strategy="immediate"`` applies injectable ``T``/``T†``/grid-aligned
+    ``Rz`` entries through a supplied ``magic_ancillas`` pool while noisy and
+    measurement events continue to replay normally. ``magic_strategy="deferred"``
+    supports fixed-mixture streams by sampling their concrete branches first and
+    then using the MAST-style deferred projection runner. State-dependent Kraus
+    channels remain on the immediate/direct path because their probabilities
+    depend on the evolving state.
     """
     if not callable(optimizer_factory):
         raise TypeError("optimizer_factory must construct a fresh optimizer per shot.")
@@ -2270,8 +3341,102 @@ def run_trajectory_shots(
 
     strategy = _validate_strategy(strategy)
     max_branches = _validate_max_branches(max_branches)
+    max_branch_factor = _validate_max_branch_factor(max_branch_factor)
+    parallel_workers = _validate_parallel_workers(parallel_workers)
+    parallel_backend = _validate_parallel_backend(parallel_backend)
+    policy = _coerce_importance_policy(importance_sampling)
+    if parallel_workers > 1:
+        if strategy == "auto":
+            raise ValueError(
+                "parallel trajectory execution needs an explicit strategy: "
+                "'independent' or 'coalesced'."
+            )
+        return run_parallel_trajectory_shots(
+            optimizer_factory,
+            gates,
+            shots,
+            seed=seed,
+            run_kwargs=run_kwargs,
+            strategy=strategy,
+            max_branches=max_branches,
+            magic_strategy=magic_strategy,
+            magic_ancillas=magic_ancillas,
+            magic_recycle=magic_recycle,
+            magic_reset_ancillas=magic_reset_ancillas,
+            magic_projection_order=magic_projection_order,
+            importance_sampling=policy,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers,
+            parallel_backend=parallel_backend,
+        )
+    magic_strategy = str(magic_strategy).strip().lower().replace("-", "_")
+    if magic_strategy not in {"direct", "immediate", "deferred"}:
+        raise ValueError(
+            "magic_strategy must be 'direct', 'immediate', or 'deferred'."
+        )
     entries = _trajectory_entries(gates)
     has_leakage = _contains_leakage_entries(entries)
+    if magic_strategy != "direct" and strategy != "independent":
+        raise ValueError(
+            "magic_strategy='immediate'/'deferred' requires strategy='independent'; "
+            "coalesced magic projection needs an explicit ancilla-branch planner."
+        )
+    if magic_strategy != "direct" and magic_ancillas is None:
+        raise ValueError(
+            "magic_ancillas is required when magic_strategy is not 'direct'."
+        )
+    if magic_strategy == "deferred":
+        if has_leakage or any(
+            isinstance(entry, TrajectoryEvent) and entry.channel.mode != "mixture"
+            for entry in entries
+        ):
+            raise ValueError(
+                "magic_strategy='deferred' currently requires fixed-mixture channels "
+                "and no stateful leakage; use magic_strategy='immediate' for Kraus streams."
+            )
+        optimizers = []
+        gate_streams = []
+        records = []
+        leakage_records = []
+        measurement_records = []
+        weights = []
+        for child_seed in _trajectory_seed_pairs(seed, shots):
+            noise_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
+            sample = sample_trajectory_stream(
+                entries,
+                seed=noise_seed,
+                importance_sampling=policy,
+            )
+            optimizer = optimizer_factory()
+            _check_trajectory_optimizer(optimizer)
+            _seed_trajectory_optimizer(optimizer, optimizer_seed)
+            run_deferred = getattr(optimizer, "run_with_deferred_injection", None)
+            if not callable(run_deferred):
+                raise TypeError(
+                    "magic_strategy='deferred' requires an STN optimizer with "
+                    "run_with_deferred_injection(...)."
+                )
+            run_deferred(
+                sample.gate_stream,
+                ancillas=magic_ancillas,
+                projection_order=magic_projection_order,
+                reset_ancillas=magic_reset_ancillas,
+                **dict(run_kwargs),
+            )
+            optimizers.append(optimizer)
+            gate_streams.append(sample.gate_stream)
+            records.append(sample.records)
+            leakage_records.append(())
+            measurement_records.append(_optimizer_measurement_records(optimizer))
+            weights.append(float(sample.weight))
+        return TrajectoryShotResult(
+            tuple(optimizers),
+            tuple(gate_streams),
+            tuple(records),
+            tuple(leakage_records),
+            tuple(measurement_records),
+            tuple(weights),
+        )
     if strategy == "coalesced":
         if has_leakage:
             raise NotImplementedError(
@@ -2285,6 +3450,8 @@ def run_trajectory_shots(
             seed=seed,
             run_kwargs=run_kwargs,
             max_branches=max_branches,
+            max_branch_factor=max_branch_factor,
+            importance_sampling=policy,
         )
     if strategy == "auto" and not has_leakage:
         try:
@@ -2295,6 +3462,8 @@ def run_trajectory_shots(
                 seed=seed,
                 run_kwargs=run_kwargs,
                 max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                importance_sampling=policy,
             )
         except _CoalescedBranchCapExceeded:
             pass
@@ -2303,20 +3472,49 @@ def run_trajectory_shots(
     gate_streams = []
     records = []
     leakage_records = []
-    for child_seed in np.random.SeedSequence(seed).spawn(int(shots)):
+    measurement_records = []
+    weights = []
+    for child_seed in _trajectory_seed_pairs(seed, shots):
+        channel_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
         optimizer = optimizer_factory()
         _check_trajectory_optimizer(optimizer)
-        rng = np.random.default_rng(child_seed)
+        _seed_trajectory_optimizer(optimizer, optimizer_seed)
+        rng = np.random.default_rng(channel_seed)
         leakage_state = _LeakageState()
         pending = []
         shot_stream = []
         shot_records = []
         shot_leakage_records = []
+        shot_measurements = []
+        shot_weight = 1.0
+        magic_context = None
+        if magic_strategy == "immediate":
+            magic_context = _new_magic_context(
+                optimizer,
+                magic_ancillas,
+                recycle=magic_recycle,
+                reset_ancillas=magic_reset_ancillas,
+            )
 
         def flush_pending():
             nonlocal pending
-            _run_trajectory_entries(optimizer, pending, run_kwargs)
-            shot_stream.extend(pending)
+            if not pending:
+                return
+            indexed = tuple(pending)
+            start = len(getattr(optimizer, "measurements", ()))
+            _run_trajectory_entries(
+                optimizer,
+                [entry for _event_index, entry in indexed],
+                run_kwargs,
+                magic_context=magic_context,
+            )
+            _capture_optimizer_measurements(
+                optimizer,
+                start,
+                _measurement_metadata(indexed),
+                shot_measurements,
+            )
+            shot_stream.extend(entry for _event_index, entry in indexed)
             pending = []
 
         for event_index, entry in enumerate(entries):
@@ -2324,6 +3522,7 @@ def run_trajectory_shots(
                 leakage_parts = _leakage_event_parts(entry)
                 if leakage_parts is not None:
                     flush_pending()
+                    start = len(getattr(optimizer, "measurements", ()))
                     _apply_leakage_event(
                         optimizer,
                         leakage_parts,
@@ -2333,6 +3532,12 @@ def run_trajectory_shots(
                         run_kwargs,
                         shot_stream,
                         shot_leakage_records,
+                    )
+                    _capture_optimizer_measurements(
+                        optimizer,
+                        start,
+                        [(event_index, False)],
+                        shot_measurements,
                     )
                     continue
                 control_parts = MpsOptimizer.control_event_parts(entry)
@@ -2349,6 +3554,7 @@ def run_trajectory_shots(
                         continue
                     if any(int(site) in leakage_state.leaked for site in control_parts[2]):
                         flush_pending()
+                        start = len(getattr(optimizer, "measurements", ()))
                         if _apply_leaked_measurement_control(
                             optimizer,
                             entry,
@@ -2358,16 +3564,28 @@ def run_trajectory_shots(
                             shot_stream,
                             shot_leakage_records,
                         ):
+                            _capture_optimizer_measurements(
+                                optimizer,
+                                start,
+                                [(event_index, control_parts[0] == "measure_reset")],
+                                shot_measurements,
+                            )
                             continue
                 if _entry_touches_leaked_qubit(entry, leakage_state):
                     continue
-                pending.append(entry)
+                pending.append((event_index, entry))
                 continue
             flush_pending()
-            record = _apply_trajectory_event(
-                optimizer, entry, rng, event_index, run_kwargs
+            record, likelihood_ratio = _apply_trajectory_event(
+                optimizer,
+                entry,
+                rng,
+                event_index,
+                run_kwargs,
+                importance_policy=policy,
             )
             shot_records.append(record)
+            shot_weight *= float(likelihood_ratio)
             outcome = next(
                 outcome
                 for outcome in entry.channel.outcomes
@@ -2375,15 +3593,113 @@ def run_trajectory_shots(
             )
             shot_stream.append(_entry_from_trajectory_outcome(outcome, entry.where))
         flush_pending()
+        if magic_context is not None:
+            _finish_magic_context(optimizer, magic_context)
         optimizers.append(optimizer)
         gate_streams.append(tuple(shot_stream))
         records.append(tuple(shot_records))
         leakage_records.append(tuple(shot_leakage_records))
+        measurement_records.append(tuple(shot_measurements))
+        weights.append(float(shot_weight))
     return TrajectoryShotResult(
         tuple(optimizers),
         tuple(gate_streams),
         tuple(records),
         tuple(leakage_records),
+        tuple(measurement_records),
+        tuple(weights),
+    )
+
+
+def run_parallel_trajectory_shots(
+    optimizer_factory: Callable[[], Any],
+    gates,
+    shots: int,
+    *,
+    seed=None,
+    run_kwargs: Optional[Mapping[str, Any]] = None,
+    strategy: str = "independent",
+    max_branches: int | None = _AUTO_MAX_BRANCHES,
+    max_branch_factor: int | None = None,
+    importance_sampling=None,
+    magic_strategy: str = "direct",
+    magic_ancillas=None,
+    magic_recycle: bool = True,
+    magic_reset_ancillas: bool = True,
+    magic_projection_order="middle_out",
+    parallel_workers: int = 2,
+    parallel_backend: str = "thread",
+) -> TrajectoryShotResult | CoalescedTrajectoryResult:
+    """Run trajectory shots or coalesced leaves in deterministic parallel batches.
+
+    Independent shot seeds are allocated in shot order before dispatch and the
+    ordered map restores that order after workers finish. Coalesced execution
+    shares the deterministic prefix and parallelizes only independent live
+    leaves. Threads are also used for ``parallel_backend='gpu'`` so live
+    Torch/CuPy/JAX state stays in one process and on the backend selected by
+    ``optimizer_factory``.
+    """
+    strategy = _validate_strategy(strategy)
+    workers = _validate_parallel_workers(parallel_workers)
+    backend = _validate_parallel_backend(parallel_backend)
+    if strategy == "auto":
+        raise ValueError(
+            "parallel trajectory execution needs strategy='independent' or "
+            "'coalesced'."
+        )
+    if (
+        strategy == "coalesced"
+        and str(magic_strategy).strip().lower().replace("-", "_") != "direct"
+    ):
+        raise ValueError(
+            "parallel coalesced trajectory execution currently supports "
+            "magic_strategy='direct' only."
+        )
+    if strategy == "coalesced":
+        return run_coalesced_trajectory_shots(
+            optimizer_factory,
+            gates,
+            shots,
+            seed=seed,
+            run_kwargs=run_kwargs,
+            max_branches=max_branches,
+            max_branch_factor=max_branch_factor,
+            importance_sampling=importance_sampling,
+            parallel_workers=workers,
+            parallel_backend=backend,
+        )
+
+    if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+        raise ValueError("shots must be a nonnegative integer.")
+    child_seeds = np.random.SeedSequence(seed).spawn(int(shots))
+
+    def run_one(child_seed):
+        child = _TrajectorySeedPair(*child_seed.spawn(2))
+        return run_trajectory_shots(
+            optimizer_factory,
+            gates,
+            1,
+            seed=child,
+            run_kwargs=run_kwargs,
+            strategy="independent",
+            magic_strategy=magic_strategy,
+            magic_ancillas=magic_ancillas,
+            magic_recycle=magic_recycle,
+            magic_reset_ancillas=magic_reset_ancillas,
+            magic_projection_order=magic_projection_order,
+            importance_sampling=importance_sampling,
+        )
+
+    results = _parallel_map_ordered(run_one, child_seeds, workers, backend)
+    if any(not isinstance(result, TrajectoryShotResult) for result in results):
+        raise TypeError("parallel independent trajectory workers returned an invalid result.")
+    return TrajectoryShotResult(
+        tuple(result.optimizers[0] for result in results),
+        tuple(result.gate_streams[0] for result in results),
+        tuple(result.records[0] for result in results),
+        tuple(result.leakage_records[0] for result in results),
+        tuple(result.measurement_records[0] for result in results),
+        tuple(result.weights[0] for result in results),
     )
 
 
@@ -2391,7 +3707,9 @@ def _apply_coalesced_trajectory_outcome(
     node,
     event,
     outcome,
-    probability,
+    target_probability,
+    proposal_probability,
+    likelihood_ratio,
     event_index,
     run_kwargs,
 ):
@@ -2399,9 +3717,9 @@ def _apply_coalesced_trajectory_outcome(
     non_unitary = event.channel.mode == "kraus"
     norm_event = (
         node.optimizer._make_norm_event(
-            "trajectory_kraus", branch_probability=probability
+            "trajectory_kraus", branch_probability=target_probability
         )
-        if non_unitary and _is_stabilizer_trajectory_optimizer(node.optimizer)
+        if non_unitary and _is_mps_stabilizer_trajectory_optimizer(node.optimizer)
         else None
     )
     entry = _entry_from_trajectory_outcome(outcome, event.where)
@@ -2412,9 +3730,17 @@ def _apply_coalesced_trajectory_outcome(
         _normalize_trajectory_branch(
             node.optimizer, event.where, norm_event=norm_event
         )
+    node.weight *= float(likelihood_ratio)
     node.gate_stream.append(entry)
     node.records.append(
-        TrajectoryRecord(event_index, event.where, outcome.label, probability)
+        TrajectoryRecord(
+            event_index,
+            event.where,
+            outcome.label,
+            float(target_probability),
+            None if proposal_probability is None else float(proposal_probability),
+            float(likelihood_ratio),
+        )
     )
 
 
@@ -2426,6 +3752,10 @@ def run_coalesced_trajectory_shots(
     seed=None,
     run_kwargs: Optional[Mapping[str, Any]] = None,
     max_branches: int | None = None,
+    max_branch_factor: int | None = None,
+    importance_sampling=None,
+    parallel_workers: int = 1,
+    parallel_backend: str = "thread",
 ) -> CoalescedTrajectoryResult:
     """Replay an exact count-coalesced ensemble of quantum trajectories.
 
@@ -2443,13 +3773,20 @@ def run_coalesced_trajectory_shots(
     """
     shots, run_kwargs = _coalesced_inputs(optimizer_factory, shots, run_kwargs)
     max_branches = _validate_max_branches(max_branches)
+    max_branch_factor = _validate_max_branch_factor(max_branch_factor)
+    parallel_workers = _validate_parallel_workers(parallel_workers)
+    parallel_backend = _validate_parallel_backend(parallel_backend)
+    policy = _coerce_importance_policy(importance_sampling)
     if _contains_leakage_entries(_trajectory_entries(gates)):
         raise NotImplementedError(
             "coalesced trajectory replay does not yet support stateful leakage entries; "
             "use run_trajectory_shots(..., strategy='independent') instead."
         )
     nodes = _initial_coalesced_nodes(optimizer_factory, shots)
-    rng = np.random.default_rng(seed)
+    channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
+    if nodes:
+        _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
+    rng = np.random.default_rng(channel_seed)
     pending = []
 
     def flush():
@@ -2460,6 +3797,9 @@ def run_coalesced_trajectory_shots(
             run_kwargs,
             rng,
             max_branches=max_branches,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers,
+            parallel_backend=parallel_backend,
         )
         pending = []
 
@@ -2470,21 +3810,42 @@ def run_coalesced_trajectory_shots(
         flush()
         if entry.channel.mode == "mixture":
             outcomes = entry.channel.outcomes
-            probabilities = [outcome.probability for outcome in outcomes]
+            target, proposal, ratios = _importance_distribution(
+                policy,
+                event_index,
+                outcomes,
+                [outcome.probability for outcome in outcomes],
+            )
 
-            def apply(node, outcome, probability):
+            target_by_label = {
+                outcome.label: (target[index], proposal[index], ratios[index])
+                for index, outcome in enumerate(outcomes)
+            }
+
+            def apply(node, outcome, proposal_probability):
+                target_probability, _proposal, ratio = target_by_label[outcome.label]
                 _apply_coalesced_trajectory_outcome(
-                    node, entry, outcome, probability, event_index, run_kwargs
+                    node,
+                    entry,
+                    outcome,
+                    target_probability,
+                    proposal_probability if policy is not None else None,
+                    ratio,
+                    event_index,
+                    run_kwargs,
                 )
 
             nodes = _split_coalesced_nodes(
                 nodes,
                 outcomes,
-                probabilities,
+                proposal,
                 apply,
                 rng,
                 context="trajectory mixture",
                 max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                parallel_workers=parallel_workers,
+                parallel_backend=parallel_backend,
             )
         else:
             split = []
@@ -2492,21 +3853,43 @@ def run_coalesced_trajectory_shots(
                 probabilities = _kraus_probabilities(
                     node.optimizer, entry.channel, entry.where
                 )
+                target, proposal, ratios = _importance_distribution(
+                    policy,
+                    event_index,
+                    entry.channel.outcomes,
+                    probabilities,
+                    node.optimizer,
+                )
+                target_by_label = {
+                    outcome.label: (target[index], proposal[index], ratios[index])
+                    for index, outcome in enumerate(entry.channel.outcomes)
+                }
 
-                def apply(child, outcome, probability):
+                def apply(child, outcome, proposal_probability):
+                    target_probability, _proposal, ratio = target_by_label[outcome.label]
                     _apply_coalesced_trajectory_outcome(
-                        child, entry, outcome, probability, event_index, run_kwargs
+                        child,
+                        entry,
+                        outcome,
+                        target_probability,
+                        proposal_probability if policy is not None else None,
+                        ratio,
+                        event_index,
+                        run_kwargs,
                     )
 
                 split.extend(
                     _split_coalesced_nodes(
                         [node],
                         entry.channel.outcomes,
-                        probabilities,
+                        proposal,
                         apply,
                         rng,
                         context="trajectory Kraus channel",
                         max_branches=max_branches,
+                        max_branch_factor=max_branch_factor,
+                        parallel_workers=parallel_workers,
+                        parallel_backend=parallel_backend,
                     )
                 )
             nodes = split
@@ -2523,6 +3906,10 @@ def run_coalesced_noisy_shots(
     seed=None,
     run_kwargs: Optional[Mapping[str, Any]] = None,
     max_branches: int | None = None,
+    max_branch_factor: int | None = None,
+    importance_sampling=None,
+    parallel_workers: int = 1,
+    parallel_backend: str = "thread",
 ) -> CoalescedTrajectoryResult:
     """Replay independent Pauli-noise shots using exact count coalescing.
 
@@ -2540,6 +3927,9 @@ def run_coalesced_noisy_shots(
         raise TypeError("error_model must be a PauliErrorModel.")
     shots, run_kwargs = _coalesced_inputs(optimizer_factory, shots, run_kwargs)
     max_branches = _validate_max_branches(max_branches)
+    max_branch_factor = _validate_max_branch_factor(max_branch_factor)
+    parallel_workers = _validate_parallel_workers(parallel_workers)
+    parallel_backend = _validate_parallel_backend(parallel_backend)
     entries = _as_entries(gates)
     if _contains_stochastic_entries(entries):
         raise ValueError(
@@ -2551,19 +3941,37 @@ def run_coalesced_noisy_shots(
             "Stateful leakage entries require run_trajectory_shots(...). "
             "PauliErrorModel is a convenience macro for clean deterministic streams."
         )
+    if importance_sampling is not None and not isinstance(
+        importance_sampling, PauliErrorModel
+    ):
+        raise TypeError("importance_sampling must be a PauliErrorModel for Pauli noise.")
     nodes = _initial_coalesced_nodes(optimizer_factory, shots)
-    rng = np.random.default_rng(seed)
+    channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
+    if nodes:
+        _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
+    rng = np.random.default_rng(channel_seed)
     pending = []
 
     def flush():
         nonlocal nodes, pending
         nodes = _run_coalesced_entries(
-            nodes, pending, run_kwargs, rng, max_branches=max_branches
+            nodes,
+            pending,
+            run_kwargs,
+            rng,
+            max_branches=max_branches,
+            max_branch_factor=max_branch_factor,
+            parallel_workers=parallel_workers,
+            parallel_backend=parallel_backend,
         )
         pending = []
 
     outcomes = ("I", "X", "Y", "Z")
-    probabilities = tuple(error_model.probabilities[label] for label in outcomes)
+    target_probabilities = tuple(error_model.probabilities[label] for label in outcomes)
+    proposal_model = error_model if importance_sampling is None else importance_sampling
+    proposal_probabilities = tuple(
+        proposal_model.probabilities[label] for label in outcomes
+    )
     for gate_index, entry in enumerate(entries):
         pending.append((gate_index, entry))
         flush()
@@ -2572,22 +3980,29 @@ def run_coalesced_noisy_shots(
             continue
         for site in support:
 
-            def apply(node, pauli, _probability):
+            def apply(node, pauli, proposal_probability):
                 if pauli == "I":
-                    return
-                fault_entry = (_pauli_matrix(pauli), site)
-                _run_trajectory_entries(node.optimizer, (fault_entry,), run_kwargs)
-                node.gate_stream.append(fault_entry)
-                node.faults.append(PauliFault(gate_index, int(site), pauli))
+                    target = target_probabilities[0]
+                else:
+                    target = error_model.probabilities[pauli]
+                    fault_entry = (_pauli_matrix(pauli), site)
+                    _run_trajectory_entries(node.optimizer, (fault_entry,), run_kwargs)
+                    node.gate_stream.append(fault_entry)
+                    node.faults.append(PauliFault(gate_index, int(site), pauli))
+                ratio = float(target / proposal_probabilities[outcomes.index(pauli)])
+                node.weight *= ratio
 
             nodes = _split_coalesced_nodes(
                 nodes,
                 outcomes,
-                probabilities,
+                proposal_probabilities,
                 apply,
                 rng,
                 context="Pauli error model",
                 max_branches=max_branches,
+                max_branch_factor=max_branch_factor,
+                parallel_workers=parallel_workers,
+                parallel_backend=parallel_backend,
             )
     return _coalesced_result(nodes)
 
@@ -2651,6 +4066,20 @@ def _stim_pauli_targets(instruction) -> tuple[tuple[str, int], ...]:
             )
         terms.append((axis, int(target.value)))
     return tuple(terms)
+
+
+def _stim_record_targets(instruction) -> tuple[tuple[int, bool], ...]:
+    """Normalize Stim ``rec[k]`` targets to ``(offset, inverted)`` pairs."""
+    targets = []
+    for target in instruction.targets_copy():
+        if not target.is_measurement_record_target:
+            raise NotImplementedError(
+                f"Stim annotation {instruction!s} has a non-record target."
+            )
+        targets.append((int(target.value), bool(target.is_inverted_result_target)))
+    if not targets:
+        raise ValueError(f"Stim annotation {instruction!s} needs record targets.")
+    return tuple(targets)
 
 
 def _stim_unitary_matrix(name: str) -> np.ndarray:
@@ -2744,25 +4173,86 @@ def _compile_stim_unitary(instruction, name: str) -> tuple[object, ...]:
     )
 
 
+def _compile_stim_classical_control(instruction, name: str):
+    """Lower one Stim measurement-record-controlled Pauli gate.
+
+    The supported form is CX/CY/CZ rec[k] q, including an inverted record
+    target. It becomes the backend-independent ("if", k, bit, action) event.
+    More elaborate classical arithmetic remains intentionally outside this
+    compiler so a record cannot be mistaken for a quantum wire.
+    """
+    targets = instruction.targets_copy()
+    records = [target for target in targets if target.is_measurement_record_target]
+    qubits = [target for target in targets if target.is_qubit_target]
+    if len(targets) != 2 or len(records) != 1 or len(qubits) != 1:
+        raise NotImplementedError(
+            f"Stim instruction {instruction!s} must contain exactly one "
+            "measurement-record control and one qubit target."
+        )
+    if name not in {"CX", "CY", "CZ"}:
+        raise NotImplementedError(
+            f"Stim classical-record-controlled gate {name} is not supported."
+        )
+    record = records[0]
+    # Stim's inverted record target means 'apply when the recorded bit is 0'.
+    expected_bit = 0 if record.is_inverted_result_target else 1
+    axis = {"CX": "X", "CY": "Y", "CZ": "Z"}[name]
+    return (
+        "if",
+        int(record.value),
+        expected_bit,
+        (_stim_unitary_matrix(axis), int(qubits[0].value)),
+    )
+
+
 def compile_stim_circuit(circuit) -> StimCircuitPlan:
     """Compile a Stim circuit into reusable physical MPS stream operations.
 
     All native stochastic error instructions are retained for trajectory
     sampling. Clifford one- and two-qubit gates, single/product Pauli
-    measurements, and Pauli-basis resets are also translated. Stim detector,
-    coordinate, tick, and observable annotations have no quantum effect and
-    are ignored. Classical-record-controlled gates and detector-record output
-    are intentionally rejected/not reconstructed: this compiler is for
-    quantum-state trajectories, while Stim remains the decoder/record engine.
+    measurements, and Pauli-basis resets are also translated. Detector and
+    observable annotations are retained in the plan and resolved after replay;
+    coordinate and tick instructions have no quantum effect. Measurement-record-
+    controlled Pauli gates ``CX/CY/CZ rec[k] q`` are lowered to explicit
+    feed-forward events. General classical arithmetic and record-to-record
+    operations remain rejected.
     """
     if isinstance(circuit, StimCircuitPlan):
         return circuit
     stim_circuit = _coerce_stim_circuit(circuit)
     stim = _require_stim()
     operations = []
+    detectors = []
+    observables = []
+    measurement_count = 0
     for instruction_index, instruction in enumerate(stim_circuit.flattened()):
         name = instruction.name.upper()
         args = tuple(float(value) for value in instruction.gate_args_copy())
+        if name == "DETECTOR":
+            detectors.append(
+                StimDetector(
+                    instruction_index=instruction_index,
+                    detector_index=len(detectors),
+                    rec_targets=_stim_record_targets(instruction),
+                    coordinates=args,
+                    measurement_count=measurement_count,
+                )
+            )
+            continue
+        if name == "OBSERVABLE_INCLUDE":
+            if len(args) != 1 or int(args[0]) != args[0] or args[0] < 0:
+                raise ValueError(
+                    f"Stim OBSERVABLE_INCLUDE needs one nonnegative integer id: {instruction!s}."
+                )
+            observables.append(
+                StimObservable(
+                    instruction_index=instruction_index,
+                    observable_index=int(args[0]),
+                    rec_targets=_stim_record_targets(instruction),
+                    measurement_count=measurement_count,
+                )
+            )
+            continue
         if name in _STIM_NOISE_NAMES:
             targets = (
                 _stim_pauli_targets(instruction)
@@ -2776,6 +4266,15 @@ def compile_stim_circuit(circuit) -> StimCircuitPlan:
             )
             continue
         if name in _STIM_IGNORED_NAMES:
+            continue
+        if any(
+            target.is_measurement_record_target
+            for target in instruction.targets_copy()
+        ):
+            entries = (_compile_stim_classical_control(instruction, name),)
+            operations.append(
+                _StimPlanOperation(instruction_index, name, args, (), entries)
+            )
             continue
         if name in _STIM_SINGLE_MEASUREMENTS or name in _STIM_SINGLE_MEASURE_RESETS:
             entries = _compile_stim_measurement(instruction, name)
@@ -2794,11 +4293,29 @@ def compile_stim_circuit(circuit) -> StimCircuitPlan:
                     "operation for MPS replay."
                 )
             entries = _compile_stim_unitary(instruction, name)
+        if name in _STIM_SINGLE_MEASUREMENTS or name in _STIM_SINGLE_MEASURE_RESETS:
+            measurement_count += len(entries)
+        elif name in _STIM_PAIR_MEASUREMENTS or name == "MPP":
+            measurement_count += len(entries)
         operations.append(_StimPlanOperation(instruction_index, name, args, (), entries))
-    return StimCircuitPlan(int(stim_circuit.num_qubits), tuple(operations))
+    return StimCircuitPlan(
+        int(stim_circuit.num_qubits),
+        tuple(operations),
+        tuple(detectors),
+        tuple(observables),
+    )
 
 
-def _sample_label(rng, labels, probabilities, *, context: str) -> str:
+def _sample_label(
+    rng,
+    labels,
+    probabilities,
+    *,
+    context: str,
+    importance_policy=None,
+    event_index=None,
+    weight_box=None,
+) -> str:
     probabilities = np.asarray(probabilities, dtype=float)
     if probabilities.ndim != 1 or len(labels) != len(probabilities):
         raise ValueError(f"Invalid probability configuration for {context}.")
@@ -2808,7 +4325,16 @@ def _sample_label(rng, labels, probabilities, *, context: str) -> str:
     if total > 1.0 + 1e-10:
         raise ValueError(f"Probabilities for {context} sum to more than one.")
     identity = max(0.0, 1.0 - total)
-    return str(rng.choice(("I", *labels), p=(identity, *probabilities)))
+    target, proposal, ratios = _importance_label_distribution(
+        importance_policy,
+        event_index,
+        ("I", *labels),
+        (identity, *probabilities),
+    )
+    index = int(rng.choice(len(target), p=proposal))
+    if weight_box is not None:
+        weight_box[0] *= float(ratios[index])
+    return str(("I", *labels)[index])
 
 
 def _append_pauli_terms(stream, faults, instruction_index, terms):
@@ -2819,7 +4345,17 @@ def _append_pauli_terms(stream, faults, instruction_index, terms):
         faults.append(PauliFault(instruction_index, site, axis))
 
 
-def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated):
+def _sample_stim_noise_operation(
+    op,
+    rng,
+    stream,
+    faults,
+    heralds,
+    *,
+    correlated,
+    importance_policy=None,
+    weight_box=None,
+):
     """Sample one native Stim noise instruction into local physical Paulis."""
     name = op.name
     qubits = tuple(site for _axis, site in op.targets)
@@ -2831,7 +4367,16 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
             raise ValueError(f"Stim {name} needs one probability argument.")
         axis = name[0]
         for site in qubits:
-            if rng.random() < args[0]:
+            sampled = _sample_label(
+                rng,
+                (axis,),
+                (args[0],),
+                context=name,
+                importance_policy=importance_policy,
+                event_index=op.instruction_index,
+                weight_box=weight_box,
+            )
+            if sampled == axis:
                 _append_pauli_terms(stream, faults, op.instruction_index, ((axis, site),))
         return False
     if name == "DEPOLARIZE1":
@@ -2839,7 +4384,13 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
             raise ValueError("Stim DEPOLARIZE1 needs one probability argument.")
         for site in qubits:
             axis = _sample_label(
-                rng, ("X", "Y", "Z"), (args[0] / 3.0,) * 3, context=name
+                rng,
+                ("X", "Y", "Z"),
+                (args[0] / 3.0,) * 3,
+                context=name,
+                importance_policy=importance_policy,
+                event_index=op.instruction_index,
+                weight_box=weight_box,
             )
             _append_pauli_terms(stream, faults, op.instruction_index, ((axis, site),))
         return False
@@ -2847,7 +4398,15 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
         if len(args) != 3:
             raise ValueError("Stim PAULI_CHANNEL_1 needs three probability arguments.")
         for site in qubits:
-            axis = _sample_label(rng, ("X", "Y", "Z"), args, context=name)
+            axis = _sample_label(
+                rng,
+                ("X", "Y", "Z"),
+                args,
+                context=name,
+                importance_policy=importance_policy,
+                event_index=op.instruction_index,
+                weight_box=weight_box,
+            )
             _append_pauli_terms(stream, faults, op.instruction_index, ((axis, site),))
         return False
     if name in {"DEPOLARIZE2", "PAULI_CHANNEL_2"}:
@@ -2861,7 +4420,15 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
             raise ValueError(f"Stim {name} needs {expected} probability argument(s).")
         labels = tuple(left + right for left, right in _STIM_PAULI_2_OUTCOMES)
         for offset in range(0, len(qubits), 2):
-            label = _sample_label(rng, labels, probabilities, context=name)
+            label = _sample_label(
+                rng,
+                labels,
+                probabilities,
+                context=name,
+                importance_policy=importance_policy,
+                event_index=op.instruction_index,
+                weight_box=weight_box,
+            )
             _append_pauli_terms(
                 stream,
                 faults,
@@ -2872,7 +4439,16 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
     if name == "E":
         if len(args) != 1:
             raise ValueError("Stim E/CORRELATED_ERROR needs one probability argument.")
-        occurred = bool(rng.random() < args[0])
+        _target, proposal, ratios = _importance_label_distribution(
+            importance_policy,
+            op.instruction_index,
+            ("I", "FAULT"),
+            (1.0 - args[0], args[0]),
+        )
+        index = int(rng.choice(2, p=proposal))
+        if weight_box is not None:
+            weight_box[0] *= float(ratios[index])
+        occurred = index == 1
         if occurred:
             _append_pauli_terms(stream, faults, op.instruction_index, op.targets)
         return occurred
@@ -2884,7 +4460,19 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
                 "Stim ELSE_CORRELATED_ERROR must immediately follow E or another "
                 "ELSE_CORRELATED_ERROR."
             )
-        occurred = correlated or bool(rng.random() < args[0])
+        if correlated:
+            occurred = True
+        else:
+            _target, proposal, ratios = _importance_label_distribution(
+                importance_policy,
+                op.instruction_index,
+                ("I", "FAULT"),
+                (1.0 - args[0], args[0]),
+            )
+            index = int(rng.choice(2, p=proposal))
+            if weight_box is not None:
+                weight_box[0] *= float(ratios[index])
+            occurred = index == 1
         if not correlated and occurred:
             _append_pauli_terms(stream, faults, op.instruction_index, op.targets)
         return occurred
@@ -2892,10 +4480,21 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
         if len(args) != 1:
             raise ValueError("Stim HERALDED_ERASE needs one probability argument.")
         for site in qubits:
-            fired = bool(rng.random() < args[0])
+            labels = ("NO_HERALD", "HERALD_I", "X", "Y", "Z")
+            target, proposal, ratios = _importance_label_distribution(
+                importance_policy,
+                op.instruction_index,
+                labels,
+                (1.0 - args[0],) + (args[0] / 4.0,) * 4,
+            )
+            index = int(rng.choice(len(labels), p=proposal))
+            if weight_box is not None:
+                weight_box[0] *= float(ratios[index])
+            label = labels[index]
+            fired = label != "NO_HERALD"
             heralds.append(StimHerald(op.instruction_index, site, fired))
-            if fired:
-                axis = str(rng.choice(("I", "X", "Y", "Z")))
+            if label in {"X", "Y", "Z"}:
+                axis = label
                 _append_pauli_terms(stream, faults, op.instruction_index, ((axis, site),))
         return False
     if name == "HERALDED_PAULI_CHANNEL_1":
@@ -2905,7 +4504,13 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
             )
         for site in qubits:
             label = _sample_label(
-                rng, ("HERALD_I", "X", "Y", "Z"), args, context=name
+                rng,
+                ("HERALD_I", "X", "Y", "Z"),
+                args,
+                context=name,
+                importance_policy=importance_policy,
+                event_index=op.instruction_index,
+                weight_box=weight_box,
             )
             fired = label != "I"
             heralds.append(StimHerald(op.instruction_index, site, fired))
@@ -2916,10 +4521,14 @@ def _sample_stim_noise_operation(op, rng, stream, faults, heralds, *, correlated
     raise AssertionError(f"Unhandled native Stim noise instruction {name!r}.")
 
 
-def _sample_stim_plan(plan: StimCircuitPlan, rng) -> StimNoiseSample:
+def _sample_stim_plan(
+    plan: StimCircuitPlan, rng, *, importance_sampling=None
+) -> StimNoiseSample:
+    policy = _coerce_importance_policy(importance_sampling)
     stream = []
     faults = []
     heralds = []
+    weight_box = [1.0]
     correlated = None
     for op in plan.operations:
         if not op.is_noise:
@@ -2928,37 +4537,70 @@ def _sample_stim_plan(plan: StimCircuitPlan, rng) -> StimNoiseSample:
             continue
         if op.name == "E":
             correlated = _sample_stim_noise_operation(
-                op, rng, stream, faults, heralds, correlated=None
+                op,
+                rng,
+                stream,
+                faults,
+                heralds,
+                correlated=None,
+                importance_policy=policy,
+                weight_box=weight_box,
             )
         elif op.name == "ELSE_CORRELATED_ERROR":
             correlated = _sample_stim_noise_operation(
-                op, rng, stream, faults, heralds, correlated=correlated
+                op,
+                rng,
+                stream,
+                faults,
+                heralds,
+                correlated=correlated,
+                importance_policy=policy,
+                weight_box=weight_box,
             )
         else:
             _sample_stim_noise_operation(
-                op, rng, stream, faults, heralds, correlated=None
+                op,
+                rng,
+                stream,
+                faults,
+                heralds,
+                correlated=None,
+                importance_policy=policy,
+                weight_box=weight_box,
             )
             correlated = None
-    return StimNoiseSample(tuple(stream), tuple(faults), tuple(heralds))
+    return StimNoiseSample(tuple(stream), tuple(faults), tuple(heralds), weight_box[0])
 
 
-def sample_stim_circuit(circuit, *, seed=None) -> StimNoiseSample:
+def sample_stim_circuit(
+    circuit, *, seed=None, importance_sampling=None
+) -> StimNoiseSample:
     """Sample every native Stim error channel into one replayable MPS stream.
 
     ``circuit`` can be a :class:`stim.Circuit`, Stim source text, or a reusable
     :class:`StimCircuitPlan`. The stream contains the compiled ideal operations
     and the sampled local Pauli faults in their original temporal order.
     """
-    return _sample_stim_plan(compile_stim_circuit(circuit), np.random.default_rng(seed))
+    return _sample_stim_plan(
+        compile_stim_circuit(circuit),
+        np.random.default_rng(seed),
+        importance_sampling=importance_sampling,
+    )
 
 
-def sample_stim_circuits(circuit, shots: int, *, seed=None) -> list[StimNoiseSample]:
+def sample_stim_circuits(
+    circuit, shots: int, *, seed=None, importance_sampling=None
+) -> list[StimNoiseSample]:
     """Sample ``shots`` independent trajectories from a Stim circuit efficiently."""
     if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
         raise ValueError("shots must be a nonnegative integer.")
     plan = compile_stim_circuit(circuit)
     return [
-        _sample_stim_plan(plan, np.random.default_rng(child_seed))
+        _sample_stim_plan(
+            plan,
+            np.random.default_rng(child_seed),
+            importance_sampling=importance_sampling,
+        )
         for child_seed in np.random.SeedSequence(seed).spawn(int(shots))
     ]
 
@@ -2986,6 +4628,9 @@ def run_stim_shots(
     *,
     seed=None,
     run_kwargs: Optional[Mapping[str, Any]] = None,
+    importance_sampling=None,
+    parallel_workers: int = 1,
+    parallel_backend: str = "thread",
 ) -> StimShotResult:
     """Sample and replay a Stim circuit on fresh MPS or STN optimizers.
 
@@ -3002,22 +4647,78 @@ def run_stim_shots(
         run_kwargs = {}
     elif not isinstance(run_kwargs, Mapping):
         raise TypeError("run_kwargs must be a mapping or None.")
+    workers = _validate_parallel_workers(parallel_workers)
+    backend = _validate_parallel_backend(parallel_backend)
+    if workers > 1:
+        return run_parallel_stim_shots(
+            optimizer_factory,
+            circuit,
+            shots,
+            seed=seed,
+            run_kwargs=run_kwargs,
+            importance_sampling=importance_sampling,
+            parallel_workers=workers,
+            parallel_backend=backend,
+        )
 
     plan = compile_stim_circuit(circuit)
     optimizers = []
     samples = []
-    for child_seed in np.random.SeedSequence(seed).spawn(int(shots)):
-        sample = _sample_stim_plan(plan, np.random.default_rng(child_seed))
+    for child_seed in _trajectory_seed_pairs(seed, shots):
+        noise_seed, optimizer_seed = child_seed.channel, child_seed.optimizer
+        sample = _sample_stim_plan(
+            plan,
+            np.random.default_rng(noise_seed),
+            importance_sampling=importance_sampling,
+        )
         optimizer = optimizer_factory()
         if not hasattr(optimizer, "set_gates") or not hasattr(optimizer, "run"):
             raise TypeError(
                 "optimizer_factory must return an optimizer with set_gates(...) and run(...)."
             )
+        _seed_trajectory_optimizer(optimizer, optimizer_seed)
         optimizer.set_gates(_stream_on_optimizer_backend(sample.gate_stream, optimizer))
         optimizer.run(**dict(run_kwargs))
         optimizers.append(optimizer)
         samples.append(sample)
-    return StimShotResult(tuple(optimizers), tuple(samples))
+    return StimShotResult(tuple(optimizers), tuple(samples), plan)
+
+
+def run_parallel_stim_shots(
+    optimizer_factory: Callable[[], Any],
+    circuit,
+    shots: int,
+    *,
+    seed=None,
+    run_kwargs: Optional[Mapping[str, Any]] = None,
+    importance_sampling=None,
+    parallel_workers: int = 2,
+    parallel_backend: str = "thread",
+) -> StimShotResult:
+    """Run compiled Stim trajectories in deterministic parallel shot order."""
+    workers = _validate_parallel_workers(parallel_workers)
+    backend = _validate_parallel_backend(parallel_backend)
+    plan = compile_stim_circuit(circuit)
+    if isinstance(shots, bool) or not isinstance(shots, Integral) or shots < 0:
+        raise ValueError("shots must be a nonnegative integer.")
+    child_seeds = _trajectory_seed_pairs(seed, shots)
+
+    def run_one(child_seed):
+        return run_stim_shots(
+            optimizer_factory,
+            plan,
+            1,
+            seed=child_seed,
+            run_kwargs=run_kwargs,
+            importance_sampling=importance_sampling,
+        )
+
+    results = _parallel_map_ordered(run_one, child_seeds, workers, backend)
+    return StimShotResult(
+        tuple(result.optimizers[0] for result in results),
+        tuple(result.samples[0] for result in results),
+        plan,
+    )
 
 
 def _stim_categorical_outcomes(labels, probabilities, *, context):
@@ -3218,7 +4919,10 @@ def run_coalesced_stim_shots(
     shots, run_kwargs = _coalesced_inputs(optimizer_factory, shots, run_kwargs)
     plan = compile_stim_circuit(circuit)
     nodes = _initial_coalesced_nodes(optimizer_factory, shots)
-    rng = np.random.default_rng(seed)
+    channel_seed, optimizer_seed = np.random.SeedSequence(seed).spawn(2)
+    if nodes:
+        _seed_trajectory_optimizer(nodes[0].optimizer, optimizer_seed)
+    rng = np.random.default_rng(channel_seed)
     correlated = []
 
     for op in plan.operations:
@@ -3258,4 +4962,4 @@ def run_coalesced_stim_shots(
         nodes = _coalesced_stim_noise_operation(nodes, op, run_kwargs, rng)
     if correlated:
         nodes = _coalesced_stim_correlated_chain(nodes, correlated, run_kwargs, rng)
-    return _coalesced_result(nodes)
+    return _coalesced_result(nodes, plan=plan)

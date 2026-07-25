@@ -49,6 +49,15 @@ jobs:
       - name: Validate package metadata
         run: twine check dist/*
 
+      - name: Smoke test wheel and version metadata
+        run: |
+          smoke_dir="$(mktemp -d)"
+          python -m venv "$smoke_dir/venv"
+          "$smoke_dir/venv/bin/pip" install --no-deps dist/*.whl
+          expected_version="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          EXPECTED_VERSION="$expected_version" "$smoke_dir/venv/bin/python" -c \
+            "import importlib.metadata as md, os, pepsy; expected=os.environ['EXPECTED_VERSION']; assert pepsy.__version__ == md.version('pepsy') == expected"
+
       - name: Capture package version
         id: meta
         run: |

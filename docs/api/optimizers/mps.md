@@ -149,9 +149,5 @@ temporarily permutes the working MPS and restores the returned MPS to the
 original site order. Layout-aware replay prints a concise report by default;
 pass `layout_report=False` to silence it.
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.mps.optimizer
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

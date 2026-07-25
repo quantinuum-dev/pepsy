@@ -11,9 +11,5 @@ The SVD/QR registration helpers are also available directly from `pepsy`, e.g.
 `reg_rel_svd_jax()`, `reg_real_svd_jax()`, and `reg_complex_svd_jax()` for the
 same custom-VJP SVD registration.
 
-```{eval-rst}
-.. automodule:: pepsy.tensors.core
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

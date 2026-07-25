@@ -1,9 +1,7 @@
 # `pepsy.optimizers.energy`
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.energy
-   :members:
-```
+
+> API details are maintained as handwritten Markdown in this page.
 
 ## Symmray fermionic encodings
 

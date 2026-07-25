@@ -1,10 +1,10 @@
 # Package Layout Migration
 
-The package has moved from a flat module layout to responsibility-based
-namespaces. The implementation now lives under the new namespaces, and the old
-root-level module aliases have been removed. Top-level convenience symbols such
-as `pepsy.SweepOptimizer` and `pepsy.rx` still work, but submodule imports
-should use the new package layout.
+The package uses responsibility-based namespaces. Implementations live under
+these namespaces, while old flat module paths remain warning-emitting
+compatibility facades during the deprecation window. Top-level convenience
+symbols such as `pepsy.SweepOptimizer` and `pepsy.rx` still work, but new
+submodule imports should use the canonical layout.
 
 ## Target Namespaces
 
@@ -15,11 +15,12 @@ pepsy.operators     gates, gate application, MPO/PEPO builders, Hamiltonians
 pepsy.boundary      boundary-MPS states, sweeps, metrics
 pepsy.solvers       gradient and finite-difference parameter solvers
 pepsy.fitting       local tensor fitting routines
-pepsy.optimizers    high-level MPS, MPO, PEPS, MERA, BP, and STN optimizers
+pepsy.optimizers    high-level MPS, MPO, PEPS, sweep, and global optimizers
 pepsy.sampling      MPS, vector, and PEPS samplers
-pepsy.vmc           optional Torch and NetKet/JAX VMC adapters (`MCState` + `VMC` portable façade)
+pepsy.vmc           optional Torch and NetKet/JAX VMC adapters
 pepsy.bp            belief propagation, loop expansions, and PNE methods
-pepsy.extensions    lazy, clearly marked entry points for optional/advanced domains
+pepsy.experimental  explicit lazy entry points for advanced domains
+pepsy.extensions    compatibility entry points for optional integrations
 pepsy._internal     private formatting and utility helpers
 ```
 
@@ -40,8 +41,8 @@ from pepsy.tensors import (
 )
 
 # Optional or advanced domains can be made explicit at the call site.
-from pepsy.extensions.vmc import TorchVMCDriver
-from pepsy.extensions.bp import gauge_all
+from pepsy.experimental import bp, symmetry, vmc
+from pepsy.vmc import TorchVMCDriver
 ```
 
 When a leaf module is needed, import the new implementation path directly:

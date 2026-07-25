@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.3.0"
 description = "Tensor-network simulation, contraction, optimization, and VMC tools"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
   "numpy>=1.24",
   "quimb>=1.8",
@@ -29,13 +30,25 @@ torch = ["torch>=2.0"]
 solvers = ["scipy>=1.10", "nlopt>=2.7"]
 viz = ["matplotlib>=3.7"]
 layout = ["nevergrad>=1.0"]
+symmetry = ["symmray>=0.1"]
+stabilizer = ["stim>=1.12"]
 dev = [
   "pytest>=8",
   "pytest-cov>=5",
   "pyflakes>=3",
   "mypy>=1.10",
+  "ruff>=0.6",
   "build>=1.2",
   "twine>=5",
+]
+test-extended = [
+  "matplotlib>=3.7",
+  "nevergrad>=1.0",
+  "nlopt>=2.7",
+  "scipy>=1.10",
+  "stim>=1.12",
+  "symmray>=0.1",
+  "torch>=2.0",
 ]
 vmc-torch = ["torch>=2.0"]
 vmc-netket = ["jax>=0.4", "flax>=0.8", "optax>=0.2", "netket>=3.10", "symmray>=0.1"]
@@ -51,11 +64,15 @@ include-package-data = true
 where = ["src"]
 include = ["pepsy*"]
 
+[tool.setuptools.package-data]
+pepsy = ["py.typed"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 cache_dir = "/tmp/pytest_cache_pepsy"
-addopts = "-m 'not integration and not slow'"
+addopts = "-m smoke"
 markers = [
+  "smoke: small deterministic contract checks for the default developer loop",
   "integration: extended optional-backend and domain-integration coverage",
   "slow: stress or long-running differential coverage",
 ]
@@ -65,6 +82,7 @@ branch = true
 source = ["pepsy"]
 
 [tool.coverage.report]
+fail_under = 30
 exclude_also = [
   "if TYPE_CHECKING:",
   "pragma: no cover",
@@ -75,3 +93,15 @@ python_version = "3.10"
 ignore_missing_imports = true
 follow_imports = "skip"
 warn_unused_configs = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = ["history", "learning", "benchmarks"]
+
+[tool.ruff.lint]
+select = ["F"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

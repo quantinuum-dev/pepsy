@@ -126,6 +126,8 @@ class STNState:
         self._sim = stim.TableauSimulator()
         self._sim.set_num_qubits(n)
         self._inv_tableau = None
+        self._clifford_unitary_cache = None
+        self._identity_cache = None
         # Coefficient state ``p`` (the MPS ``|nu>``) = |0...0>, chi = 1.
         self.p = ps_to_mps(n, dtype=dtype)
         # Tracked orthogonality centre for ``p`` (never a blind rescan): a
@@ -189,6 +191,8 @@ class STNState:
         new._sim = sim
         new.p = p
         new._inv_tableau = None
+        new._clifford_unitary_cache = None
+        new._identity_cache = None
         new.info = {"cur_orthog": None}
         return new
 
@@ -226,6 +230,8 @@ class STNState:
         """Apply a stim Clifford tableau to the basis on ``targets`` (``|nu>`` unchanged)."""
         self._sim.do_tableau(tableau, list(targets))
         self._inv_tableau = None
+        self._clifford_unitary_cache = None
+        self._identity_cache = None
         return self
 
     def absorb_basis_clifford(self, v_tableau) -> "STNState":
@@ -247,6 +253,8 @@ class STNState:
         new_sim.do_tableau(c_new, list(range(self.n)))
         self._sim = new_sim
         self._inv_tableau = None
+        self._clifford_unitary_cache = None
+        self._identity_cache = None
         return self
 
     def frame_pauli(self, phys_pauli):
@@ -302,6 +310,8 @@ class STNState:
                 )
         getattr(self._sim, method_name)(*(int(q) for q in targets))
         self._inv_tableau = None
+        self._clifford_unitary_cache = None
+        self._identity_cache = None
         return self
 
     def apply_clifford_circuit(
@@ -351,9 +361,23 @@ class STNState:
         basis: ``C X_i C^dagger = d_i`` and ``C Z_i C^dagger = s_i``.  Only
         feasible for small ``n`` (matrix is ``2**n x 2**n``).
         """
+        cached = getattr(self, "_clifford_unitary_cache", None)
+        if cached is not None:
+            return cached
         tableau = self._sim.current_inverse_tableau().inverse()
         mat = tableau.to_unitary_matrix(endian="big")
-        return np.asarray(mat, dtype=self.dtype)
+        self._clifford_unitary_cache = np.asarray(mat, dtype=self.dtype)
+        return self._clifford_unitary_cache
+
+    def is_identity_frame(self) -> bool:
+        """Return whether the live tableau is the identity Clifford."""
+        if getattr(self, "_identity_cache", None) is None:
+            import stim
+
+            self._identity_cache = bool(
+                self._sim.current_inverse_tableau() == stim.Tableau(self.n)
+            )
+        return self._identity_cache
 
     def p_dense(self) -> np.ndarray:
         """Dense coefficient vector ``p`` (big-endian, length ``2**n``)."""
@@ -371,7 +395,10 @@ class STNState:
         ``|psi> = sum_i p_i C|i> = C p``.  The result is defined up to a
         global phase (tableaus do not track global phase).
         """
-        return self.clifford_unitary() @ self.p_dense()
+        p_dense = self.p_dense()
+        if self.is_identity_frame():
+            return p_dense
+        return self.clifford_unitary() @ p_dense
 
     def _bits_to_index(self, bits) -> int:
         """Map a bitstring (str ``'010'`` or 0/1 sequence) to a big-endian index."""

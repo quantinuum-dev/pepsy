@@ -12,8 +12,8 @@ signs, amplitude contraction mode, and numerical scaling explicit.
 ## Read first
 
 - Read `AGENTS.md` and nested instructions.
-- Read the current VMC implementation in `src/pepsy/vmc/torch.py` and its
-  focused tests in `tests/test_vmc_torch.py`.
+- Read the current VMC implementation in `src/pepsy/vmc/torch/` and its
+  focused API tests in `tests/test_vmc_api.py`.
 - Read the native fermion guidance in
   `.github/skills/pepsy-fermion-operators/SKILL.md` and
   `.github/skills/pepsy-fermion-operators/references/design.md` when changing
@@ -255,7 +255,7 @@ Use Python 3.12 and run focused checks first:
 
 ```bash
 source ~/envs/py312/bin/activate
-pytest -q tests/test_vmc_torch.py
+pytest -q -o addopts='' tests/test_vmc_api.py
 pytest -q tests/test_symmetric_tensors.py
 ```
 

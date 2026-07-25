@@ -21,8 +21,11 @@ jobs:
             profile: core
             extras: dev
           - python-version: "3.12"
-            profile: torch
-            extras: dev,torch
+            profile: extended
+            extras: dev,test-extended
+          - python-version: "3.12"
+            profile: vmc
+            extras: dev,vmc
     runs-on: ubuntu-latest
     env:
       NUMBA_CACHE_DIR: /tmp/numba_cache_pepsy
@@ -41,13 +44,18 @@ jobs:
       - name: Validate source syntax
         run: python -m compileall -q -f src tests
       - name: Check Python lint
-        run: python -m pyflakes src/pepsy tests
+        run: |
+          python -m pyflakes src/pepsy tests
+          python -m ruff check src/pepsy tests
       - name: Run tests with coverage
         if: matrix.python-version == '3.12' && matrix.profile == 'core'
         run: pytest -q --cov=pepsy --cov-report=term-missing
+      - name: Run extended tests with coverage
+        if: matrix.profile == 'extended'
+        run: pytest -q -o addopts="" --cov=pepsy --cov-report=term-missing --cov-fail-under=60
       - name: Run tests
-        if: matrix.python-version != '3.12' || matrix.profile != 'core'
-        run: pytest -q
+        if: matrix.profile == 'vmc' || (matrix.profile == 'core' && matrix.python-version != '3.12')
+        run: pytest -q -o addopts=""
 
   typecheck:
     runs-on: ubuntu-latest
@@ -76,9 +84,13 @@ jobs:
           pip install -e ".[dev]"
           python -m build --sdist --wheel
           python -m twine check dist/*
+          version="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          echo "Built Pepsy version: ${version}"
       - name: Smoke test wheel installation
         run: |
           smoke_dir="$(mktemp -d)"
           python -m venv "$smoke_dir/venv"
           "$smoke_dir/venv/bin/pip" install --no-deps dist/*.whl
-          "$smoke_dir/venv/bin/python" -c "import pepsy; import pepsy.extensions; assert pepsy.__version__"
+          expected_version="$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          EXPECTED_VERSION="$expected_version" "$smoke_dir/venv/bin/python" -c \
+            "import importlib.metadata as md, os, pepsy; expected=os.environ['EXPECTED_VERSION']; actual=md.version('pepsy'); assert pepsy.__version__ == actual == expected; assert hasattr(pepsy, 'experimental')"

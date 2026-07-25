@@ -1,8 +1,4 @@
 # `pepsy.optimizers.global_opt`
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.global_opt
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

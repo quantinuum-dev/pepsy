@@ -1,8 +1,4 @@
 # `pepsy.boundary.metrics`
 
-```{eval-rst}
-.. automodule:: pepsy.boundary.metrics
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

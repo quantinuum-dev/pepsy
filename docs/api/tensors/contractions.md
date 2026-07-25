@@ -1,7 +1,4 @@
 # Tensor contractions
 
-```{eval-rst}
-.. automodule:: pepsy.tensors.contractions
-   :members:
-   :undoc-members:
-```
+
+> API details are maintained as handwritten Markdown in this page.

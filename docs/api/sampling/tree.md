@@ -35,9 +35,39 @@ transfer bounded by the bond dimension squared. All samples share the cached
 arrays and advance together through batched contractions, and each returned
 probability is the exact product of that shot's conditional Born probabilities.
 
-```{eval-rst}
-.. automodule:: pepsy.sampling.tree
-   :members:
-   :undoc-members:
-   :show-inheritance:
+## Fermionic tree states
+
+Native Symmray fermionic trees (for example a spinful `phys_dim=4` Fermi-Hubbard
+tree) are sampled with the same `O(L)` sweep. The graded-canonical tensors are
+densified once; because every Born probability contracts a tensor with its own
+conjugate over the shared indices, the fermionic exchange signs enter squared
+and cancel, so the plain dense sweep reproduces the exact graded probabilities
+and marginals (validated to machine precision against the doubled-network
+contraction). No per-conditional graded contraction is required, so fermionic
+sampling runs at the same speed as the dense path.
+
+Sampled physical codes follow Symmray's dense basis order — `empty, up, down,
+up-down` for spinful `phys_dim=4` and `empty, occupied` for spinless
+`phys_dim=2`. The batched and list results carry a
+`FermionConfigurationEncoding` so the codes decode to `(n_up, n_down)`
+occupations:
+
+```python
+from pepsy import Fermion, TreeSampler
+
+# psi_tree: a native Symmray fermionic TreeTensorNetwork / TreeOptimizer state.
+sampler = TreeSampler(psi_tree, fermion=Fermion(spinful=True, symmetry="U1U1"))
+batch = sampler.sample_batch(n_samples=4096, seed=0)
+
+codes = batch.configs            # (n_samples, nqubits) dense-basis codes
+occ = batch.occupations()        # (n_samples, nqubits, 2) in (n_up, n_down)
 ```
+
+The fermionic state is detected automatically, so passing `fermion=` is
+optional; it only pins the recorded `symmetry`/`spinful` labels. Signed
+`amplitudes(...)` follow the same dense basis convention and may differ from the
+graded amplitude ordering by a per-configuration sign, whereas
+`probabilities(...)` are exact.
+
+
+> API details are maintained as handwritten Markdown in this page.

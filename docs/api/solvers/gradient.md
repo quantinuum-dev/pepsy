@@ -1,8 +1,4 @@
 # `pepsy.solvers.gradient`
 
-```{eval-rst}
-.. automodule:: pepsy.solvers.gradient
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

@@ -170,7 +170,12 @@ def is_submpo_event(entry):
     return submpo_event_parts(entry) is not None
 
 
-_CONTROL_EVENT_NAMES = frozenset({"measure", "cap", "reset", "measure_reset"})
+_CONTROL_EVENT_NAMES = frozenset(
+    {"measure", "cap", "reset", "measure_reset", "conditional"}
+)
+_CONDITIONAL_EVENT_ALIASES = frozenset(
+    {"if", "conditional", "condition", "feed_forward", "feedforward"}
+)
 _MEASURE_RESET_ALIASES = {
     "measure_reset": None,
     "mr": None,
@@ -426,6 +431,145 @@ def _parse_control_mapping(name, entry, default_axis=None):
     raise ValueError(f"Unknown control event {name!r}.")
 
 
+def _conditional_support(action):
+    """Return the support of one auditable feed-forward action."""
+    parts = _submpo_event_parts(action)
+    if parts is not None:
+        return _normalize_control_where(parts[1])
+    if isinstance(action, Mapping):
+        where = action.get("where", action.get("sites", _MISSING))
+        if where is _MISSING:
+            raise ValueError("conditional action mappings must contain 'where'.")
+        return _normalize_control_where(where)
+    if not isinstance(action, (tuple, list)) or not action:
+        raise ValueError("conditional action must be one gate stream entry.")
+    head = action[0]
+    if not isinstance(head, str):
+        if len(action) != 2:
+            raise ValueError("conditional matrix action must be (matrix, where).")
+        return _normalize_control_where(action[1])
+    name = _normalize_event_name(head)
+    if name in {"cnot", "cx", "cy", "cz", "swap"}:
+        if len(action) != 3:
+            raise ValueError(f"conditional {head!r} action needs two targets.")
+        return _normalize_control_where(action[1:])
+    if name in {"h", "s", "sdg", "sdag", "sqrt_x", "sqrt_x_dag", "x", "y", "z", "t", "tdg"}:
+        if len(action) != 2:
+            raise ValueError(f"conditional {head!r} action needs one target.")
+        return _normalize_control_where(action[1])
+    if name in {"rx", "ry", "rz"}:
+        if len(action) != 3:
+            raise ValueError(f"conditional {head!r} action needs angle and target.")
+        return _normalize_control_where(action[2])
+    if name in {"rxx", "ryy", "rzz"}:
+        if len(action) != 4:
+            raise ValueError(f"conditional {head!r} action needs angle and targets.")
+        return _normalize_control_where(action[2:])
+    if name == "rot":
+        if len(action) != 4:
+            raise ValueError("conditional 'rot' action needs angle, axes, and targets.")
+        return _normalize_control_where(action[3])
+    if name == "measure":
+        if len(action) < 3:
+            raise ValueError("conditional 'measure' action needs pauli and targets.")
+        return _normalize_control_where(action[2])
+    if name == "reset" or name in _RESET_AXIS_ALIASES:
+        return _parse_reset_tuple(action[1:], _RESET_AXIS_ALIASES.get(name))[2]
+    if name in _MEASURE_RESET_ALIASES or name in _MEASURE_RESET_AXIS_ALIASES:
+        return _parse_measure_reset_tuple(
+            action[1:], _MEASURE_RESET_AXIS_ALIASES.get(name)
+        )[2]
+    if name == "cap":
+        if len(action) < 3:
+            raise ValueError("conditional 'cap' action needs where and vector.")
+        return _normalize_control_where(action[1], single=True)
+    if name in _CONDITIONAL_EVENT_ALIASES:
+        return _conditional_event_parts(action)[2]
+    raise ValueError(f"Unsupported conditional action {action!r}.")
+
+
+def _normalize_condition_bit(value):
+    """Normalize a feed-forward predicate to a classical bit."""
+    if isinstance(value, (bool, np.bool_)):
+        return int(value)
+    if isinstance(value, Integral) and int(value) in (0, 1):
+        return int(value)
+    raise ValueError("conditional value/bit must be 0 or 1.")
+
+
+def _conditional_event_parts(entry):
+    """Return ``(name, payload, where)`` for a classical conditional event.
+
+    Tuple form is ``("if", record, bit, action)``. ``record`` follows Stim's
+    convention: negative values are offsets from the current measurement
+    record (``-1`` is the latest result), while nonnegative values are
+    absolute indices. Mapping form accepts ``record``, ``value``/``bit`` and
+    ``then``/``action``. Conditions use computational bits: measurement +1 is
+    bit 0 and measurement -1 is bit 1.
+    """
+    if isinstance(entry, (tuple, list)) and entry and isinstance(entry[0], str):
+        name = _normalize_event_name(entry[0])
+        if name not in _CONDITIONAL_EVENT_ALIASES:
+            return None
+        if len(entry) != 4:
+            raise ValueError(
+                'conditional event must be ("if", record, bit, action).'
+            )
+        record, bit, action = entry[1:]
+    elif isinstance(entry, Mapping):
+        raw_name = entry.get(
+            "kind", entry.get("type", entry.get("event", _MISSING))
+        )
+        if (
+            raw_name is _MISSING
+            or _normalize_event_name(raw_name) not in _CONDITIONAL_EVENT_ALIASES
+        ):
+            return None
+        if "record" not in entry:
+            raise ValueError("conditional event mapping needs 'record'.")
+        record = entry["record"]
+        if "value" in entry or "bit" in entry:
+            bit = entry.get("value", entry.get("bit"))
+        elif "outcome" in entry:
+            outcome = int(entry["outcome"])
+            if outcome not in (-1, 1):
+                raise ValueError("conditional outcome must be +1 or -1.")
+            bit = int(outcome < 0)
+        else:
+            raise ValueError("conditional event mapping needs 'value' or 'bit'.")
+        action = entry.get(
+            "then", entry.get("action", entry.get("gate", _MISSING))
+        )
+        if action is _MISSING:
+            raise ValueError("conditional event mapping needs 'then' or 'action'.")
+    else:
+        return None
+    if isinstance(record, (bool, np.bool_)) or not isinstance(record, Integral):
+        raise TypeError("conditional record must be an integer index or offset.")
+    return "conditional", {
+        "record": int(record),
+        "bit": _normalize_condition_bit(bit),
+        "action": action,
+    }, _conditional_support(action)
+
+
+def conditional_event_parts(entry):
+    """Public parser for ``if``/feed-forward stream events."""
+    return _conditional_event_parts(entry)
+
+
+def _resolve_conditional(payload, measurement_count):
+    """Resolve a normalized conditional against the recorded measurements."""
+    record = int(payload["record"])
+    index = record if record >= 0 else int(measurement_count) + record
+    if index < 0 or index >= int(measurement_count):
+        raise ValueError(
+            f"conditional record {record} is unavailable after "
+            f"{measurement_count} measurement(s)."
+        )
+    return index, int(payload["bit"])
+
+
 def _control_event_parts(entry):
     """Return ``(name, payload, where)`` for a control event, else ``None``.
 
@@ -437,6 +581,9 @@ def _control_event_parts(entry):
     ``("measure_reset", basis, where[, outcome])``; equivalent mapping forms use a
     ``"kind"``/``"type"``/``"event"`` selector.
     """
+    conditional = _conditional_event_parts(entry)
+    if conditional is not None:
+        return conditional
     if (
         isinstance(entry, tuple)
         and len(entry) >= 1
@@ -2424,6 +2571,56 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             if where_is_physical
             else self._logical_to_physical_where(where)
         )
+        if name == "conditional":
+            record_index, expected = _resolve_conditional(
+                payload, len(self.measurements)
+            )
+            record = self.measurements[record_index]
+            outcome = int(getattr(record, "outcome", record[2]))
+            if int(outcome < 0) != expected:
+                return
+            action_payloads, action_wheres, action_types = _normalize_gate_queue(
+                (payload["action"],)
+            )
+            if len(action_payloads) != 1:
+                raise ValueError(
+                    "conditional action must normalize to exactly one stream entry."
+                )
+            action_where = action_wheres[0]
+            action_type = action_types[0]
+            if action_type in _CONTROL_EVENT_NAMES:
+                self._apply_control_event(
+                    action_type,
+                    action_payloads[0],
+                    action_where,
+                    record_where=action_where,
+                    where_is_physical=where_is_physical,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    measure_renormalize=measure_renormalize,
+                )
+            else:
+                physical_where = (
+                    tuple(int(site) for site in action_where)
+                    if where_is_physical
+                    else self._logical_to_physical_where(action_where)
+                )
+                self._execute_mode(
+                    [action_payloads[0]],
+                    [physical_where],
+                    [action_type],
+                    progbar=False,
+                    n_iter=1,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    k_2q_batch=1,
+                    normalize_every=None,
+                    normalize_final=False,
+                    normalize_eps=1e-12,
+                    non_unitary=False,
+                    submpo_method="direct",
+                )
+            return
         if name == "measure":
             self._apply_measure_event(
                 payload["pauli"],

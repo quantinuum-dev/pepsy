@@ -49,17 +49,21 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Mapping, MutableMapping
-from dataclasses import dataclass, fields
+from collections.abc import Mapping
 from numbers import Integral
-from typing import List, NamedTuple, Optional
+from typing import List, Optional
 
 import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
 from ..mps.layout import MpsGateStreamLayoutFinder
-from ..mps.optimizer import is_submpo_event, submpo_event_parts
+from ..mps.optimizer import (
+    _resolve_conditional,
+    conditional_event_parts,
+    is_submpo_event,
+    submpo_event_parts,
+)
 from .operators import (
     pauli_combo_submpo,
     pauli_decomposition,
@@ -69,6 +73,19 @@ from .operators import (
     single_qubit_rotation_matrix,
 )
 from .paulis import hermitian_pauli_terms, pauli_string
+from .records import (
+    DeferredInjectionRecord,
+    DeferredInjectionReport,
+    DeferredProjectionRecord,
+    ImmediateInjectionReport,
+    ImmediateProjectionRecord,
+    MeasurementRecord,
+    NormEventRecord,
+    StabilizerMpsSettingsAdvice,
+    StabilizerMpsRunResult,
+    StreamAnalysisRecord,
+)
+from .settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from .stn_state import STNState, _validate_bits
 
 __all__ = [
@@ -114,205 +131,6 @@ _S_MAT = np.array([[1, 0], [0, 1j]], dtype=complex)
 # testing one representative per coset finds the same best entanglement score
 # as testing all 11,520 two-qubit Cliffords.
 _TWO_Q_CLIFFORD_REPS = None
-
-
-class _TypedRecord(MutableMapping):
-    """Mutable mapping facade for small typed diagnostic records."""
-
-    @classmethod
-    def _field_names(cls):
-        return tuple(field.name for field in fields(cls))
-
-    def __getitem__(self, key):
-        if key in self._field_names():
-            return getattr(self, key)
-        raise KeyError(key)
-
-    def __setitem__(self, key, value):
-        if key not in self._field_names():
-            raise KeyError(key)
-        setattr(self, key, value)
-
-    def __delitem__(self, key):  # pragma: no cover - diagnostics are fixed-shape
-        raise TypeError(f"{type(self).__name__} fields cannot be deleted.")
-
-    def __iter__(self):
-        return iter(self._field_names())
-
-    def __len__(self):
-        return len(self._field_names())
-
-    def as_dict(self) -> dict:
-        """Return a plain-``dict`` snapshot."""
-        return {name: getattr(self, name) for name in self._field_names()}
-
-
-class MeasurementRecord(NamedTuple):
-    """One recorded Pauli measurement.
-
-    Kept tuple-compatible as ``(pauli, where, outcome)`` for existing callers.
-    """
-
-    pauli: object
-    where: object
-    outcome: int
-
-
-@dataclass
-class NormEventRecord(_TypedRecord):
-    """Projective normalization boundary for STN norm-loss diagnostics."""
-
-    kind: str
-    valid: bool
-    pre_norm: Optional[float] = None
-    pre_norm_sq: Optional[float] = None
-    segment_infidelity: Optional[float] = None
-    branch_probability: Optional[float] = None
-    expected_projected_norm: Optional[float] = None
-    expected_projected_norm_sq: Optional[float] = None
-    projected_norm: Optional[float] = None
-    projected_norm_sq: Optional[float] = None
-    projector_survival: Optional[float] = None
-    projector_survival_raw: Optional[float] = None
-    projector_infidelity: Optional[float] = None
-    post_norm: Optional[float] = None
-    post_norm_sq: Optional[float] = None
-
-
-@dataclass
-class ImmediateProjectionRecord(_TypedRecord):
-    """Per-gadget projection diagnostics for immediate magic injection."""
-
-    data: int
-    ancilla: int
-    angle: float
-    outcome: int
-    elapsed_s: float
-    bond_before: int
-    bond_after: int
-
-
-@dataclass
-class DeferredInjectionRecord(_TypedRecord):
-    """Deferred-MAST magic gadget awaiting end-of-circuit projection."""
-
-    index: int
-    ancilla: int
-    data: int
-    angle: float
-    outcome: int
-
-
-@dataclass
-class DeferredProjectionRecord(_TypedRecord):
-    """Per-ancilla projection diagnostics for deferred magic injection."""
-
-    index: int
-    ancilla: int
-    data: int
-    angle: float
-    outcome: int
-    order: int
-    support_size: int
-    mps_span: int
-    bond_before: int
-    bond_after: int
-
-
-@dataclass
-class ImmediateInjectionReport(_TypedRecord):
-    """Aggregate diagnostics for one immediate-injection run."""
-
-    n_injections: int
-    projection_elapsed_s: float
-    projection_peak_bond: int
-
-
-@dataclass
-class DeferredInjectionReport(_TypedRecord):
-    """Aggregate diagnostics for one deferred-MAST injection run."""
-
-    n_injections: int
-    projection_order: object
-    replay_elapsed_s: float
-    projection_elapsed_s: float
-    pre_projection_peak_bond: int
-    projection_peak_bond: int
-    peak_bond: int
-
-
-@dataclass
-class StreamAnalysisRecord(_TypedRecord):
-    """Pepsy-native gate-stream design summary for STN configuration advice."""
-
-    total_entries: int
-    n_qubits: Optional[int]
-    estimated_qubits: Optional[int]
-    touched_qubits: tuple[int, ...]
-    max_qubit: Optional[int]
-    clifford_entries: int
-    injectable_entries: int
-    other_nonclifford_entries: int
-    structural_entries: int
-    control_entries: int
-    opaque_entries: int
-    dense_matrix_entries: int
-    unitary_matrix_entries: int
-    nonunitary_matrix_entries: int
-    submpo_entries: int
-    measurement_entries: int
-    reset_entries: int
-    measure_reset_entries: int
-    cap_entries: int
-    is_clifford_only: bool
-    is_clifford_t_like: bool
-    warnings: tuple[str, ...] = ()
-
-
-@dataclass
-class StabilizerMpsSettingsAdvice(_TypedRecord):
-    """Advisory STN execution and constructor settings for a Pepsy stream."""
-
-    goal: str
-    recommended_mode: str
-    execution_method: str
-    settings: dict
-    analysis: StreamAnalysisRecord
-    magic_strategy: object
-    immediate_ancillas_required: int
-    deferred_ancillas_required: int
-    ancilla_budget: Optional[int]
-    deferred_feasible: Optional[bool]
-    disentangle_checkpoints_recommended: bool
-    warnings: tuple[str, ...]
-    message: str
-
-
-@dataclass
-class StabilizerMpsRunResult(_TypedRecord):
-    """Result record for one explicit Pepsy-stream STN replay."""
-
-    simulator: object
-    mode: str
-    requested_mode: str
-    execution_method: str
-    settings: dict
-    run_options: dict
-    analysis: StreamAnalysisRecord
-    advice: StabilizerMpsSettingsAdvice
-    elapsed_s: float
-    replay_elapsed_s: float
-    projection_elapsed_s: float
-    final_bond: int
-    peak_bond: int
-    norm: float
-    norm_diagnostics: dict
-    measurements: tuple
-    norm_events: tuple
-    immediate_projection_events: tuple
-    deferred_projection_events: tuple
-    injection_report: object
-    remaining_queue: int
 
 
 def _normalize_event_name(name):
@@ -617,6 +435,10 @@ class MpsStabOptimizer:
         The default, ``2``, bounds its ``4**k`` candidate-term cost. ``None``
         disables the guard. Clifford matrices and one-qubit unitary matrices
         use their specialized paths and do not consume this budget.
+    max_pauli_terms : int | None
+        Maximum number of retained Pauli terms for a general dense matrix.
+        This second guard makes explicit three- or four-qubit opt-ins safe by
+        bounding the width of the coefficient-frame operator sum.
     max_dense_cap_qubits : int | None
         Maximum register size for a length-shortening physical ``cap`` event.
         ``cap`` contracts the dense physical state and rebuilds an identity-frame
@@ -710,7 +532,10 @@ class MpsStabOptimizer:
         chi: Optional[int] = None,
         cutoff: float = 1e-12,
         operator_tol: Optional[float] = None,
-        max_pauli_decomposition_qubits: Optional[int] = 2,
+        max_pauli_decomposition_qubits: Optional[int] = (
+            DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
+        ),
+        max_pauli_terms: Optional[int] = 256,
         max_dense_cap_qubits: Optional[int] = 10,
         track_infidelity: bool = False,
         exact_cooling: bool = True,
@@ -764,6 +589,16 @@ class MpsStabOptimizer:
                     f"got {max_pauli_decomposition_qubits}."
                 )
         self.max_pauli_decomposition_qubits = max_pauli_decomposition_qubits
+        if max_pauli_terms is not None:
+            if (
+                isinstance(max_pauli_terms, bool)
+                or not isinstance(max_pauli_terms, Integral)
+            ):
+                raise TypeError("max_pauli_terms must be an integer or None.")
+            max_pauli_terms = int(max_pauli_terms)
+            if max_pauli_terms < 1:
+                raise ValueError("max_pauli_terms must be positive or None.")
+        self.max_pauli_terms = max_pauli_terms
         if max_dense_cap_qubits is not None:
             if (
                 isinstance(max_dense_cap_qubits, bool)
@@ -961,6 +796,9 @@ class MpsStabOptimizer:
         if parts is not None:
             _mpo, where = parts
             return set(_normalize_sites(where))
+        conditional = conditional_event_parts(entry)
+        if conditional is not None:
+            return set(_normalize_sites(conditional[2]))
 
         if not (isinstance(entry, (list, tuple)) and entry):
             return None
@@ -2004,7 +1842,17 @@ class MpsStabOptimizer:
                 f"{4**nq} candidate terms, exceeding "
                 f"max_pauli_decomposition_qubits={limit}."
             )
-        for labels, coeff in pauli_decomposition(gate, nq, tol=self.operator_tol):
+        for term_index, (labels, coeff) in enumerate(
+            pauli_decomposition(gate, nq, tol=self.operator_tol), start=1
+        ):
+            if (
+                self.max_pauli_terms is not None
+                and term_index > self.max_pauli_terms
+            ):
+                raise ValueError(
+                    f"dense gate retained more than max_pauli_terms="
+                    f"{self.max_pauli_terms} during layout analysis."
+                )
             phys = pauli_string(labels, where, self.n)
             frame_terms, _sign = hermitian_pauli_terms(self.state.frame_pauli(phys))
             support = tuple(sorted(frame_terms))
@@ -2022,6 +1870,13 @@ class MpsStabOptimizer:
 
     def _frame_layout_trace_entry(self, entry, records, *, weight_mode):
         """Trace one queued entry into weighted frame-support records."""
+        conditional = conditional_event_parts(entry)
+        if conditional is not None:
+            raise ValueError(
+                "static STN frame_layout='auto' cannot safely prepass a "
+                "branch-dependent feed-forward action; provide an explicit "
+                "layout or use the ordinary interaction layout."
+            )
         parts = submpo_event_parts(entry, normalize_where=True)
         if parts is not None:
             _mpo, where = parts
@@ -2798,6 +2653,44 @@ class MpsStabOptimizer:
         """Pseudo-stabilizer rank ``xi_tilde`` = number of non-zero ``nu_i``."""
         return self.state.pseudo_stabilizer_rank(tol=tol)
 
+    @classmethod
+    def truncation_convergence(
+        cls,
+        n,
+        gates,
+        chi_values=(1, 2, 4, 8, None),
+        *,
+        observable=None,
+        **kwargs,
+    ):
+        """Replay a stream at several bond caps and report convergence.
+
+        This is a correctness/benchmark helper for QEC and coherent-noise
+        studies. Each row is an independent product-state replay, so the
+        result directly exposes how ``chi`` changes the final norm, tracked
+        compression diagnostics, peak bond, and an optional user observable.
+        ``chi=None`` is the lossless reference up to the configured cutoff.
+        """
+        values = tuple(chi_values)
+        if not values:
+            raise ValueError("chi_values must contain at least one bond cap.")
+        rows = []
+        for chi_value in values:
+            options = dict(kwargs)
+            options["chi"] = chi_value
+            optimizer = cls(int(n), gates=gates, **options)
+            optimizer.run()
+            row = {
+                "chi": chi_value,
+                "max_bond": int(optimizer.state.max_bond()),
+                "norm": float(optimizer.norm()),
+                "norm_diagnostics": optimizer.norm_diagnostics(),
+            }
+            if callable(observable):
+                row["observable"] = observable(optimizer)
+            rows.append(row)
+        return rows
+
     def copy(self) -> "MpsStabOptimizer":
         """Return an independent copy (state deep-copied; queue/history reset)."""
         copied = MpsStabOptimizer(
@@ -2806,6 +2699,7 @@ class MpsStabOptimizer:
             cutoff=self.cutoff,
             operator_tol=self.operator_tol,
             max_pauli_decomposition_qubits=self.max_pauli_decomposition_qubits,
+            max_pauli_terms=self.max_pauli_terms,
             max_dense_cap_qubits=self.max_dense_cap_qubits,
             track_infidelity=self.track_infidelity,
             exact_cooling=self.exact_cooling,
@@ -3445,7 +3339,21 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Entry dispatch
     # ------------------------------------------------------------------ #
+    def _apply_conditional_entry(self, entry):
+        """Apply one feed-forward action when its recorded bit is true."""
+        _name, payload, _where = conditional_event_parts(entry)
+        index, expected = _resolve_conditional(payload, len(self.measurements))
+        record = self.measurements[index]
+        outcome = int(getattr(record, "outcome", record[2]))
+        if int(outcome < 0) == expected:
+            self._apply_entry(payload["action"])
+        return self
+
     def _apply_entry(self, entry) -> None:
+        conditional = conditional_event_parts(entry)
+        if conditional is not None:
+            self._apply_conditional_entry(entry)
+            return
         parts = submpo_event_parts(entry, normalize_where=True)
         if parts is not None:
             mpo, where = parts
@@ -4936,9 +4844,17 @@ class MpsStabOptimizer:
             return 0.0
         gram = np.asarray(gate).conj().T @ np.asarray(gate)
         expectation = 0.0 + 0.0j
-        for labels, coefficient in pauli_decomposition(
-            gram, k, tol=self.operator_tol
+        for term_index, (labels, coefficient) in enumerate(
+            pauli_decomposition(gram, k, tol=self.operator_tol), start=1
         ):
+            if (
+                self.max_pauli_terms is not None
+                and term_index > self.max_pauli_terms
+            ):
+                raise ValueError(
+                    f"G^dagger G retained more than max_pauli_terms="
+                    f"{self.max_pauli_terms}; increase the explicit term budget."
+                )
             physical = pauli_string(labels, where, self.n)
             frame_terms, sign = hermitian_pauli_terms(
                 self.state.frame_pauli(physical)
@@ -5047,7 +4963,16 @@ class MpsStabOptimizer:
         )
         decomp = pauli_decomposition(gate, k, tol=self.operator_tol)
         branches = []  # (weight, {site: axis})
-        for labels, coeff in decomp:
+        for term_index, (labels, coeff) in enumerate(decomp, start=1):
+            if (
+                self.max_pauli_terms is not None
+                and term_index > self.max_pauli_terms
+            ):
+                raise ValueError(
+                    f"dense gate retained more than max_pauli_terms="
+                    f"{self.max_pauli_terms}; increase the explicit term budget "
+                    "or decompose the operator into smaller supported gates."
+                )
             phys = pauli_string(labels, where, self.n)
             frame_terms, sign = hermitian_pauli_terms(self.state.frame_pauli(phys))
             branches.append((coeff * sign, frame_terms))
@@ -5265,6 +5190,7 @@ class MpsStabOptimizer:
             f"operator_tol={self.operator_tol}, "
             f"max_pauli_decomposition_qubits="
             f"{self.max_pauli_decomposition_qubits}, "
+            f"max_pauli_terms={self.max_pauli_terms}, "
             f"max_dense_cap_qubits={self.max_dense_cap_qubits}, "
             f"queued={len(self._queue)}, current_chi={self.state.max_bond()})"
         )

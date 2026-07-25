@@ -213,7 +213,8 @@ milestone of numerical coefficient updates to this class while keeping tableau
 state and stabilizer-specific bookkeeping above it. See the
 [TreeStabOptimizer API](tree_stabilizer.md) for the supported fixed-basis,
 basis-updating, immediate, and deferred magic-injection
-Clifford/rotation/measurement paths.
+Clifford/rotation/measurement paths, bounded dense matrix dispatch, and the
+safe MPS naming-compatibility surface.
 
 ## Tree state class
 
@@ -653,19 +654,5 @@ available through `truncation_report()`, `get_infidelities()`, and
   `TreePlan` but owns its own tensor network (which carries the tracked
   orthogonality centre), for branching experiments or trial gate sequences.
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.tree.optimizer
-   :members:
-   :undoc-members:
-   :show-inheritance:
 
-.. automodule:: pepsy.optimizers.tree.ttn
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-.. automodule:: pepsy.optimizers.tree.layout
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+> API details are maintained as handwritten Markdown in this page.

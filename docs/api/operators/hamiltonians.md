@@ -1,8 +1,4 @@
 # `pepsy.operators.hamiltonians`
 
-```{eval-rst}
-.. automodule:: pepsy.operators.hamiltonians
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

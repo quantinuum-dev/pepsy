@@ -21,6 +21,19 @@ This file defines default behavior for coding agents working in this repository.
 - When work needs Gaugy or Tensy behavior, make the Pepsy side expose a clean
   public API and leave package-specific code in the corresponding external
   repository.
+
+## Documentation and skill layout
+
+- Keep user-facing documentation under `docs/` and organize implementation
+  notes under `docs/development/`: `plans/`, `notes/`, `modules/`, and
+  `references/`.
+- Keep the repository root limited to essential project files such as
+  `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, and policy files.
+- Keep each agent skill in `.github/skills/<skill-name>/` with `SKILL.md` as
+  its entry point and optional `references/` or `agents/` subdirectories. Add
+  new skills to `.github/skills/README.md`.
+- Do not add one-off `.tmp*`, backup, build, or cache artifacts to the source
+  tree; use `/tmp` for transient work.
 - Local/generated artifacts may appear in `build/`, `docs/_build/`, `__pycache__/`, `cash*/`, `ctg_cash/`, and `store/`; do not use these as source-of-truth code.
 
 ## Startup Checklist
@@ -269,10 +282,13 @@ At the start of a new task:
 
 - Run the default core tests: `pytest -q`
 - Run all tests, including extended suites: `pytest -q -o addopts=''`
-- Run a focused test file: `pytest -q tests/test_name.py`
-- Run a focused test case: `pytest -q tests/test_name.py::test_case_name`
+- Run a focused smoke test file: `pytest -q tests/test_name.py`
+- Run a focused non-smoke test file: `pytest -q -o addopts='' tests/test_name.py`
+- Run a focused extended test file: `pytest -q -o addopts='' tests/test_name.py`
+- Run a focused test case: `pytest -q -o addopts='' tests/test_name.py::test_case_name`
 - Public API/layout smoke tests: `pytest -q tests/test_public_api.py tests/test_package_layout.py`
 - Check Python syntax/static issues: `python -m pyflakes src tests`
+- Check lint: `python -m ruff check src tests`
 - Documentation is maintained as Markdown under `docs/`; no documentation build is required.
 
 If numba, matplotlib, or Python cache directories cause local environment noise, prefer temporary cache locations such as:
@@ -304,8 +320,9 @@ NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX
 - For any matplotlib figure (examples, notebooks, benchmark plots), aim for
   clear, legible, decent-looking plots (labeled axes, readable fonts, a legend
   when there is more than one series, a light grid, a distinct reference curve,
-  and vector/PNG saves for keep-worthy figures). See `plot_policy.md` at the
-  repo root for the principles and a recommended house-style starting point —
+  and vector/PNG saves for keep-worthy figures). See
+  `docs/development/plot_policy.md` for the principles and a recommended
+  house-style starting point —
   it is guidance, not a rigid template to copy verbatim.
 
 ## Validation
@@ -314,17 +331,34 @@ NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX
 - If behavior or API changes, update documentation in `docs/` and/or `README.md`.
 - If unable to run tests locally, state this explicitly in the final report.
 
+### Test-size policy
+
+- Keep the default `pytest -q` loop small: it runs only the deterministic smoke
+  contract checks marked `smoke`.
+- For an algorithm change, add the smallest useful deterministic regression
+  test for the changed behavior. Add one boundary or invariant case only when
+  it protects a distinct failure mode.
+- Do not add broad Cartesian parameter grids, repeated seeds, duplicate
+  end-to-end tests, or stress tests to the default suite. Put genuinely
+  backend-specific, integration, differential, or stress coverage behind the
+  existing `integration` or `slow` markers.
+- Before adding a test, check whether an existing focused test can be extended
+  or made more precise. Remove superseded cases only when the replacement
+  preserves the same public-contract coverage.
+- Run the focused test file for the changed algorithm and run the full suite
+  only when the change crosses multiple domains or affects shared internals.
+
 Focused validation guide:
 
 - API/layout changes: `pytest -q tests/test_public_api.py tests/test_package_layout.py`
 - Boundary setup, normalization, infidelity, or sweeps: `pytest -q tests/test_prepare_boundary_inputs.py`
-- Tensor constructors, backend defaults, contraction helpers, or observables: `pytest -q tests/test_core_seed.py`
+- Tensor constructors, backend defaults, contraction helpers, or observables: `pytest -q tests/test_tensor_constructors.py`
 - Gate routing/builders: `pytest -q tests/test_gate.py`
 - Hamiltonian or lattice mapping: `pytest -q tests/test_ham.py`
 - Solver changes: `pytest -q tests/test_gradient_solver.py`
-- Optimizers: `pytest -q tests/test_optimize_global.py tests/test_optimize_sweep_plot.py tests/test_optimize_mps.py tests/test_optimize_mpo.py`
+- Optimizers: `pytest -q -o addopts='' tests/test_optimize_global.py tests/test_optimize_mera.py tests/test_optimize_mps.py tests/test_optimize_mpo.py tests/test_optimize_peps.py tests/test_optimize_tree.py`
 - MPS layout/canonicalization review: `pytest -q tests/test_optimize_mps.py tests/test_optimize_mpo.py tests/test_symmetric_tensors.py`
-- Stabilizer tensor networks: `pytest -q tests/test_stabilizer_tn.py tests/test_stabilizer_tn_stress.py`
+- Stabilizer tensor networks: `pytest -q -o addopts='' tests/test_stabilizer_tn.py tests/test_optimize_tree_stabilizer.py`
 - Sampling: `pytest -q tests/test_sampler.py`
 - Docs/API behavior changes: run focused tests; documentation is plain Markdown.
 

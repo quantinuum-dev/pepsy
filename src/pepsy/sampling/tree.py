@@ -22,6 +22,21 @@ tree's several open sibling bonds replace the MPS's single right bond.  All
 batched ``einsum`` contractions.  The returned probability of each shot is the
 exact product of its conditional Born probabilities, so it equals
 ``|<config|psi>|**2`` for the normalized state.
+
+Fermionic states
+----------------
+Native Symmray fermionic trees are supported through the same ``O(L)`` sweep.
+The graded-canonical tensors are densified once; because every Born probability
+contracts a tensor with its own conjugate over the shared indices, the fermionic
+exchange signs enter squared and cancel, so the plain dense sweep reproduces the
+exact graded probabilities and marginals (validated to machine precision against
+the doubled-network contraction).  Sampled physical codes follow Symmray's dense
+basis order -- ``empty, up, down, up-down`` for spinful ``phys_dim=4`` and
+``empty, occupied`` for spinless ``phys_dim=2`` -- and decode to ``(n_up,
+n_down)`` occupations through the :class:`FermionConfigurationEncoding` attached
+to the sample results.  Signed :meth:`~TreeSampler.amplitudes` use the same dense
+basis convention and may differ from the graded amplitude ordering by a
+per-configuration sign, whereas :meth:`~TreeSampler.probabilities` are exact.
 """
 
 from __future__ import annotations
@@ -30,6 +45,8 @@ import contextlib
 from dataclasses import dataclass
 
 import numpy as np
+
+from .samplers import FermionConfigurationEncoding
 
 __all__ = [
     "TreeBatchSampleResult",
@@ -43,6 +60,24 @@ try:  # threadpoolctl is a NumPy/SciPy transitive dependency; treat as optional.
     _THREAD_CONTROLLER = _ThreadpoolController()
 except Exception:  # pragma: no cover - threadpoolctl missing
     _THREAD_CONTROLLER = None
+
+
+def _fermion_code_occupations(phys_dim, spinful):
+    """Return Symmray's dense-basis code -> occupation table, or ``None``.
+
+    The physical legs of a native fermionic tree densify in Symmray's canonical
+    basis order.  For a spinful ``phys_dim=4`` site that order is ``empty, up,
+    down, up-down`` (matching ``number_u = diag(0, 1, 0, 1)`` and ``number_d =
+    diag(0, 0, 1, 1)``); a spinless ``phys_dim=2`` site is ``empty, occupied``.
+    Occupations are returned as ``(n_up, n_down)`` tuples when spinful and
+    ``(n,)`` tuples when spinless.  Any other layout returns ``None`` so the
+    sampler simply omits an occupation decoder.
+    """
+    if spinful and phys_dim == 4:
+        return ((0, 0), (1, 0), (0, 1), (1, 1))
+    if not spinful and phys_dim == 2:
+        return ((0,), (1,))
+    return None
 
 
 @dataclass
@@ -63,9 +98,25 @@ class TreeSampleResult:
     configs: list[list[int]]
     probs: list[float]
     nqubits: int
+    configuration_encoding: FermionConfigurationEncoding | None = None
 
     def __len__(self):
         return len(self.configs)
+
+    def occupations(self, *, to_numpy: bool = False):
+        """Decode fermionic physical codes into on-site occupations.
+
+        Requires a fermionic sampler.  Spinful results have shape
+        ``(n_samples, nqubits, 2)`` in ``(n_up, n_down)`` order; spinless
+        results have shape ``(n_samples, nqubits)``.
+        """
+        if self.configuration_encoding is None:
+            raise ValueError(
+                "This result has no fermion configuration encoding; sample from "
+                "a fermionic tree state (optionally pass fermion=... to "
+                "TreeSampler)."
+            )
+        return self.configuration_encoding.decode(self.configs, to_numpy=to_numpy)
 
     def magnetizations(self) -> np.ndarray:
         """Per-sample magnetization ``(1 / n) * sum_i (1 - 2 * bit_i)``."""
@@ -93,6 +144,7 @@ class TreeBatchSampleResult:
     configs: np.ndarray
     probs: np.ndarray
     nqubits: int
+    configuration_encoding: FermionConfigurationEncoding | None = None
 
     def __len__(self):
         return int(self.configs.shape[0])
@@ -108,7 +160,23 @@ class TreeBatchSampleResult:
             configs=np.asarray(self.configs),
             probs=np.asarray(self.probs),
             nqubits=self.nqubits,
+            configuration_encoding=self.configuration_encoding,
         )
+
+    def occupations(self, *, to_numpy: bool = False):
+        """Decode fermionic physical codes into on-site occupations.
+
+        Requires a fermionic sampler.  Spinful results have shape
+        ``(n_samples, nqubits, 2)`` in ``(n_up, n_down)`` order; spinless
+        results have shape ``(n_samples, nqubits)``.
+        """
+        if self.configuration_encoding is None:
+            raise ValueError(
+                "This batch has no fermion configuration encoding; sample from "
+                "a fermionic tree state (optionally pass fermion=... to "
+                "TreeSampler)."
+            )
+        return self.configuration_encoding.decode(self.configs, to_numpy=to_numpy)
 
     def configs_list(self) -> list[list[int]]:
         """Return configurations as Python ``list[list[int]]``."""
@@ -125,6 +193,7 @@ class TreeBatchSampleResult:
             configs=self.configs_list(),
             probs=[float(p) for p in np.asarray(self.probs)],
             nqubits=self.nqubits,
+            configuration_encoding=self.configuration_encoding,
         )
 
 
@@ -145,6 +214,12 @@ class TreeSampler:
         node arrays are small (bounded by the bond dimension), so a single
         thread is typically fastest; pass ``None`` to leave the ambient thread
         count untouched.
+    fermion : pepsy.tensors.Fermion, optional
+        Fermionic physical-space convention.  It is optional: a native Symmray
+        fermionic tree is detected automatically and its dense-basis occupation
+        decoder is attached to the sample results regardless.  Supplying a
+        ``fermion`` only pins the recorded ``symmetry``/``spinful`` labels when
+        they cannot be inferred from the state.
 
     Notes
     -----
@@ -153,9 +228,10 @@ class TreeSampler:
     sampler keeps representing its previously captured tensor data.
     """
 
-    def __init__(self, state, *, seed=None, threads: int | None = 1):
+    def __init__(self, state, *, seed=None, threads: int | None = 1, fermion=None):
         self._rng = np.random.default_rng(seed)
         self.threads = None if threads is None else int(threads)
+        self._fermion = fermion
 
         # Geometry / cached canonical arrays (populated by refresh).
         self._nqubits = None
@@ -163,6 +239,8 @@ class TreeSampler:
         self._children = None
         self._qubit_of_leaf = None
         self._arrays = None
+        self._fermionic = False
+        self._configuration_encoding = None
 
         self.refresh(state)
 
@@ -229,6 +307,18 @@ class TreeSampler:
         children = {nid: tuple(plan.children[nid]) for nid in plan.children}
         qubit_of_leaf = dict(plan.qubit_of_leaf)
 
+        # Native Symmray fermionic trees keep block-sparse arrays; densify them
+        # once.  A graded-canonical tensor is also plain-isometric (its exchange
+        # signs cancel in the ket-with-bra reduced-density contraction), so the
+        # dense sweep below reproduces the exact fermionic Born probabilities.
+        fermionic = bool(getattr(tn, "fermionic", False))
+        if fermionic:
+            def to_arr(data):
+                return np.asarray(data.to_dense())
+        else:
+            def to_arr(data):
+                return np.asarray(data)
+
         def bond_between(a, b):
             shared = set(tn.node_tensor(a).inds) & set(tn.node_tensor(b).inds)
             if len(shared) != 1:
@@ -246,18 +336,18 @@ class TreeSampler:
             if not ch:  # leaf
                 phys = tn.site_ind(qubit_of_leaf[nid])
                 if is_root:  # single-qubit tree
-                    arr = np.asarray(t.transpose(phys).data).reshape(1, -1)
+                    arr = to_arr(t.transpose(phys).data).reshape(1, -1)
                 else:
                     pbond = bond_between(nid, parent)
-                    arr = np.asarray(t.transpose(pbond, phys).data)
+                    arr = to_arr(t.transpose(pbond, phys).data)
             else:  # internal node
                 cbonds = [bond_between(nid, c) for c in ch]
                 if is_root:
-                    arr = np.asarray(t.transpose(*cbonds).data)
+                    arr = to_arr(t.transpose(*cbonds).data)
                     arr = arr.reshape((1,) + arr.shape)
                 else:
                     pbond = bond_between(nid, parent)
-                    arr = np.asarray(t.transpose(pbond, *cbonds).data)
+                    arr = to_arr(t.transpose(pbond, *cbonds).data)
             arrays[nid] = arr
 
         # Normalize via the root array (state is canonical with centre = root).
@@ -271,6 +361,35 @@ class TreeSampler:
         self._children = children
         self._qubit_of_leaf = qubit_of_leaf
         self._arrays = arrays
+        self._fermionic = fermionic
+        self._configuration_encoding = (
+            self._build_configuration_encoding(tn, arrays, qubit_of_leaf)
+            if fermionic
+            else None
+        )
+
+    def _build_configuration_encoding(self, tn, arrays, qubit_of_leaf):
+        """Build the dense-basis occupation decoder for a fermionic tree."""
+        if not qubit_of_leaf:
+            return None
+        phys_dim = int(arrays[next(iter(qubit_of_leaf))].shape[-1])
+        fermion = self._fermion
+        if fermion is not None and hasattr(fermion, "spinful"):
+            spinful = bool(fermion.spinful)
+        else:
+            spinful = phys_dim == 4
+        table = _fermion_code_occupations(phys_dim, spinful)
+        if table is None:
+            return None
+        symmetry = getattr(fermion, "symmetry", None)
+        if symmetry is None:
+            symmetry = getattr(tn, "symmetry", None)
+        symmetry = str(symmetry) if symmetry is not None else "U1U1"
+        return FermionConfigurationEncoding(
+            symmetry=symmetry,
+            spinful=spinful,
+            code_to_occupations=tuple(table for _ in range(self._nqubits)),
+        )
 
     @property
     def nqubits(self) -> int:
@@ -360,6 +479,7 @@ class TreeSampler:
             configs=configs,
             probs=probs,
             nqubits=self._nqubits,
+            configuration_encoding=self._configuration_encoding,
         )
 
     def sample(self, n_samples: int = 1, seed=None) -> TreeSampleResult:
@@ -415,7 +535,10 @@ class TreeSampler:
         """Return amplitudes ``<config|psi>`` for batched ``configs``.
 
         ``configs`` should have shape ``(batch, nqubits)``.  The tree is
-        contracted from the leaves to the root in one batched pass.
+        contracted from the leaves to the root in one batched pass.  For a
+        fermionic tree the codes index Symmray's dense basis order and the
+        returned amplitude may differ from the graded amplitude ordering by a
+        per-configuration sign; the derived :meth:`probabilities` are exact.
         """
         configs = self._check_configs(configs)
         with self._thread_ctx():

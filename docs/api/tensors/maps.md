@@ -1,7 +1,4 @@
 # Tensor maps
 
-```{eval-rst}
-.. automodule:: pepsy.tensors.maps
-   :members:
-   :undoc-members:
-```
+
+> API details are maintained as handwritten Markdown in this page.

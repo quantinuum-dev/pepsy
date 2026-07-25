@@ -1,7 +1,4 @@
 # Tensor constructors
 
-```{eval-rst}
-.. automodule:: pepsy.tensors.constructors
-   :members:
-   :undoc-members:
-```
+
+> API details are maintained as handwritten Markdown in this page.

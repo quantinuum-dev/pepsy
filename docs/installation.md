@@ -12,6 +12,9 @@ Optional extras:
 pip install -e .[torch]
 pip install -e .[solvers]
 pip install -e .[viz]
+pip install -e .[symmetry]
+pip install -e .[stabilizer]
+pip install -e .[layout]
 ```
 
 Documentation is plain Markdown under `docs/`; no documentation builder is

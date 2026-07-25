@@ -118,8 +118,8 @@ The concrete pepsy + stim call surface is in
 [references/pepsy_stim_api.md](./references/pepsy_stim_api.md).
 
 ## Implementation status (already built in `src/pepsy/optimizers/stabilizer_tn/`)
-The simulator is mature and validated against dense/stim (`tests/test_stabilizer_tn.py` and
-`tests/test_stabilizer_tn_stress.py`): `STNState` (tableau + `|p>`), Clifford and
+The simulator is mature and validated against dense/stim (`tests/test_stabilizer_tn.py`):
+`STNState` (tableau + `|p>`), Clifford and
 non-Clifford evolution, constructive exact cooling, explicit greedy Clifford cooling,
 immediate and deferred-MAST magic-state injection, fixed/basis-updating measurement, reset,
 perfect computational-basis sampling, and optional Torch/JAX/CuPy coefficient backends
@@ -249,7 +249,7 @@ the constructive pre-check.
 ## Roadmap / future improvements
 The prioritized roadmap (Clifford disentangling, dynamic layout, future PEPS/decoder work,
 and completed injection/measurement/sampling milestones) lives in
-`src/pepsy/optimizers/stabilizer_tn/PLAN.md`, with citations from the PRL-133-230601 citation scan.
+`docs/development/plans/stabilizer_tn.md`, with citations from the PRL-133-230601 citation scan.
 R1 supports `inject_rz` for $\phi$ a multiple of $\pi/4$, `inject_t`/`inject_tdg`, immediate
 nearest-clean-ancilla recycling through `run_with_injection` / `with_injection`, and deferred
 MAST projection through `run_with_deferred_injection` / `with_deferred_injection`.

@@ -18,6 +18,10 @@ cotengra_cache/
 store/
 nohup.out
 
+# One-off local scripts and intermediate files.
+.tmp*
+*.tmp
+
 *.egg-info/
 .eggs/
 build/

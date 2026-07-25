@@ -242,3 +242,129 @@ def test_public_api_exports_tree_sampler():
     assert pepsy.TreeBatchSampleResult is TreeBatchSampleResult
     for name in ("TreeSampler", "TreeSampleResult", "TreeBatchSampleResult"):
         assert name in pepsy.__all__
+
+
+# -- fermionic tree sampling --------------------------------------------------
+
+
+def _fermionic_tree(*, chi=64, steps=4):
+    """Build a mildly entangled U1U1 spinful Fermi-Hubbard tree (L=4)."""
+    from pepsy.optimizers.tree import TreeLayoutFinder
+
+    tensors = pepsy.tensors
+    Lx, Ly, L = 2, 2, 4
+    t, U, dt = 1.0, 4.0, 0.05
+    dtype = "complex128"
+
+    fermion = pepsy.Fermion(
+        spinful=True, symmetry="U1U1", t=t, U=U, mu=0.0, dtype=dtype
+    )
+    setup = fermion.lattice_half_filling(Lx, Ly, pattern="checkerboard", cyclic=True)
+    mapper = tensors.OneDMap(Lx, Ly, mode="snake")
+    _, coo2idx = mapper.build()
+    edges_1d = [tuple(sorted((coo2idx[a], coo2idx[b]))) for a, b in setup.edges]
+    occ_1d = {coo2idx[coo]: c for coo, c in setup.occupations.items()}
+    occupations = tuple(occ_1d[p] for p in range(L))
+    target = tuple(int(v) for v in np.sum(np.array(occupations), axis=0))
+
+    plan = TreeLayoutFinder(
+        [(fermion.hopping_gate(0.1, t=t, imaginary=False), e) for e in edges_1d],
+        n=L, chi=8, objective="hybrid",
+    ).recommend_arities((2, 3, 4), seed=0)["plan"]
+    seed_ttn = pepsy.ps_to_ttn(
+        L, tree=plan, fermion=fermion, occupations=occupations, dtype=dtype
+    )
+
+    half = dt / 2
+    u_hop = fermion.hopping_gate(half, t=t, imaginary=False)
+    onsite = [
+        (fermion.onsite_gate(half, site=s, U=U, mu=0.0, imaginary=False), s)
+        for s in range(L)
+    ]
+    layers = fermion.edge_coloring_layers(edges_1d)
+    fwd = [(u_hop, e) for layer in layers for e in layer]
+    rev = [(u_hop, e) for layer in reversed(layers) for e in reversed(layer)]
+    gates = (onsite + fwd + rev + onsite) * steps
+
+    engine = TreeOptimizer(
+        gates, n=L, tree=plan, state=seed_ttn.copy(), chi=chi,
+        cutoff=0.0, mode="mpo", run=False,
+    )
+    engine.run()
+    return engine, fermion, target, L
+
+
+def _all_base_d_configs(n, d):
+    """All ``d**n`` configs with site 0 as the most significant digit."""
+    return np.array(
+        [[(idx // d ** (n - 1 - q)) % d for q in range(n)] for idx in range(d**n)]
+    )
+
+
+def test_fermionic_tree_probabilities_match_statevector():
+    pytest.importorskip("symmray")
+    engine, fermion, target, L = _fermionic_tree(chi=64)
+    sampler = TreeSampler(engine, fermion=fermion, seed=0)
+    assert sampler._configuration_encoding is not None
+
+    # Exact graded statevector densified into Symmray's dense basis order.
+    tn = engine.p
+    site_inds = [tn.site_ind(q) for q in range(L)]
+    sv = np.asarray(
+        tn.contract(all).transpose(*site_inds).data.to_dense()
+    ).reshape(-1)
+    sv = sv / np.linalg.norm(sv)
+    exact = np.abs(sv) ** 2
+
+    configs = _all_base_d_configs(L, 4)
+    probs = sampler.probabilities(configs)
+    assert probs.shape == (4**L,)
+    assert np.allclose(probs.sum(), 1.0, atol=1e-10)
+    # Dense-basis code index aligns 1:1 with the densified statevector.
+    assert np.max(np.abs(probs - exact)) < 1e-10
+
+
+def test_fermionic_tree_samples_conserve_charge_and_decode():
+    pytest.importorskip("symmray")
+    engine, fermion, target, L = _fermionic_tree(chi=64)
+    sampler = TreeSampler(engine, fermion=fermion, seed=0)
+
+    res = sampler.sample_batch(2000, seed=42)
+    assert res.configs.shape == (2000, L)
+    assert res.configuration_encoding is not None
+
+    occ = res.occupations()
+    assert occ.shape == (2000, L, 2)
+    assert set(np.unique(occ).tolist()) <= {0, 1}
+    # Every shot lives in the single (n_up, n_down) charge sector of the state.
+    totals = {tuple(int(v) for v in row.sum(0)) for row in occ}
+    assert totals == {target}
+
+    # Reported per-sample probs equal probabilities() of the same configs.
+    rep = sampler.probabilities(res.configs[:200])
+    assert np.allclose(res.probs[:200], rep, atol=1e-12)
+
+    # List-based result carries the same decoder.
+    sr = res.to_sample_result()
+    assert isinstance(sr, TreeSampleResult)
+    assert np.array_equal(sr.occupations(), occ)
+
+
+def test_fermionic_tree_sample_frequencies_converge():
+    pytest.importorskip("symmray")
+    engine, fermion, _, L = _fermionic_tree(chi=64)
+    sampler = TreeSampler(engine, fermion=fermion, seed=0)
+
+    res = sampler.sample_batch(40000, seed=7)
+    uniq, inv = np.unique(res.configs, axis=0, return_inverse=True)
+    freq = np.bincount(inv, minlength=len(uniq)) / len(res)
+    assert np.max(np.abs(freq - sampler.probabilities(uniq))) < 1e-2
+
+
+def test_non_fermionic_occupations_raises():
+    opt = TreeOptimizer([(pepsy.h(), 0), (pepsy.cnot(), (0, 1))], n=2)
+    res = TreeSampler(opt, seed=0).sample_batch(4, seed=0)
+    assert res.configuration_encoding is None
+    with pytest.raises(ValueError, match="no fermion configuration encoding"):
+        res.occupations()
+

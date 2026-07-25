@@ -7,6 +7,13 @@ MPS `|nu>` (the paper's coefficient state, exposed as `.p`). Clifford gates
 update only the tableau (free, `|nu>` unchanged); non-Clifford gates and
 measurements update `|nu>`.
 
+General physical matrices use the exact coefficient-frame Pauli mapping when
+their explicit budget is raised beyond the default two qubits. Set
+`max_pauli_decomposition_qubits=3` (or `max_operator_qubits=3` for TreeStab)
+and keep `max_pauli_terms` bounded; both guards are checked before the operator
+sum is applied. `chi=None` remains exact up to the configured cutoff, while a
+finite `chi` compresses the mapped operator with the normal diagnostics.
+
 `StabilizerMpsSimulator` is the descriptive public name for the simulator, with
 `MpsStabOptimizer` kept as the long-standing compatibility alias. Both are
 available at top level as `pepsy.StabilizerMpsSimulator` and
@@ -121,6 +128,15 @@ returns the plan without mutating the simulator. Immediate and deferred
 injection runners also accept `layout="auto"`; they build a synthetic layout
 stream from the magic-ancilla gadgets and final projections, rather than using
 the original data-only stream.
+
+For measurement/feed-forward circuits, use
+`("if", record, bit, action)`. `record=-1` means the latest measurement,
+negative records are Stim-style offsets, and `bit` is the computational
+measurement bit (`+1 -> 0`, `-1 -> 1`). The action is exactly one gate entry,
+for example `("if", -1, 1, ("x", q))`. This form is supported by both STN
+frontends and by the trajectory runners. `compile_stim_circuit` lowers
+`CX/CY/CZ rec[k] q` to the same event; general classical arithmetic remains
+outside the quantum replay contract.
 
 ## Measurement, reset, and magic-state injection
 
@@ -296,14 +312,5 @@ small-`n` validation only. The focused STN tests exercise NumPy, Torch, JAX, and
 CuPy paths; optional JAX/CuPy tests skip only when the dependency or CUDA runtime
 is unavailable.
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.stabilizer_tn.mps_stab_optimizer
-   :members:
-   :undoc-members:
-   :show-inheritance:
 
-.. automodule:: pepsy.optimizers.stabilizer_tn.stn_state
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+> API details are maintained as handwritten Markdown in this page.

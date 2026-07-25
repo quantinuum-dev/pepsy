@@ -7,21 +7,28 @@ optimization, sampling, and variational Monte Carlo workflows.
 
 Current package version: `0.3.0` (from `pyproject.toml` / `pepsy.__version__`).
 See the [changelog](CHANGELOG.md) for release history and versioned changes.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and test profiles.
 
 ## Package Layout
-- `src/pepsy/`: installable library code
-  - `backends/`: backend selection, conversion, and linear algebra registration
-  - `tensors/`: lattice maps (`OneDMap`), state/MPO/PEPO builders, contraction helpers
-  - `operators/`: gates, gate application, MPO/PEPO builders, and Hamiltonian helpers
-  - `boundary/`: boundary state initialization (`BdyMPS`), sweeps (`CompBdy`), and metrics
-  - `solvers/`: gradient-based and finite-difference solvers
-  - `fitting/`: local tensor fitting routines (`FIT`)
-  - `optimizers/`: sweep, global, energy, MPS, MPO, PEPS, MERA, BP, and stabilizer optimizers
-  - `sampling/`: `MpsSampler` and related sampling utilities
-  - `bp/`: belief-propagation, loop-expansion, and PNE methods
-  - `extensions/`: clearly marked lazy entry points for optional/advanced domains
-  - `vmc/`: optional Torch and NetKet/JAX variational Monte Carlo adapters
-  - `_internal/`: private formatting and utility helpers
+
+Core namespaces are organized by responsibility:
+
+- `backends/`: backend selection, conversion, and linear algebra registration
+- `tensors/`: maps, constructors, contractions, observables, and symmetric tensors
+- `operators/`: gates, gate application, MPO/PEPO builders, and Hamiltonians
+- `boundary/`: PEPS boundary states, sweeps, norms, and overlaps
+- `solvers/`: gradient-based and finite-difference solvers
+- `fitting/`: local tensor fitting routines
+- `optimizers/`: MPS, MPO, PEPS, sweep, and global workflows
+- `sampling/`: MPS, PEPS, vector, and tree samplers
+
+Advanced namespaces are explicit:
+
+- `bp/`: belief propagation, loop corrections, and PNE
+- `vmc/`: optional Torch and NetKet/JAX VMC adapters
+- `experimental/`: lazy entry points for advanced domains
+- `extensions/`: compatibility entry points for optional integrations
+- `_internal/`: private formatting and utility helpers
 - `examples/`: lightweight runnable examples kept with the package
 - `../pepsy_examples/`: external notebooks and smoke examples, including direct
   fermionic Symmray Fermi-Hubbard starters under `fermi_hubbard/`
@@ -34,8 +41,11 @@ pip install -U -e .
 # Optional backends:
 # pip install -e .[torch]
 # pip install -e .[solvers]
+# pip install -e .[symmetry]
+# pip install -e .[stabilizer]
 # pip install -e .[vmc-torch]
 # pip install -e .[vmc-netket]
+# pip install -e .[layout]
 # Optional plotting helpers:
 # pip install -e .[viz]
 ```
@@ -69,7 +79,7 @@ fermionic parity and leg-order metadata in Symmray arrays while letting quimb
 choose graph-level contraction orders.
 
 The current finite-chain Fermi-Hubbard MPO convention and validation record are
-tracked in `learning/fermionic_mpo.md` and
+tracked in `docs/development/notes/fermionic_mpo.md` and
 `docs/development/fermi_hubbard_u1u1_mpo_notes.md`.
 
 ```python
@@ -93,6 +103,9 @@ assert ordering["methods_reference"]["doi"] == "10.1103/PhysRevResearch.7.023193
 Documentation is maintained as Markdown under `docs/`. No documentation
 builder or documentation-specific package extra is required.
 
+See [the API stability policy](docs/stability.md) for the distinction between
+stable core modules and advanced domains.
+
 Main docs sections:
 
 - `getting_started`
@@ -103,3 +116,12 @@ Main docs sections:
 ## Notes
 - `.gitattributes` marks notebooks as binary to avoid noisy diffs.
 - `.gitignore` excludes checkpoints, generated caches, logs, and build output.
+
+## Development
+
+```bash
+python -m pip install -e ".[dev]"
+pytest -q
+pytest -q -o addopts=""  # include integration and slow suites
+ruff check src tests
+```

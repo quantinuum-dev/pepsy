@@ -53,14 +53,5 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
   terms. Long-range routed terms need route-aware layer scheduling and should
   use `update="sequential"` for now.
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.peps.optimizer
-   :members:
-   :undoc-members:
-   :show-inheritance:
 
-.. automodule:: pepsy.optimizers.peps.simple_update
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+> API details are maintained as handwritten Markdown in this page.

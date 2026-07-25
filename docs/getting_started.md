@@ -16,6 +16,8 @@ Optional extras:
 pip install -e .[torch]
 pip install -e .[solvers]
 pip install -e .[viz]
+pip install -e .[symmetry]
+pip install -e .[stabilizer]
 ```
 
 ## 2. Build a small test network
@@ -54,9 +56,7 @@ print(res.cost)
 print(res.fidel)
 ```
 
-```{note}
-`contract_boundary` always returns a `BoundaryContractResult` object.
-Use `res.cost` and `res.fidel` directly.
-```
+`contract_boundary` always returns a `BoundaryContractResult` object. Use
+`res.cost` and `res.fidel` directly.
 
 Next: see [tutorials](tutorials/index.md) for more complete workflows.

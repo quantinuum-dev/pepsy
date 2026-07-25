@@ -1,12 +1,8 @@
-# How-To Guides
+# How-to guides
 
 Task-oriented references for common operational questions.
 
-```{toctree}
-:maxdepth: 2
-
-choose_parameters
-solver_tuning
-troubleshooting
-stabilizer_tn_magic
-```
+- [Choose parameters](choose_parameters.md)
+- [Tune solvers](solver_tuning.md)
+- [Troubleshooting](troubleshooting.md)
+- [Stabilizer tensor-network magic](stabilizer_tn_magic.md)

@@ -1,8 +1,4 @@
 # `pepsy.boundary.states`
 
-```{eval-rst}
-.. automodule:: pepsy.boundary.states
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

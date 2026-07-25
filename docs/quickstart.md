@@ -26,7 +26,5 @@ print("cost:", res.cost)
 print("fidelity history:", res.fidel)
 ```
 
-```{note}
-`contract_boundary` returns `BoundaryContractResult` directly.
-Use `res.cost` and `res.fidel` for outputs and diagnostics.
-```
+`contract_boundary` returns `BoundaryContractResult` directly. Use `res.cost`
+and `res.fidel` for outputs and diagnostics.

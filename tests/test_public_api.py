@@ -11,6 +11,25 @@ def test_package_version_available():
     assert pepsy.__version__
 
 
+def test_namespace_exports_have_clear_core_and_advanced_groups():
+    """Core and advanced namespaces remain discoverable and distinct."""
+    core = {
+        "backends",
+        "boundary",
+        "fitting",
+        "operators",
+        "optimizers",
+        "sampling",
+        "solvers",
+        "tensors",
+    }
+    advanced = {"bp", "extensions", "experimental", "vmc"}
+
+    assert core.isdisjoint(advanced)
+    assert core | advanced <= set(pepsy.__all__)
+    assert all(getattr(pepsy, name) is not None for name in core | advanced)
+
+
 def test_tree_optimizers_are_available_from_high_level_api():
     """Tree layout and execution helpers resolve from ``import pepsy as py``."""
     from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer
@@ -22,7 +41,7 @@ def test_tree_optimizers_are_available_from_high_level_api():
 
 
 _EXPECTED_IN_ALL = [
-    "backends", "boundary", "fitting", "operators", "optimizers",
+    "backends", "boundary", "experimental", "fitting", "operators", "optimizers",
     "sampling", "solvers", "tensors", "vmc",
     "BdyMPS", "CompBdy", "BoundaryContractResult", "contract_boundary",
     "contract_flat", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
@@ -44,10 +63,11 @@ _EXPECTED_IN_ALL = [
     "TreeTensorNetwork",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
-    "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult", "StreamAnalysisRecord",
+    "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult",
+    "StabilizerTreeRunResult", "StreamAnalysisRecord",
     "CoalescedMeasurementRecord", "CoalescedSampleResult", "CoalescedTrajectoryLeaf", "CoalescedTrajectoryResult", "LeakageRecord", "NoisyShotResult", "PauliErrorModel", "PauliFault",
-    "StimCircuitPlan", "StimHerald", "StimNoiseSample", "StimShotResult",
-    "TrajectoryChannel", "TrajectoryEvent", "TrajectoryOutcome", "TrajectoryRecord", "TrajectorySample", "TrajectoryShotResult",
+    "StimCircuitPlan", "StimDetector", "StimHerald", "StimNoiseSample", "StimObservable", "StimObservableRecord", "StimShotResult", "StimSyndromeRecord",
+    "CoherentCrosstalkModel", "TrajectoryChannel", "TrajectoryEvent", "TrajectoryMeasurementRecord", "TrajectoryOutcome", "TrajectoryRecord", "TrajectorySample", "TrajectoryShotResult",
     "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stim_shots", "run_trajectory_shots",
     "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
     "Fermion", "FermionLatticeSetup", "SpinfulFermion", "SpinfulFermionHubbard", "SymmFermions", "SymGateStream", "SymHamiltonian", "SymMPS", "SymPEPS",
@@ -108,7 +128,7 @@ _CALLABLE_EXPORTS = [
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
     "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult", "StreamAnalysisRecord",
-    "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
+    "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "CoherentCrosstalkModel", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stabilizer_tree_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeOptimizer",
@@ -134,7 +154,7 @@ _CALLABLE_EXPORTS = [
 _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
 
 _MODULE_EXPORTS = [
-    "backends", "boundary", "fitting", "operators", "optimizers",
+    "backends", "boundary", "experimental", "fitting", "operators", "optimizers",
     "sampling", "solvers", "tensors", "vmc",
 ]
 
@@ -157,15 +177,26 @@ def test_lazy_callables_resolve():
 
 
 def test_blocked_names_raise():
-    """Internal name should raise AttributeError."""
-    leaked = [name for name in _BLOCKED_NAMES if hasattr(pepsy, name)]
-    assert not leaked, f"blocked names leaked from package: {leaked}"
+    """Internal names should not be advertised through ``__all__``."""
+    leaked = [name for name in _BLOCKED_NAMES if name in pepsy.__all__]
+    assert not leaked, f"blocked names leaked into package exports: {leaked}"
 
 
 def test_module_exports_resolve():
     """Submodule export should resolve to a non-None value."""
     missing = [name for name in _MODULE_EXPORTS if getattr(pepsy, name, None) is None]
     assert not missing, f"missing module exports: {missing}"
+
+
+def test_vmc_torch_package_preserves_lazy_public_exports():
+    """The Torch VMC package and lazy VMC namespace expose the same objects."""
+    import pepsy.vmc as vmc
+    import pepsy.vmc.torch as torch_vmc
+
+    assert torch_vmc.__spec__.submodule_search_locations is not None
+    assert torch_vmc.__all__
+    for name in torch_vmc.__all__:
+        assert getattr(torch_vmc, name) is getattr(vmc, name)
 
 
 def test_optional_linalg_registrations_resolve():

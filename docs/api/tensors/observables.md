@@ -1,7 +1,4 @@
 # Tensor observables
 
-```{eval-rst}
-.. automodule:: pepsy.tensors.observables
-   :members:
-   :undoc-members:
-```
+
+> API details are maintained as handwritten Markdown in this page.

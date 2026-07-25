@@ -137,7 +137,9 @@ state evolution is shared. `run_coalesced_trajectory_shots(...)` provides the
 same exact tree for `TrajectoryEvent` mixtures and state-dependent Kraus
 channels. It also branches mid-circuit `measure`, `reset`, and
 `measure_reset` controls with exact binomial counts, which is useful for
-ancilla-based circuits. Its leaf `measurements` records the selected outcomes.
+ancilla-based circuits. Reset is replayed natively once per live leaf (it is
+trace preserving and does not create duplicate reset branches); leaf
+`measurements` records selected projective outcomes.
 
 This is normally more useful than `torch.vmap` for rare faults: after a fault
 or collapse, states have different tensor data and often different bond
@@ -184,6 +186,74 @@ the partial tree and restarts the whole ensemble independently. Pass
 `strategy="coalesced"` to request coalescing explicitly; its same cap raises
 instead of silently changing strategy. `auto_max_expected_faults` can tune the
 default `0.1` threshold when profiling a different workload.
+
+## Rare-event importance sampling
+
+For a logical event much rarer than the physical noise rate, bias the proposal
+distribution toward the relevant branches and retain an unbiased likelihood
+ratio. The physical probabilities remain the `TrajectoryChannel` or
+`PauliErrorModel` probabilities; only the sampling proposal changes:
+
+```python
+proposal = pepsy.ImportanceSamplingPolicy({
+    12: {"I": 0.5, "X": 0.5},  # event 12: proposal, not physical probability
+})
+result = pepsy.run_trajectory_shots(
+    factory,
+    noisy_stream,
+    shots=100_000,
+    seed=7,
+    importance_sampling=proposal,
+    max_branches=256,
+    max_branch_factor=4,
+)
+logical_error = [is_logical_error(sim) for sim in result.optimizers]
+estimate = result.estimate(logical_error)
+print(estimate, result.effective_sample_size)
+```
+
+The policy mapping can be label-based for every event, event-index keyed, or a
+callable `(event_index, labels, target_probabilities, optimizer)`. Every target
+branch must have nonzero proposal probability. `TrajectoryRecord` exposes both
+`probability` (physical) and `proposal_probability`, plus `likelihood_ratio`.
+Coalesced leaves carry the product ratio in `leaf.weight`, and
+`CoalescedTrajectoryResult.estimate(...)` includes leaf multiplicities. For the
+Pauli convenience API, pass a proposal `PauliErrorModel` as
+`importance_sampling` to `run_noisy_shots(...)` or
+`run_coalesced_noisy_shots(...)`.
+
+`max_branches` bounds live coalesced states and `max_branch_factor` bounds the
+number of nonempty children created by any one stochastic event. These are hard
+safety budgets: a bounded coalesced run raises (or `strategy="auto"` restarts
+independently) rather than pruning probability mass.
+
+## Deterministic parallel trajectories
+
+Use `parallel_workers` directly on `run_trajectory_shots(...)` or
+`run_noisy_shots(...)`, or call the explicit
+`run_parallel_trajectory_shots(...)` / `run_parallel_noisy_shots(...)` helpers.
+Independent shots receive their channel and optimizer child seeds before worker
+dispatch, so changing the worker count preserves shot order and outcomes.
+Coalesced execution keeps one deterministic branch-splitting stream and runs
+independent live leaves concurrently:
+
+```python
+result = pepsy.run_trajectory_shots(
+    factory,
+    noisy_stream,
+    shots=100_000,
+    seed=7,
+    strategy="coalesced",
+    parallel_workers=8,
+    parallel_backend="thread",
+)
+```
+
+`parallel_backend="gpu"` also uses threads, intentionally keeping Torch/CuPy/JAX
+objects in one process; the optimizer factory must select the device/backend.
+This is concurrent trajectory execution, not an unsafe shared mutable optimizer
+or an automatic device migration. `strategy="auto"` requires choosing either
+`"independent"` or `"coalesced"` when parallelism is requested.
 
 ## User-defined quantum trajectories
 
@@ -273,18 +343,54 @@ print(result.heralds[0])
 ordinary trajectory runner and supports the complete compiled native Stim
 noise set, including two-qubit, heralded, and `E`/`ELSE_CORRELATED_ERROR`
 chains. It shares all ideal segments and records per-leaf Pauli faults and
-herald bits.
+herald bits. `TrajectoryShotResult.measurements` and
+`StimShotResult.measurements` expose structured Pauli outcomes with event
+metadata. Detector and logical-observable annotations are compiled into the
+plan and resolved as `result.syndromes` and `result.observables`; coalesced
+Stim results expose the same records once per leaf, alongside each leaf's
+count.
+
+Measurement-record feed-forward is also supported: `CX/CY/CZ rec[k] q` is
+lowered to `("if", k, bit, action)`, and the ordinary MPS/STN stream form is
+available directly. `k=-1` means the latest measurement; general
+record-to-record arithmetic is intentionally not lowered.
 
 Supported Stim error channels are `X_ERROR`, `Y_ERROR`, `Z_ERROR`,
 `DEPOLARIZE1`, `DEPOLARIZE2`, `PAULI_CHANNEL_1`, `PAULI_CHANNEL_2`,
 `CORRELATED_ERROR`/`E`, `ELSE_CORRELATED_ERROR`, `HERALDED_ERASE`,
-`HERALDED_PAULI_CHANNEL_1`, `I_ERROR`, and `II_ERROR`. Herald bits are retained
-in the sample result; detector/observable annotations are intentionally left to
-Stim or a decoder, since they do not affect the quantum trajectory. Stim itself
-only represents Pauli noise, so amplitude damping is not a missing Stim channel.
+`HERALDED_PAULI_CHANNEL_1`, `I_ERROR`, and `II_ERROR`. Stim itself only
+represents Pauli noise, so amplitude damping is not a missing Stim channel.
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.noise
-   :members:
-   :undoc-members:
+## Coherent crosstalk and truncation studies
+
+`CoherentCrosstalkModel` inserts coherent nearest-neighbour `ZZ` rotations
+after selected two-qubit gates. The emitted `rzz` angle follows Pepsy's
+`exp(-i theta P / 2)` convention; `sign_mode="random_sign"` provides a
+reproducible random-sign comparison when a seed is supplied:
+
+```python
+model = pepsy.CoherentCrosstalkModel(
+    theta=0.01,
+    adjacency={0: (1,), 1: (0, 2), 2: (1,)},
+    sign_mode="random_sign",
+)
+noisy_stream = model.transform(gates, seed=7)
 ```
+
+For coherent-noise and QEC studies, both STN frontends provide
+`MpsStabOptimizer.truncation_convergence(...)` and
+`TreeStabOptimizer.truncation_convergence(...)`. They replay the same stream
+at several `chi` values and report peak bond, norm diagnostics, and an
+optional observable. `chi=None` is the lossless reference up to the configured
+cutoff.
+
+For an end-to-end repeated-check validation, run
+`benchmarks/stabilizer_tn_surface_code.py --distance 3 --rounds 3`. The
+benchmark scales the data/check grid, compares MPS-STN and Tree-STN
+measurement/syndrome/observable records at `chi=None`, reports finite-`chi`
+convergence and tensor-storage proxies, and replays the same compiled samples
+after inserting coherent crosstalk. Dense statevector fidelity is restricted
+to the small distance-2 smoke patch; larger runs remain tensor-network-only.
+
+
+> API details are maintained as handwritten Markdown in this page.

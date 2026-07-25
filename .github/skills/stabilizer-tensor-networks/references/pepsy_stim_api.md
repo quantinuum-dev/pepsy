@@ -193,9 +193,7 @@ src/pepsy/optimizers/stabilizer_tn/
   mps_stab_optimizer.py  # routing, rotations, measurement, injection, sampling, backends
   operators.py       # Pauli decomposition and full/windowed two-branch MPO builders
   paulis.py          # stim Pauli helpers (single_pauli, pauli_string, hermitian_pauli_terms)
-  PLAN.md            # implementation record and research roadmap
-tests/test_stabilizer_tn.py          # focused behavior and dense/stim validation
-tests/test_stabilizer_tn_stress.py   # random/deep/long-range/general-matrix validation
+  tests/test_stabilizer_tn.py          # focused behavior and dense/stim validation
 ```
 If you add public symbols, follow repo Public API Rules: update the owning subpackage
 `__all__`, top-level `src/pepsy/__init__.py`, `docs/api/`, and `tests/test_public_api.py`.

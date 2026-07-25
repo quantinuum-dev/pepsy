@@ -122,7 +122,5 @@ For a larger native Torch workflow, use the corresponding examples maintained
 in the separate `pepsy_examples` repository; the package API is demonstrated
 by the builder flow above.
 
-```{eval-rst}
-.. automodule:: pepsy.optimizers.mera
-   :members:
-```
+
+> API details are maintained as handwritten Markdown in this page.

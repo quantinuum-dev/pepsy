@@ -1,4 +1,4 @@
-"""Pepsy boundary-contraction library package."""
+"""Tensor-network simulation, contraction, optimization, and sampling."""
 
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
@@ -9,21 +9,23 @@ try:
 except PackageNotFoundError:
     __version__ = "0+unknown"
 
-_MODULE_EXPORTS = {
+# Canonical package namespaces. Keep advanced domains explicit so callers can
+# discover the stable core without scanning every lazy symbol below.
+_CORE_MODULES = (
     "backends",
     "boundary",
-    "bp",
-    "extensions",
     "fitting",
     "operators",
     "optimizers",
     "sampling",
     "solvers",
     "tensors",
-    "vmc",
-}
+)
+_ADVANCED_MODULES = ("bp", "extensions", "experimental", "vmc")
+_MODULE_EXPORTS = set(_CORE_MODULES) | set(_ADVANCED_MODULES)
 
 _SYMBOL_MODULES = {
+    # Boundary and backend helpers.
     "BdyMPS": ".boundary",
     "BoundaryContractResult": ".boundary",
     "CompBdy": ".boundary",
@@ -107,23 +109,31 @@ _SYMBOL_MODULES = {
     "NormEventRecord": ".optimizers",
     "StabilizerMpsSettingsAdvice": ".optimizers",
     "StabilizerMpsRunResult": ".optimizers",
+    "StabilizerTreeRunResult": ".optimizers",
     "StreamAnalysisRecord": ".optimizers",
     "CoalescedMeasurementRecord": ".optimizers",
+    "CoherentCrosstalkModel": ".optimizers",
     "CoalescedSampleResult": ".optimizers",
     "CoalescedTrajectoryLeaf": ".optimizers",
     "CoalescedTrajectoryResult": ".optimizers",
+    "ImportanceSamplingPolicy": ".optimizers",
     "LeakageRecord": ".optimizers",
     "NoisyShotResult": ".optimizers",
     "PauliErrorModel": ".optimizers",
     "PauliFault": ".optimizers",
     "StimCircuitPlan": ".optimizers",
+    "StimDetector": ".optimizers",
     "StimHerald": ".optimizers",
     "StimNoiseSample": ".optimizers",
+    "StimObservable": ".optimizers",
+    "StimObservableRecord": ".optimizers",
     "StimShotResult": ".optimizers",
+    "StimSyndromeRecord": ".optimizers",
     "TrajectoryChannel": ".optimizers",
     "TrajectoryEvent": ".optimizers",
     "TrajectoryOutcome": ".optimizers",
     "TrajectoryRecord": ".optimizers",
+    "TrajectoryMeasurementRecord": ".optimizers",
     "TrajectorySample": ".optimizers",
     "TrajectoryShotResult": ".optimizers",
     "STNState": ".optimizers",
@@ -143,7 +153,11 @@ _SYMBOL_MODULES = {
     "run_coalesced_stim_shots": ".optimizers",
     "run_coalesced_trajectory_shots": ".optimizers",
     "run_noisy_shots": ".optimizers",
+    "run_parallel_noisy_shots": ".optimizers",
+    "run_parallel_stim_shots": ".optimizers",
+    "run_parallel_trajectory_shots": ".optimizers",
     "run_stabilizer_mps_stream": ".optimizers",
+    "run_stabilizer_tree_stream": ".optimizers",
     "run_stim_shots": ".optimizers",
     "run_trajectory_shots": ".optimizers",
     "sample_noisy_gate_stream": ".optimizers",
@@ -249,6 +263,7 @@ __all__ = [
     "boundary",
     "bp",
     "extensions",
+    "experimental",
     "fitting",
     "operators",
     "optimizers",
@@ -337,23 +352,31 @@ __all__ = [
     "NormEventRecord",
     "StabilizerMpsSettingsAdvice",
     "StabilizerMpsRunResult",
+    "StabilizerTreeRunResult",
     "StreamAnalysisRecord",
     "CoalescedMeasurementRecord",
+    "CoherentCrosstalkModel",
     "CoalescedSampleResult",
     "CoalescedTrajectoryLeaf",
     "CoalescedTrajectoryResult",
+    "ImportanceSamplingPolicy",
     "LeakageRecord",
     "NoisyShotResult",
     "PauliErrorModel",
     "PauliFault",
     "StimCircuitPlan",
+    "StimDetector",
     "StimHerald",
     "StimNoiseSample",
+    "StimObservable",
+    "StimObservableRecord",
     "StimShotResult",
+    "StimSyndromeRecord",
     "TrajectoryChannel",
     "TrajectoryEvent",
     "TrajectoryOutcome",
     "TrajectoryRecord",
+    "TrajectoryMeasurementRecord",
     "TrajectorySample",
     "TrajectoryShotResult",
     "STNState",
@@ -373,7 +396,11 @@ __all__ = [
     "run_coalesced_stim_shots",
     "run_coalesced_trajectory_shots",
     "run_noisy_shots",
+    "run_parallel_noisy_shots",
+    "run_parallel_stim_shots",
+    "run_parallel_trajectory_shots",
     "run_stabilizer_mps_stream",
+    "run_stabilizer_tree_stream",
     "run_stim_shots",
     "run_trajectory_shots",
     "sample_noisy_gate_stream",
@@ -473,7 +500,7 @@ def __getattr__(name):
 
 if TYPE_CHECKING:
     from .bp import gauge_all, gauge_all_simple, one_norm_bp
-    from . import backends, boundary, bp, extensions, fitting, operators, optimizers, sampling, solvers, tensors, vmc
+    from . import backends, boundary, bp, extensions, experimental, fitting, operators, optimizers, sampling, solvers, tensors, vmc
     from .backends import (
         get_default_array_backend,
         get_default_grad_backend,
@@ -544,7 +571,7 @@ if TYPE_CHECKING:
         y,
         z,
     )
-    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeOptimizer, TreeStabOptimizer, run_stabilizer_mps_stream
+    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StabilizerTreeRunResult, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeOptimizer, TreeStabOptimizer, run_stabilizer_mps_stream, run_stabilizer_tree_stream
     from .sampling import FermionConfigurationEncoding, MpsDiagonalEstimate, MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler
     from .solvers import FDSolver
     from .tensors import (

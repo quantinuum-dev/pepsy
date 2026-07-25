@@ -1,4 +1,4 @@
-"""Belief-propagation contraction tools for pepsy (pepsy PLAN.md section 1).
+"""Belief-propagation contraction tools for pepsy (project plan section 1).
 
 This subpackage wraps quimb's belief propagation and exposes the BP
 contractions and corrections used by Pepsy:

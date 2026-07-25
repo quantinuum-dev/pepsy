@@ -12,7 +12,7 @@ _I = np.eye(2, dtype=complex)
 
 
 def _statevector(optimizer):
-    if isinstance(optimizer, pepsy.MpsStabOptimizer):
+    if isinstance(optimizer, (pepsy.MpsStabOptimizer, pepsy.TreeStabOptimizer)):
         return optimizer.to_statevector().reshape(-1)
     return optimizer.to_dense().reshape(-1)
 
@@ -321,6 +321,87 @@ def test_tree_state_dependent_kraus_branches_are_sampled_from_the_current_state(
         assert optimizer.norm() == pytest.approx(1.0, abs=1e-8)
 
 
+def test_tree_stab_state_dependent_kraus_branches_use_tree_normalization():
+    stream = [
+        (_X, 0),
+        pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.amplitude_damping(0.5), 0),
+    ]
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.TreeStabOptimizer(1), stream, shots=12, seed=6
+    )
+
+    labels = {records[0].label for records in result.records}
+    assert labels == {"jump", "no_jump"}
+    assert all(records[0].probability == pytest.approx(0.5) for records in result.records)
+    for optimizer, records in zip(result.optimizers, result.records):
+        expected = [1.0, 0.0] if records[0].label == "jump" else [0.0, 1.0]
+        np.testing.assert_allclose(_statevector(optimizer), expected, atol=1e-8)
+        assert optimizer.norm() == pytest.approx(1.0, abs=1e-8)
+
+
+def test_tree_stab_random_unitary_depolarizing_channel_replays_branches():
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.TreeStabOptimizer(1),
+        [pepsy.TrajectoryEvent(pepsy.TrajectoryChannel.depolarizing(1.0), 0)],
+        shots=16,
+        seed=4,
+    )
+
+    assert {records[0].label for records in result.records} == {"X", "Y", "Z"}
+    assert all(records[0].probability == pytest.approx(1.0 / 3.0) for records in result.records)
+    assert all(optimizer.norm() == pytest.approx(1.0) for optimizer in result.optimizers)
+
+
+def test_coalesced_tree_stab_measurement_and_terminal_sampling():
+    hadamard = np.array(
+        [[1.0, 1.0], [1.0, -1.0]], dtype=complex
+    ) / np.sqrt(2.0)
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.TreeStabOptimizer(1),
+        [(hadamard, 0), ("measure", "Z", 0)],
+        shots=32,
+        seed=9,
+    )
+
+    assert result.shots == 32
+    assert result.branches == 2
+    assert {leaf.measurements[0].outcome for leaf in result.leaves} == {-1, 1}
+    samples = result.sample_bits(seed=12, shuffle=False)
+    assert samples.shots == 32
+    assert samples.configs.shape == (32, 1)
+    assert set(samples.configs[:, 0]) <= {0, 1}
+
+
+def test_coalesced_feed_forward_replays_per_measurement_leaf():
+    hadamard = np.array(
+        [[1.0, 1.0], [1.0, -1.0]], dtype=complex
+    ) / np.sqrt(2.0)
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.TreeStabOptimizer(2),
+        [
+            (hadamard, 0),
+            ("measure", "Z", 0),
+            ("if", -1, 1, ("x", 1)),
+        ],
+        shots=32,
+        seed=13,
+    )
+
+    assert result.branches == 2
+    for leaf in result.leaves:
+        bit = int(leaf.optimizer.measurements[0].outcome < 0)
+        samples = leaf.optimizer.sample_bits(8, seed=4, shuffle=False)
+        assert np.all(samples[:, 0] == bit)
+        assert np.all(samples[:, 1] == bit)
+
+
+def test_tree_stab_terminal_sampling_does_not_require_dense_readout():
+    optimizer = pepsy.TreeStabOptimizer(2, max_dense_sample_qubits=1)
+    samples = optimizer.sample_bits(8, seed=3)
+    assert samples.shape == (8, 2)
+    assert set(samples.ravel()) <= {0, 1}
+
+
 def test_kraus_trajectory_starts_a_fresh_stn_norm_diagnostic_segment():
     stream = [
         ("rxx", 0.8, 0, 1),
@@ -439,6 +520,108 @@ def test_coalesced_tree_trajectory_branches_mid_circuit_measurements_by_count():
     )
 
 
+def test_importance_sampling_records_likelihood_ratios_and_estimates_rare_branch():
+    channel = pepsy.TrajectoryChannel.mixture(
+        (("I", 0.99, _I), ("X", 0.01, _X))
+    )
+    policy = pepsy.ImportanceSamplingPolicy({0: {"I": 0.5, "X": 0.5}})
+    result = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [pepsy.TrajectoryEvent(channel, 0)],
+        shots=2_000,
+        seed=19,
+        importance_sampling=policy,
+    )
+
+    assert {record[0].proposal_probability for record in result.records} == {0.5}
+    assert {record[0].likelihood_ratio for record in result.records} == {0.02, 1.98}
+    estimate = result.estimate(
+        [int(records[0].label == "X") for records in result.records]
+    )
+    assert estimate == pytest.approx(0.01, abs=0.003)
+    assert result.effective_sample_size < result.shots
+
+
+def test_coalesced_importance_sampling_weights_leaves_and_honors_branch_budget():
+    channel = pepsy.TrajectoryChannel.mixture(
+        (("I", 0.99, _I), ("X", 0.01, _X))
+    )
+    policy = pepsy.ImportanceSamplingPolicy({0: {"I": 0.5, "X": 0.5}})
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        [pepsy.TrajectoryEvent(channel, 0)],
+        shots=2_000,
+        seed=19,
+        importance_sampling=policy,
+        parallel_workers=2,
+    )
+
+    assert result.shots == 2_000
+    assert result.weights == pytest.approx((1.98, 0.02))
+    estimate = result.estimate(
+        [int(leaf.records[0].label == "X") for leaf in result.leaves]
+    )
+    assert estimate == pytest.approx(0.01, abs=0.003)
+    with pytest.raises(RuntimeError, match="per-event branch budget"):
+        pepsy.run_coalesced_trajectory_shots(
+            lambda: pepsy.MpsStabOptimizer(1, chi=4),
+            [pepsy.TrajectoryEvent(channel, 0)],
+            shots=10,
+            seed=19,
+            max_branch_factor=1,
+        )
+
+
+def test_parallel_independent_trajectory_seed_streams_are_worker_count_invariant():
+    channel = pepsy.TrajectoryChannel.mixture(
+        (("I", 0.8, _I), ("X", 0.2, _X))
+    )
+    stream = [pepsy.TrajectoryEvent(channel, 0)]
+    serial = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4), stream, shots=32, seed=23
+    )
+    parallel = pepsy.run_trajectory_shots(
+        lambda: pepsy.MpsStabOptimizer(1, chi=4),
+        stream,
+        shots=32,
+        seed=23,
+        parallel_workers=4,
+    )
+    assert parallel.weights == serial.weights
+    assert [records[0].label for records in parallel.records] == [
+        records[0].label for records in serial.records
+    ]
+
+
+def test_stim_importance_sampling_and_parallel_seed_streams():
+    stim = pytest.importorskip("stim")
+    circuit = stim.Circuit("X_ERROR(0.01) 0\nM 0")
+    policy = pepsy.ImportanceSamplingPolicy({0: {"I": 0.5, "X": 0.5}})
+
+    serial = pepsy.run_stim_shots(
+        lambda: pepsy.MpsStabOptimizer(1),
+        circuit,
+        shots=1_000,
+        seed=31,
+        importance_sampling=policy,
+    )
+    parallel = pepsy.run_stim_shots(
+        lambda: pepsy.MpsStabOptimizer(1),
+        circuit,
+        shots=1_000,
+        seed=31,
+        importance_sampling=policy,
+        parallel_workers=4,
+    )
+
+    assert serial.weights == parallel.weights
+    assert [sample.faults for sample in serial.samples] == [
+        sample.faults for sample in parallel.samples
+    ]
+    measured = [int(records[0].outcome < 0) for records in serial.measurements]
+    assert serial.estimate(measured) == pytest.approx(0.01, abs=0.003)
+
+
 def test_coalesced_kraus_ensemble_uses_one_copy_per_nonempty_outcome():
     """State-dependent channel probabilities are evaluated once per live node."""
     result = pepsy.run_coalesced_trajectory_shots(
@@ -496,3 +679,153 @@ def test_coalesced_terminal_sampling_uses_stn_tree_sampler_without_probs():
 
     assert samples.probs is None
     np.testing.assert_array_equal(samples.configs, np.zeros((10, 2), dtype=np.int8))
+
+
+@pytest.mark.parametrize("kind", ("mps_stn", "tree_stn"))
+def test_seeded_stn_trajectories_reproduce_structured_measurements(kind):
+    """The optimizer and channel RNG streams are both reproducible."""
+    optimizer_cls = (
+        pepsy.MpsStabOptimizer if kind == "mps_stn" else pepsy.TreeStabOptimizer
+    )
+    hadamard = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    stream = [(hadamard, 0), ("measure", "Z", 0)]
+
+    first = pepsy.run_trajectory_shots(
+        lambda: optimizer_cls(1), stream, shots=24, seed=31
+    )
+    second = pepsy.run_trajectory_shots(
+        lambda: optimizer_cls(1), stream, shots=24, seed=31
+    )
+
+    assert first.measurements == second.measurements
+    assert all(
+        record.event_index == 1
+        and record.pauli == "Z"
+        and record.where == (0,)
+        and record.outcome in {-1, 1}
+        for shot in first.measurements
+        for record in shot
+    )
+
+
+@pytest.mark.parametrize("optimizer_cls", (pepsy.MpsStabOptimizer, pepsy.TreeStabOptimizer))
+def test_tree_and_mps_stn_kraus_weights_do_not_need_optimizer_copies(optimizer_cls):
+    """Kraus probabilities use the exact local Gram path on both STNs."""
+    channel = pepsy.TrajectoryChannel.amplitude_damping(0.5)
+
+    def factory():
+        optimizer = optimizer_cls(1)
+
+        def forbidden_copy():
+            raise AssertionError("Kraus probability evaluation copied the optimizer")
+
+        optimizer.copy = forbidden_copy
+        return optimizer
+
+    result = pepsy.run_trajectory_shots(
+        factory,
+        [(_X, 0), pepsy.TrajectoryEvent(channel, 0)],
+        shots=16,
+        seed=17,
+    )
+    assert {records[0].label for records in result.records} == {"jump", "no_jump"}
+    assert all(records[0].probability == pytest.approx(0.5) for records in result.records)
+
+
+@pytest.mark.parametrize("optimizer_cls", (pepsy.MpsStabOptimizer, pepsy.TreeStabOptimizer))
+def test_coalesced_reset_is_trace_preserving_and_does_not_duplicate_leaves(optimizer_cls):
+    result = pepsy.run_coalesced_trajectory_shots(
+        lambda: optimizer_cls(1),
+        [("h", 0), ("reset", 0)],
+        shots=100,
+        seed=19,
+    )
+
+    assert result.branches == 1
+    assert result.counts == (100,)
+    assert result.leaves[0].measurements == ()
+    np.testing.assert_allclose(_statevector(result.leaves[0].optimizer), [1.0, 0.0])
+
+
+@pytest.mark.parametrize("optimizer_cls", (pepsy.MpsStabOptimizer, pepsy.TreeStabOptimizer))
+def test_immediate_and_deferred_magic_trajectories_match_direct_state(optimizer_cls):
+    """MAST-style projection and recycled immediate injection preserve the state."""
+    stream = [("h", 0), ("t", 0)]
+    direct = pepsy.run_trajectory_shots(
+        lambda: optimizer_cls(1), stream, shots=1, seed=23
+    ).optimizers[0]
+    direct_state = _statevector(direct)
+
+    for strategy in ("immediate", "deferred"):
+        result = pepsy.run_trajectory_shots(
+            lambda: optimizer_cls(2),
+            stream,
+            shots=1,
+            seed=23,
+            magic_strategy=strategy,
+            magic_ancillas=(1,),
+        )
+        state = _statevector(result.optimizers[0])
+        data_state = state[::2]
+        assert abs(np.vdot(direct_state, data_state)) == pytest.approx(1.0, abs=1e-7)
+        assert result.optimizers[0].measurements
+
+
+def test_stim_detector_and_observable_records_are_resolved_for_both_replay_modes():
+    """Stim rec annotations become structured syndrome records, including leaves."""
+    pytest.importorskip("stim")
+    circuit = """
+    H 0
+    M 0
+    DETECTOR(1, 2) rec[-1]
+    OBSERVABLE_INCLUDE(0) rec[-1]
+    """
+    for optimizer_cls in (pepsy.MpsStabOptimizer, pepsy.TreeStabOptimizer):
+        result = pepsy.run_stim_shots(
+            lambda optimizer_cls=optimizer_cls: optimizer_cls(1),
+            circuit,
+            shots=8,
+            seed=29,
+        )
+        assert len(result.syndromes) == 8
+        assert len(result.observables) == 8
+        assert {record.value for shot in result.syndromes for record in shot} == {False, True}
+        assert result.plan.detectors[0].coordinates == (1.0, 2.0)
+
+        coalesced = pepsy.run_coalesced_stim_shots(
+            lambda optimizer_cls=optimizer_cls: optimizer_cls(1),
+            circuit,
+            shots=8,
+            seed=29,
+        )
+        assert coalesced.plan is result.plan or coalesced.plan.detectors == result.plan.detectors
+        assert sum(coalesced.counts) == 8
+        assert len(coalesced.syndromes) == coalesced.branches
+
+
+def test_coherent_crosstalk_helper_is_seeded_and_uses_pepsy_rotation_convention():
+    model = pepsy.CoherentCrosstalkModel(0.125, sign_mode="random_sign")
+    stream = [("cnot", 0, 1), ("cnot", 1, 2)]
+    first = model.transform(stream, seed=37)
+    second = model.transform(stream, seed=37)
+
+    assert first == second
+    assert first[1][0] == "rzz"
+    assert first[1][1] in {-0.25, 0.25}
+    assert first[3][0] == "rzz"
+    assert first[3][1] in {-0.25, 0.25}
+
+
+@pytest.mark.parametrize("optimizer_cls", (pepsy.MpsStabOptimizer, pepsy.TreeStabOptimizer))
+def test_stn_truncation_convergence_reports_reference_and_observable(optimizer_cls):
+    rows = optimizer_cls.truncation_convergence(
+        2,
+        [("h", 0), ("cnot", 0, 1), ("t", 0)],
+        chi_values=(1, None),
+        observable=lambda optimizer: optimizer.expectation("Z", 0),
+    )
+
+    assert [row["chi"] for row in rows] == [1, None]
+    assert all(row["max_bond"] >= 1 for row in rows)
+    assert all(np.isfinite(row["norm"]) for row in rows)
+    assert all("norm_diagnostics" in row and "observable" in row for row in rows)

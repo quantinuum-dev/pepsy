@@ -287,8 +287,10 @@ class TreeOptimizer:
         of distinct qubits. Replayed eagerly on construction when given.
     n : int, optional
         Number of qubits.  Inferred from ``gates`` / ``tree`` when omitted.
-    chi : int
+    chi : int | None
         Maximum virtual bond dimension enforced during two-qubit threading.
+        ``None`` leaves the bond uncapped; the singular-value ``cutoff`` still
+        applies.
     cutoff : float
         Relative singular-value cutoff for truncations.
     mode : {"auto", "direct", "mpo"}
@@ -390,6 +392,18 @@ class TreeOptimizer:
         if mode not in {"auto", "direct", "mpo"}:
             raise ValueError("mode must be 'auto', 'direct', or 'mpo'.")
         return mode
+
+    @staticmethod
+    def _normalize_max_bond(max_bond):
+        """Validate an optional per-update bond cap."""
+        if max_bond is None:
+            return None
+        if isinstance(max_bond, bool):
+            raise TypeError("max_bond must be a positive integer or None.")
+        max_bond = int(max_bond)
+        if max_bond < 1:
+            raise ValueError("max_bond must be a positive integer or None.")
+        return max_bond
 
     def __init__(self, gates=None, n=None, *, chi=64, cutoff=1e-12,
                  mode="auto", two_site_mode=None,
@@ -502,9 +516,7 @@ class TreeOptimizer:
         self._logical_qubits = list(range(self.n))
         self._logical_positions = {q: q for q in self._logical_qubits}
 
-        self.chi = int(chi)
-        if self.chi < 1:
-            raise ValueError("chi must be a positive integer.")
+        self.chi = self._normalize_max_bond(chi)
         self.cutoff = float(cutoff)
         if self.cutoff < 0.0:
             raise ValueError("cutoff must be non-negative.")
@@ -2333,14 +2345,16 @@ class TreeOptimizer:
         self, u, v, *, max_bond=None, cutoff=None,
     ):
         """Compress one live tree edge and record its truncation diagnostics."""
-        max_bond = self.chi if max_bond is None else int(max_bond)
+        max_bond = (
+            self.chi if max_bond is None else self._normalize_max_bond(max_bond)
+        )
         cutoff = self.cutoff if cutoff is None else float(cutoff)
         bond_before = self.tn.bond(u, v)
         before_bond = int(self.tn.ind_size(bond_before))
         if (
             not self.track_truncation
             and cutoff == 0.0
-            and before_bond <= max_bond
+            and (max_bond is None or before_bond <= max_bond)
         ):
             # No singular value can be removed in this case. A lossless QR
             # still moves the centre across the edge, but avoids an SVD.
@@ -2498,10 +2512,14 @@ class TreeOptimizer:
                 "logical and compact sub-MPO supports must have equal length."
             )
         self._check_operator_limits(where, dense=False)
-        max_bond = self.chi if max_bond is None else int(max_bond)
+        max_bond = (
+            self.chi if max_bond is None else self._normalize_max_bond(max_bond)
+        )
         cutoff = self.cutoff if cutoff is None else float(cutoff)
-        if max_bond < 1 or cutoff < 0.0:
-            raise ValueError("max_bond must be positive and cutoff non-negative.")
+        if cutoff < 0.0:
+            raise ValueError(
+                "max_bond must be positive or None and cutoff non-negative."
+            )
         started = self._begin_update("submpo", where)
         try:
             with self._thread_ctx():
@@ -2688,9 +2706,9 @@ class TreeOptimizer:
             raise ValueError(
                 f"apply_subtree_operator needs distinct qubits; got {where}."
             )
-        max_bond = self.chi if max_bond is None else int(max_bond)
-        if max_bond < 1:
-            raise ValueError("max_bond must be a positive integer.")
+        max_bond = (
+            self.chi if max_bond is None else self._normalize_max_bond(max_bond)
+        )
         cutoff = self.cutoff if cutoff is None else float(cutoff)
         if cutoff < 0.0:
             raise ValueError("cutoff must be non-negative.")
@@ -3106,19 +3124,21 @@ class TreeOptimizer:
                     cutoff=self.cutoff, renormalize=renormalize,
                 )
             else:
-                leaves = [self.plan.leaf_of_qubit[q] for q in where]
-                snodes = self._steiner_nodes(leaves)
-                anchor = self._nearest_anchor(leaves)
-                if self.center != anchor:
-                    self._move_center(anchor)
-                order, hub = self._peel_order(snodes)
-                with self._thread_ctx():
-                    self._apply_product_pauli_projector_impl(
-                        axes, where, snodes, order, hub, outcome,
-                        max_bond=self.chi, cutoff=self.cutoff,
-                    )
-                    if renormalize:
-                        self.normalize()
+                # Build the projector as a two-branch Pauli sum. This keeps
+                # the sign of a forced parity branch explicit and routes the
+                # long sparse support through the native tree-MPO path. The
+                # older branch-copy implementation could collapse both
+                # outcomes into the same parity sector on a rooted tree.
+                self.apply_pauli_sum(
+                    [
+                        (0.5, {}),
+                        (0.5 * outcome, dict(zip(where, axes))),
+                    ],
+                    max_bond=self.chi,
+                    cutoff=self.cutoff,
+                )
+                if renormalize:
+                    self.normalize()
         except Exception:
             if started:
                 self._abort_update()
@@ -3437,7 +3457,9 @@ class TreeOptimizer:
             "edge_bonds": edge_bonds,
             "max_bond": int(max_bond),
             "chi": self.chi,
-            "requires_truncation": bool(max_bond > self.chi),
+            "requires_truncation": (
+                False if self.chi is None else bool(max_bond > self.chi)
+            ),
             "events": events,
         }
 

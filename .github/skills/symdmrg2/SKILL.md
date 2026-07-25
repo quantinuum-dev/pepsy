@@ -135,7 +135,7 @@ assert opt.backend == "symmray"
 - **Fermions**: the densify+kron trick does NOT apply (symmray handles fermionic
   swap phases during contraction). Build a **Jordan-Wigner** dense ED (Z-strings) and
   restrict to the fixed particle-number sector. See `_dense_jw_fermi_hubbard` /
-  `_dense_jw_spinless_ground_energy` in `tests/test_sym_dmrg.py`.
+  the retained fermionic regression in `tests/test_symmetric_tensors.py`.
 - **vs TeNPy** (py312 has TeNPy 1.1.0): `SpinChain` (Heisenberg, `conserve="Sz"`),
   `FermionChain` (spinless, `H=Σ -J(c†c+h.c.)+V n n − μ n`, `conserve="N"`),
   `hubbard`, `tf_ising`. Drive:
@@ -143,7 +143,7 @@ assert opt.backend == "symmray"
   `psi = MPS.from_lat_product_state(model.lat, [...])`.
 - Validated to ~1e-15: Heisenberg U1 (1D/2D vs ED, vs TeNPy), tfim Z2 (vs ED),
   spinless FH t-V U1 (vs ED **and** TeNPy). Regression tests live in
-  `tests/test_sym_dmrg.py` (`test_symdmrg2_*_matches_*_ed`) and assert genuine
+  `tests/test_symmetric_tensors.py` (`test_symdmrg_fermionic_state_accepts_raw_fermion_constructor_output`) and assert genuine
   symmetric usage (`opt.backend=="symmray"`, block-sparse multi-sector MPO/MPS).
 
 ## Assert it is genuinely symmetric (not a dense fallback)

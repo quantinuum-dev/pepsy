@@ -182,9 +182,5 @@ Hopping, pairing, and spin-flip
 operators are not diagonal and require a separate fermionic local-estimator
 calculation.
 
-```{eval-rst}
-.. automodule:: pepsy.sampling.samplers
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

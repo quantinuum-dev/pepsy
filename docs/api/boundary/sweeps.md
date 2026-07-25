@@ -1,8 +1,4 @@
 # `pepsy.boundary.sweeps`
 
-```{eval-rst}
-.. automodule:: pepsy.boundary.sweeps
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

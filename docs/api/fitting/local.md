@@ -1,8 +1,4 @@
 # `pepsy.fitting.local`
 
-```{eval-rst}
-.. automodule:: pepsy.fitting.local
-   :members:
-   :undoc-members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.

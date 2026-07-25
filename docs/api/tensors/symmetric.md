@@ -965,8 +965,5 @@ py.draw_symmray_mps(
 )
 ```
 
-```{eval-rst}
-.. automodule:: pepsy.tensors.symmetric
-   :members:
-   :show-inheritance:
-```
+
+> API details are maintained as handwritten Markdown in this page.
