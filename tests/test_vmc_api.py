@@ -288,6 +288,49 @@ def test_torch_driver_consumes_shared_sampling_and_optimization_configs():
     assert len(history) == 1
 
 
+def test_torch_vmc_modules_own_implementations_and_keep_core_aliases():
+    from pepsy.vmc.torch import _common, _core, _graded, amplitude, sr
+
+    sr_public = {
+        "TorchSRResult",
+        "apply_torch_sr_update",
+        "solve_torch_sr",
+        "torch_log_derivative_matrix",
+    }
+    graded_helpers = {
+        "_GradedTorchPair",
+        "_GradedTorchProjector",
+        "_graded_torch_compile_pair",
+        "_graded_torch_contraction_mask",
+        "_graded_torch_dense",
+        "_graded_torch_embed_dense",
+        "_graded_torch_index_map",
+        "_graded_torch_pad",
+        "_graded_torch_prepare_pair",
+        "_graded_torch_sign_mask",
+        "_graded_torch_unit_probe",
+        "_is_symmray_data",
+        "_find_symmray_tensors",
+    }
+
+    assert set(sr.__all__) >= sr_public
+    assert set(_graded.__all__) == graded_helpers
+    assert all(getattr(sr, name).__module__ == sr.__name__ for name in sr_public)
+    assert all(
+        getattr(_graded, name).__module__ == _graded.__name__
+        for name in graded_helpers
+    )
+
+    assert _core.TorchSRResult is sr.TorchSRResult
+    assert _core._spring_complement is sr._spring_complement
+    assert _core._GradedTorchProjector is _graded._GradedTorchProjector
+    assert _core._graded_torch_compile_pair is _graded._graded_torch_compile_pair
+    assert _core._as_long_matrix is _common._as_long_matrix
+    assert amplitude._as_long_matrix is _common._as_long_matrix
+    assert amplitude._validate_contraction is _common._validate_contraction
+    assert _core.count_spinful_particles is _common._count_spinful_particles
+
+
 def test_torch_compiler_lowers_common_matrix_terms():
     torch = pytest.importorskip("torch")
     from pepsy.vmc import torch_hamiltonian_connections

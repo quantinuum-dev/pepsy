@@ -4,6 +4,29 @@ Optional VMC integrations live under `pepsy.vmc`. The NetKet bridge can now
 wrap a packed PEPS as a Flax model for spin systems, while keeping the
 Fermi-Hubbard helper as a specialization.
 
+## Import boundaries
+
+Use `pepsy.vmc` for the stable backend-neutral API and the common Torch/NetKet
+builders. Use `pepsy.vmc.torch` for the lower-level native Torch workflow:
+
+- `pepsy.vmc.api`: shared terms, sampling/optimization settings, portable
+  state/measurement/result records, and the `VMC` façade.
+- `pepsy.vmc.netket`: NetKet builders, packed ansätze, and JAX/NetKet-specific
+  controls.
+- `pepsy.vmc.torch`: public Torch models, samplers, connection builders,
+  local-energy estimators, drivers, and SR helpers.
+- `pepsy.vmc.torch.sr`: the implementation module for log derivatives and
+  stochastic reconfiguration; import its public functions from
+  `pepsy.vmc` or `pepsy.vmc.torch` in application code.
+- `pepsy.vmc.torch._graded`: the private optional Symmray graded projector used
+  by `TorchPEPSAmplitude(graded_torch=True)`; it is not a public construction
+  API.
+
+The old flat `pepsy.vmc.torch` implementation module has been replaced by the
+responsibility-based package above. Compatibility imports remain in the
+private `_core` module, but new code should use the public package exports or
+the responsibility-specific leaf module when inspecting implementation code.
+
 ## Recommended public workflow
 
 Use the model-specific builders for NetKet-backed VMC:
@@ -686,6 +709,38 @@ This adaptive stopping path intentionally does not change the explicit
 chain-preserving `n_samples=...` sampler interface, whose sample count remains
 fixed and reproducible.
 
+### Measuring from an external sampler
+
+`TorchVMCDriver.measure_from_proposal(...)` accepts a sampled MPS batch, a
+`MpsSampler`, a PEPS-BP proposal, or a tree-sampler batch. Fermionic MPS
+occupations are reordered by their coordinate map and encoded using the PEPS
+metadata before the usual weighted `measure_samples(...)` path runs:
+
+```python
+from pepsy.sampling import MpsSampler
+
+mps_sampler = MpsSampler(
+    mps,
+    one_d_to_two_d=one_d_to_two_d,
+    fermion=fermion,
+    backend="auto",
+)
+estimate = vmc.measure_from_proposal(
+    mps_sampler,
+    n_samples=512,
+    seed=7,
+)
+print(estimate.energy_mean, estimate.effective_sample_size)
+```
+
+For a `TorchFermionVMC`, `measure_from_mps(...)` is the equivalent
+fermion-specific convenience method. A bare MPS requires both
+`one_d_to_two_d=` and `fermion=`; sampled batches carry their own mapping.
+Tree/qubit batches require an explicit `occupation_map=` so binary qubit
+columns are not silently interpreted as fermion physical codes. Nodes with
+zero or non-finite proposal probability or PEPS amplitude are removed before
+local-energy evaluation.
+
 `U1U1` uses moves that preserve `(N_up, N_down)`. For spinful `U1`, the
 default proposal also includes single-site spin flips, so only
 `N_up + N_down` is fixed. Spinful `Z2` adds empty/double pair toggles, so it
@@ -1036,12 +1091,5 @@ callback = pvmc.make_netket_autochunk_callback(
 driver.run(n_iter=100, out="vmc_run", callback=callback)
 ```
 
-```{eval-rst}
-.. automodule:: pepsy.vmc.netket
-   :members:
-   :undoc-members:
 
-.. automodule:: pepsy.vmc.torch
-   :members:
-   :undoc-members:
-```
+> API details are maintained as handwritten Markdown in this page.
