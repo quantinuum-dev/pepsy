@@ -22,11 +22,11 @@ from scipy.sparse.linalg import LinearOperator
 from .energy import MpsEnergyOptimizer
 
 
-# The block-sector effective-Hamiltonian prototype only materializes an
-# operator when its complete dense block map is small. Larger windows retain
-# the streamed contraction path; this is a correctness-first cache, not an
-# unbounded dense-local solver.
-_SECTOR_OPERATOR_MAX_BYTES = 32 * 1024**2
+# A composed dense sector operator changes the contraction's summation order
+# and costs more to prepare than it saves for the bounded local Krylov solves
+# used by SymDMRG2. Keep the experimental path disabled by default, with a
+# module-level limit so focused experiments can explicitly re-enable it.
+_SECTOR_OPERATOR_MAX_BYTES = 0
 # A fanout plan retains a stacked copy of static left maps. Keep the extra
 # plan-only storage bounded; the original per-output maps remain available for
 # sector-operator diagnostics and for clear plan rebuilding semantics.
@@ -1956,6 +1956,9 @@ class _LocalProjectedProblem:
         if self.sector_operator_build_attempted:
             return
         self.sector_operator_build_attempted = True
+        if _SECTOR_OPERATOR_MAX_BYTES <= 0:
+            self.sector_operator_disabled_reason = "disabled"
+            return
         layout = self._sector_operator_layout()
         if layout is None:
             if self.sector_operator_disabled_reason is None:

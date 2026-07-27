@@ -101,14 +101,12 @@ groups, output coverage, static bytes, predicted output-product savings, and
 actual fanout GEMM calls; timing totals use
 `*_compiled_block_fanout_pack_elapsed` and
 `*_compiled_block_fanout_matmul_elapsed`.
-For small, right-first, bosonic projected problems, Pepsy also considers a
-private dense block-sector effective-Hamiltonian cache. It is capped at 32 MiB
-and is retained only after its first result agrees with the streamed
-contractions at `1e-12`; left-first, fermionic, oversized, and failed
-validation cases continue to use the compiled streaming plans. The diagnostic
-record exposes the cache state, size, block count, reuse count, validation
-error, and any disabled reason. This is a bounded experimental optimization
-rather than a replacement local solver.
+The private dense block-sector effective-Hamiltonian cache is disabled by
+default. Its composed matmuls change summation order and did not amortize their
+setup cost within bounded local Krylov solves. The experimental path remains
+available to focused benchmarks and still requires first-result agreement with
+the streamed contractions at `1e-12`; its diagnostic record exposes the cache
+state, size, block count, reuse count, validation error, and disabled reason.
 `matvec_layout="fused"` is available as an opt-in prototype for the
 block-native path. It attempts to fuse multiple shared contraction legs inside
 each cached projected problem, using Symmray's fused-index support when the

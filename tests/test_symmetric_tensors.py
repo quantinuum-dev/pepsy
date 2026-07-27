@@ -5,6 +5,7 @@ import pytest
 import quimb.tensor as qtn
 
 import pepsy
+from pepsy.optimizers import sym_dmrg as sym_dmrg_mod
 from pepsy.operators import gate, gate_simple
 from pepsy.optimizers.sym_dmrg import (
     _BlockPairContraction,
@@ -407,8 +408,9 @@ def _randomized_block_tensor(tensor, seed):
     return _tensor_with_data(tensor, data)
 
 
-def test_symdmrg_compiled_fanout_plan_matches_blockwise_fh_matvec():
+def test_symdmrg_compiled_fanout_plan_matches_blockwise_fh_matvec(monkeypatch):
     """The bosonized FH path reuses one right matrix through fanout GEMM."""
+    monkeypatch.setattr(sym_dmrg_mod, "_SECTOR_OPERATOR_MAX_BYTES", 32 * 1024**2)
     mapper = OneDMap(3, 2, mode="snake")
     edges = tuple(qtn.edges_2d_square(3, 2, cyclic=True))
     mpo = SymHamiltonian.from_edges(
@@ -534,6 +536,43 @@ def test_symdmrg_compiled_fanout_plan_matches_blockwise_fh_matvec():
         np.testing.assert_allclose(
             operator_cached.data.blocks[sector], expected, atol=1e-12, rtol=1e-12
         )
+
+
+def test_symdmrg_sector_operator_default_bypasses_layout_build(monkeypatch):
+    """The default streamed matvec does not pay experimental cache setup."""
+    mapper = OneDMap(3, 2, mode="snake")
+    edges = tuple(qtn.edges_2d_square(3, 2, cyclic=True))
+    mpo = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", edges, t=1.0, U=8.0
+    ).to_mpo(mapper=mapper, compress=True, cutoff=1e-12)
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        6,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)] * 3),
+        seed=3,
+        dtype="complex128",
+    )
+    optimizer = pepsy.SymDMRG2(
+        mpo,
+        state,
+        bond_dims=[4],
+        cutoffs=[1e-10],
+        compute_initial_energy=False,
+    )
+    theta = optimizer.two_site_theta(0)
+    problem, _ = optimizer._get_projected_problem(0, theta)
+    monkeypatch.setattr(
+        problem,
+        "_sector_operator_layout",
+        lambda: pytest.fail("default matvec must not inspect the sector cache layout"),
+    )
+
+    result = problem.apply(_randomized_block_tensor(theta, 31))
+
+    assert result.data.blocks
+    assert problem.sector_operator is None
+    assert problem.sector_operator_disabled_reason == "disabled"
 
 
 def test_native_fermionic_compiled_plan_preserves_phases_and_dummy_modes():
