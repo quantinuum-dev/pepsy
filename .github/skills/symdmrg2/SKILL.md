@@ -166,3 +166,48 @@ type name starts with the symmetry (`U1…`/`Z2…`) **and carry >1 charge block
 (`run_pepsy_symdmrg2.py`, `run_tenpy_reference.py`), `tools/` (`scan_chi.py`,
 `run_6x6_paper_compare.py`, `guard.py`). Fair defaults there: product-ramp init +
 `density_matrix` mixer; random-rich is an explicit opt-in stress control.
+
+## Hot matvec implementation and safe extension rules
+- Native Fermi-Hubbard input MPS tensors are `U1U1FermionicArray`, but the
+  SymDMRG2 local state, two-site `theta`, active MPO operands, and projected
+  contractions are intentionally bosonized `U1U1Array` tensors. Therefore the
+  NumPy compiled block plan is active for the benchmark-critical Fermi-Hubbard
+  matvec path; do not diagnose it as globally disabled merely from the input
+  state type.
+- Each projected window caches two `_BlockPairContraction` objects. On the
+  first compatible application, an unfused NumPy plan lowers static left blocks
+  to dense matrices, reuses the sector routing, and batches output blocks with
+  equal `(M, K, N, input dtype, output dtype)`. Identical dynamic-right source
+  schedules share an unpacked broadcast batch; different schedules use a
+  reusable packed right batch only for groups of four or more. Smaller groups
+  retain a single dense matmul. Inspect `matvec_diagnostics` fields prefixed
+  `*_compiled_block_plan_*` and the elapsed fields prefixed
+  `*_compiled_block_*` before altering this routing.
+- A private bounded block-sector effective-Hamiltonian cache is experimental.
+  It is considered only for NumPy-backed, bosonic, right-first windows with a
+  complete map estimated below 32 MiB. Its first result must match the streamed
+  contraction at `1e-12`; a failed validation, a left-first window, fermionic
+  compiled plan, or memory cap is an expected fallback, not an error. Check
+  `matvec_sector_operator_*` diagnostics, especially `cached`, `uses`, and
+  `disabled_reason`. It is not the current 6x6 performance delivery.
+- Preserve the direct Symmray `tensordot(mode="blockwise")` fallback for mixed,
+  fused, outer-product, non-NumPy, or metadata-mismatched fermionic operands.
+  Native fermionic compiled plans must retain Symmray phase/dummy-mode metadata
+  exactly and rebuild on signature mismatch.
+
+### Matvec change validation
+1. Build the actual 3x2 periodic Fermi-Hubbard model using the benchmark
+   construction. Assert the input state is fermionic while `opt.state`, theta,
+   and projected operands are bosonic; compare seeded random theta blocks to a
+   newly constructed direct blockwise contraction at `atol=rtol=1e-12`.
+2. Exercise both sector-cache outcomes: a validation-rejected window must
+   remain streamed and agree with the direct result; a validated small window
+   must reuse the cache and retain the same blocks at `1e-12`.
+3. Retain the native-fermion dummy-mode/lazy-phase regression, then run
+   `pytest -q -o addopts='' tests/test_symmetric_tensors.py tests/test_optimize_mps.py`.
+   Set `NUMBA_CACHE_DIR=/tmp/pepsy-numba-cache` in the shared py312 environment
+   when import-time Numba caching lacks a writable package locator.
+4. For a performance claim, use the same warmed 6x6 PBC chi=64 benchmark
+   runner/options for A/B runs. Require solver-tolerance energy agreement and
+   report compiled matmul-call counts and elapsed time; do not infer a speedup
+   from a cold run or a cache that validates on only a small boundary window.
