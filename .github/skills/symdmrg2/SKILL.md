@@ -1,6 +1,6 @@
 ---
 name: symdmrg2
-description: 'Run, debug, tune, extend, or validate SymDMRG2 — pepsy''s symmetric (symmray block-sparse) two-site DMRG ground-state solver for MPS. Use when the user asks to find a ground state / run DMRG with a conserved symmetry (U1, U1U1, Z2) in pepsy; build a symmetric MPO via SymHamiltonian.to_mpo; pick or debug the initial state (product ramp vs random), bond-dimension schedule/ramp, or the mixer (density_matrix vs subspace); compare pepsy DMRG against TeNPy or exact diagonalization; run Fermi-Hubbard (U1U1), spinless Fermi-Hubbard / t-V (U1), Heisenberg (U1), or transverse-field Ising (Z2); diagnose non-monotonic energy vs chi, a stuck/locked DMRG, or a plateau above the reference; or add a new symmetric model. Also use for questions about SymDMRG2 conventions, snake 2D-to-1D mapping, fermionic MPO Jordan-Wigner signs, or adding a new symmetric model.'
+description: "Run, debug, tune, extend, or validate Pepsy SymDMRG2, the symmetric block-sparse two-site DMRG ground-state solver for MPS. Use for conserved-symmetry DMRG with U1, U1U1, or Z2; symmetric MPO construction; initial-state selection; bond-dimension schedules; mixers; comparisons against exact diagonalization or TeNPy; Fermi-Hubbard, spinless t-V, Heisenberg, and transverse-field Ising models; non-monotonic energy, stuck convergence, or plateau diagnosis; SymDMRG2 conventions; two-dimensional snake mappings; fermionic Jordan-Wigner signs; and new symmetric models."
 ---
 
 # SymDMRG2 (symmetric block-sparse DMRG) in pepsy
