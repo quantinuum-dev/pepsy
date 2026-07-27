@@ -27,6 +27,10 @@ from .energy import MpsEnergyOptimizer
 # the streamed contraction path; this is a correctness-first cache, not an
 # unbounded dense-local solver.
 _SECTOR_OPERATOR_MAX_BYTES = 32 * 1024**2
+# A fanout plan retains a stacked copy of static left maps. Keep the extra
+# plan-only storage bounded; the original per-output maps remain available for
+# sector-operator diagnostics and for clear plan rebuilding semantics.
+_FANOUT_MAX_STATIC_BYTES = 32 * 1024**2
 
 
 def _is_symmray_array(value):
@@ -807,6 +811,7 @@ class _BlockPairContraction:
         self.left_output_axes = tuple(range(len(self.left_inds)))
         self.right_output_axes = tuple(range(len(self.right_inds)))
         self.compiled_block_plan = None
+        self.compiled_block_plan_fanouts = ()
         self.compiled_block_plan_batches = ()
         self.compiled_block_plan_singles = ()
         self.compiled_right_layout = None
@@ -818,6 +823,15 @@ class _BlockPairContraction:
         self.compiled_block_plan_uses = 0
         self.compiled_block_plan_terms = 0
         self.compiled_block_plan_output_blocks = 0
+        self.compiled_block_plan_fanout_eligible_groups = 0
+        self.compiled_block_plan_fanout_eligible_output_blocks = 0
+        self.compiled_block_plan_fanout_eligible_static_bytes = 0
+        self.compiled_block_plan_fanout_groups = 0
+        self.compiled_block_plan_fanout_output_blocks = 0
+        self.compiled_block_plan_fanout_max_size = 0
+        self.compiled_block_plan_fanout_static_bytes = 0
+        self.compiled_block_plan_fanout_predicted_matmul_savings = 0
+        self.compiled_block_plan_fanout_matmul_calls = 0
         self.compiled_block_plan_batch_groups = 0
         self.compiled_block_plan_batched_output_blocks = 0
         self.compiled_block_plan_max_batch_size = 0
@@ -1005,6 +1019,7 @@ class _BlockPairContraction:
         # Clear it before attempting a replacement so a failed compilation
         # cannot leave a stale plan eligible for the next matvec.
         self.compiled_block_plan = None
+        self.compiled_block_plan_fanouts = ()
         self.compiled_block_plan_batches = ()
         self.compiled_block_plan_singles = ()
         self.compiled_right_layout = None
@@ -1140,8 +1155,81 @@ class _BlockPairContraction:
                 )
             )
 
+        # A fanout group shares one dynamically assembled right matrix across
+        # static left maps of potentially different row counts. This is unlike
+        # the batch route below: a stacked 2D GEMM gives BLAS one ordinary
+        # matrix product rather than asking batched matmul to dispatch each
+        # small output independently. Native fermions, fused layouts, and
+        # outer products deliberately retain their existing paths.
+        fanout_candidates = {}
+        if self.shared and not fermionic and self.layout == "unfused":
+            for index, (sector, _, left_matrix, right_specs) in enumerate(
+                compiled_plan
+            ):
+                right_dtype = np.result_type(
+                    *(
+                        _block_dtype(right.data.blocks[right_sector])
+                        for right_sector, _, _, _ in right_specs
+                    )
+                )
+                template_dtype = _block_dtype(output.data.blocks[sector])
+                # ``right_specs`` contains the exact source schedule,
+                # including its offsets and reduced N. Deliberately omit M:
+                # it is represented by each group's row slices instead.
+                key = (
+                    right_specs,
+                    left_matrix.shape[1],
+                    left_matrix.dtype.str,
+                    right_dtype.str,
+                    template_dtype.str,
+                )
+                fanout_candidates.setdefault(key, []).append(index)
+
+        eligible_fanouts = tuple(
+            tuple(indices)
+            for indices in fanout_candidates.values()
+            if len(indices) > 1
+        )
+        self.compiled_block_plan_fanout_eligible_groups = len(eligible_fanouts)
+        self.compiled_block_plan_fanout_eligible_output_blocks = sum(
+            len(indices) for indices in eligible_fanouts
+        )
+        self.compiled_block_plan_fanout_eligible_static_bytes = sum(
+            sum(compiled_plan[index][2].nbytes for index in indices)
+            for indices in eligible_fanouts
+        )
+
+        fanouts = []
+        fanout_claimed = set()
+        fanout_static_bytes = 0
+        for indices in eligible_fanouts:
+            static_bytes = sum(compiled_plan[index][2].nbytes for index in indices)
+            if fanout_static_bytes + static_bytes > _FANOUT_MAX_STATIC_BYTES:
+                continue
+            row_start = 0
+            row_slices = []
+            for index in indices:
+                rows = compiled_plan[index][2].shape[0]
+                row_slices.append((row_start, row_start + rows))
+                row_start += rows
+            fanouts.append(
+                (
+                    indices,
+                    np.concatenate(
+                        tuple(compiled_plan[index][2] for index in indices),
+                        axis=0,
+                    ),
+                    tuple(row_slices),
+                    compiled_plan[indices[0]][3],
+                )
+            )
+            fanout_claimed.update(indices)
+            fanout_static_bytes += static_bytes
+
         group_members = {}
         for index, (sector, _, left_matrix, right_specs) in enumerate(compiled_plan):
+            if index in fanout_claimed:
+                continue
             right_dtype = np.result_type(
                 *(
                     _block_dtype(right.data.blocks[right_sector])
@@ -1219,6 +1307,7 @@ class _BlockPairContraction:
         self.compiled_output_template = output.data
         self.compiled_right_layout = _block_data_layout_map(right.data)
         self.compiled_block_plan = tuple(compiled_plan)
+        self.compiled_block_plan_fanouts = tuple(fanouts)
         self.compiled_block_plan_batches = tuple(batches)
         self.compiled_block_plan_singles = tuple(singles)
         self.compiled_block_plan_fermionic = fermionic
@@ -1233,6 +1322,23 @@ class _BlockPairContraction:
         self.compiled_block_plan_builds += 1
         self.compiled_block_plan_terms = int(num_terms)
         self.compiled_block_plan_output_blocks = len(self.compiled_block_plan)
+        self.compiled_block_plan_fanout_groups = len(self.compiled_block_plan_fanouts)
+        self.compiled_block_plan_fanout_output_blocks = sum(
+            len(indices)
+            for indices, _, _, _ in self.compiled_block_plan_fanouts
+        )
+        self.compiled_block_plan_fanout_max_size = max(
+            (
+                len(indices)
+                for indices, _, _, _ in self.compiled_block_plan_fanouts
+            ),
+            default=0,
+        )
+        self.compiled_block_plan_fanout_static_bytes = fanout_static_bytes
+        self.compiled_block_plan_fanout_predicted_matmul_savings = sum(
+            len(indices) - 1
+            for indices, _, _, _ in self.compiled_block_plan_fanouts
+        )
         self.compiled_block_plan_batch_groups = len(self.compiled_block_plan_batches)
         self.compiled_block_plan_batched_output_blocks = sum(
             len(indices) for indices, _, _, _, _ in self.compiled_block_plan_batches
@@ -1245,9 +1351,13 @@ class _BlockPairContraction:
             default=0,
         )
         self.compiled_block_plan_mode = (
-            "output_block_batched_matmul"
-            if self.compiled_block_plan_batches
-            else "output_block_matmul"
+            "output_block_fanout_gemm"
+            if self.compiled_block_plan_fanouts
+            else (
+                "output_block_batched_matmul"
+                if self.compiled_block_plan_batches
+                else "output_block_matmul"
+            )
         )
         self.compiled_block_plan_disabled_reason = None
 
@@ -1275,6 +1385,54 @@ class _BlockPairContraction:
                 ).reshape(shared_size, right_output_size)
                 right_matrix_cache[cache_key] = right_matrix
             return right_matrix
+
+        for (
+            indices,
+            left_stack,
+            row_slices,
+            right_specs,
+        ) in self.compiled_block_plan_fanouts:
+            fanout_start = time.perf_counter() if timings is not None else None
+            right_matrices = tuple(
+                get_right_matrix(
+                    right_sector,
+                    term_shared_size,
+                    term_output_size,
+                )
+                for (
+                    right_sector,
+                    _,
+                    term_shared_size,
+                    term_output_size,
+                ) in right_specs
+            )
+            right_matrix = (
+                right_matrices[0]
+                if len(right_matrices) == 1
+                else np.concatenate(right_matrices, axis=0)
+            )
+            _add_elapsed(
+                timings,
+                f"{prefix}_compiled_block_fanout_pack_elapsed",
+                fanout_start,
+            )
+            matmul_start = time.perf_counter() if timings is not None else None
+            out_stack = left_stack @ right_matrix
+            _add_elapsed(
+                timings,
+                f"{prefix}_compiled_block_fanout_matmul_elapsed",
+                matmul_start,
+            )
+            for plan_index, (row_start, row_stop) in zip(indices, row_slices):
+                output_sector, output_shape, _, _ = self.compiled_block_plan[
+                    plan_index
+                ]
+                out = out_stack[row_start:row_stop]
+                template_dtype = _block_dtype(template_blocks[output_sector])
+                if out.dtype != template_dtype:
+                    out = np.asarray(out, dtype=template_dtype)
+                blocks[output_sector] = out.reshape(output_shape)
+            self.compiled_block_plan_fanout_matmul_calls += 1
 
         for (
             indices,
@@ -1498,6 +1656,33 @@ class _BlockPairContraction:
             ),
             f"{prefix}_compiled_block_plan_output_blocks": int(
                 self.compiled_block_plan_output_blocks
+            ),
+            f"{prefix}_compiled_block_plan_fanout_eligible_groups": int(
+                self.compiled_block_plan_fanout_eligible_groups
+            ),
+            f"{prefix}_compiled_block_plan_fanout_eligible_output_blocks": int(
+                self.compiled_block_plan_fanout_eligible_output_blocks
+            ),
+            f"{prefix}_compiled_block_plan_fanout_eligible_static_bytes": int(
+                self.compiled_block_plan_fanout_eligible_static_bytes
+            ),
+            f"{prefix}_compiled_block_plan_fanout_groups": int(
+                self.compiled_block_plan_fanout_groups
+            ),
+            f"{prefix}_compiled_block_plan_fanout_output_blocks": int(
+                self.compiled_block_plan_fanout_output_blocks
+            ),
+            f"{prefix}_compiled_block_plan_fanout_max_size": int(
+                self.compiled_block_plan_fanout_max_size
+            ),
+            f"{prefix}_compiled_block_plan_fanout_static_bytes": int(
+                self.compiled_block_plan_fanout_static_bytes
+            ),
+            f"{prefix}_compiled_block_plan_fanout_predicted_matmul_savings": int(
+                self.compiled_block_plan_fanout_predicted_matmul_savings
+            ),
+            f"{prefix}_compiled_block_plan_fanout_matmul_calls": int(
+                self.compiled_block_plan_fanout_matmul_calls
             ),
             f"{prefix}_compiled_block_plan_batch_groups": int(
                 self.compiled_block_plan_batch_groups

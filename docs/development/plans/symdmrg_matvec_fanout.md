@@ -2,8 +2,11 @@
 
 ## Status
 
-Planned. This is the next SymDMRG2 performance experiment after compiled
-same-shape batching and the bounded sector-operator prototype.
+Implemented and retained after a warmed 6x6 PBC chi=64 hot-loop A/B. The
+compiled path now builds bounded source-fanout groups for eligible bosonic,
+unfused NumPy plans and reports the census, static storage, predicted savings,
+and actual GEMM-call diagnostics. Native-fermionic, fused, outer-product, and
+metadata-mismatch paths retain their existing fallbacks.
 
 ## Evidence and decision
 
@@ -118,6 +121,32 @@ do not introduce an unmeasured duplicate-matrix footprint.
    - Keep and commit the change only if the warm A/B demonstrates a real gain.
      Otherwise retain the current batching and move the next investigation to
      the dominant SVD or local-solver phase.
+
+### 2026-07-27 result
+
+On the actual 6x6 PBC U/t=8 construction, a fixed `chi=64` block-fill state
+at the central projected window was warmed once and then evaluated 100 times
+with single-threaded BLAS. The paired compiled right/left contractions fell
+from 2.2492 s (pre-change) to 2.0618 s (fanout), an 8.3% reduction; total
+measured application time fell from 2.3156 s to 2.1279 s. The active right
+contraction formed 1,481 fanout groups covering 3,841 output blocks, with
+1,271,840 bytes of added static maps and 2,360 predicted output-product
+savings per application.
+
+A matching one-sweep `chi=64` solver control retained its energy to
+`4.9e-13` and used the same 280 Lanczos matvecs. Its end-to-end wall time was
+not used as a throughput claim because it includes cold projected-plan setup
+and shared-host noise.
+
+The required full control used the same 6x6 PBC product ramp, density-matrix
+mixer, `variational_sector_basis="off"`, seed, and single-threaded BLAS for 30
+sweeps. It produced indistinguishable energy (`-16.547808951298467` before,
+`-16.547808951298432` after) and the same 7,533 Lanczos matvecs. Aggregated
+compiled left/right contraction time fell from 43.3675 s to 41.4009 s (4.5%).
+End-to-end wall time was effectively tied (198.6 s before, 199.3 s after), so
+this is a retained hot-loop optimization rather than a claim of full-solver
+speedup. Additional scale runs should report the fanout timing fields
+separately from plan-build and total wall time.
 
 ## Test commands
 

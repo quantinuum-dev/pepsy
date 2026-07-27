@@ -407,8 +407,8 @@ def _randomized_block_tensor(tensor, seed):
     return _tensor_with_data(tensor, data)
 
 
-def test_symdmrg_compiled_batched_plan_matches_blockwise_fh_matvec():
-    """The actual FH DMRG path is bosonic and batches repeated output shapes."""
+def test_symdmrg_compiled_fanout_plan_matches_blockwise_fh_matvec():
+    """The bosonized FH path reuses one right matrix through fanout GEMM."""
     mapper = OneDMap(3, 2, mode="snake")
     edges = tuple(qtn.edges_2d_square(3, 2, cyclic=True))
     mpo = SymHamiltonian.from_edges(
@@ -456,12 +456,31 @@ def test_symdmrg_compiled_batched_plan_matches_blockwise_fh_matvec():
     got = contraction.apply(random_theta)
 
     assert contraction.compiled_block_plan_uses == 1
-    assert contraction.compiled_block_plan_batch_groups > 0
-    assert contraction.compiled_block_plan_batched_output_blocks > 1
-    assert contraction.compiled_block_plan_batched_matmul_calls > 0
+    assert contraction.compiled_block_plan_fanout_eligible_groups > 0
+    assert contraction.compiled_block_plan_fanout_groups > 0
+    assert contraction.compiled_block_plan_fanout_output_blocks > 1
+    assert contraction.compiled_block_plan_fanout_static_bytes > 0
+    assert contraction.compiled_block_plan_fanout_predicted_matmul_savings > 0
+    assert contraction.compiled_block_plan_fanout_matmul_calls > 0
+    assert any(
+        len({row_stop - row_start for row_start, row_stop in row_slices}) > 1
+        for _, _, row_slices, _ in contraction.compiled_block_plan_fanouts
+    )
     for sector, expected in reference.data.blocks.items():
         np.testing.assert_allclose(
             got.data.blocks[sector], expected, atol=1e-12, rtol=1e-12
+        )
+
+    # A compatible layout must reuse the same compiled fanout plan.
+    fanout_calls_before = contraction.compiled_block_plan_fanout_matmul_calls
+    repeated = contraction.apply(random_theta)
+    assert contraction.compiled_block_plan_uses == 2
+    assert contraction.compiled_block_plan_fanout_matmul_calls == (
+        fanout_calls_before + contraction.compiled_block_plan_fanout_groups
+    )
+    for sector, expected in got.data.blocks.items():
+        np.testing.assert_allclose(
+            repeated.data.blocks[sector], expected, atol=1e-12, rtol=1e-12
         )
 
     # This window's equivalent composed map changes the accumulation order by
@@ -536,6 +555,7 @@ def test_native_fermionic_compiled_plan_preserves_phases_and_dummy_modes():
     contraction = _BlockPairContraction(None, left, right.inds)
     contraction.apply(right)  # Direct reference call that compiles the plan.
     assert contraction.compiled_block_plan_fermionic
+    assert contraction.compiled_block_plan_fanout_groups == 0
 
     random_right = _randomized_block_tensor(right, 17)
     reference = _BlockPairContraction(None, left, right.inds).apply(random_right)
