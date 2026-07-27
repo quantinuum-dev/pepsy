@@ -89,6 +89,14 @@ non-NumPy fermionic contractions retain Symmray's exact `tensordot` path.
 `profile_summary()` aggregates the new batch timing phases, while sampled
 matvec diagnostics report the batch-plan shape and call counters so scale runs
 can confirm the hot matvec path is reusing this setup work.
+For small, right-first, bosonic projected problems, Pepsy also considers a
+private dense block-sector effective-Hamiltonian cache. It is capped at 32 MiB
+and is retained only after its first result agrees with the streamed
+contractions at `1e-12`; left-first, fermionic, oversized, and failed
+validation cases continue to use the compiled streaming plans. The diagnostic
+record exposes the cache state, size, block count, reuse count, validation
+error, and any disabled reason. This is a bounded experimental optimization
+rather than a replacement local solver.
 `matvec_layout="fused"` is available as an opt-in prototype for the
 block-native path. It attempts to fuse multiple shared contraction legs inside
 each cached projected problem, using Symmray's fused-index support when the

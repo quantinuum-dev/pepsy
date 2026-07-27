@@ -464,6 +464,58 @@ def test_symdmrg_compiled_batched_plan_matches_blockwise_fh_matvec():
             got.data.blocks[sector], expected, atol=1e-12, rtol=1e-12
         )
 
+    # This window's equivalent composed map changes the accumulation order by
+    # slightly more than the strict validation tolerance, so it must retain
+    # the streamed plan. This is the guard against numerical regressions.
+    randomized_theta = _randomized_block_tensor(theta, 29)
+    fallback = problem.apply(randomized_theta)
+    assert problem.sector_operator is None
+    assert problem.sector_operator_disabled_reason == "validation_mismatch"
+    fallback_input = qtn.Tensor(
+        data=_array_with_blocks_like(
+            problem.theta_input_data_template,
+            randomized_theta.data.blocks,
+        ),
+        inds=problem.theta_input_inds,
+        tags=randomized_theta.tags,
+    )
+    direct_right = _BlockPairContraction(
+        optimizer,
+        problem.right_contraction.left,
+        problem.right_contraction.right_inds,
+    ).apply(fallback_input)
+    direct_out = _BlockPairContraction(
+        optimizer,
+        problem.left_contraction.left,
+        problem.left_contraction.right_inds,
+    ).apply(direct_right)
+    if tuple(direct_out.inds) != tuple(randomized_theta.inds):
+        direct_out = direct_out.transpose(*randomized_theta.inds)
+    for sector, got_block in fallback.data.blocks.items():
+        expected = direct_out.data.blocks.get(
+            sector,
+            np.zeros_like(got_block),
+        )
+        np.testing.assert_allclose(
+            got_block, expected, atol=1e-12, rtol=1e-12
+        )
+
+    # A smaller right-first FH window validates the same bounded sector map,
+    # then later applications take the cached dense sector operator.
+    cached_theta = optimizer.two_site_theta(0)
+    cached_problem, _ = optimizer._get_projected_problem(0, cached_theta)
+    cached_random_theta = _randomized_block_tensor(cached_theta, 31)
+    cached_reference = cached_problem.apply(cached_random_theta)
+    assert cached_problem.sector_operator is not None
+    assert cached_problem.sector_operator_bytes > 0
+    assert cached_problem.sector_operator_block_count > 0
+    operator_cached = cached_problem.apply(cached_random_theta)
+    assert cached_problem.sector_operator_uses == 1
+    for sector, expected in cached_reference.data.blocks.items():
+        np.testing.assert_allclose(
+            operator_cached.data.blocks[sector], expected, atol=1e-12, rtol=1e-12
+        )
+
 
 def test_native_fermionic_compiled_plan_preserves_phases_and_dummy_modes():
     """Direct native contractions compile only with phase-stable metadata."""

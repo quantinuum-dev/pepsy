@@ -22,6 +22,13 @@ from scipy.sparse.linalg import LinearOperator
 from .energy import MpsEnergyOptimizer
 
 
+# The block-sector effective-Hamiltonian prototype only materializes an
+# operator when its complete dense block map is small. Larger windows retain
+# the streamed contraction path; this is a correctness-first cache, not an
+# unbounded dense-local solver.
+_SECTOR_OPERATOR_MAX_BYTES = 32 * 1024**2
+
+
 def _is_symmray_array(value):
     return type(value).__module__.split(".", 1)[0] == "symmray"
 
@@ -1548,6 +1555,13 @@ class _LocalProjectedProblem:
             sector: np.zeros_like(_to_numpy(block))
             for sector, block in theta.data.blocks.items()
         }
+        self.sector_operator = None
+        self.sector_operator_build_attempted = False
+        self.sector_operator_bytes = 0
+        self.sector_operator_disabled_reason = None
+        self.sector_operator_block_count = 0
+        self.sector_operator_validation_error = None
+        self.sector_operator_uses = 0
 
         w_left = optimizer._active_mpo_tensor_for_matvec(self.site, self.input_map)
         w_right = optimizer._active_mpo_tensor_for_matvec(
@@ -1644,7 +1658,212 @@ class _LocalProjectedProblem:
             return block.copy()
         return np.array(block, copy=True)
 
+    @staticmethod
+    def _matrix_axis_permutation(shape, axes):
+        return np.arange(_shape_size(shape)).reshape(shape).transpose(axes).reshape(-1)
+
+    @staticmethod
+    def _block_pair_operator_layout(contraction):
+        """Return dense block-map shapes without materializing their values."""
+        layout = {}
+        for output_sector, output_shape, _, right_specs in contraction.compiled_block_plan:
+            output_size = _shape_size(output_shape)
+            for right_sector, _, shared_size, right_output_size in right_specs:
+                input_shape, _ = contraction.compiled_right_layout[right_sector]
+                input_size = _shape_size(input_shape)
+                if input_size != shared_size * right_output_size:
+                    raise ValueError("Compiled block map has incompatible input shape.")
+                layout[(output_sector, right_sector)] = (output_size, input_size)
+        return layout
+
+    @staticmethod
+    def _block_pair_sector_maps(contraction):
+        """Materialize the linear maps for one cached block contraction."""
+        maps = {}
+        right_axes = contraction.right_axes + contraction.right_output_axes
+        for output_sector, output_shape, left_matrix, right_specs in (
+            contraction.compiled_block_plan
+        ):
+            output_size = _shape_size(output_shape)
+            for right_sector, offset, shared_size, right_output_size in right_specs:
+                input_shape, _ = contraction.compiled_right_layout[right_sector]
+                permutation = _LocalProjectedProblem._matrix_axis_permutation(
+                    input_shape,
+                    right_axes,
+                )
+                term_left = left_matrix[:, offset : offset + shared_size]
+                matrix = np.kron(
+                    term_left,
+                    np.eye(right_output_size, dtype=term_left.dtype),
+                )[:, permutation]
+                if matrix.shape != (output_size, _shape_size(input_shape)):
+                    raise ValueError("Compiled block map has incompatible output shape.")
+                key = (output_sector, right_sector)
+                if key in maps:
+                    maps[key] += matrix
+                else:
+                    maps[key] = matrix
+        return maps
+
+    def _sector_operator_layout(self):
+        if self.contraction_order != "right_first":
+            self.sector_operator_disabled_reason = "left_first_layout"
+            return None
+        first = self.right_contraction
+        second = self.left_contraction
+        if first.compiled_block_plan is None or second.compiled_block_plan is None:
+            return None
+        if (
+            first.compiled_block_plan_fermionic
+            or second.compiled_block_plan_fermionic
+        ):
+            self.sector_operator_disabled_reason = "fermionic_compiled_plan"
+            return None
+
+        first_layout = self._block_pair_operator_layout(first)
+        second_layout = self._block_pair_operator_layout(second)
+        second_by_input = {}
+        for (output_sector, input_sector), shape in second_layout.items():
+            second_by_input.setdefault(input_sector, []).append((output_sector, shape))
+
+        final_layout = {}
+        for (middle_sector, input_sector), (_, input_size) in first_layout.items():
+            for output_sector, (output_size, middle_size) in second_by_input.get(
+                middle_sector,
+                (),
+            ):
+                if middle_size != first_layout[(middle_sector, input_sector)][0]:
+                    raise ValueError("Compiled block maps disagree on an intermediate shape.")
+                final_layout[(output_sector, input_sector)] = (output_size, input_size)
+
+        final_axes = tuple(
+            second.output_inds.index(ind) for ind in self.inds
+        )
+        final_shapes = {
+            sector: shape
+            for sector, shape, _, _ in second.compiled_block_plan
+        }
+        remapped_layout = {}
+        for (output_sector, input_sector), shape in final_layout.items():
+            target_sector = tuple(output_sector[axis] for axis in final_axes)
+            if target_sector not in self.output_zeros:
+                continue
+            if _shape_size(final_shapes[output_sector]) != _shape_size(
+                _to_numpy(self.output_zeros[target_sector]).shape
+            ):
+                raise ValueError("Compiled block map has incompatible theta output size.")
+            remapped_layout[(target_sector, input_sector)] = shape
+
+        dtypes = [
+            left_matrix.dtype
+            for contraction in (first, second)
+            for _, _, left_matrix, _ in contraction.compiled_block_plan
+        ]
+        itemsize = np.dtype(np.result_type(*dtypes)).itemsize
+        elements = (
+            sum(rows * cols for rows, cols in first_layout.values())
+            + sum(rows * cols for rows, cols in second_layout.values())
+            + 2 * sum(rows * cols for rows, cols in remapped_layout.values())
+        )
+        return first, second, remapped_layout, int(elements * itemsize)
+
+    def _maybe_compile_sector_operator(self, theta, reference):
+        if self.sector_operator_build_attempted:
+            return
+        self.sector_operator_build_attempted = True
+        layout = self._sector_operator_layout()
+        if layout is None:
+            if self.sector_operator_disabled_reason is None:
+                self.sector_operator_disabled_reason = "uncompiled_block_plan"
+            return
+        first, second, _, estimated_bytes = layout
+        self.sector_operator_bytes = estimated_bytes
+        if estimated_bytes > _SECTOR_OPERATOR_MAX_BYTES:
+            self.sector_operator_disabled_reason = "memory_cap"
+            return
+
+        first_maps = self._block_pair_sector_maps(first)
+        second_maps = self._block_pair_sector_maps(second)
+        second_by_input = {}
+        for (output_sector, input_sector), matrix in second_maps.items():
+            second_by_input.setdefault(input_sector, []).append((output_sector, matrix))
+        maps = {}
+        for (middle_sector, input_sector), first_matrix in first_maps.items():
+            for output_sector, second_matrix in second_by_input.get(
+                middle_sector,
+                (),
+            ):
+                key = (output_sector, input_sector)
+                contribution = second_matrix @ first_matrix
+                if key in maps:
+                    maps[key] += contribution
+                else:
+                    maps[key] = contribution
+
+        final_axes = tuple(second.output_inds.index(ind) for ind in self.inds)
+        final_shapes = {
+            sector: shape for sector, shape, _, _ in second.compiled_block_plan
+        }
+        remapped_maps = {}
+        for (output_sector, input_sector), matrix in maps.items():
+            target_sector = tuple(output_sector[axis] for axis in final_axes)
+            if target_sector not in self.output_zeros:
+                continue
+            permutation = self._matrix_axis_permutation(
+                final_shapes[output_sector],
+                final_axes,
+            )
+            key = (target_sector, input_sector)
+            contribution = matrix[permutation, :]
+            if key in remapped_maps:
+                remapped_maps[key] += contribution
+            else:
+                remapped_maps[key] = contribution
+
+        self.sector_operator = remapped_maps
+        self.sector_operator_block_count = len(remapped_maps)
+        candidate = self._apply_sector_operator(theta, count_use=False)
+        errors = (
+            float(np.max(np.abs(candidate.data.blocks[sector] - block)))
+            for sector, block in reference.data.blocks.items()
+        )
+        self.sector_operator_validation_error = max(errors, default=0.0)
+        if self.sector_operator_validation_error > 1e-12:
+            self.sector_operator = None
+            self.sector_operator_block_count = 0
+            self.sector_operator_disabled_reason = "validation_mismatch"
+            return
+        self.sector_operator_disabled_reason = None
+
+    def _apply_sector_operator(self, theta, *, timings=None, count_use=True):
+        step_start = time.perf_counter() if timings is not None else None
+        input_vectors = {
+            sector: _to_numpy(block).reshape(-1)
+            for sector, block in theta.data.blocks.items()
+        }
+        blocks = {
+            sector: np.zeros_like(_to_numpy(block))
+            for sector, block in theta.data.blocks.items()
+        }
+        matmul_start = time.perf_counter() if timings is not None else None
+        for (output_sector, input_sector), matrix in self.sector_operator.items():
+            np.add(
+                blocks[output_sector].reshape(-1),
+                matrix @ input_vectors[input_sector],
+                out=blocks[output_sector].reshape(-1),
+                casting="unsafe",
+            )
+        _add_elapsed(timings, "matvec_sector_operator_matmul_elapsed", matmul_start)
+        data = _array_with_blocks_like(theta.data, blocks)
+        _add_elapsed(timings, "matvec_sector_operator_elapsed", step_start)
+        if count_use:
+            self.sector_operator_uses += 1
+        return _tensor_with_data(theta, data)
+
     def apply(self, theta, *, timings=None):
+        if self.sector_operator is not None:
+            return self._apply_sector_operator(theta, timings=timings)
+
         step_start = time.perf_counter() if timings is not None else None
         import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
@@ -1702,7 +1921,11 @@ class _LocalProjectedProblem:
                 blocks[sector] = self._copy_block(self.output_zeros[sector])
         data = _array_with_blocks_like(theta.data, blocks)
         _add_elapsed(timings, "matvec_output_blocks_elapsed", step_start)
-        return _tensor_with_data(theta, data)
+        result = _tensor_with_data(theta, data)
+        compile_start = time.perf_counter() if timings is not None else None
+        self._maybe_compile_sector_operator(theta, result)
+        _add_elapsed(timings, "matvec_sector_operator_compile_elapsed", compile_start)
+        return result
 
     @staticmethod
     def _tensor_block_stats(tensor, prefix):
@@ -1730,6 +1953,16 @@ class _LocalProjectedProblem:
             "matvec_num_contractions": 2,
             "matvec_contraction_order": self.contraction_order,
             "matvec_layout": self.layout,
+            "matvec_sector_operator_cached": self.sector_operator is not None,
+            "matvec_sector_operator_bytes": int(self.sector_operator_bytes),
+            "matvec_sector_operator_blocks": int(self.sector_operator_block_count),
+            "matvec_sector_operator_uses": int(self.sector_operator_uses),
+            "matvec_sector_operator_validation_error": (
+                self.sector_operator_validation_error
+            ),
+            "matvec_sector_operator_disabled_reason": (
+                self.sector_operator_disabled_reason
+            ),
         }
         summary.update(self._tensor_block_stats(self.left_projector, "left_projector"))
         summary.update(self._tensor_block_stats(self.right_projector, "right_projector"))
