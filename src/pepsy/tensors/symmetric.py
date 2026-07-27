@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -4865,6 +4866,41 @@ def _apply_to_array_blocks(value, to_backend):
     return to_backend(value)
 
 
+def _operator_content_fingerprint(operator):
+    """Return a stable content digest for a native Symmray operator.
+
+    ``Fermion.operator_gate`` caches gate exponentials, so the cache key must
+    depend on the operator's *contents* rather than its Python ``id``.  A
+    freshly built operator can be garbage collected and have its memory
+    address reused, which would otherwise let the cache return a stale gate
+    for an unrelated operator.  Returns ``None`` when a stable fingerprint
+    cannot be formed -- an unrecognised operator type or blocks that carry an
+    autodiff graph -- signalling that the resulting gate must not be cached.
+    """
+    blocks = getattr(operator, "blocks", None)
+    if blocks is None:
+        return None
+    hasher = hashlib.blake2b(digest_size=16)
+    header = (
+        getattr(operator, "symmetry", None),
+        getattr(operator, "charge", None),
+        tuple(getattr(operator, "duals", ()) or ()),
+        tuple(getattr(operator, "shape", ()) or ()),
+    )
+    hasher.update(repr(header).encode())
+    for sector in sorted(blocks, key=repr):
+        block = blocks[sector]
+        if getattr(block, "requires_grad", False):
+            return None
+        try:
+            array = np.ascontiguousarray(ar.to_numpy(block))
+        except Exception:  # pragma: no cover - defensive backend guard
+            return None
+        hasher.update(repr((sector, array.shape, array.dtype.str)).encode())
+        hasher.update(array.tobytes())
+    return hasher.hexdigest()
+
+
 def _apply_to_tensor_network_arrays(tn, to_backend):
     if to_backend is None:
         return tn
@@ -8224,7 +8260,7 @@ class Fermion:
             operator_key = ("name", name)
         else:
             factory = lambda: operator
-            operator_key = ("term", id(operator))
+            operator_key = ("term", _operator_content_fingerprint(operator))
 
         def build():
             term = factory()
@@ -8236,6 +8272,12 @@ class Fermion:
                 )
             gate = _gate_from_term(term, theta, imaginary=imaginary)
             return _apply_to_array_blocks(gate, self.to_backend)
+
+        if operator_key[1] is None:
+            # No stable content fingerprint (an unrecognised operator type or
+            # autodiff tensors): build without caching so that a recycled
+            # Python ``id`` can never alias an unrelated operator's gate.
+            return build()
 
         return self._cached_gate(
             ("operator", operator_key, theta, imaginary),
