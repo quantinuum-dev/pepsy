@@ -159,7 +159,9 @@ measured setup time from 7.243 s to 0.0069 s and wall time from 185.90 s to
 within every local Krylov solve); it cannot survive a tensor/environment update
 without becoming stale.
 
-The remaining candidates were measured and rejected rather than expanded:
+The following throughput measurements are scoped to the warmed, single-threaded
+CPU chi=64 control. They reject these variants for the overhead-bound regime,
+not for arbitrarily large bond dimensions:
 
 - All 70 compiled contraction layouts in a representative chi=64 sweep were
   distinct, so cross-window topology caching had zero reuse.
@@ -173,12 +175,29 @@ The remaining candidates were measured and rejected rather than expanded:
 - Disabling the density-matrix mixer after the chi ramp reduced wall time
   (162.11 s) and SVD time (6.08 s), but shifted the final energy by 4.43e-4.
 
-Those changes exceed the solver-tolerance acceptance criterion. The retained
-unfused fanout matvec, allocation-free sector-cache bypass, density-matrix
-mixer duration, and `ncv=8` are therefore the current 6x6 configuration. Any
-future performance work needs a new algorithmic approach (for example a
-validated block-sparse density-matrix reduction kernel), not another caching or
-parameter tweak.
+The `ncv=7` and earlier-mixer rejections are numerical/basin decisions, rather
+than chi=64 throughput judgments; retain `ncv=8` and the current mixer duration
+unless a new full solver-tolerance study proves otherwise. The allocation-free
+sector-cache bypass is likewise safe at any chi. Cross-window topology reuse
+is structurally unhelpful in this control (zero hits) and becomes relatively
+less important as block GEMM work grows.
+
+Do not extrapolate the fused-layout or contiguous-static-matrix losses to high
+chi. Their extra packing/copy work lost at chi=64, where the measured kernels
+are overhead-bound, but larger block products may become BLAS-bound and reverse
+that tradeoff. Before declaring this route closed for chi >= 512, run held-sweep
+A/Bs for unfused versus fused routing and native versus contiguous static
+matrices, under both one-thread and appropriately sized multi-thread BLAS.
+Require the direct-blockwise `1e-12` comparison, solver-tolerance agreement,
+and separate compiled-matvec and wall timings. Audit fanout static-map storage
+at each scale as well: its chi=64 footprint is not a safe predictor of the
+block-sector distribution or memory pressure at chi=4096.
+
+The retained unfused fanout matvec, allocation-free sector-cache bypass,
+density-matrix mixer duration, and `ncv=8` are therefore the current 6x6
+chi=64 configuration. At high chi, the next plausible work remains GEMM
+throughput and a validated block-sparse density-matrix reduction kernel; the
+6x6 control spent about 17.5 s of 180.2 s in SVD splits, not 0.1%.
 
 ## Test commands
 
