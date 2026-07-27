@@ -936,8 +936,20 @@ class _BlockPairContraction:
         left_fermionic = _is_fermionic_symmray_array(self.left.data)
         right_fermionic = _is_fermionic_symmray_array(right.data)
         if left_fermionic or right_fermionic:
-            self.compiled_block_plan_disabled_reason = "fermionic_array"
-            return False
+            if not (left_fermionic and right_fermionic):
+                self.compiled_block_plan_disabled_reason = "mixed_fermionic_arrays"
+                return False
+            if type(self.left.data) is not type(right.data):
+                self.compiled_block_plan_disabled_reason = (
+                    "fermionic_array_type_mismatch"
+                )
+                return False
+            if not self.shared:
+                self.compiled_block_plan_disabled_reason = "fermionic_outer_product"
+                return False
+            if self.layout != "unfused":
+                self.compiled_block_plan_disabled_reason = "fermionic_fused_layout"
+                return False
         if any(
             not isinstance(block, np.ndarray)
             for block in tuple(self.left.data.blocks.values())

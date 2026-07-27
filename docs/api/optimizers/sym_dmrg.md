@@ -76,15 +76,19 @@ problem for the active two-site window, including reindexed MPO tensors and
 left/right environment projectors. The cached projected problem also
 precomputes the static block-contraction routing used by repeated Lanczos
 matvecs. After the first application for a cache-compatible block layout, the
-non-fermionic NumPy-backed Symmray path compiles the block-sector pair schedule
-for each static-left contraction, flattens each output sector to a dense
-matrix product, and reuses that plan on subsequent cache-hit Lanczos matvecs.
-This avoids rediscovering the same block routing inside every hot-loop `H_eff`
-application while turning many tiny sector contractions into one
-output-block-level matmul where possible. Other backends stay on Symmray's
-original `tensordot` path. `profile_summary()` reports projected problem cache
-hits and misses so scale runs can confirm the hot matvec path is reusing this
-setup work.
+NumPy-backed Symmray path compiles the block-sector pair schedule for each
+static-left contraction, flattens each output sector to a dense matrix product,
+and groups equal `(M, K, N)` products into batched `numpy.matmul` calls. This
+avoids rediscovering block routing and collapses repeated small dense products
+inside every hot-loop `H_eff` application. The normal Fermi-Hubbard DMRG path
+is already bosonized before these contractions, so it uses this fast path.
+Compatible native fermionic arrays can also use it for unfused, shared-leg,
+NumPy-only contractions: Pepsy caches Symmray's sector phases with the plan and
+checks fermionic metadata before each reuse. Fused, outer-product, mixed, or
+non-NumPy fermionic contractions retain Symmray's exact `tensordot` path.
+`profile_summary()` aggregates the new batch timing phases, while sampled
+matvec diagnostics report the batch-plan shape and call counters so scale runs
+can confirm the hot matvec path is reusing this setup work.
 `matvec_layout="fused"` is available as an opt-in prototype for the
 block-native path. It attempts to fuse multiple shared contraction legs inside
 each cached projected problem, using Symmray's fused-index support when the

@@ -465,6 +465,72 @@ def test_symdmrg_compiled_batched_plan_matches_blockwise_fh_matvec():
         )
 
 
+def test_native_fermionic_compiled_plan_preserves_phases_and_dummy_modes():
+    """Direct native contractions compile only with phase-stable metadata."""
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        4,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)] * 2),
+        seed=7,
+        dtype="complex128",
+    )
+    left, right = list(state.tn)[1:3]
+    # Exercise an incoming lazy phase in addition to the tensors' dummy modes.
+    right = _tensor_with_data(
+        right,
+        right.data.phase_sector(next(iter(right.data.blocks))),
+    )
+    contraction = _BlockPairContraction(None, left, right.inds)
+    contraction.apply(right)  # Direct reference call that compiles the plan.
+    assert contraction.compiled_block_plan_fermionic
+
+    random_right = _randomized_block_tensor(right, 17)
+    reference = _BlockPairContraction(None, left, right.inds).apply(random_right)
+    got = contraction.apply(random_right)
+
+    assert got.data.dummy_modes == reference.data.dummy_modes
+    assert got.data.phases == reference.data.phases
+    expected_data = reference.data.phase_sync()
+    got_data = got.data.phase_sync()
+    for sector, expected in expected_data.blocks.items():
+        np.testing.assert_allclose(
+            got_data.blocks[sector], expected, atol=1e-12, rtol=1e-12
+        )
+
+    # This pair makes the static left array larger, exercising Symmray's
+    # opposite dual-index phase-flip branch during plan compilation.
+    flip_left, flip_right = list(state.tn)[2:4]
+    flip_right = _tensor_with_data(
+        flip_right,
+        flip_right.data.phase_sector(next(iter(flip_right.data.blocks))),
+    )
+    flip_plan = _BlockPairContraction(None, flip_left, flip_right.inds)
+    flip_plan.apply(flip_right)
+    random_flip_right = _randomized_block_tensor(flip_right, 19)
+    flip_reference = _BlockPairContraction(
+        None, flip_left, flip_right.inds
+    ).apply(random_flip_right)
+    flip_got = flip_plan.apply(random_flip_right)
+    assert flip_got.data.dummy_modes == flip_reference.data.dummy_modes
+    assert flip_got.data.phases == flip_reference.data.phases
+    for sector, expected in flip_reference.data.phase_sync().blocks.items():
+        np.testing.assert_allclose(
+            flip_got.data.phase_sync().blocks[sector],
+            expected,
+            atol=1e-12,
+            rtol=1e-12,
+        )
+
+    phase_changed = _tensor_with_data(
+        random_right,
+        random_right.data.phase_sector(next(iter(random_right.data.blocks))),
+    )
+    builds_before = contraction.compiled_block_plan_builds
+    contraction.apply(phase_changed)
+    assert contraction.compiled_block_plan_builds == builds_before + 1
+
+
 @pytest.mark.parametrize("symmetry", ["Z2", "Z2Z2"])
 def test_unified_spinful_fermion_supports_symmray_parity_symmetries(symmetry):
     """Spinful parity symmetries should use native charges and gates."""
