@@ -148,6 +148,38 @@ this is a retained hot-loop optimization rather than a claim of full-solver
 speedup. Additional scale runs should report the fanout timing fields
 separately from plan-build and total wall time.
 
+### 2026-07-27 follow-up closure
+
+The subsequent setup/SVD/local-solver pass retained one additional change:
+the private composed sector-operator cache is now disabled before it builds a
+layout. In the fixed 30-sweep 6x6 replay this preserved the direct trajectory
+exactly (`E=-16.52514449042574`, 7,495 Lanczos matvecs) while reducing its
+measured setup time from 7.243 s to 0.0069 s and wall time from 185.90 s to
+180.23 s. The projected-problem cache itself remains effective (it is reused
+within every local Krylov solve); it cannot survive a tensor/environment update
+without becoming stale.
+
+The remaining candidates were measured and rejected rather than expanded:
+
+- All 70 compiled contraction layouts in a representative chi=64 sweep were
+  distinct, so cross-window topology caching had zero reuse.
+- `matvec_layout="fused"` agreed numerically but added fuse work and was 6.2%
+  slower on the same seeded sweep (7.83 s versus 7.38 s).
+- Normalizing static left matrices to contiguous NumPy storage also agreed
+  numerically but cost more to prepare than BLAS recovered (7.55 s versus
+  7.20 s).
+- Reducing native Lanczos from `ncv=8` to `ncv=7` reduced the full-run matvec
+  count (7,495 to 6,633) but shifted the final energy by 5.03e-3.
+- Disabling the density-matrix mixer after the chi ramp reduced wall time
+  (162.11 s) and SVD time (6.08 s), but shifted the final energy by 4.43e-4.
+
+Those changes exceed the solver-tolerance acceptance criterion. The retained
+unfused fanout matvec, allocation-free sector-cache bypass, density-matrix
+mixer duration, and `ncv=8` are therefore the current 6x6 configuration. Any
+future performance work needs a new algorithmic approach (for example a
+validated block-sparse density-matrix reduction kernel), not another caching or
+parameter tweak.
+
 ## Test commands
 
 ```bash
