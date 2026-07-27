@@ -88,6 +88,12 @@ do not duplicate them here.
 - Each skill lives in `.github/skills/<name>/` with a concise `SKILL.md`; put
   large method notes or API maps in one-level `references/` files.
 - Keep `.github/skills/README.md` synchronized with the skill directories.
+- Start cross-cutting work with `.github/skills/pepsy-maintainer/SKILL.md`.
+- Follow `.github/skills/SKILL_POLICY.md` when adding, updating, deprecating,
+  merging, or removing skills. Run the catalog validator for those changes.
+- Use `.github/skills/agent-bundle.yaml` as the canonical Workspace Agent
+  upload map. Upload `SKILL.md` and relevant `references/**`; keep
+  `agents/openai.yaml` for local skill metadata rather than agent context.
 - Do not retain references to removed benchmark scripts in active docs or
   skills. Performance harnesses belong outside the package repository.
 

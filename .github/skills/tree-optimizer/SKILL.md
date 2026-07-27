@@ -370,98 +370,13 @@ for trajectory simulation without forming a density matrix:
 - Regression coverage lives in `tests/test_trajectory_noise.py`, including
   Tree state-dependent Kraus sampling and coalesced measurement branching.
 
-## Performance / stability (do not regress)
+## Performance and layout
 
-- **BLAS thread cap is the biggest perf lever.** Tree tensors are tiny (rank
-  `<= 3`, bounded by `chi`), so multi-threaded BLAS/OpenMP is dominated by
-  thread launch/sync overhead -- per-gate cost otherwise *grows* under
-  oversubscription even at constant TN size. `threads=1` is the default; gate
-  application and heavy read-outs run inside `self._thread_ctx()`
-  (a `threadpoolctl` `ThreadpoolController().limit(...)`, built once at import,
-  `contextlib.nullcontext()` when threadpoolctl is missing or `threads=None`).
-  Measured ~12-45x on n=16 chi=16. Only raise `threads` in a large-`chi` regime.
-- **Self-healing tid cache** (`_nid_to_tid`, `_tid`): caches node->tensor id,
-  validates against `self.tn.tensor_map` (quimb changes a tensor's identity when
-  rebuilt via `gate_inds_`); a stale entry just misses and is recomputed. Tensor
-  ids are unique and never reused, so this is always safe.
-- `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
-  tid cache, and derives a deterministic child seed for a fresh independent
-  RNG.
-
-## Layout (TreeLayoutFinder / TreePlan)
-
-`TreeLayoutFinder` reuses the MPS interaction-graph + recursive spectral
-(Fiedler) partition machinery, but **keeps the recursion as the rooted tree**
-(the MPS finder flattens it to 1D). Strongly coupled qubits become nearby
-leaves, minimising the geodesic a 2q gate must thread.
-
-- Partition uses `_similarity_weights()` = Seitz Eq. 1:
-  `s(qi,qj) = |G(qi) & G(qj)| + 1/(deg_i + deg_j)`. The co-occurrence term is
-  the accumulated `pair_weights`; the `1/(deg)` term is a tie-breaker.
-- `score(plan)` uses the **pure** `pair_weights` (weighted geodesic sum, lower
-  is better) -- keep it separate from the augmented partition similarity.
-- `report(plan)` compares against a naive `structure="balanced"` index-order
-  tree (`score_ratio_vs_balanced`). The path-objective quality layout should be
-  `<=` balanced; congestion mode is selected by edge-load cost instead.
-- `TreePlan.from_order(order, weights=, structure=, max_arity=2, community_frac=,
-  star_frac=)`: `"quality"` = spectral reorder + split; `"balanced"` = split
-  `order` directly (useful in tests to force sibling relationships, e.g.
-  `range(4)` -> `(0,1)` and `(2,3)` are siblings); `"adaptive"` = community /
-  clique-driven variable arity.
-
-### Non-binary trees (arity is a knob, not a constraint)
-
-The **data structures and all algorithms are already arity-agnostic** -- every
-builder, geometry query, `ascii_tree`, the optimizer's geodesic threading +
-sibling fast path, and `TreeSampler` loop over `plan.children[nid]` generically.
-The *only* binary-specific piece was construction. Controls:
-
-- `max_arity` defaults to the candidate search `(2, 3, 4)`; pass scalar `2` to
-  force a strictly binary tree. `2` reproduces the original binary partition
-  exactly (cut points use `floor(i*L/k)` so the 2-way case matches the old
-  `mid = L//2` bisection); larger values / `None` give flatter `k`-ary trees.
-- `structure="adaptive"` branches per strongly coupled community
-  (`community_frac` of the level's strongest edge) and collapses a near-clique
-  (present-strong-edge fraction `>= star_frac`) into a flat **star** node
-  (all intra-clique geodesics length 2 vs up to 3 for a bisection).
-- `TreePlan.from_children(children, qubit_of_leaf, root=None)` validates and
-  builds an arbitrary hand-specified tree (checks single parent, leaf/qubit
-  coverage of `0..n-1`, reachability, no cycles).
-- `TreePlan.max_arity()` / `TreePlan.is_binary()` report the shape.
-- `TreeLayoutFinder.recommend_arities((2, 3, 4))` compares candidate arities
-  using path cost or the rank-aware congestion objective and reports local
-  virtual degree, edge load, and peak bond growth. `report(plan)` also exposes
-  `is_binary`, `max_arity`, and `arity_histogram`.
-- `objective="congestion"` compares interaction, congestion-aware, and
-  balanced candidates using predicted `log2` operator-Schmidt rank load on
-  each edge. `objective="path"` remains the backward-compatible default.
-- `weight_mode` accepts `count`, `auto`, `angle`, and `operator_schmidt` for
-  interaction-graph event weighting. `TreeOptimizer` exposes these as
-  `layout_objective` and `layout_weight_mode`.
-- `layered(block_size=...)` is deliberately a fixed construction: it uses the
-  spectral order but does not score block sizes or use `chi`. Prefer
-  `recommend_layered((2, 3, 4), chi=...)` for selection; when `chi` is omitted
-  it inherits the finder's configured value (pass `chi=None` to compare blind).
-  `weight_mode="operator_schmidt"` is a two-site entangling-strength proxy;
-  `objective="congestion"` performs the actual rank-per-tree-edge selection.
-- `objective="hybrid"` combines normalized weighted path, maximum edge load,
-  and total edge load using `hybrid_weights=(path, max_edge_load,
-  total_edge_load)`. It is a fixed-tree replay/runtime-and-bond-cost proxy;
-  it does not permit layout rewrites during simulation.
-- `recommend_layered` / `recommend_arities` accept `refine="greedy"` for a
-  bounded deterministic pre-simulation adjacent leaf-label swap pass. It keeps
-  parent/child topology fixed and returns planning metadata per candidate.
-  `search="nevergrad"` is a separate optional offline search, seeded and
-  budgeted per candidate, requiring `pepsy[layout]`; it starts from the
-  spectral/greedy plan and retains only objective improvements. Keep both
-  opt-in: default layout construction stays fast and reproducible.
-- Layout hot paths matter for long streams: `edge_loads` must traverse only the
-  support's Steiner subtree, and a dense gate's Schmidt-rank cache key must use
-  wire positions rather than global labels so one repeated CNOT/CZ is factored
-  once per distinct partition.
-- All these are plumbed identically through `TreeLayoutFinder`, `TreeOptimizer`,
-  `TreeOptimizer.find_tree_layout`, `TreeOptimizer.convergence_sweep`, and
-  `TreeTensorNetwork.from_order`.
+Keep the thread cap, self-healing tensor-id cache, copy semantics, and
+TreeLayoutFinder objective plumbing intact. The detailed performance and
+non-binary layout contract is in
+[`references/performance-layout.md`](references/performance-layout.md); read
+it before changing those paths.
 
 ## Gotchas / teaching notes
 

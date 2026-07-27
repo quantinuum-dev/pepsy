@@ -1,0 +1,70 @@
+schema: 1
+name: Pepsy Maintainer
+description: Maintain and improve the Pepsy tensor-network package.
+
+# This is a repository-level upload map, not a skill package. Keep the
+# package directories below flat so local discovery and relative references
+# remain stable.
+agent:
+  repository: quantinuum-dev/pepsy
+  branch_workflow: develop-to-main
+  memory: per_user
+  external_apps: []
+
+# These are the small, stable context files to upload before domain skills.
+references:
+  - AGENTS.md
+  - README.md
+  - pyproject.toml
+  - docs/development/package_layout.md
+  - .github/skills/SKILL_POLICY.md
+  - .github/skills/README.md
+
+# Upload SKILL.md and any files under references/ for the selected package.
+# agents/openai.yaml is local UI metadata; do not upload it as ordinary agent
+# context. The maintainer router is useful when the agent must choose a skill.
+skills:
+  - name: pepsy-maintainer
+    path: .github/skills/pepsy-maintainer
+    role: router
+    upload: [SKILL.md]
+  - name: mps-optimizer
+    path: .github/skills/mps-optimizer
+    role: core
+    upload: [SKILL.md]
+  - name: tree-optimizer
+    path: .github/skills/tree-optimizer
+    role: core
+    upload: [SKILL.md, references/**]
+  - name: stabilizer-tensor-networks
+    path: .github/skills/stabilizer-tensor-networks
+    role: domain
+    upload: [SKILL.md, references/**]
+  - name: tree-stabilizer-optimizer
+    path: .github/skills/tree-stabilizer-optimizer
+    role: domain
+    upload: [SKILL.md]
+  - name: symdmrg2
+    path: .github/skills/symdmrg2
+    role: domain
+    upload: [SKILL.md]
+  - name: belief-propagation
+    path: .github/skills/belief-propagation
+    role: domain
+    upload: [SKILL.md]
+  - name: pepsy-vmc
+    path: .github/skills/pepsy-vmc
+    role: domain
+    upload: [SKILL.md, references/**]
+  - name: pepsy-fermion-operators
+    path: .github/skills/pepsy-fermion-operators
+    role: domain
+    upload: [SKILL.md, references/**]
+  - name: qmera-energy-optimizer
+    path: .github/skills/qmera-energy-optimizer
+    role: optional-domain
+    upload: [SKILL.md, references/**]
+
+# Recommended Agent Studio order: add the router and core skills first, then
+# only the domain skills needed by the agent's work. Native skill attachment
+# is preferred; use the upload entries above when the UI exposes files only.

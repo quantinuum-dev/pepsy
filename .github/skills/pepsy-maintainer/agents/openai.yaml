@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pepsy Maintainer"
+  short_description: "Route Pepsy maintenance work to the right skill"
+  default_prompt: "Use $pepsy-maintainer to plan and validate focused Pepsy package maintenance."
