@@ -20,3 +20,8 @@ optional `references/` and `agents/` subdirectories.
 
 When adding a skill, follow the same layout and add it to this catalog. Keep
 shared repository rules in `AGENTS.md`; keep skill-specific procedures here.
+
+All user-facing skills also carry `agents/openai.yaml` metadata so the catalog
+and invocation chips stay consistent. Tree stabilizer work composes the Tree
+Optimizer and Stabilizer Tensor Network skills rather than duplicating their
+shared invariants.

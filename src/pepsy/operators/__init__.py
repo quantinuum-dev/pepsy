@@ -54,7 +54,7 @@ _GATE_EXPORTS = [
 ]
 _SYMBOL_MODULES = {name: ".gates" for name in _GATE_EXPORTS}
 _SYMBOL_MODULES["ham_tn"] = ".hamiltonians"
-_SUBMODULES = ("gate_apply", "gate_builders", "gates", "hamiltonians")
+_SUBMODULES = ("gates", "hamiltonians")
 
 __all__ = [*_GATE_EXPORTS, "ham_tn", *_SUBMODULES]
 

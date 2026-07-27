@@ -384,13 +384,11 @@ at several `chi` values and report peak bond, norm diagnostics, and an
 optional observable. `chi=None` is the lossless reference up to the configured
 cutoff.
 
-For an end-to-end repeated-check validation, run
-`benchmarks/stabilizer_tn_surface_code.py --distance 3 --rounds 3`. The
-benchmark scales the data/check grid, compares MPS-STN and Tree-STN
-measurement/syndrome/observable records at `chi=None`, reports finite-`chi`
-convergence and tensor-storage proxies, and replays the same compiled samples
-after inserting coherent crosstalk. Dense statevector fidelity is restricted
-to the small distance-2 smoke patch; larger runs remain tensor-network-only.
+For an end-to-end repeated-check validation, use the public
+`compile_stim_circuit`, `run_stim_shots`, and
+`run_stabilizer_tree_stream` APIs directly. Keep performance experiments in
+the external benchmark workspace so the package remains focused on reusable
+simulation APIs.
 
 
 > API details are maintained as handwritten Markdown in this page.

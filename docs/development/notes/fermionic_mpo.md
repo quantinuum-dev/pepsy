@@ -206,8 +206,8 @@ the interruption.
   quimb's per-site progress bar.
 - `profile=True` now records phase timings for Symmray sweeps, including
   environment setup/update, norm checks, local eigensolves, matvecs, SVD splits,
-  enrichment, sweeps, and solve totals. `benchmarks/symdmrg2_fh_u1u1.py` emits
-  those diagnostics as JSON for deterministic OBC FH U1U1 chains.
+  enrichment, sweeps, and solve totals. An external harness can serialize those
+  diagnostics as JSON for deterministic OBC FH U1U1 chains.
 - Hard mapped-2D DMRG comparisons against TeNPy showed two separate issues:
   robustness of the initial state and cost of the local Lanczos solve. For
   robust starts, prefer `SymMPS.random_unitary_evolution(...)` or

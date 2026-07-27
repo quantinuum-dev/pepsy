@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pepsy Belief Propagation"
+  short_description: "Design and validate Pepsy BP workflows"
+  default_prompt: "Use $belief-propagation to design or debug a Pepsy belief-propagation workflow."

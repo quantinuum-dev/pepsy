@@ -32,9 +32,8 @@ These domains may evolve faster and can have additional dependency or backend
 requirements. Their public entry points are documented, but implementation
 details are not compatibility guarantees.
 
-## Deprecations
+## Removed compatibility modules
 
-Old flat module paths such as `pepsy.core` and `pepsy.optimize_mps` remain as
-warning-emitting compatibility facades for the current deprecation window.
-New code should use the responsibility-based paths, for example
-`pepsy.tensors.core` and `pepsy.optimizers.mps`.
+Old flat module paths such as `pepsy.core` and `pepsy.optimize_mps` were
+removed in the 0.4 package-layout cleanup. Use the responsibility-based paths,
+for example `pepsy.tensors` and `pepsy.optimizers.mps`.

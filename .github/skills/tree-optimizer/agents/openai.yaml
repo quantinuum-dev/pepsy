@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pepsy Tree Optimizer"
+  short_description: "Build and debug Pepsy tree replay"
+  default_prompt: "Use $tree-optimizer to design or debug Pepsy TreeOptimizer layout and replay."

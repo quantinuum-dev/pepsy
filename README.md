@@ -5,7 +5,7 @@
 `pepsy` is a tensor-network package for circuit simulation, contraction,
 optimization, sampling, and variational Monte Carlo workflows.
 
-Current package version: `0.3.0` (from `pyproject.toml` / `pepsy.__version__`).
+Current package version: `0.4.0` (from `pyproject.toml` / `pepsy.__version__`).
 See the [changelog](CHANGELOG.md) for release history and versioned changes.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development and test profiles.
 
@@ -27,7 +27,6 @@ Advanced namespaces are explicit:
 - `bp/`: belief propagation, loop corrections, and PNE
 - `vmc/`: optional Torch and NetKet/JAX VMC adapters
 - `experimental/`: lazy entry points for advanced domains
-- `extensions/`: compatibility entry points for optional integrations
 - `_internal/`: private formatting and utility helpers
 - `examples/`: lightweight runnable examples kept with the package
 - `../pepsy_examples/`: external notebooks and smoke examples, including direct

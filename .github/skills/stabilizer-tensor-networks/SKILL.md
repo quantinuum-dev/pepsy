@@ -241,10 +241,10 @@ direct; `mode="recommended"` is an explicit opt-in to execute the advisor's mode
 `sim.run_queued_stream(...)` applies that runner to an unrun converted queue without
 mutating the source simulator.
 
-`benchmarks/stabilizer_tn_magic_scaling.py` compares `direct`, `immediate`, and `deferred`
-execution. Read peak `|nu>` bond together with `proj-bond` and `proj[s]`; final bond alone
-does not show the deferred projection cost. Add `--no-exact-cooling` when isolating MAST from
-the constructive pre-check.
+Compare `direct`, `immediate`, and `deferred` execution through the public
+runner APIs. Read peak `|nu>` bond together with projection bond and projection
+cost; final bond alone does not show the deferred projection cost. Keep timing
+harnesses outside the Pepsy package.
 
 ## Roadmap / future improvements
 The prioritized roadmap (Clifford disentangling, dynamic layout, future PEPS/decoder work,

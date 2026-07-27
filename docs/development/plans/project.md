@@ -9,7 +9,7 @@ PEPS norm contraction and DMRG fitting). It is the "what/when" companion to the
 conceptual notes in `../notes/` (the "why/how"), the session journal in
 `history/` (the "what happened"), and the published documentation in `docs/`.
 
-Current package version: `0.3.0` (`pepsy.__version__` / `pyproject.toml`).
+Current package version: `0.4.0` (`pepsy.__version__` / `pyproject.toml`).
 
 Four headline workstreams drive the roadmap:
 
@@ -383,9 +383,8 @@ constructions, plus the fermionic Fermi-Hubbard starters in
   dense/norm/block environment setup, environment updates, norm checks, local
   eigensolves, projected matvecs, SVD splits, enrichment, sweeps, and solves.
   `profile_summary()` aggregates phase counts and elapsed time.
-- Added `benchmarks/symdmrg2_fh_u1u1.py`, a deterministic FH U1U1 OBC
-  benchmark harness that emits case metadata, final energy, and profiling data
-  as JSON.
+- Added deterministic FH U1U1 OBC profiling coverage; the performance harness
+  is maintained outside the Pepsy package repository.
 - SymDMRG2 now has TeNPy-style robust random and product-growth initialization
   paths for hard mapped-2D DMRG cases. `SymMPS.random_unitary_evolution(...)`
   and `SymMPS.random_unitary_for_model(...)` build well-conditioned random MPS

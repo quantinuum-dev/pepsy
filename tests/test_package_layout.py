@@ -212,12 +212,13 @@ def test_optional_dependency_profiles_are_declared():
 
 
 @pytest.mark.parametrize(
-    "old_module",
+    "removed_module",
     [
         "pepsy.boundary_metrics",
         "pepsy.boundary_states",
         "pepsy.boundary_sweeps",
         "pepsy.core",
+        "pepsy.extensions",
         "pepsy.fit",
         "pepsy.ft_solver",
         "pepsy.gates",
@@ -231,8 +232,7 @@ def test_optional_dependency_profiles_are_declared():
         "pepsy.sampler",
     ],
 )
-def test_old_layout_modules_warn_and_proxy(old_module):
-    """Old flat paths remain usable during the deprecation window."""
-    with pytest.warns(DeprecationWarning, match="deprecated"):
-        module = importlib.import_module(old_module)
-    assert module.__all__
+def test_removed_layout_modules_are_not_importable(removed_module):
+    """Obsolete flat and extension namespaces are no longer packaged."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(removed_module)

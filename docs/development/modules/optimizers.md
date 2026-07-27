@@ -7,7 +7,6 @@ important downstream time-compression consumer that depends on Pepsy behavior.
 
 ## Layout
 
-- `_shared.py`: cross-optimizer helpers that are genuinely shared.
 - `mps/`: MPS gate-stream optimization.
   - `optimizer.py`: `MpsOptimizer`.
   - `compression.py`: extraction target for compression backends.

@@ -24,7 +24,6 @@ the detailed functions and classes for each area.
 ## Advanced domains
 
 - [Belief propagation](bp.md)
-- [Extensions](extensions.md)
 - [MPS optimization](optimizers/mps.md)
 - [MPO optimization](optimizers/mpo.md)
 - [PEPS optimization](optimizers/peps.md)

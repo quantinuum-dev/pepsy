@@ -1,10 +1,9 @@
 # Package Layout Migration
 
 The package uses responsibility-based namespaces. Implementations live under
-these namespaces, while old flat module paths remain warning-emitting
-compatibility facades during the deprecation window. Top-level convenience
-symbols such as `pepsy.SweepOptimizer` and `pepsy.rx` still work, but new
-submodule imports should use the canonical layout.
+these namespaces, and the obsolete flat module paths were removed in 0.4.
+Top-level convenience symbols such as `pepsy.SweepOptimizer` and `pepsy.rx`
+still work, but new submodule imports should use the canonical layout.
 
 ## Target Namespaces
 
@@ -20,7 +19,6 @@ pepsy.sampling      MPS, vector, and PEPS samplers
 pepsy.vmc           optional Torch and NetKet/JAX VMC adapters
 pepsy.bp            belief propagation, loop expansions, and PNE methods
 pepsy.experimental  explicit lazy entry points for advanced domains
-pepsy.extensions    compatibility entry points for optional integrations
 pepsy._internal     private formatting and utility helpers
 ```
 
@@ -66,7 +64,7 @@ internal development.
 4. Keep optimizer implementations under `pepsy.optimizers`.
 5. Split `pepsy.tensors.core` into maps, constructors, contractions, and observables.
 6. Keep standard gate primitives separate from routing and tensor-network application.
-7. Keep optional/advanced integrations behind `pepsy.extensions` and lazy imports.
+7. Keep optional/advanced integrations behind `pepsy.experimental` and lazy imports.
 
 After each phase, run:
 

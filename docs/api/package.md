@@ -68,9 +68,8 @@ pepsy.ps_to_mps
 For new code, prefer the canonical namespace imports above. They make the
 responsibility and optional-dependency boundary clear.
 
-## Deprecated flat modules
+## Removed compatibility modules
 
-Old paths such as `pepsy.core`, `pepsy.gates`, and `pepsy.optimize_mps` are
-warning-emitting compatibility facades. Do not use them in new code; migrate
-to `pepsy.tensors.core`, `pepsy.operators.gates`, and
-`pepsy.optimizers.mps`.
+Old flat paths such as `pepsy.core`, `pepsy.gates`, and `pepsy.optimize_mps`
+were removed in the 0.4 package-layout cleanup. Use
+`pepsy.tensors`, `pepsy.operators`, and `pepsy.optimizers.mps` instead.

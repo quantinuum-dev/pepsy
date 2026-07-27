@@ -23,7 +23,7 @@ def test_namespace_exports_have_clear_core_and_advanced_groups():
         "solvers",
         "tensors",
     }
-    advanced = {"bp", "extensions", "experimental", "vmc"}
+    advanced = {"bp", "experimental", "vmc"}
 
     assert core.isdisjoint(advanced)
     assert core | advanced <= set(pepsy.__all__)

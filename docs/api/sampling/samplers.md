@@ -116,15 +116,10 @@ at a time. The statistics report distinct conditional distributions,
 candidate contractions, charge-pruned branches, peak active groups, and
 serial/adaptive fallbacks. Set `max_prefix_groups=None` to remove the hard
 group cap while retaining the `"auto"` reuse decision.
-Use `python benchmarks/mps_symmray_sampling.py --help` for comparable
-product/entangled, fermionic/non-fermionic sampling measurements. By default,
-it runs the sparse Symmray, dense-native, and Quimb sampler variants in
-separate processes and reports median throughput, setup peak RSS, and
-post-setup resident RSS for each variant.
-Use `--variants symmray` when comparing prefix policies only.
-For fermionic `Z2`/`Z2Z2` inputs it reports the dense variants as unsupported:
-naively expanding their graded virtual legs is not a state-preserving dense MPS
-conversion, so only the Symmray result is a valid comparison.
+For comparable throughput measurements, call the public sampling APIs from an
+external benchmark harness. For fermionic `Z2`/`Z2Z2` inputs, do not treat a
+naive dense expansion of graded virtual legs as a state-preserving conversion;
+only the native Symmray path is a valid comparison.
 
 Torch sampling is inference-only by default, avoiding an autograd graph for
 the discrete draw and its sampled probabilities. Use `track_grad=True` only

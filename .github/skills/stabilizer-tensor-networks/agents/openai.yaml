@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pepsy Stabilizer Tensor Networks"
+  short_description: "Implement and validate Pepsy STN simulation"
+  default_prompt: "Use $stabilizer-tensor-networks to implement or validate Pepsy stabilizer tensor-network simulation."

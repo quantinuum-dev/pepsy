@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pepsy SymDMRG2"
+  short_description: "Design and validate symmetric DMRG"
+  default_prompt: "Use $symdmrg2 to design or validate Pepsy SymDMRG2 and Symmray workflows."

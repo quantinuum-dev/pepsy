@@ -26,14 +26,11 @@ __all__ = [
     "TreeSampleResult",
     "TreeSampler",
     "VecSampler",
-    "mps",
-    "peps",
     "tree",
-    "vector",
 ]
 
 
 def __getattr__(name):
-    if name in {"mps", "peps", "tree", "vector"}:
+    if name == "tree":
         return import_module(f".{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

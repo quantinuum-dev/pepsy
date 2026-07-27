@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pepsy MPS Optimizer"
+  short_description: "Build and debug Pepsy MPS replay"
+  default_prompt: "Use $mps-optimizer to design or debug Pepsy MPS gate-stream replay and canonicalization."

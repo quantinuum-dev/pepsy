@@ -1,7 +1,6 @@
 ---
 name: belief-propagation
-description: 'Belief-propagation tensor-network contraction and its loop / cluster / partitioned corrections inside pepsy (the `pepsy.bp` subpackage). Use when the user asks to run, build, extend, wrap, or debug: 1-norm BP (`one_norm_bp`) or 2-norm BP for a quimb tensor network; the loop cluster expansion (`loop_cluster_expand`); the edge-resolved loop series (`loop_series_expand`); partitioned network expansion / PNE (`partitioned_expand`, explicit or higher-rank projectors, recursive schedules, open outputs); Appendix-C weight passing (`weight_pass`); disordered-memory / relay-BP convergence robustness (`relay_bp`, `RelayBPResult`); generalized belief propagation (GBP / region graphs, `RegionGraph`, `gen_region_counts`); message reuse / warm-starting; or questions about whether a loop correction needs BP to converge, the cluster-vs-series-vs-PNE distinction, the Midha–Zhang free-energy cluster expansion + Kotecký–Preiss error bound, stochastic (MCMC) loop corrections, or how pepsy BP feeds the tensy DEM decoder. Not for QEC-decoder-specific glue (that is the tensy `bp-decoding` skill).'
-argument-hint: 'e.g. "run the loop cluster expansion on a PEPS" or "wrap quimb GBP as pepsy region_bp" or "does this correction need BP to converge?"'
+description: 'Run, build, extend, or debug Pepsy belief propagation and its loop, cluster, and partitioned corrections in `pepsy.bp`, including one- and two-norm BP, loop cluster/series expansions, PNE, relay BP, GBP region graphs, message reuse, and convergence or error-bound questions. Use for Pepsy BP workflows and its Tensy DEM-decoder integration; not for decoder-specific glue.'
 ---
 
 # Belief propagation, loop/cluster corrections, and PNE in pepsy

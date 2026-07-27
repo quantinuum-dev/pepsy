@@ -1,378 +1,125 @@
-# AGENTS.md
-
-This file defines default behavior for coding agents working in this repository.
+# Pepsy agent guide
 
 ## Scope
 
-- Applies to the entire `pepsy` repository unless overridden by nested agent instruction files.
-- Prefer minimal, targeted changes that preserve existing APIs and style.
+These instructions apply to the whole Pepsy repository. Keep changes focused
+on Pepsy itself; Gaugy, Tensy, and other sibling-package code belongs in its
+own repository unless the user explicitly requests an integration artifact.
 
-## Project Context
+The main implementation is under `src/pepsy/`, tests under `tests/`, public
+documentation under `docs/`, implementation notes under
+`docs/development/`, and lightweight examples under `examples/`.
 
-- Main package code: `src/pepsy/`
-- Tests: `tests/`
-- Docs: `docs/`
-- Examples: `examples/`
-- Gaugy and Tensy are separate packages/repositories. Do not recreate Gaugy,
-  Tensy, or other sibling-project folders inside this Pepsy repository.
-- Keep Pepsy source, tests, docs, and examples focused on Pepsy itself. Do not
-  add `gaugy` or `tensy` imports, package code, notebooks, examples, or docs
-  here unless the user explicitly asks for a cross-package integration artifact.
-- When work needs Gaugy or Tensy behavior, make the Pepsy side expose a clean
-  public API and leave package-specific code in the corresponding external
-  repository.
+## Startup and safety
 
-## Documentation and skill layout
+- Run `git status --short --branch` before editing. Existing changes belong to
+  the user unless this task created them.
+- Find nested instructions with `rg --files --hidden -g 'AGENTS.md'`.
+- Read the closest focused tests before changing behavior. For API or import
+  work, read `tests/test_public_api.py`, `tests/test_package_layout.py`, and
+  `docs/development/package_layout.md`.
+- Use `apply_patch` for source, test, and documentation edits. Keep temporary
+  scripts and generated output under `/tmp`.
+- Never include unrelated changes in a commit or push.
 
-- Keep user-facing documentation under `docs/` and organize implementation
-  notes under `docs/development/`: `plans/`, `notes/`, `modules/`, and
-  `references/`.
-- Keep the repository root limited to essential project files such as
-  `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, and policy files.
-- Keep each agent skill in `.github/skills/<skill-name>/` with `SKILL.md` as
-  its entry point and optional `references/` or `agents/` subdirectories. Add
-  new skills to `.github/skills/README.md`.
-- Do not add one-off `.tmp*`, backup, build, or cache artifacts to the source
-  tree; use `/tmp` for transient work.
-- Local/generated artifacts may appear in `build/`, `docs/_build/`, `__pycache__/`, `cash*/`, `ctg_cash/`, and `store/`; do not use these as source-of-truth code.
+## Package architecture
 
-## Startup Checklist
+Use responsibility-based namespaces for new code:
 
-At the start of a new task:
-
-- Check `git status --short` and treat existing changes as user-owned unless you made them.
-- Look for nested instructions with `rg --files -g 'AGENTS.md'`.
-- Orient from source and tests, not cache/build output: `find src/pepsy -maxdepth 2 -type f -name '*.py' | sort`.
-- Read the closest tests before editing. For public API or import-path work, read `tests/test_public_api.py`, `tests/test_package_layout.py`, and `docs/development/package_layout.md`.
-- Prefer new package namespaces for imports. Do not add old flat modules such as `pepsy.core`, `pepsy.gates`, `pepsy.sampler`, or `pepsy.optimize_sweep`.
-
-## Branching & Workflow
-
-- After a small coherent batch of package changes, run the relevant focused
-  validation, commit only the files you changed, and push to the configured
-  upstream. Do this incrementally instead of waiting for many unrelated edits
-  to accumulate.
-- Never include unrelated or user-owned work in these automatic commits, and
-  do not push changes that fail validation unless the user explicitly asks.
-
-## Architecture Map
-
-- `pepsy.backends`: backend inference/conversion helpers, package-wide backend defaults, torch/JAX/CuPy linalg registration.
-- `pepsy.tensors`: `OneDMap`, tag validation, product/identity constructors, contraction optimizers, observables, `tn_norm`, and `tn_fidelity`. Many leaf files here are facades over `tensors/core.py`.
-- `pepsy.operators`: gate matrices, `gate`/`gate_simple` dispatch, MPO/PEPO builders, and `ham_tn` Hamiltonian helpers.
-- `pepsy.boundary`: PEPS norm/overlap setup (`build_bra_ket`), boundary environments (`BdyMPS`), sweeps (`CompBdy`), `contract_boundary`, `normalize`, and `infidelity`.
-- `pepsy.solvers`: `GradientOptimizer`, `FDSolver`, `optimize_packed_params`, finite-difference adapters, and canonical solver-name handling.
-- `pepsy.optimizers`: higher-level `GlobalOptimizer`, `SweepOptimizer`, `MpsOptimizer`, `MpoOptimizer`, and `PepsOptimizer` workflows, plus the `stabilizer_tn` subpackage (`MpsStabOptimizer`, `STNState`: stim-tableau + coefficient-MPS STN simulator with basis-updating measurement, reset, and magic-state injection).
-- `pepsy.sampling`: `MpsSampler`, `VecSampler`, `PepsBpSampler`, and result dataclasses.
-- `pepsy._internal`: private formatting and small utility helpers only.
-
-### BP and simple-update gauge workflow
-
-- The experimental BP integration is isolated in `src/pepsy/bp/`. The supported
-  top-level workflows are `pepsy.one_norm_bp`, `pepsy.gauge_all`, and
-  `pepsy.gauge_all_simple`; keep its remaining symbols under `pepsy.bp` until
-  they are individually promoted.
-- `gauge_all_simple` is the single simple-update gauge path. Its optional
-  `RelayGaugeOptions` enables convergence acceleration. It must preserve the
-  represented tensor network exactly when it mixes an external bond gauge:
-  compensate the two adjacent core tensors before returning `(core, gauges)`.
-  Relay memory and DIIS candidates are projected back to nonnegative,
-  L2-normalized singular-value gauges.
-- `gauge_all` is the SU <-> D1BP orchestrator. It may share conversions,
-  schedules, and relay controls with SU and BP, but must not collapse their
-  distinct numerical update loops into one implementation.
-- `one_norm_bp` is the primary plain 1-norm BP runner. It supports L1BP,
-  HV1BP, and D1BP; use `method="d1bp"` for the SU-compatible directed-message
-  representation.
-- Relay/SU state, DIIS history, and warm starts are keyed by the stable external
-  bond ids, so this path intentionally rejects `fuse_multibonds=True`. Its
-  `schedule="parallel"` mode schedules edge-coloured, non-overlapping bond
-  batches on threads for CPU NumPy networks; retain the serial route for other
-  backends.
-- For D1BP warm starts from simple update, use
-  `simple_update_core_and_gauges_from_messages` and
-  `run_d1bp_from_simple_update_gauges`; validate the post-update residual rather
-  than assuming a fixed sweep count means convergence.
-
-### MPS optimizer workflow
-
-- Read `.github/skills/mps-optimizer/SKILL.md` before changing
-  `pepsy.optimizers.mps.optimizer`.
-- For repeated layout-aware evolution, install a layout once with
-  `MpsOptimizer.apply_layout(...)`. It stores `logical_order` as
-  position-to-logical-site labels and intentionally never swaps the MPS back.
-  Use `logical_site`, `position`, `remap_sample`, and `to_dense` for readout.
-- A product-state reorder is free exactly when `p.max_bond() == 1`. An
-  initially entangled state must raise by default; `allow_lossy_reorder=True`
-  permits one caller-controlled-cutoff reorder only.
-- Treat `info_c["cur_orthog"]` as algorithm state. Pass it through Quimb gate,
-  canonicalization, control-event, and normalization paths. Temporary target
-  MPS copies must use isolated metadata and must not overwrite the live cache.
-  Prefer a tracked one-site canonical norm over a full doubled-network norm.
-- `mode="exact"` is a dense TensorNetwork path and does not use canonical
-  metadata. Leaving exact mode must rebuild an MPS before any MPS operation;
-  persistent layouts cannot be switched into exact mode silently.
-- Control events that change MPS length, especially `cap`, are incompatible
-  with persistent layouts. Measurement/reset bookkeeping remains in logical
-  site labels.
-
-### Tree optimizer workflow
-
-- Read `.github/skills/tree-optimizer/SKILL.md` before changing
-  `pepsy.optimizers.tree` code, tests, or documentation.
-- `TreeLayoutFinder` is circuit-only: derive a `TreePlan` from a gate stream or
-  supports, then pass a coefficient state separately to `TreeOptimizer`.
-  Reject a `TreeTensorNetwork` supplied to the finder rather than guessing a
-  circuit or silently relayouting it.
-- An entangled TTN must retain its existing plan. A requested mismatched
-  `tree=`/`layout=` is an error, never an implicit compression or warning-only
-  conversion. Bond-one TTNs and bond-one Quimb MPSs may be remounted exactly on
-  a selected tree; warn only when replacing a product TTN's old geometry.
-- Treat backend, dtype, and device as one state invariant: every live TTN
-  tensor must match. Reject mixed initial states. Callers should provide gates,
-  operators, sub-MPOs, observables, and cap vectors on the state backend;
-  preserve the optimizer's one-time warning when an explicit array must be
-  coerced. Internal Pauli/control tensors must follow the live backend without
-  producing user-facing transfer warnings.
-- Layout is fixed before replay. Never rewrite a live tree during optimization;
-  `refine="greedy"` and Nevergrad are bounded pre-simulation leaf-label searches
-  that retain the parent/child topology.
-- `TreeOptimizer` supports the shared noisy-trajectory runner. Independent
-  replay handles random-unitary mixtures, depolarizing channels, and
-  state-dependent Kraus channels by evaluating branch norms on copied TTNs;
-  selected branches are normalized before replay continues. Coalesced replay
-  branches `measure`, `reset`, and `measure_reset` through
-  `expectation_pauli`. Use matrix-valued gates such as `pepsy.h()` in direct
-  Tree streams; textual MPS gate aliases are not normalized by the Tree parser.
-
-### Stabilizer tensor-network workflow
-
-- Read `.github/skills/stabilizer-tensor-networks/SKILL.md` and its method/API
-  references before changing `MpsStabOptimizer` or `STNState`.
-- Preserve `|psi> = C|p>`: Clifford gates update the Stim tableau `C`; physical
-  non-Clifford operators are frame-mapped through `C`; `submpo` acts directly
-  in the coefficient frame.
-- Preserve the coefficient-MPS canonical-centre tracker through Quimb updates.
-  Use its one-site tensor norm, including the MPS exponent, for local norms and
-  unitary truncation diagnostics.
-- Keep the two cooling mechanisms separate. `exact_cooling=True` is the default
-  deterministic pre-check on a multi-site non-Clifford Pauli rotation. When it
-  finds a product stabilizer pivot, it uses one local coefficient rotation and
-  absorbs the controlled-Pauli remainder into the tableau, avoiding the
-  bond-growing MPO. It is not a sweep and does not perform trial SVDs. Test the
-  ordinary MPO fallback explicitly with `exact_cooling=False` when changing that
-  path. `disentangle_cliffords(...)` is the distinct, SVD-scored greedy
-  two-qubit Clifford sweep; leave it caller-scheduled at sparse checkpoints,
-  never on every T gate or normal rotation.
-- Keep the two magic-injection schedules separate. `with_injection(...)` is the
-  immediate, recycled-ancilla path and is the normal low-ancilla-throughput
-  choice. `with_deferred_injection(...)` is the MAST path: it needs one fresh
-  reserved ancilla per injectable gate, replays the circuit before the final
-  basis-updating projections, and exposes their cost separately. The input
-  stream must not act on either reserved ancilla pool. Do not call the greedy
-  disentangler between deferred replay and its final projections.
-- Use `recommend_magic_strategy(gates, ...)`, or `queued_magic_strategy()` on
-  a not-yet-run `from_stim` simulator, to give callers an explicit stream-based
-  recommendation. It is advisory by design: never make `apply()` silently
-  select direct, immediate, or deferred execution from that report.
-- When comparing direct, immediate, and deferred execution, report peak
-  `|nu>` bond plus projection cost, not only final bond or total wall time. Use
-  `benchmarks/stabilizer_tn_magic_scaling.py --no-exact-cooling` to isolate
-  injection/MAST effects from the constructive exact-cooling pre-check.
-- `track_infidelity` records sparse cumulative `1 - ||p||^2` samples only for
-  normalized unitary segments. It is not exact overlap fidelity or discarded
-  SVD weight. Do not renormalize unitary evolution or sum `infidelities`.
-  Non-unitary matrices and coefficient-frame sub-MPOs emit no sample and
-  invalidate the proxy until a normalized projective collapse resets it.
-- `norm_diagnostics()` combines completed/current segment survival factors:
-  `total_survival_proxy` is their product and `total_norm_proxy` is its square
-  root. `geometric_mean_norm` is only the per-segment geometric mean. Never
-  multiply physical Born probabilities into these compression proxies; progress
-  reports `Ntotal` and `Itotal` for the total norm and infidelity proxies.
-- A selected Kraus `TrajectoryEvent` outcome is a normalized trajectory
-  boundary. Snapshot the preceding unitary segment before applying its
-  non-unitary matrix, then normalize, reset the proxy, and commit the boundary
-  record (`kind="trajectory_kraus"`). This is how later unitary evolution
-  resumes valid STN norm tracking.
-- Keep dense Pauli decomposition bounded by
-  `max_pauli_decomposition_qubits`; prefer named gates, Pauli rotations, or a
-  coefficient-frame sub-MPO over opting into uncontrolled `4**k` enumeration.
-
-## Upstream Tensor-Network Substrate
-
-- Treat `autoray`, `cotengra`, `cotengrust`, and `quimb` as first-class
-  dependencies and prefer their APIs over local reimplementations wherever they
-  cover the needed tensor-network, contraction-planning, and backend-dispatch
-  behavior.
-- Use `quimb` tensor-network objects and methods for Tensor/TensorNetwork,
-  MPS/MPO/PEPS/PEPO construction, contraction, boundary, gate, geometry,
-  sampling, and optimization workflows when practical. Keep Pepsy wrappers
-  thin and focused on Pepsy conventions, compatibility, and stable public APIs.
-- Use `cotengra` for contraction path/tree optimization, hyper-optimization,
-  slicing, subtree reconfiguration, compressed contraction planning, and
-  reusable optimizer objects. Forward cotengra-compatible options rather than
-  inventing parallel path-search configuration inside Pepsy.
-- Use `cotengrust` through cotengra's public acceleration paths for Rust-backed
-  greedy, random-greedy, optimal, and subtree-reconfiguration path-finding.
-  Keep cotengra as the main optimizer interface unless a task specifically
-  needs a lower-level cotengrust primitive.
-- Use `autoray` for backend inference and backend-agnostic array operations,
-  including creation, conversion, `einsum`/`tensordot`, reshaping, conjugation,
-  linalg, and registered backend-specific gradient/linalg fixes. Preserve
-  compatibility with NumPy, Torch, JAX, CuPy, and other autoray-compatible
-  arrays when optional dependencies are installed.
-- Preserve compatibility with the supported dependency ranges in
-  `pyproject.toml`; handle version-specific upstream behavior with feature
-  detection and focused regression tests.
-- Do not vendor or copy upstream internals. If Pepsy needs a workaround for an
-  upstream behavior, isolate it behind a small adapter, document why it exists,
-  and test it against the closest public upstream API.
-- `symmray` is the planned symmetric/block-sparse integration path. Design new
-  tensor, gate, boundary, and optimizer code so Symmray-style arrays can flow
-  through quimb/autoray paths where possible, keep `symmray` optional unless it
-  becomes a declared dependency, and use `pytest.importorskip("symmray")` for
-  Symmray-specific tests.
-
-## Core Workflows
-
-- Boundary contraction flow: `build_bra_ket(ket, bra?) -> BdyMPS(...) -> contract_boundary(...)`.
-- `build_bra_ket` tags the ket in place, adds `KET`/`BRA` tags, validates `X*`, `Y*`, and `I*` tags, and reindexes colliding bra internal indices with an `_*` suffix.
-- `contract_boundary` returns `BoundaryContractResult`; use `res.cost` and `res.fidel`, not tuple unpacking.
-- `BdyMPS.mps_b` stores keys like `Y0_l`, `Y0_r`, `X0_l`, `X0_r`. `BdyMPS.chi` reports the largest current boundary bond, and `expand_bnd(chi, inplace=True)` retunes existing boundaries.
-- `normalize(...)` mutates the input state in place and requires `chi` unless a boundary object or `{"bdy": ...}` holder is supplied.
-- `infidelity(...)` returns a dict with `infidelity`, `norm`, `norm_target`, `overlap`, and reused/created boundary handles.
-- PEPS-like networks should carry lattice tags `X{i}`, `Y{j}`, `I...`; physical outer indices conventionally use `k...` for ket legs and `b...` for bra/operator-output legs.
-- Gate streams should use canonical bundled entries like `[(gate, where), ...]`. The ambiguous single bundled alias `(gate, where)` is intentionally rejected.
-- Keep user-provided gate tensors and tensor-network arrays on compatible
-  backends. Where an optimizer intentionally performs a compatibility coercion,
-  retain its explicit warning/diagnostic rather than silently transferring data.
-- `OneDMap` supports `snake`, `snake-row-major`, `row-major`, `col-major`, `hilbert`, `hilbert-row-major`, and `diag` modes. PEPO conversion is restricted; check `tests/test_ham.py` before changing mapper behavior.
-
-## Public API Rules
-
-- Top-level `pepsy` exports are lazy and managed in `src/pepsy/__init__.py` via `_SYMBOL_MODULES`, `_MODULE_EXPORTS`, and `__all__`.
-- If adding/removing a public symbol, update the owning subpackage `__all__`, top-level `src/pepsy/__init__.py` when appropriate, docs under `docs/api/`, and `tests/test_public_api.py`.
-- Old flat import modules are intentionally removed and covered by `tests/test_package_layout.py`.
-- Preserve convenience top-level symbols such as `pepsy.BdyMPS`, `pepsy.rx`, and `pepsy.SweepOptimizer` unless the task explicitly requests an API break.
-
-## Numerical and Backend Notes
-
-- Default contraction helper is usually `build_optimizer(progbar=False)` or string/object `contraction_opt="auto-hq"`.
-- `build_optimizer` and `build_compressed_optimizer` intentionally avoid seed kwargs; tests assert this.
-- Canonical solvers include `torch-adam`, `torch-lbfgs`, `torch-adamw`, `torch-radam`, `torch-nadam`, `scipy`, `nlopt`, `fd-adam`, `fd-scipy`, `fd-nlopt`, `jax-adam`, `jax-adamw`, `jax-sgd`, and `jax-rmsprop`.
-- `SweepOptimizer` expects canonical solver names; do not reintroduce legacy aliases like `scipy_lbfgs` or `nlopt_lbfgs`.
-- External solvers such as SciPy/NLopt flatten params to CPU NumPy `float64` internally and then cast back to original dtype/device.
-- Keep optional dependencies optional. Use `pytest.importorskip(...)` style in tests when behavior depends on torch, scipy, nlopt, jax, cupy, or optax.
-
-## Editing Rules
-
-- Do not refactor unrelated code.
-- Keep public interfaces stable unless the task explicitly requires a breaking change.
-- Add brief comments only where logic is non-obvious.
-- Preserve naming patterns and module structure used nearby.
-
-## Python and Environment
-
-- Use the Python 3.12 environment for commands and tests:
-  `source ~/envs/py312/bin/activate`.
-- Run commands from repository root when possible.
-- Install local development dependencies with `python -m pip install -e '.[dev]'` when needed.
-
-## Common Commands
-
-- Run the default core tests: `pytest -q`
-- Run all tests, including extended suites: `pytest -q -o addopts=''`
-- Run a focused smoke test file: `pytest -q tests/test_name.py`
-- Run a focused non-smoke test file: `pytest -q -o addopts='' tests/test_name.py`
-- Run a focused extended test file: `pytest -q -o addopts='' tests/test_name.py`
-- Run a focused test case: `pytest -q -o addopts='' tests/test_name.py::test_case_name`
-- Public API/layout smoke tests: `pytest -q tests/test_public_api.py tests/test_package_layout.py`
-- Check Python syntax/static issues: `python -m pyflakes src tests`
-- Check lint: `python -m ruff check src tests`
-- Documentation is maintained as Markdown under `docs/`; no documentation build is required.
-
-If numba, matplotlib, or Python cache directories cause local environment noise, prefer temporary cache locations such as:
-
-```sh
-NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX=/tmp pytest -q
+```text
+pepsy.backends       backend selection, conversion, and linalg registration
+pepsy.tensors        maps, constructors, contractions, observables, symmetry
+pepsy.operators      gates, gate application, MPO/PEPO builders, Hamiltonians
+pepsy.boundary       PEPS boundary states, sweeps, norms, and overlaps
+pepsy.fitting        local tensor fitting
+pepsy.solvers        gradient and finite-difference parameter solvers
+pepsy.optimizers     MPS, MPO, PEPS, sweep, tree, MERA, and trajectory flows
+pepsy.sampling       MPS, PEPS, vector, and tree samplers
+pepsy.bp             belief propagation and loop/PNE methods
+pepsy.vmc            optional Torch and NetKet/JAX VMC integrations
+pepsy.experimental   one lazy namespace for advanced domains
+pepsy._internal      private formatting and small utilities only
 ```
 
-## Code Style
+The old flat modules (`pepsy.core`, `pepsy.gates`, `pepsy.optimize_mps`, and
+similar) and the duplicate `pepsy.extensions` namespace are removed. Do not
+reintroduce them. Use `pepsy.experimental` for advanced-domain discovery and
+the owning namespace for stable imports.
 
-- Prefer existing PEPSY helper functions and local patterns over introducing new utilities.
-- Keep tensor-network naming, boundary naming, and optimizer argument names consistent with nearby code.
-- Avoid changing numerical tolerances, default bond dimensions, or solver choices unless the task is specifically about accuracy, convergence, or performance.
-- Keep compatibility with the supported package range in `pyproject.toml`.
+Keep public re-exports in the owning package `__init__.py`. Preserve the
+top-level convenience API only when it is already documented and useful;
+advanced implementation details should remain behind their domain namespace.
 
-## Examples and Notebooks
+Before changing a specialized subsystem, read its skill:
 
-- Keep examples lightweight and deterministic where practical.
-- Write examples compositionally: expose small setup/build/evolve/measure steps
-  that compose public APIs instead of copying internal implementation details.
-- For Pepsy examples, prefer Pepsy public functionality wherever possible; drop
-  to `quimb`, `autoray`, or `cotengra` only when the example specifically needs
-  lower-level tensor-network, backend, or contraction-planning control.
-- Do not add Gaugy or Tensy examples/notebooks under `examples/`; those belong
-  in their own repositories.
-- Do not modify generated notebook outputs unless explicitly requested.
-- When changing public examples, verify that imports use current namespaces and public API names.
-- If a notebook or helper still shows an old flat import path, migrate it deliberately instead of copying that pattern into new code.
-- For any matplotlib figure (examples, notebooks, benchmark plots), aim for
-  clear, legible, decent-looking plots (labeled axes, readable fonts, a legend
-  when there is more than one series, a light grid, a distinct reference curve,
-  and vector/PNG saves for keep-worthy figures). See
-  `docs/development/plot_policy.md` for the principles and a recommended
-  house-style starting point —
-  it is guidance, not a rigid template to copy verbatim.
+- `pepsy.optimizers.mps` → `.github/skills/mps-optimizer/SKILL.md`
+- `pepsy.optimizers.tree` → `.github/skills/tree-optimizer/SKILL.md`
+- stabilizer TN → `.github/skills/stabilizer-tensor-networks/SKILL.md`
+- tree stabilizer → `.github/skills/tree-stabilizer-optimizer/SKILL.md`
+- belief propagation → `.github/skills/belief-propagation/SKILL.md`
+- VMC → `.github/skills/pepsy-vmc/SKILL.md`
+- fermion operators → `.github/skills/pepsy-fermion-operators/SKILL.md`
+- qMERA → `.github/skills/qmera-energy-optimizer/SKILL.md`
+- SymDMRG2 → `.github/skills/symdmrg2/SKILL.md`
 
-## Validation
+Keep domain-specific invariants in those skills or their direct references;
+do not duplicate them here.
 
-- For code changes, run focused tests first (closest test files), then broader tests if needed.
-- If behavior or API changes, update documentation in `docs/` and/or `README.md`.
-- If unable to run tests locally, state this explicitly in the final report.
+## Dependency and backend rules
 
-### Test-size policy
+- Prefer public `quimb`, `cotengra`, `cotengrust`, and `autoray` APIs over
+  local reimplementations.
+- Keep Torch, JAX, CuPy, SciPy, NLopt, Stim, Symmray, and Nevergrad optional
+  unless a feature genuinely requires them at package import time.
+- `cotengrust` is currently required by Pepsy's accelerated contraction helper;
+  only move it to an extra after adding and testing a cotengra fallback.
+- `cmaes` is selected by the default cotengra optimizer string; do not remove
+  it without changing and testing the default contraction path.
+- Preserve backend, dtype, device, canonical-center, and tensor-network tag
+  invariants. Emit explicit warnings for intentional compatibility coercions.
+- Do not vendor upstream internals.
 
-- Keep the default `pytest -q` loop small: it runs only the deterministic smoke
-  contract checks marked `smoke`.
-- For an algorithm change, add the smallest useful deterministic regression
-  test for the changed behavior. Add one boundary or invariant case only when
-  it protects a distinct failure mode.
-- Do not add broad Cartesian parameter grids, repeated seeds, duplicate
-  end-to-end tests, or stress tests to the default suite. Put genuinely
-  backend-specific, integration, differential, or stress coverage behind the
-  existing `integration` or `slow` markers.
-- Before adding a test, check whether an existing focused test can be extended
-  or made more precise. Remove superseded cases only when the replacement
-  preserves the same public-contract coverage.
-- Run the focused test file for the changed algorithm and run the full suite
-  only when the change crosses multiple domains or affects shared internals.
+## Documentation and skills
 
-Focused validation guide:
+- Keep user-facing API docs under `docs/api/` and concise implementation maps
+  under `docs/development/modules/`.
+- Keep design rationale and historical records under `docs/development/notes/`
+  and `docs/development/plans/`.
+- Each skill lives in `.github/skills/<name>/` with a concise `SKILL.md`; put
+  large method notes or API maps in one-level `references/` files.
+- Keep `.github/skills/README.md` synchronized with the skill directories.
+- Do not retain references to removed benchmark scripts in active docs or
+  skills. Performance harnesses belong outside the package repository.
 
-- API/layout changes: `pytest -q tests/test_public_api.py tests/test_package_layout.py`
-- Boundary setup, normalization, infidelity, or sweeps: `pytest -q tests/test_prepare_boundary_inputs.py`
-- Tensor constructors, backend defaults, contraction helpers, or observables: `pytest -q tests/test_tensor_constructors.py`
-- Gate routing/builders: `pytest -q tests/test_gate.py`
-- Hamiltonian or lattice mapping: `pytest -q tests/test_ham.py`
-- Solver changes: `pytest -q tests/test_gradient_solver.py`
-- Optimizers: `pytest -q -o addopts='' tests/test_optimize_global.py tests/test_optimize_mera.py tests/test_optimize_mps.py tests/test_optimize_mpo.py tests/test_optimize_peps.py tests/test_optimize_tree.py`
-- MPS layout/canonicalization review: `pytest -q tests/test_optimize_mps.py tests/test_optimize_mpo.py tests/test_symmetric_tensors.py`
-- Stabilizer tensor networks: `pytest -q -o addopts='' tests/test_stabilizer_tn.py tests/test_optimize_tree_stabilizer.py`
-- Sampling: `pytest -q tests/test_sampler.py`
-- Docs/API behavior changes: run focused tests; documentation is plain Markdown.
+## Python and validation
 
-## Safety and Boundaries
+Always activate the shared Python 3.12 environment before Python, pytest, or
+notebook commands:
 
-- Never delete user data or caches unless explicitly requested.
-- Avoid destructive git operations.
-- Do not modify generated/build artifacts unless the task explicitly asks for it.
+```bash
+source ~/envs/py312/bin/activate
+```
 
-## Pull Request / Change Summary Expectations
+Focused checks:
 
-When finishing a task, include:
+```bash
+pytest -q tests/test_public_api.py tests/test_package_layout.py
+pytest -q tests/test_prepare_boundary_inputs.py
+pytest -q tests/test_gate.py
+pytest -q tests/test_tensor_constructors.py
+pytest -q tests/test_sampler.py
+```
 
-- What changed
-- Why it changed
-- How it was validated (tests/commands)
-- Any risks or follow-up suggestions
+For optimizer or numerical changes, run the closest domain suite first. Use
+`pytest -q -o addopts='' ...` for non-smoke coverage and
+`pytest -q -o addopts=''` for the full suite when changes cross subsystems.
+Run `python -m ruff check src tests` for the repository lint gate.
+
+Keep the default smoke loop small. Prefer one deterministic regression for a
+new invariant over broad Cartesian grids or duplicate end-to-end tests.
+
+## Examples and handoff
+
+Use public namespace imports in examples. Do not modify generated notebook
+outputs unless explicitly requested. Finish with a concise summary of changed
+files, validation performed, and remaining compatibility or dependency risks.

@@ -12,6 +12,24 @@ Pepsy follows [Semantic Versioning](https://semver.org/):
 
 Changes for the next release should be added here before the version is bumped.
 
+## [0.4.0] - 2026-07-27
+
+This release removes obsolete package-layout compatibility layers and keeps
+advanced-domain discovery under the single lazy `pepsy.experimental` namespace.
+
+### Removed
+
+- Old flat modules such as `pepsy.core`, `pepsy.gates`, and `pepsy.optimize_mps`.
+- The duplicate `pepsy.extensions` namespace and unused re-export leaf modules.
+- The in-package benchmark directory and its orphaned benchmark test.
+
+### Changed
+
+- Repository agent guidance is concise and delegates domain invariants to the
+  relevant skills.
+- Active documentation now points to public simulation and sampling APIs rather
+  than deleted benchmark scripts.
+
 ## [0.3.0] - 2026-07-24
 
 This release consolidates the tensor-network API refresh and the new native

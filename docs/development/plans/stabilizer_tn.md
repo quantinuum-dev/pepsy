@@ -296,11 +296,11 @@ Ordered by value/effort. Completed items remain here as implementation guidance.
     exposes a low replay-phase bond but intentionally pays a final projection
     phase and uses `t` extra ancillas. Ordinary stream entries must not touch the
     reserved ancillas.
-  - **Benchmark:** `benchmarks/stabilizer_tn_magic_scaling.py` now compares
-    `direct`, `immediate`, and `deferred`, reporting peak/final `|nu>` bond,
-    replay time, projection peak bond, projection time, and total time. Use
-    `--no-exact-cooling` to isolate the injection/MAST comparison. The benchmark
-    keeps the legacy `injection` mode name as an alias for `immediate`.
+  - **Performance harness:** compare `direct`, `immediate`, and `deferred`
+    through the public runner APIs, reporting peak/final `|nu>` bond, replay
+    time, projection peak bond, projection time, and total time. Keep the
+    harness outside this package; retain `injection` as an API alias for
+    `immediate` where compatibility requires it.
   - **Stream advice:** `analyze_stream(gates, ...)` and
     `recommend_settings(gates, ...)` inspect a user or Stim-converted Pepsy
     stream first, returning typed, mapping-compatible analysis and settings
