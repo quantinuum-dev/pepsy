@@ -2,9 +2,15 @@
 
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 
 import pepsy
 from pepsy.operators import gate, gate_simple
+from pepsy.optimizers.sym_dmrg import (
+    _BlockPairContraction,
+    _array_with_blocks_like,
+    _tensor_with_data,
+)
 from pepsy.tensors import symmetric as symmetric_mod
 from pepsy.tensors import (
     Fermion,
@@ -388,6 +394,75 @@ def test_symdmrg_fermionic_state_accepts_raw_fermion_constructor_output():
 
     assert native.L == 3
     assert type(native[0].data).__name__ == "U1U1FermionicArray"
+
+
+def _randomized_block_tensor(tensor, seed):
+    """Keep a tensor's Symmray metadata while replacing its block values."""
+    rng = np.random.default_rng(seed)
+    blocks = {}
+    for sector, block in tensor.data.blocks.items():
+        values = rng.normal(size=block.shape) + 1j * rng.normal(size=block.shape)
+        blocks[sector] = np.asarray(values, dtype=block.dtype)
+    data = _array_with_blocks_like(tensor.data, blocks)
+    return _tensor_with_data(tensor, data)
+
+
+def test_symdmrg_compiled_batched_plan_matches_blockwise_fh_matvec():
+    """The actual FH DMRG path is bosonic and batches repeated output shapes."""
+    mapper = OneDMap(3, 2, mode="snake")
+    edges = tuple(qtn.edges_2d_square(3, 2, cyclic=True))
+    mpo = SymHamiltonian.from_edges(
+        "fermi_hubbard_u1u1", "U1U1", edges, t=1.0, U=8.0
+    ).to_mpo(mapper=mapper, compress=True, cutoff=1e-12)
+    state = SymMPS.for_model(
+        "fermi_hubbard_u1u1",
+        6,
+        bond_dim=4,
+        site_charge=site_charge_from_occupations([(1, 0), (0, 1)] * 3),
+        seed=3,
+        dtype="complex128",
+    )
+    optimizer = pepsy.SymDMRG2(
+        mpo,
+        state,
+        bond_dims=[4],
+        cutoffs=[1e-10],
+        compute_initial_energy=False,
+    )
+
+    assert type(list(state.tn)[0].data).__name__ == "U1U1FermionicArray"
+    assert type(optimizer.state[0].data).__name__ == "U1U1Array"
+    theta = optimizer.two_site_theta(2)
+    assert type(theta.data).__name__ == "U1U1Array"
+    problem, _ = optimizer._get_projected_problem(2, theta)
+    contraction = problem.right_contraction
+    assert type(contraction.left.data).__name__ == "U1U1Array"
+
+    theta_input = qtn.Tensor(
+        data=_array_with_blocks_like(
+            problem.theta_input_data_template,
+            theta.data.blocks,
+        ),
+        inds=problem.theta_input_inds,
+        tags=theta.tags,
+    )
+    contraction.apply(theta_input)  # Direct reference call that compiles the plan.
+    random_theta = _randomized_block_tensor(theta_input, 13)
+    reference = _BlockPairContraction(
+        optimizer,
+        contraction.left,
+        contraction.right_inds,
+    ).apply(random_theta)
+    got = contraction.apply(random_theta)
+
+    assert contraction.compiled_block_plan_uses == 1
+    assert contraction.compiled_block_plan_batch_groups > 0
+    assert contraction.compiled_block_plan_batched_output_blocks > 1
+    assert contraction.compiled_block_plan_batched_matmul_calls > 0
+    for sector, expected in reference.data.blocks.items():
+        np.testing.assert_allclose(
+            got.data.blocks[sector], expected, atol=1e-12, rtol=1e-12
+        )
 
 
 @pytest.mark.parametrize("symmetry", ["Z2", "Z2Z2"])

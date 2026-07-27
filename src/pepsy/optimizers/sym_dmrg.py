@@ -187,12 +187,22 @@ def _blocks_from_projected_dense(dense, full_indices, template_data):
 
 
 def _array_with_blocks_like(data, blocks):
-    return type(data)(
-        indices=data.indices,
-        charge=data.charge,
-        blocks=blocks,
-        symmetry=data.symmetry,
-    )
+    kwargs = {
+        "indices": data.indices,
+        "charge": data.charge,
+        "blocks": blocks,
+        "symmetry": data.symmetry,
+    }
+    if _is_fermionic_symmray_array(data):
+        # These are logical parts of a FermionicArray, not incidental cache
+        # state. In particular, compiled contractions reuse an output template
+        # whose lazy phases and dummy modes must survive new block values.
+        kwargs.update(
+            phases=dict(data.phases),
+            label=data.label,
+            dummy_modes=data.dummy_modes,
+        )
+    return type(data)(**kwargs)
 
 
 def _tensor_with_data(tensor, data):
@@ -223,6 +233,37 @@ def _block_data_layout_map(data):
         sector: (tuple(getattr(block, "shape", ())), _block_dtype(block).str)
         for sector, block in data.blocks.items()
     }
+
+
+def _fermionic_metadata_signature(data):
+    """Return the fermionic metadata which can change contraction phases."""
+    indices = tuple(
+        (
+            tuple(index.chargemap.items()),
+            bool(index.dual),
+        )
+        for index in data.indices
+    )
+    phases = tuple(
+        sorted(data.phases.items(), key=lambda item: repr(item[0]))
+    )
+    dummy_modes = tuple(
+        (
+            getattr(mode, "label", None),
+            bool(getattr(mode, "dual", False)),
+            int(getattr(mode, "parity", 0)),
+        )
+        for mode in data.dummy_modes
+    )
+    return (
+        type(data),
+        data.symmetry,
+        data.charge,
+        data.label,
+        indices,
+        phases,
+        dummy_modes,
+    )
 
 
 def _shape_size(shape):
@@ -759,12 +800,22 @@ class _BlockPairContraction:
         self.left_output_axes = tuple(range(len(self.left_inds)))
         self.right_output_axes = tuple(range(len(self.right_inds)))
         self.compiled_block_plan = None
+        self.compiled_block_plan_batches = ()
+        self.compiled_block_plan_singles = ()
         self.compiled_right_layout = None
+        self.compiled_left_fermionic_metadata = None
+        self.compiled_right_fermionic_metadata = None
+        self.compiled_block_plan_fermionic = False
         self.compiled_output_template = None
         self.compiled_block_plan_builds = 0
         self.compiled_block_plan_uses = 0
         self.compiled_block_plan_terms = 0
         self.compiled_block_plan_output_blocks = 0
+        self.compiled_block_plan_batch_groups = 0
+        self.compiled_block_plan_batched_output_blocks = 0
+        self.compiled_block_plan_max_batch_size = 0
+        self.compiled_block_plan_batched_matmul_calls = 0
+        self.compiled_block_plan_single_matmul_calls = 0
         self.compiled_block_plan_mode = None
         self.compiled_block_plan_disabled_reason = None
         # Once a plan has been matched against the first result layout, the
@@ -860,6 +911,18 @@ class _BlockPairContraction:
     def _compiled_plan_matches(self, right):
         if self.compiled_block_plan is None or self.compiled_right_layout is None:
             return False
+        if self.compiled_block_plan_fermionic:
+            # Fermionic signs depend on metadata that is not represented by a
+            # block sector/shape/dtype layout. This path is not the hot DMRG
+            # path (which is deliberately bosonized), so check it every time.
+            self.compiled_block_plan_layout_checks += 1
+            return (
+                self.compiled_right_layout == _block_data_layout_map(right.data)
+                and self.compiled_left_fermionic_metadata
+                == _fermionic_metadata_signature(self.left.data)
+                and self.compiled_right_fermionic_metadata
+                == _fermionic_metadata_signature(right.data)
+            )
         if self.compiled_block_plan_layout_frozen:
             self.compiled_block_plan_layout_fastpath_uses += 1
             return True
@@ -870,9 +933,9 @@ class _BlockPairContraction:
         return matches
 
     def _can_compile_block_plan(self, right):
-        if _is_fermionic_symmray_array(self.left.data) or _is_fermionic_symmray_array(
-            right.data
-        ):
+        left_fermionic = _is_fermionic_symmray_array(self.left.data)
+        right_fermionic = _is_fermionic_symmray_array(right.data)
+        if left_fermionic or right_fermionic:
             self.compiled_block_plan_disabled_reason = "fermionic_array"
             return False
         if any(
@@ -884,17 +947,69 @@ class _BlockPairContraction:
             return False
         return True
 
+    def _prepare_fermionic_compilation(self, right):
+        """Mirror Symmray's fermionic tensordot preparation once per plan."""
+        left_axes = self.left_output_axes + self.left_axes
+        right_axes = self.right_axes + self.right_output_axes
+        left_data = self.left.data.transpose(left_axes)
+        right_data = right.data.transpose(right_axes)
+        ncon = len(self.left_axes)
+        right_data.phase_transpose(
+            (*range(ncon - 1, -1, -1), *range(ncon, right_data.ndim)),
+            inplace=True,
+        )
+        if left_data.size <= right_data.size:
+            flip_axes = tuple(
+                axis
+                for axis in range(left_data.ndim - ncon, left_data.ndim)
+                if not left_data.indices[axis].dual
+            )
+            left_data.phase_flip(*flip_axes, inplace=True)
+        else:
+            flip_axes = tuple(
+                axis
+                for axis in range(ncon)
+                if right_data.indices[axis].dual
+            )
+            right_data.phase_flip(*flip_axes, inplace=True)
+
+        # The right-side phases are static for a compatible plan. Store them
+        # before synchronizing so each pair-specific sign can be folded into
+        # the corresponding static left matrix below.
+        right_phases = dict(right_data.phases)
+        left_data.phase_sync(inplace=True)
+        right_data.phase_sync(inplace=True)
+        return left_data, right_data, right_phases
+
     def _compile_block_plan(self, right, output):
         # A previous plan may have been invalidated by a changed block layout.
         # Clear it before attempting a replacement so a failed compilation
         # cannot leave a stale plan eligible for the next matvec.
         self.compiled_block_plan = None
+        self.compiled_block_plan_batches = ()
+        self.compiled_block_plan_singles = ()
         self.compiled_right_layout = None
+        self.compiled_left_fermionic_metadata = None
+        self.compiled_right_fermionic_metadata = None
+        self.compiled_block_plan_fermionic = False
         self.compiled_output_template = None
         self.compiled_block_plan_layout_frozen = False
         self.compiled_block_plan_mode = None
         if not self._can_compile_block_plan(right):
             return
+
+        fermionic = _is_fermionic_symmray_array(self.left.data)
+        if fermionic:
+            prepared_left, _, right_phases = self._prepare_fermionic_compilation(
+                right
+            )
+            left_perm = self.left_output_axes + self.left_axes
+            right_perm = self.right_axes + self.right_output_axes
+        else:
+            prepared_left = None
+            right_phases = None
+            left_perm = None
+            right_perm = None
 
         output_sectors = set(output.data.blocks)
         right_by_shared = {}
@@ -913,15 +1028,37 @@ class _BlockPairContraction:
         for left_sector, left_block in _sorted_block_items(self.left.data):
             key = tuple(left_sector[axis] for axis in self.left_axes)
             left_output = tuple(left_sector[axis] for axis in self.left_output_axes)
-            left_array = _to_numpy(left_block)
+            if fermionic:
+                prepared_sector = tuple(left_sector[axis] for axis in left_perm)
+                left_array = _to_numpy(prepared_left.blocks[prepared_sector])
+            else:
+                left_array = _to_numpy(left_block)
             left_output_shape = tuple(
-                left_array.shape[axis] for axis in self.left_output_axes
+                left_array.shape[axis]
+                for axis in (
+                    range(len(self.left_output_axes))
+                    if fermionic
+                    else self.left_output_axes
+                )
             )
-            shared_shape = tuple(left_array.shape[axis] for axis in self.left_axes)
-            left_matrix = np.transpose(
-                left_array,
-                self.left_output_axes + self.left_axes,
-            ).reshape(_shape_size(left_output_shape), _shape_size(shared_shape))
+            shared_shape = tuple(
+                left_array.shape[axis]
+                for axis in (
+                    range(len(self.left_output_axes), left_array.ndim)
+                    if fermionic
+                    else self.left_axes
+                )
+            )
+            left_matrix = (
+                left_array.reshape(
+                    _shape_size(left_output_shape), _shape_size(shared_shape)
+                )
+                if fermionic
+                else np.transpose(
+                    left_array,
+                    self.left_output_axes + self.left_axes,
+                ).reshape(_shape_size(left_output_shape), _shape_size(shared_shape))
+            )
             for right_sector, _, _ in right_by_shared.get(key, ()):
                 output_sector = left_output + tuple(
                     right_sector[axis] for axis in self.right_output_axes
@@ -940,9 +1077,17 @@ class _BlockPairContraction:
                 right_output_shape = tuple(
                     right_shape[axis] for axis in self.right_output_axes
                 )
+                if fermionic:
+                    prepared_sector = tuple(right_sector[axis] for axis in right_perm)
+                    right_phase = right_phases.get(prepared_sector, 1)
+                    term_left_matrix = (
+                        left_matrix if right_phase == 1 else -left_matrix
+                    )
+                else:
+                    term_left_matrix = left_matrix
                 terms_by_output[output_sector].append(
                     (
-                        left_matrix,
+                        term_left_matrix,
                         right_sector,
                         _shape_size(shared_shape),
                         _shape_size(right_output_shape),
@@ -960,27 +1105,131 @@ class _BlockPairContraction:
                 if len(left_matrices) == 1
                 else np.concatenate(left_matrices, axis=1)
             )
-            right_specs = tuple(
-                (right_sector, shared_size, right_output_size)
-                for _, right_sector, shared_size, right_output_size in terms
-            )
+            offset = 0
+            right_specs = []
+            for _, right_sector, shared_size, right_output_size in terms:
+                right_specs.append(
+                    (right_sector, offset, shared_size, right_output_size)
+                )
+                offset += shared_size
             compiled_plan.append(
                 (
                     sector,
                     tuple(getattr(output.data.blocks[sector], "shape", ())),
                     left_matrix,
-                    right_specs,
+                    tuple(right_specs),
+                )
+            )
+
+        group_members = {}
+        for index, (sector, _, left_matrix, right_specs) in enumerate(compiled_plan):
+            right_dtype = np.result_type(
+                *(
+                    _block_dtype(right.data.blocks[right_sector])
+                    for right_sector, _, _, _ in right_specs
+                )
+            )
+            template_dtype = _block_dtype(output.data.blocks[sector]).str
+            key = (
+                *left_matrix.shape,
+                right_specs[0][3],
+                left_matrix.dtype.str,
+                right_dtype.str,
+                template_dtype,
+            )
+            group_members.setdefault(key, []).append(index)
+
+        batches = []
+        singles = []
+        for indices in group_members.values():
+            source_groups = {}
+            for index in indices:
+                right_specs = compiled_plan[index][3]
+                source_groups.setdefault(right_specs, []).append(index)
+            claimed = set()
+            for source_indices in source_groups.values():
+                if len(source_indices) < 2:
+                    continue
+                first = compiled_plan[source_indices[0]]
+                batches.append(
+                    (
+                        tuple(source_indices),
+                        np.stack(
+                            tuple(
+                                compiled_plan[index][2] for index in source_indices
+                            ),
+                            axis=0,
+                        ),
+                        None,
+                        None,
+                        first[3],
+                    )
+                )
+                claimed.update(source_indices)
+            indices = tuple(index for index in indices if index not in claimed)
+            # A pair still pays one full batch-pack copy, which is slower than
+            # two tiny output matmuls for the SymDMRG sector sizes. Batch only
+            # once that fixed packing cost is shared by at least four outputs.
+            if len(indices) < 4:
+                singles.extend(indices)
+                continue
+            first = compiled_plan[indices[0]]
+            first_right_dtypes = tuple(
+                _block_dtype(right.data.blocks[right_sector])
+                for right_sector, _, _, _ in first[3]
+            )
+            left_batch = np.stack(
+                tuple(compiled_plan[index][2] for index in indices), axis=0
+            )
+            right_dtype = np.result_type(*first_right_dtypes)
+            _, _, first_left, first_specs = compiled_plan[indices[0]]
+            right_batch = np.empty(
+                (len(indices), first_left.shape[1], first_specs[0][3]),
+                dtype=right_dtype,
+            )
+            batches.append(
+                (
+                    tuple(indices),
+                    left_batch,
+                    right_dtype,
+                    right_batch,
+                    None,
                 )
             )
 
         self.compiled_output_template = output.data
         self.compiled_right_layout = _block_data_layout_map(right.data)
         self.compiled_block_plan = tuple(compiled_plan)
+        self.compiled_block_plan_batches = tuple(batches)
+        self.compiled_block_plan_singles = tuple(singles)
+        self.compiled_block_plan_fermionic = fermionic
+        if fermionic:
+            self.compiled_left_fermionic_metadata = _fermionic_metadata_signature(
+                self.left.data
+            )
+            self.compiled_right_fermionic_metadata = _fermionic_metadata_signature(
+                right.data
+            )
         self.compiled_block_plan_layout_frozen = False
         self.compiled_block_plan_builds += 1
         self.compiled_block_plan_terms = int(num_terms)
         self.compiled_block_plan_output_blocks = len(self.compiled_block_plan)
-        self.compiled_block_plan_mode = "output_block_matmul"
+        self.compiled_block_plan_batch_groups = len(self.compiled_block_plan_batches)
+        self.compiled_block_plan_batched_output_blocks = sum(
+            len(indices) for indices, _, _, _, _ in self.compiled_block_plan_batches
+        )
+        self.compiled_block_plan_max_batch_size = max(
+            (
+                len(indices)
+                for indices, _, _, _, _ in self.compiled_block_plan_batches
+            ),
+            default=0,
+        )
+        self.compiled_block_plan_mode = (
+            "output_block_batched_matmul"
+            if self.compiled_block_plan_batches
+            else "output_block_matmul"
+        )
         self.compiled_block_plan_disabled_reason = None
 
     def _apply_compiled_block_plan(self, right, *, timings=None, prefix="contract"):
@@ -996,23 +1245,93 @@ class _BlockPairContraction:
         template_blocks = self.compiled_output_template.blocks
         right_perm = self.right_axes + self.right_output_axes
         right_matrix_cache = {}
-        for output_sector, output_shape, left_matrix, right_specs in (
-            self.compiled_block_plan
-        ):
-            right_matrices = []
-            for right_sector, shared_size, right_output_size in right_specs:
-                cache_key = (right_sector, shared_size, right_output_size)
-                right_matrix = right_matrix_cache.get(cache_key)
-                if right_matrix is None:
-                    right_matrix = np.transpose(
-                        right_arrays[right_sector],
-                        right_perm,
-                    ).reshape(
-                        shared_size,
-                        right_output_size,
+
+        def get_right_matrix(right_sector, shared_size, right_output_size):
+            cache_key = (right_sector, shared_size, right_output_size)
+            right_matrix = right_matrix_cache.get(cache_key)
+            if right_matrix is None:
+                right_matrix = np.transpose(
+                    right_arrays[right_sector],
+                    right_perm,
+                ).reshape(shared_size, right_output_size)
+                right_matrix_cache[cache_key] = right_matrix
+            return right_matrix
+
+        for (
+            indices,
+            left_batch,
+            _,
+            right_batch,
+            broadcast_specs,
+        ) in self.compiled_block_plan_batches:
+            batch_start = time.perf_counter() if timings is not None else None
+            if broadcast_specs is not None:
+                right_matrices = tuple(
+                    get_right_matrix(
+                        right_sector,
+                        term_shared_size,
+                        term_output_size,
                     )
-                    right_matrix_cache[cache_key] = right_matrix
-                right_matrices.append(right_matrix)
+                    for (
+                        right_sector,
+                        _,
+                        term_shared_size,
+                        term_output_size,
+                    ) in broadcast_specs
+                )
+                right_batch = (
+                    right_matrices[0]
+                    if len(right_matrices) == 1
+                    else np.concatenate(right_matrices, axis=0)
+                )
+            else:
+                for batch_index, plan_index in enumerate(indices):
+                    _, _, _, right_specs = self.compiled_block_plan[plan_index]
+                    for (
+                        right_sector,
+                        offset,
+                        term_shared_size,
+                        term_output_size,
+                    ) in right_specs:
+                        right_batch[
+                            batch_index, offset : offset + term_shared_size, :
+                        ] = get_right_matrix(
+                            right_sector,
+                            term_shared_size,
+                            term_output_size,
+                        )
+            _add_elapsed(
+                timings,
+                f"{prefix}_compiled_block_batch_pack_elapsed",
+                batch_start,
+            )
+            matmul_start = time.perf_counter() if timings is not None else None
+            out_batch = np.matmul(left_batch, right_batch)
+            _add_elapsed(
+                timings,
+                f"{prefix}_compiled_block_batched_matmul_elapsed",
+                matmul_start,
+            )
+            for batch_index, plan_index in enumerate(indices):
+                output_sector, output_shape, _, _ = self.compiled_block_plan[
+                    plan_index
+                ]
+                out = out_batch[batch_index]
+                template_dtype = _block_dtype(template_blocks[output_sector])
+                if out.dtype != template_dtype:
+                    out = np.asarray(out, dtype=template_dtype)
+                blocks[output_sector] = out.reshape(output_shape)
+            self.compiled_block_plan_batched_matmul_calls += 1
+
+        for plan_index in self.compiled_block_plan_singles:
+            output_sector, output_shape, left_matrix, right_specs = (
+                self.compiled_block_plan[plan_index]
+            )
+            right_matrices = []
+            for right_sector, _, shared_size, right_output_size in right_specs:
+                right_matrices.append(
+                    get_right_matrix(right_sector, shared_size, right_output_size)
+                )
             right_matrix = (
                 right_matrices[0]
                 if len(right_matrices) == 1
@@ -1023,6 +1342,7 @@ class _BlockPairContraction:
             if out.dtype != template_dtype:
                 out = np.asarray(out, dtype=template_dtype)
             blocks[output_sector] = out.reshape(output_shape)
+            self.compiled_block_plan_single_matmul_calls += 1
         data = _array_with_blocks_like(self.compiled_output_template, blocks)
         self.compiled_block_plan_uses += 1
         _add_elapsed(timings, f"{prefix}_compiled_block_elapsed", step_start)
@@ -1159,6 +1479,24 @@ class _BlockPairContraction:
             ),
             f"{prefix}_compiled_block_plan_output_blocks": int(
                 self.compiled_block_plan_output_blocks
+            ),
+            f"{prefix}_compiled_block_plan_batch_groups": int(
+                self.compiled_block_plan_batch_groups
+            ),
+            f"{prefix}_compiled_block_plan_batched_output_blocks": int(
+                self.compiled_block_plan_batched_output_blocks
+            ),
+            f"{prefix}_compiled_block_plan_max_batch_size": int(
+                self.compiled_block_plan_max_batch_size
+            ),
+            f"{prefix}_compiled_block_plan_batched_matmul_calls": int(
+                self.compiled_block_plan_batched_matmul_calls
+            ),
+            f"{prefix}_compiled_block_plan_single_matmul_calls": int(
+                self.compiled_block_plan_single_matmul_calls
+            ),
+            f"{prefix}_compiled_block_plan_fermionic": bool(
+                self.compiled_block_plan_fermionic
             ),
             f"{prefix}_compiled_block_plan_mode": self.compiled_block_plan_mode,
             f"{prefix}_compiled_block_plan_layout_frozen": bool(
