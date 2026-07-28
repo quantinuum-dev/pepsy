@@ -30,6 +30,8 @@ from ._common import (
 )
 from .results import (
     TorchChainDiagnostics,
+    TorchVMCConvergenceEstimate,
+    TorchVMCConvergenceReport,
     TorchImportanceSamples,
     TorchMCMCSamples,
     TorchMetropolisResult,
@@ -124,6 +126,8 @@ __all__ = [
     "TorchMCMCSamples",
     "TorchSampleProvenance",
     "TorchChainDiagnostics",
+    "TorchVMCConvergenceEstimate",
+    "TorchVMCConvergenceReport",
     "TorchMetropolisSampler",
     "TorchBPMetropolisSampler",
     "TorchVMCDriver",

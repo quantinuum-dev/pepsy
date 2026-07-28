@@ -1194,5 +1194,32 @@ callback = pvmc.make_netket_autochunk_callback(
 driver.run(n_iter=100, out="vmc_run", callback=callback)
 ```
 
+### Torch MCMC convergence check
+
+After a native Torch run, `TorchFermionVMC.check_mc_convergence(...)` runs a
+separate, non-mutating diagnostic sampler from the current walker positions.
+It retains one local-observable value after every raw Metropolis sweep, then
+reports ordinary and split R-hat, average and maximum integrated
+autocorrelation time, effective sample size, acceptance, and a suggested
+production `sweep_size`:
+
+```python
+report = vmc.check_mc_convergence(
+    observables={"energy": hamiltonian},
+    min_chain_length=100,
+    max_chain_length=500,
+    target_effective_samples_per_chain=50,
+    rhat_threshold=1.05,
+    progress=True,
+)
+
+print(report.reliable, report.recommended_sweep_size)
+print(report.energy.split_r_hat, report.energy.tau_max)
+```
+
+The live progress display is sampling acceptance only. The check uses a
+cloned random stream, leaves the active walker configurations and RNG state
+unchanged, and is intentionally separate from fixed-size production sampling.
+
 
 > API details are maintained as handwritten Markdown in this page.

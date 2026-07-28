@@ -827,6 +827,30 @@ class TorchFermionVMC(TorchVMCDriver):
         )
         return super().sample(sampling=sampling, **kwargs)
 
+    def check_mc_convergence(
+        self,
+        observables=None,
+        *,
+        contraction=None,
+        contraction_opts=None,
+        **kwargs,
+    ):
+        """Check energy/observable chain mixing without mutating VMC state.
+
+        The fermionic wrapper compiles the requested native observable map and
+        then delegates to :meth:`TorchVMCDriver.check_mc_convergence`, which
+        runs a temporary raw-sweep sampler from the current walker positions.
+        """
+        self._ensure_initialized(
+            contraction=contraction,
+            contraction_opts=contraction_opts,
+        )
+        compiled = self._measurement_observables(
+            observables,
+            include_energy=True,
+        )
+        return super().check_mc_convergence(compiled, **kwargs)
+
     def measure(
         self,
         samples,
@@ -1153,6 +1177,27 @@ class TorchVMCSetup:
             else self.driver.sample(sampling=sampling)
         )
         return native.to_common()
+
+    def check_mc_convergence(
+        self,
+        *,
+        sampling=None,
+        contraction=None,
+        contraction_opts=None,
+        **kwargs,
+    ):
+        """Run the native non-mutating convergence diagnostic."""
+        sampling = self.sampling if sampling is None else sampling
+        self.driver._ensure_initialized(
+            sampling=sampling,
+            contraction=contraction,
+            contraction_opts=contraction_opts,
+        )
+        return self.driver.check_mc_convergence(
+            contraction=contraction,
+            contraction_opts=contraction_opts,
+            **kwargs,
+        )
 
     def _measurement_terms(self, observables):
         if observables is None:

@@ -704,14 +704,45 @@ def _weighted_energy_statistics(local_energies, weights):
     )
 
 
-def torch_chain_diagnostics(values, *, max_lag=None):
+def _gelman_r_hat(values):
+    """Return the ordinary Gelman--Rubin R-hat for chain-shaped values."""
+    torch = _require_torch()
+    n_steps, _ = (int(value) for value in values.shape)
+    chain_means = values.mean(dim=0)
+    within = values.var(dim=0, unbiased=True).mean()
+    between = n_steps * chain_means.var(unbiased=True)
+    variance_hat = ((n_steps - 1) * within + between) / n_steps
+    if bool(within == 0):
+        return torch.where(
+            between == 0,
+            torch.ones_like(variance_hat),
+            torch.full_like(variance_hat, float("inf")),
+        )
+    return torch.sqrt(torch.clamp(variance_hat / within, min=1.0))
+
+
+def _split_chain_values(values):
+    """Split each chain in half for the more sensitive split R-hat."""
+    n_steps = int(values.shape[0])
+    if n_steps < 4:
+        return None
+    half = n_steps // 2
+    return _require_torch().cat(
+        (values[:half], values[-half:]),
+        dim=1,
+    )
+
+
+def torch_chain_diagnostics(values, *, max_lag=None, split_rhat=False):
     """Return ``R-hat``, integrated autocorrelation time, and ESS.
 
     ``values`` must have shape ``(n_samples_per_chain, n_chains)``. The
-    implementation uses split-chain-independent Gelman--Rubin statistics and
-    an FFT autocorrelation estimate with an initial-positive-sequence cutoff.
-    Complex values are reduced to their real parts, as appropriate for a
-    Hermitian local observable.
+    The default R-hat is the ordinary Gelman--Rubin estimate used by the
+    legacy adaptive measurement loop. Set ``split_rhat=True`` to also return
+    a split-chain R-hat, which is more sensitive to non-stationary chains.
+    Autocorrelation uses an FFT estimate with an initial-positive-sequence
+    cutoff. Complex values are reduced to their real parts, as appropriate
+    for a Hermitian local observable.
     """
     torch = _require_torch()
     values = torch.as_tensor(values)
@@ -731,19 +762,11 @@ def torch_chain_diagnostics(values, *, max_lag=None):
         values = values.to(torch.float64)
 
     chain_means = values.mean(dim=0)
-    within = values.var(dim=0, unbiased=True).mean()
-    between = n_steps * chain_means.var(unbiased=True)
-    variance_hat = (
-        (n_steps - 1) * within + between
-    ) / n_steps
-    if bool(within == 0):
-        r_hat = torch.where(
-            between == 0,
-            torch.ones_like(variance_hat),
-            torch.full_like(variance_hat, float("inf")),
-        )
-    else:
-        r_hat = torch.sqrt(torch.clamp(variance_hat / within, min=1.0))
+    r_hat = _gelman_r_hat(values)
+    split_values = _split_chain_values(values) if split_rhat else None
+    split_r_hat = (
+        None if split_values is None else _gelman_r_hat(split_values)
+    )
 
     if max_lag is None:
         max_lag = n_steps - 1
@@ -772,6 +795,17 @@ def torch_chain_diagnostics(values, *, max_lag=None):
             break
         tau = tau + 2 * rho[lag]
     tau = torch.clamp(tau, min=1.0)
+    chain_taus = torch.ones(
+        n_chains,
+        dtype=values.dtype,
+        device=values.device,
+    )
+    for chain in range(n_chains):
+        for lag in range(1, max_lag + 1):
+            if bool(normalized[lag, chain] <= 0):
+                break
+            chain_taus[chain] = chain_taus[chain] + 2 * normalized[lag, chain]
+    chain_taus = torch.clamp(chain_taus, min=1.0)
     total_samples = n_steps * n_chains
     effective_sample_size = torch.as_tensor(
         total_samples,
@@ -784,6 +818,8 @@ def torch_chain_diagnostics(values, *, max_lag=None):
         effective_sample_size=effective_sample_size,
         n_samples_per_chain=n_steps,
         n_chains=n_chains,
+        split_r_hat=split_r_hat,
+        max_integrated_autocorrelation_time=chain_taus.max(),
     )
 
 

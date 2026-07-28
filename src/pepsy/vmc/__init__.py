@@ -41,6 +41,8 @@ _SYMBOL_MODULES = {
     "TorchFermionVMC": ".torch",
     "TorchFermionVMCMetadata": ".torch",
     "TorchChainDiagnostics": ".torch",
+    "TorchVMCConvergenceEstimate": ".torch",
+    "TorchVMCConvergenceReport": ".torch",
     "TorchImportanceSamples": ".torch",
     "TorchMCMCSamples": ".torch",
     "TorchSampleProvenance": ".torch",

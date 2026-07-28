@@ -118,7 +118,7 @@ class TorchMCMCSamples:
     proposal_stats: Any = None
     provenance: TorchSampleProvenance | None = None
 
-    def diagnostics(self, values=None, *, max_lag=None):
+    def diagnostics(self, values=None, *, max_lag=None, split_rhat=False):
         """Compute chain diagnostics for a scalar observable.
 
         If ``values`` is omitted, the sampled ``|psi|**2`` values are used as
@@ -129,7 +129,11 @@ class TorchMCMCSamples:
             values = self.amplitudes.abs().square()
         from ._core import torch_chain_diagnostics
 
-        return torch_chain_diagnostics(values, max_lag=max_lag)
+        return torch_chain_diagnostics(
+            values,
+            max_lag=max_lag,
+            split_rhat=split_rhat,
+        )
 
     def to_common(self):
         """Convert to the backend-neutral :class:`pepsy.vmc.VMCSamples`."""
@@ -204,6 +208,8 @@ class TorchChainDiagnostics:
     effective_sample_size: Any
     n_samples_per_chain: int
     n_chains: int
+    split_r_hat: Any = None
+    max_integrated_autocorrelation_time: Any = None
 
     @property
     def rhat(self):
@@ -214,6 +220,101 @@ class TorchChainDiagnostics:
     def tau(self):
         """Alias for :attr:`integrated_autocorrelation_time`."""
         return self.integrated_autocorrelation_time
+
+    @property
+    def rhat_split(self):
+        """Alias for the optional split-chain R-hat estimate."""
+        return self.split_r_hat
+
+    @property
+    def tau_max(self):
+        """Alias for the optional maximum per-chain autocorrelation time."""
+        return self.max_integrated_autocorrelation_time
+
+
+@dataclass(frozen=True)
+class TorchVMCConvergenceEstimate:
+    """Convergence summary for one observable measured along raw sweeps."""
+
+    mean: Any
+    variance: Any
+    stderr: Any
+    r_hat: Any
+    split_r_hat: Any
+    integrated_autocorrelation_time: Any
+    max_integrated_autocorrelation_time: Any
+    effective_sample_size: Any
+    effective_samples_per_chain: Any
+    n_samples_per_chain: int
+    n_chains: int
+    recommended_sweep_size: int
+    reliable: bool
+    reliability_reason: str
+
+    @property
+    def rhat(self):
+        """Alias for :attr:`r_hat`."""
+        return self.r_hat
+
+    @property
+    def tau(self):
+        """Alias for :attr:`integrated_autocorrelation_time`."""
+        return self.integrated_autorrelation_time
+
+    @property
+    def tau_max(self):
+        """Alias for :attr:`max_integrated_autocorrelation_time`."""
+        return self.max_integrated_autocorrelation_time
+
+
+@dataclass(frozen=True)
+class TorchVMCConvergenceReport:
+    """Non-mutating post-run MCMC convergence report.
+
+    The report is produced from a temporary sampler whose retained samples
+    are separated by one raw Metropolis sweep.  ``recommended_sweep_size``
+    is therefore expressed in the same sweep units accepted by
+    :class:`SamplingConfig`.
+    """
+
+    estimates: Mapping[str, TorchVMCConvergenceEstimate]
+    n_samples_per_chain: int
+    n_chains: int
+    burn_in: int
+    sweep_size: int
+    n_sweeps: int
+    n_proposed: int
+    n_accepted: int
+    acceptance_rate: float
+    elapsed_seconds: float
+    reliable: bool
+    reliability_reason: str
+    recommended_sweep_size: int
+    min_chain_length: int
+    max_chain_length: int
+    target_effective_samples_per_chain: float
+    rhat_threshold: float | None
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "estimates",
+            MappingProxyType(dict(self.estimates)),
+        )
+
+    @property
+    def energy(self):
+        """Return the energy estimate when it was included in the report."""
+        return self.estimates.get("energy")
+
+    @property
+    def n_samples(self):
+        """Total number of retained scalar samples across all chains."""
+        return self.n_samples_per_chain * self.n_chains
+
+    def __getitem__(self, name):
+        """Return one named observable estimate."""
+        return self.estimates[name]
 
 
 @dataclass(frozen=True)
@@ -543,6 +644,8 @@ __all__ = [
     "TorchMCMCSamples",
     "TorchMetropolisResult",
     "TorchSampleProvenance",
+    "TorchVMCConvergenceEstimate",
+    "TorchVMCConvergenceReport",
     "TorchVMCImportanceEstimate",
     "TorchVMCEnergyEstimate",
     "TorchVMCStepResult",

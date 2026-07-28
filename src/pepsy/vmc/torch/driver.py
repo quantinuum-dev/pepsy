@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 import time
 import warnings
 
@@ -26,6 +27,7 @@ from .local_energy import (
     _local_energies_from_connection_map,
     _normalized_sample_weights,
     _observable_statistics,
+    torch_chain_diagnostics,
     _weighted_energy_statistics,
     local_energy_from_connections,
 )
@@ -36,6 +38,8 @@ from .proposals import (
     metropolis_exchange_sweep,
 )
 from .results import (
+    TorchVMCConvergenceEstimate,
+    TorchVMCConvergenceReport,
     TorchVMCEnergyEstimate,
     TorchVMCImportanceEstimate,
     TorchVMCStepResult,
@@ -736,6 +740,345 @@ class TorchVMCDriver:
                 deduplicate_targets=True,
                 compile_kernels=self.compile_kernels,
             )
+
+    def check_mc_convergence(
+        self,
+        observables=None,
+        *,
+        burn_in=0,
+        min_chain_length=100,
+        max_chain_length=500,
+        target_effective_samples_per_chain=50.0,
+        rhat_threshold=1.05,
+        check_interval=None,
+        seed=None,
+        progress=False,
+    ):
+        """Check MCMC convergence without advancing the active VMC chains.
+
+        A temporary driver starts from the current walker positions and keeps
+        one retained value per raw Metropolis sweep.  Each observable is
+        checked with ordinary and split R-hat, an FFT initial-positive-
+        sequence autocorrelation estimate, and a conservative maximum IAT
+        across chains. Sampling stops once every observable has at least
+        ``target_effective_samples_per_chain`` effective samples and satisfies
+        ``rhat_threshold``. The hard ``max_chain_length`` cap is always
+        respected.
+
+        The returned :class:`TorchVMCConvergenceReport` contains a suggested
+        ``sweep_size`` for a later production :class:`SamplingConfig`. The
+        diagnostic uses raw spacing intentionally, so the recommendation is
+        not confused with the spacing of an earlier production batch.
+        """
+        torch = _require_torch()
+        if not hasattr(self, "configs") or not hasattr(self, "amplitudes"):
+            raise RuntimeError(
+                "Initialize the Torch VMC driver before checking convergence."
+            )
+        if isinstance(burn_in, bool) or not isinstance(burn_in, int) or burn_in < 0:
+            raise ValueError("burn_in must be a non-negative integer.")
+        min_chain_length = _check_positive_int(
+            "min_chain_length",
+            min_chain_length,
+        )
+        max_chain_length = _check_positive_int(
+            "max_chain_length",
+            max_chain_length,
+        )
+        if max_chain_length < min_chain_length:
+            raise ValueError(
+                "max_chain_length must be at least min_chain_length."
+            )
+        try:
+            target_effective_samples_per_chain = float(
+                target_effective_samples_per_chain
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "target_effective_samples_per_chain must be positive and finite."
+            ) from exc
+        if (
+            not math.isfinite(target_effective_samples_per_chain)
+            or target_effective_samples_per_chain <= 0
+        ):
+            raise ValueError(
+                "target_effective_samples_per_chain must be positive and finite."
+            )
+        if rhat_threshold is not None:
+            try:
+                rhat_threshold = float(rhat_threshold)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "rhat_threshold must be at least 1 or None."
+                ) from exc
+            if not math.isfinite(rhat_threshold) or rhat_threshold < 1.0:
+                raise ValueError(
+                    "rhat_threshold must be at least 1 or None."
+                )
+        if check_interval is None:
+            check_interval = max(1, min_chain_length // 10)
+        check_interval = _check_positive_int("check_interval", check_interval)
+
+        if observables is None:
+            observable_items = (("energy", None),)
+        else:
+            try:
+                observable_items = tuple(observables.items())
+            except AttributeError as exc:
+                raise TypeError(
+                    "observables must be a mapping of names to native terms."
+                ) from exc
+            if not observable_items:
+                raise ValueError("observables must contain at least one entry.")
+        observable_items = tuple(
+            (str(name), terms) for name, terms in observable_items
+        )
+        observable_map = dict(observable_items)
+        n_chains = self.n_walkers
+        if n_chains < 2:
+            raise ValueError(
+                "check_mc_convergence requires at least two active chains."
+            )
+        model_device = self.configs.device
+
+        def make_generator():
+            if seed is None and self.generator is None:
+                return None
+            try:
+                generator = torch.Generator(device=model_device)
+            except (RuntimeError, TypeError, ValueError):
+                generator = torch.Generator()
+            if seed is not None:
+                generator.manual_seed(int(seed))
+            else:
+                try:
+                    generator.set_state(self.generator.get_state())
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Could not clone the active Torch RNG state for the "
+                        "temporary convergence sampler. Pass seed=... instead."
+                    ) from exc
+            return generator
+
+        if self.terms is not None:
+            temporary_terms = self.terms
+            temporary_connection_fn = None
+            temporary_connection_kwargs = None
+        else:
+            temporary_terms = None
+            temporary_connection_fn = self.connection_fn
+            temporary_connection_kwargs = self.connection_kwargs
+
+        fork_devices = []
+        if getattr(model_device, "type", None) == "cuda":
+            fork_devices = [
+                0 if model_device.index is None else int(model_device.index)
+            ]
+
+        histories = {name: [] for name in observable_map}
+        n_proposed = 0
+        n_accepted = 0
+        start = time.perf_counter()
+        bar = _make_progress(
+            progress,
+            total=burn_in + max_chain_length,
+            desc="MC convergence",
+            unit="sweep",
+        )
+
+        def update_progress(result):
+            nonlocal n_proposed, n_accepted
+            n_proposed += result.n_proposed
+            n_accepted += result.n_accepted
+            if bar is not None:
+                bar.update(1)
+                _set_vmc_progress_postfix(
+                    bar,
+                    replace(
+                        result,
+                        n_proposed=n_proposed,
+                        n_accepted=n_accepted,
+                    ),
+                    progress_postfix="acceptance",
+                )
+
+        def make_estimates():
+            estimates = {}
+            for name, values in histories.items():
+                chain_values = torch.stack(values, dim=0)
+                diagnostics = torch_chain_diagnostics(
+                    chain_values,
+                    split_rhat=True,
+                )
+                flat_values = chain_values.reshape(-1)
+                mean, variance = _energy_mean_and_variance(flat_values)
+                effective_sample_size = diagnostics.effective_sample_size
+                stderr = torch.sqrt(
+                    variance
+                    / torch.clamp(effective_sample_size, min=1.0)
+                )
+                split_r_hat = (
+                    diagnostics.split_r_hat
+                    if diagnostics.split_r_hat is not None
+                    else diagnostics.r_hat
+                )
+                max_tau = diagnostics.max_integrated_autocorrelation_time
+                effective_per_chain = effective_sample_size / n_chains
+                max_tau_float = float(max_tau.detach().cpu())
+                recommended_sweep_size = (
+                    max(1, int(math.ceil(max_tau_float)))
+                    if math.isfinite(max_tau_float)
+                    else 1
+                )
+                finite = all(
+                    bool(torch.isfinite(torch.as_tensor(value)).all())
+                    for value in (
+                        mean,
+                        variance,
+                        split_r_hat,
+                        diagnostics.integrated_autocorrelation_time,
+                        max_tau,
+                        effective_sample_size,
+                    )
+                )
+                reasons = []
+                if not finite:
+                    reasons.append("non-finite statistics")
+                if rhat_threshold is not None and (
+                    not bool(torch.isfinite(split_r_hat))
+                    or float(split_r_hat.detach().cpu()) > rhat_threshold
+                ):
+                    reasons.append(
+                        f"split R-hat={float(split_r_hat.detach().cpu()):.4f} "
+                        f"> {rhat_threshold:.4f}"
+                    )
+                if (
+                    not bool(torch.isfinite(effective_per_chain))
+                    or float(effective_per_chain.detach().cpu())
+                    < target_effective_samples_per_chain
+                ):
+                    reasons.append(
+                        "effective samples/chain="
+                        f"{float(effective_per_chain.detach().cpu()):.1f} "
+                        f"< {target_effective_samples_per_chain:.1f}"
+                    )
+                reliable = not reasons
+                estimates[name] = TorchVMCConvergenceEstimate(
+                    mean=mean,
+                    variance=variance,
+                    stderr=stderr,
+                    r_hat=diagnostics.r_hat,
+                    split_r_hat=split_r_hat,
+                    integrated_autocorrelation_time=(
+                        diagnostics.integrated_autocorrelation_time
+                    ),
+                    max_integrated_autocorrelation_time=max_tau,
+                    effective_sample_size=effective_sample_size,
+                    effective_samples_per_chain=effective_per_chain,
+                    n_samples_per_chain=int(chain_values.shape[0]),
+                    n_chains=n_chains,
+                    recommended_sweep_size=recommended_sweep_size,
+                    reliable=reliable,
+                    reliability_reason=(
+                        "reliable" if reliable else "; ".join(reasons)
+                    ),
+                )
+            return estimates
+
+        rng_context = torch.random.fork_rng(
+            devices=fork_devices,
+            enabled=self.generator is None,
+        )
+        try:
+            with rng_context:
+                temporary = TorchVMCDriver(
+                    self.model,
+                    self.graph,
+                    self.configs.detach().clone(),
+                    connection_fn=temporary_connection_fn,
+                    terms=temporary_terms,
+                    site_order=self.site_order,
+                    connection_kwargs=temporary_connection_kwargs,
+                    term_constant=self.term_constant,
+                    amplitudes=self.amplitudes.detach().clone(),
+                    proposal=self.proposal,
+                    hopping_rate=self.hopping_rate,
+                    spin_flip_rate=self.spin_flip_rate,
+                    pair_toggle_rate=self.pair_toggle_rate,
+                    encoding=self.encoding,
+                    chunk_size=self.chunk_size,
+                    compile_kernels=self.compile_kernels,
+                    log_amplitude_fn=(
+                        self.log_amplitude_fn
+                        if self.log_amplitude_fn is not None
+                        else False
+                    ),
+                    generator=make_generator(),
+                )
+                for _ in range(burn_in):
+                    update_progress(temporary.sample_sweep())
+
+                for step in range(1, max_chain_length + 1):
+                    update_progress(temporary.sample_sweep())
+                    values = temporary.local_observables(observable_map)
+                    for name, value in values.items():
+                        histories[name].append(value.detach())
+
+                    should_check = (
+                        step >= min_chain_length
+                        and (
+                            step == min_chain_length
+                            or (step - min_chain_length) % check_interval == 0
+                        )
+                    )
+                    if should_check:
+                        current = make_estimates()
+                        if all(estimate.reliable for estimate in current.values()):
+                            break
+                estimates = make_estimates()
+        finally:
+            if bar is not None:
+                bar.close()
+
+        n_steps = len(next(iter(histories.values())))
+        reliable = all(estimate.reliable for estimate in estimates.values())
+        if reliable:
+            reliability_reason = (
+                "all observables met the split-R-hat and effective-sample "
+                "targets"
+            )
+        else:
+            details = " | ".join(
+                f"{name}: {estimate.reliability_reason}"
+                for name, estimate in estimates.items()
+                if not estimate.reliable
+            )
+            reliability_reason = (
+                "maximum chain length reached before convergence: " + details
+            )
+        recommended_sweep_size = max(
+            estimate.recommended_sweep_size for estimate in estimates.values()
+        )
+        elapsed = time.perf_counter() - start
+        return TorchVMCConvergenceReport(
+            estimates=estimates,
+            n_samples_per_chain=n_steps,
+            n_chains=n_chains,
+            burn_in=burn_in,
+            sweep_size=1,
+            n_sweeps=n_steps,
+            n_proposed=n_proposed,
+            n_accepted=n_accepted,
+            acceptance_rate=(n_accepted / n_proposed if n_proposed else 0.0),
+            elapsed_seconds=elapsed,
+            reliable=reliable,
+            reliability_reason=reliability_reason,
+            recommended_sweep_size=recommended_sweep_size,
+            min_chain_length=min_chain_length,
+            max_chain_length=max_chain_length,
+            target_effective_samples_per_chain=target_effective_samples_per_chain,
+            rhat_threshold=rhat_threshold,
+        )
 
     def measure_samples(
         self,

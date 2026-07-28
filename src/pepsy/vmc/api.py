@@ -833,6 +833,10 @@ class VMC:
             proposal_log_probs=proposal_log_probs,
         )
 
+    def check_mc_convergence(self, **kwargs):
+        """Run the selected backend's explicit post-run mixing diagnostic."""
+        return self._setup.check_mc_convergence(**kwargs)
+
     def optimize(self, optimization=None, *, n_steps=None, **kwargs):
         """Optimize the variational state through the selected backend."""
         return self._setup.optimize(
