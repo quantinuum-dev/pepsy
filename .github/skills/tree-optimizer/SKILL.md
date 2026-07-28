@@ -196,7 +196,7 @@ one-node case.
   connected subtree via `ttn.subtree_span(nodes)` (union of tree paths from
   `nodes[0]`; generalises `steiner_nodes` to arbitrary internal nodes).
 - `ttn.canonize_around_qubits_(qubits)` is the qubit-level "range" entry point =
-  `canonize_subtree_(leaves_of(qubits), span=True)`.
+  `canonize_subtree_(nodes_of(qubits), span=True)`.
 - `ttn.is_subtree_canonical_form(nodes=None, span=False)` verifies every outside
   tensor is an inward isometry (defaults to the tracked region);
   `is_canonical_form` is its one-node case and delegates to it.
@@ -211,11 +211,11 @@ This is the paper's accuracy point (Figs. 3-6) -- do not regress it.
 
 1. SVD-split the gate into left/right factors joined by a virtual bond
    (`cutoff=0.0`, exact rank `k <= 4`).
-2. Move the centre to leaf `a`, absorb the left factor into `a`.
-3. Thread the virtual bond **exactly** along the geodesic to leaf `b` via
+2. Move the centre to physical node `a`, absorb the left factor into `a`.
+3. Thread the virtual bond **exactly** along the geodesic to physical node `b` via
    `_thread_hop` (economical **QR**, lossless, `absorb="right"`); the crossed
    bond grows transiently by at most `k <= 4`.
-4. Absorb the right factor into leaf `b`.
+4. Absorb the right factor into physical node `b`.
 5. Only now run `_compress_path` -- a single canonical compression sweep back
    along the geodesic, truncating every touched bond to `chi`.
 
@@ -302,7 +302,7 @@ interface use the dense `to_dense()` fallback and remain subject to
   when the gauge is unknown; native readout leaves the gauge untouched.
   Normalized native readout reuses a state-versioned norm denominator until a
   mutation invalidates it.
-- `measure(q, outcome=None)`: move centre to the leaf, read exact Born
+- `measure(q, outcome=None)`: move centre to the physical node, read exact Born
   probabilities from that one tensor (`w_i = sum_bond |t[i,bond]|^2`,
   normalise), sample via `self.rng.choice` or force `outcome`, project with a
   one-hot `apply_1q`, then `normalize()`. Returns the outcome bit. `reset(q)` =
@@ -321,6 +321,9 @@ interface use the dense `to_dense()` fallback and remain subject to
   branch norm, and both can return support/span/bond/norm diagnostics.
 - `to_dense()` returns a host NumPy statevector in `k0, k1, ..., k(n-1)` order;
   it is a readout boundary, not evidence that a Torch/CuPy live state moved.
+- `ps_to_ttn`, `hrs_to_ttn`, and `TreeSampler` resolve physical sites through
+  `node_of_qubit`, so an optional root site is constructed and sampled in the
+  same `q0..q(n-1)` order as leaf sites.
 - `run(progbar=True)` shows a tqdm replay bar with one-/two-/multi-qubit
   counts, current bond usage, norm, and a norm-based truncation proxy. Dense and
   native fermionic replay use the same `1 - (norm / reference_norm)^2` proxy;

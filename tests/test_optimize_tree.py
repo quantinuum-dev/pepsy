@@ -371,6 +371,41 @@ def test_root_physical_qubit_is_first_class_tree_site():
     assert state.validate(check_canonical=True) is state
 
 
+@pytest.mark.parametrize("root_qubit", [0, 1])
+def test_two_qubit_tree_uses_distinct_root_and_leaf_sites(root_qubit):
+    """The smallest root-site tree uses a unary root over one physical leaf."""
+    leaf_qubit = 1 - root_qubit
+    plan = TreePlan.from_order(
+        [leaf_qubit], structure="balanced", root_qubit=root_qubit,
+    )
+    layered = TreePlan.build_layered(
+        [leaf_qubit], block_size=2, root_qubit=root_qubit,
+    )
+    found = TreeLayoutFinder(
+        [], n=2, root_qubit=root_qubit, max_arity=2,
+    ).run()
+    automatic = TreeOptimizer(
+        None, n=2, root_qubit=root_qubit, max_arity=2, run=False,
+    )
+
+    for candidate in (plan, layered, found):
+        assert candidate.n == 2
+        assert candidate.root_qubit == root_qubit
+        assert candidate.node_of_qubit[root_qubit] == candidate.root
+        assert candidate.node_of_qubit[leaf_qubit] != candidate.root
+        assert len(candidate.children[candidate.root]) == 1
+    assert automatic.plan.node_of_qubit[root_qubit] == automatic.plan.root
+    assert automatic.tn.validate(check_canonical=True) is automatic.tn
+
+    stream = [
+        (pepsy.h(), root_qubit),
+        (pepsy.cnot(), (root_qubit, leaf_qubit)),
+    ]
+    opt = TreeOptimizer(stream, tree=plan, chi=8)
+    assert _fidelity(_exact_state(stream, 2), opt.to_dense()) > 1 - 1e-12
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
 def test_root_physical_qubit_gate_and_submpo_replay_are_exact():
     """Direct gates and a structured sub-MPO can target the top physical leg."""
     plan = TreePlan.from_order(
@@ -432,6 +467,7 @@ def test_root_physical_qubit_layout_and_cap_are_root_aware():
     assert automatic.plan.root_qubit == 4
 
     opt = TreeOptimizer(None, tree=plan, chi=16, run=False)
+    assert opt.layout_report()["root_qubit"] == 4
     opt.apply_1q(pepsy.h(), 4)
     x = np.array([[0.0, 1.0], [1.0, 0.0]])
     assert opt.tn.local_expectation(x, 4) == pytest.approx(1.0)
@@ -441,6 +477,21 @@ def test_root_physical_qubit_layout_and_cap_are_root_aware():
     assert opt.to_dense().shape == (2**4,)
     assert opt.norm() == pytest.approx(1 / np.sqrt(2))
     assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_explicit_tree_rejects_mismatched_n():
+    """Explicit plans enforce the same qubit-count invariant as finders."""
+    plan = TreePlan.from_order(
+        range(4), structure="balanced", root_qubit=4,
+    )
+    with pytest.raises(
+        ValueError, match=r"tree contains 5 qubits, but n=4"
+    ):
+        TreeOptimizer(None, n=4, tree=plan, run=False)
+    with pytest.raises(
+        ValueError, match=r"tree contains 5 qubits, but n=4"
+    ):
+        TreeOptimizer(None, n=4, layout=plan, run=False)
 
 
 def test_layout_finder_builds_valid_tree():
@@ -2022,6 +2073,36 @@ def test_ps_to_ttn_matches_product_state_constructor_api():
     plan = TreePlan.from_order(range(4), structure="balanced")
     explicit = pepsy.ps_to_ttn(4, tree=plan)
     assert explicit.plan is plan
+
+
+def test_product_ttn_constructors_support_a_physical_root_site():
+    """Product/random public constructors resolve every physical node."""
+    theta = 0.23
+    local = np.array([np.cos(theta), np.sin(theta)], dtype="complex128")
+    expected = local
+    for _ in range(4):
+        expected = np.kron(expected, local)
+
+    plan = TreePlan.from_order(
+        [0, 1, 3, 4], structure="balanced", root_qubit=2,
+    )
+    explicit = pepsy.ps_to_ttn(5, tree=plan, theta=theta)
+    automatic = pepsy.ps_to_ttn(5, root_qubit=2, theta=theta)
+    smallest = pepsy.ps_to_ttn(2, root_qubit=1, theta=theta)
+    random = pepsy.hrs_to_ttn(5, root_qubit=2, seed=11)
+
+    assert explicit.plan is plan
+    assert automatic.plan.root_qubit == 2
+    assert smallest.plan.n == 2
+    assert smallest.plan.root_qubit == 1
+    assert random.plan.root_qubit == 2
+    assert np.allclose(explicit.to_statevector(), expected)
+    assert np.allclose(automatic.to_statevector(), expected)
+    assert random.to_statevector().shape == (2**5,)
+    assert explicit.validate(check_canonical=True) is explicit
+
+    with pytest.raises(ValueError, match="root_qubit does not match"):
+        pepsy.ps_to_ttn(5, tree=plan, root_qubit=3)
 
 
 def test_ttn_copy_preserves_geometry_and_type():

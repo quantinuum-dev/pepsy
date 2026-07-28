@@ -147,6 +147,7 @@ _SYMBOL_MODULES = {
     "TreeEnergyOptimizer": ".optimizers",
     "TreeLayoutFinder": ".optimizers",
     "TreeOptimizer": ".optimizers",
+    "TreePlan": ".optimizers",
     "TreeStabOptimizer": ".optimizers",
     "TreeTensorNetwork": ".optimizers",
     "compile_stim_circuit": ".optimizers",
@@ -346,7 +347,7 @@ if TYPE_CHECKING:
         y,
         z,
     )
-    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StabilizerTreeRunResult, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeOptimizer, TreeStabOptimizer, run_stabilizer_mps_stream, run_stabilizer_tree_stream  # noqa: F401
+    from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StabilizerTreeRunResult, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeOptimizer, TreePlan, TreeStabOptimizer, run_stabilizer_mps_stream, run_stabilizer_tree_stream  # noqa: F401
     from .sampling import FermionConfigurationEncoding, MpsDiagonalEstimate, MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler  # noqa: F401
     from .solvers import FDSolver  # noqa: F401
     from .tensors import (  # noqa: F401

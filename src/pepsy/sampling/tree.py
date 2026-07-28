@@ -92,7 +92,7 @@ class TreeSampleResult:
     probs : list[float]
         Born probability ``|<config|psi>|**2`` for each sample.
     nqubits : int
-        Number of qubit leaves in the tree.
+        Number of physical qubit sites in the tree.
     """
 
     configs: list[list[int]]
@@ -138,7 +138,7 @@ class TreeBatchSampleResult:
     probs : np.ndarray
         Born probabilities for ``configs`` with shape ``(n_samples,)``.
     nqubits : int
-        Number of qubit leaves in the tree.
+        Number of physical qubit sites in the tree.
     """
 
     configs: np.ndarray
@@ -237,7 +237,7 @@ class TreeSampler:
         self._nqubits = None
         self._root = None
         self._children = None
-        self._qubit_of_leaf = None
+        self._qubit_of_node = None
         self._arrays = None
         self._fermionic = False
         self._configuration_encoding = None
@@ -292,11 +292,13 @@ class TreeSampler:
     def _extract_arrays(self, tn):
         """Extract per-node dense arrays with a canonical axis order.
 
-        Leaf arrays have axes ``(parent_bond, phys)``; internal arrays have
-        axes ``(parent_bond, child_0, child_1, ...)``.  The root is given a
-        dummy parent bond of size 1 so the sampling recursion is uniform.  The
-        root array is L2-normalized in place, which normalizes the whole state
-        because every other tensor is isometric in this canonical form.
+        Every array starts with its parent bond, with the root receiving a
+        dummy parent bond of size 1. A physical site's axis comes next, followed
+        by its child bonds. Thus a leaf has ``(parent_bond, phys)``, a
+        virtual-only internal node has ``(parent_bond, child_0, ...)``, and a
+        physical root has ``(dummy_parent, phys, child_0, ...)``. The root array
+        is L2-normalized in place, which normalizes the whole state because
+        every other tensor is isometric in this canonical form.
 
         Bond indices are resolved by intersecting adjacent node tensors rather
         than by the deterministic ``_tb{lo}_{hi}`` names, because gate threading
@@ -305,7 +307,7 @@ class TreeSampler:
         plan = tn.plan
         root = plan.root
         children = {nid: tuple(plan.children[nid]) for nid in plan.children}
-        qubit_of_leaf = dict(plan.qubit_of_leaf)
+        qubit_of_node = dict(plan.qubit_of_node)
 
         # Native Symmray fermionic trees keep block-sparse arrays; densify them
         # once.  A graded-canonical tensor is also plain-isometric (its exchange
@@ -333,21 +335,16 @@ class TreeSampler:
             t = tn.node_tensor(nid)
             is_root = nid == root
             parent = plan.parent.get(nid)
-            if not ch:  # leaf
-                phys = tn.site_ind(qubit_of_leaf[nid])
-                if is_root:  # single-qubit tree
-                    arr = to_arr(t.transpose(phys).data).reshape(1, -1)
-                else:
-                    pbond = bond_between(nid, parent)
-                    arr = to_arr(t.transpose(pbond, phys).data)
-            else:  # internal node
-                cbonds = [bond_between(nid, c) for c in ch]
-                if is_root:
-                    arr = to_arr(t.transpose(*cbonds).data)
-                    arr = arr.reshape((1,) + arr.shape)
-                else:
-                    pbond = bond_between(nid, parent)
-                    arr = to_arr(t.transpose(pbond, *cbonds).data)
+            ordered_inds = []
+            if not is_root:
+                ordered_inds.append(bond_between(nid, parent))
+            q = qubit_of_node.get(nid)
+            if q is not None:
+                ordered_inds.append(tn.site_ind(q))
+            ordered_inds.extend(bond_between(nid, child) for child in ch)
+            arr = to_arr(t.transpose(*ordered_inds).data)
+            if is_root:
+                arr = arr.reshape((1,) + arr.shape)
             arrays[nid] = arr
 
         # Normalize via the root array (state is canonical with centre = root).
@@ -359,20 +356,20 @@ class TreeSampler:
         self._nqubits = int(plan.n)
         self._root = root
         self._children = children
-        self._qubit_of_leaf = qubit_of_leaf
+        self._qubit_of_node = qubit_of_node
         self._arrays = arrays
         self._fermionic = fermionic
         self._configuration_encoding = (
-            self._build_configuration_encoding(tn, arrays, qubit_of_leaf)
+            self._build_configuration_encoding(tn, arrays, qubit_of_node)
             if fermionic
             else None
         )
 
-    def _build_configuration_encoding(self, tn, arrays, qubit_of_leaf):
+    def _build_configuration_encoding(self, tn, arrays, qubit_of_node):
         """Build the dense-basis occupation decoder for a fermionic tree."""
-        if not qubit_of_leaf:
+        if not qubit_of_node:
             return None
-        phys_dim = int(arrays[next(iter(qubit_of_leaf))].shape[-1])
+        phys_dim = int(arrays[next(iter(qubit_of_node))].shape[1])
         fermion = self._fermion
         if fermion is not None and hasattr(fermion, "spinful"):
             spinful = bool(fermion.spinful)
@@ -393,7 +390,7 @@ class TreeSampler:
 
     @property
     def nqubits(self) -> int:
-        """Number of qubit leaves in the tree."""
+        """Number of physical qubit sites in the tree."""
         return self._nqubits
 
     # -- sampling ------------------------------------------------------------
@@ -403,7 +400,7 @@ class TreeSampler:
         B = int(n_samples)
         arrays = self._arrays
         children = self._children
-        qubit_of_leaf = self._qubit_of_leaf
+        qubit_of_node = self._qubit_of_node
         configs = np.zeros((B, self._nqubits), dtype=np.int64)
         prob = np.ones(B, dtype=np.float64)
         batch = np.arange(B)
@@ -412,10 +409,13 @@ class TreeSampler:
             # rho: (B, d_par, d_par) reduced density on nid's parent bond.
             ch = children[nid]
             arr = arrays[nid]
-            if not ch:  # leaf
+            q = qubit_of_node.get(nid)
+            if q is not None:
                 # p[B, x] = Re sum_{a,a'} rho[a,a'] T[a,x] conj(T[a',x]).
-                tmp = np.einsum("BaA,ax->BAx", rho, arr)
-                p = np.einsum("BAx,Ax->Bx", tmp, arr.conj()).real
+                flat = arr.reshape(arr.shape[0], arr.shape[1], -1)
+                p = np.einsum(
+                    "BaA,axF,AxF->Bx", rho, flat, flat.conj()
+                ).real
                 p = np.clip(p, 0.0, None)
                 total = p.sum(axis=1, keepdims=True)
                 probs = p / np.where(total > 0.0, total, 1.0)
@@ -423,22 +423,39 @@ class TreeSampler:
                 cdf = np.cumsum(probs, axis=1)
                 x = (draws[:, None] > cdf).sum(axis=1)
                 x = np.minimum(x, probs.shape[1] - 1).astype(np.int64)
-                configs[:, qubit_of_leaf[nid]] = x
+                configs[:, q] = x
                 prob[:] *= probs[batch, x]
-                # phi[B, a] = T[a, x] -- the collapsed subtree amplitude.
-                return arr[:, x].T
+                # Selecting one physical value leaves a batched tensor over
+                # the parent and child bonds. A physical leaf has no remaining
+                # child axes and can return immediately.
+                selected = np.moveaxis(arr[:, x, ...], 1, 0)
+                if not ch:
+                    return selected.reshape(B, arr.shape[0])
 
-            par = arr.shape[0]
-            # First child: trace the (unbatched) future siblings to identity.
-            d0 = arr.shape[1]
-            F0 = int(np.prod(arr.shape[2:])) if len(ch) > 1 else 1
-            ur = arr.reshape(par, d0, F0)
-            env = np.einsum("acF,AdF->acAd", ur, ur.conj())
-            rho0 = np.einsum("BaA,acAd->Bcd", rho, env)
-            phi0 = visit(ch[0], rho0)
-            # Collapse child 0 into the node tensor -> batched remainder.
-            K = np.tensordot(phi0, arr, axes=([1], [1]))  # (B, par, d1, ...)
-            for i in range(1, len(ch)):
+                par = arr.shape[0]
+                K = selected
+                start = 0
+            else:
+                if not ch:
+                    raise ValueError(
+                        f"virtual tree leaf {nid} has no physical qubit."
+                    )
+
+                par = arr.shape[0]
+                # First child: trace the (unbatched) future siblings to
+                # identity. This avoids broadcasting every virtual-only node
+                # across the sample batch.
+                d0 = arr.shape[1]
+                F0 = int(np.prod(arr.shape[2:])) if len(ch) > 1 else 1
+                ur = arr.reshape(par, d0, F0)
+                env = np.einsum("acF,AdF->acAd", ur, ur.conj())
+                rho0 = np.einsum("BaA,acAd->Bcd", rho, env)
+                phi0 = visit(ch[0], rho0)
+                # Collapse child 0 into the node tensor -> batched remainder.
+                K = np.tensordot(phi0, arr, axes=([1], [1]))
+                start = 1
+
+            for i in range(start, len(ch)):
                 di = K.shape[2]
                 Fi = int(np.prod(K.shape[3:])) if K.ndim > 3 else 1
                 Kf = K.reshape(B, par, di, Fi)
@@ -506,20 +523,31 @@ class TreeSampler:
     def _amplitudes(self, configs):
         arrays = self._arrays
         children = self._children
-        qubit_of_leaf = self._qubit_of_leaf
+        qubit_of_node = self._qubit_of_node
         B = configs.shape[0]
 
         def visit(nid):
             ch = children[nid]
             arr = arrays[nid]
-            if not ch:  # leaf
-                x = configs[:, qubit_of_leaf[nid]]
-                return arr[:, x].T  # (B, d_par)
+            q = qubit_of_node.get(nid)
+            if q is not None:
+                x = configs[:, q]
+                K = np.moveaxis(arr[:, x, ...], 1, 0)
+                if not ch:
+                    return K.reshape(B, arr.shape[0])
+                start = 0
+            else:
+                if not ch:
+                    raise ValueError(
+                        f"virtual tree leaf {nid} has no physical qubit."
+                    )
+                K = None
+                start = 0
+
             par = arr.shape[0]
-            K = None
             for i, child in enumerate(ch):
                 phi_c = visit(child)
-                if i == 0:
+                if K is None and i == start:
                     K = np.tensordot(phi_c, arr, axes=([1], [1]))
                 else:
                     di = K.shape[2]

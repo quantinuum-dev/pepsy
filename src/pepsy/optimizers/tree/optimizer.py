@@ -617,6 +617,10 @@ class TreeOptimizer:
             tree = self.layout_finder.run()
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan or None.")
+        if tree.n != self.n:
+            raise ValueError(
+                f"tree contains {tree.n} qubits, but n={self.n} was requested."
+            )
         if root_qubit is not None and tree.root_qubit != root_qubit:
             raise ValueError(
                 "root_qubit does not match the supplied tree/layout plan."
@@ -1400,6 +1404,8 @@ class TreeOptimizer:
         if self.layout_finder is None:
             return {
                 "n_qubits": self.n,
+                "root": self.plan.root,
+                "root_qubit": self.plan.root_qubit,
                 "is_binary": self.plan.is_binary(),
                 "max_arity": self.plan.max_arity(),
             }

@@ -306,13 +306,15 @@ readout, `pepsy.TreeEnergyOptimizer` wraps this batch path and returns an
 
 For the package-level product-state constructor, matching `ps_to_mps`, use
 `pepsy.ps_to_ttn(n, theta=..., tree=...)`. It builds the requested tree,
-initialises every leaf with `[cos(theta), sin(theta)]`, and optionally expands
-the virtual bonds with `chi`.
+initialises every physical site with `[cos(theta), sin(theta)]`, and optionally
+expands the virtual bonds with `chi`. Pass `root_qubit=q` to build the plan
+directly, or supply a matching root-site `TreePlan` through `tree=`.
 
 For a native Symmray fermionic state, pass a `Fermion` model and occupations:
 `pepsy.ps_to_ttn(n, tree=plan, fermion=fermion, occupations=..., chi=1)`.
-Leaves then carry the model's physical charge/parity sectors, internal nodes
-are neutral, and every tree edge uses conjugate Symmray virtual indices.
+Physical sites then carry the model's charge/parity sectors, virtual-only
+internal nodes are neutral, and every tree edge uses conjugate Symmray virtual
+indices.
 The constructor selects a definite local Fock basis vector, not a random vector
 inside a degenerate charge sector. For spinful `U1`/`Z2`, a scalar occupation
 `1` selects the checkerboard `|up>, |down>, ...` representative; pass
@@ -320,8 +322,13 @@ inside a degenerate charge sector. For spinful `U1`/`Z2`, a scalar occupation
 graded product tree is normalized by an exact graded norm contraction, so its
 represented norm is one rather than an arbitrary constructor scalar.
 `pepsy.hrs_to_ttn(..., chi=...)` creates the corresponding random symmetric
-tree with the requested charge-sector bond dimension. These constructors keep
-the Symmray arrays native; they do not materialize dense tensor data.
+tree with the requested charge-sector bond dimension and accepts the same
+`root_qubit=` option. These constructors keep the Symmray arrays native; they
+do not materialize dense tensor data.
+
+`pepsy.TreeSampler(state)` samples every registered physical site, including
+the optional root site. Its cached canonical arrays use parent, physical, then
+child axes, so probabilities and amplitudes retain normal `q0..q(n-1)` order.
 
 `TreeTensorNetwork.show()` prints a top-down ASCII drawing of the tree -- the
 tree analogue of a quimb MPS `show()` -- with the root at the top, structural
@@ -384,7 +391,8 @@ any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
   bisection. Binary trees remain a valid special case (`max_arity=2`).
 
 A caller may bypass the finder entirely by passing an explicit `TreePlan` via
-`TreeOptimizer(..., tree=plan)`. Build one with
+`TreeOptimizer(..., tree=plan)`. `TreePlan` is exported from both `pepsy` and
+`pepsy.optimizers.tree`. Build one with
 `TreePlan.from_order(order, weights=..., structure=..., max_arity=...)`, or -- for
 a fully hand-specified arbitrary-arity tree -- with
 `TreePlan.from_children(children, qubit_of_leaf)`, which validates that the
@@ -664,7 +672,7 @@ For stream control events, `TreeOptimizer.measure_event`,
 `cap_event`, `reset_event`, and `measure_reset_event` build the same tuple forms as
 `MpsOptimizer`, including Pauli-basis measurement and reset. Their recorded
 results are `(pauli, where, outcome, probability)` in `measurements`.
-`cap(q, vec)` contracts and removes one leaf, shifting the remaining labels
+`cap(q, vec)` contracts and removes one physical site, shifting the remaining labels
 above `q` down by one unless stable labels are requested. `normalize()` rescales the represented state to unit
 norm and `max_bond()` reports the largest virtual bond. Truncation details are
 available through `truncation_report()`, `get_infidelities()`, and
@@ -679,7 +687,8 @@ available through `truncation_report()`, `get_infidelities()`, and
   QR bond-threading and double-bond fusion of the general geodesic route and is
   the common case in a locality-aware layout.
 
-- **Thread cap.** Tree tensors are small (rank `<= 3`, bounded by `chi`), so
+- **Thread cap.** Tree tensors are moderate-rank (set by local arity and the
+  optional root physical leg, with dimensions bounded by `chi`), so
   multi-threaded BLAS/OpenMP linear algebra is dominated by thread launch and
   synchronisation overhead. `TreeOptimizer` caps threads to `1` around gate
   application and the heavy read-outs by default (`threads=1`), which makes

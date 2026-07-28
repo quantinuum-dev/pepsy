@@ -5,9 +5,10 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
 
 ## Performance and stability
 
-- **BLAS thread cap is the biggest performance lever.** Tree tensors are tiny
-  (rank `<= 3`, bounded by `chi`), so multi-threaded BLAS/OpenMP is dominated
-  by thread launch/sync overhead. `threads=1` is the default; gate
+- **BLAS thread cap is the biggest performance lever.** Tree tensors are
+  moderate-rank (set by local arity and an optional root physical leg, with
+  dimensions bounded by `chi`), so multi-threaded BLAS/OpenMP is dominated by
+  thread launch/sync overhead. `threads=1` is the default; gate
   application and heavy readouts run inside `self._thread_ctx()` using
   `threadpoolctl` when available. Only raise `threads` in a large-`chi` regime.
 - The self-healing tid cache (`_nid_to_tid`, `_tid`) validates cached tensor
