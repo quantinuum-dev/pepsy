@@ -11,7 +11,7 @@ except ImportError:  # pragma: no cover - optional dependency
     torch = None
 
 __all__ = [
-    "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
+    "build_backend", "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
     "register_torch_linalg", "reg_rel_svd_torch", "reg_real_svd_torch",
     "reg_complex_svd_torch", "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
@@ -155,6 +155,33 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
         return out
 
     return cast_array
+
+
+def build_backend(device="cpu", dtype=None, requires_grad=False, *, set_default=True):
+    """Build the standard Torch array backend, defaulting to CPU.
+
+    The existing :func:`backend_torch` name remains unchanged.  This helper is
+    the concise public entry point for workflows that want one backend
+    converter and one package-wide default::
+
+        import pepsy as py
+        to_backend = py.build_backend()  # Torch CPU
+
+    Parameters are forwarded to :func:`backend_torch`.  By default the
+    resulting converter is also installed as Pepsy's default array backend;
+    pass ``set_default=False`` when only the returned converter should be
+    used.  Explicit ``to_backend=`` / ``array_backend=`` arguments continue to
+    take precedence in individual APIs.
+    """
+
+    converter = backend_torch(
+        device=device,
+        dtype=dtype,
+        requires_grad=requires_grad,
+    )
+    if set_default:
+        set_default_array_backend(converter)
+    return converter
 
 
 def backend_numpy(dtype=np.float64):

@@ -1090,6 +1090,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._unitary_initial_norm = None
         self._unitary_previous_norm = None
         self._unitary_global_norm_tracking = False
+        self._backend_mismatch_warned = False
         self._init_canonicalization()
 
     def _info_for_state(self, p, info=None):
@@ -1327,6 +1328,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._su_gauges_state = None
         self._su_force_regauge = self.mode == "su"
         self.p_ungauged = None
+        self._backend_mismatch_warned = False
         self._init_canonicalization()
 
     def normalize(self, eps=1e-15, insert=None):
@@ -1395,6 +1397,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied._unitary_initial_norm = self._unitary_initial_norm
         copied._unitary_previous_norm = self._unitary_previous_norm
         copied._unitary_global_norm_tracking = self._unitary_global_norm_tracking
+        copied._backend_mismatch_warned = self._backend_mismatch_warned
         copied._su_gauges_supplied = True
         copied._su_gauges_ready = self._su_gauges_ready
         copied._su_gauges_state = copied.p if self._su_gauges_ready else None
@@ -2364,6 +2367,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``event_seq`` must contain only ``"gate"``/``"submpo"`` events. Control
         events (measure/cap/reset) are handled by :meth:`_run_segmented`.
         """
+        # Prepare gate and sub-MPO payloads once per executable segment. The
+        # converter returns already-compatible arrays/networks unchanged,
+        # while foreign payloads are moved to the backend owned by the live
+        # MPS. This keeps exact, simple-update, and compressed modes on one
+        # backend contract.
+        G_seq = self._prepare_gate_stream_backend(G_seq, event_seq)
+
         if self.mode == "dmrg":
             self._prepare_dmrg_state()
             self._run_dmrg(
@@ -2721,6 +2731,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         like = self._state_backend_like()
         if like is None:
             return np.asarray(array, dtype=complex)
+        # Avoid any Autoray conversion for an already-compatible payload. This
+        # is important for Symmray, whose backend intentionally does not expose
+        # a generic ``array`` constructor, and keeps the common matching-gate
+        # path allocation-free for every backend.
+        try:
+            if (
+                ar.infer_backend(array) == ar.infer_backend(like)
+                and getattr(array, "dtype", None) == getattr(like, "dtype", None)
+            ):
+                return array
+        except (AttributeError, TypeError, ValueError):
+            pass
         dtype = getattr(like, "dtype", complex)
         if "complex" not in str(dtype):
             dtype = getattr(
@@ -2736,6 +2758,118 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # The final astype also preserves the complex dtype of the live state.
         arr = ar.do("array", array, like=like)
         return ar.do("astype", arr, dtype)
+
+    def to_backend(self, array):
+        """Return ``array`` on the backend currently owned by ``self.p``.
+
+        Already-compatible arrays are returned by identity. This public helper
+        is intentionally state-derived so replacing the MPS with :meth:`set_p`
+        automatically changes the target backend without stale converter state.
+        """
+        return self._to_state_backend(array)
+
+    def _prepare_gate_stream_backend(self, gates, event_types):
+        """Prepare gate and sub-MPO payloads for the live MPS backend lazily.
+
+        Gate streams are commonly authored as NumPy arrays even when the live
+        MPS uses Torch, JAX, CuPy, or another Autoray backend. The fast path in
+        :meth:`_to_state_backend` returns an already-compatible payload
+        unchanged, so matching streams incur no array copy. One representative
+        gate is used for the stream-level backend decision. Explicit sub-MPO
+        payloads are copied and converted with ``apply_to_arrays`` when needed,
+        preserving their tensor labels and operator bonds.
+        """
+        if not gates:
+            return gates
+        like = self._state_backend_like()
+        like_backend = None
+        like_dtype = None
+        if like is not None:
+            try:
+                like_backend = ar.infer_backend(like)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            like_dtype = getattr(like, "dtype", None)
+
+        # Gate streams are expected to be backend-homogeneous. Inspect one
+        # ordinary gate, then apply that decision to the whole executable
+        # segment so matching streams are left entirely untouched.
+        gate_needs_conversion = like_backend is None
+        gate_backend = None
+        if like_backend is not None:
+            for candidate, event_type in zip(gates, event_types):
+                if event_type != "gate":
+                    continue
+                try:
+                    gate_backend = ar.infer_backend(candidate)
+                    gate_needs_conversion = (
+                        gate_backend != like_backend
+                        or getattr(candidate, "dtype", None) != like_dtype
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    gate_needs_conversion = True
+                break
+
+        if (
+            gate_needs_conversion
+            and gate_backend is not None
+            and gate_backend != like_backend
+            and not self._backend_mismatch_warned
+        ):
+            warnings.warn(
+                "MpsOptimizer converted a gate payload from backend "
+                f"{gate_backend!r} to the live MPS backend "
+                f"{like_backend!r}; provide matching gate payloads to "
+                "avoid this conversion.",
+                UserWarning,
+                stacklevel=3,
+            )
+            self._backend_mismatch_warned = True
+
+        prepared = []
+        for gate, event_type in zip(gates, event_types):
+            if event_type == "gate":
+                if gate_needs_conversion:
+                    gate = self.to_backend(gate)
+            elif event_type == "submpo" and like_backend is not None:
+                # ``apply_to_arrays`` changes only the raw tensor payloads,
+                # unlike rebuilding an MPO, which can lose custom labels or
+                # operator bonds. Keep the caller's stream immutable by
+                # applying it to a shallow network copy.
+                # Tensor-network payloads are expected to use one backend and
+                # dtype throughout, so inspect one representative tensor only.
+                tensor = next(iter(getattr(gate, "tensors", ())), None)
+                if tensor is None:
+                    needs_conversion = False
+                else:
+                    array = tensor.data
+                    try:
+                        needs_conversion = (
+                            ar.infer_backend(array) != like_backend
+                            or getattr(array, "dtype", None) != like_dtype
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        needs_conversion = True
+                if needs_conversion:
+                    if not self._backend_mismatch_warned:
+                        warnings.warn(
+                            "MpsOptimizer converted a sub-MPO payload to the "
+                            f"live MPS backend {like_backend!r}; provide matching "
+                            "sub-MPO payloads to avoid this conversion.",
+                            UserWarning,
+                            stacklevel=3,
+                        )
+                        self._backend_mismatch_warned = True
+                    gate = gate.copy()
+                    apply_to_arrays = getattr(gate, "apply_to_arrays", None)
+                    if not callable(apply_to_arrays):
+                        raise TypeError(
+                            "sub-MPO payloads must provide apply_to_arrays() "
+                            "for backend conversion."
+                        )
+                    apply_to_arrays(self.to_backend)
+            prepared.append(gate)
+        return prepared
 
     def _pauli_operator(self, pauli, where):
         """Return the dense Pauli operator (numpy) for ``pauli`` on ``where``."""

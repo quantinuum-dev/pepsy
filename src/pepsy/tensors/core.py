@@ -11,6 +11,7 @@ from . import contractions as _contractions
 from . import observables as _observables
 from .contractions import (
     build_compressed_optimizer as _build_compressed_optimizer,
+    build_contraction as _build_contraction,
     build_optimizer as _build_optimizer,
     contract_hypercompressed_tn as _contract_hypercompressed_tn,
     contract_hypercompressed_tn_batch,
@@ -43,6 +44,7 @@ from ..backends.config import (
     backend_jax,
     backend_numpy,
     backend_torch,
+    build_backend,
     get_default_array_backend,
     get_default_grad_backend,
     reg_complex_qr_torch,
@@ -77,6 +79,17 @@ def build_optimizer(*args, **kwargs):
         _contractions._ensure_cotengrust = original_ensure
 
 
+def build_contraction(*args, **kwargs):
+    """Compatibility wrapper for :func:`pepsy.tensors.build_contraction`."""
+
+    original_ensure = _contractions._ensure_cotengrust
+    _contractions._ensure_cotengrust = _ensure_cotengrust
+    try:
+        return _build_contraction(*args, **kwargs)
+    finally:
+        _contractions._ensure_cotengrust = original_ensure
+
+
 def build_compressed_optimizer(*args, **kwargs):
     original_ensure = _contractions._ensure_cotengrust
     _contractions._ensure_cotengrust = _ensure_cotengrust
@@ -104,13 +117,13 @@ def contract_hypercompressed_tn(*args, **kwargs):
         _contractions.build_compressed_optimizer = original_build_compressed_optimizer
 
 __all__ = [
-    "OneDMap", "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
+    "OneDMap", "build_backend", "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
     "register_torch_linalg", "reg_rel_svd_torch", "reg_real_svd_torch",
     "reg_complex_svd_torch", "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
     "reg_stop_gradient_torch", "stop_grad", "set_default_array_backend",
     "get_default_array_backend", "set_default_grad_backend", "get_default_grad_backend",
-    "reset_default_backends", "build_optimizer", "build_compressed_optimizer",
+    "reset_default_backends", "build_contraction", "build_optimizer", "build_compressed_optimizer",
     "contract_hypercompressed_tn", "contract_hypercompressed_tn_batch", "tn_fidelity",
     "tn_norm", "measure_obs", "tns_align", "expec_mpo", "id_to_mpo", "id_to_pepo",
     "ps_to_peps", "ps_to_3dpeps", "ps_to_mps", "ps_to_ttn", "ps_to_pepo", "ps_to_mpo",

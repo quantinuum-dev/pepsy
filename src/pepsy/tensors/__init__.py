@@ -84,6 +84,7 @@ _register(
 )
 _register(
     ".contractions",
+    "build_contraction",
     "build_compressed_optimizer",
     "build_optimizer",
     "contract_hypercompressed_tn",
@@ -98,6 +99,7 @@ _register(
     "backend_jax",
     "backend_numpy",
     "backend_torch",
+    "build_backend",
     "get_default_array_backend",
     "get_default_grad_backend",
     "register_torch_linalg",

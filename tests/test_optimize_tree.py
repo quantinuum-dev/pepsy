@@ -1801,6 +1801,19 @@ def test_tree_stream_submpo_does_not_require_dense_materialization(monkeypatch):
     assert report["events"][0]["crossing_edges"]
 
 
+def test_tree_submpo_mode_declares_and_validates_mpo_streams():
+    """The explicit sub-MPO mode accepts MPO events and rejects dense gates."""
+    mpo = _two_branch_flip_submpo(L=4, sites=(0, 3), targets=(0, 3))
+    opt = TreeOptimizer(None, n=4, chi=8, mode="submpo", run=False)
+    opt.run([TreeOptimizer.submpo_event(mpo, (0, 3))])
+    assert opt.mode == "submpo"
+
+    dense = np.asarray(mpo.to_dense())
+    ordinary = TreeOptimizer(None, n=4, chi=8, mode="submpo", run=False)
+    with pytest.raises(ValueError, match="requires explicit sub-MPO"):
+        ordinary.run([(dense, (0, 3))])
+
+
 def test_tree_estimate_bonds_includes_submpo_operator_schmidt_rank():
     """Sub-MPO markers participate in the same conservative bond estimate."""
     mpo = _two_branch_flip_submpo(L=4, sites=(0, 3), targets=(0, 3))
@@ -1961,6 +1974,51 @@ def test_tree_warns_once_when_a_gate_does_not_match_the_state_backend():
         opt.apply_1q(np.eye(2, dtype=complex), 0)
     opt.apply_1q(np.eye(2, dtype=complex), 1)
     assert opt.backend_info()["backend"] == "torch"
+
+
+def test_tree_gate_stream_backend_preparation_is_stream_level():
+    """One representative gate decides conversion for the whole stream."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
+    plan = TreePlan.from_order(range(2), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    for tensor in state.tensor_map.values():
+        tensor.modify(data=to_backend(tensor.data))
+    gates = [
+        np.eye(2, dtype=complex),
+        np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex),
+    ]
+    opt = TreeOptimizer(None, state=state, tree=plan, run=False)
+
+    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
+        prepared = opt._prepare_gate_stream_backend(gates, ["gate", "gate"])
+
+    assert all(torch.is_tensor(gate) for gate in prepared)
+    assert all(isinstance(gate, np.ndarray) for gate in gates)
+
+    matching = [to_backend(gate) for gate in gates]
+    untouched = opt._prepare_gate_stream_backend(matching, ["gate", "gate"])
+    assert untouched[0] is matching[0]
+    assert untouched[1] is matching[1]
+
+
+def test_tree_submpo_stream_backend_preparation_preserves_input():
+    """A mismatched stream sub-MPO is copied and converted by its arrays."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
+    plan = TreePlan.from_order(range(2), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    for tensor in state.tensor_map.values():
+        tensor.modify(data=to_backend(tensor.data))
+    submpo = _two_branch_flip_submpo(L=2, sites=(0, 1), targets=(0, 1))
+    opt = TreeOptimizer(None, state=state, tree=plan, run=False)
+
+    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
+        prepared = opt._prepare_gate_stream_backend([submpo], ["submpo"])[0]
+
+    assert prepared is not submpo
+    assert all(torch.is_tensor(tensor.data) for tensor in prepared.tensors)
+    assert all(isinstance(tensor.data, np.ndarray) for tensor in submpo.tensors)
 
 
 def test_tree_rejects_a_mixed_backend_initial_state():
@@ -2773,6 +2831,28 @@ def test_tree_stable_labels_route_submpo_by_payload_sites(monkeypatch):
         lambda: (_ for _ in ()).throw(AssertionError("dense MPO fallback")),
     )
     opt.apply_submpo(mpo, (2, 3))
+    assert opt.qubits == [0, 2, 3]
+    assert opt.norm() == pytest.approx(1.0)
+
+
+def test_tree_stream_stable_labels_route_submpo_natively(monkeypatch):
+    """Stream replay preserves native MPO routing after a stable-label cap."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    mpo = qtn.MatrixProductOperator.from_dense(
+        np.kron(x, x), dims=(2, 2), sites=(2, 3), L=4
+    )
+    events = [
+        TreeOptimizer.cap_event(1, [1.0, 0.0], compact_labels=False),
+        TreeOptimizer.submpo_event(mpo, (2, 3)),
+    ]
+    opt = TreeOptimizer(None, n=4, chi=8, run=False)
+
+    monkeypatch.setattr(
+        mpo,
+        "to_dense",
+        lambda: (_ for _ in ()).throw(AssertionError("dense MPO fallback")),
+    )
+    opt.run(events)
     assert opt.qubits == [0, 2, 3]
     assert opt.norm() == pytest.approx(1.0)
 

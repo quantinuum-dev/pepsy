@@ -293,17 +293,17 @@ class TreeOptimizer:
         applies.
     cutoff : float
         Relative singular-value cutoff for truncations.
-    mode : {"auto", "direct", "mpo"}
-        Implementation used for two-site gates. ``"direct"`` uses the
-        specialised gate-SVD/QR path threading algorithm. ``"mpo"`` first
-        factorises every two-site gate with Quimb into a two-tensor sub-MPO,
-        routes that MPO bond exactly through the tree, then compresses the
-        affected path once. ``"auto"`` (the default) selects direct threading
-        for every two-site gate; choose ``"mpo"`` explicitly when inspecting
-        or benchmarking the operator-TN formulation. The modes represent the
-        same update and can differ only through floating-point roundoff at an
-        exact bond dimension, or through the usual final ``chi``/``cutoff``
-        truncation.
+    mode : {"auto", "direct", "mpo", "submpo"}
+        Implementation used for two-site gates and explicit operator streams.
+        ``"direct"`` uses the specialised gate-SVD/QR path. ``"mpo"`` first
+        factorises ordinary two-site gates with Quimb into a two-tensor
+        sub-MPO. ``"submpo"`` declares that the stream is already made of
+        explicit :meth:`submpo_event` entries (with ordinary one-site gates
+        allowed for singleton supports); it rejects ordinary multi-site gate
+        entries and replays the MPO payloads natively.
+        Explicit sub-MPO entries are also accepted in the other modes for
+        backward compatibility. ``"auto"`` (the default) selects direct
+        threading for ordinary two-site gates.
     structure : {"quality", "balanced", "adaptive"}
         Tree-structure strategy used when ``tree`` is not supplied.
     max_arity : int, None, or iterable of ints
@@ -348,6 +348,11 @@ class TreeOptimizer:
         Whether to probe the full local singular spectrum before each
         truncating split/compression and record discarded-weight diagnostics.
         The extra spectrum probes are disabled by default.
+    track_infidelity : bool
+        Whether to compute the norm-based progress infidelity and include it
+        in progress-bar updates. This is enabled by default for compatibility
+        with direct TreeOptimizer use, but can be disabled for non-unitary
+        transfer-operator streams where norm changes are physical.
     max_intermediate_bond : int, optional
         Conservative preflight limit for the untruncated crossing-bond bound.
         When set, eager replay raises :class:`MemoryError` before tensor work if
@@ -387,10 +392,12 @@ class TreeOptimizer:
 
     @staticmethod
     def _normalize_mode(mode):
-        """Validate and normalize the two-site gate implementation mode."""
+        """Validate and normalize the gate or sub-MPO replay mode."""
         mode = str(mode).strip().lower()
-        if mode not in {"auto", "direct", "mpo"}:
-            raise ValueError("mode must be 'auto', 'direct', or 'mpo'.")
+        if mode not in {"auto", "direct", "mpo", "submpo"}:
+            raise ValueError(
+                "mode must be 'auto', 'direct', 'mpo', or 'submpo'."
+            )
         return mode
 
     @staticmethod
@@ -411,7 +418,7 @@ class TreeOptimizer:
                  star_frac=0.75, layout_objective="path",
                  layout_weight_mode="count", layout=None, tree=None,
                  dtype=complex, threads=1, seed=None, run=True, tn=None,
-                 state=None, track_truncation=False,
+                 state=None, track_truncation=False, track_infidelity=True,
                  max_intermediate_bond=None,
                  max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
                  max_subtree_nodes=_DEFAULT_MAX_SUBTREE_NODES,
@@ -549,6 +556,7 @@ class TreeOptimizer:
             raise ValueError("threads must be positive or None.")
         self.rng = np.random.default_rng(seed)
         self.track_truncation = bool(track_truncation)
+        self.track_infidelity = bool(track_infidelity)
         self.max_intermediate_bond = self._positive_limit(
             max_intermediate_bond, "max_intermediate_bond"
         )
@@ -780,6 +788,34 @@ class TreeOptimizer:
                     f"current active labels {active!r}: {out_of_range!r}."
                 )
 
+    def _validate_mode_for_stream(self):
+        """Validate the explicit ``mode='submpo'`` stream declaration."""
+        if self.mode != "submpo" or not self.G:
+            return
+        # ``output_replay='submpo'`` still represents singleton supports as
+        # ordinary one-site gates. They do not introduce a competing
+        # multi-site lowering path and are therefore valid in this mode.
+        ordinary = []
+        for step, (where, event_type) in enumerate(
+            zip(self.where, self.event_types), start=1
+        ):
+            if event_type != "gate":
+                continue
+            width = len(_normalize_where(where))
+            if width > 1:
+                ordinary.append((step, width))
+        if ordinary:
+            raise ValueError(
+                "mode='submpo' requires explicit sub-MPO events for "
+                "multi-site operations; ordinary multi-site gate event(s) "
+                f"found at step/width {ordinary!r}. "
+                "Use mode='direct' or mode='mpo' for dense gate streams."
+            )
+        if "submpo" not in self.event_types:
+            raise ValueError(
+                "mode='submpo' requires at least one explicit sub-MPO event."
+            )
+
     # -- construction ---------------------------------------------------------
 
     @staticmethod
@@ -847,6 +883,31 @@ class TreeOptimizer:
         """Return the common backend, dtype, and device of the live TTN."""
         return self._state_backend_info(self.tn)
 
+    def _warn_backend_conversion(self, source_signature, target_signature):
+        """Warn once for one explicit source/target backend conversion."""
+        warning_key = (source_signature, target_signature)
+        if (
+            source_signature[0] != "builtins"
+            and warning_key not in self._backend_conversion_warnings
+        ):
+            self._backend_conversion_warnings.add(warning_key)
+            warnings.warn(
+                "TreeOptimizer is converting a gate/operator payload from "
+                f"backend/dtype/device {source_signature!r} to the TTN state "
+                f"{target_signature!r}. Provide backend-compatible gate "
+                "arrays to avoid this transfer or cast.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    @staticmethod
+    def _backend_converter(like):
+        """Build one converter for a stream targeting ``like``."""
+        converter = infer_backend_converter_from_sample(like)
+        if converter is not None:
+            return converter
+        return lambda array: ar.do("array", array, like=like)
+
     def _as_state_backend(self, array, *, warn=True):
         """Return an operator payload compatible with the live TTN backend.
 
@@ -862,31 +923,96 @@ class TreeOptimizer:
         source_signature = _array_backend_signature(array)
         if source_signature == target_signature:
             return array
-        warning_key = (source_signature, target_signature)
         # Python sequences/scalars are ordinary convenience inputs rather than
         # a selected numerical backend. Materialize those silently; explicit
         # array backends/dtypes still receive the transfer/cast warning.
-        is_untyped_input = source_signature[0] == "builtins"
-        if (
-            warn
-            and not is_untyped_input
-            and warning_key not in self._backend_conversion_warnings
-        ):
-            self._backend_conversion_warnings.add(warning_key)
-            warnings.warn(
-                "TreeOptimizer is converting a gate/operator payload from "
-                f"backend/dtype/device {source_signature!r} to the TTN state "
-                f"{target_signature!r}. Provide backend-compatible gate "
-                "arrays to avoid this transfer or cast.",
-                UserWarning,
-                stacklevel=3,
-            )
-        converter = infer_backend_converter_from_sample(like)
-        if converter is not None:
-            return converter(array)
+        if warn:
+            self._warn_backend_conversion(source_signature, target_signature)
         if state_info["backend"] == "numpy":
             return ar.to_numpy(array)
-        return ar.do("array", array, like=like)
+        return self._backend_converter(like)(array)
+
+    def _prepare_gate_stream_backend(self, payloads, event_types):
+        """Prepare one executable gate/sub-MPO stream for the live backend.
+
+        Ordinary gates are expected to be backend-homogeneous. One
+        representative gate decides whether the whole gate stream needs
+        conversion; matching payloads are returned by identity. Sub-MPOs use
+        one representative tensor and ``apply_to_arrays`` on a copied network,
+        preserving the caller's labels and bonds.
+        """
+        if not payloads:
+            return payloads
+
+        like = self._state_like()
+        state_info = self.backend_info()
+        target_signature = (
+            state_info["backend"], state_info["dtype"], state_info["device"]
+        )
+        converter = None
+        prepared = list(payloads)
+
+        gate_index = None
+        gate_signature = None
+        for index, (payload, event_type) in enumerate(
+            zip(payloads, event_types)
+        ):
+            if event_type != "gate":
+                continue
+            gate_index = index
+            try:
+                gate_signature = _array_backend_signature(payload)
+            except (AttributeError, TypeError, ValueError):
+                gate_signature = None
+            break
+
+        if gate_index is not None:
+            gate_needs_conversion = gate_signature != target_signature
+            if gate_needs_conversion:
+                if gate_signature is not None:
+                    self._warn_backend_conversion(
+                        gate_signature, target_signature
+                    )
+                converter = self._backend_converter(like)
+                for index, event_type in enumerate(event_types):
+                    if event_type == "gate":
+                        prepared[index] = converter(payloads[index])
+
+        for index, (payload, event_type) in enumerate(
+            zip(payloads, event_types)
+        ):
+            if event_type != "submpo":
+                continue
+            tensor = next(iter(getattr(payload, "tensors", ())), None)
+            if tensor is None:
+                continue
+            try:
+                source_signature = _array_backend_signature(tensor.data)
+            except (AttributeError, TypeError, ValueError):
+                source_signature = None
+            if source_signature == target_signature:
+                continue
+            if source_signature is not None:
+                self._warn_backend_conversion(
+                    source_signature, target_signature
+                )
+            if converter is None:
+                converter = self._backend_converter(like)
+            copied = payload.copy()
+            apply_to_arrays = getattr(copied, "apply_to_arrays", None)
+            if callable(apply_to_arrays):
+                apply_to_arrays(converter)
+            else:
+                tensor_map = getattr(copied, "tensor_map", None)
+                if tensor_map is None:
+                    # Opaque payloads are lowered later and will be coerced
+                    # when their dense operator is materialized.
+                    continue
+                for op_tensor in tensor_map.values():
+                    op_tensor.modify(data=converter(op_tensor.data))
+            prepared[index] = copied
+
+        return prepared
 
     def _coerce_tensor_network_backend(self, tn, *, warn=True):
         """Convert every tensor of an operator TN to the live state backend."""
@@ -1460,7 +1586,7 @@ class TreeOptimizer:
 
     def run(self, gates=None, *, progbar=False, mode=None, non_unitary=False,
             normalize_every=False, normalize_final=False,
-            normalize_eps=1e-15, seed=None):
+            normalize_eps=1e-15, seed=None, track_infidelity=None):
         """Replay ``gates`` (or the construction stream) on the tree.
 
         Parameters
@@ -1468,15 +1594,16 @@ class TreeOptimizer:
         gates : bundled gate stream, optional
             Replacement stream to replay. If omitted, replay the queued stream.
         progbar : bool, default=False
-            Show a tqdm progress bar with the two-qubit gate count and a
-            norm-based truncation proxy. Both dense and native trees report
-            ``1 - (norm / reference_norm)**2``; the reference is established
-            at run start and reset after control/non-unitary events.
-        mode : {"auto", "direct", "mpo"} | {"tree", "ttn"} | None, default=None
-            Optional persistent two-site implementation selection, matching
-            ``MpsOptimizer.run(mode=...)``: a supplied value updates
-            :attr:`mode` before replay and remains active for future runs and
-            copies. ``"tree"``/``"ttn"`` are deprecated no-op compatibility
+            Show a tqdm progress bar with the two-qubit gate count. When
+            ``track_infidelity`` is enabled, also report the norm-based
+            truncation proxy ``1 - (norm / reference_norm)**2``; the reference
+            is established at run start and reset after control/non-unitary
+            events.
+        mode : {"auto", "direct", "mpo", "submpo"} | {"tree", "ttn"} | None, default=None
+            Optional persistent gate/sub-MPO replay selection: a supplied
+            value updates :attr:`mode` before replay and remains active for
+            future runs and copies. ``"submpo"`` validates an explicit MPO
+            stream; ``"tree"``/``"ttn"`` are deprecated no-op compatibility
             selectors for shared coefficient frontends.
         non_unitary : bool, default=False
             Mark the stream as non-unitary when using automatic normalization.
@@ -1488,20 +1615,27 @@ class TreeOptimizer:
             Zero-state threshold used by automatic normalization.
         seed : int | None, default=None
             Reseed measurement/reset sampling before replay.
+        track_infidelity : bool | None, default=None
+            Override :attr:`track_infidelity` for this replay. When disabled,
+            the progress bar omits the norm-based infidelity field and avoids
+            the per-event norm readout. Truncation-spectrum diagnostics remain
+            controlled independently by :attr:`track_truncation`.
         """
         if mode is not None:
             requested_mode = str(mode).strip().lower()
             if requested_mode in {"tree", "ttn", "tree_tensor_network"}:
                 warnings.warn(
                     "run(mode='tree'/'ttn') is a deprecated no-op; use "
-                    "mode='auto', 'direct', or 'mpo' to select a two-site "
-                    "implementation.",
+                    "mode='auto', 'direct', 'mpo', or 'submpo' to select "
+                    "a gate/sub-MPO implementation.",
                     DeprecationWarning,
                     stacklevel=2,
                 )
             else:
                 self.mode = self._normalize_mode(requested_mode)
         non_unitary = bool(non_unitary)
+        if track_infidelity is not None:
+            self.track_infidelity = bool(track_infidelity)
         if not non_unitary and normalize_every not in (False, None):
             raise ValueError("normalize_every requires non_unitary=True.")
         if not non_unitary and normalize_final:
@@ -1515,6 +1649,13 @@ class TreeOptimizer:
         if gates is not None:
             self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
         self._validate_event_stream_for_run()
+        self._validate_mode_for_stream()
+        # Prepare the executable payloads without mutating the public queue.
+        # Matching streams retain their original objects; mismatched ordinary
+        # gates and sub-MPOs are converted to the live TTN backend once here.
+        payloads = self._prepare_gate_stream_backend(
+            self.G, self.event_types
+        )
         pbar = None
         if progbar:
             from tqdm import tqdm  # pylint: disable=import-outside-toplevel
@@ -1534,15 +1675,16 @@ class TreeOptimizer:
         control_count = 0
         progress_reference_norm = (
             self.norm()
-            if pbar is not None
+            if pbar is not None and self.track_infidelity
             else None
         )
 
         try:
             for step, (payload, where, event_type) in enumerate(zip(
-                self.G, self.where, self.event_types
+                payloads, self.where, self.event_types
             ), start=1):
-                support = _normalize_where(where)
+                logical_support = _normalize_where(where)
+                support = logical_support
                 if event_type == "gate":
                     if len(support) == 1:
                         one_qubit_count += 1
@@ -1552,27 +1694,20 @@ class TreeOptimizer:
                         multi_qubit_count += 1
                     self.apply_gate(payload, support)
                 elif event_type == "submpo":
-                    started = self._begin_update(event_type, support)
-                    try:
-                        support = self._validate_support(support)
-                        self._check_operator_limits(support, dense=False)
-                        with self._thread_ctx():
-                            applied = self._try_apply_native_submpo(
-                                payload, support, max_bond=self.chi,
-                                cutoff=self.cutoff,
-                            )
-                            if applied is None:
-                                self._check_operator_limits(support)
-                                operator = _submpo_to_dense(payload, support)
-                                self._apply_subtree_operator_impl(
-                                    operator, support
-                                )
-                    except Exception:
-                        if started:
-                            self._abort_update()
-                        raise
-                    if started:
-                        self._finish_update()
+                    # Reuse the public sub-MPO implementation so stream
+                    # replay gets the two-site factor fast path as well as
+                    # the native multi-site MPO router. Passing both forms
+                    # of support is important after a stable-label cap:
+                    # ``support`` addresses compact TTN leaves, while
+                    # ``logical_support`` addresses the MPO site tags.
+                    support = self._validate_support(logical_support)
+                    self._apply_submpo_resolved(
+                        payload,
+                        support,
+                        logical_where=logical_support,
+                        max_bond=self.chi,
+                        cutoff=self.cutoff,
+                    )
                     multi_qubit_count += 1
                 else:
                     control_count += 1
@@ -1600,29 +1735,31 @@ class TreeOptimizer:
                     })
 
                 if pbar is not None:
-                    # Use the same squared survival proxy for every backend.
-                    # Control and explicitly non-unitary events change the
-                    # physical norm for reasons unrelated to truncation, so
-                    # reset the reference after those events.
-                    state_norm = self.norm()
-                    reset_progress = non_unitary or event_type != "gate"
-                    if reset_progress:
-                        truncation_infidelity = 0.0
-                        progress_reference_norm = state_norm
-                    elif progress_reference_norm in (None, 0.0):
-                        truncation_infidelity = 0.0
-                    else:
-                        survival = state_norm / progress_reference_norm
-                        truncation_infidelity = max(
-                            0.0,
-                            1.0 - survival * survival,
-                        )
                     postfix = {
                         "2q": two_qubit_count,
-                        "infidelity": self._format_progress_infidelity(
-                            truncation_infidelity
-                        ),
                     }
+                    if self.track_infidelity:
+                        # Use the same squared survival proxy for every
+                        # backend. Control and explicitly non-unitary events
+                        # change the physical norm for reasons unrelated to
+                        # truncation, so reset the reference after those
+                        # events.
+                        state_norm = self.norm()
+                        reset_progress = non_unitary or event_type != "gate"
+                        if reset_progress:
+                            truncation_infidelity = 0.0
+                            progress_reference_norm = state_norm
+                        elif progress_reference_norm in (None, 0.0):
+                            truncation_infidelity = 0.0
+                        else:
+                            survival = state_norm / progress_reference_norm
+                            truncation_infidelity = max(
+                                0.0,
+                                1.0 - survival * survival,
+                            )
+                        postfix["infidelity"] = self._format_progress_infidelity(
+                            truncation_infidelity
+                        )
                     if multi_qubit_count:
                         postfix["kq"] = multi_qubit_count
                     if control_count:
@@ -1835,8 +1972,14 @@ class TreeOptimizer:
         make the equivalent two-tensor MPO. Both immediately enter the same
         two-factor attach/QR-thread/compress kernel. ``'auto'`` selects direct
         factorization for every backend; use ``'mpo'`` explicitly to select
-        Quimb's operator-TN factorization.
+        Quimb's operator-TN factorization. ``'submpo'`` is reserved for
+        explicit sub-MPO stream events and cannot be used with a dense gate.
         """
+        if self.mode == "submpo":
+            raise ValueError(
+                "mode='submpo' accepts explicit sub-MPO stream events, not "
+                "ordinary dense gates; use mode='direct' or mode='mpo'."
+            )
         gate = self._as_state_backend(gate)
         if self.mode in {"auto", "direct"}:
             return self._apply_2q_path_thread_impl(
@@ -2487,9 +2630,11 @@ class TreeOptimizer:
         """Apply an explicit MPO on ``where`` using the native tree path.
 
         This is the backend-neutral coefficient-state entry point used by
-        stabilizer and ordinary operator-sum frontends. MPOs exposing Quimb's
-        site interface stay structured; opaque MPO-like payloads fall back to
-        dense :meth:`apply_subtree_operator` lowering.
+        stabilizer and ordinary operator-sum frontends. Two-site MPOs reuse
+        the factorized gate path; larger MPOs exposing Quimb's site interface
+        stay structured and are QR-routed through the Steiner subtree before
+        one compression sweep. Opaque MPO-like payloads fall back to dense
+        :meth:`apply_subtree_operator` lowering.
         """
         self._invalidate_state_norm_cache()
         logical_where = _normalize_where(where)
@@ -3907,6 +4052,7 @@ class TreeOptimizer:
             layout_objective=self.layout_objective,
             layout_weight_mode=self.layout_weight_mode,
             track_truncation=self.track_truncation,
+            track_infidelity=self.track_infidelity,
             max_intermediate_bond=self.max_intermediate_bond,
             max_operator_qubits=self.max_operator_qubits,
             max_subtree_nodes=self.max_subtree_nodes,
@@ -3926,6 +4072,9 @@ class TreeOptimizer:
         other.infidelity_samples = deepcopy(self.infidelity_samples)
         other.normalizations = deepcopy(self.normalizations)
         other.projection_diagnostics = deepcopy(self.projection_diagnostics)
+        other._backend_conversion_warnings = set(
+            self._backend_conversion_warnings
+        )
         other._logical_qubits = list(self._logical_qubits)
         other._logical_positions = dict(self._logical_positions)
         other._truncation_survival = self._truncation_survival

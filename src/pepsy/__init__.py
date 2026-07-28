@@ -44,6 +44,7 @@ _SYMBOL_MODULES = {
     "backend_jax": ".backends",
     "backend_numpy": ".backends",
     "backend_torch": ".backends",
+    "build_backend": ".backends",
     "get_default_array_backend": ".backends",
     "get_default_grad_backend": ".backends",
     "register_torch_linalg": ".backends",
@@ -194,6 +195,7 @@ _SYMBOL_MODULES = {
     "SymPEPS": ".tensors",
     "add_cycle": ".tensors",
     "build_compressed_optimizer": ".tensors",
+    "build_contraction": ".tensors",
     "build_optimizer": ".tensors",
     "contract_hypercompressed_tn": ".tensors",
     "contract_hypercompressed_tn_batch": ".tensors",
@@ -276,6 +278,7 @@ if TYPE_CHECKING:
     from .backends import (  # noqa: F401
         get_default_array_backend,
         get_default_grad_backend,
+        build_backend,
         register_torch_linalg,
         reset_default_backends,
         set_default_array_backend,
@@ -348,6 +351,7 @@ if TYPE_CHECKING:
     from .solvers import FDSolver  # noqa: F401
     from .tensors import (  # noqa: F401
         OneDMap,
+        build_contraction,
         Fermion,
         FermionLatticeSetup,
         SpinfulFermion,

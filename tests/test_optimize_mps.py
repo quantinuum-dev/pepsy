@@ -185,6 +185,64 @@ def test_mps_optimizer_simple_update_routes_torch_u1u1_long_range_gate():
     assert len(optimizer.gauges) == out.L - 1
 
 
+@pytest.mark.parametrize(
+    "mode", ["dmrg", "mpo", "svd", "swap", "perm", "mix", "su", "exact"]
+)
+def test_mps_optimizer_casts_numpy_gate_stream_to_torch_state_backend(mode):
+    """Backend conversion should happen only when a gate payload mismatches p."""
+    torch = pytest.importorskip("torch")
+
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
+    gate = qu.CNOT()  # ordinary NumPy gate stream
+    optimizer = py.MpsOptimizer(
+        state,
+        gates=[(gate, (0, 1))],
+        chi=2,
+        mode=mode,
+        inplace=True,
+    )
+
+    with pytest.warns(UserWarning, match="converted a gate payload"):
+        optimizer.run(progbar=False, n_iter=2)
+
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
+    dense = np.asarray(py.MpsOptimizer._real_float(optimizer.p.norm()))
+    assert dense == pytest.approx(1.0)
+
+    matching_gate = torch.as_tensor(np.array(gate, copy=True), dtype=torch.complex128)
+    assert optimizer.to_backend(matching_gate) is matching_gate
+
+
+def test_mps_optimizer_casts_submpo_stream_arrays_to_torch_state_backend():
+    """Sub-MPO conversion preserves the network structure and input stream."""
+    torch = pytest.importorskip("torch")
+
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
+    submpo = _two_branch_flip_submpo(L=2, sites=(0, 1), targets=(0, 1))
+    original_inds = tuple(submpo.outer_inds())
+    optimizer = py.MpsOptimizer(
+        state,
+        gates=[py.MpsOptimizer.submpo_event(submpo, (0, 1))],
+        chi=2,
+        mode="mpo",
+        inplace=True,
+    )
+
+    with pytest.warns(UserWarning, match="converted a sub-MPO payload"):
+        optimizer.run(progbar=False, n_iter=2)
+
+    # ``run`` prepares a local executable segment, leaving the public queue
+    # unchanged. Re-run the same helper to inspect the converted payload.
+    converted = optimizer._prepare_gate_stream_backend([submpo], ["submpo"])[0]
+    assert converted is not submpo
+    assert tuple(converted.outer_inds()) == original_inds
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in converted.tensors)
+    assert all(isinstance(tensor.data, np.ndarray) for tensor in submpo.tensors)
+    assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
+
+
 def test_mps_optimizer_accepts_perm_mode():
     """Perm mode should expose an identity logical-to-physical ordering initially."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")

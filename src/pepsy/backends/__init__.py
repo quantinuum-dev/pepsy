@@ -15,6 +15,7 @@ from .config import (
     backend_jax,
     backend_numpy,
     backend_torch,
+    build_backend,
     get_default_array_backend,
     get_default_grad_backend,
     register_torch_linalg,
@@ -24,6 +25,7 @@ from .config import (
 )
 
 __all__ = [
+    "build_backend",
     "backend_cupy",
     "backend_jax",
     "backend_numpy",

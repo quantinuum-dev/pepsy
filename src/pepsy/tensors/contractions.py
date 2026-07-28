@@ -9,7 +9,7 @@ import cotengra as ctg
 import quimb.tensor as qtn
 
 __all__ = [
-    "build_optimizer", "build_compressed_optimizer",
+    "build_contraction", "build_optimizer", "build_compressed_optimizer",
     "contract_hypercompressed_tn", "contract_hypercompressed_tn_batch",
     "tn_norm",
 ]
@@ -107,6 +107,19 @@ def build_optimizer(
         kwargs["slicing_reconf_opts"] = slicing_reconf_opts
 
     return ctg.ReusableHyperOptimizer(**kwargs)
+
+
+def build_contraction(*args, **kwargs):
+    """Build a reusable contraction optimizer.
+
+    This is the short, backend-neutral alias for :func:`build_optimizer`.
+    Numerical contractions use the array backend of the tensors supplied to
+    Quimb; pair it with ``py.build_backend()`` and ``to_backend=`` to run the
+    calculation on Torch CPU while keeping the existing ``build_optimizer``
+    name available.
+    """
+
+    return build_optimizer(*args, **kwargs)
 
 
 def build_compressed_optimizer(
