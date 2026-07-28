@@ -2534,7 +2534,7 @@ class TreeOptimizer:
         return left, right
 
     def _compress_edge_with_diagnostics(
-        self, u, v, *, max_bond=None, cutoff=None,
+        self, u, v, *, max_bond=None, cutoff=None, reduced=True,
     ):
         """Compress one live tree edge and record its truncation diagnostics."""
         max_bond = (
@@ -2572,7 +2572,8 @@ class TreeOptimizer:
         # Keep the live canonical-region metadata in one place: the TTN edge
         # wrapper performs the compression and advances its tracked centre.
         self.tn.compress_edge_(
-            u, v, max_bond=max_bond, cutoff=cutoff, absorb="right"
+            u, v, max_bond=max_bond, cutoff=cutoff, absorb="right",
+            reduced=reduced,
         )
         bond_after = self.tn.bond(u, v)
         after_bond = int(self.tn.ind_size(bond_after))
@@ -2607,6 +2608,7 @@ class TreeOptimizer:
         """
         snodes = frozenset(snodes)
         self._move_center(hub)
+        forward_reduced = True if self.tn.fermionic else "left"
 
         def descend(node, parent):
             children = sorted(
@@ -2617,6 +2619,7 @@ class TreeOptimizer:
             for child in children:
                 self._compress_edge_with_diagnostics(
                     node, child, max_bond=max_bond, cutoff=cutoff,
+                    reduced=forward_reduced,
                 )
                 descend(child, node)
                 self.tn.canonize_edge_(child, node, absorb="right")

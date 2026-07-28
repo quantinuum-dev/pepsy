@@ -1059,13 +1059,18 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self
 
     def compress_edge_(self, a, b, *, max_bond=None, cutoff=1e-12,
-                       absorb="right"):
+                       absorb="right", reduced=True):
         """Compress the tree edge ``a -> b`` in place.
 
         Dense/nonfermionic trees delegate to Quimb's ``compress_between``.
         Native fermionic trees explicitly SVD the complete two-node tensor.
         The tracked :attr:`orthogonality_center` advances as for
         :meth:`canonize_edge_`.
+
+        ``reduced`` is forwarded only on the dense path. Quimb's one-sided
+        ``"left"`` mode is exact when node ``b`` is already isometric on its
+        non-shared legs. Native fermionic compression ignores this option and
+        retains its explicit graded split.
         """
         previous = self.orthogonality_center
         if self.fermionic:
@@ -1083,6 +1088,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 max_bond=max_bond,
                 cutoff=cutoff,
                 absorb=absorb,
+                reduced=reduced,
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)

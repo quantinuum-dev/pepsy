@@ -288,6 +288,88 @@ def test_dense_subtree_hub_recovery_reuses_routed_q_metadata(monkeypatch):
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
+def test_dense_subtree_uses_proven_one_sided_compression(monkeypatch):
+    """A routed gate ladder matches full reduction while skipping child QRs."""
+    rng = np.random.default_rng(53)
+    n = 8
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    seed = TreeTensorNetwork.rand(plan, D=2, seed=53)
+    optimized = TreeOptimizer(
+        None,
+        tree=plan,
+        state=seed.copy(),
+        chi=2,
+        cutoff=1e-12,
+        run=False,
+    )
+    reference = TreeOptimizer(
+        None,
+        tree=plan,
+        state=seed.copy(),
+        chi=2,
+        cutoff=1e-12,
+        run=False,
+    )
+
+    left_reductions = []
+    compress_edge = TreeTensorNetwork.compress_edge_
+
+    def traced_compress_edge(tn, a, b, **kwargs):
+        if tn is optimized.tn:
+            reduced = kwargs.get("reduced", True)
+            if reduced == "left":
+                child = tn.node_tensor(b)
+                bond = tn.bond(a, b)
+                assert child.left_inds is not None
+                assert set(child.left_inds) == set(child.inds) - {bond}
+                left_reductions.append((a, b))
+        return compress_edge(tn, a, b, **kwargs)
+
+    full_compress = reference._compress_edge_with_diagnostics
+
+    def force_full_reduction(
+        u, v, *, max_bond=None, cutoff=None, reduced=True,
+    ):
+        del reduced
+        return full_compress(
+            u,
+            v,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            reduced=True,
+        )
+
+    monkeypatch.setattr(
+        TreeTensorNetwork, "compress_edge_", traced_compress_edge,
+    )
+    monkeypatch.setattr(
+        reference, "_compress_edge_with_diagnostics", force_full_reduction,
+    )
+
+    exact = seed.to_statevector()
+    ladder_supports = (
+        (0, 2, 4),
+        (1, 3, 5),
+        (2, 4, 6),
+        (3, 5, 7),
+    )
+    for where in ladder_supports:
+        gate = _rand_unitary(3, rng)
+        optimized.apply_subtree_operator(gate, where)
+        reference.apply_subtree_operator(gate, where)
+        exact = _sv_apply_kq(exact, gate, where, n)
+
+    assert left_reductions
+    assert _fidelity(optimized.to_dense(), reference.to_dense()) > 1 - 1e-10
+    assert any(event["truncated"] for event in optimized.truncation_history)
+    assert _fidelity(optimized.to_dense(), exact) == pytest.approx(
+        _fidelity(reference.to_dense(), exact),
+        rel=1e-10,
+        abs=1e-12,
+    )
+    assert optimized.tn.validate(check_canonical=True) is optimized.tn
+
+
 def test_tree_mode_is_construction_and_run_override():
     """Tree gate implementation mode follows the MPS construction/run API."""
     opt = TreeOptimizer(None, n=2, mode="direct", run=False)
@@ -3162,13 +3244,30 @@ def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
     )
     installs = []
     install_routed = candidate._install_routed_subtree
+    compressions = []
+    compress_edge = candidate._compress_edge_with_diagnostics
 
     def traced_install(local, snodes, hub):
         installs.append((frozenset(snodes), hub))
         assert candidate.tn.fermionic
         return install_routed(local, snodes, hub)
 
+    def traced_compress_edge(
+        u, v, *, max_bond=None, cutoff=None, reduced=True,
+    ):
+        compressions.append(reduced)
+        return compress_edge(
+            u,
+            v,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            reduced=reduced,
+        )
+
     monkeypatch.setattr(candidate, "_install_routed_subtree", traced_install)
+    monkeypatch.setattr(
+        candidate, "_compress_edge_with_diagnostics", traced_compress_edge,
+    )
     candidate.apply_submpo(submpo, sites)
     for site, op in zip(sites, local_ops):
         reference.apply_1q(op, site)
@@ -3180,6 +3279,8 @@ def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
         return np.asarray(tensor.data.to_dense()).reshape(-1)
 
     assert installs
+    assert compressions
+    assert all(reduced is True for reduced in compressions)
     assert (
         _fidelity(dense_vector(candidate), dense_vector(reference))
         > 1 - 1e-10
