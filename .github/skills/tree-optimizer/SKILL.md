@@ -155,6 +155,13 @@ telescopes to identity between bra and ket.
   `shift_orthogonality_center` first peels that region with lossless QR and
   then walks only the remaining path. Do not regress this regional recovery to
   an unconditional O(N) recanonicalisation.
+- Local isometry proofs live only on each tensor's ``left_inds``.
+  `TreeTensorNetwork.isometry_direction` / `isometry_map` derive read-only
+  orientations, `can_skip_canonize` recognizes an already-proven dense edge,
+  and `validate_isometry_metadata` checks alignment with the canonical region.
+  `TreeOptimizer` delegates these methods; never add a second mutable
+  optimizer-owned orientation map. Native fermionic edges always retain their
+  explicit graded QR and are never skipped through this dense metadata path.
 - `ttn.is_canonical_form(center)` verifies the invariant directly (every
   non-centre tensor is an isometry toward the centre) — use it in tests/diagnostics.
 - A freshly built product state is **already canonical at the root** (all
@@ -272,8 +279,11 @@ covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductStat
    state machine without repeating those QRs; native fermionic trees retain
    their explicit graded QR recovery. Finally make one depth-first canonical
    SVD sweep: every affected tree edge is truncated once, after the complete
-   operator has arrived. `renormalize=True` renormalises afterwards (for
-   Kraus/projection).
+   operator has arrived. Dense path and subtree sweeps select one-sided
+   ``reduced="left"`` compression only when the destination tensor's live
+   ``left_inds`` proves the required isometry; missing proofs and native
+   graded tensors use the full reduction. `renormalize=True` renormalises
+   afterwards (for Kraus/projection).
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator

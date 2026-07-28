@@ -828,6 +828,11 @@ def ps_to_ttn(
             seed_rand(seed)
         ttn.expand_bond_dimension_(chi, rand_strength=rand_strength)
         ttn.canonize_around_node_(plan.root)
+    else:
+        # Replacing each product vector clears Quimb's local ``left_inds``.
+        # Bond-one normalized product tensors remain trivially canonical, so
+        # restore the network-owned orientation metadata without new QR work.
+        ttn._set_isometry_metadata_from_region({plan.root})
     return ttn.validate()
 
 
@@ -990,6 +995,8 @@ def hrs_to_ttn(
     if chi > 1:
         ttn.expand_bond_dimension_(chi, rand_strength=rand_strength)
         ttn.canonize_around_node_(plan.root)
+    else:
+        ttn._set_isometry_metadata_from_region({plan.root})
     return ttn.validate()
 
 

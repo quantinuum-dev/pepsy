@@ -10,6 +10,17 @@ milestone. It represents the state as
 where `C` is a Stim tableau Clifford and `|p>` is a dense two-level
 `TreeTensorNetwork` evolved by `TreeOptimizer`.
 
+Canonical and compression state has the same single owner as ordinary tree
+simulation: local isometry proofs live on the coefficient tensors'
+``left_inds`` and are interpreted by ``TreeTensorNetwork``. TreeStab delegates
+``isometry_direction()``, ``isometry_map()``, ``can_skip_canonize()``, and
+``validate_isometry_metadata()`` to its coefficient ``TreeOptimizer``; it does
+not keep another map. Direct, MPO, and coefficient-frame sub-MPO routes
+therefore reuse proven path/subtree Q tensors and select one-sided SVD
+compression only when the live proof is valid. Backend conversion and dense
+cap reconstruction preserve or install those proofs rather than forcing a
+second canonicalization sweep.
+
 The first milestone supports:
 
 - named and matrix-valued Clifford gates, which update only the tableau;

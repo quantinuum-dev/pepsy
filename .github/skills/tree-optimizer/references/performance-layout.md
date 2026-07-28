@@ -15,8 +15,14 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   ids against `self.tn.tensor_map`; a stale entry is recomputed safely.
 - Dense path and subtree routing preserve each QR-produced Q tensor's
   `left_inds`. Canonical recovery therefore recognizes an already-isometric
-  routed branch without repeating its decomposition. Native fermionic routing
-  deliberately retains explicit graded QR recovery.
+  routed branch without repeating its decomposition or entering Quimb's dense
+  canonicalization kernel. Path and subtree compression also reads that proof
+  before selecting one-sided `reduced="left"` compression, avoiding the
+  redundant reduction QR only when the destination tensor is proven
+  isometric. Missing proofs fall back to two-sided reduction. The network
+  derives orientation views directly from live tensors; do not cache a
+  duplicate map in the optimizer. Native fermionic routing deliberately
+  retains explicit graded QR/SVD recovery.
 - `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
   tid cache, and derives a deterministic child seed for an independent RNG.
 

@@ -1159,7 +1159,8 @@ class TreeOptimizer:
                 root_tensor = target.node_tensor(target.plan.root)
                 root_tensor.modify(data=root_tensor.data * factor)
 
-        target._with_center(self.plan.root).validate()
+        target._with_center(self.plan.root)
+        target._set_isometry_metadata_from_region({self.plan.root}).validate()
         self._state_backend_info(target)
         return target
 
@@ -1384,6 +1385,23 @@ class TreeOptimizer:
         be an isometry pointing toward the centre.  A diagnostic / test aid.
         """
         return self.tn.is_canonical_form(center, tol=tol)
+
+    def isometry_direction(self, node):
+        """Neighbour toward which ``node`` has a proven local isometry."""
+        return self.tn.isometry_direction(node)
+
+    def isometry_map(self):
+        """Return the live network-owned node-isometry orientation map."""
+        return self.tn.isometry_map()
+
+    def can_skip_canonize(self, a, b, *, absorb="right"):
+        """Whether local metadata proves this dense edge QR is redundant."""
+        return self.tn.can_skip_canonize(a, b, absorb=absorb)
+
+    def validate_isometry_metadata(self, region=None):
+        """Validate live tensor ``left_inds`` against the canonical region."""
+        self.tn.validate_isometry_metadata(region)
+        return self
 
     @property
     def canonical_region(self):
@@ -1946,18 +1964,21 @@ class TreeOptimizer:
                 gate_np.conj().T @ gate_np, np.eye(d, dtype=gate_np.dtype),
                 rtol=1e-10, atol=1e-12,
             )
+        site_node = self.plan.node_of_qubit[q]
         if not unitary:
-            self._move_center(self.plan.node_of_qubit[q])
+            self._move_center(site_node)
         region = self.tn.canonical_region
+        left_inds = self.tn.node_tensor(site_node).left_inds
         self.tn.gate_inds_(gate, [self._phys(q)], contract=True)
         if unitary:
             # A physical unitary preserves the isometric exterior, but the
             # state-owned gate mutator deliberately invalidates metadata for
-            # direct callers. Restore the known region only for this proven
-            # canonical-preserving operation.
+            # direct callers. Restore both the local proof and known region
+            # only for this proven canonical-preserving operation.
+            self.tn.node_tensor(site_node).modify(left_inds=left_inds)
             self.tn.canonical_region = region
         if not unitary:
-            self.center = self.plan.node_of_qubit[q]
+            self.center = site_node
             if renormalize:
                 self.normalize()
         return self
@@ -2269,9 +2290,17 @@ class TreeOptimizer:
             max_bond=self.chi if max_bond is None else max_bond,
             cutoff=self.cutoff if cutoff is None else cutoff,
         )
-        tla.modify(data=la_t.data, inds=la_t.inds)
-        tlb.modify(data=lb_t.data, inds=lb_t.inds)
-        tp.modify(data=p_t.data, inds=p_t.inds)
+        tla.modify(
+            data=la_t.data,
+            inds=la_t.inds,
+            left_inds=la_t.left_inds,
+        )
+        tlb.modify(
+            data=lb_t.data,
+            inds=lb_t.inds,
+            left_inds=lb_t.left_inds,
+        )
+        tp.modify(data=p_t.data, inds=p_t.inds, left_inds=None)
         self.center = parent
         return self
 
@@ -2583,6 +2612,19 @@ class TreeOptimizer:
             full_spectrum=full_spectrum, max_bond=max_bond, cutoff=cutoff,
         )
 
+    def _metadata_aware_reduction(self, u, v):
+        """Choose one-sided compression when ``v`` is proven isometric.
+
+        Every caller compresses ``u -> v`` with ``absorb="right"``. If the
+        live ``left_inds`` on ``v`` prove that it is already isometric toward
+        ``u``, Quimb can SVD only ``u`` and reuse ``v`` directly. Missing or
+        native graded metadata conservatively falls back to the usual
+        two-sided QR reduction.
+        """
+        if self.tn.can_skip_canonize(u, v, absorb="left"):
+            return "left"
+        return True
+
     def _compress_path(self, path, *, max_bond=None, cutoff=None):
         """Canonically compress every bond along ``path`` down to ``chi``.
 
@@ -2595,6 +2637,7 @@ class TreeOptimizer:
         for v, u in zip(path[::-1], path[-2::-1]):
             self._compress_edge_with_diagnostics(
                 v, u, max_bond=max_bond, cutoff=cutoff,
+                reduced=self._metadata_aware_reduction(v, u),
             )
         self.center = path[0]
 
@@ -2608,7 +2651,6 @@ class TreeOptimizer:
         """
         snodes = frozenset(snodes)
         self._move_center(hub)
-        forward_reduced = True if self.tn.fermionic else "left"
 
         def descend(node, parent):
             children = sorted(
@@ -2619,7 +2661,7 @@ class TreeOptimizer:
             for child in children:
                 self._compress_edge_with_diagnostics(
                     node, child, max_bond=max_bond, cutoff=cutoff,
-                    reduced=forward_reduced,
+                    reduced=self._metadata_aware_reduction(node, child),
                 )
                 descend(child, node)
                 self.tn.canonize_edge_(child, node, absorb="right")
@@ -3315,7 +3357,11 @@ class TreeOptimizer:
         )
         for nid in snodes:
             node_t = self.tn.tensor_map[self._tid(nid)]
-            node_t.modify(data=local[nid].data, inds=local[nid].inds)
+            node_t.modify(
+                data=local[nid].data,
+                inds=local[nid].inds,
+                left_inds=None if nid == hub else local[nid].left_inds,
+            )
         self.center = hub
 
     def _apply_product_pauli_projector(

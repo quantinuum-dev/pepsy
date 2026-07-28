@@ -88,9 +88,20 @@ the `orthogonality_center` name-parity alias), `shift_orthogonality_center(node)
 and `is_canonical_form(center)` delegate to the state, so the optimizer and its
 `TreeTensorNetwork` speak the same canonicalisation vocabulary.
 
+Local isometry orientation also has one owner: each live Quimb tensor carries
+its proven `left_inds`, while `TreeTensorNetwork.isometry_direction(node)` and
+`isometry_map()` derive read-only node-to-neighbour views from those tensors.
+`can_skip_canonize(a, b)` exposes the exact dense-edge condition used to avoid
+an already-proven QR, and `validate_isometry_metadata()` checks the local
+orientations against the tracked canonical region. `TreeOptimizer` delegates
+the same four methods without maintaining another mutable map. Native
+fermionic trees retain explicit graded QR and therefore never report a
+skippable edge through this API.
+
 `TreeTensorNetwork.validate()` checks the live tensor set, physical legs, tree
 edges, and bond ownership against the `TreePlan`; pass
-`check_canonical=True` when the more expensive isometry check is also desired.
+`check_canonical=True` when the metadata alignment and more expensive numerical
+isometry check are also desired.
 Direct Quimb mutations such as `gate_inds_`, `canonize_between`,
 `compress_between`, and `canonize_around_` invalidate the tracked canonical
 region. Call `invalidate_canonical_form()` after mutating tensor data directly;
@@ -600,8 +611,7 @@ finder = py.TreeLayoutFinder(gates, n=L, weight_mode="operator_schmidt")
 plan = finder.layered(block_size=4)
 
 state = py.TreeTensorNetwork.from_plan(plan)
-for tensor in state.tensor_map.values():
-    tensor.modify(data=to_backend(tensor.data))
+state.apply_to_arrays(to_backend)  # backend-only conversion preserves left_inds
 
 # Convert user-provided gate arrays once, at their source.
 native_gates = [(to_backend(gate), where) for gate, where in gates]
@@ -705,8 +715,14 @@ available through `truncation_report()`, `get_infidelities()`, and
   additionally normalized by their exact graded norm readout.
 - **Routed isometry reuse.** Dense geodesic and subtree QR routing retains each
   Q tensor's `left_inds`, allowing later canonical recovery to reuse the proven
-  isometry without repeating the decomposition. Native fermionic trees keep
-  their separate explicit graded QR path.
+  isometry without repeating the decomposition or entering Quimb's dense
+  canonicalization kernel. Final path and subtree compression also consults
+  that live proof: when the destination-side tensor is already isometric,
+  Quimb uses one-sided `reduced="left"` compression and avoids its redundant
+  reduction QR; otherwise it falls back to the full two-sided reduction. The
+  network derives orientation diagnostics from those tensors; the optimizer
+  does not keep a duplicate map. Native fermionic trees keep their separate
+  explicit graded QR/SVD path.
 - **State-owned centre.** The orthogonality centre lives on the
   `TreeTensorNetwork` (`orthogonality_center`, an `_EXTRA_PROPS` field), so the
   optimizer and the state cannot disagree and the centre is carried by

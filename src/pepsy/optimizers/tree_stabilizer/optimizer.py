@@ -421,7 +421,13 @@ def _dense_to_tree_state(state, plan, *, max_bond=None, cutoff=0.0, dtype=comple
 
         tensors.append(qtn.Tensor(np.asarray(data, dtype=dtype), inds=inds, tags=tags))
 
-    return TreeTensorNetwork(tensors, plan=plan)._with_center(plan.root).validate()
+    tree = TreeTensorNetwork(tensors, plan=plan)._with_center(plan.root)
+    # The hierarchical bases above are orthonormal by construction, so every
+    # non-root tensor is already an isometry toward the root. Record that
+    # proven local orientation without repeating the dense decomposition with
+    # a numerical canonicalization sweep.
+    tree._set_isometry_metadata_from_region({plan.root})
+    return tree.validate()
 
 
 def _tree_bond_index(left, right):
@@ -830,8 +836,9 @@ class TreeStabOptimizer:
         )
         self.to_backend = to_backend
         if to_backend is not None:
-            for tensor in self._tree.tn.tensor_map.values():
-                tensor.modify(data=to_backend(tensor.data))
+            # Backend-only conversion must not erase the QR/SVD isometry
+            # proofs stored in each tensor's ``left_inds``.
+            self._tree.tn.apply_to_arrays(to_backend)
             self._tree.tn.validate()
         self.max_operator_qubits = max_operator_qubits
         self.max_pauli_decomposition_qubits = max_operator_qubits
@@ -1068,6 +1075,23 @@ class TreeStabOptimizer:
     @property
     def center(self):
         return self._tree.center
+
+    def isometry_direction(self, node):
+        """Return the coefficient-tree neighbour proven by ``left_inds``."""
+        return self._tree.isometry_direction(node)
+
+    def isometry_map(self):
+        """Return the live coefficient-tree isometry orientation map."""
+        return self._tree.isometry_map()
+
+    def can_skip_canonize(self, a, b, *, absorb="right"):
+        """Whether coefficient metadata proves an edge QR is redundant."""
+        return self._tree.can_skip_canonize(a, b, absorb=absorb)
+
+    def validate_isometry_metadata(self, region=None):
+        """Validate coefficient ``left_inds`` against its canonical region."""
+        self._tree.validate_isometry_metadata(region)
+        return self
 
     @property
     def tree_optimizer(self):
@@ -3478,10 +3502,11 @@ class TreeStabOptimizer:
             dtype=old_tree.dtype,
         )
         if self.to_backend is not None:
-            for tensor in coefficient.tensor_map.values():
-                tensor.modify(data=self.to_backend(tensor.data))
+            coefficient.apply_to_arrays(self.to_backend)
         elif self._tree.backend_info()["backend"] != "numpy":
-            self._tree._coerce_tensor_network_backend(coefficient, warn=False)
+            coefficient.apply_to_arrays(
+                self._tree._backend_converter(self._tree._state_like())
+            )
         new_tree = TreeOptimizer(
             None,
             n=reduced_n,
