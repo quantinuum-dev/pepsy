@@ -345,6 +345,104 @@ def test_user_supplied_plan_runs():
     assert _fidelity(psi, opt.to_dense()) > 1 - 1e-8
 
 
+def test_root_physical_qubit_is_first_class_tree_site():
+    """A binary top tensor can own one physical qubit alongside two bonds."""
+    plan = TreePlan.from_order(
+        range(4), structure="balanced", root_qubit=4,
+    )
+    state = TreeTensorNetwork.from_plan(plan)
+    root = state.node_tensor(plan.root)
+
+    assert plan.n == 5
+    assert plan.root_qubit == 4
+    assert plan.node_of_qubit[4] == plan.root
+    assert 4 not in plan.leaf_of_qubit
+    assert set(root.inds) == {
+        state.site_ind(4),
+        *(state.bond(plan.root, child) for child in plan.children[plan.root]),
+    }
+    assert root.ndim == 3
+    assert set(state.outer_inds()) == {
+        state.site_ind(q) for q in range(plan.n)
+    }
+    expected = np.zeros(2**plan.n)
+    expected[0] = 1.0
+    assert np.array_equal(state.to_statevector(), expected)
+    assert state.validate(check_canonical=True) is state
+
+
+def test_root_physical_qubit_gate_and_submpo_replay_are_exact():
+    """Direct gates and a structured sub-MPO can target the top physical leg."""
+    plan = TreePlan.from_order(
+        range(4), structure="balanced", root_qubit=4,
+    )
+    direct_stream = [(pepsy.h(), 0), (pepsy.cnot(), (0, 4))]
+    direct = TreeOptimizer(
+        direct_stream, tree=plan, chi=32, cutoff=0.0,
+    )
+    assert _fidelity(
+        _exact_state(direct_stream, plan.n), direct.to_dense()
+    ) > 1 - 1e-10
+    assert direct.tn.validate(check_canonical=True) is direct.tn
+
+    where = (1, 3, 4)
+    mpo = _two_branch_flip_submpo(
+        L=plan.n,
+        sites=where,
+        targets=where,
+        w0=0.0,
+        w1=1.0,
+    )
+    submpo = TreeOptimizer(
+        None, tree=plan, chi=32, cutoff=0.0, run=False,
+    )
+    submpo.apply_submpo(mpo, where)
+    expected = np.zeros(2**plan.n, dtype=complex)
+    expected[int("01011", 2)] = 1.0
+    assert np.allclose(submpo.to_dense(), expected)
+    assert submpo.tn.validate(check_canonical=True) is submpo.tn
+
+
+def test_root_physical_qubit_layout_and_cap_are_root_aware():
+    """Layout scoring reaches the root site and capping removes only its leg."""
+    finder = TreeLayoutFinder(
+        supports=[(0, 4), (0, 4), (1, 2)],
+        n=5,
+        root_qubit=4,
+        structure="balanced",
+        max_arity=2,
+    )
+    plan = finder.run(refine="greedy", refine_budget=16)
+    root_path = plan.node_path(plan.node_of_qubit[0], plan.root)
+    loads = finder.edge_loads(plan)
+    path_edges = {
+        (u, v) if plan.parent.get(v) == u else (v, u)
+        for u, v in zip(root_path, root_path[1:])
+    }
+
+    assert plan.root_qubit == 4
+    assert plan.node_of_qubit[4] == plan.root
+    assert all(loads[edge] > 0.0 for edge in path_edges)
+    assert finder.report(plan)["root_qubit"] == 4
+
+    automatic = TreeOptimizer(
+        None, root_qubit=4, max_arity=2, chi=16, run=False,
+    )
+    assert automatic.n == 5
+    assert automatic.plan.root_qubit == 4
+
+    opt = TreeOptimizer(None, tree=plan, chi=16, run=False)
+    opt.apply_1q(pepsy.h(), 4)
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    assert opt.tn.local_expectation(x, 4) == pytest.approx(1.0)
+    opt.cap(4, [1.0, 0.0])
+    assert opt.plan.root_qubit is None
+    assert opt.n == 4
+    assert opt.to_dense().shape == (2**4,)
+    assert opt.norm() == pytest.approx(1 / np.sqrt(2))
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
 def test_layout_finder_builds_valid_tree():
     """With max_arity=2 the finder returns a rooted binary tree over all qubits."""
     rng = np.random.default_rng(8)
@@ -731,6 +829,43 @@ def test_layout_finder_searches_arities_by_default():
                              weight_mode="operator_schmidt")
     assert fixed.arity_candidates is None
     assert fixed.run().is_binary()
+
+
+def test_layout_finder_run_accepts_search_overrides(monkeypatch):
+    """Tree ``run`` mirrors MPS by accepting per-run quality-search controls."""
+    finder = TreeLayoutFinder([], n=4, max_arity=(2, 3), chi=8)
+    captured = {}
+    recommend_arities = finder.recommend_arities
+
+    def capture(max_arities, **kwargs):
+        captured.update(kwargs)
+        return recommend_arities(max_arities, **kwargs)
+
+    monkeypatch.setattr(finder, "recommend_arities", capture)
+    plan = finder.run(
+        chi=None,
+        refine="greedy",
+        refine_budget=2,
+        search=None,
+        search_budget=7,
+        seed=11,
+        nevergrad_optimizer="OnePlusOne",
+        progbar=True,
+    )
+
+    assert isinstance(plan, TreePlan)
+    assert captured == {
+        "chi": None,
+        "refine": "greedy",
+        "refine_budget": 2,
+        "search": None,
+        "search_budget": 7,
+        "seed": 11,
+        "nevergrad_optimizer": "OnePlusOne",
+        "progbar": True,
+    }
+    assert finder._last_arity_recommendation["refine"] == "greedy"
+    assert finder._last_arity_recommendation["chi"] is None
 
 
 def test_layout_finder_default_search_is_chi_aware_with_chi():

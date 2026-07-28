@@ -4,18 +4,19 @@
 simulator of *Simulating quantum circuits using tree tensor networks*
 (Seitz, Medina, Cruz, Huang, Mendl; Quantum 7, 964, 2023; arXiv:2206.01000).
 
-A quantum state is stored as a rooted tree tensor network whose leaves
-carry the physical qubit indices.  Internal nodes may have any arity: the
-default structure is a strictly-binary tree, but flatter ``k``-ary trees
+A quantum state is stored as a rooted tree tensor network whose leaves carry
+physical qubit indices. One optional physical qubit may instead live on the
+root tensor. Internal nodes may have any arity: the default structure is a
+strictly-binary tree, but flatter ``k``-ary trees
 (``max_arity``) or gate-connectivity-driven communities
 (``structure="adaptive"``) are supported unchanged.  A bundled gate stream
 ``[(gate, where), ...]`` is replayed:
 
-* single-qubit gates are absorbed into the leaf tensor (no bond growth); a
+* single-qubit gates are absorbed into their physical-site tensor (no bond growth); a
   unitary one-qubit gate preserves the tree canonical form regardless of where
   the orthogonality centre sits;
-* two-qubit gates on leaves ``a`` and ``b`` are SVD-split into two factors
-  joined by a virtual bond; the factors are absorbed into the two leaves and
+* two-qubit gates on sites ``a`` and ``b`` are SVD-split into two factors
+  joined by a virtual bond; the factors are absorbed into the two site nodes and
   the virtual bond is *threaded exactly* (no truncation) along the tree path
   from ``a`` to ``b``.  Only once both factors are in place is a single
   canonical compression sweep run back along the path, truncating every
@@ -115,6 +116,7 @@ def _same_tree_plan(left, right):
         and left.root == right.root
         and left.children == right.children
         and left.qubit_of_leaf == right.qubit_of_leaf
+        and left.root_qubit == right.root_qubit
     )
 
 
@@ -331,6 +333,12 @@ class TreeOptimizer:
     tree : TreePlan, optional
         Explicit tree structure (any arity).  When omitted a
         :class:`TreeLayoutFinder` builds one from the gate stream.
+    root_qubit : int, optional
+        Designated qubit carried by the top tensor instead of a leaf when the
+        layout is built automatically. Gates, sub-MPOs, readout, capping, and
+        layout scoring treat it as an ordinary physical site at the root. When
+        ``tree`` or ``layout`` is supplied, this must match its
+        ``TreePlan.root_qubit``.
     dtype : numpy dtype
         Data type of the initial product state (default ``complex128``).
     threads : int or None
@@ -417,6 +425,7 @@ class TreeOptimizer:
                  structure="quality", max_arity=(2, 3, 4), community_frac=0.35,
                  star_frac=0.75, layout_objective="path",
                  layout_weight_mode="count", layout=None, tree=None,
+                 root_qubit=None,
                  dtype=complex, threads=1, seed=None, run=True, tn=None,
                  state=None, track_truncation=False, track_infidelity=True,
                  max_intermediate_bond=None,
@@ -453,6 +462,13 @@ class TreeOptimizer:
                 "tree= expects a TreePlan, not a TreeTensorNetwork; "
                 "pass the entangled state as state= or tn=."
             )
+        if root_qubit is not None:
+            try:
+                root_qubit = int(root_qubit)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "root_qubit must be an integer or None."
+                ) from exc
         self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
         self.layout_finder = layout if isinstance(layout, TreeLayoutFinder) else None
 
@@ -514,9 +530,15 @@ class TreeOptimizer:
                     (max(w) for w in self.where if len(w) > 0),
                     default=-1,
                 )
+                if root_qubit is not None:
+                    n = max(n, root_qubit + 1)
         self.n = int(n)
         if self.n <= 0:
             raise ValueError("Could not infer qubit count; pass n explicitly.")
+        if root_qubit is not None and not 0 <= root_qubit < self.n:
+            raise ValueError(
+                f"root_qubit {root_qubit!r} is outside 0..{self.n - 1}."
+            )
         # The TTN itself always uses compact physical positions.  This facade
         # optionally preserves caller-facing logical labels across a cap while
         # keeping Quimb's internal site/index space contiguous.
@@ -590,10 +612,15 @@ class TreeOptimizer:
                 weight_mode=self.layout_weight_mode,
                 chi=self.chi,
                 max_operator_qubits=self.max_operator_qubits,
+                root_qubit=root_qubit,
             )
             tree = self.layout_finder.run()
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan or None.")
+        if root_qubit is not None and tree.root_qubit != root_qubit:
+            raise ValueError(
+                "root_qubit does not match the supplied tree/layout plan."
+            )
         self.plan = tree
 
         if product_state_source is not None:
@@ -1060,9 +1087,9 @@ class TreeOptimizer:
         """Return the adjacent node ids of ``nid`` (children plus parent)."""
         return self.tn.neighbors(nid)
 
-    def _steiner_nodes(self, leaves):
-        """Return the node set of the minimal subtree spanning ``leaves``."""
-        return self.tn.steiner_nodes(leaves)
+    def _steiner_nodes(self, nodes):
+        """Return the node set of the minimal subtree spanning ``nodes``."""
+        return self.tn.steiner_nodes(nodes)
 
     def _build_product_state(self):
         return TreeTensorNetwork.from_plan(self.plan, dtype=self.dtype)
@@ -1071,7 +1098,7 @@ class TreeOptimizer:
     def _product_site_vector(state, q):
         """Extract one qubit's vector from a bond-dimension-one TN site."""
         if isinstance(state, TreeTensorNetwork):
-            tensor = state.node_tensor(state.leaf_of_qubit(q))
+            tensor = state.node_tensor(state.node_of_qubit(q))
             physical_index = state.site_ind(q)
         else:
             site_tag = state.site_tag(q)
@@ -1105,8 +1132,8 @@ class TreeOptimizer:
         sample = next(iter(state.tensor_map.values())).data
         for node in self.plan.nodes():
             tensor = target.node_tensor(node)
-            if self.plan.is_leaf(node):
-                q = self.plan.qubit_of_leaf[node]
+            q = self.plan.qubit_of_node.get(node)
+            if q is not None:
                 vector = self._product_site_vector(state, q)
                 tensor.modify(data=ar.do("reshape", vector, ar.shape(tensor.data)))
             else:
@@ -1120,7 +1147,7 @@ class TreeOptimizer:
         if isinstance(state, TreeTensorNetwork):
             factor = None
             for node in state.plan.nodes():
-                if state.plan.is_leaf(node):
+                if node in state.plan.qubit_of_node:
                     continue
                 scalar = ar.do("reshape", state.node_tensor(node).data, ())
                 factor = scalar if factor is None else factor * scalar
@@ -1191,7 +1218,7 @@ class TreeOptimizer:
         if resolve:
             return tuple(self._validate_qubit(q) for q in where)
         for q in where:
-            if q not in self.plan.leaf_of_qubit:
+            if q not in self.plan.node_of_qubit:
                 raise ValueError(f"tree position {q} is outside the state.")
         return where
 
@@ -1226,8 +1253,8 @@ class TreeOptimizer:
                 f"max_operator_qubits={self.max_operator_qubits}."
             )
         if self.max_subtree_nodes is not None and len(where) > 1:
-            leaves = [self.plan.leaf_of_qubit[q] for q in where]
-            span = self._steiner_nodes(leaves)
+            site_nodes = [self.plan.node_of_qubit[q] for q in where]
+            span = self._steiner_nodes(site_nodes)
             if len(span) > self.max_subtree_nodes:
                 raise MemoryError(
                     f"operator Steiner subtree has {len(span)} nodes, exceeding "
@@ -1236,8 +1263,8 @@ class TreeOptimizer:
 
     def _projection_snapshot(self, where):
         """Return compact support/span/bond diagnostics for a projection."""
-        leaves = [self.plan.leaf_of_qubit[q] for q in where]
-        span = frozenset(self._steiner_nodes(leaves))
+        site_nodes = [self.plan.node_of_qubit[q] for q in where]
+        span = frozenset(self._steiner_nodes(site_nodes))
         bonds = {}
         for node in span:
             for neighbour in self._neighbors(node):
@@ -1395,7 +1422,7 @@ class TreeOptimizer:
         """Canonicalise around the minimal subtree spanning ``qubits``.
 
         The qubit-level "range canonicalisation" entry point: gauge every tensor
-        outside the minimal connected subtree spanning the given qubits' leaves
+        outside the minimal connected subtree spanning the given qubits' nodes
         to point inward, so the reduced state on those qubits is captured by that
         subtree.  Delegates to :meth:`TreeTensorNetwork.canonize_around_qubits_`.
         Returns ``self``.
@@ -1435,10 +1462,10 @@ class TreeOptimizer:
         if len(sites) not in {1, 2}:
             raise ValueError("where must be an int, (int,), or (int, int).")
         for q in sites:
-            if q not in p.plan.leaf_of_qubit:
+            if q not in p.plan.node_of_qubit:
                 raise ValueError(f"qubit {q} is outside the tree state.")
         if len(sites) == 1:
-            p.shift_orthogonality_center(p.plan.leaf_of_qubit[sites[0]])
+            p.shift_orthogonality_center(p.plan.node_of_qubit[sites[0]])
             target = (sites[0], sites[0])
         else:
             p.canonize_around_qubits_(sites)
@@ -1698,7 +1725,7 @@ class TreeOptimizer:
                     # replay gets the two-site factor fast path as well as
                     # the native multi-site MPO router. Passing both forms
                     # of support is important after a stable-label cap:
-                    # ``support`` addresses compact TTN leaves, while
+                    # ``support`` addresses compact TTN sites, while
                     # ``logical_support`` addresses the MPO site tags.
                     support = self._validate_support(logical_support)
                     self._apply_submpo_resolved(
@@ -1889,7 +1916,7 @@ class TreeOptimizer:
         return submpo_event_parts(entry) is not None
 
     def apply_1q(self, gate, q, *, renormalize=False):
-        """Absorb a one-qubit gate into the leaf tensor of qubit ``q``."""
+        """Absorb a one-qubit gate into the site tensor of qubit ``q``."""
         self._invalidate_state_norm_cache()
         with self._thread_ctx():
             return self._apply_1q_impl(gate, q, renormalize=renormalize)
@@ -1903,7 +1930,7 @@ class TreeOptimizer:
             # A Symmray gate is already a (d, d) symmetric operator; reshaping
             # into base-2 sub-legs would destroy its block/charge structure. Its
             # unitarity cannot be cheaply certified here, so take the always-safe
-            # non-unitary branch (move the centre onto the leaf first).
+            # non-unitary branch (move the centre onto the site node first).
             unitary = False
         else:
             if tuple(ar.shape(gate)) != (d, d):
@@ -1914,7 +1941,7 @@ class TreeOptimizer:
                 rtol=1e-10, atol=1e-12,
             )
         if not unitary:
-            self._move_center(self.plan.leaf_of_qubit[q])
+            self._move_center(self.plan.node_of_qubit[q])
         region = self.tn.canonical_region
         self.tn.gate_inds_(gate, [self._phys(q)], contract=True)
         if unitary:
@@ -1924,13 +1951,13 @@ class TreeOptimizer:
             # canonical-preserving operation.
             self.tn.canonical_region = region
         if not unitary:
-            self.center = self.plan.leaf_of_qubit[q]
+            self.center = self.plan.node_of_qubit[q]
             if renormalize:
                 self.normalize()
         return self
 
     def apply_2q(self, gate, qa, qb):
-        """Apply a two-qubit gate to leaves ``qa`` and ``qb``.
+        """Apply a two-qubit gate to physical sites ``qa`` and ``qb``.
 
         Following Seitz et al. (Figs. 3-6): SVD-split the gate into two factors
         joined by a virtual bond, absorb the left factor into leaf ``a`` and the
@@ -2147,10 +2174,15 @@ class TreeOptimizer:
         one canonical compression sweep.
         """
         plan = self.plan
-        la = plan.leaf_of_qubit[qa]
-        lb = plan.leaf_of_qubit[qb]
+        la = plan.node_of_qubit[qa]
+        lb = plan.node_of_qubit[qb]
         parent = plan.parent.get(la)
-        if parent is not None and plan.parent.get(lb) == parent:
+        if (
+            plan.is_leaf(la)
+            and plan.is_leaf(lb)
+            and parent is not None
+            and plan.parent.get(lb) == parent
+        ):
             return self._apply_2q_sibling_factors(
                 factors, outputs, qa, qb, la, lb, parent,
                 max_bond=max_bond, cutoff=cutoff,
@@ -2161,12 +2193,12 @@ class TreeOptimizer:
             if self._nearest_anchor((la, lb)) == la
             else (qb, qa)
         )
-        source_leaf = plan.leaf_of_qubit[source]
-        destination_leaf = plan.leaf_of_qubit[destination]
-        self._move_center(source_leaf)
+        source_node = plan.node_of_qubit[source]
+        destination_node = plan.node_of_qubit[destination]
+        self._move_center(source_node)
         self._thread_ind = thread_ind
         try:
-            source_tensor = self.tn.tensor_map[self._tid(source_leaf)]
+            source_tensor = self.tn.tensor_map[self._tid(source_node)]
             merged_source = qtn.tensor_contract(
                 source_tensor, factors[source]
             ).reindex_({outputs[source]: self._phys(source)})
@@ -2174,18 +2206,18 @@ class TreeOptimizer:
                 data=merged_source.data, inds=merged_source.inds,
             )
 
-            path = plan.node_path(source_leaf, destination_leaf)
+            path = plan.node_path(source_node, destination_node)
             for u, v in zip(path, path[1:]):
                 self._thread_hop(u, v)
 
-            destination_tensor = self.tn.tensor_map[self._tid(destination_leaf)]
+            destination_tensor = self.tn.tensor_map[self._tid(destination_node)]
             merged_destination = qtn.tensor_contract(
                 factors[destination], destination_tensor,
             ).reindex_({outputs[destination]: self._phys(destination)})
             destination_tensor.modify(
                 data=merged_destination.data, inds=merged_destination.inds,
             )
-            self.center = destination_leaf
+            self.center = destination_node
             self._compress_path(path, max_bond=max_bond, cutoff=cutoff)
         finally:
             self._thread_ind = None
@@ -2824,7 +2856,7 @@ class TreeOptimizer:
 
         The operator is first factorized into an exact tree-MPO on the
         *minimal connected subtree* (Steiner subtree) spanning the target
-        leaves. It is then applied recursively from the subtree leaves toward
+        physical nodes. It is then applied recursively from the subtree leaves toward
         a hub: each local state/operator message is QR-split losslessly on one
         edge and immediately absorbed by its parent. Thus no dense state tensor
         for the whole Steiner subtree is formed. This is the tree analogue of a
@@ -2912,23 +2944,23 @@ class TreeOptimizer:
 
         with self._thread_ctx():
             if k == 1:
-                # Single-site operator (possibly non-unitary): centre on the leaf
+                # Single-site operator (possibly non-unitary): centre on its node
                 # so it holds the (rescaled) norm, then absorb the operator.
-                leaf = self.plan.leaf_of_qubit[where[0]]
-                self._move_center(leaf)
+                site_node = self.plan.node_of_qubit[where[0]]
+                self._move_center(site_node)
                 self.tn.gate_inds_(op_arr, [phys[0]], contract=True)
-                self.center = leaf
+                self.center = site_node
                 if renormalize:
                     self.normalize()
                 return self
 
-            leaves = [self.plan.leaf_of_qubit[q] for q in where]
-            snodes = self._steiner_nodes(leaves)
-            # Centre on a target leaf so the whole exterior is isometric toward
+            site_nodes = [self.plan.node_of_qubit[q] for q in where]
+            snodes = self._steiner_nodes(site_nodes)
+            # Centre on a target physical node so the whole exterior is isometric toward
             # the subtree. Operator bonds are routed losslessly first; the
             # final subtree sweep then measures true state error against that
             # complete operator update.
-            anchor = self._nearest_anchor(leaves)
+            anchor = self._nearest_anchor(site_nodes)
             if self.center != anchor:
                 self._move_center(anchor)
 
@@ -2993,9 +3025,9 @@ class TreeOptimizer:
         if set(present) != set(payload_where):
             return None
 
-        leaves = [self.plan.leaf_of_qubit[q] for q in where]
-        snodes = self._steiner_nodes(leaves)
-        self._move_center(self._nearest_anchor(leaves))
+        site_nodes = [self.plan.node_of_qubit[q] for q in where]
+        snodes = self._steiner_nodes(site_nodes)
+        self._move_center(self._nearest_anchor(site_nodes))
         order, hub = self._peel_order(snodes)
         local = {}
         state_inds = {}
@@ -3003,7 +3035,7 @@ class TreeOptimizer:
         for nid in snodes:
             state_t = self.tn.tensor_map[self._tid(nid)].copy()
             state_inds[nid] = set(state_t.inds)
-            q = self.plan.qubit_of_leaf.get(nid)
+            q = self.plan.qubit_of_node.get(nid)
             if q is None:
                 local[nid] = state_t
                 operator_inds[nid] = set()
@@ -3064,10 +3096,10 @@ class TreeOptimizer:
             state_t = self.tn.tensor_map[self._tid(nid)].copy()
             state_inds[nid] = set(state_t.inds)
             op_t = op_factors[nid]
-            q = self.plan.qubit_of_leaf.get(nid)
+            q = self.plan.qubit_of_node.get(nid)
             if q is not None and q in where:
                 # Operator sites are packed into one dimension-four leg. Split
-                # that leg only at physical leaves, then contract its input leg
+                # that leg only at physical sites, then contract its input leg
                 # with the live state physical index.
                 op_t = self._expand_tree_operator_leaf(
                     op_t,
@@ -3125,12 +3157,12 @@ class TreeOptimizer:
         interleaved = ar.do("reshape", interleaved, (4,) * len(where))
         blob = qtn.Tensor(interleaved, inds=op_axes)
 
-        leaf_for_q = {
-            self.plan.leaf_of_qubit[q]: q for q in where
+        node_for_q = {
+            self.plan.node_of_qubit[q]: q for q in where
         }
         owned = {nid: set() for nid in snodes}
-        for leaf, q in leaf_for_q.items():
-            owned[leaf].add(op_axes[where.index(q)])
+        for node, q in node_for_q.items():
+            owned[node].add(op_axes[where.index(q)])
 
         factors = {}
         op_bonds = {"physical": dict(zip(where, op_axes))}
@@ -3166,7 +3198,7 @@ class TreeOptimizer:
         branch_index = {}
         for nid in snodes:
             state_t = self.tn.tensor_map[self._tid(nid)].copy()
-            q = self.plan.qubit_of_leaf.get(nid)
+            q = self.plan.qubit_of_node.get(nid)
             if q in target_axes:
                 p = self._phys(q)
                 branch = f"_ttn_pauli_branch_{qtn.rand_uuid()}"
@@ -3319,10 +3351,10 @@ class TreeOptimizer:
 
     def _product_pauli_expectation(self, axes, where):
         """Evaluate a product-Pauli expectation using one-site insertions."""
-        leaves = [self.plan.leaf_of_qubit[q] for q in where]
-        snodes = self._steiner_nodes(leaves)
+        site_nodes = [self.plan.node_of_qubit[q] for q in where]
+        snodes = self._steiner_nodes(site_nodes)
         if self.center not in snodes:
-            self._move_center(leaves[0])
+            self._move_center(site_nodes[0])
 
         internal = set()
         for nid in snodes:
@@ -3407,10 +3439,10 @@ class TreeOptimizer:
         """Print a top-down ASCII drawing of the tree with current bond dims.
 
         Delegates to :meth:`TreeTensorNetwork.show`: the root sits at the top,
-        the qubit leaves at the bottom, internal nodes are ``●``, leaves ``◆``
-        labelled with their qubit, and each edge carries its virtual-bond
-        dimension -- the tree analogue of a ``quimb`` MPS ``show``.  Markers are
-        coloured by tree layer by default; pass ``color=False`` for plain text.
+        structural leaves at the bottom, physical nodes are labelled with their
+        qubits, and each edge carries its virtual-bond dimension -- the tree
+        analogue of a ``quimb`` MPS ``show``. Markers are coloured by tree layer
+        by default; pass ``color=False`` for plain text.
         """
         self.tn.show(bond_dims=bond_dims, node_ids=node_ids, color=color)
 
@@ -3486,13 +3518,13 @@ class TreeOptimizer:
         edge_bonds = {}
 
         def plan_steiner(plan, support):
-            leaves = [plan.leaf_of_qubit[q] for q in support]
-            if len(leaves) == 1:
-                return {leaves[0]}
+            site_nodes = [plan.node_of_qubit[q] for q in support]
+            if len(site_nodes) == 1:
+                return {site_nodes[0]}
             nodes = set()
-            anchor = leaves[0]
-            for leaf in leaves[1:]:
-                nodes.update(plan.node_path(anchor, leaf))
+            anchor = site_nodes[0]
+            for site_node in site_nodes[1:]:
+                nodes.update(plan.node_path(anchor, site_node))
             return nodes
 
         def plan_edges(plan):
@@ -3590,7 +3622,7 @@ class TreeOptimizer:
                     raise ValueError(
                         f"cap event at step {index + 1} cannot remove the only site."
                     )
-                sim_plan = sim_plan.remove_leaf(support[0])
+                sim_plan = sim_plan.remove_qubit(support[0])
                 capped = logical_support[0]
                 active.remove(capped)
                 if payload.get("compact_labels", True):
@@ -3803,9 +3835,9 @@ class TreeOptimizer:
         """
         if self.tn.fermionic:
             return self.norm()
-        leaf = self.plan.leaf_of_qubit[min(self.plan.leaf_of_qubit)]
-        self._move_center(leaf)
-        t = self.tn.tensor_map[self._tid(leaf)]
+        site_node = self.plan.node_of_qubit[min(self.plan.node_of_qubit)]
+        self._move_center(site_node)
+        t = self.tn.tensor_map[self._tid(site_node)]
         val = qtn.tensor_contract(t.H, t, output_inds=[])
         return float(np.sqrt(abs(to_float(val, real=True))))
 
@@ -3937,18 +3969,18 @@ class TreeOptimizer:
     def measure(self, q, outcome=None):
         """Projectively measure qubit ``q`` in the computational basis.
 
-        Moves the orthogonality centre onto the leaf, reads the single-site Born
+        Moves the orthogonality centre onto the site node, reads the Born
         probabilities from that one canonical tensor, samples (or forces via
-        ``outcome``) a result, projects the leaf onto it, and renormalises.
-        Returns the outcome bit.  Because the centre sits on the leaf the
+        ``outcome``) a result, projects the site, and renormalises.
+        Returns the outcome bit. Because the centre sits on the site node the
         probabilities are exact regardless of the global state norm.
         """
         self._require_dense_qubit_state("measure")
         with self._thread_ctx():
             q = self._validate_qubit(q)
-            leaf = self.plan.leaf_of_qubit[q]
-            self._move_center(leaf)
-            t = self.tn.tensor_map[self._tid(leaf)]
+            site_node = self.plan.node_of_qubit[q]
+            self._move_center(site_node)
+            t = self.tn.tensor_map[self._tid(site_node)]
             p = self._phys(q)
             ax = t.inds.index(p)
             arr = ar.do("reshape", ar.do("moveaxis", t.data, ax, 0), (2, -1))
@@ -4112,6 +4144,7 @@ class TreeOptimizer:
                          max_arity=(2, 3, 4), community_frac=0.35,
                          star_frac=0.75, layout_objective="path",
                          layout_weight_mode="count",
+                         root_qubit=None,
                          max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS):
         """Return the :class:`TreePlan` a :class:`TreeLayoutFinder` would use."""
         return TreeLayoutFinder(
@@ -4119,6 +4152,7 @@ class TreeOptimizer:
             max_arity=max_arity, community_frac=community_frac,
             star_frac=star_frac, objective=layout_objective,
             weight_mode=layout_weight_mode,
+            root_qubit=root_qubit,
             max_operator_qubits=max_operator_qubits,
         ).run()
 
@@ -4126,7 +4160,7 @@ class TreeOptimizer:
     def convergence_sweep(cls, gates, n=None, chi_values=(2, 4, 8, 16, 32), *,
                           ops=None, structure="quality", max_arity=(2, 3, 4),
                           community_frac=0.35, star_frac=0.75, tree=None,
-                          dense_cap=1 << 14):
+                          root_qubit=None, dense_cap=1 << 14):
         """Replay ``gates`` at several ``chi`` and report convergence.
 
         The tree structure is built once and reused for every ``chi`` so the
@@ -4163,7 +4197,7 @@ class TreeOptimizer:
         if tree is None:
             probe = cls(gates, n=n, structure=structure, max_arity=max_arity,
                         community_frac=community_frac, star_frac=star_frac,
-                        run=False)
+                        root_qubit=root_qubit, run=False)
             tree = probe.plan
             n = probe.n
         elif n is None:

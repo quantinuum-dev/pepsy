@@ -15,11 +15,14 @@ Layout of a tree state
 ----------------------
 * every node of the plan (leaf **and** internal) is one tensor, tagged with the
   structural node tag ``node_tag_id.format(nid)`` (default ``"N{}"``);
-* leaf tensors additionally carry the ``quimb`` site tag
+* physical-site tensors carry the ``quimb`` site tag
   ``site_tag_id.format(q)`` (default ``"I{}"``) and the physical index
-  ``site_ind_id.format(q)`` (default ``"k{}"``) for qubit ``q`` -- so Quimb
-  treats the leaves as the sites and the internal nodes as ancillary bond
-  carriers. This class supplies the tree-specific ``local_expectation`` path;
+  ``site_ind_id.format(q)`` (default ``"k{}"``) for qubit ``q``; these are
+  structural leaves by default;
+* a plan may designate one additional ``root_qubit`` carried by the top tensor.
+  A binary root then has exactly two child bonds plus this physical leg. Other
+  internal nodes remain ancillary bond carriers. This class supplies the
+  tree-specific ``local_expectation`` path for both leaf and root sites;
 * adjacent nodes ``a`` and ``b`` share the deterministic virtual bond index
   ``_tb{lo}_{hi}`` with ``lo, hi = sorted((a, b))``.
 
@@ -149,7 +152,7 @@ def _color(s, code, enable):
 
 
 class TreeTensorNetwork(TensorNetworkGenVector):
-    """A rooted tree-tensor-network state over qubit leaves.
+    """A rooted tree-tensor-network state over physical qubit nodes.
 
     Subclasses :class:`quimb.tensor.TensorNetworkGenVector`, so it *is* a
     ``quimb`` tensor network: all of ``quimb``'s arbitrary-geometry methods
@@ -201,6 +204,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                     plan.root != ts.plan.root
                     or plan.children != ts.plan.children
                     or plan.qubit_of_leaf != ts.plan.qubit_of_leaf
+                    or plan.root_qubit != ts.plan.root_qubit
                 ):
                     raise ValueError(
                         "plan does not match the TreeTensorNetwork being copied."
@@ -421,7 +425,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     ):
         """Evaluate a local observable with a backend-specific exact path.
 
-        Dense/nonfermionic trees use the canonical target leaf or minimal
+        Dense/nonfermionic trees use the canonical target physical node or minimal
         Steiner subtree and cancel its ordinary isometric exterior. Native
         fermionic trees keep the Symmray operator structured and contract the
         complete doubled tree so graded boundary phases are never discarded.
@@ -437,7 +441,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             where = tuple(int(site) for site in where)
         if not where or len(set(where)) != len(where):
             raise ValueError("where must contain distinct tree sites.")
-        if any(site not in self.plan.leaf_of_qubit for site in where):
+        if any(site not in self.plan.node_of_qubit for site in where):
             raise ValueError(f"site(s) {where!r} are outside this tree state.")
 
         if not self.fermionic and preserve_gauge:
@@ -459,7 +463,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         else:
             original_region = None
 
-        leaves = [self.plan.leaf_of_qubit[site] for site in where]
+        site_nodes = [self.plan.node_of_qubit[site] for site in where]
         phys = [self.site_ind(site) for site in where]
         op = operator
         if self.symmetry is not None and not _is_symmray_array(op):
@@ -481,8 +485,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 normalized=normalized,
             )
         if len(where) == 1:
-            self.shift_orthogonality_center(leaves[0])
-            tensor = self.node_tensor(leaves[0])
+            self.shift_orthogonality_center(site_nodes[0])
+            tensor = self.node_tensor(site_nodes[0])
             physical = phys[0]
             if not _is_symmray_array(op):
                 dim = int(tensor.shape[tensor.inds.index(physical)])
@@ -498,9 +502,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 self._restore_readout_region(original_region)
             return result
 
-        span = self.steiner_nodes(leaves)
+        span = self.steiner_nodes(site_nodes)
         if self.orthogonality_center not in span:
-            self.shift_orthogonality_center(leaves[0])
+            self.shift_orthogonality_center(site_nodes[0])
 
         internal = {
             self.bond(node, neighbor)
@@ -513,10 +517,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         ])
         if not _is_symmray_array(op):
             dims = [
-                int(self.node_tensor(leaf).shape[
-                    self.node_tensor(leaf).inds.index(physical)
+                int(self.node_tensor(node).shape[
+                    self.node_tensor(node).inds.index(physical)
                 ])
-                for leaf, physical in zip(leaves, phys)
+                for node, physical in zip(site_nodes, phys)
             ]
             op = ar.do("reshape", op, tuple(dims + dims))
         elif len(ar.shape(op)) != 2 * len(where):
@@ -637,7 +641,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
     @property
     def nqubits(self):
-        """Number of qubit leaves (an alias of :attr:`nsites`)."""
+        """Number of physical qubits (an alias of :attr:`nsites`)."""
         return self._plan.n
 
     def node_tag(self, nid):
@@ -684,9 +688,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         The check is intentionally structural by default and therefore cheap
         enough for construction and resource-preflight paths.  It verifies that
-        every planned node has exactly one tensor, every leaf owns exactly one
-        physical index, every plan edge has exactly one live bond, and there are
-        no extra tensors or malformed shared indices.  Pass
+        every planned node has exactly one tensor, every planned physical site
+        (a leaf or the optional root site) owns exactly one physical index,
+        every plan edge has exactly one live bond, and there are no extra
+        tensors, outer legs, or malformed shared indices. Pass
         ``check_canonical=True`` to additionally verify the tracked canonical
         region; that part performs tensor contractions and is more expensive.
 
@@ -723,22 +728,23 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         for nid, tid in node_tids.items():
             tensor = self.tensor_map[tid]
             node_phys = physical_inds.intersection(tensor.inds)
-            if self._plan.is_leaf(nid):
-                q = self._plan.qubit_of_leaf[nid]
+            q = self._plan.qubit_of_node.get(nid)
+            if q is not None:
                 expected = self.site_ind(q)
                 if expected not in tensor.inds:
                     raise ValueError(
-                        f"leaf node {nid} (qubit {q}) is missing physical "
+                        f"tree node {nid} (qubit {q}) is missing physical "
                         f"index {expected!r}."
                     )
                 if len(node_phys) != 1 or expected not in node_phys:
                     raise ValueError(
-                        f"leaf node {nid} must own only physical index "
+                        f"tree node {nid} must own only physical index "
                         f"{expected!r}; found {sorted(node_phys)!r}."
                     )
                 if self.site_tag(q) not in tensor.tags:
                     raise ValueError(
-                        f"leaf node {nid} is missing site tag {self.site_tag(q)!r}."
+                        f"tree node {nid} is missing site tag "
+                        f"{self.site_tag(q)!r}."
                     )
             elif node_phys:
                 raise ValueError(
@@ -751,9 +757,16 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         for ind, ind_owners in owners.items():
             if len(ind_owners) != 1:
                 raise ValueError(
-                    f"physical index {ind!r} must belong to one leaf; "
+                    f"physical index {ind!r} must belong to one planned node; "
                     f"found nodes {ind_owners!r}."
                 )
+        unexpected_outer = set(self.outer_inds()) - physical_inds
+        if unexpected_outer:
+            raise ValueError(
+                "live tree has unregistered outer indices "
+                f"{sorted(unexpected_outer)!r}; represent a top physical leg "
+                "with TreePlan(root_qubit=...)."
+            )
 
         expected_edges = {
             frozenset((parent, child))
@@ -819,7 +832,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     # -- plan delegators ------------------------------------------------------
 
     def is_leaf(self, nid):
-        """Whether node ``nid`` is a leaf (carries a physical qubit)."""
+        """Whether ``nid`` is a structural leaf (has no children)."""
         return self._plan.is_leaf(nid)
 
     def parent(self, nid):
@@ -846,39 +859,47 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Return the leaf node id carrying qubit ``q``."""
         return self._plan.leaf_of_qubit[q]
 
+    def node_of_qubit(self, q):
+        """Return the leaf or physical root node carrying qubit ``q``."""
+        return self._plan.node_of_qubit[q]
+
     def qubit_of_leaf(self, nid):
         """Return the qubit label carried by leaf node ``nid``."""
         return self._plan.qubit_of_leaf[nid]
 
+    def qubit_of_node(self, nid):
+        """Return the qubit carried by ``nid``, or ``None`` for a virtual node."""
+        return self._plan.qubit_of_node.get(nid)
+
     def tree_distance(self, qa, qb):
-        """Return the leaf-to-leaf path length between qubits ``qa`` and ``qb``."""
+        """Return the site-node path length between qubits ``qa`` and ``qb``."""
         return self._plan.tree_distance(qa, qb)
 
-    def steiner_nodes(self, leaves):
-        """Return the node set of the minimal subtree spanning ``leaves``.
+    def steiner_nodes(self, nodes):
+        """Return the node set of the minimal subtree spanning ``nodes``.
 
         The tree has a unique path between any two nodes, so the union of the
-        paths from ``leaves[0]`` to every other leaf is exactly the minimal
+        paths from ``nodes[0]`` to every other node is exactly the minimal
         connected subtree (Steiner tree) that contains all of them.
         """
-        leaves = list(leaves)
-        if not leaves:
-            raise ValueError("need at least one leaf to span a subtree.")
-        for leaf in leaves:
-            if leaf not in self._plan.children:
-                raise ValueError(f"{leaf!r} is not a node of the tree.")
-        root_leaf = leaves[0]
-        nodes = set()
-        for lf in leaves:
-            nodes.update(self._plan.node_path(root_leaf, lf))
-        return nodes
+        nodes = list(nodes)
+        if not nodes:
+            raise ValueError("need at least one node to span a subtree.")
+        for node in nodes:
+            if node not in self._plan.children:
+                raise ValueError(f"{node!r} is not a node of the tree.")
+        root_node = nodes[0]
+        span = set()
+        for node in nodes:
+            span.update(self._plan.node_path(root_node, node))
+        return span
 
     def subtree_span(self, nodes):
         """Return the node set of the minimal connected subtree spanning ``nodes``.
 
-        Generalises :meth:`steiner_nodes` to *arbitrary* nodes (leaves and
-        internal): the union of the unique tree paths from ``nodes[0]`` to every
-        other node is the minimal connected subtree containing them all.
+        Alias-like generalisation retained for callers that work directly with
+        structural nodes: the union of the unique tree paths from ``nodes[0]``
+        to every other node is the minimal connected subtree containing them all.
         """
         nodes = list(nodes)
         if not nodes:
@@ -1114,14 +1135,14 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         The qubit-level "range canonicalisation" entry point: given a set of
         qubit labels, gauge every tensor outside the minimal connected subtree
-        that spans those qubits' leaves to point inward, so the reduced state on
+        that spans those qubits' physical nodes to point inward, so the reduced state on
         those qubits is captured by that subtree.  Equivalent to
-        ``canonize_subtree_(leaves_of(qubits), span=True)``.  Returns ``self``.
+        ``canonize_subtree_(nodes_of(qubits), span=True)``.  Returns ``self``.
         """
         if isinstance(qubits, Integral):
             qubits = (qubits,)
-        leaves = [self.leaf_of_qubit(q) for q in qubits]
-        return self.canonize_subtree_(leaves, span=True, absorb=absorb)
+        site_nodes = [self.node_of_qubit(q) for q in qubits]
+        return self.canonize_subtree_(site_nodes, span=True, absorb=absorb)
 
     def _recover_center_from_region(self, region, target, *, absorb="right"):
         """Recover one centre by peeling a tracked canonical region.
@@ -1294,25 +1315,23 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return True
 
     def cap_qubit_(self, q, vec):
-        """Contract qubit ``q`` with ``vec`` and remove that leaf in place.
+        """Contract qubit ``q`` with ``vec`` and remove that site in place.
 
         This is the tree counterpart of an MPS physical-index cap. The capped
-        leaf is absorbed into its parent; if that creates a unary parent, the
-        parent and its remaining child are fused. Remaining qubit labels are
-        compacted above ``q`` so subsequent stream entries retain MPS-style
-        positional semantics.
+        leaf is absorbed into its parent; if that creates a virtual-only unary
+        parent, the parent and its remaining child are fused. A physical root
+        qubit is contracted directly on the root without changing the tree
+        edges. Remaining qubit labels are compacted above ``q`` so subsequent
+        stream entries retain MPS-style positional semantics.
         """
         q = int(q)
         self._invalidate_norm_cache()
-        if q not in self._plan.leaf_of_qubit:
+        if q not in self._plan.node_of_qubit:
             raise ValueError(f"cap qubit {q} is outside the tree state.")
         if self._plan.n <= 1:
             raise ValueError("cannot cap the only qubit in a tree state.")
-        leaf = self._plan.leaf_of_qubit[q]
-        parent = self._plan.parent.get(leaf)
-        if parent is None:
-            raise ValueError("cannot cap the root leaf of a multi-qubit tree.")
-        like = self.node_tensor(leaf).data
+        site_node = self._plan.node_of_qubit[q]
+        like = self.node_tensor(site_node).data
         try:
             compatible = (
                 ar.infer_backend(vec) == ar.infer_backend(like)
@@ -1332,6 +1351,55 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 f"physical dimension {self.ind_size(phys)} of qubit {q}."
             )
 
+        if q == self._plan.root_qubit:
+            self.shift_orthogonality_center(self._plan.root)
+            root_t = self.node_tensor(self._plan.root)
+            cap_t = qtn.Tensor(vec, inds=(phys,))
+            merged = qtn.tensor_contract(root_t.copy(), cap_t)
+            tags = set(root_t.tags)
+            tags.discard(self.site_tag(q))
+            root_t.modify(data=merged.data, inds=merged.inds, tags=tags)
+
+            old_n = self._plan.n
+            temp_inds = {
+                old: f"_ttn_cap_ind_{old}" for old in range(q + 1, old_n)
+            }
+            temp_tags = {
+                old: f"_ttn_cap_tag_{old}" for old in range(q + 1, old_n)
+            }
+            if temp_inds:
+                self.reindex_({
+                    self.site_ind(old): temp
+                    for old, temp in temp_inds.items()
+                })
+            if temp_tags:
+                self.retag_({
+                    self.site_tag(old): temp
+                    for old, temp in temp_tags.items()
+                })
+            if temp_inds:
+                self.reindex_({
+                    temp: self.site_ind(old - 1)
+                    for old, temp in temp_inds.items()
+                })
+            if temp_tags:
+                self.retag_({
+                    temp: self.site_tag(old - 1)
+                    for old, temp in temp_tags.items()
+                })
+
+            self._plan = self._plan.remove_qubit(q)
+            self._sites = tuple(range(self._plan.n))
+            self.__dict__.pop("_node_tid_cache", None)
+            self._canonical_region = frozenset({self._plan.root})
+            self.validate()
+            return self
+
+        leaf = self._plan.leaf_of_qubit[q]
+        parent = self._plan.parent.get(leaf)
+        if parent is None:
+            raise ValueError("cannot cap the root leaf of a multi-qubit tree.")
+
         # Put the absorbing parent at the centre before contraction, so the
         # remaining state stays canonical without a full-tree rescan.
         self.shift_orthogonality_center(parent)
@@ -1342,7 +1410,13 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         leaf_message = qtn.tensor_contract(leaf_t, cap_t)
         merged = qtn.tensor_contract(parent_t, leaf_message)
 
-        collapse = len(self._plan.children[parent]) == 2
+        collapse = (
+            len(self._plan.children[parent]) == 2
+            and not (
+                parent == self._plan.root
+                and self._plan.root_qubit is not None
+            )
+        )
         child = None
         tags = set(parent_t.tags)
         if collapse:
@@ -1377,7 +1451,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         if temp_tags:
             self.retag_({temp: self.site_tag(old - 1) for old, temp in temp_tags.items()})
 
-        self._plan = self._plan.remove_leaf(q)
+        self._plan = self._plan.remove_qubit(q)
         self._sites = tuple(range(self._plan.n))
         self.__dict__.pop("_node_tid_cache", None)
         self._canonical_region = frozenset({parent})
@@ -1413,11 +1487,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Return a top-down ASCII drawing of the tree, drawn root-first.
 
         The tree analogue of a ``quimb`` MPS ``show``: the root sits at the top
-        and the qubit leaves at the bottom, each internal node marked ``●`` and
-        each leaf ``◆`` with its qubit label ``q{q}`` beneath it.  When
+        and structural leaves at the bottom. Physical nodes are labelled
+        ``q{q}``; the optional root site appears beside the top marker. When
         ``bond_dims`` is true every edge is annotated with the dimension of the
-        virtual bond joining a node to its parent (so growing entanglement shows
-        up as growing numbers on the branches)::
+        virtual bond joining a node to its parent (so growing entanglement
+        shows up as growing numbers on the branches)::
 
                    ●
               ┌────┴────┐
@@ -1447,7 +1521,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         def render(nid, depth):
             """Return ``(lines, root_col, width)`` for the subtree rooted at ``nid``."""
             if plan.is_leaf(nid):
-                label = f"q{plan.qubit_of_leaf[nid]}"
+                label = f"q{plan.qubit_of_node[nid]}"
                 w = max(1, len(label))
                 col = (w - 1) // 2
                 marker = _color("◆", _LEAF_COLOR, color)
@@ -1456,6 +1530,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                         _ascii_place(lbl, w, col)], col, w
 
             dot = f"●{nid}" if node_ids else "●"
+            if nid in plan.qubit_of_node:
+                dot += f" q{plan.qubit_of_node[nid]}"
             marker = _color(dot, _LAYER_COLORS[depth % len(_LAYER_COLORS)], color)
             blocks = []
             for child in plan.children[nid]:
@@ -1522,10 +1598,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Print the top-down ASCII drawing of the tree (see :meth:`ascii_tree`).
 
         The tree analogue of a ``quimb`` MPS ``show``: the root is at the top,
-        the qubit leaves at the bottom, internal nodes are ``●`` and leaves
-        ``◆`` labelled with their qubit, and every edge is annotated with its
-        current virtual-bond dimension.  By default the markers are coloured by
-        tree layer; pass ``color=False`` for plain text.
+        structural leaves are at the bottom, physical nodes are labelled with
+        their qubits, and every edge is annotated with its current virtual-bond
+        dimension. By default the markers are coloured by tree layer; pass
+        ``color=False`` for plain text.
         """
         print(self.ascii_tree(bond_dims=bond_dims, node_ids=node_ids, color=color))
 
@@ -1546,9 +1622,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             inds = []
             shape = []
             tags = [node_tag_id.format(nid)]
-            leaf = plan.is_leaf(nid)
-            if leaf:
-                q = plan.qubit_of_leaf[nid]
+            q = plan.qubit_of_node.get(nid)
+            if q is not None:
                 inds.append(site_ind_id.format(q))
                 shape.append(int(phys_dim))
                 tags.append(site_tag_id.format(q))
@@ -1559,7 +1634,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             if up is not None:
                 inds.append(_bond_index(nid, up))
                 shape.append(1)
-            if leaf:
+            if q is not None:
                 data = np.zeros(shape, dtype=dtype)
                 data[tuple([0] * len(shape))] = 1.0  # |0>
             else:
@@ -1594,8 +1669,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         Symmray supplies the block-sparse / fermionic tensor construction and
         all subsequent QR/SVD/contraction primitives. This method supplies
-        only the tree geometry: leaf nodes receive physical legs, while
-        internal tree nodes remain virtual tensors with neutral charge.
+        only the tree geometry: leaf nodes and the optional physical root
+        receive physical legs, while other internal tree nodes remain virtual
+        tensors with neutral charge.
         """
         try:
             import symmray as sr
@@ -1642,8 +1718,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 dtype=dtype,
                 site_tag_id=node_tag_id,
                 site_charge=lambda nid: (
-                    leaf_charges[plan.qubit_of_leaf[nid]]
-                    if plan.is_leaf(nid)
+                    leaf_charges[plan.qubit_of_node[nid]]
+                    if nid in plan.qubit_of_node
                     else neutral
                 ),
                 subsizes=subsizes,
@@ -1663,8 +1739,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 bond_duals = []
                 inds = []
 
-            if plan.is_leaf(nid):
-                q = plan.qubit_of_leaf[nid]
+            q = plan.qubit_of_node.get(nid)
+            if q is not None:
                 physical_index = sr.utils.rand_index(
                     symmetry,
                     physical_sectors,
@@ -1710,7 +1786,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def from_order(cls, order, *, weights=None, structure="quality",
                    max_arity=2, community_frac=0.35, star_frac=0.75,
                    dtype=complex, site_tag_id="I{}", site_ind_id="k{}",
-                   node_tag_id="N{}"):
+                   node_tag_id="N{}", root_qubit=None):
         """Build a product state on a tree partitioned from ``order``.
 
         Convenience wrapper that first builds a :class:`TreePlan` with
@@ -1721,7 +1797,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         plan = TreePlan.from_order(
             order, weights=weights, structure=structure,
             max_arity=max_arity, community_frac=community_frac,
-            star_frac=star_frac,
+            star_frac=star_frac, root_qubit=root_qubit,
         )
         return cls.from_plan(
             plan,
@@ -1755,9 +1831,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             inds = []
             shape = []
             tags = [node_tag_id.format(nid)]
-            leaf = plan.is_leaf(nid)
-            if leaf:
-                q = plan.qubit_of_leaf[nid]
+            q = plan.qubit_of_node.get(nid)
+            if q is not None:
                 inds.append(site_ind_id.format(q))
                 shape.append(phys_dim)
                 tags.append(site_tag_id.format(q))

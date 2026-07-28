@@ -312,24 +312,38 @@ def _chi_cut_fields(plan, chi):
 
 
 class TreePlan:
-    """A rooted tree over ``n`` qubit leaves (any internal-node arity).
+    """A rooted tree over ``n`` qubits (any internal-node arity).
 
-    Nodes are integer ids.  Leaves map one-to-one to qubits; internal nodes have
-    one or more children.  A strictly-binary tree (every internal node with two
-    children) is the common default, but the structure supports arbitrary arity
-    so a level can branch into as many subtrees as the gate stream suggests.
-    The plan is a pure structure description: it carries no tensor data and is
-    consumed by :class:`~pepsy.optimizers.tree.TreeOptimizer` to build the tree
-    tensor network.
+    Nodes are integer ids. Leaves map one-to-one to qubits. Optionally, one
+    additional qubit can be carried by the structural root via ``root_qubit``;
+    this gives a binary top tensor two child bonds plus one open physical leg.
+    Other internal nodes carry no physical qubit. A strictly-binary tree (every
+    internal node with two children) is the common default, but the structure
+    supports arbitrary arity so a level can branch into as many subtrees as the
+    gate stream suggests. The plan is a pure structure description: it carries
+    no tensor data and is consumed by
+    :class:`~pepsy.optimizers.tree.TreeOptimizer` to build the tree tensor
+    network.
     """
 
-    def __init__(self, root, children, parent, qubit_of_leaf):
+    def __init__(
+        self, root, children, parent, qubit_of_leaf, *, root_qubit=None
+    ):
         self.root = root
         self.children = dict(children)
         self.parent = dict(parent)
         self.qubit_of_leaf = dict(qubit_of_leaf)
         self.leaf_of_qubit = {q: nid for nid, q in self.qubit_of_leaf.items()}
-        self.n = len(self.qubit_of_leaf)
+        self.root_qubit = (
+            None if root_qubit is None else int(root_qubit)
+        )
+        self.qubit_of_node = dict(self.qubit_of_leaf)
+        if self.root_qubit is not None:
+            self.qubit_of_node[self.root] = self.root_qubit
+        self.node_of_qubit = {
+            q: nid for nid, q in self.qubit_of_node.items()
+        }
+        self.n = len(self.node_of_qubit)
         self._path_cache = {}
 
     # -- construction ---------------------------------------------------------
@@ -337,13 +351,15 @@ class TreePlan:
     @classmethod
     def from_order(cls, order, *, weights=None, structure="quality",
                    max_arity=2, community_frac=0.35, star_frac=0.75,
-                   dense_max=512):
+                   dense_max=512, root_qubit=None):
         """Build a rooted tree by recursive partition of ``order``.
 
         Parameters
         ----------
         order : sequence of int
-            The qubit labels to place as leaves.
+            The qubit labels to place as leaves. When ``root_qubit`` is given,
+            ``order`` contains every other qubit and the combined labels must
+            still be ``0..n-1``.
         weights : mapping, optional
             Unordered ``(qi, qj) -> weight`` interaction weights.  Used to
             spectrally reorder each recursion level (``structure="quality"``)
@@ -372,17 +388,26 @@ class TreePlan:
             (all pairwise geodesics length two) instead of being bisected.
         dense_max : int
             Maximum subsystem size for dense spectral reordering.
+        root_qubit : int, optional
+            Qubit label carried by the top tensor rather than a leaf.
         """
         order = list(order)
-        if not order:
+        if not order and root_qubit is None:
             raise ValueError("order must contain at least one qubit.")
         try:
             order = [int(q) for q in order]
         except (TypeError, ValueError) as exc:
             raise ValueError("order must contain integer qubit labels.") from exc
-        if sorted(order) != list(range(len(order))):
+        if root_qubit is not None:
+            try:
+                root_qubit = int(root_qubit)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("root_qubit must be an integer or None.") from exc
+        all_qubits = order + ([] if root_qubit is None else [root_qubit])
+        if sorted(all_qubits) != list(range(len(all_qubits))):
             raise ValueError(
-                "order must be a permutation of qubit labels 0..n-1."
+                "leaf order plus root_qubit must be a permutation of "
+                "qubit labels 0..n-1."
             )
         if structure not in {"quality", "balanced", "adaptive"}:
             raise ValueError(
@@ -533,11 +558,23 @@ class TreePlan:
             child_ids = [build(g) for g in groups]
             return make_internal(child_ids)
 
-        root = build(order)
-        return cls(root, children, parent, qubit_of_leaf)
+        if order:
+            root = build(order)
+        else:
+            root = new_node()
+            children[root] = ()
+        return cls(
+            root,
+            children,
+            parent,
+            qubit_of_leaf,
+            root_qubit=root_qubit,
+        )
 
     @classmethod
-    def from_children(cls, children, qubit_of_leaf, *, root=None):
+    def from_children(
+        cls, children, qubit_of_leaf, *, root=None, root_qubit=None
+    ):
         """Build and validate a :class:`TreePlan` from an explicit tree.
 
         This is the general entry point for arbitrary (non-binary) trees: a
@@ -554,6 +591,8 @@ class TreePlan:
         root : int, optional
             The root node id.  Inferred as the unique parent-less node when
             omitted.
+        root_qubit : int, optional
+            Qubit label carried by ``root`` rather than by a leaf.
         """
         children = {int(k): tuple(int(c) for c in v)
                     for k, v in children.items()}
@@ -581,6 +620,11 @@ class TreePlan:
             root = int(root)
             if root not in children or root in parent:
                 raise ValueError(f"invalid root {root}")
+        if root_qubit is not None:
+            try:
+                root_qubit = int(root_qubit)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("root_qubit must be an integer or None.") from exc
 
         leaves = set()
         for nid, ch in children.items():
@@ -591,15 +635,32 @@ class TreePlan:
                     )
             else:
                 leaves.add(nid)
-                if nid not in qubit_of_leaf:
+                if (
+                    nid not in qubit_of_leaf
+                    and not (nid == root and root_qubit is not None)
+                ):
                     raise ValueError(f"leaf node {nid} is missing a qubit")
-        if set(qubit_of_leaf) != leaves:
+        expected_leaf_nodes = (
+            leaves - {root}
+            if root_qubit is not None and not children[root]
+            else leaves
+        )
+        if set(qubit_of_leaf) != expected_leaf_nodes:
             raise ValueError(
                 "qubit_of_leaf must map exactly the leaf nodes"
             )
-        qs = sorted(qubit_of_leaf.values())
+        if root_qubit is not None and root in qubit_of_leaf:
+            raise ValueError("the root cannot carry both a leaf and root qubit")
+        qs = sorted(
+            [
+                *qubit_of_leaf.values(),
+                *([] if root_qubit is None else [root_qubit]),
+            ]
+        )
         if qs != list(range(len(qs))):
-            raise ValueError("leaf qubits must be 0..n-1 without repeats")
+            raise ValueError(
+                "leaf qubits plus root_qubit must be 0..n-1 without repeats"
+            )
 
         seen = set()
         stack = [root]
@@ -614,13 +675,19 @@ class TreePlan:
             raise ValueError(
                 f"nodes not reachable from root {root}: {sorted(unreached)}"
             )
-        return cls(root, children, parent, qubit_of_leaf)
+        return cls(
+            root,
+            children,
+            parent,
+            qubit_of_leaf,
+            root_qubit=root_qubit,
+        )
 
     #: Fixed number of legs on the top tensor of a :meth:`build_layered` tree.
     LAYERED_ROOT_ARITY = 3
 
     @classmethod
-    def build_layered(cls, order, *, block_size=4):
+    def build_layered(cls, order, *, block_size=4, root_qubit=None):
         """Build a fixed-structure layered tree with a ternary top tensor.
 
         The structure is fixed; only ``block_size`` is tunable:
@@ -636,22 +703,30 @@ class TreePlan:
         Parameters
         ----------
         order : sequence of int
-            Qubit labels ``0..n-1`` in the desired spatial order.  Strongly
-            coupled qubits should be consecutive so they land in the same
-            block; use :meth:`TreeLayoutFinder.qubit_order` to obtain an
+            Leaf-qubit labels in the desired spatial order. Strongly coupled
+            qubits should be consecutive so they land in the same block; use
+            :meth:`TreeLayoutFinder.qubit_order` to obtain an
             entanglement-adapted ordering, or
             :meth:`TreeLayoutFinder.recommend_layered` to also search
-            ``block_size``.
+            ``block_size``. Together with an optional ``root_qubit``, the
+            labels must cover ``0..n-1``.
         block_size : int
             Number of physical qubits per leaf-parent node. Default 4.
+        root_qubit : int, optional
+            Qubit label carried by the top tensor rather than a leaf.
         """
         order = list(order)
-        if not order:
+        if not order and root_qubit is None:
             raise ValueError("order must be non-empty.")
         order = [int(q) for q in order]
+        if root_qubit is not None:
+            root_qubit = int(root_qubit)
+        all_qubits = order + ([] if root_qubit is None else [root_qubit])
         n = len(order)
-        if sorted(order) != list(range(n)):
-            raise ValueError("order must be a permutation of 0..n-1.")
+        if sorted(all_qubits) != list(range(len(all_qubits))):
+            raise ValueError(
+                "leaf order plus root_qubit must be a permutation of 0..n-1."
+            )
         if not isinstance(block_size, Integral):
             raise ValueError("block_size must be an integer >= 1.")
         block_size = int(block_size)
@@ -674,6 +749,16 @@ class TreePlan:
             children_map[nid] = ()
             qubit_of_leaf[nid] = q
             leaf_ids.append(nid)
+
+        if not leaf_ids:
+            root_nid = new_node()
+            children_map[root_nid] = ()
+            return cls.from_children(
+                children_map,
+                qubit_of_leaf,
+                root=root_nid,
+                root_qubit=root_qubit,
+            )
 
         # First layer: group block_size leaves into one blocking node.
         # A single-leaf chunk skips the parent and uses the leaf directly.
@@ -705,7 +790,10 @@ class TreePlan:
             # not add a unary wrapper for n=1 or n <= block_size: it adds a
             # useless bond and makes the fixed layered family less efficient.
             return cls.from_children(
-                children_map, qubit_of_leaf, root=block_nodes[0]
+                children_map,
+                qubit_of_leaf,
+                root=block_nodes[0],
+                root_qubit=root_qubit,
             )
         root_arity = min(cls.LAYERED_ROOT_ARITY, num_blocks)
         if num_blocks <= root_arity:
@@ -724,7 +812,12 @@ class TreePlan:
             root_nid = new_node()
             children_map[root_nid] = tuple(root_children)
 
-        return cls.from_children(children_map, qubit_of_leaf, root=root_nid)
+        return cls.from_children(
+            children_map,
+            qubit_of_leaf,
+            root=root_nid,
+            root_qubit=root_qubit,
+        )
 
     # -- queries --------------------------------------------------------------
 
@@ -769,7 +862,8 @@ class TreePlan:
         size = {}
         for x in reversed(visit):
             ch = self.children[x]
-            size[x] = sum(size[c] for c in ch) if ch else 1
+            local = 1 if x in self.qubit_of_node else 0
+            size[x] = local + sum(size[c] for c in ch)
         best = 0
         for x, s in size.items():
             if x == self.root:
@@ -821,20 +915,38 @@ class TreePlan:
             stack.extend(self.children[node])
         masks = {}
         for node in reversed(visit):
-            if self.is_leaf(node):
-                masks[node] = 1 << self.qubit_of_leaf[node]
-            else:
-                mask = 0
-                for child in self.children[node]:
-                    mask |= masks[child]
-                masks[node] = mask
+            mask = 0
+            q = self.qubit_of_node.get(node)
+            if q is not None:
+                mask |= 1 << q
+            for child in self.children[node]:
+                mask |= masks[child]
+            masks[node] = mask
         return masks
 
     def tree_distance(self, qa, qb):
-        """Return the leaf-to-leaf path length between qubits ``qa`` and ``qb``."""
-        la = self.leaf_of_qubit[qa]
-        lb = self.leaf_of_qubit[qb]
-        return len(self.node_path(la, lb)) - 1
+        """Return the node-path length between physical qubits ``qa`` and ``qb``."""
+        na = self.node_of_qubit[qa]
+        nb = self.node_of_qubit[qb]
+        return len(self.node_path(na, nb)) - 1
+
+    def remove_qubit(self, q):
+        """Return a plan with physical qubit ``q`` removed and labels compacted."""
+        q = int(q)
+        if q == self.root_qubit:
+            if self.n <= 1:
+                raise ValueError("cannot remove the only qubit from a tree.")
+            qubit_of_leaf = {
+                node: old_q - 1 if old_q > q else old_q
+                for node, old_q in self.qubit_of_leaf.items()
+            }
+            return type(self).from_children(
+                self.children,
+                qubit_of_leaf,
+                root=self.root,
+                root_qubit=None,
+            )
+        return self.remove_leaf(q)
 
     def remove_leaf(self, q):
         """Return a plan with qubit ``q`` capped and its unary parent removed.
@@ -859,9 +971,13 @@ class TreePlan:
         del children[leaf]
         del qubit_of_leaf[leaf]
 
-        # A tree node may not become unary. Keep the old parent id and absorb
-        # its only surviving child into it; this also handles a two-leaf root.
-        if len(children[parent]) == 1:
+        # A virtual-only tree node may not become unary. A physical root is
+        # different: its one child plus root physical leg is still a meaningful
+        # rank-two top tensor, so retain that unary structural root.
+        physical_root = (
+            parent == self.root and self.root_qubit is not None
+        )
+        if len(children[parent]) == 1 and not physical_root:
             child = children[parent][0]
             children[parent] = children[child]
             del children[child]
@@ -871,15 +987,27 @@ class TreePlan:
         for node, old_q in tuple(qubit_of_leaf.items()):
             if old_q > q:
                 qubit_of_leaf[node] = old_q - 1
+        root_qubit = self.root_qubit
+        if root_qubit is not None and root_qubit > q:
+            root_qubit -= 1
         return type(self).from_children(
-            children, qubit_of_leaf, root=self.root
+            children,
+            qubit_of_leaf,
+            root=self.root,
+            root_qubit=root_qubit,
         )
 
     def __repr__(self):
         n_internal = sum(1 for nid in self.nodes() if not self.is_leaf(nid))
+        root_site = (
+            ""
+            if self.root_qubit is None
+            else f", root_qubit={self.root_qubit}"
+        )
         return (
             f"TreePlan(n={self.n}, root={self.root}, "
-            f"internal_nodes={n_internal}, max_arity={self.max_arity()})"
+            f"internal_nodes={n_internal}, "
+            f"max_arity={self.max_arity()}{root_site})"
         )
 
 
@@ -895,6 +1023,9 @@ class TreeLayoutFinder:
         :class:`TreeOptimizer`. Ignored when ``supports`` is given.
     n : int, optional
         Number of qubits.  Inferred from the stream when omitted.
+    root_qubit : int, optional
+        Designated qubit carried by the top tensor instead of a leaf. It remains
+        part of every path, Steiner-subtree, and congestion calculation.
     supports : sequence of sequences, optional
         Explicit interaction supports, used instead of extracting them from
         ``gates``.
@@ -957,7 +1088,7 @@ class TreeLayoutFinder:
                  dense_max=512, objective="path", weight_mode="count", chi=None,
                  max_operator_qubits=8, hybrid_weights=None, refine=None,
                  refine_budget=None, search=None, search_budget=128, seed=0,
-                 nevergrad_optimizer="OnePlusOne"):
+                 nevergrad_optimizer="OnePlusOne", root_qubit=None):
         if (
             _looks_like_tree_tensor_network(gates)
             or _looks_like_tree_tensor_network(supports)
@@ -982,6 +1113,14 @@ class TreeLayoutFinder:
             for site in support:
                 if isinstance(site, Integral):
                     inferred = max(inferred, site)
+        if root_qubit is not None:
+            try:
+                root_qubit = int(root_qubit)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "root_qubit must be an integer or None."
+                ) from exc
+            inferred = max(inferred, root_qubit)
         if n is None:
             n = inferred + 1
         try:
@@ -992,6 +1131,11 @@ class TreeLayoutFinder:
             raise ValueError(
                 "Could not infer qubit count; pass n explicitly."
             )
+        if root_qubit is not None:
+            if not 0 <= root_qubit < n:
+                raise ValueError(
+                    f"root_qubit {root_qubit!r} is outside 0..{n - 1}."
+                )
         normalized_supports = []
         for support in supports:
             if len(set(support)) != len(support):
@@ -1010,6 +1154,10 @@ class TreeLayoutFinder:
                     )
             normalized_supports.append(tuple(int(site) for site in support))
         self.n = n
+        self.root_qubit = root_qubit
+        self.leaf_qubits = tuple(
+            q for q in range(self.n) if q != self.root_qubit
+        )
         self.supports = tuple(normalized_supports)
         self.structure = structure
         self.max_arity, self.arity_candidates = _normalize_arity_candidates(
@@ -1157,7 +1305,7 @@ class TreeLayoutFinder:
                 refine_budget, "refine_budget"
             )
         if refine is not None and refine_budget is None:
-            refine_budget = max(1, min(self.n - 1, 64))
+            refine_budget = max(1, min(len(self.leaf_qubits) - 1, 64))
 
         if search is _DEFAULT_SEARCH_OPTION:
             search = self.search
@@ -1201,13 +1349,20 @@ class TreeLayoutFinder:
     def _plan_with_leaf_order(self, plan, order):
         """Return ``plan``'s immutable topology with a new leaf assignment."""
         order = tuple(int(q) for q in order)
-        if sorted(order) != list(range(self.n)):
-            raise ValueError("leaf order must be a permutation of 0..n-1.")
+        if set(order) != set(self.leaf_qubits) or len(order) != len(
+            self.leaf_qubits
+        ):
+            raise ValueError(
+                "leaf order must contain every non-root qubit exactly once."
+            )
         qubit_of_leaf = dict(plan.qubit_of_leaf)
         for leaf, qubit in zip(self._leaf_nodes(plan), order):
             qubit_of_leaf[leaf] = qubit
         return TreePlan.from_children(
-            plan.children, qubit_of_leaf, root=plan.root
+            plan.children,
+            qubit_of_leaf,
+            root=plan.root,
+            root_qubit=plan.root_qubit,
         )
 
     def _plan_with_leaf_swap(self, plan, left_leaf, right_leaf):
@@ -1218,7 +1373,10 @@ class TreeLayoutFinder:
             qubit_of_leaf[left_leaf],
         )
         return TreePlan.from_children(
-            plan.children, qubit_of_leaf, root=plan.root
+            plan.children,
+            qubit_of_leaf,
+            root=plan.root,
+            root_qubit=plan.root_qubit,
         )
 
     def _path_score_and_max(self, plan):
@@ -1320,7 +1478,7 @@ class TreeLayoutFinder:
         if cached is not None and cached[0] is plan:
             del self._edge_load_cache[id(plan)]
 
-    def _refine_plan_greedy(self, plan, *, chi, budget):
+    def _refine_plan_greedy(self, plan, *, chi, budget, progbar=False):
         """Greedily improve a fixed topology through adjacent leaf swaps."""
         initial_key = self._selection_key(plan, chi)
         leaf_nodes = self._leaf_nodes(plan)
@@ -1339,10 +1497,21 @@ class TreeLayoutFinder:
         evaluations = 0
         accepted_moves = 0
         position = 0
+        progress = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            progress = tqdm(
+                total=budget,
+                desc="tree layout greedy",
+                leave=False,
+            )
         while position < len(leaf_nodes) - 1 and evaluations < budget:
             left_leaf = leaf_nodes[position]
             right_leaf = leaf_nodes[position + 1]
             evaluations += 1
+            if progress is not None:
+                progress.update()
             if self.objective == "path":
                 candidate_path_score = self._path_score_after_leaf_swap(
                     current, left_leaf, right_leaf, current_path_score
@@ -1374,6 +1543,8 @@ class TreeLayoutFinder:
             else:
                 self._discard_plan_cache(candidate)
                 position += 1
+        if progress is not None:
+            progress.close()
         return current, {
             "method": "greedy",
             "evaluations": evaluations,
@@ -1383,7 +1554,7 @@ class TreeLayoutFinder:
         }
 
     def _refine_plan_nevergrad(
-        self, plan, *, chi, budget, seed, optimizer_name
+        self, plan, *, chi, budget, seed, optimizer_name, progbar=False
     ):
         """Use Nevergrad to refine a leaf assignment before simulation starts."""
         try:
@@ -1404,23 +1575,48 @@ class TreeLayoutFinder:
         initial_plan = plan
         initial_key = self._selection_key(initial_plan, chi)
         initial_order = self._leaf_order(initial_plan)
-        priorities = np.empty(self.n, dtype=float)
-        for position, qubit in enumerate(initial_order):
-            priorities[qubit] = position
+        if len(initial_order) < 2 or budget < 1:
+            return initial_plan, {
+                "method": "nevergrad",
+                "optimizer": optimizer_name,
+                "budget": budget,
+                "evaluations": 0,
+                "seed": seed,
+                "initial_key": initial_key,
+                "final_key": initial_key,
+                "improved": False,
+            }
+        leaf_qubits = tuple(initial_order)
+        priorities = np.arange(len(leaf_qubits), dtype=float)
         parametrization = ng.p.Array(init=priorities)
         if hasattr(parametrization, "set_bounds"):
-            parametrization.set_bounds(-float(self.n), float(2 * self.n))
+            parametrization.set_bounds(
+                -float(len(leaf_qubits)),
+                float(2 * len(leaf_qubits)),
+            )
         optimizer = optimizer_class(parametrization=parametrization, budget=budget)
         random_state = getattr(optimizer.parametrization, "random_state", None)
         if random_state is not None:
             random_state.seed(seed)
 
         losses = {}
+        progress = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            progress = tqdm(
+                total=budget,
+                desc="tree layout nevergrad",
+                leave=False,
+            )
 
         def loss(values):
+            if progress is not None:
+                progress.update()
             values = np.asarray(values)
             order = tuple(
-                int(q) for q in np.argsort(values, kind="stable")
+                leaf_qubits[int(position)]
+                for position in np.argsort(values, kind="stable")
             )
             cached = losses.get(order)
             if cached is not None:
@@ -1431,10 +1627,16 @@ class TreeLayoutFinder:
             self._discard_plan_cache(candidate)
             return value
 
-        recommendation = optimizer.minimize(loss)
+        try:
+            recommendation = optimizer.minimize(loss)
+        finally:
+            if progress is not None:
+                progress.close()
         final_order = tuple(
-            int(q)
-            for q in np.argsort(np.asarray(recommendation.value), kind="stable")
+            leaf_qubits[int(position)]
+            for position in np.argsort(
+                np.asarray(recommendation.value), kind="stable"
+            )
         )
         candidate = self._plan_with_leaf_order(initial_plan, final_order)
         candidate_key = self._selection_key(candidate, chi)
@@ -1456,7 +1658,7 @@ class TreeLayoutFinder:
             "improved": improved,
         }
 
-    def _improve_plan(self, plan, *, chi, settings):
+    def _improve_plan(self, plan, *, chi, settings, progbar=False):
         """Run the requested pre-simulation plan refinements in sequence."""
         initial_order = self._leaf_order(plan)
         initial_key = self._selection_key(plan, chi)
@@ -1468,7 +1670,10 @@ class TreeLayoutFinder:
         }
         if settings["refine"] == "greedy":
             plan, info["refinement"] = self._refine_plan_greedy(
-                plan, chi=chi, budget=settings["refine_budget"]
+                plan,
+                chi=chi,
+                budget=settings["refine_budget"],
+                progbar=progbar,
             )
         if settings["search"] == "nevergrad":
             plan, info["search"] = self._refine_plan_nevergrad(
@@ -1477,6 +1682,7 @@ class TreeLayoutFinder:
                 budget=settings["search_budget"],
                 seed=settings["seed"],
                 optimizer_name=settings["nevergrad_optimizer"],
+                progbar=progbar,
             )
         info["final_order"] = self._leaf_order(plan)
         info["final_key"] = self._selection_key(plan, chi)
@@ -1496,13 +1702,14 @@ class TreeLayoutFinder:
         if cached is not None and cached[0] is weights:
             return cached[1]
         plan = TreePlan.from_order(
-            range(self.n),
+            self.leaf_qubits,
             weights=weights,
             structure=structure,
             max_arity=max_arity,
             community_frac=self.community_frac,
             star_frac=self.star_frac,
             dense_max=self.dense_max,
+            root_qubit=self.root_qubit,
         )
         self._plan_cache[key] = (weights, plan)
         return plan
@@ -1580,22 +1787,24 @@ class TreeLayoutFinder:
     def qubit_order(self):
         """Return a spectral qubit ordering adapted to the gate-stream interactions.
 
-        The order is the global Fiedler spectral reordering of all qubits
+        The order is the global Fiedler spectral reordering of the leaf qubits
         under the similarity weights used internally by the layout finder.
-        Strongly coupled qubits end up consecutive, which is the ideal input
-        for :meth:`TreePlan.build_layered` so that blocks group entangled
-        qubits together.
+        A configured ``root_qubit`` is fixed at the root and omitted from this
+        returned leaf order. Strongly coupled leaf qubits end up consecutive,
+        which is the ideal input for :meth:`TreePlan.build_layered` so that
+        blocks group entangled qubits together.
 
         Returns
         -------
         list of int
-            A permutation of ``0..n-1``.
+            Every non-root qubit exactly once (all ``0..n-1`` qubits when
+            ``root_qubit`` is ``None``).
         """
         weights = self._similarity_weights()
         order = _gate_stream_spectral_order(
-            list(range(self.n)), weights, dense_max=self.dense_max
+            list(self.leaf_qubits), weights, dense_max=self.dense_max
         )
-        return order if order else list(range(self.n))
+        return order if order else list(self.leaf_qubits)
 
     def layered(self, block_size=4, *, order=None):
         """Build a fixed layered tree for a chosen ``block_size`` (no search).
@@ -1632,7 +1841,11 @@ class TreeLayoutFinder:
             order = self.qubit_order()
         else:
             order = [int(q) for q in order]
-        return TreePlan.build_layered(order, block_size=block_size)
+        return TreePlan.build_layered(
+            order,
+            block_size=block_size,
+            root_qubit=self.root_qubit,
+        )
 
     def recommend_layered(
         self,
@@ -1646,6 +1859,7 @@ class TreeLayoutFinder:
         search_budget=_DEFAULT_SEARCH_OPTION,
         seed=_DEFAULT_SEARCH_OPTION,
         nevergrad_optimizer=_DEFAULT_SEARCH_OPTION,
+        progbar=False,
     ):
         """Optimize the fixed layered structure over ``block_size``.
 
@@ -1687,6 +1901,8 @@ class TreeLayoutFinder:
             only the returned fixed plan; it never mutates a live TTN.
         search_budget, seed, nevergrad_optimizer
             Optional Nevergrad configuration for each candidate plan.
+        progbar : bool, optional
+            Display greedy and Nevergrad search progress for each candidate.
 
         Returns
         -------
@@ -1725,9 +1941,16 @@ class TreeLayoutFinder:
 
         candidates = []
         for bs in options:
-            plan = TreePlan.build_layered(order, block_size=bs)
+            plan = TreePlan.build_layered(
+                order,
+                block_size=bs,
+                root_qubit=self.root_qubit,
+            )
             plan, planning = self._improve_plan(
-                plan, chi=chi, settings=settings
+                plan,
+                chi=chi,
+                settings=settings,
+                progbar=progbar,
             )
             report = self.report(
                 plan, include_edge_loads=self.objective != "path"
@@ -1772,7 +1995,18 @@ class TreeLayoutFinder:
             "candidates": candidates,
         }
 
-    def run(self):
+    def run(
+        self,
+        *,
+        chi=_DEFAULT_CHI,
+        refine=_DEFAULT_SEARCH_OPTION,
+        refine_budget=_DEFAULT_SEARCH_OPTION,
+        search=_DEFAULT_SEARCH_OPTION,
+        search_budget=_DEFAULT_SEARCH_OPTION,
+        seed=_DEFAULT_SEARCH_OPTION,
+        nevergrad_optimizer=_DEFAULT_SEARCH_OPTION,
+        progbar=False,
+    ):
         """Return a TreePlan for the selected layout objective.
 
         When the finder was built with a set of candidate arities (the default
@@ -1780,9 +2014,31 @@ class TreeLayoutFinder:
         :meth:`recommend_arities` -- ``chi``-aware when the finder carries a
         ``chi`` -- and returns the objective-best plan.  A scalar ``max_arity``
         builds one fixed plan.
+
+        ``chi`` and the fixed-plan ``refine`` / ``search`` controls can be
+        overridden for this call. Pass ``progbar=True`` to display greedy and
+        Nevergrad search progress. Omitted values inherit the corresponding
+        finder settings, so the original zero-argument behavior is unchanged.
         """
+        if chi is _DEFAULT_CHI:
+            chi = self.chi
+        else:
+            chi = _validate_chi(chi)
+        settings = self._resolve_search_settings(
+            refine=refine,
+            refine_budget=refine_budget,
+            search=search,
+            search_budget=search_budget,
+            seed=seed,
+            nevergrad_optimizer=nevergrad_optimizer,
+        )
         if self.arity_candidates is not None:
-            rec = self.recommend_arities(self.arity_candidates, chi=self.chi)
+            rec = self.recommend_arities(
+                self.arity_candidates,
+                chi=chi,
+                progbar=progbar,
+                **settings,
+            )
             self._last_arity_recommendation = rec
             self._selected_candidate = f"arity={rec['recommended_max_arity']}"
             self._last_candidate_scores = {
@@ -1793,19 +2049,23 @@ class TreeLayoutFinder:
             }
             return rec["plan"]
         candidates = self._candidate_plans(self.max_arity)
-        settings = self._resolve_search_settings()
         if settings["refine"] is not None or settings["search"] is not None:
             candidates = {
-                name: self._improve_plan(plan, chi=self.chi, settings=settings)[0]
+                name: self._improve_plan(
+                    plan,
+                    chi=chi,
+                    settings=settings,
+                    progbar=progbar,
+                )[0]
                 for name, plan in candidates.items()
             }
         selected = min(
             candidates,
-            key=lambda name: self._selection_key(candidates[name], self.chi),
+            key=lambda name: self._selection_key(candidates[name], chi),
         )
         self._last_candidates = candidates
         self._last_candidate_scores = {
-            name: self._selection_key(plan, self.chi)
+            name: self._selection_key(plan, chi)
             for name, plan in candidates.items()
         }
         self._selected_candidate = selected
@@ -1822,6 +2082,7 @@ class TreeLayoutFinder:
         search_budget=_DEFAULT_SEARCH_OPTION,
         seed=_DEFAULT_SEARCH_OPTION,
         nevergrad_optimizer=_DEFAULT_SEARCH_OPTION,
+        progbar=False,
     ):
         """Compare binary and wider trees and return the best candidate.
 
@@ -1848,6 +2109,8 @@ class TreeLayoutFinder:
             Optional fixed-plan search controls with the same meaning as in
             :meth:`recommend_layered`. They are applied to each arity candidate
             before selecting one final immutable plan.
+        progbar : bool, optional
+            Display greedy and Nevergrad search progress for each candidate.
         """
         if chi is _DEFAULT_CHI:
             chi = self.chi
@@ -1878,7 +2141,10 @@ class TreeLayoutFinder:
         for arity in options:
             plan = self._select_plan(arity)
             plan, planning = self._improve_plan(
-                plan, chi=chi, settings=settings
+                plan,
+                chi=chi,
+                settings=settings,
+                progbar=progbar,
             )
             report = self.report(
                 plan, include_edge_loads=self.objective != "path"
@@ -2008,24 +2274,24 @@ class TreeLayoutFinder:
                 support_mask |= 1 << site
 
             # An edge crosses the support iff it belongs to the minimal
-            # subtree spanning the support leaves. Scanning every tree edge
+            # subtree spanning the support nodes. Scanning every tree edge
             # is needlessly O(n) for each event; for the dominant two-qubit
-            # case this reduces the work to the leaf-to-leaf geodesic.
-            leaves = [plan.leaf_of_qubit[site] for site in support]
-            if len(leaves) == 2:
+            # case this reduces the work to the site-to-site geodesic.
+            site_nodes = [plan.node_of_qubit[site] for site in support]
+            if len(site_nodes) == 2:
                 # This branch dominates ordinary circuit layout. Avoid sets
                 # and an all-node parent scan: every path hop is one crossed
                 # rooted tree edge.
-                path = plan.node_path(leaves[0], leaves[1])
+                path = plan.node_path(site_nodes[0], site_nodes[1])
                 crossed_edges = [
                     (u, v) if plan.parent.get(v) == u else (v, u)
                     for u, v in zip(path, path[1:])
                 ]
             else:
                 span_nodes = set()
-                anchor = leaves[0]
-                for leaf in leaves:
-                    span_nodes.update(plan.node_path(anchor, leaf))
+                anchor = site_nodes[0]
+                for site_node in site_nodes:
+                    span_nodes.update(plan.node_path(anchor, site_node))
                 crossed_edges = [
                     (parent, node)
                     for node in span_nodes
@@ -2102,7 +2368,7 @@ class TreeLayoutFinder:
         """Return the total interaction-weighted tree-path length of ``plan``.
 
         Lower is better: this is the quantity the tree structure minimises
-        (short leaf-to-leaf paths for strongly coupled qubits).
+        (short physical-node paths for strongly coupled qubits).
         """
         return self._path_score_and_max(plan)[0]
 
@@ -2110,7 +2376,9 @@ class TreeLayoutFinder:
         """Return the cached index-order balanced comparison plan."""
         if self._balanced_plan_cache is None:
             self._balanced_plan_cache = TreePlan.from_order(
-                range(self.n), structure="balanced"
+                self.leaf_qubits,
+                structure="balanced",
+                root_qubit=self.root_qubit,
             )
         return self._balanced_plan_cache
 
@@ -2118,8 +2386,8 @@ class TreeLayoutFinder:
         """Return layout-quality diagnostics for ``plan`` (or a fresh run).
 
         The dominant lever for tree-tensor-network accuracy at fixed ``chi`` is
-        how well the tree keeps strongly coupled qubits as nearby leaves: a
-        two-qubit gate threads its virtual bond along the whole leaf-to-leaf
+        how well the tree keeps strongly coupled qubits as nearby nodes: a
+        two-qubit gate threads its virtual bond along the whole site-to-site
         geodesic, and every crossed bond can grow.  This report summarises those
         geodesic lengths over the interaction graph and compares the chosen
         structure against a naive balanced index-order tree (lower ``score`` is
@@ -2173,6 +2441,7 @@ class TreeLayoutFinder:
             ),
             "hybrid_cost": hybrid_cost,
             "root": plan.root,
+            "root_qubit": plan.root_qubit,
             "is_binary": plan.is_binary(),
             "max_arity": plan.max_arity(),
             "arity_histogram": arity_histogram,

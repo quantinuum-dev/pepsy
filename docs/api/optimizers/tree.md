@@ -5,18 +5,48 @@ gate stream `[(gate, where), ...]` on a **rooted tree tensor network**, after
 *Simulating quantum circuits using tree tensor networks* (Seitz, Medina, Cruz,
 Huang, Mendl; Quantum 7, 964, 2023; [arXiv:2206.01000](https://arxiv.org/abs/2206.01000)).
 
-The state is stored with one leaf tensor per qubit. Internal nodes may have
+By default the state is stored with one leaf tensor per qubit. A plan may
+instead designate one `root_qubit`, placing that physical index directly on
+the top tensor while every other qubit remains a leaf. Internal nodes may have
 **any arity** -- by default the layout finder *searches* a small set of
 candidate arities `(2, 3, 4)` and keeps the objective-best plan, but a fixed
 binary tree, flatter `k`-ary trees, or gate-connectivity-driven communities
-(see *Tree structure*) all work through the same machinery. Gates are absorbed
-into the tree:
+(see *Tree structure*) all work through the same machinery.
 
-- **single-qubit gates** are contracted into the leaf tensor with no bond
+For example, this constructs a binary detector tree whose logical qubit is the
+open top index. The root tensor has two virtual child bonds and physical index
+`k4`:
+
+```python
+from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer
+
+finder = TreeLayoutFinder(gates, n=5, root_qubit=4, max_arity=2)
+plan = finder.run(
+    refine="greedy",
+    refine_budget=64,
+    search="nevergrad",
+    search_budget=128,
+    progbar=True,
+)
+opt = TreeOptimizer(gates, tree=plan, chi=64)
+assert opt.plan.node_of_qubit[4] == opt.plan.root
+assert set(opt.tn.node_tensor(opt.plan.root).inds) >= {"k4"}
+```
+
+`root_qubit` is first-class rather than an unregistered outer leg:
+`to_dense()` retains it in normal qubit order, `cap(root_qubit, vec)` contracts
+only that physical leg, and direct gates, dense subtree operators, and
+structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
+the site fixed at the root while its path, Steiner, congestion, greedy, and
+Nevergrad objectives permute only the remaining leaf sites.
+
+Gates are absorbed into the tree:
+
+- **single-qubit gates** are contracted into their site tensor with no bond
   growth; a unitary one-qubit gate preserves the tree canonical form regardless
   of where the orthogonality centre sits;
-- **two-qubit gates** on leaves `a` and `b` are split by SVD into two factors
-  joined by a virtual bond; the factors are absorbed into the two leaves and the
+- **two-qubit gates** on sites `a` and `b` are split by SVD into two factors
+  joined by a virtual bond; the factors are absorbed into the two site nodes and the
   bond is *threaded exactly* (lossless economical QR) along the tree path from
   `a` to `b`. Only once **both** factors are in place is a single canonical
   compression sweep run back along the path, truncating every touched bond to
@@ -37,7 +67,7 @@ into the tree:
   compression when the payload exposes Quimb's MPO site interface, so
   `to_dense()` is not required; opaque MPO-like payloads fall back to the dense
   recursive subtree-operator path.
-  `cap` contracts and removes one tree leaf, compacts the remaining qubit
+  `cap` contracts and removes one physical site, compacts the remaining qubit
   labels above it, and keeps the live tree canonical.
 
 The orthogonality centre is a single node id tracked on the
@@ -93,7 +123,7 @@ exactly as the single centre tensor does for a one-node region. Disconnected
 `nodes` raise unless `span=True` auto-expands to the minimal connected subtree
 that spans them (`subtree_span`). `canonize_around_qubits_(qubits)` is the
 qubit-level entry point: it canonicalises around the minimal subtree spanning
-those qubits' leaves, so the reduced state on a set of qubits is captured by one
+those qubits' physical nodes, so the reduced state on a set of qubits is captured by one
 subtree. `is_subtree_canonical_form(nodes)` verifies the outside-is-isometric
 property directly; `is_canonical_form` is its one-node case. `TreeOptimizer`
 mirrors this too: `canonical_region`, `canonize_subtree(nodes, span=...)`,
@@ -109,7 +139,8 @@ generalisation of the two-qubit gate: a `k`-qubit gate, a multi-site
 analogue of a sub-MPO applied over the covering range and then compressed (cf.
 Quimb's `MatrixProductState.gate_with_submpo`, which exists for the 1D chain
 only). The dense operator is first factorized into an exact tree-MPO on the
-**minimal connected subtree** (Steiner subtree) spanning the target leaves.
+**minimal connected subtree** (Steiner subtree) spanning the target physical
+nodes.
 Application then proceeds recursively from subtree leaves to a hub: each local
 state/operator message is losslessly QR-split on one edge and absorbed by its
 parent, carrying every still-open operator virtual leg. No dense state tensor
@@ -183,8 +214,9 @@ ordinary one-/two-/multi-qubit gates, structured sub-MPOs, Pauli expectation
 and projection, measurement, reset, measure-reset, cap, normalization,
 copying, canonicalization, layout construction, dense readout, and truncation
 diagnostics for dense two-level qubit TTNs. A cap's `absorb` argument is
-accepted for stream compatibility, but a tree always absorbs into the leaf's
-unique parent. `cap(q, vec)` compacts labels by default; use
+accepted for stream compatibility. A leaf site absorbs into its unique parent;
+a root site is contracted directly without changing the tree edges.
+`cap(q, vec)` compacts labels by default; use
 `stable_labels=True` (or `compact_labels=False`) to preserve caller-facing
 logical IDs across the cap while the internal TTN stays compact.
 `TreeOptimizer.qubits`, `logical_order`, `position`, and `logical_site` expose
@@ -230,7 +262,8 @@ class adds the naming and geometry glue on top of a
   node tag `node_tag_id.format(nid)` (default `"N{}"`);
 - leaf tensors additionally carry the Quimb site tag `site_tag_id.format(q)`
   (default `"I{}"`) and physical index `site_ind_id.format(q)` (default `"k{}"`)
-  for qubit `q`, so Quimb treats the leaves as the sites;
+  for qubit `q`; when `plan.root_qubit` is set, the root tensor carries that
+  qubit's site tag and physical index as well;
 - adjacent nodes share one live virtual bond. Newly constructed edges use the
   deterministic `_tb{lo}_{hi}` name, but Quimb may replace it with a UUID during
   threading or canonicalisation; `TreeTensorNetwork.bond(a, b)` resolves the
@@ -247,7 +280,7 @@ geometry queries to it.
 
 `TreeTensorNetwork.local_expectation(op, where, max_bond=None)` has two
 backend-specific exact paths. Dense/nonfermionic TTNs move the centre to the
-target leaf/subtree, cancel the ordinary isometric exterior, and contract only
+target physical node/subtree, cancel the ordinary isometric exterior, and contract only
 the minimal Steiner subtree. Native fermionic TTNs insert the Symmray operator
 without densifying it and contract the complete doubled tree, preserving every
 graded boundary phase. For native fermionic states, `max_bond` is accepted for
@@ -291,9 +324,9 @@ tree with the requested charge-sector bond dimension. These constructors keep
 the Symmray arrays native; they do not materialize dense tensor data.
 
 `TreeTensorNetwork.show()` prints a top-down ASCII drawing of the tree -- the
-tree analogue of a quimb MPS `show()` -- with the root at the top and the qubit
-leaves at the bottom, internal nodes marked `●`, leaves `◆` labelled by their
-qubit, and every branch annotated with its current virtual bond dimension
+tree analogue of a quimb MPS `show()` -- with the root at the top, structural
+leaves at the bottom, physical sites labelled by qubit, and every branch
+annotated with its current virtual bond dimension
 (`ascii_tree()` returns the same drawing as a string).
 `TreeOptimizer.show()` delegates to it.
 
@@ -305,10 +338,12 @@ recursive spectral (Fiedler) partition, keeping the recursion as the rooted
 tree (`structure="quality"`). This reuses the interaction-graph and spectral
 machinery of `pepsy.optimizers.mps.layout`; where the MPS finder flattens the
 recursion into a 1D order, the tree finder keeps the tree. Strongly coupled
-qubits become nearby leaves, minimising the tree-path length that two-qubit
-gates thread across. `structure="balanced"` splits the qubit index order in
-half at each level. `TreeLayoutFinder.score(plan)` returns the total
-interaction-weighted tree-path length that the structure minimises.
+qubits become nearby physical nodes, minimising the tree-path length that
+two-qubit gates thread across. With `root_qubit=q`, that physical node stays
+fixed at the top while the finder searches over the remaining leaf sites.
+`structure="balanced"` splits the leaf-qubit order in half at each level.
+`TreeLayoutFinder.score(plan)` returns the total interaction-weighted tree-path
+length that the structure minimises.
 
 For circuits with gates of different operator-Schmidt ranks, use
 `TreeLayoutFinder(..., objective="congestion")` or
@@ -459,6 +494,27 @@ choice = finder.recommend_layered(
 )
 ```
 
+The same fixed-plan quality controls can be supplied directly to `run()`,
+which gives finder-based frontends the same define-then-search shape as the MPS
+layout API:
+
+```python
+tree_plan = finder.run(
+    refine="greedy",
+    refine_budget=64,
+    search="nevergrad",
+    search_budget=128,
+    seed=0,
+    nevergrad_optimizer="OnePlusOne",
+    progbar=True,
+)
+```
+
+Omitted `run()` options inherit the finder configuration, preserving the
+zero-argument API. Structure, arity candidates, objective, and event weighting
+remain finder-construction options because they define the Tree search space
+and scoring model rather than one refinement pass.
+
 Nevergrad evaluates every candidate plan, so reserve it for offline circuit
 studies rather than routine short simulations. Candidate records expose their
 initial/final leaf order and the greedy/Nevergrad diagnostics under
@@ -553,7 +609,7 @@ backend.
 The dominant lever for accuracy at fixed `chi` is the tree structure, so the
 finder and optimizer expose diagnostics to choose it:
 
-- `TreeLayoutFinder.report(plan=None)` summarises the leaf-to-leaf geodesic
+- `TreeLayoutFinder.report(plan=None)` summarises the physical-node geodesic
   lengths over the interaction graph (`score`, `max_path`, `mean_path`,
   `weighted_mean_path`) and compares against a balanced index tree
   (`balanced_score`, `score_ratio_vs_balanced`). It also reports

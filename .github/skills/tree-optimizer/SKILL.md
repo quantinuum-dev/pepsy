@@ -24,7 +24,8 @@ The rooted tree-tensor-network circuit simulator of *Simulating quantum
 circuits using tree tensor networks* (Seitz, Medina, Cruz, Huang, Mendl;
 Quantum 7, 964, 2023; arXiv:2206.01000). The state is a rooted TTN (internal
 nodes of **any arity**; binary is the default, see *Non-binary trees* below)
-whose leaves carry the physical qubit indices; a bundled gate stream
+whose leaves carry physical qubit indices. An optional ``root_qubit`` is instead
+carried by the top tensor; all other physical sites remain leaves. A bundled gate stream
 `[(gate, where), ...]` is replayed. `where` is an `int` (1q) or a pair of `int`
 (2q); supports with `len(where) >= 3` route through
 `apply_subtree_operator` (see *Multi-qubit / sub-MPO application*).
@@ -91,10 +92,12 @@ naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
   `if isinstance(ts, TensorNetwork): super().__init__(ts, **o); return` lets
   the base copy the extra props without the fresh-construction defaults
   clobbering `_plan`.
-- Each leaf tensor carries **both** the structural node tag `N{nid}` and the
-  quimb site tag `I{q}` plus physical index `k{q}`; internal nodes carry only
-  `N{nid}`. So quimb sees the leaves as the `nsites` sites and internal nodes as
-  ancillary bond carriers --
+- Each physical-site tensor carries **both** the structural node tag `N{nid}`
+  and the quimb site tag `I{q}` plus physical index `k{q}`. These tensors are
+  structural leaves by default. When
+  `plan.root_qubit` is set, the root carries that site tag/index too; other
+  internal nodes carry only `N{nid}`. So quimb sees the leaf sites and optional
+  root site as `nsites`, with remaining internal nodes as ancillary bond carriers --
   `ttn.local_expectation(G, where=[q], max_bond=None, optimize="auto")` uses
   the tree's canonical contraction for dense states and an exact complete
   doubled-tree contraction for native fermionic states.
@@ -103,8 +106,8 @@ naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
 - Builders: `from_plan(plan)` (product `|0...0>`), `from_order(order,
   structure=...)` (plan + product in one call), `rand(plan, D=, seed=,
   canonicalize=True)` (random state, canonicalised around the root).
-- `show()` prints a top-down ASCII tree (root on top, qubit leaves `◆ q{q}` at
-  the bottom, internal `●`, each branch annotated with its bond dim);
+- `show()` prints a top-down ASCII tree (root on top, structural leaves at the
+  bottom, physical nodes labelled `q{q}`, each branch annotated with its bond dim);
   `ascii_tree()` returns that string. `TreeOptimizer.show()` delegates to it.
 - `TreeOptimizer.tn` **is** a `TreeTensorNetwork`; the optimizer delegates
   `_phys->tn.site_ind`, `_tag->tn.node_tag`, `_tid->tn.node_tid`,
@@ -117,13 +120,15 @@ naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
 - Node ids are ints from `TreePlan`. Tensor tag = `N{nid}` (`TreeTensorNetwork.
   node_tag`, via optimizer `_tag`).
 - Physical index of qubit `q` = `k{q}` (`TreeTensorNetwork.site_ind`, via
-  optimizer `_phys`) -- ket-leg convention. Leaves also carry site tag `I{q}`.
+  optimizer `_phys`) -- ket-leg convention. Physical nodes also carry site tag
+  `I{q}`. Resolve their geometry with `plan.node_of_qubit[q]`; use
+  `leaf_of_qubit` only when a true structural leaf is required.
 - Newly created virtual bonds between adjacent nodes `u,v` use `_tb{lo}_{hi}`
   with `lo<hi` (`optimizer._bond_name`), but Quimb may mint UUIDs during
   threading or canonicalisation. `TreeTensorNetwork.bond(u, v)` resolves the
   live shared index; use it for diagnostics and readout.
 - `plan.node_path(a, b)` is the inclusive node-id geodesic (unique in a tree);
-  `plan.tree_distance(qa, qb)` is the leaf-to-leaf path length.
+  `plan.tree_distance(qa, qb)` is the physical-node path length.
 
 ## Canonical-centre contract (core invariant)
 
@@ -249,9 +254,10 @@ spanning subtree: the tree analogue of a sub-MPO applied over a
 covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductState`
 -only; the tree base `TensorNetworkGenVector` has no such method).
 
-1. `snodes = _steiner_nodes(leaves)` -- minimal connected subtree spanning the
-   target leaves.
-2. Move the centre onto a target leaf (`_move_center(leaves[0])`, incremental)
+1. `snodes = _steiner_nodes(site_nodes)` -- minimal connected subtree spanning
+   the target physical nodes.
+2. Move the centre onto a target physical node
+   (`_move_center(site_nodes[0])`, incremental)
    so the **whole exterior is isometric toward the subtree**.
 3. Factor `op` into an exact tree-MPO on the same Steiner tree by packing each
    `(output,input)` physical pair into a dimension-four leg and applying
@@ -306,8 +312,9 @@ interface use the dense `to_dense()` fallback and remain subject to
   `cap`, `reset`, and `measure_reset`. Pauli measurements support product observables
   on distinct qubits, use `+1`/`-1` eigenvalue outcomes, and append
   `(pauli, where, outcome, probability)` to `measurements`; reset measurements
-  are internal and are not recorded. A cap contracts and removes one leaf,
-  compacts labels above it by default, and absorbs into the unique tree parent;
+  are internal and are not recorded. A cap contracts and removes one physical
+  site, compacts labels above it by default, and absorbs a leaf into its unique
+  tree parent; a physical root leg is contracted without removing tree edges;
   `stable_labels=True` / `compact_labels=False` preserves caller-facing labels
   while storage remains compact. `measure_pauli` returns outcome and Born
   probability directly; `project_pauli(..., renormalize=False)` preserves the
