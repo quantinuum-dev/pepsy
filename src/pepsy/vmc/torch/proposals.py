@@ -712,7 +712,7 @@ def _warmup_proposal_mix(
     bar = _make_progress(
         progress,
         total=n_sweeps,
-        desc="Torch VMC proposal warm-up",
+        desc="Metropolis proposal warm-up",
         unit="sweep",
     )
     try:

@@ -196,9 +196,13 @@ For sampled configurations `x`, evaluate
 
 `O_loc(x) = sum_{x'} O[x, x'] * psi(x') / psi(x)`.
 
-Average local estimators over the Markov-chain samples. The canonical sampled
-driver method is `estimate_observable(...)`; `estimate_energy(...)` remains a
-compatibility wrapper. Return complex means
+Average local estimators over the Markov-chain samples. The canonical native
+Torch workflow is `samples = vmc.sample(sampling=...)`, followed by
+`vmc.measure(samples, observables={...})`. One `measure` call shares stored
+parent amplitudes and connected-target contractions across every named
+observable. `run(observables=..., sampling=...)` is the convenience form that
+warms up, samples, and measures once; `estimate_observables(...)` and
+`estimate_energy(...)` remain compatibility wrappers. Return complex means
 when appropriate but report Hermitian observables using their real part only
 after checking the imaginary residual. Keep energy, diagonal observables,
 hopping, correlations, and arbitrary supported Fermion observables on the

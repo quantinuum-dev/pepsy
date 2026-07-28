@@ -638,10 +638,10 @@ The estimate result retains the legacy `energy_mean`, `energy_variance`, and
 `energy_stderr` field names; they contain statistics for the configured
 observable. `estimate_energy(...)` remains as a compatibility alias.
 
-For a coordinate-labelled PEPS, use `TorchFermionVMC` to derive the lattice,
-physical charge ordering, initial sector, and sampler rule in one place. Pass
-`fermion` to generate the default Hamiltonian, or omit it when supplying
-explicit `terms`:
+For compatibility with an existing lower-level sweep loop, coordinate-labelled
+PEPS can still initialize `TorchFermionVMC` in the constructor. New code
+should prefer the first-run recipe below instead. Pass `fermion` to generate
+the default Hamiltonian, or omit it when supplying explicit `terms`:
 
 ```python
 from pepsy import Fermion
@@ -662,6 +662,109 @@ result = vmc.estimate_observable(
     sweeps_between=2,
 )
 ```
+
+For a native fermionic PEPS measurement, construct `TorchFermionVMC` from the
+state and native Fermion terms only. The first `sample` (or `warmup`) owns both
+the chain recipe and PEPS contraction recipe:
+
+1. `SamplingConfig` owns the number of chains, retained samples, burn-in,
+   thinning, and RNG seeds. In the native Torch sampler, `burn_in` counts
+   discarded thinning intervals, so the `Metropolis` total is
+   `(burn_in + n_samples_per_chain) * thin` batched sweeps; every batched
+   sweep advances all chains once.
+2. `contraction_opts` is a single mapping with `method`, `chi`, `cutoff`, and
+   any backend options such as `mode`. It is consumed when the first operation builds
+   the amplitude model, then remains fixed with the Markov state.
+3. `observables` is a name-to-term mapping. `measure(samples, observables=...)`
+   uses one retained batch for every entry. Include `"energy": terms`
+   explicitly when the Hamiltonian should be visible in the measurement recipe.
+
+```python
+sampling = pvmc.SamplingConfig(
+    n_samples_per_chain=256,
+    n_chains=32,
+    burn_in=64,
+    thin=2,
+    seed=7,
+)
+contraction_opts = {
+    "method": "boundary",
+    "chi": 32,
+    "cutoff": 1e-10,
+    "mode": "mps",
+}
+
+vmc = pvmc.TorchFermionVMC(
+    peps,
+    fermion=fermion,
+    terms=terms,            # native Fermi-Hubbard terms; no JW conversion
+)
+
+# Optional, non-MCMC warm-up: inspect one valid PEPS amplitude.
+warmup = vmc.warmup(
+    sampling=sampling,
+    contraction_opts=contraction_opts,
+)
+
+# Phase 1: exactly one Metropolis pass. `samples` retains psi(x) for every x.
+samples = vmc.sample(sampling=sampling, progress=True)
+
+# Phase 2: no new Metropolis work. Reuse this batch for energy, eta, density, ...
+estimates = vmc.measure(
+    samples,
+    observables={"energy": terms, "eta": eta_terms},
+    progress=True,
+)
+print(warmup.amplitude)
+print(estimates["energy"].energy_mean, estimates["eta"].energy_stderr)
+```
+
+`estimate_observables({...}, sampling=..., contraction_opts=...)` provides the
+same one-batch behavior without retaining a separately named sample batch.
+`run(...)` is the one-command convenience form: warm up, sample once, then
+measure. `measure_samples(...)` remains the lower-level spelling of
+`measure(samples, ...)`. Native sample batches carry the PEPS parameter
+versions and contraction signature used to draw them, so `measure` rejects a
+batch after either changes; draw fresh samples after an optimization update.
+`progress=True` reports optional burn-in sweeps, MCMC
+sampling, then the shared connection-building, amplitude-contraction, and
+statistics phases. The `Metropolis` bar reports walkers (chains), retained
+samples per walker, burn-in/thinning, proposal, contraction method/`chi`,
+acceptance, and live boundary-environment cache reuse/build activity. Its
+`phase` is `equilibrate` while discarded intervals run, then `retain i/n` as
+each retained configuration per walker is recorded. The
+`Evaluation` bar reports the shared sample shape, observables, whether parent
+amplitudes were stored, connection count, and the diagonal/environment/direct
+target-amplitude split. The warm-up amplitude is a representative PEPS
+amplitude, not an energy estimate. The legacy constructor-level `n_walkers`,
+`contraction`, `chi`, and `cutoff` options remain supported for existing
+scripts, but new measurement code should keep them in `SamplingConfig` and
+`contraction_opts` as above.
+
+External MPS/BP/tree proposal sampling uses the same explicit two-stage
+shape, but has no Metropolis burn-in or thinning. Pass its independent count
+as `n_samples`, rather than a `SamplingConfig`:
+
+```python
+importance_samples = vmc.sample(
+    proposal=mps_sampler,
+    n_samples=512,
+    fermion=proposal_fermion,
+    one_d_to_two_d=mps_site_to_peps_coordinate,
+)
+importance_estimates = vmc.measure(
+    importance_samples,
+    observables={"energy": terms, "eta": eta_terms},
+)
+```
+
+`importance_samples` stores PEPS-code configurations, `log q(x)`, and target
+parent amplitudes. The later `measure` call automatically forms the
+self-normalized weights `|psi(x)|**2 / q(x)` once and shares the resulting
+target-amplitude work across every observable. Unlike a target-Metropolis
+batch, an external-proposal batch remains valid after a PEPS update: `measure`
+refreshes its target amplitudes while retaining the fixed proposal density.
+`measure_from_proposal(...)` remains the one-call compatibility shortcut.
 
 By default, `pbc=None` reads the PEPS cyclic axes through Quimb's
 `is_cyclic_x()` and `is_cyclic_y()` metadata; pass `pbc=` or `edges=` to

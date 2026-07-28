@@ -29,6 +29,10 @@ def _driver(torch, *, zero_first=False):
     from pepsy.vmc import FermionSiteEncoding, TorchVMCDriver
 
     class Amplitude(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float64))
+
         def forward(self, configs):
             values = torch.ones(configs.shape[0], dtype=torch.float64)
             if zero_first:
@@ -37,7 +41,7 @@ def _driver(torch, *, zero_first=False):
                     torch.zeros_like(values),
                     values,
                 )
-            return values
+            return self.scale * values
 
     return TorchVMCDriver(
         Amplitude(),
@@ -64,8 +68,12 @@ def test_mps_batch_bridge_reorders_occupations_and_supports_observables():
         torch.tensor([0.5, 0.5], dtype=torch.float64),
     )
 
-    result = driver.measure_from_proposal(
-        batch,
+    samples = driver.sample_from_proposal(batch)
+    assert samples.configs.tolist() == [[1, 2], [2, 1]]
+    assert samples.proposal_log_probs.shape == (2,)
+
+    result = driver.measure_samples(
+        samples,
         observables={
             "energy": None,
             "eta": {(1, 0): torch.eye(4, dtype=torch.float64)},
@@ -76,6 +84,30 @@ def test_mps_batch_bridge_reorders_occupations_and_supports_observables():
     assert result["energy"].configs.tolist() == [[[1, 2], [2, 1]]]
     assert all(torch.isfinite(value.energy_mean) for value in result.values())
     assert result["energy"].effective_sample_size == pytest.approx(2.0)
+
+
+def test_importance_samples_refresh_target_amplitudes_after_a_peps_update():
+    torch = pytest.importorskip("torch")
+    driver = _driver(torch)
+    batch = _FermionBatch(
+        torch.tensor(
+            [
+                [[1, 0], [0, 1]],
+                [[0, 1], [1, 0]],
+            ],
+            dtype=torch.long,
+        ),
+        torch.tensor([0.5, 0.5], dtype=torch.float64),
+    )
+
+    samples = driver.sample_from_proposal(batch)
+    assert torch.all(samples.amplitudes == 1.0)
+    with torch.no_grad():
+        driver.model.scale.add_(1.0)
+
+    result = driver.measure_samples(samples)
+    assert torch.all(result.amplitudes == 2.0)
+    assert result.effective_sample_size == pytest.approx(2.0)
 
 
 def test_mps_bridge_drops_zero_amplitude_nodes_before_local_energy():
@@ -174,11 +206,14 @@ def test_real_u1u1_mps_sampler_feeds_fermionic_peps_vmc():
         seed=5,
         init_max_states=4096,
     )
-    result = vmc.measure_from_mps(
-        proposal,
+    samples = vmc.sample(
+        proposal=proposal,
         n_samples=4,
         seed=8,
+        fermion=fermion,
+        one_d_to_two_d=one_d_to_two_d,
     )
+    result = vmc.measure(samples)["energy"]
 
     assert result.configs.shape == (1, 4, 6)
     assert result.configs[0].tolist() == [[2, 2, 2, 1, 1, 1]] * 4

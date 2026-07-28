@@ -42,7 +42,9 @@ from .results import (
     _accumulate_cache_profile,
     _cache_profile_snapshot,
     _make_progress,
+    _set_evaluation_progress_postfix,
     _set_vmc_progress_postfix,
+    _torch_sample_provenance,
 )
 from .sampler import TorchBPMetropolisSampler, TorchMetropolisSampler
 
@@ -600,8 +602,16 @@ class TorchVMCDriver:
         bar = _make_progress(
             True,
             total=n_sweeps,
-            desc="Torch VMC burn-in",
+            desc="Metropolis warm-up",
             unit="sweep",
+        )
+        _set_vmc_progress_postfix(
+            bar,
+            n_sites=self.n_sites,
+            include_energy=False,
+            n_chains=self.n_walkers,
+            model=self.model,
+            proposal=self.proposal,
         )
         result = None
         n_proposed = 0
@@ -623,6 +633,9 @@ class TorchVMCDriver:
                     result,
                     n_sites=self.n_sites,
                     include_energy=False,
+                    n_chains=self.n_walkers,
+                    model=self.model,
+                    proposal=self.proposal,
                 )
         finally:
             bar.close()
@@ -734,6 +747,7 @@ class TorchVMCDriver:
         proposal_log_probs=None,
         profile=False,
         deduplicate=True,
+        progress=False,
     ):
         """Measure saved chain samples without running another sampler.
 
@@ -741,8 +755,14 @@ class TorchVMCDriver:
         tensor with shape ``(n_samples_per_chain, n_chains, n_sites)``. A
         two-dimensional tensor is interpreted as one retained sample per
         chain. Stored amplitudes from ``TorchMCMCSamples`` are reused unless
-        ``amplitudes=`` is supplied explicitly; pass an explicit amplitude
-        batch when the PEPS parameters have changed since sampling.
+        ``amplitudes=`` is supplied explicitly. Native Markov samples carry a
+        PEPS/contraction provenance record and are rejected after that state
+        has changed: draw a fresh Markov batch after an update rather than
+        mixing configurations from the old Born distribution with the new
+        local estimator. In contrast, :class:`TorchImportanceSamples` came
+        from a fixed external proposal ``q``; it remains valid after a PEPS
+        update and refreshes its target parent amplitudes before forming
+        ``|psi(x)|**2 / q(x)``.
 
         With ``observables=None`` the driver's configured connection function
         is measured and one :class:`TorchVMCEnergyEstimate` is returned. A
@@ -763,13 +783,26 @@ class TorchVMCDriver:
         By default, repeated parent configurations and repeated connected
         targets are contracted once and scattered back to their original
         chain positions. Set ``deduplicate=False`` for compatibility
-        diagnostics or timing comparisons.
+        diagnostics or timing comparisons. Set ``progress=True`` to report
+        connection construction, amplitude contraction, and statistics.
         """
         torch = _require_torch()
         start = time.perf_counter()
         model_device = _model_device(self.model)
 
         sample_object = samples if hasattr(samples, "configs") else None
+        provenance = getattr(sample_object, "provenance", None)
+        if provenance is not None and provenance != _torch_sample_provenance(self.model):
+            raise RuntimeError(
+                "Samples belong to a different PEPS/model state. Call "
+                "sample(...) again after modifying the model or its "
+                "contraction settings."
+            )
+        target_provenance = getattr(sample_object, "target_provenance", None)
+        refresh_proposal_amplitudes = (
+            target_provenance is not None
+            and target_provenance != _torch_sample_provenance(self.model)
+        )
         raw_configs = (
             getattr(sample_object, "configs", None)
             if sample_object is not None
@@ -803,6 +836,12 @@ class TorchVMCDriver:
 
         if amplitudes is None and sample_object is not None:
             amplitudes = getattr(sample_object, "amplitudes", None)
+        if refresh_proposal_amplitudes:
+            amplitudes = None
+        parent_amplitude_source = (
+            "stored" if amplitudes is not None else "refreshed"
+            if refresh_proposal_amplitudes else "contracted"
+        )
         if amplitudes is None:
             with torch.no_grad():
                 if deduplicate and unique_parent_count < flat_configs.shape[0]:
@@ -885,6 +924,26 @@ class TorchVMCDriver:
                 raise ValueError("observables must contain at least one entry.")
             return_mapping = True
 
+        phase_bar = _make_progress(
+            progress,
+            total=3,
+            desc="Evaluation",
+            unit="stage",
+        )
+
+        def set_phase(stage, *, n_connections=None):
+            _set_evaluation_progress_postfix(
+                phase_bar,
+                model=self.model,
+                n_steps=n_steps,
+                n_chains=n_chains,
+                observables=(name for name, _ in observable_items),
+                parent_amplitudes=parent_amplitude_source,
+                stage=stage,
+                n_connections=n_connections,
+            )
+
+        set_phase("connections")
         connection_start = time.perf_counter()
         connection_map = {
             name: (
@@ -894,8 +953,15 @@ class TorchVMCDriver:
             )
             for name, terms in observable_items
         }
+        n_connections = sum(
+            int(connections.configs.shape[0])
+            for connections in connection_map.values()
+        )
         connection_elapsed = time.perf_counter() - connection_start
+        if phase_bar is not None:
+            phase_bar.update(1)
 
+        set_phase("target amplitudes", n_connections=n_connections)
         local_start = time.perf_counter()
         with torch.no_grad():
             flat_values = _local_energies_from_connection_map(
@@ -909,6 +975,8 @@ class TorchVMCDriver:
                 compile_kernels=self.compile_kernels,
             )
         local_elapsed = time.perf_counter() - local_start
+        if phase_bar is not None:
+            phase_bar.update(1)
         elapsed = time.perf_counter() - start
 
         acceptance_rate = float(
@@ -935,6 +1003,7 @@ class TorchVMCDriver:
                 "weighted": importance_weights is not None,
             }
 
+        set_phase("statistics", n_connections=n_connections)
         results = {}
         for name, _ in observable_items:
             local_values = flat_values[name].reshape(n_steps, n_chains)
@@ -994,6 +1063,9 @@ class TorchVMCDriver:
                 ),
             )
 
+        if phase_bar is not None:
+            phase_bar.update(1)
+            phase_bar.close()
         return results if return_mapping else results["observable"]
 
     def energy_estimate(self):
@@ -1005,6 +1077,7 @@ class TorchVMCDriver:
     def estimate_observable(
         self,
         *,
+        sampling=None,
         burn_in=0,
         n_measurements=1,
         sweeps_between=1,
@@ -1050,8 +1123,11 @@ class TorchVMCDriver:
         opt-in so normal short VMC loops keep their existing overhead.
         """
         profile = bool(profile)
+        if sampling is not None and sampler is not None:
+            raise ValueError("Pass either sampling=... or sampler=..., not both.")
         modern_sampling = (
-            sampler is not None
+            sampling is not None
+            or sampler is not None
             or n_samples is not None
             or n_chains is not None
             or n_discard_per_chain is not None
@@ -1070,6 +1146,7 @@ class TorchVMCDriver:
                 )
             if sampler is None:
                 samples = self.sample(
+                    sampling=sampling,
                     n_samples=1024 if n_samples is None else n_samples,
                     n_chains=n_chains,
                     n_discard_per_chain=n_discard_per_chain,
@@ -1344,6 +1421,7 @@ class TorchVMCDriver:
         self,
         observables,
         *,
+        sampling=None,
         burn_in=0,
         n_measurements=1,
         sweeps_between=1,
@@ -1383,6 +1461,8 @@ class TorchVMCDriver:
         if not observable_items:
             raise ValueError("observables must contain at least one entry.")
         profile = bool(profile)
+        if sampling is not None and sampler is not None:
+            raise ValueError("Pass either sampling=... or sampler=..., not both.")
 
         def make_connection_map(configs):
             return {
@@ -1444,7 +1524,8 @@ class TorchVMCDriver:
             return results
 
         modern_sampling = (
-            sampler is not None
+            sampling is not None
+            or sampler is not None
             or n_samples is not None
             or n_chains is not None
             or n_discard_per_chain is not None
@@ -1463,6 +1544,7 @@ class TorchVMCDriver:
                 )
             if sampler is None:
                 samples = self.sample(
+                    sampling=sampling,
                     n_samples=1024 if n_samples is None else n_samples,
                     n_chains=n_chains,
                     n_discard_per_chain=n_discard_per_chain,
@@ -1494,14 +1576,21 @@ class TorchVMCDriver:
             phase_bar = _make_progress(
                 progress,
                 total=3,
-                desc="Torch VMC evaluation",
-                unit="phase",
+                desc="Evaluation",
+                unit="stage",
             )
-            observable_names = ", ".join(name for name, _ in observable_items)
 
-            def set_phase(stage):
-                if phase_bar is not None:
-                    phase_bar.set_postfix({"stage": stage})
+            def set_phase(stage, *, n_connections=None):
+                _set_evaluation_progress_postfix(
+                    phase_bar,
+                    model=self.model,
+                    n_steps=samples.n_samples_per_chain,
+                    n_chains=samples.n_chains,
+                    observables=(name for name, _ in observable_items),
+                    parent_amplitudes="stored",
+                    stage=stage,
+                    n_connections=n_connections,
+                )
 
             try:
                 estimator_start = time.perf_counter()
@@ -1510,14 +1599,18 @@ class TorchVMCDriver:
                 flat_configs = sample_configs.reshape(-1, self.n_sites)
                 flat_amplitudes = sample_amplitudes.reshape(-1)
 
-                set_phase("building shared connections")
+                set_phase("connections")
                 connection_start = time.perf_counter()
                 connection_map = make_connection_map(flat_configs)
+                n_connections = sum(
+                    int(connections.configs.shape[0])
+                    for connections in connection_map.values()
+                )
                 connection_elapsed = time.perf_counter() - connection_start
                 if phase_bar is not None:
                     phase_bar.update(1)
 
-                set_phase(f"contracting {observable_names}")
+                set_phase("target amplitudes", n_connections=n_connections)
                 local_start = time.perf_counter()
                 with _require_torch().no_grad():
                     flat_values = _local_energies_from_connection_map(
@@ -1534,7 +1627,7 @@ class TorchVMCDriver:
                 if phase_bar is not None:
                     phase_bar.update(1)
 
-                set_phase("computing statistics")
+                set_phase("statistics", n_connections=n_connections)
                 local_values = {
                     name: values.reshape(sample_configs.shape[:-1])
                     for name, values in flat_values.items()
@@ -1774,6 +1867,42 @@ class TorchVMCDriver:
             auto_thin=auto_thin,
         )
 
+    def sample_from_proposal(
+        self,
+        proposal,
+        *,
+        n_samples=128,
+        seed=None,
+        fermion=None,
+        one_d_to_two_d=None,
+        site_order=None,
+        occupation_map=None,
+        sample_kwargs=None,
+        progress=False,
+        amplitude_floor=0.0,
+    ):
+        """Draw reusable PEPS-code samples from an external proposal.
+
+        The result retains ``log q(x)`` and target amplitudes. Pass it to
+        :meth:`measure_samples` to form the self-normalized importance
+        estimator for any observable map without drawing the proposal again.
+        """
+        from .importance import sample_from_proposal
+
+        return sample_from_proposal(
+            self,
+            proposal,
+            n_samples=n_samples,
+            seed=seed,
+            fermion=fermion,
+            one_d_to_two_d=one_d_to_two_d,
+            site_order=site_order,
+            occupation_map=occupation_map,
+            sample_kwargs=sample_kwargs,
+            progress=progress,
+            amplitude_floor=amplitude_floor,
+        )
+
     def measure_from_proposal(
         self,
         proposal,
@@ -1793,16 +1922,13 @@ class TorchVMCDriver:
     ):
         """Measure from an external MPS, BP, tree, or proposal batch.
 
-        The proposal is normalized at this boundary and the resulting batch
-        is delegated to :meth:`measure_samples`.  ``one_d_to_two_d`` and
-        ``fermion`` are required only when a bare MPS must be wrapped in a
-        :class:`pepsy.sampling.MpsSampler`; sampled MPS batches carry their
-        own coordinate map and occupation decoder.
+        This is the compatibility one-shot form of
+        :meth:`sample_from_proposal` followed by :meth:`measure_samples`.
+        ``one_d_to_two_d`` and ``fermion`` are required only when a bare MPS
+        must be wrapped in a :class:`pepsy.sampling.MpsSampler`; sampled MPS
+        batches carry their own coordinate map and occupation decoder.
         """
-        from .importance import measure_from_proposal
-
-        return measure_from_proposal(
-            self,
+        samples = self.sample_from_proposal(
             proposal,
             n_samples=n_samples,
             seed=seed,
@@ -1811,11 +1937,15 @@ class TorchVMCDriver:
             site_order=site_order,
             occupation_map=occupation_map,
             sample_kwargs=sample_kwargs,
-            observables=observables,
             progress=progress,
             amplitude_floor=amplitude_floor,
+        )
+        return self.measure_samples(
+            samples,
+            observables=observables,
             profile=profile,
             deduplicate=deduplicate,
+            progress=progress,
         )
 
     def importance_energy_estimate(

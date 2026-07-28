@@ -30,6 +30,7 @@ from .results import (
     TorchMetropolisResult,
     _make_progress,
     _set_vmc_progress_postfix,
+    _torch_sample_provenance,
 )
 
 __all__ = [
@@ -310,8 +311,18 @@ class TorchMetropolisSampler:
         bar = _make_progress(
             True,
             total=n_sweeps,
-            desc="Torch VMC burn-in",
+            desc="Metropolis warm-up",
             unit="sweep",
+        )
+        _set_vmc_progress_postfix(
+            bar,
+            n_sites=self.n_sites,
+            include_energy=False,
+            n_chains=self.n_chains,
+            model=self.amplitude_fn,
+            proposal=self.proposal,
+            burn_in=0,
+            thin=1,
         )
         result = None
         n_proposed = 0
@@ -333,6 +344,11 @@ class TorchMetropolisSampler:
                     result,
                     n_sites=self.n_sites,
                     include_energy=False,
+                    n_chains=self.n_chains,
+                    model=self.amplitude_fn,
+                    proposal=self.proposal,
+                    burn_in=0,
+                    thin=1,
                 )
         finally:
             bar.close()
@@ -388,7 +404,10 @@ class TorchMetropolisSampler:
         ``n_samples`` is the requested total across all chains. As in
         NetKet, the chain length is rounded up so every chain contributes the
         same number of samples. ``n_discard`` and ``n_thin`` are aliases for
-        ``n_discard_per_chain`` and ``sweep_size`` respectively.
+        ``n_discard_per_chain`` and ``sweep_size`` respectively. Both the
+        discard and retained portions use that sweep interval, so the progress
+        bar totals ``(n_discard_per_chain + n_samples_per_chain) *
+        sweep_size`` batched Metropolis sweeps.
         """
         torch = _require_torch()
         n_samples = _check_positive_int("n_samples", n_samples)
@@ -416,25 +435,60 @@ class TorchMetropolisSampler:
         bar = _make_progress(
             progress,
             total=total_sweeps,
-            desc="Torch Metropolis",
+            desc="Metropolis",
+            unit="sweep",
+        )
+        _set_vmc_progress_postfix(
+            bar,
+            n_sites=self.n_sites,
+            include_energy=False,
+            n_chains=self.n_chains,
+            model=self.amplitude_fn,
+            proposal=self.proposal,
+            retained_per_walker=n_samples_per_chain,
+            burn_in=n_discard_per_chain,
+            thin=sweep_size,
+            phase=("equilibrate" if n_discard_per_chain else "retain 0/"
+                   f"{n_samples_per_chain}"),
         )
         start = time.perf_counter()
         n_proposed = 0
         n_accepted = 0
+        n_completed_sweeps = 0
         proposal_stats = _empty_proposal_stats() if track_proposal_stats else None
 
+        def sampling_phase():
+            if n_completed_sweeps <= n_discard_per_chain * sweep_size:
+                return "equilibrate"
+            retained = (n_completed_sweeps - n_discard_per_chain * sweep_size) // sweep_size
+            return f"retain {retained}/{n_samples_per_chain}"
+
         def advance_one_sweep():
-            nonlocal n_proposed, n_accepted
+            nonlocal n_proposed, n_accepted, n_completed_sweeps
             sweep_kwargs = {"n_sweeps": 1}
             if track_proposal_stats:
                 sweep_kwargs["track_proposal_stats"] = True
             result = self.sample_sweep(**sweep_kwargs)
             n_proposed += result.n_proposed
             n_accepted += result.n_accepted
+            n_completed_sweeps += 1
             if track_proposal_stats:
                 _merge_proposal_stats(proposal_stats, result.proposal_stats)
             if bar is not None:
                 bar.update(1)
+                _set_vmc_progress_postfix(
+                    bar,
+                    result,
+                    n_sites=self.n_sites,
+                    include_energy=False,
+                    n_chains=self.n_chains,
+                    model=self.amplitude_fn,
+                    proposal=self.proposal,
+                    retained_per_walker=n_samples_per_chain,
+                    burn_in=n_discard_per_chain,
+                    thin=sweep_size,
+                    phase=sampling_phase(),
+                )
 
         for _ in range(n_discard_per_chain * sweep_size):
             advance_one_sweep()
@@ -485,6 +539,7 @@ class TorchMetropolisSampler:
             ),
             log_abs_amplitudes=log_abs_amplitudes,
             proposal_stats=proposal_stats,
+            provenance=_torch_sample_provenance(self.amplitude_fn),
         )
 
 

@@ -42,11 +42,15 @@ from .proposals import (
 )
 from .results import (
     TorchMetropolisResult,
+    TorchImportanceSamples,
     TorchMCMCSamples,
+    TorchSampleProvenance,
     TorchChainDiagnostics,
     TorchVMCEnergyEstimate,
     TorchVMCImportanceEstimate,
+    TorchVMCMeasurementRun,
     TorchVMCStepResult,
+    TorchVMCWarmupResult,
 )
 from .sampler import TorchBPMetropolisSampler, TorchMetropolisSampler, metropolis_local_sampler
 from .sr import TorchSRResult, apply_torch_sr_update, solve_torch_sr, torch_log_derivative_matrix
@@ -59,7 +63,9 @@ __all__ = [
     "TorchPEPSBoundaryAmplitude",
     "TorchConnections",
     "TorchMetropolisResult",
+    "TorchImportanceSamples",
     "TorchMCMCSamples",
+    "TorchSampleProvenance",
     "TorchChainDiagnostics",
     "TorchMetropolisSampler",
     "TorchBPMetropolisSampler",
@@ -68,7 +74,9 @@ __all__ = [
     "TorchVMCSetup",
     "TorchVMCEnergyEstimate",
     "TorchVMCImportanceEstimate",
+    "TorchVMCMeasurementRun",
     "TorchVMCStepResult",
+    "TorchVMCWarmupResult",
     "TorchSRResult",
     "TorchSquareLattice",
     "apply_torch_sr_update",

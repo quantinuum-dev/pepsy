@@ -149,7 +149,15 @@ def _resolve_contraction_config(contraction, chi=None, cutoff=None, options=None
 
 @dataclass(frozen=True)
 class SamplingConfig:
-    """Shared chain-preserving sampling settings."""
+    """Shared chain-preserving sampling settings.
+
+    ``burn_in`` is the number of discarded *thinning intervals* per chain.
+    Thus the native Torch sampler advances each chain
+    ``(burn_in + n_samples_per_chain) * thin`` Metropolis sweeps: it discards
+    ``burn_in * thin`` sweeps, then retains one configuration after every
+    ``thin`` further sweeps.  The returned batch has shape
+    ``(n_samples_per_chain, n_chains, n_sites)``.
+    """
 
     n_samples_per_chain: int = 128
     n_chains: int = 16

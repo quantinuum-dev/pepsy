@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from pepsy.vmc import (
     BackendCapabilityWarning,
@@ -275,6 +276,37 @@ def test_torch_driver_consumes_shared_sampling_and_optimization_configs():
     )
     assert samples.configs.shape == (2, 2, 2)
     assert samples.to_common().chain_shape == (2, 2)
+    assert samples.provenance is not None
+    assert samples.provenance.model_identity == id(driver.model)
+
+    with torch.no_grad():
+        driver.model.weights.add_(0.1)
+    with pytest.raises(RuntimeError, match="different PEPS/model state"):
+        driver.measure_samples(samples)
+
+    samples = driver.sample(
+        sampling=SamplingConfig(
+            n_samples_per_chain=1,
+            n_chains=2,
+            burn_in=0,
+            thin=1,
+            seed=14,
+        )
+    )
+    driver.model.contraction = "exact"
+    with pytest.raises(RuntimeError, match="different PEPS/model state"):
+        driver.measure_samples(samples)
+
+    measurement = driver.estimate_observable(
+        sampling=SamplingConfig(
+            n_samples_per_chain=1,
+            n_chains=2,
+            burn_in=0,
+            thin=1,
+            seed=13,
+        )
+    )
+    assert measurement.n_samples == 2
 
     history = driver.optimize(
         optimization=OptimizationConfig(
@@ -286,6 +318,247 @@ def test_torch_driver_consumes_shared_sampling_and_optimization_configs():
         sample_sweeps=1,
     )
     assert len(history) == 1
+
+
+def test_torch_fermion_measurement_api_keeps_sampling_and_estimation_separate(
+    monkeypatch,
+):
+    torch = pytest.importorskip("torch")
+    from pepsy.vmc import (
+        TorchFermionVMC,
+        TorchVMCMeasurementRun,
+        TorchVMCWarmupResult,
+    )
+    from pepsy.vmc.torch import TorchVMCDriver
+
+    vmc = object.__new__(TorchFermionVMC)
+    vmc.observables = {"density": "compiled-density"}
+    vmc._compile_observables = lambda observables: {
+        name: f"compiled:{value}" for name, value in observables.items()
+    }
+
+    seen = {}
+    vmc._ensure_initialized = lambda **kwargs: seen.setdefault(
+        "ensure", kwargs
+    )
+
+    def fake_estimate(self, observables, **kwargs):
+        seen["estimate_observables"] = observables
+        seen["estimate_kwargs"] = kwargs
+        return observables
+
+    monkeypatch.setattr(TorchVMCDriver, "estimate_observables", fake_estimate)
+    sampling = SamplingConfig(
+        n_samples_per_chain=2,
+        n_chains=3,
+        burn_in=4,
+        thin=2,
+        seed=9,
+    )
+    estimates = vmc.estimate_observables(sampling=sampling)
+    assert estimates == {"energy": None, "density": "compiled-density"}
+    assert seen["estimate_kwargs"] == {"sampling": sampling}
+
+    class ConstantAmplitude(torch.nn.Module):
+        def forward(self, configs):
+            return torch.ones(configs.shape[0], dtype=torch.float64)
+
+    warmup_driver = object.__new__(TorchFermionVMC)
+    warmup_driver.configs = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
+    warmup_driver.model = ConstantAmplitude()
+    warmup_driver.chunk_size = None
+    warmup_driver._ensure_initialized = lambda **kwargs: None
+    warmup = warmup_driver.warmup()
+    assert warmup.config.tolist() == [1, 2]
+    assert warmup.amplitude.item() == pytest.approx(1.0)
+    assert warmup.n_sweeps == 0
+
+    native_samples = object()
+    vmc.warmup = lambda *, n_sweeps, progress: warmup
+    vmc.sample = lambda *, sampling, progress: native_samples
+
+    def fake_measure(samples, *, observables, profile, progress, **kwargs):
+        seen["run_observables"] = observables
+        seen["measure_kwargs"] = kwargs
+        assert samples is native_samples
+        assert not profile
+        assert not progress
+        return {name: name for name in observables}
+
+    vmc.measure_samples = fake_measure
+    run = vmc.run(sampling=sampling, progress=False)
+    assert isinstance(run, TorchVMCMeasurementRun)
+    assert isinstance(run.warmup, TorchVMCWarmupResult)
+    assert run.samples is native_samples
+    assert run.energy == "energy"
+    assert run.estimates == {"energy": "energy", "density": "density"}
+    assert seen["run_observables"] == {
+        "energy": None,
+        "density": "compiled-density",
+    }
+    assert seen["measure_kwargs"] == {
+        "amplitudes": None,
+        "weights": None,
+        "proposal_log_probs": None,
+        "deduplicate": True,
+    }
+    with pytest.raises(TypeError):
+        run.estimates["other"] = "not allowed"
+
+    positional_run = vmc.run({"eta": "raw-eta"}, sampling=sampling)
+    assert positional_run.estimates == {"energy": "energy", "eta": "eta"}
+    assert seen["run_observables"] == {
+        "energy": None,
+        "eta": "compiled:raw-eta",
+    }
+
+    explicit_energy_run = vmc.run(
+        observables={"energy": "raw-energy", "eta": "raw-eta"},
+        sampling=sampling,
+        contraction_opts={
+            "method": "boundary",
+            "chi": 4,
+            "cutoff": 1.0e-10,
+            "mode": "mps",
+        },
+    )
+    assert explicit_energy_run.estimates == {"energy": "energy", "eta": "eta"}
+    assert seen["run_observables"] == {
+        "energy": "compiled:raw-energy",
+        "eta": "compiled:raw-eta",
+    }
+
+    reused = vmc.measure(
+        native_samples,
+        {"energy": "raw-energy", "eta": "raw-eta"},
+    )
+    assert reused == {"energy": "energy", "eta": "eta"}
+    assert seen["run_observables"] == {
+        "energy": "compiled:raw-energy",
+        "eta": "compiled:raw-eta",
+    }
+
+    def fake_optimization_run(self, n_steps, *, progress, **kwargs):
+        return n_steps, progress, kwargs
+
+    monkeypatch.setattr(TorchVMCDriver, "run", fake_optimization_run)
+    assert vmc.run(3, progress=True, profile=True) == (
+        3,
+        True,
+        {"profile": True},
+    )
+
+
+def test_torch_fermion_vmc_lazy_setup_uses_run_sampling_and_contraction_opts():
+    from pepsy.vmc import TorchFermionVMC
+
+    vmc = object.__new__(TorchFermionVMC)
+    vmc._driver_initialized = False
+    vmc._contraction_config = None
+    vmc._legacy_contraction_config = None
+    vmc._initial_configs = None
+    vmc._initial_n_walkers = None
+    seen = {}
+
+    def fake_initialize(contraction, *, n_walkers):
+        seen["contraction"] = contraction
+        seen["n_walkers"] = n_walkers
+
+    vmc._initialize_driver = fake_initialize
+    sampling = SamplingConfig(n_samples_per_chain=2, n_chains=3)
+    vmc._ensure_initialized(
+        sampling=sampling,
+        contraction_opts={
+            "method": "boundary",
+            "chi": 8,
+            "cutoff": 1.0e-9,
+            "mode": "mps",
+        },
+    )
+
+    assert seen["n_walkers"] == sampling.n_chains
+    assert seen["contraction"] == ContractionConfig(
+        method="boundary",
+        chi=8,
+        cutoff=1.0e-9,
+        options={"mode": "mps"},
+    )
+
+
+def test_torch_vmc_progress_postfix_reports_contraction_and_reuse():
+    from pepsy.vmc.torch.results import (
+        _set_evaluation_progress_postfix,
+        _set_vmc_progress_postfix,
+    )
+
+    class Progress:
+        postfix = None
+
+        def set_postfix(self, postfix):
+            self.postfix = dict(postfix)
+
+    model = SimpleNamespace(
+        contraction="boundary",
+        chi=16,
+        last_proposal_cache_stats={
+            "num_environment_cache_hits": 2,
+            "num_environment_builds": 1,
+            "num_transition_cache_hits": 3,
+            "num_vmapped": 0,
+        },
+        last_connected_reuse_stats={
+            "num_diagonal": 5,
+            "num_reused": 7,
+            "num_batched": 0,
+            "num_fallback": 2,
+            "num_environment_cache_hits": 4,
+            "num_environment_builds": 1,
+        },
+    )
+    bar = Progress()
+    _set_vmc_progress_postfix(
+        bar,
+        SimpleNamespace(acceptance_rate=0.75, proposal_stats=None, sr=None),
+        n_sites=4,
+        include_energy=False,
+        n_chains=3,
+        model=model,
+        proposal="spinful",
+        retained_per_walker=2,
+        burn_in=4,
+        thin=2,
+    )
+    assert bar.postfix == {
+        "amp": "boundary chi=16",
+        "walkers": 3,
+        "move": "spinful",
+        "retain": "2x3",
+        "burn": 4,
+        "thin": 2,
+        "env": "2 reuse/1 build,3 transition",
+        "accept": "0.750",
+    }
+
+    _set_evaluation_progress_postfix(
+        bar,
+        model=model,
+        n_steps=2,
+        n_chains=3,
+        observables=("energy", "eta"),
+        parent_amplitudes="stored",
+        n_connections=14,
+        stage="statistics",
+    )
+    assert bar.postfix == {
+        "amp": "boundary chi=16",
+        "samples": "2x3",
+        "obs": "energy,eta",
+        "parent psi": "stored",
+        "connections": 14,
+        "targets": "diag=5, env=7, batch=0, direct=2",
+        "env": "4 reuse/1 build",
+        "stage": "statistics",
+    }
 
 
 def test_torch_vmc_modules_own_implementations_and_keep_core_aliases():
@@ -516,6 +789,166 @@ def test_netket_setup_consumes_shared_sampling_config():
     )
     assert samples.chain_shape == (3, 2)
     assert samples.configs.shape == (3, 2, 4)
+    assert samples.diagnostics["n_samples"] == 6
+    assert samples.diagnostics["n_chains"] == 2
+    assert samples.diagnostics["burn_in"] == 0
+
+
+def test_netket_optimize_result_reports_compile_and_step_timings():
+    from pepsy.vmc.netket import VMCOptimizeResult
+
+    result = VMCOptimizeResult(
+        steps=np.asarray([0, 1]),
+        energies=np.asarray([-1.0, -1.2]),
+        errors=np.asarray([0.1, 0.05]),
+        variances=np.asarray([0.2, 0.1]),
+        final_energy=-1.2,
+        final_error=0.05,
+        compile_seconds=3.0,
+        optimization_seconds=8.0,
+        total_seconds=11.5,
+    )
+
+    assert result.warmup_seconds == 3.0
+    assert result.optimization_seconds_per_step == 4.0
+    assert result.total_seconds == 11.5
+
+
+def test_netket_build_timing_reports_slowest_phase():
+    from pepsy.vmc.netket import NetKetBuildTiming
+
+    timing = NetKetBuildTiming(
+        settings_seconds=0.1,
+        geometry_seconds=0.2,
+        hamiltonian_seconds=2.0,
+        peps_seconds=0.3,
+        model_seconds=0.4,
+        sampler_seconds=1.0,
+        total_seconds=4.0,
+    )
+
+    assert timing.slowest_phase == ("hamiltonian_seconds", 2.0)
+    assert timing.as_dict()["total_seconds"] == 4.0
+
+
+def test_netket_boundary_zero_separation_has_flat_symmray_retry():
+    import pepsy.vmc.netket as netket_vmc
+
+    flat_array = type(
+        "Z2FermionicArrayFlat",
+        (),
+        {"__module__": "symmray.fake"},
+    )()
+
+    class Tensor:
+        data = flat_array
+
+    class Network:
+        def __init__(self):
+            self.calls = []
+
+        def __iter__(self):
+            return iter((Tensor(),))
+
+        def contract_boundary(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise ValueError("empty intermediate axis")
+            return (1.0, 0.0)
+
+    netket_vmc._FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED = False
+    network = Network()
+    with pytest.warns(RuntimeWarning, match="max_separation=0"):
+        result = netket_vmc._contract_boundary_for_vmc(
+            network,
+            max_bond=8,
+            cutoff=0.0,
+            method_opts={"max_separation": 0, "canonize": True},
+        )
+    assert result == (1.0, 0.0)
+    assert network.calls[0]["max_separation"] == 0
+    assert network.calls[1]["max_separation"] == 1
+    assert network.calls[1]["canonize"] is True
+
+
+def test_netket_amplitude_timing_reports_batch_average():
+    from pepsy.vmc.netket import NetKetAmplitudeTiming
+
+    timing = NetKetAmplitudeTiming(n_samples=4, amplitude_seconds=2.0)
+
+    assert timing.amplitude_seconds_per_sample == 0.5
+    assert timing.as_dict()["n_samples"] == 4
+
+
+def test_netket_setup_benchmarks_amplitude_without_sampling_in_timer():
+    from pepsy.vmc.netket import NetKetPEPSVMC
+
+    class Ansatz:
+        n_sites = 2
+        n_params = 1
+
+    class Model:
+        def apply(self, variables, configs):
+            assert "params" in variables
+            return configs.sum(axis=-1)
+
+    class State:
+        samples = np.zeros((1, 2, 2), dtype=np.int8)
+        parameters = {"x": 1.0}
+
+    State.model = Model()
+    setup = NetKetPEPSVMC(
+        hilbert=None,
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=State(),
+        model=State.model,
+        ansatz=Ansatz(),
+        config_map=None,
+        preconditioner=None,
+    )
+
+    timing = setup.benchmark_amplitude(n_samples=1)
+    assert timing.n_samples == 1
+    assert timing.amplitude_seconds >= 0.0
+
+
+def test_netket_vmc_config_validates_shared_settings():
+    from pepsy.vmc import ContractionConfig, NetKetVMCConfig, SamplingConfig
+
+    config = NetKetVMCConfig(
+        contraction=ContractionConfig(method="boundary", chi=4),
+        sampling=SamplingConfig(n_samples_per_chain=2, n_chains=1),
+        sampler_sweep_size=8,
+        conserving=False,
+        use_sr=False,
+        progress=True,
+    )
+
+    assert config.contraction.chi == 4
+    assert config.sampling.n_samples == 2
+    assert config.sampler_sweep_size == 8
+
+
+def test_netket_native_geometry_helpers_accept_coordinate_terms():
+    from pepsy.vmc.netket import (
+        _edges_from_fermi_terms,
+        _infer_lattice_shape_from_fermi_terms,
+        _infer_pbc_from_fermi_terms,
+    )
+
+    terms = {
+        (0, 0): object(),
+        (0, 1): object(),
+        (1, 0): object(),
+        (1, 1): object(),
+        ((0, 0), (1, 0)): object(),
+        ((0, 1), (1, 1)): object(),
+    }
+    assert _infer_lattice_shape_from_fermi_terms(terms) == (2, 2)
+    assert _infer_pbc_from_fermi_terms(terms, 2, 2) == (False, False)
+    assert _edges_from_fermi_terms(terms, 2, 2) == ((0, 2), (1, 3))
 
 
 def test_netket_compiler_lowers_common_fermion_terms():
