@@ -20,10 +20,20 @@ It demonstrates:
 - [How-To: Choose Parameters](howto/choose_parameters.md)
 - [How-To: Tune Sweep Solvers](howto/solver_tuning.md)
 
+## qMERA examples
+
+- `examples/qmera_scale_plan_6x6.py` — generic heterogeneous 6x6 PBC RG
+  schedule with scale-specific blocks.
+- `examples/qmera_fermion_hubbard_2d.py` — native `U1U1` 2D multimode
+  Fermi--Hubbard schedule, grouped cones, and direct-state validation.
+- `examples/qmera_fermion_hubbard_4x4_pbc.py` — explicit 4x4 PBC square
+  disentangler/isometry RG schedule.
+- `examples/qmera_majorana_2d.py` — native `Z2` Majorana and pairing gates.
+
 ## Extended examples
 
-The package repository keeps only the lightweight example notebook under
-`examples/`. Larger runnable workflows and experiment scripts are maintained
+The package repository keeps lightweight runnable examples under `examples/`.
+Larger runnable workflows and experiment scripts are maintained
 in the separate `pepsy_examples` repository. The tests in this repository keep
 the deleted Relay-BP examples' numerical coverage without depending on local
 example files.

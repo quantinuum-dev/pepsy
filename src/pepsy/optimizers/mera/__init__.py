@@ -1,7 +1,7 @@
 """MERA and qMERA energy optimization helpers."""
 
 from .builders import QMeraAnsatz, QMeraBuilder
-from .cache import build_qmera_contraction_optimizer
+from .cache import QMeraContractionPathCache, build_qmera_contraction_optimizer
 from .compiled import (
     QMeraCompiledLightconeChunk,
     compile_qmera_parametric_lightcone,
@@ -12,7 +12,9 @@ from .compiled import (
 from .fermions import (
     QMeraSymmrayFermionBackend,
     qmera_symmray_fermi_hubbard_terms,
+    qmera_symmray_majorana_terms,
     symmray_fermion_gate_registry,
+    symmray_majorana_gate_registry,
 )
 from .gates import (
     GateRegistry,
@@ -25,14 +27,21 @@ from .geometry import QMeraGeometry
 from .lightcones import (
     LightconeChunk,
     QMeraLightconeTN,
+    QMeraLightconeGroup,
     QMeraParametricLightconeChunk,
     build_lightcone_chunks,
     build_qmera_lightcone_chunks,
     build_qmera_parametric_lightcone_chunks,
+    contract_qmera_lightcone_group,
     contract_qmera_lightcone_tn,
+    group_qmera_parametric_lightcone_chunks,
+    lightcone_energy,
     local_qmera_parametric_lightcone_expectation,
     local_lightcone_expectation,
     qmera_parametric_energy,
+    qmera_direct_parametric_energy,
+    qmera_parametric_lightcone_group_state,
+    qmera_parametric_state,
     qmera_parametric_lightcone_state,
     qmera_parametric_lightcone_tn,
     select_lightcone,
@@ -42,9 +51,13 @@ from .optimizer import MeraEnergyOptimizer
 from .parametric import QMeraParametricEnergyOptimizer
 from .schedules import (
     QMeraBlockSpec,
+    QMeraDisentanglerSpec,
     QMeraGatePlacement,
+    QMeraIsometrySpec,
     QMeraLayerSpec,
+    QMeraScaleSpec,
     QMeraSchedule,
+    QMeraUnitarySpec,
     build_qmera_schedule,
 )
 from .schematics import (
@@ -64,15 +77,21 @@ __all__ = [
     "QMeraBlockSpec",
     "QMeraBuilder",
     "QMeraCompiledLightconeChunk",
+    "QMeraContractionPathCache",
+    "QMeraDisentanglerSpec",
     "QMeraGatePlacement",
     "QMeraGeometry",
+    "QMeraIsometrySpec",
     "QMeraLayerSpec",
     "QMeraLightconeTN",
+    "QMeraLightconeGroup",
     "QMeraParametricLightconeChunk",
     "QMeraParametricEnergyOptimizer",
     "QMeraSchedule",
+    "QMeraScaleSpec",
     "QMeraSchematicBlock",
     "QMeraSymmrayFermionBackend",
+    "QMeraUnitarySpec",
     "UserGateFamily",
     "build_lightcone_chunks",
     "build_qmera_contraction_optimizer",
@@ -82,6 +101,7 @@ __all__ = [
     "compile_qmera_parametric_lightcone",
     "compile_qmera_parametric_lightcones",
     "contract_qmera_lightcone_tn",
+    "contract_qmera_lightcone_group",
     "default_gate_registry",
     "draw_qmera_schedule",
     "local_qmera_compiled_lightcone_expectation",
@@ -89,13 +109,20 @@ __all__ = [
     "local_lightcone_expectation",
     "normalize_local_terms",
     "qmera_compiled_parametric_energy",
+    "qmera_direct_parametric_energy",
     "qmera_parametric_energy",
+    "qmera_parametric_lightcone_group_state",
     "qmera_parametric_lightcone_state",
+    "qmera_parametric_state",
     "qmera_parametric_lightcone_tn",
     "qmera_schematic_blocks",
     "qmera_symmray_fermi_hubbard_terms",
+    "qmera_symmray_majorana_terms",
     "resolve_gate_spec",
+    "group_qmera_parametric_lightcone_chunks",
+    "lightcone_energy",
     "select_lightcone",
     "site_tags_for_where",
     "symmray_fermion_gate_registry",
+    "symmray_majorana_gate_registry",
 ]

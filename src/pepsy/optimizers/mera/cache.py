@@ -2,11 +2,51 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 
 from ...tensors import build_optimizer
 
-__all__ = ["build_qmera_contraction_optimizer"]
+__all__ = [
+    "QMeraContractionPathCache",
+    "build_qmera_contraction_optimizer",
+]
+
+
+@dataclass
+class QMeraContractionPathCache:
+    """Lazily build reusable cotengra optimizers per local-cone topology.
+
+    A qMERA schedule produces a small number of repeated cone topologies. The
+    cache keeps one :class:`cotengra.ReusableHyperOptimizer` per topology key,
+    so numerator and norm contractions for repeated terms reuse the same
+    searched paths. Passing a directory in ``optimizer_options`` additionally
+    persists cotengra's reusable paths across processes.
+    """
+
+    optimizer_options: Mapping[str, Any] = field(default_factory=dict)
+    _optimizers: dict[Any, Any] = field(default_factory=dict, init=False, repr=False)
+
+    def optimizer_for(self, key=None):
+        """Return the reusable optimizer associated with ``key``."""
+        key = "default" if key is None else key
+        try:
+            return self._optimizers[key]
+        except KeyError:
+            optimizer = build_qmera_contraction_optimizer(**dict(self.optimizer_options))
+            self._optimizers[key] = optimizer
+            return optimizer
+
+    @property
+    def num_cached_paths(self):
+        """Number of topology-specific reusable optimizers created so far."""
+        return len(self._optimizers)
+
+    def resolve(self, optimize, *, key=None):
+        """Resolve an ``optimize`` setting, reusing paths for auto settings."""
+        if optimize is None or str(optimize).lower() in {"auto", "auto-hq"}:
+            return self.optimizer_for(key)
+        return optimize
 
 
 def build_qmera_contraction_optimizer(

@@ -3719,6 +3719,7 @@ def symm_operator_from_dense(
     fermionic=False,
     sites=None,
     index_maps=None,
+    label=None,
 ):
     """Convert a dense local operator to a Symmray block-sparse array.
 
@@ -3793,6 +3794,8 @@ def symm_operator_from_dense(
     kwargs = {}
     if array_cls.__name__ in {"AbelianArray", "FermionicArray"}:
         kwargs["symmetry"] = symmetry
+    if label is not None:
+        kwargs["label"] = label
     return array_cls.from_dense(
         arr,
         index_maps=index_maps,
@@ -7311,11 +7314,13 @@ def fermion_hopping_param_gen(
 class Fermion:
     """Native spinless or spinful fermion observables, gates, and streams.
 
-    The helper keeps the symmetry convention, local fermionic operators, and
-    optional hopping/interaction parameters together.  It is intended for direct
-    Symmray-backed fermionic MPS or PEPS workflows; it does not introduce a
-    qubit or Jordan-Wigner circuit representation. ``hamiltonian(...)`` is a
-    convenience only; the object is equally useful for measurements and gates.
+    The helper owns only the local fermionic space, symmetry convention, and
+    optional backend conversion. Hamiltonian couplings are deliberately not
+    stored here: construct them as explicit native terms, then validate and
+    bundle them with :meth:`hamiltonian`. This prevents a native Hamiltonian,
+    a gate stream, and a VMC adapter from silently using different couplings.
+    It is intended for direct Symmray-backed fermionic MPS or PEPS workflows;
+    it does not introduce a qubit or Jordan-Wigner circuit representation.
 
     ``strang_gate_stream`` uses a deterministic edge colouring and a
     forward/reverse half-step sequence.  Consequently its hopping layers are
@@ -7325,13 +7330,9 @@ class Fermion:
     """
 
     symmetry: str | None = None
-    t: object = 1.0
-    U: object = 8.0
     dtype: object = "complex128"
     to_backend: object = None
     spinful: bool = True
-    V: object = 0.0
-    mu: object = 0.0
     _dense_ops: dict = field(default_factory=dict, init=False, repr=False)
     _observable_cache: dict = field(default_factory=dict, init=False, repr=False)
     _gate_cache: dict = field(default_factory=dict, init=False, repr=False)
@@ -7848,6 +7849,7 @@ class Fermion:
         charge=None,
         like=None,
         add_hc=False,
+        label=None,
     ):
         """Return a native operator made from explicit fermion monomials.
 
@@ -7990,8 +7992,184 @@ class Fermion:
                 }
                 for _ in range(2 * len(sites))
             ),
+            label=label,
         )
         return _apply_to_array_blocks(operator, self.to_backend)
+
+    @staticmethod
+    def _normalize_majorana_component(component):
+        key = str(component).strip().lower()
+        if component in {0, "0"} or key in {"x", "real", "gamma_x", "gamma0"}:
+            return 0
+        if component in {1, "1"} or key in {"y", "imag", "gamma_y", "gamma1"}:
+            return 1
+        raise ValueError("Majorana component must be 0/'x' or 1/'y'.")
+
+    def _require_majorana(self, feature):
+        if self.spinful:
+            raise NotImplementedError(
+                f"{feature} currently targets one complex mode per site; "
+                "use Fermion(spinful=False) or provide an explicit flavor map."
+            )
+        if self.symmetry != "Z2":
+            raise ValueError(
+                f"{feature} uses the native parity convention and requires "
+                "symmetry='Z2'; U1/U1U1 does not make a single Majorana "
+                "operator homogeneous."
+            )
+
+    def _majorana_charge(self):
+        self._require_majorana("Majorana operators")
+        return _normalize_group_charge(1, self.symmetry)
+
+    def _majorana_mode_terms(self, site, component):
+        component = self._normalize_majorana_component(component)
+        if component == 0:
+            return ((1.0, ((site, "create"),)), (1.0, ((site, "annihilate"),)))
+        return (
+            (1.0j, ((site, "create"),)),
+            (-1.0j, ((site, "annihilate"),)),
+        )
+
+    def majorana_operator(self, component=0, *, site=0):
+        """Return a native parity-odd Majorana operator.
+
+        The convention is ``gamma_x = c + c^†`` and
+        ``gamma_y = -i (c - c^†)``. It is intentionally a ``Z2`` path:
+        individual Majoranas are not homogeneous under particle-number ``U1``.
+        """
+        charge = self._majorana_charge()
+        return self.operator_term(
+            self._majorana_mode_terms(site, component),
+            sites=(site,),
+            charge=charge,
+            label=f"majorana_{site!r}",
+        )
+
+    def _majorana_bilinear_terms(
+        self,
+        left,
+        right,
+        *,
+        left_component=0,
+        right_component=0,
+        coefficient=1.0,
+        canonical=True,
+    ):
+        if left == right:
+            raise ValueError("Majorana bilinears require distinct mode sites.")
+        terms = []
+        for left_coeff, left_ops in self._majorana_mode_terms(left, left_component):
+            for right_coeff, right_ops in self._majorana_mode_terms(right, right_component):
+                coefficient_term = 1.0j * coefficient * left_coeff * right_coeff
+                # Symmray's graded local-element builder canonicalizes the
+                # all-annihilator monomial in site order. Compensate that
+                # reversal sign so ``i * gamma_left * gamma_right`` is
+                # Hermitian in the native fermionic representation.
+                if canonical and (
+                    left_ops[0][1] == "annihilate"
+                    and right_ops[0][1] == "annihilate"
+                ):
+                    coefficient_term = -coefficient_term
+                terms.append(
+                    (
+                        coefficient_term,
+                        (*left_ops, *right_ops),
+                    )
+                )
+        return tuple(terms)
+
+    def majorana_bilinear_operator(
+        self,
+        edge,
+        *,
+        left_component=0,
+        right_component=0,
+        coefficient=1.0,
+    ):
+        """Return ``coefficient * i gamma_left gamma_right``."""
+        self._require_majorana("Majorana bilinears")
+        try:
+            left, right = tuple(edge)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("edge must contain exactly two mode sites.") from exc
+        return self.operator_term(
+            self._majorana_bilinear_terms(
+                left,
+                right,
+                left_component=left_component,
+                right_component=right_component,
+                coefficient=coefficient,
+                canonical=True,
+            ),
+            sites=(left, right),
+            charge=self.zero_charge,
+        )
+
+    def pairing_operator(self, edge, *, coefficient=1.0, phase=0.0):
+        """Return a Hermitian spinless pairing operator on ``edge``."""
+        self._require_majorana("Pairing operators")
+        try:
+            left, right = tuple(edge)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("edge must contain exactly two mode sites.") from exc
+        amplitude = coefficient * _fermion_complex_phase(phase, like=coefficient)
+        return self.operator_term(
+            (
+                (amplitude, ((left, "create"), (right, "create"))),
+                (
+                    ar.do("conj", amplitude),
+                    ((left, "annihilate"), (right, "annihilate")),
+                ),
+            ),
+            sites=(left, right),
+            charge=self.zero_charge,
+        )
+
+    def majorana_gate(
+        self,
+        dt,
+        *,
+        edge,
+        left_component=0,
+        right_component=0,
+        coefficient=1.0,
+        imaginary=False,
+    ):
+        """Return ``exp(-i dt * i gamma_left gamma_right)``."""
+        self._require_majorana("Majorana gates")
+        left, right = tuple(edge)
+        return self.exponential(
+            self._majorana_bilinear_terms(
+                left,
+                right,
+                left_component=left_component,
+                right_component=right_component,
+                coefficient=coefficient,
+                canonical=False,
+            ),
+            dt,
+            sites=(left, right),
+            imaginary=imaginary,
+        )
+
+    def pairing_gate(self, dt, *, edge, coefficient=1.0, phase=0.0, imaginary=False):
+        """Return ``exp(-i dt H_pair)`` for a parity-preserving pairing term."""
+        self._require_majorana("Pairing gates")
+        left, right = tuple(edge)
+        amplitude = coefficient * _fermion_complex_phase(phase, like=coefficient)
+        return self.exponential(
+            (
+                (amplitude, ((left, "create"), (right, "create"))),
+                (
+                    -ar.do("conj", amplitude),
+                    ((left, "annihilate"), (right, "annihilate")),
+                ),
+            ),
+            dt,
+            sites=(left, right),
+            imaginary=imaginary,
+        )
 
     def eta_pair_operator(self, *, coefficient=1.0):
         """Return ``coefficient * Delta_0^dag Delta_1 + h.c.``.
@@ -8085,13 +8263,12 @@ class Fermion:
             peierls_angle=peierls_angle,
         )
 
-    def hopping_term(self, edge, *, spin=None, t=None, peierls_angle=0.0):
+    def hopping_term(self, edge, *, spin=None, t, peierls_angle=0.0):
         """Return ``-t`` times the hopping operator on ``edge``."""
         try:
             left, right = tuple(edge)
         except (TypeError, ValueError) as exc:
             raise ValueError("edge must contain exactly two site labels.") from exc
-        t = self.t if t is None else t
         t = _edge_parameter(t, left, right)
         return self._hopping_operator_on_sites(
             left,
@@ -8114,9 +8291,8 @@ class Fermion:
             sites=(0,),
         )
 
-    def interaction_term(self, site, *, U=None):
+    def interaction_term(self, site, *, U):
         """Return ``U n_up n_down`` on one physical site."""
-        U = self.U if U is None else U
         U = _node_parameter(U, site)
         return self.operator_term(
             [(U, ((site, "double"),))],
@@ -8134,9 +8310,8 @@ class Fermion:
             terms = [(1.0, ((0, "number"),))]
         return self.operator_term(terms, sites=(0,))
 
-    def chemical_potential_term(self, site, *, mu=None):
+    def chemical_potential_term(self, site, *, mu):
         """Return ``-mu n`` on one physical site."""
-        mu = self.mu if mu is None else mu
         if self.spinful:
             mu = _node_parameter(mu, site)
             mu_up, mu_down = _as_spin_pair(mu, name="mu")
@@ -8148,12 +8323,12 @@ class Fermion:
             terms = [(-_node_parameter(mu, site), ((site, "number"),))]
         return self.operator_term(terms, sites=(site,))
 
-    def onsite_term(self, site, *, U=None, mu=None):
+    def onsite_term(self, site, *, U=None, mu=0.0):
         """Return ``U n_up n_down - mu n`` on one site."""
-        U = self.U if U is None else U
-        mu = self.mu if mu is None else mu
         terms = []
         if self.spinful:
+            if U is None:
+                raise TypeError("onsite_term requires explicit U=... for spinful fermions.")
             terms.append((_node_parameter(U, site), ((site, "double"),)))
             mu = _node_parameter(mu, site)
             mu_up, mu_down = _as_spin_pair(mu, name="mu")
@@ -8180,13 +8355,12 @@ class Fermion:
         ]
         return self.operator_term(terms, sites=(0, 1))
 
-    def density_term(self, edge, *, V=None):
+    def density_term(self, edge, *, V):
         """Return ``V n_i n_j`` on a physical edge."""
         try:
             left, right = tuple(edge)
         except (TypeError, ValueError) as exc:
             raise ValueError("edge must contain exactly two site labels.") from exc
-        V = self.V if V is None else V
         V = _edge_parameter(V, left, right)
         if self.spinful:
             names = ("number_up", "number_down")
@@ -8334,7 +8508,7 @@ class Fermion:
     szz_gate = spin_z_correlator_gate
     xy_gate = xy_exchange_gate
 
-    def interaction_gate(self, dt, *, site=None, U=None, imaginary=False):
+    def interaction_gate(self, dt, *, site=None, U, imaginary=False):
         """Return the exact onsite interaction gate.
 
         With a site-dependent ``U`` mapping or callable, pass ``site`` so the
@@ -8346,7 +8520,6 @@ class Fermion:
                 "Spinless fermions have no onsite doublon interaction; use "
                 "density_gate(...) for the nearest-neighbor V interaction."
             )
-        U = self.U if U is None else U
         U = U if site is None else _node_parameter(U, site)
         theta = dt * U
 
@@ -8360,20 +8533,20 @@ class Fermion:
 
         return self._cached_gate(("interaction", dt, site, U, imaginary), build)
 
-    def onsite_gate(self, dt, *, site=None, U=None, mu=None, imaginary=False):
+    def onsite_gate(self, dt, *, site=None, U=None, mu=0.0, imaginary=False):
         """Return the complete one-site Hubbard gate.
 
         The generated gate represents ``U n_up n_down - mu n`` for spinful
         fermions and ``-mu n`` for spinless fermions. ``U`` and ``mu`` may be
         site-dependent mappings or callables when ``site`` is supplied.
         """
-        U = self.U if U is None else U
-        mu = self.mu if mu is None else mu
         if site is not None:
             U = _node_parameter(U, site)
             mu = _node_parameter(mu, site)
 
         if self.spinful:
+            if U is None:
+                raise TypeError("onsite_gate requires explicit U=... for spinful fermions.")
             mu_up, mu_down = _as_spin_pair(mu, name="mu")
             U_site = U
             diagonal = (
@@ -8398,10 +8571,8 @@ class Fermion:
 
         return self._cached_gate(("onsite", dt, site, U, mu, imaginary), build)
 
-    def hopping_gate(self, dt, *, t=None, peierls_angle=0.0, imaginary=False):
+    def hopping_gate(self, dt, *, t, peierls_angle=0.0, imaginary=False):
         """Return a two-site native fermionic hopping gate with Peierls phase."""
-        t = self.t if t is None else t
-
         def build():
             if not self.spinful:
                 gate = _spinless_hopping_gate(
@@ -8423,13 +8594,12 @@ class Fermion:
 
         return self._cached_gate(("hopping", dt, t, peierls_angle, imaginary), build)
 
-    def density_gate(self, dt, *, V=None, imaginary=False):
+    def density_gate(self, dt, *, V, imaginary=False):
         """Return the nearest-neighbor density interaction gate.
 
         For spinless fermions this is ``V n_i n_j``. For spinful fermions it
         is ``V (n_up + n_down)_i (n_up + n_down)_j``.
         """
-        V = self.V if V is None else V
         theta = dt * V
 
         def build():
@@ -8445,9 +8615,8 @@ class Fermion:
 
         return self._cached_gate(("density", dt, V, imaginary), build)
 
-    def chemical_potential_gate(self, dt, *, mu=None, site=None, imaginary=False):
+    def chemical_potential_gate(self, dt, *, mu, site=None, imaginary=False):
         """Return the chemical-potential part of an onsite gate."""
-        mu = self.mu if mu is None else mu
         mu = mu if site is None else _node_parameter(mu, site)
         if self.spinful:
             mu_up, mu_down = _as_spin_pair(mu, name="mu")
@@ -8692,47 +8861,52 @@ class Fermion:
         imaginary=False,
         t=None,
         U=None,
-        V=None,
-        mu=None,
+        V=0.0,
+        mu=0.0,
     ):
-        """Return a canonical first- or second-order fermion gate stream."""
+        """Return a canonical fermion gate stream with explicit couplings."""
         if order not in {1, 2}:
             raise ValueError("order must be 1 or 2.")
+        if t is None:
+            raise TypeError("gate_stream requires explicit t=... .")
+        if self.spinful and U is None:
+            raise TypeError("gate_stream requires explicit U=... for spinful fermions.")
         edges = _as_edges(edges)
         sites = _sites_from_edges(edges, sites)
-        target = self
-        if any(value is not None for value in (t, U, V, mu)):
-            target = type(self)(
-                symmetry=self.symmetry,
-                t=self.t if t is None else t,
-                U=self.U if U is None else U,
-                dtype=self.dtype,
-                to_backend=self.to_backend,
-                spinful=self.spinful,
-                V=self.V if V is None else V,
-                mu=self.mu if mu is None else mu,
-            )
 
         if order == 2:
-            return target.strang_gate_stream(
+            return self.strang_gate_stream(
                 edges,
                 dt,
                 sites=sites,
                 peierls_angle=peierls_angle,
                 imaginary=imaginary,
+                t=t,
+                U=U,
+                V=V,
+                mu=mu,
             )
 
         entries = []
         entries.extend(
-            (target.onsite_gate(dt, site=site, imaginary=imaginary), site)
+            (
+                self.onsite_gate(
+                    dt,
+                    site=site,
+                    U=U,
+                    mu=mu,
+                    imaginary=imaginary,
+                ),
+                site,
+            )
             for site in sites
         )
-        if target.V != 0 or isinstance(target.V, Mapping) or callable(target.V):
+        if V != 0 or isinstance(V, Mapping) or callable(V):
             entries.extend(
                 (
-                    target.density_gate(
+                    self.density_gate(
                         dt,
-                        V=_edge_parameter(target.V, left, right),
+                        V=_edge_parameter(V, left, right),
                         imaginary=imaginary,
                     ),
                     (left, right),
@@ -8741,9 +8915,9 @@ class Fermion:
             )
         entries.extend(
             (
-                target.hopping_gate(
+                self.hopping_gate(
                     dt,
-                    t=_edge_parameter(target.t, left, right),
+                    t=_edge_parameter(t, left, right),
                     peierls_angle=_edge_angle_parameter(peierls_angle, left, right),
                     imaginary=imaginary,
                 ),
@@ -8753,7 +8927,7 @@ class Fermion:
         )
         return SymGateStream(
             entries,
-            hamiltonian=target.hamiltonian(edges),
+            hamiltonian=self.hamiltonian(edges, t=t, U=U, V=V, mu=mu),
             dt=dt,
             imaginary=imaginary,
             order=1,
@@ -8767,84 +8941,53 @@ class Fermion:
         sites=None,
         peierls_angle=0.0,
         imaginary=False,
+        t=None,
+        U=None,
+        V=0.0,
+        mu=0.0,
     ):
-        """Return an edge-coloured second-order native fermionic gate stream."""
+        """Return an edge-coloured second-order stream with explicit couplings."""
+        if t is None:
+            raise TypeError("strang_gate_stream requires explicit t=... .")
+        if self.spinful and U is None:
+            raise TypeError(
+                "strang_gate_stream requires explicit U=... for spinful fermions."
+            )
         edges = _as_edges(edges)
         sites = _sites_from_edges(edges, sites)
         half_dt = dt / 2
         layers = self.edge_coloring_layers(edges)
         entries = [
-            (self.onsite_gate(half_dt, site=site, imaginary=imaginary), site)
+            (
+                self.onsite_gate(
+                    half_dt,
+                    site=site,
+                    U=U,
+                    mu=mu,
+                    imaginary=imaginary,
+                ),
+                site,
+            )
             for site in sites
         ]
-        if self.V != 0 or isinstance(self.V, Mapping) or callable(self.V):
+        if V != 0 or isinstance(V, Mapping) or callable(V):
             entries.extend(
                 (
                     self.density_gate(
                         half_dt,
-                        V=_edge_parameter(self.V, left, right),
+                        V=_edge_parameter(V, left, right),
                         imaginary=imaginary,
                     ),
                     (left, right),
                 )
                 for left, right in edges
             )
-        if not self.spinful:
-            for layer in layers:
-                entries.extend(
-                    (
-                        self.hopping_gate(
-                            half_dt,
-                            t=_edge_parameter(self.t, left, right),
-                            peierls_angle=_edge_angle_parameter(peierls_angle, left, right),
-                            imaginary=imaginary,
-                        ),
-                        (left, right),
-                    )
-                    for left, right in layer
-                )
-            for layer in reversed(layers):
-                entries.extend(
-                    (
-                        self.hopping_gate(
-                            half_dt,
-                            t=_edge_parameter(self.t, left, right),
-                            peierls_angle=_edge_angle_parameter(peierls_angle, left, right),
-                            imaginary=imaginary,
-                        ),
-                        (left, right),
-                    )
-                    for left, right in layer
-                )
-            entries.extend(
-                (
-                    self.density_gate(
-                        half_dt,
-                        V=_edge_parameter(self.V, left, right),
-                        imaginary=imaginary,
-                    ),
-                    (left, right),
-                )
-                for left, right in edges
-            )
-            entries.extend(
-                (self.chemical_potential_gate(half_dt, site=site, imaginary=imaginary), site)
-                for site in sites
-            )
-            stream = SymGateStream(
-                entries,
-                hamiltonian=self.hamiltonian(edges),
-                dt=dt,
-                imaginary=imaginary,
-                order=2,
-            )
-            return stream
         for layer in layers:
             entries.extend(
                 (
                     self.hopping_gate(
                         half_dt,
-                        t=_edge_parameter(self.t, left, right),
+                        t=_edge_parameter(t, left, right),
                         peierls_angle=_edge_angle_parameter(peierls_angle, left, right),
                         imaginary=imaginary,
                     ),
@@ -8857,7 +9000,7 @@ class Fermion:
                 (
                     self.hopping_gate(
                         half_dt,
-                        t=_edge_parameter(self.t, left, right),
+                        t=_edge_parameter(t, left, right),
                         peierls_angle=_edge_angle_parameter(peierls_angle, left, right),
                         imaginary=imaginary,
                     ),
@@ -8865,56 +9008,147 @@ class Fermion:
                 )
                 for left, right in layer
             )
+        if V != 0 or isinstance(V, Mapping) or callable(V):
+            entries.extend(
+                (
+                    self.density_gate(
+                        half_dt,
+                        V=_edge_parameter(V, left, right),
+                        imaginary=imaginary,
+                    ),
+                    (left, right),
+                )
+                for left, right in edges
+            )
         entries.extend(
-            (self.onsite_gate(half_dt, site=site, imaginary=imaginary), site)
+            (
+                self.onsite_gate(
+                    half_dt,
+                    site=site,
+                    U=U,
+                    mu=mu,
+                    imaginary=imaginary,
+                ),
+                site,
+            )
             for site in sites
         )
         return SymGateStream(
             entries,
-            hamiltonian=self.hamiltonian(edges),
+            hamiltonian=self.hamiltonian(edges, t=t, U=U, V=V, mu=mu),
             dt=dt,
             imaginary=imaginary,
             order=2,
         )
 
-    def hamiltonian(self, edges, **params):
-        """Build a native Hamiltonian from edges or explicit local terms.
+    def _validate_hamiltonian_terms(self, terms):
+        """Validate native local terms against this Fermion's local space."""
+        terms = dict(terms)
+        coordinate_sites = _term_mapping_uses_coordinate_sites(terms)
+        expected_physical = {
+            charge: int(size)
+            for charge, size in self.physical_sectors.items()
+        }
+        backends = set()
 
-        Passing an edge iterable builds the configured Fermi-Hubbard model.
-        Passing a mapping ``{site_or_edge: operator}`` preserves the supplied
-        coefficient-free operators and their locations in a
-        :class:`SymHamiltonian`; that container can then be passed to
-        ``to_mpo`` without losing fermionic ordering metadata.
+        for where, term in terms.items():
+            support = _as_term_where(
+                where,
+                coordinate_sites=coordinate_sites,
+            )
+            if not _is_fermionic_symmray_array(term):
+                raise TypeError(
+                    "Fermion.hamiltonian requires native fermionic Symmray "
+                    f"arrays; term at {where!r} is {type(term).__name__}."
+                )
+            if str(getattr(term, "symmetry", None)) != self.symmetry:
+                raise ValueError(
+                    f"Term at {where!r} has symmetry "
+                    f"{getattr(term, 'symmetry', None)!r}, expected "
+                    f"{self.symmetry!r}."
+                )
+            indices = tuple(getattr(term, "indices", ()))
+            expected_rank = 2 * len(support)
+            if len(indices) != expected_rank:
+                raise ValueError(
+                    f"Term at {where!r} has rank {len(indices)}, but its "
+                    f"{len(support)}-site key requires rank {expected_rank}."
+                )
+            for axis, index in enumerate(indices):
+                actual_physical = {
+                    charge: int(size)
+                    for charge, size in dict(getattr(index, "chargemap", {})).items()
+                }
+                if actual_physical != expected_physical:
+                    raise ValueError(
+                        f"Term at {where!r} axis {axis} has physical sectors "
+                        f"{actual_physical!r}, expected {expected_physical!r}."
+                    )
+            for block in getattr(term, "blocks", {}).values():
+                backends.add(ar.infer_backend(block))
+
+        if len(backends) > 1:
+            raise TypeError(
+                "Fermion.hamiltonian terms use mixed array backends "
+                f"{sorted(backends)!r}. Supply to_backend=... so every native "
+                "block is converted consistently."
+            )
+
+    def hamiltonian(
+        self,
+        terms_or_edges,
+        *,
+        t=None,
+        U=None,
+        V=0.0,
+        mu=0.0,
+        flat=False,
+        to_backend=None,
+    ):
+        """Validate explicit terms or build a model only from explicit couplings.
+
+        The canonical form is a mapping from one-site or two-site locations to
+        native fermionic Symmray arrays. It is checked for symmetry, physical
+        sectors, support rank, and backend consistency before being bundled in
+        a :class:`SymHamiltonian`. Passing lattice edges remains a compact
+        convenience, but requires its couplings explicitly; no coupling is
+        stored on :class:`Fermion`.
         """
-        to_backend = params.pop("to_backend", self.to_backend)
-        if isinstance(edges, Mapping):
+        to_backend = self.to_backend if to_backend is None else to_backend
+        if isinstance(terms_or_edges, Mapping):
+            if any(value is not None for value in (t, U)) or V != 0 or mu != 0:
+                raise TypeError(
+                    "When passing explicit terms, put every coupling in the "
+                    "native arrays rather than passing t/U/V/mu again."
+                )
+            terms = _apply_to_hamiltonian_terms(terms_or_edges, to_backend)
+            self._validate_hamiltonian_terms(terms)
             return SymHamiltonian.from_terms(
                 self.model,
                 self.symmetry,
-                edges,
-                to_backend=to_backend,
-                parameters=params,
+                terms,
+                parameters={},
             )
-        flat = params.pop("flat", False)
+
+        if t is None:
+            raise TypeError("hamiltonian(edges, ...) requires explicit t=... .")
+        if self.spinful and U is None:
+            raise TypeError(
+                "hamiltonian(edges, ...) requires explicit U=... for spinful fermions."
+            )
+        params = {"t": t, "V": V, "mu": mu}
         if self.spinful:
-            params = {
-                "t": self.t,
-                "U": self.U,
-                "mu": self.mu,
-                **params,
-            }
-            if self.V != 0 or "V" in params:
-                params.setdefault("V", self.V)
-        else:
-            params = {"t": self.t, "V": self.V, "mu": self.mu, **params}
-        return SymHamiltonian.from_edges(
+            params["U"] = U
+        hamiltonian = SymHamiltonian.from_edges(
             self.model,
             self.symmetry,
-            edges,
+            terms_or_edges,
             flat=flat,
             to_backend=to_backend,
             **params,
         )
+        self._validate_hamiltonian_terms(hamiltonian.terms)
+        return hamiltonian
 
     def local_terms(self, edges, *, layout="site", **params):
         """Return native local terms for site or qMERA energy workflows.
@@ -8931,8 +9165,6 @@ class Fermion:
         if layout in {"site", "sites", "native"}:
             return self.hamiltonian(edges, **params).terms
         if layout in {"qmera", "qmera_modes", "modes"}:
-            if not self.spinful:
-                raise ValueError("qMERA Hubbard terms require spinful fermions.")
             from ..optimizers.mera import (  # pylint: disable=import-outside-toplevel
                 qmera_symmray_fermi_hubbard_terms,
             )
@@ -8942,14 +9174,28 @@ class Fermion:
                 fermion=self,
                 **params,
             )
+        if layout in {"majorana", "qmera_majorana"}:
+            from ..optimizers.mera import (  # pylint: disable=import-outside-toplevel
+                qmera_symmray_majorana_terms,
+            )
+
+            return qmera_symmray_majorana_terms(
+                edges,
+                fermion=self,
+                **params,
+            )
         raise ValueError(
             "layout must be 'site' for native site terms or 'qmera' for "
-            "two-state qMERA mode terms."
+            "two-state qMERA mode terms, or 'majorana'."
         )
 
     def qmera_terms(self, geometry, **params):
         """Return the explicit two-state qMERA terms for ``geometry``."""
         return self.local_terms(geometry, layout="qmera", **params)
+
+    def majorana_terms(self, geometry, **params):
+        """Return parity-preserving Majorana terms for a qMERA geometry."""
+        return self.local_terms(geometry, layout="majorana", **params)
 
 
 # Kept for callers that adopted the initial public names before the helper was

@@ -184,6 +184,173 @@ def _patch_block(drawing, coos, *, block, label_blocks):
         drawing.text((x, y), block.stage_label, preset="block_label")
 
 
+def _unique_physical_sites(geometry, register_sites):
+    """Return physical sites represented by possibly repeated mode registers."""
+    sites = []
+    seen = set()
+    for register_site in register_sites:
+        site = geometry.to_site(register_site)
+        if site not in seen:
+            seen.add(site)
+            sites.append(site)
+    return tuple(sites)
+
+
+def _clean_stage_positions(geometry, sites, *, x0, y0):
+    """Place 2D physical sites on a stable schematic grid."""
+    return {
+        site: (x0 + float(site[1]), y0 - float(site[0]))
+        for site in sites
+    }
+
+
+def _draw_clean_stage(
+    drawing,
+    schedule,
+    layer_spec,
+    blocks,
+    stage,
+    *,
+    x0,
+    y0,
+    label_sites,
+    label_blocks,
+):
+    """Draw one clean input, gate, or coarse-output stage."""
+    geometry = schedule.geometry
+    register_sites = (
+        layer_spec.output_sites
+        if stage == "output"
+        else layer_spec.input_sites
+    )
+    sites = _unique_physical_sites(geometry, register_sites)
+    positions = _clean_stage_positions(geometry, sites, x0=x0, y0=y0)
+
+    # Keep the physical graph visible in every stage, like the simple wires in
+    # quimb's manual schematic examples.
+    site_set = set(sites)
+    for left, right in geometry.nearest_neighbor_edges():
+        if left not in site_set or right not in site_set:
+            continue
+        a = positions[left]
+        b = positions[right]
+        drawing.line(a, b, preset="wire")
+
+    for site, coo in positions.items():
+        drawing.circle(coo, radius=0.12, preset="site")
+        if label_sites and stage in {"input", "output"}:
+            drawing.text(
+                (coo[0], coo[1] + 0.23),
+                str(site),
+                preset="site_label",
+            )
+
+    if stage not in {"disentangler", "isometry"}:
+        return
+
+    for block in blocks:
+        block_sites = tuple(dict.fromkeys(block.sites))
+        coos = [positions[site] for site in block_sites if site in positions]
+        if not coos:
+            continue
+        _patch_block(drawing, coos, block=block, label_blocks=False)
+        if label_blocks:
+            x = sum(coo[0] for coo in coos) / len(coos)
+            y = sum(coo[1] for coo in coos) / len(coos)
+            drawing.text(
+                (x, y),
+                f"{block.stage_label}{block.block}",
+                preset="block_label",
+            )
+
+
+def _draw_clean_2d(
+    drawing,
+    schedule,
+    layer_indices,
+    blocks_by_layer,
+    *,
+    label_sites,
+    label_blocks,
+):
+    """Draw 2D layers as separated quimb-style input/D/W/output panels."""
+    height, width = schedule.geometry.shape
+    panel_width = float(max(width, height)) + 2.0
+    panel_gap = 1.5
+    row_gap = float(max(height, 1)) + 3.2
+    cursor_x = 0.0
+
+    for row, layer_index in enumerate(layer_indices):
+        layer = schedule.layers[layer_index]
+        y0 = -row_gap * row
+        stages = [("input", "input")]
+        disentanglers = tuple(
+            block
+            for block in blocks_by_layer.get(layer_index, ())
+            if block.stage == "disentangler"
+        )
+        isometries = tuple(
+            block
+            for block in blocks_by_layer.get(layer_index, ())
+            if block.stage == "isometry"
+        )
+        if disentanglers:
+            stages.append(("disentangler", "D"))
+        if isometries:
+            stages.append(("isometry", "W"))
+        stages.append(("output", "coarse"))
+
+        layer_start = cursor_x
+        previous_right = None
+        for stage, label in stages:
+            x0 = cursor_x
+            blocks = (
+                disentanglers
+                if stage == "disentangler"
+                else isometries
+                if stage == "isometry"
+                else ()
+            )
+            _draw_clean_stage(
+                drawing,
+                schedule,
+                layer,
+                blocks,
+                stage,
+                x0=x0,
+                y0=y0,
+                label_sites=label_sites,
+                label_blocks=label_blocks,
+            )
+            drawing.text(
+                (x0 + 0.5 * (width - 1), y0 + 0.85),
+                label,
+                preset="stage_label",
+            )
+
+            if previous_right is not None:
+                arrow_y = y0 - float(height) - 0.7
+                start = (previous_right, arrow_y)
+                end = (x0 - 0.35, arrow_y)
+                drawing.line(start, end, preset="flow")
+                drawing.arrowhead(start, end, preset="flow")
+            previous_right = x0 + panel_width - 0.35
+            cursor_x += panel_width + panel_gap
+
+        drawing.text(
+            (layer_start - 0.7, y0),
+            f"L{layer_index}",
+            preset="layer_label",
+        )
+        cursor_x += 0.8
+
+    drawing.text(
+        (0.0, -row_gap * len(layer_indices) + 1.0),
+        "D = boundary disentangler     W = isometry     arrows = coarse-graining",
+        preset="legend",
+    )
+
+
 def _draw_2d_layers(
     drawing,
     schedule,
@@ -244,6 +411,7 @@ def draw_qmera_schedule(
     schedule,
     *,
     layer=None,
+    style="clean",
     figsize=None,
     label_sites=True,
     label_blocks=True,
@@ -260,6 +428,10 @@ def draw_qmera_schedule(
     layer
         Optional layer index or iterable of layer indices. ``None`` draws all
         layers.
+    style : {"clean", "register"}, default="clean"
+        ``"clean"`` separates 2D input, disentangler, isometry, and coarse
+        output panels. ``"register"`` keeps the lower-level register wiring
+        view.
     figsize
         Optional matplotlib figure size forwarded to ``schematic.Drawing``.
     label_sites, label_blocks
@@ -271,6 +443,8 @@ def draw_qmera_schedule(
     ax
         Optional matplotlib axes.
     """
+    if style not in {"clean", "register"}:
+        raise ValueError("style must be 'clean' or 'register'.")
     try:
         from quimb import schematic
     except ImportError as exc:  # pragma: no cover - optional plotting dep
@@ -306,6 +480,13 @@ def draw_qmera_schedule(
             "verticalalignment": "center",
         },
         "layer_label": {"fontsize": 10, "fontweight": "bold"},
+        "stage_label": {
+            "fontsize": 10,
+            "fontweight": "bold",
+            "horizontalalignment": "center",
+        },
+        "flow": {"linewidth": 1.5, "color": neutral},
+        "legend": {"fontsize": 9, "color": neutral_dark},
     }
     if presets is not None:
         merged = dict(default_presets)
@@ -326,14 +507,24 @@ def draw_qmera_schedule(
         blocks_by_layer.setdefault(block.scale, []).append(block)
 
     if schedule.geometry.ndim == 2:
-        _draw_2d_layers(
-            drawing,
-            schedule,
-            layer_indices,
-            blocks_by_layer,
-            label_sites=label_sites,
-            label_blocks=label_blocks,
-        )
+        if style == "clean":
+            _draw_clean_2d(
+                drawing,
+                schedule,
+                layer_indices,
+                blocks_by_layer,
+                label_sites=label_sites,
+                label_blocks=label_blocks,
+            )
+        else:
+            _draw_2d_layers(
+                drawing,
+                schedule,
+                layer_indices,
+                blocks_by_layer,
+                label_sites=label_sites,
+                label_blocks=label_blocks,
+            )
         if scale_figsize:
             drawing.scale_figsize(1.0)
         return drawing

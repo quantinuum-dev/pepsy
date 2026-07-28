@@ -89,6 +89,7 @@ class GateSpec:
     preserves_parity: bool | None = None
     mode_order: str | None = None
     contextual_generator: Callable[..., Any] | None = None
+    symmetry: str | None = None
 
     def __post_init__(self):
         arity = int(self.arity)
@@ -111,6 +112,11 @@ class GateSpec:
             None if self.preserves_parity is None else bool(self.preserves_parity),
         )
         object.__setattr__(self, "mode_order", _normalize_mode_order(self.mode_order))
+        object.__setattr__(
+            self,
+            "symmetry",
+            None if self.symmetry is None else str(self.symmetry),
+        )
 
     @property
     def is_fermionic(self):
@@ -166,6 +172,7 @@ class UserGateFamily:
     preserves_parity: bool | None = None
     mode_order: str | None = None
     contextual_generator: Callable[..., Any] | None = None
+    symmetry: str | None = None
 
     def to_gate_spec(self):
         """Convert to a registry-ready :class:`GateSpec`."""
@@ -181,6 +188,7 @@ class UserGateFamily:
             preserves_parity=self.preserves_parity,
             mode_order=self.mode_order,
             contextual_generator=self.contextual_generator,
+            symmetry=self.symmetry,
         )
 
 
