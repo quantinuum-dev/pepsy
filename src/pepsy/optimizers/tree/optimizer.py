@@ -617,6 +617,10 @@ class TreeOptimizer:
             tree = self.layout_finder.run()
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan or None.")
+        if tree.n != self.n:
+            raise ValueError(
+                f"tree contains {tree.n} qubits, but n={self.n} was requested."
+            )
         if root_qubit is not None and tree.root_qubit != root_qubit:
             raise ValueError(
                 "root_qubit does not match the supplied tree/layout plan."
@@ -1155,7 +1159,8 @@ class TreeOptimizer:
                 root_tensor = target.node_tensor(target.plan.root)
                 root_tensor.modify(data=root_tensor.data * factor)
 
-        target._with_center(self.plan.root).validate()
+        target._with_center(self.plan.root)
+        target._set_isometry_metadata_from_region({self.plan.root}).validate()
         self._state_backend_info(target)
         return target
 
@@ -1381,6 +1386,23 @@ class TreeOptimizer:
         """
         return self.tn.is_canonical_form(center, tol=tol)
 
+    def isometry_direction(self, node):
+        """Neighbour toward which ``node`` has a proven local isometry."""
+        return self.tn.isometry_direction(node)
+
+    def isometry_map(self):
+        """Return the live network-owned node-isometry orientation map."""
+        return self.tn.isometry_map()
+
+    def can_skip_canonize(self, a, b, *, absorb="right"):
+        """Whether local metadata proves this dense edge QR is redundant."""
+        return self.tn.can_skip_canonize(a, b, absorb=absorb)
+
+    def validate_isometry_metadata(self, region=None):
+        """Validate live tensor ``left_inds`` against the canonical region."""
+        self.tn.validate_isometry_metadata(region)
+        return self
+
     @property
     def canonical_region(self):
         """Frozenset of node ids forming the canonicalised subtree (``None`` if unknown).
@@ -1400,6 +1422,8 @@ class TreeOptimizer:
         if self.layout_finder is None:
             return {
                 "n_qubits": self.n,
+                "root": self.plan.root,
+                "root_qubit": self.plan.root_qubit,
                 "is_binary": self.plan.is_binary(),
                 "max_arity": self.plan.max_arity(),
             }
@@ -1940,18 +1964,21 @@ class TreeOptimizer:
                 gate_np.conj().T @ gate_np, np.eye(d, dtype=gate_np.dtype),
                 rtol=1e-10, atol=1e-12,
             )
+        site_node = self.plan.node_of_qubit[q]
         if not unitary:
-            self._move_center(self.plan.node_of_qubit[q])
+            self._move_center(site_node)
         region = self.tn.canonical_region
+        left_inds = self.tn.node_tensor(site_node).left_inds
         self.tn.gate_inds_(gate, [self._phys(q)], contract=True)
         if unitary:
             # A physical unitary preserves the isometric exterior, but the
             # state-owned gate mutator deliberately invalidates metadata for
-            # direct callers. Restore the known region only for this proven
-            # canonical-preserving operation.
+            # direct callers. Restore both the local proof and known region
+            # only for this proven canonical-preserving operation.
+            self.tn.node_tensor(site_node).modify(left_inds=left_inds)
             self.tn.canonical_region = region
         if not unitary:
-            self.center = self.plan.node_of_qubit[q]
+            self.center = site_node
             if renormalize:
                 self.normalize()
         return self
@@ -2263,9 +2290,17 @@ class TreeOptimizer:
             max_bond=self.chi if max_bond is None else max_bond,
             cutoff=self.cutoff if cutoff is None else cutoff,
         )
-        tla.modify(data=la_t.data, inds=la_t.inds)
-        tlb.modify(data=lb_t.data, inds=lb_t.inds)
-        tp.modify(data=p_t.data, inds=p_t.inds)
+        tla.modify(
+            data=la_t.data,
+            inds=la_t.inds,
+            left_inds=la_t.left_inds,
+        )
+        tlb.modify(
+            data=lb_t.data,
+            inds=lb_t.inds,
+            left_inds=lb_t.left_inds,
+        )
+        tp.modify(data=p_t.data, inds=p_t.inds, left_inds=None)
         self.center = parent
         return self
 
@@ -2296,8 +2331,19 @@ class TreeOptimizer:
             get="tensors",
         )
         merged_v = qtn.tensor_contract(carry, tv)
-        tu.modify(data=keep.data, inds=keep.inds)
-        tv.modify(data=merged_v.data, inds=merged_v.inds)
+        # ``keep`` is the exact Q factor pointing toward ``v``. Preserve that
+        # isometry metadata so a later canonical walk can recognize the tensor
+        # without repeating the same QR decomposition.
+        tu.modify(
+            data=keep.data,
+            inds=keep.inds,
+            left_inds=keep.left_inds,
+        )
+        tv.modify(
+            data=merged_v.data,
+            inds=merged_v.inds,
+            left_inds=None,
+        )
 
     def _fermionic_thread_hop(self, u, v):
         """QR-route the operator bond without leaving native graded arrays."""
@@ -2517,7 +2563,7 @@ class TreeOptimizer:
         return left, right
 
     def _compress_edge_with_diagnostics(
-        self, u, v, *, max_bond=None, cutoff=None,
+        self, u, v, *, max_bond=None, cutoff=None, reduced=True,
     ):
         """Compress one live tree edge and record its truncation diagnostics."""
         max_bond = (
@@ -2555,7 +2601,8 @@ class TreeOptimizer:
         # Keep the live canonical-region metadata in one place: the TTN edge
         # wrapper performs the compression and advances its tracked centre.
         self.tn.compress_edge_(
-            u, v, max_bond=max_bond, cutoff=cutoff, absorb="right"
+            u, v, max_bond=max_bond, cutoff=cutoff, absorb="right",
+            reduced=reduced,
         )
         bond_after = self.tn.bond(u, v)
         after_bond = int(self.tn.ind_size(bond_after))
@@ -2564,6 +2611,19 @@ class TreeOptimizer:
             after_bond=after_bond, bond_ind=bond_after,
             full_spectrum=full_spectrum, max_bond=max_bond, cutoff=cutoff,
         )
+
+    def _metadata_aware_reduction(self, u, v):
+        """Choose one-sided compression when ``v`` is proven isometric.
+
+        Every caller compresses ``u -> v`` with ``absorb="right"``. If the
+        live ``left_inds`` on ``v`` prove that it is already isometric toward
+        ``u``, Quimb can SVD only ``u`` and reuse ``v`` directly. Missing or
+        native graded metadata conservatively falls back to the usual
+        two-sided QR reduction.
+        """
+        if self.tn.can_skip_canonize(u, v, absorb="left"):
+            return "left"
+        return True
 
     def _compress_path(self, path, *, max_bond=None, cutoff=None):
         """Canonically compress every bond along ``path`` down to ``chi``.
@@ -2577,6 +2637,7 @@ class TreeOptimizer:
         for v, u in zip(path[::-1], path[-2::-1]):
             self._compress_edge_with_diagnostics(
                 v, u, max_bond=max_bond, cutoff=cutoff,
+                reduced=self._metadata_aware_reduction(v, u),
             )
         self.center = path[0]
 
@@ -2600,6 +2661,7 @@ class TreeOptimizer:
             for child in children:
                 self._compress_edge_with_diagnostics(
                     node, child, max_bond=max_bond, cutoff=cutoff,
+                    reduced=self._metadata_aware_reduction(node, child),
                 )
                 descend(child, node)
                 self.tn.canonize_edge_(child, node, absorb="right")
@@ -2637,6 +2699,39 @@ class TreeOptimizer:
             state_inds[v].discard(state_bond)
             state_inds[v].add(new_bond)
             operator_inds[v] = set(local[v].inds) - state_inds[v]
+
+    def _install_routed_subtree(self, local, snodes, hub):
+        """Install routed tensors and recover their proven hub centre.
+
+        Dense routing already QR-isometrizes every peeled non-hub tensor toward
+        ``hub``. Retaining each Q factor's ``left_inds`` lets Quimb's canonical
+        recovery walk short-circuit those decompositions while still advancing
+        the canonical-region state machine honestly. Native fermionic tensors
+        deliberately keep the prior behavior: their graded QR recovery remains
+        explicit inside :class:`TreeTensorNetwork`.
+        """
+        dense = not self.tn.fermionic
+        for nid in snodes:
+            routed = local[nid]
+            modify_opts = {
+                "data": routed.data,
+                "inds": routed.inds,
+            }
+            if dense:
+                if nid == hub:
+                    # The accumulated operator and state norm live here.
+                    modify_opts["left_inds"] = None
+                else:
+                    if routed.left_inds is None:
+                        raise RuntimeError(
+                            "dense subtree routing lost QR isometry metadata "
+                            f"for non-hub node {nid}."
+                        )
+                    modify_opts["left_inds"] = routed.left_inds
+            self.tn.tensor_map[self._tid(nid)].modify(**modify_opts)
+
+        self.tn.canonical_region = frozenset(snodes)
+        self._move_center(hub)
 
     # -- general multi-qubit / sub-MPO application ----------------------------
 
@@ -3071,14 +3166,11 @@ class TreeOptimizer:
                 "native sub-MPO application left open operator bonds; "
                 "use an MPO with a closed tensor-network contraction."
             )
-        for nid in snodes:
-            node_t = self.tn.tensor_map[self._tid(nid)]
-            node_t.modify(data=local[nid].data, inds=local[nid].inds)
         # The exterior remained isometric toward the updated Steiner subtree.
-        # Recover a single centre within it by QR, then truncate only now that
-        # every MPO virtual bond has reached its destination.
-        self.tn.canonical_region = frozenset(snodes)
-        self._move_center(hub)
+        # Dense routed Q tensors retain their isometry metadata, so recovering
+        # the hub centre is metadata-only; native graded trees keep their
+        # explicit QR recovery. Truncate only after every MPO bond has arrived.
+        self._install_routed_subtree(local, snodes, hub)
         self._compress_subtree(
             snodes, hub, max_bond=max_bond, cutoff=cutoff,
         )
@@ -3119,11 +3211,7 @@ class TreeOptimizer:
                 "factorized subtree operator left open operator bonds at its hub."
             )
 
-        for nid in snodes:
-            node_t = self.tn.tensor_map[self._tid(nid)]
-            node_t.modify(data=local[nid].data, inds=local[nid].inds)
-        self.tn.canonical_region = frozenset(snodes)
-        self._move_center(hub)
+        self._install_routed_subtree(local, snodes, hub)
         self._compress_subtree(
             snodes, hub, max_bond=max_bond, cutoff=cutoff,
         )
@@ -3269,7 +3357,11 @@ class TreeOptimizer:
         )
         for nid in snodes:
             node_t = self.tn.tensor_map[self._tid(nid)]
-            node_t.modify(data=local[nid].data, inds=local[nid].inds)
+            node_t.modify(
+                data=local[nid].data,
+                inds=local[nid].inds,
+                left_inds=None if nid == hub else local[nid].left_inds,
+            )
         self.center = hub
 
     def _apply_product_pauli_projector(

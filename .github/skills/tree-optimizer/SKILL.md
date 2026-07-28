@@ -155,6 +155,13 @@ telescopes to identity between bra and ket.
   `shift_orthogonality_center` first peels that region with lossless QR and
   then walks only the remaining path. Do not regress this regional recovery to
   an unconditional O(N) recanonicalisation.
+- Local isometry proofs live only on each tensor's ``left_inds``.
+  `TreeTensorNetwork.isometry_direction` / `isometry_map` derive read-only
+  orientations, `can_skip_canonize` recognizes an already-proven dense edge,
+  and `validate_isometry_metadata` checks alignment with the canonical region.
+  `TreeOptimizer` delegates these methods; never add a second mutable
+  optimizer-owned orientation map. Native fermionic edges always retain their
+  explicit graded QR and are never skipped through this dense metadata path.
 - `ttn.is_canonical_form(center)` verifies the invariant directly (every
   non-centre tensor is an isometry toward the centre) — use it in tests/diagnostics.
 - A freshly built product state is **already canonical at the root** (all
@@ -196,7 +203,7 @@ one-node case.
   connected subtree via `ttn.subtree_span(nodes)` (union of tree paths from
   `nodes[0]`; generalises `steiner_nodes` to arbitrary internal nodes).
 - `ttn.canonize_around_qubits_(qubits)` is the qubit-level "range" entry point =
-  `canonize_subtree_(leaves_of(qubits), span=True)`.
+  `canonize_subtree_(nodes_of(qubits), span=True)`.
 - `ttn.is_subtree_canonical_form(nodes=None, span=False)` verifies every outside
   tensor is an inward isometry (defaults to the tracked region);
   `is_canonical_form` is its one-node case and delegates to it.
@@ -211,11 +218,11 @@ This is the paper's accuracy point (Figs. 3-6) -- do not regress it.
 
 1. SVD-split the gate into left/right factors joined by a virtual bond
    (`cutoff=0.0`, exact rank `k <= 4`).
-2. Move the centre to leaf `a`, absorb the left factor into `a`.
-3. Thread the virtual bond **exactly** along the geodesic to leaf `b` via
+2. Move the centre to physical node `a`, absorb the left factor into `a`.
+3. Thread the virtual bond **exactly** along the geodesic to physical node `b` via
    `_thread_hop` (economical **QR**, lossless, `absorb="right"`); the crossed
    bond grows transiently by at most `k <= 4`.
-4. Absorb the right factor into leaf `b`.
+4. Absorb the right factor into physical node `b`.
 5. Only now run `_compress_path` -- a single canonical compression sweep back
    along the geodesic, truncating every touched bond to `chi`.
 
@@ -267,9 +274,16 @@ covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductStat
    physical and exterior state legs, then contract its new state bond into the
    parent together with the old state/operator bonds. No dense state tensor for
    the whole Steiner subtree is formed; the last node is the hub.
-5. Recover the hub centre by QR, then make one depth-first canonical SVD sweep:
-   every affected tree edge is truncated once, after the complete operator has
-   arrived. `renormalize=True` renormalises afterwards (for Kraus/projection).
+5. Install every routed Q factor with its ``left_inds`` isometry metadata.
+   Dense trees can then recover the hub centre through the normal canonical
+   state machine without repeating those QRs; native fermionic trees retain
+   their explicit graded QR recovery. Finally make one depth-first canonical
+   SVD sweep: every affected tree edge is truncated once, after the complete
+   operator has arrived. Dense path and subtree sweeps select one-sided
+   ``reduced="left"`` compression only when the destination tensor's live
+   ``left_inds`` proves the required isometry; missing proofs and native
+   graded tensors use the full reduction. `renormalize=True` renormalises
+   afterwards (for Kraus/projection).
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator
@@ -302,7 +316,7 @@ interface use the dense `to_dense()` fallback and remain subject to
   when the gauge is unknown; native readout leaves the gauge untouched.
   Normalized native readout reuses a state-versioned norm denominator until a
   mutation invalidates it.
-- `measure(q, outcome=None)`: move centre to the leaf, read exact Born
+- `measure(q, outcome=None)`: move centre to the physical node, read exact Born
   probabilities from that one tensor (`w_i = sum_bond |t[i,bond]|^2`,
   normalise), sample via `self.rng.choice` or force `outcome`, project with a
   one-hot `apply_1q`, then `normalize()`. Returns the outcome bit. `reset(q)` =
@@ -321,6 +335,9 @@ interface use the dense `to_dense()` fallback and remain subject to
   branch norm, and both can return support/span/bond/norm diagnostics.
 - `to_dense()` returns a host NumPy statevector in `k0, k1, ..., k(n-1)` order;
   it is a readout boundary, not evidence that a Torch/CuPy live state moved.
+- `ps_to_ttn`, `hrs_to_ttn`, and `TreeSampler` resolve physical sites through
+  `node_of_qubit`, so an optional root site is constructed and sampled in the
+  same `q0..q(n-1)` order as leaf sites.
 - `run(progbar=True)` shows a tqdm replay bar with one-/two-/multi-qubit
   counts, current bond usage, norm, and a norm-based truncation proxy. Dense and
   native fermionic replay use the same `1 - (norm / reference_norm)^2` proxy;

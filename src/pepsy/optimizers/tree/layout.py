@@ -337,6 +337,11 @@ class TreePlan:
         self.root_qubit = (
             None if root_qubit is None else int(root_qubit)
         )
+        if self.root_qubit is not None and self.root in self.qubit_of_leaf:
+            raise ValueError(
+                "the root cannot carry both a leaf qubit and root_qubit; "
+                "insert a unary structural root above the leaf."
+            )
         self.qubit_of_node = dict(self.qubit_of_leaf)
         if self.root_qubit is not None:
             self.qubit_of_node[self.root] = self.root_qubit
@@ -560,6 +565,12 @@ class TreePlan:
 
         if order:
             root = build(order)
+            if root_qubit is not None and root in qubit_of_leaf:
+                # With one non-root qubit, ``build`` returns that physical
+                # leaf itself. The top qubit needs its own tensor, so insert a
+                # unary structural root rather than putting two physical legs
+                # on the same node.
+                root = make_internal((root,))
         else:
             root = new_node()
             children[root] = ()
@@ -789,10 +800,17 @@ class TreePlan:
             # The blocking node is already a valid root.  In particular, do
             # not add a unary wrapper for n=1 or n <= block_size: it adds a
             # useless bond and makes the fixed layered family less efficient.
+            # The exception is a physical root over one physical leaf: those
+            # two qubits require distinct tensors joined by one bond.
+            root_nid = block_nodes[0]
+            if root_qubit is not None and not children_map[root_nid]:
+                child = root_nid
+                root_nid = new_node()
+                children_map[root_nid] = (child,)
             return cls.from_children(
                 children_map,
                 qubit_of_leaf,
-                root=block_nodes[0],
+                root=root_nid,
                 root_qubit=root_qubit,
             )
         root_arity = min(cls.LAYERED_ROOT_ARITY, num_blocks)

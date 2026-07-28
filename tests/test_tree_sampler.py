@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 import pepsy
-from pepsy.optimizers.tree import TreeOptimizer
+from pepsy.optimizers.tree import TreeOptimizer, TreePlan
 from pepsy.sampling import (
     TreeBatchSampleResult,
     TreeSampleResult,
@@ -78,6 +78,34 @@ def test_amplitudes_match_statevector_up_to_phase():
     assert np.max(np.abs(amps * phase - psi)) < 1e-10
     # probabilities are |amplitudes|**2.
     assert np.allclose(sampler.probabilities(_all_configs(n)), np.abs(amps) ** 2)
+
+
+def test_physical_root_probabilities_and_amplitudes_match_statevector():
+    """Sampling treats the optional root physical leg as an ordinary site."""
+    n = 5
+    root_qubit = 2
+    rng = np.random.default_rng(71)
+    plan = TreePlan.from_order(
+        [0, 1, 3, 4], structure="balanced", root_qubit=root_qubit,
+    )
+    stream = _random_stream(n, 30, rng, two_qubit_frac=0.7)
+    opt = TreeOptimizer(stream, tree=plan, chi=128)
+    psi, exact = _exact_probs(opt, n)
+    configs = _all_configs(n)
+
+    sampler = TreeSampler(opt, seed=0)
+    amplitudes = sampler.amplitudes(configs)
+    probabilities = sampler.probabilities(configs)
+    pivot = int(np.argmax(np.abs(psi)))
+    phase = psi[pivot] / amplitudes[pivot]
+
+    assert np.max(np.abs(amplitudes * phase - psi)) < 1e-10
+    assert np.max(np.abs(probabilities - exact)) < 1e-10
+    result = sampler.sample_batch(32, seed=3)
+    assert result.configs.shape == (32, n)
+    assert np.allclose(
+        result.probs, sampler.probabilities(result.configs), atol=1e-12
+    )
 
 
 # -- empirical sampling -------------------------------------------------------
@@ -247,7 +275,7 @@ def test_public_api_exports_tree_sampler():
 # -- fermionic tree sampling --------------------------------------------------
 
 
-def _fermionic_tree(*, chi=64, steps=4):
+def _fermionic_tree(*, chi=64, steps=4, root_qubit=None):
     """Build a mildly entangled U1U1 spinful Fermi-Hubbard tree (L=4)."""
     from pepsy.optimizers.tree import TreeLayoutFinder
 
@@ -269,7 +297,7 @@ def _fermionic_tree(*, chi=64, steps=4):
 
     plan = TreeLayoutFinder(
         [(fermion.hopping_gate(0.1, t=t, imaginary=False), e) for e in edges_1d],
-        n=L, chi=8, objective="hybrid",
+        n=L, chi=8, objective="hybrid", root_qubit=root_qubit,
     ).recommend_arities((2, 3, 4), seed=0)["plan"]
     seed_ttn = pepsy.ps_to_ttn(
         L, tree=plan, fermion=fermion, occupations=occupations, dtype=dtype
@@ -301,9 +329,12 @@ def _all_base_d_configs(n, d):
     )
 
 
-def test_fermionic_tree_probabilities_match_statevector():
+@pytest.mark.parametrize("root_qubit", [None, 3])
+def test_fermionic_tree_probabilities_match_statevector(root_qubit):
     pytest.importorskip("symmray")
-    engine, fermion, target, L = _fermionic_tree(chi=64)
+    engine, fermion, target, L = _fermionic_tree(
+        chi=64, root_qubit=root_qubit,
+    )
     sampler = TreeSampler(engine, fermion=fermion, seed=0)
     assert sampler._configuration_encoding is not None
 
@@ -367,4 +398,3 @@ def test_non_fermionic_occupations_raises():
     assert res.configuration_encoding is None
     with pytest.raises(ValueError, match="no fermion configuration encoding"):
         res.occupations()
-

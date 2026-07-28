@@ -461,8 +461,8 @@ def _fermionic_product_fock_specs(fermion, n, occupations, site_charge):
     return specs, {site: charge for site, (charge, _) in specs.items()}
 
 
-def _set_fermionic_product_leaf(tensor, physical_index, *, charge, basis_index):
-    """Replace a Symmray leaf by one selected Fock-basis vector in-place."""
+def _set_fermionic_product_site(tensor, physical_index, *, charge, basis_index):
+    """Set one Symmray physical tensor to a selected Fock-basis vector."""
     data = tensor.data
     physical_axis = tensor.inds.index(physical_index)
     chargemap = data.indices[physical_axis].chargemap
@@ -572,7 +572,7 @@ def ps_to_mps(
             to_backend=None,
         )
         for site, (charge, basis_index) in fock_specs.items():
-            _set_fermionic_product_leaf(
+            _set_fermionic_product_site(
                 state.mps[site], state.mps.site_ind(site),
                 charge=charge, basis_index=basis_index,
             )
@@ -616,6 +616,7 @@ def ps_to_ttn(
     *,
     tree=None,
     order=None,
+    root_qubit=None,
     structure="balanced",
     max_arity=2,
     community_frac=0.35,
@@ -652,6 +653,10 @@ def ps_to_ttn(
         ``order`` (or ``range(n)``) using ``structure``.
     order : sequence of int, optional
         Leaf order used to build a plan when ``tree`` is not supplied.
+        When ``root_qubit`` is set, this contains every other qubit.
+    root_qubit : int, optional
+        Qubit carried by the top tensor rather than a structural leaf. When an
+        explicit ``tree`` is supplied, this must match its root site.
     structure, max_arity, community_frac, star_frac
         Forwarded to :meth:`TreePlan.from_order`.
     chi : int, optional
@@ -701,15 +706,27 @@ def ps_to_ttn(
     if tree is not None and order is not None:
         raise ValueError("pass either tree= or order=, not both.")
     if tree is None:
+        if root_qubit is not None:
+            root_qubit = int(root_qubit)
         if order is None:
-            order = range(n)
+            order = (
+                range(n)
+                if root_qubit is None
+                else (q for q in range(n) if q != root_qubit)
+            )
         plan = TreePlan.from_order(
             order,
             structure=structure,
             max_arity=max_arity,
             community_frac=community_frac,
             star_frac=star_frac,
+            root_qubit=root_qubit,
         )
+        if plan.n != n:
+            raise ValueError(
+                f"constructed tree contains {plan.n} qubits, "
+                f"but n={n} was requested."
+            )
     else:
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan.")
@@ -717,6 +734,10 @@ def ps_to_ttn(
         if plan.n != n:
             raise ValueError(
                 f"tree contains {plan.n} qubits, but n={n} was requested."
+            )
+        if root_qubit is not None and int(root_qubit) != plan.root_qubit:
+            raise ValueError(
+                "root_qubit does not match the supplied tree plan."
             )
 
     if fermion is not None:
@@ -760,8 +781,8 @@ def ps_to_ttn(
             node_tag_id=node_tag_id,
         )
         for qubit, (charge, basis_index) in fock_specs.items():
-            _set_fermionic_product_leaf(
-                ttn.node_tensor(ttn.leaf_of_qubit(qubit)), ttn.site_ind(qubit),
+            _set_fermionic_product_site(
+                ttn.node_tensor(ttn.node_of_qubit(qubit)), ttn.site_ind(qubit),
                 charge=charge, basis_index=basis_index,
             )
         _apply_to_tensor_network_arrays(ttn, to_backend)
@@ -792,7 +813,7 @@ def ps_to_ttn(
     )
     local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
     for q in range(n):
-        tensor = ttn.node_tensor(ttn.leaf_of_qubit(q))
+        tensor = ttn.node_tensor(ttn.node_of_qubit(q))
         phys_axis = tensor.inds.index(ttn.site_ind(q))
         data = np.zeros_like(tensor.data, dtype=dtype)
         slicer = [0] * data.ndim
@@ -807,6 +828,11 @@ def ps_to_ttn(
             seed_rand(seed)
         ttn.expand_bond_dimension_(chi, rand_strength=rand_strength)
         ttn.canonize_around_node_(plan.root)
+    else:
+        # Replacing each product vector clears Quimb's local ``left_inds``.
+        # Bond-one normalized product tensors remain trivially canonical, so
+        # restore the network-owned orientation metadata without new QR work.
+        ttn._set_isometry_metadata_from_region({plan.root})
     return ttn.validate()
 
 
@@ -816,6 +842,7 @@ def hrs_to_ttn(
     *,
     tree=None,
     order=None,
+    root_qubit=None,
     structure="balanced",
     max_arity=2,
     community_frac=0.35,
@@ -832,11 +859,12 @@ def hrs_to_ttn(
 ):
     """Create a random product or charge-preserving Symmray TTN.
 
-    With ``fermion=`` the leaves receive the model's physical charge sectors,
-    while internal tree nodes are neutral and every virtual tree edge is a
-    conjugate pair of Symmray charge-sector indices. ``chi`` is the requested
-    total virtual-bond dimension. All block-sparse and fermionic operations
-    are delegated to Symmray/Quimb.
+    With ``fermion=`` the physical sites receive the model's charge sectors,
+    while virtual-only internal nodes are neutral and every virtual tree edge
+    is a conjugate pair of Symmray charge-sector indices. ``root_qubit`` places
+    one physical site on the top tensor. ``chi`` is the requested total
+    virtual-bond dimension. All block-sparse and fermionic operations are
+    delegated to Symmray/Quimb.
     """
     from ..optimizers.tree import TreePlan, TreeTensorNetwork
 
@@ -855,19 +883,37 @@ def hrs_to_ttn(
     if tree is not None and order is not None:
         raise ValueError("pass either tree= or order=, not both.")
     if tree is None:
+        if root_qubit is not None:
+            root_qubit = int(root_qubit)
+        if order is None:
+            order = (
+                range(n)
+                if root_qubit is None
+                else (q for q in range(n) if q != root_qubit)
+            )
         plan = TreePlan.from_order(
-            range(n) if order is None else order,
+            order,
             structure=structure,
             max_arity=max_arity,
             community_frac=community_frac,
             star_frac=star_frac,
+            root_qubit=root_qubit,
         )
+        if plan.n != n:
+            raise ValueError(
+                f"constructed tree contains {plan.n} qubits, "
+                f"but n={n} was requested."
+            )
     else:
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan.")
         if tree.n != n:
             raise ValueError(f"tree contains {tree.n} qubits, but n={n} was requested.")
         plan = tree
+        if root_qubit is not None and int(root_qubit) != plan.root_qubit:
+            raise ValueError(
+                "root_qubit does not match the supplied tree plan."
+            )
 
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
@@ -939,7 +985,7 @@ def hrs_to_ttn(
             [np.cos(theta / 2.0), np.exp(1j * phi) * np.sin(theta / 2.0)],
             dtype=dtype,
         )
-        tensor = ttn.node_tensor(ttn.leaf_of_qubit(q))
+        tensor = ttn.node_tensor(ttn.node_of_qubit(q))
         physical_axis = tensor.inds.index(ttn.site_ind(q))
         data = np.zeros_like(tensor.data, dtype=dtype)
         selector = [0] * data.ndim
@@ -949,6 +995,8 @@ def hrs_to_ttn(
     if chi > 1:
         ttn.expand_bond_dimension_(chi, rand_strength=rand_strength)
         ttn.canonize_around_node_(plan.root)
+    else:
+        ttn._set_isometry_metadata_from_region({plan.root})
     return ttn.validate()
 
 

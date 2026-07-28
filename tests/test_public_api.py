@@ -32,11 +32,12 @@ def test_namespace_exports_have_clear_core_and_advanced_groups():
 
 def test_tree_optimizers_are_available_from_high_level_api():
     """Tree layout and execution helpers resolve from ``import pepsy as py``."""
-    from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer
+    from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer, TreePlan
     from pepsy.optimizers.tree_stabilizer import TreeStabOptimizer
 
     assert pepsy.TreeLayoutFinder is TreeLayoutFinder
     assert pepsy.TreeOptimizer is TreeOptimizer
+    assert pepsy.TreePlan is TreePlan
     assert pepsy.TreeStabOptimizer is TreeStabOptimizer
 
 
@@ -59,6 +60,7 @@ _EXPECTED_IN_ALL = [
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeOptimizer",
+    "TreePlan",
     "TreeStabOptimizer",
     "TreeTensorNetwork",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
@@ -132,6 +134,7 @@ _CALLABLE_EXPORTS = [
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
     "TreeOptimizer",
+    "TreePlan",
     "TreeStabOptimizer",
     "TreeTensorNetwork",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",

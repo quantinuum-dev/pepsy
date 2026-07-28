@@ -144,6 +144,135 @@ def test_tree_two_site_direct_and_mpo_modes_agree():
     assert _fidelity(mpo.to_dense(), exact) > 1 - 1e-9
 
 
+def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
+    """Every dense path-thread Q keeps its toward-destination isometry."""
+    rng = np.random.default_rng(919)
+    opt = TreeOptimizer(None, n=8, chi=16, run=False)
+    checked = []
+    compress_path = opt._compress_path
+
+    def check_then_compress(path, **kwargs):
+        for node, toward_destination in zip(path, path[1:]):
+            tensor = opt.tn.node_tensor(node)
+            bond = opt.tn.bond(node, toward_destination)
+            assert tensor.left_inds is not None
+            assert set(tensor.left_inds) == set(tensor.inds) - {bond}
+            checked.append(node)
+        return compress_path(path, **kwargs)
+
+    monkeypatch.setattr(opt, "_compress_path", check_then_compress)
+    opt.apply_2q(_rand_unitary(2, rng), 0, 7)
+
+    assert checked
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+@pytest.mark.parametrize("mode", ("direct", "mpo", "submpo"))
+def test_two_site_modes_reuse_path_isometries_for_compression(
+    mode, monkeypatch,
+):
+    """All two-site routes skip the QR already proven by ``left_inds``."""
+    rng = np.random.default_rng(920)
+    n = 8
+    where = (0, 7)
+    gate = _rand_unitary(2, rng)
+    opt = TreeOptimizer(
+        None, n=n, chi=16, cutoff=1e-12, mode=mode, run=False,
+    )
+
+    reductions = []
+    compress_edge = opt._compress_edge_with_diagnostics
+
+    def traced_compress_edge(
+        u, v, *, max_bond=None, cutoff=None, reduced=True,
+    ):
+        assert opt.tn.can_skip_canonize(u, v, absorb="left")
+        reductions.append(reduced)
+        return compress_edge(
+            u,
+            v,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            reduced=reduced,
+        )
+
+    monkeypatch.setattr(
+        opt, "_compress_edge_with_diagnostics", traced_compress_edge,
+    )
+    if mode == "submpo":
+        submpo = qtn.MatrixProductOperator.from_dense(
+            gate.reshape((2,) * 4),
+            dims=(2, 2),
+            sites=where,
+            L=n,
+            max_bond=None,
+            cutoff=0.0,
+        )
+        opt.apply_submpo(submpo, where)
+    else:
+        opt.apply_2q(gate, *where)
+
+    expected = np.zeros(2**n, dtype=complex)
+    expected[0] = 1.0
+    expected = _sv_apply_kq(expected, gate, where, n)
+    assert reductions
+    assert all(reduced == "left" for reduced in reductions)
+    assert _fidelity(expected, opt.to_dense()) > 1 - 1e-10
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_dense_path_one_sided_compression_matches_full_reduction(monkeypatch):
+    """Reusing routed Q tensors is exact even when the path truncates."""
+    rng = np.random.default_rng(921)
+    n = 8
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    seed = TreeTensorNetwork.rand(plan, D=2, seed=921)
+    optimized = TreeOptimizer(
+        None,
+        tree=plan,
+        state=seed.copy(),
+        chi=2,
+        cutoff=1e-12,
+        mode="direct",
+        run=False,
+    )
+    reference = TreeOptimizer(
+        None,
+        tree=plan,
+        state=seed.copy(),
+        chi=2,
+        cutoff=1e-12,
+        mode="direct",
+        run=False,
+    )
+    monkeypatch.setattr(
+        reference, "_metadata_aware_reduction", lambda _u, _v: True,
+    )
+
+    for where in ((0, 7), (1, 6), (2, 5), (0, 4)):
+        gate = _rand_unitary(2, rng)
+        optimized.apply_2q(gate, *where)
+        reference.apply_2q(gate, *where)
+
+    assert optimized.max_bond() <= 2
+    assert reference.max_bond() <= 2
+    assert _fidelity(optimized.to_dense(), reference.to_dense()) > 1 - 1e-10
+    assert optimized.tn.validate(check_canonical=True) is optimized.tn
+    assert reference.tn.validate(check_canonical=True) is reference.tn
+
+
+def test_compression_reduction_falls_back_without_local_isometry_proof():
+    """One-sided compression is selected only from live ``left_inds``."""
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    opt = TreeOptimizer(None, tree=plan, run=False)
+    child = plan.leaf_of_qubit[0]
+    parent = plan.parent[child]
+
+    assert opt._metadata_aware_reduction(parent, child) == "left"
+    opt.tn.node_tensor(child).modify(left_inds=None)
+    assert opt._metadata_aware_reduction(parent, child) is True
+
+
 def test_tree_mpo_mode_keeps_small_operator_schmidt_components():
     """MPO lowering must not apply Quimb's default gate-SVD cutoff."""
     x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
@@ -212,6 +341,151 @@ def test_tree_multisite_submpo_qr_routes_before_one_subtree_sweep():
     assert opt.truncation_history
     assert all(event["kind"] != "split" for event in opt.truncation_history)
     assert all(event["max_bond"] == 1 for event in opt.truncation_history)
+
+
+def test_dense_subtree_hub_recovery_reuses_routed_q_metadata(monkeypatch):
+    """Dense routed Q tensors recover the hub without another numerical QR."""
+    import quimb.tensor.tensor_core as qtc
+
+    rng = np.random.default_rng(52)
+    n = 8
+    where = (0, 3, 7)
+    gate = _rand_unitary(3, rng)
+    opt = TreeOptimizer(None, n=n, chi=16, run=False)
+    expected = np.zeros(2**n, dtype=complex)
+    expected[0] = 1.0
+    expected = _sv_apply_kq(expected, gate, where, n)
+
+    qr_calls = []
+    tensor_split = qtc.tensor_split
+    canonize_calls = []
+    canonize_between = opt.tn.canonize_between
+
+    def traced_tensor_split(*args, **kwargs):
+        if kwargs.get("method") == "qr":
+            qr_calls.append(args[0])
+        return tensor_split(*args, **kwargs)
+
+    def traced_canonize_between(*args, **kwargs):
+        canonize_calls.append(args)
+        return canonize_between(*args, **kwargs)
+
+    recoveries = []
+    move_center = opt._move_center
+
+    def traced_move_center(target):
+        region = opt.canonical_region
+        if region is not None and len(region) > 1 and target in region:
+            for nid in region:
+                tensor = opt.tn.node_tensor(nid)
+                if nid == target:
+                    assert tensor.left_inds is None
+                    continue
+                toward_hub = opt.plan.node_path(nid, target)[1]
+                bond = opt.tn.bond(nid, toward_hub)
+                assert tensor.left_inds is not None
+                assert set(tensor.left_inds) == set(tensor.inds) - {bond}
+            before = (len(qr_calls), len(canonize_calls))
+            result = move_center(target)
+            recoveries.append(
+                (
+                    len(qr_calls) - before[0],
+                    len(canonize_calls) - before[1],
+                )
+            )
+            return result
+        return move_center(target)
+
+    monkeypatch.setattr(qtc, "tensor_split", traced_tensor_split)
+    monkeypatch.setattr(opt.tn, "canonize_between", traced_canonize_between)
+    monkeypatch.setattr(opt, "_move_center", traced_move_center)
+    opt.apply_subtree_operator(gate, where)
+
+    assert recoveries == [(0, 0)]
+    assert _fidelity(expected, opt.to_dense()) > 1 - 1e-10
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_dense_subtree_uses_proven_one_sided_compression(monkeypatch):
+    """A routed gate ladder matches full reduction while skipping child QRs."""
+    rng = np.random.default_rng(53)
+    n = 8
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    seed = TreeTensorNetwork.rand(plan, D=2, seed=53)
+    optimized = TreeOptimizer(
+        None,
+        tree=plan,
+        state=seed.copy(),
+        chi=2,
+        cutoff=1e-12,
+        run=False,
+    )
+    reference = TreeOptimizer(
+        None,
+        tree=plan,
+        state=seed.copy(),
+        chi=2,
+        cutoff=1e-12,
+        run=False,
+    )
+
+    left_reductions = []
+    compress_edge = TreeTensorNetwork.compress_edge_
+
+    def traced_compress_edge(tn, a, b, **kwargs):
+        if tn is optimized.tn:
+            reduced = kwargs.get("reduced", True)
+            if reduced == "left":
+                child = tn.node_tensor(b)
+                bond = tn.bond(a, b)
+                assert child.left_inds is not None
+                assert set(child.left_inds) == set(child.inds) - {bond}
+                left_reductions.append((a, b))
+        return compress_edge(tn, a, b, **kwargs)
+
+    full_compress = reference._compress_edge_with_diagnostics
+
+    def force_full_reduction(
+        u, v, *, max_bond=None, cutoff=None, reduced=True,
+    ):
+        del reduced
+        return full_compress(
+            u,
+            v,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            reduced=True,
+        )
+
+    monkeypatch.setattr(
+        TreeTensorNetwork, "compress_edge_", traced_compress_edge,
+    )
+    monkeypatch.setattr(
+        reference, "_compress_edge_with_diagnostics", force_full_reduction,
+    )
+
+    exact = seed.to_statevector()
+    ladder_supports = (
+        (0, 2, 4),
+        (1, 3, 5),
+        (2, 4, 6),
+        (3, 5, 7),
+    )
+    for where in ladder_supports:
+        gate = _rand_unitary(3, rng)
+        optimized.apply_subtree_operator(gate, where)
+        reference.apply_subtree_operator(gate, where)
+        exact = _sv_apply_kq(exact, gate, where, n)
+
+    assert left_reductions
+    assert _fidelity(optimized.to_dense(), reference.to_dense()) > 1 - 1e-10
+    assert any(event["truncated"] for event in optimized.truncation_history)
+    assert _fidelity(optimized.to_dense(), exact) == pytest.approx(
+        _fidelity(reference.to_dense(), exact),
+        rel=1e-10,
+        abs=1e-12,
+    )
+    assert optimized.tn.validate(check_canonical=True) is optimized.tn
 
 
 def test_tree_mode_is_construction_and_run_override():
@@ -371,6 +645,41 @@ def test_root_physical_qubit_is_first_class_tree_site():
     assert state.validate(check_canonical=True) is state
 
 
+@pytest.mark.parametrize("root_qubit", [0, 1])
+def test_two_qubit_tree_uses_distinct_root_and_leaf_sites(root_qubit):
+    """The smallest root-site tree uses a unary root over one physical leaf."""
+    leaf_qubit = 1 - root_qubit
+    plan = TreePlan.from_order(
+        [leaf_qubit], structure="balanced", root_qubit=root_qubit,
+    )
+    layered = TreePlan.build_layered(
+        [leaf_qubit], block_size=2, root_qubit=root_qubit,
+    )
+    found = TreeLayoutFinder(
+        [], n=2, root_qubit=root_qubit, max_arity=2,
+    ).run()
+    automatic = TreeOptimizer(
+        None, n=2, root_qubit=root_qubit, max_arity=2, run=False,
+    )
+
+    for candidate in (plan, layered, found):
+        assert candidate.n == 2
+        assert candidate.root_qubit == root_qubit
+        assert candidate.node_of_qubit[root_qubit] == candidate.root
+        assert candidate.node_of_qubit[leaf_qubit] != candidate.root
+        assert len(candidate.children[candidate.root]) == 1
+    assert automatic.plan.node_of_qubit[root_qubit] == automatic.plan.root
+    assert automatic.tn.validate(check_canonical=True) is automatic.tn
+
+    stream = [
+        (pepsy.h(), root_qubit),
+        (pepsy.cnot(), (root_qubit, leaf_qubit)),
+    ]
+    opt = TreeOptimizer(stream, tree=plan, chi=8)
+    assert _fidelity(_exact_state(stream, 2), opt.to_dense()) > 1 - 1e-12
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
 def test_root_physical_qubit_gate_and_submpo_replay_are_exact():
     """Direct gates and a structured sub-MPO can target the top physical leg."""
     plan = TreePlan.from_order(
@@ -432,6 +741,7 @@ def test_root_physical_qubit_layout_and_cap_are_root_aware():
     assert automatic.plan.root_qubit == 4
 
     opt = TreeOptimizer(None, tree=plan, chi=16, run=False)
+    assert opt.layout_report()["root_qubit"] == 4
     opt.apply_1q(pepsy.h(), 4)
     x = np.array([[0.0, 1.0], [1.0, 0.0]])
     assert opt.tn.local_expectation(x, 4) == pytest.approx(1.0)
@@ -441,6 +751,21 @@ def test_root_physical_qubit_layout_and_cap_are_root_aware():
     assert opt.to_dense().shape == (2**4,)
     assert opt.norm() == pytest.approx(1 / np.sqrt(2))
     assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_explicit_tree_rejects_mismatched_n():
+    """Explicit plans enforce the same qubit-count invariant as finders."""
+    plan = TreePlan.from_order(
+        range(4), structure="balanced", root_qubit=4,
+    )
+    with pytest.raises(
+        ValueError, match=r"tree contains 5 qubits, but n=4"
+    ):
+        TreeOptimizer(None, n=4, tree=plan, run=False)
+    with pytest.raises(
+        ValueError, match=r"tree contains 5 qubits, but n=4"
+    ):
+        TreeOptimizer(None, n=4, layout=plan, run=False)
 
 
 def test_layout_finder_builds_valid_tree():
@@ -2024,6 +2349,36 @@ def test_ps_to_ttn_matches_product_state_constructor_api():
     assert explicit.plan is plan
 
 
+def test_product_ttn_constructors_support_a_physical_root_site():
+    """Product/random public constructors resolve every physical node."""
+    theta = 0.23
+    local = np.array([np.cos(theta), np.sin(theta)], dtype="complex128")
+    expected = local
+    for _ in range(4):
+        expected = np.kron(expected, local)
+
+    plan = TreePlan.from_order(
+        [0, 1, 3, 4], structure="balanced", root_qubit=2,
+    )
+    explicit = pepsy.ps_to_ttn(5, tree=plan, theta=theta)
+    automatic = pepsy.ps_to_ttn(5, root_qubit=2, theta=theta)
+    smallest = pepsy.ps_to_ttn(2, root_qubit=1, theta=theta)
+    random = pepsy.hrs_to_ttn(5, root_qubit=2, seed=11)
+
+    assert explicit.plan is plan
+    assert automatic.plan.root_qubit == 2
+    assert smallest.plan.n == 2
+    assert smallest.plan.root_qubit == 1
+    assert random.plan.root_qubit == 2
+    assert np.allclose(explicit.to_statevector(), expected)
+    assert np.allclose(automatic.to_statevector(), expected)
+    assert random.to_statevector().shape == (2**5,)
+    assert explicit.validate(check_canonical=True) is explicit
+
+    with pytest.raises(ValueError, match="root_qubit does not match"):
+        pepsy.ps_to_ttn(5, tree=plan, root_qubit=3)
+
+
 def test_ttn_copy_preserves_geometry_and_type():
     """copy() keeps the plan, ids, and class, with an independent tid cache."""
     plan = TreePlan.from_order(range(6), structure="balanced")
@@ -2069,8 +2424,8 @@ def test_tree_torch_state_stays_native_across_public_operations():
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(3), structure="balanced")
     state = TreeTensorNetwork.from_plan(plan)
-    for tensor in state.tensor_map.values():
-        tensor.modify(data=to_backend(tensor.data))
+    state.apply_to_arrays(to_backend)
+    assert state.validate_isometry_metadata() is state
     h = to_backend(
         np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
     )
@@ -2085,6 +2440,7 @@ def test_tree_torch_state_stays_native_across_public_operations():
     }
     assert opt.expectation_pauli("ZZ", (0, 1)) == pytest.approx(1.0)
     opt.apply_subtree_operator(to_backend(np.eye(8, dtype=complex)), (0, 1, 2))
+    assert opt.tn.validate(check_canonical=True) is opt.tn
     opt.project_pauli("ZZ", (0, 1), +1)
     assert opt.measure(2, outcome=0) == 0
     assert opt.reset(2) == 0
@@ -2101,8 +2457,7 @@ def test_tree_warns_once_when_a_gate_does_not_match_the_state_backend():
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(2), structure="balanced")
     state = TreeTensorNetwork.from_plan(plan)
-    for tensor in state.tensor_map.values():
-        tensor.modify(data=to_backend(tensor.data))
+    state.apply_to_arrays(to_backend)
     opt = TreeOptimizer(None, state=state, run=False)
 
     with pytest.warns(UserWarning, match="backend-compatible gate"):
@@ -2117,8 +2472,7 @@ def test_tree_gate_stream_backend_preparation_is_stream_level():
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(2), structure="balanced")
     state = TreeTensorNetwork.from_plan(plan)
-    for tensor in state.tensor_map.values():
-        tensor.modify(data=to_backend(tensor.data))
+    state.apply_to_arrays(to_backend)
     gates = [
         np.eye(2, dtype=complex),
         np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex),
@@ -2143,8 +2497,7 @@ def test_tree_submpo_stream_backend_preparation_preserves_input():
     to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
     plan = TreePlan.from_order(range(2), structure="balanced")
     state = TreeTensorNetwork.from_plan(plan)
-    for tensor in state.tensor_map.values():
-        tensor.modify(data=to_backend(tensor.data))
+    state.apply_to_arrays(to_backend)
     submpo = _two_branch_flip_submpo(L=2, sites=(0, 1), targets=(0, 1))
     opt = TreeOptimizer(None, state=state, tree=plan, run=False)
 
@@ -2449,6 +2802,51 @@ def _entangled_ttn(seed=0, n=6, D=3, structure="balanced"):
     """A canonical-at-root random tree state for centre-movement tests."""
     plan = TreePlan.from_order(range(n), structure=structure)
     return TreeTensorNetwork.rand(plan, D=D, seed=seed)
+
+
+def test_isometry_metadata_api_has_one_network_owned_orientation_map():
+    """Product construction and optimizer delegates expose one live map."""
+    plan = TreePlan.from_order(range(6), structure="balanced")
+    ttn = TreeTensorNetwork.from_plan(plan)
+    directions = ttn.isometry_map()
+
+    assert directions[plan.root] is None
+    for nid in plan.nodes():
+        if nid == plan.root:
+            continue
+        assert directions[nid] == plan.parent[nid]
+        assert ttn.can_skip_canonize(nid, plan.parent[nid])
+        assert ttn.can_skip_canonize(
+            plan.parent[nid], nid, absorb="left",
+        )
+    assert ttn.validate_isometry_metadata() is ttn
+    assert ttn.validate(check_canonical=True) is ttn
+
+    opt = TreeOptimizer(None, tree=plan, state=ttn, run=False)
+    assert opt.isometry_map() == directions
+    leaf = plan.leaf_of_qubit[0]
+    assert opt.isometry_direction(leaf) == plan.parent[leaf]
+    assert opt.can_skip_canonize(leaf, plan.parent[leaf])
+    assert opt.validate_isometry_metadata() is opt
+
+
+def test_isometry_metadata_validation_detects_cleared_local_proof():
+    """A live canonical-region claim cannot outlast cleared ``left_inds``."""
+    ttn = _entangled_ttn(seed=43)
+    leaf = ttn.leaf_of_qubit(0)
+    tensor = ttn.node_tensor(leaf)
+    assert ttn.isometry_direction(leaf) == ttn.parent(leaf)
+
+    # Quimb correctly clears ``left_inds`` whenever tensor data changes.
+    tensor.modify(data=np.array(tensor.data))
+    assert ttn.isometry_direction(leaf) is None
+    with pytest.raises(ValueError, match="must be isometric"):
+        ttn.validate_isometry_metadata()
+    with pytest.raises(ValueError, match="must be isometric"):
+        ttn.validate(check_canonical=True)
+
+    ttn.invalidate_canonical_form()
+    assert ttn.validate_isometry_metadata() is ttn
 
 
 def test_shift_center_lossless_and_recanonical():
@@ -2949,6 +3347,109 @@ def test_tree_native_fermionic_gate_stream_matches_mps():
     assert float(tensors.tn_fidelity(auto.p, direct.p)) > 1 - 1e-10
     assert float(tensors.tn_fidelity(direct.p, mps_exact.p)) > 1 - 1e-9
     assert float(tensors.tn_fidelity(engine.p, mps_exact.p)) > 1 - 1e-8
+
+
+def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
+    """Dense isometry metadata must not replace native graded subtree QR."""
+    pytest.importorskip("symmray")
+    L = 4
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=1.0,
+        U=8.0,
+        mu=0.0,
+        dtype="complex128",
+    )
+    occupations = ((1, 0), (0, 1), (1, 0), (0, 1))
+    plan = TreePlan.from_order(range(L), structure="balanced")
+    seed = pepsy.ps_to_ttn(
+        L,
+        tree=plan,
+        fermion=fermion,
+        occupations=occupations,
+        dtype="complex128",
+    )
+    sites = (0, 1, 2)
+    local_ops = [
+        fermion.onsite_gate(
+            0.01, site=site, U=8.0, mu=0.0, imaginary=False
+        )
+        for site in sites
+    ]
+    submpo = qtn.MPO_product_operator(
+        local_ops,
+        sites=sites,
+        L=L,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+    )
+    candidate = TreeOptimizer(
+        None,
+        n=L,
+        tree=plan,
+        state=seed.copy(),
+        chi=64,
+        cutoff=0.0,
+        run=False,
+    )
+    reference = TreeOptimizer(
+        None,
+        n=L,
+        tree=plan,
+        state=seed.copy(),
+        chi=64,
+        cutoff=0.0,
+        run=False,
+    )
+    installs = []
+    install_routed = candidate._install_routed_subtree
+    compressions = []
+    compress_edge = candidate._compress_edge_with_diagnostics
+
+    def traced_install(local, snodes, hub):
+        installs.append((frozenset(snodes), hub))
+        assert candidate.tn.fermionic
+        return install_routed(local, snodes, hub)
+
+    def traced_compress_edge(
+        u, v, *, max_bond=None, cutoff=None, reduced=True,
+    ):
+        compressions.append(reduced)
+        return compress_edge(
+            u,
+            v,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            reduced=reduced,
+        )
+
+    monkeypatch.setattr(candidate, "_install_routed_subtree", traced_install)
+    monkeypatch.setattr(
+        candidate, "_compress_edge_with_diagnostics", traced_compress_edge,
+    )
+    candidate.apply_submpo(submpo, sites)
+    for site, op in zip(sites, local_ops):
+        reference.apply_1q(op, site)
+
+    def dense_vector(opt):
+        tensor = opt.tn.contract(all, optimize="greedy").transpose(
+            *(opt.tn.site_ind(q) for q in range(L))
+        )
+        return np.asarray(tensor.data.to_dense()).reshape(-1)
+
+    assert installs
+    assert compressions
+    assert all(reduced is True for reduced in compressions)
+    assert (
+        _fidelity(dense_vector(candidate), dense_vector(reference))
+        > 1 - 1e-10
+    )
+    assert candidate.validate_isometry_metadata() is candidate
+    for nid, toward in candidate.isometry_map().items():
+        if toward is not None:
+            assert not candidate.can_skip_canonize(nid, toward)
+    assert candidate.tn.validate(check_canonical=True) is candidate.tn
 
 
 def test_tree_stable_labels_route_submpo_by_payload_sites(monkeypatch):

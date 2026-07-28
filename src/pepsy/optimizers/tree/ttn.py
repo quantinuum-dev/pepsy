@@ -683,6 +683,115 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             )
         return next(iter(shared))
 
+    def isometry_direction(self, nid):
+        """Return the neighbour proven by ``left_inds`` to receive node ``nid``.
+
+        A dense tree tensor is an isometry toward exactly one adjacent node
+        when its ``left_inds`` contain every leg except that shared tree bond.
+        ``None`` means no usable local proof is currently recorded. This is a
+        derived view of the live tensor metadata, not separately tracked state.
+        """
+        if nid not in self._plan.children:
+            raise ValueError(f"{nid!r} is not a node of the tree.")
+        tensor = self.node_tensor(nid)
+        if tensor.left_inds is None:
+            return None
+        left_inds = set(tensor.left_inds)
+        right_inds = [
+            index for index in tensor.inds if index not in left_inds
+        ]
+        if len(right_inds) != 1:
+            return None
+        toward_bond = right_inds[0]
+        for neighbour in self.neighbors(nid):
+            if toward_bond == self.bond(nid, neighbour):
+                return neighbour
+        return None
+
+    def isometry_map(self):
+        """Return ``{node: toward_node_or_None}`` from live ``left_inds``."""
+        return {
+            nid: self.isometry_direction(nid)
+            for nid in self._plan.nodes()
+        }
+
+    def _set_isometry_metadata_from_region(self, region):
+        """Record orientations for a state already proven canonical.
+
+        This changes metadata only and therefore must be called solely by
+        constructors or kernels that independently establish the stated
+        canonical region.
+        """
+        region = self._validated_region(region)
+        for nid in self._plan.nodes():
+            tensor = self.node_tensor(nid)
+            if nid in region:
+                tensor.modify(left_inds=None)
+                continue
+            toward = self._toward_region(nid, region)
+            bond = self.bond(nid, toward)
+            tensor.modify(
+                left_inds=tuple(
+                    index for index in tensor.inds if index != bond
+                )
+            )
+        return self
+
+    def can_skip_canonize(self, a, b, *, absorb="right"):
+        """Whether local metadata proves edge canonicalisation is redundant.
+
+        With ``absorb="right"`` node ``a`` must already be isometric toward
+        ``b``; the ``"left"`` orientation is symmetric. Native fermionic trees
+        always return ``False`` because their graded QR path remains explicit.
+        """
+        if absorb not in {"right", "left"}:
+            raise ValueError("absorb must be 'right' or 'left'.")
+        bond = self.bond(a, b)  # validate the requested tree edge
+        if self.fermionic:
+            return False
+        if absorb == "right":
+            node = a
+        else:
+            node = b
+        tensor = self.node_tensor(node)
+        if tensor.left_inds is None:
+            return False
+        return set(tensor.left_inds) == set(tensor.inds) - {bond}
+
+    def validate_isometry_metadata(self, region=None):
+        """Validate local ``left_inds`` against a canonical region.
+
+        Every tensor outside ``region`` must point along its unique next edge
+        toward that region. Tensors inside the region need not be isometric.
+        When no explicit or tracked region exists, only malformed non-``None``
+        metadata is rejected. Returns ``self`` when valid.
+        """
+        if region is None:
+            region = self.canonical_region
+        else:
+            region = self._validated_region(region)
+
+        for nid in self._plan.nodes():
+            tensor = self.node_tensor(nid)
+            direction = self.isometry_direction(nid)
+            if tensor.left_inds is not None and direction is None:
+                raise ValueError(
+                    f"tree node {nid} has left_inds that do not identify "
+                    "exactly one adjacent isometry direction."
+                )
+            if (
+                not self.fermionic
+                and region is not None
+                and nid not in region
+            ):
+                expected = self._toward_region(nid, region)
+                if direction != expected:
+                    raise ValueError(
+                        f"tree node {nid} must be isometric toward node "
+                        f"{expected}, but left_inds point toward {direction}."
+                    )
+        return self
+
     def validate(self, *, check_canonical=False, tol=1e-9):
         """Validate the live network against its :class:`TreePlan`.
 
@@ -823,10 +932,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 )
             if self._validated_region(region) != region:
                 raise ValueError("canonical region is not a connected subtree.")
-            if check_canonical and not self.is_subtree_canonical_form(
-                region, tol=tol
-            ):
-                raise ValueError("tracked canonical region failed the isometry check.")
+            if check_canonical:
+                self.validate_isometry_metadata(region)
+                if not self.is_subtree_canonical_form(region, tol=tol):
+                    raise ValueError(
+                        "tracked canonical region failed the isometry check."
+                    )
         return self
 
     # -- plan delegators ------------------------------------------------------
@@ -1059,13 +1170,18 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self
 
     def compress_edge_(self, a, b, *, max_bond=None, cutoff=1e-12,
-                       absorb="right"):
+                       absorb="right", reduced=True):
         """Compress the tree edge ``a -> b`` in place.
 
         Dense/nonfermionic trees delegate to Quimb's ``compress_between``.
         Native fermionic trees explicitly SVD the complete two-node tensor.
         The tracked :attr:`orthogonality_center` advances as for
         :meth:`canonize_edge_`.
+
+        ``reduced`` is forwarded only on the dense path. Quimb's one-sided
+        ``"left"`` mode is exact when node ``b`` is already isometric on its
+        non-shared legs. Native fermionic compression ignores this option and
+        retains its explicit graded split.
         """
         previous = self.orthogonality_center
         if self.fermionic:
@@ -1083,6 +1199,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 max_bond=max_bond,
                 cutoff=cutoff,
                 absorb=absorb,
+                reduced=reduced,
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
@@ -1184,7 +1301,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 a, b = node, neighbour
             else:
                 a, b = neighbour, node
-            self.canonize_edge_(a, b, absorb=absorb)
+            if not self.can_skip_canonize(a, b, absorb=absorb):
+                self.canonize_edge_(a, b, absorb=absorb)
             remaining.remove(node)
 
         self._canonical_region = frozenset({target})
@@ -1640,13 +1758,14 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             else:
                 data = np.ones(shape, dtype=dtype)
             tensors.append(qtn.Tensor(data, inds=inds, tags=tags))
-        return cls(
+        ttn = cls(
             tensors,
             plan=plan,
             site_tag_id=site_tag_id,
             site_ind_id=site_ind_id,
             node_tag_id=node_tag_id,
-        )._with_center(plan.root).validate()
+        )._with_center(plan.root)
+        return ttn._set_isometry_metadata_from_region({plan.root}).validate()
 
     @classmethod
     def from_symmray_plan(

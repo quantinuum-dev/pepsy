@@ -88,9 +88,20 @@ the `orthogonality_center` name-parity alias), `shift_orthogonality_center(node)
 and `is_canonical_form(center)` delegate to the state, so the optimizer and its
 `TreeTensorNetwork` speak the same canonicalisation vocabulary.
 
+Local isometry orientation also has one owner: each live Quimb tensor carries
+its proven `left_inds`, while `TreeTensorNetwork.isometry_direction(node)` and
+`isometry_map()` derive read-only node-to-neighbour views from those tensors.
+`can_skip_canonize(a, b)` exposes the exact dense-edge condition used to avoid
+an already-proven QR, and `validate_isometry_metadata()` checks the local
+orientations against the tracked canonical region. `TreeOptimizer` delegates
+the same four methods without maintaining another mutable map. Native
+fermionic trees retain explicit graded QR and therefore never report a
+skippable edge through this API.
+
 `TreeTensorNetwork.validate()` checks the live tensor set, physical legs, tree
 edges, and bond ownership against the `TreePlan`; pass
-`check_canonical=True` when the more expensive isometry check is also desired.
+`check_canonical=True` when the metadata alignment and more expensive numerical
+isometry check are also desired.
 Direct Quimb mutations such as `gate_inds_`, `canonize_between`,
 `compress_between`, and `canonize_around_` invalidate the tracked canonical
 region. Call `invalidate_canonical_form()` after mutating tensor data directly;
@@ -144,10 +155,12 @@ nodes.
 Application then proceeds recursively from subtree leaves to a hub: each local
 state/operator message is losslessly QR-split on one edge and absorbed by its
 parent, carrying every still-open operator virtual leg. No dense state tensor
-for the whole Steiner subtree is formed. Once all MPO factors have arrived, the
-tree is canonicalized about the hub and every touched edge is SVD-compressed
-once. Thus every truncation sees the complete operator in an isometric
-environment.
+for the whole Steiner subtree is formed. Each dense routed Q tensor retains its
+`left_inds` isometry metadata, so canonical recovery recognizes that it already
+points toward the hub instead of repeating the same QR; native fermionic trees
+retain explicit graded QR recovery. Once all MPO factors have arrived, every
+touched edge is SVD-compressed once. Thus every truncation sees the complete
+operator in an isometric environment.
 
 `op` acts on `len(where)` qubits: an array reshaped to `(2,) * 2k` with output
 indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
@@ -306,13 +319,15 @@ readout, `pepsy.TreeEnergyOptimizer` wraps this batch path and returns an
 
 For the package-level product-state constructor, matching `ps_to_mps`, use
 `pepsy.ps_to_ttn(n, theta=..., tree=...)`. It builds the requested tree,
-initialises every leaf with `[cos(theta), sin(theta)]`, and optionally expands
-the virtual bonds with `chi`.
+initialises every physical site with `[cos(theta), sin(theta)]`, and optionally
+expands the virtual bonds with `chi`. Pass `root_qubit=q` to build the plan
+directly, or supply a matching root-site `TreePlan` through `tree=`.
 
 For a native Symmray fermionic state, pass a `Fermion` model and occupations:
 `pepsy.ps_to_ttn(n, tree=plan, fermion=fermion, occupations=..., chi=1)`.
-Leaves then carry the model's physical charge/parity sectors, internal nodes
-are neutral, and every tree edge uses conjugate Symmray virtual indices.
+Physical sites then carry the model's charge/parity sectors, virtual-only
+internal nodes are neutral, and every tree edge uses conjugate Symmray virtual
+indices.
 The constructor selects a definite local Fock basis vector, not a random vector
 inside a degenerate charge sector. For spinful `U1`/`Z2`, a scalar occupation
 `1` selects the checkerboard `|up>, |down>, ...` representative; pass
@@ -320,8 +335,13 @@ inside a degenerate charge sector. For spinful `U1`/`Z2`, a scalar occupation
 graded product tree is normalized by an exact graded norm contraction, so its
 represented norm is one rather than an arbitrary constructor scalar.
 `pepsy.hrs_to_ttn(..., chi=...)` creates the corresponding random symmetric
-tree with the requested charge-sector bond dimension. These constructors keep
-the Symmray arrays native; they do not materialize dense tensor data.
+tree with the requested charge-sector bond dimension and accepts the same
+`root_qubit=` option. These constructors keep the Symmray arrays native; they
+do not materialize dense tensor data.
+
+`pepsy.TreeSampler(state)` samples every registered physical site, including
+the optional root site. Its cached canonical arrays use parent, physical, then
+child axes, so probabilities and amplitudes retain normal `q0..q(n-1)` order.
 
 `TreeTensorNetwork.show()` prints a top-down ASCII drawing of the tree -- the
 tree analogue of a quimb MPS `show()` -- with the root at the top, structural
@@ -384,7 +404,8 @@ any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
   bisection. Binary trees remain a valid special case (`max_arity=2`).
 
 A caller may bypass the finder entirely by passing an explicit `TreePlan` via
-`TreeOptimizer(..., tree=plan)`. Build one with
+`TreeOptimizer(..., tree=plan)`. `TreePlan` is exported from both `pepsy` and
+`pepsy.optimizers.tree`. Build one with
 `TreePlan.from_order(order, weights=..., structure=..., max_arity=...)`, or -- for
 a fully hand-specified arbitrary-arity tree -- with
 `TreePlan.from_children(children, qubit_of_leaf)`, which validates that the
@@ -590,8 +611,7 @@ finder = py.TreeLayoutFinder(gates, n=L, weight_mode="operator_schmidt")
 plan = finder.layered(block_size=4)
 
 state = py.TreeTensorNetwork.from_plan(plan)
-for tensor in state.tensor_map.values():
-    tensor.modify(data=to_backend(tensor.data))
+state.apply_to_arrays(to_backend)  # backend-only conversion preserves left_inds
 
 # Convert user-provided gate arrays once, at their source.
 native_gates = [(to_backend(gate), where) for gate, where in gates]
@@ -664,7 +684,7 @@ For stream control events, `TreeOptimizer.measure_event`,
 `cap_event`, `reset_event`, and `measure_reset_event` build the same tuple forms as
 `MpsOptimizer`, including Pauli-basis measurement and reset. Their recorded
 results are `(pauli, where, outcome, probability)` in `measurements`.
-`cap(q, vec)` contracts and removes one leaf, shifting the remaining labels
+`cap(q, vec)` contracts and removes one physical site, shifting the remaining labels
 above `q` down by one unless stable labels are requested. `normalize()` rescales the represented state to unit
 norm and `max_bond()` reports the largest virtual bond. Truncation details are
 available through `truncation_report()`, `get_infidelities()`, and
@@ -679,7 +699,8 @@ available through `truncation_report()`, `get_infidelities()`, and
   QR bond-threading and double-bond fusion of the general geodesic route and is
   the common case in a locality-aware layout.
 
-- **Thread cap.** Tree tensors are small (rank `<= 3`, bounded by `chi`), so
+- **Thread cap.** Tree tensors are moderate-rank (set by local arity and the
+  optional root physical leg, with dimensions bounded by `chi`), so
   multi-threaded BLAS/OpenMP linear algebra is dominated by thread launch and
   synchronisation overhead. `TreeOptimizer` caps threads to `1` around gate
   application and the heavy read-outs by default (`threads=1`), which makes
@@ -692,6 +713,16 @@ available through `truncation_report()`, `get_infidelities()`, and
   orthogonality centre; `from_plan` records that centre on the network rather
   than recomputing it on the first gate. Native fermionic product trees are
   additionally normalized by their exact graded norm readout.
+- **Routed isometry reuse.** Dense geodesic and subtree QR routing retains each
+  Q tensor's `left_inds`, allowing later canonical recovery to reuse the proven
+  isometry without repeating the decomposition or entering Quimb's dense
+  canonicalization kernel. Final path and subtree compression also consults
+  that live proof: when the destination-side tensor is already isometric,
+  Quimb uses one-sided `reduced="left"` compression and avoids its redundant
+  reduction QR; otherwise it falls back to the full two-sided reduction. The
+  network derives orientation diagnostics from those tensors; the optimizer
+  does not keep a duplicate map. Native fermionic trees keep their separate
+  explicit graded QR/SVD path.
 - **State-owned centre.** The orthogonality centre lives on the
   `TreeTensorNetwork` (`orthogonality_center`, an `_EXTRA_PROPS` field), so the
   optimizer and the state cannot disagree and the centre is carried by

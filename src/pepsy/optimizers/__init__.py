@@ -30,6 +30,7 @@ _SYMBOL_MODULES = {
     "SweepOptimizer": ".sweep",
     "TreeLayoutFinder": ".tree",
     "TreeOptimizer": ".tree",
+    "TreePlan": ".tree",
     "TreeStabOptimizer": ".tree_stabilizer",
     "TreeTensorNetwork": ".tree",
     "CoalescedMeasurementRecord": ".noise",

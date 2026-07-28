@@ -5,13 +5,24 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
 
 ## Performance and stability
 
-- **BLAS thread cap is the biggest performance lever.** Tree tensors are tiny
-  (rank `<= 3`, bounded by `chi`), so multi-threaded BLAS/OpenMP is dominated
-  by thread launch/sync overhead. `threads=1` is the default; gate
+- **BLAS thread cap is the biggest performance lever.** Tree tensors are
+  moderate-rank (set by local arity and an optional root physical leg, with
+  dimensions bounded by `chi`), so multi-threaded BLAS/OpenMP is dominated by
+  thread launch/sync overhead. `threads=1` is the default; gate
   application and heavy readouts run inside `self._thread_ctx()` using
   `threadpoolctl` when available. Only raise `threads` in a large-`chi` regime.
 - The self-healing tid cache (`_nid_to_tid`, `_tid`) validates cached tensor
   ids against `self.tn.tensor_map`; a stale entry is recomputed safely.
+- Dense path and subtree routing preserve each QR-produced Q tensor's
+  `left_inds`. Canonical recovery therefore recognizes an already-isometric
+  routed branch without repeating its decomposition or entering Quimb's dense
+  canonicalization kernel. Path and subtree compression also reads that proof
+  before selecting one-sided `reduced="left"` compression, avoiding the
+  redundant reduction QR only when the destination tensor is proven
+  isometric. Missing proofs fall back to two-sided reduction. The network
+  derives orientation views directly from live tensors; do not cache a
+  duplicate map in the optimizer. Native fermionic routing deliberately
+  retains explicit graded QR/SVD recovery.
 - `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
   tid cache, and derives a deterministic child seed for an independent RNG.
 
