@@ -144,10 +144,12 @@ nodes.
 Application then proceeds recursively from subtree leaves to a hub: each local
 state/operator message is losslessly QR-split on one edge and absorbed by its
 parent, carrying every still-open operator virtual leg. No dense state tensor
-for the whole Steiner subtree is formed. Once all MPO factors have arrived, the
-tree is canonicalized about the hub and every touched edge is SVD-compressed
-once. Thus every truncation sees the complete operator in an isometric
-environment.
+for the whole Steiner subtree is formed. Each dense routed Q tensor retains its
+`left_inds` isometry metadata, so canonical recovery recognizes that it already
+points toward the hub instead of repeating the same QR; native fermionic trees
+retain explicit graded QR recovery. Once all MPO factors have arrived, every
+touched edge is SVD-compressed once. Thus every truncation sees the complete
+operator in an isometric environment.
 
 `op` acts on `len(where)` qubits: an array reshaped to `(2,) * 2k` with output
 indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
@@ -701,6 +703,10 @@ available through `truncation_report()`, `get_infidelities()`, and
   orthogonality centre; `from_plan` records that centre on the network rather
   than recomputing it on the first gate. Native fermionic product trees are
   additionally normalized by their exact graded norm readout.
+- **Routed isometry reuse.** Dense geodesic and subtree QR routing retains each
+  Q tensor's `left_inds`, allowing later canonical recovery to reuse the proven
+  isometry without repeating the decomposition. Native fermionic trees keep
+  their separate explicit graded QR path.
 - **State-owned centre.** The orthogonality centre lives on the
   `TreeTensorNetwork` (`orthogonality_center`, an `_EXTRA_PROPS` field), so the
   optimizer and the state cannot disagree and the centre is carried by

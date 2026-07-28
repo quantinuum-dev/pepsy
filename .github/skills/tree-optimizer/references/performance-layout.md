@@ -13,6 +13,10 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   `threadpoolctl` when available. Only raise `threads` in a large-`chi` regime.
 - The self-healing tid cache (`_nid_to_tid`, `_tid`) validates cached tensor
   ids against `self.tn.tensor_map`; a stale entry is recomputed safely.
+- Dense path and subtree routing preserve each QR-produced Q tensor's
+  `left_inds`. Canonical recovery therefore recognizes an already-isometric
+  routed branch without repeating its decomposition. Native fermionic routing
+  deliberately retains explicit graded QR recovery.
 - `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
   tid cache, and derives a deterministic child seed for an independent RNG.
 

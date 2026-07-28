@@ -2302,8 +2302,19 @@ class TreeOptimizer:
             get="tensors",
         )
         merged_v = qtn.tensor_contract(carry, tv)
-        tu.modify(data=keep.data, inds=keep.inds)
-        tv.modify(data=merged_v.data, inds=merged_v.inds)
+        # ``keep`` is the exact Q factor pointing toward ``v``. Preserve that
+        # isometry metadata so a later canonical walk can recognize the tensor
+        # without repeating the same QR decomposition.
+        tu.modify(
+            data=keep.data,
+            inds=keep.inds,
+            left_inds=keep.left_inds,
+        )
+        tv.modify(
+            data=merged_v.data,
+            inds=merged_v.inds,
+            left_inds=None,
+        )
 
     def _fermionic_thread_hop(self, u, v):
         """QR-route the operator bond without leaving native graded arrays."""
@@ -2643,6 +2654,39 @@ class TreeOptimizer:
             state_inds[v].discard(state_bond)
             state_inds[v].add(new_bond)
             operator_inds[v] = set(local[v].inds) - state_inds[v]
+
+    def _install_routed_subtree(self, local, snodes, hub):
+        """Install routed tensors and recover their proven hub centre.
+
+        Dense routing already QR-isometrizes every peeled non-hub tensor toward
+        ``hub``. Retaining each Q factor's ``left_inds`` lets Quimb's canonical
+        recovery walk short-circuit those decompositions while still advancing
+        the canonical-region state machine honestly. Native fermionic tensors
+        deliberately keep the prior behavior: their graded QR recovery remains
+        explicit inside :class:`TreeTensorNetwork`.
+        """
+        dense = not self.tn.fermionic
+        for nid in snodes:
+            routed = local[nid]
+            modify_opts = {
+                "data": routed.data,
+                "inds": routed.inds,
+            }
+            if dense:
+                if nid == hub:
+                    # The accumulated operator and state norm live here.
+                    modify_opts["left_inds"] = None
+                else:
+                    if routed.left_inds is None:
+                        raise RuntimeError(
+                            "dense subtree routing lost QR isometry metadata "
+                            f"for non-hub node {nid}."
+                        )
+                    modify_opts["left_inds"] = routed.left_inds
+            self.tn.tensor_map[self._tid(nid)].modify(**modify_opts)
+
+        self.tn.canonical_region = frozenset(snodes)
+        self._move_center(hub)
 
     # -- general multi-qubit / sub-MPO application ----------------------------
 
@@ -3077,14 +3121,11 @@ class TreeOptimizer:
                 "native sub-MPO application left open operator bonds; "
                 "use an MPO with a closed tensor-network contraction."
             )
-        for nid in snodes:
-            node_t = self.tn.tensor_map[self._tid(nid)]
-            node_t.modify(data=local[nid].data, inds=local[nid].inds)
         # The exterior remained isometric toward the updated Steiner subtree.
-        # Recover a single centre within it by QR, then truncate only now that
-        # every MPO virtual bond has reached its destination.
-        self.tn.canonical_region = frozenset(snodes)
-        self._move_center(hub)
+        # Dense routed Q tensors retain their isometry metadata, so recovering
+        # the hub centre is metadata-only; native graded trees keep their
+        # explicit QR recovery. Truncate only after every MPO bond has arrived.
+        self._install_routed_subtree(local, snodes, hub)
         self._compress_subtree(
             snodes, hub, max_bond=max_bond, cutoff=cutoff,
         )
@@ -3125,11 +3166,7 @@ class TreeOptimizer:
                 "factorized subtree operator left open operator bonds at its hub."
             )
 
-        for nid in snodes:
-            node_t = self.tn.tensor_map[self._tid(nid)]
-            node_t.modify(data=local[nid].data, inds=local[nid].inds)
-        self.tn.canonical_region = frozenset(snodes)
-        self._move_center(hub)
+        self._install_routed_subtree(local, snodes, hub)
         self._compress_subtree(
             snodes, hub, max_bond=max_bond, cutoff=cutoff,
         )

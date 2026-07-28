@@ -267,9 +267,13 @@ covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductStat
    physical and exterior state legs, then contract its new state bond into the
    parent together with the old state/operator bonds. No dense state tensor for
    the whole Steiner subtree is formed; the last node is the hub.
-5. Recover the hub centre by QR, then make one depth-first canonical SVD sweep:
-   every affected tree edge is truncated once, after the complete operator has
-   arrived. `renormalize=True` renormalises afterwards (for Kraus/projection).
+5. Install every routed Q factor with its ``left_inds`` isometry metadata.
+   Dense trees can then recover the hub centre through the normal canonical
+   state machine without repeating those QRs; native fermionic trees retain
+   their explicit graded QR recovery. Finally make one depth-first canonical
+   SVD sweep: every affected tree edge is truncated once, after the complete
+   operator has arrived. `renormalize=True` renormalises afterwards (for
+   Kraus/projection).
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator

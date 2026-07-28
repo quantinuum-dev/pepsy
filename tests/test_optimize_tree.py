@@ -144,6 +144,29 @@ def test_tree_two_site_direct_and_mpo_modes_agree():
     assert _fidelity(mpo.to_dense(), exact) > 1 - 1e-9
 
 
+def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
+    """Every dense path-thread Q keeps its toward-destination isometry."""
+    rng = np.random.default_rng(919)
+    opt = TreeOptimizer(None, n=8, chi=16, run=False)
+    checked = []
+    compress_path = opt._compress_path
+
+    def check_then_compress(path, **kwargs):
+        for node, toward_destination in zip(path, path[1:]):
+            tensor = opt.tn.node_tensor(node)
+            bond = opt.tn.bond(node, toward_destination)
+            assert tensor.left_inds is not None
+            assert set(tensor.left_inds) == set(tensor.inds) - {bond}
+            checked.append(node)
+        return compress_path(path, **kwargs)
+
+    monkeypatch.setattr(opt, "_compress_path", check_then_compress)
+    opt.apply_2q(_rand_unitary(2, rng), 0, 7)
+
+    assert checked
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
 def test_tree_mpo_mode_keeps_small_operator_schmidt_components():
     """MPO lowering must not apply Quimb's default gate-SVD cutoff."""
     x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
@@ -212,6 +235,57 @@ def test_tree_multisite_submpo_qr_routes_before_one_subtree_sweep():
     assert opt.truncation_history
     assert all(event["kind"] != "split" for event in opt.truncation_history)
     assert all(event["max_bond"] == 1 for event in opt.truncation_history)
+
+
+def test_dense_subtree_hub_recovery_reuses_routed_q_metadata(monkeypatch):
+    """Dense routed Q tensors recover the hub without another numerical QR."""
+    import quimb.tensor.tensor_core as qtc
+
+    rng = np.random.default_rng(52)
+    n = 8
+    where = (0, 3, 7)
+    gate = _rand_unitary(3, rng)
+    opt = TreeOptimizer(None, n=n, chi=16, run=False)
+    expected = np.zeros(2**n, dtype=complex)
+    expected[0] = 1.0
+    expected = _sv_apply_kq(expected, gate, where, n)
+
+    qr_calls = []
+    tensor_split = qtc.tensor_split
+
+    def traced_tensor_split(*args, **kwargs):
+        if kwargs.get("method") == "qr":
+            qr_calls.append(args[0])
+        return tensor_split(*args, **kwargs)
+
+    recoveries = []
+    move_center = opt._move_center
+
+    def traced_move_center(target):
+        region = opt.canonical_region
+        if region is not None and len(region) > 1 and target in region:
+            for nid in region:
+                tensor = opt.tn.node_tensor(nid)
+                if nid == target:
+                    assert tensor.left_inds is None
+                    continue
+                toward_hub = opt.plan.node_path(nid, target)[1]
+                bond = opt.tn.bond(nid, toward_hub)
+                assert tensor.left_inds is not None
+                assert set(tensor.left_inds) == set(tensor.inds) - {bond}
+            before = len(qr_calls)
+            result = move_center(target)
+            recoveries.append(len(qr_calls) - before)
+            return result
+        return move_center(target)
+
+    monkeypatch.setattr(qtc, "tensor_split", traced_tensor_split)
+    monkeypatch.setattr(opt, "_move_center", traced_move_center)
+    opt.apply_subtree_operator(gate, where)
+
+    assert recoveries == [0]
+    assert _fidelity(expected, opt.to_dense()) > 1 - 1e-10
+    assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
 def test_tree_mode_is_construction_and_run_override():
@@ -2166,6 +2240,7 @@ def test_tree_torch_state_stays_native_across_public_operations():
     }
     assert opt.expectation_pauli("ZZ", (0, 1)) == pytest.approx(1.0)
     opt.apply_subtree_operator(to_backend(np.eye(8, dtype=complex)), (0, 1, 2))
+    assert opt.tn.validate(check_canonical=True) is opt.tn
     opt.project_pauli("ZZ", (0, 1), +1)
     assert opt.measure(2, outcome=0) == 0
     assert opt.reset(2) == 0
@@ -3030,6 +3105,86 @@ def test_tree_native_fermionic_gate_stream_matches_mps():
     assert float(tensors.tn_fidelity(auto.p, direct.p)) > 1 - 1e-10
     assert float(tensors.tn_fidelity(direct.p, mps_exact.p)) > 1 - 1e-9
     assert float(tensors.tn_fidelity(engine.p, mps_exact.p)) > 1 - 1e-8
+
+
+def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
+    """Dense isometry metadata must not replace native graded subtree QR."""
+    pytest.importorskip("symmray")
+    L = 4
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        t=1.0,
+        U=8.0,
+        mu=0.0,
+        dtype="complex128",
+    )
+    occupations = ((1, 0), (0, 1), (1, 0), (0, 1))
+    plan = TreePlan.from_order(range(L), structure="balanced")
+    seed = pepsy.ps_to_ttn(
+        L,
+        tree=plan,
+        fermion=fermion,
+        occupations=occupations,
+        dtype="complex128",
+    )
+    sites = (0, 1, 2)
+    local_ops = [
+        fermion.onsite_gate(
+            0.01, site=site, U=8.0, mu=0.0, imaginary=False
+        )
+        for site in sites
+    ]
+    submpo = qtn.MPO_product_operator(
+        local_ops,
+        sites=sites,
+        L=L,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+    )
+    candidate = TreeOptimizer(
+        None,
+        n=L,
+        tree=plan,
+        state=seed.copy(),
+        chi=64,
+        cutoff=0.0,
+        run=False,
+    )
+    reference = TreeOptimizer(
+        None,
+        n=L,
+        tree=plan,
+        state=seed.copy(),
+        chi=64,
+        cutoff=0.0,
+        run=False,
+    )
+    installs = []
+    install_routed = candidate._install_routed_subtree
+
+    def traced_install(local, snodes, hub):
+        installs.append((frozenset(snodes), hub))
+        assert candidate.tn.fermionic
+        return install_routed(local, snodes, hub)
+
+    monkeypatch.setattr(candidate, "_install_routed_subtree", traced_install)
+    candidate.apply_submpo(submpo, sites)
+    for site, op in zip(sites, local_ops):
+        reference.apply_1q(op, site)
+
+    def dense_vector(opt):
+        tensor = opt.tn.contract(all, optimize="greedy").transpose(
+            *(opt.tn.site_ind(q) for q in range(L))
+        )
+        return np.asarray(tensor.data.to_dense()).reshape(-1)
+
+    assert installs
+    assert (
+        _fidelity(dense_vector(candidate), dense_vector(reference))
+        > 1 - 1e-10
+    )
+    assert candidate.tn.validate(check_canonical=True) is candidate.tn
 
 
 def test_tree_stable_labels_route_submpo_by_payload_sites(monkeypatch):
