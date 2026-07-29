@@ -393,6 +393,59 @@ def test_tree_multisite_submpo_qr_routes_before_one_subtree_sweep():
     assert all(event["max_bond"] == 1 for event in opt.truncation_history)
 
 
+def test_tree_submpo_does_not_retruncate_existing_within_cap_bonds():
+    """A native MPO replay keeps tiny pre-existing state components."""
+    eps = 1e-8
+    large = np.sqrt(1.0 - eps**2)
+    operator = np.zeros((4, 4), dtype=complex)
+    operator[:, 0] = (large, 0.0, 0.0, eps)
+    plan = TreePlan.from_order(range(3), structure="balanced")
+
+    seed = TreeOptimizer(
+        None, n=3, tree=plan, chi=4, cutoff=0.0, mode="direct", run=False,
+    )
+    seed.apply_2q(operator, 0, 1)
+    expected = seed.to_dense()
+
+    identity = qtn.MatrixProductOperator.from_dense(
+        np.eye(8, dtype=complex).reshape((2,) * 6),
+        dims=(2, 2, 2),
+        sites=(0, 1, 2),
+        L=3,
+        max_bond=None,
+        cutoff=0.0,
+    )
+    replay = TreeOptimizer(
+        None,
+        n=3,
+        tree=plan,
+        state=seed.tn,
+        chi=4,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+        mode="submpo",
+        run=False,
+    )
+    replay.apply_submpo(identity, (0, 1, 2))
+
+    np.testing.assert_allclose(expected, replay.to_dense(), atol=1e-14)
+    assert replay.to_dense()[6] == pytest.approx(eps)
+
+    mpo_replay = TreeOptimizer(
+        None,
+        n=3,
+        tree=plan,
+        state=seed.tn,
+        chi=4,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+        mode="mpo",
+        run=False,
+    )
+    mpo_replay.apply_2q(np.eye(4, dtype=complex), 0, 1)
+    np.testing.assert_allclose(expected, mpo_replay.to_dense(), atol=1e-14)
+
+
 def test_dense_subtree_hub_recovery_reuses_routed_q_metadata(monkeypatch):
     """Dense routed Q tensors recover the hub without another numerical QR."""
     import quimb.tensor.tensor_core as qtc

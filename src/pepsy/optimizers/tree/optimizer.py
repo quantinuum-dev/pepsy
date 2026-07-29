@@ -2096,7 +2096,12 @@ class TreeOptimizer:
                 "with one local factor per requested site."
             )
         return self._apply_2q_factors_impl(
-            *factors, qa, qb, max_bond=max_bond, cutoff=cutoff
+            *factors,
+            qa,
+            qb,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            preserve_subcap=True,
         )
 
     def _two_site_mpo_factors(self, submpo, qa, qb, *, site_where=None):
@@ -2198,7 +2203,7 @@ class TreeOptimizer:
 
     def _apply_2q_factors_impl(
         self, factors, outputs, thread_ind, qa, qb, *, max_bond=None,
-        cutoff=None,
+        cutoff=None, preserve_subcap=False,
     ):
         """Apply two local operator factors with one shared path-thread kernel.
 
@@ -2220,7 +2225,9 @@ class TreeOptimizer:
         ):
             return self._apply_2q_sibling_factors(
                 factors, outputs, qa, qb, la, lb, parent,
-                max_bond=max_bond, cutoff=cutoff,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                preserve_subcap=preserve_subcap,
             )
 
         source, destination = (
@@ -2253,14 +2260,19 @@ class TreeOptimizer:
                 data=merged_destination.data, inds=merged_destination.inds,
             )
             self.center = destination_node
-            self._compress_path(path, max_bond=max_bond, cutoff=cutoff)
+            self._compress_path(
+                path,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                preserve_subcap=preserve_subcap,
+            )
         finally:
             self._thread_ind = None
         return self
 
     def _apply_2q_sibling_factors(
         self, factors, outputs, qa, qb, la, lb, parent, *, max_bond=None,
-        cutoff=None,
+        cutoff=None, preserve_subcap=False,
     ):
         """Apply two local factors to sibling leaves through their parent.
 
@@ -2292,11 +2304,13 @@ class TreeOptimizer:
             blob, [pa], edge=(la, parent), bond_ind=e_la,
             max_bond=self.chi if max_bond is None else max_bond,
             cutoff=self.cutoff if cutoff is None else cutoff,
+            preserve_subcap=preserve_subcap,
         )
         lb_t, p_t = self._split_with_diagnostics(
             rem, [pb], edge=(lb, parent), bond_ind=e_lb,
             max_bond=self.chi if max_bond is None else max_bond,
             cutoff=self.cutoff if cutoff is None else cutoff,
+            preserve_subcap=preserve_subcap,
         )
         tla.modify(
             data=la_t.data,
@@ -2544,9 +2558,14 @@ class TreeOptimizer:
 
     def _split_with_diagnostics(
         self, tensor, left_inds, *, edge, bond_ind, max_bond, cutoff,
+        preserve_subcap=False,
     ):
         """Split ``tensor`` and record the resulting virtual edge."""
         before_bond = self._split_rank_bound(tensor, left_inds)
+        if preserve_subcap:
+            cutoff = self._subtree_cutoff_for_size(
+                before_bond, max_bond=max_bond, cutoff=cutoff,
+            )
         # An uncapped zero-cutoff routing split is provably lossless. Avoid an
         # otherwise redundant full SVD spectrum probe when diagnostics are on;
         # the subsequent final compression remains fully tracked.
@@ -2575,6 +2594,21 @@ class TreeOptimizer:
             cutoff=cutoff,
         )
         return left, right
+
+    def _subtree_cutoff_for_size(self, before_bond, *, max_bond, cutoff):
+        """Return the cutoff for a Tree/MPO update at ``before_bond`` size."""
+        requested_cutoff = self.cutoff if cutoff is None else float(cutoff)
+        effective_max_bond = (
+            self.chi
+            if max_bond is None
+            else self._normalize_max_bond(max_bond)
+        )
+        if (
+            effective_max_bond is not None
+            and int(before_bond) <= effective_max_bond
+        ):
+            return 0.0
+        return requested_cutoff
 
     def _compress_edge_with_diagnostics(
         self, u, v, *, max_bond=None, cutoff=None, reduced=True,
@@ -2640,7 +2674,9 @@ class TreeOptimizer:
             return "left"
         return True
 
-    def _compress_path(self, path, *, max_bond=None, cutoff=None):
+    def _compress_path(
+        self, path, *, max_bond=None, cutoff=None, preserve_subcap=False,
+    ):
         """Canonically compress every bond along ``path`` down to ``chi``.
 
         The orthogonality centre sits at ``path[-1]`` on entry; sweeping back to
@@ -2650,8 +2686,15 @@ class TreeOptimizer:
         sweep of Seitz et al. (Fig. 6) applied along the gate geodesic.
         """
         for v, u in zip(path[::-1], path[-2::-1]):
+            edge_cutoff = cutoff
+            if preserve_subcap:
+                edge_cutoff = self._subtree_cutoff_for_size(
+                    self.tn.ind_size(self.tn.bond(v, u)),
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                )
             self._compress_edge_with_diagnostics(
-                v, u, max_bond=max_bond, cutoff=cutoff,
+                v, u, max_bond=max_bond, cutoff=edge_cutoff,
                 reduced=self._metadata_aware_reduction(v, u),
             )
         self.center = path[0]
@@ -2661,11 +2704,29 @@ class TreeOptimizer:
 
         Starting at ``hub``, descend each branch. Compressing ``node -> child``
         moves the centre onto the child; a lossless QR move returns it before
-        the next branch. Thus every SVD sees the completed operator update with
-        an isometric environment, while every edge is truncated exactly once.
+        the next branch. Thus every actual SVD sees the completed operator
+        update with an isometric environment, while every affected edge is
+        compressed exactly once.
         """
         snodes = frozenset(snodes)
         self._move_center(hub)
+
+        def edge_cutoff(node, child):
+            """Keep existing sub-cap bonds lossless during subtree replay.
+
+            The routed subtree already contains the complete state and MPO
+            update. Reapplying a positive cutoff to a bond that is still
+            within the active bond cap can repeatedly remove tiny
+            *pre-existing* state components on every MPO event. Keep this
+            Tree/MPO route stable by using the configured Quimb cutoff mode on
+            over-cap bonds, and using a lossless QR on bonds that remain within
+            the cap.
+            """
+            return self._subtree_cutoff_for_size(
+                self.tn.ind_size(self.tn.bond(node, child)),
+                max_bond=max_bond,
+                cutoff=cutoff,
+            )
 
         def descend(node, parent):
             children = sorted(
@@ -2675,7 +2736,10 @@ class TreeOptimizer:
             )
             for child in children:
                 self._compress_edge_with_diagnostics(
-                    node, child, max_bond=max_bond, cutoff=cutoff,
+                    node,
+                    child,
+                    max_bond=max_bond,
+                    cutoff=edge_cutoff(node, child),
                     reduced=self._metadata_aware_reduction(node, child),
                 )
                 descend(child, node)
@@ -2819,7 +2883,9 @@ class TreeOptimizer:
                     if factors is not None:
                         self._apply_2q_factors_impl(
                             *factors, where[0], where[1],
-                            max_bond=max_bond, cutoff=cutoff,
+                            max_bond=max_bond,
+                            cutoff=cutoff,
+                            preserve_subcap=True,
                         )
                         applied = True
                 if applied is None:
