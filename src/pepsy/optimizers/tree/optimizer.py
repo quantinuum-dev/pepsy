@@ -294,7 +294,12 @@ class TreeOptimizer:
         ``None`` leaves the bond uncapped; the singular-value ``cutoff`` still
         applies.
     cutoff : float
-        Relative singular-value cutoff for truncations.
+        Singular-value cutoff for truncations, interpreted according to
+        ``cutoff_mode``.
+    cutoff_mode : str
+        Quimb singular-value cutoff mode. The default ``"rel"`` preserves the
+        historical TreeOptimizer behavior; use ``"rsum2"`` for a relative
+        discarded-squared-weight threshold matching Pepsy's MPS default.
     mode : {"auto", "direct", "mpo", "submpo"}
         Implementation used for two-site gates and explicit operator streams.
         ``"direct"`` uses the specialised gate-SVD/QR path. ``"mpo"`` first
@@ -421,7 +426,7 @@ class TreeOptimizer:
         return max_bond
 
     def __init__(self, gates=None, n=None, *, chi=64, cutoff=1e-12,
-                 mode="auto", two_site_mode=None,
+                 cutoff_mode="rel", mode="auto", two_site_mode=None,
                  structure="quality", max_arity=(2, 3, 4), community_frac=0.35,
                  star_frac=0.75, layout_objective="path",
                  layout_weight_mode="count", layout=None, tree=None,
@@ -549,6 +554,7 @@ class TreeOptimizer:
         self.cutoff = float(cutoff)
         if self.cutoff < 0.0:
             raise ValueError("cutoff must be non-negative.")
+        self.cutoff_mode = cutoff_mode
         self.mode = self._normalize_mode(mode)
         if two_site_mode is not None:
             legacy_mode = self._normalize_mode(two_site_mode)
@@ -2427,12 +2433,14 @@ class TreeOptimizer:
         return payload
 
     @staticmethod
-    def _probe_bond_spectrum(ta, tb, *, max_bond=None, cutoff=0.0):
+    def _probe_bond_spectrum(
+        ta, tb, *, max_bond=None, cutoff=0.0, cutoff_mode="rel",
+    ):
         """Return full/kept singular spectra for a two-tensor bond."""
         info = {}
         qtn.tensor_compress_bond(
             ta.copy(), tb.copy(), max_bond=None, cutoff=0.0,
-            cutoff_mode="rel", absorb=None, info=info,
+            cutoff_mode=cutoff_mode, absorb=None, info=info,
         )
         values = info.get("singular_values")
         if values is None:
@@ -2444,7 +2452,7 @@ class TreeOptimizer:
             kept_info = {}
             qtn.tensor_compress_bond(
                 ta.copy(), tb.copy(), max_bond=max_bond,
-                cutoff=cutoff, cutoff_mode="rel", absorb=None,
+                cutoff=cutoff, cutoff_mode=cutoff_mode, absorb=None,
                 info=kept_info,
             )
             kept_values = kept_info.get("singular_values")
@@ -2453,6 +2461,7 @@ class TreeOptimizer:
     @staticmethod
     def _probe_split_spectrum(
         tensor, left_inds, *, max_bond=None, cutoff=0.0,
+        cutoff_mode="rel",
     ):
         """Return full/kept singular spectra for a tensor split."""
         _, values, _ = tensor.split(
@@ -2460,7 +2469,7 @@ class TreeOptimizer:
             method="svd",
             cutoff=0.0,
             max_bond=None,
-            cutoff_mode="rel",
+            cutoff_mode=cutoff_mode,
             absorb=None,
             get="arrays",
         )
@@ -2473,7 +2482,7 @@ class TreeOptimizer:
                 method="svd",
                 cutoff=cutoff,
                 max_bond=max_bond,
-                cutoff_mode="rel",
+                cutoff_mode=cutoff_mode,
                 absorb=None,
                 get="arrays",
             )
@@ -2528,6 +2537,7 @@ class TreeOptimizer:
             # lossless split before the final ``chi``-limited path sweep.
             "max_bond": None if max_bond is None else int(max_bond),
             "cutoff": float(self.cutoff if cutoff is None else cutoff),
+            "cutoff_mode": self.cutoff_mode,
         })
 
     def _split_with_diagnostics(
@@ -2545,12 +2555,14 @@ class TreeOptimizer:
                 left_inds,
                 max_bond=max_bond,
                 cutoff=cutoff,
+                cutoff_mode=self.cutoff_mode,
             )
             if self.track_truncation and not lossless else None
         )
         left, right = tensor.split(
             left_inds=left_inds, method="svd", max_bond=max_bond,
-            cutoff=cutoff, absorb="right", get="tensors", bond_ind=bond_ind,
+            cutoff=cutoff, cutoff_mode=self.cutoff_mode,
+            absorb="right", get="tensors", bond_ind=bond_ind,
         )
         after_bond = self._tensor_ind_size(left, bond_ind)
         self._record_truncation(
@@ -2596,13 +2608,14 @@ class TreeOptimizer:
                 tb,
                 max_bond=max_bond,
                 cutoff=cutoff,
+                cutoff_mode=self.cutoff_mode,
             )
 
         # Keep the live canonical-region metadata in one place: the TTN edge
         # wrapper performs the compression and advances its tracked centre.
         self.tn.compress_edge_(
             u, v, max_bond=max_bond, cutoff=cutoff, absorb="right",
-            reduced=reduced,
+            cutoff_mode=self.cutoff_mode, reduced=reduced,
         )
         bond_after = self.tn.bond(u, v)
         after_bond = int(self.tn.ind_size(bond_after))
@@ -4165,6 +4178,7 @@ class TreeOptimizer:
             n=self.n,
             chi=self.chi,
             cutoff=self.cutoff,
+            cutoff_mode=self.cutoff_mode,
             mode=self.mode,
             structure=self.structure,
             max_arity=self.max_arity,

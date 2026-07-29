@@ -1093,7 +1093,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self
 
     def _fermionic_compress_edge_(
-        self, a, b, *, max_bond, cutoff, absorb,
+        self, a, b, *, max_bond, cutoff, cutoff_mode, absorb,
     ):
         """Compress one native graded tree cut by an explicit two-node SVD."""
         if absorb == "right":
@@ -1113,6 +1113,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             method="svd",
             max_bond=max_bond,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             absorb="right",
             get="tensors",
             bond_ind=bond,
@@ -1169,8 +1170,17 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self._track_edge_center(a, b, absorb, previous=previous)
         return self
 
-    def compress_edge_(self, a, b, *, max_bond=None, cutoff=1e-12,
-                       absorb="right", reduced=True):
+    def compress_edge_(
+        self,
+        a,
+        b,
+        *,
+        max_bond=None,
+        cutoff=1e-12,
+        cutoff_mode="rel",
+        absorb="right",
+        reduced=True,
+    ):
         """Compress the tree edge ``a -> b`` in place.
 
         Dense/nonfermionic trees delegate to Quimb's ``compress_between``.
@@ -1178,6 +1188,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         The tracked :attr:`orthogonality_center` advances as for
         :meth:`canonize_edge_`.
 
+        ``cutoff_mode`` selects Quimb's singular-value cutoff convention.
         ``reduced`` is forwarded only on the dense path. Quimb's one-sided
         ``"left"`` mode is exact when node ``b`` is already isometric on its
         non-shared legs. Native fermionic compression ignores this option and
@@ -1190,6 +1201,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 b,
                 max_bond=max_bond,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 absorb=absorb,
             )
         else:
@@ -1198,6 +1210,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 self.node_tag(b),
                 max_bond=max_bond,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 absorb=absorb,
                 reduced=reduced,
             )

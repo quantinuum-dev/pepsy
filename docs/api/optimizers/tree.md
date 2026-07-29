@@ -28,7 +28,13 @@ plan = finder.run(
     search_budget=128,
     progbar=True,
 )
-opt = TreeOptimizer(gates, tree=plan, chi=64)
+opt = TreeOptimizer(
+    gates,
+    tree=plan,
+    chi=64,
+    cutoff=1e-12,
+    cutoff_mode="rsum2",
+)
 assert opt.plan.node_of_qubit[4] == opt.plan.root
 assert set(opt.tn.node_tensor(opt.plan.root).inds) >= {"k4"}
 ```
@@ -203,6 +209,11 @@ roundoff.
 the optimizer's selected two-site mode for that run, later runs, and copies.
 The old `run(mode="tree")`/`"ttn"` selector is a deprecated no-op retained only
 for shared frontends.
+
+`TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
+Tree-edge SVD. Its default `"rel"` preserves historical Tree behavior;
+`"rsum2"` applies a relative discarded-squared-weight threshold and matches
+the default used by `MpsOptimizer`.
 
 `TreeOptimizer.apply_submpo(...)` is the public form for an explicit MPO of
 arbitrary support. It losslessly QR-routes its virtual bonds, then uses its

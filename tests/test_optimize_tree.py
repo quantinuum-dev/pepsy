@@ -144,6 +144,46 @@ def test_tree_two_site_direct_and_mpo_modes_agree():
     assert _fidelity(mpo.to_dense(), exact) > 1 - 1e-9
 
 
+def test_tree_cutoff_mode_controls_edge_truncation_and_copy():
+    """Tree truncations honor the configured Quimb cutoff convention."""
+    small = 0.1
+    large = np.sqrt(1.0 - small**2)
+    gate = np.array(
+        [
+            [large, 0.0, 0.0, -small],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [small, 0.0, 0.0, large],
+        ],
+        dtype=complex,
+    )
+
+    relative = TreeOptimizer(
+        [(gate, (0, 1))],
+        n=2,
+        chi=2,
+        cutoff=0.05,
+        cutoff_mode="rel",
+        track_truncation=True,
+    )
+    relative_sum2 = TreeOptimizer(
+        [(gate, (0, 1))],
+        n=2,
+        chi=2,
+        cutoff=0.05,
+        cutoff_mode="rsum2",
+        track_truncation=True,
+    )
+
+    assert relative.max_bond() == 2
+    assert relative_sum2.max_bond() == 1
+    assert all(
+        event["cutoff_mode"] == "rsum2"
+        for event in relative_sum2.truncation_history
+    )
+    assert relative_sum2.copy().cutoff_mode == "rsum2"
+
+
 def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
     """Every dense path-thread Q keeps its toward-destination isometry."""
     rng = np.random.default_rng(919)

@@ -17,6 +17,9 @@ Changes for the next release should be added here before the version is bumped.
 - `SimulatorPlanner` and `recommend_simulator` provide non-executing,
   chi-aware rankings across MPS, tree, MPS-stabilizer, and tree-stabilizer
   circuit strategies using physical and dressed-frame support geometry.
+- `TreeOptimizer` and `TreeTensorNetwork.compress_edge_` now accept
+  `cutoff_mode`, allowing Tree truncations to use the same Quimb
+  singular-value cutoff conventions as MPS truncations.
 
 ## [0.4.0] - 2026-07-27
 
