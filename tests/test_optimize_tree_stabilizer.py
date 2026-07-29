@@ -85,6 +85,14 @@ def test_tree_stab_is_public_and_cliffords_are_tableau_only():
     _assert_same_state(opt.to_statevector(), expected)
 
 
+def test_tree_stab_cutoff_defaults_match_tree_quimb_path():
+    """TreeStab forwards the TreeOptimizer/Quimb compression defaults."""
+    opt = pepsy.TreeStabOptimizer(2)
+
+    assert opt.tree_optimizer.cutoff == pytest.approx(1e-10)
+    assert opt.tree_optimizer.cutoff_mode == "rsum2"
+
+
 def test_tree_stab_isometry_api_and_backend_conversion_preserve_proofs():
     """TreeStab delegates one live map and backend conversion keeps it valid."""
     def converter(array):
@@ -278,6 +286,60 @@ def test_tree_stab_submpo_matches_mps_coefficient_frame_contract():
     mps.run()
 
     _assert_same_state(tree.to_statevector(), mps.to_statevector())
+
+
+def test_tree_stab_submpo_uses_native_tree_router_for_unacted_root(monkeypatch):
+    """TreeStab keeps structured MPO application on the coefficient tree."""
+    from pepsy.optimizers.tree import TreePlan
+
+    where = (1, 2, 3)
+    plan = TreePlan.from_order(
+        range(1, 5), structure="balanced", root_qubit=0
+    )
+    dense_operator = np.diag(
+        np.array([1.0, 0.8, 0.6, 0.4, 0.3, 0.2, 0.1, -0.2])
+    ).astype(complex)
+    submpo = qtn.MatrixProductOperator.from_dense(
+        dense_operator.reshape((2,) * 6),
+        dims=(2, 2, 2),
+        sites=where,
+        L=5,
+        max_bond=None,
+        cutoff=0.0,
+    )
+    expected = _apply_local(
+        np.eye(2**5, dtype=complex)[:, 0], dense_operator, where, 5
+    )
+
+    def fail_to_dense():
+        raise AssertionError("TreeStab sub-MPO was unexpectedly materialized")
+
+    monkeypatch.setattr(submpo, "to_dense", fail_to_dense)
+    opt = pepsy.TreeStabOptimizer(5, tree=plan, chi=64, cutoff=0.0)
+    opt.apply([("submpo", submpo, where)])
+
+    _assert_same_state(opt.to_statevector(), expected)
+    assert opt.tree_optimizer.update_history[0]["kind"] == "submpo"
+
+
+def test_tree_stab_mpo_mode_reuses_tree_two_factor_kernel(monkeypatch):
+    """TreeStab's MPO mode uses the same TreeOptimizer factor kernel."""
+    opt = pepsy.TreeStabOptimizer(2, mode="mpo")
+    calls = []
+    apply_factors = opt.tree_optimizer._apply_2q_factors_impl
+
+    def traced_apply_factors(*args, **kwargs):
+        calls.append(True)
+        return apply_factors(*args, **kwargs)
+
+    monkeypatch.setattr(
+        opt.tree_optimizer, "_apply_2q_factors_impl", traced_apply_factors
+    )
+    opt.apply([("cnot", 0, 1)])
+    opt.measure_pauli("Z", 1, outcome=+1, absorb_basis=True)
+
+    assert calls
+    assert opt.tree_optimizer.mode == "mpo"
 
 
 def test_tree_stab_amplitude_probability_match_dense_readout():

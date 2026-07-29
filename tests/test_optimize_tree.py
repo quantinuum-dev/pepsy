@@ -184,6 +184,16 @@ def test_tree_cutoff_mode_controls_edge_truncation_and_copy():
     assert relative_sum2.copy().cutoff_mode == "rsum2"
 
 
+def test_tree_cutoff_defaults_match_quimb_open_mps_submpo_path():
+    """TreeOptimizer defaults match Quimb's open-chain MPO compression."""
+    opt = TreeOptimizer(None, n=2, run=False)
+
+    assert opt.cutoff == pytest.approx(1e-10)
+    assert opt.cutoff_mode == "rsum2"
+    assert opt.copy().cutoff == pytest.approx(1e-10)
+    assert opt.copy().cutoff_mode == "rsum2"
+
+
 def test_dense_path_thread_preserves_qr_isometry_metadata(monkeypatch):
     """Every dense path-thread Q keeps its toward-destination isometry."""
     rng = np.random.default_rng(919)
@@ -2340,6 +2350,37 @@ def test_tree_stream_submpo_does_not_require_dense_materialization(monkeypatch):
     )
     assert _fidelity(reference, opt.to_dense()) > 1 - 1e-10
     assert report["events"][0]["crossing_edges"]
+
+
+def test_tree_native_submpo_keeps_unacted_physical_root_structured(monkeypatch):
+    """A physical root on the Steiner subtree need not be an MPO site."""
+    where = (1, 2, 3)
+    plan = TreePlan.from_order(
+        range(1, 5), structure="balanced", root_qubit=0
+    )
+    gate = _rand_unitary(len(where), np.random.default_rng(53))
+    mpo = qtn.MatrixProductOperator.from_dense(
+        gate.reshape((2,) * (2 * len(where))),
+        dims=(2,) * len(where),
+        sites=where,
+        L=5,
+        max_bond=None,
+        cutoff=0.0,
+    )
+    expected = _sv_apply_kq(
+        np.eye(2**5, dtype=complex)[:, 0], gate, where, 5
+    )
+
+    def fail_to_dense():
+        raise AssertionError("sub-MPO was unexpectedly materialized")
+
+    monkeypatch.setattr(mpo, "to_dense", fail_to_dense)
+    opt = TreeOptimizer(
+        None, n=5, tree=plan, chi=64, cutoff=0.0, run=False
+    )
+    opt.apply_submpo(mpo, where)
+
+    assert _fidelity(expected, opt.to_dense()) > 1 - 1e-10
 
 
 def test_tree_submpo_mode_declares_and_validates_mpo_streams():

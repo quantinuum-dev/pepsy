@@ -10,6 +10,14 @@ milestone. It represents the state as
 where `C` is a Stim tableau Clifford and `|p>` is a dense two-level
 `TreeTensorNetwork` evolved by `TreeOptimizer`.
 
+TreeStab forwards `cutoff` and `cutoff_mode` to that same coefficient
+optimizer. The defaults are `cutoff=1e-10` and `cutoff_mode="rsum2"`, matching
+Quimb's open-boundary `gate_with_submpo` compression convention. Its
+`mode="mpo"` path and explicit coefficient-frame `submpo` events therefore
+reuse TreeOptimizer's Quimb MPO tag lookup, lossless QR routing, and one final
+subtree compression sweep; a payload without that MPO interface is the only
+case that uses the bounded dense fallback.
+
 Canonical and compression state has the same single owner as ordinary tree
 simulation: local isometry proofs live on the coefficient tensors'
 ``left_inds`` and are interpreted by ``TreeTensorNetwork``. TreeStab delegates

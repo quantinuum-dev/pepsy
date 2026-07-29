@@ -39,7 +39,11 @@ from ..stabilizer_tn.settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from ..stabilizer_tn.stn_state import _CLIFFORD_GATES, _validate_bits
 from ..mps.optimizer import conditional_event_parts, submpo_event_parts
 from ..tree.layout import TreeLayoutFinder, TreePlan
-from ..tree.optimizer import TreeOptimizer
+from ..tree.optimizer import (
+    TreeOptimizer,
+    _DEFAULT_CUTOFF,
+    _DEFAULT_CUTOFF_MODE,
+)
 from ..tree.ttn import TreeTensorNetwork
 
 __all__ = ["TreeStabOptimizer", "run_stabilizer_tree_stream"]
@@ -620,7 +624,8 @@ class TreeStabOptimizer:
         *,
         n=None,
         chi=None,
-        cutoff=1e-12,
+        cutoff=_DEFAULT_CUTOFF,
+        cutoff_mode=_DEFAULT_CUTOFF_MODE,
         tree=None,
         layout=None,
         structure="quality",
@@ -818,6 +823,7 @@ class TreeStabOptimizer:
             n=n,
             chi=chi,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             mode=mode,
             structure=structure,
             max_arity=max_arity,
@@ -1455,6 +1461,7 @@ class TreeStabOptimizer:
             n=self.n,
             chi=self._tree.chi,
             cutoff=self._tree.cutoff,
+            cutoff_mode=self._tree.cutoff_mode,
             mode=self._tree.mode,
             structure=self._tree.structure,
             max_arity=self._tree.max_arity,
@@ -3512,6 +3519,7 @@ class TreeStabOptimizer:
             n=reduced_n,
             chi=old_tree.chi,
             cutoff=old_tree.cutoff,
+            cutoff_mode=old_tree.cutoff_mode,
             mode=old_tree.mode,
             structure=old_tree.structure,
             max_arity=old_tree.max_arity,

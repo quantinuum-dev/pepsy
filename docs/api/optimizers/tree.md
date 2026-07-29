@@ -32,7 +32,7 @@ opt = TreeOptimizer(
     gates,
     tree=plan,
     chi=64,
-    cutoff=1e-12,
+    cutoff=1e-10,
     cutoff_mode="rsum2",
 )
 assert opt.plan.node_of_qubit[4] == opt.plan.root
@@ -211,9 +211,9 @@ The old `run(mode="tree")`/`"ttn"` selector is a deprecated no-op retained only
 for shared frontends.
 
 `TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
-Tree-edge SVD. Its default `"rel"` preserves historical Tree behavior;
-`"rsum2"` applies a relative discarded-squared-weight threshold and matches
-the default used by `MpsOptimizer`.
+Tree-edge SVD. Its defaults, `cutoff=1e-10` and `cutoff_mode="rsum2"`, match
+Quimb's open-boundary `MatrixProductState.gate_with_submpo` compression path.
+`"rel"` remains available as a relative largest-singular-value threshold.
 
 `TreeOptimizer.apply_submpo(...)` is the public form for an explicit MPO of
 arbitrary support. It losslessly QR-routes its virtual bonds, then uses its

@@ -1176,7 +1176,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         b,
         *,
         max_bond=None,
-        cutoff=1e-12,
+        cutoff=1e-10,
         cutoff_mode="rel",
         absorb="right",
         reduced=True,

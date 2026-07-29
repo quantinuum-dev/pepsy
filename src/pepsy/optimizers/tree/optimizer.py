@@ -232,6 +232,8 @@ _PAULI_1Q = {
     "Z": np.array([[1.0, 0.0], [0.0, -1.0]], dtype=complex),
 }
 _RESET_FLIP_AXES = {"X": "Z", "Y": "X", "Z": "X"}
+_DEFAULT_CUTOFF = 1e-10
+_DEFAULT_CUTOFF_MODE = "rsum2"
 _DEFAULT_MAX_OPERATOR_QUBITS = 8
 _DEFAULT_MAX_SUBTREE_NODES = 128
 
@@ -297,9 +299,9 @@ class TreeOptimizer:
         Singular-value cutoff for truncations, interpreted according to
         ``cutoff_mode``.
     cutoff_mode : str
-        Quimb singular-value cutoff mode. The default ``"rel"`` preserves the
-        historical TreeOptimizer behavior; use ``"rsum2"`` for a relative
-        discarded-squared-weight threshold matching Pepsy's MPS default.
+        Quimb singular-value cutoff mode. The default ``"rsum2"`` matches
+        Quimb's open-boundary ``MatrixProductState.gate_with_submpo`` path;
+        use ``"rel"`` for a relative largest-singular-value threshold.
     mode : {"auto", "direct", "mpo", "submpo"}
         Implementation used for two-site gates and explicit operator streams.
         ``"direct"`` uses the specialised gate-SVD/QR path. ``"mpo"`` first
@@ -425,8 +427,10 @@ class TreeOptimizer:
             raise ValueError("max_bond must be a positive integer or None.")
         return max_bond
 
-    def __init__(self, gates=None, n=None, *, chi=64, cutoff=1e-12,
-                 cutoff_mode="rel", mode="auto", two_site_mode=None,
+    def __init__(self, gates=None, n=None, *, chi=64,
+                 cutoff=_DEFAULT_CUTOFF,
+                 cutoff_mode=_DEFAULT_CUTOFF_MODE, mode="auto",
+                 two_site_mode=None,
                  structure="quality", max_arity=(2, 3, 4), community_frac=0.35,
                  star_frac=0.75, layout_objective="path",
                  layout_weight_mode="count", layout=None, tree=None,
@@ -3142,7 +3146,11 @@ class TreeOptimizer:
             state_t = self.tn.tensor_map[self._tid(nid)].copy()
             state_inds[nid] = set(state_t.inds)
             q = self.plan.qubit_of_node.get(nid)
-            if q is None:
+            # A physical root can be an internal Steiner node without being
+            # acted on by the MPO. Keep its state tensor untouched and route
+            # it as ordinary state data. Only target physical nodes need an
+            # MPO site tensor and the associated site-tag lookup.
+            if q is None or q not in payload_for_compact:
                 local[nid] = state_t
                 operator_inds[nid] = set()
                 continue
