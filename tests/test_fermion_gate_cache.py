@@ -27,7 +27,7 @@ def _dense(gate):
 
 def test_fingerprint_is_content_addressed_not_identity():
     """Equal contents share a fingerprint; different contents do not."""
-    fermion = Fermion(spinful=True, symmetry="U1", t=1.0, U=8.0)
+    fermion = Fermion(spinful=True, symmetry="U1")
 
     up_a = fermion.hopping_operator(spin="up")
     up_b = fermion.hopping_operator(spin="up")
@@ -53,7 +53,7 @@ def test_operator_gate_does_not_alias_distinct_operators_under_id_reuse():
     of different kinds at the same ``theta`` used to let a recycled ``id`` return
     a stale cached gate.  Every gate must match an independent exponential.
     """
-    fermion = Fermion(spinful=True, symmetry="U1", t=1.0, U=8.0)
+    fermion = Fermion(spinful=True, symmetry="U1")
     theta = 0.10667747
 
     references = {
@@ -78,7 +78,7 @@ def test_operator_gate_does_not_alias_distinct_operators_under_id_reuse():
 
 def test_operator_gate_cache_hits_return_equivalent_gate():
     """Repeated calls with equal contents reuse a single correct gate."""
-    fermion = Fermion(spinful=True, symmetry="U1", t=1.0, U=8.0)
+    fermion = Fermion(spinful=True, symmetry="U1")
     theta = 0.37
 
     reference = _dense(_gate_from_term(fermion.hopping_operator(spin="up"), theta))

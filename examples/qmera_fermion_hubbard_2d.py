@@ -67,16 +67,10 @@ def main():
         param_scale=0.02,
         product_state_factory=product_state_factory,
     )
-    fermion = py.Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        t=0.2,
-        U=4.0,
-        mu=0.1,
-    )
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
     schedule = builder.build_schedule()
     parameters = builder.initialize_parameters(schedule)
-    terms = builder.fermion_terms(fermion)
+    terms = builder.fermion_terms(fermion, t=0.2, U=4.0, mu=0.1)
 
     # Symmray operators are already native; preserve them with
     # convert_terms=False. The cache reuses paths for repeated local cones.

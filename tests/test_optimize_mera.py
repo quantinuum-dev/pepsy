@@ -666,19 +666,13 @@ def test_unified_fermion_helper_adapts_to_qmera_mode_terms():
     """One Fermion model should feed both site and qMERA energy layouts."""
     pytest.importorskip("symmray")
     geometry = QMeraGeometry(shape=3, site_modes=("up", "down"))
-    fermion = Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        t=0.5,
-        U=4.0,
-        mu=0.1,
-    )
+    fermion = Fermion(spinful=True, symmetry="U1U1")
 
-    site_terms = fermion.local_terms(((0, 1), (1, 2)))
-    mode_terms = fermion.local_terms(geometry, layout="qmera")
+    site_terms = fermion.local_terms(((0, 1), (1, 2)), t=0.5, U=4.0, mu=0.1)
+    mode_terms = fermion.local_terms(geometry, layout="qmera", t=0.5, U=4.0, mu=0.1)
     direct_terms = qmera_symmray_fermi_hubbard_terms(
         geometry,
-        fermion=fermion,
+        fermion=fermion, t=0.5, U=4.0, mu=0.1,
     )
 
     assert set(site_terms) == {(0, 1), (1, 2)}
@@ -700,13 +694,7 @@ def test_unified_fermion_qmera_optimizer_runs_torch_autodiff():
     array_backend = backend_torch(dtype=torch.complex128)
     backend = QMeraSymmrayFermionBackend(to_backend=array_backend)
     registry = symmray_fermion_gate_registry(backend=backend)
-    fermion = Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        t=0.2,
-        U=0.5,
-        mu=0.1,
-    )
+    fermion = Fermion(spinful=True, symmetry="U1U1")
 
     def product_state_factory(schedule, sites, **kwargs):
         return backend.product_state(
@@ -732,9 +720,10 @@ def test_unified_fermion_qmera_optimizer_runs_torch_autodiff():
         param_scale=0.01,
         product_state_factory=product_state_factory,
     )
-    terms = builder.fermion_terms()
+    terms = builder.fermion_terms(t=0.2, U=0.5, mu=0.1)
     optimizer = builder.fermion_parametric_optimizer(
         energy_per_site=False,
+        term_params={"t": 0.2, "U": 0.5, "mu": 0.1},
     )
     initial = optimizer.loss(energy_per_site=False)
     result = optimizer.run(
@@ -1052,16 +1041,10 @@ def test_qmera_2d_fermion_and_majorana_direct_oracles_match_lightcones():
     )
     hubbard_backend = QMeraSymmrayFermionBackend()
     hubbard_registry = symmray_fermion_gate_registry(backend=hubbard_backend)
-    hubbard = Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        t=0.2,
-        U=0.5,
-        mu=0.1,
-    )
+    hubbard = Fermion(spinful=True, symmetry="U1U1")
     hubbard_terms = qmera_symmray_fermi_hubbard_terms(
         hubbard_geometry,
-        fermion=hubbard,
+        fermion=hubbard, t=0.2, U=0.5, mu=0.1,
     )
     hubbard_lightcone, hubbard_direct = run_case(
         hubbard_geometry,

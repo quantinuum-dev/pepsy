@@ -1218,6 +1218,7 @@ def hrs_to_peps(
     subsizes="maximal",
     contraction_opt="auto-hq",
     to_backend=None,
+    normalize=False,
 ):
     """Create a random product or Fermion-symmetric PEPS.
 
@@ -1225,7 +1226,8 @@ def hrs_to_peps(
     With ``fermion``, construct a native charge-preserving random PEPS instead:
     ``method="direct"`` uses Symmray's direct block-filled random PEPS, with
     ``chi`` controlling the virtual bond dimension. The direct state is
-    normalized before it is returned. A unitary PEPS-growth method is not yet
+    returned without a global norm by default; pass ``normalize=True`` when a
+    normalized PEPS is required. A unitary PEPS-growth method is not yet
     implemented.
     In the fermionic branch, ``haar_params`` and ``perturb`` do not apply.
 
@@ -1260,13 +1262,20 @@ def hrs_to_peps(
         Advanced override for the per-site charge pattern.
     method : {"direct"}, optional
         Fermion-aware random-state construction. ``"direct"`` fills allowed
-        Symmray blocks using ``PEPS_fermionic_rand`` and normalizes the result.
+        Symmray blocks using ``PEPS_fermionic_rand``. Global normalization is
+        optional and disabled by default.
     subsizes : object, optional
         Symmray charge-sector sizing policy used by ``method="direct"``.
     contraction_opt : object, optional
         Contraction optimizer stored by the internal symmetric wrapper.
     to_backend : callable, optional
         Backend mapper applied to Fermion-aware Symmray blocks.
+    normalize : bool, optional
+        Whether to globally normalize a Fermion-aware PEPS before returning
+        it. Defaults to ``False``. ``normalize=True`` uses a CPU boundary-MPS
+        contraction and is only needed when the caller requires a global
+        physical norm. NetKet VMC uses the default safely: a global PEPS
+        scalar cancels from the Metropolis probability and local-energy ratios.
 
     Returns
     -------
@@ -1288,6 +1297,8 @@ def hrs_to_peps(
     method = str(method).strip().lower().replace("-", "_")
     if method not in {"direct", "unitary"}:
         raise ValueError("method must be 'direct' or 'unitary'.")
+    if not isinstance(normalize, bool):
+        raise TypeError("normalize must be a bool.")
 
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
@@ -1347,7 +1358,16 @@ def hrs_to_peps(
             contraction_opt=contraction_opt,
             to_backend=None,
         )
-        state.normalize()
+        if normalize:
+            try:
+                state.normalize()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Fermionic PEPS global normalization failed in Quimb's "
+                    "boundary-MPS decomposition. For a NetKet VMC initial "
+                    "state, pass normalize=False: its global amplitude scale "
+                    "cancels from sampling and local-energy ratios."
+                ) from exc
         if to_backend is not None:
             state.apply_to_arrays(to_backend)
         return state.peps

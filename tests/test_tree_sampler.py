@@ -284,9 +284,7 @@ def _fermionic_tree(*, chi=64, steps=4, root_qubit=None):
     t, U, dt = 1.0, 4.0, 0.05
     dtype = "complex128"
 
-    fermion = pepsy.Fermion(
-        spinful=True, symmetry="U1U1", t=t, U=U, mu=0.0, dtype=dtype
-    )
+    fermion = pepsy.Fermion(spinful=True, symmetry="U1U1", dtype=dtype)
     setup = fermion.lattice_half_filling(Lx, Ly, pattern="checkerboard", cyclic=True)
     mapper = tensors.OneDMap(Lx, Ly, mode="snake")
     _, coo2idx = mapper.build()

@@ -397,7 +397,8 @@ class QMeraBuilder:
         on the builder keeps the representation choice in one place while
         allowing the regular local-term and optimizer machinery to handle the
         result. If the builder was created with ``fermion=...``, the argument
-        can be omitted.
+        can be omitted. Pass physical couplings (for example ``t=`` and
+        ``U=``) explicitly; ``Fermion`` deliberately does not store them.
         """
         fermion = self.fermion if fermion is None else fermion
         if fermion is None:

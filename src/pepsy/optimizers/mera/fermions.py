@@ -467,7 +467,8 @@ def qmera_symmray_fermi_hubbard_terms(geometry, *, fermion=None, **kwargs):
     geometry : QMeraGeometry
         Geometry whose physical sites are expanded into two-state modes.
     fermion : pepsy.Fermion, optional
-        Unified model helper supplying ``symmetry``, ``t``, ``U``, and ``mu``.
+        Unified model helper supplying only the local symmetry convention.
+        Pass ``t=``, ``U=``, and optional ``mu=`` explicitly.
         qMERA deliberately remains mode-native, so this adapter accepts only
         a spinful ``U1U1`` helper and does not turn a four-state site tensor
         into a qMERA register tensor.
@@ -479,12 +480,13 @@ def qmera_symmray_fermi_hubbard_terms(geometry, *, fermion=None, **kwargs):
             raise ValueError(
                 "qMERA Hubbard terms currently require Fermion(symmetry='U1U1')."
             )
-        kwargs = {
-            "t": getattr(fermion, "t", 1.0),
-            "U": getattr(fermion, "U", 8.0),
-            "mu": getattr(fermion, "mu", 0.0),
-            **kwargs,
-        }
+        missing = [name for name in ("t", "U") if name not in kwargs]
+        if missing:
+            raise TypeError(
+                "qMERA Fermi-Hubbard terms require explicit "
+                + ", ".join(f"{name}=" for name in missing)
+                + ". Fermion does not store couplings."
+            )
     backend = kwargs.pop("backend", None)
     if backend is None:
         backend = QMeraSymmrayFermionBackend(

@@ -371,7 +371,14 @@ def _connected_amplitudes_with_target_dedup(
     reuse_diagonal=True,
     deduplicate_targets=False,
 ):
-    """Evaluate connected amplitudes, optionally sharing target rows globally."""
+    """Evaluate connected amplitudes, optionally sharing target rows globally.
+
+    A connected target can also be one of the parent configurations in the
+    retained batch. In that case its amplitude is already known, even when
+    the corresponding connection belongs to a different walker. Reusing that
+    value avoids an otherwise unnecessary PEPS contraction before dispatching
+    the remaining unique targets to the amplitude model.
+    """
     torch = _require_torch()
     if not deduplicate_targets or connections.configs.shape[0] <= 1:
         return _connected_amplitudes_for_connections(
@@ -383,16 +390,58 @@ def _connected_amplitudes_with_target_dedup(
             reuse_diagonal=reuse_diagonal,
         )
 
-    target_configs, target_inverse = _unique_config_rows(connections.configs)
-    if target_inverse is None:  # pragma: no cover - guarded by shape
-        target_inverse = torch.zeros(
+    # Deduplicate parent and target configurations together. Besides avoiding
+    # a second expensive row comparison, this supplies a global parent lookup
+    # for target configurations that another retained walker has already
+    # evaluated.
+    all_configs = torch.cat((configs, connections.configs), dim=0)
+    unique_configs, all_inverse = _unique_config_rows(all_configs)
+    if all_inverse is None:  # pragma: no cover - guarded by shape
+        all_inverse = torch.zeros(
             1,
             dtype=torch.long,
             device=configs.device,
         )
-    # Pick one parent for each unique target. The target amplitude is
-    # independent of its parent, while the representative parent still lets
-    # boundary backends reuse the appropriate environment.
+    n_parents = configs.shape[0]
+    parent_keys = all_inverse[:n_parents]
+    connection_keys = all_inverse[n_parents:]
+    target_keys, target_inverse = torch.unique(
+        connection_keys,
+        sorted=False,
+        return_inverse=True,
+    )
+    target_configs = unique_configs[target_keys]
+
+    # Associate every globally unique configuration with any retained parent
+    # carrying it. The particular parent is immaterial because equal
+    # configurations have equal amplitudes at the current model state.
+    parent_order = torch.argsort(parent_keys)
+    sorted_parent_keys = parent_keys[parent_order]
+    first_parent_key = torch.ones(
+        sorted_parent_keys.shape[0],
+        dtype=torch.bool,
+        device=configs.device,
+    )
+    if first_parent_key.numel() > 1:
+        first_parent_key[1:] = (
+            sorted_parent_keys[1:] != sorted_parent_keys[:-1]
+        )
+    parent_for_key = torch.full(
+        (unique_configs.shape[0],),
+        -1,
+        dtype=torch.long,
+        device=configs.device,
+    )
+    parent_for_key[sorted_parent_keys[first_parent_key]] = parent_order[
+        first_parent_key
+    ]
+    target_parent_indices = parent_for_key[target_keys]
+    reusable_targets = target_parent_indices >= 0
+
+    # Pick one parent for each unique target that is not already present in
+    # the parent batch. The target amplitude is independent of its parent,
+    # while the representative parent still lets boundary backends reuse the
+    # appropriate environment.
     order = torch.argsort(target_inverse)
     sorted_inverse = target_inverse[order]
     first = torch.ones(
@@ -403,23 +452,41 @@ def _connected_amplitudes_with_target_dedup(
     if first.numel() > 1:
         first[1:] = sorted_inverse[1:] != sorted_inverse[:-1]
     representative = order[first]
-    unique_connections = TorchConnections(
-        configs=target_configs,
-        coeffs=torch.ones(
-            target_configs.shape[0],
-            dtype=amplitudes.dtype,
-            device=configs.device,
-        ),
-        batch_ids=connections.batch_ids[representative],
+    unique_amplitudes = torch.empty(
+        target_configs.shape[0],
+        dtype=amplitudes.dtype,
+        device=configs.device,
     )
-    unique_amplitudes = _connected_amplitudes_for_connections(
-        configs,
-        amplitudes,
-        unique_connections,
-        amplitude_fn,
-        chunk_size=chunk_size,
-        reuse_diagonal=reuse_diagonal,
+    if reuse_diagonal and bool(torch.any(reusable_targets)):
+        unique_amplitudes[reusable_targets] = amplitudes[
+            target_parent_indices[reusable_targets]
+        ]
+
+    unreused_targets = ~reusable_targets if reuse_diagonal else torch.ones(
+        target_configs.shape[0],
+        dtype=torch.bool,
+        device=configs.device,
     )
+    if bool(torch.any(unreused_targets)):
+        unique_connections = TorchConnections(
+            configs=target_configs[unreused_targets],
+            coeffs=torch.ones(
+                int(unreused_targets.sum().item()),
+                dtype=amplitudes.dtype,
+                device=configs.device,
+            ),
+            batch_ids=connections.batch_ids[
+                representative[unreused_targets]
+            ],
+        )
+        unique_amplitudes[unreused_targets] = _connected_amplitudes_for_connections(
+            configs,
+            amplitudes,
+            unique_connections,
+            amplitude_fn,
+            chunk_size=chunk_size,
+            reuse_diagonal=reuse_diagonal,
+        )
     return unique_amplitudes[target_inverse]
 
 

@@ -151,13 +151,7 @@ def test_real_u1u1_mps_sampler_feeds_fermionic_peps_vmc():
     from pepsy.vmc import TorchFermionVMC
     from pepsy.vmc.netket import fermionic_peps_rand
 
-    fermion = Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        t=0.2,
-        U=1.0,
-        mu=0.1,
-    )
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     target = fermionic_peps_rand(
         "U1U1",
         2,
@@ -198,9 +192,28 @@ def test_real_u1u1_mps_sampler_feeds_fermionic_peps_vmc():
     assert occupations[:, :, 0].sum(axis=1).tolist() == [3] * 4
     assert occupations[:, :, 1].sum(axis=1).tolist() == [3] * 4
 
+    sites = tuple((x, y) for x in range(target.Lx) for y in range(target.Ly))
+    edges = tuple(
+        ((x, y), (x + 1, y))
+        for x in range(target.Lx - 1)
+        for y in range(target.Ly)
+    ) + tuple(
+        ((x, y), (x, y + 1))
+        for x in range(target.Lx)
+        for y in range(target.Ly - 1)
+    )
+    terms = {
+        edge: -0.2 * fermion.hopping_operator()
+        for edge in edges
+    }
+    terms |= {
+        site: fermion.onsite_term(site, U=1.0, mu=0.1)
+        for site in sites
+    }
     vmc = TorchFermionVMC(
         target,
         fermion=fermion,
+        terms=terms,
         contraction="exact",
         n_walkers=1,
         seed=5,

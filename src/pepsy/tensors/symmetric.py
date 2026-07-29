@@ -7314,12 +7314,13 @@ def fermion_hopping_param_gen(
 class Fermion:
     """Native spinless or spinful fermion observables, gates, and streams.
 
-    The helper owns the local fermionic space, symmetry convention, optional
-    model parameters, and backend conversion. Explicit native terms can still
-    be passed to :meth:`hamiltonian`; model parameters are used for compact
-    lattice and qMERA workflows. It is intended for direct Symmray-backed
-    fermionic MPS or PEPS workflows and does not introduce a qubit or
-    Jordan-Wigner circuit representation.
+    The helper owns only the local fermionic space, symmetry convention, and
+    optional backend conversion. Hamiltonian couplings are deliberately not
+    stored here: construct them as explicit native terms, then validate and
+    bundle them with :meth:`hamiltonian`. This prevents a native Hamiltonian,
+    a gate stream, and a VMC adapter from silently using different couplings.
+    It is intended for direct Symmray-backed fermionic MPS or PEPS workflows;
+    it does not introduce a qubit or Jordan-Wigner circuit representation.
 
     ``strang_gate_stream`` uses a deterministic edge colouring and a
     forward/reverse half-step sequence.  Consequently its hopping layers are
@@ -7329,13 +7330,9 @@ class Fermion:
     """
 
     symmetry: str | None = None
-    t: object = 1.0
-    U: object = 8.0
     dtype: object = "complex128"
     to_backend: object = None
     spinful: bool = True
-    V: object = 0.0
-    mu: object = 0.0
     _dense_ops: dict = field(default_factory=dict, init=False, repr=False)
     _observable_cache: dict = field(default_factory=dict, init=False, repr=False)
     _gate_cache: dict = field(default_factory=dict, init=False, repr=False)
@@ -8266,13 +8263,12 @@ class Fermion:
             peierls_angle=peierls_angle,
         )
 
-    def hopping_term(self, edge, *, spin=None, t=None, peierls_angle=0.0):
+    def hopping_term(self, edge, *, spin=None, t, peierls_angle=0.0):
         """Return ``-t`` times the hopping operator on ``edge``."""
         try:
             left, right = tuple(edge)
         except (TypeError, ValueError) as exc:
             raise ValueError("edge must contain exactly two site labels.") from exc
-        t = self.t if t is None else t
         t = _edge_parameter(t, left, right)
         return self._hopping_operator_on_sites(
             left,
@@ -8295,9 +8291,8 @@ class Fermion:
             sites=(0,),
         )
 
-    def interaction_term(self, site, *, U=None):
+    def interaction_term(self, site, *, U):
         """Return ``U n_up n_down`` on one physical site."""
-        U = self.U if U is None else U
         U = _node_parameter(U, site)
         return self.operator_term(
             [(U, ((site, "double"),))],
@@ -8315,9 +8310,8 @@ class Fermion:
             terms = [(1.0, ((0, "number"),))]
         return self.operator_term(terms, sites=(0,))
 
-    def chemical_potential_term(self, site, *, mu=None):
+    def chemical_potential_term(self, site, *, mu):
         """Return ``-mu n`` on one physical site."""
-        mu = self.mu if mu is None else mu
         if self.spinful:
             mu = _node_parameter(mu, site)
             mu_up, mu_down = _as_spin_pair(mu, name="mu")
@@ -8329,12 +8323,12 @@ class Fermion:
             terms = [(-_node_parameter(mu, site), ((site, "number"),))]
         return self.operator_term(terms, sites=(site,))
 
-    def onsite_term(self, site, *, U=None, mu=None):
+    def onsite_term(self, site, *, U=None, mu=0.0):
         """Return ``U n_up n_down - mu n`` on one site."""
-        U = self.U if U is None else U
-        mu = self.mu if mu is None else mu
         terms = []
         if self.spinful:
+            if U is None:
+                raise TypeError("onsite_term requires explicit U=... for spinful fermions.")
             terms.append((_node_parameter(U, site), ((site, "double"),)))
             mu = _node_parameter(mu, site)
             mu_up, mu_down = _as_spin_pair(mu, name="mu")
@@ -8361,13 +8355,12 @@ class Fermion:
         ]
         return self.operator_term(terms, sites=(0, 1))
 
-    def density_term(self, edge, *, V=None):
+    def density_term(self, edge, *, V):
         """Return ``V n_i n_j`` on a physical edge."""
         try:
             left, right = tuple(edge)
         except (TypeError, ValueError) as exc:
             raise ValueError("edge must contain exactly two site labels.") from exc
-        V = self.V if V is None else V
         V = _edge_parameter(V, left, right)
         if self.spinful:
             names = ("number_up", "number_down")
@@ -8515,7 +8508,7 @@ class Fermion:
     szz_gate = spin_z_correlator_gate
     xy_gate = xy_exchange_gate
 
-    def interaction_gate(self, dt, *, site=None, U=None, imaginary=False):
+    def interaction_gate(self, dt, *, site=None, U, imaginary=False):
         """Return the exact onsite interaction gate.
 
         With a site-dependent ``U`` mapping or callable, pass ``site`` so the
@@ -8527,7 +8520,6 @@ class Fermion:
                 "Spinless fermions have no onsite doublon interaction; use "
                 "density_gate(...) for the nearest-neighbor V interaction."
             )
-        U = self.U if U is None else U
         U = U if site is None else _node_parameter(U, site)
         theta = dt * U
 
@@ -8541,20 +8533,20 @@ class Fermion:
 
         return self._cached_gate(("interaction", dt, site, U, imaginary), build)
 
-    def onsite_gate(self, dt, *, site=None, U=None, mu=None, imaginary=False):
+    def onsite_gate(self, dt, *, site=None, U=None, mu=0.0, imaginary=False):
         """Return the complete one-site Hubbard gate.
 
         The generated gate represents ``U n_up n_down - mu n`` for spinful
         fermions and ``-mu n`` for spinless fermions. ``U`` and ``mu`` may be
         site-dependent mappings or callables when ``site`` is supplied.
         """
-        U = self.U if U is None else U
-        mu = self.mu if mu is None else mu
         if site is not None:
             U = _node_parameter(U, site)
             mu = _node_parameter(mu, site)
 
         if self.spinful:
+            if U is None:
+                raise TypeError("onsite_gate requires explicit U=... for spinful fermions.")
             mu_up, mu_down = _as_spin_pair(mu, name="mu")
             U_site = U
             diagonal = (
@@ -8579,9 +8571,8 @@ class Fermion:
 
         return self._cached_gate(("onsite", dt, site, U, mu, imaginary), build)
 
-    def hopping_gate(self, dt, *, t=None, peierls_angle=0.0, imaginary=False):
+    def hopping_gate(self, dt, *, t, peierls_angle=0.0, imaginary=False):
         """Return a two-site native fermionic hopping gate with Peierls phase."""
-        t = self.t if t is None else t
         def build():
             if not self.spinful:
                 gate = _spinless_hopping_gate(
@@ -8603,13 +8594,12 @@ class Fermion:
 
         return self._cached_gate(("hopping", dt, t, peierls_angle, imaginary), build)
 
-    def density_gate(self, dt, *, V=None, imaginary=False):
+    def density_gate(self, dt, *, V, imaginary=False):
         """Return the nearest-neighbor density interaction gate.
 
         For spinless fermions this is ``V n_i n_j``. For spinful fermions it
         is ``V (n_up + n_down)_i (n_up + n_down)_j``.
         """
-        V = self.V if V is None else V
         theta = dt * V
 
         def build():
@@ -8625,9 +8615,8 @@ class Fermion:
 
         return self._cached_gate(("density", dt, V, imaginary), build)
 
-    def chemical_potential_gate(self, dt, *, mu=None, site=None, imaginary=False):
+    def chemical_potential_gate(self, dt, *, mu, site=None, imaginary=False):
         """Return the chemical-potential part of an onsite gate."""
-        mu = self.mu if mu is None else mu
         mu = mu if site is None else _node_parameter(mu, site)
         if self.spinful:
             mu_up, mu_down = _as_spin_pair(mu, name="mu")
@@ -8649,7 +8638,7 @@ class Fermion:
         return self._cached_gate(("chemical", dt, site, mu, imaginary), build)
 
     def gate(self, name, dt, *, site=None, where=None, imaginary=False, **params):
-        """Build a named native gate using the model's local conventions."""
+        """Build a named native gate using the local fermionic conventions."""
         edge = params.pop("edge", where)
         del where  # Gate locations belong to the stream entry, not the tensor.
         name = str(name).lower().replace("-", "_")
@@ -8674,7 +8663,7 @@ class Fermion:
                 dt,
                 site=site,
                 U=params.pop("U", None),
-                mu=params.pop("mu", None),
+                mu=params.pop("mu", 0.0),
                 imaginary=imaginary,
             )
         if name in {"interaction", "onsite_interaction", "doublon"}:
@@ -8872,16 +8861,16 @@ class Fermion:
         imaginary=False,
         t=None,
         U=None,
-        V=None,
-        mu=None,
+        V=0.0,
+        mu=0.0,
     ):
-        """Return a canonical first- or second-order fermion gate stream."""
+        """Return a canonical fermion gate stream with explicit couplings."""
         if order not in {1, 2}:
             raise ValueError("order must be 1 or 2.")
-        t = self.t if t is None else t
-        U = self.U if U is None else U
-        V = self.V if V is None else V
-        mu = self.mu if mu is None else mu
+        if t is None:
+            raise TypeError("gate_stream requires explicit t=... .")
+        if self.spinful and U is None:
+            raise TypeError("gate_stream requires explicit U=... for spinful fermions.")
         edges = _as_edges(edges)
         sites = _sites_from_edges(edges, sites)
 
@@ -8954,14 +8943,16 @@ class Fermion:
         imaginary=False,
         t=None,
         U=None,
-        V=None,
-        mu=None,
+        V=0.0,
+        mu=0.0,
     ):
-        """Return an edge-coloured second-order native fermionic gate stream."""
-        t = self.t if t is None else t
-        U = self.U if U is None else U
-        V = self.V if V is None else V
-        mu = self.mu if mu is None else mu
+        """Return an edge-coloured second-order stream with explicit couplings."""
+        if t is None:
+            raise TypeError("strang_gate_stream requires explicit t=... .")
+        if self.spinful and U is None:
+            raise TypeError(
+                "strang_gate_stream requires explicit U=... for spinful fermions."
+            )
         edges = _as_edges(edges)
         sites = _sites_from_edges(edges, sites)
         half_dt = dt / 2
@@ -9109,23 +9100,23 @@ class Fermion:
         *,
         t=None,
         U=None,
-        V=None,
-        mu=None,
+        V=0.0,
+        mu=0.0,
         flat=False,
         to_backend=None,
     ):
-        """Validate explicit terms or build the configured lattice model.
+        """Validate explicit terms or build a model only from explicit couplings.
 
         The canonical form is a mapping from one-site or two-site locations to
         native fermionic Symmray arrays. It is checked for symmetry, physical
         sectors, support rank, and backend consistency before being bundled in
         a :class:`SymHamiltonian`. Passing lattice edges remains a compact
-        convenience, using this helper's model parameters unless explicit
-        coupling overrides are supplied.
+        convenience, but requires its couplings explicitly; no coupling is
+        stored on :class:`Fermion`.
         """
         to_backend = self.to_backend if to_backend is None else to_backend
         if isinstance(terms_or_edges, Mapping):
-            if any(value is not None for value in (t, U, V, mu)):
+            if any(value is not None for value in (t, U)) or V != 0 or mu != 0:
                 raise TypeError(
                     "When passing explicit terms, put every coupling in the "
                     "native arrays rather than passing t/U/V/mu again."
@@ -9139,10 +9130,12 @@ class Fermion:
                 parameters={},
             )
 
-        t = self.t if t is None else t
-        U = self.U if U is None else U
-        V = self.V if V is None else V
-        mu = self.mu if mu is None else mu
+        if t is None:
+            raise TypeError("hamiltonian(edges, ...) requires explicit t=... .")
+        if self.spinful and U is None:
+            raise TypeError(
+                "hamiltonian(edges, ...) requires explicit U=... for spinful fermions."
+            )
         params = {"t": t, "V": V, "mu": mu}
         if self.spinful:
             params["U"] = U

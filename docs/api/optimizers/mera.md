@@ -132,16 +132,18 @@ from pepsy.optimizers.mera import QMeraGeometry
 fermion = pepsy.Fermion(
     spinful=True,
     symmetry="U1U1",
-    t=1.0,
-    U=8.0,
 )
 edges = ((0, 1), (1, 2))
 
-site_terms = fermion.local_terms(edges)
-gate_stream = fermion.gate_stream(edges, dt=0.01, sites=range(3))
+site_terms = fermion.local_terms(edges, t=1.0, U=8.0)
+gate_stream = fermion.gate_stream(
+    edges, dt=0.01, sites=range(3), t=1.0, U=8.0
+)
 
 geometry = QMeraGeometry(shape=3, site_modes=("up", "down"))
-qmera_terms = fermion.local_terms(geometry, layout="qmera")
+qmera_terms = fermion.local_terms(
+    geometry, layout="qmera", t=1.0, U=8.0
+)
 ```
 
 For the normal spinful Hubbard workflow, let the builder own the mode
@@ -163,15 +165,16 @@ builder = QMeraBuilder(
     product_state_factory=backend.product_state,
 )
 geometry = builder.geometry                 # inferred from the model
-terms = builder.fermion_terms()             # inferred from the model
+terms = builder.fermion_terms(t=1.0, U=8.0)  # explicit physical couplings
 optimizer = builder.fermion_parametric_optimizer(
     energy_per_site=False,
+    term_params={"t": 1.0, "U": 8.0},
 )
 ```
 
 Passing `site_modes` or `mode_order` remains useful when testing a custom
 register convention. A site-layout object such as
-`fermion.hamiltonian(edges)` is still a valid native MPS/PEPS Hamiltonian, but
+`fermion.hamiltonian(edges, t=..., U=...)` is still a valid native MPS/PEPS Hamiltonian, but
 it does not by itself specify qMERA's explicit mode registers or RG schedule;
 use `fermion.local_terms(geometry, layout="qmera")` or the builder shortcut
 above for that conversion.

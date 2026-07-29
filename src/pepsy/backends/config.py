@@ -435,7 +435,7 @@ def reg_complex_svd_jax():
 
 
 def reg_rel_svd_jax():
-    """Register JAX SVD with Pepsy's custom VJP rule in autoray."""
+    """Register JAX SVD with Pepsy's truncation-safe VJP rule in autoray."""
     try:
         __import__("jax")
     except ImportError as exc:  # pragma: no cover - exercised in no-jax CI
@@ -450,7 +450,7 @@ def reg_rel_svd_jax():
 
 
 def reg_real_svd_jax():
-    """Register JAX SVD custom-VJP rule for real-valued SVD workloads."""
+    """Register JAX SVD's truncation-safe VJP rule for real workloads."""
     try:
         __import__("jax")
     except ImportError as exc:  # pragma: no cover - exercised in no-jax CI

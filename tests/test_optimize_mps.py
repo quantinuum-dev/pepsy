@@ -153,8 +153,6 @@ def test_mps_optimizer_simple_update_routes_torch_u1u1_long_range_gate():
     fermion = py.Fermion(
         spinful=True,
         symmetry="U1U1",
-        t=1.0,
-        U=8.0,
         dtype="float64",
     )
     state = py.hrs_to_mps(
@@ -168,7 +166,7 @@ def test_mps_optimizer_simple_update_routes_torch_u1u1_long_range_gate():
     )
     state.apply_to_arrays(backend)
     fermion.to_backend = backend
-    hopping = fermion.hopping_gate(0.001, imaginary=True)
+    hopping = fermion.hopping_gate(0.001, t=1.0, imaginary=True)
 
     optimizer = py.MpsOptimizer(
         state,

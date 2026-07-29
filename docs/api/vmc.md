@@ -42,18 +42,33 @@ Each builder returns a `NetKetPEPSVMC` setup bundle with the NetKet Hilbert
 space, Hamiltonian, sampler, variational state, packed PEPS ansatz, and optional
 SR preconditioner. The bundle exposes `n_sites`, `n_params`,
 `setup.expect_energy()`, and `setup.make_driver(...)` so notebooks can keep the
-main path compact. It also provides a clean class-level workflow with progress
-bars:
+main path compact. Pass `progress=True` to `build_fermion_vmc(...)` to show its
+eight setup phases and inspect `setup.build_timing` for the measured phase costs.
+It also provides a clean class-level workflow with progress bars:
 
 - `setup.warmup(progress=True)` — compile the sampler/amplitude/energy kernels
-  up front behind a small two-stage bar so the optimization ETA is meaningful.
+  up front behind a small staged bar so the optimization ETA is meaningful.
+- `setup.benchmark_amplitude(n_samples=1)` — time a synchronized amplitude
+  batch; `.compile_seconds` and `.amplitude_seconds_per_sample` separate
+  shape-specific JAX compilation from steady-state evaluation.
+- `setup.to_peps()` — reconstruct the current optimized Flax parameter tree as
+  the underlying quimb/Symmray PEPS network for Pepsy-side measurements or
+  persistence.
+- `setup.run(n_iter, ...)` — concise wrapper that warms up and optimizes, while
+  returning separate warmup, optimization, total, and per-step timings.
 - `setup.optimize(n_iter, *, learning_rate=..., driver="vmc"|"vmc_sr",
   energy_shift=..., per_site=..., warmup=True, progress=True)` — run VMC with a
   single live energy progress bar and return a `VMCOptimizeResult`
   (`steps/energies/errors/variances`, `.shifted_energies`, and `.plot(...)`).
-- `setup.measure(observables=None)` — evaluate observables (a single operator,
-  a `{name: operator}` mapping, or those stored on the setup) and return their
-  `nk.stats.Stats`.
+- `setup.sample(sampling=None, progress=True)` — collect a retained batch and
+  report chains, burn-in, sweep size, acceptance rate, and elapsed time in
+  `VMCSamples.diagnostics`.
+- `setup.measure_samples(samples, observables=None)` — evaluate one operator
+  or a `{name: operator}` mapping on exactly that retained NetKet batch, with
+  no additional sampling. A mapping value may be
+  `NetKetEtaPairObservable(...)`; it is compiled from the PEPS lattice only
+  after the shared sample cache is selected. `setup.measure(...,
+  samples=samples)` is the equivalent convenience form.
 
 For fermions, the supported JIT configuration intentionally combines a flat
 `Z2` Symmray PEPS ansatz with NetKet's fixed `(N_up, N_down)` `U1U1`
@@ -158,8 +173,11 @@ The shared contracts do not import Torch, JAX, Flax, or NetKet. Each adapter
 compiles the same symbolic terms into its own connection/operator
 representation and preserves its native sampling and contraction strategy.
 `ContractionConfig`, `SamplingConfig`, and `OptimizationConfig` use the same
-validated option names, including an explicit `n_samples_per_chain`
-convention.
+validated option names. The canonical sampling spelling follows NetKet:
+`n_samples` (total), `n_chains`, `n_discard_per_chain`, and `sweep_size`.
+The older `n_samples_per_chain`, `burn_in`, and `thin` spellings remain
+compatibility aliases; `n_samples` must be divisible by `n_chains` so the
+chain-preserving result has equal chain lengths.
 
 `compile_operator_sum_torch(...)` lowers the common terms to Torch connection
 tables (using a supplied `Fermion` object for graded symbolic factors), while
@@ -173,7 +191,12 @@ The shared runtime settings are consumed directly by both façades:
 ```python
 from pepsy.vmc import OptimizationConfig, SamplingConfig
 
-sampling = SamplingConfig(n_samples_per_chain=512, n_chains=32, burn_in=64)
+sampling = SamplingConfig(
+    n_samples=16_384,
+    n_chains=32,
+    n_discard_per_chain=64,
+    sweep_size=2,
+)
 torch_samples = torch_vmc.sample(sampling)
 netket_samples = netket_vmc.sample()  # its sampler was built from MCState
 
@@ -347,12 +370,74 @@ larger `chi` for production accuracy.
 The driver also deduplicates identical connected targets across current
 walkers during `local_energies`, `estimate_observable(s)`, and `step`; this is
 especially useful for serial U1/U1U1 boundary contractions.
+For native U1/U1U1 CPU measurements, pass `boundary_workers > 1` to evaluate
+independent cached boundary-window closures concurrently. This is restricted
+to no-grad inference and defaults to `1` to avoid accidental BLAS
+oversubscription; keep it at `1` when using CUDA or a shared cotengra optimizer
+that is not thread-safe. The connected profile reports `num_requests`,
+`num_reused`, `num_parallel`, and `num_fallback` for the current measurement.
 For no-grad calls on that serial boundary route, completed amplitudes are also
 cached by configuration and the current torch-parameter version, so repeated
 walkers can reuse the full boundary contraction. Inspect
 `model.last_amplitude_cache_stats` (or the `profile["cache"]["amplitude"]`
 entry); the cache is invalidated automatically after parameter updates and is
 never used for gradient-enabled or custom-parameter calls.
+
+### Native Torch throughput probes and rank-sharded sampling
+
+Use `benchmark_torch_amplitudes` (or
+`TorchVMCDriver.benchmark_amplitudes`) with an existing configuration batch to
+compare the supported amplitude batching and chunk sizes without drawing more
+Markov samples. It moves the batch to the amplitude model's device, uses
+`torch.no_grad()`, synchronizes CUDA timing, and verifies each candidate
+against the first result by default. Boundary-amplitude cache hits are disabled
+by default so the result reflects contraction throughput; pass
+`include_cache=True` to time the cache-aware serving path. The returned
+`TorchAmplitudeBenchmark.executed_batching` is the route actually selected,
+which makes an unavailable `"vmap"` request visible as `"serial"`.
+
+```python
+timing = vmc.benchmark_amplitudes(
+    samples.configs,
+    chunk_sizes=(None, 32, 64),
+    amplitude_batchings=("serial", "auto", "vmap"),
+    repeats=5,
+)
+print(timing.best)
+```
+
+After the application initializes an optional `torch.distributed` process
+group, `TorchVMCDriver.sample(..., distributed=True)` and the corresponding
+`TorchFermionVMC.sample`, `run_measurement`, and measurement-mode `run` accept
+a rank-sharded native Markov calculation. `SamplingConfig.n_chains` is the
+global count and must be at least the world size; it is split deterministically
+among ranks. Set `seed` or `sampler_seed` in that configuration so each rank
+receives a distinct reproducible stream. Each rank retains only its local PEPS
+configurations and amplitudes, while unweighted observable moments, acceptance
+counts, and rank-local effective sample sizes are reduced to global estimates.
+
+```python
+# Launch this script with torchrun after selecting each rank's CUDA device.
+torch.distributed.init_process_group("nccl")
+samples = vmc.sample(
+    sampling=pvmc.SamplingConfig(
+        n_samples=4096,
+        n_chains=128,  # global count
+        sampler_seed=7,
+    ),
+    distributed=True,
+)
+energy = vmc.measure(samples)  # detects the distributed sample metadata
+print(energy.n_samples, energy.distributed.global_n_chains)
+```
+
+`TorchMCMCSamples.distributed` and `TorchVMCEnergyEstimate.distributed` record
+the local and global counts; `TorchMCMCSamples.to_common()` preserves the same
+metadata in `VMCSamples.diagnostics["distributed"]`. Distributed measurement
+does not all-gather histories, so global R-hat is intentionally unavailable.
+It currently supports only unweighted native Markov samples—not external
+proposal/importance weights or multi-rank SR optimization.
+
 After measuring an observable, `result.chain_diagnostics` reports `r_hat`, the
 integrated autocorrelation time, and an effective sample size when there are
 at least two chains and two retained samples per chain. In that case,
@@ -432,6 +517,7 @@ model = pvmc.TorchPEPSBoundaryAmplitude(
     chi=64,
     cutoff=1e-10,
     dtype=torch.float64,
+    boundary_workers=4,  # CPU inference only; benchmark this on your machine.
 )
 ```
 
@@ -640,16 +726,21 @@ observable. `estimate_energy(...)` remains as a compatibility alias.
 
 For compatibility with an existing lower-level sweep loop, coordinate-labelled
 PEPS can still initialize `TorchFermionVMC` in the constructor. New code
-should prefer the first-run recipe below instead. Pass `fermion` to generate
-the default Hamiltonian, or omit it when supplying explicit `terms`:
+should prefer the first-run recipe below instead. Supply an explicit native
+Hamiltonian (or its terms) because `Fermion` intentionally stores no model
+couplings:
 
 ```python
 from pepsy import Fermion
 
-fermion = Fermion(spinful=True, symmetry="U1U1", t=t, U=U)
+fermion = Fermion(spinful=True, symmetry="U1U1")
+edges = ((0, 1), (1, 2), (2, 3))
+terms = {edge: -t * fermion.hopping_operator() for edge in edges}
+terms |= {site: fermion.onsite_term(site, U=U) for site in range(4)}
 vmc = pvmc.TorchFermionVMC(
     peps,
-    fermion,
+    fermion=fermion,
+    terms=terms,
     n_walkers=128,
     contraction="boundary",  # or "exact" / "ctmrg" / "hotrg"
     chi=32,  # required for an approximate contraction
@@ -667,11 +758,12 @@ For a native fermionic PEPS measurement, construct `TorchFermionVMC` from the
 state and native Fermion terms only. The first `sample` (or `warmup`) owns both
 the chain recipe and PEPS contraction recipe:
 
-1. `SamplingConfig` owns the number of chains, retained samples, burn-in,
-   thinning, and RNG seeds. In the native Torch sampler, `burn_in` counts
-   discarded thinning intervals, so the `Metropolis` total is
-   `(burn_in + n_samples_per_chain) * thin` batched sweeps; every batched
-   sweep advances all chains once.
+1. `SamplingConfig` owns the total retained samples, number of chains,
+   per-chain discard count, sweep spacing, and RNG seeds. The canonical
+   keywords are `n_samples`, `n_chains`, `n_discard_per_chain`, and
+   `sweep_size`. In the native Torch sampler, the Metropolis total is
+   `(n_discard_per_chain + n_samples_per_chain) * sweep_size` batched
+   sweeps; every batched sweep advances all chains once.
 2. `contraction_opts` is a single mapping with `method`, `chi`, `cutoff`, and
    any backend options such as `mode`. It is consumed when the first operation builds
    the amplitude model, then remains fixed with the Markov state.
@@ -681,10 +773,10 @@ the chain recipe and PEPS contraction recipe:
 
 ```python
 sampling = pvmc.SamplingConfig(
-    n_samples_per_chain=256,
+    n_samples=8192,
     n_chains=32,
-    burn_in=64,
-    thin=2,
+    n_discard_per_chain=64,
+    sweep_size=2,
     seed=7,
 )
 contraction_opts = {
@@ -1031,26 +1123,48 @@ driver = setup.make_driver(
 ### General fermion models and observables
 
 `build_fermion_vmc(...)` lifts the Fermi-Hubbard specialization to any spinful
-fermion model. Pass a `pepsy.Fermion` (its hopping `t`, on-site `U`,
-nearest-neighbor density `V`, and chemical potential `mu` are turned into a
-NetKet fermion operator over the lattice edges), an explicit list of symbolic
-terms, or a ready NetKet operator. Optional observables are stored on the setup
-and evaluated with `setup.measure(...)`.
+fermion model. Pass a `pepsy.Fermion` together with an explicit native
+Hamiltonian/term mapping, an explicit list of symbolic terms, or a ready
+NetKet operator. `Fermion` owns only local symmetry and backend conventions;
+the hopping `t`, on-site `U`, density `V`, and chemical potential `mu` live in
+the explicit term arrays. Optional observables are stored on the setup and
+evaluated with `setup.measure(...)`.
 
 Like `TorchFermionVMC`, it can also infer the lattice geometry directly from a
 native Pepsy Hamiltonian. Pass the `SymHamiltonian` from
 `fermion.hamiltonian(...)` as `hamiltonian=`, or its coordinate-keyed
 `.terms` mapping as `terms=`, together with `fermion=`; the builder reads the
-integer edges and periodic axes (`pbc`) from those terms and rebuilds the
-matching NetKet Hamiltonian. Explicit `edges` / `graph` / `pbc` still take
-precedence.
+integer edges and periodic axes (`pbc`) from those terms and compiles the
+supplied native local operators to NetKet. Explicit `edges` / `graph` / `pbc`
+still take precedence.
+
+`SamplingConfig(n_samples=..., n_chains=..., n_discard_per_chain=...,
+sweep_size=..., chunk_size=...)` controls retained samples, chains, per-chain
+discard, sweep spacing, and batching. NetKet's Metropolis sampler also performs
+`sweep_size` proposals
+between retained samples; pass `sampler_sweep_size=...` to make that cost
+explicit (the NetKet default is the Hilbert-space size).
+
+The generic fermion builder defaults to `conserving=False`, which constructs
+the exact ordinary NetKet fermion operator without a first-use conversion
+compile. Set `conserving="auto"` when the specialized conserving operator is
+worth the one-time conversion cost for a long production run.
+
+For a compact construction call, put these numerical settings in
+`NetKetVMCConfig(...)` and pass it as `config=`. Boundary/PEPS contraction
+settings belong there because changing `chi` changes the compiled amplitude
+model; retained sample counts and burn-in can instead be overridden at
+`setup.sample(...)` time.
 
 ```python
 import pepsy as py
 import pepsy.vmc as pvmc
 
-fermion = py.Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0, V=0.5)
-ham = fermion.hamiltonian(terms)     # native SymHamiltonian over the lattice
+fermion = py.Fermion(spinful=True, symmetry="U1U1")
+terms = {edge: -1.0 * fermion.hopping_operator() for edge in edges}
+terms |= {site: fermion.onsite_term(site, U=8.0) for site in sites}
+terms |= {edge: 0.5 * fermion.density_operator() for edge in edges}
+ham = fermion.hamiltonian(terms)     # authoritative native Hamiltonian
 
 # Clean API: infer edges + PBC from the native terms, build the NetKet model.
 setup = pvmc.build_fermion_vmc(
@@ -1060,10 +1174,14 @@ setup = pvmc.build_fermion_vmc(
 ```
 
 ```python
-fermion = py.Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0, V=0.5)
+fermion = py.Fermion(spinful=True, symmetry="U1U1")
+terms = {edge: -1.0 * fermion.hopping_operator() for edge in edges}
+terms |= {site: fermion.onsite_term(site, U=8.0) for site in sites}
+ham = fermion.hamiltonian(terms)
 setup = pvmc.build_fermion_vmc(
     peps,
     fermion=fermion,
+    hamiltonian=ham,
     Lx=4,
     Ly=4,
     contraction="ctmrg",
@@ -1083,7 +1201,23 @@ result = setup.optimize(
     per_site=setup.n_sites,
 )
 result.plot(per_site=setup.n_sites)
-stats = setup.measure()             # {name: nk.stats.Stats}
+
+# Sample once, then measure each operator on those exact Markov chains.
+samples = setup.sample()
+stats = setup.measure_samples(
+    samples,
+    {
+        "energy": setup.hamiltonian,
+        # The coordinate lattice is inferred from setup.ansatz.orbital_sites.
+        "eta_pair": pvmc.NetKetEtaPairObservable(
+            1,
+            0,
+            periodic=True,
+            staggered=True,
+        ),
+        **pvmc.standard_fermion_observables(setup.hilbert),
+    },
+)  # {name: nk.stats.Stats}
 ```
 
 Two lower-level helpers back this path:
@@ -1094,13 +1228,17 @@ Two lower-level helpers back this path:
   `sz` in `{+1, -1, None}`. It doubles as a Hamiltonian or an observable, and
   can optionally convert to NetKet's particle-number/spin-conserving operator
   for cheaper local energies.
-- `fermion_model_terms(fermion, edges, *, n_sites=None)` returns the symbolic
-  hopping / Hubbard / density / chemical-potential terms for a spinful
-  `pepsy.Fermion`, so custom models can start from the standard terms and add
-  their own.
+- `fermion_model_terms(fermion, edges, *, t, U, V=0.0, mu=0.0, n_sites=None)`
+  returns symbolic uniform Fermi-Hubbard terms from explicit couplings. For
+  non-uniform models, pass the authoritative native term mapping directly to
+  `build_fermion_vmc(...)`.
 - `standard_fermion_observables(hilbert)` returns common observables
   (`n_up`, `n_down`, `n_total`, `double_occupancy`) as a ready
   `{name: operator}` mapping for `setup.measure(...)`.
+- `NetKetEtaPairObservable(dx, dy, *, periodic=True, staggered=False)` is a
+  declarative eta-pair correlator for `measure_samples(...)`. Its zero-offset
+  form is the mean double occupancy; nonzero offsets measure
+  `Delta_i^dag Delta_j + h.c.` and use either periodic or in-bounds pairs.
 the PEPS once, keep `flat=True` Symmray data for JIT-friendly leaves, and
 evaluate many spin-orbital occupation rows with one compiled function. In the
 currently tested Symmray stack this flat path is the `Z2` route; sparse
@@ -1173,8 +1311,15 @@ The approximate contraction choices are Quimb's finite 2D contractions:
 `contraction="hotrg"` calls `contract_hotrg`, `contraction="ctmrg"` calls
 `contract_ctmrg`, and `contraction="boundary"` or `"mps"` calls
 `contract_boundary(mode="mps")`. Pass `contraction_opts={...}` for lower-level
-Quimb options such as `sequence`, `max_separation`, `canonize`, or a non-default
-boundary `mode`.
+Quimb options. These options are method-specific: `sequence`,
+`max_separation`, and `canonize` are boundary-MPS controls, while CTMRG's
+stable default is `mode="projector"`.
+
+For flat fermionic Symmray tensors under JAX, `max_separation=0` is accepted
+but has a guarded compatibility fallback to `1` if Quimb reaches its upstream
+empty-boundary-axis or block-matmul path. This applies to both boundary-MPS
+and CTMRG. The requested `sequence`, `chi`, and `canonize` settings remain
+active; dense/non-Symmray contractions are not modified.
 
 For larger lattices use an approximate contraction with `chi=...`, and treat
 `chi`, `chunk_size`, `chunk_size_bwd`, `n_samples`, and the SR setting as

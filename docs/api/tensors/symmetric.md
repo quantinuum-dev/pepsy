@@ -66,7 +66,7 @@ model and returns the underlying native fermionic MPS directly; callers do not
 need to instantiate ``SymMPS``:
 
 ```python
-fh = py.Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0)
+fh = py.Fermion(spinful=True, symmetry="U1U1")
 psi = py.ps_to_mps(8, fermion=fh, seed=7)
 
 # Override the product-state charge pattern when needed.
@@ -145,45 +145,39 @@ psi = py.hrs_to_peps(
 )
 ```
 
-The direct method uses Symmray's ``PEPS_fermionic_rand`` constructor and
-normalizes the returned PEPS. A unitary PEPS-growth method is not implemented
-yet. Both constructors return the underlying PEPS with native fermionic
-Symmray tensors; use ``SymPEPS`` only when wrapper methods or stored
-Hamiltonian metadata are needed.
+The direct method uses Symmray's ``PEPS_fermionic_rand`` constructor. It skips
+global normalization by default, avoiding an expensive CPU boundary-MPS
+contraction; this is safe for NetKet VMC because a global wavefunction scalar
+cancels from sampling and local-energy ratios. Pass ``normalize=True`` only
+when a globally normalized PEPS is explicitly required. A unitary PEPS-growth
+method is not implemented yet. Both constructors return the underlying PEPS
+with native fermionic Symmray tensors; use ``SymPEPS`` only when wrapper
+methods or stored Hamiltonian metadata are needed.
 
 ## Unified native fermion helper
 
 ``Fermion`` is the model-facing helper for both one-mode spinless fermions
-and four-state spinful Hubbard sites. ``spinful`` selects the local space;
+and four-state spinful Hubbard sites. It owns the local space, symmetry, and
+optional backend conversion; physical couplings are passed explicitly when
+constructing a term, gate, or stream. ``spinful`` selects the local space;
 ``symmetry`` selects the conserved charge group. Spinless helpers support
 ``U1`` and ``Z2``; spinful helpers support ``U1``, ``Z2``, ``U1U1``, and
 ``Z2Z2``.
 
 ```python
-spinless = py.Fermion(
-    spinful=False,
-    symmetry="U1",
-    t=1.0,
-    V=0.5,
-    mu=0.0,
-)
+spinless = py.Fermion(spinful=False, symmetry="U1")
 
-spinful = py.Fermion(
-    spinful=True,
-    symmetry="U1U1",
-    t=1.0,
-    U=8.0,
-)
+spinful = py.Fermion(spinful=True, symmetry="U1U1")
 
 spinless.operator("number")
 spinful.operator("n_up")
 spinful.hopping_operator(spin="up")
 spinful.interaction_operator()
 spinful.chemical_potential_operator()
-spinful.onsite_gate(dt=0.01, site=0)
-spinful.gate("interaction", dt=0.01)
-spinless.gate_stream(edges, dt=0.01, order=2)
-spinful.local_terms(edges)  # native terms for energy optimization
+spinful.onsite_gate(dt=0.01, site=0, U=8.0)
+spinful.gate("interaction", dt=0.01, U=8.0)
+spinless.gate_stream(edges, dt=0.01, order=2, t=1.0, V=0.5, mu=0.0)
+spinful.local_terms(edges, t=1.0, U=8.0)  # native terms for optimization
 ```
 
 The bare ``*_operator`` methods return explicit native fermionic operators,
@@ -247,7 +241,7 @@ expectation routines:
 edges = tuple(peps.edges)  # ((x0, y0), (x1, y1))
 sites = tuple(peps.sites)
 terms = {edge: -t * fermion.hopping_operator() for edge in edges}
-terms |= {site: fermion.onsite_term(site) for site in sites}
+terms |= {site: fermion.onsite_term(site, U=U, mu=mu) for site in sites}
 ham_peps = fermion.hamiltonian(terms)
 ```
 
@@ -258,7 +252,8 @@ for spinful fermions; spinless helpers provide ``create``, ``annihilate``,
 ``number``, and ``parity``. All returned operators retain the selected
 Symmray Abelian symmetry and fermionic grading.
 
-The site-layout ``local_terms`` mapping is keyed by edges. Its onsite
+The site-layout ``local_terms(edges, t=..., U=..., mu=...)`` mapping is keyed
+by edges. Its onsite
 Hubbard and chemical-potential pieces are divided by each site's coordination
 inside the incident edge tensors, so summing the mapping still includes each
 one-site contribution exactly once. If those pieces should be visibly
@@ -330,19 +325,19 @@ gates.
 ```python
 fermions = py.SpinfulFermion(
     symmetry="U1U1",  # use "U1" to conserve only total particle number
-    t=1.0,
-    U=8.0,
 )
 
 site_charge = fermions.half_filled_site_charge(L=16)
 number_up = fermions.observable("number_up")
 pair_create = fermions.observable("pair_create")
-hamiltonian = fermions.hamiltonian(edges)
+hamiltonian = fermions.hamiltonian(edges, t=1.0, U=8.0)
 
 # A symmetric, edge-coloured second-order step.  Each colour contains
 # vertex-disjoint hopping bonds; forward then reverse colours make the hopping
 # product formula second order as well.
-gates = fermions.strang_gate_stream(edges, dt=0.01, sites=range(16))
+gates = fermions.strang_gate_stream(
+    edges, dt=0.01, sites=range(16), t=1.0, U=8.0
+)
 ```
 
 ``py.SymmFermions`` is the companion namespace for future symmetric-fermion
@@ -371,7 +366,7 @@ edges = setup.edges
 occupations = setup.occupations
 
 terms = {edge: -t * fermion.hopping_operator() for edge in edges}
-terms |= {site: fermion.onsite_term(site) for site in sites}
+terms |= {site: fermion.onsite_term(site, U=U, mu=mu) for site in sites}
 ham = fermion.hamiltonian(terms)
 
 gate_stream = fermion.strang_gate_stream(
@@ -379,6 +374,9 @@ gate_stream = fermion.strang_gate_stream(
     dt=0.01,
     sites=sites,
     imaginary=True,
+    t=t,
+    U=U,
+    mu=mu,
 )
 ```
 

@@ -57,11 +57,10 @@ def main():
     )
     schedule = builder.build_schedule()
 
-    # The Fermion helper supplies the onsite U and chemical-potential terms;
-    # the qMERA unitary above supplies the native number-conserving hopping
-    # layer. Keeping these roles separate makes the U1U1 convention explicit.
-    fermion = py.Fermion(spinful=True, symmetry="U1U1", t=0.2, U=4.0, mu=0.1)
-    terms = builder.fermion_terms(fermion)
+    # Fermion fixes the local U1U1 convention only; physical couplings remain
+    # explicit at term construction so every simulation path sees the same model.
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    terms = builder.fermion_terms(fermion, t=0.2, U=4.0, mu=0.1)
 
     print("RG register sizes:", [len(layer.input_sites) for layer in schedule.layers], "->", len(schedule.top_sites))
     print("first-layer isometry blocks:", len(schedule.layers[0].isometry_blocks))

@@ -64,6 +64,25 @@ class TorchSampleProvenance:
     contraction_signature: tuple[Any, Any, Any, Any]
 
 
+@dataclass(frozen=True)
+class TorchDistributedMetadata:
+    """Rank-sharding information attached to local distributed VMC results.
+
+    PEPS tensors and configurations remain rank-local. Unweighted measurement
+    estimates reduce moments and rank-local effective sample sizes, but global
+    chain diagnostics (notably R-hat) are intentionally unavailable without an
+    all-gather of Markov histories.
+    """
+
+    rank: int
+    world_size: int
+    backend: str
+    global_n_chains: int
+    local_n_chains: int
+    global_n_samples: int
+    local_n_samples: int
+
+
 def _torch_sample_provenance(model):
     """Capture the mutable model state relevant to stored MCMC amplitudes."""
     parameters = getattr(model, "parameters", None)
@@ -117,6 +136,7 @@ class TorchMCMCSamples:
     log_abs_amplitudes: Any = None
     proposal_stats: Any = None
     provenance: TorchSampleProvenance | None = None
+    distributed: TorchDistributedMetadata | None = None
 
     def diagnostics(self, values=None, *, max_lag=None, split_rhat=False):
         """Compute chain diagnostics for a scalar observable.
@@ -139,6 +159,25 @@ class TorchMCMCSamples:
         """Convert to the backend-neutral :class:`pepsy.vmc.VMCSamples`."""
         from ..api import VMCSamples
 
+        diagnostics = {
+            "n_samples": self.n_samples,
+            "n_discard_per_chain": self.n_discard_per_chain,
+            "sweep_size": self.sweep_size,
+            "n_proposed": self.n_proposed,
+            "n_accepted": self.n_accepted,
+            "elapsed_seconds": self.elapsed_seconds,
+            "samples_per_second": self.samples_per_second,
+        }
+        if self.distributed is not None:
+            diagnostics["distributed"] = {
+                "rank": self.distributed.rank,
+                "world_size": self.distributed.world_size,
+                "backend": self.distributed.backend,
+                "global_n_chains": self.distributed.global_n_chains,
+                "local_n_chains": self.distributed.local_n_chains,
+                "global_n_samples": self.distributed.global_n_samples,
+                "local_n_samples": self.distributed.local_n_samples,
+            }
         return VMCSamples(
             configs=self.configs,
             amplitudes=self.amplitudes,
@@ -146,15 +185,7 @@ class TorchMCMCSamples:
             n_samples_per_chain=self.n_samples_per_chain,
             n_chains=self.n_chains,
             acceptance_rate=self.acceptance_rate,
-            diagnostics={
-                "n_samples": self.n_samples,
-                "n_discard_per_chain": self.n_discard_per_chain,
-                "sweep_size": self.sweep_size,
-                "n_proposed": self.n_proposed,
-                "n_accepted": self.n_accepted,
-                "elapsed_seconds": self.elapsed_seconds,
-                "samples_per_second": self.samples_per_second,
-            },
+            diagnostics=diagnostics,
             native=self,
         )
 
@@ -364,6 +395,7 @@ class TorchVMCEnergyEstimate:
     effective_sample_size: Any = None
     importance_weights: Any = None
     proposal_log_probs: Any = None
+    distributed: TorchDistributedMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -504,15 +536,20 @@ def _connected_target_progress(model):
     if not stats:
         return {}
     fields = {}
+    requests = int(stats.get("num_requests", 0))
     diagonal = int(stats.get("num_diagonal", 0))
     reused = int(stats.get("num_reused", 0))
     batched = int(stats.get("num_batched", 0))
+    parallel = int(stats.get("num_parallel", 0))
     fallback = int(stats.get("num_fallback", 0))
     if diagonal or reused or batched or fallback:
         fields["targets"] = (
-            f"diag={diagonal}, env={reused}, "
+            (f"req={requests}, " if requests else "")
+            + f"diag={diagonal}, env={reused}, "
             f"batch={batched}, direct={fallback}"
         )
+        if parallel:
+            fields["target-workers"] = parallel
     environment_hits = int(stats.get("num_environment_cache_hits", 0))
     environment_builds = int(stats.get("num_environment_builds", 0))
     if environment_hits or environment_builds:
@@ -541,9 +578,22 @@ def _set_vmc_progress_postfix(
     burn_in=None,
     thin=None,
     phase=None,
+    progress_postfix="full",
 ):
     """Update a Metropolis/VMC bar without affecting numerical work."""
     if bar is None:
+        return
+    if progress_postfix not in {"full", "acceptance"}:
+        raise ValueError(
+            "progress_postfix must be 'full' or 'acceptance'."
+        )
+    if progress_postfix == "acceptance":
+        postfix = {}
+        if result is not None:
+            postfix["accept"] = f"{result.acceptance_rate:.3f}"
+        set_postfix = getattr(bar, "set_postfix", None)
+        if callable(set_postfix):
+            set_postfix(postfix)
         return
     postfix = _model_progress_fields(model)
     if n_chains is not None:
@@ -640,6 +690,7 @@ def _accumulate_cache_profile(total, snapshot):
 
 __all__ = [
     "TorchChainDiagnostics",
+    "TorchDistributedMetadata",
     "TorchImportanceSamples",
     "TorchMCMCSamples",
     "TorchMetropolisResult",

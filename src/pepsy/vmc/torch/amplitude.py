@@ -848,6 +848,11 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
     quimb PEPS using boundary-MPS environments around each parent walker. For a
     local update, only the touched row or column window is recontracted.
 
+    ``boundary_workers`` optionally evaluates independent cached-window
+    closures concurrently during no-grad CPU measurements. It defaults to one;
+    use a small value such as two or four only after checking for BLAS and
+    contraction-optimizer oversubscription.
+
     Unsupported PEPS geometries or non-boundary contractions fall back to the
     base implementation.
     """
@@ -869,6 +874,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         boundary_cache_size=128,
         proposal_batching="auto",
         proposal_vmap_min_batch=8,
+        boundary_workers=1,
     ):
         super().__init__(
             peps,
@@ -894,6 +900,14 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         self.proposal_vmap_min_batch = _check_positive_int(
             "proposal_vmap_min_batch",
             proposal_vmap_min_batch,
+        )
+        # Native U1/U1U1 boundary contractions are not reliably vmappable.
+        # Independent cached-window closures can nevertheless be evaluated in
+        # parallel during no-grad CPU measurements. Keep this opt-in so the
+        # default remains deterministic and avoids BLAS/thread oversubscription.
+        self.boundary_workers = _check_positive_int(
+            "boundary_workers",
+            boundary_workers,
         )
         self._proposal_vmap_enabled = callable(
             getattr(_require_torch(), "vmap", None)
@@ -1506,11 +1520,16 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         torch = _require_torch()
         configs = _as_long_matrix(configs)
         amplitudes = torch.as_tensor(amplitudes, device=configs.device)
+        # A previous parent/fallback amplitude call must not be mistaken for
+        # the cache statistics of this connected-target measurement.
+        self.last_amplitude_cache_stats = None
         if connections.configs.numel() == 0:
             self.last_connected_reuse_stats = {
+                "num_requests": 0,
                 "num_diagonal": 0,
                 "num_reused": 0,
                 "num_batched": 0,
+                "num_parallel": 0,
                 "num_groups": 0,
                 "num_grouped_connections": 0,
                 "num_strip_cache_hits": 0,
@@ -1534,9 +1553,11 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 reuse_diagonal=reuse_diagonal,
             )
             self.last_connected_reuse_stats = {
+                "num_requests": int(connections.configs.shape[0]),
                 "num_diagonal": num_diagonal,
                 "num_reused": 0,
                 "num_batched": 0,
+                "num_parallel": 0,
                 "num_groups": 0,
                 "num_grouped_connections": 0,
                 "num_strip_cache_hits": 0,
@@ -1574,9 +1595,11 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             finally:
                 self._vmap_forward_enabled = previous_vmap_state
             self.last_connected_reuse_stats = {
+                "num_requests": int(connections.configs.shape[0]),
                 "num_diagonal": int(diag.sum().item()),
                 "num_reused": 0,
                 "num_batched": int(offdiag.numel()),
+                "num_parallel": 0,
                 "num_groups": 0,
                 "num_grouped_connections": 0,
                 "num_strip_cache_hits": 0,
@@ -1598,9 +1621,11 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         tn = self._unpack_tn()
         reference = self._reference_tensor()
         stats = {
+            "num_requests": int(connections.configs.shape[0]),
             "num_diagonal": int(diag.sum().item()),
             "num_reused": 0,
             "num_batched": 0,
+            "num_parallel": 0,
             "num_groups": 0,
             "num_grouped_connections": 0,
             "num_environment_cache_hits": 0,
@@ -1616,6 +1641,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
         # PBC edges. They can then reuse one environment pair and one selected
         # parent-strip template while only their changed projectors differ.
         groups = {}
+        fallback_indices = []
         for conn_idx_tensor in offdiag:
             conn_idx = int(conn_idx_tensor)
             parent_idx = int(connections.batch_ids[conn_idx].item())
@@ -1623,10 +1649,7 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             target_config = connections.configs[conn_idx]
             windows = self._changed_axis_windows(parent_config, target_config)
             if not windows:
-                out[conn_idx] = self._contract_value(
-                    self._select_config(tn, target_config),
-                    reference,
-                )
+                fallback_indices.append(conn_idx)
                 stats["num_fallback"] += 1
                 continue
             axis, indices = windows[0]
@@ -1686,6 +1709,11 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
             contexts[cache_key] = (envs, strip_tn)
             return contexts[cache_key]
 
+        # Build all primary contexts before dispatching work. This keeps cache
+        # mutation and boundary-environment construction on the caller thread;
+        # only independent scalar closures are allowed to run concurrently.
+        primary_jobs = []
+        alternative_jobs = []
         for (parent_idx, axis, indices), entries in groups.items():
             parent_config = configs[parent_idx]
             primary_context = get_context(
@@ -1695,67 +1723,144 @@ class TorchPEPSBoundaryAmplitude(TorchPEPSAmplitude):
                 indices,
             )
             for conn_idx, windows in entries:
-                target_config = connections.configs[conn_idx]
-                value_found = False
-                if primary_context is not None:
-                    envs, strip_tn = primary_context
-                    try:
-                        out[conn_idx] = self._contract_cached_axis_window(
-                            tn,
-                            parent_config,
-                            target_config,
-                            axis,
-                            indices,
-                            envs,
-                            strip_tn,
-                            reference,
-                        )
-                    except Exception:  # pragma: no cover - upstream exceptions vary
-                        pass
-                    else:
-                        value_found = True
+                job = (
+                    conn_idx,
+                    parent_idx,
+                    axis,
+                    indices,
+                    windows,
+                    primary_context,
+                )
+                if primary_context is None:
+                    alternative_jobs.append(job)
+                else:
+                    primary_jobs.append(job)
+
+        def contract_primary(job):
+            conn_idx, parent_idx, axis, indices, windows, context = job
+            parent_config = configs[parent_idx]
+            target_config = connections.configs[conn_idx]
+            envs, strip_tn = context
+            try:
+                value = self._contract_cached_axis_window(
+                    tn,
+                    parent_config,
+                    target_config,
+                    axis,
+                    indices,
+                    envs,
+                    strip_tn,
+                    reference,
+                )
+            except Exception:  # pragma: no cover - upstream exceptions vary
+                return job, None, False
+            return job, value, True
+
+        def contract_primary_no_grad(job):
+            # Torch's grad mode is thread-local; explicitly carry the
+            # measurement mode into worker threads.
+            with torch.no_grad():
+                return contract_primary(job)
+
+        reference_device = getattr(
+            getattr(reference, "device", None),
+            "type",
+            None,
+        )
+        boundary_workers = _check_positive_int(
+            "boundary_workers",
+            getattr(self, "boundary_workers", 1),
+        )
+        use_parallel = (
+            boundary_workers > 1
+            and len(primary_jobs) > 1
+            and not torch.is_grad_enabled()
+            and reference_device in (None, "cpu")
+        )
+        if use_parallel:
+            # Threading is deliberately restricted to no-grad CPU inference.
+            # The PEPS parameters and cached environments remain shared, while
+            # every worker contracts into its own temporary TensorNetwork.
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=boundary_workers) as executor:
+                primary_results = executor.map(
+                    contract_primary_no_grad,
+                    primary_jobs,
+                )
+                for job, value, value_found in primary_results:
+                    if value_found:
+                        conn_idx = job[0]
+                        out[conn_idx] = value
                         stats["num_reused"] += 1
-
+                    else:
+                        alternative_jobs.append(job)
+            stats["num_parallel"] = len(primary_jobs)
+        else:
+            for job in primary_jobs:
+                job, value, value_found = contract_primary(job)
                 if value_found:
-                    continue
+                    conn_idx = job[0]
+                    out[conn_idx] = value
+                    stats["num_reused"] += 1
+                else:
+                    alternative_jobs.append(job)
 
-                for window_index, (alt_axis, alt_indices) in enumerate(
-                    windows[1:],
-                    start=1,
-                ):
-                    context = get_context(
-                        parent_idx,
+        # Alternative-axis retries stay serial because they may create new
+        # cached contexts. They are uncommon for ordinary nearest-neighbor
+        # updates and retain the existing robustness path.
+        for conn_idx, parent_idx, _axis, _indices, windows, _context in alternative_jobs:
+            parent_config = configs[parent_idx]
+            target_config = connections.configs[conn_idx]
+            value_found = False
+            for alt_axis, alt_indices in windows[1:]:
+                context = get_context(
+                    parent_idx,
+                    parent_config,
+                    alt_axis,
+                    alt_indices,
+                )
+                if context is None:
+                    continue
+                envs, strip_tn = context
+                try:
+                    out[conn_idx] = self._contract_cached_axis_window(
+                        tn,
                         parent_config,
+                        target_config,
                         alt_axis,
                         alt_indices,
-                    )
-                    if context is None:
-                        continue
-                    envs, strip_tn = context
-                    try:
-                        out[conn_idx] = self._contract_cached_axis_window(
-                            tn,
-                            parent_config,
-                            target_config,
-                            alt_axis,
-                            alt_indices,
-                            envs,
-                            strip_tn,
-                            reference,
-                        )
-                    except Exception:  # pragma: no cover - upstream exceptions vary
-                        continue
-                    value_found = True
-                    stats["num_reused"] += 1
-                    stats["num_alternative_axis_reused"] += 1
-                    break
-
-                if not value_found:
-                    out[conn_idx] = self._contract_value(
-                        self._select_config(tn, target_config),
+                        envs,
+                        strip_tn,
                         reference,
                     )
-                    stats["num_fallback"] += 1
+                except Exception:  # pragma: no cover - upstream exceptions vary
+                    continue
+                value_found = True
+                stats["num_reused"] += 1
+                stats["num_alternative_axis_reused"] += 1
+                break
+
+            if not value_found:
+                fallback_indices.append(conn_idx)
+                stats["num_fallback"] += 1
+
+        if fallback_indices:
+            fallback_indices = torch.as_tensor(
+                fallback_indices,
+                dtype=torch.long,
+                device=configs.device,
+            )
+            # Re-enter ``forward`` rather than directly contracting each
+            # target. In inference mode this deduplicates and consults the
+            # persistent boundary-amplitude cache; when vmap is available it
+            # can also evaluate unresolved targets as one fixed batch.
+            # Gradient-enabled calls deliberately retain ``forward``'s normal
+            # uncached differentiable path.
+            out[fallback_indices] = self.forward(
+                connections.configs[fallback_indices],
+                chunk_size=chunk_size,
+            ).to(dtype=out.dtype, device=out.device)
 
         self.last_connected_reuse_stats = stats
         return out

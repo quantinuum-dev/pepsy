@@ -72,3 +72,41 @@ def test_to_float_handles_torch_scalar_if_available():
     value = torch.tensor(3.5 + 1.25j, dtype=torch.complex128, requires_grad=True)
 
     assert pepsy.to_float(value) == pytest.approx(3.5)
+
+
+@pytest.mark.parametrize("complex_input", (False, True))
+def test_jax_svd_vjp_restores_quimb_truncated_cotangents(complex_input):
+    """Fixed-rank contractions must not mix full and truncated SVD axes."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+
+    from pepsy.backends.linalg_jax import jaxsvd_bwd, jaxsvd_fwd
+
+    matrix = jnp.arange(64, dtype=jnp.float32).reshape(8, 8) + jnp.eye(8)
+    if complex_input:
+        matrix = matrix * (1.0 + 0.1j)
+
+    outputs, residual = jaxsvd_fwd(matrix)
+    U, S, Vh = outputs
+    retained = 2
+    u_tangent = 0.25 - 0.1j if complex_input else 0.25
+    vh_tangent = -0.2 + 0.3j if complex_input else -0.2
+    truncated_tangents = (
+        jnp.full_like(U[:, :retained], u_tangent),
+        jnp.full_like(S[:retained], 0.5),
+        jnp.full_like(Vh[:retained, :], vh_tangent),
+    )
+    actual = jaxsvd_bwd(residual, truncated_tangents)[0]
+
+    full_tangents = type(outputs)(
+        jnp.zeros_like(U).at[:, :retained].set(truncated_tangents[0]),
+        jnp.zeros_like(S).at[:retained].set(truncated_tangents[1]),
+        jnp.zeros_like(Vh).at[:retained, :].set(truncated_tangents[2]),
+    )
+    _, pullback = jax.vjp(
+        lambda value: jnp.linalg.svd(value, full_matrices=False),
+        matrix,
+    )
+    expected = pullback(full_tangents)[0]
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)

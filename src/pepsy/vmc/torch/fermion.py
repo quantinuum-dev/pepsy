@@ -19,6 +19,7 @@ from .amplitude import (
     make_torch_peps_amplitude_model,
 )
 from .connections import compile_operator_sum_torch, _normalize_terms_site_labels
+from .distributed import rank_seed, resolve_torch_distributed, shard_chain_count
 from .driver import TorchVMCDriver
 from .metadata import _infer_torch_fermion_metadata
 from .results import TorchVMCMeasurementRun, TorchVMCWarmupResult
@@ -353,6 +354,7 @@ class TorchFermionVMC(TorchVMCDriver):
         log_amplitude_fn=None,
         proposal_batching="auto",
         proposal_vmap_min_batch=8,
+        boundary_workers=1,
         generator=None,
         seed=None,
         amplitude_floor=0.0,
@@ -392,13 +394,10 @@ class TorchFermionVMC(TorchVMCDriver):
 
         from ..api import OperatorSum
         if terms is None:
-            if fermion is None:
-                raise ValueError(
-                    "Pass fermion=... when terms are omitted so the default "
-                    "Hamiltonian can be constructed."
-                )
-            hamiltonian = fermion.hamiltonian(metadata.edges)
-            terms = hamiltonian.terms
+            raise ValueError(
+                "Pass explicit hamiltonian=... or terms=.... Fermion stores "
+                "local symmetry conventions, not t/U/V/mu couplings."
+            )
         elif isinstance(terms, OperatorSum):
             hamiltonian = terms
             terms = compile_operator_sum_torch(
@@ -444,6 +443,10 @@ class TorchFermionVMC(TorchVMCDriver):
             "amplitude_batching": amplitude_batching,
             "proposal_batching": proposal_batching,
             "proposal_vmap_min_batch": proposal_vmap_min_batch,
+            "boundary_workers": _check_positive_int(
+                "boundary_workers",
+                boundary_workers,
+            ),
         }
         self._driver_options = {
             "proposal": proposal,
@@ -467,6 +470,7 @@ class TorchFermionVMC(TorchVMCDriver):
         contraction=None,
         contraction_opts=None,
         n_walkers=None,
+        initialization_seed=None,
     ):
         """Initialize the native driver once, from the measurement recipe.
 
@@ -524,12 +528,12 @@ class TorchFermionVMC(TorchVMCDriver):
                 )
             return
 
-        self._initialize_driver(
-            requested_contraction,
-            n_walkers=requested_n_walkers,
-        )
+        initialization_kwargs = {"n_walkers": requested_n_walkers}
+        if initialization_seed is not None:
+            initialization_kwargs["initialization_seed"] = initialization_seed
+        self._initialize_driver(requested_contraction, **initialization_kwargs)
 
-    def _initialize_driver(self, contraction, *, n_walkers):
+    def _initialize_driver(self, contraction, *, n_walkers, initialization_seed=None):
         """Build the amplitude model and initial walkers for a first run."""
         torch = _require_torch()
         model_kwargs = {
@@ -546,6 +550,7 @@ class TorchFermionVMC(TorchVMCDriver):
                 proposal_vmap_min_batch=self._model_options[
                     "proposal_vmap_min_batch"
                 ],
+                boundary_workers=self._model_options["boundary_workers"],
             )
         model = make_torch_peps_amplitude_model(self.peps, **model_kwargs)
         model_device = _model_device(
@@ -554,12 +559,14 @@ class TorchFermionVMC(TorchVMCDriver):
         )
 
         generator = self._initial_generator
-        if self._initial_seed is not None:
+        if initialization_seed is None:
+            initialization_seed = self._initial_seed
+        if initialization_seed is not None:
             try:
                 generator = torch.Generator(device=model_device)
             except (RuntimeError, TypeError, ValueError):
                 generator = torch.Generator()
-            generator.manual_seed(int(self._initial_seed))
+            generator.manual_seed(int(initialization_seed))
 
         metadata = self.metadata
         configs = self._initial_configs
@@ -719,8 +726,8 @@ class TorchFermionVMC(TorchVMCDriver):
             "n_chains": configured["n_chains"],
             "n_discard_per_chain": configured["n_discard_per_chain"],
             "n_discard": configured["n_discard_per_chain"],
-            "sweep_size": configured["n_thin"],
-            "n_thin": configured["n_thin"],
+            "sweep_size": configured["sweep_size"],
+            "n_thin": configured["sweep_size"],
             "seed": configured["seed"],
             "sampler_seed": configured["sampler_seed"],
         }
@@ -768,6 +775,7 @@ class TorchFermionVMC(TorchVMCDriver):
         contraction=None,
         contraction_opts=None,
         proposal=None,
+        distributed=False,
         **kwargs,
     ):
         """Collect reusable Markov or external-proposal samples.
@@ -785,6 +793,11 @@ class TorchFermionVMC(TorchVMCDriver):
         ``n_samples=...`` for that path.
         """
         if proposal is not None:
+            if distributed:
+                raise NotImplementedError(
+                    "Distributed sampling currently supports native Markov "
+                    "chains, not external proposal/importance samples."
+                )
             if sampling is not None:
                 raise ValueError(
                     "sampling= describes target-Metropolis burn-in and "
@@ -819,13 +832,27 @@ class TorchFermionVMC(TorchVMCDriver):
                 progress=progress,
                 amplitude_floor=amplitude_floor,
             )
+        distributed_runtime, initialization_sampling = self._rank_sharded_sampling_config(
+            sampling,
+            distributed,
+        )
+        initialization_seed = (
+            self._sampling_seed(initialization_sampling)
+            if distributed_runtime is not None
+            else None
+        )
         self._ensure_initialized(
-            sampling=sampling,
+            sampling=initialization_sampling,
             contraction=contraction,
             contraction_opts=contraction_opts,
             n_walkers=kwargs.get("n_chains"),
+            initialization_seed=initialization_seed,
         )
-        return super().sample(sampling=sampling, **kwargs)
+        return super().sample(
+            sampling=sampling,
+            distributed=distributed,
+            **kwargs,
+        )
 
     def check_mc_convergence(
         self,
@@ -851,6 +878,51 @@ class TorchFermionVMC(TorchVMCDriver):
         )
         return super().check_mc_convergence(compiled, **kwargs)
 
+    @staticmethod
+    def _rank_sharded_sampling_config(sampling, distributed):
+        """Return the rank-local recipe required for lazy driver setup."""
+        distributed_runtime = resolve_torch_distributed(distributed)
+        if distributed_runtime is None:
+            return None, sampling
+        if sampling is None:
+            raise ValueError(
+                "distributed sampling requires sampling=SamplingConfig(...) so "
+                "n_chains has an unambiguous global meaning."
+            )
+        from ..api import SamplingConfig
+        if not isinstance(sampling, SamplingConfig):
+            raise TypeError("sampling must be a SamplingConfig or None.")
+        rank_local_seed = (
+            rank_seed(sampling.seed, distributed_runtime)
+            if sampling.seed is not None
+            else None
+        )
+        rank_local_sampler_seed = (
+            rank_seed(sampling.sampler_seed, distributed_runtime)
+            if sampling.sampler_seed is not None
+            else None
+        )
+        return distributed_runtime, replace(
+            sampling,
+            n_chains=shard_chain_count(
+                sampling.n_chains,
+                distributed_runtime,
+            ),
+            seed=rank_local_seed,
+            sampler_seed=rank_local_sampler_seed,
+        )
+
+    @staticmethod
+    def _sampling_seed(sampling):
+        """Return the configured sampler seed, if the recipe has one."""
+        if sampling is None:
+            return None
+        return (
+            sampling.seed
+            if sampling.seed is not None
+            else sampling.sampler_seed
+        )
+
     def measure(
         self,
         samples,
@@ -862,6 +934,7 @@ class TorchFermionVMC(TorchVMCDriver):
         profile=False,
         deduplicate=True,
         progress=False,
+        distributed=None,
         _include_energy=False,
     ):
         """Measure observables from retained samples without resampling.
@@ -876,15 +949,20 @@ class TorchFermionVMC(TorchVMCDriver):
             observables,
             include_energy=_include_energy or observables is None,
         )
+        measure_kwargs = {
+            "observables": compiled,
+            "amplitudes": amplitudes,
+            "weights": weights,
+            "proposal_log_probs": proposal_log_probs,
+            "profile": profile,
+            "deduplicate": deduplicate,
+            "progress": progress,
+        }
+        if distributed is not None:
+            measure_kwargs["distributed"] = distributed
         return self.measure_samples(
             samples,
-            observables=compiled,
-            amplitudes=amplitudes,
-            weights=weights,
-            proposal_log_probs=proposal_log_probs,
-            profile=profile,
-            deduplicate=deduplicate,
-            progress=progress,
+            **measure_kwargs,
         )
 
     def warmup(
@@ -941,6 +1019,7 @@ class TorchFermionVMC(TorchVMCDriver):
         warmup_sweeps=0,
         progress=False,
         profile=False,
+        distributed=False,
     ):
         """Warm up, sample, and estimate PEPS Fermion observables once.
 
@@ -949,23 +1028,39 @@ class TorchFermionVMC(TorchVMCDriver):
         observable estimates.  ``progress=True`` reports optional burn-in,
         MCMC sampling, then the connection/contraction/statistics phases.
         """
+        distributed_runtime, initialization_sampling = self._rank_sharded_sampling_config(
+            sampling,
+            distributed,
+        )
+        initialization_seed = (
+            self._sampling_seed(initialization_sampling)
+            if distributed_runtime is not None
+            else None
+        )
         self._ensure_initialized(
-            sampling=sampling,
+            sampling=initialization_sampling,
             contraction=contraction,
             contraction_opts=contraction_opts,
+            initialization_seed=initialization_seed,
         )
         start = time.perf_counter()
+        rank_progress = bool(progress) and (
+            distributed_runtime is None or distributed_runtime.rank == 0
+        )
         warmup_result = (
-            self.warmup(n_sweeps=warmup_sweeps, progress=progress)
+            self.warmup(n_sweeps=warmup_sweeps, progress=rank_progress)
             if warmup
             else None
         )
-        samples = self.sample(sampling=sampling, progress=progress)
+        sample_kwargs = {"sampling": sampling, "progress": rank_progress}
+        if distributed_runtime is not None:
+            sample_kwargs["distributed"] = distributed
+        samples = self.sample(**sample_kwargs)
         estimates = self.measure(
             samples,
             observables=observables,
             profile=profile,
-            progress=progress,
+            progress=rank_progress,
             _include_energy=True,
         )
         return TorchVMCMeasurementRun(
@@ -986,6 +1081,7 @@ class TorchFermionVMC(TorchVMCDriver):
         warmup=None,
         warmup_sweeps=0,
         progress=False,
+        distributed=False,
         **kwargs,
     ):
         """Run either a PEPS measurement workflow or optimization updates.
@@ -1014,11 +1110,12 @@ class TorchFermionVMC(TorchVMCDriver):
                 or contraction is not None
                 or contraction_opts is not None
                 or warmup_sweeps != 0
+                or not (distributed is False or distributed is None)
             ):
                 raise ValueError(
-                    "observables, sampling, contraction settings, and "
-                    "warmup_sweeps apply only to measurement runs; omit "
-                    "n_steps to use them."
+                    "observables, sampling, contraction settings, warmup_sweeps, "
+                    "and distributed apply only to measurement runs; omit n_steps "
+                    "to use them."
                 )
             if warmup is not None:
                 raise ValueError("warmup applies only to a measurement run.")
@@ -1037,6 +1134,7 @@ class TorchFermionVMC(TorchVMCDriver):
             warmup_sweeps=warmup_sweeps,
             progress=progress,
             profile=profile,
+            distributed=distributed,
         )
 
     def make_bp_sampler(

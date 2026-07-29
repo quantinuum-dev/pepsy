@@ -15,6 +15,11 @@ from .amplitude import (
     TorchPEPSBoundaryAmplitude,
     make_torch_peps_amplitude_model,
 )
+from .benchmark import (
+    TorchAmplitudeBenchmark,
+    TorchAmplitudeBenchmarkRun,
+    benchmark_torch_amplitudes,
+)
 from .connections import TorchConnections, compile_operator_sum_torch, torch_hamiltonian_connections
 from .driver import TorchVMCDriver
 from .fermion import (
@@ -44,6 +49,7 @@ from .results import (
     TorchMetropolisResult,
     TorchImportanceSamples,
     TorchMCMCSamples,
+    TorchDistributedMetadata,
     TorchSampleProvenance,
     TorchChainDiagnostics,
     TorchVMCConvergenceEstimate,
@@ -63,10 +69,13 @@ __all__ = [
     "TorchFermionVMCMetadata",
     "TorchPEPSAmplitude",
     "TorchPEPSBoundaryAmplitude",
+    "TorchAmplitudeBenchmark",
+    "TorchAmplitudeBenchmarkRun",
     "TorchConnections",
     "TorchMetropolisResult",
     "TorchImportanceSamples",
     "TorchMCMCSamples",
+    "TorchDistributedMetadata",
     "TorchSampleProvenance",
     "TorchChainDiagnostics",
     "TorchVMCConvergenceEstimate",
@@ -84,6 +93,7 @@ __all__ = [
     "TorchSRResult",
     "TorchSquareLattice",
     "apply_torch_sr_update",
+    "benchmark_torch_amplitudes",
     "count_spinful_particles",
     "heisenberg_connections",
     "local_energy_from_connections",

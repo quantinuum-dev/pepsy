@@ -1,5 +1,6 @@
 """Tests for the backend-neutral VMC API contracts."""
 
+import os
 import numpy as np
 import pytest
 from types import SimpleNamespace
@@ -88,6 +89,15 @@ def test_mcstate_uses_netket_total_sample_convention_and_bridges_to_problem():
     assert state.sampling.n_samples_per_chain == 4
     assert state.ansatz is state.peps
     assert state.to_problem(OperatorSum()).site_order == (0, 1)
+
+    canonical_state = MCState(
+        object(),
+        n_samples=12,
+        n_chains=3,
+        n_discard_per_chain=4,
+        sweep_size=2,
+    )
+    assert canonical_state.sweep_size == 2
 
     with pytest.raises(ValueError, match="divisible"):
         MCState(object(), n_samples=5, n_chains=2)
@@ -210,14 +220,170 @@ def test_warning_types_are_backend_neutral():
     assert issubclass(VMCBackendCapabilityError, NotImplementedError)
 
 
-def test_netket_portable_adapter_rejects_external_weighted_batches():
+def test_netket_measure_samples_reuses_only_the_current_cache():
+    from pepsy.vmc.netket import NetKetPEPSVMC
+
+    native_samples = object()
+    seen = []
+
+    class State:
+        _samples = native_samples
+
+        def expect(self, observable):
+            seen.append(observable)
+            return f"stats:{observable}"
+
+    setup = NetKetPEPSVMC(
+        hilbert=None,
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=State(),
+        model=None,
+        ansatz=SimpleNamespace(n_sites=1, n_params=1),
+        config_map=None,
+        preconditioner=None,
+    )
+    retained = VMCSamples(
+        configs=np.zeros((1, 1, 1), dtype=np.int64),
+        n_samples_per_chain=1,
+        n_chains=1,
+        native=native_samples,
+    )
+
+    assert setup.measure_samples(retained, {"density": "n", "spin": "sz"}) == {
+        "density": "stats:n",
+        "spin": "stats:sz",
+    }
+    assert seen == ["n", "sz"]
+    with pytest.raises(VMCBackendCapabilityError, match="current MCState sample cache"):
+        setup.measure_samples(
+            VMCSamples(
+                configs=np.zeros((1, 1, 1), dtype=np.int64),
+                n_samples_per_chain=1,
+                n_chains=1,
+                native=object(),
+            ),
+            {"density": "n"},
+        )
+
+
+def test_netket_measure_samples_compiles_eta_pair_on_retained_batch(monkeypatch):
+    import pepsy.vmc.netket as netket_vmc
+    from pepsy.vmc.netket import NetKetEtaPairObservable, NetKetPEPSVMC
+
+    native_samples = object()
+    compiled = []
+
+    class State:
+        _samples = native_samples
+
+        def expect(self, observable):
+            return f"stats:{len(observable)}"
+
+    def fake_fermion_operator(hilbert, terms, *, constant=0.0, conserving=False):
+        assert hilbert == "fermion-hilbert"
+        assert constant == 0.0
+        assert conserving == "auto"
+        compiled.append(tuple(terms))
+        return compiled[-1]
+
+    monkeypatch.setattr(netket_vmc, "netket_fermion_operator", fake_fermion_operator)
+    setup = NetKetPEPSVMC(
+        hilbert="fermion-hilbert",
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=State(),
+        model=None,
+        ansatz=SimpleNamespace(
+            n_sites=4,
+            n_params=1,
+            orbital_sites=((0, 0), (0, 1), (1, 0), (1, 1)),
+        ),
+        config_map=None,
+        preconditioner=None,
+    )
+    retained = VMCSamples(
+        configs=np.zeros((1, 4, 1), dtype=np.int64),
+        n_samples_per_chain=1,
+        n_chains=1,
+        native=native_samples,
+    )
+
+    measured = setup.measure_samples(
+        retained,
+        {
+            "eta": NetKetEtaPairObservable(
+                1,
+                0,
+                periodic=True,
+                staggered=True,
+            )
+        },
+    )
+
+    assert measured == {"eta": "stats:8"}
+    assert len(compiled) == 1
+    assert compiled[0][0] == (
+        -0.25,
+        ((0, 1, True), (0, -1, True), (2, -1, False), (2, 1, False)),
+    )
+    assert compiled[0][1] == (
+        -0.25,
+        ((2, 1, True), (2, -1, True), (0, -1, False), (0, 1, False)),
+    )
+
+
+def test_netket_portable_adapter_rejects_weighted_batches():
     from pepsy.vmc.netket import NetKetVMCSetup
 
     setup = NetKetVMCSetup(setup=object(), problem=object())
-    with pytest.raises(VMCBackendCapabilityError, match="externally supplied"):
-        setup.measure(samples=np.zeros((2, 1), dtype=np.int64))
-    with pytest.raises(VMCBackendCapabilityError, match="externally supplied"):
+    with pytest.raises(VMCBackendCapabilityError, match="weighted or proposal"):
+        setup.measure(weights=np.ones(2))
+    with pytest.raises(VMCBackendCapabilityError, match="weighted sample"):
         setup.optimize(n_steps=1, weights=np.ones(2))
+
+
+def test_netket_portable_adapter_measures_a_retained_batch():
+    from pepsy.vmc.netket import NetKetVMCSetup
+
+    retained_native = object()
+    seen = {}
+
+    class NativeSetup:
+        hamiltonian = "hamiltonian"
+        observables = {"density": "density"}
+
+        def measure_samples(self, samples, observables=None):
+            seen["samples"] = samples
+            seen["observables"] = observables
+            return {
+                name: SimpleNamespace(
+                    mean=float(index),
+                    variance=0.0,
+                    error_of_mean=0.0,
+                )
+                for index, name in enumerate(observables)
+            }
+
+    facade = NetKetVMCSetup(
+        setup=NativeSetup(),
+        problem=VMCProblem(peps=object(), hamiltonian="hamiltonian"),
+    )
+    retained = VMCSamples(
+        configs=np.zeros((1, 1, 1), dtype=np.int64),
+        n_samples_per_chain=1,
+        n_chains=1,
+        native=retained_native,
+    )
+    measurement = facade.measure(samples=retained)
+
+    assert seen["samples"] is retained
+    assert seen["observables"] == {"energy": "hamiltonian", "density": "density"}
+    assert measurement.energy_mean == 0.0
+    assert measurement.observables["density"].mean == 1.0
+    assert measurement.diagnostics["samples"] is retained
 
 
 def test_shared_configuration_objects_normalize_aliases_and_defaults():
@@ -233,10 +399,28 @@ def test_shared_configuration_objects_normalize_aliases_and_defaults():
     assert contraction.method == "boundary"
     assert contraction.chi == 4
     assert sampling.thin == 2
+    assert sampling.sweep_size == 2
+    assert sampling.n_discard_per_chain == 3
     assert sampling.n_samples == 16
     assert sampling.torch_kwargs()["n_samples"] == 16
     assert sampling.netket_kwargs()["n_samples"] == 16
     assert optimization.method == "minsr"
+
+    canonical = SamplingConfig(
+        n_samples=16,
+        n_chains=2,
+        n_discard_per_chain=3,
+        sweep_size=2,
+    )
+    assert canonical.n_samples_per_chain == 8
+    assert canonical.burn_in == 3
+    assert canonical.thin == 2
+    assert canonical.torch_kwargs()["sweep_size"] == 2
+
+    with pytest.raises(ValueError, match="either n_samples"):
+        SamplingConfig(n_samples=16, n_samples_per_chain=8, n_chains=2)
+    with pytest.raises(ValueError, match="either sweep_size"):
+        SamplingConfig(sweep_size=2, thin=2)
 
     with pytest.raises(ValueError, match="chi is required"):
         ContractionConfig(method="ctmrg")
@@ -267,10 +451,10 @@ def test_torch_driver_consumes_shared_sampling_and_optimization_configs():
     )
     samples = driver.sample(
         sampling=SamplingConfig(
-            n_samples_per_chain=2,
+            n_samples=4,
             n_chains=2,
-            burn_in=0,
-            thin=1,
+            n_discard_per_chain=0,
+            sweep_size=1,
             seed=12,
         )
     )
@@ -538,6 +722,14 @@ def test_torch_vmc_progress_postfix_reports_contraction_and_reuse():
         "env": "2 reuse/1 build,3 transition",
         "accept": "0.750",
     }
+
+    _set_vmc_progress_postfix(
+        bar,
+        SimpleNamespace(acceptance_rate=0.625, proposal_stats=None, sr=None),
+        model=model,
+        progress_postfix="acceptance",
+    )
+    assert bar.postfix == {"accept": "0.625"}
 
     _set_evaluation_progress_postfix(
         bar,
@@ -871,6 +1063,51 @@ def test_netket_boundary_zero_separation_has_flat_symmray_retry():
     assert network.calls[1]["canonize"] is True
 
 
+def test_netket_ctmrg_zero_separation_has_flat_symmray_retry():
+    import pepsy.vmc.netket as netket_vmc
+
+    flat_array = type(
+        "Z2FermionicArrayFlat",
+        (),
+        {"__module__": "symmray.fake"},
+    )()
+
+    class Tensor:
+        data = flat_array
+
+    class Network:
+        def __init__(self):
+            self.calls = []
+
+        def __iter__(self):
+            return iter((Tensor(),))
+
+        def contract_ctmrg(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise TypeError("dot_general shape mismatch")
+            return (1.0, 0.0)
+
+    netket_vmc._FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED = False
+    network = Network()
+    with pytest.warns(RuntimeWarning, match="CTMRG.*max_separation=0"):
+        result = netket_vmc._contract_ctmrg_for_vmc(
+            network,
+            max_bond=8,
+            cutoff=0.0,
+            method_opts={
+                "sequence": ("ymin", "ymax", "xmin", "xmax"),
+                "max_separation": 0,
+                "canonize": True,
+            },
+        )
+    assert result == (1.0, 0.0)
+    assert network.calls[0]["max_separation"] == 0
+    assert network.calls[1]["max_separation"] == 1
+    assert network.calls[1]["sequence"] == ("ymin", "ymax", "xmin", "xmax")
+    assert network.calls[1]["canonize"] is True
+
+
 def test_netket_amplitude_timing_reports_batch_average():
     from pepsy.vmc.netket import NetKetAmplitudeTiming
 
@@ -888,22 +1125,32 @@ def test_netket_setup_benchmarks_amplitude_without_sampling_in_timer():
         n_params = 1
 
     class Model:
+        def __init__(self):
+            self.apply_calls = 0
+
         def apply(self, variables, configs):
-            assert "params" in variables
+            self.apply_calls += 1
             return configs.sum(axis=-1)
 
     class State:
         samples = np.zeros((1, 2, 2), dtype=np.int8)
-        parameters = {"x": 1.0}
 
-    State.model = Model()
+        def __init__(self):
+            self.log_value_batches = []
+
+        def log_value(self, configs):
+            self.log_value_batches.append(tuple(configs.shape))
+            return configs.sum(axis=-1)
+
+    model = Model()
+    state = State()
     setup = NetKetPEPSVMC(
         hilbert=None,
         graph=None,
         hamiltonian=None,
         sampler=None,
-        vstate=State(),
-        model=State.model,
+        vstate=state,
+        model=model,
         ansatz=Ansatz(),
         config_map=None,
         preconditioner=None,
@@ -912,6 +1159,48 @@ def test_netket_setup_benchmarks_amplitude_without_sampling_in_timer():
     timing = setup.benchmark_amplitude(n_samples=1)
     assert timing.n_samples == 1
     assert timing.amplitude_seconds >= 0.0
+    assert state.log_value_batches == [(1, 2), (1, 2)]
+    assert model.apply_calls == 0
+
+
+def test_netket_setup_to_peps_unpacks_current_flax_parameters():
+    import jax
+    import jax.numpy as jnp
+    import quimb.tensor as qtn
+    from pepsy.vmc.netket import NetKetPEPSVMC
+
+    original = qtn.TensorNetwork(
+        [qtn.Tensor(np.array([1.0, 2.0]), inds=("physical",), tags=("I0",))]
+    )
+    params, skeleton = qtn.pack(original)
+    leaves, treedef = jax.tree_util.tree_flatten(params)
+    ansatz = SimpleNamespace(
+        leaves=tuple(leaves),
+        treedef=treedef,
+        skeleton=skeleton,
+        n_sites=1,
+        n_params=2,
+    )
+    updated = {"params": {"t0": jnp.array([3.0, 4.0])}}
+    state = SimpleNamespace(variables=updated)
+    setup = NetKetPEPSVMC(
+        hilbert=None,
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=state,
+        model=None,
+        ansatz=ansatz,
+        config_map=None,
+        preconditioner=None,
+    )
+
+    restored = setup.to_peps()
+    np.testing.assert_allclose(restored.tensor_map[0].data, [3.0, 4.0])
+    np.testing.assert_allclose(
+        setup.to_peps(updated["params"]).tensor_map[0].data,
+        [3.0, 4.0],
+    )
 
 
 def test_netket_vmc_config_validates_shared_settings():
@@ -975,6 +1264,79 @@ def test_netket_compiler_lowers_common_fermion_terms():
 
     compiled = compile_operator_sum_netket(hilbert, common)
     assert compiled.hilbert is hilbert
+
+
+def test_netket_declarative_observables_request_conserving_operators(monkeypatch):
+    """User-supplied symbolic observables get the fixed-sector fast path."""
+    import pepsy.vmc.netket as netket_vmc
+
+    terms_calls = []
+    common_calls = []
+
+    def fake_fermion_operator(hilbert, terms, *, constant=0.0, conserving=False):
+        terms_calls.append((hilbert, terms, constant, conserving))
+        return "fermion-observable"
+
+    def fake_common_operator(hilbert, terms, *, site_order=None, conserving=False):
+        common_calls.append((hilbert, terms, site_order, conserving))
+        return "common-observable"
+
+    monkeypatch.setattr(netket_vmc, "netket_fermion_operator", fake_fermion_operator)
+    monkeypatch.setattr(netket_vmc, "compile_operator_sum_netket", fake_common_operator)
+    common = OperatorSum()
+    resolved = netket_vmc._normalize_fermion_observables(
+        "hilbert",
+        {"hopping": [(1.0, ((0, 1, True), (1, 1, False)))], "common": common},
+        site_order=((0, 0),),
+    )
+
+    assert resolved == {
+        "hopping": "fermion-observable",
+        "common": "common-observable",
+    }
+    assert terms_calls[0][-1] == "auto"
+    assert common_calls[0][-1] == "auto"
+
+
+def test_configure_jax_for_vmc_configures_an_optional_private_cache(monkeypatch):
+    """Compilation caching is opt-in and set before importing JAX."""
+    from pepsy.vmc.netket import configure_jax_for_vmc
+
+    for name in (
+        "XLA_PYTHON_CLIENT_PREALLOCATE",
+        "XLA_PYTHON_CLIENT_MEM_FRACTION",
+        "JAX_PLATFORMS",
+        "JAX_COMPILATION_CACHE_DIR",
+        "NETKET_NO_TIPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    configure_jax_for_vmc(
+        preallocate=True,
+        mem_fraction=0.8,
+        platform="cpu",
+        compilation_cache_dir="/private/jax-cache",
+    )
+
+    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
+    assert os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] == "0.8"
+    assert os.environ["JAX_PLATFORMS"] == "cpu"
+    assert os.environ["JAX_COMPILATION_CACHE_DIR"] == "/private/jax-cache"
+    with pytest.raises(ValueError, match="must not be empty"):
+        configure_jax_for_vmc(compilation_cache_dir="")
+
+
+def test_netket_autochunk_callback_has_a_clear_version_guard(monkeypatch):
+    """Old supported NetKet versions fail with an actionable feature error."""
+    import pepsy.vmc.netket as netket_vmc
+
+    monkeypatch.setattr(
+        netket_vmc,
+        "_require_netket",
+        lambda: SimpleNamespace(__version__="3.10", callbacks=SimpleNamespace()),
+    )
+    with pytest.raises(RuntimeError, match="requires NetKet >= 3.22"):
+        netket_vmc.make_netket_autochunk_callback()
 
 
 def test_common_spinful_fermion_operator_has_matching_exact_local_energies():

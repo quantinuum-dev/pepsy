@@ -16,7 +16,17 @@ from .amplitude import (
     _resolve_log_amplitude_fn,
     _unique_config_rows,
 )
+from .benchmark import benchmark_torch_amplitudes
 from .connections import _driver_terms_connections, compile_operator_sum_torch
+from .distributed import (
+    distributed_max_float,
+    distributed_metadata,
+    distributed_sum_int,
+    distributed_unweighted_statistics,
+    rank_seed,
+    resolve_torch_distributed,
+    shard_chain_count,
+)
 from .local_energy import (
     _adaptive_measurement_options,
     _adaptive_thinning_interval,
@@ -226,6 +236,42 @@ class TorchVMCDriver:
         self._refresh_log_amplitudes()
         return self.amplitudes
 
+    def benchmark_amplitudes(
+        self,
+        configs=None,
+        *,
+        chunk_sizes=(None,),
+        amplitude_batchings=None,
+        warmup=1,
+        repeats=3,
+        verify=True,
+        include_cache=False,
+    ):
+        """Benchmark chunked and vectorized amplitude evaluation.
+
+        ``configs`` defaults to the driver's active walkers. Pass retained
+        chain samples with shape ``(n_steps, n_chains, n_sites)`` to time a
+        representative production batch without drawing more samples. Boundary
+        amplitude-cache hits are bypassed by default; pass
+        ``include_cache=True`` to time the cache-aware serving path instead.
+        """
+        if configs is None:
+            configs = self.configs
+        else:
+            configs = _require_torch().as_tensor(configs, dtype=_require_torch().long)
+            if configs.ndim == 3:
+                configs = configs.reshape(-1, configs.shape[-1])
+        return benchmark_torch_amplitudes(
+            self.model,
+            configs,
+            chunk_sizes=chunk_sizes,
+            amplitude_batchings=amplitude_batchings,
+            warmup=warmup,
+            repeats=repeats,
+            verify=verify,
+            include_cache=include_cache,
+        )
+
     def _refresh_log_amplitudes(self):
         if self.log_amplitude_fn is None:
             self.log_abs_amplitudes = None
@@ -398,15 +444,20 @@ class TorchVMCDriver:
             n_samples = config_kwargs.pop("n_samples")
             n_chains = config_kwargs.pop("n_chains")
             if n_discard_per_chain is not None and n_discard_per_chain != config_kwargs["n_discard_per_chain"]:
-                raise ValueError("n_discard_per_chain conflicts with sampling.burn_in.")
+                raise ValueError(
+                    "n_discard_per_chain conflicts with sampling.n_discard_per_chain."
+                )
             if n_discard is not None and n_discard != config_kwargs["n_discard_per_chain"]:
-                raise ValueError("n_discard conflicts with sampling.burn_in.")
-            if sweep_size is not None and sweep_size != config_kwargs["n_thin"]:
-                raise ValueError("sweep_size conflicts with sampling.thin.")
-            if n_thin is not None and n_thin != config_kwargs["n_thin"]:
-                raise ValueError("n_thin conflicts with sampling.thin.")
+                raise ValueError(
+                    "n_discard conflicts with sampling.n_discard_per_chain."
+                )
+            if sweep_size is not None and sweep_size != config_kwargs["sweep_size"]:
+                raise ValueError("sweep_size conflicts with sampling.sweep_size.")
+            if n_thin is not None and n_thin != config_kwargs["sweep_size"]:
+                raise ValueError("n_thin conflicts with sampling.sweep_size.")
             n_discard_per_chain = config_kwargs["n_discard_per_chain"]
-            n_thin = config_kwargs["n_thin"]
+            sweep_size = config_kwargs["sweep_size"]
+            n_thin = None
             seed = config_kwargs["seed"]
             sampler_seed = config_kwargs["sampler_seed"]
             sampling_chunk_size = sampling.chunk_size
@@ -452,11 +503,23 @@ class TorchVMCDriver:
         sweep_size=None,
         n_thin=None,
         progress=False,
+        progress_postfix="full",
         seed=None,
         sampler_seed=None,
         track_proposal_stats=False,
+        distributed=False,
     ):
-        """Collect chain-preserving samples and update the driver state."""
+        """Collect chain-preserving samples and update the driver state.
+
+        Set ``distributed=True`` after initializing ``torch.distributed`` to
+        shard the *global* ``SamplingConfig.n_chains`` across ranks. Each rank
+        owns independent chains and returns only its local configurations;
+        metadata records the global chain/sample counts. Distributed sampling
+        requires ``sampling=...`` so the global chain semantics are explicit.
+        ``progress_postfix=\"acceptance\"`` keeps the live progress display
+        focused on the running sampling acceptance rate.
+        """
+        distributed_runtime = resolve_torch_distributed(distributed)
         sampling_chunk_size = None
         sampling_proposal = None
         if sampling is not None:
@@ -467,19 +530,58 @@ class TorchVMCDriver:
             n_samples = config_kwargs.pop("n_samples")
             n_chains = config_kwargs.pop("n_chains")
             if n_discard_per_chain is not None and n_discard_per_chain != config_kwargs["n_discard_per_chain"]:
-                raise ValueError("n_discard_per_chain conflicts with sampling.burn_in.")
+                raise ValueError(
+                    "n_discard_per_chain conflicts with sampling.n_discard_per_chain."
+                )
             if n_discard is not None and n_discard != config_kwargs["n_discard_per_chain"]:
-                raise ValueError("n_discard conflicts with sampling.burn_in.")
-            if sweep_size is not None and sweep_size != config_kwargs["n_thin"]:
-                raise ValueError("sweep_size conflicts with sampling.thin.")
-            if n_thin is not None and n_thin != config_kwargs["n_thin"]:
-                raise ValueError("n_thin conflicts with sampling.thin.")
+                raise ValueError(
+                    "n_discard conflicts with sampling.n_discard_per_chain."
+                )
+            if sweep_size is not None and sweep_size != config_kwargs["sweep_size"]:
+                raise ValueError("sweep_size conflicts with sampling.sweep_size.")
+            if n_thin is not None and n_thin != config_kwargs["sweep_size"]:
+                raise ValueError("n_thin conflicts with sampling.sweep_size.")
             n_discard_per_chain = config_kwargs["n_discard_per_chain"]
-            n_thin = config_kwargs["n_thin"]
+            sweep_size = config_kwargs["sweep_size"]
+            n_thin = None
             seed = config_kwargs["seed"]
             sampler_seed = config_kwargs["sampler_seed"]
             sampling_chunk_size = sampling.chunk_size
             sampling_proposal = sampling.proposal
+        elif distributed_runtime is not None:
+            raise ValueError(
+                "distributed sampling requires sampling=SamplingConfig(...) so "
+                "n_chains has an unambiguous global meaning."
+            )
+
+        distributed_info = None
+        if distributed_runtime is not None:
+            global_n_chains = int(n_chains)
+            local_n_chains = shard_chain_count(
+                global_n_chains,
+                distributed_runtime,
+            )
+            if self.n_walkers != local_n_chains:
+                raise ValueError(
+                    "This rank's TorchVMCDriver has "
+                    f"{self.n_walkers} walkers, but rank "
+                    f"{distributed_runtime.rank} requires {local_n_chains} of "
+                    f"the global {global_n_chains} chains. Initialize each rank "
+                    "with its local shard before calling sample(..., "
+                    "distributed=True)."
+                )
+            if seed is not None:
+                seed = rank_seed(seed, distributed_runtime)
+            if sampler_seed is not None:
+                sampler_seed = rank_seed(sampler_seed, distributed_runtime)
+            if seed is None and sampler_seed is None:
+                raise ValueError(
+                    "distributed sampling requires SamplingConfig.seed or "
+                    "SamplingConfig.sampler_seed so ranks do not duplicate "
+                    "their random streams."
+                )
+            n_chains = local_n_chains
+            n_samples = int(sampling.n_samples_per_chain) * local_n_chains
         sampler = self.make_sampler(
             n_chains=n_chains,
             seed=seed,
@@ -494,6 +596,7 @@ class TorchVMCDriver:
             sweep_size=sweep_size,
             n_thin=n_thin,
             progress=progress,
+            progress_postfix=progress_postfix,
             track_proposal_stats=track_proposal_stats,
         )
         self.configs = sampler.configs
@@ -501,6 +604,20 @@ class TorchVMCDriver:
         self.generator = sampler.generator
         if track_proposal_stats:
             self.last_proposal_stats = result.proposal_stats
+        if distributed_runtime is not None:
+            global_n_samples = distributed_sum_int(
+                result.n_samples,
+                distributed_runtime,
+                device=self.configs.device,
+            )
+            distributed_info = distributed_metadata(
+                distributed_runtime,
+                global_n_chains=global_n_chains,
+                local_n_chains=local_n_chains,
+                global_n_samples=global_n_samples,
+                local_n_samples=result.n_samples,
+            )
+            result = replace(result, distributed=distributed_info)
         return result
 
     def make_connections(self, configs=None, *, terms=None):
@@ -1091,6 +1208,7 @@ class TorchVMCDriver:
         profile=False,
         deduplicate=True,
         progress=False,
+        distributed=None,
     ):
         """Measure saved chain samples without running another sampler.
 
@@ -1134,6 +1252,21 @@ class TorchVMCDriver:
         model_device = _model_device(self.model)
 
         sample_object = samples if hasattr(samples, "configs") else None
+        sample_distributed = getattr(sample_object, "distributed", None)
+        if distributed is None:
+            distributed = sample_distributed is not None
+        distributed_runtime = resolve_torch_distributed(distributed)
+        if distributed_runtime is not None and sample_distributed is not None:
+            if (
+                sample_distributed.rank != distributed_runtime.rank
+                or sample_distributed.world_size != distributed_runtime.world_size
+            ):
+                raise RuntimeError(
+                    "The supplied samples belong to a different distributed "
+                    "rank layout than the active torch.distributed process group."
+                )
+        if distributed_runtime is not None:
+            progress = bool(progress) and distributed_runtime.rank == 0
         provenance = getattr(sample_object, "provenance", None)
         if provenance is not None and provenance != _torch_sample_provenance(self.model):
             raise RuntimeError(
@@ -1171,6 +1304,15 @@ class TorchVMCDriver:
         if n_steps <= 0 or n_chains <= 0 or n_sites <= 0:
             raise ValueError("samples must contain at least one configuration.")
         flat_configs = chain_configs.reshape(-1, n_sites)
+        global_n_chains = (
+            distributed_sum_int(
+                n_chains,
+                distributed_runtime,
+                device=model_device,
+            )
+            if distributed_runtime is not None
+            else n_chains
+        )
         unique_parent_count = (
             int(_unique_config_rows(flat_configs)[0].shape[0])
             if deduplicate
@@ -1252,6 +1394,12 @@ class TorchVMCDriver:
             )
         else:
             importance_weights = None
+        if distributed_runtime is not None and importance_weights is not None:
+            raise NotImplementedError(
+                "Distributed measurement currently supports only unweighted "
+                "rank-sharded Markov samples. Importance weights require a "
+                "global normalization and are not reduced implicitly."
+            )
 
         if observables is None:
             observable_items = (("observable", None),)
@@ -1327,6 +1475,23 @@ class TorchVMCDriver:
         ) if sample_object is not None else 0.0
         n_proposed = int(getattr(sample_object, "n_proposed", 0)) if sample_object is not None else 0
         n_accepted = int(getattr(sample_object, "n_accepted", 0)) if sample_object is not None else 0
+        if distributed_runtime is not None:
+            elapsed = distributed_max_float(
+                elapsed,
+                distributed_runtime,
+                device=model_device,
+            )
+            n_proposed = distributed_sum_int(
+                n_proposed,
+                distributed_runtime,
+                device=model_device,
+            )
+            n_accepted = distributed_sum_int(
+                n_accepted,
+                distributed_runtime,
+                device=model_device,
+            )
+            acceptance_rate = n_accepted / n_proposed if n_proposed else 0.0
         profile_data = None
         if profile:
             profile_data = {
@@ -1362,10 +1527,34 @@ class TorchVMCDriver:
                 if importance_weights is None
                 else (*_weighted_energy_statistics(flat_values[name], importance_weights), None)
             )
+            distributed_info = None
+            if distributed_runtime is not None:
+                (
+                    energy_mean,
+                    energy_variance,
+                    energy_stderr,
+                    energy_stderr_naive,
+                    effective_sample_size,
+                    global_n_samples,
+                ) = distributed_unweighted_statistics(
+                    local_values,
+                    local_effective_sample_size=effective_sample_size,
+                    runtime=distributed_runtime,
+                )
+                chain_diagnostics = None
+                distributed_info = distributed_metadata(
+                    distributed_runtime,
+                    global_n_chains=global_n_chains,
+                    local_n_chains=n_chains,
+                    global_n_samples=global_n_samples,
+                    local_n_samples=int(local_values.numel()),
+                )
             result_profile = None
             if profile_data is not None:
                 result_profile = dict(profile_data)
                 result_profile["observable"] = name
+                if distributed_info is not None:
+                    result_profile["distributed"] = distributed_info
             results[name] = TorchVMCEnergyEstimate(
                 configs=chain_configs,
                 amplitudes=chain_amplitudes,
@@ -1376,11 +1565,19 @@ class TorchVMCDriver:
                 acceptance_rate=acceptance_rate,
                 n_proposed=n_proposed,
                 n_accepted=n_accepted,
-                n_samples=int(local_values.numel()),
+                n_samples=(
+                    int(local_values.numel())
+                    if distributed_info is None
+                    else distributed_info.global_n_samples
+                ),
                 n_measurements=n_steps,
                 elapsed_seconds=elapsed,
                 samples_per_second=(
-                    int(local_values.numel()) / elapsed
+                    (
+                        int(local_values.numel())
+                        if distributed_info is None
+                        else distributed_info.global_n_samples
+                    ) / elapsed
                     if elapsed > 0
                     else float("inf")
                 ),
@@ -1404,6 +1601,7 @@ class TorchVMCDriver:
                         name="proposal_log_probs",
                     ).reshape(n_steps, n_chains)
                 ),
+                distributed=distributed_info,
             )
 
         if phase_bar is not None:

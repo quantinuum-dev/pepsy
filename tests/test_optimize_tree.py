@@ -3267,9 +3267,7 @@ def test_tree_native_fermionic_gate_stream_matches_mps():
     t, U, dt = 1.0, 8.0, 0.05
     state_dtype = "complex128"
 
-    fermion = pepsy.Fermion(
-        spinful=True, symmetry="U1U1", t=t, U=U, mu=0.0, dtype=state_dtype
-    )
+    fermion = pepsy.Fermion(spinful=True, symmetry="U1U1", dtype=state_dtype)
     setup = fermion.lattice_half_filling(Lx, Ly, pattern="checkerboard", cyclic=True)
     mapper = tensors.OneDMap(Lx, Ly, mode="snake")
     _, coo2idx = mapper.build()
@@ -3356,9 +3354,6 @@ def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
     fermion = pepsy.Fermion(
         spinful=True,
         symmetry="U1U1",
-        t=1.0,
-        U=8.0,
-        mu=0.0,
         dtype="complex128",
     )
     occupations = ((1, 0), (0, 1), (1, 0), (0, 1))

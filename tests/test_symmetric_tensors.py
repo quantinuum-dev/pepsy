@@ -63,9 +63,15 @@ def test_spinful_fermion_helper_bundles_symmetry_aware_building_blocks(
     symmetry, expected_model, expected_charge
 ):
     """The convenience helper should cover the native U1 and U1U1 workflows."""
-    fermions = SpinfulFermion(symmetry=symmetry, t=1.0, U=3.0)
+    fermions = SpinfulFermion(symmetry=symmetry)
 
     assert SpinfulFermionHubbard is SpinfulFermion
+    assert not hasattr(fermions, "t")
+    assert not hasattr(fermions, "U")
+    assert not hasattr(fermions, "V")
+    assert not hasattr(fermions, "mu")
+    with pytest.raises(TypeError, match="unexpected keyword argument 't'"):
+        SpinfulFermion(symmetry=symmetry, t=1.0)
     assert isinstance(SymmFermions.spinful(symmetry=symmetry), SpinfulFermion)
     assert pepsy.SpinfulFermion is SpinfulFermion
     assert pepsy.SymmFermions is SymmFermions
@@ -89,13 +95,17 @@ def test_spinful_fermion_helper_bundles_symmetry_aware_building_blocks(
         ((0, 1), (2, 3)),
         ((1, 2), (3, 0)),
     )
-    stream = fermions.strang_gate_stream(edges, 0.02, sites=range(4))
+    stream = fermions.strang_gate_stream(
+        edges, 0.02, sites=range(4), t=1.0, U=3.0
+    )
     assert isinstance(stream, SymGateStream)
     assert stream.order == 2
     assert len(stream) == 16
     assert all(len(where) == 2 for _, where in stream[4:12])
 
-    ham = fermions.hamiltonian(((0, 1), (1, 2)), mu=0.1)
+    ham = fermions.hamiltonian(
+        ((0, 1), (1, 2)), t=1.0, U=3.0, mu=0.1
+    )
     assert isinstance(ham, SymHamiltonian)
     assert ham.model == expected_model
     assert ham.symmetry == symmetry
@@ -104,13 +114,7 @@ def test_spinful_fermion_helper_bundles_symmetry_aware_building_blocks(
 @pytest.mark.parametrize("symmetry", ["U1", "Z2"])
 def test_unified_fermion_helper_supports_spinless_native_workflow(symmetry):
     """The unified helper should expose the spinless native t-V workflow."""
-    fermions = Fermion(
-        spinful=False,
-        symmetry=symmetry,
-        t=1.0,
-        V=2.0,
-        mu=0.3,
-    )
+    fermions = Fermion(spinful=False, symmetry=symmetry)
 
     assert fermions.model == "fermi_hubbard_spinless"
     assert fermions.physical_sectors == default_physical_sectors(symmetry, 2)
@@ -121,7 +125,7 @@ def test_unified_fermion_helper_supports_spinless_native_workflow(symmetry):
     assert fermions.operator_charge("create") == (1 if symmetry == "Z2" else 1)
     assert type(fermions.operator("number")).__name__.endswith("FermionicArray")
 
-    density = fermions.gate("density", 0.1)
+    density = fermions.gate("density", 0.1, V=2.0)
     assert type(density).__name__.endswith("FermionicArray")
     assert density.to_dense().shape == (2, 2, 2, 2)
 
@@ -130,25 +134,25 @@ def test_unified_fermion_helper_supports_spinless_native_workflow(symmetry):
         0.01,
         sites=range(3),
         order=2,
+        t=1.0,
+        V=2.0,
+        mu=0.3,
     )
     assert isinstance(stream, SymGateStream)
     assert stream.order == 2
     assert all(len(where) == 2 for _, where in stream if isinstance(where, tuple))
 
-    ham = fermions.hamiltonian(((0, 1), (1, 2)))
+    ham = fermions.hamiltonian(((0, 1), (1, 2)), t=1.0, V=2.0, mu=0.3)
     assert ham.model == "fermi_hubbard_spinless"
     assert ham.symmetry == symmetry
-    assert set(fermions.local_terms(((0, 1), (1, 2)))) == {(0, 1), (1, 2)}
+    assert set(fermions.local_terms(
+        ((0, 1), (1, 2)), t=1.0, V=2.0, mu=0.3
+    )) == {(0, 1), (1, 2)}
 
 
 def test_unified_spinful_fermion_gate_stream_runs_native_mps():
     """The unified spinful model should evolve a charge-conserving MPS."""
-    fermion = Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        t=0.5,
-        U=2.0,
-    )
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     state = SymMPS.random(
         3,
         symmetry="U1U1",
@@ -161,7 +165,9 @@ def test_unified_spinful_fermion_gate_stream_runs_native_mps():
     )
 
     state.apply_gates(
-        fermion.gate_stream(((0, 1), (1, 2)), 0.01, sites=range(3)),
+        fermion.gate_stream(
+            ((0, 1), (1, 2)), 0.01, sites=range(3), t=0.5, U=2.0
+        ),
         method="direct",
         contract="split",
         max_bond=4,
@@ -175,7 +181,7 @@ def test_unified_spinful_fermion_gate_stream_runs_native_mps():
 
 def test_ps_to_mps_accepts_fermion_and_builds_native_charge_sector():
     """The public MPS constructor should hide SymMPS for Fermion starts."""
-    fermion = Fermion(spinful=True, symmetry="U1U1", t=0.5, U=2.0)
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     mps = pepsy.ps_to_mps(4, fermion=fermion, seed=17)
 
     assert mps.L == 4
@@ -240,7 +246,7 @@ def test_hrs_to_mps_direct_uses_symmray_random_blocks():
 
 def test_ps_to_peps_accepts_fermion_coordinate_occupations():
     """The public PEPS constructor should build a native fixed-charge seed."""
-    fermion = Fermion(spinful=True, symmetry="U1U1", U=2.0)
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     occupations = {
         (x, y): (1, 0) if (x + y) % 2 == 0 else (0, 1)
         for x in range(2)
@@ -332,6 +338,7 @@ def test_hrs_to_peps_accepts_fermion_sector_and_chi():
         subsizes="maximal",
         seed=32,
         dtype="complex128",
+        normalize=True,
     )
 
     assert (peps.Lx, peps.Ly) == (2, 2)
@@ -342,6 +349,31 @@ def test_hrs_to_peps_accepts_fermion_sector_and_chi():
         for x, y in occupations
     )
     assert pepsy.hrps_to_peps is pepsy.hrs_to_peps
+
+
+def test_hrs_to_peps_skips_global_norm_by_default_for_vmc(monkeypatch):
+    """The VMC-safe default avoids the unrelated CPU boundary-norm contraction."""
+    fermion = Fermion(spinful=True, symmetry="Z2")
+    occupations = {
+        (x, y): 1 if (x + y) % 2 == 0 else 0
+        for x in range(2)
+        for y in range(2)
+    }
+
+    def unexpected_normalize(_):
+        raise AssertionError("global PEPS normalization must be skipped")
+
+    monkeypatch.setattr(SymPEPS, "normalize", unexpected_normalize)
+    peps = pepsy.hrs_to_peps(
+        (2, 2),
+        fermion=fermion,
+        occupations=occupations,
+        chi=3,
+        seed=33,
+    )
+
+    assert (peps.Lx, peps.Ly) == (2, 2)
+    assert 1 < peps.max_bond() <= 3
 
 
 @pytest.mark.parametrize(
@@ -356,7 +388,7 @@ def test_lattice_half_filling_prepares_explicit_peps_metadata(
     symmetry, expected_charge, expected_occupation
 ):
     """Lattice setup normalizes occupations without building terms or gates."""
-    fermion = Fermion(spinful=True, symmetry=symmetry, U=2.0)
+    fermion = Fermion(spinful=True, symmetry=symmetry)
 
     setup = fermion.lattice_half_filling(3, 2, pattern="checkerboard")
 
@@ -377,9 +409,9 @@ def test_lattice_half_filling_prepares_explicit_peps_metadata(
 
 def test_symdmrg_fermionic_state_accepts_raw_fermion_constructor_output():
     """SymDMRG should restore native tensors without a SymMPS wrapper input."""
-    fermion = Fermion(spinful=True, symmetry="U1U1", t=0.5, U=2.0)
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     mps = pepsy.ps_to_mps(3, fermion=fermion, seed=23)
-    mpo = fermion.hamiltonian(((0, 1), (1, 2))).to_mpo(
+    mpo = fermion.hamiltonian(((0, 1), (1, 2)), t=0.5, U=2.0).to_mpo(
         L=3,
         max_bond=8,
         compress=True,
@@ -645,7 +677,7 @@ def test_native_fermionic_compiled_plan_preserves_phases_and_dummy_modes():
 @pytest.mark.parametrize("symmetry", ["Z2", "Z2Z2"])
 def test_unified_spinful_fermion_supports_symmray_parity_symmetries(symmetry):
     """Spinful parity symmetries should use native charges and gates."""
-    fermion = Fermion(spinful=True, symmetry=symmetry, t=0.5, U=2.0, mu=0.1)
+    fermion = Fermion(spinful=True, symmetry=symmetry)
 
     assert fermion.model == (
         "fermi_hubbard" if symmetry == "Z2" else "fermi_hubbard_u1u1"
@@ -662,14 +694,16 @@ def test_unified_spinful_fermion_supports_symmray_parity_symmetries(symmetry):
         0 if symmetry == "Z2" else (1, 1)
     )
     assert type(fermion.observable("number")).__name__.endswith("FermionicArray")
-    assert type(fermion.hopping_gate(0.01)).__name__.endswith("FermionicArray")
-    assert type(fermion.interaction_gate(0.01)).__name__.endswith("FermionicArray")
+    assert type(fermion.hopping_gate(0.01, t=0.5)).__name__.endswith("FermionicArray")
+    assert type(fermion.interaction_gate(0.01, U=2.0)).__name__.endswith("FermionicArray")
 
 
-def test_unified_spinful_fermion_hamiltonian_keeps_mu_parameter():
-    """Configured spinful chemical potentials must reach Symmray terms."""
-    fermion = Fermion(spinful=True, symmetry="U1U1", U=3.0, mu=(0.2, 0.4))
-    hamiltonian = fermion.hamiltonian(((0, 1),))
+def test_unified_spinful_fermion_hamiltonian_keeps_explicit_mu_parameter():
+    """Explicit spinful chemical potentials must reach Symmray terms."""
+    fermion = Fermion(spinful=True, symmetry="U1U1")
+    hamiltonian = fermion.hamiltonian(
+        ((0, 1),), t=1.0, U=3.0, mu=(0.2, 0.4)
+    )
 
     assert hamiltonian.parameters["mu"] == (0.2, 0.4)
     dense = hamiltonian.terms[(0, 1)].to_dense()
@@ -684,14 +718,7 @@ def test_unified_spinful_fermion_hamiltonian_keeps_mu_parameter():
 
 def test_fermion_exposes_explicit_native_operator_terms():
     """Named and generic APIs return the unexponentiated fermion terms."""
-    fermion = Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        t=1.7,
-        U=3.0,
-        mu=0.4,
-        V=0.6,
-    )
+    fermion = Fermion(spinful=True, symmetry="U1U1")
 
     hopping = fermion.hopping_operator()
     reference_hopping = fermion.hamiltonian(
@@ -720,7 +747,7 @@ def test_fermion_exposes_explicit_native_operator_terms():
         (0.0, 1.0, 1.0, 2.0),
     )
     np.testing.assert_allclose(
-        np.diag(fermion.onsite_term(0).to_dense()),
+        np.diag(fermion.onsite_term(0, U=3.0, mu=0.4).to_dense()),
         (0.0, -0.4, -0.4, 3.0 - 0.8),
     )
 
@@ -883,7 +910,7 @@ def test_fermion_spin_gates_preserve_torch_backend():
 
 def test_mps_energy_uses_explicit_fermion_terms_natively():
     """An explicit one- plus two-site SymHamiltonian stays on native MPS terms."""
-    fermion = Fermion(spinful=True, symmetry="U1U1", U=2.0, mu=0.0)
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     ham = fermion.hamiltonian(
         {
             (0, 1): -fermion.hopping_operator(),
@@ -913,13 +940,7 @@ def test_mps_energy_uses_explicit_fermion_terms_natively():
 
 def test_fermion_explicit_coordinate_terms_preserve_peps_locations():
     """Coordinate-site terms remain usable by PEPS and mapped MPO workflows."""
-    fermion = Fermion(
-        spinful=True,
-        symmetry="U1U1",
-        t=1.0,
-        U=3.0,
-        mu=0.2,
-    )
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     edges = (
         ((0, 0), (0, 1)),
         ((0, 0), (1, 0)),
@@ -927,7 +948,7 @@ def test_fermion_explicit_coordinate_terms_preserve_peps_locations():
     )
     sites = tuple(sorted({site for edge in edges for site in edge}))
     terms = {edge: -fermion.hopping_operator() for edge in edges}
-    terms |= {site: fermion.onsite_term(site) for site in sites}
+    terms |= {site: fermion.onsite_term(site, U=3.0, mu=0.2) for site in sites}
 
     hamiltonian = fermion.hamiltonian(terms)
 
@@ -960,8 +981,8 @@ def test_unified_fermion_peps_energy_accepts_boundary_chi():
         seed=17,
         dtype="complex128",
     )
-    fermion = Fermion(symmetry="U1U1", U=2.0, mu=(0.1, 0.2))
-    ham = fermion.hamiltonian(peps.edges)
+    fermion = Fermion(symmetry="U1U1")
+    ham = fermion.hamiltonian(peps.edges, t=1.0, U=2.0, mu=(0.1, 0.2))
 
     exact = peps.energy(ham)
     boundary = peps.energy(ham, chi=8)
@@ -979,10 +1000,10 @@ def test_unified_fermion_gates_and_hamiltonian_preserve_backend():
     )
 
     values = (
-        fermion.onsite_gate(0.01),
-        fermion.hopping_gate(0.01),
+        fermion.onsite_gate(0.01, U=8.0),
+        fermion.hopping_gate(0.01, t=1.0),
         fermion.density_gate(0.01, V=0.2),
-        fermion.hamiltonian(((0, 1),)).terms[(0, 1)],
+        fermion.hamiltonian(((0, 1),), t=1.0, U=8.0).terms[(0, 1)],
     )
     assert all(value.backend == "torch" for value in values)
 
@@ -990,14 +1011,16 @@ def test_unified_fermion_gates_and_hamiltonian_preserve_backend():
 def test_spinful_interaction_gate_has_exact_doublon_phase():
     """The onsite gate should only phase the doubly occupied basis state."""
     theta = 0.2 * 3.0
-    gate = Fermion(spinful=True, symmetry="U1U1", U=3.0).gate(
+    gate = Fermion(spinful=True, symmetry="U1U1").gate(
         "interaction",
         0.2,
+        U=3.0,
     )
     expected = np.diag([1.0, 1.0, 1.0, np.exp(-1j * theta)])
     np.testing.assert_allclose(gate.to_dense(), expected)
-    imaginary = Fermion(spinful=True, symmetry="U1U1", U=3.0).interaction_gate(
+    imaginary = Fermion(spinful=True, symmetry="U1U1").interaction_gate(
         0.2,
+        U=3.0,
         imaginary=True,
     )
     np.testing.assert_allclose(
@@ -1008,7 +1031,7 @@ def test_spinful_interaction_gate_has_exact_doublon_phase():
 
 def test_fermion_generic_exponential_matches_named_interaction_gate():
     """Generic neutral monomials should share the native exponentiator."""
-    fermion = Fermion(spinful=True, symmetry="U1U1", U=3.0)
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     generic = fermion.exponential(
         [(3.0, ((0, "number_up"), (0, "number_down")))],
         0.2,
@@ -1017,16 +1040,16 @@ def test_fermion_generic_exponential_matches_named_interaction_gate():
 
     np.testing.assert_allclose(
         generic.to_dense(),
-        fermion.interaction_gate(0.2).to_dense(),
+        fermion.interaction_gate(0.2, U=3.0).to_dense(),
     )
     assert type(generic).__name__ == "U1U1FermionicArray"
 
 
 def test_fermion_hopping_gate_matches_native_hamiltonian_exponential():
     """Native hopping imaginary time must lower the matching term energy."""
-    fermion = Fermion(spinful=True, symmetry="U1U1", t=1.0, U=0.0)
+    fermion = Fermion(spinful=True, symmetry="U1U1")
     ham = fermion.hamiltonian({(0, 1): -fermion.hopping_operator()})
-    named = fermion.hopping_gate(0.01, imaginary=True)
+    named = fermion.hopping_gate(0.01, t=1.0, imaginary=True)
     reference = ham.trotter_gates(0.01, imaginary=True)[0][0]
 
     np.testing.assert_allclose(named.to_dense(), reference.to_dense())
@@ -1097,7 +1120,6 @@ def test_native_hopping_gate_has_correct_long_range_parity_sign(
     fermion = Fermion(
         spinful=spinful,
         symmetry="U1U1" if spinful else "U1",
-        t=1.3,
     )
     dt = 0.13
     state = pepsy.ps_to_mps(
@@ -3076,8 +3098,6 @@ def test_symmray_mpo_real_time_fermion_stream_preserves_norm_without_truncation(
     fermion = Fermion(
         spinful=True,
         symmetry="U1U1",
-        t=1.0,
-        U=8.0,
         to_backend=backend,
     )
     lx, ly = 2, 3

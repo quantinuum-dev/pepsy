@@ -65,6 +65,7 @@ from pepsy.vmc import (
     ContractionConfig,
     FermionSiteEncoding,
     MCState,
+    NetKetEtaPairObservable,
     NetKetVMCSetup,
     OptimizationConfig,
     SamplingConfig,
@@ -165,6 +166,7 @@ def test_new_namespace_imports_resolve():
     assert TorchPEPSBoundaryAmplitude is not None
     assert TorchVMCDriver is not None
     assert TorchVMCSetup is not None
+    assert NetKetEtaPairObservable is not None
     assert NetKetVMCSetup is not None
     assert TorchVMCStepResult is not None
     assert TorchSquareLattice is not None

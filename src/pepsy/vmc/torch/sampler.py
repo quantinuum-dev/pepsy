@@ -397,6 +397,7 @@ class TorchMetropolisSampler:
         sweep_size=None,
         n_thin=None,
         progress=False,
+        progress_postfix="full",
         track_proposal_stats=False,
     ):
         """Discard and collect chain-preserving Metropolis samples.
@@ -407,7 +408,10 @@ class TorchMetropolisSampler:
         ``n_discard_per_chain`` and ``sweep_size`` respectively. Both the
         discard and retained portions use that sweep interval, so the progress
         bar totals ``(n_discard_per_chain + n_samples_per_chain) *
-        sweep_size`` batched Metropolis sweeps.
+        sweep_size`` batched Metropolis sweeps. Set
+        ``progress_postfix=\"acceptance\"`` to keep the live postfix focused on
+        the running acceptance rate; the default ``\"full\"`` shows sampler and
+        cache details as well.
         """
         torch = _require_torch()
         n_samples = _check_positive_int("n_samples", n_samples)
@@ -426,6 +430,10 @@ class TorchMetropolisSampler:
             n_discard_per_chain,
         )
         sweep_size = _check_positive_int("sweep_size", sweep_size)
+        if progress_postfix not in {"full", "acceptance"}:
+            raise ValueError(
+                "progress_postfix must be 'full' or 'acceptance'."
+            )
         n_samples_per_chain = (
             n_samples + self.n_chains - 1
         ) // self.n_chains
@@ -450,6 +458,7 @@ class TorchMetropolisSampler:
             thin=sweep_size,
             phase=("equilibrate" if n_discard_per_chain else "retain 0/"
                    f"{n_samples_per_chain}"),
+            progress_postfix=progress_postfix,
         )
         start = time.perf_counter()
         n_proposed = 0
@@ -488,6 +497,7 @@ class TorchMetropolisSampler:
                     burn_in=n_discard_per_chain,
                     thin=sweep_size,
                     phase=sampling_phase(),
+                    progress_postfix=progress_postfix,
                 )
 
         for _ in range(n_discard_per_chain * sweep_size):

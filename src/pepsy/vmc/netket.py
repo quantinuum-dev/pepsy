@@ -6,9 +6,11 @@ packages only when the concrete helpers are used.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral
 import os
+import time
 from typing import Any
 import warnings
 
@@ -18,6 +20,12 @@ import quimb.tensor as qtn
 __all__ = [
     "NetKetLocalConfigMap",
     "NetKetChunkSettings",
+    "NetKetBuildTiming",
+    "NetKetAmplitudeTiming",
+    "NetKetGPUUsage",
+    "NetKetResourceUsage",
+    "NetKetVMCConfig",
+    "NetKetEtaPairObservable",
     "NetKetPEPSVMC",
     "NetKetFermiHubbardVMC",
     "NetKetVMCSetup",
@@ -174,6 +182,176 @@ class NetKetChunkSettings:
 
 
 @dataclass(frozen=True)
+class NetKetBuildTiming:
+    """Wall-clock breakdown for :func:`build_fermion_vmc`.
+
+    The setup phase is separate from :meth:`NetKetPEPSVMC.warmup`: it creates
+    the Hilbert space, packs the PEPS, builds the JAX model, and constructs the
+    sampler/state.  ``warmup`` then triggers the lazy sampler/amplitude/energy
+    compilations.  Keeping these timings separate makes the first-run cost
+    visible instead of attributing it all to a VMC iteration.
+    """
+
+    settings_seconds: float
+    geometry_seconds: float
+    hamiltonian_seconds: float
+    peps_seconds: float
+    model_seconds: float
+    sampler_seconds: float
+    total_seconds: float
+    preconditioner_seconds: float = 0.0
+    state_seconds: float = 0.0
+
+    def as_dict(self):
+        """Return a JSON-friendly phase-to-seconds mapping."""
+        return {
+            "settings_seconds": float(self.settings_seconds),
+            "geometry_seconds": float(self.geometry_seconds),
+            "hamiltonian_seconds": float(self.hamiltonian_seconds),
+            "peps_seconds": float(self.peps_seconds),
+            "model_seconds": float(self.model_seconds),
+            "sampler_seconds": float(self.sampler_seconds),
+            "total_seconds": float(self.total_seconds),
+            "preconditioner_seconds": float(self.preconditioner_seconds),
+            "state_seconds": float(self.state_seconds),
+        }
+
+    @property
+    def slowest_phase(self):
+        """Return ``(name, seconds)`` for the slowest setup phase."""
+        phases = self.as_dict()
+        phases.pop("total_seconds")
+        name = max(phases, key=phases.get)
+        return name, phases[name]
+
+
+@dataclass(frozen=True)
+class NetKetAmplitudeTiming:
+    """Wall-clock timing for a synchronized PEPS amplitude batch."""
+
+    n_samples: int
+    amplitude_seconds: float
+    compile_seconds: float | None = None
+
+    @property
+    def amplitude_seconds_per_sample(self):
+        """Return the measured average time per amplitude in the batch."""
+        return float(self.amplitude_seconds) / int(self.n_samples)
+
+    def as_dict(self):
+        """Return a JSON-friendly timing mapping."""
+        return {
+            "n_samples": int(self.n_samples),
+            "amplitude_seconds": float(self.amplitude_seconds),
+            "amplitude_seconds_per_sample": float(
+                self.amplitude_seconds_per_sample
+            ),
+            "compile_seconds": (
+                None
+                if self.compile_seconds is None
+                else float(self.compile_seconds)
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class NetKetGPUUsage:
+    """One ``nvidia-smi`` snapshot for a GPU visible to the current process."""
+
+    index: int
+    name: str
+    memory_used_mib: int | None
+    memory_total_mib: int | None
+    utilization_percent: int | None
+    memory_utilization_percent: int | None
+    process_memory_mib: int | None = None
+
+    def as_dict(self):
+        """Return a JSON-friendly representation of this GPU snapshot."""
+        return {
+            "index": self.index,
+            "name": self.name,
+            "memory_used_mib": self.memory_used_mib,
+            "memory_total_mib": self.memory_total_mib,
+            "utilization_percent": self.utilization_percent,
+            "memory_utilization_percent": self.memory_utilization_percent,
+            "process_memory_mib": self.process_memory_mib,
+        }
+
+
+@dataclass(frozen=True)
+class NetKetResourceUsage:
+    """Host and GPU resource snapshots collected around one VMC operation.
+
+    ``gpu_peak`` is sampled while the operation runs. GPU utilization is an
+    instantaneous NVML/``nvidia-smi`` quantity, so its peak is useful for
+    observing activity, but is not a time-averaged utilization percentage.
+    ``process_memory_mib`` distinguishes this notebook kernel's allocation
+    from memory consumed by other processes sharing the device.
+    """
+
+    elapsed_seconds: float
+    host_rss_before_mib: float | None
+    host_rss_after_mib: float | None
+    host_rss_peak_mib: float | None
+    gpu_before: tuple[NetKetGPUUsage, ...] = ()
+    gpu_after: tuple[NetKetGPUUsage, ...] = ()
+    gpu_peak: tuple[NetKetGPUUsage, ...] = ()
+    host_monitor: str | None = None
+
+    def as_dict(self):
+        """Return a JSON-friendly representation suitable for sample metadata."""
+        return {
+            "elapsed_seconds": float(self.elapsed_seconds),
+            "host_rss_before_mib": self.host_rss_before_mib,
+            "host_rss_after_mib": self.host_rss_after_mib,
+            "host_rss_peak_mib": self.host_rss_peak_mib,
+            "gpu_before": tuple(item.as_dict() for item in self.gpu_before),
+            "gpu_after": tuple(item.as_dict() for item in self.gpu_after),
+            "gpu_peak": tuple(item.as_dict() for item in self.gpu_peak),
+            "host_monitor": self.host_monitor,
+        }
+
+    def summary(self, label="VMC resources"):
+        """Format a compact human-readable summary for notebooks and logs."""
+        def gib(value):
+            return "n/a" if value is None else f"{value / 1024:.2f} GiB"
+
+        parts = [
+            f"{label}: {self.elapsed_seconds:.1f}s",
+            "host RSS "
+            f"{gib(self.host_rss_before_mib)} -> {gib(self.host_rss_after_mib)} "
+            f"(peak {gib(self.host_rss_peak_mib)})",
+        ]
+        after = {item.index: item for item in self.gpu_after}
+        before = {item.index: item for item in self.gpu_before}
+        peak = {item.index: item for item in self.gpu_peak}
+        for index in sorted(set(before) | set(after) | set(peak)):
+            current = after.get(index) or before.get(index) or peak[index]
+            highest = peak.get(index, current)
+            process_memory = current.process_memory_mib
+            process_peak = highest.process_memory_mib
+            current_utilization = current.utilization_percent
+            peak_utilization = highest.utilization_percent
+            device_memory = (
+                "n/a"
+                if current.memory_used_mib is None
+                or current.memory_total_mib is None
+                else f"{current.memory_used_mib / 1024:.2f}/"
+                f"{current.memory_total_mib / 1024:.2f} GiB"
+            )
+            parts.append(
+                f"GPU {index} ({current.name}): process {gib(process_memory)} "
+                f"(peak {gib(process_peak)}), device {device_memory}, "
+                f"util {current_utilization if current_utilization is not None else 'n/a'}% "
+                f"(peak {peak_utilization if peak_utilization is not None else 'n/a'}%)"
+            )
+        if not after and not before and not peak:
+            parts.append("GPU metrics unavailable (nvidia-smi not visible)")
+        return "; ".join(parts)
+
+
+@dataclass(frozen=True)
 class NetKetVMCSettings:
     """Conservative large-run NetKet settings suggested by Pepsy."""
 
@@ -189,6 +367,80 @@ class NetKetVMCSettings:
     notes: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class NetKetVMCConfig:
+    """Validated construction/runtime settings for :func:`build_fermion_vmc`.
+
+    This bundle keeps physics inputs (PEPS, ``Fermion``, and Hamiltonian)
+    separate from numerical settings without removing the builder's legacy
+    keyword arguments. ``sampling`` controls the MCState defaults; call
+    ``setup.sample(...)`` later to request a different retained batch.
+    """
+
+    contraction: Any = "exact"
+    sampling: Any = None
+    sampler_sweep_size: int | None = None
+    conserving: bool | str = False
+    use_sr: bool | str = False
+    param_dtype: Any | None = None
+    verify_columns: bool = False
+    progress: bool = False
+
+    def __post_init__(self):
+        from .api import SamplingConfig
+
+        if self.sampling is not None and not isinstance(self.sampling, SamplingConfig):
+            raise TypeError("sampling must be a SamplingConfig or None.")
+        if self.sampler_sweep_size is not None:
+            _check_positive_int("sampler_sweep_size", self.sampler_sweep_size)
+        if self.conserving not in {False, True, "auto"}:
+            raise ValueError("conserving must be False, True, or 'auto'.")
+        if self.use_sr not in {False, True, "auto"}:
+            raise ValueError("use_sr must be False, True, or 'auto'.")
+        if not isinstance(self.verify_columns, bool):
+            raise TypeError("verify_columns must be a bool.")
+        if not isinstance(self.progress, bool):
+            raise TypeError("progress must be a bool.")
+
+
+@dataclass(frozen=True)
+class NetKetEtaPairObservable:
+    r"""Declarative eta-pair observable resolved by NetKet measurement.
+
+    This represents
+
+    .. math::
+
+        P_\eta(dx, dy) = \frac{1}{N}\sum_i
+        \left(\Delta_i^\dagger \Delta_{i + (dx, dy)} + \mathrm{h.c.}\right).
+
+    Pass an instance as a value in the ``observables`` mapping given to
+    :meth:`NetKetPEPSVMC.measure_samples`.  The operator is compiled there
+    from the packed PEPS lattice order, so it shares the retained NetKet
+    configurations with every other requested observable.  At zero
+    displacement it instead measures the mean double occupancy.
+
+    ``periodic=False`` keeps only in-bounds pairs and normalizes by their
+    number. ``staggered=True`` multiplies each nonzero-displacement pair by
+    ``(-1)**(x_i + y_i + x_j + y_j)``.
+    """
+
+    dx: int
+    dy: int
+    periodic: bool = True
+    staggered: bool = False
+
+    def __post_init__(self):
+        for name in ("dx", "dy"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(f"{name} must be an integer.")
+            object.__setattr__(self, name, int(value))
+        for name in ("periodic", "staggered"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool.")
+
+
 def _make_progress_bar(*, total=None, desc=None, enabled=True):
     """Return a notebook-friendly ``tqdm`` bar, or ``None`` when unavailable."""
     if not enabled:
@@ -200,6 +452,326 @@ def _make_progress_bar(*, total=None, desc=None, enabled=True):
     return tqdm(total=total, desc=desc, leave=True, dynamic_ncols=True)
 
 
+def _block_until_ready(value):
+    """Synchronize a JAX value or pytree without importing JAX eagerly."""
+    wait = getattr(value, "block_until_ready", None)
+    if callable(wait):
+        wait()
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _block_until_ready(item)
+        return
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            _block_until_ready(item)
+        return
+    # ``np.asarray`` synchronizes JAX arrays and remains harmless for the
+    # small NumPy/scalar stand-ins used in optional-dependency tests.
+    _ = np.asarray(value)
+
+
+def _tree_isfinite(value):
+    """Return whether every numerical leaf in a JAX/Flax pytree is finite."""
+    if isinstance(value, Mapping):
+        return all(_tree_isfinite(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return all(_tree_isfinite(item) for item in value)
+    array = np.asarray(value)
+    try:
+        return bool(np.all(np.isfinite(array)))
+    except TypeError:
+        # Test doubles and framework metadata are occasionally carried next
+        # to numerical leaves; only numerical parameter arrays need checking.
+        return True
+
+
+def _process_rss_mib():
+    """Return this Python process's resident memory, if ``psutil`` is present."""
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss / (1 << 20)
+    except Exception:
+        return None
+
+
+def _nvidia_smi_integer(value):
+    """Parse a possibly unavailable ``nvidia-smi`` integer field."""
+    value = value.strip()
+    if value.lower() in {"", "n/a", "[not supported]"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _nvidia_smi_gpu_usage():
+    """Return per-GPU memory/utilization snapshots without a Python NVML dep."""
+    import subprocess
+
+    try:
+        gpu_process = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid,name,memory.used,memory.total,"
+                "utilization.gpu,utilization.memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if gpu_process.returncode or not gpu_process.stdout.strip():
+        return ()
+
+    process_memory_by_uuid = {}
+    try:
+        applications = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,gpu_uuid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if applications.returncode == 0:
+            for line in applications.stdout.splitlines():
+                fields = [field.strip() for field in line.split(",")]
+                if len(fields) != 3 or _nvidia_smi_integer(fields[0]) != os.getpid():
+                    continue
+                process_memory_by_uuid[fields[1]] = _nvidia_smi_integer(fields[2])
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    result = []
+    for line in gpu_process.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 7:
+            continue
+        index = _nvidia_smi_integer(fields[0])
+        if index is None:
+            continue
+        result.append(
+            NetKetGPUUsage(
+                index=index,
+                name=fields[2],
+                memory_used_mib=_nvidia_smi_integer(fields[3]),
+                memory_total_mib=_nvidia_smi_integer(fields[4]),
+                utilization_percent=_nvidia_smi_integer(fields[5]),
+                memory_utilization_percent=_nvidia_smi_integer(fields[6]),
+                process_memory_mib=process_memory_by_uuid.get(fields[1]),
+            )
+        )
+    return tuple(result)
+
+
+class _NetKetResourceMonitor:
+    """Sample host RSS and ``nvidia-smi`` while one blocking VMC call runs."""
+
+    def __init__(self, *, interval=0.25):
+        interval = float(interval)
+        if interval <= 0:
+            raise ValueError("resource_interval must be positive.")
+        self.interval = interval
+        self._started = None
+        self._host_before = None
+        self._gpu_before = ()
+        self._gpu_peak = {}
+        self._host_monitor = None
+        self._host_monitor_name = None
+        self._stop_event = None
+        self._thread = None
+
+    def _record_gpu_usage(self, usage):
+        for item in usage:
+            previous = self._gpu_peak.get(item.index)
+            if previous is None:
+                self._gpu_peak[item.index] = item
+                continue
+            self._gpu_peak[item.index] = NetKetGPUUsage(
+                index=item.index,
+                name=item.name,
+                memory_used_mib=max(
+                    value
+                    for value in (previous.memory_used_mib, item.memory_used_mib)
+                    if value is not None
+                )
+                if any(
+                    value is not None
+                    for value in (previous.memory_used_mib, item.memory_used_mib)
+                )
+                else None,
+                memory_total_mib=item.memory_total_mib
+                or previous.memory_total_mib,
+                utilization_percent=max(
+                    value
+                    for value in (previous.utilization_percent, item.utilization_percent)
+                    if value is not None
+                )
+                if any(
+                    value is not None
+                    for value in (
+                        previous.utilization_percent,
+                        item.utilization_percent,
+                    )
+                )
+                else None,
+                memory_utilization_percent=max(
+                    value
+                    for value in (
+                        previous.memory_utilization_percent,
+                        item.memory_utilization_percent,
+                    )
+                    if value is not None
+                )
+                if any(
+                    value is not None
+                    for value in (
+                        previous.memory_utilization_percent,
+                        item.memory_utilization_percent,
+                    )
+                )
+                else None,
+                process_memory_mib=max(
+                    value
+                    for value in (
+                        previous.process_memory_mib,
+                        item.process_memory_mib,
+                    )
+                    if value is not None
+                )
+                if any(
+                    value is not None
+                    for value in (
+                        previous.process_memory_mib,
+                        item.process_memory_mib,
+                    )
+                )
+                else None,
+            )
+
+    def _poll(self):
+        while not self._stop_event.wait(self.interval):
+            self._record_gpu_usage(_nvidia_smi_gpu_usage())
+
+    def start(self):
+        """Start non-intrusive resource sampling."""
+        import threading
+
+        self._host_before = _process_rss_mib()
+        self._gpu_before = _nvidia_smi_gpu_usage()
+        self._record_gpu_usage(self._gpu_before)
+        # xyzpy already supplies a low-overhead RSS peak sampler.  It remains
+        # optional so the NetKet bridge has no new hard runtime dependency.
+        try:
+            import xyzpy
+
+            # Keep host RSS sampling responsive at teardown; GPU polling still
+            # follows ``resource_interval`` and is the expensive operation.
+            self._host_monitor = xyzpy.MemoryMonitor(
+                interval=min(self.interval, 0.05)
+            )
+            self._host_monitor.start()
+            self._host_monitor_name = "xyzpy.MemoryMonitor"
+        except Exception:
+            self._host_monitor = None
+        # Exclude snapshot/monitor setup from the reported operation time.
+        self._started = time.perf_counter()
+        if self._gpu_before:
+            self._stop_event = threading.Event()
+            self._thread = threading.Thread(target=self._poll, daemon=True)
+            self._thread.start()
+        return self
+
+    def stop(self):
+        """Stop sampling and return the collected resource report."""
+        if self._started is None:
+            raise RuntimeError("Resource monitor has not been started.")
+        ended = time.perf_counter()
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+        gpu_after = _nvidia_smi_gpu_usage()
+        self._record_gpu_usage(gpu_after)
+        host_after = _process_rss_mib()
+        host_peak = max(
+            value
+            for value in (self._host_before, host_after)
+            if value is not None
+        ) if any(value is not None for value in (self._host_before, host_after)) else None
+        if self._host_monitor is not None:
+            self._host_monitor.stop()
+            if self._host_monitor.peak is not None:
+                host_peak = max(host_peak or 0.0, self._host_monitor.peak * 1024)
+        return NetKetResourceUsage(
+            elapsed_seconds=ended - self._started,
+            host_rss_before_mib=self._host_before,
+            host_rss_after_mib=host_after,
+            host_rss_peak_mib=host_peak,
+            gpu_before=self._gpu_before,
+            gpu_after=gpu_after,
+            gpu_peak=tuple(
+                self._gpu_peak[index] for index in sorted(self._gpu_peak)
+            ),
+            host_monitor=self._host_monitor_name,
+        )
+
+
+def _netket_sampling_diagnostics(vstate, sampler):
+    """Read portable sampling metadata from a NetKet MCState."""
+    state = getattr(vstate, "sampler_state", None)
+
+    def scalar(value):
+        if value is None:
+            return None
+        try:
+            return float(np.asarray(value))
+        except (TypeError, ValueError):
+            return None
+
+    acceptance = scalar(getattr(state, "acceptance", None))
+    n_steps = scalar(getattr(state, "n_steps", None))
+    n_accepted = scalar(getattr(state, "n_accepted", None))
+    return {
+        "n_samples": int(getattr(vstate, "n_samples", 0)),
+        "n_chains": int(getattr(sampler, "n_chains", 0)),
+        "burn_in": int(getattr(vstate, "n_discard_per_chain", 0) or 0),
+        "sweep_size": getattr(sampler, "sweep_size", None),
+        "chunk_size": getattr(vstate, "chunk_size", None),
+        "acceptance_rate": acceptance,
+        "n_steps": None if n_steps is None else int(n_steps),
+        "n_accepted": None if n_accepted is None else int(n_accepted),
+    }
+
+
+def _format_sampling_postfix(diagnostics):
+    """Format compact chain diagnostics for a progress-bar postfix."""
+    parts = []
+    acceptance = diagnostics.get("acceptance_rate")
+    if acceptance is not None:
+        parts.append(f"acc={acceptance:.2f}")
+    n_samples = diagnostics.get("n_samples")
+    n_chains = diagnostics.get("n_chains")
+    if n_samples and n_chains:
+        parts.append(f"samples={n_samples}/{n_chains}ch")
+    burn_in = diagnostics.get("burn_in")
+    sweep_size = diagnostics.get("sweep_size")
+    if burn_in is not None:
+        parts.append(f"burn={burn_in}")
+    if sweep_size is not None:
+        parts.append(f"sweep={sweep_size}")
+    return " | ".join(parts)
+
+
 @dataclass(frozen=True)
 class VMCOptimizeResult:
     """Energy-optimization history returned by :meth:`NetKetPEPSVMC.optimize`.
@@ -208,7 +780,9 @@ class VMCOptimizeResult:
     (real energy mean, error of the mean, and sample variance). ``energy_shift``
     is added to every energy by :attr:`shifted_energies` and :meth:`plot` so a
     convention offset (for example ``-U/4`` for Fermi-Hubbard) can be applied
-    without mutating the raw samples.
+    without mutating the raw samples. ``compile_seconds`` measures the staged
+    sampler/amplitude/energy warmup; ``optimization_seconds`` and
+    ``total_seconds`` are wall-clock measurements for the run.
     """
 
     steps: Any
@@ -219,6 +793,20 @@ class VMCOptimizeResult:
     final_error: float
     compile_seconds: float | None = None
     energy_shift: float = 0.0
+    optimization_seconds: float | None = None
+    total_seconds: float | None = None
+
+    @property
+    def warmup_seconds(self):
+        """Alias for the one-time sampler/JAX compilation duration."""
+        return self.compile_seconds
+
+    @property
+    def optimization_seconds_per_step(self):
+        """Return the measured optimization wall time per recorded step."""
+        if self.optimization_seconds is None or len(np.asarray(self.steps)) == 0:
+            return None
+        return float(self.optimization_seconds) / len(np.asarray(self.steps))
 
     @property
     def shifted_energies(self):
@@ -263,6 +851,7 @@ class _VMCProgressCallback:
         self.energy_shift = float(energy_shift)
         self.per_site = per_site
         self._bar = None
+        self._first_update_started = None
         self.steps = []
         self.energies = []
         self.errors = []
@@ -275,7 +864,44 @@ class _VMCProgressCallback:
             )
         return self._bar
 
+    def start(self, status="first update: sampling and compiling gradients"):
+        """Show the VMC bar before NetKet's first (potentially JIT-heavy) step."""
+        self._first_update_started = time.perf_counter()
+        bar = self._ensure_bar()
+        if bar is not None:
+            bar.set_description_str(f"VMC 0/{self.n_iter}: preparing")
+            bar.set_postfix_str(str(status))
+
+    def set_status(self, status):
+        """Update the pre-first-step status without advancing the bar."""
+        bar = self._ensure_bar()
+        if bar is not None and not self.steps:
+            bar.set_postfix_str(str(status))
+
     def __call__(self, step, log_data, driver):
+        # NetKet invokes legacy callbacks after ``update_parameters``, but JAX
+        # may still have the backward pass and optimizer update queued on the
+        # device. Synchronize the updated parameter pytree before advancing
+        # tqdm: otherwise the first energy statistic can tick while the GPU is
+        # still working on that update, and the apparent stall moves to the
+        # following bar item. VMC updates are parameter-dependent, so this
+        # does not remove useful inter-step GPU parallelism; it makes elapsed
+        # time and ETA honest.
+        vstate = getattr(driver, "variational_state", None)
+        if vstate is None:
+            vstate = getattr(driver, "_variational_state", None)
+        if vstate is not None:
+            parameters = getattr(vstate, "parameters", None)
+            if parameters is not None:
+                _block_until_ready(parameters)
+            if parameters is not None and not _tree_isfinite(parameters):
+                raise FloatingPointError(
+                    "NetKet VMC produced non-finite PEPS parameters after "
+                    f"update {int(step)}. Reduce the learning rate, restart "
+                    "from the pre-update state, and verify a short run before "
+                    "using a larger sample count."
+                )
+
         name = getattr(driver, "_loss_name", "Energy")
         stats = None
         if isinstance(log_data, dict):
@@ -286,6 +912,13 @@ class _VMCProgressCallback:
             mean = float(np.real(np.asarray(getattr(stats, "mean", stats))))
             err = float(getattr(stats, "error_of_mean", np.nan))
             var = float(getattr(stats, "variance", np.nan))
+            if not np.isfinite(mean):
+                raise FloatingPointError(
+                    "NetKet VMC produced a non-finite local-energy estimate "
+                    f"at update {int(step)}. The PEPS/sampler state is no "
+                    "longer numerically usable; reduce the learning rate and "
+                    "restart from the initial PEPS."
+                )
             self.steps.append(int(step))
             self.energies.append(mean)
             self.errors.append(err)
@@ -294,7 +927,20 @@ class _VMCProgressCallback:
             if bar is not None:
                 scale = 1.0 if not self.per_site else float(self.per_site)
                 shown = (mean + self.energy_shift) / scale
-                bar.set_postfix_str(f"E={shown:.6f}\u00b1{err / scale:.1e}")
+                details = [f"E={shown:.6f}\u00b1{err / scale:.1e}"]
+                if self._first_update_started is not None:
+                    first_seconds = time.perf_counter() - self._first_update_started
+                    details.insert(0, f"first update {first_seconds:.1f}s")
+                    self._first_update_started = None
+                if vstate is not None:
+                    sampling = _netket_sampling_diagnostics(
+                        vstate, getattr(vstate, "sampler", None)
+                    )
+                    sampling_text = _format_sampling_postfix(sampling)
+                    if sampling_text:
+                        details.append(sampling_text)
+                bar.set_description_str("VMC energy")
+                bar.set_postfix_str(" | ".join(details))
                 bar.update(1)
         return True
 
@@ -303,7 +949,12 @@ class _VMCProgressCallback:
             self._bar.close()
             self._bar = None
 
-    def result(self, compile_seconds=None):
+    def result(
+        self,
+        compile_seconds=None,
+        optimization_seconds=None,
+        total_seconds=None,
+    ):
         energies = np.asarray(self.energies, dtype=float)
         errors = np.asarray(self.errors, dtype=float)
         return VMCOptimizeResult(
@@ -314,6 +965,8 @@ class _VMCProgressCallback:
             final_energy=float(energies[-1]) if energies.size else float("nan"),
             final_error=float(errors[-1]) if errors.size else float("nan"),
             compile_seconds=compile_seconds,
+            optimization_seconds=optimization_seconds,
+            total_seconds=total_seconds,
             energy_shift=self.energy_shift,
         )
 
@@ -331,6 +984,7 @@ class NetKetPEPSVMC:
     ansatz: PackedPEPS
     config_map: NetKetLocalConfigMap | None
     preconditioner: Any | None
+    build_timing: NetKetBuildTiming | None = None
 
     @property
     def n_sites(self):
@@ -346,6 +1000,43 @@ class NetKetPEPSVMC:
         """Return NetKet's expectation estimate for this setup Hamiltonian."""
         return self.vstate.expect(self.hamiltonian)
 
+    def _mc_diagnostic_method(self, name):
+        """Return a recent NetKet MC diagnostic or raise a clear version error."""
+        method = getattr(self.vstate, name, None)
+        if callable(method):
+            return method
+        raise RuntimeError(
+            f"NetKet MC diagnostic {name}() is unavailable in this NetKet "
+            "version. Install NetKet >= 3.22 to use it."
+        )
+
+    def check_mc_convergence(self, hamiltonian=None, **kwargs):
+        """Diagnose final-state mixing without mutating the VMC state.
+
+        This delegates to NetKet's ``MCState.check_mc_convergence``. It is
+        intentionally an explicit post-optimization diagnostic because it
+        draws long chains to estimate :math:`\\hat R` and autocorrelation time.
+        """
+        if hamiltonian is None:
+            hamiltonian = self.hamiltonian
+        return self._mc_diagnostic_method("check_mc_convergence")(
+            hamiltonian, **kwargs
+        )
+
+    def thermalise(self, hamiltonian=None, **kwargs):
+        """Advance chains in place until NetKet's mixing criterion is met."""
+        if hamiltonian is None:
+            hamiltonian = self.hamiltonian
+        return self._mc_diagnostic_method("thermalise")(hamiltonian, **kwargs)
+
+    def expect_to_precision(self, observable=None, **kwargs):
+        """Sample an observable until NetKet reaches a requested tolerance."""
+        if observable is None:
+            observable = self.hamiltonian
+        return self._mc_diagnostic_method("expect_to_precision")(
+            observable, **kwargs
+        )
+
     def make_driver(self, **kwargs):
         """Create a NetKet VMC driver for this setup.
 
@@ -353,15 +1044,116 @@ class NetKetPEPSVMC:
         """
         return make_netket_vmc_driver(self, **kwargs)
 
-    def warmup(self, *, progress=True, hamiltonian=None):
+    def warmup(
+        self,
+        *,
+        progress=True,
+        hamiltonian=None,
+        verbose=None,
+        resource_monitor=False,
+        resource_interval=0.25,
+    ):
         """Compile the VMC kernels up front with a small staged progress bar.
 
         Thin wrapper over :func:`warmup_netket_vmc`; returns the elapsed
         compile seconds so the following optimization ETA is meaningful.
         """
-        return warmup_netket_vmc(self, hamiltonian=hamiltonian, progress=progress)
+        return warmup_netket_vmc(
+            self,
+            hamiltonian=hamiltonian,
+            progress=progress,
+            verbose=verbose,
+            resource_monitor=resource_monitor,
+            resource_interval=resource_interval,
+        )
 
-    def sample(self, sampling=None):
+    def to_peps(self, variables=None, *, device_get=True):
+        """Return the current NetKet parameters as a quimb PEPS-like network.
+
+        With no explicit ``variables``, this reconstructs the PEPS from the
+        setup's current ``MCState`` parameters, including parameters updated by
+        a NetKet VMC driver.  Pass either the full Flax variables mapping or
+        its ``"params"`` collection to inspect a checkpoint without mutating
+        the VMC setup.  By default leaves are copied from JAX devices to NumPy,
+        yielding a regular quimb/Symmray network suitable for Pepsy methods;
+        set ``device_get=False`` to retain JAX-backed leaves.
+
+        The result is the underlying quimb network (the ``.tn`` of a
+        :class:`pepsy.SymPEPS`), preserving the packed skeleton's tensor
+        topology, indices, and fermionic metadata.
+        """
+        if variables is None:
+            variables = getattr(self.vstate, "variables", None)
+            if variables is None:
+                variables = {"params": self.vstate.parameters}
+        params = _peps_params_from_netket_variables(
+            self.ansatz,
+            variables,
+            device_get=device_get,
+        )
+        return qtn.unpack(params, self.ansatz.skeleton)
+
+    def benchmark_amplitude(self, configs=None, *, n_samples=1):
+        """Time one synchronized jitted PEPS amplitude batch.
+
+        If ``configs`` is omitted, the first ``n_samples`` configurations from
+        the current NetKet sample cache are used. Sampling itself is outside
+        the timed region, so the result isolates NetKet's jitted log-amplitude
+        evaluation. The first synchronized call is treated as a compile probe
+        and is reported separately in ``compile_seconds``. The returned
+        ``amplitude_seconds`` is a second call with the same batch shape, so
+        it measures steady-state evaluation rather than shape-specific JAX
+        compilation. Choose ``n_samples`` to match a real sampler or forward
+        chunk; timing an arbitrary small batch does not predict VMC throughput.
+        """
+        n_samples = int(n_samples)
+        if n_samples <= 0:
+            raise ValueError("n_samples must be positive.")
+        if configs is None:
+            native = self.vstate.samples
+            configs = native.reshape((-1, native.shape[-1]))
+        else:
+            configs = np.asarray(configs)
+            if configs.ndim == 1:
+                configs = configs.reshape((1, -1))
+            if configs.ndim != 2:
+                raise ValueError(
+                    "configs must have shape (n_samples, n_orbitals)."
+                )
+        if int(configs.shape[0]) < n_samples:
+            raise ValueError(
+                f"configs contains {int(configs.shape[0])} rows, "
+                f"but n_samples={n_samples} was requested."
+            )
+        configs = configs[:n_samples]
+        log_value = getattr(self.vstate, "log_value", None)
+        if not callable(log_value):
+            raise TypeError(
+                "NetKet amplitude benchmarking requires an MCState with a "
+                "log_value(configs) method."
+            )
+        compile_started = time.perf_counter()
+        log_amplitudes = log_value(configs)
+        _block_until_ready(log_amplitudes)
+        compile_seconds = time.perf_counter() - compile_started
+        started = time.perf_counter()
+        log_amplitudes = log_value(configs)
+        _block_until_ready(log_amplitudes)
+        return NetKetAmplitudeTiming(
+            n_samples=n_samples,
+            amplitude_seconds=time.perf_counter() - started,
+            compile_seconds=compile_seconds,
+        )
+
+    def sample(
+        self,
+        sampling=None,
+        *,
+        fresh=False,
+        progress=False,
+        resource_monitor=False,
+        resource_interval=0.25,
+    ):
         """Collect samples using the shared :class:`SamplingConfig` contract.
 
         NetKet stores samples as ``(n_chains, n_samples_per_chain, sites)``;
@@ -369,55 +1161,103 @@ class NetKetPEPSVMC:
         ``(n_samples_per_chain, n_chains, sites)`` layout used by Torch.  The
         sampler's chain count is fixed when the setup is built, so a config
         requesting another count raises a clear error instead of silently
-        returning a different ensemble.
+        returning a different ensemble. With ``fresh=True``, reset NetKet's
+        retained-sample cache before reading it, forcing one new batch from the
+        current chain state. With ``progress=True``, the bar shows
+        retained samples, burn-in, sweep size, elapsed time, and NetKet's
+        acceptance rate after sampling. Set ``resource_monitor=True`` to also
+        print host RSS plus this kernel's GPU-memory and GPU-utilization
+        snapshots; the serializable report is retained in
+        ``VMCSamples.diagnostics["resources"]``.
         """
         from .api import BackendCapabilityWarning, SamplingConfig, VMCSamples
 
         if sampling is not None and not isinstance(sampling, SamplingConfig):
             raise TypeError("sampling must be a SamplingConfig or None.")
-        if sampling is None:
-            native = self.vstate.samples
-            requested_chunk = None
-        else:
-            actual_chains = getattr(self.sampler, "n_chains", None)
-            if actual_chains is not None and int(actual_chains) != sampling.n_chains:
-                raise ValueError(
-                    "sampling.n_chains does not match the setup sampler: "
-                    f"expected {int(actual_chains)}, got {sampling.n_chains}. "
-                    "Rebuild the setup with n_chains=... to change it."
-                )
-            if sampling.thin != 1:
-                warnings.warn(
-                    "NetKet MCState.sample has no per-sample thinning option; "
-                    "sampling.thin is ignored.",
-                    BackendCapabilityWarning,
-                    stacklevel=2,
-                )
-            if sampling.proposal is not None:
-                warnings.warn(
-                    "sampling.proposal is selected when the NetKet sampler is "
-                    "built and is ignored by MCState.sample.",
-                    BackendCapabilityWarning,
-                    stacklevel=2,
-                )
-            if sampling.seed is not None or sampling.sampler_seed is not None:
-                warnings.warn(
-                    "NetKet MCState.sample cannot reseed an existing sampler; "
-                    "seed settings are ignored. Rebuild the setup to reseed.",
-                    BackendCapabilityWarning,
-                    stacklevel=2,
-                )
-            kwargs = sampling.netket_kwargs()
-            kwargs.pop("n_chains", None)
-            requested_chunk = sampling.chunk_size
-            old_chunk = getattr(self.vstate, "chunk_size", None)
-            if requested_chunk is not None:
-                self.vstate.chunk_size = requested_chunk
-            try:
-                native = self.vstate.sample(**kwargs)
-            finally:
+        if not isinstance(fresh, bool):
+            raise TypeError("fresh must be a bool.")
+        bar = _make_progress_bar(total=1, desc="NetKet sampling", enabled=progress)
+        monitor = (
+            _NetKetResourceMonitor(interval=resource_interval)
+            if resource_monitor
+            else None
+        )
+        if monitor is not None:
+            monitor.start()
+        # Keep the sampling time independent of optional telemetry setup.
+        started = time.perf_counter()
+        try:
+            if fresh:
+                self.vstate.reset()
+            if sampling is None:
+                native = self.vstate.samples
+            else:
+                actual_chains = getattr(self.sampler, "n_chains", None)
+                if (
+                    actual_chains is not None
+                    and int(actual_chains) != sampling.n_chains
+                ):
+                    raise ValueError(
+                        "sampling.n_chains does not match the setup sampler: "
+                        f"expected {int(actual_chains)}, got {sampling.n_chains}. "
+                        "Rebuild the setup with n_chains=... to change it."
+                    )
+                if sampling.sweep_size != 1:
+                    warnings.warn(
+                        "NetKet MCState.sample has no per-sample thinning option; "
+                        "sampling.sweep_size is ignored.",
+                        BackendCapabilityWarning,
+                        stacklevel=2,
+                    )
+                if sampling.proposal is not None:
+                    warnings.warn(
+                        "sampling.proposal is selected when the NetKet sampler is "
+                        "built and is ignored by MCState.sample.",
+                        BackendCapabilityWarning,
+                        stacklevel=2,
+                    )
+                if sampling.seed is not None or sampling.sampler_seed is not None:
+                    warnings.warn(
+                        "NetKet MCState.sample cannot reseed an existing sampler; "
+                        "seed settings are ignored. Rebuild the setup to reseed.",
+                        BackendCapabilityWarning,
+                        stacklevel=2,
+                    )
+                kwargs = sampling.netket_kwargs()
+                kwargs.pop("n_chains", None)
+                requested_chunk = sampling.chunk_size
+                old_chunk = getattr(self.vstate, "chunk_size", None)
                 if requested_chunk is not None:
-                    self.vstate.chunk_size = old_chunk
+                    self.vstate.chunk_size = requested_chunk
+                try:
+                    native = self.vstate.sample(**kwargs)
+                finally:
+                    if requested_chunk is not None:
+                        self.vstate.chunk_size = old_chunk
+        finally:
+            resource_usage = monitor.stop() if monitor is not None else None
+
+        diagnostics = _netket_sampling_diagnostics(self.vstate, self.sampler)
+        # ``MCState.sample`` accepts a temporary sample count/discard value,
+        # but does not consistently copy those values back onto the state.
+        # Keep the progress text and returned metadata faithful to the request
+        # rather than reporting the build-time defaults in that case.
+        if sampling is not None:
+            diagnostics["n_samples"] = sampling.n_samples
+            diagnostics["n_chains"] = sampling.n_chains
+            diagnostics["burn_in"] = sampling.n_discard_per_chain
+            if sampling.chunk_size is not None:
+                diagnostics["chunk_size"] = sampling.chunk_size
+        diagnostics["elapsed_seconds"] = time.perf_counter() - started
+        if resource_usage is not None:
+            diagnostics["resources"] = resource_usage.as_dict()
+            print(resource_usage.summary("NetKet sampling resources"), flush=True)
+        if bar is not None:
+            postfix = _format_sampling_postfix(diagnostics)
+            if postfix:
+                bar.set_postfix_str(postfix)
+            bar.update(1)
+            bar.close()
 
         shape = getattr(native, "shape", ())
         if len(shape) == 3:
@@ -432,11 +1272,14 @@ class NetKetPEPSVMC:
                 "NetKet samples must have shape (chains, samples, sites) or "
                 f"(samples, sites), got {shape}."
             )
+        diagnostics["n_samples_per_chain"] = n_samples_per_chain
         return VMCSamples(
             configs=configs,
             n_samples_per_chain=n_samples_per_chain,
             n_chains=n_chains,
             native=native,
+            acceptance_rate=diagnostics.get("acceptance_rate"),
+            diagnostics=diagnostics,
         )
 
     def optimize(
@@ -510,6 +1353,20 @@ class NetKetPEPSVMC:
         if energy_shift is None:
             energy_shift = 0.0
         driver_options = {} if driver_options is None else dict(driver_options)
+        total_started = time.perf_counter()
+        cb = _VMCProgressCallback(
+            n_iter,
+            enabled=progress,
+            energy_shift=energy_shift,
+            per_site=per_site,
+        )
+        callbacks = [cb]
+        if extra_callbacks:
+            callbacks.extend(extra_callbacks)
+        # When a separate warmup has already completed (the usual notebook
+        # path), even driver setup would otherwise be invisible.
+        if not warmup:
+            cb.start("building VMC driver")
         run_driver = make_netket_vmc_driver(
             self,
             optimizer=optimizer,
@@ -520,15 +1377,10 @@ class NetKetPEPSVMC:
         compile_seconds = None
         if warmup:
             compile_seconds = self.warmup(progress=progress)
-        cb = _VMCProgressCallback(
-            n_iter,
-            enabled=progress,
-            energy_shift=energy_shift,
-            per_site=per_site,
-        )
-        callbacks = [cb]
-        if extra_callbacks:
-            callbacks.extend(extra_callbacks)
+        # NetKet invokes callbacks only after its first update.  Create this
+        # bar now so the JIT-heavy first gradient/sampling pass is visible.
+        cb.start()
+        optimization_started = time.perf_counter()
         try:
             run_driver.run(
                 n_iter,
@@ -538,16 +1390,92 @@ class NetKetPEPSVMC:
             )
         finally:
             cb.close()
-        return cb.result(compile_seconds=compile_seconds)
+        optimization_seconds = time.perf_counter() - optimization_started
+        total_seconds = time.perf_counter() - total_started
+        return cb.result(
+            compile_seconds=compile_seconds,
+            optimization_seconds=optimization_seconds,
+            total_seconds=total_seconds,
+        )
 
-    def measure(self, observables=None):
-        """Measure observables on the current variational state.
+    def run(
+        self,
+        n_iter,
+        *,
+        learning_rate=0.02,
+        driver="vmc",
+        optimizer=None,
+        warmup=True,
+        progress=True,
+        energy_shift=0.0,
+        per_site=None,
+        sr_mode="real",
+        sr_diag_shift=0.01,
+        use_sr=False,
+        driver_options=None,
+        **run_kwargs,
+    ):
+        """Run NetKet VMC with one timing-aware public entry point.
 
-        ``observables`` may be a single NetKet operator, a ``{name: operator}``
-        mapping, or ``None`` to use any observables stored on the setup (for
-        example those passed to :func:`build_fermion_vmc`). Returns a single
-        ``nk.stats.Stats`` for one operator, otherwise a ``{name: Stats}`` dict.
+        This is the concise native setup API: contraction and sampler choices
+        belong to :func:`build_fermion_vmc`, while optimization choices are
+        passed directly here. Standard ``driver='vmc'`` uses no SR
+        preconditioner unless ``use_sr=True`` or an explicit driver option is
+        supplied. The returned :class:`VMCOptimizeResult` reports
+        one-time warmup/JAX compilation, optimization wall time, total wall
+        time, and the measured time per optimization step.
         """
+        options = {} if driver_options is None else dict(driver_options)
+        driver_name = str(driver).replace("-", "_").lower()
+        if driver_name in {"vmc_sr", "vmcsr", "sr"}:
+            options.setdefault("sr_mode", sr_mode)
+            options.setdefault("sr_diag_shift", sr_diag_shift)
+        elif "use_sr" not in options and "preconditioner" not in options:
+            options["use_sr"] = use_sr
+        return self.optimize(
+            n_iter,
+            learning_rate=learning_rate,
+            driver=driver,
+            optimizer=optimizer,
+            progress=progress,
+            warmup=warmup,
+            energy_shift=energy_shift,
+            per_site=per_site,
+            driver_options=options,
+            **run_kwargs,
+        )
+
+    def measure_samples(self, samples, observables=None):
+        """Measure observables from a retained NetKet sample batch.
+
+        ``samples`` must be the :class:`~pepsy.vmc.VMCSamples` returned by
+        :meth:`sample` (or its unchanged native NetKet array). NetKet's local
+        estimators consume the ``MCState`` sample cache rather than accepting
+        configurations as an argument, so this method verifies that the batch
+        is still that cache. It then evaluates every observable on precisely
+        the same Markov-chain configurations, without drawing another batch.
+
+        A fresh ``sample(...)`` call is required after a parameter update or
+        any other operation that invalidates NetKet's cache. ``observables``
+        may be a single NetKet operator, a ``{name: operator}`` mapping, a
+        :class:`NetKetEtaPairObservable` specification, or ``None`` to use
+        those stored on the setup.
+        """
+        from .api import VMCBackendCapabilityError
+
+        native_samples = getattr(samples, "native", samples)
+        cached_samples = getattr(self.vstate, "_samples", None)
+        if native_samples is None:
+            raise VMCBackendCapabilityError(
+                "NetKet measurement needs a native sample batch. Call "
+                "setup.sample(...) and pass its returned VMCSamples object."
+            )
+        if cached_samples is None or native_samples is not cached_samples:
+            raise VMCBackendCapabilityError(
+                "NetKet can measure only the current MCState sample cache. "
+                "Call setup.sample(...) and pass that returned batch; external "
+                "or stale configurations cannot be installed safely."
+            )
         if observables is None:
             observables = getattr(self, "observables", None)
         if observables is None:
@@ -557,10 +1485,48 @@ class NetKetPEPSVMC:
             )
         if isinstance(observables, dict):
             return {
-                name: self.vstate.expect(op)
+                name: self.vstate.expect(
+                    _resolve_netket_measurement_observable(
+                        self.hilbert,
+                        self.ansatz,
+                        op,
+                    )
+                )
                 for name, op in observables.items()
             }
-        return self.vstate.expect(observables)
+        return self.vstate.expect(
+            _resolve_netket_measurement_observable(
+                self.hilbert,
+                self.ansatz,
+                observables,
+            )
+        )
+
+    def measure(
+        self,
+        observables=None,
+        *,
+        samples=None,
+        sampling=None,
+        progress=False,
+    ):
+        """Measure observables, optionally from an explicitly retained batch.
+
+        ``setup.measure_samples(samples, observables)`` is the explicit
+        sample-once/measure-many form. This convenience wrapper preserves the
+        direct API: it uses the current NetKet cache when available, or calls
+        :meth:`sample` once when a batch must be drawn. Pass ``samples=`` to
+        make the sampling boundary explicit.
+        """
+        if samples is not None and sampling is not None:
+            raise ValueError("Pass either samples or sampling, not both.")
+        if samples is None:
+            cached_samples = getattr(self.vstate, "_samples", None)
+            if sampling is not None or cached_samples is None:
+                samples = self.sample(sampling, progress=progress)
+            else:
+                samples = cached_samples
+        return self.measure_samples(samples, observables)
 
 
 @dataclass(frozen=True)
@@ -594,7 +1560,36 @@ class NetKetVMCSetup:
     def n_params(self):
         return self.setup.n_params
 
-    def sample(self, sampling=None):
+    @property
+    def build_timing(self):
+        """Return the setup-phase timing breakdown, when available."""
+        return self.setup.build_timing
+
+    def check_mc_convergence(self, hamiltonian=None, **kwargs):
+        """Forward NetKet's post-optimization mixing diagnostic."""
+        return self.setup.check_mc_convergence(hamiltonian, **kwargs)
+
+    def thermalise(self, hamiltonian=None, **kwargs):
+        """Forward NetKet's in-place chain thermalisation helper."""
+        return self.setup.thermalise(hamiltonian, **kwargs)
+
+    def expect_to_precision(self, observable=None, **kwargs):
+        """Forward NetKet's precision-targeted expectation helper."""
+        return self.setup.expect_to_precision(observable, **kwargs)
+
+    def benchmark_amplitude(self, configs=None, *, n_samples=1):
+        """Time a synchronized amplitude batch on the native NetKet setup."""
+        return self.setup.benchmark_amplitude(configs, n_samples=n_samples)
+
+    def sample(
+        self,
+        sampling=None,
+        *,
+        fresh=False,
+        progress=False,
+        resource_monitor=False,
+        resource_interval=0.25,
+    ):
         """Collect samples as backend-neutral :class:`VMCSamples`.
 
         Chain count and seeds belong to an MCState at build time in NetKet.
@@ -604,12 +1599,17 @@ class NetKetVMCSetup:
         from .api import SamplingConfig, VMCBackendCapabilityError
 
         if sampling is None:
-            return self.setup.sample()
+            return self.setup.sample(
+                fresh=fresh,
+                progress=progress,
+                resource_monitor=resource_monitor,
+                resource_interval=resource_interval,
+            )
         if not isinstance(sampling, SamplingConfig):
             raise TypeError("sampling must be a SamplingConfig or None.")
         unsupported = []
-        if sampling.thin != 1:
-            unsupported.append("thin")
+        if sampling.sweep_size != 1:
+            unsupported.append("sweep_size (formerly thin)")
         if sampling.seed is not None or sampling.sampler_seed is not None:
             unsupported.append("seed/sampler_seed")
         if sampling.proposal is not None:
@@ -621,7 +1621,13 @@ class NetKetVMCSetup:
                 "construction. Supply it while building the native sampler, "
                 "or use the native NetKet API explicitly."
             )
-        return self.setup.sample(sampling)
+        return self.setup.sample(
+            sampling,
+            fresh=fresh,
+            progress=progress,
+            resource_monitor=resource_monitor,
+            resource_interval=resource_interval,
+        )
 
     def measure(
         self,
@@ -635,14 +1641,16 @@ class NetKetVMCSetup:
         """Measure energy and optional observables on the current VMC state."""
         from .api import VMCBackendCapabilityError, VMCMeasurement
 
-        if samples is not None or weights is not None or proposal_log_probs is not None:
+        if weights is not None or proposal_log_probs is not None:
             raise VMCBackendCapabilityError(
-                "NetKet's portable adapter does not yet accept externally "
-                "supplied weighted sample batches. Use its MCState sampling "
-                "path, or use the Torch adapter for importance sampling."
+                "NetKet's portable adapter does not accept weighted or "
+                "proposal-distribution sample batches. Use the Torch adapter "
+                "for importance sampling."
             )
-
-        samples = self.sample(sampling) if sampling is not None else None
+        if samples is not None and sampling is not None:
+            raise ValueError("Pass either samples or sampling, not both.")
+        if samples is None:
+            samples = self.sample(sampling)
         if observables is None:
             extra = dict(getattr(self.setup, "observables", None) or {})
         else:
@@ -655,7 +1663,10 @@ class NetKetVMCSetup:
                 "'energy' is reserved for problem.hamiltonian; use a different "
                 "observable name."
             )
-        native = self.setup.measure({"energy": self.setup.hamiltonian, **extra})
+        native = self.setup.measure_samples(
+            samples,
+            {"energy": self.setup.hamiltonian, **extra},
+        )
         energy = native["energy"]
         return VMCMeasurement(
             energy_mean=getattr(energy, "mean", energy),
@@ -718,7 +1729,16 @@ class NetKetVMCSetup:
             per_site=per_site,
             diagnostics={
                 "backend": self.backend,
+                "build_timing": (
+                    self.setup.build_timing.as_dict()
+                    if self.setup.build_timing is not None
+                    else None
+                ),
                 "compile_seconds": native.compile_seconds,
+                "warmup_seconds": native.warmup_seconds,
+                "optimization_seconds": native.optimization_seconds,
+                "total_seconds": native.total_seconds,
+                "optimization_seconds_per_step": native.optimization_seconds_per_step,
             },
             native=native,
         )
@@ -857,8 +1877,8 @@ class NetKetSparseFermiHubbardVMC:
         )
         result = sampler.sample(
             n_samples=sampling.n_samples,
-            n_discard_per_chain=sampling.burn_in,
-            n_thin=sampling.thin,
+            n_discard_per_chain=sampling.n_discard_per_chain,
+            sweep_size=sampling.sweep_size,
         )
         object.__setattr__(self, "configs", sampler.configs)
         object.__setattr__(self, "amplitudes", sampler.amplitudes)
@@ -902,12 +1922,15 @@ def configure_jax_for_vmc(
     preallocate=False,
     mem_fraction=0.65,
     platform=None,
+    compilation_cache_dir=None,
     disable_netket_tips=True,
 ):
     """Set JAX/NetKet environment defaults for notebook VMC runs.
 
     Call this before importing ``jax`` or ``netket``. Existing environment
-    values are preserved.
+    values are preserved. When ``compilation_cache_dir`` is set, it must be a
+    private, trusted location: JAX treats a persistent compilation cache as
+    executable trusted input.
     """
     os.environ.setdefault(
         "XLA_PYTHON_CLIENT_PREALLOCATE",
@@ -917,6 +1940,11 @@ def configure_jax_for_vmc(
         os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", str(mem_fraction))
     if platform is not None:
         os.environ.setdefault("JAX_PLATFORMS", str(platform))
+    if compilation_cache_dir is not None:
+        compilation_cache_dir = os.fspath(compilation_cache_dir)
+        if not compilation_cache_dir:
+            raise ValueError("compilation_cache_dir must not be empty.")
+        os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", compilation_cache_dir)
     if disable_netket_tips:
         os.environ.setdefault("NETKET_NO_TIPS", "1")
 
@@ -1026,13 +2054,12 @@ def _require_static_cutoff_for_jit(name, contraction, cutoff):
 
 
 def _maybe_register_stable_jax_svd(contraction):
-    """Install Pepsy's regularized JAX SVD backward rule for VMC gradients.
+    """Install Pepsy's truncation-safe JAX SVD backward rule for VMC gradients.
 
-    HOTRG/CTMRG/boundary-MPS contractions compress with SVDs whose naive
-    reverse-mode rule diverges on near-degenerate singular values, which
-    destabilizes gradient-based VMC. Registering the relative-broadened custom
-    VJP (the same rule ``PepsEnergyOptimizer`` uses) stabilizes those
-    gradients. Exact contraction has no SVD, so registration is skipped. This
+    HOTRG/CTMRG/boundary-MPS contractions compress with SVDs. Quimb may retain
+    only the leading singular-vector columns, so Pepsy's registered thin-SVD
+    pullback restores the omitted zero cotangents before using JAX's native
+    derivative. Exact contraction has no SVD, so registration is skipped. This
     is a global autoray side effect and a soft no-op when JAX is unavailable.
     """
     from .api import ContractionConfig
@@ -1051,6 +2078,107 @@ def _maybe_register_stable_jax_svd(contraction):
 
 def _contraction_options(contraction_opts):
     return {} if contraction_opts is None else dict(contraction_opts)
+
+
+_FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED = False
+_FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED = False
+
+
+def _is_flat_symmray_network(tn):
+    """Return whether ``tn`` contains flat Symmray tensor data."""
+    for tensor in tn:
+        data = getattr(tensor, "data", None)
+        if _is_symmray_array(data):
+            return "Flat" in type(data).__name__
+    return False
+
+
+def _contract_boundary_for_vmc(tn, *, max_bond, cutoff, method_opts):
+    """Contract a PEPS boundary, with a flat-Symmray compatibility retry.
+
+    Quimb's ``max_separation=0`` path can ask its canonizer to unfuse an
+    empty boundary axis. Current flat fermionic Symmray arrays cannot represent
+    that intermediate operation, which surfaces as an ``align_axes`` or
+    ``unfuse`` exception during JAX tracing. The requested sequence, chi,
+    canonization, and other options are still honored; only this one stopping
+    threshold is relaxed to Quimb's stable ``1`` fallback for flat Symmray.
+    Dense/non-Symmray networks and all other failures are re-raised unchanged.
+    """
+    global _FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED
+    kwargs = dict(method_opts)
+    try:
+        return tn.contract_boundary(
+            max_bond=max_bond,
+            cutoff=cutoff,
+            strip_exponent=True,
+            **kwargs,
+        )
+    except (AttributeError, TypeError, ValueError):
+        if (
+            kwargs.get("max_separation", 1) == 0
+            and _is_flat_symmray_network(tn)
+        ):
+            if not _FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED:
+                warnings.warn(
+                    "Flat Symmray JAX boundary contraction does not support "
+                    "the max_separation=0 intermediate axis path; retrying "
+                    "with max_separation=1. The requested sequence, chi, and "
+                    "canonization options remain active.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                _FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED = True
+            kwargs["max_separation"] = 1
+            return tn.contract_boundary(
+                max_bond=max_bond,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **kwargs,
+            )
+        raise
+
+
+def _contract_ctmrg_for_vmc(tn, *, max_bond, cutoff, method_opts):
+    """Contract CTMRG, retrying flat-Symmray ``max_separation=0`` safely.
+
+    CTMRG delegates boundary compression to Quimb internally. On flat
+    fermionic Symmray arrays, its zero-separation intermediate can produce a
+    JAX block-matmul shape error (for example an environment axis of size
+    ``chi`` paired with a Z2 block axis). Keep all requested options active and
+    relax only this stopping threshold to Quimb's stable value ``1``.
+    """
+    global _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED
+    kwargs = dict(method_opts)
+    try:
+        return tn.contract_ctmrg(
+            max_bond=max_bond,
+            cutoff=cutoff,
+            strip_exponent=True,
+            **kwargs,
+        )
+    except (AttributeError, TypeError, ValueError):
+        if (
+            kwargs.get("max_separation", 1) == 0
+            and _is_flat_symmray_network(tn)
+        ):
+            if not _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED:
+                warnings.warn(
+                    "Flat Symmray JAX CTMRG does not support the "
+                    "max_separation=0 intermediate axis path; retrying "
+                    "with max_separation=1. The requested sequence, chi, "
+                    "and canonization options remain active.",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+                _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED = True
+            kwargs["max_separation"] = 1
+            return tn.contract_ctmrg(
+                max_bond=max_bond,
+                cutoff=cutoff,
+                strip_exponent=True,
+                **kwargs,
+            )
+        raise
 
 
 def _resolve_netket_contraction(contraction, chi, cutoff, contraction_opts):
@@ -1112,7 +2240,7 @@ def _resolve_sampling_build_config(
     return (
         sampling.n_samples,
         sampling.n_chains,
-        sampling.burn_in,
+        sampling.n_discard_per_chain,
         sampling.chunk_size if sampling.chunk_size is not None else chunk_size,
         sampling.seed if sampling.seed is not None else seed,
         sampling.sampler_seed if sampling.sampler_seed is not None else sampler_seed,
@@ -1227,7 +2355,7 @@ def prepare_fermionic_peps_for_netket(peps, *, device=None):
                 sr = _require_symmray()
             try:
                 converted = data.to_flat()
-            except RuntimeError:
+            except (RuntimeError, ValueError):
                 converted = _z2_flat_padded(data, sr)
                 padded_sites.append(site)
             tn[site].modify(data=converted)
@@ -1487,7 +2615,13 @@ def make_netket_autochunk_callback(
 ):
     """Create NetKet's auto-chunk callback for sampler/forward/backward OOMs."""
     nk = _require_netket()
-    return nk.callbacks.AutoChunkSize(
+    callback_cls = getattr(getattr(nk, "callbacks", None), "AutoChunkSize", None)
+    if callback_cls is None:
+        raise RuntimeError(
+            "NetKet AutoChunkSize requires NetKet >= 3.22; "
+            f"found {getattr(nk, '__version__', 'an unknown version')!r}."
+        )
+    return callback_cls(
         sampler_chunk_size=sampler_chunk_size,
         chunk_size=chunk_size,
         chunk_size_bwd=chunk_size_bwd,
@@ -1627,6 +2761,33 @@ def _infer_lattice_shape_from_peps(peps):
     return Lx, Ly
 
 
+def _infer_lattice_shape_from_fermi_terms(terms):
+    """Infer ``(Lx, Ly)`` from coordinate-keyed native fermion terms.
+
+    Integer site labels do not contain enough information to distinguish a
+    rectangular lattice from a one-dimensional indexing scheme, so this
+    fallback deliberately accepts only coordinate-keyed native terms.  The
+    normal public path still prefers the PEPS geometry when it is available.
+    """
+    if terms is None or not hasattr(terms, "keys"):
+        return None
+    coordinates = []
+    for key in terms.keys():
+        if _is_coordinate_edge_key(key):
+            coordinates.extend(tuple(site) for site in key)
+        elif isinstance(key, tuple) and len(key) == 2:
+            try:
+                coordinates.append((int(key[0]), int(key[1])))
+            except (TypeError, ValueError):
+                continue
+    if not coordinates:
+        return None
+    return (
+        max(int(site[0]) for site in coordinates) + 1,
+        max(int(site[1]) for site in coordinates) + 1,
+    )
+
+
 def _site_index_for_lattice(site, Lx, Ly):
     if isinstance(site, Integral):
         site = int(site)
@@ -1713,9 +2874,18 @@ def _infer_pbc_from_fermi_terms(terms, Lx, Ly):
     pbc_x = False
     pbc_y = False
     for key in terms.keys():
-        if not _is_coordinate_edge_key(key):
-            continue
-        (i0, j0), (i1, j1) = key
+        if _is_coordinate_edge_key(key):
+            (i0, j0), (i1, j1) = key
+        else:
+            try:
+                left, right = tuple(key)
+                left, right = int(left), int(right)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= left < Lx * Ly and 0 <= right < Lx * Ly):
+                continue
+            i0, j0 = divmod(left, Ly)
+            i1, j1 = divmod(right, Ly)
         i0, j0, i1, j1 = int(i0), int(j0), int(i1), int(j1)
         pbc_x |= {i0, i1} == {0, Lx - 1} and j0 == j1 and Lx > 2
         pbc_y |= {j0, j1} == {0, Ly - 1} and i0 == i1 and Ly > 2
@@ -2031,18 +3201,18 @@ def _make_peps_batched_amplitude_apply(
                 **method_opts,
             )
         if contraction == "ctmrg":
-            return tnx.contract_ctmrg(
+            return _contract_ctmrg_for_vmc(
+                tnx,
                 max_bond=chi,
                 cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
+                method_opts=method_opts,
             )
         if contraction == "boundary":
-            return tnx.contract_boundary(
+            return _contract_boundary_for_vmc(
+                tnx,
                 max_bond=chi,
                 cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
+                method_opts=method_opts,
             )
         amp = tnx.contract(all)
         return amp, jnp.zeros((), dtype=real_dtype)
@@ -2118,18 +3288,18 @@ def _make_peps_batched_amplitude_nojit(
                 **method_opts,
             )
         elif contraction == "ctmrg":
-            mantissa, exponent = tnx.contract_ctmrg(
+            mantissa, exponent = _contract_ctmrg_for_vmc(
+                tnx,
                 max_bond=chi,
                 cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
+                method_opts=method_opts,
             )
         elif contraction == "boundary":
-            mantissa, exponent = tnx.contract_boundary(
+            mantissa, exponent = _contract_boundary_for_vmc(
+                tnx,
                 max_bond=chi,
                 cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
+                method_opts=method_opts,
             )
         else:
             mantissa = tnx.contract(all)
@@ -2272,6 +3442,58 @@ def make_peps_log_amplitude_model(
     return PEPSLogAmplitude()
 
 
+def _netket_variables_from_ansatz(ansatz, param_dtype=None):
+    """Build Flax variables directly from an already-packed PEPS ansatz.
+
+    ``MCState`` otherwise calls ``model.init`` with a dummy configuration.
+    For these PEPS models that dummy call needlessly traces the contraction
+    once, even though the packed leaves are already the desired parameters.
+    """
+    _, jnp = _require_jax()
+    dtype = None if param_dtype is None else param_dtype
+    return {
+        "params": {
+            f"t{k}": jnp.asarray(leaf, dtype=dtype)
+            for k, leaf in enumerate(ansatz.leaves)
+        }
+    }
+
+
+def _peps_params_from_netket_variables(ansatz, variables, *, device_get=True):
+    """Rebuild quimb's packed parameter tree from Flax/NetKet variables.
+
+    The PEPS Flax models deliberately name their leaves ``t0``, ``t1``, ...
+    in :func:`_netket_variables_from_ansatz`.  Keeping the inverse conversion
+    here makes that private model detail explicit and gives the public setup
+    handoff a useful validation error instead of an opaque ``qtn.unpack``
+    failure.
+    """
+    if not hasattr(variables, "get"):
+        raise TypeError(
+            "variables must be a Flax variables mapping or a parameters mapping."
+        )
+    parameters = variables.get("params", variables)
+    if not hasattr(parameters, "__getitem__"):
+        raise TypeError("variables['params'] must be a mapping of PEPS leaves.")
+
+    expected = tuple(f"t{k}" for k in range(len(ansatz.leaves)))
+    try:
+        leaves = tuple(parameters[name] for name in expected)
+    except KeyError as error:
+        raise ValueError(
+            "NetKet PEPS parameters are missing leaf "
+            f"{error.args[0]!r}; expected {expected!r}."
+        ) from error
+
+    if device_get:
+        jax, _ = _require_jax()
+        leaves = tuple(np.asarray(jax.device_get(leaf)) for leaf in leaves)
+    else:
+        leaves = tuple(leaves)
+    jax, _ = _require_jax()
+    return jax.tree_util.tree_unflatten(ansatz.treedef, leaves)
+
+
 def _make_fermionic_peps_batched_amplitude_apply(
     ansatz,
     columns,
@@ -2335,18 +3557,18 @@ def _make_fermionic_peps_batched_amplitude_apply(
                 **method_opts,
             )
         if contraction == "ctmrg":
-            return tnx.contract_ctmrg(
+            return _contract_ctmrg_for_vmc(
+                tnx,
                 max_bond=chi,
                 cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
+                method_opts=method_opts,
             )
         if contraction == "boundary":
-            return tnx.contract_boundary(
+            return _contract_boundary_for_vmc(
+                tnx,
                 max_bond=chi,
                 cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
+                method_opts=method_opts,
             )
         amp = tnx.contract(all)
         return amp, jnp.zeros((), dtype=real_dtype)
@@ -2427,18 +3649,18 @@ def _make_fermionic_peps_batched_amplitude_nojit(
                 **method_opts,
             )
         elif contraction == "ctmrg":
-            mantissa, exponent = tnx.contract_ctmrg(
+            mantissa, exponent = _contract_ctmrg_for_vmc(
+                tnx,
                 max_bond=chi,
                 cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
+                method_opts=method_opts,
             )
         elif contraction == "boundary":
-            mantissa, exponent = tnx.contract_boundary(
+            mantissa, exponent = _contract_boundary_for_vmc(
+                tnx,
                 max_bond=chi,
                 cutoff=cutoff,
-                strip_exponent=True,
-                **method_opts,
+                method_opts=method_opts,
             )
         else:
             mantissa = tnx.contract(all)
@@ -2677,6 +3899,7 @@ def _build_netket_peps_vmc(
     vstate = _require_netket().vqs.MCState(
         sampler,
         model,
+        variables=_netket_variables_from_ansatz(ansatz, param_dtype),
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         chunk_size=_check_positive_int("chunk_size", chunk_size),
@@ -3118,7 +4341,10 @@ def compile_operator_sum_netket(hilbert, terms, *, site_order=None, conserving=F
     Symbolic fermion products are lowered to the existing
     :func:`netket_fermion_operator` primitive. Local matrix terms are lowered
     to ``nk.operator.LocalOperator``. The identity constant is included in the
-    returned native operator, so callers must not add it again.
+    returned native operator, so callers must not add it again. Pass
+    ``conserving=\"auto\"`` to use NetKet's reduced fixed-sector fermion
+    operator when the symbolic terms preserve particle number and spin; terms
+    that do not preserve the sector retain the generic operator.
     """
     from .api import (
         LocalMatrixTerm,
@@ -3207,19 +4433,29 @@ def compile_operator_sum_netket(hilbert, terms, *, site_order=None, conserving=F
     return total
 
 
-def fermion_model_terms(fermion, edges, *, n_sites=None):
+def fermion_model_terms(
+    fermion,
+    edges,
+    *,
+    t,
+    U,
+    V=0.0,
+    mu=0.0,
+    n_sites=None,
+):
     r"""Return symbolic Hamiltonian terms for a spinful :class:`pepsy.Fermion`.
 
     Reconstructs the hopping (:math:`-t`), on-site Hubbard
     (:math:`U\,n_\uparrow n_\downarrow`), nearest-neighbor density
     (:math:`V\,n_i n_j`) and chemical-potential (:math:`-\mu\,n`) terms of
-    ``fermion`` over the integer ``edges`` as a list of ``(coefficient, ops)``
-    pairs (see :func:`netket_fermion_operator`). This lets any spinful
-    :class:`pepsy.Fermion` model drive a NetKet VMC run, not only plain
-    Fermi-Hubbard.
+    explicit coefficients over the integer ``edges`` as a list of
+    ``(coefficient, ops)`` pairs (see :func:`netket_fermion_operator`). The
+    coefficients are arguments rather than state on ``fermion``, so the
+    symbolic NetKet operator cannot diverge from the native Hamiltonian.
 
-    Only spinful fermions with uniform scalar parameters are supported; supply
-    per-edge/per-site couplings directly as explicit terms.
+    Only uniform scalar parameters are supported; supply non-uniform couplings
+    as a native ``fermion.hamiltonian({...})`` mapping to
+    :func:`build_fermion_vmc`.
     """
     if not getattr(fermion, "spinful", True):
         raise NotImplementedError(
@@ -3231,20 +4467,19 @@ def fermion_model_terms(fermion, edges, *, n_sites=None):
         n_sites = 1 + max((max(i, j) for i, j in edges), default=-1)
     sites = range(int(n_sites))
 
-    def _scalar(name, default):
-        value = getattr(fermion, name, default)
+    def _scalar(name, value):
         try:
             return float(value)
         except (TypeError, ValueError) as exc:
             raise TypeError(
-                f"fermion.{name} must be a real scalar for fermion_model_terms; "
+                f"{name} must be a real scalar for fermion_model_terms; "
                 f"got {value!r}. Pass explicit terms for non-uniform couplings."
             ) from exc
 
-    t = _scalar("t", 1.0)
-    U = _scalar("U", 0.0)
-    V = _scalar("V", 0.0)
-    mu = _scalar("mu", 0.0)
+    t = _scalar("t", t)
+    U = _scalar("U", U)
+    V = _scalar("V", V)
+    mu = _scalar("mu", mu)
 
     terms = []
     for i, j in edges:
@@ -3286,8 +4521,256 @@ def fermion_model_terms(fermion, edges, *, n_sites=None):
     return terms
 
 
+def _native_term_support(where, *, coordinate_sites):
+    """Return the ordered one- or two-site support encoded by a term key."""
+    if coordinate_sites and (
+        isinstance(where, (tuple, list))
+        and len(where) == 2
+        and all(isinstance(value, Integral) for value in where)
+    ):
+        return (tuple(int(value) for value in where),)
+    if isinstance(where, (tuple, list)):
+        support = tuple(where)
+    else:
+        support = (where,)
+    if len(support) not in {1, 2}:
+        raise ValueError(
+            "Native Fermion Hamiltonian terms must have one-site or two-site keys; "
+            f"got {where!r}."
+        )
+    return support
+
+
+def _native_term_to_numpy(term):
+    """Transfer one small native local term to a host dense matrix."""
+    dense = term.to_dense() if hasattr(term, "to_dense") else term
+    detach = getattr(dense, "detach", None)
+    if callable(detach):
+        dense = detach()
+    cpu = getattr(dense, "cpu", None)
+    if callable(cpu):
+        dense = cpu()
+    return np.asarray(dense, dtype=np.complex128)
+
+
+def _project_native_term(matrix, candidates, *, where):
+    """Expand a native local matrix in a small Fermi-Hubbard operator basis."""
+    columns = np.stack([candidate.reshape(-1) for candidate in candidates], axis=1)
+    coefficients, _, _, _ = np.linalg.lstsq(columns, matrix.reshape(-1), rcond=None)
+    reconstructed = (columns @ coefficients).reshape(matrix.shape)
+    residual = np.linalg.norm(matrix - reconstructed)
+    scale = max(1.0, float(np.linalg.norm(matrix)))
+    if residual > 5.0e-6 * scale:
+        raise ValueError(
+            "Native term at "
+            f"{where!r} is not in the supported spinful Fermi-Hubbard local "
+            "operator span. Supply an explicit symbolic OperatorSum to NetKet "
+            "for a custom interaction."
+        )
+    return coefficients
+
+
+def _native_fermi_hubbard_terms_to_netket(fermion, terms, *, site_order):
+    """Compile explicit native Hubbard terms into NetKet fermion monomials.
+
+    The native Symmray terms are the authoritative Hamiltonian. Their local
+    matrices are decomposed into the neutral Fermi-Hubbard basis (identity,
+    spin-resolved number, doublon, hopping, and density terms), then emitted
+    as NetKet creation/annihilation products. This retains NetKet's fermionic
+    Jordan-Wigner signs while allowing the native and VMC paths to share the
+    exact same explicit term mapping.
+    """
+    if fermion is None or not getattr(fermion, "spinful", False):
+        raise TypeError(
+            "Compiling native terms for NetKet requires a spinful Fermion helper."
+        )
+    terms = _native_fermion_terms_mapping(terms)
+    coordinate_sites = any(
+        isinstance(where, (tuple, list))
+        and len(where) == 2
+        and all(
+            isinstance(site, (tuple, list))
+            and len(site) == 2
+            and all(isinstance(value, Integral) for value in site)
+            for site in where
+        )
+        for where in terms
+    )
+    site_order = tuple(site_order)
+    site_to_orbital = {site: orbital for orbital, site in enumerate(site_order)}
+
+    def orbital(site):
+        if site in site_to_orbital:
+            return site_to_orbital[site]
+        if isinstance(site, Integral) and 0 <= int(site) < len(site_order):
+            return int(site)
+        raise ValueError(
+            f"Native term site {site!r} is not present in the PEPS site order."
+        )
+
+    # Build basis operators on CPU: native input terms can live on JAX/Torch,
+    # but compilation only needs tiny 4x4 / 16x16 host matrices.
+    from ..tensors import Fermion  # pylint: disable=import-outside-toplevel
+
+    reference = Fermion(
+        spinful=True,
+        symmetry=fermion.symmetry,
+        dtype=fermion.dtype,
+    )
+    one_site_basis = (
+        _native_term_to_numpy(reference.observable("identity")),
+        _native_term_to_numpy(reference.observable("number_up")),
+        _native_term_to_numpy(reference.observable("number_down")),
+        _native_term_to_numpy(reference.interaction_operator()),
+    )
+    two_site_basis = (
+        _native_term_to_numpy(reference.hopping_operator(spin="up")),
+        _native_term_to_numpy(
+            reference.hopping_operator(spin="up", peierls_angle=np.pi / 2)
+        ),
+        _native_term_to_numpy(reference.hopping_operator(spin="down")),
+        _native_term_to_numpy(
+            reference.hopping_operator(spin="down", peierls_angle=np.pi / 2)
+        ),
+        _native_term_to_numpy(reference.density_operator()),
+        _native_term_to_numpy(
+            reference.operator_term(
+                [(1.0, ((0, "number_up"),))], sites=(0, 1)
+            )
+        ),
+        _native_term_to_numpy(
+            reference.operator_term(
+                [(1.0, ((0, "number_down"),))], sites=(0, 1)
+            )
+        ),
+        _native_term_to_numpy(
+            reference.operator_term(
+                [(1.0, ((1, "number_up"),))], sites=(0, 1)
+            )
+        ),
+        _native_term_to_numpy(
+            reference.operator_term(
+                [(1.0, ((1, "number_down"),))], sites=(0, 1)
+            )
+        ),
+        _native_term_to_numpy(
+            reference.operator_term(
+                [(1.0, ((0, "double"),))], sites=(0, 1)
+            )
+        ),
+        _native_term_to_numpy(
+            reference.operator_term(
+                [(1.0, ((1, "double"),))], sites=(0, 1)
+            )
+        ),
+        _native_term_to_numpy(
+            reference.operator_term([(1.0, ())], sites=(0, 1))
+        ),
+    )
+
+    symbolic = []
+    constant = 0.0j
+    for where, term in dict(terms).items():
+        support = _native_term_support(where, coordinate_sites=coordinate_sites)
+        matrix = _native_term_to_numpy(term)
+        if len(support) == 1:
+            (site,) = support
+            coeff_identity, coeff_up, coeff_down, coeff_double = _project_native_term(
+                matrix,
+                one_site_basis,
+                where=where,
+            )
+            constant += coeff_identity
+            target = orbital(site)
+            if abs(coeff_up) > 1.0e-10:
+                symbolic.append((coeff_up, ((target, 1, True), (target, 1, False))))
+            if abs(coeff_down) > 1.0e-10:
+                symbolic.append((coeff_down, ((target, -1, True), (target, -1, False))))
+            if abs(coeff_double) > 1.0e-10:
+                symbolic.append(
+                    (
+                        coeff_double,
+                        (
+                            (target, 1, True),
+                            (target, 1, False),
+                            (target, -1, True),
+                            (target, -1, False),
+                        ),
+                    )
+                )
+            continue
+
+        left, right = (orbital(site) for site in support)
+        (
+            up_real,
+            up_imag,
+            down_real,
+            down_imag,
+            density,
+            left_up,
+            left_down,
+            right_up,
+            right_down,
+            left_double,
+            right_double,
+            identity,
+        ) = _project_native_term(matrix, two_site_basis, where=where)
+        constant += identity
+        for sz, real, imag in (
+            (1, up_real, up_imag),
+            (-1, down_real, down_imag),
+        ):
+            forward = real + 1.0j * imag
+            backward = real - 1.0j * imag
+            if abs(forward) > 1.0e-10:
+                symbolic.append((forward, ((left, sz, True), (right, sz, False))))
+            if abs(backward) > 1.0e-10:
+                symbolic.append((backward, ((right, sz, True), (left, sz, False))))
+        if abs(density) > 1.0e-10:
+            for left_sz in (1, -1):
+                for right_sz in (1, -1):
+                    symbolic.append(
+                        (
+                            density,
+                            (
+                                (left, left_sz, True),
+                                (left, left_sz, False),
+                                (right, right_sz, True),
+                                (right, right_sz, False),
+                            ),
+                        )
+                    )
+        for target, sz, coefficient in (
+            (left, 1, left_up),
+            (left, -1, left_down),
+            (right, 1, right_up),
+            (right, -1, right_down),
+        ):
+            if abs(coefficient) > 1.0e-10:
+                symbolic.append(
+                    (coefficient, ((target, sz, True), (target, sz, False)))
+                )
+        for target, coefficient in (
+            (left, left_double),
+            (right, right_double),
+        ):
+            if abs(coefficient) > 1.0e-10:
+                symbolic.append(
+                    (
+                        coefficient,
+                        (
+                            (target, 1, True),
+                            (target, 1, False),
+                            (target, -1, True),
+                            (target, -1, False),
+                        ),
+                    )
+                )
+    return symbolic, constant
+
+
 def standard_fermion_observables(hilbert):
-    """Return common spinful-fermion observables for :meth:`NetKetPEPSVMC.measure`.
+    """Return common spinful observables for :meth:`NetKetPEPSVMC.measure_samples`.
 
     The returned ``{name: operator}`` mapping contains the total particle
     number per spin (``"n_up"``, ``"n_down"``), the total particle number
@@ -3302,15 +4785,144 @@ def standard_fermion_observables(hilbert):
         for i in range(n)
     ]
     return {
-        "n_up": netket_fermion_operator(hilbert, n_up),
-        "n_down": netket_fermion_operator(hilbert, n_down),
-        "n_total": netket_fermion_operator(hilbert, n_up + n_down),
-        "double_occupancy": netket_fermion_operator(hilbert, doub),
+        "n_up": netket_fermion_operator(hilbert, n_up, conserving="auto"),
+        "n_down": netket_fermion_operator(hilbert, n_down, conserving="auto"),
+        "n_total": netket_fermion_operator(
+            hilbert, n_up + n_down, conserving="auto"
+        ),
+        "double_occupancy": netket_fermion_operator(
+            hilbert, doub, conserving="auto"
+        ),
     }
 
 
+def _eta_pair_lattice_sites(ansatz):
+    """Return a rectangular zero-origin coordinate lattice from an ansatz."""
+    sites = tuple(getattr(ansatz, "orbital_sites", ()))
+    if not sites:
+        raise ValueError(
+            "Eta-pair measurement needs a packed PEPS with coordinate "
+            "orbital_sites."
+        )
+    if len(set(sites)) != len(sites):
+        raise ValueError("Eta-pair measurement requires unique orbital_sites.")
+    if any(
+        not isinstance(site, tuple)
+        or len(site) != 2
+        or any(
+            isinstance(coord, bool) or not isinstance(coord, Integral)
+            for coord in site
+        )
+        for site in sites
+    ):
+        raise ValueError(
+            "Eta-pair measurement requires two-dimensional integer "
+            "orbital_sites."
+        )
+
+    sites = tuple((int(x), int(y)) for x, y in sites)
+    xs = {x for x, _ in sites}
+    ys = {y for _, y in sites}
+    if min(xs) != 0 or min(ys) != 0:
+        raise ValueError(
+            "Eta-pair measurement requires a zero-origin rectangular lattice."
+        )
+    Lx, Ly = max(xs) + 1, max(ys) + 1
+    expected = {(x, y) for x in range(Lx) for y in range(Ly)}
+    if set(sites) != expected:
+        raise ValueError(
+            "Eta-pair measurement requires orbital_sites to cover a complete "
+            "rectangular lattice."
+        )
+    return sites, Lx, Ly
+
+
+def _netket_eta_pair_operator(hilbert, ansatz, specification):
+    """Compile a declarative eta-pair specification for a packed PEPS."""
+    sites, Lx, Ly = _eta_pair_lattice_sites(ansatz)
+    site_to_orbital = {site: orbital for orbital, site in enumerate(sites)}
+
+    if specification.dx == 0 and specification.dy == 0:
+        coefficient = 1.0 / len(sites)
+        terms = [
+            (
+                coefficient,
+                (
+                    (orbital, 1, True),
+                    (orbital, 1, False),
+                    (orbital, -1, True),
+                    (orbital, -1, False),
+                ),
+            )
+            for orbital in range(len(sites))
+        ]
+        return netket_fermion_operator(hilbert, terms, conserving="auto")
+
+    pairs = []
+    site_set = set(sites)
+    for left in sites:
+        x, y = left
+        if specification.periodic:
+            right = ((x + specification.dx) % Lx, (y + specification.dy) % Ly)
+        else:
+            right = (x + specification.dx, y + specification.dy)
+            if right not in site_set:
+                continue
+        pairs.append((left, right))
+    if not pairs:
+        raise ValueError("The requested eta-pair displacement has no valid pairs.")
+
+    normalizer = len(sites) if specification.periodic else len(pairs)
+    terms = []
+    for left, right in pairs:
+        phase = (
+            -1.0
+            if specification.staggered and (sum(left) + sum(right)) % 2
+            else 1.0
+        )
+        coefficient = phase / normalizer
+        left_orbital = site_to_orbital[left]
+        right_orbital = site_to_orbital[right]
+        terms.extend(
+            (
+                (
+                    coefficient,
+                    (
+                        (left_orbital, 1, True),
+                        (left_orbital, -1, True),
+                        (right_orbital, -1, False),
+                        (right_orbital, 1, False),
+                    ),
+                ),
+                (
+                    coefficient,
+                    (
+                        (right_orbital, 1, True),
+                        (right_orbital, -1, True),
+                        (left_orbital, -1, False),
+                        (left_orbital, 1, False),
+                    ),
+                ),
+            )
+        )
+    return netket_fermion_operator(hilbert, terms, conserving="auto")
+
+
+def _resolve_netket_measurement_observable(hilbert, ansatz, observable):
+    """Compile declarative NetKet measurement observables on demand."""
+    if isinstance(observable, NetKetEtaPairObservable):
+        return _netket_eta_pair_operator(hilbert, ansatz, observable)
+    return observable
+
+
 def _normalize_fermion_observables(hilbert, observables, *, site_order=None):
-    """Resolve an ``{name: operator_or_terms}`` mapping to NetKet operators."""
+    """Resolve an ``{name: operator_or_terms}`` mapping to NetKet operators.
+
+    Declarative symbolic operators request NetKet's conserving fermion
+    specialization when possible. Non-conserving observables safely fall back
+    to the generic operator, so pairing or spin-changing measurements retain
+    their physical meaning.
+    """
     from .api import OperatorSum
     if observables is None:
         return None
@@ -3327,9 +4939,14 @@ def _normalize_fermion_observables(hilbert, observables, *, site_order=None):
                 hilbert,
                 spec,
                 site_order=site_order,
+                conserving="auto",
             )
         else:
-            resolved[str(name)] = netket_fermion_operator(hilbert, spec)
+            resolved[str(name)] = netket_fermion_operator(
+                hilbert,
+                spec,
+                conserving="auto",
+            )
     return resolved
 
 
@@ -3391,13 +5008,13 @@ def build_fermi_hubbard_vmc(
     """Create NetKet VMC objects for a fixed-sector Fermi-Hubbard PEPS.
 
     ``fermion`` and ``terms`` may be the native Pepsy objects used during
-    imaginary-time evolution.  ``terms`` is inspected only to infer the
+    imaginary-time evolution. ``terms`` is inspected only to infer the
     lattice edges and which Hamiltonian axes are periodic; its operator
     coefficients (including any chemical-potential or on-site shifts) are NOT
     used to build the Hamiltonian.  The Hamiltonian is always NetKet's
     ``FermiHubbardJax`` with the resolved ``t``/``U`` (see below), so pass the
-    hopping/interaction through ``t``, ``U`` (or ``fermion``) rather than
-    through ``terms``.  ``sector`` or
+    hopping/interaction through explicit ``t`` and ``U`` rather than through
+    ``terms``. ``sector`` or
     ``n_fermions_per_spin`` accepts either ``(N_up, N_down)`` or Pepsy's
     ``setup.spin_occupations`` mapping.  The evolved PEPS is prepared for JAX
     internally, and its variational parameters use quimb's native
@@ -3408,11 +5025,9 @@ def build_fermi_hubbard_vmc(
     setting ``MU=0`` once the spin sector is fixed.
 
     When ``register_stable_svd`` is True (default) and ``contraction`` is an
-    SVD-based approximation (``hotrg``/``ctmrg``/``boundary``), Pepsy's
-    regularized JAX SVD backward rule is installed globally via
-    :func:`pepsy.reg_rel_svd_jax` so VMC gradients through the compression SVDs
-    stay finite near degenerate singular values. Set it False to keep your own
-    autoray SVD registration.
+    SVD-based approximation (``hotrg``/``ctmrg``/``boundary``), Pepsy installs
+    a JAX thin-SVD pullback that safely handles Quimb's fixed-rank truncation.
+    Set it False to keep your own autoray SVD registration.
     """
     (
         n_samples,
@@ -3449,11 +5064,10 @@ def build_fermi_hubbard_vmc(
     n_fermions_per_spin = tuple(int(value) for value in n_fermions_per_spin)
     if len(n_fermions_per_spin) != 2:
         raise ValueError("n_fermions_per_spin must contain (N_up, N_down).")
-    if fermion is not None:
-        if t is None:
-            t = getattr(fermion, "t", 1.0)
-        if U is None:
-            U = getattr(fermion, "U", 8.0)
+    if fermion is not None and not getattr(fermion, "spinful", True):
+        raise NotImplementedError(
+            "build_fermi_hubbard_vmc supports spinful fermions only."
+        )
     t = 1.0 if t is None else t
     U = 8.0 if U is None else U
     if pbc is None:
@@ -3511,6 +5125,7 @@ def build_fermi_hubbard_vmc(
     vstate = nk.vqs.MCState(
         sampler,
         model,
+        variables=_netket_variables_from_ansatz(ansatz, param_dtype),
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         chunk_size=_check_positive_int("chunk_size", chunk_size),
@@ -3549,6 +5164,7 @@ def build_fermion_vmc(
     hamiltonian=None,
     terms=None,
     observables=None,
+    config=None,
     Lx=None,
     Ly=None,
     n_fermions_per_spin=None,
@@ -3556,7 +5172,7 @@ def build_fermion_vmc(
     pbc=None,
     edges=None,
     graph=None,
-    conserving="auto",
+    conserving=False,
     contraction="exact",
     chi=None,
     cutoff=0.0,
@@ -3568,9 +5184,10 @@ def build_fermion_vmc(
     chunk_size=256,
     sampling=None,
     sampler_chunk_size=None,
+    sampler_sweep_size=None,
     seed=None,
     sampler_seed=None,
-    use_sr="auto",
+    use_sr=False,
     max_sr_params=5_000,
     sr_diag_shift=0.01,
     sr_diag_scale=None,
@@ -3579,22 +5196,19 @@ def build_fermion_vmc(
     sr_solver_restart=False,
     param_dtype=None,
     verify_columns=False,
+    progress=False,
 ):
     """Create a NetKet VMC setup for a general spinful-fermion model.
 
     Unlike :func:`build_fermi_hubbard_vmc`, the Hamiltonian is not restricted to
     NetKet's ``FermiHubbardJax``. Define the model in one of these ways:
 
-    * ``fermion`` -- a :class:`pepsy.Fermion` whose hopping / interaction /
-      density / chemical-potential parameters are turned into a NetKet fermion
-      operator over ``edges`` (see :func:`fermion_model_terms`). This covers
-      Fermi-Hubbard, Hubbard + nearest-neighbor ``V``, and a chemical potential.
     * ``fermion`` **plus** native ``terms=`` / ``hamiltonian=`` -- pass the
-      native Pepsy ``SymHamiltonian`` (from ``fermion.hamiltonian(...)``) or its
-      coordinate-keyed ``.terms`` mapping to let the builder infer the integer
-      lattice ``edges`` and periodic axes (``pbc``) directly from the terms,
-      then rebuild the matching NetKet Hamiltonian from ``fermion``. This mirrors
-      the ergonomics of :class:`pepsy.vmc.TorchFermionVMC`.
+      authoritative native Pepsy ``SymHamiltonian`` (from
+      ``fermion.hamiltonian(...)``) or its coordinate-keyed ``.terms`` mapping.
+      The builder infers integer lattice ``edges`` and periodic axes (``pbc``)
+      directly from those terms, then compiles the supplied local operators to
+      a matching NetKet fermion operator. Couplings never live on ``fermion``.
     * ``terms`` -- an explicit list of symbolic ``(coefficient, ops)`` terms
       (see :func:`netket_fermion_operator`) for a custom fermionic model.
     * ``OperatorSum`` -- the backend-neutral term representation shared with
@@ -3604,6 +5218,36 @@ def build_fermion_vmc(
     ``edges`` / ``graph`` / ``pbc``, when given explicitly, take precedence over
     any geometry inferred from native terms.
 
+    When omitted, ``Lx``/``Ly`` are inferred from the PEPS rectangular site
+    layout, with a coordinate-keyed native Hamiltonian as a fallback.  Native
+    coordinate or row-major integer edge keys provide the graph and periodic
+    boundary inference.  Pass :class:`~pepsy.vmc.ContractionConfig` and
+    :class:`~pepsy.vmc.SamplingConfig` through ``contraction=`` and
+    ``sampling=`` to keep those settings in one validated object.
+
+    ``progress=True`` shows an eight-stage setup bar (settings, Hilbert/graph,
+    Hamiltonian, PEPS packing, JAX model, sampler, MCState, and optional SR
+    preconditioner). The returned
+    setup stores the corresponding :class:`NetKetBuildTiming` in
+    ``build_timing``. This setup timing is distinct from the lazy JAX
+    sampler/amplitude/energy compilation reported by :meth:`warmup`.
+
+    ``conserving="auto"`` option asks NetKet to convert the operator to its
+    experimental particle-number/spin-conserving representation. That can
+    trigger a one-time Numba compilation during the first build; it is an
+    optional runtime optimization, not a physics change. The default
+    ``conserving=False`` builds the ordinary exact NetKet fermion operator
+    immediately. ``sampler_sweep_size`` is passed to NetKet's Metropolis sampler as the
+    number of proposals between retained samples. When omitted, NetKet uses
+    the Hilbert-space size (``2 * Lx * Ly`` for this spinful model), so set it
+    explicitly when you want the Markov-chain work to be obvious and
+    reproducible. ``SamplingConfig.burn_in`` remains the per-chain discard
+    count before retained samples.
+
+    For a compact call, pass a :class:`NetKetVMCConfig` as ``config``. Its
+    numerical fields override the corresponding legacy keywords, while the
+    explicit ``fermion``/``hamiltonian`` inputs remain the model definition.
+
     ``observables`` is an optional ``{name: operator_or_terms}`` mapping stored
     on the returned setup; call :meth:`NetKetPEPSVMC.measure` to evaluate them
     (see :func:`standard_fermion_observables` for common choices). All
@@ -3611,6 +5255,35 @@ def build_fermion_vmc(
     :func:`build_fermi_hubbard_vmc`, and the returned setup exposes the same
     :meth:`NetKetPEPSVMC.warmup` and :meth:`NetKetPEPSVMC.optimize` helpers.
     """
+    if config is not None:
+        if not isinstance(config, NetKetVMCConfig):
+            raise TypeError("config must be a NetKetVMCConfig or None.")
+        contraction = config.contraction
+        sampling = config.sampling
+        sampler_sweep_size = config.sampler_sweep_size
+        conserving = config.conserving
+        use_sr = config.use_sr
+        param_dtype = config.param_dtype
+        verify_columns = config.verify_columns
+        progress = config.progress
+
+    build_started = time.perf_counter()
+    build_bar = _make_progress_bar(
+        total=8, desc="Build NetKet VMC", enabled=progress
+    )
+    stage_started = build_started
+    stage_seconds = {}
+
+    def mark_stage(name):
+        nonlocal stage_started
+        now = time.perf_counter()
+        elapsed = now - stage_started
+        stage_seconds[name] = elapsed
+        stage_started = now
+        if build_bar is not None:
+            build_bar.set_postfix_str(f"{name}: {elapsed:.1f}s")
+            build_bar.update(1)
+
     (
         n_samples,
         n_chains,
@@ -3627,7 +5300,14 @@ def build_fermion_vmc(
         seed=seed,
         sampler_seed=sampler_seed,
     )
+    contraction, chi, cutoff, contraction_opts = _resolve_netket_contraction(
+        contraction,
+        chi,
+        cutoff,
+        contraction_opts,
+    )
     nk = _require_netket()
+    mark_stage("settings")
     from .api import OperatorSum
     common_hamiltonian = hamiltonian if isinstance(hamiltonian, OperatorSum) else None
     common_terms = terms if isinstance(terms, OperatorSum) else None
@@ -3643,36 +5323,10 @@ def build_fermion_vmc(
             "build_fermion_vmc supports spinful fermions; use the sparse/torch "
             "path for spinless models."
         )
-    if (Lx is None) != (Ly is None):
-        raise ValueError("Lx and Ly must be supplied together or both omitted.")
-    if Lx is None:
-        Lx, Ly = _infer_lattice_shape_from_peps(peps)
-    Lx, Ly = int(Lx), int(Ly)
-    n_sites = Lx * Ly
-    if sector is not None:
-        if n_fermions_per_spin is not None:
-            raise ValueError(
-                "Pass only one of sector and n_fermions_per_spin."
-            )
-        n_fermions_per_spin = sector
-    n_fermions_per_spin = _coerce_spin_sector(n_fermions_per_spin)
-    if n_fermions_per_spin is None:
-        n_fermions_per_spin = (n_sites // 2, n_sites // 2)
-    n_fermions_per_spin = tuple(int(value) for value in n_fermions_per_spin)
-    if len(n_fermions_per_spin) != 2:
-        raise ValueError("n_fermions_per_spin must contain (N_up, N_down).")
 
-    hilbert = nk.hilbert.SpinOrbitalFermions(
-        n_sites,
-        s=1 / 2,
-        n_fermions_per_spin=n_fermions_per_spin,
-    )
-
-    # Classify how the model was supplied. ``terms``/``hamiltonian`` may be a
-    # native Pepsy SymHamiltonian or coordinate-keyed terms mapping (used to
-    # infer the lattice edges and periodicity, with the NetKet Hamiltonian
-    # rebuilt from ``fermion``), a symbolic ``(coefficient, ops)`` list, or an
-    # already-built NetKet operator.
+    # Classify native inputs before resolving the lattice shape.  This lets a
+    # coordinate-keyed SymHamiltonian provide geometry when the PEPS wrapper
+    # does not expose rectangular ``sites`` metadata.
     prebuilt_operator = None
     symbolic_terms = None
     native_terms = None
@@ -3694,6 +5348,37 @@ def build_fermion_vmc(
         else:
             symbolic_terms = terms
 
+    if (Lx is None) != (Ly is None):
+        raise ValueError("Lx and Ly must be supplied together or both omitted.")
+    if Lx is None:
+        try:
+            Lx, Ly = _infer_lattice_shape_from_peps(peps)
+        except ValueError as peps_error:
+            inferred_shape = _infer_lattice_shape_from_fermi_terms(native_terms)
+            if inferred_shape is None:
+                raise peps_error
+            Lx, Ly = inferred_shape
+    Lx, Ly = int(Lx), int(Ly)
+    n_sites = Lx * Ly
+    if sector is not None:
+        if n_fermions_per_spin is not None:
+            raise ValueError(
+                "Pass only one of sector and n_fermions_per_spin."
+            )
+        n_fermions_per_spin = sector
+    n_fermions_per_spin = _coerce_spin_sector(n_fermions_per_spin)
+    if n_fermions_per_spin is None:
+        n_fermions_per_spin = (n_sites // 2, n_sites // 2)
+    n_fermions_per_spin = tuple(int(value) for value in n_fermions_per_spin)
+    if len(n_fermions_per_spin) != 2:
+        raise ValueError("n_fermions_per_spin must contain (N_up, N_down).")
+
+    hilbert = nk.hilbert.SpinOrbitalFermions(
+        n_sites,
+        s=1 / 2,
+        n_fermions_per_spin=n_fermions_per_spin,
+    )
+
     # Infer lattice geometry (edges) and periodicity from native terms when
     # they were not given explicitly, mirroring build_fermi_hubbard_vmc.
     if pbc is None:
@@ -3714,6 +5399,7 @@ def build_fermion_vmc(
         graph = nk.graph.Graph(edges=tuple(edges), n_nodes=n_sites)
     elif edges is None:
         edges = tuple(tuple(edge) for edge in graph.edges())
+    mark_stage("Hilbert/graph")
 
     # Build the NetKet Hamiltonian.
     if common_operator_sum is not None:
@@ -3729,17 +5415,36 @@ def build_fermion_vmc(
         hamiltonian = netket_fermion_operator(
             hilbert, symbolic_terms, conserving=conserving
         )
-    elif fermion is not None:
-        model_terms = fermion_model_terms(fermion, edges, n_sites=n_sites)
+    elif native_terms is not None:
+        if fermion is None:
+            raise ValueError(
+                "Native Pepsy terms require fermion=... so their local "
+                "symmetry and basis can be validated for NetKet."
+            )
+        native_symbolic_terms, native_constant = _native_fermi_hubbard_terms_to_netket(
+            fermion,
+            native_terms,
+            site_order=_row_major_sites(Lx, Ly),
+        )
         hamiltonian = netket_fermion_operator(
-            hilbert, model_terms, conserving=conserving
+            hilbert,
+            native_symbolic_terms,
+            constant=native_constant,
+            conserving=conserving,
+        )
+    elif fermion is not None:
+        raise ValueError(
+            "build_fermion_vmc requires explicit native hamiltonian=... or "
+            "terms=... with fermion=.... Fermion stores local symmetry and "
+            "backend conventions, not t/U/V/mu couplings."
         )
     else:
         raise ValueError(
-            "Provide fermion=... (optionally with native terms=/hamiltonian= "
-            "for geometry), a symbolic terms=..., or an already-built NetKet "
-            "hamiltonian=... to define the model for build_fermion_vmc."
+            "Provide fermion=... plus native terms=/hamiltonian=..., a "
+            "symbolic terms=..., or an already-built NetKet hamiltonian=... "
+            "to define the model for build_fermion_vmc."
         )
+    mark_stage("Hamiltonian")
 
     observable_ops = _normalize_fermion_observables(
         hilbert,
@@ -3757,6 +5462,7 @@ def build_fermion_vmc(
     peps = prepare_fermionic_peps_for_netket(peps)
     ansatz = pack_fermionic_peps_ansatz(peps, lattice_shape=(Lx, Ly))
     _warn_flat_z2_ansatz_fixed_u1u1_sector(ansatz, n_fermions_per_spin)
+    mark_stage("PEPS packing")
     model = make_fermionic_peps_log_amplitude_model(
         ansatz,
         columns,
@@ -3766,6 +5472,7 @@ def build_fermion_vmc(
         contraction_opts=contraction_opts,
         param_dtype=param_dtype,
     )
+    mark_stage("JAX model")
     sampler_kwargs = {
         "graph": graph,
         "n_chains": n_chains,
@@ -3776,16 +5483,24 @@ def build_fermion_vmc(
             "sampler_chunk_size",
             sampler_chunk_size,
         )
+    if sampler_sweep_size is not None:
+        sampler_kwargs["sweep_size"] = _check_positive_int(
+            "sampler_sweep_size",
+            sampler_sweep_size,
+        )
     sampler = nk.sampler.MetropolisFermionHop(hilbert, **sampler_kwargs)
+    mark_stage("sampler")
     vstate = nk.vqs.MCState(
         sampler,
         model,
+        variables=_netket_variables_from_ansatz(ansatz, param_dtype),
         n_samples=n_samples,
         n_discard_per_chain=n_discard_per_chain,
         chunk_size=_check_positive_int("chunk_size", chunk_size),
         seed=seed,
         sampler_seed=sampler_seed,
     )
+    mark_stage("MCState")
     preconditioner = _maybe_make_sr_preconditioner(
         ansatz,
         use_sr=use_sr,
@@ -3795,6 +5510,23 @@ def build_fermion_vmc(
         sr_qgt=sr_qgt,
         sr_solver=sr_solver,
         sr_solver_restart=sr_solver_restart,
+    )
+    mark_stage("SR preconditioner")
+    if build_bar is not None:
+        build_bar.set_postfix_str(
+            f"done: {time.perf_counter() - build_started:.1f}s"
+        )
+        build_bar.close()
+    build_timing = NetKetBuildTiming(
+        settings_seconds=stage_seconds["settings"],
+        geometry_seconds=stage_seconds["Hilbert/graph"],
+        hamiltonian_seconds=stage_seconds["Hamiltonian"],
+        peps_seconds=stage_seconds["PEPS packing"],
+        model_seconds=stage_seconds["JAX model"],
+        sampler_seconds=stage_seconds["sampler"],
+        total_seconds=time.perf_counter() - build_started,
+        preconditioner_seconds=stage_seconds["SR preconditioner"],
+        state_seconds=stage_seconds["MCState"],
     )
     return NetKetFermiHubbardVMC(
         hilbert=hilbert,
@@ -3806,6 +5538,7 @@ def build_fermion_vmc(
         ansatz=ansatz,
         config_map=None,
         preconditioner=preconditioner,
+        build_timing=build_timing,
         columns=columns,
         observables=observable_ops,
     )
@@ -3849,8 +5582,8 @@ def build_netket_vmc(
         )
     if sampling is not None:
         unsupported = []
-        if sampling.thin != 1:
-            unsupported.append("thin")
+        if sampling.sweep_size != 1:
+            unsupported.append("sweep_size (formerly thin)")
         if sampling.proposal is not None:
             unsupported.append("proposal")
         if unsupported:
@@ -4169,15 +5902,23 @@ def make_netket_vmc_driver(
     )
 
 
-def warmup_netket_vmc(setup, *, hamiltonian=None, progress=True, verbose=None):
+def warmup_netket_vmc(
+    setup,
+    *,
+    hamiltonian=None,
+    progress=True,
+    verbose=None,
+    resource_monitor=False,
+    resource_interval=0.25,
+):
     """Force XLA compilation of a NetKet VMC setup before ``driver.run(...)``.
 
-    The first optimization step compiles the sampler, the log-amplitude model
-    (including the CTMRG / boundary-MPS contraction), and the local-energy
-    kernel. That one-time compile cost is folded into the first ``tqdm`` tick,
-    so the NetKet progress-bar ETA is misleading until it clears. Calling this
-    once runs a single sample + energy evaluation so compilation happens up
-    front and the reported ETA is meaningful.
+    The first optimization step compiles the sampler, the jitted
+    log-amplitude model (including the CTMRG / boundary-MPS contraction), and
+    the local-energy/gradient kernel. That one-time compile cost is folded
+    into the first ``tqdm`` tick, so the NetKet progress-bar ETA is misleading
+    until it clears. Calling this once runs those same paths up front without
+    updating parameters, so the reported ETA is meaningful.
 
     Parameters
     ----------
@@ -4188,11 +5929,21 @@ def warmup_netket_vmc(setup, *, hamiltonian=None, progress=True, verbose=None):
     hamiltonian:
         Operator to evaluate; defaults to ``setup.hamiltonian``.
     progress:
-        When True (default), show a small two-stage ``tqdm`` bar
-        (sampler, then amplitude+energy) while compiling.
+        When True (default), show a small three-stage ``tqdm`` bar (sampler,
+        one jitted log-amplitude chunk, then local energy plus gradient) while
+        compiling.
     verbose:
         Print a short text message instead of / in addition to the bar. When
         ``None`` (default) it prints only if the progress bar is unavailable.
+    resource_monitor:
+        When True, use :class:`xyzpy.MemoryMonitor` when available to sample
+        host RSS, and ``nvidia-smi`` to sample GPU memory and utilization.
+        A compact report is printed after warmup. This remains opt-in because
+        GPU utilization sampling launches a lightweight subprocess.
+    resource_interval:
+        Seconds between GPU samples while ``resource_monitor=True``. Host RSS
+        is sampled more frequently by ``xyzpy`` so peak tracking has a quick
+        teardown.
 
     Returns
     -------
@@ -4210,36 +5961,107 @@ def warmup_netket_vmc(setup, *, hamiltonian=None, progress=True, verbose=None):
             "setup exposing a .hamiltonian attribute."
         )
     bar = _make_progress_bar(
-        total=2, desc="Compiling VMC kernels", enabled=progress
+        total=3, desc="Warmup 1/3: sampler", enabled=progress
     )
     if verbose is None:
         verbose = bar is None
     if verbose:
         print(
-            "Compiling NetKet VMC kernels (sampler, amplitude, energy)...",
+            "Compiling NetKet VMC kernels (sampler, log amplitude, energy gradient)...",
             flush=True,
         )
+    monitor = (
+        _NetKetResourceMonitor(interval=resource_interval)
+        if resource_monitor
+        else None
+    )
+    if monitor is not None:
+        monitor.start()
     started = time.perf_counter()
-    vstate.reset()
-    # Stage 1: compile the Metropolis sampler.
-    _ = vstate.samples
-    if bar is not None:
-        bar.set_postfix_str("sampler")
-        bar.update(1)
-    # Stage 2: compile the amplitude + local-energy kernels.
-    stats = vstate.expect(hamiltonian)
-    # Resolve any lazy device arrays so compilation is finished before timing.
-    mean = getattr(stats, "mean", stats)
-    _ = float(np.asarray(mean).real)
-    elapsed = time.perf_counter() - started
-    if bar is not None:
-        bar.set_postfix_str(f"{elapsed:.1f}s")
-        bar.update(1)
-        bar.close()
+    try:
+        vstate.reset()
+        # Stage 1: compile the Metropolis sampler and collect the retained
+        # batch used by the following two warmup stages.
+        stage_started = time.perf_counter()
+        samples = vstate.samples
+        sampler_seconds = time.perf_counter() - stage_started
+        n_amplitude_rows = int(np.prod(samples.shape[:-1]))
+        sample_chains = int(samples.shape[0]) if samples.ndim >= 3 else 1
+        samples_per_chain = n_amplitude_rows // sample_chains
+        sample_summary = (
+            f"{n_amplitude_rows} retained = {sample_chains} chains x "
+            f"{samples_per_chain}/chain"
+        )
+        if bar is not None:
+            bar.set_postfix_str(f"{sampler_seconds:.1f}s | {sample_summary}")
+            bar.update(1)
+        # Stage 2: compile NetKet's public JIT log-amplitude route. Use the
+        # configured forward chunk shape rather than the whole retained batch:
+        # VMC's chunked local-energy/gradient kernels use that shape in
+        # production.
+        chunk_size = getattr(vstate, "chunk_size", None)
+        if chunk_size is None:
+            amplitude_rows = n_amplitude_rows
+        else:
+            amplitude_rows = min(n_amplitude_rows, int(chunk_size))
+        amplitude_configs = samples.reshape((-1, samples.shape[-1]))[:amplitude_rows]
+        if bar is not None:
+            bar.set_description_str(
+                f"Warmup 2/3: JIT log amplitudes ({amplitude_rows} rows)"
+            )
+        amplitude_started = time.perf_counter()
+        log_value = getattr(vstate, "log_value", None)
+        if not callable(log_value):
+            raise TypeError(
+                "warmup_netket_vmc requires an MCState with a "
+                "log_value(configs) method."
+            )
+        _block_until_ready(log_value(amplitude_configs))
+        amplitude_seconds = time.perf_counter() - amplitude_started
+        if bar is not None:
+            bar.set_postfix_str(
+                f"{amplitude_seconds:.1f}s | {amplitude_rows}-row JIT chunk | "
+                f"{sample_summary}"
+            )
+            bar.update(1)
+        # Stage 3: compile the driver-dominant local-energy and gradient route.
+        # ``expect_and_grad`` is what NetKet's ordinary VMC driver calls before
+        # updating parameters, so this deliberately leaves the PEPS unchanged.
+        if bar is not None:
+            bar.set_description_str("Warmup 3/3: local energy + gradient")
+        energy_started = time.perf_counter()
+        stats, gradient = vstate.expect_and_grad(hamiltonian)
+        # Resolve lazy device arrays so compilation is finished before timing.
+        mean = getattr(stats, "mean", stats)
+        _block_until_ready(mean)
+        _block_until_ready(gradient)
+        energy_seconds = time.perf_counter() - energy_started
+        elapsed = time.perf_counter() - started
+        if bar is not None:
+            energy_text = (
+                f"{energy_seconds:.1f}s | E={float(np.asarray(mean).real):+.6f} | "
+                "local-energy and gradient kernels"
+            )
+            bar.set_postfix_str(energy_text)
+            bar.update(1)
+    finally:
+        # Resource polling must not outlive a failed JIT/compilation attempt.
+        try:
+            if bar is not None:
+                bar.close()
+        finally:
+            resource_usage = monitor.stop() if monitor is not None else None
     if verbose:
         print(
-            f"Compiled and warmed up in {elapsed:.1f} s; "
-            "progress-bar ETA is now meaningful.",
+            "Warmup complete: "
+            f"{elapsed:.1f}s total (sampler {sampler_seconds:.1f}s, "
+            f"JIT log amplitudes {amplitude_seconds:.1f}s, energy + gradient "
+            f"{energy_seconds:.1f}s); {sample_summary}; "
+            f"stage 2 compiles a representative {amplitude_rows}-row forward "
+            "chunk. Stage 3 uses Hamiltonian-connected configurations and "
+            "compiles the backward pass used by VMC.",
             flush=True,
         )
+    if resource_usage is not None:
+        print(resource_usage.summary("NetKet warmup resources"), flush=True)
     return elapsed
