@@ -1165,6 +1165,10 @@ class TreeOptimizer:
                 root_tensor = target.node_tensor(target.plan.root)
                 root_tensor.modify(data=root_tensor.data * factor)
 
+        # Quimb stores extracted global base-10 scale separately from tensor
+        # data. Preserve it when remounting a geometry-neutral product state.
+        if hasattr(state, "exponent"):
+            target.exponent = state.exponent
         target._with_center(self.plan.root)
         target._set_isometry_metadata_from_region({self.plan.root}).validate()
         self._state_backend_info(target)
@@ -1663,11 +1667,15 @@ class TreeOptimizer:
             stream; ``"tree"``/``"ttn"`` are deprecated no-op compatibility
             selectors for shared coefficient frontends.
         non_unitary : bool, default=False
-            Mark the stream as non-unitary when using automatic normalization.
+            Mark the stream as non-unitary when using automatic working-scale
+            control.
         normalize_every : bool, default=False
-            Normalize after every replay event. Requires ``non_unitary=True``.
+            Normalize the canonical working tensor after every replay event
+            and accumulate the removed global scale in ``tn.exponent``.
+            Requires ``non_unitary=True``.
         normalize_final : bool, default=False
-            Normalize once after replay. Requires ``non_unitary=True``.
+            Apply working-scale control once after replay. Requires
+            ``non_unitary=True``.
         normalize_eps : float, default=1e-15
             Zero-state threshold used by automatic normalization.
         seed : int | None, default=None
@@ -1779,17 +1787,12 @@ class TreeOptimizer:
                         self._finish_update()
 
                 if normalize_every:
-                    old_norm = self.norm()
-                    self.normalize(eps=normalize_eps)
-                    self.normalizations.append({
-                        "step": step,
-                        "old_norm": float(old_norm * old_norm),
-                        "span": tuple(support),
-                        "insert": self.center,
-                        "sites": tuple(support),
-                        "scales": (float(old_norm),),
-                        "reason": "step",
-                    })
+                    self._normalize_and_record_working_scale(
+                        step=step,
+                        support=support,
+                        reason="step",
+                        eps=normalize_eps,
+                    )
 
                 if pbar is not None:
                     postfix = {
@@ -1827,17 +1830,12 @@ class TreeOptimizer:
             if pbar is not None:
                 pbar.close()
         if normalize_final and self.G:
-            old_norm = self.norm()
-            self.normalize(eps=normalize_eps)
-            self.normalizations.append({
-                "step": len(self.G),
-                "old_norm": float(old_norm * old_norm),
-                "span": (),
-                "insert": self.center,
-                "sites": (),
-                "scales": (float(old_norm),),
-                "reason": "final",
-            })
+            self._normalize_and_record_working_scale(
+                step=len(self.G),
+                support=(),
+                reason="final",
+                eps=normalize_eps,
+            )
         return self
 
     def set_gates(self, gates):
@@ -3916,19 +3914,93 @@ class TreeOptimizer:
         a canonical center is known, with the complete doubled-network
         contraction as the unknown-gauge fallback. Dense/nonfermionic trees
         use the ordinary single-centre contraction when known and otherwise
-        the full doubled-tree path.
+        the full doubled-tree path. The fast one-tensor paths explicitly
+        restore Quimb's extracted base-10 ``tn.exponent``; full contractions
+        already include it.
         """
+        center = self.center
         if self.tn.fermionic:
             with self._thread_ctx():
                 val = self.tn._fermionic_center_norm_squared()
-            return float(np.sqrt(abs(to_float(val, real=True))))
-        if self.center is not None:
-            t = self.tn.tensor_map[self._tid(self.center)]
+            nrm = float(np.sqrt(abs(to_float(val, real=True))))
+            if center is not None:
+                nrm *= self._represented_scale()
+            return nrm
+        if center is not None:
+            t = self.tn.tensor_map[self._tid(center)]
             val = qtn.tensor_contract(t.H, t, output_inds=[])
-            return float(np.sqrt(abs(to_float(val, real=True))))
+            nrm = float(np.sqrt(abs(to_float(val, real=True))))
+            return nrm * self._represented_scale()
         with self._thread_ctx():
             val = (self.tn.H & self.tn).contract(output_inds=[])
         return float(np.sqrt(abs(to_float(val, real=True))))
+
+    def _represented_scale(self):
+        """Return Quimb's extracted global base-10 state scale."""
+        exponent = float(getattr(self.tn, "exponent", 0.0))
+        try:
+            return float(10.0 ** exponent)
+        except OverflowError:
+            return np.inf
+
+    def _working_norm(self):
+        """Return the raw canonical-centre norm without ``tn.exponent``.
+
+        Non-unitary replay uses this to keep tensor entries numerically scaled
+        while preserving the removed global factor in Quimb's exponent.
+        Establishing a centre here is lossless and only needed for an
+        unmanaged/unknown canonical gauge.
+        """
+        center = self.center
+        if center is None:
+            region = self.tn.canonical_region
+            center = min(region) if region else self.plan.root
+            self._move_center(center)
+        if self.tn.fermionic:
+            with self._thread_ctx():
+                val = self.tn._fermionic_center_norm_squared(center)
+        else:
+            tensor = self.tn.tensor_map[self._tid(center)]
+            val = qtn.tensor_contract(tensor.H, tensor, output_inds=[])
+        return float(np.sqrt(abs(to_float(val, real=True))))
+
+    def _normalize_working_scale(self, eps=1e-15):
+        """Normalize canonical working data and preserve represented scale."""
+        working_norm = self._working_norm()
+        if working_norm > float(eps) and np.isfinite(working_norm):
+            self._invalidate_state_norm_cache()
+            tensor = self.tn.tensor_map[self._tid(self.center)]
+            tensor.modify(data=tensor.data / working_norm)
+            self.tn.exponent = (
+                float(getattr(self.tn, "exponent", 0.0))
+                + float(np.log10(working_norm))
+            )
+        return working_norm
+
+    def _normalize_and_record_working_scale(
+        self, *, step, support, reason, eps,
+    ):
+        """Apply one non-unitary scale-control event and record its factor."""
+        old_norm = self._normalize_working_scale(eps=eps)
+        log10_scale = (
+            float(np.log10(old_norm)) if old_norm > 0.0 else -np.inf
+        )
+        support = tuple(support)
+        event = {
+            "step": int(step),
+            "old_norm": float(old_norm * old_norm),
+            "span": support,
+            "insert": self.center,
+            "sites": support,
+            "scales": (float(old_norm),),
+            "log10_scale": log10_scale,
+            "log10_scales": (log10_scale,),
+            "reason": str(reason),
+            "method": "canonical_center",
+            "exponent": float(getattr(self.tn, "exponent", 0.0)),
+        }
+        self.normalizations.append(event)
+        return event
 
     def _leaf_canonical_norm(self):
         """Return a cheap dense canonical norm or the exact fermionic norm.
@@ -3951,23 +4023,22 @@ class TreeOptimizer:
 
         ``eps`` and ``insert`` are accepted for compatibility with
         :meth:`MpsOptimizer.normalize`; a tree has no chain insertion site, so
-        ``insert`` is intentionally ignored.
+        ``insert`` is intentionally ignored. Unlike the non-unitary replay
+        scale-control path, this is a physical renormalization: any accumulated
+        Quimb ``tn.exponent`` is cleared so the represented state has unit norm.
         """
         eps = float(eps)
         if eps < 0.0:
             raise ValueError("eps must be non-negative.")
         nrm = self.norm()
-        if nrm > eps:
+        working_norm = self._working_norm()
+        if working_norm > eps and np.isfinite(working_norm):
             self._invalidate_state_norm_cache()
-            if self.center is not None:
-                target = self.center
-            elif self.tn.canonical_region is not None:
-                target = next(iter(self.tn.canonical_region))
-            else:
-                target = self.plan.root
-            tid = self._tid(target)
+            tid = self._tid(self.center)
             t = self.tn.tensor_map[tid]
-            t.modify(data=t.data / nrm)
+            t.modify(data=t.data / working_norm)
+            if hasattr(self.tn, "exponent"):
+                self.tn.exponent = 0.0
         return nrm
 
     def _measure_pauli(self, pauli, where, outcome=None, *, renormalize=True,
@@ -4235,9 +4306,10 @@ class TreeOptimizer:
     def get_normalizations(self):
         """Return automatic normalization records.
 
-        Tree normalization is explicit rather than an MPS run-time scale
-        controller, so this list remains empty unless a higher-level wrapper
-        records its own normalization events here.
+        Non-unitary replay records each raw canonical-centre scale removed
+        from tensor data and accumulated into ``tn.exponent``. Thus the
+        working tensors remain normalized without changing the represented
+        state norm.
         """
         return self.normalizations
 

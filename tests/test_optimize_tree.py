@@ -593,10 +593,49 @@ def test_tree_run_supports_shared_non_unitary_normalization_controls():
     half = 0.5 * np.eye(2, dtype=complex)
     opt = TreeOptimizer([(half, 0), (half, 1)], n=3, run=False)
     opt.run(non_unitary=True, normalize_every=True)
-    assert opt.norm() == pytest.approx(1.0)
+    assert opt.norm() == pytest.approx(0.25)
+    assert np.linalg.norm(opt.to_dense()) == pytest.approx(0.25)
+    assert opt.tn.exponent == pytest.approx(np.log10(0.25))
     assert len(opt.get_normalizations()) == 2
+    assert [event["old_norm"] for event in opt.get_normalizations()] == pytest.approx(
+        [0.25, 0.25]
+    )
     with pytest.raises(ValueError, match="non_unitary"):
         opt.run(normalize_every=True)
+
+
+def test_tree_nonunitary_scale_control_preserves_represented_state():
+    """Per-step scale control changes only the TTN working-data gauge."""
+    twice = 2.0 * np.eye(2, dtype=complex)
+    gates = [(twice, 0), (twice, 1)]
+    raw = TreeOptimizer(gates, n=3)
+    controlled = TreeOptimizer(gates, n=3, run=False)
+
+    controlled.run(non_unitary=True, normalize_every=True)
+
+    assert np.allclose(controlled.to_dense(), raw.to_dense())
+    assert controlled.norm() == pytest.approx(raw.norm())
+    assert controlled.tn.exponent == pytest.approx(np.log10(4.0))
+    center = controlled.tn.node_tensor(controlled.center)
+    assert np.linalg.norm(np.asarray(center.data)) == pytest.approx(1.0)
+    assert [event["exponent"] for event in controlled.get_normalizations()] == (
+        pytest.approx([np.log10(2.0), np.log10(4.0)])
+    )
+
+
+def test_tree_physical_normalize_clears_accumulated_scale():
+    """Public normalize still makes the represented state unit norm."""
+    twice = 2.0 * np.eye(2, dtype=complex)
+    opt = TreeOptimizer([(twice, 0)], n=2, run=False)
+    opt.run(non_unitary=True, normalize_every=True)
+    assert opt.norm() == pytest.approx(2.0)
+
+    old_norm = opt.normalize()
+
+    assert old_norm == pytest.approx(2.0)
+    assert opt.tn.exponent == pytest.approx(0.0)
+    assert opt.norm() == pytest.approx(1.0)
+    assert np.linalg.norm(opt.to_dense()) == pytest.approx(1.0)
 
 
 def test_tree_logical_position_helpers_are_identity_mps_compatibility():
@@ -1296,12 +1335,14 @@ def test_product_ttn_is_remounted_exactly_on_a_requested_new_layout():
     target_plan = TreePlan.from_order((0, 2, 1, 3), structure="balanced")
     h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
     source = TreeOptimizer([(h, 1)], tree=source_plan, chi=8).tn.copy()
+    source.exponent = np.log10(3.0)
 
     with pytest.warns(UserWarning, match="product TreeTensorNetwork"):
         opt = TreeOptimizer(None, state=source, tree=target_plan, run=False)
 
     assert opt.plan is target_plan
     assert opt.max_bond() == 1
+    assert opt.tn.exponent == pytest.approx(source.exponent)
     assert np.allclose(
         np.asarray(opt.to_dense()).reshape(-1),
         np.asarray(source.to_dense()).reshape(-1),

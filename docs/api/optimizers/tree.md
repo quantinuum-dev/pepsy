@@ -696,8 +696,15 @@ For stream control events, `TreeOptimizer.measure_event`,
 `MpsOptimizer`, including Pauli-basis measurement and reset. Their recorded
 results are `(pauli, where, outcome, probability)` in `measurements`.
 `cap(q, vec)` contracts and removes one physical site, shifting the remaining labels
-above `q` down by one unless stable labels are requested. `normalize()` rescales the represented state to unit
-norm and `max_bond()` reports the largest virtual bond. Truncation details are
+above `q` down by one unless stable labels are requested.
+For a non-unitary run, `normalize_every=True` (or `normalize_final=True`) keeps
+the canonical working tensor numerically normalized and accumulates each
+removed base-10 scale in `tn.exponent`; `norm()`, `to_dense()`, copies, and
+full contractions continue to represent the original physical scale.
+The normalization records expose both the per-event raw scale and the
+accumulated exponent. The public `normalize()` method remains a physical
+renormalization: it clears that exponent and rescales the represented state to
+unit norm. `max_bond()` reports the largest virtual bond. Truncation details are
 available through `truncation_report()`, `get_infidelities()`, and
 `get_infidelity_samples()` when spectrum tracking is enabled.
 

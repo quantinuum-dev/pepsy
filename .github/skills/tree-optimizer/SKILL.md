@@ -182,7 +182,13 @@ telescopes to identity between bra and ket.
   doubled tree. Native fermionic states use a one-tensor
   `TensorNetwork.H` contraction when a centre is known, so Symmray applies the
   graded outer-leg phase flips; unknown-centre fermionic states use the exact
-  complete doubled-network contraction. Keep the backend dispatch separate.
+  complete doubled-network contraction. Known-centre fast paths multiply the
+  raw centre norm by Quimb's extracted `10 ** tn.exponent`; full contractions
+  already apply it. During non-unitary replay, `normalize_every` /
+  `normalize_final` normalize only the raw working centre and accumulate its
+  removed scale in that exponent, preserving the represented state. Public
+  `normalize()` is physical renormalization and clears the exponent. Keep the
+  backend dispatch separate.
 - Any operation that moves/rebuilds the centre must update the tracked centre
   (via `self.center = ...`, i.e. `ttn.orthogonality_center`).
 
