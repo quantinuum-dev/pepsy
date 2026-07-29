@@ -27,11 +27,15 @@ from pepsy.optimizers import (
     QMeraBuilder,
     QMeraGeometry,
     QMeraParametricEnergyOptimizer,
+    SimulatorCandidate,
+    SimulatorPlan,
+    SimulatorPlanner,
     SimpleUpdateGen,
     SymDMRG2,
     SweepOptimizer,
     build_qmera_contraction_optimizer,
     mera as mera_module,
+    recommend_simulator,
 )
 from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
@@ -118,7 +122,11 @@ def test_new_namespace_imports_resolve():
     assert QMeraBuilder is not None
     assert QMeraGeometry is not None
     assert QMeraParametricEnergyOptimizer is not None
+    assert SimulatorCandidate is not None
+    assert SimulatorPlan is not None
+    assert SimulatorPlanner is not None
     assert callable(build_qmera_contraction_optimizer)
+    assert callable(recommend_simulator)
     assert mera_module is not None
     assert SimpleUpdateGen is not None
     assert SymDMRG2 is not None

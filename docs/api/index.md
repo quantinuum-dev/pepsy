@@ -32,6 +32,7 @@ the detailed functions and classes for each area.
 - [Energy optimization](optimizers/energy.md)
 - [MERA](optimizers/mera.md)
 - [Noise and trajectories](optimizers/noise.md)
+- [Simulator planning](optimizers/planning.md)
 - [Stabilizer tensor networks](optimizers/stabilizer_tn.md)
 - [Symmetry-aware DMRG](optimizers/sym_dmrg.md)
 - [Tree tensor networks](optimizers/tree.md)
