@@ -165,8 +165,12 @@ for the whole Steiner subtree is formed. Each dense routed Q tensor retains its
 `left_inds` isometry metadata, so canonical recovery recognizes that it already
 points toward the hub instead of repeating the same QR; native fermionic trees
 retain explicit graded QR recovery. Once all MPO factors have arrived, every
-touched edge is SVD-compressed once. Thus every truncation sees the complete
-operator in an isometric environment.
+touched edge is compressed once. A bond that remains within its configured
+`max_bond` uses a lossless QR, avoiding repeated cutoff loss of tiny state
+components across successive sub-MPO events; when the MPO expands an edge
+past its cap, the configured Quimb `cutoff` and `cutoff_mode` are applied to
+the truncating SVD. Thus every actual truncation sees the complete operator in
+an isometric environment.
 
 `op` acts on `len(where)` qubits: an array reshaped to `(2,) * 2k` with output
 indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
@@ -203,7 +207,9 @@ fermionic gates. Select `mode="mpo"` explicitly to inspect or benchmark
 Quimb's operator-TN factorization. Direct and MPO share the update kernel and
 defer truncation until the complete gate has reached the affected path, so at
 an exact `chi` they differ only by the factorization gauge and numerical
-roundoff.
+roundoff. MPO replay also uses the cap-aware cutoff rule: already-within-cap
+path bonds take lossless QR, while expanded bonds use the configured cutoff
+mode.
 
 `run(mode=...)` has the same persistent semantics as `MpsOptimizer`: it updates
 the optimizer's selected two-site mode for that run, later runs, and copies.
@@ -218,7 +224,8 @@ Quimb's open-boundary `MatrixProductState.gate_with_submpo` compression path.
 `TreeOptimizer.apply_submpo(...)` is the public form for an explicit MPO of
 arbitrary support. It losslessly QR-routes its virtual bonds, then uses its
 supplied (or configured) `max_bond` / `cutoff` in one final canonical sweep over
-the affected subtree.
+the affected subtree. Existing bonds at or below `max_bond` take a lossless
+QR; only bonds expanded past the cap invoke the configured cutoff mode.
 The tree backend also exposes numerical Pauli primitives used by a future
 stabilizer frontend: `apply_pauli_rotation(...)`, `apply_pauli_sum(...)`,
 `expectation_pauli(...)`, `measure_pauli(...)`, and `project_pauli(...)`. These
