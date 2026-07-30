@@ -78,6 +78,7 @@ from ._symmray import (
     align_d2bp_messages as _align_symmray_d2bp_messages,
     dense_bp_tn as _dense_bp_tn,
     dense_message_tree as _dense_message_tree,
+    restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     uses_symmray as _uses_symmray,
 )
 
@@ -1190,6 +1191,8 @@ def loop_cluster_expand(
     LoopClusterResult
     """
     key, bp_cls = _cluster_bp_class(norm)
+    if key == "2norm" and _uses_symmray(tn):
+        tn = _restore_fermionic_dummy_modes(tn)
     if key == "1norm" and _uses_symmray(tn):
         tn = _dense_bp_tn(tn)
         messages = _dense_message_tree(messages)

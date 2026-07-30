@@ -63,6 +63,70 @@ def test_fermionic_u1_two_norm_bp_is_exact_on_a_tree(bond_dim):
     )
 
 
+def test_d2bp_repairs_labelled_odd_arrays_after_new_with():
+    """D2BP repairs the phase metadata dropped by Symmray ``new_with``."""
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1",
+        bond_dim=2,
+        phys_dim=2,
+        fermionic=True,
+        seed=750,
+        dtype="complex128",
+    )
+    broken = state.tn.copy()
+    for tensor in broken.tensors:
+        data = tensor.data
+        if not getattr(data, "parity", 0):
+            continue
+        tensor.modify(
+            data=type(data).from_blocks(
+                data.blocks,
+                duals=data.indices,
+                charge=data.charge,
+                symmetry=data.symmetry,
+                phases=data.phases,
+                label=data.label,
+                dummy_modes=(),
+            )
+        )
+
+    assert all(
+        not tensor.data.dummy_modes
+        for tensor in broken.tensors
+        if getattr(tensor.data, "parity", 0)
+    )
+
+    result = two_norm_bp(
+        broken,
+        max_iterations=100,
+        tol=1e-10,
+        diis=False,
+    )
+    assert result.converged
+    assert all(
+        tensor.data.dummy_modes
+        for tensor in result.bp.tn.tensors
+        if getattr(tensor.data, "parity", 0)
+    )
+
+    cluster = loop_cluster_expand(
+        broken,
+        gloops=0,
+        norm="2norm",
+        max_iterations=100,
+        tol=1e-10,
+        diis=False,
+    )
+    assert cluster.bp_converged
+    assert all(
+        tensor.data.dummy_modes
+        for tensor in cluster.bp.tn.tensors
+        if getattr(tensor.data, "parity", 0)
+    )
+
+
 @pytest.mark.parametrize("bond_dim", (2, 3))
 def test_fermionic_u1_loop_cluster_runs_on_3x4_peps(bond_dim):
     """D2BP loop clusters pad sparse charge blocks without densifying."""

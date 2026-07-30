@@ -13,6 +13,7 @@ import numpy as np
 from ._symmray import (
     dense_bp_tn as _dense_bp_tn,
     dense_message_tree as _dense_message_tree,
+    restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     uses_symmray as _uses_symmray,
 )
 
@@ -548,6 +549,8 @@ def d2bp_from_simple_update_gauges(
     """
     from quimb.tensor.belief_propagation import D2BP
 
+    if _uses_symmray(tn):
+        tn = _restore_fermionic_dummy_modes(tn)
     _validate_d2_graph(tn)
     work = tn.copy()
     gauges_copy = copy_gauges(gauges)

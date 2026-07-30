@@ -28,6 +28,53 @@ def uses_symmray(tn) -> bool:
     return any(is_symmray_array(tensor.data) for tensor in tn.tensors)
 
 
+def restore_fermionic_dummy_modes(tn):
+    """Restore implicit dummy modes on labelled odd Symmray tensors.
+
+    Symmray's ``FermionicArray.new_with`` deliberately drops ``dummy_modes``.
+    That is a useful low-level default, but it is unsafe when a tensor is
+    subsequently used in a fermionic contraction: an odd array with a site
+    label and no dummy mode is treated as phase-neutral, so the result can
+    depend on the contraction tree. Quimb simple-update factorizations can
+    create exactly this representation.
+
+    The site label is the canonical mode identity already carried by native
+    fermionic PEPS tensors. Reconstructing with ``dummy_modes=None`` asks
+    Symmray to recreate that mode while preserving the blocks, lazy phases,
+    indices, and charge. The input network is copied before any repair.
+    Odd arrays without a label are left unchanged because their canonical
+    fermionic mode cannot be inferred safely.
+    """
+    if not uses_symmray(tn):
+        return tn
+
+    target = tn.copy()
+    for tensor in target.tensors:
+        data = tensor.data
+        if not (
+            is_symmray_array(data)
+            and hasattr(data, "dummy_modes")
+            and getattr(data, "parity", 0)
+            and not data.dummy_modes
+            and getattr(data, "label", None) is not None
+        ):
+            continue
+
+        tensor.modify(
+            data=type(data).from_blocks(
+                data.blocks,
+                duals=data.indices,
+                charge=getattr(data, "charge", None),
+                symmetry=getattr(data, "symmetry", None),
+                phases=getattr(data, "phases", None),
+                label=data.label,
+                dummy_modes=None,
+            )
+        )
+
+    return target
+
+
 def dense_bp_tn(tn):
     """Return a dense BP shadow for a Symmray scalar-network calculation.
 

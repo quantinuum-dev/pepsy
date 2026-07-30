@@ -102,6 +102,16 @@ construction, while keeping the messages and tensor data block-sparse. Do not
 replace this D2 path with a dense copy: dense eigendecomposition can reorder
 eigenvectors across charge sectors and produce invalid Symmray gates.
 
+Native fermionic arrays also require their global-phase metadata. An odd
+Symmray array with a site `label` must carry the corresponding implicit
+`dummy_modes`; `FermionicArray.new_with(...)` intentionally drops those modes.
+The D2 entry points repair labelled odd arrays on a private network copy before
+constructing BP or finite clusters, preserving blocks and lazy phases. This is
+what makes the result invariant under Cotengra contraction-tree choices. Do
+not treat `optimize="auto-hq"` as a fermionic sign fix: it is a Cotengra path
+preset, just like a reusable `PathOptimizer`, and a path-dependent sign means
+the input metadata is invalid or incomplete.
+
 For valid closed scalar Symmray networks, the 1-norm APIs (`L1BP`, `HV1BP`,
 and `D1BP`), their loop/series/PNE corrections, D1 SU bridge, and
 `weight_pass` use a topology-identical dense BP shadow because Quimb's D1

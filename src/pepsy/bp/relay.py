@@ -44,6 +44,7 @@ from ._symmray import (
     dense_message_tree as _dense_message_tree,
     is_symmray_array as _is_symmray_array,
     message_distance as _symmray_message_distance,
+    restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
     uses_symmray as _uses_symmray,
 )
 
@@ -625,6 +626,8 @@ def two_norm_bp(
     """
     if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
+    if _uses_symmray(tn):
+        tn = _restore_fermionic_dummy_modes(tn)
     bp_opts = dict(bp_opts)
     if _uses_symmray(tn):
         bp_opts.setdefault("distance", _symmray_message_distance)
@@ -750,6 +753,9 @@ def relay_bp(
         from .gauges import _validate_d1_graph
 
         _validate_d1_graph(tn)
+
+    if method_key == "d2bp" and _uses_symmray(tn):
+        tn = _restore_fermionic_dummy_modes(tn)
 
     if method_key in _ONE_NORM_CLASSES and _uses_symmray(tn):
         tn = _dense_bp_tn(tn)
