@@ -2788,6 +2788,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         source_signature = _array_backend_signature(array)
         if source_signature == target_signature:
             return array
+        if self._is_symmray_array(array) and self._is_symmray_array(like):
+            # Symmray arrays deliberately do not implement Autoray's generic
+            # ``array(..., like=symmray_array)`` constructor. Their outer
+            # object has no scalar dtype either, so the generic dtype fast
+            # path below cannot establish compatibility. Native Symmray gates
+            # already carry their own block backend and must pass through as
+            # graded arrays rather than being rebuilt as dense payloads.
+            return array
         if target_signature[0] == "symmray" and source_signature[0] != "symmray":
             raise TypeError(
                 "Cannot convert a dense gate/operator payload into a native "

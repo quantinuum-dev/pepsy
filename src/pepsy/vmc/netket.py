@@ -145,6 +145,7 @@ class PackedPEPS:
     site_inds: tuple[Any, ...] = ()
     uses_flat_symmray: bool | None = None
     phys_charges: tuple[Any, ...] = ()
+    symmray_symmetry: str | None = None
 
     @property
     def n_sites(self):
@@ -1758,7 +1759,8 @@ class NetKetSparseFermiHubbardVMC:
 
     NetKet supplies the Hilbert space, graph, and Hamiltonian metadata. The
     actual samples, amplitudes, and local energies use the non-jitted torch
-    PEPS path so block-sparse ``U1U1`` Symmray tensors can be evaluated today.
+    PEPS path so block-sparse ``U1``, ``U1U1``, and ``Z2Z2`` Symmray tensors
+    can be evaluated today.
     """
 
     hilbert: Any
@@ -2265,6 +2267,18 @@ def _is_symmray_array(value):
     return type(value).__module__.split(".", 1)[0] == "symmray"
 
 
+def _symmray_symmetry_name(tn):
+    """Return the first Symmray tensor's symmetry name, if available."""
+    for tensor in tn:
+        data = getattr(tensor, "data", None)
+        if not _is_symmray_array(data):
+            continue
+        symmetry = getattr(data, "symmetry", None)
+        if symmetry is not None:
+            return str(symmetry)
+    return None
+
+
 def _uses_flat_symmray_arrays(tn):
     """Return whether Symmray arrays in ``tn`` use flat JAX-friendly storage."""
     symmray_seen = False
@@ -2334,8 +2348,8 @@ def prepare_fermionic_peps_for_netket(peps, *, device=None):
     blocks, and then moved to JAX.  ``device=None`` follows JAX's default
     device; ``PEPSY_FH_JAX_DEVICE`` can be used for a notebook-level override.
 
-    Non-Z2 Symmray tensors are left intact so the existing clear U1U1 error is
-    raised by the jitted NetKet model.  Dense, already-flat, and non-Symmray
+    Non-Z2 Symmray tensors are left block-sparse so the jitted NetKet model can
+    raise a clear capability error.  Dense, already-flat, and non-Symmray
     tensors only go through the JAX backend conversion.
     """
     work = peps.copy()
@@ -2348,7 +2362,7 @@ def prepare_fermionic_peps_for_netket(peps, *, device=None):
         type_name = type(data).__name__
         if (
             _is_symmray_array(data)
-            and "Z2" in type_name
+            and str(getattr(data, "symmetry", "")) == "Z2"
             and "Flat" not in type_name
         ):
             if sr is None:
@@ -2457,10 +2471,12 @@ def _require_jittable_fermionic_ansatz(ansatz):
     """Raise a clear error when NetKet's jitted VMC path cannot use ``ansatz``."""
     if ansatz.uses_flat_symmray is not False:
         return
-    if _spinful_phys_lookup(getattr(ansatz, "phys_charges", ())) is not None:
-        symmetry = "U1U1"
-    else:
-        symmetry = "non-flat Symmray"
+    symmetry = getattr(ansatz, "symmray_symmetry", None)
+    if symmetry is None:
+        if _spinful_phys_lookup(getattr(ansatz, "phys_charges", ())) is not None:
+            symmetry = "U1U1 or Z2Z2"
+        else:
+            symmetry = "non-flat Symmray"
     raise NotImplementedError(
         "NetKet MCState JIT-compiles the PEPS log-amplitude model, but this "
         f"{symmetry} fermionic PEPS uses block-sparse Symmray arrays rather "
@@ -2468,7 +2484,7 @@ def _require_jittable_fermionic_ansatz(ansatz):
         "make_fermionic_peps_batched_amplitude_function(..., jit=False) with "
         "contraction='exact', 'hotrg', 'ctmrg', or 'boundary' for validation, "
         "or use a flat Z2 fermionic PEPS for full NetKet VMC until Symmray "
-        "provides a flat U1U1 fermionic backend."
+        "provides flat backends for the requested symmetry."
     )
 
 
@@ -3113,6 +3129,7 @@ def _pack_peps_ansatz(
         n_params=n_params,
         uses_flat_symmray=_uses_flat_symmray_arrays(tn),
         phys_charges=_peps_phys_charges(tn),
+        symmray_symmetry=_symmray_symmetry_name(tn),
     )
 
 
@@ -4173,18 +4190,19 @@ def fermionic_peps_rand(
     """Build a random fermionic PEPS for VMC, symmetry-aware.
 
     ``"Z2"`` uses the flat (``jax.jit``/``vmap``-friendly) Symmray backend and a
-    ``phys_dim=4`` parity-resolved physical index. ``"U1U1"`` uses the
-    block-sparse backend (Symmray currently has no flat ``U1U1`` fermionic
-    array) with a per-spin ``(n_up, n_down)`` physical charge map and a default
-    site-charge summing to ``n_fermions_per_spin`` (half filling if omitted).
+    ``phys_dim=4`` parity-resolved physical index. ``"U1"``, ``"U1U1"``, and
+    ``"Z2Z2"`` use block-sparse backends. ``U1`` receives the total local
+    occupation charge, while the latter two receive a per-spin
+    ``(n_up, n_down)`` physical charge map. The default site-charge map sums
+    to ``n_fermions_per_spin`` (half filling if omitted).
 
     Note
     ----
-    A ``U1U1`` ansatz cannot yet be driven through the NetKet Monte-Carlo state
-    (which JIT-compiles the model) because the flat backend is missing upstream.
-    The block-sparse ``U1U1`` PEPS still evaluates correctly through the
-    non-jitted amplitude functions (``jit=False``) for validation and exact/dense
-    sums.
+    A ``U1``, ``U1U1``, or ``Z2Z2`` ansatz cannot yet be driven through the NetKet
+    Monte-Carlo state (which JIT-compiles the model) because the corresponding
+    flat backend is missing upstream. The block-sparse PEPS still evaluates
+    correctly through the non-jitted amplitude functions (``jit=False``) for
+    validation and exact/dense sums.
     """
     sr = _require_symmray()
     sym = str(symmetry).upper().replace("-", "").replace("_", "")
@@ -4205,7 +4223,7 @@ def fermionic_peps_rand(
             **kwargs,
         )
 
-    if sym == "U1U1":
+    if sym in {"U1", "U1U1", "Z2Z2"}:
         from pepsy.tensors import (
             default_physical_sectors,
             site_charge_from_occupations,
@@ -4215,26 +4233,32 @@ def fermionic_peps_rand(
             if n_fermions_per_spin is None:
                 n_fermions_per_spin = (n_sites // 2, n_sites // 2)
             n_up, n_down = (int(x) for x in n_fermions_per_spin)
-            site_charge = site_charge_from_occupations(
-                _default_u1u1_flux_occupations(Lx, Ly, n_up, n_down)
+            occupations = _default_u1u1_flux_occupations(
+                Lx, Ly, n_up, n_down
             )
+            if sym == "U1":
+                occupations = {
+                    site: sum(charge)
+                    for site, charge in occupations.items()
+                }
+            site_charge = site_charge_from_occupations(occupations)
         use_flat = False if flat == "auto" else bool(flat)
         if use_flat:
             warnings.warn(
-                "Symmray has no flat U1U1 fermionic backend; falling back to "
+                f"Symmray has no flat {sym} fermionic backend; falling back to "
                 "block-sparse (flat=False). NetKet MC sampling JIT-compiles the "
                 "model and needs a flat backend, so use the non-jit amplitude "
-                "functions for U1U1 until flat U1U1 lands upstream.",
+                f"functions for {sym} until a flat {sym} backend lands upstream.",
                 RuntimeWarning,
                 stacklevel=2,
             )
             use_flat = False
         return sr.networks.PEPS_fermionic_rand(
-            "U1U1",
+            sym,
             Lx,
             Ly,
             bond_dim,
-            phys_dim=default_physical_sectors(model="fermi_hubbard_u1u1"),
+            phys_dim=default_physical_sectors(sym, 4),
             site_charge=site_charge,
             flat=use_flat,
             seed=seed,
@@ -4244,7 +4268,7 @@ def fermionic_peps_rand(
 
     raise ValueError(
         f"Unsupported symmetry {symmetry!r} for fermionic_peps_rand; "
-        "use 'Z2' or 'U1U1'."
+        "use 'Z2', 'U1', 'Z2Z2', or 'U1U1'."
     )
 
 
@@ -5635,10 +5659,11 @@ def build_sparse_fermi_hubbard_vmc(
     """Create a sparse-block PEPS VMC setup for the Fermi-Hubbard model.
 
     This path is intended for Symmray block-sparse fermionic PEPS, including
-    ``U1U1`` tensors that cannot yet be used by NetKet's jitted ``MCState``.
-    NetKet still defines the Hilbert sector, graph, and Hamiltonian metadata,
-    while Pepsy's torch kernels do Metropolis sweeps and local-energy
-    evaluation with exact, HOTRG, CTMRG, or boundary contractions.
+    ``U1``, ``U1U1``, and ``Z2Z2`` tensors that cannot yet be used by NetKet's
+    jitted ``MCState``. It is a Pepsy VMC loop with NetKet Hilbert/graph/Hamiltonian
+    metadata rather than an ``nk.driver.VMC`` instance: Pepsy's torch kernels
+    do Metropolis sweeps and local-energy evaluation with exact, HOTRG, CTMRG,
+    or boundary contractions.
     """
     nk = _require_netket()
     n_sites = int(Lx) * int(Ly)

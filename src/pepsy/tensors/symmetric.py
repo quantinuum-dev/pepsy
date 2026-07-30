@@ -9890,7 +9890,7 @@ class Fermion:
         if layout in {"site", "sites", "native"}:
             return self.hamiltonian(edges, **params).terms
         if layout in {"qmera", "qmera_modes", "modes"}:
-            from ..optimizers.mera import (  # pylint: disable=import-outside-toplevel
+            from ..optimizers.qmera import (  # pylint: disable=import-outside-toplevel
                 qmera_symmray_fermi_hubbard_terms,
             )
 
@@ -9900,7 +9900,7 @@ class Fermion:
                 **params,
             )
         if layout in {"majorana", "qmera_majorana"}:
-            from ..optimizers.mera import (  # pylint: disable=import-outside-toplevel
+            from ..optimizers.qmera import (  # pylint: disable=import-outside-toplevel
                 qmera_symmray_majorana_terms,
             )
 

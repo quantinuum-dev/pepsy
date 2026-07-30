@@ -87,6 +87,118 @@ def test_explicit_native_hubbard_terms_compile_to_matching_netket_terms():
 
 
 @pytest.mark.smoke
+def test_z2z2_peps_stays_sparse_and_supports_nonjit_amplitudes():
+    """Z2xZ2 follows Fermion's native symmetry, but not NetKet's JIT path."""
+    pytest.importorskip("jax")
+    nk = pytest.importorskip("netket")
+
+    import pepsy as py
+    from pepsy.vmc.netket import (
+        fermionic_peps_rand,
+        make_fermionic_peps_batched_amplitude_function,
+        netket_spin_orbital_columns,
+        pack_fermionic_peps_ansatz,
+        prepare_fermionic_peps_for_netket,
+    )
+
+    fermion = py.Fermion(spinful=True, symmetry="Z2Z2")
+    assert fermion.physical_sectors == {
+        (0, 0): 1,
+        (0, 1): 1,
+        (1, 0): 1,
+        (1, 1): 1,
+    }
+
+    with pytest.warns(RuntimeWarning, match="no flat Z2Z2"):
+        peps = fermionic_peps_rand(
+            "Z2Z2",
+            2,
+            2,
+            2,
+            n_fermions_per_spin=(2, 2),
+            seed=17,
+            dtype="float32",
+            flat=True,
+        )
+
+    assert type(peps[(0, 0)].data).__name__ == "Z2Z2FermionicArray"
+    prepared = prepare_fermionic_peps_for_netket(peps)
+    assert type(prepared[(0, 0)].data).__name__ == "Z2Z2FermionicArray"
+
+    ansatz = pack_fermionic_peps_ansatz(prepared, lattice_shape=(2, 2))
+    assert ansatz.uses_flat_symmray is False
+    assert ansatz.symmray_symmetry == "Z2Z2"
+
+    hilbert = nk.hilbert.SpinOrbitalFermions(
+        4,
+        s=1 / 2,
+        n_fermions_per_spin=(2, 2),
+    )
+    columns = netket_spin_orbital_columns(hilbert)
+    with pytest.raises(NotImplementedError, match="Z2Z2"):
+        make_fermionic_peps_batched_amplitude_function(
+            ansatz,
+            columns,
+            contraction="exact",
+            jit=True,
+        )
+
+    rows = np.zeros((1, 8), dtype=np.int8)
+    rows[0, list(columns.down[:2])] = 1
+    rows[0, list(columns.up[:2])] = 1
+    amplitude = make_fermionic_peps_batched_amplitude_function(
+        ansatz,
+        columns,
+        contraction="exact",
+        output="log",
+        jit=False,
+    )(rows)
+    assert np.asarray(amplitude).shape == (1,)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
+def test_sparse_u1_vmc_builder_uses_nonjit_path(symmetry):
+    """Total-U1 and U1xU1 use NetKet metadata with Pepsy's sparse VMC path."""
+    pytest.importorskip("netket")
+
+    import pepsy.vmc as pvmc
+    from pepsy.vmc import SamplingConfig
+
+    with pytest.warns(RuntimeWarning, match=f"no flat {symmetry}"):
+        peps = pvmc.fermionic_peps_rand(
+            symmetry,
+            2,
+            2,
+            2,
+            n_fermions_per_spin=(2, 2),
+            seed=23,
+            dtype="float32",
+            flat=True,
+        )
+
+    setup = pvmc.build_sparse_fermi_hubbard_vmc(
+        peps,
+        Lx=2,
+        Ly=2,
+        n_fermions_per_spin=(2, 2),
+        n_samples=2,
+        seed=23,
+        sampler_seed=29,
+        device="cpu",
+    )
+    assert setup.ansatz.symmray_symmetry == symmetry
+    assert type(setup.model).__name__ == "TorchPEPSAmplitude"
+    assert np.isfinite(setup.energy_estimate().detach().cpu().numpy())
+
+    samples = setup.sample(
+        SamplingConfig(n_samples_per_chain=2, n_chains=2, burn_in=0, thin=1)
+    )
+    assert samples.configs.shape == (2, 2, 4)
+    assert np.isfinite(setup.energy_estimate().detach().cpu().numpy())
+
+
+@pytest.mark.smoke
 def test_warmup_summary_reports_stage_times_and_amplitude_rows(capsys):
     """Warmup uses NetKet's JIT forward and gradient routes at chunk size."""
     from pepsy.vmc.netket import warmup_netket_vmc

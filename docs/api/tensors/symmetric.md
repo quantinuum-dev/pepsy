@@ -288,7 +288,7 @@ two-state mode layout. This returns qMERA ``LocalTerm`` objects rather than
 four-state site tensors, matching ``QMeraGeometry(site_modes=("up", "down"))``:
 
 ```python
-from pepsy.optimizers.mera import QMeraGeometry
+from pepsy.optimizers.qmera import QMeraGeometry
 
 geometry = QMeraGeometry(shape=3, site_modes=("up", "down"))
 qmera_terms = spinful.local_terms(geometry, layout="qmera")

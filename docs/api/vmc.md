@@ -75,8 +75,9 @@ For fermions, the supported JIT configuration intentionally combines a flat
 `SpinOrbitalFermions` sampling sector. The `Z2` label describes the
 JAX-friendly tensor storage; it does not relax the sampler's separate particle
 number conservation. The fermion builders emit `SymmetryFallbackWarning` to
-make this distinction visible. A block-sparse `U1U1` PEPS still cannot enter
-NetKet's jitted `MCState` until Symmray supplies a flat `U1U1` backend.
+make this distinction visible. Block-sparse `U1`, `U1U1`, and `Z2Z2` PEPS still
+cannot enter NetKet's jitted `MCState` until Symmray supplies matching flat
+fermionic backends.
 
 ```python
 import pepsy.vmc as pvmc
@@ -1256,12 +1257,13 @@ native sparse U1U1 and exact contraction; approximate boundary contractions
 continue to use the established sparse path.
 The same option is forwarded by `TorchFermionVMC` when its contraction is
 exact.
-For `U1U1`, `fermionic_peps_rand("U1U1", ...)` builds the block-sparse ansatz
-and `make_fermionic_peps_batched_amplitude_function(..., jit=False)` is
-validated with `contraction="exact"`, `"hotrg"`, `"ctmrg"`, and
-`"boundary"`/`"mps"`. Full NetKet `MCState` VMC still requires a jitted Flax
-model, so `build_fermi_hubbard_vmc(...)` raises clearly for block-sparse
-`U1U1` PEPS until Symmray provides a flat U1U1 fermionic backend.
+For `U1`, `U1U1`, and `Z2Z2`, `fermionic_peps_rand(...)` builds the
+block-sparse ansatz and `make_fermionic_peps_batched_amplitude_function(...,
+jit=False)` is validated with `contraction="exact"`, `"hotrg"`, `"ctmrg"`,
+and `"boundary"`/`"mps"`. Full NetKet `MCState` VMC still requires a jitted
+Flax/JAX model, so `build_fermi_hubbard_vmc(...)` raises clearly for these
+block-sparse PEPS until Symmray provides a flat backend for the requested
+symmetry.
 For an actual fixed-sector sparse-block VMC loop, use
 `build_sparse_fermi_hubbard_vmc(...)`: it builds the NetKet
 `SpinOrbitalFermions` Hilbert space and Fermi-Hubbard operator metadata, then
@@ -1273,7 +1275,7 @@ sectors it can enumerate the NetKet Hilbert space, while larger runs can pass
 
 ```python
 peps = pvmc.fermionic_peps_rand(
-    "U1U1",
+    "U1",  # or "U1U1" for separately fixed spin sectors
     Lx=2,
     Ly=2,
     bond_dim=3,

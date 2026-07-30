@@ -50,12 +50,19 @@ Keep one model-facing object responsible for:
 - matching `SymHamiltonian` construction for spinful Hubbard or spinless t-V;
 - occupation/charge helpers and model metadata.
 
-Prefer an explicit constructor such as:
+Prefer an explicit local-space constructor, with physical couplings supplied
+at the term, Hamiltonian, or gate-stream call site:
 
 ```python
-Fermion(spinful=False, symmetry="U1", t=1.0, V=0.5)
-Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0)
+spinless = Fermion(spinful=False, symmetry="U1")
+spinful = Fermion(spinful=True, symmetry="U1U1")
+
+spinless.hamiltonian(edges, t=1.0, V=0.5)
+spinful.strang_gate_stream(edges, dt=0.01, t=1.0, U=8.0)
 ```
+
+`Fermion` must not store `t`, `U`, `V`, or `mu`. Reject a Hubbard `U` on a
+spinless object instead of silently dropping it.
 
 Do not hide the spinless/spinful choice behind a model-name string when a
 boolean or explicit local-space descriptor can make it clear. Model-name
