@@ -10,6 +10,10 @@ contractions and corrections used by Pepsy:
 * :func:`loop_cluster_expand` -- the loop cluster expansion (arXiv:2510.05647),
 * :func:`loop_series_expand` -- the edge-resolved ``P + Q`` loop series
   (arXiv:2409.03108),
+* :func:`partial_trace_loop_cluster_expand` -- a D2BP loop-cluster reduced
+  density matrix and its scalar expectation companion,
+* :func:`partial_trace_loop_series_expand` -- a D2BP reduced-density-matrix
+  loop series and scalar local-observable companion,
 * :func:`loop_expand` -- an explicit selector between the correction families.
 * :func:`partitioned_expand` -- the partitioned network expansion (PNE,
   arXiv:2512.10910), with :func:`recursive_partitioned_expand` for fixed
@@ -38,6 +42,12 @@ from .series import (
     LoopSeriesCache,
     LoopSeriesResult,
     LoopSeriesTerm,
+    compute_local_expectation_edge_loop_series,
+    compute_local_expectation_loop_cluster,
+    compute_local_expectation_loop_series,
+    partial_trace_edge_loop_series_expand,
+    partial_trace_loop_cluster_expand,
+    partial_trace_loop_series_expand,
     loop_series_expand,
 )
 from .expansion import loop_expand
@@ -116,6 +126,12 @@ __all__ = [
     "LoopSeriesCache",
     "LoopSeriesResult",
     "LoopSeriesTerm",
+    "compute_local_expectation_edge_loop_series",
+    "compute_local_expectation_loop_cluster",
+    "compute_local_expectation_loop_series",
+    "partial_trace_edge_loop_series_expand",
+    "partial_trace_loop_cluster_expand",
+    "partial_trace_loop_series_expand",
     "RelayGaugeOptions",
     "ReducedALSSolution",
     "ReducedBondPair",

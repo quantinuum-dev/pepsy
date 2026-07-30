@@ -50,6 +50,23 @@ over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
 - `loop_series_expand(tn, gloops, *, norm="2norm"|"1norm", ...)` —
   edge-resolved loop **series** with explicit excited-bond terms. Its integer
   cutoff is a maximum excited-bond degree, not a tensor-region size.
+- Local D2BP observables: `partial_trace_loop_series_expand` and
+  `partial_trace_loop_cluster_expand` return local reduced density matrices;
+  `compute_local_expectation_loop_series` and
+  `compute_local_expectation_loop_cluster` accept Quimb-style
+  ``{site_or_sites: operator}`` mappings and return scalar expectations. Share
+  one D2BP solve across terms. Use the scalar APIs for fermionic observables.
+- Explicit-edge local D2BP observables:
+  `partial_trace_edge_loop_series_expand` and
+  `compute_local_expectation_edge_loop_series` use the same canonical
+  `LoopSeriesTerm` Q-edge sets and edge-degree cutoff as
+  `loop_series_expand`, rather than Quimb's local-region cutoff. The scalar
+  path inserts the gate before forming the graded bra and is the supported
+  fermionic expectation route. Terms that put Q on a bond wholly internal to
+  `where` are currently rejected explicitly. Nonzero-Q fermionic scalar
+  corrections are currently restricted to one-site gates; reject multi-site
+  graded-Q gates clearly rather than treating a dense rho trace as a sign
+  oracle.
 - `partitioned_expand(tn, partition_inds=... | partitions=..., *,
   norm="2norm"|"1norm", form="linear"|"combinatorial", ...)` — PNE from
   Evenbly, Gray, and Chan (arXiv:2512.10910). It inserts complementary
@@ -90,6 +107,16 @@ another:
 | `cluster` | tensor regions with counting numbers | `gloops` = tensor-region size or explicit regions |
 | `pne` | selected index partitions into `P` and `Q` subspaces | `partition_inds` or factorized `partitions` |
 
+The original *local-RDM* APIs deliberately follow Quimb's `get_local_gloops` region
+convention: their integer `gloops` is a local generalized-loop region cutoff,
+not the edge-degree cutoff of `loop_series_expand`. Local loop series inserts
+`Q` on the eligible internal bonds of each selected region; local loop cluster
+contracts BP-closed regions with inclusion--exclusion counts. Do not compare
+either term-for-term with a brute-force edge-subset enumeration. For that
+case, use `partial_trace_edge_loop_series_expand` or
+`compute_local_expectation_edge_loop_series`; do not silently reinterpret a
+region cutoff.
+
 PNE terms are not loop-cluster regions. A PNE residue is the all-`Q` network;
 retaining it gives the exact projector identity, while dropping it is the
 approximation whose error should be monitored.
@@ -111,6 +138,28 @@ what makes the result invariant under Cotengra contraction-tree choices. Do
 not treat `optimize="auto-hq"` as a fermionic sign fix: it is a Cotengra path
 preset, just like a reusable `PathOptimizer`, and a path-dependent sign means
 the input metadata is invalid or incomplete.
+
+### Fermionic local observables: required construction and oracle
+
+Do **not** evaluate a native fermionic observable as `trace(rho @ gate)`, even
+when a partial-trace API returns a native Symmray rho: opening and fusing the
+physical legs loses the graded gate-routing convention. Treat those rhos as
+diagnostics (charge support, trace, Hermiticity), not as an observable oracle.
+
+For scalar local observables, insert the native gate into the ket with
+`tensor_network_gate_inds(..., contract=False)` *before* forming the double
+layer. Build the bra from D2BP's `tensor_dual_map` and attach messages using
+`index_dual_map`; do not replace this with `tensor.conj()` carrying ket virtual
+labels. Normalize with the directly contracted gate-free BP network, not a
+trace of the fused rho. This works for both adjacent and separated supports.
+
+Before trusting a new fermionic BP observable path, add a native-Symmray tree
+test where D2BP is exact: compare a parity-even two-site gate (hopping,
+pairing, or eta-pairing) against `compute_local_expectation_exact`, then repeat
+with reversed site order and a correspondingly transposed native gate. A dense
+or trace-only test does not establish fermionic sign correctness. Use a
+brute-force edge-subset implementation only as a loop-enumeration oracle; if
+it is dense/non-graded, it is not by itself a fermionic-sign oracle.
 
 For valid closed scalar Symmray networks, the 1-norm APIs (`L1BP`, `HV1BP`,
 and `D1BP`), their loop/series/PNE corrections, D1 SU bridge, and
