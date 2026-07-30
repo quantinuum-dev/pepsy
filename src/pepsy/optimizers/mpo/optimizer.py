@@ -20,7 +20,8 @@ but differing in *how* two-site updates are compressed back to bond ``chi``:
 * ``mode="svd"``  — apply the gate with ``reduce-split`` then canonicalize +
   left-compress to ``chi``;
 * ``mode="mpo"``  — use :func:`pepsy.operators.gates.gate_nonlocal_opt` to
-  apply each layer independently on the ket and bra families.
+  apply each layer independently on the ket and bra families. Symmray MPOs
+  use the block-aware SVD path instead.
 
 The class also tracks a running "normalized-norm" proxy
 ``sqrt(<O|O> / <O0|O0>)`` that equals ``1`` for purely unitary two-sided
@@ -47,7 +48,15 @@ def _normalize_gate_queue(gates):
     if not entries:
         return [], []
     gate_list, where_list = zip(*entries)
-    return list(gate_list), [tuple(w) if isinstance(w, list) else w for w in where_list]
+
+    def normalize_where(where):
+        if isinstance(where, Integral):
+            return (int(where),)
+        if isinstance(where, list):
+            return tuple(where)
+        return where
+
+    return list(gate_list), [normalize_where(where) for where in where_list]
 
 
 class MpoOptimizer:
@@ -101,6 +110,26 @@ class MpoOptimizer:
     """
 
     _ALLOWED_MODES = frozenset({"dmrg", "svd", "mpo"})
+
+    @staticmethod
+    def _is_symmray_array(value):
+        """Return whether ``value`` is a Symmray block-sparse array."""
+        return hasattr(value, "blocks") and hasattr(value, "indices")
+
+    @staticmethod
+    def _is_fermionic_array(value):
+        """Return whether ``value`` carries Symmray graded-array metadata."""
+        return bool(getattr(value, "fermionic", False)) or (
+            "fermionicarray" in type(value).__name__.lower()
+        )
+
+    @classmethod
+    def _has_symmray_data(cls, tn):
+        """Return whether any tensor in ``tn`` stores Symmray data."""
+        return any(
+            cls._is_symmray_array(getattr(tensor, "data", None))
+            for tensor in getattr(tn, "tensors", ())
+        )
 
     @classmethod
     def _normalize_mode(cls, mode):
@@ -295,6 +324,13 @@ class MpoOptimizer:
         ``(o1, o2, i1, i2)`` tensors for two-site gates).  ``apply_gate``
         below expects the opposite ordering, so we transpose accordingly.
         """
+        # Native Symmray gates already carry explicit dual metadata describing
+        # output and input legs. Transposing them as if they were dense Quimb
+        # gates changes the charge sectors (and can make a U1U1 split ask for
+        # impossible virtual charges). Keep their graded/block structure intact.
+        if MpoOptimizer._is_symmray_array(gate):
+            return gate
+
         if n_sites == 1:
             return ar.do("transpose", gate, (1, 0))
         elif n_sites == 2:
@@ -317,8 +353,93 @@ class MpoOptimizer:
         else:
             raise ValueError("Each gate location must have one or two sites.")
 
+    @classmethod
+    def _symmray_physical_map(cls, p, site, ind_id):
+        """Return the dense charge list for one live MPO physical index."""
+        ind = ind_id.format(site)
+        tensor = next(
+            tensor
+            for tensor in getattr(p, "tensors", ())
+            if ind in getattr(tensor, "inds", ())
+        )
+        axis = tensor.inds.index(ind)
+        chargemap = tensor.data.indices[axis].chargemap
+        return [charge for charge, size in chargemap.items() for _ in range(int(size))]
+
     @staticmethod
-    def _prepare_gate_pair(gate, n_sites, bra_gate=None):
+    def _charge_parity(charge):
+        """Return fermion parity inferred from a scalar or product charge."""
+        if isinstance(charge, tuple):
+            return sum(int(part) for part in charge) % 2
+        return int(charge) % 2
+
+    @classmethod
+    def _fermionic_gate_to_bosonic(cls, p, gate, where, ind_id):
+        """Convert an even native gate for a non-graded Symmray MPO.
+
+        ``SymHamiltonian.to_mpo`` deliberately returns a bosonic Symmray MPO
+        with the Jordan-Wigner parity convention already encoded in its local
+        channels. Native ``Fermion`` gates use Symmray's graded tensor-product
+        convention instead. For an even two-site gate, changing conventions
+        amounts to the endpoint crossing phase on the input ket sectors.
+        """
+        if not cls._is_fermionic_array(gate) or not cls._has_symmray_data(p):
+            return gate
+
+        sample = next(
+            tensor.data
+            for tensor in getattr(p, "tensors", ())
+            if cls._is_symmray_array(getattr(tensor, "data", None))
+        )
+        if cls._is_fermionic_array(sample):
+            return gate
+
+        try:
+            dense = gate.to_dense()
+        except AttributeError:
+            dense = gate
+        dense = np.asarray(dense)
+        where = tuple(where)
+        physical_maps = [
+            cls._symmray_physical_map(p, site, ind_id) for site in where
+        ]
+        n_sites = len(where)
+        if n_sites == 2:
+            left_odd = np.array(
+                [cls._charge_parity(charge) for charge in physical_maps[0]],
+                dtype=bool,
+            )
+            right_odd = np.array(
+                [cls._charge_parity(charge) for charge in physical_maps[1]],
+                dtype=bool,
+            )
+            crossing = np.ones(
+                (len(left_odd), len(right_odd)),
+                dtype=dense.dtype,
+            )
+            crossing[np.ix_(left_odd, right_odd)] = -1
+            dense = dense * crossing[None, None, :, :]
+
+        import symmray.utils as sr_utils  # pylint: disable=import-outside-toplevel
+
+        sample_charge = next(iter(physical_maps[0]), 0)
+        zero = (
+            tuple(0 for _ in sample_charge)
+            if isinstance(sample_charge, tuple)
+            else 0
+        )
+        return sr_utils.from_dense(
+            dense,
+            symmetry=getattr(sample, "symmetry", None),
+            index_maps=physical_maps * 2,
+            duals=(False,) * n_sites + (True,) * n_sites,
+            fermionic=False,
+            charge=zero,
+        )
+
+    @classmethod
+    def _prepare_gate_pair(cls, gate, n_sites, bra_gate=None, *, p=None, where=None,
+                           ind_id="k{}"):
         """Return ``(g_k, g_b)`` ready to be fed to :func:`apply_gate`.
 
         ``gate`` becomes ``g_k`` (acts on the ket index family with the
@@ -330,12 +451,49 @@ class MpoOptimizer:
         if gate is None and bra_gate is None:
             raise ValueError("At least one of ket gate or bra gate must be provided.")
 
-        g_k = None if gate is None else MpoOptimizer._prepare_gate_tensor(gate, n_sites)
+        if p is not None and where is not None:
+            gate = (
+                None
+                if gate is None
+                else cls._fermionic_gate_to_bosonic(p, gate, where, ind_id)
+            )
+            bra_gate = (
+                None
+                if bra_gate is None
+                else cls._fermionic_gate_to_bosonic(p, bra_gate, where, ind_id)
+            )
+
+        g_k = None if gate is None else cls._prepare_gate_tensor(gate, n_sites)
         if bra_gate is None:
             g_b = None
         else:
-            g_b = ar.do("conj", MpoOptimizer._prepare_gate_tensor(bra_gate, n_sites))
+            g_b = ar.do("conj", cls._prepare_gate_tensor(bra_gate, n_sites))
         return g_k, g_b
+
+    @classmethod
+    def _materialize_split_gate(cls, p, where):
+        """Contract lazy native split-gate tensors back into site tensors.
+
+        Quimb's ``split-gate`` application is deliberately lazy: for a
+        non-local gate it temporarily leaves an extra tensor at each endpoint
+        carrying the site tag. That is useful for general tensor-network
+        workflows, but ``MatrixProductOperator.right_canonize_site`` expects
+        exactly one tensor per site. Native Symmray arrays cannot use the
+        dense swap-gate fallback, so materialize the endpoint tensors before
+        the MPO canonicalization/compression sweep.
+        """
+        if not cls._has_symmray_data(p):
+            return p
+
+        for site in set(where):
+            tag = f"I{site}"
+            if len(p.tag_map.get(tag, ())) > 1:
+                p.contract_tags(
+                    tag,
+                    preserve_tensor=True,
+                    inplace=True,
+                )
+        return p
 
     @staticmethod
     def _parse_gate_entry(G_i, where_i):
@@ -387,7 +545,14 @@ class MpoOptimizer:
         two index families stay decoupled.
         """
         n_sites = len(where)
-        g_k, g_b = self._prepare_gate_pair(gate, n_sites, bra_gate=bra_gate)
+        g_k, g_b = self._prepare_gate_pair(
+            gate,
+            n_sites,
+            bra_gate=bra_gate,
+            p=p,
+            where=where,
+            ind_id=self.ind_id_k,
+        )
 
         if g_k is not None:
             apply_gate(
@@ -411,6 +576,9 @@ class MpoOptimizer:
                 cutoff_mode=cutoff_mode,
                 inplace=inplace,
             )
+
+        if contract == "split-gate":
+            self._materialize_split_gate(p, where)
 
     def _build_dmrg_target(self, p, gate, where, bra_gate, cutoff, cutoff_mode="rsum2"):
         """Return ``p`` with one two-site gate pair applied via ``split-gate``.
@@ -637,6 +805,11 @@ class MpoOptimizer:
             elif n_sites == 2:
                 two_qubit_count += 1
                 xmin, xmax = sorted(where)
+                contract = (
+                    "split-gate"
+                    if self._has_symmray_data(p) and (xmax - xmin > 1)
+                    else "reduce-split"
+                )
 
                 self._apply_gate_pair(
                     p,
@@ -645,7 +818,7 @@ class MpoOptimizer:
                     bra_gate=bra_gate,
                     cutoff=cutoff,
                     cutoff_mode=cutoff_mode,
-                    contract="reduce-split",
+                    contract=contract,
                     inplace=True,
                 )
 
@@ -722,7 +895,14 @@ class MpoOptimizer:
                 )
             elif n_sites == 2:
                 two_qubit_count += 1
-                g_k, g_b = self._prepare_gate_pair(gate, n_sites, bra_gate=bra_gate)
+                g_k, g_b = self._prepare_gate_pair(
+                    gate,
+                    n_sites,
+                    bra_gate=bra_gate,
+                    p=p,
+                    where=where,
+                    ind_id=self.ind_id_k,
+                )
                 if g_k is not None:
                     p = gate_nonlocal_opt(
                         p, g_k, where,
@@ -803,6 +983,12 @@ class MpoOptimizer:
         -------
         qtn.MatrixProductOperator
             Updated MPO after replaying the queued gate stream.
+
+        Notes
+        -----
+        Symmray MPOs use the block-aware SVD compression implementation for
+        all three modes. This preserves multi-sector bonds when Quimb's
+        generic dense auxiliary or bond-padding paths are unavailable.
         """
         if mode is not None:
             self.set_mode(mode)
@@ -813,6 +999,20 @@ class MpoOptimizer:
             return self.p
 
         if self.mode == "dmrg":
+            # Quimb's FIT preparation expands bonds with dense-style padding,
+            # which is not valid for multi-sector Symmray indices. The
+            # symmetry-aware local SVD path applies the same gate/compression
+            # contract without destroying charge blocks.
+            if self._has_symmray_data(self.p):
+                self._run_svd(
+                    G_seq,
+                    where_seq,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=fidelity_samples,
+                )
+                return self.p
             self._prepare_dmrg_state()
             self._run_dmrg(
                 G_seq,
@@ -838,6 +1038,19 @@ class MpoOptimizer:
             return self.p
 
         if self.mode == "mpo":
+            # ``gate_nonlocal_opt`` creates a dense auxiliary sub-MPO and its
+            # generic compression currently loses multi-sector Symmray bond
+            # metadata. Reuse the block-aware local SVD route for these MPOs.
+            if self._has_symmray_data(self.p):
+                self._run_svd(
+                    G_seq,
+                    where_seq,
+                    progbar=progbar,
+                    cutoff=cutoff,
+                    cutoff_mode=cutoff_mode,
+                    fidelity_samples=fidelity_samples,
+                )
+                return self.p
             self._run_mpo(
                 G_seq,
                 where_seq,
@@ -879,3 +1092,19 @@ class MpoOptimizer:
     def get_fidelities(self):
         """Return the running loss history."""
         return self.losses
+
+    def compress(self, *, cutoff=1e-12, cutoff_mode="rsum2"):
+        """Compress the current MPO to ``chi`` while preserving its backend.
+
+        Symmray MPOs use Quimb's local block-aware compression path. This is
+        also useful when the optimizer is constructed with an empty gate
+        queue and the caller only wants a bond-dimension reduction.
+        """
+        self.p.compress(
+            form="left",
+            max_bond=self.chi,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+        )
+        self._init_canonicalization()
+        return self.p

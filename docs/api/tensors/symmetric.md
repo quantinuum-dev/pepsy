@@ -178,6 +178,11 @@ spinful.onsite_gate(dt=0.01, site=0, U=8.0)
 spinful.gate("interaction", dt=0.01, U=8.0)
 spinless.gate_stream(edges, dt=0.01, order=2, t=1.0, V=0.5, mu=0.0)
 spinful.local_terms(edges, t=1.0, U=8.0)  # native terms for optimization
+spinful.strang_gate_stream(
+    edges, dt=0.01, t=1.0, U=8.0, field_z=0.2
+)
+pairing = py.Fermion(spinful=False, symmetry="Z2")
+pairing.strang_gate_stream(edges, dt=0.01, t=1.0, pairing=0.2)
 ```
 
 The bare ``*_operator`` methods return explicit native fermionic operators,
@@ -308,9 +313,17 @@ the native Symmray gate directly. ``imaginary=True`` changes the evolution to
 ``exp(-dt H)``. The local exponential must be neutral so it remains in one
 conserved charge sector.
 
-``SpinfulFermion`` and ``SpinfulFermionHubbard`` remain compatibility aliases
-for ``Fermion``. ``SymmFermions.spinless(...)`` and
-``SymmFermions.spinful(...)`` are factory-style alternatives.
+``SpinfulFermion`` and ``SpinfulFermionHubbard`` remain compatibility
+constructors that fix ``spinful=True``. ``SymmFermions.spinless(...)`` and
+``SymmFermions.spinful(...)`` are factory-style alternatives with the same
+local-space guarantees.
+
+Automatic streams and edge-built Hamiltonians also accept ``field_x``,
+``field_y``, and ``field_z``. Transverse fields mix up/down occupation and
+therefore require spinful total-``U1`` or ``Z2`` symmetry; a longitudinal
+``field_z`` also works with spin-resolved ``U1U1``/``Z2Z2``. The ``pairing``
+and ``pairing_phase`` options describe a parity-preserving spinless pairing
+term and require ``Fermion(spinful=False, symmetry="Z2")``.
 
 ## Native spinful-fermion helper
 
@@ -507,6 +520,8 @@ Current support is:
 - spinful Fermi-Hubbard ``model="fermi_hubbard_u1u1"`` with
   ``symmetry="U1U1"``, hopping, onsite interaction, nearest-neighbor density
   interaction, and chemical-potential terms.
+- native graded MPO conversion for arbitrary neutral one- or multi-site
+  ``FermionicArray`` terms, including non-contiguous support;
 
 Spinful total-particle-number ``model="fermi_hubbard"`` with ``symmetry="U1"``
 still raises ``NotImplementedError``; use ``model="fermi_hubbard_u1u1"`` when
@@ -552,6 +567,41 @@ mpo = ham.to_mpo(mapper=mapper)
 # Equivalent when a workflow already stores the maps explicitly:
 mpo = ham.to_mpo(idx2coo=idx2coo, coo2idx=coo2idx)
 ```
+
+For the common edge-built Fermi-Hubbard path, the model helper is equivalent
+and keeps the selected symmetry attached to the construction:
+
+```python
+fermion = py.Fermion(spinful=True, symmetry="U1U1")
+mpo = fermion.build_mpo(
+    [(0, 1), (1, 2)], L=3, t=1.0, U=8.0, mu=0.0, max_bond=16
+)
+```
+
+This returns the existing symmetry-preserving Jordan-Wigner-compatible MPO
+convention. For the native graded path, use ``to_mpo``:
+
+```python
+mpo = fermion.to_mpo(
+    [(0, 1), (1, 2)], L=3, t=1.0, U=8.0, mu=0.0, max_bond=16
+)
+assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in mpo)
+```
+
+Native fermionic gate streams from the same ``Fermion`` model can be passed to
+``MpoOptimizer``; the optimizer preserves the graded Symmray tensors and their
+charge blocks during replay and compression. ``fermionic=False`` remains the
+explicit Jordan-Wigner compatibility choice for ``SymHamiltonian.to_mpo``.
+
+Pass ``to_backend=`` to ``Fermion.to_mpo`` or ``Fermion.build_mpo`` when the
+returned Symmray blocks should use a selected array backend. Native MPO
+assembly, replay, and exact energy measurement are supported. Native MPO
+energy applies the operator sitewise as a factorized graded MPO-MPS
+contraction, so its cost is controlled by the MPS and MPO bond dimensions.
+
+``Fermion.build_mpo(..., fermionic=True)`` selects the same native construction
+as ``Fermion.to_mpo(...)``. Omitting ``fermionic=True`` retains the explicit
+Jordan--Wigner compatibility MPO path.
 
 For periodic square lattices encoded as long-range edges in an OBC MPS/MPO,
 ``mode="folded-snake"`` alternates opposite columns before snaking. On a 6 by

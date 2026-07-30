@@ -465,7 +465,7 @@ class ham_tn:
 
     def build_mpo(
         self,
-        ints,
+        ints=None,
         *,
         phys_dim=2,
         max_bond=None,
@@ -473,12 +473,16 @@ class ham_tn:
         data_type=None,
         compress_each=True,
         mapper=None,
+        fermion=None,
+        edges=None,
+        fermionic=None,
+        **model_params,
     ):
         """Build MPO from user interactions.
 
         Parameters
         ----------
-        ints : sequence
+        ints : sequence | Mapping | pepsy.Fermion | None
             Sequence of terms. Supported term formats:
             - ``((op,), (coord,))``
             - ``((op1, op2), (coord1, coord2))``
@@ -500,12 +504,73 @@ class ham_tn:
         mapper : pepsy.tensors.core.OneDMap | None, default=None
             Optional mapper override used only for this MPO build. When
             omitted, the builder's configured mapper is used.
+        fermion : pepsy.Fermion | None, default=None
+            Optional native fermion model. When supplied, ``ints`` (or the
+            explicit ``edges`` alias) is passed to ``fermion.build_mpo`` and
+            the returned Symmray MPO keeps the model's U1/U1U1 symmetry.
+        edges : sequence | None, default=None
+            Explicit edge alias for the ``fermion=...`` form. For example,
+            ``builder.build_mpo(fermion=f, edges=edges, t=..., U=...)``.
+        fermionic : bool | None, default=None
+            Native graded encoding flag for the fermion-model form. ``None``
+            and ``False`` select the Jordan-Wigner-compatible MPO builder;
+            ``True`` selects ``Fermion.to_mpo(...)``.
+        **model_params
+            Explicit fermion couplings such as ``t``, ``U``/``V``, and ``mu``.
 
         Returns
         -------
         qtn.MatrixProductOperator
             Built Hamiltonian MPO.
         """
+        if (
+            fermion is None
+            and hasattr(ints, "build_mpo")
+            and hasattr(ints, "hamiltonian")
+        ):
+            fermion = ints
+            ints = None
+
+        if fermion is not None:
+            if edges is not None:
+                if ints is not None:
+                    raise TypeError(
+                        "Pass fermion terms through either ints or edges, not both."
+                    )
+                ints = edges
+            if ints is None:
+                raise ValueError(
+                    "Fermion MPO construction requires terms or an edge sequence."
+                )
+            if not isinstance(phys_dim, Integral) or int(phys_dim) < 1:
+                raise ValueError("phys_dim must be an integer >= 1.")
+            if not hasattr(fermion, "build_mpo"):
+                raise TypeError(
+                    "fermion must provide the Fermion.build_mpo interface."
+                )
+            dtype = self.data_type if data_type is None else np.dtype(data_type)
+            max_bond_use = self.max_bond if max_bond is None else int(max_bond)
+            cutoff_use = self.cutoff if cutoff is None else float(cutoff)
+            mapper_use = self.mapper if mapper is None else mapper
+            fermionic_use = False if fermionic is None else bool(fermionic)
+            mpo_builder = fermion.to_mpo if fermionic_use else fermion.build_mpo
+            return mpo_builder(
+                ints,
+                L=self.L,
+                mapper=mapper_use,
+                max_bond=max_bond_use,
+                cutoff=cutoff_use,
+                compress=bool(compress_each),
+                dtype=dtype,
+                fermionic=fermionic_use,
+                **model_params,
+            )
+
+        if edges is not None or model_params or fermionic is not None:
+            raise TypeError(
+                "edges, fermion model parameters, and fermionic encoding are "
+                "only valid with fermion=... ."
+            )
         if ints is None:
             raise ValueError("ints must be provided.")
         if not isinstance(phys_dim, Integral) or int(phys_dim) < 1:

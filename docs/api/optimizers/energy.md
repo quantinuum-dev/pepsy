@@ -30,6 +30,17 @@ the automatic re-encoding can create very large block-sparse intermediates.
 For a deliberately small or explicitly managed conversion, pass
 ``allow_encoding_conversion=True`` to ``MpsEnergyOptimizer``.
 
+An MPO returned by ``Fermion.to_mpo(...)`` is native graded and can be measured
+directly with a native fermionic MPS. Pepsy applies that MPO sitewise as a
+factorized graded MPO-MPS network, preserving Symmray's contraction order
+without materializing an exponentially sized operator.
+
+Repeated native-MPO evaluations reuse a per-optimizer cotengra path cache. The
+default is uncompressed and exact. For a controlled approximation, pass for
+example ``native_mpo_compression={"max_bond": 64, "cutoff": 1e-12,
+"method": "svd"}``; always compare against an uncompressed result when setting
+the truncation cap.
+
 ## Tree tensor networks
 
 ``TreeEnergyOptimizer`` mirrors the ``MpsEnergyOptimizer`` measurement surface
