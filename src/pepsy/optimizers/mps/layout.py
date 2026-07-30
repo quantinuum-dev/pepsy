@@ -10,6 +10,14 @@ import os
 import numpy as np
 
 from ...operators.gates import _normalize_gate_entries
+from .._layout_visualization import (
+    coordinate_lattice_edge_keys,
+    coordinate_lattice_edges,
+    event_color,
+    finish_schematic_axes,
+    matplotlib_modules,
+    resolve_site_coords,
+)
 
 __all__ = ["MpsGateStreamLayoutFinder"]
 
@@ -1419,3 +1427,257 @@ class MpsGateStreamLayoutFinder:
     def mapped_where_sequence(self, plan):
         """Return mapped locations for the stored stream."""
         return tuple(self.map_where(where, plan) for where in self.where)
+
+    def plot(
+        self,
+        plan=None,
+        *,
+        site_coords=None,
+        ax=None,
+        figsize=(10, 7),
+        cmap="turbo",
+        lattice=True,
+        show_mps_order=True,
+        show_chain_arrows=True,
+        show_order_labels=True,
+        show_gate_connectivity=True,
+        show_site_labels=False,
+        show_event_labels=False,
+        colorbar=False,
+        show_axes=False,
+        show_title=False,
+        show_chain_label=False,
+        node_size=52,
+        event_linewidth=1.8,
+        event_alpha=0.62,
+    ):
+        """Plot the logical interaction graph with the proposed MPS layout.
+
+        The faint graph is the original lattice, with solid grey edges for
+        gate connectivity. The selected MPS chain is the only colored route:
+        its arrows run through the logical lattice in exact MPS order, and the
+        optional node labels show both the logical site and its MPS position.
+        The default presentation is axis-free, following quimb's schematic
+        drawing style and contains no text; set ``show_title`` or one of the
+        label options to add annotations, or ``show_axes=True`` to retain
+        Matplotlib axes.
+        ``site_coords`` can be a mapping from logical labels to ``(x, y)`` or
+        a sequence aligned with :attr:`sites`. Tuple-valued ``(x, y)`` labels
+        are recognized automatically; otherwise sites are drawn on a line.
+
+        Returns
+        -------
+        (matplotlib.figure.Figure, matplotlib.axes.Axes)
+            The figure and axes, ready for further customization or saving.
+        """
+        plt, colormaps, ScalarMappable, Normalize, FancyArrowPatch = (
+            matplotlib_modules()
+        )
+        if plan is None:
+            plan = self.run()
+        if not isinstance(plan, Mapping) or "site_order" not in plan:
+            raise TypeError("plan must be a layout mapping returned by run().")
+
+        created_ax = ax is None
+        if created_ax:
+            _, ax = plt.subplots(figsize=figsize)
+            if not show_axes:
+                ax.figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        fig = ax.figure
+        coords = resolve_site_coords(self.sites, site_coords)
+        site_order = tuple(plan["site_order"])
+        position = {site: index for index, site in enumerate(site_order)}
+
+        # Draw the physical lattice first. This is deliberately separate from
+        # the gate graph so a long-range gate cannot be mistaken for an MPS
+        # bond or a lattice edge.
+        if lattice:
+            for left, right in coordinate_lattice_edges(coords):
+                x0, y0 = coords[left]
+                x1, y1 = coords[right]
+                ax.plot(
+                    (x0, x1),
+                    (y0, y1),
+                    color="#d5d9de",
+                    linewidth=1.0,
+                    alpha=0.78,
+                    zorder=1,
+                )
+
+        if show_gate_connectivity:
+            lattice_pairs = (
+                coordinate_lattice_edge_keys(coords)
+                if lattice
+                else set()
+            )
+            seen_pairs = {}
+            for support in self.supports:
+                unique = tuple(dict.fromkeys(support))
+                for left, right in zip(unique, unique[1:]):
+                    key = frozenset((left, right))
+                    if key in lattice_pairs:
+                        continue
+                    seen_pairs[key] = seen_pairs.get(key, 0) + 1
+            for pair, multiplicity in seen_pairs.items():
+                left, right = tuple(pair)
+                x0, y0 = coords[left]
+                x1, y1 = coords[right]
+                ax.plot(
+                    (x0, x1),
+                    (y0, y1),
+                    color="#7e8995",
+                    linewidth=(
+                        0.45 + 0.18 * min(multiplicity, 4)
+                        + 0.1 * event_linewidth
+                    ),
+                    linestyle="-",
+                    alpha=event_alpha,
+                    zorder=2,
+                )
+
+        # The colored arrows are the MPS chain itself, not stream events.
+        # This is the key visual distinction: every site has exactly one
+        # incoming/outgoing chain edge, while the grey graph above may
+        # contain arbitrary gate connectivity.
+        if show_mps_order and site_order:
+            for chain_index, (left, right) in enumerate(
+                zip(site_order, site_order[1:])
+            ):
+                x0, y0 = coords[left]
+                x1, y1 = coords[right]
+                sign = -1.0 if chain_index % 2 else 1.0
+                radius = sign * (0.045 + 0.012 * (chain_index % 3))
+                ax.add_patch(
+                    FancyArrowPatch(
+                        (x0, y0),
+                        (x1, y1),
+                        arrowstyle="-|>" if show_chain_arrows else "-",
+                        mutation_scale=10,
+                        connectionstyle=f"arc3,rad={radius}",
+                        linewidth=2.65,
+                        color=event_color(
+                            colormaps, cmap, chain_index, len(site_order)
+                        ),
+                        alpha=0.88,
+                        zorder=4,
+                    )
+                )
+
+        # Color logical sites by their position in the proposed MPS chain.
+        if self.sites:
+            site_values = [position[site] for site in self.sites]
+            scatter = ax.scatter(
+                [coords[site][0] for site in self.sites],
+                [coords[site][1] for site in self.sites],
+                c=site_values,
+                cmap=colormaps.get_cmap(cmap),
+                vmin=0,
+                vmax=max(1, len(site_order) - 1),
+                s=node_size,
+                edgecolors="#41464c",
+                linewidths=0.65,
+                zorder=5,
+            )
+        else:
+            scatter = None
+
+        if show_event_labels and self.supports:
+            for event_index, support in enumerate(self.supports):
+                support = tuple(dict.fromkeys(support))
+                if len(support) < 2:
+                    continue
+                left, right = support[:2]
+                x = (coords[left][0] + coords[right][0]) / 2.0
+                y = (coords[left][1] + coords[right][1]) / 2.0
+                ax.text(
+                    x,
+                    y,
+                    str(event_index),
+                    color="#59636e",
+                    fontsize=7,
+                    ha="center",
+                    va="center",
+                    zorder=8,
+                )
+
+        if show_site_labels:
+            for site in self.sites:
+                x, y = coords[site]
+                ax.annotate(
+                    str(site),
+                    (x, y),
+                    xytext=(0, 7),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=8,
+                    color="#41464c",
+                    zorder=9,
+                )
+        if show_order_labels and show_mps_order:
+            for site in self.sites:
+                x, y = coords[site]
+                ax.annotate(
+                    str(position[site]),
+                    (x, y),
+                    xytext=(0, -15),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=8,
+                    fontweight="bold",
+                    color="#1f2937",
+                    bbox={
+                        "boxstyle": "round,pad=0.18",
+                        "facecolor": "white",
+                        "edgecolor": "#9ca3af",
+                        "linewidth": 0.55,
+                        "alpha": 0.92,
+                    },
+                    zorder=10,
+                )
+
+        if colorbar and scatter is not None:
+            fig.colorbar(
+                ScalarMappable(
+                    norm=Normalize(vmin=0, vmax=max(1, len(site_order) - 1)),
+                    cmap=colormaps.get_cmap(cmap),
+                ),
+                ax=ax,
+                pad=0.02,
+                fraction=0.046,
+                label="MPS position",
+            )
+
+        title = (
+            "MPS layout finder"
+            + (f" — {plan['selected_order']}" if plan.get("selected_order") else "")
+        )
+        if show_axes:
+            if show_title:
+                ax.set_title(title)
+            ax.set_xlabel("logical site x")
+            ax.set_ylabel("logical site y")
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.margins(0.12)
+        else:
+            finish_schematic_axes(
+                ax,
+                title=title if show_title else None,
+            )
+        if show_chain_label and show_mps_order and site_order:
+            ax.text(
+                0.5,
+                -0.105,
+                "MPS chain: " + " → ".join(map(str, site_order)),
+                transform=ax.transAxes,
+                ha="center",
+                va="top",
+                fontsize=9,
+                color="#41464c",
+            )
+        if show_axes and coords:
+            y_values = [point[1] for point in coords.values()]
+            if max(y_values) - min(y_values) > 0.0:
+                ax.set_aspect("equal", adjustable="datalim")
+        return fig, ax
+
+    plot_layout = plot

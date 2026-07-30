@@ -1484,6 +1484,225 @@ def test_layout_report_summarizes_quality():
     assert rep["score"] <= rep["balanced_score"] + 1e-9
 
 
+def test_tree_layout_finder_plot_defaults_to_tent():
+    """The public plot shows the structural tent, not gate-route overlays."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gates = [
+        (pepsy.cnot(), (0, 3)),
+        (pepsy.cnot(), (3, 1)),
+    ]
+    finder = TreeLayoutFinder(gates, n=4, max_arity=2)
+    plan = finder.run()
+    assert plan.is_binary()
+    assert len(plan.children[plan.root]) == 2
+    fig, ax = finder.plot(
+        plan,
+        site_coords={0: (0, 0), 1: (1, 0), 2: (0, 1), 3: (1, 1)},
+    )
+
+    assert fig is ax.figure
+    assert ax.get_title() == ""
+    assert len(ax.patches) == len(plan.nodes()) - 1
+    assert len(fig.axes) == 1
+    assert not ax.axison  # schematic-style presentation by default
+    assert not ax.texts
+    assert len(ax.collections) == len(plan.nodes())
+    plt.close(fig)
+
+
+def test_tree_layout_finder_can_hide_gate_paths_for_structural_view():
+    """The structural view makes the binary TTN edges unambiguous."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gates = [
+        (pepsy.cnot(), (0, 3)),
+        (pepsy.cnot(), (3, 1)),
+    ]
+    finder = TreeLayoutFinder(gates, n=4, max_arity=2)
+    plan = finder.run()
+    fig, ax = finder.plot(
+        plan,
+        lattice=False,
+        show_gate_connectivity=False,
+        show_edge_arrows=False,
+    )
+
+    assert len(ax.lines) == len(plan.nodes()) - 1
+    assert not ax.patches
+    assert not ax.texts
+    assert not ax.axison
+    plt.close(fig)
+
+
+def test_tree_layout_finder_plot_tent_draws_hierarchy_over_raw_graph():
+    """Tent plotting separates the binary hierarchy from raw connectivity."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gates = [
+        (pepsy.cnot(), (0, 3)),
+        (pepsy.cnot(), (3, 1)),
+    ]
+    finder = TreeLayoutFinder(gates, n=4, max_arity=2)
+    plan = finder.run()
+    fig, ax = finder.plot_tent(
+        plan,
+        site_coords={0: (0, 0), 1: (1, 0), 2: (0, 1), 3: (1, 1)},
+    )
+
+    assert plan.is_binary()
+    assert fig is ax.figure
+    assert len(ax.patches) == len(plan.nodes()) - 1
+    assert not ax.texts
+    assert not ax.axison
+    assert len(ax.lines) >= len(plan.nodes()) - 1
+    assert len(ax.collections) == len(plan.nodes())
+    plt.close(fig)
+
+
+def test_tree_layout_scale_colors_do_not_depend_on_gate_stream_length():
+    """Scale coloring remains fixed when the gate stream changes."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    plan = TreePlan.from_order(range(8), structure="balanced", max_arity=2)
+    streams = [
+        [(pepsy.cnot(), (0, 7))],
+        [
+            (pepsy.cnot(), (0, 7)),
+            (pepsy.cnot(), (1, 6)),
+            (pepsy.cnot(), (2, 5)),
+            (pepsy.cnot(), (3, 4)),
+        ],
+    ]
+    structural_colors = []
+    scale_node_colors = []
+    for gates in streams:
+        finder = TreeLayoutFinder(gates, n=8, max_arity=2)
+        fig, ax = finder.plot_tent(
+            plan,
+            color_by="scale",
+            edge_color=None,
+            show_edge_arrows=False,
+        )
+        # With the default one-dimensional coordinates, the first lines are
+        # the lattice and only the non-lattice gate-connectivity background;
+        # nearest-neighbor gates are already represented by the lattice.
+        lattice_pairs = {
+            frozenset((site, site + 1))
+            for site in range(plan.n - 1)
+        }
+        nonlattice_gates = sum(
+            frozenset(where) not in lattice_pairs for _, where in gates
+        )
+        background_lines = len(plan.leaves()) - 1 + nonlattice_gates
+        structural_colors.append(
+            tuple(
+                tuple(line.get_color())
+                for line in ax.lines[background_lines:]
+            )
+        )
+        scale_node_colors.append(
+            tuple(
+                tuple(collection.get_facecolors()[0])
+                for collection in ax.collections
+            )
+        )
+        assert len(fig.axes) == 1
+        assert len(ax.collections) == len(plan.nodes())
+        plt.close(fig)
+
+    assert structural_colors[0] == structural_colors[1]
+    assert scale_node_colors[0] == scale_node_colors[1]
+    assert len(set(structural_colors[0])) > 1
+    assert len(set(scale_node_colors[0])) > 1
+
+
+def test_tree_layout_tent_edges_are_uniform_by_default():
+    """Tent hierarchy edges use one solid color unless explicitly varied."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gates = [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))]
+    finder = TreeLayoutFinder(gates, n=4, max_arity=2)
+    plan = finder.run()
+    fig, ax = finder.plot_tent(plan, color_by="scale")
+
+    lattice_pairs = {
+        frozenset((site, site + 1)) for site in range(plan.n - 1)
+    }
+    background_lines = len(plan.leaves()) - 1 + sum(
+        frozenset(where) not in lattice_pairs for _, where in gates
+    )
+    hierarchy_colors = {
+        line.get_color() for line in ax.lines[background_lines:]
+    }
+    assert hierarchy_colors == {"#2f80a0"}
+    assert len(ax.patches) == len(plan.nodes()) - 1
+    plt.close(fig)
+
+
+def test_tree_layout_tent_validates_arrow_size():
+    """Arrow marker sizing rejects values Matplotlib cannot render usefully."""
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 1))], n=2, max_arity=2
+    )
+    plan = finder.run()
+
+    with pytest.raises(ValueError, match="arrow_size"):
+        finder.plot_tent(plan, arrow_size=0.0)
+
+
+def test_tree_layout_finder_plot_rubberband_is_axis_free_and_unlabeled():
+    """Rubberband plots show clusters without plot text or axes."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gates = [
+        (pepsy.cnot(), (0, 3)),
+        (pepsy.cnot(), (3, 1)),
+        (pepsy.cnot(), (1, 2)),
+    ]
+    finder = TreeLayoutFinder(gates, n=4, max_arity=2)
+    plan = finder.run()
+    fig, ax = finder.plot_rubberband(
+        plan,
+        site_coords={0: (0, 0), 1: (1, 0), 2: (0, 1), 3: (1, 1)},
+    )
+
+    assert fig is ax.figure
+    assert ax.get_title() == ""
+    assert not ax.axison
+    assert not ax.texts
+    assert len(ax.patches) >= 1
+    plt.close(fig)
+
+
+def test_tree_optimizer_plot_layout_with_explicit_plan_is_non_mutating():
+    """The tree optimizer wrapper plots an explicit plan without replay."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gates = [(pepsy.cnot(), (0, 3))]
+    plan = TreeLayoutFinder(gates, n=4, max_arity=2).run()
+    opt = TreeOptimizer(gates, tree=plan, run=False)
+    before = opt.to_dense().copy()
+    fig, _ = opt.plot_layout(site_coords={q: (q, 0) for q in range(4)})
+
+    assert np.allclose(opt.to_dense(), before)
+    plt.close(fig)
+
+
 def test_bond_report_reflects_chi():
     """bond_report caps at chi and counts the tree tensors."""
     rng = np.random.default_rng(12)

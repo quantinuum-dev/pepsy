@@ -1040,6 +1040,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         return self.layout_finder(sites=sites, L=L).run(**kwargs)
 
+    def plot_layout(
+        self,
+        plan=None,
+        *,
+        sites=None,
+        L=None,
+        layout_kwargs=None,
+        **plot_kwargs,
+    ):
+        """Plot the current gate-stream layout and selected MPS order.
+
+        This is a convenience wrapper around
+        :meth:`MpsGateStreamLayoutFinder.plot`. It returns ``(fig, ax)`` and
+        does not mutate the optimizer or install the plotted layout. When
+        ``plan`` is omitted, the finder computes its default quality plan;
+        pass ``layout_kwargs`` to customize that search.
+        """
+        finder = self.layout_finder(sites=sites, L=L)
+        if plan is None:
+            plan = finder.run(**dict(layout_kwargs or {}))
+        return finder.plot(plan, **plot_kwargs)
+
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         p,

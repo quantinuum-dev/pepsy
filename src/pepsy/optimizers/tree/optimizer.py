@@ -1423,6 +1423,84 @@ class TreeOptimizer:
             }
         return self.layout_finder.report(self.plan)
 
+    def plot_layout(self, plan=None, *, layout_kwargs=None, **plot_kwargs):
+        """Plot the tree layout as a Cotengra-style tent.
+
+        The method returns ``(fig, ax)`` and does not alter the live TTN. For
+        an optimizer constructed with an explicit :class:`TreePlan`, the
+        temporary finder needed for gate diagnostics is built from the queued
+        stream without changing that plan.
+        """
+        finder = self.layout_finder
+        if finder is None:
+            finder = TreeLayoutFinder(
+                gates=self._layout_gate_stream(),
+                n=self.n,
+                structure=self.structure,
+                max_arity=self.max_arity,
+                community_frac=self.community_frac,
+                star_frac=self.star_frac,
+                objective=self.layout_objective,
+                weight_mode=self.layout_weight_mode,
+                chi=self.chi,
+                max_operator_qubits=self.max_operator_qubits,
+                root_qubit=self.plan.root_qubit,
+            )
+        if plan is None:
+            if layout_kwargs:
+                plan = finder.run(**dict(layout_kwargs))
+            else:
+                plan = self.plan
+        return finder.plot(plan, **plot_kwargs)
+
+    def plot_rubberband(self, plan=None, *, layout_kwargs=None, **plot_kwargs):
+        """Plot the tree's physical clusters as translucent rubberbands."""
+        finder = self.layout_finder
+        if finder is None:
+            finder = TreeLayoutFinder(
+                gates=self._layout_gate_stream(),
+                n=self.n,
+                structure=self.structure,
+                max_arity=self.max_arity,
+                community_frac=self.community_frac,
+                star_frac=self.star_frac,
+                objective=self.layout_objective,
+                weight_mode=self.layout_weight_mode,
+                chi=self.chi,
+                max_operator_qubits=self.max_operator_qubits,
+                root_qubit=self.plan.root_qubit,
+            )
+        if plan is None:
+            if layout_kwargs:
+                plan = finder.run(**dict(layout_kwargs))
+            else:
+                plan = self.plan
+        return finder.plot_rubberband(plan, **plot_kwargs)
+
+    def plot_tent(self, plan=None, *, layout_kwargs=None, **plot_kwargs):
+        """Plot the selected tree as a Cotengra-style tent over the lattice."""
+        finder = self.layout_finder
+        if finder is None:
+            finder = TreeLayoutFinder(
+                gates=self._layout_gate_stream(),
+                n=self.n,
+                structure=self.structure,
+                max_arity=self.max_arity,
+                community_frac=self.community_frac,
+                star_frac=self.star_frac,
+                objective=self.layout_objective,
+                weight_mode=self.layout_weight_mode,
+                chi=self.chi,
+                max_operator_qubits=self.max_operator_qubits,
+                root_qubit=self.plan.root_qubit,
+            )
+        if plan is None:
+            if layout_kwargs:
+                plan = finder.run(**dict(layout_kwargs))
+            else:
+                plan = self.plan
+        return finder.plot_tent(plan, **plot_kwargs)
+
     def canonize_subtree(self, nodes, *, span=False):
         """Canonicalise the state around the connected subtree ``nodes``.
 

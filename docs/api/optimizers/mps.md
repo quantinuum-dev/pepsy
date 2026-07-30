@@ -160,5 +160,32 @@ temporarily permutes the working MPS and restores the returned MPS to the
 original site order. Layout-aware replay prints a concise report by default;
 pass `layout_report=False` to silence it.
 
+The layout can be inspected graphically without changing the optimizer. The
+finder returns a Matplotlib `(fig, ax)` pair. The original lattice and gate
+connectivity remain a light grey background, while the colored arrow chain
+shows the selected MPS permutation directly. The default plot is axis-free and
+does not number the background lattice; use `show_site_labels=True` and
+`show_axes=True` when those annotations are useful:
+
+```python
+finder = opt.layout_finder()
+plan = finder.run(order="quality")
+fig, ax = finder.plot(
+    plan,
+    site_coords={q: (q % 4, q // 4) for q in range(opt.p.nsites)},
+)
+```
+
+`opt.plot_layout(plan, site_coords=...)` is the equivalent convenience wrapper.
+Coordinates are optional; tuple-valued site labels are interpreted as `(x, y)`
+automatically, and ordinary labels fall back to a 1D line. Install the
+optional `viz` profile to enable plotting. A stream-order colorbar is not shown
+by default; pass `colorbar=True` only when the MPS-position scale is useful.
+The default plot contains visible `0` through `last` order labels but no title,
+chain sentence, or other text. The styling follows Quimb's axis-free schematic
+drawings while retaining Pepsy's ordinary `(fig, ax)` return value.
+Pass `show_order_labels=False` to hide the position labels, or use
+`show_chain_label=True` and `show_title=True` for additional annotations.
+
 
 > API details are maintained as handwritten Markdown in this page.

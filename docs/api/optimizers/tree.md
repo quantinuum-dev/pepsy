@@ -655,6 +655,101 @@ backend.
 The dominant lever for accuracy at fixed `chi` is the tree structure, so the
 finder and optimizer expose diagnostics to choose it:
 
+The same diagnostics are available as a Cotengra-style tent plot.
+`TreeLayoutFinder.plot(plan)` is the default tent view (also available as
+`plot_tent(plan)`): it keeps the raw graph at the bottom and lifts
+the selected hierarchy above its descendant sites: the raw lattice and gate
+connectivity are gray, while circular nodes use stable scale colors. Hierarchy
+edges use one uniform solid color by default; pass `edge_color=None` to restore
+scale/order-colored edges. Midpoint arrows are enabled by default and indicate
+the parent-to-child direction; pass `show_edge_arrows=False` to hide them.
+Nearest-neighbor gate edges are not duplicated over the lattice. Supplying
+`site_coords={qubit: (x, y)}` places the physical sites on an existing lattice.
+It returns `(fig, ax)` and does not mutate the plan or live TTN:
+
+```python
+finder = py.TreeLayoutFinder(gates, n=n, objective="congestion")
+plan = finder.run()
+fig, ax = finder.plot(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="scale",
+    edge_color=None,
+    edge_cmap="turbo",
+    node_cmap="YlOrRd",
+    order=False,
+    show_edge_arrows=True,
+)
+
+# For a live optimizer, the same plot is available without changing its state.
+fig, ax = opt.plot_layout(site_coords=logical_lattice_coords)
+```
+
+The default plot is therefore the hierarchy that `TreeLayoutFinder` selected:
+one hierarchy edge per parent-child connection, drawn over the physical lattice
+and gate connectivity. For a background-free binary check, hide the physical
+background with:
+
+```python
+fig, ax = finder.plot(
+    plan,
+    lattice=False,
+    show_gate_connectivity=False,
+)
+```
+
+This leaves only the selected hierarchy. The public tent plot intentionally
+does not draw gate-by-gate route overlays.
+
+Use `finder.plot_rubberband(...)` for the same hierarchy in physical-lattice
+rubberband form. The optional `viz`
+profile provides Matplotlib. The plot uses the same visual
+idea as Cotengra's circuit/rubberband views: the source interaction structure
+remains visible underneath, and band color can encode either tree scale or
+post-order. The default styling is axis-free, following Quimb's schematic
+drawings, and the
+background lattice is not numbered. Pass `show_axes=True` or
+`show_site_labels=True` when those annotations are wanted. A stream-order
+colorbar is hidden by default; pass `colorbar=True` when that diagnostic is
+wanted.
+
+For a scale-invariant tree view, use `color_by="scale"`:
+
+```python
+fig, ax = finder.plot(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="scale",
+    edge_color=None,
+    edge_cmap="turbo",
+    node_cmap="YlOrRd",
+)
+```
+
+Here leaves are scale zero and nodes use stable colors for their hierarchical
+scale. To also color hierarchy edges by scale, pass `edge_color=None`.
+Midpoint arrows show the direction from each parent to its children. The
+mapping is independent of the number or order of gates;
+`colorbar=True` then labels tree scale rather than gate-stream order. The plot
+has no title by default; pass `show_title=True` if a title is wanted.
+
+For a physical-lattice view closer to Quimb's rubberband drawing, use:
+
+```python
+fig, ax = finder.plot_rubberband(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="gate",
+)
+
+# The live optimizer exposes the same non-mutating view.
+fig, ax = opt.plot_rubberband(site_coords=logical_lattice_coords)
+```
+
+This keeps the lattice sites and gate connectivity grey and wraps each
+non-root tree cluster in a rounded, translucent band. Use `color_by="scale"`
+for one stable band color per tree scale.
+
 - `TreeLayoutFinder.report(plan=None)` summarises the physical-node geodesic
   lengths over the interaction graph (`score`, `max_path`, `mean_path`,
   `weighted_mean_path`) and compares against a balanced index tree
