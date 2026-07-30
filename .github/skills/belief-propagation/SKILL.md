@@ -31,6 +31,10 @@ over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
 - `one_norm_bp(tn, *, method="l1bp"|"hv1bp"|"d1bp", max_iterations, tol, damping,
   update, diis, init_messages, ...) -> RelayBPResult` — plain 1-norm BP to a
   fixed point (partition-function / nonnegative contractions, e.g. decoding).
+- `two_norm_bp(tn, *, max_iterations, tol, damping, update, diis,
+  init_messages, ...) -> RelayBPResult` — native D2BP for wavefunction and
+  norm contractions. Symmray-backed fermionic PEPS retain their native charge
+  blocks throughout message updates and distance evaluation.
 - `relay_bp(tn, *, method, num_relays, max_iterations, gamma_range, tol, damping,
   update, memory_first_leg, init_messages, seed, ...) -> RelayBPResult` —
   disordered-memory / relay-BP: per-node random memory (incl. negative) applied
@@ -63,8 +67,12 @@ over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
   returned gauge-transformed network.
 - SU/simple-gauge bridge helpers: `simple_update_messages_from_gauges`,
   `d1bp_from_simple_update_gauges`, `run_d1bp_from_simple_update_gauges`,
-  `simple_update_bp_residual`, and `norm1_gloop_expand`. Use these for
-  scalar 1-norm cluster work with externally supplied simple gauges.
+  `simple_update_bp_residual`, `d2bp_from_simple_update_gauges`,
+  `run_d2bp_from_simple_update_gauges`,
+  `simple_update_core_and_gauges_from_d2bp`, and `norm1_gloop_expand`. Use
+  these for scalar 1-norm or PEPS 2-norm work with externally supplied simple
+  gauges. The D2BP bridge supports dense tensors and native Symmray fermionic
+  `U1`, `U1U1`, and `Z2` block-sparse tensors.
 - Result dataclasses: `RelayBPResult` (`.bp`, `.converged`, `.iterations`,
   `.max_mdiff`, `.contract()`, `.messages`, `.snapshot()`), `LoopClusterResult`
   (`.estimate`, `.bp_converged`, `.bp_iterations`, `.expand()`, `.messages`).
@@ -83,6 +91,13 @@ another:
 PNE terms are not loop-cluster regions. A PNE residue is the all-`Q` network;
 retaining it gives the exact projector identity, while dropping it is the
 approximation whose error should be monitored.
+
+For native Symmray D2BP, directed messages can temporarily omit charge
+sectors after an update. Pepsy aligns message charge maps before distance
+checks, D2BP normalization, and loop-cluster expansion, while keeping the
+messages and tensor data block-sparse. Do not replace this path with a dense
+copy: dense eigendecomposition can reorder eigenvectors across charge sectors
+and produce invalid Symmray gates.
 
 ## quimb substrate (do not reimplement)
 `quimb.tensor.belief_propagation`:
@@ -165,6 +180,10 @@ Loop corrections split by how much they need a **converged BP fixed point**:
 - `weight_pass` is intentionally restricted to closed pairwise networks; for a
   D2 calculation, obtain the environment on the appropriate closed
   double-layer network before supplying projectors to D2 PNE.
+- Native Symmray fermionic BP coverage is in `tests/test_bp_symmray.py` and
+  currently exercises `U1`, `U1U1`, and `Z2` SU↔D2BP round trips plus loop
+  cluster expansion. Preserve the array class and charge blocks when adding
+  new BP or gauge paths.
 - Keep `pepsy.bp` out of the lazy top-level namespace (import `pepsy.bp`); do
   **not** edit `src/pepsy/__init__.py` for it.
 - Tests: `tests/test_bp_relay.py` and `tests/test_simple_update_gen.py`. Env: py312

@@ -97,10 +97,137 @@ def _copy_array(x):
 
 
 def _as_numpy(x):
+    if hasattr(x, "to_dense"):
+        return np.asarray(x.to_dense())
     try:
         return np.asarray(ar.to_numpy(x))
     except Exception:
         return np.asarray(x)
+
+
+def _gauge_values_numpy(gauge):
+    """Materialize a gauge vector for validation, including Symmray vectors."""
+    if hasattr(gauge, "to_dense"):
+        return np.asarray(gauge.to_dense())
+    return _as_numpy(gauge)
+
+
+def _is_symmray_array(value) -> bool:
+    return getattr(value.__class__, "__module__", "").startswith("symmray")
+
+
+def _symmray_dense_matrix(matrix):
+    """Convert one small Symmray message to a host dense matrix."""
+    if hasattr(matrix, "to_dense"):
+        return np.asarray(matrix.to_dense())
+    return np.asarray(matrix)
+
+
+def _symmray_align_message_to_bond(tn, ix, tid, message):
+    """Pad a Symmray message to the full charge support of a PEPS bond."""
+    if not (_is_symmray_array(message) and hasattr(message, "indices")):
+        return message
+
+    charge_map = _symmray_bond_chargemap(tn, ix)
+    indices = tuple(
+        message_index.copy_with(chargemap=charge_map)
+        for message_index in message.indices
+    )
+    message = message.copy_with(indices=indices)
+    message.fill_missing_blocks()
+    return message
+
+
+def _symmray_bond_chargemap(tn, ix):
+    """Return the union of endpoint charge maps for one PEPS bond."""
+    charge_map = {}
+    for tid in tn.ind_map[ix]:
+        tensor = tn.tensor_map[tid]
+        axis = tensor.inds.index(ix)
+        for charge, size in tensor.data.indices[axis].chargemap.items():
+            previous = charge_map.setdefault(charge, int(size))
+            if previous != int(size):
+                raise ValueError(
+                    f"incompatible endpoint charge dimensions on bond {ix!r}"
+                )
+    return dict(sorted(charge_map.items()))
+
+
+def _symmray_block_vector(tn, ix, values, *, tid=None):
+    """Create a native Symmray block vector in the bond charge order.
+
+    ``tid`` optionally restricts the result to the charge sectors present in
+    that endpoint's current sparse tensor data. This matters for fermionic
+    boundary tensors: their index can retain a larger declared charge map than
+    the sectors with nonzero stored blocks.
+    """
+    import symmray as sr
+
+    charge_map = _symmray_bond_chargemap(tn, ix)
+    values = np.asarray(values).reshape(-1)
+    offsets = {}
+    offset = 0
+    for charge, size in charge_map.items():
+        offsets[charge] = offset
+        offset += int(size)
+    if offset != values.size:
+        raise ValueError(f"vector size does not match Symmray bond {ix!r}")
+
+    if tid is None:
+        selected_charges = tuple(charge_map)
+    else:
+        tensor = tn.tensor_map[tid]
+        axis = tensor.inds.index(ix)
+        selected_charges = tuple(tensor.data.indices[axis].chargemap)
+
+    blocks = {}
+    for charge in selected_charges:
+        size = int(charge_map[charge])
+        offset = offsets[charge]
+        size = int(size)
+        blocks[charge] = values[offset : offset + size].copy()
+    return sr.BlockVector(blocks)
+
+
+def _symmray_block_matrix(tn, ix, tid, matrix, *, full=False):
+    """Create a native Symmray matrix from a charge-preserving dense matrix.
+
+    ``matrix`` is indexed in the union charge order of the PEPS bond. By
+    default only sectors present in ``tid``'s current sparse tensor data are
+    emitted, while ``full=True`` retains every endpoint-supported sector for a
+    standalone density matrix or eigendecomposition.
+    """
+    tensor = tn.tensor_map[tid]
+    data = tensor.data
+    axis = tensor.inds.index(ix)
+    bond_index = data.indices[axis]
+    matrix = np.asarray(matrix)
+    charge_map = _symmray_bond_chargemap(tn, ix)
+    selected_charges = (
+        tuple(charge_map)
+        if full
+        else tuple(bond_index.chargemap)
+    )
+    offsets = {}
+    offset = 0
+    for charge, size in charge_map.items():
+        offsets[charge] = offset
+        offset += int(size)
+    if offset != matrix.shape[0] or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(f"matrix size does not match Symmray bond {ix!r}")
+    blocks = {}
+    for charge in selected_charges:
+        size = int(charge_map[charge])
+        offset = offsets[charge]
+        size = int(size)
+        blocks[(charge, charge)] = matrix[
+            offset : offset + size, offset : offset + size
+        ].copy()
+    return type(data).from_blocks(
+        blocks,
+        duals=(bond_index.dual, not bond_index.dual),
+        phases={},
+    )
 
 
 def _as_float(x) -> float:
@@ -294,13 +421,15 @@ def _d2bp_messages_from_simple_update_gauges(
         if ix in gauges:
             gauge = _copy_array(gauges[ix])
         elif missing == "ones":
-            gauge = _ones_for_index(tn, ix)
+            gauge = None
         elif missing == "raise":
             raise KeyError(f"missing simple-update gauge for index {ix!r}")
         else:
             raise ValueError("missing must be 'ones' or 'raise'")
 
-        gauge_np = np.real_if_close(_as_numpy(gauge))
+        gauge_np = np.ones(tn.ind_size(ix)) if gauge is None else np.real_if_close(
+            _gauge_values_numpy(gauge)
+        )
         if gauge_np.ndim != 1 or gauge_np.shape[0] != tn.ind_size(ix):
             raise ValueError(
                 f"SU gauge for {ix!r} must be a length-{tn.ind_size(ix)} vector"
@@ -312,18 +441,66 @@ def _d2bp_messages_from_simple_update_gauges(
                 "D2BP SU initialization requires real nonnegative Vidal "
                 f"gauges; bond {ix!r} is invalid"
             )
-        if smudge:
+        if smudge and gauge is not None:
             gauge = _smudge_gauge(gauge, smudge)
 
+        tida, tidb = tids
         # In the symmetric PEPS gauge, sqrt(lambda) is absorbed on each
         # physical-site tensor. D2BP sees both layers, hence its directed
         # density message is diag(lambda), rather than the D1 sqrt(lambda).
-        message = ar.do("diag", gauge)
-        tida, tidb = tids
-        messages[ix, tida] = _copy_array(message)
-        messages[ix, tidb] = _copy_array(message)
+        messages[ix, tida] = _d2bp_diagonal_message(
+            tn, ix, tida, gauge, smudge=smudge
+        )
+        messages[ix, tidb] = _d2bp_diagonal_message(
+            tn, ix, tidb, gauge, smudge=smudge
+        )
 
     return messages
+
+
+def _d2bp_diagonal_message(tn, ix, tid, gauge, *, smudge=0.0):
+    """Build one SU ``diag(lambda)`` D2BP message in the native backend."""
+    tensor = tn.tensor_map[tid]
+    data = tensor.data
+    if gauge is None:
+        gauge_values = np.ones(tn.ind_size(ix)) + smudge
+    else:
+        gauge_values = gauge
+
+    if not (
+        getattr(data.__class__, "__module__", "").startswith("symmray")
+        and hasattr(data, "indices")
+    ):
+        return _copy_array(ar.do("diag", gauge_values))
+
+    axis = tensor.inds.index(ix)
+    bond_index = data.indices[axis]
+    gauge_blocks = gauge_values.blocks if hasattr(gauge_values, "blocks") else {}
+    blocks = {}
+    for charge, size in bond_index.chargemap.items():
+        values = gauge_blocks.get(charge)
+        if values is None:
+            fill = 1.0 if gauge is None else 0.0
+            values = ar.do(
+                "ones" if fill else "zeros",
+                (int(size),),
+                like=data.get_any_array(),
+            )
+            if fill and smudge:
+                values = values * (1.0 + smudge)
+        else:
+            values = ar.do("reshape", values, (int(size),))
+        blocks[(charge, charge)] = ar.do("diag", values)
+
+    # The message axes must match the destination tensor leg and its dual.
+    # Do not copy the PEPS tensor's dummy modes: these auxiliary density
+    # messages are not physical fermion legs and must have no dummy mode.
+    message_cls = type(data)
+    return message_cls.from_blocks(
+        blocks,
+        duals=(bond_index.dual, not bond_index.dual),
+        phases={},
+    )
 
 
 def d2bp_from_simple_update_gauges(
@@ -1419,8 +1596,37 @@ def _psd_eigh(matrix, *, smudge: float, label: str):
     """Diagonalize a PSD message, clipping only numerical null modes."""
     if smudge < 0.0:
         raise ValueError("smudge must be nonnegative")
-    matrix = _hermitize(matrix)
-    values, vectors = ar.do("linalg.eigh", matrix)
+    if _is_symmray_array(matrix):
+        # A dense eigh is not symmetry aware: even a diagonal matrix can have
+        # its eigenvectors returned in a charge-permuting order.  That is
+        # harmless for ordinary arrays but dropping the resulting off-sector
+        # gates back into a Symmray array changes the state.  Diagonalize each
+        # charge block independently and keep the native block order.
+        charge_map = matrix.indices[0].chargemap
+        size = sum(int(n) for n in charge_map.values())
+        dtype = np.result_type(*matrix.get_all_blocks(), float)
+        values = np.empty(size, dtype=float)
+        vectors = np.zeros((size, size), dtype=dtype)
+        offset = 0
+        for charge, block_size in charge_map.items():
+            block_size = int(block_size)
+            block = matrix.blocks.get((charge, charge))
+            if block is None:
+                block = np.zeros((block_size, block_size), dtype=dtype)
+            block = np.asarray(block)
+            block = 0.5 * (block + block.conj().T)
+            block_values, block_vectors = np.linalg.eigh(block)
+            values[offset : offset + block_size] = np.real_if_close(
+                block_values
+            )
+            vectors[
+                offset : offset + block_size,
+                offset : offset + block_size,
+            ] = block_vectors
+            offset += block_size
+    else:
+        matrix = _hermitize(matrix)
+        values, vectors = ar.do("linalg.eigh", matrix)
     values_np = np.real_if_close(_as_numpy(values))
     if np.iscomplexobj(values_np) or not np.all(np.isfinite(values_np)):
         raise ValueError(f"D2BP message for {label} has invalid eigenvalues")
@@ -1449,8 +1655,12 @@ def _psd_sqrt_and_inverse(matrix, *, smudge: float, label: str):
 
     values, vectors = _psd_eigh(matrix, smudge=smudge, label=label)
     roots = ar.do("sqrt", values)
-    sqrt = qtn.decomp.rdmul(vectors, roots) @ ar.dag(vectors)
-    sqrt_inv = qtn.decomp.rdmul(vectors, 1.0 / roots) @ ar.dag(vectors)
+    if _is_symmray_array(matrix):
+        sqrt = (vectors * roots) @ vectors.conj().T
+        sqrt_inv = (vectors * (1.0 / roots)) @ vectors.conj().T
+    else:
+        sqrt = qtn.decomp.rdmul(vectors, roots) @ ar.dag(vectors)
+        sqrt_inv = qtn.decomp.rdmul(vectors, 1.0 / roots) @ ar.dag(vectors)
     return sqrt, sqrt_inv
 
 
@@ -1510,14 +1720,32 @@ def simple_update_core_and_gauges_from_d2bp(
         # solve the simultaneous congruence problem on this bond.
         m_from_a = bp.messages[ix, tidb]
         m_from_b = bp.messages[ix, tida]
+        if _is_symmray_array(m_from_a):
+            m_from_a = _symmray_align_message_to_bond(
+                bp.tn, ix, tida, m_from_a
+            )
+            m_from_b = _symmray_align_message_to_bond(
+                bp.tn, ix, tidb, m_from_b
+            )
         sqrt_a, sqrt_a_inv = _psd_sqrt_and_inverse(
             m_from_a,
             smudge=smudge,
             label=f"bond {ix!r}, source {tida!r}",
         )
-        metric_product = _hermitize(
-            sqrt_a @ ar.do("transpose", m_from_b) @ sqrt_a
-        )
+        symmray_messages = _is_symmray_array(m_from_a)
+        if symmray_messages:
+            m_from_b_dense = _symmray_dense_matrix(m_from_b)
+            metric_product = sqrt_a @ m_from_b_dense.T @ sqrt_a
+            metric_product = 0.5 * (
+                metric_product + metric_product.conj().T
+            )
+            metric_product = _symmray_block_matrix(
+                bp.tn, ix, tida, metric_product, full=True
+            )
+        else:
+            metric_product = _hermitize(
+                sqrt_a @ ar.do("transpose", m_from_b) @ sqrt_a
+            )
         lambda_squared, vectors = _psd_eigh(
             metric_product,
             smudge=smudge,
@@ -1532,13 +1760,47 @@ def simple_update_core_and_gauges_from_d2bp(
         # The transposed first gate and inverse second gate preserve the
         # single-layer contraction exactly; removing sqrt(Lambda) from both
         # tensors exposes the external SU gauge.
-        G = sqrt_a_inv @ qtn.decomp.rdmul(vectors, sqrt_gauge)
-        G_inv = qtn.decomp.lddiv(sqrt_gauge, ar.dag(vectors)) @ sqrt_a
-        core.tensor_map[tida].gate_(ar.do("transpose", G), ix)
-        core.tensor_map[tidb].gate_(G_inv, ix)
-        core.tensor_map[tida].multiply_index_diagonal_(ix, 1.0 / sqrt_gauge)
-        core.tensor_map[tidb].multiply_index_diagonal_(ix, 1.0 / sqrt_gauge)
-        gauges[ix] = _copy_array(gauge)
+        if symmray_messages:
+            G = (
+                sqrt_a_inv
+                @ (vectors * sqrt_gauge)
+            )
+            G_inv = (
+                np.diag(1.0 / sqrt_gauge)
+                @ vectors.conj().T
+                @ sqrt_a
+            )
+            core.tensor_map[tida].gate_(
+                _symmray_block_matrix(core, ix, tida, G.T), ix
+            )
+            core.tensor_map[tidb].gate_(
+                _symmray_block_matrix(core, ix, tidb, G_inv), ix
+            )
+            inv_sqrt_gauge = _symmray_block_vector(
+                core, ix, 1.0 / sqrt_gauge, tid=tida
+            )
+            core.tensor_map[tida].multiply_index_diagonal_(
+                ix, inv_sqrt_gauge
+            )
+            inv_sqrt_gauge = _symmray_block_vector(
+                core, ix, 1.0 / sqrt_gauge, tid=tidb
+            )
+            core.tensor_map[tidb].multiply_index_diagonal_(
+                ix, inv_sqrt_gauge
+            )
+            gauges[ix] = _symmray_block_vector(core, ix, gauge)
+        else:
+            G = sqrt_a_inv @ qtn.decomp.rdmul(vectors, sqrt_gauge)
+            G_inv = qtn.decomp.lddiv(sqrt_gauge, ar.dag(vectors)) @ sqrt_a
+            core.tensor_map[tida].gate_(ar.do("transpose", G), ix)
+            core.tensor_map[tidb].gate_(G_inv, ix)
+            core.tensor_map[tida].multiply_index_diagonal_(
+                ix, 1.0 / sqrt_gauge
+            )
+            core.tensor_map[tidb].multiply_index_diagonal_(
+                ix, 1.0 / sqrt_gauge
+            )
+            gauges[ix] = _copy_array(gauge)
 
     return core, gauges
 

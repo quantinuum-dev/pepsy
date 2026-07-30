@@ -52,6 +52,56 @@ _RELAY_CLASSES = {**_ONE_NORM_CLASSES, "d2bp": "D2BP"}
 _RELAY_METHODS = {"l1bp", "d1bp", "d2bp"}
 
 
+def _is_symmray_array(value) -> bool:
+    return getattr(value.__class__, "__module__", "").startswith("symmray")
+
+
+def _align_symmray_message_pair(left, right):
+    """Return charge-support-aligned copies of two Symmray messages."""
+    if not (
+        _is_symmray_array(left)
+        and _is_symmray_array(right)
+        and hasattr(left, "indices")
+        and hasattr(right, "indices")
+    ):
+        return left, right
+
+    left_indices = []
+    right_indices = []
+    for left_index, right_index in zip(left.indices, right.indices):
+        left_map = dict(left_index.chargemap)
+        right_map = dict(right_index.chargemap)
+        for charge in set(left_map) & set(right_map):
+            if left_map[charge] != right_map[charge]:
+                raise ValueError("incompatible Symmray message charge dimensions")
+        charge_map = {**left_map, **right_map}
+        left_indices.append(
+            left_index.copy_with(chargemap=charge_map, dual=left_index.dual)
+        )
+        right_indices.append(
+            right_index.copy_with(chargemap=charge_map, dual=right_index.dual)
+        )
+
+    left = left.copy_with(indices=tuple(left_indices))
+    right = right.copy_with(indices=tuple(right_indices))
+    left.fill_missing_blocks()
+    right.fill_missing_blocks()
+    return left, right
+
+
+def _symmray_message_distance(left, right) -> float:
+    """L2 distance after aligning omitted sparse charge blocks."""
+    left, right = _align_symmray_message_pair(left, right)
+    if hasattr(left, "to_dense") and hasattr(right, "to_dense"):
+        left = left.to_dense()
+        right = right.to_dense()
+    return float(np.linalg.norm(np.asarray(left) - np.asarray(right)))
+
+
+def _uses_symmray(tn) -> bool:
+    return any(_is_symmray_array(tensor.data) for tensor in tn.tensors)
+
+
 def _method_key(method: str, classes: Mapping[str, str]) -> str:
     """Validate and normalize a public BP method name against ``classes``."""
     key = str(method).lower()
@@ -77,12 +127,26 @@ def _message_data(message):
     Checking for ``modify`` deliberately avoids ``ndarray.data``, which is a
     memory-view rather than the message array.
     """
-    return message.data if hasattr(message, "modify") else message
+    return (
+        message.data
+        if hasattr(message, "modify") and hasattr(message, "data")
+        else message
+    )
+
+
+def _copy_message(message):
+    """Copy a message through its native backend before using Autoray."""
+    if hasattr(message, "copy"):
+        try:
+            return message.copy()
+        except Exception:
+            pass
+    return ar.do("copy", message)
 
 
 def _set_message(bp, key, message, data) -> None:
     """Replace one message, supporting Tensor and bare-array BPs."""
-    if hasattr(message, "modify"):
+    if hasattr(message, "modify") and hasattr(message, "data"):
         message.modify(data=data)
     else:
         bp.messages[key] = data
@@ -100,12 +164,43 @@ def _snapshot(messages):
         return {key: _snapshot(value) for key, value in messages.items()}
     if isinstance(messages, tuple):
         return tuple(_snapshot(value) for value in messages)
-    return ar.do("copy", _message_data(messages))
+    return _copy_message(_message_data(messages))
 
 
 def _message_shape(message) -> tuple[int, ...]:
     """Return a backend-independent message shape for warm-start checks."""
     return tuple(ar.do("shape", _message_data(message)))
+
+
+def _symmray_message_compatible(template, snapshot) -> bool:
+    """Allow sparse charge support to differ while preserving bond topology."""
+    if not (
+        _is_symmray_array(template)
+        and _is_symmray_array(snapshot)
+        and hasattr(template, "indices")
+        and hasattr(snapshot, "indices")
+    ):
+        return False
+    if len(template.indices) != len(snapshot.indices):
+        return False
+    for template_index, snapshot_index in zip(
+        template.indices, snapshot.indices
+    ):
+        if template_index.dual != snapshot_index.dual:
+            return False
+        template_map = template_index.chargemap
+        snapshot_map = snapshot_index.chargemap
+        if not (
+            set(template_map).issubset(snapshot_map)
+            or set(snapshot_map).issubset(template_map)
+        ):
+            return False
+        if any(
+            template_map[charge] != snapshot_map[charge]
+            for charge in set(template_map) & set(snapshot_map)
+        ):
+            return False
+    return True
 
 
 def _validate_message_tree(template, snapshot, path="messages") -> None:
@@ -129,7 +224,9 @@ def _validate_message_tree(template, snapshot, path="messages") -> None:
             _validate_message_tree(value, saved, f"{path}[{i}]")
         return
 
-    if _message_shape(template) != _message_shape(snapshot):
+    if _message_shape(template) != _message_shape(snapshot) and not (
+        _symmray_message_compatible(template, snapshot)
+    ):
         raise ValueError(
             f"{path} has shape {_message_shape(snapshot)}, expected "
             f"{_message_shape(template)} for this tensor-network topology"
@@ -153,7 +250,7 @@ def _set_messages(bp, messages) -> None:
         return
 
     for key, message in bp.messages.items():
-        _set_message(bp, key, message, ar.do("copy", messages[key]))
+        _set_message(bp, key, message, _copy_message(messages[key]))
 
 
 def _bp_constructor_kwargs(method_key: str, damping, update, bp_opts):
@@ -566,6 +663,9 @@ def two_norm_bp(
     """
     if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
+    bp_opts = dict(bp_opts)
+    if _uses_symmray(tn):
+        bp_opts.setdefault("distance", _symmray_message_distance)
     bp = _bp_class("d2bp")(
         tn,
         **_bp_constructor_kwargs("d2bp", damping, update, bp_opts),
@@ -684,6 +784,9 @@ def relay_bp(
 
         _validate_d1_graph(tn)
 
+    bp_opts = dict(bp_opts)
+    if method_key == "d2bp" and _uses_symmray(tn):
+        bp_opts.setdefault("distance", _symmray_message_distance)
     bp_class = _bp_class(method_key)
     rng = np.random.default_rng(seed)
     bp = bp_class(
