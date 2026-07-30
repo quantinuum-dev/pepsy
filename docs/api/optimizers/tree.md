@@ -22,6 +22,7 @@ from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer
 
 finder = TreeLayoutFinder(gates, n=5, root_qubit=4, max_arity=2)
 plan = finder.run(
+    order="quality",
     refine="greedy",
     refine_budget=64,
     search="nevergrad",
@@ -397,6 +398,12 @@ it combines normalized path score, maximum edge load, and total edge load with
 `weight_mode` / `layout_weight_mode` option accepts `count`, `auto`, `angle`, or
 `operator_schmidt` for interaction-graph weighting.
 
+Use `order="quality"` with `finder.run()` (or set it on the finder) for the
+MPS-style higher-quality offline search. It enables bounded greedy leaf
+refinement and opportunistic Nevergrad refinement when Nevergrad is installed;
+otherwise it falls back to greedy refinement. The zero-argument `run()` path
+remains the fast deterministic candidate selection.
+
 For compression-first selection, use `objective="compression"` (or
 `layout_objective="compression"`). It prioritizes peak and total predicted
 operator-Schmidt load, then penalizes the estimated local tensor size at the
@@ -552,6 +559,7 @@ layout API:
 
 ```python
 tree_plan = finder.run(
+    order="quality",
     refine="greedy",
     refine_budget=64,
     search="nevergrad",

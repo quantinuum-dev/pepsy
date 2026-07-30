@@ -57,6 +57,7 @@ __all__ = ["TreePlan", "TreeLayoutFinder"]
 
 _DEFAULT_MAX_ARITY = object()
 _DEFAULT_CHI = object()
+_DEFAULT_ORDER = object()
 _DEFAULT_SEARCH_OPTION = object()
 _DEFAULT_SCALE_MARKERS = ("o",)
 
@@ -145,6 +146,31 @@ def _normalize_layout_search(search):
     if name != "nevergrad":
         raise ValueError("search must be None or 'nevergrad'.")
     return name
+
+
+def _normalize_layout_order(order):
+    """Normalize the optional high-quality layout mode."""
+    if order is None:
+        return None
+    name = str(order).replace("-", "_").strip().lower()
+    aliases = {
+        "auto": "quality",
+        "best": "quality",
+        "best_quality": "quality",
+    }
+    name = aliases.get(name, name)
+    if name != "quality":
+        raise ValueError("order must be None or 'quality'.")
+    return name
+
+
+def _nevergrad_available():
+    """Return whether the optional Nevergrad dependency can be imported."""
+    try:
+        import nevergrad  # pylint: disable=import-outside-toplevel,unused-import
+    except ImportError:
+        return False
+    return True
 
 
 def _validate_search_budget(value, name):
@@ -1113,6 +1139,10 @@ class TreeLayoutFinder:
         predicted operator-Schmidt load on tree edges. `"hybrid"` combines
         normalized path, peak-edge-load, and total-edge-load costs using
         ``hybrid_weights``.
+    order : {None, "quality"}, optional
+        Optional high-quality offline mode. `"quality"` enables bounded
+        greedy refinement and opportunistic Nevergrad refinement; omitted
+        keeps the fast deterministic candidate selection.
     hybrid_weights : mapping or sequence of three floats, optional
         Weights for the hybrid path, maximum edge load, and total edge load.
         The default is ``(1.0, 1.0, 0.25)``.
@@ -1142,7 +1172,7 @@ class TreeLayoutFinder:
                  dense_max=512, objective="path", weight_mode="count", chi=None,
                  max_operator_qubits=8, hybrid_weights=None, refine=None,
                  refine_budget=None, search=None, search_budget=128, seed=0,
-                 nevergrad_optimizer="OnePlusOne", root_qubit=None):
+                 nevergrad_optimizer="OnePlusOne", order=None, root_qubit=None):
         if (
             _looks_like_tree_tensor_network(gates)
             or _looks_like_tree_tensor_network(supports)
@@ -1224,6 +1254,7 @@ class TreeLayoutFinder:
         self.objective = _normalize_layout_objective(objective)
         self.hybrid_weights = _normalize_hybrid_weights(hybrid_weights)
         self.weight_mode = _normalize_weight_mode(weight_mode)
+        self.order = _normalize_layout_order(order)
         self.refine = _normalize_layout_refinement(refine)
         if refine_budget is not None:
             refine_budget = _validate_search_budget(refine_budget, "refine_budget")
@@ -2135,6 +2166,7 @@ class TreeLayoutFinder:
     def run(
         self,
         *,
+        order=_DEFAULT_ORDER,
         chi=_DEFAULT_CHI,
         refine=_DEFAULT_SEARCH_OPTION,
         refine_budget=_DEFAULT_SEARCH_OPTION,
@@ -2156,7 +2188,22 @@ class TreeLayoutFinder:
         overridden for this call. Pass ``progbar=True`` to display greedy and
         Nevergrad search progress. Omitted values inherit the corresponding
         finder settings, so the original zero-argument behavior is unchanged.
+
+        ``order="quality"`` is a convenience mode matching the MPS layout
+        API: it enables bounded greedy refinement and opportunistic Nevergrad
+        refinement when the optional dependency is installed. If Nevergrad is
+        unavailable, quality mode falls back to greedy refinement. Pass
+        ``search=None`` or ``refine=None`` explicitly to disable either stage.
         """
+        if order is _DEFAULT_ORDER:
+            order = self.order
+        else:
+            order = _normalize_layout_order(order)
+        if order == "quality":
+            if refine is _DEFAULT_SEARCH_OPTION:
+                refine = "greedy"
+            if search is _DEFAULT_SEARCH_OPTION:
+                search = "nevergrad" if _nevergrad_available() else None
         if chi is _DEFAULT_CHI:
             chi = self.chi
         else:

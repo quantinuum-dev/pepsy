@@ -1767,6 +1767,36 @@ def test_tree_layout_finder_plot_rubberband_is_axis_free_and_unlabeled():
     plt.close(fig)
 
 
+def test_tree_layout_quality_order_enables_bounded_refinement(monkeypatch):
+    """Tree order='quality' mirrors the MPS high-quality mode."""
+    monkeypatch.setitem(sys.modules, "nevergrad", None)
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))],
+        n=4,
+        max_arity=2,
+        order="quality",
+    )
+    captured = {}
+
+    def fake_improve(plan, *, chi, settings, progbar=False):
+        captured.update(settings)
+        return plan, {"method": "test"}
+
+    monkeypatch.setattr(finder, "_improve_plan", fake_improve)
+    plan = finder.run()
+
+    assert plan.n == 4
+    assert captured["refine"] == "greedy"
+    assert captured["search"] is None
+
+
+def test_tree_layout_order_rejects_non_quality_modes():
+    """Tree layouts expose quality mode rather than 1-D order names."""
+    finder = TreeLayoutFinder([], n=4, max_arity=2)
+    with pytest.raises(ValueError, match="order"):
+        finder.run(order="input")
+
+
 def test_tree_layout_rubberband_defaults_to_cotengra_ordered_colors():
     """Default rubberbands use distinct post-order Spectral colors."""
     matplotlib = pytest.importorskip("matplotlib")
