@@ -84,6 +84,15 @@ over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
   positive-weight passing on a closed pairwise network. Call
   `result.projectors(rank=r)` and pass the returned projectors to PNE on the
   returned gauge-transformed network.
+- Long-range PEPS observable helpers: `compute_boundary_expectation(tn, terms,
+  max_bond=chi, ...)` batches one- and two-site terms, including separated
+  support, through Quimb's boundary environment. For a connected local
+  approximation, `compute_path_cluster_expectation(tn, terms,
+  max_distance=..., gauges=su_gauges, ...)` joins a two-site support by a graph
+  path and uses simple-update bond vectors to close the cluster boundary.
+  `compute_bp_path_expectation(...)` is the safe fermionic convenience route:
+  native D2BP -> Pepsy BP-to-SU conversion -> path-cluster expectation.
+  Terms use Quimb's mapping form, e.g. `{((x0, y0), (x1, y1)): operator}`.
 - SU/simple-gauge bridge helpers: `simple_update_messages_from_gauges`,
   `d1bp_from_simple_update_gauges`, `run_d1bp_from_simple_update_gauges`,
   `simple_update_bp_residual`, `d2bp_from_simple_update_gauges`,
@@ -249,6 +258,57 @@ Loop corrections split by how much they need a **converged BP fixed point**:
 - `weight_pass` is intentionally restricted to closed pairwise networks; for a
   D2 calculation, obtain the environment on the appropriate closed
   double-layer network before supplying projectors to D2 PNE.
+
+## Long-range fermionic PEPS observables
+
+Use the native two-site Symmray operator built by `Fermion` or
+`Fermion.operator_term`; never construct separated odd operators with a plain
+Kronecker product or add a Jordan--Wigner string to the native path. Symmray
+supplies the graded signs when the complete ordered native operator is
+contracted with the native PEPS.
+
+For a finite path cluster, `gauges` must be SU/simple-update *bond vectors*.
+Do **not** pass D2BP's directed positive-semidefinite matrix messages to
+Quimb's `compute_local_expectation_cluster`. Use `compute_bp_path_expectation`
+or `simple_update_core_and_gauges_from_d2bp` to convert them first. The
+returned `core` and external gauge vectors represent the same state only after
+`core.copy().gauge_simple_insert(gauges)`; the cluster routine uses the vectors
+only to close its cut boundary.
+
+For native Symmray PEPS, path-cluster compression (`max_bond=chi`) uses Pepsy's
+graded adapter around Quimb's public compressed-contraction API. It keeps the
+observable RDM physical legs unfused, aligns zero-weight virtual charge sectors
+on a private cluster copy, and uses Symmray's fermionic `squeeze` before
+Quimb's QR/SVD steps. Thus standard Quimb/Cotengra path optimizers can be
+supplied through `optimize`. A finite cluster or finite-chi boundary discrepancy
+is an environment approximation, not by itself a fermionic-sign failure;
+enlarge the region/chi against an exact small reference.
+
+### Required sign regression
+
+Any change to native fermionic D2BP, SU gauging, BP-to-SU conversion, or
+long-range measurement must preserve these tests in
+`tests/test_bp_symmray.py`:
+
+- `test_fermionic_long_range_hopping_sign_survives_su_and_bp_gauges` prepares
+  a controlled spinless U1 2x2 Fock PEPS whose diagonal hopping correlator
+  crosses an occupied mode in row-major Jordan--Wigner order.
+- `test_spinful_long_range_hopping_sign_survives_su_and_bp_gauges` repeats the
+  parity-sensitive up-fermion correlator for spinful U1 and U1U1 PEPS.
+- `test_spinful_eta_pair_measurement_survives_su_and_bp_gauges` prepares a
+  long-range eta-pair observable with the public routed 2D gate path and
+  verifies its imaginary-time expectation for spinful U1 and U1U1 PEPS.
+
+Each has an independent dense JW oracle; the hopping cases also compare it to
+the deliberately no-string bosonic control, which has the opposite sign. The
+native exact contraction, a distinct contraction path, direct SU
+reconstruction, D2BP-to-SU reconstruction, and the public BP path helper must
+all match the JW value. The spinless regression also checks the native
+compressed path-cluster route at a sufficiently large `max_bond`. Also assert
+that native tensors/messages/vectors retain their Symmray types. This is the
+sign oracle; matching only density observables or only two native contraction
+routes is insufficient.
+
 - Native Symmray fermionic BP coverage is in `tests/test_bp_symmray.py` and
   exercises `U1`, `U1U1`, and `Z2` SU↔D2BP round trips, D2 relay/loop-series/
   PNE corrections, and closed-scalar 1-norm compatibility. Preserve the array

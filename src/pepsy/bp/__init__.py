@@ -93,6 +93,11 @@ from .relay import (
     relay_bp,
     two_norm_bp,
 )
+from .observables import (
+    compute_boundary_expectation,
+    compute_bp_path_expectation,
+    compute_path_cluster_expectation,
+)
 from .reduced_update import (
     ExactReducedUpdateProblem,
     LoopClusterReducedUpdateProblem,
@@ -183,4 +188,7 @@ __all__ = [
     "solve_reduced_als",
     "su_cluster_reduced_update_problem",
     "two_norm_bp",
+    "compute_boundary_expectation",
+    "compute_path_cluster_expectation",
+    "compute_bp_path_expectation",
 ]
