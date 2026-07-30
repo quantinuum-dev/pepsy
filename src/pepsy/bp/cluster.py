@@ -74,6 +74,13 @@ import warnings
 import autoray as ar
 import numpy as np
 
+from ._symmray import (
+    align_d2bp_messages as _align_symmray_d2bp_messages,
+    dense_bp_tn as _dense_bp_tn,
+    dense_message_tree as _dense_message_tree,
+    uses_symmray as _uses_symmray,
+)
+
 __all__ = [
     "BPCandidateScore",
     "BPCandidateSelection",
@@ -137,6 +144,14 @@ def _run_plain_bp(
 ) -> dict[str, Any]:
     """Run quimb BP and record strict rather than plateau convergence."""
     info: dict[str, Any] = {}
+    if (
+        diis is not False
+        and bp.__class__.__name__ == "D2BP"
+        and _uses_symmray(bp.tn)
+    ):
+        # Symmray messages cannot be packed by Quimb's dense DIIS
+        # vectorizer; sequential D2BP remains native and convergent.
+        diis = False
     bp.run(
         max_iterations=max_iterations,
         tol=tol,
@@ -652,51 +667,6 @@ def _expand(bp, norm, gloops, combine, optimize, strip_exponent, progbar):
     return bp.contract_gloop_expand(**kwargs)
 
 
-def _align_symmray_d2bp_messages(bp) -> None:
-    """Pad omitted Symmray charge blocks before quimb D2BP normalization.
-
-    Quimb's D2BP normalization treats the two directed messages on an
-    internal bond as dense vectors with the same shape.  Symmray instead
-    stores only non-zero charge blocks, so a rank-deficient message can have a
-    smaller shape than its partner even though both messages live on the same
-    virtual bond.  ``normalize_message_pair`` then attempts a matrix product
-    and raises a shape-mismatch error.
-
-    Reindex each message onto the native bond charge map and explicitly add
-    the missing sectors as zero blocks.  The dual flags remain those of the
-    original message, so graded contractions and fermionic phases are left to
-    Symmray.  Dense or non-Symmray messages are deliberately untouched.
-    """
-    for index, tids in bp.tn.ind_map.items():
-        if len(tids) != 2:
-            continue
-
-        messages = tuple((index, tid, bp.messages[index, tid]) for tid in tids)
-        if not all(
-            getattr(message.__class__, "__module__", "").startswith("symmray")
-            and hasattr(message, "indices")
-            and hasattr(message, "copy_with")
-            and hasattr(message, "fill_missing_blocks")
-            for _, _, message in messages
-        ):
-            continue
-
-        # The tensor leg is the authoritative charge map. The two messages
-        # may carry different subsets of these sectors after BP updates.
-        tid = next(iter(tids))
-        tensor = bp.tn.tensor_map[tid]
-        axis = tensor.inds.index(index)
-        bond_index = tensor.data.indices[axis]
-        for message_index, message_tid, message in messages:
-            target_indices = tuple(
-                bond_index.copy_with(dual=message_index.dual)
-                for message_index in message.indices
-            )
-            aligned = message.copy_with(indices=target_indices)
-            aligned.fill_missing_blocks()
-            bp.messages[index, message_tid] = aligned
-
-
 @dataclass
 class LoopClusterResult:
     """Result of a loop cluster expansion contraction.
@@ -866,6 +836,10 @@ def linked_cluster_expand(
         raise ValueError("bp_runner must be either 'plain' or 'relay'")
     if require_fixed_point is None:
         require_fixed_point = bool(run_bp)
+
+    if _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        messages = _dense_message_tree(messages)
 
     from .gauges import _validate_d1_graph
 
@@ -1216,6 +1190,10 @@ def loop_cluster_expand(
     LoopClusterResult
     """
     key, bp_cls = _cluster_bp_class(norm)
+    if key == "1norm" and _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        messages = _dense_message_tree(messages)
+        gauges = _dense_message_tree(gauges)
     contract_opts = {} if contract_opts is None else dict(contract_opts)
     if run_bp and (
         not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1

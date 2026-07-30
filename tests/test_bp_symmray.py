@@ -5,9 +5,19 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-pytest.importorskip("symmray")
+sr = pytest.importorskip("symmray")
+qtn = pytest.importorskip("quimb.tensor")
 
-from pepsy.bp import gauge_all, loop_cluster_expand, two_norm_bp  # noqa: E402
+from pepsy.bp import (  # noqa: E402
+    gauge_all,
+    loop_cluster_expand,
+    loop_series_expand,
+    one_norm_bp,
+    partitioned_expand,
+    relay_bp,
+    two_norm_bp,
+    weight_pass,
+)
 from pepsy.tensors import (  # noqa: E402
     SymPEPS,
     site_charge_alternating,
@@ -185,4 +195,128 @@ def test_fermionic_sympeps_su_d2bp_bridge_preserves_symmetry_blocks(
     reverse_reconstructed.gauge_simple_insert(reverse.gauges)
     np.testing.assert_allclose(
         reverse_reconstructed.norm(), exact_norm, rtol=1e-10
+    )
+
+
+def test_fermionic_u1_d2bp_corrections_and_relay_use_native_messages():
+    """The D2 relay, series, and PNE paths share native Symmray handling."""
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1",
+        bond_dim=2,
+        phys_dim=2,
+        fermionic=True,
+        seed=1300,
+        dtype="complex128",
+    )
+    bond = next(iter(state.tn.inner_inds()))
+
+    relay = relay_bp(
+        state.tn,
+        method="d2bp",
+        num_relays=2,
+        max_iterations=200,
+        tol=1e-10,
+    )
+    assert relay.converged
+    assert all(
+        type(message).__name__ == "U1FermionicArray"
+        for message in relay.messages.values()
+    )
+
+    series = loop_series_expand(
+        state.tn,
+        2,
+        norm="2norm",
+        max_iterations=200,
+        tol=1e-10,
+    )
+    assert series.bp_converged
+    assert np.isfinite(float(np.real(series.estimate)))
+
+    pne = partitioned_expand(
+        state.tn,
+        partition_inds=(bond,),
+        norm="2norm",
+        max_iterations=200,
+        tol=1e-10,
+    )
+    assert pne.bp_converged
+    assert np.isfinite(float(np.real(pne.estimate)))
+    assert all(
+        type(message).__name__ == "U1FermionicArray"
+        for message in pne.messages.values()
+    )
+
+
+def _closed_u1_scalar_network():
+    """Build a small native Symmray scalar network for the D1 compatibility path."""
+    maps = ({0: 0, 1: 1},) * 2
+    left = sr.U1Array.from_dense(
+        np.diag([2.0, 3.0]),
+        index_maps=maps,
+        duals=(False, True),
+        charge=0,
+    )
+    right = sr.U1Array.from_dense(
+        np.diag([5.0, 7.0]),
+        index_maps=maps,
+        duals=(True, False),
+        charge=0,
+    )
+    return qtn.TensorNetwork(
+        [
+            qtn.Tensor(left, inds=("x", "y")),
+            qtn.Tensor(right, inds=("x", "y")),
+        ]
+    )
+
+
+def test_native_symmray_closed_scalar_network_works_through_one_norm_apis():
+    """Valid closed 1-norm inputs use the dense-compatible BP shadow."""
+    tn = _closed_u1_scalar_network()
+
+    result = one_norm_bp(
+        tn,
+        method="d1bp",
+        max_iterations=100,
+        tol=1e-10,
+    )
+    assert result.converged
+    assert all(type(tensor.data).__name__ == "ndarray" for tensor in result.bp.tn)
+
+    cluster = loop_cluster_expand(
+        tn,
+        0,
+        norm="1norm",
+        max_iterations=100,
+        tol=1e-10,
+    )
+    assert cluster.bp_converged
+    assert np.isfinite(float(np.real(cluster.estimate)))
+
+    series = loop_series_expand(
+        tn,
+        0,
+        norm="1norm",
+        max_iterations=100,
+        tol=1e-10,
+    )
+    assert series.bp_converged
+    assert np.isfinite(float(np.real(series.estimate)))
+
+    pne = partitioned_expand(
+        tn,
+        partition_inds=("x",),
+        norm="1norm",
+        max_iterations=100,
+        tol=1e-10,
+    )
+    assert pne.bp_converged
+    assert np.isfinite(float(np.real(pne.estimate)))
+
+    weights = weight_pass(tn, max_iterations=2)
+    assert all(
+        type(tensor.data).__name__ == "ndarray" for tensor in weights.network
     )

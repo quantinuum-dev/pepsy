@@ -34,7 +34,9 @@ over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
 - `two_norm_bp(tn, *, max_iterations, tol, damping, update, diis,
   init_messages, ...) -> RelayBPResult` — native D2BP for wavefunction and
   norm contractions. Symmray-backed fermionic PEPS retain their native charge
-  blocks throughout message updates and distance evaluation.
+  blocks throughout message updates and distance evaluation; DIIS
+  automatically falls back to native sequential updates because Symmray does
+  not expose Quimb's dense vectorizer concatenation.
 - `relay_bp(tn, *, method, num_relays, max_iterations, gamma_range, tol, damping,
   update, memory_first_leg, init_messages, seed, ...) -> RelayBPResult` —
   disordered-memory / relay-BP: per-node random memory (incl. negative) applied
@@ -92,12 +94,20 @@ PNE terms are not loop-cluster regions. A PNE residue is the all-`Q` network;
 retaining it gives the exact projector identity, while dropping it is the
 approximation whose error should be monitored.
 
-For native Symmray D2BP, directed messages can temporarily omit charge
+For native Symmray D2BP, relay, loop-series, and PNE paths, directed messages
+can temporarily omit charge
 sectors after an update. Pepsy aligns message charge maps before distance
-checks, D2BP normalization, and loop-cluster expansion, while keeping the
-messages and tensor data block-sparse. Do not replace this path with a dense
-copy: dense eigendecomposition can reorder eigenvectors across charge sectors
-and produce invalid Symmray gates.
+checks, D2BP normalization, loop-cluster/series expansion, and PNE projector
+construction, while keeping the messages and tensor data block-sparse. Do not
+replace this D2 path with a dense copy: dense eigendecomposition can reorder
+eigenvectors across charge sectors and produce invalid Symmray gates.
+
+For valid closed scalar Symmray networks, the 1-norm APIs (`L1BP`, `HV1BP`,
+and `D1BP`), their loop/series/PNE corrections, D1 SU bridge, and
+`weight_pass` use a topology-identical dense BP shadow because Quimb's D1
+initializers and weight SVDs require dense scalar operations. A raw fermionic
+PEPS with dangling physical legs is not a direct 1-norm input: use D2BP for
+its wavefunction norm (or explicitly construct a valid closed scalar network).
 
 ## quimb substrate (do not reimplement)
 `quimb.tensor.belief_propagation`:
@@ -181,9 +191,10 @@ Loop corrections split by how much they need a **converged BP fixed point**:
   D2 calculation, obtain the environment on the appropriate closed
   double-layer network before supplying projectors to D2 PNE.
 - Native Symmray fermionic BP coverage is in `tests/test_bp_symmray.py` and
-  currently exercises `U1`, `U1U1`, and `Z2` SU↔D2BP round trips plus loop
-  cluster expansion. Preserve the array class and charge blocks when adding
-  new BP or gauge paths.
+  exercises `U1`, `U1U1`, and `Z2` SU↔D2BP round trips, D2 relay/loop-series/
+  PNE corrections, and closed-scalar 1-norm compatibility. Preserve the array
+  class and charge blocks when adding new D2 BP or gauge paths; route valid
+  scalar D1 paths through the documented dense shadow.
 - Keep `pepsy.bp` out of the lazy top-level namespace (import `pepsy.bp`); do
   **not** edit `src/pepsy/__init__.py` for it.
 - Tests: `tests/test_bp_relay.py` and `tests/test_simple_update_gen.py`. Env: py312

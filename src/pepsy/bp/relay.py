@@ -38,6 +38,15 @@ from typing import Any
 import autoray as ar
 import numpy as np
 
+from ._symmray import (
+    align_message_pair as _align_symmray_message_pair,
+    dense_bp_tn as _dense_bp_tn,
+    dense_message_tree as _dense_message_tree,
+    is_symmray_array as _is_symmray_array,
+    message_distance as _symmray_message_distance,
+    uses_symmray as _uses_symmray,
+)
+
 __all__ = [
     "BPState",
     "BPUpdateResult",
@@ -50,56 +59,6 @@ __all__ = [
 _ONE_NORM_CLASSES = {"l1bp": "L1BP", "hv1bp": "HV1BP", "d1bp": "D1BP"}
 _RELAY_CLASSES = {**_ONE_NORM_CLASSES, "d2bp": "D2BP"}
 _RELAY_METHODS = {"l1bp", "d1bp", "d2bp"}
-
-
-def _is_symmray_array(value) -> bool:
-    return getattr(value.__class__, "__module__", "").startswith("symmray")
-
-
-def _align_symmray_message_pair(left, right):
-    """Return charge-support-aligned copies of two Symmray messages."""
-    if not (
-        _is_symmray_array(left)
-        and _is_symmray_array(right)
-        and hasattr(left, "indices")
-        and hasattr(right, "indices")
-    ):
-        return left, right
-
-    left_indices = []
-    right_indices = []
-    for left_index, right_index in zip(left.indices, right.indices):
-        left_map = dict(left_index.chargemap)
-        right_map = dict(right_index.chargemap)
-        for charge in set(left_map) & set(right_map):
-            if left_map[charge] != right_map[charge]:
-                raise ValueError("incompatible Symmray message charge dimensions")
-        charge_map = {**left_map, **right_map}
-        left_indices.append(
-            left_index.copy_with(chargemap=charge_map, dual=left_index.dual)
-        )
-        right_indices.append(
-            right_index.copy_with(chargemap=charge_map, dual=right_index.dual)
-        )
-
-    left = left.copy_with(indices=tuple(left_indices))
-    right = right.copy_with(indices=tuple(right_indices))
-    left.fill_missing_blocks()
-    right.fill_missing_blocks()
-    return left, right
-
-
-def _symmray_message_distance(left, right) -> float:
-    """L2 distance after aligning omitted sparse charge blocks."""
-    left, right = _align_symmray_message_pair(left, right)
-    if hasattr(left, "to_dense") and hasattr(right, "to_dense"):
-        left = left.to_dense()
-        right = right.to_dense()
-    return float(np.linalg.norm(np.asarray(left) - np.asarray(right)))
-
-
-def _uses_symmray(tn) -> bool:
-    return any(_is_symmray_array(tensor.data) for tensor in tn.tensors)
 
 
 def _method_key(method: str, classes: Mapping[str, str]) -> str:
@@ -609,6 +568,9 @@ def one_norm_bp(
     method_key = _method_key(method, _ONE_NORM_CLASSES)
     if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
+    if _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        init_messages = _dense_message_tree(init_messages)
     if method_key == "d1bp":
         from .gauges import _validate_d1_graph
 
@@ -666,6 +628,11 @@ def two_norm_bp(
     bp_opts = dict(bp_opts)
     if _uses_symmray(tn):
         bp_opts.setdefault("distance", _symmray_message_distance)
+        # Quimb's DIIS vectorizer asks Autoray for ``symmray.concatenate``.
+        # Symmray intentionally has no such dense tree-vector operation; the
+        # native sequential D2BP iteration remains fully backend aware.
+        if diis is not False:
+            diis = False
     bp = _bp_class("d2bp")(
         tn,
         **_bp_constructor_kwargs("d2bp", damping, update, bp_opts),
@@ -784,9 +751,15 @@ def relay_bp(
 
         _validate_d1_graph(tn)
 
+    if method_key in _ONE_NORM_CLASSES and _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        init_messages = _dense_message_tree(init_messages)
+
     bp_opts = dict(bp_opts)
     if method_key == "d2bp" and _uses_symmray(tn):
         bp_opts.setdefault("distance", _symmray_message_distance)
+        if diis is not False:
+            diis = False
     bp_class = _bp_class(method_key)
     rng = np.random.default_rng(seed)
     bp = bp_class(
@@ -841,7 +814,12 @@ def relay_bp(
                     g = gamma[sources[key]]
                     data = _message_data(message)
                     if g != 0.0:
-                        data = g * prev[key] + (1.0 - g) * data
+                        old_data, new_data = prev[key], data
+                        if method_key == "d2bp" and _uses_symmray(tn):
+                            old_data, new_data = _align_symmray_message_pair(
+                                old_data, new_data
+                            )
+                        data = g * old_data + (1.0 - g) * new_data
                         _set_message(bp, key, message, data)
                     # Use the BP's selected distance metric on the post-memory
                     # messages, rather than silently switching to an L-infinity

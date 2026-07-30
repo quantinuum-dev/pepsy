@@ -10,6 +10,12 @@ from typing import Any
 import autoray as ar
 import numpy as np
 
+from ._symmray import (
+    dense_bp_tn as _dense_bp_tn,
+    dense_message_tree as _dense_message_tree,
+    uses_symmray as _uses_symmray,
+)
+
 __all__ = [
     "GaugeResult",
     "RelayGaugeOptions",
@@ -319,6 +325,9 @@ def simple_update_messages_from_gauges(
     ``sqrt(lambda)``.  For a raw, non-gauge-inserted TN use
     ``message_power=1.0``.
     """
+    if _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        gauges = _dense_message_tree(gauges)
     _validate_d1_graph(tn)
     gauges = {} if gauges is None else gauges
 
@@ -366,6 +375,9 @@ def d1bp_from_simple_update_gauges(
     """
     from quimb.tensor.belief_propagation import D1BP
 
+    if _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        gauges = _dense_message_tree(gauges)
     _validate_d1_graph(tn)
     work = tn.copy()
     gauges_copy = copy_gauges(gauges)
@@ -1319,6 +1331,15 @@ def gauge_all(
     norm_key = str(norm).lower()
     if norm_key not in {"1norm", "2norm"}:
         raise ValueError("norm must be either '1norm' or '2norm'")
+
+    if norm_key == "1norm" and _uses_symmray(tn):
+        # D1BP and the scalar SU bridge require dense scalar-network
+        # contractions. Keep the topology and values, but avoid asking the
+        # native Symmray fermionic contraction path to implement D1's
+        # one-index einsum initialization.
+        tn = _dense_bp_tn(tn)
+        su_gauges = _dense_message_tree(su_gauges)
+        bp_messages = _dense_message_tree(bp_messages)
 
     su_options = {} if su_options is None else dict(su_options)
     bp_options = {} if bp_options is None else dict(bp_options)

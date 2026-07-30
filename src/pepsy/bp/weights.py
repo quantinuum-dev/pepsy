@@ -19,6 +19,10 @@ from typing import Any
 
 import numpy as np
 
+from ._symmray import dense_bp_tn as _dense_bp_tn
+from ._symmray import to_dense as _symmray_to_dense
+from ._symmray import uses_symmray as _uses_symmray
+
 __all__ = ["WeightPassingResult", "weight_pass"]
 
 
@@ -242,6 +246,30 @@ def weight_pass(
         raise ValueError("max_iterations must be a positive integer")
     if tol < 0 or eps <= 0:
         raise ValueError("tol must be non-negative and eps must be positive")
+
+    if _uses_symmray(tn):
+        # Weight passing is an SVD-based scalar-network utility. Quimb's
+        # implementation uses dense reshapes and cannot perform those local
+        # factorizations on native Symmray blocks. Keep the public API
+        # compatible by using a topology-identical dense shadow; D2BP itself
+        # remains native and should be preferred for physical Symmray norms.
+        dense_weights = (
+            None
+            if weights is None
+            else {
+                index: _symmray_to_dense(value)
+                for index, value in weights.items()
+            }
+        )
+        return weight_pass(
+            _dense_bp_tn(tn),
+            alpha=alpha,
+            max_iterations=max_iterations,
+            tol=tol,
+            weights=dense_weights,
+            index_order=index_order,
+            eps=eps,
+        )
 
     _validate_network(tn)
     network = tn.copy()

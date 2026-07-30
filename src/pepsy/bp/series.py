@@ -34,6 +34,14 @@ from .cluster import (
     _filter_gauge_init_only_bp_opts,
     _run_plain_bp,
 )
+from ._symmray import (
+    align_d2bp_messages as _align_symmray_d2bp_messages,
+    dense_bp_tn as _dense_bp_tn,
+    dense_message_tree as _dense_message_tree,
+    d2_operator as _symmray_d2_operator,
+    rank_one_d2_projector as _symmray_rank_one_d2_projector,
+    uses_symmray as _uses_symmray,
+)
 
 __all__ = [
     "LoopSeriesCache",
@@ -471,16 +479,36 @@ def _get_d2_edge_excited(bp, term: LoopSeriesTerm):
         right = tids[tid_right]
         ml = bp.messages[index, tid_left]
         mr = bp.messages[index, tid_right]
-        p0 = ar.do("einsum", "i,j->ij", ml.reshape(-1), mr.reshape(-1))
+        if _uses_symmray(bp.tn):
+            p0 = _symmray_rank_one_d2_projector(
+                bp.tn, index, ml, mr, layout="series"
+            )
+        else:
+            p0 = ar.do(
+                "einsum",
+                "i,j->ij",
+                ml.reshape(-1),
+                mr.reshape(-1),
+            )
         if index in excited_edges:
-            projector = ar.do("eye", ar.do("shape", p0)[0]) - p0
+            if _uses_symmray(bp.tn):
+                projector = _symmray_d2_operator(
+                    bp.tn,
+                    index,
+                    p0,
+                    complement=True,
+                    layout="series",
+                )
+            else:
+                projector = ar.do("eye", ar.do("shape", p0)[0]) - p0
         else:
             projector = p0
-        projector = ar.do(
-            "reshape",
-            projector,
-            ar.do("shape", ml) + ar.do("shape", mr),
-        )
+        if not _uses_symmray(bp.tn):
+            projector = ar.do(
+                "reshape",
+                projector,
+                ar.do("shape", ml) + ar.do("shape", mr),
+            )
         inds = (*left, *right)
         local |= qtn.Tensor(projector, inds)
 
@@ -543,6 +571,8 @@ def _contract_loop_series(
     normalize,
 ):
     if normalize:
+        if bp.__class__.__name__ == "D2BP":
+            _align_symmray_d2bp_messages(bp)
         bp.normalize_message_pairs()
         bp.normalize_tensors()
 
@@ -585,6 +615,10 @@ def _build_bp(
     validate_graph=True,
 ):
     key, bp_cls = _cluster_bp_class(norm)
+    if key == "1norm" and _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        messages = _dense_message_tree(messages)
+        gauges = _dense_message_tree(gauges)
     if bp_runner not in {"plain", "relay"}:
         raise ValueError("bp_runner must be either 'plain' or 'relay'")
     if gauges is not None and messages is not None:
