@@ -281,6 +281,138 @@ def _operator_schmidt_weight(payload, support, *, schmidt_max_dim=4):
     return float(powers[1:].sum() / total)
 
 
+def _operator_schmidt_rank_bound(support, left_support, local_dims=None):
+    """Return the maximum operator-Schmidt rank for a support cut.
+
+    For a product of local operator spaces the rank is bounded by the smaller
+    operator-space dimension on either side.  The default qubit dimensions
+    keep this useful even when a payload is opaque, too wide to inspect, or a
+    native symmetric array cannot be lowered to dense NumPy data.
+    """
+    support = tuple(support)
+    left = set(left_support)
+    if not left or left == set(support):
+        return 1
+    if local_dims is None:
+        local_dims = (2,) * len(support)
+    local_dims = tuple(int(dim) for dim in local_dims)
+    if len(local_dims) != len(support) or any(dim < 1 for dim in local_dims):
+        local_dims = (2,) * len(support)
+    left_dim = 1
+    right_dim = 1
+    for i, site in enumerate(support):
+        if site in left:
+            left_dim *= local_dims[i] ** 2
+        else:
+            right_dim *= local_dims[i] ** 2
+    return max(1, min(left_dim, right_dim))
+
+
+def _operator_schmidt_rank_info(
+    payload,
+    support,
+    left_support,
+    *,
+    max_operator_qubits=None,
+):
+    """Return an exact rank or an honest conservative rank bound.
+
+    The layout finder must remain usable with native/symmetric payloads, but
+    silently treating an unknown operator as rank two is unsafe: a wide
+    operator can have a much larger operator-Schmidt rank.  This helper keeps
+    the numeric ``rank`` field for scoring and records whether it was exact.
+    """
+    support = tuple(support)
+    left_support = tuple(left_support)
+    default_bound = _operator_schmidt_rank_bound(support, left_support)
+    if not left_support or set(left_support) == set(support):
+        return {"rank": 1, "exact": True, "reason": "trivial_cut"}
+    if (
+        max_operator_qubits is not None
+        and len(support) > int(max_operator_qubits)
+    ):
+        return {
+            "rank": default_bound,
+            "exact": False,
+            "reason": "max_operator_qubits",
+        }
+
+    raw = getattr(payload, "data", payload)
+    try:
+        array = np.asarray(raw)
+    except Exception:
+        return {"rank": default_bound, "exact": False, "reason": "opaque"}
+    if array.size == 0 or not np.issubdtype(array.dtype, np.number):
+        return {"rank": default_bound, "exact": False, "reason": "opaque"}
+
+    local_dims = None
+    if array.ndim == 2 and array.shape[0] == array.shape[1]:
+        dimension = int(array.shape[0])
+        local_dim = int(round(dimension ** (1.0 / len(support))))
+        if local_dim ** len(support) == dimension:
+            local_dims = (local_dim,) * len(support)
+    elif array.ndim == 2 * len(support):
+        output_dims = tuple(int(dim) for dim in array.shape[:len(support)])
+        input_dims = tuple(int(dim) for dim in array.shape[len(support):])
+        if output_dims == input_dims:
+            local_dims = output_dims
+
+    if local_dims is None:
+        return {"rank": default_bound, "exact": False, "reason": "shape"}
+
+    positions = {site: pos for pos, site in enumerate(support)}
+    try:
+        if array.ndim == 2:
+            array = array.reshape(local_dims + local_dims)
+        left_positions = [positions[site] for site in left_support]
+        right_positions = [
+            positions[site] for site in support if site not in set(left_support)
+        ]
+        axes = (
+            left_positions
+            + [len(support) + pos for pos in left_positions]
+            + right_positions
+            + [len(support) + pos for pos in right_positions]
+        )
+        left_dim = 1
+        right_dim = 1
+        for pos in left_positions:
+            left_dim *= local_dims[pos] ** 2
+        for pos in right_positions:
+            right_dim *= local_dims[pos] ** 2
+        matrix = array.transpose(axes).reshape(left_dim, right_dim)
+        rank = max(1, int(np.linalg.matrix_rank(matrix)))
+    except (IndexError, TypeError, ValueError, np.linalg.LinAlgError):
+        return {
+            "rank": _operator_schmidt_rank_bound(
+                support, left_support, local_dims
+            ),
+            "exact": False,
+            "reason": "decomposition",
+        }
+    return {"rank": rank, "exact": True, "reason": "dense_svd"}
+
+
+def _gate_stream_layout_objective(objective):
+    """Normalize MPS layout objective names."""
+    name = str(objective).replace("-", "_").strip().lower()
+    aliases = {
+        "path": "locality",
+        "span": "locality",
+        "routing": "locality",
+        "compress": "compression",
+        "bond": "compression",
+        "bond_load": "compression",
+    }
+    name = aliases.get(name, name)
+    if name not in {"locality", "compression"}:
+        raise ValueError(
+            f"Unknown MPS layout objective {objective!r}. Expected "
+            "'locality' or 'compression'."
+        )
+    return name
+
+
 def _normalize_weight_mode(weight_mode):
     """Normalize user-facing gate-stream weight mode names."""
     name = str(weight_mode).replace("-", "_").strip().lower()
@@ -368,6 +500,48 @@ def _gate_stream_event_weights(
             raise ValueError("gate-stream layout event weights must be finite.")
         weights.append(max(0.0, weight))
     return tuple(weights)
+
+
+def _gate_stream_event_rank_weights(
+    payloads,
+    supports,
+    event_types,
+    *,
+    max_operator_qubits=8,
+):
+    """Return log-rank weights for compression-oriented layout search."""
+    weights = []
+    exact = []
+    reasons = []
+    for payload, support, event_type in zip(payloads, supports, event_types):
+        normalized_type = str(event_type).lower()
+        support = _unique_ordered(support)
+        if len(support) < 2 or normalized_type in {
+            "measure", "reset", "measure_reset", "cap"
+        }:
+            weights.append(0.0)
+            exact.append(True)
+            reasons.append("non_entangling_event")
+            continue
+        if payload is None:
+            info = {
+                "rank": _operator_schmidt_rank_bound(
+                    support, support[:1]
+                ),
+                "exact": False,
+                "reason": "missing_payload",
+            }
+        else:
+            info = _operator_schmidt_rank_info(
+                payload,
+                support,
+                support[:1],
+                max_operator_qubits=max_operator_qubits,
+            )
+        weights.append(float(np.log2(max(1, info["rank"]))))
+        exact.append(bool(info["exact"]))
+        reasons.append(info["reason"])
+    return tuple(weights), tuple(exact), tuple(reasons)
 
 
 def _gate_stream_pair_weights(supports, sites, event_weights=None):
@@ -522,6 +696,105 @@ def _gate_stream_layout_stats(
             "mean_tail_span_hinge_l2": 2.5e-4,
         },
         **support_stats,
+    }
+
+
+def _gate_stream_compression_stats(
+    order,
+    payloads,
+    supports,
+    event_types,
+    *,
+    event_weights=None,
+    max_operator_qubits=8,
+):
+    """Estimate MPS cut load from operator-Schmidt ranks over chain cuts.
+
+    This is a static operator-growth bound, not a state-dependent truncation
+    prediction.  It is nevertheless closer to compression pressure than a
+    pairwise span score because a gate contributes to every chain cut that
+    separates its support.
+    """
+    order = list(order)
+    position = {site: pos for pos, site in enumerate(order)}
+    cut_loads = np.zeros(max(0, len(order) - 1), dtype=float)
+    total_load = 0.0
+    weighted_span = 0.0
+    max_span = 0
+    exact_events = 0
+    bounded_events = 0
+    rank_reasons = {}
+    if event_weights is None:
+        event_weights = (1.0,) * len(supports)
+
+    for payload, support, _event_type, event_weight in zip(
+        payloads, supports, event_types, event_weights
+    ):
+        support = _unique_ordered(support)
+        points = [position[site] for site in support if site in position]
+        if len(points) < 2:
+            continue
+        lo, hi = min(points), max(points)
+        span = hi - lo
+        max_span = max(max_span, span)
+        event_weight = max(0.0, float(event_weight))
+        weighted_span += event_weight * span
+        for cut in range(lo, hi):
+            left = tuple(site for site in support if position[site] <= cut)
+            right = tuple(site for site in support if position[site] > cut)
+            if not left or not right:
+                continue
+            if payload is None:
+                info = {
+                    "rank": _operator_schmidt_rank_bound(support, left),
+                    "exact": False,
+                    "reason": "missing_payload",
+                }
+            else:
+                info = _operator_schmidt_rank_info(
+                    payload,
+                    support,
+                    left,
+                    max_operator_qubits=max_operator_qubits,
+                )
+            rank_load = float(np.log2(max(1, info["rank"])))
+            rank_load *= event_weight
+            cut_loads[cut] += rank_load
+            total_load += rank_load
+            if info["exact"]:
+                exact_events += 1
+            else:
+                bounded_events += 1
+                rank_reasons[info["reason"]] = (
+                    rank_reasons.get(info["reason"], 0) + 1
+                )
+
+    max_cut = float(cut_loads.max()) if cut_loads.size else 0.0
+    cut_load_l2 = float(np.dot(cut_loads, cut_loads)) if cut_loads.size else 0.0
+    mean_cut = float(cut_loads.mean()) if cut_loads.size else 0.0
+    # Keep a small span term so two equally loaded layouts still prefer the
+    # cheaper replay geometry.
+    loss = float(total_load + cut_load_l2 + 0.05 * weighted_span)
+    return {
+        "compression_loss": loss,
+        "compression_score": loss,
+        "operator_cut_load": cut_loads,
+        "max_operator_cut_load": max_cut,
+        "total_operator_cut_load": float(total_load),
+        "mean_operator_cut_load": mean_cut,
+        "operator_cut_load_l2": cut_load_l2,
+        "weighted_total_span": float(weighted_span),
+        "max_span": int(max_span),
+        "rank_exact_events": int(exact_events),
+        "rank_bounded_events": int(bounded_events),
+        "rank_exact_cuts": int(exact_events),
+        "rank_bounded_cuts": int(bounded_events),
+        "rank_bound_reasons": rank_reasons,
+        "objective": {
+            "total_operator_cut_load": 1.0,
+            "operator_cut_load_l2": 1.0,
+            "weighted_total_span": 0.05,
+        },
     }
 
 
@@ -1292,6 +1565,7 @@ class MpsGateStreamLayoutFinder:
         self,
         order="quality",
         *,
+        objective="locality",
         refine_passes=8,
         refine_numba=True,
         spectral_dense_max=512,
@@ -1304,9 +1578,22 @@ class MpsGateStreamLayoutFinder:
         weight_fn=None,
         weight_mode="auto",
         schmidt_max_dim=4,
+        max_operator_qubits=8,
     ):
         """Return a layout plan for the stored gate stream."""
         order_name = _normalize_gate_stream_layout_order(order)
+        objective = _gate_stream_layout_objective(objective)
+        if max_operator_qubits is not None:
+            try:
+                max_operator_qubits = int(max_operator_qubits)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "max_operator_qubits must be a positive integer or None."
+                ) from exc
+            if max_operator_qubits < 1:
+                raise ValueError(
+                    "max_operator_qubits must be a positive integer or None."
+                )
         event_weights = _gate_stream_event_weights(
             self.payloads,
             self.supports,
@@ -1315,11 +1602,26 @@ class MpsGateStreamLayoutFinder:
             weight_mode=weight_mode,
             schmidt_max_dim=schmidt_max_dim,
         )
-        pair_weights = _gate_stream_pair_weights(
+        rank_weights, rank_exact, rank_reasons = _gate_stream_event_rank_weights(
+            self.payloads,
             self.supports,
-            self.sites,
-            event_weights,
+            self.event_types,
+            max_operator_qubits=max_operator_qubits,
         )
+        if objective == "compression":
+            pair_weights = _gate_stream_pair_weights(
+                self.supports,
+                self.sites,
+                rank_weights,
+            )
+            score_event_weights = rank_weights
+        else:
+            pair_weights = _gate_stream_pair_weights(
+                self.supports,
+                self.sites,
+                event_weights,
+            )
+            score_event_weights = event_weights
         include_nevergrad = (
             order_name == "auto" or order_name.startswith("nevergrad")
         )
@@ -1342,16 +1644,30 @@ class MpsGateStreamLayoutFinder:
             kahypar_seed=kahypar_seed,
         )
 
-        candidate_stats = {
-            name: _gate_stream_layout_stats(
+        candidate_stats = {}
+        for name, candidate in candidates.items():
+            locality_stats = _gate_stream_layout_stats(
                 candidate,
                 pair_weights,
                 num_events=len(self.supports),
                 supports=self.supports,
-                event_weights=event_weights,
+                event_weights=score_event_weights,
             )
-            for name, candidate in candidates.items()
-        }
+            stats = dict(locality_stats)
+            stats["path_loss"] = locality_stats["loss"]
+            stats["path_score"] = locality_stats["score"]
+            if objective == "compression":
+                stats.update(_gate_stream_compression_stats(
+                    candidate,
+                    self.payloads,
+                    self.supports,
+                    self.event_types,
+                    event_weights=score_event_weights,
+                    max_operator_qubits=max_operator_qubits,
+                ))
+                stats["loss"] = stats["compression_loss"]
+                stats["score"] = stats["compression_score"]
+            candidate_stats[name] = stats
 
         if order_name == "auto":
             selected_order = min(
@@ -1383,41 +1699,63 @@ class MpsGateStreamLayoutFinder:
                         f"{hint}"
                     )
 
-        site_order = tuple(candidates[selected_order])
-        site_map = {site: pos for pos, site in enumerate(site_order)}
-        mapped_where = tuple(
-            tuple(site_map[site] for site in support)
-            for support in self.supports
-        )
-        stats = candidate_stats[selected_order]
-        return {
-            "kind": "mps_gate_stream_layout",
-            "selected_order": selected_order,
-            "qubit_inds": site_order,
-            "site_order": site_order,
-            "order": site_order,
-            "original_sites": self.sites,
-            "layout": site_map,
-            "site_map": site_map,
-            "inverse_site_map": {pos: site for site, pos in site_map.items()},
-            "where": self.where,
-            "mapped_where": mapped_where,
-            "event_types": self.event_types,
-            "event_weights": event_weights,
-            "weight_mode": _normalize_weight_mode(weight_mode),
-            "stats": stats,
-            "input_stats": candidate_stats["input"],
-            "score": stats["score"],
+        def make_plan(name):
+            site_order = tuple(candidates[name])
+            site_map = {site: pos for pos, site in enumerate(site_order)}
+            mapped_where = tuple(
+                tuple(site_map[site] for site in support)
+                for support in self.supports
+            )
+            stats = candidate_stats[name]
+            return {
+                "kind": "mps_gate_stream_layout",
+                "selected_order": name,
+                "qubit_inds": site_order,
+                "site_order": site_order,
+                "order": site_order,
+                "original_sites": self.sites,
+                "layout": site_map,
+                "site_map": site_map,
+                "inverse_site_map": {pos: site for site, pos in site_map.items()},
+                "where": self.where,
+                "mapped_where": mapped_where,
+                "event_types": self.event_types,
+                "event_weights": event_weights,
+                "compression_event_weights": rank_weights,
+                "rank_exact_events": sum(rank_exact),
+                "rank_bounded_events": len(rank_exact) - sum(rank_exact),
+                "rank_bound_reasons": {
+                    reason: rank_reasons.count(reason)
+                    for reason in set(rank_reasons)
+                },
+                "weight_mode": _normalize_weight_mode(weight_mode),
+                "objective": objective,
+                "max_operator_qubits": max_operator_qubits,
+                "stats": stats,
+                "input_stats": candidate_stats["input"],
+                "score": stats["score"],
+            }
+
+        candidate_plans = {
+            name: make_plan(name) for name in candidates
+        }
+        selected_plan = dict(candidate_plans[selected_order])
+        selected_plan.update({
+            "candidate_plans": candidate_plans,
             "candidate_scores": {
                 name: info["score"] for name, info in candidate_stats.items()
             },
             "candidate_losses": {
                 name: info["loss"] for name, info in candidate_stats.items()
             },
+            "candidate_path_scores": {
+                name: info["path_score"] for name, info in candidate_stats.items()
+            },
             "candidate_score_tuples": {
                 name: info["score_tuple"] for name, info in candidate_stats.items()
             },
-        }
+        })
+        return selected_plan
 
     def map_where(self, where, plan):
         """Map one original ``where`` through ``plan``."""

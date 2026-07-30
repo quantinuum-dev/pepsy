@@ -41,6 +41,7 @@ import contextlib
 from copy import deepcopy
 import heapq
 from numbers import Integral
+import time
 import warnings
 
 import autoray as ar
@@ -323,10 +324,12 @@ class TreeOptimizer:
         optimizer's ``chi`` (structures that stay exact at ``chi`` are
         preferred).  Pass ``max_arity=2`` to force a fixed binary tree.  Ignored
         when an explicit ``tree`` is supplied.
-    layout_objective : {"path", "congestion", "hybrid"}
+    layout_objective : {"path", "congestion", "compression", "hybrid"}
         Objective used when building an automatic tree.  ``"path"`` is the
         backward-compatible interaction-path heuristic; ``"congestion"``
         selects a candidate using predicted operator-Schmidt edge load;
+        ``"compression"`` additionally penalizes peak/total load and the
+        estimated local tensor cost at ``chi``;
         ``"hybrid"`` combines normalized path, peak-load, and total-load
         costs. Pass a configured :class:`TreeLayoutFinder` through ``layout=``
         to customize its hybrid weights or enable pre-simulation refinement.
@@ -1422,6 +1425,149 @@ class TreeOptimizer:
                 "max_arity": self.plan.max_arity(),
             }
         return self.layout_finder.report(self.plan)
+
+    def select_layout_for_compression(
+        self,
+        *,
+        pilot_candidates=4,
+        pilot_steps=None,
+        install=False,
+        progbar=False,
+    ):
+        """Select a tree layout using state-aware pilot replay.
+
+        Static compression candidates are generated with
+        ``objective="compression"`` and then replayed on independent copies
+        of the current state. The pilot uses the real tree update kernels,
+        ``chi``, cutoff, backend, and queued gate stream. The original state
+        is unchanged. By default the selected plan is returned for explicit
+        hand-off; ``install=True`` is allowed only for a product state and
+        remounts that state exactly on the selected geometry.
+        """
+        try:
+            pilot_candidates = int(pilot_candidates)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pilot_candidates must be a positive integer.") from exc
+        if pilot_candidates < 1:
+            raise ValueError("pilot_candidates must be a positive integer.")
+        if pilot_steps is not None:
+            try:
+                pilot_steps = int(pilot_steps)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("pilot_steps must be a positive integer or None.") from exc
+            if pilot_steps < 1:
+                raise ValueError("pilot_steps must be a positive integer or None.")
+
+        finder = TreeLayoutFinder(
+            gates=self._layout_gate_stream(),
+            n=self.n,
+            structure=self.structure,
+            max_arity=self.max_arity,
+            community_frac=self.community_frac,
+            star_frac=self.star_frac,
+            objective="compression",
+            weight_mode=self.layout_weight_mode,
+            chi=self.chi,
+            max_operator_qubits=self.max_operator_qubits,
+            root_qubit=self.plan.root_qubit,
+        )
+        candidates = finder.candidate_plans(chi=self.chi)
+        ranked = sorted(
+            candidates,
+            key=lambda name: candidates[name]["objective_key"],
+        )[:pilot_candidates]
+        reports = {}
+        successful = []
+        for name in ranked:
+            plan = candidates[name]["plan"]
+            if not _is_product_tensor_network(self.tn):
+                raise ValueError(
+                    "Tree compression pilots require a product initial state "
+                    "when comparing different tree geometries. Convert the "
+                    "entangled state explicitly onto each candidate plan first."
+                )
+            started = time.perf_counter()
+            trial = type(self)(
+                None,
+                n=self.n,
+                chi=self.chi,
+                cutoff=self.cutoff,
+                cutoff_mode=self.cutoff_mode,
+                mode=self.mode,
+                structure=self.structure,
+                max_arity=self.max_arity,
+                community_frac=self.community_frac,
+                star_frac=self.star_frac,
+                tree=plan,
+                dtype=self.dtype,
+                threads=self.threads,
+                track_truncation=True,
+                track_infidelity=True,
+                max_intermediate_bond=self.max_intermediate_bond,
+                max_operator_qubits=self.max_operator_qubits,
+                max_subtree_nodes=self.max_subtree_nodes,
+                record_history=self.record_history,
+                run=False,
+                tn=self.tn,
+            )
+            trial.G = list(self.G)
+            trial.where = list(self.where)
+            trial.event_types = list(self.event_types)
+            if pilot_steps is not None:
+                trial.G = trial.G[:pilot_steps]
+                trial.where = trial.where[:pilot_steps]
+                trial.event_types = trial.event_types[:pilot_steps]
+            try:
+                trial.run(progbar=progbar)
+                elapsed = time.perf_counter() - started
+                infidelity = float(trial.infidelities[-1])
+                final_bond = int(trial.max_bond())
+                truncated_edges = int(sum(
+                    event.get("truncated", False)
+                    for event in trial.truncation_history
+                ))
+                reports[name] = {
+                    "status": "ok",
+                    "elapsed_seconds": float(elapsed),
+                    "infidelity": infidelity,
+                    "final_bond": final_bond,
+                    "truncated_edges": truncated_edges,
+                    "pilot_steps": len(trial.G),
+                }
+                successful.append((infidelity, truncated_edges, final_bond, elapsed, name))
+            except Exception as exc:  # pragma: no cover - backend-specific
+                reports[name] = {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                    "pilot_steps": len(trial.G),
+                }
+
+        if not successful:
+            raise RuntimeError(
+                "All Tree compression layout pilot candidates failed. "
+                f"Diagnostics: {reports!r}"
+            )
+        selected_name = min(successful)[-1]
+        selected_plan = candidates[selected_name]["plan"]
+        if install:
+            self.plan = selected_plan
+            self.tn = self._remount_product_state(self.tn)
+            self.center = self.plan.root
+            self.layout_finder = finder
+            self.layout_objective = "compression"
+        return {
+            "plan": selected_plan,
+            "selected_candidate": selected_name,
+            "candidates": candidates,
+            "pilot": {
+                "objective": "compression",
+                "pilot_candidates": tuple(ranked),
+                "selected_candidate": selected_name,
+                "reports": reports,
+                "installed": bool(install),
+            },
+        }
 
     def plot_layout(self, plan=None, *, layout_kwargs=None, **plot_kwargs):
         """Plot the tree layout as a Cotengra-style tent.

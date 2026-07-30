@@ -152,6 +152,14 @@ default to `weight_mode="auto"`: angle metadata when present, otherwise a cheap
 operator-Schmidt proxy for small dense two-site gates, falling back to count
 weights. Pass `weight_fn(payload, support, event_type)` for explicit weights.
 
+For compression-oriented selection, pass `objective="compression"`. This
+uses operator-Schmidt load over every MPS cut crossed by each support, with
+support span retained as a replay-cost tie-breaker. Exact small dense ranks
+are used when available; opaque, native, and wide operators use a conservative
+operator-space rank bound and are marked in `rank_bound_reasons` rather than
+silently being treated as rank two. The default `objective="locality"` keeps
+the faster span/congestion heuristic for backwards compatibility.
+
 The layout score depends on gate supports and optional gate/event weights, not
 on the initial MPS tensor values. The plan does not rewrite the gate stream. To
 use a layout during replay, call `opt.run(use_layout_finder=True)` or pass a
@@ -159,6 +167,25 @@ layout order such as `opt.run(use_layout_finder="quality")`; the optimizer
 temporarily permutes the working MPS and restores the returned MPS to the
 original site order. Layout-aware replay prints a concise report by default;
 pass `layout_report=False` to silence it.
+
+When the current state matters, use the explicit pilot selector:
+
+```python
+plan = opt.select_layout_for_compression(
+    pilot_candidates=4,
+    pilot_steps=64,
+)
+opt.apply_layout(plan, layout_report=False)
+```
+
+The selector replays the best static candidates on independent copies using
+the real MPS mode, `chi`, cutoff, backend, and dtype. It enables the
+infidelity trace for the pilot and chooses by measured compression
+infidelity, final bond dimension, and elapsed time, and returns
+per-candidate records under `plan["pilot"]`. The original state, queue, and
+layout are unchanged. Perform this before installing a persistent layout;
+reordering an already-entangled MPS remains explicitly guarded because the
+reorder itself can be lossy or expensive.
 
 The layout can be inspected graphically without changing the optimizer. The
 finder returns a Matplotlib `(fig, ax)` pair. The original lattice and gate

@@ -37,6 +37,8 @@ from ..mps.layout import (
     _gate_stream_spectral_order,
     _normalize_layout_gate_queue,
     _normalize_layout_support,
+    _operator_schmidt_rank_bound,
+    _operator_schmidt_rank_info as _mps_operator_schmidt_rank_info,
     _normalize_weight_mode,
 )
 from ..mps.optimizer import _control_event_parts as _mps_control_event_parts
@@ -174,12 +176,15 @@ def _normalize_layout_objective(objective):
         "bond": "congestion",
         "bond_load": "congestion",
         "combined": "hybrid",
+        "compress": "compression",
+        "accuracy": "compression",
+        "bond_growth": "compression",
     }
     name = aliases.get(name, name)
-    if name not in {"path", "congestion", "hybrid"}:
+    if name not in {"path", "congestion", "hybrid", "compression"}:
         raise ValueError(
             f"Unknown tree layout objective {objective!r}. "
-            "Expected 'path', 'congestion', or 'hybrid'."
+            "Expected 'path', 'congestion', 'compression', or 'hybrid'."
         )
     return name
 
@@ -191,12 +196,13 @@ def _operator_schmidt_rank(payload, support, left_support):
     left_set = set(left_support)
     if not left_set or left_set == set(support):
         return 1
+    default_bound = _operator_schmidt_rank_bound(support, left_support)
     try:
         array = ar.to_numpy(payload)
     except Exception:
-        return 2
+        return default_bound
     if array.size != 4 ** len(support):
-        return 2
+        return default_bound
     try:
         array = array.reshape((2,) * (2 * len(support)))
         positions = {site: pos for pos, site in enumerate(support)}
@@ -216,7 +222,7 @@ def _operator_schmidt_rank(payload, support, left_support):
         )
         return max(1, int(np.linalg.matrix_rank(matrix)))
     except (TypeError, ValueError, np.linalg.LinAlgError):
-        return 2
+        return default_bound
 
 
 def _submpo_schmidt_rank_bound(payload, support, left_support):
@@ -1101,7 +1107,7 @@ class TreeLayoutFinder:
         (see :meth:`TreePlan.from_order`).
     dense_max : int
         Maximum subsystem size for dense spectral reordering.
-    objective : {"path", "congestion", "hybrid"}
+    objective : {"path", "congestion", "compression", "hybrid"}
         Layout objective. `"path"` preserves the co-occurrence/path-length
         heuristic; `"congestion"` selects among layout candidates using the
         predicted operator-Schmidt load on tree edges. `"hybrid"` combines
@@ -1250,6 +1256,7 @@ class TreeLayoutFinder:
         # fresh dictionaries from the public diagnostic methods below.
         self._plan_cache = {}
         self._edge_load_cache = {}
+        self._rank_diagnostics_cache = {}
         self._schmidt_rank_cache = {}
         self._similarity_cache = {}
         self._congestion_weights_cache = None
@@ -1492,12 +1499,61 @@ class TreeLayoutFinder:
             int(max_path),
         )
 
+    def _tensor_cost_key(self, plan):
+        """Return a chi-scaled proxy for local TTN tensor cost.
+
+        A wider node reduces geodesic distance but increases the number of
+        virtual legs on one tensor.  The exact contraction cost depends on
+        the realized bond dimensions, so this uses the configured ``chi`` (or
+        a conservative qubit bond of two) to rank structures without ever
+        allocating tensors.
+        """
+        chi = max(2, int(self.chi or 2))
+        log_chi = float(np.log2(chi))
+        degrees = []
+        log_sizes = []
+        for node, children in plan.children.items():
+            if not children:
+                continue
+            virtual_degree = len(children) + (1 if node in plan.parent else 0)
+            physical_legs = 1 if node in plan.qubit_of_node else 0
+            degrees.append(virtual_degree)
+            log_sizes.append(virtual_degree * log_chi + physical_legs)
+        if not degrees:
+            return (0.0, 0.0, 0, 0)
+        max_log_size = max(log_sizes)
+        # log2(sum(2**log_size)) without overflowing for large chi/arity.
+        shifted = np.asarray(log_sizes, dtype=float) - max_log_size
+        total_log_size = max_log_size + float(np.log2(np.exp2(shifted).sum()))
+        return (
+            float(max_log_size),
+            float(total_log_size),
+            int(max(degrees)),
+            int(sum(degrees)),
+        )
+
     def _objective_key(self, plan):
         """Return the selected objective's deterministic comparison key."""
         if self.objective == "path":
             return self._path_score_and_max(plan)
         if self.objective == "congestion":
             return self._congestion_key(plan)
+        if self.objective == "compression":
+            loads = self.edge_loads(plan)
+            values = tuple(loads.values())
+            tensor_cost = self._tensor_cost_key(plan)
+            return (
+                max(values, default=0.0),
+                sum(values),
+                tensor_cost[0],
+                tensor_cost[1],
+                self.score(plan),
+                max(
+                    (plan.tree_distance(a, b) for a in range(self.n)
+                     for b in range(a + 1, self.n)),
+                    default=0,
+                ),
+            )
         return self._hybrid_key(plan)
 
     def _selection_key(self, plan, chi):
@@ -1512,7 +1568,7 @@ class TreeLayoutFinder:
         key = self._objective_key(plan)
         if self.objective == "path":
             value = key[0]
-        elif self.objective == "congestion":
+        elif self.objective in {"congestion", "compression"}:
             value = key[0] + 1.0e-6 * key[1] + 1.0e-12 * key[2]
         else:
             value = key[0]
@@ -1525,6 +1581,9 @@ class TreeLayoutFinder:
         cached = self._edge_load_cache.get(id(plan))
         if cached is not None and cached[0] is plan:
             del self._edge_load_cache[id(plan)]
+        cached = self._rank_diagnostics_cache.get(id(plan))
+        if cached is not None and cached[0] is plan:
+            del self._rank_diagnostics_cache[id(plan)]
 
     def _refine_plan_greedy(self, plan, *, chi, budget, progbar=False):
         """Greedily improve a fixed topology through adjacent leaf swaps."""
@@ -1763,15 +1822,26 @@ class TreeLayoutFinder:
         return plan
 
     def _schmidt_rank(self, payload, support, left_support):
-        """Return a cached operator-Schmidt rank for layout diagnostics."""
+        """Return a cached numeric operator-Schmidt rank or bound."""
+        return self._schmidt_rank_info(payload, support, left_support)["rank"]
+
+    def _schmidt_rank_info(self, payload, support, left_support):
+        """Return rank metadata used by compression diagnostics.
+
+        ``exact=False`` is deliberate for opaque native arrays, MPO bond
+        bounds, and supports larger than ``max_operator_qubits``.  The numeric
+        rank is then a conservative operator-space bound, never an optimistic
+        hard-coded rank-two fallback.
+        """
         if (
             self.max_operator_qubits is not None
             and len(support) > self.max_operator_qubits
         ):
-            # Keep layout search bounded. This is a conservative rank proxy;
-            # callers that need exact wide-operator layout costs can opt out
-            # with max_operator_qubits=None.
-            return 2
+            return {
+                "rank": _operator_schmidt_rank_bound(support, left_support),
+                "exact": False,
+                "reason": "max_operator_qubits",
+            }
         # For an ordinary dense gate, its Schmidt rank depends on the operator
         # data and *wire positions* in ``support``, not on the global qubit
         # labels. Reusing the same CNOT/CZ/parameterized matrix across many
@@ -1794,10 +1864,21 @@ class TreeLayoutFinder:
         if cached is not None and cached[0] is payload:
             return cached[1]
         rank = _submpo_schmidt_rank_bound(payload, support, left_support)
-        if rank is None:
-            rank = _operator_schmidt_rank(payload, support, left_support)
-        self._schmidt_rank_cache[key] = (payload, rank)
-        return rank
+        if rank is not None:
+            info = {
+                "rank": int(rank),
+                "exact": False,
+                "reason": "mpo_bond_bound",
+            }
+        else:
+            info = _mps_operator_schmidt_rank_info(
+                payload,
+                support,
+                left_support,
+                max_operator_qubits=self.max_operator_qubits,
+            )
+        self._schmidt_rank_cache[key] = (payload, info)
+        return info
 
     def _candidate_plans(self, max_arity):
         """Build the candidate plans considered by the selected objective."""
@@ -2019,6 +2100,14 @@ class TreeLayoutFinder:
                 "max_path": report["max_path"],
                 "max_edge_load": report["max_edge_load"],
                 "peak_bond_growth": report["peak_bond_growth"],
+                "max_virtual_degree": report["max_virtual_degree"],
+                "total_virtual_degree": report["total_virtual_degree"],
+                "estimated_max_tensor_log2": report[
+                    "estimated_max_tensor_log2"
+                ],
+                "estimated_total_tensor_log2": report[
+                    "estimated_total_tensor_log2"
+                ],
                 **_chi_cut_fields(plan, chi),
                 "order": self._leaf_order(plan),
                 "planning": planning,
@@ -2119,6 +2208,38 @@ class TreeLayoutFinder:
         self._selected_candidate = selected
         return candidates[selected]
 
+    def candidate_plans(self, *, chi=_DEFAULT_CHI):
+        """Return immutable candidate plans for optional pilot replay.
+
+        The normal :meth:`run` path remains static and cheap. This method
+        exposes the interaction, congestion, balanced, and arity candidates
+        that a state-aware pilot can compare without rebuilding the finder.
+        Candidate names are stable strings such as
+        ``"congestion:arity=2"``.
+        """
+        if chi is _DEFAULT_CHI:
+            chi = self.chi
+        else:
+            chi = _validate_chi(chi)
+        arities = (
+            tuple(self.arity_candidates)
+            if self.arity_candidates is not None
+            else (self.max_arity,)
+        )
+        result = {}
+        for arity in arities:
+            plans = self._candidate_plans(arity)
+            for name, plan in plans.items():
+                key = f"{name}:arity={arity}"
+                result[key] = {
+                    "plan": plan,
+                    "objective_key": self._selection_key(plan, chi),
+                    "path_score": self.score(plan),
+                    "tensor_cost": self._tensor_cost_key(plan),
+                    "edge_loads": self.edge_loads(plan),
+                }
+        return result
+
     def recommend_arities(
         self,
         max_arities=(2, 3, 4),
@@ -2217,10 +2338,21 @@ class TreeLayoutFinder:
                     ),
                     default=0,
                 ),
+                "total_virtual_degree": sum(
+                    len(children) + (1 if node in plan.parent else 0)
+                    for node, children in plan.children.items()
+                    if children
+                ),
                 "score": report["score"],
                 "max_path": report["max_path"],
                 "max_edge_load": report["max_edge_load"],
                 "peak_bond_growth": report["peak_bond_growth"],
+                "estimated_max_tensor_log2": report[
+                    "estimated_max_tensor_log2"
+                ],
+                "estimated_total_tensor_log2": report[
+                    "estimated_total_tensor_log2"
+                ],
                 **_chi_cut_fields(plan, chi),
                 "order": self._leaf_order(plan),
                 "planning": planning,
@@ -2309,6 +2441,11 @@ class TreeLayoutFinder:
             for parent, children in plan.children.items()
             for child in children
         }
+        rank_diagnostics = {
+            "exact_events": 0,
+            "bounded_events": 0,
+            "reasons": {},
+        }
         for payload, support, event_type in zip(
             self.payloads, self.supports, self.event_types
         ):
@@ -2354,14 +2491,24 @@ class TreeLayoutFinder:
                 left = tuple(
                     site for site in support if left_mask & (1 << site)
                 )
-                rank = (
-                    self._schmidt_rank(payload, support, left)
-                    if payload is not None else 2
-                )
-                loads[edge] += float(np.log2(rank))
+                info = self._schmidt_rank_info(payload, support, left)
+                rank = int(info["rank"])
+                loads[edge] += float(np.log2(max(1, rank)))
+                if info["exact"]:
+                    rank_diagnostics["exact_events"] += 1
+                else:
+                    rank_diagnostics["bounded_events"] += 1
+                    reason = info["reason"]
+                    rank_diagnostics["reasons"][reason] = (
+                        rank_diagnostics["reasons"].get(reason, 0) + 1
+                    )
         # Retain the plan alongside its id so a future id reuse cannot return
         # diagnostics for an unrelated short-lived plan.
         self._edge_load_cache[cache_key] = (plan, dict(loads))
+        self._rank_diagnostics_cache[cache_key] = (
+            plan,
+            rank_diagnostics,
+        )
         return dict(loads)
 
     def _congestion_key(self, plan):
@@ -2457,9 +2604,11 @@ class TreeLayoutFinder:
         if include_edge_loads:
             loads = self.edge_loads(plan)
             balanced_loads = self.edge_loads(balanced)
+            rank_info = self._rank_diagnostics_cache.get(id(plan), (plan, {}))[1]
         else:
             loads = None
             balanced_loads = None
+            rank_info = {}
         max_load = max(loads.values(), default=0.0) if loads is not None else None
         total_load = sum(loads.values()) if loads is not None else None
         balanced_max_load = (
@@ -2479,6 +2628,8 @@ class TreeLayoutFinder:
                 arity_histogram[len(children)] = (
                     arity_histogram.get(len(children), 0) + 1
                 )
+        tensor_cost = self._tensor_cost_key(plan)
+        objective_key = self._objective_key(plan)
         return {
             "n_qubits": self.n,
             "n_interacting_pairs": n_pairs,
@@ -2488,6 +2639,12 @@ class TreeLayoutFinder:
                 self.hybrid_weights if self.objective == "hybrid" else None
             ),
             "hybrid_cost": hybrid_cost,
+            "objective_key": objective_key,
+            "path_score": float(weighted_sum),
+            "compression_score": (
+                float(objective_key[0] + objective_key[1])
+                if self.objective == "compression" else None
+            ),
             "root": plan.root,
             "root_qubit": plan.root_qubit,
             "is_binary": plan.is_binary(),
@@ -2528,6 +2685,13 @@ class TreeLayoutFinder:
                 float(balanced_max_load)
                 if balanced_max_load is not None else None
             ),
+            "rank_exact_events": int(rank_info.get("exact_events", 0)),
+            "rank_bounded_events": int(rank_info.get("bounded_events", 0)),
+            "rank_bound_reasons": dict(rank_info.get("reasons", {})),
+            "max_virtual_degree": tensor_cost[2],
+            "total_virtual_degree": tensor_cost[3],
+            "estimated_max_tensor_log2": tensor_cost[0],
+            "estimated_total_tensor_log2": tensor_cost[1],
             "selected_candidate": getattr(self, "_selected_candidate", "interaction"),
             "candidate_scores": getattr(self, "_last_candidate_scores", {}),
         }
@@ -2929,11 +3093,11 @@ class TreeLayoutFinder:
         ax=None,
         figsize=(8, 7),
         cmap="turbo",
-        edge_cmap="turbo",
+        edge_cmap="GnBu",
         node_cmap="YlOrRd",
         color_by="scale",
         edge_color="#2f80a0",
-        show_edge_arrows=True,
+        show_edge_arrows=False,
         arrow_size=8.0,
         order=True,
         lattice=True,
@@ -2953,10 +3117,12 @@ class TreeLayoutFinder:
         Physical sites and gate connectivity stay in the lower, grey raw
         graph. Internal TTN nodes are lifted above the mean position of their
         descendant sites, and each parent-child hierarchy edge uses one
-        uniform solid color by default. Pass ``edge_color=None`` to color
-        edges by ``edge_cmap`` and ``color_by``. Small arrows at edge
-        midpoints show the parent-to-child direction by default; disable them
-        with ``show_edge_arrows=False``. This is deliberately a structural
+        uniform solid color by default. Pass ``edge_color=None`` to match
+        each incoming edge to the node it terminates at (so ``node_cmap``
+        controls both). The default has no arrows, matching Cotengra's
+        structural tent view; pass
+        ``show_edge_arrows=True`` only when parent-to-child direction is
+        needed. This is deliberately a structural
         visualization:
         gate-by-gate route overlays are not drawn. Set ``order=True`` to place
         hierarchy nodes by a deterministic post-order traversal, matching the
@@ -3053,7 +3219,10 @@ class TreeLayoutFinder:
         )
         y_max = max(point[1] for point in coords.values())
         if vertical_spacing is None:
-            vertical_spacing = max(0.7, 0.28 * x_span)
+            # Keep the tent compact for square 2-D lattices. The previous
+            # spacing made a 6x6 lattice grow into a very tall strip even
+            # though ``figsize`` only changes the canvas, not the geometry.
+            vertical_spacing = max(0.55, 0.16 * x_span)
         vertical_spacing = float(vertical_spacing)
         if vertical_spacing <= 0.0:
             raise ValueError("vertical_spacing must be positive.")
@@ -3119,22 +3288,21 @@ class TreeLayoutFinder:
                 colormaps, node_cmap, node_scales[node], n_colors
             )
 
-        def hierarchy_edge_color(parent):
+        def hierarchy_edge_color(parent, child):
             if edge_color is not None:
                 return edge_color
-            if color_by == "order":
-                return event_color(
-                    colormaps, cmap, order_values[parent], n_colors
-                )
-            return scale_color(
-                colormaps, edge_cmap, node_scales[parent], n_colors
-            )
+            # ``None`` means "follow the node palette": this is intentionally
+            # the node color itself rather than a separate edge colormap, so
+            # an incoming edge and its child are visually identical.
+            return node_color(child)
 
         for parent, children in plan.children.items():
             for child in children:
                 x0, y0 = positions[parent]
                 x1, y1 = positions[child]
-                edge_color_value = hierarchy_edge_color(parent)
+                # The incoming edge is colored like the node it terminates at,
+                # making each scale/order layer visually self-consistent.
+                edge_color_value = hierarchy_edge_color(parent, child)
                 ax.plot(
                     (x0, x1),
                     (y0, y1),
@@ -3208,7 +3376,7 @@ class TreeLayoutFinder:
                 colormaps,
                 ScalarMappable,
                 Normalize,
-                cmap if color_by == "order" else edge_cmap,
+                cmap if color_by == "order" else node_cmap,
                 n_colors,
                 label=(
                     "tree order" if color_by == "order" else "tree scale"
@@ -3243,8 +3411,8 @@ class TreeLayoutFinder:
         site_coords=None,
         ax=None,
         figsize=(10, 8),
-        cmap="turbo",
-        color_by="scale",
+        cmap="Spectral",
+        color_by="gate",
         scale_cmap="viridis",
         lattice=True,
         show_gate_connectivity=True,
@@ -3262,9 +3430,10 @@ class TreeLayoutFinder:
         This is the physical-lattice counterpart to Quimb's contraction-tree
         ``plot_rubberband`` view: the lattice and gate connectivity remain
         grey, while each non-root tree cluster is wrapped by a rounded,
-        translucent colored band. ``color_by="gate"`` colors the bands by a
-        deterministic post-order through the tree; ``color_by="scale"`` uses
-        one stable color for each tree scale measured from the leaves.
+        translucent colored band. The default ``color_by="gate"`` uses a
+        ``Spectral`` post-order progression, matching Cotengra's many-color
+        rubberband view. ``color_by="scale"`` is available when one stable
+        color is wanted for each tree scale measured from the leaves.
 
         The default presentation has no axes, site labels, or title. It
         returns a normal Matplotlib ``(fig, ax)`` pair for further styling.
@@ -3389,7 +3558,10 @@ class TreeLayoutFinder:
                     edgecolor=color,
                     linewidth=band_linewidth,
                     alpha=band_alpha,
-                    zorder=3,
+                    # Draw inner/earlier contractions above outer/later
+                    # bands, as in Cotengra, so overlapping bands remain
+                    # individually legible.
+                    zorder=3.0 + (n_bands - band_index) / n_bands,
                 )
             )
 

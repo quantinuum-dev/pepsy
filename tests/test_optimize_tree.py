@@ -974,6 +974,44 @@ def test_congestion_layout_uses_operator_schmidt_edge_load():
     assert report["peak_bond_growth"] == pytest.approx(8.0)
 
 
+def test_compression_layout_reports_rank_bounds_and_tensor_cost():
+    """Compression selection is explicit and honest for wide operators."""
+    gate = np.eye(8, dtype=complex)
+    finder = TreeLayoutFinder(
+        [(gate, (0, 1, 2))],
+        n=3,
+        objective="compression",
+        max_arity=(2, 3),
+        max_operator_qubits=2,
+        chi=2,
+    )
+    plan = finder.run()
+    report = finder.report(plan)
+
+    assert report["objective"] == "compression"
+    assert report["rank_bounded_events"] > 0
+    assert report["rank_bound_reasons"]["max_operator_qubits"] > 0
+    assert report["estimated_max_tensor_log2"] >= 0.0
+    assert len(report["objective_key"]) >= 5
+
+
+def test_tree_compression_layout_pilot_is_non_mutating():
+    """Tree pilot selection compares copied product states only."""
+    gates = [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1))]
+    opt = TreeOptimizer(gates, n=4, chi=2, run=False)
+    original_plan = opt.plan
+
+    selected = opt.select_layout_for_compression(
+        pilot_candidates=1,
+        pilot_steps=1,
+    )
+
+    assert selected["selected_candidate"]
+    assert selected["pilot"]["reports"]
+    assert opt.plan is original_plan
+    assert opt.max_bond() == 1
+
+
 def test_tree_edge_loads_match_full_edge_reference():
     """Steiner-only edge scanning preserves the full congestion calculation."""
     rng = np.random.default_rng(109)
@@ -1505,7 +1543,7 @@ def test_tree_layout_finder_plot_defaults_to_tent():
 
     assert fig is ax.figure
     assert ax.get_title() == ""
-    assert len(ax.patches) == len(plan.nodes()) - 1
+    assert not ax.patches
     assert len(fig.axes) == 1
     assert not ax.axison  # schematic-style presentation by default
     assert not ax.texts
@@ -1558,7 +1596,7 @@ def test_tree_layout_finder_plot_tent_draws_hierarchy_over_raw_graph():
 
     assert plan.is_binary()
     assert fig is ax.figure
-    assert len(ax.patches) == len(plan.nodes()) - 1
+    assert not ax.patches
     assert not ax.texts
     assert not ax.axison
     assert len(ax.lines) >= len(plan.nodes()) - 1
@@ -1646,7 +1684,49 @@ def test_tree_layout_tent_edges_are_uniform_by_default():
         line.get_color() for line in ax.lines[background_lines:]
     }
     assert hierarchy_colors == {"#2f80a0"}
-    assert len(ax.patches) == len(plan.nodes()) - 1
+    assert not ax.patches
+    plt.close(fig)
+
+
+def test_tree_layout_tent_colored_edges_match_child_nodes():
+    """Colored incoming edges use the same scale color as their child node."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))],
+        n=4,
+        max_arity=2,
+    )
+    plan = finder.run()
+    fig, ax = finder.plot_tent(
+        plan,
+        color_by="scale",
+        edge_color=None,
+        show_edge_arrows=False,
+    )
+
+    lattice_pairs = {
+        frozenset((site, site + 1)) for site in range(plan.n - 1)
+    }
+    background_lines = plan.n - 1 + sum(
+        frozenset(where) not in lattice_pairs
+        for _, where in [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))]
+    )
+    node_colors = {
+        node: tuple(collection.get_facecolors()[0])
+        for node, collection in zip(plan.nodes(), ax.collections)
+    }
+    hierarchy_lines = ax.lines[background_lines:]
+    line_index = 0
+    for parent, children in plan.children.items():
+        for child in children:
+            assert tuple(hierarchy_lines[line_index].get_color()) == pytest.approx(
+                node_colors[child]
+            )
+            line_index += 1
+    assert line_index == len(hierarchy_lines)
     plt.close(fig)
 
 
@@ -1684,6 +1764,33 @@ def test_tree_layout_finder_plot_rubberband_is_axis_free_and_unlabeled():
     assert not ax.axison
     assert not ax.texts
     assert len(ax.patches) >= 1
+    plt.close(fig)
+
+
+def test_tree_layout_rubberband_defaults_to_cotengra_ordered_colors():
+    """Default rubberbands use distinct post-order Spectral colors."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))],
+        n=4,
+        max_arity=2,
+    )
+    fig, ax = finder.plot_rubberband(
+        finder.run(),
+        site_coords={0: (0, 0), 1: (1, 0), 2: (0, 1), 3: (1, 1)},
+    )
+
+    expected = matplotlib.colormaps["Spectral"]
+    assert np.allclose(
+        ax.patches[0].get_edgecolor()[:3], expected(0.0)[:3]
+    )
+    assert np.allclose(
+        ax.patches[-1].get_edgecolor()[:3], expected(1.0)[:3]
+    )
+    assert ax.patches[0].get_zorder() > ax.patches[-1].get_zorder()
     plt.close(fig)
 
 
