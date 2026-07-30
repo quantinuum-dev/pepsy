@@ -397,11 +397,24 @@ it combines normalized path score, maximum edge load, and total edge load with
 `weight_mode` / `layout_weight_mode` option accepts `count`, `auto`, `angle`, or
 `operator_schmidt` for interaction-graph weighting.
 
+For compression-first selection, use `objective="compression"` (or
+`layout_objective="compression"`). It prioritizes peak and total predicted
+operator-Schmidt load, then penalizes the estimated local tensor size at the
+configured `chi`, and only then uses path length. This differs from the
+default fast `"path"` objective: path optimizes routing locality, while
+compression also accounts for bond pressure and wider-node cost.
+
 `weight_mode="operator_schmidt"` is a cheap **two-qubit entangling-strength
 proxy** used to form the spectral qubit order; it is not itself the exact
 operator-Schmidt rank. Use `objective="congestion"` when selecting a tree: its
 edge-load calculation uses the actual rank across each candidate tree cut (or
 an MPO bond bound), which is the quantity that predicts TTN bond growth.
+
+Rank diagnostics are explicit. Small dense qubit operators use exact
+operator-Schmidt ranks; opaque native arrays, MPO bond products, and supports
+larger than `max_operator_qubits` use conservative operator-space bounds and
+are counted in `rank_bounded_events` with a reason in `rank_bound_reasons`.
+They are not silently assigned rank two.
 
 The structure is **not restricted to binary trees**. Internal nodes may have
 any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
@@ -567,11 +580,30 @@ chi=chi)` forwards its own `chi` into the finder it builds -- so the everyday
 exact at `chi`. A bare finder with no `chi` searches `chi`-blind.
 Set `max_operator_qubits` to bound dense rank diagnostics and operator
 allocation; wider native MPO events can still replay without dense
-materialization. `TreeLayoutFinder(..., max_operator_qubits=...)` uses a conservative rank
-proxy above that width. `report(plan, include_edge_loads=False)` skips the
-event-by-edge congestion calculation for path-only diagnostics; when loads are
+materialization. `TreeLayoutFinder(..., max_operator_qubits=...)` uses a
+conservative rank bound above that width and reports the bounded events. The
+public `score` remains the path score for compatibility; inspect
+`objective_key`, `max_edge_load`, `peak_bond_growth`, and the tensor-cost
+fields for compression decisions. `report(plan, include_edge_loads=False)`
+skips the event-by-edge calculation for path-only diagnostics; when loads are
 included, `peak_bond_growth_log2` remains finite even when the human-readable
 `peak_bond_growth` would overflow floating point.
+
+For a state-aware choice between static candidates, call:
+
+```python
+choice = opt.select_layout_for_compression(
+    pilot_candidates=4,
+    pilot_steps=64,
+)
+opt = py.TreeOptimizer(gate_stream, tree=choice["plan"], chi=chi)
+```
+
+The pilot replays candidates on independent copies with the real tree update
+kernels and returns measured infidelity, final bond, truncation count, and
+runtime under `choice["pilot"]`. The original optimizer is unchanged unless
+`install=True` is passed. Installation is restricted to product initial states;
+an entangled TTN cannot generally be relaid out exactly.
 
 Both helpers are also available from the package-level API:
 
@@ -654,6 +686,108 @@ backend.
 
 The dominant lever for accuracy at fixed `chi` is the tree structure, so the
 finder and optimizer expose diagnostics to choose it:
+
+The same diagnostics are available as a Cotengra-style tent plot.
+`TreeLayoutFinder.plot(plan)` is the default tent view (also available as
+`plot_tent(plan)`): it keeps the raw graph at the bottom and lifts
+the selected hierarchy above its descendant sites: the raw lattice and gate
+connectivity are gray, while circular nodes use stable scale colors. Hierarchy
+edges use one uniform solid color by default. Pass `edge_color=None` to make
+each incoming edge exactly match the node it terminates at; `node_cmap` then
+controls both. Arrows are disabled by default, matching Cotengra's
+structural tent view; pass `show_edge_arrows=True` only when parent-to-child
+direction is needed.
+Nearest-neighbor gate edges are not duplicated over the lattice. Supplying
+`site_coords={qubit: (x, y)}` places the physical sites on an existing lattice.
+It returns `(fig, ax)` and does not mutate the plan or live TTN:
+
+```python
+finder = py.TreeLayoutFinder(gates, n=n, objective="congestion")
+plan = finder.run()
+fig, ax = finder.plot(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="scale",
+    edge_color=None,
+    edge_cmap="GnBu",
+    node_cmap="YlOrRd",
+    order=True,
+    show_edge_arrows=False,
+)
+
+# For a live optimizer, the same plot is available without changing its state.
+fig, ax = opt.plot_layout(site_coords=logical_lattice_coords)
+```
+
+The default plot is therefore the hierarchy that `TreeLayoutFinder` selected:
+one hierarchy edge per parent-child connection, drawn over the physical lattice
+and gate connectivity. For a background-free binary check, hide the physical
+background with:
+
+```python
+fig, ax = finder.plot(
+    plan,
+    lattice=False,
+    show_gate_connectivity=False,
+)
+```
+
+This leaves only the selected hierarchy. The public tent plot intentionally
+does not draw gate-by-gate route overlays.
+
+Use `finder.plot_rubberband(...)` for the same hierarchy in physical-lattice
+rubberband form. The optional `viz`
+profile provides Matplotlib. The plot uses the same visual
+idea as Cotengra's circuit/rubberband views: the source interaction structure
+remains visible underneath, and band color can encode either tree scale or
+post-order. The default styling is axis-free, following Quimb's schematic
+drawings, and the
+background lattice is not numbered. Pass `show_axes=True` or
+`show_site_labels=True` when those annotations are wanted. A stream-order
+colorbar is hidden by default; pass `colorbar=True` when that diagnostic is
+wanted.
+
+For a scale-invariant tree view, use `color_by="scale"`:
+
+```python
+fig, ax = finder.plot(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="scale",
+    edge_color=None,
+    edge_cmap="GnBu",
+    node_cmap="YlOrRd",
+)
+```
+
+Here leaves are scale zero and nodes use stable colors for their hierarchical
+scale. With `edge_color=None`, each incoming hierarchy edge uses the exact
+same node-palette color as the node it terminates at, so scale layers remain
+easy to follow. Set a literal `edge_color` when a uniform structural edge
+color is preferred. The scale colorbar, when enabled, follows `node_cmap`.
+Midpoint arrows can show the direction from each parent to its children when
+`show_edge_arrows=True`. The mapping is independent of the number or order of gates;
+`colorbar=True` then labels tree scale rather than gate-stream order. The plot
+has no title by default; pass `show_title=True` if a title is wanted.
+
+For a physical-lattice view closer to Quimb's rubberband drawing, use:
+
+```python
+fig, ax = finder.plot_rubberband(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="gate",
+)
+
+# The live optimizer exposes the same non-mutating view.
+fig, ax = opt.plot_rubberband(site_coords=logical_lattice_coords)
+```
+
+This keeps the lattice sites and gate connectivity grey and wraps each
+non-root tree cluster in a rounded, translucent band. The default is a
+Cotengra-style `Spectral` post-order progression, giving each nested band a
+distinct color. Use `color_by="scale"` for one stable band color per tree
+scale.
 
 - `TreeLayoutFinder.report(plan=None)` summarises the physical-node geodesic
   lengths over the interaction graph (`score`, `max_path`, `mean_path`,

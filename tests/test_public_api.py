@@ -84,9 +84,11 @@ _EXPECTED_IN_ALL = [
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
     "symmray_block_summary", "symmray_mps_summary", "symmray_mpo_summary", "symmray_peps_summary", "symm_operator_from_dense",
-    "reg_rel_svd_torch", "reg_real_svd_torch", "reg_complex_svd_torch",
+    "reg_native_svd_torch", "reg_native_svd_jax", "reg_rel_svd_torch",
+    "reg_real_svd_torch", "reg_complex_svd_torch",
     "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
+    "register_jax_linalg", "reset_linalg_registrations",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
@@ -151,9 +153,11 @@ _CALLABLE_EXPORTS = [
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
     "symmray_block_summary", "symmray_mps_summary", "symmray_mpo_summary", "symmray_peps_summary", "symm_operator_from_dense",
-    "reg_rel_svd_torch", "reg_real_svd_torch", "reg_complex_svd_torch",
+    "reg_native_svd_torch", "reg_native_svd_jax", "reg_rel_svd_torch",
+    "reg_real_svd_torch", "reg_complex_svd_torch",
     "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
+    "register_jax_linalg", "reset_linalg_registrations",
 ]
 
 _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
@@ -215,16 +219,22 @@ def test_optional_linalg_registrations_resolve():
     assert pepsy.reg_rel_svd_torch is pepsy.tensors.reg_rel_svd_torch
     assert pepsy.reg_real_svd_torch is pepsy.tensors.reg_real_svd_torch
     assert pepsy.reg_complex_svd_torch is pepsy.tensors.reg_complex_svd_torch
+    assert pepsy.reg_native_svd_torch is pepsy.tensors.reg_native_svd_torch
+    assert pepsy.reg_native_svd_jax is pepsy.tensors.reg_native_svd_jax
     assert pepsy.reg_real_qr_torch is pepsy.tensors.reg_real_qr_torch
     assert pepsy.reg_complex_qr_torch is pepsy.tensors.reg_complex_qr_torch
     assert pepsy.reg_rel_svd_jax is pepsy.tensors.reg_rel_svd_jax
     assert pepsy.reg_real_svd_jax is pepsy.tensors.reg_real_svd_jax
     assert pepsy.reg_complex_svd_jax is pepsy.tensors.reg_complex_svd_jax
+    assert pepsy.register_jax_linalg is pepsy.backends.register_jax_linalg
+    assert pepsy.reset_linalg_registrations is pepsy.backends.reset_linalg_registrations
     if has_torch:
         import torch
 
         assert callable(pepsy.tensors.core.reg_rel_svd_torch)
         assert callable(pepsy.tensors.reg_rel_svd_torch)
+        assert callable(pepsy.tensors.core.reg_native_svd_torch)
+        assert callable(pepsy.tensors.reg_native_svd_torch)
         assert callable(pepsy.tensors.core.reg_real_svd_torch)
         assert callable(pepsy.tensors.reg_real_svd_torch)
         assert callable(pepsy.tensors.core.reg_complex_svd_torch)
@@ -245,3 +255,7 @@ def test_optional_linalg_registrations_resolve():
         assert callable(pepsy.tensors.reg_real_svd_jax)
         assert callable(pepsy.tensors.core.reg_complex_svd_jax)
         assert callable(pepsy.tensors.reg_complex_svd_jax)
+        assert callable(pepsy.tensors.core.reg_native_svd_jax)
+        assert callable(pepsy.tensors.reg_native_svd_jax)
+        assert callable(pepsy.tensors.core.register_jax_linalg)
+        assert callable(pepsy.tensors.register_jax_linalg)

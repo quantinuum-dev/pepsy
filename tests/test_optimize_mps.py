@@ -682,6 +682,104 @@ def test_mps_optimizer_gate_stream_layout_remaps_long_range_path():
     )
 
 
+def test_mps_compression_layout_reports_operator_cut_load():
+    """Compression objective exposes cut-load diagnostics and rank bounds."""
+    gate = np.eye(8, dtype=complex)
+    plan = py.MpsOptimizer.gate_stream_layout(
+        [(gate, (0, 1, 2))],
+        L=3,
+        objective="compression",
+        max_operator_qubits=2,
+    )
+
+    assert plan["objective"] == "compression"
+    assert plan["stats"]["compression_score"] == plan["score"]
+    assert plan["rank_bounded_events"] > 0
+    assert plan["rank_bound_reasons"]["max_operator_qubits"] > 0
+    assert plan["candidate_plans"]
+
+    exact = py.MpsOptimizer.gate_stream_layout(
+        [(qu.CNOT(), (0, 1))],
+        L=2,
+        objective="compression",
+    )
+    assert exact["stats"]["rank_exact_events"] == 1
+    assert exact["stats"]["total_operator_cut_load"] == pytest.approx(1.0)
+
+
+def test_mps_compression_layout_pilot_is_non_mutating():
+    """Pilot selection uses copied state and does not install a layout."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [(qu.CNOT(), (0, 3)), (qu.CNOT(), (3, 1))]
+    opt = py.MpsOptimizer(
+        p0, gates=gates, chi=2, mode="svd", track_infidelity=False
+    )
+    before = opt.to_dense()
+
+    selected = opt.select_layout_for_compression(
+        pilot_candidates=1,
+        pilot_steps=1,
+    )
+
+    assert selected["pilot"]["selected_order"]
+    assert selected["pilot"]["reports"]
+    assert opt._persistent_layout_plan is None
+    assert np.allclose(opt.to_dense(), before)
+
+
+def test_mps_layout_finder_plot_draws_lattice_and_gate_order():
+    """The MPS plot exposes the lattice, gate graph, and colored chain."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gates = [
+        (qu.CNOT(), (0, 3)),
+        (qu.CNOT(), (3, 1)),
+        (qu.CNOT(), (1, 2)),
+    ]
+    finder = py.MpsOptimizer.LayoutFinder(gates, L=4)
+    plan = finder.run(order="input")
+    fig, ax = finder.plot(
+        plan,
+        site_coords={0: (0, 0), 1: (1, 0), 2: (0, 1), 3: (1, 1)},
+    )
+
+    assert fig is ax.figure
+    assert ax.get_title() == ""
+    assert len(ax.patches) == len(plan["site_order"]) - 1
+    assert len(fig.axes) == 1  # no stream-order colorbar by default
+    assert not ax.axison  # schematic-style presentation by default
+    assert any(text.get_text() == "0" for text in ax.texts)
+    assert any(text.get_text() == "3" for text in ax.texts)
+    assert any(collection.get_offsets().shape[0] for collection in ax.collections)
+    plt.close(fig)
+
+
+def test_mps_optimizer_plot_layout_is_non_mutating():
+    """The optimizer plotting wrapper does not install or alter a layout."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=8,
+        mode="svd",
+    )
+    before = tuple(opt.logical_order)
+    fig, _ = opt.plot_layout(
+        layout_kwargs={"order": "input"},
+        site_coords={q: (q, 0) for q in range(4)},
+    )
+
+    assert tuple(opt.logical_order) == before
+    assert opt._persistent_layout_plan is None
+    plt.close(fig)
+
+
 def test_mps_optimizer_gate_stream_layout_accepts_weight_fn():
     """User event weights should feed the weighted graph and report."""
     gates = [

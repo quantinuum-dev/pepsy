@@ -37,15 +37,28 @@ from ..mps.layout import (
     _gate_stream_spectral_order,
     _normalize_layout_gate_queue,
     _normalize_layout_support,
+    _operator_schmidt_rank_bound,
+    _operator_schmidt_rank_info as _mps_operator_schmidt_rank_info,
     _normalize_weight_mode,
 )
 from ..mps.optimizer import _control_event_parts as _mps_control_event_parts
+from .._layout_visualization import (
+    add_order_colorbar,
+    coordinate_lattice_edge_keys,
+    coordinate_lattice_edges,
+    event_color,
+    finish_schematic_axes,
+    matplotlib_modules,
+    resolve_site_coords,
+    scale_color,
+)
 
 __all__ = ["TreePlan", "TreeLayoutFinder"]
 
 _DEFAULT_MAX_ARITY = object()
 _DEFAULT_CHI = object()
 _DEFAULT_SEARCH_OPTION = object()
+_DEFAULT_SCALE_MARKERS = ("o",)
 
 
 def _looks_like_tree_tensor_network(value):
@@ -163,12 +176,15 @@ def _normalize_layout_objective(objective):
         "bond": "congestion",
         "bond_load": "congestion",
         "combined": "hybrid",
+        "compress": "compression",
+        "accuracy": "compression",
+        "bond_growth": "compression",
     }
     name = aliases.get(name, name)
-    if name not in {"path", "congestion", "hybrid"}:
+    if name not in {"path", "congestion", "hybrid", "compression"}:
         raise ValueError(
             f"Unknown tree layout objective {objective!r}. "
-            "Expected 'path', 'congestion', or 'hybrid'."
+            "Expected 'path', 'congestion', 'compression', or 'hybrid'."
         )
     return name
 
@@ -180,12 +196,13 @@ def _operator_schmidt_rank(payload, support, left_support):
     left_set = set(left_support)
     if not left_set or left_set == set(support):
         return 1
+    default_bound = _operator_schmidt_rank_bound(support, left_support)
     try:
         array = ar.to_numpy(payload)
     except Exception:
-        return 2
+        return default_bound
     if array.size != 4 ** len(support):
-        return 2
+        return default_bound
     try:
         array = array.reshape((2,) * (2 * len(support)))
         positions = {site: pos for pos, site in enumerate(support)}
@@ -205,7 +222,7 @@ def _operator_schmidt_rank(payload, support, left_support):
         )
         return max(1, int(np.linalg.matrix_rank(matrix)))
     except (TypeError, ValueError, np.linalg.LinAlgError):
-        return 2
+        return default_bound
 
 
 def _submpo_schmidt_rank_bound(payload, support, left_support):
@@ -309,6 +326,25 @@ def _chi_cut_fields(plan, chi):
         fields["chi_overflow"] = max(0.0, mbc - log_chi)
         fields["exact_at_chi"] = mbc <= log_chi
     return fields
+
+
+def _tree_node_scales(plan):
+    """Return hierarchical scales, with leaves at scale zero."""
+    scales = {}
+
+    def visit(node):
+        if node in scales:
+            return scales[node]
+        children = tuple(plan.children.get(node, ()))
+        if not children:
+            scale = 0
+        else:
+            scale = 1 + max(visit(child) for child in children)
+        scales[node] = scale
+        return scale
+
+    visit(plan.root)
+    return scales
 
 
 class TreePlan:
@@ -1071,7 +1107,7 @@ class TreeLayoutFinder:
         (see :meth:`TreePlan.from_order`).
     dense_max : int
         Maximum subsystem size for dense spectral reordering.
-    objective : {"path", "congestion", "hybrid"}
+    objective : {"path", "congestion", "compression", "hybrid"}
         Layout objective. `"path"` preserves the co-occurrence/path-length
         heuristic; `"congestion"` selects among layout candidates using the
         predicted operator-Schmidt load on tree edges. `"hybrid"` combines
@@ -1220,6 +1256,7 @@ class TreeLayoutFinder:
         # fresh dictionaries from the public diagnostic methods below.
         self._plan_cache = {}
         self._edge_load_cache = {}
+        self._rank_diagnostics_cache = {}
         self._schmidt_rank_cache = {}
         self._similarity_cache = {}
         self._congestion_weights_cache = None
@@ -1462,12 +1499,61 @@ class TreeLayoutFinder:
             int(max_path),
         )
 
+    def _tensor_cost_key(self, plan):
+        """Return a chi-scaled proxy for local TTN tensor cost.
+
+        A wider node reduces geodesic distance but increases the number of
+        virtual legs on one tensor.  The exact contraction cost depends on
+        the realized bond dimensions, so this uses the configured ``chi`` (or
+        a conservative qubit bond of two) to rank structures without ever
+        allocating tensors.
+        """
+        chi = max(2, int(self.chi or 2))
+        log_chi = float(np.log2(chi))
+        degrees = []
+        log_sizes = []
+        for node, children in plan.children.items():
+            if not children:
+                continue
+            virtual_degree = len(children) + (1 if node in plan.parent else 0)
+            physical_legs = 1 if node in plan.qubit_of_node else 0
+            degrees.append(virtual_degree)
+            log_sizes.append(virtual_degree * log_chi + physical_legs)
+        if not degrees:
+            return (0.0, 0.0, 0, 0)
+        max_log_size = max(log_sizes)
+        # log2(sum(2**log_size)) without overflowing for large chi/arity.
+        shifted = np.asarray(log_sizes, dtype=float) - max_log_size
+        total_log_size = max_log_size + float(np.log2(np.exp2(shifted).sum()))
+        return (
+            float(max_log_size),
+            float(total_log_size),
+            int(max(degrees)),
+            int(sum(degrees)),
+        )
+
     def _objective_key(self, plan):
         """Return the selected objective's deterministic comparison key."""
         if self.objective == "path":
             return self._path_score_and_max(plan)
         if self.objective == "congestion":
             return self._congestion_key(plan)
+        if self.objective == "compression":
+            loads = self.edge_loads(plan)
+            values = tuple(loads.values())
+            tensor_cost = self._tensor_cost_key(plan)
+            return (
+                max(values, default=0.0),
+                sum(values),
+                tensor_cost[0],
+                tensor_cost[1],
+                self.score(plan),
+                max(
+                    (plan.tree_distance(a, b) for a in range(self.n)
+                     for b in range(a + 1, self.n)),
+                    default=0,
+                ),
+            )
         return self._hybrid_key(plan)
 
     def _selection_key(self, plan, chi):
@@ -1482,7 +1568,7 @@ class TreeLayoutFinder:
         key = self._objective_key(plan)
         if self.objective == "path":
             value = key[0]
-        elif self.objective == "congestion":
+        elif self.objective in {"congestion", "compression"}:
             value = key[0] + 1.0e-6 * key[1] + 1.0e-12 * key[2]
         else:
             value = key[0]
@@ -1495,6 +1581,9 @@ class TreeLayoutFinder:
         cached = self._edge_load_cache.get(id(plan))
         if cached is not None and cached[0] is plan:
             del self._edge_load_cache[id(plan)]
+        cached = self._rank_diagnostics_cache.get(id(plan))
+        if cached is not None and cached[0] is plan:
+            del self._rank_diagnostics_cache[id(plan)]
 
     def _refine_plan_greedy(self, plan, *, chi, budget, progbar=False):
         """Greedily improve a fixed topology through adjacent leaf swaps."""
@@ -1733,15 +1822,26 @@ class TreeLayoutFinder:
         return plan
 
     def _schmidt_rank(self, payload, support, left_support):
-        """Return a cached operator-Schmidt rank for layout diagnostics."""
+        """Return a cached numeric operator-Schmidt rank or bound."""
+        return self._schmidt_rank_info(payload, support, left_support)["rank"]
+
+    def _schmidt_rank_info(self, payload, support, left_support):
+        """Return rank metadata used by compression diagnostics.
+
+        ``exact=False`` is deliberate for opaque native arrays, MPO bond
+        bounds, and supports larger than ``max_operator_qubits``.  The numeric
+        rank is then a conservative operator-space bound, never an optimistic
+        hard-coded rank-two fallback.
+        """
         if (
             self.max_operator_qubits is not None
             and len(support) > self.max_operator_qubits
         ):
-            # Keep layout search bounded. This is a conservative rank proxy;
-            # callers that need exact wide-operator layout costs can opt out
-            # with max_operator_qubits=None.
-            return 2
+            return {
+                "rank": _operator_schmidt_rank_bound(support, left_support),
+                "exact": False,
+                "reason": "max_operator_qubits",
+            }
         # For an ordinary dense gate, its Schmidt rank depends on the operator
         # data and *wire positions* in ``support``, not on the global qubit
         # labels. Reusing the same CNOT/CZ/parameterized matrix across many
@@ -1764,10 +1864,21 @@ class TreeLayoutFinder:
         if cached is not None and cached[0] is payload:
             return cached[1]
         rank = _submpo_schmidt_rank_bound(payload, support, left_support)
-        if rank is None:
-            rank = _operator_schmidt_rank(payload, support, left_support)
-        self._schmidt_rank_cache[key] = (payload, rank)
-        return rank
+        if rank is not None:
+            info = {
+                "rank": int(rank),
+                "exact": False,
+                "reason": "mpo_bond_bound",
+            }
+        else:
+            info = _mps_operator_schmidt_rank_info(
+                payload,
+                support,
+                left_support,
+                max_operator_qubits=self.max_operator_qubits,
+            )
+        self._schmidt_rank_cache[key] = (payload, info)
+        return info
 
     def _candidate_plans(self, max_arity):
         """Build the candidate plans considered by the selected objective."""
@@ -1989,6 +2100,14 @@ class TreeLayoutFinder:
                 "max_path": report["max_path"],
                 "max_edge_load": report["max_edge_load"],
                 "peak_bond_growth": report["peak_bond_growth"],
+                "max_virtual_degree": report["max_virtual_degree"],
+                "total_virtual_degree": report["total_virtual_degree"],
+                "estimated_max_tensor_log2": report[
+                    "estimated_max_tensor_log2"
+                ],
+                "estimated_total_tensor_log2": report[
+                    "estimated_total_tensor_log2"
+                ],
                 **_chi_cut_fields(plan, chi),
                 "order": self._leaf_order(plan),
                 "planning": planning,
@@ -2089,6 +2208,38 @@ class TreeLayoutFinder:
         self._selected_candidate = selected
         return candidates[selected]
 
+    def candidate_plans(self, *, chi=_DEFAULT_CHI):
+        """Return immutable candidate plans for optional pilot replay.
+
+        The normal :meth:`run` path remains static and cheap. This method
+        exposes the interaction, congestion, balanced, and arity candidates
+        that a state-aware pilot can compare without rebuilding the finder.
+        Candidate names are stable strings such as
+        ``"congestion:arity=2"``.
+        """
+        if chi is _DEFAULT_CHI:
+            chi = self.chi
+        else:
+            chi = _validate_chi(chi)
+        arities = (
+            tuple(self.arity_candidates)
+            if self.arity_candidates is not None
+            else (self.max_arity,)
+        )
+        result = {}
+        for arity in arities:
+            plans = self._candidate_plans(arity)
+            for name, plan in plans.items():
+                key = f"{name}:arity={arity}"
+                result[key] = {
+                    "plan": plan,
+                    "objective_key": self._selection_key(plan, chi),
+                    "path_score": self.score(plan),
+                    "tensor_cost": self._tensor_cost_key(plan),
+                    "edge_loads": self.edge_loads(plan),
+                }
+        return result
+
     def recommend_arities(
         self,
         max_arities=(2, 3, 4),
@@ -2187,10 +2338,21 @@ class TreeLayoutFinder:
                     ),
                     default=0,
                 ),
+                "total_virtual_degree": sum(
+                    len(children) + (1 if node in plan.parent else 0)
+                    for node, children in plan.children.items()
+                    if children
+                ),
                 "score": report["score"],
                 "max_path": report["max_path"],
                 "max_edge_load": report["max_edge_load"],
                 "peak_bond_growth": report["peak_bond_growth"],
+                "estimated_max_tensor_log2": report[
+                    "estimated_max_tensor_log2"
+                ],
+                "estimated_total_tensor_log2": report[
+                    "estimated_total_tensor_log2"
+                ],
                 **_chi_cut_fields(plan, chi),
                 "order": self._leaf_order(plan),
                 "planning": planning,
@@ -2279,6 +2441,11 @@ class TreeLayoutFinder:
             for parent, children in plan.children.items()
             for child in children
         }
+        rank_diagnostics = {
+            "exact_events": 0,
+            "bounded_events": 0,
+            "reasons": {},
+        }
         for payload, support, event_type in zip(
             self.payloads, self.supports, self.event_types
         ):
@@ -2324,14 +2491,24 @@ class TreeLayoutFinder:
                 left = tuple(
                     site for site in support if left_mask & (1 << site)
                 )
-                rank = (
-                    self._schmidt_rank(payload, support, left)
-                    if payload is not None else 2
-                )
-                loads[edge] += float(np.log2(rank))
+                info = self._schmidt_rank_info(payload, support, left)
+                rank = int(info["rank"])
+                loads[edge] += float(np.log2(max(1, rank)))
+                if info["exact"]:
+                    rank_diagnostics["exact_events"] += 1
+                else:
+                    rank_diagnostics["bounded_events"] += 1
+                    reason = info["reason"]
+                    rank_diagnostics["reasons"][reason] = (
+                        rank_diagnostics["reasons"].get(reason, 0) + 1
+                    )
         # Retain the plan alongside its id so a future id reuse cannot return
         # diagnostics for an unrelated short-lived plan.
         self._edge_load_cache[cache_key] = (plan, dict(loads))
+        self._rank_diagnostics_cache[cache_key] = (
+            plan,
+            rank_diagnostics,
+        )
         return dict(loads)
 
     def _congestion_key(self, plan):
@@ -2427,9 +2604,11 @@ class TreeLayoutFinder:
         if include_edge_loads:
             loads = self.edge_loads(plan)
             balanced_loads = self.edge_loads(balanced)
+            rank_info = self._rank_diagnostics_cache.get(id(plan), (plan, {}))[1]
         else:
             loads = None
             balanced_loads = None
+            rank_info = {}
         max_load = max(loads.values(), default=0.0) if loads is not None else None
         total_load = sum(loads.values()) if loads is not None else None
         balanced_max_load = (
@@ -2449,6 +2628,8 @@ class TreeLayoutFinder:
                 arity_histogram[len(children)] = (
                     arity_histogram.get(len(children), 0) + 1
                 )
+        tensor_cost = self._tensor_cost_key(plan)
+        objective_key = self._objective_key(plan)
         return {
             "n_qubits": self.n,
             "n_interacting_pairs": n_pairs,
@@ -2458,6 +2639,12 @@ class TreeLayoutFinder:
                 self.hybrid_weights if self.objective == "hybrid" else None
             ),
             "hybrid_cost": hybrid_cost,
+            "objective_key": objective_key,
+            "path_score": float(weighted_sum),
+            "compression_score": (
+                float(objective_key[0] + objective_key[1])
+                if self.objective == "compression" else None
+            ),
             "root": plan.root,
             "root_qubit": plan.root_qubit,
             "is_binary": plan.is_binary(),
@@ -2498,6 +2685,928 @@ class TreeLayoutFinder:
                 float(balanced_max_load)
                 if balanced_max_load is not None else None
             ),
+            "rank_exact_events": int(rank_info.get("exact_events", 0)),
+            "rank_bounded_events": int(rank_info.get("bounded_events", 0)),
+            "rank_bound_reasons": dict(rank_info.get("reasons", {})),
+            "max_virtual_degree": tensor_cost[2],
+            "total_virtual_degree": tensor_cost[3],
+            "estimated_max_tensor_log2": tensor_cost[0],
+            "estimated_total_tensor_log2": tensor_cost[1],
             "selected_candidate": getattr(self, "_selected_candidate", "interaction"),
             "candidate_scores": getattr(self, "_last_candidate_scores", {}),
         }
+
+    def _plot_gate_routes(
+        self,
+        plan=None,
+        *,
+        site_coords=None,
+        ax=None,
+        figsize=(10, 8),
+        cmap="turbo",
+        color_by="gate",
+        scale_cmap="viridis",
+        scale_markers=_DEFAULT_SCALE_MARKERS,
+        lattice=True,
+        show_gate_connectivity=True,
+        show_gate_paths=False,
+        show_node_ids=False,
+        show_site_labels=False,
+        show_event_labels=False,
+        colorbar=False,
+        show_axes=False,
+        show_title=False,
+        rubberband=False,
+        node_size=58,
+        event_linewidth=2.0,
+        event_alpha=0.5,
+        tree_edge_alpha=0.38,
+        gate_path_curvature=0.08,
+    ):
+        """Plot a tree plan over the physical lattice and gate connectivity.
+
+        By default this draws only the explicit TTN geometry over the optional
+        physical background. Pass ``show_gate_paths=True`` to add gate-stream
+        route overlays as a separate diagnostic layer; those routes are not
+        tensor legs. Pass ``rubberband=True`` for the
+        physical-lattice rubberband view, where each non-root tree cluster is
+        wrapped by a rounded translucent band. In either view,
+        ``color_by="scale"`` uses colors independent of gate-stream length;
+        the explicit tree view also uses circle markers by default (custom
+        marker cycles can be supplied with ``scale_markers``). When enabled,
+        gate-path edges are kept visually distinct: structural edges are
+        straight grey segments, while colored gate routes are offset by
+        small deterministic arcs (controlled by ``gate_path_curvature``).
+        No stream-order colorbar or title is shown by default. Pass
+        ``site_coords={qubit: (x, y)}`` to place the physical leaves on an
+        existing lattice; internal tree nodes are then placed above the
+        supplied leaves. Without coordinates, leaves use their deterministic
+        tree order and the plot becomes a clean rooted-tree view. The default
+        presentation is axis-free, following quimb's schematic drawing style;
+        set ``show_axes=True`` to retain Matplotlib axes.
+
+        Returns
+        -------
+        (matplotlib.figure.Figure, matplotlib.axes.Axes)
+            The figure and axes, ready for further customization or saving.
+        """
+        plt, colormaps, ScalarMappable, Normalize, FancyArrowPatch = (
+            matplotlib_modules()
+        )
+        if plan is None:
+            plan = self.run()
+        if not isinstance(plan, TreePlan):
+            raise TypeError("plan must be a TreePlan returned by run().")
+        color_by = str(color_by).replace("-", "_").strip().lower()
+        color_by = {"stream": "gate", "event": "gate", "level": "scale"}.get(
+            color_by, color_by
+        )
+        if color_by not in {"gate", "scale"}:
+            raise ValueError("color_by must be 'gate' or 'scale'.")
+        try:
+            scale_markers = tuple(scale_markers)
+        except TypeError as exc:
+            raise TypeError("scale_markers must be a non-empty sequence.") from exc
+        if not scale_markers:
+            raise ValueError("scale_markers must be a non-empty sequence.")
+        if rubberband:
+            return self.plot_rubberband(
+                plan,
+                site_coords=site_coords,
+                ax=ax,
+                figsize=figsize,
+                cmap=cmap,
+                color_by=color_by,
+                scale_cmap=scale_cmap,
+                lattice=lattice,
+                show_gate_connectivity=show_gate_connectivity,
+                show_site_nodes=True,
+                colorbar=colorbar,
+                show_axes=show_axes,
+                show_title=show_title,
+                band_alpha=event_alpha,
+                band_linewidth=event_linewidth,
+                node_size=node_size,
+            )
+        created_ax = ax is None
+        if created_ax:
+            _, ax = plt.subplots(figsize=figsize)
+            if not show_axes:
+                ax.figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        fig = ax.figure
+
+        qubits = tuple(range(plan.n))
+        supplied_coords = site_coords is not None
+        logical_coords = resolve_site_coords(qubits, site_coords)
+        leaf_order = tuple(sorted(plan.qubit_of_leaf))
+        leaf_position = {node: index for index, node in enumerate(leaf_order)}
+        positions = {}
+
+        if supplied_coords:
+            for node, qubit in plan.qubit_of_leaf.items():
+                positions[node] = logical_coords[qubit]
+            if plan.root_qubit is not None:
+                # The root physical site shares the root node, so it is shown
+                # at the root's eventual position below.
+                positions[plan.root] = logical_coords[plan.root_qubit]
+        else:
+            for node, index in leaf_position.items():
+                positions[node] = (float(index), 0.0)
+
+        def place_internal(node):
+            if node in positions:
+                return positions[node]
+            child_points = [place_internal(child) for child in plan.children[node]]
+            x = sum(point[0] for point in child_points) / len(child_points)
+            y = max(point[1] for point in child_points) + 1.0
+            positions[node] = (x, y)
+            return positions[node]
+
+        place_internal(plan.root)
+        node_scales = _tree_node_scales(plan)
+        n_scales = max(node_scales.values(), default=0) + 1
+        # If a root qubit was supplied, its physical coordinate should not
+        # flatten the structural root into the lattice. Keep the tree center
+        # while still recording the logical root-site label at that node.
+        if plan.root_qubit is not None and not supplied_coords:
+            positions[plan.root] = (
+                positions[plan.root][0],
+                positions[plan.root][1],
+            )
+
+        if lattice:
+            for left, right in coordinate_lattice_edges(logical_coords):
+                x0, y0 = logical_coords[left]
+                x1, y1 = logical_coords[right]
+                ax.plot(
+                    (x0, x1),
+                    (y0, y1),
+                    color="#d5d9de",
+                    linewidth=1.0,
+                    alpha=0.78,
+                    zorder=1,
+                )
+
+        if show_gate_connectivity:
+            lattice_pairs = (
+                coordinate_lattice_edge_keys(logical_coords)
+                if lattice
+                else set()
+            )
+            for support in self.supports:
+                unique = tuple(dict.fromkeys(support))
+                for left, right in zip(unique, unique[1:]):
+                    if frozenset((left, right)) in lattice_pairs:
+                        continue
+                    x0, y0 = logical_coords[left]
+                    x1, y1 = logical_coords[right]
+                    ax.plot(
+                        (x0, x1),
+                        (y0, y1),
+                        color="#7e8995",
+                        linewidth=0.72,
+                        linestyle="-",
+                        alpha=0.62,
+                        zorder=1,
+                    )
+
+        # Draw the rooted tree underneath the gate ribbons.
+        for parent, children in plan.children.items():
+            for child in children:
+                x0, y0 = positions[parent]
+                x1, y1 = positions[child]
+                ax.plot(
+                    (x0, x1),
+                    (y0, y1),
+                    color="#aeb6bf",
+                    linewidth=1.05,
+                    alpha=tree_edge_alpha,
+                    zorder=2,
+                )
+
+        internal = [node for node in plan.nodes() if not plan.is_leaf(node)]
+        leaves = list(plan.leaves())
+        if color_by == "scale":
+            def draw_scale_nodes(nodes, size):
+                for scale in sorted({node_scales[node] for node in nodes}):
+                    scale_nodes = [
+                        node for node in nodes if node_scales[node] == scale
+                    ]
+                    marker = scale_markers[scale % len(scale_markers)]
+                    ax.scatter(
+                        [positions[node][0] for node in scale_nodes],
+                        [positions[node][1] for node in scale_nodes],
+                        s=size,
+                        marker=marker,
+                        color=scale_color(
+                            colormaps, scale_cmap, scale, n_scales
+                        ),
+                        edgecolors="#41464c",
+                        linewidths=0.7,
+                        zorder=5,
+                    )
+
+            draw_scale_nodes(internal, node_size * 0.82)
+            draw_scale_nodes(leaves, node_size)
+        else:
+            if internal:
+                ax.scatter(
+                    [positions[node][0] for node in internal],
+                    [positions[node][1] for node in internal],
+                    s=node_size * 0.82,
+                    color="#7b8188",
+                    edgecolors="#41464c",
+                    linewidths=0.7,
+                    zorder=5,
+                )
+            if leaves:
+                ax.scatter(
+                    [positions[node][0] for node in leaves],
+                    [positions[node][1] for node in leaves],
+                    s=node_size,
+                    c=[plan.qubit_of_leaf[node] for node in leaves],
+                    cmap=colormaps.get_cmap(cmap),
+                    vmin=0,
+                    vmax=max(1, plan.n - 1),
+                    edgecolors="#41464c",
+                    linewidths=0.7,
+                    zorder=5,
+                )
+
+        n_events = len(self.supports)
+        if show_gate_paths:
+            event_weights = tuple(self.event_weights)
+            max_weight = max(event_weights, default=1.0)
+            for event_index, (support, weight) in enumerate(
+                zip(self.supports, event_weights)
+            ):
+                support = tuple(dict.fromkeys(support))
+                event_color_value = event_color(
+                    colormaps, cmap, event_index, n_events
+                )
+                width = event_linewidth * (
+                    0.75
+                    + 0.75 * (float(weight) / max(max_weight, 1.0)) ** 0.5
+                )
+                if gate_path_curvature:
+                    side = 1.0 if event_index % 2 == 0 else -1.0
+                    magnitude = 1.0 + float((event_index // 2) % 3)
+                    route_curvature = (
+                        side * float(gate_path_curvature) * magnitude
+                    )
+                else:
+                    route_curvature = 0.0
+                paths = []
+                for left, right in zip(support, support[1:]):
+                    path = plan.node_path(
+                        plan.node_of_qubit[left], plan.node_of_qubit[right]
+                    )
+                    paths.append(path)
+                segments = set()
+                for path in paths:
+                    for left, right in zip(path, path[1:]):
+                        edge = (left, right) if left < right else (right, left)
+                        if edge in segments:
+                            continue
+                        segments.add(edge)
+                        x0, y0 = positions[left]
+                        x1, y1 = positions[right]
+                        if color_by == "scale":
+                            segment_color = scale_color(
+                                colormaps,
+                                scale_cmap,
+                                max(node_scales[left], node_scales[right]),
+                                n_scales,
+                            )
+                        else:
+                            segment_color = event_color_value
+                        ax.add_patch(
+                            FancyArrowPatch(
+                                (x0, y0),
+                                (x1, y1),
+                                arrowstyle="-",
+                                connectionstyle=(
+                                    f"arc3,rad={route_curvature:.4g}"
+                                ),
+                                linewidth=width,
+                                color=segment_color,
+                                alpha=event_alpha,
+                                zorder=3,
+                            )
+                        )
+                if color_by == "gate":
+                    for qubit in support:
+                        x, y = positions[plan.node_of_qubit[qubit]]
+                        ax.scatter(
+                            [x], [y], s=node_size * 1.25,
+                            color=[event_color_value], alpha=event_alpha,
+                            edgecolors="white", linewidths=0.5, zorder=7,
+                        )
+                if show_event_labels and support:
+                    node = plan.node_of_qubit[support[0]]
+                    x, y = positions[node]
+                    ax.text(
+                        x,
+                        y,
+                        str(event_index),
+                        color=(
+                            event_color_value
+                            if color_by == "gate"
+                            else "#59636e"
+                        ),
+                        fontsize=8,
+                        ha="center",
+                        va="center",
+                        zorder=8,
+                    )
+
+        if show_site_labels:
+            for qubit in qubits:
+                node = plan.node_of_qubit[qubit]
+                x, y = positions[node]
+                ax.annotate(
+                    f"q{qubit}",
+                    (x, y),
+                    xytext=(0, 7),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=8,
+                    color="#374151",
+                    zorder=9,
+                )
+        if show_node_ids:
+            for node in plan.nodes():
+                x, y = positions[node]
+                ax.annotate(
+                    f"n{node}",
+                    (x, y),
+                    xytext=(0, -10),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=7,
+                    color="#5b6168",
+                    zorder=9,
+                )
+
+        colorbar_count = (
+            n_events if color_by == "gate" and show_gate_paths else n_scales
+        )
+        if colorbar and colorbar_count:
+            add_order_colorbar(
+                fig,
+                ax,
+                colormaps,
+                ScalarMappable,
+                Normalize,
+                cmap if color_by == "gate" else scale_cmap,
+                colorbar_count,
+                label=(
+                    "gate stream order"
+                    if color_by == "gate"
+                    else "tree scale (leaf = 0)"
+                ),
+            )
+        title = (
+            "Tree layout finder — "
+            + ("colored gate paths" if color_by == "gate" else "scale-colored tree")
+        )
+        if show_axes:
+            if show_title:
+                ax.set_title(title)
+            ax.set_xlabel("layout x")
+            ax.set_ylabel("layout y")
+            ax.margins(0.14)
+            ax.set_aspect("equal", adjustable="datalim")
+        else:
+            finish_schematic_axes(
+                ax,
+                title=title if show_title else None,
+                margins=0.14,
+            )
+        return fig, ax
+
+    def plot_tent(
+        self,
+        plan=None,
+        *,
+        site_coords=None,
+        ax=None,
+        figsize=(8, 7),
+        cmap="turbo",
+        edge_cmap="GnBu",
+        node_cmap="YlOrRd",
+        color_by="scale",
+        edge_color="#2f80a0",
+        show_edge_arrows=False,
+        arrow_size=8.0,
+        order=True,
+        lattice=True,
+        show_gate_connectivity=True,
+        show_node_ids=False,
+        show_site_labels=False,
+        colorbar=False,
+        show_axes=False,
+        show_title=False,
+        node_size=38,
+        edge_linewidth=1.35,
+        edge_alpha=1.0,
+        vertical_spacing=None,
+    ):
+        """Plot the hierarchy as a Cotengra-style tent over the raw graph.
+
+        Physical sites and gate connectivity stay in the lower, grey raw
+        graph. Internal TTN nodes are lifted above the mean position of their
+        descendant sites, and each parent-child hierarchy edge uses one
+        uniform solid color by default. Pass ``edge_color=None`` to match
+        each incoming edge to the node it terminates at (so ``node_cmap``
+        controls both). The default has no arrows, matching Cotengra's
+        structural tent view; pass
+        ``show_edge_arrows=True`` only when parent-to-child direction is
+        needed. This is deliberately a structural
+        visualization:
+        gate-by-gate route overlays are not drawn. Set ``order=True`` to place
+        hierarchy nodes by a deterministic post-order traversal, matching the
+        ordering option in Cotengra's tent plots. Use ``color_by="order"`` if
+        the same traversal should also control the colors.
+        """
+        plt, colormaps, ScalarMappable, Normalize, _FancyArrowPatch = (
+            matplotlib_modules()
+        )
+        if plan is None:
+            plan = self.run()
+        if not isinstance(plan, TreePlan):
+            raise TypeError("plan must be a TreePlan returned by run().")
+        color_by = str(color_by).replace("-", "_").strip().lower()
+        color_by = {"level": "scale", "size": "scale"}.get(
+            color_by, color_by
+        )
+        if color_by not in {"scale", "order"}:
+            raise ValueError("color_by must be 'scale' or 'order'.")
+        try:
+            arrow_size = float(arrow_size)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "arrow_size must be a positive real number."
+            ) from exc
+        if not np.isfinite(arrow_size) or arrow_size <= 0.0:
+            raise ValueError("arrow_size must be a positive real number.")
+        created_ax = ax is None
+        if created_ax:
+            _, ax = plt.subplots(figsize=figsize)
+            if not show_axes:
+                ax.figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        fig = ax.figure
+
+        qubits = tuple(range(plan.n))
+        coords = resolve_site_coords(qubits, site_coords)
+        node_scales = _tree_node_scales(plan)
+        n_scales = max(node_scales.values(), default=0) + 1
+
+        if lattice:
+            for left, right in coordinate_lattice_edges(coords):
+                ax.plot(
+                    (coords[left][0], coords[right][0]),
+                    (coords[left][1], coords[right][1]),
+                    color="#d5d9de",
+                    linewidth=1.0,
+                    alpha=0.78,
+                    zorder=1,
+                )
+
+        if show_gate_connectivity:
+            lattice_pairs = (
+                coordinate_lattice_edge_keys(coords)
+                if lattice
+                else set()
+            )
+            for support in self.supports:
+                unique = tuple(dict.fromkeys(support))
+                for left, right in zip(unique, unique[1:]):
+                    if frozenset((left, right)) in lattice_pairs:
+                        continue
+                    ax.plot(
+                        (coords[left][0], coords[right][0]),
+                        (coords[left][1], coords[right][1]),
+                        color="#7e8995",
+                        linewidth=0.72,
+                        linestyle="-",
+                        alpha=0.62,
+                        zorder=1,
+                    )
+
+        subtree_qubits = {}
+
+        def gather_qubits(node):
+            if node in subtree_qubits:
+                return subtree_qubits[node]
+            result = []
+            if node in plan.qubit_of_leaf:
+                result.append(plan.qubit_of_leaf[node])
+            if node == plan.root and plan.root_qubit is not None:
+                result.append(plan.root_qubit)
+            for child in plan.children.get(node, ()):
+                result.extend(gather_qubits(child))
+            subtree_qubits[node] = tuple(result)
+            return subtree_qubits[node]
+
+        for node in plan.nodes():
+            gather_qubits(node)
+
+        x_span = max(
+            max(point[0] for point in coords.values())
+            - min(point[0] for point in coords.values()),
+            1.0,
+        )
+        y_max = max(point[1] for point in coords.values())
+        if vertical_spacing is None:
+            # Keep the tent compact for square 2-D lattices. The previous
+            # spacing made a 6x6 lattice grow into a very tall strip even
+            # though ``figsize`` only changes the canvas, not the geometry.
+            vertical_spacing = max(0.55, 0.16 * x_span)
+        vertical_spacing = float(vertical_spacing)
+        if vertical_spacing <= 0.0:
+            raise ValueError("vertical_spacing must be positive.")
+
+        positions = {
+            node: coords[qubit]
+            for node, qubit in plan.qubit_of_leaf.items()
+        }
+        if plan.root_qubit is not None:
+            positions[plan.root] = coords[plan.root_qubit]
+
+        internal = [node for node in plan.nodes() if not plan.is_leaf(node)]
+        if order or color_by == "order":
+            postorder = []
+
+            def visit(node):
+                for child in plan.children.get(node, ()):
+                    visit(child)
+                postorder.append(node)
+
+            visit(plan.root)
+            order_values = {node: i for i, node in enumerate(postorder)}
+            order_count = max(1, len(postorder))
+            internal_order = {
+                node: index
+                for index, node in enumerate(
+                    node for node in postorder if node in internal
+                )
+            }
+            order_span = max(1, n_scales - 1)
+            order_denominator = max(1, len(internal) - 1)
+            for node in internal:
+                sites = gather_qubits(node)
+                x = sum(coords[qubit][0] for qubit in sites) / len(sites)
+                if order:
+                    # Preserve post-order relationships without giving every
+                    # internal node a separate vertical layer. A separate
+                    # layer for all nodes makes larger 2D circuits needlessly
+                    # tall and narrow without conveying extra geometry.
+                    height = 1.0 + order_span * (
+                        internal_order[node] / order_denominator
+                    )
+                else:
+                    height = 1.0 + order_values[node] / order_count
+                y = y_max + vertical_spacing * height
+                positions[node] = (x, y)
+            n_colors = order_count if color_by == "order" else n_scales
+        else:
+            order_values = None
+            for node in internal:
+                sites = gather_qubits(node)
+                x = sum(coords[qubit][0] for qubit in sites) / len(sites)
+                y = y_max + vertical_spacing * (node_scales[node] + 1.0)
+                positions[node] = (x, y)
+            n_colors = n_scales
+
+        def node_color(node):
+            if color_by == "order":
+                return event_color(
+                    colormaps, cmap, order_values[node], n_colors
+                )
+            return scale_color(
+                colormaps, node_cmap, node_scales[node], n_colors
+            )
+
+        def hierarchy_edge_color(parent, child):
+            if edge_color is not None:
+                return edge_color
+            # ``None`` means "follow the node palette": this is intentionally
+            # the node color itself rather than a separate edge colormap, so
+            # an incoming edge and its child are visually identical.
+            return node_color(child)
+
+        for parent, children in plan.children.items():
+            for child in children:
+                x0, y0 = positions[parent]
+                x1, y1 = positions[child]
+                # The incoming edge is colored like the node it terminates at,
+                # making each scale/order layer visually self-consistent.
+                edge_color_value = hierarchy_edge_color(parent, child)
+                ax.plot(
+                    (x0, x1),
+                    (y0, y1),
+                    color=edge_color_value,
+                    linewidth=edge_linewidth,
+                    alpha=edge_alpha,
+                    zorder=2,
+                )
+                if show_edge_arrows:
+                    dx = x1 - x0
+                    dy = y1 - y0
+                    ax.add_patch(
+                        _FancyArrowPatch(
+                            (x0 + 0.42 * dx, y0 + 0.42 * dy),
+                            (x0 + 0.62 * dx, y0 + 0.62 * dy),
+                            arrowstyle="-|>",
+                            mutation_scale=arrow_size,
+                            linewidth=max(0.6, 0.75 * edge_linewidth),
+                            color=edge_color_value,
+                            shrinkA=0.0,
+                            shrinkB=0.0,
+                            zorder=3,
+                        )
+                    )
+
+        for node in plan.nodes():
+            x, y = positions[node]
+            ax.scatter(
+                [x],
+                [y],
+                s=node_size,
+                marker="o",
+                color=[node_color(node)],
+                edgecolors="#41464c",
+                linewidths=0.65,
+                zorder=4,
+            )
+
+        if show_site_labels:
+            for qubit in qubits:
+                node = plan.node_of_qubit[qubit]
+                x, y = positions[node]
+                ax.annotate(
+                    f"q{qubit}",
+                    (x, y),
+                    xytext=(0, 7),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=8,
+                    color="#374151",
+                    zorder=5,
+                )
+        if show_node_ids:
+            for node in plan.nodes():
+                x, y = positions[node]
+                ax.annotate(
+                    f"n{node}",
+                    (x, y),
+                    xytext=(0, -10),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=7,
+                    color="#5b6168",
+                    zorder=5,
+                )
+
+        if colorbar and n_colors:
+            add_order_colorbar(
+                fig,
+                ax,
+                colormaps,
+                ScalarMappable,
+                Normalize,
+                cmap if color_by == "order" else node_cmap,
+                n_colors,
+                label=(
+                    "tree order" if color_by == "order" else "tree scale"
+                ),
+            )
+
+        title = "Tree tent"
+        if show_axes:
+            if show_title:
+                ax.set_title(title)
+            ax.set_xlabel("layout x")
+            ax.set_ylabel("hierarchy height")
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.margins(0.14)
+        else:
+            finish_schematic_axes(
+                ax,
+                title=title if show_title else None,
+                margins=0.14,
+            )
+        return fig, ax
+
+    # The public default is the structural tent view. Keep the older direct
+    # route renderer private so the hierarchy cannot be mistaken for a set of
+    # gate-stream legs.
+    plot = plot_tent
+
+    def plot_rubberband(
+        self,
+        plan=None,
+        *,
+        site_coords=None,
+        ax=None,
+        figsize=(10, 8),
+        cmap="Spectral",
+        color_by="gate",
+        scale_cmap="viridis",
+        lattice=True,
+        show_gate_connectivity=True,
+        show_site_nodes=True,
+        colorbar=False,
+        show_axes=False,
+        show_title=False,
+        band_alpha=0.68,
+        band_linewidth=1.35,
+        band_padding=0.12,
+        node_size=58,
+    ):
+        """Plot hierarchical tree clusters as smooth rubberband regions.
+
+        This is the physical-lattice counterpart to Quimb's contraction-tree
+        ``plot_rubberband`` view: the lattice and gate connectivity remain
+        grey, while each non-root tree cluster is wrapped by a rounded,
+        translucent colored band. The default ``color_by="gate"`` uses a
+        ``Spectral`` post-order progression, matching Cotengra's many-color
+        rubberband view. ``color_by="scale"`` is available when one stable
+        color is wanted for each tree scale measured from the leaves.
+
+        The default presentation has no axes, site labels, or title. It
+        returns a normal Matplotlib ``(fig, ax)`` pair for further styling.
+        """
+        plt, colormaps, ScalarMappable, Normalize, _FancyArrowPatch = (
+            matplotlib_modules()
+        )
+        from matplotlib.patches import FancyBboxPatch  # noqa: PLC0415
+
+        if plan is None:
+            plan = self.run()
+        if not isinstance(plan, TreePlan):
+            raise TypeError("plan must be a TreePlan returned by run().")
+        color_by = str(color_by).replace("-", "_").strip().lower()
+        color_by = {"stream": "gate", "event": "gate", "level": "scale"}.get(
+            color_by, color_by
+        )
+        if color_by not in {"gate", "scale"}:
+            raise ValueError("color_by must be 'gate' or 'scale'.")
+        created_ax = ax is None
+        if created_ax:
+            _, ax = plt.subplots(figsize=figsize)
+            if not show_axes:
+                ax.figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        fig = ax.figure
+
+        qubits = tuple(range(plan.n))
+        coords = resolve_site_coords(qubits, site_coords)
+        node_scales = _tree_node_scales(plan)
+        n_scales = max(node_scales.values(), default=0) + 1
+
+        if lattice:
+            for left, right in coordinate_lattice_edges(coords):
+                ax.plot(
+                    (coords[left][0], coords[right][0]),
+                    (coords[left][1], coords[right][1]),
+                    color="#c7cdd3",
+                    linewidth=1.0,
+                    alpha=0.62,
+                    zorder=1,
+                )
+
+        if show_gate_connectivity:
+            lattice_pairs = (
+                coordinate_lattice_edge_keys(coords)
+                if lattice
+                else set()
+            )
+            for support in self.supports:
+                unique = tuple(dict.fromkeys(support))
+                for left, right in zip(unique, unique[1:]):
+                    if frozenset((left, right)) in lattice_pairs:
+                        continue
+                    ax.plot(
+                        (coords[left][0], coords[right][0]),
+                        (coords[left][1], coords[right][1]),
+                        color="#87919b",
+                        linewidth=0.7,
+                        linestyle="-",
+                        alpha=0.42,
+                        zorder=1,
+                    )
+
+        subtree_qubits = {}
+
+        def gather_qubits(node):
+            if node in subtree_qubits:
+                return subtree_qubits[node]
+            children = tuple(plan.children.get(node, ()))
+            if not children:
+                result = (plan.qubit_of_leaf[node],)
+            else:
+                result = tuple(
+                    qubit
+                    for child in children
+                    for qubit in gather_qubits(child)
+                )
+                if node == plan.root and plan.root_qubit is not None:
+                    result += (plan.root_qubit,)
+            subtree_qubits[node] = result
+            return result
+
+        band_nodes = []
+
+        def visit(node):
+            for child in plan.children.get(node, ()):
+                visit(child)
+            if plan.children.get(node):
+                band_nodes.append(node)
+
+        visit(plan.root)
+        n_bands = max(1, len(band_nodes))
+        for band_index, node in enumerate(band_nodes):
+            sites = tuple(dict.fromkeys(gather_qubits(node)))
+            if len(sites) < 2:
+                continue
+            points = [coords[qubit] for qubit in sites]
+            xmin = min(point[0] for point in points)
+            xmax = max(point[0] for point in points)
+            ymin = min(point[1] for point in points)
+            ymax = max(point[1] for point in points)
+            padding = band_padding + 0.012 * band_index
+            width = max(xmax - xmin, 0.16) + 2.0 * padding
+            height = max(ymax - ymin, 0.16) + 2.0 * padding
+            rounding = min(0.28, 0.45 * min(width, height))
+            if color_by == "scale":
+                color = scale_color(
+                    colormaps,
+                    scale_cmap,
+                    node_scales[node],
+                    n_scales,
+                )
+            else:
+                color = event_color(colormaps, cmap, band_index, n_bands)
+            ax.add_patch(
+                FancyBboxPatch(
+                    (xmin - padding, ymin - padding),
+                    width,
+                    height,
+                    boxstyle=f"round,pad=0,rounding_size={rounding}",
+                    fill=False,
+                    edgecolor=color,
+                    linewidth=band_linewidth,
+                    alpha=band_alpha,
+                    # Draw inner/earlier contractions above outer/later
+                    # bands, as in Cotengra, so overlapping bands remain
+                    # individually legible.
+                    zorder=3.0 + (n_bands - band_index) / n_bands,
+                )
+            )
+
+        if show_site_nodes:
+            ax.scatter(
+                [coords[qubit][0] for qubit in qubits],
+                [coords[qubit][1] for qubit in qubits],
+                s=node_size,
+                marker="o",
+                color="#858b91",
+                edgecolors="#3f454b",
+                linewidths=0.75,
+                zorder=5,
+            )
+
+        if colorbar and (n_bands if color_by == "gate" else n_scales):
+            add_order_colorbar(
+                fig,
+                ax,
+                colormaps,
+                ScalarMappable,
+                Normalize,
+                cmap if color_by == "gate" else scale_cmap,
+                n_bands if color_by == "gate" else n_scales,
+                label=(
+                    "rubberband order"
+                    if color_by == "gate"
+                    else "tree scale (leaf = 0)"
+                ),
+            )
+
+        title = "Tree rubberband"
+        if show_axes:
+            if show_title:
+                ax.set_title(title)
+            ax.set_xlabel("logical site x")
+            ax.set_ylabel("logical site y")
+            ax.set_aspect("equal", adjustable="datalim")
+            ax.margins(0.14)
+        else:
+            finish_schematic_axes(
+                ax,
+                title=title if show_title else None,
+                margins=0.14,
+            )
+        return fig, ax
+
+    plot_layout = plot

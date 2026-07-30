@@ -12,9 +12,11 @@ except ImportError:  # pragma: no cover - optional dependency
 
 __all__ = [
     "build_backend", "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
-    "register_torch_linalg", "reg_rel_svd_torch", "reg_real_svd_torch",
+    "register_torch_linalg", "register_jax_linalg", "reg_native_svd_torch",
+    "reg_native_svd_jax", "reg_rel_svd_torch", "reg_real_svd_torch",
     "reg_complex_svd_torch", "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
+    "reset_linalg_registrations",
     "reg_stop_gradient_torch", "stop_grad", "set_default_array_backend",
     "get_default_array_backend", "set_default_grad_backend",
     "get_default_grad_backend", "reset_default_backends",
@@ -316,13 +318,26 @@ def backend_jax(device="cpu", dtype=None):
     return cast_array
 
 
-def register_torch_linalg(mode="complex"):
-    """Register custom torch linalg gradients in autoray.
+def register_torch_linalg(
+    mode="complex",
+    *,
+    stabilized=False,
+    qr_rank_policy="warn",
+    qr_rank_tol_factor=1.0,
+):
+    """Register Torch linalg rules in Autoray.
 
     Parameters
     ----------
     mode : {"complex", "real"}, default="complex"
-        Which SVD/QR registrations to install.
+        Select the real or complex stabilized rule when ``stabilized=True``.
+    stabilized : bool, default=False
+        Keep native Torch SVD/QR by default. Set this to ``True`` to install
+        Pepsy's relative-regularized SVD and validated real-QR rules.
+    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+        Response to rank-deficient inputs when stabilized real QR is active.
+    qr_rank_tol_factor : float, default=1.0
+        Multiplier for the scale-aware real-QR rank threshold.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
@@ -332,14 +347,113 @@ def register_torch_linalg(mode="complex"):
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
     if mode == "complex":
-        lr.reg_rel_svd_torch()
+        if stabilized:
+            lr.reg_rel_svd_torch()
+        else:
+            lr.reg_native_svd_torch()
         lr.reg_complex_qr_torch()
         return
     if mode == "real":
-        lr.reg_real_svd_torch()
-        lr.reg_real_qr_torch()
+        if stabilized:
+            lr.reg_real_svd_torch()
+            lr.reg_real_qr_torch(
+                rank_policy=qr_rank_policy,
+                rank_tol_factor=qr_rank_tol_factor,
+            )
+        else:
+            lr.reg_native_svd_torch()
+            lr.reg_complex_qr_torch()
         return
     raise ValueError("mode must be 'complex' or 'real'")
+
+
+def register_jax_linalg(*, stabilized=False):
+    """Register native or truncation-safe JAX SVD in Autoray.
+
+    Parameters
+    ----------
+    stabilized : bool, default=False
+        Keep native thin SVD by default. Set this to ``True`` to install the
+        custom VJP that restores cotangents from Quimb fixed-rank truncation.
+    """
+    try:
+        __import__("jax")
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "register_jax_linalg requires optional dependency 'jax'. "
+            "Install it with: pip install jax jaxlib."
+        ) from exc
+    from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+    if stabilized:
+        lr.reg_complex_svd_jax()
+    else:
+        lr.reg_native_svd_jax()
+
+
+def reset_linalg_registrations(backend="all"):
+    """Restore native linalg mappings and clear Pepsy registration caches.
+
+    Parameters
+    ----------
+    backend : {"torch", "jax", "all"}, default="all"
+        Which optional backend registration cache to reset. ``"all"`` skips
+        optional backends that are not installed.
+    """
+    if backend not in {"torch", "jax", "all"}:
+        raise ValueError("backend must be one of: all, jax, torch")
+
+    if backend in {"torch", "all"}:
+        if torch is None:
+            if backend == "torch":
+                raise ImportError(
+                    "reset_linalg_registrations(backend='torch') requires "
+                    "optional dependency 'torch'."
+                )
+        else:
+            from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+            lr.reset_torch_linalg_registrations()
+
+    if backend in {"jax", "all"}:
+        try:
+            __import__("jax")
+        except ImportError:
+            if backend == "jax":
+                raise ImportError(
+                    "reset_linalg_registrations(backend='jax') requires "
+                    "optional dependency 'jax'."
+                )
+        else:
+            from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+            lr.reset_jax_linalg_registrations()
+
+
+def reg_native_svd_torch():
+    """Register native Torch thin SVD in autoray."""
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "reg_native_svd_torch requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
+    from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_native_svd_torch()
+
+
+def reg_native_svd_jax():
+    """Register native JAX thin SVD in autoray."""
+    try:
+        __import__("jax")
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "reg_native_svd_jax requires optional dependency 'jax'. "
+            "Install it with: pip install jax jaxlib."
+        ) from exc
+    from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_native_svd_jax()
 
 
 def reg_rel_svd_torch():
@@ -396,7 +510,7 @@ def reg_real_svd_torch():
 
 
 def reg_complex_qr_torch():
-    """Register complex torch QR autograd rule in autoray."""
+    """Register native Torch QR for complex inputs in autoray."""
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_complex_qr_torch requires optional dependency 'torch'. "
@@ -407,8 +521,8 @@ def reg_complex_qr_torch():
     lr.reg_complex_qr_torch()
 
 
-def reg_real_qr_torch():
-    """Register real torch QR autograd rule in autoray."""
+def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
+    """Register real Torch QR with a rank-deficiency policy."""
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_real_qr_torch requires optional dependency 'torch'. "
@@ -416,7 +530,10 @@ def reg_real_qr_torch():
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
-    lr.reg_real_qr_torch()
+    lr.reg_real_qr_torch(
+        rank_policy=rank_policy,
+        rank_tol_factor=rank_tol_factor,
+    )
 
 
 def reg_complex_svd_jax():

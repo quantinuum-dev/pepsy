@@ -56,6 +56,7 @@ from __future__ import annotations
 from copy import deepcopy
 from collections.abc import Mapping
 from numbers import Integral
+import time
 import types
 import warnings
 import autoray as ar
@@ -934,6 +935,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         sites=None,
         L=None,
         order="quality",
+        objective="locality",
         refine_passes=8,
         refine_numba=True,
         spectral_dense_max=512,
@@ -946,6 +948,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         weight_fn=None,
         weight_mode="auto",
         schmidt_max_dim=4,
+        max_operator_qubits=8,
     ):
         """Find a good 1D MPS layout for a bundled gate stream.
 
@@ -965,6 +968,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             inferred from first use in ``gate_stream`` unless ``L`` is given.
         L : int | None
             Convenience for ``sites=range(L)``.
+        objective : {"locality", "compression"}
+            ``"locality"`` minimizes support span and cut congestion using
+            event weights. ``"compression"`` ranks layouts by operator-
+            Schmidt load over the MPS cuts, with path span as a tie-breaker.
         order : str
             One of ``"quality"``/``"auto"``/``"best"``, ``"recursive"``,
             ``"input"``, ``"degree"``, ``"bfs"``, ``"spectral"``,
@@ -998,6 +1005,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             small dense gates, falling back to count weights.
         schmidt_max_dim : int
             Maximum local dimension for the optional operator-Schmidt proxy.
+        max_operator_qubits : int | None
+            Maximum support size for exact dense rank probes in the
+            compression objective. Larger or opaque operators use a
+            conservative operator-space rank bound and are marked as bounded
+            in the returned diagnostics.
 
         Returns
         -------
@@ -1010,6 +1022,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         finder = cls.LayoutFinder(gate_stream, sites=sites, L=L)
         return finder.run(
             order=order,
+            objective=objective,
             refine_passes=refine_passes,
             refine_numba=refine_numba,
             spectral_dense_max=spectral_dense_max,
@@ -1022,6 +1035,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             weight_fn=weight_fn,
             weight_mode=weight_mode,
             schmidt_max_dim=schmidt_max_dim,
+            max_operator_qubits=max_operator_qubits,
         )
 
     @classmethod
@@ -1039,6 +1053,150 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Find a layout for the optimizer's currently queued gate stream."""
 
         return self.layout_finder(sites=sites, L=L).run(**kwargs)
+
+    def select_layout_for_compression(
+        self,
+        *,
+        sites=None,
+        L=None,
+        layout_kwargs=None,
+        pilot_candidates=4,
+        pilot_steps=None,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+        run_kwargs=None,
+    ):
+        """Select an MPS layout using a bounded, state-aware pilot replay.
+
+        The finder first produces cheap static candidates with
+        ``objective="compression"``. The best ``pilot_candidates`` are then
+        replayed on independent copies of the current MPS using the real
+        execution mode, ``chi``, cutoff, and backend. The returned plan is
+        non-mutating and contains ``pilot`` diagnostics for every candidate.
+
+        This method is intentionally separate from :meth:`run`: layout
+        selection can be expensive and should be explicit in production
+        workflows. ``pilot_steps`` limits the replay prefix while preserving
+        the original optimizer and gate queue.
+        """
+        if self.mode == "exact":
+            raise ValueError(
+                "compression layout pilots require an MPS compression mode, "
+                "not mode='exact'."
+            )
+        if self._persistent_layout_plan is not None:
+            raise ValueError(
+                "compression layout pilots require an optimizer without a "
+                "persistent layout; create the pilot before apply_layout()."
+            )
+        try:
+            pilot_candidates = int(pilot_candidates)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pilot_candidates must be a positive integer.") from exc
+        if pilot_candidates < 1:
+            raise ValueError("pilot_candidates must be a positive integer.")
+        if pilot_steps is not None:
+            try:
+                pilot_steps = int(pilot_steps)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("pilot_steps must be a positive integer or None.") from exc
+            if pilot_steps < 1:
+                raise ValueError("pilot_steps must be a positive integer or None.")
+
+        finder = self.layout_finder(sites=sites, L=L)
+        kwargs = dict(layout_kwargs or {})
+        kwargs["objective"] = "compression"
+        static_plan = finder.run(**kwargs)
+        candidates = dict(static_plan.get("candidate_plans", {}))
+        if not candidates:
+            candidates = {static_plan["selected_order"]: static_plan}
+        ranked_names = sorted(
+            candidates,
+            key=lambda name: candidates[name]["stats"].get(
+                "compression_score", candidates[name]["stats"].get("score", 0.0)
+            ),
+        )[:pilot_candidates]
+
+        base_run_kwargs = dict(run_kwargs or {})
+        base_run_kwargs.setdefault("progbar", False)
+        base_run_kwargs.setdefault("layout_report", False)
+        base_run_kwargs.setdefault("cutoff", cutoff)
+        base_run_kwargs.setdefault("cutoff_mode", cutoff_mode)
+        # The selector ranks candidates by measured retained fidelity. Ensure
+        # that diagnostic trace is available even when the source optimizer
+        # was created with track_infidelity=False.
+        base_run_kwargs["track_infidelity"] = True
+        pilot_reports = {}
+        successful = []
+        for name in ranked_names:
+            trial = self.copy()
+            if pilot_steps is not None:
+                trial.G = trial.G[:pilot_steps]
+                trial.where = trial.where[:pilot_steps]
+                trial.event_types = trial.event_types[:pilot_steps]
+            started = time.perf_counter()
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    trial.run(layout=candidates[name], **base_run_kwargs)
+                elapsed = time.perf_counter() - started
+                infidelity = float(trial.infidelities[-1])
+                final_bond = int(trial.p.max_bond())
+                report = {
+                    "status": "ok",
+                    "elapsed_seconds": float(elapsed),
+                    "final_bond": final_bond,
+                    "infidelity": infidelity,
+                    "pilot_steps": len(trial.G),
+                }
+                successful.append((infidelity, final_bond, elapsed, name))
+            except Exception as exc:  # pragma: no cover - backend-specific
+                report = {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                    "pilot_steps": len(trial.G),
+                }
+            pilot_reports[name] = report
+
+        if not successful:
+            raise RuntimeError(
+                "All MPS compression layout pilot candidates failed. "
+                f"Diagnostics: {pilot_reports!r}"
+            )
+        selected_name = min(successful)[-1]
+        selected = dict(candidates[selected_name])
+        selected["selected_order"] = selected_name
+        selected["pilot"] = {
+            "objective": "compression",
+            "pilot_candidates": tuple(ranked_names),
+            "selected_order": selected_name,
+            "reports": pilot_reports,
+        }
+        selected["candidate_plans"] = candidates
+        return selected
+
+    def plot_layout(
+        self,
+        plan=None,
+        *,
+        sites=None,
+        L=None,
+        layout_kwargs=None,
+        **plot_kwargs,
+    ):
+        """Plot the current gate-stream layout and selected MPS order.
+
+        This is a convenience wrapper around
+        :meth:`MpsGateStreamLayoutFinder.plot`. It returns ``(fig, ax)`` and
+        does not mutate the optimizer or install the plotted layout. When
+        ``plan`` is omitted, the finder computes its default quality plan;
+        pass ``layout_kwargs`` to customize that search.
+        """
+        finder = self.layout_finder(sites=sites, L=L)
+        if plan is None:
+            plan = finder.run(**dict(layout_kwargs or {}))
+        return finder.plot(plan, **plot_kwargs)
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -2034,12 +2192,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         selected = plan.get("selected_order", "<unknown>")
         site_order = plan.get("site_order", plan.get("qubit_inds", ()))
         weight_mode = plan.get("weight_mode", "count")
+        objective = plan.get("objective", "locality")
         lines = [
             (
                 "MpsOptimizer layout finder: "
                 f"order={selected}, sites={len(site_order)}, "
                 f"events={stats.get('num_events', input_stats.get('num_events', 0))}, "
-                f"weight_mode={weight_mode}"
+                f"weight_mode={weight_mode}, objective={objective}"
             ),
             (
                 "  long-range events: "
@@ -2081,6 +2240,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             ),
         ]
+        if objective == "compression":
+            lines.append(
+                "  operator cut load max/total: "
+                + cls._format_layout_value(
+                    stats.get("max_operator_cut_load", 0.0)
+                )
+                + "/"
+                + cls._format_layout_value(
+                    stats.get("total_operator_cut_load", 0.0)
+                )
+                + " | bounded cut probes: "
+                + cls._format_layout_value(stats.get("rank_bounded_cuts", 0))
+            )
         return "\n".join(lines)
 
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments

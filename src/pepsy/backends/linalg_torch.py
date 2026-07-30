@@ -1,5 +1,7 @@
 """Torch-side linalg registrations with stabilized autodiff rules."""
 
+import warnings
+
 import autoray as ar
 import numpy as np
 import torch
@@ -12,6 +14,51 @@ except ImportError:  # pragma: no cover - optional dependency
 # pylint: disable=abstract-method,arguments-differ,bad-staticmethod-argument,bare-except,line-too-long,multiple-statements,not-callable,superfluous-parens,too-many-branches,too-many-locals,too-many-statements,unnecessary-semicolon,unused-variable,using-constant-test
 
 _SVD_EPS_REL = 1.0e-6
+_REGISTERED_FUNCTIONS = {}
+_QR_RANK_POLICIES = {"warn", "native", "error"}
+_QR_RANK_POLICY = "warn"
+_QR_RANK_TOL_FACTOR = 1.0
+
+
+def _same_callable(left, right):
+    """Compare plain functions and class-bound autograd methods robustly."""
+    if left is right:
+        return True
+    left_func = getattr(left, "__func__", None)
+    right_func = getattr(right, "__func__", None)
+    return (
+        left_func is not None
+        and right_func is not None
+        and left_func is right_func
+        and getattr(left, "__self__", None)
+        is getattr(right, "__self__", None)
+    )
+
+
+def _register_once(name, function):
+    """Register one Torch autoray function once per active implementation."""
+    if _same_callable(_REGISTERED_FUNCTIONS.get(name), function):
+        return
+    ar.register_function("torch", name, function)
+    _REGISTERED_FUNCTIONS[name] = function
+
+
+def _configure_qr_rank_policy(policy="warn", rank_tol_factor=1.0):
+    """Configure the real-QR response to detected rank deficiency."""
+    if policy not in _QR_RANK_POLICIES:
+        choices = ", ".join(sorted(_QR_RANK_POLICIES))
+        raise ValueError(f"rank_policy must be one of: {choices}")
+    try:
+        rank_tol_factor = float(rank_tol_factor)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("rank_tol_factor must be a positive finite number") from exc
+    if not np.isfinite(rank_tol_factor) or rank_tol_factor <= 0.0:
+        raise ValueError("rank_tol_factor must be a positive finite number")
+
+    global _QR_RANK_POLICY  # pylint: disable=global-statement
+    global _QR_RANK_TOL_FACTOR  # pylint: disable=global-statement
+    _QR_RANK_POLICY = policy
+    _QR_RANK_TOL_FACTOR = rank_tol_factor
 
 
 def safe_inverse(x, eps_abs=1.0e-12, *, eps_rel=0.0, eps_scale=None):
@@ -328,27 +375,52 @@ class SVD_real(torch.autograd.Function):
 
 
 class QR_real(torch.autograd.Function):
-    """Real-valued QR autograd function using a custom backward pass."""
+    """Real QR with a custom full-rank backward and native rank fallback."""
 
     @staticmethod
     def forward(self, A):
         Q, R = torch.linalg.qr(A)
-        self.save_for_backward(A, Q, R)
+        diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
+        scale = R.abs().amax(dim=(-2, -1))
+        tolerance = (
+            _QR_RANK_TOL_FACTOR
+            * torch.finfo(A.dtype).eps
+            * max(A.shape[-2:])
+            * scale
+        )
+        rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
+        if bool(rank_deficient.any().item()):
+            message = (
+                "QR_real detected a rank-deficient input; native Torch QR "
+                "backward may be ill-conditioned."
+            )
+            if _QR_RANK_POLICY == "error":
+                raise RuntimeError(message)
+            if _QR_RANK_POLICY == "warn":
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
+        self.save_for_backward(A, Q, R, rank_deficient)
         return Q, R
 
     @staticmethod
     def backward(self, dq, dr):
-        A, q, r = self.saved_tensors
-        if r.shape[0] == r.shape[1]:
+        A, q, r, rank_deficient = self.saved_tensors
+        if bool(rank_deficient.any().item()):
+            return _native_qr_backward(A, dq, dr)
+        m, _n = r.shape[-2:]
+        if m == _n:
             return _simple_qr_backward(q, r, dq, dr)
-        M, _N = r.shape
-        B = A[:, M:]
-        dU = dr[:, :M]
-        dD = dr[:, M:]
-        U = r[:, :M]
-        da = _simple_qr_backward(q, U, dq + B @ dD.t(), dU)
+        B = A[..., :, m:]
+        dU = dr[..., :, :m]
+        dD = dr[..., :, m:]
+        U = r[..., :, :m]
+        da = _simple_qr_backward(
+            q,
+            U,
+            dq + B @ dD.transpose(-2, -1),
+            dU,
+        )
         db = q @ dD
-        return torch.cat([da, db], 1)
+        return torch.cat([da, db], dim=-1)
 
 
 def _simple_qr_backward(q, r, dq, dr):
@@ -359,49 +431,77 @@ def _simple_qr_backward(q, r, dq, dr):
             "or full_matrices is true and ncols != nrows."
         )
 
-    qdq = q.t() @ dq
-    qdq_ = qdq - qdq.t()
-    rdr = r @ dr.t()
-    rdr_ = rdr - rdr.t()
+    qdq = q.transpose(-2, -1) @ dq
+    qdq_ = qdq - qdq.transpose(-2, -1)
+    rdr = r @ dr.transpose(-2, -1)
+    rdr_ = rdr - rdr.transpose(-2, -1)
     tril = torch.tril(qdq_ + rdr_)
 
     def _triangular_solve(x, tri):
-        return torch.linalg.solve_triangular(tri.T, x.T, upper=True).T
+        # Solve with the upper-triangular R factor. Using R.T here gives the
+        # wrong reverse-mode rule and does not generalize to batched inputs.
+        return torch.linalg.solve_triangular(
+            tri,
+            x.transpose(-2, -1),
+            upper=True,
+        ).transpose(-2, -1)
 
     grad_a = q @ (dr + _triangular_solve(tril, r))
     grad_b = _triangular_solve(dq - q @ qdq, r)
     return grad_a + grad_b
 
 
+def _native_qr_backward(A, dq, dr):
+    """Recompute native Torch QR to obtain a reliable VJP fallback."""
+    with torch.enable_grad():
+        replay = A.detach().requires_grad_(True)
+        q, r = torch.linalg.qr(replay)
+        dq = torch.zeros_like(q) if dq is None else dq
+        dr = torch.zeros_like(r) if dr is None else dr
+        return torch.autograd.grad(
+            (q, r),
+            replay,
+            (dq, dr),
+        )[0]
+
+
 class QR_complex(torch.autograd.Function):
-    """Complex-valued QR autograd function using Hermitian symmetrization."""
+    """Complex-valued QR wrapper using native Torch's conjugate-aware VJP."""
 
     @staticmethod
     def forward(ctx, A):
         Q, R = torch.linalg.qr(A)
-        ctx.save_for_backward(A, Q, R)
+        ctx.save_for_backward(A)
         return Q, R
 
     @staticmethod
     def backward(ctx, dQ, dR):
-        _A, Q, R = ctx.saved_tensors
+        (A,) = ctx.saved_tensors
+        return _native_qr_backward(A, dQ, dR)
 
-        Qh = Q.conj().transpose(-2, -1)
-        Rh = R.conj().transpose(-2, -1)
 
-        M = R @ dR.conj().transpose(-2, -1) - Qh @ dQ
-        sym_h_M = 0.5 * (M + M.conj().transpose(-2, -1))
-        R_inv_h = torch.linalg.solve(
-            Rh,
-            torch.eye(Rh.size(-1), dtype=R.dtype, device=R.device),
-        )
-        dA = (dQ + Q @ sym_h_M) @ R_inv_h
-        return dA
+def _native_svd(A, *args, **kwargs):
+    """Use native Torch SVD with the thin-factor default expected by Pepsy."""
+    kwargs.setdefault("full_matrices", False)
+    return torch.linalg.svd(A, *args, **kwargs)
+
+
+def reg_native_svd_torch():
+    """Register native Torch SVD with Pepsy's thin-factor default."""
+    _register_once("linalg.svd", _native_svd)
+
+
+def reset_torch_linalg_registrations():
+    """Restore native Torch SVD/QR mappings and clear Pepsy's cache."""
+    _REGISTERED_FUNCTIONS.clear()
+    _configure_qr_rank_policy()
+    reg_native_svd_torch()
+    reg_complex_qr_torch()
 
 
 def reg_rel_svd_torch():
     """Register the relative-regularized torch SVD rule in autoray."""
-    ar.register_function("torch", "linalg.svd", SVD.apply)
+    _register_once("linalg.svd", SVD.apply)
 
 
 def reg_complex_svd_torch():
@@ -415,22 +515,36 @@ def reg_complex_svd_torch():
 
 def reg_real_svd_torch():
     """Register the real torch SVD autograd implementation in autoray."""
-    ar.register_function("torch", "linalg.svd", SVD_real.apply)
+    _register_once("linalg.svd", SVD_real.apply)
 
 
-def reg_real_qr_torch():
-    """Register the real torch QR autograd implementation in autoray."""
-    ar.register_function("torch", "linalg.qr", QR_real.apply)
+def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
+    """Register real QR with a configurable rank-deficiency policy."""
+    _configure_qr_rank_policy(rank_policy, rank_tol_factor)
+    _register_once("linalg.qr", QR_real.apply)
 
 
 def reg_complex_qr_torch():
-    """Register the complex torch QR autograd implementation in autoray."""
-    ar.register_function("torch", "linalg.qr", QR_complex.apply)
+    """Register native Torch QR for complex inputs.
+
+    The explicit :class:`QR_complex` compatibility wrapper is safe but
+    recomputes native QR during its backward pass, so Autoray uses native QR
+    directly for the faster default path.
+    """
+    _register_once("linalg.qr", torch.linalg.qr)
+
+
+def _stop_gradient_torch(x):
+    """Return a detached, independent Torch tensor."""
+    return x.detach().clone()
 
 
 def reg_stop_gradient_torch():
     """Register torch stop-gradient helper in autoray."""
-    ar.register_function("torch", "stop_gradient", lambda x: x.detach().clone())
+    _register_once(
+        "stop_gradient",
+        _stop_gradient_torch,
+    )
 
 
 def stop_grad(x):
