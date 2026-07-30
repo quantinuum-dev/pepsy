@@ -241,6 +241,110 @@ def test_mps_optimizer_casts_submpo_stream_arrays_to_torch_state_backend():
     assert all(isinstance(tensor.data, torch.Tensor) for tensor in optimizer.p.tensors)
 
 
+def test_mps_optimizer_backend_diagnostics_and_late_gate_conversion():
+    """Backend checks inspect every gate, not only the first stream payload."""
+    torch = pytest.importorskip("torch")
+
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    to_backend = py.backend_torch(dtype=torch.complex128, device="cpu")
+    state.apply_to_arrays(to_backend)
+    matching = to_backend(np.eye(2, dtype=complex))
+    foreign = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    optimizer = py.MpsOptimizer(
+        state,
+        gates=[],
+        chi=2,
+        mode="mpo",
+        inplace=True,
+    )
+
+    assert optimizer.backend_info() == {
+        "backend": "torch",
+        "dtype": "complex128",
+        "device": "cpu",
+    }
+    assert optimizer.backend == "torch"
+    with pytest.warns(UserWarning, match="converted a gate payload"):
+        prepared = optimizer._prepare_gate_stream_backend(
+            [matching, foreign], ["gate", "gate"]
+        )
+    assert prepared[0] is matching
+    assert isinstance(prepared[1], torch.Tensor)
+
+
+def test_mps_optimizer_rejects_mixed_state_backends():
+    """All live MPS tensors must agree on backend, dtype, and device."""
+    torch = pytest.importorskip("torch")
+
+    state = qtn.MPS_computational_state("00", dtype="complex128")
+    state[0].modify(data=torch.as_tensor(state[0].data, dtype=torch.complex128))
+    with pytest.raises(TypeError, match="one compatible backend"):
+        py.MpsOptimizer(state, gates=[], chi=2, mode="mpo")
+
+
+def test_mps_optimizer_reports_symmray_block_backend():
+    """Symmray diagnostics retain the underlying Torch block backend."""
+    pytest.importorskip("symmray")
+    torch = pytest.importorskip("torch")
+
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    state = py.ps_to_mps(
+        3,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0)),
+        seed=1,
+        dtype="complex128",
+    )
+    state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
+    optimizer = py.MpsOptimizer(state, gates=[], chi=2, mode="mpo")
+
+    assert optimizer.backend_info() == {
+        "backend": "symmray",
+        "dtype": "complex128",
+        "device": "cpu",
+        "array_backend": "torch",
+    }
+
+
+def test_mps_optimizer_converts_symmray_submpo_blocks_to_state_backend():
+    """Symmray sub-MPO copies preserve charge metadata while changing blocks."""
+    pytest.importorskip("symmray")
+    torch = pytest.importorskip("torch")
+
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    state = py.ps_to_mps(
+        3,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0)),
+        seed=1,
+        dtype="complex128",
+    )
+    state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
+    submpo = qtn.MatrixProductOperator.from_dense(
+        fermion.hopping_gate(0.01, t=1.0),
+        dims=(4, 4),
+        sites=(0, 1),
+        L=3,
+    )
+    optimizer = py.MpsOptimizer(state, gates=[], chi=2, mode="mpo")
+
+    with pytest.warns(UserWarning, match="converted a sub-MPO payload"):
+        converted = optimizer._prepare_gate_stream_backend(
+            [submpo], ["submpo"]
+        )[0]
+    assert converted is not submpo
+    assert all(tensor.data.backend == "torch" for tensor in converted.tensors)
+    assert all(tensor.data.backend == "numpy" for tensor in submpo.tensors)
+
+
 def test_mps_optimizer_accepts_perm_mode():
     """Perm mode should expose an identity logical-to-physical ordering initially."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")

@@ -47,7 +47,12 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
-from ...backends import infer_backend_converter_from_sample, to_float
+from ...backends import (
+    backend_infer,
+    infer_backend_converter_from_sample,
+    infer_backend_signature,
+    to_float,
+)
 from ...operators.gates import _normalize_gate_entries
 from ..mps.optimizer import (
     _control_event_parts as _mps_control_event_parts,
@@ -149,13 +154,7 @@ def _is_symmray_array(array):
 
 def _array_backend_signature(array):
     """Return comparable backend / dtype / device metadata for an array."""
-    backend = ar.infer_backend(array)
-    try:
-        dtype = ar.get_dtype_name(array)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        dtype = str(getattr(array, "dtype", None))
-    device = getattr(array, "device", None)
-    return backend, str(dtype), None if device is None else str(device)
+    return infer_backend_signature(array)
 
 
 def _operator_schmidt_rank(op, where, left_where):
@@ -648,6 +647,7 @@ class TreeOptimizer:
         else:
             self._install_tn(tn)
         self._thread_ind = None
+        self.backend_info()
 
         if run and self.G:
             if (
@@ -900,29 +900,19 @@ class TreeOptimizer:
     @staticmethod
     def _state_backend_info(state):
         """Validate and describe the common backend of every state tensor."""
-        tensor_map = getattr(state, "tensor_map", None)
-        if not tensor_map:
-            raise ValueError("initial state contains no tensors.")
-        data = [tensor.data for tensor in tensor_map.values()]
-        signature = _array_backend_signature(data[0])
-        mismatched = []
-        for array in data[1:]:
-            candidate = _array_backend_signature(array)
-            if candidate != signature:
-                mismatched.append(candidate)
-        if mismatched:
-            raise TypeError(
-                "Initial state tensors must use one compatible backend, dtype, "
-                "and device. Convert every tensor with the same backend "
-                "converter before constructing TreeOptimizer; found "
-                f"{signature!r} and {mismatched[0]!r}."
-            )
-        backend, dtype, device = signature
-        return {"backend": backend, "dtype": dtype, "device": device}
+        return backend_infer(state)
 
     def backend_info(self):
         """Return the common backend, dtype, and device of the live TTN."""
-        return self._state_backend_info(self.tn)
+        info = self._state_backend_info(self.tn)
+        # Keep a state-derived public diagnostic in addition to the detailed
+        # ``backend_info`` mapping.  It is refreshed on every query so direct
+        # caller mutations cannot leave a stale optimizer backend label.
+        self.backend = info["backend"]
+        self.backend_dtype = info["dtype"]
+        self.backend_device = info["device"]
+        self.array_backend = info.get("array_backend", info["backend"])
+        return info
 
     def _warn_backend_conversion(self, source_signature, target_signature):
         """Warn once for one explicit source/target backend conversion."""
@@ -958,9 +948,7 @@ class TreeOptimizer:
         """
         like = self._state_like()
         state_info = self.backend_info()
-        target_signature = (
-            state_info["backend"], state_info["dtype"], state_info["device"]
-        )
+        target_signature = _array_backend_signature(like)
         source_signature = _array_backend_signature(array)
         if source_signature == target_signature:
             return array
@@ -969,6 +957,12 @@ class TreeOptimizer:
         # array backends/dtypes still receive the transfer/cast warning.
         if warn:
             self._warn_backend_conversion(source_signature, target_signature)
+        if state_info["backend"] == "symmray" and source_signature[0] != "symmray":
+            raise TypeError(
+                "Cannot convert a dense gate/operator payload into a native "
+                "Symmray TTN without charge and fermionic metadata. Build the "
+                "payload as a Symmray array on the target U1/U1U1 backend."
+            )
         if state_info["backend"] == "numpy":
             return ar.to_numpy(array)
         return self._backend_converter(like)(array)
@@ -976,67 +970,53 @@ class TreeOptimizer:
     def _prepare_gate_stream_backend(self, payloads, event_types):
         """Prepare one executable gate/sub-MPO stream for the live backend.
 
-        Ordinary gates are expected to be backend-homogeneous. One
-        representative gate decides whether the whole gate stream needs
-        conversion; matching payloads are returned by identity. Sub-MPOs use
-        one representative tensor and ``apply_to_arrays`` on a copied network,
-        preserving the caller's labels and bonds.
+        Every ordinary gate and every tensor in every sub-MPO is checked;
+        matching payloads are returned by identity. Foreign sub-MPOs use
+        ``apply_to_arrays`` on a copied network, preserving the caller's
+        labels and operator bonds.
         """
         if not payloads:
             return payloads
 
         like = self._state_like()
-        state_info = self.backend_info()
-        target_signature = (
-            state_info["backend"], state_info["dtype"], state_info["device"]
-        )
+        self.backend_info()
+        target_signature = _array_backend_signature(like)
         converter = None
         prepared = list(payloads)
 
-        gate_index = None
-        gate_signature = None
         for index, (payload, event_type) in enumerate(
             zip(payloads, event_types)
         ):
             if event_type != "gate":
                 continue
-            gate_index = index
             try:
-                gate_signature = _array_backend_signature(payload)
-            except (AttributeError, TypeError, ValueError):
-                gate_signature = None
-            break
-
-        if gate_index is not None:
-            gate_needs_conversion = gate_signature != target_signature
-            if gate_needs_conversion:
-                if gate_signature is not None:
-                    self._warn_backend_conversion(
-                        gate_signature, target_signature
-                    )
-                converter = self._backend_converter(like)
-                for index, event_type in enumerate(event_types):
-                    if event_type == "gate":
-                        prepared[index] = converter(payloads[index])
+                source_signature = _array_backend_signature(payload)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                source_signature = None
+            if source_signature == target_signature:
+                continue
+            if source_signature is not None:
+                self._warn_backend_conversion(source_signature, target_signature)
+            prepared[index] = self._as_state_backend(payload)
 
         for index, (payload, event_type) in enumerate(
             zip(payloads, event_types)
         ):
             if event_type != "submpo":
                 continue
-            tensor = next(iter(getattr(payload, "tensors", ())), None)
-            if tensor is None:
+            tensors = tuple(getattr(payload, "tensors", ()))
+            if not tensors:
                 continue
-            try:
-                source_signature = _array_backend_signature(tensor.data)
-            except (AttributeError, TypeError, ValueError):
-                source_signature = None
-            if source_signature == target_signature:
+            source_signatures = {
+                _array_backend_signature(tensor.data) for tensor in tensors
+            }
+            if source_signatures == {target_signature}:
                 continue
-            if source_signature is not None:
-                self._warn_backend_conversion(
-                    source_signature, target_signature
-                )
+            for source_signature in source_signatures:
+                if source_signature != target_signature:
+                    self._warn_backend_conversion(
+                        source_signature, target_signature
+                    )
             if converter is None:
                 converter = self._backend_converter(like)
             copied = payload.copy()
@@ -1050,7 +1030,7 @@ class TreeOptimizer:
                     # when their dense operator is materialized.
                     continue
                 for op_tensor in tensor_map.values():
-                    op_tensor.modify(data=converter(op_tensor.data))
+                    op_tensor.modify(data=self._as_state_backend(op_tensor.data))
             prepared[index] = copied
 
         return prepared

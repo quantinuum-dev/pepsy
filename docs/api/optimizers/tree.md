@@ -620,6 +620,14 @@ Mixed-backend initial states fail immediately because there is no unambiguous
 safe execution backend. Internal Pauli/projector tensors follow the state
 backend automatically.
 
+The same diagnostic is reflected by the state-derived `backend`,
+`backend_dtype`, `backend_device`, and `array_backend` attributes. The
+complete gate stream is checked before replay, including every tensor in each
+sub-MPO; mismatches are converted on execution copies and warned about without
+mutating queued inputs. Native Symmray states report `backend="symmray"` plus
+the underlying NumPy, Torch, or CuPy `array_backend`, preserving U1/U1U1 charge
+and fermionic metadata.
+
 ```python
 import pepsy as py
 import torch

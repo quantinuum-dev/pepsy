@@ -41,6 +41,7 @@ _SYMBOL_MODULES = {
     "peps_norm": ".boundary",
     "peps_normalize": ".boundary",
     "backend_cupy": ".backends",
+    "backend_infer": ".backends",
     "backend_jax": ".backends",
     "backend_numpy": ".backends",
     "backend_torch": ".backends",
@@ -281,6 +282,7 @@ if TYPE_CHECKING:
     from .bp import gauge_all, gauge_all_simple, one_norm_bp  # noqa: F401
     from . import backends, boundary, bp, experimental, fitting, operators, optimizers, sampling, solvers, tensors, vmc  # noqa: F401
     from .backends import (  # noqa: F401
+        backend_infer,
         get_default_array_backend,
         get_default_grad_backend,
         build_backend,

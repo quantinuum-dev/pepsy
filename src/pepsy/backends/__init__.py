@@ -3,8 +3,10 @@
 from importlib import import_module
 
 from .convert import (
+    backend_infer,
     dispatch_backend_converter,
     infer_backend_and_dtype,
+    infer_backend_signature,
     infer_backend_converter_from_sample,
     resolve_backend_sample_data,
     resolve_backend_sample_data_from_tn,
@@ -25,6 +27,7 @@ from .config import (
 )
 
 __all__ = [
+    "backend_infer",
     "build_backend",
     "backend_cupy",
     "backend_jax",
@@ -32,6 +35,7 @@ __all__ = [
     "backend_torch",
     "dispatch_backend_converter",
     "infer_backend_and_dtype",
+    "infer_backend_signature",
     "infer_backend_converter_from_sample",
     "resolve_backend_sample_data",
     "resolve_backend_sample_data_from_tn",

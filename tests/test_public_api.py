@@ -52,7 +52,7 @@ _EXPECTED_IN_ALL = [
     "cnot", "cx", "cy", "cz", "swap", "iswap", "phase", "u1", "u2",
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "hrs_to_mps", "hrs_to_peps", "hrs_to_ttn", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
-    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "make_numpy_array_caster", "to_float", "SweepOptimizer",
+    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "make_numpy_array_caster", "backend_infer", "to_float", "SweepOptimizer",
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult",
     "PepsBpSampler", "MpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "one_norm_bp", "tn_fidelity", "tn_norm",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
@@ -119,7 +119,7 @@ def test_internal_symbols_not_exported():
 _CALLABLE_EXPORTS = [
     "contract_boundary", "contract_flat", "build_bra_ket", "normalize", "peps_normalize",
     "boundary_norm", "peps_norm", "infidelity", "peps_infidelity", "peps_fidelity",
-    "to_float", "gauge_all", "gauge_all_simple", "one_norm_bp",
+    "backend_infer", "to_float", "gauge_all", "gauge_all_simple", "one_norm_bp",
     "GlobalOptimizer", "FIT", "tns_align", "measure_obs",
     "build_pepo_from_gates", "build_mpo_from_gates", "pauli",
     "x", "y", "z", "s", "sdg", "t", "tdg", "h", "hadamard",

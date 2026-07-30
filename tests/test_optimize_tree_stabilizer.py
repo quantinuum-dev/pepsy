@@ -424,6 +424,11 @@ def test_tree_stab_torch_backend_matches_numpy():
     inherited = pepsy.TreeStabOptimizer(
         native_state, max_dense_cap_qubits=4
     )
+    assert inherited.backend == "torch"
+    assert inherited.backend_dtype == "complex128"
+    assert inherited.backend_device == "cpu"
+    with pytest.warns(UserWarning, match="gate/operator payload"):
+        inherited.apply([(np.diag([1.0, np.exp(0.1j)]), 0)])
     inherited.cap(1, [1.0, 0.0])
     assert inherited.backend_info()["backend"] == "torch"
     assert inherited.validate_isometry_metadata() is inherited

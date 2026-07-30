@@ -22,6 +22,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...backends import infer_backend_signature
 from ..stabilizer_tn.mps_stab_optimizer import (
     DeferredInjectionRecord,
     DeferredInjectionReport,
@@ -872,6 +873,7 @@ class TreeStabOptimizer:
         self.frame_layout_events = tuple(frame_events)
         self.stim_plan = None
         self.stim_sample = None
+        self.backend_info()
 
     @classmethod
     def from_bits(cls, bits, **kwargs):
@@ -1556,6 +1558,13 @@ class TreeStabOptimizer:
         submpo_parts = submpo_event_parts(entry, normalize_where=True)
         if submpo_parts is not None:
             mpo, where = submpo_parts
+            # Convert every operator tensor once at the stream boundary. The
+            # ordinary TreeOptimizer helper copies foreign MPOs, preserving
+            # caller ownership and avoiding repeated per-tensor conversions in
+            # the native subtree path.
+            mpo = self._tree._prepare_gate_stream_backend(
+                [mpo], ["submpo"]
+            )[0]
             self._tree.apply_submpo(mpo, where)
             return
         if isinstance(entry, (tuple, list)) and entry:
@@ -1648,9 +1657,23 @@ class TreeStabOptimizer:
                 raise ValueError(f"Unknown gate name {head!r} in stream entry {entry!r}.")
             if len(entry) != 2:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-            self._apply_matrix(entry[0], entry[1])
+            gate = entry[0]
+            self._diagnose_gate_backend(gate)
+            self._apply_matrix(gate, entry[1])
             return
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
+
+    def _diagnose_gate_backend(self, gate):
+        """Warn when an explicit matrix is foreign to the coefficient TTN."""
+        target = self._tree._state_like()
+        if target is None:
+            return
+        source_signature = infer_backend_signature(gate)
+        target_signature = infer_backend_signature(target)
+        if source_signature != target_signature:
+            self._tree._warn_backend_conversion(
+                source_signature, target_signature
+            )
 
     def _apply_matrix(self, gate, where):
         where = _normalize_sites(where)
@@ -3554,7 +3577,13 @@ class TreeStabOptimizer:
 
     def backend_info(self):
         """Return the coefficient TTN backend, dtype, and device."""
-        return self._tree.backend_info()
+        info = self._tree.backend_info()
+        self.backend = info["backend"]
+        self.backend_dtype = info["dtype"]
+        self.backend_device = info["device"]
+        self.array_backend = info.get("array_backend", info["backend"])
+        self.dtype = info["dtype"]
+        return info
 
     def normalize(self):
         """Normalize the coefficient TTN and return ``self``.

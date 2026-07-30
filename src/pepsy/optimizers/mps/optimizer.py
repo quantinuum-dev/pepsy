@@ -62,6 +62,11 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...backends import (
+    backend_infer,
+    infer_backend_converter_from_sample,
+    infer_backend_signature,
+)
 from ...fitting.local import FIT
 from ...operators.gates import (
     _normalize_gate_entries,
@@ -85,6 +90,11 @@ __all__ = [
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
 _NORM_INCLUDES_EXPONENT_CACHE = {}
+
+
+def _array_backend_signature(array):
+    """Return comparable backend / dtype / device metadata for an array."""
+    return infer_backend_signature(array)
 
 
 def _normalize_event_name(name):
@@ -1090,7 +1100,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._unitary_initial_norm = None
         self._unitary_previous_norm = None
         self._unitary_global_norm_tracking = False
-        self._backend_mismatch_warned = False
+        self._backend_conversion_warnings = set()
+        self.backend = None
+        self.backend_dtype = None
+        self.backend_device = None
+        self.array_backend = None
+        self.backend_info()
         self._init_canonicalization()
 
     def _info_for_state(self, p, info=None):
@@ -1317,7 +1332,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def set_p(self, p):
         """Assign a new state and reset canonicalization metadata."""
-        self.p = self._install_represented_norm(p if self.inplace else p.copy())
+        new_p = self._install_represented_norm(p if self.inplace else p.copy())
+        # Validate before replacing the live state so a mixed-backend input
+        # cannot leave this optimizer half-updated after a failed assignment.
+        self._state_backend_info_for(new_p)
+        self.p = new_p
         self.qubits = list(range(int(getattr(self.p, "L", 0))))
         self.logical_order = list(self.qubits)
         self._persistent_layout_plan = None
@@ -1328,7 +1347,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._su_gauges_state = None
         self._su_force_regauge = self.mode == "su"
         self.p_ungauged = None
-        self._backend_mismatch_warned = False
+        self._backend_conversion_warnings = set()
+        self.backend_info()
         self._init_canonicalization()
 
     def normalize(self, eps=1e-15, insert=None):
@@ -1397,7 +1417,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied._unitary_initial_norm = self._unitary_initial_norm
         copied._unitary_previous_norm = self._unitary_previous_norm
         copied._unitary_global_norm_tracking = self._unitary_global_norm_tracking
-        copied._backend_mismatch_warned = self._backend_mismatch_warned
+        copied._backend_conversion_warnings = set(
+            self._backend_conversion_warnings
+        )
         copied._su_gauges_supplied = True
         copied._su_gauges_ready = self._su_gauges_ready
         copied._su_gauges_state = copied.p if self._su_gauges_ready else None
@@ -2726,38 +2748,59 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return tensor.data
         return None
 
+    @staticmethod
+    def _state_backend_info_for(state):
+        """Validate and describe the common backend of an MPS-like state."""
+        return backend_infer(state)
+
+    def backend_info(self):
+        """Return the state-derived backend, dtype, and device diagnostics."""
+        info = self._state_backend_info_for(self.p)
+        self.backend = info["backend"]
+        self.backend_dtype = info["dtype"]
+        self.backend_device = info["device"]
+        self.array_backend = info.get("array_backend", info["backend"])
+        return info
+
+    def _warn_backend_conversion(self, source_signature, target_signature, *, kind):
+        """Warn once for one explicit stream source/target conversion."""
+        warning_key = (kind, source_signature, target_signature)
+        if (
+            source_signature[0] != "builtins"
+            and warning_key not in self._backend_conversion_warnings
+        ):
+            self._backend_conversion_warnings.add(warning_key)
+            warnings.warn(
+                f"MpsOptimizer converted a {kind} payload from "
+                f"backend/dtype/device {source_signature!r} to the live MPS "
+                f"backend/dtype/device {target_signature!r}; provide matching "
+                f"{kind} payloads to avoid this conversion.",
+                UserWarning,
+                stacklevel=3,
+            )
+
     def _to_state_backend(self, array):
-        """Return ``array`` cast to ``self.p``'s backend and complex dtype."""
+        """Return ``array`` cast to the backend and dtype owned by ``self.p``."""
         like = self._state_backend_like()
         if like is None:
             return np.asarray(array, dtype=complex)
-        # Avoid any Autoray conversion for an already-compatible payload. This
-        # is important for Symmray, whose backend intentionally does not expose
-        # a generic ``array`` constructor, and keeps the common matching-gate
-        # path allocation-free for every backend.
-        try:
-            if (
-                ar.infer_backend(array) == ar.infer_backend(like)
-                and getattr(array, "dtype", None) == getattr(like, "dtype", None)
-            ):
-                return array
-        except (AttributeError, TypeError, ValueError):
-            pass
-        dtype = getattr(like, "dtype", complex)
-        if "complex" not in str(dtype):
-            dtype = getattr(
-                ar.do("array", np.asarray(1.0j), like=like), "dtype", complex
-            )
-        if (
-            getattr(array, "device", None) == getattr(like, "device", None)
-            and getattr(array, "dtype", None) == dtype
-        ):
+        target_signature = _array_backend_signature(like)
+        source_signature = _array_backend_signature(array)
+        if source_signature == target_signature:
             return array
-        # ``np.asarray`` would try to materialize a CUDA/Torch gate on the CPU.
-        # Let autoray move/cast any foreign array directly to the MPS backend.
-        # The final astype also preserves the complex dtype of the live state.
-        arr = ar.do("array", array, like=like)
-        return ar.do("astype", arr, dtype)
+        if target_signature[0] == "symmray" and source_signature[0] != "symmray":
+            raise TypeError(
+                "Cannot convert a dense gate/operator payload into a native "
+                "Symmray MPS without charge and fermionic metadata. Build the "
+                "payload as a Symmray array on the target U1/U1U1 backend."
+            )
+        converter = infer_backend_converter_from_sample(like)
+        if converter is not None:
+            return converter(array)
+        if target_signature[0] == "numpy":
+            return ar.to_numpy(array)
+        # Keep the old Autoray fallback for optional/custom dense backends.
+        return ar.do("array", array, like=like)
 
     def to_backend(self, array):
         """Return ``array`` on the backend currently owned by ``self.p``.
@@ -2772,94 +2815,42 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Prepare gate and sub-MPO payloads for the live MPS backend lazily.
 
         Gate streams are commonly authored as NumPy arrays even when the live
-        MPS uses Torch, JAX, CuPy, or another Autoray backend. The fast path in
-        :meth:`_to_state_backend` returns an already-compatible payload
-        unchanged, so matching streams incur no array copy. One representative
-        gate is used for the stream-level backend decision. Explicit sub-MPO
-        payloads are copied and converted with ``apply_to_arrays`` when needed,
-        preserving their tensor labels and operator bonds.
+        MPS uses Torch, JAX, CuPy, or a Symmray block backend. Every ordinary
+        gate and every tensor in every sub-MPO is checked; matching payloads
+        are returned by identity, while foreign payloads are copied or cast
+        without mutating the public queue.
         """
         if not gates:
             return gates
         like = self._state_backend_like()
-        like_backend = None
-        like_dtype = None
-        if like is not None:
-            try:
-                like_backend = ar.infer_backend(like)
-            except (AttributeError, TypeError, ValueError):
-                pass
-            like_dtype = getattr(like, "dtype", None)
-
-        # Gate streams are expected to be backend-homogeneous. Inspect one
-        # ordinary gate, then apply that decision to the whole executable
-        # segment so matching streams are left entirely untouched.
-        gate_needs_conversion = like_backend is None
-        gate_backend = None
-        if like_backend is not None:
-            for candidate, event_type in zip(gates, event_types):
-                if event_type != "gate":
-                    continue
-                try:
-                    gate_backend = ar.infer_backend(candidate)
-                    gate_needs_conversion = (
-                        gate_backend != like_backend
-                        or getattr(candidate, "dtype", None) != like_dtype
-                    )
-                except (AttributeError, TypeError, ValueError):
-                    gate_needs_conversion = True
-                break
-
-        if (
-            gate_needs_conversion
-            and gate_backend is not None
-            and gate_backend != like_backend
-            and not self._backend_mismatch_warned
-        ):
-            warnings.warn(
-                "MpsOptimizer converted a gate payload from backend "
-                f"{gate_backend!r} to the live MPS backend "
-                f"{like_backend!r}; provide matching gate payloads to "
-                "avoid this conversion.",
-                UserWarning,
-                stacklevel=3,
-            )
-            self._backend_mismatch_warned = True
-
+        if like is None:
+            return gates
+        target_signature = _array_backend_signature(like)
         prepared = []
+        stream_converter = infer_backend_converter_from_sample(like)
         for gate, event_type in zip(gates, event_types):
             if event_type == "gate":
-                if gate_needs_conversion:
+                source_signature = _array_backend_signature(gate)
+                if source_signature != target_signature:
+                    self._warn_backend_conversion(
+                        source_signature, target_signature, kind="gate"
+                    )
                     gate = self.to_backend(gate)
-            elif event_type == "submpo" and like_backend is not None:
+            elif event_type == "submpo":
                 # ``apply_to_arrays`` changes only the raw tensor payloads,
                 # unlike rebuilding an MPO, which can lose custom labels or
                 # operator bonds. Keep the caller's stream immutable by
                 # applying it to a shallow network copy.
-                # Tensor-network payloads are expected to use one backend and
-                # dtype throughout, so inspect one representative tensor only.
-                tensor = next(iter(getattr(gate, "tensors", ())), None)
-                if tensor is None:
-                    needs_conversion = False
-                else:
-                    array = tensor.data
-                    try:
-                        needs_conversion = (
-                            ar.infer_backend(array) != like_backend
-                            or getattr(array, "dtype", None) != like_dtype
-                        )
-                    except (AttributeError, TypeError, ValueError):
-                        needs_conversion = True
-                if needs_conversion:
-                    if not self._backend_mismatch_warned:
-                        warnings.warn(
-                            "MpsOptimizer converted a sub-MPO payload to the "
-                            f"live MPS backend {like_backend!r}; provide matching "
-                            "sub-MPO payloads to avoid this conversion.",
-                            UserWarning,
-                            stacklevel=3,
-                        )
-                        self._backend_mismatch_warned = True
+                tensors = tuple(getattr(gate, "tensors", ()))
+                source_signatures = {
+                    _array_backend_signature(tensor.data) for tensor in tensors
+                }
+                if source_signatures and source_signatures != {target_signature}:
+                    for source_signature in source_signatures:
+                        if source_signature != target_signature:
+                            self._warn_backend_conversion(
+                                source_signature, target_signature, kind="sub-MPO"
+                            )
                     gate = gate.copy()
                     apply_to_arrays = getattr(gate, "apply_to_arrays", None)
                     if not callable(apply_to_arrays):
@@ -2867,7 +2858,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "sub-MPO payloads must provide apply_to_arrays() "
                             "for backend conversion."
                         )
-                    apply_to_arrays(self.to_backend)
+                    apply_to_arrays(stream_converter or self.to_backend)
             prepared.append(gate)
         return prepared
 

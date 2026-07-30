@@ -2,12 +2,28 @@
 
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 
 import pepsy
 
 
 def test_to_float_is_public_backend_helper():
     assert pepsy.to_float is pepsy.backends.to_float
+
+
+def test_backend_infer_is_available_at_the_high_level_and_for_mps():
+    """The shared backend contract accepts arrays and tensor networks."""
+    assert pepsy.backend_infer is pepsy.backends.backend_infer
+
+    array_info = pepsy.backend_infer(np.ones(2, dtype=np.complex128))
+    assert array_info["backend"] == "numpy"
+    assert array_info["dtype"] == "complex128"
+
+    mps_info = pepsy.backend_infer(
+        qtn.MPS_computational_state("00", dtype="complex128")
+    )
+    assert mps_info["backend"] == "numpy"
+    assert mps_info["dtype"] == "complex128"
 
 
 def test_to_float_handles_backend_scalar_without_numpy_coercion():

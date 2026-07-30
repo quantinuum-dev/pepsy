@@ -33,6 +33,11 @@ from pepsy.sampling import MpsSampler
 from pepsy.tensors import OneDMap, ps_to_mps, ps_to_peps, tn_norm
 ```
 
+For a shared backend contract across tensor-network classes, use
+`pepsy.backend_infer(value)`. It accepts an array or an MPS/TTN and returns
+`backend`, `dtype`, and `device`; Symmray inputs also report the underlying
+`array_backend` used by their charge-sector blocks.
+
 ## Advanced namespaces
 
 | Area | Canonical import | Notes |
@@ -63,6 +68,7 @@ pepsy.BdyMPS
 pepsy.rx
 pepsy.SweepOptimizer
 pepsy.ps_to_mps
+pepsy.backend_infer
 ```
 
 For new code, prefer the canonical namespace imports above. They make the

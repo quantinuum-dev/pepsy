@@ -2666,6 +2666,56 @@ def test_tree_gate_stream_backend_preparation_is_stream_level():
     assert untouched[1] is matching[1]
 
 
+def test_tree_gate_stream_backend_preparation_checks_late_payloads():
+    """A matching first gate cannot hide a later backend mismatch."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(device="cpu", dtype=torch.complex128)
+    plan = TreePlan.from_order(range(2), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    state.apply_to_arrays(to_backend)
+    matching = to_backend(np.eye(2, dtype=complex))
+    foreign = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    opt = TreeOptimizer(None, state=state, tree=plan, run=False)
+
+    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
+        prepared = opt._prepare_gate_stream_backend(
+            [matching, foreign], ["gate", "gate"]
+        )
+    assert prepared[0] is matching
+    assert isinstance(prepared[1], torch.Tensor)
+
+
+def test_tree_optimizer_reports_symmray_block_backend():
+    """Native fermionic TTNs report their underlying block backend."""
+    pytest.importorskip("symmray")
+    torch = pytest.importorskip("torch")
+
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    plan = TreePlan.from_order(range(3), structure="balanced")
+    state = pepsy.ps_to_ttn(
+        3,
+        tree=plan,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0)),
+        dtype="complex128",
+    )
+    state.apply_to_arrays(
+        pepsy.backend_torch(device="cpu", dtype=torch.complex128)
+    )
+    opt = TreeOptimizer(None, state=state, tree=plan, run=False)
+
+    assert opt.backend_info() == {
+        "backend": "symmray",
+        "dtype": "complex128",
+        "device": "cpu",
+        "array_backend": "torch",
+    }
+
+
 def test_tree_submpo_stream_backend_preparation_preserves_input():
     """A mismatched stream sub-MPO is copied and converted by its arrays."""
     torch = pytest.importorskip("torch")

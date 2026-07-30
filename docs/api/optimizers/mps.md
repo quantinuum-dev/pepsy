@@ -15,6 +15,17 @@ helper `MpsOptimizer.submpo_event(mpo, where)` builds the tuple form. These
 events are applied with `gate_with_submpo_` and compressed to `chi`; they are
 only accepted in `mode="mpo"`.
 
+`MpsOptimizer.backend_info()` reports the backend, dtype, and device inferred
+from every live MPS tensor; the same values are also available as the
+state-derived `backend`, `backend_dtype`, and `backend_device` attributes.
+Every gate and every tensor in a sub-MPO is checked against that signature
+before replay. Explicit mismatches are converted on an execution copy with a
+`UserWarning`; the queued payloads remain unchanged. Native Symmray MPS data
+reports `backend="symmray"` and includes `array_backend` for the underlying
+NumPy, Torch, or CuPy charge-sector blocks. Dense payloads cannot be promoted
+to native Symmray gates because that would lose charge and fermionic metadata;
+construct those gates with the matching Symmray convention instead.
+
 Streams may also include control events. `("measure", pauli, where[, outcome])`
 collapses onto a Pauli eigenvalue and records `(pauli, where, outcome, prob)`.
 `("reset", where[, basis])` resets each target to the `+1` eigenstate of

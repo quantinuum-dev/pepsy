@@ -157,5 +157,15 @@ measurement offsets and computational bits (`+1 -> 0`, `-1 -> 1`). The action
 must be one gate entry. Stim `CX/CY/CZ rec[k] q` instructions are lowered to
 this same form by `compile_stim_circuit`.
 
+TreeStab derives `backend`, `dtype`, and `device` from every live coefficient
+TTN tensor, including a caller-supplied Torch, JAX, or CuPy tree when
+`to_backend` is omitted. `backend_info()` refreshes the same public
+`backend`, `backend_dtype`, `backend_device`, and `array_backend` attributes.
+Explicit matrix gates and sub-MPO payloads are checked at the stream boundary;
+foreign arrays warn once and sub-MPOs are copied before conversion, preserving
+the caller's operator and the TTN's canonical/isometry metadata. Stim gate
+classification remains a NumPy-side operation, while TreeOptimizer applies
+the coefficient update on the inferred backend.
+
 
 > API details are maintained as handwritten Markdown in this page.
