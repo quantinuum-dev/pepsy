@@ -9,7 +9,8 @@ from importlib import import_module
 
 _MODULES = {
     "bp": "pepsy.bp",
-    "mera": "pepsy.optimizers.mera",
+    "mera": "pepsy.optimizers.qmera",
+    "qmera": "pepsy.optimizers.qmera",
     "stabilizer": "pepsy.optimizers.stabilizer_tn",
     "symmetry": "pepsy.tensors.symmetric",
     "tree": "pepsy.optimizers.tree",

@@ -6,7 +6,7 @@ second layer combines the four coarse sites into one 2x2 block.
 """
 
 import pepsy as py
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraBuilder,
     QMeraDisentanglerSpec,
     QMeraGeometry,

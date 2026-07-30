@@ -6,7 +6,7 @@ explicit register mode for each ``(site, spin)`` pair. The native
 """
 
 import pepsy as py
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraBuilder,
     QMeraGeometry,
     QMeraSymmrayFermionBackend,

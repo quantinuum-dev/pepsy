@@ -30,7 +30,7 @@ the detailed functions and classes for each area.
 - [Sweep optimization](optimizers/sweep.md)
 - [Global optimization](optimizers/global_opt.md)
 - [Energy optimization](optimizers/energy.md)
-- [MERA](optimizers/mera.md)
+- [qMERA](optimizers/qmera.md)
 - [Noise and trajectories](optimizers/noise.md)
 - [Simulator planning](optimizers/planning.md)
 - [Stabilizer tensor networks](optimizers/stabilizer_tn.md)

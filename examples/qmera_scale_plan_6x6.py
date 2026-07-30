@@ -1,6 +1,6 @@
 """Generic heterogeneous 6x6 periodic qMERA scale-plan example."""
 
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraBuilder,
     QMeraDisentanglerSpec,
     QMeraIsometrySpec,

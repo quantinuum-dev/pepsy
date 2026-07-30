@@ -1,4 +1,4 @@
-"""Reusable contraction optimizers for MERA and qMERA local cones."""
+"""Reusable contraction optimizers for qMERA local cones."""
 
 from __future__ import annotations
 

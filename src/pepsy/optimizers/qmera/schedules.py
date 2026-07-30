@@ -1,9 +1,10 @@
 """qMERA RG schedules and reverse-lightcone metadata.
 
-The schedule grammar is bottom-to-top MERA-like rather than a generic brickwall
-circuit: isometry blocks form a non-overlapping covering partition of active
+The schedule grammar is bottom-to-top qMERA RG blocking rather than a generic
+brickwall circuit: isometry blocks form a non-overlapping covering partition of active
 sites, and disentangler blocks are boundary windows between adjacent isometry
-blocks.
+blocks. In 2D, boundary windows are colored into disjoint executable
+subrounds; their supports intentionally overlap neighboring isometry blocks.
 """
 
 from __future__ import annotations
@@ -386,7 +387,13 @@ class QMeraGatePlacement:
 
 @dataclass(frozen=True)
 class QMeraLayerSpec:
-    """One MERA scale with boundary disentanglers and covering isometries."""
+    """One MERA scale with ordered, locally disjoint gate subrounds.
+
+    Isometry blocks form a disjoint covering partition. Disentangler blocks
+    are boundary windows between that partition; each executable disentangler
+    round is disjoint, while a disentangler may overlap an isometry block by
+    design.
+    """
 
     scale: int
     input_sites: tuple[int, ...]
@@ -467,17 +474,31 @@ class QMeraSchedule:
                 add(tag)
         return tuple(tags)
 
-    def schematic_blocks(self, *, layer=None):
-        """Return display-oriented disentangler/isometry blocks."""
+    def schematic_blocks(self, *, layer=None, rg_step=None):
+        """Return display blocks for one or more RG steps.
+
+        ``rg_step`` is the descriptive alias for ``layer`` used by the
+        schematic API. Supplying both is an error so a drawing cannot silently
+        select the wrong scale.
+        """
         from .schematics import qmera_schematic_blocks
 
-        return qmera_schematic_blocks(self, layer=layer)
+        return qmera_schematic_blocks(self, layer=layer, rg_step=rg_step)
 
-    def draw_schematic(self, *, layer=None, **kwargs):
-        """Draw a schematic of qMERA blocking for one or more layers."""
+    def draw_schematic(self, *, layer=None, rg_step=None, **kwargs):
+        """Draw qMERA blocking for one or more RG steps.
+
+        Use ``rg_step=0`` for the first coarse-graining step. ``layer`` is
+        retained as a backwards-compatible alias.
+        """
         from .schematics import draw_qmera_schedule
 
-        return draw_qmera_schedule(self, layer=layer, **kwargs)
+        return draw_qmera_schedule(
+            self,
+            layer=layer,
+            rg_step=rg_step,
+            **kwargs,
+        )
 
 
 def _nonoverlapping_blocks(active, block_size):
@@ -722,14 +743,24 @@ def _stage_placements(
     mode_order=None,
     boundary_pairs_by_block=None,
     block_axes=None,
+    block_rounds=None,
+    round_stride=1,
     periodic=False,
 ):
     placements = []
     counter = counter_start
     stage = stage_spec.kind
     short = "DIS" if stage == "disentangler" else "ISO"
-    for round_index in range(stage_spec.circuit_depth):
+    if round_stride < 1:
+        raise ValueError("round_stride must be >= 1.")
+    if block_rounds is not None and len(block_rounds) != len(blocks):
+        raise ValueError("block_rounds must match the number of stage blocks.")
+    for circuit_round in range(stage_spec.circuit_depth):
         for block_index, block in _block_ranges(blocks):
+            block_round = (
+                0 if block_rounds is None else int(block_rounds[block_index])
+            )
+            round_index = circuit_round * round_stride + block_round
             if boundary_pairs_by_block is not None:
                 pairs = boundary_pairs_by_block[block_index]
                 axis = None if block_axes is None else block_axes[block_index]
@@ -783,6 +814,45 @@ def _stage_placements(
                 )
                 counter += 1
     return tuple(placements), counter
+
+
+def _validate_disentangler_subrounds(blocks, placements):
+    """Ensure concurrent disentangler blocks are mutually disjoint."""
+    block_rounds = {}
+    for placement in placements:
+        block_rounds.setdefault(placement.block, set()).add(placement.round)
+    by_round = {}
+    for block_index, rounds in block_rounds.items():
+        for round_index in rounds:
+            by_round.setdefault(round_index, []).append(block_index)
+    for round_index, block_indices in by_round.items():
+        for position, left_index in enumerate(block_indices):
+            left = set(blocks[left_index])
+            for right_index in block_indices[:position]:
+                common = left.intersection(blocks[right_index])
+                if common:
+                    raise ValueError(
+                        "disentangler blocks must be disjoint within executable "
+                        f"subround {round_index}: {left_index} and {right_index} "
+                        f"share {tuple(sorted(common))!r}."
+                    )
+
+
+def _disjoint_block_colors(blocks):
+    """Greedily color overlapping blocks into disjoint execution rounds."""
+    colors = []
+    supports = [set(block) for block in blocks]
+    for index, support in enumerate(supports):
+        used = {
+            colors[previous]
+            for previous in range(index)
+            if support.intersection(supports[previous])
+        }
+        color = 0
+        while color in used:
+            color += 1
+        colors.append(color)
+    return tuple(colors), max(colors, default=-1) + 1
 
 
 def _coarse_grain(isometry_blocks):
@@ -1144,6 +1214,7 @@ def _build_qmera_schedule_1d(
                     geometry.boundary == "periodic" and disentangler.periodic_wrap
                 ),
             )
+            _validate_disentangler_subrounds(disentangler_blocks, dis)
         else:
             disentangler_blocks = _boundary_blocks(
                 isometry_blocks,
@@ -1152,6 +1223,9 @@ def _build_qmera_schedule_1d(
                     geometry.boundary == "periodic" and disentangler.periodic_wrap
                 ),
             )
+            dis_block_rounds, dis_round_count = _disjoint_block_colors(
+                disentangler_blocks
+            )
             dis, gate_counter = _stage_placements(
                 disentangler_blocks,
                 scale=scale,
@@ -1159,7 +1233,10 @@ def _build_qmera_schedule_1d(
                 counter_start=gate_counter,
                 mode_by_site=mode_by_site,
                 mode_order=mode_order,
+                block_rounds=dis_block_rounds,
+                round_stride=max(1, dis_round_count),
             )
+            _validate_disentangler_subrounds(disentangler_blocks, dis)
         iso, gate_counter = _stage_placements(
             _placement_blocks(isometry_blocks),
             scale=scale,
@@ -1257,6 +1334,7 @@ def _build_qmera_schedule_2d(
                     geometry.boundary == "periodic" and disentangler.periodic_wrap
                 ),
             )
+            _validate_disentangler_subrounds(disentangler_blocks, dis)
         else:
             (
                 disentangler_blocks,
@@ -1276,6 +1354,9 @@ def _build_qmera_schedule_2d(
                 corner_policy=disentangler.corner_policy,
             )
         if disentangler.placement == "boundary-square":
+            dis_block_rounds, dis_round_count = _disjoint_block_colors(
+                disentangler_blocks
+            )
             dis, gate_counter = _stage_placements(
                 disentangler_blocks,
                 scale=scale,
@@ -1284,8 +1365,14 @@ def _build_qmera_schedule_2d(
                 coords_by_site=coords_by_site,
                 mode_by_site=mode_by_site,
                 mode_order=geometry.site_modes,
+                block_rounds=dis_block_rounds,
+                round_stride=max(1, dis_round_count),
             )
+            _validate_disentangler_subrounds(disentangler_blocks, dis)
         elif disentangler.placement != "within-block":
+            dis_block_rounds, dis_round_count = _disjoint_block_colors(
+                disentangler_blocks
+            )
             dis, gate_counter = _stage_placements(
                 disentangler_blocks,
                 scale=scale,
@@ -1294,7 +1381,10 @@ def _build_qmera_schedule_2d(
                 boundary_pairs_by_block=dis_pairs_by_block,
                 block_axes=dis_axes,
                 mode_order=geometry.site_modes,
+                block_rounds=dis_block_rounds,
+                round_stride=max(1, dis_round_count),
             )
+            _validate_disentangler_subrounds(disentangler_blocks, dis)
         iso, gate_counter = _stage_placements(
             _placement_blocks(isometry_blocks),
             scale=scale,

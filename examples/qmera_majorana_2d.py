@@ -6,7 +6,7 @@ Majoranas are parity odd, while bilinears and pairing gates are Z2 neutral.
 """
 
 import pepsy as py
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraBuilder,
     QMeraGeometry,
     QMeraSymmrayFermionBackend,

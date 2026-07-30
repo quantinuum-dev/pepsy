@@ -1,29 +1,14 @@
-# `pepsy.optimizers.mera`
+# `pepsy.optimizers.qmera`
 
-MERA and qMERA energy helpers evaluate local Hamiltonian terms through reverse
-lightcones rather than by contracting a full state for every term.
-
-The dense MERA path wraps an existing MERA-like tensor network:
+Pepsy's optimizer surface is qMERA-only: parameterized gate families are
+placed by a static RG schedule, and local Hamiltonian terms are evaluated by
+rebuilding only their reverse lightcones.
 
 ```python
 import numpy as np
-import quimb.tensor as qtn
-
-from pepsy.optimizers import MeraEnergyOptimizer
 
 zz = np.diag([1.0, -1.0])
 h2 = np.kron(zz, zz).reshape(2, 2, 2, 2)
-mera = qtn.MERA.rand(L=8, max_bond=2, dtype="complex128", seed=1)
-
-opt = MeraEnergyOptimizer(mera, {(0, 1): h2, (2, 3): h2})
-estimate = opt.energy()
-```
-
-The qMERA path is schedule-first. `QMeraBuilder` creates the geometry, RG
-schedule, parameter dictionary, and local-cone chunks. The loss then rebuilds
-only the selected lightcone for each local term.
-
-```python
 from pepsy.optimizers import QMeraBuilder, build_qmera_contraction_optimizer
 
 builder = QMeraBuilder(
@@ -46,27 +31,7 @@ energy = builder.parametric_loss(
 )
 ```
 
-For a fixed MERA-like state, `lightcone_energy(...)` exposes the same local
-contraction primitive directly. It selects only the reverse cone, applies each
-local operator with `.gate`, and can reuse one Pepsy/cotengra path per cone
-topology:
-
-```python
-from pepsy.optimizers.mera import lightcone_energy
-
-path_cache = builder.contraction_path_cache(max_repeats=16)
-energy = lightcone_energy(
-    mera,
-    {(0, 1): h2, (2, 3): h2},
-    energy_per_site=False,
-    path_cache=path_cache,
-)
-```
-
-This is the fixed-state analogue of `builder.parametric_loss(...)`; the latter
-rebuilds the qMERA cone from a parameter dictionary on every evaluation.
-
-For repeated optimization, compile static local-cone contractions once and
+For repeated optimization, compile static qMERA local-cone contractions once and
 reuse them from NumPy, Torch, or JAX-compatible parameter dictionaries:
 
 ```python
@@ -82,8 +47,49 @@ loss_fn = builder.compiled_parametric_loss_fn(
 energy = loss_fn(params)
 ```
 
-`QMeraParametricEnergyOptimizer` routes the same compiled loss through Pepsy's
-gradient solvers:
+Native Symmray qMERA uses the same compiled API, but the builder must receive
+the graded product-state factory. The compiled object then reports
+`contraction_backend="symmray"` and `is_graded=True`; its frozen constants and
+runtime gate blocks stay block-sparse Symmray arrays, so fermionic signs,
+charge maps, duals, and Torch autodiff are retained:
+
+```python
+from pepsy.optimizers.qmera import (
+    QMeraBuilder,
+    QMeraGeometry,
+    QMeraSymmrayFermionBackend,
+    symmray_fermion_gate_registry,
+)
+
+backend = QMeraSymmrayFermionBackend(symmetry="U1U1")
+builder = QMeraBuilder(
+    geometry=QMeraGeometry(
+        shape=(4, 4),
+        boundary="periodic",
+        site_modes=("up", "down"),
+        mode_order="mode-major",
+    ),
+    gate_registry=symmray_fermion_gate_registry(backend=backend),
+    gate_family="symmray-fsim",
+    product_state_factory=backend.product_state,
+)
+compiled = builder.compile_parametric_lightcones(
+    terms,
+    convert_terms=False,
+    path_cache=builder.contraction_path_cache(max_repeats=16),
+)
+assert compiled[0].is_graded
+```
+
+`path_cache` reuses topology-specific cotengra searches while each compiled
+expression reuses its frozen contraction tree on every parameter evaluation.
+Use `builder.parametric_loss(...)` or `builder.direct_parametric_loss(...)` as
+the explicit native correctness oracle when validating a new periodic layout.
+
+`QMeraEnergyOptimizer` routes the same compiled loss through Pepsy's gradient
+solvers. Its built-in spin and fermion gate families are parameterized and
+unitary/symmetry-preserving by construction, so normalization is disabled by
+default. Pass `normalized=True` for a custom non-unitary gate family:
 
 ```python
 param_opt = builder.parametric_optimizer(
@@ -105,17 +111,51 @@ patches and arrows for the RG flow:
 
 ```python
 drawing = schedule.draw_schematic(
+    rg_step=0,                # inspect one bottom-to-top RG step
     style="clean",             # or "register" for the low-level wiring view
-    figsize=(14, 5),
+    figsize=(16, 5),
     label_sites=True,
     label_blocks=True,
     scale_figsize=False,
 )
 ```
 
-The clean view is intended for explaining a schedule or a fermionic block
-layout; `schedule.schematic_blocks()` remains the machine-readable placement
-audit.
+The clean view is ordered as input → disjoint disentangler subrounds →
+covering isometry subrounds → coarse output. Disentangler windows overlap the
+neighboring isometry blocks by design, but blocks in the same executable
+subround are disjoint. Set `rg_step=1` (or another valid scale) to inspect a
+later step; use `rg_step=None` to draw all steps. The older `layer=` selector
+remains an alias. `schedule.schematic_blocks()` remains the machine-readable
+placement audit.
+
+### qMERA layout search and prototype comparison
+
+`QMeraLayoutFinder` searches valid immutable RG scale plans and ranks them by
+gate count, executable depth, reverse-lightcone width, and Hamiltonian-support
+coverage. The result can be passed directly to `QMeraBuilder`:
+
+```python
+from pepsy.optimizers.qmera import QMeraGeometry, QMeraLayoutFinder
+
+geometry = QMeraGeometry(shape=(6, 6), boundary="periodic")
+report = QMeraLayoutFinder(geometry, max_layers=3).search({(0, 1): h2})
+builder = QMeraBuilder(geometry=geometry, scales=report.best.scales)
+```
+
+The research prototype's serialized `U_q3_l*` files are flat gate-placement
+streams, not RG schedules. Load them only for structural comparison:
+
+```python
+from pepsy.optimizers.qmera import load_qmera_prototype_layout
+
+prototype = load_qmera_prototype_layout("/home/.../mera/U_q3_l1")
+prototype_score = QMeraLayoutFinder(
+    QMeraGeometry(shape=prototype.num_sites)
+).score_prototype_layout(prototype, {(0, 1): h2})
+```
+
+This adapter deliberately does not infer qMERA scales from the prototype
+stream.
 
 Native Symmray fermion helpers are available under this module, but the
 fermion convention is explicit. The `Fermion` helper can now be supplied to
@@ -127,7 +167,7 @@ terms:
 
 ```python
 import pepsy
-from pepsy.optimizers.mera import QMeraGeometry
+from pepsy.optimizers.qmera import QMeraGeometry
 
 fermion = pepsy.Fermion(
     spinful=True,
@@ -150,7 +190,7 @@ For the normal spinful Hubbard workflow, let the builder own the mode
 expansion and conversion:
 
 ```python
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraBuilder,
     QMeraSymmrayFermionBackend,
     symmray_fermion_gate_registry,
@@ -201,7 +241,7 @@ covering blocks, then reduces 3x3 to one site with a 3x3 covering block and
 vertical 3-site internal disentangler strips:
 
 ```python
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraBuilder,
     QMeraDisentanglerSpec,
     QMeraIsometrySpec,
@@ -246,7 +286,7 @@ spinful Fermi--Hubbard workflow therefore uses `U1U1` and the Symmray FSIM
 registry:
 
 ```python
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraBuilder,
     QMeraGeometry,
     QMeraSymmrayFermionBackend,
@@ -278,7 +318,7 @@ For the explicit 4x4 periodic construction, use a 2x2 square disentangler
 around every inter-block face and a 2x2 covering unitary for each RG block:
 
 ```python
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraBuilder,
     QMeraDisentanglerSpec,
     QMeraGeometry,
@@ -383,7 +423,7 @@ physical site with native `Z2` fermion parity:
 
 ```python
 import pepsy as py
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     QMeraGeometry,
     qmera_symmray_majorana_terms,
     symmray_majorana_gate_registry,

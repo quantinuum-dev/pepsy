@@ -41,6 +41,13 @@ def _layer_indices(schedule, layer=None):
     return tuple(int(idx) for idx in layer)
 
 
+def _resolve_rg_step(layer, rg_step):
+    """Resolve the public ``layer``/``rg_step`` selectors."""
+    if layer is not None and rg_step is not None:
+        raise TypeError("Specify only one of layer= or rg_step=.")
+    return rg_step if rg_step is not None else layer
+
+
 def _placement_group_key(placement):
     return (placement.scale, placement.stage, placement.round, placement.block)
 
@@ -56,9 +63,14 @@ def _block_sites_for_group(layer_spec, stage, block_index, fallback):
     return tuple(fallback)
 
 
-def qmera_schematic_blocks(schedule, *, layer=None):
-    """Return qMERA layer blocks grouped for schematic display."""
+def qmera_schematic_blocks(schedule, *, layer=None, rg_step=None):
+    """Return qMERA blocks grouped for schematic display.
+
+    ``rg_step`` selects a single bottom-to-top coarse-graining step and is a
+    readable alias for the older ``layer`` argument.
+    """
     layers = schedule.layers
+    layer = _resolve_rg_step(layer, rg_step)
     requested = set(_layer_indices(schedule, layer))
     blocks = []
     for layer_index in requested:
@@ -196,11 +208,23 @@ def _unique_physical_sites(geometry, register_sites):
     return tuple(sites)
 
 
-def _clean_stage_positions(geometry, sites, *, x0, y0):
-    """Place 2D physical sites on a stable schematic grid."""
+def _clean_stage_positions(sites, *, x0, y0):
+    """Place a stage's active sites on a compact local schematic grid.
+
+    Coarse sites retain their physical coordinate labels, e.g. ``(0, 2)``,
+    but their drawing should occupy adjacent positions in the coarse panel.
+    Rank-compressing each stage removes misleading gaps between RG scales.
+    """
+    # ``_draw_clean_stage`` has already converted register labels to physical
+    # site labels before calling this helper.
+    coords = {site: site for site in sites}
+    xs = sorted({coord[1] for coord in coords.values()})
+    ys = sorted({coord[0] for coord in coords.values()})
+    x_rank = {value: pos for pos, value in enumerate(xs)}
+    y_rank = {value: pos for pos, value in enumerate(ys)}
     return {
-        site: (x0 + float(site[1]), y0 - float(site[0]))
-        for site in sites
+        site: (x0 + float(x_rank[coord[1]]), y0 - float(y_rank[coord[0]]))
+        for site, coord in coords.items()
     }
 
 
@@ -224,7 +248,7 @@ def _draw_clean_stage(
         else layer_spec.input_sites
     )
     sites = _unique_physical_sites(geometry, register_sites)
-    positions = _clean_stage_positions(geometry, sites, x0=x0, y0=y0)
+    positions = _clean_stage_positions(sites, x0=x0, y0=y0)
 
     # Keep the physical graph visible in every stage, like the simple wires in
     # quimb's manual schematic examples.
@@ -275,15 +299,17 @@ def _draw_clean_2d(
 ):
     """Draw 2D layers as separated quimb-style input/D/W/output panels."""
     height, width = schedule.geometry.shape
-    panel_width = float(max(width, height)) + 2.0
-    panel_gap = 1.5
-    row_gap = float(max(height, 1)) + 3.2
-    cursor_x = 0.0
+    panel_extent = float(max(width, height) - 1)
+    panel_width = panel_extent + 1.2
+    panel_gap = 1.1
+    row_gap = panel_extent + 3.0
 
     for row, layer_index in enumerate(layer_indices):
         layer = schedule.layers[layer_index]
+        # Each RG scale is its own readable horizontal strip. Keeping the
+        # origin fixed prevents later scales from drifting to the right.
+        cursor_x = 0.0
         y0 = -row_gap * row
-        stages = [("input", "input")]
         disentanglers = tuple(
             block
             for block in blocks_by_layer.get(layer_index, ())
@@ -294,15 +320,18 @@ def _draw_clean_2d(
             for block in blocks_by_layer.get(layer_index, ())
             if block.stage == "isometry"
         )
+        stages = [("input", "input", None)]
         if disentanglers:
-            stages.append(("disentangler", "D"))
+            for round_index in sorted({block.round for block in disentanglers}):
+                stages.append(("disentangler", f"D[r{round_index}]", round_index))
         if isometries:
-            stages.append(("isometry", "W"))
-        stages.append(("output", "coarse"))
+            for round_index in sorted({block.round for block in isometries}):
+                stages.append(("isometry", f"W[r{round_index}]", round_index))
+        stages.append(("output", "coarse", None))
 
         layer_start = cursor_x
         previous_right = None
-        for stage, label in stages:
+        for stage, label, round_index in stages:
             x0 = cursor_x
             blocks = (
                 disentanglers
@@ -311,6 +340,8 @@ def _draw_clean_2d(
                 if stage == "isometry"
                 else ()
             )
+            if round_index is not None:
+                blocks = tuple(block for block in blocks if block.round == round_index)
             _draw_clean_stage(
                 drawing,
                 schedule,
@@ -322,14 +353,18 @@ def _draw_clean_2d(
                 label_sites=label_sites,
                 label_blocks=label_blocks,
             )
+            if stage == "disentangler":
+                label = f"{label} ({len(blocks)} blocks)"
+            elif stage == "isometry":
+                label = f"{label} ({len(blocks)} blocks)"
             drawing.text(
-                (x0 + 0.5 * (width - 1), y0 + 0.85),
+                (x0 + 0.5 * panel_extent, y0 + 0.85),
                 label,
                 preset="stage_label",
             )
 
             if previous_right is not None:
-                arrow_y = y0 - float(height) - 0.7
+                arrow_y = y0 - 0.5 * panel_extent
                 start = (previous_right, arrow_y)
                 end = (x0 - 0.35, arrow_y)
                 drawing.line(start, end, preset="flow")
@@ -338,14 +373,13 @@ def _draw_clean_2d(
             cursor_x += panel_width + panel_gap
 
         drawing.text(
-            (layer_start - 0.7, y0),
+            (layer_start - 0.8, y0 + 0.85),
             f"L{layer_index}",
             preset="layer_label",
         )
-        cursor_x += 0.8
 
     drawing.text(
-        (0.0, -row_gap * len(layer_indices) + 1.0),
+        (0.5 * panel_extent, -row_gap * len(layer_indices) + 0.9),
         "D = boundary disentangler     W = isometry     arrows = coarse-graining",
         preset="legend",
     )
@@ -411,6 +445,7 @@ def draw_qmera_schedule(
     schedule,
     *,
     layer=None,
+    rg_step=None,
     style="clean",
     figsize=None,
     label_sites=True,
@@ -424,10 +459,11 @@ def draw_qmera_schedule(
     Parameters
     ----------
     schedule
-        A :class:`~pepsy.optimizers.mera.QMeraSchedule`.
-    layer
-        Optional layer index or iterable of layer indices. ``None`` draws all
-        layers.
+        A :class:`~pepsy.optimizers.qmera.QMeraSchedule`.
+    layer, rg_step
+        Optional layer index or iterable of layer indices. ``rg_step`` is the
+        preferred descriptive name for selecting one RG step; ``layer`` is a
+        backwards-compatible alias. ``None`` draws all steps.
     style : {"clean", "register"}, default="clean"
         ``"clean"`` separates 2D input, disentangler, isometry, and coarse
         output panels. ``"register"`` keeps the lower-level register wiring
@@ -463,14 +499,14 @@ def draw_qmera_schedule(
         },
         "site_label": {"fontsize": 8, "color": neutral_dark},
         "disentangler": {
-            "facecolor": schematic.get_color("orange", alpha=0.34),
+            "facecolor": schematic.get_color("orange", alpha=0.18),
             "edgecolor": schematic.get_color("orange"),
-            "linewidth": 1.5,
+            "linewidth": 1.4,
         },
         "isometry": {
-            "facecolor": schematic.get_color("green", alpha=0.30),
+            "facecolor": schematic.get_color("green", alpha=0.16),
             "edgecolor": schematic.get_color("green"),
-            "linewidth": 1.5,
+            "linewidth": 1.4,
         },
         "block_label": {
             "fontsize": 9,
@@ -500,6 +536,7 @@ def draw_qmera_schedule(
     drawing = schematic.Drawing(**kwargs)
 
     layers = schedule.layers
+    layer = _resolve_rg_step(layer, rg_step)
     layer_indices = _layer_indices(schedule, layer)
     blocks = qmera_schematic_blocks(schedule, layer=layer_indices)
     blocks_by_layer = {}

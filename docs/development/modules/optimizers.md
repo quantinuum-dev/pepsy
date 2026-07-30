@@ -35,8 +35,8 @@ important downstream time-compression consumer that depends on Pepsy behavior.
 - `planning.py`: non-executing physical-versus-stabilizer and
   MPS-versus-tree circuit advice using measured frame supports and explicit
   chi-scaled work proxies.
-- `mera/`: dense MERA and schedule-first qMERA local-energy objectives,
-  parameter dictionaries, compiled lightcone contractions, schematics, and
+- `qmera/`: schedule-first qMERA local-energy objectives, parameter
+  dictionaries, compiled lightcone contractions, schematics, and
   Symmray-native fermion helpers.
 - `global_opt.py`: whole-network variational optimization helpers.
 

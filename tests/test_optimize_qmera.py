@@ -1,43 +1,40 @@
-"""Tests for MERA local-energy optimization helpers."""
+"""Tests for qMERA local-energy optimization helpers."""
 
 import numpy as np
 import pytest
-import quimb.tensor as qtn
 
-from pepsy.optimizers.energy import EnergyEstimate
-from pepsy.optimizers.mera import (
+from pepsy.optimizers.qmera import (
     GateSpec,
     LocalTerm,
-    MeraEnergyOptimizer,
     QMeraBlockSpec,
     QMeraBuilder,
     QMeraCompiledLightconeChunk,
     QMeraContractionPathCache,
     QMeraDisentanglerSpec,
+    QMeraEnergyOptimizer,
     QMeraGeometry,
     QMeraIsometrySpec,
+    QMeraLayoutFinder,
     QMeraLightconeGroup,
     QMeraLightconeTN,
     QMeraSchematicBlock,
     QMeraParametricEnergyOptimizer,
     QMeraParametricLightconeChunk,
+    QMeraPrototypeLayout,
     QMeraSymmrayFermionBackend,
     QMeraScaleSpec,
     QMeraUnitarySpec,
     UserGateFamily,
-    build_lightcone_chunks,
     build_qmera_contraction_optimizer,
-    build_qmera_lightcone_chunks,
     build_qmera_parametric_lightcone_chunks,
     compile_qmera_parametric_lightcones,
     contract_qmera_lightcone_tn,
     group_qmera_parametric_lightcone_chunks,
-    lightcone_energy,
     default_gate_registry,
     draw_qmera_schedule,
     local_qmera_compiled_lightcone_expectation,
     local_qmera_parametric_lightcone_expectation,
-    local_lightcone_expectation,
+    load_qmera_prototype_layout,
     normalize_local_terms,
     qmera_compiled_parametric_energy,
     qmera_direct_parametric_energy,
@@ -50,19 +47,12 @@ from pepsy.optimizers.mera import (
     symmray_fermion_gate_registry,
     symmray_majorana_gate_registry,
 )
-from pepsy.optimizers.mera.optimizer import (
-    MeraEnergyOptimizer as ModuleMeraEnergyOptimizer,
-)
 from pepsy.tensors import Fermion
 
 
 def _zz_term():
     z_op = np.diag([1.0, -1.0])
     return np.kron(z_op, z_op).reshape(2, 2, 2, 2)
-
-
-def _small_mera(seed=23):
-    return qtn.MERA.rand(L=8, max_bond=2, dtype="complex128", seed=seed)
 
 
 def test_qmera_contraction_optimizer_helper_delegates(monkeypatch):
@@ -74,7 +64,7 @@ def test_qmera_contraction_optimizer_helper_delegates(monkeypatch):
         return "optimizer"
 
     monkeypatch.setattr(
-        "pepsy.optimizers.mera.cache.build_optimizer",
+        "pepsy.optimizers.qmera.cache.build_optimizer",
         fake_build_optimizer,
     )
 
@@ -94,7 +84,7 @@ def test_qmera_builder_exposes_contraction_optimizer(monkeypatch):
         return "optimizer"
 
     monkeypatch.setattr(
-        "pepsy.optimizers.mera.builders.build_qmera_contraction_optimizer",
+        "pepsy.optimizers.qmera.builders.build_qmera_contraction_optimizer",
         fake_build_qmera_contraction_optimizer,
     )
 
@@ -139,6 +129,54 @@ def test_qmera_builder_preserves_explicit_geometry_override():
         QMeraBuilder(geometry=bad_geometry, fermion=fermion)
 
 
+def test_qmera_layout_finder_returns_valid_ranked_candidates():
+    """Layout search should rank immutable schedule candidates."""
+    geometry = QMeraGeometry(shape=8)
+    finder = QMeraLayoutFinder(
+        geometry,
+        isometry_block_shapes=(2, 4),
+        disentangler_block_shapes=(2,),
+        disentangler_depths=(1, 2),
+        isometry_depths=(1,),
+        max_layers=4,
+    )
+
+    report = finder.search({(0, 1): _zz_term()})
+    repeat = finder.search({(0, 1): _zz_term()})
+
+    assert report.candidates
+    assert report.scores
+    assert report.best is not None
+    assert report.best_score is not None
+    assert report.pareto_front
+    assert tuple(candidate.candidate_id for candidate in report.candidates) == tuple(
+        candidate.candidate_id for candidate in repeat.candidates
+    )
+    assert all(score.valid for score in report.scores)
+    assert all("max_lightcone_width" in score.components for score in report.scores)
+
+
+def test_qmera_prototype_layout_loader_and_structural_score():
+    """Prototype U-streams should load without being mistaken for schedules."""
+    layout = load_qmera_prototype_layout(
+        "/tmp/U_q3_l1",
+        loader=lambda _path: ((0, 1), (2, 3), (1, 2)),
+        num_sites=4,
+    )
+
+    assert isinstance(layout, QMeraPrototypeLayout)
+    assert layout.level == 1
+    assert layout.gate_count == 3
+    assert layout.round_depth == 2
+    assert layout.unique_sites == (0, 1, 2, 3)
+
+    finder = QMeraLayoutFinder(QMeraGeometry(shape=4))
+    score = finder.score_prototype_layout(layout, {(0, 1): _zz_term()})
+    assert score.valid
+    assert score.components["interaction_coverage"] == pytest.approx(1.0)
+    assert score.components["gate_count"] == 3
+
+
 def test_normalize_local_terms_accepts_mapping_iterable_and_local_term():
     """Hamiltonian input should normalize to explicit LocalTerm objects."""
     op = _zz_term()
@@ -165,75 +203,6 @@ def test_normalize_local_terms_rejects_bad_supports():
         normalize_local_terms({(0, 0): op})
     with pytest.raises(ValueError, match="form"):
         normalize_local_terms([((0, 1), op, 1.0, "extra")])
-
-
-def test_mera_lightcone_expectation_matches_quimb_exact_contraction():
-    """The cached lightcone kernel should match quimb's full exact oracle."""
-    mera = _small_mera()
-    where = (0, 1)
-    op = _zz_term()
-    terms = normalize_local_terms({where: op})
-    chunk = build_lightcone_chunks(mera, terms)[0]
-
-    local_value = local_lightcone_expectation(
-        mera,
-        chunk,
-        optimize="auto-hq",
-        normalized=True,
-        real=False,
-    )
-    direct = mera.compute_local_expectation_exact(
-        {where: op},
-        optimize="auto-hq",
-        normalized=True,
-    )
-
-    assert complex(local_value) == pytest.approx(complex(direct))
-    assert chunk.tags == ("I0", "I1")
-    assert chunk.physical_width == 2
-
-
-def test_mera_energy_loss_matches_quimb_exact_sum():
-    """MeraEnergyOptimizer.loss() should sum local lightcone contractions."""
-    mera = _small_mera(seed=24)
-    op = _zz_term()
-    terms = {(0, 1): op, (2, 3): op}
-    direct = mera.compute_local_expectation_exact(
-        terms,
-        optimize="auto-hq",
-        normalized=True,
-    )
-    opt = MeraEnergyOptimizer(
-        mera,
-        terms,
-        energy_per_site=False,
-        normalized=True,
-        contraction_opt="auto-hq",
-    )
-
-    assert complex(opt.loss(real=False)) == pytest.approx(complex(direct))
-
-
-def test_generic_lightcone_energy_groups_select_gate_and_contract():
-    """The public fixed-state helper should match the full MERA oracle."""
-    mera = _small_mera(seed=241)
-    terms = {(0, 1): _zz_term(), (2, 3): _zz_term()}
-    direct = mera.compute_local_expectation_exact(
-        terms,
-        optimize="auto-hq",
-        normalized=True,
-    )
-
-    value = lightcone_energy(
-        mera,
-        terms,
-        energy_per_site=False,
-        normalized=True,
-        real=False,
-        group_terms=True,
-    )
-
-    assert complex(value) == pytest.approx(complex(direct))
 
 
 def test_qmera_parameter_sharing_per_block_reuses_round_parameters():
@@ -265,72 +234,6 @@ def test_qmera_parameter_sharing_per_block_reuses_round_parameters():
         assert by_block
         assert all(len(keys) == 1 for keys in by_block.values())
         assert len({next(iter(keys)) for keys in by_block.values()}) == len(by_block)
-
-
-def test_mera_energy_estimate_reports_lightcone_metadata():
-    """energy() should return the shared EnergyEstimate dataclass."""
-    mera = _small_mera(seed=25)
-    opt = MeraEnergyOptimizer(
-        mera,
-        {(0, 1): _zz_term()},
-        energy_per_site=True,
-        normalized=True,
-    )
-
-    estimate = opt.energy()
-
-    assert isinstance(estimate, EnergyEstimate)
-    assert estimate.num_sites == 8
-    assert estimate.boundary_mode == "lightcone-exact"
-    assert estimate.energy_per_site == pytest.approx(estimate.energy / 8)
-    assert estimate.metadata["num_terms"] == 1
-    assert estimate.metadata["max_physical_width"] == 2
-    assert estimate.metadata["max_lightcone_tensors"] >= 1
-
-
-def test_mera_energy_make_tn_optimizer_and_optimize(monkeypatch):
-    """TNOptimizer construction should receive loss constants and norm hook."""
-    calls = []
-    out = _small_mera(seed=27)
-
-    class _FakeTNOptimizer:  # pylint: disable=too-few-public-methods
-        def __init__(self, state, loss_fn, **kwargs):
-            calls.append((state, loss_fn, kwargs))
-            self.losses = [2.0, 1.0]
-
-        def optimize(self, n=220, **kwargs):
-            calls.append(("optimize", n, kwargs))
-            return out
-
-    monkeypatch.setattr(
-        "pepsy.optimizers.mera.optimizer.qtn.TNOptimizer",
-        _FakeTNOptimizer,
-    )
-    mera = _small_mera(seed=26)
-    terms = {(0, 1): _zz_term()}
-    opt = MeraEnergyOptimizer(mera, terms)
-
-    tnopt = opt.make_tn_optimizer(
-        optimizer="lbfgs",
-        autodiff_backend="jax",
-        progbar=False,
-        loss_kwargs={"precompute_tags": False},
-    )
-    assert isinstance(tnopt, _FakeTNOptimizer)
-    _, loss_fn, kwargs = calls[0]
-    assert loss_fn is ModuleMeraEnergyOptimizer._tnopt_loss
-    assert kwargs["loss_constants"]["terms"] == opt.terms
-    assert kwargs["loss_constants"]["chunks"] is None
-    assert kwargs["loss_kwargs"]["precompute_tags"] is False
-    assert kwargs["optimizer"] == "L-BFGS-B"
-    assert kwargs["autodiff_backend"] == "jax"
-    assert callable(kwargs["norm_fn"])
-
-    optimized, losses = opt.optimize(n=3, progbar=False, return_losses=True)
-    assert optimized is out
-    assert opt.state is out
-    assert losses == (2.0, 1.0)
-    assert calls[-1] == ("optimize", 3, {})
 
 
 def test_qmera_geometry_explicit_lattice_and_mapper():
@@ -457,6 +360,43 @@ def test_qmera_2d_schedule_uses_rg_blocks_and_face_disentanglers():
     assert any("AXIS_Y" in placement.tags for placement in first.disentanglers)
     assert any(placement.axis == "x" for placement in first.isometries)
     assert any(placement.axis == "y" for placement in first.isometries)
+
+    # Boundary disentangler blocks are assigned disjoint executable rounds.
+    # Their supports intentionally overlap the neighboring isometry blocks,
+    # which is the MERA boundary-coupling pattern.
+    d_round_by_block = {}
+    for placement in first.disentanglers:
+        d_round_by_block.setdefault(placement.block, placement.round)
+        assert d_round_by_block[placement.block] == placement.round
+    for round_index in set(d_round_by_block.values()):
+        blocks = [
+            set(first.disentangler_blocks[block_index])
+            for block_index, block_round in d_round_by_block.items()
+            if block_round == round_index
+        ]
+        assert all(
+            not (left & right)
+            for index, left in enumerate(blocks)
+            for right in blocks[:index]
+        )
+    assert all(
+        not (left & right)
+        for index, left in enumerate(map(set, first.isometry_blocks))
+        for right in map(set, first.isometry_blocks[:index])
+    )
+    assert any(
+        set(disentangler) & set(isometry)
+        for disentangler in first.disentangler_blocks
+        for isometry in first.isometry_blocks
+    )
+    assert all(
+        sum(
+            bool(set(disentangler) & set(isometry))
+            for isometry in first.isometry_blocks
+        )
+        >= 2
+        for disentangler in first.disentangler_blocks
+    )
 
 
 def test_qmera_explicit_specs_build_4x4_periodic_hubbard_schedule():
@@ -869,8 +809,8 @@ def test_qmera_symmray_fermion_lightcone_contracts_native_term():
         energy_per_site=False,
         real=False,
     )
-    fixed_state_value = lightcone_energy(
-        builder.build(params),
+    direct_value = builder.direct_parametric_loss(
+        params,
         terms[:1],
         schedule=schedule,
         convert_terms=False,
@@ -886,7 +826,342 @@ def test_qmera_symmray_fermion_lightcone_contracts_native_term():
     )
     assert complex(value) == pytest.approx(0.0)
     assert complex(builder_value) == pytest.approx(complex(value))
-    assert complex(fixed_state_value) == pytest.approx(complex(value))
+    assert complex(direct_value) == pytest.approx(complex(value))
+
+
+def test_qmera_native_symmray_compilation_preserves_graded_metadata():
+    """Compiled native cones keep Symmray grading instead of densifying."""
+    pytest.importorskip("symmray")
+    backend = QMeraSymmrayFermionBackend()
+    registry = symmray_fermion_gate_registry(backend=backend)
+    builder = QMeraBuilder(
+        shape=2,
+        site_modes=backend.site_modes,
+        gate_registry=registry,
+        gate_family="symmray-fsim",
+        isometry={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        max_layers=1,
+        product_state_factory=backend.product_state,
+    )
+    terms = backend.fermi_hubbard_terms(
+        builder.geometry,
+        t=0.2,
+        U=0.0,
+        mu=0.0,
+    )
+
+    schedule = builder.build_schedule()
+    parameters = builder.initialize_parameters(schedule)
+    chunks = builder.parametric_lightcone_chunks(
+        terms[:1], schedule, convert_terms=False,
+    )
+    compiled = builder.compile_parametric_lightcones(
+        chunks=chunks,
+        schedule=schedule,
+        convert_terms=False,
+    )
+    value = builder.compiled_parametric_loss(
+        parameters,
+        schedule=schedule,
+        compiled_chunks=compiled,
+        energy_per_site=False,
+        real=False,
+    )
+    direct = builder.parametric_loss(
+        parameters,
+        schedule=schedule,
+        chunks=chunks,
+        convert_terms=False,
+        energy_per_site=False,
+        real=False,
+    )
+
+    assert compiled[0].is_graded
+    assert compiled[0].contraction_backend == "symmray"
+    assert compiled[0].symmetry == "U1U1"
+    assert complex(value) == pytest.approx(complex(direct))
+
+
+def test_qmera_compiled_native_pbc_terms_match_each_explicit_cone():
+    """A compiled periodic Hubbard cone agrees term-by-term with Symmray."""
+    pytest.importorskip("symmray")
+    geometry = QMeraGeometry(
+        shape=(2, 2),
+        boundary="periodic",
+        site_modes=("up", "down"),
+        mode_order="mode-major",
+    )
+    backend = QMeraSymmrayFermionBackend(
+        symmetry="U1U1",
+        site_modes=("up", "down"),
+        mode_order="mode-major",
+    )
+    registry = symmray_fermion_gate_registry(backend=backend)
+
+    def product_state_factory(schedule, sites, **kwargs):
+        occupations = {0: 1, 1: 0, 2: 0, 3: 1, 4: 0, 5: 0, 6: 0, 7: 0}
+        return backend.product_state(
+            schedule,
+            sites,
+            occupations=occupations,
+            **kwargs,
+        )
+
+    builder = QMeraBuilder(
+        geometry=geometry,
+        gate_registry=registry,
+        gate_family="symmray-fsim",
+        disentangler={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        isometry={
+            "block_size": (2, 2),
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        max_layers=1,
+        seed=12,
+        param_scale=0.07,
+        product_state_factory=product_state_factory,
+    )
+    schedule = builder.build_schedule()
+    parameters = builder.initialize_parameters(schedule)
+    terms = qmera_symmray_fermi_hubbard_terms(
+        geometry,
+        backend=backend,
+        t=0.2,
+        U=0.5,
+        mu=0.1,
+        peierls_angle=np.pi / 3,
+    )
+    chunks = builder.parametric_lightcone_chunks(
+        terms,
+        schedule,
+        convert_terms=False,
+    )
+
+    class RecordingPathCache:
+        def __init__(self):
+            self.keys = []
+
+        def resolve(self, optimize, *, key=None):
+            self.keys.append(key)
+            return "greedy" if str(optimize).startswith("auto") else optimize
+
+    path_cache = RecordingPathCache()
+    compiled = builder.compile_parametric_lightcones(
+        chunks=chunks,
+        schedule=schedule,
+        convert_terms=False,
+        path_cache=path_cache,
+    )
+    compiled_values = [
+        local_qmera_compiled_lightcone_expectation(
+            schedule,
+            item,
+            parameters,
+            gate_registry=registry,
+            normalized=False,
+            real=False,
+        )
+        for item in compiled
+    ]
+    explicit_values = [
+        contract_qmera_lightcone_tn(
+            builder.parametric_lightcone_tn(
+                chunk,
+                parameters,
+                schedule=schedule,
+                gate_array_backend=None,
+            ),
+            optimize="greedy",
+            normalized=False,
+            real=False,
+        )
+        for chunk in chunks
+    ]
+
+    assert len(compiled) == len(terms)
+    assert len(set(path_cache.keys)) < len(path_cache.keys)
+    for compiled_value, explicit_value in zip(compiled_values, explicit_values):
+        assert complex(compiled_value) == pytest.approx(complex(explicit_value))
+
+
+def test_qmera_compiled_native_z2_majorana_matches_explicit():
+    """The graded compiler also supports the parity-only Majorana symmetry."""
+    pytest.importorskip("symmray")
+    geometry = QMeraGeometry(
+        shape=(2, 2),
+        boundary="periodic",
+        site_modes=("mode",),
+        mode_order="mode-major",
+    )
+    backend = QMeraSymmrayFermionBackend(
+        symmetry="Z2",
+        site_modes=("mode",),
+    )
+    registry = symmray_majorana_gate_registry(backend=backend)
+    builder = QMeraBuilder(
+        geometry=geometry,
+        gate_registry=registry,
+        gate_family="symmray-majorana",
+        disentangler={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-majorana",
+        },
+        isometry={
+            "block_size": (2, 2),
+            "circuit_depth": 1,
+            "gate_family": "symmray-majorana",
+        },
+        max_layers=1,
+        seed=15,
+        param_scale=0.03,
+        product_state_factory=backend.product_state,
+    )
+    schedule = builder.build_schedule()
+    parameters = builder.initialize_parameters(schedule)
+    terms = qmera_symmray_majorana_terms(
+        geometry,
+        fermion=Fermion(spinful=False, symmetry="Z2"),
+        coupling=0.4,
+        pairing=0.2,
+    )
+    chunks = builder.parametric_lightcone_chunks(
+        terms,
+        schedule,
+        convert_terms=False,
+    )
+    compiled = builder.compile_parametric_lightcones(
+        chunks=chunks,
+        schedule=schedule,
+        convert_terms=False,
+        contraction_opt="greedy",
+    )
+    compiled_value = builder.compiled_parametric_loss(
+        parameters,
+        schedule=schedule,
+        compiled_chunks=compiled,
+        energy_per_site=False,
+        real=False,
+    )
+    explicit_value = builder.parametric_loss(
+        parameters,
+        schedule=schedule,
+        chunks=chunks,
+        convert_terms=False,
+        energy_per_site=False,
+        real=False,
+    )
+
+    assert compiled
+    assert all(item.is_graded and item.symmetry == "Z2" for item in compiled)
+    assert complex(compiled_value) == pytest.approx(complex(explicit_value))
+
+
+def test_qmera_compiled_native_symmray_torch_gradients_match_explicit():
+    """Graded compiled contractions keep the qMERA Torch parameter graph."""
+    pytest.importorskip("symmray")
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import backend_torch
+
+    gate_backend = backend_torch(dtype=torch.complex128)
+    backend = QMeraSymmrayFermionBackend(to_backend=gate_backend)
+    registry = symmray_fermion_gate_registry(backend=backend)
+
+    def product_state_factory(schedule, sites, **kwargs):
+        return backend.product_state(
+            schedule,
+            sites,
+            occupations={0: 1, 1: 0, 2: 0, 3: 1},
+            **kwargs,
+        )
+
+    builder = QMeraBuilder(
+        shape=2,
+        site_modes=backend.site_modes,
+        mode_order="mode-major",
+        gate_registry=registry,
+        gate_family="symmray-fsim",
+        isometry={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        max_layers=1,
+        seed=7,
+        param_scale=0.04,
+        product_state_factory=product_state_factory,
+    )
+    schedule = builder.build_schedule()
+    parameters = builder.cast_params(
+        builder.initialize_parameters(schedule),
+        backend="torch",
+        trainable=True,
+        dtype=torch.float64,
+    )
+    terms = backend.fermi_hubbard_terms(
+        builder.geometry,
+        t=0.2,
+        U=0.3,
+        mu=0.1,
+    )
+    chunks = builder.parametric_lightcone_chunks(
+        terms,
+        schedule,
+        convert_terms=False,
+    )
+    compiled = builder.compile_parametric_lightcones(
+        chunks=chunks,
+        schedule=schedule,
+        convert_terms=False,
+        contraction_opt="greedy",
+    )
+    compiled_value = builder.compiled_parametric_loss(
+        parameters,
+        schedule=schedule,
+        compiled_chunks=compiled,
+        energy_per_site=False,
+        real=True,
+    )
+    explicit_value = builder.parametric_loss(
+        parameters,
+        schedule=schedule,
+        chunks=chunks,
+        convert_terms=False,
+        energy_per_site=False,
+        real=True,
+    )
+    compiled_gradients = torch.autograd.grad(
+        compiled_value,
+        tuple(parameters.values()),
+        retain_graph=True,
+    )
+    explicit_gradients = torch.autograd.grad(
+        explicit_value,
+        tuple(parameters.values()),
+    )
+
+    assert compiled_value.requires_grad
+    assert explicit_value.requires_grad
+    assert float(compiled_value) == pytest.approx(float(explicit_value))
+    for compiled_gradient, explicit_gradient in zip(
+        compiled_gradients,
+        explicit_gradients,
+    ):
+        np.testing.assert_allclose(
+            compiled_gradient.detach().numpy(),
+            explicit_gradient.detach().numpy(),
+            rtol=1.0e-10,
+            atol=1.0e-10,
+        )
 
 
 def test_qmera_2d_multi_mode_schedule_retains_modes_and_pairs_like_modes():
@@ -1085,6 +1360,264 @@ def test_qmera_2d_fermion_and_majorana_direct_oracles_match_lightcones():
     assert complex(majorana_lightcone) == pytest.approx(complex(majorana_direct))
 
 
+def test_qmera_fermion_every_term_and_grouping_match_direct_oracle():
+    """Every native Hubbard term should agree before grouping is enabled."""
+    pytest.importorskip("symmray")
+    geometry = QMeraGeometry(
+        shape=(2, 2),
+        site_modes=("up", "down"),
+        mode_order="mode-major",
+    )
+    backend = QMeraSymmrayFermionBackend(
+        symmetry="U1U1",
+        site_modes=("up", "down"),
+        mode_order="mode-major",
+    )
+    registry = symmray_fermion_gate_registry(backend=backend)
+
+    def product_state_factory(schedule, sites, **kwargs):
+        occupations = {
+            site: int(
+                (sum(schedule.geometry.to_site(site)) % 2 == 0)
+                == (schedule.geometry.to_mode(site)[1] == "up")
+            )
+            for site in sites
+        }
+        return backend.product_state(
+            schedule,
+            sites,
+            occupations=occupations,
+            **kwargs,
+        )
+
+    builder = QMeraBuilder(
+        geometry=geometry,
+        gate_registry=registry,
+        gate_family="symmray-fsim",
+        disentangler={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        isometry={
+            "block_size": (2, 2),
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        max_layers=1,
+        seed=97,
+        param_scale=0.01,
+        product_state_factory=product_state_factory,
+    )
+    schedule = builder.build_schedule()
+    parameters = builder.initialize_parameters(schedule)
+    fermion = Fermion(spinful=True, symmetry="U1U1")
+    terms = builder.fermion_terms(fermion, t=0.2, U=0.7, mu=0.1)
+
+    for term in terms:
+        chunk = build_qmera_parametric_lightcone_chunks(schedule, (term,))
+        local = builder.parametric_loss(
+            parameters,
+            (term,),
+            schedule=schedule,
+            chunks=chunk,
+            convert_terms=False,
+            energy_per_site=False,
+            group_terms=False,
+            real=False,
+        )
+        direct = builder.direct_parametric_loss(
+            parameters,
+            (term,),
+            schedule=schedule,
+            convert_terms=False,
+            energy_per_site=False,
+            group_terms=False,
+            real=False,
+        )
+        assert complex(local) == pytest.approx(complex(direct))
+
+    grouped = builder.parametric_loss(
+        parameters,
+        terms,
+        schedule=schedule,
+        convert_terms=False,
+        energy_per_site=False,
+        group_terms=True,
+        real=False,
+    )
+    ungrouped = builder.parametric_loss(
+        parameters,
+        terms,
+        schedule=schedule,
+        convert_terms=False,
+        energy_per_site=False,
+        group_terms=False,
+        real=False,
+    )
+    assert complex(grouped) == pytest.approx(complex(ungrouped))
+
+
+def test_qmera_periodic_fermion_terms_match_jordan_wigner_fock_oracle():
+    """PBC native qMERA terms must match an independent JW Fock oracle."""
+    pytest.importorskip("symmray")
+
+    def jw_annihilate(num_modes, mode):
+        eye = np.eye(2)
+        zed = np.diag([1.0, -1.0])
+        lower = np.array([[0.0, 1.0], [0.0, 0.0]])
+        mats = [zed] * mode + [lower] + [eye] * (num_modes - mode - 1)
+        out = mats[0]
+        for matrix in mats[1:]:
+            out = np.kron(out, matrix)
+        return out
+
+    def fock_vector(state, geometry, backend):
+        full = state.contract(all)
+        labels = tuple(f"k{site}" for site in geometry.register_sites)
+        permutation = tuple(full.inds.index(label) for label in labels)
+        # The native contraction already carries the graded swap phases. The
+        # phase-aware reorder converts its output-index order to the canonical
+        # qMERA register order without applying a second bosonization gauge.
+        data = full.data.transpose(permutation, phase=True)
+        dense = np.asarray(data.to_dense())
+        occupation_positions = []
+        for axis, register_site in enumerate(geometry.register_sites):
+            mode = geometry.to_mode(register_site)
+            occupied_charge = backend.mode_index_map(mode)[1]
+            charges = []
+            for charge, size in data.indices[axis].chargemap.items():
+                charges.extend([charge] * int(size))
+            occupation_positions.append(
+                tuple(int(charge == occupied_charge) for charge in charges)
+            )
+
+        vector = np.zeros(2 ** geometry.num_modes, dtype=complex)
+        for index in np.ndindex(dense.shape):
+            flat = 0
+            for axis, local_index in enumerate(index):
+                flat = (flat << 1) | occupation_positions[axis][local_index]
+            vector[flat] = dense[index]
+        return vector
+
+    geometry = QMeraGeometry(
+        shape=(2, 2),
+        boundary="periodic",
+        site_modes=("up", "down"),
+        mode_order="mode-major",
+    )
+    backend = QMeraSymmrayFermionBackend(
+        symmetry="U1U1",
+        site_modes=("up", "down"),
+        mode_order="mode-major",
+    )
+    registry = symmray_fermion_gate_registry(backend=backend)
+
+    def product_state_factory(schedule, sites, **kwargs):
+        # The qMERA isometry pairs are (0, 2) and (1, 3) in this register
+        # ordering, so both native hopping directions are populated.
+        occupations = {
+            0: 1,
+            1: 0,
+            2: 0,
+            3: 1,
+            4: 0,
+            5: 0,
+            6: 0,
+            7: 0,
+        }
+        return backend.product_state(
+            schedule,
+            sites,
+            occupations=occupations,
+            **kwargs,
+        )
+
+    builder = QMeraBuilder(
+        geometry=geometry,
+        gate_registry=registry,
+        gate_family="symmray-fsim",
+        disentangler={
+            "block_size": 2,
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        isometry={
+            "block_size": (2, 2),
+            "circuit_depth": 1,
+            "gate_family": "symmray-fsim",
+        },
+        max_layers=1,
+        seed=12,
+        param_scale=0.2,
+        product_state_factory=product_state_factory,
+    )
+    schedule = builder.build_schedule()
+    parameters = builder.initialize_parameters(schedule)
+    state, _ = builder.build_state(parameters, schedule)
+    vector = fock_vector(state, geometry, backend)
+    norm = np.vdot(vector, vector)
+    assert norm == pytest.approx(1.0)
+
+    t, U, mu, angle = 0.2, 0.5, 0.1, np.pi / 3
+    terms = qmera_symmray_fermi_hubbard_terms(
+        geometry,
+        backend=backend,
+        t=t,
+        U=U,
+        mu=mu,
+        peierls_angle=angle,
+    )
+    annihilators = [
+        jw_annihilate(geometry.num_modes, mode)
+        for mode in range(geometry.num_modes)
+    ]
+    number_operators = [
+        operator.conj().T @ operator for operator in annihilators
+    ]
+
+    native_total = 0.0j
+    oracle_total = 0.0j
+    for term in terms:
+        kind = term.metadata["kind"]
+        if kind == "hubbard-onsite":
+            site = term.metadata["site"]
+            up = geometry.mode_register(site, "up")
+            down = geometry.mode_register(site, "down")
+            oracle_operator = U * number_operators[up] @ number_operators[down]
+        elif kind == "hubbard-chemical":
+            site = term.metadata["site"]
+            mode = geometry.mode_register(site, term.metadata["mode"])
+            oracle_operator = -mu * number_operators[mode]
+        else:
+            left, right = term.metadata["edge"]
+            mode = term.metadata["mode"]
+            left_mode = geometry.mode_register(left, mode)
+            right_mode = geometry.mode_register(right, mode)
+            oracle_operator = -t * (
+                np.exp(1.0j * angle)
+                * annihilators[left_mode].conj().T
+                @ annihilators[right_mode]
+                + np.exp(-1.0j * angle)
+                * annihilators[right_mode].conj().T
+                @ annihilators[left_mode]
+            )
+
+        native_term_state = state.gate_inds(
+            term.operator,
+            inds=tuple(geometry.site_ind(site) for site in term.where),
+            contract=False,
+            inplace=False,
+        )
+        native_value = (state.H & native_term_state).contract(all) / norm
+        oracle_value = np.vdot(vector, oracle_operator @ vector) / norm
+        assert complex(native_value) == pytest.approx(complex(oracle_value))
+        native_total += native_value
+        oracle_total += oracle_value
+
+    assert complex(native_total) == pytest.approx(complex(oracle_total))
+
+
 def test_qmera_grouped_and_direct_energy_match_schedule_lightcones():
     """Grouping and the full direct-gate oracle must preserve local energy."""
     builder = QMeraBuilder(shape=8, seed=12, param_scale=0.02)
@@ -1120,7 +1653,7 @@ def test_qmera_contraction_path_cache_reuses_topology_optimizer(monkeypatch):
         return object()
 
     monkeypatch.setattr(
-        "pepsy.optimizers.mera.cache.build_qmera_contraction_optimizer",
+        "pepsy.optimizers.qmera.cache.build_qmera_contraction_optimizer",
         fake_builder,
     )
     cache = QMeraContractionPathCache({"directory": False})
@@ -1206,13 +1739,13 @@ def test_qmera_builder_outputs_parameters_gates_state_and_lightcone_tags():
     assert "DISENTANGLER" in ansatz.state.tags
     assert "ISOMETRY" in ansatz.state.tags
 
-    opt = MeraEnergyOptimizer(
-        ansatz.state,
+    value = builder.parametric_loss(
+        ansatz.parameters,
         {(0, 1): _zz_term()},
+        schedule=ansatz.schedule,
         energy_per_site=False,
-        contraction_opt="auto-hq",
     )
-    assert np.isfinite(float(opt.loss()))
+    assert np.isfinite(float(value))
 
 
 def test_qmera_schedule_lightcone_chunks_follow_placements():
@@ -1224,39 +1757,39 @@ def test_qmera_schedule_lightcone_chunks_follow_placements():
         seed=19,
         param_scale=0.1,
     )
-    ansatz = builder.build()
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
     op = _zz_term()
 
-    chunks = build_qmera_lightcone_chunks(
-        ansatz.state,
-        ansatz.schedule,
-        normalize_local_terms({(0, 1): op}),
-    )
-    opt = MeraEnergyOptimizer(
-        ansatz,
+    chunks = builder.parametric_lightcone_chunks(
         {(0, 1): op},
+        schedule,
+    )
+    value = builder.parametric_loss(
+        params,
+        {(0, 1): op},
+        schedule=schedule,
+        chunks=chunks,
         energy_per_site=False,
-        contraction_opt="auto-hq",
+        real=False,
     )
-    direct = ansatz.state.compute_local_expectation_exact(
+    direct = builder.direct_parametric_loss(
+        params,
         {(0, 1): op},
-        optimize="auto-hq",
-        normalized=True,
+        schedule=schedule,
+        energy_per_site=False,
+        real=False,
     )
     expected_ids = tuple(
         placement.gate_id
-        for placement in ansatz.schedule.reverse_lightcone_placements((0, 1))
+        for placement in schedule.reverse_lightcone_placements((0, 1))
     )
 
-    assert opt.schedule is ansatz.schedule
-    assert opt.lightcones[0].tags == chunks[0].tags
-    assert opt.lightcones[0].schedule_placement_ids == chunks[0].schedule_placement_ids
-    assert chunks[0].source == "schedule"
+    assert chunks[0].source == "parametric-schedule"
     assert chunks[0].schedule_placement_ids == expected_ids
     assert any(tag.startswith("GATE_L0_DIS") for tag in chunks[0].tags)
     assert chunks[0].schedule_width >= chunks[0].support_size
-    assert complex(opt.loss(real=False)) == pytest.approx(complex(direct))
-    assert opt.energy().metadata["lightcone_sources"] == ("schedule",)
+    assert complex(value) == pytest.approx(complex(direct))
 
 
 def test_qmera_schedule_lightcone_chunks_map_coordinate_terms():
@@ -1268,29 +1801,39 @@ def test_qmera_schedule_lightcone_chunks_map_coordinate_terms():
         seed=20,
         param_scale=0.03,
     )
-    ansatz = builder.build()
+    schedule = builder.build_schedule()
+    params = builder.initialize_parameters(schedule)
     op = _zz_term()
 
-    opt = MeraEnergyOptimizer(
-        ansatz,
-        {((0, 0), (0, 1)): op},
+    hamiltonian = {((0, 0), (0, 1)): op}
+    chunks = builder.parametric_lightcone_chunks(
+        hamiltonian,
+        schedule,
+    )
+    value = builder.parametric_loss(
+        params,
+        hamiltonian,
+        schedule=schedule,
+        chunks=chunks,
         energy_per_site=False,
-        contraction_opt="auto-hq",
+        real=False,
     )
-    chunk = opt.lightcones[0]
-    direct = ansatz.state.compute_local_expectation_exact(
-        {(0, 1): op},
-        optimize="auto-hq",
-        normalized=True,
+    direct = builder.direct_parametric_loss(
+        params,
+        hamiltonian,
+        schedule=schedule,
+        energy_per_site=False,
+        real=False,
     )
+    chunk = chunks[0]
 
-    assert chunk.source == "schedule"
+    assert chunk.source == "parametric-schedule"
     assert chunk.term.where == (0, 1)
     assert chunk.term.metadata["original_where"] == ((0, 0), (0, 1))
     assert chunk.term.metadata["register_where"] == (0, 1)
     assert chunk.schedule_placement_ids
     assert chunk.schedule_width_by_scale
-    assert complex(opt.loss(real=False)) == pytest.approx(complex(direct))
+    assert complex(value) == pytest.approx(complex(direct))
 
 
 def test_qmera_parametric_lightcone_loss_rebuilds_local_cone_from_params():
@@ -1533,6 +2076,9 @@ def test_qmera_parametric_optimizer_runs_compiled_torch_solver():
     )
 
     assert isinstance(opt, QMeraParametricEnergyOptimizer)
+    assert isinstance(opt, QMeraEnergyOptimizer)
+    assert QMeraEnergyOptimizer is QMeraParametricEnergyOptimizer
+    assert opt.loss_kwargs["normalized"] is False
     assert np.isfinite(float(initial))
     assert result.solver == "torch-adam"
     assert len(result.history) == 2
@@ -1721,5 +2267,40 @@ def test_qmera_2d_draw_schematic_builds_quimb_drawing():
     )
     assert isinstance(clean_drawing, schematic.Drawing)
     assert isinstance(register_drawing, schematic.Drawing)
+
+    # Each RG scale should start from the same left edge. This catches the
+    # easy-to-miss cursor drift that makes later 2D scales look detached.
+    all_layers = builder.draw_schematic(
+        style="clean",
+        label_sites=False,
+        label_blocks=False,
+        scale_figsize=False,
+    )
+    input_labels = [
+        text
+        for text in all_layers.ax.texts
+        if text.get_text() == "input"
+    ]
+    assert len(input_labels) == 2
+    assert input_labels[0].get_position()[0] == pytest.approx(
+        input_labels[1].get_position()[0]
+    )
+    assert input_labels[0].get_position()[1] != pytest.approx(
+        input_labels[1].get_position()[1]
+    )
+
+    first_step = builder.draw_schematic(
+        rg_step=0,
+        style="clean",
+        label_sites=False,
+        label_blocks=True,
+        scale_figsize=False,
+    )
+    assert sum(text.get_text() == "input" for text in first_step.ax.texts) == 1
+    assert sum(text.get_text() == "coarse" for text in first_step.ax.texts) == 1
+    assert any(text.get_text().startswith("D[") for text in first_step.ax.texts)
+    assert any(text.get_text().startswith("W[") for text in first_step.ax.texts)
+    with pytest.raises(TypeError, match="only one of layer= or rg_step="):
+        builder.draw_schematic(layer=0, rg_step=0)
     with pytest.raises(ValueError, match="style"):
         builder.draw_schematic(layer=0, style="unknown")

@@ -1,4 +1,4 @@
 interface:
   display_name: "qMERA Energy Optimizer"
-  short_description: "Design and extend Pepsy qMERA/MERA optimization."
+  short_description: "Design and extend Pepsy qMERA optimization."
   default_prompt: "Use $qmera-energy-optimizer to design or extend Pepsy qMERA energy optimization from the current schedule-first implementation."

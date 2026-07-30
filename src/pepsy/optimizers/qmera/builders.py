@@ -78,13 +78,17 @@ class QMeraAnsatz:
         """Return schedule tags in the reverse lightcone of ``where``."""
         return self.schedule.reverse_lightcone_tags(where)
 
-    def schematic_blocks(self, *, layer=None):
-        """Return display-oriented disentangler/isometry blocks."""
-        return self.schedule.schematic_blocks(layer=layer)
+    def schematic_blocks(self, *, layer=None, rg_step=None):
+        """Return display blocks for one or more RG steps."""
+        return self.schedule.schematic_blocks(layer=layer, rg_step=rg_step)
 
-    def draw_schematic(self, *, layer=None, **kwargs):
+    def draw_schematic(self, *, layer=None, rg_step=None, **kwargs):
         """Draw qMERA blocking for this ansatz."""
-        return self.schedule.draw_schematic(layer=layer, **kwargs)
+        return self.schedule.draw_schematic(
+            layer=layer,
+            rg_step=rg_step,
+            **kwargs,
+        )
 
 
 def _coerce_geometry(
@@ -344,13 +348,20 @@ class QMeraBuilder:
             self._validate_unitary_spec(scale.isometry)
         return schedule
 
-    def schematic_blocks(self, *, layer=None):
-        """Return display-oriented disentangler/isometry blocks."""
-        return self.build_schedule().schematic_blocks(layer=layer)
+    def schematic_blocks(self, *, layer=None, rg_step=None):
+        """Return display blocks for one or more RG steps."""
+        return self.build_schedule().schematic_blocks(
+            layer=layer,
+            rg_step=rg_step,
+        )
 
-    def draw_schematic(self, *, layer=None, **kwargs):
+    def draw_schematic(self, *, layer=None, rg_step=None, **kwargs):
         """Draw the qMERA blocking implied by this builder."""
-        return self.build_schedule().draw_schematic(layer=layer, **kwargs)
+        return self.build_schedule().draw_schematic(
+            layer=layer,
+            rg_step=rg_step,
+            **kwargs,
+        )
 
     def contraction_optimizer(self, **kwargs):
         """Build a reusable contraction optimizer for repeated local cones."""
@@ -717,6 +728,7 @@ class QMeraBuilder:
         convert_terms=True,
         contraction_opt="auto-hq",
         expression_opts=None,
+        path_cache=None,
     ):
         """Compile static contraction expressions for qMERA local cones."""
         schedule = self.build_schedule() if schedule is None else schedule
@@ -740,6 +752,8 @@ class QMeraBuilder:
             physical_dim=self.physical_dim,
             optimize=contraction_opt,
             expression_opts=expression_opts,
+            product_state_factory=self.product_state_factory,
+            path_cache=path_cache,
         )
 
     def compiled_parametric_loss(
@@ -758,6 +772,7 @@ class QMeraBuilder:
         real=True,
         contraction_opt="auto-hq",
         expression_opts=None,
+        path_cache=None,
     ):
         """Evaluate qMERA energy with precompiled local-cone contractions."""
         schedule = self.build_schedule() if schedule is None else schedule
@@ -778,6 +793,8 @@ class QMeraBuilder:
             energy_per_site=energy_per_site,
             real=real,
             expression_opts=expression_opts,
+            product_state_factory=self.product_state_factory,
+            path_cache=path_cache,
         )
 
     def compiled_parametric_loss_fn(
@@ -813,8 +830,14 @@ class QMeraBuilder:
         parameters=None,
         **loss_kwargs,
     ):
-        """Create a parameter-dict qMERA energy optimizer shell."""
-        from .parametric import QMeraParametricEnergyOptimizer
+        """Create the parameterized qMERA energy optimizer.
+
+        Built-in qMERA gates are unitary by construction, so the optimizer
+        uses the numerator expectation value directly by default.  Set
+        ``normalized=True`` in ``loss_kwargs`` for a custom non-unitary gate
+        family.
+        """
+        from .parametric import QMeraEnergyOptimizer
 
         schedule = self.build_schedule() if schedule is None else schedule
         if chunks is None:
@@ -826,7 +849,9 @@ class QMeraBuilder:
             )
         if parameters is None:
             parameters = self.initialize_parameters(schedule)
-        return QMeraParametricEnergyOptimizer(
+        loss_kwargs = dict(loss_kwargs)
+        loss_kwargs.setdefault("normalized", False)
+        return QMeraEnergyOptimizer(
             builder=self,
             schedule=schedule,
             hamiltonian=hamiltonian,

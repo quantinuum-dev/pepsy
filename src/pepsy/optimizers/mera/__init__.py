@@ -1,128 +1,35 @@
-"""MERA and qMERA energy optimization helpers."""
+"""Compatibility namespace for the former qMERA package name.
 
-from .builders import QMeraAnsatz, QMeraBuilder
-from .cache import QMeraContractionPathCache, build_qmera_contraction_optimizer
-from .compiled import (
-    QMeraCompiledLightconeChunk,
-    compile_qmera_parametric_lightcone,
-    compile_qmera_parametric_lightcones,
-    local_qmera_compiled_lightcone_expectation,
-    qmera_compiled_parametric_energy,
-)
-from .fermions import (
-    QMeraSymmrayFermionBackend,
-    qmera_symmray_fermi_hubbard_terms,
-    qmera_symmray_majorana_terms,
-    symmray_fermion_gate_registry,
-    symmray_majorana_gate_registry,
-)
-from .gates import (
-    GateRegistry,
-    GateSpec,
-    UserGateFamily,
-    default_gate_registry,
-    resolve_gate_spec,
-)
-from .geometry import QMeraGeometry
-from .lightcones import (
-    LightconeChunk,
-    QMeraLightconeTN,
-    QMeraLightconeGroup,
-    QMeraParametricLightconeChunk,
-    build_lightcone_chunks,
-    build_qmera_lightcone_chunks,
-    build_qmera_parametric_lightcone_chunks,
-    contract_qmera_lightcone_group,
-    contract_qmera_lightcone_tn,
-    group_qmera_parametric_lightcone_chunks,
-    lightcone_energy,
-    local_qmera_parametric_lightcone_expectation,
-    local_lightcone_expectation,
-    qmera_parametric_energy,
-    qmera_direct_parametric_energy,
-    qmera_parametric_lightcone_group_state,
-    qmera_parametric_state,
-    qmera_parametric_lightcone_state,
-    qmera_parametric_lightcone_tn,
-    select_lightcone,
-    site_tags_for_where,
-)
-from .optimizer import MeraEnergyOptimizer
-from .parametric import QMeraParametricEnergyOptimizer
-from .schedules import (
-    QMeraBlockSpec,
-    QMeraDisentanglerSpec,
-    QMeraGatePlacement,
-    QMeraIsometrySpec,
-    QMeraLayerSpec,
-    QMeraScaleSpec,
-    QMeraSchedule,
-    QMeraUnitarySpec,
-    build_qmera_schedule,
-)
-from .schematics import (
-    QMeraSchematicBlock,
-    draw_qmera_schedule,
-    qmera_schematic_blocks,
-)
-from .terms import LocalTerm, normalize_local_terms
+Use :mod:`pepsy.optimizers.qmera` for all new code. This module only aliases
+the canonical qMERA implementation so existing imports keep working during
+the namespace migration.
+"""
 
-__all__ = [
-    "GateRegistry",
-    "GateSpec",
-    "LightconeChunk",
-    "LocalTerm",
-    "MeraEnergyOptimizer",
-    "QMeraAnsatz",
-    "QMeraBlockSpec",
-    "QMeraBuilder",
-    "QMeraCompiledLightconeChunk",
-    "QMeraContractionPathCache",
-    "QMeraDisentanglerSpec",
-    "QMeraGatePlacement",
-    "QMeraGeometry",
-    "QMeraIsometrySpec",
-    "QMeraLayerSpec",
-    "QMeraLightconeTN",
-    "QMeraLightconeGroup",
-    "QMeraParametricLightconeChunk",
-    "QMeraParametricEnergyOptimizer",
-    "QMeraSchedule",
-    "QMeraScaleSpec",
-    "QMeraSchematicBlock",
-    "QMeraSymmrayFermionBackend",
-    "QMeraUnitarySpec",
-    "UserGateFamily",
-    "build_lightcone_chunks",
-    "build_qmera_contraction_optimizer",
-    "build_qmera_lightcone_chunks",
-    "build_qmera_parametric_lightcone_chunks",
-    "build_qmera_schedule",
-    "compile_qmera_parametric_lightcone",
-    "compile_qmera_parametric_lightcones",
-    "contract_qmera_lightcone_tn",
-    "contract_qmera_lightcone_group",
-    "default_gate_registry",
-    "draw_qmera_schedule",
-    "local_qmera_compiled_lightcone_expectation",
-    "local_qmera_parametric_lightcone_expectation",
-    "local_lightcone_expectation",
-    "normalize_local_terms",
-    "qmera_compiled_parametric_energy",
-    "qmera_direct_parametric_energy",
-    "qmera_parametric_energy",
-    "qmera_parametric_lightcone_group_state",
-    "qmera_parametric_lightcone_state",
-    "qmera_parametric_state",
-    "qmera_parametric_lightcone_tn",
-    "qmera_schematic_blocks",
-    "qmera_symmray_fermi_hubbard_terms",
-    "qmera_symmray_majorana_terms",
-    "resolve_gate_spec",
-    "group_qmera_parametric_lightcone_chunks",
-    "lightcone_energy",
-    "select_lightcone",
-    "site_tags_for_where",
-    "symmray_fermion_gate_registry",
-    "symmray_majorana_gate_registry",
-]
+from importlib import import_module
+import sys
+
+from ..qmera import *  # noqa: F401,F403
+from ..qmera import __all__ as __all__
+
+
+for _module_name in (
+    "builders",
+    "cache",
+    "compiled",
+    "fermions",
+    "gates",
+    "geometry",
+    "layout",
+    "lightcones",
+    "parametric",
+    "prototype",
+    "schedules",
+    "schematics",
+    "terms",
+):
+    sys.modules.setdefault(
+        f"{__name__}.{_module_name}",
+        import_module(f"..qmera.{_module_name}", __name__),
+    )
+
+del import_module, sys, _module_name

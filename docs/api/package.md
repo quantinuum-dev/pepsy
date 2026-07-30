@@ -39,7 +39,7 @@ from pepsy.tensors import OneDMap, ps_to_mps, ps_to_peps, tn_norm
 | --- | --- | --- |
 | Belief propagation | `pepsy.bp` | BP, relay gauges, loop corrections, and PNE |
 | VMC | `pepsy.vmc` | Torch and NetKet/JAX variational Monte Carlo |
-| MERA | `pepsy.optimizers.mera` | qMERA geometry and energy optimization |
+| qMERA | `pepsy.optimizers.qmera` | qMERA geometry, gates, and energy optimization |
 | Stabilizer TN | `pepsy.optimizers.stabilizer_tn` | Stim tableau plus coefficient-MPS simulation |
 | Tree TN | `pepsy.optimizers.tree` | Tree layout and circuit replay |
 | Tree stabilizer | `pepsy.optimizers.tree_stabilizer` | Tableau plus tree-coefficient simulation |

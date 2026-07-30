@@ -1,4 +1,4 @@
-"""Reverse-lightcone selection and local expectation kernels for MERA states."""
+"""Reverse-lightcone selection and local qMERA expectation kernels."""
 
 from __future__ import annotations
 
@@ -13,22 +13,18 @@ from .gates import default_gate_registry, resolve_gate_spec
 from .terms import LocalTerm, convert_local_terms, normalize_local_terms
 
 __all__ = [
-    "LightconeChunk",
     "QMeraLightconeGroup",
     "QMeraLightconeTN",
     "QMeraParametricLightconeChunk",
-    "build_lightcone_chunks",
     "build_qmera_lightcone_chunks",
     "build_qmera_parametric_lightcone_chunks",
     "group_qmera_parametric_lightcone_chunks",
     "contract_qmera_lightcone_tn",
     "contract_qmera_lightcone_group",
-    "lightcone_energy",
     "qmera_direct_parametric_energy",
     "qmera_parametric_state",
     "qmera_parametric_lightcone_group_state",
     "local_qmera_parametric_lightcone_expectation",
-    "local_lightcone_expectation",
     "qmera_parametric_energy",
     "qmera_parametric_lightcone_state",
     "qmera_parametric_lightcone_tn",
@@ -293,7 +289,7 @@ def build_qmera_lightcone_chunks(state, schedule, terms, *, validate=True):
     """Precompute lightcone chunks from an explicit qMERA schedule.
 
     Unlike :func:`build_lightcone_chunks`, this follows
-    :class:`~pepsy.optimizers.mera.QMeraSchedule` placements first and only then
+    :class:`~pepsy.optimizers.qmera.QMeraSchedule` placements first and only then
     turns the selected sites/gates into tensor-network tags. This keeps local
     energy chunks tied to the designed RG blocks rather than to a generic tag
     query on an already-built network.
@@ -975,7 +971,7 @@ def _lightcone_state_and_schedule(state, schedule):
     ):
         return candidate, schedule
     raise TypeError(
-        "state must be a MERA-like TensorNetwork with select() and gate(), "
+        "state must be a qMERA TensorNetwork with select() and gate(), "
         "or an ansatz object exposing .state."
     )
 
