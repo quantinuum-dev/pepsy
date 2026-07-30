@@ -60,11 +60,15 @@ from pepsy.tensors import (
     reg_complex_qr_torch,
     reg_complex_svd_jax,
     reg_complex_svd_torch,
+    reg_native_svd_jax,
+    reg_native_svd_torch,
     reg_real_qr_torch,
     reg_real_svd_jax,
     reg_real_svd_torch,
     reg_rel_svd_jax,
     reg_rel_svd_torch,
+    register_jax_linalg,
+    reset_linalg_registrations,
     site_charge_from_occupations,
 )
 from pepsy.vmc import (
@@ -158,11 +162,15 @@ def test_new_namespace_imports_resolve():
     assert callable(reg_rel_svd_torch)
     assert callable(reg_real_svd_torch)
     assert callable(reg_complex_svd_torch)
+    assert callable(reg_native_svd_jax)
+    assert callable(reg_native_svd_torch)
     assert callable(reg_real_qr_torch)
     assert callable(reg_complex_qr_torch)
     assert callable(reg_rel_svd_jax)
     assert callable(reg_real_svd_jax)
     assert callable(reg_complex_svd_jax)
+    assert callable(register_jax_linalg)
+    assert callable(reset_linalg_registrations)
     assert callable(site_charge_from_occupations)
     assert FermionSiteEncoding is not None
     assert ContractionConfig is not None
