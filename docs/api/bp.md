@@ -186,6 +186,10 @@ limits raise `OpenLoopEnumerationLimitError` rather than returning a partial
 sum. `gloops` remains a compatibility alias, but new code should use the
 route-specific names.
 
+Use `max_loop_terms` for a separate budget on closed-loop and path-plus-loop
+corrections. This lets nearby supports retain a richer loop tail while keeping
+long-range measurements focused on their shortest connecting paths.
+
 For very distant supports, set `corridor_width` to use the bounded corridor
 route. It retains a small weighted-shortest-path beam, inflates those paths
 by the requested graph width, and adds connected loop decorations only near
@@ -255,6 +259,52 @@ cost report; distinct operator values with the same support and shape do not
 share numerical results. If no `diagnostic` is supplied, scalar measurement
 with `mode="auto"` performs this diagnostic pass internally before starting
 the numerical contractions.
+
+For production measurements, use `on_budget="raise"` and request the
+auditable result record:
+
+```python
+from pepsy.bp import OpenLoopMeasurementResult
+
+result = compute_local_expectation_open_loop_series(
+    peps.tn,
+    {support: gate},
+    mode="auto",
+    on_budget="raise",
+    measure_resources=True,
+    return_result=True,
+)
+assert isinstance(result, OpenLoopMeasurementResult)
+assert result.complete and result.bp_converged
+```
+
+The default `on_budget="report"` preserves historical partial-sum behavior
+but records `complete=False` and omitted terms in `info`. `on_budget="skip"`
+is available for exploratory workflows. Cotengra estimates remain preflight
+guards; `measure_resources=True` additionally records observed Python and
+host-RSS high-water marks. The same flags are available on
+`partial_trace_open_loop_series_expand`; its result record stores the rho in
+`result.value` and its trace in `result.normalization`.
+
+For controlled convergence, use an adaptive corridor or cluster ladder:
+
+```python
+from pepsy.bp import adaptive_open_loop_series
+
+ladder = adaptive_open_loop_series(
+    peps.tn,
+    {support: gate},
+    corridor_widths=(0, 1, 2, 4),
+    on_budget="raise",
+)
+value = ladder.value
+```
+
+The ladder tests numerical stabilization, not a rigorous truncation bound.
+For cyclic native fermions, pass `cluster_sizes=(...)` instead. The
+`diagnose_open_rho_series` helper adds physical output shape and output-memory
+estimates. Rectangular PBC corridor discovery treats the virtual graph as a
+multigraph, so period-two seam bonds remain distinct paths and loop edges.
 
 This path performs an explicit configuration sum and normalizes only after
 the sum; it does not apply the scalar disconnected-loop resummation used by

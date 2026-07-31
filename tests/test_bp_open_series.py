@@ -9,17 +9,25 @@ import quimb.tensor as qtn
 
 from pepsy.bp import (
     OpenLoopEnumerationLimitError,
+    OpenLoopBudgetError,
+    OpenLoopMeasurementResult,
     OpenLoopObservableTerm,
     OpenLoopSeriesCache,
     OpenLoopSeriesDiagnosticCache,
     OpenLoopSeriesSweepResult,
     compute_local_expectation_open_loop_series,
+    adaptive_open_loop_series,
+    diagnose_open_rho_series,
     diagnose_open_loop_series,
     partial_trace_open_loop_series_expand,
     partial_trace_open_loop_series_sweep,
     two_norm_bp,
 )
-from pepsy.bp.series import _open_term_family
+from pepsy.bp.series import (
+    _discover_grid_corridor_paths,
+    _grid_corridor_context,
+    _open_term_family,
+)
 
 
 def _edge_degrees(tn, edges):
@@ -235,6 +243,28 @@ def test_corridor_mode_limits_geometry_before_contraction():
         )
 
 
+def test_loop_term_budget_is_separate_from_total_term_budget():
+    state = qtn.PEPS.rand(
+        3,
+        3,
+        bond_dim=2,
+        phys_dim=2,
+        seed=1938,
+        dtype="complex128",
+    )
+    with pytest.raises(OpenLoopEnumerationLimitError, match="max_loop_terms"):
+        partial_trace_open_loop_series_expand(
+            state,
+            ((0, 0), (0, 2)),
+            edge_cutoff=6,
+            max_terms=100,
+            max_loop_terms=0,
+            max_iterations=200,
+            tol=1e-10,
+            diis=False,
+        )
+
+
 def test_corridor_mode_can_use_compressed_boundary_contraction():
     state = qtn.PEPS.rand(
         1,
@@ -317,6 +347,7 @@ def test_open_measurement_diagnostic_selects_auto_route_and_reuses_terms():
     assert np.isfinite(value)
     assert info["open_scalar_mode"] == "auto"
     assert tuple(info["open_scalar_requested_terms"]) == support["terms"]
+    assert info["open_scalar_region_path_cache"]
 
     cached = diagnose_open_loop_series(
         state,
@@ -603,6 +634,153 @@ def test_open_series_reuses_contraction_paths_for_shared_regions():
     assert len(info["open_rho_region_path_cache"]) < len(
         info["open_rho_terms_list"]
     )
+
+
+def test_pbc_corridor_keeps_parallel_period_two_bonds_as_distinct_paths():
+    """A 3x2 torus is a multigraph, not a simple coordinate graph."""
+    state = qtn.PEPS.rand(
+        3,
+        2,
+        bond_dim=2,
+        phys_dim=2,
+        cyclic=(True, True),
+        seed=1948,
+    )
+    context = _grid_corridor_context(state)
+    neighbors = list(context["neighbors"]((0, 0)))
+    seam_edges = {
+        edge for neighbor, _, edge in neighbors if neighbor == (0, 1)
+    }
+    assert len(seam_edges) == 2
+
+    paths, corridor_edges, diagnostics = _discover_grid_corridor_paths(
+        state,
+        ((0, 0), (2, 1)),
+        corridor_width=0,
+        max_path_candidates=20,
+    )
+    assert diagnostics["path_count"] == 4
+    assert len({path.edges for path in paths}) == 4
+    assert len(corridor_edges) == len(set(corridor_edges))
+    assert all(len(path.edges) == 2 for path in paths)
+
+
+def test_open_series_production_result_reports_budget_and_resources():
+    state = qtn.PEPS.rand(
+        1,
+        4,
+        bond_dim=2,
+        phys_dim=2,
+        seed=1949,
+        dtype="complex128",
+    )
+    result = compute_local_expectation_open_loop_series(
+        state,
+        {((0, 0), (0, 3)): np.eye(4)},
+        edge_cutoff=3,
+        max_flops_log10=2.0,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+        return_result=True,
+        measure_resources=True,
+    )
+    assert isinstance(result, OpenLoopMeasurementResult)
+    assert not result.complete
+    assert result.omitted_terms
+    assert result.resources["enabled"]
+    assert result.info["open_scalar_complete"] is False
+    with pytest.raises(OpenLoopBudgetError):
+        compute_local_expectation_open_loop_series(
+            state,
+            {((0, 0), (0, 3)): np.eye(4)},
+            edge_cutoff=3,
+            max_flops_log10=2.0,
+            max_iterations=200,
+            tol=1e-10,
+            diis=False,
+            on_budget="raise",
+        )
+
+
+def test_rho_diagnostic_and_adaptive_corridor_ladder():
+    state = qtn.PEPS.rand(
+        1,
+        4,
+        bond_dim=2,
+        phys_dim=2,
+        seed=1950,
+        dtype="complex128",
+    )
+    support = ((0, 0), (0, 3))
+    diagnostic = diagnose_open_rho_series(
+        state,
+        (support,),
+        edge_cutoff=3,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+    )
+    record = diagnostic.for_support(support)
+    assert record["observable_kind"] == "rho"
+    assert record["output_shape"] == (4, 4)
+    assert record["logical_output_shape"] == (2, 2, 2, 2)
+    assert record["output_memory_bytes"] > 0
+
+    rho_result = partial_trace_open_loop_series_expand(
+        state,
+        support,
+        edge_cutoff=1,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+        measure_resources=True,
+        return_result=True,
+    )
+    assert isinstance(rho_result, OpenLoopMeasurementResult)
+    assert rho_result.value.shape == (4, 4)
+    assert rho_result.normalization is not None
+    assert rho_result.resources["enabled"]
+
+    adaptive = adaptive_open_loop_series(
+        state,
+        {support: np.eye(4)},
+        corridor_widths=(0, 1),
+        edge_cutoff=3,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+        min_stable=1,
+    )
+    assert adaptive.values
+    assert adaptive.settings[0]["corridor_width"] == 0
+    assert adaptive.diagnostics[0] is not None
+    assert adaptive.bp is not None
+
+
+def test_open_series_public_controls_are_validated_and_cache_is_positional_safe():
+    cache = OpenLoopSeriesDiagnosticCache({})
+    assert cache.diagnostics_by_key == {}
+
+    with pytest.raises(ValueError, match="positive integer"):
+        diagnose_open_rho_series(
+            None,
+            (((0, 0),),),
+            max_rho_identity_dimension=0,
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        adaptive_open_loop_series(
+            None,
+            {},
+            corridor_widths=(-1,),
+        )
+    with pytest.raises(ValueError, match="positive integer"):
+        adaptive_open_loop_series(
+            None,
+            {},
+            corridor_widths=(0,),
+            min_stable=0,
+        )
 
 
 def test_open_rho_series_reuses_one_d2bp_message_set():

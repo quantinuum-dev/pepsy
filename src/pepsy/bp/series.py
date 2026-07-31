@@ -30,6 +30,12 @@ import operator
 import sys
 import time
 from typing import Any, ClassVar
+import warnings
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows does not expose rusage.
+    resource = None
 
 import autoray as ar
 import numpy as np
@@ -52,7 +58,10 @@ from ._symmray import (
 )
 
 __all__ = [
+    "OpenLoopBudgetError",
     "OpenLoopEnumerationLimitError",
+    "OpenLoopMeasurementResult",
+    "OpenLoopAdaptiveResult",
     "OpenLoopObservableTerm",
     "OpenLoopSeriesDiagnostic",
     "OpenLoopSeriesDiagnosticCache",
@@ -64,6 +73,8 @@ __all__ = [
     "compute_local_expectation_edge_loop_series",
     "compute_local_expectation_open_loop_series",
     "diagnose_open_loop_series",
+    "diagnose_open_rho_series",
+    "adaptive_open_loop_series",
     "compute_local_expectation_loop_cluster",
     "partial_trace_loop_cluster_expand",
     "partial_trace_edge_loop_series_expand",
@@ -92,6 +103,156 @@ class OpenLoopEnumerationLimitError(RuntimeError):
             f"(observed {observed!r}); increase the limit or lower the "
             "edge cutoff"
         )
+
+
+class OpenLoopBudgetError(RuntimeError):
+    """Raised when a requested open-series contraction exceeds its budget."""
+
+
+@dataclass
+class OpenLoopMeasurementResult:
+    """Auditable result returned by the opt-in production API.
+
+    The legacy measurement functions continue to return a scalar or rho by
+    default.  ``return_result=True`` returns this record instead, keeping the
+    numerical value together with completeness, route, budget, BP, and
+    resource information.
+    """
+
+    value: Any
+    normalization: Any = None
+    info: dict[str, Any] = field(default_factory=dict)
+    diagnostic: "OpenLoopSeriesDiagnostic | None" = None
+    complete: bool = True
+    approximate: bool = False
+    route: str | None = None
+    omitted_terms: tuple[Any, ...] = ()
+    resources: dict[str, Any] = field(default_factory=dict)
+    bp_converged: bool | None = None
+    bp_iterations: int | None = None
+    bp_max_mdiff: float | None = None
+    bp: Any = field(default=None, repr=False)
+
+
+@dataclass
+class OpenLoopAdaptiveResult:
+    """Convergence ladder for corridor or native-cluster measurements."""
+
+    values: tuple[Any, ...]
+    settings: tuple[dict[str, Any], ...]
+    differences: tuple[float | None, ...]
+    converged: bool
+    selected_index: int | None
+    diagnostics: tuple[OpenLoopSeriesDiagnostic | None, ...] = ()
+    infos: tuple[dict[str, Any], ...] = ()
+    bp: Any = field(default=None, repr=False)
+
+    @property
+    def value(self):
+        """Return the last stable value, or the final value if unsettled."""
+        if not self.values:
+            return None
+        index = self.selected_index
+        return self.values[-1 if index is None else index]
+
+
+class _OpenLoopResourceMonitor:
+    """Small optional host-resource monitor for an open-series call.
+
+    ``tracemalloc`` measures Python allocations, while ``ru_maxrss`` gives a
+    process-level high-water mark including NumPy allocations on Unix.  They
+    are deliberately reported as observations, not exact tensor liveness
+    proofs.  Cotengra's symbolic peak remains the preflight guard.
+    """
+
+    def __init__(self, enabled):
+        self.enabled = bool(enabled)
+        self.started = time.perf_counter()
+        self._tracemalloc = None
+        self._owns_tracemalloc = False
+        if not self.enabled:
+            return
+        import tracemalloc
+
+        self._tracemalloc = tracemalloc
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
+            self._owns_tracemalloc = True
+        self._start = tracemalloc.get_traced_memory()
+        self._rss_start = self._rss()
+        self._gpu_start = self._gpu_snapshot()
+
+    @staticmethod
+    def _rss():
+        if resource is None:
+            return None
+        try:
+            value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            # Linux and the BSDs report KiB; macOS reports bytes.
+            return value if sys.platform == "darwin" else value * 1024
+        except (AttributeError, OSError):
+            return None
+
+    @staticmethod
+    def _gpu_snapshot():
+        snapshots = []
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                for device in range(torch.cuda.device_count()):
+                    snapshots.append(
+                        {
+                            "backend": "torch",
+                            "device": device,
+                            "current_bytes": int(
+                                torch.cuda.memory_allocated(device)
+                            ),
+                            "peak_bytes": int(
+                                torch.cuda.max_memory_allocated(device)
+                            ),
+                        }
+                    )
+        except (ImportError, RuntimeError):
+            pass
+        try:
+            import cupy
+
+            pool = cupy.get_default_memory_pool()
+            snapshots.append(
+                {
+                    "backend": "cupy",
+                    "device": int(cupy.cuda.Device().id),
+                    "current_bytes": int(pool.used_bytes()),
+                    "peak_bytes": None,
+                }
+            )
+        except (ImportError, RuntimeError, AttributeError):
+            pass
+        return snapshots
+
+    def finish(self):
+        result = {
+            "enabled": self.enabled,
+            "elapsed_seconds": time.perf_counter() - self.started,
+        }
+        if not self.enabled:
+            return result
+        current, peak = self._tracemalloc.get_traced_memory()
+        result.update(
+            {
+                "python_current_bytes": int(current),
+                "python_peak_bytes": int(peak),
+                "python_start_bytes": int(self._start[0]),
+                "host_rss_start_bytes": self._rss_start,
+                "host_rss_peak_bytes": self._rss(),
+                "gpu_start": self._gpu_start,
+                "gpu_end": self._gpu_snapshot(),
+            }
+        )
+        if self._owns_tracemalloc:
+            self._tracemalloc.stop()
+        return result
 
 
 @dataclass(frozen=True)
@@ -127,6 +288,9 @@ class OpenLoopSeriesDiagnostic:
     total_flops_log10: float | None = None
     peak_memory_log2: float | None = None
     cache_hits: int = 0
+    bp_converged: bool | None = None
+    bp_iterations: int | None = None
+    bp_max_mdiff: float | None = None
 
     @property
     def routes(self) -> dict[tuple[Any, ...], str]:
@@ -155,6 +319,7 @@ class OpenLoopSeriesDiagnosticCache:
     the cache's ownership.
     """
 
+    schema_version: ClassVar[str] = "open-loop-diagnostic-v2"
     diagnostics_by_key: dict[Any, OpenLoopSeriesDiagnostic] = field(
         default_factory=dict
     )
@@ -222,6 +387,7 @@ class _OpenEnumerationLimits:
     """Validated limits for lazy open-series geometry discovery."""
 
     max_terms: int | None = None
+    max_loop_terms: int | None = None
     max_enumeration_time: float | None = None
     max_enumeration_memory: int | None = None
 
@@ -230,6 +396,7 @@ class _OpenEnumerationLimits:
         cls,
         *,
         max_terms=None,
+        max_loop_terms=None,
         max_enumeration_time=None,
         max_enumeration_memory=None,
     ):
@@ -237,6 +404,15 @@ class _OpenEnumerationLimits:
             if not isinstance(max_terms, (int, np.integer)) or max_terms < 0:
                 raise ValueError("max_terms must be a non-negative integer or None")
             max_terms = int(max_terms)
+        if max_loop_terms is not None:
+            if (
+                not isinstance(max_loop_terms, (int, np.integer))
+                or max_loop_terms < 0
+            ):
+                raise ValueError(
+                    "max_loop_terms must be a non-negative integer or None"
+                )
+            max_loop_terms = int(max_loop_terms)
         if max_enumeration_time is not None:
             if (
                 not isinstance(
@@ -263,6 +439,7 @@ class _OpenEnumerationLimits:
             max_enumeration_memory = int(max_enumeration_memory)
         return cls(
             max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
             max_enumeration_time=max_enumeration_time,
             max_enumeration_memory=max_enumeration_memory,
         )
@@ -275,6 +452,7 @@ class _OpenEnumerationGuard:
         self.limits = limits
         self.started = time.perf_counter()
         self.emitted = 0
+        self.loop_emitted = 0
         self.estimated_memory = 0
 
     @staticmethod
@@ -297,7 +475,7 @@ class _OpenEnumerationGuard:
                 "max_enumeration_time", limit, elapsed
             )
 
-    def accept(self, term: LoopSeriesTerm):
+    def accept(self, term: LoopSeriesTerm, *, loop=False):
         self.check()
         if (
             self.limits.max_terms is not None
@@ -305,6 +483,16 @@ class _OpenEnumerationGuard:
         ):
             raise OpenLoopEnumerationLimitError(
                 "max_terms", self.limits.max_terms, self.emitted + 1
+            )
+        if (
+            loop
+            and self.limits.max_loop_terms is not None
+            and self.loop_emitted >= self.limits.max_loop_terms
+        ):
+            raise OpenLoopEnumerationLimitError(
+                "max_loop_terms",
+                self.limits.max_loop_terms,
+                self.loop_emitted + 1,
             )
         term_memory = self._term_memory(term)
         if (
@@ -318,11 +506,14 @@ class _OpenEnumerationGuard:
                 self.estimated_memory + term_memory,
             )
         self.emitted += 1
+        if loop:
+            self.loop_emitted += 1
         self.estimated_memory += term_memory
 
     def diagnostics(self):
         return {
             "terms": self.emitted,
+            "loop_terms": self.loop_emitted,
             "elapsed_seconds": time.perf_counter() - self.started,
             "estimated_memory_bytes": self.estimated_memory,
         }
@@ -349,10 +540,29 @@ class LoopSeriesCache:
 
     @staticmethod
     def _signature(tn):
+        def index_size(index):
+            try:
+                return int(tn.ind_size(index))
+            except (AttributeError, TypeError, ValueError):
+                return None
+
+        def tensor_shape(tensor):
+            try:
+                return tuple(tensor.shape)
+            except (AttributeError, TypeError):
+                return None
+
         return (
             frozenset(tn.tensor_map),
             frozenset(
                 (index, frozenset(tids)) for index, tids in tn.ind_map.items()
+            ),
+            frozenset(
+                (index, index_size(index)) for index in tn.ind_map
+            ),
+            frozenset(
+                (tid, tensor_shape(tensor))
+                for tid, tensor in tn.tensor_map.items()
             ),
         )
 
@@ -445,6 +655,7 @@ class OpenLoopSeriesCache:
         excluded_edges=(),
         *,
         max_terms: int | None = None,
+        max_loop_terms: int | None = None,
         max_enumeration_time: float | None = None,
         max_enumeration_memory: int | None = None,
     ):
@@ -461,6 +672,7 @@ class OpenLoopSeriesCache:
         excluded_edges = frozenset(excluded_edges)
         limits = _OpenEnumerationLimits.validate(
             max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
             max_enumeration_time=max_enumeration_time,
             max_enumeration_memory=max_enumeration_memory,
         )
@@ -485,7 +697,10 @@ class OpenLoopSeriesCache:
         if cached is not None:
             guard = _OpenEnumerationGuard(limits)
             for term in cached:
-                guard.accept(term)
+                guard.accept(
+                    term,
+                    loop=_open_term_family(tn, term) != "open_path",
+                )
                 yield term
             return
 
@@ -946,7 +1161,14 @@ def _weighted_shortest_distances(adjacency, target, guard=None):
 
 
 def _grid_corridor_context(tn):
-    """Return lazy coordinate-neighbor access for rectangular PEPS graphs."""
+    """Return lazy coordinate-neighbor access for rectangular PEPS graphs.
+
+    The returned graph is a *multigraph*.  On a period-two PBC direction the
+    two seam bonds can connect the same pair of coordinates, but they remain
+    distinct tensor-network indices and therefore distinct loop-series edges.
+    Collapsing them to one coordinate neighbor loses valid paths and, for
+    native fermions, can also lose a seam sign route.
+    """
     if not all(hasattr(tn, name) for name in ("Lx", "Ly", "has_site")):
         return None
     if not callable(getattr(tn, "site_tag", None)):
@@ -968,6 +1190,20 @@ def _grid_corridor_context(tn):
         tid_cache[coo] = tids[0]
         return tids[0]
 
+    def shared_edges(tid, neighbor_tid):
+        left_inds = set(tn.tensor_map[tid].inds)
+        right_inds = set(tn.tensor_map[neighbor_tid].inds)
+        return tuple(
+            sorted(
+                (
+                    index
+                    for index in left_inds.intersection(right_inds)
+                    if len(tn.ind_map[index]) == 2
+                ),
+                key=repr,
+            )
+        )
+
     def neighbors(coo):
         x, y = coo
         candidates = ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1))
@@ -982,21 +1218,19 @@ def _grid_corridor_context(tn):
                     continue
                 ny %= tn.Ly
             neighbor = (nx, ny)
-            if neighbor in seen or not tn.has_site(neighbor):
+            if not tn.has_site(neighbor):
                 continue
-            seen.add(neighbor)
             neighbor_tid = tid_at(neighbor)
             if neighbor_tid is not None:
-                yield neighbor, neighbor_tid
-
-    def edge_between(tid, neighbor_tid):
-        left_inds = set(tn.tensor_map[tid].inds)
-        right_inds = set(tn.tensor_map[neighbor_tid].inds)
-        shared = tuple(left_inds & right_inds)
-        for index in shared:
-            if len(tn.ind_map[index]) == 2:
-                return index
-        return None
+                for edge in shared_edges(tid_at(coo), neighbor_tid):
+                    # The same coordinate can occur twice in the candidate
+                    # list when a size-two axis wraps.  Deduplicate only the
+                    # exact multiedge record, never the coordinate itself.
+                    record = (neighbor, edge)
+                    if record in seen:
+                        continue
+                    seen.add(record)
+                    yield neighbor, neighbor_tid, edge
 
     def axis_distance(left, right, size, cyclic):
         distance = abs(left - right)
@@ -1010,7 +1244,7 @@ def _grid_corridor_context(tn):
     return {
         "tid_at": tid_at,
         "neighbors": neighbors,
-        "edge_between": edge_between,
+        "shared_edges": shared_edges,
         "distance": distance,
     }
 
@@ -1082,13 +1316,11 @@ def _discover_grid_corridor_paths(
                         continue
                     if current_distance >= target_distance and current != source:
                         continue
-                    for neighbor, neighbor_tid in context["neighbors"](current):
+                    for neighbor, neighbor_tid, edge in context["neighbors"](
+                        current
+                    ):
                         if neighbor in visited:
                             continue
-                        edge = context["edge_between"](
-                            context["tid_at"](current),
-                            neighbor_tid,
-                        )
                         if edge is None or edge in excluded_edges:
                             continue
                         if context["distance"](neighbor, target) != current_distance - 1:
@@ -1122,7 +1354,7 @@ def _discover_grid_corridor_paths(
         coo, distance = pending.popleft()
         if distance >= corridor_width:
             continue
-        for neighbor, _ in context["neighbors"](coo):
+        for neighbor, _, _ in context["neighbors"](coo):
             if neighbor in corridor_coos:
                 continue
             corridor_coos.add(neighbor)
@@ -1133,13 +1365,9 @@ def _discover_grid_corridor_paths(
         context["tid_at"](coo) for coo in corridor_coos
     }
     for coo in corridor_coos:
-        for neighbor, neighbor_tid in context["neighbors"](coo):
+        for neighbor, neighbor_tid, edge in context["neighbors"](coo):
             if neighbor not in corridor_coos:
                 continue
-            edge = context["edge_between"](
-                context["tid_at"](coo),
-                neighbor_tid,
-            )
             if edge is not None and edge not in excluded_edges:
                 corridor_edges.add(edge)
     corridor_edges = frozenset(corridor_edges)
@@ -1390,7 +1618,11 @@ def _iter_corridor_loop_clusters(
                         guard.check()
                     current, vertices, path_edges, visited = stack.pop()
                     if (
-                        len(path_edges) >= 3
+                        # A pair of parallel PBC bonds is a legitimate
+                        # two-edge cycle.  This occurs routinely on period-2
+                        # PEPS axes and must not be discarded as a simple
+                        # graph artifact.
+                        len(path_edges) >= 2
                         and len(path_edges) <= max_size
                     ):
                         for neighbor, edge in by_vertex.get(current, ()):
@@ -1481,7 +1713,7 @@ def _iter_corridor_open_terms(
             continue
         if loop.edges in seen:
             continue
-        guard.accept(loop)
+        guard.accept(loop, loop=True)
         seen.add(loop.edges)
         yield loop
 
@@ -1501,7 +1733,7 @@ def _iter_corridor_open_terms(
                 allowed_tids=allowed_tids,
                 excluded_edges=excluded_edges,
             )
-            guard.accept(term)
+            guard.accept(term, loop=True)
             seen.add(term.edges)
             yield term
 
@@ -1577,7 +1809,7 @@ def _iter_open_edge_loops(
                     frozenset(degrees),
                 )
                 if term.edges not in path_terms:
-                    guard.accept(term)
+                    guard.accept(term, loop=True)
                     yield term
             return
 
@@ -2397,6 +2629,43 @@ def _validate_contraction_cost_limits(
     )
 
 
+def _validate_on_budget(on_budget):
+    """Validate the policy used when a term exceeds a contraction budget."""
+    if on_budget not in {"report", "skip", "raise"}:
+        raise ValueError("on_budget must be 'report', 'skip', or 'raise'")
+    return on_budget
+
+
+def _apply_budget_policy(skipped_terms, *, on_budget, info, kind):
+    """Record and optionally reject an incomplete contraction.
+
+    ``report`` is the compatibility-safe default: it returns the partial
+    budgeted sum but marks it incomplete.  ``raise`` is the recommended
+    production policy.  ``skip`` is retained for exploratory workflows and
+    is intentionally equivalent numerically to the historical behavior.
+    """
+    on_budget = _validate_on_budget(on_budget)
+    skipped_terms = dict(skipped_terms or {})
+    complete = not skipped_terms
+    if info is not None:
+        info[f"{kind}_complete"] = complete
+        info[f"{kind}_budget_policy"] = on_budget
+        info[f"{kind}_omitted_terms"] = tuple(skipped_terms)
+    elif skipped_terms and on_budget == "report":
+        warnings.warn(
+            f"{kind} returned an incomplete budgeted sum; pass info=... or "
+            "use on_budget='raise' to make this failure explicit",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if skipped_terms and on_budget == "raise":
+        raise OpenLoopBudgetError(
+            f"{kind} skipped {len(skipped_terms)} term(s) because their "
+            "contraction estimate exceeded the configured budget"
+        )
+    return complete, tuple(skipped_terms)
+
+
 def _contract_cost_record(tree, *, max_bond=None):
     """Extract the standard Cotengra log-cost diagnostics from a tree."""
     if max_bond is None:
@@ -3152,6 +3421,7 @@ def _open_edge_series_terms_for_support(
     *,
     cache,
     max_terms=None,
+    max_loop_terms=None,
     max_enumeration_time=None,
     max_enumeration_memory=None,
     corridor_width=None,
@@ -3170,6 +3440,7 @@ def _open_edge_series_terms_for_support(
     allowed_tids = frozenset(tids)
     limits = _OpenEnumerationLimits.validate(
         max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
         max_enumeration_time=max_enumeration_time,
         max_enumeration_memory=max_enumeration_memory,
     )
@@ -3227,6 +3498,7 @@ def _open_edge_series_terms_for_support(
                         "max_loop_clusters_per_segment"
                     ],
                     "max_edge_cutoff": total_edge_cutoff,
+                    "max_loop_terms": limits.max_loop_terms,
                     "approximation": "path_plus_connected_loop_decorations",
                 }
             )
@@ -3279,6 +3551,7 @@ def _open_edge_series_terms_for_support(
                 allowed_tids,
                 excluded_edges=inner_bonds,
                 max_terms=limits.max_terms,
+                max_loop_terms=limits.max_loop_terms,
                 max_enumeration_time=limits.max_enumeration_time,
                 max_enumeration_memory=limits.max_enumeration_memory,
             )
@@ -3304,6 +3577,7 @@ def _open_edge_series_terms_for_support(
                 allowed_tids,
                 excluded_edges=inner_bonds,
                 max_terms=limits.max_terms,
+                max_loop_terms=limits.max_loop_terms,
                 max_enumeration_time=limits.max_enumeration_time,
                 max_enumeration_memory=limits.max_enumeration_memory,
             )
@@ -3317,10 +3591,31 @@ def _open_edge_series_terms_for_support(
             edge_cutoff,
             inner_bonds=inner_bonds,
         ):
-            guard.accept(term)
+            guard.accept(
+                term,
+                loop=_open_term_family(bp.tn, term) != "open_path",
+            )
             yield term
 
     return limited_terms(), inner_bonds
+
+
+def _limit_diagnostic_open_terms(tn, terms, *, max_loop_terms):
+    """Apply a loop-term budget even when geometry came from a diagnostic."""
+    if max_loop_terms is None:
+        return iter(terms)
+    limits = _OpenEnumerationLimits.validate(max_loop_terms=max_loop_terms)
+    guard = _OpenEnumerationGuard(limits)
+
+    def limited_terms():
+        for term in terms:
+            guard.accept(
+                term,
+                loop=_open_term_family(tn, term) != "open_path",
+            )
+            yield term
+
+    return limited_terms()
 
 
 def _log10_sum_costs(costs):
@@ -3356,6 +3651,8 @@ def _diagnose_network_cost(
     optimize,
     contract_opts,
     max_bond=None,
+    plan_cache=None,
+    plan_key=None,
 ):
     """Build a contraction tree and return costs without contracting data."""
     if "get" in contract_opts:
@@ -3364,7 +3661,10 @@ def _diagnose_network_cost(
             "diagnostics; diagnostics always build a contraction tree"
         )
     tree = network.contract(get="tree", optimize=optimize, **contract_opts)
-    return _contract_cost_record(tree, max_bond=max_bond)
+    cost = _contract_cost_record(tree, max_bond=max_bond)
+    if plan_cache is not None and plan_key is not None:
+        plan_cache[plan_key] = (tree, cost)
+    return cost
 
 
 def _open_diagnostic_key(
@@ -3376,11 +3676,14 @@ def _open_diagnostic_key(
     cluster_size,
     corridor_options,
     max_terms,
+    max_loop_terms,
     max_enumeration_time,
     max_enumeration_memory,
     max_flops_log10,
     max_peak_memory_log2,
     path_edge_weights,
+    optimize=None,
+    contract_opts=None,
 ):
     """Build a stable cache key for geometry and cost diagnostics."""
     try:
@@ -3392,17 +3695,26 @@ def _open_diagnostic_key(
     except Exception:
         dtype = repr(type(gate))
     return (
+        "open-loop-diagnostic-v2",
         tuple(sites),
         route,
         repr(edge_cutoff),
         repr(cluster_size),
         tuple(sorted((key, repr(value)) for key, value in corridor_options.items())),
         max_terms,
+        max_loop_terms,
         max_enumeration_time,
         max_enumeration_memory,
         max_flops_log10,
         max_peak_memory_log2,
         repr(path_edge_weights),
+        repr(optimize),
+        tuple(
+            sorted(
+                (str(key), repr(value))
+                for key, value in (contract_opts or {}).items()
+            )
+        ),
         shape,
         dtype,
     )
@@ -3424,6 +3736,7 @@ def _diagnose_open_scalar_support(
     max_flops_log10,
     max_peak_memory_log2,
     max_terms,
+    max_loop_terms,
     max_enumeration_time,
     max_enumeration_memory,
     corridor_options,
@@ -3442,6 +3755,7 @@ def _diagnose_open_scalar_support(
     fermionic_q = _uses_symmray(bp.tn) and _gate_needs_fermionic_open_q(gate)
     route = route_selection["route"]
     total_costs = []
+    plan_cache = {}
 
     if route == "graded_cluster_compatible":
         from quimb.tensor.belief_propagation import gen_region_counts
@@ -3510,6 +3824,7 @@ def _diagnose_open_scalar_support(
         edge_cutoff,
         cache=cache,
         max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
         max_enumeration_time=max_enumeration_time,
         max_enumeration_memory=max_enumeration_memory,
         corridor_width=(
@@ -3537,6 +3852,14 @@ def _diagnose_open_scalar_support(
     compressed = compressed_max_bond is not None
     for term in requested_terms:
         region = frozenset((*tids, *term.tids))
+        norm_path_key = (
+            "norm", where_key, tuple(sorted(region, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)), fermionic_q,
+        )
+        gate_path_key = (
+            "gate", where_key, tuple(sorted(region, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)), fermionic_q,
+        )
         norm_network = _get_d2_edge_partial_trace_excited(
             bp,
             region,
@@ -3544,7 +3867,7 @@ def _diagnose_open_scalar_support(
             exclude=inner_bonds,
             projector_layout="open" if _uses_symmray(bp.tn) else "series",
             fermionic_q=fermionic_q,
-            index_namespace=("diagnostic", "norm", where_key, term.edges),
+            index_namespace=("open-scalar", *norm_path_key),
         )
         gate_network = _get_d2_edge_partial_trace_excited(
             bp,
@@ -3556,19 +3879,23 @@ def _diagnose_open_scalar_support(
             projector_layout="open" if _uses_symmray(bp.tn) else "series",
             gate_as_operator=True,
             fermionic_q=fermionic_q,
-            index_namespace=("diagnostic", "gate", where_key, term.edges),
+            index_namespace=("open-scalar", *gate_path_key),
         )
         norm_cost = _diagnose_network_cost(
             norm_network,
             optimize=optimize,
             contract_opts=contract_opts,
             max_bond=compressed_max_bond if compressed else None,
+            plan_cache=plan_cache,
+            plan_key=norm_path_key,
         )
         gate_cost = _diagnose_network_cost(
             gate_network,
             optimize=optimize,
             contract_opts=contract_opts,
             max_bond=compressed_max_bond if compressed else None,
+            plan_cache=plan_cache,
+            plan_key=gate_path_key,
         )
         record = {
             "norm": norm_cost,
@@ -3596,7 +3923,11 @@ def _diagnose_open_scalar_support(
         exclude=inner_bonds,
         projector_layout="open" if _uses_symmray(bp.tn) else "series",
         fermionic_q=fermionic_q,
-        index_namespace=("diagnostic", "base-norm", where_key),
+        index_namespace=(
+            "open-scalar", "base-norm", where_key,
+            tuple(sorted(tids, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)), fermionic_q,
+        ),
     )
     base_gate_network = _get_d2_edge_partial_trace_excited(
         bp,
@@ -3607,19 +3938,33 @@ def _diagnose_open_scalar_support(
         projector_layout="open" if _uses_symmray(bp.tn) else "series",
         gate_as_operator=True,
         fermionic_q=fermionic_q,
-        index_namespace=("diagnostic", "base-gate", where_key),
+        index_namespace=(
+            "open-scalar", "base-gate", where_key,
+            tuple(sorted(tids, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)), fermionic_q,
+        ),
     )
     base_norm_cost = _diagnose_network_cost(
         base_norm_network,
         optimize=optimize,
         contract_opts=contract_opts,
         max_bond=compressed_max_bond if compressed else None,
+        plan_cache=plan_cache,
+        plan_key=(
+            "base-norm", where_key, tuple(sorted(tids, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)), fermionic_q,
+        ),
     )
     base_gate_cost = _diagnose_network_cost(
         base_gate_network,
         optimize=optimize,
         contract_opts=contract_opts,
         max_bond=compressed_max_bond if compressed else None,
+        plan_cache=plan_cache,
+        plan_key=(
+            "base-gate", where_key, tuple(sorted(tids, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)), fermionic_q,
+        ),
     )
     total_costs.extend((base_norm_cost, base_gate_cost))
     base_cost = {
@@ -3650,6 +3995,8 @@ def _diagnose_open_scalar_support(
             default=None,
         ),
         "inner_bonds": inner_bonds,
+        "contraction_plans": plan_cache,
+        "plan_cache_schema": "open-scalar-v1",
     }
 
 
@@ -3790,6 +4137,7 @@ def _partial_trace_open_loop_series(
     max_flops_log10,
     max_peak_memory_log2,
     max_terms,
+    max_loop_terms,
     max_enumeration_time,
     max_enumeration_memory,
     corridor_width,
@@ -3804,6 +4152,7 @@ def _partial_trace_open_loop_series(
     mode,
     auto_corridor_distance,
     diagnostic_support,
+    on_budget,
 ):
     """Contract the explicit open-edge rho loop-series expansion."""
     if bp.__class__.__name__ != "D2BP":
@@ -3920,19 +4269,19 @@ def _partial_trace_open_loop_series(
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
         )
+        cluster_region_costs = {
+            (where_key, region): cost
+            for region, cost in cluster_info.get(
+                "cluster_rho_term_costs", {}
+            ).items()
+        }
+        cluster_region_skipped = {
+            (where_key, region): cost
+            for region, cost in cluster_info.get(
+                "cluster_rho_skipped_terms", {}
+            ).items()
+        }
         if info is not None:
-            cluster_region_costs = {
-                (where_key, region): cost
-                for region, cost in cluster_info.get(
-                    "cluster_rho_term_costs", {}
-                ).items()
-            }
-            cluster_region_skipped = {
-                (where_key, region): cost
-                for region, cost in cluster_info.get(
-                    "cluster_rho_skipped_terms", {}
-                ).items()
-            }
             info["open_rho_requested_terms"] = ()
             info["open_rho_terms_list"] = ()
             info["open_rho_term_costs"] = dict(
@@ -3959,10 +4308,12 @@ def _partial_trace_open_loop_series(
             info["open_rho_support_tids"] = tids
             info["open_rho_excluded_edges"] = inner_bonds
             info["open_rho_native_route"] = "graded_cluster_compatible"
+            info["open_rho_route"] = route_selection["route"]
             info["open_rho_edge_cutoff"] = None
             info["open_rho_cluster_size"] = cluster_size
             info["open_rho_enumeration_limits"] = {
                 "max_terms": max_terms,
+                "max_loop_terms": max_loop_terms,
                 "max_enumeration_time": max_enumeration_time,
                 "max_enumeration_memory": max_enumeration_memory,
             }
@@ -3974,6 +4325,20 @@ def _partial_trace_open_loop_series(
                 None
                 if diagnostic_support is None
                 else dict(diagnostic_support)
+            )
+            complete, omitted = _apply_budget_policy(
+                cluster_region_skipped,
+                on_budget=on_budget,
+                info=info,
+                kind="open_rho",
+            )
+            info["open_rho_omitted_terms"] = omitted
+        else:
+            _apply_budget_policy(
+                cluster_region_skipped,
+                on_budget=on_budget,
+                info=None,
+                kind="open_rho",
             )
         return rho
 
@@ -3988,7 +4353,11 @@ def _partial_trace_open_loop_series(
                 "the supplied open-series diagnostic does not match the "
                 "route selected for this rho support"
             )
-        terms = iter(diagnostic_support.get("terms", ()))
+        terms = _limit_diagnostic_open_terms(
+            bp.tn,
+            diagnostic_support.get("terms", ()),
+            max_loop_terms=max_loop_terms,
+        )
         if corridor_info is not None:
             corridor_info.clear()
             corridor_info.update(diagnostic_support.get("corridor", {}))
@@ -4004,6 +4373,7 @@ def _partial_trace_open_loop_series(
             edge_cutoff,
             cache=cache,
             max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
             max_enumeration_time=max_enumeration_time,
             max_enumeration_memory=max_enumeration_memory,
             corridor_width=corridor_options["corridor_width"],
@@ -4087,6 +4457,13 @@ def _partial_trace_open_loop_series(
             term_cost_cache[term.edges] = cost
         rho_terms[term.edges] = rho_e
         accepted_terms.append(term)
+
+    complete, omitted_terms = _apply_budget_policy(
+        skipped_terms,
+        on_budget=on_budget,
+        info=info,
+        kind="open_rho",
+    )
 
     base_cache = (
         {}
@@ -4198,11 +4575,13 @@ def _partial_trace_open_loop_series(
         info["open_rho_cluster_size"] = None
         info["open_rho_enumeration_limits"] = {
             "max_terms": max_terms,
+            "max_loop_terms": max_loop_terms,
             "max_enumeration_time": max_enumeration_time,
             "max_enumeration_memory": max_enumeration_memory,
         }
         info["open_rho_corridor_options"] = dict(corridor_options)
         info["open_rho_mode"] = mode
+        info["open_rho_route"] = route_selection["route"]
         info["open_rho_support_distance"] = route_selection[
             "support_distance"
         ]
@@ -4211,6 +4590,7 @@ def _partial_trace_open_loop_series(
             if diagnostic_support is None
             else dict(diagnostic_support)
         )
+        info["open_rho_omitted_terms"] = omitted_terms
     return rho
 
 
@@ -4354,6 +4734,7 @@ def _local_expectation_open_loop_series(
     max_flops_log10,
     max_peak_memory_log2,
     max_terms,
+    max_loop_terms,
     max_enumeration_time,
     max_enumeration_memory,
     corridor_width,
@@ -4368,6 +4749,7 @@ def _local_expectation_open_loop_series(
     mode,
     auto_corridor_distance,
     diagnostic_support,
+    on_budget,
 ):
     """Contract a gate through the explicit open-edge loop series."""
     if normalized == "prod":
@@ -4476,17 +4858,17 @@ def _local_expectation_open_loop_series(
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
         )
+        cluster_region_skipped = {
+            (where_key, region): cost
+            for region, cost in cluster_info.get(
+                "cluster_scalar_skipped_terms", {}
+            ).items()
+        }
         if info is not None:
             cluster_region_costs = {
                 (where_key, region): cost
                 for region, cost in cluster_info.get(
                     "cluster_scalar_term_costs", {}
-                ).items()
-            }
-            cluster_region_skipped = {
-                (where_key, region): cost
-                for region, cost in cluster_info.get(
-                    "cluster_scalar_skipped_terms", {}
                 ).items()
             }
             info["open_scalar_requested_terms"] = ()
@@ -4509,6 +4891,7 @@ def _local_expectation_open_loop_series(
             info["open_scalar_native_route"] = (
                 "graded_cluster_compatible"
             )
+            info["open_scalar_route"] = route_selection["route"]
             info["open_scalar_fermionic_q_phase"] = fermionic_q
             info["open_scalar_cost_limits"] = {
                 "max_flops_log10": max_flops_log10,
@@ -4524,6 +4907,7 @@ def _local_expectation_open_loop_series(
             info["open_scalar_cluster_size"] = cluster_size
             info["open_scalar_enumeration_limits"] = {
                 "max_terms": max_terms,
+                "max_loop_terms": max_loop_terms,
                 "max_enumeration_time": max_enumeration_time,
                 "max_enumeration_memory": max_enumeration_memory,
             }
@@ -4536,6 +4920,20 @@ def _local_expectation_open_loop_series(
                 if diagnostic_support is None
                 else dict(diagnostic_support)
             )
+            complete, omitted = _apply_budget_policy(
+                cluster_region_skipped,
+                on_budget=on_budget,
+                info=info,
+                kind="open_scalar",
+            )
+            info["open_scalar_omitted_terms"] = omitted
+        else:
+            _apply_budget_policy(
+                cluster_region_skipped,
+                on_budget=on_budget,
+                info=None,
+                kind="open_scalar",
+            )
         return value, normalization
 
     corridor_info = (
@@ -4544,7 +4942,11 @@ def _local_expectation_open_loop_series(
         else info.setdefault("open_scalar_corridor", {})
     )
     if diagnostic_support is not None:
-        terms = iter(diagnostic_support.get("terms", ()))
+        terms = _limit_diagnostic_open_terms(
+            bp.tn,
+            diagnostic_support.get("terms", ()),
+            max_loop_terms=max_loop_terms,
+        )
         if corridor_info is not None:
             corridor_info.clear()
             corridor_info.update(diagnostic_support.get("corridor", {}))
@@ -4560,6 +4962,7 @@ def _local_expectation_open_loop_series(
             edge_cutoff,
             cache=cache,
             max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
             max_enumeration_time=max_enumeration_time,
             max_enumeration_memory=max_enumeration_memory,
             corridor_width=corridor_options["corridor_width"],
@@ -4618,6 +5021,11 @@ def _local_expectation_open_loop_series(
         if info is None
         else info.setdefault("open_scalar_region_path_cache", {})
     )
+    if diagnostic_support is not None:
+        for plan_key, plan in diagnostic_support.get(
+            "contraction_plans", {}
+        ).items():
+            path_cache.setdefault(plan_key, plan)
     for term in terms:
         requested_terms.append(term)
         if (where_key, term.edges) in skipped_terms:
@@ -4728,6 +5136,13 @@ def _local_expectation_open_loop_series(
         }
         norm_terms[term.edges] = norm_e
         gate_terms[term.edges] = gate_e
+
+    complete, omitted_terms = _apply_budget_policy(
+        skipped_terms,
+        on_budget=on_budget,
+        info=info,
+        kind="open_scalar",
+    )
 
     base_key = (where_key, tuple(kix), tids, inner_bonds, fermionic_q)
     base_norm_path_key = (
@@ -4866,11 +5281,13 @@ def _local_expectation_open_loop_series(
             if _uses_symmray(bp.tn)
             else "dense_open_projectors"
         )
+        info["open_scalar_route"] = route_selection["route"]
         info["open_scalar_fermionic_q_phase"] = fermionic_q
         info["open_scalar_edge_cutoff"] = edge_cutoff
         info["open_scalar_cluster_size"] = None
         info["open_scalar_enumeration_limits"] = {
             "max_terms": max_terms,
+            "max_loop_terms": max_loop_terms,
             "max_enumeration_time": max_enumeration_time,
             "max_enumeration_memory": max_enumeration_memory,
         }
@@ -4884,6 +5301,7 @@ def _local_expectation_open_loop_series(
             if diagnostic_support is None
             else dict(diagnostic_support)
         )
+        info["open_scalar_omitted_terms"] = omitted_terms
     return value, norm
 
 
@@ -5626,6 +6044,7 @@ def partial_trace_open_loop_series_sweep(
     edge_cutoffs=None,
     cluster_sizes=None,
     max_terms: int | None = None,
+    max_loop_terms: int | None = None,
     max_enumeration_time: float | None = None,
     max_enumeration_memory: int | None = None,
     mode: str = "exact",
@@ -5639,6 +6058,7 @@ def partial_trace_open_loop_series_sweep(
     max_corridor_edges: int | None = 100_000,
     path_edge_weights=None,
     corridor_max_bond: int | None = None,
+    on_budget: str = "report",
     contract_opts: dict[str, Any] | None = None,
     **bp_opts,
 ) -> OpenLoopSeriesSweepResult:
@@ -5714,6 +6134,12 @@ def partial_trace_open_loop_series_sweep(
         raise ValueError("each support must contain at least one site")
 
     contract_opts = {} if contract_opts is None else dict(contract_opts)
+    _OpenEnumerationLimits.validate(
+        max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+    )
     cache = cache or OpenLoopSeriesCache()
     bp, bp_info = _build_bp(
         tn,
@@ -5766,6 +6192,7 @@ def partial_trace_open_loop_series_sweep(
                 cache=cache,
                 info=support_info,
                 max_terms=max_terms,
+                max_loop_terms=max_loop_terms,
                 max_enumeration_time=max_enumeration_time,
                 max_enumeration_memory=max_enumeration_memory,
                 corridor_width=corridor_width,
@@ -5780,6 +6207,7 @@ def partial_trace_open_loop_series_sweep(
                 mode=mode,
                 auto_corridor_distance=auto_corridor_distance,
                 diagnostic_support=None,
+                on_budget=on_budget,
             )
             support_rhos[cutoff] = rho
             support_diagnostics[cutoff] = {
@@ -5863,6 +6291,7 @@ def partial_trace_open_loop_series_expand(
     edge_cutoff=None,
     cluster_size=None,
     max_terms: int | None = None,
+    max_loop_terms: int | None = None,
     max_enumeration_time: float | None = None,
     max_enumeration_memory: int | None = None,
     mode: str = "exact",
@@ -5876,6 +6305,9 @@ def partial_trace_open_loop_series_expand(
     max_corridor_edges: int | None = 100_000,
     path_edge_weights=None,
     corridor_max_bond: int | None = None,
+    on_budget: str = "report",
+    measure_resources: bool = False,
+    return_result: bool = False,
     diagnostic: OpenLoopSeriesDiagnostic | None = None,
     info: dict[str, Any] | None = None,
     contract_opts: dict[str, Any] | None = None,
@@ -5939,6 +6371,10 @@ def partial_trace_open_loop_series_expand(
         Hard limit on discovered explicit edge terms. Exceeding it raises
         :class:`OpenLoopEnumerationLimitError`; partial sums are never
         returned silently.
+    max_loop_terms : int, optional
+        Separate hard limit on loop-containing configurations (closed loops
+        and path-plus-loop terms). Open support paths do not consume this
+        budget.
     max_enumeration_time : float, optional
         Maximum edge-geometry discovery time in seconds.
     max_enumeration_memory : int, optional
@@ -5978,6 +6414,15 @@ def partial_trace_open_loop_series_expand(
         Optional Cotengra tree-cost limits. Terms over either limit are
         skipped and recorded in ``info``; the unexcited base configuration
         must still fit both limits.
+    on_budget : {"report", "skip", "raise"}, optional
+        Policy for terms rejected by the FLOP or peak-memory limits.
+        ``"report"`` preserves the historical partial result and marks it
+        incomplete; ``"raise"`` is recommended for production runs.
+    measure_resources : bool, optional
+        Record observed Python, host-RSS, and available GPU resource data.
+    return_result : bool, optional
+        Return :class:`OpenLoopMeasurementResult` with the value, route,
+        completeness, BP metadata, diagnostics, and resource observations.
     cache : OpenLoopSeriesCache, optional
         Reusable open-term geometry cache for the same topology and support.
     info : dict, optional
@@ -5990,6 +6435,17 @@ def partial_trace_open_loop_series_expand(
         older ``open_rho_term_costs`` fields are route-specific aliases.
     """
     contract_opts = {} if contract_opts is None else dict(contract_opts)
+    on_budget = _validate_on_budget(on_budget)
+    _OpenEnumerationLimits.validate(
+        max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+    )
+    monitor = _OpenLoopResourceMonitor(measure_resources)
+    internal_info = info
+    if internal_info is None and (return_result or measure_resources):
+        internal_info = {}
     where = tuple(where)
     if not where:
         raise ValueError("where must contain at least one site")
@@ -6027,13 +6483,21 @@ def partial_trace_open_loop_series_expand(
             "messages; pass require_fixed_point=False for an exploratory "
             "estimate"
         )
+    if internal_info is not None:
+        internal_info.update(
+            {
+                "bp_converged": bp_info.get("converged"),
+                "bp_iterations": bp_info.get("iterations"),
+                "bp_max_mdiff": bp_info.get("max_mdiff"),
+            }
+        )
 
     diagnostic_support = (
         None
         if diagnostic is None
         else diagnostic.supports.get(tuple(where))
     )
-    return _partial_trace_open_loop_series(
+    value = _partial_trace_open_loop_series(
         bp,
         where,
         gloops,
@@ -6043,10 +6507,11 @@ def partial_trace_open_loop_series_expand(
         max_peak_memory_log2=max_peak_memory_log2,
         contract_opts=contract_opts,
         cache=cache or OpenLoopSeriesCache(),
-        info=info,
+        info=internal_info,
         edge_cutoff=edge_cutoff,
         cluster_size=cluster_size,
         max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
         max_enumeration_time=max_enumeration_time,
         max_enumeration_memory=max_enumeration_memory,
         corridor_width=corridor_width,
@@ -6061,6 +6526,40 @@ def partial_trace_open_loop_series_expand(
         mode=mode,
         auto_corridor_distance=auto_corridor_distance,
         diagnostic_support=diagnostic_support,
+        on_budget=on_budget,
+    )
+    resources = monitor.finish()
+    if internal_info is not None:
+        internal_info["open_rho_resources"] = resources
+    if not return_result:
+        return value
+    support_info = internal_info or {}
+    route = support_info.get("open_rho_route")
+    if route is None:
+        route = (
+            "corridor"
+            if support_info.get("open_rho_mode") == "corridor"
+            else support_info.get("open_rho_native_route")
+        )
+    skipped = tuple(support_info.get("open_rho_omitted_terms", ()))
+    return OpenLoopMeasurementResult(
+        value=value,
+        normalization=_rho_trace(value),
+        info=support_info,
+        diagnostic=diagnostic,
+        complete=support_info.get("open_rho_complete", not skipped),
+        approximate=(
+            support_info.get("open_rho_mode") == "corridor"
+            or support_info.get("open_rho_native_route")
+            == "graded_cluster_compatible"
+        ),
+        route=route,
+        omitted_terms=skipped,
+        resources=resources,
+        bp_converged=bp_info.get("converged"),
+        bp_iterations=bp_info.get("iterations"),
+        bp_max_mdiff=bp_info.get("max_mdiff"),
+        bp=bp,
     )
 
 
@@ -6511,6 +7010,7 @@ def diagnose_open_loop_series(
     edge_cutoff=None,
     cluster_size=None,
     max_terms: int | None = None,
+    max_loop_terms: int | None = None,
     max_enumeration_time: float | None = None,
     max_enumeration_memory: int | None = None,
     mode: str = "auto",
@@ -6524,6 +7024,7 @@ def diagnose_open_loop_series(
     max_corridor_edges: int | None = 100_000,
     path_edge_weights=None,
     corridor_max_bond: int | None = None,
+    on_budget: str = "report",
     contract_opts: dict[str, Any] | None = None,
     **bp_opts,
 ):
@@ -6542,6 +7043,13 @@ def diagnose_open_loop_series(
     corridor route, with ``auto_corridor_distance`` controlling that switch.
     """
     records = _normalize_open_observable_terms(terms)
+    on_budget = _validate_on_budget(on_budget)
+    _OpenEnumerationLimits.validate(
+        max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+    )
     contract_opts = {} if contract_opts is None else dict(contract_opts)
     if require_fixed_point and run_bp and (
         not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1
@@ -6614,11 +7122,14 @@ def diagnose_open_loop_series(
             cluster_size=cluster_value,
             corridor_options=corridor_options,
             max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
             max_enumeration_time=max_enumeration_time,
             max_enumeration_memory=max_enumeration_memory,
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
             path_edge_weights=path_edge_weights,
+            optimize=optimize,
+            contract_opts=contract_opts,
         )
         report = diagnostic_cache.get(bp.tn, key)
         if report is not None:
@@ -6640,6 +7151,7 @@ def diagnose_open_loop_series(
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
             max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
             max_enumeration_time=max_enumeration_time,
             max_enumeration_memory=max_enumeration_memory,
             corridor_options=corridor_options,
@@ -6650,10 +7162,22 @@ def diagnose_open_loop_series(
                 "mode": mode,
                 "edge_cutoff": edge_value,
                 "cluster_size": cluster_value,
+                "max_loop_terms": max_loop_terms,
                 "corridor_options": corridor_options,
                 "cache_key": key,
             }
         )
+        skipped = report_data.get("skipped_terms", {})
+        skipped = skipped or report_data.get("cluster_region_skipped_terms", {})
+        report_data["complete"] = not bool(skipped)
+        report_data["omitted_terms"] = tuple(skipped)
+        if skipped and on_budget == "raise":
+            _apply_budget_policy(
+                skipped,
+                on_budget=on_budget,
+                info=None,
+                kind="open_loop_diagnostic",
+            )
         support_report = OpenLoopSeriesDiagnostic({tuple(sites): report_data})
         diagnostic_cache.put(bp.tn, key, support_report)
         support_reports[tuple(sites)] = report_data
@@ -6676,6 +7200,206 @@ def diagnose_open_loop_series(
         total_flops_log10=total_flops,
         peak_memory_log2=max(peaks, default=None),
         cache_hits=cache_hits,
+        bp_converged=bp_info.get("converged"),
+        bp_iterations=bp_info.get("iterations"),
+        bp_max_mdiff=bp_info.get("max_mdiff"),
+    )
+
+
+def diagnose_open_rho_series(
+    tn,
+    supports,
+    *,
+    gloops=None,
+    edge_cutoff=None,
+    cluster_size=None,
+    mode="auto",
+    max_rho_identity_dimension=2048,
+    **kwargs,
+):
+    """Preflight open-rho geometry and output-resource costs.
+
+    The loop geometry is shared with scalar observables, while the report also
+    accounts for the physical output tensor.  The identity gate is used only
+    to exercise the same support/route diagnostics; no numerical contraction
+    is performed.  Large retained regions should be diagnosed with a custom
+    application-level output budget rather than materializing a huge identity.
+    """
+    supports = tuple(tuple(support) for support in supports)
+    if not supports:
+        raise ValueError("supports must contain at least one support")
+    if (
+        not isinstance(max_rho_identity_dimension, (int, np.integer))
+        or max_rho_identity_dimension < 1
+    ):
+        raise ValueError("max_rho_identity_dimension must be a positive integer")
+    max_rho_identity_dimension = int(max_rho_identity_dimension)
+    terms = {}
+    for support in supports:
+        dims = tuple(int(tn.ind_size(tn.site_ind(site))) for site in support)
+        dimension = int(np.prod(dims, dtype=np.int64))
+        if dimension > max_rho_identity_dimension:
+            raise ValueError(
+                "diagnose_open_rho_series would materialize an identity of "
+                f"dimension {dimension}; lower the support or increase "
+                "max_rho_identity_dimension"
+            )
+        terms[support] = np.eye(dimension)
+    diagnostic = diagnose_open_loop_series(
+        tn,
+        terms,
+        gloops=gloops,
+        edge_cutoff=edge_cutoff,
+        cluster_size=cluster_size,
+        mode=mode,
+        **kwargs,
+    )
+    itemsize = np.dtype(np.complex128).itemsize
+    for support in supports:
+        record = diagnostic.supports[support]
+        dims = tuple(int(tn.ind_size(tn.site_ind(site))) for site in support)
+        dimension = int(np.prod(dims, dtype=np.int64))
+        # The public rho API returns a flattened ket-by-bra matrix. Keep the
+        # logical tensor-index shape alongside it for callers that need to
+        # reshape the result into one axis per retained site.
+        output_shape = (dimension, dimension)
+        logical_output_shape = dims + dims
+        output_elements = int(np.prod(output_shape, dtype=np.int64))
+        output_bytes = output_elements * itemsize
+        record.update(
+            {
+                "observable_kind": "rho",
+                "output_shape": output_shape,
+                "logical_output_shape": logical_output_shape,
+                "output_elements": output_elements,
+                "output_memory_bytes": output_bytes,
+                "rho_peak_memory_log2": float(
+                    max(
+                        record.get("peak_memory_log2", 0.0),
+                        np.log2(max(1, output_elements)),
+                    )
+                ),
+            }
+        )
+        record["peak_memory_log2"] = record["rho_peak_memory_log2"]
+    diagnostic.peak_memory_log2 = max(
+        (record["peak_memory_log2"] for record in diagnostic.supports.values()),
+        default=None,
+    )
+    return diagnostic
+
+
+def adaptive_open_loop_series(
+    tn,
+    terms,
+    *,
+    corridor_widths=(0, 1, 2),
+    cluster_sizes=None,
+    atol=1e-8,
+    rtol=1e-6,
+    min_stable=2,
+    diagnostic_cache=None,
+    **kwargs,
+):
+    """Measure an observable along an adaptive corridor/cluster ladder.
+
+    Each level reuses the first level's BP messages and the diagnostic cache.
+    For native cyclic fermions pass ``cluster_sizes``; for dense/tree
+    networks pass ``corridor_widths``.  The routine reports convergence of the
+    numerical value, not a rigorous truncation bound.
+    """
+    raw_levels = cluster_sizes if cluster_sizes is not None else corridor_widths
+    if isinstance(raw_levels, (int, np.integer)):
+        raw_levels = (raw_levels,)
+    try:
+        levels = tuple(_validate_nonnegative_degree(level) for level in raw_levels)
+    except TypeError as exc:
+        raise TypeError("adaptive levels must be an integer or iterable of integers") from exc
+    if len(levels) == 0:
+        raise ValueError("the adaptive ladder must contain at least one level")
+    if not isinstance(min_stable, (int, np.integer)) or min_stable < 1:
+        raise ValueError("min_stable must be a positive integer")
+    for name, value in (("atol", atol), ("rtol", rtol)):
+        if not isinstance(value, (int, float, np.integer, np.floating)):
+            raise TypeError(f"{name} must be a real number")
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and non-negative")
+    min_stable = int(min_stable)
+    atol = float(atol)
+    rtol = float(rtol)
+    diagnostic_cache = diagnostic_cache or OpenLoopSeriesDiagnosticCache()
+    values = []
+    settings = []
+    differences = []
+    diagnostics = []
+    infos = []
+    shared_messages = kwargs.pop("messages", None)
+    run_bp = kwargs.pop("run_bp", True)
+    bp = None
+    stable_count = 0
+    selected_index = None
+    for level in levels:
+        level_kwargs = dict(kwargs)
+        level_kwargs["diagnostic_cache"] = diagnostic_cache
+        level_kwargs["return_result"] = True
+        level_info = {}
+        level_kwargs["info"] = level_info
+        if shared_messages is not None:
+            level_kwargs.update(messages=shared_messages, run_bp=False)
+        else:
+            level_kwargs["run_bp"] = run_bp
+        if cluster_sizes is not None:
+            level_kwargs.update(cluster_size=int(level), mode="auto")
+            setting = {"cluster_size": int(level), "mode": "auto"}
+        else:
+            # ``mode="auto"`` retains the explicit width while enabling the
+            # diagnostic prepass and cache reuse for every ladder level.
+            level_kwargs.update(corridor_width=int(level), mode="auto")
+            setting = {"corridor_width": int(level), "mode": "auto"}
+        result = compute_local_expectation_open_loop_series(
+            tn, terms, **level_kwargs
+        )
+        if not isinstance(result, OpenLoopMeasurementResult):
+            raise RuntimeError("adaptive measurement requires return_result support")
+        if bp is None:
+            bp = result.bp
+            if bp is not None:
+                shared_messages = bp.messages
+        value = result.value
+        values.append(value)
+        settings.append(setting)
+        diagnostics.append(result.diagnostic)
+        infos.append(result.info)
+        if len(values) == 1:
+            differences.append(None)
+            continue
+        try:
+            difference = float(np.max(np.abs(np.asarray(value) - np.asarray(values[-2]))))
+            scale = max(1.0, float(np.max(np.abs(np.asarray(value)))))
+        except (TypeError, ValueError):
+            difference = None
+            scale = 1.0
+        differences.append(difference)
+        if (
+            result.complete
+            and difference is not None
+            and difference <= atol + rtol * scale
+        ):
+            stable_count += 1
+        else:
+            stable_count = 0
+        if stable_count >= min_stable:
+            selected_index = len(values) - 1
+            break
+    return OpenLoopAdaptiveResult(
+        values=tuple(values),
+        settings=tuple(settings),
+        differences=tuple(differences),
+        converged=selected_index is not None,
+        selected_index=selected_index,
+        diagnostics=tuple(diagnostics),
+        infos=tuple(infos),
+        bp=bp,
     )
 
 
@@ -6705,6 +7429,7 @@ def compute_local_expectation_open_loop_series(
     edge_cutoff=None,
     cluster_size=None,
     max_terms: int | None = None,
+    max_loop_terms: int | None = None,
     max_enumeration_time: float | None = None,
     max_enumeration_memory: int | None = None,
     mode: str = "exact",
@@ -6718,6 +7443,9 @@ def compute_local_expectation_open_loop_series(
     max_corridor_edges: int | None = 100_000,
     path_edge_weights=None,
     corridor_max_bond: int | None = None,
+    on_budget: str = "report",
+    measure_resources: bool = False,
+    return_result: bool = False,
     diagnostic_cache: OpenLoopSeriesDiagnosticCache | None = None,
     diagnostic: OpenLoopSeriesDiagnostic | None = None,
     info: dict[str, Any] | None = None,
@@ -6771,6 +7499,10 @@ def compute_local_expectation_open_loop_series(
     bound violation raises :class:`OpenLoopEnumerationLimitError` rather than
     returning a silently incomplete observable.
 
+    ``max_loop_terms`` is an additional loop-only bound. It is useful when
+    nearby supports can afford many loop corrections while long-range
+    supports should retain only a small loop tail.
+
     ``corridor_width`` activates the bounded long-separation route: weighted
     shortest paths are retained in a small beam, the paths are inflated into
     a corridor, and connected loop decorations are sampled near its segments.
@@ -6787,6 +7519,17 @@ def compute_local_expectation_open_loop_series(
             "normalized must be one of True, False, 'prod', or 'separate'"
         )
     contract_opts = {} if contract_opts is None else dict(contract_opts)
+    on_budget = _validate_on_budget(on_budget)
+    _OpenEnumerationLimits.validate(
+        max_terms=max_terms,
+        max_loop_terms=max_loop_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+    )
+    monitor = _OpenLoopResourceMonitor(measure_resources)
+    internal_info = info
+    if internal_info is None and (return_result or measure_resources):
+        internal_info = {}
     bp, bp_info = _build_bp(
         tn,
         norm="2norm",
@@ -6811,6 +7554,14 @@ def compute_local_expectation_open_loop_series(
             "compute_local_expectation_open_loop_series requires converged "
             "BP messages; pass require_fixed_point=False for an exploratory "
             "estimate"
+        )
+    if internal_info is not None:
+        internal_info.update(
+            {
+                "bp_converged": bp_info.get("converged"),
+                "bp_iterations": bp_info.get("iterations"),
+                "bp_max_mdiff": bp_info.get("max_mdiff"),
+            }
         )
 
     cache = cache or OpenLoopSeriesCache()
@@ -6853,11 +7604,14 @@ def compute_local_expectation_open_loop_series(
                 cluster_size=cluster_value,
                 corridor_options=corridor_options,
                 max_terms=max_terms,
+                max_loop_terms=max_loop_terms,
                 max_enumeration_time=max_enumeration_time,
                 max_enumeration_memory=max_enumeration_memory,
                 max_flops_log10=max_flops_log10,
                 max_peak_memory_log2=max_peak_memory_log2,
                 path_edge_weights=path_edge_weights,
+                optimize=optimize,
+                contract_opts=contract_opts,
             )
             cached = (
                 None
@@ -6884,6 +7638,7 @@ def compute_local_expectation_open_loop_series(
                     max_flops_log10=diagnostic_flops,
                     max_peak_memory_log2=diagnostic_peak,
                     max_terms=max_terms,
+                    max_loop_terms=max_loop_terms,
                     max_enumeration_time=max_enumeration_time,
                     max_enumeration_memory=max_enumeration_memory,
                     corridor_options=corridor_options,
@@ -6894,6 +7649,7 @@ def compute_local_expectation_open_loop_series(
                         "mode": mode,
                         "edge_cutoff": edge_value,
                         "cluster_size": cluster_value,
+                        "max_loop_terms": max_loop_terms,
                         "corridor_options": corridor_options,
                         "cache_key": key,
                     }
@@ -6907,13 +7663,13 @@ def compute_local_expectation_open_loop_series(
                     )
     term_info = (
         {}
-        if info is None
-        else info.setdefault("open_scalar_normalization_by_term", {})
+        if internal_info is None
+        else internal_info.setdefault("open_scalar_normalization_by_term", {})
     )
     support_info = (
         {}
-        if info is None
-        else info.setdefault("open_scalar_supports", {})
+        if internal_info is None
+        else internal_info.setdefault("open_scalar_supports", {})
     )
     expecs = {}
     for where, gate in records:
@@ -6935,6 +7691,7 @@ def compute_local_expectation_open_loop_series(
             edge_cutoff=edge_cutoff,
             cluster_size=cluster_size,
             max_terms=max_terms,
+            max_loop_terms=max_loop_terms,
             max_enumeration_time=max_enumeration_time,
             max_enumeration_memory=max_enumeration_memory,
             corridor_width=corridor_width,
@@ -6951,7 +7708,8 @@ def compute_local_expectation_open_loop_series(
             diagnostic_support=diagnostic_support,
             contract_opts=contract_opts,
             cache=cache,
-            info=info,
+            info=internal_info,
+            on_budget=on_budget,
         )
         result_key = where
         try:
@@ -6960,51 +7718,51 @@ def compute_local_expectation_open_loop_series(
             result_key = tuple(sites)
         term_info[result_key] = normalization
         expecs[result_key] = value
-        if info is not None:
+        if internal_info is not None:
             support_key = tuple(sites)
             support_edge_costs = {
                 key: value
-                for key, value in info["open_scalar_edge_term_costs"].items()
+                for key, value in internal_info["open_scalar_edge_term_costs"].items()
                 if key[0] == support_key
             }
             support_edge_skipped = {
                 key: value
-                for key, value in info[
+                for key, value in internal_info[
                     "open_scalar_edge_skipped_terms"
                 ].items()
                 if key[0] == support_key
             }
             support_cluster_costs = {
                 key: value
-                for key, value in info[
+                for key, value in internal_info[
                     "open_scalar_cluster_region_costs"
                 ].items()
                 if key[0] == support_key
             }
             support_cluster_skipped = {
                 key: value
-                for key, value in info[
+                for key, value in internal_info[
                     "open_scalar_cluster_region_skipped_terms"
                 ].items()
                 if key[0] == support_key
             }
             support_info[support_key] = {
-                "terms": tuple(info["open_scalar_terms"]),
+                "terms": tuple(internal_info["open_scalar_terms"]),
                 "requested_terms": tuple(
-                    info["open_scalar_requested_terms"]
+                    internal_info["open_scalar_requested_terms"]
                 ),
                 "skipped_terms": dict(
-                    info["open_scalar_skipped_terms"]
+                    internal_info["open_scalar_skipped_terms"]
                 ),
-                "term_costs": dict(info["open_scalar_term_costs"]),
+                "term_costs": dict(internal_info["open_scalar_term_costs"]),
                 "edge_skipped_terms": support_edge_skipped,
                 "edge_term_costs": support_edge_costs,
                 "cluster_region_skipped_terms": support_cluster_skipped,
                 "cluster_region_costs": support_cluster_costs,
-                "family_counts": dict(info["open_scalar_family_counts"]),
-                "family_weights": dict(info["open_scalar_family_weights"]),
+                "family_counts": dict(internal_info["open_scalar_family_counts"]),
+                "family_weights": dict(internal_info["open_scalar_family_weights"]),
                 "corridor": dict(
-                    info.get("open_scalar_corridor", {})
+                    internal_info.get("open_scalar_corridor", {})
                 ),
                 "diagnostic": (
                     None
@@ -7013,5 +7771,64 @@ def compute_local_expectation_open_loop_series(
                 ),
             }
     if return_all:
-        return expecs
-    return functools.reduce(operator.add, expecs.values())
+        if not return_result:
+            if internal_info is not None:
+                internal_info["open_scalar_resources"] = monitor.finish()
+            return expecs
+        value = expecs
+    else:
+        value = functools.reduce(operator.add, expecs.values())
+    resources = monitor.finish()
+    if internal_info is not None:
+        internal_info["open_scalar_resources"] = resources
+    effective_diagnostic = diagnostic
+    if effective_diagnostic is None and cached_diagnostic_supports:
+        effective_diagnostic = OpenLoopSeriesDiagnostic(
+            supports=dict(cached_diagnostic_supports),
+            bp_converged=bp_info.get("converged"),
+            bp_iterations=bp_info.get("iterations"),
+            bp_max_mdiff=bp_info.get("max_mdiff"),
+        )
+    route_values = {
+        record.get("route")
+        for record in (
+            effective_diagnostic.supports.values()
+            if effective_diagnostic
+            else ()
+        )
+        if record.get("route") is not None
+    }
+    if not route_values and internal_info is not None:
+        route_values = {
+            internal_info.get("open_scalar_route")
+        } - {None}
+    omitted = () if internal_info is None else tuple(
+        internal_info.get("open_scalar_omitted_terms", ())
+    )
+    complete = True if internal_info is None else all(
+        bool(value)
+        for key, value in internal_info.items()
+        if key.startswith("open_scalar_") and key.endswith("_complete")
+    )
+    return OpenLoopMeasurementResult(
+        value=value,
+        normalization=(
+            None
+            if internal_info is None
+            else internal_info.get("open_scalar_denominator")
+        ),
+        info=internal_info or {},
+        diagnostic=effective_diagnostic,
+        complete=complete,
+        approximate=(
+            bool(internal_info and internal_info.get("open_scalar_mode") == "corridor")
+            or bool(route_values.intersection({"graded_cluster_compatible"}))
+        ),
+        route=(next(iter(route_values)) if len(route_values) == 1 else "mixed"),
+        omitted_terms=omitted,
+        resources=resources,
+        bp_converged=bp_info.get("converged"),
+        bp_iterations=bp_info.get("iterations"),
+        bp_max_mdiff=bp_info.get("max_mdiff"),
+        bp=bp,
+    ) if return_result else value

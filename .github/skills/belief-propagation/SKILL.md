@@ -56,6 +56,35 @@ over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
   `compute_local_expectation_loop_cluster` accept Quimb-style
   ``{site_or_sites: operator}`` mappings and return scalar expectations. Share
   one D2BP solve across terms. Use the scalar APIs for fermionic observables.
+- Long-range open-loop observables:
+  `partial_trace_open_loop_series_expand` retains open support-connecting
+  paths, closed loops, and path-plus-loop configurations in a rho;
+  `compute_local_expectation_open_loop_series` inserts the gate directly into
+  the graded ket/bra contraction. Use `diagnose_open_loop_series` first when
+  the workflow must preflight geometry, Cotengra FLOP/peak-memory costs, and
+  reusable contraction plans. `diagnose_open_rho_series` adds rho output shape
+  and output-memory estimates. `OpenLoopSeriesCache` caches geometry and
+  `OpenLoopSeriesDiagnosticCache` caches topology-keyed diagnostics/plans;
+  measurements may reuse them or enumerate lazily on demand.
+- Open-loop route and budgets: use `mode="auto"` for distance awareness. It
+  keeps nearby supports on the exact route and switches sufficiently distant
+  dense/tree supports to a bounded weighted-shortest-path corridor. Set
+  `auto_corridor_distance` to change the threshold. `max_terms` bounds all
+  explicit configurations, while `max_loop_terms` separately bounds only
+  closed-loop and path-plus-loop corrections; `max_enumeration_time` and
+  `max_enumeration_memory` bound geometry discovery. For contraction costs,
+  use `max_flops_log10` and `max_peak_memory_log2`, then choose
+  `on_budget="raise"` for production. `return_result=True` returns an
+  auditable `OpenLoopMeasurementResult`; `measure_resources=True` records
+  observed Python/host/GPU resources. `adaptive_open_loop_series` compares a
+  corridor or cluster ladder, but is a numerical stabilization check rather
+  than a rigorous truncation bound.
+- Native cyclic fermion route: detect the cyclic native Symmray case before
+  explicit edge enumeration and use the graded cluster-compatible route with
+  `cluster_size`. Do not force `edge_cutoff`, `corridor_width`, or a dense
+  `trace(rho @ gate)` sign oracle onto that route. For a 2-periodic PBC axis,
+  treat the virtual lattice as a multigraph so parallel seam bonds remain
+  distinct loop-series edges.
 - Explicit-edge local D2BP observables:
   `partial_trace_edge_loop_series_expand` and
   `compute_local_expectation_edge_loop_series` use the same canonical
