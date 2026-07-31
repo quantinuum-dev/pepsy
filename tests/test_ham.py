@@ -619,6 +619,46 @@ def test_map_builder_instance_style_can_override_mode_per_call():
     assert map_[2] == (1, 1)
 
 
+def test_map_builder_finder_composes_mps_site_order_with_lattice_coords():
+    """Finder mode should map optimized MPS positions back to coordinates."""
+    base_idx2coo, _ = OneDMap(2, 2, mode="snake").build()
+    plan = {"site_order": (2, 0, 3, 1)}
+    mapper = OneDMap(2, 2, mode="finder", finder=plan)
+
+    idx2coo, coo2idx = mapper.build()
+
+    assert idx2coo == {
+        position: base_idx2coo[logical_site]
+        for position, logical_site in enumerate(plan["site_order"])
+    }
+    assert coo2idx == {coord: position for position, coord in idx2coo.items()}
+
+
+def test_map_builder_finder_mode_runs_mps_layout_finder():
+    """Finder mode should accept a gate stream without touching an MPS state."""
+    gates = [
+        (quimb.CNOT(), (0, 3)),
+        (quimb.CNOT(), (3, 1)),
+    ]
+    mapper = OneDMap(
+        2,
+        2,
+        mode="finder",
+        gates=gates,
+        layout_kwargs={"order": "input"},
+    )
+
+    idx2coo, _ = mapper.build()
+
+    assert idx2coo == OneDMap(2, 2, mode="snake").build()[0]
+
+
+def test_map_builder_finder_mode_requires_layout_source():
+    """Finder mode should fail clearly when no stream or plan is supplied."""
+    with pytest.raises(ValueError, match="mode='finder'"):
+        OneDMap(2, 2, mode="finder").build()
+
+
 def test_map_builder_instance_style_supports_3d_build():
     """Instance-style build() should preserve the 3D mapping modes."""
     mapper = OneDMap(2, 2, Lz=2, mode="col-major")

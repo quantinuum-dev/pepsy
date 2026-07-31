@@ -167,10 +167,15 @@ def _normalize_layout_search(search):
         "simulated_annealing": "anneal",
         "subtree_anneal": "anneal",
         "annealing": "anneal",
+        "quality": "hybrid",
+        "combined": "hybrid",
+        "full_tree": "hybrid",
     }
     name = aliases.get(name, name)
-    if name not in {"nevergrad", "anneal"}:
-        raise ValueError("search must be None, 'nevergrad', or 'anneal'.")
+    if name not in {"nevergrad", "anneal", "hybrid"}:
+        raise ValueError(
+            "search must be None, 'nevergrad', 'anneal', or 'hybrid'."
+        )
     return name
 
 
@@ -197,6 +202,11 @@ def _nevergrad_available():
     except ImportError:
         return False
     return True
+
+
+def _quality_search_mode():
+    """Return the complete quality search, with a clear fallback."""
+    return "hybrid" if _nevergrad_available() else "anneal"
 
 
 def _validate_search_budget(value, name):
@@ -1292,8 +1302,9 @@ class TreeLayoutFinder:
     chi : int, optional
         Bond-dimension budget used to bias the default arity search toward plans
         that stay exact at ``chi`` (see :meth:`recommend_arities`).  ``None``
-        keeps the search purely objective-driven.  :class:`TreeOptimizer`
-        forwards its own ``chi`` here automatically.
+        keeps the search purely objective-driven and is the static layout
+        default; it does not allocate tensors or perform truncations.
+        :class:`TreeOptimizer` forwards its own ``chi`` here automatically.
     community_frac : float
         Strong-edge fraction for ``structure="adaptive"`` (see
         :meth:`TreePlan.from_order`).
@@ -1314,12 +1325,14 @@ class TreeLayoutFinder:
         then applies bounded leaf and binary-topology refinement by default.
         `"full_tree"` evaluates dynamic bond pressure, tensor width, estimated
         work, write volume, and route length across every tree scale. It is
-        the high-quality, Cotengra-inspired mode and is opt-in because its
-        bounded subtree search is more expensive.
+        the high-quality, Cotengra-inspired mode; ``order="quality"`` selects
+        it automatically and enables its bounded search stages.
     order : {None, "quality"}, optional
-        Optional high-quality offline mode. `"quality"` enables bounded
-        greedy refinement and opportunistic Nevergrad refinement; omitted
-        keeps the fast deterministic candidate selection.
+        Optional high-quality offline mode. `"quality"` means
+        `objective="full_tree"` and enables bounded greedy leaf refinement,
+        all-scale subtree topology refinement, and hybrid
+        Nevergrad/annealing search. Omitted keeps the fast deterministic
+        objective selected by `objective`.
     hybrid_weights : mapping or sequence of three floats, optional
         Weights for the hybrid path, maximum edge load, and total edge load.
         The default is ``(1.0, 1.0, 0.25)``.
@@ -1340,14 +1353,18 @@ class TreeLayoutFinder:
         Maximum topology proposals per candidate plan. Defaults to at most 64
         proposals when topology refinement is enabled. For ``"subtree"``,
         proposals are sampled across the available descendant scales.
-    search : {None, "nevergrad", "anneal"}
+    search : {None, "nevergrad", "anneal", "hybrid"}
         Optional offline derivative-free refinement. It is never run unless
         requested. `"nevergrad"` refines leaf order and requires the optional
         package; `"anneal"` performs bounded simulated annealing over subtree
-        reconfigurations and has no additional dependency.
+        reconfigurations and has no additional dependency. `"hybrid"` splits
+        the budget between subtree annealing and Nevergrad leaf refinement;
+        it falls back to annealing if Nevergrad is unavailable.
     search_budget : int
         Number of offline search evaluations per candidate plan. For
-        ``search="anneal"``, this is the number of subtree proposals.
+        ``search="anneal"``, this is the number of subtree proposals; for
+        ``search="hybrid"``, it is the shared total split between annealing
+        and Nevergrad.
     seed : int
         Reproducible seed used by the optional Nevergrad stage.
     nevergrad_optimizer : str
@@ -1473,6 +1490,13 @@ class TreeLayoutFinder:
         self.hybrid_weights = _normalize_hybrid_weights(hybrid_weights)
         self.weight_mode = _normalize_weight_mode(weight_mode)
         self.order = _normalize_layout_order(order)
+        if self.order == "quality":
+            # ``order="quality"`` is the explicit high-quality contract. It
+            # is intentionally stronger than merely enabling a leaf swap: the
+            # all-scale full-tree objective and its topology search are part
+            # of the mode. Callers can still opt out of individual stages in
+            # ``run`` with ``refine=None`` or ``search=None``.
+            self.objective = "full_tree"
         self.refine = _normalize_layout_refinement(refine)
         if refine_budget is not None:
             refine_budget = _validate_search_budget(refine_budget, "refine_budget")
@@ -1515,6 +1539,7 @@ class TreeLayoutFinder:
         self._edge_load_cache = {}
         self._rank_diagnostics_cache = {}
         self._full_tree_profile_cache = {}
+        self._full_tree_structure_cache = {}
         self._schmidt_rank_cache = {}
         self._similarity_cache = {}
         self._congestion_weights_cache = None
@@ -2380,6 +2405,71 @@ class TreeLayoutFinder:
             "scales_visited": tuple(sorted(visited_scales)),
         }
 
+    def _refine_plan_hybrid(
+        self, plan, *, chi, budget, seed, optimizer_name, progbar=False
+    ):
+        """Combine all-scale topology annealing with Nevergrad leaf search.
+
+        The two search methods explore complementary spaces: annealing changes
+        descendant subtree topology while Nevergrad changes the labels assigned
+        to a fixed topology. ``budget`` is the total number of proposals and
+        is split between the two stages, so hybrid quality mode remains bounded
+        by the caller's requested offline budget.
+        """
+        initial_key = self._selection_key(plan, chi)
+        if budget < 2:
+            anneal_budget = budget
+            nevergrad_budget = 0
+        else:
+            anneal_budget = max(1, budget // 2)
+            nevergrad_budget = budget - anneal_budget
+
+        current, anneal_info = self._anneal_plan_subtree(
+            plan,
+            chi=chi,
+            budget=anneal_budget,
+            seed=seed + 1,
+            progbar=progbar,
+        )
+        nevergrad_info = None
+        if nevergrad_budget:
+            try:
+                current, nevergrad_info = self._refine_plan_nevergrad(
+                    current,
+                    chi=chi,
+                    budget=nevergrad_budget,
+                    seed=seed + 2,
+                    optimizer_name=optimizer_name,
+                    progbar=progbar,
+                )
+            except ImportError:
+                # Hybrid mode is the automatic quality path. Keep its
+                # dependency-free topology result when the optional package
+                # is absent; explicit search="nevergrad" still raises.
+                nevergrad_info = {
+                    "method": "nevergrad",
+                    "optimizer": optimizer_name,
+                    "budget": nevergrad_budget,
+                    "evaluations": 0,
+                    "seed": seed + 2,
+                    "available": False,
+                    "improved": False,
+                }
+
+        return current, {
+            "method": "hybrid",
+            "search": "hybrid",
+            "budget": budget,
+            "evaluations": int(anneal_info["evaluations"])
+            + int((nevergrad_info or {}).get("evaluations", 0)),
+            "accepted_moves": int(anneal_info["accepted_moves"])
+            + int((nevergrad_info or {}).get("improved", False)),
+            "initial_key": initial_key,
+            "final_key": self._selection_key(current, chi),
+            "anneal": anneal_info,
+            "nevergrad": nevergrad_info,
+        }
+
     def _refine_plan_nevergrad(
         self, plan, *, chi, budget, seed, optimizer_name, progbar=False
     ):
@@ -2528,6 +2618,15 @@ class TreeLayoutFinder:
             )
         elif settings["search"] == "nevergrad":
             plan, info["search"] = self._refine_plan_nevergrad(
+                plan,
+                chi=chi,
+                budget=settings["search_budget"],
+                seed=settings["seed"],
+                optimizer_name=settings["nevergrad_optimizer"],
+                progbar=progbar,
+            )
+        elif settings["search"] == "hybrid":
+            plan, info["search"] = self._refine_plan_hybrid(
                 plan,
                 chi=chi,
                 budget=settings["search_budget"],
@@ -2787,10 +2886,11 @@ class TreeLayoutFinder:
         topology_budget : int, optional
             Maximum topology proposals per candidate. When omitted, an enabled
             search uses at most 64 proposals.
-        search : {None, "nevergrad", "anneal"}, optional
+        search : {None, "nevergrad", "anneal", "hybrid"}, optional
             Override the finder offline search setting. Nevergrad optimizes
             only the returned fixed plan; annealing explores subtree
-            replacements. Neither mutates a live TTN.
+            replacements. ``"hybrid"`` combines both with one shared budget.
+            Neither mutates a live TTN.
         search_budget, seed, nevergrad_optimizer
             Optional offline-search configuration for each candidate plan.
         progbar : bool, optional
@@ -2948,11 +3048,11 @@ class TreeLayoutFinder:
         explicitly supplied. It evaluates every tree scale using dynamic
         bond-pressure and tensor-work proxies.
 
-        ``order="quality"`` is a convenience mode matching the MPS layout
-        API: it enables bounded greedy refinement and opportunistic offline
-        refinement. If Nevergrad is unavailable, quality mode falls back to
-        greedy refinement. For ``objective="full_tree"``, quality mode uses
-        the dependency-free annealing stage. Pass
+        ``order="quality"`` is the high-quality mode matching the MPS layout
+        API: it upgrades the effective objective to ``"full_tree"``, enables
+        greedy leaf refinement, all-scale subtree topology refinement, and
+        hybrid topology annealing plus Nevergrad leaf search. When Nevergrad
+        is unavailable, it selects dependency-free simulated annealing. Pass
         ``search=None`` or ``refine=None`` explicitly to disable either stage.
         """
         if order is _DEFAULT_ORDER:
@@ -2960,18 +3060,26 @@ class TreeLayoutFinder:
         else:
             order = _normalize_layout_order(order)
         if order == "quality":
+            if self.objective != "full_tree":
+                self.objective = "full_tree"
+                # Objective-dependent candidate caches may have been filled by
+                # an earlier fast/path run on this finder. Quality mode must
+                # not reuse those scores after upgrading to full-tree cost.
+                self._plan_cache.clear()
+                self._edge_load_cache.clear()
+                self._rank_diagnostics_cache.clear()
+                self._full_tree_profile_cache.clear()
+                self._full_tree_structure_cache.clear()
+                self._schmidt_rank_cache.clear()
+                self._similarity_cache.clear()
+                self._congestion_weights_cache = None
+                self._balanced_plan_cache = None
             if refine is _DEFAULT_SEARCH_OPTION:
-                refine = "greedy"
+                refine = self.refine or "greedy"
             if topology_refine is _DEFAULT_SEARCH_OPTION:
-                topology_refine = (
-                    "subtree" if self.objective == "full_tree" else "nni"
-                )
+                topology_refine = self.topology_refine or "subtree"
             if search is _DEFAULT_SEARCH_OPTION:
-                search = (
-                    "anneal"
-                    if self.objective == "full_tree"
-                    else ("nevergrad" if _nevergrad_available() else None)
-                )
+                search = self.search or _quality_search_mode()
         if chi is _DEFAULT_CHI:
             chi = self.chi
         else:
@@ -3036,6 +3144,9 @@ class TreeLayoutFinder:
         include_quality=False,
         quality_refine_budget=None,
         quality_topology_budget=None,
+        quality_search=_DEFAULT_SEARCH_OPTION,
+        quality_search_budget=_DEFAULT_SEARCH_OPTION,
+        quality_seed=_DEFAULT_SEARCH_OPTION,
     ):
         """Return immutable candidate plans for optional pilot replay.
 
@@ -3052,12 +3163,20 @@ class TreeLayoutFinder:
         include_quality : bool, optional
             Also add one ``"quality:arity=..."`` candidate per arity. These
             candidates start from the static objective candidates and apply
-            bounded greedy leaf and binary NNI topology refinement. This is
-            deliberately opt-in because it is more expensive than the static
-            candidate list.
+            bounded greedy leaf and topology refinement. For
+            ``objective="full_tree"`` this means all-scale subtree search and
+            the configured quality search; it is deliberately opt-in because
+            it is more expensive than the static candidate list.
         quality_refine_budget, quality_topology_budget : int, optional
             Bounds for the quality candidate's leaf-swap and NNI proposals.
             Each defaults to the normal bounded quality-mode budget.
+        quality_search : {None, "anneal", "nevergrad", "hybrid"}, optional
+            Optional second-stage search for quality candidates. The default
+            is no second stage for older objectives and ``"hybrid"`` (or
+            dependency-free ``"anneal"``) for ``objective="full_tree"``.
+        quality_search_budget, quality_seed : int, optional
+            Budget and seed for ``quality_search``. These are planning-only
+            controls; no tensor state is allocated or replayed here.
         """
         if chi is _DEFAULT_CHI:
             chi = self.chi
@@ -3071,12 +3190,35 @@ class TreeLayoutFinder:
         result = {}
         quality_settings = None
         if include_quality:
+            if quality_search is _DEFAULT_SEARCH_OPTION:
+                quality_search = (
+                    _quality_search_mode()
+                    if self.objective == "full_tree" else None
+                )
+            if quality_search_budget is _DEFAULT_SEARCH_OPTION:
+                quality_search_budget = self.search_budget
+            elif quality_search_budget is not None:
+                quality_search_budget = _validate_search_budget(
+                    quality_search_budget, "quality_search_budget"
+                )
+            if quality_seed is _DEFAULT_SEARCH_OPTION:
+                quality_seed = self.seed
+            else:
+                try:
+                    quality_seed = int(quality_seed)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("quality_seed must be an integer.") from exc
+            quality_topology_refine = (
+                "subtree" if self.objective == "full_tree" else "nni"
+            )
             quality_settings = self._resolve_search_settings(
                 refine="greedy",
                 refine_budget=quality_refine_budget,
-                topology_refine="nni",
+                topology_refine=quality_topology_refine,
                 topology_budget=quality_topology_budget,
-                search=None,
+                search=quality_search,
+                search_budget=quality_search_budget,
+                seed=quality_seed,
             )
         for arity in arities:
             plans = self._candidate_plans(arity)
@@ -3117,6 +3259,146 @@ class TreeLayoutFinder:
                     "planning": planning,
                 }
         return result
+
+    def targeted_candidates(
+        self,
+        plan,
+        edge_diagnostics,
+        *,
+        chi=_DEFAULT_CHI,
+        budget=32,
+        seed=0,
+    ):
+        """Propose static plans around replay-hot tree edges.
+
+        This is the circuit-only feedback hook used by
+        :meth:`TreeOptimizer.optimize_layout`. ``edge_diagnostics`` is the
+        per-edge report produced by a short pilot replay. The method uses the
+        measured hot edges only to choose where to explore; every proposed
+        plan is still ranked by the configured static layout objective. It
+        never constructs a tensor network, applies a gate, or truncates a
+        state.
+
+        The proposals include binary NNI moves where valid, local subtree
+        reconfigurations at the hot edge, and leaf exchanges across the hot
+        cut. Returned plans are immutable and deduplicated.
+        """
+        if not isinstance(plan, TreePlan):
+            raise TypeError("plan must be a TreePlan.")
+        if chi is _DEFAULT_CHI:
+            chi = self.chi
+        else:
+            chi = _validate_chi(chi)
+        budget = _validate_search_budget(budget, "budget")
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("seed must be an integer.") from exc
+        if budget is None or budget < 1:
+            return []
+        if not hasattr(edge_diagnostics, "items"):
+            raise TypeError("edge_diagnostics must be a mapping of edge metrics.")
+
+        def hot_key(item):
+            edge, metrics = item
+            metrics = metrics if hasattr(metrics, "get") else {}
+            return (
+                -float(metrics.get("discarded_fraction", 0.0) or 0.0),
+                -float(metrics.get("discarded_weight", 0.0) or 0.0),
+                -int(metrics.get("truncated", 0) or 0),
+                tuple(edge),
+            )
+
+        hot_edges = []
+        for edge, metrics in sorted(edge_diagnostics.items(), key=hot_key):
+            try:
+                edge = tuple(int(x) for x in edge)
+            except (TypeError, ValueError):
+                continue
+            if len(edge) != 2:
+                continue
+            parent, child = edge
+            if plan.parent.get(child) != parent:
+                continue
+            hot_edges.append((edge, metrics))
+        if not hot_edges:
+            return []
+
+        rng = np.random.default_rng(seed)
+        leaf_nodes = self._leaf_nodes(plan)
+        below = plan.subtree_qubit_masks()
+        proposals = []
+        seen = set()
+
+        def signature(candidate):
+            return (
+                candidate.root,
+                candidate.root_qubit,
+                tuple(
+                    sorted(
+                        (node, tuple(children))
+                        for node, children in candidate.children.items()
+                    )
+                ),
+                tuple(sorted(candidate.qubit_of_leaf.items())),
+            )
+
+        original_signature = signature(plan)
+
+        def add(candidate):
+            if candidate is None:
+                return
+            key = signature(candidate)
+            if key == original_signature or key in seen:
+                return
+            seen.add(key)
+            proposals.append(candidate)
+
+        for (parent, child), _metrics in hot_edges:
+            if len(proposals) >= budget:
+                break
+            if (parent, child) in self._nni_edges(plan):
+                for variant in (0, 1):
+                    if len(proposals) >= budget:
+                        break
+                    add(self._plan_with_nni(plan, parent, child, variant))
+
+            # Rebuild the smaller side first. A second draw at the parent
+            # lets the search change the attachment itself when the hot edge
+            # is a poor cut rather than merely a poor local ordering.
+            for node in (child, parent):
+                if len(proposals) >= budget:
+                    break
+                if node not in plan.children:
+                    continue
+                candidate = self._plan_with_subtree_reconfiguration(
+                    plan, node, rng
+                )
+                add(candidate)
+
+            hot_qubits = [
+                leaf for leaf in leaf_nodes
+                if below[child] & (1 << plan.qubit_of_leaf[leaf])
+            ]
+            cold_qubits = [leaf for leaf in leaf_nodes if leaf not in hot_qubits]
+            if hot_qubits and cold_qubits:
+                rng.shuffle(hot_qubits)
+                rng.shuffle(cold_qubits)
+                for left_leaf, right_leaf in zip(hot_qubits, cold_qubits):
+                    if len(proposals) >= budget:
+                        break
+                    add(self._plan_with_leaf_swap(plan, left_leaf, right_leaf))
+
+        # If the first cut generated fewer than the requested proposals, use
+        # deterministic neighbouring swaps so a pilot round still has a
+        # useful bounded exploration budget on shallow trees.
+        if len(proposals) < budget:
+            for left_leaf, right_leaf in zip(leaf_nodes, leaf_nodes[1:]):
+                if len(proposals) >= budget:
+                    break
+                add(self._plan_with_leaf_swap(plan, left_leaf, right_leaf))
+        proposals.sort(key=lambda candidate: self._selection_key(candidate, chi))
+        return proposals[:budget]
 
     def recommend_arities(
         self,
@@ -3460,12 +3742,33 @@ class TreeLayoutFinder:
             return cached[1]
 
         below = plan.subtree_qubit_masks()
-        node_scales = _tree_node_scales(plan)
-        edges = tuple(
-            (parent, child)
-            for parent, children in plan.children.items()
-            for child in children
+        structure_key = (
+            plan.root,
+            plan.root_qubit,
+            tuple(
+                sorted(
+                    (node, tuple(children))
+                    for node, children in plan.children.items()
+                )
+            ),
+            tuple(sorted(plan.qubit_of_node)),
         )
+        cached_structure = self._full_tree_structure_cache.get(structure_key)
+        if cached_structure is None:
+            node_scales = _tree_node_scales(plan)
+            edges = tuple(
+                (parent, child)
+                for parent, children in plan.children.items()
+                for child in children
+            )
+            self._full_tree_structure_cache[structure_key] = (
+                node_scales,
+                edges,
+            )
+            structure_reused = False
+        else:
+            node_scales, edges = cached_structure
+            structure_reused = True
         demand_log = {edge: 0.0 for edge in edges}
         bond_log = {edge: 0.0 for edge in edges}
         log_chi = (
@@ -3505,6 +3808,7 @@ class TreeLayoutFinder:
         exact_events = 0
         bounded_events = 0
         bound_reasons = {}
+        support_span_cache = {}
 
         for payload, support, event_type, temporal_factor in zip(
             self.payloads,
@@ -3521,9 +3825,12 @@ class TreeLayoutFinder:
                 }
             ):
                 continue
-            support_mask, span_nodes, crossed_edges = self._support_span(
-                plan, support
-            )
+            span_key = support
+            cached_span = support_span_cache.get(span_key)
+            if cached_span is None:
+                cached_span = self._support_span(plan, support)
+                support_span_cache[span_key] = cached_span
+            support_mask, span_nodes, crossed_edges = cached_span
             if not crossed_edges:
                 continue
             event_count += 1
@@ -3611,6 +3918,10 @@ class TreeLayoutFinder:
             "exact_events": int(exact_events),
             "bounded_events": int(bounded_events),
             "bound_reasons": bound_reasons,
+            "cache": {
+                "structure_reused": bool(structure_reused),
+                "unique_supports": len(support_span_cache),
+            },
             "scales": scales,
         }
         self._full_tree_profile_cache[cache_key] = (plan, profile)
@@ -4215,26 +4526,34 @@ class TreeLayoutFinder:
         *,
         site_coords=None,
         ax=None,
-        figsize=(8, 7),
+        figsize=(8, 8),
         cmap="turbo",
         edge_cmap="GnBu",
         node_cmap="YlOrRd",
-        color_by="scale",
-        edge_color="#2f80a0",
+        color_by="order",
+        edge_color=None,
         show_edge_arrows=False,
         arrow_size=8.0,
         order=True,
         lattice=True,
-        show_gate_connectivity=True,
+        show_gate_connectivity=False,
         show_node_ids=False,
         show_site_labels=False,
+        show_leaf_nodes=False,
+        show_lattice_markers=True,
+        lattice_marker="+",
+        lattice_marker_size=100,
+        lattice_marker_color="#737e89",
+        lattice_marker_alpha=0.95,
+        lattice_skew=0.30,
+        lattice_rise=0.18,
         colorbar=False,
         show_axes=False,
         show_title=False,
-        node_size=38,
+        node_size=24,
         edge_linewidth=1.35,
-        edge_alpha=1.0,
-        vertical_spacing=None,
+        edge_alpha=0.8,
+        vertical_spacing=0.8,
     ):
         """Plot the hierarchy as a Cotengra-style tent over the raw graph.
 
@@ -4252,6 +4571,15 @@ class TreeLayoutFinder:
         hierarchy nodes by a deterministic post-order traversal, matching the
         ordering option in Cotengra's tent plots. Use ``color_by="order"`` if
         the same traversal should also control the colors.
+        Pass ``show_leaf_nodes=False`` when the physical lattice already has
+        its own site markers (for example gray ``+`` symbols) and only the
+        internal tree nodes should be drawn over that backdrop.
+        By default, supplied two-dimensional coordinates are projected into a
+        shallow tent base using ``x' = x + lattice_skew * y`` and
+        ``y' = lattice_rise * y``. Set ``lattice_skew=0`` and
+        ``lattice_rise=1`` to preserve the supplied coordinates.
+        The default order/turbo palette and matching hierarchy edges are
+        intended to give a compact Cotengra-style structural view.
         """
         plt, colormaps, ScalarMappable, Normalize, _FancyArrowPatch = (
             matplotlib_modules()
@@ -4282,24 +4610,51 @@ class TreeLayoutFinder:
         fig = ax.figure
 
         qubits = tuple(range(plan.n))
-        coords = resolve_site_coords(qubits, site_coords)
+        raw_coords = resolve_site_coords(qubits, site_coords)
+        try:
+            lattice_skew = float(lattice_skew)
+            lattice_rise = float(lattice_rise)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "lattice_skew and lattice_rise must be real numbers."
+            ) from exc
+        if not np.isfinite(lattice_skew) or not np.isfinite(lattice_rise):
+            raise ValueError("lattice_skew and lattice_rise must be finite.")
+        coords = {
+            qubit: (
+                x + lattice_skew * y,
+                lattice_rise * y,
+            )
+            for qubit, (x, y) in raw_coords.items()
+        }
         node_scales = _tree_node_scales(plan)
         n_scales = max(node_scales.values(), default=0) + 1
 
         if lattice:
-            for left, right in coordinate_lattice_edges(coords):
+            for left, right in coordinate_lattice_edges(raw_coords):
                 ax.plot(
                     (coords[left][0], coords[right][0]),
                     (coords[left][1], coords[right][1]),
-                    color="#d5d9de",
-                    linewidth=1.0,
-                    alpha=0.78,
+                    color="#b7c0c9",
+                    linewidth=1.05,
+                    alpha=0.82,
                     zorder=1,
+                )
+            if show_lattice_markers:
+                ax.scatter(
+                    [coords[qubit][0] for qubit in qubits],
+                    [coords[qubit][1] for qubit in qubits],
+                    marker=lattice_marker,
+                    s=lattice_marker_size,
+                    color=lattice_marker_color,
+                    alpha=lattice_marker_alpha,
+                    linewidths=1.25,
+                    zorder=1.5,
                 )
 
         if show_gate_connectivity:
             lattice_pairs = (
-                coordinate_lattice_edge_keys(coords)
+                coordinate_lattice_edge_keys(raw_coords)
                 if lattice
                 else set()
             )
@@ -4453,6 +4808,8 @@ class TreeLayoutFinder:
                     )
 
         for node in plan.nodes():
+            if plan.is_leaf(node) and not show_leaf_nodes:
+                continue
             x, y = positions[node]
             ax.scatter(
                 [x],

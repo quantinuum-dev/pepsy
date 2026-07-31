@@ -1480,175 +1480,395 @@ class TreeOptimizer:
             }
         return self.layout_finder.report(self.plan)
 
-    def select_layout_for_compression(
+    def _layout_candidate_record(self, finder, plan, *, source=None):
+        """Build the common static record for a pilot candidate."""
+        return {
+            "plan": plan,
+            "objective_key": finder._selection_key(plan, self.chi),
+            "path_score": finder.score(plan),
+            "tensor_cost": finder._tensor_cost_key(plan),
+            "edge_loads": finder.edge_loads(plan),
+            **({"source": source} if source is not None else {}),
+        }
+
+    @staticmethod
+    def _pilot_edge_diagnostics(events):
+        """Aggregate replay losses by the immutable planned tree edge."""
+        diagnostics = {}
+        for event in events:
+            edge = tuple(event["edge"])
+            metric = diagnostics.setdefault(edge, {
+                "events": 0,
+                "truncated": 0,
+                "discarded_weight": 0.0,
+                "discarded_fraction": 0.0,
+                "tracked": False,
+                "max_before_bond": 0,
+                "max_after_bond": 0,
+            })
+            metric["events"] += 1
+            metric["truncated"] += int(bool(event.get("truncated", False)))
+            metric["max_before_bond"] = max(
+                metric["max_before_bond"], int(event.get("before_bond", 0))
+            )
+            metric["max_after_bond"] = max(
+                metric["max_after_bond"], int(event.get("after_bond", 0))
+            )
+            discarded_weight = event.get("discarded_weight")
+            discarded_fraction = event.get("discarded_fraction")
+            if discarded_weight is not None:
+                metric["tracked"] = True
+                metric["discarded_weight"] += float(discarded_weight)
+            if discarded_fraction is not None:
+                metric["tracked"] = True
+                metric["discarded_fraction"] = max(
+                    metric["discarded_fraction"], float(discarded_fraction)
+                )
+        return diagnostics
+
+    def _pilot_layout_candidate(
+        self, plan, *, objective, pilot_steps=None, progbar=False
+    ):
+        """Replay one candidate and return state-aware diagnostics."""
+        started = time.perf_counter()
+        trial = type(self)(
+            None,
+            n=self.n,
+            chi=self.chi,
+            cutoff=self.cutoff,
+            cutoff_mode=self.cutoff_mode,
+            mode=self.mode,
+            structure=self.structure,
+            max_arity=self.max_arity,
+            top_arity=self.top_arity,
+            community_frac=self.community_frac,
+            star_frac=self.star_frac,
+            layout_objective=objective,
+            tree=plan,
+            dtype=self.dtype,
+            threads=self.threads,
+            track_truncation=True,
+            track_infidelity=True,
+            max_intermediate_bond=self.max_intermediate_bond,
+            max_operator_qubits=self.max_operator_qubits,
+            max_subtree_nodes=self.max_subtree_nodes,
+            record_history=True,
+            run=False,
+            tn=self.tn,
+        )
+        trial.G = list(self.G)
+        trial.where = list(self.where)
+        trial.event_types = list(self.event_types)
+        if pilot_steps is not None:
+            trial.G = trial.G[:pilot_steps]
+            trial.where = trial.where[:pilot_steps]
+            trial.event_types = trial.event_types[:pilot_steps]
+        try:
+            trial.run(progbar=progbar)
+        except Exception as exc:  # pragma: no cover - backend-specific
+            return {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "elapsed_seconds": float(time.perf_counter() - started),
+                "pilot_steps": len(trial.G),
+            }
+
+        elapsed = float(time.perf_counter() - started)
+        events = deepcopy(trial.truncation_history)
+        edge_diagnostics = self._pilot_edge_diagnostics(events)
+        tracked = [
+            event for event in events
+            if event.get("discarded_weight") is not None
+        ]
+        total_discarded = float(
+            sum(event["discarded_weight"] for event in tracked)
+        ) if tracked else 0.0
+        max_fraction = max(
+            (float(event["discarded_fraction"]) for event in tracked),
+            default=0.0,
+        )
+        update_runtime = float(sum(
+            update.get("elapsed_seconds", 0.0)
+            for update in trial.update_history
+        ))
+        return {
+            "status": "ok",
+            "elapsed_seconds": elapsed,
+            "update_runtime_seconds": update_runtime,
+            "infidelity": float(trial.infidelities[-1]),
+            "final_bond": int(trial.max_bond()),
+            "truncated_edges": int(sum(
+                event.get("truncated", False) for event in events
+            )),
+            "total_discarded_weight": total_discarded,
+            "max_discarded_fraction": float(max_fraction),
+            "pilot_steps": len(trial.G),
+            "edge_diagnostics": edge_diagnostics,
+            "updates": deepcopy(trial.update_history),
+        }
+
+    def optimize_layout(
         self,
         *,
+        objective=None,
         pilot_candidates=4,
+        candidate_budget=None,
         pilot_steps=None,
         include_quality=True,
+        rounds=2,
+        topology_budget=None,
+        refine_budget=None,
+        search_budget=None,
+        seed=0,
         install=False,
         progbar=False,
     ):
-        """Select a tree layout using state-aware pilot replay.
+        """Optimize a tree layout with bounded pilot-guided feedback.
 
-        Static compression candidates are generated with
-        ``objective="compression"`` and then replayed on independent copies
-        of the current state. When ``include_quality=True`` (the default), one
-        bounded greedy/NNI quality candidate is reserved a pilot slot so it
-        cannot be excluded by static surrogate ranking. The pilot uses the
-        real tree update kernels, ``chi``, cutoff, backend, and queued gate
-        stream. The original state is unchanged. By default the selected plan
-        is returned for explicit hand-off; ``install=True`` is allowed only
-        for a product state and remounts that state exactly on the selected
-        geometry. Pass ``include_quality=False`` for the previous static-only
-        candidate set.
+        ``TreeLayoutFinder`` first generates static candidates, including the
+        all-scale ``objective="full_tree"`` search when requested. Each round
+        replays a short list on independent copies of the current *product*
+        state using the real tree kernels. The measured per-edge truncation
+        losses then seed targeted NNI, subtree, and cut-crossing leaf proposals
+        for the next round. The finder remains circuit-only: it does not
+        allocate tensors, replay gates, or perform truncations.
+
+        The original optimizer is unchanged unless ``install=True`` is passed.
+        Installation is restricted to product states because an entangled TTN
+        cannot be relaid out exactly without an explicit state conversion.
+        ``objective="full_tree"`` is the recommended high-quality mode; its
+        static score covers routing demand, tensor width, work, and every tree
+        scale, while the pilot supplies the final state-aware choice.
+        ``candidate_budget`` is an alias for ``pilot_candidates`` for callers
+        that want to express the total candidate-pilot budget explicitly.
         """
         try:
+            if candidate_budget is not None:
+                pilot_candidates = candidate_budget
             pilot_candidates = int(pilot_candidates)
+            rounds = int(rounds)
         except (TypeError, ValueError) as exc:
-            raise ValueError("pilot_candidates must be a positive integer.") from exc
-        if pilot_candidates < 1:
-            raise ValueError("pilot_candidates must be a positive integer.")
+            raise ValueError(
+                "pilot_candidates and rounds must be positive integers."
+            ) from exc
+        if pilot_candidates < 1 or rounds < 1:
+            raise ValueError("pilot_candidates and rounds must be positive integers.")
         if pilot_steps is not None:
             try:
                 pilot_steps = int(pilot_steps)
             except (TypeError, ValueError) as exc:
-                raise ValueError("pilot_steps must be a positive integer or None.") from exc
+                raise ValueError(
+                    "pilot_steps must be a positive integer or None."
+                ) from exc
             if pilot_steps < 1:
                 raise ValueError("pilot_steps must be a positive integer or None.")
+        if not _is_product_tensor_network(self.tn):
+            raise ValueError(
+                "Tree layout pilots require a product initial state when "
+                "comparing different tree geometries. Convert the entangled "
+                "state explicitly onto each candidate plan first."
+            )
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("seed must be an integer.") from exc
 
-        finder = TreeLayoutFinder(
-            gates=self._layout_gate_stream(),
-            n=self.n,
-            structure=self.structure,
-            max_arity=self.max_arity,
-            community_frac=self.community_frac,
-            star_frac=self.star_frac,
-            objective="compression",
-            weight_mode=self.layout_weight_mode,
-            time_decay=self.layout_time_decay,
-            time_window=self.layout_time_window,
-            chi=self.chi,
-            max_operator_qubits=self.max_operator_qubits,
-            root_qubit=self.plan.root_qubit,
-            top_arity=self.top_arity,
-        )
-        candidates = finder.candidate_plans(
-            chi=self.chi,
-            include_quality=bool(include_quality),
-        )
-        ranked_static = sorted(
-            candidates,
-            key=lambda name: candidates[name]["objective_key"],
-        )
-        if include_quality:
+        objective = self.layout_objective if objective is None else objective
+        previous_plan = None
+        previous_edge_diagnostics = None
+        round_reports = []
+        final_finder = None
+        final_candidates = None
+        final_ranked = None
+        final_selected_name = None
+
+        for round_index in range(rounds):
+            finder = TreeLayoutFinder(
+                gates=self._layout_gate_stream(),
+                n=self.n,
+                structure=self.structure,
+                max_arity=self.max_arity,
+                community_frac=self.community_frac,
+                star_frac=self.star_frac,
+                objective=objective,
+                weight_mode=self.layout_weight_mode,
+                time_decay=self.layout_time_decay,
+                time_window=self.layout_time_window,
+                chi=self.chi,
+                max_operator_qubits=self.max_operator_qubits,
+                root_qubit=self.plan.root_qubit,
+                top_arity=self.top_arity,
+                seed=seed + round_index,
+            )
+            quality_kwargs = {
+                "chi": self.chi,
+                "include_quality": bool(include_quality),
+            }
+            if topology_budget is not None:
+                quality_kwargs["quality_topology_budget"] = topology_budget
+            if refine_budget is not None:
+                quality_kwargs["quality_refine_budget"] = refine_budget
+            if search_budget is not None:
+                quality_kwargs["quality_search_budget"] = search_budget
+            quality_kwargs["quality_seed"] = seed + round_index
+            candidates = finder.candidate_plans(**quality_kwargs)
+
+            if (
+                previous_plan is not None
+                and previous_edge_diagnostics
+                and rounds > 1
+            ):
+                targeted = finder.targeted_candidates(
+                    previous_plan,
+                    previous_edge_diagnostics,
+                    chi=self.chi,
+                    budget=max(2 * pilot_candidates, 8),
+                    seed=seed + round_index,
+                )
+                for proposal_index, plan in enumerate(targeted):
+                    candidates[
+                        f"pilot:round={round_index}:proposal={proposal_index}"
+                    ] = self._layout_candidate_record(
+                        finder,
+                        plan,
+                        source="pilot_feedback",
+                    )
+
+            ranked_static = sorted(
+                candidates,
+                key=lambda name: candidates[name]["objective_key"],
+            )
             quality_names = [
                 name for name in ranked_static if name.startswith("quality:")
             ]
-            non_quality_names = [
-                name for name in ranked_static if not name.startswith("quality:")
+            feedback_names = [
+                name for name in ranked_static
+                if name.startswith("pilot:")
             ]
-            reserved_quality = quality_names[:1]
-            ranked = (
-                reserved_quality
-                + non_quality_names[: max(0, pilot_candidates - 1)]
-            )
-        else:
-            ranked = ranked_static[:pilot_candidates]
-        reports = {}
-        successful = []
-        for name in ranked:
-            plan = candidates[name]["plan"]
-            if not _is_product_tensor_network(self.tn):
-                raise ValueError(
-                    "Tree compression pilots require a product initial state "
-                    "when comparing different tree geometries. Convert the "
-                    "entangled state explicitly onto each candidate plan first."
+            ordinary_names = [
+                name for name in ranked_static
+                if not name.startswith(("quality:", "pilot:"))
+            ]
+            if include_quality:
+                ranked = quality_names[:1]
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(feedback_names[:remaining])
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(ordinary_names[:remaining])
+                remaining = pilot_candidates - len(ranked)
+                ranked.extend(
+                    name for name in ranked_static
+                    if name not in ranked
                 )
-            started = time.perf_counter()
-            trial = type(self)(
-                None,
-                n=self.n,
-                chi=self.chi,
-                cutoff=self.cutoff,
-                cutoff_mode=self.cutoff_mode,
-                mode=self.mode,
-                structure=self.structure,
-                max_arity=self.max_arity,
-                top_arity=self.top_arity,
-                community_frac=self.community_frac,
-                star_frac=self.star_frac,
-                tree=plan,
-                dtype=self.dtype,
-                threads=self.threads,
-                track_truncation=True,
-                track_infidelity=True,
-                max_intermediate_bond=self.max_intermediate_bond,
-                max_operator_qubits=self.max_operator_qubits,
-                max_subtree_nodes=self.max_subtree_nodes,
-                record_history=self.record_history,
-                run=False,
-                tn=self.tn,
-            )
-            trial.G = list(self.G)
-            trial.where = list(self.where)
-            trial.event_types = list(self.event_types)
-            if pilot_steps is not None:
-                trial.G = trial.G[:pilot_steps]
-                trial.where = trial.where[:pilot_steps]
-                trial.event_types = trial.event_types[:pilot_steps]
-            try:
-                trial.run(progbar=progbar)
-                elapsed = time.perf_counter() - started
-                infidelity = float(trial.infidelities[-1])
-                final_bond = int(trial.max_bond())
-                truncated_edges = int(sum(
-                    event.get("truncated", False)
-                    for event in trial.truncation_history
-                ))
-                reports[name] = {
-                    "status": "ok",
-                    "elapsed_seconds": float(elapsed),
-                    "infidelity": infidelity,
-                    "final_bond": final_bond,
-                    "truncated_edges": truncated_edges,
-                    "pilot_steps": len(trial.G),
-                }
-                successful.append((infidelity, truncated_edges, final_bond, elapsed, name))
-            except Exception as exc:  # pragma: no cover - backend-specific
-                reports[name] = {
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "elapsed_seconds": float(time.perf_counter() - started),
-                    "pilot_steps": len(trial.G),
-                }
+                ranked = ranked[:pilot_candidates]
+            else:
+                ranked = ranked_static[:pilot_candidates]
 
-        if not successful:
-            raise RuntimeError(
-                "All Tree compression layout pilot candidates failed. "
-                f"Diagnostics: {reports!r}"
+            reports = {}
+            successful = []
+            for name in ranked:
+                report = self._pilot_layout_candidate(
+                    candidates[name]["plan"],
+                    objective=finder.objective,
+                    pilot_steps=pilot_steps,
+                    progbar=progbar,
+                )
+                reports[name] = report
+                if report["status"] != "ok":
+                    continue
+                successful.append((
+                    float(report["infidelity"]),
+                    float(report["total_discarded_weight"]),
+                    float(report["max_discarded_fraction"]),
+                    int(report["truncated_edges"]),
+                    float(report["elapsed_seconds"]),
+                    int(report["final_bond"]),
+                    name,
+                ))
+            if not successful:
+                raise RuntimeError(
+                    "All Tree layout pilot candidates failed. "
+                    f"Diagnostics: {reports!r}"
+                )
+            selected_name = min(successful)[-1]
+            selected_plan = candidates[selected_name]["plan"]
+            selected_report = reports[selected_name]
+            round_reports.append({
+                "round": round_index,
+                "objective": finder.objective,
+                "pilot_candidates": tuple(ranked),
+                "selected_candidate": selected_name,
+                "reports": reports,
+            })
+            previous_plan = selected_plan
+            previous_edge_diagnostics = selected_report.get(
+                "edge_diagnostics", {}
             )
-        selected_name = min(successful)[-1]
-        selected_plan = candidates[selected_name]["plan"]
+            final_finder = finder
+            final_candidates = candidates
+            final_ranked = ranked
+            final_selected_name = selected_name
+
+        selected_plan = final_candidates[final_selected_name]["plan"]
         if install:
             self.plan = selected_plan
             self.tn = self._remount_product_state(self.tn)
             self.center = self.plan.root
-            self.layout_finder = finder
-            self.layout_objective = "compression"
+            self.layout_finder = final_finder
+            self.layout_objective = final_finder.objective
+        final_round = round_reports[-1]
         return {
             "plan": selected_plan,
-            "selected_candidate": selected_name,
-            "candidates": candidates,
+            "selected_candidate": final_selected_name,
+            "candidates": final_candidates,
             "pilot": {
-                "objective": "compression",
+                "objective": final_finder.objective,
                 "include_quality": bool(include_quality),
-                "pilot_candidates": tuple(ranked),
-                "selected_candidate": selected_name,
-                "reports": reports,
+                "pilot_candidates": tuple(final_ranked),
+                "selected_candidate": final_selected_name,
+                "reports": final_round["reports"],
+                "rounds": round_reports,
+                "n_rounds": rounds,
                 "installed": bool(install),
             },
         }
+
+    def select_layout_for_compression(
+        self,
+        *,
+        pilot_candidates=4,
+        candidate_budget=None,
+        pilot_steps=None,
+        include_quality=True,
+        rounds=1,
+        topology_budget=None,
+        refine_budget=None,
+        search_budget=None,
+        seed=0,
+        install=False,
+        progbar=False,
+    ):
+        """Backward-compatible one-round compression layout selection.
+
+        For iterative state-aware optimization, use
+        :meth:`optimize_layout`, for example with
+        ``objective="full_tree"`` and ``rounds=2``. This wrapper retains the
+        original compression objective and return shape.
+        """
+        return self.optimize_layout(
+            objective="compression",
+            pilot_candidates=pilot_candidates,
+            candidate_budget=candidate_budget,
+            pilot_steps=pilot_steps,
+            include_quality=include_quality,
+            rounds=rounds,
+            topology_budget=topology_budget,
+            refine_budget=refine_budget,
+            search_budget=search_budget,
+            seed=seed,
+            install=install,
+            progbar=progbar,
+        )
 
     def plot_layout(self, plan=None, *, layout_kwargs=None, **plot_kwargs):
         """Plot the tree layout as a Cotengra-style tent.
@@ -1816,6 +2036,7 @@ class TreeOptimizer:
             "kind": str(kind),
             "support": tuple(int(q) for q in where),
             "edge_start": len(self.truncation_history),
+            "started_at": time.perf_counter(),
         }
         return True
 
@@ -1876,6 +2097,9 @@ class TreeOptimizer:
             "update": len(self.update_history),
             "kind": active["kind"],
             "support": active["support"],
+            "elapsed_seconds": float(
+                time.perf_counter() - active["started_at"]
+            ),
             "edge_event_indices": list(range(start, len(self.truncation_history))),
             "edge_count": len(edge_events),
             "truncated_edges": sum(event["truncated"] for event in edge_events),

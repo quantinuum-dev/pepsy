@@ -1058,6 +1058,63 @@ def test_tree_compression_layout_pilot_is_non_mutating():
     assert opt.max_bond() == 1
 
 
+def test_tree_layout_pilot_feedback_is_iterative_and_edge_aware():
+    """Full-tree pilots feed bounded hot-edge proposals into the next round."""
+    h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    gates = [(h, 0), (pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1))]
+    opt = TreeOptimizer(gates, n=4, max_arity=2, chi=1, run=False)
+    original_plan = opt.plan
+
+    selected = opt.optimize_layout(
+        objective="full_tree",
+        pilot_candidates=1,
+        pilot_steps=3,
+        rounds=2,
+        topology_budget=1,
+        refine_budget=1,
+        search_budget=2,
+    )
+
+    assert selected["pilot"]["objective"] == "full_tree"
+    assert selected["pilot"]["n_rounds"] == 2
+    assert len(selected["pilot"]["rounds"]) == 2
+    assert opt.plan is original_plan
+    report = selected["pilot"]["reports"][selected["selected_candidate"]]
+    assert report["status"] == "ok"
+    assert report["update_runtime_seconds"] >= 0.0
+    assert isinstance(report["edge_diagnostics"], dict)
+    assert opt.max_bond() == 1
+
+
+def test_tree_layout_targeted_candidates_are_static_and_bounded():
+    """Hot-edge proposal generation never allocates or mutates a TTN."""
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1))],
+        n=4,
+        max_arity=2,
+        objective="full_tree",
+        chi=None,
+    )
+    plan = TreePlan.from_order(range(4), structure="balanced", max_arity=2)
+    edge = next(
+        (parent, child)
+        for parent, children in plan.children.items()
+        for child in children
+    )
+    proposals = finder.targeted_candidates(
+        plan,
+        {edge: {"truncated": 1, "discarded_fraction": 0.5}},
+        budget=3,
+        seed=3,
+    )
+
+    assert len(proposals) <= 3
+    assert all(candidate.is_binary() for candidate in proposals)
+    unchanged = TreePlan.from_order(range(4), structure="balanced", max_arity=2)
+    assert plan.children == unchanged.children
+    assert plan.qubit_of_leaf == unchanged.qubit_of_leaf
+
+
 def test_tree_candidate_plans_include_quality_for_state_aware_pilots():
     """Quality refinement is exposed as an explicit pilot candidate."""
     finder = TreeLayoutFinder(
@@ -1147,6 +1204,35 @@ def test_full_tree_anneals_subtrees_without_changing_binary_contract():
     assert planning["search"]["method"] == "subtree"
     assert planning["search"]["search"] == "anneal"
     assert candidate["full_tree_profile"]["scales"]
+
+
+def test_full_tree_hybrid_quality_search_is_static_and_budgeted():
+    """Full-tree quality combines topology and leaf search without a TTN."""
+    pytest.importorskip("nevergrad")
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1)),
+         (pepsy.cnot(), (2, 5)), (pepsy.cnot(), (4, 5))],
+        n=6,
+        max_arity=(2,),
+        top_arity=3,
+        objective="full_tree",
+        seed=7,
+    )
+    plan = finder.run(
+        order="quality",
+        topology_budget=2,
+        refine_budget=2,
+        search_budget=6,
+    )
+
+    planning = finder._last_arity_recommendation["candidates"][0]["planning"]
+    search = planning["search"]
+    assert finder.chi is None
+    assert plan.is_binary()
+    assert search["method"] == "hybrid"
+    assert search["anneal"]["search"] == "anneal"
+    assert search["nevergrad"]["method"] == "nevergrad"
+    assert search["evaluations"] <= 6
 
 
 def test_tree_edge_loads_match_full_edge_reference():
@@ -1686,7 +1772,9 @@ def test_tree_layout_finder_plot_defaults_to_tent():
     assert len(fig.axes) == 1
     assert not ax.axison  # schematic-style presentation by default
     assert not ax.texts
-    assert len(ax.collections) == len(plan.nodes())
+    assert len(ax.collections) == 1 + sum(
+        not plan.is_leaf(node) for node in plan.nodes()
+    )
     plt.close(fig)
 
 
@@ -1739,7 +1827,35 @@ def test_tree_layout_finder_plot_tent_draws_hierarchy_over_raw_graph():
     assert not ax.texts
     assert not ax.axison
     assert len(ax.lines) >= len(plan.nodes()) - 1
-    assert len(ax.collections) == len(plan.nodes())
+    assert len(ax.collections) == 1 + sum(
+        not plan.is_leaf(node) for node in plan.nodes()
+    )
+    plt.close(fig)
+
+
+def test_tree_layout_tent_can_hide_physical_leaf_nodes():
+    """Physical plus-mark backdrops can replace tree leaf circles."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1))],
+        n=4,
+        max_arity=2,
+    )
+    plan = finder.run()
+    fig, ax = finder.plot_tent(
+        plan,
+        lattice=False,
+        show_gate_connectivity=False,
+        show_leaf_nodes=False,
+    )
+
+    assert len(ax.collections) == sum(
+        not plan.is_leaf(node) for node in plan.nodes()
+    )
+    assert len(ax.lines) == len(plan.nodes()) - 1
     plt.close(fig)
 
 
@@ -1769,17 +1885,9 @@ def test_tree_layout_scale_colors_do_not_depend_on_gate_stream_length():
             edge_color=None,
             show_edge_arrows=False,
         )
-        # With the default one-dimensional coordinates, the first lines are
-        # the lattice and only the non-lattice gate-connectivity background;
-        # nearest-neighbor gates are already represented by the lattice.
-        lattice_pairs = {
-            frozenset((site, site + 1))
-            for site in range(plan.n - 1)
-        }
-        nonlattice_gates = sum(
-            frozenset(where) not in lattice_pairs for _, where in gates
-        )
-        background_lines = len(plan.leaves()) - 1 + nonlattice_gates
+        # Gate-connectivity overlays are disabled by default, so only the
+        # one-dimensional physical lattice precedes the hierarchy edges.
+        background_lines = len(plan.leaves()) - 1
         structural_colors.append(
             tuple(
                 tuple(line.get_color())
@@ -1793,7 +1901,9 @@ def test_tree_layout_scale_colors_do_not_depend_on_gate_stream_length():
             )
         )
         assert len(fig.axes) == 1
-        assert len(ax.collections) == len(plan.nodes())
+        assert len(ax.collections) == 1 + sum(
+            not plan.is_leaf(node) for node in plan.nodes()
+        )
         plt.close(fig)
 
     assert structural_colors[0] == structural_colors[1]
@@ -1802,8 +1912,8 @@ def test_tree_layout_scale_colors_do_not_depend_on_gate_stream_length():
     assert len(set(scale_node_colors[0])) > 1
 
 
-def test_tree_layout_tent_edges_are_uniform_by_default():
-    """Tent hierarchy edges use one solid color unless explicitly varied."""
+def test_tree_layout_tent_edges_match_order_colors_by_default():
+    """Tent hierarchy edges follow the default order color palette."""
     matplotlib = pytest.importorskip("matplotlib")
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
@@ -1813,16 +1923,11 @@ def test_tree_layout_tent_edges_are_uniform_by_default():
     plan = finder.run()
     fig, ax = finder.plot_tent(plan, color_by="scale")
 
-    lattice_pairs = {
-        frozenset((site, site + 1)) for site in range(plan.n - 1)
-    }
-    background_lines = len(plan.leaves()) - 1 + sum(
-        frozenset(where) not in lattice_pairs for _, where in gates
-    )
+    background_lines = len(plan.leaves()) - 1
     hierarchy_colors = {
         line.get_color() for line in ax.lines[background_lines:]
     }
-    assert hierarchy_colors == {"#2f80a0"}
+    assert len(hierarchy_colors) > 1
     assert not ax.patches
     plt.close(fig)
 
@@ -1846,24 +1951,20 @@ def test_tree_layout_tent_colored_edges_match_child_nodes():
         show_edge_arrows=False,
     )
 
-    lattice_pairs = {
-        frozenset((site, site + 1)) for site in range(plan.n - 1)
-    }
-    background_lines = plan.n - 1 + sum(
-        frozenset(where) not in lattice_pairs
-        for _, where in [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))]
-    )
+    background_lines = plan.n - 1
+    internal_nodes = [node for node in plan.nodes() if not plan.is_leaf(node)]
     node_colors = {
         node: tuple(collection.get_facecolors()[0])
-        for node, collection in zip(plan.nodes(), ax.collections)
+        for node, collection in zip(internal_nodes, ax.collections[1:])
     }
     hierarchy_lines = ax.lines[background_lines:]
     line_index = 0
     for parent, children in plan.children.items():
         for child in children:
-            assert tuple(hierarchy_lines[line_index].get_color()) == pytest.approx(
-                node_colors[child]
-            )
+            if not plan.is_leaf(child):
+                assert tuple(
+                    hierarchy_lines[line_index].get_color()
+                ) == pytest.approx(node_colors[child])
             line_index += 1
     assert line_index == len(hierarchy_lines)
     plt.close(fig)
@@ -1925,9 +2026,34 @@ def test_tree_layout_quality_order_enables_bounded_refinement(monkeypatch):
     plan = finder.run()
 
     assert plan.n == 4
+    assert finder.objective == "full_tree"
     assert captured["refine"] == "greedy"
-    assert captured["topology_refine"] == "nni"
-    assert captured["search"] is None
+    assert captured["topology_refine"] == "subtree"
+    assert captured["search"] == "anneal"
+    assert captured["search_budget"] == finder.search_budget
+
+
+def test_tree_layout_quality_run_upgrades_a_fast_finder(monkeypatch):
+    """The explicit quality run is the full-tree mode even after construction."""
+    monkeypatch.setitem(sys.modules, "nevergrad", None)
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (1, 2))],
+        n=4,
+        max_arity=2,
+    )
+    captured = {}
+
+    def fake_improve(plan, *, chi, settings, progbar=False):
+        captured.update(settings)
+        return plan, {"method": "test"}
+
+    monkeypatch.setattr(finder, "_improve_plan", fake_improve)
+    plan = finder.run(order="quality")
+
+    assert plan.n == 4
+    assert finder.objective == "full_tree"
+    assert captured["topology_refine"] == "subtree"
+    assert captured["search"] == "anneal"
 
 
 def test_tree_layout_nni_refinement_changes_binary_topology():
