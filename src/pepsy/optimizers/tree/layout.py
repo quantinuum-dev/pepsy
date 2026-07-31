@@ -136,6 +136,23 @@ def _normalize_layout_refinement(refine):
     return name
 
 
+def _normalize_topology_refinement(refine):
+    """Normalize the optional joint topology refinement mode."""
+    if refine is None or refine is False:
+        return None
+    name = str(refine).replace("-", "_").strip().lower()
+    aliases = {
+        "topology": "nni",
+        "joint": "nni",
+        "joint_greedy": "nni",
+        "greedy_topology": "nni",
+    }
+    name = aliases.get(name, name)
+    if name != "nni":
+        raise ValueError("topology_refine must be None or 'nni'.")
+    return name
+
+
 def _normalize_layout_search(search):
     """Normalize an optional offline fixed-plan search mode."""
     if search is None or search is False:
@@ -184,6 +201,49 @@ def _validate_search_budget(value, name):
     return value
 
 
+def _normalize_time_decay(value):
+    """Validate an optional newest-event temporal decay factor."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("time_decay must be in (0, 1] or None.") from exc
+    if not np.isfinite(value) or value <= 0.0 or value > 1.0:
+        raise ValueError("time_decay must be in (0, 1] or None.")
+    return value
+
+
+def _normalize_time_window(value):
+    """Validate an optional trailing event window."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("time_window must be a positive integer or None.")
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "time_window must be a positive integer or None."
+        ) from exc
+    if value < 1:
+        raise ValueError("time_window must be a positive integer or None.")
+    return value
+
+
+def _temporal_event_factors(num_events, *, time_decay=None, time_window=None):
+    """Return one newest-event-normalized factor for each stream event."""
+    if num_events < 1:
+        return ()
+    factors = np.ones(int(num_events), dtype=float)
+    if time_window is not None and time_window < num_events:
+        factors[: num_events - time_window] = 0.0
+    if time_decay is not None and time_decay != 1.0:
+        ages = np.arange(num_events - 1, -1, -1, dtype=float)
+        factors *= np.power(time_decay, ages)
+    return tuple(float(factor) for factor in factors)
+
+
 def _safe_exp2(value):
     """Return ``2**value`` without emitting overflow warnings."""
     if value > np.log2(np.finfo(float).max):
@@ -205,12 +265,20 @@ def _normalize_layout_objective(objective):
         "compress": "compression",
         "accuracy": "compression",
         "bond_growth": "compression",
+        "hyperedge": "hypergraph",
+        "hyperedges": "hypergraph",
+        "hypergraph_load": "hypergraph",
+        "per_edge": "hypergraph",
+        "per_edge_load": "hypergraph",
     }
     name = aliases.get(name, name)
-    if name not in {"path", "congestion", "hybrid", "compression"}:
+    if name not in {
+        "path", "congestion", "hybrid", "compression", "hypergraph"
+    }:
         raise ValueError(
             f"Unknown tree layout objective {objective!r}. "
-            "Expected 'path', 'congestion', 'compression', or 'hybrid'."
+            "Expected 'path', 'congestion', 'compression', 'hypergraph', "
+            "or 'hybrid'."
         )
     return name
 
@@ -1133,12 +1201,16 @@ class TreeLayoutFinder:
         (see :meth:`TreePlan.from_order`).
     dense_max : int
         Maximum subsystem size for dense spectral reordering.
-    objective : {"path", "congestion", "compression", "hybrid"}
+    objective : {"path", "congestion", "compression", "hypergraph", "hybrid"}
         Layout objective. `"path"` preserves the co-occurrence/path-length
         heuristic; `"congestion"` selects among layout candidates using the
         predicted operator-Schmidt load on tree edges. `"hybrid"` combines
         normalized path, peak-edge-load, and total-edge-load costs using
         ``hybrid_weights``.
+        `"compression"` adds a local tensor-size proxy to the edge-load
+        objective. `"hypergraph"` is the direct multi-site mode: it ranks
+        plans from the full support hyperedges and per-edge Schmidt loads,
+        then applies bounded leaf and binary-topology refinement by default.
     order : {None, "quality"}, optional
         Optional high-quality offline mode. `"quality"` enables bounded
         greedy refinement and opportunistic Nevergrad refinement; omitted
@@ -1150,9 +1222,17 @@ class TreeLayoutFinder:
         Optional fixed-plan local search used by :meth:`run` and recommendation
         methods. `"greedy"` tries adjacent leaf-label swaps before simulation;
         it never changes a live :class:`TreeOptimizer` tree.
+    topology_refine : {None, "nni"}
+        Optional joint topology refinement for binary candidates. `"nni"`
+        tries bounded nearest-neighbor interchange moves on internal edges,
+        retaining only objective-improving trees. It never changes a live
+        :class:`TreeOptimizer` tree.
     refine_budget : int, optional
         Maximum greedy swap proposals per candidate plan. Defaults to at most
         64 proposals when refinement is enabled.
+    topology_budget : int, optional
+        Maximum NNI proposals per candidate plan. Defaults to at most 64
+        proposals when topology refinement is enabled.
     search : {None, "nevergrad"}
         Optional offline derivative-free refinement. It is never run unless
         requested and requires the optional ``nevergrad`` package.
@@ -1165,14 +1245,22 @@ class TreeLayoutFinder:
     weight_mode : {"count", "auto", "angle", "operator_schmidt"}
         Event weighting used for the interaction graph. `"count"` is the
         backward-compatible default.
+    time_decay : float, optional
+        If supplied, multiply an event's weight by ``time_decay ** age`` where
+        the newest event has age zero. Values must be in ``(0, 1]``.
+    time_window : int, optional
+        If supplied, only the final ``time_window`` stream events contribute to
+        layout scoring and predicted edge load.
     """
 
     def __init__(self, gates=None, n=None, *, supports=None, structure="quality",
                  max_arity=(2, 3, 4), community_frac=0.35, star_frac=0.75,
                  dense_max=512, objective="path", weight_mode="count", chi=None,
                  max_operator_qubits=8, hybrid_weights=None, refine=None,
-                 refine_budget=None, search=None, search_budget=128, seed=0,
-                 nevergrad_optimizer="OnePlusOne", order=None, root_qubit=None):
+                 refine_budget=None, topology_refine=None, topology_budget=None,
+                 search=None, search_budget=128, seed=0,
+                 nevergrad_optimizer="OnePlusOne", order=None, root_qubit=None,
+                 time_decay=None, time_window=None):
         if (
             _looks_like_tree_tensor_network(gates)
             or _looks_like_tree_tensor_network(supports)
@@ -1259,6 +1347,12 @@ class TreeLayoutFinder:
         if refine_budget is not None:
             refine_budget = _validate_search_budget(refine_budget, "refine_budget")
         self.refine_budget = refine_budget
+        self.topology_refine = _normalize_topology_refinement(topology_refine)
+        if topology_budget is not None:
+            topology_budget = _validate_search_budget(
+                topology_budget, "topology_budget"
+            )
+        self.topology_budget = topology_budget
         self.search = _normalize_layout_search(search)
         self.search_budget = _validate_search_budget(search_budget, "search_budget")
         try:
@@ -1280,6 +1374,8 @@ class TreeLayoutFinder:
                     "max_operator_qubits must be a positive integer or None."
                 )
         self.max_operator_qubits = max_operator_qubits
+        self.time_decay = _normalize_time_decay(time_decay)
+        self.time_window = _normalize_time_window(time_window)
 
         # Layout search asks for the same structural quantities several times
         # (once per candidate arity and once per diagnostic).  Keep these
@@ -1294,7 +1390,7 @@ class TreeLayoutFinder:
         self._balanced_plan_cache = None
 
         sites = list(range(self.n))
-        self.event_weights = tuple(
+        base_event_weights = tuple(
             _gate_stream_event_weights(
                 self.payloads,
                 self.supports,
@@ -1302,11 +1398,18 @@ class TreeLayoutFinder:
                 weight_mode=self.weight_mode,
             )
         )
+        self.temporal_factors = _temporal_event_factors(
+            len(base_event_weights),
+            time_decay=self.time_decay,
+            time_window=self.time_window,
+        )
         self.event_weights = tuple(
             0.0 if str(event_type).lower() in {
                 "measure", "reset", "measure_reset", "cap"
-            } else weight
-            for weight, event_type in zip(self.event_weights, self.event_types)
+            } else weight * temporal_factor
+            for weight, temporal_factor, event_type in zip(
+                base_event_weights, self.temporal_factors, self.event_types
+            )
         )
         self.pair_weights = _gate_stream_pair_weights(
             supports, sites, self.event_weights
@@ -1374,6 +1477,8 @@ class TreeLayoutFinder:
         *,
         refine=_DEFAULT_SEARCH_OPTION,
         refine_budget=_DEFAULT_SEARCH_OPTION,
+        topology_refine=_DEFAULT_SEARCH_OPTION,
+        topology_budget=_DEFAULT_SEARCH_OPTION,
         search=_DEFAULT_SEARCH_OPTION,
         search_budget=_DEFAULT_SEARCH_OPTION,
         seed=_DEFAULT_SEARCH_OPTION,
@@ -1382,6 +1487,12 @@ class TreeLayoutFinder:
         """Resolve method overrides against finder-owned search defaults."""
         if refine is _DEFAULT_SEARCH_OPTION:
             refine = self.refine
+            if self.objective == "hypergraph" and refine is None:
+                # A direct hypergraph score is only useful as a layout search
+                # objective when the candidate is allowed to move. Keep the
+                # old objectives fast, but make the explicitly requested
+                # hypergraph mode perform its bounded local search by default.
+                refine = "greedy"
         else:
             refine = _normalize_layout_refinement(refine)
         if refine_budget is _DEFAULT_SEARCH_OPTION:
@@ -1392,6 +1503,21 @@ class TreeLayoutFinder:
             )
         if refine is not None and refine_budget is None:
             refine_budget = max(1, min(len(self.leaf_qubits) - 1, 64))
+
+        if topology_refine is _DEFAULT_SEARCH_OPTION:
+            topology_refine = self.topology_refine
+            if self.objective == "hypergraph" and topology_refine is None:
+                topology_refine = "nni"
+        else:
+            topology_refine = _normalize_topology_refinement(topology_refine)
+        if topology_budget is _DEFAULT_SEARCH_OPTION:
+            topology_budget = self.topology_budget
+        elif topology_budget is not None:
+            topology_budget = _validate_search_budget(
+                topology_budget, "topology_budget"
+            )
+        if topology_refine is not None and topology_budget is None:
+            topology_budget = max(1, min(max(1, len(self.leaf_qubits) - 2), 64))
 
         if search is _DEFAULT_SEARCH_OPTION:
             search = self.search
@@ -1417,6 +1543,8 @@ class TreeLayoutFinder:
         return {
             "refine": refine,
             "refine_budget": refine_budget,
+            "topology_refine": topology_refine,
+            "topology_budget": topology_budget,
             "search": search,
             "search_budget": search_budget,
             "seed": seed,
@@ -1463,6 +1591,52 @@ class TreeLayoutFinder:
             qubit_of_leaf,
             root=plan.root,
             root_qubit=plan.root_qubit,
+        )
+
+    def _plan_with_nni(self, plan, parent, child, variant):
+        """Return one binary nearest-neighbor interchange of ``parent-child``.
+
+        The rooted local pattern is ``parent -> (child, sibling)`` and
+        ``child -> (a, b)``. Each NNI variant keeps ``child`` below ``parent``
+        while moving either ``a`` or ``b`` across the internal edge. Node ids
+        and leaf labels are retained so this is a topology move, not a hidden
+        relabeling.
+        """
+        parent_children = tuple(plan.children[parent])
+        child_children = tuple(plan.children[child])
+        if (
+            len(parent_children) != 2
+            or len(child_children) != 2
+            or child not in parent_children
+        ):
+            raise ValueError("NNI requires a binary internal parent-child edge.")
+        sibling = next(node for node in parent_children if node != child)
+        if variant not in (0, 1):
+            raise ValueError("NNI variant must be 0 or 1.")
+        a, b = child_children
+        moved = b if variant == 0 else a
+        retained = a if variant == 0 else b
+        children = {
+            node: tuple(child_ids) for node, child_ids in plan.children.items()
+        }
+        children[parent] = (child, moved)
+        children[child] = (retained, sibling)
+        return TreePlan.from_children(
+            children,
+            plan.qubit_of_leaf,
+            root=plan.root,
+            root_qubit=plan.root_qubit,
+        )
+
+    @staticmethod
+    def _nni_edges(plan):
+        """Return deterministic binary internal edges eligible for NNI."""
+        return tuple(
+            (parent, child)
+            for parent, children in sorted(plan.children.items())
+            if len(children) == 2
+            for child in children
+            if len(plan.children.get(child, ())) == 2
         )
 
     def _path_score_and_max(self, plan):
@@ -1569,7 +1743,7 @@ class TreeLayoutFinder:
             return self._path_score_and_max(plan)
         if self.objective == "congestion":
             return self._congestion_key(plan)
-        if self.objective == "compression":
+        if self.objective in {"compression", "hypergraph"}:
             loads = self.edge_loads(plan)
             values = tuple(loads.values())
             tensor_cost = self._tensor_cost_key(plan)
@@ -1599,7 +1773,7 @@ class TreeLayoutFinder:
         key = self._objective_key(plan)
         if self.objective == "path":
             value = key[0]
-        elif self.objective in {"congestion", "compression"}:
+        elif self.objective in {"congestion", "compression", "hypergraph"}:
             value = key[0] + 1.0e-6 * key[1] + 1.0e-12 * key[2]
         else:
             value = key[0]
@@ -1685,6 +1859,71 @@ class TreeLayoutFinder:
             progress.close()
         return current, {
             "method": "greedy",
+            "evaluations": evaluations,
+            "accepted_moves": accepted_moves,
+            "initial_key": initial_key,
+            "final_key": current_key,
+        }
+
+    def _refine_plan_topology(self, plan, *, chi, budget, progbar=False):
+        """Greedily improve binary topology through bounded NNI moves."""
+        initial_key = self._selection_key(plan, chi)
+        if budget < 1 or not plan.is_binary():
+            return plan, {
+                "method": "nni",
+                "evaluations": 0,
+                "accepted_moves": 0,
+                "initial_key": initial_key,
+                "final_key": initial_key,
+            }
+
+        current = plan
+        current_key = initial_key
+        evaluations = 0
+        accepted_moves = 0
+        progress = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            progress = tqdm(
+                total=budget,
+                desc="tree layout topology",
+                leave=False,
+            )
+
+        while evaluations < budget:
+            best = current
+            best_key = current_key
+            for parent, child in self._nni_edges(current):
+                for variant in (0, 1):
+                    if evaluations >= budget:
+                        break
+                    evaluations += 1
+                    if progress is not None:
+                        progress.update()
+                    candidate = self._plan_with_nni(
+                        current, parent, child, variant
+                    )
+                    candidate_key = self._selection_key(candidate, chi)
+                    if candidate_key < best_key:
+                        if best is not current:
+                            self._discard_plan_cache(best)
+                        best = candidate
+                        best_key = candidate_key
+                    else:
+                        self._discard_plan_cache(candidate)
+                if evaluations >= budget:
+                    break
+            if best is current:
+                break
+            current = best
+            current_key = best_key
+            accepted_moves += 1
+
+        if progress is not None:
+            progress.close()
+        return current, {
+            "method": "nni",
             "evaluations": evaluations,
             "accepted_moves": accepted_moves,
             "initial_key": initial_key,
@@ -1803,9 +2042,17 @@ class TreeLayoutFinder:
         info = {
             "initial_order": initial_order,
             "initial_key": initial_key,
+            "topology_refinement": None,
             "refinement": None,
             "search": None,
         }
+        if settings["topology_refine"] == "nni":
+            plan, info["topology_refinement"] = self._refine_plan_topology(
+                plan,
+                chi=chi,
+                budget=settings["topology_budget"],
+                progbar=progbar,
+            )
         if settings["refine"] == "greedy":
             plan, info["refinement"] = self._refine_plan_greedy(
                 plan,
@@ -1912,7 +2159,14 @@ class TreeLayoutFinder:
         return info
 
     def _candidate_plans(self, max_arity):
-        """Build the candidate plans considered by the selected objective."""
+        """Build deterministic seed plans for the selected objective.
+
+        The ``hypergraph`` objective deliberately keeps several inexpensive
+        pairwise-derived seeds, but all final ranking and its default local
+        refinement use :meth:`edge_loads`, which scans each original
+        multi-site support across the candidate tree. The pairwise seeds are
+        therefore only an initialization strategy, not the objective itself.
+        """
         interaction_plan = self._build_plan(self._similarity_weights())
         if max_arity != self.max_arity:
             interaction_plan = self._build_plan(
@@ -2015,6 +2269,8 @@ class TreeLayoutFinder:
         chi=_DEFAULT_CHI,
         refine=_DEFAULT_SEARCH_OPTION,
         refine_budget=_DEFAULT_SEARCH_OPTION,
+        topology_refine=_DEFAULT_SEARCH_OPTION,
+        topology_budget=_DEFAULT_SEARCH_OPTION,
         search=_DEFAULT_SEARCH_OPTION,
         search_budget=_DEFAULT_SEARCH_OPTION,
         seed=_DEFAULT_SEARCH_OPTION,
@@ -2053,9 +2309,16 @@ class TreeLayoutFinder:
         refine : {None, "greedy"}, optional
             Override the finder refinement setting. `"greedy"` performs a
             bounded adjacent leaf-swap search on each candidate tree.
+        topology_refine : {None, "nni"}, optional
+            Override the optional binary-tree topology refinement. `"nni"`
+            performs bounded nearest-neighbor interchange proposals. It is a
+            no-op for the non-binary layered structure.
         refine_budget : int, optional
             Maximum greedy proposals per candidate. When omitted, an enabled
             greedy search uses at most ``min(n - 1, 64)`` proposals.
+        topology_budget : int, optional
+            Maximum NNI proposals per candidate. When omitted, an enabled NNI
+            search uses at most 64 proposals.
         search : {None, "nevergrad"}, optional
             Override the finder offline search setting. Nevergrad optimizes
             only the returned fixed plan; it never mutates a live TTN.
@@ -2079,6 +2342,8 @@ class TreeLayoutFinder:
         settings = self._resolve_search_settings(
             refine=refine,
             refine_budget=refine_budget,
+            topology_refine=topology_refine,
+            topology_budget=topology_budget,
             search=search,
             search_budget=search_budget,
             seed=seed,
@@ -2158,6 +2423,7 @@ class TreeLayoutFinder:
             "order": recommended["order"],
             "chi": chi,
             "refine": settings["refine"],
+            "topology_refine": settings["topology_refine"],
             "search": settings["search"],
             "plan": recommended["plan"],
             "candidates": candidates,
@@ -2170,6 +2436,8 @@ class TreeLayoutFinder:
         chi=_DEFAULT_CHI,
         refine=_DEFAULT_SEARCH_OPTION,
         refine_budget=_DEFAULT_SEARCH_OPTION,
+        topology_refine=_DEFAULT_SEARCH_OPTION,
+        topology_budget=_DEFAULT_SEARCH_OPTION,
         search=_DEFAULT_SEARCH_OPTION,
         search_budget=_DEFAULT_SEARCH_OPTION,
         seed=_DEFAULT_SEARCH_OPTION,
@@ -2188,6 +2456,10 @@ class TreeLayoutFinder:
         overridden for this call. Pass ``progbar=True`` to display greedy and
         Nevergrad search progress. Omitted values inherit the corresponding
         finder settings, so the original zero-argument behavior is unchanged.
+        The explicit ``objective="hypergraph"`` mode is the one exception:
+        when no refinement controls are supplied, it enables bounded greedy
+        and binary-NNI stages so the full support hyperedges directly
+        influence the returned layout.
 
         ``order="quality"`` is a convenience mode matching the MPS layout
         API: it enables bounded greedy refinement and opportunistic Nevergrad
@@ -2202,6 +2474,8 @@ class TreeLayoutFinder:
         if order == "quality":
             if refine is _DEFAULT_SEARCH_OPTION:
                 refine = "greedy"
+            if topology_refine is _DEFAULT_SEARCH_OPTION:
+                topology_refine = "nni"
             if search is _DEFAULT_SEARCH_OPTION:
                 search = "nevergrad" if _nevergrad_available() else None
         if chi is _DEFAULT_CHI:
@@ -2211,6 +2485,8 @@ class TreeLayoutFinder:
         settings = self._resolve_search_settings(
             refine=refine,
             refine_budget=refine_budget,
+            topology_refine=topology_refine,
+            topology_budget=topology_budget,
             search=search,
             search_budget=search_budget,
             seed=seed,
@@ -2233,7 +2509,11 @@ class TreeLayoutFinder:
             }
             return rec["plan"]
         candidates = self._candidate_plans(self.max_arity)
-        if settings["refine"] is not None or settings["search"] is not None:
+        if (
+            settings["topology_refine"] is not None
+            or settings["refine"] is not None
+            or settings["search"] is not None
+        ):
             candidates = {
                 name: self._improve_plan(
                     plan,
@@ -2255,7 +2535,14 @@ class TreeLayoutFinder:
         self._selected_candidate = selected
         return candidates[selected]
 
-    def candidate_plans(self, *, chi=_DEFAULT_CHI):
+    def candidate_plans(
+        self,
+        *,
+        chi=_DEFAULT_CHI,
+        include_quality=False,
+        quality_refine_budget=None,
+        quality_topology_budget=None,
+    ):
         """Return immutable candidate plans for optional pilot replay.
 
         The normal :meth:`run` path remains static and cheap. This method
@@ -2263,6 +2550,20 @@ class TreeLayoutFinder:
         that a state-aware pilot can compare without rebuilding the finder.
         Candidate names are stable strings such as
         ``"congestion:arity=2"``.
+
+        Parameters
+        ----------
+        chi : int, optional
+            Bond-dimension budget used in candidate ranking.
+        include_quality : bool, optional
+            Also add one ``"quality:arity=..."`` candidate per arity. These
+            candidates start from the static objective candidates and apply
+            bounded greedy leaf and binary NNI topology refinement. This is
+            deliberately opt-in because it is more expensive than the static
+            candidate list.
+        quality_refine_budget, quality_topology_budget : int, optional
+            Bounds for the quality candidate's leaf-swap and NNI proposals.
+            Each defaults to the normal bounded quality-mode budget.
         """
         if chi is _DEFAULT_CHI:
             chi = self.chi
@@ -2274,6 +2575,15 @@ class TreeLayoutFinder:
             else (self.max_arity,)
         )
         result = {}
+        quality_settings = None
+        if include_quality:
+            quality_settings = self._resolve_search_settings(
+                refine="greedy",
+                refine_budget=quality_refine_budget,
+                topology_refine="nni",
+                topology_budget=quality_topology_budget,
+                search=None,
+            )
         for arity in arities:
             plans = self._candidate_plans(arity)
             for name, plan in plans.items():
@@ -2285,6 +2595,33 @@ class TreeLayoutFinder:
                     "tensor_cost": self._tensor_cost_key(plan),
                     "edge_loads": self.edge_loads(plan),
                 }
+            if quality_settings is not None:
+                refined_candidates = []
+                for name, plan in plans.items():
+                    refined, planning = self._improve_plan(
+                        plan,
+                        chi=chi,
+                        settings=quality_settings,
+                    )
+                    refined_candidates.append((
+                        self._selection_key(refined, chi),
+                        name,
+                        refined,
+                        planning,
+                    ))
+                _key, source_name, quality_plan, planning = min(
+                    refined_candidates,
+                    key=lambda item: (item[0], item[1]),
+                )
+                result[f"quality:arity={arity}"] = {
+                    "plan": quality_plan,
+                    "objective_key": self._selection_key(quality_plan, chi),
+                    "path_score": self.score(quality_plan),
+                    "tensor_cost": self._tensor_cost_key(quality_plan),
+                    "edge_loads": self.edge_loads(quality_plan),
+                    "selected_from": source_name,
+                    "planning": planning,
+                }
         return result
 
     def recommend_arities(
@@ -2294,6 +2631,8 @@ class TreeLayoutFinder:
         chi=_DEFAULT_CHI,
         refine=_DEFAULT_SEARCH_OPTION,
         refine_budget=_DEFAULT_SEARCH_OPTION,
+        topology_refine=_DEFAULT_SEARCH_OPTION,
+        topology_budget=_DEFAULT_SEARCH_OPTION,
         search=_DEFAULT_SEARCH_OPTION,
         search_budget=_DEFAULT_SEARCH_OPTION,
         seed=_DEFAULT_SEARCH_OPTION,
@@ -2321,7 +2660,8 @@ class TreeLayoutFinder:
             ``max_bond_cut``, ``chi_overflow``, and ``exact_at_chi``.
             When omitted, uses the ``chi`` supplied to the finder; pass
             ``chi=None`` explicitly for a chi-blind comparison.
-        refine, refine_budget, search, search_budget, seed, nevergrad_optimizer
+        refine, refine_budget, topology_refine, topology_budget, search,
+        search_budget, seed, nevergrad_optimizer
             Optional fixed-plan search controls with the same meaning as in
             :meth:`recommend_layered`. They are applied to each arity candidate
             before selecting one final immutable plan.
@@ -2335,6 +2675,8 @@ class TreeLayoutFinder:
         settings = self._resolve_search_settings(
             refine=refine,
             refine_budget=refine_budget,
+            topology_refine=topology_refine,
+            topology_budget=topology_budget,
             search=search,
             search_budget=search_budget,
             seed=seed,
@@ -2417,6 +2759,7 @@ class TreeLayoutFinder:
             "recommended_max_arity": recommended["max_arity"],
             "chi": chi,
             "refine": settings["refine"],
+            "topology_refine": settings["topology_refine"],
             "search": settings["search"],
             "plan": recommended["plan"],
             "candidates": candidates,
@@ -2432,8 +2775,11 @@ class TreeLayoutFinder:
         if cached is not None:
             return cached
         event_weights = []
-        for payload, support, event_type in zip(
-            self.payloads, self.supports, self.event_types
+        for payload, support, event_type, temporal_factor in zip(
+            self.payloads,
+            self.supports,
+            self.event_types,
+            self.temporal_factors,
         ):
             if len(support) < 2 or str(event_type).lower() in {
                 "measure", "reset", "measure_reset", "cap"
@@ -2441,7 +2787,7 @@ class TreeLayoutFinder:
                 event_weights.append(0.0)
                 continue
             if payload is None:
-                event_weights.append(1.0)
+                event_weights.append(float(temporal_factor))
                 continue
             support = tuple(dict.fromkeys(support))
             logs = []
@@ -2457,7 +2803,7 @@ class TreeLayoutFinder:
                 for site in support:
                     rank = self._schmidt_rank(payload, support, (site,))
                     logs.append(float(np.log2(rank)))
-            event_weights.append(max(logs, default=1.0))
+            event_weights.append(float(temporal_factor) * max(logs, default=1.0))
         self._congestion_weights_cache = _gate_stream_pair_weights(
             self.supports,
             range(self.n),
@@ -2493,13 +2839,20 @@ class TreeLayoutFinder:
             "bounded_events": 0,
             "reasons": {},
         }
-        for payload, support, event_type in zip(
-            self.payloads, self.supports, self.event_types
+        for payload, support, event_type, temporal_factor in zip(
+            self.payloads,
+            self.supports,
+            self.event_types,
+            self.temporal_factors,
         ):
             support = tuple(dict.fromkeys(support))
-            if len(support) < 2 or str(event_type).lower() in {
-                "measure", "reset", "measure_reset", "cap"
-            }:
+            if (
+                temporal_factor <= 0.0
+                or len(support) < 2
+                or str(event_type).lower() in {
+                    "measure", "reset", "measure_reset", "cap"
+                }
+            ):
                 continue
             support_mask = 0
             for site in support:
@@ -2540,7 +2893,9 @@ class TreeLayoutFinder:
                 )
                 info = self._schmidt_rank_info(payload, support, left)
                 rank = int(info["rank"])
-                loads[edge] += float(np.log2(max(1, rank)))
+                loads[edge] += float(temporal_factor) * float(
+                    np.log2(max(1, rank))
+                )
                 if info["exact"]:
                     rank_diagnostics["exact_events"] += 1
                 else:
@@ -2682,6 +3037,9 @@ class TreeLayoutFinder:
             "n_interacting_pairs": n_pairs,
             "objective": self.objective,
             "weight_mode": self.weight_mode,
+            "time_decay": self.time_decay,
+            "time_window": self.time_window,
+            "active_events": int(sum(factor > 0.0 for factor in self.temporal_factors)),
             "hybrid_weights": (
                 self.hybrid_weights if self.objective == "hybrid" else None
             ),
@@ -2691,6 +3049,13 @@ class TreeLayoutFinder:
             "compression_score": (
                 float(objective_key[0] + objective_key[1])
                 if self.objective == "compression" else None
+            ),
+            "hypergraph_score": (
+                {
+                    "max_edge_load": float(max_load),
+                    "total_edge_load": float(total_load),
+                }
+                if self.objective == "hypergraph" and loads is not None else None
             ),
             "root": plan.root,
             "root_qubit": plan.root_qubit,

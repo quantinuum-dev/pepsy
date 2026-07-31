@@ -398,11 +398,35 @@ it combines normalized path score, maximum edge load, and total edge load with
 `weight_mode` / `layout_weight_mode` option accepts `count`, `auto`, `angle`, or
 `operator_schmidt` for interaction-graph weighting.
 
+For a genuinely multi-site layout objective, use
+`objective="hypergraph"` (or `layout_objective="hypergraph"`). Each original
+gate support is kept as one hyperedge, and the finder scores its actual
+operator-Schmidt load on every crossed tree edge rather than selecting from a
+pairwise proxy alone. This mode starts from inexpensive pairwise-derived seed
+trees, then automatically performs bounded direct greedy leaf swaps and binary
+NNI topology moves using the full hyperedge score. Pass
+`refine=None, topology_refine=None` to inspect the unrefined direct score, or
+set explicit budgets for a larger search. Dense operators wider than
+`max_operator_qubits` still use the documented conservative rank bound.
+
 Use `order="quality"` with `finder.run()` (or set it on the finder) for the
 MPS-style higher-quality offline search. It enables bounded greedy leaf
-refinement and opportunistic Nevergrad refinement when Nevergrad is installed;
-otherwise it falls back to greedy refinement. The zero-argument `run()` path
-remains the fast deterministic candidate selection.
+refinement, bounded binary-tree nearest-neighbor-interchange (NNI) topology
+refinement, and opportunistic Nevergrad refinement when Nevergrad is installed;
+otherwise it uses the deterministic NNI and leaf stages. NNI changes the
+internal grouping itself, so quality mode can improve a tree even when the
+best leaf labels are already fixed. The zero-argument `run()` path remains the
+fast deterministic candidate selection. Disable the topology stage explicitly
+with `topology_refine=None`, or bound it with `topology_budget=`.
+
+For a stream whose locality changes over time, pass `time_decay=` and/or
+`time_window=` to `TreeLayoutFinder`. A decay in `(0, 1]` weights an event by
+`time_decay ** age` (the newest event has age zero), while a window keeps only
+the final events. The same factors are used for interaction paths, congestion
+candidate construction, and per-edge operator-Schmidt load estimates, so the
+diagnostics and selected plan use one consistent time model. The defaults are
+unchanged. `TreeOptimizer` exposes these as `layout_time_decay=` and
+`layout_time_window=`.
 
 For compression-first selection, use `objective="compression"` (or
 `layout_objective="compression"`). It prioritizes peak and total predicted
@@ -532,8 +556,10 @@ choice = finder.recommend_layered(
 tree_plan = choice["plan"]
 ```
 
-`refine="greedy"` is deterministic and bounded; it is opt-in so existing
-fast/default layout construction remains unchanged. A balanced TTN turns a
+`refine="greedy"` is deterministic and bounded; it is opt-in for the existing
+fast/default objectives. The explicit `objective="hypergraph"` mode enables
+greedy and NNI refinement by default because otherwise its full-support score
+would only rank a few pairwise-derived seed trees. A balanced TTN turns a
 well-aligned physical span `r` into a path with `O(log r)` tree hops, so the
 hybrid score uses path length as a replay-cost proxy while edge loads estimate
 the accuracy/bond-dimension cost.
@@ -560,6 +586,8 @@ layout API:
 ```python
 tree_plan = finder.run(
     order="quality",
+    topology_refine="nni",
+    topology_budget=64,
     refine="greedy",
     refine_budget=64,
     search="nevergrad",
@@ -609,9 +637,13 @@ opt = py.TreeOptimizer(gate_stream, tree=choice["plan"], chi=chi)
 
 The pilot replays candidates on independent copies with the real tree update
 kernels and returns measured infidelity, final bond, truncation count, and
-runtime under `choice["pilot"]`. The original optimizer is unchanged unless
-`install=True` is passed. Installation is restricted to product initial states;
-an entangled TTN cannot generally be relaid out exactly.
+runtime under `choice["pilot"]`. By default one bounded `order="quality"`
+candidate (greedy leaf refinement plus binary NNI topology refinement) is
+reserved a pilot slot, so it cannot be rejected before state-aware replay. Use
+`include_quality=False` for the static-only candidate set. The original
+optimizer is unchanged unless `install=True` is passed. Installation is
+restricted to product initial states; an entangled TTN cannot generally be
+relaid out exactly.
 
 Both helpers are also available from the package-level API:
 
