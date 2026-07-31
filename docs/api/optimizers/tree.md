@@ -421,6 +421,15 @@ NNI topology moves using the full hyperedge score. Pass
 set explicit budgets for a larger search. Dense operators wider than
 `max_operator_qubits` still use the documented conservative rank bound.
 
+For a whole-tree optimization, use `objective="full_tree"` (also accepted as
+`"tree"` or `"cotengra"`). This evaluates dynamic operator-Schmidt demand,
+working tensor width, estimated work/write volume, and route length across
+every hierarchical scale, not only the root cut. It enables bounded subtree
+reconfiguration and simulated annealing by default; override these with
+`topology_refine="subtree"`, `topology_budget=`, `search="anneal"`, and
+`search_budget=`. The result is still a cheap layout proxy rather than a real
+TTN replay, so the state-aware pilot remains the final accuracy check.
+
 Use `order="quality"` with `finder.run()` (or set it on the finder) for the
 MPS-style higher-quality offline search. It enables bounded greedy leaf
 refinement, bounded binary-tree nearest-neighbor-interchange (NNI) topology
@@ -581,6 +590,8 @@ the accuracy/bond-dimension cost.
 For offline quality searches, add `search="nevergrad"`. Nevergrad starts from
 the spectral/greedy plan, proposes leaf orders, and keeps its result only when
 it improves the same chi-aware objective. It never acts on a live optimizer.
+For `objective="full_tree"`, use `search="anneal"` to explore subtree
+replacements at multiple scales without the optional Nevergrad dependency.
 Install the optional dependency with `pip install pepsy[layout]`:
 
 ```python

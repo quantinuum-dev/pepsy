@@ -1084,6 +1084,71 @@ def test_tree_candidate_plans_include_quality_for_state_aware_pilots():
     )
 
 
+def test_full_tree_profile_reports_dynamic_cost_at_all_scales():
+    """Whole-tree mode exposes width, work, demand, and scale diagnostics."""
+    gates = [
+        (pepsy.cnot(), (0, 1)),
+        (pepsy.cnot(), (1, 2)),
+        (pepsy.cnot(), (3, 4)),
+        (pepsy.cnot(), (2, 4)),
+    ]
+    finder = TreeLayoutFinder(
+        gates, n=5, max_arity=2, objective="full_tree", chi=4,
+    )
+    plan = TreePlan.from_order(range(5), structure="balanced", max_arity=2)
+    profile = finder.full_tree_profile(plan)
+
+    assert profile["event_count"] == len(gates)
+    assert profile["peak_tensor_log2"] >= 1.0
+    assert profile["peak_work_log2"] >= profile["peak_tensor_log2"]
+    assert profile["total_route_length"] > 0
+    assert profile["scales"]
+    assert all(
+        {
+            "node_count",
+            "edge_count",
+            "peak_tensor_log2",
+            "peak_edge_demand_log2",
+        } <= set(scale_info)
+        for scale_info in profile["scales"].values()
+    )
+
+    report = finder.report(plan)
+    assert report["objective"] == "full_tree"
+    assert report["full_tree"] == profile
+    assert len(report["objective_key"]) == 8
+
+
+def test_full_tree_anneals_subtrees_without_changing_binary_contract():
+    """All-scale subtree search preserves the requested binary tree shape."""
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1)),
+         (pepsy.cnot(), (2, 5)), (pepsy.cnot(), (4, 5))],
+        n=6,
+        max_arity=2,
+        top_arity=3,
+        objective="full_tree",
+        chi=4,
+        seed=7,
+    )
+    recommendation = finder.recommend_arities(
+        (2,),
+        topology_budget=3,
+        search_budget=4,
+        refine=None,
+    )
+    candidate = recommendation["candidates"][0]
+    planning = candidate["planning"]
+    plan = recommendation["plan"]
+
+    assert plan.top_arity == 3
+    assert plan.is_binary()
+    assert planning["topology_refinement"]["method"] == "subtree"
+    assert planning["search"]["method"] == "subtree"
+    assert planning["search"]["search"] == "anneal"
+    assert candidate["full_tree_profile"]["scales"]
+
+
 def test_tree_edge_loads_match_full_edge_reference():
     """Steiner-only edge scanning preserves the full congestion calculation."""
     rng = np.random.default_rng(109)

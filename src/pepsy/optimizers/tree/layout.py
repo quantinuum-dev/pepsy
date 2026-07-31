@@ -146,10 +146,13 @@ def _normalize_topology_refinement(refine):
         "joint": "nni",
         "joint_greedy": "nni",
         "greedy_topology": "nni",
+        "reconfigure": "subtree",
+        "subtree_reconfigure": "subtree",
+        "all_scales": "subtree",
     }
     name = aliases.get(name, name)
-    if name != "nni":
-        raise ValueError("topology_refine must be None or 'nni'.")
+    if name not in {"nni", "subtree"}:
+        raise ValueError("topology_refine must be None, 'nni', or 'subtree'.")
     return name
 
 
@@ -158,10 +161,16 @@ def _normalize_layout_search(search):
     if search is None or search is False:
         return None
     name = str(search).replace("-", "_").strip().lower()
-    aliases = {"ng": "nevergrad", "never_grad": "nevergrad"}
+    aliases = {
+        "ng": "nevergrad",
+        "never_grad": "nevergrad",
+        "simulated_annealing": "anneal",
+        "subtree_anneal": "anneal",
+        "annealing": "anneal",
+    }
     name = aliases.get(name, name)
-    if name != "nevergrad":
-        raise ValueError("search must be None or 'nevergrad'.")
+    if name not in {"nevergrad", "anneal"}:
+        raise ValueError("search must be None, 'nevergrad', or 'anneal'.")
     return name
 
 
@@ -270,15 +279,20 @@ def _normalize_layout_objective(objective):
         "hypergraph_load": "hypergraph",
         "per_edge": "hypergraph",
         "per_edge_load": "hypergraph",
+        "full": "full_tree",
+        "tree": "full_tree",
+        "cotengra": "full_tree",
+        "all_scales": "full_tree",
     }
     name = aliases.get(name, name)
     if name not in {
-        "path", "congestion", "hybrid", "compression", "hypergraph"
+        "path", "congestion", "hybrid", "compression", "hypergraph",
+        "full_tree",
     }:
         raise ValueError(
             f"Unknown tree layout objective {objective!r}. "
             "Expected 'path', 'congestion', 'compression', 'hypergraph', "
-            "or 'hybrid'."
+            "'full_tree', or 'hybrid'."
         )
     return name
 
@@ -1288,7 +1302,7 @@ class TreeLayoutFinder:
         (see :meth:`TreePlan.from_order`).
     dense_max : int
         Maximum subsystem size for dense spectral reordering.
-    objective : {"path", "congestion", "compression", "hypergraph", "hybrid"}
+    objective : {"path", "congestion", "compression", "hypergraph", "full_tree", "hybrid"}
         Layout objective. `"path"` preserves the co-occurrence/path-length
         heuristic; `"congestion"` selects among layout candidates using the
         predicted operator-Schmidt load on tree edges. `"hybrid"` combines
@@ -1298,6 +1312,10 @@ class TreeLayoutFinder:
         objective. `"hypergraph"` is the direct multi-site mode: it ranks
         plans from the full support hyperedges and per-edge Schmidt loads,
         then applies bounded leaf and binary-topology refinement by default.
+        `"full_tree"` evaluates dynamic bond pressure, tensor width, estimated
+        work, write volume, and route length across every tree scale. It is
+        the high-quality, Cotengra-inspired mode and is opt-in because its
+        bounded subtree search is more expensive.
     order : {None, "quality"}, optional
         Optional high-quality offline mode. `"quality"` enables bounded
         greedy refinement and opportunistic Nevergrad refinement; omitted
@@ -1309,22 +1327,27 @@ class TreeLayoutFinder:
         Optional fixed-plan local search used by :meth:`run` and recommendation
         methods. `"greedy"` tries adjacent leaf-label swaps before simulation;
         it never changes a live :class:`TreeOptimizer` tree.
-    topology_refine : {None, "nni"}
-        Optional joint topology refinement for binary candidates. `"nni"`
-        tries bounded nearest-neighbor interchange moves on internal edges,
-        retaining only objective-improving trees. It never changes a live
+    topology_refine : {None, "nni", "subtree"}
+        Optional joint topology refinement. `"nni"` tries bounded
+        nearest-neighbor interchange moves on binary internal edges;
+        `"subtree"` reconfigures descendant subtrees at all scales. Both
+        retain only accepted candidates and never change a live
         :class:`TreeOptimizer` tree.
     refine_budget : int, optional
         Maximum greedy swap proposals per candidate plan. Defaults to at most
         64 proposals when refinement is enabled.
     topology_budget : int, optional
-        Maximum NNI proposals per candidate plan. Defaults to at most 64
-        proposals when topology refinement is enabled.
-    search : {None, "nevergrad"}
+        Maximum topology proposals per candidate plan. Defaults to at most 64
+        proposals when topology refinement is enabled. For ``"subtree"``,
+        proposals are sampled across the available descendant scales.
+    search : {None, "nevergrad", "anneal"}
         Optional offline derivative-free refinement. It is never run unless
-        requested and requires the optional ``nevergrad`` package.
+        requested. `"nevergrad"` refines leaf order and requires the optional
+        package; `"anneal"` performs bounded simulated annealing over subtree
+        reconfigurations and has no additional dependency.
     search_budget : int
-        Number of Nevergrad objective evaluations per candidate plan.
+        Number of offline search evaluations per candidate plan. For
+        ``search="anneal"``, this is the number of subtree proposals.
     seed : int
         Reproducible seed used by the optional Nevergrad stage.
     nevergrad_optimizer : str
@@ -1491,6 +1514,7 @@ class TreeLayoutFinder:
         self._plan_cache = {}
         self._edge_load_cache = {}
         self._rank_diagnostics_cache = {}
+        self._full_tree_profile_cache = {}
         self._schmidt_rank_cache = {}
         self._similarity_cache = {}
         self._congestion_weights_cache = None
@@ -1615,6 +1639,8 @@ class TreeLayoutFinder:
             topology_refine = self.topology_refine
             if self.objective == "hypergraph" and topology_refine is None:
                 topology_refine = "nni"
+            elif self.objective == "full_tree" and topology_refine is None:
+                topology_refine = "subtree"
         else:
             topology_refine = _normalize_topology_refinement(topology_refine)
         if topology_budget is _DEFAULT_SEARCH_OPTION:
@@ -1628,6 +1654,8 @@ class TreeLayoutFinder:
 
         if search is _DEFAULT_SEARCH_OPTION:
             search = self.search
+            if self.objective == "full_tree" and search is None:
+                search = "anneal"
         else:
             search = _normalize_layout_search(search)
         if search_budget is _DEFAULT_SEARCH_OPTION:
@@ -1746,6 +1774,104 @@ class TreeLayoutFinder:
             if len(plan.children.get(child, ())) == 2
         )
 
+    @staticmethod
+    def _subtree_nodes(plan, root):
+        """Return all node ids in the rooted subtree at ``root``."""
+        nodes = set()
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node in nodes:
+                continue
+            nodes.add(node)
+            stack.extend(plan.children[node])
+        return nodes
+
+    def _plan_with_subtree_reconfiguration(self, plan, subtree_root, rng):
+        """Rebuild one descendant subtree while preserving its attachment."""
+        old_nodes = self._subtree_nodes(plan, subtree_root)
+        subtree_qubits = sorted(
+            plan.qubit_of_leaf[node]
+            for node in old_nodes
+            if node in plan.qubit_of_leaf
+        )
+        if len(subtree_qubits) < 4:
+            return None
+
+        global_weights = self._similarity_weights(
+            self._congestion_pair_weights()
+            if self.objective == "full_tree" else None
+        )
+        local_index = {q: i for i, q in enumerate(subtree_qubits)}
+        local_weights = {
+            (local_index[qa], local_index[qb]): weight
+            for (qa, qb), weight in global_weights.items()
+            if qa in local_index and qb in local_index
+        }
+        local_order = list(range(len(subtree_qubits)))
+        rng.shuffle(local_order)
+        local_structure = (
+            "adaptive" if self.structure == "adaptive" else "balanced"
+        )
+        local_root_qubit = (
+            len(subtree_qubits)
+            if subtree_root == plan.root and plan.root_qubit is not None
+            else None
+        )
+        lower_arities = [
+            len(children)
+            for node, children in plan.children.items()
+            if node != plan.root and children
+        ]
+        local_max_arity = max(lower_arities, default=2)
+        local_top_arity = (
+            plan.top_arity if subtree_root == plan.root else None
+        )
+        local_plan = TreePlan.from_order(
+            local_order,
+            weights=local_weights,
+            structure=local_structure,
+            max_arity=local_max_arity,
+            community_frac=self.community_frac,
+            star_frac=self.star_frac,
+            dense_max=self.dense_max,
+            root_qubit=local_root_qubit,
+            top_arity=local_top_arity,
+        )
+
+        next_node = max(plan.children, default=-1) + 1
+        local_to_global = {local_plan.root: subtree_root}
+        for local_node in local_plan.children:
+            if local_node != local_plan.root:
+                local_to_global[local_node] = next_node
+                next_node += 1
+
+        children = {
+            node: tuple(child_ids)
+            for node, child_ids in plan.children.items()
+            if node not in old_nodes
+        }
+        qubit_of_leaf = {
+            node: qubit
+            for node, qubit in plan.qubit_of_leaf.items()
+            if node not in old_nodes
+        }
+        for local_node, local_children in local_plan.children.items():
+            global_node = local_to_global[local_node]
+            children[global_node] = tuple(
+                local_to_global[child] for child in local_children
+            )
+        for local_node, local_qubit in local_plan.qubit_of_leaf.items():
+            qubit_of_leaf[local_to_global[local_node]] = (
+                subtree_qubits[local_qubit]
+            )
+        return TreePlan.from_children(
+            children,
+            qubit_of_leaf,
+            root=plan.root,
+            root_qubit=plan.root_qubit,
+        )
+
     def _path_score_and_max(self, plan):
         """Return the weighted interaction path sum and longest active path."""
         score = 0.0
@@ -1850,6 +1976,18 @@ class TreeLayoutFinder:
             return self._path_score_and_max(plan)
         if self.objective == "congestion":
             return self._congestion_key(plan)
+        if self.objective == "full_tree":
+            profile = self.full_tree_profile(plan)
+            return (
+                profile["peak_tensor_log2"],
+                profile["peak_work_log2"],
+                profile["log_total_write"],
+                profile["log_total_work"],
+                profile["peak_edge_demand_log2"],
+                profile["total_edge_demand_log2"],
+                profile["total_route_length"],
+                self.score(plan),
+            )
         if self.objective in {"compression", "hypergraph"}:
             loads = self.edge_loads(plan)
             values = tuple(loads.values())
@@ -1880,6 +2018,16 @@ class TreeLayoutFinder:
         key = self._objective_key(plan)
         if self.objective == "path":
             value = key[0]
+        elif self.objective == "full_tree":
+            value = (
+                key[0]
+                + 0.50 * key[1]
+                + 0.10 * key[2]
+                + 0.10 * key[3]
+                + 0.01 * key[4]
+                + 0.001 * key[5]
+                + 1.0e-6 * key[6]
+            )
         elif self.objective in {"congestion", "compression", "hypergraph"}:
             value = key[0] + 1.0e-6 * key[1] + 1.0e-12 * key[2]
         else:
@@ -1896,6 +2044,9 @@ class TreeLayoutFinder:
         cached = self._rank_diagnostics_cache.get(id(plan))
         if cached is not None and cached[0] is plan:
             del self._rank_diagnostics_cache[id(plan)]
+        cached = self._full_tree_profile_cache.get(id(plan))
+        if cached is not None and cached[0] is plan:
+            del self._full_tree_profile_cache[id(plan)]
 
     def _refine_plan_greedy(self, plan, *, chi, budget, progbar=False):
         """Greedily improve a fixed topology through adjacent leaf swaps."""
@@ -2037,6 +2188,198 @@ class TreeLayoutFinder:
             "final_key": current_key,
         }
 
+    def _refine_plan_subtree(
+        self, plan, *, chi, budget, seed, progbar=False
+    ):
+        """Greedily accept subtree replacements across all tree scales."""
+        initial_key = self._selection_key(plan, chi)
+        if budget < 1:
+            return plan, {
+                "method": "subtree",
+                "search": "greedy",
+                "evaluations": 0,
+                "accepted_moves": 0,
+                "initial_key": initial_key,
+                "final_key": initial_key,
+                "scales_visited": (),
+            }
+        rng = np.random.default_rng(seed)
+        current = plan
+        current_key = initial_key
+        evaluations = 0
+        accepted_moves = 0
+        visited_scales = set()
+        progress = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            progress = tqdm(
+                total=budget,
+                desc="tree layout subtree",
+                leave=False,
+            )
+        while evaluations < budget:
+            current_candidates = []
+            for node, children in current.children.items():
+                if not children:
+                    continue
+                subtree_size = sum(
+                    1
+                    for descendant in self._subtree_nodes(current, node)
+                    if descendant in current.qubit_of_leaf
+                )
+                if subtree_size >= 4:
+                    current_candidates.append((node, subtree_size))
+            if not current_candidates:
+                break
+            evaluations += 1
+            if progress is not None:
+                progress.update()
+            nodes = np.asarray(
+                [node for node, _size in current_candidates], dtype=int
+            )
+            weights = np.asarray(
+                [np.log2(size) for _node, size in current_candidates]
+            )
+            weights /= weights.sum()
+            node = int(rng.choice(nodes, p=weights))
+            visited_scales.add(_tree_node_scales(current)[node])
+            candidate = self._plan_with_subtree_reconfiguration(
+                current, node, rng
+            )
+            if candidate is None:
+                continue
+            candidate_key = self._selection_key(candidate, chi)
+            if candidate_key < current_key:
+                self._discard_plan_cache(current)
+                current = candidate
+                current_key = candidate_key
+                accepted_moves += 1
+            else:
+                self._discard_plan_cache(candidate)
+        if progress is not None:
+            progress.close()
+        return current, {
+            "method": "subtree",
+            "search": "greedy",
+            "evaluations": evaluations,
+            "accepted_moves": accepted_moves,
+            "initial_key": initial_key,
+            "final_key": current_key,
+            "scales_visited": tuple(sorted(visited_scales)),
+        }
+
+    def _anneal_plan_subtree(
+        self, plan, *, chi, budget, seed, progbar=False
+    ):
+        """Anneal subtree replacements across all available tree scales."""
+        initial_key = self._selection_key(plan, chi)
+        candidates = []
+        for node, children in plan.children.items():
+            if not children:
+                continue
+            subtree_size = sum(
+                1
+                for descendant in self._subtree_nodes(plan, node)
+                if descendant in plan.qubit_of_leaf
+            )
+            if subtree_size >= 4:
+                candidates.append((node, subtree_size))
+        if budget < 1 or not candidates:
+            return plan, {
+                "method": "subtree",
+                "search": "anneal",
+                "evaluations": 0,
+                "accepted_moves": 0,
+                "initial_key": initial_key,
+                "final_key": initial_key,
+                "scales_visited": (),
+            }
+
+        rng = np.random.default_rng(seed)
+        current = plan
+        current_key = initial_key
+        current_loss = self._selection_loss(current, chi)
+        best = current
+        best_key = current_key
+        evaluations = 0
+        accepted_moves = 0
+        visited_scales = set()
+        initial_temperature = max(1.0, abs(current_loss) * 0.05)
+        progress = None
+        if progbar:
+            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+
+            progress = tqdm(
+                total=budget,
+                desc="tree layout subtree anneal",
+                leave=False,
+            )
+
+        while evaluations < budget:
+            evaluations += 1
+            if progress is not None:
+                progress.update()
+            current_candidates = []
+            for current_node, current_children in current.children.items():
+                if not current_children:
+                    continue
+                current_size = sum(
+                    1
+                    for descendant in self._subtree_nodes(current, current_node)
+                    if descendant in current.qubit_of_leaf
+                )
+                if current_size >= 4:
+                    current_candidates.append((current_node, current_size))
+            if not current_candidates:
+                break
+            nodes = np.asarray(
+                [node for node, _size in current_candidates], dtype=int
+            )
+            weights = np.asarray(
+                [np.log2(size) for _node, size in current_candidates]
+            )
+            weights /= weights.sum()
+            node = int(rng.choice(nodes, p=weights))
+            visited_scales.add(_tree_node_scales(current)[node])
+            candidate = self._plan_with_subtree_reconfiguration(
+                current, node, rng
+            )
+            if candidate is None:
+                continue
+            candidate_loss = self._selection_loss(candidate, chi)
+            delta = candidate_loss - current_loss
+            fraction = evaluations / max(1, budget)
+            temperature = initial_temperature * max(1.0e-3, 1.0 - fraction)
+            accept = delta <= 0.0 or rng.random() < np.exp(
+                -min(700.0, delta / temperature)
+            )
+            if accept:
+                current = candidate
+                current_loss = candidate_loss
+                current_key = self._selection_key(current, chi)
+                accepted_moves += 1
+                if current_key < best_key:
+                    self._discard_plan_cache(best)
+                    best = current
+                    best_key = current_key
+            else:
+                self._discard_plan_cache(candidate)
+
+        if progress is not None:
+            progress.close()
+        if best is not current:
+            self._discard_plan_cache(current)
+        return best, {
+            "method": "subtree",
+            "search": "anneal",
+            "evaluations": evaluations,
+            "accepted_moves": accepted_moves,
+            "initial_key": initial_key,
+            "final_key": best_key,
+            "scales_visited": tuple(sorted(visited_scales)),
+        }
+
     def _refine_plan_nevergrad(
         self, plan, *, chi, budget, seed, optimizer_name, progbar=False
     ):
@@ -2160,6 +2503,14 @@ class TreeLayoutFinder:
                 budget=settings["topology_budget"],
                 progbar=progbar,
             )
+        elif settings["topology_refine"] == "subtree":
+            plan, info["topology_refinement"] = self._refine_plan_subtree(
+                plan,
+                chi=chi,
+                budget=settings["topology_budget"],
+                seed=settings["seed"],
+                progbar=progbar,
+            )
         if settings["refine"] == "greedy":
             plan, info["refinement"] = self._refine_plan_greedy(
                 plan,
@@ -2167,7 +2518,15 @@ class TreeLayoutFinder:
                 budget=settings["refine_budget"],
                 progbar=progbar,
             )
-        if settings["search"] == "nevergrad":
+        if settings["search"] == "anneal":
+            plan, info["search"] = self._anneal_plan_subtree(
+                plan,
+                chi=chi,
+                budget=settings["search_budget"],
+                seed=settings["seed"] + 1,
+                progbar=progbar,
+            )
+        elif settings["search"] == "nevergrad":
             plan, info["search"] = self._refine_plan_nevergrad(
                 plan,
                 chi=chi,
@@ -2417,23 +2776,25 @@ class TreeLayoutFinder:
         refine : {None, "greedy"}, optional
             Override the finder refinement setting. `"greedy"` performs a
             bounded adjacent leaf-swap search on each candidate tree.
-        topology_refine : {None, "nni"}, optional
-            Override the optional binary-tree topology refinement. `"nni"`
-            performs bounded nearest-neighbor interchange proposals. It is a
-            no-op for the non-binary layered structure.
+        topology_refine : {None, "nni", "subtree"}, optional
+            Override the optional topology refinement. ``"nni"`` performs
+            bounded nearest-neighbor interchange proposals and is a no-op for
+            the non-binary layered structure; ``"subtree"`` rebuilds selected
+            descendant subtrees and is useful for all-scale objectives.
         refine_budget : int, optional
             Maximum greedy proposals per candidate. When omitted, an enabled
             greedy search uses at most ``min(n - 1, 64)`` proposals.
         topology_budget : int, optional
-            Maximum NNI proposals per candidate. When omitted, an enabled NNI
+            Maximum topology proposals per candidate. When omitted, an enabled
             search uses at most 64 proposals.
-        search : {None, "nevergrad"}, optional
+        search : {None, "nevergrad", "anneal"}, optional
             Override the finder offline search setting. Nevergrad optimizes
-            only the returned fixed plan; it never mutates a live TTN.
+            only the returned fixed plan; annealing explores subtree
+            replacements. Neither mutates a live TTN.
         search_budget, seed, nevergrad_optimizer
-            Optional Nevergrad configuration for each candidate plan.
+            Optional offline-search configuration for each candidate plan.
         progbar : bool, optional
-            Display greedy and Nevergrad search progress for each candidate.
+            Display local-search progress for each candidate.
 
         Returns
         -------
@@ -2472,6 +2833,18 @@ class TreeLayoutFinder:
         else:
             order = [int(q) for q in order]
 
+        # ``recommend_layered`` compares a fixed block-family. Keep the
+        # all-scale objective, but do not silently replace that family with
+        # arbitrary subtree topologies unless the caller explicitly asks for
+        # those search stages.
+        if self.objective == "full_tree":
+            if topology_refine is _DEFAULT_SEARCH_OPTION:
+                settings["topology_refine"] = None
+                settings["topology_budget"] = None
+            if search is _DEFAULT_SEARCH_OPTION:
+                settings["search"] = None
+                settings["search_budget"] = self.search_budget
+
         candidates = []
         for bs in options:
             plan = TreePlan.build_layered(
@@ -2504,6 +2877,7 @@ class TreeLayoutFinder:
                 "max_path": report["max_path"],
                 "max_edge_load": report["max_edge_load"],
                 "peak_bond_growth": report["peak_bond_growth"],
+                "full_tree_profile": report["full_tree"],
                 "max_virtual_degree": report["max_virtual_degree"],
                 "total_virtual_degree": report["total_virtual_degree"],
                 "estimated_max_tensor_log2": report[
@@ -2562,17 +2936,23 @@ class TreeLayoutFinder:
 
         ``chi`` and the fixed-plan ``refine`` / ``search`` controls can be
         overridden for this call. Pass ``progbar=True`` to display greedy and
-        Nevergrad search progress. Omitted values inherit the corresponding
+        offline search progress. Omitted values inherit the corresponding
         finder settings, so the original zero-argument behavior is unchanged.
         The explicit ``objective="hypergraph"`` mode is the one exception:
         when no refinement controls are supplied, it enables bounded greedy
         and binary-NNI stages so the full support hyperedges directly
         influence the returned layout.
 
+        ``objective="full_tree"`` enables bounded all-scale subtree
+        reconfiguration and annealing by default when no search controls are
+        explicitly supplied. It evaluates every tree scale using dynamic
+        bond-pressure and tensor-work proxies.
+
         ``order="quality"`` is a convenience mode matching the MPS layout
-        API: it enables bounded greedy refinement and opportunistic Nevergrad
-        refinement when the optional dependency is installed. If Nevergrad is
-        unavailable, quality mode falls back to greedy refinement. Pass
+        API: it enables bounded greedy refinement and opportunistic offline
+        refinement. If Nevergrad is unavailable, quality mode falls back to
+        greedy refinement. For ``objective="full_tree"``, quality mode uses
+        the dependency-free annealing stage. Pass
         ``search=None`` or ``refine=None`` explicitly to disable either stage.
         """
         if order is _DEFAULT_ORDER:
@@ -2583,9 +2963,15 @@ class TreeLayoutFinder:
             if refine is _DEFAULT_SEARCH_OPTION:
                 refine = "greedy"
             if topology_refine is _DEFAULT_SEARCH_OPTION:
-                topology_refine = "nni"
+                topology_refine = (
+                    "subtree" if self.objective == "full_tree" else "nni"
+                )
             if search is _DEFAULT_SEARCH_OPTION:
-                search = "nevergrad" if _nevergrad_available() else None
+                search = (
+                    "anneal"
+                    if self.objective == "full_tree"
+                    else ("nevergrad" if _nevergrad_available() else None)
+                )
         if chi is _DEFAULT_CHI:
             chi = self.chi
         else:
@@ -2774,7 +3160,7 @@ class TreeLayoutFinder:
             :meth:`recommend_layered`. They are applied to each arity candidate
             before selecting one final immutable plan.
         progbar : bool, optional
-            Display greedy and Nevergrad search progress for each candidate.
+            Display local-search progress for each candidate.
         """
         if chi is _DEFAULT_CHI:
             chi = self.chi
@@ -2844,6 +3230,7 @@ class TreeLayoutFinder:
                 "max_path": report["max_path"],
                 "max_edge_load": report["max_edge_load"],
                 "peak_bond_growth": report["peak_bond_growth"],
+                "full_tree_profile": report["full_tree"],
                 "estimated_max_tensor_log2": report[
                     "estimated_max_tensor_log2"
                 ],
@@ -3021,6 +3408,214 @@ class TreeLayoutFinder:
         )
         return dict(loads)
 
+    @staticmethod
+    def _log2_add(total, value):
+        """Add two positive quantities represented by their log2 values."""
+        if value == -np.inf:
+            return float(total)
+        if total == -np.inf:
+            return float(value)
+        return float(np.logaddexp2(total, value))
+
+    def _support_span(self, plan, support):
+        """Return the mask, nodes, and rooted edges spanned by ``support``."""
+        support = tuple(dict.fromkeys(support))
+        support_mask = 0
+        for site in support:
+            support_mask |= 1 << site
+        site_nodes = [plan.node_of_qubit[site] for site in support]
+        if len(site_nodes) == 2:
+            path = plan.node_path(site_nodes[0], site_nodes[1])
+            span_nodes = set(path)
+            crossed_edges = [
+                (u, v) if plan.parent.get(v) == u else (v, u)
+                for u, v in zip(path, path[1:])
+            ]
+        else:
+            span_nodes = set()
+            anchor = site_nodes[0]
+            for site_node in site_nodes:
+                span_nodes.update(plan.node_path(anchor, site_node))
+            crossed_edges = [
+                (parent, node)
+                for node in span_nodes
+                if (parent := plan.parent.get(node)) in span_nodes
+            ]
+        return support_mask, span_nodes, crossed_edges
+
+    def full_tree_profile(self, plan=None):
+        """Return a dynamic, all-scale cost profile for ``plan``.
+
+        The profile is a cheap layout proxy, not a replacement for replaying
+        the circuit. It accumulates uncapped operator-Schmidt demand on every
+        tree edge, tracks the capped working bond pressure at the configured
+        ``chi``, estimates tensor widths and write/work volume for every
+        touched node, and groups those quantities by hierarchical tree scale.
+        """
+        if plan is None:
+            plan = self.run()
+        cache_key = id(plan)
+        cached = self._full_tree_profile_cache.get(cache_key)
+        if cached is not None and cached[0] is plan:
+            return cached[1]
+
+        below = plan.subtree_qubit_masks()
+        node_scales = _tree_node_scales(plan)
+        edges = tuple(
+            (parent, child)
+            for parent, children in plan.children.items()
+            for child in children
+        )
+        demand_log = {edge: 0.0 for edge in edges}
+        bond_log = {edge: 0.0 for edge in edges}
+        log_chi = (
+            float(np.log2(self.chi)) if self.chi is not None else float("inf")
+        )
+        scales = {}
+        for scale in sorted(set(node_scales.values())):
+            scales[scale] = {
+                "node_count": 0,
+                "edge_count": 0,
+                "peak_tensor_log2": 0.0,
+                "log_total_tensor_size": -np.inf,
+                "peak_edge_demand_log2": 0.0,
+                "total_edge_demand_log2": 0.0,
+            }
+        for node, scale in node_scales.items():
+            scales[scale]["node_count"] += 1
+        for parent, child in edges:
+            scales[node_scales[child]]["edge_count"] += 1
+
+        def node_log_size(node):
+            incident = []
+            if node in plan.parent:
+                incident.append((plan.parent[node], node))
+            incident.extend((node, child) for child in plan.children[node])
+            return float(
+                int(node in plan.qubit_of_node)
+                + sum(bond_log[edge] for edge in incident)
+            )
+
+        peak_tensor_log2 = 0.0
+        peak_work_log2 = 0.0
+        log_total_write = -np.inf
+        log_total_work = -np.inf
+        total_route_length = 0
+        event_count = 0
+        exact_events = 0
+        bounded_events = 0
+        bound_reasons = {}
+
+        for payload, support, event_type, temporal_factor in zip(
+            self.payloads,
+            self.supports,
+            self.event_types,
+            self.temporal_factors,
+        ):
+            support = tuple(dict.fromkeys(support))
+            if (
+                temporal_factor <= 0.0
+                or len(support) < 2
+                or str(event_type).lower() in {
+                    "measure", "reset", "measure_reset", "cap"
+                }
+            ):
+                continue
+            support_mask, span_nodes, crossed_edges = self._support_span(
+                plan, support
+            )
+            if not crossed_edges:
+                continue
+            event_count += 1
+            total_route_length += len(crossed_edges)
+            for edge in crossed_edges:
+                _parent, child = edge
+                left_mask = support_mask & below[child]
+                if not left_mask or left_mask == support_mask:
+                    continue
+                left = tuple(
+                    site for site in support if left_mask & (1 << site)
+                )
+                info = self._schmidt_rank_info(payload, support, left)
+                delta = float(temporal_factor) * float(
+                    np.log2(max(1, int(info["rank"])))
+                )
+                demand_log[edge] += delta
+                bond_log[edge] = min(log_chi, bond_log[edge] + delta)
+                if info["exact"]:
+                    exact_events += 1
+                else:
+                    bounded_events += 1
+                    reason = info["reason"]
+                    bound_reasons[reason] = bound_reasons.get(reason, 0) + 1
+
+            tensor_logs = [node_log_size(node) for node in span_nodes]
+            event_write_log = max(tensor_logs, default=0.0)
+            event_work_logs = [
+                log_size + 2.0 * len(support)
+                for log_size in tensor_logs
+            ]
+            event_work_log = max(event_work_logs, default=0.0)
+            peak_tensor_log2 = max(peak_tensor_log2, event_write_log)
+            peak_work_log2 = max(peak_work_log2, event_work_log)
+            log_total_write = self._log2_add(
+                log_total_write, event_write_log
+            )
+            log_total_work = self._log2_add(
+                log_total_work, event_work_log
+            )
+            for node, log_size in zip(span_nodes, tensor_logs):
+                scale = scales[node_scales[node]]
+                scale["peak_tensor_log2"] = max(
+                    scale["peak_tensor_log2"], log_size
+                )
+                scale["log_total_tensor_size"] = self._log2_add(
+                    scale["log_total_tensor_size"], log_size
+                )
+            for edge in crossed_edges:
+                scale = scales[node_scales[edge[1]]]
+                scale["peak_edge_demand_log2"] = max(
+                    scale["peak_edge_demand_log2"], demand_log[edge]
+                )
+
+        for node in plan.children:
+            log_size = node_log_size(node)
+            scale = scales[node_scales[node]]
+            scale["peak_tensor_log2"] = max(
+                scale["peak_tensor_log2"], log_size
+            )
+            scale["log_total_tensor_size"] = self._log2_add(
+                scale["log_total_tensor_size"], log_size
+            )
+        for edge, demand in demand_log.items():
+            scale = scales[node_scales[edge[1]]]
+            scale["peak_edge_demand_log2"] = max(
+                scale["peak_edge_demand_log2"], demand
+            )
+            scale["total_edge_demand_log2"] += demand
+
+        profile = {
+            "event_count": event_count,
+            "peak_tensor_log2": float(peak_tensor_log2),
+            "peak_work_log2": float(peak_work_log2),
+            "log_total_write": float(
+                0.0 if log_total_write == -np.inf else log_total_write
+            ),
+            "log_total_work": float(
+                0.0 if log_total_work == -np.inf else log_total_work
+            ),
+            "peak_edge_demand_log2": float(max(demand_log.values(), default=0.0)),
+            "total_edge_demand_log2": float(sum(demand_log.values())),
+            "peak_bond_log2": float(max(bond_log.values(), default=0.0)),
+            "total_route_length": int(total_route_length),
+            "exact_events": int(exact_events),
+            "bounded_events": int(bounded_events),
+            "bound_reasons": bound_reasons,
+            "scales": scales,
+        }
+        self._full_tree_profile_cache[cache_key] = (plan, profile)
+        return profile
+
     def _congestion_key(self, plan):
         """Return the lexicographic key used by the load-aware objective."""
         loads = self.edge_loads(plan)
@@ -3133,6 +3728,10 @@ class TreeLayoutFinder:
         hybrid_cost = None
         if self.objective == "hybrid" and loads is not None:
             hybrid_cost = self._hybrid_key(plan)[0]
+        full_tree = (
+            self.full_tree_profile(plan)
+            if self.objective == "full_tree" else None
+        )
         arity_histogram = {}
         for node, children in plan.children.items():
             if children:
@@ -3166,6 +3765,7 @@ class TreeLayoutFinder:
                 }
                 if self.objective == "hypergraph" and loads is not None else None
             ),
+            "full_tree": full_tree,
             "root": plan.root,
             "root_qubit": plan.root_qubit,
             "top_arity": plan.top_arity,

@@ -331,7 +331,7 @@ class TreeOptimizer:
         is built automatically. Set ``top_arity=3`` with ``max_arity=2`` for
         the conventional binary TTN with a three-leg top tensor. This keeps
         every tensor rank at most three.
-    layout_objective : {"path", "congestion", "compression", "hypergraph", "hybrid"}
+    layout_objective : {"path", "congestion", "compression", "hypergraph", "full_tree", "hybrid"}
         Objective used when building an automatic tree.  ``"path"`` is the
         backward-compatible interaction-path heuristic; ``"congestion"``
         selects a candidate using predicted operator-Schmidt edge load;
@@ -339,6 +339,8 @@ class TreeOptimizer:
         estimated local tensor cost at ``chi``; ``"hypergraph"`` directly
         scores every original multi-qubit support across every crossed tree
         edge and enables bounded leaf/NNI refinement by default;
+        ``"full_tree"`` evaluates dynamic all-scale tensor width, work, write,
+        bond pressure, and route costs;
         ``"hybrid"`` combines normalized path, peak-load, and total-load
         costs. Pass a configured :class:`TreeLayoutFinder` through ``layout=``
         to customize its hybrid weights or enable pre-simulation refinement.
