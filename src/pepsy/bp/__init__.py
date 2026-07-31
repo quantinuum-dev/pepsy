@@ -14,6 +14,12 @@ contractions and corrections used by Pepsy:
   density matrix and its scalar expectation companion,
 * :func:`partial_trace_loop_series_expand` -- a D2BP reduced-density-matrix
   loop series and scalar local-observable companion,
+* :func:`partial_trace_open_loop_series_expand` -- an explicit open-edge
+  rho series retaining long-range excitation paths and closed loops,
+* :func:`partial_trace_open_loop_series_sweep` -- one-BP multi-support,
+  multi-cutoff open-rho diagnostics,
+* :func:`compute_local_expectation_open_loop_series` -- direct gate-inserted
+  scalar expectations from the same open paths and loops,
 * :func:`loop_expand` -- an explicit selector between the correction families.
 * :func:`partitioned_expand` -- the partitioned network expansion (PNE,
   arXiv:2512.10910), with :func:`recursive_partitioned_expand` for fixed
@@ -39,13 +45,18 @@ from .cluster import (
     select_bp_candidate,
 )
 from .series import (
+    OpenLoopSeriesCache,
+    OpenLoopSeriesSweepResult,
     LoopSeriesCache,
     LoopSeriesResult,
     LoopSeriesTerm,
     compute_local_expectation_edge_loop_series,
+    compute_local_expectation_open_loop_series,
     compute_local_expectation_loop_cluster,
     compute_local_expectation_loop_series,
     partial_trace_edge_loop_series_expand,
+    partial_trace_open_loop_series_expand,
+    partial_trace_open_loop_series_sweep,
     partial_trace_loop_cluster_expand,
     partial_trace_loop_series_expand,
     loop_series_expand,
@@ -129,12 +140,17 @@ __all__ = [
     "LoopClusterResult",
     "LoopClusterTerm",
     "LoopSeriesCache",
+    "OpenLoopSeriesCache",
+    "OpenLoopSeriesSweepResult",
     "LoopSeriesResult",
     "LoopSeriesTerm",
     "compute_local_expectation_edge_loop_series",
+    "compute_local_expectation_open_loop_series",
     "compute_local_expectation_loop_cluster",
     "compute_local_expectation_loop_series",
     "partial_trace_edge_loop_series_expand",
+    "partial_trace_open_loop_series_expand",
+    "partial_trace_open_loop_series_sweep",
     "partial_trace_loop_cluster_expand",
     "partial_trace_loop_series_expand",
     "RelayGaugeOptions",

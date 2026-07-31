@@ -10,9 +10,11 @@ qtn = pytest.importorskip("quimb.tensor")
 ctg = pytest.importorskip("cotengra")
 
 from pepsy.bp import (  # noqa: E402
+    OpenLoopSeriesCache,
     compute_boundary_expectation,
     compute_bp_path_expectation,
     compute_local_expectation_edge_loop_series,
+    compute_local_expectation_open_loop_series,
     compute_local_expectation_loop_cluster,
     compute_local_expectation_loop_series,
     compute_path_cluster_expectation,
@@ -21,6 +23,8 @@ from pepsy.bp import (  # noqa: E402
     loop_series_expand,
     one_norm_bp,
     partial_trace_edge_loop_series_expand,
+    partial_trace_open_loop_series_expand,
+    partial_trace_open_loop_series_sweep,
     partial_trace_loop_series_expand,
     partial_trace_loop_cluster_expand,
     partitioned_expand,
@@ -33,6 +37,7 @@ from pepsy.tensors import (  # noqa: E402
     SymPEPS,
     ps_to_peps,
     site_charge_alternating,
+    site_charge_from_map,
 )
 
 
@@ -500,6 +505,19 @@ def test_spinful_eta_pair_measurement_survives_su_and_bp_gauges(symmetry):
     assert exact_auto == pytest.approx(jw_value, rel=1e-10, abs=1e-10)
     assert exact_greedy == pytest.approx(exact_auto, rel=1e-10, abs=1e-10)
 
+    open_info = {}
+    open_value = compute_local_expectation_open_loop_series(
+        state.tn,
+        terms,
+        gloops=3,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+        info=open_info,
+    )
+    assert open_value == pytest.approx(exact_auto, rel=1e-10, abs=1e-10)
+    assert open_info["open_scalar_fermionic_q_phase"] is True
+
     su = gauge_all(
         state.tn,
         start="su",
@@ -564,6 +582,123 @@ def test_spinful_eta_pair_measurement_survives_su_and_bp_gauges(symmetry):
     )
     assert cluster == pytest.approx(exact_auto, rel=1e-10, abs=1e-10)
     assert bp_helper == pytest.approx(exact_auto, rel=1e-10, abs=1e-10)
+
+
+@pytest.mark.parametrize("symmetry", ("U1", "U1U1"))
+def test_fermionic_long_range_doublon_product_survives_cluster_gauges(symmetry):
+    """A nontrivial long-range doublon correlator survives native clusters."""
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    doublon = 2 if symmetry == "U1" else (1, 1)
+    empty = 0 if symmetry == "U1" else (0, 0)
+    occupations = {
+        (0, 0): doublon,
+        (1, 1): doublon,
+        (0, 1): empty,
+        (1, 0): empty,
+    }
+    peps = ps_to_peps(
+        2,
+        2,
+        fermion=fermion,
+        occupations=occupations,
+        dtype="complex128",
+    )
+    state = SymPEPS(
+        peps=peps,
+        symmetry=symmetry,
+        edges=tuple(qtn.edges_2d_square(2, 2)),
+        fermionic=True,
+        phys_sectors=fermion.physical_sectors,
+        site_charge=occupations,
+        site_ind_id="k{},{}",
+    )
+
+    gate = fermion.hopping_gate(0.31, t=(1.0, 0.0))
+    state.apply_gates(
+        (
+            (gate, ((0, 0), (1, 0))),
+            (gate, ((1, 1), (0, 1))),
+        ),
+        method="direct",
+        contract="split",
+        max_bond=4,
+        cutoff=0.0,
+    )
+
+    operator = fermion.operator_term(
+        [(1.0, ((0, "double"), (1, "double")))],
+        sites=(0, 1),
+    )
+    where = ((0, 0), (1, 1))
+    terms = {where: operator}
+    norm_before = complex(state.tn.norm())
+
+    exact = state.tn.compute_local_expectation_exact(
+        terms,
+        normalized=True,
+        optimize="auto-hq",
+    )
+
+    su = gauge_all(
+        state.tn,
+        start="su",
+        target="su",
+        norm="2norm",
+        su_options={"max_iterations": 8, "tol": 0.0},
+    )
+    cluster = compute_path_cluster_expectation(
+        su.core,
+        terms,
+        gauges=su.gauges,
+        max_distance=1,
+        fillin=True,
+        max_bond=None,
+        normalized=True,
+        optimize="auto-hq",
+    )
+
+    bp_helper = compute_bp_path_expectation(
+        state.tn,
+        terms,
+        max_distance=1,
+        fillin=True,
+        max_bond=None,
+        normalized=True,
+        optimize="auto-hq",
+        bp_options={
+            "run_opts": {
+                "max_iterations": 150,
+                "tol": 1e-10,
+                "diis": False,
+            }
+        },
+        conversion_options={"smudge": 1e-12},
+    )
+
+    with pytest.warns(UserWarning, match="not a compressed one"):
+        compressed = compute_path_cluster_expectation(
+            su.core,
+            terms,
+            gauges=su.gauges,
+            max_distance=1,
+            fillin=True,
+            max_bond=8,
+            normalized=True,
+            optimize="auto-hq",
+        )
+
+    expected_type = (
+        "U1FermionicArray" if symmetry == "U1" else "U1U1FermionicArray"
+    )
+    assert exact.real > 0.1
+    assert cluster == pytest.approx(exact, rel=1e-10, abs=1e-10)
+    assert bp_helper == pytest.approx(exact, rel=1e-10, abs=1e-10)
+    assert compressed == pytest.approx(exact, rel=1e-10, abs=1e-10)
+    assert complex(state.tn.norm()) == pytest.approx(norm_before)
+    assert all(
+        type(tensor.data).__name__ == expected_type
+        for tensor in state.tn.tensors
+    )
 
 
 def test_fermionic_long_range_boundary_expectation_matches_exact():
@@ -1267,6 +1402,114 @@ def test_fermionic_partial_trace_loop_series_keeps_native_rho():
     )
 
 
+def test_fermionic_open_rho_is_native_diagnostic_and_scalar_path_is_graded():
+    """Long-range open rho stays native while observables use graded gates."""
+    state = SymPEPS.random(
+        1,
+        4,
+        symmetry="U1",
+        bond_dim=3,
+        phys_dim=2,
+        fermionic=True,
+        seed=1912,
+        dtype="complex128",
+    )
+    where = ((0, 0), (0, 3))
+    bp = two_norm_bp(
+        state.tn,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+    )
+    info = {}
+    rho = partial_trace_open_loop_series_expand(
+        state.tn,
+        where,
+        gloops=3,
+        messages=bp.messages,
+        run_bp=False,
+        cache=OpenLoopSeriesCache(),
+        info=info,
+    )
+
+    assert type(rho).__name__ == "U1FermionicArray"
+    assert info["open_rho_family_counts"] == {"open_path": 1}
+    np.testing.assert_allclose(
+        np.trace(rho.to_dense()),
+        1.0,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+    fermion = Fermion(spinful=False, symmetry="U1")
+    local_where = ((0, 1),)
+    local_gate = fermion.chemical_potential_operator()
+    exact = state.tn.compute_local_expectation_exact(
+        {local_where: local_gate},
+        normalized=True,
+        optimize="auto-hq",
+    )
+    graded = compute_local_expectation_loop_series(
+        state.tn,
+        {local_where: local_gate},
+        gloops=0,
+        messages=bp.messages,
+        run_bp=False,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+    )
+    np.testing.assert_allclose(graded, exact, rtol=1e-10, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "symmetry,phys_dim,site_charge",
+    (
+        ("U1", 2, None),
+        ("U1U1", 4, site_charge_alternating((1, 0), (0, 1))),
+        ("Z2", 2, None),
+    ),
+)
+def test_fermionic_open_rho_sweep_supports_native_symmetries(
+    symmetry,
+    phys_dim,
+    site_charge,
+):
+    """One-BP open-rho sweeps preserve native U1, U1U1, and Z2 arrays."""
+    state = SymPEPS.random(
+        1,
+        4,
+        symmetry=symmetry,
+        bond_dim=2,
+        phys_dim=phys_dim,
+        fermionic=True,
+        site_charge=site_charge,
+        seed=1920 + len(symmetry),
+        dtype="complex128",
+    )
+    supports = (((0, 0), (0, 3)), ((0, 0), (0, 1), (0, 3)))
+    result = partial_trace_open_loop_series_sweep(
+        state.tn,
+        supports,
+        (0, 2, 3),
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+    )
+
+    assert result.bp_converged
+    for support in supports:
+        for cutoff in (0, 2, 3):
+            rho = result.get_rho(support, cutoff)
+            assert type(rho).__module__.startswith("symmray")
+            np.testing.assert_allclose(
+                np.trace(rho.to_dense()),
+                1.0,
+                rtol=1e-10,
+                atol=1e-12,
+            )
+
+
 def test_fermionic_local_expectation_loop_series_aligns_charge_support():
     """Graded gate insertion is exact on a fermionic D2BP tree."""
     state = SymPEPS.random(
@@ -1366,6 +1609,401 @@ def test_explicit_edge_loop_series_uses_fermion_safe_gate_path():
     np.testing.assert_allclose(value, exact, rtol=1e-10, atol=1e-12)
     assert type(rho).__name__ == "U1FermionicArray"
     np.testing.assert_allclose(np.trace(rho.to_dense()), 1.0)
+
+
+def test_open_scalar_series_uses_native_fermion_projectors_for_long_range_hopping():
+    """Long-range native hopping stays graded while using one BP solve."""
+    state = SymPEPS.random(
+        1,
+        4,
+        symmetry="U1",
+        bond_dim=3,
+        phys_dim=2,
+        fermionic=True,
+        seed=1931,
+        dtype="complex128",
+    )
+    where = ((0, 0), (0, 3))
+    gate = Fermion(spinful=False, symmetry="U1").hopping_operator()
+    exact = state.tn.compute_local_expectation_exact(
+        {where: gate}, normalized=True, optimize="auto-hq"
+    )
+    bp = two_norm_bp(
+        state.tn,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+    )
+    info = {}
+    value = compute_local_expectation_open_loop_series(
+        state.tn,
+        {where: gate},
+        gloops=3,
+        messages=bp.messages,
+        run_bp=False,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+        info=info,
+    )
+
+    np.testing.assert_allclose(value, exact, rtol=1e-10, atol=1e-12)
+    assert info["open_scalar_native_route"] == "graded_open_projectors"
+    assert info["open_scalar_fermionic_q_phase"] is True
+    assert info["open_scalar_family_counts"] == {"open_path": 1}
+
+    reverse_where = where[::-1]
+    reverse_gate = gate.transpose((1, 0, 3, 2))
+    reverse_exact = state.tn.compute_local_expectation_exact(
+        {reverse_where: reverse_gate},
+        normalized=True,
+        optimize="auto-hq",
+    )
+    reverse_value = compute_local_expectation_open_loop_series(
+        state.tn,
+        {reverse_where: reverse_gate},
+        gloops=3,
+        messages=bp.messages,
+        run_bp=False,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+    )
+    np.testing.assert_allclose(
+        reverse_value,
+        reverse_exact,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+
+@pytest.mark.parametrize(
+    "symmetry,phys_dim,site_charge,gate_name,phase",
+    (
+        ("U1", 4, None, "density", False),
+        ("U1U1", 4, site_charge_alternating((1, 0), (0, 1)), "hopping", True),
+        ("Z2", 2, None, "density", False),
+    ),
+)
+def test_open_scalar_series_native_gate_phase_matches_symmetry(
+    symmetry,
+    phys_dim,
+    site_charge,
+    gate_name,
+    phase,
+):
+    """Native open projectors handle diagonal and off-diagonal gates."""
+    state = SymPEPS.random(
+        1,
+        4,
+        symmetry=symmetry,
+        bond_dim=3,
+        phys_dim=phys_dim,
+        fermionic=True,
+        site_charge=site_charge,
+        seed=1960 + len(symmetry),
+        dtype="complex128",
+    )
+    fermion = Fermion(
+        spinful=phys_dim == 4,
+        symmetry=symmetry,
+    )
+    gate = getattr(fermion, f"{gate_name}_operator")()
+    where = ((0, 0), (0, 3))
+    exact = state.tn.compute_local_expectation_exact(
+        {where: gate},
+        normalized=True,
+        optimize="auto-hq",
+    )
+    info = {}
+    value = compute_local_expectation_open_loop_series(
+        state.tn,
+        {where: gate},
+        gloops=3,
+        max_iterations=200,
+        tol=1e-10,
+        diis=False,
+        info=info,
+    )
+
+    np.testing.assert_allclose(value, exact, rtol=1e-10, atol=1e-12)
+    assert info["open_scalar_fermionic_q_phase"] is phase
+
+
+def test_open_scalar_series_cyclic_native_u1_matches_exact_d3():
+    """Cyclic native U1 open corrections remain exact at full cutoff."""
+    site_charge = site_charge_from_map(
+        {(0, 0): 2, (1, 2): 2},
+        default=0,
+    )
+    state = SymPEPS.random(
+        2,
+        3,
+        symmetry="U1",
+        bond_dim=3,
+        phys_dim=4,
+        fermionic=True,
+        site_charge=site_charge,
+        seed=2053,
+        dtype="complex128",
+    )
+    fermion = Fermion(spinful=True, symmetry="U1")
+    where = ((0, 0), (1, 2))
+    gate = fermion.operator_term(
+        [(1.0, ((0, "double"), (1, "double")))],
+        sites=(0, 1),
+    )
+    exact = state.tn.compute_local_expectation_exact(
+        {where: gate},
+        normalized=True,
+        optimize="auto-hq",
+    )
+    bp = two_norm_bp(
+        state.tn,
+        max_iterations=200,
+        tol=1e-9,
+        diis=False,
+    )
+    info = {}
+    value = compute_local_expectation_open_loop_series(
+        state.tn,
+        {where: gate},
+        gloops=7,
+        messages=bp.messages,
+        run_bp=False,
+        max_iterations=200,
+        tol=1e-9,
+        diis=False,
+        info=info,
+    )
+    np.testing.assert_allclose(value, exact, rtol=1e-10, atol=1e-12)
+    assert info["open_scalar_native_route"] == "graded_cluster_compatible"
+
+    rho_info = {}
+    rho = partial_trace_open_loop_series_expand(
+        state.tn,
+        where,
+        gloops=7,
+        messages=bp.messages,
+        run_bp=False,
+        max_iterations=200,
+        tol=1e-9,
+        diis=False,
+        info=rho_info,
+    )
+    assert type(rho).__name__ == "U1FermionicArray"
+    np.testing.assert_allclose(np.trace(rho.to_dense()), 1.0, atol=1e-12)
+    assert rho_info["open_rho_native_route"] == "graded_cluster_compatible"
+
+
+@pytest.mark.parametrize(
+    "symmetry,site_charge,seed",
+    (
+        (
+            "U1",
+            site_charge_from_map({(0, 0): 2, (1, 2): 2}, default=0),
+            2083,
+        ),
+        (
+            "U1",
+            site_charge_from_map({(0, 0): 2, (1, 2): 2}, default=0),
+            2085,
+        ),
+        (
+            "U1U1",
+            site_charge_alternating((1, 0), (0, 1)),
+            2084,
+        ),
+        (
+            "U1U1",
+            site_charge_alternating((1, 0), (0, 1)),
+            2086,
+        ),
+    ),
+)
+def test_cyclic_native_open_series_gate_probes_and_rho_match_cluster(
+    symmetry,
+    site_charge,
+    seed,
+):
+    """Cyclic native rho is cluster-consistent and gate probes are exact."""
+    state = SymPEPS.random(
+        2,
+        3,
+        symmetry=symmetry,
+        bond_dim=3,
+        phys_dim=4,
+        fermionic=True,
+        site_charge=site_charge,
+        seed=seed,
+        dtype="complex128",
+    )
+    where = ((0, 0), (1, 2))
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    bp = two_norm_bp(
+        state.tn,
+        max_iterations=200,
+        tol=1e-9,
+        diis=False,
+    )
+
+    open_rho = partial_trace_open_loop_series_expand(
+        state.tn,
+        where,
+        gloops=7,
+        messages=bp.messages,
+        run_bp=False,
+        max_iterations=200,
+        tol=1e-9,
+        diis=False,
+    )
+    cluster_rho = partial_trace_loop_cluster_expand(
+        state.tn,
+        where,
+        gloops=7,
+        messages=bp.messages,
+        run_bp=False,
+        max_iterations=200,
+        tol=1e-9,
+        diis=False,
+    )
+    assert type(open_rho).__name__ == f"{symmetry}FermionicArray"
+    assert type(cluster_rho).__name__ == f"{symmetry}FermionicArray"
+    np.testing.assert_allclose(
+        open_rho.to_dense(),
+        cluster_rho.to_dense(),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        np.trace(open_rho.to_dense()),
+        1.0,
+        rtol=1e-10,
+        atol=1e-12,
+    )
+
+    for gate in (
+        fermion.density_operator(),
+        fermion.hopping_operator(),
+        fermion.eta_pair_operator(),
+    ):
+        exact = state.tn.compute_local_expectation_exact(
+            {where: gate},
+            normalized=True,
+            optimize="auto-hq",
+        )
+        value = compute_local_expectation_open_loop_series(
+            state.tn,
+            {where: gate},
+            gloops=7,
+            messages=bp.messages,
+            run_bp=False,
+            max_iterations=200,
+            tol=1e-9,
+            diis=False,
+        )
+        np.testing.assert_allclose(value, exact, rtol=1e-10, atol=1e-12)
+
+        reverse_where = where[::-1]
+        reverse_gate = gate.transpose((1, 0, 3, 2))
+        reverse_exact = state.tn.compute_local_expectation_exact(
+            {reverse_where: reverse_gate},
+            normalized=True,
+            optimize="auto-hq",
+        )
+        reverse_value = compute_local_expectation_open_loop_series(
+            state.tn,
+            {reverse_where: reverse_gate},
+            gloops=7,
+            messages=bp.messages,
+            run_bp=False,
+            max_iterations=200,
+            tol=1e-9,
+            diis=False,
+        )
+        np.testing.assert_allclose(
+            reverse_value,
+            reverse_exact,
+            rtol=1e-10,
+            atol=1e-12,
+        )
+
+
+def test_cyclic_native_open_series_honors_contraction_cost_limits():
+    """Safe cyclic fallback still records and applies Cotengra budgets."""
+    site_charge = site_charge_from_map(
+        {(0, 0): 2, (1, 2): 2},
+        default=0,
+    )
+    state = SymPEPS.random(
+        2,
+        3,
+        symmetry="U1",
+        bond_dim=3,
+        phys_dim=4,
+        fermionic=True,
+        site_charge=site_charge,
+        seed=2093,
+        dtype="complex128",
+    )
+    where = ((0, 0), (1, 2))
+    gate = Fermion(spinful=True, symmetry="U1").operator_term(
+        [(1.0, ((0, "double"), (1, "double")))],
+        sites=(0, 1),
+    )
+    exact = state.tn.compute_local_expectation_exact(
+        {where: gate},
+        normalized=True,
+        optimize="auto-hq",
+    )
+    info = {}
+    value = compute_local_expectation_open_loop_series(
+        state.tn,
+        {where: gate},
+        gloops=7,
+        max_iterations=200,
+        tol=1e-9,
+        diis=False,
+        max_flops_log10=11.0,
+        max_peak_memory_log2=30.0,
+        info=info,
+    )
+    np.testing.assert_allclose(value, exact, rtol=1e-10, atol=1e-12)
+    assert info["open_scalar_native_route"] == "graded_cluster_compatible"
+    assert not info["open_scalar_edge_term_costs"]
+    assert not info["open_scalar_edge_skipped_terms"]
+    assert info["open_scalar_cluster_region_costs"]
+    assert info["open_scalar_cluster_region_skipped_terms"] == {}
+    assert info["open_scalar_term_costs"]
+    for costs in info["open_scalar_term_costs"].values():
+        for cost in costs.values():
+            if cost is not None:
+                assert cost["flops_log10"] <= 11.0
+                assert cost["peak_memory_log2"] <= 30.0
+
+    rho_info = {}
+    rho = partial_trace_open_loop_series_expand(
+        state.tn,
+        where,
+        gloops=7,
+        max_iterations=200,
+        tol=1e-9,
+        diis=False,
+        max_flops_log10=11.0,
+        max_peak_memory_log2=30.0,
+        info=rho_info,
+    )
+    assert type(rho).__name__ == "U1FermionicArray"
+    assert rho_info["open_rho_native_route"] == "graded_cluster_compatible"
+    assert not rho_info["open_rho_edge_term_costs"]
+    assert not rho_info["open_rho_edge_skipped_terms"]
+    assert rho_info["open_rho_cluster_region_costs"]
+    assert rho_info["open_rho_cluster_region_skipped_terms"] == {}
+    assert rho_info["open_rho_term_costs"]
+    np.testing.assert_allclose(np.trace(rho.to_dense()), 1.0, atol=1e-12)
+    for cost in rho_info["open_rho_term_costs"].values():
+        assert cost["flops_log10"] <= 11.0
+        assert cost["peak_memory_log2"] <= 30.0
 
 
 def test_explicit_edge_loop_series_preserves_dense_edge_degree_terms():

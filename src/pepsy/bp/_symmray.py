@@ -122,6 +122,56 @@ def dense_index_map(chargemap):
     return result
 
 
+def _charge_parity(charge):
+    """Return the fermion parity of one Abelian charge."""
+    if isinstance(charge, tuple):
+        return sum(int(component) for component in charge) % 2
+    return int(charge) % 2
+
+
+def _dense_index_parities(index):
+    """Expand a Symmray index into the parity of each dense basis state."""
+    parities = []
+    for charge, size in index.chargemap.items():
+        parities.extend([_charge_parity(charge)] * int(size))
+    return parities
+
+
+def _fermionic_open_q_phase(tn, index, dense):
+    """Apply the graded cup/cap phase to an open-bond Q operator.
+
+    An open D2 bond has two bra legs followed by two ket legs. Splitting a
+    fermionic virtual bond into those independent copies changes the graded
+    ordering relative to the native tensor contraction. The basis-change
+    phase is ``-(-1) ** (p0*p1 + p0*p2 + p1*p2)`` for axes ordered as
+    ``(left-bra, left-ket, right-bra, right-ket)``.
+    """
+    _, _, _, _, left_index, right_index = _bond_endpoint_data(tn, index)
+    left_parity = _dense_index_parities(left_index)
+    right_parity = _dense_index_parities(right_index)
+    parities = (left_parity, left_parity, right_parity, right_parity)
+
+    original_shape = dense.shape
+    if dense.ndim == 2:
+        dimension = int(np.sqrt(dense.shape[0]))
+        dense = dense.reshape(
+            dimension, dimension, dimension, dimension
+        )
+    if dense.ndim != 4:
+        raise ValueError("fermionic open Q operators must have rank four")
+
+    left_bra = np.asarray(parities[0])[:, None, None, None]
+    left_ket = np.asarray(parities[1])[None, :, None, None]
+    right_bra = np.asarray(parities[2])[None, None, :, None]
+    exponent = (
+        left_bra * left_ket
+        + left_bra * right_bra
+        + left_ket * right_bra
+    )
+    phase = -((-1) ** exponent)
+    return (dense * phase).reshape(original_shape)
+
+
 def zero_charge(chargemap):
     """Return the neutral charge matching a scalar or product symmetry."""
     charge = next(iter(chargemap), 0)
@@ -258,8 +308,15 @@ def rank4_operator_from_dense(tn, index, operator, *, layout="pne"):
             not right_index.dual,
             right_index.dual,
         )
+    elif layout == "open":
+        duals = (
+            left_index.dual,
+            not left_index.dual,
+            right_index.dual,
+            not right_index.dual,
+        )
     else:
-        raise ValueError("layout must be 'pne' or 'series'")
+        raise ValueError("layout must be 'pne', 'series', or 'open'")
 
     return array_cls.from_dense(
         dense,
@@ -286,8 +343,22 @@ def rank_one_d2_projector(
     )
 
 
-def d2_operator(tn, index, operator, *, complement=False, layout="pne"):
-    """Normalize a D2 projector/operator and preserve native Symmray data."""
+def d2_operator(
+    tn,
+    index,
+    operator,
+    *,
+    complement=False,
+    layout="pne",
+    fermionic=False,
+):
+    """Normalize a D2 operator and preserve native Symmray data.
+
+    ``fermionic=True`` applies the graded open-bond cup/cap phase to a
+    complementary Q operator. It is intentionally opt-in because the phase
+    belongs to the physical open-observable ordering, not to ordinary D2BP
+    projectors.
+    """
     dense = to_dense(operator)
     left, _, left_data, _, left_index, _ = _bond_endpoint_data(tn, index)
     del left
@@ -302,4 +373,6 @@ def d2_operator(tn, index, operator, *, complement=False, layout="pne"):
         )
     if complement:
         dense = np.eye(dimension * dimension, dtype=dense.dtype) - dense
+        if fermionic and layout == "open":
+            dense = _fermionic_open_q_phase(tn, index, dense)
     return rank4_operator_from_dense(tn, index, dense, layout=layout)

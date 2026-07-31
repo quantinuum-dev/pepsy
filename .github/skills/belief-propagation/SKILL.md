@@ -148,6 +148,34 @@ not treat `optimize="auto-hq"` as a fermionic sign fix: it is a Cotengra path
 preset, just like a reusable `PathOptimizer`, and a path-dependent sign means
 the input metadata is invalid or incomplete.
 
+The missing-`dummy_modes` defect and the cyclic open-series defect are related,
+but they are not the same bug. The former is a metadata-repair failure: a
+labelled odd array created with `new_with(...)` has lost the implicit modes
+needed to preserve its global fermionic phase. The latter can occur even when
+every local array is parity-even and has `dummy_modes=()`. In that case the
+failure is the native Symmray representation of a cyclic open correction: the
+unexcited `P` projectors and excited `Q` projectors can require incompatible
+mixed bra/ket orientations, so relabelling an open `Q` to make pairwise
+contractions run is not an algebraically safe fermionic contraction. It can
+produce a non-convergent series even though BP has converged and the dense
+shadow is correct.
+
+When a native fermionic open scalar or rho calculation has a cyclic graph,
+use the graded loop-cluster-compatible route. It keeps the rho native, inserts
+the gate in the graded ket/bra contraction for scalar observables, and avoids
+using `trace(rho @ gate)` as an oracle. A useful diagnosis is to check
+`parity`, `dummy_modes`, and `label` first: if all arrays are even with no
+dummy modes, do not blame the missing-dummy repair. Compare against the native
+exact oracle and the native loop-cluster result instead. Keep the explicit open
+edge-series route for dense/ordinary cases and fermionic trees, where the
+mixed-orientation cyclic obstruction is absent. If contraction budgets are
+provided, apply them to the cluster contractions as well and inspect the
+reported FLOP/peak-memory decisions; never use the budgeted call as a reason
+to fall back to the unsafe mixed-orientation route. Use the route-independent
+diagnostics `open_*_edge_term_costs` and
+`open_*_cluster_region_costs` when consuming cost metadata; the older
+`open_*_term_costs` fields are route-specific compatibility aliases.
+
 ### Fermionic local observables: required construction and oracle
 
 Do **not** evaluate a native fermionic observable as `trace(rho @ gate)`, even
