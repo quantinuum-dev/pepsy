@@ -17,9 +17,9 @@ The structure is not restricted to strictly-binary trees.  Internal nodes may
 have any arity: ``max_arity`` gives flatter ``k``-ary trees (shallower
 geodesics), while ``structure="adaptive"`` reads the gate-stream interaction
 graph and lets each level branch into as many children as it has strongly
-coupled communities.  By default the finder *searches* a small set of
-candidate arities (``max_arity=(2, 3, 4)``) and keeps the objective-best plan;
-pass a scalar ``max_arity=2`` to opt back into a single fixed binary tree.
+coupled communities.  The default is a binary tree below a three-virtual-leg
+root, which keeps every tensor at rank three.  Pass an explicit ``top_arity``
+or an iterable ``max_arity`` to request another geometry.
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ from .._layout_visualization import (
 __all__ = ["TreePlan", "TreeLayoutFinder"]
 
 _DEFAULT_MAX_ARITY = object()
+_DEFAULT_TOP_ARITY = object()
 _DEFAULT_CHI = object()
 _DEFAULT_ORDER = object()
 _DEFAULT_SEARCH_OPTION = object()
@@ -402,8 +403,8 @@ def _normalize_arity_candidates(max_arity):
     """Return ``(representative_arity, candidates)`` from a ``max_arity`` arg.
 
     ``max_arity`` may be a single int (a fixed arity), ``None`` (unbounded), or
-    an iterable of candidate arities to *search* (the finder default
-    ``(2, 3, 4)``).  ``candidates`` is ``None`` unless a search set was given;
+    an iterable of candidate arities to *search*. ``candidates`` is ``None``
+    unless a search set was given;
     the representative single arity is what the legacy single-plan builders use
     and is the first concrete candidate.
     """
@@ -471,8 +472,8 @@ class TreePlan:
     Nodes are integer ids. Leaves map one-to-one to qubits. Optionally, one
     additional qubit can be carried by the structural root via ``root_qubit``;
     this gives a binary top tensor two child bonds plus one open physical leg.
-    Other internal nodes carry no physical qubit. A strictly-binary tree (every
-    internal node with two children) is the common default, but the structure
+    Other internal nodes carry no physical qubit. The common default is binary
+    below a ternary virtual root, but the structure
     supports arbitrary arity so a level can branch into as many subtrees as the
     gate stream suggests. The plan is a pure structure description: it carries
     no tensor data and is consumed by
@@ -510,7 +511,8 @@ class TreePlan:
     @classmethod
     def from_order(cls, order, *, weights=None, structure="quality",
                    max_arity=2, community_frac=0.35, star_frac=0.75,
-                   dense_max=512, root_qubit=None, top_arity=None):
+                   dense_max=512, root_qubit=None,
+                   top_arity=_DEFAULT_TOP_ARITY):
         """Build a rooted tree by recursive partition of ``order``.
 
         Parameters
@@ -549,14 +551,13 @@ class TreePlan:
             Maximum subsystem size for dense spectral reordering.
         root_qubit : int, optional
             Qubit label carried by the top tensor rather than a leaf.
-        top_arity : int, optional
-            Number of virtual child bonds on the structural root. Set
-            ``top_arity=3`` with ``max_arity=2`` for the conventional binary
-            TTN with a ternary top tensor: the root has three virtual legs and
-            every non-root internal tensor has two child legs plus one parent
-            leg. This keeps every tensor rank at most three. It is incompatible
-            with ``root_qubit`` when greater than two because that would make a
-            rank-four root tensor.
+        top_arity : int or None, optional
+            Number of virtual child bonds on the structural root. By default,
+            ``max_arity=2`` uses ``top_arity=3`` when there are at least three
+            leaf qubits and no ``root_qubit``. Set ``top_arity=None`` or
+            ``top_arity=2`` to use the ordinary binary root. A value greater
+            than two is incompatible with ``root_qubit`` because that would
+            make a rank-four root tensor.
         """
         order = list(order)
         if not order and root_qubit is None:
@@ -570,6 +571,16 @@ class TreePlan:
                 root_qubit = int(root_qubit)
             except (TypeError, ValueError) as exc:
                 raise ValueError("root_qubit must be an integer or None.") from exc
+        if max_arity is not None:
+            max_arity = int(max_arity)
+            if max_arity < 2:
+                raise ValueError("max_arity must be >= 2 (or None).")
+        if top_arity is _DEFAULT_TOP_ARITY:
+            top_arity = (
+                3
+                if root_qubit is None and max_arity == 2 and len(order) >= 3
+                else None
+            )
         if top_arity is not None:
             try:
                 top_arity = int(top_arity)
@@ -598,10 +609,6 @@ class TreePlan:
             raise ValueError(
                 "structure must be 'quality', 'balanced', or 'adaptive'."
             )
-        if max_arity is not None:
-            max_arity = int(max_arity)
-            if max_arity < 2:
-                raise ValueError("max_arity must be >= 2 (or None).")
         counter = [0]
         children = {}
         parent = {}
@@ -1283,27 +1290,29 @@ class TreeLayoutFinder:
         Explicit interaction supports, used instead of extracting them from
         ``gates``.
     structure : {"quality", "balanced", "adaptive"}
-        Partition strategy passed to :meth:`TreePlan.from_order`.  ``"quality"``
-        and ``"balanced"`` build strictly-binary trees when ``max_arity=2``;
+        Partition strategy passed to :meth:`TreePlan.from_order`. ``"quality"``
+        and ``"balanced"`` build binary trees below the optional ternary root
+        when ``max_arity=2``;
         ``"adaptive"`` lets each level branch into its strongly coupled
         communities so the arity follows the gate connectivity.
     max_arity : int, None, or iterable of ints
         Maximum children per internal node.  A scalar builds one fixed tree
         (``2`` gives the binary tree; larger values or ``None`` give flatter /
         wider trees).  An iterable of candidate arities makes :meth:`run` *search*
-        them and keep the objective-best plan; this is the default
-        ``(2, 3, 4)``.  Pass a scalar to opt back into a single fixed tree.
-    top_arity : int, optional
+        them and keep the objective-best plan. The default is the scalar
+        ``2``.
+    top_arity : int or None, optional
         Override the structural root's number of virtual child bonds. With
-        ``max_arity=2, top_arity=3`` the finder builds the conventional binary
-        TTN whose top tensor has three virtual legs while all non-root internal
-        tensors remain two-in/one-out. This keeps the maximum tensor rank at
-        three. It cannot be combined with ``root_qubit`` when greater than two.
+        the default ``max_arity=2``, omitted ``top_arity`` selects ``3`` when
+        possible, so the top tensor has three virtual legs while all non-root
+        internal tensors remain two-in/one-out. Set ``top_arity=None`` or
+        ``top_arity=2`` to opt out. It cannot be greater than two with
+        ``root_qubit``.
     chi : int, optional
-        Bond-dimension budget used to bias the default arity search toward plans
-        that stay exact at ``chi`` (see :meth:`recommend_arities`).  ``None``
-        keeps the search purely objective-driven and is the static layout
-        default; it does not allocate tensors or perform truncations.
+        Bond-dimension budget used when an explicit iterable of arities is
+        searched to prefer plans that stay exact at ``chi`` (see
+        :meth:`recommend_arities`). The fixed default geometry does not
+        allocate tensors or perform truncations.
         :class:`TreeOptimizer` forwards its own ``chi`` here automatically.
     community_frac : float
         Strong-edge fraction for ``structure="adaptive"`` (see
@@ -1381,7 +1390,7 @@ class TreeLayoutFinder:
     """
 
     def __init__(self, gates=None, n=None, *, supports=None, structure="quality",
-                 max_arity=(2, 3, 4), top_arity=None,
+                 max_arity=2, top_arity=_DEFAULT_TOP_ARITY,
                  community_frac=0.35, star_frac=0.75,
                  dense_max=512, objective="path", weight_mode="count", chi=None,
                  max_operator_qubits=8, hybrid_weights=None, refine=None,
@@ -1458,6 +1467,19 @@ class TreeLayoutFinder:
         self.leaf_qubits = tuple(
             q for q in range(self.n) if q != self.root_qubit
         )
+        self.max_arity, self.arity_candidates = _normalize_arity_candidates(
+            max_arity
+        )
+        if top_arity is _DEFAULT_TOP_ARITY:
+            top_arity = (
+                3
+                if (
+                    root_qubit is None
+                    and self.max_arity == 2
+                    and len(self.leaf_qubits) >= 3
+                )
+                else None
+            )
         if top_arity is not None:
             try:
                 top_arity = int(top_arity)
@@ -1479,9 +1501,6 @@ class TreeLayoutFinder:
         self.top_arity = top_arity
         self.supports = tuple(normalized_supports)
         self.structure = structure
-        self.max_arity, self.arity_candidates = _normalize_arity_candidates(
-            max_arity
-        )
         self.chi = _validate_chi(chi)
         self.community_frac = float(community_frac)
         self.star_frac = float(star_frac)
@@ -3028,11 +3047,11 @@ class TreeLayoutFinder:
     ):
         """Return a TreePlan for the selected layout objective.
 
-        When the finder was built with a set of candidate arities (the default
-        ``max_arity=(2, 3, 4)``), this searches them with
+        A scalar ``max_arity`` (the default ``2``) builds one fixed binary
+        plan with the default ternary virtual root. When the finder is built
+        with an iterable of candidate arities, this searches them with
         :meth:`recommend_arities` -- ``chi``-aware when the finder carries a
-        ``chi`` -- and returns the objective-best plan.  A scalar ``max_arity``
-        builds one fixed plan.
+        ``chi`` -- and returns the objective-best plan.
 
         ``chi`` and the fixed-plan ``refine`` / ``search`` controls can be
         overridden for this call. Pass ``progbar=True`` to display greedy and

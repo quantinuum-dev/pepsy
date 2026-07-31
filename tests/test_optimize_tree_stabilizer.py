@@ -26,7 +26,17 @@ def _rzz(theta):
             np.exp(0.5j * theta),
             np.exp(-0.5j * theta),
         ]
-    ).astype(complex)
+).astype(complex)
+
+
+def test_tree_stab_uses_binary_tree_with_ternary_root_by_default():
+    """The stabilizer facade propagates the shared tree geometry default."""
+    optimizer = pepsy.TreeStabOptimizer(5)
+    assert optimizer.tree_optimizer.plan.top_arity == 3
+    assert optimizer.tree_optimizer.plan.is_binary()
+
+    binary_root = pepsy.TreeStabOptimizer(5, top_arity=2)
+    assert binary_root.tree_optimizer.plan.top_arity == 2
 
 
 def _rz(theta):

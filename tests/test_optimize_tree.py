@@ -910,12 +910,12 @@ def test_explicit_tree_rejects_mismatched_n():
         TreeOptimizer(None, n=4, layout=plan, run=False)
 
 
-def test_layout_finder_builds_valid_tree():
-    """With max_arity=2 the finder returns a rooted binary tree over all qubits."""
+def test_layout_finder_builds_strict_binary_tree_when_requested():
+    """Explicit top_arity=2 opts out of the ternary virtual root."""
     rng = np.random.default_rng(8)
     n = 8
     stream = _random_stream(n, 60, rng)
-    plan = TreeLayoutFinder(stream, n=n, max_arity=2).run()
+    plan = TreeLayoutFinder(stream, n=n, max_arity=2, top_arity=2).run()
     assert plan.n == n
     assert set(plan.leaf_of_qubit) == set(range(n))
     # every internal node has exactly two children
@@ -1538,19 +1538,21 @@ def test_recommend_layered_rejects_bad_chi():
         finder.recommend_layered(block_sizes=(2,), chi=0)
 
 
-def test_layout_finder_searches_arities_by_default():
-    """The finder default searches (2, 3, 4) and stays chi-blind without chi."""
+def test_layout_finder_uses_binary_ternary_root_by_default():
+    """The finder default is fixed binary below a ternary virtual root."""
     rng = np.random.default_rng(213)
     stream = _random_stream(16, 60, rng, two_qubit_frac=0.7)
     finder = TreeLayoutFinder(stream, n=16, weight_mode="operator_schmidt")
 
-    assert finder.arity_candidates == (2, 3, 4)
+    assert finder.arity_candidates is None
     assert finder.chi is None
-    # run() returns the objective-best arity from the chi-blind recommendation.
     searched = finder.run()
+    assert searched.top_arity == 3
+    assert searched.is_binary()
+
+    # Candidate arity search remains available explicitly.
     blind = finder.recommend_arities((2, 3, 4))
     assert blind["chi"] is None
-    assert searched.children == blind["plan"].children
 
     # A scalar max_arity opts back into a single fixed binary tree.
     fixed = TreeLayoutFinder(stream, n=16, max_arity=2,
@@ -1598,8 +1600,8 @@ def test_layout_finder_run_accepts_search_overrides(monkeypatch):
     assert finder._last_arity_recommendation["chi"] is None
 
 
-def test_layout_finder_default_search_is_chi_aware_with_chi():
-    """A finder built with ``chi`` makes its default arity search chi-aware."""
+def test_layout_finder_explicit_arity_search_is_chi_aware():
+    """An explicit candidate search remains ``chi``-aware."""
     rng = np.random.default_rng(214)
     stream = _random_stream(16, 60, rng, two_qubit_frac=0.7)
     finder = TreeLayoutFinder(stream, n=16, chi=64,
@@ -1608,24 +1610,25 @@ def test_layout_finder_default_search_is_chi_aware_with_chi():
     assert finder.chi == 64
     searched = finder.run()
     aware = finder.recommend_arities((2, 3, 4), chi=64)
-    assert searched.children == aware["plan"].children
+    assert searched.top_arity == 3
+    assert searched.is_binary()
     # The chi-aware search never overflows chi by more than the binary tree.
     by_arity = {c["max_arity"]: c for c in aware["candidates"]}
     chosen = by_arity[aware["recommended_max_arity"]]
     assert chosen["chi_overflow"] <= by_arity[2]["chi_overflow"]
 
 
-def test_optimizer_searches_arities_by_default_chi_aware():
-    """TreeOptimizer defaults to a chi-aware arity search using its own chi."""
+def test_optimizer_uses_binary_ternary_root_by_default():
+    """TreeOptimizer shares the fixed binary/ternary-root default."""
     rng = np.random.default_rng(215)
     stream = _random_stream(16, 60, rng, two_qubit_frac=0.7)
     opt = TreeOptimizer(stream, n=16, chi=64,
                         layout_weight_mode="operator_schmidt", run=False)
 
-    # The optimizer forwards its chi into the finder's default arity search.
-    finder = TreeLayoutFinder(stream, n=16, max_arity=(2, 3, 4), chi=64,
+    finder = TreeLayoutFinder(stream, n=16, max_arity=2, top_arity=3, chi=64,
                               weight_mode="operator_schmidt")
     assert opt.plan.children == finder.run().children
+    assert opt.plan.top_arity == 3
 
     # A scalar max_arity=2 forces a fixed binary tree through the optimizer.
     fixed = TreeOptimizer(stream, n=16, chi=64, max_arity=2,
@@ -1757,7 +1760,7 @@ def test_tree_layout_finder_plot_defaults_to_tent():
         (pepsy.cnot(), (0, 3)),
         (pepsy.cnot(), (3, 1)),
     ]
-    finder = TreeLayoutFinder(gates, n=4, max_arity=2)
+    finder = TreeLayoutFinder(gates, n=4, max_arity=2, top_arity=2)
     plan = finder.run()
     assert plan.is_binary()
     assert len(plan.children[plan.root]) == 2
@@ -2063,9 +2066,12 @@ def test_tree_layout_nni_refinement_changes_binary_topology():
         [(cnot, (0, 2)), (cnot, (0, 3))],
         n=4,
         max_arity=2,
+        top_arity=2,
         objective="path",
     )
-    initial = TreePlan.from_order(range(4), structure="balanced", max_arity=2)
+    initial = TreePlan.from_order(
+        range(4), structure="balanced", max_arity=2, top_arity=2,
+    )
 
     refined, planning = finder._refine_plan_topology(
         initial,
@@ -2261,7 +2267,7 @@ def test_truncation_report_tracks_per_edge_discarded_weight():
         [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
         dtype=complex,
     )
-    plan = TreePlan.from_order(range(4), structure="balanced")
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
     opt = TreeOptimizer(
         [(h, 0), (cnot, (0, 3))],
         n=4,
@@ -3235,6 +3241,38 @@ def test_binary_tree_supports_a_three_virtual_leg_top_tensor():
     random = pepsy.hrs_to_ttn(9, max_arity=2, top_arity=3, seed=11)
     assert random.top_arity == 3
     assert random.max_tensor_rank == 3
+
+
+def test_binary_tree_with_ternary_root_is_the_shared_default():
+    """All high-level tree builders share the rank-three root convention."""
+    plan = TreePlan.from_order(range(9), structure="balanced")
+    assert plan.top_arity == 3
+    assert plan.is_binary()
+    assert not plan.is_strictly_binary()
+
+    ordered = TreeTensorNetwork.from_order(range(9))
+    assert ordered.top_arity == 3
+    assert len(ordered.node_tensor(ordered.plan.root).inds) == 3
+
+    finder = TreeLayoutFinder([], n=9)
+    found = finder.run()
+    assert found.top_arity == 3
+    assert found.is_binary()
+
+    optimizer = TreeOptimizer([], n=9, run=False)
+    assert optimizer.plan.top_arity == 3
+    assert optimizer.tn.max_tensor_rank == 3
+
+    product = pepsy.ps_to_ttn(9)
+    random = pepsy.hrs_to_ttn(9, seed=11)
+    assert product.top_arity == random.top_arity == 3
+    assert product.max_tensor_rank == random.max_tensor_rank == 3
+
+    # A physical root cannot also use three incoming virtual bonds, and small
+    # systems naturally fall back to the ordinary binary root.
+    rooted = TreePlan.from_order(range(8), root_qubit=8)
+    assert rooted.top_arity == 2
+    assert TreePlan.from_order(range(2)).top_arity == 2
 
 
 def test_ps_to_ttn_matches_product_state_constructor_api():

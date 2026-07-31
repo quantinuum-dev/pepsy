@@ -413,7 +413,7 @@ class SimulatorPlanner:
     def _tree_layout(self, records):
         kwargs = {
             "structure": "quality",
-            "max_arity": (2, 3, 4),
+            "max_arity": 2,
             "objective": "path",
             **self.tree_layout_kwargs,
         }

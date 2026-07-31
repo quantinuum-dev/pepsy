@@ -8,10 +8,9 @@ Huang, Mendl; Quantum 7, 964, 2023; [arXiv:2206.01000](https://arxiv.org/abs/220
 By default the state is stored with one leaf tensor per qubit. A plan may
 instead designate one `root_qubit`, placing that physical index directly on
 the top tensor while every other qubit remains a leaf. Internal nodes may have
-**any arity** -- by default the layout finder *searches* a small set of
-candidate arities `(2, 3, 4)` and keeps the objective-best plan, but a fixed
-binary tree, flatter `k`-ary trees, or gate-connectivity-driven communities
-(see *Tree structure*) all work through the same machinery.
+**any arity** -- the default is a binary tree below a three-virtual-leg root,
+but a fixed binary root, flatter `k`-ary trees, or gate-connectivity-driven
+communities (see *Tree structure*) all work through the same machinery.
 
 For example, this constructs a binary detector tree whose logical qubit is the
 open top index. The root tensor has two virtual child bonds and physical index
@@ -47,9 +46,11 @@ structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
 the site fixed at the root while its path, Steiner, congestion, greedy, and
 Nevergrad objectives permute only the remaining leaf sites.
 
-For the conventional binary TTN with a three-leg top tensor, pass
-`max_arity=2, top_arity=3` to `TreePlan.from_order`, `TreeLayoutFinder`, or
-`TreeTensorNetwork.from_order`. The structural root then has three **virtual**
+The conventional binary TTN with a three-leg top tensor is the default when
+there are at least three leaves and no `root_qubit`. Pass
+`max_arity=2, top_arity=3` explicitly to `TreePlan.from_order`,
+`TreeLayoutFinder`, or `TreeTensorNetwork.from_order` for the same geometry.
+The structural root then has three **virtual**
 child bonds and no parent bond; every non-root internal tensor has two child
 bonds and one parent bond. Thus the root is still in the rank-three binary
 class, rather than being a genuinely wider tensor. `top_arity=3` is not
@@ -316,8 +317,8 @@ Because the geometry (`plan`) and naming live in `_EXTRA_PROPS`, they survive
 `.copy()` and every Quimb view, exactly like `site_ind_id` does for an MPS.
 Build one with `TreeTensorNetwork.from_plan(plan)` (product `|0...0>`),
 `TreeTensorNetwork.from_order(order, structure=...)` (build the plan and the
-product state in one step; its `top_arity=3` option exposes the ternary virtual
-root), or `TreeTensorNetwork.rand(plan, D=..., seed=...)`
+product state in one step; its default exposes the ternary virtual root), or
+`TreeTensorNetwork.rand(plan, D=..., seed=...)`
 (a random state, canonicalised around the root by default). `TreeOptimizer`
 builds and evolves its state on this class, delegating all node/qubit naming and
 geometry queries to it.
@@ -481,8 +482,8 @@ any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
   single fixed tree: `2` reproduces the strictly-binary tree exactly, larger
   values give flatter `k`-ary trees with shorter geodesics, `None` leaves the
   arity unbounded) or an iterable of candidate arities to **search**. The
-  default `(2, 3, 4)` searches those three and keeps the objective-best plan;
-  pass `max_arity=2` to force a fixed binary tree.
+  default `2` selects the fixed binary tree; pass an iterable such as
+  `(2, 3, 4)` to search candidate arities explicitly.
 - `structure="adaptive"` reads the gate-stream interaction graph and lets each
   level branch into as many children as it has strongly coupled communities
   (edges above `community_frac` times the level's strongest edge). A densely
@@ -503,11 +504,10 @@ three-virtual-bond root convention described above. `TreePlan.max_arity()` and
 `TreePlan.is_binary()` report the shape; `TreePlan.is_strictly_binary()` is the
 strict two-child-at-every-internal-node predicate.
 
-For an automatic arity choice, call
-`finder.recommend_arities((2, 3, 4))`. This is also what the finder and
-`TreeOptimizer` do **by default** (their `max_arity` defaults to `(2, 3, 4)`),
-so `TreeOptimizer(gate_stream, n=n, chi=chi)` already searches these arities --
-and does so `chi`-aware, since the optimizer forwards its own `chi` (see below).
+For an automatic arity search, call `finder.recommend_arities((2, 3, 4))`
+explicitly. The default `TreeOptimizer(gate_stream, n=n, chi=chi)` uses the
+fixed binary/ternary-root geometry; it does not allocate tensors or perform
+truncations while finding the layout.
 The result contains the recommended
 `TreePlan` plus per-candidate path, edge-load, peak-bond-growth, and local
 virtual-degree summaries. An explicit handoff looks like:
@@ -641,12 +641,11 @@ studies rather than routine short simulations. Candidate records expose their
 initial/final leaf order and the greedy/Nevergrad diagnostics under
 `candidate["planning"]`.
 
-The default search is made `chi`-aware automatically when a `chi` is available:
-`TreeLayoutFinder(gate_stream, n=n, chi=chi)` biases its default `(2, 3, 4)`
-search toward `chi`-exact structures, and `TreeOptimizer(gate_stream, n=n,
-chi=chi)` forwards its own `chi` into the finder it builds -- so the everyday
-`TreeOptimizer(gate_stream, n=n, chi=chi)` already prefers a tree that stays
-exact at `chi`. A bare finder with no `chi` searches `chi`-blind.
+When an explicit iterable of arity candidates is supplied, a `chi` biases the
+search toward `chi`-exact structures. The default fixed binary/ternary-root
+geometry is independent of `chi`; layout finding still does not allocate
+tensors or perform truncations. A bare finder with no `chi` is likewise
+static unless candidate search is explicitly requested.
 Set `max_operator_qubits` to bound dense rank diagnostics and operator
 allocation; wider native MPO events can still replay without dense
 materialization. `TreeLayoutFinder(..., max_operator_qubits=...)` uses a

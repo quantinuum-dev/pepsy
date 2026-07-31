@@ -7,7 +7,7 @@ simulator of *Simulating quantum circuits using tree tensor networks*
 A quantum state is stored as a rooted tree tensor network whose leaves carry
 physical qubit indices. One optional physical qubit may instead live on the
 root tensor. Internal nodes may have any arity: the default structure is a
-strictly-binary tree, but flatter ``k``-ary trees
+binary tree below a ternary virtual root, but flatter ``k``-ary trees
 (``max_arity``) or gate-connectivity-driven communities
 (``structure="adaptive"``) are supported unchanged.  A bundled gate stream
 ``[(gate, where), ...]`` is replayed:
@@ -61,6 +61,7 @@ from ..mps.optimizer import (
     submpo_event_parts,
 )
 from .layout import (
+    _DEFAULT_TOP_ARITY,
     TreeLayoutFinder,
     TreePlan,
     _normalize_time_decay,
@@ -320,17 +321,16 @@ class TreeOptimizer:
     max_arity : int, None, or iterable of ints
         Maximum children per internal node for the auto-built structure.  A
         scalar builds one fixed tree (``2`` = binary; larger values or ``None``
-        = flatter / wider).  An iterable of candidate arities makes the finder
-        *search* them and keep the objective-best plan; this is the default
-        ``(2, 3, 4)`` and is made ``chi``-aware automatically using this
-        optimizer's ``chi`` (structures that stay exact at ``chi`` are
-        preferred).  Pass ``max_arity=2`` to force a fixed binary tree.  Ignored
-        when an explicit ``tree`` is supplied.
-    top_arity : int, optional
+        = flatter / wider). The default is the fixed binary tree and its
+        ternary virtual root; an iterable can still be supplied explicitly to
+        search candidate arities. Ignored when an explicit ``tree`` is
+        supplied.
+    top_arity : int or None, optional
         Number of virtual child bonds on the structural root when the layout
-        is built automatically. Set ``top_arity=3`` with ``max_arity=2`` for
-        the conventional binary TTN with a three-leg top tensor. This keeps
-        every tensor rank at most three.
+        is built automatically. Omitted with ``max_arity=2`` selects
+        ``top_arity=3`` when possible, giving the conventional binary TTN
+        with a three-leg top tensor. Pass ``top_arity=None`` or ``2`` to use a
+        binary root. This keeps every tensor rank at most three.
     layout_objective : {"path", "congestion", "compression", "hypergraph", "full_tree", "hybrid"}
         Objective used when building an automatic tree.  ``"path"`` is the
         backward-compatible interaction-path heuristic; ``"congestion"``
@@ -449,7 +449,8 @@ class TreeOptimizer:
                  cutoff=_DEFAULT_CUTOFF,
                  cutoff_mode=_DEFAULT_CUTOFF_MODE, mode="auto",
                  two_site_mode=None,
-                 structure="quality", max_arity=(2, 3, 4), top_arity=None,
+                 structure="quality", max_arity=2,
+                 top_arity=_DEFAULT_TOP_ARITY,
                  community_frac=0.35,
                  star_frac=0.75, layout_objective="path",
                  layout_weight_mode="count", layout_time_decay=None,
@@ -485,8 +486,6 @@ class TreeOptimizer:
                     "layout must be a TreeLayoutFinder or TreePlan; "
                     "pass an entangled TreeTensorNetwork as state= or tn=."
                 )
-        if top_arity is None and layout_top_arity is not None:
-            top_arity = layout_top_arity
         if state is not None:
             if tn is not None:
                 raise ValueError("pass either state= or tn=, not both.")
@@ -503,20 +502,6 @@ class TreeOptimizer:
                 raise ValueError(
                     "root_qubit must be an integer or None."
                 ) from exc
-        if top_arity is not None:
-            try:
-                top_arity = int(top_arity)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "top_arity must be an integer >= 2 or None."
-                ) from exc
-            if top_arity < 2:
-                raise ValueError("top_arity must be >= 2 or None.")
-            if root_qubit is not None and top_arity != 2:
-                raise ValueError(
-                    "top_arity > 2 cannot be combined with root_qubit: "
-                    "the root would have a rank-four tensor."
-                )
         self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
         self.layout_finder = layout if isinstance(layout, TreeLayoutFinder) else None
 
@@ -587,6 +572,37 @@ class TreeOptimizer:
             raise ValueError(
                 f"root_qubit {root_qubit!r} is outside 0..{self.n - 1}."
             )
+        if top_arity is _DEFAULT_TOP_ARITY:
+            if layout_top_arity is not None:
+                top_arity = layout_top_arity if layout_top_arity >= 2 else None
+            elif isinstance(tree, TreePlan):
+                tree_top_arity = tree.top_arity
+                top_arity = tree_top_arity if tree_top_arity >= 2 else None
+            elif (
+                root_qubit is None
+                and isinstance(max_arity, Integral)
+                and int(max_arity) == 2
+                and self.n >= 3
+            ):
+                top_arity = 3
+            else:
+                top_arity = None
+        elif top_arity is None and layout_top_arity is not None:
+            top_arity = layout_top_arity
+        if top_arity is not None:
+            try:
+                top_arity = int(top_arity)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "top_arity must be an integer >= 2 or None."
+                ) from exc
+            if top_arity < 2:
+                raise ValueError("top_arity must be >= 2 or None.")
+            if root_qubit is not None and top_arity != 2:
+                raise ValueError(
+                    "top_arity > 2 cannot be combined with root_qubit: "
+                    "the root would have a rank-four tensor."
+                )
         # The TTN itself always uses compact physical positions.  This facade
         # optionally preserves caller-facing logical labels across a cap while
         # keeping Quimb's internal site/index space contiguous.
@@ -4914,11 +4930,11 @@ class TreeOptimizer:
 
     @classmethod
     def find_tree_layout(cls, gates, n=None, *, structure="quality",
-                         max_arity=(2, 3, 4), community_frac=0.35,
+                         max_arity=2, community_frac=0.35,
                          star_frac=0.75, layout_objective="path",
                          layout_weight_mode="count",
                          layout_time_decay=None, layout_time_window=None,
-                         root_qubit=None, top_arity=None,
+                         root_qubit=None, top_arity=_DEFAULT_TOP_ARITY,
                          max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS):
         """Return the :class:`TreePlan` a :class:`TreeLayoutFinder` would use."""
         return TreeLayoutFinder(
@@ -4935,9 +4951,9 @@ class TreeOptimizer:
 
     @classmethod
     def convergence_sweep(cls, gates, n=None, chi_values=(2, 4, 8, 16, 32), *,
-                          ops=None, structure="quality", max_arity=(2, 3, 4),
+                          ops=None, structure="quality", max_arity=2,
                           community_frac=0.35, star_frac=0.75, tree=None,
-                          root_qubit=None, top_arity=None,
+                          root_qubit=None, top_arity=_DEFAULT_TOP_ARITY,
                           dense_cap=1 << 14):
         """Replay ``gates`` at several ``chi`` and report convergence.
 

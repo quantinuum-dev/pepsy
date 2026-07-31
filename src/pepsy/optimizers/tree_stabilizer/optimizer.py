@@ -39,7 +39,7 @@ from ..stabilizer_tn.records import (
 from ..stabilizer_tn.settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from ..stabilizer_tn.stn_state import _CLIFFORD_GATES, _validate_bits
 from ..mps.optimizer import conditional_event_parts, submpo_event_parts
-from ..tree.layout import TreeLayoutFinder, TreePlan
+from ..tree.layout import TreeLayoutFinder, TreePlan, _DEFAULT_TOP_ARITY
 from ..tree.optimizer import (
     TreeOptimizer,
     _DEFAULT_CUTOFF,
@@ -630,7 +630,8 @@ class TreeStabOptimizer:
         tree=None,
         layout=None,
         structure="quality",
-        max_arity=(2, 3, 4),
+        max_arity=2,
+        top_arity=_DEFAULT_TOP_ARITY,
         layout_objective="path",
         layout_weight_mode="count",
         mode="auto",
@@ -792,6 +793,7 @@ class TreeStabOptimizer:
                 cutoff=cutoff,
                 structure=structure,
                 max_arity=max_arity,
+                top_arity=top_arity,
                 layout_objective=layout_objective,
                 layout_weight_mode=layout_weight_mode,
                 max_operator_qubits=max_operator_qubits,
@@ -808,6 +810,7 @@ class TreeStabOptimizer:
             finder_kwargs = dict(layout_kwargs)
             finder_kwargs.setdefault("structure", structure)
             finder_kwargs.setdefault("max_arity", max_arity)
+            finder_kwargs.setdefault("top_arity", top_arity)
             finder_kwargs.setdefault("objective", layout_objective)
             finder_kwargs.setdefault("weight_mode", layout_weight_mode)
             finder_kwargs.setdefault("chi", chi)
@@ -828,6 +831,7 @@ class TreeStabOptimizer:
             mode=mode,
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             layout_objective=layout_objective,
             layout_weight_mode=layout_weight_mode,
             tree=tree,
@@ -1128,6 +1132,7 @@ class TreeStabOptimizer:
         cutoff,
         structure,
         max_arity,
+        top_arity,
         layout_objective,
         layout_weight_mode,
         max_operator_qubits,
@@ -1161,6 +1166,7 @@ class TreeStabOptimizer:
         weight_mode = options.pop("weight_mode", layout_weight_mode)
         structure = options.pop("structure", structure)
         max_arity = options.pop("max_arity", max_arity)
+        top_arity = options.pop("top_arity", top_arity)
         objective = options.pop(
             "objective", options.pop("layout_objective", layout_objective)
         )
@@ -1196,6 +1202,7 @@ class TreeStabOptimizer:
             cutoff=cutoff,
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             layout_objective=objective,
             layout_weight_mode=weight_mode,
             max_operator_qubits=max_operator_qubits,
@@ -1211,6 +1218,7 @@ class TreeStabOptimizer:
             n=int(n),
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             objective=objective,
             weight_mode=weight_mode,
             chi=chi,
@@ -1417,6 +1425,7 @@ class TreeStabOptimizer:
         finder_kwargs = {
             "structure": self._tree.structure,
             "max_arity": self._tree.max_arity,
+            "top_arity": self._tree.top_arity,
             "objective": self._tree.layout_objective,
             "weight_mode": weight_mode,
             "chi": self._tree.chi,
@@ -1467,6 +1476,7 @@ class TreeStabOptimizer:
             mode=self._tree.mode,
             structure=self._tree.structure,
             max_arity=self._tree.max_arity,
+            top_arity=selected.top_arity,
             layout_objective=self._tree.layout_objective,
             layout_weight_mode=self._tree.layout_weight_mode,
             tree=selected,
@@ -2691,7 +2701,8 @@ class TreeStabOptimizer:
         layout_options.setdefault("weight_mode", "auto")
         finder_options = {
             "structure": kwargs.get("structure", "quality"),
-            "max_arity": kwargs.get("max_arity", (2, 3, 4)),
+            "max_arity": kwargs.get("max_arity", 2),
+            "top_arity": kwargs.get("top_arity", _DEFAULT_TOP_ARITY),
             "chi": kwargs.get("chi", 64),
             "max_operator_qubits": kwargs.get(
                 "max_operator_qubits", DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS

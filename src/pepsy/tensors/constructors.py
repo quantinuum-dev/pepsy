@@ -21,6 +21,24 @@ __all__ = [
     "hrs_to_peps", "hrs_to_mps", "hrps_to_peps", "hrps_to_mps", "hrps_to_ttn",
 ]
 
+
+_DEFAULT_TREE_TOP_ARITY = object()
+
+
+def _resolve_tree_top_arity(top_arity, *, max_arity, n, root_qubit):
+    """Resolve the constructor default without hiding explicit opt-outs."""
+    if top_arity is not _DEFAULT_TREE_TOP_ARITY:
+        return top_arity
+    if (
+        root_qubit is None
+        and isinstance(max_arity, Integral)
+        and int(max_arity) == 2
+        and int(n) >= 3
+    ):
+        return 3
+    return None
+
+
 def add_cycle(peps, bond_dim, cylinder=False):
     """Add periodic bonds to a PEPS network in x (and optional y) directions."""
     Ly = peps.Ly
@@ -619,7 +637,7 @@ def ps_to_ttn(
     root_qubit=None,
     structure="balanced",
     max_arity=2,
-    top_arity=None,
+    top_arity=_DEFAULT_TREE_TOP_ARITY,
     community_frac=0.35,
     star_frac=0.75,
     chi: int = 1,
@@ -659,7 +677,9 @@ def ps_to_ttn(
         Qubit carried by the top tensor rather than a structural leaf. When an
         explicit ``tree`` is supplied, this must match its root site.
     structure, max_arity, top_arity, community_frac, star_frac
-        Forwarded to :meth:`TreePlan.from_order`.
+        Forwarded to :meth:`TreePlan.from_order`. The default is a binary
+        tree below a three-virtual-leg root when possible; pass
+        ``top_arity=None`` or ``top_arity=2`` to use a binary root.
     chi : int, optional
         If greater than one, expand every virtual bond to at least ``chi``.
     rand_strength : float, optional
@@ -709,6 +729,9 @@ def ps_to_ttn(
     if tree is None:
         if root_qubit is not None:
             root_qubit = int(root_qubit)
+        top_arity = _resolve_tree_top_arity(
+            top_arity, max_arity=max_arity, n=n, root_qubit=root_qubit
+        )
         if order is None:
             order = (
                 range(n)
@@ -847,7 +870,7 @@ def hrs_to_ttn(
     root_qubit=None,
     structure="balanced",
     max_arity=2,
-    top_arity=None,
+    top_arity=_DEFAULT_TREE_TOP_ARITY,
     community_frac=0.35,
     star_frac=0.75,
     seed=None,
@@ -865,10 +888,11 @@ def hrs_to_ttn(
     With ``fermion=`` the physical sites receive the model's charge sectors,
     while virtual-only internal nodes are neutral and every virtual tree edge
     is a conjugate pair of Symmray charge-sector indices. ``root_qubit`` places
-    one physical site on the top tensor. ``top_arity=3`` with ``max_arity=2``
-    gives the conventional three-virtual-leg binary root. ``chi`` is the
-    requested total virtual-bond dimension. All block-sparse and fermionic
-    operations are delegated to Symmray/Quimb.
+    one physical site on the top tensor. The default gives a conventional
+    three-virtual-leg binary root when possible; ``top_arity=None`` or
+    ``top_arity=2`` selects a binary root. ``chi`` is the requested total
+    virtual-bond dimension. All block-sparse and fermionic operations are
+    delegated to Symmray/Quimb.
     """
     from ..optimizers.tree import TreePlan, TreeTensorNetwork
 
@@ -889,6 +913,9 @@ def hrs_to_ttn(
     if tree is None:
         if root_qubit is not None:
             root_qubit = int(root_qubit)
+        top_arity = _resolve_tree_top_arity(
+            top_arity, max_arity=max_arity, n=n, root_qubit=root_qubit
+        )
         if order is None:
             order = (
                 range(n)

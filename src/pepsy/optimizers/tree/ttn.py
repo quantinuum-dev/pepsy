@@ -19,9 +19,10 @@ Layout of a tree state
   ``site_tag_id.format(q)`` (default ``"I{}"``) and the physical index
   ``site_ind_id.format(q)`` (default ``"k{}"``) for qubit ``q``; these are
   structural leaves by default;
-* a plan may use ``top_arity=3`` for the conventional binary TTN with three
-  virtual bonds entering the top tensor. Other internal nodes then have two
-  child bonds plus one parent bond, so every tensor remains rank three;
+* the default auto-built plan uses ``top_arity=3`` for the conventional binary
+  TTN with three virtual bonds entering the top tensor. Other internal nodes
+  then have two child bonds plus one parent bond, so every tensor remains rank
+  three; explicit plans can use another root arity;
 * a plan may designate one additional ``root_qubit`` carried by the top tensor.
   A binary root then has exactly two child bonds plus this physical leg. Other
   internal nodes remain ancillary bond carriers. This class supplies the
@@ -45,7 +46,7 @@ import quimb.tensor as qtn
 from quimb.tensor.tensor_core import TensorNetwork
 from numbers import Integral
 
-from .layout import TreePlan
+from .layout import TreePlan, _DEFAULT_TOP_ARITY
 
 __all__ = ["TreeTensorNetwork"]
 
@@ -1940,16 +1941,16 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def from_order(cls, order, *, weights=None, structure="quality",
                    max_arity=2, community_frac=0.35, star_frac=0.75,
                    dtype=complex, site_tag_id="I{}", site_ind_id="k{}",
-                   node_tag_id="N{}", root_qubit=None, top_arity=None):
+                   node_tag_id="N{}", root_qubit=None,
+                   top_arity=_DEFAULT_TOP_ARITY):
         """Build a product state on a tree partitioned from ``order``.
 
         Convenience wrapper that first builds a :class:`TreePlan` with
         :meth:`TreePlan.from_order` and then :meth:`from_plan`.  ``max_arity``
         and ``structure`` control the tree shape (see
-        :meth:`TreePlan.from_order`); the defaults reproduce the binary tree.
-        Set ``top_arity=3`` with ``max_arity=2`` for a binary TTN with a
-        three-virtual-leg top tensor; all lower internal tensors remain rank
-        three (two child bonds plus one parent bond).
+        :meth:`TreePlan.from_order`). The default is a binary tree below a
+        three-virtual-leg top tensor when there are at least three leaves;
+        pass ``top_arity=None`` or ``top_arity=2`` to use a binary root.
         """
         plan = TreePlan.from_order(
             order, weights=weights, structure=structure,
