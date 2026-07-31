@@ -619,6 +619,7 @@ def ps_to_ttn(
     root_qubit=None,
     structure="balanced",
     max_arity=2,
+    top_arity=None,
     community_frac=0.35,
     star_frac=0.75,
     chi: int = 1,
@@ -657,7 +658,7 @@ def ps_to_ttn(
     root_qubit : int, optional
         Qubit carried by the top tensor rather than a structural leaf. When an
         explicit ``tree`` is supplied, this must match its root site.
-    structure, max_arity, community_frac, star_frac
+    structure, max_arity, top_arity, community_frac, star_frac
         Forwarded to :meth:`TreePlan.from_order`.
     chi : int, optional
         If greater than one, expand every virtual bond to at least ``chi``.
@@ -718,6 +719,7 @@ def ps_to_ttn(
             order,
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             community_frac=community_frac,
             star_frac=star_frac,
             root_qubit=root_qubit,
@@ -845,6 +847,7 @@ def hrs_to_ttn(
     root_qubit=None,
     structure="balanced",
     max_arity=2,
+    top_arity=None,
     community_frac=0.35,
     star_frac=0.75,
     seed=None,
@@ -862,9 +865,10 @@ def hrs_to_ttn(
     With ``fermion=`` the physical sites receive the model's charge sectors,
     while virtual-only internal nodes are neutral and every virtual tree edge
     is a conjugate pair of Symmray charge-sector indices. ``root_qubit`` places
-    one physical site on the top tensor. ``chi`` is the requested total
-    virtual-bond dimension. All block-sparse and fermionic operations are
-    delegated to Symmray/Quimb.
+    one physical site on the top tensor. ``top_arity=3`` with ``max_arity=2``
+    gives the conventional three-virtual-leg binary root. ``chi`` is the
+    requested total virtual-bond dimension. All block-sparse and fermionic
+    operations are delegated to Symmray/Quimb.
     """
     from ..optimizers.tree import TreePlan, TreeTensorNetwork
 
@@ -895,6 +899,7 @@ def hrs_to_ttn(
             order,
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             community_frac=community_frac,
             star_frac=star_frac,
             root_qubit=root_qubit,

@@ -47,6 +47,17 @@ structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
 the site fixed at the root while its path, Steiner, congestion, greedy, and
 Nevergrad objectives permute only the remaining leaf sites.
 
+For the conventional binary TTN with a three-leg top tensor, pass
+`max_arity=2, top_arity=3` to `TreePlan.from_order`, `TreeLayoutFinder`, or
+`TreeTensorNetwork.from_order`. The structural root then has three **virtual**
+child bonds and no parent bond; every non-root internal tensor has two child
+bonds and one parent bond. Thus the root is still in the rank-three binary
+class, rather than being a genuinely wider tensor. `top_arity=3` is not
+combined with `root_qubit`, because adding a physical root leg would make a
+rank-four tensor. `TreePlan.is_binary()` accepts this ternary-root convention,
+while `TreePlan.is_strictly_binary()` requests two children at every internal
+node.
+
 Gates are absorbed into the tree:
 
 - **single-qubit gates** are contracted into their site tensor with no bond
@@ -305,7 +316,8 @@ Because the geometry (`plan`) and naming live in `_EXTRA_PROPS`, they survive
 `.copy()` and every Quimb view, exactly like `site_ind_id` does for an MPS.
 Build one with `TreeTensorNetwork.from_plan(plan)` (product `|0...0>`),
 `TreeTensorNetwork.from_order(order, structure=...)` (build the plan and the
-product state in one step), or `TreeTensorNetwork.rand(plan, D=..., seed=...)`
+product state in one step; its `top_arity=3` option exposes the ternary virtual
+root), or `TreeTensorNetwork.rand(plan, D=..., seed=...)`
 (a random state, canonicalised around the root by default). `TreeOptimizer`
 builds and evolves its state on this class, delegating all node/qubit naming and
 geometry queries to it.
@@ -355,8 +367,8 @@ graded product tree is normalized by an exact graded norm contraction, so its
 represented norm is one rather than an arbitrary constructor scalar.
 `pepsy.hrs_to_ttn(..., chi=...)` creates the corresponding random symmetric
 tree with the requested charge-sector bond dimension and accepts the same
-`root_qubit=` option. These constructors keep the Symmray arrays native; they
-do not materialize dense tensor data.
+`root_qubit=`, `max_arity=`, and `top_arity=` options. These constructors keep
+the Symmray arrays native; they do not materialize dense tensor data.
 
 `pepsy.TreeSampler(state)` samples every registered physical site, including
 the optional root site. Its cached canonical arrays use parent, physical, then
@@ -468,12 +480,14 @@ any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
 A caller may bypass the finder entirely by passing an explicit `TreePlan` via
 `TreeOptimizer(..., tree=plan)`. `TreePlan` is exported from both `pepsy` and
 `pepsy.optimizers.tree`. Build one with
-`TreePlan.from_order(order, weights=..., structure=..., max_arity=...)`, or -- for
+`TreePlan.from_order(order, weights=..., structure=..., max_arity=..., top_arity=...)`, or -- for
 a fully hand-specified arbitrary-arity tree -- with
 `TreePlan.from_children(children, qubit_of_leaf)`, which validates that the
 children map and leaf assignment describe a single rooted tree covering qubits
-`0..n-1` exactly once. `TreePlan.max_arity()` and `TreePlan.is_binary()` report
-the shape.
+`0..n-1` exactly once. Set `top_arity=3` with `max_arity=2` for the
+three-virtual-bond root convention described above. `TreePlan.max_arity()` and
+`TreePlan.is_binary()` report the shape; `TreePlan.is_strictly_binary()` is the
+strict two-child-at-every-internal-node predicate.
 
 For an automatic arity choice, call
 `finder.recommend_arities((2, 3, 4))`. This is also what the finder and

@@ -2992,6 +2992,60 @@ def test_ttn_from_plan_is_product_state():
     assert np.linalg.norm(sv[1:]) < 1e-12
 
 
+def test_binary_tree_supports_a_three_virtual_leg_top_tensor():
+    """A ternary virtual root keeps every tensor in the binary rank class."""
+    plan = TreePlan.from_order(
+        range(9), structure="balanced", max_arity=2, top_arity=3,
+    )
+    assert plan.top_arity == 3
+    assert plan.is_binary()
+    assert not plan.is_strictly_binary()
+    assert all(
+        len(children) in (0, 2)
+        for node, children in plan.children.items()
+        if node != plan.root
+    )
+
+    ttn = TreeTensorNetwork.from_plan(plan)
+    assert len(ttn.node_tensor(plan.root).inds) == 3
+    assert ttn.max_virtual_degree == 3
+    assert ttn.max_tensor_rank == 3
+    assert ttn.validate(check_canonical=True) is ttn
+
+    ordered = TreeTensorNetwork.from_order(
+        range(9), max_arity=2, top_arity=3,
+    )
+    assert ordered.top_arity == 3
+    assert len(ordered.node_tensor(ordered.plan.root).inds) == 3
+
+    finder = TreeLayoutFinder([], n=9, max_arity=2, top_arity=3)
+    found = finder.run()
+    report = finder.report(found)
+    assert found.top_arity == 3
+    assert found.is_binary()
+    assert report["top_arity"] == 3
+    assert report["max_tensor_rank"] == 3
+
+    automatic = TreeOptimizer(
+        [], n=9, max_arity=2, top_arity=3, run=False,
+    )
+    assert automatic.plan.top_arity == 3
+    assert automatic.tn.max_tensor_rank == 3
+
+    layout = TreeLayoutFinder([], n=9, max_arity=2, top_arity=3)
+    from_layout = TreeOptimizer([], layout=layout, run=False)
+    assert from_layout.top_arity == 3
+    assert from_layout.plan.top_arity == 3
+
+    product = pepsy.ps_to_ttn(9, max_arity=2, top_arity=3)
+    assert product.top_arity == 3
+    assert product.max_tensor_rank == 3
+
+    random = pepsy.hrs_to_ttn(9, max_arity=2, top_arity=3, seed=11)
+    assert random.top_arity == 3
+    assert random.max_tensor_rank == 3
+
+
 def test_ps_to_ttn_matches_product_state_constructor_api():
     """The high-level TTN constructor mirrors ``ps_to_mps`` amplitudes."""
     theta = 0.31

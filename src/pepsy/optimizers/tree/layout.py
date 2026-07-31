@@ -486,7 +486,7 @@ class TreePlan:
     @classmethod
     def from_order(cls, order, *, weights=None, structure="quality",
                    max_arity=2, community_frac=0.35, star_frac=0.75,
-                   dense_max=512, root_qubit=None):
+                   dense_max=512, root_qubit=None, top_arity=None):
         """Build a rooted tree by recursive partition of ``order``.
 
         Parameters
@@ -525,6 +525,14 @@ class TreePlan:
             Maximum subsystem size for dense spectral reordering.
         root_qubit : int, optional
             Qubit label carried by the top tensor rather than a leaf.
+        top_arity : int, optional
+            Number of virtual child bonds on the structural root. Set
+            ``top_arity=3`` with ``max_arity=2`` for the conventional binary
+            TTN with a ternary top tensor: the root has three virtual legs and
+            every non-root internal tensor has two child legs plus one parent
+            leg. This keeps every tensor rank at most three. It is incompatible
+            with ``root_qubit`` when greater than two because that would make a
+            rank-four root tensor.
         """
         order = list(order)
         if not order and root_qubit is None:
@@ -538,6 +546,24 @@ class TreePlan:
                 root_qubit = int(root_qubit)
             except (TypeError, ValueError) as exc:
                 raise ValueError("root_qubit must be an integer or None.") from exc
+        if top_arity is not None:
+            try:
+                top_arity = int(top_arity)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "top_arity must be an integer >= 2 or None."
+                ) from exc
+            if top_arity < 2:
+                raise ValueError("top_arity must be >= 2 or None.")
+            if top_arity > len(order):
+                raise ValueError(
+                    "top_arity cannot exceed the number of non-root qubits."
+                )
+            if root_qubit is not None and top_arity != 2:
+                raise ValueError(
+                    "top_arity > 2 cannot be combined with root_qubit: "
+                    "the root would have a rank-four tensor."
+                )
         all_qubits = order + ([] if root_qubit is None else [root_qubit])
         if sorted(all_qubits) != list(range(len(all_qubits))):
             raise ValueError(
@@ -585,14 +611,15 @@ class TreePlan:
                 parent[c] = nid
             return nid
 
-        def kary_split(qs):
-            """Split ``qs`` into up to ``max_arity`` contiguous balanced parts.
+        def kary_split(qs, arity=None):
+            """Split ``qs`` into up to ``arity`` contiguous balanced parts.
 
             Cut points use ``floor(i * L / k)`` so the two-way case reproduces
             the previous ``mid = len(qs) // 2`` bisection exactly.
             """
             length = len(qs)
-            k = length if max_arity is None else max_arity
+            k = max_arity if arity is None else arity
+            k = length if k is None else k
             k = min(k, length)
             if k <= 1:
                 return [qs]
@@ -654,18 +681,19 @@ class TreePlan:
             total = m * (m - 1) // 2
             return total > 0 and strong / total >= float(star_frac)
 
-        def split(qs):
+        def split(qs, arity=None):
             """Return the child qubit-groups for the internal node over ``qs``."""
+            arity_limit = max_arity if arity is None else arity
             groups = None
-            if structure == "adaptive":
+            if structure == "adaptive" and arity is None:
                 comps = communities(qs)
                 if comps is not None and len(comps) >= 2:
-                    if max_arity is None or len(comps) <= max_arity:
+                    if arity_limit is None or len(comps) <= arity_limit:
                         groups = comps
                     # else: too many communities for the arity cap; fall back to
                     # a spectral k-ary split (deeper recursion still resolves
                     # communities inside each part).
-                elif (max_arity is None or len(qs) <= max_arity) \
+                elif (arity_limit is None or len(qs) <= arity_limit) \
                         and is_near_clique(qs):
                     # A densely coupled block is flattest as a star of leaves.
                     groups = [[q] for q in qs]
@@ -677,14 +705,15 @@ class TreePlan:
                     )
                     if spectral:
                         qs2 = spectral
-                groups = kary_split(qs2)
+                groups = kary_split(qs2, arity_limit)
             return groups
 
-        def build(qs):
+        def build(qs, *, is_root=False):
             qs = list(qs)
             if len(qs) == 1:
                 return make_leaf(qs[0])
-            groups = split(qs)
+            root_limit = top_arity if is_root else None
+            groups = split(qs, root_limit)
             if len(groups) < 2:
                 # Degenerate split (e.g. all mass in one part): force a split so
                 # recursion always makes progress.
@@ -694,7 +723,7 @@ class TreePlan:
             return make_internal(child_ids)
 
         if order:
-            root = build(order)
+            root = build(order, is_root=True)
             if root_qubit is not None and root in qubit_of_leaf:
                 # With one non-root qubit, ``build`` returns that physical
                 # leaf itself. The top qubit needs its own tensor, so insert a
@@ -984,9 +1013,60 @@ class TreePlan:
         """Return the largest number of children over all internal nodes."""
         return max((len(ch) for ch in self.children.values()), default=0)
 
-    def is_binary(self):
+    @property
+    def top_arity(self):
+        """Return the number of virtual child bonds on the structural root."""
+        return len(self.children.get(self.root, ()))
+
+    def virtual_degree(self, nid):
+        """Return the number of virtual tree bonds incident on ``nid``."""
+        if nid not in self.children:
+            raise ValueError(f"node {nid!r} is not present in the tree")
+        return len(self.children[nid]) + int(nid in self.parent)
+
+    def max_virtual_degree(self):
+        """Return the largest number of virtual bonds on any tensor."""
+        return max(
+            (self.virtual_degree(nid) for nid in self.children),
+            default=0,
+        )
+
+    def max_tensor_rank(self):
+        """Return the largest number of virtual/physical legs on a node."""
+        return max(
+            (
+                self.virtual_degree(nid)
+                + int(nid in self.qubit_of_node)
+                for nid in self.children
+            ),
+            default=0,
+        )
+
+    def is_strictly_binary(self):
         """Return ``True`` when every internal node has exactly two children."""
         return all(len(ch) in (0, 2) for ch in self.children.values())
+
+    def is_binary(self, *, allow_ternary_root=True):
+        """Return whether the tree is binary below an optional ternary root.
+
+        A conventional binary TTN has two child bonds entering every
+        non-root internal tensor and one parent bond leaving it. Its top tensor
+        has no parent, so it may carry three child bonds without increasing
+        the maximum tensor rank. Pass ``allow_ternary_root=False`` to request
+        the older strictly-binary predicate.
+        """
+        if not allow_ternary_root:
+            return self.is_strictly_binary()
+        for nid, children in self.children.items():
+            if not children:
+                continue
+            allowed = (2, 3) if nid == self.root else (2,)
+            if len(children) not in allowed:
+                return False
+        # A ternary virtual root is binary only when it has no additional
+        # physical leg. This also keeps explicit hand-built rank-four roots
+        # out of the binary predicate.
+        return self.max_tensor_rank() <= 3
 
     def max_bond_cut(self):
         """Return the largest qubit bipartition induced by any tree bond.
@@ -1155,7 +1235,8 @@ class TreePlan:
         return (
             f"TreePlan(n={self.n}, root={self.root}, "
             f"internal_nodes={n_internal}, "
-            f"max_arity={self.max_arity()}{root_site})"
+            f"max_arity={self.max_arity()}, top_arity={self.top_arity}"
+            f"{root_site})"
         )
 
 
@@ -1188,6 +1269,12 @@ class TreeLayoutFinder:
         wider trees).  An iterable of candidate arities makes :meth:`run` *search*
         them and keep the objective-best plan; this is the default
         ``(2, 3, 4)``.  Pass a scalar to opt back into a single fixed tree.
+    top_arity : int, optional
+        Override the structural root's number of virtual child bonds. With
+        ``max_arity=2, top_arity=3`` the finder builds the conventional binary
+        TTN whose top tensor has three virtual legs while all non-root internal
+        tensors remain two-in/one-out. This keeps the maximum tensor rank at
+        three. It cannot be combined with ``root_qubit`` when greater than two.
     chi : int, optional
         Bond-dimension budget used to bias the default arity search toward plans
         that stay exact at ``chi`` (see :meth:`recommend_arities`).  ``None``
@@ -1254,7 +1341,8 @@ class TreeLayoutFinder:
     """
 
     def __init__(self, gates=None, n=None, *, supports=None, structure="quality",
-                 max_arity=(2, 3, 4), community_frac=0.35, star_frac=0.75,
+                 max_arity=(2, 3, 4), top_arity=None,
+                 community_frac=0.35, star_frac=0.75,
                  dense_max=512, objective="path", weight_mode="count", chi=None,
                  max_operator_qubits=8, hybrid_weights=None, refine=None,
                  refine_budget=None, topology_refine=None, topology_budget=None,
@@ -1330,6 +1418,25 @@ class TreeLayoutFinder:
         self.leaf_qubits = tuple(
             q for q in range(self.n) if q != self.root_qubit
         )
+        if top_arity is not None:
+            try:
+                top_arity = int(top_arity)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "top_arity must be an integer >= 2 or None."
+                ) from exc
+            if top_arity < 2:
+                raise ValueError("top_arity must be >= 2 or None.")
+            if top_arity > len(self.leaf_qubits):
+                raise ValueError(
+                    "top_arity cannot exceed the number of non-root qubits."
+                )
+            if root_qubit is not None and top_arity != 2:
+                raise ValueError(
+                    "top_arity > 2 cannot be combined with root_qubit: "
+                    "the root would have a rank-four tensor."
+                )
+        self.top_arity = top_arity
         self.supports = tuple(normalized_supports)
         self.structure = structure
         self.max_arity, self.arity_candidates = _normalize_arity_candidates(
@@ -1720,7 +1827,7 @@ class TreeLayoutFinder:
         for node, children in plan.children.items():
             if not children:
                 continue
-            virtual_degree = len(children) + (1 if node in plan.parent else 0)
+            virtual_degree = plan.virtual_degree(node)
             physical_legs = 1 if node in plan.qubit_of_node else 0
             degrees.append(virtual_degree)
             log_sizes.append(virtual_degree * log_chi + physical_legs)
@@ -2095,6 +2202,7 @@ class TreeLayoutFinder:
             star_frac=self.star_frac,
             dense_max=self.dense_max,
             root_qubit=self.root_qubit,
+            top_arity=self.top_arity,
         )
         self._plan_cache[key] = (weights, plan)
         return plan
@@ -2976,6 +3084,7 @@ class TreeLayoutFinder:
                 self.leaf_qubits,
                 structure="balanced",
                 root_qubit=self.root_qubit,
+                top_arity=self.top_arity,
             )
         return self._balanced_plan_cache
 
@@ -3059,8 +3168,11 @@ class TreeLayoutFinder:
             ),
             "root": plan.root,
             "root_qubit": plan.root_qubit,
+            "top_arity": plan.top_arity,
             "is_binary": plan.is_binary(),
+            "is_strictly_binary": plan.is_strictly_binary(),
             "max_arity": plan.max_arity(),
+            "max_tensor_rank": plan.max_tensor_rank(),
             "arity_histogram": arity_histogram,
             "score": float(weighted_sum),
             "max_path": int(max(dists)) if dists else 0,
