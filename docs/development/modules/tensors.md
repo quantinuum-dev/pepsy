@@ -26,7 +26,25 @@ structure unless a change has a strong reason to split implementation.
 
 `OneDMap` maps regular 2D or 3D lattice coordinates onto a 1D path. Supported
 modes include `snake`, `snake-row-major`, `row-major`, `col-major`, `hilbert`,
-`hilbert-row-major`, and `diag`.
+`hilbert-row-major`, and `diag`. The additional `finder` mode composes an MPS
+gate-stream layout permutation with a base lattice mode. It analyzes only gate
+supports and does not construct, replay, or truncate an MPS:
+
+```python
+mapper = py.OneDMap(
+    6,
+    6,
+    mode="finder",
+    gate_stream=gates,
+    layout_kwargs={"objective": "compression", "order": "quality"},
+)
+idx2coo, coo2idx = mapper.build()
+```
+
+The gate stream's logical labels must be the compact integers `0..Lx*Ly-1`.
+Use `finder_base_mode="row-major"` when those labels were originally assigned
+by a different regular traversal. An existing MPS layout plan can be supplied
+with `finder=plan` instead of `gate_stream=`.
 
 Constructors create common tensor-network states and operators:
 

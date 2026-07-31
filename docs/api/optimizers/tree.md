@@ -428,17 +428,22 @@ every hierarchical scale, not only the root cut. It enables bounded subtree
 reconfiguration and simulated annealing by default; override these with
 `topology_refine="subtree"`, `topology_budget=`, `search="anneal"`, and
 `search_budget=`. The result is still a cheap layout proxy rather than a real
-TTN replay, so the state-aware pilot remains the final accuracy check.
+TTN replay, so the state-aware pilot remains the final accuracy check. The
+default `chi=None` leaves this as a static, chi-blind objective; supplying
+`chi` only adds cap-aware ranking and does not change the no-tensor nature of
+layout discovery.
 
 Use `order="quality"` with `finder.run()` (or set it on the finder) for the
-MPS-style higher-quality offline search. It enables bounded greedy leaf
-refinement, bounded binary-tree nearest-neighbor-interchange (NNI) topology
-refinement, and opportunistic Nevergrad refinement when Nevergrad is installed;
-otherwise it uses the deterministic NNI and leaf stages. NNI changes the
-internal grouping itself, so quality mode can improve a tree even when the
-best leaf labels are already fixed. The zero-argument `run()` path remains the
-fast deterministic candidate selection. Disable the topology stage explicitly
-with `topology_refine=None`, or bound it with `topology_budget=`.
+MPS-style high-quality offline search. Quality mode now means
+`objective="full_tree"`: it evaluates every hierarchy scale, enables bounded
+greedy leaf refinement and all-scale subtree topology refinement, and runs a
+hybrid topology-annealing/Nevergrad search when Nevergrad is available. It
+falls back explicitly to dependency-free simulated annealing otherwise. A
+finder without `order="quality"` keeps the fast deterministic zero-argument
+`run()` path.
+Disable stages explicitly with `refine=None`, `topology_refine=None`, or
+`search=None`, or bound them with `refine_budget=`, `topology_budget=`, and
+`search_budget=`.
 
 For a stream whose locality changes over time, pass `time_decay=` and/or
 `time_window=` to `TreeLayoutFinder`. A decay in `(0, 1]` weights an event by
@@ -587,11 +592,14 @@ well-aligned physical span `r` into a path with `O(log r)` tree hops, so the
 hybrid score uses path length as a replay-cost proxy while edge loads estimate
 the accuracy/bond-dimension cost.
 
-For offline quality searches, add `search="nevergrad"`. Nevergrad starts from
-the spectral/greedy plan, proposes leaf orders, and keeps its result only when
-it improves the same chi-aware objective. It never acts on a live optimizer.
-For `objective="full_tree"`, use `search="anneal"` to explore subtree
-replacements at multiple scales without the optional Nevergrad dependency.
+For offline quality searches, `search="nevergrad"` starts from the
+spectral/greedy plan, proposes leaf orders, and keeps its result only when it
+improves the same objective. `search="anneal"` explores subtree replacements
+at multiple scales without optional dependencies. For the highest-quality
+`objective="full_tree"` search, use `search="hybrid"`: it splits the bounded
+budget between topology annealing and Nevergrad leaf refinement. Quality mode
+selects this hybrid automatically when Nevergrad is installed and falls back
+to annealing otherwise. None of these stages allocates or replays a TTN.
 Install the optional dependency with `pip install pepsy[layout]`:
 
 ```python
@@ -615,7 +623,7 @@ tree_plan = finder.run(
     topology_budget=64,
     refine="greedy",
     refine_budget=64,
-    search="nevergrad",
+    search="hybrid",
     search_budget=128,
     seed=0,
     nevergrad_optimizer="OnePlusOne",
@@ -663,12 +671,35 @@ opt = py.TreeOptimizer(gate_stream, tree=choice["plan"], chi=chi)
 The pilot replays candidates on independent copies with the real tree update
 kernels and returns measured infidelity, final bond, truncation count, and
 runtime under `choice["pilot"]`. By default one bounded `order="quality"`
-candidate (greedy leaf refinement plus binary NNI topology refinement) is
+candidate (greedy leaf refinement plus topology refinement; for
+`full_tree`, this also includes bounded subtree/hybrid search) is
 reserved a pilot slot, so it cannot be rejected before state-aware replay. Use
 `include_quality=False` for the static-only candidate set. The original
 optimizer is unchanged unless `install=True` is passed. Installation is
 restricted to product initial states; an entangled TTN cannot generally be
 relaid out exactly.
+
+For the recommended closed-loop choice, use the high-level optimizer helper:
+
+```python
+choice = opt.optimize_layout(
+    objective="full_tree",
+    rounds=2,
+    pilot_candidates=4,
+    pilot_steps=64,
+    topology_budget=32,
+    search_budget=64,
+)
+```
+
+This keeps the finder tensor-free, pilots the selected candidates with the
+actual tree replay kernels, and uses each round's per-edge truncation loss,
+discarded weight, and update runtime to seed bounded NNI, subtree, and
+cross-cut leaf proposals for the next round. `choice["pilot"]["rounds"]`
+contains every round and `report["edge_diagnostics"]` identifies hot tree
+edges. `objective="full_tree"` combines all-scale static work/bond estimates
+with this short state-aware replay. `install=True` remounts the product state
+on the final plan; it remains rejected for an entangled state.
 
 Both helpers are also available from the package-level API:
 
@@ -755,13 +786,19 @@ finder and optimizer expose diagnostics to choose it:
 The same diagnostics are available as a Cotengra-style tent plot.
 `TreeLayoutFinder.plot(plan)` is the default tent view (also available as
 `plot_tent(plan)`): it keeps the raw graph at the bottom and lifts
-the selected hierarchy above its descendant sites: the raw lattice and gate
-connectivity are gray, while circular nodes use stable scale colors. Hierarchy
-edges use one uniform solid color by default. Pass `edge_color=None` to make
-each incoming edge exactly match the node it terminates at; `node_cmap` then
-controls both. Arrows are disabled by default, matching Cotengra's
-structural tent view; pass `show_edge_arrows=True` only when parent-to-child
-direction is needed.
+the selected hierarchy above its descendant sites: the raw lattice and
+optional gate connectivity are gray, while internal tree nodes use a stable order-based
+`turbo` palette by default. Incoming edges match their child nodes by default;
+pass an explicit `edge_color` for a uniform structural color. Arrows are
+disabled by default, matching Cotengra's structural tent view; pass
+`show_edge_arrows=True` only when parent-to-child direction is needed.
+When the physical background already has its own markers, pass
+`show_leaf_nodes=False` to hide the tree's physical leaf circles while keeping
+internal tree nodes and hierarchy edges visible. This is useful for a gray
+`+`-marked lattice backdrop.
+When `site_coords` are supplied, the default tent presentation projects them
+with `lattice_skew=0.30` and `lattice_rise=0.18`, and draws gray `+` markers at
+the physical sites. Override those values to use a different base projection.
 Nearest-neighbor gate edges are not duplicated over the lattice. Supplying
 `site_coords={qubit: (x, y)}` places the physical sites on an existing lattice.
 It returns `(fig, ax)` and does not mutate the plan or live TTN:

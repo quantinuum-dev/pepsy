@@ -827,6 +827,26 @@ Symmray-compatible), so it is deferred. For 2D today: order the lattice with
 ``to_mpo`` for the residual long-range terms, or evolve via a Symmray MPO-TDVP
 sweep (which preserves U1xU1 without gates).
 
+When the circuit gate stream should choose the 1D path, use the MPS layout
+finder as a mapping mode. This remains a coordinate/index operation only: it
+does not allocate an MPS or perform replay, SVD, or truncation.
+
+```python
+mapper = py.OneDMap(
+    Lx=6,
+    Ly=6,
+    mode="finder",
+    gate_stream=gates,
+    layout_kwargs={"objective": "compression", "order": "quality"},
+)
+idx2coo, coo2idx = mapper.build()
+```
+
+The finder assumes the stream uses compact logical labels in
+`range(Lx * Ly)`. Set `finder_base_mode="row-major"` (or another regular
+mode) when those labels come from a different initial traversal. A previously
+computed MPS layout plan may be passed as `finder=plan`.
+
 For a flattened MPS path, feed the same canonical bundled stream to
 ``MpsOptimizer``:
 
