@@ -1273,6 +1273,206 @@ def test_fermion_to_pepo_native_result_supports_reverse_simple_update():
     assert len(gauges) > 0
 
 
+def test_native_fermion_pepo_reverse_simple_update_matches_state_evolution():
+    """Graded operator SU must realize G.H @ O @ G, not a dense sandwich."""
+    fermion = Fermion(spinful=True, symmetry="U1")
+    left = (0, 0)
+    right = (1, 0)
+    where = (left, right)
+    mapper = OneDMap(2, 2, mode="snake")
+
+    state = pepsy.ps_to_peps(
+        (2, 2),
+        fermion=fermion,
+        occupations={(x, y): 1 for x in range(2) for y in range(2)},
+        seed=3,
+        dtype="complex128",
+        cyclic=False,
+    )
+    for x in range(2):
+        for y in range(2):
+            sign = -1 if (x + y) % 2 == 0 else 1
+            tensor = state[x, y]
+            (sector, block), = tensor.data.blocks.items()
+            tensor.data.blocks[sector] = (
+                np.asarray([1.0, sign], dtype=np.complex128)
+                .reshape(block.shape)
+                / np.sqrt(2.0)
+            )
+
+    operator = fermion.to_pepo(
+        {where: fermion.eta_pair_operator()},
+        Lx=2,
+        Ly=2,
+        mapper=mapper,
+        max_bond=64,
+        cutoff=0.0,
+        compress=False,
+        cyclic=False,
+    )
+    forward_gate = fermion.hopping_gate(0.15, t=1.0)
+    evolved_state = gate(
+        state,
+        forward_gate,
+        where=where,
+        contract="split",
+        max_bond=64,
+        cutoff=0.0,
+        inplace=False,
+    )
+
+    def expectation(psi, pepo):
+        applied = pepo.apply(psi, contract=True, compress=False)
+        return complex(np.asarray((psi.H & applied).contract(all)).item())
+
+    reference = expectation(evolved_state, operator)
+    assert abs(reference) > 1.0e-3
+
+    explicit_operator = operator.copy()
+    explicit_gauges = {}
+    explicit_operator.gauge_all_simple_(
+        gauges=explicit_gauges, progbar=False
+    )
+    explicit_operator = gate_simple(
+        explicit_operator,
+        forward_gate.H,
+        where=where,
+        which="upper",
+        gauges=explicit_gauges,
+        renorm=False,
+        smudge=1.0e-12,
+        max_bond=64,
+        cutoff=0.0,
+        contract="split",
+        inplace=False,
+    )
+    gate_simple(
+        explicit_operator,
+        forward_gate.T,
+        where=where,
+        which="lower",
+        gauges=explicit_gauges,
+        renorm=False,
+        smudge=1.0e-12,
+        max_bond=64,
+        cutoff=0.0,
+        contract="split",
+        inplace=True,
+    )
+    explicit_operator.gauge_simple_insert(explicit_gauges)
+
+    gauges = {}
+    operator.gauge_all_simple_(gauges=gauges, progbar=False)
+    reverse_evolved = gate_simple(
+        operator,
+        forward_gate.H,
+        where=where,
+        gauges=gauges,
+        renorm=False,
+        smudge=1.0e-12,
+        max_bond=64,
+        cutoff=0.0,
+        contract="split",
+        inplace=False,
+    )
+    reverse_evolved.gauge_simple_insert(gauges)
+
+    np.testing.assert_allclose(
+        expectation(state, reverse_evolved),
+        reference,
+        atol=1.0e-8,
+        rtol=1.0e-8,
+    )
+    np.testing.assert_allclose(
+        expectation(state, explicit_operator),
+        reference,
+        atol=1.0e-8,
+        rtol=1.0e-8,
+    )
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "gate_name", "operator_name"),
+    [
+        ("U1U1", "hopping", "eta"),
+        ("U1U1", "heisenberg", "number_up"),
+        ("U1", "hopping", "eta"),
+        ("U1", "heisenberg", "number_up"),
+        ("U1", "sxx", "number_up"),
+        ("Z2", "hopping", "eta"),
+        ("Z2", "heisenberg", "number_up"),
+        ("Z2", "sxx", "number_up"),
+    ],
+)
+def test_native_fermion_pepo_reverse_simple_update_unitary_families(
+    symmetry, gate_name, operator_name
+):
+    """Several native unitaries must match the exact graded local sandwich."""
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    where = ((0, 0), (1, 0))
+    mapper = OneDMap(2, 1, mode="snake")
+    if operator_name == "eta":
+        operator = fermion.eta_pair_operator()
+    else:
+        operator = fermion.operator_term(
+            [(1.0, ((where[0], "number_up"),))],
+            sites=where,
+        )
+
+    if gate_name == "hopping":
+        forward_gate = fermion.hopping_gate(0.15, t=1.0)
+    elif gate_name == "heisenberg":
+        forward_gate = fermion.heisenberg_gate(0.11)
+    else:
+        forward_gate = fermion.sxx_gate(0.13)
+
+    gate_matrix = forward_gate.fuse((0, 1), (2, 3))
+    operator_matrix = operator.fuse((0, 1), (2, 3))
+    exact_local = (
+        gate_matrix.H @ operator_matrix @ gate_matrix
+    ).reshape((4, 4, 4, 4))
+    pepo_opts = {
+        "Lx": 2,
+        "Ly": 1,
+        "mapper": mapper,
+        "max_bond": 256,
+        "cutoff": 0.0,
+        "compress": False,
+        "cyclic": False,
+    }
+    evolved = fermion.to_pepo({where: operator}, **pepo_opts)
+    exact = fermion.to_pepo({where: exact_local}, **pepo_opts)
+
+    gauges = {}
+    evolved.gauge_all_simple_(gauges=gauges, progbar=False)
+    gate_simple(
+        evolved,
+        forward_gate.H,
+        where=where,
+        gauges=gauges,
+        renorm=False,
+        smudge=1.0e-12,
+        max_bond=256,
+        cutoff=0.0,
+        contract="split",
+        inplace=True,
+    )
+    evolved.gauge_simple_insert(gauges)
+
+    def hilbert_schmidt(left, right):
+        return complex(
+            np.asarray((left.H & right).contract(all)).item()
+        )
+
+    evolved_norm = hilbert_schmidt(evolved, evolved)
+    exact_norm = hilbert_schmidt(exact, exact)
+    overlap = hilbert_schmidt(evolved, exact)
+    relative_distance = abs(
+        evolved_norm + exact_norm - 2.0 * overlap.real
+    ) / max(abs(evolved_norm), abs(exact_norm))
+    assert relative_distance < 1.0e-10
+
+
 @pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
 def test_fermion_to_pepo_supports_charged_odd_native_terms(symmetry):
     """Charged odd terms retain their native charge and dummy mode."""

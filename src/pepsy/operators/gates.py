@@ -996,6 +996,39 @@ def _symmray_sample_data_from_tn(tn):
     return None
 
 
+def _is_native_fermionic_array(value):
+    """Return whether ``value`` is a native Symmray fermionic array."""
+    return _is_symmray_array(value) and type(value).__name__.endswith(
+        "FermionicArray"
+    )
+
+
+def _is_operator_tensor_network(tn):
+    """Return whether ``tn`` exposes distinct upper and lower site legs."""
+    return (
+        callable(getattr(tn, "upper_ind", None))
+        and callable(getattr(tn, "lower_ind", None))
+    )
+
+
+def _operator_ind_id(tn, which, arity):
+    """Return an operator's live upper/lower physical-index format."""
+    attr = "upper_ind_id" if which == "upper" else "lower_ind_id"
+    return getattr(tn, attr, _ind_id_from_which(which, arity))
+
+
+def _operator_which_from_ind_id(tn, ind_id):
+    """Map an explicit operator physical-index format to its side."""
+    if ind_id == getattr(tn, "upper_ind_id", None):
+        return "upper"
+    if ind_id == getattr(tn, "lower_ind_id", None):
+        return "lower"
+    raise ValueError(
+        "gate_simple() ind_id for an operator tensor network must match its "
+        "upper_ind_id or lower_ind_id. Prefer which='upper' or 'lower'."
+    )
+
+
 def _symmray_index_map_for_tn_ind(tn, ind):
     """Return the Symmray charge map for a live tensor-network index."""
     tensor_ids = getattr(tn, "ind_map", {}).get(ind, ())
@@ -1729,7 +1762,11 @@ def gate_simple(
     * Automatic long-range SWAP routing when the two sites are not adjacent
       (works for 1D / 2D / 3D ``where`` coordinates).
     * ``which``/``ind_id`` selection for vector-like networks whose physical
-      site-index family is not the default ``k...`` family.
+      site-index family is not the default ``k...`` family, and true one-sided
+      ``which='upper'`` / ``which='lower'`` updates for MPO/PEPO operators.
+    * A graded-safe native-fermion operator sandwich. With ``which=None``, a
+      native fermionic MPO/PEPO applies the upper gate and its conjugate lower
+      gate sequentially, avoiding Quimb's dense-style eager sandwich.
     * Dimension-aware, backend-aligned internal SWAP tensors for long-range
       routing through mixed physical dimensions.
     * Optional out-of-place semantics via ``inplace=False``.
@@ -1751,8 +1788,11 @@ def gate_simple(
     gauges : dict
         Simple-update gauge dictionary keyed by bond index (mutated in place).
     which : {"upper", "lower"} | None, optional
-        Convenience selector for the physical index family. ``"upper"`` maps
-        to ``k...`` indices and ``"lower"`` maps to ``b...`` indices.
+        Convenience selector for the physical index family. On an MPO/PEPO it
+        selects a true one-sided operator update. With ``None``, operator
+        networks use sandwich semantics; native fermionic operators perform
+        this as two graded one-sided updates. On vector-like networks,
+        ``"upper"`` maps to ``k...`` and ``"lower"`` maps to ``b...``.
     ind_id : str | None, optional
         Explicit physical index format, e.g. ``"k{}"``, ``"b{},{}"``.
     renorm : bool, optional
@@ -1836,34 +1876,68 @@ def gate_simple(
         else:
             raise ValueError("Could not infer gate dimensionality from where.")
 
+        which_local = (
+            which_payload if which_payload is not None else which_default
+        )
+        is_operator = _is_operator_tensor_network(tn_work)
+        operator_which = None
         ind_id_local = ind_id
-        if which_payload is not None:
-            ind_id_local = _ind_id_from_which(which_payload, arity)
-        elif which_default is not None:
-            ind_id_local = _ind_id_from_which(which_default, arity)
+        if is_operator:
+            if which_local is not None:
+                operator_which = which_local
+                ind_id_local = _operator_ind_id(
+                    tn_work, operator_which, arity
+                )
+            elif ind_id_local is not None:
+                operator_which = _operator_which_from_ind_id(
+                    tn_work, ind_id_local
+                )
+        elif which_local is not None:
+            ind_id_local = _ind_id_from_which(which_local, arity)
 
         if ind_id_local is not None:
             _validate_gate_target_inds_exist(tn_work, where_norm, ind_id_local)
 
-        _gate_simple_one(
-            tn_work,
-            gate_payload,
-            where_norm,
-            gauges,
-            renorm=renorm,
-            smudge=smudge,
-            gate_opts=gate_opts,
-            ind_id=ind_id_local,
-            sequence=sequence,
-            path_canonize=path_canonize,
-            path_canonize_distance=path_canonize_distance,
-            path_canonize_opts=path_canonize_opts,
-            path_compress=path_compress,
-            path_compress_max_bond=path_compress_max_bond,
-            path_compress_cutoff=path_compress_cutoff,
-            path_compress_canonize_distance=path_compress_canonize_distance,
-            path_compress_opts=path_compress_opts,
-        )
+        gate_ind_id = None if is_operator else ind_id_local
+        gate_calls = ((gate_payload, operator_which, gate_ind_id),)
+        sample = _symmray_sample_data_from_tn(tn_work)
+        if (
+            is_operator
+            and operator_which is None
+            and ind_id_local is None
+            and _is_native_fermionic_array(sample)
+        ):
+            # Quimb's eager two-site sandwich forms a dense-style product of
+            # the upper gate and ``conj(gate)`` before splitting. That loses
+            # the graded ordering for native FermionicArray data. Its
+            # one-sided operator paths preserve the grading, so realize
+            # ``G @ O @ G.H`` as upper ``G`` followed by lower ``conj(G)``.
+            gate_calls = (
+                (gate_payload, "upper", None),
+                (ar.do("conj", gate_payload), "lower", None),
+            )
+
+        for gate_one, operator_which_one, ind_id_one in gate_calls:
+            _gate_simple_one(
+                tn_work,
+                gate_one,
+                where_norm,
+                gauges,
+                renorm=renorm,
+                smudge=smudge,
+                gate_opts=gate_opts,
+                ind_id=ind_id_one,
+                operator_which=operator_which_one,
+                sequence=sequence,
+                path_canonize=path_canonize,
+                path_canonize_distance=path_canonize_distance,
+                path_canonize_opts=path_canonize_opts,
+                path_compress=path_compress,
+                path_compress_max_bond=path_compress_max_bond,
+                path_compress_cutoff=path_compress_cutoff,
+                path_compress_canonize_distance=path_compress_canonize_distance,
+                path_compress_opts=path_compress_opts,
+            )
 
     return tn_work
 
@@ -2056,6 +2130,7 @@ def _gate_simple_one(
     smudge,
     gate_opts,
     ind_id=None,
+    operator_which=None,
     sequence=None,
     path_canonize=False,
     path_canonize_distance=1,
@@ -2073,6 +2148,10 @@ def _gate_simple_one(
             "gate_simple_(); use gate(..., which=...) or gate_nonlocal_opt(...) "
             "for MPO/PEPO operator layers."
         )
+
+    gate_opts = dict(gate_opts)
+    if operator_which is not None:
+        gate_opts["which"] = operator_which
 
     has_site_ind_id = hasattr(tn_work, "site_ind_id")
     old_site_ind_id = getattr(tn_work, "site_ind_id", None)
@@ -2127,13 +2206,26 @@ def _gate_simple_one_with_current_site_ind_id(
     path_compress_canonize_distance=0,
     path_compress_opts=None,
 ):
-    """Apply a single gate assuming ``site_ind_id`` has already been selected."""
+    """Apply a single gate after selecting its site-index family or side."""
     # One-site gate — no gauge update needed.
     if len(where) == 1:
-        tn_work.gate_simple_(
-            G, where=where, gauges=gauges,
-            renorm=False, smudge=smudge, inplace=True,
-        )
+        operator_which = gate_opts.get("which")
+        if operator_which is None:
+            tn_work.gate_simple_(
+                G, where=where, gauges=gauges,
+                renorm=False, smudge=smudge, inplace=True,
+            )
+        else:
+            # Quimb's one-tensor gate_simple shortcut does not forward
+            # gate_opts (including ``which``). There is no gauge to update,
+            # so use its direct one-sided operator gate instead.
+            tn_work.gate_(
+                G,
+                where=where,
+                which=operator_which,
+                contract=True,
+                inplace=True,
+            )
         return tn_work
 
     # Two-site gate — check if the sites share a bond.
@@ -2183,6 +2275,10 @@ def _gate_simple_one_with_current_site_ind_id(
         cast_complex_to_real=True,
     )
     swap_ind_id = getattr(tn_work, "site_ind_id", None)
+    operator_which = gate_opts.get("which")
+    if swap_ind_id is None and operator_which is not None:
+        ndim = len(site_a) if isinstance(site_a, (tuple, list)) else 1
+        swap_ind_id = _operator_ind_id(tn_work, operator_which, ndim)
 
     ndim = len(site_a) if isinstance(site_a, (tuple, list)) else 1
     if ndim == 1:
