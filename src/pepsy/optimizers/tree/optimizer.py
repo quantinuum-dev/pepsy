@@ -63,6 +63,8 @@ from ..mps.optimizer import (
 from .layout import (
     TreeLayoutFinder,
     TreePlan,
+    _normalize_time_decay,
+    _normalize_time_window,
     _submpo_schmidt_rank_bound,
 )
 from .ttn import TreeTensorNetwork
@@ -324,17 +326,31 @@ class TreeOptimizer:
         optimizer's ``chi`` (structures that stay exact at ``chi`` are
         preferred).  Pass ``max_arity=2`` to force a fixed binary tree.  Ignored
         when an explicit ``tree`` is supplied.
-    layout_objective : {"path", "congestion", "compression", "hybrid"}
+    top_arity : int, optional
+        Number of virtual child bonds on the structural root when the layout
+        is built automatically. Set ``top_arity=3`` with ``max_arity=2`` for
+        the conventional binary TTN with a three-leg top tensor. This keeps
+        every tensor rank at most three.
+    layout_objective : {"path", "congestion", "compression", "hypergraph", "full_tree", "hybrid"}
         Objective used when building an automatic tree.  ``"path"`` is the
         backward-compatible interaction-path heuristic; ``"congestion"``
         selects a candidate using predicted operator-Schmidt edge load;
         ``"compression"`` additionally penalizes peak/total load and the
-        estimated local tensor cost at ``chi``;
+        estimated local tensor cost at ``chi``; ``"hypergraph"`` directly
+        scores every original multi-qubit support across every crossed tree
+        edge and enables bounded leaf/NNI refinement by default;
+        ``"full_tree"`` evaluates dynamic all-scale tensor width, work, write,
+        bond pressure, and route costs;
         ``"hybrid"`` combines normalized path, peak-load, and total-load
         costs. Pass a configured :class:`TreeLayoutFinder` through ``layout=``
         to customize its hybrid weights or enable pre-simulation refinement.
     layout_weight_mode : {"count", "auto", "angle", "operator_schmidt"}
         Event weighting used by the automatic layout interaction graph.
+    layout_time_decay : float, optional
+        Optional newest-event decay passed to :class:`TreeLayoutFinder`.
+        Values are in ``(0, 1]``; omitted means no temporal weighting.
+    layout_time_window : int, optional
+        Optional trailing gate-event window passed to the layout finder.
     layout : TreeLayoutFinder or TreePlan, optional
         A precomputed layout finder or its resulting plan.  This is an alias
         layer over ``tree=`` and is useful when the finder also provides
@@ -433,9 +449,11 @@ class TreeOptimizer:
                  cutoff=_DEFAULT_CUTOFF,
                  cutoff_mode=_DEFAULT_CUTOFF_MODE, mode="auto",
                  two_site_mode=None,
-                 structure="quality", max_arity=(2, 3, 4), community_frac=0.35,
+                 structure="quality", max_arity=(2, 3, 4), top_arity=None,
+                 community_frac=0.35,
                  star_frac=0.75, layout_objective="path",
-                 layout_weight_mode="count", layout=None, tree=None,
+                 layout_weight_mode="count", layout_time_decay=None,
+                 layout_time_window=None, layout=None, tree=None,
                  root_qubit=None,
                  dtype=complex, threads=1, seed=None, run=True, tn=None,
                  state=None, track_truncation=False, track_infidelity=True,
@@ -449,6 +467,9 @@ class TreeOptimizer:
         # iterator and silently degrade to an interaction-free layout.
         if hasattr(gates, "__next__"):
             gates = list(gates)
+        layout_top_arity = (
+            layout.top_arity if isinstance(layout, TreeLayoutFinder) else None
+        )
         if layout is not None:
             if tree is not None:
                 raise ValueError("pass either layout= or tree=, not both.")
@@ -464,6 +485,8 @@ class TreeOptimizer:
                     "layout must be a TreeLayoutFinder or TreePlan; "
                     "pass an entangled TreeTensorNetwork as state= or tn=."
                 )
+        if top_arity is None and layout_top_arity is not None:
+            top_arity = layout_top_arity
         if state is not None:
             if tn is not None:
                 raise ValueError("pass either state= or tn=, not both.")
@@ -480,6 +503,20 @@ class TreeOptimizer:
                 raise ValueError(
                     "root_qubit must be an integer or None."
                 ) from exc
+        if top_arity is not None:
+            try:
+                top_arity = int(top_arity)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "top_arity must be an integer >= 2 or None."
+                ) from exc
+            if top_arity < 2:
+                raise ValueError("top_arity must be >= 2 or None.")
+            if root_qubit is not None and top_arity != 2:
+                raise ValueError(
+                    "top_arity > 2 cannot be combined with root_qubit: "
+                    "the root would have a rank-four tensor."
+                )
         self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
         self.layout_finder = layout if isinstance(layout, TreeLayoutFinder) else None
 
@@ -580,10 +617,13 @@ class TreeOptimizer:
         # iterable of candidate arities to search; forward it to the finder,
         # which normalizes and (for a candidate set) searches it chi-aware.
         self.max_arity = max_arity
+        self.top_arity = top_arity
         self.community_frac = float(community_frac)
         self.star_frac = float(star_frac)
         self.layout_objective = str(layout_objective)
         self.layout_weight_mode = str(layout_weight_mode)
+        self.layout_time_decay = _normalize_time_decay(layout_time_decay)
+        self.layout_time_window = _normalize_time_window(layout_time_window)
         self.dtype = dtype
         self.threads = None if threads is None else int(threads)
         if self.threads is not None and self.threads < 1:
@@ -620,8 +660,11 @@ class TreeOptimizer:
                 gates=self._layout_gate_stream(), n=self.n, structure=structure,
                 max_arity=self.max_arity, community_frac=self.community_frac,
                 star_frac=self.star_frac,
+                top_arity=self.top_arity,
                 objective=self.layout_objective,
                 weight_mode=self.layout_weight_mode,
+                time_decay=self.layout_time_decay,
+                time_window=self.layout_time_window,
                 chi=self.chi,
                 max_operator_qubits=self.max_operator_qubits,
                 root_qubit=root_qubit,
@@ -637,6 +680,14 @@ class TreeOptimizer:
             raise ValueError(
                 "root_qubit does not match the supplied tree/layout plan."
             )
+        if self.top_arity is not None and tree.top_arity != int(self.top_arity):
+            raise ValueError(
+                "top_arity does not match the supplied tree/layout plan."
+            )
+        if self.top_arity is None and tree.top_arity >= 2:
+            # Preserve the root convention when an explicit plan is handed in,
+            # so later candidate searches and plots keep the same topology.
+            self.top_arity = tree.top_arity
         self.plan = tree
 
         if product_state_source is not None:
@@ -1421,8 +1472,11 @@ class TreeOptimizer:
                 "n_qubits": self.n,
                 "root": self.plan.root,
                 "root_qubit": self.plan.root_qubit,
+                "top_arity": self.plan.top_arity,
                 "is_binary": self.plan.is_binary(),
+                "is_strictly_binary": self.plan.is_strictly_binary(),
                 "max_arity": self.plan.max_arity(),
+                "max_tensor_rank": self.plan.max_tensor_rank(),
             }
         return self.layout_finder.report(self.plan)
 
@@ -1431,6 +1485,7 @@ class TreeOptimizer:
         *,
         pilot_candidates=4,
         pilot_steps=None,
+        include_quality=True,
         install=False,
         progbar=False,
     ):
@@ -1438,11 +1493,15 @@ class TreeOptimizer:
 
         Static compression candidates are generated with
         ``objective="compression"`` and then replayed on independent copies
-        of the current state. The pilot uses the real tree update kernels,
-        ``chi``, cutoff, backend, and queued gate stream. The original state
-        is unchanged. By default the selected plan is returned for explicit
-        hand-off; ``install=True`` is allowed only for a product state and
-        remounts that state exactly on the selected geometry.
+        of the current state. When ``include_quality=True`` (the default), one
+        bounded greedy/NNI quality candidate is reserved a pilot slot so it
+        cannot be excluded by static surrogate ranking. The pilot uses the
+        real tree update kernels, ``chi``, cutoff, backend, and queued gate
+        stream. The original state is unchanged. By default the selected plan
+        is returned for explicit hand-off; ``install=True`` is allowed only
+        for a product state and remounts that state exactly on the selected
+        geometry. Pass ``include_quality=False`` for the previous static-only
+        candidate set.
         """
         try:
             pilot_candidates = int(pilot_candidates)
@@ -1467,15 +1526,35 @@ class TreeOptimizer:
             star_frac=self.star_frac,
             objective="compression",
             weight_mode=self.layout_weight_mode,
+            time_decay=self.layout_time_decay,
+            time_window=self.layout_time_window,
             chi=self.chi,
             max_operator_qubits=self.max_operator_qubits,
             root_qubit=self.plan.root_qubit,
+            top_arity=self.top_arity,
         )
-        candidates = finder.candidate_plans(chi=self.chi)
-        ranked = sorted(
+        candidates = finder.candidate_plans(
+            chi=self.chi,
+            include_quality=bool(include_quality),
+        )
+        ranked_static = sorted(
             candidates,
             key=lambda name: candidates[name]["objective_key"],
-        )[:pilot_candidates]
+        )
+        if include_quality:
+            quality_names = [
+                name for name in ranked_static if name.startswith("quality:")
+            ]
+            non_quality_names = [
+                name for name in ranked_static if not name.startswith("quality:")
+            ]
+            reserved_quality = quality_names[:1]
+            ranked = (
+                reserved_quality
+                + non_quality_names[: max(0, pilot_candidates - 1)]
+            )
+        else:
+            ranked = ranked_static[:pilot_candidates]
         reports = {}
         successful = []
         for name in ranked:
@@ -1496,6 +1575,7 @@ class TreeOptimizer:
                 mode=self.mode,
                 structure=self.structure,
                 max_arity=self.max_arity,
+                top_arity=self.top_arity,
                 community_frac=self.community_frac,
                 star_frac=self.star_frac,
                 tree=plan,
@@ -1562,6 +1642,7 @@ class TreeOptimizer:
             "candidates": candidates,
             "pilot": {
                 "objective": "compression",
+                "include_quality": bool(include_quality),
                 "pilot_candidates": tuple(ranked),
                 "selected_candidate": selected_name,
                 "reports": reports,
@@ -1588,9 +1669,12 @@ class TreeOptimizer:
                 star_frac=self.star_frac,
                 objective=self.layout_objective,
                 weight_mode=self.layout_weight_mode,
+                time_decay=self.layout_time_decay,
+                time_window=self.layout_time_window,
                 chi=self.chi,
                 max_operator_qubits=self.max_operator_qubits,
                 root_qubit=self.plan.root_qubit,
+                top_arity=self.top_arity,
             )
         if plan is None:
             if layout_kwargs:
@@ -1612,9 +1696,12 @@ class TreeOptimizer:
                 star_frac=self.star_frac,
                 objective=self.layout_objective,
                 weight_mode=self.layout_weight_mode,
+                time_decay=self.layout_time_decay,
+                time_window=self.layout_time_window,
                 chi=self.chi,
                 max_operator_qubits=self.max_operator_qubits,
                 root_qubit=self.plan.root_qubit,
+                top_arity=self.top_arity,
             )
         if plan is None:
             if layout_kwargs:
@@ -1636,9 +1723,12 @@ class TreeOptimizer:
                 star_frac=self.star_frac,
                 objective=self.layout_objective,
                 weight_mode=self.layout_weight_mode,
+                time_decay=self.layout_time_decay,
+                time_window=self.layout_time_window,
                 chi=self.chi,
                 max_operator_qubits=self.max_operator_qubits,
                 root_qubit=self.plan.root_qubit,
+                top_arity=self.top_arity,
             )
         if plan is None:
             if layout_kwargs:
@@ -4531,6 +4621,7 @@ class TreeOptimizer:
             mode=self.mode,
             structure=self.structure,
             max_arity=self.max_arity,
+            top_arity=self.top_arity,
             community_frac=self.community_frac,
             star_frac=self.star_frac,
             tree=self.plan,
@@ -4538,6 +4629,8 @@ class TreeOptimizer:
             threads=self.threads,
             layout_objective=self.layout_objective,
             layout_weight_mode=self.layout_weight_mode,
+            layout_time_decay=self.layout_time_decay,
+            layout_time_window=self.layout_time_window,
             track_truncation=self.track_truncation,
             track_infidelity=self.track_infidelity,
             max_intermediate_bond=self.max_intermediate_bond,
@@ -4600,14 +4693,18 @@ class TreeOptimizer:
                          max_arity=(2, 3, 4), community_frac=0.35,
                          star_frac=0.75, layout_objective="path",
                          layout_weight_mode="count",
-                         root_qubit=None,
+                         layout_time_decay=None, layout_time_window=None,
+                         root_qubit=None, top_arity=None,
                          max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS):
         """Return the :class:`TreePlan` a :class:`TreeLayoutFinder` would use."""
         return TreeLayoutFinder(
             gates=gates, n=n, structure=structure,
             max_arity=max_arity, community_frac=community_frac,
             star_frac=star_frac, objective=layout_objective,
+            top_arity=top_arity,
             weight_mode=layout_weight_mode,
+            time_decay=layout_time_decay,
+            time_window=layout_time_window,
             root_qubit=root_qubit,
             max_operator_qubits=max_operator_qubits,
         ).run()
@@ -4616,7 +4713,8 @@ class TreeOptimizer:
     def convergence_sweep(cls, gates, n=None, chi_values=(2, 4, 8, 16, 32), *,
                           ops=None, structure="quality", max_arity=(2, 3, 4),
                           community_frac=0.35, star_frac=0.75, tree=None,
-                          root_qubit=None, dense_cap=1 << 14):
+                          root_qubit=None, top_arity=None,
+                          dense_cap=1 << 14):
         """Replay ``gates`` at several ``chi`` and report convergence.
 
         The tree structure is built once and reused for every ``chi`` so the
@@ -4652,8 +4750,8 @@ class TreeOptimizer:
         chi_values = sorted(int(c) for c in chi_values)
         if tree is None:
             probe = cls(gates, n=n, structure=structure, max_arity=max_arity,
-                        community_frac=community_frac, star_frac=star_frac,
-                        root_qubit=root_qubit, run=False)
+                        top_arity=top_arity, community_frac=community_frac,
+                        star_frac=star_frac, root_qubit=root_qubit, run=False)
             tree = probe.plan
             n = probe.n
         elif n is None:

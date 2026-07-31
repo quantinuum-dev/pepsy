@@ -995,6 +995,48 @@ def test_compression_layout_reports_rank_bounds_and_tensor_cost():
     assert len(report["objective_key"]) >= 5
 
 
+def test_hypergraph_layout_scores_full_multisite_supports():
+    """Direct mode ranks original hyperedges on every crossed tree cut."""
+    rng = np.random.default_rng(104)
+    gate = _rand_unitary(3, rng)
+    supports = ((0, 1, 2), (2, 3, 4))
+    finder = TreeLayoutFinder(
+        [(gate, supports[0]), (gate, supports[1])],
+        n=5,
+        max_arity=2,
+        objective="hypergraph",
+    )
+    plan = TreePlan.from_order(range(5), structure="balanced", max_arity=2)
+
+    loads = finder.edge_loads(plan)
+    below = plan.subtree_qubit_masks()
+    expected = {edge: 0.0 for edge in loads}
+    for payload, support in zip(finder.payloads, finder.supports):
+        support_mask = sum(1 << q for q in support)
+        for edge in expected:
+            _parent, child = edge
+            left_mask = support_mask & below[child]
+            if not left_mask or left_mask == support_mask:
+                continue
+            left = tuple(q for q in support if left_mask & (1 << q))
+            expected[edge] += np.log2(finder._schmidt_rank(payload, support, left))
+
+    assert loads == pytest.approx(expected)
+    report = finder.report(plan)
+    assert report["objective"] == "hypergraph"
+    assert report["hypergraph_score"] == {
+        "max_edge_load": max(loads.values()),
+        "total_edge_load": sum(loads.values()),
+    }
+
+    recommendation = finder.recommend_arities((2,), chi=None)
+    assert recommendation["refine"] == "greedy"
+    assert recommendation["topology_refine"] == "nni"
+    assert recommendation["candidates"][0]["planning"][
+        "topology_refinement"
+    ]["method"] == "nni"
+
+
 def test_tree_compression_layout_pilot_is_non_mutating():
     """Tree pilot selection compares copied product states only."""
     gates = [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1))]
@@ -1008,8 +1050,103 @@ def test_tree_compression_layout_pilot_is_non_mutating():
 
     assert selected["selected_candidate"]
     assert selected["pilot"]["reports"]
+    assert any(
+        name.startswith("quality:")
+        for name in selected["pilot"]["pilot_candidates"]
+    )
     assert opt.plan is original_plan
     assert opt.max_bond() == 1
+
+
+def test_tree_candidate_plans_include_quality_for_state_aware_pilots():
+    """Quality refinement is exposed as an explicit pilot candidate."""
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1))],
+        n=4,
+        max_arity=2,
+        objective="compression",
+    )
+
+    candidates = finder.candidate_plans(
+        chi=2,
+        include_quality=True,
+        quality_refine_budget=2,
+        quality_topology_budget=2,
+    )
+
+    quality = candidates["quality:arity=2"]
+    assert quality["planning"]["topology_refinement"]["method"] == "nni"
+    assert quality["planning"]["refinement"]["method"] == "greedy"
+    assert quality["plan"].is_binary()
+    assert not any(
+        name.startswith("quality:")
+        for name in finder.candidate_plans(chi=2)
+    )
+
+
+def test_full_tree_profile_reports_dynamic_cost_at_all_scales():
+    """Whole-tree mode exposes width, work, demand, and scale diagnostics."""
+    gates = [
+        (pepsy.cnot(), (0, 1)),
+        (pepsy.cnot(), (1, 2)),
+        (pepsy.cnot(), (3, 4)),
+        (pepsy.cnot(), (2, 4)),
+    ]
+    finder = TreeLayoutFinder(
+        gates, n=5, max_arity=2, objective="full_tree", chi=4,
+    )
+    plan = TreePlan.from_order(range(5), structure="balanced", max_arity=2)
+    profile = finder.full_tree_profile(plan)
+
+    assert profile["event_count"] == len(gates)
+    assert profile["peak_tensor_log2"] >= 1.0
+    assert profile["peak_work_log2"] >= profile["peak_tensor_log2"]
+    assert profile["total_route_length"] > 0
+    assert profile["scales"]
+    assert all(
+        {
+            "node_count",
+            "edge_count",
+            "peak_tensor_log2",
+            "peak_edge_demand_log2",
+        } <= set(scale_info)
+        for scale_info in profile["scales"].values()
+    )
+
+    report = finder.report(plan)
+    assert report["objective"] == "full_tree"
+    assert report["full_tree"] == profile
+    assert len(report["objective_key"]) == 8
+
+
+def test_full_tree_anneals_subtrees_without_changing_binary_contract():
+    """All-scale subtree search preserves the requested binary tree shape."""
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1)),
+         (pepsy.cnot(), (2, 5)), (pepsy.cnot(), (4, 5))],
+        n=6,
+        max_arity=2,
+        top_arity=3,
+        objective="full_tree",
+        chi=4,
+        seed=7,
+    )
+    recommendation = finder.recommend_arities(
+        (2,),
+        topology_budget=3,
+        search_budget=4,
+        refine=None,
+    )
+    candidate = recommendation["candidates"][0]
+    planning = candidate["planning"]
+    plan = recommendation["plan"]
+
+    assert plan.top_arity == 3
+    assert plan.is_binary()
+    assert planning["topology_refinement"]["method"] == "subtree"
+    assert planning["search"]["method"] == "subtree"
+    assert planning["search"]["search"] == "anneal"
+    assert candidate["full_tree_profile"]["scales"]
 
 
 def test_tree_edge_loads_match_full_edge_reference():
@@ -1363,6 +1500,8 @@ def test_layout_finder_run_accepts_search_overrides(monkeypatch):
         "chi": None,
         "refine": "greedy",
         "refine_budget": 2,
+        "topology_refine": None,
+        "topology_budget": None,
         "search": None,
         "search_budget": 7,
         "seed": 11,
@@ -1787,7 +1926,68 @@ def test_tree_layout_quality_order_enables_bounded_refinement(monkeypatch):
 
     assert plan.n == 4
     assert captured["refine"] == "greedy"
+    assert captured["topology_refine"] == "nni"
     assert captured["search"] is None
+
+
+def test_tree_layout_nni_refinement_changes_binary_topology():
+    """Quality refinement can move a correlated subtree, not only labels."""
+    cnot = pepsy.cnot()
+    finder = TreeLayoutFinder(
+        [(cnot, (0, 2)), (cnot, (0, 3))],
+        n=4,
+        max_arity=2,
+        objective="path",
+    )
+    initial = TreePlan.from_order(range(4), structure="balanced", max_arity=2)
+
+    refined, planning = finder._refine_plan_topology(
+        initial,
+        chi=None,
+        budget=4,
+    )
+
+    assert refined.is_binary()
+    assert refined.children != initial.children
+    assert finder.score(refined) < finder.score(initial)
+    assert planning["accepted_moves"] >= 1
+
+
+def test_tree_layout_temporal_weights_apply_to_paths_and_edge_loads():
+    """Recent-event weighting affects both locality and Schmidt-load scoring."""
+    cnot = pepsy.cnot()
+    gates = [(cnot, (0, 1)), (cnot, (2, 3))]
+    full = TreeLayoutFinder(gates, n=4, max_arity=2, objective="congestion")
+    recent = TreeLayoutFinder(
+        gates,
+        n=4,
+        max_arity=2,
+        objective="congestion",
+        time_decay=0.5,
+        time_window=1,
+    )
+
+    assert full.temporal_factors == (1.0, 1.0)
+    assert recent.temporal_factors == (0.0, 1.0)
+    assert sum(recent.event_weights) == pytest.approx(1.0)
+    assert sum(recent.edge_loads(recent.run()).values()) < sum(
+        full.edge_loads(full.run()).values()
+    )
+    report = recent.report()
+    assert report["time_decay"] == pytest.approx(0.5)
+    assert report["time_window"] == 1
+    assert report["active_events"] == 1
+
+    opt = TreeOptimizer(
+        gates,
+        n=4,
+        max_arity=2,
+        layout_time_decay=0.5,
+        layout_time_window=1,
+        run=False,
+    )
+    assert opt.layout_finder.time_window == 1
+    assert opt.layout_finder.time_decay == pytest.approx(0.5)
 
 
 def test_tree_layout_order_rejects_non_quality_modes():
@@ -2855,6 +3055,60 @@ def test_ttn_from_plan_is_product_state():
     assert sv.shape == (2**5,)
     assert abs(sv[0] - 1.0) < 1e-12
     assert np.linalg.norm(sv[1:]) < 1e-12
+
+
+def test_binary_tree_supports_a_three_virtual_leg_top_tensor():
+    """A ternary virtual root keeps every tensor in the binary rank class."""
+    plan = TreePlan.from_order(
+        range(9), structure="balanced", max_arity=2, top_arity=3,
+    )
+    assert plan.top_arity == 3
+    assert plan.is_binary()
+    assert not plan.is_strictly_binary()
+    assert all(
+        len(children) in (0, 2)
+        for node, children in plan.children.items()
+        if node != plan.root
+    )
+
+    ttn = TreeTensorNetwork.from_plan(plan)
+    assert len(ttn.node_tensor(plan.root).inds) == 3
+    assert ttn.max_virtual_degree == 3
+    assert ttn.max_tensor_rank == 3
+    assert ttn.validate(check_canonical=True) is ttn
+
+    ordered = TreeTensorNetwork.from_order(
+        range(9), max_arity=2, top_arity=3,
+    )
+    assert ordered.top_arity == 3
+    assert len(ordered.node_tensor(ordered.plan.root).inds) == 3
+
+    finder = TreeLayoutFinder([], n=9, max_arity=2, top_arity=3)
+    found = finder.run()
+    report = finder.report(found)
+    assert found.top_arity == 3
+    assert found.is_binary()
+    assert report["top_arity"] == 3
+    assert report["max_tensor_rank"] == 3
+
+    automatic = TreeOptimizer(
+        [], n=9, max_arity=2, top_arity=3, run=False,
+    )
+    assert automatic.plan.top_arity == 3
+    assert automatic.tn.max_tensor_rank == 3
+
+    layout = TreeLayoutFinder([], n=9, max_arity=2, top_arity=3)
+    from_layout = TreeOptimizer([], layout=layout, run=False)
+    assert from_layout.top_arity == 3
+    assert from_layout.plan.top_arity == 3
+
+    product = pepsy.ps_to_ttn(9, max_arity=2, top_arity=3)
+    assert product.top_arity == 3
+    assert product.max_tensor_rank == 3
+
+    random = pepsy.hrs_to_ttn(9, max_arity=2, top_arity=3, seed=11)
+    assert random.top_arity == 3
+    assert random.max_tensor_rank == 3
 
 
 def test_ps_to_ttn_matches_product_state_constructor_api():

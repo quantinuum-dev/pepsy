@@ -47,6 +47,17 @@ structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
 the site fixed at the root while its path, Steiner, congestion, greedy, and
 Nevergrad objectives permute only the remaining leaf sites.
 
+For the conventional binary TTN with a three-leg top tensor, pass
+`max_arity=2, top_arity=3` to `TreePlan.from_order`, `TreeLayoutFinder`, or
+`TreeTensorNetwork.from_order`. The structural root then has three **virtual**
+child bonds and no parent bond; every non-root internal tensor has two child
+bonds and one parent bond. Thus the root is still in the rank-three binary
+class, rather than being a genuinely wider tensor. `top_arity=3` is not
+combined with `root_qubit`, because adding a physical root leg would make a
+rank-four tensor. `TreePlan.is_binary()` accepts this ternary-root convention,
+while `TreePlan.is_strictly_binary()` requests two children at every internal
+node.
+
 Gates are absorbed into the tree:
 
 - **single-qubit gates** are contracted into their site tensor with no bond
@@ -305,7 +316,8 @@ Because the geometry (`plan`) and naming live in `_EXTRA_PROPS`, they survive
 `.copy()` and every Quimb view, exactly like `site_ind_id` does for an MPS.
 Build one with `TreeTensorNetwork.from_plan(plan)` (product `|0...0>`),
 `TreeTensorNetwork.from_order(order, structure=...)` (build the plan and the
-product state in one step), or `TreeTensorNetwork.rand(plan, D=..., seed=...)`
+product state in one step; its `top_arity=3` option exposes the ternary virtual
+root), or `TreeTensorNetwork.rand(plan, D=..., seed=...)`
 (a random state, canonicalised around the root by default). `TreeOptimizer`
 builds and evolves its state on this class, delegating all node/qubit naming and
 geometry queries to it.
@@ -355,8 +367,8 @@ graded product tree is normalized by an exact graded norm contraction, so its
 represented norm is one rather than an arbitrary constructor scalar.
 `pepsy.hrs_to_ttn(..., chi=...)` creates the corresponding random symmetric
 tree with the requested charge-sector bond dimension and accepts the same
-`root_qubit=` option. These constructors keep the Symmray arrays native; they
-do not materialize dense tensor data.
+`root_qubit=`, `max_arity=`, and `top_arity=` options. These constructors keep
+the Symmray arrays native; they do not materialize dense tensor data.
 
 `pepsy.TreeSampler(state)` samples every registered physical site, including
 the optional root site. Its cached canonical arrays use parent, physical, then
@@ -398,11 +410,44 @@ it combines normalized path score, maximum edge load, and total edge load with
 `weight_mode` / `layout_weight_mode` option accepts `count`, `auto`, `angle`, or
 `operator_schmidt` for interaction-graph weighting.
 
+For a genuinely multi-site layout objective, use
+`objective="hypergraph"` (or `layout_objective="hypergraph"`). Each original
+gate support is kept as one hyperedge, and the finder scores its actual
+operator-Schmidt load on every crossed tree edge rather than selecting from a
+pairwise proxy alone. This mode starts from inexpensive pairwise-derived seed
+trees, then automatically performs bounded direct greedy leaf swaps and binary
+NNI topology moves using the full hyperedge score. Pass
+`refine=None, topology_refine=None` to inspect the unrefined direct score, or
+set explicit budgets for a larger search. Dense operators wider than
+`max_operator_qubits` still use the documented conservative rank bound.
+
+For a whole-tree optimization, use `objective="full_tree"` (also accepted as
+`"tree"` or `"cotengra"`). This evaluates dynamic operator-Schmidt demand,
+working tensor width, estimated work/write volume, and route length across
+every hierarchical scale, not only the root cut. It enables bounded subtree
+reconfiguration and simulated annealing by default; override these with
+`topology_refine="subtree"`, `topology_budget=`, `search="anneal"`, and
+`search_budget=`. The result is still a cheap layout proxy rather than a real
+TTN replay, so the state-aware pilot remains the final accuracy check.
+
 Use `order="quality"` with `finder.run()` (or set it on the finder) for the
 MPS-style higher-quality offline search. It enables bounded greedy leaf
-refinement and opportunistic Nevergrad refinement when Nevergrad is installed;
-otherwise it falls back to greedy refinement. The zero-argument `run()` path
-remains the fast deterministic candidate selection.
+refinement, bounded binary-tree nearest-neighbor-interchange (NNI) topology
+refinement, and opportunistic Nevergrad refinement when Nevergrad is installed;
+otherwise it uses the deterministic NNI and leaf stages. NNI changes the
+internal grouping itself, so quality mode can improve a tree even when the
+best leaf labels are already fixed. The zero-argument `run()` path remains the
+fast deterministic candidate selection. Disable the topology stage explicitly
+with `topology_refine=None`, or bound it with `topology_budget=`.
+
+For a stream whose locality changes over time, pass `time_decay=` and/or
+`time_window=` to `TreeLayoutFinder`. A decay in `(0, 1]` weights an event by
+`time_decay ** age` (the newest event has age zero), while a window keeps only
+the final events. The same factors are used for interaction paths, congestion
+candidate construction, and per-edge operator-Schmidt load estimates, so the
+diagnostics and selected plan use one consistent time model. The defaults are
+unchanged. `TreeOptimizer` exposes these as `layout_time_decay=` and
+`layout_time_window=`.
 
 For compression-first selection, use `objective="compression"` (or
 `layout_objective="compression"`). It prioritizes peak and total predicted
@@ -444,12 +489,14 @@ any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
 A caller may bypass the finder entirely by passing an explicit `TreePlan` via
 `TreeOptimizer(..., tree=plan)`. `TreePlan` is exported from both `pepsy` and
 `pepsy.optimizers.tree`. Build one with
-`TreePlan.from_order(order, weights=..., structure=..., max_arity=...)`, or -- for
+`TreePlan.from_order(order, weights=..., structure=..., max_arity=..., top_arity=...)`, or -- for
 a fully hand-specified arbitrary-arity tree -- with
 `TreePlan.from_children(children, qubit_of_leaf)`, which validates that the
 children map and leaf assignment describe a single rooted tree covering qubits
-`0..n-1` exactly once. `TreePlan.max_arity()` and `TreePlan.is_binary()` report
-the shape.
+`0..n-1` exactly once. Set `top_arity=3` with `max_arity=2` for the
+three-virtual-bond root convention described above. `TreePlan.max_arity()` and
+`TreePlan.is_binary()` report the shape; `TreePlan.is_strictly_binary()` is the
+strict two-child-at-every-internal-node predicate.
 
 For an automatic arity choice, call
 `finder.recommend_arities((2, 3, 4))`. This is also what the finder and
@@ -532,8 +579,10 @@ choice = finder.recommend_layered(
 tree_plan = choice["plan"]
 ```
 
-`refine="greedy"` is deterministic and bounded; it is opt-in so existing
-fast/default layout construction remains unchanged. A balanced TTN turns a
+`refine="greedy"` is deterministic and bounded; it is opt-in for the existing
+fast/default objectives. The explicit `objective="hypergraph"` mode enables
+greedy and NNI refinement by default because otherwise its full-support score
+would only rank a few pairwise-derived seed trees. A balanced TTN turns a
 well-aligned physical span `r` into a path with `O(log r)` tree hops, so the
 hybrid score uses path length as a replay-cost proxy while edge loads estimate
 the accuracy/bond-dimension cost.
@@ -541,6 +590,8 @@ the accuracy/bond-dimension cost.
 For offline quality searches, add `search="nevergrad"`. Nevergrad starts from
 the spectral/greedy plan, proposes leaf orders, and keeps its result only when
 it improves the same chi-aware objective. It never acts on a live optimizer.
+For `objective="full_tree"`, use `search="anneal"` to explore subtree
+replacements at multiple scales without the optional Nevergrad dependency.
 Install the optional dependency with `pip install pepsy[layout]`:
 
 ```python
@@ -560,6 +611,8 @@ layout API:
 ```python
 tree_plan = finder.run(
     order="quality",
+    topology_refine="nni",
+    topology_budget=64,
     refine="greedy",
     refine_budget=64,
     search="nevergrad",
@@ -609,9 +662,13 @@ opt = py.TreeOptimizer(gate_stream, tree=choice["plan"], chi=chi)
 
 The pilot replays candidates on independent copies with the real tree update
 kernels and returns measured infidelity, final bond, truncation count, and
-runtime under `choice["pilot"]`. The original optimizer is unchanged unless
-`install=True` is passed. Installation is restricted to product initial states;
-an entangled TTN cannot generally be relaid out exactly.
+runtime under `choice["pilot"]`. By default one bounded `order="quality"`
+candidate (greedy leaf refinement plus binary NNI topology refinement) is
+reserved a pilot slot, so it cannot be rejected before state-aware replay. Use
+`include_quality=False` for the static-only candidate set. The original
+optimizer is unchanged unless `install=True` is passed. Installation is
+restricted to product initial states; an entangled TTN cannot generally be
+relaid out exactly.
 
 Both helpers are also available from the package-level API:
 
