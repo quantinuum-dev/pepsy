@@ -520,7 +520,7 @@ Current support is:
 - spinful Fermi-Hubbard ``model="fermi_hubbard_u1u1"`` with
   ``symmetry="U1U1"``, hopping, onsite interaction, nearest-neighbor density
   interaction, and chemical-potential terms.
-- native graded MPO conversion for arbitrary neutral one- or multi-site
+- native graded MPO conversion for arbitrary homogeneous-charge one- or multi-site
   ``FermionicArray`` terms, including non-contiguous support;
 
 Spinful total-particle-number ``model="fermi_hubbard"`` with ``symmetry="U1"``
@@ -593,8 +593,66 @@ Native fermionic gate streams from the same ``Fermion`` model can be passed to
 charge blocks during replay and compression. ``fermionic=False`` remains the
 explicit Jordan-Wigner compatibility choice for ``SymHamiltonian.to_mpo``.
 
-Pass ``to_backend=`` to ``Fermion.to_mpo`` or ``Fermion.build_mpo`` when the
-returned Symmray blocks should use a selected array backend. Native MPO
+For a coordinate-keyed native operator on a 2D lattice, ``Fermion.to_pepo``
+provides the corresponding PEPO embedding:
+
+```python
+left, right = (0, 1), (2, 2)
+fermion = py.Fermion(spinful=True, symmetry="U1U1")
+term = fermion.operator_term(
+    [(1.0, ((left, "create_up"), (right, "annihilate_up")))],
+    sites=(left, right),
+    add_hc=True,
+)
+pepo = fermion.to_pepo(
+    {(left, right): term},
+    Lx=3,
+    Ly=3,
+    fermionic=True,
+    max_bond=16,
+)
+assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
+```
+
+``to_pepo`` preserves native Symmray grading and supports the spinful
+``U1U1``, ``U1``, and ``Z2`` paths as well as spinless ``U1`` and ``Z2``.
+Its current PEPO representation uses the selected snake-style MPO ordering
+for fermionic channels; the added transverse lattice bonds are dimension one
+unless periodic PEPO bonds are requested with ``cyclic=True``. Terms should
+be homogeneous in charge for one MPO/PEPO. Native ``fermionic=True``
+construction supports both neutral and nonzero charges by carrying the
+operator charge at the open MPO/PEPO boundary. For a mixed-charge collection,
+pass ``charge_sectors=True`` to receive ``{charge: PEPO}`` (or ``{charge:
+MPO}`` from ``to_mpo``). For odd-parity terms, pass ``label=`` to
+``operator_term`` so the native dummy-mode phase metadata is retained. The
+Jordan--Wigner compatibility path remains neutral-only. For a one-site
+coordinate key, use ``((x, y),)`` rather than ``(x, y)``.
+
+The same native PEPO route is available from an existing Hamiltonian or as a
+model-facing shorthand:
+
+```python
+pepo = hamiltonian.to_pepo(
+    Lx=3,
+    Ly=3,
+    mapper=py.OneDMap(3, 3, mode="snake-row-major"),
+    fermionic=True,
+)
+pepo = fermion.build_pepo(
+    {(left, right): hopping},
+    Lx=3,
+    Ly=3,
+    mapper=py.OneDMap(3, 3, mode="snake-row-major"),
+    fermionic=True,
+)
+```
+
+For Hamiltonian-builder workflows, ``ham_tn.build_pepo(..., fermion=fermion,
+fermionic=True, mapper=...)`` is equivalent.
+
+Pass ``to_backend=`` to ``Fermion.to_mpo``, ``Fermion.to_pepo``, or
+``Fermion.build_mpo`` when the returned Symmray blocks should use a selected
+array backend. Native MPO
 assembly, replay, and exact energy measurement are supported. Native MPO
 energy applies the operator sitewise as a factorized graded MPO-MPS
 contraction, so its cost is controlled by the MPS and MPO bond dimensions.

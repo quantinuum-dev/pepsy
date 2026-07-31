@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Mapping
 
 from numbers import Integral
 
@@ -476,6 +477,7 @@ class ham_tn:
         fermion=None,
         edges=None,
         fermionic=None,
+        charge_sectors=False,
         **model_params,
     ):
         """Build MPO from user interactions.
@@ -515,6 +517,10 @@ class ham_tn:
             Native graded encoding flag for the fermion-model form. ``None``
             and ``False`` select the Jordan-Wigner-compatible MPO builder;
             ``True`` selects ``Fermion.to_mpo(...)``.
+        charge_sectors : bool, default=False
+            When native construction is enabled, return one MPO per operator
+            charge as ``{charge: mpo}`` instead of requiring one homogeneous
+            charge for the whole collection.
         **model_params
             Explicit fermion couplings such as ``t``, ``U``/``V``, and ``mu``.
 
@@ -553,6 +559,8 @@ class ham_tn:
             cutoff_use = self.cutoff if cutoff is None else float(cutoff)
             mapper_use = self.mapper if mapper is None else mapper
             fermionic_use = False if fermionic is None else bool(fermionic)
+            if charge_sectors and not fermionic_use:
+                raise ValueError("charge_sectors=True requires fermionic=True.")
             mpo_builder = fermion.to_mpo if fermionic_use else fermion.build_mpo
             return mpo_builder(
                 ints,
@@ -563,10 +571,11 @@ class ham_tn:
                 compress=bool(compress_each),
                 dtype=dtype,
                 fermionic=fermionic_use,
+                charge_sectors=charge_sectors,
                 **model_params,
             )
 
-        if edges is not None or model_params or fermionic is not None:
+        if edges is not None or model_params or fermionic is not None or charge_sectors:
             raise TypeError(
                 "edges, fermion model parameters, and fermionic encoding are "
                 "only valid with fermion=... ."
@@ -709,7 +718,7 @@ class ham_tn:
 
     def build_pepo(
         self,
-        ints,
+        ints=None,
         *,
         phys_dim=2,
         max_bond=None,
@@ -718,8 +727,21 @@ class ham_tn:
         compress_each=True,
         cycle_peps=False,
         cycle_bond_dim=1,
+        mapper=None,
+        fermion=None,
+        edges=None,
+        fermionic=None,
+        charge_sectors=False,
+        **model_params,
     ):
-        """Build PEPO directly from interaction terms."""
+        """Build a PEPO from interactions or a native fermion model.
+
+        The ``fermion=...``/``edges=...`` form mirrors :meth:`build_mpo` and
+        forwards ``mapper=OneDMap(...)`` and ``fermionic=True`` to the native
+        fermion MPO builder before converting the result to a PEPO.
+        With ``charge_sectors=True``, return ``{charge: pepo}`` for a mixed
+        native operator.
+        """
         self._require_2d("build_pepo")
         mpo = self.build_mpo(
             ints,
@@ -728,7 +750,23 @@ class ham_tn:
             cutoff=cutoff,
             data_type=data_type,
             compress_each=compress_each,
+            mapper=mapper,
+            fermion=fermion,
+            edges=edges,
+            fermionic=fermionic,
+            charge_sectors=charge_sectors,
+            **model_params,
         )
+        if isinstance(mpo, Mapping):
+            return {
+                charge: self.mpo_to_pepo(
+                    sector_mpo,
+                    cycle_peps=cycle_peps,
+                    cycle_bond_dim=cycle_bond_dim,
+                    inplace=False,
+                )
+                for charge, sector_mpo in mpo.items()
+            }
         return self.mpo_to_pepo(
             mpo,
             cycle_peps=cycle_peps,

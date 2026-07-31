@@ -5474,7 +5474,13 @@ def _assemble_symmray_mpo(
     site_tag_id="I{}",
     to_backend=None,
     fermionic=False,
+    operator_charge=None,
 ):
+    operator_charge = (
+        zero
+        if operator_charge is None
+        else _normalize_group_charge(operator_charge, symmetry)
+    )
     channel_pos = [
         {channel_id: pos for pos, (channel_id, _) in enumerate(cut_channels)}
         for cut_channels in channels
@@ -5540,7 +5546,10 @@ def _assemble_symmray_mpo(
                 index_maps=index_maps,
                 duals=duals,
                 fermionic=bool(fermionic),
-                charge=zero,
+                charge=operator_charge if site == L - 1 else zero,
+                label=(site if fermionic and site == L - 1 and
+                       _charged_op_needs_fermion_string(operator_charge)
+                       else None),
             )
         )
 
@@ -5756,8 +5765,9 @@ def _add_native_term_to_mpo(
     symmetry,
     dtype,
     zero,
+    operator_charge=None,
 ):
-    """Add one neutral native fermion term as graded MPO transitions.
+    """Add one homogeneous native fermion term as graded MPO transitions.
 
     The term is split by operator Schmidt decompositions over the ordered
     support sites. This preserves Symmray's fermionic bond phases while
@@ -5800,10 +5810,15 @@ def _add_native_term_to_mpo(
         getattr(term, "charge", zero),
         symmetry,
     )
-    if term_charge != zero:
+    expected_charge = (
+        zero
+        if operator_charge is None
+        else _normalize_group_charge(operator_charge, symmetry)
+    )
+    if term_charge != expected_charge:
         raise ValueError(
-            "MPO Hamiltonian terms must be neutral under the selected "
-            f"symmetry; term {term_pos} has charge {term_charge!r}."
+            "Native MPO terms must share one homogeneous operator charge "
+            f"{expected_charge!r}; term {term_pos} has charge {term_charge!r}."
         )
 
     if n_sites == 1:
@@ -5833,8 +5848,13 @@ def _add_native_term_to_mpo(
         else:
             left_group = (0, 1)
             right_group = tuple(range(2, ndim))
+        # Absorb the singular values into the left factor for a charged
+        # operator. This leaves the total operator charge on the final site
+        # factor, where the open MPO boundary can carry it, while all
+        # preceding tensors remain neutral and can propagate identity paths.
+        absorb = "left" if expected_charge != zero else "right"
         left, _, right = current.fuse(left_group, right_group).svd(
-            absorb="right"
+            absorb=absorb
         )
         if pos == 0:
             factors.append(left.unfuse(0).transpose((2, 0, 1)))
@@ -5855,6 +5875,11 @@ def _add_native_term_to_mpo(
         bond_map = _expanded_index_charges(factor.indices[bond_axis])
         channel_ids = []
         for bond_pos, bond_charge in enumerate(bond_map):
+            if expected_charge != zero:
+                # With absorb="left", the factor bond is dual on the side
+                # that becomes the MPO's outgoing bond. Reverse its charge
+                # when installing the common MPO bond orientation.
+                bond_charge = _charge_neg(bond_charge, symmetry)
             channel_id = ("native", term_pos, interval, bond_pos)
             channel_ids.append(channel_id)
             for cut in range(sites[interval], sites[interval + 1]):
@@ -5953,15 +5978,33 @@ def _generic_symhamiltonian_to_mpo(
         hamiltonian.symmetry,
     )
     zero = _zero_like_charge(first_charge)
+    operator_charge = first_charge if fermionic else zero
+    if not fermionic and first_charge != zero:
+        raise ValueError(
+            "Charged native operator terms require fermionic=True; the "
+            "Jordan-Wigner compatibility MPO is neutral-only."
+        )
     start = ("start",)
     done = ("done",)
-    channels = [[(start, zero), (done, zero)] for _ in range(max(L - 1, 0))]
+    channels = [
+        [(start, zero), (done, _charge_neg(operator_charge, hamiltonian.symmetry))]
+        for _ in range(max(L - 1, 0))
+    ]
     transitions = [[] for _ in range(L)]
     phys_map = None
 
     for term_pos, (raw_where, where) in enumerate(zip(raw_wheres, mapped_wheres)):
         term = hamiltonian.terms[raw_where]
         term_is_fermionic = _is_fermionic_symmray_array(term)
+        term_charge = _normalize_group_charge(
+            getattr(term, "charge", zero),
+            hamiltonian.symmetry,
+        )
+        if not fermionic and term_charge != zero:
+            raise ValueError(
+                "Charged native operator terms require fermionic=True; the "
+                "Jordan-Wigner compatibility MPO is neutral-only."
+            )
         if fermionic and not term_is_fermionic:
             raise TypeError(
                 "Native fermionic MPO construction requires every Hamiltonian "
@@ -5978,6 +6021,7 @@ def _generic_symhamiltonian_to_mpo(
                 symmetry=hamiltonian.symmetry,
                 dtype=dtype,
                 zero=zero,
+                operator_charge=operator_charge,
             )
             if phys_map is None:
                 phys_map = term_phys
@@ -6082,7 +6126,20 @@ def _generic_symhamiltonian_to_mpo(
         site_tag_id=site_tag_id,
         to_backend=to_backend,
         fermionic=fermionic,
+        operator_charge=operator_charge,
     )
+
+
+def _group_symhamiltonian_terms_by_charge(hamiltonian):
+    """Group native Hamiltonian terms into homogeneous charge sectors."""
+    sectors = {}
+    for where, term in hamiltonian.terms.items():
+        charge = _normalize_group_charge(
+            getattr(term, "charge", 0),
+            hamiltonian.symmetry,
+        )
+        sectors.setdefault(charge, {})[where] = term
+    return sectors
 
 
 @dataclass(frozen=True)
@@ -6178,6 +6235,7 @@ class SymHamiltonian:
         to_backend=None,
         dtype=None,
         fermionic=False,
+        charge_sectors=False,
     ):
         """Build a symmetry-preserving MPS-chain MPO for this Hamiltonian.
 
@@ -6186,8 +6244,46 @@ class SymHamiltonian:
         Fermionic compatibility paths include parity strings along
         non-adjacent mapped hopping channels. With ``fermionic=True``, native
         Symmray ``FermionicArray`` tensors are built directly from arbitrary
-        neutral one- or multi-site terms.
+        homogeneous-charge one- or multi-site terms. The open MPO boundary
+        carries a nonzero operator charge when required.
+
+        With ``charge_sectors=True``, return a mapping from each operator
+        charge to its own homogeneous native MPO. This is the explicit way to
+        represent a mixed-charge operator such as ``I + c^\u2020`` without
+        converting it to a dense or non-symmetric tensor.
         """
+        if charge_sectors:
+            if not fermionic:
+                raise ValueError("charge_sectors=True requires fermionic=True.")
+            sectors = _group_symhamiltonian_terms_by_charge(self)
+            if not sectors:
+                raise ValueError(
+                    "At least one Hamiltonian term is required to build an MPO."
+                )
+            return {
+                charge: type(self).from_terms(
+                    self.model,
+                    self.symmetry,
+                    terms,
+                    parameters=self.parameters,
+                ).to_mpo(
+                    L=L,
+                    mapper=mapper,
+                    idx2coo=idx2coo,
+                    coo2idx=coo2idx,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    compress=compress,
+                    upper_ind_id=upper_ind_id,
+                    lower_ind_id=lower_ind_id,
+                    site_tag_id=site_tag_id,
+                    to_backend=to_backend,
+                    dtype=dtype,
+                    fermionic=True,
+                    charge_sectors=False,
+                )
+                for charge, terms in sectors.items()
+            }
         if self.explicit_terms or fermionic:
             return _generic_symhamiltonian_to_mpo(
                 self,
@@ -6357,6 +6453,77 @@ class SymHamiltonian:
             lower_ind_id=lower_ind_id,
             site_tag_id=site_tag_id,
             to_backend=to_backend,
+        )
+
+    def to_pepo(
+        self,
+        Lx=None,
+        Ly=None,
+        *,
+        mapper=None,
+        max_bond=None,
+        cutoff=1e-12,
+        compress=True,
+        cyclic=False,
+        cycle_bond_dim=1,
+        dtype=None,
+        fermionic=True,
+        to_backend=None,
+        charge_sectors=False,
+    ):
+        """Build a 2D PEPO from this Hamiltonian's native local terms.
+
+        The Hamiltonian is first assembled as an MPO using ``mapper`` and is
+        then embedded with the same snake-style ordering into a PEPO. Native
+        ``fermionic=True`` construction preserves homogeneous neutral or
+        nonzero operator charge and Symmray grading metadata. Set
+        ``fermionic=False`` to request the compatibility MPO path.
+        With ``charge_sectors=True``, return ``{charge: PEPO}`` for mixed
+        charge collections.
+        """
+        if Lx is None or Ly is None:
+            raise TypeError("to_pepo requires both Lx and Ly.")
+
+        from ..operators.hamiltonians import ham_tn
+
+        builder = ham_tn(
+            Lx=Lx,
+            Ly=Ly,
+            mapper=mapper,
+            max_bond=256 if max_bond is None else max_bond,
+            cutoff=cutoff,
+            data_type=(
+                _dtype_from_hamiltonian_terms(self.terms)
+                if dtype is None
+                else dtype
+            ),
+        )
+        mpo = self.to_mpo(
+            L=builder.L,
+            mapper=builder.mapper,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            compress=compress,
+            dtype=dtype,
+            fermionic=fermionic,
+            charge_sectors=charge_sectors,
+            to_backend=to_backend,
+        )
+        if charge_sectors:
+            return {
+                charge: builder.mpo_to_pepo(
+                    sector_mpo,
+                    cycle_peps=cyclic,
+                    cycle_bond_dim=cycle_bond_dim,
+                    inplace=True,
+                )
+                for charge, sector_mpo in mpo.items()
+            }
+        return builder.mpo_to_pepo(
+            mpo,
+            cycle_peps=cyclic,
+            cycle_bond_dim=cycle_bond_dim,
+            inplace=True,
         )
 
     def jw_trotter_gates(
@@ -9759,6 +9926,7 @@ class Fermion:
         site_tag_id="I{}",
         dtype=None,
         fermionic=False,
+        charge_sectors=False,
         to_backend=None,
         **params,
     ):
@@ -9794,7 +9962,53 @@ class Fermion:
             site_tag_id=site_tag_id,
             dtype=dtype,
             fermionic=fermionic,
+            charge_sectors=charge_sectors,
             to_backend=to_backend,
+        )
+
+    def build_pepo(
+        self,
+        terms_or_edges=None,
+        *,
+        hamiltonian=None,
+        Lx=None,
+        Ly=None,
+        mapper=None,
+        max_bond=None,
+        cutoff=1e-12,
+        compress=True,
+        cyclic=False,
+        cycle_bond_dim=1,
+        dtype=None,
+        fermionic=True,
+        charge_sectors=False,
+        to_backend=None,
+        **params,
+    ):
+        """Build a 2D PEPO from this fermion model.
+
+        This is the model-facing shorthand for :meth:`to_pepo`. Native
+        graded construction is selected by default; pass ``fermionic=False``
+        for the compatibility Jordan--Wigner MPO before PEPO embedding.
+        Coordinate-keyed explicit terms can be supplied with a
+        ``mapper=OneDMap(...)``.
+        """
+        return self.to_pepo(
+            terms_or_edges,
+            hamiltonian=hamiltonian,
+            Lx=Lx,
+            Ly=Ly,
+            mapper=mapper,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            compress=compress,
+            cyclic=cyclic,
+            cycle_bond_dim=cycle_bond_dim,
+            dtype=dtype,
+            fermionic=fermionic,
+            charge_sectors=charge_sectors,
+            to_backend=to_backend,
+            **params,
         )
 
     def to_mpo(
@@ -9814,6 +10028,7 @@ class Fermion:
         site_tag_id="I{}",
         dtype=None,
         fermionic=True,
+        charge_sectors=False,
         to_backend=None,
         **params,
     ):
@@ -9821,9 +10036,11 @@ class Fermion:
 
         ``terms_or_edges`` may be lattice edges for the built-in model or a
         mapping such as ``{(0, 2, 4): fermion.operator_term(...)}``. The
-        latter supports arbitrary neutral term support, including
+        latter supports arbitrary homogeneous-charge term support, including
         non-contiguous sites. Pass an existing :class:`SymHamiltonian` with
         ``hamiltonian=`` when the terms have already been assembled.
+        Set ``charge_sectors=True`` to return one native MPO per charge for a
+        mixed-charge term collection.
 
         The native path is selected by default and returns MPO tensors backed
         by Symmray ``FermionicArray`` objects. Set ``fermionic=False`` to
@@ -9872,7 +10089,131 @@ class Fermion:
             site_tag_id=site_tag_id,
             dtype=dtype,
             fermionic=fermionic,
+            charge_sectors=charge_sectors,
             to_backend=to_backend,
+        )
+
+    def to_pepo(
+        self,
+        terms_or_edges=None,
+        *,
+        hamiltonian=None,
+        Lx=None,
+        Ly=None,
+        mapper=None,
+        max_bond=None,
+        cutoff=1e-12,
+        compress=True,
+        cyclic=False,
+        cycle_bond_dim=1,
+        dtype=None,
+        fermionic=True,
+        charge_sectors=False,
+        to_backend=None,
+        **params,
+    ):
+        """Build a native fermionic PEPO on a 2D lattice.
+
+        The operator terms can be keyed by lattice coordinates, for example
+        ``{((0, 1), (2, 2)): term}``, where ``term`` is a native
+        :class:`symmray.FermionicArray` returned by :meth:`operator_term`.
+        Use ``{((0, 1),): term}`` for a one-site coordinate term so it is not
+        confused with a one-dimensional ``(i, j)`` edge.
+        The native graded MPO assembler is used internally with the supplied
+        one-dimensional map, and the result is embedded as a snake-style
+        PEPO. This keeps the fermionic charge and grading metadata intact,
+        including homogeneous nonzero operator charge and odd-parity dummy
+        modes; it does not pass through a dense or Jordan--Wigner
+        representation when ``fermionic=True``.
+
+        Parameters
+        ----------
+        terms_or_edges : mapping, sequence, or SymHamiltonian
+            Explicit coordinate-keyed native terms, built-in model edges, or
+            an already assembled Hamiltonian.
+        hamiltonian : SymHamiltonian, optional
+            Existing Hamiltonian. Pass either this or ``terms_or_edges``.
+        Lx, Ly : int
+            Dimensions of the 2D PEPO lattice.
+        mapper : OneDMap, optional
+            One-dimensional ordering used for the native fermionic channels.
+            The PEPO embedding currently requires ``snake`` or
+            ``snake-row-major`` ordering.
+        max_bond, cutoff, compress
+            Forwarded to native MPO construction before PEPO embedding.
+        cyclic : bool, optional
+            Add dimension-``cycle_bond_dim`` PEPO bonds around both lattice
+            directions after embedding.
+        dtype, fermionic, to_backend
+            Forwarded to :meth:`to_mpo`. Keep ``fermionic=True`` for the
+            native graded path; ``False`` explicitly selects the compatibility
+            MPO path.
+        charge_sectors : bool, optional
+            Return ``{charge: PEPO}`` for mixed-charge term collections.
+
+        Returns
+        -------
+        qtn.PEPO
+            A PEPO with coordinate tags ``I{x},{y}``, input indices
+            ``k{x},{y}``, and output indices ``b{x},{y}``.
+
+        Notes
+        -----
+        Native terms must be homogeneous: all terms in one operator
+        collection must carry the same Abelian charge, unless
+        ``charge_sectors=True`` is requested. Neutral and nonzero charges are
+        both supported with ``fermionic=True``. Odd-parity terms
+        should be created with an explicit ``label=`` in
+        :meth:`operator_term` so their dummy-mode phase metadata is retained.
+        The Jordan--Wigner compatibility path remains neutral-only.
+        The current implementation uses the MPO ordering as the fermionic
+        ordering. Thus arbitrary two-site and non-contiguous terms are
+        supported, but the PEPO's nontrivial operator bonds follow the
+        selected snake-style chain; the added transverse lattice bonds have
+        dimension one unless ``cyclic=True``.
+        """
+        if Lx is None or Ly is None:
+            raise TypeError("to_pepo requires both Lx and Ly.")
+
+        from ..operators.hamiltonians import ham_tn
+
+        builder = ham_tn(
+            Lx=Lx,
+            Ly=Ly,
+            mapper=mapper,
+            max_bond=256 if max_bond is None else max_bond,
+            cutoff=cutoff,
+            data_type=self.dtype if dtype is None else dtype,
+        )
+        mpo = self.to_mpo(
+            terms_or_edges,
+            hamiltonian=hamiltonian,
+            L=builder.L,
+            mapper=builder.mapper,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            compress=compress,
+            dtype=dtype,
+            fermionic=fermionic,
+            charge_sectors=charge_sectors,
+            to_backend=to_backend,
+            **params,
+        )
+        if charge_sectors:
+            return {
+                charge: builder.mpo_to_pepo(
+                    sector_mpo,
+                    cycle_peps=cyclic,
+                    cycle_bond_dim=cycle_bond_dim,
+                    inplace=True,
+                )
+                for charge, sector_mpo in mpo.items()
+            }
+        return builder.mpo_to_pepo(
+            mpo,
+            cycle_peps=cyclic,
+            cycle_bond_dim=cycle_bond_dim,
+            inplace=True,
         )
 
     def local_terms(self, edges, *, layout="site", **params):

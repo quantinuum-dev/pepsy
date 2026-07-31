@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import pepsy.bp.series as bp_series
 
 sr = pytest.importorskip("symmray")
 qtn = pytest.importorskip("quimb.tensor")
@@ -32,8 +33,10 @@ from pepsy.bp import (  # noqa: E402
     two_norm_bp,
     weight_pass,
 )
+from pepsy.operators.gates import gate_simple  # noqa: E402
 from pepsy.tensors import (  # noqa: E402
     Fermion,
+    OneDMap,
     SymPEPS,
     ps_to_peps,
     site_charge_alternating,
@@ -1125,6 +1128,60 @@ def test_fermionic_u1_loop_cluster_runs_on_3x4_peps(bond_dim):
     )
 
 
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_native_fermionic_pepo_simple_update_norm_and_loop_cluster(symmetry):
+    """Native PEPO evolution and D2BP norm correction compose cleanly."""
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    left, right = (0, 0), (0, 1)
+    term = fermion.operator_term(
+        [(1.0, ((left, "create_up"), (right, "annihilate_up")))],
+        sites=(left, right),
+        add_hc=True,
+    )
+    pepo = fermion.to_pepo(
+        {(left, right): term},
+        Lx=2,
+        Ly=2,
+        mapper=OneDMap(2, 2, mode="snake-row-major"),
+        max_bond=16,
+        compress=False,
+    )
+    gauges = {}
+    pepo.gauge_all_simple_(gauges=gauges, progbar=False)
+    norm_before = complex(pepo.norm())
+
+    evolved = gate_simple(
+        pepo,
+        fermion.hopping_gate(0.001, t=1.0).H,
+        where=(left, right),
+        gauges=gauges,
+        max_bond=16,
+        cutoff=1e-10,
+        contract="split",
+        renorm=False,
+        inplace=False,
+    )
+    norm_after = complex(evolved.norm())
+    correction = loop_cluster_expand(
+        evolved,
+        gloops=2,
+        norm="2norm",
+        max_iterations=100,
+        tol=1e-8,
+        diis=False,
+        progbar=False,
+    )
+
+    assert len(gauges) > 0
+    assert np.isfinite(norm_before.real)
+    assert np.isfinite(norm_after.real)
+    assert np.isfinite(float(np.real(correction.estimate)))
+    assert all(
+        type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in evolved
+    )
+
+
 def _fermionic_symmetry_cases():
     return (
         (
@@ -2004,6 +2061,64 @@ def test_cyclic_native_open_series_honors_contraction_cost_limits():
     for cost in rho_info["open_rho_term_costs"].values():
         assert cost["flops_log10"] <= 11.0
         assert cost["peak_memory_log2"] <= 30.0
+
+
+def test_cyclic_native_route_skips_open_edge_enumeration(monkeypatch):
+    """Cluster fallback is selected before combinatorial edge discovery."""
+    state = SymPEPS.random(
+        2,
+        3,
+        symmetry="U1",
+        bond_dim=2,
+        phys_dim=2,
+        fermionic=True,
+        cyclic=(True, True),
+        seed=2201,
+        dtype="complex128",
+    )
+    where = ((0, 0), (1, 2))
+    bp = two_norm_bp(
+        state.tn,
+        max_iterations=100,
+        tol=1e-9,
+        diis=False,
+    )
+
+    def fail_if_enumerated(*args, **kwargs):
+        raise AssertionError("cyclic native route enumerated edge terms")
+
+    monkeypatch.setattr(
+        bp_series,
+        "_iter_open_edge_loops",
+        fail_if_enumerated,
+    )
+    rho_info = {}
+    rho = partial_trace_open_loop_series_expand(
+        state.tn,
+        where,
+        cluster_size=3,
+        max_terms=0,
+        messages=bp.messages,
+        run_bp=False,
+        info=rho_info,
+    )
+    assert rho_info["open_rho_native_route"] == "graded_cluster_compatible"
+    np.testing.assert_allclose(np.trace(rho.to_dense()), 1.0, atol=1e-12)
+
+    scalar_info = {}
+    value = compute_local_expectation_open_loop_series(
+        state.tn,
+        {where: Fermion(spinful=False, symmetry="U1").density_operator()},
+        cluster_size=3,
+        max_terms=0,
+        messages=bp.messages,
+        run_bp=False,
+        info=scalar_info,
+    )
+    assert scalar_info["open_scalar_native_route"] == (
+        "graded_cluster_compatible"
+    )
+    assert np.isfinite(value)
 
 
 def test_explicit_edge_loop_series_preserves_dense_edge_degree_terms():

@@ -18,7 +18,7 @@ from ..backends.convert import (
     infer_backend_converter_from_sample,
     resolve_backend_sample_data_from_tn,
 )
-from ..tensors.core import add_cycle, id_to_mpo, id_to_pepo
+from ..tensors.core import OneDMap, add_cycle, id_to_mpo, id_to_pepo
 
 __all__ = [
     "gate",
@@ -2798,6 +2798,119 @@ def _apply_gate_3d(
     return tn
 
 
+def _native_gate_stream_info(gate_list, *, allow_charged=False):
+    """Validate a native Symmray fermionic gate stream and describe its legs."""
+    native_flags = [
+        _is_block_sparse_array(gate_op)
+        and "FermionicArray" in type(gate_op).__name__
+        for gate_op in gate_list
+    ]
+    if not any(native_flags):
+        return None
+    if not all(native_flags):
+        raise TypeError(
+            "Native FermionicArray gate builders cannot mix native and dense gates."
+        )
+
+    from ..tensors.symmetric import (  # pylint: disable=import-outside-toplevel
+        _expanded_index_charges,
+        _normalize_group_charge,
+        _zero_like_charge,
+    )
+
+    first = gate_list[0]
+    rank = len(first.indices)
+    if rank not in {2, 4}:
+        raise ValueError(
+            "Native gate builders support one- and two-site FermionicArray gates."
+        )
+    n_sites = rank // 2
+    symmetry = str(getattr(first, "symmetry", ""))
+    first_charge = _normalize_group_charge(
+        getattr(first, "charge", 0), symmetry
+    )
+    zero = _zero_like_charge(first_charge)
+    gate_charges = [
+        _normalize_group_charge(getattr(gate_op, "charge", zero), symmetry)
+        for gate_op in gate_list
+    ]
+    if not allow_charged and any(charge != zero for charge in gate_charges):
+        raise ValueError(
+            "Native gate builders require charge-neutral gates by default; "
+            "pass allow_charged=True to accumulate a charged operator stream."
+        )
+
+    output_maps = tuple(
+        tuple(_expanded_index_charges(index))
+        for index in first.indices[:n_sites]
+    )
+    input_maps = tuple(
+        tuple(_expanded_index_charges(index))
+        for index in first.indices[n_sites:]
+    )
+    if output_maps != input_maps:
+        raise ValueError(
+            "Native gate builders require matching upper/lower physical charge maps."
+        )
+    if any(site_map != output_maps[0] for site_map in output_maps[1:]):
+        raise ValueError(
+            "Native gate builders require one physical charge map per site."
+        )
+
+    for gate_op, gate_charge in zip(gate_list[1:], gate_charges[1:]):
+        if len(gate_op.indices) != rank:
+            raise ValueError("All native gates must act on the same number of sites.")
+        if str(getattr(gate_op, "symmetry", "")) != symmetry:
+            raise ValueError("All native gates must use the same Abelian symmetry.")
+        if not allow_charged and gate_charge != zero:
+            raise ValueError("All native gates must be charge-neutral.")
+        gate_maps = tuple(
+            tuple(_expanded_index_charges(index))
+            for index in gate_op.indices
+        )
+        if gate_maps[:n_sites] != output_maps or gate_maps[n_sites:] != input_maps:
+            raise ValueError(
+                "All native gates must use the same physical charge maps."
+            )
+
+    return {
+        "fermionic": True,
+        "n_sites": n_sites,
+        "phys_map": list(output_maps[0]),
+        "symmetry": symmetry,
+        "zero": zero,
+        "dtype": getattr(first, "dtype", np.dtype("complex128")),
+        "gate_charges": tuple(gate_charges),
+    }
+
+
+def _native_identity_mpo(length, info, *, max_bond, cutoff):
+    """Build an identity MPO whose tensors use native fermionic sectors."""
+    from ..tensors.symmetric import (  # pylint: disable=import-outside-toplevel
+        _assemble_symmray_mpo,
+    )
+
+    start = ("start",)
+    done = ("done",)
+    channels = [
+        [(start, info["zero"]), (done, info["zero"])]
+        for _ in range(max(length - 1, 0))
+    ]
+    return _assemble_symmray_mpo(
+        L=length,
+        channels=channels,
+        transitions=[[] for _ in range(length)],
+        phys_map=info["phys_map"],
+        symmetry=info["symmetry"],
+        zero=info["zero"],
+        dtype=info["dtype"],
+        max_bond=max_bond,
+        cutoff=cutoff,
+        compress=False,
+        fermionic=True,
+    )
+
+
 def build_pepo_from_gates(
     gates,
     wheres=None,
@@ -2810,6 +2923,8 @@ def build_pepo_from_gates(
     sequence="auto",
     contract="reduce-split",
     ind_id="k{},{}",
+    mapper=None,
+    allow_charged=False,
 ):
     """Build a PEPO from gate-style input on top of a PEPO identity.
 
@@ -2846,6 +2961,13 @@ def build_pepo_from_gates(
         path, which is usually cheaper than ``"split"`` for PEPO/PEPS tensors.
     ind_id : str, default="k{},{}"
         Physical index format used for PEPO ket-family indices.
+    mapper : OneDMap | None, optional
+        Optional lattice-to-chain mapping used when native Symmray gates are
+        supplied. PEPO conversion supports ``snake`` and
+        ``snake-row-major`` mappings.
+    allow_charged : bool, default=False
+        Allow native gates with nonzero operator charge. The returned PEPO
+        then carries the accumulated charge of the sequential gate product.
 
     Returns
     -------
@@ -2856,19 +2978,70 @@ def build_pepo_from_gates(
     gate_list = [g for g, _ in entries]
     where_list = [w for _, w in entries]
 
+    native_info = _native_gate_stream_info(
+        gate_list,
+        allow_charged=allow_charged,
+    )
+
     coords = [c for w in where_list for c in w]
-    Lx = max(i for i, _ in coords) + 1
-    Ly = max(j for _, j in coords) + 1
+    if mapper is None:
+        Lx = max(i for i, _ in coords) + 1
+        Ly = max(j for _, j in coords) + 1
+    else:
+        if not isinstance(mapper, OneDMap):
+            raise TypeError("mapper must be a 2D OneDMap instance or None.")
+        try:
+            mapper_shape = tuple(mapper.shape)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise TypeError("mapper must be a 2D OneDMap instance or None.") from exc
+        if len(mapper_shape) != 2:
+            raise ValueError("build_pepo_from_gates requires a 2D OneDMap.")
+        Lx, Ly = mapper_shape
 
-    pepo = pepo_.copy() if pepo_ is not None else id_to_pepo(Lx, Ly, dtype=dtype)
-    if pepo_ is None and cyclic:
-        pepo = add_cycle(pepo, 1)
+    if native_info is not None and pepo_ is None:
+        from .hamiltonians import ham_tn  # pylint: disable=import-outside-toplevel
 
-    for tensor in pepo:
-        tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
+        builder = ham_tn(
+            Lx=Lx,
+            Ly=Ly,
+            mapper=mapper,
+            max_bond=256 if max_bond is None else max_bond,
+            cutoff=cutoff,
+            data_type=native_info["dtype"],
+        )
+        mpo = _native_identity_mpo(
+            builder.L,
+            native_info,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+        pepo = builder.mpo_to_pepo(
+            mpo,
+            cycle_peps=cyclic,
+            cycle_bond_dim=1,
+            inplace=True,
+        )
+    elif native_info is not None:
+        pepo = pepo_.copy()
+        if any(not _is_block_sparse_array(tensor.data) for tensor in pepo):
+            raise TypeError(
+                "Native FermionicArray gates require a native Symmray PEPO."
+            )
+    else:
+        pepo = pepo_.copy() if pepo_ is not None else id_to_pepo(Lx, Ly, dtype=dtype)
+        if pepo_ is None and cyclic:
+            pepo = add_cycle(pepo, 1)
+
+    if native_info is None:
+        for tensor in pepo:
+            tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for gate_op, where_norm in zip(gate_list, where_list):
-        gate_use = _to_ket_gate_layout(gate_op, len(where_norm))
+        gate_use = (
+            gate_op
+            if native_info is not None
+            else _to_ket_gate_layout(gate_op, len(where_norm))
+        )
 
         gate(
             pepo, gate_use, where_norm,
@@ -2925,6 +3098,7 @@ def build_mpo_from_gates(
     max_bond=16,
     contract="reduce-split",
     ind_id="k{}",
+    allow_charged=False,
 ):
     """Build an MPO from gate-style input on top of an MPO identity.
 
@@ -2957,6 +3131,9 @@ def build_mpo_from_gates(
         path, which is usually cheaper than ``"split"`` for MPO tensors.
     ind_id : str, default="k{}"
         Physical index format used for MPO ket-family indices.
+    allow_charged : bool, default=False
+        Allow native gates with nonzero operator charge. The returned MPO
+        then carries the accumulated charge of the sequential gate product.
 
     Returns
     -------
@@ -2967,18 +3144,42 @@ def build_mpo_from_gates(
     gate_list = [g for g, _ in entries]
     where_list = [w for _, w in entries]
 
+    native_info = _native_gate_stream_info(
+        gate_list,
+        allow_charged=allow_charged,
+    )
+
     coords = [int(i) for w in where_list for i in w]
     L = max(coords) + 1
 
-    mpo = mpo_.copy() if mpo_ is not None else id_to_mpo(
-        L, phys_dim=2, dtype=dtype, cyclic=cyclic
-    )
+    if native_info is not None and mpo_ is None:
+        mpo = _native_identity_mpo(
+            L,
+            native_info,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+    else:
+        mpo = mpo_.copy() if mpo_ is not None else id_to_mpo(
+            L, phys_dim=2, dtype=dtype, cyclic=cyclic
+        )
 
-    for tensor in mpo:
-        tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
+    if native_info is not None and any(
+        not _is_block_sparse_array(tensor.data) for tensor in mpo
+    ):
+        raise TypeError(
+            "Native FermionicArray gates require a native Symmray MPO."
+        )
+    if native_info is None:
+        for tensor in mpo:
+            tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for gate_op, where_norm in zip(gate_list, where_list):
-        gate_use = _to_ket_gate_layout(gate_op, len(where_norm))
+        gate_use = (
+            gate_op
+            if native_info is not None
+            else _to_ket_gate_layout(gate_op, len(where_norm))
+        )
 
         gate(
             mpo,

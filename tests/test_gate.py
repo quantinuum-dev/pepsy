@@ -22,6 +22,7 @@ from pepsy.operators.gates import (
     y,
     z,
 )
+from pepsy.tensors.core import OneDMap
 
 
 def _dense_numpy(tn, out_inds):
@@ -1085,6 +1086,85 @@ def test_build_mpo_from_gates_accepts_single_gate_where():
     )
     assert mpo.L == 2
     assert mpo.max_bond() >= 1
+
+
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_native_fermion_gate_builders_preserve_symmetry(symmetry):
+    """Gate-to-MPO/PEPO builders accept native fermionic gates."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors.symmetric import Fermion
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    hopping_gate = fermion.hopping_gate(0.01, t=1.0)
+    mpo = build_mpo_from_gates(
+        hopping_gate,
+        where=(0, 1),
+        max_bond=8,
+        contract="split",
+    )
+    pepo = build_pepo_from_gates(
+        hopping_gate,
+        where=((0, 0), (0, 1)),
+        mapper=OneDMap(2, 2, mode="snake-row-major"),
+        max_bond=8,
+        contract="split",
+    )
+
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in mpo)
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
+    assert pepo.Lx == 2
+    assert pepo.Ly == 2
+
+
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_native_charged_gate_builders_require_opt_in(symmetry):
+    """Charged native gate streams work when explicitly enabled."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors.symmetric import Fermion, symmray_mpo_summary
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    charged_gate = fermion.operator_term(
+        [(1.0, ((0, "double"), (1, "annihilate_up")))],
+        sites=(0, 1),
+        label="charged_gate_builder",
+    )
+
+    with pytest.raises(ValueError, match="allow_charged=True"):
+        build_mpo_from_gates(
+            charged_gate,
+            where=(0, 1),
+            max_bond=16,
+            contract="split",
+        )
+    with pytest.raises(ValueError, match="allow_charged=True"):
+        build_pepo_from_gates(
+            charged_gate,
+            where=((0, 0), (0, 1)),
+            mapper=OneDMap(2, 2, mode="snake-row-major"),
+            max_bond=16,
+            contract="split",
+        )
+
+    mpo = build_mpo_from_gates(
+        charged_gate,
+        where=(0, 1),
+        allow_charged=True,
+        max_bond=16,
+        contract="split",
+    )
+    pepo = build_pepo_from_gates(
+        charged_gate,
+        where=((0, 0), (0, 1)),
+        mapper=OneDMap(2, 2, mode="snake-row-major"),
+        allow_charged=True,
+        max_bond=16,
+        contract="split",
+    )
+
+    assert symmray_mpo_summary(mpo)["total_charge"] == charged_gate.charge
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in mpo)
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
+    assert any(tensor.data.charge != fermion.zero_charge for tensor in pepo)
 
 
 def test_build_mpo_from_gates_forwards_max_bond_to_gate(monkeypatch):

@@ -24,8 +24,11 @@ from __future__ import annotations
 from collections import Counter, deque
 from dataclasses import dataclass, field
 import functools
+import heapq
 from itertools import combinations
 import operator
+import sys
+import time
 from typing import Any, ClassVar
 
 import autoray as ar
@@ -49,6 +52,10 @@ from ._symmray import (
 )
 
 __all__ = [
+    "OpenLoopEnumerationLimitError",
+    "OpenLoopObservableTerm",
+    "OpenLoopSeriesDiagnostic",
+    "OpenLoopSeriesDiagnosticCache",
     "OpenLoopSeriesCache",
     "OpenLoopSeriesSweepResult",
     "LoopSeriesCache",
@@ -56,6 +63,7 @@ __all__ = [
     "LoopSeriesTerm",
     "compute_local_expectation_edge_loop_series",
     "compute_local_expectation_open_loop_series",
+    "diagnose_open_loop_series",
     "compute_local_expectation_loop_cluster",
     "partial_trace_loop_cluster_expand",
     "partial_trace_edge_loop_series_expand",
@@ -64,6 +72,115 @@ __all__ = [
     "partial_trace_loop_series_expand",
     "loop_series_expand",
 ]
+
+
+class OpenLoopEnumerationLimitError(RuntimeError):
+    """Raised when bounded open-series term discovery reaches a limit.
+
+    A partial open-series sum is not returned: silently dropping terms would
+    turn a mathematically defined expansion into an uncontrolled truncation.
+    ``reason`` is one of the explicit enumeration limits, including
+    ``"max_corridor_edges"`` for corridor discovery.
+    """
+
+    def __init__(self, reason: str, limit: float, observed: float):
+        self.reason = reason
+        self.limit = limit
+        self.observed = observed
+        super().__init__(
+            f"open loop-series enumeration exceeded {reason}={limit!r} "
+            f"(observed {observed!r}); increase the limit or lower the "
+            "edge cutoff"
+        )
+
+
+@dataclass(frozen=True)
+class OpenLoopObservableTerm:
+    """An observable term with its physical support made explicit.
+
+    This is a small convenience wrapper for callers building terms from
+    :class:`pepsy.tensors.Fermion`.  The operator should be the native dense
+    or Symmray array returned by methods such as ``fermion.observable(...)``
+    or ``fermion.operator_term(...)``.  A bare ``Fermion`` helper is not an
+    observable: it does not identify either the support or the local
+    operator, and is therefore rejected by the measurement APIs.
+    """
+
+    where: Any
+    operator: Any
+    label: Any = None
+
+
+@dataclass
+class OpenLoopSeriesDiagnostic:
+    """Geometry and contraction-cost report for open-series measurement.
+
+    ``supports`` is keyed by the physical support tuple.  Each value contains
+    the selected route, discovered terms, corridor/path diagnostics, and
+    per-term cost records.  This object is intentionally numerical-data free:
+    it can be cached and passed back to
+    :func:`compute_local_expectation_open_loop_series` to reuse the discovered
+    geometry without re-enumerating it.
+    """
+
+    supports: dict[tuple[Any, ...], dict[str, Any]]
+    total_flops_log10: float | None = None
+    peak_memory_log2: float | None = None
+    cache_hits: int = 0
+
+    @property
+    def routes(self) -> dict[tuple[Any, ...], str]:
+        """Return the selected route for every support."""
+        return {
+            support: record.get("route", "unknown")
+            for support, record in self.supports.items()
+        }
+
+    def for_support(self, where):
+        """Return the cached report for one support."""
+        support = tuple(where)
+        try:
+            return self.supports[support]
+        except KeyError as exc:
+            raise KeyError(f"no diagnostic was built for support {support!r}") from exc
+
+
+@dataclass
+class OpenLoopSeriesDiagnosticCache:
+    """Cache geometry and cost diagnostics for one TN topology.
+
+    The cache deliberately does not retain observable values.  Consequently
+    it is safe to reuse for different native Fermion operators with the same
+    physical rank and support, while keeping BP-message and gate data out of
+    the cache's ownership.
+    """
+
+    diagnostics_by_key: dict[Any, OpenLoopSeriesDiagnostic] = field(
+        default_factory=dict
+    )
+    _topology_signature: Any = field(default=None, init=False, repr=False)
+
+    def _check_topology(self, tn) -> None:
+        signature = LoopSeriesCache._signature(tn)
+        if self._topology_signature is None:
+            self._topology_signature = signature
+        elif self._topology_signature != signature:
+            raise ValueError(
+                "OpenLoopSeriesDiagnosticCache belongs to a different "
+                "tensor-network topology or tensor-id layout; create a fresh "
+                "cache"
+            )
+
+    def get(self, tn, key):
+        """Return a diagnostic for ``key`` or ``None`` when absent."""
+        self._check_topology(tn)
+        return self.diagnostics_by_key.get(key)
+
+    def put(self, tn, key, diagnostic):
+        """Store and return ``diagnostic`` after checking the topology."""
+        self._check_topology(tn)
+        self.diagnostics_by_key[key] = diagnostic
+        return diagnostic
 
 
 @dataclass(frozen=True)
@@ -98,6 +215,127 @@ class LoopSeriesTerm:
     def weight(self) -> int:
         """Alias for :attr:`degree`, useful when comparing loop families."""
         return self.degree
+
+
+@dataclass(frozen=True)
+class _OpenEnumerationLimits:
+    """Validated limits for lazy open-series geometry discovery."""
+
+    max_terms: int | None = None
+    max_enumeration_time: float | None = None
+    max_enumeration_memory: int | None = None
+
+    @classmethod
+    def validate(
+        cls,
+        *,
+        max_terms=None,
+        max_enumeration_time=None,
+        max_enumeration_memory=None,
+    ):
+        if max_terms is not None:
+            if not isinstance(max_terms, (int, np.integer)) or max_terms < 0:
+                raise ValueError("max_terms must be a non-negative integer or None")
+            max_terms = int(max_terms)
+        if max_enumeration_time is not None:
+            if (
+                not isinstance(
+                    max_enumeration_time,
+                    (int, float, np.integer, np.floating),
+                )
+                or not np.isfinite(max_enumeration_time)
+                or max_enumeration_time <= 0
+            ):
+                raise ValueError(
+                    "max_enumeration_time must be a finite positive number "
+                    "or None"
+                )
+            max_enumeration_time = float(max_enumeration_time)
+        if max_enumeration_memory is not None:
+            if (
+                not isinstance(max_enumeration_memory, (int, np.integer))
+                or max_enumeration_memory <= 0
+            ):
+                raise ValueError(
+                    "max_enumeration_memory must be a positive byte count "
+                    "or None"
+                )
+            max_enumeration_memory = int(max_enumeration_memory)
+        return cls(
+            max_terms=max_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+        )
+
+
+class _OpenEnumerationGuard:
+    """Check lazy enumeration limits without changing term semantics."""
+
+    def __init__(self, limits: _OpenEnumerationLimits):
+        self.limits = limits
+        self.started = time.perf_counter()
+        self.emitted = 0
+        self.estimated_memory = 0
+
+    @staticmethod
+    def _term_memory(term: LoopSeriesTerm) -> int:
+        # This is deliberately conservative bookkeeping for Python-side
+        # geometry, not a claim about tensor contraction memory.
+        return (
+            sys.getsizeof(term)
+            + sys.getsizeof(term.edges)
+            + sys.getsizeof(term.tids)
+            + sum(sys.getsizeof(edge) for edge in term.edges)
+            + sum(sys.getsizeof(tid) for tid in term.tids)
+        )
+
+    def check(self):
+        elapsed = time.perf_counter() - self.started
+        limit = self.limits.max_enumeration_time
+        if limit is not None and elapsed >= limit:
+            raise OpenLoopEnumerationLimitError(
+                "max_enumeration_time", limit, elapsed
+            )
+
+    def accept(self, term: LoopSeriesTerm):
+        self.check()
+        if (
+            self.limits.max_terms is not None
+            and self.emitted >= self.limits.max_terms
+        ):
+            raise OpenLoopEnumerationLimitError(
+                "max_terms", self.limits.max_terms, self.emitted + 1
+            )
+        term_memory = self._term_memory(term)
+        if (
+            self.limits.max_enumeration_memory is not None
+            and self.estimated_memory + term_memory
+            > self.limits.max_enumeration_memory
+        ):
+            raise OpenLoopEnumerationLimitError(
+                "max_enumeration_memory",
+                self.limits.max_enumeration_memory,
+                self.estimated_memory + term_memory,
+            )
+        self.emitted += 1
+        self.estimated_memory += term_memory
+
+    def diagnostics(self):
+        return {
+            "terms": self.emitted,
+            "elapsed_seconds": time.perf_counter() - self.started,
+            "estimated_memory_bytes": self.estimated_memory,
+        }
+
+
+@dataclass(frozen=True)
+class _CorridorPath:
+    """One weighted shortest path retained by corridor discovery."""
+
+    edges: tuple[Any, ...]
+    vertices: tuple[Any, ...]
+    cost: float
+    coordinates: tuple[Any, ...] = ()
 
 
 @dataclass
@@ -184,14 +422,51 @@ class OpenLoopSeriesCache:
         allowed_tids,
         excluded_edges=(),
     ) -> tuple[LoopSeriesTerm, ...]:
-        """Return open generalized-loop terms for one rho support."""
+        """Return open generalized-loop terms for one rho support.
+
+        This eager compatibility method is retained for callers that inspect
+        the geometry directly.  The public open-series contractions use
+        :meth:`iter_terms_for` so terms are generated and consumed lazily.
+        """
+        return tuple(
+            self.iter_terms_for(
+                tn,
+                max_degree,
+                allowed_tids,
+                excluded_edges=excluded_edges,
+            )
+        )
+
+    def iter_terms_for(
+        self,
+        tn,
+        max_degree: int,
+        allowed_tids,
+        excluded_edges=(),
+        *,
+        max_terms: int | None = None,
+        max_enumeration_time: float | None = None,
+        max_enumeration_memory: int | None = None,
+    ):
+        """Yield open terms lazily for one rho support.
+
+        Newly discovered terms are streamed to the caller and retained in the
+        cache only after the complete discovery finishes.  This means a
+        bounded call can stop before a large configuration set is materialized
+        while preserving the old eager cache behavior for completed calls.
+        """
         self._check_topology(tn)
         max_degree = _validate_nonnegative_degree(max_degree)
         allowed_tids = frozenset(allowed_tids)
         excluded_edges = frozenset(excluded_edges)
+        limits = _OpenEnumerationLimits.validate(
+            max_terms=max_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+        )
         key = (max_degree, allowed_tids, excluded_edges)
         try:
-            return self.terms_by_key[key]
+            cached = self.terms_by_key[key]
         except KeyError:
             larger_keys = [
                 known_key
@@ -201,18 +476,34 @@ class OpenLoopSeriesCache:
             ]
             if larger_keys:
                 larger = self.terms_by_key[min(larger_keys)]
-                terms = tuple(
+                cached = tuple(
                     term for term in larger if term.degree <= max_degree
                 )
             else:
-                terms = _enumerate_open_edge_loops(
-                    tn,
-                    max_degree,
-                    allowed_tids=allowed_tids,
-                    excluded_edges=excluded_edges,
-                )
-            self.terms_by_key[key] = terms
-            return terms
+                cached = None
+
+        if cached is not None:
+            guard = _OpenEnumerationGuard(limits)
+            for term in cached:
+                guard.accept(term)
+                yield term
+            return
+
+        discovered = []
+        try:
+            for term in _iter_open_edge_loops(
+                tn,
+                max_degree,
+                allowed_tids=allowed_tids,
+                excluded_edges=excluded_edges,
+                limits=limits,
+            ):
+                discovered.append(term)
+                yield term
+        except OpenLoopEnumerationLimitError:
+            raise
+        else:
+            self.terms_by_key[key] = tuple(discovered)
 
 
 @dataclass
@@ -476,13 +767,752 @@ def _open_term_from_edges(
     )
 
 
-def _enumerate_open_edge_loops(
+def _iter_open_support_paths(tn, edges, allowed_tids, max_degree, guard=None):
+    """Yield simple support-connecting paths in increasing length order."""
+    if len(allowed_tids) < 2 or max_degree < 1:
+        return
+
+    adjacency: dict[Any, list[tuple[Any, Any]]] = {}
+    for index, left, right in edges:
+        adjacency.setdefault(left, []).append((right, index))
+        adjacency.setdefault(right, []).append((left, index))
+    for neighbors in adjacency.values():
+        neighbors.sort(key=lambda item: (repr(item[0]), repr(item[1])))
+
+    support = tuple(sorted(allowed_tids, key=repr))
+    queue = []
+    serial = 0
+    for source_pos, source in enumerate(support):
+        for target in support[source_pos + 1 :]:
+            heapq.heappush(
+                queue,
+                (0, serial, source, target, source, frozenset((source,)), ()),
+            )
+            serial += 1
+
+    seen = set()
+    while queue:
+        if guard is not None:
+            guard.check()
+        length, _, source, target, current, visited, path_edges = heapq.heappop(
+            queue
+        )
+        if current == target and path_edges:
+            canonical = tuple(sorted(path_edges, key=repr))
+            if canonical not in seen:
+                seen.add(canonical)
+                records = _edge_records(tn)
+                tids = set()
+                for edge in canonical:
+                    tids.update(records[edge])
+                yield LoopSeriesTerm(canonical, frozenset(tids))
+            continue
+        if length >= max_degree:
+            continue
+        for neighbor, edge in adjacency.get(current, ()):
+            if neighbor in visited:
+                continue
+            heapq.heappush(
+                queue,
+                (
+                    length + 1,
+                    serial,
+                    source,
+                    target,
+                    neighbor,
+                    visited | {neighbor},
+                    path_edges + (edge,),
+                ),
+            )
+            serial += 1
+
+
+def _validate_corridor_options(
+    *,
+    corridor_width,
+    max_path_candidates,
+    loop_decoration_size,
+    corridor_segment_length,
+    loop_radius,
+    max_loop_clusters_per_segment,
+    max_corridor_edges,
+    corridor_max_bond,
+):
+    """Validate bounded path/corridor controls."""
+    if corridor_width is not None:
+        if (
+            not isinstance(corridor_width, (int, np.integer))
+            or corridor_width < 0
+        ):
+            raise ValueError("corridor_width must be a non-negative integer")
+        corridor_width = int(corridor_width)
+    for name, value in (
+        ("max_path_candidates", max_path_candidates),
+        ("loop_decoration_size", loop_decoration_size),
+        ("corridor_segment_length", corridor_segment_length),
+        ("max_loop_clusters_per_segment", max_loop_clusters_per_segment),
+    ):
+        if not isinstance(value, (int, np.integer)) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        value = int(value)
+        if name == "max_path_candidates":
+            max_path_candidates = value
+        elif name == "loop_decoration_size":
+            loop_decoration_size = value
+        elif name == "corridor_segment_length":
+            corridor_segment_length = value
+        else:
+            max_loop_clusters_per_segment = value
+    if loop_radius is None:
+        loop_radius = max(1, corridor_width or 1)
+    elif not isinstance(loop_radius, (int, np.integer)) or loop_radius < 1:
+        raise ValueError("loop_radius must be a positive integer or None")
+    else:
+        loop_radius = int(loop_radius)
+    if max_corridor_edges is not None:
+        if (
+            not isinstance(max_corridor_edges, (int, np.integer))
+            or max_corridor_edges < 1
+        ):
+            raise ValueError(
+                "max_corridor_edges must be a positive integer or None"
+            )
+        max_corridor_edges = int(max_corridor_edges)
+    if corridor_max_bond is not None:
+        if corridor_width is None:
+            raise ValueError(
+                "corridor_max_bond requires corridor_width"
+            )
+        if (
+            not isinstance(corridor_max_bond, (int, np.integer))
+            or corridor_max_bond < 1
+        ):
+            raise ValueError(
+                "corridor_max_bond must be a positive integer or None"
+            )
+        corridor_max_bond = int(corridor_max_bond)
+    return {
+        "corridor_width": corridor_width,
+        "max_path_candidates": max_path_candidates,
+        "loop_decoration_size": loop_decoration_size,
+        "corridor_segment_length": corridor_segment_length,
+        "loop_radius": loop_radius,
+        "max_loop_clusters_per_segment": max_loop_clusters_per_segment,
+        "max_corridor_edges": max_corridor_edges,
+        "corridor_max_bond": corridor_max_bond,
+    }
+
+
+def _corridor_adjacency(tn, edges, edge_weights=None):
+    """Build deterministic tensor-graph adjacency for corridor search."""
+    weights = {} if edge_weights is None else dict(edge_weights)
+    adjacency = {}
+    records = {}
+    for index, left, right in edges:
+        weight = weights.get(index, 1.0)
+        if not isinstance(weight, (int, float, np.integer, np.floating)):
+            raise TypeError(f"path edge weight for {index!r} must be real")
+        if not np.isfinite(weight) or weight <= 0:
+            raise ValueError(
+                f"path edge weight for {index!r} must be finite and positive"
+            )
+        weight = float(weight)
+        records[index] = (left, right)
+        adjacency.setdefault(left, []).append((right, index, weight))
+        adjacency.setdefault(right, []).append((left, index, weight))
+    for neighbors in adjacency.values():
+        neighbors.sort(key=lambda item: (item[2], repr(item[0]), repr(item[1])))
+    return adjacency, records
+
+
+def _weighted_shortest_distances(adjacency, target, guard=None):
+    distances = {target: 0.0}
+    pending = [(0.0, 0, target)]
+    serial = 1
+    while pending:
+        if guard is not None:
+            guard.check()
+        distance, _, current = heapq.heappop(pending)
+        if distance > distances[current] + 1e-12:
+            continue
+        for neighbor, _, weight in adjacency.get(current, ()):
+            candidate = distance + weight
+            if candidate + 1e-12 >= distances.get(neighbor, np.inf):
+                continue
+            distances[neighbor] = candidate
+            heapq.heappush(pending, (candidate, serial, neighbor))
+            serial += 1
+    return distances
+
+
+def _grid_corridor_context(tn):
+    """Return lazy coordinate-neighbor access for rectangular PEPS graphs."""
+    if not all(hasattr(tn, name) for name in ("Lx", "Ly", "has_site")):
+        return None
+    if not callable(getattr(tn, "site_tag", None)):
+        return None
+    cyclic_x = bool(tn.is_cyclic_x()) if hasattr(tn, "is_cyclic_x") else False
+    cyclic_y = bool(tn.is_cyclic_y()) if hasattr(tn, "is_cyclic_y") else False
+    tid_cache = {}
+
+    def tid_at(coo):
+        if coo in tid_cache:
+            return tid_cache[coo]
+        if not tn.has_site(coo):
+            return None
+        tids = tuple(
+            tn._get_tids_from_tags([tn.site_tag(coo)], "any")
+        )
+        if len(tids) != 1:
+            return None
+        tid_cache[coo] = tids[0]
+        return tids[0]
+
+    def neighbors(coo):
+        x, y = coo
+        candidates = ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1))
+        seen = set()
+        for nx, ny in candidates:
+            if nx < 0 or nx >= tn.Lx:
+                if not cyclic_x:
+                    continue
+                nx %= tn.Lx
+            if ny < 0 or ny >= tn.Ly:
+                if not cyclic_y:
+                    continue
+                ny %= tn.Ly
+            neighbor = (nx, ny)
+            if neighbor in seen or not tn.has_site(neighbor):
+                continue
+            seen.add(neighbor)
+            neighbor_tid = tid_at(neighbor)
+            if neighbor_tid is not None:
+                yield neighbor, neighbor_tid
+
+    def edge_between(tid, neighbor_tid):
+        left_inds = set(tn.tensor_map[tid].inds)
+        right_inds = set(tn.tensor_map[neighbor_tid].inds)
+        shared = tuple(left_inds & right_inds)
+        for index in shared:
+            if len(tn.ind_map[index]) == 2:
+                return index
+        return None
+
+    def axis_distance(left, right, size, cyclic):
+        distance = abs(left - right)
+        return min(distance, size - distance) if cyclic else distance
+
+    def distance(left, right):
+        return axis_distance(left[0], right[0], tn.Lx, cyclic_x) + axis_distance(
+            left[1], right[1], tn.Ly, cyclic_y
+        )
+
+    return {
+        "tid_at": tid_at,
+        "neighbors": neighbors,
+        "edge_between": edge_between,
+        "distance": distance,
+    }
+
+
+def _discover_grid_corridor_paths(
+    tn,
+    support_coos,
+    *,
+    excluded_edges=(),
+    corridor_width=2,
+    max_path_candidates=8,
+    corridor_segment_length=32,
+    max_corridor_edges=100_000,
+    guard=None,
+):
+    """Discover corridor paths lazily on a rectangular lattice."""
+    context = _grid_corridor_context(tn)
+    if context is None:
+        return None
+    excluded_edges = frozenset(excluded_edges)
+    normalized_coos = []
+    for coo in support_coos:
+        if not isinstance(coo, (tuple, list)) or len(coo) != 2:
+            return None
+        normalized_coos.append(tuple(coo))
+    support_coos = tuple(dict.fromkeys(normalized_coos))
+    if len(support_coos) < 2:
+        return (), frozenset(), {
+            "path_count": 0,
+            "path_lengths": (),
+            "shortest_path_length": None,
+            "corridor_vertices": 0,
+            "corridor_edges": 0,
+        }
+
+    paths = []
+    seen_paths = set()
+    beam_width = max(8, 4 * max_path_candidates)
+    for source_pos, source in enumerate(support_coos[:-1]):
+        for target in support_coos[source_pos + 1 :]:
+            if guard is not None:
+                guard.check()
+            if context["tid_at"](source) is None or context["tid_at"](target) is None:
+                continue
+            target_distance = context["distance"](source, target)
+            frontier = [(source, (source,), (), frozenset((source,)))]
+            found = []
+            while frontier and len(found) < max_path_candidates:
+                if guard is not None:
+                    guard.check()
+                next_frontier = []
+                for current, coordinates, path_edges, visited in frontier:
+                    current_distance = context["distance"](current, target)
+                    if current == target:
+                        edge_tuple = tuple(sorted(path_edges, key=repr))
+                        if edge_tuple not in seen_paths:
+                            seen_paths.add(edge_tuple)
+                            found.append(
+                                _CorridorPath(
+                                    edge_tuple,
+                                    tuple(
+                                        context["tid_at"](coo)
+                                        for coo in coordinates
+                                    ),
+                                    float(len(path_edges)),
+                                    coordinates,
+                                )
+                            )
+                        continue
+                    if current_distance >= target_distance and current != source:
+                        continue
+                    for neighbor, neighbor_tid in context["neighbors"](current):
+                        if neighbor in visited:
+                            continue
+                        edge = context["edge_between"](
+                            context["tid_at"](current),
+                            neighbor_tid,
+                        )
+                        if edge is None or edge in excluded_edges:
+                            continue
+                        if context["distance"](neighbor, target) != current_distance - 1:
+                            continue
+                        next_frontier.append(
+                            (
+                                neighbor,
+                                coordinates + (neighbor,),
+                                path_edges + (edge,),
+                                visited | {neighbor},
+                            )
+                        )
+                next_frontier.sort(
+                    key=lambda state: (
+                        tuple(map(repr, state[2])),
+                        state[0],
+                    )
+                )
+                frontier = next_frontier[:beam_width]
+            paths.extend(found)
+
+    paths.sort(key=lambda path: (path.cost, tuple(map(repr, path.edges))))
+    paths = paths[:max_path_candidates]
+    corridor_coos = set()
+    for path in paths:
+        corridor_coos.update(path.coordinates)
+    pending = deque((coo, 0) for coo in corridor_coos)
+    while pending:
+        if guard is not None:
+            guard.check()
+        coo, distance = pending.popleft()
+        if distance >= corridor_width:
+            continue
+        for neighbor, _ in context["neighbors"](coo):
+            if neighbor in corridor_coos:
+                continue
+            corridor_coos.add(neighbor)
+            pending.append((neighbor, distance + 1))
+
+    corridor_edges = set()
+    corridor_tids = {
+        context["tid_at"](coo) for coo in corridor_coos
+    }
+    for coo in corridor_coos:
+        for neighbor, neighbor_tid in context["neighbors"](coo):
+            if neighbor not in corridor_coos:
+                continue
+            edge = context["edge_between"](
+                context["tid_at"](coo),
+                neighbor_tid,
+            )
+            if edge is not None and edge not in excluded_edges:
+                corridor_edges.add(edge)
+    corridor_edges = frozenset(corridor_edges)
+    if (
+        max_corridor_edges is not None
+        and len(corridor_edges) > max_corridor_edges
+    ):
+        raise OpenLoopEnumerationLimitError(
+            "max_corridor_edges",
+            max_corridor_edges,
+            len(corridor_edges),
+        )
+    return tuple(paths), corridor_edges, {
+        "path_count": len(paths),
+        "path_lengths": tuple(len(path.edges) for path in paths),
+        "shortest_path_length": min(
+            (len(path.edges) for path in paths),
+            default=None,
+        ),
+        "path_costs": tuple(path.cost for path in paths),
+        "corridor_vertices": len(corridor_tids),
+        "corridor_edges": len(corridor_edges),
+        "corridor_width": corridor_width,
+        "segment_length": corridor_segment_length,
+        "search_backend": "rectangular_grid",
+    }
+
+
+def _discover_corridor_paths(
+    tn,
+    allowed_tids,
+    *,
+    support_coos=None,
+    excluded_edges=(),
+    corridor_width=2,
+    max_path_candidates=8,
+    corridor_segment_length=32,
+    max_corridor_edges=100_000,
+    edge_weights=None,
+    guard=None,
+):
+    """Discover a bounded set of weighted shortest support paths.
+
+    The search follows the shortest-path DAG produced by Dijkstra and keeps a
+    small beam at each distance layer. It therefore never explores arbitrary
+    simple paths on the full lattice. The returned corridor is the graph
+    neighbourhood of the retained paths.
+    """
+    if support_coos is not None and edge_weights is None:
+        grid_result = _discover_grid_corridor_paths(
+            tn,
+            support_coos,
+            excluded_edges=excluded_edges,
+            corridor_width=corridor_width,
+            max_path_candidates=max_path_candidates,
+            corridor_segment_length=corridor_segment_length,
+            max_corridor_edges=max_corridor_edges,
+            guard=guard,
+        )
+        if grid_result is not None:
+            return grid_result
+
+    excluded_edges = frozenset(excluded_edges)
+    all_edges = _pairwise_edges(tn, norm="2norm")
+    search_edges = tuple(
+        edge for edge in all_edges if edge[0] not in excluded_edges
+    )
+    adjacency, records = _corridor_adjacency(tn, search_edges, edge_weights)
+    support = tuple(sorted(frozenset(allowed_tids), key=repr))
+    if len(support) < 2:
+        return (), frozenset(), {
+            "path_count": 0,
+            "path_lengths": (),
+            "shortest_path_length": None,
+            "corridor_vertices": 0,
+            "corridor_edges": 0,
+        }
+
+    path_records = []
+    seen_paths = set()
+    beam_width = max(8, 4 * max_path_candidates)
+    for source_pos, source in enumerate(support[:-1]):
+        for target in support[source_pos + 1 :]:
+            if guard is not None:
+                guard.check()
+            distances = _weighted_shortest_distances(
+                adjacency,
+                target,
+                guard=guard,
+            )
+            if source not in distances:
+                continue
+            shortest_cost = distances[source]
+            frontier = [
+                (source, (source,), (), 0.0, frozenset((source,)))
+            ]
+            found = []
+            while frontier and len(found) < max_path_candidates:
+                if guard is not None:
+                    guard.check()
+                next_frontier = []
+                for current, vertices, path_edges, cost, visited in frontier:
+                    if current == target:
+                        canonical = tuple(sorted(path_edges, key=repr))
+                        if canonical not in seen_paths:
+                            seen_paths.add(canonical)
+                            found.append(
+                                _CorridorPath(canonical, vertices, cost)
+                            )
+                        continue
+                    for neighbor, edge, weight in adjacency.get(current, ()):
+                        if neighbor in visited:
+                            continue
+                        remaining = distances.get(neighbor)
+                        if remaining is None:
+                            continue
+                        new_cost = cost + weight
+                        if abs(new_cost + remaining - shortest_cost) > 1e-10:
+                            continue
+                        next_frontier.append(
+                            (
+                                neighbor,
+                                vertices + (neighbor,),
+                                path_edges + (edge,),
+                                new_cost,
+                                visited | {neighbor},
+                            )
+                        )
+                next_frontier.sort(
+                    key=lambda state: (
+                        state[3],
+                        tuple(map(repr, state[2])),
+                        repr(state[0]),
+                    )
+                )
+                frontier = next_frontier[:beam_width]
+            path_records.extend(found)
+
+    path_records.sort(
+        key=lambda path: (path.cost, len(path.edges), tuple(map(repr, path.edges)))
+    )
+    path_records = path_records[:max_path_candidates]
+    path_vertices = set()
+    for path in path_records:
+        path_vertices.update(path.vertices)
+
+    corridor_vertices = set(path_vertices)
+    pending = deque((vertex, 0) for vertex in path_vertices)
+    while pending:
+        current, distance = pending.popleft()
+        if distance >= corridor_width:
+            continue
+        for neighbor, _, _ in adjacency.get(current, ()):
+            if neighbor in corridor_vertices:
+                continue
+            corridor_vertices.add(neighbor)
+            pending.append((neighbor, distance + 1))
+
+    corridor_edges = frozenset(
+        index
+        for index, left, right in search_edges
+        if left in corridor_vertices and right in corridor_vertices
+    )
+    if (
+        max_corridor_edges is not None
+        and len(corridor_edges) > max_corridor_edges
+    ):
+        raise OpenLoopEnumerationLimitError(
+            "max_corridor_edges",
+            max_corridor_edges,
+            len(corridor_edges),
+        )
+    diagnostics = {
+        "path_count": len(path_records),
+        "path_lengths": tuple(len(path.edges) for path in path_records),
+        "shortest_path_length": (
+            min((len(path.edges) for path in path_records), default=None)
+        ),
+        "path_costs": tuple(path.cost for path in path_records),
+        "corridor_vertices": len(corridor_vertices),
+        "corridor_edges": len(corridor_edges),
+        "corridor_width": corridor_width,
+        "segment_length": corridor_segment_length,
+        "search_backend": "weighted_graph",
+    }
+    return tuple(path_records), corridor_edges, diagnostics
+
+
+def _iter_corridor_loop_clusters(
+    tn,
+    corridor_edges,
+    *,
+    max_size,
+    path_records,
+    segment_length,
+    loop_radius,
+    max_per_segment,
+    guard=None,
+):
+    """Yield bounded simple-cycle decorations near path segments.
+
+    The corridor route intentionally searches cycles rather than arbitrary
+    connected edge subsets. This keeps loop discovery bounded by the local
+    radius and decoration size, while the exact global route retains its old
+    generalized-loop semantics.
+    """
+    records = _edge_records(tn)
+    edge_list = tuple(sorted(corridor_edges, key=repr))
+    by_vertex = {}
+    for edge in edge_list:
+        left, right = records[edge]
+        by_vertex.setdefault(left, []).append((right, edge))
+        by_vertex.setdefault(right, []).append((left, edge))
+    for neighbors in by_vertex.values():
+        neighbors.sort(key=lambda item: (repr(item[0]), repr(item[1])))
+
+    loop_terms = {}
+    for path in path_records:
+        if guard is not None:
+            guard.check()
+        anchors = path.vertices[::segment_length]
+        if path.vertices and path.vertices[-1] not in anchors:
+            anchors = (*anchors, path.vertices[-1])
+        for anchor in anchors:
+            if guard is not None:
+                guard.check()
+            local_vertices = {anchor}
+            pending = deque(((anchor, 0),))
+            while pending:
+                if guard is not None:
+                    guard.check()
+                vertex, distance = pending.popleft()
+                if distance >= loop_radius:
+                    continue
+                for neighbor, _ in by_vertex.get(vertex, ()):
+                    if neighbor in local_vertices:
+                        continue
+                    local_vertices.add(neighbor)
+                    pending.append((neighbor, distance + 1))
+
+            discovered = 0
+            for start in sorted(local_vertices, key=repr):
+                if discovered >= max_per_segment:
+                    break
+                stack = [(start, (start,), (), frozenset((start,)))]
+                while stack and discovered < max_per_segment:
+                    if guard is not None:
+                        guard.check()
+                    current, vertices, path_edges, visited = stack.pop()
+                    if (
+                        len(path_edges) >= 3
+                        and len(path_edges) <= max_size
+                    ):
+                        for neighbor, edge in by_vertex.get(current, ()):
+                            if neighbor != start or edge in path_edges:
+                                continue
+                            canonical = tuple(sorted((*path_edges, edge), key=repr))
+                            if canonical not in loop_terms:
+                                loop_terms[canonical] = LoopSeriesTerm(
+                                    canonical,
+                                    frozenset(vertices),
+                                )
+                                discovered += 1
+                            break
+                    if len(path_edges) >= max_size:
+                        continue
+                    for neighbor, edge in reversed(
+                        by_vertex.get(current, ())
+                    ):
+                        if neighbor not in local_vertices or neighbor in visited:
+                            continue
+                        if repr(neighbor) < repr(start):
+                            continue
+                        stack.append(
+                            (
+                                neighbor,
+                                vertices + (neighbor,),
+                                path_edges + (edge,),
+                                visited | {neighbor},
+                            )
+                        )
+
+    return tuple(
+        sorted(
+            loop_terms.values(),
+            key=lambda term: (term.degree, tuple(map(repr, term.edges))),
+        )
+    )
+
+
+def _iter_corridor_open_terms(
+    tn,
+    path_records,
+    corridor_edges,
+    *,
+    allowed_tids,
+    excluded_edges,
+    total_edge_cutoff,
+    loop_decoration_size,
+    corridor_segment_length,
+    loop_radius,
+    max_loop_clusters_per_segment,
+    limits,
+    guard=None,
+):
+    """Yield path-first corridor terms and one connected loop decoration."""
+    guard = _OpenEnumerationGuard(limits) if guard is None else guard
+    seen = set()
+    path_terms = []
+    for path in path_records:
+        if (
+            total_edge_cutoff is not None
+            and len(path.edges) > total_edge_cutoff
+        ):
+            continue
+        term = LoopSeriesTerm(path.edges, frozenset(path.vertices))
+        if term.edges in seen:
+            continue
+        guard.accept(term)
+        seen.add(term.edges)
+        path_terms.append(term)
+        yield term
+
+    loop_terms = _iter_corridor_loop_clusters(
+        tn,
+        corridor_edges,
+        max_size=loop_decoration_size,
+        path_records=path_records,
+        segment_length=corridor_segment_length,
+        loop_radius=loop_radius,
+        max_per_segment=max_loop_clusters_per_segment,
+        guard=guard,
+    )
+    for loop in loop_terms:
+        if (
+            total_edge_cutoff is not None
+            and loop.degree > total_edge_cutoff
+        ):
+            continue
+        if loop.edges in seen:
+            continue
+        guard.accept(loop)
+        seen.add(loop.edges)
+        yield loop
+
+    for path in path_terms:
+        for loop in loop_terms:
+            union = tuple(sorted(set(path.edges) | set(loop.edges), key=repr))
+            if union == path.edges or union in seen:
+                continue
+            if (
+                total_edge_cutoff is not None
+                and len(union) > total_edge_cutoff
+            ):
+                continue
+            term = _open_term_from_edges(
+                tn,
+                union,
+                allowed_tids=allowed_tids,
+                excluded_edges=excluded_edges,
+            )
+            guard.accept(term)
+            seen.add(term.edges)
+            yield term
+
+def _iter_open_edge_loops(
     tn,
     max_degree: int,
     *,
     allowed_tids,
     excluded_edges=(),
-) -> tuple[LoopSeriesTerm, ...]:
+    limits: _OpenEnumerationLimits | None = None,
+):
     """Enumerate open and closed Q-edge configurations for a rho support.
 
     The cutoff is the number of excited Q edges.  Every non-support tensor
@@ -493,7 +1523,7 @@ def _enumerate_open_edge_loops(
     """
     max_degree = _validate_nonnegative_degree(max_degree)
     if max_degree == 0:
-        return ()
+        return
 
     excluded_edges = frozenset(excluded_edges)
     edges = tuple(
@@ -503,6 +1533,26 @@ def _enumerate_open_edge_loops(
     )
     max_degree = min(max_degree, len(edges))
     allowed_tids = frozenset(allowed_tids)
+    limits = limits or _OpenEnumerationLimits.validate()
+    guard = _OpenEnumerationGuard(limits)
+
+    # The first stream is deliberately path-first.  This makes a bounded
+    # call useful for long-range observables: the smallest support-connecting
+    # configurations are seen before the much larger closed-loop tail.  The
+    # exhaustive fallback below still retains every admissible path-plus-loop
+    # and disconnected-loop configuration when no limit is reached.
+    path_terms = set()
+    for term in _iter_open_support_paths(
+        tn,
+        edges,
+        allowed_tids,
+        max_degree,
+        guard=guard,
+    ):
+        guard.accept(term)
+        path_terms.add(term.edges)
+        yield term
+
     remaining = Counter()
     for _, left, right in edges:
         remaining[left] += 1
@@ -510,8 +1560,6 @@ def _enumerate_open_edge_loops(
 
     degrees: Counter[Any] = Counter()
     selected = []
-    terms = []
-
     def has_closed_dangling_vertex():
         return any(
             remaining[tid] == 0
@@ -521,14 +1569,16 @@ def _enumerate_open_edge_loops(
         )
 
     def visit(edge_pos, selected_count):
+        guard.check()
         if edge_pos == len(edges):
             if selected and not has_closed_dangling_vertex():
-                terms.append(
-                    LoopSeriesTerm(
-                        tuple(sorted(selected, key=repr)),
-                        frozenset(degrees),
-                    )
+                term = LoopSeriesTerm(
+                    tuple(sorted(selected, key=repr)),
+                    frozenset(degrees),
                 )
+                if term.edges not in path_terms:
+                    guard.accept(term)
+                    yield term
             return
 
         _, left, right = edges[edge_pos]
@@ -536,14 +1586,14 @@ def _enumerate_open_edge_loops(
         remaining[right] -= 1
 
         if not has_closed_dangling_vertex():
-            visit(edge_pos + 1, selected_count)
+            yield from visit(edge_pos + 1, selected_count)
 
         if selected_count < max_degree:
             selected.append(edges[edge_pos][0])
             degrees[left] += 1
             degrees[right] += 1
             if not has_closed_dangling_vertex():
-                visit(edge_pos + 1, selected_count + 1)
+                yield from visit(edge_pos + 1, selected_count + 1)
             degrees[left] -= 1
             degrees[right] -= 1
             selected.pop()
@@ -551,10 +1601,30 @@ def _enumerate_open_edge_loops(
         remaining[left] += 1
         remaining[right] += 1
 
-    visit(0, 0)
+    yield from visit(0, 0)
+
+
+def _enumerate_open_edge_loops(
+    tn,
+    max_degree: int,
+    *,
+    allowed_tids,
+    excluded_edges=(),
+    limits: _OpenEnumerationLimits | None = None,
+) -> tuple[LoopSeriesTerm, ...]:
+    """Eager compatibility wrapper around :func:`_iter_open_edge_loops`."""
 
     return tuple(
-        sorted(terms, key=lambda term: (term.degree, tuple(map(repr, term.edges))))
+        sorted(
+            _iter_open_edge_loops(
+                tn,
+                max_degree,
+                allowed_tids=allowed_tids,
+                excluded_edges=excluded_edges,
+                limits=limits,
+            ),
+            key=lambda term: (term.degree, tuple(map(repr, term.edges))),
+        )
     )
 
 
@@ -636,6 +1706,107 @@ def _use_native_fermionic_cluster_open_route(bp, where):
         and bp.tn.isfermionic()
         and _pairwise_graph_has_cycle(bp.tn)
     )
+
+
+def _minimum_support_graph_distance(tn, where):
+    """Estimate the shortest pair distance without enumerating paths."""
+    sites = tuple(where)
+    if len(sites) < 2:
+        return 0
+    context = _grid_corridor_context(tn)
+    if context is not None and all(
+        isinstance(site, (tuple, list)) and len(site) == 2 for site in sites
+    ):
+        distances = [
+            context["distance"](tuple(left), tuple(right))
+            for left, right in combinations(sites, 2)
+        ]
+        return min(distances, default=0)
+
+    tags = [tn.site_tag(site) for site in sites]
+    support_tids = tuple(
+        frozenset(tn._get_tids_from_tags([tag], "any")) for tag in tags
+    )
+    adjacency, _ = _corridor_adjacency(
+        tn,
+        _pairwise_edges(tn, norm="2norm"),
+        edge_weights=None,
+    )
+    best = np.inf
+    for left_pos, left_tids in enumerate(support_tids[:-1]):
+        targets = support_tids[left_pos + 1]
+        pending = deque((tid, 0) for tid in left_tids)
+        visited = set(left_tids)
+        while pending:
+            current, distance = pending.popleft()
+            if current in targets:
+                best = min(best, distance)
+                break
+            for neighbor, _, _ in adjacency.get(current, ()):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                pending.append((neighbor, distance + 1))
+    return int(best) if np.isfinite(best) else None
+
+
+def _resolve_open_route(
+    bp,
+    where,
+    *,
+    mode,
+    corridor_width,
+    auto_corridor_distance,
+):
+    """Select the safe open-series route before term discovery."""
+    if mode not in {"exact", "corridor", "auto"}:
+        raise ValueError("mode must be 'exact', 'corridor', or 'auto'")
+    if auto_corridor_distance is None:
+        auto_corridor_distance = 32
+    if (
+        not isinstance(auto_corridor_distance, (int, np.integer))
+        or auto_corridor_distance < 1
+    ):
+        raise ValueError("auto_corridor_distance must be a positive integer or None")
+    native_cluster_route = _use_native_fermionic_cluster_open_route(bp, where)
+    distance = _minimum_support_graph_distance(bp.tn, where)
+
+    if native_cluster_route:
+        if mode == "corridor" or (mode == "exact" and corridor_width is not None):
+            raise ValueError(
+                "corridor mode is for explicit dense/tree open terms; cyclic "
+                "native fermionic observables use cluster_size"
+            )
+        return {
+            "route": "graded_cluster_compatible",
+            "corridor_width": None,
+            "native_cluster_route": True,
+            "support_distance": distance,
+            "auto_corridor_distance": int(auto_corridor_distance),
+        }
+
+    use_corridor = mode == "corridor"
+    if mode == "auto":
+        use_corridor = (
+            corridor_width is not None
+            or (distance is not None and distance > auto_corridor_distance)
+        )
+    if mode == "exact" and corridor_width is not None:
+        # Preserve the pre-mode API: specifying corridor_width was already the
+        # explicit request to use the bounded route.
+        use_corridor = True
+    if use_corridor:
+        corridor_width = 2 if corridor_width is None else corridor_width
+        route = "corridor"
+    else:
+        route = "exact"
+    return {
+        "route": route,
+        "corridor_width": corridor_width if use_corridor else None,
+        "native_cluster_route": False,
+        "support_distance": distance,
+        "auto_corridor_distance": int(auto_corridor_distance),
+    }
 
 
 def _connected_term_from_edges(tn, edges, *, tids=()):
@@ -1025,6 +2196,7 @@ def _get_d2_edge_partial_trace_excited(
     gate_as_operator=False,
     projector_index_order="bra-ket",
     fermionic_q=False,
+    index_namespace=None,
 ):
     """Build a D2 local RDM network with explicit P/Q edge choices.
 
@@ -1055,12 +2227,24 @@ def _get_d2_edge_partial_trace_excited(
     boundary_inds = []
     gate_index_map = {}
 
+    def make_index(role, tid, index):
+        if index_namespace is None:
+            import quimb.tensor as qtn
+
+            return qtn.rand_uuid()
+        # Compressed contraction treats tuple-valued labels as structured
+        # index groups. Use a deterministic string instead so regional path
+        # reuse and boundary compression see an ordinary scalar index label.
+        return "__pepsy_open__" + repr(
+            (repr(index_namespace), role, repr(tid), repr(index))
+        )
+
     for index, region_tids in stn.ind_map.items():
         region_tids = tuple(region_tids)
         if index in bp.output_inds:
             if gate_as_operator and index in gate_inds:
                 (tid,) = region_tids
-                kix = qtn.rand_uuid()
+                kix = make_index("gate-ket", tid, index)
                 kixmaps[tid][index] = kix
                 # ``tensor_network_gate_inds`` represents a gate with its
                 # original physical labels on the first (bra/output) legs
@@ -1072,13 +2256,13 @@ def _get_d2_edge_partial_trace_excited(
                 (tid,) = region_tids
                 bixmaps[tid][index] = partial_trace_map[index]
         elif index in exclude:
-            bix = qtn.rand_uuid()
+            bix = make_index("excluded-bra", region_tids[0], index)
             for tid in region_tids:
                 bixmaps[tid][index] = bix
         elif index in stn._inner_inds:
             for tid in region_tids:
-                kix = qtn.rand_uuid()
-                bix = qtn.rand_uuid()
+                kix = make_index("ket", tid, index)
+                bix = make_index("bra", tid, index)
                 kixmaps[tid][index] = kix
                 bixmaps[tid][index] = bix
                 if projector_index_order == "bra-ket":
@@ -1087,8 +2271,8 @@ def _get_d2_edge_partial_trace_excited(
                     projector_inds.setdefault(index, {})[tid] = (kix, bix)
         else:
             (tid,) = region_tids
-            kix = qtn.rand_uuid()
-            bix = qtn.rand_uuid()
+            kix = make_index("boundary-ket", tid, index)
+            bix = make_index("boundary-bra", tid, index)
             kixmaps[tid][index] = kix
             bixmaps[tid][index] = bix
             boundary_inds.append((index, tid))
@@ -1213,11 +2397,23 @@ def _validate_contraction_cost_limits(
     )
 
 
-def _contract_cost_record(tree):
+def _contract_cost_record(tree, *, max_bond=None):
     """Extract the standard Cotengra log-cost diagnostics from a tree."""
+    if max_bond is None:
+        flops = tree.total_flops(log=10)
+        peak = tree.peak_size(log=2)
+    else:
+        try:
+            flops = tree.total_flops(chi=max_bond, log=10)
+            peak = tree.peak_size(chi=max_bond, log=2)
+        except TypeError:
+            # Older cotengra trees expose only exact-tree diagnostics. Keep
+            # the budget conservative rather than failing the corridor route.
+            flops = tree.total_flops(log=10)
+            peak = tree.peak_size(log=2)
     return {
-        "flops_log10": float(tree.total_flops(log=10)),
-        "peak_memory_log2": float(tree.peak_size(log=2)),
+        "flops_log10": float(flops),
+        "peak_memory_log2": float(peak),
     }
 
 
@@ -1228,6 +2424,9 @@ def _contract_with_cost_limits(
     contract_opts,
     max_flops_log10=None,
     max_peak_memory_log2=None,
+    path_cache=None,
+    path_cache_key=None,
+    compress_opts=None,
 ):
     """Contract ``network`` or return its cost record when over budget.
 
@@ -1236,7 +2435,77 @@ def _contract_with_cost_limits(
     so path search is not repeated. ``peak_memory_log2`` follows Cotengra's
     convention: log2 of the largest concurrently live scalar tensor size.
     """
-    if max_flops_log10 is None and max_peak_memory_log2 is None:
+    if compress_opts is not None:
+        if path_cache is not None and path_cache_key is not None:
+            # Exact contraction trees are not valid compressed-contraction
+            # paths, so regional path reuse is intentionally separate here.
+            path_cache_key = None
+        if "get" in contract_opts:
+            raise TypeError(
+                "contract_opts['get'] cannot be combined with compressed "
+                "corridor contraction"
+            )
+        cost = None
+        if (
+            max_flops_log10 is not None
+            or max_peak_memory_log2 is not None
+        ):
+            tree = network.contract(get="tree", optimize=optimize)
+            cost = _contract_cost_record(
+                tree,
+                max_bond=compress_opts.get("max_bond"),
+            )
+            accepted = (
+                (
+                    max_flops_log10 is None
+                    or cost["flops_log10"] <= max_flops_log10
+                )
+                and (
+                    max_peak_memory_log2 is None
+                    or cost["peak_memory_log2"] <= max_peak_memory_log2
+                )
+            )
+            if not accepted:
+                return False, None, cost
+        compressed_opts = dict(compress_opts)
+        compressed_contract_opts = dict(contract_opts)
+        compressed_contract_opts.setdefault("output_inds", ())
+        value = network.contract_compressed(
+            optimize,
+            **compressed_opts,
+            **compressed_contract_opts,
+        )
+        return True, value, cost
+
+    cached = None
+    if path_cache is not None and path_cache_key is not None:
+        cached = path_cache.get(path_cache_key)
+
+    if cached is not None:
+        tree, cost = cached
+        accepted = (
+            (
+                max_flops_log10 is None
+                or cost["flops_log10"] <= max_flops_log10
+            )
+            and (
+                max_peak_memory_log2 is None
+                or cost["peak_memory_log2"] <= max_peak_memory_log2
+            )
+        )
+        if not accepted:
+            return False, None, cost
+        return (
+            True,
+            network.contract(optimize=tree, **contract_opts),
+            cost if max_flops_log10 is not None or max_peak_memory_log2 is not None else None,
+        )
+
+    if (
+        max_flops_log10 is None
+        and max_peak_memory_log2 is None
+        and path_cache is None
+    ):
         return (
             True,
             network.contract(optimize=optimize, **contract_opts),
@@ -1254,6 +2523,8 @@ def _contract_with_cost_limits(
         **contract_opts,
     )
     cost = _contract_cost_record(tree)
+    if path_cache is not None and path_cache_key is not None:
+        path_cache[path_cache_key] = (tree, cost)
     accepted = (
         (
             max_flops_log10 is None
@@ -1287,6 +2558,73 @@ def _term_sites(tn, where):
     if not sites:
         raise ValueError("a local expectation term must have at least one site")
     return sites
+
+
+def _resolve_open_observable_operator(operator):
+    """Resolve the small descriptor forms accepted by open measurement."""
+    if isinstance(operator, OpenLoopObservableTerm):
+        return operator.operator
+    if isinstance(operator, dict) and "operator" in operator:
+        value = operator["operator"]
+        fermion = operator.get("fermion")
+        if fermion is not None and isinstance(value, str):
+            observable = getattr(fermion, "observable", None)
+            if not callable(observable):
+                raise TypeError(
+                    "an observable descriptor with a named operator must "
+                    "contain a Fermion-like object with observable(name)"
+                )
+            return observable(value)
+        return value
+    if (
+        isinstance(operator, (tuple, list))
+        and len(operator) == 2
+        and isinstance(operator[1], str)
+        and callable(getattr(operator[0], "observable", None))
+    ):
+        # Convenient form: ``(fermion, "number")``.
+        return operator[0].observable(operator[1])
+    if operator.__class__.__name__ == "Fermion":
+        raise TypeError(
+            "a Fermion helper is not itself an observable. Use, for example, "
+            "fermion.observable('number') or "
+            "fermion.operator_term(...), or pass "
+            "OpenLoopObservableTerm(where, operator)"
+        )
+    return operator
+
+
+def _normalize_open_observable_terms(terms):
+    """Normalize mappings and explicit ``(where, operator)`` term records."""
+    if isinstance(terms, OpenLoopObservableTerm):
+        records = ((terms.where, terms.operator),)
+    elif hasattr(terms, "items"):
+        records = tuple(terms.items())
+    else:
+        try:
+            records = tuple(terms)
+        except TypeError as exc:
+            raise TypeError(
+                "terms must be a mapping, OpenLoopObservableTerm, or an "
+                "iterable of (where, operator) pairs"
+            ) from exc
+
+    if not records:
+        raise ValueError("terms must contain at least one operator")
+    normalized = []
+    for item in records:
+        if isinstance(item, OpenLoopObservableTerm):
+            key = item.where
+            operator = item.operator
+        else:
+            try:
+                key, operator = item
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "observable terms must have form (where, operator)"
+                ) from exc
+        normalized.append((key, _resolve_open_observable_operator(operator)))
+    return tuple(normalized)
 
 
 def _partial_trace_loop_series(
@@ -1323,7 +2661,6 @@ def _partial_trace_loop_series(
     tids = frozenset(bp.tn._get_tids_from_tags(tags, "any"))
     if not tids:
         raise ValueError("where must contain at least one site in the network")
-
     kix = [bp.tn.site_ind(coo) for coo in where]
     import quimb.tensor as qtn
 
@@ -1725,58 +3062,59 @@ def _edge_series_terms_for_support(bp, tids, gloops, *, cache):
     return terms, inner_bonds
 
 
-def _open_edge_series_terms_for_support(bp, tids, gloops, *, cache):
-    """Parse open rho terms, allowing dangling Q edges at ``tids``."""
-    inner_bonds = frozenset(bp.tn._select_tids(tids).inner_inds())
-    allowed_tids = frozenset(tids)
+def _resolve_open_cutoffs(
+    legacy_gloops,
+    *,
+    edge_cutoff,
+    cluster_size,
+    native_cluster_route,
+):
+    """Resolve explicit open-series and cluster cutoffs without ambiguity."""
+    if edge_cutoff is not None and cluster_size is not None:
+        raise TypeError("pass only one of edge_cutoff and cluster_size")
 
-    if isinstance(gloops, (int, np.integer)):
-        cutoff = _validate_nonnegative_degree(gloops)
-        if cache is None:
-            terms = _enumerate_open_edge_loops(
-                bp.tn,
-                cutoff,
-                allowed_tids=allowed_tids,
-                excluded_edges=inner_bonds,
+    if legacy_gloops is not None:
+        if edge_cutoff is not None or cluster_size is not None:
+            raise TypeError(
+                "gloops is a legacy alias; do not combine it with "
+                "edge_cutoff or cluster_size"
             )
+        if native_cluster_route:
+            cluster_size = legacy_gloops
         else:
-            terms = cache.terms_for(
-                bp.tn,
-                cutoff,
-                allowed_tids,
-                excluded_edges=inner_bonds,
-            )
-        return terms, inner_bonds
+            edge_cutoff = legacy_gloops
 
-    if gloops is None:
-        max_degree = sum(
-            index not in inner_bonds
-            for index, _, _ in _pairwise_edges(bp.tn, norm="2norm")
+    if native_cluster_route:
+        if edge_cutoff is not None:
+            raise ValueError(
+                "cyclic native fermionic open observables use the graded "
+                "cluster route; pass cluster_size instead of edge_cutoff"
+            )
+        return None, cluster_size
+
+    if cluster_size is not None:
+        raise ValueError(
+            "cluster_size is only valid for the cyclic native fermionic "
+            "cluster route; pass edge_cutoff for explicit open-edge terms"
         )
-        if cache is None:
-            terms = _enumerate_open_edge_loops(
-                bp.tn,
-                max_degree,
-                allowed_tids=allowed_tids,
-                excluded_edges=inner_bonds,
-            )
-        else:
-            terms = cache.terms_for(
-                bp.tn,
-                max_degree,
-                allowed_tids,
-                excluded_edges=inner_bonds,
-            )
-        return terms, inner_bonds
+    return edge_cutoff, None
 
+
+def _explicit_open_terms_iterator(
+    bp,
+    tids,
+    gloops,
+    *,
+    inner_bonds,
+):
+    """Lazily validate explicit open-edge terms supplied by the caller."""
     edge_labels = {
         index
         for index, _, _ in _pairwise_edges(bp.tn, norm="2norm")
         if index not in inner_bonds
     }
-    terms = []
     seen = set()
-    for item in tuple(gloops):
+    for item in gloops:
         if isinstance(item, LoopSeriesTerm):
             edges = item.edges
         elif hasattr(item, "edges"):
@@ -1798,17 +3136,521 @@ def _open_edge_series_terms_for_support(bp, tids, gloops, *, cache):
         term = _open_term_from_edges(
             bp.tn,
             edges,
-            allowed_tids=allowed_tids,
+            allowed_tids=tids,
             excluded_edges=inner_bonds,
         )
         if term in seen:
             raise ValueError(f"duplicate open rho term: {term.edges!r}")
         seen.add(term)
-        terms.append(term)
+        yield term
 
-    return tuple(
-        sorted(terms, key=lambda term: (term.degree, tuple(map(repr, term.edges)))),
-    ), inner_bonds
+
+def _open_edge_series_terms_for_support(
+    bp,
+    tids,
+    edge_cutoff,
+    *,
+    cache,
+    max_terms=None,
+    max_enumeration_time=None,
+    max_enumeration_memory=None,
+    corridor_width=None,
+    max_path_candidates=8,
+    loop_decoration_size=4,
+    corridor_segment_length=32,
+    loop_radius=None,
+    max_loop_clusters_per_segment=8,
+    max_corridor_edges=100_000,
+    path_edge_weights=None,
+    support_coos=None,
+    corridor_info=None,
+):
+    """Parse open rho terms, allowing dangling Q edges at ``tids``."""
+    inner_bonds = frozenset(bp.tn._select_tids(tids).inner_inds())
+    allowed_tids = frozenset(tids)
+    limits = _OpenEnumerationLimits.validate(
+        max_terms=max_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+    )
+
+    if corridor_width is not None:
+        if edge_cutoff is not None and not isinstance(
+            edge_cutoff, (int, np.integer)
+        ):
+            raise TypeError(
+                "corridor mode accepts an integer edge_cutoff or None; "
+                "explicit edge subsets are not corridor paths"
+            )
+        options = _validate_corridor_options(
+            corridor_width=corridor_width,
+            max_path_candidates=max_path_candidates,
+            loop_decoration_size=loop_decoration_size,
+            corridor_segment_length=corridor_segment_length,
+            loop_radius=loop_radius,
+            max_loop_clusters_per_segment=max_loop_clusters_per_segment,
+            max_corridor_edges=max_corridor_edges,
+            corridor_max_bond=None,
+        )
+        total_edge_cutoff = (
+            None
+            if edge_cutoff is None
+            else _validate_nonnegative_degree(edge_cutoff)
+        )
+
+        def corridor_terms():
+            if limits.max_terms == 0:
+                raise OpenLoopEnumerationLimitError(
+                    "max_terms", limits.max_terms, 1
+                )
+            guard = _OpenEnumerationGuard(limits)
+            paths, corridor_edges, diagnostics = _discover_corridor_paths(
+                bp.tn,
+                allowed_tids,
+                support_coos=support_coos,
+                excluded_edges=inner_bonds,
+                corridor_width=options["corridor_width"],
+                max_path_candidates=options["max_path_candidates"],
+                corridor_segment_length=options["corridor_segment_length"],
+                max_corridor_edges=options["max_corridor_edges"],
+                edge_weights=path_edge_weights,
+                guard=guard,
+            )
+            diagnostics.update(
+                {
+                    "loop_decoration_size": options[
+                        "loop_decoration_size"
+                    ],
+                    "loop_radius": options["loop_radius"],
+                    "max_path_candidates": options["max_path_candidates"],
+                    "max_loop_clusters_per_segment": options[
+                        "max_loop_clusters_per_segment"
+                    ],
+                    "max_edge_cutoff": total_edge_cutoff,
+                    "approximation": "path_plus_connected_loop_decorations",
+                }
+            )
+            if corridor_info is not None:
+                corridor_info.clear()
+                corridor_info.update(diagnostics)
+            if (
+                total_edge_cutoff is not None
+                and diagnostics["shortest_path_length"] is not None
+                and diagnostics["shortest_path_length"] > total_edge_cutoff
+            ):
+                raise ValueError(
+                    "edge_cutoff is smaller than the shortest corridor path: "
+                    f"{total_edge_cutoff} < "
+                    f"{diagnostics['shortest_path_length']}"
+                )
+            yield from _iter_corridor_open_terms(
+                bp.tn,
+                paths,
+                corridor_edges,
+                allowed_tids=allowed_tids,
+                excluded_edges=inner_bonds,
+                total_edge_cutoff=total_edge_cutoff,
+                loop_decoration_size=options["loop_decoration_size"],
+                corridor_segment_length=options["corridor_segment_length"],
+                loop_radius=options["loop_radius"],
+                max_loop_clusters_per_segment=options[
+                    "max_loop_clusters_per_segment"
+                ],
+                limits=limits,
+                guard=guard,
+            )
+
+        return corridor_terms(), inner_bonds
+
+    if isinstance(edge_cutoff, (int, np.integer)):
+        cutoff = _validate_nonnegative_degree(edge_cutoff)
+        if cache is None:
+            terms = _iter_open_edge_loops(
+                bp.tn,
+                cutoff,
+                allowed_tids=allowed_tids,
+                excluded_edges=inner_bonds,
+                limits=limits,
+            )
+        else:
+            terms = cache.iter_terms_for(
+                bp.tn,
+                cutoff,
+                allowed_tids,
+                excluded_edges=inner_bonds,
+                max_terms=limits.max_terms,
+                max_enumeration_time=limits.max_enumeration_time,
+                max_enumeration_memory=limits.max_enumeration_memory,
+            )
+        return terms, inner_bonds
+
+    if edge_cutoff is None:
+        max_degree = sum(
+            index not in inner_bonds
+            for index, _, _ in _pairwise_edges(bp.tn, norm="2norm")
+        )
+        if cache is None:
+            terms = _iter_open_edge_loops(
+                bp.tn,
+                max_degree,
+                allowed_tids=allowed_tids,
+                excluded_edges=inner_bonds,
+                limits=limits,
+            )
+        else:
+            terms = cache.iter_terms_for(
+                bp.tn,
+                max_degree,
+                allowed_tids,
+                excluded_edges=inner_bonds,
+                max_terms=limits.max_terms,
+                max_enumeration_time=limits.max_enumeration_time,
+                max_enumeration_memory=limits.max_enumeration_memory,
+            )
+        return terms, inner_bonds
+
+    def limited_terms():
+        guard = _OpenEnumerationGuard(limits)
+        for term in _explicit_open_terms_iterator(
+            bp,
+            allowed_tids,
+            edge_cutoff,
+            inner_bonds=inner_bonds,
+        ):
+            guard.accept(term)
+            yield term
+
+    return limited_terms(), inner_bonds
+
+
+def _log10_sum_costs(costs):
+    """Sum positive costs represented in base-10 logarithmic form."""
+    values = [
+        10.0 ** float(cost["flops_log10"])
+        for cost in costs
+        if cost is not None and np.isfinite(cost["flops_log10"])
+    ]
+    if not values:
+        return None
+    return float(np.log10(sum(values)))
+
+
+def _cost_within_limits(cost, max_flops_log10, max_peak_memory_log2):
+    """Return whether a diagnostic cost passes both optional budgets."""
+    return (
+        cost is not None
+        and (
+            max_flops_log10 is None
+            or cost["flops_log10"] <= max_flops_log10
+        )
+        and (
+            max_peak_memory_log2 is None
+            or cost["peak_memory_log2"] <= max_peak_memory_log2
+        )
+    )
+
+
+def _diagnose_network_cost(
+    network,
+    *,
+    optimize,
+    contract_opts,
+    max_bond=None,
+):
+    """Build a contraction tree and return costs without contracting data."""
+    if "get" in contract_opts:
+        raise TypeError(
+            "contract_opts['get'] cannot be combined with open-series "
+            "diagnostics; diagnostics always build a contraction tree"
+        )
+    tree = network.contract(get="tree", optimize=optimize, **contract_opts)
+    return _contract_cost_record(tree, max_bond=max_bond)
+
+
+def _open_diagnostic_key(
+    sites,
+    gate,
+    *,
+    route,
+    edge_cutoff,
+    cluster_size,
+    corridor_options,
+    max_terms,
+    max_enumeration_time,
+    max_enumeration_memory,
+    max_flops_log10,
+    max_peak_memory_log2,
+    path_edge_weights,
+):
+    """Build a stable cache key for geometry and cost diagnostics."""
+    try:
+        shape = tuple(ar.do("shape", gate))
+    except Exception:
+        shape = repr(type(gate))
+    try:
+        dtype = repr(ar.do("dtype", gate))
+    except Exception:
+        dtype = repr(type(gate))
+    return (
+        tuple(sites),
+        route,
+        repr(edge_cutoff),
+        repr(cluster_size),
+        tuple(sorted((key, repr(value)) for key, value in corridor_options.items())),
+        max_terms,
+        max_enumeration_time,
+        max_enumeration_memory,
+        max_flops_log10,
+        max_peak_memory_log2,
+        repr(path_edge_weights),
+        shape,
+        dtype,
+    )
+
+
+def _diagnose_open_scalar_support(
+    bp,
+    where,
+    gate,
+    gloops,
+    *,
+    edge_cutoff,
+    cluster_size,
+    route_selection,
+    normalized,
+    optimize,
+    contract_opts,
+    cache,
+    max_flops_log10,
+    max_peak_memory_log2,
+    max_terms,
+    max_enumeration_time,
+    max_enumeration_memory,
+    corridor_options,
+    path_edge_weights,
+):
+    """Diagnose one scalar support without contracting numerical values."""
+    _align_symmray_d2bp_messages(bp)
+    bp.normalize_message_pairs()
+    bp.normalize_tensors()
+    tags = [bp.tn.site_tag(coo) for coo in where]
+    tids = frozenset(bp.tn._get_tids_from_tags(tags, "any"))
+    if not tids:
+        raise ValueError("where must contain at least one site in the network")
+    inner_bonds = frozenset(bp.tn._select_tids(tids).inner_inds())
+    where_key = tuple(where)
+    fermionic_q = _uses_symmray(bp.tn) and _gate_needs_fermionic_open_q(gate)
+    route = route_selection["route"]
+    total_costs = []
+
+    if route == "graded_cluster_compatible":
+        from quimb.tensor.belief_propagation import gen_region_counts
+
+        regions = tuple(
+            bp.tn.get_local_gloops(
+                tids=tids,
+                gloops=cluster_size,
+                grow_from="alldangle",
+                strict_size=False,
+            )
+        )
+        region_costs = {}
+        for region, _ in gen_region_counts(regions, autocomplete=True):
+            region = frozenset(region)
+            norm_cost = _diagnose_network_cost(
+                _get_d2_cluster_norm(bp, region),
+                optimize=optimize,
+                contract_opts=contract_opts,
+            )
+            gate_cost = _diagnose_network_cost(
+                _get_d2_cluster_norm(
+                    bp,
+                    region,
+                    gate=gate,
+                    gate_inds=[bp.tn.site_ind(coo) for coo in where],
+                ),
+                optimize=optimize,
+                contract_opts=contract_opts,
+            )
+            record = {
+                "norm": norm_cost,
+                "gate": gate_cost,
+                "flops_log10": max(
+                    norm_cost["flops_log10"], gate_cost["flops_log10"]
+                ),
+                "peak_memory_log2": max(
+                    norm_cost["peak_memory_log2"],
+                    gate_cost["peak_memory_log2"],
+                ),
+            }
+            region_costs[region] = record
+            total_costs.extend((norm_cost, gate_cost))
+        return {
+            "route": route,
+            "terms": (),
+            "requested_terms": (),
+            "term_costs": {},
+            "skipped_terms": {},
+            "cluster_region_costs": region_costs,
+            "corridor": {},
+            "base_cost": None,
+            "fermionic_q": fermionic_q,
+            "support_distance": route_selection["support_distance"],
+            "total_flops_log10": _log10_sum_costs(total_costs),
+            "peak_memory_log2": max(
+                (cost["peak_memory_log2"] for cost in total_costs),
+                default=None,
+            ),
+        }
+
+    corridor_info = {}
+    terms, inner_bonds = _open_edge_series_terms_for_support(
+        bp,
+        tids,
+        edge_cutoff,
+        cache=cache,
+        max_terms=max_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+        corridor_width=(
+            corridor_options["corridor_width"] if route == "corridor" else None
+        ),
+        max_path_candidates=corridor_options["max_path_candidates"],
+        loop_decoration_size=corridor_options["loop_decoration_size"],
+        corridor_segment_length=corridor_options["corridor_segment_length"],
+        loop_radius=corridor_options["loop_radius"],
+        max_loop_clusters_per_segment=corridor_options[
+            "max_loop_clusters_per_segment"
+        ],
+        max_corridor_edges=corridor_options["max_corridor_edges"],
+        path_edge_weights=path_edge_weights,
+        support_coos=where,
+        corridor_info=corridor_info,
+    )
+    requested_terms = tuple(terms)
+    kix = [bp.tn.site_ind(coo) for coo in where]
+    term_costs = {}
+    skipped_terms = {}
+    compressed_max_bond = (
+        corridor_options["corridor_max_bond"] if route == "corridor" else None
+    )
+    compressed = compressed_max_bond is not None
+    for term in requested_terms:
+        region = frozenset((*tids, *term.tids))
+        norm_network = _get_d2_edge_partial_trace_excited(
+            bp,
+            region,
+            excited_edges=term.edges,
+            exclude=inner_bonds,
+            projector_layout="open" if _uses_symmray(bp.tn) else "series",
+            fermionic_q=fermionic_q,
+            index_namespace=("diagnostic", "norm", where_key, term.edges),
+        )
+        gate_network = _get_d2_edge_partial_trace_excited(
+            bp,
+            region,
+            excited_edges=term.edges,
+            exclude=inner_bonds,
+            gate=gate,
+            gate_inds=kix,
+            projector_layout="open" if _uses_symmray(bp.tn) else "series",
+            gate_as_operator=True,
+            fermionic_q=fermionic_q,
+            index_namespace=("diagnostic", "gate", where_key, term.edges),
+        )
+        norm_cost = _diagnose_network_cost(
+            norm_network,
+            optimize=optimize,
+            contract_opts=contract_opts,
+            max_bond=compressed_max_bond if compressed else None,
+        )
+        gate_cost = _diagnose_network_cost(
+            gate_network,
+            optimize=optimize,
+            contract_opts=contract_opts,
+            max_bond=compressed_max_bond if compressed else None,
+        )
+        record = {
+            "norm": norm_cost,
+            "gate": gate_cost,
+            "flops_log10": max(
+                norm_cost["flops_log10"], gate_cost["flops_log10"]
+            ),
+            "peak_memory_log2": max(
+                norm_cost["peak_memory_log2"],
+                gate_cost["peak_memory_log2"],
+            ),
+        }
+        term_costs[term.edges] = record
+        total_costs.extend((norm_cost, gate_cost))
+        if not _cost_within_limits(
+            norm_cost, max_flops_log10, max_peak_memory_log2
+        ) or not _cost_within_limits(
+            gate_cost, max_flops_log10, max_peak_memory_log2
+        ):
+            skipped_terms[term.edges] = record
+
+    base_norm_network = _get_d2_edge_partial_trace_excited(
+        bp,
+        tids,
+        exclude=inner_bonds,
+        projector_layout="open" if _uses_symmray(bp.tn) else "series",
+        fermionic_q=fermionic_q,
+        index_namespace=("diagnostic", "base-norm", where_key),
+    )
+    base_gate_network = _get_d2_edge_partial_trace_excited(
+        bp,
+        tids,
+        exclude=inner_bonds,
+        gate=gate,
+        gate_inds=kix,
+        projector_layout="open" if _uses_symmray(bp.tn) else "series",
+        gate_as_operator=True,
+        fermionic_q=fermionic_q,
+        index_namespace=("diagnostic", "base-gate", where_key),
+    )
+    base_norm_cost = _diagnose_network_cost(
+        base_norm_network,
+        optimize=optimize,
+        contract_opts=contract_opts,
+        max_bond=compressed_max_bond if compressed else None,
+    )
+    base_gate_cost = _diagnose_network_cost(
+        base_gate_network,
+        optimize=optimize,
+        contract_opts=contract_opts,
+        max_bond=compressed_max_bond if compressed else None,
+    )
+    total_costs.extend((base_norm_cost, base_gate_cost))
+    base_cost = {
+        "norm": base_norm_cost,
+        "gate": base_gate_cost,
+        "flops_log10": max(
+            base_norm_cost["flops_log10"], base_gate_cost["flops_log10"]
+        ),
+        "peak_memory_log2": max(
+            base_norm_cost["peak_memory_log2"],
+            base_gate_cost["peak_memory_log2"],
+        ),
+    }
+    return {
+        "route": route,
+        "terms": requested_terms,
+        "requested_terms": requested_terms,
+        "term_costs": term_costs,
+        "skipped_terms": skipped_terms,
+        "cluster_region_costs": {},
+        "corridor": corridor_info,
+        "base_cost": base_cost,
+        "fermionic_q": fermionic_q,
+        "support_distance": route_selection["support_distance"],
+        "total_flops_log10": _log10_sum_costs(total_costs),
+        "peak_memory_log2": max(
+            (cost["peak_memory_log2"] for cost in total_costs),
+            default=None,
+        ),
+        "inner_bonds": inner_bonds,
+    }
 
 
 def _edge_series_suppression(
@@ -1938,6 +3780,8 @@ def _partial_trace_open_loop_series(
     where,
     gloops,
     *,
+    edge_cutoff,
+    cluster_size,
     normalized,
     optimize,
     contract_opts,
@@ -1945,6 +3789,21 @@ def _partial_trace_open_loop_series(
     info,
     max_flops_log10,
     max_peak_memory_log2,
+    max_terms,
+    max_enumeration_time,
+    max_enumeration_memory,
+    corridor_width,
+    max_path_candidates,
+    loop_decoration_size,
+    corridor_segment_length,
+    loop_radius,
+    max_loop_clusters_per_segment,
+    max_corridor_edges,
+    path_edge_weights,
+    corridor_max_bond,
+    mode,
+    auto_corridor_distance,
+    diagnostic_support,
 ):
     """Contract the explicit open-edge rho loop-series expansion."""
     if bp.__class__.__name__ != "D2BP":
@@ -1967,6 +3826,7 @@ def _partial_trace_open_loop_series(
     tids = frozenset(bp.tn._get_tids_from_tags(tags, "any"))
     if not tids:
         raise ValueError("where must contain at least one site in the network")
+    inner_bonds = frozenset(bp.tn._select_tids(tids).inner_inds())
 
     kix = [bp.tn.site_ind(coo) for coo in where]
     import quimb.tensor as qtn
@@ -1989,19 +3849,58 @@ def _partial_trace_open_loop_series(
             partial_trace_maps[map_key] = partial_trace_map
         bix = [partial_trace_map[index] for index in kix]
     output_inds = (*kix, *bix)
-    terms, inner_bonds = _open_edge_series_terms_for_support(
-        bp,
-        tids,
-        gloops,
-        cache=cache,
-    )
-    requested_terms = terms
     max_flops_log10, max_peak_memory_log2 = _validate_contraction_cost_limits(
         max_flops_log10,
         max_peak_memory_log2,
     )
 
-    if _use_native_fermionic_cluster_open_route(bp, where):
+    if diagnostic_support is not None and mode == "exact":
+        planned_route = diagnostic_support.get("route")
+        if planned_route == "corridor" and corridor_width is None:
+            mode = "corridor"
+            corridor_width = diagnostic_support.get("corridor_options", {}).get(
+                "corridor_width", 2
+            )
+    route_selection = _resolve_open_route(
+        bp,
+        where,
+        mode=mode,
+        corridor_width=corridor_width,
+        auto_corridor_distance=auto_corridor_distance,
+    )
+    native_cluster_route = route_selection["native_cluster_route"]
+    if (
+        diagnostic_support is not None
+        and gloops is None
+        and edge_cutoff is None
+        and cluster_size is None
+    ):
+        edge_cutoff = diagnostic_support.get("edge_cutoff")
+        cluster_size = diagnostic_support.get("cluster_size")
+    edge_cutoff, cluster_size = _resolve_open_cutoffs(
+        gloops,
+        edge_cutoff=edge_cutoff,
+        cluster_size=cluster_size,
+        native_cluster_route=native_cluster_route,
+    )
+
+    corridor_options = _validate_corridor_options(
+        corridor_width=route_selection["corridor_width"],
+        max_path_candidates=max_path_candidates,
+        loop_decoration_size=loop_decoration_size,
+        corridor_segment_length=corridor_segment_length,
+        loop_radius=loop_radius,
+        max_loop_clusters_per_segment=max_loop_clusters_per_segment,
+        max_corridor_edges=max_corridor_edges,
+        corridor_max_bond=corridor_max_bond,
+    )
+    if native_cluster_route and route_selection["corridor_width"] is not None:
+        raise ValueError(
+            "corridor mode is for explicit dense/tree open terms; cyclic "
+            "native fermionic observables use cluster_size"
+        )
+
+    if native_cluster_route:
         # See the scalar counterpart below.  This preserves a native
         # fermionic rho on cyclic graphs while avoiding the unsupported mixed
         # P/Q contraction path in Symmray.
@@ -2009,7 +3908,7 @@ def _partial_trace_open_loop_series(
         rho = _partial_trace_loop_cluster(
             bp,
             where,
-            gloops,
+            cluster_size,
             combine="sum",
             normalized=normalized,
             autocomplete=True,
@@ -2021,12 +3920,6 @@ def _partial_trace_open_loop_series(
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
         )
-        term_families = {
-            term.edges: _open_term_family(bp.tn, term)
-            for term in requested_terms
-        }
-        family_counts = Counter(term_families.values())
-        family_weights = {family: 0.0 for family in family_counts}
         if info is not None:
             cluster_region_costs = {
                 (where_key, region): cost
@@ -2040,8 +3933,8 @@ def _partial_trace_open_loop_series(
                     "cluster_rho_skipped_terms", {}
                 ).items()
             }
-            info["open_rho_requested_terms"] = requested_terms
-            info["open_rho_terms_list"] = requested_terms
+            info["open_rho_requested_terms"] = ()
+            info["open_rho_terms_list"] = ()
             info["open_rho_term_costs"] = dict(
                 cluster_info.get("cluster_rho_term_costs", {})
             )
@@ -2059,14 +3952,83 @@ def _partial_trace_open_loop_series(
                 "open_rho_cluster_region_skipped_terms"
             ] = cluster_region_skipped
             info["open_rho_weights"] = {}
-            info["open_rho_term_families"] = term_families
-            info["open_rho_family_counts"] = dict(family_counts)
-            info["open_rho_family_weights"] = family_weights
+            info["open_rho_term_families"] = {}
+            info["open_rho_family_counts"] = {}
+            info["open_rho_family_weights"] = {}
             info["open_rho_base_weight"] = _rho_trace(rho)
             info["open_rho_support_tids"] = tids
             info["open_rho_excluded_edges"] = inner_bonds
             info["open_rho_native_route"] = "graded_cluster_compatible"
+            info["open_rho_edge_cutoff"] = None
+            info["open_rho_cluster_size"] = cluster_size
+            info["open_rho_enumeration_limits"] = {
+                "max_terms": max_terms,
+                "max_enumeration_time": max_enumeration_time,
+                "max_enumeration_memory": max_enumeration_memory,
+            }
+            info["open_rho_mode"] = mode
+            info["open_rho_support_distance"] = route_selection[
+                "support_distance"
+            ]
+            info["open_rho_diagnostic"] = (
+                None
+                if diagnostic_support is None
+                else dict(diagnostic_support)
+            )
         return rho
+
+    corridor_info = (
+        None
+        if info is None
+        else info.setdefault("open_rho_corridor", {})
+    )
+    if diagnostic_support is not None:
+        if diagnostic_support.get("route") != route_selection["route"]:
+            raise ValueError(
+                "the supplied open-series diagnostic does not match the "
+                "route selected for this rho support"
+            )
+        terms = iter(diagnostic_support.get("terms", ()))
+        if corridor_info is not None:
+            corridor_info.clear()
+            corridor_info.update(diagnostic_support.get("corridor", {}))
+        inner_bonds = frozenset(
+            diagnostic_support.get(
+                "inner_bonds", bp.tn._select_tids(tids).inner_inds()
+            )
+        )
+    else:
+        terms, inner_bonds = _open_edge_series_terms_for_support(
+            bp,
+            tids,
+            edge_cutoff,
+            cache=cache,
+            max_terms=max_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+            corridor_width=corridor_options["corridor_width"],
+            max_path_candidates=corridor_options["max_path_candidates"],
+            loop_decoration_size=corridor_options["loop_decoration_size"],
+            corridor_segment_length=corridor_options["corridor_segment_length"],
+            loop_radius=corridor_options["loop_radius"],
+            max_loop_clusters_per_segment=corridor_options[
+                "max_loop_clusters_per_segment"
+            ],
+            max_corridor_edges=corridor_options["max_corridor_edges"],
+            path_edge_weights=path_edge_weights,
+            support_coos=where,
+            corridor_info=corridor_info,
+        )
+    requested_terms = []
+
+    compressed_corridor_opts = None
+    if corridor_options["corridor_max_bond"] is not None:
+        compressed_corridor_opts = {
+            "max_bond": corridor_options["corridor_max_bond"],
+            "tree_gauge_distance": corridor_options[
+                "corridor_segment_length"
+            ],
+        }
 
     term_cache = {} if info is None else info.setdefault("open_rho_terms", {})
     term_cost_cache = (
@@ -2075,13 +4037,26 @@ def _partial_trace_open_loop_series(
     skipped_terms = (
         {} if info is None else info.setdefault("open_rho_skipped_terms", {})
     )
+    path_cache = (
+        {}
+        if info is None
+        else info.setdefault("open_rho_region_path_cache", {})
+    )
     rho_terms = {}
     accepted_terms = []
     for term in terms:
+        requested_terms.append(term)
         if term.edges in skipped_terms:
             continue
         region = frozenset((*tids, *term.tids))
         cache_key = (term.edges, region, where_key)
+        region_key = (
+            "rho",
+            where_key,
+            tuple(sorted(region, key=repr)),
+            tuple(output_inds),
+            tuple(sorted(inner_bonds, key=repr)),
+        )
         try:
             rho_e = term_cache[cache_key]
         except KeyError:
@@ -2092,6 +4067,7 @@ def _partial_trace_open_loop_series(
                 partial_trace_map=partial_trace_map,
                 exclude=inner_bonds,
                 projector_layout="open",
+                index_namespace=region_key,
             )
             accepted, rho_e, cost = _contract_with_cost_limits(
                 rho_network,
@@ -2099,6 +4075,9 @@ def _partial_trace_open_loop_series(
                 contract_opts={"output_inds": output_inds, **contract_opts},
                 max_flops_log10=max_flops_log10,
                 max_peak_memory_log2=max_peak_memory_log2,
+                path_cache=path_cache,
+                path_cache_key=region_key,
+                compress_opts=compressed_corridor_opts,
             )
             if not accepted:
                 skipped_terms[term.edges] = cost
@@ -2124,6 +4103,20 @@ def _partial_trace_open_loop_series(
             partial_trace_map=partial_trace_map,
             exclude=inner_bonds,
             projector_layout="open",
+            index_namespace=(
+                "rho-base",
+                where_key,
+                tuple(sorted(tids, key=repr)),
+                tuple(output_inds),
+                tuple(sorted(inner_bonds, key=repr)),
+            ),
+        )
+        base_path_key = (
+            "rho-base",
+            where_key,
+            tuple(sorted(tids, key=repr)),
+            tuple(output_inds),
+            tuple(sorted(inner_bonds, key=repr)),
         )
         accepted, base, base_cost = _contract_with_cost_limits(
             base_network,
@@ -2131,6 +4124,9 @@ def _partial_trace_open_loop_series(
             contract_opts={"output_inds": output_inds, **contract_opts},
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
+            path_cache=path_cache,
+            path_cache_key=base_path_key,
+            compress_opts=compressed_corridor_opts,
         )
         if not accepted:
             raise ValueError(
@@ -2182,8 +4178,8 @@ def _partial_trace_open_loop_series(
         }
         info["open_rho_cluster_region_costs"] = {}
         info["open_rho_cluster_region_skipped_terms"] = {}
-        info["open_rho_requested_terms"] = requested_terms
-        info["open_rho_terms_list"] = terms
+        info["open_rho_requested_terms"] = tuple(requested_terms)
+        info["open_rho_terms_list"] = tuple(accepted_terms)
         info["open_rho_term_costs"] = dict(term_cost_cache)
         info["open_rho_skipped_terms"] = dict(skipped_terms)
         info["open_rho_cost_limits"] = {
@@ -2195,8 +4191,26 @@ def _partial_trace_open_loop_series(
         info["open_rho_family_counts"] = dict(family_counts)
         info["open_rho_family_weights"] = family_weights
         info["open_rho_base_weight"] = _rho_trace(base)
+        info["open_rho_bp_baseline"] = base / _rho_trace(base)
         info["open_rho_support_tids"] = tids
         info["open_rho_excluded_edges"] = inner_bonds
+        info["open_rho_edge_cutoff"] = edge_cutoff
+        info["open_rho_cluster_size"] = None
+        info["open_rho_enumeration_limits"] = {
+            "max_terms": max_terms,
+            "max_enumeration_time": max_enumeration_time,
+            "max_enumeration_memory": max_enumeration_memory,
+        }
+        info["open_rho_corridor_options"] = dict(corridor_options)
+        info["open_rho_mode"] = mode
+        info["open_rho_support_distance"] = route_selection[
+            "support_distance"
+        ]
+        info["open_rho_diagnostic"] = (
+            None
+            if diagnostic_support is None
+            else dict(diagnostic_support)
+        )
     return rho
 
 
@@ -2330,6 +4344,8 @@ def _local_expectation_open_loop_series(
     gate,
     gloops,
     *,
+    edge_cutoff,
+    cluster_size,
     normalized,
     optimize,
     contract_opts,
@@ -2337,6 +4353,21 @@ def _local_expectation_open_loop_series(
     info,
     max_flops_log10,
     max_peak_memory_log2,
+    max_terms,
+    max_enumeration_time,
+    max_enumeration_memory,
+    corridor_width,
+    max_path_candidates,
+    loop_decoration_size,
+    corridor_segment_length,
+    loop_radius,
+    max_loop_clusters_per_segment,
+    max_corridor_edges,
+    path_edge_weights,
+    corridor_max_bond,
+    mode,
+    auto_corridor_distance,
+    diagnostic_support,
 ):
     """Contract a gate through the explicit open-edge loop series."""
     if normalized == "prod":
@@ -2354,22 +4385,74 @@ def _local_expectation_open_loop_series(
     tids = frozenset(bp.tn._get_tids_from_tags(tags, "any"))
     if not tids:
         raise ValueError("where must contain at least one site in the network")
+    inner_bonds = frozenset(bp.tn._select_tids(tids).inner_inds())
 
     kix = [bp.tn.site_ind(coo) for coo in where]
-    terms, inner_bonds = _open_edge_series_terms_for_support(
-        bp,
-        tids,
-        gloops,
-        cache=cache,
-    )
     max_flops_log10, max_peak_memory_log2 = _validate_contraction_cost_limits(
         max_flops_log10,
         max_peak_memory_log2,
     )
     where_key = tuple(where)
     fermionic_q = _uses_symmray(bp.tn) and _gate_needs_fermionic_open_q(gate)
+    if diagnostic_support is not None and mode == "exact":
+        planned_route = diagnostic_support.get("route")
+        if planned_route == "corridor" and corridor_width is None:
+            mode = "corridor"
+            corridor_width = diagnostic_support.get("corridor_options", {}).get(
+                "corridor_width", 2
+            )
+    route_selection = _resolve_open_route(
+        bp,
+        where,
+        mode=mode,
+        corridor_width=corridor_width,
+        auto_corridor_distance=auto_corridor_distance,
+    )
+    if diagnostic_support is not None:
+        planned_route = diagnostic_support.get("route")
+        if planned_route is not None and planned_route != route_selection["route"]:
+            raise ValueError(
+                "the supplied open-series diagnostic was built for route "
+                f"{planned_route!r}, but the current measurement selected "
+                f"{route_selection['route']!r}"
+            )
+        if planned_route == "corridor":
+            corridor_width = diagnostic_support["corridor_options"][
+                "corridor_width"
+            ]
+    native_cluster_route = route_selection["native_cluster_route"]
+    if (
+        diagnostic_support is not None
+        and gloops is None
+        and edge_cutoff is None
+        and cluster_size is None
+    ):
+        edge_cutoff = diagnostic_support.get("edge_cutoff")
+        cluster_size = diagnostic_support.get("cluster_size")
+    edge_cutoff, cluster_size = _resolve_open_cutoffs(
+        gloops,
+        edge_cutoff=edge_cutoff,
+        cluster_size=cluster_size,
+        native_cluster_route=native_cluster_route,
+    )
 
-    if _use_native_fermionic_cluster_open_route(bp, where):
+    corridor_options = _validate_corridor_options(
+        corridor_width=route_selection["corridor_width"],
+        max_path_candidates=max_path_candidates,
+        loop_decoration_size=loop_decoration_size,
+        corridor_segment_length=corridor_segment_length,
+        loop_radius=loop_radius,
+        max_loop_clusters_per_segment=max_loop_clusters_per_segment,
+        max_corridor_edges=max_corridor_edges,
+        corridor_max_bond=corridor_max_bond,
+    )
+    if native_cluster_route and corridor_width is not None:
+        raise ValueError(
+            "corridor mode is for explicit dense/tree open terms; cyclic "
+            "native fermionic observables use cluster_size"
+        )
+
+    if native_cluster_route:
         # The explicit open-edge decomposition is exact for dense networks
         # and for fermionic trees. On a cyclic native Symmray graph, however,
         # a mixed P/Q network can require a non-pairwise fermionic contraction
@@ -2381,7 +4464,7 @@ def _local_expectation_open_loop_series(
             bp,
             where,
             gate,
-            gloops,
+            cluster_size,
             combine="sum",
             normalized=normalized,
             autocomplete=True,
@@ -2393,10 +4476,6 @@ def _local_expectation_open_loop_series(
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
         )
-        term_families = {
-            term.edges: _open_term_family(bp.tn, term) for term in terms
-        }
-        family_counts = Counter(term_families.values())
         if info is not None:
             cluster_region_costs = {
                 (where_key, region): cost
@@ -2410,8 +4489,8 @@ def _local_expectation_open_loop_series(
                     "cluster_scalar_skipped_terms", {}
                 ).items()
             }
-            info["open_scalar_requested_terms"] = terms
-            info["open_scalar_terms"] = terms
+            info["open_scalar_requested_terms"] = ()
+            info["open_scalar_terms"] = ()
             info["open_scalar_skipped_terms"] = dict(
                 cluster_info.get("cluster_scalar_skipped_terms", {})
             )
@@ -2420,8 +4499,8 @@ def _local_expectation_open_loop_series(
             )
             info["open_scalar_norm_weights"] = {}
             info["open_scalar_gate_terms"] = {}
-            info["open_scalar_term_families"] = term_families
-            info["open_scalar_family_counts"] = dict(family_counts)
+            info["open_scalar_term_families"] = {}
+            info["open_scalar_family_counts"] = {}
             info["open_scalar_family_weights"] = {}
             info["open_scalar_base_weight"] = normalization
             info["open_scalar_numerator"] = value * normalization
@@ -2441,7 +4520,70 @@ def _local_expectation_open_loop_series(
             info[
                 "open_scalar_cluster_region_skipped_terms"
             ] = cluster_region_skipped
+            info["open_scalar_edge_cutoff"] = None
+            info["open_scalar_cluster_size"] = cluster_size
+            info["open_scalar_enumeration_limits"] = {
+                "max_terms": max_terms,
+                "max_enumeration_time": max_enumeration_time,
+                "max_enumeration_memory": max_enumeration_memory,
+            }
+            info["open_scalar_mode"] = mode
+            info["open_scalar_support_distance"] = route_selection[
+                "support_distance"
+            ]
+            info["open_scalar_diagnostic"] = (
+                None
+                if diagnostic_support is None
+                else dict(diagnostic_support)
+            )
         return value, normalization
+
+    corridor_info = (
+        None
+        if info is None
+        else info.setdefault("open_scalar_corridor", {})
+    )
+    if diagnostic_support is not None:
+        terms = iter(diagnostic_support.get("terms", ()))
+        if corridor_info is not None:
+            corridor_info.clear()
+            corridor_info.update(diagnostic_support.get("corridor", {}))
+        inner_bonds = frozenset(
+            diagnostic_support.get(
+                "inner_bonds", bp.tn._select_tids(tids).inner_inds()
+            )
+        )
+    else:
+        terms, inner_bonds = _open_edge_series_terms_for_support(
+            bp,
+            tids,
+            edge_cutoff,
+            cache=cache,
+            max_terms=max_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+            corridor_width=corridor_options["corridor_width"],
+            max_path_candidates=corridor_options["max_path_candidates"],
+            loop_decoration_size=corridor_options["loop_decoration_size"],
+            corridor_segment_length=corridor_options["corridor_segment_length"],
+            loop_radius=corridor_options["loop_radius"],
+            max_loop_clusters_per_segment=corridor_options[
+                "max_loop_clusters_per_segment"
+            ],
+            max_corridor_edges=corridor_options["max_corridor_edges"],
+            path_edge_weights=path_edge_weights,
+            support_coos=where,
+            corridor_info=corridor_info,
+        )
+
+    compressed_corridor_opts = None
+    if corridor_options["corridor_max_bond"] is not None:
+        compressed_corridor_opts = {
+            "max_bond": corridor_options["corridor_max_bond"],
+            "tree_gauge_distance": corridor_options[
+                "corridor_segment_length"
+            ],
+        }
 
     norm_cache = (
         {} if info is None else info.setdefault("open_scalar_norm_terms", {})
@@ -2464,17 +4606,38 @@ def _local_expectation_open_loop_series(
     norm_terms = {}
     gate_terms = {}
     accepted_terms = []
+    requested_terms = []
     term_costs = {} if info is None else info.setdefault(
         "open_scalar_term_costs", {}
     )
     skipped_terms = {} if info is None else info.setdefault(
         "open_scalar_skipped_terms", {}
     )
+    path_cache = (
+        {}
+        if info is None
+        else info.setdefault("open_scalar_region_path_cache", {})
+    )
     for term in terms:
+        requested_terms.append(term)
         if (where_key, term.edges) in skipped_terms:
             continue
         region = frozenset((*tids, *term.tids))
         cache_key = (term.edges, region, where_key, fermionic_q)
+        norm_path_key = (
+            "norm",
+            where_key,
+            tuple(sorted(region, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)),
+            fermionic_q,
+        )
+        gate_path_key = (
+            "gate",
+            where_key,
+            tuple(sorted(region, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)),
+            fermionic_q,
+        )
         try:
             norm_e = norm_cache[cache_key]
             norm_cost = norm_cost_cache.get((where_key, term.edges))
@@ -2488,6 +4651,7 @@ def _local_expectation_open_loop_series(
                     "open" if _uses_symmray(bp.tn) else "series"
                 ),
                 fermionic_q=fermionic_q,
+                index_namespace=("open-scalar", *norm_path_key),
             )
             accepted, norm_e, norm_cost = _contract_with_cost_limits(
                 norm_network,
@@ -2495,6 +4659,9 @@ def _local_expectation_open_loop_series(
                 contract_opts=contract_opts,
                 max_flops_log10=max_flops_log10,
                 max_peak_memory_log2=max_peak_memory_log2,
+                path_cache=path_cache,
+                path_cache_key=norm_path_key,
+                compress_opts=compressed_corridor_opts,
             )
             if not accepted:
                 skipped_terms[(where_key, term.edges)] = {"norm": norm_cost}
@@ -2520,6 +4687,7 @@ def _local_expectation_open_loop_series(
                 ),
                 gate_as_operator=True,
                 fermionic_q=fermionic_q,
+                index_namespace=("open-scalar", *gate_path_key),
             )
             accepted, gate_e, gate_cost = _contract_with_cost_limits(
                 gate_network,
@@ -2527,6 +4695,9 @@ def _local_expectation_open_loop_series(
                 contract_opts=contract_opts,
                 max_flops_log10=max_flops_log10,
                 max_peak_memory_log2=max_peak_memory_log2,
+                path_cache=path_cache,
+                path_cache_key=gate_path_key,
+                compress_opts=compressed_corridor_opts,
             )
             if accepted:
                 gate_cache[gate_cache_key] = gate_e
@@ -2559,6 +4730,13 @@ def _local_expectation_open_loop_series(
         gate_terms[term.edges] = gate_e
 
     base_key = (where_key, tuple(kix), tids, inner_bonds, fermionic_q)
+    base_norm_path_key = (
+        "base-norm",
+        where_key,
+        tuple(sorted(tids, key=repr)),
+        tuple(sorted(inner_bonds, key=repr)),
+        fermionic_q,
+    )
     base_cache = (
         {} if info is None else info.setdefault("open_scalar_base_terms", {})
     )
@@ -2573,6 +4751,7 @@ def _local_expectation_open_loop_series(
                 "open" if _uses_symmray(bp.tn) else "series"
             ),
             fermionic_q=fermionic_q,
+            index_namespace=("open-scalar", *base_norm_path_key),
         )
         accepted, base_norm, base_cost = _contract_with_cost_limits(
             base_network,
@@ -2580,6 +4759,9 @@ def _local_expectation_open_loop_series(
             contract_opts=contract_opts,
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
+            path_cache=path_cache,
+            path_cache_key=base_norm_path_key,
+            compress_opts=compressed_corridor_opts,
         )
         if not accepted:
             raise ValueError(
@@ -2601,6 +4783,21 @@ def _local_expectation_open_loop_series(
         ),
         gate_as_operator=True,
         fermionic_q=fermionic_q,
+        index_namespace=(
+            "open-scalar",
+            "base-gate",
+            where_key,
+            tuple(sorted(tids, key=repr)),
+            tuple(sorted(inner_bonds, key=repr)),
+            fermionic_q,
+        ),
+    )
+    base_gate_path_key = (
+        "base-gate",
+        where_key,
+        tuple(sorted(tids, key=repr)),
+        tuple(sorted(inner_bonds, key=repr)),
+        fermionic_q,
     )
     accepted, base_value, base_gate_cost = _contract_with_cost_limits(
         base_gate_network,
@@ -2608,6 +4805,9 @@ def _local_expectation_open_loop_series(
         contract_opts=contract_opts,
         max_flops_log10=max_flops_log10,
         max_peak_memory_log2=max_peak_memory_log2,
+        path_cache=path_cache,
+        path_cache_key=base_gate_path_key,
+        compress_opts=compressed_corridor_opts,
     )
     if not accepted:
         raise ValueError(
@@ -2638,7 +4838,7 @@ def _local_expectation_open_loop_series(
             )
             for family in family_counts
         }
-        info["open_scalar_requested_terms"] = terms
+        info["open_scalar_requested_terms"] = tuple(requested_terms)
         info["open_scalar_terms"] = tuple(accepted_terms)
         info["open_scalar_edge_term_costs"] = dict(term_costs)
         info["open_scalar_edge_skipped_terms"] = dict(skipped_terms)
@@ -2656,6 +4856,10 @@ def _local_expectation_open_loop_series(
         info["open_scalar_base_weight"] = base_norm
         info["open_scalar_numerator"] = raw_value
         info["open_scalar_denominator"] = norm
+        info["open_scalar_bp_baseline"] = base_value / base_norm
+        info["open_scalar_corridor_correction"] = value - (
+            base_value / base_norm
+        )
         info["open_scalar_excluded_edges"] = inner_bonds
         info["open_scalar_native_route"] = (
             "graded_open_projectors"
@@ -2663,6 +4867,23 @@ def _local_expectation_open_loop_series(
             else "dense_open_projectors"
         )
         info["open_scalar_fermionic_q_phase"] = fermionic_q
+        info["open_scalar_edge_cutoff"] = edge_cutoff
+        info["open_scalar_cluster_size"] = None
+        info["open_scalar_enumeration_limits"] = {
+            "max_terms": max_terms,
+            "max_enumeration_time": max_enumeration_time,
+            "max_enumeration_memory": max_enumeration_memory,
+        }
+        info["open_scalar_corridor_options"] = dict(corridor_options)
+        info["open_scalar_mode"] = mode
+        info["open_scalar_support_distance"] = route_selection[
+            "support_distance"
+        ]
+        info["open_scalar_diagnostic"] = (
+            None
+            if diagnostic_support is None
+            else dict(diagnostic_support)
+        )
     return value, norm
 
 
@@ -3382,7 +5603,7 @@ def partial_trace_edge_loop_series_expand(
 def partial_trace_open_loop_series_sweep(
     tn,
     supports,
-    cutoffs,
+    cutoffs=None,
     *,
     messages=None,
     gauges=None,
@@ -3402,6 +5623,22 @@ def partial_trace_open_loop_series_sweep(
     optimize: Any = "auto-hq",
     max_flops_log10: float | None = None,
     max_peak_memory_log2: float | None = None,
+    edge_cutoffs=None,
+    cluster_sizes=None,
+    max_terms: int | None = None,
+    max_enumeration_time: float | None = None,
+    max_enumeration_memory: int | None = None,
+    mode: str = "exact",
+    auto_corridor_distance: int | None = 32,
+    corridor_width: int | None = None,
+    max_path_candidates: int = 8,
+    loop_decoration_size: int = 4,
+    corridor_segment_length: int = 32,
+    loop_radius: int | None = None,
+    max_loop_clusters_per_segment: int = 8,
+    max_corridor_edges: int | None = 100_000,
+    path_edge_weights=None,
+    corridor_max_bond: int | None = None,
     contract_opts: dict[str, Any] | None = None,
     **bp_opts,
 ) -> OpenLoopSeriesSweepResult:
@@ -3415,7 +5652,10 @@ def partial_trace_open_loop_series_sweep(
         The physical sites to retain for each rho. List and tuple site
         coordinates are normalized to hashable tuples.
     cutoffs : iterable of int or int
-        Maximum numbers of excited Q edges to evaluate, in order.
+        Legacy cutoff alias. Prefer ``edge_cutoffs`` for explicit edge terms
+        or ``cluster_sizes`` for the cyclic native fermionic route.
+    edge_cutoffs, cluster_sizes : iterable of int or int, optional
+        Route-specific cutoff sweep. Pass only one of these.
     messages, gauges, run_bp, ...
         BP controls matching :func:`partial_trace_open_loop_series_expand`.
 
@@ -3432,6 +5672,22 @@ def partial_trace_open_loop_series_sweep(
     underlying open-rho expansion. For native fermionic PEPS, the returned
     rhos are diagnostics; evaluate operators through the graded scalar APIs.
     """
+    if edge_cutoffs is not None and cluster_sizes is not None:
+        raise TypeError("pass only one of edge_cutoffs and cluster_sizes")
+    if edge_cutoffs is not None:
+        cutoffs = edge_cutoffs
+        cutoff_kind = "edge_cutoff"
+    elif cluster_sizes is not None:
+        cutoffs = cluster_sizes
+        cutoff_kind = "cluster_size"
+    else:
+        cutoff_kind = "legacy"
+
+    if cutoffs is None:
+        raise TypeError(
+            "pass cutoffs, edge_cutoffs, or cluster_sizes"
+        )
+
     if isinstance(cutoffs, (int, np.integer)):
         cutoffs = (int(cutoffs),)
     else:
@@ -3493,10 +5749,15 @@ def partial_trace_open_loop_series_sweep(
         support_rhos = {}
         support_diagnostics = {}
         for cutoff in cutoffs:
+            edge_cutoff = cutoff if cutoff_kind == "edge_cutoff" else None
+            cluster_size = cutoff if cutoff_kind == "cluster_size" else None
+            legacy_cutoff = cutoff if cutoff_kind == "legacy" else None
             rho = _partial_trace_open_loop_series(
                 bp,
                 support,
-                cutoff,
+                legacy_cutoff,
+                edge_cutoff=edge_cutoff,
+                cluster_size=cluster_size,
                 normalized=normalized,
                 optimize=optimize,
                 max_flops_log10=max_flops_log10,
@@ -3504,6 +5765,21 @@ def partial_trace_open_loop_series_sweep(
                 contract_opts=contract_opts,
                 cache=cache,
                 info=support_info,
+                max_terms=max_terms,
+                max_enumeration_time=max_enumeration_time,
+                max_enumeration_memory=max_enumeration_memory,
+                corridor_width=corridor_width,
+                max_path_candidates=max_path_candidates,
+                loop_decoration_size=loop_decoration_size,
+                corridor_segment_length=corridor_segment_length,
+                loop_radius=loop_radius,
+                max_loop_clusters_per_segment=max_loop_clusters_per_segment,
+                max_corridor_edges=max_corridor_edges,
+                path_edge_weights=path_edge_weights,
+                corridor_max_bond=corridor_max_bond,
+                mode=mode,
+                auto_corridor_distance=auto_corridor_distance,
+                diagnostic_support=None,
             )
             support_rhos[cutoff] = rho
             support_diagnostics[cutoff] = {
@@ -3536,6 +5812,12 @@ def partial_trace_open_loop_series_sweep(
                     support_info[
                         "open_rho_cluster_region_skipped_terms"
                     ]
+                ),
+                "enumeration_limits": dict(
+                    support_info["open_rho_enumeration_limits"]
+                ),
+                "corridor": dict(
+                    support_info.get("open_rho_corridor", {})
                 ),
                 "cost_limits": dict(support_info["open_rho_cost_limits"]),
             }
@@ -3578,13 +5860,30 @@ def partial_trace_open_loop_series_expand(
     optimize: Any = "auto-hq",
     max_flops_log10: float | None = None,
     max_peak_memory_log2: float | None = None,
+    edge_cutoff=None,
+    cluster_size=None,
+    max_terms: int | None = None,
+    max_enumeration_time: float | None = None,
+    max_enumeration_memory: int | None = None,
+    mode: str = "exact",
+    auto_corridor_distance: int | None = 32,
+    corridor_width: int | None = None,
+    max_path_candidates: int = 8,
+    loop_decoration_size: int = 4,
+    corridor_segment_length: int = 32,
+    loop_radius: int | None = None,
+    max_loop_clusters_per_segment: int = 8,
+    max_corridor_edges: int | None = 100_000,
+    path_edge_weights=None,
+    corridor_max_bond: int | None = None,
+    diagnostic: OpenLoopSeriesDiagnostic | None = None,
     info: dict[str, Any] | None = None,
     contract_opts: dict[str, Any] | None = None,
     **bp_opts,
 ):
     """Compute a long-range local rho from an explicit open-edge series.
 
-    The integer ``gloops`` cutoff counts excited ``Q`` virtual edges.  A
+    ``edge_cutoff`` counts excited ``Q`` virtual edges.  A
     retained edge subset may have degree one only at one of the selected
     physical rho sites; every other touched tensor must have either zero or at
     least two excited edges.  This keeps the open excitation paths connecting
@@ -3601,11 +5900,26 @@ def partial_trace_open_loop_series_expand(
     all retained terms have unit coefficient and are normalized only after
     summation.
 
+    On cyclic native fermionic networks, use ``cluster_size`` instead.  The
+    native route is selected before edge geometry is enumerated and contracts
+    graded message-closed tensor regions rather than mixed open ``P/Q`` edge
+    networks.  ``gloops`` remains accepted as a legacy alias, but new code
+    should use the route-specific parameter.
+
     ``messages`` can be supplied from a previously converged D2BP run with
     ``run_bp=False``.  This is the intended route for measuring many
-    long-range rho supports after one BP solve.  ``gloops=None`` enumerates up
+    long-range rho supports after one BP solve.  ``edge_cutoff=None`` enumerates up
     to the number of eligible pairwise virtual bonds and can be expensive;
     use an integer cutoff for practical calculations.
+
+    Set ``corridor_width`` to activate the large-separation approximation.
+    It keeps a bounded beam of weighted shortest support paths, inflates them
+    into a graph corridor, and adds only connected loop decorations sampled
+    near corridor segments. This route is deliberately approximate: it does
+    not enumerate disconnected products of distant loop clusters. Supply
+    ``corridor_max_bond`` to use compressed boundary contraction for long
+    corridors; ``corridor_segment_length`` controls its local compression
+    scale and loop sampling stride.
 
     Parameters
     ----------
@@ -3614,7 +5928,46 @@ def partial_trace_open_loop_series_expand(
     where : sequence
         The physical sites to retain in the reduced density matrix.
     gloops : int or iterable, optional
+        Legacy alias for ``edge_cutoff`` on dense/tree networks and for
+        ``cluster_size`` on cyclic native fermionic networks.
+    edge_cutoff : int or iterable, optional
         Maximum number of excited Q edges, or explicit virtual-edge subsets.
+    cluster_size : int or iterable, optional
+        Tensor-region cutoff or explicit cluster regions for the cyclic native
+        fermionic compatibility route.
+    max_terms : int, optional
+        Hard limit on discovered explicit edge terms. Exceeding it raises
+        :class:`OpenLoopEnumerationLimitError`; partial sums are never
+        returned silently.
+    max_enumeration_time : float, optional
+        Maximum edge-geometry discovery time in seconds.
+    max_enumeration_memory : int, optional
+        Approximate Python geometry memory budget in bytes.
+    corridor_width : int, optional
+        Graph distance used to inflate retained shortest paths. ``None`` keeps
+        the exact global edge-series route; a non-negative integer activates
+        corridor mode.
+    max_path_candidates : int, optional
+        Beam size for retained weighted shortest paths.
+    loop_decoration_size : int, optional
+        Maximum Q-edge size of one connected loop decoration.
+    corridor_segment_length : int, optional
+        Path stride for local loop sampling and compressed boundary gauges.
+    loop_radius : int, optional
+        Graph radius searched around each sampled path segment for loop
+        decorations. Defaults to one site or the corridor width, whichever is
+        larger.
+    max_loop_clusters_per_segment : int, optional
+        Maximum connected loop decorations retained near each sampled segment.
+    max_corridor_edges : int, optional
+        Hard corridor-geometry limit. Exceeding it raises
+        :class:`OpenLoopEnumerationLimitError`.
+    path_edge_weights : mapping, optional
+        Positive edge costs used to rank shortest paths. Unspecified edges
+        have unit cost.
+    corridor_max_bond : int, optional
+        If supplied, use compressed boundary contraction with this maximum
+        bond dimension for corridor terms.
     normalized : bool or {"prod", "separate"}, optional
         Whether to normalize the final explicit configuration sum.
     optimize : str or path optimizer, optional
@@ -3675,6 +6028,11 @@ def partial_trace_open_loop_series_expand(
             "estimate"
         )
 
+    diagnostic_support = (
+        None
+        if diagnostic is None
+        else diagnostic.supports.get(tuple(where))
+    )
     return _partial_trace_open_loop_series(
         bp,
         where,
@@ -3686,6 +6044,23 @@ def partial_trace_open_loop_series_expand(
         contract_opts=contract_opts,
         cache=cache or OpenLoopSeriesCache(),
         info=info,
+        edge_cutoff=edge_cutoff,
+        cluster_size=cluster_size,
+        max_terms=max_terms,
+        max_enumeration_time=max_enumeration_time,
+        max_enumeration_memory=max_enumeration_memory,
+        corridor_width=corridor_width,
+        max_path_candidates=max_path_candidates,
+        loop_decoration_size=loop_decoration_size,
+        corridor_segment_length=corridor_segment_length,
+        loop_radius=loop_radius,
+        max_loop_clusters_per_segment=max_loop_clusters_per_segment,
+        max_corridor_edges=max_corridor_edges,
+        path_edge_weights=path_edge_weights,
+        corridor_max_bond=corridor_max_bond,
+        mode=mode,
+        auto_corridor_distance=auto_corridor_distance,
+        diagnostic_support=diagnostic_support,
     )
 
 
@@ -4110,6 +6485,200 @@ def compute_local_expectation_edge_loop_series(
     return functools.reduce(operator.add, expecs.values())
 
 
+def diagnose_open_loop_series(
+    tn,
+    terms,
+    gloops=None,
+    *,
+    messages=None,
+    gauges=None,
+    run_bp: bool = True,
+    bp_runner: str = "plain",
+    relay_opts: dict[str, Any] | None = None,
+    max_iterations: int = 1000,
+    tol: float = 5e-6,
+    tol_abs: float | None = None,
+    tol_rolling_diff: float | None = 0.0,
+    diis: bool | dict[str, Any] = False,
+    damping: float = 0.0,
+    update: str = "sequential",
+    require_fixed_point: bool = True,
+    cache: OpenLoopSeriesCache | None = None,
+    diagnostic_cache: OpenLoopSeriesDiagnosticCache | None = None,
+    optimize: Any = "auto-hq",
+    max_flops_log10: float | None = None,
+    max_peak_memory_log2: float | None = None,
+    edge_cutoff=None,
+    cluster_size=None,
+    max_terms: int | None = None,
+    max_enumeration_time: float | None = None,
+    max_enumeration_memory: int | None = None,
+    mode: str = "auto",
+    auto_corridor_distance: int | None = 32,
+    corridor_width: int | None = None,
+    max_path_candidates: int = 8,
+    loop_decoration_size: int = 4,
+    corridor_segment_length: int = 32,
+    loop_radius: int | None = None,
+    max_loop_clusters_per_segment: int = 8,
+    max_corridor_edges: int | None = 100_000,
+    path_edge_weights=None,
+    corridor_max_bond: int | None = None,
+    contract_opts: dict[str, Any] | None = None,
+    **bp_opts,
+):
+    """Diagnose open-series geometry and contraction costs without measuring.
+
+    ``terms`` accepts the normal ``{where: operator}`` mapping, an iterable of
+    ``(where, operator)`` pairs, or :class:`OpenLoopObservableTerm`. Operators
+    produced by :class:`pepsy.tensors.Fermion` remain native and are never
+    Jordan--Wigner substituted. The result can be passed as
+    ``diagnostic=...`` to :func:`compute_local_expectation_open_loop_series`.
+
+    The diagnostic phase performs path/loop discovery and Cotengra tree-cost
+    estimation only. It does not contract tensor values. For ``mode="auto"``
+    native cyclic fermionic supports select the graded cluster-compatible
+    route first; long separated dense/tree supports select the bounded
+    corridor route, with ``auto_corridor_distance`` controlling that switch.
+    """
+    records = _normalize_open_observable_terms(terms)
+    contract_opts = {} if contract_opts is None else dict(contract_opts)
+    if require_fixed_point and run_bp and (
+        not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1
+    ):
+        raise ValueError("max_iterations must be a positive integer when run_bp=True")
+
+    bp, bp_info = _build_bp(
+        tn,
+        norm="2norm",
+        messages=messages,
+        gauges=gauges,
+        run_bp=run_bp,
+        bp_runner=bp_runner,
+        relay_opts=relay_opts,
+        max_iterations=max_iterations,
+        tol=tol,
+        tol_abs=tol_abs,
+        tol_rolling_diff=tol_rolling_diff,
+        diis=diis,
+        damping=damping,
+        update=update,
+        optimize=optimize,
+        bp_opts=bp_opts,
+        progbar=False,
+    )
+    if require_fixed_point and run_bp and not bp_info.get("converged", False):
+        raise RuntimeError(
+            "diagnose_open_loop_series requires converged BP messages; pass "
+            "require_fixed_point=False for an exploratory estimate"
+        )
+
+    cache = cache or OpenLoopSeriesCache()
+    diagnostic_cache = diagnostic_cache or OpenLoopSeriesDiagnosticCache()
+    max_flops_log10, max_peak_memory_log2 = _validate_contraction_cost_limits(
+        max_flops_log10,
+        max_peak_memory_log2,
+    )
+    support_reports = {}
+    cache_hits = 0
+    for where_key, gate in records:
+        sites = _term_sites(bp.tn, where_key)
+        selection = _resolve_open_route(
+            bp,
+            sites,
+            mode=mode,
+            corridor_width=corridor_width,
+            auto_corridor_distance=auto_corridor_distance,
+        )
+        edge_value, cluster_value = _resolve_open_cutoffs(
+            gloops,
+            edge_cutoff=edge_cutoff,
+            cluster_size=cluster_size,
+            native_cluster_route=selection["native_cluster_route"],
+        )
+        corridor_options = _validate_corridor_options(
+            corridor_width=selection["corridor_width"],
+            max_path_candidates=max_path_candidates,
+            loop_decoration_size=loop_decoration_size,
+            corridor_segment_length=corridor_segment_length,
+            loop_radius=loop_radius,
+            max_loop_clusters_per_segment=max_loop_clusters_per_segment,
+            max_corridor_edges=max_corridor_edges,
+            corridor_max_bond=corridor_max_bond,
+        )
+        key = _open_diagnostic_key(
+            sites,
+            gate,
+            route=selection["route"],
+            edge_cutoff=edge_value,
+            cluster_size=cluster_value,
+            corridor_options=corridor_options,
+            max_terms=max_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+            max_flops_log10=max_flops_log10,
+            max_peak_memory_log2=max_peak_memory_log2,
+            path_edge_weights=path_edge_weights,
+        )
+        report = diagnostic_cache.get(bp.tn, key)
+        if report is not None:
+            cache_hits += 1
+            support_reports[tuple(sites)] = report.supports[tuple(sites)]
+            continue
+        report_data = _diagnose_open_scalar_support(
+            bp,
+            sites,
+            gate,
+            gloops,
+            edge_cutoff=edge_value,
+            cluster_size=cluster_value,
+            route_selection=selection,
+            normalized=True,
+            optimize=optimize,
+            contract_opts=contract_opts,
+            cache=cache,
+            max_flops_log10=max_flops_log10,
+            max_peak_memory_log2=max_peak_memory_log2,
+            max_terms=max_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+            corridor_options=corridor_options,
+            path_edge_weights=path_edge_weights,
+        )
+        report_data.update(
+            {
+                "mode": mode,
+                "edge_cutoff": edge_value,
+                "cluster_size": cluster_value,
+                "corridor_options": corridor_options,
+                "cache_key": key,
+            }
+        )
+        support_report = OpenLoopSeriesDiagnostic({tuple(sites): report_data})
+        diagnostic_cache.put(bp.tn, key, support_report)
+        support_reports[tuple(sites)] = report_data
+
+    costs = [
+        report.get("total_flops_log10")
+        for report in support_reports.values()
+        if report.get("total_flops_log10") is not None
+    ]
+    peaks = [
+        report.get("peak_memory_log2")
+        for report in support_reports.values()
+        if report.get("peak_memory_log2") is not None
+    ]
+    total_flops = None if not costs else float(
+        np.log10(sum(10.0 ** value for value in costs))
+    )
+    return OpenLoopSeriesDiagnostic(
+        supports=support_reports,
+        total_flops_log10=total_flops,
+        peak_memory_log2=max(peaks, default=None),
+        cache_hits=cache_hits,
+    )
+
+
 def compute_local_expectation_open_loop_series(
     tn,
     terms,
@@ -4133,6 +6702,24 @@ def compute_local_expectation_open_loop_series(
     optimize: Any = "auto-hq",
     max_flops_log10: float | None = None,
     max_peak_memory_log2: float | None = None,
+    edge_cutoff=None,
+    cluster_size=None,
+    max_terms: int | None = None,
+    max_enumeration_time: float | None = None,
+    max_enumeration_memory: int | None = None,
+    mode: str = "exact",
+    auto_corridor_distance: int | None = 32,
+    corridor_width: int | None = None,
+    max_path_candidates: int = 8,
+    loop_decoration_size: int = 4,
+    corridor_segment_length: int = 32,
+    loop_radius: int | None = None,
+    max_loop_clusters_per_segment: int = 8,
+    max_corridor_edges: int | None = 100_000,
+    path_edge_weights=None,
+    corridor_max_bond: int | None = None,
+    diagnostic_cache: OpenLoopSeriesDiagnosticCache | None = None,
+    diagnostic: OpenLoopSeriesDiagnostic | None = None,
     info: dict[str, Any] | None = None,
     return_all: bool = False,
     contract_opts: dict[str, Any] | None = None,
@@ -4140,7 +6727,10 @@ def compute_local_expectation_open_loop_series(
 ):
     """Compute fermion-safe expectations from open-edge loop terms.
 
-    The terms mapping has the usual site-or-sites to gate form. Unlike the
+    The terms mapping has the usual site-or-sites to gate form. It can also be
+    an iterable of ``(where, operator)`` pairs or
+    :class:`OpenLoopObservableTerm`; native operators produced by
+    :class:`pepsy.tensors.Fermion` are accepted directly. Unlike the
     open rho API, this function evaluates the observable as a scalar numerator
     and identity denominator. Dense networks use direct gate insertion over
     the explicit open-path, closed-loop, and path-plus-loop configurations;
@@ -4148,9 +6738,19 @@ def compute_local_expectation_open_loop_series(
     the gate in the ket/bra contraction, so the graded gate ordering is
     preserved without materializing a diagnostic rho.
 
-    Integer gloops counts excited virtual edges. For native fermionic PEPS,
-    this is the preferred route for even two-site operators such as hopping,
-    pairing, and density terms.
+    ``edge_cutoff`` counts excited virtual edges on dense networks and
+    fermionic trees. For cyclic native fermionic PEPS, pass ``cluster_size``;
+    the safe graded cluster route is selected before edge terms are generated.
+    ``gloops`` remains a legacy route-dependent alias.
+
+    ``mode="auto"`` selects the graded cluster-compatible route for native
+    cyclic fermionic supports and the bounded corridor route for supports
+    farther apart than ``auto_corridor_distance``. ``mode="exact"`` is the
+    compatibility default; an explicitly supplied ``corridor_width`` still
+    activates corridor mode. For a strict two-phase workflow, call
+    :func:`diagnose_open_loop_series` first and pass its result as
+    ``diagnostic=...``. That reuses the discovered terms and records the
+    pre-contraction FLOP and peak-memory estimates in ``info``.
 
     ``optimize`` is forwarded unchanged to Quimb's
     ``TensorNetwork.contract`` calls. Callers can pass the reusable Cotengra
@@ -4165,11 +6765,21 @@ def compute_local_expectation_open_loop_series(
     ``info["open_scalar_cluster_region_skipped_terms"]`` depending on the
     native route. The older ``open_scalar_skipped_terms`` field is a
     route-specific compatibility alias.
+
+    ``max_terms``, ``max_enumeration_time``, and
+    ``max_enumeration_memory`` bound explicit edge-geometry discovery. A
+    bound violation raises :class:`OpenLoopEnumerationLimitError` rather than
+    returning a silently incomplete observable.
+
+    ``corridor_width`` activates the bounded long-separation route: weighted
+    shortest paths are retained in a small beam, the paths are inflated into
+    a corridor, and connected loop decorations are sampled near its segments.
+    Set ``corridor_max_bond`` for compressed boundary contraction. This is an
+    approximation and intentionally omits disconnected products of distant
+    loop clusters; widen the corridor or increase the decoration controls for
+    convergence diagnostics.
     """
-    if not hasattr(terms, "items"):
-        raise TypeError("terms must be a mapping from sites to operators")
-    if not terms:
-        raise ValueError("terms must contain at least one operator")
+    records = _normalize_open_observable_terms(terms)
     if normalized == "prod":
         normalized = True
     if normalized not in (True, False, "separate"):
@@ -4204,6 +6814,97 @@ def compute_local_expectation_open_loop_series(
         )
 
     cache = cache or OpenLoopSeriesCache()
+    cached_diagnostic_supports = {}
+    if diagnostic is None and (diagnostic_cache is not None or mode == "auto"):
+        diagnostic_flops, diagnostic_peak = _validate_contraction_cost_limits(
+            max_flops_log10,
+            max_peak_memory_log2,
+        )
+        for where_key, gate in records:
+            sites = _term_sites(bp.tn, where_key)
+            selection = _resolve_open_route(
+                bp,
+                sites,
+                mode=mode,
+                corridor_width=corridor_width,
+                auto_corridor_distance=auto_corridor_distance,
+            )
+            edge_value, cluster_value = _resolve_open_cutoffs(
+                gloops,
+                edge_cutoff=edge_cutoff,
+                cluster_size=cluster_size,
+                native_cluster_route=selection["native_cluster_route"],
+            )
+            corridor_options = _validate_corridor_options(
+                corridor_width=selection["corridor_width"],
+                max_path_candidates=max_path_candidates,
+                loop_decoration_size=loop_decoration_size,
+                corridor_segment_length=corridor_segment_length,
+                loop_radius=loop_radius,
+                max_loop_clusters_per_segment=max_loop_clusters_per_segment,
+                max_corridor_edges=max_corridor_edges,
+                corridor_max_bond=corridor_max_bond,
+            )
+            key = _open_diagnostic_key(
+                sites,
+                gate,
+                route=selection["route"],
+                edge_cutoff=edge_value,
+                cluster_size=cluster_value,
+                corridor_options=corridor_options,
+                max_terms=max_terms,
+                max_enumeration_time=max_enumeration_time,
+                max_enumeration_memory=max_enumeration_memory,
+                max_flops_log10=max_flops_log10,
+                max_peak_memory_log2=max_peak_memory_log2,
+                path_edge_weights=path_edge_weights,
+            )
+            cached = (
+                None
+                if diagnostic_cache is None
+                else diagnostic_cache.get(bp.tn, key)
+            )
+            if cached is not None:
+                cached_diagnostic_supports[tuple(sites)] = cached.supports[
+                    tuple(sites)
+                ]
+            elif mode == "auto":
+                report_data = _diagnose_open_scalar_support(
+                    bp,
+                    sites,
+                    gate,
+                    gloops,
+                    edge_cutoff=edge_value,
+                    cluster_size=cluster_value,
+                    route_selection=selection,
+                    normalized=True,
+                    optimize=optimize,
+                    contract_opts=contract_opts,
+                    cache=cache,
+                    max_flops_log10=diagnostic_flops,
+                    max_peak_memory_log2=diagnostic_peak,
+                    max_terms=max_terms,
+                    max_enumeration_time=max_enumeration_time,
+                    max_enumeration_memory=max_enumeration_memory,
+                    corridor_options=corridor_options,
+                    path_edge_weights=path_edge_weights,
+                )
+                report_data.update(
+                    {
+                        "mode": mode,
+                        "edge_cutoff": edge_value,
+                        "cluster_size": cluster_value,
+                        "corridor_options": corridor_options,
+                        "cache_key": key,
+                    }
+                )
+                cached_diagnostic_supports[tuple(sites)] = report_data
+                if diagnostic_cache is not None:
+                    diagnostic_cache.put(
+                        bp.tn,
+                        key,
+                        OpenLoopSeriesDiagnostic({tuple(sites): report_data}),
+                    )
     term_info = (
         {}
         if info is None
@@ -4215,8 +6916,13 @@ def compute_local_expectation_open_loop_series(
         else info.setdefault("open_scalar_supports", {})
     )
     expecs = {}
-    for where, gate in terms.items():
+    for where, gate in records:
         sites = _term_sites(bp.tn, where)
+        diagnostic_support = (
+            cached_diagnostic_supports.get(tuple(sites))
+            if diagnostic is None
+            else diagnostic.supports.get(tuple(sites))
+        )
         value, normalization = _local_expectation_open_loop_series(
             bp,
             sites,
@@ -4226,12 +6932,34 @@ def compute_local_expectation_open_loop_series(
             optimize=optimize,
             max_flops_log10=max_flops_log10,
             max_peak_memory_log2=max_peak_memory_log2,
+            edge_cutoff=edge_cutoff,
+            cluster_size=cluster_size,
+            max_terms=max_terms,
+            max_enumeration_time=max_enumeration_time,
+            max_enumeration_memory=max_enumeration_memory,
+            corridor_width=corridor_width,
+            max_path_candidates=max_path_candidates,
+            loop_decoration_size=loop_decoration_size,
+            corridor_segment_length=corridor_segment_length,
+            loop_radius=loop_radius,
+            max_loop_clusters_per_segment=max_loop_clusters_per_segment,
+            max_corridor_edges=max_corridor_edges,
+            path_edge_weights=path_edge_weights,
+            corridor_max_bond=corridor_max_bond,
+            mode=mode,
+            auto_corridor_distance=auto_corridor_distance,
+            diagnostic_support=diagnostic_support,
             contract_opts=contract_opts,
             cache=cache,
             info=info,
         )
-        term_info[where] = normalization
-        expecs[where] = value
+        result_key = where
+        try:
+            hash(result_key)
+        except TypeError:
+            result_key = tuple(sites)
+        term_info[result_key] = normalization
+        expecs[result_key] = value
         if info is not None:
             support_key = tuple(sites)
             support_edge_costs = {
@@ -4275,6 +7003,14 @@ def compute_local_expectation_open_loop_series(
                 "cluster_region_costs": support_cluster_costs,
                 "family_counts": dict(info["open_scalar_family_counts"]),
                 "family_weights": dict(info["open_scalar_family_weights"]),
+                "corridor": dict(
+                    info.get("open_scalar_corridor", {})
+                ),
+                "diagnostic": (
+                    None
+                    if diagnostic_support is None
+                    else dict(diagnostic_support)
+                ),
             }
     if return_all:
         return expecs

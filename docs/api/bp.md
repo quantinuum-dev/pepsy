@@ -7,6 +7,42 @@ the top-level package.
 
 > API details are maintained as handwritten Markdown in this page.
 
+## Native fermionic PEPO norm workflow
+
+Native fermionic PEPOs can be evolved with `gate_simple`, including its
+simple-update gauge dictionary, and their Frobenius norm can be measured with
+`PEPO.norm()`. The D2BP loop-cluster route accepts the evolved PEPO directly:
+
+```python
+from pepsy import Fermion, OneDMap
+from pepsy.operators.gates import gate_simple
+from pepsy.bp import loop_cluster_expand
+
+pepo = fermion.to_pepo(
+    terms,
+    Lx=2,
+    Ly=2,
+    mapper=OneDMap(2, 2, mode="snake-row-major"),
+    fermionic=True,
+)
+gauges = {}
+pepo.gauge_all_simple_(gauges=gauges, progbar=False)
+pepo = gate_simple(
+    pepo,
+    fermion.hopping_gate(0.001, t=1.0).H,
+    where=((0, 0), (0, 1)),
+    gauges=gauges,
+    inplace=False,
+)
+norm = pepo.norm()
+correction = loop_cluster_expand(pepo, gloops=2, norm="2norm")
+```
+
+This path preserves native `U1`, `U1U1`, and `Z2` tensors. Simple-update
+gauges are used by `gate_simple`; D2BP recomputes its own norm messages. The
+`norm="1norm"` gauge route requires a closed scalar tensor network, so it is
+not the direct route for an open PEPO with ket/bra physical indices.
+
 ## Long-range PEPS expectations
 
 Use `compute_boundary_expectation` for batched one- and two-site operators,
@@ -121,8 +157,8 @@ is completed.
 
 For separated sites, use `partial_trace_open_loop_series_expand` when the
 explicit configuration family should include Q paths between the retained
-sites. Its integer `gloops` is a maximum number of excited virtual edges. A
-configuration is retained when degree-one Q vertices occur only at the
+sites. Use `edge_cutoff` to set the maximum number of excited virtual edges.
+A configuration is retained when degree-one Q vertices occur only at the
 selected rho sites, so the sum contains open paths, closed loops, and
 path-plus-loop combinations:
 
@@ -137,19 +173,97 @@ bp = two_norm_bp(peps.tn, max_iterations=1000, tol=1e-10)
 rho = partial_trace_open_loop_series_expand(
     peps.tn,
     where=((0, 0), (0, 7)),
-    gloops=8,
+    edge_cutoff=8,
     messages=bp.messages,
     run_bp=False,
 )
 ```
+
+The edge geometry is generated lazily, with shortest support-connecting paths
+yielded first. Set `max_terms`, `max_enumeration_time`, or
+`max_enumeration_memory` to fail before an uncontrolled geometry expansion;
+limits raise `OpenLoopEnumerationLimitError` rather than returning a partial
+sum. `gloops` remains a compatibility alias, but new code should use the
+route-specific names.
+
+For very distant supports, set `corridor_width` to use the bounded corridor
+route. It retains a small weighted-shortest-path beam, inflates those paths
+by the requested graph width, and adds connected loop decorations only near
+sampled corridor segments:
+
+```python
+rho = partial_trace_open_loop_series_expand(
+    peps.tn,
+    where=((0, 0), (999, 999)),
+    corridor_width=4,
+    max_path_candidates=8,
+    loop_decoration_size=6,
+    corridor_segment_length=32,
+    max_loop_clusters_per_segment=8,
+    corridor_max_bond=128,
+    max_corridor_edges=100_000,
+)
+```
+
+This is an explicitly controlled approximation: disconnected products of
+far-separated loop clusters are omitted. Increase the corridor width,
+candidate count, decoration size, or boundary bond dimension and compare the
+incremental correction using the `open_rho_corridor` and
+`open_scalar_corridor` diagnostics. `path_edge_weights` can supply positive
+edge costs for ranking routes; unspecified edges have unit cost.
+
+For a measurement workflow that must inspect the geometry before doing any
+numerical contractions, use `diagnose_open_loop_series`. It accepts native
+operators made by `Fermion`, records the selected route, paths, loop terms,
+Cotengra FLOP estimates, and peak-memory estimates, and can be reused during
+measurement:
+
+```python
+from pepsy.bp import (
+    OpenLoopObservableTerm,
+    OpenLoopSeriesDiagnosticCache,
+    compute_local_expectation_open_loop_series,
+    diagnose_open_loop_series,
+)
+
+term = OpenLoopObservableTerm(
+    ((0, 0), (999, 999)),
+    fermion.hopping_operator(),
+)
+diagnostic = diagnose_open_loop_series(
+    peps.tn,
+    term,
+    mode="auto",
+    edge_cutoff=2_000,
+    max_terms=10_000,
+    diagnostic_cache=OpenLoopSeriesDiagnosticCache(),
+)
+value = compute_local_expectation_open_loop_series(
+    peps.tn,
+    term,
+    mode="auto",
+    diagnostic=diagnostic,
+)
+```
+
+The diagnostic phase builds contraction trees but does not contract tensor
+values. `mode="auto"` selects the graded cluster-compatible route first for
+cyclic native fermionic supports, and selects a corridor when the support
+distance exceeds `auto_corridor_distance`. Reusing the same
+`OpenLoopSeriesDiagnosticCache` lets later measurements reuse the geometry and
+cost report; distinct operator values with the same support and shape do not
+share numerical results. If no `diagnostic` is supplied, scalar measurement
+with `mode="auto"` performs this diagnostic pass internally before starting
+the numerical contractions.
 
 This path performs an explicit configuration sum and normalizes only after
 the sum; it does not apply the scalar disconnected-loop resummation used by
 `partial_trace_edge_loop_series_expand`.
 
 For a cutoff sweep, reuse both the converged messages and the two caches. The
-same `info` dictionary keeps already-contracted rho terms, while the
-`OpenLoopSeriesCache` keeps the eligible edge configurations:
+same `info` dictionary keeps already-contracted rho terms, regional
+contraction paths, and physical output labels, while the `OpenLoopSeriesCache`
+keeps the eligible edge configurations:
 
 ```python
 cache = OpenLoopSeriesCache()
@@ -158,7 +272,7 @@ for cutoff in (2, 4, 6, 8):
     rho = partial_trace_open_loop_series_expand(
         peps.tn,
         where=((0, 0), (0, 7)),
-        gloops=cutoff,
+        edge_cutoff=cutoff,
         messages=bp.messages,
         run_bp=False,
         cache=cache,
@@ -176,6 +290,22 @@ On cyclic native fermionic graphs, those scalar and rho APIs use the
 equivalent graded loop-cluster contraction internally because Symmray cannot
 currently contract arbitrary mixed open ``P/Q`` configurations; the returned
 rho remains native and the gate is still inserted in the ket/bra network.
+For that route, pass `cluster_size`, not `edge_cutoff`:
+
+```python
+rho = partial_trace_open_loop_series_expand(
+    peps.tn,
+    where=((0, 0), (0, 7)),
+    cluster_size=8,
+    messages=bp.messages,
+    run_bp=False,
+)
+```
+
+The cyclic native route is selected before explicit edge discovery, so its
+cluster regions do not pay the open-edge enumeration cost. Inspect
+`info["open_rho_cluster_region_costs"]` or
+`info["open_scalar_cluster_region_costs"]` for its contraction decisions.
 The same one-BP/many-support workflow is runnable in the downstream example
 `../pepsy_examples/symmetric_tensors/peps/bp_open_rho_series.py`; the
 long-range native doublon comparison is in

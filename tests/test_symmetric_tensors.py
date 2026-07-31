@@ -1115,6 +1115,238 @@ def test_fermion_explicit_coordinate_terms_preserve_peps_locations():
     assert mpo.L == 4
 
 
+def test_symhamiltonian_and_fermion_build_pepo_accept_mapper():
+    """Hamiltonian and model shorthands share the native PEPO route."""
+    pytest.importorskip("symmray")
+    fermion = Fermion(spinful=True, symmetry="U1U1")
+    left = (0, 0)
+    right = (1, 1)
+    term = fermion.operator_term(
+        [(1.0, ((left, "double"), (right, "annihilate_up")))],
+        sites=(left, right),
+        label="symhamiltonian_pepo",
+    )
+    hamiltonian = fermion.hamiltonian({(left, right): term})
+    mapper = OneDMap(2, 2, mode="snake-row-major")
+
+    pepo_from_hamiltonian = hamiltonian.to_pepo(
+        2,
+        2,
+        mapper=mapper,
+        max_bond=16,
+        compress=False,
+    )
+    pepo_from_model = fermion.build_pepo(
+        hamiltonian=hamiltonian,
+        Lx=2,
+        Ly=2,
+        mapper=mapper,
+        max_bond=16,
+        compress=False,
+    )
+
+    for pepo in (pepo_from_hamiltonian, pepo_from_model):
+        assert pepo.Lx == 2
+        assert pepo.Ly == 2
+        assert list(pepo)[-1].data.charge == term.charge
+        assert all(
+            type(tensor.data).__name__.endswith("FermionicArray")
+            for tensor in pepo
+        )
+
+
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_mixed_native_charges_return_explicit_mpo_and_pepo_sectors(symmetry):
+    """Mixed native operators decompose into homogeneous charge sectors."""
+    pytest.importorskip("symmray")
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    left = (0, 0)
+    middle = (0, 1)
+    right = (1, 1)
+    neutral = fermion.hopping_operator()
+    charged = fermion.operator_term(
+        [(1.0, ((middle, "double"), (right, "annihilate_up")))],
+        sites=(middle, right),
+        label="mixed_charge_sector",
+    )
+    hamiltonian = fermion.hamiltonian(
+        {
+            (left, middle): neutral,
+            (middle, right): charged,
+        }
+    )
+    mapper = OneDMap(2, 2, mode="snake-row-major")
+
+    mpo_sectors = hamiltonian.to_mpo(
+        mapper=mapper,
+        fermionic=True,
+        charge_sectors=True,
+        compress=False,
+    )
+    pepo_sectors = hamiltonian.to_pepo(
+        2,
+        2,
+        mapper=mapper,
+        fermionic=True,
+        charge_sectors=True,
+        compress=False,
+    )
+
+    assert set(mpo_sectors) == {fermion.zero_charge, charged.charge}
+    assert set(pepo_sectors) == {fermion.zero_charge, charged.charge}
+    for charge, mpo in mpo_sectors.items():
+        assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in mpo)
+        assert list(mpo)[-1].data.charge == charge
+    for pepo in pepo_sectors.values():
+        assert pepo.Lx == 2
+        assert pepo.Ly == 2
+        assert all(
+            type(tensor.data).__name__.endswith("FermionicArray")
+            for tensor in pepo
+        )
+
+
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_fermion_to_pepo_builds_native_coordinate_terms(symmetry):
+    """Fermion.to_pepo preserves native grading for supported symmetries."""
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    left = (0, 1)
+    right = (2, 2)
+    hopping = fermion.operator_term(
+        [(1.0, ((left, "create_up"), (right, "annihilate_up")))],
+        sites=(left, right),
+        add_hc=True,
+    )
+
+    pepo = fermion.to_pepo(
+        {(left, right): hopping},
+        Lx=3,
+        Ly=3,
+        max_bond=16,
+        compress=False,
+    )
+
+    assert pepo.Lx == 3
+    assert pepo.Ly == 3
+    assert set(pepo.outer_inds()) == {
+        f"k{x},{y}" for x in range(3) for y in range(3)
+    } | {
+        f"b{x},{y}" for x in range(3) for y in range(3)
+    }
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
+
+
+def test_fermion_to_pepo_native_result_supports_reverse_simple_update():
+    """Native PEPO output can take an adjoint gate through operator SU."""
+    fermion = Fermion(spinful=True, symmetry="U1U1")
+    left = (0, 0)
+    right = (0, 1)
+    term = fermion.operator_term(
+        [(1.0, ((left, "create_up"), (right, "annihilate_up")))],
+        sites=(left, right),
+        add_hc=True,
+    )
+    pepo = fermion.to_pepo(
+        {(left, right): term},
+        Lx=2,
+        Ly=2,
+        max_bond=16,
+        compress=False,
+    )
+    gauges = {}
+    pepo.gauge_all_simple_(gauges=gauges, progbar=False)
+
+    out = gate_simple(
+        pepo,
+        fermion.hopping_gate(0.001, t=1.0).H,
+        where=(left, right),
+        gauges=gauges,
+        max_bond=16,
+        cutoff=1e-10,
+        contract="split",
+        renorm=False,
+        inplace=False,
+    )
+
+    assert out.max_bond() <= 16
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in out)
+    assert len(gauges) > 0
+
+
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_fermion_to_pepo_supports_charged_odd_native_terms(symmetry):
+    """Charged odd terms retain their native charge and dummy mode."""
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    left = (0, 1)
+    right = (2, 2)
+    charged = fermion.operator_term(
+        [(1.0, ((left, "double"), (right, "annihilate_up")))],
+        sites=(left, right),
+        label="charged_pepo",
+    )
+
+    pepo = fermion.to_pepo(
+        {(left, right): charged},
+        Lx=3,
+        Ly=3,
+        max_bond=16,
+        compress=False,
+    )
+    tensors = list(pepo)
+
+    assert charged.charge != fermion.zero_charge
+    assert tensors[-1].data.charge == charged.charge
+    assert tensors[-1].data.label is not None
+    assert tensors[-1].data.dummy_modes
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in tensors)
+    with pytest.raises(ValueError, match="fermionic=True"):
+        fermion.to_mpo(
+            {(1, 8): charged},
+            L=9,
+            fermionic=False,
+        )
+
+
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_charged_native_pepo_supports_reverse_simple_update(symmetry):
+    """Neutral reverse evolution preserves a charged PEPO operator sector."""
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    left = (0, 0)
+    right = (0, 1)
+    charged = fermion.operator_term(
+        [(1.0, ((left, "double"), (right, "annihilate_up")))],
+        sites=(left, right),
+        label="charged_pepo",
+    )
+    pepo = fermion.to_pepo(
+        {(left, right): charged},
+        Lx=2,
+        Ly=2,
+        max_bond=16,
+        compress=False,
+    )
+    gauges = {}
+    pepo.gauge_all_simple_(gauges=gauges, progbar=False)
+
+    out = gate_simple(
+        pepo,
+        fermion.hopping_gate(0.001, t=1.0).H,
+        where=(left, right),
+        gauges=gauges,
+        max_bond=16,
+        cutoff=1e-10,
+        contract="split",
+        renorm=False,
+        inplace=False,
+    )
+
+    tensors = list(out)
+    assert tensors[-1].data.charge == charged.charge
+    assert tensors[-1].data.dummy_modes
+    assert out.max_bond() <= 16
+    assert len(gauges) > 0
+
+
 def test_unified_fermion_peps_energy_accepts_boundary_chi():
     """The shared Fermion Hamiltonian can use SymPEPS boundary measurement."""
     peps = SymPEPS.for_model(
