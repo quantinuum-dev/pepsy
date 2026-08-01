@@ -110,12 +110,13 @@ and `is_canonical_form(center)` delegate to the state, so the optimizer and its
 Local isometry orientation also has one owner: each live Quimb tensor carries
 its proven `left_inds`, while `TreeTensorNetwork.isometry_direction(node)` and
 `isometry_map()` derive read-only node-to-neighbour views from those tensors.
-`can_skip_canonize(a, b)` exposes the exact dense-edge condition used to avoid
-an already-proven QR, and `validate_isometry_metadata()` checks the local
+`can_skip_canonize(a, b)` exposes the exact local condition used to avoid an
+already-proven QR, and `validate_isometry_metadata()` checks the local
 orientations against the tracked canonical region. `TreeOptimizer` delegates
 the same four methods without maintaining another mutable map. Native
-fermionic trees retain explicit graded QR and therefore never report a
-skippable edge through this API.
+fermionic edges use this shortcut only when Symmray reports a fermionic array
+with aligned charge maps and a complete `left_inds` proof; otherwise they
+retain the explicit graded QR path.
 
 `TreeTensorNetwork.validate()` checks the live tensor set, physical legs, tree
 edges, and bond ownership against the `TreePlan`; pass
@@ -174,10 +175,12 @@ nodes.
 Application then proceeds recursively from subtree leaves to a hub: each local
 state/operator message is losslessly QR-split on one edge and absorbed by its
 parent, carrying every still-open operator virtual leg. No dense state tensor
-for the whole Steiner subtree is formed. Each dense routed Q tensor retains its
-`left_inds` isometry metadata, so canonical recovery recognizes that it already
-points toward the hub instead of repeating the same QR; native fermionic trees
-retain explicit graded QR recovery. Once all MPO factors have arrived, every
+for the whole Steiner subtree is formed. Each routed Q tensor, including native
+Symmray graded Q factors, retains its `left_inds` isometry metadata when
+available, so canonical recovery recognizes that it already points toward the
+hub instead of repeating the same QR. The native predicate additionally
+validates charge-map alignment before skipping. Once all MPO factors have
+arrived, every
 touched edge is compressed once. A bond that remains within its configured
 `max_bond` uses a lossless QR, avoiding repeated cutoff loss of tiny state
 components across successive sub-MPO events; when the MPO expands an edge
@@ -410,8 +413,11 @@ For circuits with gates of different operator-Schmidt ranks, use
 congestion-aware, and balanced candidates using the predicted log bond growth
 on every edge. A gate crossing an edge contributes `log2(k)`, where `k` is its
 operator-Schmidt rank across that edge; the maximum edge load therefore
-predicts the worst-case multiplicative bond growth. The default
-`objective="path"` remains the co-occurrence/path-length heuristic.
+predicts the worst-case multiplicative bond growth. `TreeOptimizer` uses
+`layout_objective="congestion"` by default because it is a better
+execution-oriented choice at finite `chi`; a bare `TreeLayoutFinder` retains
+`objective="path"` as its fast, backward-compatible default. The path
+objective remains the co-occurrence/path-length heuristic.
 `objective="hybrid"` is useful when both replay cost and bond pressure matter:
 it combines normalized path score, maximum edge load, and total edge load with
 `hybrid_weights=(path, max_edge_load, total_edge_load)`. The
@@ -431,15 +437,24 @@ set explicit budgets for a larger search. Dense operators wider than
 
 For a whole-tree optimization, use `objective="full_tree"` (also accepted as
 `"tree"` or `"cotengra"`). This evaluates dynamic operator-Schmidt demand,
-working tensor width, estimated work/write volume, and route length across
-every hierarchical scale, not only the root cut. It enables bounded subtree
-reconfiguration and simulated annealing by default; override these with
-`topology_refine="subtree"`, `topology_budget=`, `search="anneal"`, and
+cap overflow, working tensor width, estimated work/write volume, and route
+length across every hierarchical scale, not only the root cut. Finite-`chi`
+overflow and edge demand are ranked before tensor-work proxies, since avoiding
+unnecessary truncation is the primary execution concern. It enables bounded
+subtree reconfiguration and simulated annealing by default; override these
+with `topology_refine="subtree"`, `topology_budget=`, `search="anneal"`, and
 `search_budget=`. The result is still a cheap layout proxy rather than a real
 TTN replay, so the state-aware pilot remains the final accuracy check. The
 default `chi=None` leaves this as a static, chi-blind objective; supplying
 `chi` only adds cap-aware ranking and does not change the no-tensor nature of
 layout discovery.
+
+For the 6×6 periodic square-lattice calibration stream (Hadamards followed by
+periodic controlled-phase gates), predicted total overflow ranked binary,
+ternary, and four-way candidates in the same order as actual capped replay
+pressure and truncation counts. This validates the profile as a layout-ranking
+proxy; use the state-aware pilot when the circuit has strong cancellations or
+state-dependent rank loss.
 
 Use `order="quality"` with `finder.run()` (or set it on the finder) for the
 MPS-style high-quality offline search. Quality mode now means
@@ -693,6 +708,7 @@ choice = opt.optimize_layout(
     rounds=2,
     pilot_candidates=4,
     pilot_steps=64,
+    pilot_workers=2,
     topology_budget=32,
     search_budget=64,
 )
@@ -706,6 +722,11 @@ contains every round and `report["edge_diagnostics"]` identifies hot tree
 edges. `objective="full_tree"` combines all-scale static work/bond estimates
 with this short state-aware replay. `install=True` remounts the product state
 on the final plan; it remains rejected for an entangled state.
+
+Independent product-state pilots can be evaluated concurrently with
+pilot_workers greater than one; the default is one for minimal overhead and
+deterministic resource use. Candidate order and tie-breaking remain
+deterministic.
 
 Both helpers are also available from the package-level API:
 
@@ -924,7 +945,11 @@ scale.
   the global spectrum; native Symmray states compare the full and actually
   retained charge-block spectra using the same sector-aware truncation rule as
   the live update. Spectrum probes are opt-in because they add local SVD work
-  per truncation edge. The report also contains gate-level `updates`, grouping
+  per truncation edge. Enabling it emits a one-time warning because the
+  diagnostic spectrum probes can add substantial SVD work. It remains
+  disabled by default. Lossless zero-cutoff edges that are already within
+  their bond cap use QR and do not probe a spectrum even when tracking is on.
+  The report also contains gate-level `updates`, grouping
   edge events by support and reporting the cumulative relative loss.
 - `TreeOptimizer.convergence_sweep(gates, n, chi_values, ops=...)` replays the
   stream at several `chi` on one fixed tree and returns per-`chi` `max_bond`,
@@ -967,6 +992,19 @@ available through `truncation_report()`, `get_infidelities()`, and
 
 ## Performance and stability
 
+- **Lossless QR fast paths.** Zero-cutoff splits and edge updates whose
+  rank is already within the active bond cap use QR rather than SVD. This
+  includes the sibling-leaf split and remains valid for native graded QR.
+  A positive cutoff retains the existing rank-revealing compression semantics.
+- **Repeated-gate cache.** Direct gate SVDs and MPO factorizations are cached
+  by immutable payload identity, backend signature, support, and local
+  dimensions. The bounded cache returns fresh-index tensor copies, so it does
+  not share mutable network indices with the live state.
+- **Subtree and pilot parallelism.** Set `subtree_workers>1` to evaluate
+  independent dense leaf-to-hub QR messages in a wave, with deterministic
+  merging. Native fermionic routing stays serial because graded Symmray phase
+  bookkeeping has not been established as thread-safe. Set `pilot_workers>1`
+  for independent layout pilot replays; both options default to one.
 - **Sibling fast path.** A two-qubit gate on two leaves that share a parent is
   applied as a single two-site update: the two leaves and their parent are
   contracted into one blob, the gate is applied, and the blob is re-split by

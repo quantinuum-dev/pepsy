@@ -709,10 +709,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def isometry_direction(self, nid):
         """Return the neighbour proven by ``left_inds`` to receive node ``nid``.
 
-        A dense tree tensor is an isometry toward exactly one adjacent node
-        when its ``left_inds`` contain every leg except that shared tree bond.
-        ``None`` means no usable local proof is currently recorded. This is a
-        derived view of the live tensor metadata, not separately tracked state.
+        A tree tensor is an isometry toward exactly one adjacent node when its
+        ``left_inds`` contain every leg except that shared tree bond. ``None``
+        means no usable local proof is currently recorded. This is a derived
+        view of the live tensor metadata, not separately tracked state.
         """
         if nid not in self._plan.children:
             raise ValueError(f"{nid!r} is not a node of the tree.")
@@ -764,14 +764,16 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Whether local metadata proves edge canonicalisation is redundant.
 
         With ``absorb="right"`` node ``a`` must already be isometric toward
-        ``b``; the ``"left"`` orientation is symmetric. Native fermionic trees
-        always return ``False`` because their graded QR path remains explicit.
+        ``b``; the ``"left"`` orientation is symmetric. For native fermionic
+        tensors the same local proof is accepted only when the live data is a
+        Symmray fermionic array with aligned charge maps. This deliberately
+        checks structure, not numerical isometry: the metadata is written by
+        the native graded QR path, while malformed or unknown metadata falls
+        back to explicit graded QR.
         """
         if absorb not in {"right", "left"}:
             raise ValueError("absorb must be 'right' or 'left'.")
         bond = self.bond(a, b)  # validate the requested tree edge
-        if self.fermionic:
-            return False
         if absorb == "right":
             node = a
         else:
@@ -779,7 +781,38 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         tensor = self.node_tensor(node)
         if tensor.left_inds is None:
             return False
-        return set(tensor.left_inds) == set(tensor.inds) - {bond}
+        if set(tensor.left_inds) != set(tensor.inds) - {bond}:
+            return False
+        if not self.fermionic:
+            return True
+
+        # Native graded arrays carry the phase/charge convention in their
+        # index metadata. Do not infer it from dense data or trust arbitrary
+        # ``left_inds`` supplied by a caller: only the native array contract
+        # is eligible for this QR-free move.
+        data = tensor.data
+        if not getattr(data, "fermionic", False):
+            return False
+        indices = getattr(data, "indices", None)
+        duals = getattr(data, "duals", None)
+        charges = getattr(data, "charges", None)
+        if (
+            indices is None
+            or duals is None
+            or charges is None
+            or len(indices) != len(tensor.inds)
+            or len(duals) != len(tensor.inds)
+            or len(charges) != len(tensor.inds)
+        ):
+            return False
+        check_aligned = getattr(data, "check_chargemaps_aligned", None)
+        if check_aligned is None:
+            return False
+        try:
+            check_aligned()
+        except (AttributeError, TypeError, ValueError, KeyError):
+            return False
+        return True
 
     def validate_isometry_metadata(self, region=None):
         """Validate local ``left_inds`` against a canonical region.
@@ -1173,11 +1206,26 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def canonize_edge_(self, a, b, absorb="right"):
         """Canonicalise across the tree edge ``a -> b`` in place.
 
-        Dense/nonfermionic trees delegate to Quimb's ``canonize_between``.
-        Native fermionic trees use the explicit graded QR helper above.
+        Dense/nonfermionic trees delegate to Quimb's ``canonize_between``;
+        native fermionic trees use the explicit graded QR helper above.
         ``absorb="right"`` leaves node ``a`` isometric and pushes the tracked
-        orthogonality centre onto node ``b``.
+        orthogonality centre onto node ``b``. Edges whose live metadata proves
+        the required isometry are metadata-only moves for both dense and
+        native graded arrays.
         """
+        if self.can_skip_canonize(a, b, absorb=absorb):
+            # The local QR is already represented by the tensor's proven
+            # ``left_inds``. Keep centre bookkeeping honest, but do not touch
+            # tensor data or invalidate the norm cache.
+            previous = self.orthogonality_center
+            source, target = (
+                (a, b) if absorb == "right" else (b, a)
+            )
+            if previous == source:
+                self._canonical_region = frozenset({target})
+            elif previous not in (None, target):
+                self._canonical_region = None
+            return self
         previous = self.orthogonality_center
         if self.fermionic:
             self._fermionic_canonize_edge_(a, b, absorb)
@@ -1217,6 +1265,16 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         non-shared legs. Native fermionic compression ignores this option and
         retains its explicit graded split.
         """
+        bond = self.bond(a, b)
+        before_bond = int(self.ind_size(bond))
+        if cutoff == 0.0 and (
+            max_bond is None or before_bond <= int(max_bond)
+        ):
+            # No singular value can be removed, so a QR gauge move is exact
+            # for both dense and native graded trees. This also protects direct
+            # TreeTensorNetwork callers that do not go through the optimizer's
+            # diagnostic-aware wrapper.
+            return self.canonize_edge_(a, b, absorb=absorb)
         previous = self.orthogonality_center
         if self.fermionic:
             self._fermionic_compress_edge_(

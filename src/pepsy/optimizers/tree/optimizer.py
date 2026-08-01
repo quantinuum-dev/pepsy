@@ -339,8 +339,8 @@ class TreeOptimizer:
         estimated local tensor cost at ``chi``; ``"hypergraph"`` directly
         scores every original multi-qubit support across every crossed tree
         edge and enables bounded leaf/NNI refinement by default;
-        ``"full_tree"`` evaluates dynamic all-scale tensor width, work, write,
-        bond pressure, and route costs;
+        ``"full_tree"`` evaluates dynamic all-scale bond pressure, overflow,
+        tensor width, work, write, and route costs;
         ``"hybrid"`` combines normalized path, peak-load, and total-load
         costs. Pass a configured :class:`TreeLayoutFinder` through ``layout=``
         to customize its hybrid weights or enable pre-simulation refinement.
@@ -452,11 +452,12 @@ class TreeOptimizer:
                  structure="quality", max_arity=2,
                  top_arity=_DEFAULT_TOP_ARITY,
                  community_frac=0.35,
-                 star_frac=0.75, layout_objective="path",
+                 star_frac=0.75, layout_objective="congestion",
                  layout_weight_mode="count", layout_time_decay=None,
                  layout_time_window=None, layout=None, tree=None,
                  root_qubit=None,
-                 dtype=complex, threads=1, seed=None, run=True, tn=None,
+                 dtype=complex, threads=1, subtree_workers=1, seed=None,
+                 run=True, tn=None,
                  state=None, track_truncation=False, track_infidelity=True,
                  max_intermediate_bond=None,
                  max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
@@ -644,8 +645,12 @@ class TreeOptimizer:
         self.threads = None if threads is None else int(threads)
         if self.threads is not None and self.threads < 1:
             raise ValueError("threads must be positive or None.")
+        self.subtree_workers = self._positive_limit(
+            subtree_workers, "subtree_workers"
+        )
         self.rng = np.random.default_rng(seed)
         self.track_truncation = bool(track_truncation)
+        self._track_warning_emitted = False
         self.track_infidelity = bool(track_infidelity)
         self.max_intermediate_bond = self._positive_limit(
             max_intermediate_bond, "max_intermediate_bond"
@@ -668,6 +673,13 @@ class TreeOptimizer:
         self.normalizations = []
         self.projection_diagnostics = []
         self._backend_conversion_warnings = set()
+        # Gate payloads are treated as immutable during replay. Keeping a
+        # small identity-keyed cache avoids repeating the same operator SVD or
+        # MPO factorization for repeated circuit gates without hashing/copying
+        # large backend arrays. Entries retain the payload object so Python id
+        # reuse cannot return a stale factorization.
+        self._gate_factor_cache = {}
+        self._gate_factor_cache_limit = 64
         self._active_update = None
         self._truncation_survival = 1.0
 
@@ -1000,6 +1012,20 @@ class TreeOptimizer:
                 UserWarning,
                 stacklevel=3,
             )
+
+    def _warn_track_truncation_slow(self):
+        """Warn once that complete-spectrum diagnostics add SVD work."""
+        if self.track_truncation and not self._track_warning_emitted:
+            warnings.warn(
+                "TreeOptimizer track_truncation=True enables complete "
+                "singular-spectrum probes and can add extra SVDs for each "
+                "compressed edge; this diagnostic mode can substantially "
+                "slow replay. Use track_truncation=False for performance "
+                "runs.",
+                UserWarning,
+                stacklevel=3,
+            )
+            self._track_warning_emitted = True
 
     @staticmethod
     def _backend_converter(like):
@@ -1459,7 +1485,7 @@ class TreeOptimizer:
         return self.tn.isometry_map()
 
     def can_skip_canonize(self, a, b, *, absorb="right"):
-        """Whether local metadata proves this dense edge QR is redundant."""
+        """Whether local metadata proves this edge QR is redundant."""
         return self.tn.can_skip_canonize(a, b, absorb=absorb)
 
     def validate_isometry_metadata(self, region=None):
@@ -1563,6 +1589,7 @@ class TreeOptimizer:
             tree=plan,
             dtype=self.dtype,
             threads=self.threads,
+            subtree_workers=self.subtree_workers,
             track_truncation=True,
             track_infidelity=True,
             max_intermediate_bond=self.max_intermediate_bond,
@@ -1579,6 +1606,10 @@ class TreeOptimizer:
             trial.G = trial.G[:pilot_steps]
             trial.where = trial.where[:pilot_steps]
             trial.event_types = trial.event_types[:pilot_steps]
+        # Pilots intentionally enable full diagnostics, but their parent
+        # optimizer already owns the decision to pay that cost. Suppress the
+        # user-facing warning for these internal comparison replays.
+        trial._track_warning_emitted = True
         try:
             trial.run(progbar=progbar)
         except Exception as exc:  # pragma: no cover - backend-specific
@@ -1630,6 +1661,7 @@ class TreeOptimizer:
         pilot_candidates=4,
         candidate_budget=None,
         pilot_steps=None,
+        pilot_workers=1,
         include_quality=True,
         rounds=2,
         topology_budget=None,
@@ -1678,6 +1710,12 @@ class TreeOptimizer:
                 ) from exc
             if pilot_steps < 1:
                 raise ValueError("pilot_steps must be a positive integer or None.")
+        try:
+            pilot_workers = int(pilot_workers)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pilot_workers must be a positive integer.") from exc
+        if pilot_workers < 1:
+            raise ValueError("pilot_workers must be a positive integer.")
         if not _is_product_tensor_network(self.tn):
             raise ValueError(
                 "Tree layout pilots require a product initial state when "
@@ -1780,15 +1818,34 @@ class TreeOptimizer:
             else:
                 ranked = ranked_static[:pilot_candidates]
 
-            reports = {}
-            successful = []
-            for name in ranked:
-                report = self._pilot_layout_candidate(
-                    candidates[name]["plan"],
+            pilot_jobs = [
+                (name, candidates[name]["plan"])
+                for name in ranked
+            ]
+
+            def run_pilot(job):
+                name, plan = job
+                return name, self._pilot_layout_candidate(
+                    plan,
                     objective=finder.objective,
                     pilot_steps=pilot_steps,
                     progbar=progbar,
                 )
+
+            if pilot_workers > 1 and len(pilot_jobs) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(
+                    max_workers=min(pilot_workers, len(pilot_jobs)),
+                    thread_name_prefix="pepsy-tree-pilot",
+                ) as pool:
+                    pilot_results = list(pool.map(run_pilot, pilot_jobs))
+            else:
+                pilot_results = [run_pilot(job) for job in pilot_jobs]
+
+            reports = {}
+            successful = []
+            for name, report in pilot_results:
                 reports[name] = report
                 if report["status"] != "ok":
                     continue
@@ -1855,6 +1912,7 @@ class TreeOptimizer:
         pilot_candidates=4,
         candidate_budget=None,
         pilot_steps=None,
+        pilot_workers=1,
         include_quality=True,
         rounds=1,
         topology_budget=None,
@@ -1876,6 +1934,7 @@ class TreeOptimizer:
             pilot_candidates=pilot_candidates,
             candidate_budget=candidate_budget,
             pilot_steps=pilot_steps,
+            pilot_workers=pilot_workers,
             include_quality=include_quality,
             rounds=rounds,
             topology_budget=topology_budget,
@@ -2142,6 +2201,7 @@ class TreeOptimizer:
 
     def apply_gate(self, gate, where, *, renormalize=False):
         """Apply a gate and aggregate its edge truncation diagnostics."""
+        self._warn_track_truncation_slow()
         started = self._begin_update("gate", _normalize_where(where))
         try:
             result = self._apply_gate_impl(gate, where, renormalize=renormalize)
@@ -2223,7 +2283,14 @@ class TreeOptimizer:
             the progress bar omits the norm-based infidelity field and avoids
             the per-event norm readout. Truncation-spectrum diagnostics remain
             controlled independently by :attr:`track_truncation`.
+
+        Notes
+        -----
+        track_truncation remains False by default. Enabling it is a
+        diagnostic mode: complete singular spectra require additional
+        factorization work and can substantially slow replay.
         """
+        self._warn_track_truncation_slow()
         if mode is not None:
             requested_mode = str(mode).strip().lower()
             if requested_mode in {"tree", "ttn", "tree_tensor_network"}:
@@ -2251,6 +2318,7 @@ class TreeOptimizer:
             self.rng = np.random.default_rng(seed)
         if gates is not None:
             self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
+            self._gate_factor_cache.clear()
         self._validate_event_stream_for_run()
         self._validate_mode_for_stream()
         # Prepare the executable payloads without mutating the public queue.
@@ -2379,6 +2447,7 @@ class TreeOptimizer:
     def set_gates(self, gates):
         """Replace the queued gate stream and return ``self``."""
         self.G, self.where, self.event_types = self._normalize_gate_queue(gates)
+        self._gate_factor_cache.clear()
         return self
 
     def add_gates(self, gates):
@@ -2387,6 +2456,7 @@ class TreeOptimizer:
         self.G.extend(G_new)
         self.where.extend(where_new)
         self.event_types.extend(event_types_new)
+        self._gate_factor_cache.clear()
         return self
 
     @staticmethod
@@ -2611,6 +2681,7 @@ class TreeOptimizer:
         else:
             da = int(self.tn.ind_size(self._phys(qa)))
             db = int(self.tn.ind_size(self._phys(qb)))
+        cache_source = gate
         gate = self._as_gate_tensor4(gate, da, db)
 
         # ``MatrixProductOperator.from_dense`` is backend-generic: for a
@@ -2619,10 +2690,26 @@ class TreeOptimizer:
         # orientations. Its Tensor.split default has a nonzero cutoff, so make
         # the gate factorisation explicitly lossless; ``chi``/``self.cutoff``
         # are applied only after the complete gate reaches the TTN path.
-        submpo = qtn.MatrixProductOperator.from_dense(
-            gate, dims=(da, db), sites=(qa, qb), L=self.n,
-            max_bond=None, cutoff=0.0,
+        cache_key = (
+            "mpo",
+            id(cache_source),
+            _array_backend_signature(cache_source),
+            _array_backend_signature(self._state_like()),
+            qa,
+            qb,
+            da,
+            db,
+            self.n,
         )
+        cached = self._gate_factor_cache.get(cache_key)
+        if cached is not None and cached[0] is cache_source:
+            submpo = cached[1]
+        else:
+            submpo = qtn.MatrixProductOperator.from_dense(
+                gate, dims=(da, db), sites=(qa, qb), L=self.n,
+                max_bond=None, cutoff=0.0,
+            )
+            self._cache_gate_factorization(cache_key, cache_source, submpo)
         factors = self._two_site_mpo_factors(submpo, qa, qb)
         if factors is None:
             raise TypeError(
@@ -2637,6 +2724,15 @@ class TreeOptimizer:
             cutoff=cutoff,
             preserve_subcap=True,
         )
+
+    def _cache_gate_factorization(self, key, source, value):
+        """Store one immutable gate factorization in the bounded cache."""
+        if key in self._gate_factor_cache:
+            self._gate_factor_cache[key] = (source, value)
+            return
+        if len(self._gate_factor_cache) >= self._gate_factor_cache_limit:
+            self._gate_factor_cache.pop(next(iter(self._gate_factor_cache)))
+        self._gate_factor_cache[key] = (source, value)
 
     def _two_site_mpo_factors(self, submpo, qa, qb, *, site_where=None):
         """Extract and normalize a two-site Quimb MPO into local factors.
@@ -2685,15 +2781,38 @@ class TreeOptimizer:
         if len(bonds) != 1:
             return None
 
+        cache_key = (
+            "mpo_factors",
+            id(submpo),
+            _array_backend_signature(self._state_like()),
+            qa,
+            qb,
+            site_where,
+            self.n,
+        )
+        cached = self._gate_factor_cache.get(cache_key)
+        if cached is not None and cached[0] is submpo:
+            raw_factors, shared_bond = cached[1]
+        else:
+            raw_factors = {
+                qubit: (factor.copy(), upper, lower)
+                for qubit, (factor, upper, lower) in raw_factors.items()
+            }
+            shared_bond = bonds[0]
+            self._cache_gate_factorization(
+                cache_key, submpo, (raw_factors, shared_bond)
+            )
+
         thread_ind = qtn.rand_uuid()
         factors = {}
         outputs = {}
-        for qubit, (factor, upper, lower) in raw_factors.items():
+        for qubit, (factor_template, upper, lower) in raw_factors.items():
+            factor = factor_template.copy()
             output = qtn.rand_uuid()
             factor.reindex_({
                 upper: output,
                 lower: self._phys(qubit),
-                bonds[0]: thread_ind,
+                shared_bond: thread_ind,
             })
             factors[qubit] = factor
             outputs[qubit] = output
@@ -2704,6 +2823,7 @@ class TreeOptimizer:
     ):
         """Apply a two-qubit gate without opening another thread context."""
         gate = self._as_state_backend(gate)
+        cache_source = gate
         qa = self._validate_qubit(qa)
         qb = self._validate_qubit(qb)
         if qa == qb:
@@ -2712,27 +2832,81 @@ class TreeOptimizer:
         pa, pb = self._phys(qa), self._phys(qb)
         da, db = int(self.tn.ind_size(pa)), int(self.tn.ind_size(pb))
         gate = self._as_gate_tensor4(gate, da, db)
-        thread_ind = qtn.rand_uuid()
-        output_a, output_b = qtn.rand_uuid(), qtn.rand_uuid()
-        gate_tensor = qtn.Tensor(
-            gate, inds=(output_a, output_b, pa, pb),
-        )
-        left, right = gate_tensor.split(
-            left_inds=(output_a, pa),
-            method="svd",
-            cutoff=0.0,
-            absorb="both",
-            get="tensors",
-            bond_ind=thread_ind,
+        factors, outputs, thread_ind = self._cached_direct_gate_factors(
+            gate, cache_source, qa, qb, pa, pb, da, db,
         )
         return self._apply_2q_factors_impl(
-            {qa: left, qb: right},
-            {qa: output_a, qb: output_b},
+            factors,
+            outputs,
             thread_ind,
             qa,
             qb,
             max_bond=max_bond,
             cutoff=cutoff,
+        )
+
+    def _cached_direct_gate_factors(
+        self, gate, source, qa, qb, pa, pb, da, db,
+    ):
+        """Return fresh-index copies of a cached direct gate factorization."""
+        key = (
+            "direct",
+            id(source),
+            _array_backend_signature(source),
+            _array_backend_signature(self._state_like()),
+            qa,
+            qb,
+            da,
+            db,
+        )
+        cached = self._gate_factor_cache.get(key)
+        if cached is not None and cached[0] is source:
+            left_template, right_template = cached[1]
+        else:
+            template_out_a = "_pepsy_gate_out_a"
+            template_out_b = "_pepsy_gate_out_b"
+            template_in_a = "_pepsy_gate_in_a"
+            template_in_b = "_pepsy_gate_in_b"
+            template_thread = "_pepsy_gate_thread"
+            gate_tensor = qtn.Tensor(
+                gate,
+                inds=(
+                    template_out_a,
+                    template_out_b,
+                    template_in_a,
+                    template_in_b,
+                ),
+            )
+            left_template, right_template = gate_tensor.split(
+                left_inds=(template_out_a, template_in_a),
+                method="svd",
+                cutoff=0.0,
+                absorb="both",
+                get="tensors",
+                bond_ind=template_thread,
+            )
+            self._cache_gate_factorization(
+                key, source, (left_template, right_template)
+            )
+
+        thread_ind = qtn.rand_uuid()
+        output_a, output_b = qtn.rand_uuid(), qtn.rand_uuid()
+        left = left_template.copy()
+        right = right_template.copy()
+        left.reindex_({
+            "_pepsy_gate_out_a": output_a,
+            "_pepsy_gate_in_a": pa,
+            "_pepsy_gate_thread": thread_ind,
+        })
+        right.reindex_({
+            "_pepsy_gate_out_b": output_b,
+            "_pepsy_gate_in_b": pb,
+            "_pepsy_gate_thread": thread_ind,
+        })
+        return (
+            {qa: left, qb: right},
+            {qa: output_a, qb: output_b},
+            thread_ind,
         )
 
     def _apply_2q_factors_impl(
@@ -3100,10 +3274,14 @@ class TreeOptimizer:
             cutoff = self._subtree_cutoff_for_size(
                 before_bond, max_bond=max_bond, cutoff=cutoff,
             )
-        # An uncapped zero-cutoff routing split is provably lossless. Avoid an
-        # otherwise redundant full SVD spectrum probe when diagnostics are on;
-        # the subsequent final compression remains fully tracked.
-        lossless = max_bond is None and float(cutoff) == 0.0
+        # A zero-cutoff split whose rank bound is already within the requested
+        # cap cannot truncate. Use QR in that case, including capped splits:
+        # the previous uncapped-only condition needlessly sent sibling leaf
+        # updates through a full SVD even when the cap could not bind.
+        lossless = (
+            float(cutoff) == 0.0
+            and (max_bond is None or before_bond <= max_bond)
+        )
         full_spectrum = (
             self._probe_split_spectrum(
                 tensor,
@@ -3114,11 +3292,21 @@ class TreeOptimizer:
             )
             if self.track_truncation and not lossless else None
         )
-        left, right = tensor.split(
-            left_inds=left_inds, method="svd", max_bond=max_bond,
-            cutoff=cutoff, cutoff_mode=self.cutoff_mode,
-            absorb="right", get="tensors", bond_ind=bond_ind,
-        )
+        if lossless:
+            left, right = tensor.split(
+                left_inds=left_inds,
+                method="qr",
+                cutoff=0.0,
+                absorb="right",
+                get="tensors",
+                bond_ind=bond_ind,
+            )
+        else:
+            left, right = tensor.split(
+                left_inds=left_inds, method="svd", max_bond=max_bond,
+                cutoff=cutoff, cutoff_mode=self.cutoff_mode,
+                absorb="right", get="tensors", bond_ind=bond_ind,
+            )
         after_bond = self._tensor_ind_size(left, bond_ind)
         self._record_truncation(
             kind="split", edge=edge, before_bond=before_bond,
@@ -3154,13 +3342,14 @@ class TreeOptimizer:
         cutoff = self.cutoff if cutoff is None else float(cutoff)
         bond_before = self.tn.bond(u, v)
         before_bond = int(self.tn.ind_size(bond_before))
-        if (
-            not self.track_truncation
-            and cutoff == 0.0
+        lossless = (
+            cutoff == 0.0
             and (max_bond is None or before_bond <= max_bond)
-        ):
+        )
+        if lossless:
             # No singular value can be removed in this case. A lossless QR
-            # still moves the centre across the edge, but avoids an SVD.
+            # still moves the centre across the edge, but avoids both the
+            # diagnostic spectrum probe and the compression SVD.
             self.tn.canonize_edge_(u, v, absorb="right")
             bond_after = self.tn.bond(u, v)
             self._record_truncation(
@@ -3171,6 +3360,7 @@ class TreeOptimizer:
             return
         full_spectrum = None
         if self.track_truncation:
+            self._warn_track_truncation_slow()
             ta = self.tn.tensor_map[self._tid(u)]
             tb = self.tn.tensor_map[self._tid(v)]
             full_spectrum = self._probe_bond_spectrum(
@@ -3200,9 +3390,11 @@ class TreeOptimizer:
 
         Every caller compresses ``u -> v`` with ``absorb="right"``. If the
         live ``left_inds`` on ``v`` prove that it is already isometric toward
-        ``u``, Quimb can SVD only ``u`` and reuse ``v`` directly. Missing or
-        native graded metadata conservatively falls back to the usual
-        two-sided QR reduction.
+        ``u``, Quimb can SVD only ``u`` and reuse ``v`` directly. Native
+        graded metadata is accepted only after the TreeTensorNetwork charge
+        alignment guard; missing or malformed metadata falls back to the
+        usual two-sided reduction. The native compression kernel still uses
+        its explicit graded SVD regardless of this advisory ``reduced`` flag.
         """
         if self.tn.can_skip_canonize(u, v, absorb="left"):
             return "left"
@@ -3295,23 +3487,73 @@ class TreeOptimizer:
 
     def _route_subtree_messages(
         self, local, state_inds, operator_inds, order, *, token,
+        workers=None,
     ):
         """QR-route open MPO bonds from subtree leaves to their common hub."""
-        for u, v in order:
-            state_bond = self.tn.bond(u, v)
-            left_inds = [
-                index for index in local[u].inds
-                if index != state_bond and index not in operator_inds[u]
+        if workers is None:
+            workers = self.subtree_workers
+        workers = self._positive_limit(workers, "subtree_workers")
+        # Native graded contractions remain deliberately serial. The QR
+        # factorization is algebraically independent on a peel wave, but
+        # Symmray's global index/phase bookkeeping has not been proven
+        # thread-safe and correctness takes precedence over throughput there.
+        if self.tn.fermionic:
+            workers = 1
+
+        pending = list(order)
+        while pending:
+            ready = [
+                (index, u, v)
+                for index, (u, v) in enumerate(pending)
+                if u not in {dst for _, dst in pending}
             ]
-            new_bond = f"_ttn_mpo_route_{token}_{u}_{v}"
-            kept, message = self._qr_route_message(
-                local[u], left_inds, bond_ind=new_bond,
-            )
-            local[u] = kept
-            local[v] = qtn.tensor_contract(local[v], message)
-            state_inds[v].discard(state_bond)
-            state_inds[v].add(new_bond)
-            operator_inds[v] = set(local[v].inds) - state_inds[v]
+            if not ready:
+                raise RuntimeError(
+                    "subtree peel order contains a cyclic message dependency."
+                )
+            if workers == 1:
+                ready = ready[:1]
+
+            def split_message(item):
+                index, u, v = item
+                state_bond = self.tn.bond(u, v)
+                left_inds = [
+                    ix for ix in local[u].inds
+                    if ix != state_bond and ix not in operator_inds[u]
+                ]
+                new_bond = f"_ttn_mpo_route_{token}_{u}_{v}"
+                kept, message = self._qr_route_message(
+                    local[u], left_inds, bond_ind=new_bond,
+                )
+                return index, u, v, state_bond, new_bond, kept, message
+
+            if workers > 1 and len(ready) > 1:
+                from concurrent.futures import ThreadPoolExecutor
+
+                with ThreadPoolExecutor(
+                    max_workers=min(workers, len(ready)),
+                    thread_name_prefix="pepsy-ttn-qr",
+                ) as pool:
+                    results = list(pool.map(split_message, ready))
+            else:
+                results = [split_message(item) for item in ready]
+
+            # Merge in peel-order order. At this point worker tensors are
+            # private and no destination tensor has been modified yet, so
+            # equal-destination messages remain deterministic.
+            for index, u, v, state_bond, new_bond, kept, message in sorted(
+                results
+            ):
+                local[u] = kept
+                local[v] = qtn.tensor_contract(local[v], message)
+                state_inds[v].discard(state_bond)
+                state_inds[v].add(new_bond)
+                operator_inds[v] = set(local[v].inds) - state_inds[v]
+            removed = {index for index, *_ in results}
+            pending = [
+                edge for index, edge in enumerate(pending)
+                if index not in removed
+            ]
 
     def _install_routed_subtree(self, local, snodes, hub):
         """Install routed tensors and recover their proven hub centre.
@@ -3319,28 +3561,30 @@ class TreeOptimizer:
         Dense routing already QR-isometrizes every peeled non-hub tensor toward
         ``hub``. Retaining each Q factor's ``left_inds`` lets Quimb's canonical
         recovery walk short-circuit those decompositions while still advancing
-        the canonical-region state machine honestly. Native fermionic tensors
-        deliberately keep the prior behavior: their graded QR recovery remains
-        explicit inside :class:`TreeTensorNetwork`.
+        the canonical-region state machine honestly. Native graded routing
+        retains the same metadata when Symmray supplied it; the
+        :class:`TreeTensorNetwork` predicate validates the charge maps and
+        falls back to explicit graded QR otherwise.
         """
-        dense = not self.tn.fermionic
         for nid in snodes:
             routed = local[nid]
             modify_opts = {
                 "data": routed.data,
                 "inds": routed.inds,
             }
-            if dense:
-                if nid == hub:
-                    # The accumulated operator and state norm live here.
-                    modify_opts["left_inds"] = None
-                else:
-                    if routed.left_inds is None:
-                        raise RuntimeError(
-                            "dense subtree routing lost QR isometry metadata "
-                            f"for non-hub node {nid}."
-                        )
-                    modify_opts["left_inds"] = routed.left_inds
+            if nid == hub:
+                # The accumulated operator and state norm live here.
+                modify_opts["left_inds"] = None
+            elif routed.left_inds is not None:
+                # Both dense and native QR return a Q factor with a live
+                # isometry proof. The network-level predicate performs the
+                # stricter native charge-map check when this is installed.
+                modify_opts["left_inds"] = routed.left_inds
+            elif not self.tn.fermionic:
+                raise RuntimeError(
+                    "dense subtree routing lost QR isometry metadata "
+                    f"for non-hub node {nid}."
+                )
             self.tn.tensor_map[self._tid(nid)].modify(**modify_opts)
 
         self.tn.canonical_region = frozenset(snodes)
@@ -3351,6 +3595,7 @@ class TreeOptimizer:
     def apply_subtree_operator(self, op, where, *, max_bond=None,
                                cutoff=None, renormalize=False):
         """Apply a subtree operator and aggregate its edge truncations."""
+        self._warn_track_truncation_slow()
         self._invalidate_state_norm_cache()
         started = self._begin_update("subtree", _normalize_where(where))
         try:
@@ -3376,6 +3621,7 @@ class TreeOptimizer:
         one compression sweep. Opaque MPO-like payloads fall back to dense
         :meth:`apply_subtree_operator` lowering.
         """
+        self._warn_track_truncation_slow()
         self._invalidate_state_norm_cache()
         logical_where = _normalize_where(where)
         where = self._validate_support(logical_where)
@@ -3778,6 +4024,7 @@ class TreeOptimizer:
 
         self._route_subtree_messages(
             local, state_inds, operator_inds, order, token=qtn.rand_uuid(),
+            workers=self.subtree_workers,
         )
 
         if operator_inds[hub]:
@@ -3824,6 +4071,7 @@ class TreeOptimizer:
 
         self._route_subtree_messages(
             local, state_inds, operator_inds, order, token=qtn.rand_uuid(),
+            workers=self.subtree_workers,
         )
         if operator_inds[hub]:
             raise ValueError(
@@ -4867,6 +5115,7 @@ class TreeOptimizer:
             tree=self.plan,
             dtype=self.dtype,
             threads=self.threads,
+            subtree_workers=self.subtree_workers,
             layout_objective=self.layout_objective,
             layout_weight_mode=self.layout_weight_mode,
             layout_time_decay=self.layout_time_decay,
@@ -4895,6 +5144,7 @@ class TreeOptimizer:
         other._backend_conversion_warnings = set(
             self._backend_conversion_warnings
         )
+        other._track_warning_emitted = self._track_warning_emitted
         other._logical_qubits = list(self._logical_qubits)
         other._logical_positions = dict(self._logical_positions)
         other._truncation_survival = self._truncation_survival
@@ -4931,7 +5181,7 @@ class TreeOptimizer:
     @classmethod
     def find_tree_layout(cls, gates, n=None, *, structure="quality",
                          max_arity=2, community_frac=0.35,
-                         star_frac=0.75, layout_objective="path",
+                         star_frac=0.75, layout_objective="congestion",
                          layout_weight_mode="count",
                          layout_time_decay=None, layout_time_window=None,
                          root_qubit=None, top_arity=_DEFAULT_TOP_ARITY,

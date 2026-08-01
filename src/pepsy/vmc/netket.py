@@ -4359,6 +4359,54 @@ def netket_fermion_operator(hilbert, terms, *, constant=0.0, conserving=False):
     return total
 
 
+def _fermi_hubbard_terms(edges, n_sites, *, t, U):
+    """Return second-quantized terms for the spinful Hubbard Hamiltonian."""
+    terms = []
+    for site in range(int(n_sites)):
+        terms.append(
+            (
+                U,
+                (
+                    (site, +1, True),
+                    (site, +1, False),
+                    (site, -1, True),
+                    (site, -1, False),
+                ),
+            )
+        )
+    for left, right in edges:
+        left, right = int(left), int(right)
+        for spin in (+1, -1):
+            terms.extend(
+                (
+                    (-t, ((left, spin, True), (right, spin, False))),
+                    (-t, ((right, spin, True), (left, spin, False))),
+                )
+            )
+    return terms
+
+
+def _build_netket_fermi_hubbard_operator(hilbert, graph, *, n_sites, t, U):
+    """Build Hubbard metadata across NetKet's native API generations.
+
+    NetKet releases before the removal of ``FermiHubbardJax`` expose the
+    equivalent second-quantized operator instead. The fallback preserves the
+    fixed spin sector and uses NetKet's conserving implementation when
+    available; it is not a dense or Jordan--Wigner conversion.
+    """
+    nk = _require_netket()
+    native = getattr(nk.operator, "FermiHubbardJax", None)
+    if native is not None:
+        return native(hilbert, graph=graph, t=t, U=U, dtype=float)
+
+    edges = tuple(graph.edges())
+    return netket_fermion_operator(
+        hilbert,
+        _fermi_hubbard_terms(edges, n_sites, t=t, U=U),
+        conserving="auto",
+    )
+
+
 def compile_operator_sum_netket(hilbert, terms, *, site_order=None, conserving=False):
     """Compile a backend-neutral :class:`OperatorSum` for NetKet.
 
@@ -5044,9 +5092,11 @@ def build_fermi_hubbard_vmc(
     internally, and its variational parameters use quimb's native
     ``qtn.pack``/``qtn.unpack`` representation.
 
-    NetKet's ``FermiHubbardJax`` Hamiltonian is the canonical fixed-sector
-    Hamiltonian: no chemical-potential term is added, which is equivalent to
-    setting ``MU=0`` once the spin sector is fixed.
+    When available, NetKet's ``FermiHubbardJax`` Hamiltonian is used. Newer
+    NetKet releases that removed that convenience constructor use the
+    equivalent conserving second-quantized operator instead. No
+    chemical-potential term is added, which is equivalent to setting ``MU=0``
+    once the spin sector is fixed.
 
     When ``register_stable_svd`` is True (default) and ``contraction`` is an
     SVD-based approximation (``hotrg``/``ctmrg``/``boundary``), Pepsy installs
@@ -5109,12 +5159,12 @@ def build_fermi_hubbard_vmc(
                 edges = square_lattice_edges(Lx, Ly, pbc=pbc)
         graph = nk.graph.Graph(edges=tuple(edges), n_nodes=n_sites)
 
-    hamiltonian = nk.operator.FermiHubbardJax(
+    hamiltonian = _build_netket_fermi_hubbard_operator(
         hilbert,
-        graph=graph,
+        graph,
+        n_sites=n_sites,
         t=t,
         U=U,
-        dtype=float,
     )
     columns = netket_spin_orbital_columns(hilbert)
     if verify_columns:
@@ -5681,12 +5731,12 @@ def build_sparse_fermi_hubbard_vmc(
             edges = square_lattice_edges(Lx, Ly, pbc=pbc)
         graph = nk.graph.Graph(edges=tuple(edges), n_nodes=n_sites)
 
-    hamiltonian = nk.operator.FermiHubbardJax(
+    hamiltonian = _build_netket_fermi_hubbard_operator(
         hilbert,
-        graph=graph,
+        graph,
+        n_sites=n_sites,
         t=t,
         U=U,
-        dtype=float,
     )
     columns = netket_spin_orbital_columns(hilbert)
     if verify_columns:

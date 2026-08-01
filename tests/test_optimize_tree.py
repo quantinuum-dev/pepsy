@@ -1086,6 +1086,30 @@ def test_tree_layout_pilot_feedback_is_iterative_and_edge_aware():
     assert opt.max_bond() == 1
 
 
+def test_tree_layout_pilots_can_run_in_parallel():
+    """Independent layout pilots preserve the normal report contract."""
+    gates = [(pepsy.cnot(), (0, 3)), (pepsy.cnot(), (3, 1))]
+    opt = TreeOptimizer(gates, n=4, chi=1, run=False)
+
+    selected = opt.optimize_layout(
+        objective="full_tree",
+        pilot_candidates=2,
+        pilot_workers=2,
+        pilot_steps=2,
+        rounds=1,
+        topology_budget=1,
+        refine_budget=1,
+        search_budget=2,
+    )
+
+    assert selected["pilot"]["selected_candidate"]
+    assert len(selected["pilot"]["reports"]) == 2
+    assert all(
+        report["status"] == "ok"
+        for report in selected["pilot"]["reports"].values()
+    )
+
+
 def test_tree_layout_targeted_candidates_are_static_and_bounded():
     """Hot-edge proposal generation never allocates or mutates a TTN."""
     finder = TreeLayoutFinder(
@@ -1173,7 +1197,97 @@ def test_full_tree_profile_reports_dynamic_cost_at_all_scales():
     report = finder.report(plan)
     assert report["objective"] == "full_tree"
     assert report["full_tree"] == profile
-    assert len(report["objective_key"]) == 8
+    assert len(report["objective_key"]) == 10
+    assert report["objective_key"][:4] == (
+        profile["peak_overflow_log2"],
+        profile["total_overflow_log2"],
+        profile["peak_edge_demand_log2"],
+        profile["total_edge_demand_log2"],
+    )
+
+
+def test_full_tree_6x6_pbc_calibrates_against_actual_replay():
+    """All-scale overflow ranking tracks real capped-tree replay pressure."""
+    Lx = Ly = 6
+    n = Lx * Ly
+
+    def site(x, y):
+        return x * Ly + y
+
+    edges = []
+    for x in range(Lx):
+        for y in range(Ly):
+            for dx, dy in ((1, 0), (0, 1)):
+                edge = tuple(sorted((
+                    site(x, y),
+                    site((x + dx) % Lx, (y + dy) % Ly),
+                )))
+                if edge[0] != edge[1] and edge not in edges:
+                    edges.append(edge)
+
+    gates = (
+        [(pepsy.h(), q) for q in range(n)]
+        + [(pepsy.cphase(np.pi / 4), edge) for edge in edges]
+    )
+    finder = TreeLayoutFinder(
+        gates,
+        n=n,
+        max_arity=(2, 3, 4),
+        top_arity=3,
+        objective="full_tree",
+        chi=4,
+        seed=11,
+    )
+    recommendation = finder.recommend_arities(
+        (2, 3, 4),
+        refine=None,
+        topology_refine=None,
+        search=None,
+    )
+
+    calibrated = []
+    for candidate in recommendation["candidates"]:
+        optimizer = TreeOptimizer(
+            gates,
+            n=n,
+            tree=candidate["plan"],
+            chi=4,
+            cutoff=0.0,
+            track_truncation=False,
+            run=False,
+        )
+        optimizer.run()
+        history = optimizer.truncation_history
+        calibrated.append({
+            "arity": candidate["max_arity"],
+            "predicted_total_overflow": candidate["full_tree_profile"][
+                "total_overflow_log2"
+            ],
+            "actual_total_excess": sum(
+                max(0, event["before_bond"] - 4) for event in history
+            ),
+            "actual_truncations": sum(
+                bool(event["truncated"]) for event in history
+            ),
+        })
+
+    by_arity = {item["arity"]: item for item in calibrated}
+    assert recommendation["recommended_max_arity"] == 4
+    assert (
+        by_arity[4]["predicted_total_overflow"]
+        < by_arity[3]["predicted_total_overflow"]
+        < by_arity[2]["predicted_total_overflow"]
+    )
+    assert (
+        by_arity[4]["actual_total_excess"]
+        < by_arity[3]["actual_total_excess"]
+        < by_arity[2]["actual_total_excess"]
+    )
+    assert (
+        by_arity[4]["actual_truncations"]
+        < by_arity[3]["actual_truncations"]
+        < by_arity[2]["actual_truncations"]
+    )
 
 
 def test_full_tree_anneals_subtrees_without_changing_binary_contract():
@@ -1299,6 +1413,15 @@ def test_optimizer_exposes_congestion_layout_objective():
     assert opt.layout_objective == "congestion"
     assert opt.plan.n == 6
     assert opt.plan.is_binary()
+
+
+def test_optimizer_defaults_to_congestion_layout_for_replay_performance():
+    """Automatic optimizer layouts default to finite-chi edge pressure."""
+    opt = TreeOptimizer(None, n=6, run=False)
+
+    assert opt.layout_objective == "congestion"
+    assert opt.layout_finder.objective == "congestion"
+    assert opt.track_truncation is False
 
 
 def test_layout_recommends_arity_and_reports_tree_shape():
@@ -2315,6 +2438,62 @@ def test_truncation_history_keeps_fast_untracked_path_cheap():
     assert report["n_tracked"] == 0
     assert report["total_discarded_weight"] is None
     assert all(event["discarded_weight"] is None for event in report["events"])
+
+
+def test_track_truncation_warns_and_skips_impossible_spectra():
+    """Tracking warns, while lossless within-cap edges still use QR only."""
+    with pytest.warns(UserWarning, match="track_truncation=True"):
+        opt = TreeOptimizer(
+            [(pepsy.cnot(), (0, 3))],
+            n=4,
+            chi=16,
+            cutoff=0.0,
+            track_truncation=True,
+        )
+
+    assert opt.track_truncation is True
+    assert opt.truncation_history
+    assert all(event["spectrum_rank"] is None for event in opt.truncation_history)
+
+
+def test_repeated_direct_gate_reuses_factorization(monkeypatch):
+    """Repeated immutable gate objects do not repeat their operator SVD."""
+    original_split = qtn.Tensor.split
+    svd_calls = []
+
+    def traced_split(tensor, *args, **kwargs):
+        if kwargs.get("method") == "svd":
+            svd_calls.append(tensor)
+        return original_split(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.Tensor, "split", traced_split)
+    gate = pepsy.cnot()
+    opt = TreeOptimizer(None, n=4, chi=16, cutoff=0.0, run=False)
+    opt.apply_2q(gate, 0, 3)
+    first_count = len(svd_calls)
+    opt.apply_2q(gate, 0, 3)
+
+    assert len(svd_calls) == first_count
+    assert sum(key[0] == "direct" for key in opt._gate_factor_cache) == 1
+
+
+def test_parallel_subtree_messages_match_serial():
+    """Independent dense QR message waves preserve the serial result."""
+    rng = np.random.default_rng(818)
+    operator, _ = np.linalg.qr(
+        rng.standard_normal((8, 8)) + 1j * rng.standard_normal((8, 8))
+    )
+    serial = TreeOptimizer(
+        None, n=8, chi=16, cutoff=0.0, subtree_workers=1, run=False,
+    )
+    parallel = TreeOptimizer(
+        None, n=8, chi=16, cutoff=0.0, subtree_workers=3, run=False,
+    )
+
+    serial.apply_subtree_operator(operator, (0, 2, 5))
+    parallel.apply_subtree_operator(operator, (0, 2, 5))
+
+    assert _fidelity(serial.to_dense(), parallel.to_dense()) > 1 - 1e-12
 
 
 def test_convergence_sweep_reports_rising_fidelity():
@@ -3873,6 +4052,36 @@ def test_shift_center_idempotent_touches_nothing():
         assert np.array_equal(ttn.node_tensor(nid).data, snap[nid])
 
 
+def test_dense_edge_canonization_skips_proven_isometry(monkeypatch):
+    """A direct lossless edge move reuses a live dense ``left_inds`` proof."""
+    ttn = _entangled_ttn(seed=40)
+    leaf = ttn.leaf_of_qubit(0)
+    parent = ttn.parent(leaf)
+    ttn.shift_orthogonality_center(parent)
+    assert ttn.orthogonality_center == parent
+    calls = []
+    canonize_between = ttn.canonize_between
+
+    def traced_canonize_between(*args, **kwargs):
+        calls.append((args, kwargs))
+        return canonize_between(*args, **kwargs)
+
+    monkeypatch.setattr(ttn, "canonize_between", traced_canonize_between)
+    before = {
+        nid: np.array(ttn.node_tensor(nid).data)
+        for nid in ttn.plan.nodes()
+    }
+
+    assert ttn.can_skip_canonize(leaf, parent)
+    ttn.canonize_edge_(leaf, parent)
+
+    assert not calls
+    assert all(
+        np.array_equal(ttn.node_tensor(nid).data, data)
+        for nid, data in before.items()
+    )
+
+
 def test_shift_center_from_unknown_canonicalises_once():
     """An unknown centre falls back to a full canonicalisation about the target."""
     plan = TreePlan.from_order(range(6), structure="balanced")
@@ -4346,8 +4555,84 @@ def test_tree_native_fermionic_gate_stream_matches_mps():
     assert float(tensors.tn_fidelity(engine.p, mps_exact.p)) > 1 - 1e-8
 
 
+@pytest.mark.parametrize(
+    ("symmetry", "occupations"),
+    [
+        ("U1", (1, 1, 1, 1)),
+        ("U1U1", ((1, 0), (0, 1), (1, 0), (0, 1))),
+    ],
+)
+def test_native_tree_direct_mpo_and_submpo_match_without_global_fidelity(
+    symmetry, occupations,
+):
+    """Native gate kernels agree without Cotengra's process-based fidelity."""
+    pytest.importorskip("symmray")
+    L = 4
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    plan = TreePlan.from_order(range(L), structure="balanced")
+    seed = pepsy.ps_to_ttn(
+        L,
+        tree=plan,
+        fermion=fermion,
+        occupations=occupations,
+        dtype="complex128",
+    )
+    hopping = fermion.hopping_gate(0.05, t=1.0, imaginary=False)
+    onsite = fermion.onsite_gate(
+        0.03, site=1, U=8.0, mu=0.0, imaginary=False,
+    )
+    submpo = qtn.MatrixProductOperator.from_dense(
+        hopping, dims=(4, 4), sites=(0, 2), L=L,
+    )
+
+    def dense_vector(opt):
+        tensor = opt.tn.contract(all, optimize="greedy").transpose(
+            *(opt.tn.site_ind(q) for q in range(L))
+        )
+        return np.asarray(tensor.data.to_dense()).reshape(-1)
+
+    outputs = []
+    for mode in ("direct", "mpo"):
+        opt = TreeOptimizer(
+            None,
+            n=L,
+            tree=plan,
+            state=seed.copy(),
+            chi=64,
+            cutoff=0.0,
+            mode=mode,
+            run=False,
+        )
+        opt.apply_1q(onsite, 1)
+        opt.apply_2q(hopping, 0, 2)
+        outputs.append(dense_vector(opt))
+        assert opt.tn.validate(check_canonical=True) is opt.tn
+
+    submpo_opt = TreeOptimizer(
+        None,
+        n=L,
+        tree=plan,
+        state=seed.copy(),
+        chi=64,
+        cutoff=0.0,
+        mode="submpo",
+        run=False,
+    )
+    submpo_opt.apply_1q(onsite, 1)
+    submpo_opt.apply_submpo(submpo, (0, 2))
+    outputs.append(dense_vector(submpo_opt))
+    assert submpo_opt.tn.validate(check_canonical=True) is submpo_opt.tn
+
+    for output in outputs[1:]:
+        assert _fidelity(outputs[0], output) > 1 - 1e-10
+
+
 def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
-    """Dense isometry metadata must not replace native graded subtree QR."""
+    """Native routed Q metadata skips only already-proven graded QR."""
     pytest.importorskip("symmray")
     L = 4
     fermion = pepsy.Fermion(
@@ -4434,7 +4719,8 @@ def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
 
     assert installs
     assert compressions
-    assert all(reduced is True for reduced in compressions)
+    assert all(reduced in {True, "left"} for reduced in compressions)
+    assert any(reduced == "left" for reduced in compressions)
     assert (
         _fidelity(dense_vector(candidate), dense_vector(reference))
         > 1 - 1e-10
@@ -4442,8 +4728,103 @@ def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
     assert candidate.validate_isometry_metadata() is candidate
     for nid, toward in candidate.isometry_map().items():
         if toward is not None:
-            assert not candidate.can_skip_canonize(nid, toward)
+            assert candidate.can_skip_canonize(nid, toward)
     assert candidate.tn.validate(check_canonical=True) is candidate.tn
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "spinful", "occupations"),
+    [
+        ("U1", False, (1, 0, 1, 0)),
+        ("U1U1", True, ((1, 0), (0, 1), (1, 0), (0, 1))),
+    ],
+)
+def test_native_fermionic_left_inds_skips_lossless_qr(
+    symmetry, spinful, occupations, monkeypatch,
+):
+    """Symmray U1 variants reuse native QR isometry metadata safely."""
+    pytest.importorskip("symmray")
+    L = 4
+    fermion = pepsy.Fermion(
+        spinful=spinful,
+        symmetry=symmetry,
+        dtype="complex128",
+    )
+    plan = TreePlan.from_order(range(L), structure="balanced")
+    ttn = pepsy.ps_to_ttn(
+        L,
+        tree=plan,
+        fermion=fermion,
+        occupations=occupations,
+        dtype="complex128",
+    )
+    target = plan.leaf_of_qubit[0]
+    ttn.shift_orthogonality_center(target)
+
+    source = next(
+        nid for nid, toward in ttn.isometry_map().items()
+        if toward == target and ttn.can_skip_canonize(nid, toward)
+    )
+    before = {
+        nid: np.asarray(ttn.node_tensor(nid).data.to_dense()).copy()
+        for nid in plan.nodes()
+    }
+    calls = []
+    graded_qr = ttn._fermionic_canonize_edge_
+
+    def traced_qr(*args, **kwargs):
+        calls.append((args, kwargs))
+        return graded_qr(*args, **kwargs)
+
+    monkeypatch.setattr(ttn, "_fermionic_canonize_edge_", traced_qr)
+    ttn.canonize_edge_(source, target)
+
+    assert not calls
+    assert ttn.orthogonality_center == target
+    assert ttn.is_canonical_form(target)
+    assert ttn.validate(check_canonical=True) is ttn
+    for nid in plan.nodes():
+        np.testing.assert_array_equal(
+            np.asarray(ttn.node_tensor(nid).data.to_dense()), before[nid]
+        )
+
+
+def test_native_truncating_compression_keeps_explicit_svd(monkeypatch):
+    """A positive cutoff never turns a native truncation into metadata-only."""
+    pytest.importorskip("symmray")
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    ttn = pepsy.ps_to_ttn(
+        4,
+        tree=plan,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
+        dtype="complex128",
+    )
+    target = plan.leaf_of_qubit[0]
+    ttn.shift_orthogonality_center(target)
+    source = next(
+        nid for nid, toward in ttn.isometry_map().items()
+        if toward == target and ttn.can_skip_canonize(nid, toward)
+    )
+
+    calls = []
+    compress = ttn._fermionic_compress_edge_
+
+    def traced_compress(*args, **kwargs):
+        calls.append((args, kwargs))
+        return compress(*args, **kwargs)
+
+    monkeypatch.setattr(ttn, "_fermionic_compress_edge_", traced_compress)
+    ttn.compress_edge_(
+        source, target, max_bond=64, cutoff=1e-10, cutoff_mode="rel",
+    )
+
+    assert calls
 
 
 def test_tree_stable_labels_route_submpo_by_payload_sites(monkeypatch):

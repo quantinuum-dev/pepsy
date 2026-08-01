@@ -19,10 +19,12 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   canonicalization kernel. Path and subtree compression also reads that proof
   before selecting one-sided `reduced="left"` compression, avoiding the
   redundant reduction QR only when the destination tensor is proven
-  isometric. Missing proofs fall back to two-sided reduction. The network
-  derives orientation views directly from live tensors; do not cache a
-  duplicate map in the optimizer. Native fermionic routing deliberately
-  retains explicit graded QR/SVD recovery.
+  isometric. Missing proofs fall back to two-sided reduction. Native Symmray
+  routing preserves the same proof when its charge maps are aligned; native
+  canonical recovery skips only that proven lossless QR, while truncating
+  native compression remains an explicit graded SVD. The network derives
+  orientation views directly from live tensors; do not cache a duplicate map
+  in the optimizer.
 - `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
   tid cache, and derives a deterministic child seed for an independent RNG.
 

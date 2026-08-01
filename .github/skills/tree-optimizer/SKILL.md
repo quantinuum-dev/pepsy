@@ -157,11 +157,13 @@ telescopes to identity between bra and ket.
   an unconditional O(N) recanonicalisation.
 - Local isometry proofs live only on each tensor's ``left_inds``.
   `TreeTensorNetwork.isometry_direction` / `isometry_map` derive read-only
-  orientations, `can_skip_canonize` recognizes an already-proven dense edge,
-  and `validate_isometry_metadata` checks alignment with the canonical region.
+  orientations, `can_skip_canonize` recognizes an already-proven dense edge or
+  a native Symmray edge with aligned charge maps, and
+  `validate_isometry_metadata` checks alignment with the canonical region.
   `TreeOptimizer` delegates these methods; never add a second mutable
-  optimizer-owned orientation map. Native fermionic edges always retain their
-  explicit graded QR and are never skipped through this dense metadata path.
+  optimizer-owned orientation map. Native fermionic edges fall back to
+  explicit graded QR when the proof is absent or malformed; positive-cutoff or
+  over-cap native compression still uses the explicit graded SVD.
 - `ttn.is_canonical_form(center)` verifies the invariant directly (every
   non-centre tensor is an isometry toward the centre) — use it in tests/diagnostics.
 - A freshly built product state is **already canonical at the root** (all
@@ -281,15 +283,15 @@ covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductStat
    parent together with the old state/operator bonds. No dense state tensor for
    the whole Steiner subtree is formed; the last node is the hub.
 5. Install every routed Q factor with its ``left_inds`` isometry metadata.
-   Dense trees can then recover the hub centre through the normal canonical
-   state machine without repeating those QRs; native fermionic trees retain
-   their explicit graded QR recovery. Finally make one depth-first canonical
-   SVD sweep: every affected tree edge is truncated once, after the complete
-   operator has arrived. Dense path and subtree sweeps select one-sided
-   ``reduced="left"`` compression only when the destination tensor's live
-   ``left_inds`` proves the required isometry; missing proofs and native
-   graded tensors use the full reduction. `renormalize=True` renormalises
-   afterwards (for Kraus/projection).
+   Dense trees and charge-aligned native Symmray trees can then recover the
+   hub centre through the normal canonical state machine without repeating
+   those QRs; missing or malformed native proofs use explicit graded QR.
+   Finally make one depth-first canonical SVD sweep: every affected tree edge
+   is truncated once, after the complete operator has arrived. Dense path and
+   subtree sweeps select one-sided ``reduced="left"`` compression only when
+   the destination tensor's live ``left_inds`` proves the required isometry;
+   native graded compression keeps its explicit block-SVD semantics.
+   `renormalize=True` renormalises afterwards (for Kraus/projection).
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator

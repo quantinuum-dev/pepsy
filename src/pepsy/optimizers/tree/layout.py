@@ -1332,8 +1332,9 @@ class TreeLayoutFinder:
         objective. `"hypergraph"` is the direct multi-site mode: it ranks
         plans from the full support hyperedges and per-edge Schmidt loads,
         then applies bounded leaf and binary-topology refinement by default.
-        `"full_tree"` evaluates dynamic bond pressure, tensor width, estimated
-        work, write volume, and route length across every tree scale. It is
+        `"full_tree"` evaluates dynamic bond pressure, predicted ``chi``
+        overflow, tensor width, estimated work, write volume, and route length
+        across every tree scale. It is
         the high-quality, Cotengra-inspired mode; ``order="quality"`` selects
         it automatically and enables its bounded search stages.
     order : {None, "quality"}, optional
@@ -2023,12 +2024,20 @@ class TreeLayoutFinder:
         if self.objective == "full_tree":
             profile = self.full_tree_profile(plan)
             return (
+                # For a finite-chi optimizer, predicted cut overflow is the
+                # first-order performance and accuracy failure. Prefer a
+                # layout that stays within the cap, then distinguish the
+                # remaining candidates by uncapped edge demand before
+                # considering tensor work. With chi=None, overflow is zero
+                # and this naturally reduces to uncapped demand ordering.
+                profile["peak_overflow_log2"],
+                profile["total_overflow_log2"],
+                profile["peak_edge_demand_log2"],
+                profile["total_edge_demand_log2"],
                 profile["peak_tensor_log2"],
                 profile["peak_work_log2"],
                 profile["log_total_write"],
                 profile["log_total_work"],
-                profile["peak_edge_demand_log2"],
-                profile["total_edge_demand_log2"],
                 profile["total_route_length"],
                 self.score(plan),
             )
@@ -3749,9 +3758,11 @@ class TreeLayoutFinder:
 
         The profile is a cheap layout proxy, not a replacement for replaying
         the circuit. It accumulates uncapped operator-Schmidt demand on every
-        tree edge, tracks the capped working bond pressure at the configured
-        ``chi``, estimates tensor widths and write/work volume for every
-        touched node, and groups those quantities by hierarchical tree scale.
+        tree edge, tracks capped working-bond pressure and predicted ``chi``
+        overflow at the configured ``chi``, estimates tensor widths and
+        write/work volume for every touched node, and groups those quantities
+        by hierarchical tree scale. It never allocates a TTN or performs a
+        tensor truncation.
         """
         if plan is None:
             plan = self.run()
@@ -3802,6 +3813,8 @@ class TreeLayoutFinder:
                 "log_total_tensor_size": -np.inf,
                 "peak_edge_demand_log2": 0.0,
                 "total_edge_demand_log2": 0.0,
+                "peak_bond_log2": 0.0,
+                "peak_overflow_log2": 0.0,
             }
         for node, scale in node_scales.items():
             scales[scale]["node_count"] += 1
@@ -3903,6 +3916,14 @@ class TreeLayoutFinder:
                 scale["peak_edge_demand_log2"] = max(
                     scale["peak_edge_demand_log2"], demand_log[edge]
                 )
+                scale["peak_bond_log2"] = max(
+                    scale["peak_bond_log2"], bond_log[edge]
+                )
+                if np.isfinite(log_chi):
+                    scale["peak_overflow_log2"] = max(
+                        scale["peak_overflow_log2"],
+                        max(0.0, demand_log[edge] - log_chi),
+                    )
 
         for node in plan.children:
             log_size = node_log_size(node)
@@ -3918,7 +3939,18 @@ class TreeLayoutFinder:
             scale["peak_edge_demand_log2"] = max(
                 scale["peak_edge_demand_log2"], demand
             )
+            scale["peak_bond_log2"] = max(
+                scale["peak_bond_log2"], bond_log[edge]
+            )
             scale["total_edge_demand_log2"] += demand
+
+        overflow_log = {
+            edge: (
+                max(0.0, demand - log_chi)
+                if np.isfinite(log_chi) else 0.0
+            )
+            for edge, demand in demand_log.items()
+        }
 
         profile = {
             "event_count": event_count,
@@ -3933,6 +3965,8 @@ class TreeLayoutFinder:
             "peak_edge_demand_log2": float(max(demand_log.values(), default=0.0)),
             "total_edge_demand_log2": float(sum(demand_log.values())),
             "peak_bond_log2": float(max(bond_log.values(), default=0.0)),
+            "peak_overflow_log2": float(max(overflow_log.values(), default=0.0)),
+            "total_overflow_log2": float(sum(overflow_log.values())),
             "total_route_length": int(total_route_length),
             "exact_events": int(exact_events),
             "bounded_events": int(bounded_events),
