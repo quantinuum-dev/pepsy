@@ -19,6 +19,7 @@ from .._internal.formatting import (
     resolve_color_mode,
 )
 from ..tensors.core import OneDMap
+from ..tensors.bonds import new_native_bond
 
 __all__ = [
     "ham_tn",
@@ -626,11 +627,19 @@ class ham_tn:
                 if x + 1 < self.L_x:
                     edge = frozenset(((x, y), (x + 1, y)))
                     if edge not in chain_edges:
-                        pepo[f"I{x},{y}"].new_bond(pepo[f"I{x + 1},{y}"], size=1)
+                        new_native_bond(
+                            pepo[f"I{x},{y}"],
+                            pepo[f"I{x + 1},{y}"],
+                            size=1,
+                        )
                 if y + 1 < self.L_y:
                     edge = frozenset(((x, y), (x, y + 1)))
                     if edge not in chain_edges:
-                        pepo[f"I{x},{y}"].new_bond(pepo[f"I{x},{y + 1}"], size=1)
+                        new_native_bond(
+                            pepo[f"I{x},{y}"],
+                            pepo[f"I{x},{y + 1}"],
+                            size=1,
+                        )
         return pepo
 
     def _add_cycle_bonds_(self, pepo, *, bond_dim=1):
@@ -641,11 +650,17 @@ class ham_tn:
 
         if self.L_x > 1:
             for y in range(self.L_y):
-                pepo[f"I{self.L_x - 1},{y}"].new_bond(pepo[f"I0,{y}"], size=int(bond_dim))
+                left = pepo[f"I{self.L_x - 1},{y}"]
+                right = pepo[f"I0,{y}"]
+                if not qtn.bonds(left, right):
+                    new_native_bond(left, right, size=int(bond_dim))
 
         if self.L_y > 1:
             for x in range(self.L_x):
-                pepo[f"I{x},{self.L_y - 1}"].new_bond(pepo[f"I{x},0"], size=int(bond_dim))
+                top = pepo[f"I{x},{self.L_y - 1}"]
+                bottom = pepo[f"I{x},0"]
+                if not qtn.bonds(top, bottom):
+                    new_native_bond(top, bottom, size=int(bond_dim))
 
         return pepo
 

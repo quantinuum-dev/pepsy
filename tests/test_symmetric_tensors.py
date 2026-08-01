@@ -1236,6 +1236,43 @@ def test_fermion_to_pepo_builds_native_coordinate_terms(symmetry):
     assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
 
 
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_single_native_pepo_term_uses_local_operator_schmidt_rank(symmetry):
+    """A disposable one-/two-site PEPO has no generic channel inflation."""
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    mapper = OneDMap(2, 1, mode="snake")
+
+    hopping = fermion.to_pepo(
+        {((0, 0), (1, 0)): fermion.hopping_operator()},
+        Lx=2,
+        Ly=1,
+        mapper=mapper,
+        max_bond=None,
+        cutoff=0.0,
+        compress=False,
+    )
+    onsite = fermion.to_pepo(
+        {((0, 0),): fermion.onsite_term((0, 0), U=8.0)},
+        Lx=2,
+        Ly=1,
+        mapper=mapper,
+        max_bond=None,
+        cutoff=0.0,
+        compress=False,
+    )
+
+    assert hopping.max_bond() == 4
+    assert onsite.max_bond() == 1
+    assert hopping.pepsy_compression_report["operator_schmidt_bond"] == 4
+    assert onsite.pepsy_compression_report["operator_schmidt_bond"] == 1
+    assert hopping.pepsy_compression_report["direct_local"] is True
+    assert onsite.pepsy_compression_report["direct_local"] is True
+    assert all(
+        type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in (*hopping, *onsite)
+    )
+
+
 def test_fermion_to_pepo_native_result_supports_reverse_simple_update():
     """Native PEPO output can take an adjoint gate through operator SU."""
     fermion = Fermion(spinful=True, symmetry="U1U1")

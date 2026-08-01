@@ -5919,6 +5919,232 @@ def _add_native_term_to_mpo(
     return list(physical_maps[0])
 
 
+def _native_local_term_mpo(
+    term,
+    support,
+    L,
+    *,
+    symmetry,
+    dtype,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=True,
+    upper_ind_id="k{}",
+    lower_ind_id="b{}",
+    site_tag_id="I{}",
+    to_backend=None,
+):
+    """Build an exact local-term MPO without start/done channel inflation.
+
+    The generic native MPO assembler is designed for a collection of terms,
+    so it carries explicit start and done paths at every chain cut. For one
+    one-site or two-site term those paths are unnecessary. Factorizing the
+    native local array directly and propagating its operator-Schmidt bond
+    through identity tensors leaves only the non-zero local Schmidt sectors.
+    """
+    support = tuple(int(site) for site in support)
+    if len(support) not in {1, 2} or len(set(support)) != len(support):
+        raise ValueError("direct local PEPO terms must act on one or two sites.")
+    if any(site < 0 or site >= int(L) for site in support):
+        raise ValueError(f"term support {support!r} is outside MPO length L={L}.")
+
+    _require_symmray()
+    from symmray import utils as sr_utils  # pylint: disable=import-outside-toplevel
+
+    zero = _zero_like_charge(0 if symmetry in {"U1", "Z2"} else (0, 0))
+    term_charge = _normalize_group_charge(
+        getattr(term, "charge", zero), symmetry
+    )
+    indices = getattr(term, "indices", None)
+    if indices is None or len(indices) != 2 * len(support):
+        raise TypeError("direct local PEPO terms require matching native rank.")
+
+    physical_maps = [
+        _expanded_index_charges(index) for index in indices[:len(support)]
+    ]
+    input_maps = [
+        _expanded_index_charges(index) for index in indices[len(support):]
+    ]
+    if physical_maps != input_maps or any(
+        physical_maps[site] != physical_maps[0]
+        for site in range(len(support))
+    ):
+        raise ValueError(
+            "direct local PEPO terms require one matching physical charge map."
+        )
+    phys_map = physical_maps[0]
+    phys_dim = len(phys_map)
+    zero_map = [zero]
+
+    def make_array(data, index_maps, duals, *, charge=zero, label=None):
+        return sr_utils.from_dense(
+            data,
+            symmetry=symmetry,
+            index_maps=index_maps,
+            duals=duals,
+            fermionic=True,
+            charge=charge,
+            label=label,
+        )
+
+    def identity_tensor(site):
+        identity = np.eye(phys_dim, dtype=dtype)
+        if L == 1:
+            return make_array(identity, [phys_map, phys_map], [False, True])
+        if site == 0:
+            return make_array(
+                identity.reshape(1, phys_dim, phys_dim),
+                [zero_map, phys_map, phys_map],
+                [False, False, True],
+            )
+        if site == L - 1:
+            return make_array(
+                identity.reshape(1, phys_dim, phys_dim),
+                [zero_map, phys_map, phys_map],
+                [True, False, True],
+            )
+        data = np.zeros((1, 1, phys_dim, phys_dim), dtype=dtype)
+        data[0, 0] = identity
+        return make_array(
+            data,
+            [zero_map, zero_map, phys_map, phys_map],
+            [True, False, False, True],
+        )
+
+    arrays = [identity_tensor(site) for site in range(int(L))]
+    local_schmidt_bond = 1
+
+    if len(support) == 1:
+        site = support[0]
+        dense = _dense_numpy(term, dtype=dtype)
+        label = site if _charged_op_needs_fermion_string(term_charge) else None
+        if L == 1:
+            arrays[site] = make_array(
+                dense, [phys_map, phys_map], [False, True],
+                charge=term_charge, label=label,
+            )
+        elif site == 0:
+            arrays[site] = make_array(
+                dense.reshape(1, phys_dim, phys_dim),
+                [zero_map, phys_map, phys_map],
+                [False, False, True],
+                charge=term_charge, label=label,
+            )
+        elif site == L - 1:
+            arrays[site] = make_array(
+                dense.reshape(1, phys_dim, phys_dim),
+                [zero_map, phys_map, phys_map],
+                [True, False, True],
+                charge=term_charge, label=label,
+            )
+        else:
+            arrays[site] = make_array(
+                dense.reshape(1, 1, phys_dim, phys_dim),
+                [zero_map, zero_map, phys_map, phys_map],
+                [True, False, False, True],
+                charge=term_charge, label=label,
+            )
+    else:
+        # Order the support by the MPO chain. A native operator's upper and
+        # lower legs are reordered together so its graded local signs survive.
+        ordered = tuple(sorted(enumerate(support), key=lambda item: item[1]))
+        if tuple(item[0] for item in ordered) == (0, 1):
+            ordered_term = term
+        else:
+            ordered_term = term.transpose((1, 0, 3, 2))
+        fused = ordered_term.fuse((0, 2), (1, 3))
+        # The only cutoff here removes exact numerical zero singular blocks
+        # left by Symmray's block SVD. It is not the user-requested PEPO
+        # compression cutoff and does not cap the resulting local bond.
+        structural_cutoff = 64.0 * np.finfo(float).eps
+        left, _, right = fused.svd(
+            absorb="right",
+            cutoff=structural_cutoff,
+        )
+        left = left.unfuse(0).transpose((2, 0, 1))
+        right = right.unfuse(1)
+        bond_map = _expanded_index_charges(left.indices[0])
+        bond_dim = len(bond_map)
+        local_schmidt_bond = bond_dim
+        left_dense = _dense_numpy(left, dtype=dtype)
+        right_dense = _dense_numpy(right, dtype=dtype)
+        left_charge = _normalize_group_charge(
+            getattr(left, "charge", zero), symmetry
+        )
+        right_charge = _normalize_group_charge(
+            getattr(right, "charge", zero), symmetry
+        )
+        left_site, right_site = (item[1] for item in ordered)
+
+        if left_site == 0:
+            arrays[left_site] = left
+        else:
+            arrays[left_site] = make_array(
+                left_dense.reshape(1, bond_dim, phys_dim, phys_dim),
+                [zero_map, bond_map, phys_map, phys_map],
+                [True, False, False, True],
+                charge=left_charge,
+            )
+        if right_site == L - 1:
+            arrays[right_site] = right
+        else:
+            arrays[right_site] = make_array(
+                right_dense.reshape(bond_dim, 1, phys_dim, phys_dim),
+                [bond_map, zero_map, phys_map, phys_map],
+                [True, False, False, True],
+                charge=right_charge,
+            )
+        identity = np.eye(phys_dim, dtype=dtype)
+        for site in range(left_site + 1, right_site):
+            data = np.zeros(
+                (bond_dim, bond_dim, phys_dim, phys_dim),
+                dtype=dtype,
+            )
+            for bond_pos in range(bond_dim):
+                data[bond_pos, bond_pos] = identity
+            arrays[site] = make_array(
+                data,
+                [bond_map, bond_map, phys_map, phys_map],
+                [True, False, False, True],
+            )
+
+    mpo = qtn.MatrixProductOperator(
+        arrays,
+        shape="lrud",
+        upper_ind_id=upper_ind_id,
+        lower_ind_id=lower_ind_id,
+        site_tag_id=site_tag_id,
+    )
+    if to_backend is not None:
+        _apply_to_tensor_network_arrays(mpo, to_backend)
+    raw_bond = mpo.max_bond()
+    raw_max_bond = 1 if raw_bond is None else int(raw_bond)
+    did_compress = bool(compress and L > 1)
+    if did_compress:
+        compress_opts = {"cutoff": cutoff}
+        if max_bond is not None:
+            compress_opts["max_bond"] = int(max_bond)
+        mpo.compress(**compress_opts)
+    final_bond = mpo.max_bond()
+    final_max_bond = 1 if final_bond is None else int(final_bond)
+    mpo.pepsy_compression_report = {
+        "direct_local": True,
+        "compressed": did_compress,
+        "cutoff": cutoff,
+        "requested_max_bond": None if max_bond is None else int(max_bond),
+        "operator_schmidt_bond": local_schmidt_bond,
+        "raw_max_bond": raw_max_bond,
+        "final_max_bond": final_max_bond,
+        "rank_reduced": final_max_bond < raw_max_bond,
+        "max_bond_exceeded": (
+            did_compress
+            and max_bond is not None
+            and final_max_bond > int(max_bond)
+        ),
+    }
+    return mpo
+
+
 def _generic_symhamiltonian_to_mpo(
     hamiltonian,
     L,
@@ -6498,6 +6724,77 @@ class SymHamiltonian:
                 else dtype
             ),
         )
+
+        # A single local term does not need the generic start/done channel
+        # construction used to combine a Hamiltonian.  Build its native MPO
+        # directly from the local operator Schmidt factorization instead.  In
+        # particular, a hopping term then has its physical rank (D=4 for the
+        # spinful U1 hopping operator) rather than the inflated collection
+        # channel count of the multi-term assembler. Charged terms keep the
+        # generic native route because their open boundary must carry the
+        # operator charge through the remaining chain.
+        if fermionic and len(self.terms) == 1:
+            raw_where, term = next(iter(self.terms.items()))
+            coordinate_sites = _term_mapping_uses_coordinate_sites(self.terms)
+            where = _as_term_where(
+                raw_where,
+                coordinate_sites=coordinate_sites,
+            )
+            zero = _zero_like_charge(
+                0 if self.symmetry in {"U1", "Z2"} else (0, 0)
+            )
+            term_charge = _normalize_group_charge(
+                getattr(term, "charge", zero),
+                self.symmetry,
+            )
+            if len(where) in {1, 2} and term_charge == zero:
+                _, coo2idx_use, mapped_L = _resolve_mpo_mapping(
+                    mapper=builder.mapper,
+                )
+                if mapped_L != builder.L:
+                    raise ValueError(
+                        f"MPO mapping length {mapped_L} does not match PEPO length "
+                        f"{builder.L}."
+                    )
+                mapped_where = tuple(
+                    _map_site_to_mpo_index(site, coo2idx_use)
+                    for site in where
+                )
+                dtype_use = (
+                    _dtype_from_hamiltonian_terms(self.terms)
+                    if dtype is None
+                    else np.dtype(dtype)
+                )
+                mpo = _native_local_term_mpo(
+                    term,
+                    mapped_where,
+                    builder.L,
+                    symmetry=self.symmetry,
+                    dtype=dtype_use,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    compress=compress,
+                    to_backend=to_backend,
+                )
+                pepo = builder.mpo_to_pepo(
+                    mpo,
+                    cycle_peps=cyclic,
+                    cycle_bond_dim=cycle_bond_dim,
+                    inplace=True,
+                )
+                # Keep the diagnostic on the returned PEPO after the MPO is
+                # relabelled and viewed as a PEPO.
+                pepo.pepsy_compression_report = dict(
+                    mpo.pepsy_compression_report
+                )
+                if charge_sectors:
+                    charge = _normalize_group_charge(
+                        getattr(term, "charge", 0),
+                        self.symmetry,
+                    )
+                    return {charge: pepo}
+                return pepo
+
         mpo = self.to_mpo(
             L=builder.L,
             mapper=builder.mapper,
@@ -10174,46 +10471,45 @@ class Fermion:
         """
         if Lx is None or Ly is None:
             raise TypeError("to_pepo requires both Lx and Ly.")
+        if hamiltonian is not None:
+            if terms_or_edges is not None:
+                raise TypeError(
+                    "Pass either terms_or_edges or hamiltonian, not both."
+                )
+            if not isinstance(hamiltonian, SymHamiltonian):
+                raise TypeError("hamiltonian must be a SymHamiltonian instance.")
+            target = hamiltonian
+        elif isinstance(terms_or_edges, SymHamiltonian):
+            target = terms_or_edges
+        else:
+            if terms_or_edges is None:
+                raise TypeError("to_pepo requires terms_or_edges or hamiltonian.")
+            target = self.hamiltonian(
+                terms_or_edges,
+                to_backend=to_backend,
+                **params,
+            )
+            params = {}
 
-        from ..operators.hamiltonians import ham_tn
-
-        builder = ham_tn(
+        if params:
+            names = ", ".join(sorted(params))
+            raise TypeError(
+                "Model parameters cannot be supplied with an existing "
+                f"SymHamiltonian: {names}."
+            )
+        return target.to_pepo(
             Lx=Lx,
             Ly=Ly,
             mapper=mapper,
-            max_bond=256 if max_bond is None else max_bond,
-            cutoff=cutoff,
-            data_type=self.dtype if dtype is None else dtype,
-        )
-        mpo = self.to_mpo(
-            terms_or_edges,
-            hamiltonian=hamiltonian,
-            L=builder.L,
-            mapper=builder.mapper,
             max_bond=max_bond,
             cutoff=cutoff,
             compress=compress,
+            cyclic=cyclic,
+            cycle_bond_dim=cycle_bond_dim,
             dtype=dtype,
             fermionic=fermionic,
-            charge_sectors=charge_sectors,
             to_backend=to_backend,
-            **params,
-        )
-        if charge_sectors:
-            return {
-                charge: builder.mpo_to_pepo(
-                    sector_mpo,
-                    cycle_peps=cyclic,
-                    cycle_bond_dim=cycle_bond_dim,
-                    inplace=True,
-                )
-                for charge, sector_mpo in mpo.items()
-            }
-        return builder.mpo_to_pepo(
-            mpo,
-            cycle_peps=cyclic,
-            cycle_bond_dim=cycle_bond_dim,
-            inplace=True,
+            charge_sectors=charge_sectors,
         )
 
     def local_terms(self, edges, *, layout="site", **params):

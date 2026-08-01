@@ -12,6 +12,7 @@ import numpy as np
 import quimb.tensor as qtn
 
 from .contractions import build_optimizer, tn_norm
+from .bonds import new_native_bond
 from .validation import validate_tensor_network_tags
 
 __all__ = [
@@ -46,13 +47,15 @@ def add_cycle(peps, bond_dim, cylinder=False):
     for j in range(Ly):
         T1 = peps[f"I{Lx-1},{j}"]
         T2 = peps[f"I{0},{j}"]
-        qtn.new_bond(T1, T2, size=bond_dim, name=None, axis1=0, axis2=0)
+        if not qtn.bonds(T1, T2):
+            new_native_bond(T1, T2, size=bond_dim, axis1=0, axis2=0)
 
     if not cylinder:
         for i in range(Lx):
             T1 = peps[f"I{i},{Ly-1}"]
             T2 = peps[f"I{i},{0}"]
-            qtn.new_bond(T1, T2, size=bond_dim, name=None, axis1=0, axis2=0)
+            if not qtn.bonds(T1, T2):
+                new_native_bond(T1, T2, size=bond_dim, axis1=0, axis2=0)
     return peps
 
 

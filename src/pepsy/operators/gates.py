@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from heapq import heappop, heappush
 from numbers import Integral
 import random
@@ -13,6 +15,150 @@ from itertools import count
 import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
+
+
+# Symmray's cutoff-based block-SVD keeps every singular value tied with the
+# global threshold. This is symmetry-respecting, but means ``max_bond`` is a
+# soft cap whenever a cutoff is also supplied. Operator simple-update needs a
+# predictable memory cap, so gate_simple exposes an opt-in hard total cap.
+_STRICT_MAX_BOND_ACTIVE = ContextVar("pepsy_strict_max_bond_active", default=False)
+
+
+def _hard_cap_blocksparse_svd(U, s, VH, max_bond):
+    """Keep the globally largest ``max_bond`` retained block-SVD values.
+
+    The input has already been filtered by Symmray's requested cutoff. Ties
+    crossing the total cap are resolved deterministically by the stable block
+    and in-block ordering. The result retains the symmetry sectors selected by
+    that global spectrum and never has a larger total internal dimension than
+    ``max_bond``.
+    """
+    sectors = tuple(U.sectors)
+    blocks = tuple(s.get_all_blocks())
+    sizes = tuple(int(ar.size(block)) for block in blocks)
+    if sum(sizes) <= max_bond:
+        return U, s, VH
+
+    ranked = []
+    for sector_index, block in enumerate(blocks):
+        values = np.asarray(ar.to_numpy(block)).reshape(-1)
+        ranked.extend(
+            (-float(value), sector_index, value_index)
+            for value_index, value in enumerate(values)
+        )
+    ranked.sort()
+
+    kept_per_sector = [0] * len(sectors)
+    for _, sector_index, _ in ranked[:max_bond]:
+        kept_per_sector[sector_index] += 1
+
+    chargemap = {}
+    for (c0, c1), n_keep in zip(sectors, kept_per_sector):
+        if n_keep == 0:
+            U.del_block((c0, c1))
+            s.del_block(c1)
+            VH.del_block((c1, c1))
+            continue
+        U.set_block((c0, c1), U.get_block((c0, c1))[:, :n_keep])
+        s.set_block(c1, s.get_block(c1)[:n_keep])
+        VH.set_block((c1, c1), VH.get_block((c1, c1))[:n_keep, :])
+        chargemap[c1] = n_keep
+
+    chargemap = dict(sorted(chargemap.items()))
+    U.modify(
+        indices=(
+            U.indices[0],
+            U.indices[1].copy_with(chargemap=chargemap, subinfo=None),
+        )
+    )
+    VH.modify(
+        indices=(
+            VH.indices[0].copy_with(chargemap=chargemap, subinfo=None),
+            VH.indices[1],
+        )
+    )
+    return U, s, VH
+
+
+def _install_strict_blocksparse_truncation():
+    """Install a context-controlled hard-cap layer over Symmray's SVD.
+
+    This stays dormant for every existing caller. It is activated only by the
+    ``strict_max_bond`` context in :func:`gate_simple` below.
+    """
+    try:
+        from symmray.sparse import sparse_array_common as sparse_common
+    except ImportError:
+        return
+
+    if getattr(sparse_common, "_pepsy_strict_max_bond_patch", False):
+        return
+
+    original = sparse_common.truncate_svd_result_blocksparse
+
+    def truncate_with_optional_hard_cap(
+        U,
+        s,
+        VH,
+        cutoff,
+        cutoff_mode,
+        max_bond,
+        absorb,
+        renorm,
+        backend=None,
+        use_abs=False,
+    ):
+        if not (
+            _STRICT_MAX_BOND_ACTIVE.get()
+            and cutoff > 0.0
+            and max_bond is not None
+            and max_bond > 0
+        ):
+            return original(
+                U,
+                s,
+                VH,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                max_bond=max_bond,
+                absorb=absorb,
+                renorm=renorm,
+                backend=backend,
+                use_abs=use_abs,
+            )
+
+        # First apply Symmray's numerical cutoff without an artificial cap;
+        # then impose an exact global dimension budget before absorption.
+        U, s, VH = original(
+            U,
+            s,
+            VH,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            max_bond=-1,
+            absorb=None,
+            renorm=renorm,
+            backend=backend,
+            use_abs=use_abs,
+        )
+        U, s, VH = _hard_cap_blocksparse_svd(U, s, VH, int(max_bond))
+        return sparse_common.absorb_svd_result(U, s, VH, absorb)
+
+    sparse_common.truncate_svd_result_blocksparse = truncate_with_optional_hard_cap
+    sparse_common._pepsy_strict_max_bond_patch = True
+
+
+@contextmanager
+def _strict_max_bond_context(enabled):
+    if not enabled:
+        yield
+        return
+    _install_strict_blocksparse_truncation()
+    token = _STRICT_MAX_BOND_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _STRICT_MAX_BOND_ACTIVE.reset(token)
 
 from ..backends.convert import (
     infer_backend_converter_from_sample,
@@ -1741,6 +1887,7 @@ def gate_simple(
     max_bond=None,
     cutoff=1e-12,
     cutoff_mode="rsum2",
+    strict_max_bond: bool = False,
     contract=None,
     sequence="auto",
     path_canonize=False,
@@ -1808,6 +1955,11 @@ def gate_simple(
     cutoff_mode : str, optional
         Cutoff mode passed to ``gate_simple_`` (e.g. ``'rsum2'``, ``'rel'``).
         Default ``'rsum2'``.
+    strict_max_bond : bool, optional
+        Enforce ``max_bond`` as a hard *total* block-sparse bond limit even
+        when a nonzero cutoff has degenerate singular values at its boundary.
+        This is disabled by default to preserve Symmray's standard
+        degeneracy-preserving truncation policy.
     contract : {None, "auto", "split", "reduce-split"}, optional
         Two-site split strategy passed to Quimb. The default ``None``/``"auto"``
         selects ``"split"`` as a conservative fallback for block-sparse
@@ -1918,26 +2070,27 @@ def gate_simple(
             )
 
         for gate_one, operator_which_one, ind_id_one in gate_calls:
-            _gate_simple_one(
-                tn_work,
-                gate_one,
-                where_norm,
-                gauges,
-                renorm=renorm,
-                smudge=smudge,
-                gate_opts=gate_opts,
-                ind_id=ind_id_one,
-                operator_which=operator_which_one,
-                sequence=sequence,
-                path_canonize=path_canonize,
-                path_canonize_distance=path_canonize_distance,
-                path_canonize_opts=path_canonize_opts,
-                path_compress=path_compress,
-                path_compress_max_bond=path_compress_max_bond,
-                path_compress_cutoff=path_compress_cutoff,
-                path_compress_canonize_distance=path_compress_canonize_distance,
-                path_compress_opts=path_compress_opts,
-            )
+            with _strict_max_bond_context(strict_max_bond):
+                _gate_simple_one(
+                    tn_work,
+                    gate_one,
+                    where_norm,
+                    gauges,
+                    renorm=renorm,
+                    smudge=smudge,
+                    gate_opts=gate_opts,
+                    ind_id=ind_id_one,
+                    operator_which=operator_which_one,
+                    sequence=sequence,
+                    path_canonize=path_canonize,
+                    path_canonize_distance=path_canonize_distance,
+                    path_canonize_opts=path_canonize_opts,
+                    path_compress=path_compress,
+                    path_compress_max_bond=path_compress_max_bond,
+                    path_compress_cutoff=path_compress_cutoff,
+                    path_compress_canonize_distance=path_compress_canonize_distance,
+                    path_compress_opts=path_compress_opts,
+                )
 
     return tn_work
 
