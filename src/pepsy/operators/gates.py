@@ -3160,6 +3160,61 @@ def _native_identity_mpo(length, info, *, max_bond, cutoff):
     )
 
 
+def _validate_native_pepo_compatibility(pepo, info):
+    """Validate a supplied native PEPO before applying native gates to it."""
+    from ..tensors.symmetric import (  # pylint: disable=import-outside-toplevel
+        _expanded_index_charges,
+    )
+
+    tensors = tuple(getattr(pepo, "tensors", ()))
+    if not tensors:
+        raise TypeError(
+            "Native FermionicArray gates require a non-empty native Symmray PEPO."
+        )
+
+    expected_symmetry = info["symmetry"]
+    expected_phys_map = tuple(info["phys_map"])
+    for tensor in tensors:
+        data = tensor.data
+        if not (
+            _is_block_sparse_array(data)
+            and "FermionicArray" in type(data).__name__
+            and bool(getattr(data, "fermionic", False))
+        ):
+            raise TypeError(
+                "Native FermionicArray gates require a native fermionic "
+                "Symmray PEPO."
+            )
+        actual_symmetry = str(getattr(data, "symmetry", ""))
+        if actual_symmetry != expected_symmetry:
+            raise ValueError(
+                "Native gate symmetry "
+                f"{expected_symmetry} does not match supplied PEPO symmetry "
+                f"{actual_symmetry}."
+            )
+
+    try:
+        outer_inds = set(pepo.outer_inds())
+    except (AttributeError, TypeError) as exc:
+        raise TypeError(
+            "Native FermionicArray gates require a PEPO with physical outer "
+            "indices."
+        ) from exc
+
+    for tensor in tensors:
+        for axis, ind in enumerate(tensor.inds):
+            if ind not in outer_inds:
+                continue
+            actual_phys_map = tuple(
+                _expanded_index_charges(tensor.data.indices[axis])
+            )
+            if actual_phys_map != expected_phys_map:
+                raise ValueError(
+                    "Native gate physical charge maps do not match the "
+                    "supplied PEPO physical charge maps."
+                )
+
+
 def build_pepo_from_gates(
     gates,
     wheres=None,
@@ -3272,10 +3327,7 @@ def build_pepo_from_gates(
         )
     elif native_info is not None:
         pepo = pepo_.copy()
-        if any(not _is_block_sparse_array(tensor.data) for tensor in pepo):
-            raise TypeError(
-                "Native FermionicArray gates require a native Symmray PEPO."
-            )
+        _validate_native_pepo_compatibility(pepo, native_info)
     else:
         pepo = pepo_.copy() if pepo_ is not None else id_to_pepo(Lx, Ly, dtype=dtype)
         if pepo_ is None and cyclic:
