@@ -43,10 +43,11 @@ the truncation cap.
 
 ## Tree tensor networks
 
-``TreeEnergyOptimizer`` mirrors the ``MpsEnergyOptimizer`` measurement surface
-for a :class:`~pepsy.optimizers.tree.TreeTensorNetwork`. It reports
+``TreeEnergyOptimizer`` mirrors the ``MpsEnergyOptimizer`` energy surface for
+a :class:`~pepsy.optimizers.tree.TreeTensorNetwork`. It reports
 ``sum_i <psi|H_i|psi> / <psi|psi>`` term by term using the tree's own exact,
-fermion-safe contraction, and returns the same :class:`EnergyEstimate`:
+fermion-safe contraction, returns the same :class:`EnergyEstimate`, and can
+optimize the tree tensors through Quimb's autodiff ``TNOptimizer``:
 
 ```python
 import pepsy
@@ -56,12 +57,26 @@ estimate = pepsy.TreeEnergyOptimizer(
     terms=hamiltonian,        # {where: operator} mapping or a SymHamiltonian
     energy_per_site=True,
 ).energy()
+
+optimizer = pepsy.TreeEnergyOptimizer(tree_state, terms=hamiltonian)
+tree_state, losses = optimizer.optimize(
+    n=100,
+    autodiff_backend="torch",
+    optimizer="adam",
+    progbar=False,
+    return_losses=True,
+)
 ```
 
 The terms are dispatched through
 :meth:`~pepsy.optimizers.tree.TreeTensorNetwork.local_expectations`, which
 shares one contraction optimiser across every term (pass a reusable
 ``pepsy.build_optimizer(...)`` as ``contraction_opt`` to cache paths across
-same-topology contractions) and reuses the memoized graded norm, so the
-result is identical to summing per-term
-:meth:`~pepsy.optimizers.tree.TreeTensorNetwork.local_expectation` calls.
+same-topology contractions) and reuses the memoized graded norm for ordinary
+readout. During autodiff optimization, Quimb injects tensor arrays below the
+TTN mutation hooks, so the loss instead sums unnormalized numerators and
+divides by a freshly contracted full-tree norm on every call. Afterward the
+canonical metadata is invalidated rather than rebuilt around an arbitrary
+post-optimization centre; native fermionic normalized readouts therefore stay
+gauge invariant. The returned state remains a ``TreeTensorNetwork`` and the
+scalar history is available as ``optimizer.losses``.

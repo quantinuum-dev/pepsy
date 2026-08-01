@@ -346,8 +346,15 @@ site or a tuple of sites) to its operator. It delegates each term to
 `pepsy.build_optimizer(...)` caches one contraction path per topology, and it
 reuses the memoized graded norm across the batch. Each returned value matches
 the corresponding single-term call exactly. For a Hamiltonian-level energy
-readout, `pepsy.TreeEnergyOptimizer` wraps this batch path and returns an
-`EnergyEstimate` mirroring `MpsEnergyOptimizer`.
+readout or variational energy optimization, `pepsy.TreeEnergyOptimizer` wraps
+this batch path, returns an `EnergyEstimate` mirroring `MpsEnergyOptimizer`,
+and exposes the corresponding `make_tn_optimizer` / `optimize` methods.
+Optimization updates the tree tensor parameters with Quimb's autodiff
+`TNOptimizer` while retaining the exact tree local-expectation objective. For
+ordinary readout the native graded norm is memoized. The optimization loss
+uses a fresh full doubled-tree denominator because Quimb's direct parameter
+injection cannot invalidate that cache; the post-optimization state is marked
+non-canonical rather than recanonicalized around an arbitrary centre.
 
 For the package-level product-state constructor, matching `ps_to_mps`, use
 `pepsy.ps_to_ttn(n, theta=..., tree=...)`. It builds the requested tree,
