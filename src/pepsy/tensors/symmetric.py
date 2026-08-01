@@ -5174,6 +5174,20 @@ def _dense_numpy(value, *, dtype=None):
     return np.asarray(value, dtype=dtype)
 
 
+def _is_single_site_identity_hamiltonian(target, local_dim, zero_charge):
+    """Return whether ``target`` is exactly one full local identity term."""
+    if len(target.terms) != 1:
+        return False
+    term = next(iter(target.terms.values()))
+    if getattr(term, "charge", None) != zero_charge:
+        return False
+    dense = _dense_numpy(term)
+    return dense.shape == (local_dim, local_dim) and np.array_equal(
+        dense,
+        np.eye(local_dim, dtype=dense.dtype),
+    )
+
+
 def _expanded_index_charges(index):
     chargemap = getattr(index, "chargemap", None)
     if chargemap is None:
@@ -10496,6 +10510,32 @@ class Fermion:
             raise TypeError(
                 "Model parameters cannot be supplied with an existing "
                 f"SymHamiltonian: {names}."
+            )
+        if (
+            fermionic
+            and not charge_sectors
+            and _is_single_site_identity_hamiltonian(
+                target,
+                sum(int(size) for size in self.physical_sectors.values()),
+                self.zero_charge,
+            )
+        ):
+            from .constructors import (  # pylint: disable=import-outside-toplevel
+                _native_fermion_identity_pepo,
+            )
+
+            return _native_fermion_identity_pepo(
+                self,
+                Lx,
+                Ly,
+                cyclic=cyclic,
+                cycle_bond_dim=cycle_bond_dim,
+                mapper=mapper,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                compress=compress,
+                dtype=dtype,
+                to_backend=to_backend,
             )
         return target.to_pepo(
             Lx=Lx,

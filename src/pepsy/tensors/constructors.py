@@ -59,7 +59,57 @@ def add_cycle(peps, bond_dim, cylinder=False):
     return peps
 
 
-def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0):
+def _native_fermion_identity_pepo(
+    fermion,
+    lx,
+    ly,
+    *,
+    cyclic=False,
+    cycle_bond_dim=1,
+    mapper=None,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=False,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Build a full native fermionic identity without state-sector slicing."""
+    identity = fermion.observable("identity")
+    target = fermion.hamiltonian({((0, 0),): identity}, to_backend=to_backend)
+    return target.to_pepo(
+        Lx=lx,
+        Ly=ly,
+        mapper=mapper,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        compress=compress,
+        cyclic=cyclic,
+        cycle_bond_dim=cycle_bond_dim,
+        dtype=dtype,
+        fermionic=True,
+        to_backend=to_backend,
+    )
+
+
+def id_to_pepo(
+    lx,
+    ly=None,
+    phys_dim=2,
+    dtype="complex128",
+    chi=1,
+    rand_strength=0.0,
+    *,
+    fermion=None,
+    cyclic=False,
+    cycle_bond_dim=1,
+    mapper=None,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=False,
+    to_backend=None,
+    occupations=None,
+    site_charge=None,
+):
     """Create a PEPO identity on an ``lx x ly`` lattice.
 
     Parameters
@@ -67,7 +117,8 @@ def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0)
     lx : int
         Lattice size in x direction.
     ly : int
-        Lattice size in y direction.
+        Lattice size in y direction. If omitted, ``lx`` must be a two-item
+        ``(Lx, Ly)`` shape, matching :func:`ps_to_peps`.
     phys_dim : int, optional
         Physical dimension per site.
     dtype : str, optional
@@ -77,12 +128,78 @@ def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0)
         expanded via ``expand_bond_dimension`` after initialization.
     rand_strength : float, optional
         Random noise strength passed to ``expand_bond_dimension``.
+    fermion : :class:`~pepsy.tensors.Fermion`, optional
+        If supplied, construct a native Symmray fermionic identity. The
+        physical dimension is inferred from the model when the default
+        ``phys_dim=2`` is left in place.
+    cyclic : bool, optional
+        If True on the native fermionic path, add repaired dimension-one
+        bonds around the PEPO lattice using ``cycle_bond_dim``.
+    cycle_bond_dim : int, optional
+        Periodic bond dimension for the native fermionic path.
+    mapper, max_bond, cutoff, compress, to_backend
+        Forwarded to the native Fermion PEPO construction on the native path.
+    occupations, site_charge : optional
+        Rejected on the identity path. These arguments select a state sector
+        for :func:`ps_to_peps`; they must not remove diagonal blocks from a
+        full local identity operator.
 
     Returns
     -------
     quimb.tensor.PEPO
         Identity PEPO with bond dimension ``chi``.
     """
+    if ly is None:
+        if not isinstance(lx, (tuple, list)) or len(lx) != 2:
+            raise TypeError("id_to_pepo requires Lx and Ly, or a 2-item shape.")
+        lx, ly = lx
+    lx = int(lx)
+    ly = int(ly)
+    if lx < 1 or ly < 1:
+        raise ValueError("PEPO dimensions must be positive integers.")
+
+    if fermion is not None:
+        from .symmetric import Fermion  # pylint: disable=import-outside-toplevel
+
+        if not isinstance(fermion, Fermion):
+            raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
+        if occupations is not None or site_charge is not None:
+            raise ValueError(
+                "occupations and site_charge select product-state sectors; "
+                "a fermionic identity PEPO contains the full local identity."
+            )
+        if chi != 1 or rand_strength != 0.0:
+            raise ValueError(
+                "chi and rand_strength are dense PEPO expansion controls; "
+                "use max_bond/cutoff/compress for a native fermionic identity."
+            )
+        local_dim = sum(int(size) for size in fermion.physical_sectors.values())
+        if phys_dim not in (None, 2, local_dim):
+            raise ValueError(
+                f"phys_dim={phys_dim!r} does not match the fermion local "
+                f"dimension {local_dim}."
+            )
+        return _native_fermion_identity_pepo(
+            fermion,
+            lx,
+            ly,
+            mapper=mapper,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            compress=compress,
+            cyclic=cyclic,
+            cycle_bond_dim=cycle_bond_dim,
+            dtype=dtype,
+            to_backend=to_backend,
+        )
+
+    if occupations is not None or site_charge is not None:
+        raise ValueError("occupations and site_charge require fermion=...")
+    if to_backend is not None:
+        raise ValueError("to_backend requires fermion=...")
+    if cyclic and not isinstance(cyclic, bool):
+        raise TypeError("cyclic must be a boolean for id_to_pepo.")
+
     pepo = qtn.PEPO.rand(Lx=lx, Ly=ly, bond_dim=1, seed=666, dtype=dtype)
     eye = np.eye(phys_dim, dtype=dtype)
 
@@ -94,6 +211,8 @@ def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0)
         data[tuple([0] * n_virt)] = eye
         tensor.modify(data=data)
 
+    if cyclic:
+        pepo = add_cycle(pepo, bond_dim=cycle_bond_dim)
     if chi > 1:
         pepo.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return pepo

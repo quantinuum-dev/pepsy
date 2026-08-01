@@ -154,6 +154,22 @@ method is not implemented yet. Both constructors return the underlying PEPS
 with native fermionic Symmray tensors; use ``SymPEPS`` only when wrapper
 methods or stored Hamiltonian metadata are needed.
 
+For the corresponding full operator identity, use ``id_to_pepo`` with the
+same model:
+
+```python
+identity = py.id_to_pepo(
+    (Lx, Ly),
+    fermion=fh,
+    cyclic=True,
+)
+```
+
+This returns a native graded PEPO containing every local charge sector and
+repairs periodic bond orientations. ``occupations`` and ``site_charge`` are
+intentionally rejected here: they select a product-state sector and would
+make the result something other than the full identity.
+
 ## Unified native fermion helper
 
 ``Fermion`` is the model-facing helper for both one-mode spinless fermions
