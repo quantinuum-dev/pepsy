@@ -1232,9 +1232,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         Native Symmray tensors cannot use Quimb's generic compression helper:
         its QR phase convention is not safe for structural zero sectors in
         complex64.  We nevertheless retain the same reduction that makes the
-        dense path fast.  A proven one-sided isometry lets us SVD only the
-        non-isometric endpoint; otherwise both endpoints are QR-reduced with
-        the native zero-sector-safe QR before the small graded core is SVD'd.
+        dense path fast.  A proven one-sided isometry first gets a native QR
+        reduction of the active endpoint, then only the small graded core is
+        SVD'd; otherwise both endpoints are QR-reduced before the core SVD.
         The complete two-node graded SVD remains the conservative fallback.
         """
         if absorb == "right":
@@ -1244,8 +1244,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         else:
             raise ValueError("absorb must be 'right' or 'left'.")
 
+        reduction_hint = reduced
         isometric = self.node_tensor(isometric_node)
-        reduced = self.node_tensor(reduced_node)
+        reduced_tensor = self.node_tensor(reduced_node)
         bond = self.bond(isometric_node, reduced_node)
         left_inds = [index for index in isometric.inds if index != bond]
 
@@ -1256,40 +1257,66 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         # this low-level boundary as well, since direct TTN callers can pass
         # arbitrary reduction hints.
         if (
-            reduced == "left"
+            reduction_hint == "left"
             and self.can_skip_canonize(
                 isometric_node, reduced_node, absorb="left"
             )
         ):
-            kept, remainder = isometric.split(
+            # The destination endpoint is already an isometry toward the
+            # active endpoint, so only the active endpoint needs reducing.
+            # QR it first: after fusing its external legs, a central Tree
+            # tensor can be thousands by thousands even though its shared
+            # bond is only O(chi).  The QR leaves a core whose right dimension
+            # is the live bond, avoiding a full SVD of that large matrix.
+            reduced_bond = qtn.rand_uuid()
+            isometric_q, isometric_r = self._native_qr_split(
+                isometric,
                 left_inds=left_inds,
+                right_inds=(bond,),
+                absorb="right",
+                cutoff=0.0,
+                get="tensors",
+                bond_ind=reduced_bond,
+            )
+            compressed_bond = qtn.rand_uuid()
+            core_left, core_right = isometric_r.split(
+                left_inds=(reduced_bond,),
                 method="svd",
                 max_bond=max_bond,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
                 absorb="right",
                 get="tensors",
-                bond_ind=bond,
+                bond_ind=compressed_bond,
             )
-            merged = qtn.tensor_contract(remainder, reduced)
+            kept = qtn.tensor_contract(
+                isometric_q, core_left,
+            )
+            merged = qtn.tensor_contract(
+                core_right, reduced_tensor,
+            )
+            kept.reindex_({compressed_bond: bond})
+            merged.reindex_({compressed_bond: bond})
             isometric.modify(
                 data=kept.data,
                 inds=kept.inds,
-                left_inds=kept.left_inds,
+                left_inds=left_inds,
             )
-            reduced.modify(
+            reduced_tensor.modify(
                 data=merged.data,
                 inds=merged.inds,
                 left_inds=None,
             )
             return self
 
-        if reduced is True:
+        if reduction_hint is True:
             # Mirror ``qtn.tensor_compress_bond(reduced=True)`` while routing
             # both QR decompositions through the native policy above.  This
             # keeps the expensive SVD on the reduced core and avoids the
             # O((Dl * d) x (Dr * d)) full two-node matrix in the common case.
-            right_inds = [index for index in reduced.inds if index != bond]
+            right_inds = [
+                index for index in reduced_tensor.inds if index != bond
+            ]
             left_bond = qtn.rand_uuid()
             right_bond = qtn.rand_uuid()
             isometric_q, isometric_r = self._native_qr_split(
@@ -1302,7 +1329,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 bond_ind=left_bond,
             )
             reduced_l, reduced_q = self._native_qr_split(
-                reduced,
+                reduced_tensor,
                 left_inds=(bond,),
                 right_inds=right_inds,
                 absorb="left",
@@ -1322,17 +1349,17 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 bond_ind=bond,
             )
             isometric_compressed = qtn.tensor_contract(
-                isometric_q, core_left, output_inds=isometric.inds,
+                isometric_q, core_left,
             )
             reduced_compressed = qtn.tensor_contract(
-                core_right, reduced_q, output_inds=reduced.inds,
+                core_right, reduced_q,
             )
             isometric.modify(
                 data=isometric_compressed.data,
                 inds=isometric_compressed.inds,
                 left_inds=left_inds,
             )
-            reduced.modify(
+            reduced_tensor.modify(
                 data=reduced_compressed.data,
                 inds=reduced_compressed.inds,
                 left_inds=None,
@@ -1341,7 +1368,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         # Keep the old complete graded split as a compatibility fallback for
         # direct callers that provide an unrecognised reduction hint.
-        theta = qtn.tensor_contract(isometric, reduced)
+        theta = qtn.tensor_contract(isometric, reduced_tensor)
         kept, remainder = theta.split(
             left_inds=left_inds,
             method="svd",
@@ -1357,7 +1384,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             inds=kept.inds,
             left_inds=kept.left_inds,
         )
-        reduced.modify(
+        reduced_tensor.modify(
             data=remainder.data,
             inds=remainder.inds,
             left_inds=None,
@@ -1433,9 +1460,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Compress the tree edge ``a -> b`` in place.
 
         Dense/nonfermionic trees delegate to Quimb's ``compress_between``.
-        Native fermionic trees explicitly SVD the complete two-node tensor.
-        The tracked :attr:`orthogonality_center` advances as for
-        :meth:`canonize_edge_`.
+        Native fermionic trees use the same reduced-core decomposition while
+        routing every lossless factorization through the zero-sector-safe
+        native QR helper. The tracked :attr:`orthogonality_center` advances as
+        for :meth:`canonize_edge_`.
 
         ``cutoff_mode`` selects Quimb's singular-value cutoff convention.
         ``reduced`` selects the dense Quimb reduction and the corresponding

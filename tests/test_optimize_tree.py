@@ -5056,6 +5056,53 @@ def test_native_truncating_compression_keeps_explicit_svd(monkeypatch):
     assert calls
 
 
+def test_native_one_sided_compression_qr_reduces_before_svd(monkeypatch):
+    """A proven native isometry sends only its reduced core to the SVD."""
+    pytest.importorskip("symmray")
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    ttn = pepsy.ps_to_ttn(
+        4,
+        tree=plan,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
+        dtype="complex128",
+    )
+    target = plan.leaf_of_qubit[0]
+    ttn.shift_orthogonality_center(target)
+    source = next(
+        nid for nid, toward in ttn.isometry_map().items()
+        if toward == target and ttn.can_skip_canonize(nid, toward)
+    )
+
+    split_methods = []
+    original_split = qtn.Tensor.split
+
+    def traced_split(self, *args, **kwargs):
+        method = kwargs.get("method")
+        if method in {"qr", "svd"} and hasattr(self.data, "blocks"):
+            split_methods.append((method, tuple(self.shape)))
+        return original_split(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.Tensor, "split", traced_split)
+    ttn._fermionic_compress_edge_(
+        target,
+        source,
+        max_bond=64,
+        cutoff=1e-10,
+        cutoff_mode="rel",
+        absorb="right",
+        reduced="left",
+    )
+
+    assert [method for method, _shape in split_methods] == ["qr", "svd"]
+    assert ttn.validate(check_canonical=True) is ttn
+
+
 def test_tree_stable_labels_route_submpo_by_payload_sites(monkeypatch):
     """Stable logical labels do not disable native structured MPO routing."""
     x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
