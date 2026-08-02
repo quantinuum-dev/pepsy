@@ -3109,6 +3109,52 @@ def test_tree_public_submpo_and_pauli_backend_operations():
     )
 
 
+def test_tree_expectation_mpo_is_batched_and_non_mutating():
+    """A structured MPO expectation uses one tree pass and preserves state."""
+    h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    zz = np.diag([1.0, -1.0, -1.0, 1.0])
+    mpo = qtn.MatrixProductOperator.from_dense(
+        zz, dims=(2, 2), sites=(0, 1), L=4,
+    )
+    opt = TreeOptimizer([(h, 0), (cnot, (0, 1))], n=4, chi=16)
+    before = opt.to_dense().copy()
+
+    value = opt.expectation_mpo(mpo, (0, 1), max_bond=16)
+
+    assert value == pytest.approx(1.0)
+    assert np.allclose(opt.to_dense(), before)
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_tree_profile_report_is_opt_in():
+    """Kernel timings are empty by default and available when requested."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    quiet = TreeOptimizer([(x, 0)], n=4, chi=4)
+    assert quiet.profile_report() == {
+        "enabled": False,
+        "events": [],
+        "by_kind": {},
+        "total_seconds": 0.0,
+    }
+
+    profiled = TreeOptimizer(
+        [(x, 0), (cnot, (0, 3))], n=4, chi=4, profile=True,
+    )
+    report = profiled.profile_report()
+    assert report["enabled"] is True
+    assert report["events"]
+    assert report["by_kind"]["update"]["count"] == 2
+    assert report["total_seconds"] > 0.0
+
+
 def test_tree_pauli_expectation_and_projection_are_public():
     """Pauli expectation/projection share the measurement backend semantics."""
     h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
@@ -4804,6 +4850,14 @@ def test_native_tree_direct_mpo_and_submpo_match_without_global_fidelity(
 
     for output in outputs[1:]:
         assert _fidelity(outputs[0], output) > 1 - 1e-10
+
+    before = dense_vector(submpo_opt)
+    mpo_value = submpo_opt.expectation_mpo(
+        submpo, (0, 2), max_bond=64,
+    )
+    direct_value = submpo_opt.tn.local_expectation(hopping, (0, 2))
+    assert complex(mpo_value) == pytest.approx(complex(direct_value), abs=1e-5)
+    assert np.allclose(dense_vector(submpo_opt), before)
 
 
 def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):

@@ -39,6 +39,7 @@ MPS.
 from __future__ import annotations
 
 import re
+import time
 
 import autoray as ar
 import numpy as np
@@ -405,24 +406,34 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self, operator, where, *, optimize, normalized,
     ):
         """Evaluate a native observable with the complete graded exterior."""
-        inds = [self.site_ind(site) for site in where]
-        operated = qtn.tensor_network_gate_inds(
-            self,
-            operator,
-            inds,
-            contract=False,
-            tags=[],
-            info=None,
-            inplace=False,
-        )
-        numerator = (self.H | operated).contract(
-            all,
-            optimize=optimize,
-        )
-        if not normalized:
-            return numerator
-        denominator = self._fermionic_norm_squared()
-        return numerator / denominator
+        profile_sink = getattr(self, "_profile_sink", None)
+        profile_started = time.perf_counter() if profile_sink is not None else None
+        try:
+            inds = [self.site_ind(site) for site in where]
+            operated = qtn.tensor_network_gate_inds(
+                self,
+                operator,
+                inds,
+                contract=False,
+                tags=[],
+                info=None,
+                inplace=False,
+            )
+            numerator = (self.H | operated).contract(
+                all,
+                optimize=optimize,
+            )
+            if not normalized:
+                return numerator
+            denominator = self._fermionic_norm_squared()
+            return numerator / denominator
+        finally:
+            if profile_started is not None:
+                profile_sink.append({
+                    "kind": "native_observable",
+                    "support": tuple(where),
+                    "seconds": time.perf_counter() - profile_started,
+                })
 
     def _restore_readout_region(self, region):
         """Restore a dense readout's tracked canonical region."""
@@ -591,16 +602,60 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         Returns a ``{where: value}`` dict following the iteration order of
         ``terms``.
         """
+        profile_sink = getattr(self, "_profile_sink", None)
+        profile_started = time.perf_counter() if profile_sink is not None else None
         results = {}
-        for where, operator in terms.items():
-            if isinstance(where, Integral):
-                support = (int(where),)
-            else:
-                support = tuple(int(site) for site in where)
-            results[where] = self.local_expectation(
-                operator, support, optimize=optimize, normalized=normalized,
-            )
-        return results
+        try:
+            for where, operator in terms.items():
+                if isinstance(where, Integral):
+                    support = (int(where),)
+                else:
+                    support = tuple(int(site) for site in where)
+                results[where] = self.local_expectation(
+                    operator, support, optimize=optimize, normalized=normalized,
+                )
+            return results
+        finally:
+            if profile_started is not None:
+                profile_sink.append({
+                    "kind": "observable_batch",
+                    "count": len(terms),
+                    "seconds": time.perf_counter() - profile_started,
+                })
+
+    def expectation_mpo(
+        self, mpo, where, *, max_bond=None, cutoff=0.0,
+        normalized=True, optimize="auto",
+    ):
+        """Evaluate a structured MPO expectation without changing this TTN.
+
+        This is a convenience wrapper around
+        :meth:`TreeOptimizer.expectation_mpo`.  The MPO is routed once over
+        the tree, preserving native Symmray blocks and avoiding a dense
+        operator on the full support.  The transformed-state bond cap defaults
+        to this TTN's current maximum bond; pass ``max_bond`` explicitly when
+        a larger measurement workspace is acceptable.
+        """
+        from .optimizer import TreeOptimizer
+
+        current_bond = int(self.max_bond())
+        engine = TreeOptimizer(
+            None,
+            n=self.nqubits,
+            tree=self.plan,
+            state=self,
+            chi=current_bond if max_bond is None else max_bond,
+            cutoff=0.0,
+            run=False,
+        )
+        return engine.expectation_mpo(
+            mpo,
+            where,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            normalized=normalized,
+            optimize=optimize,
+        )
 
     @property
     def orthogonality_center(self):
@@ -1170,9 +1225,18 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self
 
     def _fermionic_compress_edge_(
-        self, a, b, *, max_bond, cutoff, cutoff_mode, absorb,
+        self, a, b, *, max_bond, cutoff, cutoff_mode, absorb, reduced=True,
     ):
-        """Compress one native graded tree cut by an explicit two-node SVD."""
+        """Compress one native graded tree cut with a reduced graded SVD.
+
+        Native Symmray tensors cannot use Quimb's generic compression helper:
+        its QR phase convention is not safe for structural zero sectors in
+        complex64.  We nevertheless retain the same reduction that makes the
+        dense path fast.  A proven one-sided isometry lets us SVD only the
+        non-isometric endpoint; otherwise both endpoints are QR-reduced with
+        the native zero-sector-safe QR before the small graded core is SVD'd.
+        The complete two-node graded SVD remains the conservative fallback.
+        """
         if absorb == "right":
             isometric_node, reduced_node = a, b
         elif absorb == "left":
@@ -1184,6 +1248,99 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         reduced = self.node_tensor(reduced_node)
         bond = self.bond(isometric_node, reduced_node)
         left_inds = [index for index in isometric.inds if index != bond]
+
+        # ``reduced="left"`` is the metadata value emitted by the optimizer
+        # when ``reduced_node`` is already isometric towards ``isometric``.
+        # In that case the environment is an exact identity and decomposing
+        # the complete two-node tensor is unnecessary.  Validate the proof at
+        # this low-level boundary as well, since direct TTN callers can pass
+        # arbitrary reduction hints.
+        if (
+            reduced == "left"
+            and self.can_skip_canonize(
+                isometric_node, reduced_node, absorb="left"
+            )
+        ):
+            kept, remainder = isometric.split(
+                left_inds=left_inds,
+                method="svd",
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                get="tensors",
+                bond_ind=bond,
+            )
+            merged = qtn.tensor_contract(remainder, reduced)
+            isometric.modify(
+                data=kept.data,
+                inds=kept.inds,
+                left_inds=kept.left_inds,
+            )
+            reduced.modify(
+                data=merged.data,
+                inds=merged.inds,
+                left_inds=None,
+            )
+            return self
+
+        if reduced is True:
+            # Mirror ``qtn.tensor_compress_bond(reduced=True)`` while routing
+            # both QR decompositions through the native policy above.  This
+            # keeps the expensive SVD on the reduced core and avoids the
+            # O((Dl * d) x (Dr * d)) full two-node matrix in the common case.
+            right_inds = [index for index in reduced.inds if index != bond]
+            left_bond = qtn.rand_uuid()
+            right_bond = qtn.rand_uuid()
+            isometric_q, isometric_r = self._native_qr_split(
+                isometric,
+                left_inds=left_inds,
+                right_inds=(bond,),
+                absorb="right",
+                cutoff=0.0,
+                get="tensors",
+                bond_ind=left_bond,
+            )
+            reduced_l, reduced_q = self._native_qr_split(
+                reduced,
+                left_inds=(bond,),
+                right_inds=right_inds,
+                absorb="left",
+                cutoff=0.0,
+                get="tensors",
+                bond_ind=right_bond,
+            )
+            core = qtn.tensor_contract(isometric_r, reduced_l)
+            core_left, core_right = core.split(
+                left_inds=(left_bond,),
+                method="svd",
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                get="tensors",
+                bond_ind=bond,
+            )
+            isometric_compressed = qtn.tensor_contract(
+                isometric_q, core_left, output_inds=isometric.inds,
+            )
+            reduced_compressed = qtn.tensor_contract(
+                core_right, reduced_q, output_inds=reduced.inds,
+            )
+            isometric.modify(
+                data=isometric_compressed.data,
+                inds=isometric_compressed.inds,
+                left_inds=left_inds,
+            )
+            reduced.modify(
+                data=reduced_compressed.data,
+                inds=reduced_compressed.inds,
+                left_inds=None,
+            )
+            return self
+
+        # Keep the old complete graded split as a compatibility fallback for
+        # direct callers that provide an unrecognised reduction hint.
         theta = qtn.tensor_contract(isometric, reduced)
         kept, remainder = theta.split(
             left_inds=left_inds,
@@ -1281,10 +1438,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         :meth:`canonize_edge_`.
 
         ``cutoff_mode`` selects Quimb's singular-value cutoff convention.
-        ``reduced`` is forwarded only on the dense path. Quimb's one-sided
-        ``"left"`` mode is exact when node ``b`` is already isometric on its
-        non-shared legs. Native fermionic compression ignores this option and
-        retains its explicit graded split.
+        ``reduced`` selects the dense Quimb reduction and the corresponding
+        native graded reduction. Quimb's one-sided ``"left"`` mode is exact
+        when node ``b`` is already isometric on its non-shared legs; native
+        trees use the same proof, with the zero-sector-safe QR policy retained
+        for the two-sided reduced path.
         """
         bond = self.bond(a, b)
         before_bond = int(self.ind_size(bond))
@@ -1305,6 +1463,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
                 absorb=absorb,
+                reduced=reduced,
             )
         else:
             self.compress_between(
