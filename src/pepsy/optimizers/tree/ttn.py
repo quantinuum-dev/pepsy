@@ -1134,6 +1134,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             method="qr",
             absorb="right",
             cutoff=0.0,
+            # Native graded blocks can have exact structural-zero R diagonals;
+            # skip Quimb's phase normalization so those sectors stay finite.
+            stabilized=False,
             get="tensors",
         )
         merged = qtn.tensor_contract(carry, reduced)
@@ -1332,12 +1335,19 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """
         region = self._validated_region(nodes, span=span)
         tags = [self.node_tag(n) for n in region]
+        canonize_opts = {
+            "method": "qr",
+            "cutoff": 0.0,
+        }
+        if self.fermionic:
+            # The Symmray QR backend can encounter exact structural-zero
+            # diagonals while gauging a native fermionic region.
+            canonize_opts["stabilized"] = False
         self.canonize_around_(
             tags,
             which="any",
             absorb=absorb,
-            method="qr",
-            cutoff=0.0,
+            **canonize_opts,
         )
         self._canonical_region = region
         return self

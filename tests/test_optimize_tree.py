@@ -4601,6 +4601,135 @@ def test_tree_native_fermionic_gate_stream_matches_mps():
     assert float(tensors.tn_fidelity(engine.p, mps_exact.p)) > 1 - 1e-8
 
 
+@pytest.mark.filterwarnings(
+    "ignore:TreeOptimizer is converting a gate/operator payload"
+)
+def test_native_complex64_threading_disables_zero_phase_stabilization(monkeypatch):
+    """Native path threading keeps structural-zero QR sectors finite."""
+    pytest.importorskip("symmray")
+    L = 4
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex64",
+    )
+    plan = TreePlan.from_order(range(L), structure="balanced")
+    state = pepsy.ps_to_ttn(
+        L,
+        tree=plan,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
+        dtype="complex64",
+    )
+    gate = fermion.hopping_gate(0.05, t=1.0, imaginary=False)
+
+    threaded = False
+    qr_stabilized = []
+    original_hop = TreeOptimizer._fermionic_thread_hop
+    original_split = qtn.Tensor.split
+
+    def traced_hop(self, u, v):
+        nonlocal threaded
+        threaded = True
+        try:
+            return original_hop(self, u, v)
+        finally:
+            threaded = False
+
+    def traced_split(self, *args, **kwargs):
+        if threaded and kwargs.get("method") == "qr":
+            qr_stabilized.append(kwargs.get("stabilized"))
+        return original_split(self, *args, **kwargs)
+
+    monkeypatch.setattr(TreeOptimizer, "_fermionic_thread_hop", traced_hop)
+    monkeypatch.setattr(qtn.Tensor, "split", traced_split)
+
+    optimizer = TreeOptimizer(
+        None,
+        n=L,
+        tree=plan,
+        state=state,
+        chi=16,
+        cutoff=0.0,
+        mode="direct",
+        run=False,
+    )
+    optimizer.apply_2q(gate, 0, 2)
+
+    assert qr_stabilized
+    assert qr_stabilized == [False] * len(qr_stabilized)
+    assert all(
+        np.isfinite(np.asarray(block)).all()
+        for tensor in optimizer.tn.tensors
+        for block in tensor.data.blocks.values()
+    )
+
+
+@pytest.mark.filterwarnings(
+    "ignore:TreeOptimizer is converting a gate/operator payload"
+)
+def test_native_complex64_all_lossless_qr_routes_skip_zero_phase(monkeypatch):
+    """All native tree QR routes avoid phase division on zero sectors."""
+    pytest.importorskip("symmray")
+    L = 4
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex64",
+    )
+    plan = TreePlan.from_order(range(L), structure="balanced")
+    state = pepsy.ps_to_ttn(
+        L,
+        tree=plan,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
+        dtype="complex64",
+    )
+    hopping = fermion.hopping_gate(0.05, t=1.0, imaginary=False)
+    routed_ops = [
+        fermion.onsite_gate(
+            0.01, site=site, U=8.0, mu=0.0, imaginary=False,
+        )
+        for site in (0, 1, 2)
+    ]
+    submpo = qtn.MPO_product_operator(
+        routed_ops,
+        sites=(0, 1, 2),
+        L=L,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+    )
+
+    observed = []
+    original_split = qtn.Tensor.split
+
+    def traced_split(self, *args, **kwargs):
+        if kwargs.get("method") == "qr" and hasattr(self.data, "blocks"):
+            observed.append(kwargs.get("stabilized"))
+        return original_split(self, *args, **kwargs)
+
+    monkeypatch.setattr(qtn.Tensor, "split", traced_split)
+
+    for operation in (
+        lambda: TreeOptimizer(
+            None, n=L, tree=plan, state=state.copy(), chi=16,
+            cutoff=0.0, mode="direct", run=False,
+        ).apply_2q(hopping, 0, 1),
+        lambda: TreeOptimizer(
+            None, n=L, tree=plan, state=state.copy(), chi=16,
+            cutoff=0.0, mode="direct", run=False,
+        ).apply_2q(hopping, 0, 2),
+        lambda: TreeOptimizer(
+            None, n=L, tree=plan, state=state.copy(), chi=16,
+            cutoff=0.0, mode="submpo", run=False,
+        ).apply_submpo(submpo, (0, 1, 2)),
+    ):
+        operation()
+
+    assert observed
+    assert observed == [False] * len(observed)
+
+
 @pytest.mark.parametrize(
     ("symmetry", "occupations"),
     [

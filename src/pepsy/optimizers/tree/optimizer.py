@@ -3118,6 +3118,12 @@ class TreeOptimizer:
             method="qr",
             absorb="right",
             cutoff=0.0,
+            # Threaded native blocks can be rank deficient by symmetry. The
+            # stabilized Symmray QR normalizes every R diagonal entry to a
+            # phase, so a structural zero becomes 0 / |0| -> NaN in
+            # complex64. Plain QR is still lossless here and leaves those
+            # zero sectors finite.
+            stabilized=False,
             get="tensors",
         )
         merged_v = qtn.tensor_contract(carry, tv)
@@ -3320,6 +3326,9 @@ class TreeOptimizer:
                 method="qr",
                 cutoff=0.0,
                 absorb="right",
+                # Native Symmray QR must not phase-normalize structural-zero
+                # diagonal entries; retain Quimb's dense default otherwise.
+                stabilized=not self.tn.fermionic,
                 get="tensors",
                 bond_ind=bond_ind,
             )
@@ -3503,6 +3512,9 @@ class TreeOptimizer:
             left_inds=left_inds,
             method="qr",
             absorb="right",
+            # Keep the dense Quimb phase convention, but avoid 0 / |0| in
+            # native Symmray structural-zero sectors.
+            stabilized=not _is_symmray_array(tensor.data),
             get="tensors",
             bond_ind=bond_ind,
         )
