@@ -65,6 +65,29 @@ Before changing a specialized subsystem, read its skill:
 Keep domain-specific invariants in those skills or their direct references;
 do not duplicate them here.
 
+## Native fermionic tree QR policy
+
+The native `TreeTensorNetwork` QR policy is centralized in
+`TreeTensorNetwork._native_qr_split` and `_native_qr_options`:
+
+- Every lossless QR split on native Symmray tree tensors must use
+  `_native_qr_split`; do not add a direct `tensor.split(method="qr")` call to a
+  native tree route.
+- The helper sets `stabilized=False` only for Symmray block-sparse tensors.
+  Symmray's stabilized QR phase-normalizes each diagonal of `R`; an exact
+  structural-zero diagonal makes that phase `0 / |0|`, which can become NaN in
+  `complex64`. Dense tensors retain Quimb's normal stabilized-QR default.
+- Network-level canonicalization, which does not expose one tensor at a time,
+  obtains the same option from `_native_qr_options()` when the tree is
+  fermionic. Keep this policy aligned if another native canonicalization route
+  is added.
+- Skipping the phase convention is lossless: `Q @ R` is unchanged, and the
+  resulting `left_inds` isometry metadata remains valid. Native truncating
+  compression still uses the explicit graded SVD and its configured cutoff.
+- This safeguard is scoped to `TreeTensorNetwork` / `TreeOptimizer`. It does
+  not change the separate `MpsOptimizer` QR implementation or globally patch
+  Quimb/Symmray.
+
 ## Dependency and backend rules
 
 - Prefer public `quimb`, `cotengra`, `cotengrust`, and `autoray` APIs over
