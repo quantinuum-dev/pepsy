@@ -100,8 +100,10 @@ For unitary streams,
 `get_infidelities()` uses the current retained norm divided by the initial
 run norm, squared; this is the global retained-fidelity estimate and is
 equivalent to multiplying the per-gate fidelities without requiring a
-pre-gate target measurement. Local ratios remain available in detailed
-samples for diagnostics. The trace is populated by default. Set
+pre-gate target measurement. Local products and norm-ratio evaluations are
+accumulated in the log domain and exponentiated only for readout, so long
+streams and very small retained norms do not lose fidelity to underflow. Local
+ratios remain available in detailed samples for diagnostics. The trace is populated by default. Set
 ``track_infidelity=False`` in the constructor, or pass
 ``track_infidelity=False`` to ``run()``, to skip target-norm construction,
 retained-norm calculations, samples, and progress-bar infidelity fields. For

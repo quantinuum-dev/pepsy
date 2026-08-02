@@ -55,6 +55,11 @@ from ...backends import (
     to_float,
 )
 from ...operators.gates import _normalize_gate_entries
+from .._fidelity import (
+    fidelity_from_log,
+    infidelity_from_log,
+    log_fidelity_from_norms,
+)
 from ..mps.optimizer import (
     _control_event_parts as _mps_control_event_parts,
     normalize_submpo_where,
@@ -681,7 +686,7 @@ class TreeOptimizer:
         self._gate_factor_cache = {}
         self._gate_factor_cache_limit = 64
         self._active_update = None
-        self._truncation_survival = 1.0
+        self._truncation_log_survival = 0.0
 
         if tree is None:
             self.layout_finder = TreeLayoutFinder(
@@ -1281,7 +1286,7 @@ class TreeOptimizer:
         self.infidelity_samples.clear()
         self.normalizations.clear()
         self.projection_diagnostics.clear()
-        self._truncation_survival = 1.0
+        self._truncation_log_survival = 0.0
         return self
 
     def set_p(self, tn):
@@ -2138,11 +2143,17 @@ class TreeOptimizer:
             if event["discarded_fraction"] is not None
         ]
         if tracked:
-            edge_survival = float(np.prod([
-                max(0.0, 1.0 - event["discarded_fraction"])
-                for event in tracked
-            ]))
-            relative_loss = float(1.0 - edge_survival)
+            edge_log_survival = 0.0
+            for event in tracked:
+                edge_survival = min(
+                    1.0,
+                    max(0.0, 1.0 - float(event["discarded_fraction"])),
+                )
+                if edge_survival <= 0.0:
+                    edge_log_survival = -np.inf
+                    break
+                edge_log_survival += float(np.log(edge_survival))
+            relative_loss = infidelity_from_log(edge_log_survival)
             absolute_loss = float(
                 sum(event["discarded_weight"] for event in tracked)
             )
@@ -2152,15 +2163,25 @@ class TreeOptimizer:
             max_edge_fraction = float(
                 max(event["discarded_fraction"] for event in tracked)
             )
-            self._truncation_survival *= edge_survival
-            cumulative_loss = float(1.0 - self._truncation_survival)
+            if (
+                np.isneginf(self._truncation_log_survival)
+                or np.isneginf(edge_log_survival)
+            ):
+                self._truncation_log_survival = -np.inf
+            else:
+                self._truncation_log_survival += edge_log_survival
+            cumulative_loss = infidelity_from_log(
+                self._truncation_log_survival,
+            )
         else:
             if self.track_truncation:
                 relative_loss = 0.0
                 absolute_loss = 0.0
                 max_edge_loss = 0.0
                 max_edge_fraction = 0.0
-                cumulative_loss = float(1.0 - self._truncation_survival)
+                cumulative_loss = infidelity_from_log(
+                    self._truncation_log_survival,
+                )
             else:
                 relative_loss = None
                 absolute_loss = None
@@ -2191,7 +2212,7 @@ class TreeOptimizer:
                 "step": len(self.infidelity_samples) + 1,
                 "where": active["support"],
                 "edge_count": len(edge_events),
-                "local_fidelity": float(1.0 - local_infidelity),
+                "local_fidelity": fidelity_from_log(edge_log_survival),
                 "local_infidelity": local_infidelity,
                 "infidelity": float(cumulative_loss),
                 "cumulative_infidelity": float(cumulative_loss),
@@ -2418,10 +2439,11 @@ class TreeOptimizer:
                         elif progress_reference_norm in (None, 0.0):
                             truncation_infidelity = 0.0
                         else:
-                            survival = state_norm / progress_reference_norm
-                            truncation_infidelity = max(
-                                0.0,
-                                1.0 - survival * survival,
+                            truncation_infidelity = infidelity_from_log(
+                                log_fidelity_from_norms(
+                                    state_norm,
+                                    progress_reference_norm,
+                                )
                             )
                         postfix["infidelity"] = self._format_progress_infidelity(
                             truncation_infidelity
@@ -5147,7 +5169,7 @@ class TreeOptimizer:
         other._track_warning_emitted = self._track_warning_emitted
         other._logical_qubits = list(self._logical_qubits)
         other._logical_positions = dict(self._logical_positions)
-        other._truncation_survival = self._truncation_survival
+        other._truncation_log_survival = self._truncation_log_survival
         return other
 
     def get_infidelities(self):

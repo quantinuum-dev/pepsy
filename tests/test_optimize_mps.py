@@ -145,6 +145,16 @@ def test_mps_optimizer_run_can_override_infidelity_tracking():
     assert len(opt.get_infidelity_samples()) == 1
 
 
+def test_mps_norm_fidelity_uses_log_ratio_for_extreme_scales():
+    """Norm-ratio fidelity remains finite without forming a huge quotient."""
+    p0 = qtn.MPS_computational_state("0", dtype="complex128")
+    opt = py.MpsOptimizer(p0, gates=[], chi=2, mode="svd")
+
+    fidelity = opt._norm_ratio_fidelity(1.0e300, 1.0e300 * (1.0 + 1.0e-8))
+
+    assert fidelity == pytest.approx((1.0 / (1.0 + 1.0e-8)) ** 2)
+
+
 def test_mps_optimizer_simple_update_routes_torch_u1u1_long_range_gate():
     """SU routed SWAPs should stay on the live Torch Symmray backend."""
     torch = pytest.importorskip("torch")

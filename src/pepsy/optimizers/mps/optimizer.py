@@ -74,6 +74,11 @@ from ...operators.gates import (
     gate as apply_gate,
     gate_simple as apply_gate_simple,
 )
+from .._fidelity import (
+    fidelity_from_log,
+    infidelity_from_log,
+    log_fidelity_from_norms,
+)
 from .layout import (
     MpsGateStreamLayoutFinder,
     _normalize_layout_support,
@@ -3429,15 +3434,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ratios. Accumulating ``log(F)`` avoids losing information to
         floating-point underflow on long non-unitary streams.
         """
-        local_fidelity = self._norm_ratio_fidelity(approx_norm, target_norm)
-        if local_fidelity <= 0.0 or np.isneginf(self._infidelity_log_fidelity):
+        local_log_fidelity = log_fidelity_from_norms(
+            approx_norm, target_norm,
+        )
+        if (
+            np.isneginf(local_log_fidelity)
+            or np.isneginf(self._infidelity_log_fidelity)
+        ):
             self._infidelity_log_fidelity = -np.inf
         else:
-            self._infidelity_log_fidelity += float(np.log(local_fidelity))
-        cumulative_infidelity = (
-            1.0
-            if np.isneginf(self._infidelity_log_fidelity)
-            else float(-np.expm1(self._infidelity_log_fidelity))
+            self._infidelity_log_fidelity += local_log_fidelity
+        local_fidelity = fidelity_from_log(local_log_fidelity)
+        cumulative_infidelity = infidelity_from_log(
+            self._infidelity_log_fidelity,
         )
         sample = {
             "step": int(step),
@@ -3498,11 +3507,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self._unitary_initial_norm is None:
             self._unitary_initial_norm = previous_norm
         if self._unitary_global_norm_tracking:
-            global_fidelity = self._norm_ratio_fidelity(
+            global_log_fidelity = log_fidelity_from_norms(
                 approx_norm,
                 self._unitary_initial_norm,
             )
-            global_infidelity = 1.0 - global_fidelity
+            global_fidelity = fidelity_from_log(global_log_fidelity)
+            global_infidelity = infidelity_from_log(global_log_fidelity)
             sample["fidelity"] = global_fidelity
             sample["global_fidelity"] = global_fidelity
             sample["global_infidelity"] = global_infidelity
@@ -3714,14 +3724,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     @staticmethod
     def _norm_ratio_fidelity(approx_norm, target_norm):
         """Return clipped ``(||approx|| / ||target||)**2``."""
-        approx = MpsOptimizer._real_float(approx_norm)
-        target = MpsOptimizer._real_float(target_norm)
-
-        if target <= 0.0:
-            return 1.0 if approx <= 0.0 else 0.0
-
-        fidelity = (approx / target) ** 2
-        return min(1.0, max(0.0, float(fidelity)))
+        return fidelity_from_log(
+            log_fidelity_from_norms(
+                MpsOptimizer._real_float(approx_norm),
+                MpsOptimizer._real_float(target_norm),
+            )
+        )
 
     def _build_norm_target(self, p, gate, where, cutoff, cutoff_mode="rsum2"):
         """Build the pre-chi-compression target used for norm diagnostics."""

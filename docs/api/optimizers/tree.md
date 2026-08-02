@@ -949,6 +949,9 @@ scale.
   diagnostic spectrum probes can add substantial SVD work. It remains
   disabled by default. Lossless zero-cutoff edges that are already within
   their bond cap use QR and do not probe a spectrum even when tracking is on.
+  Per-edge retained survival and cumulative infidelity are accumulated in log
+  space and exponentiated only for readout, avoiding product underflow on long
+  streams.
   The report also contains gate-level `updates`, grouping
   edge events by support and reporting the cumulative relative loss.
 - `TreeOptimizer.convergence_sweep(gates, n, chi_values, ops=...)` replays the

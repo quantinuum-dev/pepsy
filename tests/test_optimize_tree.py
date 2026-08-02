@@ -651,6 +651,34 @@ def test_tree_truncation_infidelity_compatibility_trace():
     assert opt.get_normalizations() == []
 
 
+def test_tree_truncation_survival_accumulates_in_log_space():
+    """Many local survival factors remain stable in the cumulative trace."""
+    opt = TreeOptimizer(None, n=2, chi=2, track_truncation=True, run=False)
+    opt._active_update = {
+        "kind": "gate",
+        "support": (0, 1),
+        "edge_start": 0,
+        "started_at": 0.0,
+    }
+    local_survival = 0.999999999999
+    count = 1000
+    opt.truncation_history = [
+        {
+            "discarded_fraction": 1.0 - local_survival,
+            "discarded_weight": 1.0 - local_survival,
+            "truncated": True,
+        }
+        for _ in range(count)
+    ]
+
+    opt._finish_update()
+
+    expected_log = count * np.log(local_survival)
+    expected_infidelity = -np.expm1(expected_log)
+    assert opt._truncation_log_survival == pytest.approx(expected_log)
+    assert opt.get_infidelities()[-1] == pytest.approx(expected_infidelity)
+
+
 def test_tree_run_supports_shared_non_unitary_normalization_controls():
     """Tree replay accepts the shared non-unitary normalization contract."""
     half = 0.5 * np.eye(2, dtype=complex)
@@ -3577,6 +3605,24 @@ def test_tree_torch_state_stays_native_across_public_operations():
     opt.apply_pauli_sum([(1.0, {0: "X", 1: "Z"})])
 
     assert all(torch.is_tensor(tensor.data) for tensor in opt.tn.tensor_map.values())
+
+
+def test_tree_canonical_check_uses_backend_scalar_reduction(monkeypatch):
+    """Canonical diagnostics must not convert device tensors with NumPy."""
+    torch = pytest.importorskip("torch")
+    import importlib
+
+    ttn_module = importlib.import_module("pepsy.optimizers.tree.ttn")
+    state = TreeTensorNetwork.from_plan(TreePlan.from_order(range(3)))
+    state.apply_to_arrays(
+        pepsy.backend_torch(device="cpu", dtype=torch.complex128)
+    )
+
+    def fail_to_numpy(_value):
+        raise AssertionError("canonical checks must stay on the live backend")
+
+    monkeypatch.setattr(ttn_module.ar, "to_numpy", fail_to_numpy)
+    assert state.is_canonical_form()
 
 
 def test_tree_warns_once_when_a_gate_does_not_match_the_state_backend():

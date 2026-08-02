@@ -46,6 +46,7 @@ import quimb.tensor as qtn
 from quimb.tensor.tensor_core import TensorNetwork
 from numbers import Integral
 
+from ...backends import to_float
 from .layout import TreePlan, _DEFAULT_TOP_ARITY
 
 __all__ = ["TreeTensorNetwork"]
@@ -1515,14 +1516,20 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 prod = qtn.tensor_contract(t, tc, output_inds=output_inds)
             d = int(prod.shape[0])
             data = prod.data
-            # Autoray's generic NumPy conversion deliberately leaves a
-            # Symmray block array intact. Its explicit dense readout is only
-            # used here for this diagnostic, never in a simulation hot path.
+            # Keep the diagnostic on the live backend. In particular,
+            # ``ar.to_numpy`` cannot move a CUDA tensor to the host, while a
+            # scalar reduction can be transferred safely and cheaply.
             if hasattr(data, "to_dense"):
                 data = data.to_dense()
-            else:
-                data = ar.to_numpy(data)
-            if not np.allclose(data, np.eye(d), atol=tol):
+            identity = ar.do("eye", d, like=data)
+            close = ar.do(
+                "allclose",
+                data,
+                identity,
+                atol=float(tol),
+                rtol=1.0e-5,
+            )
+            if not bool(to_float(close, real=True)):
                 return False
         return True
 
