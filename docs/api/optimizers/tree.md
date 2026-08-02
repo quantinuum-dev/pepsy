@@ -139,6 +139,30 @@ fermionic centre uses a one-tensor `TensorNetwork.H` contraction (which applies
 the required outer-leg phase flips), while an unknown centre falls back to an
 exact complete doubled-network contraction.
 
+### Native fermionic QR stability
+
+Native Symmray tree routes use Pepsy's internal
+`TreeTensorNetwork._native_qr_split` policy for every lossless QR gauge move,
+including two-qubit path threading, edge canonicalization, lossless path
+splits, and sub-MPO message routing. The corresponding network-level subtree
+canonicalization uses the same policy through `_native_qr_options()`.
+
+For native block-sparse tensors, the policy passes `stabilized=False` to
+Quimb's QR split. Symmray's stabilized QR phase-normalizes each diagonal of
+`R`; symmetry can make a diagonal an exact structural zero, so the phase
+`0 / |0|` can produce a NaN in `complex64`. Plain QR avoids that undefined
+phase while preserving the exact factorization (`Q @ R`) and the tensor's
+`left_inds` isometry metadata. This is a gauge choice, not a truncation or a
+change to the represented state, and native `complex64` trees therefore do not
+need to be promoted to `complex128` as a workaround for this issue.
+
+The safeguard is tensor-aware: dense TTNs retain Quimb's ordinary stabilized
+QR convention. It is internal to the tree implementation, so callers do not
+need to pass a QR flag. Native truncating compression continues to use the
+graded block SVD and the configured `chi`, `cutoff`, and `cutoff_mode`. This
+policy is specific to `TreeTensorNetwork` / `TreeOptimizer`; the separate MPS
+optimizer implementation is unchanged.
+
 ## Range / subtree canonicalisation
 
 The single orthogonality centre generalises to a connected **canonical region**

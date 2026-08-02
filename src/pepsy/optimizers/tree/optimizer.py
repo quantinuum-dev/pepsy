@@ -404,6 +404,10 @@ class TreeOptimizer:
         Maximum Steiner-subtree size allowed for multi-qubit application and
         preflight.  The default limits the number of recursive local messages;
         pass ``None`` to disable it.
+    profile : bool
+        Whether to collect opt-in kernel timing records in
+        :meth:`profile_report`. Profiling is disabled by default and adds no
+        synchronization or timing calls to the normal replay path.
     tn : TreeTensorNetwork or product MatrixProductState, optional
         Initial coefficient state. A tree state is copied and canonicalised if
         needed. Its plan must match ``tree``/``layout`` when it is entangled;
@@ -467,7 +471,7 @@ class TreeOptimizer:
                  max_intermediate_bond=None,
                  max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
                  max_subtree_nodes=_DEFAULT_MAX_SUBTREE_NODES,
-                 record_history=True):
+                 record_history=True, profile=False):
         # Preserve one-shot streams for both queue normalization and automatic
         # layout discovery.  Materializing only inside
         # ``_normalize_gate_queue`` would leave the finder with an exhausted
@@ -667,6 +671,8 @@ class TreeOptimizer:
             max_subtree_nodes, "max_subtree_nodes"
         )
         self.record_history = bool(record_history)
+        self.profile = bool(profile)
+        self.profile_events = []
         self.measurements = []
         self.truncation_history = []
         self.update_history = []
@@ -733,6 +739,7 @@ class TreeOptimizer:
             self.center = self.plan.root
         else:
             self._install_tn(tn)
+        self._attach_profile_sink()
         self._thread_ind = None
         self.backend_info()
 
@@ -1275,6 +1282,10 @@ class TreeOptimizer:
         ):
             self.tn.canonize_around_node_(self.plan.root)
 
+    def _attach_profile_sink(self):
+        """Attach the optimizer's optional timing sink to the live TTN."""
+        self.tn._profile_sink = self.profile_events if self.profile else None
+
     def set_tn(self, tn):
         """Replace the live tree state with a canonical independent copy."""
         if not isinstance(tn, TreeTensorNetwork):
@@ -1287,6 +1298,7 @@ class TreeOptimizer:
         self.normalizations.clear()
         self.projection_diagnostics.clear()
         self._truncation_log_survival = 0.0
+        self._attach_profile_sink()
         return self
 
     def set_p(self, tn):
@@ -2133,7 +2145,14 @@ class TreeOptimizer:
         active = self._active_update
         if active is None:
             return
+        elapsed = time.perf_counter() - active["started_at"]
         if not self.record_history:
+            if self.profile:
+                self.profile_events.append({
+                    "kind": "update",
+                    "support": active["support"],
+                    "seconds": elapsed,
+                })
             self._active_update = None
             return
         start = active["edge_start"]
@@ -2193,9 +2212,7 @@ class TreeOptimizer:
             "update": len(self.update_history),
             "kind": active["kind"],
             "support": active["support"],
-            "elapsed_seconds": float(
-                time.perf_counter() - active["started_at"]
-            ),
+            "elapsed_seconds": float(elapsed),
             "edge_event_indices": list(range(start, len(self.truncation_history))),
             "edge_count": len(edge_events),
             "truncated_edges": sum(event["truncated"] for event in edge_events),
@@ -2205,6 +2222,12 @@ class TreeOptimizer:
             "max_edge_discarded_weight": max_edge_loss,
             "max_edge_discarded_fraction": max_edge_fraction,
         })
+        if self.profile:
+            self.profile_events.append({
+                "kind": "update",
+                "support": active["support"],
+                "seconds": elapsed,
+            })
         if tracked:
             local_infidelity = float(relative_loss)
             self.infidelities.append(float(cumulative_loss))
@@ -3112,18 +3135,12 @@ class TreeOptimizer:
             for index in tu.inds
             if index not in left_inds
         ]
-        keep, carry = tu.split(
+        keep, carry = self.tn._native_qr_split(
+            tu,
             left_inds=left_inds,
             right_inds=right_inds,
-            method="qr",
             absorb="right",
             cutoff=0.0,
-            # Threaded native blocks can be rank deficient by symmetry. The
-            # stabilized Symmray QR normalizes every R diagonal entry to a
-            # phase, so a structural zero becomes 0 / |0| -> NaN in
-            # complex64. Plain QR is still lossless here and leaves those
-            # zero sectors finite.
-            stabilized=False,
             get="tensors",
         )
         merged_v = qtn.tensor_contract(carry, tv)
@@ -3321,14 +3338,11 @@ class TreeOptimizer:
             if self.track_truncation and not lossless else None
         )
         if lossless:
-            left, right = tensor.split(
+            left, right = self.tn._native_qr_split(
+                tensor,
                 left_inds=left_inds,
-                method="qr",
                 cutoff=0.0,
                 absorb="right",
-                # Native Symmray QR must not phase-normalize structural-zero
-                # diagonal entries; retain Quimb's dense default otherwise.
-                stabilized=not self.tn.fermionic,
                 get="tensors",
                 bond_ind=bond_ind,
             )
@@ -3367,6 +3381,7 @@ class TreeOptimizer:
         self, u, v, *, max_bond=None, cutoff=None, reduced=True,
     ):
         """Compress one live tree edge and record its truncation diagnostics."""
+        profile_started = time.perf_counter() if self.profile else None
         max_bond = (
             self.chi if max_bond is None else self._normalize_max_bond(max_bond)
         )
@@ -3388,6 +3403,14 @@ class TreeOptimizer:
                 after_bond=int(self.tn.ind_size(bond_after)),
                 bond_ind=bond_after, max_bond=max_bond, cutoff=cutoff,
             )
+            if profile_started is not None:
+                self.profile_events.append({
+                    "kind": "edge_canonize",
+                    "edge": (u, v),
+                    "before_bond": before_bond,
+                    "after_bond": int(self.tn.ind_size(bond_after)),
+                    "seconds": time.perf_counter() - profile_started,
+                })
             return
         full_spectrum = None
         if self.track_truncation:
@@ -3415,17 +3438,26 @@ class TreeOptimizer:
             after_bond=after_bond, bond_ind=bond_after,
             full_spectrum=full_spectrum, max_bond=max_bond, cutoff=cutoff,
         )
+        if profile_started is not None:
+            self.profile_events.append({
+                "kind": "edge_compress",
+                "edge": (u, v),
+                "before_bond": before_bond,
+                "after_bond": after_bond,
+                "reduced": reduced,
+                "native": bool(self.tn.fermionic),
+                "seconds": time.perf_counter() - profile_started,
+            })
 
     def _metadata_aware_reduction(self, u, v):
         """Choose one-sided compression when ``v`` is proven isometric.
 
         Every caller compresses ``u -> v`` with ``absorb="right"``. If the
         live ``left_inds`` on ``v`` prove that it is already isometric toward
-        ``u``, Quimb can SVD only ``u`` and reuse ``v`` directly. Native
-        graded metadata is accepted only after the TreeTensorNetwork charge
-        alignment guard; missing or malformed metadata falls back to the
-        usual two-sided reduction. The native compression kernel still uses
-        its explicit graded SVD regardless of this advisory ``reduced`` flag.
+        ``u``, the compression kernel can SVD only ``u`` and reuse ``v``
+        directly. Native graded metadata is accepted only after the
+        TreeTensorNetwork charge alignment guard; missing or malformed
+        metadata falls back to the usual two-sided reduced compression.
         """
         if self.tn.can_skip_canonize(u, v, absorb="left"):
             return "left"
@@ -3505,16 +3537,12 @@ class TreeOptimizer:
         descend(hub, None)
         self.center = hub
 
-    @staticmethod
-    def _qr_route_message(tensor, left_inds, *, bond_ind):
+    def _qr_route_message(self, tensor, left_inds, *, bond_ind):
         """Split one subtree message losslessly while carrying operator legs."""
-        return tensor.split(
+        return self.tn._native_qr_split(
+            tensor,
             left_inds=left_inds,
-            method="qr",
             absorb="right",
-            # Keep the dense Quimb phase convention, but avoid 0 / |0| in
-            # native Symmray structural-zero sectors.
-            stabilized=not _is_symmray_array(tensor.data),
             get="tensors",
             bond_ind=bond_ind,
         )
@@ -3663,6 +3691,56 @@ class TreeOptimizer:
             submpo, where, logical_where=logical_where,
             max_bond=max_bond, cutoff=cutoff,
         )
+
+    def expectation_mpo(
+        self, submpo, where, *, max_bond=None, cutoff=0.0,
+        normalized=True, optimize="auto",
+    ):
+        """Evaluate ``<psi|MPO|psi>`` through one structured tree-MPO pass.
+
+        The live state is not modified.  A private branch routes the MPO with
+        :meth:`apply_submpo`, so MPO site tensors remain blockwise native on a
+        Symmray tree and no ``to_dense`` conversion is needed.  ``max_bond``
+        defaults to this optimizer's ``chi``; pass a larger cap when the
+        operator application must retain more of the exact MPO-transformed
+        state.  ``cutoff=0.0`` is the default because this is a measurement,
+        not a variational update.
+        """
+        event_start = len(self.profile_events)
+        work = self.copy()
+        work.apply_submpo(
+            submpo,
+            where,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+
+        # The bra and ket are separate TTNs. Keep their physical indices shared
+        # for the inner product, but rename the ket's virtual bonds so each
+        # layer remains an ordinary tree and no bond is accidentally merged
+        # across the bra/ket boundary.
+        ket = work.tn.copy()
+        outer = set(ket.outer_inds())
+        virtual = {
+            index
+            for tensor in ket.tensors
+            for index in tensor.inds
+            if index not in outer
+        }
+        ket.reindex_({index: qtn.rand_uuid() for index in virtual})
+        numerator = (self.tn.H | ket).contract(all, optimize=optimize)
+        if not normalized:
+            result = numerator
+        elif self.tn.fermionic:
+            result = numerator / self.tn._fermionic_norm_squared()
+        else:
+            result = numerator / (self.tn.norm() ** 2)
+
+        if self.profile and len(work.profile_events) > event_start:
+            self.profile_events.extend(
+                deepcopy(work.profile_events[event_start:])
+            )
+        return result
 
     def _apply_submpo_resolved(self, submpo, where, *, max_bond=None,
                                cutoff=None, logical_where=None):
@@ -5160,6 +5238,7 @@ class TreeOptimizer:
             max_operator_qubits=self.max_operator_qubits,
             max_subtree_nodes=self.max_subtree_nodes,
             record_history=self.record_history,
+            profile=self.profile,
             seed=child_seed,
             run=False,
             tn=self.tn,
@@ -5182,6 +5261,8 @@ class TreeOptimizer:
         other._logical_qubits = list(self._logical_qubits)
         other._logical_positions = dict(self._logical_positions)
         other._truncation_log_survival = self._truncation_log_survival
+        other.profile_events = deepcopy(self.profile_events)
+        other._attach_profile_sink()
         return other
 
     def get_infidelities(self):
@@ -5197,6 +5278,33 @@ class TreeOptimizer:
     def get_infidelity_samples(self):
         """Return detailed cumulative tree-truncation sample records."""
         return self.infidelity_samples
+
+    def profile_report(self):
+        """Return opt-in tree kernel timings grouped by operation kind.
+
+        Construct the optimizer with ``profile=True`` to collect records.
+        Timing is deliberately kept separate from truncation history so the
+        normal replay and diagnostic APIs remain unchanged. The returned
+        ``events`` list is a deep copy and can safely be serialized alongside
+        a benchmark result.
+        """
+        events = deepcopy(self.profile_events)
+        grouped = {}
+        for event in events:
+            kind = str(event.get("kind", "unknown"))
+            summary = grouped.setdefault(
+                kind, {"count": 0, "seconds": 0.0}
+            )
+            summary["count"] += 1
+            summary["seconds"] += float(event.get("seconds", 0.0))
+        return {
+            "enabled": self.profile,
+            "events": events,
+            "by_kind": grouped,
+            "total_seconds": float(
+                sum(float(event.get("seconds", 0.0)) for event in events)
+            ),
+        }
 
     def get_normalizations(self):
         """Return automatic normalization records.
