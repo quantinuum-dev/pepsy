@@ -1113,6 +1113,26 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 best = p
         return best[1]
 
+    def _native_qr_options(self, tensor=None):
+        """Return the QR options needed by native graded tree tensors.
+
+        Symmray's stabilized QR phase-normalizes every diagonal of ``R``.
+        A structural-zero diagonal therefore creates ``0 / |0|`` and can
+        produce a NaN in complex64.  Dense tensors retain Quimb's default
+        phase convention; network-level canonicalisation uses ``fermionic``
+        because it does not expose the individual tensors here.
+        """
+        native = self.fermionic if tensor is None else _is_symmray_array(
+            tensor.data
+        )
+        return {"stabilized": False} if native else {}
+
+    def _native_qr_split(self, tensor, **kwargs):
+        """Perform a QR split with the native graded zero-sector safeguard."""
+        kwargs.update(self._native_qr_options(tensor))
+        kwargs.setdefault("method", "qr")
+        return tensor.split(**kwargs)
+
     # -- edge-level canonical / compression helpers ---------------------------
 
     def _fermionic_canonize_edge_(self, a, b, absorb):
@@ -1128,15 +1148,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         reduced = self.node_tensor(reduced_node)
         bond = self.bond(isometric_node, reduced_node)
         left_inds = [index for index in isometric.inds if index != bond]
-        kept, carry = isometric.split(
+        kept, carry = self._native_qr_split(
+            isometric,
             left_inds=left_inds,
             right_inds=(bond,),
-            method="qr",
             absorb="right",
             cutoff=0.0,
-            # Native graded blocks can have exact structural-zero R diagonals;
-            # skip Quimb's phase normalization so those sectors stay finite.
-            stabilized=False,
             get="tensors",
         )
         merged = qtn.tensor_contract(carry, reduced)
@@ -1339,10 +1356,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             "method": "qr",
             "cutoff": 0.0,
         }
-        if self.fermionic:
-            # The Symmray QR backend can encounter exact structural-zero
-            # diagonals while gauging a native fermionic region.
-            canonize_opts["stabilized"] = False
+        canonize_opts.update(self._native_qr_options())
         self.canonize_around_(
             tags,
             which="any",

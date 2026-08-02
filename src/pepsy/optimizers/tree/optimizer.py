@@ -3112,18 +3112,12 @@ class TreeOptimizer:
             for index in tu.inds
             if index not in left_inds
         ]
-        keep, carry = tu.split(
+        keep, carry = self.tn._native_qr_split(
+            tu,
             left_inds=left_inds,
             right_inds=right_inds,
-            method="qr",
             absorb="right",
             cutoff=0.0,
-            # Threaded native blocks can be rank deficient by symmetry. The
-            # stabilized Symmray QR normalizes every R diagonal entry to a
-            # phase, so a structural zero becomes 0 / |0| -> NaN in
-            # complex64. Plain QR is still lossless here and leaves those
-            # zero sectors finite.
-            stabilized=False,
             get="tensors",
         )
         merged_v = qtn.tensor_contract(carry, tv)
@@ -3321,14 +3315,11 @@ class TreeOptimizer:
             if self.track_truncation and not lossless else None
         )
         if lossless:
-            left, right = tensor.split(
+            left, right = self.tn._native_qr_split(
+                tensor,
                 left_inds=left_inds,
-                method="qr",
                 cutoff=0.0,
                 absorb="right",
-                # Native Symmray QR must not phase-normalize structural-zero
-                # diagonal entries; retain Quimb's dense default otherwise.
-                stabilized=not self.tn.fermionic,
                 get="tensors",
                 bond_ind=bond_ind,
             )
@@ -3505,16 +3496,12 @@ class TreeOptimizer:
         descend(hub, None)
         self.center = hub
 
-    @staticmethod
-    def _qr_route_message(tensor, left_inds, *, bond_ind):
+    def _qr_route_message(self, tensor, left_inds, *, bond_ind):
         """Split one subtree message losslessly while carrying operator legs."""
-        return tensor.split(
+        return self.tn._native_qr_split(
+            tensor,
             left_inds=left_inds,
-            method="qr",
             absorb="right",
-            # Keep the dense Quimb phase convention, but avoid 0 / |0| in
-            # native Symmray structural-zero sectors.
-            stabilized=not _is_symmray_array(tensor.data),
             get="tensors",
             bond_ind=bond_ind,
         )
