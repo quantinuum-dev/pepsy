@@ -131,8 +131,12 @@ operations that prove canonicality is preserved.
 
 Native fermionic trees use a separate graded edge path. Centre moves explicitly
 QR-split the Symmray tensor and absorb the native carry into the next node;
-edge compression explicitly forms the two-node tensor and performs its native
-block SVD. Dense and nonfermionic trees continue to use Quimb's generic
+edge compression uses a reduced graded core whenever the destination endpoint
+is already proven isometric: the active endpoint is QR-split first, and only
+its `R` factor is sent to the truncating native block SVD. If that proof is
+absent, both endpoints are QR-reduced and their contracted core is SVD'd;
+only an unrecognised reduction hint forms the complete two-node tensor.
+Dense and nonfermionic trees continue to use Quimb's generic
 `canonize_between` / `compress_between` wrappers. A graded exterior is not
 assumed to be an ordinary Frobenius identity for readout: a known native
 fermionic centre uses a one-tensor `TensorNetwork.H` contraction (which applies
@@ -162,6 +166,36 @@ need to pass a QR flag. Native truncating compression continues to use the
 graded block SVD and the configured `chi`, `cutoff`, and `cutoff_mode`. This
 policy is specific to `TreeTensorNetwork` / `TreeOptimizer`; the separate MPS
 optimizer implementation is unchanged.
+
+### Native central-edge compression and profiling
+
+For a compression from active endpoint `A` to destination endpoint `B`, the
+one-sided native path is valid only when `B` is structurally proven isometric
+toward `A` (`can_skip_canonize(A, B, absorb="left")`). It uses
+
+```text
+A = Q_A R_A
+R_A = U S V†
+new_A = Q_A U
+new_B = (S V†) B
+```
+
+The first QR is lossless and uses `_native_qr_split`; the second factorization
+is the only truncating SVD. This avoids SVD'ing the fully fused `A B` tensor,
+which can be thousands by thousands at moderate `chi` even when the live
+edge is small. The implementation keeps the reduction hint separate from the
+destination tensor, uses fresh intermediate bond labels while the old edge is
+still present in `R_A`, and restores the original live edge label after the
+factors are contracted. `reduced=True` uses the analogous two-sided QR/core
+reduction. A positive cutoff never turns this into metadata-only compression.
+
+On the calibrated 6x6 χ=64 complex64 Torch-CPU run (12 threads, 48 gates),
+Tree evolution improved from 127.77 s to 6.21 s; MPS took 2.85 s in the same
+post-fix run. Thus this fix removes the pathological Tree kernel, but Tree is
+still about 2.18x slower for this prefix. The saved profile showed 276 edge
+compression events totaling 2.40 s inside 48 update envelopes totaling 6.18 s;
+the next optimization target is the gate update/threading/contraction path,
+especially the central edges, rather than further route-length tuning.
 
 ## Range / subtree canonicalisation
 

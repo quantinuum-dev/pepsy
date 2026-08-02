@@ -13,6 +13,38 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   `threadpoolctl` when available. Only raise `threads` in a large-`chi` regime.
 - The self-healing tid cache (`_nid_to_tid`, `_tid`) validates cached tensor
   ids against `self.tn.tensor_map`; a stale entry is recomputed safely.
+- **Native central-edge compression.** A native compression call receives a
+  reduction hint separately from its destination tensor. For a proven
+  one-sided reduction (`reduced="left"`), let `A` be the active endpoint and
+  `B` the destination endpoint, with `B†B = I` on the non-shared legs. The
+  implementation computes the lossless graded factorization
+  `A = Q_A R_A`, then SVDs only `R_A = U S V†`. It installs
+  `Q_A U` on `A` and absorbs `S V†` into `B`. Thus the expensive SVD scales
+  with the active endpoint's QR carry and the live bond, rather than the
+  full fused two-node tensor. The proof is structural:
+  `can_skip_canonize(A, B, absorb="left")` must accept the destination's
+  `left_inds` and aligned Symmray charge maps.
+- If that one-sided proof is absent but `reduced=True`, both endpoints are
+  QR-reduced and only the contracted `R_A L_B` core is SVD'd. Unknown hints
+  retain the complete two-node graded SVD as a compatibility fallback. The
+  truncating step always remains the explicit native block SVD with the
+  configured `max_bond`, `cutoff`, and `cutoff_mode`; the native
+  `stabilized=False` policy applies only to lossless QR.
+- The one-sided path uses fresh intermediate QR/SVD bond names because the
+  original live edge label is still present in `R_A` while that factor is
+  decomposed. After both contractions, the new compressed bond is reindexed
+  to the original live edge. Reusing the old label during the SVD creates a
+  repeated index and can route the contraction into an unsupported Symmray
+  hyperedge.
+- A 6x6, 48-gate, chi=64, complex64 Torch-CPU calibration with 12 Torch/tree
+  threads reduced Tree evolution from 127.77 s to 6.21 s. The same run's MPS
+  evolution was 2.85 s, so the remaining Tree/MPS ratio was 2.18x. The
+  pre-fix central SVDs were 4096x4096; after the QR reduction they were
+  384x384. Layout planning (~26.6 s in that run) is setup cost and is not
+  included in the evolution comparison. The remaining replay gap is mainly
+  gate-update/threading/contraction work; use `profile=True` to inspect
+  `update` envelopes and nested `edge_compress` events before changing path
+  geometry or observable contractions.
 - Dense path and subtree routing preserve each QR-produced Q tensor's
   `left_inds`. Canonical recovery therefore recognizes an already-isometric
   routed branch without repeating its decomposition or entering Quimb's dense

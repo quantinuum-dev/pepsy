@@ -243,9 +243,15 @@ forwarded to the SVD and raises `TypeError`). Unique `rand_uuid()` bonds avoid
 
 Native fermionic trees take an isolated version of this kernel:
 `_fermionic_thread_hop` explicitly calls the native Symmray QR and carries its
-graded factor, while `TreeTensorNetwork._fermionic_compress_edge_` forms the
-two-node tensor and performs the native block SVD. Dense/nonfermionic trees
-retain the generic Quimb edge wrappers.
+graded factor. `TreeTensorNetwork._fermionic_compress_edge_` uses a reduced
+graded core: when the destination endpoint is proven isometric, it QR-splits
+the active endpoint and SVDs only its `R` factor; otherwise it QR-reduces both
+endpoints and SVDs their contracted core. Only an unrecognised reduction hint
+falls back to the complete two-node SVD. The reduction hint must remain
+separate from the destination tensor object, and the one-sided split must use
+fresh intermediate bond names before restoring the live edge label. See the
+performance reference for the algebra and profiling evidence. Dense/nonfermionic
+trees retain the generic Quimb edge wrappers.
 
 ### Sibling-leaf fast path (`_apply_2q_sibling_factors`)
 
