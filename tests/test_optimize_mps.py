@@ -692,6 +692,17 @@ def test_mps_optimizer_gate_stream_layout_remaps_long_range_path():
     )
 
 
+def test_mps_layout_accepts_explicit_fixed_site_order():
+    """An explicit site permutation bypasses search and is preserved."""
+    gates = [(qu.CNOT(), (0, 3)), (qu.CNOT(), (1, 2))]
+    order = (2, 0, 3, 1)
+    plan = py.MpsOptimizer.LayoutFinder(gates, L=4).run(order=order)
+
+    assert plan["selected_order"] == "fixed"
+    assert plan["site_order"] == order
+    assert plan["mapped_where"] == ((1, 2), (3, 0))
+
+
 def test_mps_compression_layout_reports_operator_cut_load():
     """Compression objective exposes cut-load diagnostics and rank bounds."""
     gate = np.eye(8, dtype=complex)

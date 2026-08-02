@@ -155,6 +155,7 @@ _SYMBOL_MODULES = {
     "TreeLayoutFinder": ".optimizers",
     "TreeOptimizer": ".optimizers",
     "TreePlan": ".optimizers",
+    "square_lattice_zigzag": ".optimizers",
     "TreeStabOptimizer": ".optimizers",
     "TreeTensorNetwork": ".optimizers",
     "compile_stim_circuit": ".optimizers",
