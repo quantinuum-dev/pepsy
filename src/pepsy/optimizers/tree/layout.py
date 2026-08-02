@@ -41,6 +41,7 @@ from ..mps.layout import (
     _operator_schmidt_rank_info as _mps_operator_schmidt_rank_info,
     _normalize_weight_mode,
 )
+from .._layout_orders import normalize_fixed_order
 from ..mps.optimizer import _control_event_parts as _mps_control_event_parts
 from .._layout_visualization import (
     add_order_colorbar,
@@ -181,9 +182,11 @@ def _normalize_layout_search(search):
 
 
 def _normalize_layout_order(order):
-    """Normalize the optional high-quality layout mode."""
+    """Normalize the high-quality mode or preserve an explicit site order."""
     if order is None:
         return None
+    if not isinstance(order, (str, bytes)):
+        return tuple(order)
     name = str(order).replace("-", "_").strip().lower()
     aliases = {
         "auto": "quality",
@@ -1337,12 +1340,13 @@ class TreeLayoutFinder:
         across every tree scale. It is
         the high-quality, Cotengra-inspired mode; ``order="quality"`` selects
         it automatically and enables its bounded search stages.
-    order : {None, "quality"}, optional
+    order : {None, "quality"} or sequence, optional
         Optional high-quality offline mode. `"quality"` means
         `objective="full_tree"` and enables bounded greedy leaf refinement,
         all-scale subtree topology refinement, and hybrid
         Nevergrad/annealing search. Omitted keeps the fast deterministic
-        objective selected by `objective`.
+        objective selected by `objective`. An explicit site permutation builds
+        a fixed tree without refinement.
     hybrid_weights : mapping or sequence of three floats, optional
         Weights for the hybrid path, maximum edge load, and total edge load.
         The default is ``(1.0, 1.0, 0.25)``.
@@ -3082,11 +3086,29 @@ class TreeLayoutFinder:
         hybrid topology annealing plus Nevergrad leaf search. When Nevergrad
         is unavailable, it selects dependency-free simulated annealing. Pass
         ``search=None`` or ``refine=None`` explicitly to disable either stage.
+
+        An explicit site permutation can also be passed as ``order``. This
+        returns the corresponding fixed tree immediately, without layout
+        refinement or offline search.
         """
         if order is _DEFAULT_ORDER:
             order = self.order
         else:
             order = _normalize_layout_order(order)
+        if not isinstance(order, str) and order is not None:
+            if self.arity_candidates is not None:
+                raise ValueError(
+                    "an explicit site order requires scalar max_arity; "
+                    "pass one fixed arity instead of arity candidates."
+                )
+            fixed_order = normalize_fixed_order(order, self.leaf_qubits)
+            return TreePlan.from_order(
+                fixed_order,
+                structure=self.structure,
+                max_arity=self.max_arity,
+                root_qubit=self.root_qubit,
+                top_arity=self.top_arity,
+            )
         if order == "quality":
             if self.objective != "full_tree":
                 self.objective = "full_tree"

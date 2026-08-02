@@ -10,6 +10,7 @@ import os
 import numpy as np
 
 from ...operators.gates import _normalize_gate_entries
+from .._layout_orders import normalize_fixed_order
 from .._layout_visualization import (
     coordinate_lattice_edge_keys,
     coordinate_lattice_edges,
@@ -1580,8 +1581,18 @@ class MpsGateStreamLayoutFinder:
         schmidt_max_dim=4,
         max_operator_qubits=8,
     ):
-        """Return a layout plan for the stored gate stream."""
-        order_name = _normalize_gate_stream_layout_order(order)
+        """Return a layout plan for the stored gate stream.
+
+        ``order`` can also be an explicit permutation of the layout sites.
+        In that case the permutation is returned as a fixed comparison plan
+        and no layout search or refinement is performed.
+        """
+        fixed_order = None
+        if isinstance(order, (str, type(None))):
+            order_name = _normalize_gate_stream_layout_order(order)
+        else:
+            fixed_order = normalize_fixed_order(order, self.sites)
+            order_name = "fixed"
         objective = _gate_stream_layout_objective(objective)
         if max_operator_qubits is not None:
             try:
@@ -1622,27 +1633,35 @@ class MpsGateStreamLayoutFinder:
                 event_weights,
             )
             score_event_weights = event_weights
-        include_nevergrad = (
-            order_name == "auto" or order_name.startswith("nevergrad")
-        )
-        include_kahypar = (
-            order_name == "auto" or order_name.startswith("kahypar")
-        )
-        candidates = _gate_stream_layout_candidates(
-            self.sites,
-            pair_weights,
-            refine_passes=refine_passes,
-            refine_numba=refine_numba,
-            spectral_dense_max=spectral_dense_max,
-            recursive_dense_max=recursive_dense_max,
-            include_nevergrad=include_nevergrad,
-            nevergrad_budget=nevergrad_budget,
-            nevergrad_seed=nevergrad_seed,
-            nevergrad_optimizer=nevergrad_optimizer,
-            include_kahypar=include_kahypar,
-            kahypar_config_path=kahypar_config_path,
-            kahypar_seed=kahypar_seed,
-        )
+        if fixed_order is None:
+            include_nevergrad = (
+                order_name == "auto" or order_name.startswith("nevergrad")
+            )
+            include_kahypar = (
+                order_name == "auto" or order_name.startswith("kahypar")
+            )
+            candidates = _gate_stream_layout_candidates(
+                self.sites,
+                pair_weights,
+                refine_passes=refine_passes,
+                refine_numba=refine_numba,
+                spectral_dense_max=spectral_dense_max,
+                recursive_dense_max=recursive_dense_max,
+                include_nevergrad=include_nevergrad,
+                nevergrad_budget=nevergrad_budget,
+                nevergrad_seed=nevergrad_seed,
+                nevergrad_optimizer=nevergrad_optimizer,
+                include_kahypar=include_kahypar,
+                kahypar_config_path=kahypar_config_path,
+                kahypar_seed=kahypar_seed,
+            )
+        else:
+            # Keep the input baseline in diagnostics so a fixed order can be
+            # compared directly with the original logical site order.
+            candidates = {
+                "input": list(self.sites),
+                "fixed": list(fixed_order),
+            }
 
         candidate_stats = {}
         for name, candidate in candidates.items():

@@ -955,6 +955,22 @@ def test_layout_finder_builds_strict_binary_tree_when_requested():
             assert plan.tree_distance(a, b) >= 1
 
 
+def test_tree_layout_accepts_explicit_fixed_site_order():
+    """An explicit order builds the requested binary/ternary-root tree."""
+    order = pepsy.square_lattice_zigzag(2, 2)
+    finder = TreeLayoutFinder(
+        [(pepsy.cnot(), (0, 1)), (pepsy.cnot(), (2, 3))],
+        n=4,
+        max_arity=2,
+        top_arity=3,
+    )
+    plan = finder.run(order=order)
+
+    assert tuple(plan.qubit_of_leaf.values()) == order
+    assert plan.top_arity == 3
+    assert plan.is_binary()
+
+
 def test_quality_layout_not_worse_than_balanced():
     """Entanglement-adapted structure scores no worse than balanced order."""
     rng = np.random.default_rng(9)

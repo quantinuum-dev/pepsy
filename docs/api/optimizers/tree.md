@@ -584,6 +584,20 @@ three-virtual-bond root convention described above. `TreePlan.max_arity()` and
 `TreePlan.is_binary()` report the shape; `TreePlan.is_strictly_binary()` is the
 strict two-child-at-every-internal-node predicate.
 
+Both layout finders also accept an explicit site permutation as `order` for a
+fixed baseline. For example, this builds the same binary/ternary-root geometry
+using a square-lattice snake order without refinement:
+
+```python
+zigzag = py.square_lattice_zigzag(6, 6)
+tree_plan = TreeLayoutFinder(
+    gates, n=36, max_arity=2, top_arity=3,
+).run(order=zigzag)
+```
+
+The explicit order must cover every site exactly once and cannot be combined
+with iterable `max_arity` candidate search.
+
 For an automatic arity search, call `finder.recommend_arities((2, 3, 4))`
 explicitly. The default `TreeOptimizer(gate_stream, n=n, chi=chi)` uses the
 fixed binary/ternary-root geometry; it does not allocate tensors or perform

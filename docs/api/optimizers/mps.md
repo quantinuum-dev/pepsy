@@ -154,6 +154,19 @@ default to `weight_mode="auto"`: angle metadata when present, otherwise a cheap
 operator-Schmidt proxy for small dense two-site gates, falling back to count
 weights. Pass `weight_fn(payload, support, event_type)` for explicit weights.
 
+For a prescribed baseline rather than a searched order, pass an explicit site
+permutation as `order`. The returned plan is marked `selected_order="fixed"`
+and keeps the original gate stream unchanged:
+
+```python
+zigzag = py.square_lattice_zigzag(6, 6)
+fixed_plan = finder.run(order=zigzag)
+```
+
+`square_lattice_zigzag` scans x across each row and reverses direction on
+successive rows. It is a deterministic comparison layout; it performs no
+refinement or tensor work.
+
 For compression-oriented selection, pass `objective="compression"`. This
 uses operator-Schmidt load over every MPS cut crossed by each support, with
 support span retained as a replay-cost tie-breaker. Exact small dense ranks

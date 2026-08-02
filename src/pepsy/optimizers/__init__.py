@@ -41,6 +41,7 @@ _SYMBOL_MODULES = {
     "TreeLayoutFinder": ".tree",
     "TreeOptimizer": ".tree",
     "TreePlan": ".tree",
+    "square_lattice_zigzag": "._layout_orders",
     "TreeStabOptimizer": ".tree_stabilizer",
     "TreeTensorNetwork": ".tree",
     "CoalescedMeasurementRecord": ".noise",
