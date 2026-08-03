@@ -410,7 +410,18 @@ for trajectory simulation without forming a density matrix:
 
 ## Performance and layout
 
-Keep the thread cap, self-healing tensor-id cache, copy semantics, and
+The public performance defaults are ``mode="auto"`` (direct two-site
+threading), ``threads=1`` and ``subtree_workers=1`` (small-TTN operations avoid
+oversubscription), ``profile=False``, and ``track_truncation=False`` (no
+diagnostic spectrum SVDs). The low-level
+``TreeTensorNetwork.compress_edge_`` default is the same ``cutoff_mode="rsum2"``
+used by ``TreeOptimizer``. A ``track_truncation=True`` warning is intentional:
+it identifies the extra diagnostic work; backend conversion warnings and
+legacy-mode deprecations are the other actionable warning classes.
+
+Dense and native trees share the direct one-edge contraction, immutable path
+cache, routed-isometry reuse, and proof-forwarding optimizations. Keep the
+thread cap, self-healing tensor-id cache, copy semantics, and
 TreeLayoutFinder objective plumbing intact. The detailed performance and
 non-binary layout contract is in
 [`references/performance-layout.md`](references/performance-layout.md); read

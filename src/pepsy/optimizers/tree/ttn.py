@@ -44,6 +44,7 @@ import time
 import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
+from quimb.tensor.decomp import qr_stabilized as _quimb_qr_stabilized
 from quimb.tensor.tensor_core import TensorNetwork
 from numbers import Integral
 
@@ -51,6 +52,50 @@ from ...backends import to_float
 from .layout import TreePlan, _DEFAULT_TOP_ARITY
 
 __all__ = ["TreeTensorNetwork"]
+
+
+def _native_qr_block_scaled(array, **kwargs):
+    """QR one native charge block after a reversible power-of-two scaling.
+
+    Torch's complex64 QR can return NaNs for a rank-deficient block whose
+    entries are small (around ``1e-9``) even though the block is finite. Native
+    Symmray QR is blockwise, so scaling each block independently is exact: the
+    isometric factor is unchanged and the triangular factor is divided by the
+    same scalar afterwards. Power-of-two scaling avoids introducing an extra
+    rounding step into the block values.
+    """
+    opts = dict(kwargs)
+    opts.pop("method", None)
+    opts.pop("fn", None)
+    if ar.get_dtype_name(array) != "complex64":
+        return _quimb_qr_stabilized(array, **opts)
+
+    block_max = to_float(ar.do("max", ar.do("abs", array)))
+    if not np.isfinite(block_max) or block_max == 0.0:
+        # Preserve the original failure behaviour for non-finite input, while
+        # allowing genuinely empty structural sectors through unchanged.
+        return _quimb_qr_stabilized(array, **opts)
+
+    # Values above this scale are not affected by the low-norm complex64 QR
+    # failure and avoid an unnecessary multiply/divide pair.
+    if block_max >= 2.0**-8:
+        return _quimb_qr_stabilized(array, **opts)
+
+    _, exponent = np.frexp(block_max)
+    scale = float(np.ldexp(1.0, -int(exponent)))
+    left, singular_values, right = _quimb_qr_stabilized(
+        array * scale, **opts,
+    )
+
+    # ``absorb='left'`` is the LQ orientation: the left factor carries the
+    # scale. All other QR orientations carry it in the right factor.
+    absorb = opts.get("absorb", "right")
+    if absorb in {-1, "left", "Us,VH", "lfactor", "Us"}:
+        if left is not None:
+            left = left / scale
+    elif right is not None:
+        right = right / scale
+    return left, singular_values, right
 
 
 try:  # quimb renamed/removed this generic-vector base across releases.
@@ -115,6 +160,52 @@ def _is_symmray_array(value):
         return ar.infer_backend(value) == "symmray"
     except (AttributeError, TypeError):
         return hasattr(value, "blocks") and hasattr(value, "indices")
+
+
+def _contract_two_tensors(left, right, *, shared_ind=None):
+    """Contract two tensors along one ordinary shared index cheaply.
+
+    Tree routing and native reduced compression repeatedly contract adjacent
+    tensors along one virtual edge. Dispatching that ordinary operation
+    directly to the active backend avoids rebuilding a generic Quimb/Cotengra
+    expression while retaining Symmray's graded fermionic ``tensordot``.
+    Unusual hyperedges fall back to Quimb's general contraction path.
+    """
+    if shared_ind is None:
+        shared = tuple(qtn.bonds(left, right))
+        if len(shared) != 1:
+            return qtn.tensor_contract(left, right)
+        shared_ind = shared[0]
+    elif shared_ind not in left.inds or shared_ind not in right.inds:
+        return qtn.tensor_contract(left, right)
+
+    left_rest = tuple(ind for ind in left.inds if ind != shared_ind)
+    right_rest = tuple(ind for ind in right.inds if ind != shared_ind)
+    if set(left_rest) & set(right_rest):
+        return qtn.tensor_contract(left, right)
+
+    axes = ((left.inds.index(shared_ind),), (right.inds.index(shared_ind),))
+    try:
+        if _is_symmray_array(left.data):
+            data = ar.do(
+                "tensordot",
+                left.data,
+                right.data,
+                axes=axes,
+                preserve_array=True,
+            )
+        else:
+            data = ar.do(
+                "tensordot", left.data, right.data, axes=axes,
+            )
+    except (AttributeError, NotImplementedError, TypeError):
+        return qtn.tensor_contract(left, right)
+
+    return qtn.Tensor(
+        data=data,
+        inds=left_rest + right_rest,
+        tags=left.tags | right.tags,
+    )
 
 
 def _visible_len(s):
@@ -1185,6 +1276,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def _native_qr_split(self, tensor, **kwargs):
         """Perform a QR split with the native graded zero-sector safeguard."""
         kwargs.update(self._native_qr_options(tensor))
+        if _is_symmray_array(tensor.data):
+            kwargs.setdefault("fn", _native_qr_block_scaled)
         kwargs.setdefault("method", "qr")
         return tensor.split(**kwargs)
 
@@ -1211,7 +1304,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             cutoff=0.0,
             get="tensors",
         )
-        merged = qtn.tensor_contract(carry, reduced)
+        merged = _contract_two_tensors(carry, reduced, shared_ind=bond)
         isometric.modify(
             data=kept.data,
             inds=kept.inds,
@@ -1226,6 +1319,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
     def _fermionic_compress_edge_(
         self, a, b, *, max_bond, cutoff, cutoff_mode, absorb, reduced=True,
+        reduction_proven=False,
     ):
         """Compress one native graded tree cut with a reduced graded SVD.
 
@@ -1258,8 +1352,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         # arbitrary reduction hints.
         if (
             reduction_hint == "left"
-            and self.can_skip_canonize(
-                isometric_node, reduced_node, absorb="left"
+            and (
+                reduction_proven
+                or self.can_skip_canonize(
+                    isometric_node, reduced_node, absorb="left"
+                )
             )
         ):
             # The destination endpoint is already an isometry toward the
@@ -1289,12 +1386,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 get="tensors",
                 bond_ind=compressed_bond,
             )
-            kept = qtn.tensor_contract(
-                isometric_q, core_left,
-            )
-            merged = qtn.tensor_contract(
-                core_right, reduced_tensor,
-            )
+            kept = _contract_two_tensors(isometric_q, core_left)
+            merged = _contract_two_tensors(core_right, reduced_tensor)
             kept.reindex_({compressed_bond: bond})
             merged.reindex_({compressed_bond: bond})
             isometric.modify(
@@ -1305,6 +1398,49 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             reduced_tensor.modify(
                 data=merged.data,
                 inds=merged.inds,
+                left_inds=None,
+            )
+            return self
+
+        if (
+            reduction_hint == "right"
+            and (
+                reduction_proven
+                or self.can_skip_canonize(
+                    isometric_node, reduced_node, absorb="right"
+                )
+            )
+        ):
+            # Mirror Quimb's ``reduced="right"`` branch: the active endpoint
+            # is split directly while the already-left-isometric endpoint is
+            # reused. Native SVD handles the charge blocks independently, so
+            # no complete two-node contraction is formed.
+            right_inds = [
+                index for index in reduced_tensor.inds if index != bond
+            ]
+            compressed_bond = qtn.rand_uuid()
+            core_left, core_right = reduced_tensor.split(
+                left_inds=(bond,),
+                right_inds=right_inds,
+                method="svd",
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                get="tensors",
+                bond_ind=compressed_bond,
+            )
+            kept = _contract_two_tensors(isometric, core_left)
+            kept.reindex_({compressed_bond: bond})
+            core_right.reindex_({compressed_bond: bond})
+            isometric.modify(
+                data=kept.data,
+                inds=kept.inds,
+                left_inds=left_inds,
+            )
+            reduced_tensor.modify(
+                data=core_right.data,
+                inds=core_right.inds,
                 left_inds=None,
             )
             return self
@@ -1337,7 +1473,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 get="tensors",
                 bond_ind=right_bond,
             )
-            core = qtn.tensor_contract(isometric_r, reduced_l)
+            core = _contract_two_tensors(isometric_r, reduced_l)
             core_left, core_right = core.split(
                 left_inds=(left_bond,),
                 method="svd",
@@ -1348,10 +1484,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 get="tensors",
                 bond_ind=bond,
             )
-            isometric_compressed = qtn.tensor_contract(
+            isometric_compressed = _contract_two_tensors(
                 isometric_q, core_left,
             )
-            reduced_compressed = qtn.tensor_contract(
+            reduced_compressed = _contract_two_tensors(
                 core_right, reduced_q,
             )
             isometric.modify(
@@ -1368,7 +1504,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         # Keep the old complete graded split as a compatibility fallback for
         # direct callers that provide an unrecognised reduction hint.
-        theta = qtn.tensor_contract(isometric, reduced_tensor)
+        theta = _contract_two_tensors(isometric, reduced_tensor, shared_ind=bond)
         kept, remainder = theta.split(
             left_inds=left_inds,
             method="svd",
@@ -1408,7 +1544,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         else:
             self._canonical_region = None
 
-    def canonize_edge_(self, a, b, absorb="right"):
+    def canonize_edge_(
+        self, a, b, absorb="right", *, _isometry_proven=False,
+    ):
         """Canonicalise across the tree edge ``a -> b`` in place.
 
         Dense/nonfermionic trees delegate to Quimb's ``canonize_between``;
@@ -1418,7 +1556,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         the required isometry are metadata-only moves for both dense and
         native graded arrays.
         """
-        if self.can_skip_canonize(a, b, absorb=absorb):
+        if (
+            _isometry_proven
+            or self.can_skip_canonize(a, b, absorb=absorb)
+        ):
             # The local QR is already represented by the tensor's proven
             # ``left_inds``. Keep centre bookkeeping honest, but do not touch
             # tensor data or invalidate the norm cache.
@@ -1453,9 +1594,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         *,
         max_bond=None,
         cutoff=1e-10,
-        cutoff_mode="rel",
+        cutoff_mode="rsum2",
         absorb="right",
         reduced=True,
+        _reduction_proven=False,
     ):
         """Compress the tree edge ``a -> b`` in place.
 
@@ -1465,7 +1607,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         native QR helper. The tracked :attr:`orthogonality_center` advances as
         for :meth:`canonize_edge_`.
 
-        ``cutoff_mode`` selects Quimb's singular-value cutoff convention.
+        ``cutoff_mode`` selects Quimb's singular-value cutoff convention. The
+        default ``"rsum2"`` matches :class:`TreeOptimizer` and Quimb's
+        open-boundary MPS gate-application default; use ``"rel"`` explicitly
+        for a relative largest-singular-value threshold.
         ``reduced`` selects the dense Quimb reduction and the corresponding
         native graded reduction. Quimb's one-sided ``"left"`` mode is exact
         when node ``b`` is already isometric on its non-shared legs; native
@@ -1492,6 +1637,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 cutoff_mode=cutoff_mode,
                 absorb=absorb,
                 reduced=reduced,
+                reduction_proven=_reduction_proven,
             )
         else:
             self.compress_between(
@@ -1607,8 +1753,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 a, b = node, neighbour
             else:
                 a, b = neighbour, node
-            if not self.can_skip_canonize(a, b, absorb=absorb):
-                self.canonize_edge_(a, b, absorb=absorb)
+            proof = self.can_skip_canonize(a, b, absorb=absorb)
+            self.canonize_edge_(
+                a, b, absorb=absorb, _isometry_proven=proof,
+            )
             remaining.remove(node)
 
         self._canonical_region = frozenset({target})

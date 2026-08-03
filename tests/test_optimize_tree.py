@@ -1,5 +1,6 @@
 """Tests for the tree-tensor-network gate simulator (:class:`TreeOptimizer`)."""
 
+import inspect
 import sys
 import types
 
@@ -14,6 +15,8 @@ from pepsy.optimizers.tree import (
     TreePlan,
     TreeTensorNetwork,
 )
+from pepsy.optimizers.tree.optimizer import _contract_two_tensors
+from pepsy.optimizers.tree.ttn import _native_qr_block_scaled
 
 
 # -- exact statevector reference ----------------------------------------------
@@ -235,6 +238,7 @@ def test_two_site_modes_reuse_path_isometries_for_compression(
 
     def traced_compress_edge(
         u, v, *, max_bond=None, cutoff=None, reduced=True,
+        reduction_proven=False,
     ):
         assert opt.tn.can_skip_canonize(u, v, absorb="left")
         reductions.append(reduced)
@@ -244,6 +248,7 @@ def test_two_site_modes_reuse_path_isometries_for_compression(
             max_bond=max_bond,
             cutoff=cutoff,
             reduced=reduced,
+            reduction_proven=reduction_proven,
         )
 
     monkeypatch.setattr(
@@ -268,6 +273,24 @@ def test_two_site_modes_reuse_path_isometries_for_compression(
     assert reductions
     assert all(reduced == "left" for reduced in reductions)
     assert _fidelity(expected, opt.to_dense()) > 1 - 1e-10
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_lossless_path_skips_reduction_proof_lookup(monkeypatch):
+    """A QR-only path does not query truncating-compression metadata."""
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    opt = TreeOptimizer(
+        None, n=6, chi=64, cutoff=0.0, mode="direct", run=False,
+    )
+
+    def fail_reduction_lookup(*args, **kwargs):
+        raise AssertionError("lossless path queried truncation metadata")
+
+    monkeypatch.setattr(
+        opt, "_metadata_aware_reduction", fail_reduction_lookup,
+    )
+    opt.apply_2q(np.kron(x, x), 0, 5)
+
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
@@ -550,6 +573,7 @@ def test_dense_subtree_uses_proven_one_sided_compression(monkeypatch):
 
     def force_full_reduction(
         u, v, *, max_bond=None, cutoff=None, reduced=True,
+        reduction_proven=False,
     ):
         del reduced
         return full_compress(
@@ -558,6 +582,7 @@ def test_dense_subtree_uses_proven_one_sided_compression(monkeypatch):
             max_bond=max_bond,
             cutoff=cutoff,
             reduced=True,
+            reduction_proven=reduction_proven,
         )
 
     monkeypatch.setattr(
@@ -1465,7 +1490,22 @@ def test_optimizer_defaults_to_congestion_layout_for_replay_performance():
 
     assert opt.layout_objective == "congestion"
     assert opt.layout_finder.objective == "congestion"
+    assert opt.mode == "auto"
+    assert opt.threads == 1
+    assert opt.subtree_workers == 1
     assert opt.track_truncation is False
+    assert opt.track_infidelity is True
+    assert opt.cutoff_mode == "rsum2"
+    assert opt.profile is False
+
+
+def test_tree_state_compression_default_matches_optimizer():
+    """The low-level TTN edge API uses the same cutoff convention."""
+    parameter = inspect.signature(
+        TreeTensorNetwork.compress_edge_
+    ).parameters["cutoff_mode"]
+
+    assert parameter.default == "rsum2"
 
 
 def test_layout_recommends_arity_and_reports_tree_shape():
@@ -2521,6 +2561,58 @@ def test_repeated_direct_gate_reuses_factorization(monkeypatch):
     assert sum(key[0] == "direct" for key in opt._gate_factor_cache) == 1
 
 
+def test_repeated_two_site_support_reuses_only_immutable_path():
+    """Path caching never assumes the current centre or traversal direction."""
+    opt = TreeOptimizer(None, n=8, chi=16, cutoff=0.0, run=False)
+
+    leaf_a, leaf_b, path = opt._cached_two_site_path(0, 7)
+    reverse_a, reverse_b, reverse_path = opt._cached_two_site_path(7, 0)
+    cached_a, cached_b, cached_path = opt._cached_two_site_path(0, 7)
+
+    assert (leaf_a, leaf_b) == (cached_a, cached_b)
+    assert (reverse_a, reverse_b) == (leaf_b, leaf_a)
+    assert reverse_path == path[::-1]
+    assert cached_path is path
+
+
+def test_adjacent_two_tensor_contract_matches_quimb():
+    """The direct one-edge backend contraction preserves Quimb ordering."""
+    rng = np.random.default_rng(912)
+    left = qtn.Tensor(
+        rng.standard_normal((2, 4, 3)), inds=("a", "edge", "b"),
+    )
+    right = qtn.Tensor(
+        rng.standard_normal((4, 5, 2)), inds=("edge", "c", "d"),
+    )
+
+    fast = _contract_two_tensors(left, right, shared_ind="edge")
+    reference = qtn.tensor_contract(left, right)
+
+    assert fast.inds == reference.inds
+    assert np.allclose(fast.data, reference.data)
+
+
+def test_adjacent_dense_contract_avoids_generic_quimb_dispatch(monkeypatch):
+    """The shared dense hot path does not rebuild a generic contraction."""
+    left = qtn.Tensor(
+        np.arange(12.0).reshape(3, 4), inds=("a", "edge"),
+    )
+    right = qtn.Tensor(
+        np.arange(20.0).reshape(4, 5), inds=("edge", "b"),
+    )
+
+    def unexpected_generic_contract(*args, **kwargs):
+        raise AssertionError("dense one-edge contraction used generic Quimb")
+
+    monkeypatch.setattr(qtn, "tensor_contract", unexpected_generic_contract)
+    fast = _contract_two_tensors(left, right, shared_ind="edge")
+
+    assert fast.inds == ("a", "b")
+    np.testing.assert_allclose(
+        fast.data, np.asarray(left.data) @ np.asarray(right.data)
+    )
+
+
 def test_parallel_subtree_messages_match_serial():
     """Independent dense QR message waves preserve the serial result."""
     rng = np.random.default_rng(818)
@@ -3142,6 +3234,32 @@ def test_tree_expectation_mpo_is_batched_and_non_mutating():
     value = opt.expectation_mpo(mpo, (0, 1), max_bond=16)
 
     assert value == pytest.approx(1.0)
+    assert np.allclose(opt.to_dense(), before)
+    assert opt.tn.validate(check_canonical=True) is opt.tn
+
+
+def test_tree_subtree_route_batches_sibling_messages(monkeypatch):
+    """Independent leaf messages landing at one node use one contraction."""
+    n = 4
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    opt = TreeOptimizer(
+        None, n=n, tree=plan, chi=16, cutoff=0.0,
+        subtree_workers=2, run=False,
+    )
+    identity = np.eye(2**n, dtype=complex)
+    before = opt.to_dense().copy()
+    original_contract = qtn.tensor_contract
+    grouped_calls = []
+
+    def traced_contract(*tensors, **kwargs):
+        if len(tensors) >= 3:
+            grouped_calls.append(len(tensors))
+        return original_contract(*tensors, **kwargs)
+
+    monkeypatch.setattr(qtn, "tensor_contract", traced_contract)
+    opt.apply_subtree_operator(identity, tuple(range(n)))
+
+    assert grouped_calls
     assert np.allclose(opt.to_dense(), before)
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
@@ -4938,6 +5056,7 @@ def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
 
     def traced_compress_edge(
         u, v, *, max_bond=None, cutoff=None, reduced=True,
+        reduction_proven=False,
     ):
         compressions.append(reduced)
         return compress_edge(
@@ -4946,6 +5065,7 @@ def test_native_fermionic_submpo_keeps_graded_hub_recovery(monkeypatch):
             max_bond=max_bond,
             cutoff=cutoff,
             reduced=reduced,
+            reduction_proven=reduction_proven,
         )
 
     monkeypatch.setattr(candidate, "_install_routed_subtree", traced_install)
@@ -5117,6 +5237,86 @@ def test_native_one_sided_compression_qr_reduces_before_svd(monkeypatch):
 
     assert [method for method, _shape in split_methods] == ["qr", "svd"]
     assert ttn.validate(check_canonical=True) is ttn
+
+
+@pytest.mark.parametrize(
+    ("symmetry", "spinful", "occupations"),
+    [
+        ("U1", False, (1, 0, 1, 0)),
+        ("U1U1", True, ((1, 0), (0, 1), (1, 0), (0, 1))),
+    ],
+)
+@pytest.mark.parametrize("state_dtype", ["complex64", "complex128"])
+def test_native_one_sided_and_two_sided_compression_fidelity(
+    symmetry, spinful, occupations, state_dtype,
+):
+    """Native left/right/two-sided reductions preserve the state and gauge."""
+    pytest.importorskip("symmray")
+    fermion = pepsy.Fermion(
+        spinful=spinful,
+        symmetry=symmetry,
+        dtype=state_dtype,
+    )
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    base = pepsy.ps_to_ttn(
+        4,
+        tree=plan,
+        fermion=fermion,
+        occupations=occupations,
+        dtype=state_dtype,
+    )
+    target = plan.leaf_of_qubit[0]
+    base.shift_orthogonality_center(target)
+    source = next(
+        nid for nid, toward in base.isometry_map().items()
+        if toward == target and base.can_skip_canonize(nid, target)
+    )
+    cutoff = 1e-10 if state_dtype == "complex128" else 1e-7
+    fidelity_floor = 1 - (1e-10 if state_dtype == "complex128" else 1e-5)
+
+    for a, b, reduced in (
+        (source, target, "right"),
+        (target, source, "left"),
+        (target, source, True),
+    ):
+        candidate = base.copy()
+        candidate._fermionic_compress_edge_(
+            a,
+            b,
+            max_bond=64,
+            cutoff=cutoff,
+            cutoff_mode="rel",
+            absorb="right",
+            reduced=reduced,
+        )
+        assert float(pepsy.tn_fidelity(base, candidate)) > fidelity_floor
+        assert candidate.validate(check_canonical=True) is candidate
+
+
+def test_native_complex64_qr_scales_low_norm_rank_deficient_block():
+    """Native QR keeps tiny complex64 charge blocks finite and exact."""
+    torch = pytest.importorskip("torch")
+    block = torch.zeros((16, 18), dtype=torch.complex64)
+    generator = torch.Generator().manual_seed(17)
+    left = torch.randn((16, 12), generator=generator) * 1e-9
+    right = torch.randn((12, 18), generator=generator)
+    block = (left @ right).to(torch.complex64)
+
+    q, _, r = _native_qr_block_scaled(
+        block,
+        method="qr",
+        absorb="right",
+        stabilized=False,
+    )
+
+    assert torch.isfinite(q).all()
+    assert torch.isfinite(r).all()
+    torch.testing.assert_close(
+        q @ r,
+        block,
+        rtol=2e-4,
+        atol=1e-12,
+    )
 
 
 def test_tree_stable_labels_route_submpo_by_payload_sites(monkeypatch):

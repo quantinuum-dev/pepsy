@@ -194,8 +194,46 @@ Tree evolution improved from 127.77 s to 6.21 s; MPS took 2.85 s in the same
 post-fix run. Thus this fix removes the pathological Tree kernel, but Tree is
 still about 2.18x slower for this prefix. The saved profile showed 276 edge
 compression events totaling 2.40 s inside 48 update envelopes totaling 6.18 s;
-the next optimization target is the gate update/threading/contraction path,
-especially the central edges, rather than further route-length tuning.
+it identified the gate update/threading/contraction path, especially the
+central edges, rather than route-length tuning, as the next target.
+
+The update path now avoids repeating the same native isometry proof: each
+truncating edge validates its `left_inds`/charge-map proof once, while a
+lossless QR edge skips the reduction lookup entirely. Two-site factors use
+private stable output labels, removing per-factor UUID allocation and one
+metadata reindex. In multi-site Tree/MPO updates, independent QR messages
+landing at the same node are contracted as one batch; dense waves reuse their
+worker pool, while native fermionic routing remains serial for Symmray safety.
+These changes preserve the complete-gate-before-truncation rule and the
+configured χ/cutoff semantics. On repeated warm-cache runs of the same
+harness, Tree evolution was 4.90--5.15 s; absolute timings vary with BLAS
+thread state, so profile envelopes remain the authoritative comparison.
+
+The remaining two-site update bookkeeping is also shared across arbitrary
+gate streams: immutable qubit-support geodesics are cached and re-oriented
+against the live centre for each gate, while ordinary one-edge tensor merges
+use a direct backend ``tensordot``. Symmray dispatches through its graded
+fermionic contraction implementation; unusual hyperedges still use Quimb's
+general contraction path. This removes repeated path construction and
+contraction-expression setup without changing the routed QR/SVD sequence.
+
+Native complex64 QR also applies a reversible power-of-two scale separately
+to small Symmray charge blocks. This avoids a Torch QR failure on finite,
+rank-deficient blocks around ``1e-9`` without changing ``Q @ R`` or promoting
+the replay to complex128. Native ``reduced="right"`` now has the matching
+one-sided endpoint-SVD path; unproven ``right``, ``False``, and ``lazy`` modes
+continue to use the conservative complete SVD.
+
+The exact 6x6 ``nsteps=0`` stream (468 gates, χ=64, complex64 Torch CPU,
+12 threads, ``track_truncation=False``) subsequently completed without the
+previous gate-235 NaN. In one profiled run, MPS evolution took 20.39 s and
+Tree evolution 137.11 s; Tree layout planning was a separate 25.79 s, giving
+an evolution ratio of 6.72x. This confirms stability, not parity: the remaining
+Tree cost is concentrated in the per-gate update envelopes and needs further
+backend/profile-guided reduction. The same run's normalized Tree/MPS state
+fidelity was 0.590; at χ=64 this measures different truncation histories on
+the two geometries, not a QR gauge error. Compare observables or increase χ
+when using this number as an accuracy diagnostic.
 
 ## Range / subtree canonicalisation
 
@@ -294,6 +332,29 @@ for shared frontends.
 Tree-edge SVD. Its defaults, `cutoff=1e-10` and `cutoff_mode="rsum2"`, match
 Quimb's open-boundary `MatrixProductState.gate_with_submpo` compression path.
 `"rel"` remains available as a relative largest-singular-value threshold.
+The same defaults are used by the lower-level
+`TreeTensorNetwork.compress_edge_` API, so constructing the state directly and
+replaying it through `TreeOptimizer` does not silently change the truncation
+criterion.
+
+### Performance-oriented defaults and warnings
+
+The default replay configuration is intended for production evolution:
+`mode="auto"` uses the direct routed two-site kernel, `threads=1` avoids
+oversubscribing the small tree contractions, `subtree_workers=1` keeps the
+serial path allocation-free, `profile=False` avoids timing overhead, and
+`track_truncation=False` avoids full-spectrum diagnostic SVDs. `record_history`
+and `track_infidelity` retain the established API defaults; the latter only
+adds norm-based progress readouts when a progress bar is requested.
+
+Warnings are reserved for an actionable behavior change: enabling
+`track_truncation=True` emits one diagnostic-performance warning, explicit
+backend/dtype/device conversion emits one compatibility warning per conversion
+signature, and legacy mode selectors emit deprecation warnings. Dense and
+native paths share the direct one-edge contraction, path-cache, routing, and
+proof-reuse optimizations. Only the QR phase safeguard and graded reduced-core
+SVD are native Symmray specializations; dense arrays continue through Quimb's
+ordinary QR/SVD with the same cutoff, path, and truncation semantics.
 
 `TreeOptimizer.apply_submpo(...)` is the public form for an explicit MPO of
 arbitrary support. It losslessly QR-routes its virtual bonds, then uses its

@@ -57,6 +57,54 @@ Tree Optimizer skill so the upload-facing `SKILL.md` stays concise.
   native compression remains an explicit graded SVD. The network derives
   orientation views directly from live tensors; do not cache a duplicate map
   in the optimizer.
+- **Update-path bookkeeping.** A compression sweep now computes the live
+  isometry proof once per truncating edge and passes that proof into the native
+  compressor; lossless QR edges do not perform a reduction-proof lookup at
+  all. Private two-site gate-factor output labels are stable within the local
+  update, avoiding per-factor UUID/reindex work while the routed operator bond
+  remains fresh. Subtree QR messages are merged by destination, so sibling
+  messages landing at one hub use one multi-tensor contraction instead of
+  rebuilding that hub once per child. Dense message waves reuse one worker
+  pool; native fermionic waves remain serial, but use the same grouped merge
+  without changing graded block semantics.
+- **Two-site routing prefactors.** The immutable geodesic for a repeated
+  qubit support is cached and reversed when the current centre chooses the
+  opposite endpoint as the source, so the cache never assumes a gauge
+  location. Ordinary adjacent two-tensor merges in gate threading and local
+  operator absorption use a direct backend ``tensordot``; Symmray retains its
+  graded fermionic contraction semantics and unsupported hyperedges fall back
+  to Quimb's general contraction path.
+- **Public performance defaults.** ``mode="auto"`` selects the direct
+  two-site kernel, ``threads=1`` and ``subtree_workers=1`` avoid oversubscription
+  on small tree tensors, ``profile=False`` avoids timing overhead, and
+  ``track_truncation=False`` avoids diagnostic spectrum probes. The low-level
+  ``TreeTensorNetwork.compress_edge_`` API uses the same ``rsum2`` cutoff-mode
+  default as ``TreeOptimizer``. Dense and native trees share these routing,
+  contraction, path-cache, and proof-reuse optimizations; native-only code is
+  limited to graded QR/SVD semantics and the complex64 zero-sector safeguard.
+- **Native complex64 QR stability.** Torch can return NaNs for a finite,
+  rank-deficient Symmray charge block whose norm has decayed into the
+  ``1e-9`` range. Native QR therefore uses a block-local power-of-two scale
+  for small complex64 blocks and divides the triangular factor by the same
+  scale. This leaves ``Q @ R`` unchanged, keeps zero-charge sectors finite,
+  and avoids promoting the complete replay to complex128. The native
+  ``reduced="right"`` branch now mirrors Quimb's one-sided path: it SVDs only
+  the active endpoint and contracts that factor into the already-left-
+  isometric endpoint; unproven ``right``, ``False``, and ``lazy`` hints retain
+  the conservative full-SVD fallback.
+- On the same 6x6 χ=64 complex64 Torch-CPU harness, the post-compression-fix
+  Tree evolution was 6.21 s in the saved baseline; the update-path pass ran
+  in 4.90--5.15 s on repeated warm-cache runs. Threaded BLAS and cache warmth
+  affect absolute wall time, so use the profile envelopes for comparisons;
+  the optimization preserves the 48-gate state and χ/cutoff semantics.
+- The full 468-gate ``6x6_nsteps=0`` replay then completed with
+  ``track_truncation=False`` and profiling enabled: one run measured 20.39 s
+  for MPS evolution, 137.11 s for Tree evolution, and 25.79 s for Tree layout
+  planning (Tree/MPS evolution ratio 6.72x). This is the stability baseline;
+  layout planning is reported separately and the remaining update envelopes
+  are the next prefactor target. The normalized Tree/MPS state fidelity in the
+  same χ=64 run was 0.590; because the two geometries truncate different
+  bonds, this is an accuracy diagnostic rather than an exact-gauge check.
 - `copy()` shares the immutable `TreePlan`, owns `self.tn.copy()`, resets the
   tid cache, and derives a deterministic child seed for an independent RNG.
 
