@@ -3289,6 +3289,69 @@ def test_tree_profile_report_is_opt_in():
     assert report["total_seconds"] > 0.0
 
 
+def test_tree_profile_separates_qr_thread_hops_from_compression():
+    """Profiled direct routing exposes exact QR hops as separate events."""
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer(
+        [(cnot, (0, 3))], n=4, chi=2, cutoff=0.0,
+        profile=True, track_bond_diagnostics=True,
+    )
+
+    report = opt.profile_report()
+    hops = [event for event in report["events"] if event["kind"] == "thread_hop"]
+    assert hops
+    assert all(event["seconds"] >= 0.0 for event in hops)
+    assert report["by_kind"]["thread_hop"]["count"] == len(hops)
+    assert report["by_kind"]["edge_canonize"]["count"] >= 1
+
+
+def test_tree_bond_diagnostics_distinguish_transient_qr_growth():
+    """Temporary gate/QR growth may exceed chi while live bonds do not."""
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer(
+        [(cnot, (0, 3))], n=4, chi=1, cutoff=0.0,
+        record_history=False, track_bond_diagnostics=True,
+    )
+
+    report = opt.bond_diagnostic_report()
+    assert report["enabled"] is True
+    assert report["max_transient_bond"] >= 2
+    assert report["max_live_bond_after"] <= 1
+    assert report["n_transient_exceeds_chi"] >= 1
+    update = report["updates"][0]
+    assert update["transient_max_bond"] > update["live_max_bond_after"]
+    assert update["transient_exceeds_chi"] is True
+    assert update["bond_trace"]
+
+
+def test_tree_norm_and_fidelity_check_is_deterministic_without_network_fidelity():
+    """Small exact replay uses local norm plus a deterministic statevector oracle."""
+    rng = np.random.default_rng(417)
+    stream = _random_stream(4, 10, rng, two_qubit_frac=0.8)
+    exact = _exact_state(stream, 4)
+
+    first = TreeOptimizer(
+        stream, n=4, chi=64, cutoff=0.0, threads=1,
+    )
+    second = TreeOptimizer(
+        stream, n=4, chi=64, cutoff=0.0, threads=2,
+    )
+    first_dense = first.to_dense()
+    second_dense = second.to_dense()
+
+    assert first.norm() == pytest.approx(np.linalg.norm(first_dense))
+    assert second.norm() == pytest.approx(np.linalg.norm(second_dense))
+    assert _fidelity(exact, first_dense) > 1.0 - 1e-10
+    assert _fidelity(exact, second_dense) > 1.0 - 1e-10
+    assert _fidelity(first_dense, second_dense) > 1.0 - 1e-12
+
+
 def test_tree_pauli_expectation_and_projection_are_public():
     """Pauli expectation/projection share the measurement backend semantics."""
     h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)

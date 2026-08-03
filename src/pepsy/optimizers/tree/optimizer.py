@@ -416,6 +416,12 @@ class TreeOptimizer:
         Whether to collect opt-in kernel timing records in
         :meth:`profile_report`. Profiling is disabled by default and adds no
         synchronization or timing calls to the normal replay path.
+    track_bond_diagnostics : bool
+        Whether to record live and transient bond dimensions for each update.
+        This is disabled by default because determining the live maximum scans
+        the tree after QR hops. When enabled, :meth:`bond_diagnostic_report`
+        distinguishes temporary QR/gate growth from the post-compression live
+        state bonds.
     tn : TreeTensorNetwork or product MatrixProductState, optional
         Initial coefficient state. A tree state is copied and canonicalised if
         needed. Its plan must match ``tree``/``layout`` when it is entangled;
@@ -479,7 +485,8 @@ class TreeOptimizer:
                  max_intermediate_bond=None,
                  max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
                  max_subtree_nodes=_DEFAULT_MAX_SUBTREE_NODES,
-                 record_history=True, profile=False):
+                 record_history=True, profile=False,
+                 track_bond_diagnostics=False):
         # Preserve one-shot streams for both queue normalization and automatic
         # layout discovery.  Materializing only inside
         # ``_normalize_gate_queue`` would leave the finder with an exhausted
@@ -680,10 +687,12 @@ class TreeOptimizer:
         )
         self.record_history = bool(record_history)
         self.profile = bool(profile)
+        self.track_bond_diagnostics = bool(track_bond_diagnostics)
         self.profile_events = []
         self.measurements = []
         self.truncation_history = []
         self.update_history = []
+        self.bond_history = []
         # Keep the same readout attributes as MpsOptimizer. Tree infidelity
         # samples are populated when ``track_truncation`` is enabled; without
         # the spectrum probes the only honest trace is the initial zero.
@@ -1307,6 +1316,7 @@ class TreeOptimizer:
         self._install_tn(tn)
         self.truncation_history.clear()
         self.update_history.clear()
+        self.bond_history.clear()
         self.infidelities[:] = [0.0]
         self.infidelity_samples.clear()
         self.normalizations.clear()
@@ -2167,13 +2177,37 @@ class TreeOptimizer:
         """Start aggregating edge truncations for one state update."""
         if self._active_update is not None:
             return False
+        live_before = (
+            int(self.tn.max_bond())
+            if self.track_bond_diagnostics else None
+        )
         self._active_update = {
             "kind": str(kind),
             "support": tuple(int(q) for q in where),
             "edge_start": len(self.truncation_history),
             "started_at": time.perf_counter(),
+            "live_max_bond_before": live_before,
+            "transient_max_bond": live_before,
+            "bond_trace": [],
         }
         return True
+
+    def _record_transient_bond(self, dimension, *, phase, edge=None):
+        """Record one potentially transient bond dimension for the update."""
+        active = self._active_update
+        if active is None:
+            return
+        dimension = int(dimension)
+        previous = active["transient_max_bond"]
+        active["transient_max_bond"] = (
+            dimension if previous is None else max(previous, dimension)
+        )
+        if self.track_bond_diagnostics:
+            active["bond_trace"].append({
+                "phase": str(phase),
+                "edge": None if edge is None else tuple(int(x) for x in edge),
+                "bond": dimension,
+            })
 
     def _abort_update(self):
         """Discard a partial aggregation after a failed state update."""
@@ -2189,12 +2223,39 @@ class TreeOptimizer:
         if active is None:
             return
         elapsed = time.perf_counter() - active["started_at"]
+        live_after = (
+            int(self.tn.max_bond())
+            if self.track_bond_diagnostics else None
+        )
+        transient_max = active.get("transient_max_bond")
+        if transient_max is None:
+            transient_max = live_after
+        transient_over_chi = (
+            None
+            if self.chi is None or transient_max is None
+            else bool(transient_max > self.chi)
+        )
+        bond_record = {
+            "update": len(self.update_history),
+            "kind": active["kind"],
+            "support": active["support"],
+            "live_max_bond_before": active.get("live_max_bond_before"),
+            "transient_max_bond": transient_max,
+            "live_max_bond_after": live_after,
+            "transient_exceeds_chi": transient_over_chi,
+            "bond_trace": deepcopy(active.get("bond_trace", [])),
+        }
+        if self.track_bond_diagnostics:
+            self.bond_history.append(deepcopy(bond_record))
         if not self.record_history:
             if self.profile:
                 self.profile_events.append({
                     "kind": "update",
                     "support": active["support"],
                     "seconds": elapsed,
+                    "live_max_bond_before": active.get("live_max_bond_before"),
+                    "transient_max_bond": transient_max,
+                    "live_max_bond_after": live_after,
                 })
             self._active_update = None
             return
@@ -2264,6 +2325,7 @@ class TreeOptimizer:
             "cumulative_relative_discarded_weight": cumulative_loss,
             "max_edge_discarded_weight": max_edge_loss,
             "max_edge_discarded_fraction": max_edge_fraction,
+            **bond_record,
         })
         if self.profile:
             self.profile_events.append({
@@ -3147,8 +3209,38 @@ class TreeOptimizer:
         above its pre-gate size, and that growth is undone by
         :meth:`_compress_path`.
         """
-        if self.tn.fermionic:
-            return self._fermionic_thread_hop(u, v)
+        profile_started = time.perf_counter() if self.profile else None
+        before_bond = self.tn.bond(u, v)
+        before_dim = int(self.tn.ind_size(before_bond))
+        try:
+            if self.tn.fermionic:
+                result = self._fermionic_thread_hop(u, v)
+            else:
+                result = self._dense_thread_hop(u, v)
+        finally:
+            after_bond = self.tn.bond(u, v)
+            after_dim = int(self.tn.ind_size(after_bond))
+            self._record_transient_bond(
+                after_dim, phase="thread_hop", edge=(u, v),
+            )
+            if self.profile:
+                try:
+                    thread_dim = int(self.tn.ind_size(self._thread_ind))
+                except (KeyError, TypeError, ValueError):
+                    thread_dim = None
+                self.profile_events.append({
+                    "kind": "thread_hop",
+                    "edge": (u, v),
+                    "before_bond": before_dim,
+                    "after_bond": after_dim,
+                    "thread_bond": thread_dim,
+                    "native": bool(self.tn.fermionic),
+                    "seconds": time.perf_counter() - profile_started,
+                })
+        return result
+
+    def _dense_thread_hop(self, u, v):
+        """Perform one dense QR thread hop without timing/diagnostic wrapping."""
 
         tu = self.tn.tensor_map[self._tid(u)]
         tv = self.tn.tensor_map[self._tid(v)]
@@ -3317,6 +3409,9 @@ class TreeOptimizer:
         full_spectrum=None, max_bond=None, cutoff=None,
     ):
         """Record one edge split/compression and optional discarded weight."""
+        self._record_transient_bond(
+            before_bond, phase=str(kind), edge=edge,
+        )
         if not self.record_history:
             return
         discarded_weight = None
@@ -5371,6 +5466,7 @@ class TreeOptimizer:
             max_subtree_nodes=self.max_subtree_nodes,
             record_history=self.record_history,
             profile=self.profile,
+            track_bond_diagnostics=self.track_bond_diagnostics,
             seed=child_seed,
             run=False,
             tn=self.tn,
@@ -5382,6 +5478,7 @@ class TreeOptimizer:
         other.measurements = deepcopy(self.measurements)
         other.truncation_history = deepcopy(self.truncation_history)
         other.update_history = deepcopy(self.update_history)
+        other.bond_history = deepcopy(self.bond_history)
         other.infidelities = list(self.infidelities)
         other.infidelity_samples = deepcopy(self.infidelity_samples)
         other.normalizations = deepcopy(self.normalizations)
@@ -5411,14 +5508,54 @@ class TreeOptimizer:
         """Return detailed cumulative tree-truncation sample records."""
         return self.infidelity_samples
 
+    def bond_diagnostic_report(self):
+        """Return live-versus-transient bond diagnostics collected per update.
+
+        The transient maximum includes the bond dimensions presented to the
+        final compression SVD and the dimensions observed after exact QR
+        thread hops. Consequently it can exceed ``chi`` even when every
+        ``live_max_bond_after`` is capped by ``chi``. The report is populated
+        only when ``track_bond_diagnostics=True``; otherwise the update list
+        remains available but its live/transient fields are ``None``.
+        """
+        updates = deepcopy(
+            self.bond_history if self.track_bond_diagnostics else self.update_history
+        )
+        measured = [
+            update for update in updates
+            if update.get("transient_max_bond") is not None
+        ]
+        live_after = [
+            update["live_max_bond_after"]
+            for update in measured
+            if update.get("live_max_bond_after") is not None
+        ]
+        transient = [
+            update["transient_max_bond"]
+            for update in measured
+            if update.get("transient_max_bond") is not None
+        ]
+        return {
+            "enabled": self.track_bond_diagnostics,
+            "chi": self.chi,
+            "updates": updates,
+            "max_live_bond_after": max(live_after) if live_after else None,
+            "max_transient_bond": max(transient) if transient else None,
+            "n_transient_exceeds_chi": sum(
+                bool(update.get("transient_exceeds_chi"))
+                for update in measured
+            ),
+        }
+
     def profile_report(self):
         """Return opt-in tree kernel timings grouped by operation kind.
 
         Construct the optimizer with ``profile=True`` to collect records.
         Timing is deliberately kept separate from truncation history so the
-        normal replay and diagnostic APIs remain unchanged. The returned
-        ``events`` list is a deep copy and can safely be serialized alongside
-        a benchmark result.
+        normal replay and diagnostic APIs remain unchanged. In addition to
+        update and compression events, two-site direct routing reports each
+        exact QR ``thread_hop`` separately. The returned ``events`` list is a
+        deep copy and can safely be serialized alongside a benchmark result.
         """
         events = deepcopy(self.profile_events)
         grouped = {}
