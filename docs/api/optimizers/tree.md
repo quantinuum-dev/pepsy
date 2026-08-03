@@ -197,11 +197,14 @@ compression events totaling 2.40 s inside 48 update envelopes totaling 6.18 s;
 it identified the gate update/threading/contraction path, especially the
 central edges, rather than route-length tuning, as the next target.
 
-The update path now avoids repeating the same native isometry proof: each
-truncating edge validates its `left_inds`/charge-map proof once, while a
-lossless QR edge skips the reduction lookup entirely. Two-site factors use
-private stable output labels, removing per-factor UUID allocation and one
-metadata reindex. In multi-site Tree/MPO updates, independent QR messages
+The update path carries the isometry proof produced by the lossless threading
+sweep into the reverse compression sweep, so native edges do not revalidate
+the same `left_inds`/charge-map proof at every central edge. Two-site factors
+use state-owned unique work labels rather than per-factor UUID allocation;
+live routed bonds remain collision-safe across copied states without random
+label setup in the hot loop. Native Torch-CPU one-edge contractions use
+Symmray's blockwise mode, while CUDA and other backends retain the fused mode.
+In multi-site Tree/MPO updates, independent QR messages
 landing at the same node are contracted as one batch; dense waves reuse their
 worker pool, while native fermionic routing remains serial for Symmray safety.
 These changes preserve the complete-gate-before-truncation rule and the
@@ -238,10 +241,17 @@ when using this number as an accuracy diagnostic.
 #### QR/hop and bond-growth diagnostics
 
 Construct `TreeOptimizer(..., profile=True)` to split the update envelope into
-timed `thread_hop`, `edge_canonize`, and `edge_compress` events. The
+timed `thread_hop`, `edge_canonize`, and `edge_compress` events. The profile
+also records `gate_factorization`, `tensor_absorption`, `center_movement`,
+`metadata_path`, and `subtree_hub_merge` phases when those routes are used. The
 `thread_hop` events are the exact, lossless QR carry moves; `edge_compress`
 events are the truncating SVD work. These timings are nested inside the
-per-update envelope and should not be added as independent wall-clock totals.
+per-update envelope and should not be added as independent wall-clock totals;
+use `profile_report()["update_seconds"]` as the envelope total. The
+`timing_semantics` field records this relationship explicitly. For asynchronous
+CuPy or CUDA work, `profile_sync=True` synchronizes the active device at each
+phase boundary so phase durations represent device execution; this is a
+diagnostic mode and adds synchronization overhead.
 For native Symmray compression, `profile_report()` also returns
 `native_compression_routes`: counts of `one_sided_left`, `one_sided_right`, and
 `two_sided_reduced` show that the graded reduced-core paths are active, while
@@ -250,8 +260,9 @@ records have zero duration; use the enclosing `edge_compress` event for timing.
 
 For a dimension-level report, also pass
 `track_bond_diagnostics=True`. `bond_diagnostic_report()` then records
-`transient_max_bond` during routing/factorization and `live_max_bond_after`
-after the compression sweep. The former may exceed `chi` by the gate's
+the per-update `live_max_bond_before`, `transient_max_bond` during
+routing/factorization, and `live_max_bond_after` after the compression sweep.
+The former may exceed `chi` by the gate's
 operator-Schmidt rank; the latter is the enforced live-state cap. The extra
 live maximum scans are opt-in so ordinary replay retains its default cost.
 

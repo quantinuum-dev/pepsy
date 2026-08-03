@@ -416,6 +416,11 @@ class TreeOptimizer:
         Whether to collect opt-in kernel timing records in
         :meth:`profile_report`. Profiling is disabled by default and adds no
         synchronization or timing calls to the normal replay path.
+    profile_sync : bool
+        Whether profiled phase boundaries should synchronize the active device
+        before taking timestamps. This is useful for asynchronous CuPy and
+        CUDA backends, but adds a synchronization at every recorded phase and
+        is therefore disabled by default.
     track_bond_diagnostics : bool
         Whether to record live and transient bond dimensions for each update.
         This is disabled by default because determining the live maximum scans
@@ -485,7 +490,7 @@ class TreeOptimizer:
                  max_intermediate_bond=None,
                  max_operator_qubits=_DEFAULT_MAX_OPERATOR_QUBITS,
                  max_subtree_nodes=_DEFAULT_MAX_SUBTREE_NODES,
-                 record_history=True, profile=False,
+                 record_history=True, profile=False, profile_sync=False,
                  track_bond_diagnostics=False):
         # Preserve one-shot streams for both queue normalization and automatic
         # layout discovery.  Materializing only inside
@@ -687,6 +692,7 @@ class TreeOptimizer:
         )
         self.record_history = bool(record_history)
         self.profile = bool(profile)
+        self.profile_sync = bool(profile_sync)
         self.track_bond_diagnostics = bool(track_bond_diagnostics)
         self.profile_events = []
         self.measurements = []
@@ -714,6 +720,7 @@ class TreeOptimizer:
         self._two_site_path_cache = {}
         self._two_site_path_cache_limit = 256
         self._active_update = None
+        self._update_counter = 0
         self._truncation_log_survival = 0.0
 
         if tree is None:
@@ -1309,6 +1316,42 @@ class TreeOptimizer:
         """Attach the optimizer's optional timing sink to the live TTN."""
         self.tn._profile_sink = self.profile_events if self.profile else None
 
+    def _profile_synchronize(self):
+        """Synchronize an asynchronous backend for opt-in phase timing."""
+        if not self.profile_sync:
+            return
+        backend = getattr(self, "backend", None)
+        array_backend = getattr(self, "array_backend", backend)
+        if array_backend == "cupy" or backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            cp.cuda.runtime.deviceSynchronize()
+        elif backend == "torch":
+            data = self._state_like()
+            if bool(getattr(data, "is_cuda", False)):
+                import torch  # pylint: disable=import-outside-toplevel
+
+                torch.cuda.synchronize(data.device)
+
+    def _profile_phase_start(self):
+        """Return a phase timestamp, or ``None`` when profiling is disabled."""
+        if not self.profile:
+            return None
+        self._profile_synchronize()
+        return time.perf_counter()
+
+    def _profile_phase_event(self, kind, started, **payload):
+        """Append one opt-in phase event with optional device synchronization."""
+        if started is None:
+            return
+        self._profile_synchronize()
+        event = {
+            "kind": str(kind),
+            **payload,
+            "seconds": time.perf_counter() - started,
+        }
+        self.profile_events.append(event)
+
     def set_tn(self, tn):
         """Replace the live tree state with a canonical independent copy."""
         if not isinstance(tn, TreeTensorNetwork):
@@ -1322,6 +1365,7 @@ class TreeOptimizer:
         self.normalizations.clear()
         self.projection_diagnostics.clear()
         self._truncation_log_survival = 0.0
+        self._update_counter = 0
         self._attach_profile_sink()
         return self
 
@@ -1467,7 +1511,17 @@ class TreeOptimizer:
         a path walk when a multi-node canonical region is known. Only an
         otherwise uncatalogued state requires a full O(N) canonicalisation.
         """
-        self.tn.shift_orthogonality_center(target)
+        started = self._profile_phase_start()
+        previous = self.center
+        try:
+            return self.tn.shift_orthogonality_center(target)
+        finally:
+            self._profile_phase_event(
+                "center_movement",
+                started,
+                source=previous,
+                target=target,
+            )
 
     def _nearest_anchor(self, nodes):
         """Choose the closest node to the current centre or canonical region.
@@ -2181,9 +2235,12 @@ class TreeOptimizer:
             int(self.tn.max_bond())
             if self.track_bond_diagnostics else None
         )
+        update_index = self._update_counter
+        self._update_counter += 1
         self._active_update = {
             "kind": str(kind),
             "support": tuple(int(q) for q in where),
+            "update": update_index,
             "edge_start": len(self.truncation_history),
             "started_at": time.perf_counter(),
             "live_max_bond_before": live_before,
@@ -2230,13 +2287,19 @@ class TreeOptimizer:
         transient_max = active.get("transient_max_bond")
         if transient_max is None:
             transient_max = live_after
+        update_index = active.get(
+            "update",
+            len(self.bond_history)
+            if self.track_bond_diagnostics
+            else len(self.update_history),
+        )
         transient_over_chi = (
             None
             if self.chi is None or transient_max is None
             else bool(transient_max > self.chi)
         )
         bond_record = {
-            "update": len(self.update_history),
+            "update": update_index,
             "kind": active["kind"],
             "support": active["support"],
             "live_max_bond_before": active.get("live_max_bond_before"),
@@ -2251,6 +2314,7 @@ class TreeOptimizer:
             if self.profile:
                 self.profile_events.append({
                     "kind": "update",
+                    "update": update_index,
                     "support": active["support"],
                     "seconds": elapsed,
                     "live_max_bond_before": active.get("live_max_bond_before"),
@@ -2313,7 +2377,7 @@ class TreeOptimizer:
                 cumulative_loss = None
 
         self.update_history.append({
-            "update": len(self.update_history),
+            "update": update_index,
             "kind": active["kind"],
             "support": active["support"],
             "elapsed_seconds": float(elapsed),
@@ -2330,6 +2394,7 @@ class TreeOptimizer:
         if self.profile:
             self.profile_events.append({
                 "kind": "update",
+                "update": update_index,
                 "support": active["support"],
                 "seconds": elapsed,
             })
@@ -2731,7 +2796,16 @@ class TreeOptimizer:
             self._move_center(site_node)
         region = self.tn.canonical_region
         left_inds = self.tn.node_tensor(site_node).left_inds
-        self.tn.gate_inds_(gate, [self._phys(q)], contract=True)
+        absorb_started = self._profile_phase_start()
+        try:
+            self.tn.gate_inds_(gate, [self._phys(q)], contract=True)
+        finally:
+            self._profile_phase_event(
+                "tensor_absorption",
+                absorb_started,
+                support=(q,),
+                route="one_site",
+            )
         if unitary:
             # A physical unitary preserves the isometric exterior, but the
             # state-owned gate mutator deliberately invalidates metadata for
@@ -2833,6 +2907,7 @@ class TreeOptimizer:
             db = int(self.tn.ind_size(self._phys(qb)))
         cache_source = gate
         gate = self._as_gate_tensor4(gate, da, db)
+        factor_started = self._profile_phase_start()
 
         # ``MatrixProductOperator.from_dense`` is backend-generic: for a
         # Symmray FermionicArray its block-aware SVD returns native fermionic
@@ -2852,6 +2927,7 @@ class TreeOptimizer:
             self.n,
         )
         cached = self._gate_factor_cache.get(cache_key)
+        cache_hit = cached is not None and cached[0] is cache_source
         if cached is not None and cached[0] is cache_source:
             submpo = cached[1]
         else:
@@ -2866,6 +2942,14 @@ class TreeOptimizer:
                 "two-site gate could not be represented as a Quimb sub-MPO "
                 "with one local factor per requested site."
             )
+        self._profile_phase_event(
+            "gate_factorization",
+            factor_started,
+            route="mpo",
+            cache_hit=cache_hit,
+            support=(qa, qb),
+            input_shape=(da, db, da, db),
+        )
         return self._apply_2q_factors_impl(
             *factors,
             qa,
@@ -2918,6 +3002,12 @@ class TreeOptimizer:
                 if len(tids) != 1:
                     return None
                 factor = tensor_map[tids[0]].copy()
+                # The two-site fast path consumes these private factors
+                # directly, before the structured sub-MPO route gets a
+                # chance to coerce its payload tensors. Keep the caller's
+                # MPO untouched while matching each factor to the live TTN
+                # backend, dtype, and device.
+                factor.modify(data=self._as_state_backend(factor.data))
                 upper = upper_id.format(site)
                 lower = lower_id.format(site)
                 if upper not in factor.inds or lower not in factor.inds:
@@ -2953,7 +3043,7 @@ class TreeOptimizer:
                 cache_key, submpo, (raw_factors, shared_bond)
             )
 
-        thread_ind = qtn.rand_uuid()
+        thread_ind = self.tn._new_work_bond("mpo_thread", qa, qb)
         factors = {}
         outputs = {}
         for qubit, (factor_template, upper, lower) in raw_factors.items():
@@ -3004,6 +3094,7 @@ class TreeOptimizer:
         self, gate, source, qa, qb, pa, pb, da, db,
     ):
         """Return fresh-index copies of a cached direct gate factorization."""
+        factor_started = self._profile_phase_start()
         key = (
             "direct",
             id(source),
@@ -3015,6 +3106,7 @@ class TreeOptimizer:
             db,
         )
         cached = self._gate_factor_cache.get(key)
+        cache_hit = cached is not None and cached[0] is source
         if cached is not None and cached[0] is source:
             left_template, right_template = cached[1]
         else:
@@ -3044,7 +3136,16 @@ class TreeOptimizer:
                 key, source, (left_template, right_template)
             )
 
-        thread_ind = qtn.rand_uuid()
+        self._profile_phase_event(
+            "gate_factorization",
+            factor_started,
+            route="direct",
+            cache_hit=cache_hit,
+            support=(qa, qb),
+            input_shape=(da, db, da, db),
+        )
+
+        thread_ind = self.tn._new_work_bond("gate_thread", qa, qb)
         left = left_template.copy()
         right = right_template.copy()
         output_a = "_pepsy_gate_out_a"
@@ -3076,6 +3177,7 @@ class TreeOptimizer:
         one canonical compression sweep.
         """
         plan = self.plan
+        path_started = self._profile_phase_start()
         la, lb, path = self._cached_two_site_path(qa, qb)
         parent = plan.parent.get(la)
         if (
@@ -3084,6 +3186,13 @@ class TreeOptimizer:
             and parent is not None
             and plan.parent.get(lb) == parent
         ):
+            self._profile_phase_event(
+                "metadata_path",
+                path_started,
+                support=(qa, qb),
+                route="sibling",
+                path_length=len(path),
+            )
             return self._apply_2q_sibling_factors(
                 factors, outputs, qa, qb, la, lb, parent,
                 max_bond=max_bond,
@@ -3100,15 +3209,33 @@ class TreeOptimizer:
         destination_node = plan.node_of_qubit[destination]
         if source_node != path[0]:
             path = path[::-1]
+        self._profile_phase_event(
+            "metadata_path",
+            path_started,
+            support=(qa, qb),
+            route="threaded",
+            path_length=len(path),
+            source=source_node,
+            destination=destination_node,
+        )
         self._move_center(source_node)
         self._thread_ind = thread_ind
         try:
             source_tensor = self.tn.tensor_map[self._tid(source_node)]
-            merged_source = _contract_two_tensors(
-                source_tensor,
-                factors[source],
-                shared_ind=self._phys(source),
-            ).reindex_({outputs[source]: self._phys(source)})
+            absorb_started = self._profile_phase_start()
+            try:
+                merged_source = _contract_two_tensors(
+                    source_tensor,
+                    factors[source],
+                    shared_ind=self._phys(source),
+                ).reindex_({outputs[source]: self._phys(source)})
+            finally:
+                self._profile_phase_event(
+                    "tensor_absorption",
+                    absorb_started,
+                    support=(source,),
+                    route="threaded_source",
+                )
             source_tensor.modify(
                 data=merged_source.data, inds=merged_source.inds,
             )
@@ -3117,11 +3244,20 @@ class TreeOptimizer:
                 self._thread_hop(u, v)
 
             destination_tensor = self.tn.tensor_map[self._tid(destination_node)]
-            merged_destination = _contract_two_tensors(
-                factors[destination],
-                destination_tensor,
-                shared_ind=self._phys(destination),
-            ).reindex_({outputs[destination]: self._phys(destination)})
+            absorb_started = self._profile_phase_start()
+            try:
+                merged_destination = _contract_two_tensors(
+                    factors[destination],
+                    destination_tensor,
+                    shared_ind=self._phys(destination),
+                ).reindex_({outputs[destination]: self._phys(destination)})
+            finally:
+                self._profile_phase_event(
+                    "tensor_absorption",
+                    absorb_started,
+                    support=(destination,),
+                    route="threaded_destination",
+                )
             destination_tensor.modify(
                 data=merged_destination.data, inds=merged_destination.inds,
             )
@@ -3156,17 +3292,26 @@ class TreeOptimizer:
         e_la = self._bond_name(la, parent)
         e_lb = self._bond_name(lb, parent)
 
-        merged_a = _contract_two_tensors(
-            tla, factors[qa], shared_ind=pa,
-        ).reindex_(
-            {outputs[qa]: pa}
-        )
-        merged_b = _contract_two_tensors(
-            tlb, factors[qb], shared_ind=pb,
-        ).reindex_(
-            {outputs[qb]: pb}
-        )
-        blob = qtn.tensor_contract(merged_a, tp, merged_b)
+        absorb_started = self._profile_phase_start()
+        try:
+            merged_a = _contract_two_tensors(
+                tla, factors[qa], shared_ind=pa,
+            ).reindex_(
+                {outputs[qa]: pa}
+            )
+            merged_b = _contract_two_tensors(
+                tlb, factors[qb], shared_ind=pb,
+            ).reindex_(
+                {outputs[qb]: pb}
+            )
+            blob = qtn.tensor_contract(merged_a, tp, merged_b)
+        finally:
+            self._profile_phase_event(
+                "tensor_absorption",
+                absorb_started,
+                support=(qa, qb),
+                route="sibling_blob",
+            )
 
         # Split off leaf a (isometric), then leaf b, leaving the centre at the
         # parent; both new bonds keep their canonical tree-edge names.
@@ -3230,6 +3375,10 @@ class TreeOptimizer:
                     thread_dim = None
                 self.profile_events.append({
                     "kind": "thread_hop",
+                    "update": (
+                        None if self._active_update is None
+                        else self._active_update.get("update")
+                    ),
                     "edge": (u, v),
                     "before_bond": before_dim,
                     "after_bond": after_dim,
@@ -3289,6 +3438,7 @@ class TreeOptimizer:
             absorb="right",
             cutoff=0.0,
             get="tensors",
+            bond_ind=self.tn._new_work_bond("thread_hop", u, v),
         )
         merged_v = _contract_two_tensors(carry, tv, shared_ind=edge)
         tu.modify(
@@ -3557,6 +3707,10 @@ class TreeOptimizer:
             if profile_started is not None:
                 self.profile_events.append({
                     "kind": "edge_canonize",
+                    "update": (
+                        None if self._active_update is None
+                        else self._active_update.get("update")
+                    ),
                     "edge": (u, v),
                     "before_bond": before_bond,
                     "after_bond": int(self.tn.ind_size(bond_after)),
@@ -3593,6 +3747,10 @@ class TreeOptimizer:
         if profile_started is not None:
             self.profile_events.append({
                 "kind": "edge_compress",
+                "update": (
+                    None if self._active_update is None
+                    else self._active_update.get("update")
+                ),
                 "edge": (u, v),
                 "before_bond": before_bond,
                 "after_bond": after_bond,
@@ -3651,6 +3809,12 @@ class TreeOptimizer:
         leaves the centre at ``path[0]``.  This is the re-orthonormalisation
         sweep of Seitz et al. (Fig. 6) applied along the gate geodesic.
         """
+        # Every node before the destination was produced by the lossless QR
+        # threading sweep.  Its ``left_inds`` therefore prove that it is
+        # isometric toward the destination side of the next compression edge.
+        # Carry this proof through the reverse sweep instead of asking every
+        # native edge to revalidate the same charge maps.  The proof is local
+        # to this update and is not used by public arbitrary edge callers.
         for v, u in zip(path[::-1], path[-2::-1]):
             edge_cutoff = cutoff
             if preserve_subcap:
@@ -3659,9 +3823,7 @@ class TreeOptimizer:
                     max_bond=max_bond,
                     cutoff=cutoff,
                 )
-            reduced, reduction_proven = self._edge_reduction(
-                v, u, max_bond=max_bond, cutoff=edge_cutoff,
-            )
+            reduced, reduction_proven = "left", True
             self._compress_edge_with_diagnostics(
                 v, u, max_bond=max_bond, cutoff=edge_cutoff,
                 reduced=reduced, reduction_proven=reduction_proven,
@@ -3717,7 +3879,22 @@ class TreeOptimizer:
                     reduction_proven=reduction_proven,
                 )
                 descend(child, node)
-                self.tn.canonize_edge_(child, node, absorb="right")
+                canonize_bond = int(
+                    self.tn.ind_size(self.tn.bond(child, node))
+                )
+                canonize_started = self._profile_phase_start()
+                try:
+                    self.tn.canonize_edge_(child, node, absorb="right")
+                finally:
+                    self._profile_phase_event(
+                        "edge_canonize",
+                        canonize_started,
+                        edge=(child, node),
+                        before_bond=canonize_bond,
+                        after_bond=int(
+                            self.tn.ind_size(self.tn.bond(child, node))
+                        ),
+                    )
 
         descend(hub, None)
         self.center = hub
@@ -3804,13 +3981,22 @@ class TreeOptimizer:
 
                 for destination, destination_results in by_destination.items():
                     messages = [result[-1] for result in destination_results]
-                    if len(messages) == 1:
-                        local[destination] = qtn.tensor_contract(
-                            local[destination], messages[0]
-                        )
-                    else:
-                        local[destination] = qtn.tensor_contract(
-                            local[destination], *messages
+                    merge_started = self._profile_phase_start()
+                    try:
+                        if len(messages) == 1:
+                            local[destination] = qtn.tensor_contract(
+                                local[destination], messages[0]
+                            )
+                        else:
+                            local[destination] = qtn.tensor_contract(
+                                local[destination], *messages
+                            )
+                    finally:
+                        self._profile_phase_event(
+                            "subtree_hub_merge",
+                            merge_started,
+                            destination=destination,
+                            message_count=len(messages),
                         )
                     for (
                         _, source, _, state_bond, new_bond, kept, _
@@ -3985,10 +4171,20 @@ class TreeOptimizer:
             with self._thread_ctx():
                 applied = None
                 if len(where) == 2:
-                    factors = self._two_site_mpo_factors(
-                        submpo, where[0], where[1],
-                        site_where=(logical_where[0], logical_where[1]),
-                    )
+                    factor_started = self._profile_phase_start()
+                    try:
+                        factors = self._two_site_mpo_factors(
+                            submpo, where[0], where[1],
+                            site_where=(logical_where[0], logical_where[1]),
+                        )
+                    finally:
+                        self._profile_phase_event(
+                            "gate_factorization",
+                            factor_started,
+                            route="submpo",
+                            cache_hit=False,
+                            support=tuple(logical_where),
+                        )
                     if factors is not None:
                         self._apply_2q_factors_impl(
                             *factors, where[0], where[1],
@@ -4256,8 +4452,16 @@ class TreeOptimizer:
             # with any other state tensor: each edge creates one local message,
             # which is immediately absorbed by its parent and split again.
             order, hub = self._peel_order(snodes)
+            factor_started = self._profile_phase_start()
             op_factors, op_bonds = self._decompose_tree_operator(
                 op_arr, where, snodes, order, hub,
+            )
+            self._profile_phase_event(
+                "gate_factorization",
+                factor_started,
+                route="tree_operator",
+                support=tuple(logical_where),
+                subtree_nodes=len(snodes),
             )
             self._apply_factorized_subtree_operator_impl(
                 op_factors, op_bonds, where, snodes, order, hub,
@@ -4313,7 +4517,17 @@ class TreeOptimizer:
         site_nodes = [self.plan.node_of_qubit[q] for q in where]
         snodes = self._steiner_nodes(site_nodes)
         self._move_center(self._nearest_anchor(site_nodes))
+        path_started = self._profile_phase_start()
         order, hub = self._peel_order(snodes)
+        self._profile_phase_event(
+            "metadata_path",
+            path_started,
+            support=tuple(payload_where),
+            route="submpo_subtree",
+            subtree_nodes=len(snodes),
+            message_edges=len(order),
+            hub=hub,
+        )
         local = {}
         state_inds = {}
         operator_inds = {}
@@ -4345,11 +4559,20 @@ class TreeOptimizer:
                 operator_inds[nid] = set(op_t.inds) - {
                     self._phys(q) + "*", self._phys(q)
                 }
-                local[nid] = _contract_two_tensors(
-                    state_t, op_t, shared_ind=self._phys(q),
-                ).reindex_(
-                    {self._phys(q) + "*": self._phys(q)}
-                )
+                absorb_started = self._profile_phase_start()
+                try:
+                    local[nid] = _contract_two_tensors(
+                        state_t, op_t, shared_ind=self._phys(q),
+                    ).reindex_(
+                        {self._phys(q) + "*": self._phys(q)}
+                    )
+                finally:
+                    self._profile_phase_event(
+                        "tensor_absorption",
+                        absorb_started,
+                        support=(q,),
+                        route="submpo_site",
+                    )
             except (KeyError, TypeError, ValueError):
                 return None
 
@@ -4390,17 +4613,34 @@ class TreeOptimizer:
                 # Operator sites are packed into one dimension-four leg. Split
                 # that leg only at physical sites, then contract its input leg
                 # with the live state physical index.
-                op_t = self._expand_tree_operator_leaf(
-                    op_t,
-                    op_bonds["physical"][q],
-                    self._phys(q),
-                )
-            if q is not None and q in where:
-                local[nid] = _contract_two_tensors(
-                    state_t, op_t, shared_ind=self._phys(q),
-                )
+                absorb_started = self._profile_phase_start()
+                try:
+                    op_t = self._expand_tree_operator_leaf(
+                        op_t,
+                        op_bonds["physical"][q],
+                        self._phys(q),
+                    )
+                    local[nid] = _contract_two_tensors(
+                        state_t, op_t, shared_ind=self._phys(q),
+                    )
+                finally:
+                    self._profile_phase_event(
+                        "tensor_absorption",
+                        absorb_started,
+                        support=(q,),
+                        route="tree_operator_site",
+                    )
             else:
-                local[nid] = qtn.tensor_contract(state_t, op_t)
+                absorb_started = self._profile_phase_start()
+                try:
+                    local[nid] = qtn.tensor_contract(state_t, op_t)
+                finally:
+                    self._profile_phase_event(
+                        "tensor_absorption",
+                        absorb_started,
+                        support=(),
+                        route="tree_operator_internal",
+                    )
             if q is not None and q in where:
                 local[nid].reindex_({f"{self._phys(q)}*": self._phys(q)})
             operator_inds[nid] = set(local[nid].inds) - state_inds[nid]
@@ -5466,6 +5706,7 @@ class TreeOptimizer:
             max_subtree_nodes=self.max_subtree_nodes,
             record_history=self.record_history,
             profile=self.profile,
+            profile_sync=self.profile_sync,
             track_bond_diagnostics=self.track_bond_diagnostics,
             seed=child_seed,
             run=False,
@@ -5489,6 +5730,7 @@ class TreeOptimizer:
         other._track_warning_emitted = self._track_warning_emitted
         other._logical_qubits = list(self._logical_qubits)
         other._logical_positions = dict(self._logical_positions)
+        other._update_counter = self._update_counter
         other._truncation_log_survival = self._truncation_log_survival
         other.profile_events = deepcopy(self.profile_events)
         other._attach_profile_sink()
@@ -5572,11 +5814,28 @@ class TreeOptimizer:
             if kind == "native_compression_route":
                 route = str(event.get("route", "unknown"))
                 native_routes[route] = native_routes.get(route, 0) + 1
+        update_seconds = float(grouped.get("update", {}).get("seconds", 0.0))
         return {
             "enabled": self.profile,
             "events": events,
             "by_kind": grouped,
             "native_compression_routes": native_routes,
+            "update_seconds": update_seconds,
+            "timing_semantics": {
+                "wall_envelope": "update",
+                "nested_event_kinds": [
+                    "gate_factorization",
+                    "center_movement",
+                    "metadata_path",
+                    "thread_hop",
+                    "tensor_absorption",
+                    "edge_canonize",
+                    "edge_compress",
+                    "subtree_hub_merge",
+                    "native_compression_route",
+                ],
+                "total_seconds_is_sum_of_events_not_wall_time": True,
+            },
             "total_seconds": float(
                 sum(float(event.get("seconds", 0.0)) for event in events)
             ),

@@ -67,25 +67,73 @@ def _native_qr_block_scaled(array, **kwargs):
     opts = dict(kwargs)
     opts.pop("method", None)
     opts.pop("fn", None)
+
+    def torch_qr(x, qr_opts):
+        """Run the common native Torch QR block without composed dispatch."""
+        absorb = qr_opts.get("absorb", "right")
+        left_like = absorb in {
+            -1, "left", "Us,VH", "lfactor", "Us",
+        }
+        qr_kwargs = {
+            key: value for key, value in qr_opts.items()
+            if key not in {"absorb", "stabilized"}
+        }
+        if left_like:
+            x = ar.do("transpose", x, (1, 0))
+        q, r = ar.do("linalg.qr", x, **qr_kwargs)
+        if left_like:
+            left = ar.do("transpose", r, (1, 0))
+            right = ar.do("transpose", q, (1, 0))
+            if absorb in {-1, "left", "Us,VH"}:
+                return left, None, right
+            return left, None, None
+        if absorb in {"lorthog", "U", 10}:
+            return q, None, None
+        if absorb in {"rfactor", "sVH", 11}:
+            return None, None, r
+        return q, None, r
+
+    try:
+        backend = ar.infer_backend(array)
+    except (AttributeError, TypeError):
+        backend = None
+
+    # ``array_split`` calls this once per native charge block.  For the
+    # Torch path, bypassing quimb's composed linalg wrapper removes a Python
+    # dispatch layer from every block while retaining exactly the same
+    # reduced QR and the same ``stabilized=False`` policy.
+    use_torch_qr = backend == "torch"
     if ar.get_dtype_name(array) != "complex64":
+        if use_torch_qr:
+            return torch_qr(array, opts)
         return _quimb_qr_stabilized(array, **opts)
 
-    block_max = to_float(ar.do("max", ar.do("abs", array)))
+    if backend == "torch":
+        block_max = float(array.detach().abs().amax().item())
+    else:
+        block_max = to_float(ar.do("max", ar.do("abs", array)))
     if not np.isfinite(block_max) or block_max == 0.0:
         # Preserve the original failure behaviour for non-finite input, while
         # allowing genuinely empty structural sectors through unchanged.
+        if use_torch_qr:
+            return torch_qr(array, opts)
         return _quimb_qr_stabilized(array, **opts)
 
     # Values above this scale are not affected by the low-norm complex64 QR
     # failure and avoid an unnecessary multiply/divide pair.
     if block_max >= 2.0**-8:
+        if use_torch_qr:
+            return torch_qr(array, opts)
         return _quimb_qr_stabilized(array, **opts)
 
     _, exponent = np.frexp(block_max)
     scale = float(np.ldexp(1.0, -int(exponent)))
-    left, singular_values, right = _quimb_qr_stabilized(
-        array * scale, **opts,
-    )
+    if use_torch_qr:
+        left, singular_values, right = torch_qr(array * scale, opts)
+    else:
+        left, singular_values, right = _quimb_qr_stabilized(
+            array * scale, **opts,
+        )
 
     # ``absorb='left'`` is the LQ orientation: the left factor carries the
     # scale. All other QR orientations carry it in the right factor.
@@ -187,11 +235,23 @@ def _contract_two_tensors(left, right, *, shared_ind=None):
     axes = ((left.inds.index(shared_ind),), (right.inds.index(shared_ind),))
     try:
         if _is_symmray_array(left.data):
-            data = ar.do(
-                "tensordot",
-                left.data,
+            # A single shared tree bond is the hot native operation.  Fused
+            # Symmray contraction is a good general default, but on Torch CPU
+            # it first builds larger fused block views for a contraction that
+            # is already one-leg local.  Blockwise dispatch keeps the charge
+            # sectors small and avoids that temporary workspace.  CUDA/Torch
+            # and other backends retain the fused path, which usually wins by
+            # reducing the number of small kernel launches.
+            mode = "fused"
+            if getattr(left.data, "backend", None) == "torch":
+                blocks = getattr(left.data, "blocks", None)
+                sample = next(iter(blocks.values()), None) if blocks else None
+                if not bool(getattr(sample, "is_cuda", False)):
+                    mode = "blockwise"
+            data = left.data.tensordot(
                 right.data,
                 axes=axes,
+                mode=mode,
                 preserve_array=True,
             )
         else:
@@ -286,6 +346,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         "_symmetry",
         "_fermionic",
         "_physical_sectors",
+        "_work_bond_counter",
     )
 
     def __init__(self, ts=(), *, plan=None, sites=None, site_tag_id="I{}",
@@ -309,6 +370,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 self._fermionic_norm_cache = None
                 self._fermionic_norm_cache_version = 0
                 self._fermionic_norm_cache_value_version = None
+                self._work_bond_counter = getattr(ts, "_work_bond_counter", 0)
                 return
             if plan is None:
                 raise TypeError(
@@ -327,6 +389,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             self._fermionic_norm_cache = None
             self._fermionic_norm_cache_version = 0
             self._fermionic_norm_cache_value_version = None
+            self._work_bond_counter = 0
             self.validate()
             return
         super().__init__(ts, **tn_opts)
@@ -350,6 +413,22 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         # Tracked here -- surviving ``.copy()`` via ``_EXTRA_PROPS`` -- so the
         # canonical form is a property of the *state*, not of any one driver.
         self._canonical_region = None
+        self._work_bond_counter = 0
+
+    def _new_work_bond(self, kind, *nodes):
+        """Return a unique private bond label for a native decomposition.
+
+        Native QR/SVD factors are short-lived, but a routed operator bond can
+        become a live tree edge before the next hop.  A state-owned counter is
+        cheaper than generating a UUID for every factor and, because it is an
+        extra copied property, remains collision-free across TTN branches.
+        """
+        counter = int(getattr(self, "_work_bond_counter", 0))
+        self._work_bond_counter = counter + 1
+        suffix = "_".join(str(node) for node in nodes)
+        if suffix:
+            suffix = "_" + suffix
+        return f"_pepsy_{kind}_{counter}{suffix}"
 
     # -- mutation / canonical metadata --------------------------------------
 
@@ -1327,6 +1406,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             absorb="right",
             cutoff=0.0,
             get="tensors",
+            bond_ind=self._new_work_bond(
+                "canon", isometric_node, reduced_node,
+            ),
         )
         merged = _contract_two_tensors(carry, reduced, shared_ind=bond)
         isometric.modify(
@@ -1390,7 +1472,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             # tensor can be thousands by thousands even though its shared
             # bond is only O(chi).  The QR leaves a core whose right dimension
             # is the live bond, avoiding a full SVD of that large matrix.
-            reduced_bond = qtn.rand_uuid()
+            reduced_bond = self._new_work_bond(
+                "compress_qr", isometric_node, reduced_node,
+            )
             isometric_q, isometric_r = self._native_qr_split(
                 isometric,
                 left_inds=left_inds,
@@ -1400,7 +1484,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 get="tensors",
                 bond_ind=reduced_bond,
             )
-            compressed_bond = qtn.rand_uuid()
+            compressed_bond = self._new_work_bond(
+                "compress_svd", isometric_node, reduced_node,
+            )
             core_left, core_right = isometric_r.split(
                 left_inds=(reduced_bond,),
                 method="svd",
@@ -1450,7 +1536,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             right_inds = [
                 index for index in reduced_tensor.inds if index != bond
             ]
-            compressed_bond = qtn.rand_uuid()
+            compressed_bond = self._new_work_bond(
+                "compress_right", isometric_node, reduced_node,
+            )
             core_left, core_right = reduced_tensor.split(
                 left_inds=(bond,),
                 right_inds=right_inds,
@@ -1492,8 +1580,12 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             right_inds = [
                 index for index in reduced_tensor.inds if index != bond
             ]
-            left_bond = qtn.rand_uuid()
-            right_bond = qtn.rand_uuid()
+            left_bond = self._new_work_bond(
+                "compress_left", isometric_node, reduced_node,
+            )
+            right_bond = self._new_work_bond(
+                "compress_right_qr", isometric_node, reduced_node,
+            )
             isometric_q, isometric_r = self._native_qr_split(
                 isometric,
                 left_inds=left_inds,

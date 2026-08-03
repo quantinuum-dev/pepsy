@@ -3217,6 +3217,46 @@ def test_tree_public_submpo_and_pauli_backend_operations():
     )
 
 
+def test_tree_two_site_numpy_mpo_is_coerced_to_cupy_state_backend():
+    """Two-site MPO factors follow a CuPy TTN without mutating the MPO."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        if cupy.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("CuPy is installed without a CUDA device.")
+    except cupy.cuda.runtime.CUDARuntimeError as exc:
+        pytest.skip(f"CuPy CUDA runtime unavailable: {exc}")
+
+    n = 4
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    state = TreeTensorNetwork.from_plan(plan)
+    state.apply_to_arrays(
+        lambda array: cupy.asarray(array, dtype=cupy.complex64)
+    )
+    x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)
+    mpo = qtn.MatrixProductOperator.from_dense(
+        np.kron(x, x), dims=(2, 2), sites=(0, 1), L=n,
+    )
+    before = [tensor.data.copy() for tensor in mpo.tensors]
+    opt = TreeOptimizer(
+        None, state=state, tree=plan, chi=8, cutoff=0.0, run=False,
+    )
+
+    with pytest.warns(UserWarning, match="converting a gate/operator payload"):
+        opt.apply_submpo(mpo, (0, 1))
+
+    assert opt.backend_info() == {
+        "backend": "cupy",
+        "dtype": "complex64",
+        "device": str(cupy.cuda.Device()),
+    }
+    expected = np.zeros(2**n, dtype=np.complex64)
+    expected[12] = 1.0  # X_0 X_1 |0000> = |1100>
+    np.testing.assert_allclose(opt.to_dense(), expected, atol=1e-5)
+    assert opt.tn.validate() is opt.tn
+    for tensor, original in zip(mpo.tensors, before):
+        np.testing.assert_array_equal(tensor.data, original)
+
+
 def test_tree_expectation_mpo_is_batched_and_non_mutating():
     """A structured MPO expectation uses one tree pass and preserves state."""
     h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
@@ -3272,13 +3312,16 @@ def test_tree_profile_report_is_opt_in():
         dtype=complex,
     )
     quiet = TreeOptimizer([(x, 0)], n=4, chi=4)
-    assert quiet.profile_report() == {
-        "enabled": False,
-        "events": [],
-        "by_kind": {},
-        "native_compression_routes": {},
-        "total_seconds": 0.0,
-    }
+    quiet_report = quiet.profile_report()
+    assert quiet_report["enabled"] is False
+    assert quiet_report["events"] == []
+    assert quiet_report["by_kind"] == {}
+    assert quiet_report["native_compression_routes"] == {}
+    assert quiet_report["update_seconds"] == 0.0
+    assert quiet_report["total_seconds"] == 0.0
+    assert quiet_report["timing_semantics"][
+        "total_seconds_is_sum_of_events_not_wall_time"
+    ] is True
 
     profiled = TreeOptimizer(
         [(x, 0), (cnot, (0, 3))], n=4, chi=4, profile=True,
@@ -3288,6 +3331,11 @@ def test_tree_profile_report_is_opt_in():
     assert report["events"]
     assert report["by_kind"]["update"]["count"] == 2
     assert report["native_compression_routes"] == {}
+    assert report["by_kind"]["gate_factorization"]["count"] == 1
+    assert report["by_kind"]["tensor_absorption"]["count"] >= 2
+    assert report["by_kind"]["metadata_path"]["count"] == 1
+    assert report["by_kind"]["center_movement"]["count"] >= 1
+    assert report["update_seconds"] == report["by_kind"]["update"]["seconds"]
     assert report["total_seconds"] > 0.0
 
 
