@@ -2195,7 +2195,7 @@ class TreeOptimizer:
     def _record_transient_bond(self, dimension, *, phase, edge=None):
         """Record one potentially transient bond dimension for the update."""
         active = self._active_update
-        if active is None:
+        if active is None or not self.track_bond_diagnostics:
             return
         dimension = int(dimension)
         previous = active["transient_max_bond"]
