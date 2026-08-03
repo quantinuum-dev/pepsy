@@ -25,6 +25,7 @@ or an iterable ``max_arity`` to request another geometry.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from importlib import import_module
 from numbers import Integral
 
 import autoray as ar
@@ -202,7 +203,7 @@ def _normalize_layout_order(order):
 def _nevergrad_available():
     """Return whether the optional Nevergrad dependency can be imported."""
     try:
-        import nevergrad  # pylint: disable=import-outside-toplevel,unused-import
+        import_module("nevergrad")
     except ImportError:
         return False
     return True
