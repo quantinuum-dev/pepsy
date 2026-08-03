@@ -44,9 +44,9 @@ jobs:
       - name: Validate source syntax
         run: python -m compileall -q -f src tests
       - name: Check Python lint
-        run: |
-          python -m pyflakes src/pepsy tests
-          python -m ruff check src/pepsy tests
+        # Ruff's F rules cover the Pyflakes checks and honor noqa markers for
+        # intentional lazy, type-only, and compatibility exports.
+        run: python -m ruff check src/pepsy tests
       - name: Run tests with coverage
         if: matrix.python-version == '3.12' && matrix.profile == 'core'
         run: pytest -q --cov=pepsy --cov-report=term-missing
