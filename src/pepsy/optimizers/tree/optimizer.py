@@ -5554,11 +5554,14 @@ class TreeOptimizer:
         Timing is deliberately kept separate from truncation history so the
         normal replay and diagnostic APIs remain unchanged. In addition to
         update and compression events, two-site direct routing reports each
-        exact QR ``thread_hop`` separately. The returned ``events`` list is a
-        deep copy and can safely be serialized alongside a benchmark result.
+        exact QR ``thread_hop`` separately. Native compression events also
+        identify whether the reduced graded QR/SVD route or the conservative
+        full two-node SVD was selected. The returned ``events`` list is a deep
+        copy and can safely be serialized alongside a benchmark result.
         """
         events = deepcopy(self.profile_events)
         grouped = {}
+        native_routes = {}
         for event in events:
             kind = str(event.get("kind", "unknown"))
             summary = grouped.setdefault(
@@ -5566,10 +5569,14 @@ class TreeOptimizer:
             )
             summary["count"] += 1
             summary["seconds"] += float(event.get("seconds", 0.0))
+            if kind == "native_compression_route":
+                route = str(event.get("route", "unknown"))
+                native_routes[route] = native_routes.get(route, 0) + 1
         return {
             "enabled": self.profile,
             "events": events,
             "by_kind": grouped,
+            "native_compression_routes": native_routes,
             "total_seconds": float(
                 sum(float(event.get("seconds", 0.0)) for event in events)
             ),

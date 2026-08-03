@@ -242,6 +242,11 @@ timed `thread_hop`, `edge_canonize`, and `edge_compress` events. The
 `thread_hop` events are the exact, lossless QR carry moves; `edge_compress`
 events are the truncating SVD work. These timings are nested inside the
 per-update envelope and should not be added as independent wall-clock totals.
+For native Symmray compression, `profile_report()` also returns
+`native_compression_routes`: counts of `one_sided_left`, `one_sided_right`, and
+`two_sided_reduced` show that the graded reduced-core paths are active, while
+`full_svd_fallback` identifies a conservative complete two-node SVD. Route
+records have zero duration; use the enclosing `edge_compress` event for timing.
 
 For a dimension-level report, also pass
 `track_bond_diagnostics=True`. `bond_diagnostic_report()` then records

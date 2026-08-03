@@ -3276,6 +3276,7 @@ def test_tree_profile_report_is_opt_in():
         "enabled": False,
         "events": [],
         "by_kind": {},
+        "native_compression_routes": {},
         "total_seconds": 0.0,
     }
 
@@ -3286,6 +3287,7 @@ def test_tree_profile_report_is_opt_in():
     assert report["enabled"] is True
     assert report["events"]
     assert report["by_kind"]["update"]["count"] == 2
+    assert report["native_compression_routes"] == {}
     assert report["total_seconds"] > 0.0
 
 
@@ -5300,6 +5302,48 @@ def test_native_one_sided_compression_qr_reduces_before_svd(monkeypatch):
 
     assert [method for method, _shape in split_methods] == ["qr", "svd"]
     assert ttn.validate(check_canonical=True) is ttn
+
+
+def test_native_profile_reports_reduced_compression_routes():
+    """Native profiling exposes reduced compression and no hidden fallback."""
+    pytest.importorskip("symmray")
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        dtype="complex128",
+    )
+    plan = TreePlan.from_order(range(4), structure="balanced")
+    state = pepsy.ps_to_ttn(
+        4,
+        tree=plan,
+        fermion=fermion,
+        occupations=((1, 0), (0, 1), (1, 0), (0, 1)),
+        dtype="complex128",
+    )
+    hopping = fermion.hopping_gate(0.05, t=1.0, imaginary=False)
+    optimizer = TreeOptimizer(
+        None,
+        n=4,
+        tree=plan,
+        state=state,
+        chi=1,
+        cutoff=0.0,
+        mode="direct",
+        profile=True,
+        run=False,
+    )
+
+    optimizer.apply_2q(hopping, 0, 2)
+    report = optimizer.profile_report()
+    routes = report["native_compression_routes"]
+
+    assert routes
+    assert routes.get("full_svd_fallback", 0) == 0
+    assert sum(
+        count for route, count in routes.items()
+        if route != "full_svd_fallback"
+    ) == report["by_kind"]["native_compression_route"]["count"]
+    assert optimizer.tn.validate(check_canonical=True) is optimizer.tn
 
 
 @pytest.mark.parametrize(

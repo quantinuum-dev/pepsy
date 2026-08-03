@@ -1281,6 +1281,30 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         kwargs.setdefault("method", "qr")
         return tensor.split(**kwargs)
 
+    def _record_native_compression_route(
+        self, route, *, edge, before_bond, reduction_hint, reduction_proven,
+    ):
+        """Record which native compression decomposition was used.
+
+        Route records are attached to the existing opt-in profile sink, so
+        ordinary replay does not allocate diagnostic dictionaries or perform
+        any timing work.  The records deliberately describe decomposition
+        selection rather than timing: the surrounding ``edge_compress`` event
+        remains the authoritative duration measurement.
+        """
+        profile_sink = getattr(self, "_profile_sink", None)
+        if profile_sink is None:
+            return
+        profile_sink.append({
+            "kind": "native_compression_route",
+            "route": route,
+            "edge": tuple(edge),
+            "before_bond": int(before_bond),
+            "reduced": reduction_hint,
+            "reduction_proven": bool(reduction_proven),
+            "seconds": 0.0,
+        })
+
     # -- edge-level canonical / compression helpers ---------------------------
 
     def _fermionic_canonize_edge_(self, a, b, absorb):
@@ -1342,6 +1366,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         isometric = self.node_tensor(isometric_node)
         reduced_tensor = self.node_tensor(reduced_node)
         bond = self.bond(isometric_node, reduced_node)
+        before_bond = int(self.ind_size(bond))
         left_inds = [index for index in isometric.inds if index != bond]
 
         # ``reduced="left"`` is the metadata value emitted by the optimizer
@@ -1400,6 +1425,13 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 inds=merged.inds,
                 left_inds=None,
             )
+            self._record_native_compression_route(
+                "one_sided_left",
+                edge=(a, b),
+                before_bond=before_bond,
+                reduction_hint=reduction_hint,
+                reduction_proven=reduction_proven,
+            )
             return self
 
         if (
@@ -1442,6 +1474,13 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 data=core_right.data,
                 inds=core_right.inds,
                 left_inds=None,
+            )
+            self._record_native_compression_route(
+                "one_sided_right",
+                edge=(a, b),
+                before_bond=before_bond,
+                reduction_hint=reduction_hint,
+                reduction_proven=reduction_proven,
             )
             return self
 
@@ -1500,6 +1539,13 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 inds=reduced_compressed.inds,
                 left_inds=None,
             )
+            self._record_native_compression_route(
+                "two_sided_reduced",
+                edge=(a, b),
+                before_bond=before_bond,
+                reduction_hint=reduction_hint,
+                reduction_proven=reduction_proven,
+            )
             return self
 
         # Keep the old complete graded split as a compatibility fallback for
@@ -1524,6 +1570,13 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             data=remainder.data,
             inds=remainder.inds,
             left_inds=None,
+        )
+        self._record_native_compression_route(
+            "full_svd_fallback",
+            edge=(a, b),
+            before_bond=before_bond,
+            reduction_hint=reduction_hint,
+            reduction_proven=reduction_proven,
         )
         return self
 
