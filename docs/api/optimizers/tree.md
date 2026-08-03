@@ -235,6 +235,28 @@ fidelity was 0.590; at χ=64 this measures different truncation histories on
 the two geometries, not a QR gauge error. Compare observables or increase χ
 when using this number as an accuracy diagnostic.
 
+#### QR/hop and bond-growth diagnostics
+
+Construct `TreeOptimizer(..., profile=True)` to split the update envelope into
+timed `thread_hop`, `edge_canonize`, and `edge_compress` events. The
+`thread_hop` events are the exact, lossless QR carry moves; `edge_compress`
+events are the truncating SVD work. These timings are nested inside the
+per-update envelope and should not be added as independent wall-clock totals.
+
+For a dimension-level report, also pass
+`track_bond_diagnostics=True`. `bond_diagnostic_report()` then records
+`transient_max_bond` during routing/factorization and `live_max_bond_after`
+after the compression sweep. The former may exceed `chi` by the gate's
+operator-Schmidt rank; the latter is the enforced live-state cap. The extra
+live maximum scans are opt-in so ordinary replay retains its default cost.
+
+For deterministic small-system fidelity checks, use `norm()` for the
+canonical local norm and compare `to_dense()` with an independently replayed
+NumPy statevector using a fixed gate stream. This avoids making a restricted
+Cotengra overlap path the correctness oracle. A Tree/MPS overlap remains a
+useful comparative accuracy diagnostic, but it includes both layouts'
+different truncation histories.
+
 ## Range / subtree canonicalisation
 
 The single orthogonality centre generalises to a connected **canonical region**
@@ -343,8 +365,9 @@ The default replay configuration is intended for production evolution:
 `mode="auto"` uses the direct routed two-site kernel, `threads=1` avoids
 oversubscribing the small tree contractions, `subtree_workers=1` keeps the
 serial path allocation-free, `profile=False` avoids timing overhead, and
-`track_truncation=False` avoids full-spectrum diagnostic SVDs. `record_history`
-and `track_infidelity` retain the established API defaults; the latter only
+`track_truncation=False` avoids full-spectrum diagnostic SVDs, while
+`track_bond_diagnostics=False` avoids live-bond scans. `record_history` and
+`track_infidelity` retain the established API defaults; the latter only
 adds norm-based progress readouts when a progress bar is requested.
 
 Warnings are reserved for an actionable behavior change: enabling
