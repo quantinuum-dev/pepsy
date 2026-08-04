@@ -662,6 +662,17 @@ class PepsEnergyOptimizer:
         self._prepare_autodiff_backend(autodiff_backend)
         incoming_constants = dict(loss_constants or {})
         terms = incoming_constants.pop("terms", self.terms)
+        if str(autodiff_backend).strip().lower() == "torch":
+            # Symmray sends raw Torch blocks through Quimb's composed split
+            # drivers. Those drivers bypass Autoray's ordinary linalg
+            # registrations, so install the matching stable block rules too.
+            from ...backends.linalg_torch import (  # pylint: disable=import-outside-toplevel
+                reg_quimb_torch_split_drivers,
+            )
+
+            dtype_name = self._autodiff_dtype_name(self.state, terms)
+            mode = "complex" if "complex" in str(dtype_name).lower() else "real"
+            reg_quimb_torch_split_drivers(mode=mode)
         constants = {
             "terms": self._terms_for_autodiff_backend(
                 terms,

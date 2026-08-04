@@ -131,6 +131,25 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
 
     def cast_array(x, device=device, dtype=dtype, requires_grad=requires_grad):
 
+        # Symmray can use complex NumPy containers for real-valued blocks. If
+        # their imaginary part is identically zero, remove it before asking
+        # Torch for a real tensor. This preserves the requested float64 path
+        # without emitting Torch's misleading "discards the imaginary part"
+        # warning. Non-zero imaginary parts retain the historical conversion
+        # behavior below.
+        target_is_real = (
+            dtype is not None
+            and not torch.empty((), dtype=dtype).is_complex()
+        )
+        if target_is_real:
+            if isinstance(x, torch.Tensor):
+                if x.is_complex() and not bool(torch.any(x.imag != 0)):
+                    x = x.real
+            elif np.iscomplexobj(x):
+                x_np = np.asarray(x)
+                if not np.any(x_np.imag != 0):
+                    x = x_np.real
+
         if isinstance(x, torch.Tensor):
             out = x.detach() if requires_grad else x
 
@@ -333,7 +352,10 @@ def register_torch_linalg(
         Select the real or complex stabilized rule when ``stabilized=True``.
     stabilized : bool, default=False
         Keep native Torch SVD/QR by default. Set this to ``True`` to install
-        Pepsy's relative-regularized SVD and validated real-QR rules.
+        Pepsy's relative-regularized SVD and validated real-QR rules. The
+        Quimb block-split drivers used by Symmray PEPS are installed by
+        ``PepsEnergyOptimizer`` after the state is prepared, so simple-update
+        forward decompositions are not changed by this global registration.
     qr_rank_policy : {"warn", "native", "error"}, default="warn"
         Response to rank-deficient inputs when stabilized real QR is active.
     qr_rank_tol_factor : float, default=1.0
@@ -414,6 +436,7 @@ def reset_linalg_registrations(backend="all"):
             from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
             lr.reset_torch_linalg_registrations()
+            lr.reset_quimb_torch_split_drivers()
 
     if backend in {"jax", "all"}:
         try:
