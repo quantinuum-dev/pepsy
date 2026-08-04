@@ -3278,6 +3278,72 @@ def test_tree_expectation_mpo_is_batched_and_non_mutating():
     assert opt.tn.validate(check_canonical=True) is opt.tn
 
 
+def test_tree_expectation_mpo_reports_private_ket_truncation():
+    """Expectation diagnostics expose accidental finite-cap truncation."""
+    identity = np.eye(4, dtype=complex)
+    mpo = qtn.MatrixProductOperator.from_dense(
+        identity, dims=(2, 2), sites=(0, 1), L=4,
+    )
+    h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer([(h, 0), (cnot, (0, 1))], n=4, chi=16)
+
+    with pytest.warns(UserWarning, match="private transformed ket"):
+        value, diagnostics = opt.expectation_mpo(
+            mpo, (0, 1), max_bond=1, return_diagnostics=True,
+        )
+
+    assert diagnostics["truncated"] is True
+    assert diagnostics["n_truncated"] >= 1
+    assert diagnostics["max_bond"] == 1
+    assert value != pytest.approx(1.0)
+
+    exact_value, exact_diagnostics = opt.expectation_mpo(
+        mpo, (0, 1), max_bond=16, return_diagnostics=True,
+    )
+    assert exact_value == pytest.approx(1.0)
+    assert exact_diagnostics["truncated"] is False
+
+
+def test_tree_exact_mpo_expectation_keeps_mpo_separate(monkeypatch):
+    """Exact MPO readout does not lower or compress the tree state."""
+    identity = np.eye(4, dtype=complex)
+    mpo = qtn.MatrixProductOperator.from_dense(
+        identity, dims=(2, 2), sites=(0, 1), L=4,
+    )
+    h = np.array([[1.0, 1.0], [1.0, -1.0]], dtype=complex) / np.sqrt(2.0)
+    cnot = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0]],
+        dtype=complex,
+    )
+    opt = TreeOptimizer([(h, 0), (cnot, (0, 1))], n=4, chi=1)
+    before = opt.to_dense().copy()
+    before_bond = opt.tn.max_bond()
+
+    def forbid_dense(*args, **kwargs):
+        raise AssertionError("exact MPO readout must not call MPO.to_dense()")
+
+    monkeypatch.setattr(qtn.MatrixProductOperator, "to_dense", forbid_dense)
+    value = opt.expectation_mpo_exact(mpo, (0, 1))
+
+    assert value == pytest.approx(1.0)
+    assert opt.tn.max_bond() == before_bond
+    assert np.allclose(opt.to_dense(), before)
+
+
+def test_tree_rejects_native_mpo_on_dense_state():
+    """Native and ordinary tensor backends cannot be mixed silently."""
+    class NativeMarker:
+        pepsy_tree_native = True
+
+    opt = TreeOptimizer(None, n=2, run=False)
+    with pytest.raises(TypeError, match="native Symmray MPO"):
+        opt.apply_submpo(NativeMarker(), (0, 1))
+
+
 def test_tree_subtree_route_batches_sibling_messages(monkeypatch):
     """Independent leaf messages landing at one node use one contraction."""
     n = 4

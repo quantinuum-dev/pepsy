@@ -40,6 +40,7 @@ from __future__ import annotations
 import contextlib
 from copy import deepcopy
 import heapq
+import inspect
 from numbers import Integral
 import time
 import warnings
@@ -159,6 +160,25 @@ def _is_symmray_array(array):
         return ar.infer_backend(array) == "symmray"
     except Exception:  # pragma: no cover - defensive backend inference
         return False
+
+
+def _submpo_is_native(submpo):
+    """Return whether an MPO visibly contains native Symmray tensors.
+
+    ``tree_mpo`` records this explicitly, while ordinary Quimb MPOs are
+    inspected as a fallback. ``None`` means that the payload does not expose
+    enough information to classify it without materialising it.
+    """
+    marker = getattr(submpo, "pepsy_tree_native", None)
+    if marker is not None:
+        return bool(marker)
+    tensors = getattr(submpo, "tensors", None)
+    if tensors is None:
+        return None
+    try:
+        return any(_is_symmray_array(tensor.data) for tensor in tensors)
+    except (AttributeError, TypeError):
+        return None
 
 
 def _array_backend_signature(array):
@@ -3759,6 +3779,35 @@ class TreeOptimizer:
                 "seconds": time.perf_counter() - profile_started,
             })
 
+    def _compress_edge_compat(
+        self, u, v, *, max_bond=None, cutoff=None, reduced=True,
+        reduction_proven=False,
+    ):
+        """Call the compression hook while supporting older overrides.
+
+        Tree stabilizer and diagnostic integrations can wrap the private
+        compression hook. Keep wrappers with the older signature working
+        while the built-in hook receives the proof flag.
+        """
+        method = self._compress_edge_with_diagnostics
+        try:
+            parameters = inspect.signature(method).parameters.values()
+            supports_proof = any(
+                parameter.name == "reduction_proven"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_proof = True
+        kwargs = {
+            "max_bond": max_bond,
+            "cutoff": cutoff,
+            "reduced": reduced,
+        }
+        if supports_proof:
+            kwargs["reduction_proven"] = reduction_proven
+        return method(u, v, **kwargs)
+
     def _metadata_aware_reduction(self, u, v):
         """Choose one-sided compression when ``v`` is proven isometric.
 
@@ -3824,7 +3873,7 @@ class TreeOptimizer:
                     cutoff=cutoff,
                 )
             reduced, reduction_proven = "left", True
-            self._compress_edge_with_diagnostics(
+            self._compress_edge_compat(
                 v, u, max_bond=max_bond, cutoff=edge_cutoff,
                 reduced=reduced, reduction_proven=reduction_proven,
             )
@@ -3870,7 +3919,7 @@ class TreeOptimizer:
                 reduced, reduction_proven = self._edge_reduction(
                     node, child, max_bond=max_bond, cutoff=child_cutoff,
                 )
-                self._compress_edge_with_diagnostics(
+                self._compress_edge_compat(
                     node,
                     child,
                     max_bond=max_bond,
@@ -4090,6 +4139,20 @@ class TreeOptimizer:
         self._invalidate_state_norm_cache()
         logical_where = _normalize_where(where)
         where = self._validate_support(logical_where)
+        payload_native = _submpo_is_native(submpo)
+        state_native = bool(getattr(self.tn, "fermionic", False))
+        if payload_native is not None and payload_native != state_native:
+            if state_native:
+                raise TypeError(
+                    "native fermionic TreeTensorNetwork requires a native "
+                    "Symmray MPO. Build it with tree_mpo(..., fermionic=True) "
+                    "or supply a model-native MPO."
+                )
+            raise TypeError(
+                "a native Symmray MPO cannot be applied to an ordinary dense "
+                "TreeTensorNetwork. Use fermionic=False for the explicit "
+                "Jordan--Wigner compatibility MPO."
+            )
         return self._apply_submpo_resolved(
             submpo, where, logical_where=logical_where,
             max_bond=max_bond, cutoff=cutoff,
@@ -4097,7 +4160,8 @@ class TreeOptimizer:
 
     def expectation_mpo(
         self, submpo, where, *, max_bond=None, cutoff=0.0,
-        normalized=True, optimize="auto",
+        normalized=True, optimize="auto", warn_on_truncation=True,
+        return_diagnostics=False,
     ):
         """Evaluate ``<psi|MPO|psi>`` through one structured tree-MPO pass.
 
@@ -4107,16 +4171,62 @@ class TreeOptimizer:
         defaults to this optimizer's ``chi``; pass a larger cap when the
         operator application must retain more of the exact MPO-transformed
         state.  ``cutoff=0.0`` is the default because this is a measurement,
-        not a variational update.
+        not a variational update. A finite ``max_bond`` can still truncate if
+        the transformed ket exceeds that cap. Such truncation emits a
+        ``UserWarning`` by default; set ``warn_on_truncation=False`` only when
+        that approximation is intentional. Set ``return_diagnostics=True`` to
+        receive ``(value, diagnostics)`` with the compression events from this
+        expectation only.
         """
+        if not isinstance(warn_on_truncation, bool):
+            raise TypeError("warn_on_truncation must be a bool.")
+        if not isinstance(return_diagnostics, bool):
+            raise TypeError("return_diagnostics must be a bool.")
+        logical_where = _normalize_where(where)
+        effective_max_bond = (
+            self.chi
+            if max_bond is None
+            else self._normalize_max_bond(max_bond)
+        )
+        effective_cutoff = (
+            self.cutoff if cutoff is None else float(cutoff)
+        )
+        if effective_cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative.")
+        plan_order = getattr(submpo, "pepsy_tree_order", None)
+        if plan_order is not None and tuple(plan_order) != self.plan.mpo_order():
+            warnings.warn(
+                "the structured MPO was built for tree MPO order "
+                f"{tuple(plan_order)!r}, while this state uses "
+                f"{self.plan.mpo_order()!r}; the value remains logically "
+                "valid, but the MPO is not layout-optimized for this tree.",
+                UserWarning,
+                stacklevel=2,
+            )
         event_start = len(self.profile_events)
         work = self.copy()
+        history_start = len(work.truncation_history)
         work.apply_submpo(
             submpo,
-            where,
+            logical_where,
             max_bond=max_bond,
-            cutoff=cutoff,
+            cutoff=effective_cutoff,
         )
+        compression_events = work.truncation_history[history_start:]
+        truncated_events = [
+            event for event in compression_events
+            if event.get("truncated", False)
+        ]
+        if truncated_events and warn_on_truncation:
+            warnings.warn(
+                "expectation_mpo compressed its private transformed ket on "
+                f"{len(truncated_events)} edge(s) with max_bond="
+                f"{effective_max_bond!r}; the expectation is approximate. "
+                "Increase max_bond or inspect return_diagnostics=True if "
+                "an untruncated measurement is required.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # The bra and ket are separate TTNs. Keep their physical indices shared
         # for the inner product, but rename the ket's virtual bonds so each
@@ -4143,7 +4253,37 @@ class TreeOptimizer:
             self.profile_events.extend(
                 deepcopy(work.profile_events[event_start:])
             )
-        return result
+        if not return_diagnostics:
+            return result
+        diagnostics = {
+            "support": tuple(logical_where),
+            "max_bond": effective_max_bond,
+            "cutoff": effective_cutoff,
+            "n_events": len(compression_events),
+            "n_truncated": len(truncated_events),
+            "truncated": bool(truncated_events),
+            "events": deepcopy(compression_events),
+        }
+        return result, diagnostics
+
+    def expectation_mpo_exact(
+        self, submpo, where, *, normalized=True, optimize="auto",
+    ):
+        """Evaluate an MPO by exact separate-network contraction.
+
+        Unlike :meth:`expectation_mpo`, this method never applies the MPO to a
+        copied tree and never compresses a state bond. It delegates to
+        :meth:`TreeTensorNetwork.expectation_mpo_exact`, which connects the
+        MPO input legs to a private ket view and its output legs to the bra in
+        one complete doubled contraction. Native fermionic MPOs therefore
+        retain Symmray's graded contraction rules.
+        """
+        return self.tn.expectation_mpo_exact(
+            submpo,
+            where,
+            normalized=normalized,
+            optimize=optimize,
+        )
 
     def _apply_submpo_resolved(self, submpo, where, *, max_bond=None,
                                cutoff=None, logical_where=None):

@@ -46,6 +46,113 @@ structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
 the site fixed at the root while its path, Steiner, congestion, greedy, and
 Nevergrad objectives permute only the remaining leaf sites.
 
+### Layout-aware native MPOs
+
+After selecting a plan, build a Hamiltonian MPO in the plan's logical tree
+order with `plan.to_mpo(...)` or `tree_mpo(plan, hamiltonian)`. The default is
+the native graded Symmray path, including `U1FermionicArray` and
+`U1U1FermionicArray` tensors:
+
+```python
+from pepsy import Fermion
+from pepsy.optimizers.tree import TreeLayoutFinder, tree_mpo
+
+finder = TreeLayoutFinder(gates, n=8, max_arity=2)
+plan = finder.run(order="quality")
+fermion = Fermion(spinful=True, symmetry="U1U1")
+hamiltonian = fermion.hamiltonian(edges, t=1.0, U=2.0, mu=0.1)
+
+mpo = tree_mpo(plan, hamiltonian)  # fermionic=True by default
+# equivalent:
+# mpo = plan.to_mpo(hamiltonian)
+energy = opt.tn.expectation_mpo_exact(mpo, range(plan.n))
+```
+
+For the operator-level API, use `TreeMPO` (or
+`fermion.to_tree_mpo(...)`). It exposes both representations without mixing
+their tensor-network geometries:
+
+```python
+from pepsy import Fermion
+
+tree_operator = fermion.to_tree_mpo(
+    hamiltonian=hamiltonian,
+    tree=plan,
+    compress=True,
+)
+chain_operator = tree_operator.chain_mpo       # optional linear MPO
+energy = tree_operator.expectation(opt.tn)      # TreePlan-native readout
+```
+
+`TreeMPO.from_terms(plan, dense_terms)` provides the corresponding ordinary
+dense backend. Native fermionic `TreeMPO` objects retain Symmray arrays for
+U1, U1U1, and other supported symmetries; dense and native operators are not
+silently mixed with incompatible tree states.
+
+For an exact native readout that keeps the chain MPO separate, use
+`expectation_mpo_exact` as above. The general `expectation_mpo` API remains
+available for an explicitly approximate structured-MPO application: it uses a
+private transformed copy of the TTN. Routing itself is lossless, but the final
+subtree sweep may compress that copy when an MPO increases a bond beyond
+`max_bond`; `cutoff=0.0` does not disable a finite bond cap. The default
+`warn_on_truncation=True` reports this approximation, and the diagnostic form
+makes it easy to check a benchmark:
+
+```python
+energy, report = opt.tn.expectation_mpo(
+    mpo,
+    range(plan.n),
+    max_bond=64,
+    cutoff=0.0,
+    return_diagnostics=True,
+)
+assert not report["truncated"]
+```
+
+Use a larger `max_bond` when an untruncated measurement is required. Native
+fermionic trees also reject ordinary dense MPOs (and dense trees reject native
+Symmray MPOs) instead of silently changing the fermionic interpretation.
+
+For an exact readout that does not move the MPO into the tree at all, use
+`expectation_mpo_exact`:
+
+```python
+energy = opt.tn.expectation_mpo_exact(
+    mpo,
+    range(plan.n),
+)
+```
+
+The same method is available directly as `opt.expectation_mpo_exact(...)`.
+
+This keeps the bra, ket, and structured MPO as separate networks. Fresh ket
+physical indices connect to the MPO input legs, the MPO output legs connect to
+the bra, and Quimb contracts the complete doubled network. No state-bond
+compression or `to_dense()` lowering occurs. Native Symmray MPOs retain their
+graded contraction and fermionic sign rules.
+
+`TreePlan.mpo_order()` is the structural leaf-position order chosen by the
+plan; a physical `root_qubit`, when present, is placed first. The helper
+constructs the chain MPO in that one-dimensional order, then restores the
+physical labels to their logical qubit numbers. It returns the ordinary Quimb
+MPO for compatibility, while exact native readout uses the separate
+TreePlan-aware embedding attached by the builder.
+
+`TreeMPO` is the tree-routed operator class. Its optional `chain_mpo` remains a
+linear MPO for MPS workflows, while `tree_networks` contains the
+TreePlan-labelled operator networks used by `expectation`. Native neutral
+terms are factorized directly from their native Symmray operator tensor over
+the term's TreePlan Steiner subtree, then amalgamated into one charge-aware
+direct-sum TTNO. This applies to one-, two-, and higher-site native terms; it
+does not create a hyperedge for the normal Hamiltonian path. The resulting
+TTNO can be canonicalized and compressed with
+`tree_operator.canonicalize()` and
+`tree_operator.compress(cutoff=..., max_bond=...)`; no Jordan--Wigner
+conversion is used. Structured observables can use a smaller compact TTNO.
+Pass `fermionic=False` only for dense ordinary/Jordan--Wigner-compatible terms.
+Existing `OneDMap` lattice maps remain unchanged and should continue to be used
+for regular 2D/3D coordinate layouts.
+
 The conventional binary TTN with a three-leg top tensor is the default when
 there are at least three leaves and no `root_qubit`. Pass
 `max_arity=2, top_arity=3` explicitly to `TreePlan.from_order`,

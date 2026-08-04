@@ -386,6 +386,41 @@ interface use the dense `to_dense()` fallback and remain subject to
   `updates` group edge events by support and include cumulative relative loss,
   analogous to the MPS infidelity trace.
 
+### Tree-native MPO API
+
+When the consumer is a `TreeTensorNetwork`, `TreeMPO` is the primary operator
+API. Use `TreePlan.to_tree_mpo(...)` or
+`Fermion.to_tree_mpo(..., tree=plan)`:
+
+```python
+tree_operator = fermion.to_tree_mpo(
+    hamiltonian=hamiltonian,
+    tree=plan,
+    compress=True,
+)
+energy = tree_operator.expectation(tree)
+# equivalent exact readout through the state API:
+energy = tree.expectation_mpo_exact(tree_operator, range(plan.n))
+```
+
+`tree_operator.chain_mpo` is optional compatibility data for ordinary MPS/MPO
+workflows. `TreePlan.to_mpo(...)` and `tree_mpo(...)` return that regular chain
+MPO and attach the `TreeMPO`; they do not change the tree contraction route.
+The chain MPO must not be moved into the tree, densified, or compressed as a
+state update for exact tree measurement.
+
+For native fermionic Hamiltonians, one-, two-, and higher-site neutral terms
+are fused and factorized from their native Symmray operator tensor over the
+TreePlan Steiner subtree, then amalgamated into one charge-aware direct-sum
+TTNO. This is the normal general-term route and is canonicalizable/compressible;
+it is not a list of ordinary hyperedges. Structured observables may select a
+smaller dedicated TTNO, such as the four-state eta-pair endpoint automaton.
+`TreeMPO.canonicalize()` performs lossless native QR gauge fixing and
+`TreeMPO.compress(cutoff=..., max_bond=...)` performs native graded SVD
+truncation. Native operator QR uses the same centralized
+`_native_qr_split_tensor` policy as tree-state QR, including the
+`stabilized=False` structural-zero safeguard for Symmray arrays.
+
 ## Noisy trajectory replay
 
 `run_trajectory_shots` and `run_coalesced_trajectory_shots` support

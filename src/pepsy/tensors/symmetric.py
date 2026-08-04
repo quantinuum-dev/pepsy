@@ -10404,6 +10404,84 @@ class Fermion:
             to_backend=to_backend,
         )
 
+    def to_tree_mpo(
+        self,
+        terms_or_edges=None,
+        *,
+        hamiltonian=None,
+        tree=None,
+        plan=None,
+        max_bond=None,
+        cutoff=1e-12,
+        compress=True,
+        dtype=None,
+        fermionic=True,
+        charge_sectors=False,
+        to_backend=None,
+        **params,
+    ):
+        """Build a :class:`pepsy.TreeMPO` for a selected ``TreePlan``.
+
+        ``tree`` and ``plan`` are aliases.  The returned object exposes the
+        optional linear representation as ``.chain_mpo`` and the TreePlan
+        representation through ``.tree_networks`` and ``.expectation``.
+        Native ``fermionic=True`` keeps Symmray's graded tensors intact for
+        U1, U1U1, and other supported symmetries.
+        """
+        if tree is not None and plan is not None:
+            raise TypeError("pass only one of tree= or plan=")
+        plan = tree if tree is not None else plan
+        if plan is None:
+            raise TypeError("to_tree_mpo requires tree= or plan=.")
+        if hamiltonian is not None:
+            if terms_or_edges is not None:
+                raise TypeError(
+                    "Pass either terms_or_edges or hamiltonian, not both."
+                )
+            if not isinstance(hamiltonian, SymHamiltonian):
+                raise TypeError("hamiltonian must be a SymHamiltonian instance.")
+            target = hamiltonian
+        elif isinstance(terms_or_edges, SymHamiltonian):
+            target = terms_or_edges
+        else:
+            if terms_or_edges is None:
+                raise TypeError(
+                    "to_tree_mpo requires terms_or_edges or hamiltonian."
+                )
+            target = self.hamiltonian(
+                terms_or_edges,
+                to_backend=to_backend,
+                **params,
+            )
+            params = {}
+        if params:
+            names = ", ".join(sorted(params))
+            raise TypeError(
+                "Model parameters cannot be supplied with an existing "
+                f"SymHamiltonian: {names}."
+            )
+        from ..optimizers.tree import tree_mpo
+
+        built = tree_mpo(
+            plan,
+            target,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            compress=compress,
+            dtype=dtype,
+            fermionic=fermionic,
+            charge_sectors=charge_sectors,
+            to_backend=to_backend,
+        )
+        if isinstance(built, dict):
+            return {
+                charge: mpo.pepsy_tree_operator
+                for charge, mpo in built.items()
+            }
+        return built.pepsy_tree_operator
+
+    build_tree_mpo = to_tree_mpo
+
     def to_pepo(
         self,
         terms_or_edges=None,

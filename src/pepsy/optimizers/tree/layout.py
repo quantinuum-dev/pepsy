@@ -1041,6 +1041,62 @@ class TreePlan:
         """Return the leaf node ids."""
         return list(self.qubit_of_leaf.keys())
 
+    def mpo_order(self, *, include_root=True):
+        """Return the deterministic logical-site order for a tree MPO.
+
+        The leaf positions are ordered by their structural node ids, matching
+        the order used by :class:`TreeLayoutFinder` when it refines a plan.
+        When ``root_qubit`` is present, that physical site is placed first by
+        default, followed by the ordinary leaf positions. The result is a
+        permutation of ``0 .. n - 1`` and is suitable for constructing a
+        layout-aware chain MPO whose sites are subsequently routed over this
+        tree.
+
+        Parameters
+        ----------
+        include_root : bool, optional
+            Include a physical site carried by the structural root. The
+            default is ``True``; pass ``False`` to obtain only the leaf order.
+        """
+        order = tuple(
+            self.qubit_of_leaf[nid]
+            for nid in sorted(self.qubit_of_leaf)
+        )
+        if include_root and self.root_qubit is not None:
+            return (self.root_qubit, *order)
+        return order
+
+    def to_mpo(self, hamiltonian, **kwargs):
+        """Build a native chain MPO and its TreePlan embedding.
+
+        This delegates to :func:`pepsy.optimizers.tree.tree_mpo`. The returned
+        object is the ordinary Quimb ``MatrixProductOperator`` with native
+        Symmray tensors when ``fermionic=True``. Its chain order follows
+        :meth:`mpo_order`; exact native tree readout uses the separate
+        TreePlan-routed operator attached by the builder and contracts the
+        doubled ``tree.H | operator | tree`` network.
+        """
+        from .operators import tree_mpo
+
+        return tree_mpo(self, hamiltonian, **kwargs)
+
+    def to_tree_mpo(self, hamiltonian, **kwargs):
+        """Build the public :class:`TreeMPO` operator for this plan.
+
+        The returned class keeps the optional chain MPO available as
+        ``.chain_mpo`` and exposes the TreePlan-routed representation through
+        ``.tree_networks`` and ``.expectation``.
+        """
+        from .operators import tree_mpo
+
+        chain_mpo = tree_mpo(self, hamiltonian, **kwargs)
+        if isinstance(chain_mpo, dict):
+            return {
+                charge: mpo.pepsy_tree_operator
+                for charge, mpo in chain_mpo.items()
+            }
+        return chain_mpo.pepsy_tree_operator
+
     def is_leaf(self, nid):
         return len(self.children.get(nid, ())) == 0
 

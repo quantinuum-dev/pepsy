@@ -210,6 +210,50 @@ def _is_symmray_array(value):
         return hasattr(value, "blocks") and hasattr(value, "indices")
 
 
+def _native_qr_options_for_tensor(tensor):
+    """Return the centralized lossless-QR options for one tensor."""
+    return {"stabilized": False} if _is_symmray_array(tensor.data) else {}
+
+
+def _native_qr_split_tensor(tensor, **kwargs):
+    """Split one tree tensor using the native graded QR policy."""
+    kwargs.update(_native_qr_options_for_tensor(tensor))
+    if _is_symmray_array(tensor.data):
+        kwargs.setdefault("fn", _native_qr_block_scaled)
+    kwargs.setdefault("method", "qr")
+    return tensor.split(**kwargs)
+
+
+def _is_native_mpo(value):
+    """Return whether an MPO visibly contains native Symmray tensors."""
+    marker = getattr(value, "pepsy_tree_native", None)
+    if marker is not None:
+        return bool(marker)
+    tensors = getattr(value, "tensors", None)
+    if tensors is None:
+        return None
+    try:
+        return any(_is_symmray_array(tensor.data) for tensor in tensors)
+    except (AttributeError, TypeError):
+        return None
+
+
+def _tree_plan_signature(plan):
+    """Return the structural identity used by source-aware tree MPOs."""
+    return (
+        int(plan.root),
+        tuple(
+            (int(node), tuple(int(child) for child in children))
+            for node, children in sorted(plan.children.items())
+        ),
+        tuple(
+            (int(node), int(qubit))
+            for node, qubit in sorted(plan.qubit_of_leaf.items())
+        ),
+        None if plan.root_qubit is None else int(plan.root_qubit),
+    )
+
+
 def _contract_two_tensors(left, right, *, shared_ind=None):
     """Contract two tensors along one ordinary shared index cheaply.
 
@@ -793,9 +837,195 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                     "seconds": time.perf_counter() - profile_started,
                 })
 
+    def expectation_mpo_exact(
+        self, mpo, where, *, normalized=True, optimize="auto",
+    ):
+        """Contract ``<psi|MPO|psi>`` without applying or compressing the TTN.
+
+        The tree, a private ket view, and the MPO remain separate tensor
+        networks. A :class:`TreeMPO` or an MPO created by :func:`tree_mpo`
+        supplies a TreePlan-labelled operator representation, contracted as
+        ``tree.H | tree_operator | tree``; its optional chain MPO is never
+        moved into the tree, applied, densified, or compressed. For an
+        unannotated MPO, the lower physical legs are connected to fresh
+        copies of the ket physical legs, while its upper physical legs
+        connect to the bra, and the complete doubled network is contracted.
+
+        ``mpo`` must expose Quimb's regular MPO site interface. Its active site
+        labels must match ``where``. For a native fermionic TTN the MPO must
+        contain native Symmray tensors, so the graded contraction rules remain
+        attached to the operator data.
+        """
+        if isinstance(where, Integral):
+            where = (int(where),)
+        else:
+            where = tuple(int(site) for site in where)
+        if not where or len(set(where)) != len(where):
+            raise ValueError("where must contain distinct tree sites.")
+        if any(site not in self.plan.node_of_qubit for site in where):
+            raise ValueError(f"site(s) {where!r} are outside this tree state.")
+
+        if hasattr(mpo, "expectation") and hasattr(mpo, "tree_networks"):
+            all_sites = tuple(sorted(self.plan.node_of_qubit))
+            if tuple(sorted(where)) != all_sites:
+                raise ValueError(
+                    "a TreeMPO must be evaluated on all tree sites so its "
+                    "identity legs remain explicit."
+                )
+            return mpo.expectation(
+                self,
+                normalized=normalized,
+                optimize=optimize,
+            )
+
+        tree_operator = getattr(mpo, "pepsy_tree_operator", None)
+        if tree_operator is not None:
+            if getattr(mpo, "pepsy_tree_plan_signature", None) != (
+                _tree_plan_signature(self.plan)
+            ):
+                raise ValueError(
+                    "tree MPO embedding was built for a different TreePlan."
+                )
+            all_sites = tuple(sorted(self.plan.node_of_qubit))
+            if tuple(sorted(where)) != all_sites:
+                raise ValueError(
+                    "a TreePlan MPO embedding must be evaluated on all tree "
+                    "sites so its identity legs remain explicit."
+                )
+            if hasattr(tree_operator, "expectation"):
+                return tree_operator.expectation(
+                    self,
+                    normalized=normalized,
+                    optimize=optimize,
+                )
+            if not self.fermionic:
+                raise TypeError(
+                    "native TreePlan MPO embeddings require a native "
+                    "fermionic TreeTensorNetwork."
+                )
+
+            operators = (
+                tree_operator
+                if isinstance(tree_operator, (tuple, list))
+                else (tree_operator,)
+            )
+            numerator = 0.0
+            for operator in operators:
+                ket = self.copy()
+                operator_work = operator.copy()
+                ket_reindex = {}
+                operator_reindex = {}
+                for site in all_sites:
+                    physical = self.site_ind(site)
+                    upper = f"k{site}"
+                    lower = f"b{site}"
+                    if upper not in operator_work.ind_map:
+                        raise ValueError(
+                            "TreePlan MPO embedding is missing physical site "
+                            f"{site!r}."
+                        )
+                    if lower not in operator_work.ind_map:
+                        raise ValueError(
+                            "TreePlan MPO embedding is missing lower physical "
+                            f"site {site!r}."
+                        )
+                    fresh = qtn.rand_uuid()
+                    ket_reindex[physical] = fresh
+                    operator_reindex[lower] = fresh
+                ket.reindex_(ket_reindex)
+                operator_work.reindex_(operator_reindex)
+                numerator = numerator + (self.H | operator_work | ket).contract(
+                    all,
+                    optimize=optimize,
+                )
+            if not normalized:
+                return numerator
+            denominator = (self.H | self).contract(all, optimize=optimize)
+            return numerator / denominator
+
+        required = (
+            "gen_sites_present", "site_tag", "upper_ind_id", "lower_ind_id",
+            "tag_map", "tensor_map", "copy",
+        )
+        if not all(hasattr(mpo, name) for name in required):
+            raise TypeError(
+                "expectation_mpo_exact requires a regular Quimb MPO with "
+                "site, physical-index, tensor-map, and copy interfaces."
+            )
+        try:
+            present = tuple(mpo.gen_sites_present())
+        except Exception as exc:
+            raise TypeError(
+                "could not inspect the MPO's active site labels for an "
+                "exact tree contraction."
+            ) from exc
+        if set(present) != set(where):
+            raise ValueError(
+                "MPO active sites must match the declared support: "
+                f"MPO has {present!r}, where is {where!r}."
+            )
+
+        mpo_native = _is_native_mpo(mpo)
+        if mpo_native is not None and bool(mpo_native) != bool(self.fermionic):
+            if self.fermionic:
+                raise TypeError(
+                    "native fermionic TreeTensorNetwork requires a native "
+                    "Symmray MPO for exact graded contraction."
+                )
+            raise TypeError(
+                "a native Symmray MPO cannot be exactly contracted with an "
+                "ordinary dense TreeTensorNetwork."
+            )
+
+        upper_id = mpo.upper_ind_id
+        lower_id = mpo.lower_ind_id
+        ket = self.copy()
+        mpo_work = mpo.copy()
+        ket_reindex = {}
+        mpo_reindex = {}
+        for site in where:
+            physical = self.site_ind(site)
+            upper = upper_id.format(site)
+            lower = lower_id.format(site)
+            try:
+                tids = tuple(mpo_work.tag_map[mpo_work.site_tag(site)])
+            except (KeyError, TypeError) as exc:
+                raise ValueError(
+                    f"MPO has no unique tensor for active site {site!r}."
+                ) from exc
+            if len(tids) != 1:
+                raise ValueError(
+                    f"MPO site {site!r} must resolve to one tensor; "
+                    f"got {len(tids)}."
+                )
+            op_tensor = mpo_work.tensor_map[tids[0]]
+            if upper not in op_tensor.inds or lower not in op_tensor.inds:
+                raise ValueError(
+                    f"MPO site {site!r} does not contain expected physical "
+                    f"indices {upper!r} and {lower!r}."
+                )
+            fresh = qtn.rand_uuid()
+            ket_reindex[physical] = fresh
+            mpo_reindex[lower] = fresh
+
+        # This is the key orientation: bra <- MPO upper, MPO lower -> ket.
+        # Every physical index then appears exactly twice, while MPO virtual
+        # bonds stay internal to the separate structured MPO network.
+        ket.reindex_(ket_reindex)
+        mpo_work.reindex_(mpo_reindex)
+        numerator = (self.H | mpo_work | ket).contract(
+            all,
+            optimize=optimize,
+        )
+        if not normalized:
+            return numerator
+        denominator = (self.H | self).contract(all, optimize=optimize)
+        return numerator / denominator
+
     def expectation_mpo(
         self, mpo, where, *, max_bond=None, cutoff=0.0,
-        normalized=True, optimize="auto",
+        normalized=True, optimize="auto", warn_on_truncation=True,
+        return_diagnostics=False,
     ):
         """Evaluate a structured MPO expectation without changing this TTN.
 
@@ -805,6 +1035,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         operator on the full support.  The transformed-state bond cap defaults
         to this TTN's current maximum bond; pass ``max_bond`` explicitly when
         a larger measurement workspace is acceptable.
+        ``warn_on_truncation=True`` reports when that workspace actually
+        truncates the private transformed ket. ``return_diagnostics=True``
+        returns the value together with the per-expectation compression report.
         """
         from .optimizer import TreeOptimizer
 
@@ -825,6 +1058,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             cutoff=cutoff,
             normalized=normalized,
             optimize=optimize,
+            warn_on_truncation=warn_on_truncation,
+            return_diagnostics=return_diagnostics,
         )
 
     @property
@@ -1354,11 +1589,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
     def _native_qr_split(self, tensor, **kwargs):
         """Perform a QR split with the native graded zero-sector safeguard."""
-        kwargs.update(self._native_qr_options(tensor))
-        if _is_symmray_array(tensor.data):
-            kwargs.setdefault("fn", _native_qr_block_scaled)
-        kwargs.setdefault("method", "qr")
-        return tensor.split(**kwargs)
+        return _native_qr_split_tensor(tensor, **kwargs)
 
     def _record_native_compression_route(
         self, route, *, edge, before_bond, reduction_hint, reduction_proven,

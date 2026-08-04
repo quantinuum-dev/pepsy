@@ -88,6 +88,31 @@ The native `TreeTensorNetwork` QR policy is centralized in
   not change the separate `MpsOptimizer` QR implementation or globally patch
   Quimb/Symmray.
 
+## Native TreeMPO contract
+
+The tree-native operator API lives in `pepsy.optimizers.tree.operators`:
+
+- `TreeMPO` is the primary tree measurement object. Prefer
+  `TreePlan.to_tree_mpo(...)` or `Fermion.to_tree_mpo(..., tree=plan)` when the
+  consumer is a `TreeTensorNetwork`.
+- `TreePlan.to_mpo(...)` and `tree_mpo(...)` remain compatibility constructors
+  for the ordinary low-bond chain MPO. They attach the `TreeMPO`, but the
+  chain MPO is never moved into the tree, densified, or used as the tree
+  operator during `expectation_mpo_exact`.
+- Neutral native term sums are factorized from their native Symmray tensors on
+  each term's TreePlan Steiner subtree and amalgamated into one direct-sum
+  TTNO. Do not replace this with a Jordan--Wigner dense factorization or a
+  list of ordinary hyperedges. The compact eta-pair observable is an explicit
+  structured exception with its four-state TTNO automaton.
+- `TreeMPO.expectation(...)` and `TreeTensorNetwork.expectation_mpo_exact(...)`
+  contract separate bra, operator, and ket networks. `TreeMPO.canonicalize()`
+  is lossless native QR gauge fixing; `TreeMPO.compress(...)` is the explicit
+  native graded SVD truncation stage.
+- Native operator QR must use the shared `_native_qr_split_tensor` policy (and
+  therefore the same `stabilized=False` structural-zero safeguard as the
+  state). Do not add direct `tensor.split(method="qr")` calls to TreeMPO
+  canonicalization.
+
 ## Dependency and backend rules
 
 - Prefer public `quimb`, `cotengra`, `cotengrust`, and `autoray` APIs over
