@@ -1086,7 +1086,9 @@ class TreePlan:
         The returned object keeps the optional chain MPO available as
         ``.chain_mpo`` and exposes the TreePlan-routed representation through
         ``.tree_networks`` and ``.expectation``. With
-        ``charge_sectors=True`` the result is ``{charge: TreeMPO}``.
+        mixed native charges, one public ``TreeMPO`` contains one homogeneous
+        network per charge. ``charge_sectors=True`` remains available when
+        separate sector objects are specifically desired.
         """
         from .operators import build_tree_operator
 

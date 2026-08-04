@@ -755,7 +755,7 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
 
     def to_dense(self, *inds_seq, to_qarray=False, **contract_opts):
         """Contract the complete operator, summing internal term networks."""
-        if len(self.tree_networks) == 1:
+        if len(self.tree_networks) == 1 and not self.fermionic:
             return qtn.TensorNetworkGenOperator.to_dense(
                 self,
                 *inds_seq,
@@ -766,6 +766,24 @@ class TreeMPO(qtn.TensorNetworkGenOperator):
             inds_seq = (self.upper_inds_present, self.lower_inds_present)
         values = []
         for network in self.tree_networks:
+            if self.fermionic:
+                # Symmray's block-sparse contraction assumes a neutral scalar
+                # when it closes all internal legs. A charged operator has
+                # nonzero open physical charge, so densify each local block
+                # first and contract the ordinary tree network. This is only
+                # the explicit ``to_dense`` escape hatch; native expectation
+                # and compression remain graded and factorized.
+                dense_tensors = []
+                for tensor in network:
+                    data = tensor.data
+                    if hasattr(data, "to_dense"):
+                        data = data.to_dense()
+                    dense_tensors.append(qtn.Tensor(
+                        data,
+                        inds=tensor.inds,
+                        tags=tensor.tags,
+                    ))
+                network = qtn.TensorNetwork(dense_tensors)
             view = qtn.TensorNetworkGenOperator(
                 network,
                 virtual=True,
@@ -2078,12 +2096,6 @@ def _native_tree_term_network(
         if physical_map and isinstance(physical_map[0], tuple)
         else 0
     )
-    term_charge = getattr(term, "charge", zero)
-    if term_charge != zero:
-        raise ValueError(
-            "a single native TTNO must be neutral; use charge_sectors=True "
-            "for a charged operator sum."
-        )
 
     endpoint_nodes = tuple(plan.node_of_qubit[site] for site in support)
     if len(support) == 1:
@@ -3084,6 +3096,100 @@ def _dense_tree_tensor_network_for_term(plan, operator, support, *, dtype=None):
     return network
 
 
+def _terms_by_operator_charge(terms):
+    """Group native terms without mixing their Symmray operator charges."""
+    grouped = {}
+    for where, term in terms.items():
+        grouped.setdefault(getattr(term, "charge", 0), {})[where] = term
+    return grouped
+
+
+def _charge_is_zero(charge):
+    """Return whether an Abelian scalar or tuple charge is neutral."""
+    if isinstance(charge, tuple):
+        return all(value == 0 for value in charge)
+    return charge == 0
+
+
+def _build_mixed_charge_tree_operator(
+    plan,
+    hamiltonian,
+    *,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=True,
+    dtype=None,
+    fermionic=True,
+    to_backend=None,
+):
+    """Build one public ``TreeMPO`` from separate native charge networks."""
+    from ...tensors.symmetric import (
+        SymHamiltonian,
+        _apply_to_tensor_network_arrays,
+    )
+
+    networks = []
+    for charge, sector_terms in _terms_by_operator_charge(
+        hamiltonian.terms
+    ).items():
+        if not _charge_is_zero(charge):
+            # A nonzero-charge TTNO cannot be amalgamated into a neutral
+            # direct-sum tensor: the charge belongs to one open operator
+            # boundary tensor. Keep each charged term as its own homogeneous
+            # network and let the public TreeMPO sum them.
+            for where, term in sector_terms.items():
+                network = _native_tree_term_network(
+                    plan,
+                    term,
+                    _term_support(where),
+                    symmetry=hamiltonian.symmetry,
+                    cutoff=cutoff,
+                    dtype=dtype,
+                )
+                networks.append(_normalize_native_term_edge_orientation(
+                    network,
+                    plan,
+                    symmetry=hamiltonian.symmetry,
+                    dtype=dtype,
+                ))
+            continue
+        sector_hamiltonian = SymHamiltonian.from_terms(
+            hamiltonian.model,
+            hamiltonian.symmetry,
+            sector_terms,
+            parameters=hamiltonian.parameters,
+        )
+        sector_operator = _build_tree_operator(
+            plan,
+            sector_hamiltonian,
+            cutoff=cutoff,
+            max_bond=max_bond,
+            compress=False,
+            dtype=dtype,
+            fermionic=fermionic,
+        )
+        if isinstance(sector_operator, TreeMPO):
+            networks.extend(sector_operator.tree_networks)
+        else:
+            networks.append(sector_operator)
+
+    operator = TreeMPO(
+        plan,
+        tuple(networks),
+        terms=hamiltonian.terms,
+        backend="symmray" if fermionic else "dense",
+        fermionic=fermionic,
+        symmetry=hamiltonian.symmetry,
+        compressed=False,
+    )
+    if compress:
+        operator.compress(max_bond=max_bond, cutoff=cutoff)
+    if to_backend is not None:
+        for network in operator.tree_networks:
+            _apply_to_tensor_network_arrays(network, to_backend)
+    return operator
+
+
 def _build_tree_operator(
     plan,
     hamiltonian,
@@ -3097,6 +3203,30 @@ def _build_tree_operator(
     """Build the backend-specific tree representation used by ``TreeMPO``."""
     symmetry = hamiltonian.symmetry
     terms = hamiltonian.terms
+
+    if any(
+        not _charge_is_zero(charge)
+        for charge in _terms_by_operator_charge(terms)
+    ):
+        # A charged TTNO carries its operator charge on an open boundary
+        # tensor. Keep charged terms as separate homogeneous networks rather
+        # than forcing them into the neutral direct-sum construction below.
+        return tuple(
+            _normalize_native_term_edge_orientation(
+                _native_tree_term_network(
+                    plan,
+                    term,
+                    _term_support(where),
+                    symmetry=symmetry,
+                    cutoff=cutoff,
+                    dtype=dtype,
+                ),
+                plan,
+                symmetry=symmetry,
+                dtype=dtype,
+            )
+            for where, term in terms.items()
+        )
 
     # The full staggered eta correlator is a symmetric rank-one pair table.
     # Compile it before falling back to one actual tree contraction per term;
@@ -3376,8 +3506,30 @@ def build_tree_operator(
     The compatibility :func:`tree_mpo` builder returns the ordinary linear
     chain MPO and attaches this tree operator to it. This function returns
     only the tree-native operator, keeping the two tensor-network geometries
-    explicit. With ``charge_sectors=True`` it returns ``{charge: TreeMPO}``.
+    explicit. Mixed native charges are combined into one ``TreeMPO`` with one
+    homogeneous Symmray network per charge. With ``charge_sectors=True`` it
+    instead returns ``{charge: TreeMPO}`` for callers that need separate
+    sector objects.
     """
+    if fermionic and not charge_sectors:
+        from ...tensors.symmetric import SymHamiltonian
+
+        if not isinstance(hamiltonian, SymHamiltonian):
+            raise TypeError("hamiltonian must be a SymHamiltonian instance.")
+        if any(
+            not _charge_is_zero(charge)
+            for charge in _terms_by_operator_charge(hamiltonian.terms)
+        ):
+            return _build_mixed_charge_tree_operator(
+                plan,
+                hamiltonian,
+                max_bond=max_bond,
+                cutoff=cutoff,
+                compress=compress,
+                dtype=dtype,
+                fermionic=fermionic,
+                to_backend=to_backend,
+            )
     built = tree_mpo(
         plan,
         hamiltonian,

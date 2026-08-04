@@ -10372,6 +10372,11 @@ class Fermion:
         Native ``fermionic=True`` keeps Symmray's graded tensors intact for
         U1, U1U1, and other supported symmetries.
 
+        Mixed operator charges are exposed as one public ``TreeMPO`` whose
+        internal ``tree_networks`` keep one homogeneous native network per
+        charge. Pass ``charge_sectors=True`` only when separate sector
+        objects are specifically desired.
+
         This is the canonical ``Fermion`` tree-operator entry point.
         ``to_tree_mpo`` and ``build_tree_mpo`` remain compatibility aliases.
         """

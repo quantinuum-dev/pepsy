@@ -421,6 +421,11 @@ and `bond` provide the branched geometry. It cannot inherit the chain-only
 `MatrixProductOperator` implementation because a tree has no left/right
 ordering; `chain_mpo` remains the separate chain-compatible representation.
 
+Mixed native operator charges are represented as one public `TreeMPO` with one
+homogeneous Symmray tree network per charge in `tree_networks`. Use
+`charge_sectors=True` only when separate `TreeMPO` objects are explicitly
+needed.
+
 For native fermionic Hamiltonians, one-, two-, and higher-site neutral terms
 are fused and factorized from their native Symmray operator tensor over the
 TreePlan Steiner subtree, then amalgamated into one charge-aware direct-sum

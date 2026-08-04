@@ -149,7 +149,11 @@ does not create a hyperedge for the normal Hamiltonian path. The resulting
 TTNO can be canonicalized and compressed with
 `tree_operator.canonicalize()` and
 `tree_operator.compress(cutoff=..., max_bond=...)`; no Jordan--Wigner
-conversion is used. Structured observables can use a smaller compact TTNO.
+conversion is used. Nonzero or mixed operator charges remain separate
+homogeneous native networks inside the same public `TreeMPO`, so callers do
+not need `charge_sectors=True` just to construct one operator object;
+`charge_sectors=True` remains available when separate objects are preferred.
+Structured observables can use a smaller compact TTNO.
 Pass `fermionic=False` only for dense ordinary/Jordan--Wigner-compatible terms.
 Existing `OneDMap` lattice maps remain unchanged and should continue to be used
 for regular 2D/3D coordinate layouts.

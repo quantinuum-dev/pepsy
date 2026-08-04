@@ -253,6 +253,102 @@ def test_native_tree_mpo_amalgamates_higher_rank_term():
 
 
 @pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
+def test_tree_operator_combines_mixed_native_charges(symmetry):
+    """Mixed native charges form one compressible public TreeMPO sum."""
+    fermion = pepsy.Fermion(
+        spinful=True, symmetry=symmetry, dtype="complex128",
+    )
+    neutral = fermion.hopping_operator()
+    charged = fermion.operator_term(
+        [(1.0, (((1), "double"), ((2), "annihilate_up")))],
+        sites=(1, 2),
+        label="mixed_tree_charge",
+    )
+    reference = fermion.hamiltonian([(0, 1)], t=0.0, U=0.0, mu=0.0)
+    hamiltonian = type(reference).from_terms(
+        reference.model,
+        reference.symmetry,
+        {(0, 1): neutral, (1, 2): charged},
+        parameters=reference.parameters,
+    )
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+
+    operator = fermion.build_tree_operator(
+        hamiltonian=hamiltonian,
+        tree=plan,
+        compress=False,
+    )
+
+    assert isinstance(operator, TreeMPO)
+    assert operator.chain_mpo is None
+    assert len(operator.tree_networks) == 2
+    assert all(
+        type(tensor.data).__name__.endswith("FermionicArray")
+        for network in operator.tree_networks
+        for tensor in network
+    )
+
+    explicit_sectors = fermion.build_tree_operator(
+        hamiltonian=hamiltonian,
+        tree=plan,
+        compress=False,
+        charge_sectors=True,
+    )
+    assert set(explicit_sectors) == {fermion.zero_charge, charged.charge}
+    assert all(isinstance(sector, TreeMPO) for sector in explicit_sectors.values())
+
+    neutral_hamiltonian = type(reference).from_terms(
+        reference.model,
+        reference.symmetry,
+        {(0, 1): neutral},
+        parameters=reference.parameters,
+    )
+    charged_hamiltonian = type(reference).from_terms(
+        reference.model,
+        reference.symmetry,
+        {(1, 2): charged},
+        parameters=reference.parameters,
+    )
+    neutral_operator = fermion.build_tree_operator(
+        hamiltonian=neutral_hamiltonian, tree=plan, compress=False,
+    )
+    charged_operator = fermion.build_tree_operator(
+        hamiltonian=charged_hamiltonian, tree=plan, compress=False,
+    )
+    np.testing.assert_allclose(
+        operator.to_dense(),
+        neutral_operator.to_dense() + charged_operator.to_dense(),
+    )
+
+    leaf_charges = (
+        {
+            site: fermion.local_fock_state((0, 0), site=site)[0]
+            for site in range(4)
+        }
+        if symmetry == "U1" else
+        {site: (0, 0) for site in range(4)}
+    )
+    state = pepsy.TreeTensorNetwork.from_symmray_plan(
+        plan,
+        symmetry=symmetry,
+        physical_sectors=fermion.physical_sectors,
+        leaf_charges=leaf_charges,
+        bond_dim=2,
+        fermionic=True,
+        seed=7,
+        dtype="complex128",
+    )
+    np.testing.assert_allclose(
+        operator.expectation(state),
+        state.expectation_mpo_exact(operator, range(4)),
+    )
+
+    operator.canonicalize().compress(max_bond=16, cutoff=1e-12)
+    assert operator.compressed is True
+    assert isinstance(operator.pepsy_compression_report, list)
+
+
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
 def test_fermion_tree_mpo_class_is_native_and_keeps_chain_representation(symmetry):
     """Fermion exposes the class API for both native Symmray symmetries."""
     fermion = pepsy.Fermion(
