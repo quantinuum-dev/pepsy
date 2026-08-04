@@ -5574,8 +5574,6 @@ def _assemble_symmray_mpo(
         lower_ind_id=lower_ind_id,
         site_tag_id=site_tag_id,
     )
-    if to_backend is not None:
-        _apply_to_tensor_network_arrays(mpo, to_backend)
     raw_bond = mpo.max_bond()
     raw_max_bond = 1 if raw_bond is None else int(raw_bond)
     did_compress = bool(compress and L > 1)
@@ -5584,6 +5582,12 @@ def _assemble_symmray_mpo(
         if max_bond is not None:
             compress_opts["max_bond"] = int(max_bond)
         mpo.compress(**compress_opts)
+    if to_backend is not None:
+        # Cast after compression so the SVD-based bond truncation runs in the
+        # stable build precision (e.g. complex128). Converting first and then
+        # compressing runs the SVD in the target precision, which for a
+        # near-singular Hamiltonian MPO in complex64 can hit non-finite values.
+        _apply_to_tensor_network_arrays(mpo, to_backend)
 
     requested_max_bond = None if max_bond is None else int(max_bond)
     final_bond = mpo.max_bond()

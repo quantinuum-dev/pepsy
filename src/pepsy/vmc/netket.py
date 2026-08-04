@@ -2149,38 +2149,41 @@ def _contract_ctmrg_for_vmc(tn, *, max_bond, cutoff, method_opts):
     ``chi`` paired with a Z2 block axis). Keep all requested options active and
     relax only this stopping threshold to Quimb's stable value ``1``.
     """
+    from ..boundary.metrics import quimb_ctmrg_projector_compat
+
     global _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED
     kwargs = dict(method_opts)
-    try:
-        return tn.contract_ctmrg(
-            max_bond=max_bond,
-            cutoff=cutoff,
-            strip_exponent=True,
-            **kwargs,
-        )
-    except (AttributeError, TypeError, ValueError):
-        if (
-            kwargs.get("max_separation", 1) == 0
-            and _is_flat_symmray_network(tn)
-        ):
-            if not _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED:
-                warnings.warn(
-                    "Flat Symmray JAX CTMRG does not support the "
-                    "max_separation=0 intermediate axis path; retrying "
-                    "with max_separation=1. The requested sequence, chi, "
-                    "and canonization options remain active.",
-                    RuntimeWarning,
-                    stacklevel=3,
-                )
-                _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED = True
-            kwargs["max_separation"] = 1
+    with quimb_ctmrg_projector_compat():
+        try:
             return tn.contract_ctmrg(
                 max_bond=max_bond,
                 cutoff=cutoff,
                 strip_exponent=True,
                 **kwargs,
             )
-        raise
+        except (AttributeError, TypeError, ValueError):
+            if (
+                kwargs.get("max_separation", 1) == 0
+                and _is_flat_symmray_network(tn)
+            ):
+                if not _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED:
+                    warnings.warn(
+                        "Flat Symmray JAX CTMRG does not support the "
+                        "max_separation=0 intermediate axis path; retrying "
+                        "with max_separation=1. The requested sequence, chi, "
+                        "and canonization options remain active.",
+                        RuntimeWarning,
+                        stacklevel=3,
+                    )
+                    _FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED = True
+                kwargs["max_separation"] = 1
+                return tn.contract_ctmrg(
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    strip_exponent=True,
+                    **kwargs,
+                )
+            raise
 
 
 def _resolve_netket_contraction(contraction, chi, cutoff, contraction_opts):
