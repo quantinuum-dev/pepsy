@@ -82,6 +82,30 @@ def test_loss_state_identical_with_stripped_exponents_is_near_zero():
     assert loss < 1e-6
 
 
+def test_scaled_scalar_preserves_torch_exponent_gradient():
+    """Stripped Torch exponents must remain part of the global loss graph."""
+    torch = pytest.importorskip("torch")
+    exponent = torch.tensor(0.0, requires_grad=True)
+
+    fidelity = GlobalOptimizer._scaled_overlap_fidelity(
+        (torch.tensor(1.0), exponent),
+        (torch.tensor(1.0), 0.0),
+        (1.0, 0.0),
+    )
+    (1.0 - fidelity).backward()
+
+    assert exponent.grad is not None
+    assert float(exponent.grad.abs()) > 0.0
+
+    log_exponent = torch.tensor(0.0, requires_grad=True)
+    log_value = GlobalOptimizer._scaled_abs_log(
+        (torch.tensor(2.0), log_exponent),
+    )
+    log_value.backward()
+    assert log_exponent.grad is not None
+    assert float(log_exponent.grad.abs()) > 0.0
+
+
 def test_norm_state_unknown_mode_raises():
     """Unknown norm mode should raise ValueError."""
     peps = _rand_peps(seed=14)

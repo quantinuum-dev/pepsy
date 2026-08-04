@@ -272,6 +272,14 @@ class GlobalOptimizer:
         """Return ``(mantissa, exponent)`` for scalar or stripped scalar input."""
         if GlobalOptimizer._is_scaled_scalar(value):
             mantissa, exponent = value
+            # ``cotengra`` may return a differentiable Torch exponent when
+            # ``strip_exponent=True``.  Keep that node in the global loss;
+            # converting it to ``float`` makes normalized contractions look
+            # constant to autograd even when finite differences are nonzero.
+            if hasattr(exponent, "detach"):
+                return mantissa, exponent
+            if hasattr(exponent, "item"):
+                exponent = exponent.item()
             return mantissa, float(exponent)
         return value, 0.0
 
@@ -308,7 +316,7 @@ class GlobalOptimizer:
     @classmethod
     def _scaled_abs_log(cls, value):
         mantissa, exponent = cls._as_scaled_scalar(value)
-        return ar.do("log", ar.do("abs", mantissa)) + float(exponent) * math.log(10.0)
+        return ar.do("log", ar.do("abs", mantissa)) + exponent * math.log(10.0)
 
     @staticmethod
     def _accumulate_tn_exponent(tn, exponent_delta):

@@ -2571,7 +2571,7 @@ class TreeOptimizer:
                 leave=True,
                 position=0,
                 ascii=True,
-                colour="green",
+                colour="GREEN",
             )
 
         one_qubit_count = 0
