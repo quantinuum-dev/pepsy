@@ -297,6 +297,75 @@ class PepsEnergyOptimizer:
             return False
 
     @classmethod
+    def _track_tnopt_best_checkpoint(cls, tnopt):
+        """Track the parameter vector for the best finite loss seen.
+
+        Quimb records ``TNOptimizer.loss_best`` as a scalar only.  That is
+        insufficient when an optimizer backend aborts after evaluating a
+        worse trial, because the current vector can then be worse than the
+        best vector.  Wrapping the backend handler covers both SciPy's
+        ``vectorized_value_and_grad`` route and Quimb's direct NLopt callback.
+        """
+        vectorizer = getattr(tnopt, "vectorizer", None)
+        vector = getattr(vectorizer, "vector", None)
+        tracker = {
+            "loss": float("inf"),
+            "vector": None if vector is None else vector.copy(),
+        }
+        if vector is None:
+            return tracker
+
+        def record(result):
+            if not cls._is_finite_number(result):
+                return
+            loss = float(result)
+            if loss < tracker["loss"]:
+                tracker["loss"] = loss
+                tracker["vector"] = vector.copy()
+
+        handler = getattr(tnopt, "handler", None)
+        if handler is None:
+            return tracker
+
+        value_and_grad = getattr(handler, "value_and_grad", None)
+        if callable(value_and_grad):
+            def tracked_value_and_grad(arrays):
+                result, gradients = value_and_grad(arrays)
+                record(result)
+                return result, gradients
+
+            handler.value_and_grad = tracked_value_and_grad
+
+        value = getattr(handler, "value", None)
+        if callable(value):
+            def tracked_value(arrays):
+                result = value(arrays)
+                record(result)
+                return result
+
+            handler.value = tracked_value
+
+        return tracker
+
+    @staticmethod
+    def _is_recoverable_optimizer_error(exc, optlib):
+        """Return whether an optimizer exception should yield its best state."""
+        if str(optlib).strip().lower() == "nlopt":
+            # nlopt.runtime_error and nlopt.roundoff_limited are not Python's
+            # built-in RuntimeError, but all are exposed from the ``nlopt``
+            # module and represent an optimizer stop rather than a loss bug.
+            return "nlopt" in type(exc).__module__.lower()
+        return isinstance(exc, RuntimeError)
+
+    @classmethod
+    def _best_tnopt_state(cls, tnopt, tracker):
+        """Restore and extract the best tracked TNOptimizer checkpoint."""
+        vector = tracker.get("vector")
+        if vector is not None:
+            tnopt.vectorizer.vector[:] = vector
+        return tnopt.get_tn_opt()
+
+    @classmethod
     def _initial_gradient_status(cls, tnopt):
         if not (
             hasattr(tnopt, "vectorized_value_and_grad")
@@ -727,6 +796,8 @@ class PepsEnergyOptimizer:
             jit_fn=jit_fn,
             device=device,
         )
+        optlib = optimize_kwargs.get("optlib", "scipy")
+        best_tracker = self._track_tnopt_best_checkpoint(tnopt)
         if check_finite_gradient:
             finite_gradient, finite_loss = self._initial_gradient_status(tnopt)
             fallback_mode = (
@@ -751,6 +822,7 @@ class PepsEnergyOptimizer:
                     jit_fn=jit_fn,
                     device=device,
                 )
+                best_tracker = self._track_tnopt_best_checkpoint(tnopt)
                 finite_gradient, fallback_loss = self._initial_gradient_status(tnopt)
                 finite_loss = fallback_loss if fallback_loss is not None else finite_loss
             if not finite_gradient:
@@ -764,7 +836,24 @@ class PepsEnergyOptimizer:
                 if return_losses:
                     return self.state, tuple(self.losses)
                 return self.state
-        out = tnopt.optimize(n=n, **optimize_kwargs)
+        try:
+            out = tnopt.optimize(n=n, **optimize_kwargs)
+        except Exception as exc:
+            if not self._is_recoverable_optimizer_error(exc, optlib):
+                raise
+            out = self._best_tnopt_state(tnopt, best_tracker)
+            best_loss = best_tracker["loss"]
+            if self._is_finite_number(best_loss):
+                message = (
+                    f"{optlib} optimization stopped early ({exc}); returning "
+                    f"the best finite checkpoint with loss {best_loss:.12g}."
+                )
+            else:
+                message = (
+                    f"{optlib} optimization stopped before a finite loss was "
+                    f"recorded ({exc}); returning the initial state."
+                )
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
         self.losses = list(getattr(tnopt, "losses", ()))
         out = self._state_for_autodiff_backend(
             out,

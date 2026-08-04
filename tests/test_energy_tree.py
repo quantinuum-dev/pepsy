@@ -1,5 +1,7 @@
 """Tests for tree-network energy measurement and optimization."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -100,3 +102,60 @@ def test_tree_energy_optimizer_fermion_tnopt_refreshes_norm():
     assert values[-1] <= before + 1.0e-10
     assert out.orthogonality_center is None
     assert np.isfinite(float(optimizer.energy().energy))
+
+
+@pytest.mark.smoke
+def test_peps_energy_optimizer_returns_best_state_on_nlopt_stop(monkeypatch):
+    """NLopt exceptions return the best finite checkpoint, not the last trial."""
+    nlopt = pytest.importorskip("nlopt")
+
+    class FakeHandler:
+        def __init__(self):
+            self.calls = 0
+
+        def value_and_grad(self, arrays):
+            loss = (3.0, 1.0, 2.0)[self.calls]
+            self.calls += 1
+            return loss, np.zeros_like(arrays)
+
+    class FakeTNOptimizer:
+        def __init__(self):
+            self.vectorizer = SimpleNamespace(vector=np.array([0.0]))
+            self.handler = FakeHandler()
+            self.losses = []
+
+        def optimize(self, n, **kwargs):
+            _ = n, kwargs
+            for value in (0.0, 1.0, 2.0):
+                self.vectorizer.vector[:] = value
+                loss, _ = self.handler.value_and_grad(self.vectorizer.vector)
+                self.losses.append(loss)
+            raise nlopt.runtime_error("roundoff limited")
+
+        def get_tn_opt(self):
+            return self.vectorizer.vector.copy()
+
+    optimizer = object.__new__(pepsy.PepsEnergyOptimizer)
+    optimizer.loss_kwargs = {}
+    optimizer.state = object()
+    fake = FakeTNOptimizer()
+    monkeypatch.setattr(optimizer, "make_tn_optimizer", lambda **kwargs: fake)
+    monkeypatch.setattr(
+        optimizer,
+        "_state_for_autodiff_backend",
+        lambda out, *args, **kwargs: out,
+    )
+
+    with pytest.warns(RuntimeWarning, match="best finite checkpoint"):
+        out, losses = optimizer.optimize(
+            n=3,
+            optimizer="L-BFGS-B",
+            optlib="nlopt",
+            check_finite_gradient=False,
+            progbar=False,
+            return_losses=True,
+        )
+
+    assert np.array_equal(out, np.array([1.0]))
+    assert losses == (3.0, 1.0, 2.0)
+    assert np.array_equal(optimizer.state, np.array([1.0]))
