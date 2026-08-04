@@ -37,6 +37,17 @@ from .layout import TreePlan
 __all__ = ["TreeMPO", "build_tree_operator", "tree_mpo"]
 
 
+def _as_numpy(data, *, dtype=None):
+    """Convert a dense backend array to host NumPy construction data."""
+    if hasattr(data, "detach"):
+        data = data.detach()
+    if hasattr(data, "cpu"):
+        data = data.cpu()
+    if hasattr(data, "get"):
+        data = data.get()
+    return np.asarray(data, dtype=dtype)
+
+
 def _tree_plan_signature(plan):
     """Return a stable structural signature for a tree-MPO annotation."""
     return (
@@ -1500,8 +1511,8 @@ def _operator_native_channels(
         raise ValueError("could not split a native two-site operator.")
     left = left.unfuse(0).transpose((2, 0, 1))
     right = right.unfuse(1)
-    left_data = np.asarray(left.to_dense(), dtype=dtype)
-    right_data = np.asarray(right.to_dense(), dtype=dtype)
+    left_data = _as_numpy(left.to_dense(), dtype=dtype)
+    right_data = _as_numpy(right.to_dense(), dtype=dtype)
     physical_map = _expanded_index_charges(left.indices[1])
     if _expanded_index_charges(left.indices[2]) != physical_map:
         raise ValueError("native operator factors have mismatched physical maps.")
@@ -1611,7 +1622,7 @@ def _combined_tree_operator(
         if len(support) == 1:
             data = (
                 _dense_operator_array(term, dtype=dtype)
-                if not fermionic else np.asarray(term.to_dense(), dtype=dtype)
+                if not fermionic else _as_numpy(term.to_dense(), dtype=dtype)
             )
             if data.ndim != 2 or data.shape[0] != data.shape[1]:
                 raise ValueError("one-site operators must be square matrices.")
@@ -2192,7 +2203,7 @@ def _native_tree_term_network(
                 # A physical TreePlan root can lie on the active Steiner
                 # subtree without being an endpoint. Its operator action is
                 # the identity, so add that even physical pair explicitly.
-                dense = np.asarray(data.to_dense(), dtype=dtype or complex)
+                dense = _as_numpy(data.to_dense(), dtype=dtype or complex)
                 dense = np.einsum(
                     "ab,...->ab...",
                     np.eye(len(physical_map), dtype=dense.dtype),
@@ -2220,7 +2231,7 @@ def _native_tree_term_network(
                 if index in existing:
                     continue
                 dense = np.expand_dims(
-                    np.asarray(data.to_dense(), dtype=dtype or complex),
+                    _as_numpy(data.to_dense(), dtype=dtype or complex),
                     axis=-1,
                 )
                 maps = [
@@ -2324,7 +2335,7 @@ def _normalize_native_term_edge_orientation(network, plan, *, symmetry, dtype=No
                 permutation.append(old_positions[old_charge][position])
                 used[old_charge] = position + 1
             dense = np.take(
-                np.asarray(tensor.data.to_dense(), dtype=dtype or complex),
+                _as_numpy(tensor.data.to_dense(), dtype=dtype or complex),
                 permutation,
                 axis=axis,
             )
@@ -2470,7 +2481,7 @@ def _native_term_sum_tree_operator(
         data = np.zeros(shape, dtype=dtype or complex)
         for term_index, network in enumerate(term_networks):
             tensor = network[f"N{node}"].transpose(*desired)
-            local = np.asarray(tensor.data.to_dense(), dtype=data.dtype)
+            local = _as_numpy(tensor.data.to_dense(), dtype=data.dtype)
             slices = []
             if qubit is not None:
                 slices.extend((slice(None), slice(None)))
@@ -2718,7 +2729,7 @@ def _native_from_dense(
 def _pair_coefficient_factors(terms, nsite):
     """Factor an off-diagonal symmetric coefficient table, if possible."""
     first_support, first_term = next(iter(terms.items()))
-    first_matrix = np.asarray(first_term.to_dense()).reshape(
+    first_matrix = _as_numpy(first_term.to_dense()).reshape(
         (first_term.shape[0] * first_term.shape[2],) * 2
     )
     table = np.zeros((nsite, nsite), dtype=complex)
@@ -2726,7 +2737,7 @@ def _pair_coefficient_factors(terms, nsite):
         support = _term_support(where)
         if len(support) != 2 or support[0] >= support[1]:
             return None
-        matrix = np.asarray(term.to_dense()).reshape(
+        matrix = _as_numpy(term.to_dense()).reshape(
             (term.shape[0] * term.shape[2],) * 2
         )
         denominator = np.vdot(first_matrix, first_matrix)
@@ -2790,8 +2801,8 @@ def _pair_endpoint_automaton(
         return None
     left = left.unfuse(0).transpose((2, 0, 1))
     right = right.unfuse(1)
-    left_data = np.asarray(left.to_dense(), dtype=dtype or complex)[0]
-    right_data = np.asarray(right.to_dense(), dtype=dtype or complex)[0]
+    left_data = _as_numpy(left.to_dense(), dtype=dtype or complex)[0]
+    right_data = _as_numpy(right.to_dense(), dtype=dtype or complex)[0]
     physical_map = _expanded_index_charges(left.indices[1])
     physical_dim = len(physical_map)
     zero = 0 if symmetry in {"U1", "Z2"} else (0, 0)
@@ -2897,8 +2908,8 @@ def _pair_chain_mpo(
         return None
     left = left.unfuse(0).transpose((2, 0, 1))
     right = right.unfuse(1)
-    left_data = np.asarray(left.to_dense(), dtype=dtype or complex)[0]
-    right_data = np.asarray(right.to_dense(), dtype=dtype or complex)[0]
+    left_data = _as_numpy(left.to_dense(), dtype=dtype or complex)[0]
+    right_data = _as_numpy(right.to_dense(), dtype=dtype or complex)[0]
     physical_map = _expanded_index_charges(left.indices[1])
     physical_dim = len(physical_map)
     zero = 0 if symmetry in {"U1", "Z2"} else (0, 0)
@@ -3003,7 +3014,7 @@ def _tree_tensor_network_for_term(
     zero = getattr(term, "zero_charge", None)
     if zero is None:
         zero = 0 if symmetry in {"U1", "Z2"} else (0, 0)
-    operator_dtype = np.dtype(dtype or np.asarray(term.to_dense()).dtype)
+    operator_dtype = np.dtype(dtype or _as_numpy(term.to_dense()).dtype)
 
     # The term's native indices are ordered as all upper physical legs,
     # followed by all lower physical legs. Keep that ordering intact while
@@ -3048,7 +3059,7 @@ def _dense_operator_array(operator, *, dtype=None):
         operator = operator.to_dense()
     elif hasattr(operator, "data"):
         operator = operator.data
-    return np.asarray(operator, dtype=dtype)
+    return _as_numpy(operator, dtype=dtype)
 
 
 def _dense_tree_tensor_network_for_term(plan, operator, support, *, dtype=None):

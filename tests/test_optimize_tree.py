@@ -5540,6 +5540,164 @@ def test_native_complex64_qr_scales_low_norm_rank_deficient_block():
     )
 
 
+def test_native_complex64_qr_leaves_healthy_block_on_native_path(monkeypatch):
+    """Healthy complex64 blocks use one unmodified native Torch QR call."""
+    torch = pytest.importorskip("torch")
+    import pepsy.optimizers.tree.ttn as ttn_module
+
+    generator = torch.Generator().manual_seed(4108)
+    block = torch.randn((6, 4), generator=generator).to(torch.complex64)
+    qr_calls = []
+    original_do = ttn_module.ar.do
+
+    def record_qr_call(fn, x, *args, **kwargs):
+        if fn == "linalg.qr":
+            qr_calls.append(x.detach().clone())
+        return original_do(fn, x, *args, **kwargs)
+
+    monkeypatch.setattr(ttn_module.ar, "do", record_qr_call)
+    q, _, r = _native_qr_block_scaled(
+        block,
+        method="qr",
+        absorb="right",
+        stabilized=False,
+    )
+    expected_q, expected_r = torch.linalg.qr(block)
+
+    assert len(qr_calls) == 1
+    torch.testing.assert_close(qr_calls[0], block)
+    torch.testing.assert_close(q, expected_q)
+    torch.testing.assert_close(r, expected_r)
+
+
+def test_native_complex64_qr_scales_dynamic_range_block(monkeypatch):
+    """Native QR scales moderate-norm blocks with tiny charge entries."""
+    torch = pytest.importorskip("torch")
+    import pepsy.optimizers.tree.ttn as ttn_module
+
+    block = torch.zeros((4, 10), dtype=torch.complex64)
+    for index, magnitude in enumerate((8.9e-3, 8.9e-11, 8.9e-25, 8.9e-41)):
+        block[index, index] = complex(magnitude, magnitude)
+
+    qr_input_maxes = []
+    original_do = ttn_module.ar.do
+
+    def record_qr_input(fn, x, *args, **kwargs):
+        if fn == "linalg.qr":
+            qr_input_maxes.append(float(x.abs().amax().item()))
+        return original_do(fn, x, *args, **kwargs)
+
+    monkeypatch.setattr(ttn_module.ar, "do", record_qr_input)
+    q, _, r = _native_qr_block_scaled(
+        block,
+        method="qr",
+        absorb="right",
+        stabilized=False,
+    )
+
+    assert len(qr_input_maxes) == 2
+    assert qr_input_maxes[0] == pytest.approx(8.9e-3 * 2**0.5, rel=1e-6)
+    assert 0.5 <= qr_input_maxes[1] < 1.0
+    assert torch.isfinite(q).all()
+    assert torch.isfinite(r).all()
+    torch.testing.assert_close(
+        q @ r,
+        block,
+        rtol=2e-4,
+        atol=1e-12,
+    )
+
+
+def test_native_complex64_qr_handles_structurally_rank_deficient_block():
+    """Native QR keeps structural rank-deficient blocks in complex64."""
+    torch = pytest.importorskip("torch")
+    block = torch.zeros((4, 10), dtype=torch.complex64)
+    for index, magnitude in enumerate((2e-2, 2e-10, 2e-24, 2e-40)):
+        block[index, index] = complex(magnitude, magnitude)
+
+    q, _, r = _native_qr_block_scaled(
+        block,
+        method="qr",
+        absorb="right",
+        stabilized=False,
+    )
+
+    assert torch.isfinite(q).all()
+    assert torch.isfinite(r).all()
+    assert q.dtype == torch.complex64
+    assert r.dtype == torch.complex64
+    torch.testing.assert_close(
+        q @ r,
+        block,
+        rtol=2e-4,
+        atol=1e-12,
+    )
+
+
+@pytest.mark.parametrize("backend_name", ["torch", "cupy"])
+def test_native_complex64_gpu_qr_retries_same_device_double_precision(
+    monkeypatch, backend_name,
+):
+    """Failed GPU QR uses an optimized same-device complex128 retry."""
+    if backend_name == "torch":
+        torch = pytest.importorskip("torch")
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is unavailable")
+        backend_module = torch
+        block = torch.tensor(
+            [[1.0 + 0.0j, 2.0 + 0.0j], [3.0 + 0.0j, 4.0 + 0.0j]],
+            dtype=torch.complex64,
+            device="cuda",
+        )
+        dtype32 = torch.complex64
+    else:
+        cupy = pytest.importorskip("cupy")
+        try:
+            if cupy.cuda.runtime.getDeviceCount() < 1:
+                pytest.skip("CUDA is unavailable")
+        except cupy.cuda.runtime.CUDARuntimeError as exc:
+            pytest.skip(f"CUDA is unavailable: {exc}")
+        backend_module = cupy
+        block = cupy.asarray(
+            [[1.0 + 0.0j, 2.0 + 0.0j], [3.0 + 0.0j, 4.0 + 0.0j]],
+            dtype=cupy.complex64,
+        )
+        dtype32 = cupy.complex64
+
+    import pepsy.optimizers.tree.ttn as ttn_module
+
+    original_do = ttn_module.ar.do
+    qr_dtypes = []
+
+    def fail_complex64_qr(fn, value, *args, **kwargs):
+        result = original_do(fn, value, *args, **kwargs)
+        if fn == "linalg.qr":
+            qr_dtypes.append(value.dtype)
+            if value.dtype == dtype32:
+                result = tuple(
+                    backend_module.full_like(
+                        factor, complex(float("nan"), float("nan")),
+                    )
+                    for factor in result
+                )
+        return result
+
+    monkeypatch.setattr(ttn_module.ar, "do", fail_complex64_qr)
+    q, _, r = _native_qr_block_scaled(
+        block,
+        method="qr",
+        absorb="right",
+        stabilized=False,
+    )
+
+    assert qr_dtypes == [dtype32, backend_module.complex128]
+    assert q.dtype == dtype32
+    assert r.dtype == dtype32
+    assert bool(backend_module.isfinite(q).all())
+    assert bool(backend_module.isfinite(r).all())
+    assert float(backend_module.max(backend_module.abs(q @ r - block))) < 1e-5
+
+
 def test_tree_stable_labels_route_submpo_by_payload_sites(monkeypatch):
     """Stable logical labels do not disable native structured MPO routing."""
     x = np.array([[0.0, 1.0], [1.0, 0.0]], dtype=complex)

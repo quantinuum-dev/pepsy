@@ -54,22 +54,141 @@ from .layout import TreePlan, _DEFAULT_TOP_ARITY
 __all__ = ["TreeTensorNetwork"]
 
 
-def _native_qr_block_scaled(array, **kwargs):
-    """QR one native charge block after a reversible power-of-two scaling.
+def _native_rank_safe_qr(array, backend):
+    """Factor a finite complex64 block with safe backend QR."""
+    if backend == "torch":
+        import torch as xp  # pylint: disable=import-outside-toplevel
+    elif backend == "cupy":
+        import cupy as xp  # pylint: disable=import-outside-toplevel
+    else:  # pragma: no cover - only native GPU backends call this helper
+        raise ValueError(f"unsupported native QR backend {backend!r}")
 
-    Torch's complex64 QR can return NaNs for a rank-deficient block whose
-    entries are small (around ``1e-9``) even though the block is finite. Native
-    Symmray QR is blockwise, so scaling each block independently is exact: the
-    isometric factor is unchanged and the triangular factor is divided by the
-    same scalar afterwards. Power-of-two scaling avoids introducing an extra
-    rounding step into the block values.
+    rows, cols = array.shape
+    rank_limit = min(rows, cols)
+    r_factor = array.clone()
+    q_factor = xp.eye(rows, dtype=array.dtype)
+
+    for index in range(rank_limit):
+        vector = r_factor[index:, index]
+        magnitude = vector.abs()
+        scale = magnitude.amax()
+        # Construct the reflector from a max-normalized vector. This avoids
+        # the subnormal norm division that makes Torch's complex64 QR fail.
+        valid_scale = xp.isfinite(scale) & (scale > 0)
+        safe_scale = xp.where(valid_scale, scale, xp.ones_like(scale))
+        normalized = vector / safe_scale
+        norm = xp.sqrt(xp.sum(normalized.abs() ** 2))
+        valid_norm = valid_scale & xp.isfinite(norm) & (norm > 0)
+        safe_norm = xp.where(valid_norm, norm, xp.ones_like(norm))
+        first = normalized[0]
+        first_abs = first.abs()
+        safe_first_abs = xp.where(
+            first_abs > 0, first_abs, xp.ones_like(first_abs),
+        )
+        phase = xp.where(
+            first_abs > 0,
+            first / safe_first_abs,
+            xp.ones_like(first),
+        )
+        alpha = -phase * safe_norm
+        reflector = normalized.clone()
+        reflector[0] = reflector[0] - alpha
+        reflector_norm = xp.sum(reflector.conj() * reflector).real
+        valid_reflector = (
+            valid_norm
+            & xp.isfinite(reflector_norm)
+            & (reflector_norm > 0)
+        )
+        safe_reflector_norm = xp.where(
+            valid_reflector, reflector_norm, xp.ones_like(reflector_norm),
+        )
+        beta = xp.where(
+            valid_reflector,
+            2 / safe_reflector_norm,
+            xp.zeros_like(reflector_norm),
+        )
+
+        trailing = r_factor[index:, index:]
+        r_factor[index:, index:] = trailing - reflector[:, None] * (
+            beta * (reflector.conj() @ trailing)
+        )[None, :]
+
+        q_trailing = q_factor[:, index:]
+        q_factor[:, index:] = q_trailing - (q_trailing @ reflector)[:, None] * (
+            beta * reflector.conj()
+        )[None, :]
+
+    return q_factor[:, :rank_limit], r_factor[:rank_limit, :]
+
+
+def _native_factors_finite(factors, backend):
+    """Check native QR factors without converting GPU arrays to NumPy."""
+    if factors is None:
+        return False
+    for factor in factors:
+        if factor is None:
+            continue
+        if backend == "torch":
+            finite = factor.isfinite().all().item()
+        elif backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            finite = cp.isfinite(factor).all().item()
+        else:
+            finite = np.isfinite(factor).all()
+        if not bool(finite):
+            return False
+    return True
+
+
+def _native_cast_complex128(array, backend):
+    """Promote one native GPU block without moving it off device."""
+    if backend == "torch":
+        import torch  # pylint: disable=import-outside-toplevel
+
+        return array.to(dtype=torch.complex128)
+    if backend == "cupy":
+        import cupy as cp  # pylint: disable=import-outside-toplevel
+
+        return array.astype(cp.complex128, copy=False)
+    raise ValueError(f"unsupported native GPU backend {backend!r}")
+
+
+def _native_cast_like(array, reference, backend):
+    """Cast one native factor back to the original device and dtype."""
+    if backend == "torch":
+        return array.to(dtype=reference.dtype, device=reference.device)
+    if backend == "cupy":
+        return array.astype(reference.dtype, copy=False)
+    raise ValueError(f"unsupported native GPU backend {backend!r}")
+
+
+def _native_cast_factors(factors, reference, backend):
+    """Cast non-empty QR factors back to the original native dtype."""
+    return tuple(
+        None if factor is None else _native_cast_like(factor, reference, backend)
+        for factor in factors
+    )
+
+
+def _native_qr_block_scaled(array, **kwargs):
+    """QR one native charge block with a reversible scaling fallback.
+
+    Torch's complex64 QR can return NaNs for a rank-deficient block even when
+    its largest entry is moderate, if other entries in the same block are
+    many orders of magnitude smaller. Healthy blocks keep Torch's native QR
+    path unchanged. Only a failed finite block is retried after a reversible
+    power-of-two scaling, with a native rank-safe fallback for structural
+    rank deficiency.
     """
     opts = dict(kwargs)
     opts.pop("method", None)
     opts.pop("fn", None)
 
-    def torch_qr(x, qr_opts):
-        """Run the common native Torch QR block without composed dispatch."""
+    def native_qr(
+        x, qr_opts, *, rank_safe=False, allow_failure=False,
+    ):
+        """Run one native backend QR block without composed dispatch."""
         absorb = qr_opts.get("absorb", "right")
         left_like = absorb in {
             -1, "left", "Us,VH", "lfactor", "Us",
@@ -80,7 +199,20 @@ def _native_qr_block_scaled(array, **kwargs):
         }
         if left_like:
             x = ar.do("transpose", x, (1, 0))
-        q, r = ar.do("linalg.qr", x, **qr_kwargs)
+        try:
+            q, r = ar.do("linalg.qr", x, **qr_kwargs)
+        except Exception:
+            if not allow_failure:
+                raise
+            q, r = None, None
+        if rank_safe and not _native_factors_finite((q, r), backend):
+            # Native GPU QR can still emit NaNs for finite, structurally
+            # rank-deficient blocks after scaling. Use a backend-native
+            # fallback that avoids division by subnormal norms and completes
+            # the orthonormal basis explicitly for zero sectors.
+            q, r = _native_rank_safe_qr(x, backend)
+        if q is None or r is None:
+            return None
         if left_like:
             left = ar.do("transpose", r, (1, 0))
             right = ar.do("transpose", q, (1, 0))
@@ -103,33 +235,88 @@ def _native_qr_block_scaled(array, **kwargs):
     # dispatch layer from every block while retaining exactly the same
     # reduced QR and the same ``stabilized=False`` policy.
     use_torch_qr = backend == "torch"
+    use_native_gpu_qr = backend == "cupy" or (
+        backend == "torch"
+        and getattr(getattr(array, "device", None), "type", None) == "cuda"
+    )
     if ar.get_dtype_name(array) != "complex64":
-        if use_torch_qr:
-            return torch_qr(array, opts)
+        if use_torch_qr or use_native_gpu_qr:
+            return native_qr(array, opts)
         return _quimb_qr_stabilized(array, **opts)
 
-    if backend == "torch":
+    if use_native_gpu_qr:
+        # Keep the normal requested-dtype GPU QR path unchanged. Only a
+        # genuinely nonfinite result pays for the same-device double retry.
+        direct = native_qr(array, opts, allow_failure=True)
+        if _native_factors_finite(direct, backend):
+            return direct
+
+        high = _native_cast_complex128(array, backend)
+        high_result = native_qr(high, opts, allow_failure=True)
+        if _native_factors_finite(high_result, backend):
+            return _native_cast_factors(high_result, array, backend)
+
+        if backend == "torch":
+            block_max = float(array.detach().abs().amax().item())
+        else:
+            block_max = to_float(ar.do("max", ar.do("abs", array)))
+    elif use_torch_qr:
+        # Preserve Torch's normal QR exactly for healthy blocks. Only the
+        # exceptional nonfinite result pays for a scaled retry and, if needed,
+        # the rank-safe complex64 fallback.
+        direct = native_qr(array, opts)
+        if _native_factors_finite(direct, backend):
+            return direct
+
         block_max = float(array.detach().abs().amax().item())
     else:
         block_max = to_float(ar.do("max", ar.do("abs", array)))
     if not np.isfinite(block_max) or block_max == 0.0:
         # Preserve the original failure behaviour for non-finite input, while
         # allowing genuinely empty structural sectors through unchanged.
-        if use_torch_qr:
-            return torch_qr(array, opts)
+        if use_torch_qr or use_native_gpu_qr:
+            return direct
         return _quimb_qr_stabilized(array, **opts)
 
-    # Values above this scale are not affected by the low-norm complex64 QR
-    # failure and avoid an unnecessary multiply/divide pair.
-    if block_max >= 2.0**-8:
-        if use_torch_qr:
-            return torch_qr(array, opts)
-        return _quimb_qr_stabilized(array, **opts)
-
+    # Normalize the exceptional finite block before retrying QR. A threshold
+    # based only on ``block_max`` is insufficient: the failing native block
+    # has max magnitude ~9e-3 but also contains entries ~1e-32 and structural
+    # zeros. Use a power of two so the scaling is exactly reversible in the
+    # complex64 representation.
     _, exponent = np.frexp(block_max)
     scale = float(np.ldexp(1.0, -int(exponent)))
-    if use_torch_qr:
-        left, singular_values, right = torch_qr(array * scale, opts)
+    if use_native_gpu_qr:
+        high_scaled = native_qr(high * scale, opts, allow_failure=True)
+        if _native_factors_finite(high_scaled, backend):
+            left, singular_values, right = _native_cast_factors(
+                high_scaled, array, backend,
+            )
+        else:
+            fallback = native_qr(
+                array * scale,
+                opts,
+                rank_safe=True,
+                allow_failure=True,
+            )
+            if not _native_factors_finite(fallback, backend):
+                raise RuntimeError(
+                    "native GPU QR failed in requested and complex128 "
+                    "dtypes, including the rank-safe fallback."
+                )
+            left, singular_values, right = fallback
+    elif use_torch_qr:
+        fallback = native_qr(
+            array * scale,
+            opts,
+            rank_safe=True,
+            allow_failure=True,
+        )
+        if not _native_factors_finite(fallback, backend):
+            raise RuntimeError(
+                "native Torch QR failed in requested dtype and its "
+                "rank-safe fallback."
+            )
+        left, singular_values, right = fallback
     else:
         left, singular_values, right = _quimb_qr_stabilized(
             array * scale, **opts,
