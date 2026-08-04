@@ -16,22 +16,24 @@ mpo = builder.build_mpo(
 ```
 
 The native model-facing shorthand is
-`fermion.to_mpo(edges, L=3, t=..., U=..., mu=...)`. Couplings remain explicit;
-they are not stored on the `Fermion` object. Use `fermion.build_mpo(...)` when
-the Jordan-Wigner-compatible MPO convention is wanted.
+`fermion.build_mpo(edges, L=3, t=..., U=..., mu=...)`. Couplings remain
+explicit; they are not stored on the `Fermion` object. Pass `fermionic=False`
+to the same builder when the Jordan-Wigner-compatible MPO convention is
+wanted.
 
-`Fermion.to_mpo(...)` and `SymHamiltonian.to_mpo(..., fermionic=True)` return
+`Fermion.build_mpo(...)` and `SymHamiltonian.to_mpo(..., fermionic=True)` return
 native graded `FermionicArray` MPO tensors. Explicit mappings can contain
 arbitrary homogeneous-charge multi-site terms; non-contiguous supports are
 represented by charged virtual channels, and the open boundary carries the
 operator charge when it is nonzero. `ham_tn.build_mpo(..., fermionic=True)`
-selects the same native path. Pass `to_backend=...` to map the stored Symmray
-blocks to a selected array backend.
+selects the same native path. `Fermion.to_mpo(...)` remains a compatibility
+alias. Pass `to_backend=...` to map the stored Symmray blocks to a selected
+array backend.
 
 For a mixed-charge operator, request an explicit charge-sector decomposition:
 
 ```python
-sectors = fermion.to_mpo(
+sectors = fermion.build_mpo(
     mixed_terms,
     L=4,
     fermionic=True,

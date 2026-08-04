@@ -15,10 +15,11 @@ Two routes are provided:
   staggered eta-pair observable and keeps its tree bond independent of the
   lattice size.
 
-The returned public object remains a regular Quimb MPO for compatibility with
-MPS/MPO APIs.  It carries the tree operator as private metadata consumed by
-``TreeTensorNetwork.expectation_mpo_exact``.  The two networks remain
-separate throughout the contraction.
+``TreeMPO`` is a Quimb ``TensorNetworkGenOperator`` over the TreePlan geometry,
+analogous to ``TreeTensorNetwork`` being a ``TensorNetworkGenVector``.  The
+``tree_mpo`` compatibility builder additionally returns a regular Quimb MPO
+for MPS/MPO APIs and attaches the ``TreeMPO`` to it.  The two representations
+remain separate throughout the tree contraction.
 """
 
 from __future__ import annotations
@@ -27,11 +28,13 @@ import heapq
 from numbers import Integral
 import warnings
 
+import autoray as ar
 import numpy as np
+import quimb.tensor as qtn
 
 from .layout import TreePlan
 
-__all__ = ["TreeMPO", "tree_mpo"]
+__all__ = ["TreeMPO", "build_tree_operator", "tree_mpo"]
 
 
 def _tree_plan_signature(plan):
@@ -50,12 +53,58 @@ def _tree_plan_signature(plan):
     )
 
 
-class TreeMPO:
+def _tree_node_selector(plan, selector):
+    """Resolve one public tree-node selector to a structural node id."""
+    if isinstance(selector, str):
+        if selector.startswith("N"):
+            selector = selector[1:]
+        else:
+            raise ValueError(
+                "TreeMPO geometry selectors must be node ids or N<node> tags."
+            )
+    try:
+        node = int(selector)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"invalid TreeMPO node selector {selector!r}.") from exc
+    if node not in plan.children:
+        raise ValueError(f"{node!r} is not a TreePlan node.")
+    return node
+
+
+def _tree_region_selector(plan, selector):
+    """Resolve one or more node selectors to a connected TreePlan region."""
+    if isinstance(selector, (tuple, list, set, frozenset)):
+        nodes = tuple(_tree_node_selector(plan, node) for node in selector)
+    else:
+        nodes = (_tree_node_selector(plan, selector),)
+    if not nodes:
+        raise ValueError("TreeMPO canonical regions cannot be empty.")
+    region = set(nodes)
+    for node in nodes[1:]:
+        region.update(plan.node_path(nodes[0], node))
+    return frozenset(region)
+
+
+def _tree_subtree_span(plan, nodes):
+    """Return the minimal connected node set spanning ``nodes``."""
+    nodes = tuple(nodes)
+    if not nodes:
+        raise ValueError("need at least one tree node to span a subtree.")
+    region = {nodes[0]}
+    for node in nodes[1:]:
+        region.update(plan.node_path(nodes[0], node))
+    return frozenset(region)
+
+
+class TreeMPO(qtn.TensorNetworkGenOperator):
     """TreePlan-aware operator with dense and native Symmray backends.
 
     ``TreeMPO`` is the operator-level API for measurements on a
-    :class:`TreeTensorNetwork`.  It deliberately keeps the optional linear
-    chain MPO separate from the tree representation:
+    :class:`TreeTensorNetwork`. It subclasses Quimb's generalized operator
+    network, so common methods such as ``sites``, ``site_tag``, ``upper_ind``,
+    ``lower_ind``, ``to_dense``, ``H``, and ``copy`` operate on its primary
+    TreePlan network. It deliberately keeps the optional linear chain MPO
+    separate from the tree representation:
 
     ``chain_mpo``
         The ordinary Quimb ``MatrixProductOperator`` produced by
@@ -75,10 +124,26 @@ class TreeMPO:
     compact network instead.
     """
 
+    # Match Quimb's generalized operator API while retaining the additional
+    # TreePlan/chain representation metadata owned by this class.
+    _EXTRA_PROPS = qtn.TensorNetworkGenOperator._EXTRA_PROPS + (
+        "_plan",
+        "_node_tag_id",
+        "_pepsy_backend",
+        "tree_networks",
+        "_canonical_region",
+        "chain_mpo",
+        "terms",
+        "fermionic",
+        "symmetry",
+        "cutoff",
+        "compressed",
+    )
+
     def __init__(
         self,
-        plan,
-        tree_networks,
+        plan=None,
+        tree_networks=None,
         *,
         chain_mpo=None,
         terms=None,
@@ -87,24 +152,72 @@ class TreeMPO:
         symmetry=None,
         cutoff=1e-12,
         compressed=False,
+        sites=None,
+        site_tag_id="I{}",
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+        node_tag_id="N{}",
+        virtual=True,
+        deep=False,
     ):
+        if isinstance(plan, TreeMPO) and tree_networks is None:
+            source = plan
+            plan = source.plan
+            networks = tuple(
+                network.copy(virtual=virtual, deep=deep)
+                for network in source.tree_networks
+            )
+            chain_mpo = (
+                None
+                if source.chain_mpo is None
+                else source.chain_mpo.copy(virtual=virtual, deep=deep)
+            )
+            terms = source.terms
+            backend = source.backend
+            fermionic = source.fermionic
+            symmetry = source.symmetry
+            cutoff = source.cutoff
+            compressed = source.compressed
+            sites = source.sites
+            site_tag_id = source.site_tag_id
+            upper_ind_id = source.upper_ind_id
+            lower_ind_id = source.lower_ind_id
+            node_tag_id = source.node_tag_id
+        elif tree_networks is None:
+            raise TypeError("TreeMPO requires a tree operator network.")
+        else:
+            networks = (
+                tuple(tree_networks)
+                if isinstance(tree_networks, (tuple, list))
+                else (tree_networks,)
+            )
+
         if not isinstance(plan, TreePlan):
             raise TypeError("plan must be a TreePlan.")
-        if isinstance(tree_networks, (tuple, list)):
-            networks = tuple(tree_networks)
-        else:
-            networks = (tree_networks,)
         if not networks or any(network is None for network in networks):
             raise ValueError("TreeMPO requires at least one tree operator network.")
-        self.plan = plan
+        # The first network is the primary generalized tree operator. Use a
+        # virtual Quimb view so inherited operator methods such as
+        # ``sites``, ``upper_ind``, ``lower_ind``, ``to_dense``, ``bond``, and
+        # ``H`` operate on the same tensors as ``tree_networks[0]``.
+        super().__init__(networks[0], virtual=True)
+        self._plan = plan
         self.tree_networks = networks
         self.chain_mpo = chain_mpo
         self.terms = None if terms is None else dict(terms)
-        self.backend = str(backend)
+        self._pepsy_backend = str(backend)
         self.fermionic = bool(fermionic)
         self.symmetry = symmetry
         self.cutoff = float(cutoff)
         self.compressed = bool(compressed)
+        self._sites = (
+            tuple(sorted(plan.node_of_qubit)) if sites is None else tuple(sites)
+        )
+        self._site_tag_id = site_tag_id
+        self._upper_ind_id = upper_ind_id
+        self._lower_ind_id = lower_ind_id
+        self._node_tag_id = node_tag_id
+        self._canonical_region = None
         self.pepsy_tree_plan_signature = _tree_plan_signature(plan)
         if chain_mpo is not None:
             chain_mpo.pepsy_tree_plan_signature = self.pepsy_tree_plan_signature
@@ -113,6 +226,73 @@ class TreeMPO:
             )
             chain_mpo.pepsy_tree_operator = self
             chain_mpo.pepsy_tree_operator_networks = self.tree_networks
+
+    @property
+    def backend(self):
+        """Return the logical Pepsy backend label for this operator."""
+        return self._pepsy_backend
+
+    @property
+    def pepsy_backend(self):
+        """Compatibility view used by Quimb's structured-network copier."""
+        return self._pepsy_backend
+
+    @property
+    def plan(self):
+        """The :class:`TreePlan` describing the operator geometry."""
+        return self._plan
+
+    @property
+    def node_tag_id(self):
+        """Format string for structural tree-node tags."""
+        return self._node_tag_id
+
+    @property
+    def site_ind_id(self):
+        """Alias for the operator's upper physical-index format."""
+        return self.upper_ind_id
+
+    @site_ind_id.setter
+    def site_ind_id(self, value):
+        self.upper_ind_id = value
+
+    def site_ind(self, site):
+        """Return the ket-like physical index for ``site``."""
+        return self.upper_ind(site)
+
+    @property
+    def root(self):
+        """The structural root node id."""
+        return self.plan.root
+
+    @property
+    def canonical_region(self):
+        """The currently canonicalized connected operator region."""
+        return self._canonical_region
+
+    @property
+    def orthogonality_center(self):
+        """The single canonical node, or ``None`` for a larger region."""
+        region = self.canonical_region
+        return next(iter(region)) if region is not None and len(region) == 1 else None
+
+    @property
+    def fermionic(self):
+        """Whether the operator stores native fermionic arrays."""
+        return self._fermionic
+
+    @fermionic.setter
+    def fermionic(self, value):
+        self._fermionic = bool(value)
+
+    @property
+    def symmetry(self):
+        """Native Symmray symmetry label, if present."""
+        return self._symmetry
+
+    @symmetry.setter
+    def symmetry(self, value):
+        self._symmetry = value
 
     @classmethod
     def from_hamiltonian(
@@ -203,6 +383,168 @@ class TreeMPO:
             operator.compress(max_bond=max_bond, cutoff=cutoff)
         return operator
 
+    @classmethod
+    def from_dense(
+        cls,
+        plan,
+        array=None,
+        dims=2,
+        *,
+        tree=None,
+        sites=None,
+        tags=None,
+        site_tag_id="I{}",
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+        node_tag_id="N{}",
+        **split_opts,
+    ):
+        """Build an exact tree operator from a dense matrix.
+
+        This is the tree analogue of ``MatrixProductOperator.from_dense``.
+        The matrix is decomposed over the supplied ``TreePlan`` with lossless
+        leaf-to-root SVDs. Only the physical site ordering differs from the
+        chain constructor: ``sites`` labels the plan's logical qubits.
+        """
+        if not isinstance(plan, TreePlan):
+            if tree is None:
+                raise TypeError("pass a TreePlan with `tree=` or as the first argument.")
+            if array is not None:
+                raise TypeError("dense array was supplied more than once.")
+            array = plan
+            plan = tree
+        elif tree is not None and tree is not plan:
+            raise ValueError("plan and tree specify different TreePlans.")
+        if array is None:
+            raise TypeError("TreeMPO.from_dense requires a dense matrix.")
+        if not isinstance(plan, TreePlan):
+            raise TypeError("plan must be a TreePlan.")
+        if sites is None:
+            sites = tuple(sorted(plan.node_of_qubit))
+        else:
+            sites = tuple(int(site) for site in sites)
+        if sites != tuple(sorted(sites)):
+            raise ValueError("TreeMPO.from_dense requires sorted site labels.")
+        if set(sites) != set(plan.node_of_qubit):
+            raise ValueError(
+                "TreeMPO.from_dense currently requires one matrix site per tree site."
+            )
+        if isinstance(dims, Integral):
+            dims = (int(dims),) * len(sites)
+        else:
+            dims = tuple(int(dim) for dim in dims)
+        if len(dims) != len(sites):
+            raise ValueError("dims must have one entry per TreePlan site.")
+        if np.prod(dims, dtype=int) ** 2 != np.size(array):
+            raise ValueError("array size does not match the supplied physical dims.")
+        network = _tree_operator_from_dense(
+            plan,
+            array,
+            sites=sites,
+            dims=dims,
+            split_opts=split_opts,
+            site_tag_id=site_tag_id,
+            upper_ind_id=upper_ind_id,
+            lower_ind_id=lower_ind_id,
+            node_tag_id=node_tag_id,
+        )
+        if tags is not None:
+            network.add_tag(tags)
+        return cls(
+            plan,
+            network,
+            backend="dense",
+            fermionic=False,
+            sites=sites,
+            site_tag_id=site_tag_id,
+            upper_ind_id=upper_ind_id,
+            lower_ind_id=lower_ind_id,
+            node_tag_id=node_tag_id,
+        )
+
+    @classmethod
+    def from_fill_fn(
+        cls,
+        fill_fn,
+        plan,
+        bond_dim,
+        *,
+        phys_dim=2,
+        dtype=float,
+        sites=None,
+        tags=None,
+        site_tag_id="I{}",
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+        node_tag_id="N{}",
+    ):
+        """Build a tree operator from a tensor filling function.
+
+        ``fill_fn`` is called as ``fill_fn(shape)`` for each plan node, where
+        ``shape`` is ordered as physical upper/lower legs followed by the
+        node's tree bonds. A scalar ``bond_dim`` or one value per edge is
+        accepted through the same uniform tree convention.
+        """
+        if sites is None:
+            sites = tuple(sorted(plan.node_of_qubit))
+        else:
+            sites = tuple(sites)
+        network = _tree_operator_from_fill_fn(
+            plan,
+            fill_fn,
+            bond_dim=bond_dim,
+            phys_dim=phys_dim,
+            dtype=dtype,
+            site_tag_id=site_tag_id,
+            upper_ind_id=upper_ind_id,
+            lower_ind_id=lower_ind_id,
+            node_tag_id=node_tag_id,
+        )
+        if tags is not None:
+            network.add_tag(tags)
+        return cls(
+            plan,
+            network,
+            backend="dense",
+            fermionic=False,
+            sites=sites,
+            site_tag_id=site_tag_id,
+            upper_ind_id=upper_ind_id,
+            lower_ind_id=lower_ind_id,
+            node_tag_id=node_tag_id,
+        )
+
+    @classmethod
+    def rand(
+        cls,
+        plan,
+        bond_dim,
+        *,
+        phys_dim=2,
+        dtype=complex,
+        seed=None,
+        **operator_opts,
+    ):
+        """Build a random dense TreeMPO with uniform virtual bond size."""
+        rng = np.random.default_rng(seed)
+
+        def fill(shape):
+            if np.issubdtype(np.dtype(dtype), np.complexfloating):
+                return (
+                    rng.standard_normal(shape)
+                    + 1j * rng.standard_normal(shape)
+                ).astype(dtype)
+            return rng.standard_normal(shape).astype(dtype)
+
+        return cls.from_fill_fn(
+            fill,
+            plan,
+            bond_dim=bond_dim,
+            phys_dim=phys_dim,
+            dtype=dtype,
+            **operator_opts,
+        )
+
     @property
     def tree_network(self):
         """Return the sole tree network, or raise for a term sum."""
@@ -213,6 +555,166 @@ class TreeMPO:
             )
         return self.tree_networks[0]
 
+    @property
+    def nqubits(self):
+        """Number of logical physical sites in the TreePlan."""
+        return self.plan.n
+
+    @property
+    def top_arity(self):
+        """Number of virtual child bonds at the structural root."""
+        return self.plan.top_arity
+
+    @property
+    def max_virtual_degree(self):
+        """Largest number of virtual tree bonds on one operator tensor."""
+        return self.plan.max_virtual_degree()
+
+    @property
+    def max_tensor_rank(self):
+        """Largest virtual/physical leg count on one operator tensor."""
+        return self.plan.max_tensor_rank()
+
+    def node_tag(self, node):
+        """Return the structural tag for a TreePlan node."""
+        return self._node_tag_id.format(int(node))
+
+    def node_tensor(self, node):
+        """Return a primary TTNO tensor by TreePlan node id."""
+        return self.tree_networks[0][self.node_tag(node)]
+
+    def _select_tids(self, tids, virtual=True, with_exponent=False):
+        """Select a structured view while keeping its primary network live."""
+        selected = super()._select_tids(
+            tids,
+            virtual=virtual,
+            with_exponent=with_exponent,
+        )
+        # Quimb's generic ``new(like=...)`` copies the extra properties from
+        # the source, including ``tree_networks``. Replace that source tuple
+        # with the selected view so inherited selection methods never mutate
+        # or inspect the original operator by accident.
+        selected.tree_networks = (qtn.TensorNetwork(selected, virtual=True),)
+        selected.chain_mpo = None
+        return selected
+
+    def neighbors(self, node):
+        """Return the TreePlan neighbors of a structural node."""
+        node = int(node)
+        if node not in self.plan.children:
+            raise ValueError(f"{node!r} is not a TreePlan node.")
+        return tuple(self.plan.children[node]) + (
+            (self.plan.parent[node],)
+            if self.plan.parent.get(node) is not None
+            else ()
+        )
+
+    def is_leaf(self, node):
+        """Whether ``node`` is a structural leaf."""
+        return self.plan.is_leaf(int(node))
+
+    def parent(self, node):
+        """Return the parent structural node, or ``None`` at the root."""
+        node = int(node)
+        if node not in self.plan.children:
+            raise ValueError(f"{node!r} is not a TreePlan node.")
+        return self.plan.parent.get(node)
+
+    def children(self, node):
+        """Return the structural children of ``node``."""
+        node = int(node)
+        if node not in self.plan.children:
+            raise ValueError(f"{node!r} is not a TreePlan node.")
+        return self.plan.children[node]
+
+    def node_path(self, node1, node2):
+        """Return the inclusive structural path between two nodes."""
+        return self.plan.node_path(int(node1), int(node2))
+
+    def leaf_of_qubit(self, qubit):
+        """Return the structural leaf carrying ``qubit``."""
+        return self.plan.leaf_of_qubit[int(qubit)]
+
+    def qubit_of_leaf(self, node):
+        """Return the qubit carried by a structural leaf."""
+        return self.plan.qubit_of_leaf[int(node)]
+
+    def qubit_of_node(self, node):
+        """Return the qubit carried by a node, or ``None`` if virtual."""
+        return self.plan.qubit_of_node.get(int(node))
+
+    def node_of_qubit(self, qubit):
+        """Return the structural node carrying ``qubit``."""
+        return self.plan.node_of_qubit[int(qubit)]
+
+    def tree_distance(self, qubit1, qubit2):
+        """Return the structural distance between two physical sites."""
+        return self.plan.tree_distance(int(qubit1), int(qubit2))
+
+    def steiner_nodes(self, nodes):
+        """Return the minimal connected subtree spanning ``nodes``."""
+        return self.plan.steiner_nodes(tuple(int(node) for node in nodes))
+
+    def subtree_span(self, nodes):
+        """Return the minimal connected subtree spanning arbitrary nodes."""
+        return _tree_subtree_span(
+            self.plan, tuple(int(node) for node in nodes),
+        )
+
+    def is_binary(self, *, allow_ternary_root=True):
+        """Whether this operator's tree is binary below its root."""
+        return self.plan.is_binary(allow_ternary_root=allow_ternary_root)
+
+    def bond(self, node, neighbor):
+        """Return the live operator bond between adjacent TreePlan nodes."""
+        node = int(node)
+        neighbor = int(neighbor)
+        if neighbor not in self.neighbors(node):
+            raise ValueError(
+                f"nodes {node} and {neighbor} are not adjacent in the tree."
+            )
+        shared = qtn.bonds(
+            self.node_tensor(node), self.node_tensor(neighbor),
+        )
+        if len(shared) != 1:
+            raise ValueError(
+                f"nodes {node} and {neighbor} must share exactly one bond; "
+                f"found {sorted(shared)}."
+            )
+        return next(iter(shared))
+
+    def validate(self):
+        """Validate the primary TTNO against its TreePlan geometry."""
+        network = self.tree_networks[0]
+        for node in self.plan.nodes():
+            tensor = self.node_tensor(node)
+            expected = set(self.neighbors(node))
+            physical = self.plan.qubit_of_node.get(node)
+            expected_inds = {
+                f"_pepsy_tnno_{min(node, other)}_{max(node, other)}"
+                for other in expected
+            }
+            if physical is not None:
+                expected_inds.update((
+                    self.upper_ind(physical),
+                    self.lower_ind(physical),
+                ))
+            if set(tensor.inds) != expected_inds:
+                raise ValueError(
+                    f"TreeMPO node {node} has unexpected indices: "
+                    f"{tensor.inds!r}."
+                )
+        for node in self.plan.nodes():
+            for neighbor in self.plan.children[node]:
+                self.bond(node, neighbor)
+        if set(network.outer_inds()) != {
+            self.upper_ind(site) for site in self.sites
+        } | {
+            self.lower_ind(site) for site in self.sites
+        }:
+            raise ValueError("TreeMPO has unexpected outer physical indices.")
+        return self
+
     def max_bond(self):
         """Return the largest virtual bond among the tree networks."""
         bonds = []
@@ -221,13 +723,457 @@ class TreeMPO:
                 bonds.append(network.ind_size(index))
         return max(bonds, default=1)
 
-    def canonicalize(self, center=None):
-        """Canonicalize every stored TTNO around one TreePlan node."""
+    def bond_size(self, node, neighbor):
+        """Return the dimension of one live operator tree bond."""
+        return self.node_tensor(node).ind_size(self.bond(node, neighbor))
+
+    def bond_sizes(self):
+        """Return operator bond dimensions in deterministic tree-edge order."""
+        return tuple(
+            self.bond_size(node, child)
+            for node in self.plan.nodes()
+            for child in self.plan.children[node]
+        )
+
+    def edge_nodes(self):
+        """Return all directed parent-child tree edges."""
+        return tuple(
+            (node, child)
+            for node in self.plan.nodes()
+            for child in self.plan.children[node]
+        )
+
+    @property
+    def L(self):
+        """Number of logical physical sites, as in a chain MPO."""
+        return self.nsites
+
+    @property
+    def cyclic(self):
+        """TreeMPOs are open tree networks, never cyclic chains."""
+        return False
+
+    def to_dense(self, *inds_seq, to_qarray=False, **contract_opts):
+        """Contract the complete operator, summing internal term networks."""
+        if len(self.tree_networks) == 1:
+            return qtn.TensorNetworkGenOperator.to_dense(
+                self,
+                *inds_seq,
+                to_qarray=to_qarray,
+                **contract_opts,
+            )
+        if not inds_seq:
+            inds_seq = (self.upper_inds_present, self.lower_inds_present)
+        values = []
+        for network in self.tree_networks:
+            view = qtn.TensorNetworkGenOperator(
+                network,
+                virtual=True,
+            )
+            view._sites = self.sites
+            view._site_tag_id = self.site_tag_id
+            view._upper_ind_id = self.upper_ind_id
+            view._lower_ind_id = self.lower_ind_id
+            values.append(view.to_dense(*inds_seq, **contract_opts))
+        result = values[0]
+        for value in values[1:]:
+            result = result + value
+        if to_qarray:
+            import quimb as qu
+
+            return qu.qarray(result)
+        return result
+
+    def identity(self, *, phys_dim=None, dtype=None):
+        """Return the exact bond-one identity TreeMPO on this plan."""
+        if phys_dim is None:
+            phys_dim = tuple(self.phys_dim(site) for site in self.sites)
+        if dtype is None:
+            dtype = self.dtype
+        network = _identity_tree_operator(
+            self.plan,
+            phys_dim=phys_dim,
+            dtype=dtype,
+            site_tag_id=self.site_tag_id,
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            node_tag_id=self.node_tag_id,
+        )
+        return type(self)(
+            self.plan,
+            network,
+            backend="dense",
+            fermionic=False,
+            sites=self.sites,
+            site_tag_id=self.site_tag_id,
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            node_tag_id=self.node_tag_id,
+        )
+
+    def add_MPO(
+        self,
+        other,
+        inplace=False,
+        negate=False,
+        compress=False,
+        **compress_opts,
+    ):
+        """Add another matching tree operator by arbitrary-geometry direct sum."""
+        if not isinstance(other, TreeMPO):
+            other = getattr(other, "pepsy_tree_operator", None)
+        if not isinstance(other, TreeMPO):
+            raise TypeError("other must be a TreeMPO or an annotated chain MPO.")
+        if self.pepsy_tree_plan_signature != other.pepsy_tree_plan_signature:
+            raise ValueError("TreeMPOs must use the same TreePlan.")
+        if self.fermionic != other.fermionic:
+            raise TypeError("cannot add dense and native TreeMPOs.")
+        if len(self.tree_networks) != len(other.tree_networks):
+            raise ValueError("TreeMPO term-network counts must match.")
+
+        networks = []
+        for left, right in zip(self.tree_networks, other.tree_networks):
+            networks.append(qtn.tensor_network_ag_sum(
+                left,
+                right,
+                site_tags=tuple(self.node_tag(node) for node in self.plan.nodes()),
+                negate=negate,
+                compress=compress,
+                **compress_opts,
+            ))
+        chain = None
+        if self.chain_mpo is not None and other.chain_mpo is not None:
+            chain = self.chain_mpo.add_MPO(
+                other.chain_mpo,
+                inplace=False,
+                negate=negate,
+                compress=compress,
+                **compress_opts,
+            )
+        terms = None
+        if self.terms is not None and other.terms is not None:
+            terms = dict(self.terms)
+            for support, value in other.terms.items():
+                if support in terms:
+                    terms[support] = terms[support] + ((-1) if negate else 1) * value
+                else:
+                    terms[support] = ((-1) if negate else 1) * value
+        result = type(self)(
+            self.plan,
+            tuple(networks),
+            chain_mpo=chain,
+            terms=terms,
+            backend=self.backend,
+            fermionic=self.fermionic,
+            symmetry=self.symmetry,
+            cutoff=self.cutoff,
+            compressed=compress,
+            sites=self.sites,
+            site_tag_id=self.site_tag_id,
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            node_tag_id=self.node_tag_id,
+        )
+        if inplace:
+            self.__dict__.clear()
+            self.__dict__.update(result.__dict__)
+            return self
+        return result
+
+    add_MPO_ = lambda self, other, **kwargs: self.add_MPO(  # noqa: E731
+        other, inplace=True, **kwargs,
+    )
+
+    def matrix_element(self, bra, ket=None):
+        """Return ``<bra|TreeMPO|ket>`` for computational-basis strings."""
+        if ket is None:
+            ket = bra
+        bra = tuple(int(value) for value in bra)
+        ket = tuple(int(value) for value in ket)
+        if len(bra) != self.nsites or len(ket) != self.nsites:
+            raise ValueError("basis configurations must match TreeMPO.nsites.")
+        selector = {}
+        for site, bra_value, ket_value in zip(self.sites, bra, ket):
+            selector[self.upper_ind(site)] = bra_value
+            selector[self.lower_ind(site)] = ket_value
+        value = 0.0
+        for network in self.tree_networks:
+            value = value + network.isel(selector).contract(all)
+        return value
+
+    def amplitude(self, configuration):
+        """Return the diagonal computational-basis matrix element."""
+        return self.matrix_element(configuration)
+
+    def singular_values(self, node, neighbor=None, *, method="svd"):
+        """Return singular values across one tree operator edge."""
+        if neighbor is None:
+            try:
+                node, neighbor = node
+            except (TypeError, ValueError) as exc:
+                raise TypeError("singular_values needs an operator edge.") from exc
+        node = _tree_node_selector(self.plan, node)
+        neighbor = _tree_node_selector(self.plan, neighbor)
+        if neighbor not in self.neighbors(node):
+            raise ValueError("singular_values requires adjacent tree nodes.")
+        work = self.copy()
+        work.canonicalize(center=neighbor)
+        tensor = work.node_tensor(node)
+        bond = work.bond(node, neighbor)
+        return tensor.singular_values(
+            tuple(ind for ind in tensor.inds if ind != bond),
+            method=method,
+        )
+
+    def rand_state(self, bond_dim, **state_opts):
+        """Return a random :class:`TreeTensorNetwork` on the same plan."""
+        from .ttn import TreeTensorNetwork
+
+        return TreeTensorNetwork.rand(self.plan, D=bond_dim, **state_opts)
+
+    def show(self, *, bond_dims=True, node_ids=False, color=False):
+        """Print a compact top-down tree drawing for this operator."""
+        del color
+
+        def render(node, prefix="", is_last=True):
+            qubit = self.plan.qubit_of_node.get(node)
+            label = f"N{node}" if node_ids else "●"
+            if qubit is not None:
+                label += f" q{qubit}"
+            lines = [prefix + ("└─ " if is_last else "├─ ") + label]
+            children = tuple(self.plan.children[node])
+            for index, child in enumerate(children):
+                edge = self.bond_size(node, child) if bond_dims else None
+                edge_label = f" [{edge}]" if edge is not None else ""
+                child_lines = render(
+                    child,
+                    prefix + ("   " if is_last else "│  "),
+                    index == len(children) - 1,
+                )
+                child_lines[0] = child_lines[0] + edge_label
+                lines.extend(child_lines)
+            return lines
+
+        lines = render(self.plan.root, "", True)
+        print("\n".join(lines))
+
+    def canonicalize(self, center=None, *, inplace=True):
+        """Canonicalize every stored TTNO around one TreePlan node.
+
+        This is the tree equivalent of an MPO mixed-canonical gauge. The
+        default is inplace, matching Quimb's MPO canonicalization methods;
+        pass ``inplace=False`` to obtain an independent operator.
+        """
         if center is None:
             center = self.plan.root
-        for network in self.tree_networks:
-            _canonicalize_tree_operator(network, self.plan, center)
+        center = _tree_node_selector(self.plan, center)
+        target = self if inplace else self.copy()
+        for network in target.tree_networks:
+            _canonicalize_tree_operator(network, target.plan, center)
+        target._canonical_region = frozenset({center})
+        return target
+
+    def canonicalize_(self, center=None):
+        """Inplace alias for :meth:`canonicalize`."""
+        return self.canonicalize(center=center, inplace=True)
+
+    canonize = canonicalize_
+
+    def invalidate_canonical_form(self):
+        """Forget operator gauge metadata after an unmanaged tensor edit."""
+        self._canonical_region = None
         return self
+
+    def isometry_direction(self, node):
+        """Return the neighbour receiving a node's canonical QR factor."""
+        node = _tree_node_selector(self.plan, node)
+        tensor = self.node_tensor(node)
+        if tensor.left_inds is None:
+            return None
+        right_inds = [ind for ind in tensor.inds if ind not in tensor.left_inds]
+        if len(right_inds) != 1:
+            return None
+        for neighbor in self.neighbors(node):
+            if right_inds[0] == self.bond(node, neighbor):
+                return neighbor
+        return None
+
+    def isometry_map(self):
+        """Return the live QR orientation map for all TreePlan nodes."""
+        return {
+            node: self.isometry_direction(node)
+            for node in self.plan.nodes()
+        }
+
+    def is_subtree_canonical_form(self, nodes=None, *, span=False):
+        """Check the lossless QR metadata around a connected operator region."""
+        if nodes is None:
+            region = self.canonical_region
+            if region is None:
+                return False
+        else:
+            region = _tree_region_selector(self.plan, nodes) if span else frozenset(
+                _tree_node_selector(self.plan, node) for node in nodes
+            )
+            if _tree_subtree_span(self.plan, region) != region:
+                return False
+        for node in self.plan.nodes():
+            if node in region:
+                continue
+            path = min(
+                (
+                    self.plan.node_path(node, target)
+                    for target in region
+                ),
+                key=len,
+            )
+            if self.isometry_direction(node) != path[1]:
+                return False
+        return True
+
+    def is_canonical_form(self, center=None):
+        """Check whether the operator has a one-node canonical region."""
+        if center is None:
+            center = self.orthogonality_center
+        if center is None:
+            return False
+        return self.is_subtree_canonical_form((center,))
+
+    def shift_orthogonality_center(self, current, new):
+        """Move the operator QR centre to another TreePlan node."""
+        del current
+        return self.canonicalize(center=new, inplace=True)
+
+    def calc_current_orthog_center(self):
+        """Return the current operator canonical region bounds."""
+        region = self.canonical_region
+        if not region:
+            return None
+        ordered = sorted(region)
+        return ordered[0], ordered[-1]
+
+    def left_canonicalize(self, *, center=None, inplace=False, **kwargs):
+        """MPO-compatible alias for a root-oriented tree QR sweep."""
+        del kwargs
+        return self.canonicalize(
+            center=self.plan.root if center is None else center,
+            inplace=inplace,
+        )
+
+    left_canonicalize_ = lambda self, **kwargs: self.left_canonicalize(  # noqa: E731
+        inplace=True, **kwargs,
+    )
+    left_canonize = left_canonicalize_
+
+    def right_canonicalize(self, *, center=None, inplace=False, **kwargs):
+        """MPO-compatible alias for a root-oriented tree QR sweep."""
+        del kwargs
+        return self.canonicalize(
+            center=self.plan.root if center is None else center,
+            inplace=inplace,
+        )
+
+    right_canonicalize_ = lambda self, **kwargs: self.right_canonicalize(  # noqa: E731
+        inplace=True, **kwargs,
+    )
+    right_canonize = right_canonicalize_
+
+    def compress_site(self, node, *, max_bond=None, cutoff=None, **kwargs):
+        """Compress all tree bonds consistently around ``node``."""
+        del kwargs
+        self.canonicalize(center=node)
+        return self.compress(max_bond=max_bond, cutoff=cutoff)
+
+    def left_compress(self, *, max_bond=None, cutoff=None, **kwargs):
+        """Tree analogue of a left-to-right MPO compression sweep."""
+        del kwargs
+        return self.compress(max_bond=max_bond, cutoff=cutoff)
+
+    def right_compress(self, *, max_bond=None, cutoff=None, **kwargs):
+        """Tree analogue of a right-to-left MPO compression sweep."""
+        del kwargs
+        return self.compress(max_bond=max_bond, cutoff=cutoff)
+
+    def canonize_around(
+        self, tags, which="all", *, inplace=False, **canonize_opts,
+    ):
+        """Quimb-style alias for TreePlan-centered TTNO canonicalization.
+
+        Tree operators have a rooted geometry rather than a one-dimensional
+        tag interval, so the supported target is one TreePlan node. The
+        additional Quimb options are accepted for API familiarity and are
+        intentionally ignored after validating that the target is a node.
+        """
+        del which, canonize_opts
+        if isinstance(tags, (tuple, list, set, frozenset)):
+            if len(tags) == 0:
+                raise ValueError("TreeMPO.canonize_around needs one node.")
+            if len(tags) != 1:
+                target = self if inplace else self.copy()
+                region = _tree_region_selector(target.plan, tags)
+                for network in target.tree_networks:
+                    _canonicalize_tree_operator_region(
+                        network, target.plan, region,
+                    )
+                target._canonical_region = region
+                return target
+        target = self if inplace else self.copy()
+        return target.canonicalize(center=tags, inplace=True)
+
+    def canonize_around_(self, tags, **kwargs):
+        """In-place Quimb-style alias for :meth:`canonize_around`."""
+        kwargs["inplace"] = True
+        return self.canonize_around(tags, **kwargs)
+
+    def canonize_between(
+        self, tags1, tags2, *, inplace=False, absorb="right", **canonize_opts,
+    ):
+        """Canonicalize the operator exterior to a TreePlan path.
+
+        A path is the tree analogue of the mixed-canonical interval used by
+        an MPS. ``absorb`` and other Quimb gauge options are accepted for API
+        compatibility; the lossless native QR policy controls the operation.
+        """
+        del absorb, canonize_opts
+        node1 = _tree_node_selector(self.plan, tags1)
+        node2 = _tree_node_selector(self.plan, tags2)
+        region = frozenset(self.plan.node_path(node1, node2))
+        target = self if inplace else self.copy()
+        for network in target.tree_networks:
+            _canonicalize_tree_operator_region(network, target.plan, region)
+        target._canonical_region = region
+        return target
+
+    def canonize_between_(self, tags1, tags2, **kwargs):
+        """In-place alias for :meth:`canonize_between`."""
+        kwargs["inplace"] = True
+        return self.canonize_between(tags1, tags2, **kwargs)
+
+    def compress_between(
+        self, tags1, tags2, max_bond=None, cutoff=1e-10, **compress_opts,
+    ):
+        """Quimb-style compression entry point for a tree operator.
+
+        A TreeMPO compression is a global leaf-to-root sweep so every edge
+        sees the complete operator sum. ``tags1`` and ``tags2`` identify an
+        adjacent TreePlan edge for validation; the configured sweep then
+        compresses all TreePlan bonds consistently.
+        """
+        inplace = compress_opts.pop("inplace", True)
+        del compress_opts
+        node1 = _tree_node_selector(self.plan, tags1)
+        node2 = _tree_node_selector(self.plan, tags2)
+        if node2 not in self.neighbors(node1):
+            raise ValueError(
+                "TreeMPO.compress_between requires adjacent TreePlan nodes."
+            )
+        target = self if inplace else self.copy()
+        return target.compress(max_bond=max_bond, cutoff=cutoff)
+
+    def compress_between_(self, tags1, tags2, **kwargs):
+        """In-place alias for :meth:`compress_between`."""
+        kwargs["inplace"] = True
+        return self.compress_between(tags1, tags2, **kwargs)
 
     def compress(self, *, max_bond=None, cutoff=None):
         """Compress the TTNO on every TreePlan edge with native SVD."""
@@ -245,14 +1191,29 @@ class TreeMPO:
         self.cutoff = cutoff
         self.compressed = True
         self.pepsy_compression_report = reports[0] if len(reports) == 1 else reports
+        self._canonical_region = None
         return self
 
-    def copy(self):
-        """Copy the operator and both of its optional representations."""
-        chain_mpo = None if self.chain_mpo is None else self.chain_mpo.copy()
+    def copy(self, virtual=False, deep=False, *, conj=False, transpose=False):
+        """Copy the operator and both of its optional representations.
+
+        The signature follows Quimb's tensor-network ``copy`` API. ``virtual``
+        keeps tensor data shared while copying the network structure; ``deep``
+        requests independent numeric data as in the underlying Quimb views.
+        ``conj`` and ``transpose`` are accepted as convenient MPO-compatible
+        view operations.
+        """
+        chain_mpo = (
+            None
+            if self.chain_mpo is None
+            else self.chain_mpo.copy(virtual=virtual, deep=deep)
+        )
         copied = type(self)(
             self.plan,
-            tuple(network.copy() for network in self.tree_networks),
+            tuple(
+                network.copy(virtual=virtual, deep=deep)
+                for network in self.tree_networks
+            ),
             chain_mpo=chain_mpo,
             terms=self.terms,
             backend=self.backend,
@@ -260,6 +1221,11 @@ class TreeMPO:
             symmetry=self.symmetry,
             cutoff=self.cutoff,
             compressed=self.compressed,
+            sites=self.sites,
+            site_tag_id=self.site_tag_id,
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            node_tag_id=self.node_tag_id,
         )
         if chain_mpo is not None:
             chain_mpo.pepsy_tree_plan_signature = copied.pepsy_tree_plan_signature
@@ -268,7 +1234,114 @@ class TreeMPO:
             )
             chain_mpo.pepsy_tree_operator = copied
             chain_mpo.pepsy_tree_operator_networks = copied.tree_networks
+        if hasattr(self, "pepsy_compression_report"):
+            copied.pepsy_compression_report = self.pepsy_compression_report
+        copied._canonical_region = self.canonical_region
+        if transpose:
+            copied._transpose_operator_inplace()
+        if conj:
+            copied.conj(inplace=True)
         return copied
+
+    def _transpose_operator_inplace(self):
+        """Transpose every local upper/lower physical pair in place."""
+        for network in self.tree_networks:
+            for tensor in network:
+                physical_axes = []
+                for site in self.sites:
+                    upper = self.upper_ind(site)
+                    lower = self.lower_ind(site)
+                    if upper in tensor.inds and lower in tensor.inds:
+                        physical_axes.append((
+                            tensor.inds.index(upper),
+                            tensor.inds.index(lower),
+                        ))
+                if not physical_axes:
+                    continue
+                permutation = list(range(tensor.ndim))
+                for upper_axis, lower_axis in physical_axes:
+                    permutation[upper_axis], permutation[lower_axis] = (
+                        permutation[lower_axis], permutation[upper_axis]
+                    )
+                tensor.modify(data=ar.do("transpose", tensor.data, permutation))
+        if self.chain_mpo is not None:
+            for tensor in self.chain_mpo:
+                axes = []
+                for site in self.sites:
+                    upper = self.upper_ind(site)
+                    lower = self.lower_ind(site)
+                    if upper in tensor.inds and lower in tensor.inds:
+                        axes.append((
+                            tensor.inds.index(upper),
+                            tensor.inds.index(lower),
+                        ))
+                permutation = list(range(tensor.ndim))
+                for upper_axis, lower_axis in axes:
+                    permutation[upper_axis], permutation[lower_axis] = (
+                        permutation[lower_axis], permutation[upper_axis]
+                    )
+                if axes:
+                    tensor.modify(data=ar.do("transpose", tensor.data, permutation))
+        return self
+
+    def conj(
+        self,
+        mangle_inner=False,
+        output_inds=None,
+        phase_dual=True,
+        inplace=False,
+    ):
+        """Conjugate every stored tree operator like a Quimb operator view."""
+        if inplace:
+            for network in self.tree_networks:
+                network.conj(
+                    mangle_inner=mangle_inner,
+                    output_inds=output_inds,
+                    phase_dual=phase_dual,
+                    inplace=True,
+                )
+            if self.chain_mpo is not None:
+                self.chain_mpo.conj(
+                    mangle_inner=mangle_inner,
+                    output_inds=output_inds,
+                    phase_dual=phase_dual,
+                    inplace=True,
+                )
+            return self
+
+        networks = tuple(
+            network.conj(
+                mangle_inner=mangle_inner,
+                output_inds=output_inds,
+                phase_dual=phase_dual,
+            )
+            for network in self.tree_networks
+        )
+        chain_mpo = (
+            None
+            if self.chain_mpo is None
+            else self.chain_mpo.conj(
+                mangle_inner=mangle_inner,
+                output_inds=output_inds,
+                phase_dual=phase_dual,
+            )
+        )
+        return type(self)(
+            self.plan,
+            networks,
+            chain_mpo=chain_mpo,
+            terms=self.terms,
+            backend=self.backend,
+            fermionic=self.fermionic,
+            symmetry=self.symmetry,
+            cutoff=self.cutoff,
+            compressed=self.compressed,
+            sites=self.sites,
+            site_tag_id=self.site_tag_id,
+            upper_ind_id=self.upper_ind_id,
+            lower_ind_id=self.lower_ind_id,
+            node_tag_id=self.node_tag_id,
+        )
 
     def expectation(self, state, *, normalized=True, optimize="auto"):
         """Evaluate ``<state|TreeMPO|state>`` in one public operation."""
@@ -762,6 +1835,224 @@ def _tree_operator_peel_order(plan, nodes):
     return tuple(order), next(iter(remaining))
 
 
+def _tree_operator_from_dense(
+    plan,
+    array,
+    *,
+    sites,
+    dims,
+    split_opts,
+    site_tag_id,
+    upper_ind_id,
+    lower_ind_id,
+    node_tag_id,
+):
+    """Decompose a dense matrix exactly across a TreePlan."""
+    data = ar.do("reshape", array, tuple(dims) + tuple(dims))
+    upper = tuple(upper_ind_id.format(site) for site in sites)
+    lower = tuple(lower_ind_id.format(site) for site in sites)
+    blob = qtn.Tensor(data, inds=upper + lower)
+
+    owned = {node: [] for node in plan.nodes()}
+    for site in sites:
+        owned[plan.node_of_qubit[site]].extend((
+            upper_ind_id.format(site),
+            lower_ind_id.format(site),
+        ))
+    factors = {}
+    peel_order, hub = _tree_operator_peel_order(plan, set(plan.nodes()))
+    opts = dict(split_opts)
+    opts.setdefault("method", "svd")
+    opts.setdefault("absorb", "right")
+    opts.setdefault("cutoff", 0.0)
+    opts.setdefault("get", "tensors")
+
+    for node, neighbor in peel_order:
+        bond_ind = f"_pepsy_tnno_{min(node, neighbor)}_{max(node, neighbor)}"
+        left, blob = blob.split(
+            left_inds=tuple(owned[node]),
+            right_inds=tuple(ind for ind in blob.inds if ind not in owned[node]),
+            bond_ind=bond_ind,
+            **opts,
+        )
+        factors[node] = left
+        owned[neighbor].append(bond_ind)
+    factors[hub] = blob
+
+    tensors = []
+    for node in plan.nodes():
+        tensor = factors[node]
+        qubit = plan.qubit_of_node.get(node)
+        neighbors = tuple(plan.children[node]) + (
+            (plan.parent[node],) if plan.parent.get(node) is not None else ()
+        )
+        desired = [
+            *( (
+                upper_ind_id.format(qubit),
+                lower_ind_id.format(qubit),
+            ) if qubit is not None else () ),
+            *(
+                f"_pepsy_tnno_{min(node, neighbor)}_{max(node, neighbor)}"
+                for neighbor in neighbors
+            ),
+        ]
+        tensor = tensor.transpose(*desired)
+        tensor.add_tag(node_tag_id.format(node))
+        if qubit is not None:
+            tensor.add_tag(site_tag_id.format(qubit))
+        tensors.append(tensor)
+
+    network = qtn.TensorNetwork(tensors)
+    network.pepsy_tree_operator_kind = "dense_tree_tnno"
+    network.pepsy_tree_operator_is_ttno = True
+    network.pepsy_tree_operator_bond = max(
+        (network.ind_size(index) for index in network.inner_inds()),
+        default=1,
+    )
+    network.pepsy_tree_operator_raw_bond = network.pepsy_tree_operator_bond
+    return network
+
+
+def _tree_operator_from_fill_fn(
+    plan,
+    fill_fn,
+    *,
+    bond_dim,
+    phys_dim,
+    dtype,
+    site_tag_id,
+    upper_ind_id,
+    lower_ind_id,
+    node_tag_id,
+):
+    """Build a regular dense TTNO from local filled tensors."""
+    if isinstance(bond_dim, Integral):
+        edge_dims = {
+            (min(node, child), max(node, child)): int(bond_dim)
+            for node in plan.nodes()
+            for child in plan.children[node]
+        }
+    else:
+        edge_values = tuple(int(value) for value in bond_dim)
+        edges = tuple(
+            (node, child)
+            for node in plan.nodes()
+            for child in plan.children[node]
+        )
+        if len(edge_values) != len(edges):
+            raise ValueError("bond_dim must be one value per TreePlan edge.")
+        edge_dims = {
+            (min(node, child), max(node, child)): value
+            for (node, child), value in zip(edges, edge_values)
+        }
+
+    if isinstance(phys_dim, Integral):
+        physical_dims = {site: int(phys_dim) for site in plan.node_of_qubit}
+    else:
+        values = tuple(int(value) for value in phys_dim)
+        sites = tuple(sorted(plan.node_of_qubit))
+        if len(values) != len(sites):
+            raise ValueError("phys_dim must have one value per tree site.")
+        physical_dims = dict(zip(sites, values))
+
+    tensors = []
+    for node in plan.nodes():
+        qubit = plan.qubit_of_node.get(node)
+        neighbors = tuple(plan.children[node]) + (
+            (plan.parent[node],) if plan.parent.get(node) is not None else ()
+        )
+        inds = [
+            *((
+                upper_ind_id.format(qubit),
+                lower_ind_id.format(qubit),
+            ) if qubit is not None else ()),
+            *(
+                f"_pepsy_tnno_{min(node, neighbor)}_{max(node, neighbor)}"
+                for neighbor in neighbors
+            ),
+        ]
+        shape = [
+            *( (physical_dims[qubit], physical_dims[qubit])
+               if qubit is not None else () ),
+            *(
+                edge_dims[(min(node, neighbor), max(node, neighbor))]
+                for neighbor in neighbors
+            ),
+        ]
+        try:
+            data = fill_fn(tuple(shape))
+        except TypeError:
+            data = fill_fn(node, tuple(shape))
+        tensor = qtn.Tensor(np.asarray(data, dtype=dtype), inds=inds)
+        tensor.add_tag(node_tag_id.format(node))
+        if qubit is not None:
+            tensor.add_tag(site_tag_id.format(qubit))
+        tensors.append(tensor)
+
+    network = qtn.TensorNetwork(tensors)
+    network.pepsy_tree_operator_kind = "dense_tree_tnno"
+    network.pepsy_tree_operator_is_ttno = True
+    return network
+
+
+def _identity_tree_operator(
+    plan,
+    *,
+    phys_dim=2,
+    dtype=complex,
+    site_tag_id="I{}",
+    upper_ind_id="k{}",
+    lower_ind_id="b{}",
+    node_tag_id="N{}",
+):
+    """Build an exact bond-one identity TTNO."""
+    if isinstance(phys_dim, Integral):
+        physical_dims = {site: int(phys_dim) for site in plan.node_of_qubit}
+    else:
+        sites = tuple(sorted(plan.node_of_qubit))
+        values = tuple(int(value) for value in phys_dim)
+        if len(values) != len(sites):
+            raise ValueError("phys_dim must have one value per tree site.")
+        physical_dims = dict(zip(sites, values))
+
+    tensors = []
+    for node in plan.nodes():
+        qubit = plan.qubit_of_node.get(node)
+        neighbors = tuple(plan.children[node]) + (
+            (plan.parent[node],) if plan.parent.get(node) is not None else ()
+        )
+        inds = [
+            *((
+                upper_ind_id.format(qubit),
+                lower_ind_id.format(qubit),
+            ) if qubit is not None else ()),
+            *(
+                f"_pepsy_tnno_{min(node, neighbor)}_{max(node, neighbor)}"
+                for neighbor in neighbors
+            ),
+        ]
+        shape = [
+            *((physical_dims[qubit], physical_dims[qubit])
+              if qubit is not None else ()),
+            *(1 for _ in neighbors),
+        ]
+        data = np.zeros(shape, dtype=dtype)
+        if qubit is None:
+            data[...] = 1
+        else:
+            data[(slice(None), slice(None)) + (0,) * len(neighbors)] = np.eye(
+                physical_dims[qubit], dtype=dtype,
+            )
+        tensor = qtn.Tensor(data, inds=inds, tags=[node_tag_id.format(node)])
+        if qubit is not None:
+            tensor.add_tag(site_tag_id.format(qubit))
+        tensors.append(tensor)
+    network = qtn.TensorNetwork(tensors)
+    network.pepsy_tree_operator_kind = "dense_tree_identity"
+    network.pepsy_tree_operator_is_ttno = True
+    return network
+
+
 def _native_tree_term_network(
     plan, term, support, *, symmetry, cutoff=1e-12, dtype=None,
 ):
@@ -1239,17 +2530,37 @@ def _tree_operator_qr(tensor, *, left_inds, bond_ind):
 
 def _canonicalize_tree_operator(network, plan, center):
     """Canonicalize a tree operator by lossless QR from leaves to center."""
+    return _canonicalize_tree_operator_region(network, plan, {center})
+
+
+def _canonicalize_tree_operator_region(network, plan, region):
+    """Canonicalize the complement of a connected tree region inwards."""
     import quimb.tensor as qtn  # pylint: disable=import-outside-toplevel
 
-    if center not in plan.children:
-        raise ValueError(f"operator canonicalization center {center!r} is invalid.")
+    region = frozenset(region)
+    if not region or not region.issubset(plan.children):
+        raise ValueError("operator canonicalization region is invalid.")
+    if _tree_subtree_span(plan, region) != region:
+        raise ValueError("operator canonicalization region must be connected.")
+
+    def distance_to_region(node):
+        return min(len(plan.node_path(node, target)) for target in region)
+
     order = sorted(
-        (node for node in plan.nodes() if node != center),
-        key=lambda node: len(plan.node_path(node, center)),
+        (node for node in plan.nodes() if node not in region),
+        key=distance_to_region,
         reverse=True,
     )
     for node in order:
-        neighbor = plan.node_path(node, center)[1]
+        path = min(
+            (
+                plan.node_path(node, target)
+                for target in region
+                if target != node
+            ),
+            key=len,
+        )
+        neighbor = path[1]
         tensor = _tree_operator_tensor(network, node)
         target = _tree_operator_tensor(network, neighbor)
         bond = _tree_operator_bond(network, plan, node, neighbor)
@@ -1269,7 +2580,9 @@ def _canonicalize_tree_operator(network, plan, center):
             inds=merged.inds,
             left_inds=None,
         )
-    network.pepsy_tree_operator_center = int(center)
+    network.pepsy_tree_operator_center = (
+        next(iter(region)) if len(region) == 1 else None
+    )
     network.pepsy_tree_operator_canonical = True
     return network
 
@@ -1829,6 +3142,7 @@ def _annotate_tree_mpo(
     compressed=False,
     cutoff=1e-12,
     max_bond=None,
+    to_backend=None,
 ):
     """Attach a public :class:`TreeMPO` to a compatibility chain MPO."""
     mpo.pepsy_tree_plan_signature = _tree_plan_signature(plan)
@@ -1860,6 +3174,16 @@ def _annotate_tree_mpo(
     mpo.pepsy_tree_operator_networks = operator.tree_networks
     if compressed:
         operator.compress(max_bond=max_bond, cutoff=cutoff)
+    if to_backend is not None:
+        # Move the primary TreeMPO representation onto the requested backend
+        # so ``TreeMPO.expectation`` contracts against a matching tree state.
+        # The compatibility chain MPO is converted separately by the caller;
+        # here the structured operator networks are moved in place after any
+        # numpy-side compression completes.
+        from ...tensors.symmetric import _apply_to_tensor_network_arrays
+
+        for network in operator.tree_networks:
+            _apply_to_tensor_network_arrays(network, to_backend)
     return mpo
 
 
@@ -2002,6 +3326,7 @@ def tree_mpo(
                 compressed=compress,
                 cutoff=cutoff,
                 max_bond=max_bond,
+                to_backend=to_backend,
             )
         return result
     tree_operator = _build_tree_operator(
@@ -2027,4 +3352,49 @@ def tree_mpo(
         compressed=compress,
         cutoff=cutoff,
         max_bond=max_bond,
+        to_backend=to_backend,
     )
+
+
+def build_tree_operator(
+    plan,
+    hamiltonian,
+    *,
+    max_bond=None,
+    cutoff=1e-12,
+    upper_ind_id="k{}",
+    lower_ind_id="b{}",
+    site_tag_id="I{}",
+    compress=True,
+    dtype=None,
+    fermionic=True,
+    charge_sectors=False,
+    to_backend=None,
+):
+    """Build the canonical native :class:`TreeMPO` for a ``TreePlan``.
+
+    The compatibility :func:`tree_mpo` builder returns the ordinary linear
+    chain MPO and attaches this tree operator to it. This function returns
+    only the tree-native operator, keeping the two tensor-network geometries
+    explicit. With ``charge_sectors=True`` it returns ``{charge: TreeMPO}``.
+    """
+    built = tree_mpo(
+        plan,
+        hamiltonian,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        upper_ind_id=upper_ind_id,
+        lower_ind_id=lower_ind_id,
+        site_tag_id=site_tag_id,
+        compress=compress,
+        dtype=dtype,
+        fermionic=fermionic,
+        charge_sectors=charge_sectors,
+        to_backend=to_backend,
+    )
+    if isinstance(built, dict):
+        return {
+            charge: mpo.pepsy_tree_operator
+            for charge, mpo in built.items()
+        }
+    return built.pepsy_tree_operator

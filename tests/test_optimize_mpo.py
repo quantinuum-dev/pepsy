@@ -551,6 +551,7 @@ def test_mpo_optimizer_adapts_long_range_native_gate_to_jw_symmray_mpo():
         t=1.0,
         U=2.0,
         mu=0.1,
+        fermionic=False,
     )
     gates = fermion.strang_gate_stream(
         [(0, 3)],
@@ -583,6 +584,7 @@ def test_mpo_optimizer_handles_fermion_symmray_mpo_and_native_gate_stream(mode):
         t=1.0,
         U=2.0,
         mu=0.1,
+        fermionic=False,
         max_bond=16,
         cutoff=1e-12,
     )
@@ -610,7 +612,9 @@ def test_fermion_build_mpo_and_ham_tn_adapter_preserve_symmetry():
     edges = [(0, 1), (1, 2)]
     builder = py.ham_tn(Lx=3, Ly=1, data_type="complex128")
 
-    direct = fermion.build_mpo(edges, L=3, t=1.0, U=0.0, mu=0.0)
+    direct = fermion.build_mpo(
+        edges, L=3, t=1.0, U=0.0, mu=0.0, fermionic=True,
+    )
     adapted = builder.build_mpo(
         fermion=fermion,
         edges=edges,
@@ -618,6 +622,7 @@ def test_fermion_build_mpo_and_ham_tn_adapter_preserve_symmetry():
         t=1.0,
         U=0.0,
         mu=0.0,
+        fermionic=True,
     )
     positional = builder.build_mpo(
         fermion,
@@ -625,16 +630,24 @@ def test_fermion_build_mpo_and_ham_tn_adapter_preserve_symmetry():
         t=1.0,
         U=0.0,
         mu=0.0,
+        fermionic=True,
     )
 
     assert direct.L == adapted.L == positional.L == 3
-    assert all(type(tensor.data).__name__ == "U1U1Array" for tensor in direct)
-    assert all(type(tensor.data).__name__ == "U1U1Array" for tensor in adapted)
-    assert all(type(tensor.data).__name__ == "U1U1Array" for tensor in positional)
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in direct
+    )
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in adapted
+    )
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray"
+        for tensor in positional
+    )
 
 
-def test_build_mpo_can_select_native_fermionic_construction():
-    """The model-facing builder exposes the native MPO path explicitly."""
+def test_build_mpo_defaults_to_native_and_to_mpo_is_its_alias():
+    """The model-facing builder has one native default and one alias."""
     pytest.importorskip("symmray")
     fermion = py.Fermion(spinful=True, symmetry="U1U1")
 
@@ -644,7 +657,6 @@ def test_build_mpo_can_select_native_fermionic_construction():
         t=1.0,
         U=0.0,
         mu=0.0,
-        fermionic=True,
         compress=False,
     )
     direct = fermion.to_mpo(
@@ -660,6 +672,7 @@ def test_build_mpo_can_select_native_fermionic_construction():
         type(tensor.data).__name__ == "U1U1FermionicArray"
         for tensor in native
     )
+    assert type(fermion).to_mpo is type(fermion).build_mpo
     assert native.to_dense().allclose(direct.to_dense())
 
 
@@ -674,6 +687,7 @@ def test_mpo_optimizer_explicit_compress_handles_empty_symmray_stream():
         t=1.0,
         U=0.0,
         mu=0.0,
+        fermionic=False,
         compress=False,
     )
     raw_bond = mpo.max_bond()

@@ -2,9 +2,10 @@
 
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 
 import pepsy
-from pepsy.optimizers.tree import TreeMPO, TreePlan, tree_mpo
+from pepsy.optimizers.tree import TreeMPO, TreePlan, build_tree_operator, tree_mpo
 
 
 pytest.importorskip("symmray")
@@ -36,6 +37,7 @@ def test_tree_mpo_preserves_native_fermionic_symmetry_and_expectation(symmetry):
         dtype="complex64",
     )
 
+    assert pepsy.build_tree_operator is build_tree_operator
     assert pepsy.tree_mpo is tree_mpo
     assert mpo.pepsy_tree_order == (2, 0, 3, 1)
     assert mpo.pepsy_tree_native is True
@@ -260,7 +262,7 @@ def test_fermion_tree_mpo_class_is_native_and_keeps_chain_representation(symmetr
         [(0, 1), (1, 2)], t=1.0, U=2.0, mu=0.1,
     )
     plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
-    operator = fermion.to_tree_mpo(
+    operator = fermion.build_tree_operator(
         hamiltonian=hamiltonian,
         tree=plan,
         compress=True,
@@ -281,6 +283,8 @@ def test_fermion_tree_mpo_class_is_native_and_keeps_chain_representation(symmetr
     )
 
     assert isinstance(operator, TreeMPO)
+    assert type(fermion).to_tree_mpo is type(fermion).build_tree_operator
+    assert type(fermion).build_tree_mpo is type(fermion).build_tree_operator
     assert operator.backend == "symmray"
     assert operator.chain_mpo is not None
     assert len(operator.tree_networks) == 1
@@ -331,3 +335,122 @@ def test_sparse_pair_terms_do_not_invent_missing_pairs():
     operator.compress(max_bond=16)
     assert operator.max_bond() <= 16
     assert operator.max_bond() <= raw_bond
+
+
+def test_to_tree_mpo_applies_to_backend_to_operator_networks():
+    """``to_tree_mpo(to_backend=...)`` moves the primary TreeMPO operator.
+
+    The compatibility chain MPO was always backend-converted, but the primary
+    ``TreeMPO.tree_networks`` are what ``TreeMPO.expectation`` contracts. They
+    must land on the requested backend so the operator matches a tree state
+    built on that backend.
+    """
+    fermion = pepsy.Fermion(spinful=True, symmetry="U1", dtype="complex128")
+    hamiltonian = fermion.hamiltonian([(0, 1), (1, 2)], t=1.0, U=2.0, mu=0.1)
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+
+    seen = []
+
+    def to_backend(array):
+        converted = np.asarray(array, dtype=np.complex64)
+        seen.append(np.dtype(converted.dtype))
+        return converted
+
+    operator = plan.to_tree_mpo(
+        hamiltonian, fermionic=True, compress=True, to_backend=to_backend,
+    )
+
+    assert isinstance(operator, TreeMPO)
+    assert seen, "to_backend was never applied to the operator networks"
+    for network in operator.tree_networks:
+        for tensor in network:
+            assert np.dtype(tensor.data.dtype) == np.dtype("complex64")
+
+
+def test_tree_mpo_matches_quimb_generalized_operator_surface():
+    """TreeMPO shares Quimb's operator API without pretending to be a chain."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    operator = TreeMPO.from_terms(
+        plan,
+        {
+            (0,): np.diag([1.0, 2.0]),
+            (1, 2): np.arange(16.0).reshape(2, 2, 2, 2),
+        },
+        compress=False,
+    )
+
+    assert isinstance(operator, qtn.TensorNetworkGenOperator)
+    assert operator.sites == (0, 1, 2, 3)
+    assert operator.nsites == operator.nqubits == 4
+    assert operator.site_tag(2) == "I2"
+    assert operator.upper_ind(2) == "k2"
+    assert operator.lower_ind(2) == "b2"
+    assert tuple(operator.gen_sites_present()) == operator.sites
+    assert operator.to_dense().shape == (16, 16)
+    assert isinstance(operator.H, TreeMPO)
+    assert isinstance(operator.copy(), qtn.TensorNetworkGenOperator)
+    assert isinstance(qtn.TensorNetworkGenOperator(operator), qtn.TensorNetworkGenOperator)
+
+    root = plan.root
+    child = plan.children[root][0]
+    assert operator.node_tag(root) in operator.tags
+    assert child in operator.neighbors(root)
+    assert operator.bond(root, child) in operator.inner_inds()
+    assert operator.validate() is operator
+
+    canonical = operator.canonize_around(f"N{root}")
+    assert isinstance(canonical, TreeMPO)
+    assert canonical is not operator
+    assert operator.compress_between(root, child, max_bond=16) is operator
+    assert operator.canonize_around_(root) is operator
+
+
+def test_tree_mpo_is_mpo_twin_over_tree_geometry():
+    """The mature TreeMPO surface mirrors useful Quimb MPO operations."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    dense = np.arange(256.0).reshape(16, 16)
+    operator = TreeMPO.from_dense(plan, dense)
+
+    assert operator.L == operator.nsites == 4
+    assert operator.site_ind(2) == operator.upper_ind(2) == "k2"
+    assert operator.validate() is operator
+    np.testing.assert_allclose(operator.to_dense(), dense, rtol=1e-11, atol=1e-11)
+
+    identity = operator.identity()
+    np.testing.assert_allclose(identity.to_dense(), np.eye(16))
+    np.testing.assert_allclose(
+        operator.add_MPO(identity).to_dense(), dense + np.eye(16),
+    )
+    np.testing.assert_allclose(
+        operator.add_MPO(identity, negate=True).to_dense(), dense - np.eye(16),
+    )
+    assert operator.amplitude([0, 0, 0, 0]) == pytest.approx(dense[0, 0])
+
+    selected = operator.select_sites((0, 1))
+    assert isinstance(selected, TreeMPO)
+    assert len(selected.tree_networks[0].tensors) == 2
+
+    root = plan.root
+    child = plan.children[root][0]
+    values = operator.singular_values(root, child)
+    assert values.ndim == 1
+    canonical = operator.canonize_between(root, child)
+    assert canonical.is_subtree_canonical_form((root, child))
+    assert canonical is not operator
+    assert operator.copy(conj=True).to_dense().shape == (16, 16)
+    np.testing.assert_allclose(
+        operator.copy(transpose=True).to_dense(), dense.T, rtol=1e-11, atol=1e-11,
+    )
+
+
+def test_tree_mpo_from_fill_and_random_state_helpers():
+    """TreeMPO exposes the corresponding construction and state helpers."""
+    plan = TreePlan.from_order(range(4), structure="balanced", top_arity=2)
+    operator = TreeMPO.from_fill_fn(
+        lambda shape: np.ones(shape), plan, bond_dim=2,
+    )
+    assert operator.validate() is operator
+    random_operator = TreeMPO.rand(plan, bond_dim=2, seed=7)
+    assert random_operator.validate() is random_operator
+    state = random_operator.rand_state(2, seed=7)
+    assert state.plan is plan

@@ -594,14 +594,14 @@ mpo = fermion.build_mpo(
 )
 ```
 
-This returns the existing symmetry-preserving Jordan-Wigner-compatible MPO
-convention. For the native graded path, use ``to_mpo``:
+This returns the native graded MPO by default. For the explicit
+Jordan-Wigner-compatible convention, pass ``fermionic=False``:
 
 ```python
-mpo = fermion.to_mpo(
-    [(0, 1), (1, 2)], L=3, t=1.0, U=8.0, mu=0.0, max_bond=16
+mpo = fermion.build_mpo(
+    [(0, 1), (1, 2)], L=3, t=1.0, U=8.0, mu=0.0, max_bond=16,
+    fermionic=False,
 )
-assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in mpo)
 ```
 
 Native fermionic gate streams from the same ``Fermion`` model can be passed to
@@ -673,9 +673,10 @@ assembly, replay, and exact energy measurement are supported. Native MPO
 energy applies the operator sitewise as a factorized graded MPO-MPS
 contraction, so its cost is controlled by the MPS and MPO bond dimensions.
 
-``Fermion.build_mpo(..., fermionic=True)`` selects the same native construction
-as ``Fermion.to_mpo(...)``. Omitting ``fermionic=True`` retains the explicit
-Jordan--Wigner compatibility MPO path.
+``Fermion.build_mpo(...)`` is the canonical native construction and defaults
+to graded Symmray tensors. Passing ``fermionic=False`` selects the explicit
+Jordan--Wigner compatibility MPO path. ``Fermion.to_mpo(...)`` remains a
+compatibility alias.
 
 For periodic square lattices encoded as long-range edges in an OBC MPS/MPO,
 ``mode="folded-snake"`` alternates opposite columns before snaking. On a 6 by

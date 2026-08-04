@@ -48,34 +48,35 @@ Nevergrad objectives permute only the remaining leaf sites.
 
 ### Layout-aware native MPOs
 
-After selecting a plan, build a Hamiltonian MPO in the plan's logical tree
-order with `plan.to_mpo(...)` or `tree_mpo(plan, hamiltonian)`. The default is
-the native graded Symmray path, including `U1FermionicArray` and
-`U1U1FermionicArray` tensors:
+After selecting a plan, the canonical tree-native operator is built with
+`plan.build_tree_operator(...)` or `Fermion.build_tree_operator(...)`. The
+legacy `tree_mpo(plan, hamiltonian)` / `plan.to_mpo(...)` builders return the
+ordinary compatibility chain MPO with the tree operator attached. The native
+path includes `U1FermionicArray` and `U1U1FermionicArray` tensors:
 
 ```python
 from pepsy import Fermion
-from pepsy.optimizers.tree import TreeLayoutFinder, tree_mpo
+from pepsy.optimizers.tree import TreeLayoutFinder
 
 finder = TreeLayoutFinder(gates, n=8, max_arity=2)
 plan = finder.run(order="quality")
 fermion = Fermion(spinful=True, symmetry="U1U1")
 hamiltonian = fermion.hamiltonian(edges, t=1.0, U=2.0, mu=0.1)
 
-mpo = tree_mpo(plan, hamiltonian)  # fermionic=True by default
-# equivalent:
-# mpo = plan.to_mpo(hamiltonian)
-energy = opt.tn.expectation_mpo_exact(mpo, range(plan.n))
+tree_operator = plan.build_tree_operator(hamiltonian)
+chain_mpo = tree_operator.chain_mpo
+energy = opt.tn.expectation_mpo_exact(chain_mpo, range(plan.n))
 ```
 
-For the operator-level API, use `TreeMPO` (or
-`fermion.to_tree_mpo(...)`). It exposes both representations without mixing
-their tensor-network geometries:
+For a model-facing operator build, use `Fermion.build_tree_operator(...)`.
+`Fermion.to_tree_mpo(...)` and `TreePlan.to_tree_mpo(...)` remain compatibility
+aliases. `TreeMPO` exposes the optional chain representation without mixing
+the two tensor-network geometries:
 
 ```python
 from pepsy import Fermion
 
-tree_operator = fermion.to_tree_mpo(
+tree_operator = fermion.build_tree_operator(
     hamiltonian=hamiltonian,
     tree=plan,
     compress=True,
@@ -152,6 +153,18 @@ conversion is used. Structured observables can use a smaller compact TTNO.
 Pass `fermionic=False` only for dense ordinary/Jordan--Wigner-compatible terms.
 Existing `OneDMap` lattice maps remain unchanged and should continue to be used
 for regular 2D/3D coordinate layouts.
+
+`TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, in the same way that
+`TreeTensorNetwork` subclasses `TensorNetworkGenVector`. It is the tree twin
+of Quimb's `MatrixProductOperator`: the common operator surface includes
+`sites`, `nsites`, `site_tag`, `upper_ind`, `lower_ind`, `to_dense`, `H`,
+`copy`, `identity`, `from_dense`, `add_MPO`, `singular_values`, and
+`amplitude`. Tree-specific geometry is exposed through `plan`, `node_tensor`,
+`neighbors`, and `bond`; `canonicalize`/`compress` perform the corresponding
+tree-wide QR/SVD sweeps. It cannot inherit Quimb's chain-only
+`MatrixProductOperator` implementation because a branched tree has no single
+left/right ordering. The optional `chain_mpo` remains the separate object for
+chain workflows.
 
 The conventional binary TTN with a three-leg top tensor is the default when
 there are at least three leaves and no `root_qubit`. Pass

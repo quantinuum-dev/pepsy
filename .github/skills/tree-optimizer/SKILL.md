@@ -389,11 +389,11 @@ interface use the dense `to_dense()` fallback and remain subject to
 ### Tree-native MPO API
 
 When the consumer is a `TreeTensorNetwork`, `TreeMPO` is the primary operator
-API. Use `TreePlan.to_tree_mpo(...)` or
-`Fermion.to_tree_mpo(..., tree=plan)`:
+API. Use `TreePlan.build_tree_operator(...)` or
+`Fermion.build_tree_operator(..., tree=plan)`:
 
 ```python
-tree_operator = fermion.to_tree_mpo(
+tree_operator = fermion.build_tree_operator(
     hamiltonian=hamiltonian,
     tree=plan,
     compress=True,
@@ -404,10 +404,22 @@ energy = tree.expectation_mpo_exact(tree_operator, range(plan.n))
 ```
 
 `tree_operator.chain_mpo` is optional compatibility data for ordinary MPS/MPO
-workflows. `TreePlan.to_mpo(...)` and `tree_mpo(...)` return that regular chain
-MPO and attach the `TreeMPO`; they do not change the tree contraction route.
+workflows. `TreePlan.to_mpo(...)` and `tree_mpo(...)` remain compatibility
+builders that return that regular chain MPO and attach the `TreeMPO`; they do
+not change the tree contraction route. `to_tree_mpo(...)` remains a
+compatibility alias for `build_tree_operator(...)`.
 The chain MPO must not be moved into the tree, densified, or compressed as a
 state update for exact tree measurement.
+
+`TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, analogous to
+`TreeTensorNetwork` subclassing `TensorNetworkGenVector`. It is the tree twin
+of Quimb's `MatrixProductOperator`: its public operator surface includes
+`sites`, `nsites`, `site_tag`, `upper_ind`, `lower_ind`, `to_dense`, `H`,
+`copy`, `identity`, `from_dense`, `add_MPO`, `singular_values`, `amplitude`,
+and canonicalize/compress helpers, while `plan`, `node_tensor`, `neighbors`,
+and `bond` provide the branched geometry. It cannot inherit the chain-only
+`MatrixProductOperator` implementation because a tree has no left/right
+ordering; `chain_mpo` remains the separate chain-compatible representation.
 
 For native fermionic Hamiltonians, one-, two-, and higher-site neutral terms
 are fused and factorized from their native Symmray operator tensor over the

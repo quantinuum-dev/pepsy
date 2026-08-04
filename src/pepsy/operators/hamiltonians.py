@@ -517,7 +517,7 @@ class ham_tn:
         fermionic : bool | None, default=None
             Native graded encoding flag for the fermion-model form. ``None``
             and ``False`` select the Jordan-Wigner-compatible MPO builder;
-            ``True`` selects ``Fermion.to_mpo(...)``.
+            ``True`` selects the native graded ``Fermion.build_mpo(...)``.
         charge_sectors : bool, default=False
             When native construction is enabled, return one MPO per operator
             charge as ``{charge: mpo}`` instead of requiring one homogeneous
@@ -562,8 +562,7 @@ class ham_tn:
             fermionic_use = False if fermionic is None else bool(fermionic)
             if charge_sectors and not fermionic_use:
                 raise ValueError("charge_sectors=True requires fermionic=True.")
-            mpo_builder = fermion.to_mpo if fermionic_use else fermion.build_mpo
-            return mpo_builder(
+            return fermion.build_mpo(
                 ints,
                 L=self.L,
                 mapper=mapper_use,

@@ -1,14 +1,15 @@
 # `pepsy.optimizers.mpo.optimizer`
 
 `MpoOptimizer` accepts ordinary Quimb MPOs and Symmray block-sparse MPOs. For
-a native graded fermion workflow, use `Fermion.to_mpo(...)` and replay the
-matching native gate stream:
+a native graded fermion workflow, use the canonical
+`Fermion.build_mpo(...)` entry point and replay the matching native gate
+stream:
 
 ```python
 fermion = pepsy.Fermion(spinful=True, symmetry="U1U1")
 edges = [(0, 1), (1, 2)]
 hamiltonian = fermion.hamiltonian(edges, t=1.0, U=2.0, mu=0.1)
-mpo = fermion.to_mpo(hamiltonian=hamiltonian, L=3)
+mpo = fermion.build_mpo(hamiltonian=hamiltonian, L=3)
 
 opt = pepsy.MpoOptimizer(
     mpo,
@@ -28,18 +29,20 @@ term = fermion.operator_term(
     sites=(0, 2),
     add_hc=True,
 )
-mpo = fermion.to_mpo({(0, 2): term}, L=3)
+mpo = fermion.build_mpo({(0, 2): term}, L=3)
 ```
 
-The Jordan-Wigner compatibility path remains available through
-`Fermion.build_mpo(...)` and the matching
+The Jordan-Wigner compatibility path remains available by passing
+`fermionic=False` to the same builder, together with the matching
 `SymHamiltonian.jw_trotter_gates(...)` stream:
 
 ```python
 fermion = pepsy.Fermion(spinful=True, symmetry="U1U1")
 edges = [(0, 1), (1, 2)]
 hamiltonian = fermion.hamiltonian(edges, t=1.0, U=2.0, mu=0.1)
-mpo = fermion.build_mpo(edges, L=3, t=1.0, U=2.0, mu=0.1)
+mpo = fermion.build_mpo(
+    edges, L=3, t=1.0, U=2.0, mu=0.1, fermionic=False
+)
 
 opt = pepsy.MpoOptimizer(
     mpo,
@@ -63,9 +66,9 @@ compression. `mode="svd"`, `mode="mpo"`, and `mode="dmrg"` use the same
 block-aware path for native Symmray MPOs; the optimizer does not require a
 dense conversion of the input MPO.
 `ham_tn.build_mpo(..., fermionic=True)` is also routed to the native
-`Fermion.to_mpo(...)` entry point. Use `to_backend=...` on the model-facing
-builder when the stored blocks must be moved to Torch or another supported
-backend.
+`Fermion.build_mpo(...)` entry point. `Fermion.to_mpo(...)` remains a
+compatibility alias. Use `to_backend=...` on the model-facing builder when
+the stored blocks must be moved to Torch or another supported backend.
 
 Native MPO assembly/replay is also measurable with a native fermionic MPS.
 `MpsEnergyOptimizer` applies the native MPO sitewise as a factorized graded

@@ -4145,7 +4145,8 @@ class TreeOptimizer:
             if state_native:
                 raise TypeError(
                     "native fermionic TreeTensorNetwork requires a native "
-                    "Symmray MPO. Build it with tree_mpo(..., fermionic=True) "
+                    "Symmray MPO. Build it with build_tree_operator(...) or "
+                    "tree_mpo(..., fermionic=True) "
                     "or supply a model-native MPO."
                 )
             raise TypeError(

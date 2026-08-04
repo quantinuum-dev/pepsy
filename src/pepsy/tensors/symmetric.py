@@ -10223,8 +10223,9 @@ class Fermion:
 
     def build_mpo(
         self,
-        terms_or_edges,
+        terms_or_edges=None,
         *,
+        hamiltonian=None,
         L=None,
         mapper=None,
         idx2coo=None,
@@ -10236,31 +10237,52 @@ class Fermion:
         lower_ind_id="b{}",
         site_tag_id="I{}",
         dtype=None,
-        fermionic=False,
+        fermionic=True,
         charge_sectors=False,
         to_backend=None,
         **params,
     ):
-        """Build a Symmray MPO directly from this fermion model.
+        """Build the model-facing one-dimensional MPO.
 
-        This is the model-facing shorthand for
-        ``fermion.hamiltonian(...).to_mpo(...)``. The resulting MPO uses the
-        same symmetry as :meth:`SymHamiltonian.to_mpo`. By default this
-        model-facing helper builds the current bosonic/Jordan-Wigner
-        compatibility MPO and can be evolved with ``jw_trotter_gates``.
-        Pass ``fermionic=True`` to select native graded ``FermionicArray``
-        construction; this is equivalent to calling :meth:`to_mpo` with the
-        same model parameters.
-        ``t``, ``U``/``V``, and ``mu`` remain explicit build parameters and are
-        forwarded to :meth:`hamiltonian`.
+        This is the canonical ``Fermion`` entry point for a chain MPO. Pass
+        either model terms or edges in ``terms_or_edges`` or an existing
+        :class:`SymHamiltonian` with ``hamiltonian=``. Native graded
+        ``FermionicArray`` tensors are built by default; pass
+        ``fermionic=False`` for the explicit Jordan--Wigner compatibility
+        MPO.
+
+        ``to_mpo`` is retained as a compatibility alias of this method.
+        ``t``, ``U``/``V``, and ``mu`` remain explicit build parameters and
+        are forwarded to :meth:`hamiltonian`.
         """
         to_backend = self.to_backend if to_backend is None else to_backend
-        hamiltonian = self.hamiltonian(
-            terms_or_edges,
-            to_backend=to_backend,
-            **params,
-        )
-        return hamiltonian.to_mpo(
+        if hamiltonian is not None:
+            if terms_or_edges is not None:
+                raise TypeError(
+                    "Pass either terms_or_edges or hamiltonian, not both."
+                )
+            if not isinstance(hamiltonian, SymHamiltonian):
+                raise TypeError("hamiltonian must be a SymHamiltonian instance.")
+            target = hamiltonian
+        elif isinstance(terms_or_edges, SymHamiltonian):
+            target = terms_or_edges
+        else:
+            if terms_or_edges is None:
+                raise TypeError("build_mpo requires terms_or_edges or hamiltonian.")
+            target = self.hamiltonian(
+                terms_or_edges,
+                to_backend=to_backend,
+                **params,
+            )
+            params = {}
+
+        if params:
+            names = ", ".join(sorted(params))
+            raise TypeError(
+                "Model parameters cannot be supplied with an existing "
+                f"SymHamiltonian: {names}."
+            )
+        return target.to_mpo(
             L=L,
             mapper=mapper,
             idx2coo=idx2coo,
@@ -10276,6 +10298,10 @@ class Fermion:
             charge_sectors=charge_sectors,
             to_backend=to_backend,
         )
+
+    # ``to_mpo`` was the original model-facing name. Keep one implementation
+    # so the two spellings cannot drift in defaults or supported arguments.
+    to_mpo = build_mpo
 
     def build_pepo(
         self,
@@ -10322,89 +10348,7 @@ class Fermion:
             **params,
         )
 
-    def to_mpo(
-        self,
-        terms_or_edges=None,
-        *,
-        hamiltonian=None,
-        L=None,
-        mapper=None,
-        idx2coo=None,
-        coo2idx=None,
-        max_bond=None,
-        cutoff=1e-12,
-        compress=True,
-        upper_ind_id="k{}",
-        lower_ind_id="b{}",
-        site_tag_id="I{}",
-        dtype=None,
-        fermionic=True,
-        charge_sectors=False,
-        to_backend=None,
-        **params,
-    ):
-        """Build a native graded MPO from a fermionic term collection.
-
-        ``terms_or_edges`` may be lattice edges for the built-in model or a
-        mapping such as ``{(0, 2, 4): fermion.operator_term(...)}``. The
-        latter supports arbitrary homogeneous-charge term support, including
-        non-contiguous sites. Pass an existing :class:`SymHamiltonian` with
-        ``hamiltonian=`` when the terms have already been assembled.
-        Set ``charge_sectors=True`` to return one native MPO per charge for a
-        mixed-charge term collection.
-
-        The native path is selected by default and returns MPO tensors backed
-        by Symmray ``FermionicArray`` objects. Set ``fermionic=False`` to
-        request the explicit Jordan--Wigner compatibility MPO instead.
-
-        ``to_backend`` overrides the backend configured on this ``Fermion``
-        instance for both the Hamiltonian terms and the returned MPO blocks.
-        """
-        to_backend = self.to_backend if to_backend is None else to_backend
-        if hamiltonian is not None:
-            if terms_or_edges is not None:
-                raise TypeError(
-                    "Pass either terms_or_edges or hamiltonian, not both."
-                )
-            if not isinstance(hamiltonian, SymHamiltonian):
-                raise TypeError("hamiltonian must be a SymHamiltonian instance.")
-            target = hamiltonian
-        elif isinstance(terms_or_edges, SymHamiltonian):
-            target = terms_or_edges
-        else:
-            if terms_or_edges is None:
-                raise TypeError("to_mpo requires terms_or_edges or hamiltonian.")
-            target = self.hamiltonian(
-                terms_or_edges,
-                to_backend=to_backend,
-                **params,
-            )
-            params = {}
-
-        if params:
-            names = ", ".join(sorted(params))
-            raise TypeError(
-                "Model parameters cannot be supplied with an existing "
-                f"SymHamiltonian: {names}."
-            )
-        return target.to_mpo(
-            L=L,
-            mapper=mapper,
-            idx2coo=idx2coo,
-            coo2idx=coo2idx,
-            max_bond=max_bond,
-            cutoff=cutoff,
-            compress=compress,
-            upper_ind_id=upper_ind_id,
-            lower_ind_id=lower_ind_id,
-            site_tag_id=site_tag_id,
-            dtype=dtype,
-            fermionic=fermionic,
-            charge_sectors=charge_sectors,
-            to_backend=to_backend,
-        )
-
-    def to_tree_mpo(
+    def build_tree_operator(
         self,
         terms_or_edges=None,
         *,
@@ -10420,19 +10364,22 @@ class Fermion:
         to_backend=None,
         **params,
     ):
-        """Build a :class:`pepsy.TreeMPO` for a selected ``TreePlan``.
+        """Build the native :class:`pepsy.TreeMPO` for a selected plan.
 
         ``tree`` and ``plan`` are aliases.  The returned object exposes the
         optional linear representation as ``.chain_mpo`` and the TreePlan
         representation through ``.tree_networks`` and ``.expectation``.
         Native ``fermionic=True`` keeps Symmray's graded tensors intact for
         U1, U1U1, and other supported symmetries.
+
+        This is the canonical ``Fermion`` tree-operator entry point.
+        ``to_tree_mpo`` and ``build_tree_mpo`` remain compatibility aliases.
         """
         if tree is not None and plan is not None:
             raise TypeError("pass only one of tree= or plan=")
         plan = tree if tree is not None else plan
         if plan is None:
-            raise TypeError("to_tree_mpo requires tree= or plan=.")
+            raise TypeError("build_tree_operator requires tree= or plan=.")
         if hamiltonian is not None:
             if terms_or_edges is not None:
                 raise TypeError(
@@ -10446,7 +10393,7 @@ class Fermion:
         else:
             if terms_or_edges is None:
                 raise TypeError(
-                    "to_tree_mpo requires terms_or_edges or hamiltonian."
+                    "build_tree_operator requires terms_or_edges or hamiltonian."
                 )
             target = self.hamiltonian(
                 terms_or_edges,
@@ -10460,9 +10407,9 @@ class Fermion:
                 "Model parameters cannot be supplied with an existing "
                 f"SymHamiltonian: {names}."
             )
-        from ..optimizers.tree import tree_mpo
+        from ..optimizers.tree import build_tree_operator
 
-        built = tree_mpo(
+        return build_tree_operator(
             plan,
             target,
             max_bond=max_bond,
@@ -10473,14 +10420,10 @@ class Fermion:
             charge_sectors=charge_sectors,
             to_backend=to_backend,
         )
-        if isinstance(built, dict):
-            return {
-                charge: mpo.pepsy_tree_operator
-                for charge, mpo in built.items()
-            }
-        return built.pepsy_tree_operator
 
-    build_tree_mpo = to_tree_mpo
+    # Keep the historical spellings as aliases of the one canonical builder.
+    to_tree_mpo = build_tree_operator
+    build_tree_mpo = build_tree_operator
 
     def to_pepo(
         self,

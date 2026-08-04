@@ -30,10 +30,13 @@ the automatic re-encoding can create very large block-sparse intermediates.
 For a deliberately small or explicitly managed conversion, pass
 ``allow_encoding_conversion=True`` to ``MpsEnergyOptimizer``.
 
-An MPO returned by ``Fermion.to_mpo(...)`` is native graded and can be measured
+An MPO returned by ``Fermion.build_mpo(...)`` is native graded and can be measured
 directly with a native fermionic MPS. Pepsy applies that MPO sitewise as a
 factorized graded MPO-MPS network, preserving Symmray's contraction order
 without materializing an exponentially sized operator.
+
+``Fermion.to_mpo(...)`` remains a compatibility alias of
+``Fermion.build_mpo(...)``.
 
 Repeated native-MPO evaluations reuse a per-optimizer cotengra path cache. The
 default is uncompressed and exact. For a controlled approximation, pass for

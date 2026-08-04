@@ -1080,22 +1080,21 @@ class TreePlan:
 
         return tree_mpo(self, hamiltonian, **kwargs)
 
-    def to_tree_mpo(self, hamiltonian, **kwargs):
-        """Build the public :class:`TreeMPO` operator for this plan.
+    def build_tree_operator(self, hamiltonian, **kwargs):
+        """Build the canonical :class:`TreeMPO` operator for this plan.
 
-        The returned class keeps the optional chain MPO available as
+        The returned object keeps the optional chain MPO available as
         ``.chain_mpo`` and exposes the TreePlan-routed representation through
-        ``.tree_networks`` and ``.expectation``.
+        ``.tree_networks`` and ``.expectation``. With
+        ``charge_sectors=True`` the result is ``{charge: TreeMPO}``.
         """
-        from .operators import tree_mpo
+        from .operators import build_tree_operator
 
-        chain_mpo = tree_mpo(self, hamiltonian, **kwargs)
-        if isinstance(chain_mpo, dict):
-            return {
-                charge: mpo.pepsy_tree_operator
-                for charge, mpo in chain_mpo.items()
-            }
-        return chain_mpo.pepsy_tree_operator
+        return build_tree_operator(self, hamiltonian, **kwargs)
+
+    # Compatibility spelling retained while ``build_tree_operator`` becomes
+    # the single plan-facing tree operator builder.
+    to_tree_mpo = build_tree_operator
 
     def is_leaf(self, nid):
         return len(self.children.get(nid, ())) == 0
