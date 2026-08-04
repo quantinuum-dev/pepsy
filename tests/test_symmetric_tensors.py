@@ -4285,6 +4285,82 @@ def test_sympeps_measure_delegates_to_quimb_boundary_modes():
     assert ctmrg_norm == pytest.approx(exact_norm)
 
 
+def test_native_fermionic_ctmrg_matches_exact_on_small_double_layer():
+    """Native fermionic CTMRG should remain finite on a small U1U1 PEPS."""
+    site_charge = site_charge_from_occupations(
+        {
+            (0, 0): (1, 0),
+            (0, 1): (0, 1),
+            (1, 0): (0, 1),
+            (1, 1): (1, 0),
+            (2, 0): (1, 0),
+            (2, 1): (0, 1),
+        }
+    )
+    state = SymPEPS.random(
+        3,
+        2,
+        symmetry="U1U1",
+        phys_dim=default_physical_sectors(model="fermi_hubbard_u1u1"),
+        fermionic=True,
+        site_charge=site_charge,
+        bond_dim=2,
+        seed=74,
+        dtype="complex128",
+    )
+    norm = state.tn.make_norm()
+    exact = norm.contract(all, optimize="auto-hq")
+    ctmrg = pepsy.contract_flat(
+        norm,
+        chi=2,
+        method="ctmrg",
+        progress=False,
+        cutoff=1.0e-10,
+    )
+
+    assert np.isfinite(ctmrg)
+    assert ctmrg == pytest.approx(exact, rel=1.0e-6, abs=1.0e-12)
+
+
+def test_native_ctmrg_rejects_nonfinite_squared_environment_before_eigh():
+    """Non-finite native environment blocks must stop before factorization."""
+    import quimb.tensor.tensor_core as qtc
+
+    site_charge = site_charge_from_occupations(
+        {
+            (0, 0): (1, 0),
+            (0, 1): (0, 1),
+            (1, 0): (1, 0),
+            (1, 1): (0, 1),
+        }
+    )
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1U1",
+        phys_dim=default_physical_sectors(model="fermi_hubbard_u1u1"),
+        fermionic=True,
+        site_charge=site_charge,
+        bond_dim=2,
+        seed=75,
+        dtype="complex128",
+    )
+    environment = next(iter(state.peps.tensor_map.values())).data.copy()
+    sector = next(iter(environment.blocks))
+    environment.set_block(
+        sector,
+        np.full_like(environment.get_block(sector), np.nan),
+    )
+
+    with pepsy.boundary.metrics.quimb_ctmrg_projector_compat():
+        with pytest.raises(FloatingPointError, match="squared environment"):
+            qtc.squared_op_to_reduced_factor(
+                environment,
+                environment.shape[0],
+                environment.shape[0],
+            )
+
+
 def test_sympeps_gate_stream_runs_pepsy_gate_and_gate_simple():
     """SymPEPS gate streams should work with PEPSY gate wrappers."""
     state = SymPEPS.for_model(

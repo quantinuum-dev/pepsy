@@ -10,6 +10,10 @@ from __future__ import annotations
 import warnings
 
 from ..torch_types import _check_positive_int, _require_torch
+from ...boundary.metrics import (
+    _ctmrg_stabilization_kwargs,
+    quimb_ctmrg_projector_compat,
+)
 from ._common import (
     _as_contraction_options,
     _as_long_matrix,
@@ -497,6 +501,24 @@ class TorchPEPSAmplitude:
             options.setdefault("strip_exponent", strip_exponent)
         return options
 
+    def _ctmrg_options(self, tnx):
+        """Return CTMRG options with the native Symmray safety defaults."""
+        options = dict(self.contraction_opts)
+        defaults = _ctmrg_stabilization_kwargs(
+            tnx,
+            reduce_opts=options.get("reduce_opts"),
+            gauge_smudge=options.get("gauge_smudge"),
+        )
+        for key, value in defaults.items():
+            if key != "canonize_opts":
+                if options.get(key) is None:
+                    options[key] = value
+                continue
+            canonize_opts = dict(value)
+            canonize_opts.update(options.get(key) or {})
+            options[key] = canonize_opts
+        return options
+
     def _contract_remaining(self, tn, *args, final_opts=None):
         """Close an approximate PEPS contraction with the requested path."""
         if final_opts is None:
@@ -581,12 +603,13 @@ class TorchPEPSAmplitude:
                 **self.contraction_opts,
             )
         elif self.contraction == "ctmrg":
-            value = self._contract_approximate(
-                tnx.contract_ctmrg,
-                max_bond=self.chi,
-                close_final=True,
-                **self.contraction_opts,
-            )
+            with quimb_ctmrg_projector_compat():
+                value = self._contract_approximate(
+                    tnx.contract_ctmrg,
+                    max_bond=self.chi,
+                    close_final=True,
+                    **self._ctmrg_options(tnx),
+                )
         elif self.contraction == "boundary":
             value = self._contract_approximate(
                 tnx.contract_boundary,
@@ -609,13 +632,14 @@ class TorchPEPSAmplitude:
                 **self.contraction_opts,
             )
         elif self.contraction == "ctmrg":
-            mantissa, exponent_10 = self._contract_approximate(
-                tnx.contract_ctmrg,
-                max_bond=self.chi,
-                strip_exponent=True,
-                close_final=True,
-                **self.contraction_opts,
-            )
+            with quimb_ctmrg_projector_compat():
+                mantissa, exponent_10 = self._contract_approximate(
+                    tnx.contract_ctmrg,
+                    max_bond=self.chi,
+                    strip_exponent=True,
+                    close_final=True,
+                    **self._ctmrg_options(tnx),
+                )
         elif self.contraction == "boundary":
             mantissa, exponent_10 = self._contract_approximate(
                 tnx.contract_boundary,
