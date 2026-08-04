@@ -5171,6 +5171,9 @@ def _dense_numpy(value, *, dtype=None):
     cpu = getattr(value, "cpu", None)
     if callable(cpu):
         value = cpu()
+    # CuPy arrays reject implicit host conversion; move to host explicitly.
+    if type(value).__module__.split(".", 1)[0] == "cupy":
+        value = value.get()
     return np.asarray(value, dtype=dtype)
 
 
