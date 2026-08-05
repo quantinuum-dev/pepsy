@@ -957,7 +957,7 @@ class MpsStabOptimizer:
         if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
             return "opaque"
         try:
-            gate = np.asarray(entry[0], dtype=complex)
+            gate = np.asarray(ar.to_numpy(entry[0]), dtype=complex)
         except (TypeError, ValueError):
             return "opaque"
         if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
@@ -1264,7 +1264,7 @@ class MpsStabOptimizer:
             if len(entry) != 2:
                 return "opaque"
             try:
-                gate = np.asarray(entry[0], dtype=complex)
+                gate = np.asarray(ar.to_numpy(entry[0]), dtype=complex)
                 dim = gate.shape[0]
                 nq = int(round(math.log2(dim)))
                 if (
@@ -4965,7 +4965,8 @@ class MpsStabOptimizer:
             )
         if norm_squared <= 0.0:
             return 0.0
-        gram = np.asarray(gate).conj().T @ np.asarray(gate)
+        gate = np.asarray(ar.to_numpy(gate))
+        gram = gate.conj().T @ gate
         expectation = 0.0 + 0.0j
         for term_index, (labels, coefficient) in enumerate(
             pauli_decomposition(gram, k, tol=self.operator_tol), start=1
@@ -5580,7 +5581,7 @@ def _looks_like_stream(gates) -> bool:
 
 def _is_unitary(gate: np.ndarray, tol: float = 1e-9) -> bool:
     """Return whether ``gate`` is unitary within ``tol``."""
-    g = np.asarray(gate, dtype=complex)
+    g = np.asarray(ar.to_numpy(gate), dtype=complex)
     return np.allclose(g.conj().T @ g, np.eye(g.shape[0]), atol=tol)
 
 
@@ -5590,7 +5591,7 @@ def _zyz_angles(gate: np.ndarray):
     Up to a global phase, using the convention ``Rz(a) = exp(-i a/2 Z)`` and
     ``Ry(t) = exp(-i t/2 Y)``.
     """
-    u = np.asarray(gate, dtype=complex)
+    u = np.asarray(ar.to_numpy(gate), dtype=complex)
     det = u[0, 0] * u[1, 1] - u[0, 1] * u[1, 0]
     u = u / np.sqrt(det)  # to SU(2) up to a sign (global phase, irrelevant)
     c = abs(u[0, 0])

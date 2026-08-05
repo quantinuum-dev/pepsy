@@ -396,14 +396,13 @@ class TorchPEPSAmplitude:
             and self.symmray_tensor_ids
             and self.contraction_opts.get("mode") is None
         ):
-            # Quimb's default CTMRG projector compressor forms arbitrary-
-            # geometry oblique projectors. With Symmray blocks backed by
-            # Torch, that intermediate product can have incompatible dense
-            # dimensions even though the original block-sparse contraction is
-            # valid. The direct SVD boundary compressor keeps the contraction
-            # sector-local and is the compatible default for this case. A
-            # caller-provided mode remains an explicit override.
-            self.contraction_opts["mode"] = "direct"
+            # The scoped native-fermionic CTMRG compatibility layer repairs
+            # projector insertion and zero sectors. Keep the projector route
+            # as the default for Torch-backed Symmray: the direct boundary
+            # compressor can mix NumPy intermediates with Symmray blocks on
+            # larger native PEPS. A caller-provided mode remains an explicit
+            # override.
+            self.contraction_opts["mode"] = "projector"
         # ``torch.vmap`` can batch the pure tensor contractions for dense and
         # compatible Symmray PEPS. Keep a per-model fallback for contraction
         # paths or optional backends that cannot be vmapped.

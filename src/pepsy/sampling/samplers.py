@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import math
 from typing import Any, Iterable
 
+import autoray as ar
 import numpy as np
 from tqdm import tqdm
 
@@ -122,12 +123,9 @@ def _mps_array_backend(array):
 
 
 def _backend_array_to_numpy(array):
-    backend = _mps_array_backend(array)
-    if backend == "torch":
-        return array.detach().cpu().numpy()
-    if backend == "cupy":
-        return array.get()
-    return np.asarray(array)
+    if hasattr(array, "to_dense"):
+        array = array.to_dense()
+    return np.asarray(ar.to_numpy(array))
 
 
 def _fermion_symmray_occupations(charge, offset, fermion):
@@ -274,16 +272,7 @@ def _to_dense_numpy(array):
     """Convert a dense or Symmray array to a NumPy array for BP sampling."""
     if hasattr(array, "to_dense"):
         array = array.to_dense()
-    detach = getattr(array, "detach", None)
-    if callable(detach):
-        array = detach()
-        cpu = getattr(array, "cpu", None)
-        if callable(cpu):
-            array = cpu()
-        numpy = getattr(array, "numpy", None)
-        if callable(numpy):
-            array = numpy()
-    return np.asarray(array)
+    return np.asarray(ar.to_numpy(array))
 
 
 def _prepare_bp_binary_network(tn, *, site_order=None, encoding=None):
@@ -727,11 +716,11 @@ class MpsBatchSampleResult:
         if backend == "torch":
             configs = self.configs.to(dtype=self.probs.dtype)
             out = (1 - 2 * configs).sum(dim=1) / float(self.L)
-            return out.detach().cpu().numpy() if to_numpy else out
+            return ar.to_numpy(out) if to_numpy else out
         if backend == "cupy":
             configs = self.configs.astype(np.float64, copy=False)
             out = (1 - 2 * configs).sum(axis=1) / float(self.L)
-            return out.get() if to_numpy else out
+            return ar.to_numpy(out) if to_numpy else out
         configs = np.asarray(self.configs, dtype=float)
         return (1 - 2 * configs).sum(axis=1) / float(self.L)
 
@@ -962,7 +951,7 @@ class MpsSampler:
         # Convert to numpy for quimb sampling compatibility
         self._psi = psi.copy()
         self._psi.apply_to_arrays(
-            lambda x: x.get() if hasattr(x, "get") else np.asarray(x)
+            lambda x: ar.to_numpy(x)
         )
         return self
 
@@ -1326,7 +1315,7 @@ class MpsSampler:
                 replacement=True,
                 generator=rng,
             )
-            return choices.detach().cpu().numpy().astype(np.int64, copy=False)
+            return np.asarray(ar.to_numpy(choices), dtype=np.int64)
         if backend == "cupy":
             import cupy as cp  # pylint: disable=import-outside-toplevel
 
@@ -1334,7 +1323,7 @@ class MpsSampler:
             draws = rng.random(n_draws)
             choices = cp.searchsorted(cdf, draws, side="right")
             choices = cp.minimum(choices, int(probs.shape[0]) - 1)
-            return choices.get().astype(np.int64, copy=False)
+            return np.asarray(ar.to_numpy(choices), dtype=np.int64)
         return np.asarray(
             rng.choice(len(probs), size=n_draws, p=probs),
             dtype=np.int64,
@@ -2337,8 +2326,8 @@ class MpsSampler:
 
         configs = torch.stack(configs, dim=1)
         if to_numpy:
-            configs = configs.detach().cpu().numpy()
-            probs_total = probs_total.detach().cpu().numpy()
+            configs = np.asarray(ar.to_numpy(configs))
+            probs_total = np.asarray(ar.to_numpy(probs_total))
         return configs, probs_total
 
     @staticmethod
@@ -2380,12 +2369,9 @@ class MpsSampler:
             configs.append(choices)
 
         configs = xp.stack(configs, axis=1)
-        if to_numpy and backend == "cupy":
-            configs = configs.get()
-            probs_total = probs_total.get()
         if to_numpy:
-            configs = np.asarray(configs)
-            probs_total = np.asarray(probs_total)
+            configs = np.asarray(ar.to_numpy(configs))
+            probs_total = np.asarray(ar.to_numpy(probs_total))
         return configs, probs_total
 
     @staticmethod
@@ -2850,10 +2836,7 @@ class VecSampler:
         # Extract the state vector with correct index ordering
         vec = self._to_vector(state, L, ind_id)
 
-        # Move to CPU if needed (cupy)
-        if hasattr(vec, "get"):
-            vec = vec.get()
-        vec = np.asarray(vec, dtype=complex).ravel()
+        vec = np.asarray(ar.to_numpy(vec), dtype=complex).ravel()
         expected_size = 2 ** L
         if vec.size != expected_size:
             raise ValueError(

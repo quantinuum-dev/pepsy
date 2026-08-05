@@ -39,13 +39,9 @@ __all__ = ["TreeMPO", "build_tree_operator", "tree_mpo"]
 
 def _as_numpy(data, *, dtype=None):
     """Convert a dense backend array to host NumPy construction data."""
-    if hasattr(data, "detach"):
-        data = data.detach()
-    if hasattr(data, "cpu"):
-        data = data.cpu()
-    if hasattr(data, "get"):
-        data = data.get()
-    return np.asarray(data, dtype=dtype)
+    if hasattr(data, "to_dense"):
+        data = data.to_dense()
+    return np.asarray(ar.to_numpy(data), dtype=dtype)
 
 
 def _tree_plan_signature(plan):

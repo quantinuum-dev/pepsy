@@ -335,14 +335,16 @@ def _uses_symmray_arrays(tn):
 
 def _to_python_scalar(value):
     """Convert backend scalar-like objects (torch/numpy) to python scalar."""
-    obj = value
-    if hasattr(obj, "detach"):
-        obj = obj.detach()
-    if hasattr(obj, "cpu"):
-        obj = obj.cpu()
-    if hasattr(obj, "item") and not isinstance(obj, (int, float, complex, bool)):
+    if isinstance(value, (int, float, complex, bool)):
+        return value
+    try:
+        obj = ar.to_numpy(value)
+    except Exception:
+        obj = value
+    item = getattr(obj, "item", None)
+    if callable(item):
         try:
-            obj = obj.item()
+            return item()
         except (ValueError, RuntimeError):  # backend-specific .item() failures
             pass
     return obj

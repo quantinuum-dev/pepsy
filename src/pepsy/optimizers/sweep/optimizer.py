@@ -1068,12 +1068,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         """Convert solver history entries into plain Python floats."""
         values = []
         for entry in history or ():
-            value = entry
-            if hasattr(value, "detach"):
-                value = value.detach()
-            if hasattr(value, "cpu"):
-                value = value.cpu()
-            values.append(float(value))
+            values.append(float(ar.to_numpy(entry)))
         return values
 
     @staticmethod

@@ -994,6 +994,36 @@ def test_torch_ctmrg_preserves_explicit_stabilization_options(monkeypatch):
     }
 
 
+def test_torch_native_symmray_ctmrg_defaults_to_projector_mode():
+    """Native Torch Symmray CTMRG should use the guarded projector route."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymPEPS, site_charge_from_occupations
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1",
+        phys_dim={0: 1, 1: 2, 2: 1},
+        fermionic=True,
+        site_charge=site_charge_from_occupations(
+            {(x, y): 1 for x in range(2) for y in range(2)}
+        ),
+        bond_dim=2,
+        seed=194,
+        dtype="complex128",
+    )
+    model = TorchPEPSAmplitude(
+        state,
+        contraction="ctmrg",
+        chi=2,
+        dtype=torch.complex128,
+    )
+
+    assert model.contraction_opts["mode"] == "projector"
+
+
 def test_netket_setup_consumes_shared_sampling_config():
     nk = pytest.importorskip("netket")
     from pepsy.vmc.netket import NetKetPEPSVMC

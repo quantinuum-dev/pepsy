@@ -26,15 +26,15 @@ def _backend_scalar(value):
         if shape != ():
             raise TypeError(f"Expected a scalar-like value, got shape {shape}.")
 
-    obj = value
-    for method_name in ("detach", "cpu"):
-        method = getattr(obj, method_name, None)
-        if callable(method):
-            obj = method()
-
-    get = getattr(obj, "get", None)
-    if callable(get) and shape is not None:
-        obj = get()
+    if shape is not None:
+        try:
+            obj = ar.to_numpy(value)
+        except Exception:
+            # Keep supporting duck-typed scalar wrappers with ``item`` but no
+            # registered Autoray backend.
+            obj = value
+    else:
+        obj = value
 
     item = getattr(obj, "item", None)
     if callable(item) and not isinstance(obj, _SCALAR_TYPES):
@@ -56,9 +56,8 @@ def to_float(value, *, real=True):
     """Convert a scalar-like backend value to a Python ``float``.
 
     The input can be a Python scalar, NumPy scalar or scalar array, or a
-    scalar-like backend tensor. Torch-style values are detached and moved to
-    CPU before extracting ``.item()``; CuPy-style values are host-transferred
-    with ``.get()`` when available. Non-scalar arrays raise ``TypeError``.
+    scalar-like backend tensor. Autoray converts backend scalar arrays to host
+    NumPy before extracting ``.item()``. Non-scalar arrays raise ``TypeError``.
 
     Parameters
     ----------
@@ -261,7 +260,7 @@ def _build_to_numpy(sample_data, dtype_name, *, cast_complex_to_real=False):
     dtype = _NUMPY_DTYPE_MAP[dtype_name]
 
     def _to_numpy(x, dtype=dtype, cast_complex_to_real=cast_complex_to_real):
-        arr = np.asarray(x)
+        arr = np.asarray(ar.to_numpy(x))
         if cast_complex_to_real and np.issubdtype(dtype, np.floating) and np.iscomplexobj(arr):
             arr = arr.real
         target_dtype = dtype
@@ -389,13 +388,15 @@ def _build_to_jax(sample_data, dtype_name, *, cast_complex_to_real=False):
         device=device,
         cast_complex_to_real=cast_complex_to_real,
     ):
-        # Torch tensors need explicit host conversion before jnp.asarray.
         try:
-            import torch  # pylint: disable=import-outside-toplevel
-        except ImportError:  # pragma: no cover - optional dependency
-            torch = None
-        if torch is not None and isinstance(x, torch.Tensor):
-            x = x.detach().cpu().numpy()
+            # JAX accepts NumPy inputs directly, while Autoray provides the
+            # explicit host boundary for Torch/CuPy and other array backends.
+            if ar.infer_backend(x) != "jax":
+                x = ar.to_numpy(x)
+        except Exception:
+            # Preserve support for custom array-likes which JAX can consume
+            # even though Autoray cannot infer their namespace.
+            pass
 
         arr = jnp.asarray(x)
 

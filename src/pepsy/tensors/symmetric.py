@@ -85,13 +85,7 @@ def _as_python_bool(value):
 
 def _to_host_numpy(value):
     value = _to_dense(value)
-    detach = getattr(value, "detach", None)
-    if callable(detach):
-        value = detach()
-    cpu = getattr(value, "cpu", None)
-    if callable(cpu):
-        value = cpu()
-    return np.asarray(value)
+    return np.asarray(ar.to_numpy(value))
 
 
 def _is_symmray_array(value):
@@ -4831,15 +4825,15 @@ def _as_scalar(value):
         shape = tuple(shape)
         if shape != ():
             return value
-        detach = getattr(value, "detach", None)
-        if callable(detach):
-            value = detach()
-        cpu = getattr(value, "cpu", None)
-        if callable(cpu):
-            value = cpu()
-        item = getattr(value, "item", None)
-        if callable(item):
-            return item()
+        try:
+            return ar.to_numpy(value).item()
+        except Exception:
+            # Preserve the small duck-typed scalar contract for backend
+            # wrappers that expose ``item`` but are not Autoray-registered.
+            item = getattr(value, "item", None)
+            if callable(item):
+                return item()
+            raise
     arr = np.asarray(value)
     if arr.shape == ():
         return arr.item()
@@ -5165,16 +5159,7 @@ def _coupling_is_active(value):
 
 def _dense_numpy(value, *, dtype=None):
     value = _to_dense(value)
-    detach = getattr(value, "detach", None)
-    if callable(detach):
-        value = detach()
-    cpu = getattr(value, "cpu", None)
-    if callable(cpu):
-        value = cpu()
-    # CuPy arrays reject implicit host conversion; move to host explicitly.
-    if type(value).__module__.split(".", 1)[0] == "cupy":
-        value = value.get()
-    return np.asarray(value, dtype=dtype)
+    return np.asarray(ar.to_numpy(value), dtype=dtype)
 
 
 def _is_single_site_identity_hamiltonian(target, local_dim, zero_charge):

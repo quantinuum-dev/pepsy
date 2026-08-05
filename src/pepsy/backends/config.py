@@ -306,10 +306,14 @@ def backend_jax(device="cpu", dtype=None):
         target_dtype = jax.dtypes.canonicalize_dtype(jnp.dtype(dtype))
 
     def cast_array(x, device=target_device, dtype=target_dtype):
-        # Coerce non-JAX inputs (incl. torch tensors) to a numpy-compatible
-        # form first so jnp.asarray accepts them on any backend.
-        if torch is not None and isinstance(x, torch.Tensor):
-            x = x.detach().cpu().numpy()
+        # Coerce non-JAX inputs to a NumPy-compatible form through Autoray so
+        # Torch, CuPy, and other registered backends share one host boundary.
+        try:
+            if ar.infer_backend(x) != "jax":
+                x = ar.to_numpy(x)
+        except Exception:
+            # Let JAX handle custom array-likes that Autoray cannot infer.
+            pass
         arr = jnp.asarray(x, dtype=dtype)
         if device is not None:
             arr = jax.device_put(arr, device)

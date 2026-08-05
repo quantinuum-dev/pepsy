@@ -1254,7 +1254,9 @@ def _symmray_dense_gate_from_site_maps(
         else 0
     )
 
-    dense_gate = np.asarray(gate)
+    if hasattr(gate, "to_dense"):
+        gate = gate.to_dense()
+    dense_gate = np.asarray(ar.to_numpy(gate))
     if inferred_converter is not None:
         dense_gate = inferred_converter(dense_gate)
 
@@ -2164,14 +2166,14 @@ def gate_loop_cluster(
     if any(hasattr(tensor.data, "to_dense") for tensor in tn_work.tensor_map.values()):
         for tensor in tn_work.tensor_map.values():
             if hasattr(tensor.data, "to_dense"):
-                tensor.modify(data=np.asarray(tensor.data.to_dense()))
+                tensor.modify(data=np.asarray(ar.to_numpy(tensor.data.to_dense())))
         for index, gauge in tuple(gauges.items()):
             if hasattr(gauge, "to_dense"):
-                gauges[index] = np.asarray(gauge.to_dense())
+                gauges[index] = np.asarray(ar.to_numpy(gauge.to_dense()))
 
     for gate_payload, where_payload, which_payload in entries:
         if hasattr(gate_payload, "to_dense"):
-            gate_payload = np.asarray(gate_payload.to_dense())
+            gate_payload = np.asarray(ar.to_numpy(gate_payload.to_dense()))
 
         if _is_explicit_index_where(where_payload):
             raise ValueError(

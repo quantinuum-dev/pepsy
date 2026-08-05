@@ -7,6 +7,7 @@ from collections.abc import Mapping
 
 from numbers import Integral
 
+import autoray as ar
 import numpy as np
 import quimb
 import quimb.tensor as qtn
@@ -348,7 +349,9 @@ class ham_tn:
     @staticmethod
     def _as_matrix(op):
         data = getattr(op, "data", op)
-        return np.asarray(data)
+        if hasattr(data, "to_dense"):
+            data = data.to_dense()
+        return np.asarray(ar.to_numpy(data))
 
     def _coerce_op(self, op, *, phys_dim, dtype):
         if callable(op) and not hasattr(op, "shape"):

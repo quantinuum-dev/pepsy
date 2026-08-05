@@ -16,6 +16,7 @@ import math
 import time
 import warnings
 
+import autoray as ar
 import numpy as np
 from scipy.sparse.linalg import LinearOperator
 
@@ -111,15 +112,7 @@ def _normalize_backend(backend):
 
 
 def _to_numpy(array):
-    if type(array) is np.ndarray:
-        return array
-    if hasattr(array, "detach") and hasattr(array, "cpu"):
-        array = array.detach().cpu()
-    if hasattr(array, "numpy"):
-        return np.asarray(array.numpy())
-    if hasattr(array, "get"):
-        return np.asarray(array.get())
-    return np.asarray(array)
+    return np.asarray(ar.to_numpy(array))
 
 
 def _dense_data(data):

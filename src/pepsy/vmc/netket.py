@@ -14,6 +14,7 @@ import time
 from typing import Any
 import warnings
 
+import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
@@ -2296,11 +2297,7 @@ def _uses_flat_symmray_arrays(tn):
 
 def _host_array_for_flatten(value):
     """Copy a Torch/CUDA block to a host NumPy array for Symmray packing."""
-    if hasattr(value, "detach"):
-        value = value.detach()
-    if hasattr(value, "cpu"):
-        value = value.cpu()
-    return np.asarray(value)
+    return np.asarray(ar.to_numpy(value))
 
 
 def _z2_flat_padded(data, sr):
@@ -4619,13 +4616,7 @@ def _native_term_support(where, *, coordinate_sites):
 def _native_term_to_numpy(term):
     """Transfer one small native local term to a host dense matrix."""
     dense = term.to_dense() if hasattr(term, "to_dense") else term
-    detach = getattr(dense, "detach", None)
-    if callable(detach):
-        dense = detach()
-    cpu = getattr(dense, "cpu", None)
-    if callable(cpu):
-        dense = cpu()
-    return np.asarray(dense, dtype=np.complex128)
+    return np.asarray(ar.to_numpy(dense), dtype=np.complex128)
 
 
 def _project_native_term(matrix, candidates, *, where):

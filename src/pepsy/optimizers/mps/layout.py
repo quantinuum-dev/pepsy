@@ -7,6 +7,7 @@ from itertools import combinations
 from numbers import Integral
 import os
 
+import autoray as ar
 import numpy as np
 
 from ...operators.gates import _normalize_gate_entries
@@ -216,10 +217,14 @@ def _payload_angle(payload):
         else:
             return None
 
-    if isinstance(value, (tuple, list, np.ndarray)):
-        if len(value) != 1:
+    try:
+        value_array = np.asarray(ar.to_numpy(value))
+    except Exception:
+        value_array = None
+    if value_array is not None:
+        if value_array.size != 1:
             return None
-        value = value[0]
+        value = value_array.reshape(-1)[0]
     try:
         angle = abs(float(value))
     except (TypeError, ValueError):
@@ -240,7 +245,8 @@ def _operator_schmidt_weight(payload, support, *, schmidt_max_dim=4):
     if len(support) != 2:
         return None
     try:
-        array = np.asarray(payload)
+        raw = payload.to_dense() if hasattr(payload, "to_dense") else payload
+        array = np.asarray(ar.to_numpy(raw))
     except Exception:
         return None
     if array.size == 0 or not np.issubdtype(array.dtype, np.number):
@@ -339,8 +345,10 @@ def _operator_schmidt_rank_info(
         }
 
     raw = getattr(payload, "data", payload)
+    if hasattr(raw, "to_dense"):
+        raw = raw.to_dense()
     try:
-        array = np.asarray(raw)
+        array = np.asarray(ar.to_numpy(raw))
     except Exception:
         return {"rank": default_bound, "exact": False, "reason": "opaque"}
     if array.size == 0 or not np.issubdtype(array.dtype, np.number):

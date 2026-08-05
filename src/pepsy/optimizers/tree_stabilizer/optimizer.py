@@ -144,7 +144,7 @@ def _looks_like_single_entry(gates):
 
 def _is_unitary(gate):
     """Return whether a dense gate is unitary to the STN tolerance."""
-    gate = np.asarray(gate)
+    gate = np.asarray(ar.to_numpy(gate))
     if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
         return False
     return np.allclose(
@@ -159,8 +159,8 @@ def _apply_dense_gate(state, gate, where, n):
     """Apply a small gate to a dense state in logical big-endian order."""
     where = tuple(int(q) for q in where)
     k = len(where)
-    tensor = np.asarray(state).reshape((2,) * n)
-    operator = np.asarray(gate).reshape((2,) * (2 * k))
+    tensor = np.asarray(ar.to_numpy(state)).reshape((2,) * n)
+    operator = np.asarray(ar.to_numpy(gate)).reshape((2,) * (2 * k))
     out = np.tensordot(
         operator,
         tensor,
@@ -320,7 +320,7 @@ def _dense_to_tree_state(state, plan, *, max_bond=None, cutoff=0.0, dtype=comple
     if cutoff < 0.0:
         raise ValueError("cutoff must be non-negative.")
 
-    dense = np.asarray(state, dtype=dtype).reshape(-1)
+    dense = np.asarray(ar.to_numpy(state), dtype=dtype).reshape(-1)
     expected_size = 2 ** plan.n
     if dense.size != expected_size:
         raise ValueError(
@@ -1279,7 +1279,7 @@ class TreeStabOptimizer:
         if not isinstance(head, str):
             if len(entry) != 2:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-            gate = np.asarray(entry[0])
+            gate = np.asarray(ar.to_numpy(entry[0]))
             where = _normalize_sites(entry[1])
             if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
                 raise ValueError(f"Gate matrix must be square, got {gate.shape}.")

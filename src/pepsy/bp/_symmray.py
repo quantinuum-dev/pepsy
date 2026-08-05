@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import autoray as ar
 import numpy as np
 
 
@@ -107,8 +108,8 @@ def dense_message_tree(messages):
 def to_dense(value):
     """Materialize one small Symmray value for a local operator calculation."""
     if hasattr(value, "to_dense"):
-        return np.asarray(value.to_dense())
-    return np.asarray(value)
+        value = value.to_dense()
+    return np.asarray(ar.to_numpy(value))
 
 
 def dense_index_map(chargemap):
@@ -275,7 +276,9 @@ def rank4_operator_from_dense(tn, index, operator, *, layout="pne"):
         _bond_endpoint_data(tn, index)
     )
     dimension = int(left_data.shape[left_data.indices.index(left_index)])
-    dense = np.asarray(operator)
+    if hasattr(operator, "to_dense"):
+        operator = operator.to_dense()
+    dense = np.asarray(ar.to_numpy(operator))
     if dense.shape == (dimension * dimension, dimension * dimension):
         dense = dense.reshape(dimension, dimension, dimension, dimension)
     elif dense.shape != (dimension, dimension, dimension, dimension):

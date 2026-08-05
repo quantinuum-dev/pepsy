@@ -358,6 +358,7 @@ def _bridge_samples(
     progress,
     sample_kwargs,
     amplitude_floor,
+    amplitude_cache=None,
 ):
     torch = _require_torch()
     device = _model_device(driver.model)
@@ -385,11 +386,18 @@ def _bridge_samples(
     if amplitude_floor < 0:
         raise ValueError("amplitude_floor must be non-negative.")
     with torch.no_grad():
-        amplitudes = _call_amplitude_fn(
-            driver.model,
-            configs,
-            chunk_size=getattr(driver, "chunk_size", None),
-        )
+        if amplitude_cache is None:
+            amplitudes = _call_amplitude_fn(
+                driver.model,
+                configs,
+                chunk_size=getattr(driver, "chunk_size", None),
+            )
+        else:
+            amplitudes = amplitude_cache.evaluate(
+                driver.model,
+                configs,
+                chunk_size=getattr(driver, "chunk_size", None),
+            )
     amp_abs = amplitudes.abs()
     valid = torch.isfinite(amp_abs) & (amp_abs > float(amplitude_floor)) & torch.isfinite(log_q)
     if not bool(torch.any(valid)):
@@ -413,6 +421,7 @@ def sample_from_proposal(
     sample_kwargs=None,
     progress=False,
     amplitude_floor=0.0,
+    amplitude_cache=None,
 ):
     """Draw and bridge reusable samples from an MPS, BP, tree, or proposal.
 
@@ -436,6 +445,7 @@ def sample_from_proposal(
         progress=progress,
         sample_kwargs=sample_kwargs,
         amplitude_floor=amplitude_floor,
+        amplitude_cache=amplitude_cache,
     )
     elapsed = time.perf_counter() - start
     n_valid = int(configs.shape[0])
@@ -467,6 +477,7 @@ def measure_from_proposal(
     amplitude_floor=0.0,
     profile=False,
     deduplicate=True,
+    amplitude_cache=None,
 ):
     """Compatibility one-shot wrapper around sample then measure."""
     samples = sample_from_proposal(
@@ -481,6 +492,7 @@ def measure_from_proposal(
         sample_kwargs=sample_kwargs,
         progress=progress,
         amplitude_floor=amplitude_floor,
+        amplitude_cache=amplitude_cache,
     )
     return driver.measure_samples(
         samples,
@@ -488,6 +500,7 @@ def measure_from_proposal(
         profile=profile,
         deduplicate=deduplicate,
         progress=progress,
+        amplitude_cache=amplitude_cache,
     )
 
 

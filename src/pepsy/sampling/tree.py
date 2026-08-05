@@ -46,6 +46,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import autoray as ar
+
 from .samplers import FermionConfigurationEncoding
 
 __all__ = [
@@ -316,10 +318,10 @@ class TreeSampler:
         fermionic = bool(getattr(tn, "fermionic", False))
         if fermionic:
             def to_arr(data):
-                return np.asarray(data.to_dense())
+                return np.asarray(ar.to_numpy(data.to_dense()))
         else:
             def to_arr(data):
-                return np.asarray(data)
+                return np.asarray(ar.to_numpy(data))
 
         def bond_between(a, b):
             shared = set(tn.node_tensor(a).inds) & set(tn.node_tensor(b).inds)

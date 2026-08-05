@@ -41,6 +41,8 @@ _SYMBOL_MODULES = {
     "PackedFermionicPEPS": ".netket",
     "SpinOrbitalColumns": ".netket",
     "TorchConnections": ".torch",
+    "TorchFockTransitionPlan": ".torch",
+    "TorchAmplitudeCache": ".torch",
     "TorchAmplitudeBenchmark": ".torch",
     "TorchAmplitudeBenchmarkRun": ".torch",
     "TorchFermionVMC": ".torch",
