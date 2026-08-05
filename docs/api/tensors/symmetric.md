@@ -248,6 +248,23 @@ ham_dmrg = spinful.hamiltonian(terms)
 H_mpo = ham_dmrg.to_mpo(L=L)
 ```
 
+For the all-pairs staggered eta structure factor, use the dedicated compact
+native builder instead of expanding one two-site term for every pair:
+
+```python
+eta_mpo = spinful.eta_pair_structure_factor_mpo(
+    L,
+    signs=tuple((-1) ** (site % 2) for site in range(L)),
+    normalization=1.0 / L,
+)
+```
+
+This represents ``(1 / L) * (F^dagger F - sum_i Delta_i^dagger Delta_i)``
+with ``F = sum_i signs[i] * Delta_i``. It has four finite-state MPO channels
+independent of the number of pairs and remains a native graded MPO for the
+MPS evaluator. ``compress=True`` is optional; it is not needed to obtain the
+compact bond dimension.
+
 For a term mapping, scalar site keys are normalized to ``(site,)``. The
 ``SymHamiltonian`` returned by ``fermion.hamiltonian(terms)`` retains the
 locations, symmetry, and fermionic ordering metadata needed by ``to_mpo``;
