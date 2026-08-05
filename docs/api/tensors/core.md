@@ -27,10 +27,12 @@ stabilized SVD CPU forward path falls back to SciPy `gesvd` if
 
 The Torch QR split driver uses the zero-safe phase convention `phase(0)=1`.
 This preserves a lossless QR/LQ reconstruction even for rank-deficient dense
-or Symmray blocks. At a nonzero singular QR pivot its backward uses a
-scale-relative regularized right inverse rather than discarding the entire
-block gradient. An exactly zero block has no preferred QR gauge or scale and
-therefore retains the explicit zero-VJP convention.
+or Symmray blocks. A pivot at or below the scale-relative QR epsilon uses a
+regularized right inverse in backward rather than discarding the entire block
+gradient. The same epsilon sets both the near-singular detection threshold and
+the Tikhonov shift (`1e-6` times block scale for float64/complex128; a larger
+float32 safety floor applies). An exactly zero block has no preferred QR gauge
+or scale and therefore retains the explicit zero-VJP convention.
 
 Use `register_jax_linalg()` for the same native-versus-stabilized choice on
 JAX. The lower-level Torch/JAX helpers remain available directly from `pepsy`

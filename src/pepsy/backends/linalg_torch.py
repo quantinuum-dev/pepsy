@@ -424,6 +424,14 @@ class QR_real(torch.autograd.Function):
         return torch.cat([da, db], dim=-1)
 
 
+def _qr_regularization_relative_eps(real_dtype):
+    """Return the shared relative threshold and VJP regularization scale."""
+    # The normal-equation right inverse squares the condition number. The
+    # square-root machine-epsilon floor keeps it resolvable for float32 while
+    # retaining the requested 1e-6 relative stabilization for float64/complex128.
+    return max(_QR_EPS_REL, torch.finfo(real_dtype).eps ** 0.5)
+
+
 class QR_real_safe(torch.autograd.Function):
     """Real QR with a finite VJP at a singular unpivoted QR chart.
 
@@ -439,7 +447,7 @@ class QR_real_safe(torch.autograd.Function):
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
-        tolerance = torch.finfo(A.dtype).eps * max(A.shape[-2:]) * scale
+        tolerance = _qr_regularization_relative_eps(A.dtype) * scale
         rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
         ctx.save_for_backward(A, Q, R, rank_deficient)
         return Q, R
@@ -463,7 +471,7 @@ class QR_complex_safe(torch.autograd.Function):
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
         real_dtype = A.real.dtype if A.is_complex() else A.dtype
-        tolerance = torch.finfo(real_dtype).eps * max(A.shape[-2:]) * scale
+        tolerance = _qr_regularization_relative_eps(real_dtype) * scale
         rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
         ctx.save_for_backward(A, Q, R, rank_deficient)
         return Q, R
@@ -567,10 +575,7 @@ def _regularized_qr_backward(a, q, r, dq, dr, singular_pivot):
         block_scale,
     )
     real_dtype = a.real.dtype if a.is_complex() else a.dtype
-    # The normal-equation right inverse squares the condition number. The
-    # square-root machine-epsilon floor keeps it resolvable for float32 while
-    # retaining the shared 1e-6 relative stabilization for float64/complex128.
-    relative_shift = max(_QR_EPS_REL, torch.finfo(real_dtype).eps ** 0.5)
+    relative_shift = _qr_regularization_relative_eps(real_dtype)
     shift = torch.where(
         singular_pivot,
         relative_shift * scale_for_shift,

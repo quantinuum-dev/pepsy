@@ -39,10 +39,10 @@ Phys. Rev. Research 7, 023193 (2025).
   native Torch PEPS autodiff through the canonical
   `register_torch_linalg(..., quimb_split_drivers=True)` call. Its QR/LQ path
   uses the zero-safe `phase(0)=1` convention, preserving exact splits for
-  rank-deficient native fermionic blocks. A nonzero singular QR pivot uses a
-  scale-relative regularized VJP, so it stays finite without suppressing the
-  full local PEPS gradient; only an exactly zero block takes the zero-VJP
-  convention.
+  rank-deficient native fermionic blocks. A QR pivot at or below the shared
+  scale-relative epsilon uses a regularized VJP, so near-singular blocks stay
+  finite without suppressing the full local PEPS gradient; only an exactly
+  zero block takes the zero-VJP convention.
 - Key array ops: `conj`, `reshape`, `tensordot` (`mode="fused"` or
   `"blockwise"`), `trace`, `transpose`, plus `fuse` / `multiply_diagonal`.
 

@@ -289,6 +289,44 @@ def test_torch_real_qr_safe_regularizes_rank_deficient_gauge():
 
 
 @pytest.mark.parametrize("complex_input", (False, True))
+def test_torch_qr_safe_regularizes_small_nonzero_pivot(monkeypatch, complex_input):
+    """The relative QR epsilon also protects a near-singular nonzero pivot."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import linalg_torch
+
+    dtype = torch.complex128 if complex_input else torch.float64
+    qr = (
+        linalg_torch.QR_complex_safe
+        if complex_input
+        else linalg_torch.QR_real_safe
+    )
+    matrix = torch.tensor(
+        ((1.0, 1.0, 1.0), (0.0, 1.0e-8, 1.0)),
+        dtype=dtype,
+        requires_grad=True,
+    )
+    calls = []
+    original_backward = linalg_torch._regularized_qr_backward
+
+    def traced_backward(*args):
+        calls.append(args[-1].detach().clone())
+        return original_backward(*args)
+
+    monkeypatch.setattr(linalg_torch, "_regularized_qr_backward", traced_backward)
+    q, r = qr.apply(matrix)
+    gradient = torch.autograd.grad(
+        (q.conj() * torch.ones_like(q)).real.sum()
+        + (r.conj() * torch.ones_like(r)).real.sum(),
+        matrix,
+    )[0]
+
+    assert len(calls) == 1
+    assert bool(calls[0].all())
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+
+
+@pytest.mark.parametrize("complex_input", (False, True))
 def test_torch_qr_safe_zero_block_has_explicit_zero_vjp(complex_input):
     """An all-zero QR block has no intrinsic scale or preferred gauge."""
     torch = pytest.importorskip("torch")
