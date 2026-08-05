@@ -76,6 +76,7 @@ state, losses = optimizer.optimize(
     optimizer="L-BFGS-B",
     optlib="nlopt",
     validate=True,
+    validation_interval=None,  # automatic from n; e.g. 20 for checks every 20 evals
     return_losses=True,
 )
 ```
@@ -86,6 +87,16 @@ worsens or becomes non-finite, Pepsy rolls back to the last validated state.
 Candidates reconstructed by Quimb are converted back to the selected
 autodiff backend before validation, which is required for native Symmray
 states whose blocks must not mix NumPy and Torch (or another backend).
+With ``progbar=True``, this mode uses one outer progress bar showing the
+training/validation chi values, validation step, local optimizer energy, the
+higher-chi checked energy per site, and chunk status;
+the nested optimizer bars are suppressed to keep the output readable.
+Set ``validation_interval`` to a positive number to choose the number of
+optimizer evaluations between checks. With ``None`` (the default), Pepsy
+chooses an interval from ``n`` with at most five scheduled checks and a
+minimum interval of ten evaluations.
+Here ``local_E`` is the best local objective recorded by the optimizer at the
+training chi, while ``check_E`` is the higher-chi validation energy.
 The normal fast path is unchanged when ``validate=False``.
 
 ## Tree tensor networks

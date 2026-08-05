@@ -515,7 +515,11 @@ def test_peps_optimizer_global_defaults_options_and_torch_svd(monkeypatch):
         lambda *args, **kwargs: {"infidelity": next(infidelities)},
     )
     registered = []
-    monkeypatch.setattr(peps_mod, "_reg_complex_svd_torch", lambda: registered.append(True))
+    monkeypatch.setattr(
+        peps_mod,
+        "register_torch_linalg",
+        lambda **kwargs: registered.append(dict(kwargs)),
+    )
     captured = {}
 
     class _FakeGlobal:
@@ -557,7 +561,11 @@ def test_peps_optimizer_global_defaults_options_and_torch_svd(monkeypatch):
     out = opt.run(progress=False)
 
     assert out.name == "global-best"
-    assert registered == [True]
+    assert registered == [{
+        "mode": "complex",
+        "stabilized": True,
+        "quimb_split_drivers": False,
+    }]
     init_kwargs = captured["init"]["kwargs"]
     assert init_kwargs["chi"] == (16, 16)
     assert init_kwargs["norm_kwargs"]["chi"] == (16, 16)
@@ -598,7 +606,7 @@ def test_peps_optimizer_global_nlopt_runtime_error_falls_back(monkeypatch):
         "boundary_infidelity",
         lambda *args, **kwargs: {"infidelity": next(infidelities)},
     )
-    monkeypatch.setattr(peps_mod, "_reg_complex_svd_torch", lambda: None)
+    monkeypatch.setattr(peps_mod, "register_torch_linalg", lambda **kwargs: None)
     captured = {}
 
     class _FakeNloptRuntimeError(Exception):
@@ -659,7 +667,7 @@ def test_peps_optimizer_global_default_budget_is_user_overridable(monkeypatch):
         "boundary_infidelity",
         lambda *args, **kwargs: {"infidelity": 0.05},
     )
-    monkeypatch.setattr(peps_mod, "_reg_complex_svd_torch", lambda: None)
+    monkeypatch.setattr(peps_mod, "register_torch_linalg", lambda **kwargs: None)
     captured = {}
 
     class _FakeGlobal:

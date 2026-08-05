@@ -273,8 +273,8 @@ def test_torch_real_qr_rank_deficient_falls_back_to_native():
     assert torch.isfinite(actual).all()
 
 
-def test_torch_real_qr_safe_freezes_rank_deficient_gauge():
-    """The PEPS block-QR rule keeps singular gauges out of the VJP."""
+def test_torch_real_qr_safe_regularizes_rank_deficient_gauge():
+    """The PEPS block-QR rule keeps a useful finite singular-pivot VJP."""
     torch = pytest.importorskip("torch")
     from pepsy.backends.linalg_torch import QR_real_safe
 
@@ -285,16 +285,19 @@ def test_torch_real_qr_safe_freezes_rank_deficient_gauge():
     gradient = torch.autograd.grad(q.sum() + r.sum(), matrix)[0]
 
     assert torch.isfinite(gradient).all()
-    assert torch.count_nonzero(gradient) == 0
+    assert torch.count_nonzero(gradient) > 0
 
 
-def test_torch_complex_qr_safe_freezes_zero_gauge():
-    """The complex PEPS block-QR rule handles an exactly zero block."""
+@pytest.mark.parametrize("complex_input", (False, True))
+def test_torch_qr_safe_zero_block_has_explicit_zero_vjp(complex_input):
+    """An all-zero QR block has no intrinsic scale or preferred gauge."""
     torch = pytest.importorskip("torch")
-    from pepsy.backends.linalg_torch import QR_complex_safe
+    from pepsy.backends.linalg_torch import QR_complex_safe, QR_real_safe
 
-    matrix = torch.zeros(4, 3, dtype=torch.complex128, requires_grad=True)
-    q, r = QR_complex_safe.apply(matrix)
+    dtype = torch.complex128 if complex_input else torch.float64
+    qr = QR_complex_safe if complex_input else QR_real_safe
+    matrix = torch.zeros(4, 3, dtype=dtype, requires_grad=True)
+    q, r = qr.apply(matrix)
     dq = torch.ones_like(q)
     dr = torch.ones_like(r)
     gradient = torch.autograd.grad(
@@ -304,6 +307,62 @@ def test_torch_complex_qr_safe_freezes_zero_gauge():
 
     assert torch.isfinite(gradient).all()
     assert torch.count_nonzero(gradient) == 0
+
+
+@pytest.mark.parametrize("complex_input", (False, True))
+def test_torch_qr_safe_regularized_vjp_preserves_zero_pivot_reconstruction(
+    complex_input,
+):
+    """A zero unpivoted QR diagonal retains the gradient of ``Q @ R``."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends.linalg_torch import QR_complex_safe, QR_real_safe
+
+    dtype = torch.complex128 if complex_input else torch.float64
+    qr = QR_complex_safe if complex_input else QR_real_safe
+    matrix = torch.tensor(
+        ((1.0, 1.0, 1.0), (0.0, 0.0, 1.0)),
+        dtype=dtype,
+        requires_grad=True,
+    )
+    if complex_input:
+        with torch.no_grad():
+            matrix[1, 2] += 0.25j
+    q, r = qr.apply(matrix)
+    torch.testing.assert_close(q @ r, matrix)
+    expected = torch.randn_like(matrix)
+    loss = (expected.conj() * (q @ r)).real.sum()
+    gradient = torch.autograd.grad(loss, matrix)[0]
+
+    torch.testing.assert_close(gradient, expected, rtol=1.0e-5, atol=1.0e-7)
+    assert torch.isfinite(gradient).all()
+
+
+@pytest.mark.parametrize("complex_input", (False, True))
+def test_torch_qr_safe_regularizes_mixed_batched_zero_pivots(complex_input):
+    """Regularizing one batch member does not change its full-rank neighbor."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends.linalg_torch import QR_complex_safe, QR_real_safe
+
+    dtype = torch.complex128 if complex_input else torch.float64
+    qr = QR_complex_safe if complex_input else QR_real_safe
+    matrix = torch.tensor(
+        (
+            ((1.0, 0.0, 1.0), (0.0, 1.0, 1.0)),
+            ((1.0, 1.0, 1.0), (0.0, 0.0, 1.0)),
+        ),
+        dtype=dtype,
+        requires_grad=True,
+    )
+    if complex_input:
+        with torch.no_grad():
+            matrix[1, 1, 2] += 0.25j
+    q, r = qr.apply(matrix)
+    expected = torch.randn_like(matrix)
+    loss = (expected.conj() * (q @ r)).real.sum()
+    gradient = torch.autograd.grad(loss, matrix)[0]
+
+    torch.testing.assert_close(gradient, expected, rtol=1.0e-5, atol=1.0e-7)
+    assert torch.isfinite(gradient).all()
 
 
 @pytest.mark.parametrize("complex_input", (False, True))
@@ -345,45 +404,76 @@ def test_torch_svd_degenerate_inputs_have_finite_gradients(case, complex_input):
 
 
 def test_quimb_torch_split_drivers_stabilize_real_symmray_blocks():
-    """Quimb's composed Torch split path uses Pepsy's stable VJPs."""
+    """Quimb's composed Torch split path is stable and lossless."""
     torch = pytest.importorskip("torch")
     qd = pytest.importorskip("quimb.tensor.decomp")
     from pepsy.backends import config, linalg_torch
 
-    matrix = torch.randn(4, 3, dtype=torch.float64)
-    matrix[:, 1] = matrix[:, 0]
-    matrix.requires_grad_()
+    # The second diagonal of R is structurally zero, while its row has a
+    # nonzero later component.  The stabilized phase must be one, rather than
+    # zero, at that position or QR no longer reconstructs this matrix.
+    matrix = torch.tensor(
+        ((1.0, 1.0, 1.0), (0.0, 0.0, 1.0)),
+        dtype=torch.float64,
+        requires_grad=True,
+    )
     try:
-        config.register_torch_linalg(mode="real", stabilized=True)
-        assert linalg_torch.reg_quimb_torch_split_drivers(mode="real")
+        config.register_torch_linalg(
+            mode="real",
+            stabilized=True,
+            quimb_split_drivers=True,
+        )
         q, _, r = qd.qr_stabilized(matrix)
+        torch.testing.assert_close(q @ r, matrix)
         qr_gradient = torch.autograd.grad(q.sum() + r.sum(), matrix, retain_graph=True)[0]
+        expected_gradient = torch.randn_like(matrix)
+        reconstruction_gradient = torch.autograd.grad(
+            (expected_gradient * (q @ r)).sum(),
+            matrix,
+            retain_graph=True,
+        )[0]
         u, s, vh = qd.svd_truncated(matrix, absorb=None)
         svd_gradient = torch.autograd.grad(
             u.sum() + s.sum() + vh.sum(),
             matrix,
         )[0]
         assert torch.isfinite(qr_gradient).all()
+        assert torch.count_nonzero(qr_gradient) > 0
+        torch.testing.assert_close(reconstruction_gradient, expected_gradient)
         assert torch.isfinite(svd_gradient).all()
     finally:
         qd.qr_stabilized.register("torch", qd.qr_stabilized._default_fn)
         qd.svd_truncated.register("torch", qd.svd_truncated._default_fn)
 
 
-def test_quimb_torch_split_drivers_stabilize_complex_zero_block():
-    """The complex Quimb block path also avoids zero-block QR NaNs."""
+def test_quimb_torch_split_drivers_stabilize_complex_rank_deficient_block():
+    """The complex split path is stable and exact for a zero QR diagonal."""
     torch = pytest.importorskip("torch")
     qd = pytest.importorskip("quimb.tensor.decomp")
     from pepsy.backends import config, linalg_torch
 
-    matrix = torch.zeros(4, 3, dtype=torch.complex128, requires_grad=True)
+    matrix = torch.tensor(
+        ((1.0, 1.0, 1.0), (0.0, 0.0, 1.0)),
+        dtype=torch.complex128,
+        requires_grad=True,
+    )
     try:
-        config.register_torch_linalg(mode="complex", stabilized=True)
-        assert linalg_torch.reg_quimb_torch_split_drivers(mode="complex")
+        config.register_torch_linalg(
+            mode="complex",
+            stabilized=True,
+            quimb_split_drivers=True,
+        )
         q, _, r = qd.qr_stabilized(matrix)
+        torch.testing.assert_close(q @ r, matrix)
         qr_gradient = torch.autograd.grad(
             (q.conj() * torch.ones_like(q)).real.sum()
             + (r.conj() * torch.ones_like(r)).real.sum(),
+            matrix,
+            retain_graph=True,
+        )[0]
+        expected_gradient = torch.randn_like(matrix)
+        reconstruction_gradient = torch.autograd.grad(
+            (expected_gradient.conj() * (q @ r)).real.sum(),
             matrix,
             retain_graph=True,
         )[0]
@@ -395,6 +485,8 @@ def test_quimb_torch_split_drivers_stabilize_complex_zero_block():
             matrix,
         )[0]
         assert torch.isfinite(qr_gradient).all()
+        assert torch.count_nonzero(qr_gradient) > 0
+        torch.testing.assert_close(reconstruction_gradient, expected_gradient)
         assert torch.isfinite(svd_gradient).all()
     finally:
         qd.qr_stabilized.register("torch", qd.qr_stabilized._default_fn)
@@ -495,6 +587,25 @@ def test_register_torch_linalg_stabilized_real_is_opt_in(monkeypatch):
         linalg_torch._QR_RANK_TOL_FACTOR = original_factor
         linalg_torch._REGISTERED_FUNCTIONS.clear()
         linalg_torch._REGISTERED_FUNCTIONS.update(original_registered)
+
+
+def test_register_torch_linalg_leaves_quimb_drivers_untouched_without_opt_in(
+    monkeypatch,
+):
+    """The canonical default must not mutate Quimb's process-global drivers."""
+    pytest.importorskip("torch")
+    from pepsy.backends import config, linalg_torch
+
+    calls = []
+    monkeypatch.setattr(
+        linalg_torch,
+        "reg_quimb_torch_split_drivers",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    config.register_torch_linalg(mode="real", stabilized=True)
+
+    assert calls == []
 
 
 def test_reset_linalg_registrations_restores_native_torch(monkeypatch):

@@ -18,8 +18,9 @@ from ...backends import (
     backend_numpy,
     backend_torch,
     infer_backend_converter_from_sample,
+    register_torch_linalg,
 )
-from ...tensors import build_optimizer, reg_rel_svd_jax, reg_rel_svd_torch
+from ...tensors import build_optimizer, reg_rel_svd_jax
 from ..global_opt import GlobalOptimizer
 
 __all__ = ["EnergyEstimate", "MpsEnergyOptimizer", "PepsEnergyOptimizer"]
@@ -277,18 +278,27 @@ class PepsEnergyOptimizer:
     def _prepare_autodiff_backend(backend):
         key = str(backend).strip().lower()
         try:
-            if key == "torch":
-                # Boundary-MPS contractions use SVD compression. Torch's native
-                # complex SVD backward can fail on gauge/phase-sensitive losses,
-                # so install Pepsy's regularized SVD rule. Do not register QR
-                # here: rectangular QR appears in quimb boundary compression and
-                # has a narrower custom-backward domain.
-                reg_rel_svd_torch()
-            elif key == "jax":
+            if key == "jax":
                 reg_rel_svd_jax()
         except ImportError:
             # TNOptimizer will report the missing backend if it is actually
             # needed. Keeping this hook soft preserves optional-dependency tests.
+            return
+
+    @classmethod
+    def _configure_torch_linalg(cls, state, terms, *, quimb_split_drivers):
+        """Configure one consistent Torch linalg stack for an optimizer run."""
+        dtype_name = cls._autodiff_dtype_name(state, terms)
+        mode = "complex" if "complex" in str(dtype_name).lower() else "real"
+        try:
+            register_torch_linalg(
+                mode=mode,
+                stabilized=True,
+                quimb_split_drivers=quimb_split_drivers,
+            )
+        except ImportError:
+            # TNOptimizer will report a missing requested backend if it is
+            # actually needed; preserve the optional-dependency behavior.
             return
 
     @staticmethod
@@ -377,6 +387,25 @@ class PepsEnergyOptimizer:
         return chi
 
     @classmethod
+    def _validation_chunk_size(cls, n, validation_interval):
+        """Resolve the optimizer evaluations between validation checks."""
+        n_total = max(0, int(n))
+        if validation_interval is None:
+            return max(
+                10,
+                int(np.ceil(n_total / cls._VALIDATION_MAX_CHECKS)),
+            )
+        if isinstance(validation_interval, bool) or not isinstance(
+            validation_interval,
+            Integral,
+        ):
+            raise TypeError("validation_interval must be a positive integer or None.")
+        validation_interval = int(validation_interval)
+        if validation_interval <= 0:
+            raise ValueError("validation_interval must be a positive integer or None.")
+        return validation_interval
+
+    @classmethod
     def _validation_loss(cls, state, *, terms, loss_kwargs):
         """Evaluate a candidate with the automatic validation bond dimension."""
         kwargs = dict(loss_kwargs)
@@ -395,6 +424,8 @@ class PepsEnergyOptimizer:
         loss_kwargs,
         autodiff_backend,
         device,
+        progbar,
+        validation_interval,
     ):
         """Run short optimizer chunks with sparse higher-chi rollback checks."""
 
@@ -413,6 +444,43 @@ class PepsEnergyOptimizer:
             )
 
         n_total = max(0, int(n))
+        chunk_size = self._validation_chunk_size(n_total, validation_interval)
+        train_chi = loss_kwargs["chi"]
+        validation_chi = self._validation_chi(train_chi)
+        pbar = None
+        if progbar:
+            from tqdm.auto import tqdm  # pylint: disable=import-outside-toplevel
+
+            pbar = tqdm(
+                total=n_total,
+                desc="PEPS validate",
+                unit="eval",
+                leave=True,
+                position=0,
+                ascii=True,
+                dynamic_ncols=True,
+                mininterval=0.2,
+            )
+
+        def update_progress(completed, local_energy, check_energy, status):
+            if pbar is None:
+                return
+            pbar.update(completed - pbar.n)
+
+            def format_energy(value):
+                if self._is_finite_number(value):
+                    return f"{float(value):+.3e}"
+                return "n/a"
+
+            pbar.set_postfix(
+                train_chi=train_chi,
+                check_chi=validation_chi,
+                step=chunk_size,
+                local_E=format_energy(local_energy),
+                check_E=format_energy(check_energy),
+                status=status,
+            )
+
         initial_vector = tnopt.vectorizer.vector.copy()
         validated_vector = initial_vector.copy()
         initial_state = validation_state()
@@ -421,6 +489,7 @@ class PepsEnergyOptimizer:
             terms=terms,
             loss_kwargs=loss_kwargs,
         )
+        update_progress(0, best_tracker.get("loss"), initial_loss, "initial")
         if not self._is_finite_number(initial_loss):
             warnings.warn(
                 "PEPS validation energy is non-finite for the initial state; "
@@ -430,18 +499,18 @@ class PepsEnergyOptimizer:
             )
             tnopt.vectorizer.vector[:] = initial_vector
             self.validation_history = [(0, None)]
+            if pbar is not None:
+                pbar.close()
             return validation_state()
 
         validated_loss = float(initial_loss)
         self.validation_history = [(0, validated_loss)]
         if n_total == 0:
             tnopt.vectorizer.vector[:] = validated_vector
+            if pbar is not None:
+                pbar.close()
             return validation_state()
 
-        chunk_size = max(
-            10,
-            int(np.ceil(n_total / self._VALIDATION_MAX_CHECKS)),
-        )
         completed = 0
         while completed < n_total:
             chunk = min(chunk_size, n_total - completed)
@@ -449,6 +518,8 @@ class PepsEnergyOptimizer:
                 tnopt.optimize(n=chunk, **optimize_kwargs)
             except Exception as exc:
                 if not self._is_recoverable_optimizer_error(exc, optlib):
+                    if pbar is not None:
+                        pbar.close()
                     raise
                 tnopt.vectorizer.vector[:] = validated_vector
                 warnings.warn(
@@ -456,6 +527,12 @@ class PepsEnergyOptimizer:
                     "the last validated PEPS state.",
                     RuntimeWarning,
                     stacklevel=2,
+                )
+                update_progress(
+                    completed,
+                    best_tracker.get("loss"),
+                    validated_loss,
+                    "stopped",
                 )
                 break
 
@@ -488,12 +565,26 @@ class PepsEnergyOptimizer:
                     RuntimeWarning,
                     stacklevel=2,
                 )
+                update_progress(
+                    completed,
+                    best_tracker.get("loss"),
+                    candidate_loss,
+                    "rollback",
+                )
                 break
 
             validated_vector = candidate_vector.copy()
             validated_loss = float(candidate_loss)
             self.validation_history.append((completed, validated_loss))
+            update_progress(
+                completed,
+                best_tracker.get("loss"),
+                validated_loss,
+                "accepted",
+            )
 
+        if pbar is not None:
+            pbar.close()
         tnopt.vectorizer.vector[:] = validated_vector
         return validation_state()
 
@@ -921,15 +1012,13 @@ class PepsEnergyOptimizer:
         terms = incoming_constants.pop("terms", self.terms)
         if str(autodiff_backend).strip().lower() == "torch":
             # Symmray sends raw Torch blocks through Quimb's composed split
-            # drivers. Those drivers bypass Autoray's ordinary linalg
-            # registrations, so install the matching stable block rules too.
-            from ...backends.linalg_torch import (  # pylint: disable=import-outside-toplevel
-                reg_quimb_torch_split_drivers,
+            # paths. Configure both Autoray and those raw-block paths through
+            # the one public Torch-linalg entry point.
+            self._configure_torch_linalg(
+                self.state,
+                terms,
+                quimb_split_drivers=True,
             )
-
-            dtype_name = self._autodiff_dtype_name(self.state, terms)
-            mode = "complex" if "complex" in str(dtype_name).lower() else "real"
-            reg_quimb_torch_split_drivers(mode=mode)
         constants = {
             "terms": self._terms_for_autodiff_backend(
                 terms,
@@ -971,6 +1060,7 @@ class PepsEnergyOptimizer:
         bounds=None,
         max_parameter_step: float | None = None,
         validate: bool = False,
+        validation_interval: int | None = None,
         **optimize_kwargs,
     ):
         """Run ``TNOptimizer.optimize`` and store the optimized PEPS.
@@ -985,18 +1075,24 @@ class PepsEnergyOptimizer:
         ``validate=True`` runs the optimizer in a few chunks and checks each
         candidate with an automatically doubled boundary bond dimension. A
         candidate that worsens this validation energy is rejected and the
-        last validated state is returned.
+        last validated state is returned. When ``progbar=True``, validation
+        uses one outer progress bar showing training/validation chi, checked
+        energy per site, validation step, and the accepted/rollback status of
+        each chunk. ``validation_interval`` controls the number of optimizer
+        evaluations between checks; ``None`` chooses it automatically from
+        ``n``.
         """
         merged_loss_kwargs = self._merge_opts(
             self.loss_kwargs,
             self._pick_loss_kwargs(loss_kwargs),
         )
+        tnopt_progbar = False if validate else progbar
         tnopt = self.make_tn_optimizer(
             loss_kwargs=merged_loss_kwargs,
             loss_constants=loss_constants,
             autodiff_backend=autodiff_backend,
             optimizer=optimizer,
-            progbar=progbar,
+            progbar=tnopt_progbar,
             jit_fn=jit_fn,
             device=device,
         )
@@ -1029,7 +1125,7 @@ class PepsEnergyOptimizer:
                     loss_constants=loss_constants,
                     autodiff_backend=autodiff_backend,
                     optimizer=optimizer,
-                    progbar=progbar,
+                    progbar=tnopt_progbar,
                     jit_fn=jit_fn,
                     device=device,
                 )
@@ -1071,6 +1167,8 @@ class PepsEnergyOptimizer:
                 loss_kwargs=active_loss_kwargs,
                 autodiff_backend=autodiff_backend,
                 device=device,
+                progbar=progbar,
+                validation_interval=validation_interval,
             )
         else:
             try:
@@ -1929,6 +2027,14 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         self._prepare_autodiff_backend(autodiff_backend)
         incoming_constants = dict(loss_constants or {})
         terms = incoming_constants.pop("terms", self.terms)
+        if str(autodiff_backend).strip().lower() == "torch":
+            # MPS optimization uses the same SVD/QR autodiff policy, but has
+            # no Quimb PEPS boundary raw-block path to configure.
+            self._configure_torch_linalg(
+                self.state,
+                {},
+                quimb_split_drivers=False,
+            )
         if self._is_fermionic_sym_hamiltonian(terms):
             if self._can_use_native_local_terms(terms, self.state):
                 terms = terms.terms
