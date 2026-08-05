@@ -159,3 +159,205 @@ def test_peps_energy_optimizer_returns_best_state_on_nlopt_stop(monkeypatch):
     assert np.array_equal(out, np.array([1.0]))
     assert losses == (3.0, 1.0, 2.0)
     assert np.array_equal(optimizer.state, np.array([1.0]))
+
+
+@pytest.mark.smoke
+def test_peps_energy_optimizer_applies_max_parameter_step(monkeypatch):
+    """The optional trust box is applied without an extra loss evaluation."""
+
+    class FakeTNOptimizer:
+        def __init__(self):
+            self.vectorizer = SimpleNamespace(vector=np.array([0.5, -1.0]))
+            self.handler = SimpleNamespace()
+            self.losses = []
+            self._bounds = None
+
+        @property
+        def bounds(self):
+            return self._bounds
+
+        @bounds.setter
+        def bounds(self, value):
+            self._bounds = np.array((value,) * self.vectorizer.vector.size)
+
+        def optimize(self, n, **kwargs):
+            _ = n, kwargs
+            return self.get_tn_opt()
+
+        def get_tn_opt(self):
+            return self.vectorizer.vector.copy()
+
+    optimizer = object.__new__(pepsy.PepsEnergyOptimizer)
+    optimizer.loss_kwargs = {}
+    optimizer.state = object()
+    fake = FakeTNOptimizer()
+    monkeypatch.setattr(optimizer, "make_tn_optimizer", lambda **kwargs: fake)
+    monkeypatch.setattr(
+        optimizer,
+        "_state_for_autodiff_backend",
+        lambda out, *args, **kwargs: out,
+    )
+
+    out, losses = optimizer.optimize(
+        n=1,
+        optimizer="L-BFGS-B",
+        optlib="nlopt",
+        check_finite_gradient=False,
+        max_parameter_step=0.25,
+        progbar=False,
+        return_losses=True,
+    )
+
+    assert np.array_equal(
+        fake.bounds,
+        np.array([[0.25, 0.75], [-1.25, -0.75]]),
+    )
+    assert np.array_equal(out, np.array([0.5, -1.0]))
+    assert losses == ()
+
+
+@pytest.mark.smoke
+def test_peps_energy_optimizer_validation_rolls_back_false_descent(monkeypatch):
+    """Validation rejects a lower local loss with a worse checked energy."""
+
+    class FakeHandler:
+        def __init__(self):
+            self.calls = 0
+
+        def value_and_grad(self, arrays):
+            loss = (0.5, 0.4)[self.calls]
+            self.calls += 1
+            return loss, np.zeros_like(arrays)
+
+    class FakeTNOptimizer:
+        def __init__(self):
+            self.vectorizer = SimpleNamespace(vector=np.array([0.0]))
+            self.handler = FakeHandler()
+            self.losses = []
+            self.next_value = 1.0
+
+        def optimize(self, n, **kwargs):
+            _ = n, kwargs
+            self.vectorizer.vector[:] = self.next_value
+            loss, _ = self.handler.value_and_grad(self.vectorizer.vector)
+            self.losses.append(loss)
+            self.next_value += 1.0
+            return self.get_tn_opt()
+
+        def get_tn_opt(self):
+            return self.vectorizer.vector.copy()
+
+    optimizer = object.__new__(pepsy.PepsEnergyOptimizer)
+    optimizer.loss_kwargs = {
+        "chi": 2,
+        "boundary_mode": "mps",
+        "cutoff": 0.0,
+        "normalized": True,
+        "energy_per_site": True,
+        "real": True,
+        "stabilize_state": False,
+        "contraction_opt": "auto",
+        "compute_kwargs": {},
+    }
+    optimizer.terms = {}
+    optimizer.state = object()
+    fake = FakeTNOptimizer()
+    converted_states = []
+    monkeypatch.setattr(optimizer, "make_tn_optimizer", lambda **kwargs: fake)
+    monkeypatch.setattr(
+        optimizer,
+        "_validation_loss",
+        lambda state, *, terms, loss_kwargs: {
+            0.0: 0.0,
+            1.0: -1.0,
+            2.0: 0.0,
+        }[float(np.asarray(state)[0])],
+    )
+    monkeypatch.setattr(
+        optimizer,
+        "_state_for_autodiff_backend",
+        lambda out, *args, **kwargs: converted_states.append(out) or out,
+    )
+
+    with pytest.warns(RuntimeWarning, match="validation energy worsened"):
+        out, losses = optimizer.optimize(
+            n=20,
+            optimizer="LD_VAR2",
+            optlib="nlopt",
+            check_finite_gradient=False,
+            validate=True,
+            progbar=False,
+            return_losses=True,
+        )
+
+    assert np.array_equal(out, np.array([1.0]))
+    assert losses == (0.5, 0.4)
+    assert optimizer.validation_history == [(0, 0.0), (10, -1.0), (20, 0.0)]
+    # Validation must use the same backend-conversion hook as the final state,
+    # including the initial check and every candidate check.
+    assert len(converted_states) >= 4
+
+
+@pytest.mark.smoke
+def test_peps_energy_optimizer_validation_keeps_symmray_backend():
+    """Higher-chi validation converts Quimb's NumPy candidate for Symmray."""
+    pytest.importorskip("symmray")
+    pytest.importorskip("torch")
+    pytest.importorskip("nlopt")
+    import torch
+
+    to_backend = pepsy.backend_torch(dtype=torch.float64, device="cpu")
+    fermion = pepsy.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        to_backend=to_backend,
+    )
+    setup = fermion.lattice_half_filling(
+        2,
+        2,
+        pattern="checkerboard",
+        cyclic=True,
+    )
+    state = pepsy.ps_to_peps(
+        (2, 2),
+        fermion=fermion,
+        occupations=setup.occupations,
+        seed=7,
+        dtype="float64",
+        cyclic=False,
+    )
+    state.apply_to_arrays(to_backend)
+    terms = {
+        edge: -fermion.hopping_operator()
+        for edge in setup.edges
+    }
+    terms.update({
+        site: fermion.onsite_term(site, U=2.0, mu=0.0)
+        for site in setup.sites
+    })
+
+    optimizer = pepsy.PepsEnergyOptimizer(
+        state,
+        terms,
+        chi=2,
+        boundary_mode="mps",
+        contraction_opt="auto-hq",
+    )
+    out, _ = optimizer.optimize(
+        n=1,
+        optimizer="LD_VAR2",
+        optlib="nlopt",
+        progbar=False,
+        check_finite_gradient=False,
+        validate=True,
+        return_losses=True,
+    )
+
+    assert isinstance(out, type(state))
+    assert optimizer.validation_history
+    assert np.isfinite(float(optimizer.validation_history[0][1]))
+    assert all(
+        str(block.dtype) in {"torch.float64", "float64"}
+        for tensor in out.tensor_map.values()
+        for block in tensor.data.blocks.values()
+    )
