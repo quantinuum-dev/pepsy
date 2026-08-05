@@ -98,6 +98,9 @@ def _normalize_symmray_prefix_strategy(strategy):
         "shared_prefix": "prefix",
         "serial": "serial",
         "one_by_one": "serial",
+        "dense": "dense",
+        "dense_batch": "dense",
+        "batched_dense": "dense",
     }
     try:
         return aliases[key]
@@ -107,6 +110,43 @@ def _normalize_symmray_prefix_strategy(strategy):
             "Unknown Symmray prefix strategy "
             f"{strategy!r}. Expected one of: {allowed}."
         ) from exc
+
+
+def _normalize_dense_memory_limit(limit):
+    """Normalize a dense sampling memory budget to bytes."""
+    if limit is None:
+        return None
+    if isinstance(limit, (int, np.integer)):
+        limit = int(limit)
+    else:
+        text = str(limit).strip().upper().replace(" ", "")
+        if text in {"NONE", "UNBOUNDED", "INF", "INFINITY"}:
+            return None
+        units = (
+            ("GIB", 1024**3),
+            ("GB", 1000**3),
+            ("MIB", 1024**2),
+            ("MB", 1000**2),
+            ("KIB", 1024),
+            ("KB", 1000),
+            ("B", 1),
+        )
+        multiplier = 1
+        for suffix, factor in units:
+            if text.endswith(suffix):
+                text = text[:-len(suffix)]
+                multiplier = factor
+                break
+        try:
+            limit = int(float(text) * multiplier)
+        except ValueError as exc:
+            raise TypeError(
+                "dense_memory_limit must be bytes, a size such as '256MiB', "
+                "or None."
+            ) from exc
+    if limit < 1:
+        raise ValueError("dense_memory_limit must be positive or None.")
+    return int(limit)
 
 
 def _mps_array_backend(array):
@@ -765,16 +805,29 @@ class MpsSampler:
         Opt into ``torch.compile`` for repeated, device-resident, unseeded
         Torch inference batches. Unsupported compiler environments and calls
         that need eager-only behavior fall back to eager sampling.
-    prefix_strategy : {"auto", "prefix", "serial"}, default="auto"
+    strategy : {"auto", "prefix", "serial", "dense"}, optional
+        Preferred name for the Symmray sampling strategy. ``None`` leaves
+        ``prefix_strategy`` in control for backward compatibility.
+    prefix_strategy : {"auto", "prefix", "serial", "dense"}, default="auto"
         Symmray batch-sampling strategy. ``"prefix"`` shares a normalized
         block-sparse boundary between equal sampled prefixes; ``"serial"``
         uses one independent left-to-right sweep per shot. ``"auto"`` uses
         prefix sharing until ``max_prefix_groups`` is reached, then
         finishes the remaining branches serially with bounded memory.
+        ``"dense"`` creates a temporary dense view of the source MPS and
+        uses the backend-native fully batched sampler. ``"auto"`` selects
+        dense batching when the sample count and memory budget permit it.
+        Dense batching can use more memory than the sparse routes.
     max_prefix_groups : int or None, default=256
         Maximum active Symmray prefix groups before the ``"auto"`` strategy
         switches the remaining suffixes to serial sampling. ``None`` permits
         all distinct prefixes. This has no effect on dense MPS backends.
+    dense_memory_limit : int, str, or None, default="256MiB"
+        Maximum estimated dense MPS storage allowed by ``strategy="auto"`` or
+        ``strategy="dense"``. Strings such as ``"256MiB"`` and ``"1GB"`` are
+        accepted. ``None`` disables the guard.
+    dense_min_samples : int, default=1024
+        Minimum batch size for ``strategy="auto"`` to select dense batching.
     fermion : pepsy.tensors.Fermion, optional
         Fermionic physical-space convention associated with this sampler. When
         supplied, :meth:`sample_batch` attaches its symmetry-aware
@@ -801,8 +854,11 @@ class MpsSampler:
         *,
         backend: str | None = "quimb",
         torch_compile: bool = False,
+        strategy: str | None = None,
         prefix_strategy: str = "auto",
         max_prefix_groups: int | None = 256,
+        dense_memory_limit: int | str | None = 256 * 1024**2,
+        dense_min_samples: int = 1024,
         fermion=None,
     ):
         if one_d_to_two_d is None:
@@ -825,6 +881,12 @@ class MpsSampler:
         if not isinstance(torch_compile, (bool, np.bool_)):
             raise TypeError("torch_compile must be a boolean.")
         self.torch_compile = bool(torch_compile)
+        if strategy is not None:
+            if prefix_strategy not in (None, "auto"):
+                raise ValueError(
+                    "Pass either strategy= or prefix_strategy=, not both."
+                )
+            prefix_strategy = strategy
         self.prefix_strategy = _normalize_symmray_prefix_strategy(prefix_strategy)
         if max_prefix_groups is not None:
             if not isinstance(max_prefix_groups, (int, np.integer)):
@@ -835,6 +897,15 @@ class MpsSampler:
                 )
             max_prefix_groups = int(max_prefix_groups)
         self.max_prefix_groups = max_prefix_groups
+        self.dense_memory_limit = _normalize_dense_memory_limit(dense_memory_limit)
+        if not isinstance(dense_min_samples, (int, np.integer)):
+            raise TypeError("dense_min_samples must be a positive integer.")
+        if int(dense_min_samples) < 1:
+            raise ValueError("dense_min_samples must be a positive integer.")
+        self.dense_min_samples = int(dense_min_samples)
+        # ``strategy`` is the preferred public spelling; retain the old
+        # attribute for callers that inspect prefix_strategy directly.
+        self.strategy = self.prefix_strategy
         self.fermion = fermion
         self.resolved_backend = None
         self._source_psi = None
@@ -1191,10 +1262,13 @@ class MpsSampler:
         return {
             "sr": sr,
             "mps": canonical,
+            "source_mps": psi,
             "sites": tuple(sites),
             "physical_code_maps": tuple(physical_code_maps),
             "array_backend": array_backend,
             "template": template,
+            "dense_site_data": None,
+            "dense_code_maps": None,
         }
 
     @staticmethod
@@ -1471,6 +1545,208 @@ class MpsSampler:
             candidates.append(candidate)
             weights.append(cls._symmray_weight(candidate, state))
         return site_state, local_codes, candidates, weights
+
+    @staticmethod
+    def _dense_array_nbytes(array):
+        """Estimate dense storage for a backend array without copying it."""
+        nbytes = getattr(array, "nbytes", None)
+        if nbytes is not None:
+            return int(nbytes)
+        try:
+            return int(array.numel()) * int(array.element_size())
+        except (AttributeError, TypeError, ValueError):
+            return int(np.asarray(array).nbytes)
+
+    @classmethod
+    def _symmray_estimate_dense_site_bytes(cls, state):
+        """Estimate dense MPS storage from shapes without materializing it."""
+        template = state["template"]
+        if hasattr(template, "element_size"):
+            itemsize = int(template.element_size())
+        else:
+            itemsize = int(np.dtype(getattr(template, "dtype", template)).itemsize)
+        total = 0
+        source_mps = state["source_mps"]
+        for site in range(len(state["sites"])):
+            array = cls._site_array_lr_phys_r(source_mps, site)
+            total += int(np.prod(array.shape)) * itemsize
+        return int(total)
+
+    def _resolve_symmray_sampling_strategy(self, n_samples):
+        """Resolve the requested strategy before any dense allocation."""
+        requested = self.prefix_strategy
+        state = self._require_symmray_state()
+        symmetry = str(state["sites"][0]["data"].symmetry).upper()
+        dense_supported = symmetry in {"U1", "U1U1"}
+        if not dense_supported:
+            if requested == "dense":
+                raise ValueError(
+                    "Dense Symmray sampling is supported only for resolved "
+                    f"U1/U1U1 states, not symmetry={symmetry!r}. Use "
+                    "strategy='prefix' for charge-aware sampling."
+                )
+            if requested == "auto":
+                return "auto", "auto_sparse_unsupported_symmetry", None
+            return requested, "explicit_sparse", None
+        estimated_bytes = self._symmray_estimate_dense_site_bytes(state)
+        if requested == "dense":
+            if (
+                self.dense_memory_limit is not None
+                and estimated_bytes > self.dense_memory_limit
+            ):
+                raise ValueError(
+                    "Dense Symmray sampling requires an estimated "
+                    f"{estimated_bytes} bytes, above the configured limit of "
+                    f"{self.dense_memory_limit} bytes. Increase "
+                    "dense_memory_limit or use strategy='prefix'."
+                )
+            return "dense", "explicit_dense", estimated_bytes
+        if requested == "auto":
+            if (
+                int(n_samples) >= self.dense_min_samples
+                and (
+                    self.dense_memory_limit is None
+                    or estimated_bytes <= self.dense_memory_limit
+                )
+            ):
+                return "dense", "auto_dense_within_budget", estimated_bytes
+            return "auto", "auto_sparse_fallback", estimated_bytes
+        return requested, "explicit_sparse", estimated_bytes
+
+    @classmethod
+    def _symmray_dense_site_data(cls, state):
+        """Prepare cached dense site operators for explicit dense batching.
+
+        This route is deliberately opt-in. It keeps the source and canonical
+        Symmray states intact, materializing only a private sampling view so
+        the dense native sampler can contract every shot in one backend batch.
+        """
+        cached = state.get("dense_site_data")
+        if cached is not None:
+            return cached
+
+        arrays = []
+        source_mps = state["source_mps"]
+        for site in range(len(state["sites"])):
+            # Use the source MPS rather than the private canonical copy here.
+            # Symmray's fermionic bond orientations can have different dense
+            # positional layouts on dual virtual legs even though sparse
+            # charge-aware contractions remain valid. The source chain has
+            # matching virtual dimensions, so its dense view is unambiguous.
+            array = cls._site_array_lr_phys_r(source_mps, site)
+            if hasattr(array, "to_dense"):
+                array = array.to_dense()
+            arrays.append(array)
+
+        backends = {_mps_array_backend(array) for array in arrays}
+        if len(backends) != 1:
+            raise ValueError(
+                "Dense Symmray sampling requires one common dense backend; "
+                f"got {sorted(backends)!r}."
+            )
+        backend = next(iter(backends))
+        if backend == "torch":
+            site_data = cls._torch_site_ops(tuple(arrays))
+        elif backend in {"numpy", "cupy"}:
+            site_data = cls._array_namespace_site_ops(
+                tuple(arrays),
+                backend=backend,
+            )
+        else:
+            raise ValueError(
+                "Dense Symmray sampling produced unsupported arrays "
+                f"with backend {backend!r}."
+            )
+
+        dense_bytes = sum(cls._dense_array_nbytes(array) for array in arrays)
+        code_maps = tuple(
+            tuple(range(int(array.shape[1])))
+            for array in arrays
+        )
+        cached = (backend, site_data, int(dense_bytes))
+        state["dense_site_data"] = cached
+        state["dense_code_maps"] = code_maps
+        return cached
+
+    @staticmethod
+    def _symmray_map_dense_configs(configs, state):
+        """Map canonical dense physical choices back to source code labels."""
+        backend = state["array_backend"]
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            mapped = torch.empty_like(configs)
+            for site, code_map in enumerate(state["dense_code_maps"]):
+                lookup = torch.as_tensor(
+                    code_map,
+                    dtype=torch.long,
+                    device=configs.device,
+                )
+                mapped[:, site] = lookup[configs[:, site]]
+            return mapped
+        if backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            mapped = cp.empty_like(configs)
+            for site, code_map in enumerate(state["dense_code_maps"]):
+                lookup = cp.asarray(code_map, dtype=cp.int64)
+                mapped[:, site] = lookup[configs[:, site]]
+            return mapped
+
+        mapped = np.empty_like(configs)
+        for site, code_map in enumerate(state["dense_code_maps"]):
+            mapped[:, site] = np.asarray(code_map, dtype=np.int64)[
+                configs[:, site]
+            ]
+        return mapped
+
+    @classmethod
+    def _symmray_sample_arrays_dense(
+        cls,
+        state,
+        n_samples,
+        seed,
+        *,
+        to_numpy,
+    ):
+        """Sample a Symmray MPS with the dense native batched kernels."""
+        backend, site_data, dense_bytes = cls._symmray_dense_site_data(state)
+        if backend == "torch":
+            canonical_configs, probabilities = cls._torch_sample(
+                site_data,
+                int(n_samples),
+                seed,
+                to_numpy=False,
+            )
+        else:
+            canonical_configs, probabilities = cls._array_namespace_sample(
+                site_data,
+                int(n_samples),
+                seed,
+                backend=backend,
+                to_numpy=False,
+            )
+        configs = cls._symmray_map_dense_configs(canonical_configs, state)
+        stats = {
+            "strategy": "dense",
+            "n_samples": int(n_samples),
+            "conditional_evaluations": len(state["sites"]),
+            "candidate_contractions": sum(
+                len(site_state["codes"]) for site_state in state["sites"]
+            ),
+            "static_pruned_branches": 0,
+            "charge_pruned_branches": 0,
+            "cached_local_slices": False,
+            "max_active_prefix_groups": 1,
+            "serial_fallback": False,
+            "adaptive_serial_fallback": False,
+            "dense_site_bytes": int(dense_bytes),
+            "dense_batch_width": int(n_samples),
+        }
+        if to_numpy:
+            configs = _backend_array_to_numpy(configs)
+            probabilities = _backend_array_to_numpy(probabilities)
+        return configs, probabilities, stats
 
     @staticmethod
     def _symmray_note_candidates(stats, site_state, local_codes):
@@ -1820,6 +2096,13 @@ class MpsSampler:
         max_prefix_groups,
         to_numpy,
     ):
+        if strategy == "dense":
+            return cls._symmray_sample_arrays_dense(
+                state,
+                n_samples,
+                seed,
+                to_numpy=to_numpy,
+            )
         if strategy == "serial":
             return cls._symmray_sample_arrays_serial(
                 state,
@@ -2683,6 +2966,32 @@ class MpsSampler:
         if not isinstance(track_grad, (bool, np.bool_)):
             raise TypeError("track_grad must be a boolean.")
         if self._symmray_state is not None:
+            def sample_symmray():
+                strategy, selection, estimated_bytes = (
+                    self._resolve_symmray_sampling_strategy(int(n_samples))
+                )
+                configs, probs, stats = self._symmray_sample_arrays(
+                    self._symmray_state,
+                    int(n_samples),
+                    seed,
+                    strategy=strategy,
+                    max_prefix_groups=self.max_prefix_groups,
+                    to_numpy=to_numpy,
+                )
+                stats.update(
+                    {
+                        "requested_strategy": self.prefix_strategy,
+                        "strategy_selection": selection,
+                        "estimated_dense_site_bytes": (
+                            None
+                            if estimated_bytes is None
+                            else int(estimated_bytes)
+                        ),
+                        "dense_memory_limit_bytes": self.dense_memory_limit,
+                    }
+                )
+                return configs, probs, stats
+
             if (
                 self._symmray_state["array_backend"] == "torch"
                 and not track_grad
@@ -2690,24 +2999,10 @@ class MpsSampler:
                 import torch  # pylint: disable=import-outside-toplevel
 
                 with torch.no_grad():
-                    configs, probs, stats = self._symmray_sample_arrays(
-                        self._symmray_state,
-                        int(n_samples),
-                        seed,
-                        strategy=self.prefix_strategy,
-                        max_prefix_groups=self.max_prefix_groups,
-                        to_numpy=to_numpy,
-                    )
+                    configs, probs, stats = sample_symmray()
                 self._last_symmray_sampling_stats = stats
                 return configs, probs
-            configs, probs, stats = self._symmray_sample_arrays(
-                self._symmray_state,
-                int(n_samples),
-                seed,
-                strategy=self.prefix_strategy,
-                max_prefix_groups=self.max_prefix_groups,
-                to_numpy=to_numpy,
-            )
+            configs, probs, stats = sample_symmray()
             self._last_symmray_sampling_stats = stats
             return configs, probs
         if self._native_arrays is not None:
