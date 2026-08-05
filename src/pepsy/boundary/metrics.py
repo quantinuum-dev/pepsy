@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from functools import wraps
 import inspect
 import math
 import warnings
 from dataclasses import dataclass
+
+import autoray as ar
 
 from ..tensors.validation import _PHYS_OUTER, validate_tensor_network_tags
 from .states import BdyMPS
@@ -16,6 +20,7 @@ __all__ = [
     "BoundaryContractResult",
     "contract_boundary",
     "contract_flat",
+    "quimb_ctmrg_projector_compat",
     "peps_normalize",
     "normalize",
     "boundary_norm",
@@ -35,6 +40,248 @@ _DEFAULT_BOUNDARY_SEQUENCE_3D = (
     "zmin",
     "zmax",
 )
+
+
+@contextmanager
+def quimb_ctmrg_projector_compat():
+    """Use current-network projectors for Quimb's cyclic CTMRG path.
+
+    Some Quimb versions compute a row of CTMRG projectors from one snapshot
+    while inserting those projectors into a network that is modified after
+    each insertion. On cyclic networks with non-uniform effective bond
+    dimensions this can leave the projector shapes out of sync with the
+    current tensor network. Projectors are therefore computed from a fresh
+    copy of the live insertion network, with a fresh fermionic dummy-mode
+    namespace, and inserted back into that live network. Native zero-charge
+    projector sectors also receive finite identity blocks.
+
+    The patch is scoped to this context and does not modify the installed
+    Quimb package or affect boundary-MPS contractions.
+    """
+    try:
+        from quimb.tensor import tensor_core as qtc
+    except ImportError:  # pragma: no cover - Quimb is an optional dependency
+        yield
+        return
+
+    tensor_network = getattr(qtc, "TensorNetwork", None)
+    original = getattr(
+        tensor_network,
+        "insert_compressor_between_regions",
+        None,
+    )
+    original_inplace = getattr(
+        tensor_network,
+        "insert_compressor_between_regions_",
+        None,
+    )
+    original_oblique = getattr(qtc, "compute_oblique_projectors", None)
+    original_reduced_factor = getattr(
+        qtc,
+        "squared_op_to_reduced_factor",
+        None,
+    )
+    if tensor_network is None or original is None:
+        yield
+        return
+
+    is_fermionic = getattr(
+        qtc,
+        "isfermionic",
+        lambda value: bool(getattr(value, "fermionic", False)),
+    )
+
+    @wraps(original)
+    def insert_current_projector(self, ltags, rtags, *args, insert_into=None, **kwargs):
+        if insert_into is None:
+            return original(self, ltags, rtags, *args, **kwargs)
+
+        # Quimb's CTMRG caller passes a calculation copy as ``self`` and the
+        # live, progressively modified network as ``insert_into``. Recompute
+        # from a fresh copy of the live network so bond ids and sizes match,
+        # while separating the squared-environment dummy-mode namespace.
+        current_kwargs = dict(kwargs)
+        current_kwargs.pop("inplace", None)
+        projector_source = _freshen_fermionic_dummy_modes(insert_into)
+        return original(
+            projector_source,
+            ltags,
+            rtags,
+            *args,
+            insert_into=insert_into,
+            inplace=True,
+            **current_kwargs,
+        )
+
+    @wraps(original_inplace or original)
+    def insert_current_projector_inplace(
+        self,
+        ltags,
+        rtags,
+        *args,
+        insert_into=None,
+        **kwargs,
+    ):
+        # Quimb's arbitrary-geometry compression path calls the underscore
+        # alias, whose partialmethod otherwise retains the unpatched original
+        # implementation and recomputes projectors on a stale snapshot.
+        kwargs.setdefault("inplace", True)
+        return insert_current_projector(
+            self,
+            ltags,
+            rtags,
+            *args,
+            insert_into=insert_into,
+            **kwargs,
+        )
+
+    tensor_network.insert_compressor_between_regions = insert_current_projector
+    if original_inplace is not None:
+        tensor_network.insert_compressor_between_regions_ = (
+            insert_current_projector_inplace
+        )
+
+    if callable(original_oblique):
+        oblique_globals = original_oblique.__globals__
+
+        @wraps(original_oblique)
+        def compute_fermionic_oblique_projectors(
+            Rl,
+            Rr,
+            max_bond=None,
+            cutoff=0.0,
+            absorb="both",
+            cutoff_mode="rsum2",
+            method="svd",
+            **compress_opts,
+        ):
+            """Avoid zero-sector inverses in native fermionic projectors."""
+            if not (is_fermionic(Rl) or is_fermionic(Rr)) or absorb != "both":
+                return original_oblique(
+                    Rl,
+                    Rr,
+                    max_bond=max_bond,
+                    cutoff=cutoff,
+                    absorb=absorb,
+                    cutoff_mode=cutoff_mode,
+                    method=method,
+                    **compress_opts,
+                )
+
+            Ut, st, VHt = oblique_globals["array_split"](
+                Rl @ Rr,
+                max_bond=-1 if max_bond is None else max_bond,
+                cutoff=cutoff,
+                absorb=None,
+                cutoff_mode=cutoff_mode,
+                method=method,
+                **compress_opts,
+            )
+
+            # Quimb's default projector uses 1 / sqrt(s). For a sparse
+            # symmetry sector with s == 0, the mathematically appropriate
+            # pseudoinverse is zero rather than inf or NaN.
+            inverse_sqrt = st.copy()
+            zero_tol = 1.0e-12
+
+            def _inverse_sqrt(block):
+                out = ar.do("zeros_like", block)
+                mask = ar.do("abs", block) > zero_tol
+                out[mask] = 1.0 / ar.do("sqrt", block[mask])
+                return out
+
+            inverse_sqrt.apply_to_arrays(_inverse_sqrt)
+            Pl = Rr @ oblique_globals["rdmul"](
+                oblique_globals["dag"](VHt), inverse_sqrt
+            )
+            Pr = oblique_globals["ldmul"](
+                inverse_sqrt,
+                oblique_globals["dag"](Ut),
+            ) @ Rl
+
+            # If an entire charge block is empty, both projectors above are
+            # zero in that block. Keep a finite identity block so subsequent
+            # simple-gauge/canonicalization steps do not divide by zero.
+            for sector, block in st.get_sector_block_pairs():
+                if not bool(
+                    ar.do(
+                        "all",
+                        ar.do("abs", block) <= zero_tol,
+                    )
+                ):
+                    continue
+                for projector in (Pl, Pr):
+                    for key, projector_block in projector.get_sector_block_pairs():
+                        if sector not in key:
+                            continue
+                        identity = ar.do("zeros_like", projector_block)
+                        for i in range(min(identity.shape)):
+                            identity[i, i] = 1.0
+                        projector.set_block(key, identity)
+
+            return Pl, Pr
+
+        qtc.compute_oblique_projectors = compute_fermionic_oblique_projectors
+
+    if callable(original_reduced_factor):
+        reduced_impl = getattr(original_reduced_factor, "__wrapped__", None)
+        reduced_globals = getattr(
+            original_reduced_factor,
+            "__globals__",
+            getattr(reduced_impl, "__globals__", {}),
+        )
+        reduced_dag = reduced_globals.get("dag")
+
+        @wraps(original_reduced_factor)
+        def compute_fermionic_reduced_factor(
+            x2,
+            dl,
+            dr,
+            right=True,
+            method="eigh",
+            **reduce_opts,
+        ):
+            if not is_fermionic(x2):
+                return original_reduced_factor(
+                    x2,
+                    dl,
+                    dr,
+                    right=right,
+                    method=method,
+                    **reduce_opts,
+                )
+
+            _assert_finite_symmray_blocks(x2, name="squared environment")
+            if callable(reduced_dag):
+                # Remove tiny anti-Hermitian roundoff before eigh. This is
+                # deliberately after the finite check: symmetrization must
+                # never hide a NaN or Inf produced upstream.
+                x2 = 0.5 * (x2 + reduced_dag(x2))
+                _assert_finite_symmray_blocks(
+                    x2,
+                    name="symmetrized squared environment",
+                )
+
+            return original_reduced_factor(
+                x2,
+                dl,
+                dr,
+                right=right,
+                method=method,
+                **reduce_opts,
+            )
+
+        qtc.squared_op_to_reduced_factor = compute_fermionic_reduced_factor
+    try:
+        yield
+    finally:
+        tensor_network.insert_compressor_between_regions = original
+        if original_inplace is not None:
+            tensor_network.insert_compressor_between_regions_ = original_inplace
+        if callable(original_oblique):
+            qtc.compute_oblique_projectors = original_oblique
+        if callable(original_reduced_factor):
+            qtc.squared_op_to_reduced_factor = original_reduced_factor
 
 
 @dataclass(frozen=True)
@@ -88,14 +335,16 @@ def _uses_symmray_arrays(tn):
 
 def _to_python_scalar(value):
     """Convert backend scalar-like objects (torch/numpy) to python scalar."""
-    obj = value
-    if hasattr(obj, "detach"):
-        obj = obj.detach()
-    if hasattr(obj, "cpu"):
-        obj = obj.cpu()
-    if hasattr(obj, "item") and not isinstance(obj, (int, float, complex, bool)):
+    if isinstance(value, (int, float, complex, bool)):
+        return value
+    try:
+        obj = ar.to_numpy(value)
+    except Exception:
+        obj = value
+    item = getattr(obj, "item", None)
+    if callable(item):
         try:
-            obj = obj.item()
+            return item()
         except (ValueError, RuntimeError):  # backend-specific .item() failures
             pass
     return obj
@@ -315,6 +564,110 @@ def _call_with_accepted_kwargs(fn, **kwargs):
     return fn(**accepted)
 
 
+def _ctmrg_stabilization_kwargs(
+    norm,
+    *,
+    reduce_opts=None,
+    gauge_smudge=None,
+):
+    """Prepare numerically safer CTMRG projector options.
+
+    Symmray environments can be very ill-conditioned, especially after the
+    squared environment used by Quimb's oblique projector construction.  For
+    those networks, add a small positive shift before the Hermitian
+    factorization and a small gauge smudge by default.  Dense networks retain
+    Quimb's existing defaults unless the caller explicitly supplies options.
+    """
+    if reduce_opts is None:
+        reduce_opts = {}
+    else:
+        try:
+            reduce_opts = dict(reduce_opts)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("ctmrg_reduce_opts must be a mapping or None.") from exc
+
+    symmray = _uses_symmray_arrays(norm)
+    if symmray:
+        reduce_opts.setdefault("method", "eigh")
+        reduce_opts.setdefault("shift", 1.0e-12)
+        if gauge_smudge is None:
+            gauge_smudge = 1.0e-10
+
+    kwargs = {}
+    if reduce_opts:
+        kwargs["reduce_opts"] = reduce_opts
+    if gauge_smudge is not None:
+        kwargs["gauge_smudge"] = gauge_smudge
+    if symmray and gauge_smudge is not None:
+        # ``gauge_smudge`` only reaches projector construction in Quimb. The
+        # native fermionic path also needs the same floor during the preceding
+        # simple-gauge normalization, before any reduced-factor decomposition.
+        kwargs["canonize_opts"] = {"smudge": gauge_smudge}
+    return kwargs
+
+
+def _freshen_fermionic_dummy_modes(tn):
+    """Copy ``tn`` with a fresh namespace for Symmray dummy modes.
+
+    Quimb forms a squared environment by conjugating a calculation copy and
+    contracting it with the original. A double-layer fermionic network can
+    already contain matching odd dummy modes, so reusing their labels in the
+    calculation copy creates duplicate same-dual modes before Symmray can
+    cancel conjugate pairs. Renaming each tensor's dummy modes gives every
+    copied mode a unique label, while its conjugate receives the matching
+    dual label during the squared-environment construction.
+    """
+    if not hasattr(tn, "copy"):
+        return tn
+
+    source = tn.copy()
+    namespace = id(source)
+    for tensor in source:
+        data = getattr(tensor, "data", None)
+        dummy_modes = getattr(data, "dummy_modes", ())
+        if not dummy_modes or not hasattr(data, "modify"):
+            continue
+
+        fresh_modes = tuple(
+            type(mode)(
+                ("__pepsy_ctmrg_dummy__", namespace, id(tensor), mode_i),
+                dual=mode.dual,
+                parity=mode.parity,
+            )
+            for mode_i, mode in enumerate(dummy_modes)
+        )
+        data = data.copy()
+        data.modify(dummy_modes=fresh_modes)
+        tensor.modify(data=data)
+    return source
+
+
+def _assert_finite_symmray_blocks(value, *, name):
+    """Raise before decomposition if a native block already is non-finite."""
+    blocks = getattr(value, "blocks", None)
+    if blocks is None:
+        try:
+            finite = bool(ar.do("all", ar.do("isfinite", value)))
+        except (TypeError, ValueError):
+            return
+        if not finite:
+            raise FloatingPointError(
+                f"Non-finite values entered the native CTMRG {name}."
+            )
+        return
+
+    for sector, block in blocks.items():
+        try:
+            finite = bool(ar.do("all", ar.do("isfinite", block)))
+        except (TypeError, ValueError):
+            continue
+        if not finite:
+            raise FloatingPointError(
+                "Non-finite values entered the native CTMRG "
+                f"{name} block for charge sector {sector!r}."
+            )
+
+
 def _unpack_bdy_handle(handle, name):
     """Unpack a BdyMPS or ``{"bdy": BdyMPS}`` boundary handle."""
     holder = handle if isinstance(handle, dict) else None
@@ -359,6 +712,8 @@ def _contract_quimb_double_layer(  # pylint: disable=too-many-arguments
     cutoff,
     equalize_norms,
     layer_tags,
+    ctmrg_reduce_opts=None,
+    ctmrg_gauge_smudge=None,
 ):
     """Contract an already-built double-layer TN with a quimb-style method."""
     if method == "exact":
@@ -416,9 +771,17 @@ def _contract_quimb_double_layer(  # pylint: disable=too-many-arguments
             progbar=progress,
             inplace=False,
         )
+        kwargs.update(
+            _ctmrg_stabilization_kwargs(
+                norm,
+                reduce_opts=ctmrg_reduce_opts,
+                gauge_smudge=ctmrg_gauge_smudge,
+            )
+        )
         if layer_tags is not None:
             kwargs["layer_tags"] = list(layer_tags)
-        return _call_with_accepted_kwargs(contract_fn, **kwargs)
+        with quimb_ctmrg_projector_compat():
+            return _call_with_accepted_kwargs(contract_fn, **kwargs)
 
     if method == "hotrg":
         contract_fn = getattr(norm, "contract_hotrg", None)
@@ -465,6 +828,8 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     layer_tags=None,
     bdy_name="bdy",
     flat=False,
+    ctmrg_reduce_opts=None,
+    ctmrg_gauge_smudge=None,
 ):
     """Contract a double-layer PEPS norm/overlap network by the selected method."""
     method = _normalize_contraction_method(method)
@@ -526,6 +891,8 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        ctmrg_reduce_opts=ctmrg_reduce_opts,
+        ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
     return cost, None
 
@@ -550,6 +917,8 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    ctmrg_reduce_opts=None,
+    ctmrg_gauge_smudge=None,
 ):
     """Contract an already-flat PEPS-like tensor network.
 
@@ -575,6 +944,13 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         input network exposes the corresponding method.
     strip_exponent : bool, default=False
         If ``True``, return ``(mantissa, exponent)``.
+    ctmrg_reduce_opts : mapping | None, default=None
+        Optional options forwarded to Quimb's squared-environment
+        factorization for ``method="ctmrg"``. Symmray networks receive
+        ``method="eigh", shift=1e-12`` by default when this is omitted.
+    ctmrg_gauge_smudge : float | None, default=None
+        Relative regularization for CTMRG projector environments. Symmray
+        networks default to ``1e-10`` when this is omitted.
 
     Returns
     -------
@@ -613,6 +989,8 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         layer_tags=layer_tags,
         bdy_name="bdy",
         flat=True,
+        ctmrg_reduce_opts=ctmrg_reduce_opts,
+        ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
     return _format_scaled_output(cost, strip_exponent=strip_exponent)
 

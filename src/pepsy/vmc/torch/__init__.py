@@ -20,7 +20,13 @@ from .benchmark import (
     TorchAmplitudeBenchmarkRun,
     benchmark_torch_amplitudes,
 )
-from .connections import TorchConnections, compile_operator_sum_torch, torch_hamiltonian_connections
+from .cache import TorchAmplitudeCache
+from .connections import (
+    TorchConnections,
+    TorchFockTransitionPlan,
+    compile_operator_sum_torch,
+    torch_hamiltonian_connections,
+)
 from .driver import TorchVMCDriver
 from .fermion import (
     TorchFermionVMC,
@@ -72,6 +78,8 @@ __all__ = [
     "TorchAmplitudeBenchmark",
     "TorchAmplitudeBenchmarkRun",
     "TorchConnections",
+    "TorchFockTransitionPlan",
+    "TorchAmplitudeCache",
     "TorchMetropolisResult",
     "TorchImportanceSamples",
     "TorchMCMCSamples",

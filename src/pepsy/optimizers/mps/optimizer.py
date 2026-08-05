@@ -371,7 +371,7 @@ def _parse_control_tuple(name, entry, default_axis=None):
         if len(entry) < 3:
             raise ValueError("cap event must be ('cap', where, vec[, absorb]).")
         where = _normalize_control_where(entry[1], single=True)
-        vec = np.asarray(entry[2], dtype=complex).ravel()
+        vec = np.asarray(ar.to_numpy(entry[2]), dtype=complex).ravel()
         absorb = _normalize_absorb(entry[3]) if len(entry) > 3 else "left"
         return "cap", {"vec": vec, "absorb": absorb}, where
     if name == "reset":
@@ -1357,7 +1357,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Return whether dense numeric tensor data contains only finite values."""
         for tensor in getattr(p, "tensors", ()):
             try:
-                data = np.asarray(tensor.data)
+                data = tensor.data
+                if hasattr(data, "to_dense"):
+                    data = data.to_dense()
+                data = np.asarray(ar.to_numpy(data))
             except Exception:
                 continue
             if not np.issubdtype(data.dtype, np.number):
@@ -1735,7 +1738,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self.logical_site(position): value
                 for position, value in config.items()
             }
-        config = np.asarray(config)
+        config = np.asarray(ar.to_numpy(config))
         if config.ndim == 0 or config.shape[-1] != len(self.logical_order):
             raise ValueError(
                 "sample configuration must have MPS length as its final "
@@ -2960,7 +2963,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Return ``array`` cast to the backend and dtype owned by ``self.p``."""
         like = self._state_backend_like()
         if like is None:
-            return np.asarray(array, dtype=complex)
+            return np.asarray(ar.to_numpy(array), dtype=complex)
         target_signature = _array_backend_signature(like)
         source_signature = _array_backend_signature(array)
         if source_signature == target_signature:
@@ -3695,7 +3698,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 to_dense = getattr(gate, "to_dense", None)
                 if not callable(to_dense):
                     return None
-                gate = np.asarray(to_dense())
+                gate = np.asarray(ar.to_numpy(to_dense()))
             shape = tuple(int(dim) for dim in gate.shape)
             if len(shape) != 2:
                 dims = self._infer_gate_dims(gate, where)

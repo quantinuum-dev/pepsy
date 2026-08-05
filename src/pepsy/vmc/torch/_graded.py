@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import autoray as ar
 import numpy as np
 
 from ..torch_types import _require_torch
@@ -55,7 +56,7 @@ def _graded_torch_embed_dense(array, labels, full_maps):
     """Embed a sparse result into the fixed dense index layout."""
     shape = tuple(len(full_maps[label]) for label in labels)
     if getattr(array, "num_blocks", 0):
-        dense = np.asarray(array.to_dense())
+        dense = np.asarray(ar.to_numpy(array.to_dense()))
     else:
         dense = np.zeros(shape, dtype=float)
 

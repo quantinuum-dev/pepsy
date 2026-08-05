@@ -17,7 +17,11 @@ from .amplitude import (
     _unique_config_rows,
 )
 from .benchmark import benchmark_torch_amplitudes
-from .connections import _driver_terms_connections, compile_operator_sum_torch
+from .connections import (
+    TorchFockTransitionPlan,
+    _driver_terms_connections,
+    compile_operator_sum_torch,
+)
 from .distributed import (
     distributed_max_float,
     distributed_metadata,
@@ -647,6 +651,59 @@ class TorchVMCDriver:
             )
         return self.connection_fn(configs, self.graph, **self.connection_kwargs)
 
+    def compile_fock_plan(self, configs=None, *, observables=None):
+        """Compile reusable configuration transitions for a fixed sample stream.
+
+        ``observables`` follows :meth:`measure_samples`: ``None`` means the
+        driver's configured connection function, while a mapping names native
+        explicit term sets and may use ``None`` for that configured function.
+        The returned plan contains no model parameters and can therefore be
+        reused across PEPS bond dimensions, contraction methods, and dtypes.
+        """
+        configs = self.configs if configs is None else _as_long_matrix(configs)
+        configs = configs.to(device=_model_device(self.model))
+        if observables is None:
+            observable_items = (("observable", None),)
+        else:
+            try:
+                observable_items = tuple(observables.items())
+            except AttributeError as exc:
+                raise TypeError(
+                    "observables must be a mapping of names to native terms."
+                ) from exc
+            if not observable_items:
+                raise ValueError("observables must contain at least one entry.")
+        connection_map = {
+            name: (
+                self.make_connections(configs, terms=terms)
+                if terms is not None
+                else self.make_connections(configs)
+            )
+            for name, terms in observable_items
+        }
+        return TorchFockTransitionPlan(configs, connection_map)
+
+    def proposal_configs(
+        self,
+        batch,
+        *,
+        fermion=None,
+        one_d_to_two_d=None,
+        site_order=None,
+        occupation_map=None,
+    ):
+        """Bridge an already sampled external proposal without contracting it."""
+        from .importance import _proposal_batch_configs
+
+        return _proposal_batch_configs(
+            self,
+            batch,
+            fermion=fermion,
+            site_order=site_order,
+            occupation_map=occupation_map,
+            device=_model_device(self.model),
+        )
+
     def sample_sweep(self, *, n_sweeps=1, track_proposal_stats=False):
         """Run one or more Metropolis sweeps and update driver state."""
         n_sweeps = _check_positive_int("n_sweeps", n_sweeps)
@@ -1209,6 +1266,8 @@ class TorchVMCDriver:
         deduplicate=True,
         progress=False,
         distributed=None,
+        connection_plan=None,
+        amplitude_cache=None,
     ):
         """Measure saved chain samples without running another sampler.
 
@@ -1319,6 +1378,14 @@ class TorchVMCDriver:
             else int(flat_configs.shape[0])
         )
 
+        if amplitude_cache is not None:
+            from .cache import TorchAmplitudeCache
+
+            if not isinstance(amplitude_cache, TorchAmplitudeCache):
+                raise TypeError(
+                    "amplitude_cache must be a TorchAmplitudeCache or None."
+                )
+
         if amplitudes is None and sample_object is not None:
             amplitudes = getattr(sample_object, "amplitudes", None)
         if refresh_proposal_amplitudes:
@@ -1331,18 +1398,32 @@ class TorchVMCDriver:
             with torch.no_grad():
                 if deduplicate and unique_parent_count < flat_configs.shape[0]:
                     unique_configs, inverse = _unique_config_rows(flat_configs)
-                    unique_amplitudes = _call_amplitude_fn(
-                        self.model,
-                        unique_configs,
-                        chunk_size=self.chunk_size,
-                    )
+                    if amplitude_cache is None:
+                        unique_amplitudes = _call_amplitude_fn(
+                            self.model,
+                            unique_configs,
+                            chunk_size=self.chunk_size,
+                        )
+                    else:
+                        unique_amplitudes = amplitude_cache.evaluate(
+                            self.model,
+                            unique_configs,
+                            chunk_size=self.chunk_size,
+                        )
                     flat_amplitudes = unique_amplitudes[inverse]
                 else:
-                    flat_amplitudes = _call_amplitude_fn(
-                        self.model,
-                        flat_configs,
-                        chunk_size=self.chunk_size,
-                    )
+                    if amplitude_cache is None:
+                        flat_amplitudes = _call_amplitude_fn(
+                            self.model,
+                            flat_configs,
+                            chunk_size=self.chunk_size,
+                        )
+                    else:
+                        flat_amplitudes = amplitude_cache.evaluate(
+                            self.model,
+                            flat_configs,
+                            chunk_size=self.chunk_size,
+                        )
             chain_amplitudes = flat_amplitudes.reshape(n_steps, n_chains)
         else:
             amplitudes = torch.as_tensor(amplitudes, device=model_device)
@@ -1436,14 +1517,40 @@ class TorchVMCDriver:
 
         set_phase("connections")
         connection_start = time.perf_counter()
-        connection_map = {
-            name: (
-                self.make_connections(flat_configs, terms=terms)
-                if terms is not None
-                else self.make_connections(flat_configs)
-            )
-            for name, terms in observable_items
-        }
+        if connection_plan is None:
+            connection_map = {
+                name: (
+                    self.make_connections(flat_configs, terms=terms)
+                    if terms is not None
+                    else self.make_connections(flat_configs)
+                )
+                for name, terms in observable_items
+            }
+        else:
+            if not isinstance(connection_plan, TorchFockTransitionPlan):
+                raise TypeError(
+                    "connection_plan must be a TorchFockTransitionPlan."
+                )
+            if connection_plan.observable_names != tuple(
+                name for name, _ in observable_items
+            ):
+                raise ValueError(
+                    "connection_plan observable names do not match observables."
+                )
+            if (
+                connection_plan.configs.shape != flat_configs.shape
+                or not torch.equal(
+                    connection_plan.configs.to(device=flat_configs.device),
+                    flat_configs,
+                )
+            ):
+                raise ValueError(
+                    "connection_plan parent configurations do not match samples."
+                )
+            connection_map = {
+                name: connections.to(flat_configs.device)
+                for name, connections in connection_plan.connection_map.items()
+            }
         n_connections = sum(
             int(connections.configs.shape[0])
             for connections in connection_map.values()
@@ -1454,12 +1561,20 @@ class TorchVMCDriver:
 
         set_phase("target amplitudes", n_connections=n_connections)
         local_start = time.perf_counter()
+        measurement_model = self.model
+        if amplitude_cache is not None:
+            amplitude_cache.seed(
+                flat_configs,
+                flat_amplitudes,
+                model=self.model,
+            )
+            measurement_model = amplitude_cache.wrap(self.model)
         with torch.no_grad():
             flat_values = _local_energies_from_connection_map(
                 flat_configs,
                 flat_amplitudes,
                 connection_map,
-                self.model,
+                measurement_model,
                 chunk_size=self.chunk_size,
                 reuse_diagonal=True,
                 deduplicate_targets=deduplicate,
@@ -1504,6 +1619,11 @@ class TorchVMCDriver:
                 ),
                 "total_seconds": elapsed,
                 "cache": _cache_profile_snapshot(self.model),
+                **(
+                    {"amplitude_cache": amplitude_cache.snapshot()}
+                    if amplitude_cache is not None
+                    else {}
+                ),
                 "samples_only": True,
                 "deduplicate": bool(deduplicate),
                 "num_samples": int(flat_configs.shape[0]),
@@ -2421,6 +2541,7 @@ class TorchVMCDriver:
         sample_kwargs=None,
         progress=False,
         amplitude_floor=0.0,
+        amplitude_cache=None,
     ):
         """Draw reusable PEPS-code samples from an external proposal.
 
@@ -2442,6 +2563,7 @@ class TorchVMCDriver:
             sample_kwargs=sample_kwargs,
             progress=progress,
             amplitude_floor=amplitude_floor,
+            amplitude_cache=amplitude_cache,
         )
 
     def measure_from_proposal(
@@ -2460,6 +2582,7 @@ class TorchVMCDriver:
         amplitude_floor=0.0,
         profile=False,
         deduplicate=True,
+        amplitude_cache=None,
     ):
         """Measure from an external MPS, BP, tree, or proposal batch.
 
@@ -2480,6 +2603,7 @@ class TorchVMCDriver:
             sample_kwargs=sample_kwargs,
             progress=progress,
             amplitude_floor=amplitude_floor,
+            amplitude_cache=amplitude_cache,
         )
         return self.measure_samples(
             samples,
@@ -2487,6 +2611,7 @@ class TorchVMCDriver:
             profile=profile,
             deduplicate=deduplicate,
             progress=progress,
+            amplitude_cache=amplitude_cache,
         )
 
     def importance_energy_estimate(

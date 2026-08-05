@@ -1476,6 +1476,42 @@ def test_mps_sampler_symmray_prefix_controls_bound_high_entropy_batches():
     )
 
 
+@pytest.mark.parametrize("symmetry", ("U1", "U1U1"))
+def test_mps_sampler_symmray_dense_strategy_uses_batched_native_kernel(symmetry):
+    """The explicit dense strategy batches all Symmray shots safely."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    psi = SymMPS.random(
+        4,
+        symmetry=symmetry,
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(4),
+        bond_dim=4,
+        seed=29,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        backend="symmray",
+        prefix_strategy="dense",
+    )
+
+    configs, sampled_probs = sampler.sample_arrays(64, seed=7)
+    stats = sampler.symmray_sampling_stats
+
+    assert stats["strategy"] == "dense"
+    assert stats["conditional_evaluations"] == psi.L
+    assert stats["dense_site_bytes"] > 0
+    np.testing.assert_allclose(
+        sampler.probabilities(configs),
+        sampled_probs,
+        atol=1e-12,
+    )
+
+
 def test_mps_sampler_rejects_invalid_symmray_prefix_controls():
     """Prefix controls should be explicit before any MPS preprocessing."""
     psi = qtn.MPS_computational_state("0")
@@ -1484,6 +1520,71 @@ def test_mps_sampler_rejects_invalid_symmray_prefix_controls():
         sampler_mod.MpsSampler(psi, prefix_strategy="branchy")
     with pytest.raises(ValueError, match="max_prefix_groups"):
         sampler_mod.MpsSampler(psi, max_prefix_groups=0)
+
+
+def test_mps_sampler_auto_selects_dense_within_memory_budget():
+    """Auto strategy should use dense batching for a sufficiently large batch."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry="U1")
+    psi = SymMPS.random(
+        4,
+        symmetry="U1",
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(4),
+        bond_dim=4,
+        seed=43,
+        dtype="complex128",
+    ).mps
+    sampler = sampler_mod.MpsSampler(
+        psi,
+        strategy="auto",
+        dense_min_samples=32,
+        dense_memory_limit="1GiB",
+    )
+
+    configs, probs = sampler.sample_arrays(64, seed=5)
+    stats = sampler.symmray_sampling_stats
+
+    assert stats["requested_strategy"] == "auto"
+    assert stats["strategy_selection"] == "auto_dense_within_budget"
+    assert stats["strategy"] == "dense"
+    np.testing.assert_allclose(sampler.probabilities(configs), probs, atol=1e-12)
+
+
+def test_mps_sampler_rejects_conflicting_strategy_aliases_and_dense_budget():
+    """The new strategy alias and dense guard should fail clearly."""
+    psi = qtn.MPS_computational_state("0")
+    with pytest.raises(ValueError, match="either strategy"):
+        sampler_mod.MpsSampler(
+            psi,
+            strategy="dense",
+            prefix_strategy="serial",
+        )
+
+    pytest.importorskip("symmray")
+    from pepsy.tensors import Fermion, SymMPS
+
+    fermion = Fermion(spinful=True, symmetry="U1")
+    symm_psi = SymMPS.random(
+        3,
+        symmetry="U1",
+        fermionic=True,
+        phys_dim=fermion.physical_sectors,
+        site_charge=fermion.half_filled_site_charge(3),
+        bond_dim=3,
+        seed=47,
+        dtype="complex128",
+    ).mps
+    guarded = sampler_mod.MpsSampler(
+        symm_psi,
+        strategy="dense",
+        dense_memory_limit="1B",
+    )
+    with pytest.raises(ValueError, match="above the configured limit"):
+        guarded.sample_arrays(8, seed=1)
 
 
 def test_mps_sampler_symmray_torch_nonfermionic_blocks_stay_on_torch():

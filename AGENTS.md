@@ -127,6 +127,23 @@ The tree-native operator API lives in `pepsy.optimizers.tree.operators`:
   invariants. Emit explicit warnings for intentional compatibility coercions.
 - Do not vendor upstream internals.
 
+## Cyclic CTMRG compatibility
+
+- Use `pepsy.boundary.quimb_ctmrg_projector_compat` around Quimb CTMRG calls
+  for cyclic PEPS/PEPO networks whose effective bond dimensions can vary,
+  especially native U(1) term-by-term replays.
+- This is a scoped compatibility context: it redirects projector insertion to
+  the current network and restores Quimb's method on exit. It does not modify
+  installed `site-packages`, alter boundary-MPS contractions, or replace
+  CTMRG with MPS.
+- Keep the workaround at the Pepsy boundary API. Do not copy Quimb's CTMRG
+  implementation into Pepsy or edit the installed Quimb source. Add a focused
+  regression test when changing the compatibility behavior.
+- The shared CTMRG entry points already apply this context for
+  `contract_flat(..., method="ctmrg")`, native Torch PEPS VMC models with
+  `contraction="ctmrg"`, and the NetKet/JAX PEPS amplitude validation path.
+  Keep exact, HOTRG, and boundary-MPS routes independent of this workaround.
+
 ## Documentation and skills
 
 - Keep user-facing API docs under `docs/api/` and concise implementation maps

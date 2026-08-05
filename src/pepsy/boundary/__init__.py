@@ -14,6 +14,7 @@ from .metrics import (
     peps_infidelity,
     peps_norm,
     peps_normalize,
+    quimb_ctmrg_projector_compat,
 )
 from .states import BdyMPS, make_numpy_array_caster
 from .sweeps import CompBdy
@@ -33,6 +34,7 @@ __all__ = [
     "peps_infidelity",
     "peps_norm",
     "peps_normalize",
+    "quimb_ctmrg_projector_compat",
     "metrics",
     "states",
     "sweeps",

@@ -946,6 +946,84 @@ def test_torch_amplitude_accepts_common_contraction_config():
     assert model.chi == 4
 
 
+def test_torch_ctmrg_uses_symmray_stabilization_defaults(monkeypatch):
+    """Torch CTMRG should share the native Symmray safety controls."""
+    pytest.importorskip("torch")
+    import pepsy.boundary.metrics as metrics
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    model = object.__new__(TorchPEPSAmplitude)
+    model.contraction_opts = {"mode": "direct"}
+    monkeypatch.setattr(metrics, "_uses_symmray_arrays", lambda value: True)
+
+    options = model._ctmrg_options(object())
+
+    assert options["mode"] == "direct"
+    assert options["reduce_opts"] == {
+        "method": "eigh",
+        "shift": 1.0e-12,
+    }
+    assert options["gauge_smudge"] == 1.0e-10
+    assert options["canonize_opts"] == {"smudge": 1.0e-10}
+
+
+def test_torch_ctmrg_preserves_explicit_stabilization_options(monkeypatch):
+    """Explicit Torch CTMRG controls should override only the defaults."""
+    pytest.importorskip("torch")
+    import pepsy.boundary.metrics as metrics
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    model = object.__new__(TorchPEPSAmplitude)
+    model.contraction_opts = {
+        "reduce_opts": {"method": "cholesky", "shift": 1.0e-9},
+        "gauge_smudge": 2.0e-8,
+        "canonize_opts": {"max_bond": 4},
+    }
+    monkeypatch.setattr(metrics, "_uses_symmray_arrays", lambda value: True)
+
+    options = model._ctmrg_options(object())
+
+    assert options["reduce_opts"] == {
+        "method": "cholesky",
+        "shift": 1.0e-9,
+    }
+    assert options["gauge_smudge"] == 2.0e-8
+    assert options["canonize_opts"] == {
+        "smudge": 2.0e-8,
+        "max_bond": 4,
+    }
+
+
+def test_torch_native_symmray_ctmrg_defaults_to_projector_mode():
+    """Native Torch Symmray CTMRG should use the guarded projector route."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymPEPS, site_charge_from_occupations
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1",
+        phys_dim={0: 1, 1: 2, 2: 1},
+        fermionic=True,
+        site_charge=site_charge_from_occupations(
+            {(x, y): 1 for x in range(2) for y in range(2)}
+        ),
+        bond_dim=2,
+        seed=194,
+        dtype="complex128",
+    )
+    model = TorchPEPSAmplitude(
+        state,
+        contraction="ctmrg",
+        chi=2,
+        dtype=torch.complex128,
+    )
+
+    assert model.contraction_opts["mode"] == "projector"
+
+
 def test_netket_setup_consumes_shared_sampling_config():
     nk = pytest.importorskip("netket")
     from pepsy.vmc.netket import NetKetPEPSVMC

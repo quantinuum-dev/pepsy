@@ -8,6 +8,8 @@ import numpy as np
 import time
 from typing import Any
 
+import autoray as ar
+
 from ..torch_types import FermionSiteEncoding, _check_positive_int, _require_torch
 from ._common import (
     _as_long_matrix,
@@ -811,6 +813,7 @@ class TorchFermionVMC(TorchVMCDriver):
             sample_kwargs = kwargs.pop("sample_kwargs", None)
             progress = kwargs.pop("progress", False)
             amplitude_floor = kwargs.pop("amplitude_floor", 0.0)
+            amplitude_cache = kwargs.pop("amplitude_cache", None)
             if kwargs:
                 unexpected = ", ".join(sorted(kwargs))
                 raise TypeError(
@@ -831,6 +834,7 @@ class TorchFermionVMC(TorchVMCDriver):
                 sample_kwargs=sample_kwargs,
                 progress=progress,
                 amplitude_floor=amplitude_floor,
+                amplitude_cache=amplitude_cache,
             )
         distributed_runtime, initialization_sampling = self._rank_sharded_sampling_config(
             sampling,
@@ -935,6 +939,8 @@ class TorchFermionVMC(TorchVMCDriver):
         deduplicate=True,
         progress=False,
         distributed=None,
+        connection_plan=None,
+        amplitude_cache=None,
         _include_energy=False,
     ):
         """Measure observables from retained samples without resampling.
@@ -958,6 +964,10 @@ class TorchFermionVMC(TorchVMCDriver):
             "deduplicate": deduplicate,
             "progress": progress,
         }
+        if connection_plan is not None:
+            measure_kwargs["connection_plan"] = connection_plan
+        if amplitude_cache is not None:
+            measure_kwargs["amplitude_cache"] = amplitude_cache
         if distributed is not None:
             measure_kwargs["distributed"] = distributed
         return self.measure_samples(
@@ -1222,13 +1232,7 @@ class TorchFermionVMC(TorchVMCDriver):
 
 def _vmc_result_scalar(value):
     """Convert a scalar Torch/JAX-like result to a real Python float."""
-    detach = getattr(value, "detach", None)
-    if callable(detach):
-        value = detach()
-    cpu = getattr(value, "cpu", None)
-    if callable(cpu):
-        value = cpu()
-    array = np.asarray(value)
+    array = np.asarray(ar.to_numpy(value))
     if array.size != 1:
         raise ValueError("Expected a scalar VMC result.")
     return float(np.real(array.reshape(-1)[0]))
@@ -1314,6 +1318,8 @@ class TorchVMCSetup:
         samples=None,
         weights=None,
         proposal_log_probs=None,
+        connection_plan=None,
+        amplitude_cache=None,
     ):
         """Measure energy and optional observables from one shared sample set.
 
@@ -1345,6 +1351,8 @@ class TorchVMCSetup:
                 observables={"energy": None, **extra_terms},
                 weights=weights,
                 proposal_log_probs=proposal_log_probs,
+                connection_plan=connection_plan,
+                amplitude_cache=amplitude_cache,
             )
             energy = estimates["energy"]
         else:
@@ -1352,6 +1360,8 @@ class TorchVMCSetup:
                 native_samples,
                 weights=weights,
                 proposal_log_probs=proposal_log_probs,
+                connection_plan=connection_plan,
+                amplitude_cache=amplitude_cache,
             )
             estimates = {"energy": energy}
         return VMCMeasurement(

@@ -48,6 +48,7 @@ from .metadata import (
 )
 from .connections import (
     TorchConnections,
+    TorchFockTransitionPlan,
     compile_operator_sum_torch,
     torch_hamiltonian_connections,
 )
@@ -122,6 +123,7 @@ __all__ = [
     "TorchPEPSAmplitude",
     "TorchPEPSBoundaryAmplitude",
     "TorchConnections",
+    "TorchFockTransitionPlan",
     "TorchMetropolisResult",
     "TorchImportanceSamples",
     "TorchMCMCSamples",

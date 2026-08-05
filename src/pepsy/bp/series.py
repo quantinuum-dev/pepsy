@@ -7374,8 +7374,10 @@ def adaptive_open_loop_series(
             differences.append(None)
             continue
         try:
-            difference = float(np.max(np.abs(np.asarray(value) - np.asarray(values[-2]))))
-            scale = max(1.0, float(np.max(np.abs(np.asarray(value)))))
+            value_array = np.asarray(ar.to_numpy(value))
+            previous_array = np.asarray(ar.to_numpy(values[-2]))
+            difference = float(np.max(np.abs(value_array - previous_array)))
+            scale = max(1.0, float(np.max(np.abs(value_array))))
         except (TypeError, ValueError):
             difference = None
             scale = 1.0

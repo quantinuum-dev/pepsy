@@ -105,17 +105,12 @@ def _copy_array(x):
 
 def _as_numpy(x):
     if hasattr(x, "to_dense"):
-        return np.asarray(x.to_dense())
-    try:
-        return np.asarray(ar.to_numpy(x))
-    except Exception:
-        return np.asarray(x)
+        x = x.to_dense()
+    return np.asarray(ar.to_numpy(x))
 
 
 def _gauge_values_numpy(gauge):
     """Materialize a gauge vector for validation, including Symmray vectors."""
-    if hasattr(gauge, "to_dense"):
-        return np.asarray(gauge.to_dense())
     return _as_numpy(gauge)
 
 
@@ -126,8 +121,8 @@ def _is_symmray_array(value) -> bool:
 def _symmray_dense_matrix(matrix):
     """Convert one small Symmray message to a host dense matrix."""
     if hasattr(matrix, "to_dense"):
-        return np.asarray(matrix.to_dense())
-    return np.asarray(matrix)
+        matrix = matrix.to_dense()
+    return np.asarray(ar.to_numpy(matrix))
 
 
 def _symmray_align_message_to_bond(tn, ix, tid, message):

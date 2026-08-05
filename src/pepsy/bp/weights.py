@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import autoray as ar
 import numpy as np
 
 from ._symmray import dense_bp_tn as _dense_bp_tn
@@ -41,7 +42,7 @@ def _apply_left(data, axis, matrix):
 def _multiply_axis(data, axis, weights):
     shape = [1] * data.ndim
     shape[axis] = len(weights)
-    return data * np.asarray(weights).reshape(shape)
+    return data * np.asarray(ar.to_numpy(weights)).reshape(shape)
 
 
 def _validate_network(tn):
@@ -70,7 +71,7 @@ def _initial_weights(tn, weights):
     for index in tn.inner_inds():
         dimension = _dimension(tn.tensor_map[next(iter(tn.ind_map[index]))], index)
         value = supplied.get(index, np.ones(dimension, dtype=float))
-        value = np.asarray(value)
+        value = np.asarray(ar.to_numpy(value))
         if value.ndim == 2:
             if value.shape != (dimension, dimension):
                 raise ValueError(
@@ -92,7 +93,10 @@ def _initial_weights(tn, weights):
 
 
 def _weighted_tensor(tensor, weights, exclude):
-    data = np.asarray(tensor.data)
+    data = tensor.data
+    if hasattr(data, "to_dense"):
+        data = data.to_dense()
+    data = np.asarray(ar.to_numpy(data))
     for axis, index in enumerate(tensor.inds):
         if index != exclude:
             data = _multiply_axis(data, axis, weights[index])
@@ -172,8 +176,12 @@ def _bond_update(tn, index, weights, *, alpha, eps):
         @ right_u.conj().T
     )
 
-    left_data = _apply_right(np.asarray(tensor_left.data), left_axis, left_gauge)
-    right_data = _apply_left(np.asarray(tensor_right.data), right_axis, right_gauge)
+    left_data = _apply_right(
+        np.asarray(ar.to_numpy(tensor_left.data)), left_axis, left_gauge
+    )
+    right_data = _apply_left(
+        np.asarray(ar.to_numpy(tensor_right.data)), right_axis, right_gauge
+    )
     # The normalized weight differs from S_C**alpha by ``scale``. The
     # compensating scalar keeps the represented network exactly unchanged.
     left_data = left_data * scale
@@ -307,7 +315,11 @@ def weight_pass(
         _, right = tuple(network.ind_map[index])
         tensor = network.tensor_map[right]
         axis = tensor.inds.index(index)
-        tensor.modify(data=_apply_left(np.asarray(tensor.data), axis, np.diag(value)))
+        tensor.modify(
+            data=_apply_left(
+                np.asarray(ar.to_numpy(tensor.data)), axis, np.diag(value)
+            )
+        )
 
     return WeightPassingResult(
         network=network,

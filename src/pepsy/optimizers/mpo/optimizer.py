@@ -398,7 +398,7 @@ class MpoOptimizer:
             dense = gate.to_dense()
         except AttributeError:
             dense = gate
-        dense = np.asarray(dense)
+        dense = np.asarray(ar.to_numpy(dense))
         where = tuple(where)
         physical_maps = [
             cls._symmray_physical_map(p, site, ind_id) for site in where
