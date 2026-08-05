@@ -3185,6 +3185,51 @@ def test_native_factorized_mpo_matches_terms_and_jw_reference(
     )
 
 
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
+def test_native_mpo_noncontiguous_hopping_matches_native_local_term(symmetry):
+    """Native graded MPOs preserve signs across skipped chain sites."""
+    L = 5
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    occupations = (
+        [1] * L
+        if symmetry == "U1"
+        else [(1, 0) if site % 2 == 0 else (0, 1) for site in range(L)]
+    )
+    state = SymMPS.random_unitary_evolution(
+        L,
+        symmetry=symmetry,
+        fermionic=True,
+        phys_dim=default_physical_sectors(symmetry, 4),
+        site_charge=site_charge_from_occupations(occupations),
+        bond_dim=4,
+        seed=333,
+        dtype="complex128",
+        rounds=2,
+        stall_rounds=1,
+    )
+
+    for edge in ((0, 2), (0, 4), (1, 4)):
+        term = fermion.hopping_operator()
+        hamiltonian = fermion.hamiltonian({edge: term})
+        native_mpo = hamiltonian.to_mpo(L=L, fermionic=True, compress=False)
+        native_mpo_value = pepsy.MpsEnergyOptimizer(
+            state,
+            native_mpo,
+            energy_per_site=False,
+            real=False,
+        ).energy().energy
+        local_term_value = pepsy.MpsEnergyOptimizer(
+            state,
+            {edge: term},
+            energy_per_site=False,
+            real=False,
+        ).energy().energy
+
+        assert complex(native_mpo_value) == pytest.approx(
+            complex(local_term_value), abs=1e-10
+        )
+
+
 def test_fermi_hubbard_u1u1_mpo_energy_matches_high_bond_fermionic_mps():
     """High-bond fermionic FH MPS energy should use the direct MPO."""
     state = SymMPS.for_model(

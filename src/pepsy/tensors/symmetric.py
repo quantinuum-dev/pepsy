@@ -5875,6 +5875,7 @@ def _add_native_term_to_mpo(
     # channel charge is taken directly from the native factor bond index,
     # rather than reconstructed from dense matrix elements.
     interval_channel_ids = []
+    interval_channel_charges = []
     for interval in range(n_sites - 1):
         factor = factors[interval]
         bond_axis = 0 if interval == 0 else 1
@@ -5891,6 +5892,7 @@ def _add_native_term_to_mpo(
             for cut in range(sites[interval], sites[interval + 1]):
                 channels[cut].append((channel_id, bond_charge))
         interval_channel_ids.append(channel_ids)
+        interval_channel_charges.append(tuple(bond_map))
 
     first_data = _dense_numpy(factors[0], dtype=dtype)
     for bond_pos, channel_id in enumerate(interval_channel_ids[0]):
@@ -5919,8 +5921,20 @@ def _add_native_term_to_mpo(
     identity = np.eye(len(physical_maps[0]), dtype=dtype)
     for interval, channel_ids in enumerate(interval_channel_ids):
         for site in range(sites[interval] + 1, sites[interval + 1]):
-            for channel_id in channel_ids:
-                transitions[site].append((channel_id, channel_id, identity))
+            for channel_pos, channel_id in enumerate(channel_ids):
+                # A skipped site still participates in the graded ordering.
+                # For an odd operator-Schmidt channel, moving that channel
+                # past one omitted physical site contributes a scalar -1.
+                # This is a graded factorization phase, not a JW parity
+                # operator: inserting the latter would change the native
+                # operator by making the result state-dependent.
+                bond_charge = interval_channel_charges[interval][channel_pos]
+                phase_op = (
+                    -identity
+                    if _charged_op_needs_fermion_string(bond_charge)
+                    else identity
+                )
+                transitions[site].append((channel_id, channel_id, phase_op))
 
     return list(physical_maps[0])
 
