@@ -21,6 +21,8 @@ _TORCH_NAMES = {
     "reg_real_svd_torch",
     "reg_real_qr_torch",
     "reg_complex_qr_torch",
+    "reg_quimb_torch_split_drivers",
+    "reset_quimb_torch_split_drivers",
     "reset_torch_linalg_registrations",
     "reg_stop_gradient_torch",
     "stop_grad",

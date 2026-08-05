@@ -1102,6 +1102,14 @@ def _run_scipy_lbfgs(
     if method in {"L-BFGS-B", "TNC"}:
         options.setdefault("maxls", 40)
 
+    # ``ftol_rel`` and ``xtol_rel`` are Pepsy/NLopt-style aliases. They were
+    # consumed above and translated to SciPy's method-specific controls. Keep
+    # this final boundary guard so a future option-normalization branch cannot
+    # accidentally hand the aliases to ``scipy.optimize.minimize`` (which
+    # emits an OptimizeWarning instead of ignoring them quietly).
+    options.pop("ftol_rel", None)
+    options.pop("xtol_rel", None)
+
     if bounds is None and (lower is not None or upper is not None):
         n_vars = int(x0.size)
         lower_arr = _as_numpy_vector(-np.inf if lower is None else lower, n_vars, key="lower_bounds")

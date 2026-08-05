@@ -1,5 +1,7 @@
 """Tests for the simplified gradient solver API."""
 
+import warnings
+
 import numpy as np
 import pytest
 torch = pytest.importorskip("torch")
@@ -182,9 +184,21 @@ def test_resolve_user_solver_accepts_canonical_names():
 
 def test_resolve_user_solver_warns_for_nlopt():
     """NLopt path should warn users with tuning guidance."""
-    with pytest.warns(UserWarning, match="uses NLopt"):
+    with pytest.warns(UserWarning, match="without explicit stopping controls"):
         solver = SweepOptimizer._resolve_user_solver("nlopt")  # pylint: disable=protected-access
     assert solver == "nlopt"
+
+
+def test_resolve_user_solver_suppresses_warning_with_stopping_controls():
+    """Configured NLopt calls should not emit a repeated tuning warning."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        solver = SweepOptimizer._resolve_user_solver(
+            "nlopt",
+            solver_options={"maxeval": 100, "ftol_rel": 1.0e-9},
+        )  # pylint: disable=protected-access
+    assert solver == "nlopt"
+    assert not [warning for warning in caught if "NLopt" in str(warning.message)]
 
 
 def test_scipy_solver_reduces_quadratic_if_available():
@@ -198,6 +212,44 @@ def test_scipy_solver_reduces_quadratic_if_available():
     assert result.history
     assert result.history[-1] < result.history[0]
     assert abs(float(result.params["x"].detach().item())) < 1e-6
+
+
+def test_scipy_solver_consumes_nlopt_tolerance_aliases_if_available(monkeypatch):
+    """Package-relative tolerances must not leak into scipy.minimize."""
+    scipy = pytest.importorskip("scipy")
+    from scipy.optimize import OptimizeWarning
+
+    forwarded = {}
+    real_minimize = scipy.optimize.minimize
+
+    def capture_minimize(*args, **kwargs):
+        forwarded.update(kwargs.get("options", {}))
+        return real_minimize(*args, **kwargs)
+
+    monkeypatch.setattr(scipy.optimize, "minimize", capture_minimize)
+
+    runner = GradientOptimizer(
+        solver="scipy",
+        n_steps=3,
+        options={
+            "algorithm": "L-BFGS-B",
+            "ftol_rel": 1.0e-9,
+            "xtol_rel": 1.0e-7,
+        },
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        runner.run(
+            params_init={"x": torch.tensor([2.0], dtype=torch.float64)},
+            loss_fn=_loss_quadratic,
+        )
+    assert not any(
+        isinstance(item.message, OptimizeWarning)
+        and "Unknown solver options" in str(item.message)
+        for item in caught
+    )
+    assert "ftol_rel" not in forwarded
+    assert "xtol_rel" not in forwarded
 
 
 def test_scipy_solver_honors_lower_upper_bounds_if_available():

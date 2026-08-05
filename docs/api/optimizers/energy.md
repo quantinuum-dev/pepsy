@@ -44,6 +44,50 @@ example ``native_mpo_compression={"max_bond": 64, "cutoff": 1e-12,
 "method": "svd"}``; always compare against an uncompressed result when setting
 the truncation cap.
 
+## PEPS optimizer step guard
+
+For a truncated or boundary-MPS PEPS energy objective, an L-BFGS line search
+can probe a high-energy trial point even when it retains a lower-energy best
+state. A cheap parameter-space guard can limit this without performing a
+second energy contraction:
+
+```python
+state, losses = optimizer.optimize(
+    n=100,
+    optimizer="L-BFGS-B",
+    optlib="nlopt",
+    max_parameter_step=5e-2,
+    return_losses=True,
+)
+```
+
+This places finite lower and upper bounds ``initial_parameter +/-
+max_parameter_step`` on the flattened real optimizer vector for that run.
+Use ``bounds=...`` when explicit per-parameter limits are needed. The guard
+is opt-in; omitting both arguments preserves the unconstrained optimizer
+behavior.
+
+For occasional protection against a truncated local loss descending for
+numerical reasons, enable the compact validation mode:
+
+```python
+state, losses = optimizer.optimize(
+    n=100,
+    optimizer="L-BFGS-B",
+    optlib="nlopt",
+    validate=True,
+    return_losses=True,
+)
+```
+
+Validation is opt-in and runs a few optimizer chunks, checking each candidate
+with twice the training boundary bond dimension. If that validation energy
+worsens or becomes non-finite, Pepsy rolls back to the last validated state.
+Candidates reconstructed by Quimb are converted back to the selected
+autodiff backend before validation, which is required for native Symmray
+states whose blocks must not mix NumPy and Torch (or another backend).
+The normal fast path is unchanged when ``validate=False``.
+
 ## Tree tensor networks
 
 ``TreeEnergyOptimizer`` mirrors the ``MpsEnergyOptimizer`` energy surface for

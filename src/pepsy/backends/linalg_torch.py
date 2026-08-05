@@ -423,6 +423,60 @@ class QR_real(torch.autograd.Function):
         return torch.cat([da, db], dim=-1)
 
 
+class QR_real_safe(torch.autograd.Function):
+    """Real QR VJP that does not differentiate a singular gauge.
+
+    Symmetry-resolved PEPS boundary blocks can be exactly rank deficient even
+    when the complete tensor is well behaved.  Torch's QR backward is not
+    defined for those blocks.  The boundary contraction only uses their
+    canonical gauge, so the safe policy is to keep the forward QR factors but
+    return a zero VJP for a singular block.  Full-rank tall blocks use the
+    validated Pepsy rule and full-rank wide blocks use Torch's native VJP,
+    which covers the shape not handled by ``_simple_qr_backward``.
+    """
+
+    @staticmethod
+    def forward(ctx, A):
+        Q, R = torch.linalg.qr(A)
+        diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
+        scale = R.abs().amax(dim=(-2, -1))
+        tolerance = torch.finfo(A.dtype).eps * max(A.shape[-2:]) * scale
+        rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
+        ctx.save_for_backward(A, Q, R, rank_deficient)
+        return Q, R
+
+    @staticmethod
+    def backward(ctx, dQ, dR):
+        A, Q, R, rank_deficient = ctx.saved_tensors
+        if bool(rank_deficient.any().item()):
+            return torch.zeros_like(A)
+        if R.shape[-1] > R.shape[-2]:
+            return _native_qr_backward(A, dQ, dR)
+        return _simple_qr_backward(Q, R, dQ, dR)
+
+
+class QR_complex_safe(torch.autograd.Function):
+    """Complex QR VJP that freezes exactly rank-deficient gauges."""
+
+    @staticmethod
+    def forward(ctx, A):
+        Q, R = torch.linalg.qr(A)
+        diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
+        scale = R.abs().amax(dim=(-2, -1))
+        real_dtype = A.real.dtype if A.is_complex() else A.dtype
+        tolerance = torch.finfo(real_dtype).eps * max(A.shape[-2:]) * scale
+        rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
+        ctx.save_for_backward(A, rank_deficient)
+        return Q, R
+
+    @staticmethod
+    def backward(ctx, dQ, dR):
+        A, rank_deficient = ctx.saved_tensors
+        if bool(rank_deficient.any().item()):
+            return torch.zeros_like(A)
+        return _native_qr_backward(A, dQ, dR)
+
+
 def _simple_qr_backward(q, r, dq, dr):
     """Compute the QR gradient for the square-``R`` case."""
     if r.shape[-2] != r.shape[-1]:
@@ -532,6 +586,110 @@ def reg_complex_qr_torch():
     directly for the faster default path.
     """
     _register_once("linalg.qr", torch.linalg.qr)
+
+
+def reg_quimb_torch_split_drivers(mode="real"):
+    """Register stable Torch split drivers used inside Symmray blocks.
+
+    Quimb's composed ``qr_stabilized`` and ``svd_truncated`` drivers receive
+    raw Torch blocks from Symmray and call the Torch namespace directly. That
+    path bypasses Autoray's ordinary ``linalg.qr`` and ``linalg.svd``
+    registrations, so PEPS autodiff needs backend-specific Quimb drivers as
+    well. Missing Quimb is allowed because this helper is optional outside
+    tensor-network optimization.
+    """
+    if mode not in {"real", "complex"}:
+        raise ValueError("mode must be 'real' or 'complex'")
+    try:
+        import quimb.tensor.decomp as qd  # pylint: disable=import-outside-toplevel
+    except ImportError:  # pragma: no cover - quimb is an optional integration
+        return False
+
+    def qr_torch(x, absorb=qd.get_U_sVH, stabilized=True, **kwargs):
+        del kwargs
+        absorb_i = qd._ABSORB_MAP[absorb]
+        transposed = absorb_i in (qd.get_Us_VH, qd.get_Us, qd.get_VH)
+        if transposed:
+            x = x.swapaxes(-2, -1)
+            absorb_i = qd._ABSORB_TRANSPOSE_MAP[absorb_i]
+
+        if mode == "real" and not x.is_complex():
+            Q, R = QR_real_safe.apply(x)
+        elif mode == "complex" and x.is_complex():
+            Q, R = QR_complex_safe.apply(x)
+        else:
+            Q, R = torch.linalg.qr(x)
+
+        if stabilized:
+            # The sign/phase is a discrete gauge choice. It should not enter
+            # the VJP, especially when a rank-deficient block has zero R
+            # diagonal entries.
+            phase = torch.sgn(
+                torch.diagonal(R, dim1=-2, dim2=-1)
+            ).detach()
+            Q = Q * torch.conj(phase)[..., None, :]
+            R = phase[..., :, None] * R
+
+        left = None if absorb_i == qd.get_sVH else Q
+        right = None if absorb_i == qd.get_U else R
+        if transposed:
+            left, right = right, left
+            if left is not None:
+                left = left.swapaxes(-2, -1)
+            if right is not None:
+                right = right.swapaxes(-2, -1)
+        return left, None, right
+
+    def svd_torch(
+        x,
+        cutoff=-1.0,
+        cutoff_mode=qd.cutoff_mode_rsum2,
+        max_bond=-1,
+        absorb=qd.get_Usq_sqVH,
+        renorm=0,
+        info=None,
+        **kwargs,
+    ):
+        del kwargs
+        absorb_i = qd._ABSORB_MAP[absorb]
+        cutoff_mode_i = qd._CUTOFF_MODE_MAP[cutoff_mode]
+        if mode == "real" and not x.is_complex():
+            U, s, VH = SVD_real.apply(x)
+        else:
+            U, s, VH = SVD.apply(x)
+        return qd._trim_and_renorm_svd_result(
+            U,
+            s,
+            VH,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode_i,
+            max_bond=max_bond,
+            absorb=absorb_i,
+            renorm=renorm,
+            info=info,
+            xp=qd.get_namespace(x),
+        )
+
+    try:
+        qd.qr_stabilized.register("torch", qr_torch)
+        qd.svd_truncated.register("torch", svd_torch)
+    except AttributeError:  # pragma: no cover - older Quimb integration
+        return False
+    return True
+
+
+def reset_quimb_torch_split_drivers():
+    """Restore Quimb's default Torch split drivers if Quimb is installed."""
+    try:
+        import quimb.tensor.decomp as qd  # pylint: disable=import-outside-toplevel
+    except ImportError:  # pragma: no cover - quimb is an optional integration
+        return False
+    try:
+        qd.qr_stabilized.register("torch", qd.qr_stabilized._default_fn)
+        qd.svd_truncated.register("torch", qd.svd_truncated._default_fn)
+    except AttributeError:  # pragma: no cover - older Quimb integration
+        return False
+    return True
 
 
 def _stop_gradient_torch(x):

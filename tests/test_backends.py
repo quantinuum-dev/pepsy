@@ -72,6 +72,17 @@ def test_torch_backend_and_linalg_on_available_devices(device):
     assert sigma.device == matrix.device
 
 
+def test_torch_float_backend_drops_only_zero_imaginary_part_without_warning():
+    """Real Symmray blocks with complex containers stay cleanly float64."""
+    torch = pytest.importorskip("torch")
+    to_backend = pepsy.backend_torch(dtype=torch.float64, device="cpu")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = to_backend(np.array([1.0 + 0.0j, -2.0 + 0.0j]))
+    assert out.dtype is torch.float64
+    assert not [warning for warning in caught if "discards the imaginary part" in str(warning.message)]
+
+
 def test_to_float_handles_backend_scalar_without_numpy_coercion():
     class BackendScalar:
         shape = ()
@@ -262,6 +273,39 @@ def test_torch_real_qr_rank_deficient_falls_back_to_native():
     assert torch.isfinite(actual).all()
 
 
+def test_torch_real_qr_safe_freezes_rank_deficient_gauge():
+    """The PEPS block-QR rule keeps singular gauges out of the VJP."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends.linalg_torch import QR_real_safe
+
+    matrix = torch.randn(4, 3, dtype=torch.float64)
+    matrix[:, 1] = matrix[:, 0]
+    matrix.requires_grad_()
+    q, r = QR_real_safe.apply(matrix)
+    gradient = torch.autograd.grad(q.sum() + r.sum(), matrix)[0]
+
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) == 0
+
+
+def test_torch_complex_qr_safe_freezes_zero_gauge():
+    """The complex PEPS block-QR rule handles an exactly zero block."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends.linalg_torch import QR_complex_safe
+
+    matrix = torch.zeros(4, 3, dtype=torch.complex128, requires_grad=True)
+    q, r = QR_complex_safe.apply(matrix)
+    dq = torch.ones_like(q)
+    dr = torch.ones_like(r)
+    gradient = torch.autograd.grad(
+        (q.conj() * dq).real.sum() + (r.conj() * dr).real.sum(),
+        matrix,
+    )[0]
+
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) == 0
+
+
 @pytest.mark.parametrize("complex_input", (False, True))
 @pytest.mark.parametrize("case", ("zero", "repeated", "rank_deficient"))
 def test_torch_svd_degenerate_inputs_have_finite_gradients(case, complex_input):
@@ -298,6 +342,63 @@ def test_torch_svd_degenerate_inputs_have_finite_gradients(case, complex_input):
     gradient = torch.autograd.grad(loss, matrix)[0]
 
     assert torch.isfinite(gradient).all()
+
+
+def test_quimb_torch_split_drivers_stabilize_real_symmray_blocks():
+    """Quimb's composed Torch split path uses Pepsy's stable VJPs."""
+    torch = pytest.importorskip("torch")
+    qd = pytest.importorskip("quimb.tensor.decomp")
+    from pepsy.backends import config, linalg_torch
+
+    matrix = torch.randn(4, 3, dtype=torch.float64)
+    matrix[:, 1] = matrix[:, 0]
+    matrix.requires_grad_()
+    try:
+        config.register_torch_linalg(mode="real", stabilized=True)
+        assert linalg_torch.reg_quimb_torch_split_drivers(mode="real")
+        q, _, r = qd.qr_stabilized(matrix)
+        qr_gradient = torch.autograd.grad(q.sum() + r.sum(), matrix, retain_graph=True)[0]
+        u, s, vh = qd.svd_truncated(matrix, absorb=None)
+        svd_gradient = torch.autograd.grad(
+            u.sum() + s.sum() + vh.sum(),
+            matrix,
+        )[0]
+        assert torch.isfinite(qr_gradient).all()
+        assert torch.isfinite(svd_gradient).all()
+    finally:
+        qd.qr_stabilized.register("torch", qd.qr_stabilized._default_fn)
+        qd.svd_truncated.register("torch", qd.svd_truncated._default_fn)
+
+
+def test_quimb_torch_split_drivers_stabilize_complex_zero_block():
+    """The complex Quimb block path also avoids zero-block QR NaNs."""
+    torch = pytest.importorskip("torch")
+    qd = pytest.importorskip("quimb.tensor.decomp")
+    from pepsy.backends import config, linalg_torch
+
+    matrix = torch.zeros(4, 3, dtype=torch.complex128, requires_grad=True)
+    try:
+        config.register_torch_linalg(mode="complex", stabilized=True)
+        assert linalg_torch.reg_quimb_torch_split_drivers(mode="complex")
+        q, _, r = qd.qr_stabilized(matrix)
+        qr_gradient = torch.autograd.grad(
+            (q.conj() * torch.ones_like(q)).real.sum()
+            + (r.conj() * torch.ones_like(r)).real.sum(),
+            matrix,
+            retain_graph=True,
+        )[0]
+        u, s, vh = qd.svd_truncated(matrix, absorb=None)
+        svd_gradient = torch.autograd.grad(
+            (u.conj() * torch.ones_like(u)).real.sum()
+            + s.sum()
+            + (vh.conj() * torch.ones_like(vh)).real.sum(),
+            matrix,
+        )[0]
+        assert torch.isfinite(qr_gradient).all()
+        assert torch.isfinite(svd_gradient).all()
+    finally:
+        qd.qr_stabilized.register("torch", qd.qr_stabilized._default_fn)
+        qd.svd_truncated.register("torch", qd.svd_truncated._default_fn)
 
 
 def test_torch_complex_qr_registration_uses_native_fallback(monkeypatch):
