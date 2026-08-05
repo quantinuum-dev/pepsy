@@ -2490,6 +2490,49 @@ def test_torch_backend_matrix_gate_input():
     assert _fidelity(sim.to_statevector(), ref) == pytest.approx(1.0, abs=1e-6)
 
 
+def test_native_mps_backend_is_inferred_and_foreign_payloads_are_diagnosed():
+    torch = pytest.importorskip("torch")
+    backend = _torch_backend()
+    p = qtn.MatrixProductState.from_dense(
+        np.array([1, 0, 0, 0], dtype=complex), dims=[2, 2]
+    )
+    p.apply_to_arrays(backend)
+
+    sim = MpsStabOptimizer.from_mps(p)
+    assert sim.backend_info() == {
+        "backend": "torch",
+        "dtype": "complex128",
+        "device": "cpu",
+    }
+    assert sim.backend == "torch"
+    assert sim.backend_dtype == "complex128"
+    assert sim.backend_device == "cpu"
+
+    with pytest.warns(UserWarning, match="gate payload"):
+        sim.apply([(np.diag([1.0, np.exp(0.1j)]), 0)])
+    assert isinstance(sim.p[0].data, torch.Tensor)
+    sim.cap(0, [1.0, 0.0])
+    assert sim.backend_info()["backend"] == "torch"
+    assert isinstance(sim.p[0].data, torch.Tensor)
+
+
+def test_native_mps_submpo_conversion_does_not_mutate_source():
+    backend = _torch_backend()
+    p = qtn.MatrixProductState.from_dense(
+        np.array([1, 0, 0, 0], dtype=complex), dims=[2, 2]
+    )
+    p.apply_to_arrays(backend)
+    sim = MpsStabOptimizer.from_mps(p)
+    mpo = pauli_rotation_mpo(0.2, ["X", "Z"])
+    source_types = tuple(type(tensor.data) for tensor in mpo.tensors)
+
+    with pytest.warns(UserWarning, match="sub-MPO payload"):
+        sim.apply([("submpo", mpo, (0, 1))])
+
+    assert tuple(type(tensor.data) for tensor in mpo.tensors) == source_types
+    assert "torch" in type(sim.p[0].data).__module__
+
+
 def test_torch_backend_injection_and_sampling():
     tb = _torch_backend()
     # injection on the torch backend reproduces T

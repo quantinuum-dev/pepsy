@@ -151,9 +151,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     - Symmray PEPS inputs must be Torch-backed. Their sweep cleanup defaults
       to NLopt ``LD_LBFGS`` while obtaining gradients from Torch autograd;
       provide both the PEPS and gates with the same Torch Symmray backend.
-    - ``non_unitary=True`` normalizes generated targets and candidates; it does
-      not implement the interval scheduling or norm-proxy machinery available
-      in :class:`pepsy.optimizers.mps.MpsOptimizer`.
+    - Generated targets are normalized by default before infidelity estimates
+      and variational cleanup. Pass ``normalize_target=False`` only when that
+      normalization is handled externally; ``non_unitary=True`` remains a
+      compatibility shorthand when ``normalize_target=None`` is supplied.
+      This does not implement the interval scheduling or norm-proxy machinery
+      available in :class:`pepsy.optimizers.mps.MpsOptimizer`.
     - Step records and fidelity traces are per measured two-site update.
       One-site gates applied outside a two-site batch are not recorded as
       separate steps. For PEPS lattice gates, prefer coordinate-tuple sites
@@ -239,6 +242,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     sweep_optimize_kwargs : mapping, optional
         Per-run sweep controls. PEPS defaults use ``n_round_trips=4`` and
         ``renormalize=False``; pass explicit values here to override them.
+    sweep_progress : bool | None, default=None
+        Show the internal directional sweep progress bar independently of
+        the outer PEPS bar. ``None`` follows the outer ``progress`` setting;
+        ``False`` hides it and ``True`` enables it.
     global_kwargs : mapping, optional
         Constructor options forwarded to :class:`GlobalOptimizer`.
     global_optimize_kwargs : mapping, optional
@@ -287,6 +294,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         optimizer_options: Mapping[str, Any] | None = None,
         sweep_kwargs: Mapping[str, Any] | None = None,
         sweep_optimize_kwargs: Mapping[str, Any] | None = None,
+        sweep_progress: bool | None = None,
         global_kwargs: Mapping[str, Any] | None = None,
         global_optimize_kwargs: Mapping[str, Any] | None = None,
         global_fallback_kwargs: Mapping[str, Any] | None = None,
@@ -341,6 +349,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.optimizer_options = dict(optimizer_options or {})
         self.sweep_kwargs = dict(sweep_kwargs or {})
         self.sweep_optimize_kwargs = dict(sweep_optimize_kwargs or {})
+        self.sweep_progress = None if sweep_progress is None else bool(sweep_progress)
         self.global_kwargs = dict(global_kwargs or {})
         self.global_optimize_kwargs = dict(global_optimize_kwargs or {})
         self.global_fallback_kwargs = _merge_opts(
@@ -885,20 +894,24 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         _prefer_boundary_engine_mps(opts, self.boundary_engine, state, target)
         return self._clean_infidelity(boundary_infidelity(state, target, **opts))
 
-    def _sweep_boundary_kwargs(self, *, progress):
+    def _sweep_boundary_kwargs(self, *, progress, sweep_progress=None):
         opts = _merge_opts(self.boundary_kwargs)
         strip_exponent = opts.pop("strip_exponent", None)
         opts.setdefault("chi", self.boundary_chi)
         opts.setdefault("contraction_opt", self.contraction_opt)
         opts.setdefault("progress", False)
+        inner_progress = bool(progress) if sweep_progress is None else bool(sweep_progress)
         # SweepOptimizer.run uses env_n_iter for boundary moves during sweeps.
-        # The inner sweep keeps its own progress bar silent so only the outer
-        # PEPS bar is shown, matching the MpsOptimizer visualization.
+        # Keep boundary-contraction progress silent, but let its one
+        # slice-level bar show the directional sweep when the outer PEPS
+        # progress bar is enabled. ``sweep_progress`` can explicitly override
+        # that coupling. The gradient solver remains silent unless the caller
+        # explicitly puts ``progress=True`` in optimizer_options.
         opt_kwargs = {
             "env_n_iter": opts.get("n_iter", _DEFAULT_BOUNDARY_KWARGS["n_iter"]),
             "track_boundary_fidelity": opts.get("track_boundary_fidelity", False),
-            "progress": False,
-            "progress_position": 0,
+            "progress": inner_progress,
+            "progress_position": 1 if progress and inner_progress else 0,
             "progress_leave": False,
         }
         return opts, opt_kwargs, strip_exponent
@@ -1032,6 +1045,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         target,
         *,
         progress,
+        sweep_progress=None,
         normalize_chi=None,
         sweep_kwargs=None,
         sweep_optimize_kwargs=None,
@@ -1039,6 +1053,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_opt = self._copy_and_mangle_target(target)
         boundary_init_kwargs, boundary_opt_kwargs, strip_exponent = self._sweep_boundary_kwargs(
             progress=progress,
+            sweep_progress=sweep_progress,
         )
         init_kwargs = {
             "chi": self.boundary_chi,
@@ -1052,6 +1067,13 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             init_kwargs["boundary_options"] = dict(self.boundary_options)
         init_kwargs.update(self.sweep_kwargs)
         init_kwargs.update(dict(sweep_kwargs or {}))
+        # ``full_simplify`` is not backend-safe for Symmray block trees. Make
+        # the supported default explicit here so SweepOptimizer does not need
+        # to correct it (and warn) during construction. An explicit
+        # ``simplify=True`` in sweep_kwargs remains visible and is corrected by
+        # SweepOptimizer with its actionable compatibility warning.
+        if uses_symmray_arrays(state, target_opt) and "simplify" not in init_kwargs:
+            init_kwargs["simplify"] = False
         boundary_engine = normalize_boundary_engine(
             init_kwargs.get("boundary_engine", "auto"),
             state,
@@ -1090,6 +1112,12 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             sweep_optimize_kwargs,
         )
         opt_kwargs = self._apply_sweep_optimizer_options(opt_kwargs)
+        if sweep_progress is not None:
+            # A top-level explicit setting wins over legacy nested
+            # ``sweep_optimize_kwargs={"progress": ...}`` values.
+            opt_kwargs["progress"] = bool(sweep_progress)
+            opt_kwargs["progress_position"] = 1 if progress and sweep_progress else 0
+            opt_kwargs["progress_leave"] = False
         opt_kwargs.setdefault("progress", bool(progress))
         if opt_kwargs:
             sweeper.set_optimize_kwargs(**opt_kwargs)
@@ -1232,12 +1260,45 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             ("step_loss_trace", "step_loss_count"),
             ("step_trace", "step_count"),
             ("inner_loss_traces", "inner_loss_trace_count"),
+            ("inner_best_loss_traces", "inner_best_loss_trace_count"),
             ("norm_trace", "norm_count"),
             ("fidels", "fidelity_count"),
         ):
             values = result.get(source_key)
             if values is not None:
                 summary[target_key] = len(values)
+
+        best_traces = result.get("inner_best_loss_traces")
+        if best_traces:
+            best_values = [
+                float(value)
+                for trace in best_traces
+                for value in (trace or ())
+                if value is not None and math.isfinite(float(value)) and float(value) >= 0.0
+            ]
+            if best_values:
+                summary["min_inner_infidelity"] = min(best_values)
+            finite_traces = [
+                [float(value) for value in trace]
+                for trace in best_traces
+                if trace and all(
+                    value is not None and math.isfinite(float(value))
+                    for value in trace
+                )
+            ]
+            summary["inner_best_monotonic"] = all(
+                all(right <= left + 1.0e-14 for left, right in zip(trace, trace[1:]))
+                for trace in finite_traces
+            )
+
+        runs = result.get("runs") or ()
+        summary["invalid_inner_loss_count"] = sum(
+            bool(run.get("invalid_loss")) for run in runs
+        )
+        if result.get("best_loss") is not None and result.get("loss_after") is not None:
+            summary["best_after_abs_error"] = abs(
+                float(result["best_loss"]) - float(result["loss_after"])
+            )
 
         for key in ("converged", "early_exit"):
             if key in result and result[key] is not None:
@@ -1276,6 +1337,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         mode,
         progress,
+        sweep_progress,
         cutoff,
         normalize_chi,
         sweep_kwargs,
@@ -1293,6 +1355,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 state,
                 target,
                 progress=progress,
+                sweep_progress=sweep_progress,
                 normalize_chi=normalize_chi,
                 sweep_kwargs=sweep_kwargs,
                 sweep_optimize_kwargs=sweep_optimize_kwargs,
@@ -1329,14 +1392,65 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         self,
         *,
         two_site_count=None,
+        step=None,
+        total_steps=None,
+        status=None,
+        input_infidelity=None,
     ):
-        """Return a compact tqdm postfix that mirrors :class:`MpsOptimizer`."""
+        """Return compact gate and local-optimization progress diagnostics."""
         postfix = {
             "2q": self._fidelity_count if two_site_count is None else int(two_site_count),
             "bnd": self._max_bond(self.state),
         }
+        if step is not None:
+            total = "?" if total_steps is None else int(total_steps)
+            postfix["step"] = f"{int(step)}/{total}"
+        if status is not None:
+            postfix["status"] = str(status)
         if self._fidelity_count:
-            postfix["Icum"] = self._format_progress_infidelity(self.infidelities[-1])
+            postfix["infidelity"] = self._format_progress_infidelity(
+                self.infidelities[-1]
+            )
+
+        if self.step_records:
+            record = self.step_records[-1]
+            if input_infidelity is None:
+                input_infidelity = record.get("pre_infidelity")
+            optimizer_result = record.get("optimizer_result")
+        else:
+            optimizer_result = None
+        if input_infidelity is not None:
+            postfix["input"] = self._format_progress_infidelity(input_infidelity)
+
+        if isinstance(optimizer_result, Mapping):
+            sweep_in = optimizer_result.get("loss_before")
+            sweep_out = optimizer_result.get("loss_after")
+            if sweep_in is not None and sweep_out is not None:
+                postfix["sweep"] = (
+                    f"{self._format_progress_infidelity(sweep_in)}"
+                    f"->{self._format_progress_infidelity(sweep_out)}"
+                )
+            sweep_best = optimizer_result.get("best_loss")
+            if sweep_best is not None:
+                postfix["slice_best"] = self._format_progress_infidelity(sweep_best)
+            n_runs = optimizer_result.get("n_runs")
+            if n_runs is not None:
+                postfix["slices"] = int(n_runs)
+
+        if self.step_records:
+            record = self.step_records[-1]
+            local_infidelity = record.get("final_infidelity")
+            if local_infidelity is not None:
+                postfix["local_infidelity"] = self._format_progress_infidelity(
+                    local_infidelity
+                )
+            pre_infidelity = record.get("pre_infidelity")
+            if pre_infidelity is not None and local_infidelity is not None:
+                # Positive gain means the variational cleanup reduced the
+                # local infidelity. A rejected or unchanged candidate shows 0.
+                postfix["opt_gain"] = self._format_progress_infidelity(
+                    float(pre_infidelity) - float(local_infidelity)
+                )
         return postfix
 
     def run(  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
@@ -1349,7 +1463,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff_mode="rsum2",
         k_2q_batch=1,
         non_unitary=False,
-        normalize_target=None,
+        normalize_target=True,
         normalize_initial=None,
         normalize_chi=None,
         evaluation_chi=None,
@@ -1365,6 +1479,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         infidelity_kwargs: Mapping[str, Any] | None = None,
         sweep_kwargs: Mapping[str, Any] | None = None,
         sweep_optimize_kwargs: Mapping[str, Any] | None = None,
+        sweep_progress: bool | None = None,
         global_kwargs: Mapping[str, Any] | None = None,
         global_optimize_kwargs: Mapping[str, Any] | None = None,
         reset_traces=True,
@@ -1395,9 +1510,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         non_unitary : bool, default=False
             If ``True``, target states produced by gates are explicitly
             normalized before fidelity estimates and optimization.
-        normalize_target : bool | None, default=None
-            Override whether target states are normalized. The default follows
-            ``non_unitary``.
+        normalize_target : bool | None, default=True
+            Normalize generated target states before compression and
+            infidelity measurement. Pass ``False`` only when target
+            normalization is managed externally. Passing ``None`` retains the
+            legacy behavior of following ``non_unitary``.
         normalize_initial : bool | None, optional
             Override the constructor's one-time initial normalization setting.
         normalize_chi : int | None, optional
@@ -1435,6 +1552,10 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             Per-run overrides merged after the constructor-level settings.
         sweep_kwargs, sweep_optimize_kwargs : mapping, optional
             Per-run sweep backend and optimizer overrides.
+        sweep_progress : bool | None, optional
+            Override the constructor-level internal directional sweep-bar
+            setting for this run. ``None`` follows the constructor setting,
+            then the outer ``progress`` value.
         global_kwargs, global_optimize_kwargs : mapping, optional
             Per-run global backend and optimizer overrides.
         reset_traces : bool, default=True
@@ -1447,6 +1568,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             self.set_mode(mode)
         run_mode = self.mode
         show_progress = bool(progbar if progress is None else progress)
+        effective_sweep_progress = (
+            self.sweep_progress
+            if sweep_progress is None
+            else bool(sweep_progress)
+        )
         normalize_target = bool(non_unitary) if normalize_target is None else bool(normalize_target)
         accept_if_improved = (
             self.accept_if_improved
@@ -1466,14 +1592,17 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         pbar = None
         if show_progress:
-            from tqdm import tqdm  # pylint: disable=import-outside-toplevel
+            from tqdm.auto import tqdm  # pylint: disable=import-outside-toplevel
 
             pbar = tqdm(
                 total=len(self.gates),
-                desc=f"peps-{run_mode}",
+                desc=f"PEPS {run_mode}",
+                unit="gate",
                 leave=True,
                 position=0,
                 ascii=True,
+                dynamic_ncols=True,
+                mininterval=0.2,
                 colour=self._PROGBAR_COLORS[run_mode],
             )
 
@@ -1603,6 +1732,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                         reason = "warmstart"
                     else:
                         optimizer_attempted = True
+                        if pbar is not None:
+                            pbar.set_postfix(self._progress_postfix(
+                                two_site_count=two_site_count,
+                                step=record_step,
+                                total_steps=len(self.gates),
+                                status="optimizing",
+                                input_infidelity=pre_infidelity,
+                            ))
                         warmstart_snapshot = None
                         if accept_if_improved and pre_infidelity is not None:
                             warmstart_snapshot = (
@@ -1615,6 +1752,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                             target,
                             mode=run_mode,
                             progress=show_progress,
+                            sweep_progress=effective_sweep_progress,
                             cutoff=cutoff,
                             normalize_chi=normalize_chi,
                             sweep_kwargs=sweep_kwargs,
@@ -1710,6 +1848,9 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             if pbar is not None:
                 pbar.set_postfix(self._progress_postfix(
                     two_site_count=two_site_count,
+                    step=record_step,
+                    total_steps=len(self.gates),
+                    status=reason,
                 ))
                 pbar.update(advanced)
 

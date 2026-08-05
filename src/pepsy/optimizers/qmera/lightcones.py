@@ -1,4 +1,4 @@
-"""Reverse-lightcone selection and local expectation kernels for MERA states."""
+"""Reverse-lightcone selection and local qMERA expectation kernels."""
 
 from __future__ import annotations
 
@@ -13,15 +13,18 @@ from .gates import default_gate_registry, resolve_gate_spec
 from .terms import LocalTerm, convert_local_terms, normalize_local_terms
 
 __all__ = [
-    "LightconeChunk",
+    "QMeraLightconeGroup",
     "QMeraLightconeTN",
     "QMeraParametricLightconeChunk",
-    "build_lightcone_chunks",
     "build_qmera_lightcone_chunks",
     "build_qmera_parametric_lightcone_chunks",
+    "group_qmera_parametric_lightcone_chunks",
     "contract_qmera_lightcone_tn",
+    "contract_qmera_lightcone_group",
+    "qmera_direct_parametric_energy",
+    "qmera_parametric_state",
+    "qmera_parametric_lightcone_group_state",
     "local_qmera_parametric_lightcone_expectation",
-    "local_lightcone_expectation",
     "qmera_parametric_energy",
     "qmera_parametric_lightcone_state",
     "qmera_parametric_lightcone_tn",
@@ -93,6 +96,26 @@ class QMeraParametricLightconeChunk:
     @property
     def num_gates(self):
         """Number of parametrized gates rebuilt for this local cone."""
+        return len(self.schedule_placement_ids)
+
+
+@dataclass(frozen=True)
+class QMeraLightconeGroup:
+    """Local terms sharing one qMERA reverse-lightcone topology."""
+
+    key: tuple
+    chunks: tuple[QMeraParametricLightconeChunk, ...]
+    input_sites: tuple[int, ...]
+    schedule_placement_ids: tuple[str, ...]
+
+    @property
+    def num_terms(self):
+        """Number of local Hamiltonian terms in this group."""
+        return len(self.chunks)
+
+    @property
+    def num_gates(self):
+        """Number of gates in the shared local cone."""
         return len(self.schedule_placement_ids)
 
 
@@ -266,7 +289,7 @@ def build_qmera_lightcone_chunks(state, schedule, terms, *, validate=True):
     """Precompute lightcone chunks from an explicit qMERA schedule.
 
     Unlike :func:`build_lightcone_chunks`, this follows
-    :class:`~pepsy.optimizers.mera.QMeraSchedule` placements first and only then
+    :class:`~pepsy.optimizers.qmera.QMeraSchedule` placements first and only then
     turns the selected sites/gates into tensor-network tags. This keeps local
     energy chunks tied to the designed RG blocks rather than to a generic tag
     query on an already-built network.
@@ -300,6 +323,23 @@ def build_qmera_parametric_lightcone_chunks(schedule, terms):
     )
 
 
+def group_qmera_parametric_lightcone_chunks(chunks):
+    """Group qMERA chunks that share input support and gate topology."""
+    groups = {}
+    for chunk in tuple(chunks):
+        key = (tuple(chunk.input_sites), tuple(chunk.schedule_placement_ids))
+        groups.setdefault(key, []).append(chunk)
+    return tuple(
+        QMeraLightconeGroup(
+            key=key,
+            chunks=tuple(group_chunks),
+            input_sites=key[0],
+            schedule_placement_ids=key[1],
+        )
+        for key, group_chunks in groups.items()
+    )
+
+
 def _maybe_real(value):
     try:
         return ar.do("real", value)
@@ -320,6 +360,27 @@ def _contract(tn, *, optimize, contract_opts):
 
 def _site_ind(site):
     return f"k{site}"
+
+
+def _apply_local_gate(state, operator, where, *, contract, inplace):
+    """Apply a local operator through the state's native TN gate API."""
+    gate = getattr(state, "gate", None)
+    if callable(gate):
+        return gate(
+            operator,
+            where,
+            contract=contract,
+            inplace=inplace,
+        )
+    gate_inds = getattr(state, "gate_inds", None)
+    if callable(gate_inds):
+        return gate_inds(
+            operator,
+            inds=_site_inds_for_where(state, where),
+            contract=contract,
+            inplace=inplace,
+        )
+    raise TypeError("state must provide gate() or gate_inds().")
 
 
 def _product_state_on_sites(sites, *, physical_dim=2, array_backend=None):
@@ -363,6 +424,15 @@ def _placements_by_id(schedule):
     return by_id if isinstance(by_id, dict) else dict(by_id)
 
 
+def _resolve_contraction_opt(optimize, path_cache, *, key):
+    if path_cache is None:
+        return optimize
+    resolver = getattr(path_cache, "resolve", None)
+    if not callable(resolver):
+        raise TypeError("path_cache must provide resolve(optimize, key=...).")
+    return resolver(optimize, key=key)
+
+
 def _gate_for_placement(
     placement,
     parameters,
@@ -390,6 +460,46 @@ def _gate_for_placement(
         schedule=schedule,
         array_backend=array_backend,
     )
+
+
+def qmera_parametric_state(
+    schedule,
+    parameters,
+    *,
+    gate_registry=None,
+    array_backend=None,
+    gate_array_backend=None,
+    physical_dim=2,
+    contract=False,
+    product_state_factory=None,
+):
+    """Build the complete direct-gate qMERA state from a parameter map."""
+    gate_registry = default_gate_registry() if gate_registry is None else gate_registry
+    array_backend = _resolve_array_backend(array_backend)
+    placements = tuple(schedule.placements)
+    state = _product_state_for_schedule(
+        schedule,
+        schedule.geometry.register_sites,
+        physical_dim=physical_dim,
+        array_backend=array_backend,
+        product_state_factory=product_state_factory,
+    )
+    for placement in placements:
+        gate = _gate_for_placement(
+            placement,
+            parameters,
+            gate_registry=gate_registry,
+            array_backend=gate_array_backend,
+            schedule=schedule,
+        )
+        state = state.gate_inds(
+            gate,
+            inds=tuple(_site_ind(site) for site in placement.where),
+            contract=contract,
+            tags=placement.tags,
+            inplace=False,
+        )
+    return state
 
 
 def qmera_parametric_lightcone_state(
@@ -432,6 +542,39 @@ def qmera_parametric_lightcone_state(
             inplace=False,
         )
     return state
+
+
+def qmera_parametric_lightcone_group_state(
+    schedule,
+    group: QMeraLightconeGroup,
+    parameters,
+    *,
+    gate_registry=None,
+    array_backend=None,
+    gate_array_backend=None,
+    physical_dim=2,
+    contract=False,
+    product_state_factory=None,
+):
+    """Build one shared ket for all terms in a lightcone group."""
+    representative = QMeraParametricLightconeChunk(
+        term=group.chunks[0].term,
+        tags=group.chunks[0].tags,
+        input_sites=group.input_sites,
+        schedule_placement_ids=group.schedule_placement_ids,
+        schedule_width_by_scale=group.chunks[0].schedule_width_by_scale,
+    )
+    return qmera_parametric_lightcone_state(
+        schedule,
+        representative,
+        parameters,
+        gate_registry=gate_registry,
+        array_backend=array_backend,
+        gate_array_backend=gate_array_backend,
+        physical_dim=physical_dim,
+        contract=contract,
+        product_state_factory=product_state_factory,
+    )
 
 
 def qmera_parametric_lightcone_tn(
@@ -483,8 +626,14 @@ def contract_qmera_lightcone_tn(
     normalized=True,
     real=True,
     contract_opts=None,
+    path_cache=None,
 ):
     """Contract an explicit qMERA local-cone TN with a cotengra optimizer."""
+    optimize = _resolve_contraction_opt(
+        optimize,
+        path_cache,
+        key=(lightcone.chunk.input_sites, lightcone.chunk.schedule_placement_ids),
+    )
     value = _contract(
         lightcone.numerator,
         optimize=optimize,
@@ -508,6 +657,40 @@ def contract_qmera_lightcone_tn(
     return value
 
 
+def contract_qmera_lightcone_group(
+    group: QMeraLightconeGroup,
+    ket,
+    *,
+    optimize="auto-hq",
+    normalized=True,
+    real=True,
+    contract_opts=None,
+    path_cache=None,
+    gate_contract=True,
+):
+    """Contract all terms in ``group`` while reusing its ket and norm."""
+    optimize = _resolve_contraction_opt(optimize, path_cache, key=group.key)
+    denominator = None
+    if normalized:
+        denominator = _contract(ket.H & ket, optimize=optimize, contract_opts=contract_opts)
+    values = []
+    for chunk in group.chunks:
+        ket_g = ket.gate_inds(
+            chunk.term.operator,
+            inds=tuple(_site_ind(site) for site in chunk.term.where),
+            contract=gate_contract,
+            inplace=False,
+        )
+        value = _contract(ket.H & ket_g, optimize=optimize, contract_opts=contract_opts)
+        if normalized:
+            value = value / denominator
+        if chunk.term.weight != 1.0:
+            value = value * chunk.term.weight
+        values.append(value)
+    value = sum(values[1:], values[0]) if values else 0.0
+    return _maybe_real(value) if real else value
+
+
 def local_qmera_parametric_lightcone_expectation(
     schedule,
     chunk: QMeraParametricLightconeChunk,
@@ -524,6 +707,7 @@ def local_qmera_parametric_lightcone_expectation(
     gate_contract=True,
     contract_opts=None,
     product_state_factory=None,
+    path_cache=None,
 ):
     """Contract one qMERA local term by rebuilding only its scheduled cone."""
     lightcone = qmera_parametric_lightcone_tn(
@@ -544,6 +728,7 @@ def local_qmera_parametric_lightcone_expectation(
         normalized=normalized,
         real=real,
         contract_opts=contract_opts,
+        path_cache=path_cache,
     )
 
 
@@ -566,6 +751,8 @@ def qmera_parametric_energy(
     gate_contract=True,
     contract_opts=None,
     product_state_factory=None,
+    group_terms=True,
+    path_cache=None,
 ):
     """Evaluate a qMERA energy by rebuilding each scheduled lightcone only."""
     array_backend = _resolve_array_backend(array_backend)
@@ -577,24 +764,148 @@ def qmera_parametric_energy(
             terms = convert_local_terms(terms, array_backend)
         chunks = build_qmera_parametric_lightcone_chunks(schedule, terms)
     value = None
-    for chunk in chunks:
-        term_value = local_qmera_parametric_lightcone_expectation(
-            schedule,
-            chunk,
-            parameters,
-            gate_registry=gate_registry,
-            array_backend=array_backend,
-            gate_array_backend=gate_array_backend,
-            physical_dim=physical_dim,
-            optimize=optimize,
-            normalized=normalized,
-            real=False,
-            simplify=simplify,
-            gate_contract=gate_contract,
-            contract_opts=contract_opts,
-            product_state_factory=product_state_factory,
+    # ``simplify`` is implemented by the per-chunk TN builder. Fall back to
+    # that path when requested so grouping never changes this public option.
+    if group_terms and simplify:
+        group_terms = False
+    if group_terms:
+        for group in group_qmera_parametric_lightcone_chunks(chunks):
+            ket = qmera_parametric_lightcone_group_state(
+                schedule,
+                group,
+                parameters,
+                gate_registry=gate_registry,
+                array_backend=array_backend,
+                gate_array_backend=gate_array_backend,
+                physical_dim=physical_dim,
+                product_state_factory=product_state_factory,
+            )
+            group_value = contract_qmera_lightcone_group(
+                group,
+                ket,
+                optimize=optimize,
+                normalized=normalized,
+                real=False,
+                contract_opts=contract_opts,
+                path_cache=path_cache,
+                gate_contract=gate_contract,
+            )
+            value = group_value if value is None else value + group_value
+    else:
+        for chunk in chunks:
+            term_value = local_qmera_parametric_lightcone_expectation(
+                schedule,
+                chunk,
+                parameters,
+                gate_registry=gate_registry,
+                array_backend=array_backend,
+                gate_array_backend=gate_array_backend,
+                physical_dim=physical_dim,
+                optimize=optimize,
+                normalized=normalized,
+                real=False,
+                simplify=simplify,
+                gate_contract=gate_contract,
+                contract_opts=contract_opts,
+                product_state_factory=product_state_factory,
+                path_cache=path_cache,
+            )
+            value = term_value if value is None else value + term_value
+    if value is None:
+        raise ValueError("hamiltonian contains no local terms.")
+    if energy_per_site:
+        value = value / schedule.geometry.num_sites
+    if real:
+        value = _maybe_real(value)
+    return value
+
+
+def qmera_direct_parametric_energy(
+    schedule,
+    parameters,
+    hamiltonian=None,
+    *,
+    chunks=None,
+    gate_registry=None,
+    array_backend=None,
+    gate_array_backend=None,
+    convert_terms=True,
+    physical_dim=2,
+    optimize="auto-hq",
+    normalized=True,
+    energy_per_site=True,
+    real=True,
+    contract_opts=None,
+    group_terms=True,
+    path_cache=None,
+    product_state_factory=None,
+):
+    """Evaluate qMERA energy from the complete direct-gate tensor network.
+
+    This is intentionally a validation/debugging oracle for the
+    schedule-first local-cone path, not the primary optimization route.
+    """
+    array_backend = _resolve_array_backend(array_backend)
+    if chunks is None:
+        if hamiltonian is None:
+            raise ValueError("qmera_direct_parametric_energy requires hamiltonian or chunks.")
+        terms = normalize_local_terms(hamiltonian)
+        if convert_terms:
+            terms = convert_local_terms(terms, array_backend)
+        chunks = build_qmera_parametric_lightcone_chunks(schedule, terms)
+    state = qmera_parametric_state(
+        schedule,
+        parameters,
+        gate_registry=gate_registry,
+        array_backend=array_backend,
+        gate_array_backend=gate_array_backend,
+        physical_dim=physical_dim,
+        product_state_factory=product_state_factory,
+    )
+    groups = group_qmera_parametric_lightcone_chunks(chunks) if group_terms else (
+        QMeraLightconeGroup(
+            key=(chunk.input_sites, chunk.schedule_placement_ids),
+            chunks=(chunk,),
+            input_sites=chunk.input_sites,
+            schedule_placement_ids=chunk.schedule_placement_ids,
         )
-        value = term_value if value is None else value + term_value
+        for chunk in chunks
+    )
+    value = None
+    for group in groups:
+        # Direct-state validation uses the full state, while the grouping still
+        # shares the norm/path topology for terms with the same local support.
+        denominator = None
+        group_optimize = _resolve_contraction_opt(
+            optimize,
+            path_cache,
+            key=group.key,
+        )
+        if normalized:
+            denominator = _contract(
+                state.H & state,
+                optimize=group_optimize,
+                contract_opts=contract_opts,
+            )
+        group_value = 0.0
+        for chunk in group.chunks:
+            state_g = state.gate_inds(
+                chunk.term.operator,
+                inds=tuple(_site_ind(site) for site in chunk.term.where),
+                contract=True,
+                inplace=False,
+            )
+            term_value = _contract(
+                state.H & state_g,
+                optimize=group_optimize,
+                contract_opts=contract_opts,
+            )
+            if normalized:
+                term_value = term_value / denominator
+            if chunk.term.weight != 1.0:
+                term_value = term_value * chunk.term.weight
+            group_value = group_value + term_value
+        value = group_value if value is None else value + group_value
     if value is None:
         raise ValueError("hamiltonian contains no local terms.")
     if energy_per_site:
@@ -614,11 +925,18 @@ def local_lightcone_expectation(
     simplify=False,
     gate_contract=True,
     contract_opts=None,
+    path_cache=None,
 ):
     """Contract one local expectation value over a MERA reverse lightcone."""
     term = chunk.term
     ket = select_lightcone(state, tags=chunk.tags, validate=False)
-    ket_g = ket.gate(
+    optimize = _resolve_contraction_opt(
+        optimize,
+        path_cache,
+        key=(tuple(chunk.tags), tuple(chunk.physical_outer_inds)),
+    )
+    ket_g = _apply_local_gate(
+        ket,
         term.operator,
         term.where,
         contract=gate_contract,
@@ -638,6 +956,141 @@ def local_lightcone_expectation(
     if term.weight != 1.0:
         value = value * term.weight
 
+    if real:
+        value = _maybe_real(value)
+    return value
+
+
+def _lightcone_state_and_schedule(state, schedule):
+    """Unwrap an ansatz payload while retaining an optional qMERA schedule."""
+    if schedule is None:
+        schedule = getattr(state, "schedule", None)
+    candidate = getattr(state, "state", state)
+    if hasattr(candidate, "select") and (
+        hasattr(candidate, "gate") or hasattr(candidate, "gate_inds")
+    ):
+        return candidate, schedule
+    raise TypeError(
+        "state must be a qMERA TensorNetwork with select() and gate(), "
+        "or an ansatz object exposing .state."
+    )
+
+
+def _lightcone_num_sites(state, schedule=None):
+    """Infer the physical-site count used for an energy-per-site result."""
+    if schedule is not None:
+        geometry = getattr(schedule, "geometry", None)
+        num_sites = getattr(geometry, "num_sites", None)
+        if num_sites is not None:
+            return int(num_sites() if callable(num_sites) else num_sites)
+    for name in ("num_sites", "sites", "L"):
+        value = getattr(state, name, None)
+        if value is None:
+            continue
+        return int(len(tuple(value)) if name == "sites" else value() if callable(value) else value)
+    raise ValueError("Could not infer the number of MERA physical sites.")
+
+
+def lightcone_energy(
+    state,
+    hamiltonian=None,
+    *,
+    chunks=None,
+    schedule=None,
+    array_backend=None,
+    convert_terms=True,
+    optimize="auto-hq",
+    normalized=True,
+    energy_per_site=True,
+    real=True,
+    simplify=False,
+    gate_contract=True,
+    contract_opts=None,
+    group_terms=True,
+    path_cache=None,
+):
+    """Evaluate a local energy by contracting only reverse-lightcone TNs.
+
+    This is the generic, fixed-state counterpart to
+    :func:`qmera_parametric_energy`. Each term selects its local cone, applies
+    the operator with ``TensorNetwork.gate`` (or the native indexed equivalent
+    for graded networks), and contracts the numerator and norm with a reusable
+    topology-specific optimizer when ``path_cache`` is supplied. ``schedule``
+    may be supplied for a qMERA state so the selector follows schedule-derived
+    reverse-lightcone tags.
+
+    Native Symmray operators and tensors are passed through unchanged when
+    ``convert_terms=False``. Consequently the graded contraction and
+    fermionic signs remain owned by Symmray; this function does not introduce
+    Jordan--Wigner strings or dense sign corrections.
+    """
+    state, schedule = _lightcone_state_and_schedule(state, schedule)
+    if chunks is None:
+        if hamiltonian is None:
+            raise ValueError("lightcone_energy requires hamiltonian or chunks.")
+        terms = normalize_local_terms(hamiltonian)
+        if convert_terms:
+            terms = convert_local_terms(terms, array_backend)
+        if schedule is None:
+            chunks = build_lightcone_chunks(state, terms)
+        else:
+            chunks = build_qmera_lightcone_chunks(state, schedule, terms)
+    else:
+        chunks = tuple(chunks)
+        if not chunks:
+            raise ValueError("lightcone chunks cannot be empty.")
+
+    value = None
+    if group_terms:
+        groups = {}
+        for chunk in chunks:
+            key = (tuple(chunk.tags), tuple(chunk.physical_outer_inds))
+            groups.setdefault(key, []).append(chunk)
+        grouped_chunks = tuple(groups.items())
+    else:
+        grouped_chunks = tuple(
+            (((tuple(chunk.tags), tuple(chunk.physical_outer_inds))), [chunk])
+            for chunk in chunks
+        )
+
+    for key, group in grouped_chunks:
+        ket = select_lightcone(state, tags=group[0].tags, validate=False)
+        group_optimize = _resolve_contraction_opt(
+            optimize,
+            path_cache,
+            key=("lightcone", key),
+        )
+        denominator = None
+        if normalized:
+            denominator = _contract(
+                _maybe_simplify(ket.H & ket, simplify),
+                optimize=group_optimize,
+                contract_opts=contract_opts,
+            )
+        for chunk in group:
+            term = chunk.term
+            ket_g = _apply_local_gate(
+                ket,
+                term.operator,
+                term.where,
+                contract=gate_contract,
+                inplace=False,
+            )
+            term_value = _contract(
+                _maybe_simplify(ket.H & ket_g, simplify),
+                optimize=group_optimize,
+                contract_opts=contract_opts,
+            )
+            if normalized:
+                term_value = term_value / denominator
+            if term.weight != 1.0:
+                term_value = term_value * term.weight
+            value = term_value if value is None else value + term_value
+
+    if value is None:
+        raise ValueError("hamiltonian contains no local terms.")
+    if energy_per_site:
+        value = value / _lightcone_num_sites(state, schedule)
     if real:
         value = _maybe_real(value)
     return value

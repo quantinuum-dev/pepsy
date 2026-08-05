@@ -15,11 +15,18 @@ Layout of a tree state
 ----------------------
 * every node of the plan (leaf **and** internal) is one tensor, tagged with the
   structural node tag ``node_tag_id.format(nid)`` (default ``"N{}"``);
-* leaf tensors additionally carry the ``quimb`` site tag
+* physical-site tensors carry the ``quimb`` site tag
   ``site_tag_id.format(q)`` (default ``"I{}"``) and the physical index
-  ``site_ind_id.format(q)`` (default ``"k{}"``) for qubit ``q`` -- so Quimb
-  treats the leaves as the sites and the internal nodes as ancillary bond
-  carriers. This class supplies the tree-specific ``local_expectation`` path;
+  ``site_ind_id.format(q)`` (default ``"k{}"``) for qubit ``q``; these are
+  structural leaves by default;
+* the default auto-built plan uses ``top_arity=3`` for the conventional binary
+  TTN with three virtual bonds entering the top tensor. Other internal nodes
+  then have two child bonds plus one parent bond, so every tensor remains rank
+  three; explicit plans can use another root arity;
+* a plan may designate one additional ``root_qubit`` carried by the top tensor.
+  A binary root then has exactly two child bonds plus this physical leg. Other
+  internal nodes remain ancillary bond carriers. This class supplies the
+  tree-specific ``local_expectation`` path for both leaf and root sites;
 * adjacent nodes ``a`` and ``b`` share the deterministic virtual bond index
   ``_tb{lo}_{hi}`` with ``lo, hi = sorted((a, b))``.
 
@@ -32,16 +39,298 @@ MPS.
 from __future__ import annotations
 
 import re
+import time
 
 import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
+from quimb.tensor.decomp import qr_stabilized as _quimb_qr_stabilized
 from quimb.tensor.tensor_core import TensorNetwork
 from numbers import Integral
 
-from .layout import TreePlan
+from ...backends import to_float
+from .layout import TreePlan, _DEFAULT_TOP_ARITY
 
 __all__ = ["TreeTensorNetwork"]
+
+
+def _native_rank_safe_qr(array, backend):
+    """Factor a finite complex64 block with safe backend QR."""
+    if backend == "torch":
+        import torch as xp  # pylint: disable=import-outside-toplevel
+    elif backend == "cupy":
+        import cupy as xp  # pylint: disable=import-outside-toplevel
+    else:  # pragma: no cover - only native GPU backends call this helper
+        raise ValueError(f"unsupported native QR backend {backend!r}")
+
+    rows, cols = array.shape
+    rank_limit = min(rows, cols)
+    r_factor = array.clone()
+    q_factor = xp.eye(rows, dtype=array.dtype)
+
+    for index in range(rank_limit):
+        vector = r_factor[index:, index]
+        magnitude = vector.abs()
+        scale = magnitude.amax()
+        # Construct the reflector from a max-normalized vector. This avoids
+        # the subnormal norm division that makes Torch's complex64 QR fail.
+        valid_scale = xp.isfinite(scale) & (scale > 0)
+        safe_scale = xp.where(valid_scale, scale, xp.ones_like(scale))
+        normalized = vector / safe_scale
+        norm = xp.sqrt(xp.sum(normalized.abs() ** 2))
+        valid_norm = valid_scale & xp.isfinite(norm) & (norm > 0)
+        safe_norm = xp.where(valid_norm, norm, xp.ones_like(norm))
+        first = normalized[0]
+        first_abs = first.abs()
+        safe_first_abs = xp.where(
+            first_abs > 0, first_abs, xp.ones_like(first_abs),
+        )
+        phase = xp.where(
+            first_abs > 0,
+            first / safe_first_abs,
+            xp.ones_like(first),
+        )
+        alpha = -phase * safe_norm
+        reflector = normalized.clone()
+        reflector[0] = reflector[0] - alpha
+        reflector_norm = xp.sum(reflector.conj() * reflector).real
+        valid_reflector = (
+            valid_norm
+            & xp.isfinite(reflector_norm)
+            & (reflector_norm > 0)
+        )
+        safe_reflector_norm = xp.where(
+            valid_reflector, reflector_norm, xp.ones_like(reflector_norm),
+        )
+        beta = xp.where(
+            valid_reflector,
+            2 / safe_reflector_norm,
+            xp.zeros_like(reflector_norm),
+        )
+
+        trailing = r_factor[index:, index:]
+        r_factor[index:, index:] = trailing - reflector[:, None] * (
+            beta * (reflector.conj() @ trailing)
+        )[None, :]
+
+        q_trailing = q_factor[:, index:]
+        q_factor[:, index:] = q_trailing - (q_trailing @ reflector)[:, None] * (
+            beta * reflector.conj()
+        )[None, :]
+
+    return q_factor[:, :rank_limit], r_factor[:rank_limit, :]
+
+
+def _native_factors_finite(factors, backend):
+    """Check native QR factors without converting GPU arrays to NumPy."""
+    if factors is None:
+        return False
+    for factor in factors:
+        if factor is None:
+            continue
+        if backend == "torch":
+            finite = factor.isfinite().all().item()
+        elif backend == "cupy":
+            import cupy as cp  # pylint: disable=import-outside-toplevel
+
+            finite = cp.isfinite(factor).all().item()
+        else:
+            finite = np.isfinite(factor).all()
+        if not bool(finite):
+            return False
+    return True
+
+
+def _native_cast_complex128(array, backend):
+    """Promote one native GPU block without moving it off device."""
+    if backend == "torch":
+        import torch  # pylint: disable=import-outside-toplevel
+
+        return array.to(dtype=torch.complex128)
+    if backend == "cupy":
+        import cupy as cp  # pylint: disable=import-outside-toplevel
+
+        return array.astype(cp.complex128, copy=False)
+    raise ValueError(f"unsupported native GPU backend {backend!r}")
+
+
+def _native_cast_like(array, reference, backend):
+    """Cast one native factor back to the original device and dtype."""
+    if backend == "torch":
+        return array.to(dtype=reference.dtype, device=reference.device)
+    if backend == "cupy":
+        return array.astype(reference.dtype, copy=False)
+    raise ValueError(f"unsupported native GPU backend {backend!r}")
+
+
+def _native_cast_factors(factors, reference, backend):
+    """Cast non-empty QR factors back to the original native dtype."""
+    return tuple(
+        None if factor is None else _native_cast_like(factor, reference, backend)
+        for factor in factors
+    )
+
+
+def _native_qr_block_scaled(array, **kwargs):
+    """QR one native charge block with a reversible scaling fallback.
+
+    Torch's complex64 QR can return NaNs for a rank-deficient block even when
+    its largest entry is moderate, if other entries in the same block are
+    many orders of magnitude smaller. Healthy blocks keep Torch's native QR
+    path unchanged. Only a failed finite block is retried after a reversible
+    power-of-two scaling, with a native rank-safe fallback for structural
+    rank deficiency.
+    """
+    opts = dict(kwargs)
+    opts.pop("method", None)
+    opts.pop("fn", None)
+
+    def native_qr(
+        x, qr_opts, *, rank_safe=False, allow_failure=False,
+    ):
+        """Run one native backend QR block without composed dispatch."""
+        absorb = qr_opts.get("absorb", "right")
+        left_like = absorb in {
+            -1, "left", "Us,VH", "lfactor", "Us",
+        }
+        qr_kwargs = {
+            key: value for key, value in qr_opts.items()
+            if key not in {"absorb", "stabilized"}
+        }
+        if left_like:
+            x = ar.do("transpose", x, (1, 0))
+        try:
+            q, r = ar.do("linalg.qr", x, **qr_kwargs)
+        except Exception:
+            if not allow_failure:
+                raise
+            q, r = None, None
+        if rank_safe and not _native_factors_finite((q, r), backend):
+            # Native GPU QR can still emit NaNs for finite, structurally
+            # rank-deficient blocks after scaling. Use a backend-native
+            # fallback that avoids division by subnormal norms and completes
+            # the orthonormal basis explicitly for zero sectors.
+            q, r = _native_rank_safe_qr(x, backend)
+        if q is None or r is None:
+            return None
+        if left_like:
+            left = ar.do("transpose", r, (1, 0))
+            right = ar.do("transpose", q, (1, 0))
+            if absorb in {-1, "left", "Us,VH"}:
+                return left, None, right
+            return left, None, None
+        if absorb in {"lorthog", "U", 10}:
+            return q, None, None
+        if absorb in {"rfactor", "sVH", 11}:
+            return None, None, r
+        return q, None, r
+
+    try:
+        backend = ar.infer_backend(array)
+    except (AttributeError, TypeError):
+        backend = None
+
+    # ``array_split`` calls this once per native charge block.  For the
+    # Torch path, bypassing quimb's composed linalg wrapper removes a Python
+    # dispatch layer from every block while retaining exactly the same
+    # reduced QR and the same ``stabilized=False`` policy.
+    use_torch_qr = backend == "torch"
+    use_native_gpu_qr = backend == "cupy" or (
+        backend == "torch"
+        and getattr(getattr(array, "device", None), "type", None) == "cuda"
+    )
+    if ar.get_dtype_name(array) != "complex64":
+        if use_torch_qr or use_native_gpu_qr:
+            return native_qr(array, opts)
+        return _quimb_qr_stabilized(array, **opts)
+
+    if use_native_gpu_qr:
+        # Keep the normal requested-dtype GPU QR path unchanged. Only a
+        # genuinely nonfinite result pays for the same-device double retry.
+        direct = native_qr(array, opts, allow_failure=True)
+        if _native_factors_finite(direct, backend):
+            return direct
+
+        high = _native_cast_complex128(array, backend)
+        high_result = native_qr(high, opts, allow_failure=True)
+        if _native_factors_finite(high_result, backend):
+            return _native_cast_factors(high_result, array, backend)
+
+        if backend == "torch":
+            block_max = float(array.detach().abs().amax().item())
+        else:
+            block_max = to_float(ar.do("max", ar.do("abs", array)))
+    elif use_torch_qr:
+        # Preserve Torch's normal QR exactly for healthy blocks. Only the
+        # exceptional nonfinite result pays for a scaled retry and, if needed,
+        # the rank-safe complex64 fallback.
+        direct = native_qr(array, opts)
+        if _native_factors_finite(direct, backend):
+            return direct
+
+        block_max = float(array.detach().abs().amax().item())
+    else:
+        block_max = to_float(ar.do("max", ar.do("abs", array)))
+    if not np.isfinite(block_max) or block_max == 0.0:
+        # Preserve the original failure behaviour for non-finite input, while
+        # allowing genuinely empty structural sectors through unchanged.
+        if use_torch_qr or use_native_gpu_qr:
+            return direct
+        return _quimb_qr_stabilized(array, **opts)
+
+    # Normalize the exceptional finite block before retrying QR. A threshold
+    # based only on ``block_max`` is insufficient: the failing native block
+    # has max magnitude ~9e-3 but also contains entries ~1e-32 and structural
+    # zeros. Use a power of two so the scaling is exactly reversible in the
+    # complex64 representation.
+    _, exponent = np.frexp(block_max)
+    scale = float(np.ldexp(1.0, -int(exponent)))
+    if use_native_gpu_qr:
+        high_scaled = native_qr(high * scale, opts, allow_failure=True)
+        if _native_factors_finite(high_scaled, backend):
+            left, singular_values, right = _native_cast_factors(
+                high_scaled, array, backend,
+            )
+        else:
+            fallback = native_qr(
+                array * scale,
+                opts,
+                rank_safe=True,
+                allow_failure=True,
+            )
+            if not _native_factors_finite(fallback, backend):
+                raise RuntimeError(
+                    "native GPU QR failed in requested and complex128 "
+                    "dtypes, including the rank-safe fallback."
+                )
+            left, singular_values, right = fallback
+    elif use_torch_qr:
+        fallback = native_qr(
+            array * scale,
+            opts,
+            rank_safe=True,
+            allow_failure=True,
+        )
+        if not _native_factors_finite(fallback, backend):
+            raise RuntimeError(
+                "native Torch QR failed in requested dtype and its "
+                "rank-safe fallback."
+            )
+        left, singular_values, right = fallback
+    else:
+        left, singular_values, right = _quimb_qr_stabilized(
+            array * scale, **opts,
+        )
+
+    # ``absorb='left'`` is the LQ orientation: the left factor carries the
+    # scale. All other QR orientations carry it in the right factor.
+    absorb = opts.get("absorb", "right")
+    if absorb in {-1, "left", "Us,VH", "lfactor", "Us"}:
+        if left is not None:
+            left = left / scale
+    elif right is not None:
+        right = right / scale
+    return left, singular_values, right
 
 
 try:  # quimb renamed/removed this generic-vector base across releases.
@@ -108,6 +397,108 @@ def _is_symmray_array(value):
         return hasattr(value, "blocks") and hasattr(value, "indices")
 
 
+def _native_qr_options_for_tensor(tensor):
+    """Return the centralized lossless-QR options for one tensor."""
+    return {"stabilized": False} if _is_symmray_array(tensor.data) else {}
+
+
+def _native_qr_split_tensor(tensor, **kwargs):
+    """Split one tree tensor using the native graded QR policy."""
+    kwargs.update(_native_qr_options_for_tensor(tensor))
+    if _is_symmray_array(tensor.data):
+        kwargs.setdefault("fn", _native_qr_block_scaled)
+    kwargs.setdefault("method", "qr")
+    return tensor.split(**kwargs)
+
+
+def _is_native_mpo(value):
+    """Return whether an MPO visibly contains native Symmray tensors."""
+    marker = getattr(value, "pepsy_tree_native", None)
+    if marker is not None:
+        return bool(marker)
+    tensors = getattr(value, "tensors", None)
+    if tensors is None:
+        return None
+    try:
+        return any(_is_symmray_array(tensor.data) for tensor in tensors)
+    except (AttributeError, TypeError):
+        return None
+
+
+def _tree_plan_signature(plan):
+    """Return the structural identity used by source-aware tree MPOs."""
+    return (
+        int(plan.root),
+        tuple(
+            (int(node), tuple(int(child) for child in children))
+            for node, children in sorted(plan.children.items())
+        ),
+        tuple(
+            (int(node), int(qubit))
+            for node, qubit in sorted(plan.qubit_of_leaf.items())
+        ),
+        None if plan.root_qubit is None else int(plan.root_qubit),
+    )
+
+
+def _contract_two_tensors(left, right, *, shared_ind=None):
+    """Contract two tensors along one ordinary shared index cheaply.
+
+    Tree routing and native reduced compression repeatedly contract adjacent
+    tensors along one virtual edge. Dispatching that ordinary operation
+    directly to the active backend avoids rebuilding a generic Quimb/Cotengra
+    expression while retaining Symmray's graded fermionic ``tensordot``.
+    Unusual hyperedges fall back to Quimb's general contraction path.
+    """
+    if shared_ind is None:
+        shared = tuple(qtn.bonds(left, right))
+        if len(shared) != 1:
+            return qtn.tensor_contract(left, right)
+        shared_ind = shared[0]
+    elif shared_ind not in left.inds or shared_ind not in right.inds:
+        return qtn.tensor_contract(left, right)
+
+    left_rest = tuple(ind for ind in left.inds if ind != shared_ind)
+    right_rest = tuple(ind for ind in right.inds if ind != shared_ind)
+    if set(left_rest) & set(right_rest):
+        return qtn.tensor_contract(left, right)
+
+    axes = ((left.inds.index(shared_ind),), (right.inds.index(shared_ind),))
+    try:
+        if _is_symmray_array(left.data):
+            # A single shared tree bond is the hot native operation.  Fused
+            # Symmray contraction is a good general default, but on Torch CPU
+            # it first builds larger fused block views for a contraction that
+            # is already one-leg local.  Blockwise dispatch keeps the charge
+            # sectors small and avoids that temporary workspace.  CUDA/Torch
+            # and other backends retain the fused path, which usually wins by
+            # reducing the number of small kernel launches.
+            mode = "fused"
+            if getattr(left.data, "backend", None) == "torch":
+                blocks = getattr(left.data, "blocks", None)
+                sample = next(iter(blocks.values()), None) if blocks else None
+                if not bool(getattr(sample, "is_cuda", False)):
+                    mode = "blockwise"
+            data = left.data.tensordot(
+                right.data,
+                axes=axes,
+                mode=mode,
+                preserve_array=True,
+            )
+        else:
+            data = ar.do(
+                "tensordot", left.data, right.data, axes=axes,
+            )
+    except (AttributeError, NotImplementedError, TypeError):
+        return qtn.tensor_contract(left, right)
+
+    return qtn.Tensor(
+        data=data,
+        inds=left_rest + right_rest,
+        tags=left.tags | right.tags,
+    )
+
+
 def _visible_len(s):
     """Length of ``s`` ignoring any ANSI colour escape sequences."""
     return len(_ANSI_RE.sub("", s))
@@ -149,7 +540,7 @@ def _color(s, code, enable):
 
 
 class TreeTensorNetwork(TensorNetworkGenVector):
-    """A rooted tree-tensor-network state over qubit leaves.
+    """A rooted tree-tensor-network state over physical qubit nodes.
 
     Subclasses :class:`quimb.tensor.TensorNetworkGenVector`, so it *is* a
     ``quimb`` tensor network: all of ``quimb``'s arbitrary-geometry methods
@@ -186,6 +577,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         "_symmetry",
         "_fermionic",
         "_physical_sectors",
+        "_work_bond_counter",
     )
 
     def __init__(self, ts=(), *, plan=None, sites=None, site_tag_id="I{}",
@@ -201,6 +593,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                     plan.root != ts.plan.root
                     or plan.children != ts.plan.children
                     or plan.qubit_of_leaf != ts.plan.qubit_of_leaf
+                    or plan.root_qubit != ts.plan.root_qubit
                 ):
                     raise ValueError(
                         "plan does not match the TreeTensorNetwork being copied."
@@ -208,6 +601,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 self._fermionic_norm_cache = None
                 self._fermionic_norm_cache_version = 0
                 self._fermionic_norm_cache_value_version = None
+                self._work_bond_counter = getattr(ts, "_work_bond_counter", 0)
                 return
             if plan is None:
                 raise TypeError(
@@ -226,6 +620,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             self._fermionic_norm_cache = None
             self._fermionic_norm_cache_version = 0
             self._fermionic_norm_cache_value_version = None
+            self._work_bond_counter = 0
             self.validate()
             return
         super().__init__(ts, **tn_opts)
@@ -249,6 +644,22 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         # Tracked here -- surviving ``.copy()`` via ``_EXTRA_PROPS`` -- so the
         # canonical form is a property of the *state*, not of any one driver.
         self._canonical_region = None
+        self._work_bond_counter = 0
+
+    def _new_work_bond(self, kind, *nodes):
+        """Return a unique private bond label for a native decomposition.
+
+        Native QR/SVD factors are short-lived, but a routed operator bond can
+        become a live tree edge before the next hop.  A state-owned counter is
+        cheaper than generating a UUID for every factor and, because it is an
+        extra copied property, remains collision-free across TTN branches.
+        """
+        counter = int(getattr(self, "_work_bond_counter", 0))
+        self._work_bond_counter = counter + 1
+        suffix = "_".join(str(node) for node in nodes)
+        if suffix:
+            suffix = "_" + suffix
+        return f"_pepsy_{kind}_{counter}{suffix}"
 
     # -- mutation / canonical metadata --------------------------------------
 
@@ -308,6 +719,25 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def plan(self):
         """The :class:`TreePlan` describing the tree structure."""
         return self._plan
+
+    @property
+    def top_arity(self):
+        """Number of virtual child bonds entering the structural root."""
+        return self._plan.top_arity
+
+    @property
+    def max_virtual_degree(self):
+        """Largest number of virtual bonds incident on any live tensor."""
+        return self._plan.max_virtual_degree()
+
+    @property
+    def max_tensor_rank(self):
+        """Largest virtual/physical leg count in the live tree."""
+        return self._plan.max_tensor_rank()
+
+    def is_binary(self, *, allow_ternary_root=True):
+        """Whether the TTN is binary below an optional ternary top tensor."""
+        return self._plan.is_binary(allow_ternary_root=allow_ternary_root)
 
     @property
     def node_tag_id(self):
@@ -377,24 +807,34 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self, operator, where, *, optimize, normalized,
     ):
         """Evaluate a native observable with the complete graded exterior."""
-        inds = [self.site_ind(site) for site in where]
-        operated = qtn.tensor_network_gate_inds(
-            self,
-            operator,
-            inds,
-            contract=False,
-            tags=[],
-            info=None,
-            inplace=False,
-        )
-        numerator = (self.H | operated).contract(
-            all,
-            optimize=optimize,
-        )
-        if not normalized:
-            return numerator
-        denominator = self._fermionic_norm_squared()
-        return numerator / denominator
+        profile_sink = getattr(self, "_profile_sink", None)
+        profile_started = time.perf_counter() if profile_sink is not None else None
+        try:
+            inds = [self.site_ind(site) for site in where]
+            operated = qtn.tensor_network_gate_inds(
+                self,
+                operator,
+                inds,
+                contract=False,
+                tags=[],
+                info=None,
+                inplace=False,
+            )
+            numerator = (self.H | operated).contract(
+                all,
+                optimize=optimize,
+            )
+            if not normalized:
+                return numerator
+            denominator = self._fermionic_norm_squared()
+            return numerator / denominator
+        finally:
+            if profile_started is not None:
+                profile_sink.append({
+                    "kind": "native_observable",
+                    "support": tuple(where),
+                    "seconds": time.perf_counter() - profile_started,
+                })
 
     def _restore_readout_region(self, region):
         """Restore a dense readout's tracked canonical region."""
@@ -421,7 +861,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     ):
         """Evaluate a local observable with a backend-specific exact path.
 
-        Dense/nonfermionic trees use the canonical target leaf or minimal
+        Dense/nonfermionic trees use the canonical target physical node or minimal
         Steiner subtree and cancel its ordinary isometric exterior. Native
         fermionic trees keep the Symmray operator structured and contract the
         complete doubled tree so graded boundary phases are never discarded.
@@ -437,7 +877,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             where = tuple(int(site) for site in where)
         if not where or len(set(where)) != len(where):
             raise ValueError("where must contain distinct tree sites.")
-        if any(site not in self.plan.leaf_of_qubit for site in where):
+        if any(site not in self.plan.node_of_qubit for site in where):
             raise ValueError(f"site(s) {where!r} are outside this tree state.")
 
         if not self.fermionic and preserve_gauge:
@@ -459,7 +899,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         else:
             original_region = None
 
-        leaves = [self.plan.leaf_of_qubit[site] for site in where]
+        site_nodes = [self.plan.node_of_qubit[site] for site in where]
         phys = [self.site_ind(site) for site in where]
         op = operator
         if self.symmetry is not None and not _is_symmray_array(op):
@@ -481,8 +921,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 normalized=normalized,
             )
         if len(where) == 1:
-            self.shift_orthogonality_center(leaves[0])
-            tensor = self.node_tensor(leaves[0])
+            self.shift_orthogonality_center(site_nodes[0])
+            tensor = self.node_tensor(site_nodes[0])
             physical = phys[0]
             if not _is_symmray_array(op):
                 dim = int(tensor.shape[tensor.inds.index(physical)])
@@ -498,9 +938,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 self._restore_readout_region(original_region)
             return result
 
-        span = self.steiner_nodes(leaves)
+        span = self.steiner_nodes(site_nodes)
         if self.orthogonality_center not in span:
-            self.shift_orthogonality_center(leaves[0])
+            self.shift_orthogonality_center(site_nodes[0])
 
         internal = {
             self.bond(node, neighbor)
@@ -513,10 +953,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         ])
         if not _is_symmray_array(op):
             dims = [
-                int(self.node_tensor(leaf).shape[
-                    self.node_tensor(leaf).inds.index(physical)
+                int(self.node_tensor(node).shape[
+                    self.node_tensor(node).inds.index(physical)
                 ])
-                for leaf, physical in zip(leaves, phys)
+                for node, physical in zip(site_nodes, phys)
             ]
             op = ar.do("reshape", op, tuple(dims + dims))
         elif len(ar.shape(op)) != 2 * len(where):
@@ -563,16 +1003,251 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         Returns a ``{where: value}`` dict following the iteration order of
         ``terms``.
         """
+        profile_sink = getattr(self, "_profile_sink", None)
+        profile_started = time.perf_counter() if profile_sink is not None else None
         results = {}
-        for where, operator in terms.items():
-            if isinstance(where, Integral):
-                support = (int(where),)
-            else:
-                support = tuple(int(site) for site in where)
-            results[where] = self.local_expectation(
-                operator, support, optimize=optimize, normalized=normalized,
+        try:
+            for where, operator in terms.items():
+                if isinstance(where, Integral):
+                    support = (int(where),)
+                else:
+                    support = tuple(int(site) for site in where)
+                results[where] = self.local_expectation(
+                    operator, support, optimize=optimize, normalized=normalized,
+                )
+            return results
+        finally:
+            if profile_started is not None:
+                profile_sink.append({
+                    "kind": "observable_batch",
+                    "count": len(terms),
+                    "seconds": time.perf_counter() - profile_started,
+                })
+
+    def expectation_mpo_exact(
+        self, mpo, where, *, normalized=True, optimize="auto",
+    ):
+        """Contract ``<psi|MPO|psi>`` without applying or compressing the TTN.
+
+        The tree, a private ket view, and the MPO remain separate tensor
+        networks. A :class:`TreeMPO` or an MPO created by :func:`tree_mpo`
+        supplies a TreePlan-labelled operator representation, contracted as
+        ``tree.H | tree_operator | tree``; its optional chain MPO is never
+        moved into the tree, applied, densified, or compressed. For an
+        unannotated MPO, the lower physical legs are connected to fresh
+        copies of the ket physical legs, while its upper physical legs
+        connect to the bra, and the complete doubled network is contracted.
+
+        ``mpo`` must expose Quimb's regular MPO site interface. Its active site
+        labels must match ``where``. For a native fermionic TTN the MPO must
+        contain native Symmray tensors, so the graded contraction rules remain
+        attached to the operator data.
+        """
+        if isinstance(where, Integral):
+            where = (int(where),)
+        else:
+            where = tuple(int(site) for site in where)
+        if not where or len(set(where)) != len(where):
+            raise ValueError("where must contain distinct tree sites.")
+        if any(site not in self.plan.node_of_qubit for site in where):
+            raise ValueError(f"site(s) {where!r} are outside this tree state.")
+
+        if hasattr(mpo, "expectation") and hasattr(mpo, "tree_networks"):
+            all_sites = tuple(sorted(self.plan.node_of_qubit))
+            if tuple(sorted(where)) != all_sites:
+                raise ValueError(
+                    "a TreeMPO must be evaluated on all tree sites so its "
+                    "identity legs remain explicit."
+                )
+            return mpo.expectation(
+                self,
+                normalized=normalized,
+                optimize=optimize,
             )
-        return results
+
+        tree_operator = getattr(mpo, "pepsy_tree_operator", None)
+        if tree_operator is not None:
+            if getattr(mpo, "pepsy_tree_plan_signature", None) != (
+                _tree_plan_signature(self.plan)
+            ):
+                raise ValueError(
+                    "tree MPO embedding was built for a different TreePlan."
+                )
+            all_sites = tuple(sorted(self.plan.node_of_qubit))
+            if tuple(sorted(where)) != all_sites:
+                raise ValueError(
+                    "a TreePlan MPO embedding must be evaluated on all tree "
+                    "sites so its identity legs remain explicit."
+                )
+            if hasattr(tree_operator, "expectation"):
+                return tree_operator.expectation(
+                    self,
+                    normalized=normalized,
+                    optimize=optimize,
+                )
+            if not self.fermionic:
+                raise TypeError(
+                    "native TreePlan MPO embeddings require a native "
+                    "fermionic TreeTensorNetwork."
+                )
+
+            operators = (
+                tree_operator
+                if isinstance(tree_operator, (tuple, list))
+                else (tree_operator,)
+            )
+            numerator = 0.0
+            for operator in operators:
+                ket = self.copy()
+                operator_work = operator.copy()
+                ket_reindex = {}
+                operator_reindex = {}
+                for site in all_sites:
+                    physical = self.site_ind(site)
+                    upper = f"k{site}"
+                    lower = f"b{site}"
+                    if upper not in operator_work.ind_map:
+                        raise ValueError(
+                            "TreePlan MPO embedding is missing physical site "
+                            f"{site!r}."
+                        )
+                    if lower not in operator_work.ind_map:
+                        raise ValueError(
+                            "TreePlan MPO embedding is missing lower physical "
+                            f"site {site!r}."
+                        )
+                    fresh = qtn.rand_uuid()
+                    ket_reindex[physical] = fresh
+                    operator_reindex[lower] = fresh
+                ket.reindex_(ket_reindex)
+                operator_work.reindex_(operator_reindex)
+                numerator = numerator + (self.H | operator_work | ket).contract(
+                    all,
+                    optimize=optimize,
+                )
+            if not normalized:
+                return numerator
+            denominator = (self.H | self).contract(all, optimize=optimize)
+            return numerator / denominator
+
+        required = (
+            "gen_sites_present", "site_tag", "upper_ind_id", "lower_ind_id",
+            "tag_map", "tensor_map", "copy",
+        )
+        if not all(hasattr(mpo, name) for name in required):
+            raise TypeError(
+                "expectation_mpo_exact requires a regular Quimb MPO with "
+                "site, physical-index, tensor-map, and copy interfaces."
+            )
+        try:
+            present = tuple(mpo.gen_sites_present())
+        except Exception as exc:
+            raise TypeError(
+                "could not inspect the MPO's active site labels for an "
+                "exact tree contraction."
+            ) from exc
+        if set(present) != set(where):
+            raise ValueError(
+                "MPO active sites must match the declared support: "
+                f"MPO has {present!r}, where is {where!r}."
+            )
+
+        mpo_native = _is_native_mpo(mpo)
+        if mpo_native is not None and bool(mpo_native) != bool(self.fermionic):
+            if self.fermionic:
+                raise TypeError(
+                    "native fermionic TreeTensorNetwork requires a native "
+                    "Symmray MPO for exact graded contraction."
+                )
+            raise TypeError(
+                "a native Symmray MPO cannot be exactly contracted with an "
+                "ordinary dense TreeTensorNetwork."
+            )
+
+        upper_id = mpo.upper_ind_id
+        lower_id = mpo.lower_ind_id
+        ket = self.copy()
+        mpo_work = mpo.copy()
+        ket_reindex = {}
+        mpo_reindex = {}
+        for site in where:
+            physical = self.site_ind(site)
+            upper = upper_id.format(site)
+            lower = lower_id.format(site)
+            try:
+                tids = tuple(mpo_work.tag_map[mpo_work.site_tag(site)])
+            except (KeyError, TypeError) as exc:
+                raise ValueError(
+                    f"MPO has no unique tensor for active site {site!r}."
+                ) from exc
+            if len(tids) != 1:
+                raise ValueError(
+                    f"MPO site {site!r} must resolve to one tensor; "
+                    f"got {len(tids)}."
+                )
+            op_tensor = mpo_work.tensor_map[tids[0]]
+            if upper not in op_tensor.inds or lower not in op_tensor.inds:
+                raise ValueError(
+                    f"MPO site {site!r} does not contain expected physical "
+                    f"indices {upper!r} and {lower!r}."
+                )
+            fresh = qtn.rand_uuid()
+            ket_reindex[physical] = fresh
+            mpo_reindex[lower] = fresh
+
+        # This is the key orientation: bra <- MPO upper, MPO lower -> ket.
+        # Every physical index then appears exactly twice, while MPO virtual
+        # bonds stay internal to the separate structured MPO network.
+        ket.reindex_(ket_reindex)
+        mpo_work.reindex_(mpo_reindex)
+        numerator = (self.H | mpo_work | ket).contract(
+            all,
+            optimize=optimize,
+        )
+        if not normalized:
+            return numerator
+        denominator = (self.H | self).contract(all, optimize=optimize)
+        return numerator / denominator
+
+    def expectation_mpo(
+        self, mpo, where, *, max_bond=None, cutoff=0.0,
+        normalized=True, optimize="auto", warn_on_truncation=True,
+        return_diagnostics=False,
+    ):
+        """Evaluate a structured MPO expectation without changing this TTN.
+
+        This is a convenience wrapper around
+        :meth:`TreeOptimizer.expectation_mpo`.  The MPO is routed once over
+        the tree, preserving native Symmray blocks and avoiding a dense
+        operator on the full support.  The transformed-state bond cap defaults
+        to this TTN's current maximum bond; pass ``max_bond`` explicitly when
+        a larger measurement workspace is acceptable.
+        ``warn_on_truncation=True`` reports when that workspace actually
+        truncates the private transformed ket. ``return_diagnostics=True``
+        returns the value together with the per-expectation compression report.
+        """
+        from .optimizer import TreeOptimizer
+
+        current_bond = int(self.max_bond())
+        engine = TreeOptimizer(
+            None,
+            n=self.nqubits,
+            tree=self.plan,
+            state=self,
+            chi=current_bond if max_bond is None else max_bond,
+            cutoff=0.0,
+            run=False,
+        )
+        return engine.expectation_mpo(
+            mpo,
+            where,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            normalized=normalized,
+            optimize=optimize,
+            warn_on_truncation=warn_on_truncation,
+            return_diagnostics=return_diagnostics,
+        )
 
     @property
     def orthogonality_center(self):
@@ -637,7 +1312,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
     @property
     def nqubits(self):
-        """Number of qubit leaves (an alias of :attr:`nsites`)."""
+        """Number of physical qubits (an alias of :attr:`nsites`)."""
         return self._plan.n
 
     def node_tag(self, nid):
@@ -679,14 +1354,157 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             )
         return next(iter(shared))
 
+    def isometry_direction(self, nid):
+        """Return the neighbour proven by ``left_inds`` to receive node ``nid``.
+
+        A tree tensor is an isometry toward exactly one adjacent node when its
+        ``left_inds`` contain every leg except that shared tree bond. ``None``
+        means no usable local proof is currently recorded. This is a derived
+        view of the live tensor metadata, not separately tracked state.
+        """
+        if nid not in self._plan.children:
+            raise ValueError(f"{nid!r} is not a node of the tree.")
+        tensor = self.node_tensor(nid)
+        if tensor.left_inds is None:
+            return None
+        left_inds = set(tensor.left_inds)
+        right_inds = [
+            index for index in tensor.inds if index not in left_inds
+        ]
+        if len(right_inds) != 1:
+            return None
+        toward_bond = right_inds[0]
+        for neighbour in self.neighbors(nid):
+            if toward_bond == self.bond(nid, neighbour):
+                return neighbour
+        return None
+
+    def isometry_map(self):
+        """Return ``{node: toward_node_or_None}`` from live ``left_inds``."""
+        return {
+            nid: self.isometry_direction(nid)
+            for nid in self._plan.nodes()
+        }
+
+    def _set_isometry_metadata_from_region(self, region):
+        """Record orientations for a state already proven canonical.
+
+        This changes metadata only and therefore must be called solely by
+        constructors or kernels that independently establish the stated
+        canonical region.
+        """
+        region = self._validated_region(region)
+        for nid in self._plan.nodes():
+            tensor = self.node_tensor(nid)
+            if nid in region:
+                tensor.modify(left_inds=None)
+                continue
+            toward = self._toward_region(nid, region)
+            bond = self.bond(nid, toward)
+            tensor.modify(
+                left_inds=tuple(
+                    index for index in tensor.inds if index != bond
+                )
+            )
+        return self
+
+    def can_skip_canonize(self, a, b, *, absorb="right"):
+        """Whether local metadata proves edge canonicalisation is redundant.
+
+        With ``absorb="right"`` node ``a`` must already be isometric toward
+        ``b``; the ``"left"`` orientation is symmetric. For native fermionic
+        tensors the same local proof is accepted only when the live data is a
+        Symmray fermionic array with aligned charge maps. This deliberately
+        checks structure, not numerical isometry: the metadata is written by
+        the native graded QR path, while malformed or unknown metadata falls
+        back to explicit graded QR.
+        """
+        if absorb not in {"right", "left"}:
+            raise ValueError("absorb must be 'right' or 'left'.")
+        bond = self.bond(a, b)  # validate the requested tree edge
+        if absorb == "right":
+            node = a
+        else:
+            node = b
+        tensor = self.node_tensor(node)
+        if tensor.left_inds is None:
+            return False
+        if set(tensor.left_inds) != set(tensor.inds) - {bond}:
+            return False
+        if not self.fermionic:
+            return True
+
+        # Native graded arrays carry the phase/charge convention in their
+        # index metadata. Do not infer it from dense data or trust arbitrary
+        # ``left_inds`` supplied by a caller: only the native array contract
+        # is eligible for this QR-free move.
+        data = tensor.data
+        if not getattr(data, "fermionic", False):
+            return False
+        indices = getattr(data, "indices", None)
+        duals = getattr(data, "duals", None)
+        charges = getattr(data, "charges", None)
+        if (
+            indices is None
+            or duals is None
+            or charges is None
+            or len(indices) != len(tensor.inds)
+            or len(duals) != len(tensor.inds)
+            or len(charges) != len(tensor.inds)
+        ):
+            return False
+        check_aligned = getattr(data, "check_chargemaps_aligned", None)
+        if check_aligned is None:
+            return False
+        try:
+            check_aligned()
+        except (AttributeError, TypeError, ValueError, KeyError):
+            return False
+        return True
+
+    def validate_isometry_metadata(self, region=None):
+        """Validate local ``left_inds`` against a canonical region.
+
+        Every tensor outside ``region`` must point along its unique next edge
+        toward that region. Tensors inside the region need not be isometric.
+        When no explicit or tracked region exists, only malformed non-``None``
+        metadata is rejected. Returns ``self`` when valid.
+        """
+        if region is None:
+            region = self.canonical_region
+        else:
+            region = self._validated_region(region)
+
+        for nid in self._plan.nodes():
+            tensor = self.node_tensor(nid)
+            direction = self.isometry_direction(nid)
+            if tensor.left_inds is not None and direction is None:
+                raise ValueError(
+                    f"tree node {nid} has left_inds that do not identify "
+                    "exactly one adjacent isometry direction."
+                )
+            if (
+                not self.fermionic
+                and region is not None
+                and nid not in region
+            ):
+                expected = self._toward_region(nid, region)
+                if direction != expected:
+                    raise ValueError(
+                        f"tree node {nid} must be isometric toward node "
+                        f"{expected}, but left_inds point toward {direction}."
+                    )
+        return self
+
     def validate(self, *, check_canonical=False, tol=1e-9):
         """Validate the live network against its :class:`TreePlan`.
 
         The check is intentionally structural by default and therefore cheap
         enough for construction and resource-preflight paths.  It verifies that
-        every planned node has exactly one tensor, every leaf owns exactly one
-        physical index, every plan edge has exactly one live bond, and there are
-        no extra tensors or malformed shared indices.  Pass
+        every planned node has exactly one tensor, every planned physical site
+        (a leaf or the optional root site) owns exactly one physical index,
+        every plan edge has exactly one live bond, and there are no extra
+        tensors, outer legs, or malformed shared indices. Pass
         ``check_canonical=True`` to additionally verify the tracked canonical
         region; that part performs tensor contractions and is more expensive.
 
@@ -723,22 +1541,23 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         for nid, tid in node_tids.items():
             tensor = self.tensor_map[tid]
             node_phys = physical_inds.intersection(tensor.inds)
-            if self._plan.is_leaf(nid):
-                q = self._plan.qubit_of_leaf[nid]
+            q = self._plan.qubit_of_node.get(nid)
+            if q is not None:
                 expected = self.site_ind(q)
                 if expected not in tensor.inds:
                     raise ValueError(
-                        f"leaf node {nid} (qubit {q}) is missing physical "
+                        f"tree node {nid} (qubit {q}) is missing physical "
                         f"index {expected!r}."
                     )
                 if len(node_phys) != 1 or expected not in node_phys:
                     raise ValueError(
-                        f"leaf node {nid} must own only physical index "
+                        f"tree node {nid} must own only physical index "
                         f"{expected!r}; found {sorted(node_phys)!r}."
                     )
                 if self.site_tag(q) not in tensor.tags:
                     raise ValueError(
-                        f"leaf node {nid} is missing site tag {self.site_tag(q)!r}."
+                        f"tree node {nid} is missing site tag "
+                        f"{self.site_tag(q)!r}."
                     )
             elif node_phys:
                 raise ValueError(
@@ -751,9 +1570,16 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         for ind, ind_owners in owners.items():
             if len(ind_owners) != 1:
                 raise ValueError(
-                    f"physical index {ind!r} must belong to one leaf; "
+                    f"physical index {ind!r} must belong to one planned node; "
                     f"found nodes {ind_owners!r}."
                 )
+        unexpected_outer = set(self.outer_inds()) - physical_inds
+        if unexpected_outer:
+            raise ValueError(
+                "live tree has unregistered outer indices "
+                f"{sorted(unexpected_outer)!r}; represent a top physical leg "
+                "with TreePlan(root_qubit=...)."
+            )
 
         expected_edges = {
             frozenset((parent, child))
@@ -810,16 +1636,18 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 )
             if self._validated_region(region) != region:
                 raise ValueError("canonical region is not a connected subtree.")
-            if check_canonical and not self.is_subtree_canonical_form(
-                region, tol=tol
-            ):
-                raise ValueError("tracked canonical region failed the isometry check.")
+            if check_canonical:
+                self.validate_isometry_metadata(region)
+                if not self.is_subtree_canonical_form(region, tol=tol):
+                    raise ValueError(
+                        "tracked canonical region failed the isometry check."
+                    )
         return self
 
     # -- plan delegators ------------------------------------------------------
 
     def is_leaf(self, nid):
-        """Whether node ``nid`` is a leaf (carries a physical qubit)."""
+        """Whether ``nid`` is a structural leaf (has no children)."""
         return self._plan.is_leaf(nid)
 
     def parent(self, nid):
@@ -846,39 +1674,47 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Return the leaf node id carrying qubit ``q``."""
         return self._plan.leaf_of_qubit[q]
 
+    def node_of_qubit(self, q):
+        """Return the leaf or physical root node carrying qubit ``q``."""
+        return self._plan.node_of_qubit[q]
+
     def qubit_of_leaf(self, nid):
         """Return the qubit label carried by leaf node ``nid``."""
         return self._plan.qubit_of_leaf[nid]
 
+    def qubit_of_node(self, nid):
+        """Return the qubit carried by ``nid``, or ``None`` for a virtual node."""
+        return self._plan.qubit_of_node.get(nid)
+
     def tree_distance(self, qa, qb):
-        """Return the leaf-to-leaf path length between qubits ``qa`` and ``qb``."""
+        """Return the site-node path length between qubits ``qa`` and ``qb``."""
         return self._plan.tree_distance(qa, qb)
 
-    def steiner_nodes(self, leaves):
-        """Return the node set of the minimal subtree spanning ``leaves``.
+    def steiner_nodes(self, nodes):
+        """Return the node set of the minimal subtree spanning ``nodes``.
 
         The tree has a unique path between any two nodes, so the union of the
-        paths from ``leaves[0]`` to every other leaf is exactly the minimal
+        paths from ``nodes[0]`` to every other node is exactly the minimal
         connected subtree (Steiner tree) that contains all of them.
         """
-        leaves = list(leaves)
-        if not leaves:
-            raise ValueError("need at least one leaf to span a subtree.")
-        for leaf in leaves:
-            if leaf not in self._plan.children:
-                raise ValueError(f"{leaf!r} is not a node of the tree.")
-        root_leaf = leaves[0]
-        nodes = set()
-        for lf in leaves:
-            nodes.update(self._plan.node_path(root_leaf, lf))
-        return nodes
+        nodes = list(nodes)
+        if not nodes:
+            raise ValueError("need at least one node to span a subtree.")
+        for node in nodes:
+            if node not in self._plan.children:
+                raise ValueError(f"{node!r} is not a node of the tree.")
+        root_node = nodes[0]
+        span = set()
+        for node in nodes:
+            span.update(self._plan.node_path(root_node, node))
+        return span
 
     def subtree_span(self, nodes):
         """Return the node set of the minimal connected subtree spanning ``nodes``.
 
-        Generalises :meth:`steiner_nodes` to *arbitrary* nodes (leaves and
-        internal): the union of the unique tree paths from ``nodes[0]`` to every
-        other node is the minimal connected subtree containing them all.
+        Alias-like generalisation retained for callers that work directly with
+        structural nodes: the union of the unique tree paths from ``nodes[0]``
+        to every other node is the minimal connected subtree containing them all.
         """
         nodes = list(nodes)
         if not nodes:
@@ -924,6 +1760,48 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 best = p
         return best[1]
 
+    def _native_qr_options(self, tensor=None):
+        """Return the QR options needed by native graded tree tensors.
+
+        Symmray's stabilized QR phase-normalizes every diagonal of ``R``.
+        A structural-zero diagonal therefore creates ``0 / |0|`` and can
+        produce a NaN in complex64.  Dense tensors retain Quimb's default
+        phase convention; network-level canonicalisation uses ``fermionic``
+        because it does not expose the individual tensors here.
+        """
+        native = self.fermionic if tensor is None else _is_symmray_array(
+            tensor.data
+        )
+        return {"stabilized": False} if native else {}
+
+    def _native_qr_split(self, tensor, **kwargs):
+        """Perform a QR split with the native graded zero-sector safeguard."""
+        return _native_qr_split_tensor(tensor, **kwargs)
+
+    def _record_native_compression_route(
+        self, route, *, edge, before_bond, reduction_hint, reduction_proven,
+    ):
+        """Record which native compression decomposition was used.
+
+        Route records are attached to the existing opt-in profile sink, so
+        ordinary replay does not allocate diagnostic dictionaries or perform
+        any timing work.  The records deliberately describe decomposition
+        selection rather than timing: the surrounding ``edge_compress`` event
+        remains the authoritative duration measurement.
+        """
+        profile_sink = getattr(self, "_profile_sink", None)
+        if profile_sink is None:
+            return
+        profile_sink.append({
+            "kind": "native_compression_route",
+            "route": route,
+            "edge": tuple(edge),
+            "before_bond": int(before_bond),
+            "reduced": reduction_hint,
+            "reduction_proven": bool(reduction_proven),
+            "seconds": 0.0,
+        })
+
     # -- edge-level canonical / compression helpers ---------------------------
 
     def _fermionic_canonize_edge_(self, a, b, absorb):
@@ -939,15 +1817,18 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         reduced = self.node_tensor(reduced_node)
         bond = self.bond(isometric_node, reduced_node)
         left_inds = [index for index in isometric.inds if index != bond]
-        kept, carry = isometric.split(
+        kept, carry = self._native_qr_split(
+            isometric,
             left_inds=left_inds,
             right_inds=(bond,),
-            method="qr",
             absorb="right",
             cutoff=0.0,
             get="tensors",
+            bond_ind=self._new_work_bond(
+                "canon", isometric_node, reduced_node,
+            ),
         )
-        merged = qtn.tensor_contract(carry, reduced)
+        merged = _contract_two_tensors(carry, reduced, shared_ind=bond)
         isometric.modify(
             data=kept.data,
             inds=kept.inds,
@@ -961,9 +1842,19 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         return self
 
     def _fermionic_compress_edge_(
-        self, a, b, *, max_bond, cutoff, absorb,
+        self, a, b, *, max_bond, cutoff, cutoff_mode, absorb, reduced=True,
+        reduction_proven=False,
     ):
-        """Compress one native graded tree cut by an explicit two-node SVD."""
+        """Compress one native graded tree cut with a reduced graded SVD.
+
+        Native Symmray tensors cannot use Quimb's generic compression helper:
+        its QR phase convention is not safe for structural zero sectors in
+        complex64.  We nevertheless retain the same reduction that makes the
+        dense path fast.  A proven one-sided isometry first gets a native QR
+        reduction of the active endpoint, then only the small graded core is
+        SVD'd; otherwise both endpoints are QR-reduced before the core SVD.
+        The complete two-node graded SVD remains the conservative fallback.
+        """
         if absorb == "right":
             isometric_node, reduced_node = a, b
         elif absorb == "left":
@@ -971,16 +1862,211 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         else:
             raise ValueError("absorb must be 'right' or 'left'.")
 
+        reduction_hint = reduced
         isometric = self.node_tensor(isometric_node)
-        reduced = self.node_tensor(reduced_node)
+        reduced_tensor = self.node_tensor(reduced_node)
         bond = self.bond(isometric_node, reduced_node)
+        before_bond = int(self.ind_size(bond))
         left_inds = [index for index in isometric.inds if index != bond]
-        theta = qtn.tensor_contract(isometric, reduced)
+
+        # ``reduced="left"`` is the metadata value emitted by the optimizer
+        # when ``reduced_node`` is already isometric towards ``isometric``.
+        # In that case the environment is an exact identity and decomposing
+        # the complete two-node tensor is unnecessary.  Validate the proof at
+        # this low-level boundary as well, since direct TTN callers can pass
+        # arbitrary reduction hints.
+        if (
+            reduction_hint == "left"
+            and (
+                reduction_proven
+                or self.can_skip_canonize(
+                    isometric_node, reduced_node, absorb="left"
+                )
+            )
+        ):
+            # The destination endpoint is already an isometry toward the
+            # active endpoint, so only the active endpoint needs reducing.
+            # QR it first: after fusing its external legs, a central Tree
+            # tensor can be thousands by thousands even though its shared
+            # bond is only O(chi).  The QR leaves a core whose right dimension
+            # is the live bond, avoiding a full SVD of that large matrix.
+            reduced_bond = self._new_work_bond(
+                "compress_qr", isometric_node, reduced_node,
+            )
+            isometric_q, isometric_r = self._native_qr_split(
+                isometric,
+                left_inds=left_inds,
+                right_inds=(bond,),
+                absorb="right",
+                cutoff=0.0,
+                get="tensors",
+                bond_ind=reduced_bond,
+            )
+            compressed_bond = self._new_work_bond(
+                "compress_svd", isometric_node, reduced_node,
+            )
+            core_left, core_right = isometric_r.split(
+                left_inds=(reduced_bond,),
+                method="svd",
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                get="tensors",
+                bond_ind=compressed_bond,
+            )
+            kept = _contract_two_tensors(isometric_q, core_left)
+            merged = _contract_two_tensors(core_right, reduced_tensor)
+            kept.reindex_({compressed_bond: bond})
+            merged.reindex_({compressed_bond: bond})
+            isometric.modify(
+                data=kept.data,
+                inds=kept.inds,
+                left_inds=left_inds,
+            )
+            reduced_tensor.modify(
+                data=merged.data,
+                inds=merged.inds,
+                left_inds=None,
+            )
+            self._record_native_compression_route(
+                "one_sided_left",
+                edge=(a, b),
+                before_bond=before_bond,
+                reduction_hint=reduction_hint,
+                reduction_proven=reduction_proven,
+            )
+            return self
+
+        if (
+            reduction_hint == "right"
+            and (
+                reduction_proven
+                or self.can_skip_canonize(
+                    isometric_node, reduced_node, absorb="right"
+                )
+            )
+        ):
+            # Mirror Quimb's ``reduced="right"`` branch: the active endpoint
+            # is split directly while the already-left-isometric endpoint is
+            # reused. Native SVD handles the charge blocks independently, so
+            # no complete two-node contraction is formed.
+            right_inds = [
+                index for index in reduced_tensor.inds if index != bond
+            ]
+            compressed_bond = self._new_work_bond(
+                "compress_right", isometric_node, reduced_node,
+            )
+            core_left, core_right = reduced_tensor.split(
+                left_inds=(bond,),
+                right_inds=right_inds,
+                method="svd",
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                get="tensors",
+                bond_ind=compressed_bond,
+            )
+            kept = _contract_two_tensors(isometric, core_left)
+            kept.reindex_({compressed_bond: bond})
+            core_right.reindex_({compressed_bond: bond})
+            isometric.modify(
+                data=kept.data,
+                inds=kept.inds,
+                left_inds=left_inds,
+            )
+            reduced_tensor.modify(
+                data=core_right.data,
+                inds=core_right.inds,
+                left_inds=None,
+            )
+            self._record_native_compression_route(
+                "one_sided_right",
+                edge=(a, b),
+                before_bond=before_bond,
+                reduction_hint=reduction_hint,
+                reduction_proven=reduction_proven,
+            )
+            return self
+
+        if reduction_hint is True:
+            # Mirror ``qtn.tensor_compress_bond(reduced=True)`` while routing
+            # both QR decompositions through the native policy above.  This
+            # keeps the expensive SVD on the reduced core and avoids the
+            # O((Dl * d) x (Dr * d)) full two-node matrix in the common case.
+            right_inds = [
+                index for index in reduced_tensor.inds if index != bond
+            ]
+            left_bond = self._new_work_bond(
+                "compress_left", isometric_node, reduced_node,
+            )
+            right_bond = self._new_work_bond(
+                "compress_right_qr", isometric_node, reduced_node,
+            )
+            isometric_q, isometric_r = self._native_qr_split(
+                isometric,
+                left_inds=left_inds,
+                right_inds=(bond,),
+                absorb="right",
+                cutoff=0.0,
+                get="tensors",
+                bond_ind=left_bond,
+            )
+            reduced_l, reduced_q = self._native_qr_split(
+                reduced_tensor,
+                left_inds=(bond,),
+                right_inds=right_inds,
+                absorb="left",
+                cutoff=0.0,
+                get="tensors",
+                bond_ind=right_bond,
+            )
+            core = _contract_two_tensors(isometric_r, reduced_l)
+            core_left, core_right = core.split(
+                left_inds=(left_bond,),
+                method="svd",
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                absorb="right",
+                get="tensors",
+                bond_ind=bond,
+            )
+            isometric_compressed = _contract_two_tensors(
+                isometric_q, core_left,
+            )
+            reduced_compressed = _contract_two_tensors(
+                core_right, reduced_q,
+            )
+            isometric.modify(
+                data=isometric_compressed.data,
+                inds=isometric_compressed.inds,
+                left_inds=left_inds,
+            )
+            reduced_tensor.modify(
+                data=reduced_compressed.data,
+                inds=reduced_compressed.inds,
+                left_inds=None,
+            )
+            self._record_native_compression_route(
+                "two_sided_reduced",
+                edge=(a, b),
+                before_bond=before_bond,
+                reduction_hint=reduction_hint,
+                reduction_proven=reduction_proven,
+            )
+            return self
+
+        # Keep the old complete graded split as a compatibility fallback for
+        # direct callers that provide an unrecognised reduction hint.
+        theta = _contract_two_tensors(isometric, reduced_tensor, shared_ind=bond)
         kept, remainder = theta.split(
             left_inds=left_inds,
             method="svd",
             max_bond=max_bond,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             absorb="right",
             get="tensors",
             bond_ind=bond,
@@ -990,10 +2076,17 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             inds=kept.inds,
             left_inds=kept.left_inds,
         )
-        reduced.modify(
+        reduced_tensor.modify(
             data=remainder.data,
             inds=remainder.inds,
             left_inds=None,
+        )
+        self._record_native_compression_route(
+            "full_svd_fallback",
+            edge=(a, b),
+            before_bond=before_bond,
+            reduction_hint=reduction_hint,
+            reduction_proven=reduction_proven,
         )
         return self
 
@@ -1014,14 +2107,34 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         else:
             self._canonical_region = None
 
-    def canonize_edge_(self, a, b, absorb="right"):
+    def canonize_edge_(
+        self, a, b, absorb="right", *, _isometry_proven=False,
+    ):
         """Canonicalise across the tree edge ``a -> b`` in place.
 
-        Dense/nonfermionic trees delegate to Quimb's ``canonize_between``.
-        Native fermionic trees use the explicit graded QR helper above.
+        Dense/nonfermionic trees delegate to Quimb's ``canonize_between``;
+        native fermionic trees use the explicit graded QR helper above.
         ``absorb="right"`` leaves node ``a`` isometric and pushes the tracked
-        orthogonality centre onto node ``b``.
+        orthogonality centre onto node ``b``. Edges whose live metadata proves
+        the required isometry are metadata-only moves for both dense and
+        native graded arrays.
         """
+        if (
+            _isometry_proven
+            or self.can_skip_canonize(a, b, absorb=absorb)
+        ):
+            # The local QR is already represented by the tensor's proven
+            # ``left_inds``. Keep centre bookkeeping honest, but do not touch
+            # tensor data or invalidate the norm cache.
+            previous = self.orthogonality_center
+            source, target = (
+                (a, b) if absorb == "right" else (b, a)
+            )
+            if previous == source:
+                self._canonical_region = frozenset({target})
+            elif previous not in (None, target):
+                self._canonical_region = None
+            return self
         previous = self.orthogonality_center
         if self.fermionic:
             self._fermionic_canonize_edge_(a, b, absorb)
@@ -1037,15 +2150,46 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         self._track_edge_center(a, b, absorb, previous=previous)
         return self
 
-    def compress_edge_(self, a, b, *, max_bond=None, cutoff=1e-12,
-                       absorb="right"):
+    def compress_edge_(
+        self,
+        a,
+        b,
+        *,
+        max_bond=None,
+        cutoff=1e-10,
+        cutoff_mode="rsum2",
+        absorb="right",
+        reduced=True,
+        _reduction_proven=False,
+    ):
         """Compress the tree edge ``a -> b`` in place.
 
         Dense/nonfermionic trees delegate to Quimb's ``compress_between``.
-        Native fermionic trees explicitly SVD the complete two-node tensor.
-        The tracked :attr:`orthogonality_center` advances as for
-        :meth:`canonize_edge_`.
+        Native fermionic trees use the same reduced-core decomposition while
+        routing every lossless factorization through the zero-sector-safe
+        native QR helper. The tracked :attr:`orthogonality_center` advances as
+        for :meth:`canonize_edge_`.
+
+        ``cutoff_mode`` selects Quimb's singular-value cutoff convention. The
+        default ``"rsum2"`` matches :class:`TreeOptimizer` and Quimb's
+        open-boundary MPS gate-application default; use ``"rel"`` explicitly
+        for a relative largest-singular-value threshold.
+        ``reduced`` selects the dense Quimb reduction and the corresponding
+        native graded reduction. Quimb's one-sided ``"left"`` mode is exact
+        when node ``b`` is already isometric on its non-shared legs; native
+        trees use the same proof, with the zero-sector-safe QR policy retained
+        for the two-sided reduced path.
         """
+        bond = self.bond(a, b)
+        before_bond = int(self.ind_size(bond))
+        if cutoff == 0.0 and (
+            max_bond is None or before_bond <= int(max_bond)
+        ):
+            # No singular value can be removed, so a QR gauge move is exact
+            # for both dense and native graded trees. This also protects direct
+            # TreeTensorNetwork callers that do not go through the optimizer's
+            # diagnostic-aware wrapper.
+            return self.canonize_edge_(a, b, absorb=absorb)
         previous = self.orthogonality_center
         if self.fermionic:
             self._fermionic_compress_edge_(
@@ -1053,7 +2197,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 b,
                 max_bond=max_bond,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 absorb=absorb,
+                reduced=reduced,
+                reduction_proven=_reduction_proven,
             )
         else:
             self.compress_between(
@@ -1061,7 +2208,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 self.node_tag(b),
                 max_bond=max_bond,
                 cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
                 absorb=absorb,
+                reduced=reduced,
             )
         self._invalidate_norm_cache()
         self._track_edge_center(a, b, absorb, previous=previous)
@@ -1099,12 +2248,16 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """
         region = self._validated_region(nodes, span=span)
         tags = [self.node_tag(n) for n in region]
+        canonize_opts = {
+            "method": "qr",
+            "cutoff": 0.0,
+        }
+        canonize_opts.update(self._native_qr_options())
         self.canonize_around_(
             tags,
             which="any",
             absorb=absorb,
-            method="qr",
-            cutoff=0.0,
+            **canonize_opts,
         )
         self._canonical_region = region
         return self
@@ -1114,14 +2267,14 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         The qubit-level "range canonicalisation" entry point: given a set of
         qubit labels, gauge every tensor outside the minimal connected subtree
-        that spans those qubits' leaves to point inward, so the reduced state on
+        that spans those qubits' physical nodes to point inward, so the reduced state on
         those qubits is captured by that subtree.  Equivalent to
-        ``canonize_subtree_(leaves_of(qubits), span=True)``.  Returns ``self``.
+        ``canonize_subtree_(nodes_of(qubits), span=True)``.  Returns ``self``.
         """
         if isinstance(qubits, Integral):
             qubits = (qubits,)
-        leaves = [self.leaf_of_qubit(q) for q in qubits]
-        return self.canonize_subtree_(leaves, span=True, absorb=absorb)
+        site_nodes = [self.node_of_qubit(q) for q in qubits]
+        return self.canonize_subtree_(site_nodes, span=True, absorb=absorb)
 
     def _recover_center_from_region(self, region, target, *, absorb="right"):
         """Recover one centre by peeling a tracked canonical region.
@@ -1163,7 +2316,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 a, b = node, neighbour
             else:
                 a, b = neighbour, node
-            self.canonize_edge_(a, b, absorb=absorb)
+            proof = self.can_skip_canonize(a, b, absorb=absorb)
+            self.canonize_edge_(
+                a, b, absorb=absorb, _isometry_proven=proof,
+            )
             remaining.remove(node)
 
         self._canonical_region = frozenset({target})
@@ -1282,37 +2438,41 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 prod = qtn.tensor_contract(t, tc, output_inds=output_inds)
             d = int(prod.shape[0])
             data = prod.data
-            # Autoray's generic NumPy conversion deliberately leaves a
-            # Symmray block array intact. Its explicit dense readout is only
-            # used here for this diagnostic, never in a simulation hot path.
+            # Keep the diagnostic on the live backend. In particular,
+            # ``ar.to_numpy`` cannot move a CUDA tensor to the host, while a
+            # scalar reduction can be transferred safely and cheaply.
             if hasattr(data, "to_dense"):
                 data = data.to_dense()
-            else:
-                data = ar.to_numpy(data)
-            if not np.allclose(data, np.eye(d), atol=tol):
+            identity = ar.do("eye", d, like=data)
+            close = ar.do(
+                "allclose",
+                data,
+                identity,
+                atol=float(tol),
+                rtol=1.0e-5,
+            )
+            if not bool(to_float(close, real=True)):
                 return False
         return True
 
     def cap_qubit_(self, q, vec):
-        """Contract qubit ``q`` with ``vec`` and remove that leaf in place.
+        """Contract qubit ``q`` with ``vec`` and remove that site in place.
 
         This is the tree counterpart of an MPS physical-index cap. The capped
-        leaf is absorbed into its parent; if that creates a unary parent, the
-        parent and its remaining child are fused. Remaining qubit labels are
-        compacted above ``q`` so subsequent stream entries retain MPS-style
-        positional semantics.
+        leaf is absorbed into its parent; if that creates a virtual-only unary
+        parent, the parent and its remaining child are fused. A physical root
+        qubit is contracted directly on the root without changing the tree
+        edges. Remaining qubit labels are compacted above ``q`` so subsequent
+        stream entries retain MPS-style positional semantics.
         """
         q = int(q)
         self._invalidate_norm_cache()
-        if q not in self._plan.leaf_of_qubit:
+        if q not in self._plan.node_of_qubit:
             raise ValueError(f"cap qubit {q} is outside the tree state.")
         if self._plan.n <= 1:
             raise ValueError("cannot cap the only qubit in a tree state.")
-        leaf = self._plan.leaf_of_qubit[q]
-        parent = self._plan.parent.get(leaf)
-        if parent is None:
-            raise ValueError("cannot cap the root leaf of a multi-qubit tree.")
-        like = self.node_tensor(leaf).data
+        site_node = self._plan.node_of_qubit[q]
+        like = self.node_tensor(site_node).data
         try:
             compatible = (
                 ar.infer_backend(vec) == ar.infer_backend(like)
@@ -1332,6 +2492,55 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 f"physical dimension {self.ind_size(phys)} of qubit {q}."
             )
 
+        if q == self._plan.root_qubit:
+            self.shift_orthogonality_center(self._plan.root)
+            root_t = self.node_tensor(self._plan.root)
+            cap_t = qtn.Tensor(vec, inds=(phys,))
+            merged = qtn.tensor_contract(root_t.copy(), cap_t)
+            tags = set(root_t.tags)
+            tags.discard(self.site_tag(q))
+            root_t.modify(data=merged.data, inds=merged.inds, tags=tags)
+
+            old_n = self._plan.n
+            temp_inds = {
+                old: f"_ttn_cap_ind_{old}" for old in range(q + 1, old_n)
+            }
+            temp_tags = {
+                old: f"_ttn_cap_tag_{old}" for old in range(q + 1, old_n)
+            }
+            if temp_inds:
+                self.reindex_({
+                    self.site_ind(old): temp
+                    for old, temp in temp_inds.items()
+                })
+            if temp_tags:
+                self.retag_({
+                    self.site_tag(old): temp
+                    for old, temp in temp_tags.items()
+                })
+            if temp_inds:
+                self.reindex_({
+                    temp: self.site_ind(old - 1)
+                    for old, temp in temp_inds.items()
+                })
+            if temp_tags:
+                self.retag_({
+                    temp: self.site_tag(old - 1)
+                    for old, temp in temp_tags.items()
+                })
+
+            self._plan = self._plan.remove_qubit(q)
+            self._sites = tuple(range(self._plan.n))
+            self.__dict__.pop("_node_tid_cache", None)
+            self._canonical_region = frozenset({self._plan.root})
+            self.validate()
+            return self
+
+        leaf = self._plan.leaf_of_qubit[q]
+        parent = self._plan.parent.get(leaf)
+        if parent is None:
+            raise ValueError("cannot cap the root leaf of a multi-qubit tree.")
+
         # Put the absorbing parent at the centre before contraction, so the
         # remaining state stays canonical without a full-tree rescan.
         self.shift_orthogonality_center(parent)
@@ -1342,7 +2551,13 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         leaf_message = qtn.tensor_contract(leaf_t, cap_t)
         merged = qtn.tensor_contract(parent_t, leaf_message)
 
-        collapse = len(self._plan.children[parent]) == 2
+        collapse = (
+            len(self._plan.children[parent]) == 2
+            and not (
+                parent == self._plan.root
+                and self._plan.root_qubit is not None
+            )
+        )
         child = None
         tags = set(parent_t.tags)
         if collapse:
@@ -1377,7 +2592,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         if temp_tags:
             self.retag_({temp: self.site_tag(old - 1) for old, temp in temp_tags.items()})
 
-        self._plan = self._plan.remove_leaf(q)
+        self._plan = self._plan.remove_qubit(q)
         self._sites = tuple(range(self._plan.n))
         self.__dict__.pop("_node_tid_cache", None)
         self._canonical_region = frozenset({parent})
@@ -1413,11 +2628,11 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Return a top-down ASCII drawing of the tree, drawn root-first.
 
         The tree analogue of a ``quimb`` MPS ``show``: the root sits at the top
-        and the qubit leaves at the bottom, each internal node marked ``●`` and
-        each leaf ``◆`` with its qubit label ``q{q}`` beneath it.  When
+        and structural leaves at the bottom. Physical nodes are labelled
+        ``q{q}``; the optional root site appears beside the top marker. When
         ``bond_dims`` is true every edge is annotated with the dimension of the
-        virtual bond joining a node to its parent (so growing entanglement shows
-        up as growing numbers on the branches)::
+        virtual bond joining a node to its parent (so growing entanglement
+        shows up as growing numbers on the branches)::
 
                    ●
               ┌────┴────┐
@@ -1447,7 +2662,7 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         def render(nid, depth):
             """Return ``(lines, root_col, width)`` for the subtree rooted at ``nid``."""
             if plan.is_leaf(nid):
-                label = f"q{plan.qubit_of_leaf[nid]}"
+                label = f"q{plan.qubit_of_node[nid]}"
                 w = max(1, len(label))
                 col = (w - 1) // 2
                 marker = _color("◆", _LEAF_COLOR, color)
@@ -1456,6 +2671,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                         _ascii_place(lbl, w, col)], col, w
 
             dot = f"●{nid}" if node_ids else "●"
+            if nid in plan.qubit_of_node:
+                dot += f" q{plan.qubit_of_node[nid]}"
             marker = _color(dot, _LAYER_COLORS[depth % len(_LAYER_COLORS)], color)
             blocks = []
             for child in plan.children[nid]:
@@ -1522,10 +2739,10 @@ class TreeTensorNetwork(TensorNetworkGenVector):
         """Print the top-down ASCII drawing of the tree (see :meth:`ascii_tree`).
 
         The tree analogue of a ``quimb`` MPS ``show``: the root is at the top,
-        the qubit leaves at the bottom, internal nodes are ``●`` and leaves
-        ``◆`` labelled with their qubit, and every edge is annotated with its
-        current virtual-bond dimension.  By default the markers are coloured by
-        tree layer; pass ``color=False`` for plain text.
+        structural leaves are at the bottom, physical nodes are labelled with
+        their qubits, and every edge is annotated with its current virtual-bond
+        dimension. By default the markers are coloured by tree layer; pass
+        ``color=False`` for plain text.
         """
         print(self.ascii_tree(bond_dims=bond_dims, node_ids=node_ids, color=color))
 
@@ -1546,9 +2763,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             inds = []
             shape = []
             tags = [node_tag_id.format(nid)]
-            leaf = plan.is_leaf(nid)
-            if leaf:
-                q = plan.qubit_of_leaf[nid]
+            q = plan.qubit_of_node.get(nid)
+            if q is not None:
                 inds.append(site_ind_id.format(q))
                 shape.append(int(phys_dim))
                 tags.append(site_tag_id.format(q))
@@ -1559,19 +2775,20 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             if up is not None:
                 inds.append(_bond_index(nid, up))
                 shape.append(1)
-            if leaf:
+            if q is not None:
                 data = np.zeros(shape, dtype=dtype)
                 data[tuple([0] * len(shape))] = 1.0  # |0>
             else:
                 data = np.ones(shape, dtype=dtype)
             tensors.append(qtn.Tensor(data, inds=inds, tags=tags))
-        return cls(
+        ttn = cls(
             tensors,
             plan=plan,
             site_tag_id=site_tag_id,
             site_ind_id=site_ind_id,
             node_tag_id=node_tag_id,
-        )._with_center(plan.root).validate()
+        )._with_center(plan.root)
+        return ttn._set_isometry_metadata_from_region({plan.root}).validate()
 
     @classmethod
     def from_symmray_plan(
@@ -1594,8 +2811,9 @@ class TreeTensorNetwork(TensorNetworkGenVector):
 
         Symmray supplies the block-sparse / fermionic tensor construction and
         all subsequent QR/SVD/contraction primitives. This method supplies
-        only the tree geometry: leaf nodes receive physical legs, while
-        internal tree nodes remain virtual tensors with neutral charge.
+        only the tree geometry: leaf nodes and the optional physical root
+        receive physical legs, while other internal tree nodes remain virtual
+        tensors with neutral charge.
         """
         try:
             import symmray as sr
@@ -1642,8 +2860,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 dtype=dtype,
                 site_tag_id=node_tag_id,
                 site_charge=lambda nid: (
-                    leaf_charges[plan.qubit_of_leaf[nid]]
-                    if plan.is_leaf(nid)
+                    leaf_charges[plan.qubit_of_node[nid]]
+                    if nid in plan.qubit_of_node
                     else neutral
                 ),
                 subsizes=subsizes,
@@ -1663,8 +2881,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
                 bond_duals = []
                 inds = []
 
-            if plan.is_leaf(nid):
-                q = plan.qubit_of_leaf[nid]
+            q = plan.qubit_of_node.get(nid)
+            if q is not None:
                 physical_index = sr.utils.rand_index(
                     symmetry,
                     physical_sectors,
@@ -1710,18 +2928,22 @@ class TreeTensorNetwork(TensorNetworkGenVector):
     def from_order(cls, order, *, weights=None, structure="quality",
                    max_arity=2, community_frac=0.35, star_frac=0.75,
                    dtype=complex, site_tag_id="I{}", site_ind_id="k{}",
-                   node_tag_id="N{}"):
+                   node_tag_id="N{}", root_qubit=None,
+                   top_arity=_DEFAULT_TOP_ARITY):
         """Build a product state on a tree partitioned from ``order``.
 
         Convenience wrapper that first builds a :class:`TreePlan` with
         :meth:`TreePlan.from_order` and then :meth:`from_plan`.  ``max_arity``
         and ``structure`` control the tree shape (see
-        :meth:`TreePlan.from_order`); the defaults reproduce the binary tree.
+        :meth:`TreePlan.from_order`). The default is a binary tree below a
+        three-virtual-leg top tensor when there are at least three leaves;
+        pass ``top_arity=None`` or ``top_arity=2`` to use a binary root.
         """
         plan = TreePlan.from_order(
             order, weights=weights, structure=structure,
             max_arity=max_arity, community_frac=community_frac,
-            star_frac=star_frac,
+            star_frac=star_frac, root_qubit=root_qubit,
+            top_arity=top_arity,
         )
         return cls.from_plan(
             plan,
@@ -1755,9 +2977,8 @@ class TreeTensorNetwork(TensorNetworkGenVector):
             inds = []
             shape = []
             tags = [node_tag_id.format(nid)]
-            leaf = plan.is_leaf(nid)
-            if leaf:
-                q = plan.qubit_of_leaf[nid]
+            q = plan.qubit_of_node.get(nid)
+            if q is not None:
                 inds.append(site_ind_id.format(q))
                 shape.append(phys_dim)
                 tags.append(site_tag_id.format(q))

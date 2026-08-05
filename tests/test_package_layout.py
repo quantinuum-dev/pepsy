@@ -19,19 +19,25 @@ from pepsy.boundary import (
 )
 from pepsy.operators import gate, rx
 from pepsy.optimizers import (
-    MeraEnergyOptimizer,
     MpsEnergyOptimizer,
     MpsOptimizer,
     PepsEnergyOptimizer,
     PepsOptimizer,
     QMeraBuilder,
+    QMeraEnergyOptimizer,
     QMeraGeometry,
+    QMeraLayoutFinder,
     QMeraParametricEnergyOptimizer,
+    SimulatorCandidate,
+    SimulatorPlan,
+    SimulatorPlanner,
     SimpleUpdateGen,
     SymDMRG2,
     SweepOptimizer,
     build_qmera_contraction_optimizer,
     mera as mera_module,
+    qmera as qmera_module,
+    recommend_simulator,
 )
 from pepsy.sampling import MpsSampler, PepsBpSampler
 from pepsy.solvers import FDSolver
@@ -54,17 +60,22 @@ from pepsy.tensors import (
     reg_complex_qr_torch,
     reg_complex_svd_jax,
     reg_complex_svd_torch,
+    reg_native_svd_jax,
+    reg_native_svd_torch,
     reg_real_qr_torch,
     reg_real_svd_jax,
     reg_real_svd_torch,
     reg_rel_svd_jax,
     reg_rel_svd_torch,
+    register_jax_linalg,
+    reset_linalg_registrations,
     site_charge_from_occupations,
 )
 from pepsy.vmc import (
     ContractionConfig,
     FermionSiteEncoding,
     MCState,
+    NetKetEtaPairObservable,
     NetKetVMCSetup,
     OptimizationConfig,
     SamplingConfig,
@@ -110,15 +121,23 @@ def test_new_namespace_imports_resolve():
     assert callable(gate)
     assert callable(rx)
     assert MpsOptimizer is not None
-    assert MeraEnergyOptimizer is not None
     assert MpsEnergyOptimizer is not None
     assert PepsEnergyOptimizer is not None
     assert PepsOptimizer is not None
     assert QMeraBuilder is not None
+    assert QMeraEnergyOptimizer is not None
     assert QMeraGeometry is not None
+    assert QMeraLayoutFinder is not None
     assert QMeraParametricEnergyOptimizer is not None
+    assert SimulatorCandidate is not None
+    assert SimulatorPlan is not None
+    assert SimulatorPlanner is not None
     assert callable(build_qmera_contraction_optimizer)
+    assert callable(recommend_simulator)
     assert mera_module is not None
+    assert qmera_module is not None
+    assert qmera_module.QMeraBuilder is QMeraBuilder
+    assert qmera_module.QMeraBuilder is mera_module.QMeraBuilder
     assert SimpleUpdateGen is not None
     assert SymDMRG2 is not None
     assert SweepOptimizer is not None
@@ -143,11 +162,15 @@ def test_new_namespace_imports_resolve():
     assert callable(reg_rel_svd_torch)
     assert callable(reg_real_svd_torch)
     assert callable(reg_complex_svd_torch)
+    assert callable(reg_native_svd_jax)
+    assert callable(reg_native_svd_torch)
     assert callable(reg_real_qr_torch)
     assert callable(reg_complex_qr_torch)
     assert callable(reg_rel_svd_jax)
     assert callable(reg_real_svd_jax)
     assert callable(reg_complex_svd_jax)
+    assert callable(register_jax_linalg)
+    assert callable(reset_linalg_registrations)
     assert callable(site_charge_from_occupations)
     assert FermionSiteEncoding is not None
     assert ContractionConfig is not None
@@ -165,6 +188,7 @@ def test_new_namespace_imports_resolve():
     assert TorchPEPSBoundaryAmplitude is not None
     assert TorchVMCDriver is not None
     assert TorchVMCSetup is not None
+    assert NetKetEtaPairObservable is not None
     assert NetKetVMCSetup is not None
     assert TorchVMCStepResult is not None
     assert TorchSquareLattice is not None

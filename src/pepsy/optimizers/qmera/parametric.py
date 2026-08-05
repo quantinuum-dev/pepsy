@@ -9,7 +9,7 @@ from typing import Any
 from ...backends import backend_jax, backend_torch
 from ...solvers import GradientOptimizer, GradSolverResult
 
-__all__ = ["QMeraParametricEnergyOptimizer"]
+__all__ = ["QMeraEnergyOptimizer", "QMeraParametricEnergyOptimizer"]
 
 
 def _solver_backend(solver):
@@ -40,8 +40,15 @@ def _array_backend_for_train_backend(backend, *, dtype=None, device="cpu"):
 
 
 @dataclass
-class QMeraParametricEnergyOptimizer:
-    """Optimize qMERA parameters using schedule-only local lightcones."""
+class QMeraEnergyOptimizer:
+    """Optimize parameterized qMERA gates using schedule-only lightcones.
+
+    The built-in qMERA gate families are unitary (and the fermion families
+    are symmetry/parity preserving) by construction.  Consequently the
+    optimizer does not normalize the state by default.  Pass
+    ``normalized=True`` in ``loss_kwargs`` or to ``loss``/``run`` when using
+    a custom gate family that is not norm preserving.
+    """
 
     builder: Any
     schedule: Any
@@ -55,6 +62,7 @@ class QMeraParametricEnergyOptimizer:
 
     def __post_init__(self):
         self.loss_kwargs = {} if self.loss_kwargs is None else dict(self.loss_kwargs)
+        self.loss_kwargs.setdefault("normalized", False)
         if self.parameters is None:
             self.parameters = self.builder.initialize_parameters(self.schedule)
         else:
@@ -132,6 +140,7 @@ class QMeraParametricEnergyOptimizer:
         convert_terms=True,
         contraction_opt="auto-hq",
         expression_opts=None,
+        path_cache=None,
     ):
         """Compile static contraction expressions for configured local cones."""
         chunks = self._chunks_for_backend(
@@ -147,6 +156,7 @@ class QMeraParametricEnergyOptimizer:
             convert_terms=convert_terms,
             contraction_opt=contraction_opt,
             expression_opts=expression_opts,
+            path_cache=path_cache,
         )
         return self.compiled_chunks
 
@@ -162,6 +172,7 @@ class QMeraParametricEnergyOptimizer:
                 convert_terms=opts.get("convert_terms", True),
                 contraction_opt=opts.get("contraction_opt", "auto-hq"),
                 expression_opts=opts.get("expression_opts"),
+                path_cache=opts.get("path_cache"),
             )
         return self.builder.compiled_parametric_loss(
             params,
@@ -230,6 +241,7 @@ class QMeraParametricEnergyOptimizer:
                 convert_terms=opts.get("convert_terms", True),
                 contraction_opt=opts.get("contraction_opt", "auto-hq"),
                 expression_opts=expression_opts,
+                path_cache=opts.get("path_cache"),
             )
             opts["compiled_chunks"] = self.compiled_chunks
 
@@ -253,3 +265,8 @@ class QMeraParametricEnergyOptimizer:
         return result
 
     optimize = run
+
+
+# Compatibility name retained for callers of the original parameter-dict
+# qMERA API.  The canonical public name is now QMeraEnergyOptimizer.
+QMeraParametricEnergyOptimizer = QMeraEnergyOptimizer

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from heapq import heappop, heappush
 from numbers import Integral
 import random
@@ -14,11 +16,155 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+
+# Symmray's cutoff-based block-SVD keeps every singular value tied with the
+# global threshold. This is symmetry-respecting, but means ``max_bond`` is a
+# soft cap whenever a cutoff is also supplied. Operator simple-update needs a
+# predictable memory cap, so gate_simple exposes an opt-in hard total cap.
+_STRICT_MAX_BOND_ACTIVE = ContextVar("pepsy_strict_max_bond_active", default=False)
+
+
+def _hard_cap_blocksparse_svd(U, s, VH, max_bond):
+    """Keep the globally largest ``max_bond`` retained block-SVD values.
+
+    The input has already been filtered by Symmray's requested cutoff. Ties
+    crossing the total cap are resolved deterministically by the stable block
+    and in-block ordering. The result retains the symmetry sectors selected by
+    that global spectrum and never has a larger total internal dimension than
+    ``max_bond``.
+    """
+    sectors = tuple(U.sectors)
+    blocks = tuple(s.get_all_blocks())
+    sizes = tuple(int(ar.size(block)) for block in blocks)
+    if sum(sizes) <= max_bond:
+        return U, s, VH
+
+    ranked = []
+    for sector_index, block in enumerate(blocks):
+        values = np.asarray(ar.to_numpy(block)).reshape(-1)
+        ranked.extend(
+            (-float(value), sector_index, value_index)
+            for value_index, value in enumerate(values)
+        )
+    ranked.sort()
+
+    kept_per_sector = [0] * len(sectors)
+    for _, sector_index, _ in ranked[:max_bond]:
+        kept_per_sector[sector_index] += 1
+
+    chargemap = {}
+    for (c0, c1), n_keep in zip(sectors, kept_per_sector):
+        if n_keep == 0:
+            U.del_block((c0, c1))
+            s.del_block(c1)
+            VH.del_block((c1, c1))
+            continue
+        U.set_block((c0, c1), U.get_block((c0, c1))[:, :n_keep])
+        s.set_block(c1, s.get_block(c1)[:n_keep])
+        VH.set_block((c1, c1), VH.get_block((c1, c1))[:n_keep, :])
+        chargemap[c1] = n_keep
+
+    chargemap = dict(sorted(chargemap.items()))
+    U.modify(
+        indices=(
+            U.indices[0],
+            U.indices[1].copy_with(chargemap=chargemap, subinfo=None),
+        )
+    )
+    VH.modify(
+        indices=(
+            VH.indices[0].copy_with(chargemap=chargemap, subinfo=None),
+            VH.indices[1],
+        )
+    )
+    return U, s, VH
+
+
+def _install_strict_blocksparse_truncation():
+    """Install a context-controlled hard-cap layer over Symmray's SVD.
+
+    This stays dormant for every existing caller. It is activated only by the
+    ``strict_max_bond`` context in :func:`gate_simple` below.
+    """
+    try:
+        from symmray.sparse import sparse_array_common as sparse_common
+    except ImportError:
+        return
+
+    if getattr(sparse_common, "_pepsy_strict_max_bond_patch", False):
+        return
+
+    original = sparse_common.truncate_svd_result_blocksparse
+
+    def truncate_with_optional_hard_cap(
+        U,
+        s,
+        VH,
+        cutoff,
+        cutoff_mode,
+        max_bond,
+        absorb,
+        renorm,
+        backend=None,
+        use_abs=False,
+    ):
+        if not (
+            _STRICT_MAX_BOND_ACTIVE.get()
+            and cutoff > 0.0
+            and max_bond is not None
+            and max_bond > 0
+        ):
+            return original(
+                U,
+                s,
+                VH,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                max_bond=max_bond,
+                absorb=absorb,
+                renorm=renorm,
+                backend=backend,
+                use_abs=use_abs,
+            )
+
+        # First apply Symmray's numerical cutoff without an artificial cap;
+        # then impose an exact global dimension budget before absorption.
+        U, s, VH = original(
+            U,
+            s,
+            VH,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            max_bond=-1,
+            absorb=None,
+            renorm=renorm,
+            backend=backend,
+            use_abs=use_abs,
+        )
+        U, s, VH = _hard_cap_blocksparse_svd(U, s, VH, int(max_bond))
+        return sparse_common.absorb_svd_result(U, s, VH, absorb)
+
+    sparse_common.truncate_svd_result_blocksparse = truncate_with_optional_hard_cap
+    sparse_common._pepsy_strict_max_bond_patch = True
+
+
+@contextmanager
+def _strict_max_bond_context(enabled):
+    if not enabled:
+        yield
+        return
+    _install_strict_blocksparse_truncation()
+    token = _STRICT_MAX_BOND_ACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _STRICT_MAX_BOND_ACTIVE.reset(token)
+
 from ..backends.convert import (
     infer_backend_converter_from_sample,
     resolve_backend_sample_data_from_tn,
 )
-from ..tensors.core import add_cycle, id_to_mpo, id_to_pepo
+from ..tensors.core import OneDMap, add_cycle, id_to_mpo, id_to_pepo
 
 __all__ = [
     "gate",
@@ -996,6 +1142,39 @@ def _symmray_sample_data_from_tn(tn):
     return None
 
 
+def _is_native_fermionic_array(value):
+    """Return whether ``value`` is a native Symmray fermionic array."""
+    return _is_symmray_array(value) and type(value).__name__.endswith(
+        "FermionicArray"
+    )
+
+
+def _is_operator_tensor_network(tn):
+    """Return whether ``tn`` exposes distinct upper and lower site legs."""
+    return (
+        callable(getattr(tn, "upper_ind", None))
+        and callable(getattr(tn, "lower_ind", None))
+    )
+
+
+def _operator_ind_id(tn, which, arity):
+    """Return an operator's live upper/lower physical-index format."""
+    attr = "upper_ind_id" if which == "upper" else "lower_ind_id"
+    return getattr(tn, attr, _ind_id_from_which(which, arity))
+
+
+def _operator_which_from_ind_id(tn, ind_id):
+    """Map an explicit operator physical-index format to its side."""
+    if ind_id == getattr(tn, "upper_ind_id", None):
+        return "upper"
+    if ind_id == getattr(tn, "lower_ind_id", None):
+        return "lower"
+    raise ValueError(
+        "gate_simple() ind_id for an operator tensor network must match its "
+        "upper_ind_id or lower_ind_id. Prefer which='upper' or 'lower'."
+    )
+
+
 def _symmray_index_map_for_tn_ind(tn, ind):
     """Return the Symmray charge map for a live tensor-network index."""
     tensor_ids = getattr(tn, "ind_map", {}).get(ind, ())
@@ -1075,7 +1254,9 @@ def _symmray_dense_gate_from_site_maps(
         else 0
     )
 
-    dense_gate = np.asarray(gate)
+    if hasattr(gate, "to_dense"):
+        gate = gate.to_dense()
+    dense_gate = np.asarray(ar.to_numpy(gate))
     if inferred_converter is not None:
         dense_gate = inferred_converter(dense_gate)
 
@@ -1708,6 +1889,7 @@ def gate_simple(
     max_bond=None,
     cutoff=1e-12,
     cutoff_mode="rsum2",
+    strict_max_bond: bool = False,
     contract=None,
     sequence="auto",
     path_canonize=False,
@@ -1729,7 +1911,11 @@ def gate_simple(
     * Automatic long-range SWAP routing when the two sites are not adjacent
       (works for 1D / 2D / 3D ``where`` coordinates).
     * ``which``/``ind_id`` selection for vector-like networks whose physical
-      site-index family is not the default ``k...`` family.
+      site-index family is not the default ``k...`` family, and true one-sided
+      ``which='upper'`` / ``which='lower'`` updates for MPO/PEPO operators.
+    * A graded-safe native-fermion operator sandwich. With ``which=None``, a
+      native fermionic MPO/PEPO applies the upper gate and its conjugate lower
+      gate sequentially, avoiding Quimb's dense-style eager sandwich.
     * Dimension-aware, backend-aligned internal SWAP tensors for long-range
       routing through mixed physical dimensions.
     * Optional out-of-place semantics via ``inplace=False``.
@@ -1751,8 +1937,11 @@ def gate_simple(
     gauges : dict
         Simple-update gauge dictionary keyed by bond index (mutated in place).
     which : {"upper", "lower"} | None, optional
-        Convenience selector for the physical index family. ``"upper"`` maps
-        to ``k...`` indices and ``"lower"`` maps to ``b...`` indices.
+        Convenience selector for the physical index family. On an MPO/PEPO it
+        selects a true one-sided operator update. With ``None``, operator
+        networks use sandwich semantics; native fermionic operators perform
+        this as two graded one-sided updates. On vector-like networks,
+        ``"upper"`` maps to ``k...`` and ``"lower"`` maps to ``b...``.
     ind_id : str | None, optional
         Explicit physical index format, e.g. ``"k{}"``, ``"b{},{}"``.
     renorm : bool, optional
@@ -1768,6 +1957,11 @@ def gate_simple(
     cutoff_mode : str, optional
         Cutoff mode passed to ``gate_simple_`` (e.g. ``'rsum2'``, ``'rel'``).
         Default ``'rsum2'``.
+    strict_max_bond : bool, optional
+        Enforce ``max_bond`` as a hard *total* block-sparse bond limit even
+        when a nonzero cutoff has degenerate singular values at its boundary.
+        This is disabled by default to preserve Symmray's standard
+        degeneracy-preserving truncation policy.
     contract : {None, "auto", "split", "reduce-split"}, optional
         Two-site split strategy passed to Quimb. The default ``None``/``"auto"``
         selects ``"split"`` as a conservative fallback for block-sparse
@@ -1836,34 +2030,69 @@ def gate_simple(
         else:
             raise ValueError("Could not infer gate dimensionality from where.")
 
+        which_local = (
+            which_payload if which_payload is not None else which_default
+        )
+        is_operator = _is_operator_tensor_network(tn_work)
+        operator_which = None
         ind_id_local = ind_id
-        if which_payload is not None:
-            ind_id_local = _ind_id_from_which(which_payload, arity)
-        elif which_default is not None:
-            ind_id_local = _ind_id_from_which(which_default, arity)
+        if is_operator:
+            if which_local is not None:
+                operator_which = which_local
+                ind_id_local = _operator_ind_id(
+                    tn_work, operator_which, arity
+                )
+            elif ind_id_local is not None:
+                operator_which = _operator_which_from_ind_id(
+                    tn_work, ind_id_local
+                )
+        elif which_local is not None:
+            ind_id_local = _ind_id_from_which(which_local, arity)
 
         if ind_id_local is not None:
             _validate_gate_target_inds_exist(tn_work, where_norm, ind_id_local)
 
-        _gate_simple_one(
-            tn_work,
-            gate_payload,
-            where_norm,
-            gauges,
-            renorm=renorm,
-            smudge=smudge,
-            gate_opts=gate_opts,
-            ind_id=ind_id_local,
-            sequence=sequence,
-            path_canonize=path_canonize,
-            path_canonize_distance=path_canonize_distance,
-            path_canonize_opts=path_canonize_opts,
-            path_compress=path_compress,
-            path_compress_max_bond=path_compress_max_bond,
-            path_compress_cutoff=path_compress_cutoff,
-            path_compress_canonize_distance=path_compress_canonize_distance,
-            path_compress_opts=path_compress_opts,
-        )
+        gate_ind_id = None if is_operator else ind_id_local
+        gate_calls = ((gate_payload, operator_which, gate_ind_id),)
+        sample = _symmray_sample_data_from_tn(tn_work)
+        if (
+            is_operator
+            and operator_which is None
+            and ind_id_local is None
+            and _is_native_fermionic_array(sample)
+        ):
+            # Quimb's eager two-site sandwich forms a dense-style product of
+            # the upper gate and ``conj(gate)`` before splitting. That loses
+            # the graded ordering for native FermionicArray data. Its
+            # one-sided operator paths preserve the grading, so realize
+            # ``G @ O @ G.H`` as upper ``G`` followed by lower ``conj(G)``.
+            gate_calls = (
+                (gate_payload, "upper", None),
+                (ar.do("conj", gate_payload), "lower", None),
+            )
+
+        for gate_one, operator_which_one, ind_id_one in gate_calls:
+            with _strict_max_bond_context(strict_max_bond):
+                _gate_simple_one(
+                    tn_work,
+                    gate_one,
+                    where_norm,
+                    gauges,
+                    renorm=renorm,
+                    smudge=smudge,
+                    gate_opts=gate_opts,
+                    ind_id=ind_id_one,
+                    operator_which=operator_which_one,
+                    sequence=sequence,
+                    path_canonize=path_canonize,
+                    path_canonize_distance=path_canonize_distance,
+                    path_canonize_opts=path_canonize_opts,
+                    path_compress=path_compress,
+                    path_compress_max_bond=path_compress_max_bond,
+                    path_compress_cutoff=path_compress_cutoff,
+                    path_compress_canonize_distance=path_compress_canonize_distance,
+                    path_compress_opts=path_compress_opts,
+                )
 
     return tn_work
 
@@ -1937,14 +2166,14 @@ def gate_loop_cluster(
     if any(hasattr(tensor.data, "to_dense") for tensor in tn_work.tensor_map.values()):
         for tensor in tn_work.tensor_map.values():
             if hasattr(tensor.data, "to_dense"):
-                tensor.modify(data=np.asarray(tensor.data.to_dense()))
+                tensor.modify(data=np.asarray(ar.to_numpy(tensor.data.to_dense())))
         for index, gauge in tuple(gauges.items()):
             if hasattr(gauge, "to_dense"):
-                gauges[index] = np.asarray(gauge.to_dense())
+                gauges[index] = np.asarray(ar.to_numpy(gauge.to_dense()))
 
     for gate_payload, where_payload, which_payload in entries:
         if hasattr(gate_payload, "to_dense"):
-            gate_payload = np.asarray(gate_payload.to_dense())
+            gate_payload = np.asarray(ar.to_numpy(gate_payload.to_dense()))
 
         if _is_explicit_index_where(where_payload):
             raise ValueError(
@@ -2056,6 +2285,7 @@ def _gate_simple_one(
     smudge,
     gate_opts,
     ind_id=None,
+    operator_which=None,
     sequence=None,
     path_canonize=False,
     path_canonize_distance=1,
@@ -2073,6 +2303,10 @@ def _gate_simple_one(
             "gate_simple_(); use gate(..., which=...) or gate_nonlocal_opt(...) "
             "for MPO/PEPO operator layers."
         )
+
+    gate_opts = dict(gate_opts)
+    if operator_which is not None:
+        gate_opts["which"] = operator_which
 
     has_site_ind_id = hasattr(tn_work, "site_ind_id")
     old_site_ind_id = getattr(tn_work, "site_ind_id", None)
@@ -2127,13 +2361,26 @@ def _gate_simple_one_with_current_site_ind_id(
     path_compress_canonize_distance=0,
     path_compress_opts=None,
 ):
-    """Apply a single gate assuming ``site_ind_id`` has already been selected."""
+    """Apply a single gate after selecting its site-index family or side."""
     # One-site gate — no gauge update needed.
     if len(where) == 1:
-        tn_work.gate_simple_(
-            G, where=where, gauges=gauges,
-            renorm=False, smudge=smudge, inplace=True,
-        )
+        operator_which = gate_opts.get("which")
+        if operator_which is None:
+            tn_work.gate_simple_(
+                G, where=where, gauges=gauges,
+                renorm=False, smudge=smudge, inplace=True,
+            )
+        else:
+            # Quimb's one-tensor gate_simple shortcut does not forward
+            # gate_opts (including ``which``). There is no gauge to update,
+            # so use its direct one-sided operator gate instead.
+            tn_work.gate_(
+                G,
+                where=where,
+                which=operator_which,
+                contract=True,
+                inplace=True,
+            )
         return tn_work
 
     # Two-site gate — check if the sites share a bond.
@@ -2183,6 +2430,10 @@ def _gate_simple_one_with_current_site_ind_id(
         cast_complex_to_real=True,
     )
     swap_ind_id = getattr(tn_work, "site_ind_id", None)
+    operator_which = gate_opts.get("which")
+    if swap_ind_id is None and operator_which is not None:
+        ndim = len(site_a) if isinstance(site_a, (tuple, list)) else 1
+        swap_ind_id = _operator_ind_id(tn_work, operator_which, ndim)
 
     ndim = len(site_a) if isinstance(site_a, (tuple, list)) else 1
     if ndim == 1:
@@ -2798,6 +3049,174 @@ def _apply_gate_3d(
     return tn
 
 
+def _native_gate_stream_info(gate_list, *, allow_charged=False):
+    """Validate a native Symmray fermionic gate stream and describe its legs."""
+    native_flags = [
+        _is_block_sparse_array(gate_op)
+        and "FermionicArray" in type(gate_op).__name__
+        for gate_op in gate_list
+    ]
+    if not any(native_flags):
+        return None
+    if not all(native_flags):
+        raise TypeError(
+            "Native FermionicArray gate builders cannot mix native and dense gates."
+        )
+
+    from ..tensors.symmetric import (  # pylint: disable=import-outside-toplevel
+        _expanded_index_charges,
+        _normalize_group_charge,
+        _zero_like_charge,
+    )
+
+    first = gate_list[0]
+    rank = len(first.indices)
+    if rank not in {2, 4}:
+        raise ValueError(
+            "Native gate builders support one- and two-site FermionicArray gates."
+        )
+    n_sites = rank // 2
+    symmetry = str(getattr(first, "symmetry", ""))
+    first_charge = _normalize_group_charge(
+        getattr(first, "charge", 0), symmetry
+    )
+    zero = _zero_like_charge(first_charge)
+    gate_charges = [
+        _normalize_group_charge(getattr(gate_op, "charge", zero), symmetry)
+        for gate_op in gate_list
+    ]
+    if not allow_charged and any(charge != zero for charge in gate_charges):
+        raise ValueError(
+            "Native gate builders require charge-neutral gates by default; "
+            "pass allow_charged=True to accumulate a charged operator stream."
+        )
+
+    output_maps = tuple(
+        tuple(_expanded_index_charges(index))
+        for index in first.indices[:n_sites]
+    )
+    input_maps = tuple(
+        tuple(_expanded_index_charges(index))
+        for index in first.indices[n_sites:]
+    )
+    if output_maps != input_maps:
+        raise ValueError(
+            "Native gate builders require matching upper/lower physical charge maps."
+        )
+    if any(site_map != output_maps[0] for site_map in output_maps[1:]):
+        raise ValueError(
+            "Native gate builders require one physical charge map per site."
+        )
+
+    for gate_op, gate_charge in zip(gate_list[1:], gate_charges[1:]):
+        if len(gate_op.indices) != rank:
+            raise ValueError("All native gates must act on the same number of sites.")
+        if str(getattr(gate_op, "symmetry", "")) != symmetry:
+            raise ValueError("All native gates must use the same Abelian symmetry.")
+        if not allow_charged and gate_charge != zero:
+            raise ValueError("All native gates must be charge-neutral.")
+        gate_maps = tuple(
+            tuple(_expanded_index_charges(index))
+            for index in gate_op.indices
+        )
+        if gate_maps[:n_sites] != output_maps or gate_maps[n_sites:] != input_maps:
+            raise ValueError(
+                "All native gates must use the same physical charge maps."
+            )
+
+    return {
+        "fermionic": True,
+        "n_sites": n_sites,
+        "phys_map": list(output_maps[0]),
+        "symmetry": symmetry,
+        "zero": zero,
+        "dtype": getattr(first, "dtype", np.dtype("complex128")),
+        "gate_charges": tuple(gate_charges),
+    }
+
+
+def _native_identity_mpo(length, info, *, max_bond, cutoff):
+    """Build an identity MPO whose tensors use native fermionic sectors."""
+    from ..tensors.symmetric import (  # pylint: disable=import-outside-toplevel
+        _assemble_symmray_mpo,
+    )
+
+    start = ("start",)
+    done = ("done",)
+    channels = [
+        [(start, info["zero"]), (done, info["zero"])]
+        for _ in range(max(length - 1, 0))
+    ]
+    return _assemble_symmray_mpo(
+        L=length,
+        channels=channels,
+        transitions=[[] for _ in range(length)],
+        phys_map=info["phys_map"],
+        symmetry=info["symmetry"],
+        zero=info["zero"],
+        dtype=info["dtype"],
+        max_bond=max_bond,
+        cutoff=cutoff,
+        compress=False,
+        fermionic=True,
+    )
+
+
+def _validate_native_pepo_compatibility(pepo, info):
+    """Validate a supplied native PEPO before applying native gates to it."""
+    from ..tensors.symmetric import (  # pylint: disable=import-outside-toplevel
+        _expanded_index_charges,
+    )
+
+    tensors = tuple(getattr(pepo, "tensors", ()))
+    if not tensors:
+        raise TypeError(
+            "Native FermionicArray gates require a non-empty native Symmray PEPO."
+        )
+
+    expected_symmetry = info["symmetry"]
+    expected_phys_map = tuple(info["phys_map"])
+    for tensor in tensors:
+        data = tensor.data
+        if not (
+            _is_block_sparse_array(data)
+            and "FermionicArray" in type(data).__name__
+            and bool(getattr(data, "fermionic", False))
+        ):
+            raise TypeError(
+                "Native FermionicArray gates require a native fermionic "
+                "Symmray PEPO."
+            )
+        actual_symmetry = str(getattr(data, "symmetry", ""))
+        if actual_symmetry != expected_symmetry:
+            raise ValueError(
+                "Native gate symmetry "
+                f"{expected_symmetry} does not match supplied PEPO symmetry "
+                f"{actual_symmetry}."
+            )
+
+    try:
+        outer_inds = set(pepo.outer_inds())
+    except (AttributeError, TypeError) as exc:
+        raise TypeError(
+            "Native FermionicArray gates require a PEPO with physical outer "
+            "indices."
+        ) from exc
+
+    for tensor in tensors:
+        for axis, ind in enumerate(tensor.inds):
+            if ind not in outer_inds:
+                continue
+            actual_phys_map = tuple(
+                _expanded_index_charges(tensor.data.indices[axis])
+            )
+            if actual_phys_map != expected_phys_map:
+                raise ValueError(
+                    "Native gate physical charge maps do not match the "
+                    "supplied PEPO physical charge maps."
+                )
+
+
 def build_pepo_from_gates(
     gates,
     wheres=None,
@@ -2810,6 +3229,8 @@ def build_pepo_from_gates(
     sequence="auto",
     contract="reduce-split",
     ind_id="k{},{}",
+    mapper=None,
+    allow_charged=False,
 ):
     """Build a PEPO from gate-style input on top of a PEPO identity.
 
@@ -2846,6 +3267,13 @@ def build_pepo_from_gates(
         path, which is usually cheaper than ``"split"`` for PEPO/PEPS tensors.
     ind_id : str, default="k{},{}"
         Physical index format used for PEPO ket-family indices.
+    mapper : OneDMap | None, optional
+        Optional lattice-to-chain mapping used when native Symmray gates are
+        supplied. PEPO conversion supports ``snake`` and
+        ``snake-row-major`` mappings.
+    allow_charged : bool, default=False
+        Allow native gates with nonzero operator charge. The returned PEPO
+        then carries the accumulated charge of the sequential gate product.
 
     Returns
     -------
@@ -2856,19 +3284,67 @@ def build_pepo_from_gates(
     gate_list = [g for g, _ in entries]
     where_list = [w for _, w in entries]
 
+    native_info = _native_gate_stream_info(
+        gate_list,
+        allow_charged=allow_charged,
+    )
+
     coords = [c for w in where_list for c in w]
-    Lx = max(i for i, _ in coords) + 1
-    Ly = max(j for _, j in coords) + 1
+    if mapper is None:
+        Lx = max(i for i, _ in coords) + 1
+        Ly = max(j for _, j in coords) + 1
+    else:
+        if not isinstance(mapper, OneDMap):
+            raise TypeError("mapper must be a 2D OneDMap instance or None.")
+        try:
+            mapper_shape = tuple(mapper.shape)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise TypeError("mapper must be a 2D OneDMap instance or None.") from exc
+        if len(mapper_shape) != 2:
+            raise ValueError("build_pepo_from_gates requires a 2D OneDMap.")
+        Lx, Ly = mapper_shape
 
-    pepo = pepo_.copy() if pepo_ is not None else id_to_pepo(Lx, Ly, dtype=dtype)
-    if pepo_ is None and cyclic:
-        pepo = add_cycle(pepo, 1)
+    if native_info is not None and pepo_ is None:
+        from .hamiltonians import ham_tn  # pylint: disable=import-outside-toplevel
 
-    for tensor in pepo:
-        tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
+        builder = ham_tn(
+            Lx=Lx,
+            Ly=Ly,
+            mapper=mapper,
+            max_bond=256 if max_bond is None else max_bond,
+            cutoff=cutoff,
+            data_type=native_info["dtype"],
+        )
+        mpo = _native_identity_mpo(
+            builder.L,
+            native_info,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+        pepo = builder.mpo_to_pepo(
+            mpo,
+            cycle_peps=cyclic,
+            cycle_bond_dim=1,
+            inplace=True,
+        )
+    elif native_info is not None:
+        pepo = pepo_.copy()
+        _validate_native_pepo_compatibility(pepo, native_info)
+    else:
+        pepo = pepo_.copy() if pepo_ is not None else id_to_pepo(Lx, Ly, dtype=dtype)
+        if pepo_ is None and cyclic:
+            pepo = add_cycle(pepo, 1)
+
+    if native_info is None:
+        for tensor in pepo:
+            tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for gate_op, where_norm in zip(gate_list, where_list):
-        gate_use = _to_ket_gate_layout(gate_op, len(where_norm))
+        gate_use = (
+            gate_op
+            if native_info is not None
+            else _to_ket_gate_layout(gate_op, len(where_norm))
+        )
 
         gate(
             pepo, gate_use, where_norm,
@@ -2925,6 +3401,7 @@ def build_mpo_from_gates(
     max_bond=16,
     contract="reduce-split",
     ind_id="k{}",
+    allow_charged=False,
 ):
     """Build an MPO from gate-style input on top of an MPO identity.
 
@@ -2957,6 +3434,9 @@ def build_mpo_from_gates(
         path, which is usually cheaper than ``"split"`` for MPO tensors.
     ind_id : str, default="k{}"
         Physical index format used for MPO ket-family indices.
+    allow_charged : bool, default=False
+        Allow native gates with nonzero operator charge. The returned MPO
+        then carries the accumulated charge of the sequential gate product.
 
     Returns
     -------
@@ -2967,18 +3447,42 @@ def build_mpo_from_gates(
     gate_list = [g for g, _ in entries]
     where_list = [w for _, w in entries]
 
+    native_info = _native_gate_stream_info(
+        gate_list,
+        allow_charged=allow_charged,
+    )
+
     coords = [int(i) for w in where_list for i in w]
     L = max(coords) + 1
 
-    mpo = mpo_.copy() if mpo_ is not None else id_to_mpo(
-        L, phys_dim=2, dtype=dtype, cyclic=cyclic
-    )
+    if native_info is not None and mpo_ is None:
+        mpo = _native_identity_mpo(
+            L,
+            native_info,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+    else:
+        mpo = mpo_.copy() if mpo_ is not None else id_to_mpo(
+            L, phys_dim=2, dtype=dtype, cyclic=cyclic
+        )
 
-    for tensor in mpo:
-        tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
+    if native_info is not None and any(
+        not _is_block_sparse_array(tensor.data) for tensor in mpo
+    ):
+        raise TypeError(
+            "Native FermionicArray gates require a native Symmray MPO."
+        )
+    if native_info is None:
+        for tensor in mpo:
+            tensor.modify(data=ar.do("array", tensor.data, like=gate_list[0]))
 
     for gate_op, where_norm in zip(gate_list, where_list):
-        gate_use = _to_ket_gate_layout(gate_op, len(where_norm))
+        gate_use = (
+            gate_op
+            if native_info is not None
+            else _to_ket_gate_layout(gate_op, len(where_norm))
+        )
 
         gate(
             mpo,

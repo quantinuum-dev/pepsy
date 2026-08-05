@@ -85,6 +85,9 @@ _CONTRACTION_ALIASES = {
 }
 
 
+_SAMPLING_UNSET = object()
+
+
 def _positive_int(name, value, *, allow_none=False):
     if value is None and allow_none:
         return None
@@ -147,40 +150,129 @@ def _resolve_contraction_config(contraction, chi=None, cutoff=None, options=None
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class SamplingConfig:
-    """Shared chain-preserving sampling settings."""
+    """Shared chain-preserving sampling settings.
 
-    n_samples_per_chain: int = 128
-    n_chains: int = 16
-    burn_in: int = 0
-    thin: int = 1
-    seed: int | None = None
-    sampler_seed: int | None = None
-    chunk_size: int | None = None
-    proposal: str | None = None
+    The canonical constructor follows NetKet::
 
-    def __post_init__(self):
-        n_samples = _positive_int("n_samples_per_chain", self.n_samples_per_chain)
-        n_chains = _positive_int("n_chains", self.n_chains)
-        if isinstance(self.burn_in, bool) or not isinstance(self.burn_in, int) or self.burn_in < 0:
-            raise ValueError("burn_in must be a non-negative integer.")
-        thin = _positive_int("thin", self.thin)
-        chunk_size = _positive_int("chunk_size", self.chunk_size, allow_none=True)
-        if self.seed is not None and isinstance(self.seed, bool):
+    ``n_samples`` is the total requested across chains,
+    ``n_discard_per_chain`` is the discarded prefix of every chain, and
+    ``sweep_size`` is the number of Metropolis sweeps between retained
+    configurations. The total must be divisible by ``n_chains`` so both
+    backends can return a fixed chain-shaped batch.
+
+    The former ``n_samples_per_chain``, ``burn_in``, and ``thin`` keywords are
+    retained as compatibility aliases. They are also exposed as properties
+    for callers that still use the original Pepsy spelling.
+    """
+
+    n_samples_per_chain: int
+    n_chains: int
+    burn_in: int
+    thin: int
+    seed: int | None
+    sampler_seed: int | None
+    chunk_size: int | None
+    proposal: str | None
+
+    def __init__(
+        self,
+        n_samples_per_chain=_SAMPLING_UNSET,
+        n_chains=16,
+        burn_in=_SAMPLING_UNSET,
+        thin=_SAMPLING_UNSET,
+        seed=None,
+        sampler_seed=None,
+        chunk_size=None,
+        proposal=None,
+        *,
+        n_samples=_SAMPLING_UNSET,
+        n_discard_per_chain=_SAMPLING_UNSET,
+        sweep_size=_SAMPLING_UNSET,
+    ):
+        if (
+            n_samples is not _SAMPLING_UNSET
+            and n_samples_per_chain is not _SAMPLING_UNSET
+        ):
+            raise ValueError(
+                "Pass either n_samples or n_samples_per_chain, not both."
+            )
+        if (
+            n_discard_per_chain is not _SAMPLING_UNSET
+            and burn_in is not _SAMPLING_UNSET
+        ):
+            raise ValueError(
+                "Pass either n_discard_per_chain or burn_in, not both."
+            )
+        if sweep_size is not _SAMPLING_UNSET and thin is not _SAMPLING_UNSET:
+            raise ValueError("Pass either sweep_size or thin, not both.")
+
+        n_chains = _positive_int("n_chains", n_chains)
+        if n_samples is _SAMPLING_UNSET:
+            n_samples_per_chain = (
+                128
+                if n_samples_per_chain is _SAMPLING_UNSET
+                else n_samples_per_chain
+            )
+            n_samples_per_chain = _positive_int(
+                "n_samples_per_chain",
+                n_samples_per_chain,
+            )
+            n_samples = n_samples_per_chain * n_chains
+        else:
+            n_samples = _positive_int("n_samples", n_samples)
+            if n_samples % n_chains:
+                raise ValueError(
+                    "n_samples must be divisible by n_chains so every chain "
+                    "has the same retained length."
+                )
+            n_samples_per_chain = n_samples // n_chains
+
+        if burn_in is _SAMPLING_UNSET:
+            burn_in = (
+                0
+                if n_discard_per_chain is _SAMPLING_UNSET
+                else n_discard_per_chain
+            )
+        if (
+            isinstance(burn_in, bool)
+            or not isinstance(burn_in, int)
+            or burn_in < 0
+        ):
+            raise ValueError("n_discard_per_chain must be a non-negative integer.")
+        if thin is _SAMPLING_UNSET:
+            thin = 1 if sweep_size is _SAMPLING_UNSET else sweep_size
+        thin = _positive_int("sweep_size", thin)
+        chunk_size = _positive_int("chunk_size", chunk_size, allow_none=True)
+        if seed is not None and isinstance(seed, bool):
             raise ValueError("seed must be an integer or None.")
-        if self.sampler_seed is not None and isinstance(self.sampler_seed, bool):
+        if sampler_seed is not None and isinstance(sampler_seed, bool):
             raise ValueError("sampler_seed must be an integer or None.")
-        object.__setattr__(self, "n_samples_per_chain", n_samples)
+
+        object.__setattr__(self, "n_samples_per_chain", n_samples_per_chain)
         object.__setattr__(self, "n_chains", n_chains)
-        object.__setattr__(self, "burn_in", int(self.burn_in))
+        object.__setattr__(self, "burn_in", int(burn_in))
         object.__setattr__(self, "thin", thin)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "sampler_seed", sampler_seed)
         object.__setattr__(self, "chunk_size", chunk_size)
+        object.__setattr__(self, "proposal", proposal)
 
     @property
     def n_samples(self):
         """Total requested samples across all chains."""
         return self.n_samples_per_chain * self.n_chains
+
+    @property
+    def n_discard_per_chain(self):
+        """Number of discarded samples/intervals per chain."""
+        return self.burn_in
+
+    @property
+    def sweep_size(self):
+        """Number of Metropolis sweeps between retained configurations."""
+        return self.thin
 
     def torch_kwargs(self):
         """Return the canonical keyword mapping for Torch samplers.
@@ -196,7 +288,7 @@ class SamplingConfig:
             "n_samples": self.n_samples,
             "n_chains": self.n_chains,
             "n_discard_per_chain": self.burn_in,
-            "n_thin": self.thin,
+            "sweep_size": self.thin,
             "seed": self.seed,
             "sampler_seed": self.sampler_seed,
         }
@@ -586,8 +678,8 @@ class MCState:
     ``MCState`` owns the variational ansatz and the sampling specification;
     :class:`VMC` attaches a Hamiltonian and builds the selected backend. The
     familiar ``n_samples`` value is the total over all chains, exactly as in
-    NetKet. ``sampling=SamplingConfig(...)`` remains available when the
-    per-chain convention is more convenient.
+    NetKet. ``SamplingConfig`` accepts the same total-sample spelling, while
+    retaining its older per-chain aliases for compatibility.
     """
 
     peps: Any
@@ -605,6 +697,7 @@ class MCState:
         n_chains=None,
         n_discard_per_chain=None,
         thin=None,
+        sweep_size=None,
         seed=None,
         sampler_seed=None,
         chunk_size=None,
@@ -621,6 +714,7 @@ class MCState:
                 "n_chains": n_chains,
                 "n_discard_per_chain": n_discard_per_chain,
                 "thin": thin,
+                "sweep_size": sweep_size,
                 "seed": seed,
                 "sampler_seed": sampler_seed,
                 "chunk_size": chunk_size,
@@ -642,11 +736,19 @@ class MCState:
                     "n_samples must be divisible by n_chains so every chain "
                     "has the same retained length."
                 )
+            if thin is not None and sweep_size is not None:
+                raise ValueError("Pass either thin or sweep_size, not both.")
             sampling = SamplingConfig(
-                n_samples_per_chain=n_samples // n_chains,
+                n_samples=n_samples,
                 n_chains=n_chains,
-                burn_in=0 if n_discard_per_chain is None else n_discard_per_chain,
-                thin=1 if thin is None else thin,
+                n_discard_per_chain=(
+                    0 if n_discard_per_chain is None else n_discard_per_chain
+                ),
+                sweep_size=(
+                    1
+                    if thin is None and sweep_size is None
+                    else thin if sweep_size is None else sweep_size
+                ),
                 seed=seed,
                 sampler_seed=sampler_seed,
                 chunk_size=chunk_size,
@@ -685,7 +787,12 @@ class MCState:
     @property
     def n_discard_per_chain(self):
         """Per-chain burn-in, using NetKet's naming convention."""
-        return self.sampling.burn_in
+        return self.sampling.n_discard_per_chain
+
+    @property
+    def sweep_size(self):
+        """Metropolis sweeps between retained samples."""
+        return self.sampling.sweep_size
 
     def to_problem(self, hamiltonian, *, observables=None):
         """Make the compatibility :class:`VMCProblem` representation."""
@@ -824,6 +931,10 @@ class VMC:
             weights=weights,
             proposal_log_probs=proposal_log_probs,
         )
+
+    def check_mc_convergence(self, **kwargs):
+        """Run the selected backend's explicit post-run mixing diagnostic."""
+        return self._setup.check_mc_convergence(**kwargs)
 
     def optimize(self, optimization=None, *, n_steps=None, **kwargs):
         """Optimize the variational state through the selected backend."""

@@ -1,7 +1,9 @@
 """Tests for the backend-neutral VMC API contracts."""
 
+import os
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from pepsy.vmc import (
     BackendCapabilityWarning,
@@ -87,6 +89,15 @@ def test_mcstate_uses_netket_total_sample_convention_and_bridges_to_problem():
     assert state.sampling.n_samples_per_chain == 4
     assert state.ansatz is state.peps
     assert state.to_problem(OperatorSum()).site_order == (0, 1)
+
+    canonical_state = MCState(
+        object(),
+        n_samples=12,
+        n_chains=3,
+        n_discard_per_chain=4,
+        sweep_size=2,
+    )
+    assert canonical_state.sweep_size == 2
 
     with pytest.raises(ValueError, match="divisible"):
         MCState(object(), n_samples=5, n_chains=2)
@@ -209,14 +220,170 @@ def test_warning_types_are_backend_neutral():
     assert issubclass(VMCBackendCapabilityError, NotImplementedError)
 
 
-def test_netket_portable_adapter_rejects_external_weighted_batches():
+def test_netket_measure_samples_reuses_only_the_current_cache():
+    from pepsy.vmc.netket import NetKetPEPSVMC
+
+    native_samples = object()
+    seen = []
+
+    class State:
+        _samples = native_samples
+
+        def expect(self, observable):
+            seen.append(observable)
+            return f"stats:{observable}"
+
+    setup = NetKetPEPSVMC(
+        hilbert=None,
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=State(),
+        model=None,
+        ansatz=SimpleNamespace(n_sites=1, n_params=1),
+        config_map=None,
+        preconditioner=None,
+    )
+    retained = VMCSamples(
+        configs=np.zeros((1, 1, 1), dtype=np.int64),
+        n_samples_per_chain=1,
+        n_chains=1,
+        native=native_samples,
+    )
+
+    assert setup.measure_samples(retained, {"density": "n", "spin": "sz"}) == {
+        "density": "stats:n",
+        "spin": "stats:sz",
+    }
+    assert seen == ["n", "sz"]
+    with pytest.raises(VMCBackendCapabilityError, match="current MCState sample cache"):
+        setup.measure_samples(
+            VMCSamples(
+                configs=np.zeros((1, 1, 1), dtype=np.int64),
+                n_samples_per_chain=1,
+                n_chains=1,
+                native=object(),
+            ),
+            {"density": "n"},
+        )
+
+
+def test_netket_measure_samples_compiles_eta_pair_on_retained_batch(monkeypatch):
+    import pepsy.vmc.netket as netket_vmc
+    from pepsy.vmc.netket import NetKetEtaPairObservable, NetKetPEPSVMC
+
+    native_samples = object()
+    compiled = []
+
+    class State:
+        _samples = native_samples
+
+        def expect(self, observable):
+            return f"stats:{len(observable)}"
+
+    def fake_fermion_operator(hilbert, terms, *, constant=0.0, conserving=False):
+        assert hilbert == "fermion-hilbert"
+        assert constant == 0.0
+        assert conserving == "auto"
+        compiled.append(tuple(terms))
+        return compiled[-1]
+
+    monkeypatch.setattr(netket_vmc, "netket_fermion_operator", fake_fermion_operator)
+    setup = NetKetPEPSVMC(
+        hilbert="fermion-hilbert",
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=State(),
+        model=None,
+        ansatz=SimpleNamespace(
+            n_sites=4,
+            n_params=1,
+            orbital_sites=((0, 0), (0, 1), (1, 0), (1, 1)),
+        ),
+        config_map=None,
+        preconditioner=None,
+    )
+    retained = VMCSamples(
+        configs=np.zeros((1, 4, 1), dtype=np.int64),
+        n_samples_per_chain=1,
+        n_chains=1,
+        native=native_samples,
+    )
+
+    measured = setup.measure_samples(
+        retained,
+        {
+            "eta": NetKetEtaPairObservable(
+                1,
+                0,
+                periodic=True,
+                staggered=True,
+            )
+        },
+    )
+
+    assert measured == {"eta": "stats:8"}
+    assert len(compiled) == 1
+    assert compiled[0][0] == (
+        -0.25,
+        ((0, 1, True), (0, -1, True), (2, -1, False), (2, 1, False)),
+    )
+    assert compiled[0][1] == (
+        -0.25,
+        ((2, 1, True), (2, -1, True), (0, -1, False), (0, 1, False)),
+    )
+
+
+def test_netket_portable_adapter_rejects_weighted_batches():
     from pepsy.vmc.netket import NetKetVMCSetup
 
     setup = NetKetVMCSetup(setup=object(), problem=object())
-    with pytest.raises(VMCBackendCapabilityError, match="externally supplied"):
-        setup.measure(samples=np.zeros((2, 1), dtype=np.int64))
-    with pytest.raises(VMCBackendCapabilityError, match="externally supplied"):
+    with pytest.raises(VMCBackendCapabilityError, match="weighted or proposal"):
+        setup.measure(weights=np.ones(2))
+    with pytest.raises(VMCBackendCapabilityError, match="weighted sample"):
         setup.optimize(n_steps=1, weights=np.ones(2))
+
+
+def test_netket_portable_adapter_measures_a_retained_batch():
+    from pepsy.vmc.netket import NetKetVMCSetup
+
+    retained_native = object()
+    seen = {}
+
+    class NativeSetup:
+        hamiltonian = "hamiltonian"
+        observables = {"density": "density"}
+
+        def measure_samples(self, samples, observables=None):
+            seen["samples"] = samples
+            seen["observables"] = observables
+            return {
+                name: SimpleNamespace(
+                    mean=float(index),
+                    variance=0.0,
+                    error_of_mean=0.0,
+                )
+                for index, name in enumerate(observables)
+            }
+
+    facade = NetKetVMCSetup(
+        setup=NativeSetup(),
+        problem=VMCProblem(peps=object(), hamiltonian="hamiltonian"),
+    )
+    retained = VMCSamples(
+        configs=np.zeros((1, 1, 1), dtype=np.int64),
+        n_samples_per_chain=1,
+        n_chains=1,
+        native=retained_native,
+    )
+    measurement = facade.measure(samples=retained)
+
+    assert seen["samples"] is retained
+    assert seen["observables"] == {"energy": "hamiltonian", "density": "density"}
+    assert measurement.energy_mean == 0.0
+    assert measurement.observables["density"].mean == 1.0
+    assert measurement.diagnostics["samples"] is retained
 
 
 def test_shared_configuration_objects_normalize_aliases_and_defaults():
@@ -232,10 +399,28 @@ def test_shared_configuration_objects_normalize_aliases_and_defaults():
     assert contraction.method == "boundary"
     assert contraction.chi == 4
     assert sampling.thin == 2
+    assert sampling.sweep_size == 2
+    assert sampling.n_discard_per_chain == 3
     assert sampling.n_samples == 16
     assert sampling.torch_kwargs()["n_samples"] == 16
     assert sampling.netket_kwargs()["n_samples"] == 16
     assert optimization.method == "minsr"
+
+    canonical = SamplingConfig(
+        n_samples=16,
+        n_chains=2,
+        n_discard_per_chain=3,
+        sweep_size=2,
+    )
+    assert canonical.n_samples_per_chain == 8
+    assert canonical.burn_in == 3
+    assert canonical.thin == 2
+    assert canonical.torch_kwargs()["sweep_size"] == 2
+
+    with pytest.raises(ValueError, match="either n_samples"):
+        SamplingConfig(n_samples=16, n_samples_per_chain=8, n_chains=2)
+    with pytest.raises(ValueError, match="either sweep_size"):
+        SamplingConfig(sweep_size=2, thin=2)
 
     with pytest.raises(ValueError, match="chi is required"):
         ContractionConfig(method="ctmrg")
@@ -266,15 +451,46 @@ def test_torch_driver_consumes_shared_sampling_and_optimization_configs():
     )
     samples = driver.sample(
         sampling=SamplingConfig(
-            n_samples_per_chain=2,
+            n_samples=4,
             n_chains=2,
-            burn_in=0,
-            thin=1,
+            n_discard_per_chain=0,
+            sweep_size=1,
             seed=12,
         )
     )
     assert samples.configs.shape == (2, 2, 2)
     assert samples.to_common().chain_shape == (2, 2)
+    assert samples.provenance is not None
+    assert samples.provenance.model_identity == id(driver.model)
+
+    with torch.no_grad():
+        driver.model.weights.add_(0.1)
+    with pytest.raises(RuntimeError, match="different PEPS/model state"):
+        driver.measure_samples(samples)
+
+    samples = driver.sample(
+        sampling=SamplingConfig(
+            n_samples_per_chain=1,
+            n_chains=2,
+            burn_in=0,
+            thin=1,
+            seed=14,
+        )
+    )
+    driver.model.contraction = "exact"
+    with pytest.raises(RuntimeError, match="different PEPS/model state"):
+        driver.measure_samples(samples)
+
+    measurement = driver.estimate_observable(
+        sampling=SamplingConfig(
+            n_samples_per_chain=1,
+            n_chains=2,
+            burn_in=0,
+            thin=1,
+            seed=13,
+        )
+    )
+    assert measurement.n_samples == 2
 
     history = driver.optimize(
         optimization=OptimizationConfig(
@@ -286,6 +502,255 @@ def test_torch_driver_consumes_shared_sampling_and_optimization_configs():
         sample_sweeps=1,
     )
     assert len(history) == 1
+
+
+def test_torch_fermion_measurement_api_keeps_sampling_and_estimation_separate(
+    monkeypatch,
+):
+    torch = pytest.importorskip("torch")
+    from pepsy.vmc import (
+        TorchFermionVMC,
+        TorchVMCMeasurementRun,
+        TorchVMCWarmupResult,
+    )
+    from pepsy.vmc.torch import TorchVMCDriver
+
+    vmc = object.__new__(TorchFermionVMC)
+    vmc.observables = {"density": "compiled-density"}
+    vmc._compile_observables = lambda observables: {
+        name: f"compiled:{value}" for name, value in observables.items()
+    }
+
+    seen = {}
+    vmc._ensure_initialized = lambda **kwargs: seen.setdefault(
+        "ensure", kwargs
+    )
+
+    def fake_estimate(self, observables, **kwargs):
+        seen["estimate_observables"] = observables
+        seen["estimate_kwargs"] = kwargs
+        return observables
+
+    monkeypatch.setattr(TorchVMCDriver, "estimate_observables", fake_estimate)
+    sampling = SamplingConfig(
+        n_samples_per_chain=2,
+        n_chains=3,
+        burn_in=4,
+        thin=2,
+        seed=9,
+    )
+    estimates = vmc.estimate_observables(sampling=sampling)
+    assert estimates == {"energy": None, "density": "compiled-density"}
+    assert seen["estimate_kwargs"] == {"sampling": sampling}
+
+    class ConstantAmplitude(torch.nn.Module):
+        def forward(self, configs):
+            return torch.ones(configs.shape[0], dtype=torch.float64)
+
+    warmup_driver = object.__new__(TorchFermionVMC)
+    warmup_driver.configs = torch.tensor([[1, 2], [2, 1]], dtype=torch.long)
+    warmup_driver.model = ConstantAmplitude()
+    warmup_driver.chunk_size = None
+    warmup_driver._ensure_initialized = lambda **kwargs: None
+    warmup = warmup_driver.warmup()
+    assert warmup.config.tolist() == [1, 2]
+    assert warmup.amplitude.item() == pytest.approx(1.0)
+    assert warmup.n_sweeps == 0
+
+    native_samples = object()
+    vmc.warmup = lambda *, n_sweeps, progress: warmup
+    vmc.sample = lambda *, sampling, progress: native_samples
+
+    def fake_measure(samples, *, observables, profile, progress, **kwargs):
+        seen["run_observables"] = observables
+        seen["measure_kwargs"] = kwargs
+        assert samples is native_samples
+        assert not profile
+        assert not progress
+        return {name: name for name in observables}
+
+    vmc.measure_samples = fake_measure
+    run = vmc.run(sampling=sampling, progress=False)
+    assert isinstance(run, TorchVMCMeasurementRun)
+    assert isinstance(run.warmup, TorchVMCWarmupResult)
+    assert run.samples is native_samples
+    assert run.energy == "energy"
+    assert run.estimates == {"energy": "energy", "density": "density"}
+    assert seen["run_observables"] == {
+        "energy": None,
+        "density": "compiled-density",
+    }
+    assert seen["measure_kwargs"] == {
+        "amplitudes": None,
+        "weights": None,
+        "proposal_log_probs": None,
+        "deduplicate": True,
+    }
+    with pytest.raises(TypeError):
+        run.estimates["other"] = "not allowed"
+
+    positional_run = vmc.run({"eta": "raw-eta"}, sampling=sampling)
+    assert positional_run.estimates == {"energy": "energy", "eta": "eta"}
+    assert seen["run_observables"] == {
+        "energy": None,
+        "eta": "compiled:raw-eta",
+    }
+
+    explicit_energy_run = vmc.run(
+        observables={"energy": "raw-energy", "eta": "raw-eta"},
+        sampling=sampling,
+        contraction_opts={
+            "method": "boundary",
+            "chi": 4,
+            "cutoff": 1.0e-10,
+            "mode": "mps",
+        },
+    )
+    assert explicit_energy_run.estimates == {"energy": "energy", "eta": "eta"}
+    assert seen["run_observables"] == {
+        "energy": "compiled:raw-energy",
+        "eta": "compiled:raw-eta",
+    }
+
+    reused = vmc.measure(
+        native_samples,
+        {"energy": "raw-energy", "eta": "raw-eta"},
+    )
+    assert reused == {"energy": "energy", "eta": "eta"}
+    assert seen["run_observables"] == {
+        "energy": "compiled:raw-energy",
+        "eta": "compiled:raw-eta",
+    }
+
+    def fake_optimization_run(self, n_steps, *, progress, **kwargs):
+        return n_steps, progress, kwargs
+
+    monkeypatch.setattr(TorchVMCDriver, "run", fake_optimization_run)
+    assert vmc.run(3, progress=True, profile=True) == (
+        3,
+        True,
+        {"profile": True},
+    )
+
+
+def test_torch_fermion_vmc_lazy_setup_uses_run_sampling_and_contraction_opts():
+    from pepsy.vmc import TorchFermionVMC
+
+    vmc = object.__new__(TorchFermionVMC)
+    vmc._driver_initialized = False
+    vmc._contraction_config = None
+    vmc._legacy_contraction_config = None
+    vmc._initial_configs = None
+    vmc._initial_n_walkers = None
+    seen = {}
+
+    def fake_initialize(contraction, *, n_walkers):
+        seen["contraction"] = contraction
+        seen["n_walkers"] = n_walkers
+
+    vmc._initialize_driver = fake_initialize
+    sampling = SamplingConfig(n_samples_per_chain=2, n_chains=3)
+    vmc._ensure_initialized(
+        sampling=sampling,
+        contraction_opts={
+            "method": "boundary",
+            "chi": 8,
+            "cutoff": 1.0e-9,
+            "mode": "mps",
+        },
+    )
+
+    assert seen["n_walkers"] == sampling.n_chains
+    assert seen["contraction"] == ContractionConfig(
+        method="boundary",
+        chi=8,
+        cutoff=1.0e-9,
+        options={"mode": "mps"},
+    )
+
+
+def test_torch_vmc_progress_postfix_reports_contraction_and_reuse():
+    from pepsy.vmc.torch.results import (
+        _set_evaluation_progress_postfix,
+        _set_vmc_progress_postfix,
+    )
+
+    class Progress:
+        postfix = None
+
+        def set_postfix(self, postfix):
+            self.postfix = dict(postfix)
+
+    model = SimpleNamespace(
+        contraction="boundary",
+        chi=16,
+        last_proposal_cache_stats={
+            "num_environment_cache_hits": 2,
+            "num_environment_builds": 1,
+            "num_transition_cache_hits": 3,
+            "num_vmapped": 0,
+        },
+        last_connected_reuse_stats={
+            "num_diagonal": 5,
+            "num_reused": 7,
+            "num_batched": 0,
+            "num_fallback": 2,
+            "num_environment_cache_hits": 4,
+            "num_environment_builds": 1,
+        },
+    )
+    bar = Progress()
+    _set_vmc_progress_postfix(
+        bar,
+        SimpleNamespace(acceptance_rate=0.75, proposal_stats=None, sr=None),
+        n_sites=4,
+        include_energy=False,
+        n_chains=3,
+        model=model,
+        proposal="spinful",
+        retained_per_walker=2,
+        burn_in=4,
+        thin=2,
+    )
+    assert bar.postfix == {
+        "amp": "boundary chi=16",
+        "walkers": 3,
+        "move": "spinful",
+        "retain": "2x3",
+        "burn": 4,
+        "thin": 2,
+        "env": "2 reuse/1 build,3 transition",
+        "accept": "0.750",
+    }
+
+    _set_vmc_progress_postfix(
+        bar,
+        SimpleNamespace(acceptance_rate=0.625, proposal_stats=None, sr=None),
+        model=model,
+        progress_postfix="acceptance",
+    )
+    assert bar.postfix == {"accept": "0.625"}
+
+    _set_evaluation_progress_postfix(
+        bar,
+        model=model,
+        n_steps=2,
+        n_chains=3,
+        observables=("energy", "eta"),
+        parent_amplitudes="stored",
+        n_connections=14,
+        stage="statistics",
+    )
+    assert bar.postfix == {
+        "amp": "boundary chi=16",
+        "samples": "2x3",
+        "obs": "energy,eta",
+        "parent psi": "stored",
+        "connections": 14,
+        "targets": "diag=5, env=7, batch=0, direct=2",
+        "env": "4 reuse/1 build",
+        "stage": "statistics",
+    }
 
 
 def test_torch_vmc_modules_own_implementations_and_keep_core_aliases():
@@ -481,6 +946,84 @@ def test_torch_amplitude_accepts_common_contraction_config():
     assert model.chi == 4
 
 
+def test_torch_ctmrg_uses_symmray_stabilization_defaults(monkeypatch):
+    """Torch CTMRG should share the native Symmray safety controls."""
+    pytest.importorskip("torch")
+    import pepsy.boundary.metrics as metrics
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    model = object.__new__(TorchPEPSAmplitude)
+    model.contraction_opts = {"mode": "direct"}
+    monkeypatch.setattr(metrics, "_uses_symmray_arrays", lambda value: True)
+
+    options = model._ctmrg_options(object())
+
+    assert options["mode"] == "direct"
+    assert options["reduce_opts"] == {
+        "method": "eigh",
+        "shift": 1.0e-12,
+    }
+    assert options["gauge_smudge"] == 1.0e-10
+    assert options["canonize_opts"] == {"smudge": 1.0e-10}
+
+
+def test_torch_ctmrg_preserves_explicit_stabilization_options(monkeypatch):
+    """Explicit Torch CTMRG controls should override only the defaults."""
+    pytest.importorskip("torch")
+    import pepsy.boundary.metrics as metrics
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    model = object.__new__(TorchPEPSAmplitude)
+    model.contraction_opts = {
+        "reduce_opts": {"method": "cholesky", "shift": 1.0e-9},
+        "gauge_smudge": 2.0e-8,
+        "canonize_opts": {"max_bond": 4},
+    }
+    monkeypatch.setattr(metrics, "_uses_symmray_arrays", lambda value: True)
+
+    options = model._ctmrg_options(object())
+
+    assert options["reduce_opts"] == {
+        "method": "cholesky",
+        "shift": 1.0e-9,
+    }
+    assert options["gauge_smudge"] == 2.0e-8
+    assert options["canonize_opts"] == {
+        "smudge": 2.0e-8,
+        "max_bond": 4,
+    }
+
+
+def test_torch_native_symmray_ctmrg_defaults_to_projector_mode():
+    """Native Torch Symmray CTMRG should use the guarded projector route."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymPEPS, site_charge_from_occupations
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1",
+        phys_dim={0: 1, 1: 2, 2: 1},
+        fermionic=True,
+        site_charge=site_charge_from_occupations(
+            {(x, y): 1 for x in range(2) for y in range(2)}
+        ),
+        bond_dim=2,
+        seed=194,
+        dtype="complex128",
+    )
+    model = TorchPEPSAmplitude(
+        state,
+        contraction="ctmrg",
+        chi=2,
+        dtype=torch.complex128,
+    )
+
+    assert model.contraction_opts["mode"] == "projector"
+
+
 def test_netket_setup_consumes_shared_sampling_config():
     nk = pytest.importorskip("netket")
     from pepsy.vmc.netket import NetKetPEPSVMC
@@ -516,6 +1059,263 @@ def test_netket_setup_consumes_shared_sampling_config():
     )
     assert samples.chain_shape == (3, 2)
     assert samples.configs.shape == (3, 2, 4)
+    assert samples.diagnostics["n_samples"] == 6
+    assert samples.diagnostics["n_chains"] == 2
+    assert samples.diagnostics["burn_in"] == 0
+
+
+def test_netket_optimize_result_reports_compile_and_step_timings():
+    from pepsy.vmc.netket import VMCOptimizeResult
+
+    result = VMCOptimizeResult(
+        steps=np.asarray([0, 1]),
+        energies=np.asarray([-1.0, -1.2]),
+        errors=np.asarray([0.1, 0.05]),
+        variances=np.asarray([0.2, 0.1]),
+        final_energy=-1.2,
+        final_error=0.05,
+        compile_seconds=3.0,
+        optimization_seconds=8.0,
+        total_seconds=11.5,
+    )
+
+    assert result.warmup_seconds == 3.0
+    assert result.optimization_seconds_per_step == 4.0
+    assert result.total_seconds == 11.5
+
+
+def test_netket_build_timing_reports_slowest_phase():
+    from pepsy.vmc.netket import NetKetBuildTiming
+
+    timing = NetKetBuildTiming(
+        settings_seconds=0.1,
+        geometry_seconds=0.2,
+        hamiltonian_seconds=2.0,
+        peps_seconds=0.3,
+        model_seconds=0.4,
+        sampler_seconds=1.0,
+        total_seconds=4.0,
+    )
+
+    assert timing.slowest_phase == ("hamiltonian_seconds", 2.0)
+    assert timing.as_dict()["total_seconds"] == 4.0
+
+
+def test_netket_boundary_zero_separation_has_flat_symmray_retry():
+    import pepsy.vmc.netket as netket_vmc
+
+    flat_array = type(
+        "Z2FermionicArrayFlat",
+        (),
+        {"__module__": "symmray.fake"},
+    )()
+
+    class Tensor:
+        data = flat_array
+
+    class Network:
+        def __init__(self):
+            self.calls = []
+
+        def __iter__(self):
+            return iter((Tensor(),))
+
+        def contract_boundary(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise ValueError("empty intermediate axis")
+            return (1.0, 0.0)
+
+    netket_vmc._FLAT_SYMMRAY_BOUNDARY_FALLBACK_WARNED = False
+    network = Network()
+    with pytest.warns(RuntimeWarning, match="max_separation=0"):
+        result = netket_vmc._contract_boundary_for_vmc(
+            network,
+            max_bond=8,
+            cutoff=0.0,
+            method_opts={"max_separation": 0, "canonize": True},
+        )
+    assert result == (1.0, 0.0)
+    assert network.calls[0]["max_separation"] == 0
+    assert network.calls[1]["max_separation"] == 1
+    assert network.calls[1]["canonize"] is True
+
+
+def test_netket_ctmrg_zero_separation_has_flat_symmray_retry():
+    import pepsy.vmc.netket as netket_vmc
+
+    flat_array = type(
+        "Z2FermionicArrayFlat",
+        (),
+        {"__module__": "symmray.fake"},
+    )()
+
+    class Tensor:
+        data = flat_array
+
+    class Network:
+        def __init__(self):
+            self.calls = []
+
+        def __iter__(self):
+            return iter((Tensor(),))
+
+        def contract_ctmrg(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                raise TypeError("dot_general shape mismatch")
+            return (1.0, 0.0)
+
+    netket_vmc._FLAT_SYMMRAY_CTMRG_FALLBACK_WARNED = False
+    network = Network()
+    with pytest.warns(RuntimeWarning, match="CTMRG.*max_separation=0"):
+        result = netket_vmc._contract_ctmrg_for_vmc(
+            network,
+            max_bond=8,
+            cutoff=0.0,
+            method_opts={
+                "sequence": ("ymin", "ymax", "xmin", "xmax"),
+                "max_separation": 0,
+                "canonize": True,
+            },
+        )
+    assert result == (1.0, 0.0)
+    assert network.calls[0]["max_separation"] == 0
+    assert network.calls[1]["max_separation"] == 1
+    assert network.calls[1]["sequence"] == ("ymin", "ymax", "xmin", "xmax")
+    assert network.calls[1]["canonize"] is True
+
+
+def test_netket_amplitude_timing_reports_batch_average():
+    from pepsy.vmc.netket import NetKetAmplitudeTiming
+
+    timing = NetKetAmplitudeTiming(n_samples=4, amplitude_seconds=2.0)
+
+    assert timing.amplitude_seconds_per_sample == 0.5
+    assert timing.as_dict()["n_samples"] == 4
+
+
+def test_netket_setup_benchmarks_amplitude_without_sampling_in_timer():
+    from pepsy.vmc.netket import NetKetPEPSVMC
+
+    class Ansatz:
+        n_sites = 2
+        n_params = 1
+
+    class Model:
+        def __init__(self):
+            self.apply_calls = 0
+
+        def apply(self, variables, configs):
+            self.apply_calls += 1
+            return configs.sum(axis=-1)
+
+    class State:
+        samples = np.zeros((1, 2, 2), dtype=np.int8)
+
+        def __init__(self):
+            self.log_value_batches = []
+
+        def log_value(self, configs):
+            self.log_value_batches.append(tuple(configs.shape))
+            return configs.sum(axis=-1)
+
+    model = Model()
+    state = State()
+    setup = NetKetPEPSVMC(
+        hilbert=None,
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=state,
+        model=model,
+        ansatz=Ansatz(),
+        config_map=None,
+        preconditioner=None,
+    )
+
+    timing = setup.benchmark_amplitude(n_samples=1)
+    assert timing.n_samples == 1
+    assert timing.amplitude_seconds >= 0.0
+    assert state.log_value_batches == [(1, 2), (1, 2)]
+    assert model.apply_calls == 0
+
+
+def test_netket_setup_to_peps_unpacks_current_flax_parameters():
+    import jax
+    import jax.numpy as jnp
+    import quimb.tensor as qtn
+    from pepsy.vmc.netket import NetKetPEPSVMC
+
+    original = qtn.TensorNetwork(
+        [qtn.Tensor(np.array([1.0, 2.0]), inds=("physical",), tags=("I0",))]
+    )
+    params, skeleton = qtn.pack(original)
+    leaves, treedef = jax.tree_util.tree_flatten(params)
+    ansatz = SimpleNamespace(
+        leaves=tuple(leaves),
+        treedef=treedef,
+        skeleton=skeleton,
+        n_sites=1,
+        n_params=2,
+    )
+    updated = {"params": {"t0": jnp.array([3.0, 4.0])}}
+    state = SimpleNamespace(variables=updated)
+    setup = NetKetPEPSVMC(
+        hilbert=None,
+        graph=None,
+        hamiltonian=None,
+        sampler=None,
+        vstate=state,
+        model=None,
+        ansatz=ansatz,
+        config_map=None,
+        preconditioner=None,
+    )
+
+    restored = setup.to_peps()
+    np.testing.assert_allclose(restored.tensor_map[0].data, [3.0, 4.0])
+    np.testing.assert_allclose(
+        setup.to_peps(updated["params"]).tensor_map[0].data,
+        [3.0, 4.0],
+    )
+
+
+def test_netket_vmc_config_validates_shared_settings():
+    from pepsy.vmc import ContractionConfig, NetKetVMCConfig, SamplingConfig
+
+    config = NetKetVMCConfig(
+        contraction=ContractionConfig(method="boundary", chi=4),
+        sampling=SamplingConfig(n_samples_per_chain=2, n_chains=1),
+        sampler_sweep_size=8,
+        conserving=False,
+        use_sr=False,
+        progress=True,
+    )
+
+    assert config.contraction.chi == 4
+    assert config.sampling.n_samples == 2
+    assert config.sampler_sweep_size == 8
+
+
+def test_netket_native_geometry_helpers_accept_coordinate_terms():
+    from pepsy.vmc.netket import (
+        _edges_from_fermi_terms,
+        _infer_lattice_shape_from_fermi_terms,
+        _infer_pbc_from_fermi_terms,
+    )
+
+    terms = {
+        (0, 0): object(),
+        (0, 1): object(),
+        (1, 0): object(),
+        (1, 1): object(),
+        ((0, 0), (1, 0)): object(),
+        ((0, 1), (1, 1)): object(),
+    }
+    assert _infer_lattice_shape_from_fermi_terms(terms) == (2, 2)
+    assert _infer_pbc_from_fermi_terms(terms, 2, 2) == (False, False)
+    assert _edges_from_fermi_terms(terms, 2, 2) == ((0, 2), (1, 3))
 
 
 def test_netket_compiler_lowers_common_fermion_terms():
@@ -542,6 +1342,79 @@ def test_netket_compiler_lowers_common_fermion_terms():
 
     compiled = compile_operator_sum_netket(hilbert, common)
     assert compiled.hilbert is hilbert
+
+
+def test_netket_declarative_observables_request_conserving_operators(monkeypatch):
+    """User-supplied symbolic observables get the fixed-sector fast path."""
+    import pepsy.vmc.netket as netket_vmc
+
+    terms_calls = []
+    common_calls = []
+
+    def fake_fermion_operator(hilbert, terms, *, constant=0.0, conserving=False):
+        terms_calls.append((hilbert, terms, constant, conserving))
+        return "fermion-observable"
+
+    def fake_common_operator(hilbert, terms, *, site_order=None, conserving=False):
+        common_calls.append((hilbert, terms, site_order, conserving))
+        return "common-observable"
+
+    monkeypatch.setattr(netket_vmc, "netket_fermion_operator", fake_fermion_operator)
+    monkeypatch.setattr(netket_vmc, "compile_operator_sum_netket", fake_common_operator)
+    common = OperatorSum()
+    resolved = netket_vmc._normalize_fermion_observables(
+        "hilbert",
+        {"hopping": [(1.0, ((0, 1, True), (1, 1, False)))], "common": common},
+        site_order=((0, 0),),
+    )
+
+    assert resolved == {
+        "hopping": "fermion-observable",
+        "common": "common-observable",
+    }
+    assert terms_calls[0][-1] == "auto"
+    assert common_calls[0][-1] == "auto"
+
+
+def test_configure_jax_for_vmc_configures_an_optional_private_cache(monkeypatch):
+    """Compilation caching is opt-in and set before importing JAX."""
+    from pepsy.vmc.netket import configure_jax_for_vmc
+
+    for name in (
+        "XLA_PYTHON_CLIENT_PREALLOCATE",
+        "XLA_PYTHON_CLIENT_MEM_FRACTION",
+        "JAX_PLATFORMS",
+        "JAX_COMPILATION_CACHE_DIR",
+        "NETKET_NO_TIPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    configure_jax_for_vmc(
+        preallocate=True,
+        mem_fraction=0.8,
+        platform="cpu",
+        compilation_cache_dir="/private/jax-cache",
+    )
+
+    assert os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] == "true"
+    assert os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] == "0.8"
+    assert os.environ["JAX_PLATFORMS"] == "cpu"
+    assert os.environ["JAX_COMPILATION_CACHE_DIR"] == "/private/jax-cache"
+    with pytest.raises(ValueError, match="must not be empty"):
+        configure_jax_for_vmc(compilation_cache_dir="")
+
+
+def test_netket_autochunk_callback_has_a_clear_version_guard(monkeypatch):
+    """Old supported NetKet versions fail with an actionable feature error."""
+    import pepsy.vmc.netket as netket_vmc
+
+    monkeypatch.setattr(
+        netket_vmc,
+        "_require_netket",
+        lambda: SimpleNamespace(__version__="3.10", callbacks=SimpleNamespace()),
+    )
+    with pytest.raises(RuntimeError, match="requires NetKet >= 3.22"):
+        netket_vmc.make_netket_autochunk_callback()
 
 
 def test_common_spinful_fermion_operator_has_matching_exact_local_energies():

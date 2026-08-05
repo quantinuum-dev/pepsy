@@ -11,10 +11,12 @@ except ImportError:  # pragma: no cover - optional dependency
     torch = None
 
 __all__ = [
-    "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
-    "register_torch_linalg", "reg_rel_svd_torch", "reg_real_svd_torch",
+    "build_backend", "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
+    "register_torch_linalg", "register_jax_linalg", "reg_native_svd_torch",
+    "reg_native_svd_jax", "reg_rel_svd_torch", "reg_real_svd_torch",
     "reg_complex_svd_torch", "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
+    "reset_linalg_registrations",
     "reg_stop_gradient_torch", "stop_grad", "set_default_array_backend",
     "get_default_array_backend", "set_default_grad_backend",
     "get_default_grad_backend", "reset_default_backends",
@@ -129,6 +131,25 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
 
     def cast_array(x, device=device, dtype=dtype, requires_grad=requires_grad):
 
+        # Symmray can use complex NumPy containers for real-valued blocks. If
+        # their imaginary part is identically zero, remove it before asking
+        # Torch for a real tensor. This preserves the requested float64 path
+        # without emitting Torch's misleading "discards the imaginary part"
+        # warning. Non-zero imaginary parts retain the historical conversion
+        # behavior below.
+        target_is_real = (
+            dtype is not None
+            and not torch.empty((), dtype=dtype).is_complex()
+        )
+        if target_is_real:
+            if isinstance(x, torch.Tensor):
+                if x.is_complex() and not bool(torch.any(x.imag != 0)):
+                    x = x.real
+            elif np.iscomplexobj(x):
+                x_np = np.asarray(x)
+                if not np.any(x_np.imag != 0):
+                    x = x_np.real
+
         if isinstance(x, torch.Tensor):
             out = x.detach() if requires_grad else x
 
@@ -155,6 +176,33 @@ def backend_torch(device="cpu", dtype=None, requires_grad=False):
         return out
 
     return cast_array
+
+
+def build_backend(device="cpu", dtype=None, requires_grad=False, *, set_default=True):
+    """Build the standard Torch array backend, defaulting to CPU.
+
+    The existing :func:`backend_torch` name remains unchanged.  This helper is
+    the concise public entry point for workflows that want one backend
+    converter and one package-wide default::
+
+        import pepsy as py
+        to_backend = py.build_backend()  # Torch CPU
+
+    Parameters are forwarded to :func:`backend_torch`.  By default the
+    resulting converter is also installed as Pepsy's default array backend;
+    pass ``set_default=False`` when only the returned converter should be
+    used.  Explicit ``to_backend=`` / ``array_backend=`` arguments continue to
+    take precedence in individual APIs.
+    """
+
+    converter = backend_torch(
+        device=device,
+        dtype=dtype,
+        requires_grad=requires_grad,
+    )
+    if set_default:
+        set_default_array_backend(converter)
+    return converter
 
 
 def backend_numpy(dtype=np.float64):
@@ -277,10 +325,14 @@ def backend_jax(device="cpu", dtype=None):
         target_dtype = jax.dtypes.canonicalize_dtype(jnp.dtype(dtype))
 
     def cast_array(x, device=target_device, dtype=target_dtype):
-        # Coerce non-JAX inputs (incl. torch tensors) to a numpy-compatible
-        # form first so jnp.asarray accepts them on any backend.
-        if torch is not None and isinstance(x, torch.Tensor):
-            x = x.detach().cpu().numpy()
+        # Coerce non-JAX inputs to a NumPy-compatible form through Autoray so
+        # Torch, CuPy, and other registered backends share one host boundary.
+        try:
+            if ar.infer_backend(x) != "jax":
+                x = ar.to_numpy(x)
+        except Exception:
+            # Let JAX handle custom array-likes that Autoray cannot infer.
+            pass
         arr = jnp.asarray(x, dtype=dtype)
         if device is not None:
             arr = jax.device_put(arr, device)
@@ -289,13 +341,29 @@ def backend_jax(device="cpu", dtype=None):
     return cast_array
 
 
-def register_torch_linalg(mode="complex"):
-    """Register custom torch linalg gradients in autoray.
+def register_torch_linalg(
+    mode="complex",
+    *,
+    stabilized=False,
+    qr_rank_policy="warn",
+    qr_rank_tol_factor=1.0,
+):
+    """Register Torch linalg rules in Autoray.
 
     Parameters
     ----------
     mode : {"complex", "real"}, default="complex"
-        Which SVD/QR registrations to install.
+        Select the real or complex stabilized rule when ``stabilized=True``.
+    stabilized : bool, default=False
+        Keep native Torch SVD/QR by default. Set this to ``True`` to install
+        Pepsy's relative-regularized SVD and validated real-QR rules. The
+        Quimb block-split drivers used by Symmray PEPS are installed by
+        ``PepsEnergyOptimizer`` after the state is prepared, so simple-update
+        forward decompositions are not changed by this global registration.
+    qr_rank_policy : {"warn", "native", "error"}, default="warn"
+        Response to rank-deficient inputs when stabilized real QR is active.
+    qr_rank_tol_factor : float, default=1.0
+        Multiplier for the scale-aware real-QR rank threshold.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
@@ -305,14 +373,114 @@ def register_torch_linalg(mode="complex"):
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
     if mode == "complex":
-        lr.reg_rel_svd_torch()
+        if stabilized:
+            lr.reg_rel_svd_torch()
+        else:
+            lr.reg_native_svd_torch()
         lr.reg_complex_qr_torch()
         return
     if mode == "real":
-        lr.reg_real_svd_torch()
-        lr.reg_real_qr_torch()
+        if stabilized:
+            lr.reg_real_svd_torch()
+            lr.reg_real_qr_torch(
+                rank_policy=qr_rank_policy,
+                rank_tol_factor=qr_rank_tol_factor,
+            )
+        else:
+            lr.reg_native_svd_torch()
+            lr.reg_complex_qr_torch()
         return
     raise ValueError("mode must be 'complex' or 'real'")
+
+
+def register_jax_linalg(*, stabilized=False):
+    """Register native or truncation-safe JAX SVD in Autoray.
+
+    Parameters
+    ----------
+    stabilized : bool, default=False
+        Keep native thin SVD by default. Set this to ``True`` to install the
+        custom VJP that restores cotangents from Quimb fixed-rank truncation.
+    """
+    try:
+        __import__("jax")
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "register_jax_linalg requires optional dependency 'jax'. "
+            "Install it with: pip install jax jaxlib."
+        ) from exc
+    from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+    if stabilized:
+        lr.reg_complex_svd_jax()
+    else:
+        lr.reg_native_svd_jax()
+
+
+def reset_linalg_registrations(backend="all"):
+    """Restore native linalg mappings and clear Pepsy registration caches.
+
+    Parameters
+    ----------
+    backend : {"torch", "jax", "all"}, default="all"
+        Which optional backend registration cache to reset. ``"all"`` skips
+        optional backends that are not installed.
+    """
+    if backend not in {"torch", "jax", "all"}:
+        raise ValueError("backend must be one of: all, jax, torch")
+
+    if backend in {"torch", "all"}:
+        if torch is None:
+            if backend == "torch":
+                raise ImportError(
+                    "reset_linalg_registrations(backend='torch') requires "
+                    "optional dependency 'torch'."
+                )
+        else:
+            from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+            lr.reset_torch_linalg_registrations()
+            lr.reset_quimb_torch_split_drivers()
+
+    if backend in {"jax", "all"}:
+        try:
+            __import__("jax")
+        except ImportError:
+            if backend == "jax":
+                raise ImportError(
+                    "reset_linalg_registrations(backend='jax') requires "
+                    "optional dependency 'jax'."
+                )
+        else:
+            from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+            lr.reset_jax_linalg_registrations()
+
+
+def reg_native_svd_torch():
+    """Register native Torch thin SVD in autoray."""
+    if torch is None:  # pragma: no cover - exercised in no-torch CI
+        raise ImportError(
+            "reg_native_svd_torch requires optional dependency 'torch'. "
+            "Install it with: pip install pepsy[torch] (or pip install torch)."
+        )
+    from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_native_svd_torch()
+
+
+def reg_native_svd_jax():
+    """Register native JAX thin SVD in autoray."""
+    try:
+        __import__("jax")
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError(
+            "reg_native_svd_jax requires optional dependency 'jax'. "
+            "Install it with: pip install jax jaxlib."
+        ) from exc
+    from ..backends import linalg_jax as lr  # pylint: disable=import-outside-toplevel
+
+    lr.reg_native_svd_jax()
 
 
 def reg_rel_svd_torch():
@@ -369,7 +537,7 @@ def reg_real_svd_torch():
 
 
 def reg_complex_qr_torch():
-    """Register complex torch QR autograd rule in autoray."""
+    """Register native Torch QR for complex inputs in autoray."""
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_complex_qr_torch requires optional dependency 'torch'. "
@@ -380,8 +548,8 @@ def reg_complex_qr_torch():
     lr.reg_complex_qr_torch()
 
 
-def reg_real_qr_torch():
-    """Register real torch QR autograd rule in autoray."""
+def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
+    """Register real Torch QR with a rank-deficiency policy."""
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_real_qr_torch requires optional dependency 'torch'. "
@@ -389,7 +557,10 @@ def reg_real_qr_torch():
         )
     from ..backends import linalg_torch as lr  # pylint: disable=import-outside-toplevel
 
-    lr.reg_real_qr_torch()
+    lr.reg_real_qr_torch(
+        rank_policy=rank_policy,
+        rank_tol_factor=rank_tol_factor,
+    )
 
 
 def reg_complex_svd_jax():
@@ -408,7 +579,7 @@ def reg_complex_svd_jax():
 
 
 def reg_rel_svd_jax():
-    """Register JAX SVD with Pepsy's custom VJP rule in autoray."""
+    """Register JAX SVD with Pepsy's truncation-safe VJP rule in autoray."""
     try:
         __import__("jax")
     except ImportError as exc:  # pragma: no cover - exercised in no-jax CI
@@ -423,7 +594,7 @@ def reg_rel_svd_jax():
 
 
 def reg_real_svd_jax():
-    """Register JAX SVD custom-VJP rule for real-valued SVD workloads."""
+    """Register JAX SVD's truncation-safe VJP rule for real workloads."""
     try:
         __import__("jax")
     except ImportError as exc:  # pragma: no cover - exercised in no-jax CI

@@ -15,6 +15,17 @@ helper `MpsOptimizer.submpo_event(mpo, where)` builds the tuple form. These
 events are applied with `gate_with_submpo_` and compressed to `chi`; they are
 only accepted in `mode="mpo"`.
 
+`MpsOptimizer.backend_info()` reports the backend, dtype, and device inferred
+from every live MPS tensor; the same values are also available as the
+state-derived `backend`, `backend_dtype`, and `backend_device` attributes.
+Every gate and every tensor in a sub-MPO is checked against that signature
+before replay. Explicit mismatches are converted on an execution copy with a
+`UserWarning`; the queued payloads remain unchanged. Native Symmray MPS data
+reports `backend="symmray"` and includes `array_backend` for the underlying
+NumPy, Torch, or CuPy charge-sector blocks. Dense payloads cannot be promoted
+to native Symmray gates because that would lose charge and fermionic metadata;
+construct those gates with the matching Symmray convention instead.
+
 Streams may also include control events. `("measure", pauli, where[, outcome])`
 collapses onto a Pauli eigenvalue and records `(pauli, where, outcome, prob)`.
 `("reset", where[, basis])` resets each target to the `+1` eigenstate of
@@ -89,8 +100,10 @@ For unitary streams,
 `get_infidelities()` uses the current retained norm divided by the initial
 run norm, squared; this is the global retained-fidelity estimate and is
 equivalent to multiplying the per-gate fidelities without requiring a
-pre-gate target measurement. Local ratios remain available in detailed
-samples for diagnostics. The trace is populated by default. Set
+pre-gate target measurement. Local products and norm-ratio evaluations are
+accumulated in the log domain and exponentiated only for readout, so long
+streams and very small retained norms do not lose fidelity to underflow. Local
+ratios remain available in detailed samples for diagnostics. The trace is populated by default. Set
 ``track_infidelity=False`` in the constructor, or pass
 ``track_infidelity=False`` to ``run()``, to skip target-norm construction,
 retained-norm calculations, samples, and progress-bar infidelity fields. For
@@ -141,6 +154,27 @@ default to `weight_mode="auto"`: angle metadata when present, otherwise a cheap
 operator-Schmidt proxy for small dense two-site gates, falling back to count
 weights. Pass `weight_fn(payload, support, event_type)` for explicit weights.
 
+For a prescribed baseline rather than a searched order, pass an explicit site
+permutation as `order`. The returned plan is marked `selected_order="fixed"`
+and keeps the original gate stream unchanged:
+
+```python
+zigzag = py.square_lattice_zigzag(6, 6)
+fixed_plan = finder.run(order=zigzag)
+```
+
+`square_lattice_zigzag` scans x across each row and reverses direction on
+successive rows. It is a deterministic comparison layout; it performs no
+refinement or tensor work.
+
+For compression-oriented selection, pass `objective="compression"`. This
+uses operator-Schmidt load over every MPS cut crossed by each support, with
+support span retained as a replay-cost tie-breaker. Exact small dense ranks
+are used when available; opaque, native, and wide operators use a conservative
+operator-space rank bound and are marked in `rank_bound_reasons` rather than
+silently being treated as rank two. The default `objective="locality"` keeps
+the faster span/congestion heuristic for backwards compatibility.
+
 The layout score depends on gate supports and optional gate/event weights, not
 on the initial MPS tensor values. The plan does not rewrite the gate stream. To
 use a layout during replay, call `opt.run(use_layout_finder=True)` or pass a
@@ -148,6 +182,52 @@ layout order such as `opt.run(use_layout_finder="quality")`; the optimizer
 temporarily permutes the working MPS and restores the returned MPS to the
 original site order. Layout-aware replay prints a concise report by default;
 pass `layout_report=False` to silence it.
+
+When the current state matters, use the explicit pilot selector:
+
+```python
+plan = opt.select_layout_for_compression(
+    pilot_candidates=4,
+    pilot_steps=64,
+)
+opt.apply_layout(plan, layout_report=False)
+```
+
+The selector replays the best static candidates on independent copies using
+the real MPS mode, `chi`, cutoff, backend, and dtype. It enables the
+infidelity trace for the pilot and chooses by measured compression
+infidelity, final bond dimension, and elapsed time, and returns
+per-candidate records under `plan["pilot"]`. The original state, queue, and
+layout are unchanged. Perform this before installing a persistent layout;
+reordering an already-entangled MPS remains explicitly guarded because the
+reorder itself can be lossy or expensive.
+
+The layout can be inspected graphically without changing the optimizer. The
+finder returns a Matplotlib `(fig, ax)` pair. The original lattice and gate
+connectivity remain a light grey background, while the colored arrow chain
+shows the selected MPS permutation directly. The default plot is axis-free and
+does not number the background lattice; use `show_site_labels=True` and
+`show_axes=True` when those annotations are useful:
+
+```python
+finder = opt.layout_finder()
+plan = finder.run(order="quality")
+fig, ax = finder.plot(
+    plan,
+    site_coords={q: (q % 4, q // 4) for q in range(opt.p.nsites)},
+)
+```
+
+`opt.plot_layout(plan, site_coords=...)` is the equivalent convenience wrapper.
+Coordinates are optional; tuple-valued site labels are interpreted as `(x, y)`
+automatically, and ordinary labels fall back to a 1D line. Install the
+optional `viz` profile to enable plotting. A stream-order colorbar is not shown
+by default; pass `colorbar=True` only when the MPS-position scale is useful.
+The default plot contains visible `0` through `last` order labels but no title,
+chain sentence, or other text. The styling follows Quimb's axis-free schematic
+drawings while retaining Pepsy's ordinary `(fig, ax)` return value.
+Pass `show_order_labels=False` to hide the position labels, or use
+`show_chain_label=True` and `show_title=True` for additional annotations.
 
 
 > API details are maintained as handwritten Markdown in this page.

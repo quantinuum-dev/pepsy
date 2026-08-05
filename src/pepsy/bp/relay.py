@@ -38,6 +38,16 @@ from typing import Any
 import autoray as ar
 import numpy as np
 
+from ._symmray import (
+    align_message_pair as _align_symmray_message_pair,
+    dense_bp_tn as _dense_bp_tn,
+    dense_message_tree as _dense_message_tree,
+    is_symmray_array as _is_symmray_array,
+    message_distance as _symmray_message_distance,
+    restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
+    uses_symmray as _uses_symmray,
+)
+
 __all__ = [
     "BPState",
     "BPUpdateResult",
@@ -77,12 +87,26 @@ def _message_data(message):
     Checking for ``modify`` deliberately avoids ``ndarray.data``, which is a
     memory-view rather than the message array.
     """
-    return message.data if hasattr(message, "modify") else message
+    return (
+        message.data
+        if hasattr(message, "modify") and hasattr(message, "data")
+        else message
+    )
+
+
+def _copy_message(message):
+    """Copy a message through its native backend before using Autoray."""
+    if hasattr(message, "copy"):
+        try:
+            return message.copy()
+        except Exception:
+            pass
+    return ar.do("copy", message)
 
 
 def _set_message(bp, key, message, data) -> None:
     """Replace one message, supporting Tensor and bare-array BPs."""
-    if hasattr(message, "modify"):
+    if hasattr(message, "modify") and hasattr(message, "data"):
         message.modify(data=data)
     else:
         bp.messages[key] = data
@@ -100,12 +124,43 @@ def _snapshot(messages):
         return {key: _snapshot(value) for key, value in messages.items()}
     if isinstance(messages, tuple):
         return tuple(_snapshot(value) for value in messages)
-    return ar.do("copy", _message_data(messages))
+    return _copy_message(_message_data(messages))
 
 
 def _message_shape(message) -> tuple[int, ...]:
     """Return a backend-independent message shape for warm-start checks."""
     return tuple(ar.do("shape", _message_data(message)))
+
+
+def _symmray_message_compatible(template, snapshot) -> bool:
+    """Allow sparse charge support to differ while preserving bond topology."""
+    if not (
+        _is_symmray_array(template)
+        and _is_symmray_array(snapshot)
+        and hasattr(template, "indices")
+        and hasattr(snapshot, "indices")
+    ):
+        return False
+    if len(template.indices) != len(snapshot.indices):
+        return False
+    for template_index, snapshot_index in zip(
+        template.indices, snapshot.indices
+    ):
+        if template_index.dual != snapshot_index.dual:
+            return False
+        template_map = template_index.chargemap
+        snapshot_map = snapshot_index.chargemap
+        if not (
+            set(template_map).issubset(snapshot_map)
+            or set(snapshot_map).issubset(template_map)
+        ):
+            return False
+        if any(
+            template_map[charge] != snapshot_map[charge]
+            for charge in set(template_map) & set(snapshot_map)
+        ):
+            return False
+    return True
 
 
 def _validate_message_tree(template, snapshot, path="messages") -> None:
@@ -129,7 +184,9 @@ def _validate_message_tree(template, snapshot, path="messages") -> None:
             _validate_message_tree(value, saved, f"{path}[{i}]")
         return
 
-    if _message_shape(template) != _message_shape(snapshot):
+    if _message_shape(template) != _message_shape(snapshot) and not (
+        _symmray_message_compatible(template, snapshot)
+    ):
         raise ValueError(
             f"{path} has shape {_message_shape(snapshot)}, expected "
             f"{_message_shape(template)} for this tensor-network topology"
@@ -153,7 +210,7 @@ def _set_messages(bp, messages) -> None:
         return
 
     for key, message in bp.messages.items():
-        _set_message(bp, key, message, ar.do("copy", messages[key]))
+        _set_message(bp, key, message, _copy_message(messages[key]))
 
 
 def _bp_constructor_kwargs(method_key: str, damping, update, bp_opts):
@@ -512,6 +569,9 @@ def one_norm_bp(
     method_key = _method_key(method, _ONE_NORM_CLASSES)
     if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
+    if _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        init_messages = _dense_message_tree(init_messages)
     if method_key == "d1bp":
         from .gauges import _validate_d1_graph
 
@@ -566,6 +626,16 @@ def two_norm_bp(
     """
     if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1:
         raise ValueError("max_iterations must be a positive integer")
+    if _uses_symmray(tn):
+        tn = _restore_fermionic_dummy_modes(tn)
+    bp_opts = dict(bp_opts)
+    if _uses_symmray(tn):
+        bp_opts.setdefault("distance", _symmray_message_distance)
+        # Quimb's DIIS vectorizer asks Autoray for ``symmray.concatenate``.
+        # Symmray intentionally has no such dense tree-vector operation; the
+        # native sequential D2BP iteration remains fully backend aware.
+        if diis is not False:
+            diis = False
     bp = _bp_class("d2bp")(
         tn,
         **_bp_constructor_kwargs("d2bp", damping, update, bp_opts),
@@ -684,6 +754,18 @@ def relay_bp(
 
         _validate_d1_graph(tn)
 
+    if method_key == "d2bp" and _uses_symmray(tn):
+        tn = _restore_fermionic_dummy_modes(tn)
+
+    if method_key in _ONE_NORM_CLASSES and _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        init_messages = _dense_message_tree(init_messages)
+
+    bp_opts = dict(bp_opts)
+    if method_key == "d2bp" and _uses_symmray(tn):
+        bp_opts.setdefault("distance", _symmray_message_distance)
+        if diis is not False:
+            diis = False
     bp_class = _bp_class(method_key)
     rng = np.random.default_rng(seed)
     bp = bp_class(
@@ -738,7 +820,12 @@ def relay_bp(
                     g = gamma[sources[key]]
                     data = _message_data(message)
                     if g != 0.0:
-                        data = g * prev[key] + (1.0 - g) * data
+                        old_data, new_data = prev[key], data
+                        if method_key == "d2bp" and _uses_symmray(tn):
+                            old_data, new_data = _align_symmray_message_pair(
+                                old_data, new_data
+                            )
+                        data = g * old_data + (1.0 - g) * new_data
                         _set_message(bp, key, message, data)
                     # Use the BP's selected distance metric on the post-memory
                     # messages, rather than silently switching to an L-infinity

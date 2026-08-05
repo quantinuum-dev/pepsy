@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Mapping
 
 from numbers import Integral
 
+import autoray as ar
 import numpy as np
 import quimb
 import quimb.tensor as qtn
@@ -18,6 +20,7 @@ from .._internal.formatting import (
     resolve_color_mode,
 )
 from ..tensors.core import OneDMap
+from ..tensors.bonds import new_native_bond
 
 __all__ = [
     "ham_tn",
@@ -346,7 +349,9 @@ class ham_tn:
     @staticmethod
     def _as_matrix(op):
         data = getattr(op, "data", op)
-        return np.asarray(data)
+        if hasattr(data, "to_dense"):
+            data = data.to_dense()
+        return np.asarray(ar.to_numpy(data))
 
     def _coerce_op(self, op, *, phys_dim, dtype):
         if callable(op) and not hasattr(op, "shape"):
@@ -465,7 +470,7 @@ class ham_tn:
 
     def build_mpo(
         self,
-        ints,
+        ints=None,
         *,
         phys_dim=2,
         max_bond=None,
@@ -473,12 +478,17 @@ class ham_tn:
         data_type=None,
         compress_each=True,
         mapper=None,
+        fermion=None,
+        edges=None,
+        fermionic=None,
+        charge_sectors=False,
+        **model_params,
     ):
         """Build MPO from user interactions.
 
         Parameters
         ----------
-        ints : sequence
+        ints : sequence | Mapping | pepsy.Fermion | None
             Sequence of terms. Supported term formats:
             - ``((op,), (coord,))``
             - ``((op1, op2), (coord1, coord2))``
@@ -500,12 +510,79 @@ class ham_tn:
         mapper : pepsy.tensors.core.OneDMap | None, default=None
             Optional mapper override used only for this MPO build. When
             omitted, the builder's configured mapper is used.
+        fermion : pepsy.Fermion | None, default=None
+            Optional native fermion model. When supplied, ``ints`` (or the
+            explicit ``edges`` alias) is passed to ``fermion.build_mpo`` and
+            the returned Symmray MPO keeps the model's U1/U1U1 symmetry.
+        edges : sequence | None, default=None
+            Explicit edge alias for the ``fermion=...`` form. For example,
+            ``builder.build_mpo(fermion=f, edges=edges, t=..., U=...)``.
+        fermionic : bool | None, default=None
+            Native graded encoding flag for the fermion-model form. ``None``
+            and ``False`` select the Jordan-Wigner-compatible MPO builder;
+            ``True`` selects the native graded ``Fermion.build_mpo(...)``.
+        charge_sectors : bool, default=False
+            When native construction is enabled, return one MPO per operator
+            charge as ``{charge: mpo}`` instead of requiring one homogeneous
+            charge for the whole collection.
+        **model_params
+            Explicit fermion couplings such as ``t``, ``U``/``V``, and ``mu``.
 
         Returns
         -------
         qtn.MatrixProductOperator
             Built Hamiltonian MPO.
         """
+        if (
+            fermion is None
+            and hasattr(ints, "build_mpo")
+            and hasattr(ints, "hamiltonian")
+        ):
+            fermion = ints
+            ints = None
+
+        if fermion is not None:
+            if edges is not None:
+                if ints is not None:
+                    raise TypeError(
+                        "Pass fermion terms through either ints or edges, not both."
+                    )
+                ints = edges
+            if ints is None:
+                raise ValueError(
+                    "Fermion MPO construction requires terms or an edge sequence."
+                )
+            if not isinstance(phys_dim, Integral) or int(phys_dim) < 1:
+                raise ValueError("phys_dim must be an integer >= 1.")
+            if not hasattr(fermion, "build_mpo"):
+                raise TypeError(
+                    "fermion must provide the Fermion.build_mpo interface."
+                )
+            dtype = self.data_type if data_type is None else np.dtype(data_type)
+            max_bond_use = self.max_bond if max_bond is None else int(max_bond)
+            cutoff_use = self.cutoff if cutoff is None else float(cutoff)
+            mapper_use = self.mapper if mapper is None else mapper
+            fermionic_use = False if fermionic is None else bool(fermionic)
+            if charge_sectors and not fermionic_use:
+                raise ValueError("charge_sectors=True requires fermionic=True.")
+            return fermion.build_mpo(
+                ints,
+                L=self.L,
+                mapper=mapper_use,
+                max_bond=max_bond_use,
+                cutoff=cutoff_use,
+                compress=bool(compress_each),
+                dtype=dtype,
+                fermionic=fermionic_use,
+                charge_sectors=charge_sectors,
+                **model_params,
+            )
+
+        if edges is not None or model_params or fermionic is not None or charge_sectors:
+            raise TypeError(
+                "edges, fermion model parameters, and fermionic encoding are "
+                "only valid with fermion=... ."
+            )
         if ints is None:
             raise ValueError("ints must be provided.")
         if not isinstance(phys_dim, Integral) or int(phys_dim) < 1:
@@ -552,11 +629,19 @@ class ham_tn:
                 if x + 1 < self.L_x:
                     edge = frozenset(((x, y), (x + 1, y)))
                     if edge not in chain_edges:
-                        pepo[f"I{x},{y}"].new_bond(pepo[f"I{x + 1},{y}"], size=1)
+                        new_native_bond(
+                            pepo[f"I{x},{y}"],
+                            pepo[f"I{x + 1},{y}"],
+                            size=1,
+                        )
                 if y + 1 < self.L_y:
                     edge = frozenset(((x, y), (x, y + 1)))
                     if edge not in chain_edges:
-                        pepo[f"I{x},{y}"].new_bond(pepo[f"I{x},{y + 1}"], size=1)
+                        new_native_bond(
+                            pepo[f"I{x},{y}"],
+                            pepo[f"I{x},{y + 1}"],
+                            size=1,
+                        )
         return pepo
 
     def _add_cycle_bonds_(self, pepo, *, bond_dim=1):
@@ -567,11 +652,17 @@ class ham_tn:
 
         if self.L_x > 1:
             for y in range(self.L_y):
-                pepo[f"I{self.L_x - 1},{y}"].new_bond(pepo[f"I0,{y}"], size=int(bond_dim))
+                left = pepo[f"I{self.L_x - 1},{y}"]
+                right = pepo[f"I0,{y}"]
+                if not qtn.bonds(left, right):
+                    new_native_bond(left, right, size=int(bond_dim))
 
         if self.L_y > 1:
             for x in range(self.L_x):
-                pepo[f"I{x},{self.L_y - 1}"].new_bond(pepo[f"I{x},0"], size=int(bond_dim))
+                top = pepo[f"I{x},{self.L_y - 1}"]
+                bottom = pepo[f"I{x},0"]
+                if not qtn.bonds(top, bottom):
+                    new_native_bond(top, bottom, size=int(bond_dim))
 
         return pepo
 
@@ -644,7 +735,7 @@ class ham_tn:
 
     def build_pepo(
         self,
-        ints,
+        ints=None,
         *,
         phys_dim=2,
         max_bond=None,
@@ -653,8 +744,21 @@ class ham_tn:
         compress_each=True,
         cycle_peps=False,
         cycle_bond_dim=1,
+        mapper=None,
+        fermion=None,
+        edges=None,
+        fermionic=None,
+        charge_sectors=False,
+        **model_params,
     ):
-        """Build PEPO directly from interaction terms."""
+        """Build a PEPO from interactions or a native fermion model.
+
+        The ``fermion=...``/``edges=...`` form mirrors :meth:`build_mpo` and
+        forwards ``mapper=OneDMap(...)`` and ``fermionic=True`` to the native
+        fermion MPO builder before converting the result to a PEPO.
+        With ``charge_sectors=True``, return ``{charge: pepo}`` for a mixed
+        native operator.
+        """
         self._require_2d("build_pepo")
         mpo = self.build_mpo(
             ints,
@@ -663,7 +767,23 @@ class ham_tn:
             cutoff=cutoff,
             data_type=data_type,
             compress_each=compress_each,
+            mapper=mapper,
+            fermion=fermion,
+            edges=edges,
+            fermionic=fermionic,
+            charge_sectors=charge_sectors,
+            **model_params,
         )
+        if isinstance(mpo, Mapping):
+            return {
+                charge: self.mpo_to_pepo(
+                    sector_mpo,
+                    cycle_peps=cycle_peps,
+                    cycle_bond_dim=cycle_bond_dim,
+                    inplace=False,
+                )
+                for charge, sector_mpo in mpo.items()
+            }
         return self.mpo_to_pepo(
             mpo,
             cycle_peps=cycle_peps,

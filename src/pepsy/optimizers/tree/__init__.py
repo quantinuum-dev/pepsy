@@ -8,6 +8,7 @@ describe the tree structure.
 
 from .layout import TreeLayoutFinder, TreePlan
 from .optimizer import TreeOptimizer
+from .operators import TreeMPO, build_tree_operator, tree_mpo
 from .ttn import TreeTensorNetwork
 
 __all__ = [
@@ -15,4 +16,7 @@ __all__ = [
     "TreeTensorNetwork",
     "TreeLayoutFinder",
     "TreePlan",
+    "TreeMPO",
+    "build_tree_operator",
+    "tree_mpo",
 ]

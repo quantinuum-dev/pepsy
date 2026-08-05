@@ -1,5 +1,8 @@
 """Tests for :mod:`pepsy.optimizers.peps.optimizer`."""
 
+import warnings
+
+import numpy as np
 import pytest
 
 import pepsy.optimizers.peps.optimizer as peps_mod
@@ -143,7 +146,7 @@ def test_peps_optimizer_within_chi_skips_infidelity_and_optimizer(monkeypatch):
         normalize_initial=False,
     )
 
-    out = opt.run(progress=False)
+    out = opt.run(progress=False, normalize_target=False)
 
     assert out.bond == 2
     assert len(gate_calls) == 1
@@ -154,7 +157,7 @@ def test_peps_optimizer_within_chi_skips_infidelity_and_optimizer(monkeypatch):
 
 
 def test_peps_optimizer_truncated_warmstart_below_tol_skips_sweep(monkeypatch):
-    """A good chi-truncated warm start should be accepted without sweeps."""
+    """Default target normalization precedes warm-start acceptance."""
     gate_calls = _install_fake_gate(monkeypatch)
     norm_calls = _install_fake_normalize(monkeypatch)
 
@@ -180,8 +183,8 @@ def test_peps_optimizer_truncated_warmstart_below_tol_skips_sweep(monkeypatch):
     out = opt.run(progress=False, infidelity_tol=1.0e-9)
 
     assert out.bond == 3
-    assert out.normalized == 1
-    assert len(norm_calls) == 1
+    assert out.normalized == 2
+    assert len(norm_calls) == 2
     assert norm_calls[0][1]["chi"] == 6
     assert norm_calls[0][1]["n_iter"] == 10
     assert norm_calls[0][1]["direction"] == "y"
@@ -193,10 +196,11 @@ def test_peps_optimizer_truncated_warmstart_below_tol_skips_sweep(monkeypatch):
     assert opt.step_records[0]["reason"] == "below_tol"
     assert opt.step_records[0]["pre_infidelity"] == pytest.approx(1.0e-12)
     normalization_events = opt.get_normalizations()
-    assert len(normalization_events) == 1
+    assert len(normalization_events) == 2
     assert "state" not in normalization_events[0]
     assert normalization_events[0]["old_norm"] == pytest.approx(1.0)
-    assert normalization_events[0]["state_max_bond"] == 3
+    assert normalization_events[0]["state_max_bond"] == 8
+    assert normalization_events[1]["state_max_bond"] == 3
 
 
 def test_peps_optimizer_symmray_defaults_to_quimb_mps_boundaries(monkeypatch):
@@ -283,6 +287,7 @@ def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
                 "loss": [0.2, 0.05],
                 "step_trace": [{"state": DummyState(bond=99, name="heavy-step")}],
                 "inner_loss_traces": [[0.2, 0.1]],
+                "inner_best_loss_traces": [[0.2, 0.1]],
             }
 
     monkeypatch.setattr(peps_mod, "SweepOptimizer", _FakeSweep)
@@ -296,7 +301,7 @@ def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
         sweep_optimize_kwargs={"n_cycles": 2, "optimizer": "scipy"},
     )
 
-    out = opt.run(progress=False)
+    out = opt.run(progress=False, sweep_progress=True)
 
     assert out.name == "best"
     assert out.normalized == 1
@@ -315,7 +320,7 @@ def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
     assert captured["optimize_kwargs"]["n_round_trips"] == 4
     assert captured["optimize_kwargs"]["renormalize"] is False
     assert captured["optimize_kwargs"]["env_n_iter"] == 10
-    assert captured["optimize_kwargs"]["progress"] is False
+    assert captured["optimize_kwargs"]["progress"] is True
     assert captured["optimize_kwargs"]["progress_position"] == 0
     assert opt.local_infidelities[0] == pytest.approx(0.04)
     assert opt.get_fidelities()[-1] == pytest.approx(0.96)
@@ -333,6 +338,11 @@ def test_peps_optimizer_runs_sweep_and_records_geometric_fidelity(monkeypatch):
     assert result_summary["loss_count"] == 2
     assert result_summary["step_count"] == 1
     assert result_summary["inner_loss_trace_count"] == 1
+    assert result_summary["inner_best_loss_trace_count"] == 1
+    assert result_summary["min_inner_infidelity"] == pytest.approx(0.1)
+    assert result_summary["inner_best_monotonic"] is True
+    assert result_summary["best_after_abs_error"] == pytest.approx(0.03)
+    assert result_summary["invalid_inner_loss_count"] == 0
     assert "best_state" not in result_summary
     assert "runs" not in result_summary
     assert "step_trace" not in result_summary
@@ -388,7 +398,7 @@ def test_peps_optimizer_separates_optimization_normalize_and_evaluation_chi(monk
     out = opt.run(progress=False, infidelity_tol=1.0e-9)
 
     assert out.name == "best"
-    assert [call[1]["chi"] for call in norm_calls] == [6, 6, 6]
+    assert [call[1]["chi"] for call in norm_calls] == [6, 6, 6, 6]
     assert [call["chi"] for call in infidelity_calls] == [9, 9]
     assert captured["init"]["kwargs"]["chi"] == 4
     assert captured["init"]["kwargs"]["normalize_kwargs"]["chi"] == 6
@@ -433,7 +443,7 @@ def test_peps_optimizer_run_overrides_normalize_and_evaluation_chi(monkeypatch):
     )
 
     assert out.bond == 3
-    assert [call[1]["chi"] for call in norm_calls] == [10]
+    assert [call[1]["chi"] for call in norm_calls] == [10, 10]
     assert [call["chi"] for call in infidelity_calls] == [11]
     record = opt.step_records[0]
     assert record["normalize_chi"] == 10
@@ -740,7 +750,7 @@ def test_peps_optimizer_run_resets_traces_by_default(monkeypatch):
 
 def test_peps_optimizer_progress_reports_geometric_infidelity(monkeypatch):
     """Progress bar should expose a compact MpsOptimizer-style postfix."""
-    import tqdm as tqdm_pkg
+    import tqdm.auto as tqdm_auto
 
     _install_fake_gate(monkeypatch)
     _install_fake_normalize(monkeypatch)
@@ -769,7 +779,7 @@ def test_peps_optimizer_progress_reports_geometric_infidelity(monkeypatch):
         def close(self):
             self.closed = True
 
-    monkeypatch.setattr(tqdm_pkg, "tqdm", _FakeTqdm)
+    monkeypatch.setattr(tqdm_auto, "tqdm", _FakeTqdm)
 
     opt = PepsOptimizer(
         DummyState(bond=1),
@@ -786,29 +796,103 @@ def test_peps_optimizer_progress_reports_geometric_infidelity(monkeypatch):
     assert progress.closed is True
     assert progress.kwargs["position"] == 0
     assert progress.kwargs["ascii"] is True
-    # No widget-only knobs that diverge from MpsOptimizer's bar.
-    assert "unit" not in progress.kwargs
-    assert "dynamic_ncols" not in progress.kwargs
-    # Compact postfix mirrors MpsOptimizer: 2q, bnd, Icum (no why/I/Igeo/tgt).
-    assert set(last.keys()) == {"2q", "bnd", "Icum"}
+    assert progress.kwargs["unit"] == "gate"
+    assert progress.kwargs["dynamic_ncols"] is True
+    assert progress.kwargs["mininterval"] == pytest.approx(0.2)
+    # The bar reports gate position/status, cumulative infidelity, the current
+    # input/local values, and optimizer gain (pre-optimization minus final).
+    assert set(last.keys()) == {
+        "2q", "bnd", "step", "status", "infidelity", "input",
+        "local_infidelity", "opt_gain",
+    }
     assert last["2q"] == 1
     assert last["bnd"] == 3
-    assert last["Icum"] == PepsOptimizer._format_progress_infidelity(
+    assert last["step"] == "1/1"
+    assert last["status"] == "below_tol"
+    assert last["input"] == PepsOptimizer._format_progress_infidelity(1.0e-6)
+    assert last["infidelity"] == PepsOptimizer._format_progress_infidelity(
         opt.get_infidelities()[-1]
     )
+    assert last["local_infidelity"] == PepsOptimizer._format_progress_infidelity(1.0e-6)
+    assert last["opt_gain"] == PepsOptimizer._format_progress_infidelity(0.0)
     # Only one postfix update per gate step, matching MpsOptimizer.
     assert len(progress.postfix_calls) == 1
 
 
-def test_peps_optimizer_inner_sweep_progress_is_silenced():
-    """Inner sweep bar should be off so only the outer PEPS bar shows."""
+def test_peps_optimizer_progress_reports_optimizer_gain():
+    """The progress postfix should expose positive local cleanup improvement."""
+    opt = PepsOptimizer(DummyState(bond=1), [], chi=2, normalize_initial=False)
+    opt._fidelity_count = 1
+    opt.infidelities = [0.0, 0.03]
+    opt.step_records = [{
+        "pre_infidelity": 0.2,
+        "final_infidelity": 0.04,
+    }]
+
+    postfix = opt._progress_postfix(two_site_count=1)
+
+    assert postfix["infidelity"] == PepsOptimizer._format_progress_infidelity(0.03)
+    assert postfix["local_infidelity"] == PepsOptimizer._format_progress_infidelity(0.04)
+    assert postfix["opt_gain"] == PepsOptimizer._format_progress_infidelity(0.16)
+
+
+def test_peps_optimizer_progress_reports_sweep_input_output():
+    """Sweep progress should distinguish boundary input/output from final acceptance."""
+    opt = PepsOptimizer(DummyState(bond=1), [], chi=2, normalize_initial=False)
+    opt._fidelity_count = 1
+    opt.infidelities = [0.0, 0.03]
+    opt.step_records = [{
+        "pre_infidelity": 0.2,
+        "final_infidelity": 0.04,
+        "optimizer_result": {
+            "loss_before": 0.2,
+            "loss_after": 0.05,
+            "best_loss": 0.03,
+            "n_runs": 4,
+        },
+    }]
+
+    postfix = opt._progress_postfix(two_site_count=1)
+
+    assert postfix["input"] == PepsOptimizer._format_progress_infidelity(0.2)
+    assert postfix["sweep"] == (
+        f"{PepsOptimizer._format_progress_infidelity(0.2)}"
+        f"->{PepsOptimizer._format_progress_infidelity(0.05)}"
+    )
+    assert postfix["slice_best"] == PepsOptimizer._format_progress_infidelity(0.03)
+    assert postfix["slices"] == 4
+    assert postfix["local_infidelity"] == PepsOptimizer._format_progress_infidelity(0.04)
+    assert postfix["opt_gain"] == PepsOptimizer._format_progress_infidelity(0.16)
+
+
+def test_peps_optimizer_inner_sweep_progress_shows_directional_moves():
+    """Outer progress enables a separate slice-level directional sweep bar."""
     opt = PepsOptimizer(DummyState(bond=1), [], chi=2, normalize_initial=False)
 
     _init_kwargs, opt_kwargs, strip_exponent = opt._sweep_boundary_kwargs(progress=True)
 
+    assert opt_kwargs["progress"] is True
+    assert opt_kwargs["progress_position"] == 1
+    assert opt_kwargs["progress_leave"] is False
+    assert strip_exponent is True
+
+    _init_kwargs, opt_kwargs, _strip_exponent = opt._sweep_boundary_kwargs(
+        progress=True,
+        sweep_progress=False,
+    )
     assert opt_kwargs["progress"] is False
     assert opt_kwargs["progress_position"] == 0
-    assert strip_exponent is True
+
+    configured = PepsOptimizer(
+        DummyState(bond=1), [], chi=2, normalize_initial=False, sweep_progress=False
+    )
+    assert configured.sweep_progress is False
+
+    direction_label = peps_mod.SweepOptimizer._sweep_direction_label
+    assert direction_label("x", "forward") == "right"
+    assert direction_label("x", "backward") == "left"
+    assert direction_label("y", "forward") == "up"
+    assert direction_label("y", "backward") == "down"
 
 
 def test_peps_optimizer_nonunitary_normalizes_target_before_infidelity(monkeypatch):
@@ -986,9 +1070,159 @@ def test_peps_optimizer_symmray_sweep_uses_quimb_mps_boundaries(monkeypatch):
     assert captured["kwargs"]["normalize_kwargs"]["method"] == "mps"
     assert captured["kwargs"]["normalize_kwargs"]["mode_"] == "mps"
     assert captured["kwargs"]["normalize_kwargs"]["balance_bonds"] is False
+    assert captured["kwargs"]["simplify"] is False
     assert captured["optimize_kwargs"]["env_n_iter"] == 10
     assert captured["optimize_kwargs"]["optimizer"] == "nlopt"
     assert captured["optimize_kwargs"]["optimizer_options"]["algorithm"] == "LD_LBFGS"
+
+
+def test_sweep_scaled_scalar_preserves_torch_exponent_gradient():
+    """Scaled Torch exponents must remain in the differentiable loss path."""
+    torch = pytest.importorskip("torch")
+    exponent = torch.tensor(3.0, requires_grad=True)
+    mantissa, exponent_out = peps_mod.SweepOptimizer._as_scaled_scalar(
+        (1.0, exponent),
+        name="target_norm",
+    )
+    assert mantissa == 1.0
+    assert exponent_out is exponent
+
+    fidelity = peps_mod.SweepOptimizer._scaled_overlap_fidelity(
+        (torch.tensor(1.0), exponent),
+        (torch.tensor(1.0), 0.0),
+        (1.0, 0.0),
+    )
+    (1.0 - fidelity).backward()
+    assert exponent.grad is not None
+    assert float(exponent.grad.abs()) > 0.0
+
+
+def test_symmray_fermionic_local_bra_preserves_full_norm():
+    """Fermionic local bras must use the full-network conjugation context."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("symmray")
+
+    import pepsy as py
+    from pepsy.boundary.metrics import build_bra_ket
+    from pepsy.tensors import SymPEPS
+
+    py.reg_rel_svd_torch()
+    to_backend = py.build_backend(
+        device="cpu",
+        dtype=torch.complex128,
+        requires_grad=False,
+        set_default=False,
+    )
+    contraction = py.build_contraction(parallel=False, progbar=False)
+    site_charge = py.site_charge_alternating((1, 0), (0, 1))
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1U1",
+        bond_dim=2,
+        phys_dim=4,
+        fermionic=True,
+        site_charge=site_charge,
+        seed=202,
+        dtype="complex128",
+        to_backend=to_backend,
+        contraction_opt=contraction,
+    ).peps
+    target = state.copy()
+    target.mangle_inner_("_target")
+
+    _, norm = build_bra_ket(ket=state, bra=None)
+    _, overlap = build_bra_ket(ket=target, bra=state)
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        target_norm=1.0,
+        chi=64,
+        contraction_opt=contraction,
+        boundary_engine="quimb-mps",
+        simplify=False,
+        renormalize_state=False,
+    )
+    local = state.select(["Y1"], "any")
+    local_target = target.select(["Y1"], "any")
+    bra_norm, bra_overlap = sweep._symmray_local_bras(local)
+
+    def scalar(tn):
+        value = tn.contract(all, optimize=contraction, strip_exponent=False)
+        value = sweep._unwrap_contracted_scalar(value, name="norm")
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().item()
+        return complex(value)
+
+    full_norm = scalar(norm)
+    split_norm = scalar(norm.select(["Y0"], "any") | norm.select(["Y1"], "any"))
+    local_norm = scalar(norm.select(["Y0"], "any") | local | bra_norm)
+    full_overlap = scalar(overlap)
+    local_overlap = scalar(
+        overlap.select(["Y0"], "any") | local_target | bra_overlap
+    )
+
+    assert split_norm == pytest.approx(full_norm, rel=1.0e-12, abs=1.0e-12)
+    assert local_norm == pytest.approx(full_norm, rel=1.0e-12, abs=1.0e-12)
+    assert local_overlap == pytest.approx(full_overlap, rel=1.0e-12, abs=1.0e-12)
+
+
+@pytest.mark.parametrize("symmetry", ["U1", "U1U1"])
+@pytest.mark.parametrize("axis", ["x", "y"])
+def test_symmray_fermionic_sweep_improves_global_infidelity(symmetry, axis):
+    """A real fermionic sweep must improve both lattice directions."""
+    pytest.importorskip("torch")
+    pytest.importorskip("symmray")
+
+    import pepsy as py
+    from pepsy.tensors import SymPEPS
+
+    py.reg_rel_svd_torch()
+    contraction = py.build_contraction(parallel=False, progbar=False)
+    kwargs = {
+        "symmetry": symmetry,
+        "bond_dim": 2,
+        "phys_dim": 4 if symmetry == "U1U1" else 2,
+        "fermionic": True,
+        "dtype": "complex128",
+        "contraction_opt": contraction,
+    }
+    if symmetry == "U1U1":
+        kwargs["site_charge"] = py.site_charge_alternating((1, 0), (0, 1))
+
+    state = SymPEPS.random(2, 2, seed=7, **kwargs).peps
+    target = SymPEPS.random(2, 2, seed=107, **kwargs).peps
+    target.mangle_inner_("_target")
+    target_norm = complex(
+        np.asarray((target.H & target).contract(all, optimize=contraction)).item()
+    )
+    before = float(1.0 - py.tn_fidelity(state, target, contraction_opt=contraction).real)
+
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        target_norm=target_norm,
+        chi=64,
+        contraction_opt=contraction,
+        boundary_engine="quimb-mps",
+        simplify=False,
+        renormalize_state=False,
+    )
+    sweep.set_optimize_kwargs(
+        axes=(axis,),
+        n_cycles=1,
+        n_round_trips=1,
+        optimizer="scipy",
+        optimizer_options={"n_steps": 3, "maxiter": 25},
+        env_n_iter=4,
+        progress=False,
+        renormalize=False,
+    )
+    result = sweep.run()
+    after = float(1.0 - py.tn_fidelity(state, target, contraction_opt=contraction).real)
+
+    assert result["runs"]
+    assert after < before
 
 
 def test_peps_optimizer_explicit_quimb_boundary_engine_forwards_options(monkeypatch):
@@ -1114,6 +1348,6 @@ def test_peps_optimizer_forwards_entry_which_over_default(monkeypatch):
         normalize_initial=False,
     )
 
-    _ = opt.run(progress=False)
+    _ = opt.run(progress=False, normalize_target=False)
 
     assert gate_calls[0]["which"] == "lower"

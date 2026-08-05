@@ -82,21 +82,31 @@ and groups equal `(M, K, N)` products into batched `numpy.matmul` calls. This
 avoids rediscovering block routing and collapses repeated small dense products
 inside every hot-loop `H_eff` application. The normal Fermi-Hubbard DMRG path
 is already bosonized before these contractions, so it uses this fast path.
-Compatible native fermionic arrays can also use it for unfused, shared-leg,
-NumPy-only contractions: Pepsy caches Symmray's sector phases with the plan and
+For unfused bosonic NumPy plans, output blocks with an identical dynamic right
+source schedule can additionally use a source-fanout GEMM: Pepsy stacks their
+static left maps even when their row count `M` differs, builds the shared right
+matrix once, and scatters the GEMM rows back to their sector blocks. The
+additional stacked maps are collectively capped at 32 MiB per compiled pair;
+all unclaimed outputs retain the existing batched or single-matmul routes.
+Compatible native fermionic arrays can still use the compiled route for
+unfused, shared-leg, NumPy-only contractions, but retain their existing
+per-output batching: Pepsy caches Symmray's sector phases with the plan and
 checks fermionic metadata before each reuse. Fused, outer-product, mixed, or
 non-NumPy fermionic contractions retain Symmray's exact `tensordot` path.
 `profile_summary()` aggregates the new batch timing phases, while sampled
 matvec diagnostics report the batch-plan shape and call counters so scale runs
-can confirm the hot matvec path is reusing this setup work.
-For small, right-first, bosonic projected problems, Pepsy also considers a
-private dense block-sector effective-Hamiltonian cache. It is capped at 32 MiB
-and is retained only after its first result agrees with the streamed
-contractions at `1e-12`; left-first, fermionic, oversized, and failed
-validation cases continue to use the compiled streaming plans. The diagnostic
-record exposes the cache state, size, block count, reuse count, validation
-error, and any disabled reason. This is a bounded experimental optimization
-rather than a replacement local solver.
+can confirm the hot matvec path is reusing this setup work. Fanout diagnostics
+use the `*_compiled_block_plan_fanout_*` prefix and report eligible/enabled
+groups, output coverage, static bytes, predicted output-product savings, and
+actual fanout GEMM calls; timing totals use
+`*_compiled_block_fanout_pack_elapsed` and
+`*_compiled_block_fanout_matmul_elapsed`.
+The private dense block-sector effective-Hamiltonian cache is disabled by
+default. Its composed matmuls change summation order and did not amortize their
+setup cost within bounded local Krylov solves. The experimental path remains
+available to focused benchmarks and still requires first-result agreement with
+the streamed contractions at `1e-12`; its diagnostic record exposes the cache
+state, size, block count, reuse count, validation error, and disabled reason.
 `matvec_layout="fused"` is available as an opt-in prototype for the
 block-native path. It attempts to fuse multiple shared contraction legs inside
 each cached projected problem, using Symmray's fused-index support when the

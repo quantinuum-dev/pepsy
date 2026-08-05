@@ -37,6 +37,15 @@ swap/split updates, and linear canonical metadata are chain-specific. Keep
 `to_statevector()` equal to `C @ p_dense` in logical big-endian order, and
 delegate `norm()` to the coefficient tree.
 
+Keep coefficient canonicality single-owned as well. Local isometry proofs live
+only on ``TreeTensorNetwork`` tensors' ``left_inds``; TreeStab exposes
+read-only delegates to the tree API and must not cache another map. Direct,
+MPO, and coefficient-frame sub-MPO paths inherit TreeOptimizer's
+metadata-gated one-sided compression. Use ``apply_to_arrays`` for backend-only
+conversion, and when a TreeStab constructor independently proves a canonical
+tree (such as dense cap factorization), install the proven metadata without a
+redundant numerical QR sweep.
+
 Clifford events update `C`. Physical Pauli rotations, measurements, resets,
 and magic gadgets map through `C† P C` and update `|p>`. Coefficient-frame
 sub-MPO events go directly to `TreeOptimizer.apply_submpo`; they are not

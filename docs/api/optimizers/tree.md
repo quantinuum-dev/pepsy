@@ -5,18 +5,191 @@ gate stream `[(gate, where), ...]` on a **rooted tree tensor network**, after
 *Simulating quantum circuits using tree tensor networks* (Seitz, Medina, Cruz,
 Huang, Mendl; Quantum 7, 964, 2023; [arXiv:2206.01000](https://arxiv.org/abs/2206.01000)).
 
-The state is stored with one leaf tensor per qubit. Internal nodes may have
-**any arity** -- by default the layout finder *searches* a small set of
-candidate arities `(2, 3, 4)` and keeps the objective-best plan, but a fixed
-binary tree, flatter `k`-ary trees, or gate-connectivity-driven communities
-(see *Tree structure*) all work through the same machinery. Gates are absorbed
-into the tree:
+By default the state is stored with one leaf tensor per qubit. A plan may
+instead designate one `root_qubit`, placing that physical index directly on
+the top tensor while every other qubit remains a leaf. Internal nodes may have
+**any arity** -- the default is a binary tree below a three-virtual-leg root,
+but a fixed binary root, flatter `k`-ary trees, or gate-connectivity-driven
+communities (see *Tree structure*) all work through the same machinery.
 
-- **single-qubit gates** are contracted into the leaf tensor with no bond
+For example, this constructs a binary detector tree whose logical qubit is the
+open top index. The root tensor has two virtual child bonds and physical index
+`k4`:
+
+```python
+from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer
+
+finder = TreeLayoutFinder(gates, n=5, root_qubit=4, max_arity=2)
+plan = finder.run(
+    order="quality",
+    refine="greedy",
+    refine_budget=64,
+    search="nevergrad",
+    search_budget=128,
+    progbar=True,
+)
+opt = TreeOptimizer(
+    gates,
+    tree=plan,
+    chi=64,
+    cutoff=1e-10,
+    cutoff_mode="rsum2",
+)
+assert opt.plan.node_of_qubit[4] == opt.plan.root
+assert set(opt.tn.node_tensor(opt.plan.root).inds) >= {"k4"}
+```
+
+`root_qubit` is first-class rather than an unregistered outer leg:
+`to_dense()` retains it in normal qubit order, `cap(root_qubit, vec)` contracts
+only that physical leg, and direct gates, dense subtree operators, and
+structured sub-MPOs may include it in their support. `TreeLayoutFinder` keeps
+the site fixed at the root while its path, Steiner, congestion, greedy, and
+Nevergrad objectives permute only the remaining leaf sites.
+
+### Layout-aware native MPOs
+
+After selecting a plan, the canonical tree-native operator is built with
+`plan.build_tree_operator(...)` or `Fermion.build_tree_operator(...)`. The
+legacy `tree_mpo(plan, hamiltonian)` / `plan.to_mpo(...)` builders return the
+ordinary compatibility chain MPO with the tree operator attached. The native
+path includes `U1FermionicArray` and `U1U1FermionicArray` tensors:
+
+```python
+from pepsy import Fermion
+from pepsy.optimizers.tree import TreeLayoutFinder
+
+finder = TreeLayoutFinder(gates, n=8, max_arity=2)
+plan = finder.run(order="quality")
+fermion = Fermion(spinful=True, symmetry="U1U1")
+hamiltonian = fermion.hamiltonian(edges, t=1.0, U=2.0, mu=0.1)
+
+tree_operator = plan.build_tree_operator(hamiltonian)
+chain_mpo = tree_operator.chain_mpo
+energy = opt.tn.expectation_mpo_exact(chain_mpo, range(plan.n))
+```
+
+For a model-facing operator build, use `Fermion.build_tree_operator(...)`.
+`Fermion.to_tree_mpo(...)` and `TreePlan.to_tree_mpo(...)` remain compatibility
+aliases. `TreeMPO` exposes the optional chain representation without mixing
+the two tensor-network geometries:
+
+```python
+from pepsy import Fermion
+
+tree_operator = fermion.build_tree_operator(
+    hamiltonian=hamiltonian,
+    tree=plan,
+    compress=True,
+)
+chain_operator = tree_operator.chain_mpo       # optional linear MPO
+energy = tree_operator.expectation(opt.tn)      # TreePlan-native readout
+```
+
+`TreeMPO.from_terms(plan, dense_terms)` provides the corresponding ordinary
+dense backend. Native fermionic `TreeMPO` objects retain Symmray arrays for
+U1, U1U1, and other supported symmetries; dense and native operators are not
+silently mixed with incompatible tree states.
+
+For an exact native readout that keeps the chain MPO separate, use
+`expectation_mpo_exact` as above. The general `expectation_mpo` API remains
+available for an explicitly approximate structured-MPO application: it uses a
+private transformed copy of the TTN. Routing itself is lossless, but the final
+subtree sweep may compress that copy when an MPO increases a bond beyond
+`max_bond`; `cutoff=0.0` does not disable a finite bond cap. The default
+`warn_on_truncation=True` reports this approximation, and the diagnostic form
+makes it easy to check a benchmark:
+
+```python
+energy, report = opt.tn.expectation_mpo(
+    mpo,
+    range(plan.n),
+    max_bond=64,
+    cutoff=0.0,
+    return_diagnostics=True,
+)
+assert not report["truncated"]
+```
+
+Use a larger `max_bond` when an untruncated measurement is required. Native
+fermionic trees also reject ordinary dense MPOs (and dense trees reject native
+Symmray MPOs) instead of silently changing the fermionic interpretation.
+
+For an exact readout that does not move the MPO into the tree at all, use
+`expectation_mpo_exact`:
+
+```python
+energy = opt.tn.expectation_mpo_exact(
+    mpo,
+    range(plan.n),
+)
+```
+
+The same method is available directly as `opt.expectation_mpo_exact(...)`.
+
+This keeps the bra, ket, and structured MPO as separate networks. Fresh ket
+physical indices connect to the MPO input legs, the MPO output legs connect to
+the bra, and Quimb contracts the complete doubled network. No state-bond
+compression or `to_dense()` lowering occurs. Native Symmray MPOs retain their
+graded contraction and fermionic sign rules.
+
+`TreePlan.mpo_order()` is the structural leaf-position order chosen by the
+plan; a physical `root_qubit`, when present, is placed first. The helper
+constructs the chain MPO in that one-dimensional order, then restores the
+physical labels to their logical qubit numbers. It returns the ordinary Quimb
+MPO for compatibility, while exact native readout uses the separate
+TreePlan-aware embedding attached by the builder.
+
+`TreeMPO` is the tree-routed operator class. Its optional `chain_mpo` remains a
+linear MPO for MPS workflows, while `tree_networks` contains the
+TreePlan-labelled operator networks used by `expectation`. Native neutral
+terms are factorized directly from their native Symmray operator tensor over
+the term's TreePlan Steiner subtree, then amalgamated into one charge-aware
+direct-sum TTNO. This applies to one-, two-, and higher-site native terms; it
+does not create a hyperedge for the normal Hamiltonian path. The resulting
+TTNO can be canonicalized and compressed with
+`tree_operator.canonicalize()` and
+`tree_operator.compress(cutoff=..., max_bond=...)`; no Jordan--Wigner
+conversion is used. Nonzero or mixed operator charges remain separate
+homogeneous native networks inside the same public `TreeMPO`, so callers do
+not need `charge_sectors=True` just to construct one operator object;
+`charge_sectors=True` remains available when separate objects are preferred.
+Structured observables can use a smaller compact TTNO.
+Pass `fermionic=False` only for dense ordinary/Jordan--Wigner-compatible terms.
+Existing `OneDMap` lattice maps remain unchanged and should continue to be used
+for regular 2D/3D coordinate layouts.
+
+`TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, in the same way that
+`TreeTensorNetwork` subclasses `TensorNetworkGenVector`. It is the tree twin
+of Quimb's `MatrixProductOperator`: the common operator surface includes
+`sites`, `nsites`, `site_tag`, `upper_ind`, `lower_ind`, `to_dense`, `H`,
+`copy`, `identity`, `from_dense`, `add_MPO`, `singular_values`, and
+`amplitude`. Tree-specific geometry is exposed through `plan`, `node_tensor`,
+`neighbors`, and `bond`; `canonicalize`/`compress` perform the corresponding
+tree-wide QR/SVD sweeps. It cannot inherit Quimb's chain-only
+`MatrixProductOperator` implementation because a branched tree has no single
+left/right ordering. The optional `chain_mpo` remains the separate object for
+chain workflows.
+
+The conventional binary TTN with a three-leg top tensor is the default when
+there are at least three leaves and no `root_qubit`. Pass
+`max_arity=2, top_arity=3` explicitly to `TreePlan.from_order`,
+`TreeLayoutFinder`, or `TreeTensorNetwork.from_order` for the same geometry.
+The structural root then has three **virtual**
+child bonds and no parent bond; every non-root internal tensor has two child
+bonds and one parent bond. Thus the root is still in the rank-three binary
+class, rather than being a genuinely wider tensor. `top_arity=3` is not
+combined with `root_qubit`, because adding a physical root leg would make a
+rank-four tensor. `TreePlan.is_binary()` accepts this ternary-root convention,
+while `TreePlan.is_strictly_binary()` requests two children at every internal
+node.
+
+Gates are absorbed into the tree:
+
+- **single-qubit gates** are contracted into their site tensor with no bond
   growth; a unitary one-qubit gate preserves the tree canonical form regardless
   of where the orthogonality centre sits;
-- **two-qubit gates** on leaves `a` and `b` are split by SVD into two factors
-  joined by a virtual bond; the factors are absorbed into the two leaves and the
+- **two-qubit gates** on sites `a` and `b` are split by SVD into two factors
+  joined by a virtual bond; the factors are absorbed into the two site nodes and the
   bond is *threaded exactly* (lossless economical QR) along the tree path from
   `a` to `b`. Only once **both** factors are in place is a single canonical
   compression sweep run back along the path, truncating every touched bond to
@@ -37,7 +210,7 @@ into the tree:
   compression when the payload exposes Quimb's MPO site interface, so
   `to_dense()` is not required; opaque MPO-like payloads fall back to the dense
   recursive subtree-operator path.
-  `cap` contracts and removes one tree leaf, compacts the remaining qubit
+  `cap` contracts and removes one physical site, compacts the remaining qubit
   labels above it, and keeps the live tree canonical.
 
 The orthogonality centre is a single node id tracked on the
@@ -58,9 +231,21 @@ the `orthogonality_center` name-parity alias), `shift_orthogonality_center(node)
 and `is_canonical_form(center)` delegate to the state, so the optimizer and its
 `TreeTensorNetwork` speak the same canonicalisation vocabulary.
 
+Local isometry orientation also has one owner: each live Quimb tensor carries
+its proven `left_inds`, while `TreeTensorNetwork.isometry_direction(node)` and
+`isometry_map()` derive read-only node-to-neighbour views from those tensors.
+`can_skip_canonize(a, b)` exposes the exact local condition used to avoid an
+already-proven QR, and `validate_isometry_metadata()` checks the local
+orientations against the tracked canonical region. `TreeOptimizer` delegates
+the same four methods without maintaining another mutable map. Native
+fermionic edges use this shortcut only when Symmray reports a fermionic array
+with aligned charge maps and a complete `left_inds` proof; otherwise they
+retain the explicit graded QR path.
+
 `TreeTensorNetwork.validate()` checks the live tensor set, physical legs, tree
 edges, and bond ownership against the `TreePlan`; pass
-`check_canonical=True` when the more expensive isometry check is also desired.
+`check_canonical=True` when the metadata alignment and more expensive numerical
+isometry check are also desired.
 Direct Quimb mutations such as `gate_inds_`, `canonize_between`,
 `compress_between`, and `canonize_around_` invalidate the tracked canonical
 region. Call `invalidate_canonical_form()` after mutating tensor data directly;
@@ -70,13 +255,147 @@ operations that prove canonicality is preserved.
 
 Native fermionic trees use a separate graded edge path. Centre moves explicitly
 QR-split the Symmray tensor and absorb the native carry into the next node;
-edge compression explicitly forms the two-node tensor and performs its native
-block SVD. Dense and nonfermionic trees continue to use Quimb's generic
+edge compression uses a reduced graded core whenever the destination endpoint
+is already proven isometric: the active endpoint is QR-split first, and only
+its `R` factor is sent to the truncating native block SVD. If that proof is
+absent, both endpoints are QR-reduced and their contracted core is SVD'd;
+only an unrecognised reduction hint forms the complete two-node tensor.
+Dense and nonfermionic trees continue to use Quimb's generic
 `canonize_between` / `compress_between` wrappers. A graded exterior is not
 assumed to be an ordinary Frobenius identity for readout: a known native
 fermionic centre uses a one-tensor `TensorNetwork.H` contraction (which applies
 the required outer-leg phase flips), while an unknown centre falls back to an
 exact complete doubled-network contraction.
+
+### Native fermionic QR stability
+
+Native Symmray tree routes use Pepsy's internal
+`TreeTensorNetwork._native_qr_split` policy for every lossless QR gauge move,
+including two-qubit path threading, edge canonicalization, lossless path
+splits, and sub-MPO message routing. The corresponding network-level subtree
+canonicalization uses the same policy through `_native_qr_options()`.
+
+For native block-sparse tensors, the policy passes `stabilized=False` to
+Quimb's QR split. Symmray's stabilized QR phase-normalizes each diagonal of
+`R`; symmetry can make a diagonal an exact structural zero, so the phase
+`0 / |0|` can produce a NaN in `complex64`. Plain QR avoids that undefined
+phase while preserving the exact factorization (`Q @ R`) and the tensor's
+`left_inds` isometry metadata. This is a gauge choice, not a truncation or a
+change to the represented state, and native `complex64` trees therefore do not
+need to be promoted to `complex128` as a workaround for this issue.
+
+The safeguard is tensor-aware: dense TTNs retain Quimb's ordinary stabilized
+QR convention. It is internal to the tree implementation, so callers do not
+need to pass a QR flag. Native truncating compression continues to use the
+graded block SVD and the configured `chi`, `cutoff`, and `cutoff_mode`. This
+policy is specific to `TreeTensorNetwork` / `TreeOptimizer`; the separate MPS
+optimizer implementation is unchanged.
+
+### Native central-edge compression and profiling
+
+For a compression from active endpoint `A` to destination endpoint `B`, the
+one-sided native path is valid only when `B` is structurally proven isometric
+toward `A` (`can_skip_canonize(A, B, absorb="left")`). It uses
+
+```text
+A = Q_A R_A
+R_A = U S V†
+new_A = Q_A U
+new_B = (S V†) B
+```
+
+The first QR is lossless and uses `_native_qr_split`; the second factorization
+is the only truncating SVD. This avoids SVD'ing the fully fused `A B` tensor,
+which can be thousands by thousands at moderate `chi` even when the live
+edge is small. The implementation keeps the reduction hint separate from the
+destination tensor, uses fresh intermediate bond labels while the old edge is
+still present in `R_A`, and restores the original live edge label after the
+factors are contracted. `reduced=True` uses the analogous two-sided QR/core
+reduction. A positive cutoff never turns this into metadata-only compression.
+
+On the calibrated 6x6 χ=64 complex64 Torch-CPU run (12 threads, 48 gates),
+Tree evolution improved from 127.77 s to 6.21 s; MPS took 2.85 s in the same
+post-fix run. Thus this fix removes the pathological Tree kernel, but Tree is
+still about 2.18x slower for this prefix. The saved profile showed 276 edge
+compression events totaling 2.40 s inside 48 update envelopes totaling 6.18 s;
+it identified the gate update/threading/contraction path, especially the
+central edges, rather than route-length tuning, as the next target.
+
+The update path carries the isometry proof produced by the lossless threading
+sweep into the reverse compression sweep, so native edges do not revalidate
+the same `left_inds`/charge-map proof at every central edge. Two-site factors
+use state-owned unique work labels rather than per-factor UUID allocation;
+live routed bonds remain collision-safe across copied states without random
+label setup in the hot loop. Native Torch-CPU one-edge contractions use
+Symmray's blockwise mode, while CUDA and other backends retain the fused mode.
+In multi-site Tree/MPO updates, independent QR messages
+landing at the same node are contracted as one batch; dense waves reuse their
+worker pool, while native fermionic routing remains serial for Symmray safety.
+These changes preserve the complete-gate-before-truncation rule and the
+configured χ/cutoff semantics. On repeated warm-cache runs of the same
+harness, Tree evolution was 4.90--5.15 s; absolute timings vary with BLAS
+thread state, so profile envelopes remain the authoritative comparison.
+
+The remaining two-site update bookkeeping is also shared across arbitrary
+gate streams: immutable qubit-support geodesics are cached and re-oriented
+against the live centre for each gate, while ordinary one-edge tensor merges
+use a direct backend ``tensordot``. Symmray dispatches through its graded
+fermionic contraction implementation; unusual hyperedges still use Quimb's
+general contraction path. This removes repeated path construction and
+contraction-expression setup without changing the routed QR/SVD sequence.
+
+Native complex64 QR also applies a reversible power-of-two scale separately
+to small Symmray charge blocks. This avoids a Torch QR failure on finite,
+rank-deficient blocks around ``1e-9`` without changing ``Q @ R`` or promoting
+the replay to complex128. Native ``reduced="right"`` now has the matching
+one-sided endpoint-SVD path; unproven ``right``, ``False``, and ``lazy`` modes
+continue to use the conservative complete SVD.
+
+The exact 6x6 ``nsteps=0`` stream (468 gates, χ=64, complex64 Torch CPU,
+12 threads, ``track_truncation=False``) subsequently completed without the
+previous gate-235 NaN. In one profiled run, MPS evolution took 20.39 s and
+Tree evolution 137.11 s; Tree layout planning was a separate 25.79 s, giving
+an evolution ratio of 6.72x. This confirms stability, not parity: the remaining
+Tree cost is concentrated in the per-gate update envelopes and needs further
+backend/profile-guided reduction. The same run's normalized Tree/MPS state
+fidelity was 0.590; at χ=64 this measures different truncation histories on
+the two geometries, not a QR gauge error. Compare observables or increase χ
+when using this number as an accuracy diagnostic.
+
+#### QR/hop and bond-growth diagnostics
+
+Construct `TreeOptimizer(..., profile=True)` to split the update envelope into
+timed `thread_hop`, `edge_canonize`, and `edge_compress` events. The profile
+also records `gate_factorization`, `tensor_absorption`, `center_movement`,
+`metadata_path`, and `subtree_hub_merge` phases when those routes are used. The
+`thread_hop` events are the exact, lossless QR carry moves; `edge_compress`
+events are the truncating SVD work. These timings are nested inside the
+per-update envelope and should not be added as independent wall-clock totals;
+use `profile_report()["update_seconds"]` as the envelope total. The
+`timing_semantics` field records this relationship explicitly. For asynchronous
+CuPy or CUDA work, `profile_sync=True` synchronizes the active device at each
+phase boundary so phase durations represent device execution; this is a
+diagnostic mode and adds synchronization overhead.
+For native Symmray compression, `profile_report()` also returns
+`native_compression_routes`: counts of `one_sided_left`, `one_sided_right`, and
+`two_sided_reduced` show that the graded reduced-core paths are active, while
+`full_svd_fallback` identifies a conservative complete two-node SVD. Route
+records have zero duration; use the enclosing `edge_compress` event for timing.
+
+For a dimension-level report, also pass
+`track_bond_diagnostics=True`. `bond_diagnostic_report()` then records
+the per-update `live_max_bond_before`, `transient_max_bond` during
+routing/factorization, and `live_max_bond_after` after the compression sweep.
+The former may exceed `chi` by the gate's
+operator-Schmidt rank; the latter is the enforced live-state cap. The extra
+live maximum scans are opt-in so ordinary replay retains its default cost.
+
+For deterministic small-system fidelity checks, use `norm()` for the
+canonical local norm and compare `to_dense()` with an independently replayed
+NumPy statevector using a fixed gate stream. This avoids making a restricted
+Cotengra overlap path the correctness oracle. A Tree/MPS overlap remains a
+useful comparative accuracy diagnostic, but it includes both layouts'
+different truncation histories.
 
 ## Range / subtree canonicalisation
 
@@ -93,7 +412,7 @@ exactly as the single centre tensor does for a one-node region. Disconnected
 `nodes` raise unless `span=True` auto-expands to the minimal connected subtree
 that spans them (`subtree_span`). `canonize_around_qubits_(qubits)` is the
 qubit-level entry point: it canonicalises around the minimal subtree spanning
-those qubits' leaves, so the reduced state on a set of qubits is captured by one
+those qubits' physical nodes, so the reduced state on a set of qubits is captured by one
 subtree. `is_subtree_canonical_form(nodes)` verifies the outside-is-isometric
 property directly; `is_canonical_form` is its one-node case. `TreeOptimizer`
 mirrors this too: `canonical_region`, `canonize_subtree(nodes, span=...)`,
@@ -109,14 +428,23 @@ generalisation of the two-qubit gate: a `k`-qubit gate, a multi-site
 analogue of a sub-MPO applied over the covering range and then compressed (cf.
 Quimb's `MatrixProductState.gate_with_submpo`, which exists for the 1D chain
 only). The dense operator is first factorized into an exact tree-MPO on the
-**minimal connected subtree** (Steiner subtree) spanning the target leaves.
+**minimal connected subtree** (Steiner subtree) spanning the target physical
+nodes.
 Application then proceeds recursively from subtree leaves to a hub: each local
 state/operator message is losslessly QR-split on one edge and absorbed by its
 parent, carrying every still-open operator virtual leg. No dense state tensor
-for the whole Steiner subtree is formed. Once all MPO factors have arrived, the
-tree is canonicalized about the hub and every touched edge is SVD-compressed
-once. Thus every truncation sees the complete operator in an isometric
-environment.
+for the whole Steiner subtree is formed. Each routed Q tensor, including native
+Symmray graded Q factors, retains its `left_inds` isometry metadata when
+available, so canonical recovery recognizes that it already points toward the
+hub instead of repeating the same QR. The native predicate additionally
+validates charge-map alignment before skipping. Once all MPO factors have
+arrived, every
+touched edge is compressed once. A bond that remains within its configured
+`max_bond` uses a lossless QR, avoiding repeated cutoff loss of tiny state
+components across successive sub-MPO events; when the MPO expands an edge
+past its cap, the configured Quimb `cutoff` and `cutoff_mode` are applied to
+the truncating SVD. Thus every actual truncation sees the complete operator in
+an isometric environment.
 
 `op` acts on `len(where)` qubits: an array reshaped to `(2,) * 2k` with output
 indices first, `op[o_0..o_{k-1}, i_0..i_{k-1}]` (a `(2**k, 2**k)` matrix is
@@ -153,17 +481,49 @@ fermionic gates. Select `mode="mpo"` explicitly to inspect or benchmark
 Quimb's operator-TN factorization. Direct and MPO share the update kernel and
 defer truncation until the complete gate has reached the affected path, so at
 an exact `chi` they differ only by the factorization gauge and numerical
-roundoff.
+roundoff. MPO replay also uses the cap-aware cutoff rule: already-within-cap
+path bonds take lossless QR, while expanded bonds use the configured cutoff
+mode.
 
 `run(mode=...)` has the same persistent semantics as `MpsOptimizer`: it updates
 the optimizer's selected two-site mode for that run, later runs, and copies.
 The old `run(mode="tree")`/`"ttn"` selector is a deprecated no-op retained only
 for shared frontends.
 
+`TreeOptimizer` accepts Quimb's `cutoff_mode` conventions for every truncating
+Tree-edge SVD. Its defaults, `cutoff=1e-10` and `cutoff_mode="rsum2"`, match
+Quimb's open-boundary `MatrixProductState.gate_with_submpo` compression path.
+`"rel"` remains available as a relative largest-singular-value threshold.
+The same defaults are used by the lower-level
+`TreeTensorNetwork.compress_edge_` API, so constructing the state directly and
+replaying it through `TreeOptimizer` does not silently change the truncation
+criterion.
+
+### Performance-oriented defaults and warnings
+
+The default replay configuration is intended for production evolution:
+`mode="auto"` uses the direct routed two-site kernel, `threads=1` avoids
+oversubscribing the small tree contractions, `subtree_workers=1` keeps the
+serial path allocation-free, `profile=False` avoids timing overhead, and
+`track_truncation=False` avoids full-spectrum diagnostic SVDs, while
+`track_bond_diagnostics=False` avoids live-bond scans. `record_history` and
+`track_infidelity` retain the established API defaults; the latter only
+adds norm-based progress readouts when a progress bar is requested.
+
+Warnings are reserved for an actionable behavior change: enabling
+`track_truncation=True` emits one diagnostic-performance warning, explicit
+backend/dtype/device conversion emits one compatibility warning per conversion
+signature, and legacy mode selectors emit deprecation warnings. Dense and
+native paths share the direct one-edge contraction, path-cache, routing, and
+proof-reuse optimizations. Only the QR phase safeguard and graded reduced-core
+SVD are native Symmray specializations; dense arrays continue through Quimb's
+ordinary QR/SVD with the same cutoff, path, and truncation semantics.
+
 `TreeOptimizer.apply_submpo(...)` is the public form for an explicit MPO of
 arbitrary support. It losslessly QR-routes its virtual bonds, then uses its
 supplied (or configured) `max_bond` / `cutoff` in one final canonical sweep over
-the affected subtree.
+the affected subtree. Existing bonds at or below `max_bond` take a lossless
+QR; only bonds expanded past the cap invoke the configured cutoff mode.
 The tree backend also exposes numerical Pauli primitives used by a future
 stabilizer frontend: `apply_pauli_rotation(...)`, `apply_pauli_sum(...)`,
 `expectation_pauli(...)`, `measure_pauli(...)`, and `project_pauli(...)`. These
@@ -183,8 +543,9 @@ ordinary one-/two-/multi-qubit gates, structured sub-MPOs, Pauli expectation
 and projection, measurement, reset, measure-reset, cap, normalization,
 copying, canonicalization, layout construction, dense readout, and truncation
 diagnostics for dense two-level qubit TTNs. A cap's `absorb` argument is
-accepted for stream compatibility, but a tree always absorbs into the leaf's
-unique parent. `cap(q, vec)` compacts labels by default; use
+accepted for stream compatibility. A leaf site absorbs into its unique parent;
+a root site is contracted directly without changing the tree edges.
+`cap(q, vec)` compacts labels by default; use
 `stable_labels=True` (or `compact_labels=False`) to preserve caller-facing
 logical IDs across the cap while the internal TTN stays compact.
 `TreeOptimizer.qubits`, `logical_order`, `position`, and `logical_site` expose
@@ -230,7 +591,8 @@ class adds the naming and geometry glue on top of a
   node tag `node_tag_id.format(nid)` (default `"N{}"`);
 - leaf tensors additionally carry the Quimb site tag `site_tag_id.format(q)`
   (default `"I{}"`) and physical index `site_ind_id.format(q)` (default `"k{}"`)
-  for qubit `q`, so Quimb treats the leaves as the sites;
+  for qubit `q`; when `plan.root_qubit` is set, the root tensor carries that
+  qubit's site tag and physical index as well;
 - adjacent nodes share one live virtual bond. Newly constructed edges use the
   deterministic `_tb{lo}_{hi}` name, but Quimb may replace it with a UUID during
   threading or canonicalisation; `TreeTensorNetwork.bond(a, b)` resolves the
@@ -240,14 +602,15 @@ Because the geometry (`plan`) and naming live in `_EXTRA_PROPS`, they survive
 `.copy()` and every Quimb view, exactly like `site_ind_id` does for an MPS.
 Build one with `TreeTensorNetwork.from_plan(plan)` (product `|0...0>`),
 `TreeTensorNetwork.from_order(order, structure=...)` (build the plan and the
-product state in one step), or `TreeTensorNetwork.rand(plan, D=..., seed=...)`
+product state in one step; its default exposes the ternary virtual root), or
+`TreeTensorNetwork.rand(plan, D=..., seed=...)`
 (a random state, canonicalised around the root by default). `TreeOptimizer`
 builds and evolves its state on this class, delegating all node/qubit naming and
 geometry queries to it.
 
 `TreeTensorNetwork.local_expectation(op, where, max_bond=None)` has two
 backend-specific exact paths. Dense/nonfermionic TTNs move the centre to the
-target leaf/subtree, cancel the ordinary isometric exterior, and contract only
+target physical node/subtree, cancel the ordinary isometric exterior, and contract only
 the minimal Steiner subtree. Native fermionic TTNs insert the Symmray operator
 without densifying it and contract the complete doubled tree, preserving every
 graded boundary phase. For native fermionic states, `max_bond` is accepted for
@@ -268,18 +631,27 @@ site or a tuple of sites) to its operator. It delegates each term to
 `pepsy.build_optimizer(...)` caches one contraction path per topology, and it
 reuses the memoized graded norm across the batch. Each returned value matches
 the corresponding single-term call exactly. For a Hamiltonian-level energy
-readout, `pepsy.TreeEnergyOptimizer` wraps this batch path and returns an
-`EnergyEstimate` mirroring `MpsEnergyOptimizer`.
+readout or variational energy optimization, `pepsy.TreeEnergyOptimizer` wraps
+this batch path, returns an `EnergyEstimate` mirroring `MpsEnergyOptimizer`,
+and exposes the corresponding `make_tn_optimizer` / `optimize` methods.
+Optimization updates the tree tensor parameters with Quimb's autodiff
+`TNOptimizer` while retaining the exact tree local-expectation objective. For
+ordinary readout the native graded norm is memoized. The optimization loss
+uses a fresh full doubled-tree denominator because Quimb's direct parameter
+injection cannot invalidate that cache; the post-optimization state is marked
+non-canonical rather than recanonicalized around an arbitrary centre.
 
 For the package-level product-state constructor, matching `ps_to_mps`, use
 `pepsy.ps_to_ttn(n, theta=..., tree=...)`. It builds the requested tree,
-initialises every leaf with `[cos(theta), sin(theta)]`, and optionally expands
-the virtual bonds with `chi`.
+initialises every physical site with `[cos(theta), sin(theta)]`, and optionally
+expands the virtual bonds with `chi`. Pass `root_qubit=q` to build the plan
+directly, or supply a matching root-site `TreePlan` through `tree=`.
 
 For a native Symmray fermionic state, pass a `Fermion` model and occupations:
 `pepsy.ps_to_ttn(n, tree=plan, fermion=fermion, occupations=..., chi=1)`.
-Leaves then carry the model's physical charge/parity sectors, internal nodes
-are neutral, and every tree edge uses conjugate Symmray virtual indices.
+Physical sites then carry the model's charge/parity sectors, virtual-only
+internal nodes are neutral, and every tree edge uses conjugate Symmray virtual
+indices.
 The constructor selects a definite local Fock basis vector, not a random vector
 inside a degenerate charge sector. For spinful `U1`/`Z2`, a scalar occupation
 `1` selects the checkerboard `|up>, |down>, ...` representative; pass
@@ -287,13 +659,18 @@ inside a degenerate charge sector. For spinful `U1`/`Z2`, a scalar occupation
 graded product tree is normalized by an exact graded norm contraction, so its
 represented norm is one rather than an arbitrary constructor scalar.
 `pepsy.hrs_to_ttn(..., chi=...)` creates the corresponding random symmetric
-tree with the requested charge-sector bond dimension. These constructors keep
+tree with the requested charge-sector bond dimension and accepts the same
+`root_qubit=`, `max_arity=`, and `top_arity=` options. These constructors keep
 the Symmray arrays native; they do not materialize dense tensor data.
 
+`pepsy.TreeSampler(state)` samples every registered physical site, including
+the optional root site. Its cached canonical arrays use parent, physical, then
+child axes, so probabilities and amplitudes retain normal `q0..q(n-1)` order.
+
 `TreeTensorNetwork.show()` prints a top-down ASCII drawing of the tree -- the
-tree analogue of a quimb MPS `show()` -- with the root at the top and the qubit
-leaves at the bottom, internal nodes marked `●`, leaves `◆` labelled by their
-qubit, and every branch annotated with its current virtual bond dimension
+tree analogue of a quimb MPS `show()` -- with the root at the top, structural
+leaves at the bottom, physical sites labelled by qubit, and every branch
+annotated with its current virtual bond dimension
 (`ascii_tree()` returns the same drawing as a string).
 `TreeOptimizer.show()` delegates to it.
 
@@ -305,10 +682,12 @@ recursive spectral (Fiedler) partition, keeping the recursion as the rooted
 tree (`structure="quality"`). This reuses the interaction-graph and spectral
 machinery of `pepsy.optimizers.mps.layout`; where the MPS finder flattens the
 recursion into a 1D order, the tree finder keeps the tree. Strongly coupled
-qubits become nearby leaves, minimising the tree-path length that two-qubit
-gates thread across. `structure="balanced"` splits the qubit index order in
-half at each level. `TreeLayoutFinder.score(plan)` returns the total
-interaction-weighted tree-path length that the structure minimises.
+qubits become nearby physical nodes, minimising the tree-path length that
+two-qubit gates thread across. With `root_qubit=q`, that physical node stays
+fixed at the top while the finder searches over the remaining leaf sites.
+`structure="balanced"` splits the leaf-qubit order in half at each level.
+`TreeLayoutFinder.score(plan)` returns the total interaction-weighted tree-path
+length that the structure minimises.
 
 For circuits with gates of different operator-Schmidt ranks, use
 `TreeLayoutFinder(..., objective="congestion")` or
@@ -316,19 +695,88 @@ For circuits with gates of different operator-Schmidt ranks, use
 congestion-aware, and balanced candidates using the predicted log bond growth
 on every edge. A gate crossing an edge contributes `log2(k)`, where `k` is its
 operator-Schmidt rank across that edge; the maximum edge load therefore
-predicts the worst-case multiplicative bond growth. The default
-`objective="path"` remains the co-occurrence/path-length heuristic.
+predicts the worst-case multiplicative bond growth. `TreeOptimizer` uses
+`layout_objective="congestion"` by default because it is a better
+execution-oriented choice at finite `chi`; a bare `TreeLayoutFinder` retains
+`objective="path"` as its fast, backward-compatible default. The path
+objective remains the co-occurrence/path-length heuristic.
 `objective="hybrid"` is useful when both replay cost and bond pressure matter:
 it combines normalized path score, maximum edge load, and total edge load with
 `hybrid_weights=(path, max_edge_load, total_edge_load)`. The
 `weight_mode` / `layout_weight_mode` option accepts `count`, `auto`, `angle`, or
 `operator_schmidt` for interaction-graph weighting.
 
+For a genuinely multi-site layout objective, use
+`objective="hypergraph"` (or `layout_objective="hypergraph"`). Each original
+gate support is kept as one hyperedge, and the finder scores its actual
+operator-Schmidt load on every crossed tree edge rather than selecting from a
+pairwise proxy alone. This mode starts from inexpensive pairwise-derived seed
+trees, then automatically performs bounded direct greedy leaf swaps and binary
+NNI topology moves using the full hyperedge score. Pass
+`refine=None, topology_refine=None` to inspect the unrefined direct score, or
+set explicit budgets for a larger search. Dense operators wider than
+`max_operator_qubits` still use the documented conservative rank bound.
+
+For a whole-tree optimization, use `objective="full_tree"` (also accepted as
+`"tree"` or `"cotengra"`). This evaluates dynamic operator-Schmidt demand,
+cap overflow, working tensor width, estimated work/write volume, and route
+length across every hierarchical scale, not only the root cut. Finite-`chi`
+overflow and edge demand are ranked before tensor-work proxies, since avoiding
+unnecessary truncation is the primary execution concern. It enables bounded
+subtree reconfiguration and simulated annealing by default; override these
+with `topology_refine="subtree"`, `topology_budget=`, `search="anneal"`, and
+`search_budget=`. The result is still a cheap layout proxy rather than a real
+TTN replay, so the state-aware pilot remains the final accuracy check. The
+default `chi=None` leaves this as a static, chi-blind objective; supplying
+`chi` only adds cap-aware ranking and does not change the no-tensor nature of
+layout discovery.
+
+For the 6×6 periodic square-lattice calibration stream (Hadamards followed by
+periodic controlled-phase gates), predicted total overflow ranked binary,
+ternary, and four-way candidates in the same order as actual capped replay
+pressure and truncation counts. This validates the profile as a layout-ranking
+proxy; use the state-aware pilot when the circuit has strong cancellations or
+state-dependent rank loss.
+
+Use `order="quality"` with `finder.run()` (or set it on the finder) for the
+MPS-style high-quality offline search. Quality mode now means
+`objective="full_tree"`: it evaluates every hierarchy scale, enables bounded
+greedy leaf refinement and all-scale subtree topology refinement, and runs a
+hybrid topology-annealing/Nevergrad search when Nevergrad is available. It
+falls back explicitly to dependency-free simulated annealing otherwise. A
+finder without `order="quality"` keeps the fast deterministic zero-argument
+`run()` path.
+Disable stages explicitly with `refine=None`, `topology_refine=None`, or
+`search=None`, or bound them with `refine_budget=`, `topology_budget=`, and
+`search_budget=`.
+
+For a stream whose locality changes over time, pass `time_decay=` and/or
+`time_window=` to `TreeLayoutFinder`. A decay in `(0, 1]` weights an event by
+`time_decay ** age` (the newest event has age zero), while a window keeps only
+the final events. The same factors are used for interaction paths, congestion
+candidate construction, and per-edge operator-Schmidt load estimates, so the
+diagnostics and selected plan use one consistent time model. The defaults are
+unchanged. `TreeOptimizer` exposes these as `layout_time_decay=` and
+`layout_time_window=`.
+
+For compression-first selection, use `objective="compression"` (or
+`layout_objective="compression"`). It prioritizes peak and total predicted
+operator-Schmidt load, then penalizes the estimated local tensor size at the
+configured `chi`, and only then uses path length. This differs from the
+default fast `"path"` objective: path optimizes routing locality, while
+compression also accounts for bond pressure and wider-node cost.
+
 `weight_mode="operator_schmidt"` is a cheap **two-qubit entangling-strength
 proxy** used to form the spectral qubit order; it is not itself the exact
 operator-Schmidt rank. Use `objective="congestion"` when selecting a tree: its
 edge-load calculation uses the actual rank across each candidate tree cut (or
 an MPO bond bound), which is the quantity that predicts TTN bond growth.
+
+Rank diagnostics are explicit. Small dense qubit operators use exact
+operator-Schmidt ranks; opaque native arrays, MPO bond products, and supports
+larger than `max_operator_qubits` use conservative operator-space bounds and
+are counted in `rank_bounded_events` with a reason in `rank_bound_reasons`.
+They are not silently assigned rank two.
 
 The structure is **not restricted to binary trees**. Internal nodes may have
 any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
@@ -338,8 +786,8 @@ any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
   single fixed tree: `2` reproduces the strictly-binary tree exactly, larger
   values give flatter `k`-ary trees with shorter geodesics, `None` leaves the
   arity unbounded) or an iterable of candidate arities to **search**. The
-  default `(2, 3, 4)` searches those three and keeps the objective-best plan;
-  pass `max_arity=2` to force a fixed binary tree.
+  default `2` selects the fixed binary tree; pass an iterable such as
+  `(2, 3, 4)` to search candidate arities explicitly.
 - `structure="adaptive"` reads the gate-stream interaction graph and lets each
   level branch into as many children as it has strongly coupled communities
   (edges above `community_frac` times the level's strongest edge). A densely
@@ -349,19 +797,35 @@ any arity, controlled by two knobs on `TreeLayoutFinder` / `TreePlan.from_order`
   bisection. Binary trees remain a valid special case (`max_arity=2`).
 
 A caller may bypass the finder entirely by passing an explicit `TreePlan` via
-`TreeOptimizer(..., tree=plan)`. Build one with
-`TreePlan.from_order(order, weights=..., structure=..., max_arity=...)`, or -- for
+`TreeOptimizer(..., tree=plan)`. `TreePlan` is exported from both `pepsy` and
+`pepsy.optimizers.tree`. Build one with
+`TreePlan.from_order(order, weights=..., structure=..., max_arity=..., top_arity=...)`, or -- for
 a fully hand-specified arbitrary-arity tree -- with
 `TreePlan.from_children(children, qubit_of_leaf)`, which validates that the
 children map and leaf assignment describe a single rooted tree covering qubits
-`0..n-1` exactly once. `TreePlan.max_arity()` and `TreePlan.is_binary()` report
-the shape.
+`0..n-1` exactly once. Set `top_arity=3` with `max_arity=2` for the
+three-virtual-bond root convention described above. `TreePlan.max_arity()` and
+`TreePlan.is_binary()` report the shape; `TreePlan.is_strictly_binary()` is the
+strict two-child-at-every-internal-node predicate.
 
-For an automatic arity choice, call
-`finder.recommend_arities((2, 3, 4))`. This is also what the finder and
-`TreeOptimizer` do **by default** (their `max_arity` defaults to `(2, 3, 4)`),
-so `TreeOptimizer(gate_stream, n=n, chi=chi)` already searches these arities --
-and does so `chi`-aware, since the optimizer forwards its own `chi` (see below).
+Both layout finders also accept an explicit site permutation as `order` for a
+fixed baseline. For example, this builds the same binary/ternary-root geometry
+using a square-lattice snake order without refinement:
+
+```python
+zigzag = py.square_lattice_zigzag(6, 6)
+tree_plan = TreeLayoutFinder(
+    gates, n=36, max_arity=2, top_arity=3,
+).run(order=zigzag)
+```
+
+The explicit order must cover every site exactly once and cannot be combined
+with iterable `max_arity` candidate search.
+
+For an automatic arity search, call `finder.recommend_arities((2, 3, 4))`
+explicitly. The default `TreeOptimizer(gate_stream, n=n, chi=chi)` uses the
+fixed binary/ternary-root geometry; it does not allocate tensors or perform
+truncations while finding the layout.
 The result contains the recommended
 `TreePlan` plus per-candidate path, edge-load, peak-bond-growth, and local
 virtual-degree summaries. An explicit handoff looks like:
@@ -438,15 +902,22 @@ choice = finder.recommend_layered(
 tree_plan = choice["plan"]
 ```
 
-`refine="greedy"` is deterministic and bounded; it is opt-in so existing
-fast/default layout construction remains unchanged. A balanced TTN turns a
+`refine="greedy"` is deterministic and bounded; it is opt-in for the existing
+fast/default objectives. The explicit `objective="hypergraph"` mode enables
+greedy and NNI refinement by default because otherwise its full-support score
+would only rank a few pairwise-derived seed trees. A balanced TTN turns a
 well-aligned physical span `r` into a path with `O(log r)` tree hops, so the
 hybrid score uses path length as a replay-cost proxy while edge loads estimate
 the accuracy/bond-dimension cost.
 
-For offline quality searches, add `search="nevergrad"`. Nevergrad starts from
-the spectral/greedy plan, proposes leaf orders, and keeps its result only when
-it improves the same chi-aware objective. It never acts on a live optimizer.
+For offline quality searches, `search="nevergrad"` starts from the
+spectral/greedy plan, proposes leaf orders, and keeps its result only when it
+improves the same objective. `search="anneal"` explores subtree replacements
+at multiple scales without optional dependencies. For the highest-quality
+`objective="full_tree"` search, use `search="hybrid"`: it splits the bounded
+budget between topology annealing and Nevergrad leaf refinement. Quality mode
+selects this hybrid automatically when Nevergrad is installed and falls back
+to annealing otherwise. None of these stages allocates or replays a TTN.
 Install the optional dependency with `pip install pepsy[layout]`:
 
 ```python
@@ -459,24 +930,99 @@ choice = finder.recommend_layered(
 )
 ```
 
+The same fixed-plan quality controls can be supplied directly to `run()`,
+which gives finder-based frontends the same define-then-search shape as the MPS
+layout API:
+
+```python
+tree_plan = finder.run(
+    order="quality",
+    topology_refine="nni",
+    topology_budget=64,
+    refine="greedy",
+    refine_budget=64,
+    search="hybrid",
+    search_budget=128,
+    seed=0,
+    nevergrad_optimizer="OnePlusOne",
+    progbar=True,
+)
+```
+
+Omitted `run()` options inherit the finder configuration, preserving the
+zero-argument API. Structure, arity candidates, objective, and event weighting
+remain finder-construction options because they define the Tree search space
+and scoring model rather than one refinement pass.
+
 Nevergrad evaluates every candidate plan, so reserve it for offline circuit
 studies rather than routine short simulations. Candidate records expose their
 initial/final leaf order and the greedy/Nevergrad diagnostics under
 `candidate["planning"]`.
 
-The default search is made `chi`-aware automatically when a `chi` is available:
-`TreeLayoutFinder(gate_stream, n=n, chi=chi)` biases its default `(2, 3, 4)`
-search toward `chi`-exact structures, and `TreeOptimizer(gate_stream, n=n,
-chi=chi)` forwards its own `chi` into the finder it builds -- so the everyday
-`TreeOptimizer(gate_stream, n=n, chi=chi)` already prefers a tree that stays
-exact at `chi`. A bare finder with no `chi` searches `chi`-blind.
+When an explicit iterable of arity candidates is supplied, a `chi` biases the
+search toward `chi`-exact structures. The default fixed binary/ternary-root
+geometry is independent of `chi`; layout finding still does not allocate
+tensors or perform truncations. A bare finder with no `chi` is likewise
+static unless candidate search is explicitly requested.
 Set `max_operator_qubits` to bound dense rank diagnostics and operator
 allocation; wider native MPO events can still replay without dense
-materialization. `TreeLayoutFinder(..., max_operator_qubits=...)` uses a conservative rank
-proxy above that width. `report(plan, include_edge_loads=False)` skips the
-event-by-edge congestion calculation for path-only diagnostics; when loads are
+materialization. `TreeLayoutFinder(..., max_operator_qubits=...)` uses a
+conservative rank bound above that width and reports the bounded events. The
+public `score` remains the path score for compatibility; inspect
+`objective_key`, `max_edge_load`, `peak_bond_growth`, and the tensor-cost
+fields for compression decisions. `report(plan, include_edge_loads=False)`
+skips the event-by-edge calculation for path-only diagnostics; when loads are
 included, `peak_bond_growth_log2` remains finite even when the human-readable
 `peak_bond_growth` would overflow floating point.
+
+For a state-aware choice between static candidates, call:
+
+```python
+choice = opt.select_layout_for_compression(
+    pilot_candidates=4,
+    pilot_steps=64,
+)
+opt = py.TreeOptimizer(gate_stream, tree=choice["plan"], chi=chi)
+```
+
+The pilot replays candidates on independent copies with the real tree update
+kernels and returns measured infidelity, final bond, truncation count, and
+runtime under `choice["pilot"]`. By default one bounded `order="quality"`
+candidate (greedy leaf refinement plus topology refinement; for
+`full_tree`, this also includes bounded subtree/hybrid search) is
+reserved a pilot slot, so it cannot be rejected before state-aware replay. Use
+`include_quality=False` for the static-only candidate set. The original
+optimizer is unchanged unless `install=True` is passed. Installation is
+restricted to product initial states; an entangled TTN cannot generally be
+relaid out exactly.
+
+For the recommended closed-loop choice, use the high-level optimizer helper:
+
+```python
+choice = opt.optimize_layout(
+    objective="full_tree",
+    rounds=2,
+    pilot_candidates=4,
+    pilot_steps=64,
+    pilot_workers=2,
+    topology_budget=32,
+    search_budget=64,
+)
+```
+
+This keeps the finder tensor-free, pilots the selected candidates with the
+actual tree replay kernels, and uses each round's per-edge truncation loss,
+discarded weight, and update runtime to seed bounded NNI, subtree, and
+cross-cut leaf proposals for the next round. `choice["pilot"]["rounds"]`
+contains every round and `report["edge_diagnostics"]` identifies hot tree
+edges. `objective="full_tree"` combines all-scale static work/bond estimates
+with this short state-aware replay. `install=True` remounts the product state
+on the final plan; it remains rejected for an entangled state.
+
+Independent product-state pilots can be evaluated concurrently with
+pilot_workers greater than one; the default is one for minimal overhead and
+deterministic resource use. Candidate order and tie-breaking remain
+deterministic.
 
 Both helpers are also available from the package-level API:
 
@@ -525,6 +1071,14 @@ Mixed-backend initial states fail immediately because there is no unambiguous
 safe execution backend. Internal Pauli/projector tensors follow the state
 backend automatically.
 
+The same diagnostic is reflected by the state-derived `backend`,
+`backend_dtype`, `backend_device`, and `array_backend` attributes. The
+complete gate stream is checked before replay, including every tensor in each
+sub-MPO; mismatches are converted on execution copies and warned about without
+mutating queued inputs. Native Symmray states report `backend="symmray"` plus
+the underlying NumPy, Torch, or CuPy `array_backend`, preserving U1/U1U1 charge
+and fermionic metadata.
+
 ```python
 import pepsy as py
 import torch
@@ -534,8 +1088,7 @@ finder = py.TreeLayoutFinder(gates, n=L, weight_mode="operator_schmidt")
 plan = finder.layered(block_size=4)
 
 state = py.TreeTensorNetwork.from_plan(plan)
-for tensor in state.tensor_map.values():
-    tensor.modify(data=to_backend(tensor.data))
+state.apply_to_arrays(to_backend)  # backend-only conversion preserves left_inds
 
 # Convert user-provided gate arrays once, at their source.
 native_gates = [(to_backend(gate), where) for gate, where in gates]
@@ -553,7 +1106,115 @@ backend.
 The dominant lever for accuracy at fixed `chi` is the tree structure, so the
 finder and optimizer expose diagnostics to choose it:
 
-- `TreeLayoutFinder.report(plan=None)` summarises the leaf-to-leaf geodesic
+The same diagnostics are available as a Cotengra-style tent plot.
+`TreeLayoutFinder.plot(plan)` is the default tent view (also available as
+`plot_tent(plan)`): it keeps the raw graph at the bottom and lifts
+the selected hierarchy above its descendant sites: the raw lattice and
+optional gate connectivity are gray, while internal tree nodes use a stable order-based
+`turbo` palette by default. Incoming edges match their child nodes by default;
+pass an explicit `edge_color` for a uniform structural color. Arrows are
+disabled by default, matching Cotengra's structural tent view; pass
+`show_edge_arrows=True` only when parent-to-child direction is needed.
+When the physical background already has its own markers, pass
+`show_leaf_nodes=False` to hide the tree's physical leaf circles while keeping
+internal tree nodes and hierarchy edges visible. This is useful for a gray
+`+`-marked lattice backdrop.
+When `site_coords` are supplied, the default tent presentation projects them
+with `lattice_skew=0.30` and `lattice_rise=0.18`, and draws gray `+` markers at
+the physical sites. Override those values to use a different base projection.
+Nearest-neighbor gate edges are not duplicated over the lattice. Supplying
+`site_coords={qubit: (x, y)}` places the physical sites on an existing lattice.
+It returns `(fig, ax)` and does not mutate the plan or live TTN:
+
+```python
+finder = py.TreeLayoutFinder(gates, n=n, objective="congestion")
+plan = finder.run()
+fig, ax = finder.plot(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="scale",
+    edge_color=None,
+    edge_cmap="GnBu",
+    node_cmap="YlOrRd",
+    order=True,
+    show_edge_arrows=False,
+)
+
+# For a live optimizer, the same plot is available without changing its state.
+fig, ax = opt.plot_layout(site_coords=logical_lattice_coords)
+```
+
+The default plot is therefore the hierarchy that `TreeLayoutFinder` selected:
+one hierarchy edge per parent-child connection, drawn over the physical lattice
+and gate connectivity. For a background-free binary check, hide the physical
+background with:
+
+```python
+fig, ax = finder.plot(
+    plan,
+    lattice=False,
+    show_gate_connectivity=False,
+)
+```
+
+This leaves only the selected hierarchy. The public tent plot intentionally
+does not draw gate-by-gate route overlays.
+
+Use `finder.plot_rubberband(...)` for the same hierarchy in physical-lattice
+rubberband form. The optional `viz`
+profile provides Matplotlib. The plot uses the same visual
+idea as Cotengra's circuit/rubberband views: the source interaction structure
+remains visible underneath, and band color can encode either tree scale or
+post-order. The default styling is axis-free, following Quimb's schematic
+drawings, and the
+background lattice is not numbered. Pass `show_axes=True` or
+`show_site_labels=True` when those annotations are wanted. A stream-order
+colorbar is hidden by default; pass `colorbar=True` when that diagnostic is
+wanted.
+
+For a scale-invariant tree view, use `color_by="scale"`:
+
+```python
+fig, ax = finder.plot(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="scale",
+    edge_color=None,
+    edge_cmap="GnBu",
+    node_cmap="YlOrRd",
+)
+```
+
+Here leaves are scale zero and nodes use stable colors for their hierarchical
+scale. With `edge_color=None`, each incoming hierarchy edge uses the exact
+same node-palette color as the node it terminates at, so scale layers remain
+easy to follow. Set a literal `edge_color` when a uniform structural edge
+color is preferred. The scale colorbar, when enabled, follows `node_cmap`.
+Midpoint arrows can show the direction from each parent to its children when
+`show_edge_arrows=True`. The mapping is independent of the number or order of gates;
+`colorbar=True` then labels tree scale rather than gate-stream order. The plot
+has no title by default; pass `show_title=True` if a title is wanted.
+
+For a physical-lattice view closer to Quimb's rubberband drawing, use:
+
+```python
+fig, ax = finder.plot_rubberband(
+    plan,
+    site_coords=logical_lattice_coords,
+    color_by="gate",
+)
+
+# The live optimizer exposes the same non-mutating view.
+fig, ax = opt.plot_rubberband(site_coords=logical_lattice_coords)
+```
+
+This keeps the lattice sites and gate connectivity grey and wraps each
+non-root tree cluster in a rounded, translucent band. The default is a
+Cotengra-style `Spectral` post-order progression, giving each nested band a
+distinct color. Use `color_by="scale"` for one stable band color per tree
+scale.
+
+- `TreeLayoutFinder.report(plan=None)` summarises the physical-node geodesic
   lengths over the interaction graph (`score`, `max_path`, `mean_path`,
   `weighted_mean_path`) and compares against a balanced index tree
   (`balanced_score`, `score_ratio_vs_balanced`). It also reports
@@ -580,7 +1241,14 @@ finder and optimizer expose diagnostics to choose it:
   the global spectrum; native Symmray states compare the full and actually
   retained charge-block spectra using the same sector-aware truncation rule as
   the live update. Spectrum probes are opt-in because they add local SVD work
-  per truncation edge. The report also contains gate-level `updates`, grouping
+  per truncation edge. Enabling it emits a one-time warning because the
+  diagnostic spectrum probes can add substantial SVD work. It remains
+  disabled by default. Lossless zero-cutoff edges that are already within
+  their bond cap use QR and do not probe a spectrum even when tracking is on.
+  Per-edge retained survival and cumulative infidelity are accumulated in log
+  space and exponentiated only for readout, avoiding product underflow on long
+  streams.
+  The report also contains gate-level `updates`, grouping
   edge events by support and reporting the cumulative relative loss.
 - `TreeOptimizer.convergence_sweep(gates, n, chi_values, ops=...)` replays the
   stream at several `chi` on one fixed tree and returns per-`chi` `max_bond`,
@@ -608,14 +1276,34 @@ For stream control events, `TreeOptimizer.measure_event`,
 `cap_event`, `reset_event`, and `measure_reset_event` build the same tuple forms as
 `MpsOptimizer`, including Pauli-basis measurement and reset. Their recorded
 results are `(pauli, where, outcome, probability)` in `measurements`.
-`cap(q, vec)` contracts and removes one leaf, shifting the remaining labels
-above `q` down by one unless stable labels are requested. `normalize()` rescales the represented state to unit
-norm and `max_bond()` reports the largest virtual bond. Truncation details are
+`cap(q, vec)` contracts and removes one physical site, shifting the remaining labels
+above `q` down by one unless stable labels are requested.
+For a non-unitary run, `normalize_every=True` (or `normalize_final=True`) keeps
+the canonical working tensor numerically normalized and accumulates each
+removed base-10 scale in `tn.exponent`; `norm()`, `to_dense()`, copies, and
+full contractions continue to represent the original physical scale.
+The normalization records expose both the per-event raw scale and the
+accumulated exponent. The public `normalize()` method remains a physical
+renormalization: it clears that exponent and rescales the represented state to
+unit norm. `max_bond()` reports the largest virtual bond. Truncation details are
 available through `truncation_report()`, `get_infidelities()`, and
 `get_infidelity_samples()` when spectrum tracking is enabled.
 
 ## Performance and stability
 
+- **Lossless QR fast paths.** Zero-cutoff splits and edge updates whose
+  rank is already within the active bond cap use QR rather than SVD. This
+  includes the sibling-leaf split and remains valid for native graded QR.
+  A positive cutoff retains the existing rank-revealing compression semantics.
+- **Repeated-gate cache.** Direct gate SVDs and MPO factorizations are cached
+  by immutable payload identity, backend signature, support, and local
+  dimensions. The bounded cache returns fresh-index tensor copies, so it does
+  not share mutable network indices with the live state.
+- **Subtree and pilot parallelism.** Set `subtree_workers>1` to evaluate
+  independent dense leaf-to-hub QR messages in a wave, with deterministic
+  merging. Native fermionic routing stays serial because graded Symmray phase
+  bookkeeping has not been established as thread-safe. Set `pilot_workers>1`
+  for independent layout pilot replays; both options default to one.
 - **Sibling fast path.** A two-qubit gate on two leaves that share a parent is
   applied as a single two-site update: the two leaves and their parent are
   contracted into one blob, the gate is applied, and the blob is re-split by
@@ -623,7 +1311,8 @@ available through `truncation_report()`, `get_infidelities()`, and
   QR bond-threading and double-bond fusion of the general geodesic route and is
   the common case in a locality-aware layout.
 
-- **Thread cap.** Tree tensors are small (rank `<= 3`, bounded by `chi`), so
+- **Thread cap.** Tree tensors are moderate-rank (set by local arity and the
+  optional root physical leg, with dimensions bounded by `chi`), so
   multi-threaded BLAS/OpenMP linear algebra is dominated by thread launch and
   synchronisation overhead. `TreeOptimizer` caps threads to `1` around gate
   application and the heavy read-outs by default (`threads=1`), which makes
@@ -636,6 +1325,16 @@ available through `truncation_report()`, `get_infidelities()`, and
   orthogonality centre; `from_plan` records that centre on the network rather
   than recomputing it on the first gate. Native fermionic product trees are
   additionally normalized by their exact graded norm readout.
+- **Routed isometry reuse.** Dense geodesic and subtree QR routing retains each
+  Q tensor's `left_inds`, allowing later canonical recovery to reuse the proven
+  isometry without repeating the decomposition or entering Quimb's dense
+  canonicalization kernel. Final path and subtree compression also consults
+  that live proof: when the destination-side tensor is already isometric,
+  Quimb uses one-sided `reduced="left"` compression and avoids its redundant
+  reduction QR; otherwise it falls back to the full two-sided reduction. The
+  network derives orientation diagnostics from those tensors; the optimizer
+  does not keep a duplicate map. Native fermionic trees keep their separate
+  explicit graded QR/SVD path.
 - **State-owned centre.** The orthogonality centre lives on the
   `TreeTensorNetwork` (`orthogonality_center`, an `_EXTRA_PROPS` field), so the
   optimizer and the state cannot disagree and the centre is carried by

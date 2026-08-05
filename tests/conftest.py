@@ -26,7 +26,7 @@ _INTEGRATION_MODULES = frozenset(
         "test_bp_relay.py",
         "test_fh_jw_gates.py",
         "test_optimize_global.py",
-        "test_optimize_mera.py",
+        "test_optimize_qmera.py",
         "test_optimize_peps.py",
         "test_optimize_tree.py",
         "test_optimize_tree_stabilizer.py",

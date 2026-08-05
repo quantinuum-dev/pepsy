@@ -146,6 +146,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "patience": 40,
         "min_steps": 10,
         "restore_best": True,
+        # Sweep objectives are infidelities and should not accept a negative
+        # numerical artifact as the best state during a line search.
+        "assume_nonnegative": True,
         "bad_max": 20,
         "penalty_on_bad": 1e20,
     }
@@ -186,7 +189,19 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if isinstance(value, (tuple, list)):
             if len(value) != 2:
                 raise ValueError(f"{name} must be a scalar or (mantissa, exponent).")
-            return value[0], float(value[1])
+            exponent = value[1]
+            # ``cotengra`` returns a differentiable Torch exponent when
+            # ``strip_exponent=True``. The mantissa is then rescaled after
+            # every contraction, often leaving it close to unit magnitude,
+            # so detaching the exponent makes the local fidelity objective
+            # appear flat to autograd even though finite differences change
+            # it. Preserve autodiff scalar nodes and only normalize ordinary
+            # backend/python scalar metadata.
+            if hasattr(exponent, "detach"):
+                return value[0], exponent
+            if hasattr(exponent, "item"):
+                exponent = exponent.item()
+            return value[0], float(exponent)
         return value, 0.0
 
     @staticmethod
@@ -613,10 +628,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.loss = self.step_loss_trace
         self.step_trace = []
         self.inner_loss_traces = []
+        self.inner_best_loss_traces = []
         self.norm_trace = []
         self.fidels = []
         self.best_state = None
         self.best_loss = float("inf")
+        self._warned_invalid_local_loss = False
 
     def _best_nonnegative_from_history(self, history):
         """Return minimum finite non-negative loss from history or ``None``."""
@@ -1068,12 +1085,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         """Convert solver history entries into plain Python floats."""
         values = []
         for entry in history or ():
-            value = entry
-            if hasattr(value, "detach"):
-                value = value.detach()
-            if hasattr(value, "cpu"):
-                value = value.cpu()
-            values.append(float(value))
+            values.append(float(ar.to_numpy(entry)))
         return values
 
     @staticmethod
@@ -1101,6 +1113,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
             history = self._to_float_history(run_info.get("history"))
             self.inner_loss_traces.append(history)
+            best_history = self._to_float_history(run_info.get("best_history"))
+            self.inner_best_loss_traces.append(best_history)
 
             time_boundary = run_info.get("time_boundary")
             time_optimize = run_info.get("time_optimize")
@@ -1172,6 +1186,22 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             return "X"
         raise ValueError("axis must be 'x' or 'y'")
 
+    @staticmethod
+    def _sweep_direction_label(axis, sweep):
+        """Return the physical direction represented by an axis half-sweep."""
+        labels = {
+            ("x", "forward"): "right",
+            ("x", "backward"): "left",
+            ("y", "forward"): "up",
+            ("y", "backward"): "down",
+        }
+        try:
+            return labels[(axis, sweep)]
+        except KeyError as exc:
+            raise ValueError(
+                "axis must be 'x' or 'y' and sweep must be 'forward' or 'backward'"
+            ) from exc
+
     def _site_tensor_tags(self, axis, index):
         if axis == "y":
             return [f"I{x},{index}" for x in range(self.Lx)]
@@ -1240,9 +1270,56 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         return bra
 
+    def _symmray_local_bras(self, local_tn):
+        """Build Symmray local bras from the full PEPS conjugation context.
+
+        Fermionic Symmray conjugation is sensitive to the surrounding tensor
+        network ordering. Conjugating ``local_tn`` after selecting a row or
+        column can therefore produce different block data from conjugating
+        the full PEPS and selecting that slice. The cached overlap boundaries
+        were built from the latter convention, so reproduce it here while
+        replacing only the trainable slice data.
+        """
+        site_tags = tuple(
+            sorted(
+                {
+                    site_tag
+                    for tensor in local_tn.tensor_map.values()
+                    for site_tag in tensor.tags
+                    if isinstance(site_tag, str) and site_tag.startswith("I")
+                }
+            )
+        )
+        if not site_tags:
+            raise ValueError("Could not identify Symmray site tags in the local slice.")
+
+        state_context = self.state.copy()
+        for site_tag in site_tags:
+            local_tensor = next(iter(local_tn.select(site_tag).tensor_map.values()))
+            context_tensor = next(iter(state_context.select(site_tag).tensor_map.values()))
+            context_tensor.modify(data=local_tensor.data)
+
+        _, norm_context = build_bra_ket(ket=state_context, bra=None)
+        _, overlap_context = build_bra_ket(
+            ket=self.state_target,
+            bra=state_context,
+        )
+        norm_bra = norm_context.select("BRA", "all").select(site_tags, "any")
+        overlap_bra = overlap_context.select("BRA", "all").select(site_tags, "any")
+        return (
+            norm_bra,
+            overlap_bra,
+        )
+
     @staticmethod
-    def _resolve_user_solver(solver):
-        """Validate solver names and emit practical warnings."""
+    def _resolve_user_solver(solver, solver_options=None):
+        """Validate solver names and flag untuned NLopt calls once.
+
+        NLopt is safe to use with the package defaults, so a bare solver name
+        should not emit a warning for every PEPS gate. Keep the warning for
+        genuinely underspecified direct calls, where no evaluation or
+        convergence control was supplied by the caller.
+        """
         if not isinstance(solver, str):
             raise TypeError("solver must be a string")
         solver = solver.strip().lower()
@@ -1252,12 +1329,25 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"Unsupported solver={solver!r}. Supported solvers: {supported}")
 
         if solver in {"nlopt", "fd-nlopt"}:
-            warnings.warn(
-                f"solver={solver!r} uses NLopt and can be sensitive to tolerances; "
-                "consider tuning algorithm/maxeval/ftol_rel/xtol_rel.",
-                UserWarning,
-                stacklevel=2,
+            options = dict(solver_options or {})
+            has_stopping_control = any(
+                key in options
+                for key in (
+                    "maxeval",
+                    "maxiter",
+                    "maxtime",
+                    "ftol_rel",
+                    "xtol_rel",
+                    "stopval",
+                )
             )
+            if not has_stopping_control:
+                warnings.warn(
+                    f"solver={solver!r} uses NLopt without explicit stopping "
+                    "controls; consider setting maxeval, ftol_rel, or xtol_rel.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         return solver
 
@@ -1433,8 +1523,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         """Estimate FLOP/peak complexity for local norm and overlap networks."""
         local0 = qtn.unpack(params_init, skeleton)
-        bra_norm0 = self._bra_with_reindexed_inner(local0)
-        bra_overlap0 = self._overlap_bra(local0)
+        if self._symmray_state:
+            bra_norm0, bra_overlap0 = self._symmray_local_bras(local0)
+        else:
+            bra_norm0 = self._bra_with_reindexed_inner(local0)
+            bra_overlap0 = self._overlap_bra(local0)
         norm_net0 = self._attach_boundaries(
             local0 | bra_norm0,
             self.bdy.mps_b,
@@ -1616,13 +1709,18 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         if self._needs_nested_param_flatten(params_init_tree):
             params_init_opt, param_tree_spec = self._flatten_param_tree(params_init_tree)
+            # Nested block trees are the expected parameter representation for
+            # Symmray slices. They are flattened deliberately below, so do
+            # not report that normal path as a warning. Keep the warning for
+            # dense/custom nested trees where the fallback is unexpected.
             if not self._warned_nested_param_tree:
-                warnings.warn(
-                    "Detected nested local slice params (for example Symmray "
-                    "block trees); enabling tree-flattened sweep optimization path.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+                if not self._symmray_state:
+                    warnings.warn(
+                        "Detected nested local slice params (for example Symmray "
+                        "block trees); enabling tree-flattened sweep optimization path.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
                 self._warned_nested_param_tree = True
 
             def _restore_params(params_in):
@@ -1653,10 +1751,15 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     params_init_tree,
                 )
             local = qtn.unpack(params_tree, skeleton)
-            bra_norm = self._bra_with_reindexed_inner(local)
-            # Keep the local overlap bra index convention identical to the
-            # full double layer used to build ``bdy_overlap``.
-            bra_overlap = self._overlap_bra(local)
+            if self._symmray_state:
+                # Keep Symmray fermionic conjugation in the same full-network
+                # context used to build the cached norm/overlap boundaries.
+                bra_norm, bra_overlap = self._symmray_local_bras(local)
+            else:
+                bra_norm = self._bra_with_reindexed_inner(local)
+                # Keep the local overlap bra index convention identical to the
+                # full double layer used to build ``bdy_overlap``.
+                bra_overlap = self._overlap_bra(local)
 
             norm_net = self._attach_boundaries(
                 local | bra_norm,
@@ -1705,6 +1808,32 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
 
         initial_loss = float(loss_fn(params_init_opt))
 
+        # A negative normalized infidelity means the local boundary estimate
+        # is numerically invalid (fidelity > 1), not that this slice is a
+        # genuinely better state. Never let such a value enter a solver or
+        # the best-state tracker.
+        if (not math.isfinite(initial_loss)) or initial_loss < -1.0e-10:
+            if not self._warned_invalid_local_loss:
+                warnings.warn(
+                    "Skipping a local sweep update because its boundary "
+                    f"infidelity is invalid ({initial_loss:.3e}); retaining "
+                    "the current slice until the boundary environment is refreshed.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._warned_invalid_local_loss = True
+            return {
+                "axis": axis,
+                "index": index,
+                "loss_initial": initial_loss,
+                "loss_final": None,
+                "loss_best": None,
+                "history": [],
+                "best_history": [],
+                "invalid_loss": True,
+                **metrics,
+            }
+
         previous_requires_fd = getattr(
             self,
             "_active_local_requires_finite_differences",
@@ -1721,7 +1850,21 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         finally:
             self._active_local_requires_finite_differences = previous_requires_fd
         history_values = self._to_float_history(history)
-        final_loss = history_values[-1] if history_values else initial_loss
+        # Gradient backends may restore the best iterate rather than return
+        # their last trial iterate. Re-evaluate the parameters that will
+        # actually be applied so ``loss_final`` describes the returned state,
+        # not a stale last callback value.
+        applied_loss = self._to_float_history([loss_fn(params_opt)])[0]
+        observed_losses = [initial_loss, *history_values, applied_loss]
+        best_history = []
+        running_best = float("inf")
+        for value in observed_losses:
+            if math.isfinite(value) and value >= 0.0:
+                running_best = min(running_best, value)
+            # Invalid/negative trial values are not allowed to create a jump
+            # in the diagnostic minimum; carry the last valid minimum forward.
+            best_history.append(running_best)
+        best_loss = self._best_nonnegative_from_history(observed_losses)
         params_opt_tree = _restore_params(params_opt)
         params_opt_tree = self._match_param_tree_backends(
             params_opt_tree,
@@ -1729,15 +1872,17 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         )
         params_opt_tree = self._clone_param_tree(params_opt_tree)
         self._apply_slice_update(index, params_opt_tree, skeleton, axis)
-        # Track the best state using the minimum non-negative loss observed
-        # during this local gradient optimization.
-        self._maybe_store_best_state(self._best_nonnegative_from_history(history_values))
+        # Track the state that was actually applied, rather than a trial loss
+        # from an iterate that may have been discarded by restore_best.
+        self._maybe_store_best_state(applied_loss)
         return {
             "axis": axis,
             "index": index,
             "loss_initial": initial_loss,
-            "loss_final": final_loss,
+            "loss_final": applied_loss,
+            "loss_best": best_loss,
             "history": history_values,
+            "best_history": best_history,
             **metrics,
         }
 
@@ -2031,7 +2176,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "Set it in constructor or via set_target()."
             )
         n = self._axis_n(axis)
-        resolved_solver = self._resolve_user_solver(solver)
+        resolved_solver = self._resolve_user_solver(
+            solver,
+            solver_options=solver_options,
+        )
         all_runs = []
 
         self.bdy.normalize()
@@ -2182,6 +2330,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "step_loss_trace": list(self.step_loss_trace),
                 "step_trace": list(self.step_trace),
                 "inner_loss_traces": [list(v) for v in self.inner_loss_traces],
+                "inner_best_loss_traces": [
+                    list(v) for v in self.inner_best_loss_traces
+                ],
                 "norm_trace": list(self.norm_trace),
                 "fidels": list(self.fidels),
                 "bdy_norm": None,
@@ -2189,6 +2340,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 "converged": True,
                 "early_exit": True,
             })
+
+        # Include the state entering the sweep in the best-state tracker.
+        # Otherwise a later local move could be reported as the best result
+        # even when it is worse than the original warm start.
+        if loss_before is not None:
+            self._maybe_store_best_state(float(loss_before))
 
         def _steps_for_axis(axis_name):
             n = self._axis_n(axis_name)
@@ -2199,12 +2356,28 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if progress:
             global_progress = tqdm(
                 total=total_steps,
-                desc="optimize",
+                desc="PEPS sweep",
+                unit="slice",
                 leave=progress_leave,
                 position=progress_position,
-                colour="gray",
+                ascii=True,
+                # tqdm accepts named colours in uppercase only. Keep this bar
+                # neutral while remaining compatible with tqdm's validation.
+                colour="WHITE",
                 dynamic_ncols=True,
+                mininterval=0.2,
             )
+
+        def _progress_number(value):
+            if value is None:
+                return "-"
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return "-"
+            if not math.isfinite(value):
+                return "-"
+            return f"{value:.2e}"
 
         for cyc in range(n_cycles):
             for axis in axis_seq:
@@ -2214,37 +2387,25 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                     global_progress.update(1)
                     local_loss = run_info.get("exact_loss_after", run_info.get("loss_final"))
                     best_now = getattr(self, "best_loss", float("inf"))
-                    best_str = "na" if not math.isfinite(float(best_now)) else f"{float(best_now):.6e}"
-                    head = f"loss=nan [best:{best_str}]"
-                    if local_loss is not None:
-                        cur = float(local_loss)
-                        # Scientific notation keeps very small losses readable.
-                        head = f"loss={cur:.6e} [best:{best_str}]"
-                    t_opt = run_info.get("time_optimize")
-                    t_bdy = run_info.get("time_boundary")
-                    parts = []
-                    if t_opt is not None or t_bdy is not None:
-                        t_opt_s = "na" if t_opt is None else f"{float(t_opt):.2f}"
-                        t_bdy_s = "na" if t_bdy is None else f"{float(t_bdy):.2f}"
-                        parts.append(f"t={t_opt_s}/{t_bdy_s}s")
-                    flops = run_info.get("flops")
-                    peak_norm = run_info.get("peak_norm")
-                    peak_overlap = run_info.get("peak_overlap")
-                    peak_vals = [v for v in (peak_norm, peak_overlap) if v is not None]
-                    peak2 = None if not peak_vals else float(max(peak_vals))
-                    if flops is not None or peak2 is not None:
-                        flops_s = "na" if flops is None else f"{float(flops):.2f}"
-                        peak2_s = "na" if peak2 is None else f"{peak2:.2f}"
-                        # cost=(log10 flops, log2 peak)
-                        parts.append(f"cost=({flops_s},{peak2_s})")
                     axis_name = run_info.get("axis")
                     sweep_name = run_info.get("sweep")
                     index = run_info.get("index")
+                    direction = "-"
                     if axis_name is not None and sweep_name is not None and index is not None:
-                        short = "fwd" if sweep_name == "forward" else "bwd"
-                        parts.append(f"slice={axis_name}_{short}_{index}")
-                    global_progress.set_description_str(head)
-                    global_progress.set_postfix_str(" | ".join(parts))
+                        direction = self._sweep_direction_label(axis_name, sweep_name)
+                    postfix = {
+                        "move": f"{direction}_{index}" if index is not None else direction,
+                        "loss": _progress_number(local_loss),
+                        "best": _progress_number(best_now),
+                    }
+                    time_opt = run_info.get("time_optimize")
+                    time_bdy = run_info.get("time_boundary")
+                    if time_opt is not None or time_bdy is not None:
+                        postfix["t"] = (
+                            f"{_progress_number(time_opt)}"
+                            f"/{_progress_number(time_bdy)}s"
+                        )
+                    global_progress.set_postfix(postfix)
 
                 axis_runs = self._call_with_accepted_kwargs(
                     self.optimize_axis,
@@ -2275,7 +2436,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 break
 
         # Restore the best snapshot so the returned state matches best_loss.
-        if early_exit and self.best_state is not None:
+        # This must also happen on a normal sweep completion: a later local
+        # move can be worse than the best state seen earlier in the sweep.
+        if self.best_state is not None and math.isfinite(float(self.best_loss)):
             self.state = self.best_state.copy()
             self._set_boundary_pair(
                 *self._call_with_accepted_kwargs(
@@ -2329,6 +2492,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             "step_loss_trace": list(self.step_loss_trace),
             "step_trace": list(self.step_trace),
             "inner_loss_traces": [list(v) for v in self.inner_loss_traces],
+            "inner_best_loss_traces": [
+                list(v) for v in self.inner_best_loss_traces
+            ],
             "norm_trace": list(self.norm_trace),
             "fidels": list(self.fidels),
             "bdy_norm": bdy_norm,

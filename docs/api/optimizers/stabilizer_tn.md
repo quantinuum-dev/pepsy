@@ -312,5 +312,15 @@ small-`n` validation only. The focused STN tests exercise NumPy, Torch, JAX, and
 CuPy paths; optional JAX/CuPy tests skip only when the dependency or CUDA runtime
 is unavailable.
 
+When an existing coefficient MPS is supplied, the stabilizer optimizer infers
+its common `backend`, `dtype`, and `device` automatically, even when
+`to_backend` is omitted. `backend_info()` returns the live mapping and refreshes
+the public `backend`, `backend_dtype`, and `backend_device` attributes. Explicit
+matrix gates and coefficient-frame sub-MPOs are checked against that signature;
+foreign payloads emit one warning per source/target combination. Sub-MPOs are
+copied to the live backend without mutating the caller's MPO; dense physical
+matrices use a temporary NumPy view for Stim/Pauli classification and their
+coefficient contractions remain on the inferred backend.
+
 
 > API details are maintained as handwritten Markdown in this page.

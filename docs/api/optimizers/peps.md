@@ -42,9 +42,11 @@ SWAP routing. Use `route_opts` for routing controls such as `sequence`,
 - Sweep mode defaults to Torch Adam for Torch-backed Symmray states and to the
   optional NLopt `LD_LBFGS` solver otherwise. Pass an explicit `optimizer` /
   `sweep_optimize_kwargs` value to override this choice.
-- `non_unitary=True` normalizes generated targets and candidates; it does not
-  implement the interval scheduling or norm-proxy machinery available in
-  `MpsOptimizer`.
+- Generated targets are normalized by default before infidelity estimates and
+  variational cleanup. Pass `normalize_target=False` only when that
+  normalization is handled externally. Passing `normalize_target=None` keeps
+  the legacy behavior of following `non_unitary`; this does not implement the
+  interval scheduling or norm-proxy machinery available in `MpsOptimizer`.
 - Step records and fidelity traces are per measured two-site update. One-site
   gates applied outside a two-site batch are not recorded as separate steps.
   For PEPS lattice gates, prefer coordinate-tuple sites such as

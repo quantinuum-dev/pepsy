@@ -26,7 +26,17 @@ def _rzz(theta):
             np.exp(0.5j * theta),
             np.exp(-0.5j * theta),
         ]
-    ).astype(complex)
+).astype(complex)
+
+
+def test_tree_stab_uses_binary_tree_with_ternary_root_by_default():
+    """The stabilizer facade propagates the shared tree geometry default."""
+    optimizer = pepsy.TreeStabOptimizer(5)
+    assert optimizer.tree_optimizer.plan.top_arity == 3
+    assert optimizer.tree_optimizer.plan.is_binary()
+
+    binary_root = pepsy.TreeStabOptimizer(5, top_arity=2)
+    assert binary_root.tree_optimizer.plan.top_arity == 2
 
 
 def _rz(theta):
@@ -83,6 +93,105 @@ def test_tree_stab_is_public_and_cliffords_are_tableau_only():
     assert np.allclose(opt.p.to_dense(), initial)
     expected = _apply_local(_apply_local(np.array([1, 0, 0, 0]), H, (0,), 2), CNOT, (0, 1), 2)
     _assert_same_state(opt.to_statevector(), expected)
+
+
+def test_tree_stab_cutoff_defaults_match_tree_quimb_path():
+    """TreeStab forwards the TreeOptimizer/Quimb compression defaults."""
+    opt = pepsy.TreeStabOptimizer(2)
+
+    assert opt.tree_optimizer.cutoff == pytest.approx(1e-10)
+    assert opt.tree_optimizer.cutoff_mode == "rsum2"
+
+
+def test_tree_stab_isometry_api_and_backend_conversion_preserve_proofs():
+    """TreeStab delegates one live map and backend conversion keeps it valid."""
+    def converter(array):
+        return np.array(array, copy=True)
+
+    opt = pepsy.TreeStabOptimizer(6, to_backend=converter)
+    directions = opt.isometry_map()
+
+    assert directions == opt.tree_optimizer.isometry_map()
+    assert directions[opt.plan.root] is None
+    for node in opt.plan.nodes():
+        if node == opt.plan.root:
+            continue
+        parent = opt.plan.parent[node]
+        assert opt.isometry_direction(node) == parent
+        assert opt.can_skip_canonize(node, parent)
+    assert opt.validate_isometry_metadata() is opt
+    assert opt.p.validate(check_canonical=True) is opt.p
+
+    # Dense cap reconstruction independently proves a new root-canonical tree
+    # and then crosses the same backend-only conversion boundary.
+    opt.cap(1, [1.0, 0.0])
+    assert opt.validate_isometry_metadata() is opt
+    assert opt.p.validate(check_canonical=True) is opt.p
+
+
+@pytest.mark.parametrize("route", ("direct", "mpo", "submpo"))
+def test_tree_stab_routes_reuse_proven_path_isometries(
+    route, monkeypatch,
+):
+    """Direct, MPO, and sub-MPO coefficient paths avoid redundant QRs."""
+    from pepsy.optimizers.tree import TreePlan
+
+    n = 8
+    where = (0, 7)
+    plan = TreePlan.from_order(range(n), structure="balanced")
+    opt = pepsy.TreeStabOptimizer(n, tree=plan, mode=route)
+    reductions = []
+    compress_edge = opt.tree_optimizer._compress_edge_with_diagnostics
+
+    def traced_compress_edge(
+        u, v, *, max_bond=None, cutoff=None, reduced=True,
+    ):
+        reductions.append((
+            reduced,
+            opt.can_skip_canonize(u, v, absorb="left"),
+        ))
+        return compress_edge(
+            u,
+            v,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            reduced=reduced,
+        )
+
+    monkeypatch.setattr(
+        opt.tree_optimizer,
+        "_compress_edge_with_diagnostics",
+        traced_compress_edge,
+    )
+    if route == "submpo":
+        operator = np.kron(X, X).reshape((2,) * 4)
+        submpo = qtn.MatrixProductOperator.from_dense(
+            operator,
+            dims=(2, 2),
+            sites=where,
+            L=n,
+            max_bond=None,
+            cutoff=0.0,
+        )
+        opt.apply([("submpo", submpo, where)])
+        expected = np.zeros(2**n, dtype=complex)
+        expected[(1 << (n - 1)) | 1] = 1.0
+        _assert_same_state(opt.to_statevector(), expected)
+    else:
+        # The physical Cliffords spread Z_7 to Z_0 Z_7. Basis-updating
+        # measurement then runs a long-range coefficient CNOT localizer through
+        # the selected direct/MPO path.
+        opt.apply([("h", 0), ("cnot", 0, 7)])
+        opt.measure_pauli("Z", 7, outcome=+1, absorb_basis=True)
+        assert opt.expectation("Z", 7) == pytest.approx(1.0)
+
+    assert reductions
+    assert all(
+        reduced == "left" and proven
+        for reduced, proven in reductions
+    )
+    assert opt.validate_isometry_metadata() is opt
+    assert opt.p.validate(check_canonical=True) is opt.p
 
 
 def test_tree_stab_chi_none_is_uncapped_and_sampling_is_conditional():
@@ -189,6 +298,60 @@ def test_tree_stab_submpo_matches_mps_coefficient_frame_contract():
     _assert_same_state(tree.to_statevector(), mps.to_statevector())
 
 
+def test_tree_stab_submpo_uses_native_tree_router_for_unacted_root(monkeypatch):
+    """TreeStab keeps structured MPO application on the coefficient tree."""
+    from pepsy.optimizers.tree import TreePlan
+
+    where = (1, 2, 3)
+    plan = TreePlan.from_order(
+        range(1, 5), structure="balanced", root_qubit=0
+    )
+    dense_operator = np.diag(
+        np.array([1.0, 0.8, 0.6, 0.4, 0.3, 0.2, 0.1, -0.2])
+    ).astype(complex)
+    submpo = qtn.MatrixProductOperator.from_dense(
+        dense_operator.reshape((2,) * 6),
+        dims=(2, 2, 2),
+        sites=where,
+        L=5,
+        max_bond=None,
+        cutoff=0.0,
+    )
+    expected = _apply_local(
+        np.eye(2**5, dtype=complex)[:, 0], dense_operator, where, 5
+    )
+
+    def fail_to_dense():
+        raise AssertionError("TreeStab sub-MPO was unexpectedly materialized")
+
+    monkeypatch.setattr(submpo, "to_dense", fail_to_dense)
+    opt = pepsy.TreeStabOptimizer(5, tree=plan, chi=64, cutoff=0.0)
+    opt.apply([("submpo", submpo, where)])
+
+    _assert_same_state(opt.to_statevector(), expected)
+    assert opt.tree_optimizer.update_history[0]["kind"] == "submpo"
+
+
+def test_tree_stab_mpo_mode_reuses_tree_two_factor_kernel(monkeypatch):
+    """TreeStab's MPO mode uses the same TreeOptimizer factor kernel."""
+    opt = pepsy.TreeStabOptimizer(2, mode="mpo")
+    calls = []
+    apply_factors = opt.tree_optimizer._apply_2q_factors_impl
+
+    def traced_apply_factors(*args, **kwargs):
+        calls.append(True)
+        return apply_factors(*args, **kwargs)
+
+    monkeypatch.setattr(
+        opt.tree_optimizer, "_apply_2q_factors_impl", traced_apply_factors
+    )
+    opt.apply([("cnot", 0, 1)])
+    opt.measure_pauli("Z", 1, outcome=+1, absorb_basis=True)
+
+    assert calls
+    assert opt.tree_optimizer.mode == "mpo"
+
+
 def test_tree_stab_amplitude_probability_match_dense_readout():
     opt = pepsy.TreeStabOptimizer(
         2, gates=[("h", 0), ("cnot", 0, 1)]
@@ -243,6 +406,8 @@ def test_tree_stab_norm_diagnostics_and_sampling_copy_contract():
 
 
 def test_tree_stab_torch_backend_matches_numpy():
+    from pepsy.optimizers.tree import TreePlan, TreeTensorNetwork
+
     torch = pytest.importorskip("torch")
     backend = pepsy.backend_torch(dtype=torch.complex128, device="cpu")
     stream = [
@@ -257,6 +422,27 @@ def test_tree_stab_torch_backend_matches_numpy():
     assert gpu.backend_info()["backend"] == "torch"
     assert "torch" in type(gpu.p[0].data).__module__
     _assert_same_state(gpu.to_statevector(), cpu.to_statevector())
+    assert gpu.validate_isometry_metadata() is gpu
+    assert gpu.p.validate(check_canonical=True) is gpu.p
+
+    # A caller-supplied native TTN has no retained ``to_backend`` callback, so
+    # cap must derive the converter from the live tree without clearing proofs.
+    native_state = TreeTensorNetwork.from_plan(
+        TreePlan.from_order(range(3), structure="balanced")
+    )
+    native_state.apply_to_arrays(backend)
+    inherited = pepsy.TreeStabOptimizer(
+        native_state, max_dense_cap_qubits=4
+    )
+    assert inherited.backend == "torch"
+    assert inherited.backend_dtype == "complex128"
+    assert inherited.backend_device == "cpu"
+    with pytest.warns(UserWarning, match="gate/operator payload"):
+        inherited.apply([(np.diag([1.0, np.exp(0.1j)]), 0)])
+    inherited.cap(1, [1.0, 0.0])
+    assert inherited.backend_info()["backend"] == "torch"
+    assert inherited.validate_isometry_metadata() is inherited
+    assert inherited.p.validate(check_canonical=True) is inherited.p
 
 
 def test_tree_stab_cap_matches_mps_and_rebuilds_identity_frame():
@@ -276,6 +462,8 @@ def test_tree_stab_cap_matches_mps_and_rebuilds_identity_frame():
         mps.probability("00"), abs=1e-7
     )
     assert tree.p.max_bond() > 1
+    assert tree.validate_isometry_metadata() is tree
+    assert tree.p.validate(check_canonical=True) is tree.p
 
 
 def test_tree_stab_cap_stream_remaps_later_compact_labels():

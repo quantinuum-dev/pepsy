@@ -15,7 +15,18 @@ from .amplitude import (
     TorchPEPSBoundaryAmplitude,
     make_torch_peps_amplitude_model,
 )
-from .connections import TorchConnections, compile_operator_sum_torch, torch_hamiltonian_connections
+from .benchmark import (
+    TorchAmplitudeBenchmark,
+    TorchAmplitudeBenchmarkRun,
+    benchmark_torch_amplitudes,
+)
+from .cache import TorchAmplitudeCache
+from .connections import (
+    TorchConnections,
+    TorchFockTransitionPlan,
+    compile_operator_sum_torch,
+    torch_hamiltonian_connections,
+)
 from .driver import TorchVMCDriver
 from .fermion import (
     TorchFermionVMC,
@@ -42,11 +53,18 @@ from .proposals import (
 )
 from .results import (
     TorchMetropolisResult,
+    TorchImportanceSamples,
     TorchMCMCSamples,
+    TorchDistributedMetadata,
+    TorchSampleProvenance,
     TorchChainDiagnostics,
+    TorchVMCConvergenceEstimate,
+    TorchVMCConvergenceReport,
     TorchVMCEnergyEstimate,
     TorchVMCImportanceEstimate,
+    TorchVMCMeasurementRun,
     TorchVMCStepResult,
+    TorchVMCWarmupResult,
 )
 from .sampler import TorchBPMetropolisSampler, TorchMetropolisSampler, metropolis_local_sampler
 from .sr import TorchSRResult, apply_torch_sr_update, solve_torch_sr, torch_log_derivative_matrix
@@ -57,10 +75,19 @@ __all__ = [
     "TorchFermionVMCMetadata",
     "TorchPEPSAmplitude",
     "TorchPEPSBoundaryAmplitude",
+    "TorchAmplitudeBenchmark",
+    "TorchAmplitudeBenchmarkRun",
     "TorchConnections",
+    "TorchFockTransitionPlan",
+    "TorchAmplitudeCache",
     "TorchMetropolisResult",
+    "TorchImportanceSamples",
     "TorchMCMCSamples",
+    "TorchDistributedMetadata",
+    "TorchSampleProvenance",
     "TorchChainDiagnostics",
+    "TorchVMCConvergenceEstimate",
+    "TorchVMCConvergenceReport",
     "TorchMetropolisSampler",
     "TorchBPMetropolisSampler",
     "TorchVMCDriver",
@@ -68,10 +95,13 @@ __all__ = [
     "TorchVMCSetup",
     "TorchVMCEnergyEstimate",
     "TorchVMCImportanceEstimate",
+    "TorchVMCMeasurementRun",
     "TorchVMCStepResult",
+    "TorchVMCWarmupResult",
     "TorchSRResult",
     "TorchSquareLattice",
     "apply_torch_sr_update",
+    "benchmark_torch_amplitudes",
     "count_spinful_particles",
     "heisenberg_connections",
     "local_energy_from_connections",

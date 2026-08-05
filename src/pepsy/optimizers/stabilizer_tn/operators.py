@@ -13,6 +13,7 @@ import itertools
 from collections.abc import Mapping
 from typing import List, Sequence, Tuple
 
+import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
@@ -52,7 +53,7 @@ def pauli_decomposition(
 
     Enumerates ``4**k`` Paulis, so intended for small ``k`` (few-qubit gates).
     """
-    gate = np.asarray(gate)
+    gate = np.asarray(ar.to_numpy(gate))
     dim = 2 ** k
     if gate.shape != (dim, dim):
         raise ValueError(f"gate must be {dim}x{dim} for k={k}, got {gate.shape}.")

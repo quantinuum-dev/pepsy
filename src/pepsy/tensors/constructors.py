@@ -12,6 +12,7 @@ import numpy as np
 import quimb.tensor as qtn
 
 from .contractions import build_optimizer, tn_norm
+from .bonds import new_native_bond
 from .validation import validate_tensor_network_tags
 
 __all__ = [
@@ -21,6 +22,24 @@ __all__ = [
     "hrs_to_peps", "hrs_to_mps", "hrps_to_peps", "hrps_to_mps", "hrps_to_ttn",
 ]
 
+
+_DEFAULT_TREE_TOP_ARITY = object()
+
+
+def _resolve_tree_top_arity(top_arity, *, max_arity, n, root_qubit):
+    """Resolve the constructor default without hiding explicit opt-outs."""
+    if top_arity is not _DEFAULT_TREE_TOP_ARITY:
+        return top_arity
+    if (
+        root_qubit is None
+        and isinstance(max_arity, Integral)
+        and int(max_arity) == 2
+        and int(n) >= 3
+    ):
+        return 3
+    return None
+
+
 def add_cycle(peps, bond_dim, cylinder=False):
     """Add periodic bonds to a PEPS network in x (and optional y) directions."""
     Ly = peps.Ly
@@ -28,17 +47,69 @@ def add_cycle(peps, bond_dim, cylinder=False):
     for j in range(Ly):
         T1 = peps[f"I{Lx-1},{j}"]
         T2 = peps[f"I{0},{j}"]
-        qtn.new_bond(T1, T2, size=bond_dim, name=None, axis1=0, axis2=0)
+        if not qtn.bonds(T1, T2):
+            new_native_bond(T1, T2, size=bond_dim, axis1=0, axis2=0)
 
     if not cylinder:
         for i in range(Lx):
             T1 = peps[f"I{i},{Ly-1}"]
             T2 = peps[f"I{i},{0}"]
-            qtn.new_bond(T1, T2, size=bond_dim, name=None, axis1=0, axis2=0)
+            if not qtn.bonds(T1, T2):
+                new_native_bond(T1, T2, size=bond_dim, axis1=0, axis2=0)
     return peps
 
 
-def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0):
+def _native_fermion_identity_pepo(
+    fermion,
+    lx,
+    ly,
+    *,
+    cyclic=False,
+    cycle_bond_dim=1,
+    mapper=None,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=False,
+    dtype="complex128",
+    to_backend=None,
+):
+    """Build a full native fermionic identity without state-sector slicing."""
+    identity = fermion.observable("identity")
+    target = fermion.hamiltonian({((0, 0),): identity}, to_backend=to_backend)
+    return target.to_pepo(
+        Lx=lx,
+        Ly=ly,
+        mapper=mapper,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        compress=compress,
+        cyclic=cyclic,
+        cycle_bond_dim=cycle_bond_dim,
+        dtype=dtype,
+        fermionic=True,
+        to_backend=to_backend,
+    )
+
+
+def id_to_pepo(
+    lx,
+    ly=None,
+    phys_dim=2,
+    dtype="complex128",
+    chi=1,
+    rand_strength=0.0,
+    *,
+    fermion=None,
+    cyclic=False,
+    cycle_bond_dim=1,
+    mapper=None,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=False,
+    to_backend=None,
+    occupations=None,
+    site_charge=None,
+):
     """Create a PEPO identity on an ``lx x ly`` lattice.
 
     Parameters
@@ -46,7 +117,8 @@ def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0)
     lx : int
         Lattice size in x direction.
     ly : int
-        Lattice size in y direction.
+        Lattice size in y direction. If omitted, ``lx`` must be a two-item
+        ``(Lx, Ly)`` shape, matching :func:`ps_to_peps`.
     phys_dim : int, optional
         Physical dimension per site.
     dtype : str, optional
@@ -56,12 +128,78 @@ def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0)
         expanded via ``expand_bond_dimension`` after initialization.
     rand_strength : float, optional
         Random noise strength passed to ``expand_bond_dimension``.
+    fermion : :class:`~pepsy.tensors.Fermion`, optional
+        If supplied, construct a native Symmray fermionic identity. The
+        physical dimension is inferred from the model when the default
+        ``phys_dim=2`` is left in place.
+    cyclic : bool, optional
+        If True on the native fermionic path, add repaired dimension-one
+        bonds around the PEPO lattice using ``cycle_bond_dim``.
+    cycle_bond_dim : int, optional
+        Periodic bond dimension for the native fermionic path.
+    mapper, max_bond, cutoff, compress, to_backend
+        Forwarded to the native Fermion PEPO construction on the native path.
+    occupations, site_charge : optional
+        Rejected on the identity path. These arguments select a state sector
+        for :func:`ps_to_peps`; they must not remove diagonal blocks from a
+        full local identity operator.
 
     Returns
     -------
     quimb.tensor.PEPO
         Identity PEPO with bond dimension ``chi``.
     """
+    if ly is None:
+        if not isinstance(lx, (tuple, list)) or len(lx) != 2:
+            raise TypeError("id_to_pepo requires Lx and Ly, or a 2-item shape.")
+        lx, ly = lx
+    lx = int(lx)
+    ly = int(ly)
+    if lx < 1 or ly < 1:
+        raise ValueError("PEPO dimensions must be positive integers.")
+
+    if fermion is not None:
+        from .symmetric import Fermion  # pylint: disable=import-outside-toplevel
+
+        if not isinstance(fermion, Fermion):
+            raise TypeError("fermion must be a pepsy.tensors.Fermion instance.")
+        if occupations is not None or site_charge is not None:
+            raise ValueError(
+                "occupations and site_charge select product-state sectors; "
+                "a fermionic identity PEPO contains the full local identity."
+            )
+        if chi != 1 or rand_strength != 0.0:
+            raise ValueError(
+                "chi and rand_strength are dense PEPO expansion controls; "
+                "use max_bond/cutoff/compress for a native fermionic identity."
+            )
+        local_dim = sum(int(size) for size in fermion.physical_sectors.values())
+        if phys_dim not in (None, 2, local_dim):
+            raise ValueError(
+                f"phys_dim={phys_dim!r} does not match the fermion local "
+                f"dimension {local_dim}."
+            )
+        return _native_fermion_identity_pepo(
+            fermion,
+            lx,
+            ly,
+            mapper=mapper,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            compress=compress,
+            cyclic=cyclic,
+            cycle_bond_dim=cycle_bond_dim,
+            dtype=dtype,
+            to_backend=to_backend,
+        )
+
+    if occupations is not None or site_charge is not None:
+        raise ValueError("occupations and site_charge require fermion=...")
+    if to_backend is not None:
+        raise ValueError("to_backend requires fermion=...")
+    if cyclic and not isinstance(cyclic, bool):
+        raise TypeError("cyclic must be a boolean for id_to_pepo.")
+
     pepo = qtn.PEPO.rand(Lx=lx, Ly=ly, bond_dim=1, seed=666, dtype=dtype)
     eye = np.eye(phys_dim, dtype=dtype)
 
@@ -73,6 +211,8 @@ def id_to_pepo(lx, ly, phys_dim=2, dtype="complex128", chi=1, rand_strength=0.0)
         data[tuple([0] * n_virt)] = eye
         tensor.modify(data=data)
 
+    if cyclic:
+        pepo = add_cycle(pepo, bond_dim=cycle_bond_dim)
     if chi > 1:
         pepo.expand_bond_dimension_(chi, rand_strength=rand_strength)
     return pepo
@@ -461,8 +601,8 @@ def _fermionic_product_fock_specs(fermion, n, occupations, site_charge):
     return specs, {site: charge for site, (charge, _) in specs.items()}
 
 
-def _set_fermionic_product_leaf(tensor, physical_index, *, charge, basis_index):
-    """Replace a Symmray leaf by one selected Fock-basis vector in-place."""
+def _set_fermionic_product_site(tensor, physical_index, *, charge, basis_index):
+    """Set one Symmray physical tensor to a selected Fock-basis vector."""
     data = tensor.data
     physical_axis = tensor.inds.index(physical_index)
     chargemap = data.indices[physical_axis].chargemap
@@ -572,7 +712,7 @@ def ps_to_mps(
             to_backend=None,
         )
         for site, (charge, basis_index) in fock_specs.items():
-            _set_fermionic_product_leaf(
+            _set_fermionic_product_site(
                 state.mps[site], state.mps.site_ind(site),
                 charge=charge, basis_index=basis_index,
             )
@@ -616,8 +756,10 @@ def ps_to_ttn(
     *,
     tree=None,
     order=None,
+    root_qubit=None,
     structure="balanced",
     max_arity=2,
+    top_arity=_DEFAULT_TREE_TOP_ARITY,
     community_frac=0.35,
     star_frac=0.75,
     chi: int = 1,
@@ -652,8 +794,14 @@ def ps_to_ttn(
         ``order`` (or ``range(n)``) using ``structure``.
     order : sequence of int, optional
         Leaf order used to build a plan when ``tree`` is not supplied.
-    structure, max_arity, community_frac, star_frac
-        Forwarded to :meth:`TreePlan.from_order`.
+        When ``root_qubit`` is set, this contains every other qubit.
+    root_qubit : int, optional
+        Qubit carried by the top tensor rather than a structural leaf. When an
+        explicit ``tree`` is supplied, this must match its root site.
+    structure, max_arity, top_arity, community_frac, star_frac
+        Forwarded to :meth:`TreePlan.from_order`. The default is a binary
+        tree below a three-virtual-leg root when possible; pass
+        ``top_arity=None`` or ``top_arity=2`` to use a binary root.
     chi : int, optional
         If greater than one, expand every virtual bond to at least ``chi``.
     rand_strength : float, optional
@@ -701,15 +849,31 @@ def ps_to_ttn(
     if tree is not None and order is not None:
         raise ValueError("pass either tree= or order=, not both.")
     if tree is None:
+        if root_qubit is not None:
+            root_qubit = int(root_qubit)
+        top_arity = _resolve_tree_top_arity(
+            top_arity, max_arity=max_arity, n=n, root_qubit=root_qubit
+        )
         if order is None:
-            order = range(n)
+            order = (
+                range(n)
+                if root_qubit is None
+                else (q for q in range(n) if q != root_qubit)
+            )
         plan = TreePlan.from_order(
             order,
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             community_frac=community_frac,
             star_frac=star_frac,
+            root_qubit=root_qubit,
         )
+        if plan.n != n:
+            raise ValueError(
+                f"constructed tree contains {plan.n} qubits, "
+                f"but n={n} was requested."
+            )
     else:
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan.")
@@ -717,6 +881,10 @@ def ps_to_ttn(
         if plan.n != n:
             raise ValueError(
                 f"tree contains {plan.n} qubits, but n={n} was requested."
+            )
+        if root_qubit is not None and int(root_qubit) != plan.root_qubit:
+            raise ValueError(
+                "root_qubit does not match the supplied tree plan."
             )
 
     if fermion is not None:
@@ -760,8 +928,8 @@ def ps_to_ttn(
             node_tag_id=node_tag_id,
         )
         for qubit, (charge, basis_index) in fock_specs.items():
-            _set_fermionic_product_leaf(
-                ttn.node_tensor(ttn.leaf_of_qubit(qubit)), ttn.site_ind(qubit),
+            _set_fermionic_product_site(
+                ttn.node_tensor(ttn.node_of_qubit(qubit)), ttn.site_ind(qubit),
                 charge=charge, basis_index=basis_index,
             )
         _apply_to_tensor_network_arrays(ttn, to_backend)
@@ -792,7 +960,7 @@ def ps_to_ttn(
     )
     local_vec = np.array([math.cos(theta), math.sin(theta)], dtype=dtype)
     for q in range(n):
-        tensor = ttn.node_tensor(ttn.leaf_of_qubit(q))
+        tensor = ttn.node_tensor(ttn.node_of_qubit(q))
         phys_axis = tensor.inds.index(ttn.site_ind(q))
         data = np.zeros_like(tensor.data, dtype=dtype)
         slicer = [0] * data.ndim
@@ -807,6 +975,11 @@ def ps_to_ttn(
             seed_rand(seed)
         ttn.expand_bond_dimension_(chi, rand_strength=rand_strength)
         ttn.canonize_around_node_(plan.root)
+    else:
+        # Replacing each product vector clears Quimb's local ``left_inds``.
+        # Bond-one normalized product tensors remain trivially canonical, so
+        # restore the network-owned orientation metadata without new QR work.
+        ttn._set_isometry_metadata_from_region({plan.root})
     return ttn.validate()
 
 
@@ -816,8 +989,10 @@ def hrs_to_ttn(
     *,
     tree=None,
     order=None,
+    root_qubit=None,
     structure="balanced",
     max_arity=2,
+    top_arity=_DEFAULT_TREE_TOP_ARITY,
     community_frac=0.35,
     star_frac=0.75,
     seed=None,
@@ -832,11 +1007,14 @@ def hrs_to_ttn(
 ):
     """Create a random product or charge-preserving Symmray TTN.
 
-    With ``fermion=`` the leaves receive the model's physical charge sectors,
-    while internal tree nodes are neutral and every virtual tree edge is a
-    conjugate pair of Symmray charge-sector indices. ``chi`` is the requested
-    total virtual-bond dimension. All block-sparse and fermionic operations
-    are delegated to Symmray/Quimb.
+    With ``fermion=`` the physical sites receive the model's charge sectors,
+    while virtual-only internal nodes are neutral and every virtual tree edge
+    is a conjugate pair of Symmray charge-sector indices. ``root_qubit`` places
+    one physical site on the top tensor. The default gives a conventional
+    three-virtual-leg binary root when possible; ``top_arity=None`` or
+    ``top_arity=2`` selects a binary root. ``chi`` is the requested total
+    virtual-bond dimension. All block-sparse and fermionic operations are
+    delegated to Symmray/Quimb.
     """
     from ..optimizers.tree import TreePlan, TreeTensorNetwork
 
@@ -855,19 +1033,41 @@ def hrs_to_ttn(
     if tree is not None and order is not None:
         raise ValueError("pass either tree= or order=, not both.")
     if tree is None:
+        if root_qubit is not None:
+            root_qubit = int(root_qubit)
+        top_arity = _resolve_tree_top_arity(
+            top_arity, max_arity=max_arity, n=n, root_qubit=root_qubit
+        )
+        if order is None:
+            order = (
+                range(n)
+                if root_qubit is None
+                else (q for q in range(n) if q != root_qubit)
+            )
         plan = TreePlan.from_order(
-            range(n) if order is None else order,
+            order,
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             community_frac=community_frac,
             star_frac=star_frac,
+            root_qubit=root_qubit,
         )
+        if plan.n != n:
+            raise ValueError(
+                f"constructed tree contains {plan.n} qubits, "
+                f"but n={n} was requested."
+            )
     else:
         if not isinstance(tree, TreePlan):
             raise TypeError("tree must be a TreePlan.")
         if tree.n != n:
             raise ValueError(f"tree contains {tree.n} qubits, but n={n} was requested.")
         plan = tree
+        if root_qubit is not None and int(root_qubit) != plan.root_qubit:
+            raise ValueError(
+                "root_qubit does not match the supplied tree plan."
+            )
 
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
@@ -939,7 +1139,7 @@ def hrs_to_ttn(
             [np.cos(theta / 2.0), np.exp(1j * phi) * np.sin(theta / 2.0)],
             dtype=dtype,
         )
-        tensor = ttn.node_tensor(ttn.leaf_of_qubit(q))
+        tensor = ttn.node_tensor(ttn.node_of_qubit(q))
         physical_axis = tensor.inds.index(ttn.site_ind(q))
         data = np.zeros_like(tensor.data, dtype=dtype)
         selector = [0] * data.ndim
@@ -949,6 +1149,8 @@ def hrs_to_ttn(
     if chi > 1:
         ttn.expand_bond_dimension_(chi, rand_strength=rand_strength)
         ttn.canonize_around_node_(plan.root)
+    else:
+        ttn._set_isometry_metadata_from_region({plan.root})
     return ttn.validate()
 
 
@@ -1170,6 +1372,7 @@ def hrs_to_peps(
     subsizes="maximal",
     contraction_opt="auto-hq",
     to_backend=None,
+    normalize=False,
 ):
     """Create a random product or Fermion-symmetric PEPS.
 
@@ -1177,7 +1380,8 @@ def hrs_to_peps(
     With ``fermion``, construct a native charge-preserving random PEPS instead:
     ``method="direct"`` uses Symmray's direct block-filled random PEPS, with
     ``chi`` controlling the virtual bond dimension. The direct state is
-    normalized before it is returned. A unitary PEPS-growth method is not yet
+    returned without a global norm by default; pass ``normalize=True`` when a
+    normalized PEPS is required. A unitary PEPS-growth method is not yet
     implemented.
     In the fermionic branch, ``haar_params`` and ``perturb`` do not apply.
 
@@ -1212,13 +1416,20 @@ def hrs_to_peps(
         Advanced override for the per-site charge pattern.
     method : {"direct"}, optional
         Fermion-aware random-state construction. ``"direct"`` fills allowed
-        Symmray blocks using ``PEPS_fermionic_rand`` and normalizes the result.
+        Symmray blocks using ``PEPS_fermionic_rand``. Global normalization is
+        optional and disabled by default.
     subsizes : object, optional
         Symmray charge-sector sizing policy used by ``method="direct"``.
     contraction_opt : object, optional
         Contraction optimizer stored by the internal symmetric wrapper.
     to_backend : callable, optional
         Backend mapper applied to Fermion-aware Symmray blocks.
+    normalize : bool, optional
+        Whether to globally normalize a Fermion-aware PEPS before returning
+        it. Defaults to ``False``. ``normalize=True`` uses a CPU boundary-MPS
+        contraction and is only needed when the caller requires a global
+        physical norm. NetKet VMC uses the default safely: a global PEPS
+        scalar cancels from the Metropolis probability and local-energy ratios.
 
     Returns
     -------
@@ -1240,6 +1451,8 @@ def hrs_to_peps(
     method = str(method).strip().lower().replace("-", "_")
     if method not in {"direct", "unitary"}:
         raise ValueError("method must be 'direct' or 'unitary'.")
+    if not isinstance(normalize, bool):
+        raise TypeError("normalize must be a bool.")
 
     if fermion is not None:
         from .symmetric import (  # pylint: disable=import-outside-toplevel
@@ -1299,7 +1512,16 @@ def hrs_to_peps(
             contraction_opt=contraction_opt,
             to_backend=None,
         )
-        state.normalize()
+        if normalize:
+            try:
+                state.normalize()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Fermionic PEPS global normalization failed in Quimb's "
+                    "boundary-MPS decomposition. For a NetKet VMC initial "
+                    "state, pass normalize=False: its global amplitude scale "
+                    "cancels from sampling and local-energy ratios."
+                ) from exc
         if to_backend is not None:
             state.apply_to_arrays(to_backend)
         return state.peps

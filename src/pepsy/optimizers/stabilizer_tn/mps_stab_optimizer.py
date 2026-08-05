@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import math
 import time
+import warnings
 from collections.abc import Mapping
 from numbers import Integral
 from typing import List, Optional
@@ -57,6 +58,11 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...backends import (
+    backend_infer,
+    infer_backend_converter_from_sample,
+    infer_backend_signature,
+)
 from ..mps.layout import MpsGateStreamLayoutFinder
 from ..mps.optimizer import (
     _resolve_conditional,
@@ -625,13 +631,18 @@ class MpsStabOptimizer:
         self.last_layout_plan = None
 
         self.to_backend = to_backend
+        self._explicit_backend_converter = to_backend
         self._bk_cache: dict = {}
+        self._backend_conversion_warnings = set()
+        self._backend_signature = None
+        self._backend_converter = None
         self._clifford_rot_cache: dict = {}
         self._localizer_cache: dict = {}
         if to_backend is not None:
             # Place the coefficient MPS |nu> on the requested backend; gate/MPO
             # arrays are converted on the fly by the _bk* helpers below.
             self.state.p.apply_to_arrays(to_backend)
+        self.backend_info()
 
         self._queue: List[object] = []
         self.infidelities: List[float] = []
@@ -946,7 +957,7 @@ class MpsStabOptimizer:
         if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
             return "opaque"
         try:
-            gate = np.asarray(entry[0], dtype=complex)
+            gate = np.asarray(ar.to_numpy(entry[0]), dtype=complex)
         except (TypeError, ValueError):
             return "opaque"
         if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
@@ -1253,7 +1264,7 @@ class MpsStabOptimizer:
             if len(entry) != 2:
                 return "opaque"
             try:
-                gate = np.asarray(entry[0], dtype=complex)
+                gate = np.asarray(ar.to_numpy(entry[0]), dtype=complex)
                 dim = gate.shape[0]
                 nq = int(round(math.log2(dim)))
                 if (
@@ -2948,26 +2959,135 @@ class MpsStabOptimizer:
     # ------------------------------------------------------------------ #
     # Backend helpers (place |nu> gates/MPOs on the configured backend)
     # ------------------------------------------------------------------ #
-    def _bk(self, mat) -> np.ndarray:
-        """Backend copy of a (possibly parametrized) gate matrix (dtype-cast)."""
+    def _state_backend_like(self):
+        """Return a representative live coefficient-MPS array."""
+        for tensor in getattr(self.state.p, "tensors", ()):
+            return tensor.data
+        return None
+
+    def backend_info(self):
+        """Return and cache the live coefficient-MPS backend diagnostics."""
+        info = backend_infer(self.state.p)
+        signature = infer_backend_signature(self._state_backend_like())
+        if signature != self._backend_signature:
+            self._bk_cache.clear()
+            self._backend_signature = signature
+            self._backend_converter = (
+                self._explicit_backend_converter
+                or infer_backend_converter_from_sample(self._state_backend_like())
+            )
+        self.backend = info["backend"]
+        self.backend_dtype = info["dtype"]
+        self.backend_device = info["device"]
+        self.array_backend = info.get("array_backend", info["backend"])
+        # The live array dtype is authoritative when a caller supplies an
+        # existing MPS. This keeps generated coefficient operators aligned
+        # with the state rather than with STNState's constructor default.
+        self.dtype = info["dtype"]
+        self.state.dtype = self.dtype
+        return info
+
+    def _warn_backend_conversion(self, source_signature, target_signature, *, kind):
+        """Warn once for an explicit stream payload conversion."""
+        warning_key = (kind, source_signature, target_signature)
+        if (
+            source_signature[0] != "builtins"
+            and warning_key not in self._backend_conversion_warnings
+        ):
+            self._backend_conversion_warnings.add(warning_key)
+            warnings.warn(
+                f"MpsStabOptimizer is converting a {kind} payload from "
+                f"backend/dtype/device {source_signature!r} to the live "
+                f"coefficient-MPS state {target_signature!r}; provide matching "
+                f"{kind} payloads to avoid this transfer or cast.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    def _to_state_backend(self, array, *, warn=False, kind="operator"):
+        """Return an array converted to the live coefficient-MPS signature."""
+        like = self._state_backend_like()
+        if like is None:
+            return np.asarray(array, dtype=self.dtype)
+        # The full diagnostic validates every MPS tensor and is intentionally
+        # exposed through ``backend_info``. Internal rotations use the cached
+        # live signature so backend checks do not become an O(n) scan inside
+        # every gate/MPO contraction.
+        if self._backend_signature is None:
+            self.backend_info()
+        target_signature = self._backend_signature
+        source_signature = infer_backend_signature(array)
+        if source_signature == target_signature:
+            return array
+        if warn:
+            self._warn_backend_conversion(source_signature, target_signature, kind=kind)
+        if target_signature[0] == "symmray" and source_signature[0] != "symmray":
+            raise TypeError(
+                "Cannot convert a dense gate/operator payload into a native "
+                "Symmray MPS without charge and fermionic metadata. Build the "
+                "payload as a Symmray array on the target U1/U1U1 backend."
+            )
+        converter = self._backend_converter
+        if converter is not None:
+            return converter(array)
+        return ar.do("array", array, like=like)
+
+    def _diagnose_gate_backend(self, gate):
+        """Warn if an explicit stream matrix is foreign to the live MPS."""
+        self.backend_info()
+        source_signature = infer_backend_signature(gate)
+        if source_signature != self._backend_signature:
+            self._warn_backend_conversion(
+                source_signature, self._backend_signature, kind="gate"
+            )
+
+    def _bk(self, mat):
+        """Backend copy of an internally generated gate matrix."""
         arr = np.asarray(mat, dtype=self.dtype)
-        return self.to_backend(arr) if self.to_backend is not None else arr
+        return self._to_state_backend(arr)
 
     def _bk_const(self, tag: str, mat):
         """Backend copy of a *constant* gate matrix, cached by ``tag``."""
-        if self.to_backend is None:
-            return np.asarray(mat, dtype=self.dtype)
         cached = self._bk_cache.get(tag)
         if cached is None:
-            cached = self.to_backend(np.asarray(mat, dtype=self.dtype))
+            cached = self._to_state_backend(np.asarray(mat, dtype=self.dtype))
             self._bk_cache[tag] = cached
         return cached
 
-    def _bk_mpo(self, mpo):
-        """Place a sub-MPO's arrays on the configured backend (in place)."""
-        if self.to_backend is not None:
-            mpo.apply_to_arrays(self.to_backend)
-        return mpo
+    def _bk_mpo(self, mpo, *, warn=True):
+        """Return a sub-MPO on the live backend without mutating its source."""
+        tensors = tuple(getattr(mpo, "tensors", ()))
+        if not tensors:
+            return mpo
+        if self._backend_signature is None:
+            self.backend_info()
+        target_signature = self._backend_signature
+        source_signatures = {
+            infer_backend_signature(tensor.data) for tensor in tensors
+        }
+        if source_signatures == {target_signature}:
+            return mpo
+        for source_signature in source_signatures:
+            if source_signature != target_signature and warn:
+                self._warn_backend_conversion(
+                    source_signature, target_signature, kind="sub-MPO"
+                )
+        if target_signature[0] == "symmray":
+            for source_signature in source_signatures:
+                if source_signature[0] != "symmray":
+                    raise TypeError(
+                        "Cannot convert a dense sub-MPO into a native Symmray "
+                        "MPS without charge and fermionic metadata."
+                    )
+        converted = mpo.copy()
+        apply_to_arrays = getattr(converted, "apply_to_arrays", None)
+        if not callable(apply_to_arrays):
+            raise TypeError(
+                "sub-MPO payloads must provide apply_to_arrays() for backend "
+                "conversion."
+            )
+        apply_to_arrays(self._backend_converter or self._to_state_backend)
+        return converted
 
     @staticmethod
     def _to_scalar(x) -> complex:
@@ -3416,6 +3536,7 @@ class MpsStabOptimizer:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
             # matrix form: (gate_tensor, where)
             gate, where = entry
+            self._diagnose_gate_backend(gate)
             self._apply_matrix(self._gate_to_numpy(gate), where)
             return
 
@@ -3661,7 +3782,7 @@ class MpsStabOptimizer:
         coef = -1j * sign * np.sin(theta / 2)
         mps_terms = self._mps_terms(terms)
         mpo, where = pauli_combo_submpo(c, coef, mps_terms, self.n, dtype=self.dtype)
-        self._record(self._evolve_p(self._bk_mpo(mpo), where, unitary=True))
+        self._record(self._evolve_p(self._bk_mpo(mpo, warn=False), where, unitary=True))
 
     def _evolve_p(
         self,
@@ -3953,14 +4074,16 @@ class MpsStabOptimizer:
             dims=[2] * (n - 1),
             **split_opts,
         )
-        if self.to_backend is not None:
-            p.apply_to_arrays(self.to_backend)
+        converter = self.to_backend or self._backend_converter
+        if converter is not None:
+            p.apply_to_arrays(converter)
 
         import stim
 
         tableau = stim.TableauSimulator()
         tableau.set_num_qubits(n - 1)
         self.state = STNState.from_tableau_and_state(tableau, p, dtype=self.dtype)
+        self.backend_info()
         self._localizer_cache.clear()
         self._invalidate_norm_infidelity()
         self._record()
@@ -4122,7 +4245,7 @@ class MpsStabOptimizer:
         mps_terms = self._mps_terms(terms)
         mpo, where = pauli_combo_submpo(0.5, coef, mps_terms, self.n, dtype=self.dtype)
         self._evolve_p(
-            self._bk_mpo(mpo),
+            self._bk_mpo(mpo, warn=False),
             where,
             renormalize=True,
             norm_event=norm_event,
@@ -4842,7 +4965,8 @@ class MpsStabOptimizer:
             )
         if norm_squared <= 0.0:
             return 0.0
-        gram = np.asarray(gate).conj().T @ np.asarray(gate)
+        gate = np.asarray(ar.to_numpy(gate))
+        gram = gate.conj().T @ gate
         expectation = 0.0 + 0.0j
         for term_index, (labels, coefficient) in enumerate(
             pauli_decomposition(gram, k, tol=self.operator_tol), start=1
@@ -5019,8 +5143,8 @@ class MpsStabOptimizer:
         )
         mpo, where = pauli_sum_submpo(mapped, self.n, dtype=self.dtype)
         if unitary:
-            return self._evolve_p(self._bk_mpo(mpo), where, unitary=True)
-        self._evolve_p(self._bk_mpo(mpo), where)
+            return self._evolve_p(self._bk_mpo(mpo, warn=False), where, unitary=True)
+        self._evolve_p(self._bk_mpo(mpo, warn=False), where)
         if target_norm is None:
             self._invalidate_norm_infidelity()
             return None
@@ -5457,7 +5581,7 @@ def _looks_like_stream(gates) -> bool:
 
 def _is_unitary(gate: np.ndarray, tol: float = 1e-9) -> bool:
     """Return whether ``gate`` is unitary within ``tol``."""
-    g = np.asarray(gate, dtype=complex)
+    g = np.asarray(ar.to_numpy(gate), dtype=complex)
     return np.allclose(g.conj().T @ g, np.eye(g.shape[0]), atol=tol)
 
 
@@ -5467,7 +5591,7 @@ def _zyz_angles(gate: np.ndarray):
     Up to a global phase, using the convention ``Rz(a) = exp(-i a/2 Z)`` and
     ``Ry(t) = exp(-i t/2 Y)``.
     """
-    u = np.asarray(gate, dtype=complex)
+    u = np.asarray(ar.to_numpy(gate), dtype=complex)
     det = u[0, 0] * u[1, 1] - u[0, 1] * u[1, 0]
     u = u / np.sqrt(det)  # to SU(2) up to a sign (global phase, irrelevant)
     c = abs(u[0, 0])

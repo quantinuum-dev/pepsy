@@ -8,10 +8,12 @@ represented.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any
 
+import autoray as ar
 import numpy as np
 
 from ..torch_types import _require_torch
@@ -29,6 +31,98 @@ class TorchConnections:
     configs: Any
     coeffs: Any
     batch_ids: Any
+
+    def to(self, device):
+        """Return this connection table on ``device``."""
+        return TorchConnections(
+            configs=self.configs.to(device=device),
+            coeffs=self.coeffs.to(device=device),
+            batch_ids=self.batch_ids.to(device=device),
+        )
+
+    def slice(self, start, stop):
+        """Slice rows belonging to parent samples ``[start, stop)``."""
+        start = int(start)
+        stop = int(stop)
+        if start < 0 or stop < start:
+            raise ValueError("connection slice must satisfy 0 <= start <= stop")
+        mask = (self.batch_ids >= start) & (self.batch_ids < stop)
+        return TorchConnections(
+            configs=self.configs[mask],
+            coeffs=self.coeffs[mask],
+            batch_ids=self.batch_ids[mask] - start,
+        )
+
+
+@dataclass(frozen=True)
+class TorchFockTransitionPlan:
+    """Reusable parent-to-connected-configuration tables.
+
+    A plan is tied to one ordered parent configuration stream and one named
+    observable map. It contains no PEPS parameters, so the same plan can be
+    reused for every PEPS bond dimension or dtype that measures the same
+    stored proposal stream. :meth:`slice` makes it safe to process a persisted
+    full-stream plan in sequential chunks.
+    """
+
+    configs: Any
+    connection_map: Mapping[str, TorchConnections]
+
+    def __post_init__(self):
+        configs = _as_long_matrix(self.configs)
+        if not isinstance(self.connection_map, Mapping):
+            raise TypeError("connection_map must be a mapping of observable names.")
+        normalized = {}
+        for name, connections in self.connection_map.items():
+            if not isinstance(name, str):
+                raise TypeError("transition-plan observable names must be strings.")
+            if not isinstance(connections, TorchConnections):
+                raise TypeError("connection_map values must be TorchConnections.")
+            normalized[name] = connections
+        object.__setattr__(self, "configs", configs)
+        object.__setattr__(self, "connection_map", normalized)
+
+    @property
+    def observable_names(self):
+        return tuple(self.connection_map)
+
+    @property
+    def n_samples(self):
+        return int(self.configs.shape[0])
+
+    @property
+    def n_connections(self):
+        return sum(
+            int(connections.configs.shape[0])
+            for connections in self.connection_map.values()
+        )
+
+    def to(self, device):
+        """Return the plan on ``device`` without changing its parent order."""
+        return TorchFockTransitionPlan(
+            configs=self.configs.to(device=device),
+            connection_map={
+                name: connections.to(device)
+                for name, connections in self.connection_map.items()
+            },
+        )
+
+    def slice(self, start, stop):
+        """Return the plan for parent samples ``[start, stop)``."""
+        start = int(start)
+        stop = int(stop)
+        if start < 0 or stop < start or stop > self.n_samples:
+            raise ValueError(
+                f"invalid transition-plan slice [{start}, {stop}) for "
+                f"{self.n_samples} samples"
+            )
+        return TorchFockTransitionPlan(
+            configs=self.configs[start:stop],
+            connection_map={
+                name: connections.slice(start, stop)
+                for name, connections in self.connection_map.items()
+            },
+        )
 
 
 def _term_items(terms):
@@ -111,13 +205,7 @@ def _charge_parity(charge):
 def _operator_dense_numpy(operator):
     """Get a detached CPU view of a fixed native operator tensor."""
     dense = _term_dense_array(operator)
-    detach = getattr(dense, "detach", None)
-    if callable(detach):
-        dense = detach()
-    cpu = getattr(dense, "cpu", None)
-    if callable(cpu):
-        dense = cpu()
-    return np.asarray(dense)
+    return np.asarray(ar.to_numpy(dense))
 
 
 @dataclass(frozen=True)
@@ -719,6 +807,7 @@ def _normalize_terms_site_labels(terms, site_order):
 
 __all__ = [
     "TorchConnections",
+    "TorchFockTransitionPlan",
     "compile_operator_sum_torch",
     "torch_hamiltonian_connections",
     "_driver_terms_connections",

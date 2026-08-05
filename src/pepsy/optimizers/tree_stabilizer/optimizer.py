@@ -22,6 +22,7 @@ import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...backends import infer_backend_signature
 from ..stabilizer_tn.mps_stab_optimizer import (
     DeferredInjectionRecord,
     DeferredInjectionReport,
@@ -38,8 +39,12 @@ from ..stabilizer_tn.records import (
 from ..stabilizer_tn.settings import DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
 from ..stabilizer_tn.stn_state import _CLIFFORD_GATES, _validate_bits
 from ..mps.optimizer import conditional_event_parts, submpo_event_parts
-from ..tree.layout import TreeLayoutFinder, TreePlan
-from ..tree.optimizer import TreeOptimizer
+from ..tree.layout import TreeLayoutFinder, TreePlan, _DEFAULT_TOP_ARITY
+from ..tree.optimizer import (
+    TreeOptimizer,
+    _DEFAULT_CUTOFF,
+    _DEFAULT_CUTOFF_MODE,
+)
 from ..tree.ttn import TreeTensorNetwork
 
 __all__ = ["TreeStabOptimizer", "run_stabilizer_tree_stream"]
@@ -139,7 +144,7 @@ def _looks_like_single_entry(gates):
 
 def _is_unitary(gate):
     """Return whether a dense gate is unitary to the STN tolerance."""
-    gate = np.asarray(gate)
+    gate = np.asarray(ar.to_numpy(gate))
     if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
         return False
     return np.allclose(
@@ -154,8 +159,8 @@ def _apply_dense_gate(state, gate, where, n):
     """Apply a small gate to a dense state in logical big-endian order."""
     where = tuple(int(q) for q in where)
     k = len(where)
-    tensor = np.asarray(state).reshape((2,) * n)
-    operator = np.asarray(gate).reshape((2,) * (2 * k))
+    tensor = np.asarray(ar.to_numpy(state)).reshape((2,) * n)
+    operator = np.asarray(ar.to_numpy(gate)).reshape((2,) * (2 * k))
     out = np.tensordot(
         operator,
         tensor,
@@ -315,7 +320,7 @@ def _dense_to_tree_state(state, plan, *, max_bond=None, cutoff=0.0, dtype=comple
     if cutoff < 0.0:
         raise ValueError("cutoff must be non-negative.")
 
-    dense = np.asarray(state, dtype=dtype).reshape(-1)
+    dense = np.asarray(ar.to_numpy(state), dtype=dtype).reshape(-1)
     expected_size = 2 ** plan.n
     if dense.size != expected_size:
         raise ValueError(
@@ -421,7 +426,13 @@ def _dense_to_tree_state(state, plan, *, max_bond=None, cutoff=0.0, dtype=comple
 
         tensors.append(qtn.Tensor(np.asarray(data, dtype=dtype), inds=inds, tags=tags))
 
-    return TreeTensorNetwork(tensors, plan=plan)._with_center(plan.root).validate()
+    tree = TreeTensorNetwork(tensors, plan=plan)._with_center(plan.root)
+    # The hierarchical bases above are orthonormal by construction, so every
+    # non-root tensor is already an isometry toward the root. Record that
+    # proven local orientation without repeating the dense decomposition with
+    # a numerical canonicalization sweep.
+    tree._set_isometry_metadata_from_region({plan.root})
+    return tree.validate()
 
 
 def _tree_bond_index(left, right):
@@ -614,11 +625,13 @@ class TreeStabOptimizer:
         *,
         n=None,
         chi=None,
-        cutoff=1e-12,
+        cutoff=_DEFAULT_CUTOFF,
+        cutoff_mode=_DEFAULT_CUTOFF_MODE,
         tree=None,
         layout=None,
         structure="quality",
-        max_arity=(2, 3, 4),
+        max_arity=2,
+        top_arity=_DEFAULT_TOP_ARITY,
         layout_objective="path",
         layout_weight_mode="count",
         mode="auto",
@@ -780,6 +793,7 @@ class TreeStabOptimizer:
                 cutoff=cutoff,
                 structure=structure,
                 max_arity=max_arity,
+                top_arity=top_arity,
                 layout_objective=layout_objective,
                 layout_weight_mode=layout_weight_mode,
                 max_operator_qubits=max_operator_qubits,
@@ -796,6 +810,7 @@ class TreeStabOptimizer:
             finder_kwargs = dict(layout_kwargs)
             finder_kwargs.setdefault("structure", structure)
             finder_kwargs.setdefault("max_arity", max_arity)
+            finder_kwargs.setdefault("top_arity", top_arity)
             finder_kwargs.setdefault("objective", layout_objective)
             finder_kwargs.setdefault("weight_mode", layout_weight_mode)
             finder_kwargs.setdefault("chi", chi)
@@ -812,9 +827,11 @@ class TreeStabOptimizer:
             n=n,
             chi=chi,
             cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
             mode=mode,
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             layout_objective=layout_objective,
             layout_weight_mode=layout_weight_mode,
             tree=tree,
@@ -830,8 +847,9 @@ class TreeStabOptimizer:
         )
         self.to_backend = to_backend
         if to_backend is not None:
-            for tensor in self._tree.tn.tensor_map.values():
-                tensor.modify(data=to_backend(tensor.data))
+            # Backend-only conversion must not erase the QR/SVD isometry
+            # proofs stored in each tensor's ``left_inds``.
+            self._tree.tn.apply_to_arrays(to_backend)
             self._tree.tn.validate()
         self.max_operator_qubits = max_operator_qubits
         self.max_pauli_decomposition_qubits = max_operator_qubits
@@ -859,6 +877,7 @@ class TreeStabOptimizer:
         self.frame_layout_events = tuple(frame_events)
         self.stim_plan = None
         self.stim_sample = None
+        self.backend_info()
 
     @classmethod
     def from_bits(cls, bits, **kwargs):
@@ -1069,6 +1088,23 @@ class TreeStabOptimizer:
     def center(self):
         return self._tree.center
 
+    def isometry_direction(self, node):
+        """Return the coefficient-tree neighbour proven by ``left_inds``."""
+        return self._tree.isometry_direction(node)
+
+    def isometry_map(self):
+        """Return the live coefficient-tree isometry orientation map."""
+        return self._tree.isometry_map()
+
+    def can_skip_canonize(self, a, b, *, absorb="right"):
+        """Whether coefficient metadata proves an edge QR is redundant."""
+        return self._tree.can_skip_canonize(a, b, absorb=absorb)
+
+    def validate_isometry_metadata(self, region=None):
+        """Validate coefficient ``left_inds`` against its canonical region."""
+        self._tree.validate_isometry_metadata(region)
+        return self
+
     @property
     def tree_optimizer(self):
         """Return the coefficient-side ``TreeOptimizer``."""
@@ -1096,6 +1132,7 @@ class TreeStabOptimizer:
         cutoff,
         structure,
         max_arity,
+        top_arity,
         layout_objective,
         layout_weight_mode,
         max_operator_qubits,
@@ -1129,6 +1166,7 @@ class TreeStabOptimizer:
         weight_mode = options.pop("weight_mode", layout_weight_mode)
         structure = options.pop("structure", structure)
         max_arity = options.pop("max_arity", max_arity)
+        top_arity = options.pop("top_arity", top_arity)
         objective = options.pop(
             "objective", options.pop("layout_objective", layout_objective)
         )
@@ -1164,6 +1202,7 @@ class TreeStabOptimizer:
             cutoff=cutoff,
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             layout_objective=objective,
             layout_weight_mode=weight_mode,
             max_operator_qubits=max_operator_qubits,
@@ -1179,6 +1218,7 @@ class TreeStabOptimizer:
             n=int(n),
             structure=structure,
             max_arity=max_arity,
+            top_arity=top_arity,
             objective=objective,
             weight_mode=weight_mode,
             chi=chi,
@@ -1239,7 +1279,7 @@ class TreeStabOptimizer:
         if not isinstance(head, str):
             if len(entry) != 2:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-            gate = np.asarray(entry[0])
+            gate = np.asarray(ar.to_numpy(entry[0]))
             where = _normalize_sites(entry[1])
             if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
                 raise ValueError(f"Gate matrix must be square, got {gate.shape}.")
@@ -1385,6 +1425,7 @@ class TreeStabOptimizer:
         finder_kwargs = {
             "structure": self._tree.structure,
             "max_arity": self._tree.max_arity,
+            "top_arity": self._tree.top_arity,
             "objective": self._tree.layout_objective,
             "weight_mode": weight_mode,
             "chi": self._tree.chi,
@@ -1431,9 +1472,11 @@ class TreeStabOptimizer:
             n=self.n,
             chi=self._tree.chi,
             cutoff=self._tree.cutoff,
+            cutoff_mode=self._tree.cutoff_mode,
             mode=self._tree.mode,
             structure=self._tree.structure,
             max_arity=self._tree.max_arity,
+            top_arity=selected.top_arity,
             layout_objective=self._tree.layout_objective,
             layout_weight_mode=self._tree.layout_weight_mode,
             tree=selected,
@@ -1525,6 +1568,13 @@ class TreeStabOptimizer:
         submpo_parts = submpo_event_parts(entry, normalize_where=True)
         if submpo_parts is not None:
             mpo, where = submpo_parts
+            # Convert every operator tensor once at the stream boundary. The
+            # ordinary TreeOptimizer helper copies foreign MPOs, preserving
+            # caller ownership and avoiding repeated per-tensor conversions in
+            # the native subtree path.
+            mpo = self._tree._prepare_gate_stream_backend(
+                [mpo], ["submpo"]
+            )[0]
             self._tree.apply_submpo(mpo, where)
             return
         if isinstance(entry, (tuple, list)) and entry:
@@ -1617,9 +1667,23 @@ class TreeStabOptimizer:
                 raise ValueError(f"Unknown gate name {head!r} in stream entry {entry!r}.")
             if len(entry) != 2:
                 raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
-            self._apply_matrix(entry[0], entry[1])
+            gate = entry[0]
+            self._diagnose_gate_backend(gate)
+            self._apply_matrix(gate, entry[1])
             return
         raise ValueError(f"Unsupported gate stream entry: {entry!r}.")
+
+    def _diagnose_gate_backend(self, gate):
+        """Warn when an explicit matrix is foreign to the coefficient TTN."""
+        target = self._tree._state_like()
+        if target is None:
+            return
+        source_signature = infer_backend_signature(gate)
+        target_signature = infer_backend_signature(target)
+        if source_signature != target_signature:
+            self._tree._warn_backend_conversion(
+                source_signature, target_signature
+            )
 
     def _apply_matrix(self, gate, where):
         where = _normalize_sites(where)
@@ -2637,7 +2701,8 @@ class TreeStabOptimizer:
         layout_options.setdefault("weight_mode", "auto")
         finder_options = {
             "structure": kwargs.get("structure", "quality"),
-            "max_arity": kwargs.get("max_arity", (2, 3, 4)),
+            "max_arity": kwargs.get("max_arity", 2),
+            "top_arity": kwargs.get("top_arity", _DEFAULT_TOP_ARITY),
             "chi": kwargs.get("chi", 64),
             "max_operator_qubits": kwargs.get(
                 "max_operator_qubits", DEFAULT_MAX_PAULI_DECOMPOSITION_QUBITS
@@ -3478,15 +3543,17 @@ class TreeStabOptimizer:
             dtype=old_tree.dtype,
         )
         if self.to_backend is not None:
-            for tensor in coefficient.tensor_map.values():
-                tensor.modify(data=self.to_backend(tensor.data))
+            coefficient.apply_to_arrays(self.to_backend)
         elif self._tree.backend_info()["backend"] != "numpy":
-            self._tree._coerce_tensor_network_backend(coefficient, warn=False)
+            coefficient.apply_to_arrays(
+                self._tree._backend_converter(self._tree._state_like())
+            )
         new_tree = TreeOptimizer(
             None,
             n=reduced_n,
             chi=old_tree.chi,
             cutoff=old_tree.cutoff,
+            cutoff_mode=old_tree.cutoff_mode,
             mode=old_tree.mode,
             structure=old_tree.structure,
             max_arity=old_tree.max_arity,
@@ -3521,7 +3588,13 @@ class TreeStabOptimizer:
 
     def backend_info(self):
         """Return the coefficient TTN backend, dtype, and device."""
-        return self._tree.backend_info()
+        info = self._tree.backend_info()
+        self.backend = info["backend"]
+        self.backend_dtype = info["dtype"]
+        self.backend_device = info["device"]
+        self.array_backend = info.get("array_backend", info["backend"])
+        self.dtype = info["dtype"]
+        return info
 
     def normalize(self):
         """Normalize the coefficient TTN and return ``self``.

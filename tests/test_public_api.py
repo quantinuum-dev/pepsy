@@ -32,11 +32,12 @@ def test_namespace_exports_have_clear_core_and_advanced_groups():
 
 def test_tree_optimizers_are_available_from_high_level_api():
     """Tree layout and execution helpers resolve from ``import pepsy as py``."""
-    from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer
+    from pepsy.optimizers.tree import TreeLayoutFinder, TreeOptimizer, TreePlan
     from pepsy.optimizers.tree_stabilizer import TreeStabOptimizer
 
     assert pepsy.TreeLayoutFinder is TreeLayoutFinder
     assert pepsy.TreeOptimizer is TreeOptimizer
+    assert pepsy.TreePlan is TreePlan
     assert pepsy.TreeStabOptimizer is TreeStabOptimizer
 
 
@@ -51,14 +52,16 @@ _EXPECTED_IN_ALL = [
     "cnot", "cx", "cy", "cz", "swap", "iswap", "phase", "u1", "u2",
     "cphase", "crx", "cry", "crz", "cu1", "cu2", "cu3", "rx", "ry", "rz",
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "hrs_to_mps", "hrs_to_peps", "hrs_to_ttn", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
-    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "make_numpy_array_caster", "to_float", "SweepOptimizer",
+    "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "make_numpy_array_caster", "backend_infer", "to_float", "SweepOptimizer",
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult",
     "PepsBpSampler", "MpsSampler", "FermionConfigurationEncoding", "MpsDiagonalEstimate", "MpsBatchSampleResult", "MpsSampleResult", "VecSampler", "gate", "gauge_all", "gauge_all_simple", "one_norm_bp", "tn_fidelity", "tn_norm",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
     "MpsStabOptimizer", "STNState", "StabilizerMpsSimulator",
+    "SimulatorCandidate", "SimulatorPlan", "SimulatorPlanner", "recommend_simulator",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
-    "TreeOptimizer",
+    "TreeMPO", "TreeOptimizer", "build_tree_operator", "tree_mpo",
+    "TreePlan",
     "TreeStabOptimizer",
     "TreeTensorNetwork",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
@@ -81,9 +84,11 @@ _EXPECTED_IN_ALL = [
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
     "symmray_block_summary", "symmray_mps_summary", "symmray_mpo_summary", "symmray_peps_summary", "symm_operator_from_dense",
-    "reg_rel_svd_torch", "reg_real_svd_torch", "reg_complex_svd_torch",
+    "reg_native_svd_torch", "reg_native_svd_jax", "reg_rel_svd_torch",
+    "reg_real_svd_torch", "reg_complex_svd_torch",
     "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
+    "register_jax_linalg", "reset_linalg_registrations",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
@@ -116,7 +121,7 @@ def test_internal_symbols_not_exported():
 _CALLABLE_EXPORTS = [
     "contract_boundary", "contract_flat", "build_bra_ket", "normalize", "peps_normalize",
     "boundary_norm", "peps_norm", "infidelity", "peps_infidelity", "peps_fidelity",
-    "to_float", "gauge_all", "gauge_all_simple", "one_norm_bp",
+    "backend_infer", "to_float", "gauge_all", "gauge_all_simple", "one_norm_bp",
     "GlobalOptimizer", "FIT", "tns_align", "measure_obs",
     "build_pepo_from_gates", "build_mpo_from_gates", "pauli",
     "x", "y", "z", "s", "sdg", "t", "tdg", "h", "hadamard",
@@ -125,13 +130,15 @@ _CALLABLE_EXPORTS = [
     "rxx", "ryy", "rzz", "u3", "su4", "fsim", "fsimg", "haar_random_state", "hrs_to_mps", "hrs_to_peps", "hrs_to_ttn", "ps_to_peps", "ps_to_3dpeps", "expec_mpo",
     "id_to_mpo", "id_to_pepo", "ps_to_pepo", "ps_to_mpo", "ps_to_ttn", "SweepOptimizer",
     "FDSolver", "MpsEnergyOptimizer", "MpsOptimizer", "MpoOptimizer", "MpsStabOptimizer", "StabilizerMpsSimulator",
+    "SimulatorCandidate", "SimulatorPlan", "SimulatorPlanner", "recommend_simulator",
     "DeferredInjectionRecord", "DeferredInjectionReport", "DeferredProjectionRecord",
     "ImmediateInjectionReport", "ImmediateProjectionRecord", "MeasurementRecord", "NormEventRecord",
     "StabilizerMpsSettingsAdvice", "StabilizerMpsRunResult", "StreamAnalysisRecord",
     "PepsEnergyOptimizer", "PepsOptimizer", "SimpleUpdateGen", "SymDMRG2", "PEPSSampleResult", "PepsBpSampler", "CoherentCrosstalkModel", "compile_stim_circuit", "run_coalesced_noisy_shots", "run_coalesced_stim_shots", "run_coalesced_trajectory_shots", "run_noisy_shots", "run_stabilizer_mps_stream", "run_stabilizer_tree_stream", "run_stim_shots", "run_trajectory_shots", "sample_coalesced_bits", "sample_noisy_gate_stream", "sample_noisy_gate_streams", "sample_stim_circuit", "sample_stim_circuits", "sample_trajectory_stream",
     "TreeEnergyOptimizer",
     "TreeLayoutFinder",
-    "TreeOptimizer",
+    "TreeMPO", "TreeOptimizer", "build_tree_operator", "tree_mpo",
+    "TreePlan",
     "TreeStabOptimizer",
     "TreeTensorNetwork",
     "TreeSampler", "TreeBatchSampleResult", "TreeSampleResult",
@@ -146,9 +153,11 @@ _CALLABLE_EXPORTS = [
     "site_charge_alternating", "site_charge_from_map",
     "site_charge_from_occupations", "site_charge_uniform",
     "symmray_block_summary", "symmray_mps_summary", "symmray_mpo_summary", "symmray_peps_summary", "symm_operator_from_dense",
-    "reg_rel_svd_torch", "reg_real_svd_torch", "reg_complex_svd_torch",
+    "reg_native_svd_torch", "reg_native_svd_jax", "reg_rel_svd_torch",
+    "reg_real_svd_torch", "reg_complex_svd_torch",
     "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
+    "register_jax_linalg", "reset_linalg_registrations",
 ]
 
 _BLOCKED_NAMES = _EXPECTED_NOT_IN_ALL
@@ -210,16 +219,22 @@ def test_optional_linalg_registrations_resolve():
     assert pepsy.reg_rel_svd_torch is pepsy.tensors.reg_rel_svd_torch
     assert pepsy.reg_real_svd_torch is pepsy.tensors.reg_real_svd_torch
     assert pepsy.reg_complex_svd_torch is pepsy.tensors.reg_complex_svd_torch
+    assert pepsy.reg_native_svd_torch is pepsy.tensors.reg_native_svd_torch
+    assert pepsy.reg_native_svd_jax is pepsy.tensors.reg_native_svd_jax
     assert pepsy.reg_real_qr_torch is pepsy.tensors.reg_real_qr_torch
     assert pepsy.reg_complex_qr_torch is pepsy.tensors.reg_complex_qr_torch
     assert pepsy.reg_rel_svd_jax is pepsy.tensors.reg_rel_svd_jax
     assert pepsy.reg_real_svd_jax is pepsy.tensors.reg_real_svd_jax
     assert pepsy.reg_complex_svd_jax is pepsy.tensors.reg_complex_svd_jax
+    assert pepsy.register_jax_linalg is pepsy.backends.register_jax_linalg
+    assert pepsy.reset_linalg_registrations is pepsy.backends.reset_linalg_registrations
     if has_torch:
         import torch
 
         assert callable(pepsy.tensors.core.reg_rel_svd_torch)
         assert callable(pepsy.tensors.reg_rel_svd_torch)
+        assert callable(pepsy.tensors.core.reg_native_svd_torch)
+        assert callable(pepsy.tensors.reg_native_svd_torch)
         assert callable(pepsy.tensors.core.reg_real_svd_torch)
         assert callable(pepsy.tensors.reg_real_svd_torch)
         assert callable(pepsy.tensors.core.reg_complex_svd_torch)
@@ -240,3 +255,7 @@ def test_optional_linalg_registrations_resolve():
         assert callable(pepsy.tensors.reg_real_svd_jax)
         assert callable(pepsy.tensors.core.reg_complex_svd_jax)
         assert callable(pepsy.tensors.reg_complex_svd_jax)
+        assert callable(pepsy.tensors.core.reg_native_svd_jax)
+        assert callable(pepsy.tensors.reg_native_svd_jax)
+        assert callable(pepsy.tensors.core.register_jax_linalg)
+        assert callable(pepsy.tensors.register_jax_linalg)

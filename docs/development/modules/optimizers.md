@@ -32,8 +32,11 @@ important downstream time-compression consumer that depends on Pepsy behavior.
   simulator. See `../plans/stabilizer_tn.md` for its implementation record and
   `docs/howto/stabilizer_tn_magic.md` for exact cooling, greedy checkpoints,
   and immediate versus deferred MAST injection.
-- `mera/`: dense MERA and schedule-first qMERA local-energy objectives,
-  parameter dictionaries, compiled lightcone contractions, schematics, and
+- `planning.py`: non-executing physical-versus-stabilizer and
+  MPS-versus-tree circuit advice using measured frame supports and explicit
+  chi-scaled work proxies.
+- `qmera/`: schedule-first qMERA local-energy objectives, parameter
+  dictionaries, compiled lightcone contractions, schematics, and
   Symmray-native fermion helpers.
 - `global_opt.py`: whole-network variational optimization helpers.
 

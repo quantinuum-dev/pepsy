@@ -6,24 +6,20 @@ Symmray implementation.
 
 ## Current Pepsy state
 
-Pepsy currently exposes `SpinfulFermion` from `pepsy` and `pepsy.tensors`. The
-implementation lives in `src/pepsy/tensors/symmetric.py`, is re-exported by
-`src/pepsy/tensors/symm_fermions.py`, and currently provides:
+Pepsy exposes the canonical `Fermion` helper from `pepsy` and `pepsy.tensors`.
+The implementation lives in `src/pepsy/tensors/symmetric.py`, is re-exported
+by `src/pepsy/tensors/symm_fermions.py`, and provides:
 
-- spinful `U1` and `U1U1` local spaces;
+- spinless `U1`/`Z2` and spinful `U1`/`Z2`/`U1U1`/`Z2Z2` local spaces;
 - dense local operators and aliases;
 - native Symmray one-site observables;
-- onsite interaction and two-site hopping gates;
-- deterministic second-order edge-colored gate streams;
-- `SymHamiltonian` construction for `fermi_hubbard` and
-  `fermi_hubbard_u1u1`;
-- `SpinfulFermionHubbard = SpinfulFermion` compatibility alias.
+- onsite, hopping, density, field, and parity-preserving pairing gates;
+- deterministic first- and second-order edge-colored gate streams;
+- `SymHamiltonian` construction for spinful Hubbard and spinless t-V models.
 
-Pepsy already supports spinless model metadata and Hamiltonian paths through
-`fermi_hubbard_spinless`, but the model-facing helper does not yet unify that
-space with the spinful helper. The intended evolution is a canonical
-`Fermion(spinful=...)` helper, retaining the existing spinful names as
-compatibility aliases.
+`SpinfulFermion` and `SpinfulFermionHubbard` are compatibility constructors:
+they deliberately fix `spinful=True`, while `SymmFermions.spinful(...)` and
+`SymmFermions.spinless(...)` provide corresponding factories.
 
 ## Symmray local conventions
 
@@ -68,15 +64,15 @@ Use one object with an explicit local-space switch. The exact name can change
 only with user direction; `Fermion` is the recommended canonical name.
 
 ```python
-spinless = Fermion(spinful=False, symmetry="U1", t=1.0, V=0.5, mu=0.0)
-spinful = Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0, mu=0.0)
+spinless = Fermion(spinful=False, symmetry="U1")
+spinful = Fermion(spinful=True, symmetry="U1U1")
 
 spinless.dense_operator("number")
 spinful.observable("number_up")
-spinful.hopping_gate(dt=0.01)
-spinful.interaction_gate(dt=0.01, site=3)
-spinful.strang_gate_stream(edges, dt=0.01, sites=range(L))
-spinful.hamiltonian(edges)
+spinful.hopping_gate(dt=0.01, t=1.0)
+spinful.interaction_gate(dt=0.01, site=3, U=8.0)
+spinful.strang_gate_stream(edges, dt=0.01, sites=range(L), t=1.0, U=8.0)
+spinful.hamiltonian(edges, t=1.0, U=8.0, mu=0.0)
 ```
 
 Recommended metadata and methods:
@@ -96,7 +92,10 @@ Recommended metadata and methods:
 | `strang_gate_stream(...)` | create deterministic canonical bundled entries |
 
 The spinless parameter should use `V` for nearest-neighbor density interaction;
-do not silently interpret a spinless `U` as a doublon interaction. Spinless
+do not silently interpret a spinless `U` as a doublon interaction: the public
+methods reject it. `Fermion` stores only local-space and backend metadata;
+pass `t`, `U`, `V`, and `mu` to a term, Hamiltonian, or gate-stream call.
+Spinless
 pairing or superconducting terms should be added only with explicit symmetry
 and charge semantics, since they break particle-number conservation.
 
@@ -170,14 +169,16 @@ once. This is correct for native local-term measurements, but the one-site
 interaction is not a separate dictionary entry.
 
 For examples that prioritize visible bookkeeping, build hopping-only edge
-terms with `U=0` and `mu=0`, then add one-site native observables:
+terms with `U=0` and `mu=0`, then add one-site native observables. Keep the
+couplings as ordinary local variables rather than Fermion attributes:
 
 ```python
-hop = fermion.hamiltonian(edges, U=0.0, mu=0.0)
+U, mu = 8.0, 0.0
+hop = fermion.hamiltonian(edges, t=1.0, U=0.0, mu=0.0)
 energy_terms = dict(hop.terms)
 onsite = (
-    fermion.U * fermion.observable("double")
-    - fermion.mu * fermion.observable("number")
+    U * fermion.observable("double")
+    - mu * fermion.observable("number")
 )
 energy_terms.update({(site,): onsite for site in range(L)})
 ```

@@ -10,6 +10,25 @@ milestone. It represents the state as
 where `C` is a Stim tableau Clifford and `|p>` is a dense two-level
 `TreeTensorNetwork` evolved by `TreeOptimizer`.
 
+TreeStab forwards `cutoff` and `cutoff_mode` to that same coefficient
+optimizer. The defaults are `cutoff=1e-10` and `cutoff_mode="rsum2"`, matching
+Quimb's open-boundary `gate_with_submpo` compression convention. Its
+`mode="mpo"` path and explicit coefficient-frame `submpo` events therefore
+reuse TreeOptimizer's Quimb MPO tag lookup, lossless QR routing, and one final
+subtree compression sweep; a payload without that MPO interface is the only
+case that uses the bounded dense fallback.
+
+Canonical and compression state has the same single owner as ordinary tree
+simulation: local isometry proofs live on the coefficient tensors'
+``left_inds`` and are interpreted by ``TreeTensorNetwork``. TreeStab delegates
+``isometry_direction()``, ``isometry_map()``, ``can_skip_canonize()``, and
+``validate_isometry_metadata()`` to its coefficient ``TreeOptimizer``; it does
+not keep another map. Direct, MPO, and coefficient-frame sub-MPO routes
+therefore reuse proven path/subtree Q tensors and select one-sided SVD
+compression only when the live proof is valid. Backend conversion and dense
+cap reconstruction preserve or install those proofs rather than forcing a
+second canonicalization sweep.
+
 The first milestone supports:
 
 - named and matrix-valued Clifford gates, which update only the tableau;
@@ -137,6 +156,16 @@ Feed-forward uses `("if", record, bit, action)`, with Stim-style negative
 measurement offsets and computational bits (`+1 -> 0`, `-1 -> 1`). The action
 must be one gate entry. Stim `CX/CY/CZ rec[k] q` instructions are lowered to
 this same form by `compile_stim_circuit`.
+
+TreeStab derives `backend`, `dtype`, and `device` from every live coefficient
+TTN tensor, including a caller-supplied Torch, JAX, or CuPy tree when
+`to_backend` is omitted. `backend_info()` refreshes the same public
+`backend`, `backend_dtype`, `backend_device`, and `array_backend` attributes.
+Explicit matrix gates and sub-MPO payloads are checked at the stream boundary;
+foreign arrays warn once and sub-MPOs are copied before conversion, preserving
+the caller's operator and the TTN's canonical/isometry metadata. Stim gate
+classification remains a NumPy-side operation, while TreeOptimizer applies
+the coefficient update on the inferred backend.
 
 
 > API details are maintained as handwritten Markdown in this page.

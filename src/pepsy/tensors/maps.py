@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from numbers import Integral
 
 __all__ = ["OneDMap"]
@@ -39,6 +40,7 @@ class OneDMap:
         "hilbert",
         "hilbert-row-major",
         "diag",
+        "finder",
     )
     _MODE_ALIASES = {
         "snake": "snake",
@@ -75,6 +77,8 @@ class OneDMap:
         "diag": "diag",
         "diagonal": "diag",
         "diag-snake": "diag",
+        "mps-finder": "finder",
+        "layout-finder": "finder",
     }
 
     @classmethod
@@ -105,7 +109,22 @@ class OneDMap:
 
         return Lx, Ly, Lz
 
-    def __init__(self, Lx=None, Ly=None, Lz=None, mode="snake", *, L_x=None, L_y=None, L_z=_ONE_D_MAP_UNSET):
+    def __init__(
+        self,
+        Lx=None,
+        Ly=None,
+        Lz=None,
+        mode="snake",
+        *,
+        L_x=None,
+        L_y=None,
+        L_z=_ONE_D_MAP_UNSET,
+        finder=None,
+        gate_stream=None,
+        gates=None,
+        layout_kwargs=None,
+        finder_base_mode="snake",
+    ):
         Lx, Ly, Lz = self._coalesce_dim_names(
             Lx=Lx,
             Ly=Ly,
@@ -117,6 +136,24 @@ class OneDMap:
         self.Lx, self.Ly, self.Lz = self._normalize_dims(Lx, Ly, Lz=Lz)
         self.L_x, self.L_y, self.L_z = self.Lx, self.Ly, self.Lz
         self.mode = self._normalize_mode(mode)
+        if gate_stream is not None and gates is not None:
+            raise TypeError("pass only one of gate_stream= or gates=.")
+        if gates is not None:
+            gate_stream = gates
+        if finder is not None and gate_stream is not None:
+            raise TypeError(
+                "pass either finder= or gate_stream=/gates=, not both."
+            )
+        if hasattr(gate_stream, "__next__"):
+            gate_stream = list(gate_stream)
+        self.finder = finder
+        self.gate_stream = gate_stream
+        self.layout_kwargs = (
+            {} if layout_kwargs is None else dict(layout_kwargs)
+        )
+        self.finder_base_mode = self._normalize_mode(finder_base_mode)
+        if self.finder_base_mode == "finder":
+            raise ValueError("finder_base_mode cannot itself be 'finder'.")
 
     def __repr__(self):
         shape = (self.Lx, self.Ly) if self.Lz is None else (self.Lx, self.Ly, self.Lz)
@@ -344,20 +381,129 @@ class OneDMap:
         return one_d_to_lattice, lattice_to_one_d
 
     @classmethod
+    def _coords_from_mps_finder(
+        cls,
+        Lx,
+        Ly,
+        Lz,
+        *,
+        finder=None,
+        gate_stream=None,
+        layout_kwargs=None,
+        finder_base_mode="snake",
+    ):
+        """Compose an MPS layout permutation with a regular lattice map.
+
+        The MPS finder works on logical integer site labels and returns a
+        position-to-logical-site permutation. This method applies that
+        permutation to the coordinates of ``finder_base_mode``. It performs
+        no tensor-network construction or state replay.
+        """
+        if finder is not None and gate_stream is not None:
+            raise TypeError(
+                "pass either finder= or gate_stream=/gates=, not both."
+            )
+        if finder is None:
+            if gate_stream is None:
+                raise ValueError(
+                    "mode='finder' requires gate_stream=, gates=, or finder=."
+                )
+            from ..optimizers.mps.layout import MpsGateStreamLayoutFinder
+
+            nsites = Lx * Ly if Lz is None else Lx * Ly * Lz
+            finder = MpsGateStreamLayoutFinder(gate_stream, L=nsites)
+
+        layout_kwargs = {} if layout_kwargs is None else dict(layout_kwargs)
+        if isinstance(finder, Mapping):
+            plan = finder
+        else:
+            run = getattr(finder, "run", None)
+            if not callable(run):
+                raise TypeError(
+                    "finder must be an MpsGateStreamLayoutFinder or a layout "
+                    "plan mapping returned by its run() method."
+                )
+            plan = run(**layout_kwargs)
+
+        site_order = plan.get(
+            "site_order",
+            plan.get("qubit_inds", plan.get("order")),
+        )
+        if site_order is None:
+            raise ValueError(
+                "MPS finder plan must contain site_order, qubit_inds, or order."
+            )
+        try:
+            site_order = tuple(int(site) for site in site_order)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "MPS finder site_order must contain integer lattice labels."
+            ) from exc
+        nsites = Lx * Ly if Lz is None else Lx * Ly * Lz
+        if len(site_order) != nsites or set(site_order) != set(range(nsites)):
+            raise ValueError(
+                "MPS finder site_order must be a permutation of the lattice "
+                f"labels 0..{nsites - 1}."
+            )
+
+        base_idx2coo, _ = cls.build(
+            Lx,
+            Ly,
+            Lz=Lz,
+            mode=finder_base_mode,
+        )
+        return [base_idx2coo[site] for site in site_order]
+
+    @classmethod
     def _normalize_mode(cls, mode):
         mode_norm = str(mode).strip().lower().replace("_", "-")
         return cls._MODE_ALIASES.get(mode_norm, mode_norm)
 
     @_dualmethod
-    def build(target, Lx=None, Ly=None, Lz=_ONE_D_MAP_UNSET, mode=None, *, L_x=None, L_y=None, L_z=_ONE_D_MAP_UNSET):
+    def build(
+        target,
+        Lx=None,
+        Ly=None,
+        Lz=_ONE_D_MAP_UNSET,
+        mode=None,
+        *,
+        L_x=None,
+        L_y=None,
+        L_z=_ONE_D_MAP_UNSET,
+        finder=None,
+        gate_stream=None,
+        gates=None,
+        layout_kwargs=None,
+        finder_base_mode=None,
+    ):
         """Build ``(one_d_to_lattice, lattice_to_one_d)`` for a traversal mode.
 
         This can be called either as ``OneDMap.build(Lx, Ly, ...)`` or on an
         instance, e.g. ``OneDMap(Lx, Ly, mode="row-major").build()``.
         Instance calls can override options per use, for example
         ``mapper.build(mode="snake")``.
+
+        ``mode="finder"`` composes an MPS gate-stream layout with the base
+        lattice traversal. Supply ``gate_stream=``/``gates=`` or a previously
+        constructed MPS layout ``finder=``. The finder only analyzes supports
+        and returns a site permutation; it never allocates or truncates an MPS.
         """
         cls = target if isinstance(target, type) else type(target)
+        if gate_stream is not None and gates is not None:
+            raise TypeError("pass only one of gate_stream= or gates=.")
+        if gates is not None:
+            gate_stream = gates
+        if not isinstance(target, type):
+            if finder is None:
+                finder = target.finder
+            if gate_stream is None:
+                gate_stream = target.gate_stream
+            if layout_kwargs is None:
+                layout_kwargs = target.layout_kwargs
+            if finder_base_mode is None:
+                finder_base_mode = target.finder_base_mode
+        if finder_base_mode is None:
+            finder_base_mode = "snake"
         Lx, Ly, Lz, mode_norm = cls._resolve_call_params(
             target,
             Lx=Lx,
@@ -368,6 +514,18 @@ class OneDMap:
             L_y=L_y,
             L_z=L_z,
         )
+
+        if mode_norm == "finder":
+            coords = cls._coords_from_mps_finder(
+                Lx,
+                Ly,
+                Lz,
+                finder=finder,
+                gate_stream=gate_stream,
+                layout_kwargs=layout_kwargs,
+                finder_base_mode=finder_base_mode,
+            )
+            return cls._coords_to_maps(coords)
 
         if mode_norm == "snake":
             coords = (
@@ -589,6 +747,11 @@ class OneDMap:
         L_x=None,
         L_y=None,
         L_z=_ONE_D_MAP_UNSET,
+        finder=None,
+        gate_stream=None,
+        gates=None,
+        layout_kwargs=None,
+        finder_base_mode=None,
         print_out=False,
         ax=None,
         title=None,
@@ -614,7 +777,26 @@ class OneDMap:
             L_y=L_y,
             L_z=L_z,
         )
-        one_d_to_lattice, lattice_to_one_d = cls.build(Lx, Ly, Lz=Lz, mode=mode_norm)
+        if not isinstance(target, type):
+            if finder is None:
+                finder = target.finder
+            if gate_stream is None:
+                gate_stream = target.gate_stream
+            if layout_kwargs is None:
+                layout_kwargs = target.layout_kwargs
+            if finder_base_mode is None:
+                finder_base_mode = target.finder_base_mode
+        one_d_to_lattice, lattice_to_one_d = cls.build(
+            Lx,
+            Ly,
+            Lz=Lz,
+            mode=mode_norm,
+            finder=finder,
+            gate_stream=gate_stream,
+            gates=gates,
+            layout_kwargs=layout_kwargs,
+            finder_base_mode=finder_base_mode,
+        )
         if Lz is not None:
             raise NotImplementedError(
                 "OneDMap.show() is currently only available for 2D lattices."

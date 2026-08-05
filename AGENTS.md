@@ -65,6 +65,54 @@ Before changing a specialized subsystem, read its skill:
 Keep domain-specific invariants in those skills or their direct references;
 do not duplicate them here.
 
+## Native fermionic tree QR policy
+
+The native `TreeTensorNetwork` QR policy is centralized in
+`TreeTensorNetwork._native_qr_split` and `_native_qr_options`:
+
+- Every lossless QR split on native Symmray tree tensors must use
+  `_native_qr_split`; do not add a direct `tensor.split(method="qr")` call to a
+  native tree route.
+- The helper sets `stabilized=False` only for Symmray block-sparse tensors.
+  Symmray's stabilized QR phase-normalizes each diagonal of `R`; an exact
+  structural-zero diagonal makes that phase `0 / |0|`, which can become NaN in
+  `complex64`. Dense tensors retain Quimb's normal stabilized-QR default.
+- Network-level canonicalization, which does not expose one tensor at a time,
+  obtains the same option from `_native_qr_options()` when the tree is
+  fermionic. Keep this policy aligned if another native canonicalization route
+  is added.
+- Skipping the phase convention is lossless: `Q @ R` is unchanged, and the
+  resulting `left_inds` isometry metadata remains valid. Native truncating
+  compression still uses the explicit graded SVD and its configured cutoff.
+- This safeguard is scoped to `TreeTensorNetwork` / `TreeOptimizer`. It does
+  not change the separate `MpsOptimizer` QR implementation or globally patch
+  Quimb/Symmray.
+
+## Native TreeMPO contract
+
+The tree-native operator API lives in `pepsy.optimizers.tree.operators`:
+
+- `TreeMPO` is the primary tree measurement object. Prefer
+  `TreePlan.to_tree_mpo(...)` or `Fermion.to_tree_mpo(..., tree=plan)` when the
+  consumer is a `TreeTensorNetwork`.
+- `TreePlan.to_mpo(...)` and `tree_mpo(...)` remain compatibility constructors
+  for the ordinary low-bond chain MPO. They attach the `TreeMPO`, but the
+  chain MPO is never moved into the tree, densified, or used as the tree
+  operator during `expectation_mpo_exact`.
+- Neutral native term sums are factorized from their native Symmray tensors on
+  each term's TreePlan Steiner subtree and amalgamated into one direct-sum
+  TTNO. Do not replace this with a Jordan--Wigner dense factorization or a
+  list of ordinary hyperedges. The compact eta-pair observable is an explicit
+  structured exception with its four-state TTNO automaton.
+- `TreeMPO.expectation(...)` and `TreeTensorNetwork.expectation_mpo_exact(...)`
+  contract separate bra, operator, and ket networks. `TreeMPO.canonicalize()`
+  is lossless native QR gauge fixing; `TreeMPO.compress(...)` is the explicit
+  native graded SVD truncation stage.
+- Native operator QR must use the shared `_native_qr_split_tensor` policy (and
+  therefore the same `stabilized=False` structural-zero safeguard as the
+  state). Do not add direct `tensor.split(method="qr")` calls to TreeMPO
+  canonicalization.
+
 ## Dependency and backend rules
 
 - Prefer public `quimb`, `cotengra`, `cotengrust`, and `autoray` APIs over
@@ -78,6 +126,23 @@ do not duplicate them here.
 - Preserve backend, dtype, device, canonical-center, and tensor-network tag
   invariants. Emit explicit warnings for intentional compatibility coercions.
 - Do not vendor upstream internals.
+
+## Cyclic CTMRG compatibility
+
+- Use `pepsy.boundary.quimb_ctmrg_projector_compat` around Quimb CTMRG calls
+  for cyclic PEPS/PEPO networks whose effective bond dimensions can vary,
+  especially native U(1) term-by-term replays.
+- This is a scoped compatibility context: it redirects projector insertion to
+  the current network and restores Quimb's method on exit. It does not modify
+  installed `site-packages`, alter boundary-MPS contractions, or replace
+  CTMRG with MPS.
+- Keep the workaround at the Pepsy boundary API. Do not copy Quimb's CTMRG
+  implementation into Pepsy or edit the installed Quimb source. Add a focused
+  regression test when changing the compatibility behavior.
+- The shared CTMRG entry points already apply this context for
+  `contract_flat(..., method="ctmrg")`, native Torch PEPS VMC models with
+  `contraction="ctmrg"`, and the NetKet/JAX PEPS amplitude validation path.
+  Keep exact, HOTRG, and boundary-MPS routes independent of this workaround.
 
 ## Documentation and skills
 

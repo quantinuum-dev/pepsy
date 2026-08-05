@@ -26,15 +26,15 @@ def _backend_scalar(value):
         if shape != ():
             raise TypeError(f"Expected a scalar-like value, got shape {shape}.")
 
-    obj = value
-    for method_name in ("detach", "cpu"):
-        method = getattr(obj, method_name, None)
-        if callable(method):
-            obj = method()
-
-    get = getattr(obj, "get", None)
-    if callable(get) and shape is not None:
-        obj = get()
+    if shape is not None:
+        try:
+            obj = ar.to_numpy(value)
+        except Exception:
+            # Keep supporting duck-typed scalar wrappers with ``item`` but no
+            # registered Autoray backend.
+            obj = value
+    else:
+        obj = value
 
     item = getattr(obj, "item", None)
     if callable(item) and not isinstance(obj, _SCALAR_TYPES):
@@ -56,9 +56,8 @@ def to_float(value, *, real=True):
     """Convert a scalar-like backend value to a Python ``float``.
 
     The input can be a Python scalar, NumPy scalar or scalar array, or a
-    scalar-like backend tensor. Torch-style values are detached and moved to
-    CPU before extracting ``.item()``; CuPy-style values are host-transferred
-    with ``.get()`` when available. Non-scalar arrays raise ``TypeError``.
+    scalar-like backend tensor. Autoray converts backend scalar arrays to host
+    NumPy before extracting ``.item()``. Non-scalar arrays raise ``TypeError``.
 
     Parameters
     ----------
@@ -115,6 +114,135 @@ def resolve_backend_sample_data_from_tn(tn):
     return None
 
 
+def _is_symmray_array(value):
+    """Return whether ``value`` is a Symmray block-sparse array."""
+    return (
+        type(value).__module__.split(".", 1)[0] == "symmray"
+        or hasattr(value, "blocks") and hasattr(value, "indices")
+    )
+
+
+def _symmray_block_signatures(value):
+    """Return backend signatures for the raw arrays held by a Symmray value."""
+    blocks = getattr(value, "blocks", None)
+    if not blocks:
+        return ()
+    signatures = []
+    for block in blocks.values():
+        backend, dtype = infer_backend_and_dtype(block)
+        device = getattr(block, "device", None)
+        signatures.append(
+            (backend, str(dtype), None if device is None else str(device))
+        )
+    return tuple(signatures)
+
+
+def infer_backend_signature(sample_data):
+    """Infer comparable backend, dtype, device, and Symmray-block metadata.
+
+    Dense arrays return the traditional ``(backend, dtype, device)`` tuple.
+    Symmray arrays return ``(symmray, dtype, device, block_backend)`` where
+    ``block_backend`` is the backend of their raw charge-sector blocks.  The
+    extra field is essential: ``ar.infer_backend`` intentionally reports the
+    structured Symmray container rather than the Torch/CuPy backend used by
+    its blocks.
+    """
+    if sample_data is None:
+        raise ValueError("Cannot infer backend: sample_data is None.")
+
+    try:
+        backend, dtype = infer_backend_and_dtype(sample_data)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        # Untyped Python sequences are convenience inputs. Treat them as
+        # non-backend data so callers can materialize them on the state
+        # backend without emitting a transfer warning.
+        try:
+            array = np.asarray(sample_data)
+            dtype = ar.get_dtype_name(array)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise TypeError(
+                "Could not infer a backend or dtype from the supplied array."
+            ) from exc
+        return "builtins", str(dtype), None
+    device = getattr(sample_data, "device", None)
+    device = None if device is None else str(device)
+    if backend != "symmray" and not _is_symmray_array(sample_data):
+        return backend, str(dtype), device
+
+    block_signatures = _symmray_block_signatures(sample_data)
+    if block_signatures:
+        unique = set(block_signatures)
+        if len(unique) != 1:
+            raise TypeError(
+                "Symmray arrays must use one underlying backend, dtype, and "
+                f"device; found {sorted(unique)!r}."
+            )
+        block_backend, block_dtype, block_device = block_signatures[0]
+        # The raw block dtype/device is authoritative for a structured array.
+        dtype = block_dtype
+        device = block_device
+    else:
+        block_backend = str(getattr(sample_data, "backend", "symmray"))
+    return "symmray", str(dtype), device, str(block_backend)
+
+
+def _backend_data_values(value):
+    """Return array payloads from an array, tensor, or tensor network."""
+    tensor_map = getattr(value, "tensor_map", None)
+    if tensor_map is not None:
+        values = tuple(
+            getattr(tensor, "data", None) for tensor in tensor_map.values()
+        )
+        return tuple(data for data in values if data is not None)
+
+    tensors = getattr(value, "tensors", None)
+    if tensors is not None and not hasattr(value, "shape"):
+        values = tuple(getattr(tensor, "data", None) for tensor in tensors)
+        return tuple(data for data in values if data is not None)
+
+    data = getattr(value, "data", None)
+    if data is not None and hasattr(data, "shape") and hasattr(data, "dtype"):
+        return (data,)
+    return (value,)
+
+
+def backend_infer(value):
+    """Infer and validate backend metadata from an array or tensor network.
+
+    Parameters
+    ----------
+    value
+        An array-like payload, Quimb tensor, or tensor network such as an MPS
+        or :class:`TreeTensorNetwork`. For a tensor network, every tensor is
+        checked for one common backend, dtype, and device.
+
+    Returns
+    -------
+    dict
+        The normalized metadata mapping ``backend``, ``dtype``, and
+        ``device``. Native Symmray arrays additionally include
+        ``array_backend`` for their underlying NumPy, Torch, or CuPy blocks.
+    """
+    values = _backend_data_values(value)
+    if not values:
+        raise ValueError("Cannot infer backend: value contains no tensors.")
+
+    signatures = tuple(infer_backend_signature(data) for data in values)
+    signature = signatures[0]
+    mismatched = tuple(candidate for candidate in signatures[1:] if candidate != signature)
+    if mismatched:
+        raise TypeError(
+            "Backend arrays must use one compatible backend, dtype, and "
+            f"device; found {signature!r} and {mismatched[0]!r}."
+        )
+
+    backend, dtype, device = signature[:3]
+    info = {"backend": backend, "dtype": dtype, "device": device}
+    if len(signature) > 3:
+        info["array_backend"] = signature[3]
+    return info
+
+
 def infer_backend_and_dtype(sample_data):
     """Infer backend name and dtype name from sample tensor data."""
     if sample_data is None:
@@ -132,7 +260,7 @@ def _build_to_numpy(sample_data, dtype_name, *, cast_complex_to_real=False):
     dtype = _NUMPY_DTYPE_MAP[dtype_name]
 
     def _to_numpy(x, dtype=dtype, cast_complex_to_real=cast_complex_to_real):
-        arr = np.asarray(x)
+        arr = np.asarray(ar.to_numpy(x))
         if cast_complex_to_real and np.issubdtype(dtype, np.floating) and np.iscomplexobj(arr):
             arr = arr.real
         target_dtype = dtype
@@ -260,13 +388,15 @@ def _build_to_jax(sample_data, dtype_name, *, cast_complex_to_real=False):
         device=device,
         cast_complex_to_real=cast_complex_to_real,
     ):
-        # Torch tensors need explicit host conversion before jnp.asarray.
         try:
-            import torch  # pylint: disable=import-outside-toplevel
-        except ImportError:  # pragma: no cover - optional dependency
-            torch = None
-        if torch is not None and isinstance(x, torch.Tensor):
-            x = x.detach().cpu().numpy()
+            # JAX accepts NumPy inputs directly, while Autoray provides the
+            # explicit host boundary for Torch/CuPy and other array backends.
+            if ar.infer_backend(x) != "jax":
+                x = ar.to_numpy(x)
+        except Exception:
+            # Preserve support for custom array-likes which JAX can consume
+            # even though Autoray cannot infer their namespace.
+            pass
 
         arr = jnp.asarray(x)
 
@@ -334,6 +464,29 @@ def infer_backend_converter_from_sample(
         return None
 
     backend, dtype_name = infer_backend_and_dtype(sample_data)
+    if backend == "symmray" or _is_symmray_array(sample_data):
+        blocks = getattr(sample_data, "blocks", None) or {}
+        block_sample = next(iter(blocks.values()), None)
+        if block_sample is None:
+            return None
+        block_converter = infer_backend_converter_from_sample(
+            block_sample,
+            cast_complex_to_real=cast_complex_to_real,
+        )
+        if block_converter is None:
+            return None
+
+        def _to_symmray_or_block(value):
+            # Network-level ``apply_to_arrays`` callbacks may receive raw
+            # sector blocks, while public payload conversion receives the
+            # structured Symmray object. Support both call sites.
+            if _is_symmray_array(value):
+                converted = value.copy()
+                converted.apply_to_arrays(block_converter)
+                return converted
+            return block_converter(value)
+
+        return _to_symmray_or_block
     try:
         return dispatch_backend_converter(
             backend=backend,

@@ -8,10 +8,15 @@ does not need to import or own a particular sampler implementation.
 from __future__ import annotations
 
 import inspect
+import time
 
 from ._common import _as_long_matrix, _model_device, _proposal_log_probabilities
 from .amplitude import _call_amplitude_fn
-from .results import TorchVMCImportanceEstimate
+from .results import (
+    TorchImportanceSamples,
+    TorchVMCImportanceEstimate,
+    _torch_sample_provenance,
+)
 from ..torch_types import (
     FermionSiteEncoding,
     SpinlessSiteEncoding,
@@ -19,7 +24,7 @@ from ..torch_types import (
     _require_torch,
 )
 
-__all__ = ["measure_from_proposal"]
+__all__ = ["measure_from_proposal", "sample_from_proposal"]
 
 
 def _target_site_order(driver, site_order):
@@ -353,6 +358,7 @@ def _bridge_samples(
     progress,
     sample_kwargs,
     amplitude_floor,
+    amplitude_cache=None,
 ):
     torch = _require_torch()
     device = _model_device(driver.model)
@@ -380,11 +386,18 @@ def _bridge_samples(
     if amplitude_floor < 0:
         raise ValueError("amplitude_floor must be non-negative.")
     with torch.no_grad():
-        amplitudes = _call_amplitude_fn(
-            driver.model,
-            configs,
-            chunk_size=getattr(driver, "chunk_size", None),
-        )
+        if amplitude_cache is None:
+            amplitudes = _call_amplitude_fn(
+                driver.model,
+                configs,
+                chunk_size=getattr(driver, "chunk_size", None),
+            )
+        else:
+            amplitudes = amplitude_cache.evaluate(
+                driver.model,
+                configs,
+                chunk_size=getattr(driver, "chunk_size", None),
+            )
     amp_abs = amplitudes.abs()
     valid = torch.isfinite(amp_abs) & (amp_abs > float(amplitude_floor)) & torch.isfinite(log_q)
     if not bool(torch.any(valid)):
@@ -393,6 +406,59 @@ def _bridge_samples(
             "VMC amplitude and proposal probability."
         )
     return configs[valid], amplitudes[valid], log_q[valid], int(configs.shape[0])
+
+
+def sample_from_proposal(
+    driver,
+    proposal,
+    *,
+    n_samples=128,
+    seed=None,
+    fermion=None,
+    one_d_to_two_d=None,
+    site_order=None,
+    occupation_map=None,
+    sample_kwargs=None,
+    progress=False,
+    amplitude_floor=0.0,
+    amplitude_cache=None,
+):
+    """Draw and bridge reusable samples from an MPS, BP, tree, or proposal.
+
+    The resulting :class:`TorchImportanceSamples` stores PEPS-code
+    configurations, the fixed proposal density ``log q(x)``, and the current
+    target amplitudes. Pass it to :meth:`TorchVMCDriver.measure_samples` (or
+    :meth:`TorchFermionVMC.measure`) to estimate any number of observables
+    without drawing the MPS proposal again.
+    """
+    n_samples = _check_positive_int("n_samples", n_samples)
+    start = time.perf_counter()
+    configs, amplitudes, log_q, n_drawn = _bridge_samples(
+        driver,
+        proposal,
+        n_samples=n_samples,
+        seed=seed,
+        fermion=fermion,
+        one_d_to_two_d=one_d_to_two_d,
+        site_order=site_order,
+        occupation_map=occupation_map,
+        progress=progress,
+        sample_kwargs=sample_kwargs,
+        amplitude_floor=amplitude_floor,
+        amplitude_cache=amplitude_cache,
+    )
+    elapsed = time.perf_counter() - start
+    n_valid = int(configs.shape[0])
+    return TorchImportanceSamples(
+        configs=configs,
+        amplitudes=amplitudes,
+        proposal_log_probs=log_q,
+        n_samples=n_valid,
+        n_drawn=n_drawn,
+        elapsed_seconds=elapsed,
+        samples_per_second=n_valid / elapsed if elapsed > 0 else float("inf"),
+        target_provenance=_torch_sample_provenance(driver.model),
+    )
 
 
 def measure_from_proposal(
@@ -411,16 +477,10 @@ def measure_from_proposal(
     amplitude_floor=0.0,
     profile=False,
     deduplicate=True,
+    amplitude_cache=None,
 ):
-    """Measure VMC observables from an MPS, BP, tree, or proposal batch.
-
-    The returned value is exactly the result of
-    :meth:`TorchVMCDriver.measure_samples`: one
-    :class:`TorchVMCEnergyEstimate` for the default Hamiltonian or a mapping
-    of estimates when ``observables`` is supplied.
-    """
-    n_samples = _check_positive_int("n_samples", n_samples)
-    configs, amplitudes, log_q, _ = _bridge_samples(
+    """Compatibility one-shot wrapper around sample then measure."""
+    samples = sample_from_proposal(
         driver,
         proposal,
         n_samples=n_samples,
@@ -429,17 +489,18 @@ def measure_from_proposal(
         one_d_to_two_d=one_d_to_two_d,
         site_order=site_order,
         occupation_map=occupation_map,
-        progress=progress,
         sample_kwargs=sample_kwargs,
+        progress=progress,
         amplitude_floor=amplitude_floor,
+        amplitude_cache=amplitude_cache,
     )
     return driver.measure_samples(
-        configs,
+        samples,
         observables=observables,
-        amplitudes=amplitudes,
-        proposal_log_probs=log_q,
         profile=profile,
         deduplicate=deduplicate,
+        progress=progress,
+        amplitude_cache=amplitude_cache,
     )
 
 

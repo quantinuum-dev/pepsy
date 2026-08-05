@@ -1,4 +1,4 @@
-"""Local-term normalization for MERA energy objectives."""
+"""Local-term normalization for qMERA energy objectives."""
 
 from __future__ import annotations
 

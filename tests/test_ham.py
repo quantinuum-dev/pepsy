@@ -49,6 +49,83 @@ def test_build_mpo_accepts_mapper_override():
     assert np.allclose(mpo_from_override.to_dense(), mpo_from_mapper_builder.to_dense())
 
 
+def test_build_mpo_and_pepo_accept_native_fermion_terms_with_mapper():
+    """Hamiltonian builders forward OneDMap and native fermion terms together."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    left = (0, 0)
+    right = (2, 1)
+    term = fermion.operator_term(
+        [(1.0, ((left, "double"), (right, "annihilate_up")))],
+        sites=(left, right),
+        label="ham_builder_charged",
+    )
+    mapper = OneDMap(3, 2, mode="snake-row-major")
+    builder = py.ham_tn(
+        Lx=3,
+        Ly=2,
+        mapper=mapper,
+        data_type="complex128",
+    )
+
+    mpo = builder.build_mpo(
+        {(left, right): term},
+        fermion=fermion,
+        fermionic=True,
+        compress_each=False,
+    )
+    pepo = builder.build_pepo(
+        {(left, right): term},
+        fermion=fermion,
+        fermionic=True,
+        compress_each=False,
+    )
+
+    assert mpo.L == 6
+    assert pepo.Lx == 3
+    assert pepo.Ly == 2
+    assert list(pepo)[-1].data.charge == term.charge
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
+
+
+def test_build_mpo_and_pepo_return_mixed_charge_sectors():
+    """Hamiltonian builders expose mixed native charges explicitly."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    left = (0, 0)
+    middle = (0, 1)
+    right = (1, 1)
+    neutral = fermion.hopping_operator()
+    charged = fermion.operator_term(
+        [(1.0, ((middle, "double"), (right, "annihilate_up")))],
+        sites=(middle, right),
+        label="ham_builder_mixed_charge",
+    )
+    terms = {(left, middle): neutral, (middle, right): charged}
+    mapper = OneDMap(2, 2, mode="snake-row-major")
+    builder = py.ham_tn(Lx=2, Ly=2, mapper=mapper, data_type="complex128")
+
+    mpo_sectors = builder.build_mpo(
+        terms,
+        fermion=fermion,
+        fermionic=True,
+        charge_sectors=True,
+        compress_each=False,
+    )
+    pepo_sectors = builder.build_pepo(
+        terms,
+        fermion=fermion,
+        fermionic=True,
+        charge_sectors=True,
+        compress_each=False,
+    )
+
+    assert set(mpo_sectors) == {fermion.zero_charge, charged.charge}
+    assert set(pepo_sectors) == {fermion.zero_charge, charged.charge}
+    assert all(mpo.L == 4 for mpo in mpo_sectors.values())
+    assert all(pepo.Lx == 2 and pepo.Ly == 2 for pepo in pepo_sectors.values())
+
+
 def test_build_mpo_uses_canonical_ops_sites_coeff_order():
     """build_mpo should accept the canonical (ops, sites, coeff) term order."""
     builder = py.ham_tn(Lx=2, Ly=2, data_type="complex128")
@@ -540,6 +617,46 @@ def test_map_builder_instance_style_can_override_mode_per_call():
     assert map_[0] == (0, 0)
     assert map_[1] == (0, 1)
     assert map_[2] == (1, 1)
+
+
+def test_map_builder_finder_composes_mps_site_order_with_lattice_coords():
+    """Finder mode should map optimized MPS positions back to coordinates."""
+    base_idx2coo, _ = OneDMap(2, 2, mode="snake").build()
+    plan = {"site_order": (2, 0, 3, 1)}
+    mapper = OneDMap(2, 2, mode="finder", finder=plan)
+
+    idx2coo, coo2idx = mapper.build()
+
+    assert idx2coo == {
+        position: base_idx2coo[logical_site]
+        for position, logical_site in enumerate(plan["site_order"])
+    }
+    assert coo2idx == {coord: position for position, coord in idx2coo.items()}
+
+
+def test_map_builder_finder_mode_runs_mps_layout_finder():
+    """Finder mode should accept a gate stream without touching an MPS state."""
+    gates = [
+        (quimb.CNOT(), (0, 3)),
+        (quimb.CNOT(), (3, 1)),
+    ]
+    mapper = OneDMap(
+        2,
+        2,
+        mode="finder",
+        gates=gates,
+        layout_kwargs={"order": "input"},
+    )
+
+    idx2coo, _ = mapper.build()
+
+    assert idx2coo == OneDMap(2, 2, mode="snake").build()[0]
+
+
+def test_map_builder_finder_mode_requires_layout_source():
+    """Finder mode should fail clearly when no stream or plan is supplied."""
+    with pytest.raises(ValueError, match="mode='finder'"):
+        OneDMap(2, 2, mode="finder").build()
 
 
 def test_map_builder_instance_style_supports_3d_build():

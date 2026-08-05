@@ -24,7 +24,8 @@ The rooted tree-tensor-network circuit simulator of *Simulating quantum
 circuits using tree tensor networks* (Seitz, Medina, Cruz, Huang, Mendl;
 Quantum 7, 964, 2023; arXiv:2206.01000). The state is a rooted TTN (internal
 nodes of **any arity**; binary is the default, see *Non-binary trees* below)
-whose leaves carry the physical qubit indices; a bundled gate stream
+whose leaves carry physical qubit indices. An optional ``root_qubit`` is instead
+carried by the top tensor; all other physical sites remain leaves. A bundled gate stream
 `[(gate, where), ...]` is replayed. `where` is an `int` (1q) or a pair of `int`
 (2q); supports with `len(where) >= 3` route through
 `apply_subtree_operator` (see *Multi-qubit / sub-MPO application*).
@@ -91,10 +92,12 @@ naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
   `if isinstance(ts, TensorNetwork): super().__init__(ts, **o); return` lets
   the base copy the extra props without the fresh-construction defaults
   clobbering `_plan`.
-- Each leaf tensor carries **both** the structural node tag `N{nid}` and the
-  quimb site tag `I{q}` plus physical index `k{q}`; internal nodes carry only
-  `N{nid}`. So quimb sees the leaves as the `nsites` sites and internal nodes as
-  ancillary bond carriers --
+- Each physical-site tensor carries **both** the structural node tag `N{nid}`
+  and the quimb site tag `I{q}` plus physical index `k{q}`. These tensors are
+  structural leaves by default. When
+  `plan.root_qubit` is set, the root carries that site tag/index too; other
+  internal nodes carry only `N{nid}`. So quimb sees the leaf sites and optional
+  root site as `nsites`, with remaining internal nodes as ancillary bond carriers --
   `ttn.local_expectation(G, where=[q], max_bond=None, optimize="auto")` uses
   the tree's canonical contraction for dense states and an exact complete
   doubled-tree contraction for native fermionic states.
@@ -103,8 +106,8 @@ naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
 - Builders: `from_plan(plan)` (product `|0...0>`), `from_order(order,
   structure=...)` (plan + product in one call), `rand(plan, D=, seed=,
   canonicalize=True)` (random state, canonicalised around the root).
-- `show()` prints a top-down ASCII tree (root on top, qubit leaves `◆ q{q}` at
-  the bottom, internal `●`, each branch annotated with its bond dim);
+- `show()` prints a top-down ASCII tree (root on top, structural leaves at the
+  bottom, physical nodes labelled `q{q}`, each branch annotated with its bond dim);
   `ascii_tree()` returns that string. `TreeOptimizer.show()` delegates to it.
 - `TreeOptimizer.tn` **is** a `TreeTensorNetwork`; the optimizer delegates
   `_phys->tn.site_ind`, `_tag->tn.node_tag`, `_tid->tn.node_tid`,
@@ -117,13 +120,15 @@ naming, so all inherited quimb methods (`canonize_around`, `canonize_between`,
 - Node ids are ints from `TreePlan`. Tensor tag = `N{nid}` (`TreeTensorNetwork.
   node_tag`, via optimizer `_tag`).
 - Physical index of qubit `q` = `k{q}` (`TreeTensorNetwork.site_ind`, via
-  optimizer `_phys`) -- ket-leg convention. Leaves also carry site tag `I{q}`.
+  optimizer `_phys`) -- ket-leg convention. Physical nodes also carry site tag
+  `I{q}`. Resolve their geometry with `plan.node_of_qubit[q]`; use
+  `leaf_of_qubit` only when a true structural leaf is required.
 - Newly created virtual bonds between adjacent nodes `u,v` use `_tb{lo}_{hi}`
   with `lo<hi` (`optimizer._bond_name`), but Quimb may mint UUIDs during
   threading or canonicalisation. `TreeTensorNetwork.bond(u, v)` resolves the
   live shared index; use it for diagnostics and readout.
 - `plan.node_path(a, b)` is the inclusive node-id geodesic (unique in a tree);
-  `plan.tree_distance(qa, qb)` is the leaf-to-leaf path length.
+  `plan.tree_distance(qa, qb)` is the physical-node path length.
 
 ## Canonical-centre contract (core invariant)
 
@@ -150,6 +155,15 @@ telescopes to identity between bra and ket.
   `shift_orthogonality_center` first peels that region with lossless QR and
   then walks only the remaining path. Do not regress this regional recovery to
   an unconditional O(N) recanonicalisation.
+- Local isometry proofs live only on each tensor's ``left_inds``.
+  `TreeTensorNetwork.isometry_direction` / `isometry_map` derive read-only
+  orientations, `can_skip_canonize` recognizes an already-proven dense edge or
+  a native Symmray edge with aligned charge maps, and
+  `validate_isometry_metadata` checks alignment with the canonical region.
+  `TreeOptimizer` delegates these methods; never add a second mutable
+  optimizer-owned orientation map. Native fermionic edges fall back to
+  explicit graded QR when the proof is absent or malformed; positive-cutoff or
+  over-cap native compression still uses the explicit graded SVD.
 - `ttn.is_canonical_form(center)` verifies the invariant directly (every
   non-centre tensor is an isometry toward the centre) — use it in tests/diagnostics.
 - A freshly built product state is **already canonical at the root** (all
@@ -170,7 +184,13 @@ telescopes to identity between bra and ket.
   doubled tree. Native fermionic states use a one-tensor
   `TensorNetwork.H` contraction when a centre is known, so Symmray applies the
   graded outer-leg phase flips; unknown-centre fermionic states use the exact
-  complete doubled-network contraction. Keep the backend dispatch separate.
+  complete doubled-network contraction. Known-centre fast paths multiply the
+  raw centre norm by Quimb's extracted `10 ** tn.exponent`; full contractions
+  already apply it. During non-unitary replay, `normalize_every` /
+  `normalize_final` normalize only the raw working centre and accumulate its
+  removed scale in that exponent, preserving the represented state. Public
+  `normalize()` is physical renormalization and clears the exponent. Keep the
+  backend dispatch separate.
 - Any operation that moves/rebuilds the centre must update the tracked centre
   (via `self.center = ...`, i.e. `ttn.orthogonality_center`).
 
@@ -191,7 +211,7 @@ one-node case.
   connected subtree via `ttn.subtree_span(nodes)` (union of tree paths from
   `nodes[0]`; generalises `steiner_nodes` to arbitrary internal nodes).
 - `ttn.canonize_around_qubits_(qubits)` is the qubit-level "range" entry point =
-  `canonize_subtree_(leaves_of(qubits), span=True)`.
+  `canonize_subtree_(nodes_of(qubits), span=True)`.
 - `ttn.is_subtree_canonical_form(nodes=None, span=False)` verifies every outside
   tensor is an inward isometry (defaults to the tracked region);
   `is_canonical_form` is its one-node case and delegates to it.
@@ -206,11 +226,11 @@ This is the paper's accuracy point (Figs. 3-6) -- do not regress it.
 
 1. SVD-split the gate into left/right factors joined by a virtual bond
    (`cutoff=0.0`, exact rank `k <= 4`).
-2. Move the centre to leaf `a`, absorb the left factor into `a`.
-3. Thread the virtual bond **exactly** along the geodesic to leaf `b` via
+2. Move the centre to physical node `a`, absorb the left factor into `a`.
+3. Thread the virtual bond **exactly** along the geodesic to physical node `b` via
    `_thread_hop` (economical **QR**, lossless, `absorb="right"`); the crossed
    bond grows transiently by at most `k <= 4`.
-4. Absorb the right factor into leaf `b`.
+4. Absorb the right factor into physical node `b`.
 5. Only now run `_compress_path` -- a single canonical compression sweep back
    along the geodesic, truncating every touched bond to `chi`.
 
@@ -223,9 +243,15 @@ forwarded to the SVD and raises `TypeError`). Unique `rand_uuid()` bonds avoid
 
 Native fermionic trees take an isolated version of this kernel:
 `_fermionic_thread_hop` explicitly calls the native Symmray QR and carries its
-graded factor, while `TreeTensorNetwork._fermionic_compress_edge_` forms the
-two-node tensor and performs the native block SVD. Dense/nonfermionic trees
-retain the generic Quimb edge wrappers.
+graded factor. `TreeTensorNetwork._fermionic_compress_edge_` uses a reduced
+graded core: when the destination endpoint is proven isometric, it QR-splits
+the active endpoint and SVDs only its `R` factor; otherwise it QR-reduces both
+endpoints and SVDs their contracted core. Only an unrecognised reduction hint
+falls back to the complete two-node SVD. The reduction hint must remain
+separate from the destination tensor object, and the one-sided split must use
+fresh intermediate bond names before restoring the live edge label. See the
+performance reference for the algebra and profiling evidence. Dense/nonfermionic
+trees retain the generic Quimb edge wrappers.
 
 ### Sibling-leaf fast path (`_apply_2q_sibling_factors`)
 
@@ -249,9 +275,10 @@ spanning subtree: the tree analogue of a sub-MPO applied over a
 covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductState`
 -only; the tree base `TensorNetworkGenVector` has no such method).
 
-1. `snodes = _steiner_nodes(leaves)` -- minimal connected subtree spanning the
-   target leaves.
-2. Move the centre onto a target leaf (`_move_center(leaves[0])`, incremental)
+1. `snodes = _steiner_nodes(site_nodes)` -- minimal connected subtree spanning
+   the target physical nodes.
+2. Move the centre onto a target physical node
+   (`_move_center(site_nodes[0])`, incremental)
    so the **whole exterior is isometric toward the subtree**.
 3. Factor `op` into an exact tree-MPO on the same Steiner tree by packing each
    `(output,input)` physical pair into a dimension-four leg and applying
@@ -261,9 +288,16 @@ covering range then compressed (quimb's `gate_with_submpo` is `MatrixProductStat
    physical and exterior state legs, then contract its new state bond into the
    parent together with the old state/operator bonds. No dense state tensor for
    the whole Steiner subtree is formed; the last node is the hub.
-5. Recover the hub centre by QR, then make one depth-first canonical SVD sweep:
-   every affected tree edge is truncated once, after the complete operator has
-   arrived. `renormalize=True` renormalises afterwards (for Kraus/projection).
+5. Install every routed Q factor with its ``left_inds`` isometry metadata.
+   Dense trees and charge-aligned native Symmray trees can then recover the
+   hub centre through the normal canonical state machine without repeating
+   those QRs; missing or malformed native proofs use explicit graded QR.
+   Finally make one depth-first canonical SVD sweep: every affected tree edge
+   is truncated once, after the complete operator has arrived. Dense path and
+   subtree sweeps select one-sided ``reduced="left"`` compression only when
+   the destination tensor's live ``left_inds`` proves the required isometry;
+   native graded compression keeps its explicit block-SVD semantics.
+   `renormalize=True` renormalises afterwards (for Kraus/projection).
 
 State bonds are always read from the live tensors because gate application can
 rename them. New state message bonds are fresh per-update names, while operator
@@ -296,7 +330,7 @@ interface use the dense `to_dense()` fallback and remain subject to
   when the gauge is unknown; native readout leaves the gauge untouched.
   Normalized native readout reuses a state-versioned norm denominator until a
   mutation invalidates it.
-- `measure(q, outcome=None)`: move centre to the leaf, read exact Born
+- `measure(q, outcome=None)`: move centre to the physical node, read exact Born
   probabilities from that one tensor (`w_i = sum_bond |t[i,bond]|^2`,
   normalise), sample via `self.rng.choice` or force `outcome`, project with a
   one-hot `apply_1q`, then `normalize()`. Returns the outcome bit. `reset(q)` =
@@ -306,14 +340,18 @@ interface use the dense `to_dense()` fallback and remain subject to
   `cap`, `reset`, and `measure_reset`. Pauli measurements support product observables
   on distinct qubits, use `+1`/`-1` eigenvalue outcomes, and append
   `(pauli, where, outcome, probability)` to `measurements`; reset measurements
-  are internal and are not recorded. A cap contracts and removes one leaf,
-  compacts labels above it by default, and absorbs into the unique tree parent;
+  are internal and are not recorded. A cap contracts and removes one physical
+  site, compacts labels above it by default, and absorbs a leaf into its unique
+  tree parent; a physical root leg is contracted without removing tree edges;
   `stable_labels=True` / `compact_labels=False` preserves caller-facing labels
   while storage remains compact. `measure_pauli` returns outcome and Born
   probability directly; `project_pauli(..., renormalize=False)` preserves the
   branch norm, and both can return support/span/bond/norm diagnostics.
 - `to_dense()` returns a host NumPy statevector in `k0, k1, ..., k(n-1)` order;
   it is a readout boundary, not evidence that a Torch/CuPy live state moved.
+- `ps_to_ttn`, `hrs_to_ttn`, and `TreeSampler` resolve physical sites through
+  `node_of_qubit`, so an optional root site is constructed and sampled in the
+  same `q0..q(n-1)` order as leaf sites.
 - `run(progbar=True)` shows a tqdm replay bar with one-/two-/multi-qubit
   counts, current bond usage, norm, and a norm-based truncation proxy. Dense and
   native fermionic replay use the same `1 - (norm / reference_norm)^2` proxy;
@@ -348,6 +386,58 @@ interface use the dense `to_dense()` fallback and remain subject to
   `updates` group edge events by support and include cumulative relative loss,
   analogous to the MPS infidelity trace.
 
+### Tree-native MPO API
+
+When the consumer is a `TreeTensorNetwork`, `TreeMPO` is the primary operator
+API. Use `TreePlan.build_tree_operator(...)` or
+`Fermion.build_tree_operator(..., tree=plan)`:
+
+```python
+tree_operator = fermion.build_tree_operator(
+    hamiltonian=hamiltonian,
+    tree=plan,
+    compress=True,
+)
+energy = tree_operator.expectation(tree)
+# equivalent exact readout through the state API:
+energy = tree.expectation_mpo_exact(tree_operator, range(plan.n))
+```
+
+`tree_operator.chain_mpo` is optional compatibility data for ordinary MPS/MPO
+workflows. `TreePlan.to_mpo(...)` and `tree_mpo(...)` remain compatibility
+builders that return that regular chain MPO and attach the `TreeMPO`; they do
+not change the tree contraction route. `to_tree_mpo(...)` remains a
+compatibility alias for `build_tree_operator(...)`.
+The chain MPO must not be moved into the tree, densified, or compressed as a
+state update for exact tree measurement.
+
+`TreeMPO` subclasses Quimb's `TensorNetworkGenOperator`, analogous to
+`TreeTensorNetwork` subclassing `TensorNetworkGenVector`. It is the tree twin
+of Quimb's `MatrixProductOperator`: its public operator surface includes
+`sites`, `nsites`, `site_tag`, `upper_ind`, `lower_ind`, `to_dense`, `H`,
+`copy`, `identity`, `from_dense`, `add_MPO`, `singular_values`, `amplitude`,
+and canonicalize/compress helpers, while `plan`, `node_tensor`, `neighbors`,
+and `bond` provide the branched geometry. It cannot inherit the chain-only
+`MatrixProductOperator` implementation because a tree has no left/right
+ordering; `chain_mpo` remains the separate chain-compatible representation.
+
+Mixed native operator charges are represented as one public `TreeMPO` with one
+homogeneous Symmray tree network per charge in `tree_networks`. Use
+`charge_sectors=True` only when separate `TreeMPO` objects are explicitly
+needed.
+
+For native fermionic Hamiltonians, one-, two-, and higher-site neutral terms
+are fused and factorized from their native Symmray operator tensor over the
+TreePlan Steiner subtree, then amalgamated into one charge-aware direct-sum
+TTNO. This is the normal general-term route and is canonicalizable/compressible;
+it is not a list of ordinary hyperedges. Structured observables may select a
+smaller dedicated TTNO, such as the four-state eta-pair endpoint automaton.
+`TreeMPO.canonicalize()` performs lossless native QR gauge fixing and
+`TreeMPO.compress(cutoff=..., max_bond=...)` performs native graded SVD
+truncation. Native operator QR uses the same centralized
+`_native_qr_split_tensor` policy as tree-state QR, including the
+`stabilized=False` structural-zero safeguard for Symmray arrays.
+
 ## Noisy trajectory replay
 
 `run_trajectory_shots` and `run_coalesced_trajectory_shots` support
@@ -372,7 +462,18 @@ for trajectory simulation without forming a density matrix:
 
 ## Performance and layout
 
-Keep the thread cap, self-healing tensor-id cache, copy semantics, and
+The public performance defaults are ``mode="auto"`` (direct two-site
+threading), ``threads=1`` and ``subtree_workers=1`` (small-TTN operations avoid
+oversubscription), ``profile=False``, and ``track_truncation=False`` (no
+diagnostic spectrum SVDs). The low-level
+``TreeTensorNetwork.compress_edge_`` default is the same ``cutoff_mode="rsum2"``
+used by ``TreeOptimizer``. A ``track_truncation=True`` warning is intentional:
+it identifies the extra diagnostic work; backend conversion warnings and
+legacy-mode deprecations are the other actionable warning classes.
+
+Dense and native trees share the direct one-edge contraction, immutable path
+cache, routed-isometry reuse, and proof-forwarding optimizations. Keep the
+thread cap, self-healing tensor-id cache, copy semantics, and
 TreeLayoutFinder objective plumbing intact. The detailed performance and
 non-binary layout contract is in
 [`references/performance-layout.md`](references/performance-layout.md); read

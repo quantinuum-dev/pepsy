@@ -12,6 +12,21 @@ Pepsy follows [Semantic Versioning](https://semver.org/):
 
 Changes for the next release should be added here before the version is bumped.
 
+### Added
+
+- `SimulatorPlanner` and `recommend_simulator` provide non-executing,
+  chi-aware rankings across MPS, tree, MPS-stabilizer, and tree-stabilizer
+  circuit strategies using physical and dressed-frame support geometry.
+- `TreeOptimizer` and `TreeTensorNetwork.compress_edge_` now accept
+  `cutoff_mode`, allowing Tree truncations to use the same Quimb
+  singular-value cutoff conventions as MPS truncations.
+
+### Fixed
+
+- `TreeOptimizer` non-unitary scale control now preserves removed normalization
+  in the TTN exponent, and fast centre-based norm reads include that exponent,
+  so `normalize_every=True` no longer changes the represented state.
+
 ## [0.4.0] - 2026-07-27
 
 This release removes obsolete package-layout compatibility layers and keeps

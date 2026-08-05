@@ -453,6 +453,9 @@ Symmray optional (the `vmc` extra), so the core package stays lightweight.
   `recommend_netket_vmc_settings`, `choose_netket_chunk_size`, plus the
   `SpinOrbitalColumns` / `PackedFermionicPEPS` / `NetKetVMCSettings` /
   `NetKetChunkSettings` / `NetKetFermiHubbardVMC` dataclasses.
+- `NetKetPEPSVMC.to_peps()` reconstructs the current optimized NetKet/Flax
+  variables as the underlying quimb/Symmray PEPS network, so downstream Pepsy
+  measurement or persistence can resume from an optimized VMC state.
 - Validated end-to-end in
   `../pepsy_examples/fermi_hubbard/fermi_hubbard_vmc.ipynb` (2×2, `t=1`,
   `U=8`, `D=4`, `Z2`, half filling):
@@ -470,18 +473,16 @@ Symmray optional (the `vmc` extra), so the core package stays lightweight.
 
 ### Plan (next Pepsy cuts)
 
-1. `to_peps(variables)` / `update_peps_from_variables(...)` to convert an
-   optimized NetKet state back into a `SymPEPS`.
-2. `benchmark_log_amplitude_batch(...)` timing batch / chunk sizes and
+1. `benchmark_log_amplitude_batch(...)` timing batch / chunk sizes and
    `exact` vs `hotrg` without a full VMC optimization.
-3. `chi_sweep_energy(...)` for HOTRG `chi` convergence of sampled energies.
-4. A GPU example script/notebook that measures after warmup and reports device,
+2. `chi_sweep_energy(...)` for HOTRG `chi` convergence of sampled energies.
+3. A GPU example script/notebook that measures after warmup and reports device,
    memory, batch size, and compile time separately.
-5. `U1U1` and odd-parity `Z2` setup helpers so 3×3 / odd half-filled systems
+4. `U1U1` and odd-parity `Z2` setup helpers so 3×3 / odd half-filled systems
    are not awkward.
-6. Scalable SR: diagonal / iterative / minSR-style paths before dense SR on
+5. Scalable SR: diagonal / iterative / minSR-style paths before dense SR on
    large PEPS parameter counts.
-7. Keep CI tiny and CPU-only; large GPU timing stays in examples.
+6. Keep CI tiny and CPU-only; large GPU timing stays in examples.
 
 Development rule of thumb (from the notebook): reusable NetKet/Symmray glue
 moves into `pepsy.vmc`; physics sanity checks and timing experiments stay in the

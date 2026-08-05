@@ -1,4 +1,4 @@
-# qMERA / MERA Energy Optimizer Design Notes
+# qMERA Energy Optimizer Design Notes
 
 ## Research Anchor
 
@@ -8,23 +8,21 @@ doi:10.1103/PhysRevX.12.011047.
 
 Key design points for Pepsy:
 
-- Dense MERA uses unitary disentanglers and isometric coarse-graining tensors.
-- qMERA/QMERA-B keeps the MERA global structure but decomposes dense unitary and
-  isometric blocks into finite-depth local quantum circuits.
+- qMERA/QMERA-B keeps the MERA RG structure but represents every block as a
+  finite-depth local quantum circuit.
 - The useful controls are `q` or local block width, internal circuit depth, gate
   count, and local circuit structure such as brickwall.
 - The energy objective used in the paper is exact contraction of local
   Hamiltonian terms, with global gradients supplied by automatic
   differentiation through quimb tensor networks.
-- Unitary/isometric constraints should be enforced by differentiable projection
-  from parameters to constrained tensors or by explicit circuit gates.
+- Unitary and symmetry constraints should be enforced by the parameterized
+  circuit gate families themselves.
 
 ## Current Pepsy State
 
-As of July 2026, Pepsy has a real `src/pepsy/optimizers/mera/` package rather
+As of July 2026, Pepsy has a real `src/pepsy/optimizers/qmera/` package rather
 than only a design sketch. The important implemented pieces are:
 
-- dense/isometric `MeraEnergyOptimizer` for MERA-like tensor networks;
 - explicit `QMeraGeometry` lattice/register objects, including per-site mode
   expansion for fermionic registers;
 - RG-style `QMeraSchedule` objects with non-overlapping isometry blocks,
@@ -38,10 +36,11 @@ than only a design sketch. The important implemented pieces are:
 - explicit local-cone tensor networks through `QMeraLightconeTN`,
   `qmera_parametric_lightcone_tn(...)`, and
   `contract_qmera_lightcone_tn(...)`;
-- compiled dense local-cone contractions through cotengra
-  `array_contract_expression`, suitable for JAX/Torch array losses when the
-  schedule and chunks are static;
-- `QMeraParametricEnergyOptimizer`, which routes parameter dictionaries through
+- compiled local-cone contractions through cotengra
+  `array_contract_expression`, including a native graded Symmray route that
+  keeps Symmray constants and gate blocks intact for JAX/Torch autodiff when
+  the schedule and chunks are static;
+- `QMeraEnergyOptimizer`, which routes parameter dictionaries through
   Pepsy `GradientOptimizer`;
 - Symmray-native fermion support for two-state modes, Fermi-Hubbard local
   terms, and a contextual `symmray-fsim` gate family.
@@ -54,14 +53,14 @@ parametric loss route.
 
 ## quimb Anchors
 
-quimb has two relevant layers:
+quimb provides tensor-network storage and contraction for qMERA. Its circuit
+and MERA examples are conceptual references only; Pepsy owns the schedule,
+gate registry, parameter dictionary, and lightcone selection.
 
-- `quimb.tensor.MERA`: stable 1D MERA class used in the public MERA example.
-  It supports causal-cone selection with site tags and works with
-  `qtn.TNOptimizer`.
-- `quimb.experimental.merabuilder.TensorNetworkGenIso`: arbitrary-geometry
-  isometric builder with `layer_gate_fill_fn(operation="uni"|"iso"|"cap")`.
-  It is useful for 2D/qMERA prototypes but should remain behind a Pepsy adapter.
+- `quimb.tensor.TensorNetwork` stores explicit direct-gate qMERA states and
+  local-cone tensor networks.
+- `quimb.experimental.merabuilder.TensorNetworkGenIso` may inform geometry
+  prototypes but remains behind a Pepsy qMERA adapter.
 
 The quimb example computes local terms by:
 
@@ -70,10 +69,6 @@ The quimb example computes local terms by:
 3. apply the local gate/operator to the selected ket;
 4. join with the conjugate selected cone;
 5. contract exactly with a reusable contraction optimizer.
-
-For constrained global optimization, quimb uses a `norm_fn` that projects the
-state with `unitize(method="exp")`; in new Pepsy code prefer the current
-`isometrize(method="exp")` spelling.
 
 For qMERA circuits, use the quimb quantum-circuit guide as conceptual guidance
 only:
@@ -142,9 +137,8 @@ backend-native arrays in the parameter dictionary.
 Current layout:
 
 ```text
-src/pepsy/optimizers/mera/
+src/pepsy/optimizers/qmera/
   __init__.py
-  optimizer.py
   terms.py
   lightcones.py
   geometry.py
@@ -155,11 +149,12 @@ src/pepsy/optimizers/mera/
   parametric.py
   schematics.py
   fermions.py
+  layout.py
+  prototype.py
 ```
 
 The implemented responsibilities are:
 
-- `optimizer.py`: `MeraEnergyOptimizer` for dense/isometric MERA-like states.
 - `terms.py`: `LocalTerm`, input normalization, and local operator conversion.
 - `geometry.py`: explicit lattice labels, register sites, mapper support, and
   optional mode labels such as spin-up/spin-down.
@@ -167,19 +162,21 @@ The implemented responsibilities are:
 - `gates.py`: parameterized gate registry and context-aware gate generation.
 - `builders.py`: `QMeraBuilder`, `QMeraAnsatz`, parameter casting, direct-gate
   state construction, and local-cone loss helpers.
-- `lightcones.py`: tag-based dense MERA cones plus schedule-first qMERA cones.
-- `compiled.py`: static contraction expressions for dense local qMERA cones.
-- `parametric.py`: parameter-dict optimizer shell over `GradientOptimizer`.
+- `lightcones.py`: schedule-first qMERA cones and direct-gate validation oracles.
+- `compiled.py`: static contraction expressions for local qMERA cones.
+- `parametric.py`: `QMeraEnergyOptimizer` over `GradientOptimizer`.
 - `schematics.py`: inspection drawings of disentangler/isometry blocking.
 - `fermions.py`: Symmray-native fermion mode backend and Fermi-Hubbard terms.
+- `layout.py`: deterministic qMERA RG candidate generation and structural
+  scoring.
+- `prototype.py`: diagnostic loading of serialized research-prototype gate
+  streams without treating them as Pepsy schedules.
 
-Still-open package work:
+Remaining package work:
 
-- document examples for the implemented public path;
-- local-cone grouping and cotengra path-cache ergonomics;
-- explicit 2D multi-mode/Fermi-Hubbard RG design;
-- broader comparison tests between direct-gate TNs and schedule-only chunks;
-- possible top-level export decisions for selected qMERA symbols.
+- optional actual cotengra cost estimates after structural layout ranking;
+- broader later-scale direct-versus-lightcone comparisons;
+- a formally specified mapping from flat prototype streams to RG scales.
 
 ## Design Data Flow
 
@@ -225,9 +222,9 @@ enough for:
 - fermionic local terms after a caller-selected encoding such as Jordan-Wigner
   or a fermionic gate-aware ansatz.
 
-`MeraEnergyOptimizer` should not build the Hamiltonian from model names. That
-belongs in separate helpers or examples. The optimizer consumes normalized
-local terms.
+`QMeraBuilder` should not build the Hamiltonian from model names. That belongs
+in separate helpers or examples. The qMERA optimizer consumes normalized local
+terms.
 
 For Fermi-Hubbard, prefer Pepsy's existing symbolic/symmetric layer:
 
@@ -308,9 +305,8 @@ like `iso_(...)` form covering blocks, `uni_(...)` forms shifted/wrapped
 boundary blocks, and 2D builders alternate horizontal/vertical unitary and
 isometry sublayers before capping.
 
-For dense MERA, block tensors can be direct quimb isometries. For qMERA, dense
-blocks are replaced by local parameterized circuit layers whose contraction
-acts as the block tensor. Keep those modes explicit.
+qMERA blocks are local parameterized circuit layers whose contraction acts as
+the block tensor. Keep fermionic modes explicit.
 
 ## Parametrized Gate Registry
 
@@ -381,22 +377,12 @@ solvers the natural optimization layer.
 
 ## JAX and Pepsy Gradient Route
 
-There are two useful JAX patterns:
+qMERA gate-parameter optimization follows one schedule-first pattern:
 
-1. Dense/isometric MERA tensor optimization:
-   - create a quimb MERA-like tensor network;
-   - call `qtn.pack(state)` once to get `(params, skeleton)`;
-   - define `loss_fn(params)` as `state = qtn.unpack(params, skeleton)`, optional
-     `state.isometrize(method=...)`, then local energy contraction;
-   - run either external Flax/Optax or Pepsy `GradientOptimizer` with a
-     `jax-*` solver.
-
-2. qMERA gate-parameter optimization:
    - create a Pepsy `QMeraSchedule` from geometry/disentangler/isometry specs;
    - initialize a JAX pytree/dict of gate parameters;
-   - define `loss_fn(params)` by generating all gate tensors from params,
-     assembling the fixed qMERA tensor skeleton/chunks, and contracting local
-     lightcone chunks;
+   - define `loss_fn(params)` by generating parameterized gate tensors and
+     contracting static local qMERA lightcone chunks;
    - run `GradientOptimizer(params, loss_fn, solver="jax-adam"|"jax-adamw")`
      once the loss is pure and JAX-compatible.
 
@@ -408,61 +394,26 @@ Implementation rule: JAX tracing should see a static schedule and static
 contraction/chunk topology. Dynamic inputs should be arrays in `params`, not
 new Python tensor-network objects, changing tag sets, or file-loaded schedules.
 
-## `MeraEnergyOptimizer` Shape
+## `QMeraEnergyOptimizer` Shape
 
-Mirror `PepsEnergyOptimizer` where possible:
+The canonical optimizer owns a parameter dictionary and a static schedule:
 
 ```python
-class MeraEnergyOptimizer:
-    def __init__(
-        self,
-        state,
-        hamiltonian,
-        *,
-        normalized=True,
-        energy_per_site=True,
-        real=True,
-        isometrize_method="exp",
-        contraction_opt="auto-hq",
-        backend="auto",
-        jit=False,
-        compute_kwargs=None,
-        loss_kwargs=None,
-    ): ...
+class QMeraEnergyOptimizer:
+    builder: QMeraBuilder
+    schedule: QMeraSchedule
+    hamiltonian: object
+    parameters: Mapping[str, object]
 
-    def loss(self, state=None, *, hamiltonian=None, terms=None, **kwargs): ...
-    def energy(self, state=None, *, hamiltonian=None, terms=None, **kwargs): ...
-    def make_tn_optimizer(...): ...
-    def optimize(...): ...
+    def loss(self, parameters=None, **kwargs): ...
+    def compile(self, **kwargs): ...
+    def compiled_loss(self, parameters=None, **kwargs): ...
+    def run(self, params_init=None, *, solver="torch-adam", **kwargs): ...
 ```
 
-Candidate loss kwargs:
-
-- `normalized`: whether to divide by local norm if state is not guaranteed
-  isometric. Default can be `True` only if implemented cheaply and tested.
-- `energy_per_site`: divide by inferred number of physical sites.
-- `real`: return `autoray.real(...)`.
-- `isometrize_method`: method used by `norm_fn`, commonly `"exp"`.
-- `contraction_opt`: exact contraction optimizer for causal cones.
-- `precompute_tags`: cache causal-cone tags for fixed term supports.
-- `chunk_terms`: group compatible local terms by identical or similar
-  lightcone selectors.
-- `jit`: request backend JIT when the loss graph is static, especially JAX.
-- `solver`: Pepsy solver name such as `"jax-adam"`, `"jax-adamw"`,
-  `"torch-adam"`, or `"torch-lbfgs"` when optimizing explicit parameter dicts.
-- `simplify`: optional local simplification such as `full_simplify(seq="R")`.
-
-`make_tn_optimizer()` should pass:
-
-- `loss_fn`: static adapter around `_loss_state`.
-- `norm_fn`: `lambda state: state.isometrize(method=isometrize_method)` when
-  using dense isometric tensors.
-- `loss_constants`: normalized terms and any cached tag selectors.
-- `loss_kwargs`: contraction and scalar-format options.
-
-For qMERA circuit builders with explicit unitary gates, `norm_fn` might be
-unneeded because circuit gates already enforce unitarity. Keep this a builder
-or ansatz property rather than auto-detecting silently.
+Built-in qMERA gates are unitary or symmetry-preserving by construction, so
+the optimizer defaults to `normalized=False`. A caller may explicitly enable
+normalization for a custom non-unitary gate family.
 
 ## Term Normalization
 
@@ -666,8 +617,8 @@ than rebuilding tensor networks inside a traced function.
 - Jordan-Wigner Fermi-Hubbard hopping is a two-site gate only for adjacent
   mapped bonds. For non-adjacent 2D mapped bonds, use the Pepsy MPO/term path or
   an explicitly provided long-string gate representation.
-- Dense MERA projection and explicit qMERA circuit unitarity are different
-  constraint mechanisms. Do not mix them silently in one code path.
+- qMERA circuit unitarity and fermionic symmetry preservation are gate-family
+  constraints. Do not add a separate tensor projection path.
 - A DMRG-like local gate optimizer from the paper is a later milestone. Start
   with global autodiff since it matches existing Pepsy energy optimizer style.
 
@@ -677,12 +628,11 @@ Run the focused qMERA suite after implementation changes:
 
 ```bash
 env NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPREFIX=/tmp \
-  /home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pytest -q tests/test_optimize_mera.py
+  /home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pytest -q tests/test_optimize_qmera.py
 ```
 
 The focused suite should continue to cover:
 
-- dense 1D MERA local expectation and energy smoke tests;
 - causal-cone metadata and bounded schedule-width diagnostics;
 - `QMeraGeometry` lattice, mapper, register, and mode ordering behavior;
 - 1D and 2D RG schedules with non-overlapping isometry blocks and boundary
@@ -692,8 +642,8 @@ The focused suite should continue to cover:
 - direct-gate TN construction as a debugging/comparison path;
 - schedule-first parametric lightcone chunks that rebuild only local cones;
 - explicit `QMeraLightconeTN` construction and cotengra contraction;
-- compiled dense local-cone contractions matching rebuilt local cones;
-- Torch optimizer smoke through `QMeraParametricEnergyOptimizer`;
+- compiled qMERA local-cone contractions matching rebuilt local cones;
+- Torch optimizer smoke through `QMeraEnergyOptimizer`;
 - JAX JIT smoke for the compiled parameter-dict loss, skipped cleanly when JAX
   or Optax is unavailable;
 - Symmray-native Fermi-Hubbard local terms and `symmray-fsim` lightcone tests,
@@ -709,5 +659,5 @@ env NUMBA_CACHE_DIR=/tmp/numba_cache MPLCONFIGDIR=/tmp/mplconfig PYTHONPYCACHEPR
 For syntax-only checks:
 
 ```bash
-/home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pyflakes src/pepsy/optimizers/mera tests/test_optimize_mera.py
+/home/reza.haghshenas@quantinuum.com/envs/py312/bin/python -m pyflakes src/pepsy/optimizers/qmera tests/test_optimize_qmera.py
 ```

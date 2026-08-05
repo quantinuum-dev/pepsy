@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 import time
 import warnings
 
@@ -15,7 +16,21 @@ from .amplitude import (
     _resolve_log_amplitude_fn,
     _unique_config_rows,
 )
-from .connections import _driver_terms_connections, compile_operator_sum_torch
+from .benchmark import benchmark_torch_amplitudes
+from .connections import (
+    TorchFockTransitionPlan,
+    _driver_terms_connections,
+    compile_operator_sum_torch,
+)
+from .distributed import (
+    distributed_max_float,
+    distributed_metadata,
+    distributed_sum_int,
+    distributed_unweighted_statistics,
+    rank_seed,
+    resolve_torch_distributed,
+    shard_chain_count,
+)
 from .local_energy import (
     _adaptive_measurement_options,
     _adaptive_thinning_interval,
@@ -26,6 +41,7 @@ from .local_energy import (
     _local_energies_from_connection_map,
     _normalized_sample_weights,
     _observable_statistics,
+    torch_chain_diagnostics,
     _weighted_energy_statistics,
     local_energy_from_connections,
 )
@@ -36,13 +52,17 @@ from .proposals import (
     metropolis_exchange_sweep,
 )
 from .results import (
+    TorchVMCConvergenceEstimate,
+    TorchVMCConvergenceReport,
     TorchVMCEnergyEstimate,
     TorchVMCImportanceEstimate,
     TorchVMCStepResult,
     _accumulate_cache_profile,
     _cache_profile_snapshot,
     _make_progress,
+    _set_evaluation_progress_postfix,
     _set_vmc_progress_postfix,
+    _torch_sample_provenance,
 )
 from .sampler import TorchBPMetropolisSampler, TorchMetropolisSampler
 
@@ -220,6 +240,42 @@ class TorchVMCDriver:
         self._refresh_log_amplitudes()
         return self.amplitudes
 
+    def benchmark_amplitudes(
+        self,
+        configs=None,
+        *,
+        chunk_sizes=(None,),
+        amplitude_batchings=None,
+        warmup=1,
+        repeats=3,
+        verify=True,
+        include_cache=False,
+    ):
+        """Benchmark chunked and vectorized amplitude evaluation.
+
+        ``configs`` defaults to the driver's active walkers. Pass retained
+        chain samples with shape ``(n_steps, n_chains, n_sites)`` to time a
+        representative production batch without drawing more samples. Boundary
+        amplitude-cache hits are bypassed by default; pass
+        ``include_cache=True`` to time the cache-aware serving path instead.
+        """
+        if configs is None:
+            configs = self.configs
+        else:
+            configs = _require_torch().as_tensor(configs, dtype=_require_torch().long)
+            if configs.ndim == 3:
+                configs = configs.reshape(-1, configs.shape[-1])
+        return benchmark_torch_amplitudes(
+            self.model,
+            configs,
+            chunk_sizes=chunk_sizes,
+            amplitude_batchings=amplitude_batchings,
+            warmup=warmup,
+            repeats=repeats,
+            verify=verify,
+            include_cache=include_cache,
+        )
+
     def _refresh_log_amplitudes(self):
         if self.log_amplitude_fn is None:
             self.log_abs_amplitudes = None
@@ -392,15 +448,20 @@ class TorchVMCDriver:
             n_samples = config_kwargs.pop("n_samples")
             n_chains = config_kwargs.pop("n_chains")
             if n_discard_per_chain is not None and n_discard_per_chain != config_kwargs["n_discard_per_chain"]:
-                raise ValueError("n_discard_per_chain conflicts with sampling.burn_in.")
+                raise ValueError(
+                    "n_discard_per_chain conflicts with sampling.n_discard_per_chain."
+                )
             if n_discard is not None and n_discard != config_kwargs["n_discard_per_chain"]:
-                raise ValueError("n_discard conflicts with sampling.burn_in.")
-            if sweep_size is not None and sweep_size != config_kwargs["n_thin"]:
-                raise ValueError("sweep_size conflicts with sampling.thin.")
-            if n_thin is not None and n_thin != config_kwargs["n_thin"]:
-                raise ValueError("n_thin conflicts with sampling.thin.")
+                raise ValueError(
+                    "n_discard conflicts with sampling.n_discard_per_chain."
+                )
+            if sweep_size is not None and sweep_size != config_kwargs["sweep_size"]:
+                raise ValueError("sweep_size conflicts with sampling.sweep_size.")
+            if n_thin is not None and n_thin != config_kwargs["sweep_size"]:
+                raise ValueError("n_thin conflicts with sampling.sweep_size.")
             n_discard_per_chain = config_kwargs["n_discard_per_chain"]
-            n_thin = config_kwargs["n_thin"]
+            sweep_size = config_kwargs["sweep_size"]
+            n_thin = None
             seed = config_kwargs["seed"]
             sampler_seed = config_kwargs["sampler_seed"]
             sampling_chunk_size = sampling.chunk_size
@@ -446,11 +507,23 @@ class TorchVMCDriver:
         sweep_size=None,
         n_thin=None,
         progress=False,
+        progress_postfix="full",
         seed=None,
         sampler_seed=None,
         track_proposal_stats=False,
+        distributed=False,
     ):
-        """Collect chain-preserving samples and update the driver state."""
+        """Collect chain-preserving samples and update the driver state.
+
+        Set ``distributed=True`` after initializing ``torch.distributed`` to
+        shard the *global* ``SamplingConfig.n_chains`` across ranks. Each rank
+        owns independent chains and returns only its local configurations;
+        metadata records the global chain/sample counts. Distributed sampling
+        requires ``sampling=...`` so the global chain semantics are explicit.
+        ``progress_postfix=\"acceptance\"`` keeps the live progress display
+        focused on the running sampling acceptance rate.
+        """
+        distributed_runtime = resolve_torch_distributed(distributed)
         sampling_chunk_size = None
         sampling_proposal = None
         if sampling is not None:
@@ -461,19 +534,58 @@ class TorchVMCDriver:
             n_samples = config_kwargs.pop("n_samples")
             n_chains = config_kwargs.pop("n_chains")
             if n_discard_per_chain is not None and n_discard_per_chain != config_kwargs["n_discard_per_chain"]:
-                raise ValueError("n_discard_per_chain conflicts with sampling.burn_in.")
+                raise ValueError(
+                    "n_discard_per_chain conflicts with sampling.n_discard_per_chain."
+                )
             if n_discard is not None and n_discard != config_kwargs["n_discard_per_chain"]:
-                raise ValueError("n_discard conflicts with sampling.burn_in.")
-            if sweep_size is not None and sweep_size != config_kwargs["n_thin"]:
-                raise ValueError("sweep_size conflicts with sampling.thin.")
-            if n_thin is not None and n_thin != config_kwargs["n_thin"]:
-                raise ValueError("n_thin conflicts with sampling.thin.")
+                raise ValueError(
+                    "n_discard conflicts with sampling.n_discard_per_chain."
+                )
+            if sweep_size is not None and sweep_size != config_kwargs["sweep_size"]:
+                raise ValueError("sweep_size conflicts with sampling.sweep_size.")
+            if n_thin is not None and n_thin != config_kwargs["sweep_size"]:
+                raise ValueError("n_thin conflicts with sampling.sweep_size.")
             n_discard_per_chain = config_kwargs["n_discard_per_chain"]
-            n_thin = config_kwargs["n_thin"]
+            sweep_size = config_kwargs["sweep_size"]
+            n_thin = None
             seed = config_kwargs["seed"]
             sampler_seed = config_kwargs["sampler_seed"]
             sampling_chunk_size = sampling.chunk_size
             sampling_proposal = sampling.proposal
+        elif distributed_runtime is not None:
+            raise ValueError(
+                "distributed sampling requires sampling=SamplingConfig(...) so "
+                "n_chains has an unambiguous global meaning."
+            )
+
+        distributed_info = None
+        if distributed_runtime is not None:
+            global_n_chains = int(n_chains)
+            local_n_chains = shard_chain_count(
+                global_n_chains,
+                distributed_runtime,
+            )
+            if self.n_walkers != local_n_chains:
+                raise ValueError(
+                    "This rank's TorchVMCDriver has "
+                    f"{self.n_walkers} walkers, but rank "
+                    f"{distributed_runtime.rank} requires {local_n_chains} of "
+                    f"the global {global_n_chains} chains. Initialize each rank "
+                    "with its local shard before calling sample(..., "
+                    "distributed=True)."
+                )
+            if seed is not None:
+                seed = rank_seed(seed, distributed_runtime)
+            if sampler_seed is not None:
+                sampler_seed = rank_seed(sampler_seed, distributed_runtime)
+            if seed is None and sampler_seed is None:
+                raise ValueError(
+                    "distributed sampling requires SamplingConfig.seed or "
+                    "SamplingConfig.sampler_seed so ranks do not duplicate "
+                    "their random streams."
+                )
+            n_chains = local_n_chains
+            n_samples = int(sampling.n_samples_per_chain) * local_n_chains
         sampler = self.make_sampler(
             n_chains=n_chains,
             seed=seed,
@@ -488,6 +600,7 @@ class TorchVMCDriver:
             sweep_size=sweep_size,
             n_thin=n_thin,
             progress=progress,
+            progress_postfix=progress_postfix,
             track_proposal_stats=track_proposal_stats,
         )
         self.configs = sampler.configs
@@ -495,6 +608,20 @@ class TorchVMCDriver:
         self.generator = sampler.generator
         if track_proposal_stats:
             self.last_proposal_stats = result.proposal_stats
+        if distributed_runtime is not None:
+            global_n_samples = distributed_sum_int(
+                result.n_samples,
+                distributed_runtime,
+                device=self.configs.device,
+            )
+            distributed_info = distributed_metadata(
+                distributed_runtime,
+                global_n_chains=global_n_chains,
+                local_n_chains=local_n_chains,
+                global_n_samples=global_n_samples,
+                local_n_samples=result.n_samples,
+            )
+            result = replace(result, distributed=distributed_info)
         return result
 
     def make_connections(self, configs=None, *, terms=None):
@@ -523,6 +650,59 @@ class TorchVMCDriver:
                 constant=term_constant,
             )
         return self.connection_fn(configs, self.graph, **self.connection_kwargs)
+
+    def compile_fock_plan(self, configs=None, *, observables=None):
+        """Compile reusable configuration transitions for a fixed sample stream.
+
+        ``observables`` follows :meth:`measure_samples`: ``None`` means the
+        driver's configured connection function, while a mapping names native
+        explicit term sets and may use ``None`` for that configured function.
+        The returned plan contains no model parameters and can therefore be
+        reused across PEPS bond dimensions, contraction methods, and dtypes.
+        """
+        configs = self.configs if configs is None else _as_long_matrix(configs)
+        configs = configs.to(device=_model_device(self.model))
+        if observables is None:
+            observable_items = (("observable", None),)
+        else:
+            try:
+                observable_items = tuple(observables.items())
+            except AttributeError as exc:
+                raise TypeError(
+                    "observables must be a mapping of names to native terms."
+                ) from exc
+            if not observable_items:
+                raise ValueError("observables must contain at least one entry.")
+        connection_map = {
+            name: (
+                self.make_connections(configs, terms=terms)
+                if terms is not None
+                else self.make_connections(configs)
+            )
+            for name, terms in observable_items
+        }
+        return TorchFockTransitionPlan(configs, connection_map)
+
+    def proposal_configs(
+        self,
+        batch,
+        *,
+        fermion=None,
+        one_d_to_two_d=None,
+        site_order=None,
+        occupation_map=None,
+    ):
+        """Bridge an already sampled external proposal without contracting it."""
+        from .importance import _proposal_batch_configs
+
+        return _proposal_batch_configs(
+            self,
+            batch,
+            fermion=fermion,
+            site_order=site_order,
+            occupation_map=occupation_map,
+            device=_model_device(self.model),
+        )
 
     def sample_sweep(self, *, n_sweeps=1, track_proposal_stats=False):
         """Run one or more Metropolis sweeps and update driver state."""
@@ -600,8 +780,16 @@ class TorchVMCDriver:
         bar = _make_progress(
             True,
             total=n_sweeps,
-            desc="Torch VMC burn-in",
+            desc="Metropolis warm-up",
             unit="sweep",
+        )
+        _set_vmc_progress_postfix(
+            bar,
+            n_sites=self.n_sites,
+            include_energy=False,
+            n_chains=self.n_walkers,
+            model=self.model,
+            proposal=self.proposal,
         )
         result = None
         n_proposed = 0
@@ -623,6 +811,9 @@ class TorchVMCDriver:
                     result,
                     n_sites=self.n_sites,
                     include_energy=False,
+                    n_chains=self.n_walkers,
+                    model=self.model,
+                    proposal=self.proposal,
                 )
         finally:
             bar.close()
@@ -724,6 +915,345 @@ class TorchVMCDriver:
                 compile_kernels=self.compile_kernels,
             )
 
+    def check_mc_convergence(
+        self,
+        observables=None,
+        *,
+        burn_in=0,
+        min_chain_length=100,
+        max_chain_length=500,
+        target_effective_samples_per_chain=50.0,
+        rhat_threshold=1.05,
+        check_interval=None,
+        seed=None,
+        progress=False,
+    ):
+        """Check MCMC convergence without advancing the active VMC chains.
+
+        A temporary driver starts from the current walker positions and keeps
+        one retained value per raw Metropolis sweep.  Each observable is
+        checked with ordinary and split R-hat, an FFT initial-positive-
+        sequence autocorrelation estimate, and a conservative maximum IAT
+        across chains. Sampling stops once every observable has at least
+        ``target_effective_samples_per_chain`` effective samples and satisfies
+        ``rhat_threshold``. The hard ``max_chain_length`` cap is always
+        respected.
+
+        The returned :class:`TorchVMCConvergenceReport` contains a suggested
+        ``sweep_size`` for a later production :class:`SamplingConfig`. The
+        diagnostic uses raw spacing intentionally, so the recommendation is
+        not confused with the spacing of an earlier production batch.
+        """
+        torch = _require_torch()
+        if not hasattr(self, "configs") or not hasattr(self, "amplitudes"):
+            raise RuntimeError(
+                "Initialize the Torch VMC driver before checking convergence."
+            )
+        if isinstance(burn_in, bool) or not isinstance(burn_in, int) or burn_in < 0:
+            raise ValueError("burn_in must be a non-negative integer.")
+        min_chain_length = _check_positive_int(
+            "min_chain_length",
+            min_chain_length,
+        )
+        max_chain_length = _check_positive_int(
+            "max_chain_length",
+            max_chain_length,
+        )
+        if max_chain_length < min_chain_length:
+            raise ValueError(
+                "max_chain_length must be at least min_chain_length."
+            )
+        try:
+            target_effective_samples_per_chain = float(
+                target_effective_samples_per_chain
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "target_effective_samples_per_chain must be positive and finite."
+            ) from exc
+        if (
+            not math.isfinite(target_effective_samples_per_chain)
+            or target_effective_samples_per_chain <= 0
+        ):
+            raise ValueError(
+                "target_effective_samples_per_chain must be positive and finite."
+            )
+        if rhat_threshold is not None:
+            try:
+                rhat_threshold = float(rhat_threshold)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "rhat_threshold must be at least 1 or None."
+                ) from exc
+            if not math.isfinite(rhat_threshold) or rhat_threshold < 1.0:
+                raise ValueError(
+                    "rhat_threshold must be at least 1 or None."
+                )
+        if check_interval is None:
+            check_interval = max(1, min_chain_length // 10)
+        check_interval = _check_positive_int("check_interval", check_interval)
+
+        if observables is None:
+            observable_items = (("energy", None),)
+        else:
+            try:
+                observable_items = tuple(observables.items())
+            except AttributeError as exc:
+                raise TypeError(
+                    "observables must be a mapping of names to native terms."
+                ) from exc
+            if not observable_items:
+                raise ValueError("observables must contain at least one entry.")
+        observable_items = tuple(
+            (str(name), terms) for name, terms in observable_items
+        )
+        observable_map = dict(observable_items)
+        n_chains = self.n_walkers
+        if n_chains < 2:
+            raise ValueError(
+                "check_mc_convergence requires at least two active chains."
+            )
+        model_device = self.configs.device
+
+        def make_generator():
+            if seed is None and self.generator is None:
+                return None
+            try:
+                generator = torch.Generator(device=model_device)
+            except (RuntimeError, TypeError, ValueError):
+                generator = torch.Generator()
+            if seed is not None:
+                generator.manual_seed(int(seed))
+            else:
+                try:
+                    generator.set_state(self.generator.get_state())
+                except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Could not clone the active Torch RNG state for the "
+                        "temporary convergence sampler. Pass seed=... instead."
+                    ) from exc
+            return generator
+
+        if self.terms is not None:
+            temporary_terms = self.terms
+            temporary_connection_fn = None
+            temporary_connection_kwargs = None
+        else:
+            temporary_terms = None
+            temporary_connection_fn = self.connection_fn
+            temporary_connection_kwargs = self.connection_kwargs
+
+        fork_devices = []
+        if getattr(model_device, "type", None) == "cuda":
+            fork_devices = [
+                0 if model_device.index is None else int(model_device.index)
+            ]
+
+        histories = {name: [] for name in observable_map}
+        n_proposed = 0
+        n_accepted = 0
+        start = time.perf_counter()
+        bar = _make_progress(
+            progress,
+            total=burn_in + max_chain_length,
+            desc="MC convergence",
+            unit="sweep",
+        )
+
+        def update_progress(result):
+            nonlocal n_proposed, n_accepted
+            n_proposed += result.n_proposed
+            n_accepted += result.n_accepted
+            if bar is not None:
+                bar.update(1)
+                _set_vmc_progress_postfix(
+                    bar,
+                    replace(
+                        result,
+                        n_proposed=n_proposed,
+                        n_accepted=n_accepted,
+                    ),
+                    progress_postfix="acceptance",
+                )
+
+        def make_estimates():
+            estimates = {}
+            for name, values in histories.items():
+                chain_values = torch.stack(values, dim=0)
+                diagnostics = torch_chain_diagnostics(
+                    chain_values,
+                    split_rhat=True,
+                )
+                flat_values = chain_values.reshape(-1)
+                mean, variance = _energy_mean_and_variance(flat_values)
+                effective_sample_size = diagnostics.effective_sample_size
+                stderr = torch.sqrt(
+                    variance
+                    / torch.clamp(effective_sample_size, min=1.0)
+                )
+                split_r_hat = (
+                    diagnostics.split_r_hat
+                    if diagnostics.split_r_hat is not None
+                    else diagnostics.r_hat
+                )
+                max_tau = diagnostics.max_integrated_autocorrelation_time
+                effective_per_chain = effective_sample_size / n_chains
+                max_tau_float = float(max_tau.detach().cpu())
+                recommended_sweep_size = (
+                    max(1, int(math.ceil(max_tau_float)))
+                    if math.isfinite(max_tau_float)
+                    else 1
+                )
+                finite = all(
+                    bool(torch.isfinite(torch.as_tensor(value)).all())
+                    for value in (
+                        mean,
+                        variance,
+                        split_r_hat,
+                        diagnostics.integrated_autocorrelation_time,
+                        max_tau,
+                        effective_sample_size,
+                    )
+                )
+                reasons = []
+                if not finite:
+                    reasons.append("non-finite statistics")
+                if rhat_threshold is not None and (
+                    not bool(torch.isfinite(split_r_hat))
+                    or float(split_r_hat.detach().cpu()) > rhat_threshold
+                ):
+                    reasons.append(
+                        f"split R-hat={float(split_r_hat.detach().cpu()):.4f} "
+                        f"> {rhat_threshold:.4f}"
+                    )
+                if (
+                    not bool(torch.isfinite(effective_per_chain))
+                    or float(effective_per_chain.detach().cpu())
+                    < target_effective_samples_per_chain
+                ):
+                    reasons.append(
+                        "effective samples/chain="
+                        f"{float(effective_per_chain.detach().cpu()):.1f} "
+                        f"< {target_effective_samples_per_chain:.1f}"
+                    )
+                reliable = not reasons
+                estimates[name] = TorchVMCConvergenceEstimate(
+                    mean=mean,
+                    variance=variance,
+                    stderr=stderr,
+                    r_hat=diagnostics.r_hat,
+                    split_r_hat=split_r_hat,
+                    integrated_autocorrelation_time=(
+                        diagnostics.integrated_autocorrelation_time
+                    ),
+                    max_integrated_autocorrelation_time=max_tau,
+                    effective_sample_size=effective_sample_size,
+                    effective_samples_per_chain=effective_per_chain,
+                    n_samples_per_chain=int(chain_values.shape[0]),
+                    n_chains=n_chains,
+                    recommended_sweep_size=recommended_sweep_size,
+                    reliable=reliable,
+                    reliability_reason=(
+                        "reliable" if reliable else "; ".join(reasons)
+                    ),
+                )
+            return estimates
+
+        rng_context = torch.random.fork_rng(
+            devices=fork_devices,
+            enabled=self.generator is None,
+        )
+        try:
+            with rng_context:
+                temporary = TorchVMCDriver(
+                    self.model,
+                    self.graph,
+                    self.configs.detach().clone(),
+                    connection_fn=temporary_connection_fn,
+                    terms=temporary_terms,
+                    site_order=self.site_order,
+                    connection_kwargs=temporary_connection_kwargs,
+                    term_constant=self.term_constant,
+                    amplitudes=self.amplitudes.detach().clone(),
+                    proposal=self.proposal,
+                    hopping_rate=self.hopping_rate,
+                    spin_flip_rate=self.spin_flip_rate,
+                    pair_toggle_rate=self.pair_toggle_rate,
+                    encoding=self.encoding,
+                    chunk_size=self.chunk_size,
+                    compile_kernels=self.compile_kernels,
+                    log_amplitude_fn=(
+                        self.log_amplitude_fn
+                        if self.log_amplitude_fn is not None
+                        else False
+                    ),
+                    generator=make_generator(),
+                )
+                for _ in range(burn_in):
+                    update_progress(temporary.sample_sweep())
+
+                for step in range(1, max_chain_length + 1):
+                    update_progress(temporary.sample_sweep())
+                    values = temporary.local_observables(observable_map)
+                    for name, value in values.items():
+                        histories[name].append(value.detach())
+
+                    should_check = (
+                        step >= min_chain_length
+                        and (
+                            step == min_chain_length
+                            or (step - min_chain_length) % check_interval == 0
+                        )
+                    )
+                    if should_check:
+                        current = make_estimates()
+                        if all(estimate.reliable for estimate in current.values()):
+                            break
+                estimates = make_estimates()
+        finally:
+            if bar is not None:
+                bar.close()
+
+        n_steps = len(next(iter(histories.values())))
+        reliable = all(estimate.reliable for estimate in estimates.values())
+        if reliable:
+            reliability_reason = (
+                "all observables met the split-R-hat and effective-sample "
+                "targets"
+            )
+        else:
+            details = " | ".join(
+                f"{name}: {estimate.reliability_reason}"
+                for name, estimate in estimates.items()
+                if not estimate.reliable
+            )
+            reliability_reason = (
+                "maximum chain length reached before convergence: " + details
+            )
+        recommended_sweep_size = max(
+            estimate.recommended_sweep_size for estimate in estimates.values()
+        )
+        elapsed = time.perf_counter() - start
+        return TorchVMCConvergenceReport(
+            estimates=estimates,
+            n_samples_per_chain=n_steps,
+            n_chains=n_chains,
+            burn_in=burn_in,
+            sweep_size=1,
+            n_sweeps=n_steps,
+            n_proposed=n_proposed,
+            n_accepted=n_accepted,
+            acceptance_rate=(n_accepted / n_proposed if n_proposed else 0.0),
+            elapsed_seconds=elapsed,
+            reliable=reliable,
+            reliability_reason=reliability_reason,
+            recommended_sweep_size=recommended_sweep_size,
+            min_chain_length=min_chain_length,
+            max_chain_length=max_chain_length,
+            target_effective_samples_per_chain=target_effective_samples_per_chain,
+            rhat_threshold=rhat_threshold,
+        )
+
     def measure_samples(
         self,
         samples,
@@ -734,6 +1264,10 @@ class TorchVMCDriver:
         proposal_log_probs=None,
         profile=False,
         deduplicate=True,
+        progress=False,
+        distributed=None,
+        connection_plan=None,
+        amplitude_cache=None,
     ):
         """Measure saved chain samples without running another sampler.
 
@@ -741,8 +1275,14 @@ class TorchVMCDriver:
         tensor with shape ``(n_samples_per_chain, n_chains, n_sites)``. A
         two-dimensional tensor is interpreted as one retained sample per
         chain. Stored amplitudes from ``TorchMCMCSamples`` are reused unless
-        ``amplitudes=`` is supplied explicitly; pass an explicit amplitude
-        batch when the PEPS parameters have changed since sampling.
+        ``amplitudes=`` is supplied explicitly. Native Markov samples carry a
+        PEPS/contraction provenance record and are rejected after that state
+        has changed: draw a fresh Markov batch after an update rather than
+        mixing configurations from the old Born distribution with the new
+        local estimator. In contrast, :class:`TorchImportanceSamples` came
+        from a fixed external proposal ``q``; it remains valid after a PEPS
+        update and refreshes its target parent amplitudes before forming
+        ``|psi(x)|**2 / q(x)``.
 
         With ``observables=None`` the driver's configured connection function
         is measured and one :class:`TorchVMCEnergyEstimate` is returned. A
@@ -763,13 +1303,41 @@ class TorchVMCDriver:
         By default, repeated parent configurations and repeated connected
         targets are contracted once and scattered back to their original
         chain positions. Set ``deduplicate=False`` for compatibility
-        diagnostics or timing comparisons.
+        diagnostics or timing comparisons. Set ``progress=True`` to report
+        connection construction, amplitude contraction, and statistics.
         """
         torch = _require_torch()
         start = time.perf_counter()
         model_device = _model_device(self.model)
 
         sample_object = samples if hasattr(samples, "configs") else None
+        sample_distributed = getattr(sample_object, "distributed", None)
+        if distributed is None:
+            distributed = sample_distributed is not None
+        distributed_runtime = resolve_torch_distributed(distributed)
+        if distributed_runtime is not None and sample_distributed is not None:
+            if (
+                sample_distributed.rank != distributed_runtime.rank
+                or sample_distributed.world_size != distributed_runtime.world_size
+            ):
+                raise RuntimeError(
+                    "The supplied samples belong to a different distributed "
+                    "rank layout than the active torch.distributed process group."
+                )
+        if distributed_runtime is not None:
+            progress = bool(progress) and distributed_runtime.rank == 0
+        provenance = getattr(sample_object, "provenance", None)
+        if provenance is not None and provenance != _torch_sample_provenance(self.model):
+            raise RuntimeError(
+                "Samples belong to a different PEPS/model state. Call "
+                "sample(...) again after modifying the model or its "
+                "contraction settings."
+            )
+        target_provenance = getattr(sample_object, "target_provenance", None)
+        refresh_proposal_amplitudes = (
+            target_provenance is not None
+            and target_provenance != _torch_sample_provenance(self.model)
+        )
         raw_configs = (
             getattr(sample_object, "configs", None)
             if sample_object is not None
@@ -795,30 +1363,67 @@ class TorchVMCDriver:
         if n_steps <= 0 or n_chains <= 0 or n_sites <= 0:
             raise ValueError("samples must contain at least one configuration.")
         flat_configs = chain_configs.reshape(-1, n_sites)
+        global_n_chains = (
+            distributed_sum_int(
+                n_chains,
+                distributed_runtime,
+                device=model_device,
+            )
+            if distributed_runtime is not None
+            else n_chains
+        )
         unique_parent_count = (
             int(_unique_config_rows(flat_configs)[0].shape[0])
             if deduplicate
             else int(flat_configs.shape[0])
         )
 
+        if amplitude_cache is not None:
+            from .cache import TorchAmplitudeCache
+
+            if not isinstance(amplitude_cache, TorchAmplitudeCache):
+                raise TypeError(
+                    "amplitude_cache must be a TorchAmplitudeCache or None."
+                )
+
         if amplitudes is None and sample_object is not None:
             amplitudes = getattr(sample_object, "amplitudes", None)
+        if refresh_proposal_amplitudes:
+            amplitudes = None
+        parent_amplitude_source = (
+            "stored" if amplitudes is not None else "refreshed"
+            if refresh_proposal_amplitudes else "contracted"
+        )
         if amplitudes is None:
             with torch.no_grad():
                 if deduplicate and unique_parent_count < flat_configs.shape[0]:
                     unique_configs, inverse = _unique_config_rows(flat_configs)
-                    unique_amplitudes = _call_amplitude_fn(
-                        self.model,
-                        unique_configs,
-                        chunk_size=self.chunk_size,
-                    )
+                    if amplitude_cache is None:
+                        unique_amplitudes = _call_amplitude_fn(
+                            self.model,
+                            unique_configs,
+                            chunk_size=self.chunk_size,
+                        )
+                    else:
+                        unique_amplitudes = amplitude_cache.evaluate(
+                            self.model,
+                            unique_configs,
+                            chunk_size=self.chunk_size,
+                        )
                     flat_amplitudes = unique_amplitudes[inverse]
                 else:
-                    flat_amplitudes = _call_amplitude_fn(
-                        self.model,
-                        flat_configs,
-                        chunk_size=self.chunk_size,
-                    )
+                    if amplitude_cache is None:
+                        flat_amplitudes = _call_amplitude_fn(
+                            self.model,
+                            flat_configs,
+                            chunk_size=self.chunk_size,
+                        )
+                    else:
+                        flat_amplitudes = amplitude_cache.evaluate(
+                            self.model,
+                            flat_configs,
+                            chunk_size=self.chunk_size,
+                        )
             chain_amplitudes = flat_amplitudes.reshape(n_steps, n_chains)
         else:
             amplitudes = torch.as_tensor(amplitudes, device=model_device)
@@ -870,6 +1475,12 @@ class TorchVMCDriver:
             )
         else:
             importance_weights = None
+        if distributed_runtime is not None and importance_weights is not None:
+            raise NotImplementedError(
+                "Distributed measurement currently supports only unweighted "
+                "rank-sharded Markov samples. Importance weights require a "
+                "global normalization and are not reduced implicitly."
+            )
 
         if observables is None:
             observable_items = (("observable", None),)
@@ -885,30 +1496,93 @@ class TorchVMCDriver:
                 raise ValueError("observables must contain at least one entry.")
             return_mapping = True
 
-        connection_start = time.perf_counter()
-        connection_map = {
-            name: (
-                self.make_connections(flat_configs, terms=terms)
-                if terms is not None
-                else self.make_connections(flat_configs)
-            )
-            for name, terms in observable_items
-        }
-        connection_elapsed = time.perf_counter() - connection_start
+        phase_bar = _make_progress(
+            progress,
+            total=3,
+            desc="Evaluation",
+            unit="stage",
+        )
 
+        def set_phase(stage, *, n_connections=None):
+            _set_evaluation_progress_postfix(
+                phase_bar,
+                model=self.model,
+                n_steps=n_steps,
+                n_chains=n_chains,
+                observables=(name for name, _ in observable_items),
+                parent_amplitudes=parent_amplitude_source,
+                stage=stage,
+                n_connections=n_connections,
+            )
+
+        set_phase("connections")
+        connection_start = time.perf_counter()
+        if connection_plan is None:
+            connection_map = {
+                name: (
+                    self.make_connections(flat_configs, terms=terms)
+                    if terms is not None
+                    else self.make_connections(flat_configs)
+                )
+                for name, terms in observable_items
+            }
+        else:
+            if not isinstance(connection_plan, TorchFockTransitionPlan):
+                raise TypeError(
+                    "connection_plan must be a TorchFockTransitionPlan."
+                )
+            if connection_plan.observable_names != tuple(
+                name for name, _ in observable_items
+            ):
+                raise ValueError(
+                    "connection_plan observable names do not match observables."
+                )
+            if (
+                connection_plan.configs.shape != flat_configs.shape
+                or not torch.equal(
+                    connection_plan.configs.to(device=flat_configs.device),
+                    flat_configs,
+                )
+            ):
+                raise ValueError(
+                    "connection_plan parent configurations do not match samples."
+                )
+            connection_map = {
+                name: connections.to(flat_configs.device)
+                for name, connections in connection_plan.connection_map.items()
+            }
+        n_connections = sum(
+            int(connections.configs.shape[0])
+            for connections in connection_map.values()
+        )
+        connection_elapsed = time.perf_counter() - connection_start
+        if phase_bar is not None:
+            phase_bar.update(1)
+
+        set_phase("target amplitudes", n_connections=n_connections)
         local_start = time.perf_counter()
+        measurement_model = self.model
+        if amplitude_cache is not None:
+            amplitude_cache.seed(
+                flat_configs,
+                flat_amplitudes,
+                model=self.model,
+            )
+            measurement_model = amplitude_cache.wrap(self.model)
         with torch.no_grad():
             flat_values = _local_energies_from_connection_map(
                 flat_configs,
                 flat_amplitudes,
                 connection_map,
-                self.model,
+                measurement_model,
                 chunk_size=self.chunk_size,
                 reuse_diagonal=True,
                 deduplicate_targets=deduplicate,
                 compile_kernels=self.compile_kernels,
             )
         local_elapsed = time.perf_counter() - local_start
+        if phase_bar is not None:
+            phase_bar.update(1)
         elapsed = time.perf_counter() - start
 
         acceptance_rate = float(
@@ -916,6 +1590,23 @@ class TorchVMCDriver:
         ) if sample_object is not None else 0.0
         n_proposed = int(getattr(sample_object, "n_proposed", 0)) if sample_object is not None else 0
         n_accepted = int(getattr(sample_object, "n_accepted", 0)) if sample_object is not None else 0
+        if distributed_runtime is not None:
+            elapsed = distributed_max_float(
+                elapsed,
+                distributed_runtime,
+                device=model_device,
+            )
+            n_proposed = distributed_sum_int(
+                n_proposed,
+                distributed_runtime,
+                device=model_device,
+            )
+            n_accepted = distributed_sum_int(
+                n_accepted,
+                distributed_runtime,
+                device=model_device,
+            )
+            acceptance_rate = n_accepted / n_proposed if n_proposed else 0.0
         profile_data = None
         if profile:
             profile_data = {
@@ -928,6 +1619,11 @@ class TorchVMCDriver:
                 ),
                 "total_seconds": elapsed,
                 "cache": _cache_profile_snapshot(self.model),
+                **(
+                    {"amplitude_cache": amplitude_cache.snapshot()}
+                    if amplitude_cache is not None
+                    else {}
+                ),
                 "samples_only": True,
                 "deduplicate": bool(deduplicate),
                 "num_samples": int(flat_configs.shape[0]),
@@ -935,6 +1631,7 @@ class TorchVMCDriver:
                 "weighted": importance_weights is not None,
             }
 
+        set_phase("statistics", n_connections=n_connections)
         results = {}
         for name, _ in observable_items:
             local_values = flat_values[name].reshape(n_steps, n_chains)
@@ -950,10 +1647,34 @@ class TorchVMCDriver:
                 if importance_weights is None
                 else (*_weighted_energy_statistics(flat_values[name], importance_weights), None)
             )
+            distributed_info = None
+            if distributed_runtime is not None:
+                (
+                    energy_mean,
+                    energy_variance,
+                    energy_stderr,
+                    energy_stderr_naive,
+                    effective_sample_size,
+                    global_n_samples,
+                ) = distributed_unweighted_statistics(
+                    local_values,
+                    local_effective_sample_size=effective_sample_size,
+                    runtime=distributed_runtime,
+                )
+                chain_diagnostics = None
+                distributed_info = distributed_metadata(
+                    distributed_runtime,
+                    global_n_chains=global_n_chains,
+                    local_n_chains=n_chains,
+                    global_n_samples=global_n_samples,
+                    local_n_samples=int(local_values.numel()),
+                )
             result_profile = None
             if profile_data is not None:
                 result_profile = dict(profile_data)
                 result_profile["observable"] = name
+                if distributed_info is not None:
+                    result_profile["distributed"] = distributed_info
             results[name] = TorchVMCEnergyEstimate(
                 configs=chain_configs,
                 amplitudes=chain_amplitudes,
@@ -964,11 +1685,19 @@ class TorchVMCDriver:
                 acceptance_rate=acceptance_rate,
                 n_proposed=n_proposed,
                 n_accepted=n_accepted,
-                n_samples=int(local_values.numel()),
+                n_samples=(
+                    int(local_values.numel())
+                    if distributed_info is None
+                    else distributed_info.global_n_samples
+                ),
                 n_measurements=n_steps,
                 elapsed_seconds=elapsed,
                 samples_per_second=(
-                    int(local_values.numel()) / elapsed
+                    (
+                        int(local_values.numel())
+                        if distributed_info is None
+                        else distributed_info.global_n_samples
+                    ) / elapsed
                     if elapsed > 0
                     else float("inf")
                 ),
@@ -992,8 +1721,12 @@ class TorchVMCDriver:
                         name="proposal_log_probs",
                     ).reshape(n_steps, n_chains)
                 ),
+                distributed=distributed_info,
             )
 
+        if phase_bar is not None:
+            phase_bar.update(1)
+            phase_bar.close()
         return results if return_mapping else results["observable"]
 
     def energy_estimate(self):
@@ -1005,6 +1738,7 @@ class TorchVMCDriver:
     def estimate_observable(
         self,
         *,
+        sampling=None,
         burn_in=0,
         n_measurements=1,
         sweeps_between=1,
@@ -1050,8 +1784,11 @@ class TorchVMCDriver:
         opt-in so normal short VMC loops keep their existing overhead.
         """
         profile = bool(profile)
+        if sampling is not None and sampler is not None:
+            raise ValueError("Pass either sampling=... or sampler=..., not both.")
         modern_sampling = (
-            sampler is not None
+            sampling is not None
+            or sampler is not None
             or n_samples is not None
             or n_chains is not None
             or n_discard_per_chain is not None
@@ -1070,6 +1807,7 @@ class TorchVMCDriver:
                 )
             if sampler is None:
                 samples = self.sample(
+                    sampling=sampling,
                     n_samples=1024 if n_samples is None else n_samples,
                     n_chains=n_chains,
                     n_discard_per_chain=n_discard_per_chain,
@@ -1344,6 +2082,7 @@ class TorchVMCDriver:
         self,
         observables,
         *,
+        sampling=None,
         burn_in=0,
         n_measurements=1,
         sweeps_between=1,
@@ -1383,6 +2122,8 @@ class TorchVMCDriver:
         if not observable_items:
             raise ValueError("observables must contain at least one entry.")
         profile = bool(profile)
+        if sampling is not None and sampler is not None:
+            raise ValueError("Pass either sampling=... or sampler=..., not both.")
 
         def make_connection_map(configs):
             return {
@@ -1444,7 +2185,8 @@ class TorchVMCDriver:
             return results
 
         modern_sampling = (
-            sampler is not None
+            sampling is not None
+            or sampler is not None
             or n_samples is not None
             or n_chains is not None
             or n_discard_per_chain is not None
@@ -1463,6 +2205,7 @@ class TorchVMCDriver:
                 )
             if sampler is None:
                 samples = self.sample(
+                    sampling=sampling,
                     n_samples=1024 if n_samples is None else n_samples,
                     n_chains=n_chains,
                     n_discard_per_chain=n_discard_per_chain,
@@ -1494,14 +2237,21 @@ class TorchVMCDriver:
             phase_bar = _make_progress(
                 progress,
                 total=3,
-                desc="Torch VMC evaluation",
-                unit="phase",
+                desc="Evaluation",
+                unit="stage",
             )
-            observable_names = ", ".join(name for name, _ in observable_items)
 
-            def set_phase(stage):
-                if phase_bar is not None:
-                    phase_bar.set_postfix({"stage": stage})
+            def set_phase(stage, *, n_connections=None):
+                _set_evaluation_progress_postfix(
+                    phase_bar,
+                    model=self.model,
+                    n_steps=samples.n_samples_per_chain,
+                    n_chains=samples.n_chains,
+                    observables=(name for name, _ in observable_items),
+                    parent_amplitudes="stored",
+                    stage=stage,
+                    n_connections=n_connections,
+                )
 
             try:
                 estimator_start = time.perf_counter()
@@ -1510,14 +2260,18 @@ class TorchVMCDriver:
                 flat_configs = sample_configs.reshape(-1, self.n_sites)
                 flat_amplitudes = sample_amplitudes.reshape(-1)
 
-                set_phase("building shared connections")
+                set_phase("connections")
                 connection_start = time.perf_counter()
                 connection_map = make_connection_map(flat_configs)
+                n_connections = sum(
+                    int(connections.configs.shape[0])
+                    for connections in connection_map.values()
+                )
                 connection_elapsed = time.perf_counter() - connection_start
                 if phase_bar is not None:
                     phase_bar.update(1)
 
-                set_phase(f"contracting {observable_names}")
+                set_phase("target amplitudes", n_connections=n_connections)
                 local_start = time.perf_counter()
                 with _require_torch().no_grad():
                     flat_values = _local_energies_from_connection_map(
@@ -1534,7 +2288,7 @@ class TorchVMCDriver:
                 if phase_bar is not None:
                     phase_bar.update(1)
 
-                set_phase("computing statistics")
+                set_phase("statistics", n_connections=n_connections)
                 local_values = {
                     name: values.reshape(sample_configs.shape[:-1])
                     for name, values in flat_values.items()
@@ -1774,6 +2528,44 @@ class TorchVMCDriver:
             auto_thin=auto_thin,
         )
 
+    def sample_from_proposal(
+        self,
+        proposal,
+        *,
+        n_samples=128,
+        seed=None,
+        fermion=None,
+        one_d_to_two_d=None,
+        site_order=None,
+        occupation_map=None,
+        sample_kwargs=None,
+        progress=False,
+        amplitude_floor=0.0,
+        amplitude_cache=None,
+    ):
+        """Draw reusable PEPS-code samples from an external proposal.
+
+        The result retains ``log q(x)`` and target amplitudes. Pass it to
+        :meth:`measure_samples` to form the self-normalized importance
+        estimator for any observable map without drawing the proposal again.
+        """
+        from .importance import sample_from_proposal
+
+        return sample_from_proposal(
+            self,
+            proposal,
+            n_samples=n_samples,
+            seed=seed,
+            fermion=fermion,
+            one_d_to_two_d=one_d_to_two_d,
+            site_order=site_order,
+            occupation_map=occupation_map,
+            sample_kwargs=sample_kwargs,
+            progress=progress,
+            amplitude_floor=amplitude_floor,
+            amplitude_cache=amplitude_cache,
+        )
+
     def measure_from_proposal(
         self,
         proposal,
@@ -1790,19 +2582,17 @@ class TorchVMCDriver:
         amplitude_floor=0.0,
         profile=False,
         deduplicate=True,
+        amplitude_cache=None,
     ):
         """Measure from an external MPS, BP, tree, or proposal batch.
 
-        The proposal is normalized at this boundary and the resulting batch
-        is delegated to :meth:`measure_samples`.  ``one_d_to_two_d`` and
-        ``fermion`` are required only when a bare MPS must be wrapped in a
-        :class:`pepsy.sampling.MpsSampler`; sampled MPS batches carry their
-        own coordinate map and occupation decoder.
+        This is the compatibility one-shot form of
+        :meth:`sample_from_proposal` followed by :meth:`measure_samples`.
+        ``one_d_to_two_d`` and ``fermion`` are required only when a bare MPS
+        must be wrapped in a :class:`pepsy.sampling.MpsSampler`; sampled MPS
+        batches carry their own coordinate map and occupation decoder.
         """
-        from .importance import measure_from_proposal
-
-        return measure_from_proposal(
-            self,
+        samples = self.sample_from_proposal(
             proposal,
             n_samples=n_samples,
             seed=seed,
@@ -1811,11 +2601,17 @@ class TorchVMCDriver:
             site_order=site_order,
             occupation_map=occupation_map,
             sample_kwargs=sample_kwargs,
-            observables=observables,
             progress=progress,
             amplitude_floor=amplitude_floor,
+            amplitude_cache=amplitude_cache,
+        )
+        return self.measure_samples(
+            samples,
+            observables=observables,
             profile=profile,
             deduplicate=deduplicate,
+            progress=progress,
+            amplitude_cache=amplitude_cache,
         )
 
     def importance_energy_estimate(

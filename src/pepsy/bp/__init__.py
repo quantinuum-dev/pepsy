@@ -10,6 +10,16 @@ contractions and corrections used by Pepsy:
 * :func:`loop_cluster_expand` -- the loop cluster expansion (arXiv:2510.05647),
 * :func:`loop_series_expand` -- the edge-resolved ``P + Q`` loop series
   (arXiv:2409.03108),
+* :func:`partial_trace_loop_cluster_expand` -- a D2BP loop-cluster reduced
+  density matrix and its scalar expectation companion,
+* :func:`partial_trace_loop_series_expand` -- a D2BP reduced-density-matrix
+  loop series and scalar local-observable companion,
+* :func:`partial_trace_open_loop_series_expand` -- an explicit open-edge
+  rho series retaining long-range excitation paths and closed loops,
+* :func:`partial_trace_open_loop_series_sweep` -- one-BP multi-support,
+  multi-cutoff open-rho diagnostics,
+* :func:`compute_local_expectation_open_loop_series` -- direct gate-inserted
+  scalar expectations from the same open paths and loops,
 * :func:`loop_expand` -- an explicit selector between the correction families.
 * :func:`partitioned_expand` -- the partitioned network expansion (PNE,
   arXiv:2512.10910), with :func:`recursive_partitioned_expand` for fixed
@@ -35,9 +45,30 @@ from .cluster import (
     select_bp_candidate,
 )
 from .series import (
+    OpenLoopBudgetError,
+    OpenLoopAdaptiveResult,
+    OpenLoopEnumerationLimitError,
+    OpenLoopMeasurementResult,
+    OpenLoopObservableTerm,
+    OpenLoopSeriesDiagnostic,
+    OpenLoopSeriesDiagnosticCache,
+    OpenLoopSeriesCache,
+    OpenLoopSeriesSweepResult,
     LoopSeriesCache,
     LoopSeriesResult,
     LoopSeriesTerm,
+    compute_local_expectation_edge_loop_series,
+    compute_local_expectation_open_loop_series,
+    compute_local_expectation_loop_cluster,
+    compute_local_expectation_loop_series,
+    partial_trace_edge_loop_series_expand,
+    partial_trace_open_loop_series_expand,
+    partial_trace_open_loop_series_sweep,
+    diagnose_open_loop_series,
+    diagnose_open_rho_series,
+    adaptive_open_loop_series,
+    partial_trace_loop_cluster_expand,
+    partial_trace_loop_series_expand,
     loop_series_expand,
 )
 from .expansion import loop_expand
@@ -83,6 +114,11 @@ from .relay import (
     relay_bp,
     two_norm_bp,
 )
+from .observables import (
+    compute_boundary_expectation,
+    compute_bp_path_expectation,
+    compute_path_cluster_expectation,
+)
 from .reduced_update import (
     ExactReducedUpdateProblem,
     LoopClusterReducedUpdateProblem,
@@ -114,8 +150,29 @@ __all__ = [
     "LoopClusterResult",
     "LoopClusterTerm",
     "LoopSeriesCache",
+    "OpenLoopSeriesCache",
+    "OpenLoopEnumerationLimitError",
+    "OpenLoopObservableTerm",
+    "OpenLoopSeriesDiagnostic",
+    "OpenLoopSeriesDiagnosticCache",
+    "OpenLoopBudgetError",
+    "OpenLoopAdaptiveResult",
+    "OpenLoopMeasurementResult",
+    "OpenLoopSeriesSweepResult",
     "LoopSeriesResult",
     "LoopSeriesTerm",
+    "compute_local_expectation_edge_loop_series",
+    "compute_local_expectation_open_loop_series",
+    "diagnose_open_loop_series",
+    "diagnose_open_rho_series",
+    "adaptive_open_loop_series",
+    "compute_local_expectation_loop_cluster",
+    "compute_local_expectation_loop_series",
+    "partial_trace_edge_loop_series_expand",
+    "partial_trace_open_loop_series_expand",
+    "partial_trace_open_loop_series_sweep",
+    "partial_trace_loop_cluster_expand",
+    "partial_trace_loop_series_expand",
     "RelayGaugeOptions",
     "ReducedALSSolution",
     "ReducedBondPair",
@@ -167,4 +224,7 @@ __all__ = [
     "solve_reduced_als",
     "su_cluster_reduced_update_problem",
     "two_norm_bp",
+    "compute_boundary_expectation",
+    "compute_path_cluster_expectation",
+    "compute_bp_path_expectation",
 ]

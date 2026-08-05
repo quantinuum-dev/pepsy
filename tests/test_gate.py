@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import quimb.tensor as qtn
 
-from pepsy import hrs_to_peps, ps_to_3dpeps, ps_to_peps
+from pepsy import hrs_to_peps, id_to_pepo, ps_to_3dpeps, ps_to_peps
 from pepsy.operators.gates import (
     build_mpo_from_gates,
     build_pepo_from_gates,
@@ -22,6 +22,7 @@ from pepsy.operators.gates import (
     y,
     z,
 )
+from pepsy.tensors.core import OneDMap
 
 
 def _dense_numpy(tn, out_inds):
@@ -1085,6 +1086,156 @@ def test_build_mpo_from_gates_accepts_single_gate_where():
     )
     assert mpo.L == 2
     assert mpo.max_bond() >= 1
+
+
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_native_fermion_gate_builders_preserve_symmetry(symmetry):
+    """Gate-to-MPO/PEPO builders accept native fermionic gates."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors.symmetric import Fermion
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    hopping_gate = fermion.hopping_gate(0.01, t=1.0)
+    mpo = build_mpo_from_gates(
+        hopping_gate,
+        where=(0, 1),
+        max_bond=8,
+        contract="split",
+    )
+    pepo = build_pepo_from_gates(
+        hopping_gate,
+        where=((0, 0), (0, 1)),
+        mapper=OneDMap(2, 2, mode="snake-row-major"),
+        max_bond=8,
+        contract="split",
+    )
+
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in mpo)
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
+    assert pepo.Lx == 2
+    assert pepo.Ly == 2
+
+
+def test_native_fermion_gate_builder_accepts_matching_supplied_pepo():
+    """A supplied native PEPO with matching sectors is accepted."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors.symmetric import Fermion
+
+    fermion = Fermion(spinful=True, symmetry="U1")
+    base = id_to_pepo((2, 2), fermion=fermion, cyclic=True)
+    result = build_pepo_from_gates(
+        fermion.hopping_gate(0.01, t=1.0),
+        where=((0, 0), (1, 0)),
+        mapper=OneDMap(2, 2, mode="snake-row-major"),
+        pepo_=base,
+        max_bond=8,
+        contract="split",
+    )
+
+    assert result.Lx == 2
+    assert result.Ly == 2
+    assert all(
+        type(tensor.data).__name__.endswith("FermionicArray")
+        for tensor in result
+    )
+
+
+@pytest.mark.parametrize(
+    ("gate_symmetry", "pepo_symmetry"),
+    [("U1U1", "U1"), ("U1", "U1U1")],
+)
+def test_native_fermion_gate_builder_rejects_symmetry_mismatch(
+    gate_symmetry,
+    pepo_symmetry,
+):
+    """Mismatched native Abelian groups fail before gate contraction."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors.symmetric import Fermion
+
+    gate_fermion = Fermion(spinful=True, symmetry=gate_symmetry)
+    pepo_fermion = Fermion(spinful=True, symmetry=pepo_symmetry)
+    base = id_to_pepo((2, 2), fermion=pepo_fermion, cyclic=True)
+
+    with pytest.raises(ValueError, match="does not match supplied PEPO symmetry"):
+        build_pepo_from_gates(
+            gate_fermion.hopping_gate(0.01, t=1.0),
+            where=((0, 0), (1, 0)),
+            mapper=OneDMap(2, 2, mode="snake-row-major"),
+            pepo_=base,
+            max_bond=8,
+            contract="split",
+        )
+
+
+def test_native_fermion_gate_builder_rejects_physical_map_mismatch():
+    """A same-group spinful gate cannot act on a spinless native PEPO."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors.symmetric import Fermion
+
+    gate_fermion = Fermion(spinful=True, symmetry="U1")
+    pepo_fermion = Fermion(spinful=False, symmetry="U1")
+    base = id_to_pepo((2, 2), fermion=pepo_fermion, cyclic=True)
+
+    with pytest.raises(ValueError, match="physical charge maps"):
+        build_pepo_from_gates(
+            gate_fermion.hopping_gate(0.01, t=1.0),
+            where=((0, 0), (1, 0)),
+            mapper=OneDMap(2, 2, mode="snake-row-major"),
+            pepo_=base,
+            max_bond=8,
+            contract="split",
+        )
+
+
+@pytest.mark.parametrize("symmetry", ["U1U1", "U1", "Z2"])
+def test_native_charged_gate_builders_require_opt_in(symmetry):
+    """Charged native gate streams work when explicitly enabled."""
+    pytest.importorskip("symmray")
+    from pepsy.tensors.symmetric import Fermion, symmray_mpo_summary
+
+    fermion = Fermion(spinful=True, symmetry=symmetry)
+    charged_gate = fermion.operator_term(
+        [(1.0, ((0, "double"), (1, "annihilate_up")))],
+        sites=(0, 1),
+        label="charged_gate_builder",
+    )
+
+    with pytest.raises(ValueError, match="allow_charged=True"):
+        build_mpo_from_gates(
+            charged_gate,
+            where=(0, 1),
+            max_bond=16,
+            contract="split",
+        )
+    with pytest.raises(ValueError, match="allow_charged=True"):
+        build_pepo_from_gates(
+            charged_gate,
+            where=((0, 0), (0, 1)),
+            mapper=OneDMap(2, 2, mode="snake-row-major"),
+            max_bond=16,
+            contract="split",
+        )
+
+    mpo = build_mpo_from_gates(
+        charged_gate,
+        where=(0, 1),
+        allow_charged=True,
+        max_bond=16,
+        contract="split",
+    )
+    pepo = build_pepo_from_gates(
+        charged_gate,
+        where=((0, 0), (0, 1)),
+        mapper=OneDMap(2, 2, mode="snake-row-major"),
+        allow_charged=True,
+        max_bond=16,
+        contract="split",
+    )
+
+    assert symmray_mpo_summary(mpo)["total_charge"] == charged_gate.charge
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in mpo)
+    assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
+    assert any(tensor.data.charge != fermion.zero_charge for tensor in pepo)
 
 
 def test_build_mpo_from_gates_forwards_max_bond_to_gate(monkeypatch):

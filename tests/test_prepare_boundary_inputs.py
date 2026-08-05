@@ -1491,6 +1491,125 @@ def test_contract_flat_quimb_routes_forward_strip_exponent(method):
         assert call_kwargs["final_contract_opts"]["optimize"] == "OPT"
 
 
+def test_contract_flat_ctmrg_enters_projector_compatibility_scope(monkeypatch):
+    """The shared flat CTMRG route enables the scoped Quimb workaround."""
+    events = []
+
+    class _Scope:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_ctmrg(self, **kwargs):
+            events.append("contract")
+            return 2.0
+
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "quimb_ctmrg_projector_compat",
+        lambda: _Scope(),
+    )
+
+    assert pepsy.contract_flat(_FlatTN(), method="ctmrg", chi=4) == 2.0
+    assert events == ["enter", "contract", "exit"]
+
+
+def test_contract_flat_ctmrg_forwards_stabilization_options():
+    """CTMRG stabilization controls should reach Quimb's projector path."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_ctmrg(self, **kwargs):
+            captured.update(kwargs)
+            return 2.0
+
+    reduce_opts = {"method": "cholesky", "shift": 1.0e-9}
+    out = pepsy.contract_flat(
+        _FlatTN(),
+        method="ctmrg",
+        chi=4,
+        ctmrg_reduce_opts=reduce_opts,
+        ctmrg_gauge_smudge=2.0e-8,
+    )
+
+    assert out == 2.0
+    assert captured["reduce_opts"] == reduce_opts
+    assert captured["gauge_smudge"] == 2.0e-8
+    assert reduce_opts == {"method": "cholesky", "shift": 1.0e-9}
+
+
+def test_contract_flat_ctmrg_adds_symmray_stabilization_defaults(monkeypatch):
+    """Symmray CTMRG should get a shift and gauge smudge by default."""
+    captured = {}
+
+    class _FlatTN:
+        Lx = 2
+        Ly = 2
+
+        def contract_ctmrg(self, **kwargs):
+            captured.update(kwargs)
+            return 2.0
+
+    monkeypatch.setattr(
+        pepsy.boundary.metrics,
+        "_uses_symmray_arrays",
+        lambda tn: tn is not None,
+    )
+
+    assert pepsy.contract_flat(_FlatTN(), method="ctmrg", chi=4) == 2.0
+    assert captured["reduce_opts"] == {"method": "eigh", "shift": 1.0e-12}
+    assert captured["gauge_smudge"] == 1.0e-10
+    assert captured["canonize_opts"] == {"smudge": 1.0e-10}
+
+
+def test_quimb_ctmrg_projector_compat_uses_live_insert_target(monkeypatch):
+    """CTMRG projector insertion should use the current network snapshot."""
+    import quimb.tensor.tensor_core as qtc
+
+    calls = []
+    def fake_insert(self, ltags, rtags, *args, insert_into=None, **kwargs):
+        calls.append((self, ltags, rtags, insert_into, kwargs))
+        return self
+
+    monkeypatch.setattr(
+        qtc.TensorNetwork,
+        "insert_compressor_between_regions",
+        fake_insert,
+    )
+
+    stale = object()
+    current = object()
+    with pepsy.boundary.metrics.quimb_ctmrg_projector_compat():
+        qtc.TensorNetwork.insert_compressor_between_regions(
+            stale,
+            ("L",),
+            ("R",),
+            insert_into=current,
+        )
+        qtc.TensorNetwork.insert_compressor_between_regions_(
+            stale,
+            ("L",),
+            ("R",),
+            insert_into=current,
+        )
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call[0] is current
+        assert call[3] is current
+        assert call[4]["inplace"] is True
+    assert qtc.TensorNetwork.insert_compressor_between_regions is fake_insert
+
+
 def test_infidelity_accepts_bdy_holder_dicts_and_fills_missing(monkeypatch):
     """infidelity should accept dict holders and populate missing bdy entries."""
     created = []

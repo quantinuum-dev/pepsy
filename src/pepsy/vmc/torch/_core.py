@@ -30,17 +30,25 @@ from ._common import (
 )
 from .results import (
     TorchChainDiagnostics,
+    TorchVMCConvergenceEstimate,
+    TorchVMCConvergenceReport,
+    TorchImportanceSamples,
     TorchMCMCSamples,
+    TorchDistributedMetadata,
     TorchMetropolisResult,
+    TorchSampleProvenance,
     TorchVMCImportanceEstimate,
     TorchVMCEnergyEstimate,
+    TorchVMCMeasurementRun,
     TorchVMCStepResult,
+    TorchVMCWarmupResult,
 )
 from .metadata import (
     TorchFermionVMCMetadata,
 )
 from .connections import (
     TorchConnections,
+    TorchFockTransitionPlan,
     compile_operator_sum_torch,
     torch_hamiltonian_connections,
 )
@@ -115,9 +123,15 @@ __all__ = [
     "TorchPEPSAmplitude",
     "TorchPEPSBoundaryAmplitude",
     "TorchConnections",
+    "TorchFockTransitionPlan",
     "TorchMetropolisResult",
+    "TorchImportanceSamples",
     "TorchMCMCSamples",
+    "TorchDistributedMetadata",
+    "TorchSampleProvenance",
     "TorchChainDiagnostics",
+    "TorchVMCConvergenceEstimate",
+    "TorchVMCConvergenceReport",
     "TorchMetropolisSampler",
     "TorchBPMetropolisSampler",
     "TorchVMCDriver",
@@ -125,7 +139,9 @@ __all__ = [
     "TorchVMCSetup",
     "TorchVMCEnergyEstimate",
     "TorchVMCImportanceEstimate",
+    "TorchVMCMeasurementRun",
     "TorchVMCStepResult",
+    "TorchVMCWarmupResult",
     "TorchSRResult",
     "TorchSquareLattice",
     "apply_torch_sr_update",

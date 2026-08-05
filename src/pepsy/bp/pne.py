@@ -27,6 +27,13 @@ import autoray as ar
 import numpy as np
 
 from .series import _build_bp
+from ._symmray import (
+    align_d2bp_messages as _align_symmray_d2bp_messages,
+    d2_operator as _symmray_d2_operator,
+    rank_one_d2_projector as _symmray_rank_one_d2_projector,
+    to_dense as _symmray_to_dense,
+    uses_symmray as _uses_symmray,
+)
 
 __all__ = [
     "PNEExpansionTerm",
@@ -232,6 +239,8 @@ def pne_projectors(source, indices=None):
     if indices is None:
         indices = tuple(bp.tn.inner_inds())
     indices = tuple(indices)
+    if bp.__class__.__name__ == "D2BP":
+        _align_symmray_d2bp_messages(bp)
     bp.normalize_message_pairs()
     return _projector_map(
         bp,
@@ -244,7 +253,7 @@ def pne_projector_diagnostics(projectors):
     """Return rank, idempotency, and Hermiticity diagnostics for ``P`` maps."""
     diagnostics = {}
     for index, operator in projectors.items():
-        matrix = np.asarray(ar.to_numpy(operator))
+        matrix = _symmray_to_dense(operator)
         if matrix.ndim > 2:
             half = int(np.sqrt(matrix.size))
             matrix = matrix.reshape(half, half)
@@ -277,6 +286,13 @@ def _rank_one_d1_projector(bp, index):
 
 def _rank_one_d2_projector(bp, index):
     left, right = tuple(bp.tn.ind_map[index])
+    if _uses_symmray(bp.tn):
+        return _symmray_rank_one_d2_projector(
+            bp.tn,
+            index,
+            bp.messages[index, left],
+            bp.messages[index, right],
+        )
     ml = bp.messages[index, left].reshape(-1)
     mr = bp.messages[index, right].reshape(-1)
     return ar.do("einsum", "i,j->ij", ml, mr)
@@ -316,6 +332,14 @@ def _operator_for(bp, index, projectors, *, complement):
         if complement:
             operator = ar.do("eye", expected) - operator
         return operator
+
+    if _uses_symmray(bp.tn):
+        return _symmray_d2_operator(
+            bp.tn,
+            index,
+            operator,
+            complement=complement,
+        )
 
     left = next(iter(bp.tn.ind_map[index]))
     dimension = bp.tn.tensor_map[left].ind_size(index)
@@ -495,6 +519,8 @@ def _partitioned_contract(
             "multi-index PNE partitions currently require form='combinatorial'"
         )
     if normalize:
+        if bp.__class__.__name__ == "D2BP":
+            _align_symmray_d2bp_messages(bp)
         bp.normalize_message_pairs()
         if not (bp.__class__.__name__ == "D1BP" and open_inds):
             bp.normalize_tensors()

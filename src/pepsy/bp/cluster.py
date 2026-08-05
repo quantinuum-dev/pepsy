@@ -74,6 +74,14 @@ import warnings
 import autoray as ar
 import numpy as np
 
+from ._symmray import (
+    align_d2bp_messages as _align_symmray_d2bp_messages,
+    dense_bp_tn as _dense_bp_tn,
+    dense_message_tree as _dense_message_tree,
+    restore_fermionic_dummy_modes as _restore_fermionic_dummy_modes,
+    uses_symmray as _uses_symmray,
+)
+
 __all__ = [
     "BPCandidateScore",
     "BPCandidateSelection",
@@ -137,6 +145,14 @@ def _run_plain_bp(
 ) -> dict[str, Any]:
     """Run quimb BP and record strict rather than plateau convergence."""
     info: dict[str, Any] = {}
+    if (
+        diis is not False
+        and bp.__class__.__name__ == "D2BP"
+        and _uses_symmray(bp.tn)
+    ):
+        # Symmray messages cannot be packed by Quimb's dense DIIS
+        # vectorizer; sequential D2BP remains native and convergent.
+        diis = False
     bp.run(
         max_iterations=max_iterations,
         tol=tol,
@@ -822,6 +838,10 @@ def linked_cluster_expand(
     if require_fixed_point is None:
         require_fixed_point = bool(run_bp)
 
+    if _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        messages = _dense_message_tree(messages)
+
     from .gauges import _validate_d1_graph
 
     _validate_d1_graph(tn)
@@ -1171,6 +1191,12 @@ def loop_cluster_expand(
     LoopClusterResult
     """
     key, bp_cls = _cluster_bp_class(norm)
+    if key == "2norm" and _uses_symmray(tn):
+        tn = _restore_fermionic_dummy_modes(tn)
+    if key == "1norm" and _uses_symmray(tn):
+        tn = _dense_bp_tn(tn)
+        messages = _dense_message_tree(messages)
+        gauges = _dense_message_tree(gauges)
     contract_opts = {} if contract_opts is None else dict(contract_opts)
     if run_bp and (
         not isinstance(max_iterations, (int, np.integer)) or max_iterations < 1
@@ -1321,6 +1347,7 @@ def loop_cluster_expand(
             autocomplete=autocomplete,
         )
     else:
+        _align_symmray_d2bp_messages(bp)
         estimate = _expand(
             bp, key, gloops, combine, optimize, strip_exponent, progbar
         )

@@ -66,7 +66,7 @@ model and returns the underlying native fermionic MPS directly; callers do not
 need to instantiate ``SymMPS``:
 
 ```python
-fh = py.Fermion(spinful=True, symmetry="U1U1", t=1.0, U=8.0)
+fh = py.Fermion(spinful=True, symmetry="U1U1")
 psi = py.ps_to_mps(8, fermion=fh, seed=7)
 
 # Override the product-state charge pattern when needed.
@@ -145,45 +145,60 @@ psi = py.hrs_to_peps(
 )
 ```
 
-The direct method uses Symmray's ``PEPS_fermionic_rand`` constructor and
-normalizes the returned PEPS. A unitary PEPS-growth method is not implemented
-yet. Both constructors return the underlying PEPS with native fermionic
-Symmray tensors; use ``SymPEPS`` only when wrapper methods or stored
-Hamiltonian metadata are needed.
+The direct method uses Symmray's ``PEPS_fermionic_rand`` constructor. It skips
+global normalization by default, avoiding an expensive CPU boundary-MPS
+contraction; this is safe for NetKet VMC because a global wavefunction scalar
+cancels from sampling and local-energy ratios. Pass ``normalize=True`` only
+when a globally normalized PEPS is explicitly required. A unitary PEPS-growth
+method is not implemented yet. Both constructors return the underlying PEPS
+with native fermionic Symmray tensors; use ``SymPEPS`` only when wrapper
+methods or stored Hamiltonian metadata are needed.
+
+For the corresponding full operator identity, use ``id_to_pepo`` with the
+same model:
+
+```python
+identity = py.id_to_pepo(
+    (Lx, Ly),
+    fermion=fh,
+    cyclic=True,
+)
+```
+
+This returns a native graded PEPO containing every local charge sector and
+repairs periodic bond orientations. ``occupations`` and ``site_charge`` are
+intentionally rejected here: they select a product-state sector and would
+make the result something other than the full identity.
 
 ## Unified native fermion helper
 
 ``Fermion`` is the model-facing helper for both one-mode spinless fermions
-and four-state spinful Hubbard sites. ``spinful`` selects the local space;
+and four-state spinful Hubbard sites. It owns the local space, symmetry, and
+optional backend conversion; physical couplings are passed explicitly when
+constructing a term, gate, or stream. ``spinful`` selects the local space;
 ``symmetry`` selects the conserved charge group. Spinless helpers support
 ``U1`` and ``Z2``; spinful helpers support ``U1``, ``Z2``, ``U1U1``, and
 ``Z2Z2``.
 
 ```python
-spinless = py.Fermion(
-    spinful=False,
-    symmetry="U1",
-    t=1.0,
-    V=0.5,
-    mu=0.0,
-)
+spinless = py.Fermion(spinful=False, symmetry="U1")
 
-spinful = py.Fermion(
-    spinful=True,
-    symmetry="U1U1",
-    t=1.0,
-    U=8.0,
-)
+spinful = py.Fermion(spinful=True, symmetry="U1U1")
 
 spinless.operator("number")
 spinful.operator("n_up")
 spinful.hopping_operator(spin="up")
 spinful.interaction_operator()
 spinful.chemical_potential_operator()
-spinful.onsite_gate(dt=0.01, site=0)
-spinful.gate("interaction", dt=0.01)
-spinless.gate_stream(edges, dt=0.01, order=2)
-spinful.local_terms(edges)  # native terms for energy optimization
+spinful.onsite_gate(dt=0.01, site=0, U=8.0)
+spinful.gate("interaction", dt=0.01, U=8.0)
+spinless.gate_stream(edges, dt=0.01, order=2, t=1.0, V=0.5, mu=0.0)
+spinful.local_terms(edges, t=1.0, U=8.0)  # native terms for optimization
+spinful.strang_gate_stream(
+    edges, dt=0.01, t=1.0, U=8.0, field_z=0.2
+)
+pairing = py.Fermion(spinful=False, symmetry="Z2")
+pairing.strang_gate_stream(edges, dt=0.01, t=1.0, pairing=0.2)
 ```
 
 The bare ``*_operator`` methods return explicit native fermionic operators,
@@ -247,7 +262,7 @@ expectation routines:
 edges = tuple(peps.edges)  # ((x0, y0), (x1, y1))
 sites = tuple(peps.sites)
 terms = {edge: -t * fermion.hopping_operator() for edge in edges}
-terms |= {site: fermion.onsite_term(site) for site in sites}
+terms |= {site: fermion.onsite_term(site, U=U, mu=mu) for site in sites}
 ham_peps = fermion.hamiltonian(terms)
 ```
 
@@ -258,7 +273,8 @@ for spinful fermions; spinless helpers provide ``create``, ``annihilate``,
 ``number``, and ``parity``. All returned operators retain the selected
 Symmray Abelian symmetry and fermionic grading.
 
-The site-layout ``local_terms`` mapping is keyed by edges. Its onsite
+The site-layout ``local_terms(edges, t=..., U=..., mu=...)`` mapping is keyed
+by edges. Its onsite
 Hubbard and chemical-potential pieces are divided by each site's coordination
 inside the incident edge tensors, so summing the mapping still includes each
 one-site contribution exactly once. If those pieces should be visibly
@@ -288,7 +304,7 @@ two-state mode layout. This returns qMERA ``LocalTerm`` objects rather than
 four-state site tensors, matching ``QMeraGeometry(site_modes=("up", "down"))``:
 
 ```python
-from pepsy.optimizers.mera import QMeraGeometry
+from pepsy.optimizers.qmera import QMeraGeometry
 
 geometry = QMeraGeometry(shape=3, site_modes=("up", "down"))
 qmera_terms = spinful.local_terms(geometry, layout="qmera")
@@ -313,9 +329,17 @@ the native Symmray gate directly. ``imaginary=True`` changes the evolution to
 ``exp(-dt H)``. The local exponential must be neutral so it remains in one
 conserved charge sector.
 
-``SpinfulFermion`` and ``SpinfulFermionHubbard`` remain compatibility aliases
-for ``Fermion``. ``SymmFermions.spinless(...)`` and
-``SymmFermions.spinful(...)`` are factory-style alternatives.
+``SpinfulFermion`` and ``SpinfulFermionHubbard`` remain compatibility
+constructors that fix ``spinful=True``. ``SymmFermions.spinless(...)`` and
+``SymmFermions.spinful(...)`` are factory-style alternatives with the same
+local-space guarantees.
+
+Automatic streams and edge-built Hamiltonians also accept ``field_x``,
+``field_y``, and ``field_z``. Transverse fields mix up/down occupation and
+therefore require spinful total-``U1`` or ``Z2`` symmetry; a longitudinal
+``field_z`` also works with spin-resolved ``U1U1``/``Z2Z2``. The ``pairing``
+and ``pairing_phase`` options describe a parity-preserving spinless pairing
+term and require ``Fermion(spinful=False, symmetry="Z2")``.
 
 ## Native spinful-fermion helper
 
@@ -330,19 +354,19 @@ gates.
 ```python
 fermions = py.SpinfulFermion(
     symmetry="U1U1",  # use "U1" to conserve only total particle number
-    t=1.0,
-    U=8.0,
 )
 
 site_charge = fermions.half_filled_site_charge(L=16)
 number_up = fermions.observable("number_up")
 pair_create = fermions.observable("pair_create")
-hamiltonian = fermions.hamiltonian(edges)
+hamiltonian = fermions.hamiltonian(edges, t=1.0, U=8.0)
 
 # A symmetric, edge-coloured second-order step.  Each colour contains
 # vertex-disjoint hopping bonds; forward then reverse colours make the hopping
 # product formula second order as well.
-gates = fermions.strang_gate_stream(edges, dt=0.01, sites=range(16))
+gates = fermions.strang_gate_stream(
+    edges, dt=0.01, sites=range(16), t=1.0, U=8.0
+)
 ```
 
 ``py.SymmFermions`` is the companion namespace for future symmetric-fermion
@@ -371,7 +395,7 @@ edges = setup.edges
 occupations = setup.occupations
 
 terms = {edge: -t * fermion.hopping_operator() for edge in edges}
-terms |= {site: fermion.onsite_term(site) for site in sites}
+terms |= {site: fermion.onsite_term(site, U=U, mu=mu) for site in sites}
 ham = fermion.hamiltonian(terms)
 
 gate_stream = fermion.strang_gate_stream(
@@ -379,6 +403,9 @@ gate_stream = fermion.strang_gate_stream(
     dt=0.01,
     sites=sites,
     imaginary=True,
+    t=t,
+    U=U,
+    mu=mu,
 )
 ```
 
@@ -509,6 +536,8 @@ Current support is:
 - spinful Fermi-Hubbard ``model="fermi_hubbard_u1u1"`` with
   ``symmetry="U1U1"``, hopping, onsite interaction, nearest-neighbor density
   interaction, and chemical-potential terms.
+- native graded MPO conversion for arbitrary homogeneous-charge one- or multi-site
+  ``FermionicArray`` terms, including non-contiguous support;
 
 Spinful total-particle-number ``model="fermi_hubbard"`` with ``symmetry="U1"``
 still raises ``NotImplementedError``; use ``model="fermi_hubbard_u1u1"`` when
@@ -554,6 +583,100 @@ mpo = ham.to_mpo(mapper=mapper)
 # Equivalent when a workflow already stores the maps explicitly:
 mpo = ham.to_mpo(idx2coo=idx2coo, coo2idx=coo2idx)
 ```
+
+For the common edge-built Fermi-Hubbard path, the model helper is equivalent
+and keeps the selected symmetry attached to the construction:
+
+```python
+fermion = py.Fermion(spinful=True, symmetry="U1U1")
+mpo = fermion.build_mpo(
+    [(0, 1), (1, 2)], L=3, t=1.0, U=8.0, mu=0.0, max_bond=16
+)
+```
+
+This returns the native graded MPO by default. For the explicit
+Jordan-Wigner-compatible convention, pass ``fermionic=False``:
+
+```python
+mpo = fermion.build_mpo(
+    [(0, 1), (1, 2)], L=3, t=1.0, U=8.0, mu=0.0, max_bond=16,
+    fermionic=False,
+)
+```
+
+Native fermionic gate streams from the same ``Fermion`` model can be passed to
+``MpoOptimizer``; the optimizer preserves the graded Symmray tensors and their
+charge blocks during replay and compression. ``fermionic=False`` remains the
+explicit Jordan-Wigner compatibility choice for ``SymHamiltonian.to_mpo``.
+
+For a coordinate-keyed native operator on a 2D lattice, ``Fermion.to_pepo``
+provides the corresponding PEPO embedding:
+
+```python
+left, right = (0, 1), (2, 2)
+fermion = py.Fermion(spinful=True, symmetry="U1U1")
+term = fermion.operator_term(
+    [(1.0, ((left, "create_up"), (right, "annihilate_up")))],
+    sites=(left, right),
+    add_hc=True,
+)
+pepo = fermion.to_pepo(
+    {(left, right): term},
+    Lx=3,
+    Ly=3,
+    fermionic=True,
+    max_bond=16,
+)
+assert all(type(tensor.data).__name__.endswith("FermionicArray") for tensor in pepo)
+```
+
+``to_pepo`` preserves native Symmray grading and supports the spinful
+``U1U1``, ``U1``, and ``Z2`` paths as well as spinless ``U1`` and ``Z2``.
+Its current PEPO representation uses the selected snake-style MPO ordering
+for fermionic channels; the added transverse lattice bonds are dimension one
+unless periodic PEPO bonds are requested with ``cyclic=True``. Terms should
+be homogeneous in charge for one MPO/PEPO. Native ``fermionic=True``
+construction supports both neutral and nonzero charges by carrying the
+operator charge at the open MPO/PEPO boundary. For a mixed-charge collection,
+pass ``charge_sectors=True`` to receive ``{charge: PEPO}`` (or ``{charge:
+MPO}`` from ``to_mpo``). For odd-parity terms, pass ``label=`` to
+``operator_term`` so the native dummy-mode phase metadata is retained. The
+Jordan--Wigner compatibility path remains neutral-only. For a one-site
+coordinate key, use ``((x, y),)`` rather than ``(x, y)``.
+
+The same native PEPO route is available from an existing Hamiltonian or as a
+model-facing shorthand:
+
+```python
+pepo = hamiltonian.to_pepo(
+    Lx=3,
+    Ly=3,
+    mapper=py.OneDMap(3, 3, mode="snake-row-major"),
+    fermionic=True,
+)
+pepo = fermion.build_pepo(
+    {(left, right): hopping},
+    Lx=3,
+    Ly=3,
+    mapper=py.OneDMap(3, 3, mode="snake-row-major"),
+    fermionic=True,
+)
+```
+
+For Hamiltonian-builder workflows, ``ham_tn.build_pepo(..., fermion=fermion,
+fermionic=True, mapper=...)`` is equivalent.
+
+Pass ``to_backend=`` to ``Fermion.to_mpo``, ``Fermion.to_pepo``, or
+``Fermion.build_mpo`` when the returned Symmray blocks should use a selected
+array backend. Native MPO
+assembly, replay, and exact energy measurement are supported. Native MPO
+energy applies the operator sitewise as a factorized graded MPO-MPS
+contraction, so its cost is controlled by the MPS and MPO bond dimensions.
+
+``Fermion.build_mpo(...)`` is the canonical native construction and defaults
+to graded Symmray tensors. Passing ``fermionic=False`` selects the explicit
+Jordan--Wigner compatibility MPO path. ``Fermion.to_mpo(...)`` remains a
+compatibility alias.
 
 For periodic square lattices encoded as long-range edges in an OBC MPS/MPO,
 ``mode="folded-snake"`` alternates opposite columns before snaking. On a 6 by
@@ -720,6 +843,26 @@ Symmray-compatible), so it is deferred. For 2D today: order the lattice with
 ``OneDMap(..., mode="folded-snake")`` to maximize nearest-neighbour bonds, use
 ``to_mpo`` for the residual long-range terms, or evolve via a Symmray MPO-TDVP
 sweep (which preserves U1xU1 without gates).
+
+When the circuit gate stream should choose the 1D path, use the MPS layout
+finder as a mapping mode. This remains a coordinate/index operation only: it
+does not allocate an MPS or perform replay, SVD, or truncation.
+
+```python
+mapper = py.OneDMap(
+    Lx=6,
+    Ly=6,
+    mode="finder",
+    gate_stream=gates,
+    layout_kwargs={"objective": "compression", "order": "quality"},
+)
+idx2coo, coo2idx = mapper.build()
+```
+
+The finder assumes the stream uses compact logical labels in
+`range(Lx * Ly)`. Set `finder_base_mode="row-major"` (or another regular
+mode) when those labels come from a different initial traversal. A previously
+computed MPS layout plan may be passed as `finder=plan`.
 
 For a flattened MPS path, feed the same canonical bundled stream to
 ``MpsOptimizer``:

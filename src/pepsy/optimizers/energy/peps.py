@@ -70,6 +70,8 @@ class PepsEnergyOptimizer:
         "contraction_opt",
         "compute_kwargs",
     })
+    _VALIDATION_TOL = 1.0e-8
+    _VALIDATION_MAX_CHECKS = 5
 
     def __init__(
         self,
@@ -295,6 +297,261 @@ class PepsEnergyOptimizer:
             return bool(np.isfinite(float(value)))
         except (TypeError, ValueError):
             return False
+
+    @classmethod
+    def _track_tnopt_best_checkpoint(cls, tnopt):
+        """Track the parameter vector for the best finite loss seen.
+
+        Quimb records ``TNOptimizer.loss_best`` as a scalar only.  That is
+        insufficient when an optimizer backend aborts after evaluating a
+        worse trial, because the current vector can then be worse than the
+        best vector.  Wrapping the backend handler covers both SciPy's
+        ``vectorized_value_and_grad`` route and Quimb's direct NLopt callback.
+        """
+        vectorizer = getattr(tnopt, "vectorizer", None)
+        vector = getattr(vectorizer, "vector", None)
+        tracker = {
+            "loss": float("inf"),
+            "vector": None if vector is None else vector.copy(),
+        }
+        if vector is None:
+            return tracker
+
+        def record(result):
+            if not cls._is_finite_number(result):
+                return
+            loss = float(result)
+            if loss < tracker["loss"]:
+                tracker["loss"] = loss
+                tracker["vector"] = vector.copy()
+
+        handler = getattr(tnopt, "handler", None)
+        if handler is None:
+            return tracker
+
+        value_and_grad = getattr(handler, "value_and_grad", None)
+        if callable(value_and_grad):
+            def tracked_value_and_grad(arrays):
+                result, gradients = value_and_grad(arrays)
+                record(result)
+                return result, gradients
+
+            handler.value_and_grad = tracked_value_and_grad
+
+        value = getattr(handler, "value", None)
+        if callable(value):
+            def tracked_value(arrays):
+                result = value(arrays)
+                record(result)
+                return result
+
+            handler.value = tracked_value
+
+        return tracker
+
+    @staticmethod
+    def _is_recoverable_optimizer_error(exc, optlib):
+        """Return whether an optimizer exception should yield its best state."""
+        if str(optlib).strip().lower() == "nlopt":
+            # nlopt.runtime_error and nlopt.roundoff_limited are not Python's
+            # built-in RuntimeError, but all are exposed from the ``nlopt``
+            # module and represent an optimizer stop rather than a loss bug.
+            return "nlopt" in type(exc).__module__.lower()
+        return isinstance(exc, RuntimeError)
+
+    @classmethod
+    def _best_tnopt_state(cls, tnopt, tracker):
+        """Restore and extract the best tracked TNOptimizer checkpoint."""
+        vector = tracker.get("vector")
+        if vector is not None:
+            tnopt.vectorizer.vector[:] = vector
+        return tnopt.get_tn_opt()
+
+    @staticmethod
+    def _validation_chi(chi):
+        """Choose the automatic higher-chi validation bond dimension."""
+        if isinstance(chi, Integral) and not isinstance(chi, bool):
+            return max(1, 2 * int(chi))
+        if isinstance(chi, (tuple, list)):
+            return tuple(max(1, 2 * int(value)) for value in chi)
+        return chi
+
+    @classmethod
+    def _validation_loss(cls, state, *, terms, loss_kwargs):
+        """Evaluate a candidate with the automatic validation bond dimension."""
+        kwargs = dict(loss_kwargs)
+        kwargs["chi"] = cls._validation_chi(kwargs["chi"])
+        return cls._loss_state(state, terms=terms, **kwargs)
+
+    def _optimize_with_validation(
+        self,
+        tnopt,
+        *,
+        n,
+        optimize_kwargs,
+        optlib,
+        best_tracker,
+        terms,
+        loss_kwargs,
+        autodiff_backend,
+        device,
+    ):
+        """Run short optimizer chunks with sparse higher-chi rollback checks."""
+
+        def validation_state():
+            # Quimb's ``TNOptimizer.get_tn_opt`` deliberately converts its
+            # injected variables back to NumPy. That is fine for ordinary
+            # dense PEPS, but native Symmray PEPS can then contain NumPy
+            # blocks next to Torch blocks. Convert the complete candidate
+            # before contracting the validation loss.
+            candidate = tnopt.get_tn_opt()
+            return self._state_for_autodiff_backend(
+                candidate,
+                self.state,
+                autodiff_backend,
+                device=device,
+            )
+
+        n_total = max(0, int(n))
+        initial_vector = tnopt.vectorizer.vector.copy()
+        validated_vector = initial_vector.copy()
+        initial_state = validation_state()
+        initial_loss = self._validation_loss(
+            initial_state,
+            terms=terms,
+            loss_kwargs=loss_kwargs,
+        )
+        if not self._is_finite_number(initial_loss):
+            warnings.warn(
+                "PEPS validation energy is non-finite for the initial state; "
+                "returning the unmodified state.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            tnopt.vectorizer.vector[:] = initial_vector
+            self.validation_history = [(0, None)]
+            return validation_state()
+
+        validated_loss = float(initial_loss)
+        self.validation_history = [(0, validated_loss)]
+        if n_total == 0:
+            tnopt.vectorizer.vector[:] = validated_vector
+            return validation_state()
+
+        chunk_size = max(
+            10,
+            int(np.ceil(n_total / self._VALIDATION_MAX_CHECKS)),
+        )
+        completed = 0
+        while completed < n_total:
+            chunk = min(chunk_size, n_total - completed)
+            try:
+                tnopt.optimize(n=chunk, **optimize_kwargs)
+            except Exception as exc:
+                if not self._is_recoverable_optimizer_error(exc, optlib):
+                    raise
+                tnopt.vectorizer.vector[:] = validated_vector
+                warnings.warn(
+                    f"{optlib} optimization stopped early ({exc}); returning "
+                    "the last validated PEPS state.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                break
+
+            completed += chunk
+            candidate_vector = best_tracker.get("vector")
+            if candidate_vector is None:
+                candidate_vector = tnopt.vectorizer.vector.copy()
+            tnopt.vectorizer.vector[:] = candidate_vector
+            candidate_state = validation_state()
+            candidate_loss = self._validation_loss(
+                candidate_state,
+                terms=terms,
+                loss_kwargs=loss_kwargs,
+            )
+            candidate_finite = self._is_finite_number(candidate_loss)
+            if (
+                not candidate_finite
+                or float(candidate_loss) > validated_loss + self._VALIDATION_TOL
+            ):
+                tnopt.vectorizer.vector[:] = validated_vector
+                self.validation_history.append(
+                    (
+                        completed,
+                        None if not candidate_finite else float(candidate_loss),
+                    )
+                )
+                warnings.warn(
+                    "PEPS validation energy worsened or became non-finite; "
+                    "rolling back to the last validated state.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                break
+
+            validated_vector = candidate_vector.copy()
+            validated_loss = float(candidate_loss)
+            self.validation_history.append((completed, validated_loss))
+
+        tnopt.vectorizer.vector[:] = validated_vector
+        return validation_state()
+
+    @staticmethod
+    def _coerce_parameter_bounds(bounds, dimension):
+        """Validate and normalize flat-parameter bounds for TNOptimizer."""
+        array = np.asarray(bounds, dtype=float)
+        if array.shape == (2,):
+            array = np.broadcast_to(array, (dimension, 2)).copy()
+        if array.shape != (dimension, 2) and array.shape == (2, dimension):
+            array = array.T
+        if array.shape != (dimension, 2):
+            raise ValueError(
+                "parameter bounds must have shape (dimension, 2) or "
+                "be a (lower, upper) pair of length dimension."
+            )
+        if not np.all(np.isfinite(array)):
+            raise ValueError("parameter bounds must contain only finite values.")
+        if np.any(array[:, 0] > array[:, 1]):
+            raise ValueError("each parameter lower bound must not exceed its upper bound.")
+        return array
+
+    @classmethod
+    def _apply_parameter_bounds(
+        cls,
+        tnopt,
+        *,
+        bounds=None,
+        max_parameter_step=None,
+    ):
+        """Apply optional cheap trust-box bounds to a TNOptimizer."""
+        if bounds is not None and max_parameter_step is not None:
+            raise ValueError(
+                "pass either bounds or max_parameter_step, not both."
+            )
+        if bounds is None and max_parameter_step is None:
+            return
+
+        vector = np.asarray(tnopt.vectorizer.vector, dtype=float)
+        dimension = vector.size
+        if max_parameter_step is not None:
+            try:
+                step = float(max_parameter_step)
+            except (TypeError, ValueError) as exc:
+                raise TypeError("max_parameter_step must be a positive number.") from exc
+            if not np.isfinite(step) or step <= 0.0:
+                raise ValueError("max_parameter_step must be a positive finite number.")
+            bounds = np.column_stack((vector - step, vector + step))
+        bounds = cls._coerce_parameter_bounds(bounds, dimension)
+        # Quimb's public ``bounds`` setter accepts only one scalar pair and
+        # broadcasts it across all variables. Preserve per-variable bounds by
+        # writing its backing field directly; the optimizer backends read the
+        # public property afterward. Small test doubles without that property
+        # retain the ordinary assignment path.
+        if isinstance(getattr(type(tnopt), "bounds", None), property):
+            tnopt._bounds = bounds
+        else:
+            tnopt.bounds = bounds
 
     @classmethod
     def _initial_gradient_status(cls, tnopt):
@@ -662,6 +919,17 @@ class PepsEnergyOptimizer:
         self._prepare_autodiff_backend(autodiff_backend)
         incoming_constants = dict(loss_constants or {})
         terms = incoming_constants.pop("terms", self.terms)
+        if str(autodiff_backend).strip().lower() == "torch":
+            # Symmray sends raw Torch blocks through Quimb's composed split
+            # drivers. Those drivers bypass Autoray's ordinary linalg
+            # registrations, so install the matching stable block rules too.
+            from ...backends.linalg_torch import (  # pylint: disable=import-outside-toplevel
+                reg_quimb_torch_split_drivers,
+            )
+
+            dtype_name = self._autodiff_dtype_name(self.state, terms)
+            mode = "complex" if "complex" in str(dtype_name).lower() else "real"
+            reg_quimb_torch_split_drivers(mode=mode)
         constants = {
             "terms": self._terms_for_autodiff_backend(
                 terms,
@@ -700,9 +968,25 @@ class PepsEnergyOptimizer:
         normalize_kwargs: Mapping[str, Any] | None = None,
         check_finite_gradient: bool = True,
         fallback_boundary_mode: str | None = "exact",
+        bounds=None,
+        max_parameter_step: float | None = None,
+        validate: bool = False,
         **optimize_kwargs,
     ):
-        """Run ``TNOptimizer.optimize`` and store the optimized PEPS."""
+        """Run ``TNOptimizer.optimize`` and store the optimized PEPS.
+
+        ``max_parameter_step`` creates a cheap hard trust box around the
+        initial flattened PEPS parameters. It is useful for noisy or
+        truncated PEPS objectives where an L-BFGS line search can probe a
+        very high-energy trial point. It does not perform an additional
+        energy evaluation. Pass explicit ``bounds`` instead when different
+        lower and upper limits are required.
+
+        ``validate=True`` runs the optimizer in a few chunks and checks each
+        candidate with an automatically doubled boundary bond dimension. A
+        candidate that worsens this validation energy is rejected and the
+        last validated state is returned.
+        """
         merged_loss_kwargs = self._merge_opts(
             self.loss_kwargs,
             self._pick_loss_kwargs(loss_kwargs),
@@ -716,6 +1000,14 @@ class PepsEnergyOptimizer:
             jit_fn=jit_fn,
             device=device,
         )
+        self._apply_parameter_bounds(
+            tnopt,
+            bounds=bounds,
+            max_parameter_step=max_parameter_step,
+        )
+        optlib = optimize_kwargs.get("optlib", "scipy")
+        best_tracker = self._track_tnopt_best_checkpoint(tnopt)
+        active_loss_kwargs = merged_loss_kwargs
         if check_finite_gradient:
             finite_gradient, finite_loss = self._initial_gradient_status(tnopt)
             fallback_mode = (
@@ -731,6 +1023,7 @@ class PepsEnergyOptimizer:
             ):
                 fallback_loss_kwargs = dict(merged_loss_kwargs)
                 fallback_loss_kwargs["boundary_mode"] = fallback_mode
+                active_loss_kwargs = fallback_loss_kwargs
                 tnopt = self.make_tn_optimizer(
                     loss_kwargs=fallback_loss_kwargs,
                     loss_constants=loss_constants,
@@ -740,6 +1033,12 @@ class PepsEnergyOptimizer:
                     jit_fn=jit_fn,
                     device=device,
                 )
+                self._apply_parameter_bounds(
+                    tnopt,
+                    bounds=bounds,
+                    max_parameter_step=max_parameter_step,
+                )
+                best_tracker = self._track_tnopt_best_checkpoint(tnopt)
                 finite_gradient, fallback_loss = self._initial_gradient_status(tnopt)
                 finite_loss = fallback_loss if fallback_loss is not None else finite_loss
             if not finite_gradient:
@@ -753,7 +1052,45 @@ class PepsEnergyOptimizer:
                 if return_losses:
                     return self.state, tuple(self.losses)
                 return self.state
-        out = tnopt.optimize(n=n, **optimize_kwargs)
+        if validate:
+            validation_constants = dict(loss_constants or {})
+            validation_terms = validation_constants.pop("terms", self.terms)
+            validation_terms = self._terms_for_autodiff_backend(
+                validation_terms,
+                self.state,
+                autodiff_backend,
+                device=device,
+            )
+            out = self._optimize_with_validation(
+                tnopt,
+                n=n,
+                optimize_kwargs=optimize_kwargs,
+                optlib=optlib,
+                best_tracker=best_tracker,
+                terms=validation_terms,
+                loss_kwargs=active_loss_kwargs,
+                autodiff_backend=autodiff_backend,
+                device=device,
+            )
+        else:
+            try:
+                out = tnopt.optimize(n=n, **optimize_kwargs)
+            except Exception as exc:
+                if not self._is_recoverable_optimizer_error(exc, optlib):
+                    raise
+                out = self._best_tnopt_state(tnopt, best_tracker)
+                best_loss = best_tracker["loss"]
+                if self._is_finite_number(best_loss):
+                    message = (
+                        f"{optlib} optimization stopped early ({exc}); returning "
+                        f"the best finite checkpoint with loss {best_loss:.12g}."
+                    )
+                else:
+                    message = (
+                        f"{optlib} optimization stopped before a finite loss was "
+                        f"recorded ({exc}); returning the initial state."
+                    )
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
         self.losses = list(getattr(tnopt, "losses", ()))
         out = self._state_for_autodiff_backend(
             out,
@@ -774,13 +1111,19 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
 
     The objective is the normalized local expectation value
     ``<psi|H|psi>/<psi|psi>``. Local-term Hamiltonians are evaluated with
-    ``MPS.compute_local_expectation_exact(...)``. MPO Hamiltonians are evaluated
-    directly as ``(<psi| & H_mpo & |psi>).contract(all, optimize=...)``, using
-    ``contraction_opt`` for the full network contraction. Native fermionic
-    Symmray states use native local terms by default when a mapped
-    ``SymHamiltonian`` is supplied. A bosonic/Jordan-Wigner Symmray MPO cannot
-    be silently contracted with a native fermionic state, since the required
-    re-encoding can create very large block contractions; pass
+    ``MPS.compute_local_expectation_exact(...)``. Bosonic MPO Hamiltonians are
+    evaluated directly as ``(<psi| & H_mpo & |psi>).contract(all,
+    optimize=...)``, using ``contraction_opt`` for the full network
+    contraction. Native fermionic MPOs are applied sitewise as a factorized
+    MPO-MPS network, which preserves Symmray's graded contraction ordering
+    without materializing a global operator. Repeated native-MPO evaluations
+    reuse a per-optimizer contraction path cache. Optional compression can be
+    requested with ``native_mpo_compression={"max_bond": ..., "cutoff": ...}``;
+    it is disabled by default so the energy remains exact.
+    Native fermionic Symmray states use native local terms by default when a
+    mapped ``SymHamiltonian`` is supplied. A bosonic/Jordan-Wigner Symmray MPO
+    cannot be silently contracted with a native fermionic state, since the
+    required re-encoding can create very large block contractions; pass
     ``allow_encoding_conversion=True`` to explicitly request that conversion.
     Hamiltonians can be supplied as a ``qtn.MatrixProductOperator``, a
     ``qtn.LocalHam1D``-like object with ``.terms``, a Pepsy symmetric
@@ -798,6 +1141,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         "compute_kwargs",
         "progbar",
         "allow_encoding_conversion",
+        "native_mpo_compression",
     })
 
     def __init__(
@@ -814,6 +1158,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         compute_kwargs: Mapping[str, Any] | None = None,
         loss_kwargs: Mapping[str, Any] | None = None,
         allow_encoding_conversion: bool = False,
+        native_mpo_compression: Mapping[str, Any] | None = None,
     ):
         if hamiltonian is not None and terms is not None:
             raise TypeError("pass either hamiltonian or terms, not both")
@@ -830,7 +1175,13 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             "progbar": progbar,
             "compute_kwargs": {} if compute_kwargs is None else dict(compute_kwargs),
             "allow_encoding_conversion": bool(allow_encoding_conversion),
+            "native_mpo_compression": (
+                None
+                if native_mpo_compression is None
+                else dict(native_mpo_compression)
+            ),
         }
+        self._native_mpo_path_optimizer = None
         if loss_kwargs is not None:
             self.set_loss_kwargs(**loss_kwargs)
 
@@ -868,6 +1219,25 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             "state must be an MPS-like object with "
             "compute_local_expectation_exact()."
         )
+
+    def _prepare_native_mpo_options(self, state, terms, options):
+        """Reuse one cotengra optimizer for repeated native MPO losses."""
+        options = dict(options)
+        if not self._is_mpo_hamiltonian(terms):
+            return options
+        if self._symmray_encoding(state) != "native_fermionic":
+            return options
+        if self._symmray_encoding(terms) != "native_fermionic":
+            return options
+
+        contraction_opt = options.get("contraction_opt", "auto-hq")
+        if contraction_opt is None or contraction_opt == "auto-hq":
+            if self._native_mpo_path_optimizer is None:
+                self._native_mpo_path_optimizer = build_optimizer(
+                    progbar=bool(options.get("progbar", False)),
+                )
+            options["contraction_opt"] = self._native_mpo_path_optimizer
+        return options
 
     @staticmethod
     def _is_mpo_hamiltonian(hamiltonian):
@@ -915,6 +1285,65 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
     @classmethod
     def _mpo_uses_bosonic_symmray(cls, mpo):
         return cls._symmray_encoding(mpo) == "bosonic_symmray"
+
+    @classmethod
+    def _native_mpo_expectation(
+        cls,
+        state,
+        mpo,
+        *,
+        normalized=True,
+        contraction_opt="auto-hq",
+        native_mpo_compression=None,
+    ):
+        """Evaluate a native graded MPO through a factorized MPO-MPS network.
+
+        Symmray fermionic contractions are order-sensitive. A conventional
+        MPO sandwich allows Quimb's path optimizer to interleave local MPO
+        factors with bra and ket tensors, which can change the graded phase.
+        Applying the MPO sitewise first keeps each local graded contraction
+        together and leaves the operator bond factorized, so the contraction
+        scales with the MPS and MPO bond dimensions rather than the global
+        Hilbert-space dimension.
+        """
+        gated = qtn.tensor_network_apply_op_vec(
+            mpo,
+            state,
+            which_A="lower",
+            contract=True,
+            fuse_multibonds=True,
+            compress=False,
+            inplace=False,
+            inplace_A=False,
+        )
+        if native_mpo_compression is not None:
+            compression_opts = dict(native_mpo_compression)
+            max_bond = compression_opts.get("max_bond")
+            if max_bond is None:
+                raise ValueError(
+                    "native_mpo_compression requires an explicit max_bond."
+                )
+            max_bond = int(max_bond)
+            if max_bond < 1:
+                raise ValueError(
+                    "native_mpo_compression max_bond must be positive."
+                )
+            cutoff = compression_opts.get("cutoff", 1e-12)
+            if cutoff < 0.0:
+                raise ValueError(
+                    "native_mpo_compression cutoff must be non-negative."
+                )
+            compression_opts["max_bond"] = max_bond
+            compression_opts["cutoff"] = cutoff
+            compression_opts.setdefault("method", "svd")
+            gated.compress(**compression_opts)
+        value = (state.H | gated).contract(all, optimize=contraction_opt)
+        if normalized:
+            norm = (state.H & state).contract(all, optimize=contraction_opt)
+            if norm == 0.0:
+                raise ValueError("Cannot compute normalized energy for a zero-norm state.")
+            value = value / norm
+        return value
 
     @staticmethod
     def _symmray_symmetry_name(data):
@@ -1306,6 +1735,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         normalized=True,
         contraction_opt="auto-hq",
         allow_encoding_conversion=False,
+        native_mpo_compression=None,
     ):
         if contraction_opt is None:
             contraction_opt = build_optimizer(progbar=False)
@@ -1324,6 +1754,24 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                 "`hamiltonian=ham.terms`) for large-chi energy evaluation, or "
                 "pass `allow_encoding_conversion=True` to explicitly request "
                 "the potentially memory-intensive re-encoding."
+            )
+        if mpo_encoding == "native_fermionic":
+            if state_encoding != "native_fermionic":
+                raise ValueError(
+                    "Native fermionic MPO energy evaluation requires a native "
+                    "fermionic Symmray MPS state."
+                )
+            return cls._native_mpo_expectation(
+                state,
+                mpo,
+                normalized=normalized,
+                contraction_opt=contraction_opt,
+                native_mpo_compression=native_mpo_compression,
+            )
+        if native_mpo_compression is not None:
+            raise ValueError(
+                "native_mpo_compression is only supported for native "
+                "fermionic Symmray MPOs."
             )
         if cls._mpo_uses_bosonic_symmray(mpo):
             ket = cls._bosonize_fermionic_tn(state)
@@ -1355,6 +1803,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         compute_kwargs=None,
         progbar=False,
         allow_encoding_conversion=False,
+        native_mpo_compression=None,
     ):
         state = cls._as_mps_state(state)
         terms = cls._terms_from_hamiltonian(terms)
@@ -1370,6 +1819,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                 normalized=normalized,
                 contraction_opt=contraction_opt,
                 allow_encoding_conversion=allow_encoding_conversion,
+                native_mpo_compression=native_mpo_compression,
             )
             if energy_per_site:
                 value = value / cls._num_sites(state)
@@ -1410,6 +1860,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
         if terms is not None:
             terms_use = self._terms_from_hamiltonian(terms)
         opts = self._merge_opts(self.loss_kwargs, self._pick_loss_kwargs(kwargs))
+        opts = self._prepare_native_mpo_options(state, terms_use, opts)
         return self._loss_state(state, terms=terms_use, **opts)
 
     def energy(self, state=None, *, hamiltonian=None, terms=None, **kwargs):
@@ -1422,6 +1873,7 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
             terms_use = self._terms_from_hamiltonian(terms)
 
         opts = self._merge_opts(self.loss_kwargs, self._pick_loss_kwargs(kwargs))
+        opts = self._prepare_native_mpo_options(state, terms_use, opts)
         opts_full = dict(opts)
         opts_full["energy_per_site"] = False
         energy = self._loss_state(state, terms=terms_use, **opts_full)
@@ -1439,6 +1891,11 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                 "contraction_opt": opts["contraction_opt"],
                 "progbar": opts["progbar"],
                 "compute_kwargs": dict(opts["compute_kwargs"]),
+                "native_mpo_compression": (
+                    None
+                    if opts["native_mpo_compression"] is None
+                    else dict(opts["native_mpo_compression"])
+                ),
             },
         )
 
@@ -1477,6 +1934,11 @@ class MpsEnergyOptimizer(PepsEnergyOptimizer):
                 terms = terms.terms
             else:
                 terms = self._fermionic_hamiltonian_mpo_for_state(terms, self.state)
+        merged_loss_kwargs = self._prepare_native_mpo_options(
+            self.state,
+            terms,
+            merged_loss_kwargs,
+        )
         if self._is_mpo_hamiltonian(terms):
             constants = {"terms": terms}
             constants.update(incoming_constants)

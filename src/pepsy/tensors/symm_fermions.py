@@ -2,14 +2,11 @@
 
 The underlying Symmray adapters live in :mod:`pepsy.tensors.symmetric`.  This
 module is the model-facing home for convenient fermionic building blocks, so
-future spinless or multicomponent helpers can live alongside ``SpinfulFermion``
+future multicomponent helpers can live alongside the unified ``Fermion``
 without making the symmetry implementation module into a model catalogue.
 """
 
-from .symmetric import Fermion
-
-SpinfulFermion = Fermion
-SpinfulFermionHubbard = Fermion
+from .symmetric import Fermion, SpinfulFermion, SpinfulFermionHubbard
 
 __all__ = [
     "Fermion",
@@ -34,7 +31,7 @@ class SymmFermions:
         This namespace makes it possible to add other local fermion spaces
         later while keeping the direct ``SpinfulFermion(...)`` form concise.
         """
-        return Fermion(*args, **kwargs)
+        return SpinfulFermion(*args, **kwargs)
 
     @staticmethod
     def spinless(*args, **kwargs):

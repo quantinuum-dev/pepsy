@@ -453,3 +453,342 @@ def test_mpo_optimizer_mpo_mode_bra_only_gate():
 
     assert out.L == 4
     assert not np.allclose(out.to_dense(), mpo0.to_dense())
+
+
+def _native_u1u1_identity_mpo(L=3):
+    """Make a small native graded MPO fixture without testing construction."""
+    pytest.importorskip("symmray")
+    import symmray.utils as sr_utils
+
+    phys_map = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    arrays = []
+    for site in range(L):
+        if site == 0:
+            data = np.zeros((1, 4, 4), dtype="complex128")
+            data[0] = np.eye(4)
+            index_maps = [[(0, 0)], phys_map, phys_map]
+            duals = (False, False, True)
+        elif site == L - 1:
+            data = np.zeros((1, 4, 4), dtype="complex128")
+            data[0] = np.eye(4)
+            index_maps = [[(0, 0)], phys_map, phys_map]
+            duals = (True, False, True)
+        else:
+            data = np.zeros((1, 1, 4, 4), dtype="complex128")
+            data[0, 0] = np.eye(4)
+            index_maps = [[(0, 0)], [(0, 0)], phys_map, phys_map]
+            duals = (True, False, False, True)
+        arrays.append(
+            sr_utils.from_dense(
+                data,
+                symmetry="U1U1",
+                index_maps=index_maps,
+                duals=duals,
+                fermionic=True,
+                charge=(0, 0),
+            )
+        )
+    return qtn.MatrixProductOperator(
+        arrays,
+        shape="lrud",
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+        site_tag_id="I{}",
+    )
+
+
+@pytest.mark.parametrize("mode", ["svd", "mpo", "dmrg"])
+def test_mpo_optimizer_replays_native_graded_mpo_without_dense_fallback(mode):
+    """Native graded MPO inputs remain FermionicArray-backed through replay."""
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    gates = fermion.strang_gate_stream(
+        [(0, 1), (1, 2)],
+        dt=0.01,
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+    )
+
+    out = py.MpoOptimizer(
+        _native_u1u1_identity_mpo(),
+        gates=gates,
+        chi=8,
+        mode=mode,
+    ).run(progbar=False, cutoff=1e-10, fidelity_samples=0, n_iter=1)
+
+    assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in out)
+
+
+def test_mpo_optimizer_materializes_native_long_range_split_gates():
+    """Long-range native split gates are canonicalizable after replay."""
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    gates = fermion.strang_gate_stream(
+        [(0, 3)],
+        dt=0.01,
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+    )
+
+    out = py.MpoOptimizer(
+        _native_u1u1_identity_mpo(L=4),
+        gates=gates,
+        chi=8,
+        mode="svd",
+    ).run(progbar=False, cutoff=1e-10, fidelity_samples=0)
+
+    assert out.L == 4
+    assert all(len(out.tag_map[f"I{site}"]) == 1 for site in range(4))
+    assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in out)
+
+
+def test_mpo_optimizer_adapts_long_range_native_gate_to_jw_symmray_mpo():
+    """The current JW MPO path also handles long-range native even gates."""
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    mpo = fermion.build_mpo(
+        [(0, 3)],
+        L=4,
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+        fermionic=False,
+    )
+    gates = fermion.strang_gate_stream(
+        [(0, 3)],
+        dt=0.01,
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+    )
+
+    out = py.MpoOptimizer(mpo, gates=gates, chi=8, mode="svd").run(
+        progbar=False,
+        cutoff=1e-10,
+        fidelity_samples=0,
+    )
+
+    assert out.L == 4
+    assert all(type(tensor.data).__name__ == "U1U1Array" for tensor in out)
+
+
+@pytest.mark.parametrize("mode", ["svd", "mpo", "dmrg"])
+def test_mpo_optimizer_handles_fermion_symmray_mpo_and_native_gate_stream(mode):
+    """The optimizer adapts native gates onto the current U1U1 MPO path."""
+    pytest.importorskip("symmray")
+
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    edges = [(0, 1), (1, 2)]
+    mpo = fermion.build_mpo(
+        edges,
+        L=3,
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+        fermionic=False,
+        max_bond=16,
+        cutoff=1e-12,
+    )
+    gates = fermion.strang_gate_stream(
+        edges,
+        dt=0.01,
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+    )
+
+    optimizer = py.MpoOptimizer(mpo, gates=gates, chi=8, mode=mode)
+    out = optimizer.run(progbar=False, cutoff=1e-10, fidelity_samples=0, n_iter=1)
+
+    assert out.L == 3
+    assert out.max_bond() <= 8
+    assert all(type(tensor.data).__name__ == "U1U1Array" for tensor in out)
+
+
+def test_fermion_build_mpo_and_ham_tn_adapter_preserve_symmetry():
+    """Both public MPO builders preserve the model's U1U1 symmetry."""
+    pytest.importorskip("symmray")
+
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    edges = [(0, 1), (1, 2)]
+    builder = py.ham_tn(Lx=3, Ly=1, data_type="complex128")
+
+    direct = fermion.build_mpo(
+        edges, L=3, t=1.0, U=0.0, mu=0.0, fermionic=True,
+    )
+    adapted = builder.build_mpo(
+        fermion=fermion,
+        edges=edges,
+        phys_dim=4,
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+        fermionic=True,
+    )
+    positional = builder.build_mpo(
+        fermion,
+        edges=edges,
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+        fermionic=True,
+    )
+
+    assert direct.L == adapted.L == positional.L == 3
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in direct
+    )
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in adapted
+    )
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray"
+        for tensor in positional
+    )
+
+
+def test_build_mpo_defaults_to_native_and_to_mpo_is_its_alias():
+    """The model-facing builder has one native default and one alias."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+
+    native = fermion.build_mpo(
+        [(0, 1)],
+        L=2,
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+        compress=False,
+    )
+    direct = fermion.to_mpo(
+        [(0, 1)],
+        L=2,
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+        compress=False,
+    )
+
+    assert all(
+        type(tensor.data).__name__ == "U1U1FermionicArray"
+        for tensor in native
+    )
+    assert type(fermion).to_mpo is type(fermion).build_mpo
+    assert native.to_dense().allclose(direct.to_dense())
+
+
+def test_mpo_optimizer_explicit_compress_handles_empty_symmray_stream():
+    """The optimizer compresses symmetry-preserving Symmray MPOs directly."""
+    pytest.importorskip("symmray")
+
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    mpo = fermion.build_mpo(
+        [(0, 1), (1, 2)],
+        L=3,
+        t=1.0,
+        U=0.0,
+        mu=0.0,
+        fermionic=False,
+        compress=False,
+    )
+    raw_bond = mpo.max_bond()
+    optimizer = py.MpoOptimizer(mpo, gates=[], chi=2, mode="svd")
+    out = optimizer.compress(cutoff=1e-10)
+
+    # Symmray can retain a small sector-multiplicity overshoot for a requested
+    # cap, but the compression must still reduce the raw MPO bond.
+    assert out.max_bond() < raw_bond
+    assert all(type(tensor.data).__name__ == "U1U1Array" for tensor in out)
+
+
+def test_fermion_to_mpo_builds_native_mpo_for_optimizer_replay():
+    """The native Fermion.to_mpo path feeds the MPO optimizer directly."""
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    hopping = fermion.hopping_operator()
+    two_site_mpo = fermion.to_mpo(
+        {(0, 1): hopping},
+        L=2,
+        compress=False,
+    )
+    assert two_site_mpo.to_dense().allclose(hopping.fuse((0, 1), (2, 3)))
+
+    hamiltonian = fermion.hamiltonian(
+        [(0, 1), (1, 2)],
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+    )
+    mpo = fermion.to_mpo(
+        hamiltonian=hamiltonian,
+        L=3,
+        max_bond=16,
+        cutoff=1e-12,
+    )
+
+    assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in mpo)
+
+    out = py.MpoOptimizer(
+        mpo,
+        gates=hamiltonian.trotter_gates(0.01),
+        chi=8,
+        mode="svd",
+    ).run(progbar=False, cutoff=1e-10, fidelity_samples=0)
+    assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in out)
+
+
+def test_fermion_to_mpo_preserves_configured_backend():
+    """Native MPO conversion applies the Fermion backend to every block."""
+    torch = pytest.importorskip("torch")
+    backend = py.backend_torch(dtype=torch.complex128, device="cpu")
+    fermion = py.Fermion(
+        spinful=True,
+        symmetry="U1U1",
+        to_backend=backend,
+    )
+
+    mpo = fermion.to_mpo(
+        [(0, 1)],
+        L=2,
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+        compress=False,
+    )
+
+    for tensor in mpo:
+        assert tensor.data.backend == "torch"
+        assert all(isinstance(block, torch.Tensor) for block in tensor.data.blocks.values())
+
+
+def test_fermion_to_mpo_accepts_arbitrary_neutral_term_support():
+    """Native MPO conversion supports non-contiguous multi-site terms."""
+    fermion = py.Fermion(spinful=False, symmetry="U1")
+    term = fermion.operator_term(
+        [(1.0, ((2, "create"), (0, "number"), (3, "annihilate")))],
+        sites=(2, 0, 3),
+    )
+    hamiltonian = fermion.hamiltonian({(2, 0, 3): term})
+    mpo = fermion.to_mpo(
+        hamiltonian=hamiltonian,
+        L=4,
+        compress=False,
+    )
+
+    assert mpo.L == 4
+    assert all(type(tensor.data).__name__ == "U1FermionicArray" for tensor in mpo)
+    embedded_term = fermion.operator_term(
+        [(1.0, ((2, "create"), (0, "number"), (3, "annihilate")))],
+        sites=(0, 1, 2, 3),
+    )
+    assert mpo.to_dense().allclose(
+        embedded_term.fuse((0, 1, 2, 3), (4, 5, 6, 7))
+    )
+
+
+def test_fermion_to_mpo_handles_one_site_native_term():
+    """Native MPO construction also handles the no-virtual-bond case."""
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    term = fermion.interaction_operator()
+    mpo = fermion.to_mpo({(0,): term}, L=1, compress=False)
+
+    assert mpo.to_dense().allclose(term)
+    assert mpo.pepsy_compression_report["raw_max_bond"] == 1

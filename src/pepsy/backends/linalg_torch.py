@@ -1,5 +1,7 @@
 """Torch-side linalg registrations with stabilized autodiff rules."""
 
+import warnings
+
 import autoray as ar
 import numpy as np
 import torch
@@ -12,6 +14,51 @@ except ImportError:  # pragma: no cover - optional dependency
 # pylint: disable=abstract-method,arguments-differ,bad-staticmethod-argument,bare-except,line-too-long,multiple-statements,not-callable,superfluous-parens,too-many-branches,too-many-locals,too-many-statements,unnecessary-semicolon,unused-variable,using-constant-test
 
 _SVD_EPS_REL = 1.0e-6
+_REGISTERED_FUNCTIONS = {}
+_QR_RANK_POLICIES = {"warn", "native", "error"}
+_QR_RANK_POLICY = "warn"
+_QR_RANK_TOL_FACTOR = 1.0
+
+
+def _same_callable(left, right):
+    """Compare plain functions and class-bound autograd methods robustly."""
+    if left is right:
+        return True
+    left_func = getattr(left, "__func__", None)
+    right_func = getattr(right, "__func__", None)
+    return (
+        left_func is not None
+        and right_func is not None
+        and left_func is right_func
+        and getattr(left, "__self__", None)
+        is getattr(right, "__self__", None)
+    )
+
+
+def _register_once(name, function):
+    """Register one Torch autoray function once per active implementation."""
+    if _same_callable(_REGISTERED_FUNCTIONS.get(name), function):
+        return
+    ar.register_function("torch", name, function)
+    _REGISTERED_FUNCTIONS[name] = function
+
+
+def _configure_qr_rank_policy(policy="warn", rank_tol_factor=1.0):
+    """Configure the real-QR response to detected rank deficiency."""
+    if policy not in _QR_RANK_POLICIES:
+        choices = ", ".join(sorted(_QR_RANK_POLICIES))
+        raise ValueError(f"rank_policy must be one of: {choices}")
+    try:
+        rank_tol_factor = float(rank_tol_factor)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("rank_tol_factor must be a positive finite number") from exc
+    if not np.isfinite(rank_tol_factor) or rank_tol_factor <= 0.0:
+        raise ValueError("rank_tol_factor must be a positive finite number")
+
+    global _QR_RANK_POLICY  # pylint: disable=global-statement
+    global _QR_RANK_TOL_FACTOR  # pylint: disable=global-statement
+    _QR_RANK_POLICY = policy
+    _QR_RANK_TOL_FACTOR = rank_tol_factor
 
 
 def safe_inverse(x, eps_abs=1.0e-12, *, eps_rel=0.0, eps_scale=None):
@@ -328,27 +375,106 @@ class SVD_real(torch.autograd.Function):
 
 
 class QR_real(torch.autograd.Function):
-    """Real-valued QR autograd function using a custom backward pass."""
+    """Real QR with a custom full-rank backward and native rank fallback."""
 
     @staticmethod
     def forward(self, A):
         Q, R = torch.linalg.qr(A)
-        self.save_for_backward(A, Q, R)
+        diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
+        scale = R.abs().amax(dim=(-2, -1))
+        tolerance = (
+            _QR_RANK_TOL_FACTOR
+            * torch.finfo(A.dtype).eps
+            * max(A.shape[-2:])
+            * scale
+        )
+        rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
+        if bool(rank_deficient.any().item()):
+            message = (
+                "QR_real detected a rank-deficient input; native Torch QR "
+                "backward may be ill-conditioned."
+            )
+            if _QR_RANK_POLICY == "error":
+                raise RuntimeError(message)
+            if _QR_RANK_POLICY == "warn":
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
+        self.save_for_backward(A, Q, R, rank_deficient)
         return Q, R
 
     @staticmethod
     def backward(self, dq, dr):
-        A, q, r = self.saved_tensors
-        if r.shape[0] == r.shape[1]:
+        A, q, r, rank_deficient = self.saved_tensors
+        if bool(rank_deficient.any().item()):
+            return _native_qr_backward(A, dq, dr)
+        m, _n = r.shape[-2:]
+        if m == _n:
             return _simple_qr_backward(q, r, dq, dr)
-        M, _N = r.shape
-        B = A[:, M:]
-        dU = dr[:, :M]
-        dD = dr[:, M:]
-        U = r[:, :M]
-        da = _simple_qr_backward(q, U, dq + B @ dD.t(), dU)
+        B = A[..., :, m:]
+        dU = dr[..., :, :m]
+        dD = dr[..., :, m:]
+        U = r[..., :, :m]
+        da = _simple_qr_backward(
+            q,
+            U,
+            dq + B @ dD.transpose(-2, -1),
+            dU,
+        )
         db = q @ dD
-        return torch.cat([da, db], 1)
+        return torch.cat([da, db], dim=-1)
+
+
+class QR_real_safe(torch.autograd.Function):
+    """Real QR VJP that does not differentiate a singular gauge.
+
+    Symmetry-resolved PEPS boundary blocks can be exactly rank deficient even
+    when the complete tensor is well behaved.  Torch's QR backward is not
+    defined for those blocks.  The boundary contraction only uses their
+    canonical gauge, so the safe policy is to keep the forward QR factors but
+    return a zero VJP for a singular block.  Full-rank tall blocks use the
+    validated Pepsy rule and full-rank wide blocks use Torch's native VJP,
+    which covers the shape not handled by ``_simple_qr_backward``.
+    """
+
+    @staticmethod
+    def forward(ctx, A):
+        Q, R = torch.linalg.qr(A)
+        diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
+        scale = R.abs().amax(dim=(-2, -1))
+        tolerance = torch.finfo(A.dtype).eps * max(A.shape[-2:]) * scale
+        rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
+        ctx.save_for_backward(A, Q, R, rank_deficient)
+        return Q, R
+
+    @staticmethod
+    def backward(ctx, dQ, dR):
+        A, Q, R, rank_deficient = ctx.saved_tensors
+        if bool(rank_deficient.any().item()):
+            return torch.zeros_like(A)
+        if R.shape[-1] > R.shape[-2]:
+            return _native_qr_backward(A, dQ, dR)
+        return _simple_qr_backward(Q, R, dQ, dR)
+
+
+class QR_complex_safe(torch.autograd.Function):
+    """Complex QR VJP that freezes exactly rank-deficient gauges."""
+
+    @staticmethod
+    def forward(ctx, A):
+        Q, R = torch.linalg.qr(A)
+        diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
+        scale = R.abs().amax(dim=(-2, -1))
+        real_dtype = A.real.dtype if A.is_complex() else A.dtype
+        tolerance = torch.finfo(real_dtype).eps * max(A.shape[-2:]) * scale
+        rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
+        ctx.save_for_backward(A, rank_deficient)
+        return Q, R
+
+    @staticmethod
+    def backward(ctx, dQ, dR):
+        A, rank_deficient = ctx.saved_tensors
+        if bool(rank_deficient.any().item()):
+            return torch.zeros_like(A)
+        return _native_qr_backward(A, dQ, dR)
 
 
 def _simple_qr_backward(q, r, dq, dr):
@@ -359,49 +485,77 @@ def _simple_qr_backward(q, r, dq, dr):
             "or full_matrices is true and ncols != nrows."
         )
 
-    qdq = q.t() @ dq
-    qdq_ = qdq - qdq.t()
-    rdr = r @ dr.t()
-    rdr_ = rdr - rdr.t()
+    qdq = q.transpose(-2, -1) @ dq
+    qdq_ = qdq - qdq.transpose(-2, -1)
+    rdr = r @ dr.transpose(-2, -1)
+    rdr_ = rdr - rdr.transpose(-2, -1)
     tril = torch.tril(qdq_ + rdr_)
 
     def _triangular_solve(x, tri):
-        return torch.linalg.solve_triangular(tri.T, x.T, upper=True).T
+        # Solve with the upper-triangular R factor. Using R.T here gives the
+        # wrong reverse-mode rule and does not generalize to batched inputs.
+        return torch.linalg.solve_triangular(
+            tri,
+            x.transpose(-2, -1),
+            upper=True,
+        ).transpose(-2, -1)
 
     grad_a = q @ (dr + _triangular_solve(tril, r))
     grad_b = _triangular_solve(dq - q @ qdq, r)
     return grad_a + grad_b
 
 
+def _native_qr_backward(A, dq, dr):
+    """Recompute native Torch QR to obtain a reliable VJP fallback."""
+    with torch.enable_grad():
+        replay = A.detach().requires_grad_(True)
+        q, r = torch.linalg.qr(replay)
+        dq = torch.zeros_like(q) if dq is None else dq
+        dr = torch.zeros_like(r) if dr is None else dr
+        return torch.autograd.grad(
+            (q, r),
+            replay,
+            (dq, dr),
+        )[0]
+
+
 class QR_complex(torch.autograd.Function):
-    """Complex-valued QR autograd function using Hermitian symmetrization."""
+    """Complex-valued QR wrapper using native Torch's conjugate-aware VJP."""
 
     @staticmethod
     def forward(ctx, A):
         Q, R = torch.linalg.qr(A)
-        ctx.save_for_backward(A, Q, R)
+        ctx.save_for_backward(A)
         return Q, R
 
     @staticmethod
     def backward(ctx, dQ, dR):
-        _A, Q, R = ctx.saved_tensors
+        (A,) = ctx.saved_tensors
+        return _native_qr_backward(A, dQ, dR)
 
-        Qh = Q.conj().transpose(-2, -1)
-        Rh = R.conj().transpose(-2, -1)
 
-        M = R @ dR.conj().transpose(-2, -1) - Qh @ dQ
-        sym_h_M = 0.5 * (M + M.conj().transpose(-2, -1))
-        R_inv_h = torch.linalg.solve(
-            Rh,
-            torch.eye(Rh.size(-1), dtype=R.dtype, device=R.device),
-        )
-        dA = (dQ + Q @ sym_h_M) @ R_inv_h
-        return dA
+def _native_svd(A, *args, **kwargs):
+    """Use native Torch SVD with the thin-factor default expected by Pepsy."""
+    kwargs.setdefault("full_matrices", False)
+    return torch.linalg.svd(A, *args, **kwargs)
+
+
+def reg_native_svd_torch():
+    """Register native Torch SVD with Pepsy's thin-factor default."""
+    _register_once("linalg.svd", _native_svd)
+
+
+def reset_torch_linalg_registrations():
+    """Restore native Torch SVD/QR mappings and clear Pepsy's cache."""
+    _REGISTERED_FUNCTIONS.clear()
+    _configure_qr_rank_policy()
+    reg_native_svd_torch()
+    reg_complex_qr_torch()
 
 
 def reg_rel_svd_torch():
     """Register the relative-regularized torch SVD rule in autoray."""
-    ar.register_function("torch", "linalg.svd", SVD.apply)
+    _register_once("linalg.svd", SVD.apply)
 
 
 def reg_complex_svd_torch():
@@ -415,22 +569,140 @@ def reg_complex_svd_torch():
 
 def reg_real_svd_torch():
     """Register the real torch SVD autograd implementation in autoray."""
-    ar.register_function("torch", "linalg.svd", SVD_real.apply)
+    _register_once("linalg.svd", SVD_real.apply)
 
 
-def reg_real_qr_torch():
-    """Register the real torch QR autograd implementation in autoray."""
-    ar.register_function("torch", "linalg.qr", QR_real.apply)
+def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
+    """Register real QR with a configurable rank-deficiency policy."""
+    _configure_qr_rank_policy(rank_policy, rank_tol_factor)
+    _register_once("linalg.qr", QR_real.apply)
 
 
 def reg_complex_qr_torch():
-    """Register the complex torch QR autograd implementation in autoray."""
-    ar.register_function("torch", "linalg.qr", QR_complex.apply)
+    """Register native Torch QR for complex inputs.
+
+    The explicit :class:`QR_complex` compatibility wrapper is safe but
+    recomputes native QR during its backward pass, so Autoray uses native QR
+    directly for the faster default path.
+    """
+    _register_once("linalg.qr", torch.linalg.qr)
+
+
+def reg_quimb_torch_split_drivers(mode="real"):
+    """Register stable Torch split drivers used inside Symmray blocks.
+
+    Quimb's composed ``qr_stabilized`` and ``svd_truncated`` drivers receive
+    raw Torch blocks from Symmray and call the Torch namespace directly. That
+    path bypasses Autoray's ordinary ``linalg.qr`` and ``linalg.svd``
+    registrations, so PEPS autodiff needs backend-specific Quimb drivers as
+    well. Missing Quimb is allowed because this helper is optional outside
+    tensor-network optimization.
+    """
+    if mode not in {"real", "complex"}:
+        raise ValueError("mode must be 'real' or 'complex'")
+    try:
+        import quimb.tensor.decomp as qd  # pylint: disable=import-outside-toplevel
+    except ImportError:  # pragma: no cover - quimb is an optional integration
+        return False
+
+    def qr_torch(x, absorb=qd.get_U_sVH, stabilized=True, **kwargs):
+        del kwargs
+        absorb_i = qd._ABSORB_MAP[absorb]
+        transposed = absorb_i in (qd.get_Us_VH, qd.get_Us, qd.get_VH)
+        if transposed:
+            x = x.swapaxes(-2, -1)
+            absorb_i = qd._ABSORB_TRANSPOSE_MAP[absorb_i]
+
+        if mode == "real" and not x.is_complex():
+            Q, R = QR_real_safe.apply(x)
+        elif mode == "complex" and x.is_complex():
+            Q, R = QR_complex_safe.apply(x)
+        else:
+            Q, R = torch.linalg.qr(x)
+
+        if stabilized:
+            # The sign/phase is a discrete gauge choice. It should not enter
+            # the VJP, especially when a rank-deficient block has zero R
+            # diagonal entries.
+            phase = torch.sgn(
+                torch.diagonal(R, dim1=-2, dim2=-1)
+            ).detach()
+            Q = Q * torch.conj(phase)[..., None, :]
+            R = phase[..., :, None] * R
+
+        left = None if absorb_i == qd.get_sVH else Q
+        right = None if absorb_i == qd.get_U else R
+        if transposed:
+            left, right = right, left
+            if left is not None:
+                left = left.swapaxes(-2, -1)
+            if right is not None:
+                right = right.swapaxes(-2, -1)
+        return left, None, right
+
+    def svd_torch(
+        x,
+        cutoff=-1.0,
+        cutoff_mode=qd.cutoff_mode_rsum2,
+        max_bond=-1,
+        absorb=qd.get_Usq_sqVH,
+        renorm=0,
+        info=None,
+        **kwargs,
+    ):
+        del kwargs
+        absorb_i = qd._ABSORB_MAP[absorb]
+        cutoff_mode_i = qd._CUTOFF_MODE_MAP[cutoff_mode]
+        if mode == "real" and not x.is_complex():
+            U, s, VH = SVD_real.apply(x)
+        else:
+            U, s, VH = SVD.apply(x)
+        return qd._trim_and_renorm_svd_result(
+            U,
+            s,
+            VH,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode_i,
+            max_bond=max_bond,
+            absorb=absorb_i,
+            renorm=renorm,
+            info=info,
+            xp=qd.get_namespace(x),
+        )
+
+    try:
+        qd.qr_stabilized.register("torch", qr_torch)
+        qd.svd_truncated.register("torch", svd_torch)
+    except AttributeError:  # pragma: no cover - older Quimb integration
+        return False
+    return True
+
+
+def reset_quimb_torch_split_drivers():
+    """Restore Quimb's default Torch split drivers if Quimb is installed."""
+    try:
+        import quimb.tensor.decomp as qd  # pylint: disable=import-outside-toplevel
+    except ImportError:  # pragma: no cover - quimb is an optional integration
+        return False
+    try:
+        qd.qr_stabilized.register("torch", qd.qr_stabilized._default_fn)
+        qd.svd_truncated.register("torch", qd.svd_truncated._default_fn)
+    except AttributeError:  # pragma: no cover - older Quimb integration
+        return False
+    return True
+
+
+def _stop_gradient_torch(x):
+    """Return a detached, independent Torch tensor."""
+    return x.detach().clone()
 
 
 def reg_stop_gradient_torch():
     """Register torch stop-gradient helper in autoray."""
-    ar.register_function("torch", "stop_gradient", lambda x: x.detach().clone())
+    _register_once(
+        "stop_gradient",
+        _stop_gradient_torch,
+    )
 
 
 def stop_grad(x):

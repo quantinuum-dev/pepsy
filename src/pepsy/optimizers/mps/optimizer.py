@@ -56,17 +56,28 @@ from __future__ import annotations
 from copy import deepcopy
 from collections.abc import Mapping
 from numbers import Integral
+import time
 import types
 import warnings
 import autoray as ar
 import numpy as np
 import quimb.tensor as qtn
 
+from ...backends import (
+    backend_infer,
+    infer_backend_converter_from_sample,
+    infer_backend_signature,
+)
 from ...fitting.local import FIT
 from ...operators.gates import (
     _normalize_gate_entries,
     gate as apply_gate,
     gate_simple as apply_gate_simple,
+)
+from .._fidelity import (
+    fidelity_from_log,
+    infidelity_from_log,
+    log_fidelity_from_norms,
 )
 from .layout import (
     MpsGateStreamLayoutFinder,
@@ -85,6 +96,11 @@ __all__ = [
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
 _NORM_INCLUDES_EXPONENT_CACHE = {}
+
+
+def _array_backend_signature(array):
+    """Return comparable backend / dtype / device metadata for an array."""
+    return infer_backend_signature(array)
 
 
 def _normalize_event_name(name):
@@ -355,7 +371,7 @@ def _parse_control_tuple(name, entry, default_axis=None):
         if len(entry) < 3:
             raise ValueError("cap event must be ('cap', where, vec[, absorb]).")
         where = _normalize_control_where(entry[1], single=True)
-        vec = np.asarray(entry[2], dtype=complex).ravel()
+        vec = np.asarray(ar.to_numpy(entry[2]), dtype=complex).ravel()
         absorb = _normalize_absorb(entry[3]) if len(entry) > 3 else "left"
         return "cap", {"vec": vec, "absorb": absorb}, where
     if name == "reset":
@@ -924,6 +940,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         sites=None,
         L=None,
         order="quality",
+        objective="locality",
         refine_passes=8,
         refine_numba=True,
         spectral_dense_max=512,
@@ -936,6 +953,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         weight_fn=None,
         weight_mode="auto",
         schmidt_max_dim=4,
+        max_operator_qubits=8,
     ):
         """Find a good 1D MPS layout for a bundled gate stream.
 
@@ -955,6 +973,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             inferred from first use in ``gate_stream`` unless ``L`` is given.
         L : int | None
             Convenience for ``sites=range(L)``.
+        objective : {"locality", "compression"}
+            ``"locality"`` minimizes support span and cut congestion using
+            event weights. ``"compression"`` ranks layouts by operator-
+            Schmidt load over the MPS cuts, with path span as a tie-breaker.
         order : str
             One of ``"quality"``/``"auto"``/``"best"``, ``"recursive"``,
             ``"input"``, ``"degree"``, ``"bfs"``, ``"spectral"``,
@@ -988,6 +1010,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             small dense gates, falling back to count weights.
         schmidt_max_dim : int
             Maximum local dimension for the optional operator-Schmidt proxy.
+        max_operator_qubits : int | None
+            Maximum support size for exact dense rank probes in the
+            compression objective. Larger or opaque operators use a
+            conservative operator-space rank bound and are marked as bounded
+            in the returned diagnostics.
 
         Returns
         -------
@@ -1000,6 +1027,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         finder = cls.LayoutFinder(gate_stream, sites=sites, L=L)
         return finder.run(
             order=order,
+            objective=objective,
             refine_passes=refine_passes,
             refine_numba=refine_numba,
             spectral_dense_max=spectral_dense_max,
@@ -1012,6 +1040,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             weight_fn=weight_fn,
             weight_mode=weight_mode,
             schmidt_max_dim=schmidt_max_dim,
+            max_operator_qubits=max_operator_qubits,
         )
 
     @classmethod
@@ -1029,6 +1058,150 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Find a layout for the optimizer's currently queued gate stream."""
 
         return self.layout_finder(sites=sites, L=L).run(**kwargs)
+
+    def select_layout_for_compression(
+        self,
+        *,
+        sites=None,
+        L=None,
+        layout_kwargs=None,
+        pilot_candidates=4,
+        pilot_steps=None,
+        cutoff=1e-12,
+        cutoff_mode="rsum2",
+        run_kwargs=None,
+    ):
+        """Select an MPS layout using a bounded, state-aware pilot replay.
+
+        The finder first produces cheap static candidates with
+        ``objective="compression"``. The best ``pilot_candidates`` are then
+        replayed on independent copies of the current MPS using the real
+        execution mode, ``chi``, cutoff, and backend. The returned plan is
+        non-mutating and contains ``pilot`` diagnostics for every candidate.
+
+        This method is intentionally separate from :meth:`run`: layout
+        selection can be expensive and should be explicit in production
+        workflows. ``pilot_steps`` limits the replay prefix while preserving
+        the original optimizer and gate queue.
+        """
+        if self.mode == "exact":
+            raise ValueError(
+                "compression layout pilots require an MPS compression mode, "
+                "not mode='exact'."
+            )
+        if self._persistent_layout_plan is not None:
+            raise ValueError(
+                "compression layout pilots require an optimizer without a "
+                "persistent layout; create the pilot before apply_layout()."
+            )
+        try:
+            pilot_candidates = int(pilot_candidates)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pilot_candidates must be a positive integer.") from exc
+        if pilot_candidates < 1:
+            raise ValueError("pilot_candidates must be a positive integer.")
+        if pilot_steps is not None:
+            try:
+                pilot_steps = int(pilot_steps)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("pilot_steps must be a positive integer or None.") from exc
+            if pilot_steps < 1:
+                raise ValueError("pilot_steps must be a positive integer or None.")
+
+        finder = self.layout_finder(sites=sites, L=L)
+        kwargs = dict(layout_kwargs or {})
+        kwargs["objective"] = "compression"
+        static_plan = finder.run(**kwargs)
+        candidates = dict(static_plan.get("candidate_plans", {}))
+        if not candidates:
+            candidates = {static_plan["selected_order"]: static_plan}
+        ranked_names = sorted(
+            candidates,
+            key=lambda name: candidates[name]["stats"].get(
+                "compression_score", candidates[name]["stats"].get("score", 0.0)
+            ),
+        )[:pilot_candidates]
+
+        base_run_kwargs = dict(run_kwargs or {})
+        base_run_kwargs.setdefault("progbar", False)
+        base_run_kwargs.setdefault("layout_report", False)
+        base_run_kwargs.setdefault("cutoff", cutoff)
+        base_run_kwargs.setdefault("cutoff_mode", cutoff_mode)
+        # The selector ranks candidates by measured retained fidelity. Ensure
+        # that diagnostic trace is available even when the source optimizer
+        # was created with track_infidelity=False.
+        base_run_kwargs["track_infidelity"] = True
+        pilot_reports = {}
+        successful = []
+        for name in ranked_names:
+            trial = self.copy()
+            if pilot_steps is not None:
+                trial.G = trial.G[:pilot_steps]
+                trial.where = trial.where[:pilot_steps]
+                trial.event_types = trial.event_types[:pilot_steps]
+            started = time.perf_counter()
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    trial.run(layout=candidates[name], **base_run_kwargs)
+                elapsed = time.perf_counter() - started
+                infidelity = float(trial.infidelities[-1])
+                final_bond = int(trial.p.max_bond())
+                report = {
+                    "status": "ok",
+                    "elapsed_seconds": float(elapsed),
+                    "final_bond": final_bond,
+                    "infidelity": infidelity,
+                    "pilot_steps": len(trial.G),
+                }
+                successful.append((infidelity, final_bond, elapsed, name))
+            except Exception as exc:  # pragma: no cover - backend-specific
+                report = {
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_seconds": float(time.perf_counter() - started),
+                    "pilot_steps": len(trial.G),
+                }
+            pilot_reports[name] = report
+
+        if not successful:
+            raise RuntimeError(
+                "All MPS compression layout pilot candidates failed. "
+                f"Diagnostics: {pilot_reports!r}"
+            )
+        selected_name = min(successful)[-1]
+        selected = dict(candidates[selected_name])
+        selected["selected_order"] = selected_name
+        selected["pilot"] = {
+            "objective": "compression",
+            "pilot_candidates": tuple(ranked_names),
+            "selected_order": selected_name,
+            "reports": pilot_reports,
+        }
+        selected["candidate_plans"] = candidates
+        return selected
+
+    def plot_layout(
+        self,
+        plan=None,
+        *,
+        sites=None,
+        L=None,
+        layout_kwargs=None,
+        **plot_kwargs,
+    ):
+        """Plot the current gate-stream layout and selected MPS order.
+
+        This is a convenience wrapper around
+        :meth:`MpsGateStreamLayoutFinder.plot`. It returns ``(fig, ax)`` and
+        does not mutate the optimizer or install the plotted layout. When
+        ``plan`` is omitted, the finder computes its default quality plan;
+        pass ``layout_kwargs`` to customize that search.
+        """
+        finder = self.layout_finder(sites=sites, L=L)
+        if plan is None:
+            plan = finder.run(**dict(layout_kwargs or {}))
+        return finder.plot(plan, **plot_kwargs)
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -1090,6 +1263,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._unitary_initial_norm = None
         self._unitary_previous_norm = None
         self._unitary_global_norm_tracking = False
+        self._backend_conversion_warnings = set()
+        self.backend = None
+        self.backend_dtype = None
+        self.backend_device = None
+        self.array_backend = None
+        self.backend_info()
         self._init_canonicalization()
 
     def _info_for_state(self, p, info=None):
@@ -1178,7 +1357,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Return whether dense numeric tensor data contains only finite values."""
         for tensor in getattr(p, "tensors", ()):
             try:
-                data = np.asarray(tensor.data)
+                data = tensor.data
+                if hasattr(data, "to_dense"):
+                    data = data.to_dense()
+                data = np.asarray(ar.to_numpy(data))
             except Exception:
                 continue
             if not np.issubdtype(data.dtype, np.number):
@@ -1316,7 +1498,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     def set_p(self, p):
         """Assign a new state and reset canonicalization metadata."""
-        self.p = self._install_represented_norm(p if self.inplace else p.copy())
+        new_p = self._install_represented_norm(p if self.inplace else p.copy())
+        # Validate before replacing the live state so a mixed-backend input
+        # cannot leave this optimizer half-updated after a failed assignment.
+        self._state_backend_info_for(new_p)
+        self.p = new_p
         self.qubits = list(range(int(getattr(self.p, "L", 0))))
         self.logical_order = list(self.qubits)
         self._persistent_layout_plan = None
@@ -1327,6 +1513,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._su_gauges_state = None
         self._su_force_regauge = self.mode == "su"
         self.p_ungauged = None
+        self._backend_conversion_warnings = set()
+        self.backend_info()
         self._init_canonicalization()
 
     def normalize(self, eps=1e-15, insert=None):
@@ -1395,6 +1583,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied._unitary_initial_norm = self._unitary_initial_norm
         copied._unitary_previous_norm = self._unitary_previous_norm
         copied._unitary_global_norm_tracking = self._unitary_global_norm_tracking
+        copied._backend_conversion_warnings = set(
+            self._backend_conversion_warnings
+        )
         copied._su_gauges_supplied = True
         copied._su_gauges_ready = self._su_gauges_ready
         copied._su_gauges_state = copied.p if self._su_gauges_ready else None
@@ -1547,7 +1738,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 self.logical_site(position): value
                 for position, value in config.items()
             }
-        config = np.asarray(config)
+        config = np.asarray(ar.to_numpy(config))
         if config.ndim == 0 or config.shape[-1] != len(self.logical_order):
             raise ValueError(
                 "sample configuration must have MPS length as its final "
@@ -2009,12 +2200,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         selected = plan.get("selected_order", "<unknown>")
         site_order = plan.get("site_order", plan.get("qubit_inds", ()))
         weight_mode = plan.get("weight_mode", "count")
+        objective = plan.get("objective", "locality")
         lines = [
             (
                 "MpsOptimizer layout finder: "
                 f"order={selected}, sites={len(site_order)}, "
                 f"events={stats.get('num_events', input_stats.get('num_events', 0))}, "
-                f"weight_mode={weight_mode}"
+                f"weight_mode={weight_mode}, objective={objective}"
             ),
             (
                 "  long-range events: "
@@ -2056,6 +2248,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
             ),
         ]
+        if objective == "compression":
+            lines.append(
+                "  operator cut load max/total: "
+                + cls._format_layout_value(
+                    stats.get("max_operator_cut_load", 0.0)
+                )
+                + "/"
+                + cls._format_layout_value(
+                    stats.get("total_operator_cut_load", 0.0)
+                )
+                + " | bounded cut probes: "
+                + cls._format_layout_value(stats.get("rank_bounded_cuts", 0))
+            )
         return "\n".join(lines)
 
     def run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -2364,6 +2569,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``event_seq`` must contain only ``"gate"``/``"submpo"`` events. Control
         events (measure/cap/reset) are handled by :meth:`_run_segmented`.
         """
+        # Prepare gate and sub-MPO payloads once per executable segment. The
+        # converter returns already-compatible arrays/networks unchanged,
+        # while foreign payloads are moved to the backend owned by the live
+        # MPS. This keeps exact, simple-update, and compressed modes on one
+        # backend contract.
+        G_seq = self._prepare_gate_stream_backend(G_seq, event_seq)
+
         if self.mode == "dmrg":
             self._prepare_dmrg_state()
             self._run_dmrg(
@@ -2716,26 +2928,127 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return tensor.data
         return None
 
+    @staticmethod
+    def _state_backend_info_for(state):
+        """Validate and describe the common backend of an MPS-like state."""
+        return backend_infer(state)
+
+    def backend_info(self):
+        """Return the state-derived backend, dtype, and device diagnostics."""
+        info = self._state_backend_info_for(self.p)
+        self.backend = info["backend"]
+        self.backend_dtype = info["dtype"]
+        self.backend_device = info["device"]
+        self.array_backend = info.get("array_backend", info["backend"])
+        return info
+
+    def _warn_backend_conversion(self, source_signature, target_signature, *, kind):
+        """Warn once for one explicit stream source/target conversion."""
+        warning_key = (kind, source_signature, target_signature)
+        if (
+            source_signature[0] != "builtins"
+            and warning_key not in self._backend_conversion_warnings
+        ):
+            self._backend_conversion_warnings.add(warning_key)
+            warnings.warn(
+                f"MpsOptimizer converted a {kind} payload from "
+                f"backend/dtype/device {source_signature!r} to the live MPS "
+                f"backend/dtype/device {target_signature!r}; provide matching "
+                f"{kind} payloads to avoid this conversion.",
+                UserWarning,
+                stacklevel=3,
+            )
+
     def _to_state_backend(self, array):
-        """Return ``array`` cast to ``self.p``'s backend and complex dtype."""
+        """Return ``array`` cast to the backend and dtype owned by ``self.p``."""
         like = self._state_backend_like()
         if like is None:
-            return np.asarray(array, dtype=complex)
-        dtype = getattr(like, "dtype", complex)
-        if "complex" not in str(dtype):
-            dtype = getattr(
-                ar.do("array", np.asarray(1.0j), like=like), "dtype", complex
-            )
-        if (
-            getattr(array, "device", None) == getattr(like, "device", None)
-            and getattr(array, "dtype", None) == dtype
-        ):
+            return np.asarray(ar.to_numpy(array), dtype=complex)
+        target_signature = _array_backend_signature(like)
+        source_signature = _array_backend_signature(array)
+        if source_signature == target_signature:
             return array
-        # ``np.asarray`` would try to materialize a CUDA/Torch gate on the CPU.
-        # Let autoray move/cast any foreign array directly to the MPS backend.
-        # The final astype also preserves the complex dtype of the live state.
-        arr = ar.do("array", array, like=like)
-        return ar.do("astype", arr, dtype)
+        if self._is_symmray_array(array) and self._is_symmray_array(like):
+            # Symmray arrays deliberately do not implement Autoray's generic
+            # ``array(..., like=symmray_array)`` constructor. Their outer
+            # object has no scalar dtype either, so the generic dtype fast
+            # path below cannot establish compatibility. Native Symmray gates
+            # already carry their own block backend and must pass through as
+            # graded arrays rather than being rebuilt as dense payloads.
+            return array
+        if target_signature[0] == "symmray" and source_signature[0] != "symmray":
+            raise TypeError(
+                "Cannot convert a dense gate/operator payload into a native "
+                "Symmray MPS without charge and fermionic metadata. Build the "
+                "payload as a Symmray array on the target U1/U1U1 backend."
+            )
+        converter = infer_backend_converter_from_sample(like)
+        if converter is not None:
+            return converter(array)
+        if target_signature[0] == "numpy":
+            return ar.to_numpy(array)
+        # Keep the old Autoray fallback for optional/custom dense backends.
+        return ar.do("array", array, like=like)
+
+    def to_backend(self, array):
+        """Return ``array`` on the backend currently owned by ``self.p``.
+
+        Already-compatible arrays are returned by identity. This public helper
+        is intentionally state-derived so replacing the MPS with :meth:`set_p`
+        automatically changes the target backend without stale converter state.
+        """
+        return self._to_state_backend(array)
+
+    def _prepare_gate_stream_backend(self, gates, event_types):
+        """Prepare gate and sub-MPO payloads for the live MPS backend lazily.
+
+        Gate streams are commonly authored as NumPy arrays even when the live
+        MPS uses Torch, JAX, CuPy, or a Symmray block backend. Every ordinary
+        gate and every tensor in every sub-MPO is checked; matching payloads
+        are returned by identity, while foreign payloads are copied or cast
+        without mutating the public queue.
+        """
+        if not gates:
+            return gates
+        like = self._state_backend_like()
+        if like is None:
+            return gates
+        target_signature = _array_backend_signature(like)
+        prepared = []
+        stream_converter = infer_backend_converter_from_sample(like)
+        for gate, event_type in zip(gates, event_types):
+            if event_type == "gate":
+                source_signature = _array_backend_signature(gate)
+                if source_signature != target_signature:
+                    self._warn_backend_conversion(
+                        source_signature, target_signature, kind="gate"
+                    )
+                    gate = self.to_backend(gate)
+            elif event_type == "submpo":
+                # ``apply_to_arrays`` changes only the raw tensor payloads,
+                # unlike rebuilding an MPO, which can lose custom labels or
+                # operator bonds. Keep the caller's stream immutable by
+                # applying it to a shallow network copy.
+                tensors = tuple(getattr(gate, "tensors", ()))
+                source_signatures = {
+                    _array_backend_signature(tensor.data) for tensor in tensors
+                }
+                if source_signatures and source_signatures != {target_signature}:
+                    for source_signature in source_signatures:
+                        if source_signature != target_signature:
+                            self._warn_backend_conversion(
+                                source_signature, target_signature, kind="sub-MPO"
+                            )
+                    gate = gate.copy()
+                    apply_to_arrays = getattr(gate, "apply_to_arrays", None)
+                    if not callable(apply_to_arrays):
+                        raise TypeError(
+                            "sub-MPO payloads must provide apply_to_arrays() "
+                            "for backend conversion."
+                        )
+                    apply_to_arrays(stream_converter or self.to_backend)
+            prepared.append(gate)
+        return prepared
 
     def _pauli_operator(self, pauli, where):
         """Return the dense Pauli operator (numpy) for ``pauli`` on ``where``."""
@@ -3124,15 +3437,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ratios. Accumulating ``log(F)`` avoids losing information to
         floating-point underflow on long non-unitary streams.
         """
-        local_fidelity = self._norm_ratio_fidelity(approx_norm, target_norm)
-        if local_fidelity <= 0.0 or np.isneginf(self._infidelity_log_fidelity):
+        local_log_fidelity = log_fidelity_from_norms(
+            approx_norm, target_norm,
+        )
+        if (
+            np.isneginf(local_log_fidelity)
+            or np.isneginf(self._infidelity_log_fidelity)
+        ):
             self._infidelity_log_fidelity = -np.inf
         else:
-            self._infidelity_log_fidelity += float(np.log(local_fidelity))
-        cumulative_infidelity = (
-            1.0
-            if np.isneginf(self._infidelity_log_fidelity)
-            else float(-np.expm1(self._infidelity_log_fidelity))
+            self._infidelity_log_fidelity += local_log_fidelity
+        local_fidelity = fidelity_from_log(local_log_fidelity)
+        cumulative_infidelity = infidelity_from_log(
+            self._infidelity_log_fidelity,
         )
         sample = {
             "step": int(step),
@@ -3193,11 +3510,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self._unitary_initial_norm is None:
             self._unitary_initial_norm = previous_norm
         if self._unitary_global_norm_tracking:
-            global_fidelity = self._norm_ratio_fidelity(
+            global_log_fidelity = log_fidelity_from_norms(
                 approx_norm,
                 self._unitary_initial_norm,
             )
-            global_infidelity = 1.0 - global_fidelity
+            global_fidelity = fidelity_from_log(global_log_fidelity)
+            global_infidelity = infidelity_from_log(global_log_fidelity)
             sample["fidelity"] = global_fidelity
             sample["global_fidelity"] = global_fidelity
             sample["global_infidelity"] = global_infidelity
@@ -3380,7 +3698,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 to_dense = getattr(gate, "to_dense", None)
                 if not callable(to_dense):
                     return None
-                gate = np.asarray(to_dense())
+                gate = np.asarray(ar.to_numpy(to_dense()))
             shape = tuple(int(dim) for dim in gate.shape)
             if len(shape) != 2:
                 dims = self._infer_gate_dims(gate, where)
@@ -3409,14 +3727,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     @staticmethod
     def _norm_ratio_fidelity(approx_norm, target_norm):
         """Return clipped ``(||approx|| / ||target||)**2``."""
-        approx = MpsOptimizer._real_float(approx_norm)
-        target = MpsOptimizer._real_float(target_norm)
-
-        if target <= 0.0:
-            return 1.0 if approx <= 0.0 else 0.0
-
-        fidelity = (approx / target) ** 2
-        return min(1.0, max(0.0, float(fidelity)))
+        return fidelity_from_log(
+            log_fidelity_from_norms(
+                MpsOptimizer._real_float(approx_norm),
+                MpsOptimizer._real_float(target_norm),
+            )
+        )
 
     def _build_norm_target(self, p, gate, where, cutoff, cutoff_mode="rsum2"):
         """Build the pre-chi-compression target used for norm diagnostics."""

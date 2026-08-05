@@ -101,21 +101,30 @@ constructing the sampler:
 sampler = MpsSampler(
     psi,
     backend="symmray",
-    prefix_strategy="auto",  # "prefix" or "serial" are also available
+    strategy="auto",  # "prefix", "serial", or "dense" are also available
     max_prefix_groups=256,
+    dense_memory_limit="256MiB",
 )
 configs, probs = sampler.sample_arrays(4096, seed=0)
 print(sampler.symmray_sampling_stats)
 ```
 
-`"auto"` shares equal prefixes while they still amortize a boundary: singleton
-prefixes are completed serially, and retained groups obey both the active-group
-cap and a per-level block-storage budget. `"prefix"` keeps every group allowed
-by `max_prefix_groups`, including singletons; `"serial"` retains one boundary
-at a time. The statistics report distinct conditional distributions,
-candidate contractions, charge-pruned branches, peak active groups, and
-serial/adaptive fallbacks. Set `max_prefix_groups=None` to remove the hard
-group cap while retaining the `"auto"` reuse decision.
+`"auto"` selects the fully batched dense kernel when the batch has at least
+`dense_min_samples` shots and the estimated dense MPS view fits within
+`dense_memory_limit`; otherwise it shares equal sparse prefixes. `"prefix"`
+keeps every group allowed by `max_prefix_groups`, including singletons;
+`"serial"` retains one boundary at a time. `"dense"` materializes a private
+dense view of the source MPS and uses the backend-native batched conditional
+kernel. It is supported for resolved fermionic U1/U1U1 states; parity-collapsed
+Z2/Z2Z2 states remain on the sparse charge-aware route. Dense batching can be
+substantially faster for moderate bond dimensions and high-entropy batches,
+but uses more memory. The statistics report the requested and selected
+strategy, dense-memory estimate, conditional distributions, candidate
+contractions, charge-pruned branches, peak active groups, and serial/adaptive
+fallbacks. Set `max_prefix_groups=None` to remove the hard group cap while
+retaining sparse prefix sampling.
+
+`prefix_strategy=` remains a backward-compatible alias for `strategy=`.
 For comparable throughput measurements, call the public sampling APIs from an
 external benchmark harness. For fermionic `Z2`/`Z2Z2` inputs, do not treat a
 naive dense expansion of graded virtual legs as a state-preserving conversion;
