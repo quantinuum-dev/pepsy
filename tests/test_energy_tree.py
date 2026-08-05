@@ -263,7 +263,32 @@ def test_peps_energy_optimizer_validation_rolls_back_false_descent(monkeypatch):
     optimizer.state = object()
     fake = FakeTNOptimizer()
     converted_states = []
-    monkeypatch.setattr(optimizer, "make_tn_optimizer", lambda **kwargs: fake)
+    optimizer_kwargs = []
+    progress_bars = []
+
+    class FakeProgress:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.n = 0
+            self.postfixes = []
+            self.closed = False
+            progress_bars.append(self)
+
+        def update(self, amount):
+            self.n += amount
+
+        def set_postfix(self, **values):
+            self.postfixes.append(dict(values))
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        optimizer,
+        "make_tn_optimizer",
+        lambda **kwargs: optimizer_kwargs.append(kwargs) or fake,
+    )
+    monkeypatch.setattr("tqdm.auto.tqdm", FakeProgress)
     monkeypatch.setattr(
         optimizer,
         "_validation_loss",
@@ -286,16 +311,44 @@ def test_peps_energy_optimizer_validation_rolls_back_false_descent(monkeypatch):
             optlib="nlopt",
             check_finite_gradient=False,
             validate=True,
-            progbar=False,
+            validation_interval=5,
+            progbar=True,
             return_losses=True,
         )
 
     assert np.array_equal(out, np.array([1.0]))
     assert losses == (0.5, 0.4)
-    assert optimizer.validation_history == [(0, 0.0), (10, -1.0), (20, 0.0)]
+    assert optimizer.validation_history == [(0, 0.0), (5, -1.0), (10, 0.0)]
     # Validation must use the same backend-conversion hook as the final state,
     # including the initial check and every candidate check.
     assert len(converted_states) >= 4
+    assert optimizer_kwargs[0]["progbar"] is False
+    assert len(progress_bars) == 1
+    assert progress_bars[0].n == 10
+    assert progress_bars[0].closed
+    assert progress_bars[0].postfixes[-1] == {
+        "train_chi": 2,
+        "check_chi": 4,
+        "step": 5,
+        "local_E": "+4.000e-01",
+        "check_E": "+0.000e+00",
+        "status": "rollback",
+    }
+
+
+@pytest.mark.smoke
+def test_peps_energy_optimizer_validation_interval_auto_and_explicit():
+    """Validation cadence follows ``n`` unless the user overrides it."""
+    optimizer_cls = pepsy.PepsEnergyOptimizer
+
+    assert optimizer_cls._validation_chunk_size(100, None) == 20
+    assert optimizer_cls._validation_chunk_size(20, None) == 10
+    assert optimizer_cls._validation_chunk_size(100, 7) == 7
+
+    with pytest.raises(ValueError, match="validation_interval"):
+        optimizer_cls._validation_chunk_size(100, 0)
+    with pytest.raises(TypeError, match="validation_interval"):
+        optimizer_cls._validation_chunk_size(100, 2.5)
 
 
 @pytest.mark.smoke

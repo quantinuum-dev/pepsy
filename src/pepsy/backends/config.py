@@ -347,8 +347,13 @@ def register_torch_linalg(
     stabilized=False,
     qr_rank_policy="warn",
     qr_rank_tol_factor=1.0,
+    quimb_split_drivers=False,
 ):
-    """Register Torch linalg rules in Autoray.
+    """Configure the canonical Torch linalg rules used by Pepsy.
+
+    This is the public configuration entry point. The lower-level
+    ``reg_*_torch`` helpers are retained for advanced and compatibility uses;
+    do not combine them in ordinary PEPS workflows.
 
     Parameters
     ----------
@@ -356,14 +361,20 @@ def register_torch_linalg(
         Select the real or complex stabilized rule when ``stabilized=True``.
     stabilized : bool, default=False
         Keep native Torch SVD/QR by default. Set this to ``True`` to install
-        Pepsy's relative-regularized SVD and validated real-QR rules. The
-        Quimb block-split drivers used by Symmray PEPS are installed by
-        ``PepsEnergyOptimizer`` after the state is prepared, so simple-update
-        forward decompositions are not changed by this global registration.
+        Pepsy's relative-regularized SVD and validated real-QR rules.
     qr_rank_policy : {"warn", "native", "error"}, default="warn"
         Response to rank-deficient inputs when stabilized real QR is active.
     qr_rank_tol_factor : float, default=1.0
         Multiplier for the scale-aware real-QR rank threshold.
+    quimb_split_drivers : bool, default=False
+        Also register Pepsy's stable Torch drivers for Quimb's
+        ``qr_stabilized`` and ``svd_truncated`` split paths. Enable this for
+        Torch-autodiff PEPS workflows with native Symmray blocks. The drivers
+        use the same ``mode`` and a zero-safe QR phase convention
+        ``phase(0)=1``. It is opt-in because this is a process-global Quimb
+        registration. Passing ``False`` leaves any previously installed Quimb
+        drivers unchanged; use :func:`reset_linalg_registrations` to restore
+        Quimb's defaults explicitly.
     """
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
@@ -378,8 +389,7 @@ def register_torch_linalg(
         else:
             lr.reg_native_svd_torch()
         lr.reg_complex_qr_torch()
-        return
-    if mode == "real":
+    elif mode == "real":
         if stabilized:
             lr.reg_real_svd_torch()
             lr.reg_real_qr_torch(
@@ -389,8 +399,11 @@ def register_torch_linalg(
         else:
             lr.reg_native_svd_torch()
             lr.reg_complex_qr_torch()
-        return
-    raise ValueError("mode must be 'complex' or 'real'")
+    else:
+        raise ValueError("mode must be 'complex' or 'real'")
+
+    if quimb_split_drivers:
+        lr.reg_quimb_torch_split_drivers(mode=mode)
 
 
 def register_jax_linalg(*, stabilized=False):
@@ -458,7 +471,7 @@ def reset_linalg_registrations(backend="all"):
 
 
 def reg_native_svd_torch():
-    """Register native Torch thin SVD in autoray."""
+    """Advanced compatibility helper; prefer ``register_torch_linalg``."""
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_native_svd_torch requires optional dependency 'torch'. "
@@ -484,7 +497,7 @@ def reg_native_svd_jax():
 
 
 def reg_rel_svd_torch():
-    """Register torch SVD with a stable relative-regularized backward rule.
+    """Advanced compatibility helper for stabilized Torch SVD.
 
     The registered autoray ``torch`` SVD uses Townsend's rectangular SVD
     reverse-mode update, Lorentzian broadening of singular-value denominators
@@ -502,7 +515,7 @@ def reg_rel_svd_torch():
 
 
 def reg_complex_svd_torch():
-    """Register complex torch SVD autograd rule in autoray.
+    """Advanced compatibility helper for the stabilized complex Torch SVD.
 
     Compatibility wrapper for :func:`reg_rel_svd_torch`.
     """
@@ -517,7 +530,7 @@ def reg_complex_svd_torch():
 
 
 def reg_real_svd_torch():
-    """Register the real-only torch SVD autograd rule in autoray.
+    """Advanced compatibility helper for the stabilized real Torch SVD.
 
     This is the real counterpart of :func:`reg_rel_svd_torch`. It shares the
     robust forward path (``gesvd`` driver on CUDA plus a batched SciPy ``gesvd``
@@ -537,7 +550,7 @@ def reg_real_svd_torch():
 
 
 def reg_complex_qr_torch():
-    """Register native Torch QR for complex inputs in autoray."""
+    """Advanced compatibility helper; prefer ``register_torch_linalg``."""
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_complex_qr_torch requires optional dependency 'torch'. "
@@ -549,7 +562,7 @@ def reg_complex_qr_torch():
 
 
 def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
-    """Register real Torch QR with a rank-deficiency policy."""
+    """Advanced compatibility helper; prefer ``register_torch_linalg``."""
     if torch is None:  # pragma: no cover - exercised in no-torch CI
         raise ImportError(
             "reg_real_qr_torch requires optional dependency 'torch'. "
