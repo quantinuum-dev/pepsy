@@ -508,6 +508,10 @@ def _model_progress_fields(model):
             if chi is None
             else f"{contraction} chi={chi}"
         )
+    if hasattr(model, "ctmrg_failures"):
+        fields["ctmrg_failures"] = int(model.ctmrg_failures)
+    if hasattr(model, "ctmrg_calls"):
+        fields["ctmrg_calls"] = int(model.ctmrg_calls)
     return fields
 
 
@@ -672,6 +676,12 @@ def _cache_profile_snapshot(model):
             snapshot[name] = dict(value)
     if hasattr(model, "cutoff_fallbacks"):
         snapshot["cutoff_fallbacks"] = int(model.cutoff_fallbacks)
+    if hasattr(model, "ctmrg_failures"):
+        snapshot["ctmrg_failures"] = int(model.ctmrg_failures)
+    if hasattr(model, "ctmrg_calls"):
+        snapshot["ctmrg_calls"] = int(model.ctmrg_calls)
+    if hasattr(model, "contraction_fallbacks"):
+        snapshot["contraction_fallbacks"] = int(model.contraction_fallbacks)
     return snapshot
 
 

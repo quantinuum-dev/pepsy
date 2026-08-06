@@ -1018,10 +1018,130 @@ def test_torch_native_symmray_ctmrg_defaults_to_projector_mode():
         state,
         contraction="ctmrg",
         chi=2,
+        contraction_opts={"fallback_contraction": "boundary_mps"},
         dtype=torch.complex128,
     )
 
     assert model.contraction_opts["mode"] == "projector"
+    assert model.contraction_fallback == "boundary"
+
+
+def _make_ctmrg_fallback_test_model():
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    model = object.__new__(TorchPEPSAmplitude)
+    model.contraction = "ctmrg"
+    model.requested_contraction = "ctmrg"
+    model.contraction_fallback = "boundary"
+    model.contraction_opts = {
+        "mode": "projector",
+        "reduce_opts": {"method": "eigh"},
+        "final_contract_opts": {"optimize": "auto-hq"},
+    }
+    model.chi = 4
+    model.cutoff = 0.0
+    model.symmray_tensor_ids = ()
+    model.ctmrg_calls = 0
+    model.ctmrg_failures = 0
+    model.contraction_fallbacks = 0
+    model.contraction_fallback_error = None
+    return model
+
+
+def test_torch_ctmrg_can_switch_to_boundary_after_projector_failure():
+    """A failed native CTMRG call should not abort a configured VMC run."""
+    torch = pytest.importorskip("torch")
+    from pepsy.vmc import ContractionFallbackWarning
+
+    class FakeNetwork:
+        ctmrg_calls = 0
+        boundary_calls = 0
+
+        def contract_ctmrg(self, **kwargs):
+            self.ctmrg_calls += 1
+            raise RuntimeError("contracted dimensions need to match")
+
+        def contract_boundary(self, **kwargs):
+            self.boundary_calls += 1
+            assert kwargs["mode"] == "mps"
+            assert "reduce_opts" not in kwargs
+            return 2.0
+
+    model = _make_ctmrg_fallback_test_model()
+    network = FakeNetwork()
+    with pytest.warns(ContractionFallbackWarning, match="boundary-MPS"):
+        result = model._contract_value(network)
+
+    assert torch.as_tensor(result).item() == 2.0
+    assert network.ctmrg_calls == 1
+    assert model.ctmrg_calls == 1
+    assert network.boundary_calls == 1
+    assert model.contraction == "boundary"
+    assert model.ctmrg_failures == 1
+    assert model.contraction_fallbacks == 1
+    assert "contracted dimensions" in model.contraction_fallback_error
+
+    # The circuit breaker stays on the fallback route for later samples.
+    assert model._contract_value(network).item() == 2.0
+    assert network.ctmrg_calls == 1
+    assert network.boundary_calls == 2
+
+
+def test_torch_ctmrg_fallback_preserves_stable_log_amplitude_path():
+    """The fallback also covers the mantissa/exponent contraction route."""
+    torch = pytest.importorskip("torch")
+    from pepsy.vmc import ContractionFallbackWarning
+
+    class FakeNetwork:
+        def contract_ctmrg(self, **kwargs):
+            raise RuntimeError("incompatible sparse blocks")
+
+        def contract_boundary(self, **kwargs):
+            assert kwargs["strip_exponent"] is True
+            return 2.0, 1
+
+    model = _make_ctmrg_fallback_test_model()
+    with pytest.warns(ContractionFallbackWarning, match="boundary-MPS"):
+        phase, log_abs = model._contract_log_parts(FakeNetwork())
+
+    assert torch.as_tensor(phase).item() == 1.0
+    assert torch.allclose(
+        torch.as_tensor(log_abs),
+        torch.log(torch.as_tensor(2.0)) + torch.log(torch.as_tensor(10.0)),
+    )
+    assert model.contraction == "boundary"
+    assert model.ctmrg_calls == 1
+
+
+def test_torch_native_symmray_preserves_complex64_parameters():
+    """Native Torch PEPS initialization must retain requested complex64."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("symmray")
+    from pepsy.tensors import SymPEPS, site_charge_from_occupations
+    from pepsy.vmc.torch.amplitude import TorchPEPSAmplitude
+
+    state = SymPEPS.random(
+        2,
+        2,
+        symmetry="U1",
+        phys_dim={0: 1, 1: 2, 2: 1},
+        fermionic=True,
+        site_charge=site_charge_from_occupations(
+            {(x, y): 1 for x in range(2) for y in range(2)}
+        ),
+        bond_dim=2,
+        seed=195,
+        dtype="complex64",
+    )
+    model = TorchPEPSAmplitude(
+        state,
+        contraction="exact",
+        dtype=torch.complex64,
+    )
+
+    assert {parameter.dtype for parameter in model.parameters()} == {
+        torch.complex64
+    }
 
 
 def test_netket_setup_consumes_shared_sampling_config():
