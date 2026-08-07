@@ -6,6 +6,8 @@ and fail early when input structure is inconsistent.
 """
 
 import logging
+import math
+from numbers import Integral
 from typing import Any, Dict, List, Optional, Sequence
 
 import autoray as ar
@@ -114,6 +116,10 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # Diagnostics collected during sweeps.
         self.fidelity_trace: List[float] = []
         self.local_norm_trace: List[float] = []
+        self.sweep_norm_trace: List[float] = []
+        self.iterations_run = 0
+        self.converged = False
+        self.last_relative_change: Optional[float] = None
         self.info: Dict[str, Any] = info or {}
         self.range_int: List[int] = list(range_int) if range_int is not None else []
         if self.range_int:
@@ -476,15 +482,49 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 self.fidelity_trace.append(ar.do("real", fidelity))
 
     def run_gate(
-        self, n_iter=6, verbose=False
+        self,
+        n_iter=6,
+        verbose=False,
+        *,
+        min_iter=None,
+        rtol=None,
+        patience=1,
+        finite_check=None,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run fitting restricted to ``range_int`` with gate-style sweeps.
 
         The algorithm canonicalizes the active interval and updates tensors
-        using effective environments built from neighboring boundaries.
+        using effective environments built from neighboring boundaries. By
+        default, exactly ``n_iter`` sweeps are performed. Supplying ``rtol``
+        enables early stopping after ``min_iter`` sweeps once the final local
+        norm changes by at most ``rtol`` for ``patience`` consecutive sweeps.
+        ``finite_check``, when supplied, is called once after every sweep and
+        must return whether the fitted state is numerically healthy.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
+        if not isinstance(n_iter, Integral) or int(n_iter) < 1:
+            raise ValueError("n_iter must be a positive integer.")
+        n_iter = int(n_iter)
+        if min_iter is None:
+            min_iter = n_iter if rtol is None else 1
+        if not isinstance(min_iter, Integral) or int(min_iter) < 1:
+            raise ValueError("min_iter must be a positive integer or None.")
+        min_iter = min(int(min_iter), n_iter)
+        if rtol is not None:
+            rtol = float(rtol)
+            if not math.isfinite(rtol) or rtol < 0.0:
+                raise ValueError("rtol must be a finite non-negative number or None.")
+        if not isinstance(patience, Integral) or int(patience) < 1:
+            raise ValueError("patience must be a positive integer.")
+        patience = int(patience)
+        if finite_check is not None and not callable(finite_check):
+            raise TypeError("finite_check must be callable or None.")
+
+        self.sweep_norm_trace = []
+        self.iterations_run = 0
+        self.converged = False
+        self.last_relative_change = None
 
         site_tag_id = self.site_tag_id
         psi = self.p
@@ -508,7 +548,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         env_left = {site_tag_id.format(i): None for i in range(psi.L)}
         env_right = {site_tag_id.format(i): None for i in range(psi.L)}
 
-        for _ in range(n_iter):
+        previous_sweep_norm = None
+        stable_sweeps = 0
+        for sweep in range(1, n_iter + 1):
             for i in range(stop, start, -1):
                 psi.right_canonize_site(i, bra=None)
 
@@ -596,3 +638,39 @@ class FIT:  # pylint: disable=too-many-instance-attributes
             if verbose:
                 fidelity = tn_fidelity(self.tn, psi)
                 self.fidelity_trace.append(ar.do("real", fidelity))
+
+            self.iterations_run = sweep
+            if finite_check is not None and not bool(finite_check(psi)):
+                error = FloatingPointError(
+                    f"FIT gate sweep {sweep} produced non-finite tensor data."
+                )
+                error.fit_iteration = sweep
+                raise error
+
+            if rtol is not None:
+                sweep_norm = float(ar.to_numpy(self.local_norm_trace[-1]))
+                self.sweep_norm_trace.append(sweep_norm)
+                if not math.isfinite(sweep_norm):
+                    error = FloatingPointError(
+                        f"FIT gate sweep {sweep} produced a non-finite local norm."
+                    )
+                    error.fit_iteration = sweep
+                    raise error
+                if previous_sweep_norm is not None:
+                    scale = max(
+                        abs(sweep_norm),
+                        abs(previous_sweep_norm),
+                        float.fromhex("0x1.0p-1022"),
+                    )
+                    relative_change = abs(
+                        sweep_norm - previous_sweep_norm
+                    ) / scale
+                    self.last_relative_change = relative_change
+                    if relative_change <= rtol:
+                        stable_sweeps += 1
+                    else:
+                        stable_sweeps = 0
+                    if sweep >= min_iter and stable_sweeps >= patience:
+                        self.converged = True
+                        break
+                previous_sweep_norm = sweep_norm

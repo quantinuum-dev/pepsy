@@ -37,22 +37,34 @@ measures each target in `basis`, records the result, then resets it to the
 physical leg with `vec`, absorbs it into the selected neighbour, and shortens
 the MPS by one site.
 
-`mode="mix"` is a unitary gate-stream mode that warms up with MPO replay while
-`p.max_bond() < chi`, then uses transactional DMRG replay once the working MPS
-reaches the target bond. One-site gates remain on the exact direct/MPO path;
-`k_2q_batch` controls contiguous two-site DMRG batches. If a DMRG batch raises,
-produces non-finite data, or exceeds `chi`, the optimizer restores the complete
-pre-batch state (including canonical and infidelity metadata) and replays the
-batch through MPO. Interrupts restore the trial state and are re-raised.
+`mode="mix"` is a unitary gate-stream mode that warms up with MPO replay until
+the global bond and every bond in the active gate interval reach their
+`chi`-capped physical rank targets, then uses transactional DMRG replay.
+Structurally smaller edge bonds use their attainable rank rather than being
+padded to `chi`. One-site gates remain on the exact direct/MPO path;
+`k_2q_batch` controls contiguous DMRG-ready two-site batches. If a DMRG batch
+raises, produces non-finite data, or exceeds `chi`, the optimizer restores the
+complete pre-batch state (including canonical and infidelity metadata) and
+replays the batch through MPO. Interrupts restore the trial state and are
+re-raised.
 
-Mixed-mode DMRG expands only the active gate interval. Native Symmray states
-with a short active bond stay on the symmetry-aware MPO path rather than using
-Quimb's dense-style bond expansion. The initial MPS must satisfy
-`p.max_bond() <= chi`. The mixed replay history is stored in `opt.mix_history`
-and summarized in `opt.last_mix_summary`; history entries include logical
-`where` and execution `execution_where` positions. With `progbar=True`, the
-progress bar shows the current backend, cumulative MPO/DMRG/fallback counts,
-and `bond=current/chi`.
+For mixed DMRG, `n_iter` is a maximum rather than an unconditional sweep count.
+`mix_fit_min_iter`, `mix_fit_rtol`, and `mix_fit_patience` control adaptive
+stopping from FIT's final local-norm change; `mix_fit_rtol="auto"` selects
+`1e-3`, `1e-5`, or `1e-8` for 16-, 32-/complex64-, or higher-precision data.
+Pass `mix_fit_rtol=None` for the old fixed-iteration behavior. FIT checks the
+whole state after every sweep. Torch and CuPy checks reduce every tensor on the
+device and transfer one combined Boolean to the host.
+
+After a non-finite DMRG result, `mix_sticky_nonfinite=True` keeps the remainder
+of the current `run()` call on MPO rather than retrying an unhealthy FIT for
+every gate. An ordinary exception still falls back only for its transaction.
+The initial MPS must satisfy `p.max_bond() <= chi`. The mixed replay history is
+stored in `opt.mix_history` and summarized in `opt.last_mix_summary`; entries
+include logical `where`, execution `execution_where`, FIT iterations and
+convergence, target bond, fallback sweep, and sticky-disable diagnostics. With
+`progbar=True`, the progress bar shows the current backend, cumulative
+MPO/DMRG/fallback counts, and `bond=current/chi`.
 
 `mode="su"` uses simple-update evolution for imaginary-time or other
 non-unitary gate streams. It keeps `opt.p` as the simple-update core and

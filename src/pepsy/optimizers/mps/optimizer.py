@@ -1261,6 +1261,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.last_layout_plan = self._persistent_layout_plan
         self.mix_history = []
         self.last_mix_summary = None
+        self._mix_dmrg_disabled_reason = None
+        self._mix_dmrg_failed_sweep = None
+        self._last_dmrg_fit_diagnostics = None
         self.measurements = []
         self._rng = np.random.default_rng()
         self._infidelity_log_fidelity = 0.0
@@ -1360,38 +1363,57 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _mps_data_is_finite(p):
         """Return whether tensor data contains only finite values.
 
-        The reduction is kept on the live array backend until the final scalar
-        conversion. In particular, this must not materialize every CuPy/Torch
-        tensor on the host merely to check a DMRG trial state.
+        All dense tensors or symmetry blocks are reduced to scalar booleans on
+        their live backend, combined there, and copied to the host once. In
+        particular, this neither materializes CuPy/Torch tensors on the host
+        nor synchronizes once per MPS site.
         """
 
-        def check_array(data):
-            """Check one dense or block-sparse backend array."""
+        def iter_arrays(data):
+            """Yield dense leaves from one dense or block-sparse array."""
             blocks = getattr(data, "blocks", None)
             if blocks is not None:
                 if isinstance(blocks, Mapping):
                     blocks = blocks.values()
                 try:
-                    return all(check_array(block) for block in blocks)
+                    for block in blocks:
+                        yield from iter_arrays(block)
+                    return
                 except TypeError:
                     pass
+            yield data
 
-            try:
-                finite = ar.do("isfinite", data)
-                reduced = ar.do("all", finite)
-                return bool(ar.to_numpy(reduced))
-            except Exception:
+        checks = []
+        for tensor in getattr(p, "tensors", ()):
+            for data in iter_arrays(tensor.data):
+                try:
+                    checks.append(ar.do("all", ar.do("isfinite", data)))
+                    continue
+                except Exception:
+                    pass
+
                 dense = getattr(data, "to_dense", None)
                 if callable(dense):
                     data = dense()
                 try:
-                    return bool(np.all(np.isfinite(np.asarray(data))))
+                    if not bool(np.all(np.isfinite(np.asarray(data)))):
+                        return False
                 except Exception:
                     return False
 
-        for tensor in getattr(p, "tensors", ()):
-            if not check_array(tensor.data):
-                return False
+        if checks:
+            try:
+                combined = checks[0]
+                for check in checks[1:]:
+                    combined = ar.do("logical_and", combined, check)
+                if not bool(ar.to_numpy(combined)):
+                    return False
+            except Exception:
+                # Unknown backends may not implement scalar logical-and. The
+                # supported NumPy/Torch/CuPy path above always has one host
+                # conversion; retain a conservative compatibility fallback.
+                if not all(bool(ar.to_numpy(check)) for check in checks):
+                    return False
         exponent = getattr(p, "exponent", 0.0)
         try:
             return bool(np.isfinite(float(exponent)))
@@ -1523,21 +1545,27 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         xmin, xmax = min(where), max(where)
         if xmin == xmax:
             return
-        bond_sizes = [
-            int(self.p.bond_size(site, site + 1))
+        target_sizes = self._mix_target_bond_dimensions()
+        bonds_to_expand = [
+            site
             for site in range(xmin, xmax)
+            if int(self.p.bond_size(site, site + 1)) < target_sizes[site]
         ]
-        if any(bond_size < int(self.chi) for bond_size in bond_sizes):
-            bond_inds = [self.p.bond(site, site + 1) for site in range(xmin, xmax)]
-            # MatrixProductState overrides this method without exposing
-            # ``inds_to_expand``. Calling the public TensorNetwork method
-            # retains the MPS object while selecting only these bonds.
-            qtn.TensorNetwork.expand_bond_dimension(
-                self.p,
-                int(self.chi),
-                inds_to_expand=bond_inds,
-                inplace=True,
-            )
+        if bonds_to_expand:
+            by_target = {}
+            for site in bonds_to_expand:
+                by_target.setdefault(target_sizes[site], []).append(site)
+            for target, sites in by_target.items():
+                bond_inds = [self.p.bond(site, site + 1) for site in sites]
+                # MatrixProductState overrides this method without exposing
+                # ``inds_to_expand``. Calling the public TensorNetwork method
+                # retains the MPS object while selecting only these bonds.
+                qtn.TensorNetwork.expand_bond_dimension(
+                    self.p,
+                    int(target),
+                    inds_to_expand=bond_inds,
+                    inplace=True,
+                )
             self._init_canonicalization()
 
     def set_p(self, p):
@@ -1622,6 +1650,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied.infidelity_samples = deepcopy(self.infidelity_samples)
         copied.mix_history = deepcopy(self.mix_history)
         copied.last_mix_summary = deepcopy(self.last_mix_summary)
+        copied._mix_dmrg_disabled_reason = self._mix_dmrg_disabled_reason
+        copied._mix_dmrg_failed_sweep = self._mix_dmrg_failed_sweep
+        copied._last_dmrg_fit_diagnostics = deepcopy(
+            self._last_dmrg_fit_diagnostics
+        )
         copied.measurements = deepcopy(self.measurements)
         copied._infidelity_log_fidelity = self._infidelity_log_fidelity
         copied._unitary_initial_norm = self._unitary_initial_norm
@@ -2329,14 +2362,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         seed=None,
         track_infidelity=None,
         mix_strict=False,
+        mix_fit_min_iter=2,
+        mix_fit_rtol="auto",
+        mix_fit_patience=2,
+        mix_sticky_nonfinite=True,
     ):
         """Run the currently queued gates.
 
         Parameters
         ----------
         n_iter : int, default=5
-            Inner iterations for DMRG local fits. Ignored by
-            ``mpo``/``swap``/``svd``/``exact``.
+            Inner iterations for DMRG local fits. In mixed mode this is the
+            maximum number of sweeps because adaptive convergence can stop
+            earlier. Ignored by ``mpo``/``swap``/``svd``/``exact``.
         progbar : bool, default=False
             Show per-mode progress bars.
         cutoff : float, default=1e-12
@@ -2408,6 +2446,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mix_strict : bool, default=False
             In ``mode="mix"``, restore the committed state and re-raise an
             ordinary DMRG trial exception instead of falling back to MPO.
+        mix_fit_min_iter : int, default=2
+            Minimum FIT sweeps before mixed-mode adaptive convergence can
+            stop. Values above ``n_iter`` are clamped to ``n_iter``.
+        mix_fit_rtol : {"auto"} | float | None, default="auto"
+            Relative tolerance for mixed-mode FIT early stopping. ``"auto"``
+            selects a dtype-aware tolerance; ``None`` disables early stopping
+            and restores fixed ``n_iter`` behavior.
+        mix_fit_patience : int, default=2
+            Consecutive converged FIT sweeps required before stopping early.
+        mix_sticky_nonfinite : bool, default=True
+            After a mixed DMRG trial produces NaN or Inf, use MPO for the
+            remainder of this :meth:`run` call instead of retrying DMRG on
+            every subsequent gate.
 
         Returns
         -------
@@ -2430,6 +2481,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self.mode == "mix":
             self.mix_history = []
             self.last_mix_summary = None
+            self._mix_dmrg_disabled_reason = None
+            self._mix_dmrg_failed_sweep = None
         if not G_seq:
             if self.mode == "su":
                 self._prepare_su_state()
@@ -2537,8 +2590,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self.mode == "mix":
             if non_unitary:
                 raise ValueError("mode='mix' is only for unitary gate streams.")
+            if not isinstance(n_iter, Integral) or int(n_iter) < 1:
+                raise ValueError("n_iter must be a positive integer.")
             if not isinstance(k_2q_batch, Integral) or k_2q_batch < 1:
                 raise ValueError("k_2q_batch must be a positive integer.")
+            if (
+                not isinstance(mix_fit_min_iter, Integral)
+                or int(mix_fit_min_iter) < 1
+            ):
+                raise ValueError("mix_fit_min_iter must be a positive integer.")
+            if (
+                not isinstance(mix_fit_patience, Integral)
+                or int(mix_fit_patience) < 1
+            ):
+                raise ValueError("mix_fit_patience must be a positive integer.")
+            mix_fit_rtol = self._resolve_mix_fit_rtol(mix_fit_rtol)
             if self.p.max_bond() > self.chi:
                 raise ValueError(
                     "mode='mix' requires the initial MPS max bond to be <= chi; "
@@ -2561,6 +2627,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             non_unitary=non_unitary,
             submpo_method=submpo_method,
             mix_strict=bool(mix_strict),
+            mix_fit_min_iter=int(mix_fit_min_iter),
+            mix_fit_rtol=mix_fit_rtol,
+            mix_fit_patience=int(mix_fit_patience),
+            mix_sticky_nonfinite=bool(mix_sticky_nonfinite),
         )
 
         if has_control:
@@ -2620,6 +2690,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         non_unitary,
         submpo_method,
         mix_strict=False,
+        mix_fit_min_iter=2,
+        mix_fit_rtol=None,
+        mix_fit_patience=2,
+        mix_sticky_nonfinite=True,
     ):
         """Dispatch a gate/subMPO segment to the active mode backend.
 
@@ -2664,6 +2738,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff_mode=cutoff_mode,
                 submpo_method=submpo_method,
                 mix_strict=mix_strict,
+                fit_min_iter=mix_fit_min_iter,
+                fit_rtol=mix_fit_rtol,
+                fit_patience=mix_fit_patience,
+                sticky_nonfinite=mix_sticky_nonfinite,
             )
             return self.p
 
@@ -4126,6 +4204,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         step,
         n_iter,
+        fit_min_iter,
+        fit_rtol,
+        fit_patience,
         cutoff,
         cutoff_mode,
     ):
@@ -4141,6 +4222,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             k_2q_batch=1,
             normalize_every=None,
             normalize_final=False,
+            fit_min_iter=fit_min_iter,
+            fit_rtol=fit_rtol,
+            fit_patience=fit_patience,
+            fit_finite_check=self._mps_data_is_finite,
         )
         self._renumber_mix_infidelity_samples(sample_start, step)
         if not self._mps_data_is_finite(self.p):
@@ -4153,6 +4238,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         steps,
         n_iter,
+        fit_min_iter,
+        fit_rtol,
+        fit_patience,
         cutoff,
         cutoff_mode,
     ):
@@ -4168,6 +4256,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             k_2q_batch=len(G_seq),
             normalize_every=None,
             normalize_final=False,
+            fit_min_iter=fit_min_iter,
+            fit_rtol=fit_rtol,
+            fit_patience=fit_patience,
+            fit_finite_check=self._mps_data_is_finite,
         )
         # FIT produces one compression sample for the whole batch. It is
         # therefore associated with the final gate in the batch.
@@ -4175,13 +4267,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not self._mps_data_is_finite(self.p):
             raise FloatingPointError("DMRG batch produced non-finite MPS tensor data.")
         if int(self.p.max_bond()) > int(self.chi):
-            raise FloatingPointError(
+            raise RuntimeError(
                 "DMRG batch exceeded the mixed-mode chi bond limit."
             )
 
-    @staticmethod
-    def _collect_mix_dmrg_batch(G_seq, where_seq, start_idx, k_2q_batch):
-        """Collect contiguous two-site gates for one mixed DMRG transaction."""
+    def _collect_mix_dmrg_batch(
+        self,
+        G_seq,
+        where_seq,
+        start_idx,
+        k_2q_batch,
+        *,
+        target_sizes=None,
+    ):
+        """Collect contiguous DMRG-ready gates for one mixed transaction."""
         batch_G = []
         batch_where = []
         idx = start_idx
@@ -4189,6 +4288,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             idx < len(G_seq)
             and len(batch_G) < int(k_2q_batch)
             and len(where_seq[idx]) == 2
+            and not self._mix_active_bond_is_short(
+                where_seq[idx], target_sizes=target_sizes
+            )
         ):
             batch_G.append(G_seq[idx])
             batch_where.append(where_seq[idx])
@@ -4255,13 +4357,67 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             committed_p.exponent = trial_p.exponent
         self.p = committed_p
 
-    def _mix_active_bond_is_short(self, where):
-        """Return whether a gate's active interval has a bond below ``chi``."""
+    def _resolve_mix_fit_rtol(self, value):
+        """Return a validated dtype-aware mixed FIT stopping tolerance."""
+        if value == "auto":
+            dtype = str(self.backend_dtype).lower()
+            if "16" in dtype:
+                return 1e-3
+            if "32" in dtype or "complex64" in dtype:
+                return 1e-5
+            return 1e-8
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "mix_fit_rtol must be 'auto', a non-negative number, or None."
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "mix_fit_rtol must be 'auto', a non-negative number, or None."
+            )
+        return value
+
+    def _mix_target_bond_dimensions(self):
+        """Return each bond's ``chi``-capped physical rank ceiling."""
+        L = int(getattr(self.p, "L", 0))
+        if L <= 1:
+            return []
+        dims = []
+        for site in range(L):
+            try:
+                dim = int(self.p.phys_dim(site))
+            except (AttributeError, TypeError, ValueError):
+                dim = int(self.p.ind_size(self._format_ind(site)))
+            dims.append(dim)
+
+        left_caps = []
+        rank = 1
+        for site in range(L - 1):
+            rank = min(int(self.chi), rank * dims[site])
+            left_caps.append(rank)
+
+        right_caps = [1] * (L - 1)
+        rank = 1
+        for site in range(L - 1, 0, -1):
+            rank = min(int(self.chi), rank * dims[site])
+            right_caps[site - 1] = rank
+        return [
+            min(int(self.chi), left, right)
+            for left, right in zip(left_caps, right_caps)
+        ]
+
+    def _mix_active_bond_is_short(self, where, *, target_sizes=None):
+        """Return whether an active bond is below its attainable target."""
         if self.chi <= 1 or len(where) < 2:
             return False
         xmin, xmax = min(where), max(where)
+        if target_sizes is None:
+            target_sizes = self._mix_target_bond_dimensions()
         return any(
-            int(self.p.bond_size(site, site + 1)) < int(self.chi)
+            int(self.p.bond_size(site, site + 1)) < target_sizes[site]
             for site in range(xmin, xmax)
         )
 
@@ -4273,6 +4429,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         *,
         logical_where_seq=None,
         n_iter,
+        fit_min_iter,
+        fit_rtol,
+        fit_patience,
+        sticky_nonfinite,
         k_2q_batch=1,
         mix_strict=False,
         progbar=False,
@@ -4302,6 +4462,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if len(logical_where_seq) != len(where_seq):
             raise ValueError("logical and execution gate streams must have equal length.")
 
+        target_sizes = self._mix_target_bond_dimensions()
+        target_bond = max(target_sizes, default=1)
         mix_step_offset = len(self.mix_history)
         mpo_steps = sum(event["backend"] == "mpo" for event in self.mix_history)
         dmrg_steps = sum(event["backend"] == "dmrg" for event in self.mix_history)
@@ -4340,13 +4502,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
                 step = mix_step_offset + idx + 1
                 start_bond = int(self.p.max_bond())
+                active_bond_is_short = self._mix_active_bond_is_short(
+                    where, target_sizes=target_sizes
+                )
                 use_mpo = (
                     len(where) == 1
-                    or start_bond < int(self.chi)
-                    or (
-                        self._has_symmray_data(self.p)
-                        and self._mix_active_bond_is_short(where)
-                    )
+                    or self._mix_dmrg_disabled_reason is not None
+                    or start_bond < target_bond
+                    or active_bond_is_short
                 )
                 if use_mpo:
                     self._run_mix_mpo_step(
@@ -4361,23 +4524,28 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     mpo_steps += 1
                     if len(where) == 1:
                         reason = "one_site_exact"
-                    elif start_bond < int(self.chi):
-                        reason = "bond_below_chi"
+                    elif self._mix_dmrg_disabled_reason is not None:
+                        reason = "dmrg_disabled_nonfinite"
+                    elif start_bond < target_bond:
+                        reason = "bond_below_target"
                     else:
-                        reason = "symmray_bond_below_chi"
-                    append_entries(
-                        [
-                            {
-                                "step": int(step),
-                                "where": tuple(logical_where),
-                                "execution_where": tuple(where),
-                                "start_bond": start_bond,
-                                "backend": "mpo",
-                                "reason": reason,
-                                "end_bond": int(self.p.max_bond()),
-                            }
-                        ]
-                    )
+                        reason = "active_bond_below_target"
+                    entry = {
+                        "step": int(step),
+                        "where": tuple(logical_where),
+                        "execution_where": tuple(where),
+                        "start_bond": start_bond,
+                        "target_bond": int(target_bond),
+                        "backend": "mpo",
+                        "reason": reason,
+                        "end_bond": int(self.p.max_bond()),
+                    }
+                    if self._mix_dmrg_disabled_reason is not None:
+                        entry["dmrg_disabled_reason"] = (
+                            self._mix_dmrg_disabled_reason
+                        )
+                        entry["failed_sweep"] = self._mix_dmrg_failed_sweep
+                    append_entries([entry])
                     idx += 1
                     continue
 
@@ -4386,6 +4554,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     where_seq,
                     idx,
                     k_2q_batch,
+                    target_sizes=target_sizes,
                 )
                 batch_steps = [
                     mix_step_offset + position + 1
@@ -4394,6 +4563,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 batch_logical_where = logical_where_seq[idx:next_idx]
                 snapshot = self._mix_state_snapshot()
                 committed_p = snapshot["p"]
+                self._last_dmrg_fit_diagnostics = None
                 try:
                     # DMRG/FIT can mutate its input before it raises or
                     # produces invalid data. Run it against an isolated
@@ -4417,14 +4587,30 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         batch_where,
                         steps=batch_steps,
                         n_iter=n_iter,
+                        fit_min_iter=fit_min_iter,
+                        fit_rtol=fit_rtol,
+                        fit_patience=fit_patience,
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
+                    )
+                    fit_diagnostics = deepcopy(
+                        self._last_dmrg_fit_diagnostics or {}
                     )
                     self._commit_mix_trial(committed_p, self.p)
                 except Exception as exc:  # fallback is the point of mix mode
                     self._restore_mix_state(snapshot)
                     if mix_strict:
                         raise
+                    fit_diagnostics = deepcopy(
+                        self._last_dmrg_fit_diagnostics or {}
+                    )
+                    if sticky_nonfinite and isinstance(exc, FloatingPointError):
+                        self._mix_dmrg_disabled_reason = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        self._mix_dmrg_failed_sweep = getattr(
+                            exc, "fit_iteration", None
+                        )
                     fallback_trial = self._install_represented_norm(
                         committed_p.copy(deep=True)
                     )
@@ -4457,6 +4643,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                                 "where": tuple(logical_i),
                                 "execution_where": tuple(where_i),
                                 "start_bond": start_bond,
+                                "target_bond": int(target_bond),
                                 "backend": "mpo",
                                 "reason": (
                                     "dmrg_fallback"
@@ -4464,6 +4651,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                                     else "dmrg_fallback_batch"
                                 ),
                                 "fallback_error": f"{type(exc).__name__}: {exc}",
+                                "fit_iterations": fit_diagnostics.get(
+                                    "iterations", 0
+                                ),
+                                "fit_converged": fit_diagnostics.get(
+                                    "converged", False
+                                ),
+                                "fit_relative_change": fit_diagnostics.get(
+                                    "relative_change"
+                                ),
+                                "dmrg_disabled": (
+                                    self._mix_dmrg_disabled_reason is not None
+                                ),
+                                "failed_sweep": self._mix_dmrg_failed_sweep,
                                 "end_bond": final_bond,
                             }
                         )
@@ -4486,11 +4686,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             "where": tuple(logical_i),
                             "execution_where": tuple(where_i),
                             "start_bond": start_bond,
+                            "target_bond": int(target_bond),
                             "backend": "dmrg",
                             "reason": (
-                                "bond_at_chi"
-                                if offset == 0 and start_bond == int(self.chi)
+                                "bond_at_target"
+                                if offset == 0 and start_bond >= target_bond
                                 else "dmrg_batch"
+                            ),
+                            "fit_iterations": fit_diagnostics.get("iterations"),
+                            "fit_converged": fit_diagnostics.get("converged"),
+                            "fit_relative_change": fit_diagnostics.get(
+                                "relative_change"
                             ),
                             "end_bond": final_bond,
                         }
@@ -4507,6 +4713,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "fallback_steps": int(fallback_steps),
             "final_bond": int(self.p.max_bond()),
             "chi": int(self.chi),
+            "target_bond": int(target_bond),
+            "dmrg_disabled": self._mix_dmrg_disabled_reason is not None,
+            "dmrg_disabled_reason": self._mix_dmrg_disabled_reason,
+            "failed_sweep": self._mix_dmrg_failed_sweep,
         }
 
     def _run_dmrg(
@@ -4522,11 +4732,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_final=True,
         normalize_eps=1e-15,
         non_unitary=False,
+        fit_min_iter=None,
+        fit_rtol=None,
+        fit_patience=1,
+        fit_finite_check=None,
     ):
         """Apply gates with local DMRG-style fitting."""
         if k_2q_batch < 1:
             raise ValueError("k_2q_batch must be >= 1.")
 
+        self._last_dmrg_fit_diagnostics = None
         p = self.p
         two_qubit_count = 0
         last_where = self._current_orthog(p)
@@ -4590,6 +4805,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff,
                         cutoff_mode,
                     )
+                    if (
+                        fit_finite_check is not None
+                        and not fit_finite_check(p_g)
+                    ):
+                        self._last_dmrg_fit_diagnostics = {
+                            "iterations": 0,
+                            "converged": False,
+                            "relative_change": None,
+                        }
+                        error = FloatingPointError(
+                            "DMRG gate target contains non-finite tensor data."
+                        )
+                        error.fit_iteration = 0
+                        raise error
                     if self.track_infidelity and not track_unitary_norm:
                         target_norm = self._raw_state_norm(p_g)
                     fit = FIT(
@@ -4601,7 +4830,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         range_int=[xmin, xmax],
                         inplace=False,
                     )
-                    fit.run_gate(n_iter=n_iter, verbose=False)
+                    try:
+                        fit.run_gate(
+                            n_iter=n_iter,
+                            verbose=False,
+                            min_iter=fit_min_iter,
+                            rtol=fit_rtol,
+                            patience=fit_patience,
+                            finite_check=fit_finite_check,
+                        )
+                    finally:
+                        self._last_dmrg_fit_diagnostics = {
+                            "iterations": int(fit.iterations_run),
+                            "converged": bool(fit.converged),
+                            "relative_change": fit.last_relative_change,
+                        }
 
                     p = self._install_represented_norm(fit.p)
                     self.p = p
@@ -4639,6 +4882,20 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self.canonize_mps(p, (xmin, xmax))
                     target_norm = None
                     p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff, cutoff_mode)
+                    if (
+                        fit_finite_check is not None
+                        and not fit_finite_check(p_g)
+                    ):
+                        self._last_dmrg_fit_diagnostics = {
+                            "iterations": 0,
+                            "converged": False,
+                            "relative_change": None,
+                        }
+                        error = FloatingPointError(
+                            "DMRG batch target contains non-finite tensor data."
+                        )
+                        error.fit_iteration = 0
+                        raise error
                     if self.track_infidelity and not track_unitary_norm:
                         target_norm = self._raw_state_norm(p_g)
                     fit = FIT(
@@ -4649,7 +4906,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         retag=False,
                         range_int=[xmin, xmax],
                     )
-                    fit.run_gate(n_iter=n_iter, verbose=False)
+                    try:
+                        fit.run_gate(
+                            n_iter=n_iter,
+                            verbose=False,
+                            min_iter=fit_min_iter,
+                            rtol=fit_rtol,
+                            patience=fit_patience,
+                            finite_check=fit_finite_check,
+                        )
+                    finally:
+                        self._last_dmrg_fit_diagnostics = {
+                            "iterations": int(fit.iterations_run),
+                            "converged": bool(fit.converged),
+                            "relative_change": fit.last_relative_change,
+                        }
 
                     p = self._install_represented_norm(fit.p)
                     self.p = p

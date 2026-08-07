@@ -481,11 +481,12 @@ def test_mps_optimizer_svd_smoke():
 
 
 def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
-    """Mix mode should use MPO below chi and DMRG after reaching chi."""
+    """Mix mode should use MPO until the active bonds reach their targets."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
         (qu.CNOT(), (0, 1)),
+        (qu.CNOT(), (1, 2)),
         (qu.CNOT(), (1, 2)),
     ]
 
@@ -493,9 +494,14 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     out = opt.run(progbar=False, cutoff=1e-12, n_iter=3)
 
     assert out.max_bond() <= 2
-    assert [event["backend"] for event in opt.mix_history][:2] == ["mpo", "mpo"]
+    assert [event["backend"] for event in opt.mix_history][:3] == [
+        "mpo",
+        "mpo",
+        "mpo",
+    ]
     assert opt.mix_history[-1]["backend"] == "dmrg"
-    assert opt.last_mix_summary["mpo_steps"] == 2
+    assert opt.mix_history[-1]["reason"] == "bond_at_target"
+    assert opt.last_mix_summary["mpo_steps"] == 3
     assert opt.last_mix_summary["dmrg_steps"] == 1
     assert opt.last_mix_summary["fallback_steps"] == 0
 
@@ -519,8 +525,20 @@ def test_mps_optimizer_mix_one_site_fast_path_keeps_input_identity():
     assert out is p0
 
 
-def test_mps_optimizer_mix_expands_bonds_before_dmrg_handoff():
-    """Mixed DMRG must retain entanglement on a previously short bond."""
+def test_mps_optimizer_mix_targets_attainable_edge_bonds():
+    """Mixed warm-up should cap edge targets by their physical ranks."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000", dtype="complex128"),
+        gates=[],
+        chi=8,
+        mode="mix",
+    )
+
+    assert opt._mix_target_bond_dimensions() == [2, 4, 2]
+
+
+def test_mps_optimizer_mix_keeps_short_active_bonds_on_mpo():
+    """Mixed mode must not pad a previously short active bond for DMRG."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
     gates = [
         (qu.hadamard(), (0,)),
@@ -535,8 +553,10 @@ def test_mps_optimizer_mix_expands_bonds_before_dmrg_handoff():
     expected = np.zeros(16, dtype=complex)
     expected[[0, 15]] = 1.0 / np.sqrt(2.0)
     assert np.allclose(out.to_dense(["k0", "k1", "k2", "k3"]).reshape(-1), expected)
-    assert opt.mix_history[2]["backend"] == "dmrg"
-    assert opt.mix_history[2]["reason"] == "bond_at_chi"
+    assert opt.mix_history[2]["backend"] == "mpo"
+    assert opt.mix_history[2]["reason"] == "active_bond_below_target"
+    assert opt.mix_history[3]["backend"] == "mpo"
+    assert opt.mix_history[3]["reason"] == "active_bond_below_target"
     assert [sample["step"] for sample in opt.infidelity_samples] == [2, 3, 4]
 
 
@@ -626,6 +646,113 @@ def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
     assert np.allclose(opt.p.to_dense(), reference.p.to_dense())
 
 
+def test_mps_optimizer_finite_check_combines_backend_scalars_once(monkeypatch):
+    """A whole-MPS health check should perform one backend-to-host conversion."""
+    torch = pytest.importorskip("torch")
+    state = qtn.MPS_rand_state(
+        4, bond_dim=2, phys_dim=2, dtype="complex128", seed=20
+    )
+    state.apply_to_arrays(py.backend_torch(dtype=torch.complex128, device="cpu"))
+    original_to_numpy = mps_optimizer_module.ar.to_numpy
+    conversions = []
+
+    def counted_to_numpy(value):
+        conversions.append(value)
+        return original_to_numpy(value)
+
+    monkeypatch.setattr(mps_optimizer_module.ar, "to_numpy", counted_to_numpy)
+
+    assert py.MpsOptimizer._mps_data_is_finite(state)
+    assert len(conversions) == 1
+
+
+def test_mps_optimizer_mix_stops_fit_adaptively():
+    """Mixed n_iter is a maximum when the FIT norm has converged."""
+    state = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=2, dtype="complex128", seed=21
+    )
+    opt = py.MpsOptimizer(
+        state,
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="mix",
+    )
+
+    opt.run(
+        progbar=False,
+        n_iter=8,
+        mix_fit_min_iter=2,
+        mix_fit_rtol=1e9,
+        mix_fit_patience=1,
+    )
+
+    event = opt.mix_history[0]
+    assert event["backend"] == "dmrg"
+    assert event["fit_iterations"] == 2
+    assert event["fit_converged"] is True
+    assert event["fit_relative_change"] <= 1e9
+
+
+def test_mps_optimizer_mix_can_keep_fixed_fit_iterations():
+    """Disabling mixed FIT tolerance should preserve exact n_iter behavior."""
+    state = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=2, dtype="complex128", seed=211
+    )
+    opt = py.MpsOptimizer(
+        state,
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="mix",
+    )
+
+    opt.run(progbar=False, n_iter=3, mix_fit_rtol=None)
+
+    event = opt.mix_history[0]
+    assert event["fit_iterations"] == 3
+    assert event["fit_converged"] is False
+    assert event["fit_relative_change"] is None
+
+
+def test_mps_optimizer_mix_nonfinite_sweep_disables_later_dmrg(monkeypatch):
+    """A non-finite FIT sweep should fall back once and latch to MPO."""
+    state = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=2, dtype="complex128", seed=22
+    )
+    original_check = py.MpsOptimizer._mps_data_is_finite
+    checks = 0
+
+    def staged_check(candidate):
+        nonlocal checks
+        checks += 1
+        # First call checks the DMRG target. The second is the first completed
+        # FIT sweep, where a backend non-finite reduction is simulated.
+        if checks == 2:
+            return False
+        return original_check(candidate)
+
+    monkeypatch.setattr(
+        py.MpsOptimizer,
+        "_mps_data_is_finite",
+        staticmethod(staged_check),
+    )
+    opt = py.MpsOptimizer(
+        state,
+        gates=[(qu.CNOT(), (0, 2)), (qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="mix",
+    )
+
+    opt.run(progbar=False, n_iter=8)
+
+    first, second = opt.mix_history
+    assert first["reason"] == "dmrg_fallback"
+    assert first["fit_iterations"] == 1
+    assert first["failed_sweep"] == 1
+    assert second["reason"] == "dmrg_disabled_nonfinite"
+    assert opt.last_mix_summary["dmrg_disabled"] is True
+    assert opt.last_mix_summary["failed_sweep"] == 1
+
+
 def test_mps_optimizer_mix_inplace_success_two_site_keeps_input_identity():
     """Successful two-site mixed DMRG updates must preserve inplace semantics."""
     p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=23)
@@ -646,15 +773,15 @@ def test_mps_optimizer_mix_inplace_success_two_site_keeps_input_identity():
     assert not np.allclose(p0.to_dense(), before)
 
 
-def test_mps_optimizer_mix_inplace_commits_local_bond_expansion():
-    """In-place commit should also handle active-bond dimension growth."""
+def test_mps_optimizer_mix_inplace_short_active_bond_uses_mpo():
+    """In-place mixed replay should warm a short active bond through MPO."""
     dense = np.zeros((2, 2, 2, 2), dtype=complex)
     dense[0, 0, 0, 0] = 1.0 / np.sqrt(2.0)
     dense[1, 1, 0, 0] = 1.0 / np.sqrt(2.0)
     p0 = qtn.MatrixProductState.from_dense(dense)
     opt = py.MpsOptimizer(
         p0,
-        gates=[(qu.CNOT(), (2, 3))],
+        gates=[(qu.hadamard(), (2,)), (qu.CNOT(), (2, 3))],
         chi=2,
         mode="mix",
         inplace=True,
@@ -664,7 +791,8 @@ def test_mps_optimizer_mix_inplace_commits_local_bond_expansion():
 
     assert out is p0
     assert opt.p is p0
-    assert opt.mix_history[0]["backend"] == "dmrg"
+    assert opt.mix_history[1]["backend"] == "mpo"
+    assert opt.mix_history[1]["reason"] == "active_bond_below_target"
     assert p0.bond_size(2, 3) == 2
 
 
@@ -771,7 +899,7 @@ def test_mps_optimizer_mix_batches_two_site_transactions():
 
     assert out.max_bond() <= 2
     assert [entry["backend"] for entry in opt.mix_history] == ["dmrg", "dmrg"]
-    assert opt.mix_history[0]["reason"] == "bond_at_chi"
+    assert opt.mix_history[0]["reason"] == "bond_at_target"
     assert opt.mix_history[1]["reason"] == "dmrg_batch"
     assert [sample["step"] for sample in opt.infidelity_samples] == [2]
 
