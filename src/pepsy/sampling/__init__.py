@@ -9,6 +9,7 @@ from .samplers import (
     MpsSampleResult,
     MpsSampler,
     PEPSSampleResult,
+    PepsSampler,
     PepsBpSampler,
     VecSampler,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "MpsSampleResult",
     "MpsSampler",
     "PEPSSampleResult",
+    "PepsSampler",
     "PepsBpSampler",
     "TreeBatchSampleResult",
     "TreeSampleResult",

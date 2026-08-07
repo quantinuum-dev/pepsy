@@ -2,16 +2,19 @@
 
 ## Status
 
-Proposed. Pepsy does not currently provide a `PepsSampler` implementing the
+Phases 1–6 are implemented. Pepsy now provides a `PepsSampler` implementing the
 direct-sampling construction from
 [Direct sampling of projected entangled-pair states](https://arxiv.org/pdf/2109.07356).
 The existing `PepsBpSampler` is a separate belief-propagation proposal
 sampler.
 
-The first implementation targets finite, open-boundary PEPS with dense tensor
-data, a row-major sweep, and independent importance samples. Symmray support,
-batch prefix sharing, and alternative sweep orderings can follow after the
-scalar dense path is validated.
+The implementation targets finite, open-boundary PEPS with dense tensor data,
+a row-major sweep, and independent samples. The default exact mode contracts
+the full conditioned Quimb norm network at each site. The boundary mode keeps a
+conditioned single-layer ket boundary, optionally compresses it to `sample_chi`,
+and can attach cached future marginal environments truncated to `marginal_chi`.
+Prefix-grouped batches are supported; native tensor batch axes and Symmray
+support remain deferred.
 
 ## Contract
 
@@ -83,6 +86,16 @@ The future `ymax` environment is safe to precompute because rows above the
 current row remain unmeasured. This is the central distinction between the
 paper's proposal and simply sampling each row from an unconditioned PEPS norm.
 
+Within a row, the boundary implementation also builds a Quimb transfer cache
+when the center is compact enough: each column is contracted once into a
+local ket/bra transfer, all right suffix transfers are cached, and the sampled
+left prefix is updated immediately after each `isel_`. The suffix contraction
+does not apply another cutoff, since `marginal_chi` has already controlled the
+future double-layer boundary. This preserves the full-center serial proposal
+on the supported compact paths. Large centers with an already-collapsed
+future MPS adaptively use the reference local-center path because a dense
+column transfer would otherwise be slower and more memory hungry.
+
 ## Pepsy and Quimb mapping
 
 ### Common network construction
@@ -145,63 +158,70 @@ The dense Pepsy route is:
 build_bra_ket(...) -> BdyMPS(...) -> CompBdy.move_bdy(...)
 ```
 
-For future double-layer environments, the relevant direction is the
-`y_right` side. `BdyMPS.mps_b` then supplies the cached boundary objects that
-can be attached to the current row.
+For future double-layer environments, the implementation calls
+`CompBdy.move_bdy(direction="y_right")`; the right-side entries
+`BdyMPS.mps_b[f"Y{Ly - 2 - y}_r"]` then supply the cached future boundary for
+row `y`.
 
 The conditioned single-layer `phi` update is a separate stateful operation.
-It should not be confused with `BdyMPS`'s double-layer norm boundaries. The
-initial implementation may use Quimb MPS compression for `phi`; the FIT
-alternative can use `FIT.run_eff` against the projected row target. A future
-provider interface should hide this distinction from the sampling loop.
+It is not confused with `BdyMPS`'s double-layer norm boundaries. The
+`ket_compression="quimb"` option uses Quimb MPS compression, while
+`ket_compression="fit"` uses `FIT` against the projected row target.
 
-Truncated DMRG/FIT environments can acquire small non-Hermitian or negative
-components in a local `rho`. The sampler must validate, symmetrize, and apply
-a documented numerical policy before constructing probabilities, while
-retaining diagnostics for the uncorrected `rho`.
+Truncated DMRG/FIT environments can acquire small negative diagonal
+components in a local `rho`. The sampler validates the real trace and clips
+only tiny negative diagonal probabilities; stronger Hermiticity diagnostics
+and correction reporting remain a follow-up.
 
-## Draft public API
+## Public API
 
-The names below are intentionally provisional until the first implementation
-clarifies the result and cache lifetimes:
+The implemented boundary API is:
 
 ```python
 sampler = PepsSampler(
     peps,
     sample_chi=chi_s,
     marginal_chi=chi_m,
-    boundary_engine="auto",       # "dmrg" or "quimb-mps"
+    boundary_engine="dmrg",       # "exact", "quimb-mps", or "dmrg"
+    ket_compression="quimb",      # "quimb", "fit", or None
     contraction_opt="auto-hq",
     cutoff=1.0e-12,
 )
 result = sampler.sample(samples=..., seed=...)
 ```
 
-`boundary_engine="auto"` should follow Pepsy's existing selector policy:
-dense inputs use the DMRG/FIT path, while Symmray-looking inputs route to
-Quimb MPS environments. The sampler should expose `refresh()` for a changed
-PEPS and should never mutate the caller's source network during sampling.
+`boundary_engine="auto"` is accepted as an alias for the dense DMRG/FIT
+future-environment path. `marginal_chi=None` or `0` disables future
+environments and uses an identity future cap. `refresh()` rebuilds private
+networks after a changed PEPS; sampling never mutates the caller's source
+network. `rho_diagnostics` reports trace, Hermiticity defect, and any clipped
+roundoff-scale negative diagonal mass. `sample_batch()` shares networks by
+identical prefixes and exposes its group counts through `batch_stats`.
+`row_cache_stats` reports suffix-cache construction and left-prefix update
+counts for the most recent boundary sample. Highly fragmented large batches
+use the reference prefix path rather than constructing one dense transfer
+cache per singleton group.
 
-The result should preserve the existing PEPS sampling vocabulary where
-possible: `configs`, proposal probabilities (`omegas`), and amplitudes
-(`ps`). A new result type is preferable if direct sampling needs additional
-fields such as log weights, per-row proposal traces, boundary diagnostics, or
-the selected engine.
+The result preserves the existing PEPS sampling vocabulary: `configs`, proposal
+probabilities (`omegas`), and amplitudes (`ps`). Boundary diagnostics and batch
+group statistics remain sampler attributes so the result type stays compatible.
 
 ## Implementation phases
 
-1. **Quimb dense prototype** — implement one sample with `chi_m=0`, exact
+1. **Quimb dense prototype** — implemented as serial `PepsSampler` with exact
    local `rho` contractions, deterministic seeds, and full-amplitude checks.
-2. **Conditioned boundary state** — represent `phi` explicitly as a
-   single-layer MPS, project each sampled row, and compress to `chi_s`.
-3. **Marginal environment** — add cached `ymax` environments with `chi_m`,
-   scaled contractions, and proposal diagnostics.
-4. **DMRG/FIT provider** — adapt `BdyMPS`/`CompBdy` for the future environment
-   path and add the FIT option for conditioned-boundary compression.
-5. **Public API and result type** — export `PepsSampler`, settle parameter
-   names, and integrate with the existing PEPS sampling documentation.
-6. **Performance extensions** — cache row contractions, reduce repeated
-   Cotengra path construction, then consider batched/prefix-shared samples.
+2. **Conditioned boundary state** — implemented with explicit single-layer
+   `phi`, projected rows, and `sample_chi` compression.
+3. **Marginal environment** — implemented with cached future environments and
+   `marginal_chi`, including the identity (`None`/`0`) path.
+4. **DMRG/FIT provider** — implemented with `BdyMPS`/`CompBdy` for future
+   environments and `FIT` as a conditioned-boundary compression option.
+5. **Public API and result type** — implemented and documented.
+6. **Performance extensions** — implemented row-template caching, compact-row
+   right-suffix transfer caching, and prefix-grouped `sample_batch`; reusable
+   `build_contraction` optimizers cache repeated Cotengra path searches.
+   Adaptive reference fallbacks protect larger collapsed-boundary batches.
+   Native tensor batch axes remain future work.
 
 ## Required validation
 
@@ -221,7 +241,7 @@ the selected engine.
 ## Deferred features
 
 - Symmray-native local density matrices and charge-aware sampling.
-- Batched samples sharing row or site prefixes.
+- Native tensor-axis batching and adaptive prefix-group limits.
 - Adaptive sweep direction and arbitrary site orderings.
 - Independent-proposal Metropolis correction using `p_c` as a transition
   kernel.
