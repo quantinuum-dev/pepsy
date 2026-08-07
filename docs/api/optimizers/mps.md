@@ -96,14 +96,14 @@ optimizer moves the tracked range to a one-site center, normalizes that center
 tensor, and stores the removed scale in `p.exponent`. Thus `p.norm()` restores
 the represented norm, while a copy with `exponent=0` exposes the normalized
 working data. For DMRG, a multi-gate batch is one replay step for this purpose.
-For unitary streams,
-`get_infidelities()` uses the current retained norm divided by the initial
-run norm, squared; this is the global retained-fidelity estimate and is
-equivalent to multiplying the per-gate fidelities without requiring a
-pre-gate target measurement. Local products and norm-ratio evaluations are
-accumulated in the log domain and exponentiated only for readout, so long
-streams and very small retained norms do not lose fidelity to underflow. Local
-ratios remain available in detailed samples for diagnostics. The trace is populated by default. Set
+For unitary streams, `get_infidelities()` uses the running product of local
+retained fidelities. The cumulative state is preserved across repeated
+`run()` calls, so it can be used directly as the simulation-fidelity trace;
+call `reset_infidelity_tracking()` when starting an independent accounting
+interval. Local products and norm-ratio evaluations are accumulated in the log
+domain and exponentiated only for readout, so long streams and very small
+retained norms do not lose fidelity to underflow. Local ratios remain available
+in detailed samples for diagnostics. The trace is populated by default. Set
 ``track_infidelity=False`` in the constructor, or pass
 ``track_infidelity=False`` to ``run()``, to skip target-norm construction,
 retained-norm calculations, samples, and progress-bar infidelity fields. For
@@ -128,6 +128,7 @@ opt.run(non_unitary=True, normalize_every=True, track_infidelity=False)
 opt.get_infidelities()        # [0.0] when tracking is disabled
 opt.get_infidelity_samples()  # [] when tracking is disabled
 opt.get_normalizations()      # scale events and accumulated exponents
+opt.reset_infidelity_tracking()  # start a new fidelity accounting interval
 ```
 
 When enabled, infidelity is recorded automatically whenever a compressed

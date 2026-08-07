@@ -1498,6 +1498,50 @@ def test_mps_optimizer_unitary_default_reports_infidelity():
     assert len(opt.get_infidelities()) == 2
 
 
+def test_mps_optimizer_unitary_infidelity_accumulates_across_run_calls():
+    """Unitary cumulative fidelity should survive repeated ``run`` calls."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 3))]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode="svd")
+    opt.run(progbar=False, cutoff=1e-12)
+    first_infidelity = opt.get_infidelities()[-1]
+
+    opt.set_gates(gates)
+    opt.run(progbar=False, cutoff=1e-12)
+
+    cumulative_fidelity = 1.0
+    for sample in opt.get_infidelity_samples():
+        cumulative_fidelity *= sample["local_fidelity"]
+
+    assert opt.get_infidelities()[-1] > first_infidelity
+    assert opt.get_infidelities()[-1] == pytest.approx(1.0 - cumulative_fidelity)
+    assert opt.infidelity_samples[-1]["global_fidelity"] == pytest.approx(
+        cumulative_fidelity
+    )
+
+
+def test_mps_optimizer_can_reset_infidelity_tracking_between_runs():
+    """Infidelity tracking can start a fresh accounting interval explicitly."""
+    p0 = qtn.MPS_computational_state("0000", dtype="complex128")
+    gates = [(qu.hadamard(), (0,)), (qu.CNOT(), (0, 3))]
+
+    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=1, mode="svd")
+    opt.run(progbar=False, cutoff=1e-12)
+    opt.reset_infidelity_tracking()
+
+    assert opt.get_infidelities() == [0.0]
+    assert opt.get_infidelity_samples() == []
+
+    opt.set_gates(gates)
+    opt.run(progbar=False, cutoff=1e-12)
+
+    assert len(opt.get_infidelity_samples()) == 1
+    assert opt.get_infidelities()[-1] == pytest.approx(
+        opt.infidelity_samples[-1]["local_infidelity"]
+    )
+
+
 def test_mps_optimizer_svd_forwards_cutoff_mode_to_final_compression(monkeypatch):
     """SVD mode should honor explicit cutoff_mode in its chi compression pass."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")

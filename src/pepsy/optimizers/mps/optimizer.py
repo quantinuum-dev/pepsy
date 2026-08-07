@@ -2468,11 +2468,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
 
         non_unitary = bool(non_unitary)
-        self._unitary_initial_norm = None
-        self._unitary_previous_norm = None
         self._unitary_global_norm_tracking = (
             self.track_infidelity and not non_unitary and not has_control
         )
+        if not self._unitary_global_norm_tracking:
+            # Non-unitary and control-event runs can change the represented
+            # norm without a unitary compression, so the next unitary stream
+            # must establish a fresh local norm reference. The cumulative
+            # fidelity log is intentionally preserved until explicitly reset.
+            self._unitary_initial_norm = None
+            self._unitary_previous_norm = None
         if not non_unitary:
             if normalize_every is not None and normalize_every is not False:
                 raise ValueError("normalize_every requires non_unitary=True.")
@@ -3493,10 +3498,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         """Record loss from the post-compression norm of a unitary stream.
 
         A unitary gate preserves the norm of the current approximate MPS. The
-        current post-compression norm therefore carries the global retained
-        fidelity relative to the initial run norm. The previous norm is kept
-        only to expose the optional local diagnostic without another network
-        contraction.
+        previous retained norm therefore gives the local compression fidelity,
+        while ``_infidelity_log_fidelity`` carries its product across repeated
+        ``run`` calls. The initial and previous norms are kept for diagnostics
+        and for the next local ratio without another network contraction.
         """
         if self._unitary_previous_norm is None:
             raise RuntimeError("unitary norm tracking was not initialized")
@@ -3510,12 +3515,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self._unitary_initial_norm is None:
             self._unitary_initial_norm = previous_norm
         if self._unitary_global_norm_tracking:
-            global_log_fidelity = log_fidelity_from_norms(
-                approx_norm,
-                self._unitary_initial_norm,
-            )
-            global_fidelity = fidelity_from_log(global_log_fidelity)
-            global_infidelity = infidelity_from_log(global_log_fidelity)
+            global_fidelity = fidelity_from_log(self._infidelity_log_fidelity)
+            global_infidelity = infidelity_from_log(self._infidelity_log_fidelity)
             sample["fidelity"] = global_fidelity
             sample["global_fidelity"] = global_fidelity
             sample["global_infidelity"] = global_infidelity
@@ -5154,9 +5155,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         The initial value is ``0.0``. A new value is appended after every
         compressed two-site update. For unitary streams, values are computed
-        from the current retained norm relative to the initial run norm. For
-        non-unitary streams, values use the multiplicative canonical
-        norm-ratio estimator.
+        from the running product of local retained fidelities, including
+        across repeated ``run`` calls. For non-unitary streams, values use the
+        same multiplicative canonical norm-ratio estimator.
         """
         return self.infidelities
 
@@ -5166,9 +5167,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Each record contains ``step``, ``where``, ``target_norm``,
         ``approx_norm``, ``local_fidelity``, ``local_infidelity``, and
         cumulative ``infidelity``. Unitary records additionally contain
-        ``global_fidelity`` and ``global_infidelity``.
+        ``global_fidelity`` and ``global_infidelity``, which remain cumulative
+        across repeated ``run`` calls until ``reset_infidelity_tracking``.
         """
         return self.infidelity_samples
+
+    def reset_infidelity_tracking(self):
+        """Reset the compression-infidelity trace and its running state.
+
+        ``run`` deliberately preserves cumulative infidelity for repeated
+        evolution calls. Use this method when starting an independent
+        simulation or fidelity accounting interval.
+        """
+        self.infidelities[:] = [0.0]
+        self.infidelity_samples.clear()
+        self._infidelity_log_fidelity = 0.0
+        self._unitary_initial_norm = None
+        self._unitary_previous_norm = None
+        self._unitary_global_norm_tracking = False
+        return self
 
     def get_normalizations(self):
         """Return automatic normalization events recorded during ``run``.
