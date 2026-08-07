@@ -640,6 +640,32 @@ def test_mps_sampler_native_torch_evaluates_batched_configs_on_torch():
     torch.testing.assert_close(amplitudes, torch.sqrt(expected_probs))
 
 
+def test_mps_sampler_torch_amplitudes_default_to_inference_mode():
+    """Amplitude measurements do not retain graphs unless explicitly asked."""
+    torch = pytest.importorskip("torch")
+    psi = qtn.MPS_product_state([
+        np.sqrt(np.array([0.8, 0.2])),
+        np.sqrt(np.array([0.3, 0.7])),
+    ])
+    psi.apply_to_arrays(
+        lambda array: torch.tensor(
+            array,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+    )
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+    configs = torch.tensor([[0, 0], [1, 1]], dtype=torch.long)
+
+    inference = sampler.amplitudes(configs, to_numpy=False)
+    tracked = sampler.amplitudes(configs, to_numpy=False, track_grad=True)
+
+    assert not inference.requires_grad
+    assert tracked.requires_grad
+    tracked.real.sum().backward()
+    assert any(psi[site].data.grad is not None for site in range(psi.L))
+
+
 def test_mps_sampler_native_torch_matches_numpy_random_mps():
     """Torch native evaluation should agree with the NumPy dense reference."""
     torch = pytest.importorskip("torch")

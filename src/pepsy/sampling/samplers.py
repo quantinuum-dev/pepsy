@@ -913,6 +913,7 @@ class MpsSampler:
         self._native_arrays = None
         self._native_site_ops = None
         self._native_inference_site_ops = None
+        self._native_amplitude_site_ops = None
         self._evaluation_backend = None
         self._evaluation_arrays = None
         self._evaluation_site_ops = None
@@ -970,6 +971,7 @@ class MpsSampler:
         self._native_arrays = None
         self._native_site_ops = None
         self._native_inference_site_ops = None
+        self._native_amplitude_site_ops = None
         self._evaluation_backend = None
         self._evaluation_arrays = None
         self._evaluation_site_ops = None
@@ -2575,6 +2577,100 @@ class MpsSampler:
         return MpsSampler._array_namespace_site_ops(arrays, backend=backend)
 
     @staticmethod
+    def _torch_amplitude_site_ops(arrays):
+        """Prepare amplitude contractions without retaining right environments."""
+        import torch  # pylint: disable=import-outside-toplevel
+
+        device = arrays[0].device
+        dtype = arrays[0].dtype
+        if not (torch.is_floating_point(arrays[0]) or torch.is_complex(arrays[0])):
+            dtype = torch.float64
+        arrays = tuple(array.to(device=device, dtype=dtype) for array in arrays)
+        right_env = torch.ones((1, 1), dtype=dtype, device=device)
+        for array in reversed(arrays):
+            right_env = torch.einsum(
+                "asb,bc,dsc->ad",
+                array.conj(),
+                right_env,
+                array,
+            )
+        norm = right_env.reshape(()).real
+        if (
+            (not bool(torch.isfinite(norm).detach().cpu().item()))
+            or float(norm.detach().cpu().item()) <= 0.0
+        ):
+            raise ValueError("MPS must have a finite non-zero norm.")
+        site_ops = tuple(
+            (
+                array.reshape(array.shape[0], array.shape[1] * array.shape[2])
+                .contiguous(),
+                int(array.shape[1]),
+                int(array.shape[2]),
+            )
+            for array in arrays
+        )
+        return device, dtype, site_ops, (), norm
+
+    @staticmethod
+    def _array_namespace_amplitude_site_ops(arrays, *, backend):
+        """Prepare NumPy/CuPy amplitudes without retaining right environments."""
+        xp = np
+        if backend == "cupy":
+            import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
+
+        dtype = np.dtype(getattr(arrays[0], "dtype", np.float64))
+        if dtype.kind not in {"f", "c"}:
+            dtype = np.dtype(np.float64)
+        arrays = tuple(array.astype(dtype, copy=False) for array in arrays)
+        right_env = xp.ones((1, 1), dtype=dtype)
+        for array in reversed(arrays):
+            right_env = xp.einsum(
+                "asb,bc,dsc->ad",
+                xp.conjugate(array),
+                right_env,
+                array,
+            )
+        norm = right_env.reshape(()).real
+        norm_value = float(norm.get()) if backend == "cupy" else float(norm)
+        if (not np.isfinite(norm_value)) or norm_value <= 0.0:
+            raise ValueError("MPS must have a finite non-zero norm.")
+        site_ops = tuple(
+            (
+                xp.ascontiguousarray(
+                    array.reshape((array.shape[0], array.shape[1] * array.shape[2]))
+                ),
+                int(array.shape[1]),
+                int(array.shape[2]),
+            )
+            for array in arrays
+        )
+        return xp, dtype, site_ops, (), norm
+
+    def _get_native_amplitude_site_ops(self, *, track_grad=False):
+        """Return amplitude-only site data, caching only inference data."""
+        if not track_grad and self._native_amplitude_site_ops is not None:
+            return self.resolved_backend, self._native_amplitude_site_ops
+
+        arrays = self._native_arrays
+        if self.resolved_backend == "torch":
+            if not track_grad:
+                import torch  # pylint: disable=import-outside-toplevel
+
+                arrays = tuple(array.detach() for array in arrays)
+                with torch.no_grad():
+                    site_data = self._torch_amplitude_site_ops(arrays)
+            else:
+                site_data = self._torch_amplitude_site_ops(arrays)
+        else:
+            site_data = self._array_namespace_amplitude_site_ops(
+                arrays,
+                backend=self.resolved_backend,
+            )
+        if not track_grad:
+            self._native_amplitude_site_ops = site_data
+        return self.resolved_backend, site_data
+
+    @staticmethod
     def _torch_sample(site_data, n_samples, seed, *, to_numpy):
         import torch  # pylint: disable=import-outside-toplevel
 
@@ -2897,23 +2993,41 @@ class MpsSampler:
     def _to_numpy_backend_array(array, backend):
         return _backend_array_to_numpy(array)
 
-    def amplitudes(self, configs, *, to_numpy: bool = True):
+    def amplitudes(
+        self,
+        configs,
+        *,
+        to_numpy: bool = True,
+        track_grad: bool = False,
+    ):
         """Return batched MPS amplitudes for ``configs``.
 
         ``configs`` should have shape ``(batch, L)``. Dense NumPy, Torch, and
         CuPy MPS tensors are contracted in one batched backend-native pass.
         Symmray MPSs use block-sparse contractions on the underlying NumPy,
         Torch, or CuPy backend. Set ``to_numpy=False`` to keep Torch/CuPy
-        outputs on their device.
+        outputs on their device. Measurement calls default to inference mode;
+        pass ``track_grad=True`` to retain a Torch autograd graph.
         """
         if self._symmray_state is not None:
             out = self._symmray_amplitudes(configs)
             backend = self._symmray_state["array_backend"]
             return self._to_numpy_backend_array(out, backend) if to_numpy else out
 
-        backend, site_data = self._get_evaluation_site_ops()
+        if self._native_arrays is None:
+            backend, site_data = self._get_evaluation_site_ops()
+        else:
+            backend, site_data = self._get_native_amplitude_site_ops(
+                track_grad=bool(track_grad)
+            )
         if backend == "torch":
-            out = self._torch_amplitudes(site_data, configs, L=self._L)
+            if track_grad:
+                out = self._torch_amplitudes(site_data, configs, L=self._L)
+            else:
+                import torch  # pylint: disable=import-outside-toplevel
+
+                with torch.no_grad():
+                    out = self._torch_amplitudes(site_data, configs, L=self._L)
         else:
             out = self._array_namespace_amplitudes(
                 site_data,
