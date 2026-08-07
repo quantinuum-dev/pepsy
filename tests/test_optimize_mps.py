@@ -500,6 +500,24 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     assert opt.last_mix_summary["fallback_steps"] == 0
 
 
+def test_mps_optimizer_mix_inplace_success_keeps_input_identity():
+    """Successful mixed DMRG updates should preserve inplace semantics."""
+    p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=17)
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.hadamard(), (1,))],
+        chi=2,
+        mode="mix",
+        inplace=True,
+    )
+
+    out = opt.run(progbar=False, cutoff=1e-12)
+
+    assert opt.mix_history[0]["backend"] == "dmrg"
+    assert opt.p is p0
+    assert out is p0
+
+
 def test_mps_optimizer_mix_expands_bonds_before_dmrg_handoff():
     """Mixed DMRG must retain entanglement on a previously short bond."""
     p0 = qtn.MPS_computational_state("0000", dtype="complex128")
@@ -582,6 +600,7 @@ def test_mps_optimizer_mix_starts_with_dmrg_at_target_bond():
 def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
     """Mix mode should restore and use MPO if DMRG leaves non-finite data."""
     p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=19)
+    p0_ref = p0.copy()
     gates = [(qu.hadamard(), (1,))]
     original_run_dmrg = py.MpsOptimizer._run_dmrg
 
@@ -591,7 +610,7 @@ def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
         self.p[0].modify(data=np.full_like(data, np.nan))
 
     monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", nonfinite_dmrg)
-    opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
+    opt = py.MpsOptimizer(p0, gates=gates, chi=2, mode="mix", inplace=True)
 
     opt.run(progbar=False, cutoff=1e-12)
 
@@ -599,7 +618,11 @@ def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
     assert opt.mix_history[0]["reason"] == "dmrg_fallback"
     assert "non-finite" in opt.mix_history[0]["fallback_error"]
     assert opt.last_mix_summary["fallback_steps"] == 1
+    assert opt.p is p0
     assert py.MpsOptimizer._mps_data_is_finite(opt.p)
+    reference = py.MpsOptimizer(p0_ref, gates=gates, chi=2, mode="mpo")
+    reference.run(progbar=False, cutoff=1e-12)
+    assert np.allclose(opt.p.to_dense(), reference.p.to_dense())
 
 
 def test_mps_optimizer_mix_rejects_non_unitary_stream_controls():

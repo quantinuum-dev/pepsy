@@ -4109,8 +4109,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     entry["backend"] = "mpo"
                     entry["reason"] = "bond_below_chi"
                 else:
-                    saved_p = self._install_represented_norm(self.p.copy())
-                    saved_info = dict(self.info_c)
+                    # DMRG/FIT can mutate its input before it raises or
+                    # produces invalid data. Run it against an isolated
+                    # trial state so a failed mixed-mode attempt cannot
+                    # corrupt a caller-owned ``inplace=True`` MPS. Keep the
+                    # committed state as the MPO fallback target.
+                    committed_p = self.p
+                    saved_info = deepcopy(self.info_c)
                     saved_infidelity_log = self._infidelity_log_fidelity
                     saved_lengths = {
                         "infidelities": len(self.infidelities),
@@ -4118,6 +4123,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         "normalizations": len(self.normalizations),
                     }
                     try:
+                        trial_p = self._install_represented_norm(
+                            committed_p.copy(deep=True)
+                        )
+                        self.p = trial_p
+                        self.info_c = deepcopy(saved_info)
                         self._prepare_mix_dmrg_state()
                         self._run_mix_dmrg_step(
                             gate,
@@ -4128,7 +4138,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff_mode=cutoff_mode,
                         )
                     except Exception as exc:  # fallback is the point of mix mode
-                        self.p = saved_p
+                        self.p = committed_p
                         self.info_c = saved_info
                         self._infidelity_log_fidelity = saved_infidelity_log
                         for attr, length in saved_lengths.items():
@@ -4148,6 +4158,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         entry["reason"] = "dmrg_fallback"
                         entry["fallback_error"] = f"{type(exc).__name__}: {exc}"
                     else:
+                        if self.inplace and len(where) == 1:
+                            committed_p.set_params(self.p.get_params())
+                            committed_p.exponent = self.p.exponent
+                            self.p = committed_p
                         dmrg_steps += 1
                         entry["backend"] = "dmrg"
                         entry["reason"] = (
