@@ -165,6 +165,25 @@ def test_mps_sampler_native_numpy_samples_product_state():
     assert result.probs == [1.0] * 4
 
 
+def test_mps_sampler_auto_warns_before_quimb_fallback(monkeypatch):
+    """Auto backend selection should expose native preparation fallbacks."""
+    psi = qtn.MPS_computational_state("0")
+
+    def fail_native_prepare(self, source):  # pylint: disable=unused-argument
+        raise ValueError("native layout unavailable")
+
+    monkeypatch.setattr(
+        sampler_mod.MpsSampler,
+        "_prepare_native_arrays",
+        fail_native_prepare,
+    )
+
+    with pytest.warns(RuntimeWarning, match="falling back to Quimb"):
+        sampler = sampler_mod.MpsSampler(psi, backend="auto")
+
+    assert sampler.resolved_backend == "quimb"
+
+
 def test_mps_sampler_defaults_to_trivial_1d_site_map():
     """Omitting one_d_to_two_d should infer a trivial single-row 1D layout."""
     psi = qtn.MPS_computational_state("101")

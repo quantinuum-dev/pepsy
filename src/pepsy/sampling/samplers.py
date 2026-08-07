@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from typing import Any, Iterable
+import warnings
 
 import autoray as ar
 import numpy as np
@@ -1014,9 +1015,16 @@ class MpsSampler:
                 self.resolved_backend = native_backend
                 self._native_arrays = native_arrays
                 return self
-            except Exception:
+            except Exception as exc:
                 if self.backend != "auto":
                     raise
+                warnings.warn(
+                    "MpsSampler backend='auto' could not prepare the native "
+                    "sampler and is falling back to Quimb: "
+                    f"{type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         self.resolved_backend = "quimb"
         # Convert to numpy for quimb sampling compatibility
