@@ -445,7 +445,7 @@ def test_quimb_torch_split_drivers_stabilize_real_symmray_blocks():
     """Quimb's composed Torch split path is stable and lossless."""
     torch = pytest.importorskip("torch")
     qd = pytest.importorskip("quimb.tensor.decomp")
-    from pepsy.backends import config, linalg_torch
+    from pepsy.backends import config
 
     # The second diagonal of R is structurally zero, while its row has a
     # nonzero later component.  The stabilized phase must be one, rather than
@@ -488,7 +488,7 @@ def test_quimb_torch_split_drivers_stabilize_complex_rank_deficient_block():
     """The complex split path is stable and exact for a zero QR diagonal."""
     torch = pytest.importorskip("torch")
     qd = pytest.importorskip("quimb.tensor.decomp")
-    from pepsy.backends import config, linalg_torch
+    from pepsy.backends import config
 
     matrix = torch.tensor(
         ((1.0, 1.0, 1.0), (0.0, 0.0, 1.0)),

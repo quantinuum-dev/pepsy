@@ -171,15 +171,41 @@ def _native_cast_factors(factors, reference, backend):
     )
 
 
+def _native_qr_exponent_span(array, backend):
+    """Return the stored nonzero magnitude exponent span of one native block."""
+    if backend == "torch":
+        magnitude = array.detach().abs()
+        nonzero = magnitude[magnitude > 0]
+        if nonzero.numel() == 0:
+            return None
+        minimum = float(nonzero.amin().item())
+        maximum = float(magnitude.amax().item())
+    elif backend == "cupy":
+        magnitude = ar.do("abs", array)
+        nonzero = magnitude[magnitude > 0]
+        if nonzero.size == 0:
+            return None
+        minimum = float(nonzero.min().item())
+        maximum = float(magnitude.max().item())
+    else:
+        return None
+    if not np.isfinite(minimum) or not np.isfinite(maximum) or minimum <= 0:
+        return None
+    _, maximum_exponent = np.frexp(maximum)
+    _, minimum_exponent = np.frexp(minimum)
+    return int(maximum_exponent - minimum_exponent)
+
+
 def _native_qr_block_scaled(array, **kwargs):
     """QR one native charge block with a reversible scaling fallback.
 
     Torch's complex64 QR can return NaNs for a rank-deficient block even when
     its largest entry is moderate, if other entries in the same block are
-    many orders of magnitude smaller. Healthy blocks keep Torch's native QR
-    path unchanged. Only a failed finite block is retried after a reversible
-    power-of-two scaling, with a native rank-safe fallback for structural
-    rank deficiency.
+    many orders of magnitude smaller. It can also return finite factors while
+    losing those tiny entries. Healthy blocks keep Torch's native QR path
+    unchanged; small or extremely wide-range blocks use a reversible
+    power-of-two scaling, with a native rank-safe fallback for structural rank
+    deficiency.
     """
     opts = dict(kwargs)
     opts.pop("method", None)
@@ -261,14 +287,25 @@ def _native_qr_block_scaled(array, **kwargs):
         else:
             block_max = to_float(ar.do("max", ar.do("abs", array)))
     elif use_torch_qr:
-        # Preserve Torch's normal QR exactly for healthy blocks. Only the
-        # exceptional nonfinite result pays for a scaled retry and, if needed,
-        # the rank-safe complex64 fallback.
-        direct = native_qr(array, opts)
-        if _native_factors_finite(direct, backend):
-            return direct
-
         block_max = float(array.detach().abs().amax().item())
+        # Very small blocks have historically needed the scaled path even
+        # when the current Torch build happens to return finite QR factors.
+        # For moderate blocks, make the same choice when stored entries span
+        # enough binary exponents that a finite direct QR can still erase the
+        # smallest charge sector. The direct call is retained in that case so
+        # healthy blocks keep the one-call fast path and diagnostics can show
+        # the protective retry.
+        direct = None
+        if not (
+            np.isfinite(block_max)
+            and block_max != 0.0
+            and block_max < 2.0**-8
+        ):
+            direct = native_qr(array, opts)
+            exponent_span = _native_qr_exponent_span(array, backend)
+            needs_scale = exponent_span is not None and exponent_span >= 64
+            if _native_factors_finite(direct, backend) and not needs_scale:
+                return direct
     else:
         block_max = to_float(ar.do("max", ar.do("abs", array)))
     if not np.isfinite(block_max) or block_max == 0.0:

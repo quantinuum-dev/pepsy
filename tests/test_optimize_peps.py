@@ -1,7 +1,5 @@
 """Tests for :mod:`pepsy.optimizers.peps.optimizer`."""
 
-import warnings
-
 import numpy as np
 import pytest
 
