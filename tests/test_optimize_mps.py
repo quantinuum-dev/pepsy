@@ -500,8 +500,8 @@ def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     assert opt.last_mix_summary["fallback_steps"] == 0
 
 
-def test_mps_optimizer_mix_inplace_success_keeps_input_identity():
-    """Successful mixed DMRG updates should preserve inplace semantics."""
+def test_mps_optimizer_mix_one_site_fast_path_keeps_input_identity():
+    """Mixed mode should apply one-site gates without a DMRG trial copy."""
     p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=17)
     opt = py.MpsOptimizer(
         p0,
@@ -513,7 +513,8 @@ def test_mps_optimizer_mix_inplace_success_keeps_input_identity():
 
     out = opt.run(progbar=False, cutoff=1e-12)
 
-    assert opt.mix_history[0]["backend"] == "dmrg"
+    assert opt.mix_history[0]["backend"] == "mpo"
+    assert opt.mix_history[0]["reason"] == "one_site_exact"
     assert opt.p is p0
     assert out is p0
 
@@ -584,8 +585,8 @@ def test_mps_optimizer_mix_global_infidelity_tracks_current_norm():
     )
 
 
-def test_mps_optimizer_mix_starts_with_dmrg_at_target_bond():
-    """Mix mode should not do MPO warmup when the initial MPS is already at chi."""
+def test_mps_optimizer_mix_one_site_is_exact_at_target_bond():
+    """One-site gates stay on the exact fast path at the target bond."""
     p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=17)
     assert p0.max_bond() == 2
     gates = [(qu.hadamard(), (1,))]
@@ -593,15 +594,15 @@ def test_mps_optimizer_mix_starts_with_dmrg_at_target_bond():
     opt = py.MpsOptimizer(p0.copy(), gates=gates, chi=2, mode="mix")
     opt.run(progbar=False, cutoff=1e-12)
 
-    assert opt.mix_history[0]["backend"] == "dmrg"
-    assert opt.mix_history[0]["reason"] == "bond_at_chi"
+    assert opt.mix_history[0]["backend"] == "mpo"
+    assert opt.mix_history[0]["reason"] == "one_site_exact"
 
 
 def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
     """Mix mode should restore and use MPO if DMRG leaves non-finite data."""
     p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=19)
     p0_ref = p0.copy()
-    gates = [(qu.hadamard(), (1,))]
+    gates = [(qu.CNOT(), (0, 2))]
     original_run_dmrg = py.MpsOptimizer._run_dmrg
 
     def nonfinite_dmrg(self, *args, **kwargs):
@@ -623,6 +624,184 @@ def test_mps_optimizer_mix_falls_back_to_mpo_on_nonfinite_dmrg(monkeypatch):
     reference = py.MpsOptimizer(p0_ref, gates=gates, chi=2, mode="mpo")
     reference.run(progbar=False, cutoff=1e-12)
     assert np.allclose(opt.p.to_dense(), reference.p.to_dense())
+
+
+def test_mps_optimizer_mix_inplace_success_two_site_keeps_input_identity():
+    """Successful two-site mixed DMRG updates must preserve inplace semantics."""
+    p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=23)
+    before = p0.to_dense().copy()
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="mix",
+        inplace=True,
+    )
+
+    out = opt.run(progbar=False, cutoff=1e-12, n_iter=3)
+
+    assert out is p0
+    assert opt.p is p0
+    assert opt.mix_history[0]["backend"] == "dmrg"
+    assert not np.allclose(p0.to_dense(), before)
+
+
+def test_mps_optimizer_mix_inplace_commits_local_bond_expansion():
+    """In-place commit should also handle active-bond dimension growth."""
+    dense = np.zeros((2, 2, 2, 2), dtype=complex)
+    dense[0, 0, 0, 0] = 1.0 / np.sqrt(2.0)
+    dense[1, 1, 0, 0] = 1.0 / np.sqrt(2.0)
+    p0 = qtn.MatrixProductState.from_dense(dense)
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.CNOT(), (2, 3))],
+        chi=2,
+        mode="mix",
+        inplace=True,
+    )
+
+    out = opt.run(progbar=False, cutoff=1e-12, n_iter=4)
+
+    assert out is p0
+    assert opt.p is p0
+    assert opt.mix_history[0]["backend"] == "dmrg"
+    assert p0.bond_size(2, 3) == 2
+
+
+def test_mps_optimizer_mix_fallback_restores_unitary_norm_tracking(monkeypatch):
+    """A failed DMRG trial must not change the MPO fallback error bar."""
+    p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=29)
+    p0_ref = p0.copy()
+    gates = [(qu.CNOT(), (0, 2))]
+    original_run_dmrg = py.MpsOptimizer._run_dmrg
+
+    def failed_dmrg(self, *args, **kwargs):
+        original_run_dmrg(self, *args, **kwargs)
+        self._unitary_previous_norm = 123.456
+        raise RuntimeError("forced DMRG failure")
+
+    monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", failed_dmrg)
+    opt = py.MpsOptimizer(
+        p0,
+        gates=gates,
+        chi=2,
+        mode="mix",
+        inplace=True,
+        track_infidelity=True,
+    )
+    opt.run(progbar=False, cutoff=1e-12)
+
+    reference = py.MpsOptimizer(
+        p0_ref,
+        gates=gates,
+        chi=2,
+        mode="mpo",
+        track_infidelity=True,
+    )
+    reference.run(progbar=False, cutoff=1e-12)
+    assert opt.infidelity_samples[0]["target_norm"] == pytest.approx(
+        reference.infidelity_samples[0]["target_norm"]
+    )
+    assert opt.get_infidelities()[-1] == pytest.approx(
+        reference.get_infidelities()[-1]
+    )
+
+
+def test_mps_optimizer_mix_strict_restores_then_reraises(monkeypatch):
+    """Strict mixed mode should expose DMRG errors without corrupting state."""
+    p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=30)
+    before = p0.to_dense().copy()
+
+    def failed_dmrg(self, *args, **kwargs):
+        raise RuntimeError("strict DMRG failure")
+
+    monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", failed_dmrg)
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="mix",
+        inplace=True,
+    )
+
+    with pytest.raises(RuntimeError, match="strict DMRG failure"):
+        opt.run(progbar=False, mix_strict=True)
+    assert opt.p is p0
+    assert np.allclose(p0.to_dense(), before)
+    assert opt.mix_history == []
+
+
+def test_mps_optimizer_mix_interrupt_restores_trial_state(monkeypatch):
+    """Interrupting a DMRG trial must leave the committed MPS usable."""
+    p0 = qtn.MPS_rand_state(3, bond_dim=2, phys_dim=2, dtype="complex128", seed=31)
+    before = p0.to_dense().copy()
+
+    def interrupt(self, *args, **kwargs):
+        data = np.asarray(self.p[0].data)
+        self.p[0].modify(data=np.full_like(data, np.nan))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(py.MpsOptimizer, "_run_dmrg", interrupt)
+    opt = py.MpsOptimizer(
+        p0,
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="mix",
+        inplace=True,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        opt.run(progbar=False)
+    assert opt.p is p0
+    assert py.MpsOptimizer._mps_data_is_finite(p0)
+    assert np.allclose(p0.to_dense(), before)
+    assert opt.mix_history == []
+
+
+def test_mps_optimizer_mix_batches_two_site_transactions():
+    """Mixed mode should support transactional DMRG batches."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128", seed=37),
+        gates=[(qu.CNOT(), (0, 2)), (qu.CNOT(), (1, 3))],
+        chi=2,
+        mode="mix",
+    )
+
+    out = opt.run(progbar=False, cutoff=1e-12, n_iter=3, k_2q_batch=2)
+
+    assert out.max_bond() <= 2
+    assert [entry["backend"] for entry in opt.mix_history] == ["dmrg", "dmrg"]
+    assert opt.mix_history[0]["reason"] == "bond_at_chi"
+    assert opt.mix_history[1]["reason"] == "dmrg_batch"
+    assert [sample["step"] for sample in opt.infidelity_samples] == [2]
+
+
+def test_mps_optimizer_mix_rejects_initial_bond_above_chi():
+    """Mixed mode must not silently violate its configured bond limit."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(4, bond_dim=4, phys_dim=2, dtype="complex128", seed=41),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="mix",
+    )
+
+    with pytest.raises(ValueError, match="initial MPS max bond"):
+        opt.run(progbar=False)
+
+
+def test_mps_optimizer_mix_history_keeps_logical_layout_sites():
+    """Mixed history should expose logical and execution gate locations."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("0000"),
+        gates=[(qu.CNOT(), (0, 3))],
+        chi=2,
+        mode="mix",
+    )
+    opt.apply_layout((3, 2, 1, 0), layout_report=False)
+    opt.run(progbar=False)
+
+    assert opt.mix_history[0]["where"] == (0, 3)
+    assert opt.mix_history[0]["execution_where"] == (3, 0)
 
 
 def test_mps_optimizer_mix_rejects_non_unitary_stream_controls():

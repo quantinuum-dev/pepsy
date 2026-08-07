@@ -38,12 +38,21 @@ physical leg with `vec`, absorbs it into the selected neighbour, and shortens
 the MPS by one site.
 
 `mode="mix"` is a unitary gate-stream mode that warms up with MPO replay while
-`p.max_bond() < chi`, then switches to DMRG replay once the working MPS reaches
-the target bond. If a DMRG step raises or produces non-finite tensor data, the
-optimizer restores the pre-step state and replays that step with MPO instead.
-The mixed replay history is stored in `opt.mix_history` and summarized in
-`opt.last_mix_summary`. With `progbar=True`, the progress bar shows the current
-backend, cumulative MPO/DMRG/fallback counts, and `bond=current/chi`.
+`p.max_bond() < chi`, then uses transactional DMRG replay once the working MPS
+reaches the target bond. One-site gates remain on the exact direct/MPO path;
+`k_2q_batch` controls contiguous two-site DMRG batches. If a DMRG batch raises,
+produces non-finite data, or exceeds `chi`, the optimizer restores the complete
+pre-batch state (including canonical and infidelity metadata) and replays the
+batch through MPO. Interrupts restore the trial state and are re-raised.
+
+Mixed-mode DMRG expands only the active gate interval. Native Symmray states
+with a short active bond stay on the symmetry-aware MPO path rather than using
+Quimb's dense-style bond expansion. The initial MPS must satisfy
+`p.max_bond() <= chi`. The mixed replay history is stored in `opt.mix_history`
+and summarized in `opt.last_mix_summary`; history entries include logical
+`where` and execution `execution_where` positions. With `progbar=True`, the
+progress bar shows the current backend, cumulative MPO/DMRG/fallback counts,
+and `bond=current/chi`.
 
 `mode="su"` uses simple-update evolution for imaginary-time or other
 non-unitary gate streams. It keeps `opt.p` as the simple-update core and

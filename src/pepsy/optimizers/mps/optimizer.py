@@ -714,7 +714,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         ``cap`` event shortens the MPS, so later event site labels refer to the
         shortened chain.
     chi : int
-        Maximum bond dimension used by MPO/swap/perm/SVD/simple-update modes.
+        Positive target/max bond dimension used by compressed modes. Mixed mode
+        requires the initial MPS to have ``max_bond() <= chi`` and keeps its
+        committed DMRG/MPO results at or below this limit.
     mode : {"dmrg", "mpo", "mix", "swap", "perm", "svd", "su", "exact"}, default="dmrg"
         Optimization backend.
     contraction_opt : object | None, default="auto-hq"
@@ -1224,11 +1226,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "chi must be provided. Use MpsOptimizer(p, gates, chi) "
                     "or MpsOptimizer(p, chi) for an empty gate queue."
                 )
+        if not isinstance(chi, Integral) or int(chi) < 1:
+            raise ValueError("chi must be a positive integer.")
 
         self.inplace = bool(inplace)
         self.p = self._install_represented_norm(p if self.inplace else p.copy())
         self.G, self.where, self.event_types = _normalize_gate_queue(gates)
-        self.chi = chi
+        self.chi = int(chi)
         self.mode = self._normalize_mode(mode)
         self.contraction_opt = "auto-hq" if contraction_opt is None else contraction_opt
         self.ind_id = str(ind_id)
@@ -1354,18 +1358,39 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
     @staticmethod
     def _mps_data_is_finite(p):
-        """Return whether dense numeric tensor data contains only finite values."""
-        for tensor in getattr(p, "tensors", ()):
+        """Return whether tensor data contains only finite values.
+
+        The reduction is kept on the live array backend until the final scalar
+        conversion. In particular, this must not materialize every CuPy/Torch
+        tensor on the host merely to check a DMRG trial state.
+        """
+
+        def check_array(data):
+            """Check one dense or block-sparse backend array."""
+            blocks = getattr(data, "blocks", None)
+            if blocks is not None:
+                if isinstance(blocks, Mapping):
+                    blocks = blocks.values()
+                try:
+                    return all(check_array(block) for block in blocks)
+                except TypeError:
+                    pass
+
             try:
-                data = tensor.data
-                if hasattr(data, "to_dense"):
-                    data = data.to_dense()
-                data = np.asarray(ar.to_numpy(data))
+                finite = ar.do("isfinite", data)
+                reduced = ar.do("all", finite)
+                return bool(ar.to_numpy(reduced))
             except Exception:
-                continue
-            if not np.issubdtype(data.dtype, np.number):
-                continue
-            if not np.all(np.isfinite(data)):
+                dense = getattr(data, "to_dense", None)
+                if callable(dense):
+                    data = dense()
+                try:
+                    return bool(np.all(np.isfinite(np.asarray(data))))
+                except Exception:
+                    return False
+
+        for tensor in getattr(p, "tensors", ()):
+            if not check_array(tensor.data):
                 return False
         exponent = getattr(p, "exponent", 0.0)
         try:
@@ -1483,17 +1508,36 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self.p.expand_bond_dimension(self.chi, inplace=True)
             self._init_canonicalization()
 
-    def _prepare_mix_dmrg_state(self):
-        """Ensure every bond can support a mixed-mode DMRG update."""
+    def _prepare_mix_dmrg_state(self, where):
+        """Ensure the active bonds can support a mixed-mode DMRG update.
+
+        FIT only optimizes the interval spanned by the gate. Expanding every
+        bond in a long MPS would waste ``O(L * chi**2)`` memory, so only the
+        active internal indices are padded. Native Symmray callers are routed
+        through MPO while an active bond is still short, avoiding Quimb's
+        dense-style expansion path.
+        """
         if self.chi <= 1 or getattr(self.p, "L", 0) <= 1:
             return
 
+        xmin, xmax = min(where), max(where)
+        if xmin == xmax:
+            return
         bond_sizes = [
             int(self.p.bond_size(site, site + 1))
-            for site in range(int(self.p.L) - 1)
+            for site in range(xmin, xmax)
         ]
         if any(bond_size < int(self.chi) for bond_size in bond_sizes):
-            self.p.expand_bond_dimension(self.chi, inplace=True)
+            bond_inds = [self.p.bond(site, site + 1) for site in range(xmin, xmax)]
+            # MatrixProductState overrides this method without exposing
+            # ``inds_to_expand``. Calling the public TensorNetwork method
+            # retains the MPS object while selecting only these bonds.
+            qtn.TensorNetwork.expand_bond_dimension(
+                self.p,
+                int(self.chi),
+                inds_to_expand=bond_inds,
+                inplace=True,
+            )
             self._init_canonicalization()
 
     def set_p(self, p):
@@ -2284,6 +2328,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         measure_renormalize=True,
         seed=None,
         track_infidelity=None,
+        mix_strict=False,
     ):
         """Run the currently queued gates.
 
@@ -2303,11 +2348,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Optional mode override for this run. If supplied, updates
             ``self.mode`` before execution.
         k_2q_batch : int, default=1
-            DMRG mode only: number of sequential two-qubit gates to batch
-            into one local FIT update. The FIT window uses the batch-wide
-            ``[xmin, xmax]`` from all two-qubit gate locations in the batch.
-            ``mode="mix"`` currently switches at gate-step granularity and
-            requires ``k_2q_batch=1``.
+            DMRG and mixed modes: number of contiguous two-qubit gates to batch
+            into one local FIT update. In mixed mode, a failed batch is replayed
+            through MPO as one transaction. One-site gates always use the
+            exact direct/MPO path.
         non_unitary : bool, default=False
             Convenience flag for non-unitary gate streams. Normalization is
             only available when this is ``True``; default/unitary runs never
@@ -2361,6 +2405,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         track_infidelity : bool | None, default=None
             Override :attr:`track_infidelity` for this run. ``None`` keeps the
             constructor setting.
+        mix_strict : bool, default=False
+            In ``mode="mix"``, restore the committed state and re-raise an
+            ordinary DMRG trial exception instead of falling back to MPO.
 
         Returns
         -------
@@ -2490,10 +2537,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if self.mode == "mix":
             if non_unitary:
                 raise ValueError("mode='mix' is only for unitary gate streams.")
-            if k_2q_batch != 1:
+            if not isinstance(k_2q_batch, Integral) or k_2q_batch < 1:
+                raise ValueError("k_2q_batch must be a positive integer.")
+            if self.p.max_bond() > self.chi:
                 raise ValueError(
-                    "mode='mix' switches at gate-step granularity and currently "
-                    "requires k_2q_batch=1."
+                    "mode='mix' requires the initial MPS max bond to be <= chi; "
+                    "compress the state first or increase chi."
                 )
         if normalize_every is not None and self.mode == "exact":
             raise ValueError(
@@ -2511,6 +2560,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_eps=normalize_eps,
             non_unitary=non_unitary,
             submpo_method=submpo_method,
+            mix_strict=bool(mix_strict),
         )
 
         if has_control:
@@ -2540,6 +2590,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 G_seq,
                 where_seq,
                 event_seq,
+                logical_where_seq=logical_where_seq,
                 progbar=progbar,
                 **mode_kwargs,
             )
@@ -2557,6 +2608,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         event_seq,
         *,
+        logical_where_seq=None,
         n_iter,
         progbar,
         cutoff,
@@ -2567,6 +2619,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_eps,
         non_unitary,
         submpo_method,
+        mix_strict=False,
     ):
         """Dispatch a gate/subMPO segment to the active mode backend.
 
@@ -2603,11 +2656,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 G_seq,
                 where_seq,
                 event_seq,
+                logical_where_seq=logical_where_seq,
                 n_iter=n_iter,
+                k_2q_batch=k_2q_batch,
                 progbar=progbar,
                 cutoff=cutoff,
                 cutoff_mode=cutoff_mode,
                 submpo_method=submpo_method,
+                mix_strict=mix_strict,
             )
             return self.p
 
@@ -2725,6 +2781,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             logical_where_seq = where_seq
         seg_G = []
         seg_where = []
+        seg_logical_where = []
         seg_event = []
 
         def flush():
@@ -2733,11 +2790,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     list(seg_G),
                     list(seg_where),
                     list(seg_event),
+                    logical_where_seq=list(seg_logical_where),
                     progbar=progbar,
                     **mode_kwargs,
                 )
                 seg_G.clear()
                 seg_where.clear()
+                seg_logical_where.clear()
                 seg_event.clear()
 
         for payload, where, logical_where, event_type in zip(
@@ -2758,6 +2817,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             else:
                 seg_G.append(payload)
                 seg_where.append(where)
+                seg_logical_where.append(logical_where)
                 seg_event.append(event_type)
 
         flush()
@@ -2826,6 +2886,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     [action_payloads[0]],
                     [physical_where],
                     [action_type],
+                    logical_where_seq=[action_where],
                     progbar=False,
                     n_iter=1,
                     cutoff=cutoff,
@@ -4013,6 +4074,51 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not self._mps_data_is_finite(self.p):
             raise FloatingPointError("MPO step produced non-finite MPS tensor data.")
 
+    def _run_mix_mpo_batch(
+        self,
+        G_seq,
+        where_seq,
+        event_seq,
+        *,
+        steps,
+        cutoff,
+        cutoff_mode,
+        submpo_method,
+    ):
+        """Apply a mixed-mode fallback batch through the MPO backend."""
+        sample_start = len(self.infidelity_samples)
+        self._run_mpo(
+            G_seq,
+            where_seq,
+            event_seq,
+            progbar=False,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            normalize_every=None,
+            normalize_final=False,
+            submpo_method=submpo_method,
+        )
+        self._renumber_mix_infidelity_samples(
+            sample_start,
+            steps[-1],
+            steps=steps,
+        )
+        if not self._mps_data_is_finite(self.p):
+            raise FloatingPointError("MPO batch produced non-finite MPS tensor data.")
+
+    def _renumber_mix_infidelity_samples(self, sample_start, step, *, steps=None):
+        """Assign global gate-stream steps to samples from a mixed update."""
+        new_samples = self.infidelity_samples[sample_start:]
+        if steps is None:
+            for sample in new_samples:
+                sample["step"] = int(step)
+            return
+
+        for sample in new_samples:
+            local_step = int(sample.get("step", len(steps))) - 1
+            local_step = min(max(local_step, 0), len(steps) - 1)
+            sample["step"] = int(steps[local_step])
+
     def _run_mix_dmrg_step(
         self,
         gate,
@@ -4040,10 +4146,124 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         if not self._mps_data_is_finite(self.p):
             raise FloatingPointError("DMRG step produced non-finite MPS tensor data.")
 
-    def _renumber_mix_infidelity_samples(self, sample_start, step):
-        """Assign the global gate-stream step to samples from one mix step."""
-        for sample in self.infidelity_samples[sample_start:]:
-            sample["step"] = int(step)
+    def _run_mix_dmrg_batch(
+        self,
+        G_seq,
+        where_seq,
+        *,
+        steps,
+        n_iter,
+        cutoff,
+        cutoff_mode,
+    ):
+        """Apply a contiguous two-site batch through the DMRG backend."""
+        sample_start = len(self.infidelity_samples)
+        self._run_dmrg(
+            G_seq,
+            where_seq,
+            n_iter=n_iter,
+            progbar=False,
+            cutoff=cutoff,
+            cutoff_mode=cutoff_mode,
+            k_2q_batch=len(G_seq),
+            normalize_every=None,
+            normalize_final=False,
+        )
+        # FIT produces one compression sample for the whole batch. It is
+        # therefore associated with the final gate in the batch.
+        self._renumber_mix_infidelity_samples(sample_start, steps[-1])
+        if not self._mps_data_is_finite(self.p):
+            raise FloatingPointError("DMRG batch produced non-finite MPS tensor data.")
+        if int(self.p.max_bond()) > int(self.chi):
+            raise FloatingPointError(
+                "DMRG batch exceeded the mixed-mode chi bond limit."
+            )
+
+    @staticmethod
+    def _collect_mix_dmrg_batch(G_seq, where_seq, start_idx, k_2q_batch):
+        """Collect contiguous two-site gates for one mixed DMRG transaction."""
+        batch_G = []
+        batch_where = []
+        idx = start_idx
+        while (
+            idx < len(G_seq)
+            and len(batch_G) < int(k_2q_batch)
+            and len(where_seq[idx]) == 2
+        ):
+            batch_G.append(G_seq[idx])
+            batch_where.append(where_seq[idx])
+            idx += 1
+        return batch_G, batch_where, idx
+
+    def _mix_state_snapshot(self):
+        """Capture mutable optimizer state before a trial mixed update."""
+        return {
+            "p": self.p,
+            "p_exponent": getattr(self.p, "exponent", None),
+            "info_c": deepcopy(self.info_c),
+            "infidelity_log": self._infidelity_log_fidelity,
+            "unitary_initial_norm": self._unitary_initial_norm,
+            "unitary_previous_norm": self._unitary_previous_norm,
+            "unitary_global_norm_tracking": self._unitary_global_norm_tracking,
+            "lengths": {
+                "infidelities": len(self.infidelities),
+                "infidelity_samples": len(self.infidelity_samples),
+                "normalizations": len(self.normalizations),
+            },
+        }
+
+    def _restore_mix_state(self, snapshot):
+        """Restore a mixed-mode transaction without changing caller identity."""
+        self.p = snapshot["p"]
+        if snapshot["p_exponent"] is not None:
+            self.p.exponent = snapshot["p_exponent"]
+        self.info_c = snapshot["info_c"]
+        self._infidelity_log_fidelity = snapshot["infidelity_log"]
+        self._unitary_initial_norm = snapshot["unitary_initial_norm"]
+        self._unitary_previous_norm = snapshot["unitary_previous_norm"]
+        self._unitary_global_norm_tracking = snapshot[
+            "unitary_global_norm_tracking"
+        ]
+        for attr, length in snapshot["lengths"].items():
+            del getattr(self, attr)[length:]
+
+    def _commit_mix_trial(self, committed_p, trial_p):
+        """Commit a successful trial while honoring ``inplace=True``."""
+        if not self.inplace:
+            self.p = trial_p
+            return
+        if trial_p is not committed_p:
+            if len(committed_p.tensors) != len(trial_p.tensors):
+                raise RuntimeError(
+                    "mixed-mode trial changed the number of MPS tensors; "
+                    "cannot preserve inplace object identity."
+                )
+            for committed_tensor, trial_tensor in zip(
+                committed_p.tensors,
+                trial_p.tensors,
+            ):
+                if committed_tensor.inds != trial_tensor.inds:
+                    raise RuntimeError(
+                        "mixed-mode trial changed MPS index structure; "
+                        "cannot preserve inplace object identity."
+                    )
+                data = trial_tensor.data
+                copy_data = getattr(data, "copy", None)
+                if callable(copy_data):
+                    data = copy_data()
+                committed_tensor.modify(data=data)
+            committed_p.exponent = trial_p.exponent
+        self.p = committed_p
+
+    def _mix_active_bond_is_short(self, where):
+        """Return whether a gate's active interval has a bond below ``chi``."""
+        if self.chi <= 1 or len(where) < 2:
+            return False
+        xmin, xmax = min(where), max(where)
+        return any(
+            int(self.p.bond_size(site, site + 1)) < int(self.chi)
+            for site in range(xmin, xmax)
+        )
 
     def _run_mix(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -4051,7 +4271,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         where_seq,
         event_seq,
         *,
+        logical_where_seq=None,
         n_iter,
+        k_2q_batch=1,
+        mix_strict=False,
         progbar=False,
         cutoff=1e-12,
         cutoff_mode="rsum2",
@@ -4074,120 +4297,206 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 colour=self._PROGBAR_COLORS["mix"],
             )
 
+        if logical_where_seq is None:
+            logical_where_seq = where_seq
+        if len(logical_where_seq) != len(where_seq):
+            raise ValueError("logical and execution gate streams must have equal length.")
+
         mix_step_offset = len(self.mix_history)
         mpo_steps = sum(event["backend"] == "mpo" for event in self.mix_history)
         dmrg_steps = sum(event["backend"] == "dmrg" for event in self.mix_history)
         fallback_steps = sum(
-            event.get("reason") == "dmrg_fallback" for event in self.mix_history
+            event.get("reason", "").startswith("dmrg_fallback")
+            for event in self.mix_history
         )
 
+        def append_entries(entries):
+            self.mix_history.extend(entries)
+            if pbar is not None:
+                final = entries[-1]
+                postfix = {
+                    "backend": final["backend"],
+                    "mpo": mpo_steps,
+                    "dmrg": dmrg_steps,
+                    "fallback": fallback_steps,
+                    "bond": f"{final['end_bond']}/{self.chi}",
+                }
+                if self.track_infidelity:
+                    postfix["infidelity"] = self._format_progress_infidelity(
+                        self.infidelities[-1]
+                    )
+                pbar.set_postfix(postfix)
+                pbar.update(len(entries))
+
+        idx = 0
         try:
-            for idx, (gate, where, event_type) in enumerate(
-                zip(G_seq, where_seq, event_seq),
-                start=mix_step_offset + 1,
-            ):
+            while idx < len(G_seq):
+                gate = G_seq[idx]
+                where = where_seq[idx]
+                event_type = event_seq[idx]
+                logical_where = logical_where_seq[idx]
                 if len(where) not in {1, 2}:
                     raise ValueError("Each gate location must have one or two sites.")
 
+                step = mix_step_offset + idx + 1
                 start_bond = int(self.p.max_bond())
-                entry = {
-                    "step": int(idx),
-                    "where": tuple(where),
-                    "start_bond": start_bond,
-                }
-
-                if start_bond < int(self.chi):
+                use_mpo = (
+                    len(where) == 1
+                    or start_bond < int(self.chi)
+                    or (
+                        self._has_symmray_data(self.p)
+                        and self._mix_active_bond_is_short(where)
+                    )
+                )
+                if use_mpo:
                     self._run_mix_mpo_step(
                         gate,
                         where,
                         event_type,
-                        step=idx,
+                        step=step,
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
                         submpo_method=submpo_method,
                     )
                     mpo_steps += 1
-                    entry["backend"] = "mpo"
-                    entry["reason"] = "bond_below_chi"
-                else:
+                    if len(where) == 1:
+                        reason = "one_site_exact"
+                    elif start_bond < int(self.chi):
+                        reason = "bond_below_chi"
+                    else:
+                        reason = "symmray_bond_below_chi"
+                    append_entries(
+                        [
+                            {
+                                "step": int(step),
+                                "where": tuple(logical_where),
+                                "execution_where": tuple(where),
+                                "start_bond": start_bond,
+                                "backend": "mpo",
+                                "reason": reason,
+                                "end_bond": int(self.p.max_bond()),
+                            }
+                        ]
+                    )
+                    idx += 1
+                    continue
+
+                batch_G, batch_where, next_idx = self._collect_mix_dmrg_batch(
+                    G_seq,
+                    where_seq,
+                    idx,
+                    k_2q_batch,
+                )
+                batch_steps = [
+                    mix_step_offset + position + 1
+                    for position in range(idx, next_idx)
+                ]
+                batch_logical_where = logical_where_seq[idx:next_idx]
+                snapshot = self._mix_state_snapshot()
+                committed_p = snapshot["p"]
+                try:
                     # DMRG/FIT can mutate its input before it raises or
                     # produces invalid data. Run it against an isolated
                     # trial state so a failed mixed-mode attempt cannot
                     # corrupt a caller-owned ``inplace=True`` MPS. Keep the
                     # committed state as the MPO fallback target.
-                    committed_p = self.p
-                    saved_info = deepcopy(self.info_c)
-                    saved_infidelity_log = self._infidelity_log_fidelity
-                    saved_lengths = {
-                        "infidelities": len(self.infidelities),
-                        "infidelity_samples": len(self.infidelity_samples),
-                        "normalizations": len(self.normalizations),
-                    }
+                    trial_p = self._install_represented_norm(
+                        committed_p.copy(deep=True)
+                    )
+                    self.p = trial_p
+                    self.info_c = deepcopy(snapshot["info_c"])
+                    if len(batch_where) == 1:
+                        active_where = batch_where[0]
+                    else:
+                        xmin = min(min(where_i) for where_i in batch_where)
+                        xmax = max(max(where_i) for where_i in batch_where)
+                        active_where = (xmin, xmax)
+                    self._prepare_mix_dmrg_state(active_where)
+                    self._run_mix_dmrg_batch(
+                        batch_G,
+                        batch_where,
+                        steps=batch_steps,
+                        n_iter=n_iter,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                    )
+                    self._commit_mix_trial(committed_p, self.p)
+                except Exception as exc:  # fallback is the point of mix mode
+                    self._restore_mix_state(snapshot)
+                    if mix_strict:
+                        raise
+                    fallback_trial = self._install_represented_norm(
+                        committed_p.copy(deep=True)
+                    )
                     try:
-                        trial_p = self._install_represented_norm(
-                            committed_p.copy(deep=True)
-                        )
-                        self.p = trial_p
-                        self.info_c = deepcopy(saved_info)
-                        self._prepare_mix_dmrg_state()
-                        self._run_mix_dmrg_step(
-                            gate,
-                            where,
-                            step=idx,
-                            n_iter=n_iter,
-                            cutoff=cutoff,
-                            cutoff_mode=cutoff_mode,
-                        )
-                    except Exception as exc:  # fallback is the point of mix mode
-                        self.p = committed_p
-                        self.info_c = saved_info
-                        self._infidelity_log_fidelity = saved_infidelity_log
-                        for attr, length in saved_lengths.items():
-                            del getattr(self, attr)[length:]
-                        self._run_mix_mpo_step(
-                            gate,
-                            where,
-                            event_type,
-                            step=idx,
+                        self.p = fallback_trial
+                        self.info_c = deepcopy(snapshot["info_c"])
+                        self._run_mix_mpo_batch(
+                            batch_G,
+                            batch_where,
+                            event_seq[idx:next_idx],
+                            steps=batch_steps,
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
                             submpo_method=submpo_method,
                         )
-                        mpo_steps += 1
-                        fallback_steps += 1
-                        entry["backend"] = "mpo"
-                        entry["reason"] = "dmrg_fallback"
-                        entry["fallback_error"] = f"{type(exc).__name__}: {exc}"
-                    else:
-                        if self.inplace and len(where) == 1:
-                            committed_p.set_params(self.p.get_params())
-                            committed_p.exponent = self.p.exponent
-                            self.p = committed_p
-                        dmrg_steps += 1
-                        entry["backend"] = "dmrg"
-                        entry["reason"] = (
-                            "bond_at_chi"
-                            if start_bond == int(self.chi)
-                            else "bond_above_chi"
+                        self._commit_mix_trial(committed_p, self.p)
+                    except BaseException:
+                        self._restore_mix_state(snapshot)
+                        raise
+                    mpo_steps += len(batch_G)
+                    fallback_steps += len(batch_G)
+                    final_bond = int(self.p.max_bond())
+                    entries = []
+                    for offset, (step_i, where_i, logical_i) in enumerate(
+                        zip(batch_steps, batch_where, batch_logical_where)
+                    ):
+                        entries.append(
+                            {
+                                "step": int(step_i),
+                                "where": tuple(logical_i),
+                                "execution_where": tuple(where_i),
+                                "start_bond": start_bond,
+                                "backend": "mpo",
+                                "reason": (
+                                    "dmrg_fallback"
+                                    if offset == 0
+                                    else "dmrg_fallback_batch"
+                                ),
+                                "fallback_error": f"{type(exc).__name__}: {exc}",
+                                "end_bond": final_bond,
+                            }
                         )
+                    append_entries(entries)
+                    idx = next_idx
+                    continue
+                except BaseException:
+                    self._restore_mix_state(snapshot)
+                    raise
 
-                entry["end_bond"] = int(self.p.max_bond())
-                self.mix_history.append(entry)
-
-                if pbar is not None:
-                    postfix = {
-                        "backend": entry["backend"],
-                        "mpo": mpo_steps,
-                        "dmrg": dmrg_steps,
-                        "fallback": fallback_steps,
-                        "bond": f"{entry['end_bond']}/{self.chi}",
-                    }
-                    if self.track_infidelity:
-                        postfix["infidelity"] = self._format_progress_infidelity(
-                            self.infidelities[-1]
-                        )
-                    pbar.set_postfix(postfix)
-                    pbar.update(1)
+                dmrg_steps += len(batch_G)
+                final_bond = int(self.p.max_bond())
+                entries = []
+                for offset, (step_i, where_i, logical_i) in enumerate(
+                    zip(batch_steps, batch_where, batch_logical_where)
+                ):
+                    entries.append(
+                        {
+                            "step": int(step_i),
+                            "where": tuple(logical_i),
+                            "execution_where": tuple(where_i),
+                            "start_bond": start_bond,
+                            "backend": "dmrg",
+                            "reason": (
+                                "bond_at_chi"
+                                if offset == 0 and start_bond == int(self.chi)
+                                else "dmrg_batch"
+                            ),
+                            "end_bond": final_bond,
+                        }
+                    )
+                append_entries(entries)
+                idx = next_idx
         finally:
             if pbar is not None:
                 pbar.close()
