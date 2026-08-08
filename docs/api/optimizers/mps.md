@@ -48,13 +48,22 @@ complete pre-batch state (including canonical and infidelity metadata) and
 replays the batch through MPO. Interrupts restore the trial state and are
 re-raised.
 
-For mixed DMRG, `n_iter` is a maximum rather than an unconditional sweep count.
-`mix_fit_min_iter`, `mix_fit_rtol`, and `mix_fit_patience` control adaptive
-stopping from FIT's final local-norm change; `mix_fit_rtol="auto"` selects
-`1e-3`, `1e-5`, or `1e-8` for 16-, 32-/complex64-, or higher-precision data.
-Pass `mix_fit_rtol=None` for the old fixed-iteration behavior. FIT checks the
-whole state after every sweep. Torch and CuPy checks reduce every tensor on the
-device and transfer one combined Boolean to the host.
+For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
+unconditional sweep count. `mix_fit_min_iter`, `mix_fit_rtol`, and
+`mix_fit_patience` control adaptive stopping from FIT's final local-norm
+change; `mix_fit_rtol="auto"` selects `1e-3`, `1e-5`, or `1e-8` for 16-,
+32-/complex64-, or higher-precision data. Pass `mix_fit_rtol=None` for fixed
+iterations. FIT checks the small per-site norm scalars it already computes
+after every sweep, transferring only one active-span-sized vector to the host.
+It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
+non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
+when `mix_fit_rtol="auto"`, while an explicit numeric tolerance enables
+adaptive stopping there too. Mixed DMRG additionally performs one full tensor
+check before committing a trial, while consecutive MPO warm-up steps share one
+full check at the next DMRG handoff or at the end of the segment. A
+transactional MPO fallback is checked before commit. Torch and CuPy full
+checks process one tensor at a time, combine scalar results on the device, and
+transfer one Boolean to the host.
 
 After a non-finite DMRG result, `mix_sticky_nonfinite=True` keeps the remainder
 of the current `run()` call on MPO rather than retrying an unhealthy FIT for
@@ -65,6 +74,23 @@ include logical `where`, execution `execution_where`, FIT iterations and
 convergence, target bond, fallback sweep, and sticky-disable diagnostics. With
 `progbar=True`, the progress bar shows the current backend, cumulative
 MPO/DMRG/fallback counts, and `bond=current/chi`.
+
+Replay timing is opt-in and does not print by itself:
+
+```python
+opt.run(timing=True)
+print(opt.get_run_timing())
+```
+
+The copy-safe record contains replay wall time, event count, final bond,
+backend signature, and—when using `mode="mix"`—a copy of
+`last_mix_summary`, including its elapsed time and backend decision counts.
+It also contains inclusive `stages` totals for `gate_stream.prepare`, the
+active mode replay, `canonicalize`, `gate.apply`, `dmrg.fit`,
+`normalization`, `control.<event>`, and `infidelity.compute`. Stage totals can
+overlap with the mode replay total; use them to identify the dominant work,
+not to add into a second total. Ordinary runs retain no per-gate timer
+overhead.
 
 `mode="su"` uses simple-update evolution for imaginary-time or other
 non-unitary gate streams. It keeps `opt.p` as the simple-update core and

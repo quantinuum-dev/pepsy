@@ -55,6 +55,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from collections.abc import Mapping
+from contextlib import contextmanager
 from numbers import Integral
 import time
 import types
@@ -758,6 +759,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         Per-update canonical norm-ratio records. Each record contains the
         target and retained canonical norms, local fidelity, and cumulative
         infidelity. This remains empty when tracking is disabled.
+    last_run_timing : dict | None
+        Most recent opt-in replay timing record from ``run(timing=True)``.
+        The record contains total replay time, inclusive stage totals, and,
+        for mixed mode, the final ``last_mix_summary``. Use
+        :meth:`get_run_timing` for a copy.
     gauges : dict
         Simple-update bond gauges. In ``mode="su"``, ``p`` is the gauged core
         and the physical state is recovered with ``p.gauge_simple_insert(gauges)``.
@@ -1261,6 +1267,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.last_layout_plan = self._persistent_layout_plan
         self.mix_history = []
         self.last_mix_summary = None
+        self.last_run_timing = None
+        self._timing_state = None
         self._mix_dmrg_disabled_reason = None
         self._mix_dmrg_failed_sweep = None
         self._last_dmrg_fit_diagnostics = None
@@ -1486,7 +1494,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     def _apply_gate(self, p, gate, where, **kwargs):
         """Apply a gate using this optimizer's physical-index convention."""
         kwargs.setdefault("ind_id", self.ind_id)
-        return apply_gate(p, gate, where, **kwargs)
+        if self._timing_state is None:
+            return apply_gate(p, gate, where, **kwargs)
+        return self._timed_call("gate.apply", apply_gate, p, gate, where, **kwargs)
 
     def _init_canonicalization(self):
         """Initialize canonical form and orthogonality center."""
@@ -1650,6 +1660,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         copied.infidelity_samples = deepcopy(self.infidelity_samples)
         copied.mix_history = deepcopy(self.mix_history)
         copied.last_mix_summary = deepcopy(self.last_mix_summary)
+        copied.last_run_timing = deepcopy(self.last_run_timing)
         copied._mix_dmrg_disabled_reason = self._mix_dmrg_disabled_reason
         copied._mix_dmrg_failed_sweep = self._mix_dmrg_failed_sweep
         copied._last_dmrg_fit_diagnostics = deepcopy(
@@ -2366,15 +2377,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mix_fit_rtol="auto",
         mix_fit_patience=2,
         mix_sticky_nonfinite=True,
+        timing=False,
     ):
         """Run the currently queued gates.
 
         Parameters
         ----------
         n_iter : int, default=5
-            Inner iterations for DMRG local fits. In mixed mode this is the
-            maximum number of sweeps because adaptive convergence can stop
-            earlier. Ignored by ``mpo``/``swap``/``svd``/``exact``.
+            Inner iterations for DMRG local fits. In ``dmrg`` and ``mix``
+            modes this is the maximum number of sweeps when adaptive FIT
+            stopping is enabled; pass ``mix_fit_rtol=None`` for fixed
+            iterations. Ignored by ``mpo``/``swap``/``svd``/``exact``.
         progbar : bool, default=False
             Show per-mode progress bars.
         cutoff : float, default=1e-12
@@ -2447,24 +2460,34 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             In ``mode="mix"``, restore the committed state and re-raise an
             ordinary DMRG trial exception instead of falling back to MPO.
         mix_fit_min_iter : int, default=2
-            Minimum FIT sweeps before mixed-mode adaptive convergence can
-            stop. Values above ``n_iter`` are clamped to ``n_iter``.
+            Minimum FIT sweeps before adaptive convergence can stop in
+            ``dmrg`` or ``mix`` mode. Values above ``n_iter`` are clamped to
+            ``n_iter``.
         mix_fit_rtol : {"auto"} | float | None, default="auto"
-            Relative tolerance for mixed-mode FIT early stopping. ``"auto"``
+            Relative tolerance for DMRG FIT early stopping. ``"auto"``
             selects a dtype-aware tolerance; ``None`` disables early stopping
             and restores fixed ``n_iter`` behavior.
         mix_fit_patience : int, default=2
-            Consecutive converged FIT sweeps required before stopping early.
+            Consecutive converged FIT sweeps required before stopping early in
+            ``dmrg`` or ``mix`` mode.
         mix_sticky_nonfinite : bool, default=True
             After a mixed DMRG trial produces NaN or Inf, use MPO for the
             remainder of this :meth:`run` call instead of retrying DMRG on
             every subsequent gate.
+        timing : bool, default=False
+            Record wall-clock replay timing in :attr:`last_run_timing` without
+            printing or adding per-gate timing overhead. The record includes
+            inclusive stage totals for gate preparation, canonicalization,
+            gate application, FIT, normalization, control-event measurement,
+            infidelity calculation, and the active mode replay. Mixed-mode
+            records also include the final :attr:`last_mix_summary`.
 
         Returns
         -------
         qtn.TensorNetwork
             The updated ``self.p`` state after replaying the queued gate stream.
         """
+        timing = bool(timing)
         if mode is not None:
             self.set_mode(mode)
 
@@ -2484,10 +2507,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             self._mix_dmrg_disabled_reason = None
             self._mix_dmrg_failed_sweep = None
         if not G_seq:
-            if self.mode == "su":
-                self._prepare_su_state()
-                self._refresh_su_physical_state()
-            return self.p
+            def run_empty():
+                if self.mode == "su":
+                    self._prepare_su_state()
+                    self._refresh_su_physical_state()
+                return self.p
+
+            return self._run_with_timing(
+                run_empty,
+                enabled=timing,
+                event_count=0,
+            )
         self._validate_symmray_mode_support()
         self._validate_event_stream_for_run(G_seq, where_seq, event_seq)
         has_control = any(
@@ -2587,8 +2617,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_every,
             non_unitary=non_unitary,
         )
-        if self.mode == "mix":
-            if non_unitary:
+        if self.mode in {"dmrg", "mix"}:
+            if self.mode == "mix" and non_unitary:
                 raise ValueError("mode='mix' is only for unitary gate streams.")
             if not isinstance(n_iter, Integral) or int(n_iter) < 1:
                 raise ValueError("n_iter must be a positive integer.")
@@ -2604,8 +2634,15 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 or int(mix_fit_patience) < 1
             ):
                 raise ValueError("mix_fit_patience must be a positive integer.")
-            mix_fit_rtol = self._resolve_mix_fit_rtol(mix_fit_rtol)
-            if self.p.max_bond() > self.chi:
+            if self.mode == "dmrg" and non_unitary and mix_fit_rtol == "auto":
+                # Preserve the historical fixed-sweep behavior for
+                # non-unitary DMRG unless the caller supplies an explicit
+                # tolerance. Mixed mode is unitary-only and keeps adaptive
+                # stopping by default.
+                mix_fit_rtol = None
+            else:
+                mix_fit_rtol = self._resolve_mix_fit_rtol(mix_fit_rtol)
+            if self.mode == "mix" and self.p.max_bond() > self.chi:
                 raise ValueError(
                     "mode='mix' requires the initial MPS max bond to be <= chi; "
                     "compress the state first or increase chi."
@@ -2635,17 +2672,21 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
 
         if has_control:
             try:
-                return self._run_segmented(
-                    G_seq,
-                    where_seq,
-                    event_seq,
-                    logical_where_seq=logical_where_seq,
-                    progbar=progbar,
-                    cutoff=cutoff,
-                    cutoff_mode=cutoff_mode,
-                    measure_renormalize=measure_renormalize,
-                    where_is_physical=persistent_layout_active,
-                    mode_kwargs=mode_kwargs,
+                return self._run_with_timing(
+                    lambda: self._run_segmented(
+                        G_seq,
+                        where_seq,
+                        event_seq,
+                        logical_where_seq=logical_where_seq,
+                        progbar=progbar,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        measure_renormalize=measure_renormalize,
+                        where_is_physical=persistent_layout_active,
+                        mode_kwargs=mode_kwargs,
+                    ),
+                    enabled=timing,
+                    event_count=len(G_seq),
                 )
             finally:
                 if layout_current_order is not None:
@@ -2656,13 +2697,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self._normalize_visible_mps_order()
 
         try:
-            return self._execute_mode(
-                G_seq,
-                where_seq,
-                event_seq,
-                logical_where_seq=logical_where_seq,
-                progbar=progbar,
-                **mode_kwargs,
+            return self._run_with_timing(
+                lambda: self._execute_mode(
+                    G_seq,
+                    where_seq,
+                    event_seq,
+                    logical_where_seq=logical_where_seq,
+                    progbar=progbar,
+                    **mode_kwargs,
+                ),
+                enabled=timing,
+                event_count=len(G_seq),
             )
         finally:
             if layout_current_order is not None:
@@ -2671,6 +2716,73 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     current_order=layout_current_order,
                 )
                 self._normalize_visible_mps_order()
+
+    def _run_with_timing(self, executor, *, enabled, event_count):
+        """Execute one replay segment and optionally retain wall-clock timing."""
+        if not enabled:
+            return executor()
+
+        previous_timing_state = self._timing_state
+        self._timing_state = {"stages": {}}
+        started = time.perf_counter()
+        status = "complete"
+        try:
+            return executor()
+        except BaseException:
+            status = "failed"
+            raise
+        finally:
+            try:
+                final_bond = int(self.p.max_bond())
+            except (AttributeError, TypeError, ValueError):
+                final_bond = None
+            self.last_run_timing = {
+                "status": status,
+                "mode": self.mode,
+                "event_count": int(event_count),
+                "elapsed_seconds": float(time.perf_counter() - started),
+                "final_bond": final_bond,
+                "chi": int(self.chi),
+                "backend": self.backend,
+                "backend_dtype": self.backend_dtype,
+                "backend_device": self.backend_device,
+                "stages": deepcopy(self._timing_state["stages"]),
+                "mix_summary": (
+                    deepcopy(self.last_mix_summary)
+                    if self.mode == "mix"
+                    else None
+                ),
+            }
+            self._timing_state = previous_timing_state
+
+    @contextmanager
+    def _timing_stage(self, name):
+        """Accumulate inclusive wall time for one diagnostic stage."""
+        if self._timing_state is None:
+            yield
+            return
+
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            stage = self._timing_state["stages"].setdefault(
+                str(name),
+                {"calls": 0, "elapsed_seconds": 0.0},
+            )
+            stage["calls"] += 1
+            stage["elapsed_seconds"] += time.perf_counter() - started
+
+    def _timed_call(self, name, function, *args, **kwargs):
+        """Call ``function`` and time it only during an opt-in run."""
+        if self._timing_state is None:
+            return function(*args, **kwargs)
+        with self._timing_stage(name):
+            return function(*args, **kwargs)
+
+    def get_run_timing(self):
+        """Return the most recent opt-in replay and stage timing record."""
+        return deepcopy(self.last_run_timing)
 
     def _execute_mode(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
@@ -2706,11 +2818,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         # while foreign payloads are moved to the backend owned by the live
         # MPS. This keeps exact, simple-update, and compressed modes on one
         # backend contract.
-        G_seq = self._prepare_gate_stream_backend(G_seq, event_seq)
+        G_seq = self._timed_call(
+            "gate_stream.prepare",
+            self._prepare_gate_stream_backend,
+            G_seq,
+            event_seq,
+        )
 
         if self.mode == "dmrg":
-            self._prepare_dmrg_state()
-            self._run_dmrg(
+            self._timed_call("dmrg.prepare", self._prepare_dmrg_state)
+            self._timed_call(
+                "dmrg.replay",
+                self._run_dmrg,
                 G_seq,
                 where_seq,
                 n_iter=n_iter,
@@ -2722,11 +2841,17 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
+                fit_min_iter=mix_fit_min_iter,
+                fit_rtol=mix_fit_rtol,
+                fit_patience=mix_fit_patience,
+                fit_finite_check=True,
             )
             return self.p
 
         if self.mode == "mix":
-            self._run_mix(
+            self._timed_call(
+                "mix.replay",
+                self._run_mix,
                 G_seq,
                 where_seq,
                 event_seq,
@@ -2746,7 +2871,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
 
         if self.mode == "mpo":
-            self._run_mpo(
+            self._timed_call(
+                "mpo.replay",
+                self._run_mpo,
                 G_seq,
                 where_seq,
                 event_seq,
@@ -2762,7 +2889,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
 
         if self.mode == "swap":
-            self._run_swap(
+            self._timed_call(
+                "swap.replay",
+                self._run_swap,
                 G_seq,
                 where_seq,
                 progbar=progbar,
@@ -2776,7 +2905,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
 
         if self.mode == "perm":
-            self._run_perm(
+            self._timed_call(
+                "perm.replay",
+                self._run_perm,
                 G_seq,
                 where_seq,
                 progbar=progbar,
@@ -2790,7 +2921,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
 
         if self.mode == "svd":
-            self._run_svd(
+            self._timed_call(
+                "svd.replay",
+                self._run_svd,
                 G_seq,
                 where_seq,
                 progbar=progbar,
@@ -2804,7 +2937,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
 
         if self.mode == "su":
-            self._run_su(
+            self._timed_call(
+                "su.replay",
+                self._run_su,
                 G_seq,
                 where_seq,
                 event_seq,
@@ -2815,7 +2950,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             return self.p
 
         if self.mode == "exact":
-            self._run_exact(
+            self._timed_call(
+                "exact.replay",
+                self._run_exact,
                 G_seq,
                 where_seq,
                 progbar=progbar,
@@ -2904,7 +3041,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
     # ------------------------------------------------------------------ #
     # Control events (measure / cap / reset)
     # ------------------------------------------------------------------ #
-    def _apply_control_event(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    def _apply_control_event(self, *args, **kwargs):
+        """Apply one control event, optionally recording its stage time."""
+        if self._timing_state is None:
+            return self._apply_control_event_impl(*args, **kwargs)
+        name = args[0] if args else kwargs.get("name", "unknown")
+        return self._timed_call(
+            f"control.{name}",
+            self._apply_control_event_impl,
+            *args,
+            **kwargs,
+        )
+
+    def _apply_control_event_impl(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         name,
         payload,
@@ -3570,6 +3719,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         step,
         where,
     ):
+        """Record compression infidelity and optionally time its calculation."""
+        if self._timing_state is None:
+            return self._append_compression_infidelity_sample_impl(
+                approx_norm,
+                target_norm,
+                step=step,
+                where=where,
+            )
+        return self._timed_call(
+            "infidelity.compute",
+            self._append_compression_infidelity_sample_impl,
+            approx_norm,
+            target_norm,
+            step=step,
+            where=where,
+        )
+
+    def _append_compression_infidelity_sample_impl(
+        self,
+        approx_norm,
+        target_norm,
+        *,
+        step,
+        where,
+    ):
         """Append the canonical norm-ratio infidelity for one compression.
 
         In mixed canonical form the center tensor contains the complete norm
@@ -3980,6 +4154,24 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         )
 
     def _normalize_canonical_center(self, p, where, *, step, reason):
+        """Normalize a center and optionally accumulate normalization time."""
+        if self._timing_state is None:
+            return self._normalize_canonical_center_impl(
+                p,
+                where,
+                step=step,
+                reason=reason,
+            )
+        return self._timed_call(
+            "normalization",
+            self._normalize_canonical_center_impl,
+            p,
+            where,
+            step=step,
+            reason=reason,
+        )
+
+    def _normalize_canonical_center_impl(self, p, where, *, step, reason):
         """Normalize one canonical center and preserve its scale in exponent.
 
         The canonical center is the right edge of ``where``. Canonicalizing
@@ -4149,8 +4341,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             submpo_method=submpo_method,
         )
         self._renumber_mix_infidelity_samples(sample_start, step)
-        if not self._mps_data_is_finite(self.p):
-            raise FloatingPointError("MPO step produced non-finite MPS tensor data.")
 
     def _run_mix_mpo_batch(
         self,
@@ -4225,7 +4415,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_min_iter=fit_min_iter,
             fit_rtol=fit_rtol,
             fit_patience=fit_patience,
-            fit_finite_check=self._mps_data_is_finite,
+            fit_finite_check=True,
         )
         self._renumber_mix_infidelity_samples(sample_start, step)
         if not self._mps_data_is_finite(self.p):
@@ -4259,7 +4449,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             fit_min_iter=fit_min_iter,
             fit_rtol=fit_rtol,
             fit_patience=fit_patience,
-            fit_finite_check=self._mps_data_is_finite,
+            fit_finite_check=True,
         )
         # FIT produces one compression sample for the whole batch. It is
         # therefore associated with the final gate in the batch.
@@ -4380,6 +4570,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             )
         return value
 
+    @staticmethod
+    def _mix_error_is_nonfinite(exc):
+        """Return whether an exception reports NaN or infinite numerics."""
+        if isinstance(exc, FloatingPointError):
+            return True
+        if "linalg" in type(exc).__name__.casefold():
+            return True
+        message = str(exc).casefold()
+        return any(
+            marker in message
+            for marker in ("nan", "infs", "non-finite", "nonfinite", "infinite")
+        )
+
     def _mix_target_bond_dimensions(self):
         """Return each bond's ``chi``-capped physical rank ceiling."""
         L = int(getattr(self.p, "L", 0))
@@ -4441,6 +4644,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         submpo_method="direct",
     ):
         """Apply a unitary stream with MPO warmup then DMRG at target bond."""
+        mix_started = time.perf_counter()
         if any(event_type == "submpo" for event_type in event_seq):
             raise ValueError("mode='mix' currently supports gate streams only.")
 
@@ -4490,6 +4694,19 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 pbar.set_postfix(postfix)
                 pbar.update(len(entries))
 
+        mpo_state_needs_check = False
+
+        def check_pending_mpo_state():
+            """Validate one completed contiguous MPO warm-up block."""
+            nonlocal mpo_state_needs_check
+            if not mpo_state_needs_check:
+                return
+            if not self._mps_data_is_finite(self.p):
+                raise FloatingPointError(
+                    "MPO warm-up produced non-finite MPS tensor data."
+                )
+            mpo_state_needs_check = False
+
         idx = 0
         try:
             while idx < len(G_seq):
@@ -4522,6 +4739,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         submpo_method=submpo_method,
                     )
                     mpo_steps += 1
+                    mpo_state_needs_check = True
                     if len(where) == 1:
                         reason = "one_site_exact"
                     elif self._mix_dmrg_disabled_reason is not None:
@@ -4549,6 +4767,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     idx += 1
                     continue
 
+                check_pending_mpo_state()
                 batch_G, batch_where, next_idx = self._collect_mix_dmrg_batch(
                     G_seq,
                     where_seq,
@@ -4604,12 +4823,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     fit_diagnostics = deepcopy(
                         self._last_dmrg_fit_diagnostics or {}
                     )
-                    if sticky_nonfinite and isinstance(exc, FloatingPointError):
+                    if sticky_nonfinite and self._mix_error_is_nonfinite(exc):
                         self._mix_dmrg_disabled_reason = (
                             f"{type(exc).__name__}: {exc}"
                         )
                         self._mix_dmrg_failed_sweep = getattr(
-                            exc, "fit_iteration", None
+                            exc,
+                            "fit_iteration",
+                            fit_diagnostics.get("iterations") or None,
                         )
                     fallback_trial = self._install_represented_norm(
                         committed_p.copy(deep=True)
@@ -4627,6 +4848,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             submpo_method=submpo_method,
                         )
                         self._commit_mix_trial(committed_p, self.p)
+                        mpo_state_needs_check = False
                     except BaseException:
                         self._restore_mix_state(snapshot)
                         raise
@@ -4703,11 +4925,13 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     )
                 append_entries(entries)
                 idx = next_idx
+            check_pending_mpo_state()
         finally:
             if pbar is not None:
                 pbar.close()
 
         self.last_mix_summary = {
+            "elapsed_seconds": float(time.perf_counter() - mix_started),
             "mpo_steps": int(mpo_steps),
             "dmrg_steps": int(dmrg_steps),
             "fallback_steps": int(fallback_steps),
@@ -4718,6 +4942,12 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             "dmrg_disabled_reason": self._mix_dmrg_disabled_reason,
             "failed_sweep": self._mix_dmrg_failed_sweep,
         }
+
+    def _run_fit_gate(self, fit, **kwargs):
+        """Run one FIT sweep sequence and optionally accumulate its time."""
+        if self._timing_state is None:
+            return fit.run_gate(**kwargs)
+        return self._timed_call("dmrg.fit", fit.run_gate, **kwargs)
 
     def _run_dmrg(
         self,
@@ -4805,20 +5035,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff,
                         cutoff_mode,
                     )
-                    if (
-                        fit_finite_check is not None
-                        and not fit_finite_check(p_g)
-                    ):
-                        self._last_dmrg_fit_diagnostics = {
-                            "iterations": 0,
-                            "converged": False,
-                            "relative_change": None,
-                        }
-                        error = FloatingPointError(
-                            "DMRG gate target contains non-finite tensor data."
-                        )
-                        error.fit_iteration = 0
-                        raise error
                     if self.track_infidelity and not track_unitary_norm:
                         target_norm = self._raw_state_norm(p_g)
                     fit = FIT(
@@ -4831,7 +5047,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         inplace=False,
                     )
                     try:
-                        fit.run_gate(
+                        self._run_fit_gate(
+                            fit,
                             n_iter=n_iter,
                             verbose=False,
                             min_iter=fit_min_iter,
@@ -4882,20 +5099,6 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     self.canonize_mps(p, (xmin, xmax))
                     target_norm = None
                     p_g = self._build_dmrg_batch_target(p, batch_G, batch_where, cutoff, cutoff_mode)
-                    if (
-                        fit_finite_check is not None
-                        and not fit_finite_check(p_g)
-                    ):
-                        self._last_dmrg_fit_diagnostics = {
-                            "iterations": 0,
-                            "converged": False,
-                            "relative_change": None,
-                        }
-                        error = FloatingPointError(
-                            "DMRG batch target contains non-finite tensor data."
-                        )
-                        error.fit_iteration = 0
-                        raise error
                     if self.track_infidelity and not track_unitary_norm:
                         target_norm = self._raw_state_norm(p_g)
                     fit = FIT(
@@ -4907,7 +5110,8 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         range_int=[xmin, xmax],
                     )
                     try:
-                        fit.run_gate(
+                        self._run_fit_gate(
+                            fit,
                             n_iter=n_iter,
                             verbose=False,
                             min_iter=fit_min_iter,
@@ -5699,6 +5903,18 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self.p = self._install_represented_norm(p)
 
     def canonize_mps(self, p, where, *, info=None):
+        """Update canonical form and optionally accumulate its wall time."""
+        if self._timing_state is None:
+            return self._canonize_mps_impl(p, where, info=info)
+        return self._timed_call(
+            "canonicalize",
+            self._canonize_mps_impl,
+            p,
+            where,
+            info=info,
+        )
+
+    def _canonize_mps_impl(self, p, where, *, info=None):
         """Update canonical form around a one- or two-site gate span.
 
         ``where`` may be an int, a 1-tuple ``(site,)``, or a 2-tuple

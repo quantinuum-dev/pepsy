@@ -211,6 +211,21 @@ probs = sampler.probabilities(configs, to_numpy=False)
 
 Both methods evaluate the whole batch in one backend-native sweep.
 
+For binary dense-native MPSs, local-energy estimators can evaluate all
+single-site-flip ratios without constructing a separate full MPS amplitude
+sweep for every flip:
+
+```python
+ratios = sampler.single_site_flip_amplitude_ratios(
+    configs,
+    to_numpy=False,
+)  # shape: (n_configs, n_sites)
+```
+
+The method uses bounded prefix/suffix workspaces and supports native NumPy,
+Torch, and CuPy samplers. Symmray and legacy Quimb samplers should retain the
+explicit connected-configuration path through `amplitudes(...)`.
+
 ### Fermionic diagonal observables
 
 `MpsSampler` can estimate diagonal observables of a

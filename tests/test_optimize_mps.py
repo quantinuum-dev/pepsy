@@ -480,6 +480,47 @@ def test_mps_optimizer_svd_smoke():
     assert opt.p.max_bond() <= 8
 
 
+def test_mps_optimizer_opt_in_run_timing_reports_replay_metrics():
+    """Timing is opt-in and returns a copy-safe replay record."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("00", dtype="complex128"),
+        gates=[(qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="mpo",
+    )
+
+    assert opt.get_run_timing() is None
+    opt.run(progbar=False, timing=True)
+
+    timing = opt.get_run_timing()
+    assert timing["status"] == "complete"
+    assert timing["mode"] == "mpo"
+    assert timing["event_count"] == 1
+    assert timing["elapsed_seconds"] >= 0.0
+    assert timing["final_bond"] <= 2
+    assert timing["stages"]["mpo.replay"]["calls"] == 1
+    assert timing["stages"]["canonicalize"]["calls"] >= 1
+    assert timing["stages"]["infidelity.compute"]["calls"] >= 1
+    timing["mode"] = "changed"
+    assert opt.last_run_timing["mode"] == "mpo"
+
+
+def test_mps_optimizer_mix_timing_includes_mix_summary():
+    """Mixed timing records expose the existing backend decision summary."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[(qu.hadamard(), (0,)), (qu.CNOT(), (0, 1))],
+        chi=2,
+        mode="mix",
+    )
+
+    opt.run(progbar=False, timing=True)
+
+    timing = opt.get_run_timing()
+    assert timing["mix_summary"] == opt.last_mix_summary
+    assert timing["mix_summary"]["elapsed_seconds"] >= 0.0
+
+
 def test_mps_optimizer_mix_warms_up_with_mpo_then_uses_dmrg():
     """Mix mode should use MPO until the active bonds reach their targets."""
     p0 = qtn.MPS_computational_state("000", dtype="complex128")
@@ -666,6 +707,90 @@ def test_mps_optimizer_finite_check_combines_backend_scalars_once(monkeypatch):
     assert len(conversions) == 1
 
 
+def test_fit_gate_cheap_finite_check_transfers_one_vector_per_sweep(monkeypatch):
+    """Cheap FIT health checks should transfer one tiny vector per sweep."""
+    state = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=2, dtype="complex128", seed=201
+    )
+    fit = py.FIT(state.copy(), p=state, range_int=[0, 2])
+    original_to_numpy = mps_optimizer_module.ar.to_numpy
+    conversions = []
+
+    def counted_to_numpy(value):
+        conversions.append(value)
+        return original_to_numpy(value)
+
+    monkeypatch.setattr(mps_optimizer_module.ar, "to_numpy", counted_to_numpy)
+
+    fit.run_gate(n_iter=3, finite_check=True)
+
+    assert fit.iterations_run == 3
+    assert len(conversions) == 3
+    assert all(np.asarray(original_to_numpy(value)).size == 3 for value in conversions)
+
+
+def test_mps_optimizer_mix_full_checks_once_after_dmrg(monkeypatch):
+    """Successful mixed FIT sweeps should share one full pre-commit check."""
+    original_check = py.MpsOptimizer._mps_data_is_finite
+    checks = 0
+
+    def counted_check(candidate):
+        nonlocal checks
+        checks += 1
+        return original_check(candidate)
+
+    monkeypatch.setattr(
+        py.MpsOptimizer,
+        "_mps_data_is_finite",
+        staticmethod(counted_check),
+    )
+    opt = py.MpsOptimizer(
+        qtn.MPS_rand_state(
+            3, bond_dim=2, phys_dim=2, dtype="complex128", seed=202
+        ),
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="mix",
+    )
+
+    opt.run(progbar=False, n_iter=3, mix_fit_rtol=None)
+
+    assert opt.mix_history[0]["backend"] == "dmrg"
+    assert checks == 1
+
+
+def test_mps_optimizer_mix_full_checks_once_per_mpo_warmup(monkeypatch):
+    """Consecutive MPO warm-up gates should share one final full-state check."""
+    original_check = py.MpsOptimizer._mps_data_is_finite
+    checks = 0
+
+    def counted_check(candidate):
+        nonlocal checks
+        checks += 1
+        return original_check(candidate)
+
+    monkeypatch.setattr(
+        py.MpsOptimizer,
+        "_mps_data_is_finite",
+        staticmethod(counted_check),
+    )
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000", dtype="complex128"),
+        gates=[
+            (qu.hadamard(), (0,)),
+            (qu.CNOT(), (0, 1)),
+            (qu.CNOT(), (1, 2)),
+        ],
+        chi=2,
+        mode="mix",
+    )
+
+    opt.run(progbar=False)
+
+    assert [entry["backend"] for entry in opt.mix_history] == ["mpo"] * 3
+    assert checks == 1
+
+
 def test_mps_optimizer_mix_stops_fit_adaptively():
     """Mixed n_iter is a maximum when the FIT norm has converged."""
     state = qtn.MPS_rand_state(
@@ -693,6 +818,29 @@ def test_mps_optimizer_mix_stops_fit_adaptively():
     assert event["fit_relative_change"] <= 1e9
 
 
+def test_mps_optimizer_dmrg_stops_fit_adaptively():
+    """Ordinary DMRG should use the same adaptive FIT stopping controls."""
+    state = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=2, dtype="complex128", seed=212
+    )
+    opt = py.MpsOptimizer(
+        state,
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    opt.run(
+        progbar=False,
+        n_iter=8,
+        mix_fit_min_iter=2,
+        mix_fit_rtol=1e9,
+        mix_fit_patience=1,
+    )
+
+    assert opt._last_dmrg_fit_diagnostics["iterations"] == 2
+
+
 def test_mps_optimizer_mix_can_keep_fixed_fit_iterations():
     """Disabling mixed FIT tolerance should preserve exact n_iter behavior."""
     state = qtn.MPS_rand_state(
@@ -718,22 +866,18 @@ def test_mps_optimizer_mix_nonfinite_sweep_disables_later_dmrg(monkeypatch):
     state = qtn.MPS_rand_state(
         3, bond_dim=2, phys_dim=2, dtype="complex128", seed=22
     )
-    original_check = py.MpsOptimizer._mps_data_is_finite
-    checks = 0
-
-    def staged_check(candidate):
-        nonlocal checks
-        checks += 1
-        # First call checks the DMRG target. The second is the first completed
-        # FIT sweep, where a backend non-finite reduction is simulated.
-        if checks == 2:
-            return False
-        return original_check(candidate)
+    def failed_fit_sweep(self, *_args, **_kwargs):
+        self.iterations_run = 1
+        self.converged = False
+        self.last_relative_change = None
+        raise np.linalg.LinAlgError(
+            "Array must not contain infs or NaNs."
+        )
 
     monkeypatch.setattr(
-        py.MpsOptimizer,
-        "_mps_data_is_finite",
-        staticmethod(staged_check),
+        mps_optimizer_module.FIT,
+        "run_gate",
+        failed_fit_sweep,
     )
     opt = py.MpsOptimizer(
         state,

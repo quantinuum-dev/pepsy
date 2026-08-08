@@ -11,6 +11,7 @@ from numbers import Integral
 from typing import Any, Dict, List, Optional, Sequence
 
 import autoray as ar
+import numpy as np
 import quimb.tensor as qtn
 
 from ..tensors.core import tn_fidelity
@@ -498,8 +499,9 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         default, exactly ``n_iter`` sweeps are performed. Supplying ``rtol``
         enables early stopping after ``min_iter`` sweeps once the final local
         norm changes by at most ``rtol`` for ``patience`` consecutive sweeps.
-        ``finite_check``, when supplied, is called once after every sweep and
-        must return whether the fitted state is numerically healthy.
+        ``finite_check=True`` checks only the already-computed per-site norm
+        scalars, transferring one tiny vector per sweep. A callable retains
+        the general state-check callback behavior.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
@@ -518,8 +520,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if not isinstance(patience, Integral) or int(patience) < 1:
             raise ValueError("patience must be a positive integer.")
         patience = int(patience)
-        if finite_check is not None and not callable(finite_check):
-            raise TypeError("finite_check must be callable or None.")
+        if finite_check not in (None, False, True) and not callable(finite_check):
+            raise TypeError("finite_check must be bool, callable, or None.")
 
         self.sweep_norm_trace = []
         self.iterations_run = 0
@@ -551,6 +553,8 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         previous_sweep_norm = None
         stable_sweeps = 0
         for sweep in range(1, n_iter + 1):
+            self.iterations_run = sweep
+            sweep_norm_start = len(self.local_norm_trace)
             for i in range(stop, start, -1):
                 psi.right_canonize_site(i, bra=None)
 
@@ -639,16 +643,34 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 fidelity = tn_fidelity(self.tn, psi)
                 self.fidelity_trace.append(ar.do("real", fidelity))
 
-            self.iterations_run = sweep
-            if finite_check is not None and not bool(finite_check(psi)):
+            if callable(finite_check) and not bool(finite_check(psi)):
                 error = FloatingPointError(
                     f"FIT gate sweep {sweep} produced non-finite tensor data."
                 )
                 error.fit_iteration = sweep
                 raise error
 
+            if finite_check is True or rtol is not None:
+                sweep_scalars = self.local_norm_trace[sweep_norm_start:]
+                try:
+                    sweep_norms = np.asarray(
+                        ar.to_numpy(ar.do("stack", sweep_scalars))
+                    ).reshape(-1)
+                except Exception:
+                    # Compatibility fallback for a backend without scalar
+                    # stack support. NumPy, Torch, and CuPy use the fast path.
+                    sweep_norms = np.asarray(
+                        [float(ar.to_numpy(value)) for value in sweep_scalars]
+                    )
+                if finite_check is True and not bool(np.all(np.isfinite(sweep_norms))):
+                    error = FloatingPointError(
+                        f"FIT gate sweep {sweep} produced a non-finite local norm."
+                    )
+                    error.fit_iteration = sweep
+                    raise error
+
             if rtol is not None:
-                sweep_norm = float(ar.to_numpy(self.local_norm_trace[-1]))
+                sweep_norm = float(sweep_norms[-1])
                 self.sweep_norm_trace.append(sweep_norm)
                 if not math.isfinite(sweep_norm):
                     error = FloatingPointError(

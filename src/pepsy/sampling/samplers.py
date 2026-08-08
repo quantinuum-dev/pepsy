@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from numbers import Integral
 from typing import Any, Iterable
 import warnings
 
@@ -3038,6 +3039,217 @@ class MpsSampler:
                 L=self._L,
             )
         return self._to_numpy_backend_array(out, backend) if to_numpy else out
+
+    def single_site_flip_amplitude_ratios(
+        self,
+        configs,
+        *,
+        to_numpy: bool = True,
+        block_size: int = 16,
+    ):
+        """Return ``psi(x with site flipped) / psi(x)`` for binary MPSs.
+
+        This dense-native helper is intended for local-energy estimators. It
+        evaluates all one-site flips with prefix/suffix contractions instead
+        of making one complete MPS amplitude sweep per flipped configuration.
+        The returned array has shape ``(batch, L)``. Native NumPy, Torch, and
+        CuPy MPSs are supported; Symmray and legacy Quimb samplers should use
+        :meth:`amplitudes` on explicitly connected configurations instead.
+
+        ``block_size`` limits the prefix workspace retained while forming the
+        ratios. Smaller values reduce peak memory at the cost of a little more
+        backend work.
+        """
+        if not isinstance(block_size, Integral) or int(block_size) < 1:
+            raise ValueError("block_size must be a positive integer.")
+        if self._symmray_state is not None or self._native_arrays is None:
+            raise NotImplementedError(
+                "single-site flip ratios require a dense native MPS sampler."
+            )
+
+        backend, _site_data = self._get_native_amplitude_site_ops(
+            track_grad=False
+        )
+        arrays = self._native_arrays
+        L = len(arrays)
+        if any(int(array.shape[1]) != 2 for array in arrays):
+            raise NotImplementedError(
+                "single-site flip ratios require binary physical dimensions."
+            )
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            with torch.no_grad():
+                ratios = self._single_site_flip_ratios_native(
+                    arrays,
+                    configs,
+                    backend=backend,
+                    block_size=int(block_size),
+                    L=L,
+                )
+        else:
+            ratios = self._single_site_flip_ratios_native(
+                arrays,
+                configs,
+                backend=backend,
+                block_size=int(block_size),
+                L=L,
+            )
+        return self._to_numpy_backend_array(ratios, backend) if to_numpy else ratios
+
+    @staticmethod
+    def _single_site_flip_ratios_native(
+        arrays,
+        configs,
+        *,
+        backend,
+        block_size,
+        L,
+    ):
+        """Form dense-native single-site flip ratios with bounded workspace."""
+        if backend == "torch":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            device = arrays[0].device
+            dtype = arrays[0].dtype
+            configs = MpsSampler._torch_configs(configs, device=device, L=L)
+            xp = torch
+        else:
+            xp = np
+            if backend == "cupy":
+                import cupy as xp  # pylint: disable=import-outside-toplevel,reimported
+
+            configs = MpsSampler._array_namespace_configs(
+                configs,
+                backend=backend,
+                L=L,
+            )
+            dtype = arrays[0].dtype
+
+        invalid = (configs < 0) | (configs > 1)
+        if backend == "torch":
+            invalid = bool(invalid.any().item())
+        elif backend == "cupy":
+            invalid = bool(invalid.any().get())
+        else:
+            invalid = bool(invalid.any())
+        if invalid:
+            raise ValueError("configs contain non-binary physical indices.")
+
+        n_samples = int(configs.shape[0])
+        block_size = min(int(block_size), L)
+        block_starts = tuple(range(0, L, block_size))
+
+        def contract_left(left, choices, array):
+            mask_zero = choices == 0
+            mask_one = ~mask_zero
+            output = xp.empty(
+                (n_samples, int(array.shape[2])),
+                dtype=dtype,
+            )
+            if backend == "torch":
+                output[mask_zero] = left[mask_zero] @ array[:, 0, :]
+                output[mask_one] = left[mask_one] @ array[:, 1, :]
+            else:
+                output[mask_zero] = xp.einsum(
+                    "nl,lr->nr", left[mask_zero], array[:, 0, :]
+                )
+                output[mask_one] = xp.einsum(
+                    "nl,lr->nr", left[mask_one], array[:, 1, :]
+                )
+            return output
+
+        def contract_right(choices, array, right):
+            mask_zero = choices == 0
+            mask_one = ~mask_zero
+            output = xp.empty(
+                (n_samples, int(array.shape[0])),
+                dtype=dtype,
+            )
+            if backend == "torch":
+                output[mask_zero] = right[mask_zero] @ array[:, 0, :].transpose(0, 1)
+                output[mask_one] = right[mask_one] @ array[:, 1, :].transpose(0, 1)
+            else:
+                output[mask_zero] = xp.einsum(
+                    "lr,nr->nl", array[:, 0, :], right[mask_zero]
+                )
+                output[mask_one] = xp.einsum(
+                    "lr,nr->nl", array[:, 1, :], right[mask_one]
+                )
+            return output
+
+        def contract_site(left, array, choices, right):
+            if backend == "torch":
+                values = contract_left(left, choices, array)
+                return (values * right).sum(dim=1)
+            values = contract_left(left, choices, array)
+            return xp.sum(values * right, axis=1)
+
+        def ones(width):
+            if backend == "torch":
+                return xp.ones((n_samples, width), dtype=dtype, device=configs.device)
+            return xp.ones((n_samples, width), dtype=dtype)
+
+        # The parent amplitude is shared by every local ratio and is therefore
+        # evaluated once, independently of the block workspace below.
+        prefix = ones(1)
+        for site in range(L):
+            choices = configs[:, site]
+            prefix = contract_left(
+                prefix,
+                choices,
+                arrays[site],
+            )
+        parent = prefix[:, 0]
+
+        # Save only suffixes at block boundaries. Prefixes inside one block
+        # are retained briefly, keeping peak workspace independent of L.
+        suffix_boundaries = {L: ones(1)}
+        suffix = suffix_boundaries[L]
+        block_start_set = set(block_starts[1:])
+        for site in range(L - 1, -1, -1):
+            choices = configs[:, site]
+            suffix = contract_right(
+                choices,
+                arrays[site],
+                suffix,
+            )
+            if site in block_start_set:
+                suffix_boundaries[site] = suffix
+
+        prefix = ones(1)
+        ratios = xp.empty((n_samples, L), dtype=dtype)
+        for start in block_starts:
+            stop = min(start + block_size, L)
+            block_prefixes = [prefix]
+            for site in range(start, stop):
+                choices = configs[:, site]
+                prefix = contract_left(
+                    prefix,
+                    choices,
+                    arrays[site],
+                )
+                block_prefixes.append(prefix)
+
+            suffix = suffix_boundaries[stop]
+            for offset in range(stop - start - 1, -1, -1):
+                site = start + offset
+                choices = configs[:, site]
+                flipped = 1 - choices
+                numerator = contract_site(
+                    block_prefixes[offset],
+                    arrays[site],
+                    flipped,
+                    suffix,
+                )
+                ratios[:, site] = numerator / parent
+                suffix = contract_right(
+                    choices,
+                    arrays[site],
+                    suffix,
+                )
+
+        return ratios
 
     def probabilities(self, configs, *, to_numpy: bool = True):
         """Return normalized Born probabilities for batched ``configs``.

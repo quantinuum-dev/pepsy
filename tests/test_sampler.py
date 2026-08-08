@@ -275,6 +275,46 @@ def test_mps_sampler_native_site_ops_are_reused(monkeypatch):
     assert calls == ["numpy"]
 
 
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_mps_sampler_single_site_flip_ratios_match_amplitudes(backend):
+    """All binary single-site ratios should match explicit amplitudes."""
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+    else:
+        torch = None
+
+    psi = qtn.MPS_rand_state(5, bond_dim=3, phys_dim=2, dtype="complex128", seed=8)
+    if torch is not None:
+        psi.apply_to_arrays(
+            pepsy.backend_torch(dtype=torch.complex128, device="cpu")
+        )
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+    configs = np.asarray(
+        [[0, 0, 0, 0, 0], [0, 1, 1, 0, 1], [1, 0, 1, 1, 0]],
+        dtype=np.int64,
+    )
+
+    fast = sampler.single_site_flip_amplitude_ratios(
+        configs,
+        to_numpy=True,
+        block_size=2,
+    )
+    flipped = np.repeat(configs[:, None, :], configs.shape[1], axis=1)
+    flipped ^= np.eye(configs.shape[1], dtype=np.int64)[None, :, :]
+    all_configs = np.concatenate(
+        (configs, flipped.reshape(-1, configs.shape[1])),
+        axis=0,
+    )
+    amplitudes = np.asarray(sampler.amplitudes(all_configs, to_numpy=True))
+    expected = (
+        amplitudes[configs.shape[0] :]
+        .reshape(configs.shape[0], configs.shape[1])
+        / amplitudes[: configs.shape[0], None]
+    )
+
+    np.testing.assert_allclose(fast, expected, rtol=1e-11, atol=1e-11)
+
+
 def test_mps_sampler_refresh_rebuilds_cached_native_state():
     """Refreshing should pick up replacement MPS tensors after caching."""
     psi = qtn.MPS_computational_state("00")
