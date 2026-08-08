@@ -31,6 +31,7 @@ router, not a replacement for the domain skills below.
 - Tree stabilizer simulation → [`tree-stabilizer-optimizer`](../tree-stabilizer-optimizer/SKILL.md)
 - Symmetry-conserving DMRG2 → [`symdmrg2`](../symdmrg2/SKILL.md)
 - Belief propagation or loop/PNE methods → [`belief-propagation`](../belief-propagation/SKILL.md)
+- Direct PEPS sampling, conditioned boundary MPS, or PEPS proposal batching → [`peps-sampler`](../peps-sampler/SKILL.md)
 - Torch/NetKet/JAX variational Monte Carlo → [`pepsy-vmc`](../pepsy-vmc/SKILL.md)
 - Fermion operators, Symmray charges, or fermionic gates → [`pepsy-fermion-operators`](../pepsy-fermion-operators/SKILL.md)
 - qMERA energy optimization → [`qmera-energy-optimizer`](../qmera-energy-optimizer/SKILL.md)

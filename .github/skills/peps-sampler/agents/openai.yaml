@@ -1,0 +1,4 @@
+interface:
+  display_name: "PEPS Sampler"
+  short_description: "Design and implement direct PEPS sampling"
+  default_prompt: "Use $peps-sampler to implement or review direct PEPS sampling in Pepsy."

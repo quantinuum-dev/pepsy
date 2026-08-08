@@ -25,6 +25,7 @@ catalog or skill-package change.
 ## Domain workflows
 
 - [Belief propagation](belief-propagation/SKILL.md)
+- [Direct PEPS sampling](peps-sampler/SKILL.md)
 - [Fermion operators](pepsy-fermion-operators/SKILL.md)
 - [Variational Monte Carlo](pepsy-vmc/SKILL.md)
 - [Stabilizer tensor networks](stabilizer-tensor-networks/SKILL.md)

@@ -52,6 +52,10 @@ skills:
     path: .github/skills/belief-propagation
     role: domain
     upload: [SKILL.md]
+  - name: peps-sampler
+    path: .github/skills/peps-sampler
+    role: domain
+    upload: [SKILL.md, references/**]
   - name: pepsy-vmc
     path: .github/skills/pepsy-vmc
     role: domain
