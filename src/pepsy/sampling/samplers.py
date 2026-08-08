@@ -3143,10 +3143,17 @@ class MpsSampler:
         def contract_left(left, choices, array):
             mask_zero = choices == 0
             mask_one = ~mask_zero
-            output = xp.empty(
-                (n_samples, int(array.shape[2])),
-                dtype=dtype,
-            )
+            if backend == "torch":
+                output = xp.empty(
+                    (n_samples, int(array.shape[2])),
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                output = xp.empty(
+                    (n_samples, int(array.shape[2])),
+                    dtype=dtype,
+                )
             if backend == "torch":
                 output[mask_zero] = left[mask_zero] @ array[:, 0, :]
                 output[mask_one] = left[mask_one] @ array[:, 1, :]
@@ -3162,10 +3169,17 @@ class MpsSampler:
         def contract_right(choices, array, right):
             mask_zero = choices == 0
             mask_one = ~mask_zero
-            output = xp.empty(
-                (n_samples, int(array.shape[0])),
-                dtype=dtype,
-            )
+            if backend == "torch":
+                output = xp.empty(
+                    (n_samples, int(array.shape[0])),
+                    dtype=dtype,
+                    device=device,
+                )
+            else:
+                output = xp.empty(
+                    (n_samples, int(array.shape[0])),
+                    dtype=dtype,
+                )
             if backend == "torch":
                 output[mask_zero] = right[mask_zero] @ array[:, 0, :].transpose(0, 1)
                 output[mask_one] = right[mask_one] @ array[:, 1, :].transpose(0, 1)
@@ -3218,7 +3232,10 @@ class MpsSampler:
                 suffix_boundaries[site] = suffix
 
         prefix = ones(1)
-        ratios = xp.empty((n_samples, L), dtype=dtype)
+        if backend == "torch":
+            ratios = xp.empty((n_samples, L), dtype=dtype, device=device)
+        else:
+            ratios = xp.empty((n_samples, L), dtype=dtype)
         for start in block_starts:
             stop = min(start + block_size, L)
             block_prefixes = [prefix]

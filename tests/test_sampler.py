@@ -315,6 +315,33 @@ def test_mps_sampler_single_site_flip_ratios_match_amplitudes(backend):
     np.testing.assert_allclose(fast, expected, rtol=1e-11, atol=1e-11)
 
 
+def test_mps_sampler_single_site_flip_ratios_keep_torch_device():
+    """Torch flip-ratio workspaces must stay on the MPS device."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    psi = qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128", seed=9)
+    psi.apply_to_arrays(
+        pepsy.backend_torch(dtype=torch.complex128, device="cuda")
+    )
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+    configs = torch.tensor(
+        [[0, 0, 0, 0], [0, 1, 1, 0]],
+        dtype=torch.long,
+        device="cuda",
+    )
+
+    ratios = sampler.single_site_flip_amplitude_ratios(
+        configs,
+        to_numpy=False,
+        block_size=2,
+    )
+
+    assert ratios.device.type == "cuda"
+    assert torch.isfinite(ratios).all().item()
+
+
 def test_mps_sampler_refresh_rebuilds_cached_native_state():
     """Refreshing should pick up replacement MPS tensors after caching."""
     psi = qtn.MPS_computational_state("00")
