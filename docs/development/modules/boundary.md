@@ -33,6 +33,22 @@ bra indices are reindexed with an `_*` suffix.
 `CompBdy` updates those environments with `move_bdy(...)` or
 `move_step_bdy(...)`, then contracts a final boundary network in `run(...)`.
 
+The local boundary solver is selected with `fit_mode`:
+
+- `"eff"` is the compatibility default and performs cached one-site sweeps.
+- `"two-site"` forms neighboring boundary wavefunctions, splits them with a
+  backend-native SVD, and can discover bond subspaces up to `fit_max_bond`.
+- `"global"` uses the reference global FIT solve.
+
+Two-site sweeps do not rebuild a complete environment for every pair. One
+side is cached once per sweep and the moving side is updated incrementally, so
+environment construction remains linear in boundary length. PEPS helpers pass
+the requested `chi` as the default two-site bond cap; direct `CompBdy` users
+should set `fit_max_bond` when they want a lower-rank boundary to grow. New
+two-site boundaries start at bond 1 and grow through these local splits.
+Reusing a boundary at a larger `chi` does not globally pad it first; lowering
+`chi` still compresses existing bonds immediately.
+
 ## Public helpers
 
 - `contract_boundary(...)`: contracts a prebuilt double-layer network with a

@@ -2,9 +2,11 @@
 
 import numpy as np
 import pytest
+import quimb.tensor as qtn
 
 from pepsy.backends import TorchLinalgConfig
 import pepsy.optimizers.peps.optimizer as peps_mod
+import pepsy.optimizers.sweep.optimizer as sweep_mod
 from pepsy.optimizers.peps import PepsOptimizer
 
 
@@ -122,6 +124,199 @@ def _install_fake_normalize(monkeypatch):
 
     monkeypatch.setattr(peps_mod, "boundary_normalize", _fake_normalize)
     return calls
+
+
+def test_peps_optimizer_routes_two_site_boundary_policy(monkeypatch):
+    """Boundary kwargs should configure normalization and inner PEPS sweeps."""
+    calls = _install_fake_normalize(monkeypatch)
+    infidelity_calls = []
+
+    def _fake_infidelity(_state, _target, **kwargs):
+        infidelity_calls.append(dict(kwargs))
+        return {"infidelity": 0.0}
+
+    monkeypatch.setattr(peps_mod, "boundary_infidelity", _fake_infidelity)
+    policy = {
+        "fit_mode": "two-site",
+        "fit_max_bond": 7,
+        "fit_sweep_sequence": "RL",
+        "fit_cutoff_mode": "rsum2",
+        "fit_min_iter": 2,
+        "fit_rtol": 1.0e-8,
+        "fit_patience": 3,
+        "cutoff": 2.0e-10,
+    }
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [],
+        chi=3,
+        boundary_kwargs=policy,
+        normalize_initial=False,
+    )
+
+    opt.normalize()
+    opt.estimate_infidelity(DummyState(), DummyState())
+    init_kwargs, _, _ = opt._sweep_boundary_kwargs(progress=False)
+
+    for key, value in policy.items():
+        assert calls[-1][1][key] == value
+        assert infidelity_calls[-1][key] == value
+        assert init_kwargs[key] == value
+
+
+def test_sweep_optimizer_builds_two_site_cached_boundary_pair():
+    """PEPS sweep cleanup should construct both CompBdy objects consistently."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=5)
+    target = state.copy()
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=(3, 4),
+        fit_mode="two-site",
+        fit_sweep_sequence="LR",
+        fit_cutoff_mode="rel",
+        cutoff=2.0e-9,
+        fit_min_iter=2,
+        fit_rtol=3.0e-8,
+        fit_patience=4,
+        simplify=False,
+    )
+    assert max(mps.max_bond() for mps in sweep.bdy.mps_b.values()) == 1
+    assert max(mps.max_bond() for mps in sweep.bdy_overlap.mps_b.values()) == 1
+    norm_tn, overlap_tn = sweep._prepare_current_double_layers()
+
+    comp_norm, comp_overlap = sweep._make_comp_pair(norm_tn, overlap_tn)
+
+    assert comp_norm.fit_mode == comp_overlap.fit_mode == "two-site"
+    assert comp_norm.fit_max_bond == 3
+    assert comp_overlap.fit_max_bond == 4
+    for comp in (comp_norm, comp_overlap):
+        assert comp.fit_sweep_sequence == "LR"
+        assert comp.fit_cutoff == 2.0e-9
+        assert comp.fit_cutoff_mode == "rel"
+        assert comp.fit_min_iter == 2
+        assert comp.fit_rtol == 3.0e-8
+        assert comp.fit_patience == 4
+
+    sweep.set_chi((5, 6))
+    assert max(mps.max_bond() for mps in sweep.bdy.mps_b.values()) == 1
+    assert max(mps.max_bond() for mps in sweep.bdy_overlap.mps_b.values()) == 1
+    comp_norm, comp_overlap = sweep._make_comp_pair(norm_tn, overlap_tn)
+    assert comp_norm.fit_max_bond == 5
+    assert comp_overlap.fit_max_bond == 6
+
+
+def test_sweep_optimizer_two_site_boundary_move_grows_rank_locally():
+    """A real PEPS boundary move should grow rank from the product warm start."""
+    state = qtn.PEPS.rand(3, 3, bond_dim=2, dtype="complex128", seed=71)
+    target = qtn.PEPS.rand(3, 3, bond_dim=2, dtype="complex128", seed=73)
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=(4, 5),
+        fit_mode="two-site",
+        fit_sweep_sequence="RL",
+        simplify=False,
+    )
+
+    sweep._refresh_right_boundaries_once("y", env_n_iter=2)
+
+    assert 1 < sweep.bdy.chi <= 4
+    assert 1 < sweep.bdy_overlap.chi <= 5
+
+
+def test_sweep_optimizer_one_site_set_chi_can_lower_boundary_caps():
+    """One-site set_chi should treat a lower value as a target, not a no-op."""
+    state = qtn.PEPS.rand(3, 3, bond_dim=2, dtype="complex128", seed=75)
+    target = state.copy()
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=5,
+        fit_mode="eff",
+        simplify=False,
+    )
+
+    sweep.set_chi(2)
+
+    assert sweep.chi == 2
+    assert sweep.bdy.chi <= 2
+    assert sweep.bdy_overlap.chi <= 2
+
+
+def test_sweep_optimizer_two_site_policy_survives_target_replacement():
+    """A new target chi should update only the stored overlap FIT cap."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=79)
+    target = state.copy()
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=(3, 4),
+        fit_mode="two_site",
+        simplify=False,
+    )
+    replacement = qtn.PEPS.rand(
+        2,
+        2,
+        bond_dim=2,
+        dtype="complex128",
+        seed=83,
+    )
+    replacement.mangle_inner_("_replacement")
+
+    returned = sweep.set_target(replacement, chi=7)
+    norm_tn, overlap_tn = sweep._prepare_current_double_layers()
+    comp_norm, comp_overlap = sweep._make_comp_pair(norm_tn, overlap_tn)
+
+    assert returned is sweep
+    assert sweep.fit_mode == "two-site"
+    assert sweep.chi == (3, 7)
+    assert sweep.bdy_overlap.chi == 1
+    assert comp_norm.fit_max_bond == 3
+    assert comp_overlap.fit_max_bond == 7
+
+
+def test_sweep_optimizer_infidelity_uses_requested_chi_and_none_override(
+    monkeypatch,
+):
+    """Warm rank must not become the cap, and None must disable inherited rtol."""
+    state = qtn.PEPS.rand(2, 2, bond_dim=2, dtype="complex128", seed=89)
+    target = state.copy()
+    target.mangle_inner_("_target")
+    sweep = peps_mod.SweepOptimizer(
+        state,
+        target,
+        chi=(4, 6),
+        fit_mode="two-site",
+        cutoff=2.0e-10,
+        fit_min_iter=2,
+        fit_rtol=3.0e-8,
+        fit_patience=4,
+        simplify=False,
+    )
+    calls = []
+
+    def fake_infidelity(_state, _target, **kwargs):
+        calls.append(dict(kwargs))
+        return {"infidelity": 0.0}
+
+    monkeypatch.setattr(sweep_mod, "boundary_infidelity", fake_infidelity)
+
+    sweep.infidelity()
+    sweep.infidelity(fit_min_iter=None, fit_rtol=None)
+
+    inherited, fixed_sweeps = calls
+    assert inherited["chi"] == fixed_sweeps["chi"] == 6
+    assert inherited["cutoff"] == fixed_sweeps["cutoff"] == 2.0e-10
+    assert inherited["fit_min_iter"] == 2
+    assert inherited["fit_rtol"] == 3.0e-8
+    assert inherited["fit_patience"] == 4
+    assert fixed_sweeps["fit_min_iter"] is None
+    assert fixed_sweeps["fit_rtol"] is None
 
 
 def test_peps_optimizer_within_chi_skips_infidelity_and_optimizer(monkeypatch):

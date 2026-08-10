@@ -13,5 +13,18 @@
 Torch-backed Symmray blocks use the Torch autograd local solver. NumPy-backed
 Symmray blocks retain the finite-difference fallback.
 
+For dense DMRG environments, `fit_mode="two-site"` starts new boundaries at
+bond 1 and lets native pair SVDs grow them to the requested `chi`. The
+optimizer stores requested chi separately from the current warm-state rank,
+so `normalize()`, `infidelity()`, and `set_target(...)` do not accidentally
+turn bond 1 into the future accuracy cap. A tuple `chi=(chi_norm, chi_overlap)`
+keeps the two caps independent during local sweeps.
+
+`SweepOptimizer.infidelity(...)` inherits constructor FIT controls when they
+are omitted. Passing `fit_rtol=None` explicitly disables adaptive stopping for
+that diagnostic; omitting `fit_rtol` inherits the constructor value. The same
+omitted-versus-explicit-`None` rule applies to other FIT controls for which
+`None` has an underlying solver meaning.
+
 
 > API details are maintained as handwritten Markdown in this page.

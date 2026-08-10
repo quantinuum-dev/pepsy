@@ -21,6 +21,35 @@ Use `PepsOptimizer.run(k_2q_batch=N)` to absorb up to `N` sequential two-site
 gates, plus intervening one-site gates, into one PEPS target before truncating
 to `chi` and optionally running the sweep/global cleanup.
 
+## Two-site boundary FIT
+
+Dense DMRG boundaries can opt into native-SVD two-site updates through
+`boundary_kwargs`:
+
+```python
+optimizer = pepsy.PepsOptimizer(
+    state,
+    gates,
+    chi=32,
+    boundary_chi=(64, 96),
+    boundary_engine="dmrg",
+    boundary_kwargs={
+        "fit_mode": "two-site",
+        "fit_sweep_sequence": "RL",
+        "fit_rtol": 1e-8,
+        "fit_min_iter": 2,
+        "fit_patience": 2,
+        "cutoff": 1e-12,
+    },
+)
+```
+
+For sweep cleanup, tuple `boundary_chi` values cap the norm and overlap
+boundaries independently. Normalization and diagnostic contractions receive
+the corresponding scalar `chi`. DMRG two-site boundaries start at bond 1 and
+grow through local SVDs instead of global padding. `fit_mode="eff"` remains
+the default while two-site accuracy and wall time are workload-dependent.
+
 ## One Torch SVD/QR policy
 
 Torch autodiff through PEPS cleanup uses both SVD and QR. Configure both with

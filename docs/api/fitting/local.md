@@ -4,8 +4,10 @@
 guess to a target tensor network. There are three sweep entry points:
 
 - `run()` is the simple full-contraction reference.
-- `run_eff()` is the cached full-chain solver used by boundary/sampling code.
-- `run_gate()` is the cached active-window solver used by MPS/MPO circuit FIT.
+- `run_eff()` is the cached one-site full-chain solver used by the default
+  boundary/sampling path.
+- `run_gate()` is the cached active-window solver used by MPS/MPO circuit FIT
+  and by `fit_mode="two-site"` boundary contraction over the full interval.
 
 For circuit compression, set `range_int=(xmin, xmax)` and use:
 

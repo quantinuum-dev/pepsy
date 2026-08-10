@@ -152,7 +152,8 @@ directions; `"R"` preserves a one-way sweep when required.
 In this optimizer the fit is intentionally
 restricted to the interval `[xmin, xmax]` touched by the current two-site gate
 or batch. This is implemented by `FIT.run_gate`, the gate-window version of
-`FIT.run_eff`; `run_eff` remains the full-chain solver used by boundary fits.
+`FIT.run_eff`; `run_eff` remains the default one-site full-chain boundary
+solver, while PEPS `fit_mode="two-site"` uses `run_gate` over the full boundary.
 Using `run_eff` for each gate would refit unrelated sites and would no longer
 be local DMRG compression. `fit_layer_size=N` explicitly forms the paper's
 multi-gate/layer target before each restricted fit. With the default

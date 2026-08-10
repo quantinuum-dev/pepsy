@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 from ...boundary.metrics import peps_infidelity as boundary_infidelity
 from ...boundary.metrics import build_bra_ket, peps_normalize
 from ...boundary.states import BdyMPS
-from ...boundary.sweeps import CompBdy
+from ...boundary.sweeps import CompBdy, _canonical_fit_mode_selector
 from ...tensors.core import tn_fidelity
 from ...solvers.gradient import GradientOptimizer, SUPPORTED_SOLVERS
 from ...tensors.validation import _PHYS_IND_PATTERN, _TAG_X, _TAG_Y
@@ -28,6 +28,21 @@ from .environments import (
 )
 
 __all__ = ["SweepOptimizer"]
+
+
+class _InheritFitOption:  # pylint: disable=too-few-public-methods
+    """Readable sentinel for per-call options inherited from the optimizer."""
+
+    def __repr__(self):
+        return "<inherit>"
+
+
+_INHERIT_FIT_OPTION = _InheritFitOption()
+
+
+def _resolve_fit_option(value, inherited):
+    """Resolve an omitted per-call FIT option without conflating it with None."""
+    return inherited if value is _INHERIT_FIT_OPTION else value
 
 
 class _AttrDict(dict):
@@ -67,8 +82,24 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         place.
     contraction_opt : object | str, default="auto-hq"
         Contraction optimizer.
-    fit_mode : {"eff", "global"}, default="eff"
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
         Backend mode passed to :class:`pepsy.boundary.sweeps.CompBdy`.
+    fit_max_bond : int | None, default=None
+        Two-site boundary SVD cap. Defaults to each boundary's requested
+        ``chi``.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site boundary sweep directions.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used by two-site boundary splits.
+    cutoff : float, default=1e-12
+        Boundary compression cutoff. In ``fit_mode="two-site"`` this is the
+        native SVD truncation cutoff.
+    fit_min_iter : int | None, default=None
+        Minimum two-site boundary sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative two-site boundary convergence tolerance.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required when ``fit_rtol`` is set.
     boundary_engine : {"auto", "dmrg", "quimb-mps"}, default="auto"
         Environment engine used during local sweeps. ``"dmrg"`` preserves the
         Pepsy ``BdyMPS``/``CompBdy`` path. ``"quimb-mps"`` builds reusable
@@ -89,6 +120,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
+        "fit_max_bond",
+        "fit_sweep_sequence",
+        "fit_cutoff_mode",
+        "fit_min_iter",
+        "fit_rtol",
+        "fit_patience",
         "strip_exponent",
         "method",
         "mode_",
@@ -108,6 +145,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         "max_separation",
         "progress",
         "track_boundary_fidelity",
+        "fit_max_bond",
+        "fit_sweep_sequence",
+        "fit_cutoff_mode",
+        "fit_min_iter",
+        "fit_rtol",
+        "fit_patience",
         "single_layer",
         "strip_exponent",
         "method",
@@ -378,6 +421,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         bdy_overlap=None,
         contraction_opt="auto-hq",
         fit_mode="eff",
+        fit_max_bond=None,
+        fit_sweep_sequence="RL",
+        fit_cutoff_mode="rsum2",
+        cutoff=1.0e-12,
+        fit_min_iter=None,
+        fit_rtol=None,
+        fit_patience=1,
         single_layer=False,
         simplify=True,
         normalize_kwargs: Mapping[str, Any] | None = None,
@@ -394,6 +444,9 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
     ):
         self._ensure_no_common_internal_indices(state, state_target)
         self._validate_symmray_input_backends(state, state_target)
+        # Canonicalize before boundary construction because the mode decides
+        # whether a new dense DMRG boundary should start at rank one.
+        fit_mode = _canonical_fit_mode_selector(fit_mode)
 
         bdy_obj, bdy_holder = self._resolve_boundary_arg(bdy, "bdy")
         bdy_overlap_obj, bdy_overlap_holder = self._resolve_boundary_arg(
@@ -430,6 +483,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 single_layer=single_layer,
                 boundary_engine=self.boundary_engine,
                 boundary_options=self.boundary_options,
+                initial_bond=(
+                    1
+                    if fit_mode == "two-site" and self.boundary_engine == "dmrg"
+                    else None
+                ),
             )
 
         self.state = state
@@ -438,6 +496,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self._set_boundary_pair(bdy_obj, bdy_overlap_obj)
         self.contraction_opt = contraction_opt
         self.fit_mode = fit_mode
+        self.fit_max_bond = fit_max_bond
+        self.fit_sweep_sequence = fit_sweep_sequence
+        self.fit_cutoff_mode = fit_cutoff_mode
+        self.fit_cutoff = cutoff
+        self.fit_min_iter = fit_min_iter
+        self.fit_rtol = fit_rtol
+        self.fit_patience = fit_patience
         # Store chi as-is (may be int or (int, int) tuple).
         self.chi = chi if chi is not None else getattr(bdy_obj, "chi", None)
         self.single_layer = single_layer
@@ -562,6 +627,7 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         single_layer=False,
         boundary_engine="dmrg",
         boundary_options=None,
+        initial_bond=None,
     ):
         """Construct norm and overlap boundary MPS containers."""
         chi_bdy, chi_overlap = SweepOptimizer._unpack_chi(chi)
@@ -572,6 +638,13 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 QuimbMpsBoundaryStore(chi=chi_bdy, **opts),
                 QuimbMpsBoundaryStore(chi=chi_overlap, **opts),
             )
+
+        if initial_bond is not None:
+            initial_bond = int(initial_bond)
+            if initial_bond < 1:
+                raise ValueError("initial_bond must be >= 1")
+            chi_bdy = min(chi_bdy, initial_bond)
+            chi_overlap = min(chi_overlap, initial_bond)
 
         _, state_norm = build_bra_ket(ket=state, bra=None)
         _, overlap_norm = build_bra_ket(ket=target, bra=state)
@@ -664,10 +737,11 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             self.best_state = state.copy()
 
     def _ensure_boundary_chi(self, chi):
-        """Retune both stored boundary objects to at least ``chi``.
+        """Retune stored boundaries for the requested ``chi`` policy.
 
         *chi* may be ``int`` (same for both) or ``(int, int)`` for
-        ``(bdy, bdy_overlap)``.
+        ``(bdy, bdy_overlap)``. Two-site FIT keeps smaller warm bonds and lets
+        its SVDs grow them locally; lowering the cap still compresses eagerly.
         """
         if chi is None:
             return
@@ -675,13 +749,30 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         if chi_bdy < 1 or chi_overlap < 1:
             raise ValueError("chi must be >= 1")
 
-        bdy = getattr(self, "bdy", None)
-        if bdy is not None and getattr(bdy, "chi", 0) < chi_bdy:
-            bdy.expand_bnd(chi_bdy, inplace=True)
-
-        bdy_overlap = getattr(self, "bdy_overlap", None)
-        if bdy_overlap is not None and getattr(bdy_overlap, "chi", 0) < chi_overlap:
-            bdy_overlap.expand_bnd(chi_overlap, inplace=True)
+        two_site_fit = (
+            self.fit_mode == "two-site"
+            and getattr(self, "boundary_engine", "dmrg") == "dmrg"
+        )
+        for boundary, target in (
+            (getattr(self, "bdy", None), chi_bdy),
+            (getattr(self, "bdy_overlap", None), chi_overlap),
+        ):
+            if boundary is None:
+                continue
+            current = int(getattr(boundary, "chi", 0))
+            if two_site_fit:
+                # Do not manufacture zero-padded sectors when raising a
+                # two-site cap: the next pair SVD should choose the useful
+                # subspace. Lowering remains eager so ``chi`` is a real cap.
+                should_retune = current > target
+            else:
+                # One-site FIT cannot discover a larger bond subspace itself,
+                # so it needs eager padding on growth. It also compresses on
+                # reduction so set_chi() has symmetric target semantics.
+                should_retune = current != target
+            if should_retune:
+                boundary.expand_bnd(target, inplace=True)
+        self.chi = chi
 
     def set_chi(
         self,
@@ -694,12 +785,15 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         progress=False,
         track_boundary_fidelity=False,
     ):
-        """Expand stored boundaries to ``chi`` and optionally renormalize state.
+        """Set the boundary ``chi`` policy and optionally renormalize state.
 
         Parameters
         ----------
-        chi : int
-            Target boundary bond dimension.
+        chi : int | tuple[int, int]
+            Target norm and overlap boundary bond dimensions. A scalar applies
+            to both; a tuple sets them independently. One-site mode pads
+            smaller stored boundaries immediately, while two-site mode grows
+            them through local SVD updates instead.
         normalize_state : bool, default=False
             If True, run :meth:`normalize` immediately after expanding
             boundaries.
@@ -739,9 +833,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         ----------
         state : qtn.TensorNetwork
             New trainable PEPS-like state.
-        chi : int | None, default=None
-            Boundary bond dimension for rebuilt boundaries. If omitted, uses
-            ``self.bdy.chi`` when available.
+        chi : int | tuple[int, int] | None, default=None
+            Boundary bond dimensions for rebuilt boundaries. If omitted, uses
+            the optimizer's requested ``self.chi`` policy before consulting
+            the current (possibly rank-one) boundary state.
         single_layer : bool, default=False
             Forwarded to :class:`pepsy.boundary.states.BdyMPS`.
         normalize_state : bool, default=True
@@ -762,6 +857,8 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.Lx, self.Ly = self._infer_shape(self.state)
 
         if chi is None:
+            chi = getattr(self, "chi", None)
+        if chi is None:
             chi = getattr(self.bdy, "chi", None)
         if chi is None:
             raise ValueError("Provide chi when current boundary chi is unavailable.")
@@ -775,8 +872,15 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             single_layer=single_layer,
             boundary_engine=getattr(self, "boundary_engine", "dmrg"),
             boundary_options=getattr(self, "boundary_options", None),
+            initial_bond=(
+                1
+                if self.fit_mode == "two-site"
+                and getattr(self, "boundary_engine", "dmrg") == "dmrg"
+                else None
+            ),
         )
         self._set_boundary_pair(bdy_new, bdy_overlap_new)
+        self.chi = chi
 
         if normalize_state:
             return self.normalize(
@@ -806,9 +910,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             Known ``<target|target>`` value for local sweep objectives. Pass a
             ``(mantissa, exponent)`` pair to avoid reconstructing very large or
             very small scalar norms.
-        chi : int | None, default=None
-            Bond dimension for rebuilt overlap boundary. If omitted, uses
-            ``self.bdy_overlap.chi`` when available.
+        chi : int | tuple[int, int] | None, default=None
+            Bond dimension for the rebuilt overlap boundary. A tuple uses its
+            overlap entry. If omitted, uses the optimizer's requested overlap
+            policy before consulting the current boundary state.
         single_layer : bool, default=False
             Forwarded to :class:`pepsy.boundary.states.BdyMPS`.
         """
@@ -816,12 +921,16 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         self.state_target = target
         self.set_target_norm(target_norm)
 
-        # Extract overlap chi from tuple or scalar.
+        chi_was_provided = chi is not None
+
+        # Extract the overlap cap without changing the independent norm cap.
+        # Replacing a target should not silently alter the accuracy policy for
+        # <state|state>, even when the caller requests a new overlap chi.
         _, chi_overlap = self._unpack_chi(chi)
         if chi_overlap is None:
-            chi_overlap = getattr(self.bdy_overlap, "chi", None)
-        if chi_overlap is None:
             _, chi_overlap = self._unpack_chi(getattr(self, "chi", None))
+        if chi_overlap is None:
+            chi_overlap = getattr(self.bdy_overlap, "chi", None)
         if chi_overlap is None:
             raise ValueError("Provide chi when current boundary chi is unavailable.")
 
@@ -834,10 +943,16 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             _, overlap_norm = build_bra_ket(ket=self.state_target, bra=self.state)
             bdy_overlap_new = BdyMPS(
                 tn_double=overlap_norm,
-                chi=chi_overlap,
+                chi=1 if self.fit_mode == "two-site" else chi_overlap,
                 single_layer=single_layer,
             )
         self._set_boundary_pair(self.bdy, bdy_overlap_new)
+        if chi_was_provided:
+            chi_norm, _ = self._unpack_chi(getattr(self, "chi", None))
+            if chi_norm is None:
+                chi_norm = getattr(self.bdy, "chi", None)
+            self.chi = (int(chi_norm), int(chi_overlap))
+        return self
 
     def set_normalize_kwargs(self, **kwargs):
         """Update stored defaults for :meth:`normalize`."""
@@ -866,7 +981,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         track_boundary_fidelity = opts.get("track_boundary_fidelity", False)
         strip_exponent = opts.get("strip_exponent", False)
         method = opts.get("method", "mps" if uses_quimb else "dmrg")
-        chi = self._normalize_chi(opts.get("chi", getattr(self.bdy, "chi", None)))
+        default_chi = self._normalize_chi(getattr(self, "chi", None))
+        if default_chi is None:
+            default_chi = getattr(self.bdy, "chi", None)
+        chi = self._normalize_chi(opts.get("chi", default_chi))
         bdy = None if uses_quimb else self.bdy
         balance_bonds = opts.get("balance_bonds", not uses_quimb)
 
@@ -882,11 +1000,19 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 progress=progress,
                 track_boundary_fidelity=track_boundary_fidelity,
                 fit_mode=self.fit_mode,
+                fit_max_bond=opts.get("fit_max_bond", self.fit_max_bond),
+                fit_sweep_sequence=opts.get(
+                    "fit_sweep_sequence", self.fit_sweep_sequence
+                ),
+                fit_cutoff_mode=opts.get("fit_cutoff_mode", self.fit_cutoff_mode),
+                fit_min_iter=opts.get("fit_min_iter", self.fit_min_iter),
+                fit_rtol=opts.get("fit_rtol", self.fit_rtol),
+                fit_patience=opts.get("fit_patience", self.fit_patience),
                 strip_exponent=strip_exponent,
                 method=method,
                 mode_=opts.get("mode_", "mps"),
                 sequence=opts.get("sequence", None),
-                cutoff=opts.get("cutoff", 1.0e-12),
+                cutoff=opts.get("cutoff", self.fit_cutoff),
                 equalize_norms=opts.get("equalize_norms", False),
                 layer_tags=opts.get("layer_tags", None),
                 balance_bonds=balance_bonds,
@@ -904,11 +1030,19 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             progress=progress,
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
+            fit_max_bond=opts.get("fit_max_bond", self.fit_max_bond),
+            fit_sweep_sequence=opts.get(
+                "fit_sweep_sequence", self.fit_sweep_sequence
+            ),
+            fit_cutoff_mode=opts.get("fit_cutoff_mode", self.fit_cutoff_mode),
+            fit_min_iter=opts.get("fit_min_iter", self.fit_min_iter),
+            fit_rtol=opts.get("fit_rtol", self.fit_rtol),
+            fit_patience=opts.get("fit_patience", self.fit_patience),
             strip_exponent=strip_exponent,
             method=method,
             mode_=opts.get("mode_", "mps"),
             sequence=opts.get("sequence", None),
-            cutoff=opts.get("cutoff", 1.0e-12),
+            cutoff=opts.get("cutoff", self.fit_cutoff),
             equalize_norms=opts.get("equalize_norms", False),
             layer_tags=opts.get("layer_tags", None),
             balance_bonds=balance_bonds,
@@ -941,20 +1075,32 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         max_separation=1,
         progress=False,
         track_boundary_fidelity=False,
+        fit_max_bond=_INHERIT_FIT_OPTION,
+        fit_sweep_sequence=_INHERIT_FIT_OPTION,
+        fit_cutoff_mode=_INHERIT_FIT_OPTION,
+        fit_min_iter=_INHERIT_FIT_OPTION,
+        fit_rtol=_INHERIT_FIT_OPTION,
+        fit_patience=_INHERIT_FIT_OPTION,
         single_layer=False,
         strip_exponent=False,
         method="dmrg",
         mode_="mps",
         sequence=None,
-        cutoff=1.0e-12,
+        cutoff=_INHERIT_FIT_OPTION,
         equalize_norms=False,
         layer_tags=None,
     ):
         """Compute boundary-based infidelity for current ``(state, state_target)``.
 
         This reuses ``self.bdy`` and ``self.bdy_overlap``. If ``chi`` is
-        provided and larger than current boundary bond dimension, both boundary
-        objects are expanded before evaluation.
+        omitted, the optimizer's requested chi policy is used rather than the
+        current warm-state rank. One-site FIT pads smaller boundaries eagerly;
+        two-site FIT keeps them compact and grows rank through local SVDs.
+
+        Per-call ``fit_*`` and ``cutoff`` options inherit constructor values
+        when omitted. Passing ``None`` remains meaningful for controls that
+        support it: for example, ``fit_rtol=None`` explicitly disables
+        adaptive stopping for this call.
 
         Returns
         -------
@@ -972,9 +1118,12 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             method = "mps"
         self._ensure_boundary_chi(chi)
 
-        # boundary_infidelity() expects a scalar int chi; derive one from
-        # the (possibly tuple) value after boundaries are already expanded.
-        chi_bdy, chi_overlap = self._unpack_chi(chi)
+        # boundary_infidelity() expects one scalar chi even though local sweep
+        # environments can carry separate norm/overlap caps. Use the larger
+        # requested cap for this diagnostic so neither contraction is
+        # accidentally limited by a rank-one warm state.
+        requested_chi = chi if chi is not None else getattr(self, "chi", None)
+        chi_bdy, chi_overlap = self._unpack_chi(requested_chi)
         if chi_bdy is not None:
             chi_for_call = max(chi_bdy, chi_overlap)
         elif uses_quimb:
@@ -983,7 +1132,10 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
                 int(getattr(self.bdy_overlap, "chi", 1)),
             )
         elif norm_target is None:
-            chi_for_call = max(int(getattr(self.bdy, "chi", 1)), int(getattr(self.bdy_overlap, "chi", 1)))
+            chi_for_call = max(
+                int(getattr(self.bdy, "chi", 1)),
+                int(getattr(self.bdy_overlap, "chi", 1)),
+            )
         else:
             chi_for_call = None
 
@@ -996,24 +1148,46 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
             norm_target=norm_target,
             bdy=None if uses_quimb else self.bdy,
             bdy_overlap=None if uses_quimb else self.bdy_overlap,
-            contraction_opt=self.contraction_opt if contraction_opt is None else contraction_opt,
+            contraction_opt=(
+                self.contraction_opt
+                if contraction_opt is None
+                else contraction_opt
+            ),
             n_iter=n_iter,
             direction=direction,
             max_separation=max_separation,
             progress=progress,
             track_boundary_fidelity=track_boundary_fidelity,
             fit_mode=self.fit_mode,
+            fit_max_bond=_resolve_fit_option(fit_max_bond, self.fit_max_bond),
+            fit_sweep_sequence=_resolve_fit_option(
+                fit_sweep_sequence,
+                self.fit_sweep_sequence,
+            ),
+            fit_cutoff_mode=_resolve_fit_option(
+                fit_cutoff_mode,
+                self.fit_cutoff_mode,
+            ),
+            fit_min_iter=_resolve_fit_option(fit_min_iter, self.fit_min_iter),
+            fit_rtol=_resolve_fit_option(fit_rtol, self.fit_rtol),
+            fit_patience=_resolve_fit_option(fit_patience, self.fit_patience),
             single_layer=single_layer,
             strip_exponent=strip_exponent,
             method=method,
             mode_=mode_,
             sequence=sequence,
-            cutoff=cutoff,
+            cutoff=_resolve_fit_option(cutoff, self.fit_cutoff),
             equalize_norms=equalize_norms,
             layer_tags=layer_tags,
         )
 
         self._update_boundaries_from_result(result)
+        if requested_chi is not None:
+            # peps_infidelity() currently accepts one scalar chi and therefore
+            # uses max(chi_norm, chi_overlap). Restore the independent stored
+            # caps afterwards; in two-site mode this only compresses a boundary
+            # that actually grew beyond its own cap and never pads a warm state.
+            self._ensure_boundary_chi(requested_chi)
 
         return float(result["infidelity"])
 
@@ -1887,8 +2061,33 @@ class SweepOptimizer:  # pylint: disable=too-many-instance-attributes
         }
 
     def _make_comp_pair(self, norm_tn, overlap_tn):
-        comp_norm = CompBdy(norm_tn, self.bdy.mps_b, contraction_opt=self.contraction_opt, fit_mode=self.fit_mode)
-        comp_overlap = CompBdy(overlap_tn, self.bdy_overlap.mps_b, contraction_opt=self.contraction_opt, fit_mode=self.fit_mode)
+        chi_norm, chi_overlap = self._unpack_chi(self.chi)
+        common = {
+            "contraction_opt": self.contraction_opt,
+            "fit_mode": self.fit_mode,
+            "fit_sweep_sequence": self.fit_sweep_sequence,
+            "fit_cutoff": self.fit_cutoff,
+            "fit_cutoff_mode": self.fit_cutoff_mode,
+            "fit_min_iter": self.fit_min_iter,
+            "fit_rtol": self.fit_rtol,
+            "fit_patience": self.fit_patience,
+        }
+        comp_norm = CompBdy(
+            norm_tn,
+            self.bdy.mps_b,
+            fit_max_bond=(
+                chi_norm if self.fit_max_bond is None else self.fit_max_bond
+            ),
+            **common,
+        )
+        comp_overlap = CompBdy(
+            overlap_tn,
+            self.bdy_overlap.mps_b,
+            fit_max_bond=(
+                chi_overlap if self.fit_max_bond is None else self.fit_max_bond
+            ),
+            **common,
+        )
         return comp_norm, comp_overlap
 
     @staticmethod

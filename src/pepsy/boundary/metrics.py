@@ -13,7 +13,7 @@ import autoray as ar
 
 from ..tensors.validation import _PHYS_OUTER, validate_tensor_network_tags
 from .states import BdyMPS
-from .sweeps import CompBdy
+from .sweeps import CompBdy, _canonical_fit_mode_selector
 
 __all__ = [
     "build_bra_ket",
@@ -683,12 +683,21 @@ def _unpack_bdy_handle(handle, name):
     return obj, holder
 
 
-def _retune_bdy_to_chi(obj, chi, name):
-    """Retune an existing boundary object to the requested chi."""
+def _retune_bdy_to_chi(obj, chi, name, *, expand_growth=True):
+    """Retune an existing boundary object to the requested chi.
+
+    Two-site FIT discovers rank through its local SVDs, so ``expand_growth``
+    can be disabled to avoid globally padding a warm boundary before every
+    contraction. A lower requested cap is always applied immediately.
+    """
     if obj is None or chi is None:
         return
     cur = getattr(obj, "chi", None)
     if cur is None or int(cur) == chi:
+        return
+    if int(cur) < chi and not expand_growth:
+        # Preserve a low-rank warm start. The caller passes ``chi`` directly
+        # to the two-site split, which can populate useful sectors naturally.
         return
     if not hasattr(obj, "expand_bnd"):
         raise TypeError(
@@ -818,6 +827,12 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -840,22 +855,33 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
         layer_tags = tuple(layer_tags)
 
     if method == "dmrg":
+        fit_mode = _canonical_fit_mode_selector(fit_mode)
         bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, bdy_name)
-        _retune_bdy_to_chi(bdy_obj, chi, bdy_name)
+        two_site_fit = fit_mode == "two-site"
+        _retune_bdy_to_chi(
+            bdy_obj,
+            chi,
+            bdy_name,
+            expand_growth=not two_site_fit,
+        )
         if bdy_obj is None:
             if chi is None:
                 raise ValueError(f"Provide chi when {bdy_name} is not supplied.")
+            # A two-site SVD can discover rank as it sweeps. Starting from a
+            # product boundary avoids allocating and canonicalizing chi-wide
+            # random bonds that may be immediately truncated away.
+            initial_chi = 1 if two_site_fit else chi
             if flat:
                 bdy_obj = BdyMPS(
                     tn_flat=norm,
-                    chi=chi,
+                    chi=initial_chi,
                     flat=True,
                     single_layer=single_layer,
                 )
             else:
                 bdy_obj = BdyMPS(
                     tn_double=norm,
-                    chi=chi,
+                    chi=initial_chi,
                     single_layer=single_layer,
                 )
             if bdy_holder is not None:
@@ -866,6 +892,13 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             bdy=bdy_obj,
             contraction_opt=contraction_opt,
             fit_mode=fit_mode,
+            fit_max_bond=chi if fit_max_bond is None else fit_max_bond,
+            fit_sweep_sequence=fit_sweep_sequence,
+            fit_cutoff=cutoff,
+            fit_cutoff_mode=fit_cutoff_mode,
+            fit_min_iter=fit_min_iter,
+            fit_rtol=fit_rtol,
+            fit_patience=fit_patience,
             n_iter=n_iter,
             progress=progress,
             direction=direction,
@@ -910,6 +943,12 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
     visualize=False,
     strip_exponent=False,
     mode_=None,
@@ -979,6 +1018,12 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
         single_layer=False,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -1071,6 +1116,13 @@ def contract_boundary(
     contraction_opt="auto-hq",
     flat=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff=1.0e-12,
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
     n_iter=10,
     retag=True,
     progress=True,
@@ -1098,8 +1150,25 @@ def contract_boundary(
         Contraction optimizer passed through to :class:`pepsy.boundary.sweeps.CompBdy`.
     flat : bool, default=False
         Forwarded to sweep backend.
-    fit_mode : {"eff", "global"}, default="eff"
-        Fit backend mode.
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
+        Fit backend mode. ``"two-site"`` performs native-SVD pair updates
+        while preserving the cached left/right environment sweep.
+    fit_max_bond : int | None, default=None
+        Two-site SVD cap. If omitted, use the boundary object's current bond.
+        Higher-level PEPS helpers pass their requested ``chi`` explicitly.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions.
+    fit_cutoff : float, default=1e-12
+        Two-site SVD truncation cutoff.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used by the two-site split.
+    fit_min_iter : int | None, default=None
+        Minimum sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative convergence tolerance. ``None`` runs exactly ``n_iter``
+        sweeps, preserving legacy fixed-iteration behavior.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required for adaptive stopping.
     n_iter : int, default=10
         Number of local fit iterations per step.
     retag : bool, default=True
@@ -1132,6 +1201,7 @@ def contract_boundary(
     if bdy is None:
         raise ValueError("Provide bdy.")
     if hasattr(bdy, "mps_b"):
+        bdy_obj = bdy
         mps_boundaries = bdy.mps_b
     elif isinstance(bdy, dict):
         bdy_obj = bdy.get("bdy", None)
@@ -1144,6 +1214,9 @@ def contract_boundary(
     if not isinstance(mps_boundaries, dict):
         raise TypeError("mps_boundaries must be a dictionary of boundary states.")
 
+    if fit_max_bond is None:
+        fit_max_bond = getattr(bdy_obj, "chi", None)
+
     retag = bool(retag)
     norm_tagged = norm.copy()
 
@@ -1152,6 +1225,13 @@ def contract_boundary(
         mps_boundaries,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff=fit_cutoff,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
     )
 
     cost = comp_bdy.run(
@@ -1190,6 +1270,12 @@ def _contract_state_norm(
     progress,
     track_boundary_fidelity,
     fit_mode,
+    fit_max_bond,
+    fit_sweep_sequence,
+    fit_cutoff_mode,
+    fit_min_iter,
+    fit_rtol,
+    fit_patience,
     single_layer,
     visualize,
     strip_exponent,
@@ -1224,6 +1310,12 @@ def _contract_state_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
         single_layer=single_layer,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -1257,6 +1349,12 @@ def peps_normalize(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1307,8 +1405,22 @@ def peps_normalize(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"eff", "global"}, default="eff"
-        Boundary fitting backend mode.
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
+        Boundary fitting backend mode. ``"two-site"`` can grow useful bond
+        subspaces up to ``fit_max_bond`` through native SVD pair updates.
+    fit_max_bond : int | None, default=None
+        Two-site SVD cap. Defaults to the requested boundary ``chi``.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_min_iter : int | None, default=None
+        Minimum two-site sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative convergence tolerance. ``None`` performs exactly ``n_iter``
+        sweeps.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required when ``fit_rtol`` is set.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     strip_exponent : bool, default=False
@@ -1343,6 +1455,12 @@ def peps_normalize(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
         single_layer=single_layer,
         visualize=visualize,
         mode_=mode_,
@@ -1396,6 +1514,12 @@ def boundary_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1434,8 +1558,22 @@ def boundary_norm(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"eff", "global"}, default="eff"
-        Boundary fitting backend mode.
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
+        Boundary fitting backend mode. ``"two-site"`` uses cached pair
+        environments and native SVD truncation.
+    fit_max_bond : int | None, default=None
+        Two-site SVD cap. Defaults to the requested boundary ``chi``.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_min_iter : int | None, default=None
+        Minimum two-site sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative convergence tolerance. ``None`` performs exactly ``n_iter``
+        sweeps.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required when ``fit_rtol`` is set.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     strip_exponent : bool, default=False
@@ -1462,6 +1600,12 @@ def boundary_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
         single_layer=single_layer,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -1487,6 +1631,12 @@ def peps_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1520,6 +1670,12 @@ def peps_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
         single_layer=single_layer,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -1549,6 +1705,12 @@ def peps_infidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1623,8 +1785,20 @@ def peps_infidelity(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track per-step fidelity during boundary contraction.
-    fit_mode : {"eff", "global"}, default="eff"
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
         Boundary fitting backend mode.
+    fit_max_bond : int | None, default=None
+        Two-site SVD cap. Defaults to the requested boundary ``chi``.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_min_iter : int | None, default=None
+        Minimum two-site sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative two-site convergence tolerance.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required when ``fit_rtol`` is set.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     visualize : bool, default=False
@@ -1659,6 +1833,12 @@ def peps_infidelity(
         chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
         n_iter=n_iter,
         progress=progress,
         direction=direction,
@@ -1754,6 +1934,12 @@ def peps_fidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1792,6 +1978,12 @@ def peps_fidelity(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
         single_layer=single_layer,
         visualize=visualize,
         strip_exponent=strip_exponent,
