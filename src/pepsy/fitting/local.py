@@ -7,7 +7,9 @@ and fail early when input structure is inconsistent.
 
 import logging
 import math
+from copy import deepcopy
 from numbers import Integral
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 import autoray as ar
@@ -35,6 +37,50 @@ def internal_inds(psi):
     return inner
 
 
+def _synchronize_array(data):
+    """Synchronize a supported accelerator array without moving its data.
+
+    Accelerator kernels are asynchronous, so an unsynchronized wall-clock
+    timer mostly measures dispatch latency. This helper is intentionally
+    opt-in and backend-local: normal FIT execution never pays for a device
+    barrier, and symmetric arrays are inspected through their native blocks.
+    """
+    blocks = getattr(data, "blocks", None)
+    if blocks is not None:
+        values = blocks.values() if hasattr(blocks, "values") else blocks
+        for block in values:
+            if _synchronize_array(block):
+                return True
+        return False
+
+    module = type(data).__module__.split(".", 1)[0]
+    if module == "torch":
+        device = getattr(data, "device", None)
+        if getattr(device, "type", None) == "cuda":
+            import torch  # pylint: disable=import-outside-toplevel
+
+            torch.cuda.synchronize(device)
+            return True
+    elif module == "cupy":
+        import cupy  # pylint: disable=import-outside-toplevel
+
+        cupy.cuda.get_current_stream().synchronize()
+        return True
+    elif module in {"jax", "jaxlib"}:
+        block_until_ready = getattr(data, "block_until_ready", None)
+        if block_until_ready is not None:
+            block_until_ready()
+            return True
+    return False
+
+
+def _synchronize_tensor_network(tn):
+    """Synchronize the first accelerator-backed leaf in ``tn`` if present."""
+    for tensor in tn.tensors:
+        if _synchronize_array(tensor.data):
+            return
+
+
 class FIT:  # pylint: disable=too-many-instance-attributes
     """Local tensor fitting of an MPS/MPO against a target tensor network.
 
@@ -43,11 +89,13 @@ class FIT:  # pylint: disable=too-many-instance-attributes
     tn : qtn.TensorNetwork
         Target tensor network to fit.
     p : qtn.MatrixProductState | qtn.MatrixProductOperator
-        Initial state to optimize.
+        Initial open-boundary state or operator to optimize.
     cutoffs : float, default=1e-12
         Numerical cutoff used by local decompositions/truncations.
     backend : str | None, default=None
-        Backend specification for tensor operations.
+        Compatibility metadata retained on the solver. Array execution is
+        inferred from tensor data; choose the local contraction route with
+        ``environment_strategy``.
     site_tag_id : str, default="I{}"
         Site-tag format used by ``p`` and local environment builders.
     contraction_opt : str | object, default="auto-hq"
@@ -62,6 +110,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         Enable warning logs for fallback and retagging edge-cases.
     inplace : bool, default=False
         If ``True``, optimize ``p`` in place; otherwise operate on ``p.copy()``.
+    environment_strategy : {"auto", "mps-direct", "generic"}, default="auto"
+        Local environment contraction route. ``"mps-direct"`` avoids
+        temporary TensorNetwork construction when both the target and fitted
+        state are ordinary dense MPS/MPO networks. ``"generic"`` is the
+        native-safe general/Symmray route.
+    copy_target : bool, default=True
+        Copy ``tn`` before its internal indices are randomized. Optimizer
+        integrations that construct a disposable target can pass ``False``
+        and transfer ownership, avoiding one complete target-network copy.
     """
 
     def __init__(
@@ -77,12 +134,19 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         info: Optional[Dict[str, Any]] = None,
         warning: bool = False,
         inplace: bool = False,
+        *,
+        environment_strategy: str = "auto",
+        copy_target: bool = True,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
 
         if p is None:
-            raise ValueError("Initial MPS `p` must be provided for FIT.")
+            raise ValueError("Initial MPS/MPO `p` must be provided for FIT.")
         if not isinstance(p, (qtn.MatrixProductState, qtn.MatrixProductOperator)):
-            raise TypeError("Initial MPS `p` must be MatrixProductState or MatrixProductOperator.")
+            raise TypeError(
+                "Initial `p` must be MatrixProductState or MatrixProductOperator."
+            )
+        if p.cyclic:
+            raise ValueError("FIT currently supports open-boundary MPS/MPO guesses only.")
         if not isinstance(site_tag_id, str) or "{}" not in site_tag_id:
             raise ValueError("site_tag_id must be a format string containing '{}'.")
 
@@ -90,17 +154,32 @@ class FIT:  # pylint: disable=too-many-instance-attributes
 
         self.p = p if inplace else p.copy()
 
-        self.tn = tn.copy()
+        # Reindexing below is structural and therefore requires ownership.
+        # Public callers keep the safe copying default; MpsOptimizer hands FIT
+        # a freshly built disposable target and can transfer it explicitly.
+        self.tn = tn.copy() if copy_target else tn
 
         if site_tag_id:
-            site_ind_id = getattr(self.p, "site_ind_id", None)
-            self.p.view_as_(
-                qtn.MatrixProductState,
-                L=self.L,
-                site_tag_id=site_tag_id,
-                site_ind_id=site_ind_id,
-                cyclic=False,
-            )
+            if isinstance(self.p, qtn.MatrixProductOperator):
+                # Preserve both MPO physical-index families. Re-viewing every
+                # guess as an MPS leaves ``site_ind_id=None`` and breaks normal
+                # MPO operations such as ``to_dense()`` after fitting.
+                self.p.view_as_(
+                    qtn.MatrixProductOperator,
+                    L=self.L,
+                    site_tag_id=site_tag_id,
+                    upper_ind_id=self.p.upper_ind_id,
+                    lower_ind_id=self.p.lower_ind_id,
+                    cyclic=False,
+                )
+            else:
+                self.p.view_as_(
+                    qtn.MatrixProductState,
+                    L=self.L,
+                    site_tag_id=site_tag_id,
+                    site_ind_id=self.p.site_ind_id,
+                    cyclic=False,
+                )
 
         self.site_tag_id = site_tag_id
 
@@ -111,8 +190,15 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.cutoffs = cutoffs
         self.backend = backend
 
+        environment_strategy = str(environment_strategy).strip().lower()
+        if environment_strategy not in {"auto", "mps-direct", "generic"}:
+            raise ValueError(
+                "environment_strategy must be 'auto', 'mps-direct', or 'generic'."
+            )
+
         # warnings being printed or not
         self.warning = warning
+        self.timing_records: List[Dict[str, Any]] = []
 
         # Diagnostics collected during sweeps.
         self.fidelity_trace: List[float] = []
@@ -120,12 +206,22 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         self.sweep_norm_trace: List[float] = []
         self.iterations_run = 0
         self.converged = False
+        self.convergence_reason = "not_run"
         self.last_relative_change: Optional[float] = None
-        self.info: Dict[str, Any] = info or {}
+        self.final_center_site: Optional[int] = None
+        self.final_direction: Optional[str] = None
+        self.final_norm = None
+        self._timing_sync_device = False
+        # Preserve an explicitly supplied empty dictionary: callers use this
+        # object as a live diagnostics channel during and after a FIT run.
+        self.info: Dict[str, Any] = info if info is not None else {}
         self.range_int: List[int] = list(range_int) if range_int is not None else []
         if self.range_int:
             if len(self.range_int) != 2:
                 raise ValueError("range_int must be a sequence of two integers: (start, stop).")
+            if not all(isinstance(site, Integral) for site in self.range_int):
+                raise TypeError("range_int entries must be integers.")
+            self.range_int = [int(site) for site in self.range_int]
             start, stop = self.range_int
             if start >= stop:
                 raise ValueError("range_int must satisfy start < stop.")
@@ -140,6 +236,58 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         # Re-tag TN for effective environments when requested.
         if retag:
             self._re_tag()
+
+        # Resolve the local contraction route only after reindexing and
+        # optional retagging. In particular, ``retag=True`` can turn an
+        # initially untagged dense MPS/MPO into a valid one-tensor-per-site
+        # target for the direct route.
+        self._target_site_tensors = self._build_target_site_cache()
+        direct_available = (
+            self._target_site_tensors is not None
+            and not self.tn.isfermionic()
+            and not self.p.isfermionic()
+            and not any(
+                type(tensor.data).__module__.split(".", 1)[0] == "symmray"
+                for tensor in (*self.tn.tensors, *self.p.tensors)
+            )
+        )
+        if environment_strategy == "mps-direct" and not direct_available:
+            raise ValueError(
+                "environment_strategy='mps-direct' requires an ordinary dense "
+                "MPS/MPO target and fitted state with exactly one target tensor "
+                "per site."
+            )
+        self.environment_strategy = (
+            "mps-direct"
+            if environment_strategy == "mps-direct"
+            or (environment_strategy == "auto" and direct_available)
+            else "generic"
+        )
+
+    def _build_target_site_cache(self):
+        """Return one target tensor per site, or ``None`` for a layered TN.
+
+        This is a structural optimization, not a dense conversion. The cache
+        stores views of the already-copied target and never changes array
+        backends, devices, symmetry sectors, or fermionic metadata.
+        """
+        tensors = []
+        for site in range(self.L):
+            tag = self.site_tag_id.format(site)
+            selected = self.tn.select(tag, which="all")
+            site_tensors = tuple(selected.tensors)
+            if len(site_tensors) != 1:
+                return None
+            tensors.append(site_tensors[0])
+        # A single tensor carrying several site tags is not an MPS site cache:
+        # storing it once per tag would contract the same tensor repeatedly.
+        # Likewise, extra untagged/layer tensors make the direct site-by-site
+        # route incomplete. Require an exact one-to-one site/tensor mapping.
+        if len({id(tensor) for tensor in tensors}) != self.L:
+            return None
+        if len(self.tn.tensor_map) != self.L:
+            return None
+        return tuple(tensors)
 
     def visual(
         self,
@@ -302,73 +450,6 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 t |= env_right[site_tag_id.format(i + 1)]
                 env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
 
-    def _right_range(self, psi, env_right, start, stop):
-        """Build right environments over a restricted ``[start, stop]`` window.
-
-        This variant is used by :meth:`run_gate` and supports partially
-        available right boundaries at interval edges.
-        """
-        L = self.L
-        contraction_opt = self.contraction_opt
-        site_tag_id = self.site_tag_id
-
-        indx = None
-        indx_ = None
-        # iterate from rightmost to leftmost
-        for count, i in enumerate(range(stop, start, -1)):
-            psi_block = psi.H.select([site_tag_id.format(i)], "all")
-
-            # Is there any tensor in tn to be included in env
-            if site_tag_id.format(i) in self.tn.tags:
-                tn_block = self.tn.select([site_tag_id.format(i)], "all")
-                t = psi_block | tn_block
-            else:
-                t = psi_block
-
-            if i == L - 1:
-                env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
-            else:
-                if count == 0:
-                    indx = psi.bond(stop + 1, stop)
-                    indx_ = self.tn.bond(stop + 1, stop)
-
-                # tie to previously computed right environment
-                if env_right[site_tag_id.format(i + 1)] is not None:
-                    t |= env_right[site_tag_id.format(i + 1)]
-                    env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
-                else:
-                    if indx is None or indx_ is None:
-                        raise ValueError("Right-range boundary indices are not initialized.")
-                    t = t.reindex({indx: indx_})
-                    env_right[site_tag_id.format(i)] = t.contract(all, optimize=contraction_opt)
-
-    def _left_range(self, psi, site, count, env_left):
-        """Update left environment incrementally for current site."""
-
-        # get tensor at site from p
-        psi_block = psi.H.select([self.site_tag_id.format(site)], "all")
-        contraction_opt = self.contraction_opt
-        site_tag_id = self.site_tag_id
-
-        if site_tag_id.format(site) in self.tn.tags:
-            tn_block = self.tn.select([self.site_tag_id.format(site)], "all")
-            t = psi_block | tn_block
-        else:
-            t = psi_block
-
-        if site == 0:
-            env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
-        else:
-            if count == 1:
-                indx = psi.bond(site - 1, site)
-                indx_ = self.tn.bond(site - 1, site)
-                t = t.copy()
-                t = t.reindex({indx: indx_})
-                env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
-            else:
-                t |= env_left[site_tag_id.format(site - 1)]
-                env_left[site_tag_id.format(site)] = t.contract(all, optimize=contraction_opt)
-
     def _update_env_left(self, psi, site: int, env_left):
         """Update left environment incrementally for current site."""
 
@@ -396,7 +477,14 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         """Run environment-based fitting sweeps with cached left/right blocks.
 
         This method avoids rebuilding full contractions at each site by
-        incrementally reusing left and right environments.
+        incrementally reusing left and right environments. It is the
+        full-chain counterpart of :meth:`run_gate`: ``run_eff`` deliberately
+        visits every site and does not use ``range_int`` to restrict the fit.
+
+        The DMRG circuit path uses ``run_gate`` instead. A gate target differs
+        from the current MPS only on its active interval, so fitting the whole
+        chain here would do unnecessary work and would change the algorithm
+        from local gate compression into a global variational refit.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
@@ -482,29 +570,496 @@ class FIT:  # pylint: disable=too-many-instance-attributes
                 fidelity = tn_fidelity(self.tn, psi)
                 self.fidelity_trace.append(ar.do("real", fidelity))
 
+    def _target_components(self, sites, *, reindex=None):
+        """Return target tensors for ``sites`` without changing the target.
+
+        Dense MPS/MPO targets use the per-site cache. General layered targets
+        retain the older tag-selection behavior. A boundary reindex is always
+        applied to a copy because cached tensors are shared across sweeps.
+        """
+        sites = tuple(int(site) for site in sites)
+        if self._target_site_tensors is not None:
+            components = [self._target_site_tensors[site] for site in sites]
+        else:
+            tags = tuple(self.site_tag_id.format(site) for site in sites)
+            selected = self.tn.select(tags, which="any")
+            components = list(selected.tensors)
+
+        if reindex:
+            components = [
+                tensor.reindex(reindex, inplace=False)
+                if any(index in reindex for index in tensor.inds)
+                else tensor
+                for tensor in components
+            ]
+        return components
+
+    def _active_boundary_reindex(self, psi, sites, start, stop):
+        """Map target boundary bonds onto the fixed outside MPS bonds.
+
+        FIT deliberately does not contract sites outside the active gate
+        interval. Identifying each target boundary bond with the corresponding
+        fitted-state bond is therefore the exact identity environment supplied
+        by those untouched sites.
+        """
+        first, last = min(sites), max(sites)
+        mapping = {}
+        if first == start and start > 0:
+            mapping[self._target_bond(start - 1, start)] = psi.bond(
+                start - 1, start
+            )
+        if last == stop and stop < self.L - 1:
+            mapping[self._target_bond(stop, stop + 1)] = psi.bond(
+                stop, stop + 1
+            )
+        return mapping
+
+    def _target_bond(self, left_site, right_site):
+        """Return the unique target index crossing two neighboring site tags.
+
+        A gate target can contain multiple tensors per site, so the MPS/MPO
+        ``bond(i, j)`` convenience method is not always defined. The cut itself
+        must still have one chain index for an active-window identity boundary.
+        """
+        if self._target_site_tensors is not None:
+            return self.tn.bond(left_site, right_site)
+        left_tids = set(
+            self.tn.tag_map[self.site_tag_id.format(left_site)]
+        )
+        right_tids = set(
+            self.tn.tag_map[self.site_tag_id.format(right_site)]
+        )
+        candidates = [
+            index
+            for index, tids in self.tn.ind_map.items()
+            if left_tids.intersection(tids) and right_tids.intersection(tids)
+        ]
+        if len(candidates) != 1:
+            raise ValueError(
+                "A gate-window FIT target must have one chain index across "
+                f"sites {left_site} and {right_site}; found {candidates}."
+            )
+        return candidates[0]
+
+    def _contract_components(self, components, *, output_inds=None):
+        """Contract local components through a safe or specialized route.
+
+        The direct route avoids constructing a temporary TensorNetwork for an
+        ordinary dense MPS target. Symmray and fermionic tensors intentionally
+        stay on Quimb's TensorNetwork route so native block contraction,
+        dual-leg handling, dummy modes, and graded phases remain authoritative.
+        """
+        components = tuple(components)
+        if not components:
+            raise ValueError("Cannot contract an empty FIT environment.")
+
+        if self.environment_strategy == "mps-direct" and all(
+            isinstance(component, qtn.Tensor) for component in components
+        ):
+            if len(components) == 1:
+                result = components[0]
+                if output_inds is not None:
+                    result = result.transpose(*output_inds)
+                return result
+            return qtn.tensor_contract(
+                *components,
+                optimize=self.contraction_opt,
+                output_inds=output_inds,
+            )
+
+        network = components[0]
+        for component in components[1:]:
+            network = network | component
+        if isinstance(network, qtn.TensorNetwork):
+            kwargs = {"optimize": self.contraction_opt}
+            if output_inds is not None:
+                kwargs["output_inds"] = output_inds
+            return network.contract(all, **kwargs)
+        if output_inds is not None:
+            return network.transpose(*output_inds)
+        return network
+
+    def _overlap_environment_site(self, psi, site, start, stop, prior=None):
+        """Contract one ``<psi|target>`` site into a cached environment."""
+        mapping = self._active_boundary_reindex(
+            psi,
+            (site,),
+            start,
+            stop,
+        )
+        components = [psi[site].H]
+        components.extend(
+            self._target_components((site,), reindex=mapping)
+        )
+        if prior is not None:
+            components.append(prior)
+        return self._contract_components(components)
+
+    def _build_active_environments(self, psi, start, stop, direction):
+        """Build inclusive active-interval overlap environments."""
+        environments = {}
+        if direction == "R":
+            prior = None
+            for site in range(stop, start - 1, -1):
+                prior = self._overlap_environment_site(
+                    psi,
+                    site,
+                    start,
+                    stop,
+                    prior=prior,
+                )
+                environments[site] = prior
+        else:
+            prior = None
+            for site in range(start, stop + 1):
+                prior = self._overlap_environment_site(
+                    psi,
+                    site,
+                    start,
+                    stop,
+                    prior=prior,
+                )
+                environments[site] = prior
+        return environments
+
+    def _effective_tensor(
+        self,
+        psi,
+        sites,
+        start,
+        stop,
+        *,
+        left_environment=None,
+        right_environment=None,
+        output_inds,
+    ):
+        """Form the one- or two-site variational target tensor."""
+        mapping = self._active_boundary_reindex(psi, sites, start, stop)
+        components = self._target_components(sites, reindex=mapping)
+        if left_environment is not None:
+            components.append(left_environment)
+        if right_environment is not None:
+            components.append(right_environment)
+        return self._contract_components(components, output_inds=output_inds)
+
+    @staticmethod
+    def _validate_sweep_sequence(sweep_sequence):
+        """Return a non-empty Quimb-compatible ``R``/``L`` sweep sequence."""
+        sequence = str(sweep_sequence).strip().upper()
+        if not sequence or any(direction not in {"R", "L"} for direction in sequence):
+            raise ValueError("sweep_sequence must contain only 'R' and 'L'.")
+        return sequence
+
+    def _run_gate_one_site_sweep(
+        self,
+        psi,
+        start,
+        stop,
+        *,
+        direction,
+        timing_record,
+    ):
+        """Perform one cached one-site FIT sweep in ``direction``."""
+        if direction == "R":
+            for site in range(stop, start, -1):
+                psi.right_canonize_site(site, bra=None)
+            fixed_environments = self._build_active_environments(
+                psi, start, stop, "R"
+            )
+            moving_environments = {}
+            sites = range(start, stop + 1)
+        else:
+            for site in range(start, stop):
+                psi.left_canonize_site(site, bra=None)
+            fixed_environments = self._build_active_environments(
+                psi, start, stop, "L"
+            )
+            moving_environments = {}
+            sites = range(stop, start - 1, -1)
+
+        for site in sites:
+            site_started = self._timing_mark() if timing_record is not None else None
+            left_environment = (
+                moving_environments.get(site - 1)
+                if direction == "R"
+                else fixed_environments.get(site - 1)
+            )
+            right_environment = (
+                fixed_environments.get(site + 1)
+                if direction == "R"
+                else moving_environments.get(site + 1)
+            )
+            f = self._effective_tensor(
+                psi,
+                (site,),
+                start,
+                stop,
+                left_environment=left_environment,
+                right_environment=right_environment,
+                output_inds=psi[site].inds,
+            )
+            norm_f = (f.H & f).contract(
+                all, optimize=self.contraction_opt
+            ) ** 0.5
+            self.local_norm_trace.append(ar.do("real", norm_f))
+            psi[site].modify(data=f.data)
+
+            if direction == "R" and site < stop:
+                psi.left_canonize_site(site, bra=None)
+                moving_environments[site] = self._overlap_environment_site(
+                    psi,
+                    site,
+                    start,
+                    stop,
+                    prior=moving_environments.get(site - 1),
+                )
+            elif direction == "L" and site > start:
+                psi.right_canonize_site(site, bra=None)
+                moving_environments[site] = self._overlap_environment_site(
+                    psi,
+                    site,
+                    start,
+                    stop,
+                    prior=moving_environments.get(site + 1),
+                )
+
+            if timing_record is not None:
+                site_finished = self._timing_mark()
+                timing_record["site_timings"].append(
+                    {
+                        "site": int(site),
+                        "sites": (int(site),),
+                        "block_size": 1,
+                        "elapsed_seconds": float(
+                            site_finished - site_started
+                        ),
+                    }
+                )
+
+    def _run_gate_two_site_sweep(
+        self,
+        psi,
+        start,
+        stop,
+        *,
+        direction,
+        max_bond,
+        cutoff,
+        cutoff_mode,
+        timing_record,
+        collect_split_diagnostics,
+    ):
+        """Optimize dense two-site wavefunctions and split their middle bond.
+
+        ``Tensor.split`` is essential here: it dispatches to the registered
+        NumPy/Torch/CuPy SVD for dense arrays and to Symmray's native block SVD
+        for U1, U1xU1, and fermionic arrays. Calling ``numpy.linalg.svd`` would
+        silently destroy charge sectors, dual-leg metadata, and graded signs.
+        """
+        if direction == "R":
+            for site in range(stop, start, -1):
+                psi.right_canonize_site(site, bra=None)
+            fixed_environments = self._build_active_environments(
+                psi, start, stop, "R"
+            )
+            moving_environments = {}
+            pairs = ((site, site + 1) for site in range(start, stop))
+        else:
+            for site in range(start, stop):
+                psi.left_canonize_site(site, bra=None)
+            fixed_environments = self._build_active_environments(
+                psi, start, stop, "L"
+            )
+            moving_environments = {}
+            pairs = ((site, site + 1) for site in range(stop - 1, start - 1, -1))
+
+        for left_site, right_site in pairs:
+            site_started = self._timing_mark() if timing_record is not None else None
+            left_tensor = psi[left_site]
+            right_tensor = psi[right_site]
+            (bond,) = left_tensor.bonds(right_tensor)
+            left_inds = tuple(index for index in left_tensor.inds if index != bond)
+            right_inds = tuple(index for index in right_tensor.inds if index != bond)
+            left_environment = (
+                moving_environments.get(left_site - 1)
+                if direction == "R"
+                else fixed_environments.get(left_site - 1)
+            )
+            right_environment = (
+                fixed_environments.get(right_site + 1)
+                if direction == "R"
+                else moving_environments.get(right_site + 1)
+            )
+            theta = self._effective_tensor(
+                psi,
+                (left_site, right_site),
+                start,
+                stop,
+                left_environment=left_environment,
+                right_environment=right_environment,
+                output_inds=left_inds + right_inds,
+            )
+            effective_finished = (
+                self._timing_mark() if timing_record is not None else None
+            )
+
+            split_info = {} if collect_split_diagnostics else None
+            new_left, new_right = theta.split(
+                left_inds=left_inds,
+                right_inds=right_inds,
+                method="svd",
+                absorb="right" if direction == "R" else "left",
+                max_bond=max_bond,
+                cutoff=cutoff,
+                cutoff_mode=cutoff_mode,
+                bond_ind=bond,
+                ltags=left_tensor.tags,
+                rtags=right_tensor.tags,
+                get="tensors",
+                info=split_info,
+            )
+            split_finished = (
+                self._timing_mark() if timing_record is not None else None
+            )
+            new_left.transpose_like_(left_tensor)
+            new_right.transpose_like_(right_tensor)
+            left_tensor.modify(
+                data=new_left.data,
+                left_inds=new_left.left_inds,
+            )
+            right_tensor.modify(
+                data=new_right.data,
+                left_inds=new_right.left_inds,
+            )
+
+            # The SVD absorbs singular values into the sweep-facing center.
+            # Its Frobenius norm is therefore the retained global FIT norm;
+            # measuring theta before truncation would overstate fidelity.
+            center = right_tensor if direction == "R" else left_tensor
+            self.local_norm_trace.append(ar.do("real", center.norm()))
+            if collect_split_diagnostics:
+                self.info.setdefault("two_site_splits", []).append(
+                    {
+                        "sites": (int(left_site), int(right_site)),
+                        "direction": direction,
+                        "bond": bond,
+                        "bond_dim": int(psi.bond_size(left_site, right_site)),
+                        "max_bond": None if max_bond is None else int(max_bond),
+                        "cutoff": float(cutoff),
+                        "cutoff_mode": str(cutoff_mode),
+                        "truncation_error": split_info.get("error"),
+                    }
+                )
+            writeback_finished = (
+                self._timing_mark() if timing_record is not None else None
+            )
+
+            if direction == "R":
+                moving_environments[left_site] = self._overlap_environment_site(
+                    psi,
+                    left_site,
+                    start,
+                    stop,
+                    prior=moving_environments.get(left_site - 1),
+                )
+            else:
+                moving_environments[right_site] = self._overlap_environment_site(
+                    psi,
+                    right_site,
+                    start,
+                    stop,
+                    prior=moving_environments.get(right_site + 1),
+                )
+
+            if timing_record is not None:
+                environment_finished = self._timing_mark()
+                timing_record["site_timings"].append(
+                    {
+                        "site": int(left_site),
+                        "sites": (int(left_site), int(right_site)),
+                        "block_size": 2,
+                        "effective_seconds": float(
+                            effective_finished - site_started
+                        ),
+                        "svd_seconds": float(
+                            split_finished - effective_finished
+                        ),
+                        "writeback_seconds": float(
+                            writeback_finished - split_finished
+                        ),
+                        "environment_seconds": float(
+                            environment_finished - writeback_finished
+                        ),
+                        "elapsed_seconds": float(
+                            environment_finished - site_started
+                        ),
+                    }
+                )
+
     def run_gate(
         self,
         n_iter=6,
         verbose=False,
         *,
+        block_size=1,
+        sweep_sequence="R",
+        max_bond=None,
+        cutoff=None,
+        cutoff_mode="rsum2",
         min_iter=None,
         rtol=None,
         patience=1,
         finite_check=None,
+        timing=None,
+        timing_sync_device=False,
+        single_pair_fast_path=False,
+        collect_split_diagnostics=True,
     ):  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
         """Run fitting restricted to ``range_int`` with gate-style sweeps.
 
-        The algorithm canonicalizes the active interval and updates tensors
-        using effective environments built from neighboring boundaries. By
-        default, exactly ``n_iter`` sweeps are performed. Supplying ``rtol``
+        This is the gate-restricted, cached-environment form of the paper's
+        DMRG/FIT update. ``block_size=1`` updates one tensor with fixed bond
+        dimensions. ``block_size=2`` forms a wavefunction tensor with the two
+        outer virtual legs and both sites' physical legs, then performs a
+        native SVD across the middle bond. The latter can discover and grow
+        useful bond subspaces up to ``max_bond`` without globally padding the
+        MPS.
+
+        ``run_eff`` implements the same environment-reuse idea for a complete
+        MPS. Keeping this method separate is intentional: MpsOptimizer uses
+        it for local gate compression, and must not refit unrelated sites.
+
+        ``sweep_sequence`` follows Quimb's convention: ``"R"`` sweeps from
+        left to right and ``"L"`` sweeps right to left; sequences such as
+        ``"RL"`` alternate directions. By default, exactly ``n_iter`` sweeps
+        are performed. Supplying ``rtol``
         enables early stopping after ``min_iter`` sweeps once the final local
         norm changes by at most ``rtol`` for ``patience`` consecutive sweeps.
         ``finite_check=True`` checks only the already-computed per-site norm
         scalars, transferring one tiny vector per sweep. A callable retains
-        the general state-check callback behavior.
+        the general state-check callback behavior. ``timing=True`` records one
+        wall-clock entry per sweep and per active-site update. Accelerator
+        timings become kernel-complete when ``timing_sync_device=True``.
+        ``single_pair_fast_path=True`` stops a two-site interval after its one
+        exact variational update; additional sweeps cannot change that local
+        optimum. ``collect_split_diagnostics=False`` avoids allocating SVD
+        metadata when the caller only needs the fitted state.
         """
         if self.p is None:
             raise ValueError("Initial state `p` must be provided.")
+        if not isinstance(block_size, Integral) or int(block_size) not in {1, 2}:
+            raise ValueError("block_size must be 1 or 2.")
+        block_size = int(block_size)
+        sweep_sequence = self._validate_sweep_sequence(sweep_sequence)
+        if max_bond is not None:
+            if not isinstance(max_bond, Integral) or int(max_bond) < 1:
+                raise ValueError("max_bond must be a positive integer or None.")
+            max_bond = int(max_bond)
+        if cutoff is None:
+            cutoff = self.cutoffs
+        cutoff = float(cutoff)
+        if not math.isfinite(cutoff) or cutoff < 0.0:
+            raise ValueError("cutoff must be a finite non-negative number.")
         if not isinstance(n_iter, Integral) or int(n_iter) < 1:
             raise ValueError("n_iter must be a positive integer.")
         n_iter = int(n_iter)
@@ -522,16 +1077,25 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         patience = int(patience)
         if finite_check not in (None, False, True) and not callable(finite_check):
             raise TypeError("finite_check must be bool, callable, or None.")
+        timing = bool(timing)
+        timing_sync_device = bool(timing_sync_device)
+        single_pair_fast_path = bool(single_pair_fast_path)
+        collect_split_diagnostics = bool(collect_split_diagnostics)
+        self._timing_sync_device = timing and timing_sync_device
+        if timing:
+            self.timing_records = []
 
         self.sweep_norm_trace = []
         self.iterations_run = 0
         self.converged = False
+        self.convergence_reason = "max_sweeps"
         self.last_relative_change = None
+        self.final_center_site = None
+        self.final_direction = None
+        self.final_norm = None
 
-        site_tag_id = self.site_tag_id
         psi = self.p
         L = self.L
-        contraction_opt = self.contraction_opt
 
         if L == 1:
             if self.warning:
@@ -547,152 +1111,182 @@ class FIT:  # pylint: disable=too-many-instance-attributes
         if stop == start:
             raise ValueError("run_gate requires range_int spanning at least two sites.")
 
-        env_left = {site_tag_id.format(i): None for i in range(psi.L)}
-        env_right = {site_tag_id.format(i): None for i in range(psi.L)}
-
         previous_sweep_norm = None
         stable_sweeps = 0
         for sweep in range(1, n_iter + 1):
+            direction = sweep_sequence[(sweep - 1) % len(sweep_sequence)]
+            sweep_timing = self._start_timing_record(
+                sweep,
+                timing,
+                direction=direction,
+                block_size=block_size,
+            )
             self.iterations_run = sweep
             sweep_norm_start = len(self.local_norm_trace)
-            for i in range(stop, start, -1):
-                psi.right_canonize_site(i, bra=None)
-
-            for count_, site in enumerate(range(start, stop + 1)):
-                if count_ == 0:
-                    self._right_range(psi, env_right, start, stop)
+            try:
+                if block_size == 1:
+                    self._run_gate_one_site_sweep(
+                        psi,
+                        start,
+                        stop,
+                        direction=direction,
+                        timing_record=sweep_timing,
+                    )
                 else:
-                    self._left_range(psi, site - 1, count_, env_left)
+                    self._run_gate_two_site_sweep(
+                        psi,
+                        start,
+                        stop,
+                        direction=direction,
+                        max_bond=max_bond,
+                        cutoff=cutoff,
+                        cutoff_mode=cutoff_mode,
+                        timing_record=sweep_timing,
+                        collect_split_diagnostics=collect_split_diagnostics,
+                    )
 
-                if self.site_tag_id.format(site) in self.tn.tags:
-                    tn_site = self.tn.select([site_tag_id.format(site)], "any")
-                else:
-                    tn_site = None
+                self.final_direction = direction
+                self.final_center_site = stop if direction == "R" else start
+                self.final_norm = self.local_norm_trace[-1]
 
-                tn = None
-                if site == 0:
-                    if tn_site is not None:
-                        tn = tn_site | env_right[site_tag_id.format(site + 1)]
-                    else:
-                        tn = env_right[site_tag_id.format(site + 1)]
+                if verbose:
+                    fidelity = tn_fidelity(self.tn, psi)
+                    self.fidelity_trace.append(ar.do("real", fidelity))
 
-                if 0 < site < L - 1:
-                    # Boundary consistency: the left and right indices must match between tn and p
-                    if count_ == 0:
-                        indx = psi.bond(start - 1, start)
-                        indx_ = self.tn.bond(start - 1, start)
-                        if tn_site is not None:
-                            tn_site = tn_site.reindex({indx_: indx})
-                    if count_ == stop - start:
-                        indx = psi.bond(stop + 1, stop)
-                        indx_ = self.tn.bond(stop + 1, stop)
-                        if tn_site is not None:
-                            tn_site = tn_site.reindex({indx_: indx})
+                if callable(finite_check) and not bool(finite_check(psi)):
+                    error = FloatingPointError(
+                        f"FIT gate sweep {sweep} produced non-finite tensor data."
+                    )
+                    error.fit_iteration = sweep
+                    raise error
 
-                    if tn_site is not None:
-                        if (
-                            env_right[site_tag_id.format(site + 1)] is not None
-                            and env_left[site_tag_id.format(site - 1)] is not None
-                        ):
-                            tn = (
-                                tn_site
-                                | env_right[site_tag_id.format(site + 1)]
-                                | env_left[site_tag_id.format(site - 1)]
-                            )
-                        elif env_left[site_tag_id.format(site - 1)] is not None:
-                            tn = tn_site | env_left[site_tag_id.format(site - 1)]
-                        elif env_right[site_tag_id.format(site + 1)] is not None:
-                            tn = tn_site | env_right[site_tag_id.format(site + 1)]
-                        else:
-                            tn = tn_site
-                    else:
-                        tn = (
-                            env_right[site_tag_id.format(site + 1)]
-                            | env_left[site_tag_id.format(site - 1)]
+                if finite_check is True or rtol is not None:
+                    sweep_scalars = self.local_norm_trace[sweep_norm_start:]
+                    try:
+                        sweep_norms = np.asarray(
+                            ar.to_numpy(ar.do("stack", sweep_scalars))
+                        ).reshape(-1)
+                    except Exception:
+                        # Unknown backends can omit scalar stack. NumPy,
+                        # Torch, CuPy, and supported Symmray leaves use the
+                        # one-transfer path above.
+                        sweep_norms = np.asarray(
+                            [float(ar.to_numpy(value)) for value in sweep_scalars]
                         )
+                    if finite_check is True and not bool(
+                        np.all(np.isfinite(sweep_norms))
+                    ):
+                        error = FloatingPointError(
+                            f"FIT gate sweep {sweep} produced a non-finite local norm."
+                        )
+                        error.fit_iteration = sweep
+                        raise error
 
-                if site == L - 1:
-                    if tn_site is not None:
-                        tn = tn_site | env_left[site_tag_id.format(site - 1)]
-                    else:
-                        tn = env_left[site_tag_id.format(site - 1)]
+                should_stop = False
+                if (
+                    single_pair_fast_path
+                    and block_size == 2
+                    and stop == start + 1
+                ):
+                    # There is only one variational pair. Its effective tensor
+                    # and native SVD solve the complete active problem in one
+                    # update, so rebuilding identical environments is wasted.
+                    self.converged = True
+                    self.convergence_reason = "single_pair_exact"
+                    self.last_relative_change = 0.0
+                    should_stop = True
+                if rtol is not None:
+                    sweep_norm = float(sweep_norms[-1])
+                    self.sweep_norm_trace.append(sweep_norm)
+                    if not math.isfinite(sweep_norm):
+                        error = FloatingPointError(
+                            f"FIT gate sweep {sweep} produced a non-finite local norm."
+                        )
+                        error.fit_iteration = sweep
+                        raise error
+                    if previous_sweep_norm is not None:
+                        scale = max(
+                            abs(sweep_norm),
+                            abs(previous_sweep_norm),
+                            float.fromhex("0x1.0p-1022"),
+                        )
+                        relative_change = abs(
+                            sweep_norm - previous_sweep_norm
+                        ) / scale
+                        self.last_relative_change = relative_change
+                        if relative_change <= rtol:
+                            stable_sweeps += 1
+                        else:
+                            stable_sweeps = 0
+                        if sweep >= min_iter and stable_sweeps >= patience:
+                            self.converged = True
+                            self.convergence_reason = "relative_tolerance"
+                            should_stop = True
+                    previous_sweep_norm = sweep_norm
+            except BaseException as error:
+                self.convergence_reason = "failed"
+                if sweep_timing is not None:
+                    sweep_timing["error"] = f"{type(error).__name__}: {error}"
+                    self._finish_timing_record(sweep_timing, status="failed")
+                raise
+            else:
+                if sweep_timing is not None:
+                    self._finish_timing_record(sweep_timing, status="complete")
+                if should_stop:
+                    break
 
-                if tn is None:
-                    raise ValueError("Failed to build effective tensor for gate sweep.")
+    def _start_timing_record(
+        self,
+        sweep,
+        enabled,
+        *,
+        direction="R",
+        block_size=1,
+    ):
+        """Start one opt-in FIT sweep timing record."""
+        if not enabled:
+            return None
+        started = self._timing_mark()
+        return {
+            "sweep": int(sweep),
+            "range_int": tuple(self.range_int),
+            "direction": str(direction),
+            "block_size": int(block_size),
+            "environment_strategy": self.environment_strategy,
+            "timing_sync_device": bool(self._timing_sync_device),
+            "site_timings": [],
+            "_started": started,
+        }
 
-                if isinstance(tn, qtn.TensorNetwork):
-                    f = tn.contract(all, optimize=contraction_opt).transpose(
-                        *psi[site_tag_id.format(site)].inds
-                    )
-                elif isinstance(tn, qtn.Tensor):
-                    f = tn.transpose(*psi[site_tag_id.format(site)].inds)
-                else:
-                    raise TypeError("Unexpected effective tensor type during run_gate.")
+    def _finish_timing_record(self, record, *, status):
+        """Finalize and retain one FIT sweep timing record."""
+        started = record.pop("_started")
+        record["status"] = status
+        record["elapsed_seconds"] = float(self._timing_mark() - started)
+        record["site_count"] = len(record["site_timings"])
+        record["site_elapsed_seconds"] = float(
+            sum(site["elapsed_seconds"] for site in record["site_timings"])
+        )
+        record["non_site_elapsed_seconds"] = max(
+            0.0,
+            record["elapsed_seconds"] - record["site_elapsed_seconds"],
+        )
+        record["converged"] = bool(self.converged)
+        record["convergence_reason"] = self.convergence_reason
+        record["relative_change"] = self.last_relative_change
+        self.timing_records.append(record)
 
-                norm_f = (f.H & f).contract(all) ** 0.5
-                self.local_norm_trace.append(ar.do("real", norm_f))
+    def _timing_mark(self):
+        """Return a wall-clock mark after an optional device barrier."""
+        if self._timing_sync_device:
+            _synchronize_tensor_network(self.p)
+        return time.perf_counter()
 
-                # Update tensor data
-                psi[site].modify(data=f.data)
+    @staticmethod
+    def synchronize_backend(tn):
+        """Synchronize accelerator work for explicit external profiling."""
+        _synchronize_tensor_network(tn)
 
-                if site < stop:
-                    psi.left_canonize_site(site, bra=None)
-
-            # Compute fidelity if verbose mode is enabled
-            if verbose:
-                fidelity = tn_fidelity(self.tn, psi)
-                self.fidelity_trace.append(ar.do("real", fidelity))
-
-            if callable(finite_check) and not bool(finite_check(psi)):
-                error = FloatingPointError(
-                    f"FIT gate sweep {sweep} produced non-finite tensor data."
-                )
-                error.fit_iteration = sweep
-                raise error
-
-            if finite_check is True or rtol is not None:
-                sweep_scalars = self.local_norm_trace[sweep_norm_start:]
-                try:
-                    sweep_norms = np.asarray(
-                        ar.to_numpy(ar.do("stack", sweep_scalars))
-                    ).reshape(-1)
-                except Exception:
-                    # Compatibility fallback for a backend without scalar
-                    # stack support. NumPy, Torch, and CuPy use the fast path.
-                    sweep_norms = np.asarray(
-                        [float(ar.to_numpy(value)) for value in sweep_scalars]
-                    )
-                if finite_check is True and not bool(np.all(np.isfinite(sweep_norms))):
-                    error = FloatingPointError(
-                        f"FIT gate sweep {sweep} produced a non-finite local norm."
-                    )
-                    error.fit_iteration = sweep
-                    raise error
-
-            if rtol is not None:
-                sweep_norm = float(sweep_norms[-1])
-                self.sweep_norm_trace.append(sweep_norm)
-                if not math.isfinite(sweep_norm):
-                    error = FloatingPointError(
-                        f"FIT gate sweep {sweep} produced a non-finite local norm."
-                    )
-                    error.fit_iteration = sweep
-                    raise error
-                if previous_sweep_norm is not None:
-                    scale = max(
-                        abs(sweep_norm),
-                        abs(previous_sweep_norm),
-                        float.fromhex("0x1.0p-1022"),
-                    )
-                    relative_change = abs(
-                        sweep_norm - previous_sweep_norm
-                    ) / scale
-                    self.last_relative_change = relative_change
-                    if relative_change <= rtol:
-                        stable_sweeps += 1
-                    else:
-                        stable_sweeps = 0
-                    if sweep >= min_iter and stable_sweeps >= patience:
-                        self.converged = True
-                        break
-                previous_sweep_norm = sweep_norm
+    def get_timing(self):
+        """Return a copy of the most recent opt-in per-sweep timing records."""
+        return deepcopy(self.timing_records)

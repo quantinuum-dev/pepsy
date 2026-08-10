@@ -102,12 +102,16 @@ measures each target in `basis`, records the result, then resets it to the
 physical leg with `vec`, absorbs it into the selected neighbour, and shortens
 the MPS by one site.
 
-`mode="mix"` is a unitary gate-stream mode that warms up with MPO replay until
-the global bond and every bond in the active gate interval reach their
-`chi`-capped physical rank targets, then uses transactional DMRG replay.
-Structurally smaller edge bonds use their attainable rank rather than being
-padded to `chi`. One-site gates remain on the exact direct/MPO path;
-`k_2q_batch` controls contiguous DMRG-ready two-site batches. If a DMRG batch
+`mode="fit"` is a clear alias for the historical `mode="dmrg"`. Both default
+to native two-site FIT. `mode="mix"` is the transactional unitary variant.
+With `fit_block_size=2`, FIT grows only bonds visited by the gate interval, up
+to `chi`, through the middle-bond SVD; it does not pad the whole MPS and does
+not need an MPO rank warm-up. `fit_block_size=1` retains the fixed-rank
+compatibility algorithm, for which mixed mode still warms short active bonds
+through MPO. Standalone one-site gates use the exact direct/MPO path; ordinary
+DMRG target blocks can absorb intervening one-site gates before the block's
+shared compression. `fit_layer_size` is the clear name for `k_2q_batch`; it
+counts two-site gates in a contiguous paper-style target block. If a DMRG/FIT batch
 raises, produces non-finite data, or exceeds `chi`, the optimizer restores the
 complete pre-batch state (including canonical and infidelity metadata) and
 replays the batch through MPO. Interrupts restore the trial state and are
@@ -120,6 +124,11 @@ change; `mix_fit_rtol="auto"` selects `1e-3`, `1e-5`, or `1e-8` for 16-,
 32-/complex64-, or higher-precision data. Pass `mix_fit_rtol=None` for fixed
 iterations. FIT checks the small per-site norm scalars it already computes
 after every sweep, transferring only one active-span-sized vector to the host.
+An adjacent two-site interval is a structural special case: its only pair is
+the complete variational problem, so the default
+`fit_single_pair_fast_path=True` stops after one effective-tensor SVD even when
+`mix_fit_rtol=None`. Set it to `False` only when intentionally benchmarking
+repeated identical sweeps.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
 when `mix_fit_rtol="auto"`, while an explicit numeric tolerance enables
@@ -129,6 +138,43 @@ full check at the next DMRG handoff or at the end of the segment. A
 transactional MPO fallback is checked before commit. Torch and CuPy full
 checks process one tensor at a time, combine scalar results on the device, and
 transfer one Boolean to the host.
+
+The DMRG/FIT update follows the variational update described in
+the [Ayral *et al.* PRX Quantum paper](https://doi.org/10.1103/PRXQuantum.4.020304):
+the effective tensor is built from cached contractions on the left and right,
+then the MPS is swept repeatedly. Recommended `fit_block_size=2` forms a local
+wavefunction with the two outer virtual legs and both sites' physical groups,
+then splits its middle bond with `Tensor.split`. This dispatches to configured
+dense SVD drivers and, crucially, Symmray's native block SVD for U1, U1xU1,
+and fermionic tensors. `fit_sweep_sequence="RL"` alternates canonical
+directions; `"R"` preserves a one-way sweep when required.
+
+In this optimizer the fit is intentionally
+restricted to the interval `[xmin, xmax]` touched by the current two-site gate
+or batch. This is implemented by `FIT.run_gate`, the gate-window version of
+`FIT.run_eff`; `run_eff` remains the full-chain solver used by boundary fits.
+Using `run_eff` for each gate would refit unrelated sites and would no longer
+be local DMRG compression. `fit_layer_size=N` explicitly forms the paper's
+multi-gate/layer target before each restricted fit. With the default
+`fit_target_strategy="auto"`, ordinary NumPy/Torch/CuPy gates remain as exact
+spatially split operator layers: FIT contracts them lazily instead of growing,
+copying, and repeatedly decomposing an intermediate target MPS. The gate SVD
+has only the operator-Schmidt rank and does not apply the output `chi` limit.
+`fit_target_strategy="mps"` selects the traditional materialized target;
+`"auto"` also chooses that native routed representation for Symmray U1/U1xU1
+and fermionic data. `target_cutoff=0.0` keeps either representation exact while
+ordinary `cutoff` controls only the two-site output split, so target-
+construction loss is not reported as FIT loss.
+
+Unitary DMRG/FIT streams default to `fit_stabilize_unitary=True`. After each
+compression, Pepsy first records retained norm loss in log-fidelity space when
+infidelity tracking is enabled, then restores the raw working MPS to its
+pre-compression norm without accumulating that approximation loss in
+`p.exponent`. FIT reports its final canonical center and retained norm, so this
+rescaling reuses them rather than performing a second canonical sweep. This
+prevents deep complex64 streams from underflowing while
+keeping cumulative infidelity meaningful. Set the option to `False` only to
+reproduce historical norm-decay behavior.
 
 After a non-finite DMRG result, `mix_sticky_nonfinite=True` keeps the remainder
 of the current `run()` call on MPO rather than retrying an unhealthy FIT for
@@ -151,11 +197,27 @@ The copy-safe record contains replay wall time, event count, final bond,
 backend signature, and—when using `mode="mix"`—a copy of
 `last_mix_summary`, including its elapsed time and backend decision counts.
 It also contains inclusive `stages` totals for `gate_stream.prepare`, the
-active mode replay, `canonicalize`, `gate.apply`, `dmrg.fit`,
+active mode replay, `canonicalize`, `gate.apply`, `dmrg.target`, `dmrg.fit`,
 `normalization`, `control.<event>`, and `infidelity.compute`. Stage totals can
 overlap with the mode replay total; use them to identify the dominant work,
-not to add into a second total. Ordinary runs retain no per-gate timer
-overhead.
+not to add into a second total. DMRG and mixed-mode timing also exposes
+`fit_steps`: one record per completed or failed FIT sweep, including its FIT
+call index, global record index, direction, block size, active interval, sweep
+time, per-site/pair update times, and non-site sweep overhead. Two-site pair
+records separate effective-environment contraction, native SVD, writeback/norm,
+and moving-environment time. Ordinary runs retain no per-gate timer overhead.
+These are host wall-clock measurements by default. Use
+`run(timing=True, timing_sync_device=True)` for kernel-complete Torch CUDA,
+CuPy, or JAX timings; the added barriers intentionally make profiling slower
+and are recorded as `timing_sync_device=True` in both replay and FIT records.
+
+Parallel pTEBD/IPMC and local-TDVP circuit compression are intentionally not
+aliases of this sequential solver. Their status is exposed through
+`pepsy.experimental.mps_fit.experimental_mps_fit_backends()`. pTEBD/IPMC needs
+faithful parallel independent-compression scheduling (Phys. Rev. B 110,
+085149), while the local-TDVP circuit route remains based on a 2025 preprint.
+Selecting either currently raises a clear `NotImplementedError` instead of
+silently running a different algorithm.
 
 `mode="su"` uses simple-update evolution for imaginary-time or other
 non-unitary gate streams. It keeps `opt.p` as the simple-update core and

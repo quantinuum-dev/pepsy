@@ -928,9 +928,18 @@ quimb's block-aware auto-swap split path for nonlocal 1D gate streams such as a
 row-major square lattice. ``mode="mpo"`` uses its usual sub-MPO compression for
 nearest-neighbor gates and falls back to the same Symmray auto-swap path for
 nonlocal gates, because the current quimb/Symmray sub-MPO path mixes in dense
-helper tensors. ``mode="exact"`` is useful as a small-system reference, and
-``mode="dmrg"`` works when the initial symmetric MPS was built with enough
-block-sparse bond capacity, for example ``bond_dim >= chi``.
+helper tensors. ``mode="exact"`` is useful as a small-system reference.
+``mode="fit"`` (the alias of ``mode="dmrg"``) defaults to
+``fit_block_size=2`` and can grow visited bonds without dense padding: the
+effective two-site tensor is split by Symmray's native block SVD, preserving
+U1/U1xU1 charges, dual legs, fermionic dummy modes, and graded phases.
+`fit_target_strategy="auto"` deliberately selects the native routed-MPS target
+for these arrays; the lazy layered target optimization is currently limited to
+ordinary NumPy/Torch/CuPy tensors because graded gate-layer tagging needs a
+separate phase-contract validation. Explicit `fit_target_strategy="layered"`
+therefore fails early instead of densifying or guessing fermionic metadata.
+Fixed-rank ``fit_block_size=1`` requires the needed native bond capacity to
+exist already.
 
 ```python
 peps = py.SymPEPS.for_model("itf", 4, 4, bond_dim=2)
