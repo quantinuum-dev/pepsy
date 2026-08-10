@@ -120,6 +120,148 @@ def test_register_torch_svd_for_autoray():
     assert vh.shape == (2, 2)
 
 
+def test_torch_linalg_config_is_public_and_reports_runtime():
+    """The structured Torch policy exposes resolved and runtime information."""
+    torch = pytest.importorskip("torch")
+    config = pepsy.TorchLinalgConfig(
+        mode="complex",
+        stabilized=False,
+        svd_driver="auto",
+        cpu_svd="torch",
+    )
+    assert config.resolved_svd_fallback == "none"
+    assert config.approximate is False
+    assert config.exact is True
+    info = config.describe()
+    assert info["torch_version"] == torch.__version__
+    assert info["cuda_available"] is False or isinstance(
+        info["cuda_available"], bool
+    )
+    assert info["cpu_svd"] == "torch"
+
+
+def test_torch_linalg_config_rejects_unacknowledged_approximate_driver():
+    """The approximate CUDA driver must be an explicit user decision."""
+    pytest.importorskip("torch")
+    with pytest.raises(ValueError, match="approximate"):
+        pepsy.TorchLinalgConfig(svd_driver="gesvda")
+
+    config = pepsy.TorchLinalgConfig(
+        svd_driver="gesvda",
+        allow_approximate=True,
+    )
+    assert config.approximate is True
+    assert config.exact is False
+
+
+@pytest.mark.parametrize("cpu_svd", ["scipy_gesdd", "scipy_gesvd"])
+def test_torch_linalg_config_cpu_exact_scipy_complex64(cpu_svd):
+    """Exact SciPy CPU choices preserve complex64 reconstruction."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("scipy")
+    import autoray as ar
+
+    config = pepsy.TorchLinalgConfig(
+        stabilized=False,
+        cpu_svd=cpu_svd,
+    )
+    assert config.exact is True
+    try:
+        config.register()
+        matrix = torch.randn(7, 4, dtype=torch.complex64)
+        u, s, vh = ar.do("linalg.svd", matrix)
+        assert u.dtype is torch.complex64
+        assert s.dtype is torch.float32
+        assert vh.dtype is torch.complex64
+        reconstructed = u @ torch.diag_embed(s.to(matrix.dtype)) @ vh
+        torch.testing.assert_close(reconstructed, matrix, rtol=2e-5, atol=2e-5)
+    finally:
+        pepsy.reset_linalg_registrations(backend="torch")
+
+
+def test_native_svd_policy_passes_explicit_cuda_driver(monkeypatch):
+    """The configured CUDA driver reaches Torch without requiring a GPU test."""
+    torch = pytest.importorskip("torch")
+    from pepsy.backends import linalg_torch
+
+    calls = []
+
+    class FakeCudaTensor:
+        device = torch.device("cuda")
+        is_cuda = True
+        requires_grad = False
+
+    def fake_svd(array, *args, **kwargs):
+        calls.append((array, args, kwargs))
+        return "u", "s", "vh"
+
+    monkeypatch.setattr(torch.linalg, "svd", fake_svd)
+    result = linalg_torch._native_svd_configured(  # pylint: disable=protected-access
+        FakeCudaTensor(),
+        driver="gesvdj",
+    )
+    assert result == ("u", "s", "vh")
+    assert calls[0][2]["driver"] == "gesvdj"
+    assert calls[0][2]["full_matrices"] is False
+
+
+def test_torch_linalg_config_cpu_scipy_stabilized_path_keeps_backward():
+    """An explicit SciPy CPU forward can still use the stabilized VJP."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("scipy")
+    import autoray as ar
+
+    config = pepsy.TorchLinalgConfig(
+        mode="real",
+        stabilized=True,
+        cpu_svd="scipy_gesdd",
+    )
+    try:
+        config.register()
+        matrix = torch.randn(5, 3, dtype=torch.float64, requires_grad=True)
+        u, s, vh = ar.do("linalg.svd", matrix)
+        assert u.shape == (5, 3)
+        assert s.shape == (3,)
+        assert vh.shape == (3, 3)
+        (u.square().sum() + s.sum() + vh.square().sum()).backward()
+        assert torch.isfinite(matrix.grad).all()
+    finally:
+        pepsy.reset_linalg_registrations(backend="torch")
+
+
+def test_torch_linalg_config_native_scipy_path_rejects_autodiff():
+    """Native registration never silently drops gradients on SciPy output."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("scipy")
+    import autoray as ar
+
+    config = pepsy.TorchLinalgConfig(
+        stabilized=False,
+        cpu_svd="scipy_gesvd",
+    )
+    try:
+        config.register()
+        matrix = torch.randn(4, 3, dtype=torch.float64, requires_grad=True)
+        with pytest.raises(RuntimeError, match="forward-only"):
+            ar.do("linalg.svd", matrix)
+    finally:
+        pepsy.reset_linalg_registrations(backend="torch")
+
+
+def test_torch_linalg_config_activated_restores_previous_policy():
+    """Scoped policy activation restores the prior native configuration."""
+    pytest.importorskip("torch")
+    native = pepsy.TorchLinalgConfig()
+    stabilized = pepsy.TorchLinalgConfig(stabilized=True)
+    try:
+        native.register()
+        with stabilized.activated():
+            assert pepsy.get_torch_linalg_config() == stabilized
+        assert pepsy.get_torch_linalg_config() == native
+    finally:
+        pepsy.reset_linalg_registrations(backend="torch")
+
+
 def test_torch_linalg_registration_is_idempotent(monkeypatch):
     """Repeated public/backend registration does not re-patch Autoray."""
     pytest.importorskip("torch")

@@ -20,12 +20,14 @@ from .config import (
     build_backend,
     get_default_array_backend,
     get_default_grad_backend,
+    get_torch_linalg_config,
     register_jax_linalg,
     register_torch_linalg,
     reset_linalg_registrations,
     reset_default_backends,
     set_default_array_backend,
     set_default_grad_backend,
+    TorchLinalgConfig,
 )
 
 __all__ = [
@@ -44,6 +46,8 @@ __all__ = [
     "to_float",
     "get_default_array_backend",
     "get_default_grad_backend",
+    "get_torch_linalg_config",
+    "TorchLinalgConfig",
     "register_jax_linalg",
     "register_torch_linalg",
     "reset_linalg_registrations",

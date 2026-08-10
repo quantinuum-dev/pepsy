@@ -1,5 +1,70 @@
 # `pepsy.optimizers.mps.optimizer`
 
+## Torch SVD policy
+
+Torch/Autoray SVD dispatch is process-global, so configure it once at
+application startup or use a scoped policy for an experiment:
+
+```python
+import pepsy
+
+svd_policy = pepsy.TorchLinalgConfig(
+    mode="complex",
+    stabilized=False,       # native Torch forward and backward
+    svd_driver="auto",     # CUDA: let Torch select its default driver
+    cpu_svd="torch",       # CPU: Torch's native LAPACK path
+    svd_fallback="auto",   # no fallback for native mode
+)
+svd_policy.register()
+print(svd_policy.describe())
+```
+
+`svd_driver` applies only to CUDA and accepts `"auto"`, `"gesvdj"`,
+`"gesvda"`, or `"gesvd"`. `gesvda` is approximate and requires
+`allow_approximate=True`. `cpu_svd` accepts `"torch"`, `"scipy_gesdd"`, or
+`"scipy_gesvd"`; the SciPy choices are intended for explicit forward-only
+CPU experiments when `stabilized=False`, or for stabilized autodiff when
+`stabilized=True`. `svd_fallback="auto"` means no fallback for native mode
+and SciPy `gesvd` for stabilized mode.
+
+The non-approximate choices are CUDA `gesvdj` and `gesvd`, plus CPU Torch,
+SciPy `gesdd`, and SciPy `gesvd`. For `complex64`, try CUDA `gesvdj` first;
+on CPU, benchmark `scipy_gesdd` against the native Torch path. `gesvd` is a
+robust fallback rather than the speed choice. The approximate CUDA `gesvda`
+driver is never selected unless `allow_approximate=True` is passed, and the
+policy exposes this decision as `policy.exact` and `policy.approximate`.
+
+For example, an exact complex64-oriented CPU experiment is:
+
+```python
+pepsy.TorchLinalgConfig(
+    mode="complex",
+    stabilized=False,
+    cpu_svd="scipy_gesdd",
+).register()
+```
+
+On CUDA, select the exact Jacobi driver explicitly with
+`svd_driver="gesvdj"`. These settings do not change the tensor dtype; they
+change only the underlying SVD implementation.
+
+For ordinary MPS simulation, native mode is the recommended default. The
+regularized mode exists for finite SVD gradients and difficult autodiff
+inputs, not as a faster forward SVD. A temporary policy restores the previous
+one when the block exits:
+
+```python
+with pepsy.TorchLinalgConfig(
+    stabilized=True,
+    svd_fallback="scipy_gesvd",
+).activated():
+    run_differentiable_workflow()
+```
+
+Use `pepsy.get_torch_linalg_config()` to inspect the last Pepsy-installed
+policy. `pepsy.reset_linalg_registrations(backend="torch")` restores native
+Torch and Quimb split registrations.
+
 `MpsOptimizer` consumes canonical bundled gate streams of the form
 `[(gate, where), ...]`. In `mode="mpo"` the stream can also contain explicit
 sub-MPO events for already-factorized nonlocal operators:

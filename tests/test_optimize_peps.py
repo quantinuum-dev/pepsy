@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from pepsy.backends import TorchLinalgConfig
 import pepsy.optimizers.peps.optimizer as peps_mod
 from pepsy.optimizers.peps import PepsOptimizer
 
@@ -513,11 +514,14 @@ def test_peps_optimizer_global_defaults_options_and_torch_svd(monkeypatch):
         lambda *args, **kwargs: {"infidelity": next(infidelities)},
     )
     registered = []
-    monkeypatch.setattr(
-        peps_mod,
-        "register_torch_linalg",
-        lambda **kwargs: registered.append(dict(kwargs)),
-    )
+    class _RecordingConfig:
+        def __init__(self, **kwargs):
+            registered.append(dict(kwargs))
+
+        def register(self):
+            return self
+
+    monkeypatch.setattr(peps_mod, "TorchLinalgConfig", _RecordingConfig)
     captured = {}
 
     class _FakeGlobal:
@@ -594,6 +598,41 @@ def test_peps_optimizer_global_defaults_options_and_torch_svd(monkeypatch):
     assert "losses" not in result_summary
 
 
+def test_peps_optimizer_accepts_one_torch_linalg_policy(monkeypatch):
+    """PepsOptimizer uses the supplied class for SVD and QR registration."""
+    registered = []
+
+    def _register(policy):
+        registered.append(policy)
+        return policy
+
+    monkeypatch.setattr(TorchLinalgConfig, "register", _register)
+    policy = TorchLinalgConfig(
+        mode="complex",
+        stabilized=False,
+        svd_driver="gesvdj",
+        cpu_svd="scipy_gesdd",
+    )
+
+    opt = PepsOptimizer(
+        DummyState(bond=1),
+        [],
+        chi=3,
+        mode="global",
+        torch_linalg_config=policy,
+        normalize_initial=False,
+    )
+    opt._maybe_configure_torch_linalg(  # pylint: disable=protected-access
+        opt.state,
+        opt.state,
+        {"autodiff_backend": "torch"},
+    )
+
+    assert registered == [policy]
+    assert registered[0].exact is True
+    assert registered[0].stabilized is False
+
+
 def test_peps_optimizer_global_nlopt_runtime_error_falls_back(monkeypatch):
     """NLopt runtime errors should fall back to a short LBFGS cleanup."""
     _install_fake_gate(monkeypatch)
@@ -604,7 +643,7 @@ def test_peps_optimizer_global_nlopt_runtime_error_falls_back(monkeypatch):
         "boundary_infidelity",
         lambda *args, **kwargs: {"infidelity": next(infidelities)},
     )
-    monkeypatch.setattr(peps_mod, "register_torch_linalg", lambda **kwargs: None)
+    monkeypatch.setattr(peps_mod.TorchLinalgConfig, "register", lambda self: self)
     captured = {}
 
     class _FakeNloptRuntimeError(Exception):
@@ -665,7 +704,7 @@ def test_peps_optimizer_global_default_budget_is_user_overridable(monkeypatch):
         "boundary_infidelity",
         lambda *args, **kwargs: {"infidelity": 0.05},
     )
-    monkeypatch.setattr(peps_mod, "register_torch_linalg", lambda **kwargs: None)
+    monkeypatch.setattr(peps_mod.TorchLinalgConfig, "register", lambda self: self)
     captured = {}
 
     class _FakeGlobal:
