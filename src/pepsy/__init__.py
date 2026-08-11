@@ -15,6 +15,7 @@ _CORE_MODULES = (
     "backends",
     "boundary",
     "fitting",
+    "interop",
     "operators",
     "optimizers",
     "sampling",
@@ -59,6 +60,10 @@ _SYMBOL_MODULES = {
     "TorchLinalgConfig": ".backends",
     "to_float": ".backends",
     "FIT": ".fitting",
+    "GuppyConversionError": ".interop",
+    "GuppyGateStream": ".interop",
+    "GuppyMeasurement": ".interop",
+    "guppy_gate_stream": ".interop",
     "internal_inds": ".fitting",
     "build_mpo_from_gates": ".operators",
     "build_pepo_from_gates": ".operators",
@@ -292,7 +297,8 @@ def __getattr__(name):
 
 if TYPE_CHECKING:
     from .bp import gauge_all, gauge_all_simple, one_norm_bp  # noqa: F401
-    from . import backends, boundary, bp, experimental, fitting, operators, optimizers, sampling, solvers, tensors, vmc  # noqa: F401
+    from . import backends, boundary, bp, experimental, fitting, interop, operators, optimizers, sampling, solvers, tensors, vmc  # noqa: F401
+    from .interop import GuppyConversionError, GuppyGateStream, GuppyMeasurement, guppy_gate_stream  # noqa: F401
     from .backends import (  # noqa: F401
         backend_infer,
         get_default_array_backend,

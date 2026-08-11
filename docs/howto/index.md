@@ -6,3 +6,4 @@ Task-oriented references for common operational questions.
 - [Tune solvers](solver_tuning.md)
 - [Troubleshooting](troubleshooting.md)
 - [Stabilizer tensor-network magic](stabilizer_tn_magic.md)
+- [Guppy circuit streams](../api/interop.md)
