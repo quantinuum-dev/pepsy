@@ -44,7 +44,7 @@ def test_tree_optimizers_are_available_from_high_level_api():
 _EXPECTED_IN_ALL = [
     "backends", "boundary", "experimental", "fitting", "operators", "optimizers",
     "sampling", "solvers", "tensors", "vmc",
-    "BdyMPS", "CompBdy", "BoundaryContractResult", "contract_boundary",
+    "BdyMPS", "CompBdy", "BoundaryContractResult", "BoundaryFitDiagnostic", "contract_boundary",
     "contract_flat", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
     "peps_norm", "peps_infidelity", "peps_fidelity", "GlobalOptimizer", "FIT",
     "tns_align", "measure_obs", "build_pepo_from_gates", "build_mpo_from_gates",

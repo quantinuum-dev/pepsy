@@ -28,6 +28,7 @@ _SYMBOL_MODULES = {
     # Boundary and backend helpers.
     "BdyMPS": ".boundary",
     "BoundaryContractResult": ".boundary",
+    "BoundaryFitDiagnostic": ".boundary",
     "CompBdy": ".boundary",
     "boundary_norm": ".boundary",
     "build_bra_ket": ".boundary",

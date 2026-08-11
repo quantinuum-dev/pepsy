@@ -56,12 +56,17 @@ Reusing a boundary at a larger `chi` does not globally pad it first; lowering
   `BoundaryContractResult`.
 - `peps_normalize(...)` / `normalize(...)`: normalize a PEPS in place.
 - `boundary_norm(...)` / `peps_norm(...)`: compute `<p|p>` without rescaling.
+  Pass `return_info=True` for the structured result instead of only the scalar.
 - `peps_infidelity(...)` / `infidelity(...)`: compute boundary-based
   infidelity, optionally reusing norm and overlap boundaries.
+- `peps_fidelity(...)`: return only fidelity by default, or preserve all three
+  contraction results and their FIT diagnostics with `return_info=True`.
 - `contract_flat(...)`: contract an already-flat PEPS-like tensor network.
 
-Use `result.cost` and `result.fidel` from `BoundaryContractResult`; do not rely
-on tuple unpacking.
+Use `result.cost`, `result.fidel`, and `result.fit_diagnostics` from
+`BoundaryContractResult`; do not rely on tuple unpacking. Each typed boundary
+FIT diagnostic reports actual iterations and convergence, with detailed sweep
+timing populated only when `fit_timing=True`.
 
 ## Boundary methods
 

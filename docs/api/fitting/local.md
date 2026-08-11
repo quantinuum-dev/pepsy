@@ -65,3 +65,9 @@ normal runs never pay for these synchronization barriers. FIT also exposes
 `final_center_site`, `final_norm`, `final_direction`, and
 `convergence_reason`, allowing an optimizer to reuse the known canonical
 center without a redundant sweep.
+
+Those adaptive and detailed timing fields belong to `run_gate()`. The legacy
+`run()` and `run_eff()` solvers remain fixed-sweep numerical paths and are not
+silently changed by the gate-window controls. PEPS boundary results describe
+them as `convergence_reason="fixed_sweeps"` and can collect one coarse elapsed
+time per boundary fit without altering either solver's update sequence.

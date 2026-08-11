@@ -52,8 +52,12 @@ editing the solver or its MpsOptimizer integration.
   MPS as a side effect.
 - U1, U1U1, dual-leg, dummy-mode, and fermionic phase metadata remain native.
 - Compression loss is recorded before unitary working-state renormalization.
+- The public stabilization control is `stabilize_unitary`; it covers FIT
+  and mixed-mode MPO compression without changing the recorded loss.
 - Reuse FIT's final canonical center/norm for stabilization; do not sweep the
   same interval a second time.
+- Keep `run()` and `run_eff()` fixed-sweep semantics independent of adaptive
+  `run_gate()` controls; wrappers may report them as `fixed_sweeps`.
 - A failed sweep retains a timing record with `status="failed"`.
 - Experimental algorithm names must not dispatch to a materially different
   sequential fallback.

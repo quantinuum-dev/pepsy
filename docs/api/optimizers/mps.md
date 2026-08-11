@@ -118,20 +118,24 @@ replays the batch through MPO. Interrupts restore the trial state and are
 re-raised.
 
 For ordinary DMRG and mixed DMRG, `n_iter` is a maximum rather than an
-unconditional sweep count. `mix_fit_min_iter`, `mix_fit_rtol`, and
-`mix_fit_patience` control adaptive stopping from FIT's final local-norm
-change; `mix_fit_rtol="auto"` selects `1e-3`, `1e-5`, or `1e-8` for 16-,
-32-/complex64-, or higher-precision data. Pass `mix_fit_rtol=None` for fixed
-iterations. FIT checks the small per-site norm scalars it already computes
-after every sweep, transferring only one active-span-sized vector to the host.
+unconditional sweep count. `fit_min_iter`, `fit_rtol`, and `fit_patience`
+control adaptive stopping from FIT's final local-norm change;
+`fit_rtol="auto"` selects `1e-3`, `1e-5`, or `1e-8` for 16-, 32-/complex64-,
+or higher-precision data. Pass `fit_rtol=None` for fixed iterations. The old
+`mix_fit_min_iter`, `mix_fit_rtol`, and `mix_fit_patience` spellings remain as
+deprecated aliases. A legacy value replaces the canonical default for old
+call sites; a conflicting non-default canonical value fails instead of
+silently choosing a policy. FIT checks the small per-site norm scalars it
+already computes after every sweep, transferring only one active-span-sized
+vector to the host.
 An adjacent two-site interval is a structural special case: its only pair is
 the complete variational problem, so the default
 `fit_single_pair_fast_path=True` stops after one effective-tensor SVD even when
-`mix_fit_rtol=None`. Set it to `False` only when intentionally benchmarking
+`fit_rtol=None`. Set it to `False` only when intentionally benchmarking
 repeated identical sweeps.
 It does not allocate or scan a second MPS. Ordinary DMRG raises on a detected
 non-finite sweep; for compatibility, non-unitary DMRG retains fixed sweeps
-when `mix_fit_rtol="auto"`, while an explicit numeric tolerance enables
+when `fit_rtol="auto"`, while an explicit numeric tolerance enables
 adaptive stopping there too. Mixed DMRG additionally performs one full tensor
 check before committing a trial, while consecutive MPO warm-up steps share one
 full check at the next DMRG handoff or at the end of the segment. A
@@ -167,15 +171,17 @@ and fermionic data. `target_cutoff=0.0` keeps either representation exact while
 ordinary `cutoff` controls only the two-site output split, so target-
 construction loss is not reported as FIT loss.
 
-Unitary DMRG/FIT streams default to `fit_stabilize_unitary=True`. After each
-compression, Pepsy first records retained norm loss in log-fidelity space when
+Unitary DMRG and mixed streams default to `stabilize_unitary=True`. After each
+FIT compression—and after an MPO rank warm-up or fallback inside mixed
+mode—Pepsy first records retained norm loss in log-fidelity space when
 infidelity tracking is enabled, then restores the raw working MPS to its
 pre-compression norm without accumulating that approximation loss in
-`p.exponent`. FIT reports its final canonical center and retained norm, so this
-rescaling reuses them rather than performing a second canonical sweep. This
-prevents deep complex64 streams from underflowing while
-keeping cumulative infidelity meaningful. Set the option to `False` only to
-reproduce historical norm-decay behavior.
+`p.exponent`. FIT reuses its final canonical center and retained norm; mixed
+MPO compression measures the already-canonicalized center before rescaling.
+This prevents deep complex64 streams and one-site mixed warm-up from
+underflowing while keeping cumulative infidelity meaningful. Set the option to
+`False` only to reproduce historical norm-decay behavior. The old
+`fit_stabilize_unitary` spelling remains as a deprecated alias.
 
 After a non-finite DMRG result, `mix_sticky_nonfinite=True` keeps the remainder
 of the current `run()` call on MPO rather than retrying an unhealthy FIT for

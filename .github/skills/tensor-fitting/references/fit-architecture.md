@@ -18,6 +18,8 @@
 - `fit_block_size=2`: recommended two-site local wavefunction and native SVD.
 - `fit_block_size=1`: fixed-rank compatibility update.
 - `fit_sweep_sequence="RL"`: alternating left-to-right/right-to-left sweeps.
+- `fit_min_iter`, `fit_rtol`, `fit_patience`: mode-neutral adaptive stopping
+  controls for DMRG and mixed DMRG; legacy `mix_fit_*` names are deprecated.
 - `fit_layer_size=N`: number of circuit gates in one target block; compatibility
   alias `k_2q_batch` remains.
 - `target_cutoff=0.0`: target construction cutoff.
@@ -25,8 +27,9 @@
   for ordinary arrays versus a materialized/native-routed target MPS.
 - `fit_single_pair_fast_path=True`: one update for an adjacent active pair.
 - `cutoff`, `cutoff_mode`, `chi`: output split/truncation controls.
-- `fit_stabilize_unitary=True`: restore raw norm after recording compression
-  loss, preventing deep complex64 underflow.
+- `stabilize_unitary=True`: restore raw norm after recording compression
+  loss for FIT and mixed-mode MPO compression, preventing deep complex64
+  underflow. `fit_stabilize_unitary` remains a deprecated compatibility alias.
 - `environment_strategy={"auto", "mps-direct", "generic"}` on `FIT`: dense
   MPS specialization versus general/native-safe contraction.
 - `timing_sync_device=True`: opt-in accelerator barriers for kernel-complete
@@ -55,6 +58,8 @@ stabilization; recanonicalizing the interval is redundant.
 
 `run_eff` is a separate global full-chain fit used by boundary/sampling code.
 Do not substitute it for the gate-window solver.
+`run` and `run_eff` retain fixed-sweep behavior; PEPS boundary diagnostics
+describe them as `fixed_sweeps` and use only coarse opt-in elapsed timing.
 
 ## Native tensor rule
 

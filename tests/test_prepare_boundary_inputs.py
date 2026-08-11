@@ -745,6 +745,104 @@ def test_contract_boundary_includes_requested_metadata(monkeypatch):
     assert out.direction == "x"
     assert out.n_iter == 3
     assert out.max_separation == 1
+    assert out.fit_diagnostics == ()
+
+
+def test_peps_norm_can_return_typed_fit_convergence_and_timing():
+    """High-level PEPS norms should expose every adaptive boundary FIT."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=49, dtype="complex128")
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=8,
+        method="dmrg",
+        fit_mode="two-site",
+        fit_sweep_sequence="RL",
+        n_iter=8,
+        fit_min_iter=2,
+        fit_rtol=1.0e9,
+        fit_patience=1,
+        fit_timing=True,
+        return_info=True,
+        cutoff=0.0,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert isinstance(result, pepsy.BoundaryContractResult)
+    assert abs(result.cost - exact) / abs(exact) < 1.0e-10
+    assert result.fit_diagnostics
+    for diagnostic in result.fit_diagnostics:
+        assert isinstance(diagnostic, pepsy.BoundaryFitDiagnostic)
+        assert diagnostic.fit_mode == "two-site"
+        assert diagnostic.status == "complete"
+        assert diagnostic.iterations == 2
+        assert diagnostic.converged is True
+        assert diagnostic.convergence_reason == "relative_tolerance"
+        assert diagnostic.elapsed_seconds >= 0.0
+        assert len(diagnostic.sweep_timings) == 2
+        assert [record["direction"] for record in diagnostic.sweep_timings] == [
+            "R",
+            "L",
+        ]
+
+
+def test_peps_norm_fit_diagnostics_are_cheap_without_timing():
+    """Convergence metadata should not enable per-site timers implicitly."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=51, dtype="complex128")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=4,
+        method="dmrg",
+        fit_mode="two-site",
+        n_iter=2,
+        fit_rtol=None,
+        return_info=True,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.iterations == 2
+        and diagnostic.convergence_reason == "max_sweeps"
+        and diagnostic.elapsed_seconds is None
+        and diagnostic.sweep_timings == ()
+        for diagnostic in result.fit_diagnostics
+    )
+
+
+@pytest.mark.parametrize("fit_mode", ["eff", "global"])
+def test_peps_norm_reports_legacy_fit_solvers_without_changing_them(fit_mode):
+    """Reference and cached one-site FIT should remain fixed-sweep solvers."""
+    ket = qtn.PEPS.rand(Lx=3, Ly=3, bond_dim=2, seed=71, dtype="complex128")
+    exact = ket.make_norm().contract(all, optimize="greedy")
+
+    result = pepsy.peps_norm(
+        ket,
+        chi=8,
+        method="dmrg",
+        fit_mode=fit_mode,
+        n_iter=1,
+        fit_timing=True,
+        return_info=True,
+        contraction_opt="greedy",
+        progress=False,
+    )
+
+    assert abs(result.cost - exact) / abs(exact) < 1.0e-10
+    assert result.fit_diagnostics
+    assert all(
+        diagnostic.fit_mode == fit_mode
+        and diagnostic.iterations == 1
+        and diagnostic.converged is False
+        and diagnostic.convergence_reason == "fixed_sweeps"
+        and diagnostic.elapsed_seconds >= 0.0
+        and diagnostic.sweep_timings == ()
+        for diagnostic in result.fit_diagnostics
+    )
 
 
 def test_contract_boundary_can_return_stripped_exponent(monkeypatch):
@@ -1884,6 +1982,9 @@ def test_infidelity_accepts_bdy_holder_dicts_and_fills_missing(monkeypatch):
     assert out["bdy"] is bdy["bdy"]
     assert out["bdy_target"] is bdy_target["bdy"]
     assert out["bdy_overlap"] is bdy_overlap["bdy"]
+    assert isinstance(out["norm_result"], pepsy.BoundaryContractResult)
+    assert isinstance(out["norm_target_result"], pepsy.BoundaryContractResult)
+    assert isinstance(out["overlap_result"], pepsy.BoundaryContractResult)
     assert len(captured["contract_calls"]) == 3
 
 
@@ -2054,6 +2155,14 @@ def test_peps_metric_aliases(monkeypatch):
 
     assert pepsy.peps_norm("p", chi=4) == 2.0
     assert pepsy.peps_fidelity("p", "q", chi=5) == pytest.approx(0.75)
+    fidelity_info = pepsy.peps_fidelity(
+        "p",
+        "q",
+        chi=6,
+        return_info=True,
+    )
+    assert fidelity_info["fidelity"] == pytest.approx(0.75)
+    assert fidelity_info["infidelity"] == pytest.approx(0.25)
     assert calls[0][0] == "norm"
     assert calls[0][1] == ("p",)
     assert calls[0][2]["chi"] == 4
@@ -2062,6 +2171,9 @@ def test_peps_metric_aliases(monkeypatch):
     assert calls[1][1] == ("p", "q")
     assert calls[1][2]["chi"] == 5
     assert calls[1][2]["method"] == "dmrg"
+    assert calls[2][1] == ("p", "q")
+    assert calls[2][2]["chi"] == 6
+    assert calls[2][2]["method"] == "dmrg"
 
 
 def test_infidelity_reuses_existing_bdy_holder_entries(monkeypatch):

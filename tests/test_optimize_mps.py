@@ -721,7 +721,7 @@ def test_mps_optimizer_mix_global_infidelity_tracks_current_norm():
         mode="mix",
     )
 
-    opt.run(progbar=False, n_iter=8, fit_stabilize_unitary=False)
+    opt.run(progbar=False, n_iter=8, stabilize_unitary=False)
 
     raw = opt.p.copy()
     raw.exponent = 0.0
@@ -960,12 +960,16 @@ def test_new_fit_configuration_is_keyword_only():
 
     assert fit_parameters["environment_strategy"].kind is inspect.Parameter.KEYWORD_ONLY
     for name in (
+        "fit_min_iter",
+        "fit_rtol",
+        "fit_patience",
         "fit_block_size",
         "fit_sweep_sequence",
         "fit_layer_size",
         "target_cutoff",
         "fit_target_strategy",
         "fit_single_pair_fast_path",
+        "stabilize_unitary",
         "fit_stabilize_unitary",
         "timing",
         "timing_sync_device",
@@ -1006,7 +1010,7 @@ def test_dmrg_uses_single_pair_fast_path_by_default():
         mode="dmrg",
     )
 
-    optimizer.run(progbar=False, n_iter=8, mix_fit_rtol=None)
+    optimizer.run(progbar=False, n_iter=8, fit_rtol=None)
 
     diagnostics = optimizer._last_dmrg_fit_diagnostics
     assert diagnostics["iterations"] == 1
@@ -1204,7 +1208,7 @@ def test_dmrg_complex64_deep_unitary_stream_keeps_working_norm_stable():
         n_iter=1,
         cutoff=0.0,
         target_cutoff=0.0,
-        fit_stabilize_unitary=True,
+        stabilize_unitary=True,
     )
 
     raw = out.copy()
@@ -1383,7 +1387,7 @@ def test_mps_optimizer_mix_full_checks_once_after_dmrg(monkeypatch):
         mode="mix",
     )
 
-    opt.run(progbar=False, n_iter=3, mix_fit_rtol=None)
+    opt.run(progbar=False, n_iter=3, fit_rtol=None)
 
     assert opt.mix_history[0]["backend"] == "dmrg"
     assert checks == 1
@@ -1436,9 +1440,9 @@ def test_mps_optimizer_mix_stops_fit_adaptively():
     opt.run(
         progbar=False,
         n_iter=8,
-        mix_fit_min_iter=2,
-        mix_fit_rtol=1e9,
-        mix_fit_patience=1,
+        fit_min_iter=2,
+        fit_rtol=1e9,
+        fit_patience=1,
     )
 
     event = opt.mix_history[0]
@@ -1463,9 +1467,9 @@ def test_mps_optimizer_dmrg_stops_fit_adaptively():
     opt.run(
         progbar=False,
         n_iter=8,
-        mix_fit_min_iter=2,
-        mix_fit_rtol=1e9,
-        mix_fit_patience=1,
+        fit_min_iter=2,
+        fit_rtol=1e9,
+        fit_patience=1,
     )
 
     assert opt._last_dmrg_fit_diagnostics["iterations"] == 2
@@ -1483,12 +1487,119 @@ def test_mps_optimizer_mix_can_keep_fixed_fit_iterations():
         mode="mix",
     )
 
-    opt.run(progbar=False, n_iter=3, mix_fit_rtol=None)
+    opt.run(progbar=False, n_iter=3, fit_rtol=None)
 
     event = opt.mix_history[0]
     assert event["fit_iterations"] == 3
     assert event["fit_converged"] is False
     assert event["fit_relative_change"] is None
+
+
+def test_mps_optimizer_deprecated_fit_controls_warn_and_remain_functional():
+    """Legacy mixed FIT names should delegate to the canonical controls."""
+    state = qtn.MPS_rand_state(
+        3, bond_dim=2, phys_dim=2, dtype="complex128", seed=217
+    )
+    opt = py.MpsOptimizer(
+        state,
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    with pytest.warns(DeprecationWarning, match="mix_fit_rtol"):
+        opt.run(
+            progbar=False,
+            n_iter=4,
+            mix_fit_rtol=None,
+        )
+
+    assert opt._last_dmrg_fit_diagnostics["iterations"] == 4
+
+
+def test_mps_optimizer_rejects_conflicting_legacy_fit_controls():
+    """Mixed old/new convergence policies must never be resolved silently."""
+    opt = py.MpsOptimizer(
+        qtn.MPS_computational_state("000"),
+        gates=[(qu.CNOT(), (0, 2))],
+        chi=2,
+        mode="dmrg",
+    )
+
+    with pytest.warns(DeprecationWarning, match="mix_fit_rtol"):
+        with pytest.raises(ValueError, match="different values"):
+            opt.run(
+                progbar=False,
+                fit_rtol=1.0e-8,
+                mix_fit_rtol=None,
+            )
+
+
+def test_mix_unitary_stabilization_covers_mpo_rank_warmup():
+    """One-site mixed MPO warm-up should retain norm without hiding loss."""
+    gates = []
+    for depth in range(4):
+        start = depth % 2
+        for site in range(start, 7, 2):
+            gates.append((qu.rand_uni(4, seed=100 + len(gates)), (site, site + 1)))
+
+    stabilized = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * 8, dtype="complex128"),
+        gates=gates,
+        chi=4,
+        mode="mix",
+        track_infidelity=True,
+    )
+    stabilized.run(
+        progbar=False,
+        n_iter=1,
+        fit_block_size=1,
+        fit_rtol=None,
+        stabilize_unitary=True,
+    )
+
+    unstabilized = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * 8, dtype="complex128"),
+        gates=gates,
+        chi=4,
+        mode="mix",
+        track_infidelity=True,
+    )
+    unstabilized.run(
+        progbar=False,
+        n_iter=1,
+        fit_block_size=1,
+        fit_rtol=None,
+        stabilize_unitary=False,
+    )
+
+    assert _mps_data_norm(stabilized.p) == pytest.approx(1.0, abs=1.0e-12)
+    assert _mps_data_norm(unstabilized.p) < 0.999
+    assert stabilized.get_infidelities()[-1] > 0.0
+    assert stabilized.get_infidelities()[-1] == pytest.approx(
+        unstabilized.get_infidelities()[-1],
+        rel=1.0e-10,
+        abs=1.0e-12,
+    )
+
+    without_tracking = py.MpsOptimizer(
+        qtn.MPS_computational_state("0" * 8, dtype="complex128"),
+        gates=gates,
+        chi=4,
+        mode="mix",
+        track_infidelity=False,
+    )
+    without_tracking.run(
+        progbar=False,
+        n_iter=1,
+        fit_block_size=1,
+        fit_rtol=None,
+        stabilize_unitary=True,
+    )
+    assert _mps_data_norm(without_tracking.p) == pytest.approx(
+        1.0,
+        abs=1.0e-12,
+    )
 
 
 def test_mps_optimizer_mix_nonfinite_sweep_disables_later_dmrg(monkeypatch):

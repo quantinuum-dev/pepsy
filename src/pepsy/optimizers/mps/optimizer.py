@@ -36,9 +36,10 @@ canonicalized and does not produce compression-infidelity samples.
 Control events split the stream into gate/subMPO segments run through the
 active mode and are applied directly to the state between segments, so the same
 stream works in every mode. The default gate path assumes a norm-preserving
-stream. DMRG/FIT restores the raw unitary working norm after recording each
-compression loss, preventing deep low-precision underflow; other modes retain
-their existing normalization behavior. Non-unitary streams should use
+stream. DMRG/FIT and mixed-mode MPO warm-up/fallback restore the raw unitary
+working norm after recording each compression loss, preventing deep
+low-precision underflow; other modes retain their existing normalization
+behavior. Non-unitary streams should use
 ``non_unitary=True``; when ``normalize_every`` is enabled this moves the
 orthogonality center to one site after every replay step, normalizes that
 center tensor, and accumulates the removed scale into ``p.exponent``. Quimb
@@ -99,6 +100,16 @@ __all__ = [
 _SUBMPO_EVENT_NAMES = frozenset({"submpo", "mpo"})
 _MISSING = object()
 _NORM_INCLUDES_EXPONENT_CACHE = {}
+
+
+class _DeprecatedOptionDefault:
+    """Readable signature sentinel for compatibility-only keyword values."""
+
+    def __repr__(self):
+        return "<deprecated>"
+
+
+_DEPRECATED_OPTION = _DeprecatedOptionDefault()
 
 
 def _array_backend_signature(array):
@@ -2466,18 +2477,22 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         seed=None,
         track_infidelity=None,
         mix_strict=False,
-        mix_fit_min_iter=2,
-        mix_fit_rtol="auto",
-        mix_fit_patience=2,
+        mix_fit_min_iter=_DEPRECATED_OPTION,
+        mix_fit_rtol=_DEPRECATED_OPTION,
+        mix_fit_patience=_DEPRECATED_OPTION,
         mix_sticky_nonfinite=True,
         *,
+        fit_min_iter=2,
+        fit_rtol="auto",
+        fit_patience=2,
         fit_block_size=2,
         fit_sweep_sequence="RL",
         fit_layer_size=None,
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
-        fit_stabilize_unitary=True,
+        stabilize_unitary=True,
+        fit_stabilize_unitary=_DEPRECATED_OPTION,
         timing=False,
         timing_sync_device=False,
     ):
@@ -2488,7 +2503,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         n_iter : int, default=5
             Inner iterations for DMRG local fits. In ``dmrg`` and ``mix``
             modes this is the maximum number of sweeps when adaptive FIT
-            stopping is enabled; pass ``mix_fit_rtol=None`` for fixed
+            stopping is enabled; pass ``fit_rtol=None`` for fixed
             iterations. Ignored by ``mpo``/``swap``/``svd``/``exact``.
         progbar : bool, default=False
             Show per-mode progress bars.
@@ -2563,21 +2578,25 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         mix_strict : bool, default=False
             In ``mode="mix"``, restore the committed state and re-raise an
             ordinary DMRG trial exception instead of falling back to MPO.
-        mix_fit_min_iter : int, default=2
-            Minimum FIT sweeps before adaptive convergence can stop in
-            ``dmrg`` or ``mix`` mode. Values above ``n_iter`` are clamped to
-            ``n_iter``.
-        mix_fit_rtol : {"auto"} | float | None, default="auto"
-            Relative tolerance for DMRG FIT early stopping. ``"auto"``
-            selects a dtype-aware tolerance; ``None`` disables early stopping
-            and restores fixed ``n_iter`` behavior.
-        mix_fit_patience : int, default=2
-            Consecutive converged FIT sweeps required before stopping early in
-            ``dmrg`` or ``mix`` mode.
+        mix_fit_min_iter, mix_fit_rtol, mix_fit_patience : optional
+            Deprecated compatibility aliases for ``fit_min_iter``,
+            ``fit_rtol``, and ``fit_patience``. New code should use the
+            mode-neutral keyword-only names below.
         mix_sticky_nonfinite : bool, default=True
             After a mixed DMRG trial produces NaN or Inf, use MPO for the
             remainder of this :meth:`run` call instead of retrying DMRG on
             every subsequent gate.
+        fit_min_iter : int, default=2
+            Minimum FIT sweeps before adaptive convergence can stop in
+            ``dmrg`` or ``mix`` mode. Values above ``n_iter`` are clamped to
+            ``n_iter``.
+        fit_rtol : {"auto"} | float | None, default="auto"
+            Relative tolerance for DMRG FIT early stopping. ``"auto"``
+            selects a dtype-aware tolerance; ``None`` disables early stopping
+            and restores fixed ``n_iter`` behavior.
+        fit_patience : int, default=2
+            Consecutive converged FIT sweeps required before stopping early in
+            ``dmrg`` or ``mix`` mode.
         fit_block_size : {1, 2}, default=2
             Number of neighboring MPS tensors optimized by each FIT update.
             Two-site FIT is recommended: it forms both physical legs and the
@@ -2607,12 +2626,14 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             Stop an adjacent two-site FIT after its single exact variational
             update. This structural convergence is independent of ``rtol``;
             disable it only for diagnostics that deliberately repeat sweeps.
-        fit_stabilize_unitary : bool, default=True
-            Renormalize the raw working MPS after each unitary FIT compression
-            without storing the discarded scale in ``p.exponent``. When
-            infidelity tracking is enabled, compression loss remains in that
-            trace, while complex64 tensors stay near unit scale during deep
-            streams.
+        stabilize_unitary : bool, default=True
+            Restore the raw working norm after each unitary FIT compression
+            and after mixed-mode MPO warm-up or fallback compression. The
+            discarded scale is still recorded as compression infidelity and
+            is not stored in ``p.exponent``. This keeps complex64 tensors near
+            unit scale during deep streams.
+        fit_stabilize_unitary : optional
+            Deprecated compatibility alias for ``stabilize_unitary``.
         timing : bool, default=False
             Record wall-clock replay timing in :attr:`last_run_timing` without
             printing or adding per-gate timing overhead. The record includes
@@ -2761,6 +2782,34 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_every,
             non_unitary=non_unitary,
         )
+        fit_min_iter = self._resolve_legacy_fit_option(
+            canonical_name="fit_min_iter",
+            canonical_value=fit_min_iter,
+            canonical_default=2,
+            legacy_name="mix_fit_min_iter",
+            legacy_value=mix_fit_min_iter,
+        )
+        fit_rtol = self._resolve_legacy_fit_option(
+            canonical_name="fit_rtol",
+            canonical_value=fit_rtol,
+            canonical_default="auto",
+            legacy_name="mix_fit_rtol",
+            legacy_value=mix_fit_rtol,
+        )
+        fit_patience = self._resolve_legacy_fit_option(
+            canonical_name="fit_patience",
+            canonical_value=fit_patience,
+            canonical_default=2,
+            legacy_name="mix_fit_patience",
+            legacy_value=mix_fit_patience,
+        )
+        stabilize_unitary = self._resolve_legacy_fit_option(
+            canonical_name="stabilize_unitary",
+            canonical_value=stabilize_unitary,
+            canonical_default=True,
+            legacy_name="fit_stabilize_unitary",
+            legacy_value=fit_stabilize_unitary,
+        )
         if self.mode in {"dmrg", "mix"}:
             if self.mode == "mix" and non_unitary:
                 raise ValueError("mode='mix' is only for unitary gate streams.")
@@ -2805,23 +2854,23 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                     "Symmray/fermionic MPS data; use 'auto' or 'mps'."
                 )
             if (
-                not isinstance(mix_fit_min_iter, Integral)
-                or int(mix_fit_min_iter) < 1
+                not isinstance(fit_min_iter, Integral)
+                or int(fit_min_iter) < 1
             ):
-                raise ValueError("mix_fit_min_iter must be a positive integer.")
+                raise ValueError("fit_min_iter must be a positive integer.")
             if (
-                not isinstance(mix_fit_patience, Integral)
-                or int(mix_fit_patience) < 1
+                not isinstance(fit_patience, Integral)
+                or int(fit_patience) < 1
             ):
-                raise ValueError("mix_fit_patience must be a positive integer.")
-            if self.mode == "dmrg" and non_unitary and mix_fit_rtol == "auto":
+                raise ValueError("fit_patience must be a positive integer.")
+            if self.mode == "dmrg" and non_unitary and fit_rtol == "auto":
                 # Preserve the historical fixed-sweep behavior for
                 # non-unitary DMRG unless the caller supplies an explicit
                 # tolerance. Mixed mode is unitary-only and keeps adaptive
                 # stopping by default.
-                mix_fit_rtol = None
+                fit_rtol = None
             else:
-                mix_fit_rtol = self._resolve_mix_fit_rtol(mix_fit_rtol)
+                fit_rtol = self._resolve_fit_rtol(fit_rtol)
             if self.mode == "mix" and self.p.max_bond() > self.chi:
                 raise ValueError(
                     "mode='mix' requires the initial MPS max bond to be <= chi; "
@@ -2844,16 +2893,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             non_unitary=non_unitary,
             submpo_method=submpo_method,
             mix_strict=bool(mix_strict),
-            mix_fit_min_iter=int(mix_fit_min_iter),
-            mix_fit_rtol=mix_fit_rtol,
-            mix_fit_patience=int(mix_fit_patience),
+            fit_min_iter=int(fit_min_iter),
+            fit_rtol=fit_rtol,
+            fit_patience=int(fit_patience),
             mix_sticky_nonfinite=bool(mix_sticky_nonfinite),
             fit_block_size=fit_block_size,
             fit_sweep_sequence=fit_sweep_sequence,
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
             fit_single_pair_fast_path=bool(fit_single_pair_fast_path),
-            fit_stabilize_unitary=bool(fit_stabilize_unitary),
+            stabilize_unitary=bool(stabilize_unitary),
         )
 
         if has_control:
@@ -3015,16 +3064,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         non_unitary,
         submpo_method,
         mix_strict=False,
-        mix_fit_min_iter=2,
-        mix_fit_rtol=None,
-        mix_fit_patience=2,
+        fit_min_iter=2,
+        fit_rtol=None,
+        fit_patience=2,
         mix_sticky_nonfinite=True,
         fit_block_size=2,
         fit_sweep_sequence="RL",
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
-        fit_stabilize_unitary=True,
+        stabilize_unitary=True,
     ):
         """Dispatch a gate/subMPO segment to the active mode backend.
 
@@ -3060,16 +3109,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 normalize_final=normalize_final,
                 normalize_eps=normalize_eps,
                 non_unitary=non_unitary,
-                fit_min_iter=mix_fit_min_iter,
-                fit_rtol=mix_fit_rtol,
-                fit_patience=mix_fit_patience,
+                fit_min_iter=fit_min_iter,
+                fit_rtol=fit_rtol,
+                fit_patience=fit_patience,
                 fit_finite_check=True,
                 fit_block_size=fit_block_size,
                 fit_sweep_sequence=fit_sweep_sequence,
                 target_cutoff=target_cutoff,
                 fit_target_strategy=fit_target_strategy,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
-                fit_stabilize_unitary=fit_stabilize_unitary,
+                stabilize_unitary=stabilize_unitary,
             )
             return self.p
 
@@ -3088,16 +3137,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 cutoff_mode=cutoff_mode,
                 submpo_method=submpo_method,
                 mix_strict=mix_strict,
-                fit_min_iter=mix_fit_min_iter,
-                fit_rtol=mix_fit_rtol,
-                fit_patience=mix_fit_patience,
+                fit_min_iter=fit_min_iter,
+                fit_rtol=fit_rtol,
+                fit_patience=fit_patience,
                 sticky_nonfinite=mix_sticky_nonfinite,
                 fit_block_size=fit_block_size,
                 fit_sweep_sequence=fit_sweep_sequence,
                 target_cutoff=target_cutoff,
                 fit_target_strategy=fit_target_strategy,
                 fit_single_pair_fast_path=fit_single_pair_fast_path,
-                fit_stabilize_unitary=fit_stabilize_unitary,
+                stabilize_unitary=stabilize_unitary,
             )
             return self.p
 
@@ -4590,7 +4639,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
         return p_g
 
-    def _stabilize_unitary_fit_state(
+    def _stabilize_unitary_compression_state(
         self,
         p,
         where,
@@ -4599,7 +4648,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         current_norm=None,
         center_site=None,
     ):
-        """Restore a unitary FIT state to its pre-compression raw norm.
+        """Restore a unitary compressed state to its pre-compression raw norm.
 
         The removed scale is deliberately *not* accumulated into ``exponent``:
         it is approximation loss, not physical non-unitary evolution. The loss
@@ -4631,6 +4680,10 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         self._record_orthog_span(p, (center, center))
         self._unitary_previous_norm = target_float
 
+    def _stabilize_unitary_fit_state(self, *args, **kwargs):
+        """Compatibility wrapper for the generalized compression stabilizer."""
+        return self._stabilize_unitary_compression_state(*args, **kwargs)
+
     def _run_mix_mpo_step(
         self,
         gate,
@@ -4641,6 +4694,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         submpo_method,
+        stabilize_unitary,
     ):
         """Apply one mixed-mode step through the MPO backend."""
         sample_start = len(self.infidelity_samples)
@@ -4654,6 +4708,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_every=None,
             normalize_final=False,
             submpo_method=submpo_method,
+            stabilize_unitary=stabilize_unitary,
         )
         self._renumber_mix_infidelity_samples(sample_start, step)
 
@@ -4667,6 +4722,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         cutoff,
         cutoff_mode,
         submpo_method,
+        stabilize_unitary,
     ):
         """Apply a mixed-mode fallback batch through the MPO backend."""
         sample_start = len(self.infidelity_samples)
@@ -4680,6 +4736,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             normalize_every=None,
             normalize_final=False,
             submpo_method=submpo_method,
+            stabilize_unitary=stabilize_unitary,
         )
         self._renumber_mix_infidelity_samples(
             sample_start,
@@ -4719,7 +4776,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
-        fit_stabilize_unitary=True,
+        stabilize_unitary=True,
     ):
         """Apply one mixed-mode step through the DMRG backend."""
         sample_start = len(self.infidelity_samples)
@@ -4742,7 +4799,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
-            fit_stabilize_unitary=fit_stabilize_unitary,
+            stabilize_unitary=stabilize_unitary,
         )
         self._renumber_mix_infidelity_samples(sample_start, step)
         if not self._mps_data_is_finite(self.p):
@@ -4765,7 +4822,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
-        fit_stabilize_unitary=True,
+        stabilize_unitary=True,
     ):
         """Apply a contiguous two-site batch through the DMRG backend."""
         sample_start = len(self.infidelity_samples)
@@ -4788,7 +4845,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             target_cutoff=target_cutoff,
             fit_target_strategy=fit_target_strategy,
             fit_single_pair_fast_path=fit_single_pair_fast_path,
-            fit_stabilize_unitary=fit_stabilize_unitary,
+            stabilize_unitary=stabilize_unitary,
         )
         # FIT produces one compression sample for the whole batch. It is
         # therefore associated with the final gate in the batch.
@@ -4890,8 +4947,42 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             committed_p.exponent = trial_p.exponent
         self.p = committed_p
 
-    def _resolve_mix_fit_rtol(self, value):
-        """Return a validated dtype-aware mixed FIT stopping tolerance."""
+    @staticmethod
+    def _resolve_legacy_fit_option(
+        *,
+        canonical_name,
+        canonical_value,
+        canonical_default,
+        legacy_name,
+        legacy_value,
+    ):
+        """Resolve one deprecated FIT option without silently mixing policies.
+
+        Canonical controls have readable defaults in the public signature.
+        A supplied legacy value can replace that default, preserving old call
+        sites. If the caller also selects a different non-default canonical
+        value, fail early instead of guessing which convergence or
+        stabilization policy they intended.
+        """
+        if legacy_value is _DEPRECATED_OPTION:
+            return canonical_value
+        warnings.warn(
+            f"{legacy_name} is deprecated; use {canonical_name} instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        if (
+            canonical_value != canonical_default
+            and canonical_value != legacy_value
+        ):
+            raise ValueError(
+                f"{canonical_name} and deprecated {legacy_name} specify "
+                "different values; pass only the canonical option."
+            )
+        return legacy_value
+
+    def _resolve_fit_rtol(self, value):
+        """Return a validated dtype-aware FIT stopping tolerance."""
         if value == "auto":
             dtype = str(self.backend_dtype).lower()
             if "16" in dtype:
@@ -4905,11 +4996,11 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
             value = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "mix_fit_rtol must be 'auto', a non-negative number, or None."
+                "fit_rtol must be 'auto', a non-negative number, or None."
             ) from exc
         if not np.isfinite(value) or value < 0.0:
             raise ValueError(
-                "mix_fit_rtol must be 'auto', a non-negative number, or None."
+                "fit_rtol must be 'auto', a non-negative number, or None."
             )
         return value
 
@@ -4990,7 +5081,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
-        fit_stabilize_unitary=True,
+        stabilize_unitary=True,
     ):
         """Apply unitary transactional FIT with an MPO fallback.
 
@@ -5094,6 +5185,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         cutoff=cutoff,
                         cutoff_mode=cutoff_mode,
                         submpo_method=submpo_method,
+                        stabilize_unitary=stabilize_unitary,
                     )
                     mpo_steps += 1
                     mpo_state_needs_check = True
@@ -5175,7 +5267,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                         target_cutoff=target_cutoff,
                         fit_target_strategy=fit_target_strategy,
                         fit_single_pair_fast_path=fit_single_pair_fast_path,
-                        fit_stabilize_unitary=fit_stabilize_unitary,
+                        stabilize_unitary=stabilize_unitary,
                     )
                     fit_diagnostics = deepcopy(
                         self._last_dmrg_fit_diagnostics or {}
@@ -5211,6 +5303,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                             cutoff=cutoff,
                             cutoff_mode=cutoff_mode,
                             submpo_method=submpo_method,
+                            stabilize_unitary=stabilize_unitary,
                         )
                         self._commit_mix_trial(committed_p, self.p)
                         mpo_state_needs_check = False
@@ -5361,7 +5454,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         target_cutoff=0.0,
         fit_target_strategy="auto",
         fit_single_pair_fast_path=True,
-        fit_stabilize_unitary=True,
+        stabilize_unitary=True,
     ):
         """Apply gates with local DMRG-style fitting."""
         if k_2q_batch < 1:
@@ -5383,7 +5476,7 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         last_normalized_step = None
         cumulative_infidelity = None
         track_unitary_norm = self.track_infidelity and not non_unitary
-        stabilize_unitary = bool(fit_stabilize_unitary) and not non_unitary
+        stabilize_unitary = bool(stabilize_unitary) and not non_unitary
         if (track_unitary_norm or stabilize_unitary) and (
             not self._unitary_global_norm_tracking
             or self._unitary_previous_norm is None
@@ -5763,13 +5856,16 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         normalize_eps=1e-15,
         non_unitary=False,
         submpo_method="direct",
+        stabilize_unitary=False,
     ):
         """Apply gates with MPO-style nonlocal compression.
 
         Uses :meth:`qtn.MatrixProductState.gate_nonlocal_` for two-qubit gates.
         """
         p = self.p
-        if self.track_infidelity and not non_unitary:
+        track_unitary_norm = self.track_infidelity and not non_unitary
+        stabilize_unitary = bool(stabilize_unitary) and not non_unitary
+        if track_unitary_norm or stabilize_unitary:
             self._start_unitary_norm_tracking(p)
         two_qubit_count = 0
         submpo_count = 0
@@ -5793,6 +5889,9 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
         idx = 0
         while idx < len(G_seq):
             compressed = False
+            unitary_target_norm = (
+                self._unitary_previous_norm if stabilize_unitary else None
+            )
             where = where_seq[idx]
             gate = G_seq[idx]
             event_type = event_seq[idx]
@@ -5835,22 +5934,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if self.track_infidelity:
+                if self.track_infidelity or stabilize_unitary:
                     approx_norm = self._canonical_span_norm(p, (xmin, xmax))
-                    if non_unitary:
+                    if self.track_infidelity and non_unitary:
                         sample = self._append_compression_infidelity_sample(
                             approx_norm,
                             target_norm,
                             step=idx,
                             where=(xmin, xmax),
                         )
-                    else:
+                    elif self.track_infidelity:
                         sample = self._append_unitary_compression_infidelity_sample(
                             approx_norm,
                             step=idx,
                             where=(xmin, xmax),
                         )
-                    norm_cumulative_infidelity = sample["infidelity"]
+                    if self.track_infidelity:
+                        norm_cumulative_infidelity = sample["infidelity"]
+                    if stabilize_unitary:
+                        self._stabilize_unitary_compression_state(
+                            p,
+                            (xmin, xmax),
+                            unitary_target_norm,
+                            current_norm=approx_norm,
+                            center_site=xmax,
+                        )
             elif len(where) == 1:
                 self._apply_gate(
                     p,
@@ -5917,22 +6025,31 @@ class MpsOptimizer:  # pylint: disable=too-many-instance-attributes
                 advanced = 1
                 last_where = (xmin, xmax)
                 compressed = True
-                if self.track_infidelity:
+                if self.track_infidelity or stabilize_unitary:
                     approx_norm = self._canonical_span_norm(p, (xmin, xmax))
-                    if non_unitary:
+                    if self.track_infidelity and non_unitary:
                         sample = self._append_compression_infidelity_sample(
                             approx_norm,
                             target_norm,
                             step=idx,
                             where=(xmin, xmax),
                         )
-                    else:
+                    elif self.track_infidelity:
                         sample = self._append_unitary_compression_infidelity_sample(
                             approx_norm,
                             step=idx,
                             where=(xmin, xmax),
                         )
-                    norm_cumulative_infidelity = sample["infidelity"]
+                    if self.track_infidelity:
+                        norm_cumulative_infidelity = sample["infidelity"]
+                    if stabilize_unitary:
+                        self._stabilize_unitary_compression_state(
+                            p,
+                            (xmin, xmax),
+                            unitary_target_norm,
+                            current_norm=approx_norm,
+                            center_site=xmax,
+                        )
 
             event = self._maybe_normalize_after_step(
                 p,

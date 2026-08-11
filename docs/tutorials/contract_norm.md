@@ -51,10 +51,18 @@ res = pepsy.contract_boundary(
     n_iter=8,
     max_separation=0,
     track_boundary_fidelity=True,
+    fit_timing=True,
 )
 
 print("cost:", res.cost)
 print("fidel entries:", len(res.fidel))
+for fit in res.fit_diagnostics:
+    print(
+        fit.boundary_key,
+        fit.iterations,
+        fit.convergence_reason,
+        fit.elapsed_seconds,
+    )
 ```
 
 ## Notes on parameters
@@ -73,6 +81,11 @@ print("fidel entries:", len(res.fidel))
 - `fit_cutoff` and `fit_cutoff_mode`: direct `contract_boundary(...)`
   two-site SVD policy. The higher-level `peps_norm(...)` API uses `cutoff`
   with `fit_cutoff_mode`.
+- `fit_timing`: opt into elapsed and detailed two-site sweep timings. Cheap
+  iteration and convergence metadata is present in `fit_diagnostics` even
+  when timing is disabled.
+- `return_info=True`: use this with `peps_norm(...)` or `boundary_norm(...)`
+  when the high-level scalar helpers should return `BoundaryContractResult`.
 - `direction`: `y`, `y_left`, `y_right`, `x`, `x_left`, `x_right`.
 - `max_separation`: currently `0` or `1`.
 
