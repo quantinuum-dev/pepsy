@@ -7,17 +7,22 @@ from functools import wraps
 import inspect
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import autoray as ar
 
 from ..tensors.validation import _PHYS_OUTER, validate_tensor_network_tags
 from .states import BdyMPS
-from .sweeps import CompBdy
+from .sweeps import (
+    BoundaryFitDiagnostic,
+    CompBdy,
+    _canonical_fit_mode_selector,
+)
 
 __all__ = [
     "build_bra_ket",
     "BoundaryContractResult",
+    "BoundaryFitDiagnostic",
     "contract_boundary",
     "contract_flat",
     "quimb_ctmrg_projector_compat",
@@ -296,6 +301,7 @@ class BoundaryContractResult:
     direction: str
     n_iter: int
     max_separation: int
+    fit_diagnostics: tuple[BoundaryFitDiagnostic, ...] = ()
 
 
 def _warn_nonstandard_physical_outer_inds(tn, role):
@@ -683,12 +689,21 @@ def _unpack_bdy_handle(handle, name):
     return obj, holder
 
 
-def _retune_bdy_to_chi(obj, chi, name):
-    """Retune an existing boundary object to the requested chi."""
+def _retune_bdy_to_chi(obj, chi, name, *, expand_growth=True):
+    """Retune an existing boundary object to the requested chi.
+
+    Two-site FIT discovers rank through its local SVDs, so ``expand_growth``
+    can be disabled to avoid globally padding a warm boundary before every
+    contraction. A lower requested cap is always applied immediately.
+    """
     if obj is None or chi is None:
         return
     cur = getattr(obj, "chi", None)
     if cur is None or int(cur) == chi:
+        return
+    if int(cur) < chi and not expand_growth:
+        # Preserve a low-rank warm start. The caller passes ``chi`` directly
+        # to the two-site split, which can populate useful sectors naturally.
         return
     if not hasattr(obj, "expand_bnd"):
         raise TypeError(
@@ -818,6 +833,14 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -840,22 +863,33 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
         layer_tags = tuple(layer_tags)
 
     if method == "dmrg":
+        fit_mode = _canonical_fit_mode_selector(fit_mode)
         bdy_obj, bdy_holder = _unpack_bdy_handle(bdy, bdy_name)
-        _retune_bdy_to_chi(bdy_obj, chi, bdy_name)
+        two_site_fit = fit_mode == "two-site"
+        _retune_bdy_to_chi(
+            bdy_obj,
+            chi,
+            bdy_name,
+            expand_growth=not two_site_fit,
+        )
         if bdy_obj is None:
             if chi is None:
                 raise ValueError(f"Provide chi when {bdy_name} is not supplied.")
+            # A two-site SVD can discover rank as it sweeps. Starting from a
+            # product boundary avoids allocating and canonicalizing chi-wide
+            # random bonds that may be immediately truncated away.
+            initial_chi = 1 if two_site_fit else chi
             if flat:
                 bdy_obj = BdyMPS(
                     tn_flat=norm,
-                    chi=chi,
+                    chi=initial_chi,
                     flat=True,
                     single_layer=single_layer,
                 )
             else:
                 bdy_obj = BdyMPS(
                     tn_double=norm,
-                    chi=chi,
+                    chi=initial_chi,
                     single_layer=single_layer,
                 )
             if bdy_holder is not None:
@@ -866,6 +900,15 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             bdy=bdy_obj,
             contraction_opt=contraction_opt,
             fit_mode=fit_mode,
+            fit_max_bond=chi if fit_max_bond is None else fit_max_bond,
+            fit_sweep_sequence=fit_sweep_sequence,
+            fit_cutoff=cutoff,
+            fit_cutoff_mode=fit_cutoff_mode,
+            fit_min_iter=fit_min_iter,
+            fit_rtol=fit_rtol,
+            fit_patience=fit_patience,
+            fit_timing=fit_timing,
+            fit_timing_sync_device=fit_timing_sync_device,
             n_iter=n_iter,
             progress=progress,
             direction=direction,
@@ -876,7 +919,7 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
             equalize_norms=equalize_norms,
             flat=flat,
         )
-        return result.cost, bdy_obj
+        return result, bdy_obj
 
     cost = _contract_quimb_double_layer(
         norm,
@@ -894,7 +937,13 @@ def _contract_peps_double_layer(  # pylint: disable=too-many-arguments
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
-    return cost, None
+    return BoundaryContractResult(
+        cost=cost,
+        fidel=[],
+        direction=direction,
+        n_iter=n_iter,
+        max_separation=max_separation,
+    ), None
 
 
 def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arguments
@@ -910,8 +959,17 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
     visualize=False,
     strip_exponent=False,
+    return_info=False,
     mode_=None,
     sequence=None,
     cutoff=1.0e-12,
@@ -944,6 +1002,9 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         input network exposes the corresponding method.
     strip_exponent : bool, default=False
         If ``True``, return ``(mantissa, exponent)``.
+    return_info : bool, default=False
+        Return :class:`BoundaryContractResult` instead of only its ``cost``.
+        The result includes per-boundary convergence diagnostics for DMRG.
     ctmrg_reduce_opts : mapping | None, default=None
         Optional options forwarded to Quimb's squared-environment
         factorization for ``method="ctmrg"``. Symmray networks receive
@@ -954,8 +1015,9 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
 
     Returns
     -------
-    complex | float | tuple[complex | float, float]
-        Contraction scalar, optionally with stripped exponent.
+    complex | float | tuple[complex | float, float] | BoundaryContractResult
+        Contraction scalar, optionally with stripped exponent, or the complete
+        structured result when ``return_info=True``.
     """
     if tn is None:
         raise ValueError("tn must not be None.")
@@ -967,7 +1029,7 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
             "use method='mps', 'ctmrg', 'hotrg', or 'exact' for 3D networks."
         )
 
-    cost, _ = _contract_peps_double_layer(
+    result, _ = _contract_peps_double_layer(
         tn,
         method=method,
         chi=chi,
@@ -979,6 +1041,14 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
         single_layer=False,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -992,7 +1062,10 @@ def contract_flat(  # pylint: disable=too-many-arguments,too-many-positional-arg
         ctmrg_reduce_opts=ctmrg_reduce_opts,
         ctmrg_gauge_smudge=ctmrg_gauge_smudge,
     )
-    return _format_scaled_output(cost, strip_exponent=strip_exponent)
+    cost = _format_scaled_output(result.cost, strip_exponent=strip_exponent)
+    if return_info:
+        return replace(result, cost=cost)
+    return cost
 
 
 def build_bra_ket(
@@ -1071,6 +1144,15 @@ def contract_boundary(
     contraction_opt="auto-hq",
     flat=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff=1.0e-12,
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
     n_iter=10,
     retag=True,
     progress=True,
@@ -1098,8 +1180,31 @@ def contract_boundary(
         Contraction optimizer passed through to :class:`pepsy.boundary.sweeps.CompBdy`.
     flat : bool, default=False
         Forwarded to sweep backend.
-    fit_mode : {"eff", "global"}, default="eff"
-        Fit backend mode.
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
+        Fit backend mode. ``"two-site"`` performs native-SVD pair updates
+        while preserving the cached left/right environment sweep.
+    fit_max_bond : int | None, default=None
+        Two-site SVD cap. If omitted, use the boundary object's current bond.
+        Higher-level PEPS helpers pass their requested ``chi`` explicitly.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions.
+    fit_cutoff : float, default=1e-12
+        Two-site SVD truncation cutoff.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used by the two-site split.
+    fit_min_iter : int | None, default=None
+        Minimum sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative convergence tolerance. ``None`` runs exactly ``n_iter``
+        sweeps, preserving legacy fixed-iteration behavior.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required for adaptive stopping.
+    fit_timing : bool, default=False
+        Collect elapsed time and detailed two-site sweep timings in
+        ``result.fit_diagnostics``.
+    fit_timing_sync_device : bool, default=False
+        Synchronize supported accelerators at FIT timing boundaries. Enable
+        only for kernel-complete profiling because barriers add overhead.
     n_iter : int, default=10
         Number of local fit iterations per step.
     retag : bool, default=True
@@ -1124,14 +1229,15 @@ def contract_boundary(
     Returns
     -------
     BoundaryContractResult
-        Structured contraction result with scalar ``cost`` and optional
-        fidelity history ``fidel``.
+        Structured contraction result with scalar ``cost``, optional fidelity
+        history ``fidel``, and one typed convergence record per boundary fit.
     """
     if norm is None:
         raise ValueError("norm must not be None.")
     if bdy is None:
         raise ValueError("Provide bdy.")
     if hasattr(bdy, "mps_b"):
+        bdy_obj = bdy
         mps_boundaries = bdy.mps_b
     elif isinstance(bdy, dict):
         bdy_obj = bdy.get("bdy", None)
@@ -1144,6 +1250,9 @@ def contract_boundary(
     if not isinstance(mps_boundaries, dict):
         raise TypeError("mps_boundaries must be a dictionary of boundary states.")
 
+    if fit_max_bond is None:
+        fit_max_bond = getattr(bdy_obj, "chi", None)
+
     retag = bool(retag)
     norm_tagged = norm.copy()
 
@@ -1152,6 +1261,15 @@ def contract_boundary(
         mps_boundaries,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff=fit_cutoff,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
     )
 
     cost = comp_bdy.run(
@@ -1174,6 +1292,7 @@ def contract_boundary(
         direction=direction,
         n_iter=n_iter,
         max_separation=max_separation,
+        fit_diagnostics=tuple(getattr(comp_bdy, "fit_diagnostics", ())),
     )
 
 
@@ -1190,6 +1309,14 @@ def _contract_state_norm(
     progress,
     track_boundary_fidelity,
     fit_mode,
+    fit_max_bond,
+    fit_sweep_sequence,
+    fit_cutoff_mode,
+    fit_min_iter,
+    fit_rtol,
+    fit_patience,
+    fit_timing,
+    fit_timing_sync_device,
     single_layer,
     visualize,
     strip_exponent,
@@ -1212,7 +1339,7 @@ def _contract_state_norm(
     """
     ket_tagged, norm_tagged = build_bra_ket(ket=p, bra=None)
 
-    cost, bdy_obj = _contract_peps_double_layer(
+    result, bdy_obj = _contract_peps_double_layer(
         norm_tagged,
         method=method,
         chi=chi,
@@ -1224,6 +1351,14 @@ def _contract_state_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
         single_layer=single_layer,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -1233,13 +1368,6 @@ def _contract_state_norm(
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
         bdy_name="bdy",
-    )
-    result = BoundaryContractResult(
-        cost=cost,
-        fidel=[],
-        direction=direction,
-        n_iter=n_iter,
-        max_separation=max_separation,
     )
     return result, ket_tagged, bdy_obj
 
@@ -1257,6 +1385,14 @@ def peps_normalize(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1266,6 +1402,7 @@ def peps_normalize(
     equalize_norms=False,
     layer_tags=None,
     balance_bonds=True,
+    return_info=False,
 ):
     """Normalize a PEPS state in place using boundary contraction.
 
@@ -1307,8 +1444,27 @@ def peps_normalize(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"eff", "global"}, default="eff"
-        Boundary fitting backend mode.
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
+        Boundary fitting backend mode. ``"two-site"`` can grow useful bond
+        subspaces up to ``fit_max_bond`` through native SVD pair updates.
+    fit_max_bond : int | None, default=None
+        Two-site SVD cap. Defaults to the requested boundary ``chi``.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_min_iter : int | None, default=None
+        Minimum two-site sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative convergence tolerance. ``None`` performs exactly ``n_iter``
+        sweeps.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required when ``fit_rtol`` is set.
+    fit_timing : bool, default=False
+        Include elapsed and detailed two-site sweep timings in boundary FIT
+        diagnostics.
+    fit_timing_sync_device : bool, default=False
+        Synchronize supported accelerator kernels for timing accuracy.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     strip_exponent : bool, default=False
@@ -1321,12 +1477,15 @@ def peps_normalize(
         If ``True``, call ``balance_bonds_()`` after rescaling a dense state.
         Symmray block-sparse states always skip this step because Quimb's bond
         balancer currently needs a contraction unsupported by Symmray.
+    return_info : bool, default=False
+        Return :class:`BoundaryContractResult` with the old norm in ``cost``
+        instead of returning only the old norm scalar.
 
     Returns
     -------
-    complex | float
-        The old norm estimate returned by the boundary contraction before
-        rescaling.
+    complex | float | BoundaryContractResult
+        The old norm estimate returned before rescaling, or the complete
+        contraction result when ``return_info=True``.
     """
     if p is None:
         raise ValueError("p must not be None.")
@@ -1343,6 +1502,14 @@ def peps_normalize(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
         single_layer=single_layer,
         visualize=visualize,
         mode_=mode_,
@@ -1380,6 +1547,8 @@ def peps_normalize(
     _normalize_by_scaled_norm(ket_tagged, cost)
     if balance_bonds and not _uses_symmray_arrays(ket_tagged):
         ket_tagged.balance_bonds_()
+    if return_info:
+        return replace(result, cost=old_norm)
     return old_norm
 
 
@@ -1396,6 +1565,14 @@ def boundary_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1404,6 +1581,7 @@ def boundary_norm(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    return_info=False,
 ):
     """Compute ``<p|p>`` via boundary contraction without rescaling ``p``.
 
@@ -1434,17 +1612,39 @@ def boundary_norm(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track fidelity history during boundary contraction.
-    fit_mode : {"eff", "global"}, default="eff"
-        Boundary fitting backend mode.
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
+        Boundary fitting backend mode. ``"two-site"`` uses cached pair
+        environments and native SVD truncation.
+    fit_max_bond : int | None, default=None
+        Two-site SVD cap. Defaults to the requested boundary ``chi``.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_min_iter : int | None, default=None
+        Minimum two-site sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative convergence tolerance. ``None`` performs exactly ``n_iter``
+        sweeps.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required when ``fit_rtol`` is set.
+    fit_timing : bool, default=False
+        Include elapsed and detailed two-site sweep timings in boundary FIT
+        diagnostics.
+    fit_timing_sync_device : bool, default=False
+        Synchronize supported accelerator kernels for timing accuracy.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     strip_exponent : bool, default=False
         If ``True``, return ``(mantissa, exponent)`` for the norm estimate.
+    return_info : bool, default=False
+        Return :class:`BoundaryContractResult` instead of only its ``cost``.
 
     Returns
     -------
-    complex | float
-        The ``<p|p>`` norm estimate from the boundary contraction.
+    complex | float | BoundaryContractResult
+        The ``<p|p>`` norm estimate, or the complete contraction result when
+        ``return_info=True``.
     """
     if p is None:
         raise ValueError("p must not be None.")
@@ -1462,6 +1662,14 @@ def boundary_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
         single_layer=single_layer,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -1471,7 +1679,10 @@ def boundary_norm(
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
     )
-    return _format_scaled_output(result.cost, strip_exponent=strip_exponent)
+    cost = _format_scaled_output(result.cost, strip_exponent=strip_exponent)
+    if return_info:
+        return replace(result, cost=cost)
+    return cost
 
 
 def peps_norm(
@@ -1487,6 +1698,14 @@ def peps_norm(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1495,6 +1714,7 @@ def peps_norm(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    return_info=False,
 ):
     """Compute the PEPS norm ``<p|p>`` without modifying ``p``.
 
@@ -1504,9 +1724,10 @@ def peps_norm(
 
     Returns
     -------
-    complex | float | tuple[complex | float, float]
+    complex | float | tuple[complex | float, float] | BoundaryContractResult
         Norm estimate. With ``strip_exponent=True`` this is
-        ``(mantissa, exponent)``.
+        ``(mantissa, exponent)``. With ``return_info=True``, return the
+        structured contraction result and store that value in ``result.cost``.
     """
     return boundary_norm(
         p,
@@ -1520,6 +1741,14 @@ def peps_norm(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
         single_layer=single_layer,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -1528,6 +1757,7 @@ def peps_norm(
         cutoff=cutoff,
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
+        return_info=return_info,
     )
 
 
@@ -1549,6 +1779,14 @@ def peps_infidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1623,8 +1861,25 @@ def peps_infidelity(
         Show progress bar.
     track_boundary_fidelity : bool, default=False
         Track per-step fidelity during boundary contraction.
-    fit_mode : {"eff", "global"}, default="eff"
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
         Boundary fitting backend mode.
+    fit_max_bond : int | None, default=None
+        Two-site SVD cap. Defaults to the requested boundary ``chi``.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used with ``cutoff`` by two-site splits.
+    fit_min_iter : int | None, default=None
+        Minimum two-site sweeps before adaptive stopping.
+    fit_rtol : float | None, default=None
+        Relative two-site convergence tolerance.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required when ``fit_rtol`` is set.
+    fit_timing : bool, default=False
+        Include elapsed and detailed two-site sweep timings in each returned
+        contraction result's FIT diagnostics.
+    fit_timing_sync_device : bool, default=False
+        Synchronize supported accelerator kernels for timing accuracy.
     single_layer : bool, default=False
         Boundary initializer mode for :class:`pepsy.boundary.states.BdyMPS`.
     visualize : bool, default=False
@@ -1645,6 +1900,9 @@ def peps_infidelity(
         - ``bdy_target``: boundary MPS for *p_target* (``None`` when
           ``norm_target`` was given)
         - ``bdy_overlap``: boundary MPS for the overlap network
+        - ``norm_result`` / ``norm_target_result`` / ``overlap_result``:
+          structured contraction results with boundary FIT diagnostics;
+          known supplied norms have a corresponding result of ``None``
     """
     if p is None:
         raise ValueError("p must not be None.")
@@ -1659,6 +1917,14 @@ def peps_infidelity(
         chi=chi,
         contraction_opt=contraction_opt,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
         n_iter=n_iter,
         progress=progress,
         direction=direction,
@@ -1675,9 +1941,10 @@ def peps_infidelity(
 
     # -- <p|p> --
     bdy_obj = None
+    norm_result = None
     if norm is None:
         _, norm_tn = build_bra_ket(ket=p, bra=None)
-        cost, bdy_obj = _contract_peps_double_layer(
+        norm_result, bdy_obj = _contract_peps_double_layer(
             norm_tn,
             bdy=bdy,
             single_layer=single_layer,
@@ -1685,7 +1952,7 @@ def peps_infidelity(
             **_kw,
         )
         norm = _format_scaled_output(
-            cost,
+            norm_result.cost,
             strip_exponent=strip_exponent,
         )
     else:
@@ -1693,9 +1960,10 @@ def peps_infidelity(
 
     # -- <p_target|p_target> --
     bdy_target_obj = None
+    norm_target_result = None
     if norm_target is None:
         _, norm_target_tn = build_bra_ket(ket=p_target, bra=None)
-        cost, bdy_target_obj = _contract_peps_double_layer(
+        norm_target_result, bdy_target_obj = _contract_peps_double_layer(
             norm_target_tn,
             bdy=bdy_target,
             single_layer=single_layer,
@@ -1703,7 +1971,7 @@ def peps_infidelity(
             **_kw,
         )
         norm_target = _format_scaled_output(
-            cost,
+            norm_target_result.cost,
             strip_exponent=strip_exponent,
         )
     else:
@@ -1711,7 +1979,7 @@ def peps_infidelity(
 
     # -- <p_target|p> (overlap) --
     _, overlap_tn = build_bra_ket(ket=p, bra=p_target)
-    cost, bdy_overlap_obj = _contract_peps_double_layer(
+    overlap_result, bdy_overlap_obj = _contract_peps_double_layer(
         overlap_tn,
         bdy=bdy_overlap,
         single_layer=single_layer,
@@ -1719,7 +1987,7 @@ def peps_infidelity(
         **_kw,
     )
     overlap = _format_scaled_output(
-        cost,
+        overlap_result.cost,
         strip_exponent=strip_exponent,
     )
 
@@ -1733,6 +2001,9 @@ def peps_infidelity(
         "bdy": bdy_obj,
         "bdy_target": bdy_target_obj,
         "bdy_overlap": bdy_overlap_obj,
+        "norm_result": norm_result,
+        "norm_target_result": norm_target_result,
+        "overlap_result": overlap_result,
     }
 
 
@@ -1754,6 +2025,14 @@ def peps_fidelity(
     progress=False,
     track_boundary_fidelity=False,
     fit_mode="eff",
+    fit_max_bond=None,
+    fit_sweep_sequence="RL",
+    fit_cutoff_mode="rsum2",
+    fit_min_iter=None,
+    fit_rtol=None,
+    fit_patience=1,
+    fit_timing=False,
+    fit_timing_sync_device=False,
     single_layer=False,
     visualize=False,
     strip_exponent=False,
@@ -1762,18 +2041,22 @@ def peps_fidelity(
     cutoff=1.0e-12,
     equalize_norms=False,
     layer_tags=None,
+    return_info=False,
 ):
     """Compute boundary-estimated PEPS fidelity.
 
     This is a convenience wrapper around :func:`peps_infidelity` that returns
     ``1 - infidelity``. Pass ``norm`` and/or ``norm_target`` when one of the
     states is already known to be normalized; the corresponding self-overlap
-    contraction is then skipped.
+    contraction is then skipped. With ``return_info=True``, return the complete
+    infidelity result dictionary plus its computed ``fidelity`` so opt-in FIT
+    timing and convergence diagnostics remain observable.
 
     Returns
     -------
-    float
-        Boundary-estimated fidelity.
+    float | dict[str, object]
+        Boundary-estimated fidelity, or complete norm/overlap contraction
+        information when ``return_info=True``.
     """
     result = peps_infidelity(
         p,
@@ -1792,6 +2075,14 @@ def peps_fidelity(
         progress=progress,
         track_boundary_fidelity=track_boundary_fidelity,
         fit_mode=fit_mode,
+        fit_max_bond=fit_max_bond,
+        fit_sweep_sequence=fit_sweep_sequence,
+        fit_cutoff_mode=fit_cutoff_mode,
+        fit_min_iter=fit_min_iter,
+        fit_rtol=fit_rtol,
+        fit_patience=fit_patience,
+        fit_timing=fit_timing,
+        fit_timing_sync_device=fit_timing_sync_device,
         single_layer=single_layer,
         visualize=visualize,
         strip_exponent=strip_exponent,
@@ -1801,7 +2092,11 @@ def peps_fidelity(
         equalize_norms=equalize_norms,
         layer_tags=layer_tags,
     )
-    return 1 - result["infidelity"]
+    fidelity = 1 - result["infidelity"]
+    if return_info:
+        result["fidelity"] = fidelity
+        return result
+    return fidelity
 
 
 def normalize(*args, **kwargs):

@@ -5616,6 +5616,181 @@ def _assemble_symmray_mpo(
     return mpo
 
 
+def _build_factorized_pair_mpo(
+    *,
+    L,
+    pair_create,
+    pair_annihilate,
+    onsite,
+    signs,
+    normalization,
+    symmetry,
+    max_bond=None,
+    cutoff=1e-12,
+    compress=False,
+    upper_ind_id="k{}",
+    lower_ind_id="b{}",
+    site_tag_id="I{}",
+    to_backend=None,
+    dtype=None,
+):
+    """Build a compact native MPO for a staggered pair structure factor.
+
+    The operator is assembled from the finite-state identity
+
+    ``normalization * ((sum_i s_i D_i^dagger) (sum_j s_j D_j)
+    - sum_i D_i^dagger D_i)``.
+
+    The explicit two-site expansion has ``O(L**2)`` terms, but this automaton
+    has only two open pair channels plus start/done.  In particular, it does
+    not first create one MPO channel per pair and then try to compress the
+    result.  The local operators are native Symmray fermionic arrays; the
+    graded evaluator therefore remains responsible for the MPO--MPS signs.
+    """
+    if not isinstance(L, Integral) or int(L) < 1:
+        raise ValueError("L must be a positive integer.")
+    L = int(L)
+    signs = tuple(signs)
+    if len(signs) != L:
+        raise ValueError(f"signs must contain exactly L={L} values.")
+    normalization = np.asarray(normalization).reshape(())
+    if not np.isfinite(normalization):
+        raise ValueError("normalization must be finite.")
+    dtype = np.dtype(dtype or np.result_type(
+        _dense_numpy(pair_create).dtype,
+        _dense_numpy(pair_annihilate).dtype,
+        _dense_numpy(onsite).dtype,
+        np.asarray(signs).dtype,
+        normalization.dtype,
+    ))
+
+    create_dense, phys_map = _term_dense_and_phys_map(
+        pair_create,
+        dtype=dtype,
+    )
+    annihilate_dense, annihilate_phys_map = _term_dense_and_phys_map(
+        pair_annihilate,
+        dtype=dtype,
+    )
+    _, onsite_phys_map = _term_dense_and_phys_map(
+        onsite,
+        dtype=dtype,
+    )
+    if phys_map != annihilate_phys_map or phys_map != onsite_phys_map:
+        raise ValueError(
+            "factorized pair MPO operators must share one physical charge map."
+        )
+
+    # Preserve the charge rank for product symmetries (e.g. ``U1U1``); a
+    # scalar ``0`` is not equal to the neutral tuple ``(0, 0)``.
+    zero = _normalize_group_charge(
+        _zero_like_charge(getattr(pair_create, "charge", 0)),
+        symmetry,
+    )
+    create_charge = _normalize_group_charge(
+        getattr(pair_create, "charge", zero), symmetry
+    )
+    annihilate_charge = _normalize_group_charge(
+        getattr(pair_annihilate, "charge", zero), symmetry
+    )
+    onsite_charge = _normalize_group_charge(
+        getattr(onsite, "charge", zero), symmetry
+    )
+    if create_charge == zero or annihilate_charge == zero:
+        raise ValueError("pair creation and annihilation operators must be charged.")
+    if create_charge != _charge_neg(annihilate_charge, symmetry):
+        raise ValueError(
+            "pair creation and annihilation charges must be negatives of one "
+            "another."
+        )
+    if onsite_charge != zero:
+        raise ValueError("the onsite pair subtraction must be charge neutral.")
+
+    # ``_assemble_symmray_mpo`` reserves these boundary labels for the
+    # identity path shared by all of its finite-state MPO builders.
+    start = ("start",)
+    create_state = ("factorized_pair_create",)
+    annihilate_state = ("factorized_pair_annihilate",)
+    done = ("done",)
+    channels = [
+        [
+            (start, zero),
+            (create_state, _charge_neg(create_charge, symmetry)),
+            (annihilate_state, _charge_neg(annihilate_charge, symmetry)),
+            (done, zero),
+        ]
+        for _ in range(max(L - 1, 0))
+    ]
+    transitions = [[] for _ in range(L)]
+    identity = np.eye(len(phys_map), dtype=dtype)
+    scaled_normalization = dtype.type(normalization)
+
+    for site in range(L):
+        if site < L - 1:
+            # Put the overall normalization on the closing endpoint.  The
+            # open-channel transition is the first factor in F^dagger F, so
+            # applying normalization at both ends would incorrectly produce
+            # normalization**2 for every pair.
+            coefficient = dtype.type(signs[site])
+            transitions[site].extend(
+                (
+                    (start, create_state, coefficient * create_dense),
+                    (start, annihilate_state, coefficient * annihilate_dense),
+                )
+            )
+
+        if 0 < site < L - 1:
+            transitions[site].extend(
+                (
+                    (create_state, create_state, identity),
+                    (annihilate_state, annihilate_state, identity),
+                )
+            )
+
+        if site > 0:
+            coefficient = scaled_normalization * dtype.type(signs[site])
+            transitions[site].extend(
+                (
+                    (create_state, done, coefficient * annihilate_dense),
+                    (annihilate_state, done, coefficient * create_dense),
+                )
+            )
+
+        # The start->done onsite transition is intentionally omitted.  The
+        # finite-state paths above contain only i < j and i > j, which is
+        # exactly the off-diagonal structure factor.  Equivalently, this is
+        # F^dagger F - sum_i Delta_i^dagger Delta_i without constructing the
+        # diagonal term and subtracting it afterward.
+
+    mpo = _assemble_symmray_mpo(
+        L=L,
+        channels=channels,
+        transitions=transitions,
+        phys_map=phys_map,
+        symmetry=symmetry,
+        zero=zero,
+        dtype=dtype,
+        max_bond=max_bond,
+        cutoff=cutoff,
+        compress=compress,
+        upper_ind_id=upper_ind_id,
+        lower_ind_id=lower_ind_id,
+        site_tag_id=site_tag_id,
+        to_backend=to_backend,
+        fermionic=True,
+        operator_charge=zero,
+    )
+    mpo.pepsy_compression_report.update(
+        {
+            "factorized_pair": True,
+            "factorized_channels": 4,
+            "pair_term_count": L * (L - 1) // 2,
+            "normalization": complex(normalization),
+        }
+    )
+    return mpo
+
+
 def _build_fermionic_model_mpo(
     hamiltonian,
     L,
@@ -5875,6 +6050,7 @@ def _add_native_term_to_mpo(
     # channel charge is taken directly from the native factor bond index,
     # rather than reconstructed from dense matrix elements.
     interval_channel_ids = []
+    interval_channel_charges = []
     for interval in range(n_sites - 1):
         factor = factors[interval]
         bond_axis = 0 if interval == 0 else 1
@@ -5891,6 +6067,7 @@ def _add_native_term_to_mpo(
             for cut in range(sites[interval], sites[interval + 1]):
                 channels[cut].append((channel_id, bond_charge))
         interval_channel_ids.append(channel_ids)
+        interval_channel_charges.append(tuple(bond_map))
 
     first_data = _dense_numpy(factors[0], dtype=dtype)
     for bond_pos, channel_id in enumerate(interval_channel_ids[0]):
@@ -5919,8 +6096,20 @@ def _add_native_term_to_mpo(
     identity = np.eye(len(physical_maps[0]), dtype=dtype)
     for interval, channel_ids in enumerate(interval_channel_ids):
         for site in range(sites[interval] + 1, sites[interval + 1]):
-            for channel_id in channel_ids:
-                transitions[site].append((channel_id, channel_id, identity))
+            for channel_pos, channel_id in enumerate(channel_ids):
+                # A skipped site still participates in the graded ordering.
+                # For an odd operator-Schmidt channel, moving that channel
+                # past one omitted physical site contributes a scalar -1.
+                # This is a graded factorization phase, not a JW parity
+                # operator: inserting the latter would change the native
+                # operator by making the result state-dependent.
+                bond_charge = interval_channel_charges[interval][channel_pos]
+                phase_op = (
+                    -identity
+                    if _charged_op_needs_fermion_string(bond_charge)
+                    else identity
+                )
+                transitions[site].append((channel_id, channel_id, phase_op))
 
     return list(physical_maps[0])
 
@@ -8909,6 +9098,66 @@ class Fermion:
             sites=(0, 1),
             charge=self.zero_charge,
             add_hc=True,
+        )
+
+    def eta_pair_structure_factor_mpo(
+        self,
+        L,
+        *,
+        signs,
+        normalization=None,
+        max_bond=None,
+        cutoff=1e-12,
+        compress=False,
+        upper_ind_id="k{}",
+        lower_ind_id="b{}",
+        site_tag_id="I{}",
+        dtype=None,
+        to_backend=None,
+    ):
+        """Build a compact native MPO for the staggered eta structure factor.
+
+        ``signs`` gives the staggered sign in the one-dimensional MPS chain
+        order.  The returned neutral MPO represents
+
+        ``normalization * (F^dagger F - sum_i Delta_i^dagger Delta_i)``
+
+        with ``F = sum_i signs[i] * Delta_i``.  For the common convention
+        ``P_eta = (2 / L) * sum_{i < j} signs[i] * signs[j] *
+        Re(<Delta_i^dagger Delta_j>)``, use ``normalization=1 / L``.
+
+        This uses a constant-size native graded automaton rather than the
+        explicit ``O(L**2)`` two-site term expansion.  The internal pair
+        channels carry the nonzero Symmray charges while the MPO boundary is
+        neutral, so no charge-changing MPO sector or Jordan--Wigner copy is
+        introduced.
+        """
+        self._require_spinful("eta-pair structure-factor MPOs")
+        if not isinstance(L, Integral) or int(L) < 1:
+            raise ValueError("L must be a positive integer.")
+        L = int(L)
+        if normalization is None:
+            normalization = 1.0 / L
+        to_backend = self.to_backend if to_backend is None else to_backend
+        pair_create = self.observable("pair_create")
+        pair_annihilate = self.observable("pair_annihilate")
+        onsite = self.observable("doublon")
+        return _build_factorized_pair_mpo(
+            L=L,
+            pair_create=pair_create,
+            pair_annihilate=pair_annihilate,
+            onsite=onsite,
+            signs=signs,
+            normalization=normalization,
+            symmetry=self.symmetry,
+            max_bond=max_bond,
+            cutoff=cutoff,
+            compress=compress,
+            upper_ind_id=upper_ind_id,
+            lower_ind_id=lower_ind_id,
+            site_tag_id=site_tag_id,
+            to_backend=to_backend,
+            dtype=self.dtype if dtype is None else dtype,
         )
 
     def _hopping_operator_on_sites(

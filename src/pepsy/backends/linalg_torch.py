@@ -1,5 +1,6 @@
-"""Torch-side linalg registrations with stabilized autodiff rules."""
+"""Torch-side linalg registrations with configurable SVD policies."""
 
+import contextvars
 import warnings
 
 import autoray as ar
@@ -14,7 +15,16 @@ except ImportError:  # pragma: no cover - optional dependency
 # pylint: disable=abstract-method,arguments-differ,bad-staticmethod-argument,bare-except,line-too-long,multiple-statements,not-callable,superfluous-parens,too-many-branches,too-many-locals,too-many-statements,unnecessary-semicolon,unused-variable,using-constant-test
 
 _SVD_EPS_REL = 1.0e-6
+_QR_EPS_REL = 1.0e-6
 _REGISTERED_FUNCTIONS = {}
+_SVD_WRAPPERS = {}
+_SVD_FORWARD_OPTIONS = contextvars.ContextVar(
+    "pepsy_torch_svd_forward_options",
+    default=None,
+)
+_SVD_DRIVERS = {"auto", "gesvdj", "gesvda", "gesvd"}
+_CPU_SVD_BACKENDS = {"torch", "scipy_gesdd", "scipy_gesvd"}
+_SVD_FALLBACKS = {"auto", "none", "scipy_gesdd", "scipy_gesvd"}
 _QR_RANK_POLICIES = {"warn", "native", "error"}
 _QR_RANK_POLICY = "warn"
 _QR_RANK_TOL_FACTOR = 1.0
@@ -80,12 +90,15 @@ def safe_inverse_2(x, eps):
     return x.clamp_min(eps).reciprocal()
 
 
-def _scipy_gesvd(A, exc):
-    """Compute a thin SVD through SciPy's more robust ``gesvd`` driver."""
+def _scipy_svd(A, lapack_driver="gesvd", exc=None):
+    """Compute a thin CPU SVD through an explicit SciPy LAPACK driver."""
     if scipy_linalg is None:
-        raise RuntimeError(
-            "torch.linalg.svd failed and scipy is unavailable for gesvd fallback."
-        ) from exc
+        message = (
+            "SciPy is required for the requested CPU SVD backend or fallback."
+        )
+        if exc is not None:
+            raise RuntimeError(message) from exc
+        raise ImportError(message)
 
     A_np = A.detach().cpu().numpy()
     batch_shape = A_np.shape[:-2]
@@ -103,7 +116,7 @@ def _scipy_gesvd(A, exc):
                 scipy_linalg.svd(
                     mat,
                     full_matrices=False,
-                    lapack_driver="gesvd",
+                    lapack_driver=lapack_driver,
                 )
                 for mat in flat
             ]
@@ -120,13 +133,85 @@ def _scipy_gesvd(A, exc):
         U_np, S_np, Vh_np = scipy_linalg.svd(
             A_np,
             full_matrices=False,
-            lapack_driver="gesvd",
+            lapack_driver=lapack_driver,
         )
 
     U = torch.from_numpy(np.asarray(U_np)).to(device=A.device, dtype=A.dtype)
     S = torch.from_numpy(np.asarray(S_np)).to(device=A.device, dtype=A.real.dtype)
     Vh = torch.from_numpy(np.asarray(Vh_np)).to(device=A.device, dtype=A.dtype)
     return U, S, Vh
+
+
+def _scipy_gesvd(A, exc):
+    """Compute a thin SVD through SciPy's robust ``gesvd`` fallback."""
+    return _scipy_svd(A, lapack_driver="gesvd", exc=exc)
+
+
+def _resolve_svd_options(*, driver="auto", cpu_svd="torch", fallback="auto"):
+    """Validate and normalize the low-level Torch SVD policy."""
+    if driver not in _SVD_DRIVERS:
+        choices = ", ".join(sorted(_SVD_DRIVERS))
+        raise ValueError(f"svd_driver must be one of: {choices}")
+    if cpu_svd not in _CPU_SVD_BACKENDS:
+        choices = ", ".join(sorted(_CPU_SVD_BACKENDS))
+        raise ValueError(f"cpu_svd must be one of: {choices}")
+    if fallback not in _SVD_FALLBACKS:
+        choices = ", ".join(sorted(_SVD_FALLBACKS))
+        raise ValueError(f"svd_fallback must be one of: {choices}")
+    return driver, cpu_svd, fallback
+
+
+def _svd_forward(
+    A,
+    *,
+    driver="auto",
+    cpu_svd="torch",
+    fallback="auto",
+    stabilized=False,
+):
+    """Execute one configured thin SVD, including explicit CPU fallbacks."""
+    driver, cpu_svd, fallback = _resolve_svd_options(
+        driver=driver,
+        cpu_svd=cpu_svd,
+        fallback=fallback,
+    )
+    if fallback == "auto":
+        fallback = "scipy_gesvd" if stabilized else "none"
+
+    if A.device.type == "cpu" and cpu_svd != "torch":
+        if A.requires_grad and not stabilized:
+            raise RuntimeError(
+                "cpu_svd={!r} is forward-only for stabilized=False. Use "
+                "cpu_svd='torch' or stabilized=True for autodiff.".format(cpu_svd)
+            )
+        return _scipy_svd(A, lapack_driver=cpu_svd.removeprefix("scipy_"))
+
+    kwargs = {"full_matrices": False}
+    if A.is_cuda:
+        if driver == "auto":
+            # Preserve the historical stabilized path's robust CUDA choice,
+            # while native Torch keeps its own default (currently gesvdj with
+            # a gesvd fallback in supported CUDA builds).
+            if stabilized:
+                kwargs["driver"] = "gesvd"
+        else:
+            kwargs["driver"] = driver
+
+    try:
+        return torch.linalg.svd(A, **kwargs)
+    except Exception as exc:  # pragma: no cover - backend failure dependent
+        if fallback == "none":
+            raise
+        return _scipy_svd(A, lapack_driver=fallback.removeprefix("scipy_"), exc=exc)
+
+
+def _configured_svd_call(function, A, *, driver, cpu_svd, fallback):
+    """Call a regularized SVD with options scoped to this synchronous forward."""
+    token = _SVD_FORWARD_OPTIONS.set((driver, cpu_svd, fallback))
+    try:
+        return function.apply(A)
+    finally:
+        _SVD_FORWARD_OPTIONS.reset(token)
 
 
 class SVD(torch.autograd.Function):
@@ -142,13 +227,16 @@ class SVD(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
-        try:
-            if A.is_cuda:
-                U, S, Vh = torch.linalg.svd(A, full_matrices=False, driver="gesvd")
-            else:
-                U, S, Vh = torch.linalg.svd(A, full_matrices=False)
-        except Exception as exc:  # pragma: no cover - backend failure dependent
-            U, S, Vh = _scipy_gesvd(A, exc)
+        options = _SVD_FORWARD_OPTIONS.get()
+        if options is None:
+            options = ("auto", "torch", "scipy_gesvd")
+        U, S, Vh = _svd_forward(
+            A,
+            driver=options[0],
+            cpu_svd=options[1],
+            fallback=options[2],
+            stabilized=True,
+        )
         ctx.save_for_backward(U, S, Vh)
         return U, S, Vh
 
@@ -272,13 +360,16 @@ class SVD_real(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, A):
-        try:
-            if A.is_cuda:
-                U, S, Vh = torch.linalg.svd(A, full_matrices=False, driver="gesvd")
-            else:
-                U, S, Vh = torch.linalg.svd(A, full_matrices=False)
-        except Exception as exc:  # pragma: no cover - backend failure dependent
-            U, S, Vh = _scipy_gesvd(A, exc)
+        options = _SVD_FORWARD_OPTIONS.get()
+        if options is None:
+            options = ("auto", "torch", "scipy_gesvd")
+        U, S, Vh = _svd_forward(
+            A,
+            driver=options[0],
+            cpu_svd=options[1],
+            fallback=options[2],
+            stabilized=True,
+        )
         ctx.save_for_backward(U, S, Vh)
         return U, S, Vh
 
@@ -423,16 +514,22 @@ class QR_real(torch.autograd.Function):
         return torch.cat([da, db], dim=-1)
 
 
-class QR_real_safe(torch.autograd.Function):
-    """Real QR VJP that does not differentiate a singular gauge.
+def _qr_regularization_relative_eps(real_dtype):
+    """Return the shared relative threshold and VJP regularization scale."""
+    # The normal-equation right inverse squares the condition number. The
+    # square-root machine-epsilon floor keeps it resolvable for float32 while
+    # retaining the requested 1e-6 relative stabilization for float64/complex128.
+    return max(_QR_EPS_REL, torch.finfo(real_dtype).eps ** 0.5)
 
-    Symmetry-resolved PEPS boundary blocks can be exactly rank deficient even
-    when the complete tensor is well behaved.  Torch's QR backward is not
-    defined for those blocks.  The boundary contraction only uses their
-    canonical gauge, so the safe policy is to keep the forward QR factors but
-    return a zero VJP for a singular block.  Full-rank tall blocks use the
-    validated Pepsy rule and full-rank wide blocks use Torch's native VJP,
-    which covers the shape not handled by ``_simple_qr_backward``.
+
+class QR_real_safe(torch.autograd.Function):
+    """Real QR with a finite VJP at a singular unpivoted QR chart.
+
+    A zero diagonal entry of unpivoted ``R`` makes Torch's QR derivative
+    undefined. This can occur in a symmetry-resolved PEPS block even when the
+    complete wide matrix has useful physical rank. The forward QR remains
+    exact; only its VJP replaces ``R^{-H}`` by a scale-relative regularized
+    right inverse. Exactly zero blocks keep the explicit zero-VJP convention.
     """
 
     @staticmethod
@@ -440,7 +537,7 @@ class QR_real_safe(torch.autograd.Function):
         Q, R = torch.linalg.qr(A)
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
-        tolerance = torch.finfo(A.dtype).eps * max(A.shape[-2:]) * scale
+        tolerance = _qr_regularization_relative_eps(A.dtype) * scale
         rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
         ctx.save_for_backward(A, Q, R, rank_deficient)
         return Q, R
@@ -449,14 +546,14 @@ class QR_real_safe(torch.autograd.Function):
     def backward(ctx, dQ, dR):
         A, Q, R, rank_deficient = ctx.saved_tensors
         if bool(rank_deficient.any().item()):
-            return torch.zeros_like(A)
+            return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         if R.shape[-1] > R.shape[-2]:
             return _native_qr_backward(A, dQ, dR)
         return _simple_qr_backward(Q, R, dQ, dR)
 
 
 class QR_complex_safe(torch.autograd.Function):
-    """Complex QR VJP that freezes exactly rank-deficient gauges."""
+    """Complex QR with a finite VJP at a singular unpivoted QR chart."""
 
     @staticmethod
     def forward(ctx, A):
@@ -464,16 +561,16 @@ class QR_complex_safe(torch.autograd.Function):
         diagonal = torch.diagonal(R, dim1=-2, dim2=-1).abs()
         scale = R.abs().amax(dim=(-2, -1))
         real_dtype = A.real.dtype if A.is_complex() else A.dtype
-        tolerance = torch.finfo(real_dtype).eps * max(A.shape[-2:]) * scale
+        tolerance = _qr_regularization_relative_eps(real_dtype) * scale
         rank_deficient = (diagonal <= tolerance.unsqueeze(-1)).any(dim=-1)
-        ctx.save_for_backward(A, rank_deficient)
+        ctx.save_for_backward(A, Q, R, rank_deficient)
         return Q, R
 
     @staticmethod
     def backward(ctx, dQ, dR):
-        A, rank_deficient = ctx.saved_tensors
+        A, Q, R, rank_deficient = ctx.saved_tensors
         if bool(rank_deficient.any().item()):
-            return torch.zeros_like(A)
+            return _regularized_qr_backward(A, Q, R, dQ, dR, rank_deficient)
         return _native_qr_backward(A, dQ, dR)
 
 
@@ -484,6 +581,9 @@ def _simple_qr_backward(q, r, dq, dr):
             "QrGrad not implemented when ncols > nrows "
             "or full_matrices is true and ncols != nrows."
         )
+
+    dq = torch.zeros_like(q) if dq is None else dq
+    dr = torch.zeros_like(r) if dr is None else dr
 
     qdq = q.transpose(-2, -1) @ dq
     qdq_ = qdq - qdq.transpose(-2, -1)
@@ -503,6 +603,101 @@ def _simple_qr_backward(q, r, dq, dr):
     grad_a = q @ (dr + _triangular_solve(tril, r))
     grad_b = _triangular_solve(dq - q @ qdq, r)
     return grad_a + grad_b
+
+
+def _regularized_qr_right_solve(rhs, r, shift):
+    """Compute ``rhs @ R^{-H}`` with a scale-relative Tikhonov inverse."""
+    gram = r.mH @ r
+    size = r.shape[-1]
+    identity = torch.eye(size, dtype=r.dtype, device=r.device)
+    gram = gram + shift.square()[..., None, None] * identity
+    # For ``shift == 0`` this is algebraically the ordinary right triangular
+    # solve. For a singular pivot it is
+    # ``rhs @ R @ (R^H R + shift**2 I)^{-1}``.
+    return torch.linalg.solve(gram, (rhs @ r).mH).mH
+
+
+def _qr_syminv_adjoint(x):
+    """Adjoint of the QR upper-triangular Hermitian projection."""
+    output = x + x.mH
+    diagonal = output.diagonal(0, -2, -1)
+    if output.is_complex():
+        diagonal.real.mul_(0.5)
+    else:
+        diagonal.mul_(0.5)
+    return output
+
+
+def _qr_trilim_inv_adjoint_skew(x):
+    """Adjoint QR skew projection for a wide reduced QR factorization."""
+    output = (x - x.mH).tril()
+    if output.is_complex():
+        output.diagonal(0, -2, -1).imag.mul_(0.5)
+    return output
+
+
+def _regularized_qr_backward(a, q, r, dq, dr, singular_pivot):
+    """Finite extension of Torch's reduced QR VJP at a singular pivot.
+
+    The full-rank part exactly follows PyTorch's QR backward formula. For each
+    singular unpivoted block, its final ``R^{-H}`` solve is replaced by the
+    Tikhonov right inverse with a scale-relative shift. This preserves the
+    exact forward QR and only chooses a bounded derivative where the
+    mathematical QR chart has no unique derivative. An exactly zero input block
+    retains a zero VJP, since it has neither a preferred QR gauge nor an
+    intrinsic scale for the regularizer.
+    """
+    if (dq is None) and (dr is None):
+        return torch.zeros_like(a)
+
+    if dq is None:
+        gradient = dr @ r.mH
+    elif dr is None:
+        gradient = -q.mH @ dq
+    else:
+        gradient = dr @ r.mH - q.mH @ dq
+
+    block_scale = a.detach().abs().amax(dim=(-2, -1))
+    zero_block = block_scale == 0
+    scale_for_shift = torch.where(
+        zero_block,
+        torch.ones_like(block_scale),
+        block_scale,
+    )
+    real_dtype = a.real.dtype if a.is_complex() else a.dtype
+    relative_shift = _qr_regularization_relative_eps(real_dtype)
+    shift = torch.where(
+        singular_pivot,
+        relative_shift * scale_for_shift,
+        torch.zeros_like(scale_for_shift),
+    )
+    m = q.shape[-2]
+    n = r.shape[-1]
+    if m >= n:
+        gradient = q @ _qr_syminv_adjoint(gradient.triu())
+        if dq is not None:
+            gradient = gradient + dq
+        gradient = _regularized_qr_right_solve(gradient, r, shift)
+    else:
+        gradient = q @ _qr_trilim_inv_adjoint_skew(-gradient)
+        r_leading = r.narrow(-1, 0, m)
+        gradient = _regularized_qr_right_solve(gradient, r_leading, shift)
+        gradient = torch.cat(
+            (
+                gradient,
+                torch.zeros(
+                    *gradient.shape[:-1],
+                    n - m,
+                    dtype=gradient.dtype,
+                    device=gradient.device,
+                ),
+            ),
+            dim=-1,
+        )
+        if dr is not None:
+            gradient = gradient + q @ dr
+
+    return torch.where(zero_block[..., None, None], torch.zeros_like(gradient), gradient)
 
 
 def _native_qr_backward(A, dq, dr):
@@ -540,9 +735,96 @@ def _native_svd(A, *args, **kwargs):
     return torch.linalg.svd(A, *args, **kwargs)
 
 
-def reg_native_svd_torch():
-    """Register native Torch SVD with Pepsy's thin-factor default."""
-    _register_once("linalg.svd", _native_svd)
+def _native_svd_configured(A, *args, driver="auto", cpu_svd="torch", **kwargs):
+    """Run native Torch SVD with an explicit backend policy."""
+    kwargs.setdefault("full_matrices", False)
+    if A.device.type == "cpu" and cpu_svd != "torch":
+        if A.requires_grad:
+            raise RuntimeError(
+                "cpu_svd={!r} is forward-only for stabilized=False. Use "
+                "cpu_svd='torch' or stabilized=True for autodiff.".format(cpu_svd)
+            )
+        return _scipy_svd(
+            A,
+            lapack_driver=cpu_svd.removeprefix("scipy_"),
+        )
+    if A.is_cuda and driver != "auto":
+        kwargs.setdefault("driver", driver)
+    return torch.linalg.svd(A, *args, **kwargs)
+
+
+def _get_native_svd_wrapper(*, driver="auto", cpu_svd="torch"):
+    """Return a cached Autoray wrapper for one native SVD policy."""
+    _resolve_svd_options(driver=driver, cpu_svd=cpu_svd, fallback="none")
+    if driver == "auto" and cpu_svd == "torch":
+        return _native_svd
+    key = ("native", driver, cpu_svd)
+    function = _SVD_WRAPPERS.get(key)
+    if function is None:
+        def function(A, *args, **kwargs):
+            return _native_svd_configured(
+                A,
+                *args,
+                driver=driver,
+                cpu_svd=cpu_svd,
+                **kwargs,
+            )
+
+        function.__name__ = f"native_svd_{driver}_{cpu_svd}"
+        _SVD_WRAPPERS[key] = function
+    return _SVD_WRAPPERS[key]
+
+
+def _get_stabilized_svd_wrapper(
+    *,
+    mode="complex",
+    driver="auto",
+    cpu_svd="torch",
+    fallback="scipy_gesvd",
+):
+    """Return a cached regularized SVD wrapper for one explicit policy."""
+    _resolve_svd_options(
+        driver=driver,
+        cpu_svd=cpu_svd,
+        fallback=fallback,
+    )
+    function_class = SVD_real if mode == "real" else SVD
+    if (
+        driver == "auto"
+        and cpu_svd == "torch"
+        and fallback == "scipy_gesvd"
+    ):
+        return function_class.apply
+    key = ("stabilized", mode, driver, cpu_svd, fallback)
+    function = _SVD_WRAPPERS.get(key)
+    if function is None:
+        def function(A):
+            return _configured_svd_call(
+                function_class,
+                A,
+                driver=driver,
+                cpu_svd=cpu_svd,
+                fallback=fallback,
+            )
+
+        function.__name__ = (
+            f"{mode}_stabilized_svd_{driver}_{cpu_svd}_{fallback}"
+        )
+        _SVD_WRAPPERS[key] = function
+    return _SVD_WRAPPERS[key]
+
+
+def reg_native_svd_torch(*, svd_driver="auto", cpu_svd="torch"):
+    """Register native Torch SVD with an optional backend policy.
+
+    ``svd_driver`` applies only to CUDA tensors. ``cpu_svd`` can explicitly
+    select Torch's native CPU LAPACK path or a SciPy LAPACK driver. SciPy
+    backends are forward-only when the input requires gradients.
+    """
+    _register_once(
+        "linalg.svd",
+        _get_native_svd_wrapper(driver=svd_driver, cpu_svd=cpu_svd),
+    )
 
 
 def reset_torch_linalg_registrations():
@@ -553,23 +835,49 @@ def reset_torch_linalg_registrations():
     reg_complex_qr_torch()
 
 
-def reg_rel_svd_torch():
-    """Register the relative-regularized torch SVD rule in autoray."""
-    _register_once("linalg.svd", SVD.apply)
+def reg_rel_svd_torch(
+    *,
+    svd_driver="auto",
+    cpu_svd="torch",
+    svd_fallback="scipy_gesvd",
+):
+    """Register the relative-regularized Torch SVD rule in Autoray."""
+    _register_once(
+        "linalg.svd",
+        _get_stabilized_svd_wrapper(
+            mode="complex",
+            driver=svd_driver,
+            cpu_svd=cpu_svd,
+            fallback=svd_fallback,
+        ),
+    )
 
 
-def reg_complex_svd_torch():
+def reg_complex_svd_torch(**kwargs):
     """Register the complex torch SVD autograd implementation in autoray.
 
     This compatibility name installs the same relative-regularized SVD rule as
     :func:`reg_rel_svd_torch`.
     """
-    reg_rel_svd_torch()
+    reg_rel_svd_torch(**kwargs)
 
 
-def reg_real_svd_torch():
-    """Register the real torch SVD autograd implementation in autoray."""
-    _register_once("linalg.svd", SVD_real.apply)
+def reg_real_svd_torch(
+    *,
+    svd_driver="auto",
+    cpu_svd="torch",
+    svd_fallback="scipy_gesvd",
+):
+    """Register the real Torch SVD autograd implementation in Autoray."""
+    _register_once(
+        "linalg.svd",
+        _get_stabilized_svd_wrapper(
+            mode="real",
+            driver=svd_driver,
+            cpu_svd=cpu_svd,
+            fallback=svd_fallback,
+        ),
+    )
 
 
 def reg_real_qr_torch(*, rank_policy="warn", rank_tol_factor=1.0):
@@ -588,15 +896,23 @@ def reg_complex_qr_torch():
     _register_once("linalg.qr", torch.linalg.qr)
 
 
-def reg_quimb_torch_split_drivers(mode="real"):
-    """Register stable Torch split drivers used inside Symmray blocks.
+def reg_quimb_torch_split_drivers(
+    mode="real",
+    *,
+    svd_driver="auto",
+    cpu_svd="torch",
+    svd_fallback="scipy_gesvd",
+):
+    """Advanced helper for Quimb raw-block split drivers.
 
     Quimb's composed ``qr_stabilized`` and ``svd_truncated`` drivers receive
     raw Torch blocks from Symmray and call the Torch namespace directly. That
     path bypasses Autoray's ordinary ``linalg.qr`` and ``linalg.svd``
     registrations, so PEPS autodiff needs backend-specific Quimb drivers as
-    well. Missing Quimb is allowed because this helper is optional outside
-    tensor-network optimization.
+    well. Use :func:`pepsy.register_torch_linalg` with
+    ``quimb_split_drivers=True`` in application code; this helper remains for
+    backend implementation and compatibility. Missing Quimb is allowed because
+    it is optional outside tensor-network optimization.
     """
     if mode not in {"real", "complex"}:
         raise ValueError("mode must be 'real' or 'complex'")
@@ -622,10 +938,15 @@ def reg_quimb_torch_split_drivers(mode="real"):
 
         if stabilized:
             # The sign/phase is a discrete gauge choice. It should not enter
-            # the VJP, especially when a rank-deficient block has zero R
-            # diagonal entries.
-            phase = torch.sgn(
-                torch.diagonal(R, dim1=-2, dim2=-1)
+            # the VJP. ``phase(0)`` must be one: setting it to zero for a
+            # rank-deficient block erases the associated Q column and R row,
+            # so the nominally lossless QR split no longer reconstructs its
+            # input. This matches Quimb's backend-generic ``sgn`` rule.
+            diagonal = torch.diagonal(R, dim1=-2, dim2=-1)
+            phase = torch.where(
+                diagonal == 0,
+                torch.ones_like(diagonal),
+                torch.sgn(diagonal),
             ).detach()
             Q = Q * torch.conj(phase)[..., None, :]
             R = phase[..., :, None] * R
@@ -654,9 +975,20 @@ def reg_quimb_torch_split_drivers(mode="real"):
         absorb_i = qd._ABSORB_MAP[absorb]
         cutoff_mode_i = qd._CUTOFF_MODE_MAP[cutoff_mode]
         if mode == "real" and not x.is_complex():
-            U, s, VH = SVD_real.apply(x)
+            svd_function = _get_stabilized_svd_wrapper(
+                mode="real",
+                driver=svd_driver,
+                cpu_svd=cpu_svd,
+                fallback=svd_fallback,
+            )
         else:
-            U, s, VH = SVD.apply(x)
+            svd_function = _get_stabilized_svd_wrapper(
+                mode="complex",
+                driver=svd_driver,
+                cpu_svd=cpu_svd,
+                fallback=svd_fallback,
+            )
+        U, s, VH = svd_function(x)
         return qd._trim_and_renorm_svd_result(
             U,
             s,

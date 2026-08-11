@@ -44,7 +44,7 @@ def test_tree_optimizers_are_available_from_high_level_api():
 _EXPECTED_IN_ALL = [
     "backends", "boundary", "experimental", "fitting", "operators", "optimizers",
     "sampling", "solvers", "tensors", "vmc",
-    "BdyMPS", "CompBdy", "BoundaryContractResult", "contract_boundary",
+    "BdyMPS", "CompBdy", "BoundaryContractResult", "BoundaryFitDiagnostic", "contract_boundary",
     "contract_flat", "build_bra_ket", "normalize", "peps_normalize", "boundary_norm", "infidelity",
     "peps_norm", "peps_infidelity", "peps_fidelity", "GlobalOptimizer", "FIT",
     "tns_align", "measure_obs", "build_pepo_from_gates", "build_mpo_from_gates",
@@ -88,7 +88,8 @@ _EXPECTED_IN_ALL = [
     "reg_real_svd_torch", "reg_complex_svd_torch",
     "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",
-    "register_jax_linalg", "reset_linalg_registrations",
+    "register_jax_linalg", "register_torch_linalg", "reset_linalg_registrations",
+    "TorchLinalgConfig", "get_torch_linalg_config",
 ]
 
 _EXPECTED_NOT_IN_ALL = [
@@ -227,6 +228,9 @@ def test_optional_linalg_registrations_resolve():
     assert pepsy.reg_real_svd_jax is pepsy.tensors.reg_real_svd_jax
     assert pepsy.reg_complex_svd_jax is pepsy.tensors.reg_complex_svd_jax
     assert pepsy.register_jax_linalg is pepsy.backends.register_jax_linalg
+    assert pepsy.register_torch_linalg is pepsy.backends.register_torch_linalg
+    assert pepsy.TorchLinalgConfig is pepsy.backends.TorchLinalgConfig
+    assert pepsy.get_torch_linalg_config is pepsy.backends.get_torch_linalg_config
     assert pepsy.reset_linalg_registrations is pepsy.backends.reset_linalg_registrations
     if has_torch:
         import torch

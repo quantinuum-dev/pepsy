@@ -1,22 +1,42 @@
 # `pepsy.tensors.core`
 
-`register_torch_linalg()` keeps native Torch SVD/QR as the default. Pass
-`stabilized=True` to opt into Pepsy's relative-regularized SVD and validated
-real-QR rules for tensor-network autodiff. The explicit
-`reg_rel_svd_torch()` helper remains available when only the stabilized SVD
-rule is wanted; its CPU forward path falls back to SciPy `gesvd` if
+Use one public setup call for a Torch-autodiff PEPS run:
+
+```python
+py.register_torch_linalg(
+    mode="real", stabilized=True, quimb_split_drivers=True,
+)
+```
+
+It configures both Autoray's ordinary Torch SVD/QR operations and Quimb's
+raw-block split drivers. Set `quimb_split_drivers=False` (the default) for
+ordinary Torch tensor work that does not use native Symmray PEPS boundary
+autodiff. `PepsEnergyOptimizer` applies the same canonical configuration
+automatically from its input dtype.
+
+The Quimb split-driver registration is process-global. Passing
+`quimb_split_drivers=False` does not undo a previous registration; use
+`py.reset_linalg_registrations("torch")` to explicitly restore Quimb's and
+Autoray's native Torch rules.
+
+`stabilized=True` selects Pepsy's relative-regularized SVD and validated
+real-QR rules. The lower-level `reg_*_torch()` helpers remain for advanced
+compatibility use; ordinary applications should not combine them. The
+stabilized SVD CPU forward path falls back to SciPy `gesvd` if
 `torch.linalg.svd` fails.
+
+The Torch QR split driver uses the zero-safe phase convention `phase(0)=1`.
+This preserves a lossless QR/LQ reconstruction even for rank-deficient dense
+or Symmray blocks. A pivot at or below the scale-relative QR epsilon uses a
+regularized right inverse in backward rather than discarding the entire block
+gradient. The same epsilon sets both the near-singular detection threshold and
+the Tikhonov shift (`1e-6` times block scale for float64/complex128; a larger
+float32 safety floor applies). An exactly zero block has no preferred QR gauge
+or scale and therefore retains the explicit zero-VJP convention.
+
 Use `register_jax_linalg()` for the same native-versus-stabilized choice on
-JAX, or call `reg_native_svd_torch()` / `reg_native_svd_jax()` directly.
-The SVD/QR registration helpers are also available directly from `pepsy`, e.g.
-`import pepsy as py; py.reg_rel_svd_torch()`. Torch exposes
-`reg_native_svd_torch()`, `reg_rel_svd_torch()`, `reg_real_svd_torch()`,
-`reg_complex_svd_torch()`,
-`reg_real_qr_torch()`, and `reg_complex_qr_torch()`. JAX exposes SVD aliases
-`reg_native_svd_jax()`, `reg_rel_svd_jax()`, `reg_real_svd_jax()`, and
-`reg_complex_svd_jax()` for a
-thin-SVD custom VJP that preserves JAX's native derivative while safely
-restoring cotangents from Quimb fixed-rank truncation.
+JAX. The lower-level Torch/JAX helpers remain available directly from `pepsy`
+for advanced compatibility workflows.
 Registration helpers are idempotent: repeated calls do not re-register the
 same Autoray implementation, while switching Torch between native/stabilized
 or real/complex modes, and JAX between native/stabilized modes, intentionally

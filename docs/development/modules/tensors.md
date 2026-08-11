@@ -69,13 +69,23 @@ Backend helpers manage package-wide defaults and optional linalg shims:
 
 - `set_default_array_backend(...)` / `get_default_array_backend()`
 - `set_default_grad_backend(...)` / `get_default_grad_backend()`
+- `TorchLinalgConfig` / `get_torch_linalg_config()` — the single structured
+  process-global Torch SVD/QR policy. One `config.register()` call installs
+  native or relative-regularized SVD autodiff, the matching QR policy, CPU or
+  CUDA driver choices, optional fallbacks, and (when requested) Quimb's raw
+  Symmray split drivers. `register_torch_linalg(...)` remains a compatibility
+  constructor for this class.
 - `reset_default_backends()`
-- torch and JAX linalg/stop-gradient registrations. Native thin SVD/QR is the
-  default through `register_torch_linalg()` and native thin SVD is the default
-  through `register_jax_linalg()`. The explicit `stabilized=True` mode, or
-  `reg_rel_svd_torch()` / `reg_rel_svd_jax()`, installs the truncation-safe,
-  relative-regularized SVD rules for workflows that need them. The stabilized
-  Torch SVD falls back to SciPy `gesvd` on CPU forward-driver failures.
+- torch and JAX linalg/stop-gradient registrations. Use
+  `register_torch_linalg(...)` as the canonical public setup. Its explicit
+  `quimb_split_drivers=True` option also configures Quimb's raw Symmray-block
+  split paths; `PepsEnergyOptimizer` enables that option automatically.
+  Native thin SVD/QR is the default, while `stabilized=True` installs the
+  truncation-safe, relative-regularized SVD rules. The stabilized Torch SVD
+  falls back to SciPy `gesvd` on CPU forward-driver failures. The QR/LQ split
+  driver uses `phase(0)=1`, preserving rank-deficient dense and Symmray
+  reconstructions exactly, and a scale-relative regularized VJP for nonzero
+  singular pivots rather than dropping the full block gradient.
 
 ## Tag and index conventions
 

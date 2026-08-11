@@ -19,12 +19,14 @@ catalog or skill-package change.
 ## Core workflows
 
 - [MPS optimizer](mps-optimizer/SKILL.md)
+- [Tensor fitting](tensor-fitting/SKILL.md)
 - [Tree optimizer](tree-optimizer/SKILL.md)
 - [qMERA energy optimizer](qmera-energy-optimizer/SKILL.md)
 
 ## Domain workflows
 
 - [Belief propagation](belief-propagation/SKILL.md)
+- [Direct PEPS sampling](peps-sampler/SKILL.md)
 - [Fermion operators](pepsy-fermion-operators/SKILL.md)
 - [Variational Monte Carlo](pepsy-vmc/SKILL.md)
 - [Stabilizer tensor networks](stabilizer-tensor-networks/SKILL.md)

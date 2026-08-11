@@ -23,6 +23,30 @@ def test_mpo_optimizer_accepts_svd_mode():
     assert opt.mode == "svd"
 
 
+def test_fit_two_site_preserves_mpo_view_and_dense_readout():
+    """Direct FIT on an MPO must return a functional MPO, not an MPS view."""
+    guess = qtn.MPO_rand(
+        3, bond_dim=1, phys_dim=2, dtype="complex128", seed=212
+    )
+    target = qtn.MPO_rand(
+        3, bond_dim=2, phys_dim=2, dtype="complex128", seed=213
+    )
+    fit = py.FIT(target, p=guess, range_int=[0, 2])
+
+    fit.run_gate(
+        n_iter=2,
+        block_size=2,
+        sweep_sequence="RL",
+        max_bond=2,
+    )
+
+    assert isinstance(fit.p, qtn.MatrixProductOperator)
+    assert fit.p.upper_ind_id == guess.upper_ind_id
+    assert fit.p.lower_ind_id == guess.lower_ind_id
+    assert fit.p.to_dense().shape == (8, 8)
+    assert fit.p.max_bond() <= 2
+
+
 def test_mpo_prepare_gate_pair_uses_matrix_transpose_for_2q_quimb_gate():
     """For rank-2 two-site gates, use direct matrix transpose on ket only."""
     gate = qu.CNOT()
@@ -252,6 +276,46 @@ def test_mpo_optimizer_prepare_dmrg_state_expands_to_chi():
 
     opt._prepare_dmrg_state()
     assert opt.p.max_bond() >= 7
+
+
+@pytest.mark.parametrize("fit_block_size", (2, 3))
+def test_mpo_optimizer_dmrg_forwards_native_fit_controls(
+    monkeypatch,
+    fit_block_size,
+):
+    """MPO DMRG must pass block and SVD policy into the FIT kernel."""
+    calls = []
+    original_run_gate = py.FIT.run_gate
+
+    def recording_run_gate(self, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_run_gate(self, *args, **kwargs)
+
+    monkeypatch.setattr(py.FIT, "run_gate", recording_run_gate)
+
+    opt = py.MpoOptimizer(
+        qtn.MPO_identity(5, dtype="complex128"),
+        gates=[((qu.CNOT(), None), (0, 4))],
+        chi=2,
+        mode="dmrg",
+    )
+    out = opt.run(
+        n_iter=1,
+        progbar=False,
+        cutoff=2.0e-2,
+        cutoff_mode="rel",
+        fit_block_size=fit_block_size,
+        fit_sweep_sequence="L",
+        target_cutoff=0.0,
+    )
+
+    assert out.max_bond() <= 2
+    assert len(calls) == 1
+    assert calls[0]["block_size"] == fit_block_size
+    assert calls[0]["sweep_sequence"] == "L"
+    assert calls[0]["max_bond"] == 2
+    assert calls[0]["cutoff"] == pytest.approx(2.0e-2)
+    assert calls[0]["cutoff_mode"] == "rel"
 
 
 def test_mpo_optimizer_tracks_fidelity_proxy_for_two_site_fit():
@@ -517,6 +581,126 @@ def test_mpo_optimizer_replays_native_graded_mpo_without_dense_fallback(mode):
     ).run(progbar=False, cutoff=1e-10, fidelity_samples=0, n_iter=1)
 
     assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in out)
+
+
+def test_mpo_optimizer_native_dmrg_uses_fit_controls(monkeypatch):
+    """Native Symmray MPO DMRG must use block-aware FIT, not direct SVD."""
+    calls = []
+    original_run_gate = py.FIT.run_gate
+
+    def recording_run_gate(self, *args, **kwargs):
+        calls.append(dict(kwargs))
+        return original_run_gate(self, *args, **kwargs)
+
+    monkeypatch.setattr(py.FIT, "run_gate", recording_run_gate)
+
+    fermion = py.Fermion(spinful=True, symmetry="U1U1")
+    gates = fermion.strang_gate_stream(
+        [(0, 2)],
+        dt=0.01,
+        t=1.0,
+        U=2.0,
+        mu=0.1,
+    )
+    out = py.MpoOptimizer(
+        _native_u1u1_identity_mpo(),
+        gates=gates,
+        chi=8,
+        mode="dmrg",
+    ).run(
+        progbar=False,
+        cutoff=2.0e-2,
+        cutoff_mode="rel",
+        target_cutoff=0.0,
+        fit_block_size=3,
+        fit_sweep_sequence="L",
+        fidelity_samples=0,
+        n_iter=1,
+    )
+
+    assert calls
+    assert all(call["block_size"] == 3 for call in calls)
+    assert all(call["sweep_sequence"] == "L" for call in calls)
+    assert all(call["max_bond"] == 8 for call in calls)
+    assert all(call["cutoff"] == pytest.approx(2.0e-2) for call in calls)
+    assert all(call["cutoff_mode"] == "rel" for call in calls)
+    assert all(type(tensor.data).__name__ == "U1U1FermionicArray" for tensor in out)
+
+
+@pytest.mark.parametrize(
+    ("spinful", "symmetry", "params", "array_name"),
+    [
+        (False, "U1", {"V": 0.4, "mu": 0.1}, "U1FermionicArray"),
+        (False, "Z2", {"V": 0.4, "mu": 0.1}, "Z2FermionicArray"),
+        (True, "U1", {"U": 2.0, "mu": 0.1}, "U1FermionicArray"),
+        (True, "U1U1", {"U": 2.0, "mu": 0.1}, "U1U1FermionicArray"),
+        (True, "Z2", {"U": 2.0, "mu": 0.1}, "Z2FermionicArray"),
+    ],
+)
+def test_mpo_optimizer_native_fermion_symmetries_use_dmrg_fit(
+    spinful, symmetry, params, array_name,
+):
+    """Native fermion U1/U1U1/Z2 MPOs remain block-sparse under FIT."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(spinful=spinful, symmetry=symmetry)
+    edges = [(0, 1), (1, 2), (2, 3)]
+    hamiltonian = fermion.hamiltonian(edges, t=1.0, **params)
+    mpo = fermion.to_mpo(hamiltonian=hamiltonian, L=4, compress=False)
+    gates = fermion.gate_stream(edges, 0.002, t=1.0, **params)
+
+    out = py.MpoOptimizer(
+        mpo,
+        gates=gates,
+        chi=8,
+        mode="dmrg",
+    ).run(
+        progbar=False,
+        cutoff=1.0e-12,
+        fidelity_samples=0,
+        n_iter=1,
+        fit_block_size=3,
+    )
+
+    assert out.max_bond() <= 8
+    assert all(type(tensor.data).__name__ == array_name for tensor in out)
+
+
+@pytest.mark.parametrize("mode", ["svd", "mpo"])
+@pytest.mark.parametrize(
+    ("spinful", "symmetry", "params", "array_name"),
+    [
+        (False, "U1", {"V": 0.4, "mu": 0.1}, "U1FermionicArray"),
+        (False, "Z2", {"V": 0.4, "mu": 0.1}, "Z2FermionicArray"),
+        (True, "U1", {"U": 2.0, "mu": 0.1}, "U1FermionicArray"),
+        (True, "U1U1", {"U": 2.0, "mu": 0.1}, "U1U1FermionicArray"),
+        (True, "Z2", {"U": 2.0, "mu": 0.1}, "Z2FermionicArray"),
+    ],
+)
+def test_mpo_optimizer_native_fermion_symmetries_use_direct_modes(
+    mode, spinful, symmetry, params, array_name,
+):
+    """Native fermion MPOs survive direct SVD and MPO-mode replay."""
+    pytest.importorskip("symmray")
+    fermion = py.Fermion(spinful=spinful, symmetry=symmetry)
+    edges = [(0, 3)]
+    hamiltonian = fermion.hamiltonian(edges, t=1.0, **params)
+    mpo = fermion.to_mpo(hamiltonian=hamiltonian, L=4, compress=False)
+    gates = fermion.strang_gate_stream(edges, 0.002, t=1.0, **params)
+
+    out = py.MpoOptimizer(
+        mpo,
+        gates=gates,
+        chi=8,
+        mode=mode,
+    ).run(
+        progbar=False,
+        cutoff=2.0e-2,
+        cutoff_mode="rel",
+        fidelity_samples=0,
+    )
+
+    assert out.max_bond() <= 8
+    assert all(type(tensor.data).__name__ == array_name for tensor in out)
 
 
 def test_mpo_optimizer_materializes_native_long_range_split_gates():

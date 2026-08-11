@@ -5,13 +5,14 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Mapping
+from dataclasses import replace
 from numbers import Integral
 from typing import Any
 
 from ...boundary.metrics import peps_infidelity as boundary_infidelity
 from ...boundary.metrics import peps_normalize as boundary_normalize
+from ...backends import TorchLinalgConfig
 from ...operators.gates import _normalize_gate_entries, gate as apply_gate
-from ...tensors.core import reg_complex_svd_torch as _reg_complex_svd_torch
 from ..global_opt import GlobalOptimizer
 from ..sweep import SweepOptimizer
 from ..sweep.environments import (
@@ -254,9 +255,16 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
     global_fallback_kwargs : mapping, optional
         Global fallback controls used if an optional NLopt run raises an NLopt
         runtime error. Defaults to one LBFGS step.
+    torch_linalg_config : TorchLinalgConfig | None, optional
+        One policy for Torch SVD autodiff, QR autodiff, CUDA/CPU SVD drivers,
+        and Quimb's raw Symmray split paths. When omitted, global Torch
+        cleanup creates a stabilized policy and infers ``mode`` from the
+        state. Pass a policy explicitly when choosing native versus
+        regularized SVD or a specific exact backend.
     register_torch_svd : bool, default=True
-        Register PEPSY's torch complex-SVD rule before torch global
-        optimization.
+        Automatically register the Torch linalg policy before Torch global
+        optimization. The legacy name is retained for compatibility; prefer
+        ``torch_linalg_config=TorchLinalgConfig(...)`` for new code.
     accept_if_improved : bool, default=True
         Keep the pre-optimization warm start when measured cleanup does not
         improve the local infidelity.
@@ -298,6 +306,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         global_kwargs: Mapping[str, Any] | None = None,
         global_optimize_kwargs: Mapping[str, Any] | None = None,
         global_fallback_kwargs: Mapping[str, Any] | None = None,
+        torch_linalg_config: TorchLinalgConfig | None = None,
         register_torch_svd=True,
         accept_if_improved=True,
     ):
@@ -356,6 +365,14 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
             _DEFAULT_GLOBAL_FALLBACK_KWARGS,
             global_fallback_kwargs,
         )
+        if torch_linalg_config is not None and not isinstance(
+            torch_linalg_config,
+            TorchLinalgConfig,
+        ):
+            raise TypeError(
+                "torch_linalg_config must be a TorchLinalgConfig instance or None."
+            )
+        self.torch_linalg_config = torch_linalg_config
         self.register_torch_svd = bool(register_torch_svd)
         self.accept_if_improved = bool(accept_if_improved)
 
@@ -1005,17 +1022,63 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opt_kwargs.setdefault("optimizer", _DEFAULT_GLOBAL_OPTIMIZE_KWARGS["optimizer"])
         return opt_kwargs
 
-    def _maybe_register_torch_svd(self, opt_kwargs):
+    @staticmethod
+    def _torch_linalg_mode(*states):
+        """Infer the Torch linalg mode from the first available tensor block."""
+        found_dtype = False
+        for state in states:
+            if state is None:
+                continue
+            tensors = getattr(state, "tensor_map", None)
+            if isinstance(tensors, Mapping):
+                tensors = tensors.values()
+            elif tensors is None:
+                try:
+                    tensors = iter(state)
+                except TypeError:
+                    tensors = ()
+            for tensor in tensors:
+                data = getattr(tensor, "data", None)
+                blocks = getattr(data, "blocks", None)
+                samples = blocks.values() if blocks is not None else (data,)
+                for sample in samples:
+                    dtype = getattr(sample, "dtype", None)
+                    if dtype is None:
+                        continue
+                    found_dtype = True
+                    if "complex" in str(dtype).lower():
+                        return "complex"
+        return "real" if found_dtype else "complex"
+
+    def _maybe_configure_torch_linalg(self, state, target, opt_kwargs):
+        """Configure the canonical Torch linalg stack for global cleanup."""
         if not self.register_torch_svd:
             return
         backend = opt_kwargs.get("autodiff_backend", "torch")
         if not isinstance(backend, str) or backend.strip().lower() != "torch":
             return
+
+        symmray_blocks = uses_symmray_arrays(state, target)
+        config = self.torch_linalg_config
+        if config is None:
+            # Global PEPS cleanup differentiates through SVD/QR. The default
+            # therefore favors finite autodiff over the native-only policy,
+            # while keeping the dtype-dependent real/complex choice automatic.
+            config = TorchLinalgConfig(
+                mode=self._torch_linalg_mode(state, target),
+                stabilized=True,
+                quimb_split_drivers=symmray_blocks,
+            )
+        elif symmray_blocks and not config.quimb_split_drivers:
+            # Raw Symmray blocks bypass Autoray. Preserve the user's SVD/QR
+            # choices but enable the matching Quimb registrations so the
+            # configured policy actually covers the PEPS split path.
+            config = replace(config, quimb_split_drivers=True)
         try:
-            _reg_complex_svd_torch()
+            config.register()
         except ImportError as exc:
             warnings.warn(
-                f"Could not register torch complex SVD rule: {exc}",
+                f"Could not configure Torch linalg: {exc}",
                 RuntimeWarning,
                 stacklevel=3,
             )
@@ -1194,7 +1257,7 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
         opt_kwargs.setdefault("progbar", False)
         optimizer_name = opt_kwargs.get("optimizer", "adam")
         use_nlopt = _is_nlopt_optimizer(optimizer_name)
-        self._maybe_register_torch_svd(opt_kwargs)
+        self._maybe_configure_torch_linalg(state, target_opt, opt_kwargs)
         fallback_used = False
         fallback_error = None
         if use_nlopt:
@@ -1211,7 +1274,11 @@ class PepsOptimizer:  # pylint: disable=too-many-instance-attributes
                 )
                 fallback_kwargs = _merge_opts(self.global_fallback_kwargs)
                 fallback_kwargs.setdefault("progbar", False)
-                self._maybe_register_torch_svd(fallback_kwargs)
+                self._maybe_configure_torch_linalg(
+                    state,
+                    target_opt,
+                    fallback_kwargs,
+                )
                 out = optimizer.optimize(**fallback_kwargs)
                 fallback_used = True
         else:

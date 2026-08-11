@@ -27,6 +27,29 @@ Keep the chi controls separated by job:
 `boundary_options` is forwarded to the Quimb MPS boundary store when sweep
 cleanup uses that engine.
 
+Dense `boundary_engine="dmrg"` runs can opt into two-site cached boundary
+updates through `boundary_kwargs`:
+
+```python
+optimizer = PepsOptimizer(
+    state,
+    gates,
+    chi=peps_chi,
+    boundary_chi=boundary_chi,
+    boundary_kwargs={
+        "fit_mode": "two-site",
+        "fit_sweep_sequence": "RL",
+        "fit_rtol": 1e-8,
+        "fit_min_iter": 2,
+        "fit_patience": 2,
+        "cutoff": 1e-12,
+    },
+)
+```
+
+The boundary `chi` is used as the native two-site SVD cap unless
+`fit_max_bond` is supplied. `fit_mode="eff"` remains the compatibility default.
+
 ## Extraction map
 
 - `optimizer.py`: `PepsOptimizer` and the current orchestration logic.

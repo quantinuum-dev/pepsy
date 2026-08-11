@@ -56,6 +56,14 @@ class TreeEnergyOptimizer(PepsEnergyOptimizer):
         "real",
         "contraction_opt",
     })
+    _STOCHASTIC_OPTIMIZERS = frozenset({
+        "adam",
+        "adabelief",
+        "cadam",
+        "nadam",
+        "rmsprop",
+        "sgd",
+    })
 
     def __init__(
         self,
@@ -438,7 +446,13 @@ class TreeEnergyOptimizer(PepsEnergyOptimizer):
                     return self.state, tuple(self.losses)
                 return self.state
 
-        out = tnopt.optimize(n=n, **optimize_kwargs)
+        optimizer_name = str(optimizer).strip().lower()
+        # Recent Quimb releases treat ``n`` as a strict function-evaluation
+        # budget. A stochastic optimizer needs one evaluation for its initial
+        # gradient and another to install the first proposed parameter vector;
+        # with ``n=1`` the wrapper would otherwise return the unchanged state.
+        effective_n = 2 if n == 1 and optimizer_name in self._STOCHASTIC_OPTIMIZERS else n
+        out = tnopt.optimize(n=effective_n, **optimize_kwargs)
         self.losses = list(getattr(tnopt, "losses", ()))
         out = self._state_for_autodiff_backend(
             out,

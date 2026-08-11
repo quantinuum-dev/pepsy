@@ -28,6 +28,7 @@ _SYMBOL_MODULES = {
     # Boundary and backend helpers.
     "BdyMPS": ".boundary",
     "BoundaryContractResult": ".boundary",
+    "BoundaryFitDiagnostic": ".boundary",
     "CompBdy": ".boundary",
     "boundary_norm": ".boundary",
     "build_bra_ket": ".boundary",
@@ -48,12 +49,14 @@ _SYMBOL_MODULES = {
     "build_backend": ".backends",
     "get_default_array_backend": ".backends",
     "get_default_grad_backend": ".backends",
+    "get_torch_linalg_config": ".backends",
     "register_jax_linalg": ".backends",
     "register_torch_linalg": ".backends",
     "reset_linalg_registrations": ".backends",
     "reset_default_backends": ".backends",
     "set_default_array_backend": ".backends",
     "set_default_grad_backend": ".backends",
+    "TorchLinalgConfig": ".backends",
     "to_float": ".backends",
     "FIT": ".fitting",
     "internal_inds": ".fitting",
@@ -185,6 +188,7 @@ _SYMBOL_MODULES = {
     "MpsSampleResult": ".sampling",
     "MpsSampler": ".sampling",
     "PEPSSampleResult": ".sampling",
+    "PepsSampler": ".sampling",
     "PepsBpSampler": ".sampling",
     "VecSampler": ".sampling",
     "TreeBatchSampleResult": ".sampling",
@@ -293,6 +297,7 @@ if TYPE_CHECKING:
         backend_infer,
         get_default_array_backend,
         get_default_grad_backend,
+        get_torch_linalg_config,
         build_backend,
         register_jax_linalg,
         register_torch_linalg,
@@ -300,6 +305,7 @@ if TYPE_CHECKING:
         reset_default_backends,
         set_default_array_backend,
         set_default_grad_backend,
+        TorchLinalgConfig,
         to_float,
     )
     from .boundary import (  # noqa: F401
@@ -364,7 +370,7 @@ if TYPE_CHECKING:
         z,
     )
     from .optimizers import DeferredInjectionRecord, DeferredInjectionReport, DeferredProjectionRecord, GlobalOptimizer, ImmediateInjectionReport, ImmediateProjectionRecord, MeasurementRecord, MpoOptimizer, MpsEnergyOptimizer, MpsOptimizer, MpsStabOptimizer, NormEventRecord, PepsEnergyOptimizer, PepsOptimizer, STNState, StabilizerMpsSettingsAdvice, StabilizerMpsRunResult, StabilizerMpsSimulator, StabilizerTreeRunResult, StreamAnalysisRecord, SimpleUpdateGen, SymDMRG2, SweepOptimizer, TreeEnergyOptimizer, TreeLayoutFinder, TreeMPO, TreeOptimizer, TreePlan, TreeStabOptimizer, build_tree_operator, run_stabilizer_mps_stream, run_stabilizer_tree_stream  # noqa: F401
-    from .sampling import FermionConfigurationEncoding, MpsDiagonalEstimate, MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsBpSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler  # noqa: F401
+    from .sampling import FermionConfigurationEncoding, MpsDiagonalEstimate, MpsBatchSampleResult, MpsSampleResult, MpsSampler, PEPSSampleResult, PepsSampler, PepsBpSampler, TreeBatchSampleResult, TreeSampleResult, TreeSampler, VecSampler  # noqa: F401
     from .solvers import FDSolver  # noqa: F401
     from .tensors import (  # noqa: F401
         OneDMap,

@@ -248,6 +248,23 @@ ham_dmrg = spinful.hamiltonian(terms)
 H_mpo = ham_dmrg.to_mpo(L=L)
 ```
 
+For the all-pairs staggered eta structure factor, use the dedicated compact
+native builder instead of expanding one two-site term for every pair:
+
+```python
+eta_mpo = spinful.eta_pair_structure_factor_mpo(
+    L,
+    signs=tuple((-1) ** (site % 2) for site in range(L)),
+    normalization=1.0 / L,
+)
+```
+
+This represents ``(1 / L) * (F^dagger F - sum_i Delta_i^dagger Delta_i)``
+with ``F = sum_i signs[i] * Delta_i``. It has four finite-state MPO channels
+independent of the number of pairs and remains a native graded MPO for the
+MPS evaluator. ``compress=True`` is optional; it is not needed to obtain the
+compact bond dimension.
+
 For a term mapping, scalar site keys are normalized to ``(site,)``. The
 ``SymHamiltonian`` returned by ``fermion.hamiltonian(terms)`` retains the
 locations, symmetry, and fermionic ordering metadata needed by ``to_mpo``;
@@ -911,9 +928,20 @@ quimb's block-aware auto-swap split path for nonlocal 1D gate streams such as a
 row-major square lattice. ``mode="mpo"`` uses its usual sub-MPO compression for
 nearest-neighbor gates and falls back to the same Symmray auto-swap path for
 nonlocal gates, because the current quimb/Symmray sub-MPO path mixes in dense
-helper tensors. ``mode="exact"`` is useful as a small-system reference, and
-``mode="dmrg"`` works when the initial symmetric MPS was built with enough
-block-sparse bond capacity, for example ``bond_dim >= chi``.
+helper tensors. ``mode="exact"`` is useful as a small-system reference.
+``mode="fit"`` (the alias of ``mode="dmrg"``) defaults to
+``fit_block_size=2`` and can grow visited bonds without dense padding: the
+effective two-site tensor is split by Symmray's native block SVD, preserving
+U1/U1xU1 charges, dual legs, fermionic dummy modes, and graded phases.
+``fit_block_size=3`` is also available for a three-site effective tensor and
+performs two native block SVD splits with the same metadata preservation.
+`fit_target_strategy="auto"` deliberately selects the native routed-MPS target
+for these arrays; the lazy layered target optimization is currently limited to
+ordinary NumPy/Torch/CuPy tensors because graded gate-layer tagging needs a
+separate phase-contract validation. Explicit `fit_target_strategy="layered"`
+therefore fails early instead of densifying or guessing fermionic metadata.
+Fixed-rank ``fit_block_size=1`` requires the needed native bond capacity to
+exist already.
 
 ```python
 peps = py.SymPEPS.for_model("itf", 4, 4, bond_dim=2)

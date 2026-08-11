@@ -47,6 +47,7 @@ from ..backends.config import (
     build_backend,
     get_default_array_backend,
     get_default_grad_backend,
+    get_torch_linalg_config,
     register_jax_linalg,
     reg_native_svd_jax,
     reg_native_svd_torch,
@@ -65,6 +66,7 @@ from ..backends.config import (
     set_default_array_backend,
     set_default_grad_backend,
     stop_grad,
+    TorchLinalgConfig,
 )
 
 # A few long-standing tests and downstream integrations patch these names on
@@ -122,7 +124,8 @@ def contract_hypercompressed_tn(*args, **kwargs):
 
 __all__ = [
     "OneDMap", "build_backend", "backend_torch", "backend_numpy", "backend_cupy", "backend_jax",
-    "register_torch_linalg", "register_jax_linalg", "reg_native_svd_torch",
+    "register_torch_linalg", "register_jax_linalg", "TorchLinalgConfig",
+    "get_torch_linalg_config", "reg_native_svd_torch",
     "reg_native_svd_jax", "reg_rel_svd_torch", "reg_real_svd_torch",
     "reg_complex_svd_torch", "reg_real_qr_torch", "reg_complex_qr_torch",
     "reg_rel_svd_jax", "reg_real_svd_jax", "reg_complex_svd_jax",

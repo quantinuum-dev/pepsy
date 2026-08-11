@@ -33,6 +33,22 @@ bra indices are reindexed with an `_*` suffix.
 `CompBdy` updates those environments with `move_bdy(...)` or
 `move_step_bdy(...)`, then contracts a final boundary network in `run(...)`.
 
+The local boundary solver is selected with `fit_mode`:
+
+- `"eff"` is the compatibility default and performs cached one-site sweeps.
+- `"two-site"` forms neighboring boundary wavefunctions, splits them with a
+  backend-native SVD, and can discover bond subspaces up to `fit_max_bond`.
+- `"global"` uses the reference global FIT solve.
+
+Two-site sweeps do not rebuild a complete environment for every pair. One
+side is cached once per sweep and the moving side is updated incrementally, so
+environment construction remains linear in boundary length. PEPS helpers pass
+the requested `chi` as the default two-site bond cap; direct `CompBdy` users
+should set `fit_max_bond` when they want a lower-rank boundary to grow. New
+two-site boundaries start at bond 1 and grow through these local splits.
+Reusing a boundary at a larger `chi` does not globally pad it first; lowering
+`chi` still compresses existing bonds immediately.
+
 ## Public helpers
 
 - `contract_boundary(...)`: contracts a prebuilt double-layer network with a
@@ -40,12 +56,17 @@ bra indices are reindexed with an `_*` suffix.
   `BoundaryContractResult`.
 - `peps_normalize(...)` / `normalize(...)`: normalize a PEPS in place.
 - `boundary_norm(...)` / `peps_norm(...)`: compute `<p|p>` without rescaling.
+  Pass `return_info=True` for the structured result instead of only the scalar.
 - `peps_infidelity(...)` / `infidelity(...)`: compute boundary-based
   infidelity, optionally reusing norm and overlap boundaries.
+- `peps_fidelity(...)`: return only fidelity by default, or preserve all three
+  contraction results and their FIT diagnostics with `return_info=True`.
 - `contract_flat(...)`: contract an already-flat PEPS-like tensor network.
 
-Use `result.cost` and `result.fidel` from `BoundaryContractResult`; do not rely
-on tuple unpacking.
+Use `result.cost`, `result.fidel`, and `result.fit_diagnostics` from
+`BoundaryContractResult`; do not rely on tuple unpacking. Each typed boundary
+FIT diagnostic reports actual iterations and convergence, with detailed sweep
+timing populated only when `fit_timing=True`.
 
 ## Boundary methods
 

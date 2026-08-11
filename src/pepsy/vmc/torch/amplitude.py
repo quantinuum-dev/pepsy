@@ -10,6 +10,7 @@ from __future__ import annotations
 import warnings
 
 from ..torch_types import _check_positive_int, _require_torch
+from ..api import ContractionFallbackWarning
 from ...boundary.metrics import (
     _ctmrg_stabilization_kwargs,
     quimb_ctmrg_projector_compat,
@@ -309,6 +310,12 @@ class TorchPEPSAmplitude:
     known to be supported, or ``"serial"`` for native U1/U1U1 PEPS and other
     dynamic block-sparse contractions. A failed explicit ``"vmap"`` request
     still falls back safely rather than changing numerical semantics.
+
+    For a long native CTMRG run, ``contraction_opts`` may include
+    ``fallback_contraction="boundary_mps"``. The first CTMRG exception then
+    switches the model to boundary-MPS for the remainder of the run and
+    records the fallback cause; omit it (or use ``"none"``) for strict
+    failure behavior.
     """
 
     def __init__(
@@ -344,7 +351,27 @@ class TorchPEPSAmplitude:
             if cutoff is None and self.contraction == "exact"
             else 1.0e-10 if cutoff is None else float(cutoff)
         )
-        self.contraction_opts = _as_contraction_options(contraction_opts)
+        contraction_opts = _as_contraction_options(contraction_opts)
+        fallback_contraction = contraction_opts.pop(
+            "fallback_contraction", None
+        )
+        if fallback_contraction is not None:
+            fallback_key = str(fallback_contraction).replace("_", "-").lower()
+            if fallback_key in {"none", "off", "false"}:
+                fallback_contraction = None
+            else:
+                fallback_contraction = _validate_contraction(
+                    fallback_contraction,
+                    self.chi,
+                )
+                if fallback_contraction != "boundary":
+                    raise ValueError(
+                        "fallback_contraction currently supports only "
+                        "'boundary_mps'."
+                    )
+        self.contraction_fallback = fallback_contraction
+        self.requested_contraction = self.contraction
+        self.contraction_opts = contraction_opts
         if self.contraction == "boundary":
             self.contraction_opts.setdefault("mode", "mps")
 
@@ -358,6 +385,13 @@ class TorchPEPSAmplitude:
             raise ValueError(f"site_order contains site(s) not in PEPS: {missing!r}")
         self.site_inds = tuple(tn.site_ind(site) for site in self.sites)
         self.cutoff_fallbacks = 0
+        # Count outer CTMRG contractions, not the internal CTMRG iterations
+        # performed by Quimb. This is useful for estimating the cost of a
+        # stored-sample replay.
+        self.ctmrg_calls = 0
+        self.ctmrg_failures = 0
+        self.contraction_fallbacks = 0
+        self.contraction_fallback_error = None
         self.final_optimizer_fallbacks = 0
         self._warned_final_optimizer_fallback = False
         self.graded_torch = bool(graded_torch)
@@ -518,6 +552,42 @@ class TorchPEPSAmplitude:
             options[key] = canonize_opts
         return options
 
+    def _boundary_fallback_options(self):
+        """Adapt CTMRG options for a boundary-MPS retry."""
+        options = dict(self.contraction_opts)
+        # These options control CTMRG's projector and gauge construction and
+        # are not accepted by the boundary-MPS route. ``mode='mps'`` is
+        # deliberate: this fallback is intended to avoid the failing CTMRG
+        # projector path, not to re-enter it through a different alias.
+        for key in ("reduce_opts", "gauge_smudge", "canonize_opts", "mode"):
+            options.pop(key, None)
+        options["mode"] = "mps"
+        return options
+
+    def _activate_contraction_fallback(self, error):
+        """Switch a failed CTMRG model to its configured fallback route."""
+        if self.contraction != "ctmrg":
+            return False
+
+        self.ctmrg_failures += 1
+        if self.contraction_fallback is None:
+            return False
+
+        self.contraction = self.contraction_fallback
+        self.contraction_opts = self._boundary_fallback_options()
+        self.contraction_fallbacks += 1
+        self.contraction_fallback_error = (
+            f"{type(error).__name__}: {error}"
+        )[:1000]
+        warnings.warn(
+            "CTMRG contraction failed; switching this Torch PEPS amplitude "
+            "model to boundary-MPS for the remainder of the run. "
+            f"Cause: {self.contraction_fallback_error}",
+            ContractionFallbackWarning,
+            stacklevel=3,
+        )
+        return True
+
     def _contract_remaining(self, tn, *args, final_opts=None):
         """Close an approximate PEPS contraction with the requested path."""
         if final_opts is None:
@@ -593,53 +663,93 @@ class TorchPEPSAmplitude:
             self.cutoff_fallbacks += 1
             return finish(fn(*args, **retry_kwargs))
 
+    def _counted_ctmrg(self, tnx):
+        """Return a CTMRG closure that counts outer contractions."""
+        def contract(*args, **kwargs):
+            self.ctmrg_calls += 1
+            return tnx.contract_ctmrg(*args, **kwargs)
+
+        return contract
+
     def _contract_value(self, tnx, reference=None):
-        if self.contraction == "hotrg":
-            value = self._contract_approximate(
-                tnx.contract_hotrg,
-                max_bond=self.chi,
-                close_final=True,
-                **self.contraction_opts,
-            )
-        elif self.contraction == "ctmrg":
-            with quimb_ctmrg_projector_compat():
+        try:
+            if self.contraction == "hotrg":
                 value = self._contract_approximate(
-                    tnx.contract_ctmrg,
+                    tnx.contract_hotrg,
                     max_bond=self.chi,
                     close_final=True,
-                    **self._ctmrg_options(tnx),
+                    **self.contraction_opts,
                 )
-        elif self.contraction == "boundary":
+            elif self.contraction == "ctmrg":
+                with quimb_ctmrg_projector_compat():
+                    value = self._contract_approximate(
+                        self._counted_ctmrg(tnx),
+                        max_bond=self.chi,
+                        close_final=True,
+                        **self._ctmrg_options(tnx),
+                    )
+            elif self.contraction == "boundary":
+                value = self._contract_approximate(
+                    tnx.contract_boundary,
+                    max_bond=self.chi,
+                    close_final=True,
+                    **self.contraction_opts,
+                )
+            else:
+                value = tnx.contract(all)
+        except Exception as error:  # pragma: no cover - upstream varies
+            if not self._activate_contraction_fallback(error):
+                raise
             value = self._contract_approximate(
                 tnx.contract_boundary,
                 max_bond=self.chi,
                 close_final=True,
                 **self.contraction_opts,
             )
-        else:
-            value = tnx.contract(all)
         return _as_torch_scalar(value, reference)
 
     def _contract_log_parts(self, tnx, reference=None):
         torch = _require_torch()
-        if self.contraction == "hotrg":
-            mantissa, exponent_10 = self._contract_approximate(
-                tnx.contract_hotrg,
-                max_bond=self.chi,
-                strip_exponent=True,
-                close_final=True,
-                **self.contraction_opts,
-            )
-        elif self.contraction == "ctmrg":
-            with quimb_ctmrg_projector_compat():
+        try:
+            if self.contraction == "hotrg":
                 mantissa, exponent_10 = self._contract_approximate(
-                    tnx.contract_ctmrg,
+                    tnx.contract_hotrg,
                     max_bond=self.chi,
                     strip_exponent=True,
                     close_final=True,
-                    **self._ctmrg_options(tnx),
+                    **self.contraction_opts,
                 )
-        elif self.contraction == "boundary":
+            elif self.contraction == "ctmrg":
+                with quimb_ctmrg_projector_compat():
+                    mantissa, exponent_10 = self._contract_approximate(
+                        self._counted_ctmrg(tnx),
+                        max_bond=self.chi,
+                        strip_exponent=True,
+                        close_final=True,
+                        **self._ctmrg_options(tnx),
+                    )
+            elif self.contraction == "boundary":
+                mantissa, exponent_10 = self._contract_approximate(
+                    tnx.contract_boundary,
+                    max_bond=self.chi,
+                    strip_exponent=True,
+                    close_final=True,
+                    **self.contraction_opts,
+                )
+            else:
+                amp = tnx.contract(all)
+                amp = _as_torch_scalar(amp, reference)
+                abs_amp = amp.abs()
+                tiny = _torch_finfo_tiny(abs_amp.dtype)
+                phase = torch.where(
+                    abs_amp > 0,
+                    amp / abs_amp.to(dtype=amp.dtype),
+                    torch.zeros_like(amp),
+                )
+                return phase, torch.log(abs_amp.clamp_min(tiny))
+        except Exception as error:  # pragma: no cover - upstream varies
+            if not self._activate_contraction_fallback(error):
+                raise
             mantissa, exponent_10 = self._contract_approximate(
                 tnx.contract_boundary,
                 max_bond=self.chi,
@@ -647,17 +757,6 @@ class TorchPEPSAmplitude:
                 close_final=True,
                 **self.contraction_opts,
             )
-        else:
-            amp = tnx.contract(all)
-            amp = _as_torch_scalar(amp, reference)
-            abs_amp = amp.abs()
-            tiny = _torch_finfo_tiny(abs_amp.dtype)
-            phase = torch.where(
-                abs_amp > 0,
-                amp / abs_amp.to(dtype=amp.dtype),
-                torch.zeros_like(amp),
-            )
-            return phase, torch.log(abs_amp.clamp_min(tiny))
 
         mantissa = _as_torch_scalar(mantissa, reference)
         if isinstance(exponent_10, torch.Tensor):

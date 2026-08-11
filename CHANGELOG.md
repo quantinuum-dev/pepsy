@@ -14,6 +14,16 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Added
 
+- MPS FIT convergence controls now use mode-neutral `fit_min_iter`,
+  `fit_rtol`, and `fit_patience` names, with deprecated `mix_fit_*` aliases,
+  and `stabilize_unitary` now covers mixed MPO warm-up/fallback compression.
+- PEPS boundary contractions expose typed per-fit convergence diagnostics,
+  opt-in detailed timing, `return_info=True` on scalar norm helpers, and an
+  information-preserving `peps_fidelity(..., return_info=True)` path.
+- Dense PEPS DMRG boundaries now support cached two-site FIT sweeps with
+  native SVD rank growth, independent norm/overlap bond caps, configurable
+  sweep and truncation policy, and optional adaptive stopping across the
+  boundary metrics, `SweepOptimizer`, and `PepsOptimizer` APIs.
 - `SimulatorPlanner` and `recommend_simulator` provide non-executing,
   chi-aware rankings across MPS, tree, MPS-stabilizer, and tree-stabilizer
   circuit strategies using physical and dressed-frame support geometry.
@@ -23,6 +33,9 @@ Changes for the next release should be added here before the version is bumped.
 
 ### Fixed
 
+- Two-site PEPS boundary warm starts retain their requested future bond caps
+  instead of treating the current rank as the cap; target replacement,
+  per-call FIT overrides, and lowering `chi` now preserve explicit policy.
 - `TreeOptimizer` non-unitary scale control now preserves removed normalization
   in the TTN exponent, and fast centre-based norm reads include that exponent,
   so `normalize_every=True` no longer changes the represented state.

@@ -1,7 +1,9 @@
 """Boundary-MPS sweep utilities for approximate 2D tensor-network contraction."""
 
+from copy import deepcopy
 import re
 from dataclasses import dataclass
+import time
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -9,7 +11,33 @@ from tqdm.auto import tqdm
 from ..tensors.core import tn_fidelity
 from ..fitting.local import FIT
 
-__all__ = ["CompBdy"]
+__all__ = ["BoundaryFitDiagnostic", "CompBdy"]
+
+
+_FIT_MODE_ALIASES = {
+    "eff": "eff",
+    "one-site": "eff",
+    "two-site": "two-site",
+    "global": "global",
+}
+
+
+def _canonical_fit_mode_selector(fit_mode):
+    """Return the canonical boundary-FIT mode or fail with a useful error.
+
+    Underscores are accepted as spelling aliases so configuration-file values
+    such as ``"two_site"`` behave like the documented ``"two-site"`` form.
+    ``"one-site"`` is also accepted as a descriptive alias for the historical
+    ``"eff"`` mode; the canonical values stored on runtime objects remain
+    stable for downstream comparisons and serialization.
+    """
+    key = str(fit_mode).strip().lower().replace("_", "-")
+    if key not in _FIT_MODE_ALIASES:
+        raise ValueError(
+            f"Unknown fit_mode={fit_mode!r}. Expected 'eff', 'two-site', "
+            "or 'global'."
+        )
+    return _FIT_MODE_ALIASES[key]
 
 
 @dataclass(frozen=True)
@@ -22,6 +50,30 @@ class DirectionSpec:
     left_steps: int
     right_steps: int
     left_index: int
+
+
+@dataclass(frozen=True)
+class BoundaryFitDiagnostic:
+    """One boundary-MPS FIT attempt and its convergence/profile metadata.
+
+    ``sweep_timings`` is populated only when ``fit_timing=True``. Cheap
+    convergence fields are always retained, so callers can verify adaptive
+    stopping without enabling per-site timers or accelerator barriers.
+    """
+
+    boundary_key: str
+    fit_mode: str
+    status: str
+    iterations: int
+    converged: bool
+    convergence_reason: str
+    relative_change: float | None
+    center_site: int | None
+    direction: str | None
+    max_bond: int
+    elapsed_seconds: float | None = None
+    sweep_timings: tuple[dict[str, object], ...] = ()
+    error: str | None = None
 
 
 def max_tag_number(tags, tag_format):
@@ -59,10 +111,36 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         Contraction optimizer used by the local :class:`~pepsy.fitting.local.FIT`
         boundary fits. Kept separate from ``contraction_opt`` so the local
         fitting path can be tuned independently of the final contraction.
-    fit_mode : {"eff", "global"}, default="eff"
+    fit_mode : {"eff", "two-site", "global"}, default="eff"
         Local fit backend used by :class:`pepsy.fitting.local.FIT`:
         ``"eff"`` uses ``FIT.run_eff`` for multi-site boundaries;
+        ``"two-site"`` uses cached full-boundary two-site sweeps with a
+        native SVD after every pair update;
         ``"global"`` uses ``FIT.run``.
+    fit_max_bond : int | None, default=None
+        Two-site SVD bond cap. When omitted, the current boundary-MPS bond is
+        used as a safe cap. PEPS metric helpers pass their requested ``chi``
+        explicitly so a lower-rank warm start can grow up to that target.
+    fit_sweep_sequence : str, default="RL"
+        Repeating two-site sweep directions. Alternating directions normally
+        converges more evenly than repeatedly sweeping from one side.
+    fit_cutoff : float, default=1e-12
+        Two-site SVD truncation cutoff.
+    fit_cutoff_mode : str, default="rsum2"
+        Quimb cutoff convention used by the native two-site split.
+    fit_min_iter : int | None, default=None
+        Minimum two-site sweeps before adaptive convergence can stop.
+    fit_rtol : float | None, default=None
+        Relative final-center-norm tolerance. ``None`` preserves fixed-sweep
+        behavior.
+    fit_patience : int, default=1
+        Consecutive converged sweeps required when ``fit_rtol`` is enabled.
+    fit_timing : bool, default=False
+        Record coarse elapsed time for every boundary fit and detailed
+        two-site sweep/site timings in :class:`BoundaryFitDiagnostic`.
+    fit_timing_sync_device : bool, default=False
+        Synchronize supported accelerators at FIT timing boundaries. This is
+        intended for profiling and deliberately adds device barriers.
 
     Notes
     -----
@@ -82,6 +160,15 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         contraction_opt="auto-hq",
         fit_contraction_opt="auto-hq",
         fit_mode="eff",
+        fit_max_bond=None,
+        fit_sweep_sequence="RL",
+        fit_cutoff=1.0e-12,
+        fit_cutoff_mode="rsum2",
+        fit_min_iter=None,
+        fit_rtol=None,
+        fit_patience=1,
+        fit_timing=False,
+        fit_timing_sync_device=False,
     ):  # pylint: disable=too-many-arguments,too-many-positional-arguments
         if not isinstance(mps_boundaries, dict):
             raise TypeError("mps_boundaries must be a dictionary of boundary states.")
@@ -90,7 +177,20 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.mps_boundaries = mps_boundaries
         self.contraction_opt = contraction_opt
         self.fit_contraction_opt = fit_contraction_opt
-        self.fit_mode = fit_mode
+        # Validate at construction time rather than after an expensive PEPS
+        # boundary has already reached its first local fit.
+        self.fit_mode = _canonical_fit_mode_selector(fit_mode)
+        self.fit_max_bond = fit_max_bond
+        self.fit_sweep_sequence = fit_sweep_sequence
+        self.fit_cutoff = fit_cutoff
+        self.fit_cutoff_mode = fit_cutoff_mode
+        self.fit_min_iter = fit_min_iter
+        self.fit_rtol = fit_rtol
+        self.fit_patience = fit_patience
+        self.fit_timing = bool(fit_timing)
+        self.fit_timing_sync_device = bool(
+            self.fit_timing and fit_timing_sync_device
+        )
 
         # Runtime sweep options are configured per call in run/move methods.
         self.equalize_norms = False
@@ -101,6 +201,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         self.visualize = False
         self.track_boundary_fidelity = False
         self.fidel = []
+        self.fit_diagnostics = []
         self.progress = False
         self.max_separation = 0
         self.direction = "y"
@@ -124,6 +225,10 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
     def _reset_fidelity_history(self):
         """Reset stored fidelity values for a fresh public call."""
         self.fidel = []
+
+    def _reset_fit_diagnostics(self):
+        """Reset run-local convergence and timing diagnostics."""
+        self.fit_diagnostics = []
 
     @staticmethod
     def _direction_base(direction):
@@ -262,10 +367,108 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         if self.fit_mode == "eff":
             fit.run_eff(n_iter=self.n_iter, verbose=verbose)
             return
+        if self.fit_mode == "two-site":
+            # The complete boundary is the active DMRG interval. ``run_gate``
+            # builds one fixed environment per sweep and updates the opposite
+            # environment incrementally, so pair updates remain O(L) rather
+            # than rebuilding an O(L) contraction at every bond.
+            fit.range_int = (0, int(boundary_mps.L) - 1)
+            max_bond = self.fit_max_bond
+            if max_bond is None:
+                # An uncapped two-site split can grow exponentially. Direct
+                # CompBdy callers therefore inherit the current boundary cap;
+                # PEPS metric APIs pass the requested chi explicitly.
+                max_bond = int(boundary_mps.max_bond())
+            run_kwargs = dict(
+                n_iter=self.n_iter,
+                verbose=verbose,
+                block_size=2,
+                sweep_sequence=self.fit_sweep_sequence,
+                max_bond=max_bond,
+                cutoff=self.fit_cutoff,
+                cutoff_mode=self.fit_cutoff_mode,
+                min_iter=self.fit_min_iter,
+                rtol=self.fit_rtol,
+                patience=self.fit_patience,
+                collect_split_diagnostics=False,
+            )
+            if getattr(self, "fit_timing", False):
+                run_kwargs["timing"] = True
+                run_kwargs["timing_sync_device"] = bool(
+                    getattr(self, "fit_timing_sync_device", False)
+                )
+            fit.run_gate(**run_kwargs)
+            return
         if self.fit_mode == "global":
             fit.run(n_iter=self.n_iter, verbose=verbose)
             return
-        raise ValueError(f"Unsupported fit_mode mode: {self.fit_mode}")
+        # Constructor canonicalization makes this defensive rather than a
+        # normal user-input path.
+        raise RuntimeError(f"Unhandled canonical fit_mode: {self.fit_mode}")
+
+    def _record_fit_diagnostic(
+        self,
+        fit,
+        boundary_mps,
+        boundary_key,
+        *,
+        status,
+        elapsed_seconds,
+        error=None,
+    ):
+        """Append one typed, copy-safe boundary FIT diagnostic."""
+        gate_solver_ran = self.fit_mode == "two-site" and boundary_mps.L > 1
+        if status == "failed":
+            # Failure reporting must not assume run_gate reached its normal
+            # epilogue. FIT initializes these fields, but getattr keeps this
+            # path safe for compatible solver doubles and future backends.
+            iterations = int(getattr(fit, "iterations_run", 0) or 0)
+            converged = False
+            reason = "failed"
+            relative_change = getattr(fit, "last_relative_change", None)
+            center_site = getattr(fit, "final_center_site", None)
+            direction = getattr(fit, "final_direction", None)
+        elif gate_solver_ran:
+            iterations = int(fit.iterations_run)
+            converged = bool(fit.converged)
+            reason = str(fit.convergence_reason)
+            relative_change = fit.last_relative_change
+            center_site = fit.final_center_site
+            direction = fit.final_direction
+        elif status == "complete":
+            # ``run`` and ``run_eff`` are fixed-sweep compatibility solvers and
+            # predate FIT's adaptive diagnostic fields. Report what actually
+            # ran instead of exposing their constructor's ``not_run`` state.
+            iterations = int(self.n_iter)
+            converged = False
+            reason = "fixed_sweeps"
+            relative_change = None
+            center_site = None
+            direction = None
+        if relative_change is not None:
+            relative_change = float(relative_change)
+        sweep_timings = (
+            tuple(deepcopy(fit.get_timing())) if self.fit_timing else ()
+        )
+        self.fit_diagnostics.append(
+            BoundaryFitDiagnostic(
+                boundary_key=str(boundary_key),
+                fit_mode=str(self.fit_mode),
+                status=str(status),
+                iterations=iterations,
+                converged=converged,
+                convergence_reason=reason,
+                relative_change=relative_change,
+                center_site=(
+                    None if center_site is None else int(center_site)
+                ),
+                direction=None if direction is None else str(direction),
+                max_bond=int(fit.p.max_bond()),
+                elapsed_seconds=elapsed_seconds,
+                sweep_timings=sweep_timings,
+                error=error,
+            )
+        )
 
     def _maybe_visualize_fit(
         self,
@@ -328,7 +531,44 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
             retag=self.retag,
         )
         self._maybe_visualize_fit(tn, boundary_mps, fit, site_tag_id, axis_len)
-        self._run_fit_solver(fit, boundary_mps)
+        if self.fit_timing_sync_device:
+            FIT.synchronize_backend(fit.p)
+        started = time.perf_counter() if self.fit_timing else None
+        try:
+            self._run_fit_solver(fit, boundary_mps)
+        except Exception as exc:
+            if self.fit_timing_sync_device:
+                FIT.synchronize_backend(fit.p)
+            elapsed = (
+                None if started is None else float(time.perf_counter() - started)
+            )
+            try:
+                self._record_fit_diagnostic(
+                    fit,
+                    boundary_mps,
+                    boundary_key,
+                    status="failed",
+                    elapsed_seconds=elapsed,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                # Diagnostics are secondary: never replace the solver error
+                # with a profiling or metadata-extraction failure.
+                pass
+            raise
+        else:
+            if self.fit_timing_sync_device:
+                FIT.synchronize_backend(fit.p)
+            elapsed = (
+                None if started is None else float(time.perf_counter() - started)
+            )
+            self._record_fit_diagnostic(
+                fit,
+                boundary_mps,
+                boundary_key,
+                status="complete",
+                elapsed_seconds=elapsed,
+            )
 
         if self.equalize_norms:
             fit.p.equalize_norms_(value=self.equalize_norms)
@@ -506,6 +746,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         """
         # Fidelity history is run-local and resets for each run() call.
         self._reset_fidelity_history()
+        self._reset_fit_diagnostics()
         self.max_separation = max_separation
         self._update_separation()
         self._apply_runtime_overrides(
@@ -575,6 +816,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         performed. This method is useful for environment preconditioning.
         """
         self._reset_fidelity_history()
+        self._reset_fit_diagnostics()
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
             retag=retag,
@@ -642,6 +884,7 @@ class CompBdy:  # pylint: disable=too-many-instance-attributes
         ``*_left``, ``*_right``, or both.
         """
         self._reset_fidelity_history()
+        self._reset_fit_diagnostics()
         self._apply_runtime_overrides(
             mps_boundaries=mps_boundaries,
             retag=retag,

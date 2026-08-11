@@ -32,6 +32,10 @@ skills:
     path: .github/skills/mps-optimizer
     role: core
     upload: [SKILL.md]
+  - name: tensor-fitting
+    path: .github/skills/tensor-fitting
+    role: core
+    upload: [SKILL.md, references/**]
   - name: tree-optimizer
     path: .github/skills/tree-optimizer
     role: core
@@ -52,6 +56,10 @@ skills:
     path: .github/skills/belief-propagation
     role: domain
     upload: [SKILL.md]
+  - name: peps-sampler
+    path: .github/skills/peps-sampler
+    role: domain
+    upload: [SKILL.md, references/**]
   - name: pepsy-vmc
     path: .github/skills/pepsy-vmc
     role: domain

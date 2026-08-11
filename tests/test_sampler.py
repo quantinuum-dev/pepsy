@@ -165,6 +165,25 @@ def test_mps_sampler_native_numpy_samples_product_state():
     assert result.probs == [1.0] * 4
 
 
+def test_mps_sampler_auto_warns_before_quimb_fallback(monkeypatch):
+    """Auto backend selection should expose native preparation fallbacks."""
+    psi = qtn.MPS_computational_state("0")
+
+    def fail_native_prepare(self, source):  # pylint: disable=unused-argument
+        raise ValueError("native layout unavailable")
+
+    monkeypatch.setattr(
+        sampler_mod.MpsSampler,
+        "_prepare_native_arrays",
+        fail_native_prepare,
+    )
+
+    with pytest.warns(RuntimeWarning, match="falling back to Quimb"):
+        sampler = sampler_mod.MpsSampler(psi, backend="auto")
+
+    assert sampler.resolved_backend == "quimb"
+
+
 def test_mps_sampler_defaults_to_trivial_1d_site_map():
     """Omitting one_d_to_two_d should infer a trivial single-row 1D layout."""
     psi = qtn.MPS_computational_state("101")
@@ -254,6 +273,73 @@ def test_mps_sampler_native_site_ops_are_reused(monkeypatch):
     sampler.amplitudes(np.array([[1, 0, 1], [1, 0, 1]]))
 
     assert calls == ["numpy"]
+
+
+@pytest.mark.parametrize("backend", ["numpy", "torch"])
+def test_mps_sampler_single_site_flip_ratios_match_amplitudes(backend):
+    """All binary single-site ratios should match explicit amplitudes."""
+    if backend == "torch":
+        torch = pytest.importorskip("torch")
+    else:
+        torch = None
+
+    psi = qtn.MPS_rand_state(5, bond_dim=3, phys_dim=2, dtype="complex128", seed=8)
+    if torch is not None:
+        psi.apply_to_arrays(
+            pepsy.backend_torch(dtype=torch.complex128, device="cpu")
+        )
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+    configs = np.asarray(
+        [[0, 0, 0, 0, 0], [0, 1, 1, 0, 1], [1, 0, 1, 1, 0]],
+        dtype=np.int64,
+    )
+
+    fast = sampler.single_site_flip_amplitude_ratios(
+        configs,
+        to_numpy=True,
+        block_size=2,
+    )
+    flipped = np.repeat(configs[:, None, :], configs.shape[1], axis=1)
+    flipped ^= np.eye(configs.shape[1], dtype=np.int64)[None, :, :]
+    all_configs = np.concatenate(
+        (configs, flipped.reshape(-1, configs.shape[1])),
+        axis=0,
+    )
+    amplitudes = np.asarray(sampler.amplitudes(all_configs, to_numpy=True))
+    expected = (
+        amplitudes[configs.shape[0] :]
+        .reshape(configs.shape[0], configs.shape[1])
+        / amplitudes[: configs.shape[0], None]
+    )
+
+    np.testing.assert_allclose(fast, expected, rtol=1e-11, atol=1e-11)
+
+
+def test_mps_sampler_single_site_flip_ratios_keep_torch_device():
+    """Torch flip-ratio workspaces must stay on the MPS device."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    psi = qtn.MPS_rand_state(4, bond_dim=2, phys_dim=2, dtype="complex128", seed=9)
+    psi.apply_to_arrays(
+        pepsy.backend_torch(dtype=torch.complex128, device="cuda")
+    )
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+    configs = torch.tensor(
+        [[0, 0, 0, 0], [0, 1, 1, 0]],
+        dtype=torch.long,
+        device="cuda",
+    )
+
+    ratios = sampler.single_site_flip_amplitude_ratios(
+        configs,
+        to_numpy=False,
+        block_size=2,
+    )
+
+    assert ratios.device.type == "cuda"
+    assert torch.isfinite(ratios).all().item()
 
 
 def test_mps_sampler_refresh_rebuilds_cached_native_state():
@@ -619,6 +705,32 @@ def test_mps_sampler_native_torch_evaluates_batched_configs_on_torch():
     assert isinstance(amplitudes, torch.Tensor)
     torch.testing.assert_close(probabilities, expected_probs)
     torch.testing.assert_close(amplitudes, torch.sqrt(expected_probs))
+
+
+def test_mps_sampler_torch_amplitudes_default_to_inference_mode():
+    """Amplitude measurements do not retain graphs unless explicitly asked."""
+    torch = pytest.importorskip("torch")
+    psi = qtn.MPS_product_state([
+        np.sqrt(np.array([0.8, 0.2])),
+        np.sqrt(np.array([0.3, 0.7])),
+    ])
+    psi.apply_to_arrays(
+        lambda array: torch.tensor(
+            array,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+    )
+    sampler = sampler_mod.MpsSampler(psi, backend="native")
+    configs = torch.tensor([[0, 0], [1, 1]], dtype=torch.long)
+
+    inference = sampler.amplitudes(configs, to_numpy=False)
+    tracked = sampler.amplitudes(configs, to_numpy=False, track_grad=True)
+
+    assert not inference.requires_grad
+    assert tracked.requires_grad
+    tracked.real.sum().backward()
+    assert any(psi[site].data.grad is not None for site in range(psi.L))
 
 
 def test_mps_sampler_native_torch_matches_numpy_random_mps():

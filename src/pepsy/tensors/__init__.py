@@ -102,6 +102,7 @@ _register(
     "build_backend",
     "get_default_array_backend",
     "get_default_grad_backend",
+    "get_torch_linalg_config",
     "register_jax_linalg",
     "register_torch_linalg",
     "reset_linalg_registrations",
@@ -120,6 +121,7 @@ _register(
     "reg_rel_svd_torch",
     "reg_stop_gradient_torch",
     "stop_grad",
+    "TorchLinalgConfig",
 )
 
 _SUBMODULES = (

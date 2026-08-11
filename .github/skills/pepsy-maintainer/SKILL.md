@@ -26,11 +26,13 @@ router, not a replacement for the domain skills below.
 ## Domain routing
 
 - MPS replay, layouts, or canonicalization → [`mps-optimizer`](../mps-optimizer/SKILL.md)
+- FIT sweeps, variational compression, active rank growth, or FIT profiling → [`tensor-fitting`](../tensor-fitting/SKILL.md)
 - Tree replay, TTN layout, trajectories, or measurement → [`tree-optimizer`](../tree-optimizer/SKILL.md)
 - Stabilizer tensor networks → [`stabilizer-tensor-networks`](../stabilizer-tensor-networks/SKILL.md)
 - Tree stabilizer simulation → [`tree-stabilizer-optimizer`](../tree-stabilizer-optimizer/SKILL.md)
 - Symmetry-conserving DMRG2 → [`symdmrg2`](../symdmrg2/SKILL.md)
 - Belief propagation or loop/PNE methods → [`belief-propagation`](../belief-propagation/SKILL.md)
+- Direct PEPS sampling, conditioned boundary MPS, or PEPS proposal batching → [`peps-sampler`](../peps-sampler/SKILL.md)
 - Torch/NetKet/JAX variational Monte Carlo → [`pepsy-vmc`](../pepsy-vmc/SKILL.md)
 - Fermion operators, Symmray charges, or fermionic gates → [`pepsy-fermion-operators`](../pepsy-fermion-operators/SKILL.md)
 - qMERA energy optimization → [`qmera-energy-optimizer`](../qmera-energy-optimizer/SKILL.md)

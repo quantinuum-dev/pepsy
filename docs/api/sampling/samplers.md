@@ -1,5 +1,64 @@
 # `pepsy.sampling.samplers`
 
+## Direct PEPS sampler
+
+`PepsSampler` has an exact reference mode and a compressed boundary-MPS mode.
+The exact mode is:
+
+```python
+sampler = pepsy.PepsSampler(peps)
+result = sampler.sample(samples=16, seed=0)
+```
+
+The boundary-MPS mode separates the conditioned ket boundary from the future
+double-layer environment:
+
+```python
+sampler = pepsy.PepsSampler(
+    peps,
+    sample_chi=32,
+    marginal_chi=64,             # None or 0 disables the future environment
+    boundary_engine="dmrg",      # or "quimb-mps"
+    ket_compression="quimb",    # or "fit", or None
+    cutoff=1.0e-12,
+)
+```
+
+`sample_chi` caps the conditioned single-layer ket boundary. `marginal_chi`
+caps the optional future double-layer environment. The `dmrg` engine prepares
+future boundaries with Pepsy `BdyMPS`/`CompBdy`; `quimb-mps` uses Quimb's MPS
+environment cache. Ket compression is performed separately with Quimb MPS
+compression or Pepsy `FIT`.
+
+`result.configs` contains row-major physical-index configurations, while
+`result.omegas` and `result.ps` contain proposal probabilities and projected
+PEPS amplitudes in mantissa/exponent form. For multiple shots,
+`sample_batch(...)` shares a local Quimb conditional network until shot
+prefixes diverge:
+
+```python
+batch = sampler.sample_batch(samples=256, seed=0)
+print(sampler.batch_stats)
+print(sampler.rho_diagnostics)
+```
+
+This uses prefix groups rather than adding a shared batch index to PEPS
+tensors, because a repeated Quimb index would be contracted as an ordinary
+bond. The batch still contracts final amplitudes from the original PEPS for
+importance weights.
+
+For compact boundary centers, each row also uses a Quimb transfer cache: its
+right suffixes are contracted once, while the conditioned left prefix is
+updated immediately after each sampled site. `sampler.row_cache_stats` exposes
+the number of cached row suffixes and prefix updates. Larger centers with a
+collapsed future MPS, or highly fragmented large batches, adaptively retain
+the reference local-center contractions because dense column transfers would
+be slower and use more memory.
+
+For the 4x4 D=4 observable comparison used during development, run
+`examples/peps_sampler_d4_observables.py`; it reports exact density-matrix
+values, raw proposal estimates, and importance-weighted estimates.
+
 ## MPS sampler quick API
 
 `MpsSampler.sample_batch(...)` is the preferred batched interface for new code:
@@ -151,6 +210,21 @@ probs = sampler.probabilities(configs, to_numpy=False)
 ```
 
 Both methods evaluate the whole batch in one backend-native sweep.
+
+For binary dense-native MPSs, local-energy estimators can evaluate all
+single-site-flip ratios without constructing a separate full MPS amplitude
+sweep for every flip:
+
+```python
+ratios = sampler.single_site_flip_amplitude_ratios(
+    configs,
+    to_numpy=False,
+)  # shape: (n_configs, n_sites)
+```
+
+The method uses bounded prefix/suffix workspaces and supports native NumPy,
+Torch, and CuPy samplers. Symmray and legacy Quimb samplers should retain the
+explicit connected-configuration path through `amplitudes(...)`.
 
 ### Fermionic diagonal observables
 
