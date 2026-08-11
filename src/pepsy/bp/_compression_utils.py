@@ -36,6 +36,9 @@ def validate_input_mode(input_mode: str, gauges) -> str:
     if input_mode not in {"auto", "physical", "su_core"}:
         raise ValueError("input_mode must be 'auto', 'physical', or 'su_core'")
     if input_mode == "auto":
+        # A non-empty gauge mapping is the only unambiguous signal that the
+        # caller supplied an SU core. With no gauges, the network is already
+        # physical and a fresh BP solve is the safe default.
         return "su_core" if gauges else "physical"
     if input_mode == "su_core" and not gauges:
         raise ValueError(
@@ -82,6 +85,9 @@ def resolve_d2bp_boundaries(
     bp_opts: dict[str, Any] | None,
 ):
     """Use explicit closures, SU closures, or run a fresh D2BP solve."""
+    # Preserve the caller's strongest information first: directed messages
+    # describe the actual working network and can contain non-diagonal
+    # correlations that diagonal SU vectors cannot represent.
     if boundary_messages is not None:
         return boundary_messages, {
             "source": "boundary_messages",
@@ -104,6 +110,9 @@ def resolve_d2bp_boundaries(
             "max_mdiff": None,
         }
 
+    # With no explicit closure, the public API chooses plain D2BP by default.
+    # Relay BP is opt-in because it has different convergence dynamics and
+    # should not silently change a reproducible default calculation.
     options = {} if bp_opts is None else dict(bp_opts)
     if bp_runner == "plain":
         from .relay import two_norm_bp
@@ -156,6 +165,9 @@ def cost_check_requested(
     """Return whether a contraction tree should be built before measuring."""
     if not isinstance(cost_check, bool):
         raise TypeError("cost_check must be a bool")
+    # A limit necessarily requires a preflight even when the caller omitted
+    # the convenience flag; otherwise an over-budget contraction could start
+    # before Pepsy has a chance to reject it.
     return bool(
         cost_check
         or max_flops_log10 is not None

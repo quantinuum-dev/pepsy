@@ -848,6 +848,10 @@ def compress_bond_cluster(
         max_peak_memory_log2,
     )
 
+    # Resolve representation before any BP or cluster work. In particular,
+    # ``input_mode="physical"`` prevents the common double-gauge error when a
+    # caller supplies boundary vectors for a network that already contains
+    # those factors.
     work, gauge_inputs, _ = prepare_working_network(
         tn,
         gauges,
@@ -899,6 +903,9 @@ def compress_bond_cluster(
             max_bond=rank,
         )
 
+    # Closure precedence is explicit D2BP messages, then SU diagonal vectors,
+    # then a fresh plain D2BP solve. This keeps boundary choice auditable in
+    # ``bp_info`` and avoids silently mixing incompatible representations.
     resolved_messages, bp_info = resolve_d2bp_boundaries(
         work,
         boundary_messages,

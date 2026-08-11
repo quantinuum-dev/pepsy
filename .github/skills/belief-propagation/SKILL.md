@@ -134,6 +134,66 @@ over `quimb.tensor.belief_propagation`; the annotated paper trail lives in
   `.max_mdiff`, `.contract()`, `.messages`, `.snapshot()`), `LoopClusterResult`
   (`.estimate`, `.bp_converged`, `.bp_iterations`, `.expand()`, `.messages`).
 
+## Local bond compression and reduced updates
+
+Use the selected-bond APIs when the input is a PEPS/PEPO with bond dimension
+`D` and only one virtual bond should be reduced to `D'`:
+
+- `compress_bond_cluster(tn, where=..., max_bond=D_prime, ...)` contracts a
+  finite cluster and fits rectangular endpoint maps `L: D -> D'` and
+  `R: D' -> D`. It is the direct no-gate path and keeps PEPO lower/upper
+  physical legs separate.
+- `prepare_reduced_bond_pair(...)` performs the QR/LQ reduction used by the
+  gate and reduced-update paths. Build one pair and reuse it for several
+  problem builders rather than repeating the environment preparation.
+- `exact_reduced_update_problem`, `su_cluster_reduced_update_problem`, and
+  `loop_cluster_reduced_update_problem` build, respectively, the system
+  environment, a finite SU/D2BP-closed cluster, or the additive open-leg loop
+  correction. `solve_reduced_als` then fits the reduced two-site tensor.
+- `compress_reduced_loop_cluster(...)` applies the identity-gate compression
+  path; `apply_reduced_loop_cluster_gate(...)` applies a two-site gate and
+  returns the updated physical network plus a fresh SU representation when
+  requested. `gate_loop_cluster(...)` is the gate-stream bridge.
+
+### Choosing the options
+
+Apply these rules in order. They prevent the most common mistake: inserting
+SU vectors into a network that already contains them, or using D2BP matrices
+as if they were diagonal SU vectors.
+
+| situation | option | reason |
+| --- | --- | --- |
+| `tn` already contains the gauge factors | `input_mode="physical"` | use supplied gauges only as diagonal boundary closures; never insert them again |
+| `tn` is an SU/simple-update core and `gauges` is supplied | `input_mode="su_core"` (the `"auto"` default when gauges are non-empty) | insert the vectors into a private working copy before building the environment |
+| no gauges or messages are available | `run_bp=True` (default) | run fresh `two_norm_bp`; use `bp_runner="relay"` only when the plain fixed-point iteration is difficult |
+| a system-covering cluster is intentionally used, or unresolved boundaries should fail | `run_bp=False` | do not silently invent a closure; explicit messages still take precedence |
+| directed D2BP matrices are available | pass `boundary_messages` | they take precedence over gauges and preserve non-diagonal boundary correlations |
+| supplied messages are numerical/noisy | `message_psd_project=True` (default) | Hermitianize and PSD-project each boundary matrix; disable only for raw diagnostics |
+| finite local approximation | `max_distance` / `base_radius` | choose the tensor-graph region around the active bond |
+| loop correction on that region | `max_loop_size > 0` | add open-leg loop-cluster regions; it is not the same cutoff as loop-series edge degree |
+| contraction may be large | `cost_check=True`, or provide either cost limit | build Cotengra trees before value contraction and report FLOPs and peak memory |
+| production budget violation | `on_budget="raise"` | stop before contraction; `"warn"` warns and also raises, while `"ignore"` proceeds |
+
+For ALS, keep `solver="auto"` for the normal path: it uses Quimb's public
+native `tensor_network_fit_als` route and only falls back to the weighted QR
+path when needed. Choose `solver="autodiff"` when gradients are required;
+Torch and JAX use their native autodiff optimizers, while other supported
+backends use Quimb's public autodiff fitter. Choose `solver="qr"` for an
+explicit PSD weighted least-squares solve, or `solver="normal"` only when a
+materially indefinite diagnostic metric requires the normal-equation fallback.
+A positive `regularization` selects the QR path automatically because native
+Quimb ALS does not apply Pepsy's relative Tikhonov term.
+
+The tensor-shaped path stays in the input Quimb/Autoray backend (NumPy,
+Torch, JAX, or CuPy when the requested Quimb operation supports it); only
+scalar diagnostics are converted to Python values. Native block-sparse
+Symmray tensors are rejected by this dense reduced-compression path until a
+graded adapter is available. The shared policy implementation is in
+[`bp/_compression_utils.py`](../../../src/pepsy/bp/_compression_utils.py) and
+the backend helpers are in
+[`bp/_backend.py`](../../../src/pepsy/bp/_backend.py). Regression coverage is
+in `tests/test_bp_compression.py` and `tests/test_bp_reduced_update.py`.
+
 ## Keep the correction APIs distinct
 
 Use `loop_expand` only as a selector; do not translate one cutoff into

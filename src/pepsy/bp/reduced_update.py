@@ -1366,6 +1366,9 @@ def exact_reduced_update_problem(
         max_peak_memory_log2=max_peak_memory_log2,
         on_budget=on_budget,
     )
+    # Project the smaller open environment before tensoring in physical
+    # identity factors. This preserves the native backend and avoids creating
+    # the much larger D^2 D^2 dense metric just to repair Hermiticity/PSD.
     environment, raw_min, clipped = _project_open_environment_if_requested(
         pair,
         environment,
@@ -2538,6 +2541,10 @@ def solve_reduced_als(
         raise ValueError("max_bond must be a positive integer")
     max_bond = min(max_bond, left_dim * physical_left, physical_right * right_dim)
 
+    # Native Quimb ALS is the stable default because it contracts the open
+    # environment directly. Regularization, explicit autodiff, and indefinite
+    # diagnostic metrics are the deliberate reasons to select the alternatives
+    # below; do not choose them merely because a dense metric is available.
     requested_solver = solver
     if solver == "auto":
         solver = "qr" if regularization else "quimb"
