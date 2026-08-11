@@ -199,6 +199,22 @@ and make the reduced-tensor split
 
 ``A = Q_L R_L,    B = L_R Q_R``.
 
+**Implemented extension (2026-08-10).** The standalone
+`compress_reduced_loop_cluster` path performs the first local full-update
+compression: it fills a cluster by distance, accepts a frozen directed D2BP
+message tree through `boundary_messages={(bond_index, destination_tid): M}`,
+and solves the reduced `R/L` ALS truncation. Dense PEPS and PEPO inputs are
+supported; PEPO lower/upper physical legs are fused only on the private
+reduced-update copy and restored before returning. Supplied boundary messages
+are Hermitian/PSD projected by default, following the positive-approximant
+construction of [Lubasch--Cirac--Bañuls](https://arxiv.org/abs/1405.3259). This keeps the current
+physical representation unchanged while replacing diagonal SU closures on cut
+bonds with non-diagonal BP fixed-point matrices. `regauge=True` optionally
+refreshes SU gauges after truncation; otherwise the compressed physical network
+is returned directly. The gate APIs remain compatibility wrappers, and callers
+should rerun D2BP after a bond-dimension-changing step when a refreshed
+environment is required.
+
 `Q_L` and `Q_R` retain untouched outer virtual legs; `R_L` and `L_R` retain
 the physical legs and active bond and are the only variational tensors. This
 is the finite-PEPS reduced-tensor construction, rather than a physical-site
@@ -235,7 +251,10 @@ At finite loop order use the safe metric
 
 ``N_red <- PSD((N_red + N_red^dag) / 2)``
 
-and solve the reduced ALS with a relative pseudoinverse cutoff. First implement
+and solve the reduced ALS with a relative pseudoinverse cutoff. The dense ALS
+solver now also supports direct metric-weighted QR least squares with relative
+Tikhonov regularization, while retaining regularized normal equations as an
+explicit fallback for indefinite diagnostic metrics. First implement
 a direct buffered cluster (radius 0, then 1, then 2): with PSD SU-message
 closures it is a Gram matrix. Add open-leg loop-series / cluster-sum terms as
 the systematic acceleration and radius-convergence diagnostic.
@@ -245,6 +264,23 @@ cluster family contains the complete system, its boundary disappears and it
 returns exact `N_red` and `b_red` independently of the SU messages. The
 subsequent ALS is then exact **within fixed `Q_L`, `Q_R`**. It becomes a
 full-tensor full update only if later sweeps also vary the outer factors.
+
+The retained implementation represents the environment first as the smaller
+open Quimb tensor. Native Quimb ALS consumes that tensor directly; the
+physical-identity-expanded `N_red` is a lazy compatibility view and is only
+materialized for dense solvers or explicit diagnostics. This avoids the
+`D^4 d^4` PEPS (`D^4 d^8` fused-PEPO) allocation on the native path.
+
+**Implemented selected-bond compression path (2026-08-11).**
+`compress_bond_cluster` is the gate-free local alternative. It selects one
+virtual bond, fills a finite tensor cluster around its two endpoints, inserts
+directed BP messages or diagonal SU closures on the cut bonds, and contracts
+the fixed cluster to the four-leg `B_reduce` environment. The default
+Hermitian/PSD projection makes this local environment safe for Quimb ALS.
+Only the selected endpoint map pair `D -> chi` / `chi -> D` is optimized;
+other bonds and all spectator site tensors remain fixed. PEPO physical legs
+are never fused. This path is intentionally separate from the reduced
+two-site gate update, which retains its QR/LQ representation.
 
 ### References
 

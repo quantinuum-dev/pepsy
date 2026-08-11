@@ -43,6 +43,109 @@ gauges are used by `gate_simple`; D2BP recomputes its own norm messages. The
 `norm="1norm"` gauge route requires a closed scalar tensor network, so it is
 not the direct route for an open PEPO with ket/bra physical indices.
 
+## Reduced loop-cluster compression
+
+For the first-pass local full-update style compression, use
+`compress_reduced_loop_cluster`. It selects the active bond, fills a finite
+cluster by `max_distance`, closes its cut bonds with either SU vectors or
+directed D2BP matrices, and solves the reduced `R/L` ALS problem. This works
+for dense PEPS and dense PEPOs. For a PEPO, Quimb's lower and upper physical
+legs are fused only on the private reduced-update copy and restored before the
+result is returned. Pass messages from a separately solved `two_norm_bp` run
+without first changing the tensor network into an SU gauge:
+
+```python
+from pepsy.bp import compress_reduced_loop_cluster, two_norm_bp
+
+bp = two_norm_bp(peps, max_iterations=1000, tol=1e-10)
+result = compress_reduced_loop_cluster(
+    peps,
+    where=((0, 0), (1, 0)),
+    boundary_messages=bp.messages,
+    max_bond=chi,
+    max_distance=1,
+    inplace=False,
+)
+```
+
+Set `regauge=True` to refresh SU gauges after truncation; the default returns
+the compressed physical network without refreshing them. Set
+`max_loop_size>0` to add the open-leg loop-cluster correction on top of the
+finite base cluster. Supplied D2BP boundary messages are Hermitian/PSD
+projected by default (`message_psd_project=True`); set
+`message_psd_project=False` only for diagnostic raw-message experiments.
+The ALS options accept `solver="auto"` (the default), `solver="quimb"`,
+`solver="qr"`, or `solver="normal"`, plus a relative `regularization` value.
+The automatic and explicit Quimb modes use Quimb's public
+`tensor_network_fit_als` with prebuilt open-leg `tnAA`/`tnAB` overlap networks;
+QR mode is the regularized dense fallback, and automatic mode falls back to
+normal equations for an indefinite diagnostic metric. For repeated bond
+dimensions, build one reduced problem and reuse it with `solve_reduced_als`
+rather than rebuilding the environment. Reduced problem builders retain the
+open Quimb environment directly, so native ALS does not first form the full
+`N_red` matrix. The `.metric` and `.linear_term` attributes are lazy dense
+compatibility views; accessing them, or selecting a dense solver, materializes
+the physical-identity-expanded metric. Native Symmray compression remains
+separate work.
+
+For explicit dense diagnostics, use `problem.dense_metric()` and
+`problem.dense_linear_term()`. Direct problem builders also accept
+`materialize_metric=True`, but this is unnecessary for the native Quimb path.
+The three builder return types share the `ReducedUpdateProblem` type alias for
+annotations.
+
+The reduced-update message keys are `(bond_index, destination_tid)`, matching
+Quimb's D2BP layout. Messages are copied at preparation time and are not
+refreshed after a gate; rerun D2BP before another update if the fixed-point
+environment needs to track the changed state.
+
+For compatibility with gate streams, `apply_reduced_loop_cluster_gate` and
+`gate_loop_cluster` accept the same `boundary_messages=` option for adjacent
+two-site updates.
+
+## Selected-bond PEPS/PEPO compression
+
+When there is no gate and one particular virtual bond should be reduced, use
+`compress_bond_cluster`. It fills a cluster around that bond, contracts the
+cluster to a four-leg `B_reduce` environment, and optimizes only the two maps
+on the selected bond:
+
+```python
+from pepsy.bp import compress_bond_cluster, two_norm_bp
+
+bp = two_norm_bp(peps, max_iterations=1000, tol=1e-10)
+result = compress_bond_cluster(
+    peps,
+    where=((0, 0), (1, 0)),
+    boundary_messages=bp.messages,
+    max_distance=1,
+    max_bond=chi,
+    steps=20,
+)
+compressed = result.compressed
+```
+
+`result.bond_maps[result.bond_ind]` contains the fitted `(L, R)` pair with
+shapes `(D, chi)` and `(chi, D)`. These are ordinary rectangular variational
+tensors; no isometry, orthogonality, or adjoint constraint is imposed. The
+endpoint and spectator site tensors are fixed, and no QR/LQ split or gate is
+used. All other virtual bonds are unchanged.
+
+The default `init="b_reduce"` uses Quimb tensor contractions to form the two
+bond marginals of `B_reduce` and takes their dominant `chi` subspaces as the
+ALS starting maps. Use `init="projector"` or `init="random"` for simpler
+initializations.
+
+For a radius-zero cluster, every cut bond needs either a directed D2BP message
+or an SU gauge vector. SU vectors are interpreted as `diag(lambda)` boundary
+closures. Set `b_reduce=True` (the default) to Hermitian/PSD-project the
+contracted `B_reduce` before ALS; `result.B_reduce` exposes the retained
+four-leg environment in `(left_ket, right_ket, left_bra, right_bra)` order.
+This makes the local normal equations positive while avoiding the physical-leg
+fusion that produces `d^4` PEPS or `d^8` PEPO dense spaces. PEPO lower and upper
+legs remain separate. The cluster contraction can still be expensive as
+`max_distance` grows, so pass an appropriate Cotengra optimizer.
+
 ## Long-range PEPS expectations
 
 Use `compute_boundary_expectation` for batched one- and two-site operators,

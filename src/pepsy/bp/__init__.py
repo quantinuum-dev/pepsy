@@ -24,6 +24,10 @@ contractions and corrections used by Pepsy:
 * :func:`partitioned_expand` -- the partitioned network expansion (PNE,
   arXiv:2512.10910), with :func:`recursive_partitioned_expand` for fixed
   recursive schedules. :func:`weight_pass` supplies higher-rank projectors.
+* :func:`compress_reduced_loop_cluster` -- BP/SU-closed reduced-bond
+  compression for dense PEPS and PEPO networks.
+* :func:`compress_bond_cluster` -- gate-free compression of one selected bond
+  with variational rectangular maps and a BP/SU cluster environment.
 
 Most BP tools are imported explicitly as ``pepsy.bp``. The supported top-level
 workflow entry points are :func:`pepsy.one_norm_bp`, :func:`pepsy.gauge_all`,
@@ -119,15 +123,19 @@ from .observables import (
     compute_bp_path_expectation,
     compute_path_cluster_expectation,
 )
+from .compression import BondClusterCompressionResult, compress_bond_cluster
 from .reduced_update import (
     ExactReducedUpdateProblem,
     LoopClusterReducedUpdateProblem,
     LoopClusterTerm,
     ReducedALSSolution,
     ReducedBondPair,
+    ReducedLoopClusterCompressionResult,
     ReducedLoopClusterGateResult,
+    ReducedUpdateProblem,
     SUClusterReducedUpdateProblem,
     apply_reduced_loop_cluster_gate,
+    compress_reduced_loop_cluster,
     exact_reduced_update_problem,
     loop_cluster_reduced_update_problem,
     prepare_reduced_bond_pair,
@@ -137,6 +145,7 @@ from .reduced_update import (
 
 __all__ = [
     "GaugeResult",
+    "BondClusterCompressionResult",
     "ExactReducedUpdateProblem",
     "BPCandidateScore",
     "BPCandidateSelection",
@@ -176,10 +185,14 @@ __all__ = [
     "RelayGaugeOptions",
     "ReducedALSSolution",
     "ReducedBondPair",
+    "ReducedLoopClusterCompressionResult",
     "ReducedLoopClusterGateResult",
+    "ReducedUpdateProblem",
     "SUClusterReducedUpdateProblem",
     "ScalarClusterCache",
     "apply_reduced_loop_cluster_gate",
+    "compress_bond_cluster",
+    "compress_reduced_loop_cluster",
     "compare_simple_update_gauges",
     "compare_simple_update_to_bp",
     "copy_gauges",
